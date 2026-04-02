@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(psql:*)",
+      "Bash(python:*)",
+      "Bash(.venv/Scripts/python:*)"
+    ]
+  }
+}
