@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.database import get_db
+from app.services.document_workspace import build_docx_workspace
 from app.services.file_parser import parse_uploaded_file
 from app.services.matcher import match_sentences_with_stats
 from app.services.sentence_splitter import split_sentences
@@ -107,6 +108,47 @@ async def upload_and_match(
             "sentence_count": len(sentences),
             "results": results,
             "performance_summary": performance_summary,
+        },
+    )
+
+
+@router.post("/workspace", response_class=HTMLResponse)
+async def open_workspace(
+    request: Request,
+    workspace_file: UploadFile = File(...),
+    threshold: float = Form(default=settings.default_similarity_threshold),
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    if not 0 <= threshold <= 1:
+        raise HTTPException(status_code=400, detail="模糊匹配阈值必须在 0 到 1 之间。")
+
+    extension = f".{(workspace_file.filename or '').split('.')[-1].lower()}" if workspace_file.filename else ""
+    if extension != ".docx":
+        raise HTTPException(status_code=400, detail="可视化工作台目前仅支持 DOCX 文件。")
+
+    raw_bytes = await workspace_file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="上传的 DOCX 文件为空。")
+
+    workspace_started_at = perf_counter()
+    workspace_data = build_docx_workspace(
+        db=db,
+        raw_bytes=raw_bytes,
+        similarity_threshold=threshold,
+    )
+    workspace_ms = (perf_counter() - workspace_started_at) * 1000
+
+    return templates.TemplateResponse(
+        request,
+        "workspace.html",
+        {
+            "request": request,
+            "filename": workspace_file.filename,
+            "threshold": threshold,
+            "document_html": workspace_data["document_html"],
+            "segments": workspace_data["segments"],
+            "match_stats": workspace_data["match_stats"],
+            "workspace_ms": round(workspace_ms, 2),
         },
     )
 
