@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     app_name: str = "Translation Memory Demo"
     database_url: str = Field(
-        default="postgresql+psycopg://postgres:postgres@localhost:5432/tm_demo"
+        default="postgresql+psycopg://postgres:postgres@localhost:5432/tm_demo" 
     )
     upload_max_size_mb: int = 10
     default_similarity_threshold: float = 0.90
