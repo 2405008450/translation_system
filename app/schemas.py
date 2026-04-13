@@ -7,3 +7,4 @@ class MatchResult(BaseModel):
     score: float
     matched_source_text: str | None = None
     target_text: str | None = None
+    sentence_id: str = ""

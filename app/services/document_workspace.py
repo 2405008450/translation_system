@@ -264,3 +264,87 @@ def _build_empty_match_stats() -> MatchStats:
         total_match_ms=0.0,
         fuzzy_candidates_evaluated=0,
     )
+
+
+def build_document_html_from_segments(segments: list) -> str:
+    """从数据库 segments 重建预览 HTML"""
+    if not segments:
+        return ""
+
+    html_parts: list[str] = []
+    current_block_index = -1
+    current_block_type = None
+    current_table_row = -1
+    paragraph_buffer: list[str] = []
+    table_rows: list[list[list[str]]] = []  # rows -> cells -> paragraphs
+
+    def flush_paragraph():
+        nonlocal paragraph_buffer
+        if paragraph_buffer:
+            html_parts.append(f'<p class="doc-paragraph">{"".join(paragraph_buffer)}</p>')
+            paragraph_buffer = []
+
+    def flush_table():
+        nonlocal table_rows
+        if table_rows:
+            row_html = []
+            for row in table_rows:
+                cell_html = []
+                for cell_paragraphs in row:
+                    if cell_paragraphs:
+                        cell_content = "".join(f'<p class="doc-paragraph">{p}</p>' for p in cell_paragraphs)
+                    else:
+                        cell_content = '<p class="doc-paragraph doc-empty"><br></p>'
+                    cell_html.append(f'<td class="doc-table-cell">{cell_content}</td>')
+                row_html.append(f'<tr>{"".join(cell_html)}</tr>')
+            html_parts.append(f'<table class="doc-table"><tbody>{"".join(row_html)}</tbody></table>')
+            table_rows = []
+
+    for seg in segments:
+        block_index = seg.block_index
+        block_type = seg.block_type
+        sentence_id = seg.sentence_id
+        display_text = escape(seg.display_text)
+
+        sentence_html = f'<span class="doc-sentence" id="{sentence_id}" data-sentence-id="{sentence_id}">{display_text}</span>'
+
+        if block_type == "paragraph":
+            if current_block_type == "table_cell":
+                flush_table()
+            if block_index != current_block_index:
+                flush_paragraph()
+            paragraph_buffer.append(sentence_html)
+            current_block_index = block_index
+            current_block_type = "paragraph"
+
+        elif block_type == "table_cell":
+            if current_block_type == "paragraph":
+                flush_paragraph()
+
+            row_index = seg.row_index or 0
+            cell_index = seg.cell_index or 0
+
+            # 确保 table_rows 有足够的行和列
+            while len(table_rows) <= row_index:
+                table_rows.append([])
+            while len(table_rows[row_index]) <= cell_index:
+                table_rows[row_index].append([])
+
+            # 同一个 cell 的内容追加
+            if current_block_index == block_index and current_table_row == row_index:
+                if table_rows[row_index][cell_index]:
+                    table_rows[row_index][cell_index][-1] += sentence_html
+                else:
+                    table_rows[row_index][cell_index].append(sentence_html)
+            else:
+                table_rows[row_index][cell_index].append(sentence_html)
+
+            current_block_index = block_index
+            current_block_type = "table_cell"
+            current_table_row = row_index
+
+    # 清空缓冲区
+    flush_paragraph()
+    flush_table()
+
+    return "".join(html_parts) or '<p class="doc-paragraph doc-empty"><br></p>'
