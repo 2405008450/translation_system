@@ -5,79 +5,891 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>匹配结果</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .main-content {
+            transition: margin-right 0.3s ease;
+            margin-right: 48px;
+        }
+        .main-content.panel-open {
+            margin-right: 448px;
+        }
+        .side-toolbar {
+            position: fixed;
+            top: 0;
+            right: 0;
+            width: 48px;
+            height: 100vh;
+            background: #fff;
+            border-left: 1px solid #dee2e6;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding-top: 12px;
+            gap: 8px;
+            z-index: 1060;
+        }
+        .toolbar-btn {
+            width: 36px;
+            height: 36px;
+            border: none;
+            border-radius: 8px;
+            background: transparent;
+            color: #6c757d;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s ease;
+        }
+        .toolbar-btn:hover {
+            background: #f0f0f0;
+            color: #212529;
+        }
+        .toolbar-btn.active {
+            background: #0d6efd;
+            color: #fff;
+        }
+        .toolbar-btn svg {
+            width: 20px;
+            height: 20px;
+        }
+        .diff-panel {
+            position: fixed;
+            top: 0;
+            right: -400px;
+            width: 400px;
+            height: 100vh;
+            background: #fff;
+            box-shadow: -4px 0 12px rgba(0,0,0,0.15);
+            transition: right 0.3s ease;
+            z-index: 1050;
+            display: flex;
+            flex-direction: column;
+        }
+        .diff-panel.open {
+            right: 48px;
+        }
+        .diff-panel-header {
+            padding: 1rem 1.25rem;
+            border-bottom: 1px solid #dee2e6;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .diff-panel-body {
+            padding: 1.25rem;
+            overflow-y: auto;
+            flex: 1;
+        }
+        .diff-section {
+            margin-bottom: 1.5rem;
+        }
+        .diff-section-title {
+            font-size: 0.875rem;
+            color: #6c757d;
+            margin-bottom: 0.5rem;
+        }
+        .diff-content {
+            background: #f8f9fa;
+            padding: 1rem;
+            border-radius: 8px;
+            line-height: 1.8;
+            word-break: break-word;
+        }
+        .diff-content del {
+            background: #fecaca;
+            text-decoration: line-through;
+            color: #dc2626;
+            padding: 0 2px;
+            border-radius: 2px;
+        }
+        .diff-content ins {
+            background: #bbf7d0;
+            text-decoration: none;
+            color: #16a34a;
+            padding: 0 2px;
+            border-radius: 2px;
+        }
+        .clickable-cell {
+            cursor: pointer;
+            transition: background-color 0.15s;
+        }
+        .clickable-cell:hover {
+            background-color: rgba(13, 110, 253, 0.08);
+        }
+        .editable-target {
+            min-width: 200px;
+            padding: 0.375rem 0.5rem;
+            border: 1px solid transparent;
+            border-radius: 4px;
+            background: transparent;
+            transition: all 0.15s ease;
+            cursor: text;
+        }
+        .editable-target:hover {
+            background: #f8f9fa;
+            border-color: #dee2e6;
+        }
+        .editable-target:focus {
+            outline: none;
+            background: #fff;
+            border-color: #0d6efd;
+            box-shadow: 0 0 0 2px rgba(13, 110, 253, 0.15);
+        }
+        .editable-target.modified {
+            background: #fff3cd;
+            border-color: #ffc107;
+        }
+        .editable-target.saved {
+            background: #d1e7dd;
+            border-color: #198754;
+        }
+        /* 底部 tab 栏 */
+        .bottom-tabbar {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 48px;
+            height: 44px;
+            background: #fff;
+            border-top: 1px solid #dee2e6;
+            display: flex;
+            align-items: stretch;
+            justify-content: flex-start;
+            z-index: 1050;
+            box-shadow: 0 -2px 8px rgba(0,0,0,0.06);
+            transition: right 0.3s ease;
+        }
+        .bottom-tabbar.panel-open {
+            right: 448px; /* 400px panel + 48px toolbar */
+        }
+        .bottom-tab {
+            flex: 0 0 auto;
+            width: 120px;
+            border: none;
+            background: transparent;
+            color: #6c757d;
+            font-size: 0.875rem;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            border-right: 1px solid #dee2e6;
+            transition: all 0.15s ease;
+            padding: 0 12px;
+        }
+        .bottom-tab:last-child {
+            border-right: none;
+        }
+        .bottom-tab:hover {
+            background: #f8f9fa;
+            color: #212529;
+        }
+        .bottom-tab.active {
+            color: #0d6efd;
+            border-top: 2px solid #0d6efd;
+            background: #f0f5ff;
+        }
+        .bottom-tab svg {
+            width: 15px;
+            height: 15px;
+            flex-shrink: 0;
+        }
+        .main-content.preview-open {
+            padding-bottom: 400px !important; /* 300px面板 + 44px tabbar + 56px缓冲 */
+        }
+        .main-content.tabbar-visible {
+            padding-bottom: 60px;
+        }
+        .preview-panel {
+            position: fixed;
+            bottom: -300px;
+            left: 0;
+            right: 48px;
+            height: 300px;
+            background: #fff;
+            border-top: 1px solid #dee2e6;
+            box-shadow: 0 -4px 12px rgba(0,0,0,0.1);
+            transition: bottom 0.3s ease, right 0.3s ease;
+            z-index: 1040;
+            display: flex;
+            flex-direction: column;
+        }
+        .preview-panel.open {
+            bottom: 44px;
+        }
+        .preview-panel.panel-open {
+            right: 448px;
+        }
+        .preview-panel-header {
+            padding: 0.75rem 1.25rem;
+            border-bottom: 1px solid #dee2e6;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-shrink: 0;
+        }
+        .preview-panel-body {
+            padding: 1.25rem;
+            overflow-y: auto;
+            flex: 1;
+        }
+        .document-body {
+            font-size: 1rem;
+            line-height: 1.8;
+        }
+        .doc-paragraph {
+            margin-bottom: 1rem;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .doc-empty {
+            min-height: 1rem;
+        }
+        .doc-sentence {
+            cursor: pointer;
+            border-radius: 4px;
+            padding: 1px 2px;
+            transition: background-color 0.15s ease;
+        }
+        .doc-sentence:hover {
+            background: rgba(13, 110, 253, 0.1);
+        }
+        .doc-sentence.is-active {
+            background: rgba(13, 110, 253, 0.25);
+            box-shadow: 0 0 0 2px rgba(13, 110, 253, 0.25);
+        }
+        .doc-table {
+            width: 100%;
+            margin-bottom: 1rem;
+            border-collapse: collapse;
+        }
+        .doc-table-cell {
+            border: 1px solid #dee2e6;
+            padding: 0.5rem;
+            vertical-align: top;
+        }
+        .table tbody tr {
+            scroll-margin-bottom: 360px;
+        }
+        .table tbody tr.is-active,
+        .table-striped > tbody > tr.is-active {
+            background-color: rgba(13, 110, 253, 0.25) !important;
+            box-shadow: inset 0 0 0 2px #0d6efd;
+        }
+        .table tbody tr.is-active td {
+            background-color: transparent !important;
+        }
+        .close-btn {
+            background: none;
+            border: none;
+            font-size: 1.5rem;
+            line-height: 1;
+            color: #6c757d;
+            cursor: pointer;
+        }
+        .close-btn:hover {
+            color: #000;
+        }
+    </style>
 </head>
-<body class="bg-light">
-    <div class="container py-5">
-        <div class="d-flex justify-content-between align-items-center mb-4">
-            <div>
-                <h1 class="h3 mb-1">匹配结果</h1>
-                <p class="text-muted mb-0">文件：{{ filename }} | 原始句子数：{{ sentence_count }} | 模糊阈值：{{ "%.2f"|format(threshold) }}</p>
-            </div>
-            <a href="/" class="btn btn-outline-secondary">返回首页</a>
-        </div>
-
-        {% if performance_summary %}
-        <div class="card shadow-sm mb-4">
-            <div class="card-body">
-                <h2 class="h5 mb-3">性能摘要</h2>
-                <div class="row g-3 small">
-                    <div class="col-md-3"><strong>解析耗时：</strong>{{ "%.2f"|format(performance_summary.parse_ms) }} ms</div>
-                    <div class="col-md-3"><strong>断句耗时：</strong>{{ "%.2f"|format(performance_summary.split_ms) }} ms</div>
-                    <div class="col-md-3"><strong>匹配总耗时：</strong>{{ "%.2f"|format(performance_summary.stats.total_match_ms) }} ms</div>
-                    <div class="col-md-3"><strong>路由匹配耗时：</strong>{{ "%.2f"|format(performance_summary.route_match_ms) }} ms</div>
-                    <div class="col-md-3"><strong>预处理后句子：</strong>{{ performance_summary.stats.prepared_sentences }}</div>
-                    <div class="col-md-3"><strong>去重后句子：</strong>{{ performance_summary.stats.unique_sentences }}</div>
-                    <div class="col-md-3"><strong>exact：</strong>{{ performance_summary.stats.exact_hits }}</div>
-                    <div class="col-md-3"><strong>fuzzy：</strong>{{ performance_summary.stats.fuzzy_hits }}</div>
-                    <div class="col-md-3"><strong>none：</strong>{{ performance_summary.stats.none_hits }}</div>
-                    <div class="col-md-3"><strong>exact 阶段：</strong>{{ "%.2f"|format(performance_summary.stats.exact_phase_ms) }} ms</div>
-                    <div class="col-md-3"><strong>fuzzy 阶段：</strong>{{ "%.2f"|format(performance_summary.stats.fuzzy_phase_ms) }} ms</div>
-                    <div class="col-md-3"><strong>候选比较数：</strong>{{ performance_summary.stats.fuzzy_candidates_evaluated }}</div>
+<body class="bg-light" data-preview-supported="{{ 'true' if (is_docx and document_html) else 'false' }}" data-document-id="{{ document_id or '' }}">
+    <div class="main-content">
+        <div class="container py-5">
+            <div class="d-flex justify-content-between align-items-center mb-4">
+                <div>
+                    <h1 class="h3 mb-1">匹配结果</h1>
+                    <p class="text-muted mb-0">文件：{{ filename }} | 原始句子数：{{ sentence_count }} | 模糊阈值：{{ "%.2f"|format(threshold) }}</p>
+                </div>
+                <div class="d-flex gap-2">
+                    <button class="btn btn-primary" id="btnSaveProgress" title="保存当前翻译进度">
+                        <span id="saveIcon">💾</span> 保存进度
+                    </button>
+                    <a href="/" class="btn btn-outline-secondary">返回首页</a>
                 </div>
             </div>
-        </div>
-        {% endif %}
 
-        <div class="card shadow-sm">
-            <div class="card-body">
-                {% if results %}
-                <div class="table-responsive">
-                    <table class="table table-striped table-hover align-middle">
-                        <thead class="table-dark">
-                            <tr>
-                                <th>原文句子</th>
-                                <th>状态</th>
-                                <th>匹配度</th>
-                                <th>匹配到的原文</th>
-                                <th>对应译文</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {% for item in results %}
-                            <tr>
-                                <td>{{ item.source_sentence }}</td>
-                                <td>
-                                    {% if item.status == "exact" %}
-                                    <span class="badge text-bg-success">exact</span>
-                                    {% elif item.status == "fuzzy" %}
-                                    <span class="badge text-bg-warning">fuzzy</span>
-                                    {% else %}
-                                    <span class="badge text-bg-secondary">none</span>
-                                    {% endif %}
-                                </td>
-                                <td>{{ "%.4f"|format(item.score) }}</td>
-                                <td>{{ item.matched_source_text or "-" }}</td>
-                                <td>{{ item.target_text or "-" }}</td>
-                            </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
+            {% if performance_summary %}
+            <div class="card shadow-sm mb-4">
+                <div class="card-body">
+                    <h2 class="h5 mb-3">性能摘要</h2>
+                    <div class="row g-3 small">
+                        <div class="col-md-3"><strong>解析耗时：</strong>{{ "%.2f"|format(performance_summary.parse_ms) }} ms</div>
+                        <div class="col-md-3"><strong>断句耗时：</strong>{{ "%.2f"|format(performance_summary.split_ms) }} ms</div>
+                        <div class="col-md-3"><strong>匹配总耗时：</strong>{{ "%.2f"|format(performance_summary.stats.total_match_ms) }} ms</div>
+                        <div class="col-md-3"><strong>路由匹配耗时：</strong>{{ "%.2f"|format(performance_summary.route_match_ms) }} ms</div>
+                        <div class="col-md-3"><strong>预处理后句子：</strong>{{ performance_summary.stats.prepared_sentences }}</div>
+                        <div class="col-md-3"><strong>去重后句子：</strong>{{ performance_summary.stats.unique_sentences }}</div>
+                        <div class="col-md-3"><strong>exact：</strong>{{ performance_summary.stats.exact_hits }}</div>
+                        <div class="col-md-3"><strong>fuzzy：</strong>{{ performance_summary.stats.fuzzy_hits }}</div>
+                        <div class="col-md-3"><strong>none：</strong>{{ performance_summary.stats.none_hits }}</div>
+                        <div class="col-md-3"><strong>exact 阶段：</strong>{{ "%.2f"|format(performance_summary.stats.exact_phase_ms) }} ms</div>
+                        <div class="col-md-3"><strong>fuzzy 阶段：</strong>{{ "%.2f"|format(performance_summary.stats.fuzzy_phase_ms) }} ms</div>
+                        <div class="col-md-3"><strong>候选比较数：</strong>{{ performance_summary.stats.fuzzy_candidates_evaluated }}</div>
+                    </div>
                 </div>
-                {% else %}
-                <p class="mb-0 text-muted">未提取到可匹配的句子。</p>
-                {% endif %}
+            </div>
+            {% endif %}
+
+            <div class="card shadow-sm">
+                <div class="card-body">
+                    {% if results %}
+                    <div class="table-responsive">
+                        <table class="table table-striped table-hover align-middle">
+                            <thead class="table-dark">
+                                <tr>
+                                    <th>原文句子</th>
+                                    <th>状态</th>
+                                    <th>匹配度</th>
+                                    <th>匹配到的原文</th>
+                                    <th>对应译文</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for item in results %}
+                                <tr data-index="{{ loop.index0 }}" data-sentence-id="{{ item.sentence_id }}">
+                                    <td>{{ item.source_sentence }}</td>
+                                    <td>
+                                        {% if item.status == "exact" %}
+                                        <span class="badge text-bg-success">exact</span>
+                                        {% elif item.status == "fuzzy" %}
+                                        <span class="badge text-bg-warning">fuzzy</span>
+                                        {% else %}
+                                        <span class="badge text-bg-secondary">none</span>
+                                        {% endif %}
+                                    </td>
+                                    <td>{{ "%.4f"|format(item.score) }}</td>
+                                    <td>{{ item.matched_source_text or "-" }}</td>
+                                    <td>
+                                        <div class="editable-target" 
+                                             contenteditable="true"
+                                             data-source="{{ item.source_sentence }}"
+                                             data-matched="{{ item.matched_source_text or '' }}"
+                                             data-original="{{ item.target_text or '' }}"
+                                             data-status="{{ item.status }}"
+                                             data-sentence-id="{{ item.sentence_id }}">{{ item.target_text or "" }}</div>
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                    {% else %}
+                    <p class="mb-0 text-muted">未提取到可匹配的句子。</p>
+                    {% endif %}
+                </div>
             </div>
         </div>
     </div>
+
+    {% if is_docx and document_html %}
+    <div class="preview-panel" id="previewPanel">
+        <div class="preview-panel-header">
+            <h5 class="mb-0">原文预览</h5>
+            <button class="close-btn" id="closePreview">&times;</button>
+        </div>
+        <div class="preview-panel-body">
+            <div class="document-body">{{ document_html|safe }}</div>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- 底部 tab 栏 -->
+    <div class="bottom-tabbar" id="bottomTabbar">
+        <button class="bottom-tab" id="tabQA" title="QA结果">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                <polyline points="14 2 14 8 20 8"></polyline>
+                <line x1="9" y1="13" x2="15" y2="13"></line>
+                <line x1="9" y1="17" x2="15" y2="17"></line>
+            </svg>
+            QA结果
+        </button>
+        <button class="bottom-tab" id="tabHistory" title="历史记录">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"></circle>
+                <polyline points="12 6 12 12 16 14"></polyline>
+            </svg>
+            历史记录
+        </button>
+        <button class="bottom-tab" id="tabSourcePreview" title="原文预览">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                <circle cx="12" cy="12" r="3"></circle>
+            </svg>
+            原文预览
+        </button>
+        <button class="bottom-tab" id="tabTargetPreview" title="译文预览">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"></path>
+                <path d="M9 9h6M9 12h6M9 15h4"></path>
+            </svg>
+            译文预览
+            <span style="font-size:0.7rem;color:#adb5bd;margin-left:2px;" title="功能开发中">?</span>
+        </button>
+    </div>
+
+    <aside class="side-toolbar">
+        <button class="toolbar-btn active" id="btnMemory" title="记忆匹配">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
+            </svg>
+        </button>
+        <button class="toolbar-btn" id="btnTerms" title="术语库">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 20h9"></path>
+                <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
+            </svg>
+        </button>
+        <button class="toolbar-btn" id="btnSearch" title="搜索">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="8"></circle>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+            </svg>
+        </button>
+        <button class="toolbar-btn" id="btnHistory" title="历史记录">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"></circle>
+                <polyline points="12 6 12 12 16 14"></polyline>
+            </svg>
+        </button>
+        <button class="toolbar-btn" id="btnQA" title="质量检查">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                <polyline points="14 2 14 8 20 8"></polyline>
+                <line x1="16" y1="13" x2="8" y2="13"></line>
+                <line x1="16" y1="17" x2="8" y2="17"></line>
+                <polyline points="10 9 9 9 8 9"></polyline>
+            </svg>
+        </button>
+        <button class="toolbar-btn" id="btnComment" title="批注">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+            </svg>
+        </button>
+    </aside>
+
+    <div class="diff-panel" id="diffPanel">
+        <div class="diff-panel-header">
+            <h5 class="mb-0">记忆对比</h5>
+            <button class="close-btn" id="closePanel">&times;</button>
+        </div>
+        <div class="diff-panel-body">
+            <div class="diff-section">
+                <div class="diff-section-title">当前原文</div>
+                <div class="diff-content" id="currentSource"></div>
+            </div>
+            <div class="diff-section">
+                <div class="diff-section-title">匹配到的原文</div>
+                <div class="diff-content" id="matchedSource"></div>
+            </div>
+            <div class="diff-section">
+                <div class="diff-section-title">原文差异对比</div>
+                <div class="diff-content" id="diffResult"></div>
+            </div>
+            <div class="diff-section">
+                <div class="diff-section-title">记忆库译文</div>
+                <div class="diff-content" id="targetText"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    (() => {
+        const panel = document.getElementById('diffPanel');
+        const mainContent = document.querySelector('.main-content');
+        const closeBtn = document.getElementById('closePanel');
+        const editableCells = document.querySelectorAll('.editable-target');
+        const btnSaveProgress = document.getElementById('btnSaveProgress');
+        const documentId = document.body.dataset.documentId;
+
+        // 跟踪修改的条目
+        const modifiedEntries = new Map();
+
+        // 简单的字符级 diff 算法
+        function computeDiff(oldText, newText) {
+            if (!oldText || !newText) return newText || oldText || '';
+            if (oldText === newText) return newText;
+
+            const oldChars = [...oldText];
+            const newChars = [...newText];
+            const m = oldChars.length;
+            const n = newChars.length;
+
+            // LCS 动态规划
+            const dp = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
+            for (let i = 1; i <= m; i++) {
+                for (let j = 1; j <= n; j++) {
+                    if (oldChars[i - 1] === newChars[j - 1]) {
+                        dp[i][j] = dp[i - 1][j - 1] + 1;
+                    } else {
+                        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+                    }
+                }
+            }
+
+            // 回溯生成 diff
+            const result = [];
+            let i = m, j = n;
+            while (i > 0 || j > 0) {
+                if (i > 0 && j > 0 && oldChars[i - 1] === newChars[j - 1]) {
+                    result.unshift({ type: 'same', char: oldChars[i - 1] });
+                    i--; j--;
+                } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+                    result.unshift({ type: 'ins', char: newChars[j - 1] });
+                    j--;
+                } else {
+                    result.unshift({ type: 'del', char: oldChars[i - 1] });
+                    i--;
+                }
+            }
+
+            // 合并连续相同类型
+            let html = '';
+            let currentType = null;
+            let buffer = '';
+
+            for (const item of result) {
+                if (item.type !== currentType) {
+                    if (buffer) {
+                        if (currentType === 'del') html += `<del>${buffer}</del>`;
+                        else if (currentType === 'ins') html += `<ins>${buffer}</ins>`;
+                        else html += buffer;
+                    }
+                    currentType = item.type;
+                    buffer = item.char;
+                } else {
+                    buffer += item.char;
+                }
+            }
+            if (buffer) {
+                if (currentType === 'del') html += `<del>${buffer}</del>`;
+                else if (currentType === 'ins') html += `<ins>${buffer}</ins>`;
+                else html += buffer;
+            }
+
+            return html;
+        }
+
+        function openPanel(source, matched, target, status) {
+            document.getElementById('currentSource').textContent = source || '-';
+            document.getElementById('matchedSource').textContent = matched || '-';
+            // 没匹配到时记忆库译文显示 -
+            document.getElementById('targetText').textContent = (status === 'none' || !matched) ? '-' : (target || '-');
+
+            if (matched && source && status === 'fuzzy') {
+                document.getElementById('diffResult').innerHTML = computeDiff(matched, source);
+            } else if (status === 'exact') {
+                document.getElementById('diffResult').innerHTML = '<span class="text-success">完全匹配</span>';
+            } else {
+                document.getElementById('diffResult').innerHTML = '<span class="text-muted">无匹配数据</span>';
+            }
+
+            panel.classList.add('open');
+            mainContent.classList.add('panel-open');
+            document.getElementById('bottomTabbar').classList.add('panel-open');
+            const pp = document.getElementById('previewPanel');
+            if (pp) pp.classList.add('panel-open');
+            btnMemory.classList.add('active');
+        }
+
+        function closePanel() {
+            panel.classList.remove('open');
+            mainContent.classList.remove('panel-open');
+            document.getElementById('bottomTabbar').classList.remove('panel-open');
+            const pp = document.getElementById('previewPanel');
+            if (pp) pp.classList.remove('panel-open');
+        }
+
+        // 可编辑单元格事件
+        editableCells.forEach(cell => {
+            const originalText = cell.dataset.original;
+
+            // 点击打开侧边栏
+            cell.addEventListener('click', () => {
+                const source = cell.dataset.source;
+                const matched = cell.dataset.matched;
+                const tmTarget = cell.dataset.original;  // 记忆库原始译文
+                const status = cell.dataset.status;
+                openPanel(source, matched, tmTarget, status);
+            });
+
+            // 输入时标记修改状态
+            cell.addEventListener('input', () => {
+                const currentText = cell.textContent.trim();
+                const sentenceId = cell.dataset.sentenceId;
+
+                if (currentText !== originalText) {
+                    cell.classList.add('modified');
+                    cell.classList.remove('saved');
+                    if (sentenceId) {
+                        modifiedEntries.set(sentenceId, currentText);
+                    }
+                } else {
+                    cell.classList.remove('modified');
+                    modifiedEntries.delete(sentenceId);
+                }
+
+                updateSaveButton();
+            });
+
+            // 回车保存，Shift+回车换行
+            cell.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    cell.blur();
+                }
+            });
+        });
+
+        function updateSaveButton() {
+            const count = modifiedEntries.size;
+            if (count > 0) {
+                btnSaveProgress.textContent = `💾 保存进度 (${count})`;
+                btnSaveProgress.disabled = false;
+            } else {
+                btnSaveProgress.innerHTML = '<span id="saveIcon">💾</span> 保存进度';
+                btnSaveProgress.disabled = false;
+            }
+        }
+
+        // 保存进度到数据库
+        btnSaveProgress.addEventListener('click', async () => {
+            if (!documentId) {
+                alert('文档未保存，无法保存进度。请先上传文档创建任务。');
+                return;
+            }
+
+            if (modifiedEntries.size === 0) {
+                alert('没有需要保存的修改。');
+                return;
+            }
+
+            const updates = [];
+            modifiedEntries.forEach((targetText, sentenceId) => {
+                updates.push({ sentence_id: sentenceId, target_text: targetText, source: 'manual' });
+            });
+
+            btnSaveProgress.disabled = true;
+            btnSaveProgress.innerHTML = '⏳ 保存中...';
+
+            try {
+                const response = await fetch(`/api/documents/${documentId}/segments`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ updates }),
+                });
+
+                if (!response.ok) {
+                    throw new Error('保存失败');
+                }
+
+                const result = await response.json();
+
+                // 标记已保存的单元格
+                editableCells.forEach(cell => {
+                    const sentenceId = cell.dataset.sentenceId;
+                    if (modifiedEntries.has(sentenceId)) {
+                        cell.classList.remove('modified');
+                        cell.classList.add('saved');
+                        cell.dataset.original = cell.textContent.trim();
+                    }
+                });
+
+                modifiedEntries.clear();
+                updateSaveButton();
+
+                alert(`保存完成！已更新 ${result.updated_count} 条记录。`);
+
+            } catch (error) {
+                alert('保存失败：' + error.message);
+            } finally {
+                btnSaveProgress.disabled = false;
+                updateSaveButton();
+            }
+        });
+
+        closeBtn.addEventListener('click', closePanel);
+
+        // 工具栏按钮切换
+        const toolbarBtns = document.querySelectorAll('.toolbar-btn');
+        const btnMemory = document.getElementById('btnMemory');
+
+        toolbarBtns.forEach(btn => {
+            btn.addEventListener('click', () => {
+                if (btn.id === 'btnMemory') {
+                    if (panel.classList.contains('open')) {
+                        closePanel();
+                        btn.classList.remove('active');
+                    } else {
+                        // 优先用当前高亮行，否则用第一行
+                        const activeRow = document.querySelector('tbody tr.is-active');
+                        const cell = activeRow
+                            ? activeRow.querySelector('.editable-target')
+                            : editableCells[0];
+                        if (cell) {
+                            openPanel(
+                                cell.dataset.source,
+                                cell.dataset.matched,
+                                cell.dataset.original,
+                                cell.dataset.status
+                            );
+                        } else {
+                            openPanel('', '', '', 'none');
+                        }
+                    }
+                } else {
+                    toolbarBtns.forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    closePanel();
+                }
+            });
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closePanel();
+            // Ctrl+S 保存
+            if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+                e.preventDefault();
+                btnSaveProgress.click();
+            }
+        });
+
+        // ========== 底部 tab 栏 ==========
+        mainContent.classList.add('tabbar-visible');
+
+        const tabQA = document.getElementById('tabQA');
+        const tabHistory = document.getElementById('tabHistory');
+        const tabSourcePreview = document.getElementById('tabSourcePreview');
+        const tabTargetPreview = document.getElementById('tabTargetPreview');
+        const allTabs = [tabQA, tabHistory, tabSourcePreview, tabTargetPreview];
+
+        function clearActiveTabs() {
+            allTabs.forEach(t => t && t.classList.remove('active'));
+        }
+
+        // QA / 历史 / 译文预览 暂未实现，点击仅切换高亮
+        [tabQA, tabHistory, tabTargetPreview].forEach(tab => {
+            if (!tab) return;
+            tab.addEventListener('click', () => {
+                const wasActive = tab.classList.contains('active');
+                clearActiveTabs();
+                if (!wasActive) tab.classList.add('active');
+            });
+        });
+
+        // ========== 原文预览双向联动 ==========
+        const previewPanel = document.getElementById('previewPanel');
+        const closePreviewBtn = document.getElementById('closePreview');
+        const tableRows = document.querySelectorAll('tbody tr[data-sentence-id]');
+        const isPreviewSupported = document.body.dataset.previewSupported === 'true';
+
+        function openPreview() {
+            if (!previewPanel) return;
+            previewPanel.classList.add('open');
+            mainContent.classList.add('preview-open');
+            clearActiveTabs();
+            tabSourcePreview.classList.add('active');
+        }
+
+        function closePreview() {
+            if (!previewPanel) return;
+            previewPanel.classList.remove('open');
+            mainContent.classList.remove('preview-open');
+            tabSourcePreview.classList.remove('active');
+        }
+
+        if (tabSourcePreview) {
+            tabSourcePreview.addEventListener('click', () => {
+                if (!isPreviewSupported) {
+                    const existing = document.getElementById('previewToast');
+                    if (existing) return;
+                    const toast = document.createElement('div');
+                    toast.id = 'previewToast';
+                    toast.style.cssText = 'position:fixed;bottom:60px;left:50%;transform:translateX(-50%);background:#343a40;color:#fff;padding:10px 20px;border-radius:8px;font-size:0.875rem;z-index:9999;box-shadow:0 4px 12px rgba(0,0,0,0.2);pointer-events:none;';
+                    toast.textContent = '该文件格式不支持原文预览';
+                    document.body.appendChild(toast);
+                    setTimeout(() => toast.remove(), 2500);
+                    return;
+                }
+                if (previewPanel.classList.contains('open')) {
+                    closePreview();
+                } else {
+                    openPreview();
+                }
+            });
+        }
+
+        if (closePreviewBtn) {
+            closePreviewBtn.addEventListener('click', closePreview);
+        }
+
+        if (previewPanel) {
+            const docSentences = previewPanel.querySelectorAll('.doc-sentence');
+            const rowMap = new Map();
+            const sentenceMap = new Map();
+
+            tableRows.forEach(row => {
+                const sid = row.dataset.sentenceId;
+                if (sid) rowMap.set(sid, row);
+            });
+
+            docSentences.forEach(node => {
+                const sid = node.dataset.sentenceId;
+                if (sid) sentenceMap.set(sid, node);
+            });
+
+            function setActiveSentence(sentenceId, options = {}) {
+                if (!sentenceId) return;
+
+                tableRows.forEach(row => {
+                    row.classList.toggle('is-active', row.dataset.sentenceId === sentenceId);
+                });
+
+                docSentences.forEach(node => {
+                    node.classList.toggle('is-active', node.dataset.sentenceId === sentenceId);
+                });
+
+                if (options.scrollTable !== false) {
+                    const row = rowMap.get(sentenceId);
+                    if (row) {
+                        const previewOpen = previewPanel.classList.contains('open');
+                        const bottomReserved = previewOpen ? 380 : 60;
+                        
+                        const viewportHeight = window.innerHeight;
+                        const availableHeight = viewportHeight - bottomReserved;
+                        const targetY = availableHeight * 0.33;
+                        
+                        const rowRect = row.getBoundingClientRect();
+                        const scrollOffset = rowRect.top - targetY;
+                        
+                        window.scrollBy({ top: scrollOffset, behavior: 'smooth' });
+                    }
+                }
+
+                if (options.scrollPreview !== false) {
+                    const node = sentenceMap.get(sentenceId);
+                    if (node) node.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                }
+            }
+
+            tableRows.forEach(row => {
+                row.addEventListener('click', (e) => {
+                    if (e.target.classList.contains('editable-target')) return;
+                    setActiveSentence(row.dataset.sentenceId, { scrollTable: false });
+                });
+            });
+
+            docSentences.forEach(node => {
+                node.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    setActiveSentence(node.dataset.sentenceId, { scrollPreview: false });
+                });
+            });
+        }
+    })();
+    </script>
 </body>
 </html>

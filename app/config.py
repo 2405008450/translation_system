@@ -10,7 +10,7 @@ class Settings(BaseSettings):
         default="postgresql+psycopg://postgres:postgres@localhost:5432/tm_demo" 
     )
     upload_max_size_mb: int = 10
-    default_similarity_threshold: float = 0.90
+    default_similarity_threshold: float = 0.60
 
     model_config = SettingsConfigDict(
         env_file=".env",
