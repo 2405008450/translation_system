@@ -31,7 +31,9 @@ def main() -> None:
         )
 
     print(
-        f"Imported {summary.imported_rows} rows from {summary.filename}; "
+        f"Processed {summary.imported_rows} rows from {summary.filename}; "
+        f"created: {summary.created_rows}; "
+        f"updated: {summary.updated_rows}; "
         f"skipped header rows: {summary.skipped_header_rows}; "
         f"skipped empty rows: {summary.skipped_empty_rows}"
     )

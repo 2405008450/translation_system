@@ -35,7 +35,8 @@
                 {% if import_summary %}
                 <div class="alert alert-success" role="alert">
                     <div><strong>导入完成：</strong>{{ import_summary.filename }}</div>
-                    <div>新增行数：{{ import_summary.imported_rows }}</div>
+                    <div>新增行数：{{ import_summary.created_rows }}</div>
+                    <div>更新行数：{{ import_summary.updated_rows }}</div>
                     <div>跳过表头行：{{ import_summary.skipped_header_rows }}</div>
                     <div>跳过空行：{{ import_summary.skipped_empty_rows }}</div>
                 </div>
@@ -90,7 +91,7 @@
                             </div>
 
                             <div class="alert alert-secondary small mb-4">
-                                大文件导入建议耐心等待；上传后会直接写入 `translation_memory`，并自动计算 `source_hash` 和 `source_normalized`。
+                                大文件导入建议耐心等待；导入时会自动计算 `source_hash` 和 `source_normalized`，同源文本会更新现有记录而不是重复插入。
                             </div>
 
                             <button type="submit" class="btn btn-success">导入 XLSX 到数据库</button>

@@ -29,10 +29,11 @@ app/
     result.html
 scripts/
   init_db.sql
+  create_document_tables.sql
   import_tm.py
   import_tm_xlsx.py
   rebuild_tm_fields.py
-  expand_tm_dataset.py
+  deduplicate_tm_source_hash.py
 requirements.txt
 README.md
 ```
@@ -55,9 +56,23 @@ pip install -r requirements.txt
 psql -U postgres -d tm_demo -f scripts/init_db.sql
 ```
 
+`scripts/init_db.sql` 会同时初始化：
+
+- `translation_memory`
+- `file_records`
+- `segments`
+
+如果是旧库，只初始化过 TM 相关表，也可以单独补跑：
+
+```powershell
+psql -U postgres -d tm_demo -f scripts/create_document_tables.sql
+```
+
 ## 3. 数据库连接
 
 项目默认会从根目录 `.env` 读取连接串。
+
+`.env` 只建议本地保留，不要提交到仓库。
 
 当前可用示例：
 
@@ -103,6 +118,8 @@ python scripts/import_tm_xlsx.py --database-url "postgresql+psycopg://tm_user:tm
 ```
 
 也可以直接在首页上传 `.xlsx` 文件导入数据库。
+
+XLSX 导入会按 `source_hash` 去重；如果命中现有 TM，系统会更新原记录而不是重复插入。
 
 ## 5. 启动项目
 
@@ -179,7 +196,7 @@ http://192.168.31.135:19003
 
 再模糊匹配：
 
-- 批量 trigram 候选召回
+- 先走 trigram 索引候选召回
 - 再用相似度重排
 
 ## 8. 维护脚本
@@ -190,11 +207,13 @@ http://192.168.31.135:19003
 python scripts/rebuild_tm_fields.py --database-url "postgresql+psycopg://tm_user:tm123456@localhost:5432/tm_demo" --batch-size 1000
 ```
 
-扩容到指定数据量并导出随机测试文本：
+按 `source_hash` 清理历史重复记录：
 
 ```powershell
-python scripts/expand_tm_dataset.py --database-url "postgresql://tm_user:tm123456@localhost:5432/tm_demo" --target-count 1000000 --batch-size 5000 --sample-size 5000 --sample-output "sample_5000_source_text.txt"
+python scripts/deduplicate_tm_source_hash.py --database-url "postgresql+psycopg://tm_user:tm123456@localhost:5432/tm_demo" --apply
 ```
+
+如果要顺便补 `uq_translation_memory_source_hash` 唯一索引，执行该命令的数据库账号需要是 `translation_memory` 表属主。
 
 ## 9. 注意事项
 

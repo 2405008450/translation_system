@@ -3,7 +3,7 @@ from io import BytesIO
 from pathlib import Path
 
 from openpyxl import load_workbook
-from sqlalchemy import insert
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.models import TranslationMemory
@@ -23,9 +23,14 @@ HEADER_ALIASES = {
 @dataclass
 class TMImportSummary:
     filename: str
-    imported_rows: int
+    created_rows: int
+    updated_rows: int
     skipped_empty_rows: int
     skipped_header_rows: int
+
+    @property
+    def imported_rows(self) -> int:
+        return self.created_rows + self.updated_rows
 
 
 def import_tm_from_xlsx_upload(
@@ -54,8 +59,9 @@ def import_tm_from_xlsx_path(
 
 def _import_workbook(db: Session, workbook, filename: str, batch_size: int) -> TMImportSummary:
     worksheet = workbook.active
-    batch_rows: list[dict] = []
-    imported_rows = 0
+    batch_rows: dict[str, dict] = {}
+    created_rows = 0
+    updated_rows = 0
     skipped_empty_rows = 0
     skipped_header_rows = 0
 
@@ -71,33 +77,90 @@ def _import_workbook(db: Session, workbook, filename: str, batch_size: int) -> T
             skipped_empty_rows += 1
             continue
 
-        batch_rows.append(
-            {
-                "source_text": source_text,
-                "target_text": target_text,
-                "source_hash": build_source_hash(source_text),
-                "source_normalized": normalize_match_text(source_text) or normalize_text(source_text),
-            }
-        )
+        tm_row = _build_tm_row(source_text=source_text, target_text=target_text)
+        batch_rows[tm_row["source_hash"]] = tm_row
 
         if len(batch_rows) >= batch_size:
-            db.execute(insert(TranslationMemory), batch_rows)
-            db.commit()
-            imported_rows += len(batch_rows)
+            created_in_batch, updated_in_batch = _flush_tm_batch(
+                db=db,
+                batch_rows=list(batch_rows.values()),
+            )
+            created_rows += created_in_batch
+            updated_rows += updated_in_batch
             batch_rows.clear()
 
     if batch_rows:
-        db.execute(insert(TranslationMemory), batch_rows)
-        db.commit()
-        imported_rows += len(batch_rows)
+        created_in_batch, updated_in_batch = _flush_tm_batch(
+            db=db,
+            batch_rows=list(batch_rows.values()),
+        )
+        created_rows += created_in_batch
+        updated_rows += updated_in_batch
 
     workbook.close()
     return TMImportSummary(
         filename=filename,
-        imported_rows=imported_rows,
+        created_rows=created_rows,
+        updated_rows=updated_rows,
         skipped_empty_rows=skipped_empty_rows,
         skipped_header_rows=skipped_header_rows,
     )
+
+
+def _build_tm_row(source_text: str, target_text: str) -> dict:
+    return {
+        "source_text": source_text,
+        "target_text": target_text,
+        "source_hash": build_source_hash(source_text),
+        "source_normalized": normalize_match_text(source_text) or normalize_text(source_text),
+    }
+
+
+def _flush_tm_batch(db: Session, batch_rows: list[dict]) -> tuple[int, int]:
+    if not batch_rows:
+        return 0, 0
+
+    source_hashes = [row["source_hash"] for row in batch_rows]
+    source_texts = [row["source_text"] for row in batch_rows]
+    existing_rows = (
+        db.query(TranslationMemory)
+        .filter(
+            or_(
+                TranslationMemory.source_hash.in_(source_hashes),
+                TranslationMemory.source_text.in_(source_texts),
+            )
+        )
+        .all()
+    )
+
+    existing_by_hash: dict[str, TranslationMemory] = {}
+    existing_by_source_text: dict[str, TranslationMemory] = {}
+    for existing in existing_rows:
+        if existing.source_hash:
+            existing_by_hash.setdefault(existing.source_hash, existing)
+        existing_by_source_text.setdefault(existing.source_text, existing)
+
+    created_rows = 0
+    updated_rows = 0
+    for row in batch_rows:
+        existing = existing_by_hash.get(row["source_hash"]) or existing_by_source_text.get(
+            row["source_text"]
+        )
+        if existing is None:
+            db.add(TranslationMemory(**row))
+            created_rows += 1
+            continue
+
+        existing.source_text = row["source_text"]
+        existing.target_text = row["target_text"]
+        existing.source_hash = row["source_hash"]
+        existing.source_normalized = row["source_normalized"]
+        existing_by_hash[row["source_hash"]] = existing
+        existing_by_source_text[row["source_text"]] = existing
+        updated_rows += 1
+
+    db.commit()
+    return created_rows, updated_rows
 
 
 def _cell_to_text(row: tuple, index: int) -> str:

@@ -1,16 +1,18 @@
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.services.document_workspace import build_docx_workspace
-from app.services.document_service import (
-    create_document_with_segments,
-    get_document_with_segments,
-    list_documents,
+from app.services.file_record_service import (
+    create_file_record_with_segments,
+    get_file_record_with_segments,
+    list_file_records,
     update_segment_by_sentence_id,
     batch_update_segments,
-    delete_document,
+    delete_file_record,
 )
 from app.services.slate_parser import parse_docx_for_slate
 
@@ -76,8 +78,9 @@ async def upload_for_workspace(
 
 # ========== 文档管理 API ==========
 
-@router.post("/documents")
-async def create_document(
+@router.post("/file-records")
+@router.post("/documents", include_in_schema=False)
+async def create_file_record(
     file: UploadFile = File(...),
     threshold: float = Form(default=0.6),
     db: Session = Depends(get_db),
@@ -90,62 +93,76 @@ async def create_document(
         raise HTTPException(status_code=400, detail="文件为空。")
 
     try:
-        document = create_document_with_segments(
+        file_record = create_file_record_with_segments(
             db=db,
             raw_bytes=raw_bytes,
             filename=file.filename or "untitled.docx",
             similarity_threshold=threshold,
         )
         return {
-            "id": document.id,
-            "filename": document.filename,
-            "status": document.status,
-            "created_at": document.created_at.isoformat(),
+            "id": file_record.id,
+            "filename": file_record.filename,
+            "status": file_record.status,
+            "created_at": file_record.created_at.isoformat(),
         }
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/documents")
-def get_documents(
+@router.get("/file-records")
+@router.get("/documents", include_in_schema=False)
+def get_file_records(
     skip: int = 0,
     limit: int = 50,
     db: Session = Depends(get_db),
 ):
     """获取文档列表"""
-    documents = list_documents(db, skip=skip, limit=limit)
+    file_records = list_file_records(db, skip=skip, limit=limit)
     return [
         {
-            "id": doc.id,
-            "filename": doc.filename,
-            "status": doc.status,
-            "created_at": doc.created_at.isoformat(),
-            "updated_at": doc.updated_at.isoformat(),
+            "id": file_record.id,
+            "filename": file_record.filename,
+            "status": file_record.status,
+            "created_at": file_record.created_at.isoformat(),
+            "updated_at": file_record.updated_at.isoformat(),
         }
-        for doc in documents
+        for file_record in file_records
     ]
 
 
-@router.get("/documents/{document_id}")
-def get_document(
-    document_id: int,
+@router.get("/file-records/{file_record_id}")
+@router.get("/documents/{file_record_id}", include_in_schema=False)
+def get_file_record(
+    file_record_id: UUID,
+    skip: int = 0,
+    limit: int = 200,
     db: Session = Depends(get_db),
 ):
-    """获取文档详情及所有片段"""
-    result = get_document_with_segments(db, document_id)
+    """获取文档详情及片段，支持分页"""
+    safe_skip = max(skip, 0)
+    safe_limit = min(max(limit, 1), 1000)
+    result = get_file_record_with_segments(
+        db,
+        file_record_id,
+        skip=safe_skip,
+        limit=safe_limit,
+    )
     if not result:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
-    doc = result["document"]
+    file_record = result["file_record"]
     segments = result["segments"]
 
     return {
-        "id": doc.id,
-        "filename": doc.filename,
-        "status": doc.status,
-        "created_at": doc.created_at.isoformat(),
-        "updated_at": doc.updated_at.isoformat(),
+        "id": file_record.id,
+        "filename": file_record.filename,
+        "status": file_record.status,
+        "created_at": file_record.created_at.isoformat(),
+        "updated_at": file_record.updated_at.isoformat(),
+        "total_segments": result["total_segments"],
+        "skip": result["skip"],
+        "limit": result["limit"],
         "segments": [
             {
                 "id": seg.id,
@@ -165,9 +182,10 @@ def get_document(
     }
 
 
-@router.put("/documents/{document_id}/segments/{sentence_id}")
+@router.put("/file-records/{file_record_id}/segments/{sentence_id}")
+@router.put("/documents/{file_record_id}/segments/{sentence_id}", include_in_schema=False)
 def update_segment(
-    document_id: int,
+    file_record_id: UUID,
     sentence_id: str,
     update: SegmentUpdate,
     db: Session = Depends(get_db),
@@ -175,7 +193,7 @@ def update_segment(
     """更新单个片段的译文"""
     segment = update_segment_by_sentence_id(
         db=db,
-        document_id=document_id,
+        file_record_id=file_record_id,
         sentence_id=sentence_id,
         target_text=update.target_text,
         source=update.source,
@@ -192,28 +210,30 @@ def update_segment(
     }
 
 
-@router.put("/documents/{document_id}/segments")
+@router.put("/file-records/{file_record_id}/segments")
+@router.put("/documents/{file_record_id}/segments", include_in_schema=False)
 def batch_update(
-    document_id: int,
+    file_record_id: UUID,
     batch: BatchSegmentUpdate,
     db: Session = Depends(get_db),
 ):
     """批量更新片段译文"""
     updated_count = batch_update_segments(
         db=db,
-        document_id=document_id,
+        file_record_id=file_record_id,
         updates=[u.model_dump() for u in batch.updates],
     )
     return {"updated_count": updated_count}
 
 
-@router.delete("/documents/{document_id}")
-def remove_document(
-    document_id: int,
+@router.delete("/file-records/{file_record_id}")
+@router.delete("/documents/{file_record_id}", include_in_schema=False)
+def remove_file_record(
+    file_record_id: UUID,
     db: Session = Depends(get_db),
 ):
     """删除文档及其所有片段"""
-    success = delete_document(db, document_id)
+    success = delete_file_record(db, file_record_id)
     if not success:
         raise HTTPException(status_code=404, detail="文档不存在。")
     return {"message": "文档已删除。"}
