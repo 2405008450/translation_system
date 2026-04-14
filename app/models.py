@@ -1,19 +1,34 @@
-from sqlalchemy import BigInteger, DateTime, Enum, ForeignKey, Index, String, Text, func
+import uuid
+
+from sqlalchemy import DateTime, ForeignKey, Index, String, Text, Uuid, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
 
+UUID_SQL_DEFAULT = text(
+    """(
+        lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
+        lpad(to_hex(floor(random() * 65536)::int), 4, '0') || '-' ||
+        '4' || substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        substr('89ab', floor(random() * 4)::int + 1, 1) ||
+        substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
+    )::uuid"""
+)
 
-class Document(Base):
-    """文档表：记录用户上传的文档"""
-    __tablename__ = "documents"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+class FileRecord(Base):
+    __tablename__ = "file_records"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     file_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    status: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="draft"
-    )  # draft, in_progress, completed
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft")
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -24,26 +39,36 @@ class Document(Base):
         nullable=False,
     )
 
-    segments: Mapped[list["Segment"]] = relationship("Segment", back_populates="document", cascade="all, delete-orphan")
+    segments: Mapped[list["Segment"]] = relationship(
+        "Segment",
+        back_populates="file_record",
+        cascade="all, delete-orphan",
+    )
 
 
 class Segment(Base):
-    """片段表：记录文档中的每个翻译单元"""
     __tablename__ = "segments"
-    __table_args__ = (
-        Index("ix_segments_document_id", "document_id"),
-    )
+    __table_args__ = (Index("ix_segments_file_record_id", "file_record_id"),)
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    document_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
-    sentence_id: Mapped[str] = mapped_column(String(20), nullable=False)  # sent-00001
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    file_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sentence_id: Mapped[str] = mapped_column(String(20), nullable=False)
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
     display_text: Mapped[str] = mapped_column(Text, nullable=False)
     target_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="none")  # exact, fuzzy, none, confirmed
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="none")
     score: Mapped[float] = mapped_column(nullable=False, default=0.0)
     matched_source_text: Mapped[str | None] = mapped_column(Text, nullable=True)
-    source: Mapped[str] = mapped_column(String(20), nullable=False, default="tm")  # tm, llm, manual
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="tm")
     block_type: Mapped[str] = mapped_column(String(20), nullable=False, default="paragraph")
     block_index: Mapped[int] = mapped_column(nullable=False, default=0)
     row_index: Mapped[int | None] = mapped_column(nullable=True)
@@ -58,7 +83,7 @@ class Segment(Base):
         nullable=False,
     )
 
-    document: Mapped["Document"] = relationship("Document", back_populates="segments")
+    file_record: Mapped["FileRecord"] = relationship("FileRecord", back_populates="segments")
 
 
 class TranslationMemory(Base):
@@ -81,7 +106,12 @@ class TranslationMemory(Base):
         ),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
     target_text: Mapped[str] = mapped_column(Text, nullable=False)
     source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)

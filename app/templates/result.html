@@ -294,7 +294,43 @@
         }
     </style>
 </head>
-<body class="bg-light" data-preview-supported="{{ 'true' if (is_docx and document_html) else 'false' }}" data-document-id="{{ document_id or '' }}">
+<body class="bg-light" data-preview-supported="{{ 'true' if (is_docx and document_html) else 'false' }}" data-file-record-id="{{ file_record_id or '' }}">
+    {% macro render_pagination(pagination) -%}
+    {% if pagination and pagination.total_pages > 1 %}
+    <nav aria-label="片段分页">
+        <ul class="pagination pagination-sm mb-0">
+            {% if pagination.has_prev %}
+            <li class="page-item">
+                <a class="page-link page-nav-link" href="{{ pagination.prev_url }}">上一页</a>
+            </li>
+            {% else %}
+            <li class="page-item disabled">
+                <span class="page-link">上一页</span>
+            </li>
+            {% endif %}
+            {% for page_number in pagination.page_numbers %}
+            <li class="page-item {% if page_number == pagination.page %}active{% endif %}">
+                {% if page_number == pagination.page %}
+                <span class="page-link">{{ page_number }}</span>
+                {% else %}
+                <a class="page-link page-nav-link" href="{{ pagination.page_urls[page_number] }}">{{ page_number }}</a>
+                {% endif %}
+            </li>
+            {% endfor %}
+            {% if pagination.has_next %}
+            <li class="page-item">
+                <a class="page-link page-nav-link" href="{{ pagination.next_url }}">下一页</a>
+            </li>
+            {% else %}
+            <li class="page-item disabled">
+                <span class="page-link">下一页</span>
+            </li>
+            {% endif %}
+        </ul>
+    </nav>
+    {% endif %}
+    {%- endmacro %}
+
     <div class="main-content">
         <div class="container py-5">
             <div class="d-flex justify-content-between align-items-center mb-4">
@@ -329,6 +365,19 @@
                         <div class="col-md-3"><strong>候选比较数：</strong>{{ performance_summary.stats.fuzzy_candidates_evaluated }}</div>
                     </div>
                 </div>
+            </div>
+            {% endif %}
+
+            {% if pagination %}
+            <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-3">
+                <p class="text-muted small mb-0">
+                    {% if pagination.total_items %}
+                    当前显示第 {{ pagination.page }} / {{ pagination.total_pages }} 页，{{ pagination.start_item }} - {{ pagination.end_item }} / {{ pagination.total_items }} 条；原文预览同步按当前页展示
+                    {% else %}
+                    当前没有可显示的片段
+                    {% endif %}
+                </p>
+                {{ render_pagination(pagination) }}
             </div>
             {% endif %}
 
@@ -375,6 +424,11 @@
                             </tbody>
                         </table>
                     </div>
+                    {% if pagination %}
+                    <div class="d-flex justify-content-end mt-3">
+                        {{ render_pagination(pagination) }}
+                    </div>
+                    {% endif %}
                     {% else %}
                     <p class="mb-0 text-muted">未提取到可匹配的句子。</p>
                     {% endif %}
@@ -502,11 +556,16 @@
         const mainContent = document.querySelector('.main-content');
         const closeBtn = document.getElementById('closePanel');
         const editableCells = document.querySelectorAll('.editable-target');
+        const pageNavLinks = document.querySelectorAll('.page-nav-link');
         const btnSaveProgress = document.getElementById('btnSaveProgress');
-        const documentId = document.body.dataset.documentId;
+        const fileRecordId = document.body.dataset.fileRecordId;
 
         // 跟踪修改的条目
         const modifiedEntries = new Map();
+
+        function hasUnsavedChanges() {
+            return modifiedEntries.size > 0;
+        }
 
         // 简单的字符级 diff 算法
         function computeDiff(oldText, newText) {
@@ -655,9 +714,29 @@
             }
         }
 
+        pageNavLinks.forEach(link => {
+            link.addEventListener('click', (event) => {
+                if (!hasUnsavedChanges()) {
+                    return;
+                }
+                const confirmed = confirm('当前页有未保存修改，翻页后会丢失。是否继续？');
+                if (!confirmed) {
+                    event.preventDefault();
+                }
+            });
+        });
+
+        window.addEventListener('beforeunload', (event) => {
+            if (!hasUnsavedChanges()) {
+                return;
+            }
+            event.preventDefault();
+            event.returnValue = '';
+        });
+
         // 保存进度到数据库
         btnSaveProgress.addEventListener('click', async () => {
-            if (!documentId) {
+            if (!fileRecordId) {
                 alert('文档未保存，无法保存进度。请先上传文档创建任务。');
                 return;
             }
@@ -676,7 +755,7 @@
             btnSaveProgress.innerHTML = '⏳ 保存中...';
 
             try {
-                const response = await fetch(`/api/documents/${documentId}/segments`, {
+                const response = await fetch(`/api/file-records/${fileRecordId}/segments`, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ updates }),

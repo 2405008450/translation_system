@@ -1,5 +1,6 @@
 import logging
 from time import perf_counter
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse
@@ -9,7 +10,13 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.database import get_db
 from app.services.document_workspace import build_docx_workspace, build_document_html_from_segments
-from app.services.document_service import create_document_with_segments, create_txt_document_with_segments, get_document_with_segments, list_documents
+from app.services.file_record_service import (
+    count_file_records,
+    create_file_record_with_segments,
+    create_txt_file_record_with_segments,
+    get_file_record_with_segments,
+    list_file_records,
+)
 from app.services.file_parser import parse_uploaded_file
 from app.services.matcher import match_sentences_with_stats
 from app.services.sentence_splitter import split_sentences
@@ -20,6 +27,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
 settings = get_settings()
+
+DEFAULT_TASKS_PAGE_SIZE = 24
+MAX_TASKS_PAGE_SIZE = 100
+DEFAULT_SEGMENTS_PAGE_SIZE = 200
+MAX_SEGMENTS_PAGE_SIZE = 500
 
 
 def _render_index(
@@ -39,42 +51,47 @@ def _render_index(
     )
 
 
-@router.get("/", response_class=HTMLResponse)
-def index(request: Request) -> HTMLResponse:
-    return _render_index(request)
+def _clamp_page(page: int) -> int:
+    return max(page, 1)
 
 
-@router.get("/tasks", response_class=HTMLResponse)
-def tasks_list(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
-    """任务列表页面"""
-    documents = list_documents(db, skip=0, limit=100)
-    return templates.TemplateResponse(
-        request,
-        "tasks.html",
-        {"request": request, "documents": documents},
-    )
+def _clamp_page_size(page_size: int, default: int, maximum: int) -> int:
+    if page_size < 1:
+        return default
+    return min(page_size, maximum)
 
 
-@router.get("/tasks/{document_id}", response_class=HTMLResponse)
-def continue_task(
-    request: Request,
-    document_id: int,
-    db: Session = Depends(get_db),
-) -> HTMLResponse:
-    """继续翻译任务"""
-    result = get_document_with_segments(db, document_id)
-    if not result:
-        return templates.TemplateResponse(
-            request,
-            "tasks.html",
-            {"request": request, "documents": list_documents(db), "error_message": "任务不存在"},
-        )
+def _build_pagination(base_path: str, page: int, page_size: int, total_items: int) -> dict:
+    total_pages = max(1, (total_items + page_size - 1) // page_size) if total_items else 1
+    current_page = min(_clamp_page(page), total_pages)
+    start_item = 0 if total_items == 0 else (current_page - 1) * page_size + 1
+    end_item = 0 if total_items == 0 else min(current_page * page_size, total_items)
+    page_start = max(1, current_page - 2)
+    page_end = min(total_pages, current_page + 2)
 
-    doc = result["document"]
-    segments = result["segments"]
+    def make_url(target_page: int) -> str:
+        return f"{base_path}?page={target_page}&page_size={page_size}"
 
-    # 转换 segments 为 results 格式
-    results = [
+    return {
+        "page": current_page,
+        "page_size": page_size,
+        "total_items": total_items,
+        "total_pages": total_pages,
+        "start_item": start_item,
+        "end_item": end_item,
+        "has_prev": current_page > 1,
+        "has_next": current_page < total_pages,
+        "prev_page": current_page - 1,
+        "next_page": current_page + 1,
+        "prev_url": make_url(current_page - 1) if current_page > 1 else None,
+        "next_url": make_url(current_page + 1) if current_page < total_pages else None,
+        "page_numbers": list(range(page_start, page_end + 1)),
+        "page_urls": {target_page: make_url(target_page) for target_page in range(page_start, page_end + 1)},
+    }
+
+
+def _build_match_results(segments) -> list:
+    return [
         type("MatchResult", (), {
             "source_sentence": seg.display_text,
             "status": seg.status,
@@ -86,7 +103,92 @@ def continue_task(
         for seg in segments
     ]
 
-    # 从 segments 重建预览 HTML
+
+def _render_tasks_list(
+    request: Request,
+    db: Session,
+    page: int = 1,
+    page_size: int = DEFAULT_TASKS_PAGE_SIZE,
+    error_message: str | None = None,
+) -> HTMLResponse:
+    safe_page = _clamp_page(page)
+    safe_page_size = _clamp_page_size(page_size, DEFAULT_TASKS_PAGE_SIZE, MAX_TASKS_PAGE_SIZE)
+    total_file_records = count_file_records(db)
+    pagination = _build_pagination("/tasks", safe_page, safe_page_size, total_file_records)
+    file_records = list_file_records(
+        db,
+        skip=(pagination["page"] - 1) * safe_page_size,
+        limit=safe_page_size,
+    )
+    return templates.TemplateResponse(
+        request,
+        "tasks.html",
+        {
+            "request": request,
+            "file_records": file_records,
+            "pagination": pagination,
+            "error_message": error_message,
+        },
+    )
+
+
+@router.get("/", response_class=HTMLResponse)
+def index(request: Request) -> HTMLResponse:
+    return _render_index(request)
+
+
+@router.get("/tasks", response_class=HTMLResponse)
+def tasks_list(
+    request: Request,
+    page: int = 1,
+    page_size: int = DEFAULT_TASKS_PAGE_SIZE,
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    """任务列表页面"""
+    return _render_tasks_list(request, db=db, page=page, page_size=page_size)
+
+
+@router.get("/tasks/{file_record_id}", response_class=HTMLResponse)
+def continue_task(
+    request: Request,
+    file_record_id: UUID,
+    page: int = 1,
+    page_size: int = DEFAULT_SEGMENTS_PAGE_SIZE,
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    """继续翻译任务"""
+    safe_page = _clamp_page(page)
+    safe_page_size = _clamp_page_size(page_size, DEFAULT_SEGMENTS_PAGE_SIZE, MAX_SEGMENTS_PAGE_SIZE)
+    result = get_file_record_with_segments(
+        db,
+        file_record_id,
+        skip=(safe_page - 1) * safe_page_size,
+        limit=safe_page_size,
+    )
+    if not result:
+        return _render_tasks_list(request, db=db, error_message="任务不存在")
+
+    pagination = _build_pagination(
+        f"/tasks/{file_record_id}",
+        safe_page,
+        safe_page_size,
+        result["total_segments"],
+    )
+    if pagination["page"] != safe_page:
+        result = get_file_record_with_segments(
+            db,
+            file_record_id,
+            skip=(pagination["page"] - 1) * safe_page_size,
+            limit=safe_page_size,
+        )
+
+    file_record = result["file_record"]
+    segments = result["segments"]
+
+    # 转换 segments 为 results 格式
+    results = _build_match_results(segments)
+
+    # 从当前页 segments 重建预览 HTML，避免一次性渲染整份文档
     document_html = build_document_html_from_segments(segments) if segments else ""
     supports_preview = bool(document_html)
 
@@ -95,14 +197,15 @@ def continue_task(
         "result.html",
         {
             "request": request,
-            "filename": doc.filename,
+            "filename": file_record.filename,
             "threshold": 0.6,
-            "sentence_count": len(results),
+            "sentence_count": result["total_segments"],
             "results": results,
             "performance_summary": None,
             "document_html": document_html,
             "is_docx": supports_preview,
-            "document_id": document_id,
+            "file_record_id": file_record_id,
+            "pagination": pagination,
         },
     )
 
@@ -120,7 +223,7 @@ async def upload_and_match(
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
     is_docx_file = extension == ".docx"
     document_html = ""
-    document_id = None
+    file_record_id = None
 
     parse_started_at = perf_counter()
 
@@ -130,21 +233,24 @@ async def upload_and_match(
         if not raw_bytes:
             raise HTTPException(status_code=400, detail="文件为空。")
 
-        # 创建持久化文档
-        document = create_document_with_segments(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=file.filename or "untitled.docx",
-            similarity_threshold=threshold,
-        )
-        document_id = document.id
-
-        # 重新获取 workspace 数据用于渲染（包含 document_html）
+        workspace_started_at = perf_counter()
         workspace_data = build_docx_workspace(
             db=db,
             raw_bytes=raw_bytes,
             similarity_threshold=threshold,
         )
+        route_match_ms = (perf_counter() - workspace_started_at) * 1000
+
+        # 使用预计算的 workspace 数据创建持久化文档，避免重复解析和匹配
+        file_record = create_file_record_with_segments(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=file.filename or "untitled.docx",
+            similarity_threshold=threshold,
+            workspace_data=workspace_data,
+        )
+        file_record_id = file_record.id
+
         document_html = workspace_data["document_html"]
         # 转换 segments 为 results 格式
         results = [
@@ -161,7 +267,6 @@ async def upload_and_match(
         match_stats = type("MatchStats", (), workspace_data["match_stats"])()
         parse_ms = (perf_counter() - parse_started_at) * 1000
         split_ms = 0.0
-        route_match_ms = parse_ms
     else:
         # TXT: 使用原有逻辑
         try:
@@ -183,23 +288,18 @@ async def upload_and_match(
         route_match_ms = (perf_counter() - match_started_at) * 1000
 
         # 创建 TXT 文档记录并保存片段
-        document = create_txt_document_with_segments(
+        file_record = create_txt_file_record_with_segments(
             db=db,
             content=content,
             filename=file.filename or "untitled.txt",
             results=results,
         )
-        document_id = document.id
+        file_record_id = file_record.id
 
         # 为结果添加 sentence_id 并生成预览 HTML
         for i, r in enumerate(results):
             r.sentence_id = f"sent-{i+1:05d}"
         
-        # 获取保存后的 segments 生成预览 HTML
-        doc_result = get_document_with_segments(db, document_id)
-        if doc_result:
-            document_html = build_document_html_from_segments(doc_result["segments"])
-
     logger.info(
         "match request file=%s total=%s prepared=%s unique=%s exact=%s fuzzy=%s none=%s "
         "parse_ms=%.2f split_ms=%.2f exact_ms=%.2f fuzzy_ms=%.2f route_match_ms=%.2f total_match_ms=%.2f candidates=%s",
@@ -226,6 +326,27 @@ async def upload_and_match(
         "stats": match_stats,
     }
 
+    sentence_count = len(results)
+    pagination = None
+    display_results = results
+
+    if file_record_id is not None:
+        pagination = _build_pagination(
+            f"/tasks/{file_record_id}",
+            page=1,
+            page_size=DEFAULT_SEGMENTS_PAGE_SIZE,
+            total_items=sentence_count,
+        )
+        doc_result = get_file_record_with_segments(
+            db,
+            file_record_id,
+            skip=0,
+            limit=pagination["page_size"],
+        )
+        if doc_result:
+            display_results = _build_match_results(doc_result["segments"])
+            document_html = build_document_html_from_segments(doc_result["segments"]) if doc_result["segments"] else ""
+
     # 只要有 document_html 就支持预览
     supports_preview = bool(document_html)
 
@@ -236,12 +357,13 @@ async def upload_and_match(
             "request": request,
             "filename": file.filename,
             "threshold": threshold,
-            "sentence_count": len(results),
-            "results": results,
+            "sentence_count": sentence_count,
+            "results": display_results,
             "performance_summary": performance_summary,
             "document_html": document_html,
             "is_docx": supports_preview,
-            "document_id": document_id,
+            "file_record_id": file_record_id,
+            "pagination": pagination,
         },
     )
 

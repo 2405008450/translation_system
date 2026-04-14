@@ -1,9 +1,12 @@
--- 创建文档表和片段表
--- 执行前请确认连接的是正确的数据库
-
--- 文档表
-CREATE TABLE IF NOT EXISTS documents (
-    id BIGSERIAL PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS file_records (
+    id UUID PRIMARY KEY DEFAULT (
+        lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
+        lpad(to_hex(floor(random() * 65536)::int), 4, '0') || '-' ||
+        '4' || substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        substr('89ab', floor(random() * 4)::int + 1, 1) ||
+        substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
+    )::uuid,
     filename VARCHAR(255) NOT NULL,
     file_hash VARCHAR(64),
     status VARCHAR(20) NOT NULL DEFAULT 'draft',
@@ -11,10 +14,16 @@ CREATE TABLE IF NOT EXISTS documents (
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
--- 片段表
 CREATE TABLE IF NOT EXISTS segments (
-    id BIGSERIAL PRIMARY KEY,
-    document_id BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    id UUID PRIMARY KEY DEFAULT (
+        lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
+        lpad(to_hex(floor(random() * 65536)::int), 4, '0') || '-' ||
+        '4' || substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        substr('89ab', floor(random() * 4)::int + 1, 1) ||
+        substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
+    )::uuid,
+    file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
     sentence_id VARCHAR(20) NOT NULL,
     source_text TEXT NOT NULL,
     display_text TEXT NOT NULL,
@@ -31,21 +40,20 @@ CREATE TABLE IF NOT EXISTS segments (
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
--- 索引
-CREATE INDEX IF NOT EXISTS ix_segments_document_id ON segments(document_id);
+CREATE INDEX IF NOT EXISTS ix_segments_file_record_id
+    ON segments (file_record_id);
 
--- 更新时间触发器（可选，用于自动更新 updated_at）
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at = NOW();
     RETURN NEW;
 END;
-$$ language 'plpgsql';
+$$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS update_documents_updated_at ON documents;
-CREATE TRIGGER update_documents_updated_at
-    BEFORE UPDATE ON documents
+DROP TRIGGER IF EXISTS update_file_records_updated_at ON file_records;
+CREATE TRIGGER update_file_records_updated_at
+    BEFORE UPDATE ON file_records
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 

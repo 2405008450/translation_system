@@ -304,8 +304,10 @@ def _find_fuzzy_matches_chunk(
     normalized_sentences: list[str],
     similarity_threshold: float,
 ):
+    trigram_prefilter_threshold = _get_trigram_prefilter_threshold(similarity_threshold)
     params = {
         "candidate_limit": FUZZY_CANDIDATE_LIMIT,
+        "trigram_limit": trigram_prefilter_threshold,
     }
     value_rows: list[str] = []
 
@@ -331,19 +333,24 @@ def _find_fuzzy_matches_chunk(
                 tm.source_normalized AS compare_text,
                 tm.source_text,
                 tm.target_text,
-                GREATEST(
-                    similarity(tm.source_normalized, input.query_text),
-                    1 - (tm.source_normalized <-> input.query_text)
-                ) AS trigram_score
+                similarity(tm.source_normalized, input.query_text) AS trigram_score
             FROM translation_memory AS tm
             WHERE tm.source_normalized IS NOT NULL
-            ORDER BY tm.source_normalized <-> input.query_text
+              AND tm.source_normalized % input.query_text
+            ORDER BY similarity(tm.source_normalized, input.query_text) DESC, tm.updated_at DESC
             LIMIT :candidate_limit
         ) AS matched ON TRUE
         """
     )
 
+    db.execute(
+        text(
+            "SELECT set_config('pg_trgm.similarity_threshold', CAST(:trigram_limit AS text), true)"
+        ),
+        {"trigram_limit": trigram_prefilter_threshold},
+    )
     rows = db.execute(stmt, params).mappings().all()
+
     grouped_candidates: dict[str, list[dict]] = {}
     for row in rows:
         if row["source_text"] is None or row["target_text"] is None:
@@ -391,6 +398,10 @@ def _pick_best_fuzzy_candidate(
         return best_candidate
 
     return None
+
+
+def _get_trigram_prefilter_threshold(similarity_threshold: float) -> float:
+    return min(max(similarity_threshold, 0.01), 0.3)
 
 
 def _chunked(items: list[str], chunk_size: int) -> list[list[str]]:
