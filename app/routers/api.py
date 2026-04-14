@@ -131,12 +131,18 @@ def get_file_records(
     ]
 
 
+<<<<<<< HEAD
 @router.get("/file-records/{file_record_id}")
 @router.get("/documents/{file_record_id}", include_in_schema=False)
 def get_file_record(
     file_record_id: UUID,
     skip: int = 0,
     limit: int = 200,
+=======
+@router.get("/documents/{document_id}")
+def get_document(
+    document_id: UUID,
+>>>>>>> 506e4e1 (移除 __pycache__ 追踪)
     db: Session = Depends(get_db),
 ):
     """获取文档详情及片段，支持分页"""
@@ -185,7 +191,11 @@ def get_file_record(
 @router.put("/file-records/{file_record_id}/segments/{sentence_id}")
 @router.put("/documents/{file_record_id}/segments/{sentence_id}", include_in_schema=False)
 def update_segment(
+<<<<<<< HEAD
     file_record_id: UUID,
+=======
+    document_id: UUID,
+>>>>>>> 506e4e1 (移除 __pycache__ 追踪)
     sentence_id: str,
     update: SegmentUpdate,
     db: Session = Depends(get_db),
@@ -213,7 +223,11 @@ def update_segment(
 @router.put("/file-records/{file_record_id}/segments")
 @router.put("/documents/{file_record_id}/segments", include_in_schema=False)
 def batch_update(
+<<<<<<< HEAD
     file_record_id: UUID,
+=======
+    document_id: UUID,
+>>>>>>> 506e4e1 (移除 __pycache__ 追踪)
     batch: BatchSegmentUpdate,
     db: Session = Depends(get_db),
 ):
@@ -226,10 +240,16 @@ def batch_update(
     return {"updated_count": updated_count}
 
 
+<<<<<<< HEAD
 @router.delete("/file-records/{file_record_id}")
 @router.delete("/documents/{file_record_id}", include_in_schema=False)
 def remove_file_record(
     file_record_id: UUID,
+=======
+@router.delete("/documents/{document_id}")
+def remove_document(
+    document_id: UUID,
+>>>>>>> 506e4e1 (移除 __pycache__ 追踪)
     db: Session = Depends(get_db),
 ):
     """删除文档及其所有片段"""

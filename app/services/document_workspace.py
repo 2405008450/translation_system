@@ -68,6 +68,7 @@ def build_docx_workspace(
             segment["score"] = match.score
             segment["matched_source_text"] = match.matched_source_text
             segment["target_text"] = match.target_text or ""
+            segment["fuzzy_candidates"] = match.fuzzy_candidates or []
 
     return {
         "document_html": "".join(html_parts) or '<p class="doc-paragraph doc-empty"><br></p>',
@@ -169,6 +170,7 @@ def _render_paragraph(
                 "score": 0.0,
                 "matched_source_text": None,
                 "target_text": "",
+                "fuzzy_candidates": [],
                 "block_type": block_type,
                 "block_index": block_index,
                 "row_index": row_index,

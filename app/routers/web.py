@@ -61,6 +61,7 @@ def _clamp_page_size(page_size: int, default: int, maximum: int) -> int:
     return min(page_size, maximum)
 
 
+<<<<<<< HEAD
 def _build_pagination(base_path: str, page: int, page_size: int, total_items: int) -> dict:
     total_pages = max(1, (total_items + page_size - 1) // page_size) if total_items else 1
     current_page = min(_clamp_page(page), total_pages)
@@ -68,6 +69,22 @@ def _build_pagination(base_path: str, page: int, page_size: int, total_items: in
     end_item = 0 if total_items == 0 else min(current_page * page_size, total_items)
     page_start = max(1, current_page - 2)
     page_end = min(total_pages, current_page + 2)
+=======
+@router.get("/tasks/{document_id}", response_class=HTMLResponse)
+def continue_task(
+    request: Request,
+    document_id: UUID,
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    """继续翻译任务"""
+    result = get_document_with_segments(db, document_id)
+    if not result:
+        return templates.TemplateResponse(
+            request,
+            "tasks.html",
+            {"request": request, "documents": list_documents(db), "error_message": "任务不存在"},
+        )
+>>>>>>> 506e4e1 (移除 __pycache__ 追踪)
 
     def make_url(target_page: int) -> str:
         return f"{base_path}?page={target_page}&page_size={page_size}"
@@ -99,6 +116,7 @@ def _build_match_results(segments) -> list:
             "matched_source_text": seg.matched_source_text,
             "target_text": seg.target_text,
             "sentence_id": seg.sentence_id,
+            "fuzzy_candidates": [],  # 从数据库恢复时没有候选数据
         })()
         for seg in segments
     ]
@@ -261,6 +279,7 @@ async def upload_and_match(
                 "matched_source_text": seg["matched_source_text"],
                 "target_text": seg["target_text"],
                 "sentence_id": seg["sentence_id"],
+                "fuzzy_candidates": seg.get("fuzzy_candidates", []),
             })()
             for seg in workspace_data["segments"]
         ]

@@ -97,7 +97,11 @@
                             更新时间：{{ doc.updated_at.strftime('%Y-%m-%d %H:%M') }}
                         </p>
                         <div class="d-flex gap-2">
+<<<<<<< HEAD
                             <a href="/tasks/{{ doc.id }}?page=1&page_size=200" class="btn btn-primary btn-sm flex-grow-1">继续翻译</a>
+=======
+                            <a href="/tasks/{{ doc.id }}" class="btn btn-primary btn-sm flex-grow-1">继续翻译</a>
+>>>>>>> 506e4e1 (移除 __pycache__ 追踪)
                             <button class="btn btn-outline-danger btn-sm" onclick="deleteTask('{{ doc.id }}')">删除</button>
                         </div>
                     </div>

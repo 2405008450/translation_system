@@ -11,7 +11,7 @@
             margin-right: 48px;
         }
         .main-content.panel-open {
-            margin-right: 448px;
+            margin-right: calc(33.33vw + 48px);
         }
         .side-toolbar {
             position: fixed;
@@ -56,8 +56,9 @@
         .diff-panel {
             position: fixed;
             top: 0;
-            right: -400px;
-            width: 400px;
+            right: calc(-33.33vw);
+            width: 33.33vw;
+            min-width: 400px;
             height: 100vh;
             background: #fff;
             box-shadow: -4px 0 12px rgba(0,0,0,0.15);
@@ -96,14 +97,16 @@
             line-height: 1.8;
             word-break: break-word;
         }
-        .diff-content del {
+        .diff-content del,
+        .memory-match-table del {
             background: #fecaca;
             text-decoration: line-through;
             color: #dc2626;
             padding: 0 2px;
             border-radius: 2px;
         }
-        .diff-content ins {
+        .diff-content ins,
+        .memory-match-table ins {
             background: #bbf7d0;
             text-decoration: none;
             color: #16a34a;
@@ -161,7 +164,7 @@
             transition: right 0.3s ease;
         }
         .bottom-tabbar.panel-open {
-            right: 448px; /* 400px panel + 48px toolbar */
+            right: calc(33.33vw + 48px);
         }
         .bottom-tab {
             flex: 0 0 auto;
@@ -220,7 +223,7 @@
             bottom: 44px;
         }
         .preview-panel.panel-open {
-            right: 448px;
+            right: calc(33.33vw + 48px);
         }
         .preview-panel-header {
             padding: 0.75rem 1.25rem;
@@ -291,6 +294,64 @@
         }
         .close-btn:hover {
             color: #000;
+        }
+        /* 记忆匹配表格样式 */
+        .memory-table-wrapper {
+            max-height: calc(100vh - 200px);
+            overflow-y: auto;
+        }
+        .memory-match-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.875rem;
+        }
+        .memory-match-table th,
+        .memory-match-table td {
+            border: 1px solid #dee2e6;
+            padding: 0.75rem;
+            vertical-align: top;
+            word-break: break-word;
+        }
+        .memory-match-table thead th {
+            background: #f8f9fa;
+            font-weight: 600;
+            position: sticky;
+            top: 0;
+            z-index: 1;
+        }
+        .memory-match-table tbody tr:hover {
+            background: rgba(13, 110, 253, 0.05);
+        }
+        .match-score {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-weight: 600;
+            font-size: 0.8rem;
+            text-align: center;
+            min-width: 50px;
+        }
+        .match-score.exact {
+            background: #198754;
+            color: #fff;
+        }
+        .match-score.high {
+            background: #8bc34a;
+            color: #fff;
+        }
+        .match-score.medium {
+            background: #ffc107;
+            color: #212529;
+        }
+        .match-score.low {
+            background: #ff9800;
+            color: #fff;
+        }
+        .no-match-hint {
+            padding: 2rem;
+            text-align: center;
+            background: #f8f9fa;
+            border-radius: 8px;
         }
     </style>
 </head>
@@ -388,16 +449,17 @@
                         <table class="table table-striped table-hover align-middle">
                             <thead class="table-dark">
                                 <tr>
+                                    <th style="width: 50px;">#</th>
                                     <th>原文句子</th>
                                     <th>状态</th>
                                     <th>匹配度</th>
-                                    <th>匹配到的原文</th>
                                     <th>对应译文</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 {% for item in results %}
                                 <tr data-index="{{ loop.index0 }}" data-sentence-id="{{ item.sentence_id }}">
+                                    <td>{{ loop.index }}</td>
                                     <td>{{ item.source_sentence }}</td>
                                     <td>
                                         {% if item.status == "exact" %}
@@ -409,7 +471,6 @@
                                         {% endif %}
                                     </td>
                                     <td>{{ "%.4f"|format(item.score) }}</td>
-                                    <td>{{ item.matched_source_text or "-" }}</td>
                                     <td>
                                         <div class="editable-target" 
                                              contenteditable="true"
@@ -417,6 +478,8 @@
                                              data-matched="{{ item.matched_source_text or '' }}"
                                              data-original="{{ item.target_text or '' }}"
                                              data-status="{{ item.status }}"
+                                             data-score="{{ item.score }}"
+                                             data-fuzzy-candidates='{{ item.fuzzy_candidates | tojson }}'
                                              data-sentence-id="{{ item.sentence_id }}">{{ item.target_text or "" }}</div>
                                     </td>
                                 </tr>
@@ -527,25 +590,29 @@
 
     <div class="diff-panel" id="diffPanel">
         <div class="diff-panel-header">
-            <h5 class="mb-0">记忆对比</h5>
+            <h5 class="mb-0">记忆匹配</h5>
             <button class="close-btn" id="closePanel">&times;</button>
         </div>
         <div class="diff-panel-body">
             <div class="diff-section">
-                <div class="diff-section-title">当前原文</div>
-                <div class="diff-content" id="currentSource"></div>
-            </div>
-            <div class="diff-section">
-                <div class="diff-section-title">匹配到的原文</div>
-                <div class="diff-content" id="matchedSource"></div>
-            </div>
-            <div class="diff-section">
-                <div class="diff-section-title">原文差异对比</div>
-                <div class="diff-content" id="diffResult"></div>
-            </div>
-            <div class="diff-section">
-                <div class="diff-section-title">记忆库译文</div>
-                <div class="diff-content" id="targetText"></div>
+                <div class="diff-section-title">匹配结果</div>
+                <div class="memory-table-wrapper">
+                    <table class="memory-match-table" id="memoryMatchTable">
+                        <thead>
+                            <tr>
+                                <th style="width: 40px;">#</th>
+                                <th>原文差异对比</th>
+                                <th style="width: 70px;">匹配度</th>
+                                <th>记忆库译文</th>
+                            </tr>
+                        </thead>
+                        <tbody id="memoryMatchBody">
+                        </tbody>
+                    </table>
+                    <div class="no-match-hint" id="noMatchHint" style="display:none;">
+                        <span class="text-muted">无超过阈值的匹配结果</span>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -632,18 +699,80 @@
             return html;
         }
 
-        function openPanel(source, matched, target, status) {
-            document.getElementById('currentSource').textContent = source || '-';
-            document.getElementById('matchedSource').textContent = matched || '-';
-            // 没匹配到时记忆库译文显示 -
-            document.getElementById('targetText').textContent = (status === 'none' || !matched) ? '-' : (target || '-');
-
-            if (matched && source && status === 'fuzzy') {
-                document.getElementById('diffResult').innerHTML = computeDiff(matched, source);
-            } else if (status === 'exact') {
-                document.getElementById('diffResult').innerHTML = '<span class="text-success">完全匹配</span>';
+        function openPanel(source, matched, target, status, score, fuzzyCandidates) {
+            const memoryMatchBody = document.getElementById('memoryMatchBody');
+            const noMatchHint = document.getElementById('noMatchHint');
+            
+            // 清空表格
+            memoryMatchBody.innerHTML = '';
+            
+            // 获取阈值
+            const threshold = {{ threshold }};
+            const scoreNum = parseFloat(score) || 0;
+            
+            // 解析fuzzy candidates
+            let candidates = [];
+            if (fuzzyCandidates) {
+                try {
+                    candidates = JSON.parse(fuzzyCandidates);
+                    console.log('Parsed fuzzy candidates:', candidates);
+                } catch (e) {
+                    console.error('Failed to parse fuzzy candidates:', e, fuzzyCandidates);
+                    candidates = [];
+                }
             } else {
-                document.getElementById('diffResult').innerHTML = '<span class="text-muted">无匹配数据</span>';
+                console.log('No fuzzy candidates data');
+            }
+            
+            // 如果是exact匹配，显示一条100%的记录
+            if (status === 'exact' && matched) {
+                noMatchHint.style.display = 'none';
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>1</td>
+                    <td>${escapeHtml(matched)}</td>
+                    <td><span class="match-score exact">100%</span></td>
+                    <td>${escapeHtml(target) || '-'}</td>
+                `;
+                memoryMatchBody.appendChild(row);
+            }
+            // 如果有fuzzy candidates，展示所有超过阈值的
+            else if (candidates.length > 0) {
+                noMatchHint.style.display = 'none';
+                
+                candidates.forEach((candidate, index) => {
+                    const candScore = parseFloat(candidate.score) || 0;
+                    if (candScore < threshold) return;
+                    
+                    // 计算差异对比
+                    const diffHtml = computeDiff(candidate.source_text, source);
+                    
+                    // 确定匹配度颜色
+                    let scoreClass = 'low';
+                    if (candScore >= 1.0) {
+                        scoreClass = 'exact';
+                    } else if (candScore >= 0.85) {
+                        scoreClass = 'high';
+                    } else if (candScore >= 0.7) {
+                        scoreClass = 'medium';
+                    }
+                    
+                    const row = document.createElement('tr');
+                    row.innerHTML = `
+                        <td>${index + 1}</td>
+                        <td>${diffHtml}</td>
+                        <td><span class="match-score ${scoreClass}">${Math.round(candScore * 100)}%</span></td>
+                        <td>${escapeHtml(candidate.target_text) || '-'}</td>
+                    `;
+                    memoryMatchBody.appendChild(row);
+                });
+                
+                // 如果过滤后没有结果
+                if (memoryMatchBody.children.length === 0) {
+                    noMatchHint.style.display = 'block';
+                }
+            } else {
+                noMatchHint.style.display = 'block';
             }
 
             panel.classList.add('open');
@@ -652,6 +781,13 @@
             const pp = document.getElementById('previewPanel');
             if (pp) pp.classList.add('panel-open');
             btnMemory.classList.add('active');
+        }
+        
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
         }
 
         function closePanel() {
@@ -672,7 +808,9 @@
                 const matched = cell.dataset.matched;
                 const tmTarget = cell.dataset.original;  // 记忆库原始译文
                 const status = cell.dataset.status;
-                openPanel(source, matched, tmTarget, status);
+                const score = cell.dataset.score;
+                const fuzzyCandidates = cell.dataset.fuzzyCandidates;
+                openPanel(source, matched, tmTarget, status, score, fuzzyCandidates);
             });
 
             // 输入时标记修改状态
@@ -813,10 +951,12 @@
                                 cell.dataset.source,
                                 cell.dataset.matched,
                                 cell.dataset.original,
-                                cell.dataset.status
+                                cell.dataset.status,
+                                cell.dataset.score,
+                                cell.dataset.fuzzyCandidates
                             );
                         } else {
-                            openPanel('', '', '', 'none');
+                            openPanel('', '', '', 'none', '0', '[]');
                         }
                     }
                 } else {

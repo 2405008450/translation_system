@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from collections.abc import Iterable
 from time import perf_counter
@@ -13,7 +13,8 @@ from app.services.normalizer import build_source_hash, normalize_match_text, nor
 
 EXACT_MATCH_BATCH_SIZE = 1000
 FUZZY_MATCH_BATCH_SIZE = 200
-FUZZY_CANDIDATE_LIMIT = 3
+FUZZY_CANDIDATE_LIMIT = 10  # 增加候选数量以获取更多匹配
+MAX_FUZZY_RESULTS = 5  # 最多返回5条模糊匹配结果
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class ResolvedMatch:
     score: float
     matched_source_text: str | None
     target_text: str | None
+    fuzzy_candidates: tuple = field(default_factory=tuple)  # 所有超过阈值的模糊匹配候选
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,14 @@ def match_sentences_with_stats(
             score=resolved_matches[sentence.match_text].score,
             matched_source_text=resolved_matches[sentence.match_text].matched_source_text,
             target_text=resolved_matches[sentence.match_text].target_text,
+            fuzzy_candidates=[
+                {
+                    "source_text": c["source_text"],
+                    "target_text": c["target_text"],
+                    "score": round(float(c["score"]), 4),
+                }
+                for c in (resolved_matches[sentence.match_text].fuzzy_candidates or ())
+            ],
         )
         for sentence in prepared_sentences
     ]
@@ -200,11 +210,14 @@ def _resolve_matches(
     for match_text, sentence in unresolved_sentences.items():
         fuzzy_match = fuzzy_matches.get(sentence.match_text)
         if fuzzy_match:
+            best = fuzzy_match["best"]
+            all_candidates = fuzzy_match["all_candidates"]
             resolved_matches[match_text] = ResolvedMatch(
                 status="fuzzy",
-                score=round(float(fuzzy_match["score"]), 4),
-                matched_source_text=fuzzy_match["source_text"],
-                target_text=fuzzy_match["target_text"],
+                score=round(float(best["score"]), 4),
+                matched_source_text=best["source_text"],
+                target_text=best["target_text"],
+                fuzzy_candidates=tuple(all_candidates),
             )
             fuzzy_hits += 1
             continue
@@ -214,6 +227,7 @@ def _resolve_matches(
             score=0.0,
             matched_source_text=None,
             target_text=None,
+            fuzzy_candidates=(),
         )
         none_hits += 1
 
@@ -359,13 +373,16 @@ def _find_fuzzy_matches_chunk(
 
     matches = {}
     for query_text, candidates in grouped_candidates.items():
-        best_candidate = _pick_best_fuzzy_candidate(
+        best_candidate, all_candidates = _pick_best_fuzzy_candidate(
             query_text=query_text,
             candidates=candidates,
             similarity_threshold=similarity_threshold,
         )
         if best_candidate:
-            matches[query_text] = best_candidate
+            matches[query_text] = {
+                "best": best_candidate,
+                "all_candidates": all_candidates,
+            }
 
     candidate_count = sum(len(candidates) for candidates in grouped_candidates.values())
     return matches, candidate_count
@@ -376,8 +393,8 @@ def _pick_best_fuzzy_candidate(
     candidates: list[dict],
     similarity_threshold: float,
 ):
-    best_candidate = None
-    best_score = 0.0
+    """返回最佳候选和所有超过阈值的候选列表"""
+    scored_candidates = []
 
     for candidate in candidates:
         compare_text = normalize_match_text(candidate["compare_text"]) or candidate["compare_text"]
@@ -385,19 +402,33 @@ def _pick_best_fuzzy_candidate(
         trigram_score = float(candidate["trigram_score"])
         final_score = max(trigram_score, sequence_score)
 
-        if final_score > best_score:
-            best_score = final_score
-            best_candidate = {
+        if final_score >= similarity_threshold:
+            scored_candidates.append({
                 "query_text": query_text,
                 "source_text": candidate["source_text"],
                 "target_text": candidate["target_text"],
                 "score": final_score,
-            }
+            })
 
-    if best_candidate and best_score >= similarity_threshold:
-        return best_candidate
+    if not scored_candidates:
+        return None, []
 
-    return None
+    # 按分数降序排序
+    scored_candidates.sort(key=lambda x: x["score"], reverse=True)
+    
+    # 去重（相同source_text只保留最高分的）
+    seen_sources = set()
+    unique_candidates = []
+    for c in scored_candidates:
+        if c["source_text"] not in seen_sources:
+            seen_sources.add(c["source_text"])
+            unique_candidates.append(c)
+    
+    # 最多返回5条
+    unique_candidates = unique_candidates[:MAX_FUZZY_RESULTS]
+    
+    best_candidate = unique_candidates[0] if unique_candidates else None
+    return best_candidate, unique_candidates
 
 
 def _get_trigram_prefilter_threshold(similarity_threshold: float) -> float:
