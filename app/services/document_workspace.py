@@ -15,7 +15,7 @@ from app.services.normalizer import normalize_text
 from app.services.sentence_splitter import SENTENCE_ENDINGS
 
 
-TRAILING_SENTENCE_CLOSERS = "\"'”’》】）)]」』"
+TRAILING_SENTENCE_CLOSERS = "\"'》】）)]」』"
 
 
 @dataclass(frozen=True)

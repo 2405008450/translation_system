@@ -1,6 +1,9 @@
+import json
+from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -8,11 +11,22 @@ from app.database import get_db
 from app.services.document_workspace import build_docx_workspace
 from app.services.file_record_service import (
     create_file_record_with_segments,
+    get_file_record as get_file_record_model,
     get_file_record_with_segments,
+    get_tm_target_text_map,
     list_file_records,
+    list_segments_for_file_record,
     update_segment_by_sentence_id,
+    update_segment_with_llm_result,
     batch_update_segments,
     delete_file_record,
+)
+from app.services.llm_service import (
+    LLMConfigurationError,
+    LLMTranslationFailure,
+    LLMTranslationTask,
+    iter_batch_translate,
+    validate_provider_choice,
 )
 from app.services.slate_parser import parse_docx_for_slate
 
@@ -28,6 +42,61 @@ class SegmentUpdate(BaseModel):
 
 class BatchSegmentUpdate(BaseModel):
     updates: list[SegmentUpdate]
+
+
+class LLMTranslateRequest(BaseModel):
+    scope: Literal["fuzzy_only", "none_only", "all"] = "all"
+    provider: Literal["auto", "deepseek", "openrouter"] = "auto"
+
+
+def _sse_event(event: str, payload: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _build_llm_translation_tasks(
+    db: Session,
+    file_record_id: UUID,
+    scope: Literal["fuzzy_only", "none_only", "all"],
+) -> list[LLMTranslationTask]:
+    statuses_by_scope = {
+        "fuzzy_only": {"fuzzy"},
+        "none_only": {"none"},
+        "all": {"fuzzy", "none"},
+    }
+    target_statuses = statuses_by_scope[scope]
+    segments = list_segments_for_file_record(db, file_record_id)
+    tm_target_text_map = get_tm_target_text_map(
+        db,
+        [segment.matched_source_text for segment in segments if segment.matched_source_text],
+    )
+
+    tasks: list[LLMTranslationTask] = []
+    for index, segment in enumerate(segments):
+        if segment.status not in target_statuses:
+            continue
+
+        previous_segment = segments[index - 1] if index > 0 else None
+        next_segment = segments[index + 1] if index + 1 < len(segments) else None
+        tm_target_text = tm_target_text_map.get(
+            segment.matched_source_text or "",
+            segment.target_text if segment.source == "tm" else "",
+        )
+
+        tasks.append(
+            LLMTranslationTask(
+                sentence_id=segment.sentence_id,
+                status=segment.status,
+                source_text=segment.source_text,
+                matched_source_text=segment.matched_source_text,
+                tm_target_text=tm_target_text,
+                previous_source_text=previous_segment.source_text if previous_segment else None,
+                previous_target_text=(previous_segment.target_text or None) if previous_segment else None,
+                next_source_text=next_segment.source_text if next_segment else None,
+                next_target_text=(next_segment.target_text or None) if next_segment else None,
+            )
+        )
+
+    return tasks
 
 
 def _validate_docx_upload(file: UploadFile) -> None:
@@ -224,6 +293,144 @@ def batch_update(
         updates=[u.model_dump() for u in batch.updates],
     )
     return {"updated_count": updated_count}
+
+
+@router.post("/file-records/{file_record_id}/llm-translate")
+@router.post("/documents/{file_record_id}/llm-translate", include_in_schema=False)
+async def llm_translate_file_record(
+    file_record_id: UUID,
+    request: Request,
+    payload: LLMTranslateRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    """对 fuzzy / none 片段触发 LLM 译文修正，并通过 SSE 逐条返回结果。"""
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    body = payload or LLMTranslateRequest()
+    try:
+        validate_provider_choice(body.provider)
+    except LLMConfigurationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    translation_tasks = _build_llm_translation_tasks(
+        db=db,
+        file_record_id=file_record_id,
+        scope=body.scope,
+    )
+
+    async def event_stream():
+        updated_count = 0
+        error_count = 0
+        total_count = len(translation_tasks)
+
+        yield _sse_event(
+            "start",
+            {
+                "file_record_id": str(file_record_id),
+                "scope": body.scope,
+                "provider": body.provider,
+                "total": total_count,
+            },
+        )
+
+        if total_count == 0:
+            yield _sse_event(
+                "complete",
+                {
+                    "file_record_id": str(file_record_id),
+                    "updated_count": 0,
+                    "error_count": 0,
+                    "total": 0,
+                },
+            )
+            return
+
+        async for result in iter_batch_translate(
+            translation_tasks,
+            provider=body.provider,
+        ):
+            if await request.is_disconnected():
+                break
+
+            if isinstance(result, LLMTranslationFailure):
+                error_count += 1
+                yield _sse_event(
+                    "error",
+                    {
+                        "sentence_id": result.sentence_id,
+                        "status": result.status,
+                        "message": result.error_message,
+                    },
+                )
+                continue
+
+            try:
+                segment = update_segment_with_llm_result(
+                    db=db,
+                    file_record_id=file_record_id,
+                    sentence_id=result.sentence_id,
+                    target_text=result.translated_text,
+                )
+            except Exception as exc:  # noqa: BLE001
+                db.rollback()
+                error_count += 1
+                yield _sse_event(
+                    "error",
+                    {
+                        "sentence_id": result.sentence_id,
+                        "status": result.status,
+                        "message": f"数据库更新失败：{exc}",
+                    },
+                )
+                continue
+
+            if not segment:
+                error_count += 1
+                yield _sse_event(
+                    "error",
+                    {
+                        "sentence_id": result.sentence_id,
+                        "status": result.status,
+                        "message": "片段不存在，无法写回 LLM 译文。",
+                    },
+                )
+                continue
+
+            updated_count += 1
+            yield _sse_event(
+                "segment",
+                {
+                    "sentence_id": segment.sentence_id,
+                    "target_text": segment.target_text,
+                    "status": segment.status,
+                    "source": segment.source,
+                    "provider": result.provider,
+                    "model": result.model,
+                },
+            )
+
+        if not await request.is_disconnected():
+            yield _sse_event(
+                "complete",
+                {
+                    "file_record_id": str(file_record_id),
+                    "updated_count": updated_count,
+                    "error_count": error_count,
+                    "total": total_count,
+                },
+            )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.delete("/file-records/{file_record_id}")

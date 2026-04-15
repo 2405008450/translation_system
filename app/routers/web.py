@@ -15,6 +15,7 @@ from app.services.file_record_service import (
     create_file_record_with_segments,
     create_txt_file_record_with_segments,
     get_file_record_with_segments,
+    get_tm_target_text_map,
     list_file_records,
 )
 from app.services.file_parser import parse_uploaded_file
@@ -90,7 +91,11 @@ def _build_pagination(base_path: str, page: int, page_size: int, total_items: in
     }
 
 
-def _build_match_results(segments) -> list:
+def _build_match_results(
+    segments,
+    tm_target_text_map: dict[str, str] | None = None,
+) -> list:
+    target_map = tm_target_text_map or {}
     return [
         type("MatchResult", (), {
             "source_sentence": seg.display_text,
@@ -99,9 +104,20 @@ def _build_match_results(segments) -> list:
             "matched_source_text": seg.matched_source_text,
             "target_text": seg.target_text,
             "sentence_id": seg.sentence_id,
+            "source": seg.source,
+            "tm_target_text": target_map.get(seg.matched_source_text or "", seg.target_text if seg.source == "tm" else ""),
         })()
         for seg in segments
     ]
+
+
+def _build_tm_target_text_map(db: Session, segments) -> dict[str, str]:
+    matched_source_texts = [
+        seg.matched_source_text
+        for seg in segments
+        if getattr(seg, "matched_source_text", None)
+    ]
+    return get_tm_target_text_map(db, matched_source_texts)
 
 
 def _render_tasks_list(
@@ -184,9 +200,10 @@ def continue_task(
 
     file_record = result["file_record"]
     segments = result["segments"]
+    tm_target_text_map = _build_tm_target_text_map(db, segments)
 
     # 转换 segments 为 results 格式
-    results = _build_match_results(segments)
+    results = _build_match_results(segments, tm_target_text_map=tm_target_text_map)
 
     # 从当前页 segments 重建预览 HTML，避免一次性渲染整份文档
     document_html = build_document_html_from_segments(segments) if segments else ""
@@ -261,6 +278,8 @@ async def upload_and_match(
                 "matched_source_text": seg["matched_source_text"],
                 "target_text": seg["target_text"],
                 "sentence_id": seg["sentence_id"],
+                "source": "tm" if seg["status"] in ("exact", "fuzzy") else "none",
+                "tm_target_text": seg["target_text"] if seg["status"] in ("exact", "fuzzy") else "",
             })()
             for seg in workspace_data["segments"]
         ]
@@ -299,6 +318,8 @@ async def upload_and_match(
         # 为结果添加 sentence_id 并生成预览 HTML
         for i, r in enumerate(results):
             r.sentence_id = f"sent-{i+1:05d}"
+            r.source = "tm" if r.status in ("exact", "fuzzy") else "none"
+            r.tm_target_text = r.target_text if r.source == "tm" else ""
         
     logger.info(
         "match request file=%s total=%s prepared=%s unique=%s exact=%s fuzzy=%s none=%s "
@@ -344,7 +365,11 @@ async def upload_and_match(
             limit=pagination["page_size"],
         )
         if doc_result:
-            display_results = _build_match_results(doc_result["segments"])
+            tm_target_text_map = _build_tm_target_text_map(db, doc_result["segments"])
+            display_results = _build_match_results(
+                doc_result["segments"],
+                tm_target_text_map=tm_target_text_map,
+            )
             document_html = build_document_html_from_segments(doc_result["segments"]) if doc_result["segments"] else ""
 
     # 只要有 document_html 就支持预览
