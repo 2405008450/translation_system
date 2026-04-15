@@ -479,7 +479,7 @@
                                              data-original="{{ item.target_text or '' }}"
                                              data-status="{{ item.status }}"
                                              data-score="{{ item.score }}"
-                                             data-fuzzy-candidates='{{ item.fuzzy_candidates | tojson }}'
+                                             data-fuzzy-candidates="{{ item.fuzzy_candidates | tojson | e }}"
                                              data-sentence-id="{{ item.sentence_id }}">{{ item.target_text or "" }}</div>
                                     </td>
                                 </tr>
@@ -714,7 +714,11 @@
             let candidates = [];
             if (fuzzyCandidates) {
                 try {
-                    candidates = JSON.parse(fuzzyCandidates);
+                    // 先解码 HTML 实体
+                    const textarea = document.createElement('textarea');
+                    textarea.innerHTML = fuzzyCandidates;
+                    const decoded = textarea.value;
+                    candidates = JSON.parse(decoded);
                     console.log('Parsed fuzzy candidates:', candidates);
                 } catch (e) {
                     console.error('Failed to parse fuzzy candidates:', e, fuzzyCandidates);
@@ -771,6 +775,33 @@
                 if (memoryMatchBody.children.length === 0) {
                     noMatchHint.style.display = 'block';
                 }
+            }
+            // 如果是fuzzy状态但没有candidates数据，用matched和target显示一条记录
+            else if (status === 'fuzzy' && matched) {
+                noMatchHint.style.display = 'none';
+                const scoreNum = parseFloat(score) || 0;
+                
+                // 计算差异对比
+                const diffHtml = computeDiff(matched, source);
+                
+                // 确定匹配度颜色
+                let scoreClass = 'low';
+                if (scoreNum >= 1.0) {
+                    scoreClass = 'exact';
+                } else if (scoreNum >= 0.85) {
+                    scoreClass = 'high';
+                } else if (scoreNum >= 0.7) {
+                    scoreClass = 'medium';
+                }
+                
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>1</td>
+                    <td>${diffHtml}</td>
+                    <td><span class="match-score ${scoreClass}">${Math.round(scoreNum * 100)}%</span></td>
+                    <td>${escapeHtml(target) || '-'}</td>
+                `;
+                memoryMatchBody.appendChild(row);
             } else {
                 noMatchHint.style.display = 'block';
             }
