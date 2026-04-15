@@ -3,8 +3,16 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from app.models import FileRecord, Segment
+from app.models import FileRecord, Segment, TranslationMemory
 from app.services.document_workspace import build_docx_workspace
+
+
+SEGMENT_ORDERING = (
+    Segment.block_index.asc(),
+    Segment.row_index.asc().nullsfirst(),
+    Segment.cell_index.asc().nullsfirst(),
+    Segment.sentence_id.asc(),
+)
 
 
 def create_file_record_with_segments(
@@ -125,12 +133,7 @@ def get_file_record_with_segments(
     base_query = db.query(Segment).filter(Segment.file_record_id == file_record_id)
     total_segments = base_query.count()
 
-    segments_query = base_query.order_by(
-        Segment.block_index.asc(),
-        Segment.row_index.asc().nullsfirst(),
-        Segment.cell_index.asc().nullsfirst(),
-        Segment.sentence_id.asc(),
-    )
+    segments_query = base_query.order_by(*SEGMENT_ORDERING)
     if safe_skip:
         segments_query = segments_query.offset(safe_skip)
     if limit is not None:
@@ -157,6 +160,59 @@ def list_file_records(db: Session, skip: int = 0, limit: int = 50) -> list[FileR
 
 def count_file_records(db: Session) -> int:
     return db.query(FileRecord).count()
+
+
+def list_segments_for_file_record(
+    db: Session,
+    file_record_id: UUID,
+) -> list[Segment]:
+    return (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id)
+        .order_by(*SEGMENT_ORDERING)
+        .all()
+    )
+
+
+def list_segments_for_llm_translation(
+    db: Session,
+    file_record_id: UUID,
+    scope: str = "all",
+) -> list[Segment]:
+    statuses_by_scope = {
+        "fuzzy_only": ["fuzzy"],
+        "none_only": ["none"],
+        "all": ["fuzzy", "none"],
+    }
+    statuses = statuses_by_scope.get(scope)
+    if statuses is None:
+        raise ValueError(f"不支持的 scope: {scope}")
+
+    return (
+        db.query(Segment)
+        .filter(
+            Segment.file_record_id == file_record_id,
+            Segment.status.in_(statuses),
+        )
+        .order_by(*SEGMENT_ORDERING)
+        .all()
+    )
+
+
+def get_tm_target_text_map(
+    db: Session,
+    source_texts: list[str],
+) -> dict[str, str]:
+    unique_source_texts = [text for text in dict.fromkeys(source_texts) if text]
+    if not unique_source_texts:
+        return {}
+
+    matches = (
+        db.query(TranslationMemory)
+        .filter(TranslationMemory.source_text.in_(unique_source_texts))
+        .all()
+    )
+    return {match.source_text: match.target_text for match in matches}
 
 
 def update_segment_target(
@@ -202,6 +258,21 @@ def update_segment_by_sentence_id(
     db.commit()
     db.refresh(segment)
     return segment
+
+
+def update_segment_with_llm_result(
+    db: Session,
+    file_record_id: UUID,
+    sentence_id: str,
+    target_text: str,
+) -> Segment | None:
+    return update_segment_by_sentence_id(
+        db=db,
+        file_record_id=file_record_id,
+        sentence_id=sentence_id,
+        target_text=target_text,
+        source="llm",
+    )
 
 
 def batch_update_segments(
