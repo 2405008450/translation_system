@@ -1,0 +1,4 @@
+# file: D:\Pychar\demo\translation_system\app\services\adapters\svg_adapter.py
+# hypothesis_version: 6.151.10
+
+['.svg', '//svg:text | //text', '0', '<unknown>', 'baseline-shift', 'dx', 'dy', 'fill', 'font-family', 'font-size', 'font-style', 'font-weight', 'height', 'index', 'stroke', 'svg', 'svg:tspan | tspan', 'svg_element', 'text', 'text-anchor', 'text_count', 'transform', 'tspan', 'unknown', 'viewBox', 'width', 'x', 'y']

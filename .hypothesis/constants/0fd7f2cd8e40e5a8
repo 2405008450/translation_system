@@ -1,0 +1,4 @@
+# file: D:\Pychar\demo\translation_system\app\services\adapters\models.py
+# hypothesis_version: 6.151.10
+
+['block_path', 'children', 'code_block', 'codeblock', 'display_text', 'heading', 'inline', 'list', 'list_item', 'metadata', 'node_type', 'nodes', 'note', 'paragraph', 'position', 'section', 'segment_id', 'shortdesc', 'slide', 'source_format', 'source_text', 'table', 'table_cell', 'table_row', 'text', 'text_content', 'title']

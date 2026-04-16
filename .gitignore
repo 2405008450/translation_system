@@ -1,0 +1,31 @@
+# 环境变量
+.env
+
+# Python 虚拟环境
+.venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Pytest 缓存
+.pytest_cache/
+
+# Hypothesis 测试数据
+.hypothesis/
+
+# IDE 配置
+.idea/
+.vscode/
+
+# Claude 配置
+.claude/
+
+# 数据文件
+*.xlsx
+
+# 数据库文件
+*.db
+*.sqlite3

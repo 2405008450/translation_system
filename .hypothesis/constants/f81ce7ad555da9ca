@@ -1,0 +1,4 @@
+# file: D:\Pychar\demo\translation_system\app\services\adapters\svg_exporter.py
+# hypothesis_version: 6.151.10
+
+[0.3, 100, ' / ', '//svg:text | //text', '<unknown>', 'UTF-8', 'change_ratio', 'message', 'original_length', 'segment_id', 'svg', 'svg:tspan | tspan', 'translated_length', '双语文本可能超出原有空间']

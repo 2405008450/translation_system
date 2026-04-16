@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.database import get_db
-from app.services.document_workspace import build_docx_workspace
+from app.services.document_workspace import build_docx_workspace, build_workspace_with_adapters
 from app.services.file_parser import parse_uploaded_file
 from app.services.matcher import match_sentences_with_stats
 from app.services.sentence_splitter import split_sentences
@@ -122,20 +122,38 @@ async def open_workspace(
     if not 0 <= threshold <= 1:
         raise HTTPException(status_code=400, detail="模糊匹配阈值必须在 0 到 1 之间。")
 
-    extension = f".{(workspace_file.filename or '').split('.')[-1].lower()}" if workspace_file.filename else ""
-    if extension != ".docx":
-        raise HTTPException(status_code=400, detail="可视化工作台目前仅支持 DOCX 文件。")
+    filename = workspace_file.filename or ""
+    extension = f".{filename.split('.')[-1].lower()}" if filename else ""
+    
+    # 支持的格式
+    supported_extensions = {".txt", ".docx", ".pdf", ".pptx", ".dita", ".ditamap", ".xml", ".svg", ".yaml", ".yml", ".json", ".php"}
+    if extension not in supported_extensions:
+        supported_list = ", ".join(sorted(supported_extensions))
+        raise HTTPException(
+            status_code=400, 
+            detail=f"不支持的文件格式 '{extension}'。支持的格式: {supported_list}"
+        )
 
     raw_bytes = await workspace_file.read()
     if not raw_bytes:
-        raise HTTPException(status_code=400, detail="上传的 DOCX 文件为空。")
+        raise HTTPException(status_code=400, detail="上传的文件为空。")
 
     workspace_started_at = perf_counter()
-    workspace_data = build_docx_workspace(
-        db=db,
-        raw_bytes=raw_bytes,
-        similarity_threshold=threshold,
-    )
+    
+    # 使用适配器系统构建工作台
+    try:
+        workspace_data = build_workspace_with_adapters(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            similarity_threshold=threshold,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        logger.exception(f"解析文件失败: {filename}")
+        raise HTTPException(status_code=500, detail=f"解析文件失败: {str(e)}") from e
+    
     workspace_ms = (perf_counter() - workspace_started_at) * 1000
 
     return templates.TemplateResponse(

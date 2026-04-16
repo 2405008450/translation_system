@@ -1,0 +1,4 @@
+# file: D:\Pychar\demo\translation_system\app\services\adapters\docx_adapter.py
+# hypothesis_version: 6.151.10
+
+['"\'"\'》】）)]」』', '.docx', '\\s+', 'block_type', 'cell', 'col_index', 'docx', 'filename', 'paragraph', 'row_count', 'row_index', 'table', 'table_cell', 'utf-8', '}p', '}tbl', '。？！!?.', '文档中未找到可翻译的文本内容']

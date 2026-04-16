@@ -1,0 +1,4 @@
+# file: D:\Pychar\demo\translation_system\app\services\normalizer.py
+# hypothesis_version: 6.151.12
+
+['[^\\S\\n]+', '[。？！!?\\.]+$', '\\n+', '\\s+', 'utf-8']
