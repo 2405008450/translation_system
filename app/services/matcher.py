@@ -1,7 +1,10 @@
+from __future__ import annotations
+
+from collections.abc import Iterable
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from collections.abc import Iterable
 from time import perf_counter
+from typing import TypeVar
 
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -14,6 +17,7 @@ from app.services.normalizer import build_source_hash, normalize_match_text, nor
 EXACT_MATCH_BATCH_SIZE = 1000
 FUZZY_MATCH_BATCH_SIZE = 200
 FUZZY_CANDIDATE_LIMIT = 3
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -76,24 +80,22 @@ def match_sentences_with_stats(
             fuzzy_candidates_evaluated=0,
         )
 
-    unique_sentences = _deduplicate_sentences(prepared_sentences)
     resolved_matches, stats = _resolve_matches(
         db=db,
-        unique_sentences=unique_sentences,
+        prepared_sentences=prepared_sentences,
         similarity_threshold=similarity_threshold,
         total_input_sentences=len(sentences),
-        prepared_sentence_count=len(prepared_sentences),
     )
 
     results = [
         MatchResult(
             source_sentence=sentence.source_sentence,
-            status=resolved_matches[sentence.match_text].status,
-            score=resolved_matches[sentence.match_text].score,
-            matched_source_text=resolved_matches[sentence.match_text].matched_source_text,
-            target_text=resolved_matches[sentence.match_text].target_text,
+            status=match.status,
+            score=match.score,
+            matched_source_text=match.matched_source_text,
+            target_text=match.target_text,
         )
-        for sentence in prepared_sentences
+        for sentence, match in zip(prepared_sentences, resolved_matches, strict=False)
     ]
 
     total_match_ms = (perf_counter() - total_started_at) * 1000
@@ -116,40 +118,30 @@ def _prepare_sentences(sentences: list[str]) -> list[PreparedSentence]:
 
     for sentence in sentences:
         normalized_sentence = normalize_text(sentence)
-        if not normalized_sentence:
-            continue
-
         prepared_sentences.append(
             PreparedSentence(
                 source_sentence=sentence,
                 normalized_sentence=normalized_sentence,
                 match_text=normalize_match_text(sentence) or normalized_sentence,
-                source_hash=build_source_hash(sentence),
+                source_hash=build_source_hash(sentence) if normalized_sentence else "",
             )
         )
 
     return prepared_sentences
 
 
-def _deduplicate_sentences(
-    prepared_sentences: list[PreparedSentence],
-) -> dict[str, PreparedSentence]:
-    unique_sentences: dict[str, PreparedSentence] = {}
-
-    for sentence in prepared_sentences:
-        unique_sentences.setdefault(sentence.match_text, sentence)
-
-    return unique_sentences
-
-
 def _resolve_matches(
     db: Session,
-    unique_sentences: dict[str, PreparedSentence],
+    prepared_sentences: list[PreparedSentence],
     similarity_threshold: float,
     total_input_sentences: int,
-    prepared_sentence_count: int,
-) -> tuple[dict[str, ResolvedMatch], MatchStats]:
-    resolved_matches: dict[str, ResolvedMatch] = {}
+) -> tuple[list[ResolvedMatch], MatchStats]:
+    resolved_matches: list[ResolvedMatch | None] = [None] * len(prepared_sentences)
+    matchable_items = [
+        (index, sentence)
+        for index, sentence in enumerate(prepared_sentences)
+        if sentence.normalized_sentence
+    ]
 
     exact_started_at = perf_counter()
     (
@@ -158,13 +150,24 @@ def _resolve_matches(
         exact_matches_by_source_text,
     ) = _find_exact_matches(
         db,
-        unique_sentences.values(),
+        [sentence for _, sentence in matchable_items],
     )
     exact_phase_ms = (perf_counter() - exact_started_at) * 1000
 
-    unresolved_sentences: dict[str, PreparedSentence] = {}
+    unresolved_items: list[tuple[int, PreparedSentence]] = []
     exact_hits = 0
-    for match_text, sentence in unique_sentences.items():
+    none_hits = 0
+    for index, sentence in enumerate(prepared_sentences):
+        if not sentence.normalized_sentence:
+            resolved_matches[index] = ResolvedMatch(
+                status="none",
+                score=0.0,
+                matched_source_text=None,
+                target_text=None,
+            )
+            none_hits += 1
+            continue
+
         exact_match = exact_matches_by_hash.get(sentence.source_hash)
         if exact_match is None:
             exact_match = exact_matches_by_normalized.get(sentence.normalized_sentence)
@@ -176,7 +179,7 @@ def _resolve_matches(
             exact_match = exact_matches_by_source_text.get(sentence.match_text)
 
         if exact_match:
-            resolved_matches[match_text] = ResolvedMatch(
+            resolved_matches[index] = ResolvedMatch(
                 status="exact",
                 score=1.0,
                 matched_source_text=exact_match.source_text,
@@ -185,31 +188,25 @@ def _resolve_matches(
             exact_hits += 1
             continue
 
-        unresolved_sentences[match_text] = sentence
+        unresolved_items.append((index, sentence))
 
     fuzzy_started_at = perf_counter()
     fuzzy_matches, fuzzy_candidates_evaluated = _find_fuzzy_matches(
-        db,
-        [sentence.match_text for sentence in unresolved_sentences.values()],
-        similarity_threshold,
+        db=db,
+        prepared_sentences=[sentence for _, sentence in unresolved_items],
+        similarity_threshold=similarity_threshold,
     )
     fuzzy_phase_ms = (perf_counter() - fuzzy_started_at) * 1000
 
     fuzzy_hits = 0
-    none_hits = 0
-    for match_text, sentence in unresolved_sentences.items():
-        fuzzy_match = fuzzy_matches.get(sentence.match_text)
-        if fuzzy_match:
-            resolved_matches[match_text] = ResolvedMatch(
-                status="fuzzy",
-                score=round(float(fuzzy_match["score"]), 4),
-                matched_source_text=fuzzy_match["source_text"],
-                target_text=fuzzy_match["target_text"],
-            )
+    for offset, (index, _) in enumerate(unresolved_items):
+        fuzzy_match = fuzzy_matches[offset]
+        if fuzzy_match is not None:
+            resolved_matches[index] = fuzzy_match
             fuzzy_hits += 1
             continue
 
-        resolved_matches[match_text] = ResolvedMatch(
+        resolved_matches[index] = ResolvedMatch(
             status="none",
             score=0.0,
             matched_source_text=None,
@@ -217,10 +214,10 @@ def _resolve_matches(
         )
         none_hits += 1
 
-    return resolved_matches, MatchStats(
+    return [match for match in resolved_matches if match is not None], MatchStats(
         total_input_sentences=total_input_sentences,
-        prepared_sentences=prepared_sentence_count,
-        unique_sentences=len(unique_sentences),
+        prepared_sentences=len(prepared_sentences),
+        unique_sentences=len({sentence.match_text for sentence in prepared_sentences if sentence.match_text}),
         exact_hits=exact_hits,
         fuzzy_hits=fuzzy_hits,
         none_hits=none_hits,
@@ -279,21 +276,21 @@ def _find_exact_matches(
 
 def _find_fuzzy_matches(
     db: Session,
-    normalized_sentences: list[str],
+    prepared_sentences: list[PreparedSentence],
     similarity_threshold: float,
-):
-    if not normalized_sentences:
-        return {}, 0
+) -> tuple[list[ResolvedMatch | None], int]:
+    if not prepared_sentences:
+        return [], 0
 
-    matches = {}
+    matches: list[ResolvedMatch | None] = []
     total_candidates = 0
-    for chunk in _chunked(normalized_sentences, FUZZY_MATCH_BATCH_SIZE):
+    for chunk in _chunked(prepared_sentences, FUZZY_MATCH_BATCH_SIZE):
         chunk_matches, chunk_candidates = _find_fuzzy_matches_chunk(
             db=db,
-            normalized_sentences=chunk,
+            prepared_sentences=chunk,
             similarity_threshold=similarity_threshold,
         )
-        matches.update(chunk_matches)
+        matches.extend(chunk_matches)
         total_candidates += chunk_candidates
 
     return matches, total_candidates
@@ -301,9 +298,9 @@ def _find_fuzzy_matches(
 
 def _find_fuzzy_matches_chunk(
     db: Session,
-    normalized_sentences: list[str],
+    prepared_sentences: list[PreparedSentence],
     similarity_threshold: float,
-):
+) -> tuple[list[ResolvedMatch | None], int]:
     trigram_prefilter_threshold = _get_trigram_prefilter_threshold(similarity_threshold)
     params = {
         "candidate_limit": FUZZY_CANDIDATE_LIMIT,
@@ -311,17 +308,18 @@ def _find_fuzzy_matches_chunk(
     }
     value_rows: list[str] = []
 
-    for index, sentence in enumerate(normalized_sentences):
+    for index, sentence in enumerate(prepared_sentences):
         param_name = f"query_{index}"
-        params[param_name] = sentence
-        value_rows.append(f"(:{param_name})")
+        params[param_name] = sentence.match_text
+        value_rows.append(f"({index}, :{param_name})")
 
     stmt = text(
         f"""
-        WITH input(query_text) AS (
+        WITH input(query_index, query_text) AS (
             VALUES {", ".join(value_rows)}
         )
         SELECT
+            input.query_index,
             input.query_text,
             matched.compare_text,
             matched.source_text,
@@ -340,6 +338,7 @@ def _find_fuzzy_matches_chunk(
             ORDER BY similarity(tm.source_normalized, input.query_text) DESC, tm.updated_at DESC
             LIMIT :candidate_limit
         ) AS matched ON TRUE
+        ORDER BY input.query_index ASC
         """
     )
 
@@ -351,21 +350,31 @@ def _find_fuzzy_matches_chunk(
     )
     rows = db.execute(stmt, params).mappings().all()
 
-    grouped_candidates: dict[str, list[dict]] = {}
+    grouped_candidates: dict[int, list[dict]] = {}
     for row in rows:
         if row["source_text"] is None or row["target_text"] is None:
             continue
-        grouped_candidates.setdefault(row["query_text"], []).append(dict(row))
+        grouped_candidates.setdefault(int(row["query_index"]), []).append(dict(row))
 
-    matches = {}
-    for query_text, candidates in grouped_candidates.items():
+    matches: list[ResolvedMatch | None] = []
+    for index, sentence in enumerate(prepared_sentences):
         best_candidate = _pick_best_fuzzy_candidate(
-            query_text=query_text,
-            candidates=candidates,
+            query_text=sentence.match_text,
+            candidates=grouped_candidates.get(index, []),
             similarity_threshold=similarity_threshold,
         )
-        if best_candidate:
-            matches[query_text] = best_candidate
+        if best_candidate is None:
+            matches.append(None)
+            continue
+
+        matches.append(
+            ResolvedMatch(
+                status="fuzzy",
+                score=round(float(best_candidate["score"]), 4),
+                matched_source_text=best_candidate["source_text"],
+                target_text=best_candidate["target_text"],
+            )
+        )
 
     candidate_count = sum(len(candidates) for candidates in grouped_candidates.values())
     return matches, candidate_count
@@ -375,7 +384,7 @@ def _pick_best_fuzzy_candidate(
     query_text: str,
     candidates: list[dict],
     similarity_threshold: float,
-):
+) -> dict | None:
     best_candidate = None
     best_score = 0.0
 
@@ -388,7 +397,6 @@ def _pick_best_fuzzy_candidate(
         if final_score > best_score:
             best_score = final_score
             best_candidate = {
-                "query_text": query_text,
                 "source_text": candidate["source_text"],
                 "target_text": candidate["target_text"],
                 "score": final_score,
@@ -404,5 +412,5 @@ def _get_trigram_prefilter_threshold(similarity_threshold: float) -> float:
     return min(max(similarity_threshold, 0.01), 0.3)
 
 
-def _chunked(items: list[str], chunk_size: int) -> list[list[str]]:
+def _chunked(items: list[T], chunk_size: int) -> list[list[T]]:
     return [items[index : index + chunk_size] for index in range(0, len(items), chunk_size)]
