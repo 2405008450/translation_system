@@ -5,6 +5,11 @@ const props = defineProps<{
   html: string
   activeSentenceId: string | null
   supported: boolean
+  title?: string
+}>()
+
+const emit = defineEmits<{
+  close: []
 }>()
 
 const containerRef = ref<HTMLElement | null>(null)
@@ -52,8 +57,16 @@ watch(() => props.activeSentenceId, () => {
 
 <template>
   <section class="preview-panel">
-    <div class="section-title">原文预览</div>
-    <div v-if="supported" ref="containerRef" class="preview-panel__body" v-html="html" />
-    <div v-else class="preview-panel__empty">当前任务没有可展示的预览内容</div>
+    <div class="preview-panel__header">
+      <div class="section-title section-title--tight">{{ title || '原文预览' }}</div>
+      <button class="button preview-panel__close" type="button" @click="emit('close')">关闭</button>
+    </div>
+
+    <div class="preview-panel__viewport">
+      <div class="preview-panel__paper">
+        <div v-if="supported" ref="containerRef" class="preview-panel__body" v-html="html" />
+        <div v-else class="preview-panel__empty">当前任务没有可展示的预览内容</div>
+      </div>
+    </div>
   </section>
 </template>

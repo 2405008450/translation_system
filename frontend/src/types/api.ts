@@ -41,6 +41,8 @@ export interface Segment {
   source: string
   block_type: string
   block_index: number
+  row_index?: number | null
+  cell_index?: number | null
 }
 
 export interface FileRecordDetail {

@@ -7,6 +7,7 @@ import PreviewPanel from '../components/PreviewPanel.vue'
 import SegmentEditorRow from '../components/SegmentEditorRow.vue'
 import VirtualList from '../components/VirtualList.vue'
 import { useSegmentStore } from '../stores/segment'
+import { buildDocumentPreviewHtml } from '../utils/documentPreview'
 
 const props = defineProps<{
   id: string
@@ -15,10 +16,25 @@ const props = defineProps<{
 const router = useRouter()
 const segmentStore = useSegmentStore()
 
+type ToolKey = 'source-preview' | 'target-preview' | 'terms' | 'notes' | 'history'
+type ActiveToolConfig =
+  | {
+      kind: 'preview'
+      title: string
+      html: string
+      supported: boolean
+    }
+  | {
+      kind: 'placeholder'
+      title: string
+      message: string
+    }
+
 const pageError = ref('')
 const llmScope = ref<'fuzzy_only' | 'none_only' | 'all'>('all')
 const llmProvider = ref<'auto' | 'deepseek' | 'openrouter'>('auto')
 const itemHeight = ref(resolveItemHeight())
+const activeTool = ref<ToolKey | null>(null)
 
 function resolveItemHeight() {
   if (window.innerWidth <= 720) {
@@ -32,6 +48,10 @@ function resolveItemHeight() {
 
 function handleResize() {
   itemHeight.value = resolveItemHeight()
+}
+
+function toggleTool(tool: ToolKey) {
+  activeTool.value = activeTool.value === tool ? null : tool
 }
 
 const statusSummary = computed(() => {
@@ -55,6 +75,72 @@ const statusSummary = computed(() => {
     { key: 'confirmed', label: '已确认', value: counters.confirmed, tone: 'confirmed' },
   ]
 })
+
+const translatedPreviewHtml = computed(() =>
+  buildDocumentPreviewHtml(segmentStore.segments, 'target'),
+)
+
+const toolButtons = [
+  { key: 'source-preview' as const, label: '原文预览' },
+  { key: 'target-preview' as const, label: '译文预览' },
+  { key: 'terms' as const, label: '术语' },
+  { key: 'notes' as const, label: '备注' },
+  { key: 'history' as const, label: '历史版本' },
+]
+
+const activeToolConfig = computed<ActiveToolConfig | null>(() => {
+  if (activeTool.value === 'source-preview') {
+    return {
+      kind: 'preview' as const,
+      title: '原文预览',
+      html: segmentStore.previewHtml,
+      supported: segmentStore.previewSupported,
+    }
+  }
+
+  if (activeTool.value === 'target-preview') {
+    return {
+      kind: 'preview' as const,
+      title: '译文预览',
+      html: translatedPreviewHtml.value,
+      supported: true,
+    }
+  }
+
+  if (activeTool.value === 'terms') {
+    return {
+      kind: 'placeholder' as const,
+      title: '术语',
+      message: '术语面板即将接入。',
+    }
+  }
+
+  if (activeTool.value === 'notes') {
+    return {
+      kind: 'placeholder' as const,
+      title: '备注',
+      message: '备注面板即将接入。',
+    }
+  }
+
+  if (activeTool.value === 'history') {
+    return {
+      kind: 'placeholder' as const,
+      title: '历史版本',
+      message: '历史版本面板即将接入。',
+    }
+  }
+
+  return null
+})
+
+const activePreviewConfig = computed(() =>
+  activeToolConfig.value?.kind === 'preview' ? activeToolConfig.value : null,
+)
+
+const activePlaceholderConfig = computed(() =>
+  activeToolConfig.value?.kind === 'placeholder' ? activeToolConfig.value : null,
+)
 
 async function loadTask() {
   pageError.value = ''
@@ -222,11 +308,43 @@ onBeforeRouteLeave(async () => {
         </VirtualList>
       </section>
 
-      <PreviewPanel
-        :html="segmentStore.previewHtml"
-        :supported="segmentStore.previewSupported"
-        :active-sentence-id="segmentStore.activeSentenceId"
-      />
+      <div class="workbench-sidecar" :class="{ 'is-preview-open': !!activeToolConfig }">
+        <Transition name="preview-drawer">
+          <PreviewPanel
+            v-if="activePreviewConfig"
+            class="preview-panel--drawer"
+            :title="activePreviewConfig.title"
+            :html="activePreviewConfig.html"
+            :supported="activePreviewConfig.supported"
+            :active-sentence-id="segmentStore.activeSentenceId"
+            @close="activeTool = null"
+          />
+        </Transition>
+
+        <Transition name="preview-drawer">
+          <section v-if="activePlaceholderConfig" class="panel workbench-tool-panel">
+            <div class="panel-header panel-header--compact">
+              <div class="section-title section-title--tight">{{ activePlaceholderConfig.title }}</div>
+              <button class="button preview-panel__close" type="button" @click="activeTool = null">关闭</button>
+            </div>
+            <div class="empty-state">{{ activePlaceholderConfig.message }}</div>
+          </section>
+        </Transition>
+
+        <aside class="workbench-rail" aria-label="工作台工具">
+          <button
+            v-for="tool in toolButtons"
+            :key="tool.key"
+            class="workbench-rail__button"
+            :class="{ 'is-active': activeTool === tool.key }"
+            type="button"
+            :title="tool.label"
+            @click="toggleTool(tool.key)"
+          >
+            {{ tool.label }}
+          </button>
+        </aside>
+      </div>
     </section>
   </div>
 </template>

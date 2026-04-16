@@ -352,6 +352,8 @@ def get_file_record(
                 "source": seg.source,
                 "block_type": seg.block_type,
                 "block_index": seg.block_index,
+                "row_index": seg.row_index,
+                "cell_index": seg.cell_index,
             }
             for seg in segments
         ],
