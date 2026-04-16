@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     database_url: str = Field(
         default="postgresql+psycopg://postgres:postgres@localhost:5432/tm_demo" 
     )
+    file_storage_dir: str = "data/file_records"
     upload_max_size_mb: int = 10
     default_similarity_threshold: float = 0.60
     deepseek_api_key: str | None = None

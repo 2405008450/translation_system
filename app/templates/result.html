@@ -266,6 +266,17 @@
             font-size: 1rem;
             line-height: 1.8;
         }
+        .doc-story {
+            margin-bottom: 1.25rem;
+        }
+        .doc-story-label {
+            margin-bottom: 0.5rem;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: #6c757d;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
         .doc-paragraph {
             margin-bottom: 1rem;
             white-space: pre-wrap;
@@ -296,6 +307,19 @@
             border: 1px solid #dee2e6;
             padding: 0.5rem;
             vertical-align: top;
+        }
+        .doc-textbox {
+            margin: 0.75rem 0 1rem;
+            padding: 0.75rem;
+            border: 1px solid #dee2e6;
+            background: #f8f9fa;
+        }
+        .doc-run {
+            white-space: pre-wrap;
+        }
+        .document-body a {
+            color: inherit;
+            text-decoration: underline;
         }
         .table tbody tr {
             scroll-margin-bottom: 360px;
@@ -383,6 +407,9 @@
                         <button class="btn btn-primary" id="btnSaveProgress" title="保存当前翻译进度">
                             <span id="saveIcon">💾</span> 保存进度
                         </button>
+                        {% if can_export_docx and file_record_id %}
+                        <a href="/tasks/{{ file_record_id }}/export" class="btn btn-outline-success">导出译后 DOCX</a>
+                        {% endif %}
                         <a href="/" class="btn btn-outline-secondary">返回首页</a>
                     </div>
                     <div class="small mt-2 text-muted llm-status" id="llmStatus">可对 fuzzy / none 句子执行 AI 译文修正。</div>

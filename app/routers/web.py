@@ -1,22 +1,36 @@
 import logging
+from io import BytesIO
 from time import perf_counter
+from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.database import get_db
-from app.services.document_workspace import build_docx_workspace, build_document_html_from_segments
+from app.services.document_exporter import (
+    DOCX_MEDIA_TYPE,
+    build_translated_docx_filename,
+    export_translated_docx,
+)
+from app.services.document_workspace import (
+    build_docx_preview_html,
+    build_docx_workspace,
+    build_document_html_from_segments,
+)
 from app.services.file_record_service import (
     count_file_records,
     create_file_record_with_segments,
     create_txt_file_record_with_segments,
+    get_file_record as get_file_record_model,
     get_file_record_with_segments,
     get_tm_target_text_map,
     list_file_records,
+    list_segments_for_file_record,
+    load_file_record_source,
 )
 from app.services.file_parser import parse_uploaded_file
 from app.services.matcher import match_sentences_with_stats
@@ -33,6 +47,24 @@ DEFAULT_TASKS_PAGE_SIZE = 24
 MAX_TASKS_PAGE_SIZE = 100
 DEFAULT_SEGMENTS_PAGE_SIZE = 200
 MAX_SEGMENTS_PAGE_SIZE = 500
+
+
+def _build_docx_download_response(filename: str, docx_bytes: bytes) -> StreamingResponse:
+    export_filename = build_translated_docx_filename(filename)
+    ascii_filename = export_filename.encode("ascii", "ignore").decode("ascii").strip() or "translated.docx"
+    ascii_filename = ascii_filename.replace('"', "")
+    quoted_filename = quote(export_filename)
+
+    return StreamingResponse(
+        BytesIO(docx_bytes),
+        media_type=DOCX_MEDIA_TYPE,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_filename}"; '
+                f"filename*=UTF-8''{quoted_filename}"
+            )
+        },
+    )
 
 
 def _render_index(
@@ -205,8 +237,11 @@ def continue_task(
     # 转换 segments 为 results 格式
     results = _build_match_results(segments, tm_target_text_map=tm_target_text_map)
 
-    # 从当前页 segments 重建预览 HTML，避免一次性渲染整份文档
-    document_html = build_document_html_from_segments(segments) if segments else ""
+    source_bytes = load_file_record_source(file_record)
+    if source_bytes:
+        document_html = build_docx_preview_html(source_bytes)
+    else:
+        document_html = build_document_html_from_segments(segments) if segments else ""
     supports_preview = bool(document_html)
 
     return templates.TemplateResponse(
@@ -221,10 +256,35 @@ def continue_task(
             "performance_summary": None,
             "document_html": document_html,
             "is_docx": supports_preview,
+            "can_export_docx": bool(source_bytes),
             "file_record_id": file_record_id,
             "pagination": pagination,
         },
     )
+
+
+@router.get("/tasks/{file_record_id}/export")
+def export_task_docx(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File record not found.")
+
+    raw_bytes = load_file_record_source(file_record)
+    if raw_bytes is None:
+        raise HTTPException(status_code=400, detail="The source DOCX is unavailable for export.")
+
+    segments = list_segments_for_file_record(db, file_record_id)
+    try:
+        translated_docx = export_translated_docx(raw_bytes=raw_bytes, segments=segments)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return _build_docx_download_response(file_record.filename, translated_docx)
 
 
 @router.post("/match", response_class=HTMLResponse)
@@ -350,6 +410,7 @@ async def upload_and_match(
     sentence_count = len(results)
     pagination = None
     display_results = results
+    can_export_docx = False
 
     if file_record_id is not None:
         pagination = _build_pagination(
@@ -370,7 +431,12 @@ async def upload_and_match(
                 doc_result["segments"],
                 tm_target_text_map=tm_target_text_map,
             )
-            document_html = build_document_html_from_segments(doc_result["segments"]) if doc_result["segments"] else ""
+            source_bytes = load_file_record_source(doc_result["file_record"])
+            can_export_docx = bool(source_bytes)
+            if source_bytes:
+                document_html = build_docx_preview_html(source_bytes)
+            else:
+                document_html = build_document_html_from_segments(doc_result["segments"]) if doc_result["segments"] else ""
 
     # 只要有 document_html 就支持预览
     supports_preview = bool(document_html)
@@ -387,6 +453,7 @@ async def upload_and_match(
             "performance_summary": performance_summary,
             "document_html": document_html,
             "is_docx": supports_preview,
+            "can_export_docx": can_export_docx,
             "file_record_id": file_record_id,
             "pagination": pagination,
         },

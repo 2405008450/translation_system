@@ -16,3 +16,6 @@ htmlcov/
 coverage/
 *.log
 .claude/
+data/
+tests/
+

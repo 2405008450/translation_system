@@ -1,7 +1,8 @@
 from pathlib import Path
 
-from docx import Document
 from fastapi import UploadFile
+
+from app.services.document_workspace import parse_docx_workspace
 
 
 SUPPORTED_EXTENSIONS = {".txt", ".docx"}
@@ -34,8 +35,5 @@ def _parse_txt(raw_bytes: bytes) -> str:
 
 
 def _parse_docx(raw_bytes: bytes) -> str:
-    from io import BytesIO
-
-    document = Document(BytesIO(raw_bytes))
-    paragraphs = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
-    return "\n".join(paragraphs)
+    workspace = parse_docx_workspace(raw_bytes)
+    return "\n".join(segment["display_text"] for segment in workspace["segments"])

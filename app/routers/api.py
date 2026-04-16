@@ -1,5 +1,7 @@
 import json
+from io import BytesIO
 from typing import Literal
+from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
@@ -8,18 +10,24 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.services.document_exporter import (
+    DOCX_MEDIA_TYPE,
+    build_translated_docx_filename,
+    export_translated_docx,
+)
 from app.services.document_workspace import build_docx_workspace
 from app.services.file_record_service import (
+    batch_update_segments,
     create_file_record_with_segments,
+    delete_file_record,
     get_file_record as get_file_record_model,
     get_file_record_with_segments,
     get_tm_target_text_map,
     list_file_records,
     list_segments_for_file_record,
+    load_file_record_source,
     update_segment_by_sentence_id,
     update_segment_with_llm_result,
-    batch_update_segments,
-    delete_file_record,
 )
 from app.services.llm_service import (
     LLMConfigurationError,
@@ -47,6 +55,24 @@ class BatchSegmentUpdate(BaseModel):
 class LLMTranslateRequest(BaseModel):
     scope: Literal["fuzzy_only", "none_only", "all"] = "all"
     provider: Literal["auto", "deepseek", "openrouter"] = "auto"
+
+
+def _build_docx_download_response(filename: str, docx_bytes: bytes) -> StreamingResponse:
+    export_filename = build_translated_docx_filename(filename)
+    ascii_filename = export_filename.encode("ascii", "ignore").decode("ascii").strip() or "translated.docx"
+    ascii_filename = ascii_filename.replace('"', "")
+    quoted_filename = quote(export_filename)
+
+    return StreamingResponse(
+        BytesIO(docx_bytes),
+        media_type=DOCX_MEDIA_TYPE,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_filename}"; '
+                f"filename*=UTF-8''{quoted_filename}"
+            )
+        },
+    )
 
 
 def _sse_event(event: str, payload: dict) -> str:
@@ -249,6 +275,31 @@ def get_file_record(
             for seg in segments
         ],
     }
+
+
+@router.get("/file-records/{file_record_id}/export-docx")
+@router.get("/documents/{file_record_id}/export-docx", include_in_schema=False)
+def export_file_record_docx(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File record not found.")
+
+    raw_bytes = load_file_record_source(file_record)
+    if raw_bytes is None:
+        raise HTTPException(status_code=400, detail="The source DOCX is unavailable for export.")
+
+    segments = list_segments_for_file_record(db, file_record_id)
+    try:
+        translated_docx = export_translated_docx(raw_bytes=raw_bytes, segments=segments)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return _build_docx_download_response(file_record.filename, translated_docx)
 
 
 @router.put("/file-records/{file_record_id}/segments/{sentence_id}")
