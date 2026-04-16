@@ -28,3 +28,4 @@ frontend/*.log
 frontend/.env.local
 frontend/.env.*.local
 frontend/.DS_Store
+.claude
