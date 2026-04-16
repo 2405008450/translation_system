@@ -45,6 +45,7 @@ HIGHLIGHT_COLORS = {
     "yellow": "#ffff00",
 }
 PAGE_NUMBER_FIELD_NAMES = {"PAGE", "NUMPAGES", "SECTIONPAGES"}
+NUMBERING_PLACEHOLDER_RE = re.compile(r"%(\d+)")
 PAGE_NUMBER_WRAPPER_RE = re.compile(r"[\s\-\u2013\u2014\u2212\uff0d_./\\|:：()\[\]{}（）【】<>《》·•]+")
 
 
@@ -84,6 +85,46 @@ class StoryPart:
     part_name: str
     root: ET.Element
     rels: dict[str, str]
+
+
+@dataclass(frozen=True)
+class NumberingLevel:
+    ilvl: int
+    num_fmt: str
+    lvl_text: str
+    start: int = 1
+    suffix: str = "tab"
+    p_style: str | None = None
+
+
+@dataclass(frozen=True)
+class NumberingInstance:
+    num_id: str
+    abstract_num_id: str
+    level_overrides: dict[int, NumberingLevel]
+    start_overrides: dict[int, int]
+
+
+@dataclass(frozen=True)
+class StyleDefinition:
+    style_id: str
+    based_on: str | None
+    num_id: str | None
+    ilvl: int | None
+
+
+@dataclass(frozen=True)
+class NumberingSchema:
+    abstract_levels: dict[str, dict[int, NumberingLevel]]
+    instances: dict[str, NumberingInstance]
+    styles: dict[str, StyleDefinition]
+    style_numbering_map: dict[str, tuple[str, int]]
+
+
+@dataclass
+class NumberingState:
+    schema: NumberingSchema
+    counters: dict[str, dict[int, int]] = field(default_factory=dict)
 
 
 class DocxPackage:
@@ -139,6 +180,178 @@ class DocxPackage:
         return rels
 
 
+def _build_numbering_schema(package: DocxPackage) -> NumberingSchema:
+    abstract_levels: dict[str, dict[int, NumberingLevel]] = {}
+    instances: dict[str, NumberingInstance] = {}
+    styles = _parse_style_definitions(package.read_xml("word/styles.xml"))
+
+    numbering_root = package.read_xml("word/numbering.xml")
+    if numbering_root is None:
+        return NumberingSchema(
+            abstract_levels={},
+            instances={},
+            styles=styles,
+            style_numbering_map={},
+        )
+
+    for abstract_num in numbering_root.findall("./w:abstractNum", NS):
+        abstract_num_id = abstract_num.get(_qn("w", "abstractNumId"))
+        if not abstract_num_id:
+            continue
+        levels: dict[int, NumberingLevel] = {}
+        for level in abstract_num.findall("./w:lvl", NS):
+            parsed_level = _parse_numbering_level(level)
+            if parsed_level is None:
+                continue
+            levels[parsed_level.ilvl] = parsed_level
+        abstract_levels[abstract_num_id] = levels
+
+    for num in numbering_root.findall("./w:num", NS):
+        num_id = num.get(_qn("w", "numId"))
+        abstract_num_id_element = num.find("./w:abstractNumId", NS)
+        abstract_num_id = (
+            None if abstract_num_id_element is None else abstract_num_id_element.get(_qn("w", "val"))
+        )
+        if not num_id or not abstract_num_id:
+            continue
+
+        level_overrides: dict[int, NumberingLevel] = {}
+        start_overrides: dict[int, int] = {}
+        for level_override in num.findall("./w:lvlOverride", NS):
+            ilvl_value = level_override.get(_qn("w", "ilvl"))
+            if ilvl_value is None or not ilvl_value.isdigit():
+                continue
+            ilvl = int(ilvl_value)
+
+            start_override = level_override.find("./w:startOverride", NS)
+            start_value = None if start_override is None else start_override.get(_qn("w", "val"))
+            if start_value and start_value.isdigit():
+                start_overrides[ilvl] = int(start_value)
+
+            level_element = level_override.find("./w:lvl", NS)
+            parsed_level = _parse_numbering_level(level_element)
+            if parsed_level is not None:
+                level_overrides[ilvl] = parsed_level
+
+        instances[num_id] = NumberingInstance(
+            num_id=num_id,
+            abstract_num_id=abstract_num_id,
+            level_overrides=level_overrides,
+            start_overrides=start_overrides,
+        )
+
+    style_numbering_map: dict[str, tuple[str, int]] = {}
+    for num_id, instance in instances.items():
+        for ilvl, level in _iter_instance_levels(instance, abstract_levels):
+            if level.p_style and level.p_style not in style_numbering_map:
+                style_numbering_map[level.p_style] = (num_id, ilvl)
+
+    return NumberingSchema(
+        abstract_levels=abstract_levels,
+        instances=instances,
+        styles=styles,
+        style_numbering_map=style_numbering_map,
+    )
+
+
+def _parse_style_definitions(styles_root: ET.Element | None) -> dict[str, StyleDefinition]:
+    if styles_root is None:
+        return {}
+
+    styles: dict[str, StyleDefinition] = {}
+    for style in styles_root.findall("./w:style", NS):
+        if style.get(_qn("w", "type")) != "paragraph":
+            continue
+
+        style_id = style.get(_qn("w", "styleId"))
+        if not style_id:
+            continue
+
+        based_on = None
+        based_on_element = style.find("./w:basedOn", NS)
+        if based_on_element is not None:
+            based_on = based_on_element.get(_qn("w", "val"))
+
+        num_id = None
+        ilvl = None
+        num_pr = style.find("./w:pPr/w:numPr", NS)
+        if num_pr is not None:
+            num_id_element = num_pr.find("./w:numId", NS)
+            ilvl_element = num_pr.find("./w:ilvl", NS)
+            if num_id_element is not None:
+                num_id = num_id_element.get(_qn("w", "val"))
+            if ilvl_element is not None:
+                ilvl_value = ilvl_element.get(_qn("w", "val"))
+                if ilvl_value and ilvl_value.isdigit():
+                    ilvl = int(ilvl_value)
+
+        styles[style_id] = StyleDefinition(
+            style_id=style_id,
+            based_on=based_on,
+            num_id=num_id,
+            ilvl=ilvl,
+        )
+
+    return styles
+
+
+def _parse_numbering_level(level: ET.Element | None) -> NumberingLevel | None:
+    if level is None:
+        return None
+
+    ilvl_value = level.get(_qn("w", "ilvl"))
+    if ilvl_value is None or not ilvl_value.isdigit():
+        return None
+
+    start_value = 1
+    start_element = level.find("./w:start", NS)
+    if start_element is not None:
+        raw_start = start_element.get(_qn("w", "val"))
+        if raw_start and raw_start.isdigit():
+            start_value = int(raw_start)
+
+    num_fmt = "decimal"
+    num_fmt_element = level.find("./w:numFmt", NS)
+    if num_fmt_element is not None:
+        num_fmt = num_fmt_element.get(_qn("w", "val"), "decimal")
+
+    lvl_text = f"%{int(ilvl_value) + 1}."
+    lvl_text_element = level.find("./w:lvlText", NS)
+    if lvl_text_element is not None:
+        lvl_text = lvl_text_element.get(_qn("w", "val"), lvl_text)
+
+    suffix = "tab"
+    suffix_element = level.find("./w:suff", NS)
+    if suffix_element is not None:
+        suffix = suffix_element.get(_qn("w", "val"), "tab")
+
+    p_style = None
+    p_style_element = level.find("./w:pStyle", NS)
+    if p_style_element is not None:
+        p_style = p_style_element.get(_qn("w", "val"))
+
+    return NumberingLevel(
+        ilvl=int(ilvl_value),
+        num_fmt=num_fmt,
+        lvl_text=lvl_text,
+        start=start_value,
+        suffix=suffix,
+        p_style=p_style,
+    )
+
+
+def _iter_instance_levels(
+    instance: NumberingInstance,
+    abstract_levels: dict[str, dict[int, NumberingLevel]],
+):
+    levels = abstract_levels.get(instance.abstract_num_id, {})
+    all_levels = set(levels) | set(instance.level_overrides)
+    for ilvl in sorted(all_levels):
+        resolved_level = instance.level_overrides.get(ilvl) or levels.get(ilvl)
+        if resolved_level is not None:
+            yield ilvl, resolved_level
+
+
 def build_docx_workspace(
     db: Session,
     raw_bytes: bytes,
@@ -153,6 +366,10 @@ def build_docx_workspace(
         match_results, match_stats = match_sentences_with_stats(
             db=db,
             sentences=[segment["source_text"] for segment in segments],
+            auxiliary_sentences=[
+                _build_auxiliary_match_sentence(segment.get("numbering_text", ""), segment["source_text"])
+                for segment in segments
+            ],
             similarity_threshold=similarity_threshold,
         )
         for segment, match in zip(segments, match_results):
@@ -181,17 +398,20 @@ def build_docx_workspace(
 
 def parse_docx_workspace(raw_bytes: bytes) -> dict:
     package = DocxPackage(raw_bytes)
+    numbering_schema = _build_numbering_schema(package)
     sentence_counter = count(1)
     block_counter = count(0)
 
     html_parts: list[str] = []
     segments: list[dict] = []
     for story in _build_story_parts(package):
+        numbering_state = NumberingState(schema=numbering_schema)
         story_html_parts, story_segments = _render_block_sequence(
             container=story.root,
             story=story,
             sentence_counter=sentence_counter,
             block_counter=block_counter,
+            numbering_state=numbering_state,
         )
         if not story_html_parts:
             continue
@@ -335,6 +555,7 @@ def _render_block_sequence(
     story: StoryPart,
     sentence_counter,
     block_counter,
+    numbering_state: NumberingState,
     default_block_type: str = "paragraph",
     fixed_block_index: int | None = None,
     row_index: int | None = None,
@@ -349,6 +570,7 @@ def _render_block_sequence(
             story=story,
             sentence_counter=sentence_counter,
             block_counter=block_counter,
+            numbering_state=numbering_state,
             default_block_type=default_block_type,
             fixed_block_index=fixed_block_index,
             row_index=row_index,
@@ -388,6 +610,7 @@ def _render_block(
     story: StoryPart,
     sentence_counter,
     block_counter,
+    numbering_state: NumberingState,
     default_block_type: str,
     fixed_block_index: int | None,
     row_index: int | None,
@@ -401,6 +624,7 @@ def _render_block(
             story=story,
             sentence_counter=sentence_counter,
             block_counter=block_counter,
+            numbering_state=numbering_state,
             block_index=block_index,
             block_type=default_block_type,
             row_index=row_index,
@@ -413,6 +637,7 @@ def _render_block(
             story=story,
             sentence_counter=sentence_counter,
             block_counter=block_counter,
+            numbering_state=numbering_state,
         )
 
     return "", []
@@ -423,6 +648,7 @@ def _render_table(
     story: StoryPart,
     sentence_counter,
     block_counter,
+    numbering_state: NumberingState,
 ) -> tuple[str, list[dict]]:
     block_index = next(block_counter)
     row_html_parts: list[str] = []
@@ -437,6 +663,7 @@ def _render_table(
                 story=story,
                 sentence_counter=sentence_counter,
                 block_counter=block_counter,
+                numbering_state=numbering_state,
                 default_block_type="table_cell",
                 fixed_block_index=block_index,
                 row_index=row_index,
@@ -466,19 +693,30 @@ def _render_paragraph(
     story: StoryPart,
     sentence_counter,
     block_counter,
+    numbering_state: NumberingState,
     block_index: int,
     block_type: str,
     row_index: int | None,
     cell_index: int | None,
 ) -> tuple[str, list[dict]]:
     parse_state = InlineParseState()
+    numbering_text = _resolve_paragraph_numbering(paragraph, numbering_state)
     fragments, textbox_html_parts, textbox_segments = _collect_inline_content(
         node=paragraph,
         story=story,
         sentence_counter=sentence_counter,
         block_counter=block_counter,
+        numbering_state=numbering_state,
         parse_state=parse_state,
     )
+    if numbering_text:
+        fragments = [
+            InlineFragment(
+                display_text=numbering_text,
+                source_text="".join(" " if not char.isspace() else char for char in numbering_text),
+            ),
+            *fragments,
+        ]
 
     paragraph_classes = ["doc-paragraph"]
     if block_type == "table_cell":
@@ -498,6 +736,7 @@ def _render_paragraph(
         row_index=row_index,
         cell_index=cell_index,
         suppressed_page_number_field=parse_state.suppressed_page_number_field,
+        numbering_text=numbering_text,
     )
 
     html_parts: list[str] = []
@@ -518,6 +757,7 @@ def _render_paragraph_from_fragments(
     row_index: int | None = None,
     cell_index: int | None = None,
     suppressed_page_number_field: bool = False,
+    numbering_text: str = "",
 ) -> tuple[str, list[dict]]:
     display_text = "".join(fragment.display_text for fragment in fragments)
     if not display_text:
@@ -531,10 +771,12 @@ def _render_paragraph_from_fragments(
 
     renderable_sentences: list[RenderableSentence] = []
     segments: list[dict] = []
+    numbering_available = bool(numbering_text)
     for span in spans:
         sentence_display = _collect_span_text(fragments, span, use_source=False)
         sentence_source = normalize_text(_collect_span_text(fragments, span, use_source=True))
         sentence_id = None
+        segment_numbering_text = numbering_text if numbering_available else ""
         if sentence_source:
             sentence_id = f"sent-{next(sentence_counter):05d}"
             segments.append(
@@ -542,6 +784,7 @@ def _render_paragraph_from_fragments(
                     "sentence_id": sentence_id,
                     "source_text": sentence_source,
                     "display_text": sentence_display,
+                    "numbering_text": segment_numbering_text,
                     "status": "none",
                     "score": 0.0,
                     "matched_source_text": None,
@@ -552,6 +795,7 @@ def _render_paragraph_from_fragments(
                     "cell_index": cell_index,
                 }
             )
+            numbering_available = False
 
         renderable_sentences.append(
             RenderableSentence(
@@ -571,11 +815,247 @@ def _render_paragraph_from_fragments(
     return f'<p class="{class_attr}"{style_attr}>{html_content}</p>', segments
 
 
+def _resolve_paragraph_numbering(
+    paragraph: ET.Element,
+    numbering_state: NumberingState,
+) -> str:
+    numbering_reference = _resolve_paragraph_numbering_reference(paragraph, numbering_state.schema)
+    if numbering_reference is None:
+        return ""
+
+    num_id, ilvl = numbering_reference
+    instance = numbering_state.schema.instances.get(num_id)
+    if instance is None:
+        return ""
+
+    level = _resolve_numbering_level(numbering_state.schema, instance, ilvl)
+    if level is None:
+        return ""
+
+    counters = numbering_state.counters.setdefault(num_id, {})
+    for deeper_level in [value for value in counters if value > ilvl]:
+        del counters[deeper_level]
+
+    start_value = instance.start_overrides.get(ilvl, level.start)
+    current_value = counters.get(ilvl, start_value - 1) + 1
+    counters[ilvl] = current_value
+
+    rendered_text = NUMBERING_PLACEHOLDER_RE.sub(
+        lambda match: _render_numbering_placeholder(
+            numbering_state.schema,
+            instance,
+            counters,
+            match.group(1),
+        ),
+        level.lvl_text,
+    )
+    if not rendered_text:
+        return ""
+
+    return f"{rendered_text}{_numbering_suffix_text(level.suffix)}"
+
+
+def _resolve_paragraph_numbering_reference(
+    paragraph: ET.Element,
+    numbering_schema: NumberingSchema,
+) -> tuple[str, int] | None:
+    direct_reference = _extract_numpr_reference(paragraph.find("./w:pPr/w:numPr", NS))
+    if direct_reference is not None:
+        return direct_reference
+
+    paragraph_style_id = _get_paragraph_style_id(paragraph)
+    if not paragraph_style_id:
+        return None
+
+    style_reference = _resolve_style_numbering_reference(paragraph_style_id, numbering_schema.styles)
+    if style_reference is not None:
+        return style_reference
+
+    return numbering_schema.style_numbering_map.get(paragraph_style_id)
+
+
+def _extract_numpr_reference(num_pr: ET.Element | None) -> tuple[str, int] | None:
+    if num_pr is None:
+        return None
+
+    num_id_element = num_pr.find("./w:numId", NS)
+    if num_id_element is None:
+        return None
+
+    num_id = num_id_element.get(_qn("w", "val"))
+    if not num_id or num_id == "0":
+        return None
+
+    ilvl = 0
+    ilvl_element = num_pr.find("./w:ilvl", NS)
+    if ilvl_element is not None:
+        ilvl_value = ilvl_element.get(_qn("w", "val"))
+        if ilvl_value and ilvl_value.isdigit():
+            ilvl = int(ilvl_value)
+
+    return num_id, ilvl
+
+
+def _get_paragraph_style_id(paragraph: ET.Element) -> str | None:
+    style_element = paragraph.find("./w:pPr/w:pStyle", NS)
+    if style_element is None:
+        return None
+    return style_element.get(_qn("w", "val"))
+
+
+def _resolve_style_numbering_reference(
+    style_id: str,
+    styles: dict[str, StyleDefinition],
+) -> tuple[str, int] | None:
+    current_style_id = style_id
+    visited: set[str] = set()
+
+    while current_style_id and current_style_id not in visited:
+        visited.add(current_style_id)
+        style = styles.get(current_style_id)
+        if style is None:
+            return None
+        if style.num_id:
+            return style.num_id, style.ilvl or 0
+        current_style_id = style.based_on
+
+    return None
+
+
+def _resolve_numbering_level(
+    numbering_schema: NumberingSchema,
+    instance: NumberingInstance,
+    ilvl: int,
+) -> NumberingLevel | None:
+    if ilvl in instance.level_overrides:
+        return instance.level_overrides[ilvl]
+    return numbering_schema.abstract_levels.get(instance.abstract_num_id, {}).get(ilvl)
+
+
+def _render_numbering_placeholder(
+    numbering_schema: NumberingSchema,
+    instance: NumberingInstance,
+    counters: dict[int, int],
+    placeholder_text: str,
+) -> str:
+    if not placeholder_text.isdigit():
+        return ""
+
+    target_level = int(placeholder_text) - 1
+    if target_level < 0:
+        return ""
+
+    level = _resolve_numbering_level(numbering_schema, instance, target_level)
+    value = counters.get(target_level)
+    if level is None or value is None:
+        return ""
+
+    return _format_numbering_value(value, level.num_fmt, level.lvl_text)
+
+
+def _numbering_suffix_text(suffix: str) -> str:
+    if suffix == "space":
+        return " "
+    if suffix == "nothing":
+        return ""
+    return "\t"
+
+
+def _format_numbering_value(value: int, num_fmt: str, lvl_text: str) -> str:
+    if num_fmt in {"bullet", "none"}:
+        return ""
+    if num_fmt == "decimalZero":
+        return f"{value:02d}"
+    if num_fmt in {"upperLetter", "lowerLetter"}:
+        rendered = _to_alpha_sequence(value)
+        return rendered.upper() if num_fmt == "upperLetter" else rendered.lower()
+    if num_fmt in {"upperRoman", "lowerRoman"}:
+        rendered = _to_roman(value)
+        return rendered.upper() if num_fmt == "upperRoman" else rendered.lower()
+    if num_fmt in {
+        "chineseCounting",
+        "chineseLegalSimplified",
+        "ideographDigital",
+        "chineseCountingThousand",
+    }:
+        return _to_simplified_chinese_number(value)
+    return str(value)
+
+
+def _to_alpha_sequence(value: int) -> str:
+    if value <= 0:
+        return str(value)
+
+    letters: list[str] = []
+    current = value
+    while current > 0:
+        current -= 1
+        letters.append(chr(ord("A") + (current % 26)))
+        current //= 26
+    return "".join(reversed(letters))
+
+
+def _to_roman(value: int) -> str:
+    if value <= 0:
+        return str(value)
+
+    numerals = (
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    )
+    current = value
+    parts: list[str] = []
+    for arabic, roman in numerals:
+        while current >= arabic:
+            parts.append(roman)
+            current -= arabic
+    return "".join(parts)
+
+
+def _to_simplified_chinese_number(value: int) -> str:
+    if value <= 0:
+        return str(value)
+    if value >= 100000:
+        return str(value)
+
+    digits = "零一二三四五六七八九"
+    units = ("", "十", "百", "千", "万")
+    parts: list[str] = []
+    zero_pending = False
+
+    for index, digit_char in enumerate(str(value)):
+        digit = int(digit_char)
+        place = len(str(value)) - index - 1
+        if digit == 0:
+            zero_pending = bool(parts)
+            continue
+        if zero_pending:
+            parts.append("零")
+            zero_pending = False
+        if not (digit == 1 and place == 1 and not parts):
+            parts.append(digits[digit])
+        parts.append(units[place])
+
+    return "".join(parts) or str(value)
+
+
 def _collect_inline_content(
     node: ET.Element,
     story: StoryPart,
     sentence_counter,
     block_counter,
+    numbering_state: NumberingState,
     parse_state: InlineParseState,
     hyperlink: str | None = None,
     inherited_css: str = "",
@@ -637,6 +1117,7 @@ def _collect_inline_content(
             story=story,
             sentence_counter=sentence_counter,
             block_counter=block_counter,
+            numbering_state=numbering_state,
         )
         return [], textbox_html_parts, textbox_segments
 
@@ -649,6 +1130,7 @@ def _collect_inline_content(
             story=story,
             sentence_counter=sentence_counter,
             block_counter=block_counter,
+            numbering_state=numbering_state,
             parse_state=parse_state,
             hyperlink=hyperlink,
             inherited_css=inherited_css,
@@ -665,6 +1147,7 @@ def _render_embedded_textboxes(
     story: StoryPart,
     sentence_counter,
     block_counter,
+    numbering_state: NumberingState,
 ) -> tuple[list[str], list[dict]]:
     textbox_html_parts: list[str] = []
     textbox_segments: list[dict] = []
@@ -675,6 +1158,7 @@ def _render_embedded_textboxes(
             story=story,
             sentence_counter=sentence_counter,
             block_counter=block_counter,
+            numbering_state=numbering_state,
             default_block_type="textbox",
         )
         if not inner_html_parts:
@@ -865,6 +1349,12 @@ def _build_trimmed_span(text: str) -> SentenceSpan:
     while end > start and text[end - 1].isspace():
         end -= 1
     return SentenceSpan(start=start, end=end)
+
+
+def _build_auxiliary_match_sentence(numbering_text: str, source_text: str) -> str:
+    if not numbering_text:
+        return ""
+    return normalize_text(f"{numbering_text} {source_text}")
 
 
 def _build_note_reference_fragment(node: ET.Element, inherited_css: str) -> InlineFragment:

@@ -65,10 +65,12 @@ def export_translated_docx(raw_bytes: bytes, segments: Iterable[Any]) -> bytes:
             segments_by_block=segments_by_block,
         )
 
+    _localize_numbering_definitions(package)
+
     return _build_modified_docx(
         raw_bytes=raw_bytes,
         package=package,
-        part_names={story.part_name for story in stories},
+        part_names={story.part_name for story in stories} | {"word/numbering.xml"},
     )
 
 
@@ -490,6 +492,119 @@ def _namespace_uri(tag: str) -> str:
     if tag.startswith("{") and "}" in tag:
         return tag[1:].split("}", 1)[0]
     return ""
+
+
+def _localize_numbering_definitions(package: DocxPackage) -> None:
+    numbering_root = package.read_xml("word/numbering.xml")
+    if numbering_root is None:
+        return
+
+    for level in numbering_root.findall(".//w:lvl", NS):
+        localized_definition = _build_localized_numbering_definition(level)
+        if localized_definition is None:
+            continue
+
+        num_fmt_value, lvl_text_value, suffix_value = localized_definition
+        _set_level_child_value(level, "numFmt", num_fmt_value)
+        _set_level_child_value(level, "lvlText", lvl_text_value)
+        _set_level_child_value(level, "suff", suffix_value)
+        _apply_numbering_level_font(level)
+
+
+def _build_localized_numbering_definition(
+    level: ET.Element,
+) -> tuple[str, str, str] | None:
+    lvl_text_element = level.find("./w:lvlText", NS)
+    if lvl_text_element is None:
+        return None
+
+    lvl_text_value = lvl_text_element.get(_qn("w", "val"), "")
+    if not lvl_text_value:
+        return None
+
+    num_fmt_element = level.find("./w:numFmt", NS)
+    num_fmt_value = "decimal" if num_fmt_element is None else num_fmt_element.get(_qn("w", "val"), "decimal")
+    suffix_element = level.find("./w:suff", NS)
+    suffix_value = "tab" if suffix_element is None else suffix_element.get(_qn("w", "val"), "tab")
+
+    for chinese_marker, english_label in (
+        ("章", "Chapter"),
+        ("节", "Section"),
+        ("条", "Article"),
+        ("款", "Clause"),
+    ):
+        if chinese_marker in lvl_text_value and "%1" in lvl_text_value:
+            return "decimal", f"{english_label} %1", "space"
+
+    normalized_text = _normalize_numbering_pattern(lvl_text_value)
+    if normalized_text != lvl_text_value or num_fmt_value in {
+        "chineseCounting",
+        "chineseLegalSimplified",
+        "ideographDigital",
+        "chineseCountingThousand",
+    }:
+        if _has_only_placeholders_and_ascii_punctuation(normalized_text):
+            normalized_text = normalized_text or "%1."
+            return "decimal", normalized_text, "space"
+
+    if any(token in lvl_text_value for token in ("、", "（", "）", "．", "。")) and _has_only_placeholders_and_ascii_punctuation(normalized_text):
+        return "decimal", normalized_text or "%1.", "space"
+
+    return None
+
+
+def _normalize_numbering_pattern(lvl_text: str) -> str:
+    normalized = lvl_text
+    for source, target in (
+        ("（", "("),
+        ("）", ")"),
+        ("【", "["),
+        ("】", "]"),
+        ("、", "."),
+        ("．", "."),
+        ("。", "."),
+        ("第", ""),
+        ("章", ""),
+        ("节", ""),
+        ("条", ""),
+        ("款", ""),
+    ):
+        normalized = normalized.replace(source, target)
+    return normalized.strip()
+
+
+def _has_only_placeholders_and_ascii_punctuation(text: str) -> bool:
+    stripped = text
+    for match in ("%1", "%2", "%3", "%4", "%5", "%6", "%7", "%8", "%9"):
+        stripped = stripped.replace(match, "")
+    stripped = stripped.replace("(", "").replace(")", "").replace("[", "").replace("]", "")
+    stripped = stripped.replace(".", "").replace("-", "").replace(" ", "")
+    return stripped == ""
+
+
+def _set_level_child_value(level: ET.Element, child_name: str, value: str) -> None:
+    child = level.find(f"./w:{child_name}", NS)
+    if child is None:
+        child = ET.Element(_qn("w", child_name))
+        level.append(child)
+    child.set(_qn("w", "val"), value)
+
+
+def _apply_numbering_level_font(level: ET.Element) -> None:
+    run_properties = level.find("./w:rPr", NS)
+    if run_properties is None:
+        run_properties = ET.Element(_qn("w", "rPr"))
+        level.append(run_properties)
+
+    fonts = run_properties.find("./w:rFonts", NS)
+    if fonts is None:
+        fonts = ET.Element(_qn("w", "rFonts"))
+        run_properties.insert(0, fonts)
+
+    for attr_name in ("ascii", "hAnsi", "cs", "eastAsia"):
+        fonts.set(_qn("w", attr_name), EXPORT_FONT_FAMILY)
+    for theme_attr in ("asciiTheme", "hAnsiTheme", "csTheme", "eastAsiaTheme"):
+        fonts.attrib.pop(_qn("w", theme_attr), None)
 
 
 def _build_modified_docx(
