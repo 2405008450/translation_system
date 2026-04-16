@@ -1,21 +1,36 @@
 import logging
+from io import BytesIO
 from time import perf_counter
+from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.database import get_db
-from app.services.document_workspace import build_docx_workspace, build_document_html_from_segments
+from app.services.document_exporter import (
+    DOCX_MEDIA_TYPE,
+    build_translated_docx_filename,
+    export_translated_docx,
+)
+from app.services.document_workspace import (
+    build_docx_preview_html,
+    build_docx_workspace,
+    build_document_html_from_segments,
+)
 from app.services.file_record_service import (
     count_file_records,
     create_file_record_with_segments,
     create_txt_file_record_with_segments,
+    get_file_record as get_file_record_model,
     get_file_record_with_segments,
+    get_tm_target_text_map,
     list_file_records,
+    list_segments_for_file_record,
+    load_file_record_source,
 )
 from app.services.file_parser import parse_uploaded_file
 from app.services.matcher import match_sentences_with_stats
@@ -32,6 +47,24 @@ DEFAULT_TASKS_PAGE_SIZE = 24
 MAX_TASKS_PAGE_SIZE = 100
 DEFAULT_SEGMENTS_PAGE_SIZE = 200
 MAX_SEGMENTS_PAGE_SIZE = 500
+
+
+def _build_docx_download_response(filename: str, docx_bytes: bytes) -> StreamingResponse:
+    export_filename = build_translated_docx_filename(filename)
+    ascii_filename = export_filename.encode("ascii", "ignore").decode("ascii").strip() or "translated.docx"
+    ascii_filename = ascii_filename.replace('"', "")
+    quoted_filename = quote(export_filename)
+
+    return StreamingResponse(
+        BytesIO(docx_bytes),
+        media_type=DOCX_MEDIA_TYPE,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_filename}"; '
+                f"filename*=UTF-8''{quoted_filename}"
+            )
+        },
+    )
 
 
 def _render_index(
@@ -61,7 +94,6 @@ def _clamp_page_size(page_size: int, default: int, maximum: int) -> int:
     return min(page_size, maximum)
 
 
-<<<<<<< HEAD
 def _build_pagination(base_path: str, page: int, page_size: int, total_items: int) -> dict:
     total_pages = max(1, (total_items + page_size - 1) // page_size) if total_items else 1
     current_page = min(_clamp_page(page), total_pages)
@@ -69,22 +101,6 @@ def _build_pagination(base_path: str, page: int, page_size: int, total_items: in
     end_item = 0 if total_items == 0 else min(current_page * page_size, total_items)
     page_start = max(1, current_page - 2)
     page_end = min(total_pages, current_page + 2)
-=======
-@router.get("/tasks/{document_id}", response_class=HTMLResponse)
-def continue_task(
-    request: Request,
-    document_id: UUID,
-    db: Session = Depends(get_db),
-) -> HTMLResponse:
-    """继续翻译任务"""
-    result = get_document_with_segments(db, document_id)
-    if not result:
-        return templates.TemplateResponse(
-            request,
-            "tasks.html",
-            {"request": request, "documents": list_documents(db), "error_message": "任务不存在"},
-        )
->>>>>>> 506e4e1 (移除 __pycache__ 追踪)
 
     def make_url(target_page: int) -> str:
         return f"{base_path}?page={target_page}&page_size={page_size}"
@@ -107,7 +123,11 @@ def continue_task(
     }
 
 
-def _build_match_results(segments) -> list:
+def _build_match_results(
+    segments,
+    tm_target_text_map: dict[str, str] | None = None,
+) -> list:
+    target_map = tm_target_text_map or {}
     return [
         type("MatchResult", (), {
             "source_sentence": seg.display_text,
@@ -116,10 +136,20 @@ def _build_match_results(segments) -> list:
             "matched_source_text": seg.matched_source_text,
             "target_text": seg.target_text,
             "sentence_id": seg.sentence_id,
-            "fuzzy_candidates": [],  # 从数据库恢复时没有候选数据
+            "source": seg.source,
+            "tm_target_text": target_map.get(seg.matched_source_text or "", seg.target_text if seg.source == "tm" else ""),
         })()
         for seg in segments
     ]
+
+
+def _build_tm_target_text_map(db: Session, segments) -> dict[str, str]:
+    matched_source_texts = [
+        seg.matched_source_text
+        for seg in segments
+        if getattr(seg, "matched_source_text", None)
+    ]
+    return get_tm_target_text_map(db, matched_source_texts)
 
 
 def _render_tasks_list(
@@ -202,12 +232,16 @@ def continue_task(
 
     file_record = result["file_record"]
     segments = result["segments"]
+    tm_target_text_map = _build_tm_target_text_map(db, segments)
 
     # 转换 segments 为 results 格式
-    results = _build_match_results(segments)
+    results = _build_match_results(segments, tm_target_text_map=tm_target_text_map)
 
-    # 从当前页 segments 重建预览 HTML，避免一次性渲染整份文档
-    document_html = build_document_html_from_segments(segments) if segments else ""
+    source_bytes = load_file_record_source(file_record)
+    if source_bytes:
+        document_html = build_docx_preview_html(source_bytes)
+    else:
+        document_html = build_document_html_from_segments(segments) if segments else ""
     supports_preview = bool(document_html)
 
     return templates.TemplateResponse(
@@ -222,10 +256,35 @@ def continue_task(
             "performance_summary": None,
             "document_html": document_html,
             "is_docx": supports_preview,
+            "can_export_docx": bool(source_bytes),
             "file_record_id": file_record_id,
             "pagination": pagination,
         },
     )
+
+
+@router.get("/tasks/{file_record_id}/export")
+def export_task_docx(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File record not found.")
+
+    raw_bytes = load_file_record_source(file_record)
+    if raw_bytes is None:
+        raise HTTPException(status_code=400, detail="The source DOCX is unavailable for export.")
+
+    segments = list_segments_for_file_record(db, file_record_id)
+    try:
+        translated_docx = export_translated_docx(raw_bytes=raw_bytes, segments=segments)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return _build_docx_download_response(file_record.filename, translated_docx)
 
 
 @router.post("/match", response_class=HTMLResponse)
@@ -273,13 +332,14 @@ async def upload_and_match(
         # 转换 segments 为 results 格式
         results = [
             type("MatchResult", (), {
-                "source_sentence": seg["source_text"],
+                "source_sentence": seg["display_text"],
                 "status": seg["status"],
                 "score": seg["score"],
                 "matched_source_text": seg["matched_source_text"],
                 "target_text": seg["target_text"],
                 "sentence_id": seg["sentence_id"],
-                "fuzzy_candidates": seg.get("fuzzy_candidates", []),
+                "source": "tm" if seg["status"] in ("exact", "fuzzy") else "none",
+                "tm_target_text": seg["target_text"] if seg["status"] in ("exact", "fuzzy") else "",
             })()
             for seg in workspace_data["segments"]
         ]
@@ -318,6 +378,8 @@ async def upload_and_match(
         # 为结果添加 sentence_id 并生成预览 HTML
         for i, r in enumerate(results):
             r.sentence_id = f"sent-{i+1:05d}"
+            r.source = "tm" if r.status in ("exact", "fuzzy") else "none"
+            r.tm_target_text = r.target_text if r.source == "tm" else ""
         
     logger.info(
         "match request file=%s total=%s prepared=%s unique=%s exact=%s fuzzy=%s none=%s "
@@ -348,6 +410,7 @@ async def upload_and_match(
     sentence_count = len(results)
     pagination = None
     display_results = results
+    can_export_docx = False
 
     if file_record_id is not None:
         pagination = _build_pagination(
@@ -363,8 +426,17 @@ async def upload_and_match(
             limit=pagination["page_size"],
         )
         if doc_result:
-            display_results = _build_match_results(doc_result["segments"])
-            document_html = build_document_html_from_segments(doc_result["segments"]) if doc_result["segments"] else ""
+            tm_target_text_map = _build_tm_target_text_map(db, doc_result["segments"])
+            display_results = _build_match_results(
+                doc_result["segments"],
+                tm_target_text_map=tm_target_text_map,
+            )
+            source_bytes = load_file_record_source(doc_result["file_record"])
+            can_export_docx = bool(source_bytes)
+            if source_bytes:
+                document_html = build_docx_preview_html(source_bytes)
+            else:
+                document_html = build_document_html_from_segments(doc_result["segments"]) if doc_result["segments"] else ""
 
     # 只要有 document_html 就支持预览
     supports_preview = bool(document_html)
@@ -381,6 +453,7 @@ async def upload_and_match(
             "performance_summary": performance_summary,
             "document_html": document_html,
             "is_docx": supports_preview,
+            "can_export_docx": can_export_docx,
             "file_record_id": file_record_id,
             "pagination": pagination,
         },

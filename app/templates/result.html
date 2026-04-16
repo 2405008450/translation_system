@@ -11,7 +11,7 @@
             margin-right: 48px;
         }
         .main-content.panel-open {
-            margin-right: calc(33.33vw + 48px);
+            margin-right: 448px;
         }
         .side-toolbar {
             position: fixed;
@@ -56,9 +56,8 @@
         .diff-panel {
             position: fixed;
             top: 0;
-            right: calc(-33.33vw);
-            width: 33.33vw;
-            min-width: 400px;
+            right: -400px;
+            width: 400px;
             height: 100vh;
             background: #fff;
             box-shadow: -4px 0 12px rgba(0,0,0,0.15);
@@ -97,16 +96,14 @@
             line-height: 1.8;
             word-break: break-word;
         }
-        .diff-content del,
-        .memory-match-table del {
+        .diff-content del {
             background: #fecaca;
             text-decoration: line-through;
             color: #dc2626;
             padding: 0 2px;
             border-radius: 2px;
         }
-        .diff-content ins,
-        .memory-match-table ins {
+        .diff-content ins {
             background: #bbf7d0;
             text-decoration: none;
             color: #16a34a;
@@ -147,6 +144,33 @@
             background: #d1e7dd;
             border-color: #198754;
         }
+        .editable-target.llm-updated {
+            background: #e7f1ff;
+            border-color: #6ea8fe;
+        }
+        .editable-target.streaming {
+            animation: llmPulse 1.1s ease;
+        }
+        .segment-meta {
+            min-height: 1.25rem;
+        }
+        .segment-meta.is-llm {
+            color: #0d6efd !important;
+        }
+        .llm-toolbar .form-select {
+            min-width: 132px;
+        }
+        .llm-status {
+            min-height: 1.5rem;
+        }
+        @keyframes llmPulse {
+            0% {
+                background: #cfe2ff;
+            }
+            100% {
+                background: #e7f1ff;
+            }
+        }
         /* 底部 tab 栏 */
         .bottom-tabbar {
             position: fixed;
@@ -164,7 +188,7 @@
             transition: right 0.3s ease;
         }
         .bottom-tabbar.panel-open {
-            right: calc(33.33vw + 48px);
+            right: 448px; /* 400px panel + 48px toolbar */
         }
         .bottom-tab {
             flex: 0 0 auto;
@@ -223,7 +247,7 @@
             bottom: 44px;
         }
         .preview-panel.panel-open {
-            right: calc(33.33vw + 48px);
+            right: 448px;
         }
         .preview-panel-header {
             padding: 0.75rem 1.25rem;
@@ -241,6 +265,17 @@
         .document-body {
             font-size: 1rem;
             line-height: 1.8;
+        }
+        .doc-story {
+            margin-bottom: 1.25rem;
+        }
+        .doc-story-label {
+            margin-bottom: 0.5rem;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: #6c757d;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
         }
         .doc-paragraph {
             margin-bottom: 1rem;
@@ -273,6 +308,19 @@
             padding: 0.5rem;
             vertical-align: top;
         }
+        .doc-textbox {
+            margin: 0.75rem 0 1rem;
+            padding: 0.75rem;
+            border: 1px solid #dee2e6;
+            background: #f8f9fa;
+        }
+        .doc-run {
+            white-space: pre-wrap;
+        }
+        .document-body a {
+            color: inherit;
+            text-decoration: underline;
+        }
         .table tbody tr {
             scroll-margin-bottom: 360px;
         }
@@ -294,64 +342,6 @@
         }
         .close-btn:hover {
             color: #000;
-        }
-        /* 记忆匹配表格样式 */
-        .memory-table-wrapper {
-            max-height: calc(100vh - 200px);
-            overflow-y: auto;
-        }
-        .memory-match-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 0.875rem;
-        }
-        .memory-match-table th,
-        .memory-match-table td {
-            border: 1px solid #dee2e6;
-            padding: 0.75rem;
-            vertical-align: top;
-            word-break: break-word;
-        }
-        .memory-match-table thead th {
-            background: #f8f9fa;
-            font-weight: 600;
-            position: sticky;
-            top: 0;
-            z-index: 1;
-        }
-        .memory-match-table tbody tr:hover {
-            background: rgba(13, 110, 253, 0.05);
-        }
-        .match-score {
-            display: inline-block;
-            padding: 0.25rem 0.5rem;
-            border-radius: 4px;
-            font-weight: 600;
-            font-size: 0.8rem;
-            text-align: center;
-            min-width: 50px;
-        }
-        .match-score.exact {
-            background: #198754;
-            color: #fff;
-        }
-        .match-score.high {
-            background: #8bc34a;
-            color: #fff;
-        }
-        .match-score.medium {
-            background: #ffc107;
-            color: #212529;
-        }
-        .match-score.low {
-            background: #ff9800;
-            color: #fff;
-        }
-        .no-match-hint {
-            padding: 2rem;
-            text-align: center;
-            background: #f8f9fa;
-            border-radius: 8px;
         }
     </style>
 </head>
@@ -394,16 +384,35 @@
 
     <div class="main-content">
         <div class="container py-5">
-            <div class="d-flex justify-content-between align-items-center mb-4">
+            <div class="d-flex justify-content-between align-items-start gap-3 mb-4 flex-wrap">
                 <div>
                     <h1 class="h3 mb-1">匹配结果</h1>
                     <p class="text-muted mb-0">文件：{{ filename }} | 原始句子数：{{ sentence_count }} | 模糊阈值：{{ "%.2f"|format(threshold) }}</p>
                 </div>
-                <div class="d-flex gap-2">
-                    <button class="btn btn-primary" id="btnSaveProgress" title="保存当前翻译进度">
-                        <span id="saveIcon">💾</span> 保存进度
-                    </button>
-                    <a href="/" class="btn btn-outline-secondary">返回首页</a>
+                <div class="text-end">
+                    <div class="d-flex flex-wrap gap-2 justify-content-end llm-toolbar">
+                        <select class="form-select" id="llmScope" title="选择 AI 处理范围">
+                            <option value="all" selected>处理全部</option>
+                            <option value="fuzzy_only">仅 fuzzy</option>
+                            <option value="none_only">仅 none</option>
+                        </select>
+                        <select class="form-select" id="llmProvider" title="选择 LLM 提供方">
+                            <option value="auto" selected>自动选择</option>
+                            <option value="deepseek">DeepSeek</option>
+                            <option value="openrouter">OpenRouter</option>
+                        </select>
+                        <button class="btn btn-outline-primary" id="btnLlmTranslate" title="对 fuzzy / none 句子执行 AI 译文修正">
+                            AI 译文修正
+                        </button>
+                        <button class="btn btn-primary" id="btnSaveProgress" title="保存当前翻译进度">
+                            <span id="saveIcon">💾</span> 保存进度
+                        </button>
+                        {% if can_export_docx and file_record_id %}
+                        <a href="/tasks/{{ file_record_id }}/export" class="btn btn-outline-success">导出译后 DOCX</a>
+                        {% endif %}
+                        <a href="/" class="btn btn-outline-secondary">返回首页</a>
+                    </div>
+                    <div class="small mt-2 text-muted llm-status" id="llmStatus">可对 fuzzy / none 句子执行 AI 译文修正。</div>
                 </div>
             </div>
 
@@ -449,17 +458,16 @@
                         <table class="table table-striped table-hover align-middle">
                             <thead class="table-dark">
                                 <tr>
-                                    <th style="width: 50px;">#</th>
                                     <th>原文句子</th>
                                     <th>状态</th>
                                     <th>匹配度</th>
+                                    <th>匹配到的原文</th>
                                     <th>对应译文</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 {% for item in results %}
-                                <tr data-index="{{ loop.index0 }}" data-sentence-id="{{ item.sentence_id }}">
-                                    <td>{{ loop.index }}</td>
+                                <tr data-index="{{ loop.index0 }}" data-sentence-id="{{ item.sentence_id }}" data-status="{{ item.status }}" data-source="{{ item.source }}">
                                     <td>{{ item.source_sentence }}</td>
                                     <td>
                                         {% if item.status == "exact" %}
@@ -471,16 +479,29 @@
                                         {% endif %}
                                     </td>
                                     <td>{{ "%.4f"|format(item.score) }}</td>
+                                    <td>{{ item.matched_source_text or "-" }}</td>
                                     <td>
-                                        <div class="editable-target" 
+                                        <div class="editable-target{% if item.source == 'llm' %} llm-updated{% endif %}" 
                                              contenteditable="true"
-                                             data-source="{{ item.source_sentence }}"
+                                             data-source-text="{{ item.source_sentence }}"
                                              data-matched="{{ item.matched_source_text or '' }}"
                                              data-original="{{ item.target_text or '' }}"
+                                             data-source-origin="{{ item.source }}"
                                              data-status="{{ item.status }}"
-                                             data-score="{{ item.score }}"
-                                             data-fuzzy-candidates="{{ item.fuzzy_candidates | tojson | e }}"
-                                             data-sentence-id="{{ item.sentence_id }}">{{ item.target_text or "" }}</div>
+                                             data-sentence-id="{{ item.sentence_id }}"
+                                             data-tm-target="{{ item.tm_target_text or '' }}"
+                                             data-llm-provider="">{{ item.target_text or "" }}</div>
+                                        <div class="segment-meta small text-muted mt-1{% if item.source == 'llm' %} is-llm{% endif %}" data-meta-for="{{ item.sentence_id }}">
+                                            {% if item.source == "llm" %}
+                                            来源：AI
+                                            {% elif item.source == "manual" %}
+                                            来源：人工
+                                            {% elif item.source == "tm" %}
+                                            来源：TM
+                                            {% else %}
+                                            来源：未翻译
+                                            {% endif %}
+                                        </div>
                                     </td>
                                 </tr>
                                 {% endfor %}
@@ -590,29 +611,25 @@
 
     <div class="diff-panel" id="diffPanel">
         <div class="diff-panel-header">
-            <h5 class="mb-0">记忆匹配</h5>
+            <h5 class="mb-0">记忆对比</h5>
             <button class="close-btn" id="closePanel">&times;</button>
         </div>
         <div class="diff-panel-body">
             <div class="diff-section">
-                <div class="diff-section-title">匹配结果</div>
-                <div class="memory-table-wrapper">
-                    <table class="memory-match-table" id="memoryMatchTable">
-                        <thead>
-                            <tr>
-                                <th style="width: 40px;">#</th>
-                                <th>原文差异对比</th>
-                                <th style="width: 70px;">匹配度</th>
-                                <th>记忆库译文</th>
-                            </tr>
-                        </thead>
-                        <tbody id="memoryMatchBody">
-                        </tbody>
-                    </table>
-                    <div class="no-match-hint" id="noMatchHint" style="display:none;">
-                        <span class="text-muted">无超过阈值的匹配结果</span>
-                    </div>
-                </div>
+                <div class="diff-section-title">当前原文</div>
+                <div class="diff-content" id="currentSource"></div>
+            </div>
+            <div class="diff-section">
+                <div class="diff-section-title">匹配到的原文</div>
+                <div class="diff-content" id="matchedSource"></div>
+            </div>
+            <div class="diff-section">
+                <div class="diff-section-title">原文差异对比</div>
+                <div class="diff-content" id="diffResult"></div>
+            </div>
+            <div class="diff-section">
+                <div class="diff-section-title">记忆库译文</div>
+                <div class="diff-content" id="targetText"></div>
             </div>
         </div>
     </div>
@@ -622,32 +639,54 @@
         const panel = document.getElementById('diffPanel');
         const mainContent = document.querySelector('.main-content');
         const closeBtn = document.getElementById('closePanel');
-        const editableCells = document.querySelectorAll('.editable-target');
-        const pageNavLinks = document.querySelectorAll('.page-nav-link');
+        const editableCells = Array.from(document.querySelectorAll('.editable-target'));
+        const pageNavLinks = Array.from(document.querySelectorAll('.page-nav-link'));
         const btnSaveProgress = document.getElementById('btnSaveProgress');
+        const btnLlmTranslate = document.getElementById('btnLlmTranslate');
+        const llmScope = document.getElementById('llmScope');
+        const llmProvider = document.getElementById('llmProvider');
+        const llmStatus = document.getElementById('llmStatus');
         const fileRecordId = document.body.dataset.fileRecordId;
+        const toolbarBtns = Array.from(document.querySelectorAll('.toolbar-btn'));
+        const btnMemory = document.getElementById('btnMemory');
+        const tableRows = Array.from(document.querySelectorAll('tbody tr[data-sentence-id]'));
 
-        // 跟踪修改的条目
         const modifiedEntries = new Map();
+        const cellMap = new Map(editableCells.map(cell => [cell.dataset.sentenceId, cell]));
+        const metaMap = new Map(
+            Array.from(document.querySelectorAll('.segment-meta')).map(node => [node.dataset.metaFor, node])
+        );
+        let isLlmRunning = false;
 
         function hasUnsavedChanges() {
             return modifiedEntries.size > 0;
         }
 
-        // 简单的字符级 diff 算法
+        function hasPendingWork() {
+            return hasUnsavedChanges() || isLlmRunning;
+        }
+
+        function escapeHtml(text) {
+            return String(text ?? '')
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;')
+                .replaceAll('"', '&quot;')
+                .replaceAll("'", '&#39;');
+        }
+
         function computeDiff(oldText, newText) {
-            if (!oldText || !newText) return newText || oldText || '';
-            if (oldText === newText) return newText;
+            if (!oldText || !newText) return escapeHtml(newText || oldText || '');
+            if (oldText === newText) return escapeHtml(newText);
 
             const oldChars = [...oldText];
             const newChars = [...newText];
             const m = oldChars.length;
             const n = newChars.length;
 
-            // LCS 动态规划
             const dp = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
-            for (let i = 1; i <= m; i++) {
-                for (let j = 1; j <= n; j++) {
+            for (let i = 1; i <= m; i += 1) {
+                for (let j = 1; j <= n; j += 1) {
                     if (oldChars[i - 1] === newChars[j - 1]) {
                         dp[i][j] = dp[i - 1][j - 1] + 1;
                     } else {
@@ -656,23 +695,23 @@
                 }
             }
 
-            // 回溯生成 diff
             const result = [];
-            let i = m, j = n;
+            let i = m;
+            let j = n;
             while (i > 0 || j > 0) {
                 if (i > 0 && j > 0 && oldChars[i - 1] === newChars[j - 1]) {
                     result.unshift({ type: 'same', char: oldChars[i - 1] });
-                    i--; j--;
+                    i -= 1;
+                    j -= 1;
                 } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
                     result.unshift({ type: 'ins', char: newChars[j - 1] });
-                    j--;
+                    j -= 1;
                 } else {
                     result.unshift({ type: 'del', char: oldChars[i - 1] });
-                    i--;
+                    i -= 1;
                 }
             }
 
-            // 合并连续相同类型
             let html = '';
             let currentType = null;
             let buffer = '';
@@ -680,9 +719,10 @@
             for (const item of result) {
                 if (item.type !== currentType) {
                     if (buffer) {
-                        if (currentType === 'del') html += `<del>${buffer}</del>`;
-                        else if (currentType === 'ins') html += `<ins>${buffer}</ins>`;
-                        else html += buffer;
+                        const safeBuffer = escapeHtml(buffer);
+                        if (currentType === 'del') html += `<del>${safeBuffer}</del>`;
+                        else if (currentType === 'ins') html += `<ins>${safeBuffer}</ins>`;
+                        else html += safeBuffer;
                     }
                     currentType = item.type;
                     buffer = item.char;
@@ -691,119 +731,62 @@
                 }
             }
             if (buffer) {
-                if (currentType === 'del') html += `<del>${buffer}</del>`;
-                else if (currentType === 'ins') html += `<ins>${buffer}</ins>`;
-                else html += buffer;
+                const safeBuffer = escapeHtml(buffer);
+                if (currentType === 'del') html += `<del>${safeBuffer}</del>`;
+                else if (currentType === 'ins') html += `<ins>${safeBuffer}</ins>`;
+                else html += safeBuffer;
             }
 
             return html;
         }
 
-        function openPanel(source, matched, target, status, score, fuzzyCandidates) {
-            const memoryMatchBody = document.getElementById('memoryMatchBody');
-            const noMatchHint = document.getElementById('noMatchHint');
-            
-            // 清空表格
-            memoryMatchBody.innerHTML = '';
-            
-            // 获取阈值
-            const threshold = {{ threshold }};
-            const scoreNum = parseFloat(score) || 0;
-            
-            // 解析fuzzy candidates
-            let candidates = [];
-            if (fuzzyCandidates) {
-                try {
-                    // 先解码 HTML 实体
-                    const textarea = document.createElement('textarea');
-                    textarea.innerHTML = fuzzyCandidates;
-                    const decoded = textarea.value;
-                    candidates = JSON.parse(decoded);
-                    console.log('Parsed fuzzy candidates:', candidates);
-                } catch (e) {
-                    console.error('Failed to parse fuzzy candidates:', e, fuzzyCandidates);
-                    candidates = [];
-                }
+        function getSourceLabel(sourceOrigin, providerName = '') {
+            if (sourceOrigin === 'llm') {
+                return providerName ? `来源：AI (${providerName})` : '来源：AI';
+            }
+            if (sourceOrigin === 'manual') {
+                return '来源：人工';
+            }
+            if (sourceOrigin === 'tm') {
+                return '来源：TM';
+            }
+            return '来源：未翻译';
+        }
+
+        function updateSourceMeta(sentenceId, sourceOrigin, providerName = '') {
+            const meta = metaMap.get(sentenceId);
+            if (!meta) return;
+            meta.textContent = getSourceLabel(sourceOrigin, providerName);
+            meta.classList.toggle('is-llm', sourceOrigin === 'llm');
+        }
+
+        function setLlmStatus(message, tone = 'muted') {
+            if (!llmStatus) return;
+            llmStatus.textContent = message || '';
+            llmStatus.className = `small mt-2 llm-status text-${tone}`;
+        }
+
+        function setLlmControlsLoading(loading) {
+            isLlmRunning = loading;
+            if (btnLlmTranslate) {
+                btnLlmTranslate.disabled = loading;
+                btnLlmTranslate.textContent = loading ? 'AI 修正中...' : 'AI 译文修正';
+            }
+            if (llmScope) llmScope.disabled = loading;
+            if (llmProvider) llmProvider.disabled = loading;
+        }
+
+        function openPanel(source, matched, tmTarget, status) {
+            document.getElementById('currentSource').textContent = source || '-';
+            document.getElementById('matchedSource').textContent = matched || '-';
+            document.getElementById('targetText').textContent = (status === 'none' || !matched) ? '-' : (tmTarget || '-');
+
+            if (matched && source && status === 'fuzzy') {
+                document.getElementById('diffResult').innerHTML = computeDiff(matched, source);
+            } else if (status === 'exact') {
+                document.getElementById('diffResult').innerHTML = '<span class="text-success">完全匹配</span>';
             } else {
-                console.log('No fuzzy candidates data');
-            }
-            
-            // 如果是exact匹配，显示一条100%的记录
-            if (status === 'exact' && matched) {
-                noMatchHint.style.display = 'none';
-                const row = document.createElement('tr');
-                row.innerHTML = `
-                    <td>1</td>
-                    <td>${escapeHtml(matched)}</td>
-                    <td><span class="match-score exact">100%</span></td>
-                    <td>${escapeHtml(target) || '-'}</td>
-                `;
-                memoryMatchBody.appendChild(row);
-            }
-            // 如果有fuzzy candidates，展示所有超过阈值的
-            else if (candidates.length > 0) {
-                noMatchHint.style.display = 'none';
-                
-                candidates.forEach((candidate, index) => {
-                    const candScore = parseFloat(candidate.score) || 0;
-                    if (candScore < threshold) return;
-                    
-                    // 计算差异对比
-                    const diffHtml = computeDiff(candidate.source_text, source);
-                    
-                    // 确定匹配度颜色
-                    let scoreClass = 'low';
-                    if (candScore >= 1.0) {
-                        scoreClass = 'exact';
-                    } else if (candScore >= 0.85) {
-                        scoreClass = 'high';
-                    } else if (candScore >= 0.7) {
-                        scoreClass = 'medium';
-                    }
-                    
-                    const row = document.createElement('tr');
-                    row.innerHTML = `
-                        <td>${index + 1}</td>
-                        <td>${diffHtml}</td>
-                        <td><span class="match-score ${scoreClass}">${Math.round(candScore * 100)}%</span></td>
-                        <td>${escapeHtml(candidate.target_text) || '-'}</td>
-                    `;
-                    memoryMatchBody.appendChild(row);
-                });
-                
-                // 如果过滤后没有结果
-                if (memoryMatchBody.children.length === 0) {
-                    noMatchHint.style.display = 'block';
-                }
-            }
-            // 如果是fuzzy状态但没有candidates数据，用matched和target显示一条记录
-            else if (status === 'fuzzy' && matched) {
-                noMatchHint.style.display = 'none';
-                const scoreNum = parseFloat(score) || 0;
-                
-                // 计算差异对比
-                const diffHtml = computeDiff(matched, source);
-                
-                // 确定匹配度颜色
-                let scoreClass = 'low';
-                if (scoreNum >= 1.0) {
-                    scoreClass = 'exact';
-                } else if (scoreNum >= 0.85) {
-                    scoreClass = 'high';
-                } else if (scoreNum >= 0.7) {
-                    scoreClass = 'medium';
-                }
-                
-                const row = document.createElement('tr');
-                row.innerHTML = `
-                    <td>1</td>
-                    <td>${diffHtml}</td>
-                    <td><span class="match-score ${scoreClass}">${Math.round(scoreNum * 100)}%</span></td>
-                    <td>${escapeHtml(target) || '-'}</td>
-                `;
-                memoryMatchBody.appendChild(row);
-            } else {
-                noMatchHint.style.display = 'block';
+                document.getElementById('diffResult').innerHTML = '<span class="text-muted">无匹配数据</span>';
             }
 
             panel.classList.add('open');
@@ -812,13 +795,6 @@
             const pp = document.getElementById('previewPanel');
             if (pp) pp.classList.add('panel-open');
             btnMemory.classList.add('active');
-        }
-        
-        function escapeHtml(text) {
-            if (!text) return '';
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
         }
 
         function closePanel() {
@@ -829,24 +805,54 @@
             if (pp) pp.classList.remove('panel-open');
         }
 
-        // 可编辑单元格事件
-        editableCells.forEach(cell => {
-            const originalText = cell.dataset.original;
+        function updateSaveButton() {
+            const count = modifiedEntries.size;
+            if (count > 0) {
+                btnSaveProgress.textContent = `保存进度 (${count})`;
+            } else {
+                btnSaveProgress.innerHTML = '<span id="saveIcon">💾</span> 保存进度';
+            }
+            btnSaveProgress.disabled = false;
+        }
 
-            // 点击打开侧边栏
+        function setCellSavedState(cell, text, sourceOrigin, providerName = '') {
+            const sentenceId = cell.dataset.sentenceId;
+            cell.textContent = text;
+            cell.dataset.original = text;
+            cell.dataset.sourceOrigin = sourceOrigin;
+            cell.dataset.llmProvider = providerName;
+            cell.classList.remove('modified');
+            cell.classList.add('saved');
+            cell.classList.remove('streaming');
+            cell.classList.toggle('llm-updated', sourceOrigin === 'llm');
+
+            if (sourceOrigin === 'llm') {
+                cell.classList.add('streaming');
+                window.setTimeout(() => cell.classList.remove('streaming'), 1200);
+            }
+
+            if (sentenceId) {
+                modifiedEntries.delete(sentenceId);
+                updateSourceMeta(sentenceId, sourceOrigin, providerName);
+                const row = cell.closest('tr');
+                if (row) row.dataset.source = sourceOrigin;
+            }
+            updateSaveButton();
+        }
+
+        function bindEditableCell(cell) {
             cell.addEventListener('click', () => {
-                const source = cell.dataset.source;
-                const matched = cell.dataset.matched;
-                const tmTarget = cell.dataset.original;  // 记忆库原始译文
-                const status = cell.dataset.status;
-                const score = cell.dataset.score;
-                const fuzzyCandidates = cell.dataset.fuzzyCandidates;
-                openPanel(source, matched, tmTarget, status, score, fuzzyCandidates);
+                openPanel(
+                    cell.dataset.sourceText,
+                    cell.dataset.matched,
+                    cell.dataset.tmTarget,
+                    cell.dataset.status
+                );
             });
 
-            // 输入时标记修改状态
             cell.addEventListener('input', () => {
                 const currentText = cell.textContent.trim();
+                const originalText = cell.dataset.original || '';
                 const sentenceId = cell.dataset.sentenceId;
 
                 if (currentText !== originalText) {
@@ -857,54 +863,25 @@
                     }
                 } else {
                     cell.classList.remove('modified');
-                    modifiedEntries.delete(sentenceId);
+                    if (sentenceId) {
+                        modifiedEntries.delete(sentenceId);
+                    }
                 }
 
                 updateSaveButton();
             });
 
-            // 回车保存，Shift+回车换行
-            cell.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
+            cell.addEventListener('keydown', event => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault();
                     cell.blur();
                 }
             });
-        });
-
-        function updateSaveButton() {
-            const count = modifiedEntries.size;
-            if (count > 0) {
-                btnSaveProgress.textContent = `💾 保存进度 (${count})`;
-                btnSaveProgress.disabled = false;
-            } else {
-                btnSaveProgress.innerHTML = '<span id="saveIcon">💾</span> 保存进度';
-                btnSaveProgress.disabled = false;
-            }
         }
 
-        pageNavLinks.forEach(link => {
-            link.addEventListener('click', (event) => {
-                if (!hasUnsavedChanges()) {
-                    return;
-                }
-                const confirmed = confirm('当前页有未保存修改，翻页后会丢失。是否继续？');
-                if (!confirmed) {
-                    event.preventDefault();
-                }
-            });
-        });
+        editableCells.forEach(bindEditableCell);
 
-        window.addEventListener('beforeunload', (event) => {
-            if (!hasUnsavedChanges()) {
-                return;
-            }
-            event.preventDefault();
-            event.returnValue = '';
-        });
-
-        // 保存进度到数据库
-        btnSaveProgress.addEventListener('click', async () => {
+        async function saveProgress() {
             if (!fileRecordId) {
                 alert('文档未保存，无法保存进度。请先上传文档创建任务。');
                 return;
@@ -916,12 +893,13 @@
             }
 
             const updates = [];
+            const sentenceIds = Array.from(modifiedEntries.keys());
             modifiedEntries.forEach((targetText, sentenceId) => {
                 updates.push({ sentence_id: sentenceId, target_text: targetText, source: 'manual' });
             });
 
             btnSaveProgress.disabled = true;
-            btnSaveProgress.innerHTML = '⏳ 保存中...';
+            btnSaveProgress.innerHTML = '保存中...';
 
             try {
                 const response = await fetch(`/api/file-records/${fileRecordId}/segments`, {
@@ -935,35 +913,204 @@
                 }
 
                 const result = await response.json();
-
-                // 标记已保存的单元格
-                editableCells.forEach(cell => {
-                    const sentenceId = cell.dataset.sentenceId;
-                    if (modifiedEntries.has(sentenceId)) {
-                        cell.classList.remove('modified');
-                        cell.classList.add('saved');
-                        cell.dataset.original = cell.textContent.trim();
-                    }
+                sentenceIds.forEach(sentenceId => {
+                    const cell = cellMap.get(sentenceId);
+                    if (!cell) return;
+                    setCellSavedState(cell, cell.textContent.trim(), 'manual');
                 });
 
                 modifiedEntries.clear();
                 updateSaveButton();
-
                 alert(`保存完成！已更新 ${result.updated_count} 条记录。`);
-
             } catch (error) {
                 alert('保存失败：' + error.message);
             } finally {
                 btnSaveProgress.disabled = false;
                 updateSaveButton();
             }
+        }
+
+        function processSseBuffer(buffer, handler) {
+            const parts = buffer.split('\n\n');
+            const pending = parts.pop() || '';
+
+            parts.forEach(part => {
+                if (!part.trim()) return;
+
+                let eventName = 'message';
+                const dataLines = [];
+
+                part.split(/\r?\n/).forEach(line => {
+                    if (line.startsWith('event:')) {
+                        eventName = line.slice(6).trim();
+                    } else if (line.startsWith('data:')) {
+                        dataLines.push(line.slice(5).trim());
+                    }
+                });
+
+                if (dataLines.length === 0) return;
+
+                try {
+                    handler(eventName, JSON.parse(dataLines.join('\n')));
+                } catch (error) {
+                    console.error('解析 SSE 事件失败', error);
+                }
+            });
+
+            return pending;
+        }
+
+        async function readErrorMessage(response) {
+            const contentType = response.headers.get('content-type') || '';
+            if (contentType.includes('application/json')) {
+                const payload = await response.json();
+                return payload.detail || '请求失败';
+            }
+            return (await response.text()) || '请求失败';
+        }
+
+        async function runLlmTranslate() {
+            if (!fileRecordId) {
+                alert('文档未保存，无法执行 AI 译文修正。');
+                return;
+            }
+
+            if (hasUnsavedChanges()) {
+                alert('请先保存当前修改，再执行 AI 译文修正。');
+                return;
+            }
+
+            let updatedCount = 0;
+            let errorCount = 0;
+            let totalCount = 0;
+
+            setLlmControlsLoading(true);
+            setLlmStatus('正在连接 AI 服务...', 'primary');
+
+            try {
+                const response = await fetch(`/api/file-records/${fileRecordId}/llm-translate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        scope: llmScope.value,
+                        provider: llmProvider.value,
+                    }),
+                });
+
+                if (!response.ok) {
+                    throw new Error(await readErrorMessage(response));
+                }
+                if (!response.body) {
+                    throw new Error('当前浏览器不支持流式响应。');
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder('utf-8');
+                let buffer = '';
+
+                const handleEvent = (eventName, payload) => {
+                    if (eventName === 'start') {
+                        totalCount = payload.total || 0;
+                        if (totalCount === 0) {
+                            setLlmStatus('当前范围内没有需要 AI 处理的句子。', 'muted');
+                        } else {
+                            setLlmStatus(`准备处理 ${totalCount} 条句子...`, 'primary');
+                        }
+                        return;
+                    }
+
+                    if (eventName === 'segment') {
+                        updatedCount += 1;
+                        const cell = cellMap.get(payload.sentence_id);
+                        if (cell) {
+                            setCellSavedState(
+                                cell,
+                                payload.target_text || '',
+                                payload.source || 'llm',
+                                payload.provider || ''
+                            );
+                        }
+                        setLlmStatus(
+                            `AI 已更新 ${updatedCount}/${totalCount || updatedCount} 条${errorCount ? `，失败 ${errorCount} 条` : ''}。`,
+                            'primary'
+                        );
+                        return;
+                    }
+
+                    if (eventName === 'error') {
+                        errorCount += 1;
+                        setLlmStatus(
+                            `AI 已更新 ${updatedCount}/${totalCount || updatedCount + errorCount} 条，失败 ${errorCount} 条。${payload.message ? ` ${payload.message}` : ''}`,
+                            'danger'
+                        );
+                        return;
+                    }
+
+                    if (eventName === 'complete') {
+                        updatedCount = payload.updated_count ?? updatedCount;
+                        errorCount = payload.error_count ?? errorCount;
+                        totalCount = payload.total ?? totalCount;
+
+                        if (totalCount === 0) {
+                            setLlmStatus('当前范围内没有需要 AI 处理的句子。', 'muted');
+                        } else if (errorCount > 0) {
+                            setLlmStatus(`AI 译文修正完成：成功 ${updatedCount} 条，失败 ${errorCount} 条。`, 'danger');
+                        } else {
+                            setLlmStatus(`AI 译文修正完成：已更新 ${updatedCount} 条。`, 'success');
+                        }
+                    }
+                };
+
+                while (true) {
+                    const { value, done } = await reader.read();
+                    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+                    buffer = processSseBuffer(buffer, handleEvent);
+
+                    if (done) {
+                        buffer = processSseBuffer(`${buffer}\n\n`, handleEvent);
+                        break;
+                    }
+                }
+            } catch (error) {
+                setLlmStatus(`AI 译文修正失败：${error.message}`, 'danger');
+                alert('AI 译文修正失败：' + error.message);
+            } finally {
+                setLlmControlsLoading(false);
+                updateSaveButton();
+            }
+        }
+
+        pageNavLinks.forEach(link => {
+            link.addEventListener('click', event => {
+                if (!hasPendingWork()) {
+                    return;
+                }
+                const message = isLlmRunning
+                    ? 'AI 译文修正仍在进行中，翻页后会中断当前流式任务。是否继续？'
+                    : '当前页有未保存修改，翻页后会丢失。是否继续？';
+                if (!confirm(message)) {
+                    event.preventDefault();
+                }
+            });
         });
 
-        closeBtn.addEventListener('click', closePanel);
+        window.addEventListener('beforeunload', event => {
+            if (!hasPendingWork()) {
+                return;
+            }
+            event.preventDefault();
+            event.returnValue = '';
+        });
 
-        // 工具栏按钮切换
-        const toolbarBtns = document.querySelectorAll('.toolbar-btn');
-        const btnMemory = document.getElementById('btnMemory');
+        if (btnSaveProgress) {
+            btnSaveProgress.addEventListener('click', saveProgress);
+        }
+
+        if (btnLlmTranslate) {
+            btnLlmTranslate.addEventListener('click', runLlmTranslate);
+        }
+
+        closeBtn.addEventListener('click', closePanel);
 
         toolbarBtns.forEach(btn => {
             btn.addEventListener('click', () => {
@@ -972,42 +1119,37 @@
                         closePanel();
                         btn.classList.remove('active');
                     } else {
-                        // 优先用当前高亮行，否则用第一行
                         const activeRow = document.querySelector('tbody tr.is-active');
                         const cell = activeRow
                             ? activeRow.querySelector('.editable-target')
                             : editableCells[0];
                         if (cell) {
                             openPanel(
-                                cell.dataset.source,
+                                cell.dataset.sourceText,
                                 cell.dataset.matched,
-                                cell.dataset.original,
-                                cell.dataset.status,
-                                cell.dataset.score,
-                                cell.dataset.fuzzyCandidates
+                                cell.dataset.tmTarget,
+                                cell.dataset.status
                             );
                         } else {
-                            openPanel('', '', '', 'none', '0', '[]');
+                            openPanel('', '', '', 'none');
                         }
                     }
                 } else {
-                    toolbarBtns.forEach(b => b.classList.remove('active'));
+                    toolbarBtns.forEach(button => button.classList.remove('active'));
                     btn.classList.add('active');
                     closePanel();
                 }
             });
         });
 
-        document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape') closePanel();
-            // Ctrl+S 保存
-            if ((e.ctrlKey || e.metaKey) && e.key === 's') {
-                e.preventDefault();
+        document.addEventListener('keydown', event => {
+            if (event.key === 'Escape') closePanel();
+            if ((event.ctrlKey || event.metaKey) && event.key === 's') {
+                event.preventDefault();
                 btnSaveProgress.click();
             }
         });
 
-        // ========== 底部 tab 栏 ==========
         mainContent.classList.add('tabbar-visible');
 
         const tabQA = document.getElementById('tabQA');
@@ -1017,10 +1159,9 @@
         const allTabs = [tabQA, tabHistory, tabSourcePreview, tabTargetPreview];
 
         function clearActiveTabs() {
-            allTabs.forEach(t => t && t.classList.remove('active'));
+            allTabs.forEach(tab => tab && tab.classList.remove('active'));
         }
 
-        // QA / 历史 / 译文预览 暂未实现，点击仅切换高亮
         [tabQA, tabHistory, tabTargetPreview].forEach(tab => {
             if (!tab) return;
             tab.addEventListener('click', () => {
@@ -1030,10 +1171,8 @@
             });
         });
 
-        // ========== 原文预览双向联动 ==========
         const previewPanel = document.getElementById('previewPanel');
         const closePreviewBtn = document.getElementById('closePreview');
-        const tableRows = document.querySelectorAll('tbody tr[data-sentence-id]');
         const isPreviewSupported = document.body.dataset.previewSupported === 'true';
 
         function openPreview() {
@@ -1077,7 +1216,7 @@
         }
 
         if (previewPanel) {
-            const docSentences = previewPanel.querySelectorAll('.doc-sentence');
+            const docSentences = Array.from(previewPanel.querySelectorAll('.doc-sentence'));
             const rowMap = new Map();
             const sentenceMap = new Map();
 
@@ -1126,15 +1265,15 @@
             }
 
             tableRows.forEach(row => {
-                row.addEventListener('click', (e) => {
-                    if (e.target.classList.contains('editable-target')) return;
+                row.addEventListener('click', event => {
+                    if (event.target.closest('.editable-target')) return;
                     setActiveSentence(row.dataset.sentenceId, { scrollTable: false });
                 });
             });
 
             docSentences.forEach(node => {
-                node.addEventListener('click', (e) => {
-                    e.stopPropagation();
+                node.addEventListener('click', event => {
+                    event.stopPropagation();
                     setActiveSentence(node.dataset.sentenceId, { scrollPreview: false });
                 });
             });

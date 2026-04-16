@@ -1,39 +1,21 @@
-# ===== 环境变量 =====
-.env
-.env.*
-!.env.example
-
-# ===== Python =====
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.py[cod]
-
-# ===== 虚拟环境 =====
 .venv/
 venv/
 env/
 ENV/
-
-# ===== 测试 / 缓存 =====
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 htmlcov/
 coverage/
-
-# ===== 日志 =====
 *.log
-
-# ===== IDE =====
-.idea/
-.vscode/
-
-# ===== 其他工具 =====
 .claude/
+data/
+tests/
 
-# ===== 本地数据（按需打开）=====
-# *.xlsx
-# *.db
-# *.sqlite3

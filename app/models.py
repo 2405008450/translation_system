@@ -1,13 +1,6 @@
-<<<<<<< HEAD
 import uuid
 
 from sqlalchemy import DateTime, ForeignKey, Index, String, Text, Uuid, func, text
-=======
-from uuid import UUID
-
-from sqlalchemy import BigInteger, DateTime, Enum, ForeignKey, Index, String, Text, func
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
->>>>>>> 506e4e1 (移除 __pycache__ 追踪)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -23,7 +16,6 @@ UUID_SQL_DEFAULT = text(
     )::uuid"""
 )
 
-<<<<<<< HEAD
 
 class FileRecord(Base):
     __tablename__ = "file_records"
@@ -34,13 +26,6 @@ class FileRecord(Base):
         default=uuid.uuid4,
         server_default=UUID_SQL_DEFAULT,
     )
-=======
-class Document(Base):
-    """文档表：记录用户上传的文档"""
-    __tablename__ = "file_records"
-
-    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
->>>>>>> 506e4e1 (移除 __pycache__ 追踪)
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     file_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft")
@@ -63,7 +48,6 @@ class Document(Base):
 
 class Segment(Base):
     __tablename__ = "segments"
-<<<<<<< HEAD
     __table_args__ = (Index("ix_segments_file_record_id", "file_record_id"),)
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -78,15 +62,6 @@ class Segment(Base):
         nullable=False,
     )
     sentence_id: Mapped[str] = mapped_column(String(20), nullable=False)
-=======
-    __table_args__ = (
-        Index("ix_segments_file_record_id", "file_record_id"),
-    )
-
-    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
-    file_record_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("file_records.id", ondelete="CASCADE"), nullable=False)
-    sentence_id: Mapped[str] = mapped_column(String(20), nullable=False)  # sent-00001
->>>>>>> 506e4e1 (移除 __pycache__ 追踪)
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
     display_text: Mapped[str] = mapped_column(Text, nullable=False)
     target_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
