@@ -30,6 +30,12 @@ def parse_docx_for_slate(
         db=db,
         sentences=[segment["source_text"] for segment in segments],
         similarity_threshold=similarity_threshold,
+        auxiliary_sentences=[
+            f"{segment.get('numbering_text', '')} {segment['source_text']}".strip()
+            if segment.get("numbering_text")
+            else ""
+            for segment in segments
+        ],
     )
 
     output_segments: list[dict] = []

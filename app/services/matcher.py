@@ -26,6 +26,10 @@ class PreparedSentence:
     normalized_sentence: str
     match_text: str
     source_hash: str
+    auxiliary_sentence: str = ""
+    auxiliary_normalized: str = ""
+    auxiliary_match_text: str = ""
+    auxiliary_hash: str = ""
 
 
 @dataclass(frozen=True)
@@ -54,8 +58,14 @@ def match_sentences(
     db: Session,
     sentences: list[str],
     similarity_threshold: float,
+    auxiliary_sentences: list[str] | None = None,
 ) -> list[MatchResult]:
-    results, _ = match_sentences_with_stats(db, sentences, similarity_threshold)
+    results, _ = match_sentences_with_stats(
+        db,
+        sentences,
+        similarity_threshold,
+        auxiliary_sentences=auxiliary_sentences,
+    )
     return results
 
 
@@ -63,9 +73,10 @@ def match_sentences_with_stats(
     db: Session,
     sentences: list[str],
     similarity_threshold: float,
+    auxiliary_sentences: list[str] | None = None,
 ) -> tuple[list[MatchResult], MatchStats]:
     total_started_at = perf_counter()
-    prepared_sentences = _prepare_sentences(sentences)
+    prepared_sentences = _prepare_sentences(sentences, auxiliary_sentences=auxiliary_sentences)
     if not prepared_sentences:
         return [], MatchStats(
             total_input_sentences=len(sentences),
@@ -113,17 +124,30 @@ def match_sentences_with_stats(
     )
 
 
-def _prepare_sentences(sentences: list[str]) -> list[PreparedSentence]:
+def _prepare_sentences(
+    sentences: list[str],
+    auxiliary_sentences: list[str] | None = None,
+) -> list[PreparedSentence]:
     prepared_sentences: list[PreparedSentence] = []
+    normalized_auxiliary_sentences = list(auxiliary_sentences or [])
+    if len(normalized_auxiliary_sentences) < len(sentences):
+        normalized_auxiliary_sentences.extend([""] * (len(sentences) - len(normalized_auxiliary_sentences)))
 
-    for sentence in sentences:
+    for index, sentence in enumerate(sentences):
         normalized_sentence = normalize_text(sentence)
+        auxiliary_sentence = normalized_auxiliary_sentences[index]
+        auxiliary_normalized = normalize_text(auxiliary_sentence)
+        auxiliary_match_text = normalize_match_text(auxiliary_sentence) or auxiliary_normalized
         prepared_sentences.append(
             PreparedSentence(
                 source_sentence=sentence,
                 normalized_sentence=normalized_sentence,
                 match_text=normalize_match_text(sentence) or normalized_sentence,
                 source_hash=build_source_hash(sentence) if normalized_sentence else "",
+                auxiliary_sentence=auxiliary_sentence,
+                auxiliary_normalized=auxiliary_normalized,
+                auxiliary_match_text=auxiliary_match_text,
+                auxiliary_hash=build_source_hash(auxiliary_sentence) if auxiliary_normalized else "",
             )
         )
 
@@ -168,7 +192,17 @@ def _resolve_matches(
             none_hits += 1
             continue
 
-        exact_match = exact_matches_by_hash.get(sentence.source_hash)
+        exact_match = exact_matches_by_hash.get(sentence.auxiliary_hash)
+        if exact_match is None:
+            exact_match = exact_matches_by_normalized.get(sentence.auxiliary_normalized)
+        if exact_match is None:
+            exact_match = exact_matches_by_normalized.get(sentence.auxiliary_match_text)
+        if exact_match is None:
+            exact_match = exact_matches_by_source_text.get(sentence.auxiliary_normalized)
+        if exact_match is None:
+            exact_match = exact_matches_by_source_text.get(sentence.auxiliary_match_text)
+        if exact_match is None:
+            exact_match = exact_matches_by_hash.get(sentence.source_hash)
         if exact_match is None:
             exact_match = exact_matches_by_normalized.get(sentence.normalized_sentence)
         if exact_match is None:
@@ -237,14 +271,25 @@ def _find_exact_matches(
     dict[str, TranslationMemory],
 ]:
     sentences = list(sentences)
-    source_hashes = [sentence.source_hash for sentence in sentences]
+    source_hashes = [
+        source_hash
+        for sentence in sentences
+        for source_hash in (sentence.auxiliary_hash, sentence.source_hash)
+        if source_hash
+    ]
     normalized_candidates = list(
         {
             sentence.normalized_sentence
             for sentence in sentences
             if sentence.normalized_sentence
         }
+        | {
+            sentence.auxiliary_normalized
+            for sentence in sentences
+            if sentence.auxiliary_normalized
+        }
         | {sentence.match_text for sentence in sentences if sentence.match_text}
+        | {sentence.auxiliary_match_text for sentence in sentences if sentence.auxiliary_match_text}
     )
     source_text_candidates = normalized_candidates
 
@@ -309,17 +354,22 @@ def _find_fuzzy_matches_chunk(
     value_rows: list[str] = []
 
     for index, sentence in enumerate(prepared_sentences):
-        param_name = f"query_{index}"
-        params[param_name] = sentence.match_text
-        value_rows.append(f"({index}, :{param_name})")
+        source_param_name = f"query_source_{index}"
+        params[source_param_name] = sentence.match_text
+        value_rows.append(f"({index}, 'source', :{source_param_name})")
+        if sentence.auxiliary_match_text and sentence.auxiliary_match_text != sentence.match_text:
+            auxiliary_param_name = f"query_aux_{index}"
+            params[auxiliary_param_name] = sentence.auxiliary_match_text
+            value_rows.append(f"({index}, 'auxiliary', :{auxiliary_param_name})")
 
     stmt = text(
         f"""
-        WITH input(query_index, query_text) AS (
+        WITH input(query_index, query_kind, query_text) AS (
             VALUES {", ".join(value_rows)}
         )
         SELECT
             input.query_index,
+            input.query_kind,
             input.query_text,
             matched.compare_text,
             matched.source_text,
@@ -350,17 +400,38 @@ def _find_fuzzy_matches_chunk(
     )
     rows = db.execute(stmt, params).mappings().all()
 
-    grouped_candidates: dict[int, list[dict]] = {}
+    grouped_candidates: dict[int, dict[tuple[str, str], dict]] = {}
     for row in rows:
         if row["source_text"] is None or row["target_text"] is None:
             continue
-        grouped_candidates.setdefault(int(row["query_index"]), []).append(dict(row))
+        query_index = int(row["query_index"])
+        candidate_key = (row["source_text"], row["target_text"])
+        candidate_entry = grouped_candidates.setdefault(query_index, {}).setdefault(
+            candidate_key,
+            {
+                "compare_text": row["compare_text"],
+                "source_text": row["source_text"],
+                "target_text": row["target_text"],
+                "source_trigram_score": 0.0,
+                "auxiliary_trigram_score": 0.0,
+            },
+        )
+        if row["query_kind"] == "auxiliary":
+            candidate_entry["auxiliary_trigram_score"] = max(
+                float(row["trigram_score"]),
+                float(candidate_entry["auxiliary_trigram_score"]),
+            )
+        else:
+            candidate_entry["source_trigram_score"] = max(
+                float(row["trigram_score"]),
+                float(candidate_entry["source_trigram_score"]),
+            )
 
     matches: list[ResolvedMatch | None] = []
     for index, sentence in enumerate(prepared_sentences):
         best_candidate = _pick_best_fuzzy_candidate(
-            query_text=sentence.match_text,
-            candidates=grouped_candidates.get(index, []),
+            sentence=sentence,
+            candidates=list(grouped_candidates.get(index, {}).values()),
             similarity_threshold=similarity_threshold,
         )
         if best_candidate is None:
@@ -381,28 +452,48 @@ def _find_fuzzy_matches_chunk(
 
 
 def _pick_best_fuzzy_candidate(
-    query_text: str,
+    sentence: PreparedSentence,
     candidates: list[dict],
     similarity_threshold: float,
 ) -> dict | None:
     best_candidate = None
     best_score = 0.0
+    best_base_score = 0.0
 
     for candidate in candidates:
         compare_text = normalize_match_text(candidate["compare_text"]) or candidate["compare_text"]
-        sequence_score = SequenceMatcher(None, query_text, compare_text).ratio()
-        trigram_score = float(candidate["trigram_score"])
-        final_score = max(trigram_score, sequence_score)
+        source_sequence_score = SequenceMatcher(None, sentence.match_text, compare_text).ratio()
+        source_score = max(float(candidate["source_trigram_score"]), source_sequence_score)
 
-        if final_score > best_score:
+        auxiliary_score = 0.0
+        if sentence.auxiliary_match_text:
+            auxiliary_sequence_score = SequenceMatcher(
+                None,
+                sentence.auxiliary_match_text,
+                compare_text,
+            ).ratio()
+            auxiliary_score = max(
+                float(candidate["auxiliary_trigram_score"]),
+                auxiliary_sequence_score,
+            )
+
+        base_score = max(source_score, auxiliary_score)
+        final_score = base_score
+        if auxiliary_score > source_score:
+            final_score += min(auxiliary_score - source_score, 0.05)
+
+        if final_score > best_score or (
+            final_score == best_score and base_score > best_base_score
+        ):
             best_score = final_score
+            best_base_score = base_score
             best_candidate = {
                 "source_text": candidate["source_text"],
                 "target_text": candidate["target_text"],
                 "score": final_score,
             }
 
-    if best_candidate and best_score >= similarity_threshold:
+    if best_candidate and best_base_score >= similarity_threshold:
         return best_candidate
 
     return None

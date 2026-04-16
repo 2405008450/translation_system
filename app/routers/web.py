@@ -332,7 +332,7 @@ async def upload_and_match(
         # 转换 segments 为 results 格式
         results = [
             type("MatchResult", (), {
-                "source_sentence": seg["source_text"],
+                "source_sentence": seg["display_text"],
                 "status": seg["status"],
                 "score": seg["score"],
                 "matched_source_text": seg["matched_source_text"],
