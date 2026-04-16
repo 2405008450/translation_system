@@ -1,4 +1,0 @@
-# file: D:\Pychar\demo\translation_system\app\services\adapters\__init__.py
-# hypothesis_version: 6.151.10
-
-['AdapterError', 'AdapterNotFoundError', 'AdapterRegistry', 'ConversionError', 'DocumentAST', 'DocumentAdapter', 'DocumentNode', 'EncodingError', 'ParseError', 'ParseResult', 'Segment', 'TxtAdapter', 'get_registry']

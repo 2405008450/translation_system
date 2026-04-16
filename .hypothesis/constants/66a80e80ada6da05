@@ -1,4 +1,0 @@
-# file: D:\Pychar\demo\translation_system\app\services\adapters\dita_adapter.py
-# hypothesis_version: 6.151.10
-
-['.dita', '.ditamap', '.xml', '<unknown>', 'abstract', 'apiname', 'attrs', 'b', 'body', 'cite', 'cmdname', 'codeblock', 'codeph', 'conbody', 'concept', 'conref', 'dita_tag', 'doc_type', 'end', 'entry', 'filepath', 'i', 'inline_tags', 'is_placeholder', 'keyword', 'li', 'link', 'menucascade', 'note', 'ol', 'option', 'p', 'parmname', 'ph', 'pre', 'q', 'refbody', 'reference', 'row', 'section', 'shortdesc', 'simpletable', 'start', 'stentry', 'strow', 'sub', 'sup', 'table', 'tag', 'task', 'taskbody', 'term', 'title', 'topic', 'tt', 'u', 'uicontrol', 'ul', 'varname', 'wintitle', 'xref']

@@ -1,4 +1,0 @@
-# file: D:\Pychar\demo\translation_system\app\services\adapters\dita_exporter.py
-# hypothesis_version: 6.151.10
-
-['<unknown>', 'Exported Document', 'UTF-8', 'attr_', 'body', 'codeblock', 'conbody', 'concept', 'conref', 'dita_tag', 'entry', 'exported_topic', 'id', 'li', 'note', 'p', 'refbody', 'reference', 'row', 'section', 'table', 'task', 'taskbody', 'title', 'topic', 'ul']
