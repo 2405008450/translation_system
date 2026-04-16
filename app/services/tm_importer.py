@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from uuid import UUID
 
 from openpyxl import load_workbook
 from sqlalchemy import or_
@@ -38,15 +39,23 @@ def import_tm_from_xlsx_upload(
     raw_bytes: bytes,
     filename: str,
     batch_size: int = 5000,
+    collection_id: UUID | None = None,
 ) -> TMImportSummary:
     workbook = load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)
-    return _import_workbook(db=db, workbook=workbook, filename=filename, batch_size=batch_size)
+    return _import_workbook(
+        db=db,
+        workbook=workbook,
+        filename=filename,
+        batch_size=batch_size,
+        collection_id=collection_id,
+    )
 
 
 def import_tm_from_xlsx_path(
     db: Session,
     xlsx_path: str | Path,
     batch_size: int = 5000,
+    collection_id: UUID | None = None,
 ) -> TMImportSummary:
     workbook = load_workbook(Path(xlsx_path), read_only=True, data_only=True)
     return _import_workbook(
@@ -54,10 +63,17 @@ def import_tm_from_xlsx_path(
         workbook=workbook,
         filename=Path(xlsx_path).name,
         batch_size=batch_size,
+        collection_id=collection_id,
     )
 
 
-def _import_workbook(db: Session, workbook, filename: str, batch_size: int) -> TMImportSummary:
+def _import_workbook(
+    db: Session,
+    workbook,
+    filename: str,
+    batch_size: int,
+    collection_id: UUID | None = None,
+) -> TMImportSummary:
     worksheet = workbook.active
     batch_rows: dict[str, dict] = {}
     created_rows = 0
@@ -77,13 +93,18 @@ def _import_workbook(db: Session, workbook, filename: str, batch_size: int) -> T
             skipped_empty_rows += 1
             continue
 
-        tm_row = _build_tm_row(source_text=source_text, target_text=target_text)
+        tm_row = _build_tm_row(
+            source_text=source_text,
+            target_text=target_text,
+            collection_id=collection_id,
+        )
         batch_rows[tm_row["source_hash"]] = tm_row
 
         if len(batch_rows) >= batch_size:
             created_in_batch, updated_in_batch = _flush_tm_batch(
                 db=db,
                 batch_rows=list(batch_rows.values()),
+                collection_id=collection_id,
             )
             created_rows += created_in_batch
             updated_rows += updated_in_batch
@@ -93,6 +114,7 @@ def _import_workbook(db: Session, workbook, filename: str, batch_size: int) -> T
         created_in_batch, updated_in_batch = _flush_tm_batch(
             db=db,
             batch_rows=list(batch_rows.values()),
+            collection_id=collection_id,
         )
         created_rows += created_in_batch
         updated_rows += updated_in_batch
@@ -107,8 +129,13 @@ def _import_workbook(db: Session, workbook, filename: str, batch_size: int) -> T
     )
 
 
-def _build_tm_row(source_text: str, target_text: str) -> dict:
+def _build_tm_row(
+    source_text: str,
+    target_text: str,
+    collection_id: UUID | None = None,
+) -> dict:
     return {
+        "collection_id": collection_id,
         "source_text": source_text,
         "target_text": target_text,
         "source_hash": build_source_hash(source_text),
@@ -116,13 +143,17 @@ def _build_tm_row(source_text: str, target_text: str) -> dict:
     }
 
 
-def _flush_tm_batch(db: Session, batch_rows: list[dict]) -> tuple[int, int]:
+def _flush_tm_batch(
+    db: Session,
+    batch_rows: list[dict],
+    collection_id: UUID | None = None,
+) -> tuple[int, int]:
     if not batch_rows:
         return 0, 0
 
     source_hashes = [row["source_hash"] for row in batch_rows]
     source_texts = [row["source_text"] for row in batch_rows]
-    existing_rows = (
+    existing_query = (
         db.query(TranslationMemory)
         .filter(
             or_(
@@ -130,8 +161,12 @@ def _flush_tm_batch(db: Session, batch_rows: list[dict]) -> tuple[int, int]:
                 TranslationMemory.source_text.in_(source_texts),
             )
         )
-        .all()
     )
+    if collection_id is None:
+        existing_query = existing_query.filter(TranslationMemory.collection_id.is_(None))
+    else:
+        existing_query = existing_query.filter(TranslationMemory.collection_id == collection_id)
+    existing_rows = existing_query.all()
 
     existing_by_hash: dict[str, TranslationMemory] = {}
     existing_by_source_text: dict[str, TranslationMemory] = {}
@@ -155,6 +190,7 @@ def _flush_tm_batch(db: Session, batch_rows: list[dict]) -> tuple[int, int]:
         existing.target_text = row["target_text"]
         existing.source_hash = row["source_hash"]
         existing.source_normalized = row["source_normalized"]
+        existing.collection_id = row["collection_id"]
         existing_by_hash[row["source_hash"]] = existing
         existing_by_source_text[row["source_text"]] = existing
         updated_rows += 1

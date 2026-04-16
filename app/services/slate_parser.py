@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from uuid import UUID
+
 from sqlalchemy.orm import Session
 
 from app.services.document_workspace import parse_docx_workspace
@@ -10,6 +12,7 @@ def parse_docx_for_slate(
     db: Session,
     raw_bytes: bytes,
     similarity_threshold: float = 0.6,
+    collection_ids: list[UUID] | None = None,
 ) -> dict:
     workspace = parse_docx_workspace(raw_bytes)
     segments = workspace["segments"]
@@ -36,6 +39,7 @@ def parse_docx_for_slate(
             else ""
             for segment in segments
         ],
+        collection_ids=collection_ids,
     )
 
     output_segments: list[dict] = []

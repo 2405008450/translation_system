@@ -6,6 +6,7 @@ from io import BytesIO
 from itertools import count
 import posixpath
 import re
+from uuid import UUID
 from zipfile import BadZipFile, ZipFile
 from xml.etree import ElementTree as ET
 
@@ -379,6 +380,7 @@ def build_docx_workspace(
     raw_bytes: bytes,
     similarity_threshold: float = 0.6,
     include_matches: bool = True,
+    collection_ids: list[UUID] | None = None,
 ) -> dict:
     parsed_workspace = parse_docx_workspace(raw_bytes)
     segments = parsed_workspace["segments"]
@@ -393,6 +395,7 @@ def build_docx_workspace(
                 for segment in segments
             ],
             similarity_threshold=similarity_threshold,
+            collection_ids=collection_ids,
         )
         for segment, match in zip(segments, match_results):
             segment["status"] = match.status

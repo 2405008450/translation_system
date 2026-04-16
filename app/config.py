@@ -22,6 +22,17 @@ class Settings(BaseSettings):
     llm_max_concurrency: int = 5
     llm_temperature: float = 0.2
     llm_retry_attempts_per_provider: int = 2
+    jwt_secret_key: str = "change-me-in-production"
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 1440
+    cors_allow_origins: list[str] = Field(
+        default_factory=lambda: [
+            "http://127.0.0.1:5173",
+            "http://localhost:5173",
+            "http://127.0.0.1:19003",
+            "http://localhost:19003",
+        ]
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",

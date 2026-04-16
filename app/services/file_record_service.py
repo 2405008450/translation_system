@@ -23,6 +23,7 @@ def create_file_record_with_segments(
     filename: str,
     similarity_threshold: float = 0.6,
     workspace_data: dict | None = None,
+    collection_ids: list[UUID] | None = None,
 ) -> FileRecord:
     file_hash = hashlib.sha256(raw_bytes).hexdigest()
 
@@ -31,6 +32,7 @@ def create_file_record_with_segments(
             db=db,
             raw_bytes=raw_bytes,
             similarity_threshold=similarity_threshold,
+            collection_ids=collection_ids,
         )
 
     return _create_file_record_from_workspace(

@@ -46,6 +46,24 @@ class FileRecord(Base):
     )
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    username: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False, default="user")
+    is_active: Mapped[bool] = mapped_column(nullable=False, default=True)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+
+
 class Segment(Base):
     __tablename__ = "segments"
     __table_args__ = (Index("ix_segments_file_record_id", "file_record_id"),)
@@ -86,9 +104,46 @@ class Segment(Base):
     file_record: Mapped["FileRecord"] = relationship("FileRecord", back_populates="segments")
 
 
+class TMCollection(Base):
+    __tablename__ = "tm_collections"
+    __table_args__ = (
+        Index("uq_tm_collections_name", "name", unique=True),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    translation_memories: Mapped[list["TranslationMemory"]] = relationship(
+        "TranslationMemory",
+        back_populates="collection",
+    )
+
+
 class TranslationMemory(Base):
     __tablename__ = "translation_memory"
     __table_args__ = (
+        Index("ix_translation_memory_collection_id", "collection_id"),
+        Index("ix_translation_memory_collection_source_hash", "collection_id", "source_hash"),
+        Index(
+            "ix_translation_memory_collection_source_normalized",
+            "collection_id",
+            "source_normalized",
+        ),
         Index("ix_translation_memory_source_hash", "source_hash"),
         Index("ix_translation_memory_source_text", "source_text"),
         Index("ix_translation_memory_source_normalized", "source_normalized"),
@@ -112,6 +167,11 @@ class TranslationMemory(Base):
         default=uuid.uuid4,
         server_default=UUID_SQL_DEFAULT,
     )
+    collection_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("tm_collections.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
     target_text: Mapped[str] = mapped_column(Text, nullable=False)
     source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -124,4 +184,9 @@ class TranslationMemory(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+
+    collection: Mapped[TMCollection | None] = relationship(
+        "TMCollection",
+        back_populates="translation_memories",
     )
