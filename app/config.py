@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 60.0
     llm_max_concurrency: int = 5
     llm_temperature: float = 0.2
+    llm_retry_attempts_per_provider: int = 2
 
     model_config = SettingsConfigDict(
         env_file=".env",

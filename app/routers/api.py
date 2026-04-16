@@ -113,6 +113,7 @@ def _build_llm_translation_tasks(
                 sentence_id=segment.sentence_id,
                 status=segment.status,
                 source_text=segment.source_text,
+                block_type=segment.block_type,
                 matched_source_text=segment.matched_source_text,
                 tm_target_text=tm_target_text,
                 previous_source_text=previous_segment.source_text if previous_segment else None,
