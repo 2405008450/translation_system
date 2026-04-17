@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, ref, watch } from 'vue'
 
-import type { Segment } from '../types/api'
+import type { CommentAnchorDraft, Segment, SegmentComment } from '../types/api'
 import PreviewPanel from './PreviewPanel.vue'
 
 const props = withDefaults(defineProps<{
@@ -15,17 +15,23 @@ const props = withDefaults(defineProps<{
   targetUpdatedSentenceId?: string | null
   targetUpdatedSentenceText?: string
   targetUpdateToken?: number
+  comments?: SegmentComment[]
+  activeCommentId?: string | null
 }>(), {
   targetRenderMode: 'static',
   targetSegments: () => [],
   targetUpdatedSentenceId: null,
   targetUpdatedSentenceText: '',
   targetUpdateToken: 0,
+  comments: () => [],
+  activeCommentId: null,
 })
 
 const emit = defineEmits<{
   close: []
   focusSentence: [sentenceId: string]
+  focusComment: [commentId: string]
+  requestComment: [draft: CommentAnchorDraft]
 }>()
 
 const layoutRef = ref<HTMLElement | null>(null)
@@ -128,9 +134,14 @@ onBeforeUnmount(() => {
           :html="sourceHtml"
           :supported="sourceSupported"
           :active-sentence-id="activeSentenceId"
+          :comments="comments"
+          :active-comment-id="activeCommentId"
+          :enable-comment-selection="true"
           :sync-sentence-id="sourceSyncSentenceId"
           :closable="false"
           @focus-sentence="emit('focusSentence', $event)"
+          @focus-comment="emit('focusComment', $event)"
+          @request-comment="emit('requestComment', $event)"
           @visible-sentence-change="handleVisibleSentence('source', $event)"
         />
       </div>
@@ -148,6 +159,9 @@ onBeforeUnmount(() => {
           :html="targetHtml"
           :supported="targetSupported"
           :active-sentence-id="activeSentenceId"
+          :comments="comments"
+          :active-comment-id="activeCommentId"
+          :enable-comment-selection="true"
           :sync-sentence-id="targetSyncSentenceId"
           :render-mode="targetRenderMode"
           :segments="targetSegments"
@@ -156,6 +170,8 @@ onBeforeUnmount(() => {
           :update-token="targetUpdateToken"
           :closable="false"
           @focus-sentence="emit('focusSentence', $event)"
+          @focus-comment="emit('focusComment', $event)"
+          @request-comment="emit('requestComment', $event)"
           @visible-sentence-change="handleVisibleSentence('target', $event)"
         />
       </div>

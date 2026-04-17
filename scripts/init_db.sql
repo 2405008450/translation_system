@@ -1,4 +1,5 @@
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS tm_collections (
     id UUID PRIMARY KEY DEFAULT (
@@ -32,6 +33,8 @@ CREATE TABLE IF NOT EXISTS translation_memory (
     target_text TEXT NOT NULL,
     source_hash VARCHAR(64),
     source_normalized TEXT,
+    source_embedding vector(128),
+    source_embedding_version INTEGER,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -61,6 +64,14 @@ CREATE INDEX IF NOT EXISTS ix_translation_memory_source_text_trgm
 CREATE INDEX IF NOT EXISTS ix_translation_memory_source_normalized_trgm
     ON translation_memory
     USING GIN (source_normalized gin_trgm_ops);
+
+CREATE INDEX IF NOT EXISTS ix_translation_memory_source_embedding_version
+    ON translation_memory (source_embedding_version);
+
+CREATE INDEX IF NOT EXISTS ix_translation_memory_source_embedding_ivfflat
+    ON translation_memory
+    USING ivfflat (source_embedding vector_cosine_ops)
+    WITH (lists = 100);
 
 INSERT INTO tm_collections (name, description)
 SELECT '默认记忆库', '迁移前已有的 TM 记录'

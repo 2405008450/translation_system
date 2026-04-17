@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { FolderKanban, Database, Users, LogOut, PanelLeftClose, PanelLeft, Languages } from 'lucide-vue-next'
 import { computed, ref } from 'vue'
 import { RouterView, useRoute, useRouter } from 'vue-router'
 
@@ -7,6 +8,7 @@ import { useAuthStore } from '../stores/auth'
 interface NavItem {
   name: string
   label: string
+  icon: any
   shortLabel: string
   description: string
   visible: boolean
@@ -25,6 +27,7 @@ const navItems = computed<NavItem[]>(() => [
   {
     name: 'tasks',
     label: '任务管理',
+    icon: FolderKanban,
     shortLabel: '任',
     description: '上传与翻译任务',
     visible: true,
@@ -32,6 +35,7 @@ const navItems = computed<NavItem[]>(() => [
   {
     name: 'tm',
     label: 'TM 记忆库',
+    icon: Database,
     shortLabel: 'TM',
     description: '双语记忆与导入',
     visible: authStore.isAdmin,
@@ -39,6 +43,7 @@ const navItems = computed<NavItem[]>(() => [
   {
     name: 'users',
     label: '用户管理',
+    icon: Users,
     shortLabel: '用',
     description: '账号和角色',
     visible: authStore.isAdmin,
@@ -86,8 +91,13 @@ async function logout() {
       <div class="sidebar-brand">
         <div class="sidebar-brand__top">
           <div class="sidebar-brand__identity">
-            <div v-if="!sidebarCollapsed" class="section-kicker">协同翻译</div>
-            <h1>{{ sidebarCollapsed ? '译' : '翻译工作台' }}</h1>
+            <div class="brand-logo" :class="{ 'is-collapsed': sidebarCollapsed }">
+              <Languages :size="sidebarCollapsed ? 28 : 24" stroke-width="2.5" />
+            </div>
+            <div v-if="!sidebarCollapsed" class="brand-text">
+              <div class="section-kicker">协同翻译</div>
+              <h1>翻译工作台</h1>
+            </div>
           </div>
           <button
             class="button sidebar-toggle"
@@ -96,7 +106,7 @@ async function logout() {
             :aria-label="sidebarCollapsed ? '展开导航栏' : '收起导航栏'"
             @click="toggleSidebar"
           >
-            {{ sidebarCollapsed ? '展' : '收起' }}
+            <component :is="sidebarCollapsed ? PanelLeft : PanelLeftClose" :size="20" />
           </button>
         </div>
         <p v-if="!sidebarCollapsed">按板块管理任务、TM 和记忆库用户</p>
@@ -113,7 +123,9 @@ async function logout() {
           :title="item.label"
           @click="router.push({ name: item.name })"
         >
-          <span class="sidebar-nav__mark">{{ item.shortLabel }}</span>
+          <span class="sidebar-nav__mark">
+            <component :is="item.icon" :size="20" />
+          </span>
           <div v-if="!sidebarCollapsed" class="sidebar-nav__text">
             <strong>{{ item.label }}</strong>
             <span>{{ item.description }}</span>
@@ -121,45 +133,47 @@ async function logout() {
         </button>
       </nav>
 
-      <div class="sidebar-footer">
-        <div class="user-badge user-badge--sidebar">
-          <strong>{{ sidebarCollapsed ? (authStore.user?.username || '-').slice(0, 1) : authStore.user?.username }}</strong>
-          <span v-if="!sidebarCollapsed">{{ authStore.user?.role === 'admin' ? '管理员' : '普通用户' }}</span>
-        </div>
-        <button
-          class="button"
-          type="button"
-          :title="'退出登录'"
-          :aria-label="'退出登录'"
-          @click="logout"
-        >
-          {{ sidebarCollapsed ? '退' : '退出登录' }}
-        </button>
-      </div>
     </aside>
 
     <div class="app-main">
       <header class="shell-header">
-        <nav class="breadcrumb" aria-label="面包屑">
-          <template v-for="(item, index) in breadcrumbItems" :key="`${item.label}-${index}`">
-            <button
-              v-if="item.routeName && index < breadcrumbItems.length - 1"
-              class="breadcrumb__item is-link"
-              type="button"
-              @click="router.push({ name: item.routeName })"
-            >
-              {{ item.label }}
-            </button>
-            <span v-else class="breadcrumb__item" :class="{ 'is-current': index === breadcrumbItems.length - 1 }">
-              {{ item.label }}
-            </span>
-            <span v-if="index < breadcrumbItems.length - 1" class="breadcrumb__sep">/</span>
-          </template>
-        </nav>
-        <div>
-          <div class="section-kicker">当前板块</div>
-          <h2>{{ pageTitle }}</h2>
-          <p>{{ pageDescription }}</p>
+        <div class="shell-header__content">
+          <nav class="breadcrumb" aria-label="面包屑">
+            <template v-for="(item, index) in breadcrumbItems" :key="`${item.label}-${index}`">
+              <button
+                v-if="item.routeName && index < breadcrumbItems.length - 1"
+                class="breadcrumb__item is-link"
+                type="button"
+                @click="router.push({ name: item.routeName })"
+              >
+                {{ item.label }}
+              </button>
+              <span v-else class="breadcrumb__item" :class="{ 'is-current': index === breadcrumbItems.length - 1 }">
+                {{ item.label }}
+              </span>
+              <span v-if="index < breadcrumbItems.length - 1" class="breadcrumb__sep">/</span>
+            </template>
+          </nav>
+          <div>
+            <div class="section-kicker">当前板块</div>
+            <h2>{{ pageTitle }}</h2>
+            <p>{{ pageDescription }}</p>
+          </div>
+        </div>
+        <div class="shell-header__actions">
+          <div class="user-badge" style="text-align: right;">
+            <strong>{{ authStore.user?.username }}</strong>
+            <span>{{ authStore.user?.role === 'admin' ? '管理员' : '普通用户' }}</span>
+          </div>
+          <button
+            class="button"
+            type="button"
+            :title="'退出登录'"
+            :aria-label="'退出登录'"
+            @click="logout"
+          >
+            <LogOut :size="16" /> 退出
+          </button>
         </div>
       </header>
 

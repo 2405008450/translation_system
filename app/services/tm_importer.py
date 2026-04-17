@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.models import TranslationMemory
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
+from app.services.tm_vector import sync_tm_embeddings
 
 
 XLSX_EXTENSIONS = {".xlsx"}
@@ -177,12 +178,15 @@ def _flush_tm_batch(
 
     created_rows = 0
     updated_rows = 0
+    sync_candidates: list[TranslationMemory] = []
     for row in batch_rows:
         existing = existing_by_hash.get(row["source_hash"]) or existing_by_source_text.get(
             row["source_text"]
         )
         if existing is None:
-            db.add(TranslationMemory(**row))
+            tm_row = TranslationMemory(**row)
+            db.add(tm_row)
+            sync_candidates.append(tm_row)
             created_rows += 1
             continue
 
@@ -193,9 +197,19 @@ def _flush_tm_batch(
         existing.collection_id = row["collection_id"]
         existing_by_hash[row["source_hash"]] = existing
         existing_by_source_text[row["source_text"]] = existing
+        sync_candidates.append(existing)
         updated_rows += 1
 
+    db.flush()
+    sync_rows = list(
+        {
+            row.id: row.source_text
+            for row in sync_candidates
+            if row.id is not None and row.source_text
+        }.items()
+    )
     db.commit()
+    sync_tm_embeddings(db, sync_rows)
     return created_rows, updated_rows
 
 

@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
+import type { CommentAnchorDraft, SegmentComment } from '../types/api'
+import FloatingCommentButton from './FloatingCommentButton.vue'
+
 interface PreviewSegment {
   sentence_id: string
   source_text: string
@@ -20,6 +23,9 @@ const props = withDefaults(defineProps<{
   updatedSentenceId?: string | null
   updatedSentenceText?: string
   updateToken?: number
+  comments?: SegmentComment[]
+  activeCommentId?: string | null
+  enableCommentSelection?: boolean
 }>(), {
   syncSentenceId: null,
   title: '原文预览',
@@ -29,11 +35,16 @@ const props = withDefaults(defineProps<{
   updatedSentenceId: null,
   updatedSentenceText: '',
   updateToken: 0,
+  comments: () => [],
+  activeCommentId: null,
+  enableCommentSelection: false,
 })
 
 const emit = defineEmits<{
   close: []
   focusSentence: [sentenceId: string]
+  focusComment: [commentId: string]
+  requestComment: [draft: CommentAnchorDraft]
   visibleSentenceChange: [sentenceId: string]
 }>()
 
@@ -41,6 +52,11 @@ const containerRef = ref<HTMLElement | null>(null)
 const currentPage = ref(1)
 const totalPages = ref(1)
 const isRendering = ref(false)
+const pendingCommentSelection = ref<{
+  top: number
+  left: number
+  draft: CommentAnchorDraft
+} | null>(null)
 const pageSummary = computed(() => {
   if (!props.supported) {
     return ''
@@ -50,6 +66,7 @@ const pageSummary = computed(() => {
 
 let resizeObserver: ResizeObserver | null = null
 let scrollFrame = 0
+let selectionFrame = 0
 let programmaticScrollTimer = 0
 let ignoreScrollEvents = false
 let lastVisibleSentenceId: string | null = null
@@ -57,6 +74,19 @@ let renderedHtmlSignature = ''
 let renderSequence = 0
 const sentenceNodeMap = new Map<string, HTMLElement>()
 const appliedSentenceTexts = new Map<string, string>()
+
+function escapeHtml(text: string) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function escapeAttribute(text: string) {
+  return escapeHtml(text)
+}
 
 function getSentenceNode(sentenceId: string | null | undefined) {
   if (!sentenceId) {
@@ -89,6 +119,141 @@ function resolveSegmentPreviewText(segment: PreviewSegment) {
   return segment.target_text || segment.display_text || segment.source_text || ''
 }
 
+function resolveCommentRange(text: string, comment: SegmentComment) {
+  if (comment.anchor_mode === 'sentence') {
+    return text ? { start: 0, end: text.length } : null
+  }
+
+  const start = comment.range_start_offset
+  const end = comment.range_end_offset
+  const anchorText = comment.anchor_text || ''
+  if (
+    typeof start === 'number'
+    && typeof end === 'number'
+    && start >= 0
+    && end > start
+    && end <= text.length
+    && text.slice(start, end) === anchorText
+  ) {
+    return { start, end }
+  }
+
+  if (anchorText) {
+    const fallbackStart = text.indexOf(anchorText)
+    if (fallbackStart !== -1) {
+      return {
+        start: fallbackStart,
+        end: fallbackStart + anchorText.length,
+      }
+    }
+  }
+
+  if (
+    typeof start === 'number'
+    && typeof end === 'number'
+    && start >= 0
+    && end > start
+    && end <= text.length
+  ) {
+    return { start, end }
+  }
+
+  return null
+}
+
+function buildSentenceMarkup(text: string, comments: SegmentComment[]) {
+  if (!comments.length) {
+    return escapeHtml(text)
+  }
+
+  const ranges = comments
+    .map((comment) => {
+      const range = resolveCommentRange(text, comment)
+      if (!range) {
+        return null
+      }
+      return {
+        comment,
+        ...range,
+      }
+    })
+    .filter((item): item is { comment: SegmentComment; start: number; end: number } => Boolean(item))
+    .sort((left, right) => {
+      if (left.start !== right.start) {
+        return left.start - right.start
+      }
+      if (left.end !== right.end) {
+        return left.end - right.end
+      }
+      return left.comment.id.localeCompare(right.comment.id)
+    })
+
+  if (!ranges.length) {
+    return escapeHtml(text)
+  }
+
+  const parts: string[] = []
+  let cursor = 0
+
+  for (const range of ranges) {
+    if (range.start < cursor) {
+      continue
+    }
+
+    if (range.start > cursor) {
+      parts.push(escapeHtml(text.slice(cursor, range.start)))
+    }
+
+    const classes = ['doc-comment-anchor']
+    if (range.comment.status === 'resolved') {
+      classes.push('is-resolved')
+    }
+    if (range.comment.id === props.activeCommentId) {
+      classes.push('is-active')
+    }
+
+    parts.push(
+      `<mark class="${classes.join(' ')}" data-comment-id="${escapeAttribute(range.comment.id)}">`
+      + `${escapeHtml(text.slice(range.start, range.end))}`
+      + '</mark>',
+    )
+    cursor = range.end
+  }
+
+  if (cursor < text.length) {
+    parts.push(escapeHtml(text.slice(cursor)))
+  }
+
+  return parts.join('')
+}
+
+function renderSentenceComments(sentenceId: string) {
+  const node = getSentenceNode(sentenceId)
+  if (!node) {
+    return
+  }
+
+  const text = node.textContent || ''
+  const sentenceComments = props.comments.filter((comment) => comment.sentence_id === sentenceId)
+
+  if (!sentenceComments.length) {
+    node.textContent = text
+    node.classList.remove('has-comments')
+    delete node.dataset.commentCount
+    return
+  }
+
+  node.innerHTML = buildSentenceMarkup(text, sentenceComments)
+  node.classList.add('has-comments')
+  node.dataset.commentCount = String(sentenceComments.length)
+}
+
+function applyCommentDecorations() {
+  for (const sentenceId of sentenceNodeMap.keys()) {
+    renderSentenceComments(sentenceId)
+  }
+}
+
 function applySentenceText(
   sentenceId: string | null | undefined,
   text: string,
@@ -109,6 +274,7 @@ function applySentenceText(
 
   node.textContent = text
   appliedSentenceTexts.set(sentenceId, text)
+  renderSentenceComments(sentenceId)
 }
 
 function applyTargetSentenceTexts(force = false) {
@@ -136,6 +302,7 @@ async function renderPreviewContent(forceHtml = false) {
   }
 
   applyTargetSentenceTexts(forceHtml)
+  applyCommentDecorations()
 }
 
 function waitForPaint() {
@@ -157,6 +324,7 @@ async function runRenderCycle(forceHtml = false, scrollToActive = false) {
     await waitForPaint()
     await renderPreviewContent(forceHtml)
     await applyHighlight(scrollToActive)
+    highlightActiveComment(false)
   } finally {
     if (sequence === renderSequence) {
       isRendering.value = false
@@ -263,6 +431,21 @@ function scrollSentenceIntoView(sentenceId: string | null | undefined, behavior:
   })
 }
 
+function scrollCommentIntoView(commentId: string, behavior: ScrollBehavior = 'smooth') {
+  const target = containerRef.value?.querySelector<HTMLElement>(
+    `.doc-comment-anchor[data-comment-id="${commentId}"]`,
+  )
+  if (!target) {
+    return
+  }
+
+  markProgrammaticScroll(260)
+  target.scrollIntoView({
+    block: 'center',
+    behavior,
+  })
+}
+
 async function applyHighlight(scrollToActive = true) {
   await nextTick()
   const container = containerRef.value
@@ -296,7 +479,129 @@ async function applyHighlight(scrollToActive = true) {
   notifyVisibleSentence()
 }
 
+function highlightActiveComment(scrollIntoView = true) {
+  applyCommentDecorations()
+  if (props.activeCommentId && scrollIntoView) {
+    scrollCommentIntoView(props.activeCommentId)
+  }
+}
+
+function getSentenceElementFromNode(node: Node | null) {
+  if (!node) {
+    return null
+  }
+  if (node instanceof HTMLElement) {
+    return node.closest<HTMLElement>('.doc-sentence[data-sentence-id]')
+  }
+  return node.parentElement?.closest<HTMLElement>('.doc-sentence[data-sentence-id]') || null
+}
+
+function getTextOffsetWithin(root: HTMLElement, targetNode: Node, targetOffset: number) {
+  let total = 0
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+
+  while (walker.nextNode()) {
+    const currentNode = walker.currentNode
+    if (currentNode === targetNode) {
+      return total + targetOffset
+    }
+    total += currentNode.textContent?.length || 0
+  }
+
+  return -1
+}
+
+function clearPendingCommentSelection(removeSelection = false) {
+  pendingCommentSelection.value = null
+  if (removeSelection) {
+    window.getSelection()?.removeAllRanges()
+  }
+}
+
+function syncPendingCommentSelection() {
+  if (!props.enableCommentSelection) {
+    clearPendingCommentSelection()
+    return
+  }
+
+  const container = containerRef.value
+  const selection = window.getSelection()
+  if (!container || !selection || selection.rangeCount === 0 || selection.isCollapsed) {
+    clearPendingCommentSelection()
+    return
+  }
+
+  const range = selection.getRangeAt(0)
+  if (!container.contains(range.commonAncestorContainer)) {
+    clearPendingCommentSelection()
+    return
+  }
+
+  const startSentence = getSentenceElementFromNode(range.startContainer)
+  const endSentence = getSentenceElementFromNode(range.endContainer)
+  if (!startSentence || !endSentence || startSentence !== endSentence) {
+    clearPendingCommentSelection()
+    return
+  }
+
+  const sentenceId = startSentence.dataset.sentenceId
+  if (!sentenceId) {
+    clearPendingCommentSelection()
+    return
+  }
+
+  const selectedText = selection.toString().trim()
+  if (!selectedText) {
+    clearPendingCommentSelection()
+    return
+  }
+
+  const startOffset = getTextOffsetWithin(startSentence, range.startContainer, range.startOffset)
+  const endOffset = getTextOffsetWithin(startSentence, range.endContainer, range.endOffset)
+  if (startOffset < 0 || endOffset <= startOffset) {
+    clearPendingCommentSelection()
+    return
+  }
+
+  const rect = range.getBoundingClientRect()
+  if (!rect.width && !rect.height) {
+    clearPendingCommentSelection()
+    return
+  }
+
+  pendingCommentSelection.value = {
+    top: Math.max(16, rect.top - 44),
+    left: Math.min(Math.max(rect.left + rect.width / 2, 88), window.innerWidth - 88),
+    draft: {
+      sentence_id: sentenceId,
+      anchor_mode: 'range',
+      range_start_offset: startOffset,
+      range_end_offset: endOffset,
+      anchor_text: selectedText,
+    },
+  }
+}
+
+function handleSelectionChange() {
+  if (selectionFrame) {
+    window.cancelAnimationFrame(selectionFrame)
+  }
+  selectionFrame = window.requestAnimationFrame(() => {
+    selectionFrame = 0
+    syncPendingCommentSelection()
+  })
+}
+
+function requestPendingComment() {
+  if (!pendingCommentSelection.value) {
+    return
+  }
+  emit('requestComment', pendingCommentSelection.value.draft)
+  clearPendingCommentSelection(true)
+}
+
 function handleScroll() {
+  clearPendingCommentSelection()
   if (ignoreScrollEvents) {
     return
   }
@@ -305,6 +610,14 @@ function handleScroll() {
 
 function handleClick(event: MouseEvent) {
   const target = event.target instanceof HTMLElement ? event.target : null
+  const commentAnchor = target?.closest<HTMLElement>('.doc-comment-anchor[data-comment-id]')
+  const commentId = commentAnchor?.dataset.commentId
+  if (commentId) {
+    clearPendingCommentSelection(true)
+    emit('focusComment', commentId)
+    return
+  }
+
   const sentence = target?.closest<HTMLElement>('.doc-sentence[data-sentence-id]')
   const sentenceId = sentence?.dataset.sentenceId
   if (!sentenceId) {
@@ -325,18 +638,25 @@ onMounted(() => {
       resizeObserver.observe(containerRef.value)
     }
   }
+
+  document.addEventListener('selectionchange', handleSelectionChange)
 })
 
 onBeforeUnmount(() => {
   if (scrollFrame) {
     window.cancelAnimationFrame(scrollFrame)
   }
+  if (selectionFrame) {
+    window.cancelAnimationFrame(selectionFrame)
+  }
   window.clearTimeout(programmaticScrollTimer)
+  document.removeEventListener('selectionchange', handleSelectionChange)
   resizeObserver?.disconnect()
 })
 
 watch(() => props.html, () => {
   lastVisibleSentenceId = null
+  clearPendingCommentSelection()
   void runRenderCycle(true, false)
 })
 
@@ -347,6 +667,7 @@ watch(() => props.supported, (supported) => {
     sentenceNodeMap.clear()
     appliedSentenceTexts.clear()
     isRendering.value = false
+    clearPendingCommentSelection()
     return
   }
 
@@ -355,6 +676,7 @@ watch(() => props.supported, (supported) => {
 
 watch(() => props.renderMode, () => {
   lastVisibleSentenceId = null
+  clearPendingCommentSelection()
   void runRenderCycle(true, false)
 })
 
@@ -365,13 +687,31 @@ watch(() => props.updateToken, (token, previousToken) => {
 
   void nextTick(() => {
     applySentenceText(props.updatedSentenceId, props.updatedSentenceText, false)
+    highlightActiveComment(false)
     updatePagination()
     notifyVisibleSentence()
   })
 })
 
+watch(() => props.comments, () => {
+  void nextTick(() => {
+    highlightActiveComment(false)
+    updatePagination()
+    notifyVisibleSentence()
+  })
+}, { deep: true })
+
 watch(() => props.activeSentenceId, () => {
   void applyHighlight(true)
+})
+
+watch(() => props.activeCommentId, (commentId, previousCommentId) => {
+  if (commentId === previousCommentId) {
+    return
+  }
+  void nextTick(() => {
+    highlightActiveComment(Boolean(commentId))
+  })
 })
 
 watch(() => props.syncSentenceId, (sentenceId) => {
@@ -411,6 +751,12 @@ watch(() => props.syncSentenceId, (sentenceId) => {
           <span class="preview-panel__spinner" aria-hidden="true" />
           <span>预览加载中...</span>
         </div>
+        <FloatingCommentButton
+          v-if="pendingCommentSelection"
+          :top="pendingCommentSelection.top"
+          :left="pendingCommentSelection.left"
+          @create="requestPendingComment"
+        />
       </div>
     </div>
   </section>

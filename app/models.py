@@ -44,6 +44,11 @@ class FileRecord(Base):
         back_populates="file_record",
         cascade="all, delete-orphan",
     )
+    comments: Mapped[list["SegmentComment"]] = relationship(
+        "SegmentComment",
+        back_populates="file_record",
+        cascade="all, delete-orphan",
+    )
 
 
 class User(Base):
@@ -62,6 +67,7 @@ class User(Base):
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
+    comments: Mapped[list["SegmentComment"]] = relationship("SegmentComment", back_populates="author")
 
 
 class Segment(Base):
@@ -102,6 +108,76 @@ class Segment(Base):
     )
 
     file_record: Mapped["FileRecord"] = relationship("FileRecord", back_populates="segments")
+    comments: Mapped[list["SegmentComment"]] = relationship("SegmentComment", back_populates="segment")
+
+
+class SegmentComment(Base):
+    __tablename__ = "segment_comments"
+    __table_args__ = (
+        Index("ix_segment_comments_file_record_id", "file_record_id"),
+        Index("ix_segment_comments_segment_id", "segment_id"),
+        Index("ix_segment_comments_parent_id", "parent_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    file_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    segment_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("segments.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    anchor_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="sentence")
+    range_start_offset: Mapped[int | None] = mapped_column(nullable=True)
+    range_end_offset: Mapped[int | None] = mapped_column(nullable=True)
+    anchor_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    author_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("segment_comments.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+    resolved_at: Mapped[DateTime | None] = mapped_column(
+        DateTime(timezone=False),
+        nullable=True,
+    )
+
+    file_record: Mapped["FileRecord"] = relationship("FileRecord", back_populates="comments")
+    segment: Mapped["Segment | None"] = relationship("Segment", back_populates="comments")
+    author: Mapped["User"] = relationship("User", back_populates="comments")
+    parent: Mapped["SegmentComment | None"] = relationship(
+        "SegmentComment",
+        remote_side=lambda: SegmentComment.id,
+        back_populates="replies",
+    )
+    replies: Mapped[list["SegmentComment"]] = relationship(
+        "SegmentComment",
+        back_populates="parent",
+        cascade="all, delete-orphan",
+    )
 
 
 class TMCollection(Base):

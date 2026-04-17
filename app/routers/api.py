@@ -14,6 +14,14 @@ from sqlalchemy.orm import Session
 from app.auth import get_current_user, require_admin
 from app.database import get_db
 from app.models import TMCollection, TranslationMemory, User
+from app.services.comment_service import (
+    create_segment_comment,
+    create_segment_comment_reply,
+    delete_segment_comment,
+    list_segment_comments_for_file_record,
+    serialize_segment_comment,
+    update_segment_comment,
+)
 from app.services.document_exporter import (
     DOCX_MEDIA_TYPE,
     build_translated_docx_filename,
@@ -47,6 +55,7 @@ from app.services.llm_service import (
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
 from app.services.slate_parser import parse_docx_for_slate
 from app.services.tm_importer import XLSX_EXTENSIONS, import_tm_from_xlsx_upload
+from app.services.tm_vector import sync_tm_embeddings
 
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -70,6 +79,25 @@ class LLMTranslateRequest(BaseModel):
 class TMCollectionPayload(BaseModel):
     name: str
     description: str | None = None
+
+
+class CommentCreateRequest(BaseModel):
+    sentence_id: str | None = None
+    segment_id: UUID | None = None
+    anchor_mode: Literal["sentence", "range"] = "range"
+    range_start_offset: int | None = None
+    range_end_offset: int | None = None
+    anchor_text: str | None = None
+    body: str
+
+
+class CommentUpdateRequest(BaseModel):
+    body: str | None = None
+    status: Literal["open", "resolved"] | None = None
+
+
+class CommentReplyRequest(BaseModel):
+    body: str
 
 
 def _build_docx_download_response(filename: str, docx_bytes: bytes) -> StreamingResponse:
@@ -449,6 +477,94 @@ def batch_update(
     return {"updated_count": updated_count}
 
 
+@router.get("/file-records/{file_record_id}/comments")
+@router.get("/documents/{file_record_id}/comments", include_in_schema=False)
+def get_file_record_comments(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    comments = list_segment_comments_for_file_record(db, file_record_id)
+    return [serialize_segment_comment(comment) for comment in comments]
+
+
+@router.post("/file-records/{file_record_id}/comments")
+@router.post("/documents/{file_record_id}/comments", include_in_schema=False)
+def create_file_record_comment(
+    file_record_id: UUID,
+    payload: CommentCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    comment = create_segment_comment(
+        db,
+        file_record_id=file_record_id,
+        sentence_id=payload.sentence_id,
+        segment_id=payload.segment_id,
+        anchor_mode=payload.anchor_mode,
+        range_start_offset=payload.range_start_offset,
+        range_end_offset=payload.range_end_offset,
+        anchor_text=payload.anchor_text,
+        body=payload.body,
+        author=current_user,
+    )
+    return serialize_segment_comment(comment)
+
+
+@router.patch("/comments/{comment_id}")
+def patch_comment(
+    comment_id: UUID,
+    payload: CommentUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    comment = update_segment_comment(
+        db,
+        comment_id=comment_id,
+        body=payload.body,
+        status=payload.status,
+        current_user=current_user,
+    )
+    return serialize_segment_comment(comment)
+
+
+@router.delete("/comments/{comment_id}")
+def remove_comment(
+    comment_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    delete_segment_comment(
+        db,
+        comment_id=comment_id,
+        current_user=current_user,
+    )
+    return {"message": "批注已删除。"}
+
+
+@router.post("/comments/{comment_id}/replies")
+def create_comment_reply(
+    comment_id: UUID,
+    payload: CommentReplyRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    comment = create_segment_comment_reply(
+        db,
+        comment_id=comment_id,
+        body=payload.body,
+        author=current_user,
+    )
+    return serialize_segment_comment(comment)
+
+
 @router.post("/file-records/{file_record_id}/llm-translate")
 @router.post("/documents/{file_record_id}/llm-translate", include_in_schema=False)
 async def llm_translate_file_record(
@@ -773,9 +889,12 @@ def add_tm_entry(
 
     if existing:
         # 已存在，更新译文
+        existing.source_text = source_text
         existing.target_text = target_text
+        existing.source_hash = source_hash
         existing.source_normalized = normalize_match_text(source_text) or source_text
         db.commit()
+        sync_tm_embeddings(db, [(existing.id, existing.source_text)])
         return {"status": "updated", "id": existing.id, "message": "已更新现有记录。"}
 
     # 不存在，新增
@@ -789,6 +908,7 @@ def add_tm_entry(
     db.add(tm)
     db.commit()
     db.refresh(tm)
+    sync_tm_embeddings(db, [(tm.id, tm.source_text)])
 
     return {"status": "created", "id": tm.id, "message": "已添加新记录。"}
 
@@ -802,6 +922,7 @@ def batch_add_tm_entries(
     created_count = 0
     updated_count = 0
     skipped_count = 0
+    sync_candidates: list[TranslationMemory] = []
     collection_ids = [
         collection_id
         for collection_id in (
@@ -829,8 +950,12 @@ def batch_add_tm_entries(
         existing = _filter_tm_collection(existing_query, collection_id).first()
 
         if existing:
+            existing.source_text = source_text
             existing.target_text = target_text
+            existing.source_hash = source_hash
             existing.source_normalized = normalize_match_text(source_text) or source_text
+            existing.collection_id = collection_id
+            sync_candidates.append(existing)
             updated_count += 1
         else:
             tm = TranslationMemory(
@@ -841,9 +966,22 @@ def batch_add_tm_entries(
                 source_normalized=normalize_match_text(source_text) or source_text,
             )
             db.add(tm)
+            sync_candidates.append(tm)
             created_count += 1
 
-    db.commit()
+    sync_rows: list[tuple[UUID, str]] = []
+    if sync_candidates:
+        db.flush()
+        sync_rows = list(
+            {
+                row.id: row.source_text
+                for row in sync_candidates
+                if row.id is not None and row.source_text
+            }.items()
+        )
+        db.commit()
+
+    sync_tm_embeddings(db, sync_rows)
 
     return {
         "created": created_count,

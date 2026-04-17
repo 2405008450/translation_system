@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -8,17 +9,27 @@ from typing import TypeVar
 from uuid import UUID
 
 from sqlalchemy import select, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.models import TranslationMemory
 from app.schemas import MatchResult
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
+from app.services.tm_vector import (
+    TM_EMBEDDING_VERSION,
+    build_tm_embedding_literal,
+    get_tm_vector_dimensions,
+    is_tm_vector_ready,
+    mark_tm_vector_unavailable,
+)
 
 
 EXACT_MATCH_BATCH_SIZE = 1000
 FUZZY_MATCH_BATCH_SIZE = 200
 FUZZY_CANDIDATE_LIMIT = 3
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -442,6 +453,8 @@ def _find_fuzzy_matches_chunk(
                 "target_text": row["target_text"],
                 "source_trigram_score": 0.0,
                 "auxiliary_trigram_score": 0.0,
+                "source_vector_score": 0.0,
+                "auxiliary_vector_score": 0.0,
             },
         )
         if row["query_kind"] == "auxiliary":
@@ -454,6 +467,14 @@ def _find_fuzzy_matches_chunk(
                 float(row["trigram_score"]),
                 float(candidate_entry["source_trigram_score"]),
             )
+
+    if is_tm_vector_ready(db):
+        _merge_vector_candidates(
+            db=db,
+            prepared_sentences=prepared_sentences,
+            grouped_candidates=grouped_candidates,
+            collection_ids=collection_ids,
+        )
 
     matches: list[ResolvedMatch | None] = []
     for index, sentence in enumerate(prepared_sentences):
@@ -479,6 +500,124 @@ def _find_fuzzy_matches_chunk(
     return matches, candidate_count
 
 
+def _merge_vector_candidates(
+    db: Session,
+    prepared_sentences: list[PreparedSentence],
+    grouped_candidates: dict[int, dict[tuple[str, str], dict]],
+    collection_ids: list[UUID] | None = None,
+) -> None:
+    settings = get_settings()
+    vector_candidate_limit = max(int(settings.tm_vector_candidate_limit), 1)
+    vector_similarity_floor = min(max(float(settings.tm_vector_similarity_floor), 0.0), 1.0)
+    vector_dimensions = get_tm_vector_dimensions()
+    params = {
+        "vector_candidate_limit": vector_candidate_limit,
+        "embedding_version": TM_EMBEDDING_VERSION,
+        "vector_similarity_floor": vector_similarity_floor,
+    }
+    value_rows: list[str] = []
+    collection_filter_sql = ""
+    normalized_collection_ids = _normalize_collection_ids(collection_ids)
+    if normalized_collection_ids:
+        collection_param_names: list[str] = []
+        for index, collection_id in enumerate(normalized_collection_ids):
+            param_name = f"vector_collection_id_{index}"
+            params[param_name] = collection_id
+            collection_param_names.append(f":{param_name}")
+        collection_filter_sql = (
+            f" AND tm.collection_id IN ({', '.join(collection_param_names)})"
+        )
+
+    for index, sentence in enumerate(prepared_sentences):
+        source_vector_param_name = f"query_source_vector_{index}"
+        params[source_vector_param_name] = build_tm_embedding_literal(
+            sentence.match_text,
+            dimensions=vector_dimensions,
+        )
+        value_rows.append(
+            f"({index}, 'source', CAST(:{source_vector_param_name} AS vector({vector_dimensions})))"
+        )
+        if sentence.auxiliary_match_text and sentence.auxiliary_match_text != sentence.match_text:
+            auxiliary_vector_param_name = f"query_aux_vector_{index}"
+            params[auxiliary_vector_param_name] = build_tm_embedding_literal(
+                sentence.auxiliary_match_text,
+                dimensions=vector_dimensions,
+            )
+            value_rows.append(
+                f"({index}, 'auxiliary', "
+                f"CAST(:{auxiliary_vector_param_name} AS vector({vector_dimensions})))"
+            )
+
+    if not value_rows:
+        return
+
+    stmt = text(
+        f"""
+        WITH input(query_index, query_kind, query_vector) AS (
+            VALUES {", ".join(value_rows)}
+        )
+        SELECT
+            input.query_index,
+            input.query_kind,
+            matched.compare_text,
+            matched.source_text,
+            matched.target_text,
+            matched.vector_score
+        FROM input
+        LEFT JOIN LATERAL (
+            SELECT
+                COALESCE(tm.source_normalized, tm.source_text) AS compare_text,
+                tm.source_text,
+                tm.target_text,
+                1 - (tm.source_embedding <=> input.query_vector) AS vector_score
+            FROM translation_memory AS tm
+            WHERE tm.source_embedding IS NOT NULL
+              AND tm.source_embedding_version = :embedding_version
+              AND 1 - (tm.source_embedding <=> input.query_vector) >= :vector_similarity_floor
+              {collection_filter_sql}
+            ORDER BY tm.source_embedding <=> input.query_vector ASC, tm.updated_at DESC
+            LIMIT :vector_candidate_limit
+        ) AS matched ON TRUE
+        ORDER BY input.query_index ASC
+        """
+    )
+
+    try:
+        rows = db.execute(stmt, params).mappings().all()
+    except SQLAlchemyError as exc:
+        mark_tm_vector_unavailable(db)
+        logger.warning("tm vector recall skipped because query failed: %s", exc)
+        return
+
+    for row in rows:
+        if row["source_text"] is None or row["target_text"] is None:
+            continue
+        query_index = int(row["query_index"])
+        candidate_key = (row["source_text"], row["target_text"])
+        candidate_entry = grouped_candidates.setdefault(query_index, {}).setdefault(
+            candidate_key,
+            {
+                "compare_text": row["compare_text"] or row["source_text"],
+                "source_text": row["source_text"],
+                "target_text": row["target_text"],
+                "source_trigram_score": 0.0,
+                "auxiliary_trigram_score": 0.0,
+                "source_vector_score": 0.0,
+                "auxiliary_vector_score": 0.0,
+            },
+        )
+        if row["query_kind"] == "auxiliary":
+            candidate_entry["auxiliary_vector_score"] = max(
+                float(row["vector_score"]),
+                float(candidate_entry["auxiliary_vector_score"]),
+            )
+        else:
+            candidate_entry["source_vector_score"] = max(
+                float(row["vector_score"]),
+                float(candidate_entry["source_vector_score"]),
+            )
+
+
 def _pick_best_fuzzy_candidate(
     sentence: PreparedSentence,
     candidates: list[dict],
@@ -489,9 +628,13 @@ def _pick_best_fuzzy_candidate(
     best_base_score = 0.0
 
     for candidate in candidates:
-        compare_text = normalize_match_text(candidate["compare_text"]) or candidate["compare_text"]
+        compare_text_raw = candidate.get("compare_text") or candidate["source_text"]
+        compare_text = normalize_match_text(compare_text_raw) or compare_text_raw
         source_sequence_score = SequenceMatcher(None, sentence.match_text, compare_text).ratio()
-        source_score = max(float(candidate["source_trigram_score"]), source_sequence_score)
+        source_score = _blend_match_score(
+            lexical_score=max(float(candidate["source_trigram_score"]), source_sequence_score),
+            vector_score=float(candidate.get("source_vector_score") or 0.0),
+        )
 
         auxiliary_score = 0.0
         if sentence.auxiliary_match_text:
@@ -500,9 +643,12 @@ def _pick_best_fuzzy_candidate(
                 sentence.auxiliary_match_text,
                 compare_text,
             ).ratio()
-            auxiliary_score = max(
-                float(candidate["auxiliary_trigram_score"]),
-                auxiliary_sequence_score,
+            auxiliary_score = _blend_match_score(
+                lexical_score=max(
+                    float(candidate["auxiliary_trigram_score"]),
+                    auxiliary_sequence_score,
+                ),
+                vector_score=float(candidate.get("auxiliary_vector_score") or 0.0),
             )
 
         base_score = max(source_score, auxiliary_score)
@@ -529,6 +675,26 @@ def _pick_best_fuzzy_candidate(
 
 def _get_trigram_prefilter_threshold(similarity_threshold: float) -> float:
     return min(max(similarity_threshold, 0.01), 0.3)
+
+
+def _blend_match_score(lexical_score: float, vector_score: float) -> float:
+    lexical = min(max(lexical_score, 0.0), 1.0)
+    weight = _get_tm_vector_weight()
+    if weight <= 0:
+        return lexical
+
+    vector = min(max(vector_score, 0.0), 1.0)
+    if vector <= 0:
+        return lexical
+
+    return max(lexical, (lexical * (1 - weight)) + (vector * weight))
+
+
+def _get_tm_vector_weight() -> float:
+    settings = get_settings()
+    if not getattr(settings, "tm_vector_enabled", True):
+        return 0.0
+    return min(max(float(getattr(settings, "tm_vector_weight", 0.0)), 0.0), 1.0)
 
 
 def _normalize_collection_ids(collection_ids: list[UUID] | None) -> list[UUID] | None:

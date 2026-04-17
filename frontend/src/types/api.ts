@@ -64,6 +64,35 @@ export interface FileRecordPreview {
   preview_html: string
 }
 
+export type CommentAnchorMode = 'sentence' | 'range'
+export type CommentStatus = 'open' | 'resolved'
+
+export interface CommentAnchorDraft {
+  sentence_id: string
+  anchor_mode: CommentAnchorMode
+  range_start_offset: number | null
+  range_end_offset: number | null
+  anchor_text: string | null
+}
+
+export interface SegmentComment {
+  id: string
+  file_record_id: string
+  segment_id: string | null
+  sentence_id: string | null
+  anchor_mode: CommentAnchorMode
+  range_start_offset: number | null
+  range_end_offset: number | null
+  anchor_text: string | null
+  body: string
+  author: User
+  parent_id: string | null
+  status: CommentStatus
+  created_at: string
+  updated_at: string
+  resolved_at: string | null
+}
+
 export interface TMCollection {
   id: string
   name: string
@@ -88,6 +117,20 @@ export interface SegmentUpdatePayload {
   sentence_id: string
   target_text: string
   source: string
+}
+
+export interface CommentCreatePayload extends CommentAnchorDraft {
+  segment_id?: string | null
+  body: string
+}
+
+export interface CommentUpdatePayload {
+  body?: string
+  status?: CommentStatus
+}
+
+export interface CommentReplyPayload {
+  body: string
 }
 
 export type LLMTranslateScope = 'fuzzy_only' | 'none_only' | 'all' | 'all_with_exact'

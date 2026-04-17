@@ -21,7 +21,11 @@ async function bootstrap() {
     }
   })
 
-  await authStore.bootstrap()
+  try {
+    await authStore.bootstrap()
+  } catch {
+    // Keep mounting the app so the login view can surface backend/init errors.
+  }
 
   app.use(router)
   await router.isReady()
