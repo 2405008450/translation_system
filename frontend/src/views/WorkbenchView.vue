@@ -5,9 +5,12 @@ import { onBeforeRouteLeave, useRouter } from 'vue-router'
 
 import PreviewPanel from '../components/PreviewPanel.vue'
 import SegmentEditorRow from '../components/SegmentEditorRow.vue'
+import SplitPreviewPanel from '../components/SplitPreviewPanel.vue'
 import VirtualList from '../components/VirtualList.vue'
 import { useSegmentStore } from '../stores/segment'
+import type { LLMProvider, LLMTranslateScope } from '../types/api'
 import { buildDocumentPreviewHtml } from '../utils/documentPreview'
+import { renderTargetPreview } from '../utils/renderTargetPreview'
 
 const props = defineProps<{
   id: string
@@ -16,7 +19,7 @@ const props = defineProps<{
 const router = useRouter()
 const segmentStore = useSegmentStore()
 
-type ToolKey = 'source-preview' | 'target-preview' | 'terms' | 'notes' | 'history'
+type ToolKey = 'source-preview' | 'target-preview' | 'split-preview' | 'terms' | 'notes' | 'history'
 type ActiveToolConfig =
   | {
       kind: 'preview'
@@ -25,14 +28,18 @@ type ActiveToolConfig =
       supported: boolean
     }
   | {
+      kind: 'split'
+      title: string
+    }
+  | {
       kind: 'placeholder'
       title: string
       message: string
     }
 
 const pageError = ref('')
-const llmScope = ref<'fuzzy_only' | 'none_only' | 'all'>('all')
-const llmProvider = ref<'auto' | 'deepseek' | 'openrouter'>('auto')
+const llmScope = ref<LLMTranslateScope>('all')
+const llmProvider = ref<LLMProvider>('auto')
 const itemHeight = ref(resolveItemHeight())
 const activeTool = ref<ToolKey | null>(null)
 
@@ -76,13 +83,18 @@ const statusSummary = computed(() => {
   ]
 })
 
-const translatedPreviewHtml = computed(() =>
-  buildDocumentPreviewHtml(segmentStore.segments, 'target'),
-)
+const translatedPreviewHtml = computed(() => {
+  const fallbackHtml = buildDocumentPreviewHtml(segmentStore.segments, 'target')
+  if (!segmentStore.previewSupported || !segmentStore.previewHtml) {
+    return fallbackHtml
+  }
+  return renderTargetPreview(segmentStore.previewHtml, segmentStore.segments)
+})
 
 const toolButtons = [
   { key: 'source-preview' as const, label: '原文预览' },
   { key: 'target-preview' as const, label: '译文预览' },
+  { key: 'split-preview' as const, label: '分屏对照' },
   { key: 'terms' as const, label: '术语' },
   { key: 'notes' as const, label: '备注' },
   { key: 'history' as const, label: '历史版本' },
@@ -103,7 +115,14 @@ const activeToolConfig = computed<ActiveToolConfig | null>(() => {
       kind: 'preview' as const,
       title: '译文预览',
       html: translatedPreviewHtml.value,
-      supported: true,
+      supported: segmentStore.previewSupported || segmentStore.segments.length > 0,
+    }
+  }
+
+  if (activeTool.value === 'split-preview') {
+    return {
+      kind: 'split' as const,
+      title: '分屏对照',
     }
   }
 
@@ -141,6 +160,14 @@ const activePreviewConfig = computed(() =>
 const activePlaceholderConfig = computed(() =>
   activeToolConfig.value?.kind === 'placeholder' ? activeToolConfig.value : null,
 )
+
+const activeSplitConfig = computed(() =>
+  activeToolConfig.value?.kind === 'split' ? activeToolConfig.value : null,
+)
+
+function handlePreviewFocus(sentenceId: string) {
+  segmentStore.setActiveSentence(sentenceId)
+}
 
 async function loadTask() {
   pageError.value = ''
@@ -253,6 +280,7 @@ onBeforeRouteLeave(async () => {
           <span class="field__label">AI 处理范围</span>
           <select v-model="llmScope" class="field__control">
             <option value="all">fuzzy + none</option>
+            <option value="all_with_exact">exact + fuzzy + none</option>
             <option value="fuzzy_only">仅 fuzzy</option>
             <option value="none_only">仅 none</option>
           </select>
@@ -308,7 +336,23 @@ onBeforeRouteLeave(async () => {
         </VirtualList>
       </section>
 
-      <div class="workbench-sidecar" :class="{ 'is-preview-open': !!activeToolConfig }">
+      <div
+        class="workbench-sidecar"
+        :class="{ 'is-preview-open': !!activeToolConfig, 'is-split-open': !!activeSplitConfig }"
+      >
+        <Transition name="preview-drawer">
+          <SplitPreviewPanel
+            v-if="activeSplitConfig"
+            :source-html="segmentStore.previewHtml"
+            :target-html="translatedPreviewHtml"
+            :source-supported="segmentStore.previewSupported"
+            :target-supported="segmentStore.previewSupported || segmentStore.segments.length > 0"
+            :active-sentence-id="segmentStore.activeSentenceId"
+            @close="activeTool = null"
+            @focus-sentence="handlePreviewFocus"
+          />
+        </Transition>
+
         <Transition name="preview-drawer">
           <PreviewPanel
             v-if="activePreviewConfig"
@@ -317,6 +361,7 @@ onBeforeRouteLeave(async () => {
             :html="activePreviewConfig.html"
             :supported="activePreviewConfig.supported"
             :active-sentence-id="segmentStore.activeSentenceId"
+            @focus-sentence="handlePreviewFocus"
             @close="activeTool = null"
           />
         </Transition>

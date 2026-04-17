@@ -204,6 +204,7 @@ def list_segments_for_llm_translation(
         "fuzzy_only": ["fuzzy"],
         "none_only": ["none"],
         "all": ["fuzzy", "none"],
+        "all_with_exact": ["exact", "fuzzy", "none"],
     }
     statuses = statuses_by_scope.get(scope)
     if statuses is None:

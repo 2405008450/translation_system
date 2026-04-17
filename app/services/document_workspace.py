@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from html import escape
+import hashlib
 from io import BytesIO
 from itertools import count
 import posixpath
@@ -12,6 +14,7 @@ from xml.etree import ElementTree as ET
 
 from sqlalchemy.orm import Session
 
+from app.services.cache import get_json, set_json
 from app.services.matcher import MatchStats, match_sentences_with_stats
 from app.services.normalizer import normalize_text
 from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
@@ -53,6 +56,8 @@ CELL_SHORT_PARAGRAPH_MAX_CHARS = 20
 CELL_NEXT_PARAGRAPH_MAX_CHARS = 50
 CELL_GROUP_MAX_CHARS = 200
 CELL_PARAGRAPH_BREAK_SENTINEL = "\uE000"
+PAGE_BREAK_SENTINEL = "\uE001"
+DOCX_PARSE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -382,7 +387,7 @@ def build_docx_workspace(
     include_matches: bool = True,
     collection_ids: list[UUID] | None = None,
 ) -> dict:
-    parsed_workspace = parse_docx_workspace(raw_bytes)
+    parsed_workspace = _get_cached_parsed_workspace(raw_bytes)
     segments = parsed_workspace["segments"]
     match_stats = _build_empty_match_stats()
 
@@ -460,7 +465,18 @@ def parse_docx_workspace(raw_bytes: bytes) -> dict:
 
 
 def build_docx_preview_html(raw_bytes: bytes) -> str:
-    return parse_docx_workspace(raw_bytes)["document_html"]
+    return _get_cached_parsed_workspace(raw_bytes)["document_html"]
+
+
+def _get_cached_parsed_workspace(raw_bytes: bytes) -> dict:
+    cache_key = f"preview:workspace:{hashlib.sha256(raw_bytes).hexdigest()}"
+    cached_workspace = get_json(cache_key)
+    if isinstance(cached_workspace, dict):
+        return copy.deepcopy(cached_workspace)
+
+    parsed_workspace = parse_docx_workspace(raw_bytes)
+    set_json(cache_key, parsed_workspace, ttl_seconds=DOCX_PARSE_CACHE_TTL_SECONDS)
+    return copy.deepcopy(parsed_workspace)
 
 
 def _build_story_parts(package: DocxPackage) -> list[StoryPart]:
@@ -946,6 +962,8 @@ def _render_paragraph(
     )
 
     html_parts: list[str] = []
+    if _paragraph_starts_new_page(paragraph):
+        html_parts.append(_build_page_break_html())
     if paragraph_html:
         html_parts.append(paragraph_html)
     html_parts.extend(paragraph_data.textbox_html_parts)
@@ -954,6 +972,58 @@ def _render_paragraph(
 
 
 def _render_paragraph_from_fragments(
+    fragments: list[InlineFragment],
+    sentence_counter,
+    block_index: int,
+    block_type: str,
+    paragraph_classes: list[str],
+    paragraph_css: str = "",
+    row_index: int | None = None,
+    cell_index: int | None = None,
+    suppressed_page_number_field: bool = False,
+    numbering_text: str = "",
+) -> tuple[str, list[dict]]:
+    fragment_groups = _split_fragments_on_page_breaks(fragments)
+    if len(fragment_groups) > 1:
+        html_parts: list[str] = []
+        segments: list[dict] = []
+
+        for group_index, group in enumerate(fragment_groups):
+            group_html, group_segments = _render_paragraph_fragment_group(
+                fragments=group,
+                sentence_counter=sentence_counter,
+                block_index=block_index,
+                block_type=block_type,
+                paragraph_classes=paragraph_classes,
+                paragraph_css=paragraph_css,
+                row_index=row_index,
+                cell_index=cell_index,
+                suppressed_page_number_field=suppressed_page_number_field,
+                numbering_text=numbering_text if group_index == 0 else "",
+            )
+            if group_html:
+                html_parts.append(group_html)
+            segments.extend(group_segments)
+            if group_index < len(fragment_groups) - 1:
+                html_parts.append(_build_page_break_html())
+
+        return "".join(html_parts), segments
+
+    return _render_paragraph_fragment_group(
+        fragments=fragments,
+        sentence_counter=sentence_counter,
+        block_index=block_index,
+        block_type=block_type,
+        paragraph_classes=paragraph_classes,
+        paragraph_css=paragraph_css,
+        row_index=row_index,
+        cell_index=cell_index,
+        suppressed_page_number_field=suppressed_page_number_field,
+        numbering_text=numbering_text,
+    )
+
+
+def _render_paragraph_fragment_group(
     fragments: list[InlineFragment],
     sentence_counter,
     block_index: int,
@@ -1019,6 +1089,34 @@ def _render_paragraph_from_fragments(
     class_attr = " ".join(paragraph_classes)
     style_attr = f' style="{paragraph_css}"' if paragraph_css else ""
     return f'<p class="{class_attr}"{style_attr}>{html_content}</p>', segments
+
+
+def _split_fragments_on_page_breaks(fragments: list[InlineFragment]) -> list[list[InlineFragment]]:
+    groups: list[list[InlineFragment]] = [[]]
+
+    for fragment in fragments:
+        if (
+            fragment.display_text == PAGE_BREAK_SENTINEL
+            and fragment.source_text == PAGE_BREAK_SENTINEL
+            and not fragment.css
+            and fragment.href is None
+        ):
+            groups.append([])
+            continue
+        groups[-1].append(fragment)
+
+    return groups
+
+
+def _build_page_break_html() -> str:
+    return '<div class="doc-page-break" aria-hidden="true"></div>'
+
+
+def _paragraph_starts_new_page(paragraph: ET.Element) -> bool:
+    properties = paragraph.find("w:pPr", NS)
+    if properties is None:
+        return False
+    return _is_enabled(properties, "pageBreakBefore")
 
 
 def _resolve_paragraph_numbering(
@@ -1302,7 +1400,13 @@ def _collect_inline_content(
     if node_name == "tab":
         return [InlineFragment(display_text="\t", source_text="\t", css=inherited_css, href=hyperlink)], [], []
 
+    if node_name == "lastRenderedPageBreak":
+        return [InlineFragment(display_text=PAGE_BREAK_SENTINEL, source_text=PAGE_BREAK_SENTINEL)], [], []
+
     if node_name in {"br", "cr"}:
+        break_type = node.get(_qn("w", "type"))
+        if break_type == "page":
+            return [InlineFragment(display_text=PAGE_BREAK_SENTINEL, source_text=PAGE_BREAK_SENTINEL)], [], []
         return [InlineFragment(display_text="\n", source_text="\n", css=inherited_css, href=hyperlink)], [], []
 
     if node_name == "noBreakHyphen":
