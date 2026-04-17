@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRouter } from 'vue-router'
 
 import PreviewPanel from '../components/PreviewPanel.vue'
@@ -8,9 +8,8 @@ import SegmentEditorRow from '../components/SegmentEditorRow.vue'
 import SplitPreviewPanel from '../components/SplitPreviewPanel.vue'
 import VirtualList from '../components/VirtualList.vue'
 import { useSegmentStore } from '../stores/segment'
-import type { LLMProvider, LLMTranslateScope } from '../types/api'
+import type { LLMProvider, LLMTranslateScope, Segment } from '../types/api'
 import { buildDocumentPreviewHtml } from '../utils/documentPreview'
-import { renderTargetPreview } from '../utils/renderTargetPreview'
 
 const props = defineProps<{
   id: string
@@ -18,6 +17,10 @@ const props = defineProps<{
 
 const router = useRouter()
 const segmentStore = useSegmentStore()
+const virtualListRef = ref<{
+  scrollToIndex: (index: number, align?: ScrollLogicalPosition) => Promise<boolean>
+  focusIndex: (index: number, selector?: string, align?: ScrollLogicalPosition) => Promise<boolean>
+} | null>(null)
 
 type ToolKey = 'source-preview' | 'target-preview' | 'split-preview' | 'terms' | 'notes' | 'history'
 type ActiveToolConfig =
@@ -26,6 +29,11 @@ type ActiveToolConfig =
       title: string
       html: string
       supported: boolean
+      renderMode?: 'static' | 'target'
+      segments?: Segment[]
+      updatedSentenceId?: string | null
+      updatedSentenceText?: string
+      updateToken?: number
     }
   | {
       kind: 'split'
@@ -83,13 +91,23 @@ const statusSummary = computed(() => {
   ]
 })
 
-const translatedPreviewHtml = computed(() => {
-  const fallbackHtml = buildDocumentPreviewHtml(segmentStore.segments, 'target')
-  if (!segmentStore.previewSupported || !segmentStore.previewHtml) {
-    return fallbackHtml
+const targetPreviewRenderMode = computed<'static' | 'target'>(() => {
+  if (segmentStore.previewSupported && segmentStore.previewHtml) {
+    return 'target'
   }
-  return renderTargetPreview(segmentStore.previewHtml, segmentStore.segments)
+  return 'static'
 })
+
+const targetPreviewHtml = computed(() => {
+  if (targetPreviewRenderMode.value === 'target') {
+    return segmentStore.previewHtml
+  }
+  return buildDocumentPreviewHtml(segmentStore.segments, 'target')
+})
+
+const targetPreviewSupported = computed(() =>
+  segmentStore.previewSupported || segmentStore.segments.length > 0,
+)
 
 const toolButtons = [
   { key: 'source-preview' as const, label: '原文预览' },
@@ -114,8 +132,13 @@ const activeToolConfig = computed<ActiveToolConfig | null>(() => {
     return {
       kind: 'preview' as const,
       title: '译文预览',
-      html: translatedPreviewHtml.value,
-      supported: segmentStore.previewSupported || segmentStore.segments.length > 0,
+      html: targetPreviewHtml.value,
+      supported: targetPreviewSupported.value,
+      renderMode: targetPreviewRenderMode.value,
+      segments: targetPreviewRenderMode.value === 'target' ? segmentStore.segments : [],
+      updatedSentenceId: segmentStore.lastPreviewUpdatedSentenceId,
+      updatedSentenceText: segmentStore.lastPreviewUpdatedText,
+      updateToken: segmentStore.previewUpdateToken,
     }
   }
 
@@ -167,6 +190,17 @@ const activeSplitConfig = computed(() =>
 
 function handlePreviewFocus(sentenceId: string) {
   segmentStore.setActiveSentence(sentenceId)
+  void focusEditorSentence(sentenceId)
+}
+
+async function focusEditorSentence(sentenceId: string) {
+  const targetIndex = segmentStore.segments.findIndex((segment) => segment.sentence_id === sentenceId)
+  if (targetIndex === -1) {
+    return
+  }
+
+  await nextTick()
+  await virtualListRef.value?.focusIndex(targetIndex, '[data-segment-target="true"]', 'nearest')
 }
 
 async function loadTask() {
@@ -323,7 +357,11 @@ onBeforeRouteLeave(async () => {
             <p class="panel-subtitle">逐句校对并整理译文。</p>
           </div>
         </div>
-        <VirtualList :items="segmentStore.segments" :item-height="itemHeight">
+        <VirtualList
+          ref="virtualListRef"
+          :items="segmentStore.segments"
+          :item-height="itemHeight"
+        >
           <template #default="{ item, index }">
             <SegmentEditorRow
               :segment="item"
@@ -343,11 +381,17 @@ onBeforeRouteLeave(async () => {
         <Transition name="preview-drawer">
           <SplitPreviewPanel
             v-if="activeSplitConfig"
+            :key="activeTool || 'split-preview'"
             :source-html="segmentStore.previewHtml"
-            :target-html="translatedPreviewHtml"
+            :target-html="targetPreviewHtml"
             :source-supported="segmentStore.previewSupported"
-            :target-supported="segmentStore.previewSupported || segmentStore.segments.length > 0"
+            :target-supported="targetPreviewSupported"
             :active-sentence-id="segmentStore.activeSentenceId"
+            :target-render-mode="targetPreviewRenderMode"
+            :target-segments="targetPreviewRenderMode === 'target' ? segmentStore.segments : []"
+            :target-updated-sentence-id="segmentStore.lastPreviewUpdatedSentenceId"
+            :target-updated-sentence-text="segmentStore.lastPreviewUpdatedText"
+            :target-update-token="segmentStore.previewUpdateToken"
             @close="activeTool = null"
             @focus-sentence="handlePreviewFocus"
           />
@@ -356,11 +400,17 @@ onBeforeRouteLeave(async () => {
         <Transition name="preview-drawer">
           <PreviewPanel
             v-if="activePreviewConfig"
+            :key="activeTool || 'preview-panel'"
             class="preview-panel--drawer"
             :title="activePreviewConfig.title"
             :html="activePreviewConfig.html"
             :supported="activePreviewConfig.supported"
             :active-sentence-id="segmentStore.activeSentenceId"
+            :render-mode="activePreviewConfig.renderMode || 'static'"
+            :segments="activePreviewConfig.segments || []"
+            :updated-sentence-id="activePreviewConfig.updatedSentenceId || null"
+            :updated-sentence-text="activePreviewConfig.updatedSentenceText || ''"
+            :update-token="activePreviewConfig.updateToken || 0"
             @focus-sentence="handlePreviewFocus"
             @close="activeTool = null"
           />

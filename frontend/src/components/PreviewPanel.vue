@@ -1,6 +1,13 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
+interface PreviewSegment {
+  sentence_id: string
+  source_text: string
+  display_text?: string | null
+  target_text?: string | null
+}
+
 const props = withDefaults(defineProps<{
   html: string
   activeSentenceId: string | null
@@ -8,10 +15,20 @@ const props = withDefaults(defineProps<{
   supported: boolean
   title?: string
   closable?: boolean
+  renderMode?: 'static' | 'target'
+  segments?: PreviewSegment[]
+  updatedSentenceId?: string | null
+  updatedSentenceText?: string
+  updateToken?: number
 }>(), {
   syncSentenceId: null,
   title: '原文预览',
   closable: true,
+  renderMode: 'static',
+  segments: () => [],
+  updatedSentenceId: null,
+  updatedSentenceText: '',
+  updateToken: 0,
 })
 
 const emit = defineEmits<{
@@ -23,6 +40,7 @@ const emit = defineEmits<{
 const containerRef = ref<HTMLElement | null>(null)
 const currentPage = ref(1)
 const totalPages = ref(1)
+const isRendering = ref(false)
 const pageSummary = computed(() => {
   if (!props.supported) {
     return ''
@@ -35,14 +53,115 @@ let scrollFrame = 0
 let programmaticScrollTimer = 0
 let ignoreScrollEvents = false
 let lastVisibleSentenceId: string | null = null
+let renderedHtmlSignature = ''
+let renderSequence = 0
+const sentenceNodeMap = new Map<string, HTMLElement>()
+const appliedSentenceTexts = new Map<string, string>()
 
 function getSentenceNode(sentenceId: string | null | undefined) {
   if (!sentenceId) {
     return null
   }
-  return containerRef.value?.querySelector<HTMLElement>(
+  const cachedNode = sentenceNodeMap.get(sentenceId)
+  if (cachedNode) {
+    return cachedNode
+  }
+  const node = containerRef.value?.querySelector<HTMLElement>(
     `.doc-sentence[data-sentence-id="${sentenceId}"]`,
   ) || null
+  if (node) {
+    sentenceNodeMap.set(sentenceId, node)
+  }
+  return node
+}
+
+function rebuildSentenceNodeMap(container: HTMLElement) {
+  sentenceNodeMap.clear()
+  for (const node of container.querySelectorAll<HTMLElement>('.doc-sentence[data-sentence-id]')) {
+    const sentenceId = node.dataset.sentenceId
+    if (sentenceId) {
+      sentenceNodeMap.set(sentenceId, node)
+    }
+  }
+}
+
+function resolveSegmentPreviewText(segment: PreviewSegment) {
+  return segment.target_text || segment.display_text || segment.source_text || ''
+}
+
+function applySentenceText(
+  sentenceId: string | null | undefined,
+  text: string,
+  force = false,
+) {
+  if (!sentenceId) {
+    return
+  }
+
+  const node = getSentenceNode(sentenceId)
+  if (!node) {
+    return
+  }
+
+  if (!force && appliedSentenceTexts.get(sentenceId) === text) {
+    return
+  }
+
+  node.textContent = text
+  appliedSentenceTexts.set(sentenceId, text)
+}
+
+function applyTargetSentenceTexts(force = false) {
+  if (props.renderMode !== 'target') {
+    return
+  }
+
+  for (const segment of props.segments) {
+    applySentenceText(segment.sentence_id, resolveSegmentPreviewText(segment), force)
+  }
+}
+
+async function renderPreviewContent(forceHtml = false) {
+  await nextTick()
+  const container = containerRef.value
+  if (!container || !props.supported) {
+    return
+  }
+
+  if (forceHtml || renderedHtmlSignature !== props.html) {
+    container.innerHTML = props.html
+    renderedHtmlSignature = props.html
+    appliedSentenceTexts.clear()
+    rebuildSentenceNodeMap(container)
+  }
+
+  applyTargetSentenceTexts(forceHtml)
+}
+
+function waitForPaint() {
+  return new Promise<void>((resolve) => {
+    if (typeof window === 'undefined' || typeof window.requestAnimationFrame !== 'function') {
+      resolve()
+      return
+    }
+    window.requestAnimationFrame(() => resolve())
+  })
+}
+
+async function runRenderCycle(forceHtml = false, scrollToActive = false) {
+  const sequence = ++renderSequence
+  isRendering.value = true
+
+  try {
+    await nextTick()
+    await waitForPaint()
+    await renderPreviewContent(forceHtml)
+    await applyHighlight(scrollToActive)
+  } finally {
+    if (sequence === renderSequence) {
+      isRendering.value = false
+    }
+  }
 }
 
 function updatePagination() {
@@ -195,7 +314,7 @@ function handleClick(event: MouseEvent) {
 }
 
 onMounted(() => {
-  void applyHighlight(true)
+  void runRenderCycle(true, true)
 
   if (typeof ResizeObserver !== 'undefined') {
     resizeObserver = new ResizeObserver(() => {
@@ -218,7 +337,37 @@ onBeforeUnmount(() => {
 
 watch(() => props.html, () => {
   lastVisibleSentenceId = null
-  void applyHighlight(false)
+  void runRenderCycle(true, false)
+})
+
+watch(() => props.supported, (supported) => {
+  if (!supported) {
+    renderedHtmlSignature = ''
+    lastVisibleSentenceId = null
+    sentenceNodeMap.clear()
+    appliedSentenceTexts.clear()
+    isRendering.value = false
+    return
+  }
+
+  void runRenderCycle(true, false)
+})
+
+watch(() => props.renderMode, () => {
+  lastVisibleSentenceId = null
+  void runRenderCycle(true, false)
+})
+
+watch(() => props.updateToken, (token, previousToken) => {
+  if (props.renderMode !== 'target' || token === previousToken) {
+    return
+  }
+
+  void nextTick(() => {
+    applySentenceText(props.updatedSentenceId, props.updatedSentenceText, false)
+    updatePagination()
+    notifyVisibleSentence()
+  })
 })
 
 watch(() => props.activeSentenceId, () => {
@@ -253,11 +402,15 @@ watch(() => props.syncSentenceId, (sentenceId) => {
           v-if="supported"
           ref="containerRef"
           class="preview-panel__body"
+          :aria-busy="isRendering"
           @click="handleClick"
           @scroll="handleScroll"
-          v-html="html"
         />
         <div v-else class="preview-panel__empty">当前任务没有可展示的预览内容</div>
+        <div v-if="supported && isRendering" class="preview-panel__loading">
+          <span class="preview-panel__spinner" aria-hidden="true" />
+          <span>预览加载中...</span>
+        </div>
       </div>
     </div>
   </section>

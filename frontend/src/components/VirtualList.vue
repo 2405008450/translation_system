@@ -41,6 +41,72 @@ function onScroll(event: Event) {
   scrollTop.value = (event.target as HTMLElement).scrollTop
 }
 
+async function scrollToIndex(index: number, align: ScrollLogicalPosition = 'center') {
+  const container = containerRef.value
+  if (!container || index < 0 || index >= props.items.length) {
+    return false
+  }
+
+  const itemTop = index * props.itemHeight
+  const maxScrollTop = Math.max(0, totalHeight.value - container.clientHeight)
+  let nextScrollTop = itemTop
+
+  if (align === 'center') {
+    nextScrollTop = itemTop - (container.clientHeight - props.itemHeight) / 2
+  } else if (align === 'end') {
+    nextScrollTop = itemTop - container.clientHeight + props.itemHeight
+  } else if (align === 'nearest') {
+    const itemBottom = itemTop + props.itemHeight
+    const viewportTop = container.scrollTop
+    const viewportBottom = viewportTop + container.clientHeight
+    if (itemTop < viewportTop) {
+      nextScrollTop = itemTop
+    } else if (itemBottom > viewportBottom) {
+      nextScrollTop = itemBottom - container.clientHeight
+    } else {
+      nextScrollTop = container.scrollTop
+    }
+  }
+
+  const safeScrollTop = Math.min(maxScrollTop, Math.max(0, nextScrollTop))
+  container.scrollTop = safeScrollTop
+  scrollTop.value = safeScrollTop
+
+  await nextTick()
+  await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()))
+  return true
+}
+
+async function focusIndex(
+  index: number,
+  selector = 'textarea, input, select, button, [tabindex]',
+  align: ScrollLogicalPosition = 'nearest',
+) {
+  const scrolled = await scrollToIndex(index, align)
+  if (!scrolled) {
+    return false
+  }
+
+  const container = containerRef.value
+  if (!container) {
+    return false
+  }
+
+  const row = container.querySelector<HTMLElement>(`[data-virtual-index="${index}"]`)
+  const target = row?.querySelector<HTMLElement>(selector)
+  if (!target) {
+    return false
+  }
+
+  target.focus({ preventScroll: true })
+  return true
+}
+
+defineExpose({
+  scrollToIndex,
+  focusIndex,
+})
+
 onMounted(async () => {
   await nextTick()
   updateViewportHeight()
@@ -74,6 +140,7 @@ onBeforeUnmount(() => {
           v-for="entry in visibleItems"
           :key="entry.index"
           class="virtual-list-row"
+          :data-virtual-index="entry.index"
           :style="{ height: `${itemHeight}px` }"
         >
           <slot :item="entry.item" :index="entry.index" />

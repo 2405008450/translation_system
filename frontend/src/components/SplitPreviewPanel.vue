@@ -1,15 +1,27 @@
 <script setup lang="ts">
 import { onBeforeUnmount, ref, watch } from 'vue'
 
+import type { Segment } from '../types/api'
 import PreviewPanel from './PreviewPanel.vue'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   sourceHtml: string
   targetHtml: string
   sourceSupported: boolean
   targetSupported: boolean
   activeSentenceId: string | null
-}>()
+  targetRenderMode?: 'static' | 'target'
+  targetSegments?: Segment[]
+  targetUpdatedSentenceId?: string | null
+  targetUpdatedSentenceText?: string
+  targetUpdateToken?: number
+}>(), {
+  targetRenderMode: 'static',
+  targetSegments: () => [],
+  targetUpdatedSentenceId: null,
+  targetUpdatedSentenceText: '',
+  targetUpdateToken: 0,
+})
 
 const emit = defineEmits<{
   close: []
@@ -137,6 +149,11 @@ onBeforeUnmount(() => {
           :supported="targetSupported"
           :active-sentence-id="activeSentenceId"
           :sync-sentence-id="targetSyncSentenceId"
+          :render-mode="targetRenderMode"
+          :segments="targetSegments"
+          :updated-sentence-id="targetUpdatedSentenceId"
+          :updated-sentence-text="targetUpdatedSentenceText"
+          :update-token="targetUpdateToken"
           :closable="false"
           @focus-sentence="emit('focusSentence', $event)"
           @visible-sentence-change="handleVisibleSentence('target', $event)"

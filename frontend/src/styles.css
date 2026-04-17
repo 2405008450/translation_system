@@ -1017,6 +1017,7 @@ button {
     inset 0 0 0 1px rgba(255, 255, 255, 0.75),
     0 16px 30px rgba(25, 48, 45, 0.08);
   overflow: hidden;
+  position: relative;
 }
 
 .preview-panel__body {
@@ -1046,6 +1047,37 @@ button {
   padding: 24px;
   color: #607677;
   text-align: center;
+}
+
+.preview-panel__loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  gap: 10px;
+  align-content: center;
+  background: rgba(255, 255, 255, 0.88);
+  color: #325257;
+  font-size: 14px;
+}
+
+.preview-panel__spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid rgba(143, 173, 168, 0.35);
+  border-top-color: var(--brand-700);
+  border-radius: 999px;
+  animation: preview-spin 0.8s linear infinite;
+}
+
+@keyframes preview-spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .preview-panel .doc-story {

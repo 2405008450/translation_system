@@ -20,7 +20,11 @@ const sourceClass = computed(() => `segment-row__tag--source-${props.segment.sou
 </script>
 
 <template>
-  <article class="segment-row" :class="[statusClass, { 'is-active': active }]">
+  <article
+    class="segment-row"
+    :class="[statusClass, { 'is-active': active }]"
+    :data-sentence-id="segment.sentence_id"
+  >
     <div class="segment-row__head">
       <span class="segment-row__index">#{{ index + 1 }}</span>
       <span class="segment-row__tag segment-row__tag--status">{{ segment.status }}</span>
@@ -42,6 +46,8 @@ const sourceClass = computed(() => `segment-row__tag--source-${props.segment.sou
           class="segment-row__textarea"
           :value="segment.target_text"
           :disabled="disabled"
+          data-segment-target="true"
+          :data-sentence-id="segment.sentence_id"
           spellcheck="false"
           @focus="emit('focus', segment.sentence_id)"
           @input="emit('update', segment.sentence_id, ($event.target as HTMLTextAreaElement).value)"
