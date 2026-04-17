@@ -90,7 +90,7 @@ export interface SegmentUpdatePayload {
   source: string
 }
 
-export type LLMTranslateScope = 'fuzzy_only' | 'none_only' | 'all'
+export type LLMTranslateScope = 'fuzzy_only' | 'none_only' | 'all' | 'all_with_exact'
 export type LLMProvider = 'auto' | 'deepseek' | 'openrouter'
 
 export interface LLMEvent {

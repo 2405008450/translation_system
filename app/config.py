@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     llm_max_concurrency: int = 5
     llm_temperature: float = 0.2
     llm_retry_attempts_per_provider: int = 2
+    redis_url: str | None = None
     jwt_secret_key: str = "change-me-in-production"
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 1440

@@ -63,7 +63,7 @@ class BatchSegmentUpdate(BaseModel):
 
 
 class LLMTranslateRequest(BaseModel):
-    scope: Literal["fuzzy_only", "none_only", "all"] = "all"
+    scope: Literal["fuzzy_only", "none_only", "all", "all_with_exact"] = "all"
     provider: Literal["auto", "deepseek", "openrouter"] = "auto"
 
 
@@ -97,12 +97,13 @@ def _sse_event(event: str, payload: dict) -> str:
 def _build_llm_translation_tasks(
     db: Session,
     file_record_id: UUID,
-    scope: Literal["fuzzy_only", "none_only", "all"],
+    scope: Literal["fuzzy_only", "none_only", "all", "all_with_exact"],
 ) -> list[LLMTranslationTask]:
     statuses_by_scope = {
         "fuzzy_only": {"fuzzy"},
         "none_only": {"none"},
         "all": {"fuzzy", "none"},
+        "all_with_exact": {"exact", "fuzzy", "none"},
     }
     target_statuses = statuses_by_scope[scope]
     segments = list_segments_for_file_record(db, file_record_id)
@@ -112,12 +113,10 @@ def _build_llm_translation_tasks(
     )
 
     tasks: list[LLMTranslationTask] = []
-    for index, segment in enumerate(segments):
+    for segment in segments:
         if segment.status not in target_statuses:
             continue
 
-        previous_segment = segments[index - 1] if index > 0 else None
-        next_segment = segments[index + 1] if index + 1 < len(segments) else None
         tm_target_text = tm_target_text_map.get(
             segment.matched_source_text or "",
             segment.target_text if segment.source == "tm" else "",
@@ -131,10 +130,6 @@ def _build_llm_translation_tasks(
                 block_type=segment.block_type,
                 matched_source_text=segment.matched_source_text,
                 tm_target_text=tm_target_text,
-                previous_source_text=previous_segment.source_text if previous_segment else None,
-                previous_target_text=(previous_segment.target_text or None) if previous_segment else None,
-                next_source_text=next_segment.source_text if next_segment else None,
-                next_target_text=(next_segment.target_text or None) if next_segment else None,
             )
         )
 
@@ -462,7 +457,7 @@ async def llm_translate_file_record(
     payload: LLMTranslateRequest | None = None,
     db: Session = Depends(get_db),
 ):
-    """对 fuzzy / none 片段触发 LLM 译文修正，并通过 SSE 逐条返回结果。"""
+    """对指定范围的片段触发 LLM 译文修正，并通过 SSE 逐条返回结果。"""
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")

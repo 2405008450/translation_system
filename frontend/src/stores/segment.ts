@@ -41,7 +41,7 @@ export const useSegmentStore = defineStore('segment', () => {
   const saving = ref(false)
   const llmRunning = ref(false)
   const syncMessage = ref('暂无未保存修改')
-  const llmMessage = ref('可对 fuzzy / none 句段执行 AI 修正。')
+  const llmMessage = ref('可按范围对 exact / fuzzy / none 句段执行 AI 修正。')
   const lastSyncedAt = ref<string | null>(null)
   const dirtyEntries = ref<Record<string, SegmentUpdatePayload>>({})
 
@@ -62,7 +62,7 @@ export const useSegmentStore = defineStore('segment', () => {
     saving.value = false
     llmRunning.value = false
     syncMessage.value = '暂无未保存修改'
-    llmMessage.value = '可对 fuzzy / none 句段执行 AI 修正。'
+    llmMessage.value = '可按范围对 exact / fuzzy / none 句段执行 AI 修正。'
     lastSyncedAt.value = null
     dirtyEntries.value = {}
   }
