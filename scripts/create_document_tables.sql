@@ -44,12 +44,12 @@ CREATE INDEX IF NOT EXISTS ix_segments_file_record_id
     ON segments (file_record_id);
 
 CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $
+RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at = NOW();
     RETURN NEW;
 END;
-$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS update_file_records_updated_at ON file_records;
 CREATE TRIGGER update_file_records_updated_at

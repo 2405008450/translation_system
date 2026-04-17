@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -11,6 +12,7 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from app.config import Settings, get_settings
+from app.services.normalizer import normalize_text
 
 try:
     import httpx
@@ -36,11 +38,16 @@ class LLMRequestError(LLMServiceError):
     """LLM 请求异常。"""
 
 
+class LLMResponseValidationError(LLMServiceError):
+    """LLM 返回内容不符合约束。"""
+
+
 @dataclass(frozen=True)
 class LLMTranslationTask:
     sentence_id: str
     status: str
     source_text: str
+    block_type: str = "paragraph"
     matched_source_text: str | None = None
     tm_target_text: str | None = None
     previous_source_text: str | None = None
@@ -73,40 +80,50 @@ class ProviderConfig:
     model: str
 
 
+NUMERIC_LIKE_FRAGMENT_RE = re.compile(r"^[0-9\s,.\-+/%()（）$€¥￥£:：]+$")
+SHORT_FRAGMENT_MAX_CHARS = 12
+SENTENCE_END_CHARS = frozenset("。？！?!")
+STRICT_PRESERVE_SYMBOLS = frozenset({"□", "☐", "☑", "", "", "✓", "✔", "✗", "✘"})
+
+
 def validate_provider_choice(
     provider: LLMProvider = "auto",
     settings: Settings | None = None,
 ) -> list[ProviderConfig]:
     config = settings or get_settings()
-    providers: list[ProviderConfig] = []
+    available_providers: dict[str, ProviderConfig] = {}
 
-    if provider in ("auto", "deepseek") and config.deepseek_api_key:
-        providers.append(
-            ProviderConfig(
-                name="deepseek",
-                api_key=config.deepseek_api_key,
-                base_url=config.deepseek_base_url.rstrip("/"),
-                model=config.deepseek_model,
-            )
+    if config.deepseek_api_key:
+        available_providers["deepseek"] = ProviderConfig(
+            name="deepseek",
+            api_key=config.deepseek_api_key,
+            base_url=config.deepseek_base_url.rstrip("/"),
+            model=config.deepseek_model,
         )
 
-    if provider in ("auto", "openrouter") and config.openrouter_api_key:
-        providers.append(
-            ProviderConfig(
-                name="openrouter",
-                api_key=config.openrouter_api_key,
-                base_url=config.openrouter_base_url.rstrip("/"),
-                model=config.openrouter_model,
-            )
+    if config.openrouter_api_key:
+        available_providers["openrouter"] = ProviderConfig(
+            name="openrouter",
+            api_key=config.openrouter_api_key,
+            base_url=config.openrouter_base_url.rstrip("/"),
+            model=config.openrouter_model,
         )
+
+    if provider == "auto":
+        ordered_names = ["deepseek", "openrouter"]
+    elif provider == "deepseek":
+        if "deepseek" not in available_providers:
+            raise LLMConfigurationError("未配置 DEEPSEEK_API_KEY，无法使用 DeepSeek。")
+        ordered_names = ["deepseek", "openrouter"]
+    else:
+        if "openrouter" not in available_providers:
+            raise LLMConfigurationError("未配置 OPENROUTER_API_KEY，无法使用 OpenRouter。")
+        ordered_names = ["openrouter", "deepseek"]
+
+    providers = [available_providers[name] for name in ordered_names if name in available_providers]
 
     if providers:
         return providers
-
-    if provider == "deepseek":
-        raise LLMConfigurationError("未配置 DEEPSEEK_API_KEY，无法使用 DeepSeek。")
-    if provider == "openrouter":
-        raise LLMConfigurationError("未配置 OPENROUTER_API_KEY，无法使用 OpenRouter。")
 
     raise LLMConfigurationError("未配置可用的 LLM API key。")
 
@@ -180,33 +197,43 @@ async def _translate_single_task(
     clients: dict[str, "httpx.AsyncClient" | None],
     settings: Settings,
 ) -> LLMTranslationResult:
-    messages = _build_messages(task)
     last_error: Exception | None = None
+    retry_attempts = max(int(getattr(settings, "llm_retry_attempts_per_provider", 2)), 1)
 
-    for provider in providers:
-        try:
-            translated_text = await _request_translation(
-                client=clients.get(provider.name),
-                provider=provider,
-                messages=messages,
-                temperature=settings.llm_temperature,
-                timeout_seconds=settings.llm_timeout_seconds,
+    for provider_index, provider in enumerate(providers):
+        for attempt_index in range(retry_attempts):
+            strict_retry = attempt_index > 0 or provider_index > 0
+            current_temperature = 0.0 if strict_retry else settings.llm_temperature
+            messages = _build_messages(
+                task,
+                strict_retry=strict_retry,
+                retry_reason=str(last_error) if strict_retry and last_error else None,
             )
-            return LLMTranslationResult(
-                sentence_id=task.sentence_id,
-                translated_text=translated_text,
-                status=task.status,
-                provider=provider.name,
-                model=provider.model,
-            )
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            logger.warning(
-                "llm provider failed sentence_id=%s provider=%s error=%s",
-                task.sentence_id,
-                provider.name,
-                exc,
-            )
+            try:
+                translated_text = await _request_translation(
+                    client=clients.get(provider.name),
+                    provider=provider,
+                    messages=messages,
+                    temperature=current_temperature,
+                    timeout_seconds=settings.llm_timeout_seconds,
+                )
+                _validate_translation_output(task, translated_text)
+                return LLMTranslationResult(
+                    sentence_id=task.sentence_id,
+                    translated_text=translated_text,
+                    status=task.status,
+                    provider=provider.name,
+                    model=provider.model,
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning(
+                    "llm provider failed sentence_id=%s provider=%s attempt=%s error=%s",
+                    task.sentence_id,
+                    provider.name,
+                    attempt_index + 1,
+                    exc,
+                )
 
     raise LLMRequestError(str(last_error) if last_error else "LLM 请求失败。")
 
@@ -250,12 +277,25 @@ async def _request_translation(
     return _extract_translation_from_payload(response.json(), provider.name)
 
 
-def _build_messages(task: LLMTranslationTask) -> list[dict[str, str]]:
+def _build_messages(
+    task: LLMTranslationTask,
+    strict_retry: bool = False,
+    retry_reason: str | None = None,
+) -> list[dict[str, str]]:
     system_prompt = (
         "你是专业的中英翻译专家。"
         "请保持术语一致，保留数字、单位、专有名词和格式。"
+        "如果原文包含复选框、勾选框、项目符号或特殊符号（如 □、☐、☑、、✓ 等），必须按原样保留这些符号本身及其顺序，不得新增、删除、替换，也不得自行改变其选中状态。"
         "只输出最终英文译文，不要解释，不要引号，不要项目符号。"
     )
+    retry_instruction = ""
+    if strict_retry:
+        retry_instruction = (
+            "\n这是一次纠错重试。"
+            "请更严格地保留原文中的数字、格式、复选框和特殊符号，禁止擅自补充勾选状态或改写符号样式。"
+        )
+        if retry_reason:
+            retry_instruction += f"\n上一次结果的问题：{retry_reason}"
 
     if task.status == "fuzzy":
         return [
@@ -273,21 +313,40 @@ def _build_messages(task: LLMTranslationTask) -> list[dict[str, str]]:
                     "1. 把“翻译记忆库的译文”当作基础译文，优先保留其中仍然适用的表达、术语、句式和语气。\n"
                     "2. 重点根据两个原文之间的差异，对基础译文做对应修改，而不是忽略基础译文直接整句重译。\n"
                     "3. 必须让结果完整表达“当前原文”的全部含义；如果当前原文比记忆库原文多了信息，就补全；如果少了信息，就删去不再适用的内容；如果有替换，就准确改写对应部分。\n"
-                    "4. 保留数字、单位、标点风格、专有名词和已存在的专业术语一致性。\n"
+                    "4. 保留数字、单位、标点风格、专有名词、复选框/勾选框/特殊符号和已存在的专业术语一致性，不得擅自增删或替换符号。\n"
                     "5. 输出必须是最终可直接使用的完整英文译文，只输出译文本身。\n\n"
-                    "请输出基于记忆库译文修订后的最终英文译文。"
+                    f"请输出基于记忆库译文修订后的最终英文译文。{retry_instruction}"
                 ),
             },
         ]
 
+    if _is_numeric_like_fragment(task.source_text):
+        return [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    "请处理以下内容并输出英文目标文本。\n"
+                    "如果内容只是数字、金额、百分比、日期、编号或符号，并且在英文中通常可直接沿用，请原样输出。\n"
+                    "如果内容中包含可翻译文字，只翻译文字部分，并尽量保留数字和原有排版格式。\n"
+                    "除非原文明确体现需要转换的中文数字单位或本地格式，否则不要擅自改动千分位、小数点、货币符号、编号格式或特殊符号。\n\n"
+                    f"原文：{task.source_text}\n\n"
+                    f"只输出最终结果。{retry_instruction}"
+                ),
+            },
+        ]
+
+    include_neighbor_sources = task.block_type != "table_cell"
+    include_neighbor_targets = include_neighbor_sources and not _looks_like_short_fragment(task.source_text)
+
     context_lines = []
-    if task.previous_source_text:
+    if include_neighbor_sources and task.previous_source_text:
         context_lines.append(f"上一句原文：{task.previous_source_text}")
-    if task.previous_target_text:
+    if include_neighbor_targets and task.previous_target_text:
         context_lines.append(f"上一句译文：{task.previous_target_text}")
-    if task.next_source_text:
+    if include_neighbor_sources and task.next_source_text:
         context_lines.append(f"下一句原文：{task.next_source_text}")
-    if task.next_target_text:
+    if include_neighbor_targets and task.next_target_text:
         context_lines.append(f"下一句译文：{task.next_target_text}")
 
     context_block = "\n".join(context_lines)
@@ -299,13 +358,47 @@ def _build_messages(task: LLMTranslationTask) -> list[dict[str, str]]:
         {
             "role": "user",
             "content": (
-                "请将以下中文翻译为英文。"
+                "请将以下内容翻译为英文。"
                 f"{context_block}\n"
                 f"原文：{task.source_text}\n\n"
-                "只输出英文译文。"
+                f"请严格保留原文中的数字、复选框、勾选框和特殊符号，不得擅自新增或改变其状态。\n\n只输出英文译文。{retry_instruction}"
             ),
         },
     ]
+
+
+def _is_numeric_like_fragment(text: str) -> bool:
+    normalized = normalize_text(text)
+    if not normalized:
+        return False
+    return bool(NUMERIC_LIKE_FRAGMENT_RE.fullmatch(normalized))
+
+
+def _looks_like_short_fragment(text: str) -> bool:
+    normalized = normalize_text(text)
+    if not normalized or _is_numeric_like_fragment(normalized):
+        return False
+    return len(normalized) <= SHORT_FRAGMENT_MAX_CHARS and normalized[-1] not in SENTENCE_END_CHARS
+
+
+def _extract_preserved_symbol_sequence(text: str) -> list[str]:
+    return [char for char in text if char in STRICT_PRESERVE_SYMBOLS]
+
+
+def _validate_translation_output(task: LLMTranslationTask, translated_text: str) -> None:
+    normalized_output = normalize_text(translated_text)
+    if not normalized_output:
+        raise LLMResponseValidationError("LLM 返回空译文。")
+
+    if _is_numeric_like_fragment(task.source_text):
+        if normalized_output != normalize_text(task.source_text):
+            raise LLMResponseValidationError("数字或符号片段未按原文保留。")
+
+    source_symbols = _extract_preserved_symbol_sequence(task.source_text)
+    if source_symbols:
+        output_symbols = _extract_preserved_symbol_sequence(translated_text)
+        if output_symbols != source_symbols:
+            raise LLMResponseValidationError("复选框或特殊符号未按原文原样保留。")
 
 
 def _describe_diff(source_text: str, matched_source_text: str) -> str:

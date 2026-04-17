@@ -7,15 +7,23 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.auth import get_current_user, require_admin
 from app.database import get_db
+from app.models import TMCollection, TranslationMemory, User
 from app.services.document_exporter import (
     DOCX_MEDIA_TYPE,
     build_translated_docx_filename,
     export_translated_docx,
 )
-from app.services.document_workspace import build_docx_workspace
+from app.services.document_workspace import (
+    build_docx_preview_html,
+    build_document_html_from_segments,
+    build_docx_workspace,
+)
 from app.services.file_record_service import (
     batch_update_segments,
     create_file_record_with_segments,
@@ -36,10 +44,12 @@ from app.services.llm_service import (
     iter_batch_translate,
     validate_provider_choice,
 )
+from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
 from app.services.slate_parser import parse_docx_for_slate
+from app.services.tm_importer import XLSX_EXTENSIONS, import_tm_from_xlsx_upload
 
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 
 class SegmentUpdate(BaseModel):
@@ -55,6 +65,11 @@ class BatchSegmentUpdate(BaseModel):
 class LLMTranslateRequest(BaseModel):
     scope: Literal["fuzzy_only", "none_only", "all"] = "all"
     provider: Literal["auto", "deepseek", "openrouter"] = "auto"
+
+
+class TMCollectionPayload(BaseModel):
+    name: str
+    description: str | None = None
 
 
 def _build_docx_download_response(filename: str, docx_bytes: bytes) -> StreamingResponse:
@@ -113,6 +128,7 @@ def _build_llm_translation_tasks(
                 sentence_id=segment.sentence_id,
                 status=segment.status,
                 source_text=segment.source_text,
+                block_type=segment.block_type,
                 matched_source_text=segment.matched_source_text,
                 tm_target_text=tm_target_text,
                 previous_source_text=previous_segment.source_text if previous_segment else None,
@@ -130,10 +146,63 @@ def _validate_docx_upload(file: UploadFile) -> None:
         raise HTTPException(status_code=400, detail="仅支持 DOCX 文件。")
 
 
+def _normalize_collection_name(name: str) -> str:
+    return " ".join(name.strip().split())
+
+
+def _validate_collection_ids(
+    db: Session,
+    collection_ids: list[UUID] | None,
+) -> list[UUID] | None:
+    if not collection_ids:
+        return None
+
+    normalized_ids = list(dict.fromkeys(collection_ids))
+    existing_collections = (
+        db.query(TMCollection)
+        .filter(TMCollection.id.in_(normalized_ids))
+        .all()
+    )
+    existing_ids = {collection.id for collection in existing_collections}
+    missing_ids = [collection_id for collection_id in normalized_ids if collection_id not in existing_ids]
+    if missing_ids:
+        raise HTTPException(status_code=404, detail="选择的 TM 记忆库不存在。")
+
+    return normalized_ids
+
+
+def _get_collection_or_404(db: Session, collection_id: UUID | None) -> TMCollection | None:
+    if collection_id is None:
+        return None
+
+    collection = db.query(TMCollection).filter(TMCollection.id == collection_id).first()
+    if collection is None:
+        raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
+    return collection
+
+
+def _filter_tm_collection(query, collection_id: UUID | None):
+    if collection_id is None:
+        return query.filter(TranslationMemory.collection_id.is_(None))
+    return query.filter(TranslationMemory.collection_id == collection_id)
+
+
+def _serialize_tm_collection(collection: TMCollection, entry_count: int = 0) -> dict:
+    return {
+        "id": collection.id,
+        "name": collection.name,
+        "description": collection.description,
+        "created_at": collection.created_at.isoformat(),
+        "updated_at": collection.updated_at.isoformat(),
+        "entry_count": entry_count,
+    }
+
+
 @router.post("/parser/slate")
 async def upload_for_slate(
     file: UploadFile = File(...),
     threshold: float = Form(default=0.6),
+    collection_ids: list[UUID] | None = Form(default=None),
     db: Session = Depends(get_db),
 ):
     _validate_docx_upload(file)
@@ -142,8 +211,14 @@ async def upload_for_slate(
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="文件为空。")
 
+    selected_collection_ids = _validate_collection_ids(db, collection_ids)
     try:
-        result = parse_docx_for_slate(db=db, raw_bytes=raw_bytes, similarity_threshold=threshold)
+        result = parse_docx_for_slate(
+            db=db,
+            raw_bytes=raw_bytes,
+            similarity_threshold=threshold,
+            collection_ids=selected_collection_ids,
+        )
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -153,6 +228,7 @@ async def upload_for_slate(
 async def upload_for_workspace(
     file: UploadFile = File(...),
     threshold: float = Form(default=0.6),
+    collection_ids: list[UUID] | None = Form(default=None),
     db: Session = Depends(get_db),
 ):
     _validate_docx_upload(file)
@@ -161,11 +237,13 @@ async def upload_for_workspace(
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="文件为空。")
 
+    selected_collection_ids = _validate_collection_ids(db, collection_ids)
     try:
         return build_docx_workspace(
             db=db,
             raw_bytes=raw_bytes,
             similarity_threshold=threshold,
+            collection_ids=selected_collection_ids,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -178,6 +256,7 @@ async def upload_for_workspace(
 async def create_file_record(
     file: UploadFile = File(...),
     threshold: float = Form(default=0.6),
+    collection_ids: list[UUID] | None = Form(default=None),
     db: Session = Depends(get_db),
 ):
     """上传文档并创建持久化记录"""
@@ -187,12 +266,14 @@ async def create_file_record(
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="文件为空。")
 
+    selected_collection_ids = _validate_collection_ids(db, collection_ids)
     try:
         file_record = create_file_record_with_segments(
             db=db,
             raw_bytes=raw_bytes,
             filename=file.filename or "untitled.docx",
             similarity_threshold=threshold,
+            collection_ids=selected_collection_ids,
         )
         return {
             "id": file_record.id,
@@ -271,9 +352,36 @@ def get_file_record(
                 "source": seg.source,
                 "block_type": seg.block_type,
                 "block_index": seg.block_index,
+                "row_index": seg.row_index,
+                "cell_index": seg.cell_index,
             }
             for seg in segments
         ],
+    }
+
+
+@router.get("/file-records/{file_record_id}/preview")
+@router.get("/documents/{file_record_id}/preview", include_in_schema=False)
+def get_file_record_preview(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    source_bytes = load_file_record_source(file_record)
+    if source_bytes:
+        preview_html = build_docx_preview_html(source_bytes)
+    else:
+        segments = list_segments_for_file_record(db, file_record_id)
+        preview_html = build_document_html_from_segments(segments) if segments else ""
+
+    return {
+        "id": file_record.id,
+        "filename": file_record.filename,
+        "supports_preview": bool(preview_html),
+        "preview_html": preview_html,
     }
 
 
@@ -489,6 +597,7 @@ async def llm_translate_file_record(
 def remove_file_record(
     file_record_id: UUID,
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     """删除文档及其所有片段"""
     success = delete_file_record(db, file_record_id)
@@ -502,10 +611,148 @@ def remove_file_record(
 class TMEntry(BaseModel):
     source_text: str
     target_text: str
+    collection_id: UUID | None = None
 
 
 class BatchTMEntry(BaseModel):
+    collection_id: UUID | None = None
     entries: list[TMEntry]
+
+
+@router.get("/tm/collections")
+def list_tm_collections(
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(TMCollection, func.count(TranslationMemory.id).label("entry_count"))
+        .outerjoin(TranslationMemory, TranslationMemory.collection_id == TMCollection.id)
+        .group_by(TMCollection.id)
+        .order_by(TMCollection.created_at.desc())
+        .all()
+    )
+    return [
+        _serialize_tm_collection(collection, int(entry_count))
+        for collection, entry_count in rows
+    ]
+
+
+@router.post("/tm/collections")
+def create_tm_collection(
+    payload: TMCollectionPayload,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    name = _normalize_collection_name(payload.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="记忆库名称不能为空。")
+
+    collection = TMCollection(
+        name=name,
+        description=normalize_text(payload.description or "") or None,
+    )
+    db.add(collection)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="同名记忆库已存在。") from exc
+
+    db.refresh(collection)
+    return _serialize_tm_collection(collection)
+
+
+@router.put("/tm/collections/{collection_id}")
+def update_tm_collection(
+    collection_id: UUID,
+    payload: TMCollectionPayload,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    collection = _get_collection_or_404(db, collection_id)
+    if collection is None:
+        raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
+
+    name = _normalize_collection_name(payload.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="记忆库名称不能为空。")
+
+    collection.name = name
+    collection.description = normalize_text(payload.description or "") or None
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="同名记忆库已存在。") from exc
+
+    db.refresh(collection)
+    entry_count = (
+        db.query(TranslationMemory)
+        .filter(TranslationMemory.collection_id == collection.id)
+        .count()
+    )
+    return _serialize_tm_collection(collection, entry_count)
+
+
+@router.delete("/tm/collections/{collection_id}")
+def delete_tm_collection(
+    collection_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    collection = _get_collection_or_404(db, collection_id)
+    if collection is None:
+        raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
+
+    entry_count = (
+        db.query(TranslationMemory)
+        .filter(TranslationMemory.collection_id == collection.id)
+        .count()
+    )
+    if entry_count:
+        raise HTTPException(status_code=409, detail="请先清空该记忆库中的 TM 记录。")
+
+    db.delete(collection)
+    db.commit()
+    return {"message": "记忆库已删除。"}
+
+
+@router.post("/tm/import-xlsx")
+async def import_tm_xlsx(
+    file: UploadFile = File(...),
+    collection_id: UUID | None = Form(default=None),
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
+    if extension not in XLSX_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="仅支持上传 .xlsx 文件。")
+
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="上传的 XLSX 文件为空。")
+
+    collection = _get_collection_or_404(db, collection_id)
+    try:
+        import_summary = import_tm_from_xlsx_upload(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=file.filename or "uploaded.xlsx",
+            collection_id=collection_id,
+        )
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"TM 导入失败：{exc}") from exc
+
+    return {
+        "filename": import_summary.filename,
+        "created_rows": import_summary.created_rows,
+        "updated_rows": import_summary.updated_rows,
+        "skipped_empty_rows": import_summary.skipped_empty_rows,
+        "skipped_header_rows": import_summary.skipped_header_rows,
+        "imported_rows": import_summary.imported_rows,
+        "collection_id": collection.id if collection else None,
+        "collection_name": collection.name if collection else None,
+    }
 
 
 @router.post("/tm/add")
@@ -514,30 +761,31 @@ def add_tm_entry(
     db: Session = Depends(get_db),
 ):
     """添加单条 TM 记录（去重：相同原文不重复添加）"""
-    from app.models import TranslationMemory
-    from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
-
     source_text = normalize_text(entry.source_text)
     target_text = normalize_text(entry.target_text)
 
     if not source_text or not target_text:
         raise HTTPException(status_code=400, detail="原文和译文不能为空。")
 
+    _get_collection_or_404(db, entry.collection_id)
     source_hash = build_source_hash(source_text)
 
     # 检查是否已存在
-    existing = db.query(TranslationMemory).filter(
+    existing_query = db.query(TranslationMemory).filter(
         TranslationMemory.source_hash == source_hash
-    ).first()
+    )
+    existing = _filter_tm_collection(existing_query, entry.collection_id).first()
 
     if existing:
         # 已存在，更新译文
         existing.target_text = target_text
+        existing.source_normalized = normalize_match_text(source_text) or source_text
         db.commit()
         return {"status": "updated", "id": existing.id, "message": "已更新现有记录。"}
 
     # 不存在，新增
     tm = TranslationMemory(
+        collection_id=entry.collection_id,
         source_text=source_text,
         target_text=target_text,
         source_hash=source_hash,
@@ -556,16 +804,23 @@ def batch_add_tm_entries(
     db: Session = Depends(get_db),
 ):
     """批量添加 TM 记录（去重）"""
-    from app.models import TranslationMemory
-    from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
-
     created_count = 0
     updated_count = 0
     skipped_count = 0
+    collection_ids = [
+        collection_id
+        for collection_id in (
+            [batch.collection_id]
+            + [entry.collection_id for entry in batch.entries]
+        )
+        if collection_id is not None
+    ]
+    _validate_collection_ids(db, collection_ids)
 
     for entry in batch.entries:
         source_text = normalize_text(entry.source_text)
         target_text = normalize_text(entry.target_text)
+        collection_id = entry.collection_id or batch.collection_id
 
         if not source_text or not target_text:
             skipped_count += 1
@@ -573,15 +828,18 @@ def batch_add_tm_entries(
 
         source_hash = build_source_hash(source_text)
 
-        existing = db.query(TranslationMemory).filter(
+        existing_query = db.query(TranslationMemory).filter(
             TranslationMemory.source_hash == source_hash
-        ).first()
+        )
+        existing = _filter_tm_collection(existing_query, collection_id).first()
 
         if existing:
             existing.target_text = target_text
+            existing.source_normalized = normalize_match_text(source_text) or source_text
             updated_count += 1
         else:
             tm = TranslationMemory(
+                collection_id=collection_id,
                 source_text=source_text,
                 target_text=target_text,
                 source_hash=source_hash,

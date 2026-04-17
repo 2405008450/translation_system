@@ -6,6 +6,7 @@ from io import BytesIO
 from itertools import count
 import posixpath
 import re
+from uuid import UUID
 from zipfile import BadZipFile, ZipFile
 from xml.etree import ElementTree as ET
 
@@ -47,6 +48,11 @@ HIGHLIGHT_COLORS = {
 PAGE_NUMBER_FIELD_NAMES = {"PAGE", "NUMPAGES", "SECTIONPAGES"}
 NUMBERING_PLACEHOLDER_RE = re.compile(r"%(\d+)")
 PAGE_NUMBER_WRAPPER_RE = re.compile(r"[\s\-\u2013\u2014\u2212\uff0d_./\\|:：()\[\]{}（）【】<>《》·•]+")
+CELL_SENTENCE_END_CHARS = frozenset("。？！?!.；;:：")
+CELL_SHORT_PARAGRAPH_MAX_CHARS = 20
+CELL_NEXT_PARAGRAPH_MAX_CHARS = 50
+CELL_GROUP_MAX_CHARS = 200
+CELL_PARAGRAPH_BREAK_SENTINEL = "\uE000"
 
 
 @dataclass(frozen=True)
@@ -55,6 +61,12 @@ class InlineFragment:
     source_text: str
     css: str = ""
     href: str | None = None
+
+
+CELL_PARAGRAPH_BREAK_FRAGMENT = InlineFragment(
+    display_text="\n",
+    source_text=CELL_PARAGRAPH_BREAK_SENTINEL,
+)
 
 
 @dataclass(frozen=True)
@@ -76,6 +88,17 @@ class TrackedField:
 class InlineParseState:
     field_stack: list[TrackedField] = field(default_factory=list)
     suppressed_page_number_field: bool = False
+
+
+@dataclass
+class ParsedParagraphRenderData:
+    paragraph: ET.Element
+    fragments: list[InlineFragment]
+    textbox_html_parts: list[str]
+    textbox_segments: list[dict]
+    numbering_text: str
+    paragraph_css: str
+    suppressed_page_number_field: bool
 
 
 @dataclass(frozen=True)
@@ -357,6 +380,7 @@ def build_docx_workspace(
     raw_bytes: bytes,
     similarity_threshold: float = 0.6,
     include_matches: bool = True,
+    collection_ids: list[UUID] | None = None,
 ) -> dict:
     parsed_workspace = parse_docx_workspace(raw_bytes)
     segments = parsed_workspace["segments"]
@@ -371,6 +395,7 @@ def build_docx_workspace(
                 for segment in segments
             ],
             similarity_threshold=similarity_threshold,
+            collection_ids=collection_ids,
         )
         for segment, match in zip(segments, match_results):
             segment["status"] = match.status
@@ -643,6 +668,208 @@ def _render_block(
     return "", []
 
 
+def _normalize_segment_source_text(text: str) -> str:
+    if not text:
+        return ""
+    return normalize_text(text.replace(CELL_PARAGRAPH_BREAK_SENTINEL, ""))
+
+
+def _build_paragraph_classes(story_kind: str, block_type: str) -> list[str]:
+    paragraph_classes = ["doc-paragraph"]
+    if block_type == "table_cell":
+        paragraph_classes.append("doc-table-paragraph")
+    if block_type == "textbox":
+        paragraph_classes.append("doc-textbox-paragraph")
+    if story_kind != "body":
+        paragraph_classes.append(f"doc-{story_kind}-paragraph")
+    return paragraph_classes
+
+
+def _collect_paragraph_render_data(
+    paragraph: ET.Element,
+    story: StoryPart,
+    sentence_counter,
+    block_counter,
+    numbering_state: NumberingState,
+) -> ParsedParagraphRenderData:
+    parse_state = InlineParseState()
+    numbering_text = _resolve_paragraph_numbering(paragraph, numbering_state)
+    fragments, textbox_html_parts, textbox_segments = _collect_inline_content(
+        node=paragraph,
+        story=story,
+        sentence_counter=sentence_counter,
+        block_counter=block_counter,
+        numbering_state=numbering_state,
+        parse_state=parse_state,
+    )
+    if numbering_text:
+        fragments = [
+            InlineFragment(
+                display_text=numbering_text,
+                source_text="".join(" " if not char.isspace() else char for char in numbering_text),
+            ),
+            *fragments,
+        ]
+
+    return ParsedParagraphRenderData(
+        paragraph=paragraph,
+        fragments=fragments,
+        textbox_html_parts=textbox_html_parts,
+        textbox_segments=textbox_segments,
+        numbering_text=numbering_text,
+        paragraph_css=_build_paragraph_css(paragraph),
+        suppressed_page_number_field=parse_state.suppressed_page_number_field,
+    )
+
+
+def _cell_paragraph_text(fragments: list[InlineFragment]) -> str:
+    return normalize_text("".join(fragment.display_text for fragment in fragments))
+
+
+def _cell_paragraph_text_length(fragments: list[InlineFragment]) -> int:
+    return len(_cell_paragraph_text(fragments))
+
+
+def _cell_paragraph_looks_incomplete(fragments: list[InlineFragment]) -> bool:
+    text = "".join(fragment.display_text for fragment in fragments).rstrip()
+    if not text:
+        return False
+    return text[-1] not in CELL_SENTENCE_END_CHARS
+
+
+def _should_merge_cell_paragraphs(
+    current: ParsedParagraphRenderData,
+    next_paragraph: ParsedParagraphRenderData,
+) -> bool:
+    if not current.fragments or not next_paragraph.fragments:
+        return False
+    if current.textbox_html_parts or current.textbox_segments:
+        return False
+    if next_paragraph.textbox_html_parts or next_paragraph.textbox_segments:
+        return False
+    if next_paragraph.numbering_text:
+        return False
+    if not _cell_paragraph_looks_incomplete(current.fragments):
+        return False
+
+    next_length = _cell_paragraph_text_length(next_paragraph.fragments)
+    if next_length == 0 or next_length > CELL_NEXT_PARAGRAPH_MAX_CHARS:
+        return False
+    if next_length <= CELL_SHORT_PARAGRAPH_MAX_CHARS:
+        return True
+
+    return _cell_paragraph_text_length(current.fragments) + next_length <= CELL_GROUP_MAX_CHARS
+
+
+def _group_cell_paragraphs(
+    paragraphs: list[ParsedParagraphRenderData],
+) -> list[ParsedParagraphRenderData]:
+    grouped_paragraphs: list[ParsedParagraphRenderData] = []
+    current_group: ParsedParagraphRenderData | None = None
+
+    for paragraph in paragraphs:
+        paragraph_group = ParsedParagraphRenderData(
+            paragraph=paragraph.paragraph,
+            fragments=list(paragraph.fragments),
+            textbox_html_parts=list(paragraph.textbox_html_parts),
+            textbox_segments=list(paragraph.textbox_segments),
+            numbering_text=paragraph.numbering_text,
+            paragraph_css=paragraph.paragraph_css,
+            suppressed_page_number_field=paragraph.suppressed_page_number_field,
+        )
+        if current_group is None:
+            current_group = paragraph_group
+            continue
+
+        if _should_merge_cell_paragraphs(current_group, paragraph_group):
+            current_group.fragments.extend((CELL_PARAGRAPH_BREAK_FRAGMENT, *paragraph_group.fragments))
+            current_group.suppressed_page_number_field = (
+                current_group.suppressed_page_number_field or paragraph_group.suppressed_page_number_field
+            )
+            continue
+
+        grouped_paragraphs.append(current_group)
+        current_group = paragraph_group
+
+    if current_group is not None:
+        grouped_paragraphs.append(current_group)
+
+    return grouped_paragraphs
+
+
+def _render_table_cell(
+    cell: ET.Element,
+    story: StoryPart,
+    sentence_counter,
+    block_counter,
+    numbering_state: NumberingState,
+    block_index: int,
+    row_index: int,
+    cell_index: int,
+) -> tuple[list[str], list[dict]]:
+    cell_inner_html_parts: list[str] = []
+    cell_segments: list[dict] = []
+    paragraph_buffer: list[ParsedParagraphRenderData] = []
+    paragraph_classes = _build_paragraph_classes(story.kind, "table_cell")
+    segment_block_type = _resolve_segment_block_type(story.kind, "table_cell")
+
+    def flush_paragraphs() -> None:
+        nonlocal paragraph_buffer
+        if not paragraph_buffer:
+            return
+
+        for grouped_paragraph in _group_cell_paragraphs(paragraph_buffer):
+            paragraph_html, paragraph_segments = _render_paragraph_from_fragments(
+                fragments=grouped_paragraph.fragments,
+                sentence_counter=sentence_counter,
+                block_index=block_index,
+                block_type=segment_block_type,
+                paragraph_classes=paragraph_classes,
+                paragraph_css=grouped_paragraph.paragraph_css,
+                row_index=row_index,
+                cell_index=cell_index,
+                suppressed_page_number_field=grouped_paragraph.suppressed_page_number_field,
+                numbering_text=grouped_paragraph.numbering_text,
+            )
+            if paragraph_html:
+                cell_inner_html_parts.append(paragraph_html)
+            cell_inner_html_parts.extend(grouped_paragraph.textbox_html_parts)
+            cell_segments.extend(paragraph_segments)
+            cell_segments.extend(grouped_paragraph.textbox_segments)
+
+        paragraph_buffer = []
+
+    for block in _iter_block_nodes(cell):
+        block_name = _local_name(block.tag)
+        if block_name == "p":
+            paragraph_buffer.append(
+                _collect_paragraph_render_data(
+                    paragraph=block,
+                    story=story,
+                    sentence_counter=sentence_counter,
+                    block_counter=block_counter,
+                    numbering_state=numbering_state,
+                )
+            )
+            continue
+
+        if block_name == "tbl":
+            flush_paragraphs()
+            nested_table_html, nested_table_segments = _render_table(
+                table=block,
+                story=story,
+                sentence_counter=sentence_counter,
+                block_counter=block_counter,
+                numbering_state=numbering_state,
+            )
+            if nested_table_html:
+                cell_inner_html_parts.append(nested_table_html)
+            cell_segments.extend(nested_table_segments)
+
+    flush_paragraphs()
+    return cell_inner_html_parts, cell_segments
+
+
 def _render_table(
     table: ET.Element,
     story: StoryPart,
@@ -658,14 +885,13 @@ def _render_table(
         cell_html_parts: list[str] = []
 
         for cell_index, cell in enumerate(row.findall("./w:tc", NS)):
-            cell_inner_html_parts, cell_segments = _render_block_sequence(
-                container=cell,
+            cell_inner_html_parts, cell_segments = _render_table_cell(
+                cell=cell,
                 story=story,
                 sentence_counter=sentence_counter,
                 block_counter=block_counter,
                 numbering_state=numbering_state,
-                default_block_type="table_cell",
-                fixed_block_index=block_index,
+                block_index=block_index,
                 row_index=row_index,
                 cell_index=cell_index,
             )
@@ -699,52 +925,32 @@ def _render_paragraph(
     row_index: int | None,
     cell_index: int | None,
 ) -> tuple[str, list[dict]]:
-    parse_state = InlineParseState()
-    numbering_text = _resolve_paragraph_numbering(paragraph, numbering_state)
-    fragments, textbox_html_parts, textbox_segments = _collect_inline_content(
-        node=paragraph,
+    paragraph_data = _collect_paragraph_render_data(
+        paragraph=paragraph,
         story=story,
         sentence_counter=sentence_counter,
         block_counter=block_counter,
         numbering_state=numbering_state,
-        parse_state=parse_state,
     )
-    if numbering_text:
-        fragments = [
-            InlineFragment(
-                display_text=numbering_text,
-                source_text="".join(" " if not char.isspace() else char for char in numbering_text),
-            ),
-            *fragments,
-        ]
-
-    paragraph_classes = ["doc-paragraph"]
-    if block_type == "table_cell":
-        paragraph_classes.append("doc-table-paragraph")
-    if block_type == "textbox":
-        paragraph_classes.append("doc-textbox-paragraph")
-    if story.kind != "body":
-        paragraph_classes.append(f"doc-{story.kind}-paragraph")
-
     paragraph_html, paragraph_segments = _render_paragraph_from_fragments(
-        fragments=fragments,
+        fragments=paragraph_data.fragments,
         sentence_counter=sentence_counter,
         block_index=block_index,
         block_type=_resolve_segment_block_type(story.kind, block_type),
-        paragraph_classes=paragraph_classes,
-        paragraph_css=_build_paragraph_css(paragraph),
+        paragraph_classes=_build_paragraph_classes(story.kind, block_type),
+        paragraph_css=paragraph_data.paragraph_css,
         row_index=row_index,
         cell_index=cell_index,
-        suppressed_page_number_field=parse_state.suppressed_page_number_field,
-        numbering_text=numbering_text,
+        suppressed_page_number_field=paragraph_data.suppressed_page_number_field,
+        numbering_text=paragraph_data.numbering_text,
     )
 
     html_parts: list[str] = []
     if paragraph_html:
         html_parts.append(paragraph_html)
-    html_parts.extend(textbox_html_parts)
+    html_parts.extend(paragraph_data.textbox_html_parts)
 
-    return "".join(html_parts), paragraph_segments + textbox_segments
+    return "".join(html_parts), paragraph_segments + paragraph_data.textbox_segments
 
 
 def _render_paragraph_from_fragments(
@@ -774,7 +980,7 @@ def _render_paragraph_from_fragments(
     numbering_available = bool(numbering_text)
     for span in spans:
         sentence_display = _collect_span_text(fragments, span, use_source=False)
-        sentence_source = normalize_text(_collect_span_text(fragments, span, use_source=True))
+        sentence_source = _normalize_segment_source_text(_collect_span_text(fragments, span, use_source=True))
         sentence_id = None
         segment_numbering_text = numbering_text if numbering_available else ""
         if sentence_source:

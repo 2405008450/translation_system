@@ -11,15 +11,24 @@ from zipfile import ZipFile
 from xml.etree import ElementTree as ET
 
 from app.services.document_workspace import (
+    CELL_GROUP_MAX_CHARS,
+    CELL_NEXT_PARAGRAPH_MAX_CHARS,
+    CELL_PARAGRAPH_BREAK_SENTINEL,
+    CELL_SENTENCE_END_CHARS,
+    CELL_SHORT_PARAGRAPH_MAX_CHARS,
     DocxPackage,
     NS,
+    NumberingSchema,
     StoryPart,
+    _build_numbering_schema,
     _build_story_parts,
     _build_trimmed_span,
     _decode_symbol,
     _iter_block_nodes,
     _local_name,
+    _normalize_segment_source_text,
     _qn,
+    _resolve_paragraph_numbering_reference,
 )
 from app.services.normalizer import normalize_text
 from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
@@ -51,9 +60,16 @@ class TextToken:
     apply_export_font: bool = False
 
 
+@dataclass(frozen=True)
+class CellParagraphTokens:
+    paragraph: ET.Element
+    tokens: list[TextToken]
+
+
 def export_translated_docx(raw_bytes: bytes, segments: Iterable[Any]) -> bytes:
     package = DocxPackage(raw_bytes)
     stories = _build_story_parts(package)
+    numbering_schema = _build_numbering_schema(package)
     segments_by_block = _group_segments_by_block(segments)
     block_counter = count(0)
 
@@ -62,6 +78,7 @@ def export_translated_docx(raw_bytes: bytes, segments: Iterable[Any]) -> bytes:
             container=story.root,
             story=story,
             block_counter=block_counter,
+            numbering_schema=numbering_schema,
             segments_by_block=segments_by_block,
         )
 
@@ -103,6 +120,7 @@ def _export_block_sequence(
     container: ET.Element,
     story: StoryPart,
     block_counter,
+    numbering_schema: NumberingSchema,
     segments_by_block: dict[BlockKey, list[ExportSegment]],
     default_block_type: str = "paragraph",
     fixed_block_index: int | None = None,
@@ -114,6 +132,7 @@ def _export_block_sequence(
             block=block,
             story=story,
             block_counter=block_counter,
+            numbering_schema=numbering_schema,
             segments_by_block=segments_by_block,
             default_block_type=default_block_type,
             fixed_block_index=fixed_block_index,
@@ -126,6 +145,7 @@ def _export_block(
     block: ET.Element,
     story: StoryPart,
     block_counter,
+    numbering_schema: NumberingSchema,
     segments_by_block: dict[BlockKey, list[ExportSegment]],
     default_block_type: str,
     fixed_block_index: int | None,
@@ -139,6 +159,7 @@ def _export_block(
             paragraph=block,
             story=story,
             block_counter=block_counter,
+            numbering_schema=numbering_schema,
             block_index=block_index,
             block_type=default_block_type,
             row_index=row_index,
@@ -152,6 +173,7 @@ def _export_block(
             table=block,
             story=story,
             block_counter=block_counter,
+            numbering_schema=numbering_schema,
             segments_by_block=segments_by_block,
         )
 
@@ -160,28 +182,178 @@ def _export_table(
     table: ET.Element,
     story: StoryPart,
     block_counter,
+    numbering_schema: NumberingSchema,
     segments_by_block: dict[BlockKey, list[ExportSegment]],
 ) -> None:
     block_index = next(block_counter)
 
     for row_index, row in enumerate(table.findall("./w:tr", NS)):
         for cell_index, cell in enumerate(row.findall("./w:tc", NS)):
-            _export_block_sequence(
-                container=cell,
+            _export_table_cell(
+                cell=cell,
                 story=story,
                 block_counter=block_counter,
+                numbering_schema=numbering_schema,
                 segments_by_block=segments_by_block,
-                default_block_type="table_cell",
-                fixed_block_index=block_index,
+                block_index=block_index,
                 row_index=row_index,
                 cell_index=cell_index,
             )
+
+
+def _table_cell_text_length(tokens: list[TextToken]) -> int:
+    return len(normalize_text("".join(token.display_text for token in tokens)))
+
+
+def _table_cell_tokens_look_incomplete(tokens: list[TextToken]) -> bool:
+    text = "".join(token.display_text for token in tokens).rstrip()
+    if not text:
+        return False
+    return text[-1] not in CELL_SENTENCE_END_CHARS
+
+
+def _should_merge_table_cell_paragraphs(
+    current_tokens: list[TextToken],
+    next_paragraph: CellParagraphTokens,
+    numbering_schema: NumberingSchema,
+) -> bool:
+    if not current_tokens or not next_paragraph.tokens:
+        return False
+    if _resolve_paragraph_numbering_reference(next_paragraph.paragraph, numbering_schema) is not None:
+        return False
+    if not _table_cell_tokens_look_incomplete(current_tokens):
+        return False
+
+    next_length = _table_cell_text_length(next_paragraph.tokens)
+    if next_length == 0 or next_length > CELL_NEXT_PARAGRAPH_MAX_CHARS:
+        return False
+    if next_length <= CELL_SHORT_PARAGRAPH_MAX_CHARS:
+        return True
+
+    return _table_cell_text_length(current_tokens) + next_length <= CELL_GROUP_MAX_CHARS
+
+
+def _count_token_sentence_spans(tokens: list[TextToken]) -> int:
+    _assign_token_offsets(tokens)
+    display_text = "".join(token.display_text for token in tokens)
+    if not display_text:
+        return 0
+
+    spans = split_sentence_spans(display_text)
+    if not spans and normalize_text(display_text):
+        spans = [_build_trimmed_span(display_text)]
+
+    count = 0
+    for span in spans:
+        sentence_source = _normalize_segment_source_text(_collect_span_text(tokens, span, use_source=True))
+        if sentence_source:
+            count += 1
+    return count
+
+
+def _group_table_cell_paragraphs(
+    paragraphs: list[CellParagraphTokens],
+    numbering_schema: NumberingSchema,
+) -> list[tuple[list[TextToken], int]]:
+    grouped_paragraphs: list[tuple[list[TextToken], int]] = []
+    current_tokens: list[TextToken] = []
+
+    for paragraph in paragraphs:
+        if not paragraph.tokens:
+            continue
+
+        paragraph_tokens = list(paragraph.tokens)
+        if not current_tokens:
+            current_tokens = paragraph_tokens
+            continue
+
+        if _should_merge_table_cell_paragraphs(current_tokens, paragraph, numbering_schema):
+            current_tokens.append(
+                TextToken(
+                    display_text="\n",
+                    source_text=CELL_PARAGRAPH_BREAK_SENTINEL,
+                )
+            )
+            current_tokens.extend(paragraph_tokens)
+            continue
+
+        grouped_paragraphs.append((current_tokens, _count_token_sentence_spans(current_tokens)))
+        current_tokens = paragraph_tokens
+
+    if current_tokens:
+        grouped_paragraphs.append((current_tokens, _count_token_sentence_spans(current_tokens)))
+
+    return grouped_paragraphs
+
+
+def _export_table_cell(
+    cell: ET.Element,
+    story: StoryPart,
+    block_counter,
+    numbering_schema: NumberingSchema,
+    segments_by_block: dict[BlockKey, list[ExportSegment]],
+    block_index: int,
+    row_index: int,
+    cell_index: int,
+) -> None:
+    cell_segments = segments_by_block.get(
+        (_resolve_segment_block_type(story.kind, "table_cell"), block_index, row_index, cell_index),
+        [],
+    )
+    segment_cursor = 0
+    paragraph_buffer: list[CellParagraphTokens] = []
+
+    def flush_paragraphs() -> None:
+        nonlocal paragraph_buffer, segment_cursor
+        if not paragraph_buffer:
+            return
+
+        for token_group, sentence_count in _group_table_cell_paragraphs(paragraph_buffer, numbering_schema):
+            if sentence_count == 0:
+                continue
+            _replace_block_tokens(
+                tokens=token_group,
+                segments=cell_segments[segment_cursor : segment_cursor + sentence_count],
+            )
+            segment_cursor += sentence_count
+
+        paragraph_buffer = []
+
+    for block in _iter_block_nodes(cell):
+        block_name = _local_name(block.tag)
+        if block_name == "p":
+            paragraph_buffer.append(
+                CellParagraphTokens(
+                    paragraph=block,
+                    tokens=_collect_inline_tokens(
+                        node=block,
+                        story=story,
+                        block_counter=block_counter,
+                        numbering_schema=numbering_schema,
+                        segments_by_block=segments_by_block,
+                    ),
+                )
+            )
+            continue
+
+        if block_name == "tbl":
+            flush_paragraphs()
+            _export_table(
+                table=block,
+                story=story,
+                block_counter=block_counter,
+                numbering_schema=numbering_schema,
+                segments_by_block=segments_by_block,
+            )
+
+    flush_paragraphs()
 
 
 def _export_paragraph(
     paragraph: ET.Element,
     story: StoryPart,
     block_counter,
+    numbering_schema: NumberingSchema,
     block_index: int,
     block_type: str,
     row_index: int | None,
@@ -192,6 +364,7 @@ def _export_paragraph(
         node=paragraph,
         story=story,
         block_counter=block_counter,
+        numbering_schema=numbering_schema,
         segments_by_block=segments_by_block,
     )
 
@@ -208,6 +381,7 @@ def _collect_inline_tokens(
     node: ET.Element,
     story: StoryPart,
     block_counter,
+    numbering_schema: NumberingSchema,
     segments_by_block: dict[BlockKey, list[ExportSegment]],
     current_run: ET.Element | None = None,
 ) -> list[TextToken]:
@@ -255,6 +429,7 @@ def _collect_inline_tokens(
             node=node,
             story=story,
             block_counter=block_counter,
+            numbering_schema=numbering_schema,
             segments_by_block=segments_by_block,
         )
         return []
@@ -269,6 +444,7 @@ def _collect_inline_tokens(
                 node=child,
                 story=story,
                 block_counter=block_counter,
+                numbering_schema=numbering_schema,
                 segments_by_block=segments_by_block,
                 current_run=current_run,
             )
@@ -281,6 +457,7 @@ def _export_embedded_textboxes(
     node: ET.Element,
     story: StoryPart,
     block_counter,
+    numbering_schema: NumberingSchema,
     segments_by_block: dict[BlockKey, list[ExportSegment]],
 ) -> None:
     textbox_contents = node.findall(".//w:txbxContent", NS)
@@ -290,6 +467,7 @@ def _export_embedded_textboxes(
                 container=textbox_content,
                 story=story,
                 block_counter=block_counter,
+                numbering_schema=numbering_schema,
                 segments_by_block=segments_by_block,
                 default_block_type="textbox",
             )
@@ -346,7 +524,7 @@ def _replace_block_tokens(
 
     segment_index = 0
     for span in spans:
-        sentence_source = normalize_text(_collect_span_text(tokens, span, use_source=True))
+        sentence_source = _normalize_segment_source_text(_collect_span_text(tokens, span, use_source=True))
         if not sentence_source:
             continue
 

@@ -19,3 +19,14 @@ coverage/
 data/
 tests/
 
+# frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+frontend/*.log
+frontend/.env.local
+frontend/.env.*.local
+frontend/.DS_Store
+.claude
+

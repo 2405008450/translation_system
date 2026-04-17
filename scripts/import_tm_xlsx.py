@@ -1,4 +1,5 @@
 import argparse
+from uuid import UUID
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -16,6 +17,12 @@ def parse_args() -> argparse.Namespace:
         default=5000,
         help="Rows inserted per batch",
     )
+    parser.add_argument(
+        "--collection-id",
+        type=UUID,
+        default=None,
+        help="TM collection UUID to import into",
+    )
     return parser.parse_args()
 
 
@@ -28,6 +35,7 @@ def main() -> None:
             db=session,
             xlsx_path=args.xlsx_path,
             batch_size=args.batch_size,
+            collection_id=args.collection_id,
         )
 
     print(

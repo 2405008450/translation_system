@@ -1,11 +1,10 @@
-from pydantic import BaseModel, Field
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, Field, StringConstraints
 
 
-class FuzzyCandidate(BaseModel):
-    """单个模糊匹配候选项"""
-    source_text: str
-    target_text: str
-    score: float
+UsernameStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=3, max_length=50)]
+PasswordStr = Annotated[str, StringConstraints(min_length=6, max_length=128)]
 
 
 class MatchResult(BaseModel):
@@ -15,5 +14,40 @@ class MatchResult(BaseModel):
     matched_source_text: str | None = None
     target_text: str | None = None
     sentence_id: str = ""
-    # 所有超过阈值的模糊匹配候选（最多5条），存储为字典列表便于JSON序列化
-    fuzzy_candidates: list[dict] = []
+
+
+class UserRead(BaseModel):
+    id: str
+    username: str
+    role: Literal["admin", "user"]
+    is_active: bool
+    created_at: str
+
+
+class LoginRequest(BaseModel):
+    username: UsernameStr
+    password: PasswordStr
+
+
+class InitAdminRequest(BaseModel):
+    username: UsernameStr
+    password: PasswordStr
+
+
+class RegisterRequest(BaseModel):
+    username: UsernameStr
+    password: PasswordStr
+    role: Literal["admin", "user"] = "user"
+
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserRead
+
+
+class InitStatusResponse(BaseModel):
+    initialized: bool
+    requires_init: bool
+    table_exists: bool = True
+    message: str | None = None

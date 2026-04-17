@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from time import perf_counter
 from typing import TypeVar
+from uuid import UUID
 
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -59,12 +60,14 @@ def match_sentences(
     sentences: list[str],
     similarity_threshold: float,
     auxiliary_sentences: list[str] | None = None,
+    collection_ids: list[UUID] | None = None,
 ) -> list[MatchResult]:
     results, _ = match_sentences_with_stats(
         db,
         sentences,
         similarity_threshold,
         auxiliary_sentences=auxiliary_sentences,
+        collection_ids=collection_ids,
     )
     return results
 
@@ -74,6 +77,7 @@ def match_sentences_with_stats(
     sentences: list[str],
     similarity_threshold: float,
     auxiliary_sentences: list[str] | None = None,
+    collection_ids: list[UUID] | None = None,
 ) -> tuple[list[MatchResult], MatchStats]:
     total_started_at = perf_counter()
     prepared_sentences = _prepare_sentences(sentences, auxiliary_sentences=auxiliary_sentences)
@@ -96,6 +100,7 @@ def match_sentences_with_stats(
         prepared_sentences=prepared_sentences,
         similarity_threshold=similarity_threshold,
         total_input_sentences=len(sentences),
+        collection_ids=collection_ids,
     )
 
     results = [
@@ -159,6 +164,7 @@ def _resolve_matches(
     prepared_sentences: list[PreparedSentence],
     similarity_threshold: float,
     total_input_sentences: int,
+    collection_ids: list[UUID] | None = None,
 ) -> tuple[list[ResolvedMatch], MatchStats]:
     resolved_matches: list[ResolvedMatch | None] = [None] * len(prepared_sentences)
     matchable_items = [
@@ -175,6 +181,7 @@ def _resolve_matches(
     ) = _find_exact_matches(
         db,
         [sentence for _, sentence in matchable_items],
+        collection_ids=collection_ids,
     )
     exact_phase_ms = (perf_counter() - exact_started_at) * 1000
 
@@ -229,6 +236,7 @@ def _resolve_matches(
         db=db,
         prepared_sentences=[sentence for _, sentence in unresolved_items],
         similarity_threshold=similarity_threshold,
+        collection_ids=collection_ids,
     )
     fuzzy_phase_ms = (perf_counter() - fuzzy_started_at) * 1000
 
@@ -265,6 +273,7 @@ def _resolve_matches(
 def _find_exact_matches(
     db: Session,
     sentences: Iterable[PreparedSentence],
+    collection_ids: list[UUID] | None = None,
 ) -> tuple[
     dict[str, TranslationMemory],
     dict[str, TranslationMemory],
@@ -299,8 +308,10 @@ def _find_exact_matches(
     matches_by_hash: dict[str, TranslationMemory] = {}
     matches_by_normalized: dict[str, TranslationMemory] = {}
     matches_by_source_text: dict[str, TranslationMemory] = {}
+    normalized_collection_ids = _normalize_collection_ids(collection_ids)
     for chunk in _chunked(source_hashes, EXACT_MATCH_BATCH_SIZE):
         stmt = select(TranslationMemory).where(TranslationMemory.source_hash.in_(chunk))
+        stmt = _apply_collection_filter(stmt, normalized_collection_ids)
         for match in db.execute(stmt).scalars():
             matches_by_hash.setdefault(match.source_hash, match)
 
@@ -308,11 +319,13 @@ def _find_exact_matches(
         stmt = select(TranslationMemory).where(
             TranslationMemory.source_normalized.in_(chunk)
         )
+        stmt = _apply_collection_filter(stmt, normalized_collection_ids)
         for match in db.execute(stmt).scalars():
             matches_by_normalized.setdefault(match.source_normalized, match)
 
     for chunk in _chunked(source_text_candidates, EXACT_MATCH_BATCH_SIZE):
         stmt = select(TranslationMemory).where(TranslationMemory.source_text.in_(chunk))
+        stmt = _apply_collection_filter(stmt, normalized_collection_ids)
         for match in db.execute(stmt).scalars():
             matches_by_source_text.setdefault(match.source_text, match)
 
@@ -323,6 +336,7 @@ def _find_fuzzy_matches(
     db: Session,
     prepared_sentences: list[PreparedSentence],
     similarity_threshold: float,
+    collection_ids: list[UUID] | None = None,
 ) -> tuple[list[ResolvedMatch | None], int]:
     if not prepared_sentences:
         return [], 0
@@ -334,6 +348,7 @@ def _find_fuzzy_matches(
             db=db,
             prepared_sentences=chunk,
             similarity_threshold=similarity_threshold,
+            collection_ids=collection_ids,
         )
         matches.extend(chunk_matches)
         total_candidates += chunk_candidates
@@ -345,6 +360,7 @@ def _find_fuzzy_matches_chunk(
     db: Session,
     prepared_sentences: list[PreparedSentence],
     similarity_threshold: float,
+    collection_ids: list[UUID] | None = None,
 ) -> tuple[list[ResolvedMatch | None], int]:
     trigram_prefilter_threshold = _get_trigram_prefilter_threshold(similarity_threshold)
     params = {
@@ -352,6 +368,17 @@ def _find_fuzzy_matches_chunk(
         "trigram_limit": trigram_prefilter_threshold,
     }
     value_rows: list[str] = []
+    collection_filter_sql = ""
+    normalized_collection_ids = _normalize_collection_ids(collection_ids)
+    if normalized_collection_ids:
+        collection_param_names: list[str] = []
+        for index, collection_id in enumerate(normalized_collection_ids):
+            param_name = f"collection_id_{index}"
+            params[param_name] = collection_id
+            collection_param_names.append(f":{param_name}")
+        collection_filter_sql = (
+            f" AND tm.collection_id IN ({', '.join(collection_param_names)})"
+        )
 
     for index, sentence in enumerate(prepared_sentences):
         source_param_name = f"query_source_{index}"
@@ -385,6 +412,7 @@ def _find_fuzzy_matches_chunk(
             FROM translation_memory AS tm
             WHERE tm.source_normalized IS NOT NULL
               AND tm.source_normalized % input.query_text
+              {collection_filter_sql}
             ORDER BY similarity(tm.source_normalized, input.query_text) DESC, tm.updated_at DESC
             LIMIT :candidate_limit
         ) AS matched ON TRUE
@@ -501,6 +529,18 @@ def _pick_best_fuzzy_candidate(
 
 def _get_trigram_prefilter_threshold(similarity_threshold: float) -> float:
     return min(max(similarity_threshold, 0.01), 0.3)
+
+
+def _normalize_collection_ids(collection_ids: list[UUID] | None) -> list[UUID] | None:
+    if not collection_ids:
+        return None
+    return list(dict.fromkeys(collection_ids))
+
+
+def _apply_collection_filter(stmt, collection_ids: list[UUID] | None):
+    if not collection_ids:
+        return stmt
+    return stmt.where(TranslationMemory.collection_id.in_(collection_ids))
 
 
 def _chunked(items: list[T], chunk_size: int) -> list[list[T]]:
