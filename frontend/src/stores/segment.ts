@@ -47,6 +47,9 @@ export const useSegmentStore = defineStore('segment', () => {
   const llmMessage = ref('可按范围对 exact / fuzzy / none 句段执行 AI 修正。')
   const lastSyncedAt = ref<string | null>(null)
   const dirtyEntries = ref<Record<string, SegmentUpdatePayload>>({})
+  const previewUpdateToken = ref(0)
+  const lastPreviewUpdatedSentenceId = ref<string | null>(null)
+  const lastPreviewUpdatedText = ref('')
 
   let syncTimer: number | null = null
 
@@ -70,6 +73,9 @@ export const useSegmentStore = defineStore('segment', () => {
     llmMessage.value = '可按范围对 exact / fuzzy / none 句段执行 AI 修正。'
     lastSyncedAt.value = null
     dirtyEntries.value = {}
+    previewUpdateToken.value = 0
+    lastPreviewUpdatedSentenceId.value = null
+    lastPreviewUpdatedText.value = ''
   }
 
   async function loadTask(fileRecordId: string) {
@@ -132,6 +138,12 @@ export const useSegmentStore = defineStore('segment', () => {
     return data
   }
 
+  function markPreviewUpdate(sentenceId: string, targetText: string) {
+    lastPreviewUpdatedSentenceId.value = sentenceId
+    lastPreviewUpdatedText.value = targetText
+    previewUpdateToken.value += 1
+  }
+
   function updateTarget(sentenceId: string, targetText: string) {
     const index = segments.value.findIndex((segment) => segment.sentence_id === sentenceId)
     if (index === -1) {
@@ -145,6 +157,7 @@ export const useSegmentStore = defineStore('segment', () => {
       source: 'manual',
       status: 'confirmed',
     }
+    markPreviewUpdate(sentenceId, targetText)
 
     dirtyEntries.value = {
       ...dirtyEntries.value,
@@ -236,6 +249,7 @@ export const useSegmentStore = defineStore('segment', () => {
       source,
       status,
     }
+    markPreviewUpdate(sentenceId, targetText)
 
     const nextDirtyEntries = { ...dirtyEntries.value }
     delete nextDirtyEntries[sentenceId]
@@ -388,6 +402,9 @@ export const useSegmentStore = defineStore('segment', () => {
     syncMessage,
     llmMessage,
     dirtyCount,
+    previewUpdateToken,
+    lastPreviewUpdatedSentenceId,
+    lastPreviewUpdatedText,
     loadTask,
     updateTarget,
     setActiveSentence,

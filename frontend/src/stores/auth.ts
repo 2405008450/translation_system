@@ -1,5 +1,6 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
+import axios from 'axios'
 
 import { http } from '../api/http'
 import type { AuthResponse, InitStatusResponse, User } from '../types/api'
@@ -38,6 +39,15 @@ export const useAuthStore = defineStore('auth', () => {
     user.value = null
   }
 
+  function setInitFailureMessage(error: unknown) {
+    tableExists.value = false
+    if (axios.isAxiosError(error)) {
+      initMessage.value = String(error.response?.data?.detail || '无法连接后端服务。')
+      return
+    }
+    initMessage.value = error instanceof Error ? error.message : '无法连接后端服务。'
+  }
+
   async function checkInitStatus() {
     const { data } = await http.get<InitStatusResponse>('/auth/init')
     initialized.value = data.initialized
@@ -59,7 +69,15 @@ export const useAuthStore = defineStore('auth', () => {
 
     bootstrapPromise = (async () => {
       try {
-        const initStatus = await checkInitStatus()
+        let initStatus: InitStatusResponse
+        try {
+          initStatus = await checkInitStatus()
+        } catch (error) {
+          clearSession()
+          setInitFailureMessage(error)
+          return
+        }
+
         if (!initStatus.initialized) {
           clearSession()
           return

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import axios from 'axios'
+import { Upload, Loader2, ArrowRight, Trash2 } from 'lucide-vue-next'
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
@@ -159,6 +160,8 @@ onMounted(() => {
           :disabled="taskStore.uploading"
           @click="uploadFile"
         >
+          <Loader2 v-if="taskStore.uploading" class="lucide-spin" />
+          <Upload v-else />
           {{ taskStore.uploading ? '上传中...' : '上传并进入工作台' }}
         </button>
       </div>
@@ -168,7 +171,10 @@ onMounted(() => {
 
     <section class="panel">
       <div class="section-title">任务列表</div>
-      <div v-if="taskStore.loading" class="empty-state">任务列表加载中...</div>
+      <div v-if="taskStore.loading" class="empty-state">
+        <Loader2 class="lucide-spin" :size="32" />
+        任务列表加载中...
+      </div>
       <div v-else-if="taskStore.tasks.length === 0" class="empty-state">当前还没有翻译任务</div>
       <div v-else class="task-list">
         <article v-for="task in taskStore.tasks" :key="task.id" class="task-item">
@@ -187,7 +193,7 @@ onMounted(() => {
               type="button"
               @click="router.push({ name: 'workbench', params: { id: task.id } })"
             >
-              继续翻译
+              <ArrowRight /> 继续翻译
             </button>
             <button
               v-if="authStore.isAdmin"
@@ -195,7 +201,7 @@ onMounted(() => {
               type="button"
               @click="removeTask(task.id)"
             >
-              删除
+              <Trash2 /> 删除
             </button>
           </div>
         </article>

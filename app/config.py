@@ -3,6 +3,8 @@ from functools import lru_cache
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+DEFAULT_JWT_SECRET_KEY = "change-me-in-production"
+
 
 class Settings(BaseSettings):
     app_name: str = "Translation Memory Demo"
@@ -23,9 +25,15 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.2
     llm_retry_attempts_per_provider: int = 2
     redis_url: str | None = None
-    jwt_secret_key: str = "change-me-in-production"
+    tm_vector_enabled: bool = True
+    tm_vector_dimensions: int = 128
+    tm_vector_candidate_limit: int = 6
+    tm_vector_similarity_floor: float = 0.45
+    tm_vector_weight: float = 0.35
+    jwt_secret_key: str = DEFAULT_JWT_SECRET_KEY
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 1440
+    log_level: str = "INFO"
     cors_allow_origins: list[str] = Field(
         default_factory=lambda: [
             "http://127.0.0.1:5173",
@@ -46,3 +54,10 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def validate_runtime_settings(settings: Settings) -> None:
+    if settings.jwt_secret_key == DEFAULT_JWT_SECRET_KEY:
+        raise RuntimeError(
+            "JWT_SECRET_KEY 仍为默认值，请在 .env 或环境变量中设置独立密钥后再启动服务。"
+        )

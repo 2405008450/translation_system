@@ -7,12 +7,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.config import get_settings
+from app.config import get_settings, validate_runtime_settings
+from app.logging import configure_logging
 from app.routers.api import router as api_router
 from app.routers.auth import router as auth_router
 
 
+configure_logging()
 settings = get_settings()
+validate_runtime_settings(settings)
 frontend_dist_dir = Path("frontend/dist")
 frontend_assets_dir = frontend_dist_dir / "assets"
 

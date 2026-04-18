@@ -1,24 +1,40 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { ArrowLeft, Bot, Download, Loader2, Save, FileText, FileCheck, Columns, Languages, MessageSquare, History } from 'lucide-vue-next'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRouter } from 'vue-router'
 
+import NotesPanel from '../components/NotesPanel.vue'
 import PreviewPanel from '../components/PreviewPanel.vue'
 import SegmentEditorRow from '../components/SegmentEditorRow.vue'
 import SplitPreviewPanel from '../components/SplitPreviewPanel.vue'
 import TMMatchPanel from '../components/TMMatchPanel.vue'
 import VirtualList from '../components/VirtualList.vue'
+import { useAuthStore } from '../stores/auth'
+import { useCommentStore } from '../stores/comment'
 import { useSegmentStore } from '../stores/segment'
-import type { LLMProvider, LLMTranslateScope } from '../types/api'
+import type {
+  CommentAnchorDraft,
+  CommentCreatePayload,
+  CommentStatus,
+  LLMProvider,
+  LLMTranslateScope,
+  Segment,
+} from '../types/api'
 import { buildDocumentPreviewHtml } from '../utils/documentPreview'
-import { renderTargetPreview } from '../utils/renderTargetPreview'
 
 const props = defineProps<{
   id: string
 }>()
 
 const router = useRouter()
+const authStore = useAuthStore()
+const commentStore = useCommentStore()
 const segmentStore = useSegmentStore()
+const virtualListRef = ref<{
+  scrollToIndex: (index: number, align?: ScrollLogicalPosition) => Promise<boolean>
+  focusIndex: (index: number, selector?: string, align?: ScrollLogicalPosition) => Promise<boolean>
+} | null>(null)
 
 type ToolKey = 'source-preview' | 'target-preview' | 'split-preview' | 'tm-match' | 'terms' | 'notes' | 'history'
 type ActiveToolConfig =
@@ -27,6 +43,11 @@ type ActiveToolConfig =
       title: string
       html: string
       supported: boolean
+      renderMode?: 'static' | 'target'
+      segments?: Segment[]
+      updatedSentenceId?: string | null
+      updatedSentenceText?: string
+      updateToken?: number
     }
   | {
       kind: 'split'
@@ -34,6 +55,10 @@ type ActiveToolConfig =
     }
   | {
       kind: 'tm-match'
+      title: string
+    }
+  | {
+      kind: 'notes'
       title: string
     }
   | {
@@ -88,22 +113,32 @@ const statusSummary = computed(() => {
   ]
 })
 
-const translatedPreviewHtml = computed(() => {
-  const fallbackHtml = buildDocumentPreviewHtml(segmentStore.segments, 'target')
-  if (!segmentStore.previewSupported || !segmentStore.previewHtml) {
-    return fallbackHtml
+const targetPreviewRenderMode = computed<'static' | 'target'>(() => {
+  if (segmentStore.previewSupported && segmentStore.previewHtml) {
+    return 'target'
   }
-  return renderTargetPreview(segmentStore.previewHtml, segmentStore.segments)
+  return 'static'
 })
 
+const targetPreviewHtml = computed(() => {
+  if (targetPreviewRenderMode.value === 'target') {
+    return segmentStore.previewHtml
+  }
+  return buildDocumentPreviewHtml(segmentStore.segments, 'target')
+})
+
+const targetPreviewSupported = computed(() =>
+  segmentStore.previewSupported || segmentStore.segments.length > 0,
+)
+
 const toolButtons = [
-  { key: 'source-preview' as const, label: '原文预览' },
-  { key: 'target-preview' as const, label: '译文预览' },
-  { key: 'split-preview' as const, label: '分屏对照' },
-  { key: 'tm-match' as const, label: '记忆/术语匹配' },
-  { key: 'terms' as const, label: '术语' },
-  { key: 'notes' as const, label: '备注' },
-  { key: 'history' as const, label: '历史版本' },
+  { key: 'source-preview' as const, label: '原文预览', icon: FileText },
+  { key: 'target-preview' as const, label: '译文预览', icon: FileCheck },
+  { key: 'split-preview' as const, label: '分屏对照', icon: Columns },
+  { key: 'tm-match' as const, label: '记忆/术语匹配', icon: Languages },
+  { key: 'terms' as const, label: '术语', icon: Languages },
+  { key: 'notes' as const, label: '批注', icon: MessageSquare },
+  { key: 'history' as const, label: '历史版本', icon: History },
 ]
 
 const activeToolConfig = computed<ActiveToolConfig | null>(() => {
@@ -120,8 +155,13 @@ const activeToolConfig = computed<ActiveToolConfig | null>(() => {
     return {
       kind: 'preview' as const,
       title: '译文预览',
-      html: translatedPreviewHtml.value,
-      supported: segmentStore.previewSupported || segmentStore.segments.length > 0,
+      html: targetPreviewHtml.value,
+      supported: targetPreviewSupported.value,
+      renderMode: targetPreviewRenderMode.value,
+      segments: targetPreviewRenderMode.value === 'target' ? segmentStore.segments : [],
+      updatedSentenceId: segmentStore.lastPreviewUpdatedSentenceId,
+      updatedSentenceText: segmentStore.lastPreviewUpdatedText,
+      updateToken: segmentStore.previewUpdateToken,
     }
   }
 
@@ -149,9 +189,8 @@ const activeToolConfig = computed<ActiveToolConfig | null>(() => {
 
   if (activeTool.value === 'notes') {
     return {
-      kind: 'placeholder' as const,
-      title: '备注',
-      message: '备注面板即将接入。',
+      kind: 'notes' as const,
+      title: '批注',
     }
   }
 
@@ -182,8 +221,23 @@ const activeTMMatchConfig = computed(() =>
   activeToolConfig.value?.kind === 'tm-match' ? activeToolConfig.value : null,
 )
 
+const activeNotesConfig = computed(() =>
+  activeToolConfig.value?.kind === 'notes' ? activeToolConfig.value : null,
+)
+
 function handlePreviewFocus(sentenceId: string) {
   segmentStore.setActiveSentence(sentenceId)
+  void focusEditorSentence(sentenceId)
+}
+
+async function focusEditorSentence(sentenceId: string) {
+  const targetIndex = segmentStore.segments.findIndex((segment) => segment.sentence_id === sentenceId)
+  if (targetIndex === -1) {
+    return
+  }
+
+  await nextTick()
+  await virtualListRef.value?.focusIndex(targetIndex, '[data-segment-target="true"]', 'nearest')
 }
 
 function handleApplyTMTarget(sentenceId: string, targetText: string) {
@@ -192,8 +246,19 @@ function handleApplyTMTarget(sentenceId: string, targetText: string) {
 
 async function loadTask() {
   pageError.value = ''
+  commentStore.stopPolling()
   try {
     await segmentStore.loadTask(props.id)
+    try {
+      await commentStore.loadComments(props.id)
+      commentStore.startPolling(props.id)
+    } catch (error) {
+      if (axios.isAxiosError(error)) {
+        commentStore.message = String(error.response?.data?.detail || '批注暂时不可用。')
+      } else {
+        commentStore.message = error instanceof Error ? error.message : '批注暂时不可用。'
+      }
+    }
   } catch (error) {
     if (axios.isAxiosError(error)) {
       pageError.value = String(error.response?.data?.detail || '任务加载失败。')
@@ -242,6 +307,92 @@ async function exportDocx() {
   }
 }
 
+async function handleCommentDraft(draft: CommentAnchorDraft) {
+  commentStore.setDraftAnchor(draft)
+  commentStore.setActiveComment(null)
+  segmentStore.setActiveSentence(draft.sentence_id)
+  await focusEditorSentence(draft.sentence_id)
+  activeTool.value = 'notes'
+}
+
+async function handleCommentFocus(commentId: string) {
+  commentStore.setDraftAnchor(null)
+  commentStore.setActiveComment(commentId)
+  const comment = commentStore.comments.find((item) => item.id === commentId)
+  if (comment?.sentence_id) {
+    segmentStore.setActiveSentence(comment.sentence_id)
+    await focusEditorSentence(comment.sentence_id)
+  }
+  activeTool.value = 'notes'
+}
+
+async function handleCreateComment(payload: CommentCreatePayload) {
+  if (!segmentStore.fileRecord) {
+    return
+  }
+
+  pageError.value = ''
+  try {
+    const comment = await commentStore.createComment(segmentStore.fileRecord.id, payload)
+    if (comment.sentence_id) {
+      segmentStore.setActiveSentence(comment.sentence_id)
+      await focusEditorSentence(comment.sentence_id)
+    }
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      pageError.value = String(error.response?.data?.detail || '批注保存失败。')
+      return
+    }
+    pageError.value = error instanceof Error ? error.message : '批注保存失败。'
+  }
+}
+
+async function handleReplyComment(commentId: string, body: string) {
+  pageError.value = ''
+  try {
+    const comment = await commentStore.replyToComment(commentId, { body })
+    if (comment.sentence_id) {
+      segmentStore.setActiveSentence(comment.sentence_id)
+      await focusEditorSentence(comment.sentence_id)
+    }
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      pageError.value = String(error.response?.data?.detail || '回复保存失败。')
+      return
+    }
+    pageError.value = error instanceof Error ? error.message : '回复保存失败。'
+  }
+}
+
+async function handleUpdateComment(commentId: string, payload: { body?: string; status?: CommentStatus }) {
+  pageError.value = ''
+  try {
+    const comment = await commentStore.updateComment(commentId, payload)
+    if (comment.sentence_id) {
+      segmentStore.setActiveSentence(comment.sentence_id)
+    }
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      pageError.value = String(error.response?.data?.detail || '批注更新失败。')
+      return
+    }
+    pageError.value = error instanceof Error ? error.message : '批注更新失败。'
+  }
+}
+
+async function handleDeleteComment(commentId: string) {
+  pageError.value = ''
+  try {
+    await commentStore.deleteComment(commentId)
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      pageError.value = String(error.response?.data?.detail || '批注删除失败。')
+      return
+    }
+    pageError.value = error instanceof Error ? error.message : '批注删除失败。'
+  }
+}
+
 watch(() => props.id, () => {
   void loadTask()
 })
@@ -253,9 +404,11 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
+  commentStore.stopPolling()
 })
 
 onBeforeRouteLeave(async () => {
+  commentStore.stopPolling()
   await segmentStore.syncToBackend()
 })
 </script>
@@ -272,11 +425,17 @@ onBeforeRouteLeave(async () => {
         </div>
 
         <div class="header-actions">
-          <button class="button" type="button" @click="router.push({ name: 'tasks' })">返回任务列表</button>
+          <button class="button" type="button" @click="router.push({ name: 'tasks' })">
+            <ArrowLeft /> 返回任务列表
+          </button>
           <button class="button" type="button" :disabled="segmentStore.saving" @click="saveNow">
+            <Loader2 v-if="segmentStore.saving" class="lucide-spin" />
+            <Save v-else />
             {{ segmentStore.saving ? '保存中...' : '立即保存' }}
           </button>
-          <button class="button" type="button" @click="exportDocx">导出 DOCX</button>
+          <button class="button" type="button" @click="exportDocx">
+            <Download /> 导出 DOCX
+          </button>
         </div>
       </div>
 
@@ -322,6 +481,8 @@ onBeforeRouteLeave(async () => {
           :disabled="segmentStore.llmRunning"
           @click="runLLMTranslation"
         >
+          <Loader2 v-if="segmentStore.llmRunning" class="lucide-spin" />
+          <Bot v-else />
           {{ segmentStore.llmRunning ? 'AI 处理中...' : '执行 AI 修正' }}
         </button>
       </div>
@@ -333,7 +494,10 @@ onBeforeRouteLeave(async () => {
     </section>
 
     <section v-if="segmentStore.loading" class="panel">
-      <div class="empty-state">任务内容加载中...</div>
+      <div class="empty-state">
+        <Loader2 class="lucide-spin" :size="32" />
+        任务内容加载中...
+      </div>
     </section>
 
     <section v-else class="workbench-layout">
@@ -344,7 +508,11 @@ onBeforeRouteLeave(async () => {
             <p class="panel-subtitle">逐句校对并整理译文。</p>
           </div>
         </div>
-        <VirtualList :items="segmentStore.segments" :item-height="itemHeight">
+        <VirtualList
+          ref="virtualListRef"
+          :items="segmentStore.segments"
+          :item-height="itemHeight"
+        >
           <template #default="{ item, index }">
             <SegmentEditorRow
               :segment="item"
@@ -365,25 +533,46 @@ onBeforeRouteLeave(async () => {
         <Transition name="preview-drawer">
           <SplitPreviewPanel
             v-if="activeSplitConfig"
+            :key="activeTool || 'split-preview'"
             :source-html="segmentStore.previewHtml"
-            :target-html="translatedPreviewHtml"
+            :target-html="targetPreviewHtml"
             :source-supported="segmentStore.previewSupported"
-            :target-supported="segmentStore.previewSupported || segmentStore.segments.length > 0"
+            :target-supported="targetPreviewSupported"
             :active-sentence-id="segmentStore.activeSentenceId"
+            :target-render-mode="targetPreviewRenderMode"
+            :target-segments="targetPreviewRenderMode === 'target' ? segmentStore.segments : []"
+            :target-updated-sentence-id="segmentStore.lastPreviewUpdatedSentenceId"
+            :target-updated-sentence-text="segmentStore.lastPreviewUpdatedText"
+            :target-update-token="segmentStore.previewUpdateToken"
+            :comments="commentStore.comments"
+            :active-comment-id="commentStore.activeCommentId"
             @close="activeTool = null"
             @focus-sentence="handlePreviewFocus"
+            @focus-comment="handleCommentFocus"
+            @request-comment="handleCommentDraft"
           />
         </Transition>
 
         <Transition name="preview-drawer">
           <PreviewPanel
             v-if="activePreviewConfig"
+            :key="activeTool || 'preview-panel'"
             class="preview-panel--drawer"
             :title="activePreviewConfig.title"
             :html="activePreviewConfig.html"
             :supported="activePreviewConfig.supported"
             :active-sentence-id="segmentStore.activeSentenceId"
+            :comments="commentStore.comments"
+            :active-comment-id="commentStore.activeCommentId"
+            :enable-comment-selection="true"
+            :render-mode="activePreviewConfig.renderMode || 'static'"
+            :segments="activePreviewConfig.segments || []"
+            :updated-sentence-id="activePreviewConfig.updatedSentenceId || null"
+            :updated-sentence-text="activePreviewConfig.updatedSentenceText || ''"
+            :update-token="activePreviewConfig.updateToken || 0"
             @focus-sentence="handlePreviewFocus"
+            @focus-comment="handleCommentFocus"
+            @request-comment="handleCommentDraft"
             @close="activeTool = null"
           />
         </Transition>
@@ -396,6 +585,27 @@ onBeforeRouteLeave(async () => {
             :active-source-text="segmentStore.activeSourceText"
             @close="activeTool = null"
             @apply-target="handleApplyTMTarget"
+          />
+        </Transition>
+
+        <Transition name="preview-drawer">
+          <NotesPanel
+            v-if="activeNotesConfig"
+            :comments="commentStore.comments"
+            :loading="commentStore.loading"
+            :saving="commentStore.saving"
+            :polling="commentStore.polling"
+            :active-comment-id="commentStore.activeCommentId"
+            :draft-anchor="commentStore.draftAnchor"
+            :current-user-id="authStore.user?.id || null"
+            :message="commentStore.message"
+            @close="activeTool = null"
+            @select-comment="handleCommentFocus"
+            @create-comment="handleCreateComment"
+            @update-comment="handleUpdateComment"
+            @delete-comment="handleDeleteComment"
+            @reply-comment="handleReplyComment"
+            @cancel-draft="commentStore.setDraftAnchor(null)"
           />
         </Transition>
 
@@ -419,7 +629,8 @@ onBeforeRouteLeave(async () => {
             :title="tool.label"
             @click="toggleTool(tool.key)"
           >
-            {{ tool.label }}
+            <component :is="tool.icon" :size="20" />
+            <span>{{ tool.label }}</span>
           </button>
         </aside>
       </div>
