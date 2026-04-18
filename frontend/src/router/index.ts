@@ -4,6 +4,7 @@ import { useAuthStore } from '../stores/auth'
 import AppLayout from '../views/AppLayout.vue'
 import LoginView from '../views/LoginView.vue'
 import TaskListView from '../views/TaskListView.vue'
+import TermbaseManagementView from '../views/TermbaseManagementView.vue'
 import TMManagementView from '../views/TMManagementView.vue'
 import UserManagementView from '../views/UserManagementView.vue'
 import WorkbenchView from '../views/WorkbenchView.vue'
@@ -54,7 +55,18 @@ const router = createRouter({
             requiresAdmin: true,
             navSection: 'tm',
             pageTitle: 'TM 记忆库',
-            pageDescription: '导入术语和双语句对，增强匹配效果',
+            pageDescription: '导入双语句对，增强匹配效果',
+          },
+        },
+        {
+          path: 'termbase',
+          name: 'termbase',
+          component: TermbaseManagementView,
+          meta: {
+            requiresAdmin: true,
+            navSection: 'termbase',
+            pageTitle: '术语库',
+            pageDescription: '管理术语，在工作台中自动高亮匹配',
           },
         },
         {

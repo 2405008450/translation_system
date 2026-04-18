@@ -6,6 +6,7 @@ import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import PreviewPanel from '../components/PreviewPanel.vue'
 import SegmentEditorRow from '../components/SegmentEditorRow.vue'
 import SplitPreviewPanel from '../components/SplitPreviewPanel.vue'
+import TMMatchPanel from '../components/TMMatchPanel.vue'
 import VirtualList from '../components/VirtualList.vue'
 import { useSegmentStore } from '../stores/segment'
 import type { LLMProvider, LLMTranslateScope } from '../types/api'
@@ -19,7 +20,7 @@ const props = defineProps<{
 const router = useRouter()
 const segmentStore = useSegmentStore()
 
-type ToolKey = 'source-preview' | 'target-preview' | 'split-preview' | 'terms' | 'notes' | 'history'
+type ToolKey = 'source-preview' | 'target-preview' | 'split-preview' | 'tm-match' | 'terms' | 'notes' | 'history'
 type ActiveToolConfig =
   | {
       kind: 'preview'
@@ -29,6 +30,10 @@ type ActiveToolConfig =
     }
   | {
       kind: 'split'
+      title: string
+    }
+  | {
+      kind: 'tm-match'
       title: string
     }
   | {
@@ -95,6 +100,7 @@ const toolButtons = [
   { key: 'source-preview' as const, label: '原文预览' },
   { key: 'target-preview' as const, label: '译文预览' },
   { key: 'split-preview' as const, label: '分屏对照' },
+  { key: 'tm-match' as const, label: '记忆/术语匹配' },
   { key: 'terms' as const, label: '术语' },
   { key: 'notes' as const, label: '备注' },
   { key: 'history' as const, label: '历史版本' },
@@ -123,6 +129,13 @@ const activeToolConfig = computed<ActiveToolConfig | null>(() => {
     return {
       kind: 'split' as const,
       title: '分屏对照',
+    }
+  }
+
+  if (activeTool.value === 'tm-match') {
+    return {
+      kind: 'tm-match' as const,
+      title: '记忆匹配',
     }
   }
 
@@ -165,8 +178,16 @@ const activeSplitConfig = computed(() =>
   activeToolConfig.value?.kind === 'split' ? activeToolConfig.value : null,
 )
 
+const activeTMMatchConfig = computed(() =>
+  activeToolConfig.value?.kind === 'tm-match' ? activeToolConfig.value : null,
+)
+
 function handlePreviewFocus(sentenceId: string) {
   segmentStore.setActiveSentence(sentenceId)
+}
+
+function handleApplyTMTarget(sentenceId: string, targetText: string) {
+  segmentStore.updateTarget(sentenceId, targetText)
 }
 
 async function loadTask() {
@@ -329,6 +350,7 @@ onBeforeRouteLeave(async () => {
               :segment="item"
               :index="index"
               :active="segmentStore.activeSentenceId === item.sentence_id"
+              :term-matches="segmentStore.getTermMatches(item.sentence_id)"
               @focus="segmentStore.setActiveSentence"
               @update="segmentStore.updateTarget"
             />
@@ -363,6 +385,17 @@ onBeforeRouteLeave(async () => {
             :active-sentence-id="segmentStore.activeSentenceId"
             @focus-sentence="handlePreviewFocus"
             @close="activeTool = null"
+          />
+        </Transition>
+
+        <Transition name="preview-drawer">
+          <TMMatchPanel
+            v-if="activeTMMatchConfig"
+            :file-record-id="props.id"
+            :active-sentence-id="segmentStore.activeSentenceId"
+            :active-source-text="segmentStore.activeSourceText"
+            @close="activeTool = null"
+            @apply-target="handleApplyTMTarget"
           />
         </Transition>
 

@@ -37,6 +37,13 @@ const navItems = computed<NavItem[]>(() => [
     visible: authStore.isAdmin,
   },
   {
+    name: 'termbase',
+    label: '术语库',
+    shortLabel: 'TB',
+    description: '术语管理与匹配',
+    visible: authStore.isAdmin,
+  },
+  {
     name: 'users',
     label: '用户管理',
     shortLabel: '用',

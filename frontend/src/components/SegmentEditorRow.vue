@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 
-import type { Segment } from '../types/api'
+import type { Segment, TermMatch } from '../types/api'
 
 const props = defineProps<{
   segment: Segment
   index: number
   active: boolean
   disabled?: boolean
+  termMatches?: TermMatch[]
 }>()
 
 const emit = defineEmits<{
@@ -17,6 +18,43 @@ const emit = defineEmits<{
 
 const statusClass = computed(() => `segment-row--${props.segment.status || 'none'}`)
 const sourceClass = computed(() => `segment-row__tag--source-${props.segment.source || 'none'}`)
+
+const highlightedSourceText = computed(() => {
+  const text = props.segment.display_text || props.segment.source_text
+  if (!props.termMatches || props.termMatches.length === 0) {
+    return text
+  }
+
+  // 按位置排序
+  const sortedMatches = [...props.termMatches].sort((a, b) => a.start - b.start)
+  
+  let result = ''
+  let lastEnd = 0
+
+  for (const match of sortedMatches) {
+    if (match.start >= lastEnd) {
+      // 添加匹配前的普通文本
+      result += escapeHtml(text.slice(lastEnd, match.start))
+      // 添加高亮的术语
+      result += `<mark class="term-highlight" title="${escapeHtml(match.target_text)}">${escapeHtml(text.slice(match.start, match.end))}</mark>`
+      lastEnd = match.end
+    }
+  }
+  
+  // 添加剩余文本
+  result += escapeHtml(text.slice(lastEnd))
+  
+  return result
+})
+
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;')
+}
 </script>
 
 <template>
@@ -33,7 +71,12 @@ const sourceClass = computed(() => `segment-row__tag--source-${props.segment.sou
     <div class="segment-row__grid">
       <div class="segment-row__cell segment-row__cell--source">
         <div class="segment-row__label">原文</div>
-        <div class="segment-row__text">{{ segment.display_text || segment.source_text }}</div>
+        <div 
+          v-if="termMatches && termMatches.length > 0" 
+          class="segment-row__text" 
+          v-html="highlightedSourceText"
+        />
+        <div v-else class="segment-row__text">{{ segment.display_text || segment.source_text }}</div>
       </div>
 
       <label class="segment-row__cell segment-row__cell--target">

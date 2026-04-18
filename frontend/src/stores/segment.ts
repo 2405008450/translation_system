@@ -9,6 +9,7 @@ import type {
   LLMTranslateScope,
   Segment,
   SegmentUpdatePayload,
+  TermMatch,
 } from '../types/api'
 
 const SEGMENT_PAGE_SIZE = 1000
@@ -37,6 +38,8 @@ export const useSegmentStore = defineStore('segment', () => {
   const previewHtml = ref('')
   const previewSupported = ref(false)
   const activeSentenceId = ref<string | null>(null)
+  const activeSourceText = ref('')
+  const termMatchesMap = ref<Record<string, TermMatch[]>>({})
   const loading = ref(false)
   const saving = ref(false)
   const llmRunning = ref(false)
@@ -59,6 +62,8 @@ export const useSegmentStore = defineStore('segment', () => {
     previewHtml.value = ''
     previewSupported.value = false
     activeSentenceId.value = null
+    activeSourceText.value = ''
+    termMatchesMap.value = {}
     saving.value = false
     llmRunning.value = false
     syncMessage.value = '暂无未保存修改'
@@ -155,6 +160,34 @@ export const useSegmentStore = defineStore('segment', () => {
 
   function setActiveSentence(sentenceId: string | null) {
     activeSentenceId.value = sentenceId
+    if (sentenceId) {
+      const segment = segments.value.find((s) => s.sentence_id === sentenceId)
+      activeSourceText.value = segment?.source_text || ''
+      void loadTermMatches(sentenceId, activeSourceText.value)
+    } else {
+      activeSourceText.value = ''
+    }
+  }
+
+  async function loadTermMatches(sentenceId: string, sourceText: string) {
+    if (!sourceText) {
+      return
+    }
+    try {
+      const { data } = await http.get<{ matches: TermMatch[] }>('/termbase/match', {
+        params: { text: sourceText },
+      })
+      termMatchesMap.value = {
+        ...termMatchesMap.value,
+        [sentenceId]: data.matches,
+      }
+    } catch {
+      // 静默失败
+    }
+  }
+
+  function getTermMatches(sentenceId: string): TermMatch[] {
+    return termMatchesMap.value[sentenceId] || []
   }
 
   function scheduleSync() {
@@ -347,6 +380,8 @@ export const useSegmentStore = defineStore('segment', () => {
     previewHtml,
     previewSupported,
     activeSentenceId,
+    activeSourceText,
+    termMatchesMap,
     loading,
     saving,
     llmRunning,
@@ -356,6 +391,7 @@ export const useSegmentStore = defineStore('segment', () => {
     loadTask,
     updateTarget,
     setActiveSentence,
+    getTermMatches,
     syncToBackend,
     startLLMTranslation,
     downloadTranslatedDocx,

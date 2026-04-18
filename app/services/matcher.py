@@ -72,6 +72,137 @@ def match_sentences(
     return results
 
 
+@dataclass(frozen=True)
+class TMCandidate:
+    source_text: str
+    target_text: str
+    score: float
+    diff_html: str
+
+
+def get_tm_candidates(
+    db: Session,
+    source_text: str,
+    similarity_threshold: float,
+    max_candidates: int = 5,
+    collection_ids: list[UUID] | None = None,
+) -> list[TMCandidate]:
+    """获取单个句子的 TM 匹配候选项，返回满足阈值的前 N 条记录"""
+    normalized = normalize_text(source_text)
+    if not normalized:
+        return []
+
+    match_text = normalize_match_text(source_text) or normalized
+    source_hash = build_source_hash(source_text)
+
+    # 先检查精确匹配（hash 完全相同）
+    normalized_collection_ids = _normalize_collection_ids(collection_ids)
+    exact_stmt = select(TranslationMemory).where(TranslationMemory.source_hash == source_hash)
+    exact_stmt = _apply_collection_filter(exact_stmt, normalized_collection_ids)
+    exact_match = db.execute(exact_stmt).scalars().first()
+
+    candidates: list[TMCandidate] = []
+    seen_sources: set[str] = set()
+
+    if exact_match:
+        # 计算实际相似度，而不是直接返回 1.0
+        actual_score = SequenceMatcher(None, source_text, exact_match.source_text).ratio()
+        seen_sources.add(exact_match.source_text)
+        candidates.append(TMCandidate(
+            source_text=exact_match.source_text,
+            target_text=exact_match.target_text,
+            score=round(actual_score, 4),
+            diff_html=_build_diff_html(source_text, exact_match.source_text),
+        ))
+
+    # 模糊匹配
+    trigram_threshold = _get_trigram_prefilter_threshold(similarity_threshold)
+    params = {
+        "query_text": match_text,
+        "candidate_limit": max_candidates * 2,
+        "trigram_limit": trigram_threshold,
+    }
+
+    collection_filter_sql = ""
+    if normalized_collection_ids:
+        collection_param_names: list[str] = []
+        for index, collection_id in enumerate(normalized_collection_ids):
+            param_name = f"collection_id_{index}"
+            params[param_name] = collection_id
+            collection_param_names.append(f":{param_name}")
+        collection_filter_sql = f" AND tm.collection_id IN ({', '.join(collection_param_names)})"
+
+    stmt = text(f"""
+        SELECT
+            tm.source_text,
+            tm.target_text,
+            tm.source_normalized,
+            similarity(tm.source_normalized, :query_text) AS trigram_score
+        FROM translation_memory AS tm
+        WHERE tm.source_normalized IS NOT NULL
+          AND tm.source_normalized % :query_text
+          {collection_filter_sql}
+        ORDER BY similarity(tm.source_normalized, :query_text) DESC, tm.updated_at DESC
+        LIMIT :candidate_limit
+    """)
+
+    db.execute(
+        text("SELECT set_config('pg_trgm.similarity_threshold', CAST(:trigram_limit AS text), true)"),
+        {"trigram_limit": trigram_threshold},
+    )
+    rows = db.execute(stmt, params).mappings().all()
+
+    for row in rows:
+        if row["source_text"] in seen_sources:
+            continue
+
+        compare_text = normalize_match_text(row["source_normalized"]) or row["source_normalized"]
+        sequence_score = SequenceMatcher(None, match_text, compare_text).ratio()
+        final_score = max(float(row["trigram_score"]), sequence_score)
+
+        if final_score >= similarity_threshold:
+            seen_sources.add(row["source_text"])
+            candidates.append(TMCandidate(
+                source_text=row["source_text"],
+                target_text=row["target_text"],
+                score=round(final_score, 4),
+                diff_html=_build_diff_html(source_text, row["source_text"]),
+            ))
+
+    # 按分数排序，取前 N 条
+    candidates.sort(key=lambda c: c.score, reverse=True)
+    return candidates[:max_candidates]
+
+
+def _build_diff_html(source: str, matched: str) -> str:
+    """生成修订格式的 HTML，标记原文和匹配文本的差异"""
+    matcher = SequenceMatcher(None, source, matched)
+    result_parts: list[str] = []
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            result_parts.append(_escape_html(matched[j1:j2]))
+        elif tag == "replace":
+            result_parts.append(f'<del>{_escape_html(source[i1:i2])}</del>')
+            result_parts.append(f'<ins>{_escape_html(matched[j1:j2])}</ins>')
+        elif tag == "delete":
+            result_parts.append(f'<del>{_escape_html(source[i1:i2])}</del>')
+        elif tag == "insert":
+            result_parts.append(f'<ins>{_escape_html(matched[j1:j2])}</ins>')
+
+    return "".join(result_parts)
+
+
+def _escape_html(text: str) -> str:
+    """转义 HTML 特殊字符"""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
 def match_sentences_with_stats(
     db: Session,
     sentences: list[str],

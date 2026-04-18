@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import get_current_user, require_admin
 from app.database import get_db
-from app.models import TMCollection, TranslationMemory, User
+from app.models import Segment, Term, TermbaseCollection, TMCollection, TranslationMemory, User
 from app.services.document_exporter import (
     DOCX_MEDIA_TYPE,
     build_translated_docx_filename,
@@ -45,6 +45,7 @@ from app.services.llm_service import (
     validate_provider_choice,
 )
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
+from app.services.matcher import get_tm_candidates
 from app.services.slate_parser import parse_docx_for_slate
 from app.services.tm_importer import XLSX_EXTENSIONS, import_tm_from_xlsx_upload
 
@@ -70,6 +71,17 @@ class LLMTranslateRequest(BaseModel):
 class TMCollectionPayload(BaseModel):
     name: str
     description: str | None = None
+
+
+class TermbaseCollectionPayload(BaseModel):
+    name: str
+    description: str | None = None
+
+
+class TermPayload(BaseModel):
+    source_text: str
+    target_text: str
+    collection_id: UUID | None = None
 
 
 def _build_docx_download_response(filename: str, docx_bytes: bytes) -> StreamingResponse:
@@ -403,6 +415,49 @@ def export_file_record_docx(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return _build_docx_download_response(file_record.filename, translated_docx)
+
+
+@router.get("/file-records/{file_record_id}/segments/{sentence_id}/tm-candidates")
+def get_segment_tm_candidates(
+    file_record_id: UUID,
+    sentence_id: str,
+    threshold: float = 0.6,
+    max_candidates: int = 5,
+    db: Session = Depends(get_db),
+):
+    """获取指定句段的 TM 匹配候选项"""
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    segment = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not segment:
+        raise HTTPException(status_code=404, detail="句段不存在。")
+
+    candidates = get_tm_candidates(
+        db=db,
+        source_text=segment.source_text,
+        similarity_threshold=threshold,
+        max_candidates=max_candidates,
+    )
+
+    return {
+        "sentence_id": sentence_id,
+        "source_text": segment.source_text,
+        "candidates": [
+            {
+                "source_text": c.source_text,
+                "target_text": c.target_text,
+                "score": c.score,
+                "diff_html": c.diff_html,
+            }
+            for c in candidates
+        ],
+    }
 
 
 @router.put("/file-records/{file_record_id}/segments/{sentence_id}")
@@ -850,3 +905,313 @@ def batch_add_tm_entries(
         "updated": updated_count,
         "skipped": skipped_count,
     }
+
+
+# ========== 术语库管理 API ==========
+
+def _serialize_termbase_collection(collection: TermbaseCollection, entry_count: int = 0) -> dict:
+    return {
+        "id": collection.id,
+        "name": collection.name,
+        "description": collection.description,
+        "created_at": collection.created_at.isoformat(),
+        "updated_at": collection.updated_at.isoformat(),
+        "entry_count": entry_count,
+    }
+
+
+def _get_termbase_collection_or_404(db: Session, collection_id: UUID | None) -> TermbaseCollection | None:
+    if collection_id is None:
+        return None
+
+    collection = db.query(TermbaseCollection).filter(TermbaseCollection.id == collection_id).first()
+    if collection is None:
+        raise HTTPException(status_code=404, detail="术语库不存在。")
+    return collection
+
+
+@router.get("/termbase/collections")
+def list_termbase_collections(
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(TermbaseCollection, func.count(Term.id).label("entry_count"))
+        .outerjoin(Term, Term.collection_id == TermbaseCollection.id)
+        .group_by(TermbaseCollection.id)
+        .order_by(TermbaseCollection.created_at.desc())
+        .all()
+    )
+    return [
+        _serialize_termbase_collection(collection, int(entry_count))
+        for collection, entry_count in rows
+    ]
+
+
+@router.post("/termbase/collections")
+def create_termbase_collection(
+    payload: TermbaseCollectionPayload,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    name = _normalize_collection_name(payload.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="术语库名称不能为空。")
+
+    collection = TermbaseCollection(
+        name=name,
+        description=normalize_text(payload.description or "") or None,
+    )
+    db.add(collection)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="同名术语库已存在。") from exc
+
+    db.refresh(collection)
+    return _serialize_termbase_collection(collection)
+
+
+@router.delete("/termbase/collections/{collection_id}")
+def delete_termbase_collection(
+    collection_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    collection = _get_termbase_collection_or_404(db, collection_id)
+    if collection is None:
+        raise HTTPException(status_code=404, detail="术语库不存在。")
+
+    entry_count = (
+        db.query(Term)
+        .filter(Term.collection_id == collection.id)
+        .count()
+    )
+    if entry_count:
+        raise HTTPException(status_code=409, detail="请先清空该术语库中的术语记录。")
+
+    db.delete(collection)
+    db.commit()
+    return {"message": "术语库已删除。"}
+
+
+@router.get("/termbase/terms")
+def list_terms(
+    collection_id: UUID | None = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    query = db.query(Term)
+    if collection_id:
+        query = query.filter(Term.collection_id == collection_id)
+    
+    total = query.count()
+    terms = query.order_by(Term.source_text).offset(skip).limit(limit).all()
+    
+    return {
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "terms": [
+            {
+                "id": term.id,
+                "source_text": term.source_text,
+                "target_text": term.target_text,
+                "collection_id": term.collection_id,
+                "created_at": term.created_at.isoformat(),
+            }
+            for term in terms
+        ],
+    }
+
+
+@router.post("/termbase/terms")
+def add_term(
+    payload: TermPayload,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    source_text = normalize_text(payload.source_text)
+    target_text = normalize_text(payload.target_text)
+
+    if not source_text or not target_text:
+        raise HTTPException(status_code=400, detail="原文和译文不能为空。")
+
+    _get_termbase_collection_or_404(db, payload.collection_id)
+
+    # 检查是否已存在相同原文的术语
+    existing = (
+        db.query(Term)
+        .filter(Term.source_text == source_text, Term.collection_id == payload.collection_id)
+        .first()
+    )
+
+    if existing:
+        existing.target_text = target_text
+        db.commit()
+        return {"status": "updated", "id": existing.id, "message": "已更新现有术语。"}
+
+    term = Term(
+        collection_id=payload.collection_id,
+        source_text=source_text,
+        target_text=target_text,
+    )
+    db.add(term)
+    db.commit()
+    db.refresh(term)
+
+    return {"status": "created", "id": term.id, "message": "已添加新术语。"}
+
+
+@router.delete("/termbase/terms/{term_id}")
+def delete_term(
+    term_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    term = db.query(Term).filter(Term.id == term_id).first()
+    if not term:
+        raise HTTPException(status_code=404, detail="术语不存在。")
+
+    db.delete(term)
+    db.commit()
+    return {"message": "术语已删除。"}
+
+
+@router.post("/termbase/import-xlsx")
+async def import_termbase_xlsx(
+    file: UploadFile = File(...),
+    collection_id: UUID | None = Form(default=None),
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
+    if extension not in XLSX_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="仅支持上传 .xlsx 文件。")
+
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="上传的 XLSX 文件为空。")
+
+    collection = _get_termbase_collection_or_404(db, collection_id)
+    
+    try:
+        from openpyxl import load_workbook
+        from io import BytesIO
+        
+        wb = load_workbook(filename=BytesIO(raw_bytes), read_only=True, data_only=True)
+        ws = wb.active
+        
+        created_count = 0
+        updated_count = 0
+        skipped_count = 0
+        
+        for row_idx, row in enumerate(ws.iter_rows(min_row=1, values_only=True), start=1):
+            if not row or len(row) < 2:
+                skipped_count += 1
+                continue
+            
+            source_text = normalize_text(str(row[0] or ""))
+            target_text = normalize_text(str(row[1] or ""))
+            
+            if not source_text or not target_text:
+                skipped_count += 1
+                continue
+            
+            # 跳过表头
+            if row_idx == 1 and (source_text.lower() in ("source", "原文", "术语") or target_text.lower() in ("target", "译文", "翻译")):
+                skipped_count += 1
+                continue
+            
+            existing = (
+                db.query(Term)
+                .filter(Term.source_text == source_text, Term.collection_id == collection_id)
+                .first()
+            )
+            
+            if existing:
+                existing.target_text = target_text
+                updated_count += 1
+            else:
+                term = Term(
+                    collection_id=collection_id,
+                    source_text=source_text,
+                    target_text=target_text,
+                )
+                db.add(term)
+                created_count += 1
+        
+        db.commit()
+        wb.close()
+        
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"术语库导入失败：{exc}") from exc
+
+    return {
+        "filename": file.filename,
+        "created_rows": created_count,
+        "updated_rows": updated_count,
+        "skipped_rows": skipped_count,
+        "imported_rows": created_count + updated_count,
+        "collection_id": collection.id if collection else None,
+        "collection_name": collection.name if collection else None,
+    }
+
+
+@router.get("/termbase/match")
+def match_terms(
+    text: str,
+    collection_ids: list[UUID] | None = None,
+    db: Session = Depends(get_db),
+):
+    """匹配文本中的术语，返回匹配到的术语列表（长术语优先）"""
+    if not text:
+        return {"matches": []}
+    
+    query = db.query(Term)
+    if collection_ids:
+        query = query.filter(Term.collection_id.in_(collection_ids))
+    
+    all_terms = query.all()
+    
+    # 按原文长度降序排序（长术语优先）
+    sorted_terms = sorted(all_terms, key=lambda t: len(t.source_text), reverse=True)
+    
+    matches = []
+    matched_positions = set()
+    text_lower = text.lower()
+    
+    for term in sorted_terms:
+        term_lower = term.source_text.lower()
+        start = 0
+        while True:
+            pos = text_lower.find(term_lower, start)
+            if pos == -1:
+                break
+            
+            end_pos = pos + len(term.source_text)
+            # 检查是否与已匹配的位置重叠
+            overlap = False
+            for matched_start, matched_end in matched_positions:
+                if not (end_pos <= matched_start or pos >= matched_end):
+                    overlap = True
+                    break
+            
+            if not overlap:
+                matched_positions.add((pos, end_pos))
+                matches.append({
+                    "term_id": str(term.id),
+                    "source_text": term.source_text,
+                    "target_text": term.target_text,
+                    "start": pos,
+                    "end": end_pos,
+                })
+            
+            start = pos + 1
+    
+    # 按位置排序
+    matches.sort(key=lambda m: m["start"])
+    
+    return {"matches": matches}

@@ -134,6 +134,78 @@ class TMCollection(Base):
     )
 
 
+class TermbaseCollection(Base):
+    __tablename__ = "termbase_collections"
+    __table_args__ = (
+        Index("uq_termbase_collections_name", "name", unique=True),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    terms: Mapped[list["Term"]] = relationship(
+        "Term",
+        back_populates="collection",
+    )
+
+
+class Term(Base):
+    __tablename__ = "terms"
+    __table_args__ = (
+        Index("ix_terms_collection_id", "collection_id"),
+        Index("ix_terms_source_text", "source_text"),
+        Index(
+            "ix_terms_source_text_trgm",
+            "source_text",
+            postgresql_using="gin",
+            postgresql_ops={"source_text": "gin_trgm_ops"},
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    collection_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("termbase_collections.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    source_text: Mapped[str] = mapped_column(Text, nullable=False)
+    target_text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    collection: Mapped[TermbaseCollection | None] = relationship(
+        "TermbaseCollection",
+        back_populates="terms",
+    )
+
+
 class TranslationMemory(Base):
     __tablename__ = "translation_memory"
     __table_args__ = (
