@@ -1,31 +1,35 @@
-# 环境变量
-.env
-
-# Python 虚拟环境
 .venv/
-
-# Python 缓存
+venv/
+env/
+ENV/
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Pytest 缓存
-.pytest_cache/
-
-# Hypothesis 测试数据
-.hypothesis/
-
-# IDE 配置
+*.py[cod]
+.env
+.env.*
+!.env.example
 .idea/
 .vscode/
-
-# Claude 配置
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+coverage/
+*.log
 .claude/
+data/
+tests/__pycache__/
+tests/.tmp/
+.hypothesis/
 
-# 数据文件
+# frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+frontend/*.log
+frontend/.env.local
+frontend/.env.*.local
+frontend/.DS_Store
+.claude
 *.xlsx
-
-# 数据库文件
-*.db
-*.sqlite3
+tests/

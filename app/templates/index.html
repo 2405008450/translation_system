@@ -45,6 +45,15 @@
                         <h1 class="h3 mb-2">翻译记忆库检索 Demo</h1>
                         <p class="text-muted mb-0">支持文本匹配与翻译记忆库 XLSX 导入。匹配入口和 TM 导入入口共用同一个页面。</p>
                     </div>
+                    <a href="/tasks" class="btn btn-outline-primary">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 4px; vertical-align: -2px;">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                            <polyline points="14 2 14 8 20 8"></polyline>
+                            <line x1="16" y1="13" x2="8" y2="13"></line>
+                            <line x1="16" y1="17" x2="8" y2="17"></line>
+                        </svg>
+                        任务列表
+                    </a>
                 </div>
 
                 {% if error_message %}
@@ -56,14 +65,15 @@
                 {% if import_summary %}
                 <div class="alert alert-success" role="alert">
                     <div><strong>导入完成：</strong>{{ import_summary.filename }}</div>
-                    <div>新增行数：{{ import_summary.imported_rows }}</div>
+                    <div>新增行数：{{ import_summary.created_rows }}</div>
+                    <div>更新行数：{{ import_summary.updated_rows }}</div>
                     <div>跳过表头行：{{ import_summary.skipped_header_rows }}</div>
                     <div>跳过空行：{{ import_summary.skipped_empty_rows }}</div>
                 </div>
                 {% endif %}
             </div>
 
-            <div class="col-lg-4">
+            <div class="col-lg-5">
                 <div class="card shadow-sm h-100">
                     <div class="card-body p-4">
                         <h2 class="h5 mb-3">文本匹配</h2>
@@ -76,7 +86,7 @@
                                 <div class="form-text">
                                     支持的文件类型：docx, pdf, pptx, txt, dita, svg <a class="toggle-formats" onclick="toggleFormats('match-formats')">更多</a>
                                     <div id="match-formats" class="format-details">
-                                        <div class="format-category"><strong>办公文件：</strong><span>docx,  pptx</span></div>
+                                        <div class="format-category"><strong>办公文件：</strong><span>docx, pptx</span></div>
                                         <div class="format-category"><strong>本地化文件：</strong><span>yml, json, xml, php, yaml</span></div>
                                         <div class="format-category"><strong>技术写作文件：</strong><span>dita, ditamap</span></div>
                                         <div class="format-category"><strong>文本文件：</strong><span>txt</span></div>
@@ -106,50 +116,7 @@
                 </div>
             </div>
 
-            <div class="col-lg-4">
-                <div class="card shadow-sm h-100">
-                    <div class="card-body p-4">
-                        <h2 class="h5 mb-3">可视化工作台</h2>
-                        <p class="text-muted small mb-4">上传文档后生成句子锚点、TM 匹配结果和右侧正文视图，支持列表与正文联动定位。</p>
-
-                        <form action="/workspace" method="post" enctype="multipart/form-data">
-                            <div class="mb-3">
-                                <label for="workspace_file" class="form-label">上传文档</label>
-                                <input class="form-control" type="file" id="workspace_file" name="workspace_file" accept=".txt,.docx,.pdf,.pptx,.dita,.ditamap,.xml,.svg,.yaml,.yml,.json,.php" required>
-                                <div class="form-text">
-                                    支持的文件类型：docx, pdf, pptx, txt, dita, svg <a class="toggle-formats" onclick="toggleFormats('workspace-formats')">更多</a>
-                                    <div id="workspace-formats" class="format-details">
-                                        <div class="format-category"><strong>办公文件：</strong><span>docx,  pptx</span></div>
-                                        <div class="format-category"><strong>本地化文件：</strong><span>yml, json, xml, php, yaml</span></div>
-                                        <div class="format-category"><strong>技术写作文件：</strong><span>dita, ditamap</span></div>
-                                        <div class="format-category"><strong>文本文件：</strong><span>txt</span></div>
-                                        <div class="format-category"><strong>排版文件：</strong><span>pdf, svg</span></div>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <div class="mb-4">
-                                <label for="workspace_threshold" class="form-label">模糊匹配阈值</label>
-                                <input
-                                    class="form-control"
-                                    type="number"
-                                    id="workspace_threshold"
-                                    name="threshold"
-                                    min="0"
-                                    max="1"
-                                    step="0.01"
-                                    value="{{ default_threshold }}"
-                                >
-                                <div class="form-text">会对提取出的每个句子进行 TM 匹配，并在工作台左侧展示状态。</div>
-                            </div>
-
-                            <button type="submit" class="btn btn-dark">打开工作台</button>
-                        </form>
-                    </div>
-                </div>
-            </div>
-
-            <div class="col-lg-4">
+            <div class="col-lg-5">
                 <div class="card shadow-sm h-100">
                     <div class="card-body p-4">
                         <h2 class="h5 mb-3">XLSX 导入 TM</h2>
@@ -163,7 +130,7 @@
                             </div>
 
                             <div class="alert alert-secondary small mb-4">
-                                大文件导入建议耐心等待；上传后会直接写入 `translation_memory`，并自动计算 `source_hash` 和 `source_normalized`。
+                                大文件导入建议耐心等待；导入时会自动计算 `source_hash` 和 `source_normalized`，同源文本会更新现有记录而不是重复插入。
                             </div>
 
                             <button type="submit" class="btn btn-success">导入 XLSX 到数据库</button>

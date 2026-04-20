@@ -7,7 +7,10 @@ INLINE_INVISIBLE_CHAR_PATTERN = re.compile(
 )
 WHITESPACE_PATTERN = re.compile(r"\s+")
 LINE_WHITESPACE_PATTERN = re.compile(r"[^\S\n]+")
-TRAILING_SENTENCE_MARK_PATTERN = re.compile(r"[。？！!?\.]+$")
+TRAILING_SENTENCE_MARK_PATTERN = re.compile(r"[\u3002\uff01\uff1f!?.]+$")
+SPACE_BEFORE_PUNCTUATION_PATTERN = re.compile(
+    r"\s+([\u3002\uff01\uff1f!?.\uff0c,\u3001\uff1b;\uff1a:\uff09\)\]\}])"
+)
 
 
 def normalize_text(text: str) -> str:
@@ -16,6 +19,7 @@ def normalize_text(text: str) -> str:
 
     cleaned = INLINE_INVISIBLE_CHAR_PATTERN.sub(" ", text)
     cleaned = WHITESPACE_PATTERN.sub(" ", cleaned)
+    cleaned = SPACE_BEFORE_PUNCTUATION_PATTERN.sub(r"\1", cleaned)
     return cleaned.strip()
 
 
@@ -26,7 +30,7 @@ def normalize_text_preserve_lines(text: str) -> str:
     cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = INLINE_INVISIBLE_CHAR_PATTERN.sub(" ", cleaned)
     cleaned = LINE_WHITESPACE_PATTERN.sub(" ", cleaned)
-    cleaned = re.sub(r"\n+", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
 
 
