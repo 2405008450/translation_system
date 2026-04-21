@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import base64
 import copy
 from dataclasses import dataclass, field
 from html import escape
 import hashlib
 from io import BytesIO
 from itertools import count
+import mimetypes
 import posixpath
 import re
 from uuid import UUID
@@ -22,9 +24,12 @@ from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
 
 NS = {
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
     "rels": "http://schemas.openxmlformats.org/package/2006/relationships",
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "v": "urn:schemas-microsoft-com:vml",
     "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
 }
 
 TRUTHY_VALUES = {"1", "on", "true"}
@@ -58,6 +63,17 @@ CELL_GROUP_MAX_CHARS = 200
 CELL_PARAGRAPH_BREAK_SENTINEL = "\uE000"
 PAGE_BREAK_SENTINEL = "\uE001"
 DOCX_PARSE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+EMU_PER_PIXEL = 9525
+SUPPORTED_BROWSER_IMAGE_MIME_TYPES = {
+    "image/bmp",
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/svg+xml",
+    "image/tiff",
+    "image/webp",
+    "image/x-icon",
+}
 
 
 @dataclass(frozen=True)
@@ -99,8 +115,8 @@ class InlineParseState:
 class ParsedParagraphRenderData:
     paragraph: ET.Element
     fragments: list[InlineFragment]
-    textbox_html_parts: list[str]
-    textbox_segments: list[dict]
+    embedded_html_parts: list[str]
+    embedded_segments: list[dict]
     numbering_text: str
     paragraph_css: str
     suppressed_page_number_field: bool
@@ -113,6 +129,15 @@ class StoryPart:
     part_name: str
     root: ET.Element
     rels: dict[str, str]
+    package: DocxPackage
+
+
+@dataclass(frozen=True)
+class EmbeddedImage:
+    source: str
+    alt_text: str = ""
+    width_px: int | None = None
+    height_px: int | None = None
 
 
 @dataclass(frozen=True)
@@ -163,6 +188,7 @@ class DocxPackage:
             raise ValueError("Invalid DOCX package.") from exc
         self._xml_cache: dict[str, ET.Element | None] = {}
         self._rels_cache: dict[str, dict[str, str]] = {}
+        self._binary_cache: dict[str, bytes | None] = {}
 
     def read_xml(self, part_name: str) -> ET.Element | None:
         normalized_name = part_name.lstrip("/")
@@ -206,6 +232,20 @@ class DocxPackage:
 
         self._rels_cache[normalized_name] = rels
         return rels
+
+    def read_binary(self, part_name: str) -> bytes | None:
+        normalized_name = part_name.lstrip("/")
+        if normalized_name in self._binary_cache:
+            return self._binary_cache[normalized_name]
+
+        try:
+            binary_bytes = self._archive.read(normalized_name)
+        except KeyError:
+            self._binary_cache[normalized_name] = None
+            return None
+
+        self._binary_cache[normalized_name] = binary_bytes
+        return binary_bytes
 
 
 def _build_numbering_schema(package: DocxPackage) -> NumberingSchema:
@@ -505,6 +545,7 @@ def _build_story_parts(package: DocxPackage) -> list[StoryPart]:
                 part_name=part_name,
                 root=root,
                 rels=package.read_relationships(part_name),
+                package=package,
             )
         )
 
@@ -515,6 +556,7 @@ def _build_story_parts(package: DocxPackage) -> list[StoryPart]:
             part_name=document_part_name,
             root=body,
             rels=document_rels,
+            package=package,
         )
     )
     stories.extend(_build_note_story_parts(package, "word/footnotes.xml", "footnote", "Footnote"))
@@ -531,6 +573,7 @@ def _build_story_parts(package: DocxPackage) -> list[StoryPart]:
                 part_name=part_name,
                 root=root,
                 rels=package.read_relationships(part_name),
+                package=package,
             )
         )
 
@@ -586,6 +629,7 @@ def _build_note_story_parts(
                 part_name=part_name,
                 root=note,
                 rels=rels,
+                package=package,
             )
         )
     return stories
@@ -710,7 +754,7 @@ def _collect_paragraph_render_data(
 ) -> ParsedParagraphRenderData:
     parse_state = InlineParseState()
     numbering_text = _resolve_paragraph_numbering(paragraph, numbering_state)
-    fragments, textbox_html_parts, textbox_segments = _collect_inline_content(
+    fragments, embedded_html_parts, embedded_segments = _collect_inline_content(
         node=paragraph,
         story=story,
         sentence_counter=sentence_counter,
@@ -730,8 +774,8 @@ def _collect_paragraph_render_data(
     return ParsedParagraphRenderData(
         paragraph=paragraph,
         fragments=fragments,
-        textbox_html_parts=textbox_html_parts,
-        textbox_segments=textbox_segments,
+        embedded_html_parts=embedded_html_parts,
+        embedded_segments=embedded_segments,
         numbering_text=numbering_text,
         paragraph_css=_build_paragraph_css(paragraph),
         suppressed_page_number_field=parse_state.suppressed_page_number_field,
@@ -759,9 +803,9 @@ def _should_merge_cell_paragraphs(
 ) -> bool:
     if not current.fragments or not next_paragraph.fragments:
         return False
-    if current.textbox_html_parts or current.textbox_segments:
+    if current.embedded_html_parts or current.embedded_segments:
         return False
-    if next_paragraph.textbox_html_parts or next_paragraph.textbox_segments:
+    if next_paragraph.embedded_html_parts or next_paragraph.embedded_segments:
         return False
     if next_paragraph.numbering_text:
         return False
@@ -787,8 +831,8 @@ def _group_cell_paragraphs(
         paragraph_group = ParsedParagraphRenderData(
             paragraph=paragraph.paragraph,
             fragments=list(paragraph.fragments),
-            textbox_html_parts=list(paragraph.textbox_html_parts),
-            textbox_segments=list(paragraph.textbox_segments),
+            embedded_html_parts=list(paragraph.embedded_html_parts),
+            embedded_segments=list(paragraph.embedded_segments),
             numbering_text=paragraph.numbering_text,
             paragraph_css=paragraph.paragraph_css,
             suppressed_page_number_field=paragraph.suppressed_page_number_field,
@@ -849,9 +893,9 @@ def _render_table_cell(
             )
             if paragraph_html:
                 cell_inner_html_parts.append(paragraph_html)
-            cell_inner_html_parts.extend(grouped_paragraph.textbox_html_parts)
+            cell_inner_html_parts.extend(grouped_paragraph.embedded_html_parts)
             cell_segments.extend(paragraph_segments)
-            cell_segments.extend(grouped_paragraph.textbox_segments)
+            cell_segments.extend(grouped_paragraph.embedded_segments)
 
         paragraph_buffer = []
 
@@ -966,9 +1010,9 @@ def _render_paragraph(
         html_parts.append(_build_page_break_html())
     if paragraph_html:
         html_parts.append(paragraph_html)
-    html_parts.extend(paragraph_data.textbox_html_parts)
+    html_parts.extend(paragraph_data.embedded_html_parts)
 
-    return "".join(html_parts), paragraph_segments + paragraph_data.textbox_segments
+    return "".join(html_parts), paragraph_segments + paragraph_data.embedded_segments
 
 
 def _render_paragraph_from_fragments(
@@ -1422,20 +1466,20 @@ def _collect_inline_content(
         return [_build_note_reference_fragment(node, inherited_css)], [], []
 
     if node_name in {"drawing", "pict"}:
-        textbox_html_parts, textbox_segments = _render_embedded_textboxes(
+        embedded_html_parts, embedded_segments = _render_embedded_objects(
             node=node,
             story=story,
             sentence_counter=sentence_counter,
             block_counter=block_counter,
             numbering_state=numbering_state,
         )
-        return [], textbox_html_parts, textbox_segments
+        return [], embedded_html_parts, embedded_segments
 
     fragments: list[InlineFragment] = []
-    textbox_html_parts: list[str] = []
-    textbox_segments: list[dict] = []
+    embedded_html_parts: list[str] = []
+    embedded_segments: list[dict] = []
     for child in list(node):
-        child_fragments, child_textbox_html_parts, child_textbox_segments = _collect_inline_content(
+        child_fragments, child_embedded_html_parts, child_embedded_segments = _collect_inline_content(
             node=child,
             story=story,
             sentence_counter=sentence_counter,
@@ -1446,10 +1490,49 @@ def _collect_inline_content(
             inherited_css=inherited_css,
         )
         fragments.extend(child_fragments)
-        textbox_html_parts.extend(child_textbox_html_parts)
-        textbox_segments.extend(child_textbox_segments)
+        embedded_html_parts.extend(child_embedded_html_parts)
+        embedded_segments.extend(child_embedded_segments)
 
-    return fragments, textbox_html_parts, textbox_segments
+    return fragments, embedded_html_parts, embedded_segments
+
+
+def _render_embedded_objects(
+    node: ET.Element,
+    story: StoryPart,
+    sentence_counter,
+    block_counter,
+    numbering_state: NumberingState,
+) -> tuple[list[str], list[dict]]:
+    embedded_html_parts = _render_embedded_images(node=node, story=story)
+    textbox_html_parts, textbox_segments = _render_embedded_textboxes(
+        node=node,
+        story=story,
+        sentence_counter=sentence_counter,
+        block_counter=block_counter,
+        numbering_state=numbering_state,
+    )
+    embedded_html_parts.extend(textbox_html_parts)
+    return embedded_html_parts, textbox_segments
+
+
+def _render_embedded_images(
+    node: ET.Element,
+    story: StoryPart,
+) -> list[str]:
+    image_html_parts: list[str] = []
+    seen_images: set[tuple[str, int | None, int | None, str]] = set()
+
+    for image in _extract_embedded_images(node=node, story=story):
+        image_key = (image.source, image.width_px, image.height_px, image.alt_text)
+        if image_key in seen_images:
+            continue
+        seen_images.add(image_key)
+
+        image_html = _build_embedded_image_html(package=story.package, image=image)
+        if image_html:
+            image_html_parts.append(image_html)
+
+    return image_html_parts
 
 
 def _render_embedded_textboxes(
@@ -1496,6 +1579,215 @@ def _render_embedded_textboxes(
         return [], []
 
     return [f'<div class="doc-textbox">{paragraph_html}</div>'], paragraph_segments
+
+
+def _extract_embedded_images(
+    node: ET.Element,
+    story: StoryPart,
+) -> list[EmbeddedImage]:
+    images: list[EmbeddedImage] = []
+    drawing_alt_text = _resolve_drawing_alt_text(node)
+    drawing_width_px, drawing_height_px = _resolve_drawing_extent_pixels(node)
+
+    for blip in node.findall(".//a:blip", NS):
+        rel_id = blip.get(_qn("r", "embed")) or blip.get(_qn("r", "link"))
+        if not rel_id:
+            continue
+
+        source = story.rels.get(rel_id)
+        if not source:
+            continue
+
+        images.append(
+            EmbeddedImage(
+                source=source,
+                alt_text=drawing_alt_text,
+                width_px=drawing_width_px,
+                height_px=drawing_height_px,
+            )
+        )
+
+    vml_shapes = node.findall(".//v:shape", NS)
+    if vml_shapes:
+        for shape in vml_shapes:
+            imagedata = shape.find(".//v:imagedata", NS)
+            if imagedata is None:
+                continue
+
+            rel_id = imagedata.get(_qn("r", "id")) or imagedata.get(_qn("r", "href"))
+            if not rel_id:
+                continue
+
+            source = story.rels.get(rel_id)
+            if not source:
+                continue
+
+            width_px, height_px = _parse_vml_image_dimensions(shape.get("style", ""))
+            images.append(
+                EmbeddedImage(
+                    source=source,
+                    alt_text=imagedata.get("title", "") or drawing_alt_text,
+                    width_px=width_px,
+                    height_px=height_px,
+                )
+            )
+    else:
+        for imagedata in node.findall(".//v:imagedata", NS):
+            rel_id = imagedata.get(_qn("r", "id")) or imagedata.get(_qn("r", "href"))
+            if not rel_id:
+                continue
+
+            source = story.rels.get(rel_id)
+            if not source:
+                continue
+
+            images.append(
+                EmbeddedImage(
+                    source=source,
+                    alt_text=imagedata.get("title", "") or drawing_alt_text,
+                    width_px=drawing_width_px,
+                    height_px=drawing_height_px,
+                )
+            )
+
+    return images
+
+
+def _build_embedded_image_html(
+    package: DocxPackage,
+    image: EmbeddedImage,
+) -> str:
+    mime_type = _guess_embedded_image_mime_type(image.source)
+    image_src = _resolve_embedded_image_src(package=package, source=image.source)
+    if not image_src:
+        format_label = mime_type.split("/")[-1].upper() if mime_type else "UNKNOWN"
+        return (
+            '<div class="doc-image doc-image--placeholder">'
+            f"Image preview unavailable ({escape(format_label)})"
+            "</div>"
+        )
+
+    alt_text = image.alt_text.strip() or "Embedded image"
+    width_style = ""
+    if image.width_px is not None:
+        width_style = f"width: {image.width_px}px;"
+
+    css_parts = [width_style, "max-width: 100%;", "height: auto;"]
+    style_attr = escape(" ".join(part for part in css_parts if part).strip(), quote=True)
+    width_attr = f' width="{image.width_px}"' if image.width_px is not None else ""
+    height_attr = f' height="{image.height_px}"' if image.height_px is not None else ""
+    src_attr = escape(image_src, quote=True)
+    alt_attr = escape(alt_text, quote=True)
+    return (
+        '<div class="doc-image">'
+        f'<img class="doc-image__img" src="{src_attr}" alt="{alt_attr}"'
+        f'{width_attr}{height_attr} style="{style_attr}">'
+        "</div>"
+    )
+
+
+def _resolve_embedded_image_src(
+    package: DocxPackage,
+    source: str,
+) -> str:
+    if not source:
+        return ""
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", source):
+        return source
+
+    binary_bytes = package.read_binary(source)
+    if not binary_bytes:
+        return ""
+
+    mime_type = _guess_embedded_image_mime_type(source)
+    if mime_type not in SUPPORTED_BROWSER_IMAGE_MIME_TYPES:
+        return ""
+
+    encoded = base64.b64encode(binary_bytes).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _guess_embedded_image_mime_type(source: str) -> str:
+    return mimetypes.guess_type(source)[0] or "application/octet-stream"
+
+
+def _resolve_drawing_alt_text(node: ET.Element) -> str:
+    for element in node.findall(".//wp:docPr", NS):
+        alt_text = element.get("descr") or element.get("title") or element.get("name")
+        if alt_text:
+            return alt_text
+
+    for element in node.findall(".//pic:cNvPr", NS):
+        alt_text = element.get("descr") or element.get("title") or element.get("name")
+        if alt_text:
+            return alt_text
+
+    return ""
+
+
+def _resolve_drawing_extent_pixels(node: ET.Element) -> tuple[int | None, int | None]:
+    for extent in node.findall(".//wp:extent", NS):
+        width_px = _emu_to_pixels(extent.get("cx"))
+        height_px = _emu_to_pixels(extent.get("cy"))
+        if width_px is not None or height_px is not None:
+            return width_px, height_px
+
+    for extent in node.findall(".//a:ext", NS):
+        width_px = _emu_to_pixels(extent.get("cx"))
+        height_px = _emu_to_pixels(extent.get("cy"))
+        if width_px is not None or height_px is not None:
+            return width_px, height_px
+
+    return None, None
+
+
+def _emu_to_pixels(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        pixels = int(round(int(value) / EMU_PER_PIXEL))
+    except (TypeError, ValueError):
+        return None
+    return max(pixels, 1)
+
+
+def _parse_vml_image_dimensions(style_value: str) -> tuple[int | None, int | None]:
+    width_px = _parse_css_length_to_pixels(_extract_style_value(style_value, "width"))
+    height_px = _parse_css_length_to_pixels(_extract_style_value(style_value, "height"))
+    return width_px, height_px
+
+
+def _extract_style_value(style_value: str, property_name: str) -> str:
+    match = re.search(rf"(?:^|;)\s*{re.escape(property_name)}\s*:\s*([^;]+)", style_value, re.IGNORECASE)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def _parse_css_length_to_pixels(value: str) -> int | None:
+    if not value:
+        return None
+
+    match = re.match(r"(-?\d+(?:\.\d+)?)\s*(px|pt|in|cm|mm)?$", value.strip(), re.IGNORECASE)
+    if not match:
+        return None
+
+    numeric_value = float(match.group(1))
+    unit = (match.group(2) or "px").lower()
+    if unit == "px":
+        pixels = numeric_value
+    elif unit == "pt":
+        pixels = numeric_value * 96.0 / 72.0
+    elif unit == "in":
+        pixels = numeric_value * 96.0
+    elif unit == "cm":
+        pixels = numeric_value * 96.0 / 2.54
+    elif unit == "mm":
+        pixels = numeric_value * 96.0 / 25.4
+    else:
+        return None
+
+    return max(int(round(pixels)), 1)
 
 
 def _update_field_state(
