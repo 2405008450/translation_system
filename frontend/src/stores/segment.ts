@@ -1,7 +1,8 @@
 import { computed, ref } from 'vue'
-import { defineStore } from 'pinia'
+import { defineStore, storeToRefs } from 'pinia'
 
 import { http } from '../api/http'
+import { useTaskStore } from './task'
 import type {
   FileRecordDetail,
   FileRecordPreview,
@@ -33,6 +34,8 @@ function parseSSEChunk(chunk: string) {
 }
 
 export const useSegmentStore = defineStore('segment', () => {
+  const taskStore = useTaskStore()
+  
   const fileRecord = ref<FileRecordDetail | null>(null)
   const segments = ref<Segment[]>([])
   const previewHtml = ref('')
@@ -40,6 +43,7 @@ export const useSegmentStore = defineStore('segment', () => {
   const activeSentenceId = ref<string | null>(null)
   const activeSourceText = ref('')
   const termMatchesMap = ref<Record<string, TermMatch[]>>({})
+  const termbaseCollectionIds = ref<string[]>([])
   const loading = ref(false)
   const saving = ref(false)
   const llmRunning = ref(false)
@@ -67,6 +71,7 @@ export const useSegmentStore = defineStore('segment', () => {
     activeSentenceId.value = null
     activeSourceText.value = ''
     termMatchesMap.value = {}
+    termbaseCollectionIds.value = []
     saving.value = false
     llmRunning.value = false
     syncMessage.value = '暂无未保存修改'
@@ -81,6 +86,8 @@ export const useSegmentStore = defineStore('segment', () => {
   async function loadTask(fileRecordId: string) {
     resetState()
     loading.value = true
+    // 加载术语库选择
+    termbaseCollectionIds.value = taskStore.getTermbaseCollections(fileRecordId)
     try {
       const [detail, preview] = await Promise.all([
         fetchAllSegments(fileRecordId),
@@ -187,9 +194,11 @@ export const useSegmentStore = defineStore('segment', () => {
       return
     }
     try {
-      const { data } = await http.get<{ matches: TermMatch[] }>('/termbase/match', {
-        params: { text: sourceText },
-      })
+      const params: Record<string, unknown> = { text: sourceText }
+      if (termbaseCollectionIds.value.length > 0) {
+        params.collection_ids = termbaseCollectionIds.value
+      }
+      const { data } = await http.get<{ matches: TermMatch[] }>('/termbase/match', { params })
       termMatchesMap.value = {
         ...termMatchesMap.value,
         [sentenceId]: data.matches,
@@ -201,6 +210,16 @@ export const useSegmentStore = defineStore('segment', () => {
 
   function getTermMatches(sentenceId: string): TermMatch[] {
     return termMatchesMap.value[sentenceId] || []
+  }
+
+  function setTermbaseCollections(collectionIds: string[]) {
+    termbaseCollectionIds.value = collectionIds
+    // 同步保存到 taskStore
+    if (fileRecord.value) {
+      taskStore.setTermbaseCollections(fileRecord.value.id, collectionIds)
+    }
+    // 清空已缓存的术语匹配，下次选中句段时会重新加载
+    termMatchesMap.value = {}
   }
 
   function scheduleSync() {
@@ -396,6 +415,7 @@ export const useSegmentStore = defineStore('segment', () => {
     activeSentenceId,
     activeSourceText,
     termMatchesMap,
+    termbaseCollectionIds,
     loading,
     saving,
     llmRunning,
@@ -409,6 +429,7 @@ export const useSegmentStore = defineStore('segment', () => {
     updateTarget,
     setActiveSentence,
     getTermMatches,
+    setTermbaseCollections,
     syncToBackend,
     startLLMTranslation,
     downloadTranslatedDocx,

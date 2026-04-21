@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
 import { http } from '../api/http'
+import { useSegmentStore } from '../stores/segment'
 import type { TermMatch } from '../types/api'
 
 interface TMCandidate {
@@ -21,6 +22,8 @@ const emit = defineEmits<{
   close: []
   applyTarget: [sentenceId: string, targetText: string]
 }>()
+
+const segmentStore = useSegmentStore()
 
 const loading = ref(false)
 const error = ref('')
@@ -61,9 +64,11 @@ async function loadCandidates() {
   // 术语匹配独立处理，失败时静默
   try {
     if (props.activeSourceText) {
-      const termResponse = await http.get<{ matches: TermMatch[] }>('/termbase/match', {
-        params: { text: props.activeSourceText },
-      })
+      const params: Record<string, unknown> = { text: props.activeSourceText }
+      if (segmentStore.termbaseCollectionIds.length > 0) {
+        params.collection_ids = segmentStore.termbaseCollectionIds
+      }
+      const termResponse = await http.get<{ matches: TermMatch[] }>('/termbase/match', { params })
       termMatches.value = termResponse.data.matches
     } else {
       termMatches.value = []

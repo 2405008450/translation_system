@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { FolderKanban, Database, Users, LogOut, PanelLeftClose, PanelLeft, Languages } from 'lucide-vue-next'
+import { FolderKanban, Database, Users, LogOut, PanelLeftClose, PanelLeft, Languages, BookA } from 'lucide-vue-next'
 import { computed, ref } from 'vue'
 import { RouterView, useRoute, useRouter } from 'vue-router'
 
@@ -43,6 +43,7 @@ const navItems = computed<NavItem[]>(() => [
   {
     name: 'termbase',
     label: '术语库',
+    icon: BookA,
     shortLabel: 'TB',
     description: '术语管理与匹配',
     visible: authStore.isAdmin,

@@ -7,7 +7,7 @@ import { useRouter } from 'vue-router'
 import { http } from '../api/http'
 import { useAuthStore } from '../stores/auth'
 import { useTaskStore } from '../stores/task'
-import type { TMCollection } from '../types/api'
+import type { TMCollection, TermbaseCollection } from '../types/api'
 
 const authStore = useAuthStore()
 const taskStore = useTaskStore()
@@ -17,8 +17,11 @@ const selectedFile = ref<File | null>(null)
 const threshold = ref(0.6)
 const pageError = ref('')
 const tmCollections = ref<TMCollection[]>([])
+const termbaseCollections = ref<TermbaseCollection[]>([])
 const loadingCollections = ref(false)
+const loadingTermbaseCollections = ref(false)
 const selectedCollectionIds = ref<string[]>([])
+const selectedTermbaseCollectionIds = ref<string[]>([])
 
 function formatTime(value: string) {
   return new Date(value).toLocaleString('zh-CN', { hour12: false })
@@ -56,6 +59,26 @@ async function loadTMCollections() {
   }
 }
 
+async function loadTermbaseCollections() {
+  loadingTermbaseCollections.value = true
+  try {
+    const { data } = await http.get<TermbaseCollection[]>('/termbase/collections')
+    termbaseCollections.value = data
+    // 默认选中所有术语库
+    if (selectedTermbaseCollectionIds.value.length === 0 && data.length > 0) {
+      selectedTermbaseCollectionIds.value = data.map((c) => c.id)
+    }
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      pageError.value = String(error.response?.data?.detail || '术语库加载失败。')
+      return
+    }
+    pageError.value = error instanceof Error ? error.message : '术语库加载失败。'
+  } finally {
+    loadingTermbaseCollections.value = false
+  }
+}
+
 function onFileChange(event: Event) {
   selectedFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
 }
@@ -76,6 +99,7 @@ async function uploadFile() {
       selectedFile.value,
       threshold.value,
       selectedCollectionIds.value,
+      selectedTermbaseCollectionIds.value,
     )
     selectedFile.value = null
     const fileInput = document.getElementById('upload-file') as HTMLInputElement | null
@@ -112,6 +136,7 @@ async function removeTask(fileRecordId: string) {
 onMounted(() => {
   void loadTasks()
   void loadTMCollections()
+  void loadTermbaseCollections()
 })
 </script>
 
@@ -151,6 +176,23 @@ onMounted(() => {
           </select>
           <span class="hint-text">
             {{ tmCollections.length ? '可多选，任务只会匹配选中的记忆库' : '请先在 TM 记忆库导入 Excel' }}
+          </span>
+        </label>
+
+        <label class="field field--collections">
+          <span class="field__label">匹配术语库</span>
+          <select
+            v-model="selectedTermbaseCollectionIds"
+            class="field__control field__control--multi"
+            multiple
+            :disabled="loadingTermbaseCollections || termbaseCollections.length === 0"
+          >
+            <option v-for="collection in termbaseCollections" :key="collection.id" :value="collection.id">
+              {{ collection.name }}（{{ collection.entry_count }} 条）
+            </option>
+          </select>
+          <span class="hint-text">
+            {{ termbaseCollections.length ? '可多选，工作台中只高亮选中术语库的术语' : '请先在术语库导入 Excel' }}
           </span>
         </label>
 

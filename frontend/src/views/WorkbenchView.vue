@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { ArrowLeft, Bot, Download, Loader2, Save, FileText, FileCheck, Columns, Languages, MessageSquare, History } from 'lucide-vue-next'
+import { ArrowLeft, Bot, Download, Loader2, Save, FileText, FileCheck, Columns, Languages, MessageSquare, History, Database, ClipboardList } from 'lucide-vue-next'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRouter } from 'vue-router'
 
+import HistoryPanel from '../components/HistoryPanel.vue'
 import NotesPanel from '../components/NotesPanel.vue'
 import PreviewPanel from '../components/PreviewPanel.vue'
 import SegmentEditorRow from '../components/SegmentEditorRow.vue'
@@ -36,7 +37,7 @@ const virtualListRef = ref<{
   focusIndex: (index: number, selector?: string, align?: ScrollLogicalPosition) => Promise<boolean>
 } | null>(null)
 
-type ToolKey = 'source-preview' | 'target-preview' | 'split-preview' | 'tm-match' | 'terms' | 'notes' | 'history'
+type ToolKey = 'source-preview' | 'target-preview' | 'split-preview' | 'tm-match' | 'terms' | 'notes' | 'history' | 'segment-history'
 type ActiveToolConfig =
   | {
       kind: 'preview'
@@ -59,6 +60,14 @@ type ActiveToolConfig =
     }
   | {
       kind: 'notes'
+      title: string
+    }
+  | {
+      kind: 'history'
+      title: string
+    }
+  | {
+      kind: 'segment-history'
       title: string
     }
   | {
@@ -135,9 +144,10 @@ const toolButtons = [
   { key: 'source-preview' as const, label: '原文预览', icon: FileText },
   { key: 'target-preview' as const, label: '译文预览', icon: FileCheck },
   { key: 'split-preview' as const, label: '分屏对照', icon: Columns },
-  { key: 'tm-match' as const, label: '记忆/术语匹配', icon: Languages },
+  { key: 'tm-match' as const, label: '记忆/术语匹配', icon: Database },
   { key: 'terms' as const, label: '术语', icon: Languages },
   { key: 'notes' as const, label: '批注', icon: MessageSquare },
+  { key: 'segment-history' as const, label: '历史记录', icon: ClipboardList },
   { key: 'history' as const, label: '历史版本', icon: History },
 ]
 
@@ -194,11 +204,17 @@ const activeToolConfig = computed<ActiveToolConfig | null>(() => {
     }
   }
 
+  if (activeTool.value === 'segment-history') {
+    return {
+      kind: 'segment-history' as const,
+      title: '历史记录',
+    }
+  }
+
   if (activeTool.value === 'history') {
     return {
-      kind: 'placeholder' as const,
+      kind: 'history' as const,
       title: '历史版本',
-      message: '历史版本面板即将接入。',
     }
   }
 
@@ -225,7 +241,28 @@ const activeNotesConfig = computed(() =>
   activeToolConfig.value?.kind === 'notes' ? activeToolConfig.value : null,
 )
 
+const activeHistoryConfig = computed(() =>
+  activeToolConfig.value?.kind === 'segment-history' ? activeToolConfig.value : null,
+)
+
+function handleRequestTMPanel(sentenceId: string) {
+  if (skipNextTMPanelRequest) {
+    skipNextTMPanelRequest = false
+    return
+  }
+  // 只有在没有打开任何面板时才自动打开 TM 匹配面板
+  if (activeTool.value !== null) {
+    return
+  }
+  segmentStore.setActiveSentence(sentenceId)
+  activeTool.value = 'tm-match'
+}
+
+// 标记是否是从预览跳转过来的，避免自动打开 TM 面板
+let skipNextTMPanelRequest = false
+
 function handlePreviewFocus(sentenceId: string) {
+  skipNextTMPanelRequest = true
   segmentStore.setActiveSentence(sentenceId)
   void focusEditorSentence(sentenceId)
 }
@@ -518,9 +555,10 @@ onBeforeRouteLeave(async () => {
               :segment="item"
               :index="index"
               :active="segmentStore.activeSentenceId === item.sentence_id"
-              :term-matches="segmentStore.getTermMatches(item.sentence_id)"
+              :term-matches="segmentStore.activeSentenceId === item.sentence_id ? segmentStore.getTermMatches(item.sentence_id) : []"
               @focus="segmentStore.setActiveSentence"
               @update="segmentStore.updateTarget"
+              @request-t-m-panel="handleRequestTMPanel"
             />
           </template>
         </VirtualList>
@@ -606,6 +644,15 @@ onBeforeRouteLeave(async () => {
             @delete-comment="handleDeleteComment"
             @reply-comment="handleReplyComment"
             @cancel-draft="commentStore.setDraftAnchor(null)"
+          />
+        </Transition>
+
+        <Transition name="preview-drawer">
+          <HistoryPanel
+            v-if="activeHistoryConfig"
+            :file-record-id="props.id"
+            :active-sentence-id="segmentStore.activeSentenceId"
+            @close="activeTool = null"
           />
         </Transition>
 

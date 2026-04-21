@@ -45,6 +45,10 @@ from app.services.file_record_service import (
     update_segment_by_sentence_id,
     update_segment_with_llm_result,
 )
+from app.services.history_service import (
+    list_segment_history,
+    serialize_segment_history,
+)
 from app.services.llm_service import (
     LLMConfigurationError,
     LLMTranslationFailure,
@@ -85,12 +89,14 @@ class TMCollectionPayload(BaseModel):
 class TermbaseCollectionPayload(BaseModel):
     name: str
     description: str | None = None
+    source_language: str | None = None
+    target_language: str | None = None
 
 
 class TermPayload(BaseModel):
     source_text: str
     target_text: str
-    collection_id: UUID | None = None
+    term_base_id: UUID | None = None
 
 
 class CommentCreateRequest(BaseModel):
@@ -488,6 +494,34 @@ def get_segment_tm_candidates(
     }
 
 
+@router.get("/file-records/{file_record_id}/segments/{sentence_id}/history")
+def get_segment_history(
+    file_record_id: UUID,
+    sentence_id: str,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+):
+    """获取指定句段的修改历史"""
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    segment = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not segment:
+        raise HTTPException(status_code=404, detail="句段不存在。")
+
+    history_list = list_segment_history(db, segment.id, limit=min(limit, 100))
+    return {
+        "sentence_id": sentence_id,
+        "source_text": segment.source_text,
+        "history": [serialize_segment_history(h) for h in history_list],
+    }
+
+
 @router.put("/file-records/{file_record_id}/segments/{sentence_id}")
 @router.put("/documents/{file_record_id}/segments/{sentence_id}", include_in_schema=False)
 def update_segment(
@@ -495,6 +529,7 @@ def update_segment(
     sentence_id: str,
     update: SegmentUpdate,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """更新单个片段的译文"""
     segment = update_segment_by_sentence_id(
@@ -503,6 +538,7 @@ def update_segment(
         sentence_id=sentence_id,
         target_text=update.target_text,
         source=update.source,
+        operator=current_user,
     )
     if not segment:
         raise HTTPException(status_code=404, detail="片段不存在。")
@@ -522,12 +558,14 @@ def batch_update(
     file_record_id: UUID,
     batch: BatchSegmentUpdate,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """批量更新片段译文"""
     updated_count = batch_update_segments(
         db=db,
         file_record_id=file_record_id,
         updates=[u.model_dump() for u in batch.updates],
+        operator=current_user,
     )
     return {"updated_count": updated_count}
 
@@ -1052,6 +1090,8 @@ def _serialize_termbase_collection(collection: TermbaseCollection, entry_count: 
         "id": collection.id,
         "name": collection.name,
         "description": collection.description,
+        "source_language": collection.source_language,
+        "target_language": collection.target_language,
         "created_at": collection.created_at.isoformat(),
         "updated_at": collection.updated_at.isoformat(),
         "entry_count": entry_count,
@@ -1074,7 +1114,7 @@ def list_termbase_collections(
 ):
     rows = (
         db.query(TermbaseCollection, func.count(Term.id).label("entry_count"))
-        .outerjoin(Term, Term.collection_id == TermbaseCollection.id)
+        .outerjoin(Term, Term.term_base_id == TermbaseCollection.id)
         .group_by(TermbaseCollection.id)
         .order_by(TermbaseCollection.created_at.desc())
         .all()
@@ -1098,6 +1138,8 @@ def create_termbase_collection(
     collection = TermbaseCollection(
         name=name,
         description=normalize_text(payload.description or "") or None,
+        source_language=payload.source_language or None,
+        target_language=payload.target_language or None,
     )
     db.add(collection)
     try:
@@ -1122,7 +1164,7 @@ def delete_termbase_collection(
 
     entry_count = (
         db.query(Term)
-        .filter(Term.collection_id == collection.id)
+        .filter(Term.term_base_id == collection.id)
         .count()
     )
     if entry_count:
@@ -1142,7 +1184,7 @@ def list_terms(
 ):
     query = db.query(Term)
     if collection_id:
-        query = query.filter(Term.collection_id == collection_id)
+        query = query.filter(Term.term_base_id == collection_id)
     
     total = query.count()
     terms = query.order_by(Term.source_text).offset(skip).limit(limit).all()
@@ -1156,7 +1198,7 @@ def list_terms(
                 "id": term.id,
                 "source_text": term.source_text,
                 "target_text": term.target_text,
-                "collection_id": term.collection_id,
+                "term_base_id": term.term_base_id,
                 "created_at": term.created_at.isoformat(),
             }
             for term in terms
@@ -1176,12 +1218,17 @@ def add_term(
     if not source_text or not target_text:
         raise HTTPException(status_code=400, detail="原文和译文不能为空。")
 
-    _get_termbase_collection_or_404(db, payload.collection_id)
+    collection = _get_termbase_collection_or_404(db, payload.term_base_id)
+    if not collection:
+        raise HTTPException(status_code=400, detail="请选择目标术语库。")
+
+    if not collection.source_language or not collection.target_language:
+        raise HTTPException(status_code=400, detail="请先设置术语库的语言方向。")
 
     # 检查是否已存在相同原文的术语
     existing = (
         db.query(Term)
-        .filter(Term.source_text == source_text, Term.collection_id == payload.collection_id)
+        .filter(Term.source_text == source_text, Term.term_base_id == payload.term_base_id)
         .first()
     )
 
@@ -1191,9 +1238,11 @@ def add_term(
         return {"status": "updated", "id": existing.id, "message": "已更新现有术语。"}
 
     term = Term(
-        collection_id=payload.collection_id,
+        term_base_id=payload.term_base_id,
         source_text=source_text,
         target_text=target_text,
+        source_language=collection.source_language if collection else None,
+        target_language=collection.target_language if collection else None,
     )
     db.add(term)
     db.commit()
@@ -1232,8 +1281,16 @@ async def import_termbase_xlsx(
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="上传的 XLSX 文件为空。")
 
+    if not collection_id:
+        raise HTTPException(status_code=400, detail="请选择目标术语库。")
+
     collection = _get_termbase_collection_or_404(db, collection_id)
-    
+    if not collection:
+        raise HTTPException(status_code=404, detail="术语库不存在。")
+
+    if not collection.source_language or not collection.target_language:
+        raise HTTPException(status_code=400, detail="请先设置术语库的语言方向。")
+
     try:
         from openpyxl import load_workbook
         from io import BytesIO
@@ -1264,7 +1321,7 @@ async def import_termbase_xlsx(
             
             existing = (
                 db.query(Term)
-                .filter(Term.source_text == source_text, Term.collection_id == collection_id)
+                .filter(Term.source_text == source_text, Term.term_base_id == collection_id)
                 .first()
             )
             
@@ -1273,9 +1330,11 @@ async def import_termbase_xlsx(
                 updated_count += 1
             else:
                 term = Term(
-                    collection_id=collection_id,
+                    term_base_id=collection_id,
                     source_text=source_text,
                     target_text=target_text,
+                    source_language=collection.source_language if collection else None,
+                    target_language=collection.target_language if collection else None,
                 )
                 db.add(term)
                 created_count += 1
@@ -1310,7 +1369,7 @@ def match_terms(
     
     query = db.query(Term)
     if collection_ids:
-        query = query.filter(Term.collection_id.in_(collection_ids))
+        query = query.filter(Term.term_base_id.in_(collection_ids))
     
     all_terms = query.all()
     

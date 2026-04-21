@@ -82,14 +82,14 @@ def is_tm_vector_ready(db: Session) -> bool:
                             SELECT 1
                             FROM information_schema.columns
                             WHERE table_schema = current_schema()
-                              AND table_name = 'translation_memory'
+                              AND table_name = 'memory_entries'
                               AND column_name = 'source_embedding'
                         )
                         AND EXISTS (
                             SELECT 1
                             FROM information_schema.columns
                             WHERE table_schema = current_schema()
-                              AND table_name = 'translation_memory'
+                              AND table_name = 'memory_entries'
                               AND column_name = 'source_embedding_version'
                         )
                     """
@@ -132,7 +132,7 @@ def sync_tm_embeddings(
         db.execute(
             text(
                 f"""
-                UPDATE translation_memory
+                UPDATE memory_entries
                 SET source_embedding = CAST(:source_embedding AS vector({vector_dimensions})),
                     source_embedding_version = :source_embedding_version
                 WHERE id = CAST(:id AS uuid)

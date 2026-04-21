@@ -4,7 +4,8 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from app.models import FileRecord, Segment, TranslationMemory
+from app.models import FileRecord, Segment, SegmentHistory, TranslationMemory, User
+from app.services.history_service import create_segment_history, get_confirm_type
 from app.services.document_workspace import build_docx_workspace
 from app.services.document_storage import delete_source_file, load_source_file, save_source_file
 
@@ -263,6 +264,7 @@ def update_segment_by_sentence_id(
     sentence_id: str,
     target_text: str,
     source: str = "manual",
+    operator: User | None = None,
 ) -> Segment | None:
     segment = (
         db.query(Segment)
@@ -277,6 +279,9 @@ def update_segment_by_sentence_id(
     if source == "manual":
         segment.status = "confirmed"
 
+    # 记录历史
+    create_segment_history(db, segment, operator)
+
     db.commit()
     db.refresh(segment)
     return segment
@@ -287,6 +292,7 @@ def update_segment_with_llm_result(
     file_record_id: UUID,
     sentence_id: str,
     target_text: str,
+    operator: User | None = None,
 ) -> Segment | None:
     return update_segment_by_sentence_id(
         db=db,
@@ -294,6 +300,7 @@ def update_segment_with_llm_result(
         sentence_id=sentence_id,
         target_text=target_text,
         source="llm",
+        operator=operator,
     )
 
 
@@ -301,6 +308,7 @@ def batch_update_segments(
     db: Session,
     file_record_id: UUID,
     updates: list[dict],
+    operator: User | None = None,
 ) -> int:
     updates_by_sentence_id: dict[str, dict] = {}
     for item in updates:
@@ -332,6 +340,9 @@ def batch_update_segments(
         segment.source = source
         if source == "manual":
             segment.status = "confirmed"
+        
+        # 记录历史
+        create_segment_history(db, segment, operator)
         updated_count += 1
 
     db.commit()

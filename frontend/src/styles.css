@@ -108,7 +108,7 @@ button {
 }
 
 .upload-form--task {
-  grid-template-columns: minmax(220px, 1.2fr) 160px minmax(220px, 1fr) auto;
+  grid-template-columns: minmax(200px, 1fr) 140px minmax(200px, 1fr) minmax(200px, 1fr) auto;
 }
 
 .form-grid-2 {
@@ -1835,4 +1835,82 @@ button {
 .tm-match-term-source {
   font-weight: 500;
   color: #0b6b5b;
+}
+
+/* 译文术语高亮覆盖层 */
+.segment-row__target-wrapper {
+  position: relative;
+  min-height: 0;
+  height: 100%;
+}
+
+.segment-row__target-backdrop {
+  position: absolute;
+  inset: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(214, 226, 222, 0.9);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.96);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
+  font: inherit;
+  color: var(--ink-900);
+  overflow: hidden;
+  pointer-events: none;
+  box-sizing: border-box;
+}
+
+.segment-row__textarea--overlay {
+  position: relative;
+  background: transparent !important;
+  color: transparent !important;
+  caret-color: var(--ink-900);
+  line-height: 1.55;
+  font: inherit;
+  box-sizing: border-box;
+}
+
+.segment-row__textarea--overlay::selection {
+  background: rgba(13, 122, 104, 0.3);
+  color: transparent;
+}
+
+/* contenteditable 编辑器样式 */
+.segment-row__editor {
+  min-height: 0;
+  height: 100%;
+  padding: 10px 12px;
+  border: 1px solid rgba(214, 226, 222, 0.9);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.96);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
+  color: var(--ink-900);
+  overflow: auto;
+  scrollbar-gutter: stable;
+  outline: none;
+}
+
+.segment-row__editor:focus {
+  outline: 2px solid rgba(13, 122, 104, 0.15);
+  border-color: var(--brand-700);
+}
+
+.segment-row__editor.is-disabled {
+  background: rgba(245, 248, 247, 0.96);
+  color: var(--ink-500);
+  cursor: not-allowed;
+}
+
+/* 术语下划线高亮 */
+.term-underline {
+  text-decoration: underline;
+  text-decoration-color: #e6a23c;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 2px;
+  cursor: help;
 }

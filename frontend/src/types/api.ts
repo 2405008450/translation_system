@@ -145,6 +145,8 @@ export interface TermbaseCollection {
   id: string
   name: string
   description: string | null
+  source_language: string | null
+  target_language: string | null
   created_at: string
   updated_at: string
   entry_count: number
@@ -154,7 +156,7 @@ export interface Term {
   id: string
   source_text: string
   target_text: string
-  collection_id: string | null
+  term_base_id: string | null
   created_at: string
 }
 
@@ -174,4 +176,29 @@ export interface TermbaseImportSummary {
   imported_rows: number
   collection_id: string | null
   collection_name: string | null
+}
+
+export interface SegmentHistoryOperator {
+  id: string
+  username: string
+}
+
+export interface SegmentHistory {
+  id: string
+  segment_id: string
+  file_record_id: string
+  sentence_id: string
+  source_text: string
+  target_text: string
+  status: string
+  source: string
+  confirm_type: string | null
+  operator: SegmentHistoryOperator | null
+  created_at: string
+}
+
+export interface SegmentHistoryResponse {
+  sentence_id: string
+  source_text: string
+  history: SegmentHistory[]
 }

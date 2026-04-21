@@ -16,6 +16,30 @@ const collectionSubmitting = ref(false)
 const selectedCollectionId = ref('')
 const newCollectionName = ref('')
 const newCollectionDescription = ref('')
+const newCollectionSourceLang = ref('')
+const newCollectionTargetLang = ref('')
+
+const languageOptions = [
+  { code: '', label: '不指定' },
+  { code: 'zh-CN', label: '简体中文 (zh-CN)' },
+  { code: 'zh-TW', label: '繁体中文 (zh-TW)' },
+  { code: 'en-US', label: '美式英语 (en-US)' },
+  { code: 'en-GB', label: '英式英语 (en-GB)' },
+  { code: 'ja-JP', label: '日语 (ja-JP)' },
+  { code: 'ko-KR', label: '韩语 (ko-KR)' },
+  { code: 'fr-FR', label: '法语 (fr-FR)' },
+  { code: 'de-DE', label: '德语 (de-DE)' },
+  { code: 'es-ES', label: '西班牙语 (es-ES)' },
+  { code: 'pt-BR', label: '葡萄牙语-巴西 (pt-BR)' },
+  { code: 'pt-PT', label: '葡萄牙语-葡萄牙 (pt-PT)' },
+  { code: 'ru-RU', label: '俄语 (ru-RU)' },
+  { code: 'ar-SA', label: '阿拉伯语 (ar-SA)' },
+  { code: 'it-IT', label: '意大利语 (it-IT)' },
+  { code: 'nl-NL', label: '荷兰语 (nl-NL)' },
+  { code: 'pl-PL', label: '波兰语 (pl-PL)' },
+  { code: 'th-TH', label: '泰语 (th-TH)' },
+  { code: 'vi-VN', label: '越南语 (vi-VN)' },
+]
 
 function formatTime(value: string) {
   return new Date(value).toLocaleString('zh-CN', { hour12: false })
@@ -54,7 +78,7 @@ async function loadCollections() {
   }
 }
 
-async function createCollection(name: string, description = '') {
+async function createCollection(name: string, description = '', sourceLanguage = '', targetLanguage = '') {
   const cleanedName = name.trim()
   if (!cleanedName) {
     throw new Error('术语库名称不能为空。')
@@ -63,6 +87,8 @@ async function createCollection(name: string, description = '') {
   const { data } = await http.post<TermbaseCollection>('/termbase/collections', {
     name: cleanedName,
     description: description.trim() || null,
+    source_language: sourceLanguage.trim() || null,
+    target_language: targetLanguage.trim() || null,
   })
   await loadCollections()
   return data
@@ -72,10 +98,17 @@ async function createCollectionFromForm() {
   collectionMessage.value = ''
   collectionSubmitting.value = true
   try {
-    const collection = await createCollection(newCollectionName.value, newCollectionDescription.value)
+    const collection = await createCollection(
+      newCollectionName.value,
+      newCollectionDescription.value,
+      newCollectionSourceLang.value,
+      newCollectionTargetLang.value
+    )
     selectedCollectionId.value = collection.id
     newCollectionName.value = ''
     newCollectionDescription.value = ''
+    newCollectionSourceLang.value = ''
+    newCollectionTargetLang.value = ''
     collectionMessage.value = `已创建术语库：${collection.name}`
   } catch (error) {
     collectionMessage.value = getErrorMessage(error, '术语库创建失败。')
@@ -90,10 +123,17 @@ async function ensureImportCollection() {
   }
 
   const fallbackName = selectedFile.value ? fileBaseName(selectedFile.value) : ''
-  const collection = await createCollection(newCollectionName.value || fallbackName, newCollectionDescription.value)
+  const collection = await createCollection(
+    newCollectionName.value || fallbackName,
+    newCollectionDescription.value,
+    newCollectionSourceLang.value,
+    newCollectionTargetLang.value
+  )
   selectedCollectionId.value = collection.id
   newCollectionName.value = ''
   newCollectionDescription.value = ''
+  newCollectionSourceLang.value = ''
+  newCollectionTargetLang.value = ''
   return collection.id
 }
 
@@ -187,6 +227,24 @@ onMounted(() => {
           <input v-model="newCollectionDescription" class="field__control" type="text" placeholder="可选" />
         </label>
 
+        <label class="field">
+          <span class="field__label">源语言</span>
+          <select v-model="newCollectionSourceLang" class="field__control">
+            <option v-for="lang in languageOptions" :key="lang.code" :value="lang.code">
+              {{ lang.label }}
+            </option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span class="field__label">目标语言</span>
+          <select v-model="newCollectionTargetLang" class="field__control">
+            <option v-for="lang in languageOptions" :key="lang.code" :value="lang.code">
+              {{ lang.label }}
+            </option>
+          </select>
+        </label>
+
         <div class="field-actions">
           <button
             class="button button--primary"
@@ -205,6 +263,9 @@ onMounted(() => {
         <article v-for="collection in collections" :key="collection.id" class="collection-item">
           <div>
             <strong>{{ collection.name }}</strong>
+            <span v-if="collection.source_language || collection.target_language" style="color: var(--color-text-muted); font-size: 0.85em; margin-left: 0.5em;">
+              {{ collection.source_language || '?' }} → {{ collection.target_language || '?' }}
+            </span>
             <span>{{ collection.description || '无说明' }}</span>
             <small>术语：{{ collection.entry_count }} 条 · 创建：{{ formatTime(collection.created_at) }}</small>
           </div>
