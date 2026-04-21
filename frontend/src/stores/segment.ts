@@ -2,17 +2,21 @@ import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 
 import { http } from '../api/http'
+import { pushToast } from '../composables/useToast'
+import { translate } from '../i18n'
 import type {
   FileRecordDetail,
   FileRecordPreview,
   LLMProvider,
   LLMTranslateScope,
   Segment,
+  SegmentRevisionEntry,
   SegmentUpdatePayload,
 } from '../types/api'
 
 const SEGMENT_PAGE_SIZE = 1000
 const AUTO_SYNC_DELAY_MS = 1500
+const REVISION_HISTORY_STORAGE_PREFIX = 'tm-workbench-history:'
 
 function parseSSEChunk(chunk: string) {
   const eventMatch = chunk.match(/^event:\s*(.+)$/m)
@@ -38,99 +42,283 @@ export const useSegmentStore = defineStore('segment', () => {
   const previewSupported = ref(false)
   const activeSentenceId = ref<string | null>(null)
   const loading = ref(false)
+  const loadingMoreSegments = ref(false)
+  const loadingAllSegments = ref(false)
+  const previewLoading = ref(false)
   const saving = ref(false)
   const llmRunning = ref(false)
-  const syncMessage = ref('暂无未保存修改')
-  const llmMessage = ref('可按范围对 exact / fuzzy / none 句段执行 AI 修正。')
+  const syncMessage = ref(translate('stores.segment.syncIdle'))
+  const llmMessage = ref(translate('stores.segment.llmReady'))
+  const llmPlannedCount = ref(0)
+  const llmProcessedCount = ref(0)
+  const llmErrorCount = ref(0)
   const lastSyncedAt = ref<string | null>(null)
   const dirtyEntries = ref<Record<string, SegmentUpdatePayload>>({})
+  const manualRevisionBase = ref<Record<string, string>>({})
   const previewUpdateToken = ref(0)
   const lastPreviewUpdatedSentenceId = ref<string | null>(null)
   const lastPreviewUpdatedText = ref('')
+  const totalSegmentCount = ref(0)
+  const revisionHistory = ref<Record<string, SegmentRevisionEntry[]>>({})
 
+  const segmentIndexMap = new Map<string, number>()
   let syncTimer: number | null = null
+  let loadMorePromise: Promise<boolean> | null = null
+  let previewPromise: Promise<void> | null = null
+  let previewLoaded = false
+  let llmAbortController: AbortController | null = null
+  let llmReader: ReadableStreamDefaultReader<Uint8Array> | null = null
+  let llmAbortRequested = false
 
   const dirtyCount = computed(() => Object.keys(dirtyEntries.value).length)
+  const loadedSegmentCount = computed(() => segments.value.length)
+  const hasMoreSegments = computed(() => loadedSegmentCount.value < totalSegmentCount.value)
+  const allSegmentsLoaded = computed(() => (
+    totalSegmentCount.value === 0
+      ? !loading.value && loadedSegmentCount.value === 0
+      : loadedSegmentCount.value >= totalSegmentCount.value
+  ))
+  const llmProgressPercent = computed(() => {
+    if (llmPlannedCount.value <= 0) {
+      return 0
+    }
+    return Math.min(100, Math.round((llmProcessedCount.value / llmPlannedCount.value) * 100))
+  })
+
+  function loadRevisionHistory(fileRecordId: string) {
+    try {
+      const raw = window.localStorage.getItem(`${REVISION_HISTORY_STORAGE_PREFIX}${fileRecordId}`)
+      if (!raw) {
+        revisionHistory.value = {}
+        return
+      }
+
+      const parsed = JSON.parse(raw) as Record<string, SegmentRevisionEntry[]>
+      revisionHistory.value = parsed && typeof parsed === 'object' ? parsed : {}
+    } catch {
+      revisionHistory.value = {}
+    }
+  }
+
+  function persistRevisionHistory() {
+    if (!fileRecord.value) {
+      return
+    }
+    window.localStorage.setItem(
+      `${REVISION_HISTORY_STORAGE_PREFIX}${fileRecord.value.id}`,
+      JSON.stringify(revisionHistory.value),
+    )
+  }
+
+  function recordRevision(sentenceId: string, beforeText: string, afterText: string, source: string) {
+    if (beforeText === afterText) {
+      return
+    }
+
+    const entry: SegmentRevisionEntry = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      sentence_id: sentenceId,
+      source,
+      before_text: beforeText,
+      after_text: afterText,
+      created_at: new Date().toISOString(),
+    }
+
+    revisionHistory.value = {
+      ...revisionHistory.value,
+      [sentenceId]: [entry, ...(revisionHistory.value[sentenceId] || [])].slice(0, 20),
+    }
+    persistRevisionHistory()
+  }
+
+  function resetPreviewState() {
+    previewHtml.value = ''
+    previewSupported.value = false
+    previewLoading.value = false
+    previewPromise = null
+    previewLoaded = false
+  }
+
+  function resetSegments(nextSegments: Segment[] = []) {
+    segmentIndexMap.clear()
+    nextSegments.forEach((segment, index) => {
+      segmentIndexMap.set(segment.sentence_id, index)
+    })
+    segments.value = nextSegments
+  }
+
+  function appendSegments(nextSegments: Segment[]) {
+    if (!nextSegments.length) {
+      return
+    }
+
+    const startIndex = segments.value.length
+    segments.value = segments.value.concat(nextSegments)
+    nextSegments.forEach((segment, offset) => {
+      segmentIndexMap.set(segment.sentence_id, startIndex + offset)
+    })
+  }
+
+  async function fetchSegmentPage(fileRecordId: string, skip: number, limit: number) {
+    const { data } = await http.get<FileRecordDetail>(`/file-records/${fileRecordId}`, {
+      params: {
+        skip,
+        limit,
+      },
+    })
+    return data
+  }
 
   function resetState() {
     if (syncTimer !== null) {
       window.clearTimeout(syncTimer)
       syncTimer = null
     }
+
     fileRecord.value = null
-    segments.value = []
-    previewHtml.value = ''
-    previewSupported.value = false
+    resetSegments()
+    resetPreviewState()
+    totalSegmentCount.value = 0
     activeSentenceId.value = null
+    loading.value = false
+    loadingMoreSegments.value = false
+    loadingAllSegments.value = false
     saving.value = false
     llmRunning.value = false
-    syncMessage.value = '暂无未保存修改'
-    llmMessage.value = '可按范围对 exact / fuzzy / none 句段执行 AI 修正。'
+    syncMessage.value = translate('stores.segment.syncIdle')
+    llmMessage.value = translate('stores.segment.llmReady')
+    llmPlannedCount.value = 0
+    llmProcessedCount.value = 0
+    llmErrorCount.value = 0
     lastSyncedAt.value = null
     dirtyEntries.value = {}
+    manualRevisionBase.value = {}
     previewUpdateToken.value = 0
     lastPreviewUpdatedSentenceId.value = null
     lastPreviewUpdatedText.value = ''
+    revisionHistory.value = {}
+    loadMorePromise = null
+    llmAbortController = null
+    llmReader = null
+    llmAbortRequested = false
   }
 
   async function loadTask(fileRecordId: string) {
     resetState()
     loading.value = true
     try {
-      const [detail, preview] = await Promise.all([
-        fetchAllSegments(fileRecordId),
-        fetchPreview(fileRecordId),
-      ])
-      fileRecord.value = detail
-      segments.value = detail.segments
-      previewHtml.value = preview.preview_html
-      previewSupported.value = preview.supports_preview
+      const detail = await fetchSegmentPage(fileRecordId, 0, SEGMENT_PAGE_SIZE)
+      fileRecord.value = {
+        ...detail,
+        segments: [],
+      }
+      loadRevisionHistory(fileRecordId)
+      totalSegmentCount.value = detail.total_segments
+      resetSegments(detail.segments)
     } finally {
       loading.value = false
     }
   }
 
-  async function fetchAllSegments(fileRecordId: string) {
-    let skip = 0
-    let total = 0
-    let baseDetail: FileRecordDetail | null = null
-    const allSegments: Segment[] = []
-
-    do {
-      const { data } = await http.get<FileRecordDetail>(`/file-records/${fileRecordId}`, {
-        params: {
-          skip,
-          limit: SEGMENT_PAGE_SIZE,
-        },
-      })
-
-      if (!baseDetail) {
-        baseDetail = {
-          ...data,
-          segments: [],
-        }
-      }
-
-      total = data.total_segments
-      allSegments.push(...data.segments)
-      skip += data.segments.length
-    } while (skip < total)
-
-    if (!baseDetail) {
-      throw new Error('任务详情加载失败。')
+  async function loadMoreSegments() {
+    if (!fileRecord.value || !hasMoreSegments.value) {
+      return false
     }
 
-    return {
-      ...baseDetail,
-      segments: allSegments,
-      skip: 0,
-      limit: allSegments.length,
+    if (loadMorePromise) {
+      return loadMorePromise
+    }
+
+    loadingMoreSegments.value = true
+    loadMorePromise = (async () => {
+      const detail = await fetchSegmentPage(
+        fileRecord.value!.id,
+        segments.value.length,
+        SEGMENT_PAGE_SIZE,
+      )
+      totalSegmentCount.value = detail.total_segments
+      appendSegments(detail.segments)
+      return detail.segments.length > 0
+    })()
+
+    try {
+      return await loadMorePromise
+    } finally {
+      loadMorePromise = null
+      loadingMoreSegments.value = false
+    }
+  }
+
+  async function ensureAllSegmentsLoaded() {
+    if (!fileRecord.value || !hasMoreSegments.value) {
+      return
+    }
+
+    if (loadingAllSegments.value) {
+      while (loadingAllSegments.value) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 60))
+      }
+      return
+    }
+
+    loadingAllSegments.value = true
+    try {
+      while (hasMoreSegments.value) {
+        const loaded = await loadMoreSegments()
+        if (!loaded) {
+          break
+        }
+      }
+    } finally {
+      loadingAllSegments.value = false
     }
   }
 
   async function fetchPreview(fileRecordId: string) {
     const { data } = await http.get<FileRecordPreview>(`/file-records/${fileRecordId}/preview`)
     return data
+  }
+
+  async function ensurePreviewLoaded() {
+    if (!fileRecord.value || previewLoaded) {
+      return
+    }
+
+    if (previewPromise) {
+      return previewPromise
+    }
+
+    previewLoading.value = true
+    previewPromise = (async () => {
+      const preview = await fetchPreview(fileRecord.value!.id)
+      previewHtml.value = preview.preview_html
+      previewSupported.value = preview.supports_preview
+      previewLoaded = true
+    })()
+
+    try {
+      await previewPromise
+    } finally {
+      previewPromise = null
+      previewLoading.value = false
+    }
+  }
+
+  function getSegmentIndex(sentenceId: string) {
+    const index = segmentIndexMap.get(sentenceId)
+    return typeof index === 'number' ? index : -1
+  }
+
+  async function ensureSentenceLoaded(sentenceId: string) {
+    let index = getSegmentIndex(sentenceId)
+    while (index === -1 && hasMoreSegments.value) {
+      const loaded = await loadMoreSegments()
+      if (!loaded) {
+        break
+      }
+      index = getSegmentIndex(sentenceId)
+    }
+    return index
   }
 
   function markPreviewUpdate(sentenceId: string, targetText: string) {
@@ -140,12 +328,18 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   function updateTarget(sentenceId: string, targetText: string) {
-    const index = segments.value.findIndex((segment) => segment.sentence_id === sentenceId)
+    const index = getSegmentIndex(sentenceId)
     if (index === -1) {
       return
     }
 
     const segment = segments.value[index]
+    if (!(sentenceId in manualRevisionBase.value) && segment.target_text !== targetText) {
+      manualRevisionBase.value = {
+        ...manualRevisionBase.value,
+        [sentenceId]: segment.target_text,
+      }
+    }
     segments.value[index] = {
       ...segment,
       target_text: targetText,
@@ -162,7 +356,7 @@ export const useSegmentStore = defineStore('segment', () => {
         source: 'manual',
       },
     }
-    syncMessage.value = `待同步 ${dirtyCount.value} 条修改`
+    syncMessage.value = translate('stores.segment.syncPending', { count: dirtyCount.value })
     scheduleSync()
   }
 
@@ -191,25 +385,33 @@ export const useSegmentStore = defineStore('segment', () => {
 
     const updates = Object.values(dirtyEntries.value)
     saving.value = true
-    syncMessage.value = `正在同步 ${updates.length} 条修改...`
+    syncMessage.value = translate('stores.segment.syncing', { count: updates.length })
     try {
       await http.put(`/file-records/${fileRecord.value.id}/segments`, {
         updates,
       })
+      for (const update of updates) {
+        const beforeText = manualRevisionBase.value[update.sentence_id]
+        if (typeof beforeText === 'string') {
+          recordRevision(update.sentence_id, beforeText, update.target_text, update.source)
+        }
+      }
       dirtyEntries.value = {}
+      manualRevisionBase.value = {}
       lastSyncedAt.value = new Date().toLocaleString('zh-CN', { hour12: false })
-      syncMessage.value = `已同步，最近一次保存于 ${lastSyncedAt.value}`
+      syncMessage.value = translate('stores.segment.syncedAt', { time: lastSyncedAt.value })
     } finally {
       saving.value = false
     }
   }
 
   function applyLLMUpdate(sentenceId: string, targetText: string, source = 'llm', status = 'confirmed') {
-    const index = segments.value.findIndex((segment) => segment.sentence_id === sentenceId)
+    const index = getSegmentIndex(sentenceId)
     if (index === -1) {
       return
     }
 
+    recordRevision(sentenceId, segments.value[index].target_text, targetText, source)
     segments.value[index] = {
       ...segments.value[index],
       target_text: targetText,
@@ -237,10 +439,15 @@ export const useSegmentStore = defineStore('segment', () => {
     }
 
     llmRunning.value = true
-    llmMessage.value = '正在请求 AI 修正译文...'
+    llmAbortRequested = false
+    llmPlannedCount.value = 0
+    llmProcessedCount.value = 0
+    llmErrorCount.value = 0
+    llmMessage.value = translate('stores.segment.llmStarting')
 
     try {
       const token = window.localStorage.getItem('token')
+      llmAbortController = new AbortController()
       const response = await fetch(`/api/file-records/${fileRecord.value.id}/llm-translate`, {
         method: 'POST',
         headers: {
@@ -252,10 +459,11 @@ export const useSegmentStore = defineStore('segment', () => {
           scope,
           provider,
         }),
+        signal: llmAbortController.signal,
       })
 
       if (!response.ok) {
-        let message = 'AI 修正请求失败。'
+        let message = translate('stores.segment.llmRequestFailed')
         try {
           const payload = await response.json()
           message = String(payload.detail || message)
@@ -266,15 +474,15 @@ export const useSegmentStore = defineStore('segment', () => {
       }
 
       if (!response.body) {
-        throw new Error('AI 修正未返回流式结果。')
+        throw new Error(translate('stores.segment.llmNoStream'))
       }
 
-      const reader = response.body.getReader()
+      llmReader = response.body.getReader()
       const decoder = new TextDecoder('utf-8')
       let buffer = ''
 
       while (true) {
-        const { done, value } = await reader.read()
+        const { done, value } = await llmReader.read()
         if (done) {
           break
         }
@@ -288,17 +496,33 @@ export const useSegmentStore = defineStore('segment', () => {
           if (!event) {
             continue
           }
+          if (llmAbortRequested) {
+            continue
+          }
           handleLLMEvent(event.event, event.data)
         }
       }
 
-      if (buffer.trim()) {
+      if (!llmAbortRequested && buffer.trim()) {
         const event = parseSSEChunk(buffer)
         if (event) {
           handleLLMEvent(event.event, event.data)
         }
       }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        llmMessage.value = translate('stores.segment.llmStopped')
+        pushToast({
+          tone: 'info',
+          title: translate('stores.segment.llmStoppedToastTitle'),
+          message: translate('stores.segment.llmStoppedToastMessage'),
+        })
+        return
+      }
+      throw error
     } finally {
+      llmAbortController = null
+      llmReader = null
       llmRunning.value = false
     }
   }
@@ -306,31 +530,72 @@ export const useSegmentStore = defineStore('segment', () => {
   function handleLLMEvent(event: string, data: Record<string, unknown>) {
     if (event === 'start') {
       const total = Number(data.total || 0)
-      llmMessage.value = `AI 修正已开始，本次计划处理 ${total} 条句段。`
+      llmPlannedCount.value = total
+      llmProcessedCount.value = 0
+      llmErrorCount.value = 0
+      llmMessage.value = translate('stores.segment.llmStarted', { total })
       return
     }
 
     if (event === 'segment') {
+      llmProcessedCount.value += 1
       applyLLMUpdate(
         String(data.sentence_id || ''),
         String(data.target_text || ''),
         String(data.source || 'llm'),
         'confirmed',
       )
-      llmMessage.value = `AI 已写回句段 ${String(data.sentence_id || '')}`
+      llmMessage.value = translate('stores.segment.llmProgress', {
+        processed: llmProcessedCount.value,
+        planned: Math.max(llmPlannedCount.value, llmProcessedCount.value),
+      })
       return
     }
 
     if (event === 'error') {
-      llmMessage.value = `AI 修正出现错误：${String(data.message || '未知错误')}`
+      llmProcessedCount.value += 1
+      llmErrorCount.value += 1
+      llmMessage.value = translate('stores.segment.llmError', {
+        message: String(data.message || '未知错误'),
+      })
       return
     }
 
     if (event === 'complete') {
       const updatedCount = Number(data.updated_count || 0)
       const errorCount = Number(data.error_count || 0)
-      llmMessage.value = `AI 修正完成，成功 ${updatedCount} 条，失败 ${errorCount} 条。`
+      const total = Number(data.total || llmPlannedCount.value || updatedCount + errorCount)
+      llmPlannedCount.value = total
+      llmProcessedCount.value = Math.max(total, updatedCount + errorCount)
+      llmErrorCount.value = errorCount
+      llmMessage.value = translate('stores.segment.llmCompleted', {
+        updated: updatedCount,
+        error: errorCount,
+      })
+      pushToast({
+        tone: errorCount > 0 ? 'warn' : 'success',
+        title: translate('stores.segment.llmCompletedToastTitle'),
+        message: translate('stores.segment.llmCompletedToastMessage', {
+          updated: updatedCount,
+          error: errorCount,
+        }),
+      })
     }
+  }
+
+  async function abortLLM() {
+    if (!llmRunning.value) {
+      return
+    }
+
+    llmAbortRequested = true
+    llmAbortController?.abort()
+    try {
+      await llmReader?.cancel()
+    } catch {
+      // ignore cancel errors
+    }
+    llmMessage.value = translate('stores.segment.llmStopped')
   }
 
   async function downloadTranslatedDocx() {
@@ -362,19 +627,36 @@ export const useSegmentStore = defineStore('segment', () => {
     previewSupported,
     activeSentenceId,
     loading,
+    loadingMoreSegments,
+    loadingAllSegments,
+    previewLoading,
     saving,
     llmRunning,
     syncMessage,
     llmMessage,
+    llmPlannedCount,
+    llmProcessedCount,
+    llmErrorCount,
+    llmProgressPercent,
     dirtyCount,
+    loadedSegmentCount,
+    totalSegmentCount,
+    hasMoreSegments,
+    allSegmentsLoaded,
     previewUpdateToken,
     lastPreviewUpdatedSentenceId,
     lastPreviewUpdatedText,
+    revisionHistory,
     loadTask,
+    loadMoreSegments,
+    ensureAllSegmentsLoaded,
+    ensurePreviewLoaded,
+    ensureSentenceLoaded,
     updateTarget,
     setActiveSentence,
     syncToBackend,
     startLLMTranslation,
+    abortLLM,
     downloadTranslatedDocx,
     resetState,
   }

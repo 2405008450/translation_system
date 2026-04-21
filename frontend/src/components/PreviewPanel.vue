@@ -18,6 +18,7 @@ const props = withDefaults(defineProps<{
   supported: boolean
   title?: string
   closable?: boolean
+  loading?: boolean
   renderMode?: 'static' | 'target'
   segments?: PreviewSegment[]
   updatedSentenceId?: string | null
@@ -30,6 +31,7 @@ const props = withDefaults(defineProps<{
   syncSentenceId: null,
   title: '原文预览',
   closable: true,
+  loading: false,
   renderMode: 'static',
   segments: () => [],
   updatedSentenceId: null,
@@ -58,7 +60,7 @@ const pendingCommentSelection = ref<{
   draft: CommentAnchorDraft
 } | null>(null)
 const pageSummary = computed(() => {
-  if (!props.supported) {
+  if (!props.supported || props.loading) {
     return ''
   }
   return `分页感知：第 ${currentPage.value} / ${totalPages.value} 页`
@@ -414,7 +416,6 @@ function markProgrammaticScroll(durationMs = 220) {
   programmaticScrollTimer = window.setTimeout(() => {
     ignoreScrollEvents = false
     updatePagination()
-    notifyVisibleSentence()
   }, durationMs)
 }
 
@@ -680,6 +681,30 @@ watch(() => props.renderMode, () => {
   void runRenderCycle(true, false)
 })
 
+watch(() => props.loading, (loading) => {
+  if (!loading && props.supported) {
+    void runRenderCycle(true, false)
+  }
+})
+
+watch(() => props.segments, (segments, previousSegments) => {
+  if (
+    props.renderMode !== 'target'
+    || props.loading
+    || !props.supported
+    || segments === previousSegments
+  ) {
+    return
+  }
+
+  void nextTick(() => {
+    applyTargetSentenceTexts(false)
+    highlightActiveComment(false)
+    updatePagination()
+    notifyVisibleSentence()
+  })
+})
+
 watch(() => props.updateToken, (token, previousToken) => {
   if (props.renderMode !== 'target' || token === previousToken) {
     return
@@ -742,14 +767,15 @@ watch(() => props.syncSentenceId, (sentenceId) => {
           v-if="supported"
           ref="containerRef"
           class="preview-panel__body"
-          :aria-busy="isRendering"
+          :aria-busy="loading || isRendering"
           @click="handleClick"
           @scroll="handleScroll"
         />
+        <div v-else-if="loading" class="preview-panel__empty">预览准备中...</div>
         <div v-else class="preview-panel__empty">当前任务没有可展示的预览内容</div>
-        <div v-if="supported && isRendering" class="preview-panel__loading">
+        <div v-if="loading || (supported && isRendering)" class="preview-panel__loading">
           <span class="preview-panel__spinner" aria-hidden="true" />
-          <span>预览加载中...</span>
+          <span>{{ loading ? '预览加载中...' : '预览渲染中...' }}</span>
         </div>
         <FloatingCommentButton
           v-if="pendingCommentSelection"

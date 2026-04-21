@@ -7,13 +7,13 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user, require_admin
 from app.database import get_db
-from app.models import TMCollection, TranslationMemory, User
+from app.models import FileRecord, Segment, TMCollection, TranslationMemory, User
 from app.services.comment_service import (
     create_segment_comment,
     create_segment_comment_reply,
@@ -33,6 +33,7 @@ from app.services.document_workspace import (
     build_docx_workspace,
 )
 from app.services.file_record_service import (
+    attach_source_document_to_file_record,
     batch_update_segments,
     create_file_record_with_segments,
     delete_file_record,
@@ -52,6 +53,7 @@ from app.services.llm_service import (
     iter_batch_translate,
     validate_provider_choice,
 )
+from app.services.language_pairs import require_language_pair
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
 from app.services.slate_parser import parse_docx_for_slate
 from app.services.tm_importer import XLSX_EXTENSIONS, import_tm_from_xlsx_upload
@@ -79,6 +81,8 @@ class LLMTranslateRequest(BaseModel):
 class TMCollectionPayload(BaseModel):
     name: str
     description: str | None = None
+    source_language: str
+    target_language: str
 
 
 class CommentCreateRequest(BaseModel):
@@ -98,6 +102,22 @@ class CommentUpdateRequest(BaseModel):
 
 class CommentReplyRequest(BaseModel):
     body: str
+
+
+class ProjectCreatePayload(BaseModel):
+    name: str
+    source_language: str
+    target_language: str
+    deadline: str | None = None
+    access_level: Literal["team", "private", "public"] = "team"
+
+
+class ProjectUpdatePayload(BaseModel):
+    name: str | None = None
+    source_language: str | None = None
+    target_language: str | None = None
+    deadline: str | None = None
+    access_level: Literal["team", "private", "public"] | None = None
 
 
 def _build_docx_download_response(filename: str, docx_bytes: bytes) -> StreamingResponse:
@@ -173,6 +193,44 @@ def _normalize_collection_name(name: str) -> str:
     return " ".join(name.strip().split())
 
 
+def _require_tm_language_pair(
+    source_language: str | None,
+    target_language: str | None,
+) -> tuple[str, str]:
+    try:
+        return require_language_pair(source_language, target_language)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _resolve_collection_language_pair(
+    collection: TMCollection | None,
+    source_language: str | None,
+    target_language: str | None,
+) -> tuple[str, str]:
+    if collection and collection.source_language and collection.target_language:
+        if source_language or target_language:
+            normalized_source_language, normalized_target_language = _require_tm_language_pair(
+                source_language,
+                target_language,
+            )
+            if (
+                normalized_source_language != collection.source_language
+                or normalized_target_language != collection.target_language
+            ):
+                raise HTTPException(status_code=400, detail="所选记忆库的语言对与本次提交不一致。")
+        return collection.source_language, collection.target_language
+
+    normalized_source_language, normalized_target_language = _require_tm_language_pair(
+        source_language,
+        target_language,
+    )
+    if collection is not None:
+        collection.source_language = normalized_source_language
+        collection.target_language = normalized_target_language
+    return normalized_source_language, normalized_target_language
+
+
 def _validate_collection_ids(
     db: Session,
     collection_ids: list[UUID] | None,
@@ -194,6 +252,17 @@ def _validate_collection_ids(
     return normalized_ids
 
 
+def _require_selected_collection_ids(
+    collection_ids: list[UUID] | None,
+) -> list[UUID]:
+    if not collection_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="请至少选择一个 TM 记忆库，避免全库模糊匹配拖慢处理进程。",
+        )
+    return collection_ids
+
+
 def _get_collection_or_404(db: Session, collection_id: UUID | None) -> TMCollection | None:
     if collection_id is None:
         return None
@@ -204,10 +273,21 @@ def _get_collection_or_404(db: Session, collection_id: UUID | None) -> TMCollect
     return collection
 
 
-def _filter_tm_collection(query, collection_id: UUID | None):
+def _filter_tm_collection(
+    query,
+    collection_id: UUID | None,
+    source_language: str | None = None,
+    target_language: str | None = None,
+):
     if collection_id is None:
-        return query.filter(TranslationMemory.collection_id.is_(None))
-    return query.filter(TranslationMemory.collection_id == collection_id)
+        query = query.filter(TranslationMemory.collection_id.is_(None))
+    else:
+        query = query.filter(TranslationMemory.collection_id == collection_id)
+    if source_language:
+        query = query.filter(TranslationMemory.source_language == source_language)
+    if target_language:
+        query = query.filter(TranslationMemory.target_language == target_language)
+    return query
 
 
 def _serialize_tm_collection(collection: TMCollection, entry_count: int = 0) -> dict:
@@ -215,6 +295,8 @@ def _serialize_tm_collection(collection: TMCollection, entry_count: int = 0) -> 
         "id": collection.id,
         "name": collection.name,
         "description": collection.description,
+        "source_language": collection.source_language,
+        "target_language": collection.target_language,
         "created_at": collection.created_at.isoformat(),
         "updated_at": collection.updated_at.isoformat(),
         "entry_count": entry_count,
@@ -235,12 +317,13 @@ async def upload_for_slate(
         raise HTTPException(status_code=400, detail="文件为空。")
 
     selected_collection_ids = _validate_collection_ids(db, collection_ids)
+    required_collection_ids = _require_selected_collection_ids(selected_collection_ids)
     try:
         result = parse_docx_for_slate(
             db=db,
             raw_bytes=raw_bytes,
             similarity_threshold=threshold,
-            collection_ids=selected_collection_ids,
+            collection_ids=required_collection_ids,
         )
         return result
     except Exception as exc:
@@ -261,12 +344,13 @@ async def upload_for_workspace(
         raise HTTPException(status_code=400, detail="文件为空。")
 
     selected_collection_ids = _validate_collection_ids(db, collection_ids)
+    required_collection_ids = _require_selected_collection_ids(selected_collection_ids)
     try:
         return build_docx_workspace(
             db=db,
             raw_bytes=raw_bytes,
             similarity_threshold=threshold,
-            collection_ids=selected_collection_ids,
+            collection_ids=required_collection_ids,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -290,13 +374,14 @@ async def create_file_record(
         raise HTTPException(status_code=400, detail="文件为空。")
 
     selected_collection_ids = _validate_collection_ids(db, collection_ids)
+    required_collection_ids = _require_selected_collection_ids(selected_collection_ids)
     try:
         file_record = create_file_record_with_segments(
             db=db,
             raw_bytes=raw_bytes,
             filename=file.filename or "untitled.docx",
             similarity_threshold=threshold,
-            collection_ids=selected_collection_ids,
+            collection_ids=required_collection_ids,
         )
         return {
             "id": file_record.id,
@@ -307,6 +392,241 @@ async def create_file_record(
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/projects")
+def create_project(
+    payload: ProjectCreatePayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """仅填写基础信息创建项目，文档导入在项目详情页完成"""
+    from datetime import datetime as _dt
+
+    deadline_dt = None
+    if payload.deadline:
+        try:
+            deadline_dt = _dt.fromisoformat(payload.deadline)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="截止期限格式不正确，请使用 ISO 格式。")
+
+    project = FileRecord(
+        filename=payload.name.strip(),
+        status="draft",
+        source_language=payload.source_language,
+        target_language=payload.target_language,
+        creator_id=current_user.id,
+        deadline=deadline_dt,
+        access_level=payload.access_level,
+    )
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+
+    return {
+        "id": str(project.id),
+        "filename": project.filename,
+        "status": project.status,
+        "source_language": project.source_language,
+        "target_language": project.target_language,
+        "creator": current_user.username,
+        "deadline": project.deadline.isoformat() if project.deadline else None,
+        "access_level": project.access_level,
+        "created_at": project.created_at.isoformat(),
+    }
+
+
+def _build_project_detail_payload(
+    project: FileRecord,
+    total_segments: int,
+    translated_segments: int,
+) -> dict:
+    progress = round(translated_segments / total_segments * 100) if total_segments > 0 else 0
+    creator_name = project.creator.username if project.creator else None
+
+    return {
+        "id": str(project.id),
+        "filename": project.filename,
+        "status": project.status,
+        "progress": progress,
+        "total_segments": total_segments,
+        "translated_segments": translated_segments,
+        "source_language": project.source_language,
+        "target_language": project.target_language,
+        "creator": creator_name,
+        "deadline": project.deadline.isoformat() if project.deadline else None,
+        "access_level": project.access_level,
+        "created_at": project.created_at.isoformat(),
+        "updated_at": project.updated_at.isoformat(),
+        "has_source_document": load_file_record_source(project) is not None,
+    }
+
+
+@router.get("/projects/{project_id}")
+def get_project_detail(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+):
+    project = db.query(FileRecord).filter(FileRecord.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+
+    total_segments = (
+        db.query(func.count(Segment.id))
+        .filter(Segment.file_record_id == project_id)
+        .scalar()
+        or 0
+    )
+    translated_segments = (
+        db.query(func.count(Segment.id))
+        .filter(
+            Segment.file_record_id == project_id,
+            Segment.target_text != "",
+        )
+        .scalar()
+        or 0
+    )
+
+    return _build_project_detail_payload(project, total_segments, translated_segments)
+
+
+@router.post("/projects/{project_id}/source-document")
+def upload_project_source_document(
+    project_id: UUID,
+    file: UploadFile = File(...),
+    threshold: float = Form(default=0.6),
+    collection_ids: list[UUID] | None = Form(default=None),
+    db: Session = Depends(get_db),
+):
+    _validate_docx_upload(file)
+    project = get_file_record_model(db, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    if project.status != "draft":
+        raise HTTPException(status_code=400, detail="该项目已经上传过待翻译文档，请直接继续处理。")
+
+    existing_segments = (
+        db.query(Segment.id)
+        .filter(Segment.file_record_id == project_id)
+        .first()
+    )
+    if existing_segments or load_file_record_source(project) is not None:
+        raise HTTPException(status_code=400, detail="该项目已经存在源文档，请直接继续处理。")
+
+    raw_bytes = file.file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="文件为空。")
+
+    selected_collection_ids = _validate_collection_ids(db, collection_ids)
+    required_collection_ids = _require_selected_collection_ids(selected_collection_ids)
+
+    try:
+        project = attach_source_document_to_file_record(
+            db=db,
+            file_record=project,
+            raw_bytes=raw_bytes,
+            source_filename=file.filename or "source.docx",
+            similarity_threshold=threshold,
+            collection_ids=required_collection_ids,
+        )
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    total_segments = (
+        db.query(func.count(Segment.id))
+        .filter(Segment.file_record_id == project_id)
+        .scalar()
+        or 0
+    )
+
+    return {
+        "id": str(project.id),
+        "status": project.status,
+        "filename": project.filename,
+        "total_segments": total_segments,
+        "has_source_document": True,
+    }
+
+
+@router.get("/projects")
+def list_projects(
+    skip: int = 0,
+    limit: int = 50,
+    search: str = "",
+    db: Session = Depends(get_db),
+):
+    """获取项目列表（分页、搜索），含翻译进度统计"""
+    from sqlalchemy import case as sql_case
+    from sqlalchemy.orm import joinedload
+
+    base_query = db.query(FileRecord).options(joinedload(FileRecord.creator))
+    if search.strip():
+        base_query = base_query.filter(FileRecord.filename.ilike(f"%{search.strip()}%"))
+
+    total = base_query.count()
+    safe_skip = max(skip, 0)
+    safe_limit = min(max(limit, 1), 200)
+    file_records = (
+        base_query
+        .order_by(FileRecord.created_at.desc())
+        .offset(safe_skip)
+        .limit(safe_limit)
+        .all()
+    )
+
+    fr_ids = [fr.id for fr in file_records]
+    segment_stats: dict = {}
+    if fr_ids:
+        stats_rows = (
+            db.query(
+                Segment.file_record_id,
+                func.count(Segment.id).label("total"),
+                func.count(sql_case((Segment.target_text != "", 1))).label("filled"),
+            )
+            .filter(Segment.file_record_id.in_(fr_ids))
+            .group_by(Segment.file_record_id)
+            .all()
+        )
+        for row in stats_rows:
+            segment_stats[row.file_record_id] = {
+                "total": row.total,
+                "filled": row.filled,
+            }
+
+    items = []
+    for fr in file_records:
+        st = segment_stats.get(fr.id, {"total": 0, "filled": 0})
+        total_segs = st["total"]
+        filled_segs = st["filled"]
+        progress = round(filled_segs / total_segs * 100) if total_segs > 0 else 0
+
+        creator_name = None
+        if fr.creator:
+            creator_name = fr.creator.username
+
+        items.append({
+            "id": str(fr.id),
+            "filename": fr.filename,
+            "status": fr.status,
+            "progress": progress,
+            "total_segments": total_segs,
+            "translated_segments": filled_segs,
+            "source_language": fr.source_language,
+            "target_language": fr.target_language,
+            "creator": creator_name,
+            "deadline": fr.deadline.isoformat() if fr.deadline else None,
+            "access_level": fr.access_level,
+            "created_at": fr.created_at.isoformat(),
+            "updated_at": fr.updated_at.isoformat(),
+        })
+
+    return {
+        "items": items,
+        "total": total,
+        "skip": safe_skip,
+        "limit": safe_limit,
+    }
 
 
 @router.get("/file-records")
@@ -323,6 +643,8 @@ def get_file_records(
             "id": file_record.id,
             "filename": file_record.filename,
             "status": file_record.status,
+            "source_language": file_record.source_language,
+            "target_language": file_record.target_language,
             "created_at": file_record.created_at.isoformat(),
             "updated_at": file_record.updated_at.isoformat(),
         }
@@ -357,6 +679,8 @@ def get_file_record(
         "id": file_record.id,
         "filename": file_record.filename,
         "status": file_record.status,
+        "source_language": file_record.source_language,
+        "target_language": file_record.target_language,
         "created_at": file_record.created_at.isoformat(),
         "updated_at": file_record.updated_at.isoformat(),
         "total_segments": result["total_segments"],
@@ -723,14 +1047,37 @@ class TMEntry(BaseModel):
     source_text: str
     target_text: str
     collection_id: UUID | None = None
+    source_language: str | None = None
+    target_language: str | None = None
 
 
 class BatchTMEntry(BaseModel):
     collection_id: UUID | None = None
+    source_language: str | None = None
+    target_language: str | None = None
     entries: list[TMEntry]
 
 
-@router.get("/tm/collections")
+class TMEntryUpdatePayload(BaseModel):
+    source_text: str
+    target_text: str
+
+
+def _serialize_tm_entry(entry: TranslationMemory) -> dict:
+    return {
+        "id": entry.id,
+        "collection_id": entry.collection_id,
+        "source_text": entry.source_text,
+        "target_text": entry.target_text,
+        "source_language": entry.source_language,
+        "target_language": entry.target_language,
+        "created_at": entry.created_at.isoformat(),
+        "updated_at": entry.updated_at.isoformat(),
+    }
+
+
+@router.get("/translation-memory/collections")
+@router.get("/tm/collections", include_in_schema=False)
 def list_tm_collections(
     db: Session = Depends(get_db),
 ):
@@ -747,19 +1094,44 @@ def list_tm_collections(
     ]
 
 
-@router.post("/tm/collections")
+@router.get("/translation-memory/collections/{collection_id}")
+@router.get("/tm/collections/{collection_id}", include_in_schema=False)
+def get_tm_collection(
+    collection_id: UUID,
+    db: Session = Depends(get_db),
+):
+    collection = _get_collection_or_404(db, collection_id)
+    if collection is None:
+        raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
+
+    entry_count = (
+        db.query(TranslationMemory)
+        .filter(TranslationMemory.collection_id == collection.id)
+        .count()
+    )
+    return _serialize_tm_collection(collection, entry_count)
+
+
+@router.post("/translation-memory/collections")
+@router.post("/tm/collections", include_in_schema=False)
 def create_tm_collection(
     payload: TMCollectionPayload,
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
     name = _normalize_collection_name(payload.name)
+    source_language, target_language = _require_tm_language_pair(
+        payload.source_language,
+        payload.target_language,
+    )
     if not name:
         raise HTTPException(status_code=400, detail="记忆库名称不能为空。")
 
     collection = TMCollection(
         name=name,
         description=normalize_text(payload.description or "") or None,
+        source_language=source_language,
+        target_language=target_language,
     )
     db.add(collection)
     try:
@@ -772,7 +1144,8 @@ def create_tm_collection(
     return _serialize_tm_collection(collection)
 
 
-@router.put("/tm/collections/{collection_id}")
+@router.put("/translation-memory/collections/{collection_id}")
+@router.put("/tm/collections/{collection_id}", include_in_schema=False)
 def update_tm_collection(
     collection_id: UUID,
     payload: TMCollectionPayload,
@@ -784,11 +1157,28 @@ def update_tm_collection(
         raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
 
     name = _normalize_collection_name(payload.name)
+    source_language, target_language = _require_tm_language_pair(
+        payload.source_language,
+        payload.target_language,
+    )
     if not name:
         raise HTTPException(status_code=400, detail="记忆库名称不能为空。")
 
     collection.name = name
     collection.description = normalize_text(payload.description or "") or None
+    collection.source_language = source_language
+    collection.target_language = target_language
+    (
+        db.query(TranslationMemory)
+        .filter(TranslationMemory.collection_id == collection.id)
+        .update(
+            {
+                TranslationMemory.source_language: source_language,
+                TranslationMemory.target_language: target_language,
+            },
+            synchronize_session=False,
+        )
+    )
     try:
         db.commit()
     except IntegrityError as exc:
@@ -804,7 +1194,8 @@ def update_tm_collection(
     return _serialize_tm_collection(collection, entry_count)
 
 
-@router.delete("/tm/collections/{collection_id}")
+@router.delete("/translation-memory/collections/{collection_id}")
+@router.delete("/tm/collections/{collection_id}", include_in_schema=False)
 def delete_tm_collection(
     collection_id: UUID,
     db: Session = Depends(get_db),
@@ -827,10 +1218,13 @@ def delete_tm_collection(
     return {"message": "记忆库已删除。"}
 
 
-@router.post("/tm/import-xlsx")
+@router.post("/translation-memory/import-xlsx")
+@router.post("/tm/import-xlsx", include_in_schema=False)
 async def import_tm_xlsx(
     file: UploadFile = File(...),
     collection_id: UUID | None = Form(default=None),
+    source_language: str = Form(...),
+    target_language: str = Form(...),
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
@@ -843,12 +1237,19 @@ async def import_tm_xlsx(
         raise HTTPException(status_code=400, detail="上传的 XLSX 文件为空。")
 
     collection = _get_collection_or_404(db, collection_id)
+    resolved_source_language, resolved_target_language = _resolve_collection_language_pair(
+        collection,
+        source_language,
+        target_language,
+    )
     try:
         import_summary = import_tm_from_xlsx_upload(
             db=db,
             raw_bytes=raw_bytes,
             filename=file.filename or "uploaded.xlsx",
             collection_id=collection_id,
+            source_language=resolved_source_language,
+            target_language=resolved_target_language,
         )
     except Exception as exc:
         db.rollback()
@@ -863,10 +1264,58 @@ async def import_tm_xlsx(
         "imported_rows": import_summary.imported_rows,
         "collection_id": collection.id if collection else None,
         "collection_name": collection.name if collection else None,
+        "source_language": resolved_source_language,
+        "target_language": resolved_target_language,
     }
 
 
-@router.post("/tm/add")
+@router.get("/translation-memory/collections/{collection_id}/entries")
+@router.get("/tm/collections/{collection_id}/entries", include_in_schema=False)
+def list_tm_collection_entries(
+    collection_id: UUID,
+    skip: int = 0,
+    limit: int = 50,
+    search: str | None = None,
+    db: Session = Depends(get_db),
+):
+    collection = _get_collection_or_404(db, collection_id)
+    if collection is None:
+        raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
+
+    safe_skip = max(skip, 0)
+    safe_limit = min(max(limit, 1), 200)
+    query = (
+        db.query(TranslationMemory)
+        .filter(TranslationMemory.collection_id == collection.id)
+    )
+    normalized_search = normalize_text(search or "")
+    if normalized_search:
+        like_pattern = f"%{normalized_search}%"
+        query = query.filter(
+            or_(
+                TranslationMemory.source_text.ilike(like_pattern),
+                TranslationMemory.target_text.ilike(like_pattern),
+            )
+        )
+
+    total = query.count()
+    rows = (
+        query
+        .order_by(TranslationMemory.updated_at.desc(), TranslationMemory.created_at.desc())
+        .offset(safe_skip)
+        .limit(safe_limit)
+        .all()
+    )
+    return {
+        "items": [_serialize_tm_entry(row) for row in rows],
+        "total": total,
+        "skip": safe_skip,
+        "limit": safe_limit,
+    }
+
+
+@router.post("/translation-memory/entries")
+@router.post("/tm/add", include_in_schema=False)
 def add_tm_entry(
     entry: TMEntry,
     db: Session = Depends(get_db),
@@ -878,14 +1327,24 @@ def add_tm_entry(
     if not source_text or not target_text:
         raise HTTPException(status_code=400, detail="原文和译文不能为空。")
 
-    _get_collection_or_404(db, entry.collection_id)
+    collection = _get_collection_or_404(db, entry.collection_id)
+    source_language, target_language = _resolve_collection_language_pair(
+        collection,
+        entry.source_language,
+        entry.target_language,
+    )
     source_hash = build_source_hash(source_text)
 
     # 检查是否已存在
     existing_query = db.query(TranslationMemory).filter(
         TranslationMemory.source_hash == source_hash
     )
-    existing = _filter_tm_collection(existing_query, entry.collection_id).first()
+    existing = _filter_tm_collection(
+        existing_query,
+        entry.collection_id,
+        source_language=source_language,
+        target_language=target_language,
+    ).first()
 
     if existing:
         # 已存在，更新译文
@@ -893,6 +1352,8 @@ def add_tm_entry(
         existing.target_text = target_text
         existing.source_hash = source_hash
         existing.source_normalized = normalize_match_text(source_text) or source_text
+        existing.source_language = source_language
+        existing.target_language = target_language
         db.commit()
         sync_tm_embeddings(db, [(existing.id, existing.source_text)])
         return {"status": "updated", "id": existing.id, "message": "已更新现有记录。"}
@@ -904,6 +1365,8 @@ def add_tm_entry(
         target_text=target_text,
         source_hash=source_hash,
         source_normalized=normalize_match_text(source_text) or source_text,
+        source_language=source_language,
+        target_language=target_language,
     )
     db.add(tm)
     db.commit()
@@ -913,7 +1376,60 @@ def add_tm_entry(
     return {"status": "created", "id": tm.id, "message": "已添加新记录。"}
 
 
-@router.post("/tm/batch-add")
+@router.put("/translation-memory/entries/{entry_id}")
+@router.put("/tm/entries/{entry_id}", include_in_schema=False)
+def update_tm_entry(
+    entry_id: UUID,
+    payload: TMEntryUpdatePayload,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    entry = db.query(TranslationMemory).filter(TranslationMemory.id == entry_id).first()
+    if entry is None:
+        raise HTTPException(status_code=404, detail="TM 条目不存在。")
+
+    source_text = normalize_text(payload.source_text)
+    target_text = normalize_text(payload.target_text)
+    if not source_text or not target_text:
+        raise HTTPException(status_code=400, detail="原文和译文不能为空。")
+
+    collection = _get_collection_or_404(db, entry.collection_id)
+    source_language = collection.source_language if collection else entry.source_language
+    target_language = collection.target_language if collection else entry.target_language
+    if not source_language or not target_language:
+        raise HTTPException(status_code=400, detail="当前 TM 条目缺少语言对，请先更新记忆库信息。")
+
+    source_hash = build_source_hash(source_text)
+    duplicate_query = db.query(TranslationMemory).filter(
+        TranslationMemory.id != entry.id,
+        or_(
+            TranslationMemory.source_hash == source_hash,
+            TranslationMemory.source_text == source_text,
+        ),
+    )
+    duplicate = _filter_tm_collection(
+        duplicate_query,
+        entry.collection_id,
+        source_language=source_language,
+        target_language=target_language,
+    ).first()
+    if duplicate is not None:
+        raise HTTPException(status_code=409, detail="当前记忆库中已存在相同原文的 TM 条目。")
+
+    entry.source_text = source_text
+    entry.target_text = target_text
+    entry.source_hash = source_hash
+    entry.source_normalized = normalize_match_text(source_text) or source_text
+    entry.source_language = source_language
+    entry.target_language = target_language
+    db.commit()
+    db.refresh(entry)
+    sync_tm_embeddings(db, [(entry.id, entry.source_text)])
+    return _serialize_tm_entry(entry)
+
+
+@router.post("/translation-memory/entries/batch")
+@router.post("/tm/batch-add", include_in_schema=False)
 def batch_add_tm_entries(
     batch: BatchTMEntry,
     db: Session = Depends(get_db),
@@ -943,11 +1459,22 @@ def batch_add_tm_entries(
             continue
 
         source_hash = build_source_hash(source_text)
+        collection = _get_collection_or_404(db, collection_id)
+        source_language, target_language = _resolve_collection_language_pair(
+            collection,
+            entry.source_language or batch.source_language,
+            entry.target_language or batch.target_language,
+        )
 
         existing_query = db.query(TranslationMemory).filter(
             TranslationMemory.source_hash == source_hash
         )
-        existing = _filter_tm_collection(existing_query, collection_id).first()
+        existing = _filter_tm_collection(
+            existing_query,
+            collection_id,
+            source_language=source_language,
+            target_language=target_language,
+        ).first()
 
         if existing:
             existing.source_text = source_text
@@ -955,6 +1482,8 @@ def batch_add_tm_entries(
             existing.source_hash = source_hash
             existing.source_normalized = normalize_match_text(source_text) or source_text
             existing.collection_id = collection_id
+            existing.source_language = source_language
+            existing.target_language = target_language
             sync_candidates.append(existing)
             updated_count += 1
         else:
@@ -964,6 +1493,8 @@ def batch_add_tm_entries(
                 target_text=target_text,
                 source_hash=source_hash,
                 source_normalized=normalize_match_text(source_text) or source_text,
+                source_language=source_language,
+                target_language=target_language,
             )
             db.add(tm)
             sync_candidates.append(tm)

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
@@ -420,7 +420,7 @@ def _find_fuzzy_matches_chunk(
                 tm.source_text,
                 tm.target_text,
                 similarity(tm.source_normalized, input.query_text) AS trigram_score
-            FROM translation_memory AS tm
+FROM memory_entries AS tm
             WHERE tm.source_normalized IS NOT NULL
               AND tm.source_normalized % input.query_text
               {collection_filter_sql}
@@ -570,7 +570,7 @@ def _merge_vector_candidates(
                 tm.source_text,
                 tm.target_text,
                 1 - (tm.source_embedding <=> input.query_vector) AS vector_score
-            FROM translation_memory AS tm
+FROM memory_entries AS tm
             WHERE tm.source_embedding IS NOT NULL
               AND tm.source_embedding_version = :embedding_version
               AND 1 - (tm.source_embedding <=> input.query_vector) >= :vector_similarity_floor
@@ -711,3 +711,4 @@ def _apply_collection_filter(stmt, collection_ids: list[UUID] | None):
 
 def _chunked(items: list[T], chunk_size: int) -> list[list[T]]:
     return [items[index : index + chunk_size] for index in range(0, len(items), chunk_size)]
+

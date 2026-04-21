@@ -21,6 +21,8 @@ except ModuleNotFoundError:  # pragma: no cover - 允许在未安装 redis 的�
 
 
 logger = logging.getLogger(__name__)
+REDIS_CONNECT_TIMEOUT_SECONDS = 0.3
+REDIS_OPERATION_TIMEOUT_SECONDS = 0.5
 
 
 @dataclass
@@ -57,7 +59,14 @@ class _InMemoryJsonCache:
 
 class _RedisJsonCache:
     def __init__(self, redis_url: str) -> None:
-        self._client = Redis.from_url(redis_url, decode_responses=True)
+        self._client = Redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
+            socket_timeout=REDIS_OPERATION_TIMEOUT_SECONDS,
+            retry_on_timeout=False,
+        )
+        self._client.ping()
 
     def get_json(self, key: str) -> Any | None:
         try:
@@ -94,8 +103,13 @@ class _RedisJsonCache:
 def _get_cache_backend() -> _InMemoryJsonCache | _RedisJsonCache:
     settings = get_settings()
     if settings.redis_url and Redis is not None:
-        logger.info("json cache backend initialized with redis")
-        return _RedisJsonCache(settings.redis_url)
+        try:
+            backend = _RedisJsonCache(settings.redis_url)
+            logger.info("json cache backend initialized with redis")
+            return backend
+        except (RedisError, OSError) as exc:
+            logger.warning("redis cache unavailable, fallback to memory cache: %s", exc)
+            return _InMemoryJsonCache()
 
     if settings.redis_url and Redis is None:
         logger.warning("redis_url is configured but redis dependency is unavailable, fallback to memory cache")

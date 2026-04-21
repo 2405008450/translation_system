@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 
+import { getSegmentSourceMeta, getSegmentStatusMeta } from '../constants/status'
 import type { Segment } from '../types/api'
 
 const props = defineProps<{
@@ -17,18 +18,23 @@ const emit = defineEmits<{
 
 const statusClass = computed(() => `segment-row--${props.segment.status || 'none'}`)
 const sourceClass = computed(() => `segment-row__tag--source-${props.segment.source || 'none'}`)
+const statusMeta = computed(() => getSegmentStatusMeta(props.segment.status))
+const sourceMeta = computed(() => getSegmentSourceMeta(props.segment.source))
 </script>
 
 <template>
   <article
     class="segment-row"
     :class="[statusClass, { 'is-active': active }]"
+    :id="`segment-${segment.sentence_id}`"
     :data-sentence-id="segment.sentence_id"
+    role="group"
+    :aria-label="`句段 ${index + 1}`"
   >
     <div class="segment-row__head">
       <span class="segment-row__index">#{{ index + 1 }}</span>
-      <span class="segment-row__tag segment-row__tag--status">{{ segment.status }}</span>
-      <span class="segment-row__tag is-muted" :class="sourceClass">{{ segment.source }}</span>
+      <span class="segment-row__tag segment-row__tag--status">{{ statusMeta.label }}</span>
+      <span class="segment-row__tag is-muted" :class="sourceClass">{{ sourceMeta.label }}</span>
       <span v-if="segment.score" class="segment-row__tag is-muted">
         {{ segment.score.toFixed(2) }}
       </span>
@@ -48,6 +54,7 @@ const sourceClass = computed(() => `segment-row__tag--source-${props.segment.sou
           :disabled="disabled"
           data-segment-target="true"
           :data-sentence-id="segment.sentence_id"
+          :aria-label="`句段 ${index + 1} 的译文`"
           spellcheck="false"
           @focus="emit('focus', segment.sentence_id)"
           @input="emit('update', segment.sentence_id, ($event.target as HTMLTextAreaElement).value)"

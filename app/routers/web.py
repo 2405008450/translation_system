@@ -491,6 +491,8 @@ async def import_xlsx(
             db=db,
             raw_bytes=raw_bytes,
             filename=xlsx_file.filename or "uploaded.xlsx",
+            source_language="zh-CN",
+            target_language="en-US",
         )
     except Exception as exc:
         db.rollback()

@@ -29,6 +29,19 @@ class FileRecord(Base):
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     file_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft")
+    source_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    target_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    creator_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    deadline: Mapped[DateTime | None] = mapped_column(
+        DateTime(timezone=False), nullable=True
+    )
+    access_level: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="team", server_default=text("'team'")
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -39,6 +52,9 @@ class FileRecord(Base):
         nullable=False,
     )
 
+    creator: Mapped["User | None"] = relationship(
+        "User", foreign_keys=[creator_id]
+    )
     segments: Mapped[list["Segment"]] = relationship(
         "Segment",
         back_populates="file_record",
@@ -181,9 +197,10 @@ class SegmentComment(Base):
 
 
 class TMCollection(Base):
-    __tablename__ = "tm_collections"
+    __tablename__ = "memory_bases"
     __table_args__ = (
-        Index("uq_tm_collections_name", "name", unique=True),
+        Index("uq_memory_bases_name", "name", unique=True),
+        Index("ix_memory_bases_language_pair", "source_language", "target_language"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -194,6 +211,8 @@ class TMCollection(Base):
     )
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    target_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -211,26 +230,33 @@ class TMCollection(Base):
 
 
 class TranslationMemory(Base):
-    __tablename__ = "translation_memory"
+    __tablename__ = "memory_entries"
     __table_args__ = (
-        Index("ix_translation_memory_collection_id", "collection_id"),
-        Index("ix_translation_memory_collection_source_hash", "collection_id", "source_hash"),
+        Index("ix_memory_entries_collection_id", "collection_id"),
+        Index("ix_memory_entries_collection_source_hash", "collection_id", "source_hash"),
         Index(
-            "ix_translation_memory_collection_source_normalized",
+            "ix_memory_entries_collection_source_normalized",
             "collection_id",
             "source_normalized",
         ),
-        Index("ix_translation_memory_source_hash", "source_hash"),
-        Index("ix_translation_memory_source_text", "source_text"),
-        Index("ix_translation_memory_source_normalized", "source_normalized"),
+        Index("ix_memory_entries_source_hash", "source_hash"),
+        Index("ix_memory_entries_source_text", "source_text"),
+        Index("ix_memory_entries_source_normalized", "source_normalized"),
+        Index("ix_memory_entries_language_pair", "source_language", "target_language"),
         Index(
-            "ix_translation_memory_source_text_trgm",
+            "ix_memory_entries_collection_language_pair",
+            "collection_id",
+            "source_language",
+            "target_language",
+        ),
+        Index(
+            "ix_memory_entries_source_text_trgm",
             "source_text",
             postgresql_using="gin",
             postgresql_ops={"source_text": "gin_trgm_ops"},
         ),
         Index(
-            "ix_translation_memory_source_normalized_trgm",
+            "ix_memory_entries_source_normalized_trgm",
             "source_normalized",
             postgresql_using="gin",
             postgresql_ops={"source_normalized": "gin_trgm_ops"},
@@ -245,13 +271,15 @@ class TranslationMemory(Base):
     )
     collection_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("tm_collections.id", ondelete="SET NULL"),
+        ForeignKey("memory_bases.id", ondelete="SET NULL"),
         nullable=True,
     )
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
     target_text: Mapped[str] = mapped_column(Text, nullable=False)
     source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     source_normalized: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    target_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -266,3 +294,84 @@ class TranslationMemory(Base):
         "TMCollection",
         back_populates="translation_memories",
     )
+
+
+class TermBase(Base):
+    __tablename__ = "term_bases"
+    __table_args__ = (
+        Index("uq_term_bases_name", "name", unique=True),
+        Index("ix_term_bases_language_pair", "source_language", "target_language"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    target_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    term_entries: Mapped[list["TermEntry"]] = relationship(
+        "TermEntry",
+        back_populates="term_base",
+        cascade="all, delete-orphan",
+    )
+
+
+class TermEntry(Base):
+    __tablename__ = "term_entries"
+    __table_args__ = (
+        Index("ix_term_entries_term_base_id", "term_base_id"),
+        Index("ix_term_entries_term_base_source_text", "term_base_id", "source_text"),
+        Index(
+            "ix_term_entries_term_base_source_normalized",
+            "term_base_id",
+            "source_normalized",
+        ),
+        Index("ix_term_entries_language_pair", "source_language", "target_language"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    term_base_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("term_bases.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_text: Mapped[str] = mapped_column(Text, nullable=False)
+    target_text: Mapped[str] = mapped_column(Text, nullable=False)
+    source_normalized: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    target_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    term_base: Mapped[TermBase] = relationship(
+        "TermBase",
+        back_populates="term_entries",
+    )
+
+

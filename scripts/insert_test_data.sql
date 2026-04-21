@@ -1,8 +1,8 @@
--- 向 translation_memory 表插入测试数据
+﻿-- 向 translation_memory_entries 表插入测试数据
 -- source_text: 源语言（中文）
 -- target_text: 目标语言（英文）
 
-INSERT INTO translation_memory (source_text, target_text, source_hash, source_normalized, created_at, updated_at) VALUES
+INSERT INTO memory_entries (source_text, target_text, source_hash, source_normalized, created_at, updated_at) VALUES
 -- 技术文档类
 ('软件架构遵循微服务模式', 'The software architecture follows a microservices pattern', 'a1b2c3d4', 'software architecture follows microservices pattern', NOW(), NOW()),
 ('数据库连接池提高性能', 'Database connection pooling improves performance', 'e5f6g7h8', 'database connection pooling improves performance', NOW(), NOW()),
@@ -95,4 +95,5 @@ INSERT INTO translation_memory (source_text, target_text, source_hash, source_no
 ('戏剧作品获得评论界好评', 'The theater production received critical acclaim', 'w7x8y9z0', 'theater production received critical acclaim', NOW(), NOW());
 
 -- 验证插入结果
-SELECT COUNT(*) as total_records FROM translation_memory;
+SELECT COUNT(*) as total_records FROM memory_entries;
+

@@ -2,6 +2,7 @@ import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 
 import { http } from '../api/http'
+import { translate } from '../i18n'
 import type {
   CommentAnchorDraft,
   CommentCreatePayload,
@@ -10,7 +11,7 @@ import type {
   SegmentComment,
 } from '../types/api'
 
-const DEFAULT_MESSAGE = '在预览中选中文字后即可添加批注。'
+const DEFAULT_MESSAGE = translate('stores.comment.defaultMessage')
 const COMMENT_POLL_INTERVAL_MS = 8000
 
 function sortComments(comments: SegmentComment[]) {
@@ -90,8 +91,8 @@ export const useCommentStore = defineStore('comment', () => {
       if (!silent || hasChanged) {
         if (data.length > 0) {
           message.value = silent
-            ? `批注已自动刷新，共 ${totalCount.value} 条。`
-            : `已加载 ${totalCount.value} 条批注。`
+            ? translate('stores.comment.autoRefreshed', { count: totalCount.value })
+            : translate('stores.comment.loaded', { count: totalCount.value })
         } else {
           message.value = DEFAULT_MESSAGE
         }
@@ -100,7 +101,7 @@ export const useCommentStore = defineStore('comment', () => {
       if (!silent) {
         throw error
       }
-      message.value = error instanceof Error ? error.message : '批注自动刷新失败。'
+      message.value = error instanceof Error ? error.message : translate('stores.comment.refreshFailed')
     }
   }
 
@@ -129,7 +130,7 @@ export const useCommentStore = defineStore('comment', () => {
   function setDraftAnchor(anchor: CommentAnchorDraft | null) {
     draftAnchor.value = anchor
     if (anchor) {
-      message.value = '已定位到选区，输入内容后即可保存。'
+      message.value = translate('stores.comment.draftReady')
     } else if (!comments.value.length) {
       message.value = DEFAULT_MESSAGE
     }
@@ -165,7 +166,7 @@ export const useCommentStore = defineStore('comment', () => {
       upsertComment(data)
       activeCommentId.value = data.id
       draftAnchor.value = null
-      message.value = '批注已保存。'
+      message.value = translate('stores.comment.saved')
       return data
     } finally {
       saving.value = false
@@ -178,7 +179,7 @@ export const useCommentStore = defineStore('comment', () => {
       const { data } = await http.post<SegmentComment>(`/comments/${commentId}/replies`, payload)
       upsertComment(data)
       activeCommentId.value = data.id
-      message.value = '回复已保存。'
+      message.value = translate('stores.comment.replySaved')
       return data
     } finally {
       saving.value = false
@@ -191,7 +192,9 @@ export const useCommentStore = defineStore('comment', () => {
       const { data } = await http.patch<SegmentComment>(`/comments/${commentId}`, payload)
       upsertComment(data)
       activeCommentId.value = data.id
-      message.value = data.status === 'resolved' ? '批注已标记为已解决。' : '批注已更新。'
+      message.value = data.status === 'resolved'
+        ? translate('stores.comment.resolved')
+        : translate('stores.comment.updated')
       return data
     } finally {
       saving.value = false
@@ -208,7 +211,7 @@ export const useCommentStore = defineStore('comment', () => {
         activeCommentId.value = null
       }
       syncSignature()
-      message.value = '批注已删除。'
+      message.value = translate('stores.comment.deleted')
     } finally {
       saving.value = false
     }

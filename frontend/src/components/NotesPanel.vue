@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 
 import type {
   CommentAnchorDraft,
@@ -43,6 +44,7 @@ const editingCommentId = ref<string | null>(null)
 const editingBody = ref('')
 const replyingToCommentId = ref<string | null>(null)
 const replyBody = ref('')
+const { t } = useI18n()
 
 const threads = computed<CommentThread[]>(() => {
   const repliesByParentId = new Map<string, SegmentComment[]>()
@@ -66,14 +68,18 @@ const threads = computed<CommentThread[]>(() => {
     }))
 })
 
+const pendingThreadsCount = computed(() => (
+  threads.value.filter((thread) => thread.root.status === 'open').length
+))
+
 const draftSummary = computed(() => {
   if (!props.draftAnchor) {
     return ''
   }
   if (props.draftAnchor.anchor_mode === 'range' && props.draftAnchor.anchor_text) {
-    return `选中内容：${props.draftAnchor.anchor_text}`
+    return t('notes.selectedContent', { text: props.draftAnchor.anchor_text })
   }
-  return `句段：${props.draftAnchor.sentence_id}`
+  return t('notes.sentence', { id: props.draftAnchor.sentence_id })
 })
 
 function isOwnComment(comment: SegmentComment) {
@@ -86,9 +92,9 @@ function formatDateTime(value: string) {
 
 function buildAnchorLabel(comment: SegmentComment) {
   if (comment.anchor_mode === 'range' && comment.anchor_text) {
-    return `${comment.sentence_id || '未定位'} · ${comment.anchor_text}`
+    return `${comment.sentence_id || t('notes.unresolvedSentence')} · ${comment.anchor_text}`
   }
-  return comment.sentence_id || '未定位句段'
+  return comment.sentence_id || t('notes.unresolvedSegment')
 }
 
 function submitDraft() {
@@ -150,40 +156,40 @@ watch(() => props.draftAnchor, (draftAnchor) => {
   <section class="panel notes-panel">
     <div class="notes-panel__header">
       <div>
-        <div class="section-title section-title--tight">批注</div>
-        <p class="panel-subtitle">{{ message || '在预览中选中文字后即可添加批注。' }}</p>
+        <div class="section-title section-title--tight">{{ t('notes.title') }}</div>
+        <p class="panel-subtitle">{{ message || t('stores.comment.defaultMessage') }}</p>
       </div>
-      <button class="button preview-panel__close" type="button" @click="emit('close')">关闭</button>
+      <button class="button preview-panel__close" type="button" @click="emit('close')">{{ t('notes.close') }}</button>
     </div>
 
     <div class="notes-panel__summary">
-      <span>共 {{ threads.length }} 条主批注</span>
-      <span>待处理 {{ threads.filter((thread) => thread.root.status === 'open').length }} 条</span>
-      <span v-if="polling">自动刷新中</span>
+      <span>{{ t('notes.summary', { count: threads.length }) }}</span>
+      <span>{{ t('notes.pending', { count: pendingThreadsCount }) }}</span>
+      <span v-if="polling">{{ t('notes.polling') }}</span>
     </div>
 
     <section v-if="draftAnchor" class="notes-panel__composer">
       <div class="notes-panel__composer-head">
-        <strong>新建批注</strong>
-        <button class="button" type="button" @click="emit('cancelDraft')">取消</button>
+        <strong>{{ t('notes.newComment') }}</strong>
+        <button class="button" type="button" @click="emit('cancelDraft')">{{ t('common.actions.cancel') }}</button>
       </div>
       <div class="notes-panel__anchor">{{ draftSummary }}</div>
       <textarea
         v-model="draftBody"
         class="notes-panel__textarea"
         rows="4"
-        placeholder="输入批注内容"
+        :placeholder="t('notes.placeholder')"
       />
       <div class="notes-panel__actions">
         <button class="button button--primary" type="button" :disabled="saving || !draftBody.trim()" @click="submitDraft">
-          {{ saving ? '保存中...' : '保存批注' }}
+          {{ saving ? t('common.actions.saving') : t('notes.saveComment') }}
         </button>
       </div>
     </section>
 
-    <div v-if="loading" class="empty-state">批注加载中...</div>
+    <div v-if="loading" class="empty-state">{{ t('notes.loading') }}</div>
     <div v-else-if="threads.length === 0" class="empty-state">
-      暂时还没有批注，在预览里选中文字后即可创建。
+      {{ t('notes.empty') }}
     </div>
     <div v-else class="notes-panel__threads">
       <article
@@ -203,7 +209,7 @@ watch(() => props.draftAnchor, (draftAnchor) => {
           <div class="notes-comment__meta">
             <strong>{{ thread.root.author.username }}</strong>
             <span>{{ formatDateTime(thread.root.created_at) }}</span>
-            <span class="notes-comment__status">{{ thread.root.status === 'open' ? '处理中' : '已解决' }}</span>
+            <span class="notes-comment__status">{{ thread.root.status === 'open' ? t('notes.processing') : t('notes.resolved') }}</span>
           </div>
           <div class="notes-comment__anchor">{{ buildAnchorLabel(thread.root) }}</div>
           <p v-if="editingCommentId !== thread.root.id" class="notes-comment__body">{{ thread.root.body }}</p>
@@ -211,15 +217,15 @@ watch(() => props.draftAnchor, (draftAnchor) => {
             <textarea v-model="editingBody" class="notes-panel__textarea" rows="4" />
             <div class="notes-panel__actions">
               <button class="button button--primary" type="button" :disabled="saving || !editingBody.trim()" @click.stop="saveEdit(thread.root.id)">
-                {{ saving ? '保存中...' : '保存修改' }}
+                {{ saving ? t('common.actions.saving') : t('notes.saveEdit') }}
               </button>
-              <button class="button" type="button" @click.stop="editingCommentId = null">取消</button>
+              <button class="button" type="button" @click.stop="editingCommentId = null">{{ t('common.actions.cancel') }}</button>
             </div>
           </div>
           <div class="notes-comment__actions">
-            <button class="button" type="button" @click.stop="startReply(thread.root.id)">回复</button>
+            <button class="button" type="button" @click.stop="startReply(thread.root.id)">{{ t('common.actions.reply') }}</button>
             <button class="button" type="button" @click.stop="toggleStatus(thread.root)">
-              {{ thread.root.status === 'open' ? '标记已解决' : '重新打开' }}
+              {{ thread.root.status === 'open' ? t('notes.markResolved') : t('notes.reopen') }}
             </button>
             <button
               v-if="isOwnComment(thread.root)"
@@ -227,7 +233,7 @@ watch(() => props.draftAnchor, (draftAnchor) => {
               type="button"
               @click.stop="startEdit(thread.root)"
             >
-              编辑
+              {{ t('common.actions.edit') }}
             </button>
             <button
               v-if="isOwnComment(thread.root)"
@@ -235,7 +241,7 @@ watch(() => props.draftAnchor, (draftAnchor) => {
               type="button"
               @click.stop="emit('deleteComment', thread.root.id)"
             >
-              删除
+              {{ t('common.actions.delete') }}
             </button>
           </div>
           <div v-if="replyingToCommentId === thread.root.id" class="notes-comment__reply-box">
@@ -243,13 +249,13 @@ watch(() => props.draftAnchor, (draftAnchor) => {
               v-model="replyBody"
               class="notes-panel__textarea"
               rows="3"
-              placeholder="输入回复内容"
+              :placeholder="t('notes.replyPlaceholder')"
             />
             <div class="notes-panel__actions">
               <button class="button button--primary" type="button" :disabled="saving || !replyBody.trim()" @click.stop="submitReply(thread.root.id)">
-                {{ saving ? '发送中...' : '发送回复' }}
+                {{ saving ? t('notes.sendingReply') : t('notes.sendReply') }}
               </button>
-              <button class="button" type="button" @click.stop="replyingToCommentId = null">取消</button>
+              <button class="button" type="button" @click.stop="replyingToCommentId = null">{{ t('common.actions.cancel') }}</button>
             </div>
           </div>
         </section>
@@ -270,9 +276,9 @@ watch(() => props.draftAnchor, (draftAnchor) => {
             <textarea v-model="editingBody" class="notes-panel__textarea" rows="3" />
             <div class="notes-panel__actions">
               <button class="button button--primary" type="button" :disabled="saving || !editingBody.trim()" @click.stop="saveEdit(reply.id)">
-                {{ saving ? '保存中...' : '保存修改' }}
+                {{ saving ? t('common.actions.saving') : t('notes.saveEdit') }}
               </button>
-              <button class="button" type="button" @click.stop="editingCommentId = null">取消</button>
+              <button class="button" type="button" @click.stop="editingCommentId = null">{{ t('common.actions.cancel') }}</button>
             </div>
           </div>
           <div v-if="editingCommentId !== reply.id" class="notes-comment__actions">
@@ -282,7 +288,7 @@ watch(() => props.draftAnchor, (draftAnchor) => {
               type="button"
               @click.stop="startEdit(reply)"
             >
-              编辑
+              {{ t('common.actions.edit') }}
             </button>
             <button
               v-if="isOwnComment(reply)"
@@ -290,7 +296,7 @@ watch(() => props.draftAnchor, (draftAnchor) => {
               type="button"
               @click.stop="emit('deleteComment', reply.id)"
             >
-              删除
+              {{ t('common.actions.delete') }}
             </button>
           </div>
         </section>

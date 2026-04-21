@@ -16,14 +16,17 @@ def save_source_file(file_record_id: UUID, filename: str, raw_bytes: bytes) -> P
 def load_source_file(file_record_id: UUID, filename: str) -> bytes | None:
     path = get_source_file_path(file_record_id, filename)
     if not path.exists():
-        return None
+        path = _find_any_source_file(file_record_id)
+        if path is None:
+            return None
     return path.read_bytes()
 
 
 def delete_source_file(file_record_id: UUID, filename: str) -> None:
-    path = get_source_file_path(file_record_id, filename)
-    if path.exists():
-        path.unlink()
+    candidates = {get_source_file_path(file_record_id, filename), *iter_source_file_paths(file_record_id)}
+    for path in candidates:
+        if path.exists():
+            path.unlink()
 
 
 def get_source_file_path(file_record_id: UUID, filename: str) -> Path:
@@ -34,3 +37,13 @@ def get_source_file_path(file_record_id: UUID, filename: str) -> Path:
 def _get_storage_root() -> Path:
     settings = get_settings()
     return Path(settings.file_storage_dir)
+
+
+def iter_source_file_paths(file_record_id: UUID) -> set[Path]:
+    return set(_get_storage_root().glob(f"{file_record_id}.*"))
+
+
+def _find_any_source_file(file_record_id: UUID) -> Path | None:
+    for path in iter_source_file_paths(file_record_id):
+        return path
+    return None

@@ -3,6 +3,7 @@ import { defineStore } from 'pinia'
 import axios from 'axios'
 
 import { http } from '../api/http'
+import { translate } from '../i18n'
 import type { AuthResponse, InitStatusResponse, User } from '../types/api'
 
 export const useAuthStore = defineStore('auth', () => {
@@ -42,10 +43,10 @@ export const useAuthStore = defineStore('auth', () => {
   function setInitFailureMessage(error: unknown) {
     tableExists.value = false
     if (axios.isAxiosError(error)) {
-      initMessage.value = String(error.response?.data?.detail || '无法连接后端服务。')
+      initMessage.value = String(error.response?.data?.detail || translate('stores.auth.backendUnavailable'))
       return
     }
-    initMessage.value = error instanceof Error ? error.message : '无法连接后端服务。'
+    initMessage.value = error instanceof Error ? error.message : translate('stores.auth.backendUnavailable')
   }
 
   async function checkInitStatus() {

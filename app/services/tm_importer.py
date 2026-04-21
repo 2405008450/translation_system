@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -8,6 +10,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.models import TranslationMemory
+from app.services.language_pairs import require_language_pair
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
 from app.services.tm_vector import sync_tm_embeddings
 
@@ -15,10 +18,11 @@ from app.services.tm_vector import sync_tm_embeddings
 XLSX_EXTENSIONS = {".xlsx"}
 HEADER_ALIASES = {
     ("zh-cn", "en-us"),
+    ("source", "target"),
     ("source_text", "target_text"),
-    ("中文", "英文"),
-    ("中文原文", "英文译文"),
+    ("源文", "译文"),
     ("原文", "译文"),
+    ("中文", "英文"),
 }
 
 
@@ -39,6 +43,8 @@ def import_tm_from_xlsx_upload(
     db: Session,
     raw_bytes: bytes,
     filename: str,
+    source_language: str,
+    target_language: str,
     batch_size: int = 5000,
     collection_id: UUID | None = None,
 ) -> TMImportSummary:
@@ -49,12 +55,16 @@ def import_tm_from_xlsx_upload(
         filename=filename,
         batch_size=batch_size,
         collection_id=collection_id,
+        source_language=source_language,
+        target_language=target_language,
     )
 
 
 def import_tm_from_xlsx_path(
     db: Session,
     xlsx_path: str | Path,
+    source_language: str,
+    target_language: str,
     batch_size: int = 5000,
     collection_id: UUID | None = None,
 ) -> TMImportSummary:
@@ -65,6 +75,8 @@ def import_tm_from_xlsx_path(
         filename=Path(xlsx_path).name,
         batch_size=batch_size,
         collection_id=collection_id,
+        source_language=source_language,
+        target_language=target_language,
     )
 
 
@@ -73,8 +85,14 @@ def _import_workbook(
     workbook,
     filename: str,
     batch_size: int,
+    source_language: str,
+    target_language: str,
     collection_id: UUID | None = None,
 ) -> TMImportSummary:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
     worksheet = workbook.active
     batch_rows: dict[str, dict] = {}
     created_rows = 0
@@ -97,6 +115,8 @@ def _import_workbook(
         tm_row = _build_tm_row(
             source_text=source_text,
             target_text=target_text,
+            source_language=normalized_source_language,
+            target_language=normalized_target_language,
             collection_id=collection_id,
         )
         batch_rows[tm_row["source_hash"]] = tm_row
@@ -106,6 +126,8 @@ def _import_workbook(
                 db=db,
                 batch_rows=list(batch_rows.values()),
                 collection_id=collection_id,
+                source_language=normalized_source_language,
+                target_language=normalized_target_language,
             )
             created_rows += created_in_batch
             updated_rows += updated_in_batch
@@ -116,6 +138,8 @@ def _import_workbook(
             db=db,
             batch_rows=list(batch_rows.values()),
             collection_id=collection_id,
+            source_language=normalized_source_language,
+            target_language=normalized_target_language,
         )
         created_rows += created_in_batch
         updated_rows += updated_in_batch
@@ -133,6 +157,8 @@ def _import_workbook(
 def _build_tm_row(
     source_text: str,
     target_text: str,
+    source_language: str,
+    target_language: str,
     collection_id: UUID | None = None,
 ) -> dict:
     return {
@@ -141,12 +167,16 @@ def _build_tm_row(
         "target_text": target_text,
         "source_hash": build_source_hash(source_text),
         "source_normalized": normalize_match_text(source_text) or normalize_text(source_text),
+        "source_language": source_language,
+        "target_language": target_language,
     }
 
 
 def _flush_tm_batch(
     db: Session,
     batch_rows: list[dict],
+    source_language: str,
+    target_language: str,
     collection_id: UUID | None = None,
 ) -> tuple[int, int]:
     if not batch_rows:
@@ -160,7 +190,9 @@ def _flush_tm_batch(
             or_(
                 TranslationMemory.source_hash.in_(source_hashes),
                 TranslationMemory.source_text.in_(source_texts),
-            )
+            ),
+            TranslationMemory.source_language == source_language,
+            TranslationMemory.target_language == target_language,
         )
     )
     if collection_id is None:
@@ -195,6 +227,8 @@ def _flush_tm_batch(
         existing.source_hash = row["source_hash"]
         existing.source_normalized = row["source_normalized"]
         existing.collection_id = row["collection_id"]
+        existing.source_language = row["source_language"]
+        existing.target_language = row["target_language"]
         existing_by_hash[row["source_hash"]] = existing
         existing_by_source_text[row["source_text"]] = existing
         sync_candidates.append(existing)

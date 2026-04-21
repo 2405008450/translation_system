@@ -135,9 +135,57 @@ def get_file_record(db: Session, file_record_id: UUID) -> FileRecord | None:
 
 
 def load_file_record_source(file_record: FileRecord) -> bytes | None:
-    if not _is_docx_filename(file_record.filename):
-        return None
     return load_source_file(file_record.id, file_record.filename)
+
+
+def attach_source_document_to_file_record(
+    db: Session,
+    file_record: FileRecord,
+    raw_bytes: bytes,
+    source_filename: str,
+    similarity_threshold: float = 0.6,
+    collection_ids: list[UUID] | None = None,
+) -> FileRecord:
+    file_hash = hashlib.sha256(raw_bytes).hexdigest()
+    workspace_data = build_docx_workspace(
+        db=db,
+        raw_bytes=raw_bytes,
+        similarity_threshold=similarity_threshold,
+        collection_ids=collection_ids,
+    )
+
+    file_record.file_hash = file_hash
+    file_record.status = "in_progress"
+
+    for seg in workspace_data["segments"]:
+        db.add(
+            Segment(
+                file_record_id=file_record.id,
+                sentence_id=seg["sentence_id"],
+                source_text=seg["source_text"],
+                display_text=seg["display_text"],
+                target_text=seg["target_text"],
+                status=seg["status"],
+                score=seg["score"],
+                matched_source_text=seg["matched_source_text"],
+                source="tm" if seg["status"] in ("exact", "fuzzy") else "none",
+                block_type=seg["block_type"],
+                block_index=seg["block_index"],
+                row_index=seg.get("row_index"),
+                cell_index=seg.get("cell_index"),
+            )
+        )
+
+    try:
+        save_source_file(file_record.id, source_filename, raw_bytes)
+        db.commit()
+    except Exception:
+        db.rollback()
+        delete_source_file(file_record.id, source_filename)
+        raise
+
+    db.refresh(file_record)
+    return file_record
 
 
 def get_file_record_with_segments(

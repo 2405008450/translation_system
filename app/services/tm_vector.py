@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hashlib
 import logging
@@ -82,14 +82,14 @@ def is_tm_vector_ready(db: Session) -> bool:
                             SELECT 1
                             FROM information_schema.columns
                             WHERE table_schema = current_schema()
-                              AND table_name = 'translation_memory'
+                              AND table_name = 'memory_entries'
                               AND column_name = 'source_embedding'
                         )
                         AND EXISTS (
                             SELECT 1
                             FROM information_schema.columns
                             WHERE table_schema = current_schema()
-                              AND table_name = 'translation_memory'
+                              AND table_name = 'memory_entries'
                               AND column_name = 'source_embedding_version'
                         )
                     """
@@ -132,7 +132,7 @@ def sync_tm_embeddings(
         db.execute(
             text(
                 f"""
-                UPDATE translation_memory
+                UPDATE memory_entries
                 SET source_embedding = CAST(:source_embedding AS vector({vector_dimensions})),
                     source_embedding_version = :source_embedding_version
                 WHERE id = CAST(:id AS uuid)
@@ -171,3 +171,4 @@ def _collect_embedding_features(normalized_text: str) -> list[tuple[str, float]]
 
 def _resolve_cache_key(db: Session) -> str:
     return db.get_bind().url.render_as_string(hide_password=True)
+

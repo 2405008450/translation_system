@@ -9,6 +9,8 @@ const props = withDefaults(defineProps<{
   targetHtml: string
   sourceSupported: boolean
   targetSupported: boolean
+  sourceLoading?: boolean
+  targetLoading?: boolean
   activeSentenceId: string | null
   targetRenderMode?: 'static' | 'target'
   targetSegments?: Segment[]
@@ -19,6 +21,8 @@ const props = withDefaults(defineProps<{
   activeCommentId?: string | null
 }>(), {
   targetRenderMode: 'static',
+  sourceLoading: false,
+  targetLoading: false,
   targetSegments: () => [],
   targetUpdatedSentenceId: null,
   targetUpdatedSentenceText: '',
@@ -133,6 +137,7 @@ onBeforeUnmount(() => {
           title="原文预览"
           :html="sourceHtml"
           :supported="sourceSupported"
+          :loading="sourceLoading"
           :active-sentence-id="activeSentenceId"
           :comments="comments"
           :active-comment-id="activeCommentId"
@@ -158,6 +163,7 @@ onBeforeUnmount(() => {
           title="译文预览"
           :html="targetHtml"
           :supported="targetSupported"
+          :loading="targetLoading"
           :active-sentence-id="activeSentenceId"
           :comments="comments"
           :active-comment-id="activeCommentId"

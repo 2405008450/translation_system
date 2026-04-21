@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import axios from 'axios'
 import { ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 
 import { useAuthStore } from '../stores/auth'
 
 const authStore = useAuthStore()
+const { t } = useI18n()
 
 const createUserMessage = ref('')
 const newUsername = ref('')
@@ -18,13 +20,13 @@ async function createUser() {
     newUsername.value = ''
     newPassword.value = ''
     newRole.value = 'user'
-    createUserMessage.value = '用户已创建'
+    createUserMessage.value = t('userManagement.created')
   } catch (error) {
     if (axios.isAxiosError(error)) {
-      createUserMessage.value = String(error.response?.data?.detail || '用户创建失败。')
+      createUserMessage.value = String(error.response?.data?.detail || t('userManagement.createFailed'))
       return
     }
-    createUserMessage.value = error instanceof Error ? error.message : '用户创建失败。'
+    createUserMessage.value = error instanceof Error ? error.message : t('userManagement.createFailed')
   }
 }
 </script>
@@ -32,43 +34,43 @@ async function createUser() {
 <template>
   <div class="content-stack">
     <section class="panel">
-      <div class="section-title">创建用户</div>
+      <div class="section-title">{{ t('userManagement.createTitle') }}</div>
       <div class="upload-form form-grid-2">
         <label class="field field--compact">
-          <span class="field__label">用户名</span>
-          <input v-model.trim="newUsername" class="field__control" type="text" minlength="3" maxlength="50" />
+          <span class="field__label">{{ t('userManagement.username') }}</span>
+          <input v-model.trim="newUsername" class="field__control" type="text" minlength="3" maxlength="50" :aria-label="t('userManagement.username')" />
         </label>
         <label class="field field--compact">
-          <span class="field__label">密码</span>
-          <input v-model="newPassword" class="field__control" type="password" minlength="6" maxlength="128" />
+          <span class="field__label">{{ t('userManagement.password') }}</span>
+          <input v-model="newPassword" class="field__control" type="password" minlength="6" maxlength="128" :aria-label="t('userManagement.password')" />
         </label>
         <label class="field field--compact">
-          <span class="field__label">角色</span>
+          <span class="field__label">{{ t('userManagement.role') }}</span>
           <select v-model="newRole" class="field__control">
-            <option value="user">普通用户</option>
-            <option value="admin">管理员</option>
+            <option value="user">{{ t('common.roles.user') }}</option>
+            <option value="admin">{{ t('common.roles.admin') }}</option>
           </select>
         </label>
         <div class="field field--compact field-actions">
-          <span class="field__label">执行</span>
-          <button class="button button--primary" type="button" @click="createUser">创建用户</button>
+          <span class="field__label">{{ t('userManagement.action') }}</span>
+          <button class="button button--primary" type="button" @click="createUser">{{ t('userManagement.createUser') }}</button>
         </div>
       </div>
-      <p v-if="createUserMessage" class="form-message" :class="{ 'is-error': createUserMessage !== '用户已创建' }">
+      <p v-if="createUserMessage" class="form-message" :class="{ 'is-error': createUserMessage !== t('userManagement.created') }">
         {{ createUserMessage }}
       </p>
     </section>
 
     <section class="panel">
-      <div class="section-title">管理说明</div>
+      <div class="section-title">{{ t('userManagement.guideTitle') }}</div>
       <div class="info-list">
         <div class="info-item">
-          <strong>管理员</strong>
-          <span>可导入 TM、创建用户、删除任务</span>
+          <strong>{{ t('userManagement.admin') }}</strong>
+          <span>{{ t('userManagement.adminDesc') }}</span>
         </div>
         <div class="info-item">
-          <strong>普通用户</strong>
-          <span>可登录、上传文档、编辑句段、执行翻译流程</span>
+          <strong>{{ t('userManagement.user') }}</strong>
+          <span>{{ t('userManagement.userDesc') }}</span>
         </div>
       </div>
     </section>

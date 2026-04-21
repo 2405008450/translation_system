@@ -25,6 +25,8 @@ export interface FileRecordSummary {
   id: string
   filename: string
   status: string
+  source_language: string | null
+  target_language: string | null
   created_at: string
   updated_at: string
 }
@@ -49,6 +51,8 @@ export interface FileRecordDetail {
   id: string
   filename: string
   status: string
+  source_language: string | null
+  target_language: string | null
   created_at: string
   updated_at: string
   total_segments: number
@@ -93,13 +97,55 @@ export interface SegmentComment {
   resolved_at: string | null
 }
 
+export interface TermBase {
+  id: string
+  name: string
+  description: string | null
+  source_language: string
+  target_language: string
+  created_at: string
+  updated_at: string
+  entry_count: number
+}
+
 export interface TMCollection {
   id: string
   name: string
   description: string | null
+  source_language: string | null
+  target_language: string | null
   created_at: string
   updated_at: string
   entry_count: number
+}
+
+export interface TMEntryRecord {
+  id: string
+  collection_id: string | null
+  source_text: string
+  target_text: string
+  source_language: string | null
+  target_language: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface TermEntryRecord {
+  id: string
+  term_base_id: string
+  source_text: string
+  target_text: string
+  source_language: string
+  target_language: string
+  created_at: string
+  updated_at: string
+}
+
+export interface PaginatedResponse<T> {
+  items: T[]
+  total: number
+  skip: number
+  limit: number
 }
 
 export interface TMImportSummary {
@@ -111,12 +157,36 @@ export interface TMImportSummary {
   imported_rows: number
   collection_id: string | null
   collection_name: string | null
+  source_language: string
+  target_language: string
+}
+
+export interface TermImportSummary {
+  filename: string
+  created_rows: number
+  updated_rows: number
+  skipped_empty_rows: number
+  skipped_header_rows: number
+  imported_rows: number
+  term_base_id: string
+  term_base_name: string
+  source_language: string
+  target_language: string
 }
 
 export interface SegmentUpdatePayload {
   sentence_id: string
   target_text: string
   source: string
+}
+
+export interface SegmentRevisionEntry {
+  id: string
+  sentence_id: string
+  source: string
+  before_text: string
+  after_text: string
+  created_at: string
 }
 
 export interface CommentCreatePayload extends CommentAnchorDraft {

@@ -1,4 +1,4 @@
--- =============================================================================
+﻿-- =============================================================================
 -- AI Translation System - 数据库初始化脚本 (one-shot)
 -- -----------------------------------------------------------------------------
 -- 使用方式：
@@ -14,7 +14,7 @@
 --
 -- 包含的对象：
 --   扩展：pg_trgm, vector
---   表：tm_collections / translation_memory / file_records / segments
+--   表：memory_bases / memory_entries / file_records / segments
 --       users / segment_comments
 --   触发器：统一维护 updated_at 字段
 -- =============================================================================
@@ -36,7 +36,7 @@ $$ LANGUAGE plpgsql;
 -- -----------------------------------------------------------------------------
 -- 1. TM 记忆库分组
 -- -----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS tm_collections (
+CREATE TABLE IF NOT EXISTS memory_bases (
     id UUID PRIMARY KEY DEFAULT (
         lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
         lpad(to_hex(floor(random() * 65536)::int), 4, '0') || '-' ||
@@ -47,23 +47,32 @@ CREATE TABLE IF NOT EXISTS tm_collections (
     )::uuid,
     name VARCHAR(120) NOT NULL,
     description TEXT,
+    source_language VARCHAR(20),
+    target_language VARCHAR(20),
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_tm_collections_name
-    ON tm_collections (name);
+ALTER TABLE IF EXISTS memory_bases
+    ADD COLUMN IF NOT EXISTS source_language VARCHAR(20);
+ALTER TABLE IF EXISTS memory_bases
+    ADD COLUMN IF NOT EXISTS target_language VARCHAR(20);
 
-DROP TRIGGER IF EXISTS update_tm_collections_updated_at ON tm_collections;
-CREATE TRIGGER update_tm_collections_updated_at
-    BEFORE UPDATE ON tm_collections
+CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_bases_name
+    ON memory_bases (name);
+CREATE INDEX IF NOT EXISTS ix_memory_bases_language_pair
+    ON memory_bases (source_language, target_language);
+
+DROP TRIGGER IF EXISTS update_memory_bases_updated_at ON memory_bases;
+CREATE TRIGGER update_memory_bases_updated_at
+    BEFORE UPDATE ON memory_bases
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
 -- -----------------------------------------------------------------------------
 -- 2. 翻译记忆条目（支持 trigram + pgvector 混合检索）
 -- -----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS translation_memory (
+CREATE TABLE IF NOT EXISTS memory_entries (
     id UUID PRIMARY KEY DEFAULT (
         lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
         lpad(to_hex(floor(random() * 65536)::int), 4, '0') || '-' ||
@@ -72,75 +81,180 @@ CREATE TABLE IF NOT EXISTS translation_memory (
         substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
         lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
     )::uuid,
-    collection_id UUID REFERENCES tm_collections(id) ON DELETE SET NULL,
+    collection_id UUID REFERENCES memory_bases(id) ON DELETE SET NULL,
     source_text TEXT NOT NULL,
     target_text TEXT NOT NULL,
     source_hash VARCHAR(64),
     source_normalized TEXT,
+    source_language VARCHAR(20),
+    target_language VARCHAR(20),
     source_embedding vector(128),
     source_embedding_version INTEGER,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS ix_translation_memory_collection_id
-    ON translation_memory (collection_id);
-CREATE INDEX IF NOT EXISTS ix_translation_memory_collection_source_hash
-    ON translation_memory (collection_id, source_hash);
-CREATE INDEX IF NOT EXISTS ix_translation_memory_collection_source_normalized
-    ON translation_memory (collection_id, source_normalized);
-CREATE INDEX IF NOT EXISTS ix_translation_memory_source_hash
-    ON translation_memory (source_hash);
-CREATE INDEX IF NOT EXISTS ix_translation_memory_source_text
-    ON translation_memory (source_text);
-CREATE INDEX IF NOT EXISTS ix_translation_memory_source_normalized
-    ON translation_memory (source_normalized);
-CREATE INDEX IF NOT EXISTS ix_translation_memory_source_text_trgm
-    ON translation_memory
+ALTER TABLE IF EXISTS memory_entries
+    ADD COLUMN IF NOT EXISTS source_language VARCHAR(20);
+ALTER TABLE IF EXISTS memory_entries
+    ADD COLUMN IF NOT EXISTS target_language VARCHAR(20);
+
+CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_id
+    ON memory_entries (collection_id);
+CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_source_hash
+    ON memory_entries (collection_id, source_hash);
+CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_source_normalized
+    ON memory_entries (collection_id, source_normalized);
+CREATE INDEX IF NOT EXISTS ix_memory_entries_source_hash
+    ON memory_entries (source_hash);
+CREATE INDEX IF NOT EXISTS ix_memory_entries_source_text
+    ON memory_entries (source_text);
+CREATE INDEX IF NOT EXISTS ix_memory_entries_source_normalized
+    ON memory_entries (source_normalized);
+CREATE INDEX IF NOT EXISTS ix_memory_entries_language_pair
+    ON memory_entries (source_language, target_language);
+CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_language_pair
+    ON memory_entries (collection_id, source_language, target_language);
+CREATE INDEX IF NOT EXISTS ix_memory_entries_source_text_trgm
+    ON memory_entries
     USING GIN (source_text gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS ix_translation_memory_source_normalized_trgm
-    ON translation_memory
+CREATE INDEX IF NOT EXISTS ix_memory_entries_source_normalized_trgm
+    ON memory_entries
     USING GIN (source_normalized gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS ix_translation_memory_source_embedding_version
-    ON translation_memory (source_embedding_version);
-CREATE INDEX IF NOT EXISTS ix_translation_memory_source_embedding_ivfflat
-    ON translation_memory
+CREATE INDEX IF NOT EXISTS ix_memory_entries_source_embedding_version
+    ON memory_entries (source_embedding_version);
+CREATE INDEX IF NOT EXISTS ix_memory_entries_source_embedding_ivfflat
+    ON memory_entries
     USING ivfflat (source_embedding vector_cosine_ops)
     WITH (lists = 100);
 
-DROP TRIGGER IF EXISTS update_translation_memory_updated_at ON translation_memory;
-CREATE TRIGGER update_translation_memory_updated_at
-    BEFORE UPDATE ON translation_memory
+DROP TRIGGER IF EXISTS update_memory_entries_updated_at ON memory_entries;
+CREATE TRIGGER update_memory_entries_updated_at
+    BEFORE UPDATE ON memory_entries
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
 -- 兼容旧库：把 collection_id 仍为 NULL 的历史记录迁入「默认记忆库」
-INSERT INTO tm_collections (name, description)
+INSERT INTO memory_bases (name, description)
 SELECT '默认记忆库', '迁移前已有的 TM 记录'
 WHERE EXISTS (
     SELECT 1
-    FROM translation_memory
+    FROM memory_entries
     WHERE collection_id IS NULL
 )
 ON CONFLICT (name) DO NOTHING;
 
-UPDATE translation_memory
+UPDATE memory_entries
 SET collection_id = (
     SELECT id
-    FROM tm_collections
+    FROM memory_bases
     WHERE name = '默认记忆库'
     LIMIT 1
 )
 WHERE collection_id IS NULL
   AND EXISTS (
       SELECT 1
-      FROM tm_collections
+      FROM memory_bases
       WHERE name = '默认记忆库'
   );
 
 -- -----------------------------------------------------------------------------
 -- 3. 用户账号
 -- -----------------------------------------------------------------------------
+UPDATE memory_entries AS tm
+SET source_language = COALESCE(tm.source_language, collection.source_language),
+    target_language = COALESCE(tm.target_language, collection.target_language)
+FROM memory_bases AS collection
+WHERE tm.collection_id = collection.id
+  AND (
+      tm.source_language IS DISTINCT FROM collection.source_language
+      OR tm.target_language IS DISTINCT FROM collection.target_language
+  );
+
+CREATE TABLE IF NOT EXISTS term_bases (
+    id UUID PRIMARY KEY DEFAULT (
+        lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
+        lpad(to_hex(floor(random() * 65536)::int), 4, '0') || '-' ||
+        '4' || substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        substr('89ab', floor(random() * 4)::int + 1, 1) ||
+        substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
+    )::uuid,
+    name VARCHAR(120) NOT NULL,
+    description TEXT,
+    source_language VARCHAR(20) NOT NULL,
+    target_language VARCHAR(20) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE IF EXISTS term_bases
+    ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE IF EXISTS term_bases
+    ADD COLUMN IF NOT EXISTS source_language VARCHAR(20);
+ALTER TABLE IF EXISTS term_bases
+    ADD COLUMN IF NOT EXISTS target_language VARCHAR(20);
+ALTER TABLE IF EXISTS term_bases
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+ALTER TABLE IF EXISTS term_bases
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_term_bases_name
+    ON term_bases (name);
+CREATE INDEX IF NOT EXISTS ix_term_bases_language_pair
+    ON term_bases (source_language, target_language);
+
+DROP TRIGGER IF EXISTS update_term_bases_updated_at ON term_bases;
+CREATE TRIGGER update_term_bases_updated_at
+    BEFORE UPDATE ON term_bases
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TABLE IF NOT EXISTS term_entries (
+    id UUID PRIMARY KEY DEFAULT (
+        lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
+        lpad(to_hex(floor(random() * 65536)::int), 4, '0') || '-' ||
+        '4' || substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        substr('89ab', floor(random() * 4)::int + 1, 1) ||
+        substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
+    )::uuid,
+    term_base_id UUID NOT NULL REFERENCES term_bases(id) ON DELETE CASCADE,
+    source_text TEXT NOT NULL,
+    target_text TEXT NOT NULL,
+    source_normalized TEXT,
+    source_language VARCHAR(20) NOT NULL,
+    target_language VARCHAR(20) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE IF EXISTS term_entries
+    ADD COLUMN IF NOT EXISTS source_normalized TEXT;
+ALTER TABLE IF EXISTS term_entries
+    ADD COLUMN IF NOT EXISTS source_language VARCHAR(20);
+ALTER TABLE IF EXISTS term_entries
+    ADD COLUMN IF NOT EXISTS target_language VARCHAR(20);
+ALTER TABLE IF EXISTS term_entries
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+ALTER TABLE IF EXISTS term_entries
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+
+CREATE INDEX IF NOT EXISTS ix_term_entries_term_base_id
+    ON term_entries (term_base_id);
+CREATE INDEX IF NOT EXISTS ix_term_entries_term_base_source_text
+    ON term_entries (term_base_id, source_text);
+CREATE INDEX IF NOT EXISTS ix_term_entries_term_base_source_normalized
+    ON term_entries (term_base_id, source_normalized);
+CREATE INDEX IF NOT EXISTS ix_term_entries_language_pair
+    ON term_entries (source_language, target_language);
+
+DROP TRIGGER IF EXISTS update_term_entries_updated_at ON term_entries;
+CREATE TRIGGER update_term_entries_updated_at
+    BEFORE UPDATE ON term_entries
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT (
         lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
@@ -267,3 +381,5 @@ CREATE TRIGGER update_segment_comments_updated_at
 -- 完成。首次运行后请通过前端 "/login" 页面使用首次初始化接口创建管理员账号：
 --   POST /api/auth/init  { "username": "admin", "password": "..." }
 -- =============================================================================
+
+

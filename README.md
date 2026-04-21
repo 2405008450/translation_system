@@ -1,4 +1,4 @@
-# AI Translation System
+﻿# AI Translation System
 
 基于 **FastAPI + Vue 3 + PostgreSQL** 的全栈翻译记忆（TM）工作台，支持：
 
@@ -115,12 +115,20 @@ psql -U postgres -d tm_demo -f scripts/init_db.sql
 
 `scripts/init_db.sql` 幂等，可以多次运行。涉及的表：
 
-- `tm_collections`：TM 记忆库分组
-- `translation_memory`：翻译记忆条目（含 trigram + pgvector 双路索引）
+- `memory_bases`：TM 记忆库分组
+- `memory_entries`：翻译记忆条目（含 trigram + pgvector 双路索引）
 - `file_records`：上传的文件 / 翻译任务记录
 - `segments`：句段及匹配状态
 - `users`：用户 / 角色（`admin` / `user`）
 - `segment_comments`：句段批注与嵌套回复
+
+如果你是从旧版库升级，且库里还存在 `tm_collections` / `translation_memory`，先执行：
+
+```powershell
+psql -U postgres -d tm_demo -f scripts/rename_translation_memory_tables.sql
+```
+
+该脚本会把旧 TM 表直接改名为 `memory_bases` / `memory_entries`，同时清理旧术语表 `termbase_collections` / `terms`。
 
 ### 3.3（可选）导入示例 TM
 
@@ -279,10 +287,10 @@ python scripts/deduplicate_tm_source_hash.py --database-url "$env:DATABASE_URL" 
 | 批注 | GET/POST | `/api/file-records/{id}/comments` | 列表 / 新建 |
 | 批注 | PATCH/DELETE | `/api/comments/{id}` | 更新 / 删除 |
 | 批注 | POST | `/api/comments/{id}/replies` | 嵌套回复 |
-| TM | GET/POST/PUT/DELETE | `/api/tm/collections[/{id}]` | 记忆库 CRUD |
-| TM | POST | `/api/tm/import-xlsx` | XLSX 导入（管理员） |
-| TM | POST | `/api/tm/add` | 单条新增（去重） |
-| TM | POST | `/api/tm/batch-add` | 批量新增（去重） |
+| TM | GET/POST/PUT/DELETE | `/api/translation-memory/collections[/{id}]` | 记忆库 CRUD |
+| TM | POST | `/api/translation-memory/import-xlsx` | XLSX 导入（管理员） |
+| TM | POST | `/api/translation-memory/entries` | 单条新增（去重） |
+| TM | POST | `/api/translation-memory/entries/batch` | 批量新增（去重） |
 | 解析 | POST | `/api/parser/workspace` | 仅解析不落库，返回工作台结构 |
 
 更多细节直接看 `app/routers/api.py` 与 FastAPI 自带的 `/docs` 页。
@@ -293,7 +301,7 @@ python scripts/deduplicate_tm_source_hash.py --database-url "$env:DATABASE_URL" 
 
 - **启动报 "JWT_SECRET_KEY 仍为默认值"**：检查 `.env` 是否真的生效（工作目录要在项目根），并替换为长随机字符串。
 - **`CREATE EXTENSION vector` 失败**：说明 pgvector 没装到当前 PostgreSQL 实例，参考第 1.1 节。
-- **`ix_translation_memory_source_embedding_ivfflat` 初次命中慢**：ivfflat 索引训练后建议执行 `VACUUM ANALYZE translation_memory;` 并调整 `lists` / `ivfflat.probes`。
+- **`ix_memory_entries_source_embedding_ivfflat` 初次命中慢**：ivfflat 索引训练后建议执行 `VACUUM ANALYZE memory_entries;` 并调整 `lists` / `ivfflat.probes`。
 - **LLM 修正不可用**：至少配置 `DEEPSEEK_API_KEY` 或 `OPENROUTER_API_KEY`，否则调用 `llm-translate` 会返回 400。
 - **局域网无法访问**：后端启动参数用 `--host 0.0.0.0`，并放行 Windows 防火墙端口。
 - **前端开发时 `/api` 404**：检查 `frontend/.env.local` 中的 `VITE_API_PROXY_TARGET` 是否指向真正的后端端口。
@@ -303,3 +311,5 @@ python scripts/deduplicate_tm_source_hash.py --database-url "$env:DATABASE_URL" 
 ## 10. 许可证
 
 内部项目，默认保留所有权利。需要开源请自行在此处补充 LICENSE。
+
+

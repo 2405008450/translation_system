@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -10,7 +10,7 @@ STATS_SQL = text(
         COUNT(*) AS total_rows,
         COUNT(*) FILTER (WHERE source_hash IS NULL) AS null_source_hash_rows,
         COUNT(*) FILTER (WHERE source_hash IS NOT NULL) AS non_null_source_hash_rows
-    FROM translation_memory
+    FROM memory_entries
     """
 )
 
@@ -23,7 +23,7 @@ DUPLICATE_STATS_SQL = text(
             COUNT(*) AS row_count,
             COUNT(DISTINCT source_text) AS distinct_source_text_count,
             COUNT(DISTINCT target_text) AS distinct_target_text_count
-        FROM translation_memory
+        FROM memory_entries
         WHERE source_hash IS NOT NULL
         GROUP BY source_hash
         HAVING COUNT(*) > 1
@@ -48,7 +48,7 @@ TOP_DUPLICATES_SQL = text(
             COUNT(DISTINCT source_text) AS distinct_source_text_count,
             COUNT(DISTINCT target_text) AS distinct_target_text_count,
             MAX(COALESCE(updated_at, created_at)) AS latest_timestamp
-        FROM translation_memory
+        FROM memory_entries
         WHERE source_hash IS NOT NULL
         GROUP BY source_hash
         HAVING COUNT(*) > 1
@@ -76,7 +76,7 @@ DELETE_DUPLICATES_SQL = text(
             created_at,
             COUNT(*) OVER (PARTITION BY source_hash, target_text) AS target_frequency,
             COUNT(*) OVER (PARTITION BY source_hash, source_text) AS source_frequency
-        FROM translation_memory
+        FROM memory_entries
         WHERE source_hash IS NOT NULL
     ),
     ranked_rows AS (
@@ -94,7 +94,7 @@ DELETE_DUPLICATES_SQL = text(
         FROM duplicate_rows
     ),
     deleted_rows AS (
-        DELETE FROM translation_memory tm
+        DELETE FROM memory_entries tm
         USING ranked_rows rr
         WHERE tm.id = rr.id
           AND rr.row_rank > 1
@@ -108,21 +108,21 @@ DELETE_DUPLICATES_SQL = text(
 
 DROP_NON_UNIQUE_INDEX_SQL = text(
     """
-    DROP INDEX IF EXISTS ix_translation_memory_source_hash
+    DROP INDEX IF EXISTS ix_memory_entries_source_hash
     """
 )
 
 
 CREATE_UNIQUE_INDEX_SQL = text(
     """
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_translation_memory_source_hash
-        ON translation_memory (source_hash)
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_entries_source_hash
+        ON memory_entries (source_hash)
         WHERE source_hash IS NOT NULL
     """
 )
 
 
-ANALYZE_SQL = text("ANALYZE translation_memory")
+ANALYZE_SQL = text("ANALYZE memory_entries")
 
 
 INDEX_PERMISSION_SQL = text(
@@ -131,7 +131,7 @@ INDEX_PERMISSION_SQL = text(
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = current_schema()
-      AND c.relname = 'translation_memory'
+      AND c.relname = 'memory_entries'
       AND c.relkind = 'r'
     """
 )
@@ -140,7 +140,7 @@ INDEX_PERMISSION_SQL = text(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Deduplicate translation_memory rows by source_hash. "
+            "Deduplicate memory_entries rows by source_hash. "
             "The kept row is chosen by target_text frequency, then source_text frequency, "
             "then the latest updated/created row."
         )
@@ -169,7 +169,7 @@ def fetch_stats(connection) -> tuple[dict, dict]:
 def print_summary(connection, top: int) -> None:
     overview, duplicates = fetch_stats(connection)
 
-    print("=== translation_memory summary ===")
+    print("=== memory_entries summary ===")
     print(f"total_rows={overview['total_rows']}")
     print(f"null_source_hash_rows={overview['null_source_hash_rows']}")
     print(f"non_null_source_hash_rows={overview['non_null_source_hash_rows']}")
@@ -206,12 +206,12 @@ def ensure_unique_index(engine) -> str:
         if not can_manage_index:
             return (
                 "Skipped unique index creation because the current user is not "
-                "the owner of table translation_memory."
+                "the owner of table memory_entries."
             )
 
         connection.execute(DROP_NON_UNIQUE_INDEX_SQL)
         connection.execute(CREATE_UNIQUE_INDEX_SQL)
-        return "Created or verified uq_translation_memory_source_hash."
+        return "Created or verified uq_memory_entries_source_hash."
 
 
 def main() -> None:
@@ -242,3 +242,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

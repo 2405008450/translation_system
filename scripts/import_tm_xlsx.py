@@ -11,6 +11,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Import translation memory from XLSX.")
     parser.add_argument("--database-url", required=True, help="SQLAlchemy database URL")
     parser.add_argument("--xlsx-path", required=True, help="XLSX file path")
+    parser.add_argument("--source-language", required=True, help="Source language code, e.g. zh-CN")
+    parser.add_argument("--target-language", required=True, help="Target language code, e.g. en-US")
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -36,6 +38,8 @@ def main() -> None:
             xlsx_path=args.xlsx_path,
             batch_size=args.batch_size,
             collection_id=args.collection_id,
+            source_language=args.source_language,
+            target_language=args.target_language,
         )
 
     print(

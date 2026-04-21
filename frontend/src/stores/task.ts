@@ -1,13 +1,24 @@
 import { ref } from 'vue'
 import { defineStore } from 'pinia'
+import type { AxiosProgressEvent } from 'axios'
 
 import { http } from '../api/http'
 import type { FileRecordSummary } from '../types/api'
 
+interface UploadingState {
+  active: boolean
+  percent: number
+  fileName: string
+}
+
 export const useTaskStore = defineStore('task', () => {
   const tasks = ref<FileRecordSummary[]>([])
   const loading = ref(false)
-  const uploading = ref(false)
+  const uploading = ref<UploadingState>({
+    active: false,
+    percent: 0,
+    fileName: '',
+  })
 
   async function fetchTasks() {
     loading.value = true
@@ -25,8 +36,29 @@ export const useTaskStore = defineStore('task', () => {
     }
   }
 
+  function resetUploading() {
+    uploading.value = {
+      active: false,
+      percent: 0,
+      fileName: '',
+    }
+  }
+
+  function handleUploadProgress(event: AxiosProgressEvent) {
+    const total = event.total || 0
+    const loaded = event.loaded || 0
+    uploading.value = {
+      ...uploading.value,
+      percent: total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0,
+    }
+  }
+
   async function uploadTask(file: File, threshold = 0.6, collectionIds: string[] = []) {
-    uploading.value = true
+    uploading.value = {
+      active: true,
+      percent: 0,
+      fileName: file.name,
+    }
     try {
       const formData = new FormData()
       formData.append('file', file)
@@ -38,11 +70,12 @@ export const useTaskStore = defineStore('task', () => {
         headers: {
           'Content-Type': 'multipart/form-data',
         },
+        onUploadProgress: handleUploadProgress,
       })
       await fetchTasks()
       return data
     } finally {
-      uploading.value = false
+      resetUploading()
     }
   }
 

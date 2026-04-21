@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 from datetime import datetime
@@ -59,7 +59,7 @@ def _load_batch(
     stmt = text(
         f"""
         SELECT id, source_text, created_at
-        FROM translation_memory
+        FROM memory_entries
         WHERE source_text IS NOT NULL
           AND (
                 :rebuild_all
@@ -119,3 +119,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
