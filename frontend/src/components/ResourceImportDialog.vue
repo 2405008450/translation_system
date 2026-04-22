@@ -14,12 +14,16 @@ const props = withDefaults(defineProps<{
   sourceLanguage?: string | null
   targetLanguage?: string | null
   contextLabel?: string
+  fixedTMCollectionId?: string
+  fixedTermBaseId?: string
 }>(), {
   initialTab: 'tm',
   title: '',
   sourceLanguage: null,
   targetLanguage: null,
   contextLabel: '',
+  fixedTMCollectionId: '',
+  fixedTermBaseId: '',
 })
 
 const { t } = useI18n()
@@ -46,6 +50,8 @@ const emit = defineEmits<{
       :source-language="sourceLanguage"
       :target-language="targetLanguage"
       :context-label="contextLabel"
+      :fixed-tm-collection-id="fixedTMCollectionId"
+      :fixed-term-base-id="fixedTermBaseId"
       @imported="emit('imported', $event)"
     />
   </Modal>

@@ -25,6 +25,7 @@ import { useToast } from '../composables/useToast'
 import { getLanguageLabel, languageOptions } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
 import { useAuthStore } from '../stores/auth'
+import { getProgressStyle } from '../utils/progress'
 
 interface ProjectItem {
   id: string
@@ -47,6 +48,10 @@ interface ProjectListResponse {
   total: number
   skip: number
   limit: number
+}
+
+interface ProjectCreateResponse {
+  id: string
 }
 
 const authStore = useAuthStore()
@@ -152,7 +157,7 @@ async function createProject() {
   creating.value = true
   formError.value = ''
   try {
-    await http.post('/projects', {
+    const { data } = await http.post<ProjectCreateResponse>('/projects', {
       name: form.name.trim(),
       source_language: form.source_language,
       target_language: form.target_language,
@@ -160,8 +165,12 @@ async function createProject() {
       access_level: form.access_level,
     })
     showCreateDialog.value = false
-    await loadProjects()
+    resetForm()
     toast.success(t('projectList.messages.created'))
+    await router.push({
+      name: 'project-detail',
+      params: { id: data.id },
+    })
   } catch (error) {
     if (axios.isAxiosError(error)) {
       formError.value = String(error.response?.data?.detail || t('projectList.errors.create'))
@@ -246,19 +255,6 @@ function getAccessLabel(level: string | null) {
 function getStatusClass(status: string) {
   const meta = getFileStatusMeta(status)
   return `project-status--${meta.tone}`
-}
-
-function getProgressStyle(progress: number) {
-  if (progress >= 80) {
-    return { width: `${progress}%`, background: 'linear-gradient(90deg, #36d1a0, #2f9786)' }
-  }
-  if (progress >= 50) {
-    return { width: `${progress}%`, background: 'linear-gradient(90deg, #4db8ff, #1890ff)' }
-  }
-  if (progress >= 20) {
-    return { width: `${progress}%`, background: 'linear-gradient(90deg, #ffd666, #faad14)' }
-  }
-  return { width: `${progress}%`, background: 'linear-gradient(90deg, #d9e3e0, #c4d2ce)' }
 }
 
 function handleSort(key: string, order: 'asc' | 'desc') {

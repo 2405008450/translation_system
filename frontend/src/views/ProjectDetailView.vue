@@ -1,19 +1,46 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { ArrowLeft, ArrowRight, Loader2, Upload } from 'lucide-vue-next'
-import { computed, onMounted, ref } from 'vue'
+import {
+  ArrowLeft,
+  BookOpen,
+  ChevronDown,
+  ChevronUp,
+  Clock3,
+  Download,
+  FileText,
+  Filter,
+  FolderOpen,
+  Link,
+  Loader2,
+  MoreHorizontal,
+  Settings2,
+  Trash2,
+  Upload,
+  Users,
+} from 'lucide-vue-next'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 
 import { http } from '../api/http'
+import Modal from '../components/base/Modal.vue'
+import DataTable from '../components/DataTable.vue'
+import type { DataTableColumn } from '../components/DataTable.vue'
+import Pagination from '../components/Pagination.vue'
+import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
 import { useToast } from '../composables/useToast'
-import { formatLanguagePair } from '../constants/languages'
+import { formatLanguagePair, getLanguageLabel } from '../constants/languages'
+import { getFileStatusMeta } from '../constants/status'
+import { useAuthStore } from '../stores/auth'
 import type { TMCollection } from '../types/api'
+import { getProgressStyle } from '../utils/progress'
 
 const props = defineProps<{
   id: string
 }>()
+
+type ProjectTab = 'files' | 'settings' | 'stats' | 'summary' | 'quote'
 
 interface ProjectDetail {
   id: string
@@ -30,13 +57,19 @@ interface ProjectDetail {
   created_at: string
   updated_at: string
   has_source_document: boolean
+  file_size_bytes: number | null
 }
 
+type ProjectRow = ProjectDetail | Record<string, any>
+
+const authStore = useAuthStore()
+const confirm = useConfirm()
 const router = useRouter()
 const toast = useToast()
 const { t } = useI18n()
 
 const loading = ref(false)
+const deleting = ref(false)
 const uploading = ref(false)
 const uploadPercent = ref(0)
 const loadingCollections = ref(false)
@@ -47,14 +80,59 @@ const selectedFile = ref<File | null>(null)
 const threshold = ref(0.6)
 const tmCollections = ref<TMCollection[]>([])
 const selectedCollectionIds = ref<string[]>([])
+const basicCollapsed = ref(false)
+const activeTab = ref<ProjectTab>('files')
+const showUploadModal = ref(false)
+const uploadInputKey = ref(0)
+const openActionMenuId = ref<string | null>(null)
+const currentPage = ref(1)
+const pageSize = ref(10)
 
-const canEnterWorkbench = computed(() => (
-  Boolean(project.value?.has_source_document) && (project.value?.total_segments ?? 0) > 0
-))
+const tabs = computed(() => ([
+  { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
+  { key: 'settings' as const, label: t('projectDetail.tabs.settings'), disabled: true },
+  { key: 'stats' as const, label: t('projectDetail.tabs.stats'), disabled: true },
+  { key: 'summary' as const, label: t('projectDetail.tabs.summary'), disabled: true },
+  { key: 'quote' as const, label: t('projectDetail.tabs.quote'), disabled: true },
+]))
 
 const languagePairLabel = computed(() => (
   formatLanguagePair(project.value?.source_language ?? null, project.value?.target_language ?? null)
 ))
+
+const tableRows = computed(() => (project.value ? [project.value] : []))
+const pagedRows = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value
+  return tableRows.value.slice(start, start + pageSize.value)
+})
+const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
+
+const columns = computed<DataTableColumn[]>(() => ([
+  { key: 'filename', label: t('projectDetail.files.columns.details'), width: '280px' },
+  { key: 'progress', label: t('projectDetail.files.columns.progress'), width: '180px' },
+  { key: 'taskManage', label: t('projectDetail.files.columns.task'), width: '150px' },
+  { key: 'status', label: t('projectDetail.files.columns.status'), width: '120px' },
+  { key: 'created_at', label: t('projectDetail.files.columns.createdAt'), width: '170px' },
+  { key: 'target_language', label: t('projectDetail.files.columns.targetLang'), width: '130px' },
+  { key: 'file_size_bytes', label: t('projectDetail.files.columns.size'), width: '120px', align: 'right' },
+]))
+
+const canOpenUploadModal = computed(() => (
+  Boolean(project.value) && project.value?.has_source_document === false && tmCollections.value.length > 0
+))
+
+const uploadButtonTitle = computed(() => {
+  if (project.value?.has_source_document) {
+    return t('projectDetail.common.alreadyUploaded')
+  }
+  if (loadingCollections.value) {
+    return t('projectDetail.loading')
+  }
+  if (tmCollections.value.length === 0) {
+    return t('projectDetail.hints.noCollections')
+  }
+  return ''
+})
 
 usePageHeader(() => ({
   title: project.value?.filename || t('projectDetail.titleFallback'),
@@ -65,51 +143,147 @@ usePageHeader(() => ({
   ],
 }))
 
-function formatDate(value: string | null) {
-  if (!value) {
-    return '--'
-  }
-  return new Date(value).toLocaleString('zh-CN', { hour12: false })
+function getPlaceholder() {
+  return t('projectDetail.common.placeholder')
 }
 
-function formatAccessLevel(value: string | null) {
-  const labels: Record<string, string> = {
-    team: t('projectDetail.access.team'),
-    private: t('projectDetail.access.private'),
-    public: t('projectDetail.access.public'),
+function getErrorMessage(error: unknown, fallback: string) {
+  if (axios.isAxiosError(error)) {
+    return String(error.response?.data?.detail || fallback)
   }
-  return labels[value || 'team'] || t('projectDetail.access.team')
+  return error instanceof Error ? error.message : fallback
+}
+
+function formatDateParts(value: string | null) {
+  if (!value) {
+    return { date: getPlaceholder(), time: '' }
+  }
+
+  const date = new Date(value)
+  return {
+    date: date.toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }),
+    time: date.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+  }
+}
+
+function formatDateText(value: string | null) {
+  const parts = formatDateParts(value)
+  return parts.time ? `${parts.date} ${parts.time}` : parts.date
 }
 
 function formatStatus(value: string) {
-  const labels: Record<string, string> = {
-    draft: t('projectDetail.status.draft'),
-    in_progress: t('projectDetail.status.inProgress'),
-    pending: t('projectDetail.status.pending'),
-    processing: t('projectDetail.status.processing'),
-    completed: t('projectDetail.status.completed'),
-    translated: t('projectDetail.status.translated'),
-    error: t('projectDetail.status.error'),
+  return getFileStatusMeta(value).label
+}
+
+function getStatusClass(status: string) {
+  return `project-status--${getFileStatusMeta(status).tone}`
+}
+
+function formatBytes(value: number | null | undefined) {
+  if (value == null || Number.isNaN(value)) {
+    return getPlaceholder()
   }
-  return labels[value] || value
+
+  const units = ['B', 'KB', 'MB', 'GB']
+  let size = value
+  let unitIndex = 0
+
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024
+    unitIndex += 1
+  }
+
+  const decimals = size >= 10 || unitIndex === 0 ? 0 : 1
+  return `${size.toFixed(decimals)} ${units[unitIndex]}`
+}
+
+function canEnterWorkbench(row: ProjectRow) {
+  return Boolean(row.has_source_document) && Number(row.total_segments ?? 0) > 0
+}
+
+function getFileDetailHint(row: ProjectRow) {
+  if (canEnterWorkbench(row)) {
+    return t('projectDetail.files.openHint')
+  }
+  if (row.has_source_document) {
+    return t('projectDetail.files.processingHint')
+  }
+  return t('projectDetail.common.uploadRequired')
+}
+
+function getDeleteTitle() {
+  return authStore.isAdmin ? '' : t('projectDetail.common.deleteRequiresAdmin')
 }
 
 function onFileChange(event: Event) {
   selectedFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
 }
 
+function resetUploadForm() {
+  selectedFile.value = null
+  uploadMessage.value = ''
+  uploadPercent.value = 0
+  uploadInputKey.value += 1
+}
+
+function openUploadDialog() {
+  if (!canOpenUploadModal.value) {
+    return
+  }
+
+  resetUploadForm()
+  showUploadModal.value = true
+}
+
+function closeUploadDialog() {
+  if (uploading.value) {
+    return
+  }
+
+  showUploadModal.value = false
+  resetUploadForm()
+}
+
+function closeActionMenu() {
+  openActionMenuId.value = null
+}
+
+function toggleActionMenu(id: string) {
+  openActionMenuId.value = openActionMenuId.value === id ? null : id
+}
+
+function handleDocumentClick() {
+  closeActionMenu()
+}
+
+function goBack() {
+  void router.push({ name: 'projects' })
+}
+
+function openWorkbench(row: ProjectRow) {
+  if (!canEnterWorkbench(row)) {
+    return
+  }
+
+  closeActionMenu()
+  const rowId = String(row.id)
+  void router.push({
+    name: 'workbench',
+    params: { id: rowId },
+    query: { from: 'project', pid: rowId },
+  })
+}
+
 async function loadProject() {
   loading.value = true
   pageError.value = ''
+
   try {
     const { data } = await http.get<ProjectDetail>(`/projects/${props.id}`)
     project.value = data
+    currentPage.value = 1
   } catch (error) {
-    if (axios.isAxiosError(error)) {
-      pageError.value = String(error.response?.data?.detail || t('projectDetail.errors.load'))
-      return
-    }
-    pageError.value = error instanceof Error ? error.message : t('projectDetail.errors.load')
+    pageError.value = getErrorMessage(error, t('projectDetail.errors.load'))
   } finally {
     loading.value = false
   }
@@ -117,6 +291,7 @@ async function loadProject() {
 
 async function loadTMCollections() {
   loadingCollections.value = true
+
   try {
     const { data } = await http.get<TMCollection[]>('/translation-memory/collections')
     tmCollections.value = data
@@ -124,11 +299,7 @@ async function loadTMCollections() {
       selectedCollectionIds.value = [data[0].id]
     }
   } catch (error) {
-    if (axios.isAxiosError(error)) {
-      pageError.value = String(error.response?.data?.detail || t('projectDetail.errors.collectionsLoad'))
-      return
-    }
-    pageError.value = error instanceof Error ? error.message : t('projectDetail.errors.collectionsLoad')
+    pageError.value = getErrorMessage(error, t('projectDetail.errors.collectionsLoad'))
   } finally {
     loadingCollections.value = false
   }
@@ -168,81 +339,133 @@ async function uploadSourceDocument() {
     })
 
     await loadProject()
+    showUploadModal.value = false
+    resetUploadForm()
     toast.success(t('projectDetail.messages.uploaded'))
-    await router.push({
-      name: 'workbench',
-      params: { id: props.id },
-      query: { from: 'project', pid: props.id },
-    })
   } catch (error) {
-    if (axios.isAxiosError(error)) {
-      uploadMessage.value = String(error.response?.data?.detail || t('projectDetail.errors.upload'))
-      return
-    }
-    uploadMessage.value = error instanceof Error ? error.message : t('projectDetail.errors.upload')
+    uploadMessage.value = getErrorMessage(error, t('projectDetail.errors.upload'))
   } finally {
     uploading.value = false
     uploadPercent.value = 0
   }
 }
 
+async function exportProjectFile(row: ProjectRow) {
+  if (!row.has_source_document) {
+    return
+  }
+
+  closeActionMenu()
+  pageError.value = ''
+  const rowId = String(row.id)
+  const filename = String(row.filename || 'translated.docx')
+
+  try {
+    const response = await http.get(`/file-records/${rowId}/export-docx`, {
+      responseType: 'blob',
+    })
+    const blobUrl = window.URL.createObjectURL(response.data)
+    const link = document.createElement('a')
+    link.href = blobUrl
+    link.download = `${filename.replace(/\.docx$/i, '') || 'translated'}-translated.docx`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    window.URL.revokeObjectURL(blobUrl)
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('projectDetail.errors.export'))
+  }
+}
+
+async function deleteProject(row: ProjectRow) {
+  closeActionMenu()
+
+  if (!authStore.isAdmin) {
+    return
+  }
+
+  const rowId = String(row.id)
+  const filename = String(row.filename || t('projectDetail.titleFallback'))
+
+  const confirmed = await confirm({
+    title: t('projectDetail.files.actions.delete'),
+    message: t('projectDetail.messages.deleteConfirm', { name: filename }),
+    confirmText: t('common.actions.delete'),
+    danger: true,
+  })
+
+  if (!confirmed) {
+    return
+  }
+
+  deleting.value = true
+  pageError.value = ''
+
+  try {
+    await http.delete(`/file-records/${rowId}`)
+    toast.success(t('projectDetail.messages.deleted', { name: filename }))
+    await router.push({ name: 'projects' })
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('projectDetail.errors.delete'))
+  } finally {
+    deleting.value = false
+  }
+}
+
 onMounted(() => {
+  document.addEventListener('click', handleDocumentClick)
   void loadProject()
   void loadTMCollections()
+})
+
+onBeforeUnmount(() => {
+  document.removeEventListener('click', handleDocumentClick)
 })
 </script>
 
 <template>
-  <div class="content-stack">
-    <section class="panel panel--hero">
-      <div class="panel-header">
-        <div>
-          <div class="section-title section-title--tight">{{ project?.filename || t('projectDetail.titleFallback') }}</div>
-          <p class="panel-subtitle">{{ t('projectDetail.heroSubtitle') }}</p>
+  <div class="content-stack pd-layout">
+    <section class="panel pd-hero">
+      <div class="pd-hero__main">
+        <div class="pd-hero__left">
+          <button class="button" type="button" @click="goBack">
+            <ArrowLeft :size="16" />
+            {{ t('projectDetail.back') }}
+          </button>
+          <div class="pd-hero__copy">
+            <div class="section-title section-title--tight">
+              {{ t('projectDetail.hero.title', { name: project?.filename || t('projectDetail.titleFallback') }) }}
+            </div>
+            <p class="panel-subtitle">{{ t('projectDetail.description') }}</p>
+          </div>
         </div>
 
-        <div class="header-actions">
-          <button class="button" type="button" @click="router.push({ name: 'projects' })">
-            <ArrowLeft /> {{ t('projectDetail.back') }}
-          </button>
-          <button
-            v-if="canEnterWorkbench"
-            class="button button--primary"
-            type="button"
-            @click="router.push({ name: 'workbench', params: { id: props.id }, query: { from: 'project', pid: props.id } })"
-          >
-            <ArrowRight /> {{ t('projectDetail.enterWorkbench') }}
-          </button>
-        </div>
-      </div>
-
-      <div class="summary-grid summary-grid--wide">
-        <div class="summary-item">
-          <strong>{{ formatStatus(project?.status || 'draft') }}</strong>
-          <span>{{ t('projectDetail.summaries.currentStatus') }}</span>
-        </div>
-        <div class="summary-item">
-          <strong>{{ languagePairLabel }}</strong>
-          <span>{{ t('projectDetail.summaries.languagePair') }}</span>
-        </div>
-        <div class="summary-item">
-          <strong>{{ project?.progress ?? 0 }}%</strong>
-          <span>{{ t('projectDetail.summaries.progress') }}</span>
-        </div>
-        <div class="summary-item">
-          <strong>{{ project?.total_segments ?? 0 }}</strong>
-          <span>{{ t('projectDetail.summaries.totalSegments') }}</span>
-        </div>
-        <div class="summary-item">
-          <strong>{{ project?.creator || '--' }}</strong>
-          <span>{{ t('projectDetail.summaries.creator') }}</span>
-        </div>
-        <div class="summary-item">
-          <strong>{{ formatAccessLevel(project?.access_level || null) }}</strong>
-          <span>{{ t('projectDetail.summaries.accessLevel') }}</span>
+        <div class="pd-hero__progress">
+          <span class="pd-hero__progress-label">{{ t('projectDetail.totals.progressLabel') }}</span>
+          <div class="progress-bar pd-hero__progress-bar">
+            <div class="progress-bar__track">
+              <div class="progress-bar__fill" :style="getProgressStyle(project?.progress ?? 0)" />
+            </div>
+            <span class="progress-bar__text">{{ project?.progress ?? 0 }}%</span>
+          </div>
         </div>
       </div>
     </section>
+
+    <nav class="pd-tabs" :aria-label="t('pages.projectDetail.title')">
+      <button
+        v-for="tab in tabs"
+        :key="tab.key"
+        class="pd-tabs__item"
+        :class="{ 'is-active': activeTab === tab.key }"
+        type="button"
+        :disabled="tab.disabled"
+        :title="tab.disabled ? t('projectDetail.common.comingSoon') : undefined"
+        @click="activeTab = tab.key"
+      >
+        {{ tab.label }}
+      </button>
+    </nav>
 
     <p v-if="pageError" class="form-message is-error">{{ pageError }}</p>
 
@@ -254,146 +477,656 @@ onMounted(() => {
     </section>
 
     <template v-else-if="project">
-      <section v-if="!project.has_source_document" class="panel">
-        <div class="panel-header panel-header--compact">
-          <div>
-            <div class="section-title section-title--tight">{{ t('projectDetail.uploadSectionTitle') }}</div>
-            <p class="panel-subtitle">{{ t('projectDetail.uploadSectionDescription') }}</p>
+      <section class="panel">
+        <div class="pd-panel-head">
+          <div class="pd-panel-head__copy">
+            <div class="section-title section-title--tight">{{ t('projectDetail.base.title') }}</div>
+            <p class="panel-subtitle">{{ t('projectDetail.base.description') }}</p>
           </div>
+          <button class="button pd-panel-toggle" type="button" @click="basicCollapsed = !basicCollapsed">
+            {{ basicCollapsed ? t('projectDetail.base.expand') : t('projectDetail.base.collapse') }}
+            <ChevronDown v-if="basicCollapsed" :size="16" />
+            <ChevronUp v-else :size="16" />
+          </button>
         </div>
 
-        <div class="upload-form form-grid-2">
-          <label class="field">
-            <span class="field__label">{{ t('projectDetail.fields.wordFile') }}</span>
-            <input class="field__control" type="file" accept=".docx" :aria-label="t('projectDetail.fields.wordFile')" @change="onFileChange" />
-          </label>
-
-          <label class="field field--compact">
-            <span class="field__label">{{ t('projectDetail.fields.threshold') }}</span>
-            <input
-              v-model.number="threshold"
-              class="field__control"
-              type="number"
-              step="0.05"
-              min="0"
-              max="1"
-              :aria-label="t('projectDetail.fields.threshold')"
-            />
-          </label>
-
-          <label class="field field--full">
-            <span class="field__label">{{ t('projectDetail.fields.collections') }}</span>
-            <select
-              v-model="selectedCollectionIds"
-              class="field__control field__control--multi"
-              multiple
-              :disabled="loadingCollections || tmCollections.length === 0"
-              :aria-label="t('projectDetail.fields.collections')"
-            >
-              <option v-for="collection in tmCollections" :key="collection.id" :value="collection.id">
-                {{ collection.name }}（{{ formatLanguagePair(collection.source_language, collection.target_language) }} / {{ collection.entry_count }} 条）
-              </option>
-            </select>
-            <span class="hint-text">
-              {{ tmCollections.length ? t('projectDetail.hints.collections') : t('projectDetail.hints.noCollections') }}
+        <div v-if="!basicCollapsed" class="pd-basic-grid">
+          <label class="pd-field">
+            <span class="pd-field__label">{{ t('projectDetail.base.status') }}</span>
+            <span class="pd-field__value">
+              <span class="project-status" :class="getStatusClass(project.status)">
+                {{ formatStatus(project.status) }}
+              </span>
             </span>
           </label>
+          <label class="pd-field">
+            <span class="pd-field__label">{{ t('projectDetail.base.languagePair') }}</span>
+            <span class="pd-field__value">{{ languagePairLabel }}</span>
+          </label>
+          <label class="pd-field">
+            <span class="pd-field__label">{{ t('projectDetail.base.workflow') }}</span>
+            <span class="pd-field__value">{{ t('projectDetail.base.workflowValue') }}</span>
+          </label>
+          <label class="pd-field">
+            <span class="pd-field__label">{{ t('projectDetail.base.createdAt') }}</span>
+            <span class="pd-field__value">{{ formatDateText(project.created_at) }}</span>
+          </label>
+          <label class="pd-field">
+            <span class="pd-field__label">{{ t('projectDetail.base.totalWords') }}</span>
+            <span class="pd-field__value">{{ project.total_segments }}</span>
+          </label>
+          <label class="pd-field">
+            <span class="pd-field__label">{{ t('projectDetail.base.deadline') }}</span>
+            <span class="pd-field__value">{{ formatDateText(project.deadline) }}</span>
+          </label>
+          <label class="pd-field">
+            <span class="pd-field__label">{{ t('projectDetail.base.domain') }}</span>
+            <span class="pd-field__value">{{ getPlaceholder() }}</span>
+          </label>
+          <label class="pd-field">
+            <span class="pd-field__label">{{ t('projectDetail.base.fileCount') }}</span>
+            <span class="pd-field__value">{{ tableRows.length }}</span>
+          </label>
+          <label class="pd-field">
+            <span class="pd-field__label">{{ t('projectDetail.base.creator') }}</span>
+            <span class="pd-field__value">{{ project.creator || getPlaceholder() }}</span>
+          </label>
+          <label class="pd-field">
+            <span class="pd-field__label">{{ t('projectDetail.base.pm') }}</span>
+            <span class="pd-field__value">{{ getPlaceholder() }}</span>
+          </label>
         </div>
-
-        <div class="project-detail__footer">
-          <div class="project-detail__meta">
-            <span class="tag">{{ t('projectDetail.summaries.createdAt') }}：{{ formatDate(project.created_at) }}</span>
-            <span class="tag">{{ t('projectDetail.summaries.deadline') }}：{{ formatDate(project.deadline) }}</span>
-          </div>
-          <button
-            class="button button--primary"
-            type="button"
-            :disabled="uploading || loadingCollections || tmCollections.length === 0 || selectedCollectionIds.length === 0"
-            @click="uploadSourceDocument"
-          >
-            <Loader2 v-if="uploading" class="lucide-spin" />
-            <Upload v-else :size="14" />
-            {{ uploading ? t('projectDetail.messages.uploading', { percent: uploadPercent }) : t('projectDetail.messages.startUpload') }}
-          </button>
-        </div>
-
-        <div v-if="uploading" class="project-detail__progress">
-          <div class="progress-bar">
-            <div class="progress-bar__track">
-              <div class="progress-bar__fill" :style="{ width: `${uploadPercent}%` }" />
-            </div>
-            <span class="progress-bar__text">{{ uploadPercent }}%</span>
-          </div>
-        </div>
-
-        <p v-if="uploadMessage" class="form-message is-error">{{ uploadMessage }}</p>
       </section>
 
-      <section v-else class="panel">
-        <div class="panel-header panel-header--compact">
-          <div>
-            <div class="section-title section-title--tight">{{ t('projectDetail.readyTitle') }}</div>
-            <p class="panel-subtitle">{{ t('projectDetail.readyDescription') }}</p>
+      <section class="panel">
+        <div class="pd-panel-head">
+          <div class="pd-panel-head__copy">
+            <div class="section-title section-title--tight">{{ t('projectDetail.files.title') }}</div>
+            <p class="panel-subtitle">{{ t('projectDetail.files.description') }}</p>
           </div>
-          <button
-            class="button button--primary"
-            type="button"
-            @click="router.push({ name: 'workbench', params: { id: props.id }, query: { from: 'project', pid: props.id } })"
-          >
-            <ArrowRight /> {{ t('projectDetail.enterWorkbench') }}
-          </button>
         </div>
 
-        <div class="summary-grid summary-grid--wide">
-          <div class="summary-item">
-            <strong>{{ project.total_segments }}</strong>
-            <span>{{ t('projectDetail.summaries.totalSegments') }}</span>
+        <div class="table-toolbar pd-toolbar">
+          <div class="table-toolbar__left pd-toolbar__left">
+            <button
+              class="button button--primary"
+              type="button"
+              :disabled="!canOpenUploadModal"
+              :title="uploadButtonTitle || undefined"
+              @click="openUploadDialog"
+            >
+              <Upload :size="14" />
+              {{ t('projectDetail.files.actions.upload') }}
+            </button>
+            <button class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
+              <Link :size="14" />
+              {{ t('projectDetail.files.actions.link') }}
+            </button>
+            <button class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
+              <BookOpen :size="14" />
+              {{ t('projectDetail.files.actions.glossary') }}
+            </button>
+            <button class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
+              <Users :size="14" />
+              {{ t('projectDetail.files.actions.assign') }}
+            </button>
+            <button
+              class="button"
+              type="button"
+              :disabled="!project.has_source_document"
+              :title="!project.has_source_document ? t('projectDetail.common.uploadRequired') : undefined"
+              @click="exportProjectFile(project)"
+            >
+              <Download :size="14" />
+              {{ t('projectDetail.files.actions.export') }}
+            </button>
+            <button class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
+              <Clock3 :size="14" />
+              {{ t('projectDetail.files.actions.modifyTaskType') }}
+            </button>
+            <button class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
+              <FolderOpen :size="14" />
+              {{ t('projectDetail.files.actions.mergeOpen') }}
+            </button>
+            <button
+              class="button"
+              type="button"
+              :disabled="!authStore.isAdmin || deleting"
+              :title="getDeleteTitle() || undefined"
+              @click="deleteProject(project)"
+            >
+              <Trash2 :size="14" />
+              {{ t('projectDetail.files.actions.delete') }}
+            </button>
           </div>
-          <div class="summary-item">
-            <strong>{{ project.translated_segments }}</strong>
-            <span>{{ t('projectDetail.summaries.translatedSegments') }}</span>
-          </div>
-          <div class="summary-item">
-            <strong>{{ project.progress }}%</strong>
-            <span>{{ t('projectDetail.summaries.progress') }}</span>
-          </div>
-          <div class="summary-item">
-            <strong>{{ formatDate(project.updated_at) }}</strong>
-            <span>{{ t('projectDetail.summaries.updatedAt') }}</span>
+
+          <div class="table-toolbar__right pd-toolbar__right">
+            <button class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
+              <Filter :size="14" />
+              {{ t('projectDetail.files.actions.filter') }}
+            </button>
+            <button class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
+              <Settings2 :size="14" />
+              {{ t('projectDetail.files.actions.columns') }}
+            </button>
           </div>
         </div>
+
+        <DataTable
+          :columns="columns"
+          :data="pagedRows"
+          :loading="loading"
+          :show-index="true"
+          :index-offset="indexOffset"
+          :empty-text="t('projectDetail.files.empty')"
+        >
+          <template #filename="{ row }">
+            <div class="pd-file-cell">
+              <FileText class="pd-file-cell__icon" :size="18" />
+              <div class="pd-file-cell__content">
+                <button
+                  v-if="canEnterWorkbench(row)"
+                  class="pd-link-button"
+                  type="button"
+                  @click="openWorkbench(row)"
+                >
+                  {{ row.filename }}
+                </button>
+                <span v-else class="pd-file-cell__title">{{ row.filename }}</span>
+                <span class="pd-file-cell__meta">{{ getFileDetailHint(row) }}</span>
+              </div>
+            </div>
+          </template>
+
+          <template #progress="{ row }">
+            <div class="progress-bar">
+              <div class="progress-bar__track">
+                <div class="progress-bar__fill" :style="getProgressStyle(row.progress)" />
+              </div>
+              <span class="progress-bar__text">{{ row.progress }}%</span>
+            </div>
+          </template>
+
+          <template #taskManage>
+            <div class="pd-task-links">
+              <button class="pd-inline-link" type="button" disabled :title="t('projectDetail.common.comingSoon')">
+                {{ t('projectDetail.files.task.assign') }}
+              </button>
+              <button class="pd-inline-link" type="button" disabled :title="t('projectDetail.common.comingSoon')">
+                {{ t('projectDetail.files.task.detail') }}
+              </button>
+            </div>
+          </template>
+
+          <template #status="{ row }">
+            <span class="project-status" :class="getStatusClass(row.status)">
+              {{ formatStatus(row.status) }}
+            </span>
+          </template>
+
+          <template #created_at="{ row }">
+            <div class="date-cell">
+              {{ formatDateParts(row.created_at).date }}<br>{{ formatDateParts(row.created_at).time }}
+            </div>
+          </template>
+
+          <template #target_language="{ row }">
+            <span>{{ row.target_language ? getLanguageLabel(row.target_language) : getPlaceholder() }}</span>
+          </template>
+
+          <template #file_size_bytes="{ row }">
+            <span>{{ formatBytes(row.file_size_bytes) }}</span>
+          </template>
+
+          <template #actions="{ row }">
+            <div class="pd-row-actions" @click.stop>
+              <div class="pd-action-menu">
+                <button
+                  class="data-table__actions-btn"
+                  type="button"
+                  :title="t('projectDetail.files.columns.actions')"
+                  :aria-label="t('projectDetail.files.columns.actions')"
+                  @click.stop="toggleActionMenu(row.id)"
+                >
+                  <MoreHorizontal :size="16" />
+                </button>
+
+                <div v-if="openActionMenuId === row.id" class="pd-action-menu__dropdown">
+                  <button
+                    type="button"
+                    :disabled="!canEnterWorkbench(row)"
+                    :title="!canEnterWorkbench(row) ? getFileDetailHint(row) : undefined"
+                    @click="openWorkbench(row)"
+                  >
+                    {{ t('projectDetail.enterWorkbench') }}
+                  </button>
+                  <button
+                    type="button"
+                    :disabled="!row.has_source_document"
+                    :title="!row.has_source_document ? t('projectDetail.common.uploadRequired') : undefined"
+                    @click="exportProjectFile(row)"
+                  >
+                    {{ t('projectDetail.files.actions.export') }}
+                  </button>
+                  <button
+                    class="is-danger"
+                    type="button"
+                    :disabled="!authStore.isAdmin || deleting"
+                    :title="getDeleteTitle() || undefined"
+                    @click="deleteProject(row)"
+                  >
+                    {{ t('projectDetail.files.actions.delete') }}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </template>
+        </DataTable>
+
+        <Pagination
+          :total="tableRows.length"
+          :page="currentPage"
+          :page-size="pageSize"
+          :page-sizes="[10]"
+          @update:page="currentPage = $event"
+          @update:page-size="pageSize = $event"
+        />
       </section>
     </template>
+
+    <Modal
+      :open="showUploadModal"
+      :title="t('projectDetail.uploadDialog.title')"
+      :description="t('projectDetail.uploadDialog.description')"
+      width="min(680px, calc(100vw - 32px))"
+      @close="closeUploadDialog"
+    >
+      <div class="form-grid-2">
+        <label class="field">
+          <span class="field__label">{{ t('projectDetail.fields.wordFile') }}</span>
+          <input
+            :key="uploadInputKey"
+            class="field__control"
+            type="file"
+            accept=".docx"
+            :aria-label="t('projectDetail.fields.wordFile')"
+            @change="onFileChange"
+          />
+        </label>
+
+        <label class="field field--compact">
+          <span class="field__label">{{ t('projectDetail.fields.threshold') }}</span>
+          <input
+            v-model.number="threshold"
+            class="field__control"
+            type="number"
+            step="0.05"
+            min="0"
+            max="1"
+            :aria-label="t('projectDetail.fields.threshold')"
+          />
+        </label>
+
+        <label class="field field--full">
+          <span class="field__label">{{ t('projectDetail.fields.collections') }}</span>
+          <select
+            v-model="selectedCollectionIds"
+            class="field__control field__control--multi"
+            multiple
+            :disabled="loadingCollections || tmCollections.length === 0"
+            :aria-label="t('projectDetail.fields.collections')"
+          >
+            <option v-for="collection in tmCollections" :key="collection.id" :value="collection.id">
+              {{ collection.name }}（{{ formatLanguagePair(collection.source_language, collection.target_language) }} / {{ collection.entry_count }} 条）
+            </option>
+          </select>
+          <span class="hint-text">
+            {{ tmCollections.length ? t('projectDetail.hints.collections') : t('projectDetail.hints.noCollections') }}
+          </span>
+        </label>
+      </div>
+
+      <div v-if="uploading" class="pd-upload-progress">
+        <div class="progress-bar">
+          <div class="progress-bar__track">
+            <div class="progress-bar__fill" :style="{ width: `${uploadPercent}%` }" />
+          </div>
+          <span class="progress-bar__text">{{ uploadPercent }}%</span>
+        </div>
+      </div>
+
+      <p v-if="uploadMessage" class="form-message is-error">{{ uploadMessage }}</p>
+
+      <template #footer>
+        <button class="button" type="button" :disabled="uploading" @click="closeUploadDialog">
+          {{ t('common.actions.cancel') }}
+        </button>
+        <button
+          class="button button--primary"
+          type="button"
+          :disabled="uploading || loadingCollections || tmCollections.length === 0 || selectedCollectionIds.length === 0"
+          @click="uploadSourceDocument"
+        >
+          <Loader2 v-if="uploading" class="lucide-spin" :size="14" />
+          <Upload v-else :size="14" />
+          {{ uploading ? t('projectDetail.messages.uploading', { percent: uploadPercent }) : t('projectDetail.messages.startUpload') }}
+        </button>
+      </template>
+    </Modal>
   </div>
 </template>
 
 <style scoped>
-.project-detail__footer {
-  display: flex;
-  justify-content: space-between;
+.pd-layout {
   gap: 16px;
-  align-items: center;
-  margin-top: 18px;
 }
 
-.project-detail__meta {
+.pd-hero {
+  padding: 20px;
+}
+
+.pd-hero__main {
   display: flex;
-  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.pd-hero__left {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  min-width: 0;
+}
+
+.pd-hero__copy {
+  display: grid;
+  gap: 6px;
+}
+
+.pd-hero__progress {
+  width: min(320px, 100%);
+  display: grid;
   gap: 8px;
 }
 
-.project-detail__progress {
+.pd-hero__progress-label {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.pd-hero__progress-bar {
+  width: 100%;
+}
+
+.pd-tabs {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 6px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.pd-tabs__item {
+  position: relative;
+  padding: 12px 8px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 14px;
+  font-weight: 500;
+  box-shadow: none;
+}
+
+.pd-tabs__item::after {
+  content: '';
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 0;
+  height: 2px;
+  border-radius: 999px;
+  background: transparent;
+}
+
+.pd-tabs__item.is-active {
+  color: var(--text-primary);
+}
+
+.pd-tabs__item.is-active::after {
+  background: var(--brand-700);
+}
+
+.pd-tabs__item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.pd-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.pd-panel-head__copy {
+  display: grid;
+  gap: 4px;
+}
+
+.pd-panel-toggle {
+  flex-shrink: 0;
+}
+
+.pd-basic-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px 28px;
+}
+
+.pd-field {
+  display: grid;
+  gap: 6px;
+}
+
+.pd-field__label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.pd-field__value {
+  color: var(--text-primary);
+  word-break: break-word;
+}
+
+.pd-toolbar {
+  padding: 8px 0 16px;
+  flex-wrap: wrap;
+}
+
+.pd-toolbar__left,
+.pd-toolbar__right {
+  flex-wrap: wrap;
+}
+
+.pd-file-cell {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.pd-file-cell__icon {
+  margin-top: 2px;
+  color: var(--brand-700);
+}
+
+.pd-file-cell__content {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.pd-link-button {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--brand-700);
+  text-align: left;
+  box-shadow: none;
+}
+
+.pd-link-button:hover {
+  color: var(--brand-600);
+}
+
+.pd-file-cell__title {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.pd-file-cell__meta {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.pd-task-links {
+  display: grid;
+  justify-items: start;
+  gap: 4px;
+}
+
+.pd-inline-link {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  box-shadow: none;
+}
+
+.pd-inline-link:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.pd-row-actions {
+  display: flex;
+  justify-content: center;
+  position: relative;
+}
+
+.pd-action-menu {
+  position: relative;
+}
+
+.pd-action-menu__dropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  min-width: 148px;
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-soft);
+}
+
+.pd-action-menu__dropdown button {
+  justify-content: flex-start;
+  min-height: 34px;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  box-shadow: none;
+}
+
+.pd-action-menu__dropdown button:hover:not(:disabled) {
+  background: var(--surface-muted);
+  color: var(--text-primary);
+}
+
+.pd-action-menu__dropdown button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.pd-action-menu__dropdown button.is-danger {
+  color: var(--state-danger);
+}
+
+.pd-action-menu__dropdown button.is-danger:hover:not(:disabled) {
+  background: var(--state-danger-bg);
+}
+
+.pd-upload-progress {
   margin-top: 12px;
+}
+
+.project-status {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.project-status--info {
+  color: var(--state-info);
+  background: var(--state-info-bg);
+}
+
+.project-status--success {
+  color: var(--state-success);
+  background: var(--state-success-bg);
+}
+
+.project-status--warning {
+  color: var(--state-warning);
+  background: var(--state-warning-bg);
+}
+
+.project-status--danger {
+  color: var(--state-danger);
+  background: var(--state-danger-bg);
+}
+
+.project-status--default {
+  color: var(--text-secondary);
+  background: var(--surface-muted);
 }
 
 .field--full {
   grid-column: 1 / -1;
 }
 
+@media (max-width: 960px) {
+  .pd-basic-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 @media (max-width: 720px) {
-  .project-detail__footer {
+  .pd-hero__main,
+  .pd-hero__left,
+  .pd-panel-head {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .pd-basic-grid {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+
+  .pd-tabs {
+    overflow-x: auto;
   }
 }
 </style>

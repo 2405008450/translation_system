@@ -77,6 +77,7 @@ class User(Base):
         server_default=UUID_SQL_DEFAULT,
     )
     username: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    nickname: Mapped[str | None] = mapped_column(String(50), nullable=True)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(20), nullable=False, default="user")
     is_active: Mapped[bool] = mapped_column(nullable=False, default=True)

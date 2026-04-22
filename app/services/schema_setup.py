@@ -41,6 +41,7 @@ REQUIRED_SCHEMA = {
         "source_language",
         "target_language",
     },
+    "users": {"nickname"},
 }
 
 
@@ -283,6 +284,25 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             BEFORE UPDATE ON term_entries
             FOR EACH ROW
             EXECUTE FUNCTION update_updated_at_column()
+            """,
+            """
+            ALTER TABLE IF EXISTS users
+            ADD COLUMN IF NOT EXISTS nickname VARCHAR(50)
+            """,
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'users'
+                ) THEN
+                    UPDATE users
+                    SET nickname = username
+                    WHERE nickname IS NULL OR btrim(nickname) = '';
+                END IF;
+            END
+            $$;
             """,
         ]
     )

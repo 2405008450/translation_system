@@ -1,27 +1,35 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { ArrowLeft, Loader2, Pencil, RefreshCw, Save, Search } from 'lucide-vue-next'
+import { ArrowLeft, Download, Loader2, Pencil, Plus, RefreshCw, Save, Search, Trash2, Upload } from 'lucide-vue-next'
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { http } from '../api/http'
 import DataTable from '../components/DataTable.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
+import ResourceImportDialog from '../components/ResourceImportDialog.vue'
+import Modal from '../components/base/Modal.vue'
 import Pagination from '../components/Pagination.vue'
+import { useConfirm } from '../composables/useConfirm'
 import { formatLanguagePair, languageOptions } from '../constants/languages'
 import type { PaginatedResponse, TermBase, TermEntryRecord } from '../types/api'
+import { downloadBlob } from '../utils/download'
 
 const props = defineProps<{
   id: string
 }>()
 
 const router = useRouter()
+const confirm = useConfirm()
 
 const termBase = ref<TermBase | null>(null)
 const loadingBase = ref(false)
 const loadingEntries = ref(false)
 const savingBase = ref(false)
 const savingEntry = ref(false)
+const creatingEntry = ref(false)
+const exportingEntries = ref(false)
+const deletingEntryId = ref('')
 const pageError = ref('')
 const baseMessage = ref('')
 const entryMessage = ref('')
@@ -39,6 +47,11 @@ const entries = ref<TermEntryRecord[]>([])
 const editingEntryId = ref('')
 const editingSourceText = ref('')
 const editingTargetText = ref('')
+
+const showCreateEntryDialog = ref(false)
+const showImportDialog = ref(false)
+const newSourceText = ref('')
+const newTargetText = ref('')
 
 const entryColumns: DataTableColumn[] = [
   { key: 'source_text', label: '术语原文' },
@@ -94,11 +107,20 @@ function startEditing(entry: TermEntryRecord | Record<string, any>) {
   entryMessage.value = ''
 }
 
+function normalizeEntry(entry: TermEntryRecord | Record<string, any>): TermEntryRecord {
+  return entry as TermEntryRecord
+}
+
 function cancelEditing() {
   editingEntryId.value = ''
   editingSourceText.value = ''
   editingTargetText.value = ''
   entryMessage.value = ''
+}
+
+function resetCreateEntryForm() {
+  newSourceText.value = ''
+  newTargetText.value = ''
 }
 
 async function loadBase() {
@@ -176,6 +198,37 @@ async function saveBase() {
   }
 }
 
+async function createEntry() {
+  if (!termBase.value) {
+    return
+  }
+
+  entryMessage.value = ''
+  creatingEntry.value = true
+  try {
+    const { data } = await http.post<TermEntryRecord>(
+      `/term-bases/${termBase.value.id}/entries`,
+      {
+        source_text: newSourceText.value,
+        target_text: newTargetText.value,
+      },
+    )
+    showCreateEntryDialog.value = false
+    resetCreateEntryForm()
+    currentPage.value = 1
+    await reloadPage()
+    const created = entries.value.find((item) => item.id === data.id)
+    if (created) {
+      startEditing(created)
+    }
+    entryMessage.value = '术语条目已新增。'
+  } catch (error) {
+    entryMessage.value = getErrorMessage(error, '术语条目新增失败。')
+  } finally {
+    creatingEntry.value = false
+  }
+}
+
 async function saveEntry() {
   if (!editingEntryId.value) {
     return
@@ -203,8 +256,64 @@ async function saveEntry() {
   }
 }
 
+async function deleteEntry(rawEntry: TermEntryRecord | Record<string, any>) {
+  const entry = normalizeEntry(rawEntry)
+  const confirmed = await confirm({
+    title: '删除术语条目',
+    message: '确定删除该条术语记录吗？',
+    confirmText: '删除',
+    danger: true,
+  })
+  if (!confirmed) {
+    return
+  }
+
+  deletingEntryId.value = entry.id
+  entryMessage.value = ''
+  try {
+    await http.delete(`/term-entries/${entry.id}`)
+    if (editingEntryId.value === entry.id) {
+      cancelEditing()
+    }
+    if (entries.value.length === 1 && currentPage.value > 1) {
+      currentPage.value -= 1
+    }
+    await reloadPage()
+    entryMessage.value = '术语条目已删除。'
+  } catch (error) {
+    entryMessage.value = getErrorMessage(error, '术语条目删除失败。')
+  } finally {
+    deletingEntryId.value = ''
+  }
+}
+
+async function exportEntries() {
+  if (!termBase.value) {
+    return
+  }
+
+  exportingEntries.value = true
+  entryMessage.value = ''
+  try {
+    const response = await http.get(`/term-bases/${termBase.value.id}/export-xlsx`, {
+      responseType: 'blob',
+    })
+    downloadBlob(response.data, `${termBase.value.name}-term-base.xlsx`)
+    entryMessage.value = '术语条目已导出为 XLSX。'
+  } catch (error) {
+    entryMessage.value = getErrorMessage(error, '术语条目导出失败。')
+  } finally {
+    exportingEntries.value = false
+  }
+}
+
 function goBack() {
-  router.push({ name: 'term-base' })
+  void router.push({ name: 'term-base' })
+}
+
+function openCreateEntryDialog() {
+  resetCreateEntryForm()
+  showCreateEntryDialog.value = true
 }
 
 function runEntrySearch() {
@@ -213,6 +322,15 @@ function runEntrySearch() {
     return
   }
   void loadEntries()
+}
+
+async function handleImported(payload: { tab: 'tm' | 'term' }) {
+  if (payload.tab !== 'term') {
+    return
+  }
+  showImportDialog.value = false
+  await reloadPage()
+  entryMessage.value = '导入完成，列表已刷新。'
 }
 
 watch([currentPage, pageSize], () => {
@@ -240,9 +358,9 @@ onMounted(() => {
             返回术语库管理
           </button>
           <div class="section-title section-title--tight" style="margin-top: 14px;">
-            {{ termBase?.name || '编辑术语库' }}
+            {{ termBase?.name || '术语库详情' }}
           </div>
-          <p class="panel-subtitle">维护语言对、基础信息和术语键值对。</p>
+          <p class="panel-subtitle">像任务详情页一样集中管理基础信息、术语条目、导入和导出。</p>
         </div>
         <div class="summary-grid" style="min-width: min(420px, 100%);">
           <div class="summary-item">
@@ -326,10 +444,13 @@ onMounted(() => {
       <section class="panel panel--stretch">
         <div class="panel-header panel-header--compact">
           <div>
-            <div class="section-title section-title--tight">术语条目编辑</div>
-            <p class="panel-subtitle">先从下面选择一条术语，再修改原文和译文。</p>
+            <div class="section-title section-title--tight">术语条目</div>
+            <p class="panel-subtitle">支持手动新增、导入 Excel、导出 XLSX，以及逐条编辑和删除。</p>
           </div>
-          <div class="table-toolbar__right">
+        </div>
+
+        <div class="table-toolbar" style="padding: 0 0 12px;">
+          <div class="table-toolbar__left">
             <div class="table-page__search">
               <Search :size="14" class="table-page__search-icon" />
               <input
@@ -340,6 +461,22 @@ onMounted(() => {
                 @keyup.enter="runEntrySearch"
               />
             </div>
+            <span style="font-size: 13px; color: var(--ink-500);">{{ entryCountLabel }}</span>
+          </div>
+          <div class="table-toolbar__right">
+            <button class="button button--primary" type="button" @click="openCreateEntryDialog">
+              <Plus :size="14" />
+              手动新增
+            </button>
+            <button class="button" type="button" @click="showImportDialog = true">
+              <Upload :size="14" />
+              导入
+            </button>
+            <button class="button" type="button" :disabled="exportingEntries" @click="exportEntries">
+              <Loader2 v-if="exportingEntries" class="lucide-spin" :size="14" />
+              <Download v-else :size="14" />
+              导出 XLSX
+            </button>
             <button class="button" type="button" @click="runEntrySearch">搜索</button>
             <button class="button" type="button" :disabled="loadingEntries" @click="loadEntries">
               <RefreshCw :size="14" />
@@ -409,9 +546,20 @@ onMounted(() => {
           </template>
 
           <template #actions="{ row }">
-            <button class="data-table__actions-btn" type="button" title="编辑术语" @click="startEditing(row)">
-              <Pencil :size="14" />
-            </button>
+            <div class="asset-entry-actions">
+              <button class="data-table__actions-btn" type="button" title="编辑术语" @click="startEditing(row)">
+                <Pencil :size="14" />
+              </button>
+              <button
+                class="data-table__actions-btn"
+                type="button"
+                title="删除术语"
+                :disabled="deletingEntryId === row.id"
+                @click="deleteEntry(row)"
+              >
+                <Trash2 :size="14" />
+              </button>
+            </div>
           </template>
         </DataTable>
 
@@ -425,5 +573,63 @@ onMounted(() => {
         />
       </section>
     </template>
+
+    <Modal
+      :open="showCreateEntryDialog"
+      title="手动新增术语条目"
+      description="填写术语原文和译文后会直接写入当前术语库。"
+      width="min(760px, calc(100vw - 32px))"
+      @close="showCreateEntryDialog = false"
+    >
+      <div class="form-grid-2">
+        <label class="field">
+          <span class="field__label">术语原文</span>
+          <textarea
+            v-model="newSourceText"
+            class="field__control field__control--multi"
+            rows="6"
+            placeholder="请输入术语原文"
+          />
+        </label>
+
+        <label class="field">
+          <span class="field__label">术语译文</span>
+          <textarea
+            v-model="newTargetText"
+            class="field__control field__control--multi"
+            rows="6"
+            placeholder="请输入术语译文"
+          />
+        </label>
+      </div>
+
+      <template #footer>
+        <button class="button" type="button" @click="showCreateEntryDialog = false">取消</button>
+        <button class="button button--primary" type="button" :disabled="creatingEntry" @click="createEntry">
+          <Loader2 v-if="creatingEntry" class="lucide-spin" :size="14" />
+          <Plus v-else :size="14" />
+          {{ creatingEntry ? '新增中...' : '确认新增' }}
+        </button>
+      </template>
+    </Modal>
+
+    <ResourceImportDialog
+      :open="showImportDialog"
+      initial-tab="term"
+      :context-label="termBase?.name || '当前术语库'"
+      :source-language="termBase?.source_language || null"
+      :target-language="termBase?.target_language || null"
+      :fixed-term-base-id="termBase?.id || ''"
+      @close="showImportDialog = false"
+      @imported="handleImported"
+    />
   </div>
 </template>
+
+<style scoped>
+.asset-entry-actions {
+  display: flex;
+  gap: 4px;
+  justify-content: center;
+}
+</style>

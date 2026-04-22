@@ -159,6 +159,7 @@ async function createTermBaseFromForm() {
     newBaseSourceLanguage.value = ''
     newBaseTargetLanguage.value = ''
     showCreateForm.value = false
+    await router.push({ name: 'term-base-edit', params: { id: termBase.id } })
     baseMessage.value = `已创建术语库：${termBase.name}`
   } catch (error) {
     baseMessage.value = getErrorMessage(error, '术语库创建失败。')
@@ -435,7 +436,13 @@ onMounted(() => {
             @select="handleSelect"
           >
             <template #name="{ row }">
-              <strong style="font-weight: 500; color: var(--brand-700);">{{ row.name }}</strong>
+              <button
+                class="text-link term-base-link"
+                type="button"
+                @click="router.push({ name: 'term-base-edit', params: { id: row.id } })"
+              >
+                {{ row.name }}
+              </button>
             </template>
 
             <template #language_pair="{ row }">
@@ -467,7 +474,7 @@ onMounted(() => {
                 <button
                   class="data-table__actions-btn"
                   type="button"
-                  title="编辑"
+                  title="查看详情"
                   @click="router.push({ name: 'term-base-edit', params: { id: row.id } })"
                 >
                   <Pencil :size="14" />
@@ -608,3 +615,18 @@ onMounted(() => {
     </div>
   </div>
 </template>
+
+<style scoped>
+.term-base-link {
+  padding: 0;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  color: var(--brand-700);
+  font-weight: 500;
+}
+
+.term-base-link:hover {
+  color: var(--brand-600);
+}
+</style>

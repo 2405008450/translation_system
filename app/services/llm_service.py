@@ -250,7 +250,7 @@ async def _request_translation(
         "Content-Type": "application/json",
     }
     if provider.name == "openrouter":
-        headers["HTTP-Referer"] = "http://localhost"
+        headers["HTTP-Referer"] = "AI Translation System"
         headers["X-Title"] = "AI Translation System"
 
     if client is None:

@@ -3,6 +3,7 @@ export type UserRole = 'admin' | 'user'
 export interface User {
   id: string
   username: string
+  nickname: string | null
   role: UserRole
   is_active: boolean
   created_at: string

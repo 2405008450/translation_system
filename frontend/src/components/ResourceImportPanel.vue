@@ -22,12 +22,16 @@ const props = withDefaults(defineProps<{
   sourceLanguage?: string | null
   targetLanguage?: string | null
   contextLabel?: string
+  fixedTMCollectionId?: string
+  fixedTermBaseId?: string
 }>(), {
   mode: 'all',
   initialTab: 'tm',
   sourceLanguage: null,
   targetLanguage: null,
   contextLabel: '',
+  fixedTMCollectionId: '',
+  fixedTermBaseId: '',
 })
 
 const emit = defineEmits<{
@@ -85,8 +89,8 @@ const contextLanguagePair = computed(() => (
   formatLanguagePair(props.sourceLanguage, props.targetLanguage)
 ))
 
-const showTMCreateFields = computed(() => !selectedTMCollectionId.value)
-const showTermCreateFields = computed(() => !selectedTermBaseId.value)
+const showTMCreateFields = computed(() => !props.fixedTMCollectionId && !selectedTMCollectionId.value)
+const showTermCreateFields = computed(() => !props.fixedTermBaseId && !selectedTermBaseId.value)
 
 watch(() => props.mode, (mode) => {
   if (mode !== 'all') {
@@ -99,6 +103,18 @@ watch(() => props.initialTab, (initialTab) => {
     activeTab.value = initialTab
   }
 })
+
+watch(() => props.fixedTMCollectionId, (value) => {
+  if (value) {
+    selectedTMCollectionId.value = value
+  }
+}, { immediate: true })
+
+watch(() => props.fixedTermBaseId, (value) => {
+  if (value) {
+    selectedTermBaseId.value = value
+  }
+}, { immediate: true })
 
 watch(
   () => [props.sourceLanguage, props.targetLanguage] as const,
@@ -246,6 +262,9 @@ function onTermFileChange(event: Event) {
 }
 
 async function ensureImportCollection() {
+  if (props.fixedTMCollectionId) {
+    return props.fixedTMCollectionId
+  }
   if (selectedTMCollectionId.value) {
     return selectedTMCollectionId.value
   }
@@ -261,6 +280,9 @@ async function ensureImportCollection() {
 }
 
 async function ensureImportTermBase() {
+  if (props.fixedTermBaseId) {
+    return props.fixedTermBaseId
+  }
   if (selectedTermBaseId.value) {
     return selectedTermBaseId.value
   }
@@ -437,7 +459,7 @@ onMounted(() => {
           <select
             v-model="selectedTMCollectionId"
             class="field__control"
-            :disabled="loadingTMCollections"
+            :disabled="loadingTMCollections || Boolean(props.fixedTMCollectionId)"
           >
             <option value="">{{ t('resourceImport.tm.createNew') }}</option>
             <option
@@ -586,7 +608,7 @@ onMounted(() => {
           <select
             v-model="selectedTermBaseId"
             class="field__control"
-            :disabled="loadingTermBases"
+            :disabled="loadingTermBases || Boolean(props.fixedTermBaseId)"
           >
             <option value="">{{ t('resourceImport.term.createNew') }}</option>
             <option

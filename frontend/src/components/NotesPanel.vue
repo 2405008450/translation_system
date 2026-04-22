@@ -90,6 +90,10 @@ function formatDateTime(value: string) {
   return new Date(value).toLocaleString('zh-CN', { hour12: false })
 }
 
+function getAuthorDisplayName(comment: SegmentComment) {
+  return comment.author.nickname || comment.author.username
+}
+
 function buildAnchorLabel(comment: SegmentComment) {
   if (comment.anchor_mode === 'range' && comment.anchor_text) {
     return `${comment.sentence_id || t('notes.unresolvedSentence')} · ${comment.anchor_text}`
@@ -207,7 +211,7 @@ watch(() => props.draftAnchor, (draftAnchor) => {
           @click="emit('selectComment', thread.root.id)"
         >
           <div class="notes-comment__meta">
-            <strong>{{ thread.root.author.username }}</strong>
+            <strong>{{ getAuthorDisplayName(thread.root) }}</strong>
             <span>{{ formatDateTime(thread.root.created_at) }}</span>
             <span class="notes-comment__status">{{ thread.root.status === 'open' ? t('notes.processing') : t('notes.resolved') }}</span>
           </div>
@@ -268,7 +272,7 @@ watch(() => props.draftAnchor, (draftAnchor) => {
           @click="emit('selectComment', reply.id)"
         >
           <div class="notes-comment__meta">
-            <strong>{{ reply.author.username }}</strong>
+            <strong>{{ getAuthorDisplayName(reply) }}</strong>
             <span>{{ formatDateTime(reply.created_at) }}</span>
           </div>
           <p v-if="editingCommentId !== reply.id" class="notes-comment__body">{{ reply.body }}</p>

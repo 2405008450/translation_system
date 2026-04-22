@@ -17,6 +17,7 @@ from app.services.term_importer import (
     XLSX_EXTENSIONS,
     import_terms_from_xlsx_upload,
 )
+from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_response
 
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -329,6 +330,81 @@ def list_term_base_entries(
     }
 
 
+@router.get("/term-bases/{term_base_id}/export-xlsx")
+def export_term_base_entries_xlsx(
+    term_base_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    term_base = _get_term_base_or_404(db, term_base_id)
+    rows = (
+        db.query(TermEntry)
+        .filter(TermEntry.term_base_id == term_base.id)
+        .order_by(TermEntry.updated_at.desc(), TermEntry.created_at.desc())
+        .all()
+    )
+    xlsx_bytes = build_tabular_xlsx(
+        sheet_title=term_base.name,
+        headers=["术语原文", "术语译文", "源语言", "目标语言", "创建时间", "更新时间"],
+        rows=[
+            [
+                entry.source_text,
+                entry.target_text,
+                entry.source_language,
+                entry.target_language,
+                entry.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                entry.updated_at.strftime("%Y-%m-%d %H:%M:%S"),
+            ]
+            for entry in rows
+        ],
+    )
+    return build_xlsx_download_response(f"{term_base.name}-term-base.xlsx", xlsx_bytes)
+
+
+@router.post("/term-bases/{term_base_id}/entries")
+def create_term_base_entry(
+    term_base_id: UUID,
+    payload: TermEntryUpdatePayload,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    term_base = _get_term_base_or_404(db, term_base_id)
+    source_text = normalize_text(payload.source_text)
+    target_text = normalize_text(payload.target_text)
+    if not source_text or not target_text:
+        raise HTTPException(status_code=400, detail="术语原文和译文不能为空。")
+
+    source_normalized = normalize_match_text(source_text) or source_text
+    duplicate = (
+        db.query(TermEntry)
+        .filter(
+            TermEntry.term_base_id == term_base.id,
+            TermEntry.source_language == term_base.source_language,
+            TermEntry.target_language == term_base.target_language,
+            or_(
+                TermEntry.source_normalized == source_normalized,
+                TermEntry.source_text == source_text,
+            ),
+        )
+        .first()
+    )
+    if duplicate is not None:
+        raise HTTPException(status_code=409, detail="当前术语库中已存在相同原文的术语条目。")
+
+    entry = TermEntry(
+        term_base_id=term_base.id,
+        source_text=source_text,
+        target_text=target_text,
+        source_normalized=source_normalized,
+        source_language=term_base.source_language,
+        target_language=term_base.target_language,
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    return _serialize_term_entry(entry)
+
+
 @router.put("/term-entries/{entry_id}")
 def update_term_entry(
     entry_id: UUID,
@@ -375,3 +451,18 @@ def update_term_entry(
     db.commit()
     db.refresh(entry)
     return _serialize_term_entry(entry)
+
+
+@router.delete("/term-entries/{entry_id}")
+def delete_term_entry(
+    entry_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    entry = db.query(TermEntry).filter(TermEntry.id == entry_id).first()
+    if entry is None:
+        raise HTTPException(status_code=404, detail="术语条目不存在。")
+
+    db.delete(entry)
+    db.commit()
+    return {"message": "术语条目已删除。"}

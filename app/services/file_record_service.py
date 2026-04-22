@@ -2,6 +2,7 @@ import hashlib
 from pathlib import Path
 from uuid import UUID
 
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.models import FileRecord, Segment, TranslationMemory
@@ -15,6 +16,56 @@ SEGMENT_ORDERING = (
     Segment.cell_index.asc().nullsfirst(),
     Segment.sentence_id.asc(),
 )
+
+
+def calculate_file_record_progress(total_segments: int, translated_segments: int) -> int:
+    return round(translated_segments / total_segments * 100) if total_segments > 0 else 0
+
+
+def resolve_file_record_status(
+    current_status: str | None,
+    total_segments: int,
+    translated_segments: int,
+) -> str:
+    status = current_status or "draft"
+    if status == "error":
+        return status
+    if total_segments > 0:
+        if translated_segments >= total_segments:
+            return "completed"
+        return "in_progress"
+    return status
+
+
+def get_file_record_segment_counts(db: Session, file_record_id: UUID) -> tuple[int, int]:
+    total_segments, translated_segments = (
+        db.query(
+            func.count(Segment.id),
+            func.count(case((Segment.target_text != "", 1))),
+        )
+        .filter(Segment.file_record_id == file_record_id)
+        .one()
+    )
+    return int(total_segments or 0), int(translated_segments or 0)
+
+
+def sync_file_record_status(db: Session, file_record_id: UUID) -> str | None:
+    file_record = get_file_record(db, file_record_id)
+    if not file_record:
+        return None
+
+    db.flush()
+    total_segments, translated_segments = get_file_record_segment_counts(db, file_record_id)
+    file_record.status = resolve_file_record_status(
+        file_record.status,
+        total_segments,
+        translated_segments,
+    )
+    return file_record.status
+
+
+def _count_filled_targets(items: list[dict]) -> int:
+    return sum(1 for item in items if item.get("target_text", "") != "")
 
 
 def create_file_record_with_segments(
@@ -78,6 +129,12 @@ def _create_file_record_from_workspace(
             )
         )
 
+    file_record.status = resolve_file_record_status(
+        file_record.status,
+        len(workspace_data["segments"]),
+        _count_filled_targets(workspace_data["segments"]),
+    )
+
     try:
         if raw_bytes is not None and _is_docx_filename(filename):
             save_source_file(file_record.id, filename, raw_bytes)
@@ -124,6 +181,12 @@ def create_txt_file_record_with_segments(
                 block_index=index,
             )
         )
+
+    file_record.status = resolve_file_record_status(
+        file_record.status,
+        len(results),
+        sum(1 for result in results if (result.target_text or "") != ""),
+    )
 
     db.commit()
     db.refresh(file_record)
@@ -175,6 +238,12 @@ def attach_source_document_to_file_record(
                 cell_index=seg.get("cell_index"),
             )
         )
+
+    file_record.status = resolve_file_record_status(
+        file_record.status,
+        len(workspace_data["segments"]),
+        _count_filled_targets(workspace_data["segments"]),
+    )
 
     try:
         save_source_file(file_record.id, source_filename, raw_bytes)
@@ -300,6 +369,7 @@ def update_segment_target(
     if source == "manual":
         segment.status = "confirmed"
 
+    sync_file_record_status(db, segment.file_record_id)
     db.commit()
     db.refresh(segment)
     return segment
@@ -325,6 +395,7 @@ def update_segment_by_sentence_id(
     if source == "manual":
         segment.status = "confirmed"
 
+    sync_file_record_status(db, segment.file_record_id)
     db.commit()
     db.refresh(segment)
     return segment
@@ -381,6 +452,9 @@ def batch_update_segments(
         if source == "manual":
             segment.status = "confirmed"
         updated_count += 1
+
+    if updated_count > 0:
+        sync_file_record_status(db, file_record_id)
 
     db.commit()
     return updated_count

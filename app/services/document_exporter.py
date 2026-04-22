@@ -29,6 +29,7 @@ from app.services.document_workspace import (
     _normalize_segment_source_text,
     _qn,
     _resolve_paragraph_numbering_reference,
+    _select_preferred_alternate_content_branch,
 )
 from app.services.normalizer import normalize_text
 from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
@@ -388,6 +389,19 @@ def _collect_inline_tokens(
     node_name = _local_name(node.tag)
     if node_name in {"pPr", "rPr", "tblPr", "tblGrid", "trPr", "tcPr", "sectPr"}:
         return []
+
+    if node_name == "AlternateContent":
+        preferred_branch = _select_preferred_alternate_content_branch(node)
+        if preferred_branch is None:
+            return []
+        return _collect_inline_tokens(
+            node=preferred_branch,
+            story=story,
+            block_counter=block_counter,
+            numbering_schema=numbering_schema,
+            segments_by_block=segments_by_block,
+            current_run=current_run,
+        )
 
     if node_name == "r":
         current_run = node

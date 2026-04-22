@@ -63,6 +63,7 @@ CELL_GROUP_MAX_CHARS = 200
 CELL_PARAGRAPH_BREAK_SENTINEL = "\uE000"
 PAGE_BREAK_SENTINEL = "\uE001"
 DOCX_PARSE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+DOCX_PARSE_CACHE_VERSION = "2"
 EMU_PER_PIXEL = 9525
 SUPPORTED_BROWSER_IMAGE_MIME_TYPES = {
     "image/bmp",
@@ -509,7 +510,7 @@ def build_docx_preview_html(raw_bytes: bytes) -> str:
 
 
 def _get_cached_parsed_workspace(raw_bytes: bytes) -> dict:
-    cache_key = f"preview:workspace:{hashlib.sha256(raw_bytes).hexdigest()}"
+    cache_key = f"preview:workspace:v{DOCX_PARSE_CACHE_VERSION}:{hashlib.sha256(raw_bytes).hexdigest()}"
     cached_workspace = get_json(cache_key)
     if isinstance(cached_workspace, dict):
         return copy.deepcopy(cached_workspace)
@@ -686,8 +687,25 @@ def _iter_block_nodes(container: ET.Element):
             continue
 
         if child_name == "AlternateContent":
-            for alternate_child in list(child):
-                yield from _iter_block_nodes(alternate_child)
+            preferred_branch = _select_preferred_alternate_content_branch(child)
+            if preferred_branch is not None:
+                yield from _iter_block_nodes(preferred_branch)
+
+
+def _select_preferred_alternate_content_branch(node: ET.Element) -> ET.Element | None:
+    choice_branch: ET.Element | None = None
+    fallback_branch: ET.Element | None = None
+
+    for child in list(node):
+        child_name = _local_name(child.tag)
+        if child_name == "Choice" and choice_branch is None:
+            choice_branch = child
+        elif child_name == "Fallback" and fallback_branch is None:
+            fallback_branch = child
+
+    if choice_branch is not None:
+        return choice_branch
+    return fallback_branch
 
 
 def _render_block(
@@ -1411,6 +1429,21 @@ def _collect_inline_content(
     node_name = _local_name(node.tag)
     if node_name in {"pPr", "rPr", "tblPr", "tblGrid", "trPr", "tcPr", "sectPr"}:
         return [], [], []
+
+    if node_name == "AlternateContent":
+        preferred_branch = _select_preferred_alternate_content_branch(node)
+        if preferred_branch is None:
+            return [], [], []
+        return _collect_inline_content(
+            node=preferred_branch,
+            story=story,
+            sentence_counter=sentence_counter,
+            block_counter=block_counter,
+            numbering_state=numbering_state,
+            parse_state=parse_state,
+            hyperlink=hyperlink,
+            inherited_css=inherited_css,
+        )
 
     if node_name == "fldSimple":
         instruction = node.get(_qn("w", "instr"), "")

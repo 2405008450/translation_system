@@ -11,7 +11,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.auth import get_current_user, require_admin
+from app.auth import get_current_user, get_user_display_name, require_admin
 from app.database import get_db
 from app.models import FileRecord, Segment, TMCollection, TranslationMemory, User
 from app.services.comment_service import (
@@ -35,6 +35,7 @@ from app.services.document_workspace import (
 from app.services.file_record_service import (
     attach_source_document_to_file_record,
     batch_update_segments,
+    calculate_file_record_progress,
     create_file_record_with_segments,
     delete_file_record,
     get_file_record as get_file_record_model,
@@ -43,6 +44,7 @@ from app.services.file_record_service import (
     list_file_records,
     list_segments_for_file_record,
     load_file_record_source,
+    resolve_file_record_status,
     update_segment_by_sentence_id,
     update_segment_with_llm_result,
 )
@@ -58,6 +60,7 @@ from app.services.normalizer import build_source_hash, normalize_match_text, nor
 from app.services.slate_parser import parse_docx_for_slate
 from app.services.tm_importer import XLSX_EXTENSIONS, import_tm_from_xlsx_upload
 from app.services.tm_vector import sync_tm_embeddings
+from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_response
 
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -429,25 +432,30 @@ def create_project(
         "status": project.status,
         "source_language": project.source_language,
         "target_language": project.target_language,
-        "creator": current_user.username,
+        "creator": get_user_display_name(current_user),
         "deadline": project.deadline.isoformat() if project.deadline else None,
         "access_level": project.access_level,
         "created_at": project.created_at.isoformat(),
     }
 
 
-def _build_project_detail_payload(
+def _build_project_summary_payload(
     project: FileRecord,
     total_segments: int,
     translated_segments: int,
+    creator_name: str | None = None,
 ) -> dict:
-    progress = round(translated_segments / total_segments * 100) if total_segments > 0 else 0
-    creator_name = project.creator.username if project.creator else None
+    progress = calculate_file_record_progress(total_segments, translated_segments)
+    effective_status = resolve_file_record_status(
+        project.status,
+        total_segments,
+        translated_segments,
+    )
 
     return {
         "id": str(project.id),
         "filename": project.filename,
-        "status": project.status,
+        "status": effective_status,
         "progress": progress,
         "total_segments": total_segments,
         "translated_segments": translated_segments,
@@ -458,8 +466,28 @@ def _build_project_detail_payload(
         "access_level": project.access_level,
         "created_at": project.created_at.isoformat(),
         "updated_at": project.updated_at.isoformat(),
-        "has_source_document": load_file_record_source(project) is not None,
     }
+
+
+def _build_project_detail_payload(
+    project: FileRecord,
+    total_segments: int,
+    translated_segments: int,
+) -> dict:
+    creator_name = get_user_display_name(project.creator)
+    source_bytes = load_file_record_source(project)
+    payload = _build_project_summary_payload(
+        project=project,
+        total_segments=total_segments,
+        translated_segments=translated_segments,
+        creator_name=creator_name,
+    )
+
+    payload.update({
+        "has_source_document": source_bytes is not None,
+        "file_size_bytes": len(source_bytes) if source_bytes is not None else None,
+    })
+    return payload
 
 
 @router.get("/projects/{project_id}")
@@ -599,27 +627,19 @@ def list_projects(
         st = segment_stats.get(fr.id, {"total": 0, "filled": 0})
         total_segs = st["total"]
         filled_segs = st["filled"]
-        progress = round(filled_segs / total_segs * 100) if total_segs > 0 else 0
 
         creator_name = None
         if fr.creator:
-            creator_name = fr.creator.username
+            creator_name = get_user_display_name(fr.creator)
 
-        items.append({
-            "id": str(fr.id),
-            "filename": fr.filename,
-            "status": fr.status,
-            "progress": progress,
-            "total_segments": total_segs,
-            "translated_segments": filled_segs,
-            "source_language": fr.source_language,
-            "target_language": fr.target_language,
-            "creator": creator_name,
-            "deadline": fr.deadline.isoformat() if fr.deadline else None,
-            "access_level": fr.access_level,
-            "created_at": fr.created_at.isoformat(),
-            "updated_at": fr.updated_at.isoformat(),
-        })
+        items.append(
+            _build_project_summary_payload(
+                project=fr,
+                total_segments=total_segs,
+                translated_segments=filled_segs,
+                creator_name=creator_name,
+            )
+        )
 
     return {
         "items": items,
@@ -1314,6 +1334,68 @@ def list_tm_collection_entries(
     }
 
 
+@router.get("/translation-memory/collections/{collection_id}/export-xlsx")
+def export_tm_collection_entries_xlsx(
+    collection_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    collection = _get_collection_or_404(db, collection_id)
+    if collection is None:
+        raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
+
+    entries = (
+        db.query(TranslationMemory)
+        .filter(TranslationMemory.collection_id == collection.id)
+        .order_by(TranslationMemory.updated_at.desc(), TranslationMemory.created_at.desc())
+        .all()
+    )
+    rows = [
+        [
+            entry.source_text,
+            entry.target_text,
+            entry.source_language or "",
+            entry.target_language or "",
+            entry.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            entry.updated_at.strftime("%Y-%m-%d %H:%M:%S"),
+        ]
+        for entry in entries
+    ]
+    xlsx_bytes = build_tabular_xlsx(
+        sheet_title=collection.name,
+        headers=["原文", "译文", "源语言", "目标语言", "创建时间", "更新时间"],
+        rows=rows,
+    )
+    return build_xlsx_download_response(f"{collection.name}-tm.xlsx", xlsx_bytes)
+
+
+@router.post("/translation-memory/collections/{collection_id}/entries")
+def add_tm_collection_entry(
+    collection_id: UUID,
+    payload: TMEntryUpdatePayload,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    collection = _get_collection_or_404(db, collection_id)
+    if collection is None:
+        raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
+
+    result = add_tm_entry(
+        TMEntry(
+            collection_id=collection.id,
+            source_text=payload.source_text,
+            target_text=payload.target_text,
+            source_language=collection.source_language,
+            target_language=collection.target_language,
+        ),
+        db,
+    )
+    entry = db.query(TranslationMemory).filter(TranslationMemory.id == result["id"]).first()
+    if entry is None:
+        raise HTTPException(status_code=500, detail="TM 条目保存成功，但读取结果失败。")
+    return _serialize_tm_entry(entry)
+
+
 @router.post("/translation-memory/entries")
 @router.post("/tm/add", include_in_schema=False)
 def add_tm_entry(
@@ -1426,6 +1508,22 @@ def update_tm_entry(
     db.refresh(entry)
     sync_tm_embeddings(db, [(entry.id, entry.source_text)])
     return _serialize_tm_entry(entry)
+
+
+@router.delete("/translation-memory/entries/{entry_id}")
+@router.delete("/tm/entries/{entry_id}", include_in_schema=False)
+def delete_tm_entry(
+    entry_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    entry = db.query(TranslationMemory).filter(TranslationMemory.id == entry_id).first()
+    if entry is None:
+        raise HTTPException(status_code=404, detail="TM 条目不存在。")
+
+    db.delete(entry)
+    db.commit()
+    return {"message": "TM 条目已删除。"}
 
 
 @router.post("/translation-memory/entries/batch")

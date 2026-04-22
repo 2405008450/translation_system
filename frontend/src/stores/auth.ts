@@ -131,9 +131,15 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  async function registerUser(username: string, password: string, role: 'admin' | 'user') {
+  async function registerUser(
+    username: string,
+    password: string,
+    role: 'admin' | 'user',
+    nickname?: string | null,
+  ) {
     const { data } = await http.post<User>('/auth/register', {
       username,
+      nickname: nickname || null,
       password,
       role,
     })

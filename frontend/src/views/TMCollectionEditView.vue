@@ -1,27 +1,35 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { ArrowLeft, Loader2, Pencil, RefreshCw, Save, Search } from 'lucide-vue-next'
+import { ArrowLeft, Download, Loader2, Pencil, Plus, RefreshCw, Save, Search, Trash2, Upload } from 'lucide-vue-next'
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { http } from '../api/http'
 import DataTable from '../components/DataTable.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
+import ResourceImportDialog from '../components/ResourceImportDialog.vue'
+import Modal from '../components/base/Modal.vue'
 import Pagination from '../components/Pagination.vue'
+import { useConfirm } from '../composables/useConfirm'
 import { formatLanguagePair, languageOptions } from '../constants/languages'
 import type { PaginatedResponse, TMCollection, TMEntryRecord } from '../types/api'
+import { downloadBlob } from '../utils/download'
 
 const props = defineProps<{
   id: string
 }>()
 
 const router = useRouter()
+const confirm = useConfirm()
 
 const collection = ref<TMCollection | null>(null)
 const loadingCollection = ref(false)
 const loadingEntries = ref(false)
 const savingCollection = ref(false)
 const savingEntry = ref(false)
+const creatingEntry = ref(false)
+const exportingEntries = ref(false)
+const deletingEntryId = ref('')
 const pageError = ref('')
 const collectionMessage = ref('')
 const entryMessage = ref('')
@@ -39,6 +47,11 @@ const entries = ref<TMEntryRecord[]>([])
 const editingEntryId = ref('')
 const editingSourceText = ref('')
 const editingTargetText = ref('')
+
+const showCreateEntryDialog = ref(false)
+const showImportDialog = ref(false)
+const newSourceText = ref('')
+const newTargetText = ref('')
 
 const entryColumns: DataTableColumn[] = [
   { key: 'source_text', label: '原文' },
@@ -94,11 +107,20 @@ function startEditing(entry: TMEntryRecord | Record<string, any>) {
   entryMessage.value = ''
 }
 
+function normalizeEntry(entry: TMEntryRecord | Record<string, any>): TMEntryRecord {
+  return entry as TMEntryRecord
+}
+
 function cancelEditing() {
   editingEntryId.value = ''
   editingSourceText.value = ''
   editingTargetText.value = ''
   entryMessage.value = ''
+}
+
+function resetCreateEntryForm() {
+  newSourceText.value = ''
+  newTargetText.value = ''
 }
 
 async function loadCollection() {
@@ -179,6 +201,37 @@ async function saveCollection() {
   }
 }
 
+async function createEntry() {
+  if (!collection.value) {
+    return
+  }
+
+  entryMessage.value = ''
+  creatingEntry.value = true
+  try {
+    const { data } = await http.post<TMEntryRecord>(
+      `/translation-memory/collections/${collection.value.id}/entries`,
+      {
+        source_text: newSourceText.value,
+        target_text: newTargetText.value,
+      },
+    )
+    showCreateEntryDialog.value = false
+    resetCreateEntryForm()
+    currentPage.value = 1
+    await reloadPage()
+    const created = entries.value.find((item) => item.id === data.id)
+    if (created) {
+      startEditing(created)
+    }
+    entryMessage.value = 'TM 条目已新增。'
+  } catch (error) {
+    entryMessage.value = getErrorMessage(error, 'TM 条目新增失败。')
+  } finally {
+    creatingEntry.value = false
+  }
+}
+
 async function saveEntry() {
   if (!editingEntryId.value) {
     return
@@ -209,8 +262,64 @@ async function saveEntry() {
   }
 }
 
+async function deleteEntry(rawEntry: TMEntryRecord | Record<string, any>) {
+  const entry = normalizeEntry(rawEntry)
+  const confirmed = await confirm({
+    title: '删除 TM 条目',
+    message: `确定删除该条 TM 记录吗？`,
+    confirmText: '删除',
+    danger: true,
+  })
+  if (!confirmed) {
+    return
+  }
+
+  deletingEntryId.value = entry.id
+  entryMessage.value = ''
+  try {
+    await http.delete(`/translation-memory/entries/${entry.id}`)
+    if (editingEntryId.value === entry.id) {
+      cancelEditing()
+    }
+    if (entries.value.length === 1 && currentPage.value > 1) {
+      currentPage.value -= 1
+    }
+    await reloadPage()
+    entryMessage.value = 'TM 条目已删除。'
+  } catch (error) {
+    entryMessage.value = getErrorMessage(error, 'TM 条目删除失败。')
+  } finally {
+    deletingEntryId.value = ''
+  }
+}
+
+async function exportEntries() {
+  if (!collection.value) {
+    return
+  }
+
+  exportingEntries.value = true
+  entryMessage.value = ''
+  try {
+    const response = await http.get(`/translation-memory/collections/${collection.value.id}/export-xlsx`, {
+      responseType: 'blob',
+    })
+    downloadBlob(response.data, `${collection.value.name}-tm.xlsx`)
+    entryMessage.value = 'TM 条目已导出为 XLSX。'
+  } catch (error) {
+    entryMessage.value = getErrorMessage(error, 'TM 条目导出失败。')
+  } finally {
+    exportingEntries.value = false
+  }
+}
+
 function goBack() {
-  router.push({ name: 'tm' })
+  void router.push({ name: 'tm' })
+}
+
+function openCreateEntryDialog() {
+  resetCreateEntryForm()
+  showCreateEntryDialog.value = true
 }
 
 function runEntrySearch() {
@@ -219,6 +328,15 @@ function runEntrySearch() {
     return
   }
   void loadEntries()
+}
+
+async function handleImported(payload: { tab: 'tm' | 'term' }) {
+  if (payload.tab !== 'tm') {
+    return
+  }
+  showImportDialog.value = false
+  await reloadPage()
+  entryMessage.value = '导入完成，列表已刷新。'
 }
 
 watch([currentPage, pageSize], () => {
@@ -246,9 +364,9 @@ onMounted(() => {
             返回记忆库管理
           </button>
           <div class="section-title section-title--tight" style="margin-top: 14px;">
-            {{ collection?.name || '编辑记忆库' }}
+            {{ collection?.name || '记忆库详情' }}
           </div>
-          <p class="panel-subtitle">维护语言对、基础信息和 TM 键值对。</p>
+          <p class="panel-subtitle">像任务详情页一样集中管理基础信息、TM 条目、导入和导出。</p>
         </div>
         <div class="summary-grid" style="min-width: min(420px, 100%);">
           <div class="summary-item">
@@ -332,10 +450,13 @@ onMounted(() => {
       <section class="panel panel--stretch">
         <div class="panel-header panel-header--compact">
           <div>
-            <div class="section-title section-title--tight">TM 条目编辑</div>
-            <p class="panel-subtitle">先从下面选择一条记录，再修改原文和译文。</p>
+            <div class="section-title section-title--tight">TM 条目</div>
+            <p class="panel-subtitle">支持手动新增、导入 Excel、导出 XLSX，以及逐条编辑和删除。</p>
           </div>
-          <div class="table-toolbar__right">
+        </div>
+
+        <div class="table-toolbar" style="padding: 0 0 12px;">
+          <div class="table-toolbar__left">
             <div class="table-page__search">
               <Search :size="14" class="table-page__search-icon" />
               <input
@@ -346,6 +467,22 @@ onMounted(() => {
                 @keyup.enter="runEntrySearch"
               />
             </div>
+            <span style="font-size: 13px; color: var(--ink-500);">{{ entryCountLabel }}</span>
+          </div>
+          <div class="table-toolbar__right">
+            <button class="button button--primary" type="button" @click="openCreateEntryDialog">
+              <Plus :size="14" />
+              手动新增
+            </button>
+            <button class="button" type="button" @click="showImportDialog = true">
+              <Upload :size="14" />
+              导入
+            </button>
+            <button class="button" type="button" :disabled="exportingEntries" @click="exportEntries">
+              <Loader2 v-if="exportingEntries" class="lucide-spin" :size="14" />
+              <Download v-else :size="14" />
+              导出 XLSX
+            </button>
             <button class="button" type="button" @click="runEntrySearch">搜索</button>
             <button class="button" type="button" :disabled="loadingEntries" @click="loadEntries">
               <RefreshCw :size="14" />
@@ -415,9 +552,20 @@ onMounted(() => {
           </template>
 
           <template #actions="{ row }">
-            <button class="data-table__actions-btn" type="button" title="编辑条目" @click="startEditing(row)">
-              <Pencil :size="14" />
-            </button>
+            <div class="asset-entry-actions">
+              <button class="data-table__actions-btn" type="button" title="编辑条目" @click="startEditing(row)">
+                <Pencil :size="14" />
+              </button>
+              <button
+                class="data-table__actions-btn"
+                type="button"
+                title="删除条目"
+                :disabled="deletingEntryId === row.id"
+                @click="deleteEntry(row)"
+              >
+                <Trash2 :size="14" />
+              </button>
+            </div>
           </template>
         </DataTable>
 
@@ -431,5 +579,63 @@ onMounted(() => {
         />
       </section>
     </template>
+
+    <Modal
+      :open="showCreateEntryDialog"
+      title="手动新增 TM 条目"
+      description="填写原文和译文后会直接写入当前记忆库。"
+      width="min(760px, calc(100vw - 32px))"
+      @close="showCreateEntryDialog = false"
+    >
+      <div class="form-grid-2">
+        <label class="field">
+          <span class="field__label">原文</span>
+          <textarea
+            v-model="newSourceText"
+            class="field__control field__control--multi"
+            rows="6"
+            placeholder="请输入原文"
+          />
+        </label>
+
+        <label class="field">
+          <span class="field__label">译文</span>
+          <textarea
+            v-model="newTargetText"
+            class="field__control field__control--multi"
+            rows="6"
+            placeholder="请输入译文"
+          />
+        </label>
+      </div>
+
+      <template #footer>
+        <button class="button" type="button" @click="showCreateEntryDialog = false">取消</button>
+        <button class="button button--primary" type="button" :disabled="creatingEntry" @click="createEntry">
+          <Loader2 v-if="creatingEntry" class="lucide-spin" :size="14" />
+          <Plus v-else :size="14" />
+          {{ creatingEntry ? '新增中...' : '确认新增' }}
+        </button>
+      </template>
+    </Modal>
+
+    <ResourceImportDialog
+      :open="showImportDialog"
+      initial-tab="tm"
+      :context-label="collection?.name || '当前记忆库'"
+      :source-language="collection?.source_language || null"
+      :target-language="collection?.target_language || null"
+      :fixed-tm-collection-id="collection?.id || ''"
+      @close="showImportDialog = false"
+      @imported="handleImported"
+    />
   </div>
 </template>
+
+<style scoped>
+.asset-entry-actions {
+  display: flex;
+  gap: 4px;
+  justify-content: center;
+}
+</style>

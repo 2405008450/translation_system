@@ -107,6 +107,24 @@ function onTMFileChange(event: Event) {
   }
 }
 
+async function navigateToCollectionDetail(collectionId: string) {
+  const resolvedId = String(collectionId || '').trim()
+  if (!resolvedId) {
+    throw new Error('创建成功但未返回记忆库 ID。')
+  }
+
+  const target = router.resolve({ name: 'tm-edit', params: { id: resolvedId } })
+
+  try {
+    const navigationResult = await router.push(target)
+    if (navigationResult) {
+      window.location.assign(target.href)
+    }
+  } catch {
+    window.location.assign(target.href)
+  }
+}
+
 async function loadCollections() {
   loadingCollections.value = true
   try {
@@ -159,6 +177,7 @@ async function createCollectionFromForm() {
     newCollectionSourceLanguage.value = ''
     newCollectionTargetLanguage.value = ''
     showCreateForm.value = false
+    await navigateToCollectionDetail(collection.id)
     collectionMessage.value = `已创建记忆库：${collection.name}`
   } catch (error) {
     collectionMessage.value = getErrorMessage(error, '记忆库创建失败。')
@@ -439,7 +458,13 @@ onMounted(() => {
             @select="handleSelect"
           >
             <template #name="{ row }">
-              <strong style="font-weight: 500; color: var(--brand-700);">{{ row.name }}</strong>
+              <button
+                class="text-link tm-link"
+                type="button"
+                @click="navigateToCollectionDetail(row.id)"
+              >
+                {{ row.name }}
+              </button>
             </template>
 
             <template #language_pair="{ row }">
@@ -471,8 +496,8 @@ onMounted(() => {
                 <button
                   class="data-table__actions-btn"
                   type="button"
-                  title="编辑"
-                  @click="router.push({ name: 'tm-edit', params: { id: row.id } })"
+                  title="查看详情"
+                  @click="navigateToCollectionDetail(row.id)"
                 >
                   <Pencil :size="14" />
                 </button>
@@ -612,3 +637,18 @@ onMounted(() => {
     </div>
   </div>
 </template>
+
+<style scoped>
+.tm-link {
+  padding: 0;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  color: var(--brand-700);
+  font-weight: 500;
+}
+
+.tm-link:hover {
+  color: var(--brand-600);
+}
+</style>

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -9,9 +11,12 @@ from app.auth import (
     count_users,
     create_user,
     get_current_user,
+    get_user_by_id,
+    list_users,
     require_admin,
     require_users_table,
     serialize_user,
+    update_user_profile,
     users_table_exists,
 )
 from app.database import get_db
@@ -22,6 +27,7 @@ from app.schemas import (
     InitStatusResponse,
     LoginRequest,
     RegisterRequest,
+    UpdateUserRequest,
     UserRead,
 )
 
@@ -62,6 +68,7 @@ def init_admin_account(
     user = create_user(
         db=db,
         username=payload.username,
+        nickname=payload.nickname,
         password=payload.password,
         role="admin",
     )
@@ -90,6 +97,17 @@ def get_me(current_user: User = Depends(get_current_user)) -> UserRead:
     return UserRead.model_validate(serialize_user(current_user))
 
 
+@router.get("/users", response_model=list[UserRead])
+def get_users(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> list[UserRead]:
+    return [
+        UserRead.model_validate(serialize_user(user))
+        for user in list_users(db)
+    ]
+
+
 @router.post("/register", response_model=UserRead)
 def register_user(
     payload: RegisterRequest,
@@ -100,7 +118,37 @@ def register_user(
     user = create_user(
         db=db,
         username=payload.username,
+        nickname=payload.nickname,
         password=payload.password,
         role=payload.role,
+    )
+    return UserRead.model_validate(serialize_user(user))
+
+
+@router.patch("/users/{user_id}", response_model=UserRead)
+def update_user_account(
+    user_id: UUID,
+    payload: UpdateUserRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> UserRead:
+    require_users_table()
+    target_user = get_user_by_id(db, user_id)
+    if target_user is None:
+        raise HTTPException(status_code=404, detail="\u7528\u6237\u4e0d\u5b58\u5728\u3002")
+
+    updated_fields = payload.model_fields_set
+    if not updated_fields:
+        raise HTTPException(status_code=400, detail="\u8bf7\u81f3\u5c11\u63d0\u4ea4\u4e00\u4e2a\u9700\u8981\u4fee\u6539\u7684\u5b57\u6bb5\u3002")
+
+    user = update_user_profile(
+        db=db,
+        user=target_user,
+        username=payload.username,
+        nickname=payload.nickname,
+        password=payload.password,
+        update_username="username" in updated_fields,
+        update_nickname="nickname" in updated_fields,
+        update_password="password" in updated_fields,
     )
     return UserRead.model_validate(serialize_user(user))

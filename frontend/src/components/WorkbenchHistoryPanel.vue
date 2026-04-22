@@ -26,6 +26,10 @@ const timelineComments = computed(() => {
 function formatDateTime(value: string) {
   return new Date(value).toLocaleString('zh-CN', { hour12: false })
 }
+
+function getAuthorDisplayName(comment: SegmentComment) {
+  return comment.author.nickname || comment.author.username
+}
 </script>
 
 <template>
@@ -54,7 +58,7 @@ function formatDateTime(value: string) {
         />
         <article v-for="comment in timelineComments" :key="comment.id" class="workbench-history-panel__comment">
           <div class="workbench-history-panel__meta">
-            <strong>{{ comment.author.username }}</strong>
+            <strong>{{ getAuthorDisplayName(comment) }}</strong>
             <span>{{ formatDateTime(comment.created_at) }}</span>
           </div>
           <p>{{ comment.body }}</p>

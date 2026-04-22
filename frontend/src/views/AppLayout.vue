@@ -220,8 +220,12 @@ async function logout() {
   await router.push({ name: 'login' })
 }
 
+function getUserDisplayName() {
+  return authStore.user?.nickname || authStore.user?.username || ''
+}
+
 function getUserInitial() {
-  const name = authStore.user?.username || ''
+  const name = getUserDisplayName()
   return name.charAt(0).toUpperCase()
 }
 
@@ -376,7 +380,7 @@ watch(
       <div class="sidebar-footer">
         <div class="sidebar-user-avatar">{{ getUserInitial() }}</div>
         <div v-if="!sidebarCollapsed" class="sidebar-user-info">
-          <strong>{{ authStore.user?.username }}</strong>
+          <strong>{{ getUserDisplayName() || authStore.user?.username }}</strong>
           <span>{{ authStore.user?.role === 'admin' ? t('common.roles.admin') : t('common.roles.user') }}</span>
         </div>
         <button
@@ -463,7 +467,7 @@ watch(
 
           <div class="shell-header__user-display">
             <div class="shell-header__user-avatar">{{ getUserInitial() }}</div>
-            <span class="shell-header__user-name">{{ authStore.user?.username || t('shell.userFallback') }}</span>
+            <span class="shell-header__user-name">{{ getUserDisplayName() || t('shell.userFallback') }}</span>
           </div>
 
           <button

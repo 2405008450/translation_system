@@ -265,11 +265,19 @@ CREATE TABLE IF NOT EXISTS users (
         lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
     )::uuid,
     username VARCHAR(50) NOT NULL UNIQUE,
+    nickname VARCHAR(50),
     hashed_password VARCHAR(255) NOT NULL,
     role VARCHAR(20) NOT NULL DEFAULT 'user',
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE IF EXISTS users
+    ADD COLUMN IF NOT EXISTS nickname VARCHAR(50);
+
+UPDATE users
+SET nickname = username
+WHERE nickname IS NULL OR BTRIM(nickname) = '';
 
 CREATE INDEX IF NOT EXISTS ix_users_username
     ON users (username);
