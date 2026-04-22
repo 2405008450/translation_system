@@ -8,7 +8,10 @@ import type {
   FileRecordPreview,
   LLMProvider,
   LLMTranslateScope,
+  RevisionAuthorSummary,
+  RevisionMark,
   Segment,
+  SegmentRevision,
   SegmentUpdatePayload,
   TermMatch,
 } from '../types/api'
@@ -55,9 +58,53 @@ export const useSegmentStore = defineStore('segment', () => {
   const lastPreviewUpdatedSentenceId = ref<string | null>(null)
   const lastPreviewUpdatedText = ref('')
 
+  // 修订跟踪相关状态
+  const revisionEnabled = ref(false)
+  const revisionLoading = ref(false)
+  const revisions = ref<Map<string, SegmentRevision>>(new Map())
+  const revisionSelectedAuthorId = ref<string | null>(null)
+  const revisionNavigationIndex = ref(0)
+
   let syncTimer: number | null = null
 
   const dirtyCount = computed(() => Object.keys(dirtyEntries.value).length)
+
+  // 修订跟踪相关计算属性
+  const revisionAllMarks = computed(() => {
+    const marks: { sentenceId: string; markIndex: number; mark: RevisionMark }[] = []
+    for (const [sentenceId, segmentRevision] of revisions.value) {
+      const filteredMarks = revisionSelectedAuthorId.value
+        ? segmentRevision.marks.filter(m => m.author_id === revisionSelectedAuthorId.value)
+        : segmentRevision.marks
+      filteredMarks.forEach((mark, index) => {
+        marks.push({ sentenceId, markIndex: index, mark })
+      })
+    }
+    return marks
+  })
+
+  const revisionTotalCount = computed(() => revisionAllMarks.value.length)
+
+  const revisionAuthorSummary = computed<RevisionAuthorSummary[]>(() => {
+    const authorMap = new Map<string, { id: string; username: string; count: number }>()
+    for (const [, segmentRevision] of revisions.value) {
+      for (const mark of segmentRevision.marks) {
+        if (mark.author_id && mark.author_username) {
+          const existing = authorMap.get(mark.author_id)
+          if (existing) {
+            existing.count++
+          } else {
+            authorMap.set(mark.author_id, {
+              id: mark.author_id,
+              username: mark.author_username,
+              count: 1,
+            })
+          }
+        }
+      }
+    }
+    return Array.from(authorMap.values()).sort((a, b) => b.count - a.count)
+  })
 
   function resetState() {
     if (syncTimer !== null) {
@@ -81,6 +128,12 @@ export const useSegmentStore = defineStore('segment', () => {
     previewUpdateToken.value = 0
     lastPreviewUpdatedSentenceId.value = null
     lastPreviewUpdatedText.value = ''
+    // 重置修订状态
+    revisionEnabled.value = false
+    revisionLoading.value = false
+    revisions.value = new Map()
+    revisionSelectedAuthorId.value = null
+    revisionNavigationIndex.value = 0
   }
 
   async function loadTask(fileRecordId: string) {
@@ -97,6 +150,8 @@ export const useSegmentStore = defineStore('segment', () => {
       segments.value = detail.segments
       previewHtml.value = preview.preview_html
       previewSupported.value = preview.supports_preview
+      // 加载修订数据
+      await loadRevisions(fileRecordId)
     } finally {
       loading.value = false
     }
@@ -407,6 +462,146 @@ export const useSegmentStore = defineStore('segment', () => {
     window.URL.revokeObjectURL(blobUrl)
   }
 
+  // ========== 修订跟踪相关函数 ==========
+
+  async function loadRevisions(fileRecordId: string) {
+    revisionLoading.value = true
+    try {
+      const { data } = await http.get<Record<string, SegmentRevision>>(
+        `/file-records/${fileRecordId}/revisions`
+      )
+      revisions.value = new Map(Object.entries(data))
+    } catch (e) {
+      console.error('Failed to load revisions:', e)
+      revisions.value = new Map()
+    } finally {
+      revisionLoading.value = false
+    }
+  }
+
+  function getRevisionMarks(sentenceId: string): RevisionMark[] {
+    const segmentRevision = revisions.value.get(sentenceId)
+    if (!segmentRevision) return []
+    if (!revisionSelectedAuthorId.value) return segmentRevision.marks
+    return segmentRevision.marks.filter(m => m.author_id === revisionSelectedAuthorId.value)
+  }
+
+  async function acceptRevision(sentenceId: string, markId: string) {
+    if (!fileRecord.value) return
+    try {
+      await http.post(`/file-records/${fileRecord.value.id}/revisions/${sentenceId}/accept`, {
+        mark_id: markId,
+      })
+      // 本地移除 mark，不重新加载
+      const revision = revisions.value.get(sentenceId)
+      if (revision) {
+        revision.marks = revision.marks.filter(m => m.id !== markId)
+        if (revision.marks.length === 0) {
+          revisions.value.delete(sentenceId)
+        }
+      }
+    } catch (e) {
+      console.error('Failed to accept revision:', e)
+      throw e
+    }
+  }
+
+  async function rejectRevision(sentenceId: string, markId: string) {
+    if (!fileRecord.value) return
+    try {
+      await http.post(`/file-records/${fileRecord.value.id}/revisions/${sentenceId}/reject`, {
+        mark_id: markId,
+      })
+      // 本地更新：回退文本 + 移除修订
+      const revision = revisions.value.get(sentenceId)
+      if (revision) {
+        const segment = segments.value.find(s => s.sentence_id === sentenceId)
+        if (segment) {
+          segment.target_text = revision.previous_text
+          markPreviewUpdate(sentenceId, revision.previous_text)
+        }
+        revisions.value.delete(sentenceId)
+      }
+    } catch (e) {
+      console.error('Failed to reject revision:', e)
+      throw e
+    }
+  }
+
+  async function acceptAllRevisions() {
+    if (!fileRecord.value) return
+    try {
+      await http.post(`/file-records/${fileRecord.value.id}/revisions/accept-all`, {
+        author_id: revisionSelectedAuthorId.value,
+      })
+      // 本地移除所有匹配的修订
+      if (revisionSelectedAuthorId.value) {
+        for (const [sentenceId, revision] of revisions.value) {
+          revision.marks = revision.marks.filter(m => m.author_id !== revisionSelectedAuthorId.value)
+          if (revision.marks.length === 0) {
+            revisions.value.delete(sentenceId)
+          }
+        }
+      } else {
+        revisions.value.clear()
+      }
+    } catch (e) {
+      console.error('Failed to accept all revisions:', e)
+      throw e
+    }
+  }
+
+  async function rejectAllRevisions() {
+    if (!fileRecord.value) return
+    try {
+      await http.post(`/file-records/${fileRecord.value.id}/revisions/reject-all`, {
+        author_id: revisionSelectedAuthorId.value,
+      })
+      // 本地更新：回退所有匹配句段的文本
+      for (const [sentenceId, revision] of revisions.value) {
+        const hasMatchingMark = revisionSelectedAuthorId.value
+          ? revision.marks.some(m => m.author_id === revisionSelectedAuthorId.value)
+          : true
+        if (hasMatchingMark) {
+          const segment = segments.value.find(s => s.sentence_id === sentenceId)
+          if (segment) {
+            segment.target_text = revision.previous_text
+            markPreviewUpdate(sentenceId, revision.previous_text)
+          }
+          revisions.value.delete(sentenceId)
+        }
+      }
+    } catch (e) {
+      console.error('Failed to reject all revisions:', e)
+      throw e
+    }
+  }
+
+  function revisionNavigatePrev(): { sentenceId: string; markIndex: number } | null {
+    if (revisionAllMarks.value.length === 0) return null
+    revisionNavigationIndex.value = 
+      (revisionNavigationIndex.value - 1 + revisionAllMarks.value.length) % revisionAllMarks.value.length
+    const item = revisionAllMarks.value[revisionNavigationIndex.value]
+    return { sentenceId: item.sentenceId, markIndex: item.markIndex }
+  }
+
+  function revisionNavigateNext(): { sentenceId: string; markIndex: number } | null {
+    if (revisionAllMarks.value.length === 0) return null
+    revisionNavigationIndex.value = 
+      (revisionNavigationIndex.value + 1) % revisionAllMarks.value.length
+    const item = revisionAllMarks.value[revisionNavigationIndex.value]
+    return { sentenceId: item.sentenceId, markIndex: item.markIndex }
+  }
+
+  function setRevisionEnabled(value: boolean) {
+    revisionEnabled.value = value
+  }
+
+  function setRevisionSelectedAuthorId(value: string | null) {
+    revisionSelectedAuthorId.value = value
+    revisionNavigationIndex.value = 0
+  }
+
   return {
     fileRecord,
     segments,
@@ -425,6 +620,13 @@ export const useSegmentStore = defineStore('segment', () => {
     previewUpdateToken,
     lastPreviewUpdatedSentenceId,
     lastPreviewUpdatedText,
+    // 修订跟踪
+    revisionEnabled,
+    revisionLoading,
+    revisionTotalCount,
+    revisionAuthorSummary,
+    revisionSelectedAuthorId,
+    revisionNavigationIndex,
     loadTask,
     updateTarget,
     setActiveSentence,
@@ -434,5 +636,15 @@ export const useSegmentStore = defineStore('segment', () => {
     startLLMTranslation,
     downloadTranslatedDocx,
     resetState,
+    // 修订跟踪函数
+    getRevisionMarks,
+    acceptRevision,
+    rejectRevision,
+    acceptAllRevisions,
+    rejectAllRevisions,
+    revisionNavigatePrev,
+    revisionNavigateNext,
+    setRevisionEnabled,
+    setRevisionSelectedAuthorId,
   }
 })

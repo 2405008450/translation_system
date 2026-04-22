@@ -178,7 +178,7 @@ watch(() => props.activeSentenceId, () => {
   <section class="panel history-panel">
     <div class="history-panel__header">
       <div>
-        <div class="section-title section-title--tight">历史版本</div>
+        <div class="section-title section-title--tight">历史记录</div>
         <p class="panel-subtitle">查看句段的修改记录和差异对比。</p>
       </div>
       <button class="button preview-panel__close" type="button" @click="emit('close')">关闭</button>

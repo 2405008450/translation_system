@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, ref, watch, nextTick } from 'vue'
+import { Check, X } from 'lucide-vue-next'
+import { computed, ref, watch } from 'vue'
 
-import type { Segment, TermMatch } from '../types/api'
+import type { RevisionMark, Segment, TermMatch } from '../types/api'
 
 const props = defineProps<{
   segment: Segment
@@ -9,12 +10,16 @@ const props = defineProps<{
   active: boolean
   disabled?: boolean
   termMatches?: TermMatch[]
+  revisionEnabled?: boolean
+  revisionMarks?: RevisionMark[]
 }>()
 
 const emit = defineEmits<{
   update: [sentenceId: string, value: string]
   focus: [sentenceId: string]
   requestTMPanel: [sentenceId: string]
+  acceptRevision: [sentenceId: string, markId: string]
+  rejectRevision: [sentenceId: string, markId: string]
 }>()
 
 const statusClass = computed(() => `segment-row--${props.segment.status || 'none'}`)
@@ -24,7 +29,14 @@ const targetEditor = ref<HTMLElement | null>(null)
 const isComposing = ref(false)
 const localText = ref(props.segment.target_text || '')
 const isEditing = ref(false)
+const hoveredMarkId = ref<string | null>(null)
+const tooltipPosition = ref({ x: 0, y: 0 })
 let highlightTimer: number | null = null
+
+// 检查是否有修订标记
+const hasRevisions = computed(() => 
+  props.revisionEnabled && props.revisionMarks && props.revisionMarks.length > 0
+)
 
 function escapeHtml(str: string): string {
   return str
@@ -103,6 +115,76 @@ const highlightedTargetText = computed(() => {
   }))
   return highlightTerms(text, terms)
 })
+
+// 渲染带修订标记的文本
+const revisionRenderedText = computed(() => {
+  if (!hasRevisions.value || !props.revisionMarks) {
+    return highlightedTargetText.value
+  }
+  
+  const text = localText.value || ''
+  const marks = [...props.revisionMarks].sort((a, b) => a.position - b.position)
+  
+  let result = ''
+  let lastEnd = 0
+  
+  for (const mark of marks) {
+    // 添加标记前的普通文本
+    if (mark.position > lastEnd) {
+      result += escapeHtml(text.slice(lastEnd, mark.position))
+    }
+    
+    if (mark.type === 'insert') {
+      result += `<ins class="revision-mark revision-mark--insert" data-mark-id="${mark.id}" data-author="${escapeHtml(mark.author_username || '')}" data-time="${mark.created_at}">${escapeHtml(mark.text)}</ins>`
+      lastEnd = mark.position + mark.length
+    } else if (mark.type === 'delete') {
+      result += `<del class="revision-mark revision-mark--delete" data-mark-id="${mark.id}" data-author="${escapeHtml(mark.author_username || '')}" data-time="${mark.created_at}">${escapeHtml(mark.text)}</del>`
+      lastEnd = mark.position
+    }
+  }
+  
+  // 添加剩余文本
+  if (lastEnd < text.length) {
+    result += escapeHtml(text.slice(lastEnd))
+  }
+  
+  return result
+})
+
+// 获取当前悬停的修订标记信息
+const hoveredMark = computed(() => {
+  if (!hoveredMarkId.value || !props.revisionMarks) return null
+  return props.revisionMarks.find(m => m.id === hoveredMarkId.value) || null
+})
+
+function formatRevisionTime(isoString: string): string {
+  return new Date(isoString).toLocaleString('zh-CN', { hour12: false })
+}
+
+function handleRevisionMouseEnter(event: MouseEvent) {
+  const target = event.target as HTMLElement
+  const markId = target.dataset.markId
+  if (markId) {
+    hoveredMarkId.value = markId
+    const rect = target.getBoundingClientRect()
+    tooltipPosition.value = {
+      x: rect.left + rect.width / 2,
+      y: rect.top - 8
+    }
+  }
+}
+
+function handleRevisionMouseLeave() {
+  hoveredMarkId.value = null
+}
+
+function handleAcceptRevision(markId: string) {
+  emit('acceptRevision', props.segment.sentence_id, markId)
+}
+
+function handleRejectRevision(markId: string) {
+  emit('rejectRevision', props.segment.sentence_id, markId)
+}
 
 function handleTargetFocus() {
   emit('focus', props.segment.sentence_id)
@@ -226,7 +308,7 @@ watch(targetEditor, (el) => {
 <template>
   <article
     class="segment-row"
-    :class="[statusClass, { 'is-active': active }]"
+    :class="[statusClass, { 'is-active': active, 'has-revisions': hasRevisions }]"
     :data-sentence-id="segment.sentence_id"
   >
     <div class="segment-row__head">
@@ -236,6 +318,28 @@ watch(targetEditor, (el) => {
       <span v-if="segment.score" class="segment-row__tag is-muted">
         {{ segment.score.toFixed(2) }}
       </span>
+      
+      <!-- 修订操作按钮 -->
+      <template v-if="hasRevisions && revisionMarks && revisionMarks.length > 0">
+        <div class="segment-row__revision-actions">
+          <button
+            class="segment-row__revision-btn segment-row__revision-btn--accept"
+            type="button"
+            title="接受此句段的修订"
+            @click="handleAcceptRevision(revisionMarks[0].id)"
+          >
+            <Check :size="14" />
+          </button>
+          <button
+            class="segment-row__revision-btn segment-row__revision-btn--reject"
+            type="button"
+            title="拒绝此句段的修订"
+            @click="handleRejectRevision(revisionMarks[0].id)"
+          >
+            <X :size="14" />
+          </button>
+        </div>
+      </template>
     </div>
 
     <div class="segment-row__grid">
@@ -254,7 +358,17 @@ watch(targetEditor, (el) => {
 
       <div class="segment-row__cell segment-row__cell--target">
         <span class="segment-row__label">译文</span>
+        <!-- 修订模式下显示只读的修订标记 -->
         <div
+          v-if="hasRevisions"
+          class="segment-row__revision-view"
+          v-html="revisionRenderedText"
+          @mouseover="handleRevisionMouseEnter"
+          @mouseout="handleRevisionMouseLeave"
+        />
+        <!-- 正常编辑模式 -->
+        <div
+          v-else
           ref="targetEditor"
           class="segment-row__editor"
           :class="{ 'is-disabled': disabled }"
@@ -270,5 +384,20 @@ watch(targetEditor, (el) => {
         />
       </div>
     </div>
+    
+    <!-- 修订信息 Tooltip -->
+    <Teleport to="body">
+      <div
+        v-if="hoveredMark"
+        class="revision-tooltip"
+        :style="{
+          left: `${tooltipPosition.x}px`,
+          top: `${tooltipPosition.y}px`
+        }"
+      >
+        <span class="revision-tooltip__author">{{ hoveredMark.author_username || '未知用户' }}</span>
+        <span class="revision-tooltip__time">{{ formatRevisionTime(hoveredMark.created_at) }}</span>
+      </div>
+    </Teleport>
   </article>
 </template>

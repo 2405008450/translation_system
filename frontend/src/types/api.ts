@@ -202,3 +202,28 @@ export interface SegmentHistoryResponse {
   source_text: string
   history: SegmentHistory[]
 }
+
+// 修订跟踪相关类型
+export interface RevisionMark {
+  id: string
+  type: 'insert' | 'delete'
+  text: string
+  position: number
+  length: number
+  author_id: string | null
+  author_username: string | null
+  created_at: string
+}
+
+export interface SegmentRevision {
+  sentence_id: string
+  current_text: string
+  previous_text: string
+  marks: RevisionMark[]
+}
+
+export interface RevisionAuthorSummary {
+  id: string
+  username: string
+  count: number
+}

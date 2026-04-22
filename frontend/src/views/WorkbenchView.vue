@@ -7,6 +7,7 @@ import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import HistoryPanel from '../components/HistoryPanel.vue'
 import NotesPanel from '../components/NotesPanel.vue'
 import PreviewPanel from '../components/PreviewPanel.vue'
+import RevisionToolbar from '../components/RevisionToolbar.vue'
 import SegmentEditorRow from '../components/SegmentEditorRow.vue'
 import SplitPreviewPanel from '../components/SplitPreviewPanel.vue'
 import TMMatchPanel from '../components/TMMatchPanel.vue'
@@ -344,6 +345,76 @@ async function exportDocx() {
   }
 }
 
+// ========== 修订跟踪相关处理 ==========
+
+async function handleAcceptRevision(sentenceId: string, markId: string) {
+  pageError.value = ''
+  try {
+    await segmentStore.acceptRevision(sentenceId, markId)
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      pageError.value = String(error.response?.data?.detail || '接受修订失败。')
+      return
+    }
+    pageError.value = error instanceof Error ? error.message : '接受修订失败。'
+  }
+}
+
+async function handleRejectRevision(sentenceId: string, markId: string) {
+  pageError.value = ''
+  try {
+    await segmentStore.rejectRevision(sentenceId, markId)
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      pageError.value = String(error.response?.data?.detail || '拒绝修订失败。')
+      return
+    }
+    pageError.value = error instanceof Error ? error.message : '拒绝修订失败。'
+  }
+}
+
+async function handleAcceptAllRevisions() {
+  pageError.value = ''
+  try {
+    await segmentStore.acceptAllRevisions()
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      pageError.value = String(error.response?.data?.detail || '接受所有修订失败。')
+      return
+    }
+    pageError.value = error instanceof Error ? error.message : '接受所有修订失败。'
+  }
+}
+
+async function handleRejectAllRevisions() {
+  pageError.value = ''
+  try {
+    await segmentStore.rejectAllRevisions()
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      pageError.value = String(error.response?.data?.detail || '拒绝所有修订失败。')
+      return
+    }
+    pageError.value = error instanceof Error ? error.message : '拒绝所有修订失败。'
+  }
+}
+
+async function handleRevisionNavigatePrev() {
+  const target = segmentStore.revisionNavigatePrev()
+  if (target) {
+    segmentStore.setActiveSentence(target.sentenceId)
+    await focusEditorSentence(target.sentenceId)
+  }
+}
+
+async function handleRevisionNavigateNext() {
+  const target = segmentStore.revisionNavigateNext()
+  if (target) {
+    segmentStore.setActiveSentence(target.sentenceId)
+    await focusEditorSentence(target.sentenceId)
+  }
+}
+
 async function handleCommentDraft(draft: CommentAnchorDraft) {
   commentStore.setDraftAnchor(draft)
   commentStore.setActiveComment(null)
@@ -492,42 +563,59 @@ onBeforeRouteLeave(async () => {
     <p v-if="pageError" class="form-message is-error">{{ pageError }}</p>
 
     <section class="toolbar-panel">
-      <div class="toolbar-panel__group">
-        <label class="field field--compact">
-          <span class="field__label">AI 处理范围</span>
-          <select v-model="llmScope" class="field__control">
-            <option value="all">fuzzy + none</option>
-            <option value="all_with_exact">exact + fuzzy + none</option>
-            <option value="fuzzy_only">仅 fuzzy</option>
-            <option value="none_only">仅 none</option>
-          </select>
-        </label>
+      <div class="toolbar-panel__left">
+        <div class="toolbar-panel__group">
+          <label class="field field--compact">
+            <span class="field__label">AI 处理范围</span>
+            <select v-model="llmScope" class="field__control">
+              <option value="all">fuzzy + none</option>
+              <option value="all_with_exact">exact + fuzzy + none</option>
+              <option value="fuzzy_only">仅 fuzzy</option>
+              <option value="none_only">仅 none</option>
+            </select>
+          </label>
 
-        <label class="field field--compact">
-          <span class="field__label">AI 提供方</span>
-          <select v-model="llmProvider" class="field__control">
-            <option value="auto">自动</option>
-            <option value="deepseek">DeepSeek</option>
-            <option value="openrouter">OpenRouter</option>
-          </select>
-        </label>
+          <label class="field field--compact">
+            <span class="field__label">AI 提供方</span>
+            <select v-model="llmProvider" class="field__control">
+              <option value="auto">自动</option>
+              <option value="deepseek">DeepSeek</option>
+              <option value="openrouter">OpenRouter</option>
+            </select>
+          </label>
 
-        <button
-          class="button button--primary"
-          type="button"
-          :disabled="segmentStore.llmRunning"
-          @click="runLLMTranslation"
-        >
-          <Loader2 v-if="segmentStore.llmRunning" class="lucide-spin" />
-          <Bot v-else />
-          {{ segmentStore.llmRunning ? 'AI 处理中...' : '执行 AI 修正' }}
-        </button>
+          <button
+            class="button button--primary"
+            type="button"
+            :disabled="segmentStore.llmRunning"
+            @click="runLLMTranslation"
+          >
+            <Loader2 v-if="segmentStore.llmRunning" class="lucide-spin" />
+            <Bot v-else />
+            {{ segmentStore.llmRunning ? 'AI 处理中...' : '执行 AI 修正' }}
+          </button>
+        </div>
+
+        <div class="toolbar-panel__status">
+          <span>待同步 {{ segmentStore.dirtyCount }} 条</span>
+          <span>{{ segmentStore.llmMessage }}</span>
+        </div>
       </div>
-
-      <div class="toolbar-panel__status">
-        <span>待同步 {{ segmentStore.dirtyCount }} 条</span>
-        <span>{{ segmentStore.llmMessage }}</span>
-      </div>
+      
+      <!-- 修订工具栏放在右侧 -->
+      <RevisionToolbar
+        :enabled="segmentStore.revisionEnabled"
+        :authors="segmentStore.revisionAuthorSummary"
+        :selected-author-id="segmentStore.revisionSelectedAuthorId"
+        :current-index="segmentStore.revisionNavigationIndex"
+        :total-count="segmentStore.revisionTotalCount"
+        @update:enabled="segmentStore.setRevisionEnabled"
+        @update:selected-author-id="segmentStore.setRevisionSelectedAuthorId"
+        @accept-all="handleAcceptAllRevisions"
+        @reject-all="handleRejectAllRevisions"
+        @navigate-prev="handleRevisionNavigatePrev"
+        @navigate-next="handleRevisionNavigateNext"
+      />
     </section>
 
     <section v-if="segmentStore.loading" class="panel">
@@ -545,6 +633,7 @@ onBeforeRouteLeave(async () => {
             <p class="panel-subtitle">逐句校对并整理译文。</p>
           </div>
         </div>
+        
         <VirtualList
           ref="virtualListRef"
           :items="segmentStore.segments"
@@ -556,9 +645,13 @@ onBeforeRouteLeave(async () => {
               :index="index"
               :active="segmentStore.activeSentenceId === item.sentence_id"
               :term-matches="segmentStore.activeSentenceId === item.sentence_id ? segmentStore.getTermMatches(item.sentence_id) : []"
+              :revision-enabled="segmentStore.revisionEnabled"
+              :revision-marks="segmentStore.revisionEnabled ? segmentStore.getRevisionMarks(item.sentence_id) : []"
               @focus="segmentStore.setActiveSentence"
               @update="segmentStore.updateTarget"
               @request-t-m-panel="handleRequestTMPanel"
+              @accept-revision="handleAcceptRevision"
+              @reject-revision="handleRejectRevision"
             />
           </template>
         </VirtualList>

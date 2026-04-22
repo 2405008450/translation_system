@@ -729,9 +729,16 @@ button {
 
 .toolbar-panel {
   display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: start;
   gap: 16px;
   background:
     linear-gradient(135deg, rgba(239, 248, 244, 0.96), rgba(248, 251, 249, 0.96));
+}
+
+.toolbar-panel__left {
+  display: grid;
+  gap: 16px;
 }
 
 .toolbar-panel__group {
@@ -1932,4 +1939,150 @@ button {
   text-decoration-thickness: 2px;
   text-underline-offset: 2px;
   cursor: help;
+}
+
+/* ========== 修订跟踪样式 ========== */
+
+/* 修订操作按钮 */
+.segment-row__revision-actions {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.segment-row__revision-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(247, 251, 249, 0.94));
+  color: var(--ink-500);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.segment-row__revision-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 8px rgba(20, 53, 45, 0.1);
+}
+
+.segment-row__revision-btn--accept:hover {
+  border-color: #22c55e;
+  background: linear-gradient(180deg, rgba(220, 252, 231, 0.96), rgba(240, 253, 244, 0.94));
+  color: #166534;
+}
+
+.segment-row__revision-btn--reject:hover {
+  border-color: #ef4444;
+  background: linear-gradient(180deg, rgba(254, 226, 226, 0.96), rgba(254, 242, 242, 0.94));
+  color: #991b1b;
+}
+
+/* 修订视图（只读） */
+.segment-row__revision-view {
+  min-height: 0;
+  height: 100%;
+  padding: 10px 12px;
+  border: 1px solid rgba(214, 226, 222, 0.9);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.96);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
+  color: var(--ink-900);
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+/* 修订标记 - 插入 */
+.revision-mark--insert {
+  background: rgba(34, 197, 94, 0.2);
+  color: #166534;
+  text-decoration: none;
+  border-bottom: 2px solid #22c55e;
+  padding: 0 1px;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.revision-mark--insert:hover {
+  background: rgba(34, 197, 94, 0.35);
+}
+
+/* 修订标记 - 删除 */
+.revision-mark--delete {
+  background: rgba(239, 68, 68, 0.15);
+  color: #991b1b;
+  text-decoration: line-through;
+  padding: 0 1px;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.revision-mark--delete:hover {
+  background: rgba(239, 68, 68, 0.3);
+}
+
+/* 有修订的行样式 */
+.segment-row.has-revisions {
+  border-color: #fbbf24;
+  background: linear-gradient(180deg, rgba(255, 251, 235, 0.98), rgba(254, 249, 195, 0.4));
+}
+
+.segment-row.has-revisions:hover {
+  border-color: #f59e0b;
+}
+
+/* 修订信息 Tooltip */
+.revision-tooltip {
+  position: fixed;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(23, 49, 59, 0.95);
+  color: #ffffff;
+  font-size: 12px;
+  pointer-events: none;
+  transform: translate(-50%, -100%);
+  white-space: nowrap;
+  box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2);
+}
+
+.revision-tooltip::after {
+  content: '';
+  position: absolute;
+  bottom: -6px;
+  left: 50%;
+  transform: translateX(-50%);
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-top: 6px solid rgba(23, 49, 59, 0.95);
+}
+
+.revision-tooltip__author {
+  font-weight: 600;
+}
+
+.revision-tooltip__time {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+
+/* 修订工具栏在编辑面板中的间距 */
+.panel--editor .revision-toolbar {
+  margin-bottom: 14px;
+}
+
+/* 修订工具栏加载状态 */
+.revision-toolbar--loading {
+  opacity: 0.7;
+  pointer-events: none;
 }

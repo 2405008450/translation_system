@@ -1412,3 +1412,132 @@ def match_terms(
     matches.sort(key=lambda m: m["start"])
     
     return {"matches": matches}
+
+
+# ========== 修订跟踪 API ==========
+
+from app.services.revision_service import (
+    get_segment_revisions,
+    accept_revision,
+    reject_revision,
+    accept_all_revisions,
+    reject_all_revisions,
+)
+
+
+class RevisionActionRequest(BaseModel):
+    mark_id: str
+
+
+class RevisionBatchActionRequest(BaseModel):
+    author_id: str | None = None
+
+
+@router.get("/file-records/{file_record_id}/revisions")
+def get_file_record_revisions(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+):
+    """获取文件所有句段的修订标记"""
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    revisions = get_segment_revisions(db, file_record_id)
+    return revisions
+
+
+@router.post("/file-records/{file_record_id}/revisions/{sentence_id}/accept")
+def accept_segment_revision(
+    file_record_id: UUID,
+    sentence_id: str,
+    payload: RevisionActionRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """接受单个修订"""
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    success = accept_revision(
+        db=db,
+        file_record_id=file_record_id,
+        sentence_id=sentence_id,
+        mark_id=payload.mark_id,
+        operator=current_user,
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail="句段不存在或修订无效。")
+
+    return {"message": "修订已接受。"}
+
+
+@router.post("/file-records/{file_record_id}/revisions/{sentence_id}/reject")
+def reject_segment_revision(
+    file_record_id: UUID,
+    sentence_id: str,
+    payload: RevisionActionRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """拒绝单个修订"""
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    success = reject_revision(
+        db=db,
+        file_record_id=file_record_id,
+        sentence_id=sentence_id,
+        mark_id=payload.mark_id,
+        operator=current_user,
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail="句段不存在或无法回退。")
+
+    return {"message": "修订已拒绝。"}
+
+
+@router.post("/file-records/{file_record_id}/revisions/accept-all")
+def accept_all_file_revisions(
+    file_record_id: UUID,
+    payload: RevisionBatchActionRequest | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """接受所有修订（可选按作者筛选）"""
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    body = payload or RevisionBatchActionRequest()
+    count = accept_all_revisions(
+        db=db,
+        file_record_id=file_record_id,
+        author_id=body.author_id,
+        operator=current_user,
+    )
+    return {"message": f"已接受 {count} 处修订。", "count": count}
+
+
+@router.post("/file-records/{file_record_id}/revisions/reject-all")
+def reject_all_file_revisions(
+    file_record_id: UUID,
+    payload: RevisionBatchActionRequest | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """拒绝所有修订（可选按作者筛选）"""
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    body = payload or RevisionBatchActionRequest()
+    count = reject_all_revisions(
+        db=db,
+        file_record_id=file_record_id,
+        author_id=body.author_id,
+        operator=current_user,
+    )
+    return {"message": f"已拒绝 {count} 处修订。", "count": count}

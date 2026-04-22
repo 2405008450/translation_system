@@ -186,20 +186,26 @@ def get_tm_candidates(
 
 
 def _build_diff_html(source: str, matched: str) -> str:
-    """生成修订格式的 HTML，标记原文和匹配文本的差异"""
-    matcher = SequenceMatcher(None, source, matched)
+    """生成修订格式的 HTML，以当前原文为基准显示 TM 匹配文本的差异
+    
+    显示逻辑：基于当前原文，标记 TM 匹配文本中不同的部分
+    - <del> 标记 TM 匹配文本中有但当前原文中没有的部分（需要删除才能变成当前原文）
+    - <ins> 标记当前原文中有但 TM 匹配文本中没有的部分（需要插入才能变成当前原文）
+    """
+    # 比较方向：matched -> source，以当前原文为目标
+    matcher = SequenceMatcher(None, matched, source)
     result_parts: list[str] = []
 
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
-            result_parts.append(_escape_html(matched[j1:j2]))
+            result_parts.append(_escape_html(matched[i1:i2]))
         elif tag == "replace":
-            result_parts.append(f'<del>{_escape_html(source[i1:i2])}</del>')
-            result_parts.append(f'<ins>{_escape_html(matched[j1:j2])}</ins>')
+            result_parts.append(f'<del>{_escape_html(matched[i1:i2])}</del>')
+            result_parts.append(f'<ins>{_escape_html(source[j1:j2])}</ins>')
         elif tag == "delete":
-            result_parts.append(f'<del>{_escape_html(source[i1:i2])}</del>')
+            result_parts.append(f'<del>{_escape_html(matched[i1:i2])}</del>')
         elif tag == "insert":
-            result_parts.append(f'<ins>{_escape_html(matched[j1:j2])}</ins>')
+            result_parts.append(f'<ins>{_escape_html(source[j1:j2])}</ins>')
 
     return "".join(result_parts)
 
