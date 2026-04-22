@@ -211,3 +211,90 @@ export interface LLMEvent {
   event: string
   data: Record<string, unknown>
 }
+
+export interface TermbaseCollection {
+  id: string
+  name: string
+  description: string | null
+  source_language: string | null
+  target_language: string | null
+  created_at: string
+  updated_at: string
+  entry_count: number
+}
+
+export interface Term {
+  id: string
+  source_text: string
+  target_text: string
+  term_base_id: string | null
+  created_at: string
+}
+
+export interface TermMatch {
+  term_id: string
+  source_text: string
+  target_text: string
+  start: number
+  end: number
+}
+
+export interface TermbaseImportSummary {
+  filename: string
+  created_rows: number
+  updated_rows: number
+  skipped_rows: number
+  imported_rows: number
+  collection_id: string | null
+  collection_name: string | null
+}
+
+export interface SegmentHistoryOperator {
+  id: string
+  username: string
+}
+
+export interface SegmentHistory {
+  id: string
+  segment_id: string
+  file_record_id: string
+  sentence_id: string
+  source_text: string
+  target_text: string
+  status: string
+  source: string
+  confirm_type: string | null
+  operator: SegmentHistoryOperator | null
+  created_at: string
+}
+
+export interface SegmentHistoryResponse {
+  sentence_id: string
+  source_text: string
+  history: SegmentHistory[]
+}
+
+// 修订跟踪相关类型
+export interface RevisionMark {
+  id: string
+  type: 'insert' | 'delete'
+  text: string
+  position: number
+  length: number
+  author_id: string | null
+  author_username: string | null
+  created_at: string
+}
+
+export interface SegmentRevision {
+  sentence_id: string
+  current_text: string
+  previous_text: string
+  marks: RevisionMark[]
+}
+
+export interface RevisionAuthorSummary {
+  id: string
+  username: string
+  count: number
+}
