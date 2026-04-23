@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Mapping
 import copy
 from dataclasses import dataclass, field
 from html import escape
@@ -19,11 +20,14 @@ from sqlalchemy.orm import Session
 from app.services.cache import get_json, set_json
 from app.services.matcher import MatchStats, match_sentences_with_stats
 from app.services.normalizer import normalize_text
+from app.services.omml_to_mathml import convert as convert_omml_to_mathml
+from app.services.omml_to_mathml import serialize_omml_xml
 from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
 
 
 NS = {
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "m": "http://schemas.openxmlformats.org/officeDocument/2006/math",
     "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
     "rels": "http://schemas.openxmlformats.org/package/2006/relationships",
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
@@ -63,8 +67,13 @@ CELL_GROUP_MAX_CHARS = 200
 CELL_PARAGRAPH_BREAK_SENTINEL = "\uE000"
 PAGE_BREAK_SENTINEL = "\uE001"
 DOCX_PARSE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
-DOCX_PARSE_CACHE_VERSION = "2"
+DOCX_PARSE_CACHE_VERSION = "3"
 EMU_PER_PIXEL = 9525
+MATH_PLACEHOLDER_TEMPLATE = "⟦MATH_{index}⟧"
+OMML_ATOMIC_TAGS = {
+    f'{{{NS["m"]}}}oMath',
+    f'{{{NS["m"]}}}oMathPara',
+}
 SUPPORTED_BROWSER_IMAGE_MIME_TYPES = {
     "image/bmp",
     "image/gif",
@@ -83,6 +92,9 @@ class InlineFragment:
     source_text: str
     css: str = ""
     href: str | None = None
+    render_html: str | None = None
+    is_math: bool = False
+    math_omml_xml: str | None = None
 
 
 CELL_PARAGRAPH_BREAK_FRAGMENT = InlineFragment(
@@ -110,6 +122,7 @@ class TrackedField:
 class InlineParseState:
     field_stack: list[TrackedField] = field(default_factory=list)
     suppressed_page_number_field: bool = False
+    math_placeholder_index: int = 0
 
 
 @dataclass
@@ -507,6 +520,10 @@ def parse_docx_workspace(raw_bytes: bytes) -> dict:
 
 def build_docx_preview_html(raw_bytes: bytes) -> str:
     return _get_cached_parsed_workspace(raw_bytes)["document_html"]
+
+
+def get_cached_docx_workspace(raw_bytes: bytes) -> dict:
+    return _get_cached_parsed_workspace(raw_bytes)
 
 
 def _get_cached_parsed_workspace(raw_bytes: bytes) -> dict:
@@ -1113,6 +1130,7 @@ def _render_paragraph_fragment_group(
     for span in spans:
         sentence_display = _collect_span_text(fragments, span, use_source=False)
         sentence_source = _normalize_segment_source_text(_collect_span_text(fragments, span, use_source=True))
+        math_placeholders = _collect_span_math_placeholders(fragments, span)
         sentence_id = None
         segment_numbering_text = numbering_text if numbering_available else ""
         if sentence_source:
@@ -1131,6 +1149,7 @@ def _render_paragraph_fragment_group(
                     "block_index": block_index,
                     "row_index": row_index,
                     "cell_index": cell_index,
+                    "math_placeholders": math_placeholders,
                 }
             )
             numbering_available = False
@@ -1426,6 +1445,9 @@ def _collect_inline_content(
     hyperlink: str | None = None,
     inherited_css: str = "",
 ) -> tuple[list[InlineFragment], list[str], list[dict]]:
+    if node.tag in OMML_ATOMIC_TAGS:
+        return [_build_math_fragment(node, parse_state)], [], []
+
     node_name = _local_name(node.tag)
     if node_name in {"pPr", "rPr", "tblPr", "tblGrid", "trPr", "tcPr", "sectPr"}:
         return [], [], []
@@ -1445,60 +1467,71 @@ def _collect_inline_content(
             inherited_css=inherited_css,
         )
 
-    if node_name == "fldSimple":
+    if node.tag == _qn("w", "fldSimple"):
         instruction = node.get(_qn("w", "instr"), "")
         if _should_suppress_page_number_field(instruction, story.kind):
             parse_state.suppressed_page_number_field = True
             return [], [], []
 
-    if node_name == "hyperlink":
+    if node.tag == _qn("w", "hyperlink"):
         hyperlink = _resolve_hyperlink_target(node, story.rels) or hyperlink
 
-    if node_name == "r":
+    if node.tag == _qn("w", "r"):
         inherited_css = _merge_css(inherited_css, _build_run_css(node))
 
-    if node_name == "fldChar":
+    if node.tag == _qn("w", "fldChar"):
         _update_field_state(node, story.kind, parse_state)
         return [], [], []
 
-    if node_name == "instrText":
+    if node.tag == _qn("w", "instrText"):
         if parse_state.field_stack and parse_state.field_stack[-1].collecting_instruction:
             parse_state.field_stack[-1].instruction_parts.append(node.text or "")
         return [], [], []
 
     if _is_inside_suppressed_page_number_field(parse_state.field_stack):
-        if node_name in {"t", "tab", "br", "cr", "noBreakHyphen", "sym", "footnoteReference", "endnoteReference", "drawing", "pict"}:
+        if node.tag in {
+            _qn("w", "t"),
+            _qn("w", "tab"),
+            _qn("w", "br"),
+            _qn("w", "cr"),
+            _qn("w", "noBreakHyphen"),
+            _qn("w", "sym"),
+            _qn("w", "footnoteReference"),
+            _qn("w", "endnoteReference"),
+            _qn("w", "drawing"),
+            _qn("w", "pict"),
+        }:
             return [], [], []
 
-    if node_name == "t":
+    if node.tag == _qn("w", "t"):
         text_value = node.text or ""
         return [InlineFragment(display_text=text_value, source_text=text_value, css=inherited_css, href=hyperlink)], [], []
 
-    if node_name == "tab":
+    if node.tag == _qn("w", "tab"):
         return [InlineFragment(display_text="\t", source_text="\t", css=inherited_css, href=hyperlink)], [], []
 
-    if node_name == "lastRenderedPageBreak":
+    if node.tag == _qn("w", "lastRenderedPageBreak"):
         return [InlineFragment(display_text=PAGE_BREAK_SENTINEL, source_text=PAGE_BREAK_SENTINEL)], [], []
 
-    if node_name in {"br", "cr"}:
+    if node.tag in {_qn("w", "br"), _qn("w", "cr")}:
         break_type = node.get(_qn("w", "type"))
         if break_type == "page":
             return [InlineFragment(display_text=PAGE_BREAK_SENTINEL, source_text=PAGE_BREAK_SENTINEL)], [], []
         return [InlineFragment(display_text="\n", source_text="\n", css=inherited_css, href=hyperlink)], [], []
 
-    if node_name == "noBreakHyphen":
+    if node.tag == _qn("w", "noBreakHyphen"):
         return [InlineFragment(display_text="-", source_text="-", css=inherited_css, href=hyperlink)], [], []
 
-    if node_name == "sym":
+    if node.tag == _qn("w", "sym"):
         symbol_text = _decode_symbol(node)
         if not symbol_text:
             return [], [], []
         return [InlineFragment(display_text=symbol_text, source_text=symbol_text, css=inherited_css, href=hyperlink)], [], []
 
-    if node_name in {"footnoteReference", "endnoteReference"}:
+    if node.tag in {_qn("w", "footnoteReference"), _qn("w", "endnoteReference")}:
         return [_build_note_reference_fragment(node, inherited_css)], [], []
 
-    if node_name in {"drawing", "pict"}:
+    if node.tag in {_qn("w", "drawing"), _qn("w", "pict")}:
         embedded_html_parts, embedded_segments = _render_embedded_objects(
             node=node,
             story=story,
@@ -1527,6 +1560,20 @@ def _collect_inline_content(
         embedded_segments.extend(child_embedded_segments)
 
     return fragments, embedded_html_parts, embedded_segments
+
+
+def _build_math_fragment(node: ET.Element, parse_state: InlineParseState) -> InlineFragment:
+    parse_state.math_placeholder_index += 1
+    placeholder = MATH_PLACEHOLDER_TEMPLATE.format(index=parse_state.math_placeholder_index)
+    mathml_html = convert_omml_to_mathml(node)
+    wrapper_class = "doc-math doc-math--block" if _local_name(node.tag) == "oMathPara" else "doc-math"
+    return InlineFragment(
+        display_text=placeholder,
+        source_text=placeholder,
+        render_html=f'<span class="{wrapper_class}">{mathml_html}</span>',
+        is_math=True,
+        math_omml_xml=serialize_omml_xml(node),
+    )
 
 
 def _render_embedded_objects(
@@ -1941,8 +1988,11 @@ def _render_fragment_piece(fragment: InlineFragment, piece: str) -> str:
     if not piece:
         return ""
 
-    piece_html = escape(piece.expandtabs(4))
-    if fragment.css:
+    if fragment.render_html is not None:
+        piece_html = fragment.render_html
+    else:
+        piece_html = escape(piece.expandtabs(4))
+    if fragment.css and fragment.render_html is None:
         piece_html = f'<span class="doc-run" style="{fragment.css}">{piece_html}</span>'
     if fragment.href:
         href = escape(fragment.href, quote=True)
@@ -1952,6 +2002,22 @@ def _render_fragment_piece(fragment: InlineFragment, piece: str) -> str:
             "</a>"
         )
     return piece_html
+
+
+def _collect_span_math_placeholders(
+    fragments: list[InlineFragment],
+    span: SentenceSpan,
+) -> dict[str, str]:
+    placeholders: dict[str, str] = {}
+    cursor = 0
+    for fragment in fragments:
+        next_cursor = cursor + len(fragment.display_text)
+        overlap_start = max(span.start, cursor)
+        overlap_end = min(span.end, next_cursor)
+        if overlap_end > overlap_start and fragment.is_math and fragment.math_omml_xml:
+            placeholders[fragment.source_text] = fragment.math_omml_xml
+        cursor = next_cursor
+    return placeholders
 
 
 def _collect_span_text(
@@ -2273,7 +2339,10 @@ def build_document_html_from_segments(segments: list) -> str:
     for segment in segments:
         block_type = getattr(segment, "block_type", "paragraph") or "paragraph"
         sentence_id = getattr(segment, "sentence_id", "")
-        display_text = escape(getattr(segment, "display_text", ""))
+        display_text = build_segment_display_html(
+            getattr(segment, "display_text", ""),
+            getattr(segment, "math_placeholders", None),
+        )
         sentence_html = (
             f'<span class="doc-sentence" id="{sentence_id}" data-sentence-id="{sentence_id}">'
             f"{display_text}"
@@ -2309,3 +2378,62 @@ def build_document_html_from_segments(segments: list) -> str:
     flush_table()
 
     return "".join(html_parts) or '<p class="doc-paragraph doc-empty"><br></p>'
+
+
+def build_segment_display_html(
+    display_text: str,
+    math_placeholders: Mapping[str, str] | None = None,
+) -> str:
+    if not display_text:
+        return ""
+    if not math_placeholders:
+        return escape(display_text)
+
+    html_parts: list[str] = []
+    cursor = 0
+    for start, end, placeholder, omml_xml in _iter_math_placeholder_occurrences(display_text, math_placeholders):
+        if start > cursor:
+            html_parts.append(escape(display_text[cursor:start]))
+        rendered_math = _render_math_placeholder_html(placeholder, omml_xml)
+        html_parts.append(rendered_math)
+        cursor = end
+    if cursor < len(display_text):
+        html_parts.append(escape(display_text[cursor:]))
+    return "".join(html_parts)
+
+
+def _iter_math_placeholder_occurrences(
+    text: str,
+    math_placeholders: Mapping[str, str],
+):
+    ordered_placeholders = sorted(
+        ((placeholder, omml_xml) for placeholder, omml_xml in math_placeholders.items() if placeholder),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+    cursor = 0
+    text_length = len(text)
+    while cursor < text_length:
+        match_item: tuple[str, str] | None = None
+        for placeholder, omml_xml in ordered_placeholders:
+            if text.startswith(placeholder, cursor):
+                match_item = (placeholder, omml_xml)
+                break
+        if match_item is None:
+            cursor += 1
+            continue
+        placeholder, omml_xml = match_item
+        start = cursor
+        end = start + len(placeholder)
+        yield start, end, placeholder, omml_xml
+        cursor = end
+
+
+def _render_math_placeholder_html(placeholder: str, omml_xml: str) -> str:
+    try:
+        math_node = ET.fromstring(omml_xml)
+        mathml_html = convert_omml_to_mathml(math_node)
+    except ET.ParseError:
+        return escape(placeholder)
+    wrapper_class = "doc-math doc-math--block" if _local_name(math_node.tag) == "oMathPara" else "doc-math"
+    return f'<span class="{wrapper_class}">{mathml_html}</span>'

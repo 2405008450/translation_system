@@ -17,9 +17,11 @@ from app.services.document_exporter import (
     export_translated_docx,
 )
 from app.services.document_workspace import (
+    build_segment_display_html,
     build_docx_preview_html,
     build_docx_workspace,
     build_document_html_from_segments,
+    get_cached_docx_workspace,
 )
 from app.services.file_record_service import (
     count_file_records,
@@ -126,11 +128,20 @@ def _build_pagination(base_path: str, page: int, page_size: int, total_items: in
 def _build_match_results(
     segments,
     tm_target_text_map: dict[str, str] | None = None,
+    source_html_by_sentence_id: dict[str, str] | None = None,
 ) -> list:
     target_map = tm_target_text_map or {}
+    source_html_map = source_html_by_sentence_id or {}
     return [
         type("MatchResult", (), {
             "source_sentence": seg.display_text,
+            "source_html": source_html_map.get(
+                seg.sentence_id,
+                build_segment_display_html(
+                    getattr(seg, "display_text", ""),
+                    getattr(seg, "math_placeholders", None),
+                ),
+            ),
             "status": seg.status,
             "score": seg.score,
             "matched_source_text": seg.matched_source_text,
@@ -141,6 +152,25 @@ def _build_match_results(
         })()
         for seg in segments
     ]
+
+
+def _build_source_html_map_from_segments(segments) -> dict[str, str]:
+    html_map: dict[str, str] = {}
+    for segment in segments:
+        sentence_id = _get_segment_value(segment, "sentence_id", "")
+        if not sentence_id:
+            continue
+        html_map[str(sentence_id)] = build_segment_display_html(
+            str(_get_segment_value(segment, "display_text", "") or ""),
+            _get_segment_value(segment, "math_placeholders"),
+        )
+    return html_map
+
+
+def _get_segment_value(segment, name: str, default=None):
+    if isinstance(segment, dict):
+        return segment.get(name, default)
+    return getattr(segment, name, default)
 
 
 def _build_tm_target_text_map(db: Session, segments) -> dict[str, str]:
@@ -233,12 +263,24 @@ def continue_task(
     file_record = result["file_record"]
     segments = result["segments"]
     tm_target_text_map = _build_tm_target_text_map(db, segments)
+    source_html_by_sentence_id: dict[str, str] = {}
 
     # 转换 segments 为 results 格式
-    results = _build_match_results(segments, tm_target_text_map=tm_target_text_map)
+    results = _build_match_results(
+        segments,
+        tm_target_text_map=tm_target_text_map,
+        source_html_by_sentence_id=source_html_by_sentence_id,
+    )
 
     source_bytes = load_file_record_source(file_record)
     if source_bytes:
+        source_workspace = get_cached_docx_workspace(source_bytes)
+        source_html_by_sentence_id = _build_source_html_map_from_segments(source_workspace["segments"])
+        results = _build_match_results(
+            segments,
+            tm_target_text_map=tm_target_text_map,
+            source_html_by_sentence_id=source_html_by_sentence_id,
+        )
         document_html = build_docx_preview_html(source_bytes)
     else:
         document_html = build_document_html_from_segments(segments) if segments else ""
@@ -333,6 +375,10 @@ async def upload_and_match(
         results = [
             type("MatchResult", (), {
                 "source_sentence": seg["display_text"],
+                "source_html": build_segment_display_html(
+                    seg["display_text"],
+                    seg.get("math_placeholders"),
+                ),
                 "status": seg["status"],
                 "score": seg["score"],
                 "matched_source_text": seg["matched_source_text"],
@@ -434,6 +480,13 @@ async def upload_and_match(
             source_bytes = load_file_record_source(doc_result["file_record"])
             can_export_docx = bool(source_bytes)
             if source_bytes:
+                source_workspace = get_cached_docx_workspace(source_bytes)
+                source_html_by_sentence_id = _build_source_html_map_from_segments(source_workspace["segments"])
+                display_results = _build_match_results(
+                    doc_result["segments"],
+                    tm_target_text_map=tm_target_text_map,
+                    source_html_by_sentence_id=source_html_by_sentence_id,
+                )
                 document_html = build_docx_preview_html(source_bytes)
             else:
                 document_html = build_document_html_from_segments(doc_result["segments"]) if doc_result["segments"] else ""

@@ -77,6 +77,7 @@ class ProviderConfig:
 
 
 NUMERIC_LIKE_FRAGMENT_RE = re.compile(r"^[0-9\s,.\-+/%()（）$€¥￥£:：]+$")
+MATH_PLACEHOLDER_RE = re.compile(r"⟦MATH_\d+⟧")
 STRICT_PRESERVE_SYMBOLS = frozenset({"□", "☐", "☑", "", "", "✓", "✔", "✗", "✘"})
 
 
@@ -280,6 +281,8 @@ def _build_messages(
         "你是专业的中英翻译专家。"
         "请保持术语一致，保留数字、单位、专有名词和格式。"
         "如果原文包含复选框、勾选框、项目符号或特殊符号（如 □、☐、☑、、✓ 等），必须按原样保留这些符号本身及其顺序，不得新增、删除、替换，也不得自行改变其选中状态。"
+        "如果原文包含形如 ⟦MATH_1⟧ 的占位符，这代表一个数学公式，必须原样保留该占位符本身。"
+        "占位符的顺序和数量必须与原文一致，不得翻译、改写、删除、重排，也不得增删空格、括号或引号。"
         "只输出最终英文译文，不要解释，不要引号，不要项目符号。"
     )
     retry_instruction = ""
@@ -287,6 +290,7 @@ def _build_messages(
         retry_instruction = (
             "\n这是一次纠错重试。"
             "请更严格地保留原文中的数字、格式、复选框和特殊符号，禁止擅自补充勾选状态或改写符号样式。"
+            "请同时原样保留所有数学公式占位符 ⟦MATH_n⟧。"
         )
         if retry_reason:
             retry_instruction += f"\n上一次结果的问题：{retry_reason}"
@@ -355,6 +359,10 @@ def _extract_preserved_symbol_sequence(text: str) -> list[str]:
     return [char for char in text if char in STRICT_PRESERVE_SYMBOLS]
 
 
+def _extract_math_placeholder_sequence(text: str) -> list[str]:
+    return MATH_PLACEHOLDER_RE.findall(text)
+
+
 def _validate_translation_output(task: LLMTranslationTask, translated_text: str) -> None:
     normalized_output = normalize_text(translated_text)
     if not normalized_output:
@@ -369,6 +377,12 @@ def _validate_translation_output(task: LLMTranslationTask, translated_text: str)
         output_symbols = _extract_preserved_symbol_sequence(translated_text)
         if output_symbols != source_symbols:
             raise LLMResponseValidationError("复选框或特殊符号未按原文原样保留。")
+
+    source_math_placeholders = _extract_math_placeholder_sequence(task.source_text)
+    if source_math_placeholders:
+        output_math_placeholders = _extract_math_placeholder_sequence(translated_text)
+        if output_math_placeholders != source_math_placeholders:
+            raise LLMResponseValidationError("数学公式占位符未按原文原样保留。")
 
 
 def _describe_diff(source_text: str, matched_source_text: str) -> str:

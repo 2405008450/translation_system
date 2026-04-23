@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from io import BytesIO
 from itertools import count
 from pathlib import Path
+import re
 from typing import Any
 from zipfile import ZipFile
 from xml.etree import ElementTree as ET
@@ -17,9 +19,12 @@ from app.services.document_workspace import (
     CELL_SENTENCE_END_CHARS,
     CELL_SHORT_PARAGRAPH_MAX_CHARS,
     DocxPackage,
+    MATH_PLACEHOLDER_TEMPLATE,
     NS,
     NumberingSchema,
+    OMML_ATOMIC_TAGS,
     StoryPart,
+    get_cached_docx_workspace,
     _build_numbering_schema,
     _build_story_parts,
     _build_trimmed_span,
@@ -39,6 +44,7 @@ DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingm
 XML_SPACE_ATTR = "{http://www.w3.org/XML/1998/namespace}space"
 EXPORT_FONT_FAMILY = "Times New Roman"
 BlockKey = tuple[str, int, int | None, int | None]
+MATH_PLACEHOLDER_RE = re.compile(r"⟦MATH_\d+⟧|\[\[MATH_\d+\]\]")
 
 
 @dataclass(frozen=True)
@@ -46,6 +52,7 @@ class ExportSegment:
     sentence_id: str
     source_text: str
     target_text: str
+    math_placeholders: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -54,11 +61,14 @@ class TextToken:
     source_text: str
     element: ET.Element | None = None
     run_element: ET.Element | None = None
+    anchor_element: ET.Element | None = None
+    container_element: ET.Element | None = None
     original_text: str = ""
     start: int = 0
     end: int = 0
     edits: list[tuple[int, int, str]] = field(default_factory=list)
     apply_export_font: bool = False
+    is_math: bool = False
 
 
 @dataclass(frozen=True)
@@ -71,7 +81,13 @@ def export_translated_docx(raw_bytes: bytes, segments: Iterable[Any]) -> bytes:
     package = DocxPackage(raw_bytes)
     stories = _build_story_parts(package)
     numbering_schema = _build_numbering_schema(package)
-    segments_by_block = _group_segments_by_block(segments)
+    source_workspace = get_cached_docx_workspace(raw_bytes)
+    math_placeholders_by_sentence_id = {
+        str(segment["sentence_id"]): dict(segment.get("math_placeholders") or {})
+        for segment in source_workspace["segments"]
+        if segment.get("sentence_id")
+    }
+    segments_by_block = _group_segments_by_block(segments, math_placeholders_by_sentence_id)
     block_counter = count(0)
 
     for story in stories:
@@ -97,20 +113,26 @@ def build_translated_docx_filename(filename: str) -> str:
     return f"{source_path.stem}_translated.docx"
 
 
-def _group_segments_by_block(segments: Iterable[Any]) -> dict[BlockKey, list[ExportSegment]]:
+def _group_segments_by_block(
+    segments: Iterable[Any],
+    math_placeholders_by_sentence_id: Mapping[str, dict[str, str]] | None = None,
+) -> dict[BlockKey, list[ExportSegment]]:
     grouped: dict[BlockKey, list[ExportSegment]] = defaultdict(list)
+    math_map = math_placeholders_by_sentence_id or {}
 
     for segment in segments:
         block_type = str(_get_segment_value(segment, "block_type", "paragraph") or "paragraph")
         block_index = int(_get_segment_value(segment, "block_index", 0) or 0)
         row_index = _to_optional_int(_get_segment_value(segment, "row_index"))
         cell_index = _to_optional_int(_get_segment_value(segment, "cell_index"))
+        sentence_id = str(_get_segment_value(segment, "sentence_id", "") or "")
 
         grouped[(block_type, block_index, row_index, cell_index)].append(
             ExportSegment(
-                sentence_id=str(_get_segment_value(segment, "sentence_id", "") or ""),
+                sentence_id=sentence_id,
                 source_text=str(_get_segment_value(segment, "source_text", "") or ""),
                 target_text=str(_get_segment_value(segment, "target_text", "") or ""),
+                math_placeholders=dict(math_map.get(sentence_id) or {}),
             )
         )
 
@@ -332,6 +354,7 @@ def _export_table_cell(
                         block_counter=block_counter,
                         numbering_schema=numbering_schema,
                         segments_by_block=segments_by_block,
+                        math_placeholder_counter=[0],
                     ),
                 )
             )
@@ -367,6 +390,7 @@ def _export_paragraph(
         block_counter=block_counter,
         numbering_schema=numbering_schema,
         segments_by_block=segments_by_block,
+        math_placeholder_counter=[0],
     )
 
     _replace_block_tokens(
@@ -385,7 +409,24 @@ def _collect_inline_tokens(
     numbering_schema: NumberingSchema,
     segments_by_block: dict[BlockKey, list[ExportSegment]],
     current_run: ET.Element | None = None,
+    current_run_container: ET.Element | None = None,
+    parent_element: ET.Element | None = None,
+    math_placeholder_counter: list[int] | None = None,
 ) -> list[TextToken]:
+    placeholder_counter = math_placeholder_counter if math_placeholder_counter is not None else [0]
+    if node.tag in OMML_ATOMIC_TAGS:
+        placeholder_counter[0] += 1
+        placeholder = MATH_PLACEHOLDER_TEMPLATE.format(index=placeholder_counter[0])
+        return [
+            TextToken(
+                display_text=placeholder,
+                source_text=placeholder,
+                anchor_element=node,
+                container_element=parent_element,
+                is_math=True,
+            )
+        ]
+
     node_name = _local_name(node.tag)
     if node_name in {"pPr", "rPr", "tblPr", "tblGrid", "trPr", "tcPr", "sectPr"}:
         return []
@@ -401,12 +442,16 @@ def _collect_inline_tokens(
             numbering_schema=numbering_schema,
             segments_by_block=segments_by_block,
             current_run=current_run,
+            current_run_container=current_run_container,
+            parent_element=parent_element,
+            math_placeholder_counter=placeholder_counter,
         )
 
-    if node_name == "r":
+    if node.tag == _qn("w", "r"):
         current_run = node
+        current_run_container = parent_element
 
-    if node_name == "t":
+    if node.tag == _qn("w", "t"):
         text_value = node.text or ""
         return [
             TextToken(
@@ -414,31 +459,33 @@ def _collect_inline_tokens(
                 source_text=text_value,
                 element=node,
                 run_element=current_run,
+                anchor_element=current_run or node,
+                container_element=current_run_container or parent_element,
                 original_text=text_value,
             )
         ]
 
-    if node_name == "tab":
+    if node.tag == _qn("w", "tab"):
         return [TextToken(display_text="\t", source_text="\t")]
 
-    if node_name in {"br", "cr"}:
+    if node.tag in {_qn("w", "br"), _qn("w", "cr")}:
         return [TextToken(display_text="\n", source_text="\n")]
 
-    if node_name == "noBreakHyphen":
+    if node.tag == _qn("w", "noBreakHyphen"):
         return [TextToken(display_text="-", source_text="-")]
 
-    if node_name == "sym":
+    if node.tag == _qn("w", "sym"):
         symbol_text = _decode_symbol(node)
         if not symbol_text:
             return []
         return [TextToken(display_text=symbol_text, source_text=symbol_text)]
 
-    if node_name in {"footnoteReference", "endnoteReference"}:
+    if node.tag in {_qn("w", "footnoteReference"), _qn("w", "endnoteReference")}:
         note_id = node.get(_qn("w", "id"), "")
         marker = f"[{note_id}]" if note_id else "[*]"
         return [TextToken(display_text=marker, source_text=" " * len(marker))]
 
-    if node_name in {"drawing", "pict"}:
+    if node.tag in {_qn("w", "drawing"), _qn("w", "pict")}:
         _export_embedded_textboxes(
             node=node,
             story=story,
@@ -461,6 +508,9 @@ def _collect_inline_tokens(
                 numbering_schema=numbering_schema,
                 segments_by_block=segments_by_block,
                 current_run=current_run,
+                current_run_container=current_run_container,
+                parent_element=node,
+                math_placeholder_counter=placeholder_counter,
             )
         )
 
@@ -551,9 +601,178 @@ def _replace_block_tokens(
         if not normalize_text(replacement):
             continue
 
-        _queue_sentence_replacement(tokens, span, replacement)
+        expected_math_placeholders = _extract_math_placeholders_from_tokens(tokens, span)
+        if expected_math_placeholders:
+            _queue_math_sentence_replacement(
+                tokens=tokens,
+                span=span,
+                replacement=replacement,
+                expected_math_placeholders=expected_math_placeholders,
+            )
+        else:
+            _queue_sentence_replacement(tokens, span, replacement)
 
     _apply_token_edits(tokens)
+
+
+def _extract_math_placeholders_from_tokens(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+) -> list[str]:
+    return [
+        token.source_text
+        for token in tokens
+        if token.is_math and token.start < span.end and token.end > span.start
+    ]
+
+
+def _queue_math_sentence_replacement(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+    replacement: str,
+    expected_math_placeholders: list[str],
+) -> None:
+    text_parts = _split_replacement_around_math_placeholders(replacement, expected_math_placeholders)
+    if text_parts is None:
+        raise ValueError("导出失败：译文中的数学公式占位符顺序或数量与原文不一致。")
+
+    sentence_tokens = [
+        token
+        for token in tokens
+        if token.start < span.end and token.end > span.start
+    ]
+    math_tokens = [token for token in sentence_tokens if token.is_math]
+    if len(math_tokens) != len(expected_math_placeholders):
+        raise ValueError("导出失败：段落中的数学公式结构与句段映射不一致。")
+
+    for index, replacement_text in enumerate(text_parts):
+        region_start = span.start if index == 0 else math_tokens[index - 1].end
+        region_end = span.end if index == len(math_tokens) else math_tokens[index].start
+        before_token = math_tokens[index - 1] if index > 0 else None
+        after_token = math_tokens[index] if index < len(math_tokens) else _find_first_token_starting_at_or_after(tokens, span.end)
+        _queue_text_region_replacement(
+            tokens=tokens,
+            region_start=region_start,
+            region_end=region_end,
+            replacement_text=replacement_text,
+            before_token=before_token,
+            after_token=after_token,
+        )
+
+
+def _split_replacement_around_math_placeholders(
+    replacement: str,
+    expected_math_placeholders: list[str],
+) -> list[str] | None:
+    matches = list(MATH_PLACEHOLDER_RE.finditer(replacement))
+    actual_placeholders = [match.group(0) for match in matches]
+    if actual_placeholders != expected_math_placeholders:
+        return None
+
+    text_parts: list[str] = []
+    cursor = 0
+    for match in matches:
+        text_parts.append(replacement[cursor:match.start()])
+        cursor = match.end()
+    text_parts.append(replacement[cursor:])
+    return text_parts
+
+
+def _queue_text_region_replacement(
+    tokens: list[TextToken],
+    region_start: int,
+    region_end: int,
+    replacement_text: str,
+    before_token: TextToken | None,
+    after_token: TextToken | None,
+) -> None:
+    writable_overlaps: list[tuple[TextToken, int, int]] = []
+    for token in tokens:
+        if token.element is None:
+            continue
+        overlap_start = max(region_start, token.start)
+        overlap_end = min(region_end, token.end)
+        if overlap_end <= overlap_start:
+            continue
+        writable_overlaps.append((token, overlap_start - token.start, overlap_end - token.start))
+
+    if writable_overlaps:
+        _queue_text_range_edit(writable_overlaps, replacement_text)
+        return
+
+    if not replacement_text:
+        return
+
+    _insert_text_run_between_tokens(replacement_text, before_token=before_token, after_token=after_token)
+
+
+def _queue_text_range_edit(
+    writable_overlaps: list[tuple[TextToken, int, int]],
+    replacement_text: str,
+) -> None:
+    first_token, first_start, first_end = writable_overlaps[0]
+    first_token.edits.append((first_start, first_end, replacement_text))
+    first_token.apply_export_font = True
+
+    for token, local_start, local_end in writable_overlaps[1:]:
+        token.edits.append((local_start, local_end, ""))
+
+
+def _insert_text_run_between_tokens(
+    text: str,
+    before_token: TextToken | None,
+    after_token: TextToken | None,
+) -> None:
+    if not text:
+        return
+
+    if after_token is not None and after_token.container_element is not None and after_token.anchor_element is not None:
+        parent = after_token.container_element
+        index = list(parent).index(after_token.anchor_element)
+        reference_run = _pick_reference_run(before_token, after_token)
+        parent.insert(index, _build_inserted_word_run(text, reference_run))
+        return
+
+    if before_token is not None and before_token.container_element is not None and before_token.anchor_element is not None:
+        parent = before_token.container_element
+        index = list(parent).index(before_token.anchor_element) + 1
+        reference_run = _pick_reference_run(before_token, after_token)
+        parent.insert(index, _build_inserted_word_run(text, reference_run))
+
+
+def _pick_reference_run(
+    before_token: TextToken | None,
+    after_token: TextToken | None,
+) -> ET.Element | None:
+    for token in (before_token, after_token):
+        if token is not None and token.run_element is not None:
+            return token.run_element
+    return None
+
+
+def _build_inserted_word_run(text: str, reference_run: ET.Element | None) -> ET.Element:
+    if reference_run is not None and _namespace_uri(reference_run.tag) == NS["w"]:
+        run_element = deepcopy(reference_run)
+        for child in list(run_element):
+            if _local_name(child.tag) != "rPr":
+                run_element.remove(child)
+    else:
+        run_element = ET.Element(_qn("w", "r"))
+
+    text_element = ET.Element(_qn("w", "t"))
+    text_element.text = text
+    if _needs_space_preserve(text):
+        text_element.set(XML_SPACE_ATTR, "preserve")
+    run_element.append(text_element)
+    _apply_export_font(run_element)
+    return run_element
+
+
+def _find_first_token_starting_at_or_after(tokens: list[TextToken], position: int) -> TextToken | None:
+    for token in tokens:
+        if token.start >= position and token.anchor_element is not None and token.container_element is not None:
+            return token
+    return None
 
 
 def _assign_token_offsets(tokens: list[TextToken]) -> None:

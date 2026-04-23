@@ -317,6 +317,30 @@
         .doc-run {
             white-space: pre-wrap;
         }
+        .doc-math {
+            display: inline-flex;
+            align-items: center;
+            max-width: 100%;
+            padding: 0 4px;
+            margin: 0 2px;
+            border: 1px solid #d0d7de;
+            border-radius: 4px;
+            background: #f6f8fa;
+            vertical-align: middle;
+            user-select: none;
+        }
+        .doc-math math {
+            font-size: 1em;
+        }
+        .doc-math--block {
+            display: flex;
+            width: fit-content;
+            margin: 0.35rem 0;
+            padding: 0.35rem 0.5rem;
+        }
+        .doc-math--block math {
+            display: block;
+        }
         .document-body a {
             color: inherit;
             text-decoration: underline;
@@ -468,7 +492,7 @@
                             <tbody>
                                 {% for item in results %}
                                 <tr data-index="{{ loop.index0 }}" data-sentence-id="{{ item.sentence_id }}" data-status="{{ item.status }}" data-source="{{ item.source }}">
-                                    <td>{{ item.source_sentence }}</td>
+                                    <td class="source-sentence-cell">{{ (item.source_html if item.source_html is defined else item.source_sentence)|safe }}</td>
                                     <td>
                                         {% if item.status == "exact" %}
                                         <span class="badge text-bg-success">exact</span>
@@ -776,8 +800,13 @@
             if (llmProvider) llmProvider.disabled = loading;
         }
 
-        function openPanel(source, matched, tmTarget, status) {
-            document.getElementById('currentSource').textContent = source || '-';
+        function openPanel(source, matched, tmTarget, status, sourceHtml = '') {
+            const currentSource = document.getElementById('currentSource');
+            if (sourceHtml) {
+                currentSource.innerHTML = sourceHtml;
+            } else {
+                currentSource.textContent = source || '-';
+            }
             document.getElementById('matchedSource').textContent = matched || '-';
             document.getElementById('targetText').textContent = (status === 'none' || !matched) ? '-' : (tmTarget || '-');
 
@@ -842,11 +871,13 @@
 
         function bindEditableCell(cell) {
             cell.addEventListener('click', () => {
+                const sourceCell = cell.closest('tr')?.querySelector('.source-sentence-cell');
                 openPanel(
                     cell.dataset.sourceText,
                     cell.dataset.matched,
                     cell.dataset.tmTarget,
-                    cell.dataset.status
+                    cell.dataset.status,
+                    sourceCell ? sourceCell.innerHTML : ''
                 );
             });
 
@@ -1124,11 +1155,13 @@
                             ? activeRow.querySelector('.editable-target')
                             : editableCells[0];
                         if (cell) {
+                            const sourceCell = cell.closest('tr')?.querySelector('.source-sentence-cell');
                             openPanel(
                                 cell.dataset.sourceText,
                                 cell.dataset.matched,
                                 cell.dataset.tmTarget,
-                                cell.dataset.status
+                                cell.dataset.status,
+                                sourceCell ? sourceCell.innerHTML : ''
                             );
                         } else {
                             openPanel('', '', '', 'none');
