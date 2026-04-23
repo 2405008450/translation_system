@@ -5,9 +5,10 @@ from uuid import UUID
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
-from app.models import FileRecord, Segment, TranslationMemory
+from app.models import FileRecord, Segment, TranslationMemory, User
 from app.services.document_workspace import build_docx_workspace
 from app.services.document_storage import delete_source_file, load_source_file, save_source_file
+from app.services.revision_service import create_revision
 
 
 SEGMENT_ORDERING = (
@@ -359,15 +360,26 @@ def update_segment_target(
     segment_id: UUID,
     target_text: str,
     source: str = "manual",
+    current_user: User | None = None,
 ) -> Segment | None:
     segment = db.query(Segment).filter(Segment.id == segment_id).first()
     if not segment:
         return None
 
+    before_text = segment.target_text
     segment.target_text = target_text
     segment.source = source
     if source == "manual":
         segment.status = "confirmed"
+    create_revision(
+        db,
+        file_record_id=segment.file_record_id,
+        segment=segment,
+        before_text=before_text,
+        after_text=target_text,
+        source=source,
+        author=current_user,
+    )
 
     sync_file_record_status(db, segment.file_record_id)
     db.commit()
@@ -381,6 +393,7 @@ def update_segment_by_sentence_id(
     sentence_id: str,
     target_text: str,
     source: str = "manual",
+    current_user: User | None = None,
 ) -> Segment | None:
     segment = (
         db.query(Segment)
@@ -390,10 +403,20 @@ def update_segment_by_sentence_id(
     if not segment:
         return None
 
+    before_text = segment.target_text
     segment.target_text = target_text
     segment.source = source
     if source == "manual":
         segment.status = "confirmed"
+    create_revision(
+        db,
+        file_record_id=file_record_id,
+        segment=segment,
+        before_text=before_text,
+        after_text=target_text,
+        source=source,
+        author=current_user,
+    )
 
     sync_file_record_status(db, segment.file_record_id)
     db.commit()
@@ -406,6 +429,7 @@ def update_segment_with_llm_result(
     file_record_id: UUID,
     sentence_id: str,
     target_text: str,
+    current_user: User | None = None,
 ) -> Segment | None:
     return update_segment_by_sentence_id(
         db=db,
@@ -413,6 +437,7 @@ def update_segment_with_llm_result(
         sentence_id=sentence_id,
         target_text=target_text,
         source="llm",
+        current_user=current_user,
     )
 
 
@@ -420,6 +445,7 @@ def batch_update_segments(
     db: Session,
     file_record_id: UUID,
     updates: list[dict],
+    current_user: User | None = None,
 ) -> int:
     updates_by_sentence_id: dict[str, dict] = {}
     for item in updates:
@@ -445,12 +471,22 @@ def batch_update_segments(
         if item is None:
             continue
 
+        before_text = segment.target_text
         target_text = item.get("target_text", "")
         source = item.get("source", "manual")
         segment.target_text = target_text
         segment.source = source
         if source == "manual":
             segment.status = "confirmed"
+        create_revision(
+            db,
+            file_record_id=file_record_id,
+            segment=segment,
+            before_text=before_text,
+            after_text=target_text,
+            source=source,
+            author=current_user,
+        )
         updated_count += 1
 
     if updated_count > 0:

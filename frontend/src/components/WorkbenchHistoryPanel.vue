@@ -3,9 +3,10 @@ import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import StateView from './base/StateView.vue'
+import DiffText from './DiffText.vue'
 
 import { getSegmentSourceMeta } from '../constants/status'
-import type { SegmentComment, SegmentRevisionEntry } from '../types/api'
+import type { SegmentComment, SegmentRevisionEntry, User } from '../types/api'
 
 const props = withDefaults(defineProps<{
   activeSentenceId: string | null
@@ -23,12 +24,26 @@ const timelineComments = computed(() => {
   return props.comments.filter((comment) => comment.sentence_id === props.activeSentenceId && !comment.parent_id)
 })
 
-function formatDateTime(value: string) {
+function formatDateTime(value: string | null) {
+  if (!value) {
+    return ''
+  }
   return new Date(value).toLocaleString('zh-CN', { hour12: false })
 }
 
-function getAuthorDisplayName(comment: SegmentComment) {
-  return comment.author.nickname || comment.author.username
+function getUserDisplayName(user: User | null) {
+  if (!user) {
+    return '系统'
+  }
+  return user.nickname || user.username
+}
+
+function getRevisionStatusLabel(status: SegmentRevisionEntry['status']) {
+  return {
+    pending: '待审核',
+    accepted: '已接受',
+    rejected: '已拒绝',
+  }[status]
 }
 </script>
 
@@ -58,7 +73,7 @@ function getAuthorDisplayName(comment: SegmentComment) {
         />
         <article v-for="comment in timelineComments" :key="comment.id" class="workbench-history-panel__comment">
           <div class="workbench-history-panel__meta">
-            <strong>{{ getAuthorDisplayName(comment) }}</strong>
+            <strong>{{ getUserDisplayName(comment.author) }}</strong>
             <span>{{ formatDateTime(comment.created_at) }}</span>
           </div>
           <p>{{ comment.body }}</p>
@@ -75,18 +90,31 @@ function getAuthorDisplayName(comment: SegmentComment) {
         />
         <article v-for="entry in history" :key="entry.id" class="workbench-history-panel__revision">
           <div class="workbench-history-panel__meta">
-            <strong>{{ getSegmentSourceMeta(entry.source).label }}</strong>
+            <div class="workbench-history-panel__meta-primary">
+              <strong>{{ getUserDisplayName(entry.author) }}</strong>
+              <span class="workbench-history-panel__tag">
+                {{ getSegmentSourceMeta(entry.source).label }}
+              </span>
+              <span
+                class="workbench-history-panel__tag"
+                :class="`is-${entry.status}`"
+              >
+                {{ getRevisionStatusLabel(entry.status) }}
+              </span>
+            </div>
             <span>{{ formatDateTime(entry.created_at) }}</span>
           </div>
+          <div v-if="entry.resolved_by || entry.resolved_at" class="workbench-history-panel__resolved">
+            <span>处理人：{{ getUserDisplayName(entry.resolved_by) }}</span>
+            <span v-if="entry.resolved_at">{{ formatDateTime(entry.resolved_at) }}</span>
+          </div>
           <div class="workbench-history-panel__diff">
-            <div>
-              <div class="workbench-history-panel__label">{{ t('historyPanel.before') }}</div>
-              <p>{{ entry.before_text || t('historyPanel.emptyText') }}</p>
-            </div>
-            <div>
-              <div class="workbench-history-panel__label">{{ t('historyPanel.after') }}</div>
-              <p>{{ entry.after_text || t('historyPanel.emptyText') }}</p>
-            </div>
+            <div class="workbench-history-panel__label">变更内容</div>
+            <DiffText
+              :old-text="entry.before_text"
+              :new-text="entry.after_text"
+              :empty-text="t('historyPanel.emptyText')"
+            />
           </div>
         </article>
       </div>
@@ -118,17 +146,22 @@ function getAuthorDisplayName(comment: SegmentComment) {
   background: var(--surface-panel);
 }
 
-.workbench-history-panel__meta {
+.workbench-history-panel__meta,
+.workbench-history-panel__meta-primary,
+.workbench-history-panel__resolved {
   display: flex;
   justify-content: space-between;
-  gap: 12px;
+  gap: 8px;
   flex-wrap: wrap;
   color: var(--text-muted);
   font-size: 12px;
 }
 
-.workbench-history-panel__comment p,
-.workbench-history-panel__revision p {
+.workbench-history-panel__meta-primary {
+  justify-content: flex-start;
+}
+
+.workbench-history-panel__comment p {
   margin: 0;
   color: var(--text-secondary);
   line-height: 1.6;
@@ -137,12 +170,36 @@ function getAuthorDisplayName(comment: SegmentComment) {
 
 .workbench-history-panel__diff {
   display: grid;
-  gap: 10px;
+  gap: 6px;
 }
 
 .workbench-history-panel__label {
-  margin-bottom: 4px;
   color: var(--text-muted);
   font-size: 12px;
+}
+
+.workbench-history-panel__tag {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: rgba(229, 236, 238, 0.9);
+  color: #556d72;
+}
+
+.workbench-history-panel__tag.is-pending {
+  background: rgba(218, 183, 61, 0.18);
+  color: #8f6900;
+}
+
+.workbench-history-panel__tag.is-accepted {
+  background: rgba(83, 176, 116, 0.18);
+  color: #267246;
+}
+
+.workbench-history-panel__tag.is-rejected {
+  background: rgba(208, 88, 88, 0.16);
+  color: #9d3a3a;
 }
 </style>

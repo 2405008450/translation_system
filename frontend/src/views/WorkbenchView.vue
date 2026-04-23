@@ -12,6 +12,7 @@ import {
   Languages,
   Loader2,
   MessageSquare,
+  MoreHorizontal,
   Save,
   Upload,
 } from 'lucide-vue-next'
@@ -77,6 +78,8 @@ const activeTool = ref<ToolKey | null>(null)
 const showImportDialog = ref(false)
 const importDialogInitialTab = ref<ResourceImportTab>('tm')
 const showShortcutHelp = ref(false)
+const openRevisionMenu = ref(false)
+const revisionActionLoading = ref(false)
 
 const termBases = ref<TermBase[]>([])
 const termEntries = ref<TermEntryRecord[]>([])
@@ -368,9 +371,64 @@ function confirmCurrentSentence() {
   toast.success(t('workbench.messages.confirmed'))
 }
 
+async function handleAcceptRevision(revisionId: string) {
+  pageError.value = ''
+  revisionActionLoading.value = true
+  try {
+    await segmentStore.acceptRevision(revisionId)
+    toast.success('修订已接受')
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '接受修订失败')
+  } finally {
+    revisionActionLoading.value = false
+  }
+}
+
+async function handleRejectRevision(revisionId: string) {
+  pageError.value = ''
+  revisionActionLoading.value = true
+  try {
+    await segmentStore.rejectRevision(revisionId)
+    toast.success('修订已拒绝')
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '拒绝修订失败')
+  } finally {
+    revisionActionLoading.value = false
+  }
+}
+
+async function handleBatchAcceptRevisions() {
+  pageError.value = ''
+  revisionActionLoading.value = true
+  try {
+    const updatedCount = await segmentStore.batchAcceptRevisions()
+    openRevisionMenu.value = false
+    toast.success(updatedCount > 0 ? `已接受 ${updatedCount} 条修订` : '没有待处理的修订')
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '批量接受修订失败')
+  } finally {
+    revisionActionLoading.value = false
+  }
+}
+
+async function handleBatchRejectRevisions() {
+  pageError.value = ''
+  revisionActionLoading.value = true
+  try {
+    const updatedCount = await segmentStore.batchRejectRevisions()
+    openRevisionMenu.value = false
+    toast.success(updatedCount > 0 ? `已拒绝 ${updatedCount} 条修订` : '没有待处理的修订')
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '批量拒绝修订失败')
+  } finally {
+    revisionActionLoading.value = false
+  }
+}
+
 async function loadTask() {
   pageError.value = ''
   activeTool.value = null
+  openRevisionMenu.value = false
   commentStore.stopPolling()
   termEntries.value = []
   termBases.value = []
@@ -591,6 +649,36 @@ onBeforeRouteLeave(async () => {
           {{ t('workbench.exportDocx') }}
         </button>
 
+        <div class="workbench-revision-menu">
+          <button
+            class="button"
+            type="button"
+            :disabled="segmentStore.pendingRevisionCount === 0"
+            @click="openRevisionMenu = !openRevisionMenu"
+          >
+            <MoreHorizontal :size="14" />
+            修订管理
+            <span class="workbench-revision-menu__badge">{{ segmentStore.pendingRevisionCount }}</span>
+          </button>
+          <div v-if="openRevisionMenu" class="workbench-revision-menu__dropdown">
+            <button
+              type="button"
+              :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
+              @click="void handleBatchAcceptRevisions()"
+            >
+              全部接受
+            </button>
+            <button
+              class="is-danger"
+              type="button"
+              :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
+              @click="void handleBatchRejectRevisions()"
+            >
+              全部拒绝
+            </button>
+          </div>
+        </div>
+
         <button
           v-if="!segmentStore.llmRunning"
           class="button button--primary"
@@ -723,8 +811,12 @@ onBeforeRouteLeave(async () => {
               :segment="item"
               :index="index"
               :active="segmentStore.activeSentenceId === item.sentence_id"
+              :pending-revision="segmentStore.getPendingRevision(item.sentence_id)"
+              :revision-busy="revisionActionLoading"
               @focus="segmentStore.setActiveSentence"
               @update="segmentStore.updateTarget"
+              @accept-revision="handleAcceptRevision"
+              @reject-revision="handleRejectRevision"
             />
           </template>
         </VirtualList>
@@ -734,10 +826,10 @@ onBeforeRouteLeave(async () => {
         class="workbench-sidecar"
         :class="{ 'is-preview-open': activeTool && activeTool !== 'split-preview', 'is-split-open': activeTool === 'split-preview' }"
       >
-        <Transition name="preview-drawer">
+        <Transition name="preview-drawer" mode="out-in">
           <SplitPreviewPanel
             v-if="activeTool === 'split-preview'"
-            :key="activeTool"
+            key="split-preview"
             :source-html="segmentStore.previewHtml"
             :target-html="targetPreviewHtml"
             :source-supported="segmentStore.previewSupported"
@@ -757,12 +849,9 @@ onBeforeRouteLeave(async () => {
             @focus-comment="handleCommentFocus"
             @request-comment="handleCommentDraft"
           />
-        </Transition>
-
-        <Transition name="preview-drawer">
           <PreviewPanel
-            v-if="activeTool === 'source-preview' || activeTool === 'target-preview'"
-            :key="activeTool"
+            v-else-if="activeTool === 'source-preview' || activeTool === 'target-preview'"
+            key="single-preview"
             class="preview-panel--drawer"
             :title="activeTool === 'source-preview' ? t('workbench.tools.sourcePreview') : t('workbench.tools.targetPreview')"
             :html="activeTool === 'source-preview' ? segmentStore.previewHtml : targetPreviewHtml"
@@ -782,11 +871,9 @@ onBeforeRouteLeave(async () => {
             @request-comment="handleCommentDraft"
             @close="activeTool = null"
           />
-        </Transition>
-
-        <Transition name="preview-drawer">
           <WorkbenchTermsPanel
-            v-if="activeTool === 'terms'"
+            v-else-if="activeTool === 'terms'"
+            key="terms"
             :term-bases="termBases"
             :selected-term-base-id="selectedTermBaseId"
             :entries="termEntries"
@@ -796,11 +883,9 @@ onBeforeRouteLeave(async () => {
             :message="termsMessage"
             @update:selected-term-base-id="selectedTermBaseId = $event"
           />
-        </Transition>
-
-        <Transition name="preview-drawer">
           <NotesPanel
-            v-if="activeTool === 'notes'"
+            v-else-if="activeTool === 'notes'"
+            key="notes"
             :comments="commentStore.comments"
             :loading="commentStore.loading"
             :saving="commentStore.saving"
@@ -817,11 +902,9 @@ onBeforeRouteLeave(async () => {
             @reply-comment="handleReplyComment"
             @cancel-draft="commentStore.setDraftAnchor(null)"
           />
-        </Transition>
-
-        <Transition name="preview-drawer">
           <WorkbenchHistoryPanel
-            v-if="activeTool === 'history'"
+            v-else-if="activeTool === 'history'"
+            key="history"
             :active-sentence-id="segmentStore.activeSentenceId"
             :comments="commentStore.comments"
             :history="activeSegmentHistory"
@@ -896,6 +979,67 @@ onBeforeRouteLeave(async () => {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
+}
+
+.workbench-revision-menu {
+  position: relative;
+}
+
+.workbench-revision-menu__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  min-height: 22px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: rgba(13, 122, 104, 0.14);
+  color: #0b6b5b;
+  font-size: 12px;
+}
+
+.workbench-revision-menu__dropdown {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 20;
+  display: grid;
+  min-width: 160px;
+  padding: 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: var(--shadow-medium);
+}
+
+.workbench-revision-menu__dropdown button {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 36px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+}
+
+.workbench-revision-menu__dropdown button:hover:not(:disabled) {
+  background: rgba(13, 122, 104, 0.08);
+}
+
+.workbench-revision-menu__dropdown button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.workbench-revision-menu__dropdown button.is-danger {
+  color: #a43a3d;
+}
+
+.workbench-revision-menu__dropdown button.is-danger:hover:not(:disabled) {
+  background: rgba(194, 59, 63, 0.08);
 }
 
 .shortcut-list {

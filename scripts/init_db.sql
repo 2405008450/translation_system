@@ -15,7 +15,7 @@
 -- 包含的对象：
 --   扩展：pg_trgm, vector
 --   表：memory_bases / memory_entries / file_records / segments
---       users / segment_comments
+--       users / segment_comments / segment_revisions
 --   触发器：统一维护 updated_at 字段
 -- =============================================================================
 
@@ -384,6 +384,40 @@ CREATE TRIGGER update_segment_comments_updated_at
     BEFORE UPDATE ON segment_comments
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
+
+-- -----------------------------------------------------------------------------
+-- 7. Segment revisions
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS segment_revisions (
+    id UUID PRIMARY KEY DEFAULT (
+        lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
+        lpad(to_hex(floor(random() * 65536)::int), 4, '0') || '-' ||
+        '4' || substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        substr('89ab', floor(random() * 4)::int + 1, 1) ||
+        substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
+    )::uuid,
+    file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+    segment_id UUID NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+    sentence_id VARCHAR(20) NOT NULL,
+    before_text TEXT NOT NULL DEFAULT '',
+    after_text TEXT NOT NULL DEFAULT '',
+    source VARCHAR(20) NOT NULL DEFAULT 'manual',
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    author_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    resolved_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    resolved_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS ix_segment_revisions_file_record_id
+    ON segment_revisions (file_record_id);
+CREATE INDEX IF NOT EXISTS ix_segment_revisions_segment_id
+    ON segment_revisions (segment_id);
+CREATE INDEX IF NOT EXISTS ix_segment_revisions_sentence_id
+    ON segment_revisions (sentence_id);
+CREATE INDEX IF NOT EXISTS ix_segment_revisions_status
+    ON segment_revisions (status);
 
 -- =============================================================================
 -- 完成。首次运行后请通过前端 "/login" 页面使用首次初始化接口创建管理员账号：

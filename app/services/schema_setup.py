@@ -42,6 +42,20 @@ REQUIRED_SCHEMA = {
         "target_language",
     },
     "users": {"nickname"},
+    "segment_revisions": {
+        "id",
+        "file_record_id",
+        "segment_id",
+        "sentence_id",
+        "before_text",
+        "after_text",
+        "source",
+        "status",
+        "author_id",
+        "resolved_by_id",
+        "created_at",
+        "resolved_at",
+    },
 }
 
 
@@ -300,6 +314,101 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                     UPDATE users
                     SET nickname = username
                     WHERE nickname IS NULL OR btrim(nickname) = '';
+                END IF;
+            END
+            $$;
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS segment_revisions (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+                segment_id UUID NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+                sentence_id VARCHAR(20) NOT NULL,
+                before_text TEXT NOT NULL DEFAULT '',
+                after_text TEXT NOT NULL DEFAULT '',
+                source VARCHAR(20) NOT NULL DEFAULT 'manual',
+                status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                author_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                resolved_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                resolved_at TIMESTAMP
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_revisions
+            ADD COLUMN IF NOT EXISTS before_text TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_revisions
+            ADD COLUMN IF NOT EXISTS after_text TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_revisions
+            ADD COLUMN IF NOT EXISTS source VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_revisions
+            ADD COLUMN IF NOT EXISTS status VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_revisions
+            ADD COLUMN IF NOT EXISTS author_id UUID
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_revisions
+            ADD COLUMN IF NOT EXISTS resolved_by_id UUID
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_revisions
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_revisions
+            ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_revisions_file_record_id
+            ON segment_revisions (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_revisions_segment_id
+            ON segment_revisions (segment_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_revisions_sentence_id
+            ON segment_revisions (sentence_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_revisions_status
+            ON segment_revisions (status)
+            """,
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'segment_revisions'
+                ) THEN
+                    ALTER TABLE segment_revisions
+                        ALTER COLUMN before_text SET DEFAULT '';
+                    ALTER TABLE segment_revisions
+                        ALTER COLUMN after_text SET DEFAULT '';
+                    ALTER TABLE segment_revisions
+                        ALTER COLUMN source SET DEFAULT 'manual';
+                    ALTER TABLE segment_revisions
+                        ALTER COLUMN status SET DEFAULT 'pending';
+                    UPDATE segment_revisions
+                    SET before_text = COALESCE(before_text, ''),
+                        after_text = COALESCE(after_text, ''),
+                        source = COALESCE(NULLIF(source, ''), 'manual'),
+                        status = COALESCE(NULLIF(status, ''), 'pending')
+                    WHERE before_text IS NULL
+                       OR after_text IS NULL
+                       OR source IS NULL
+                       OR btrim(source) = ''
+                       OR status IS NULL
+                       OR btrim(status) = '';
                 END IF;
             END
             $$;

@@ -2434,15 +2434,12 @@ body.modal-open {
 
 .preview-drawer-enter-active,
 .preview-drawer-leave-active {
-  transition:
-    opacity 180ms ease,
-    transform 180ms ease;
+  transition: opacity 140ms ease;
 }
 
 .preview-drawer-enter-from,
 .preview-drawer-leave-to {
   opacity: 0;
-  transform: translateX(16px);
 }
 
 /* ===== Tab Bar ===== */

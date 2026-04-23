@@ -183,11 +183,17 @@ export interface SegmentUpdatePayload {
 
 export interface SegmentRevisionEntry {
   id: string
+  file_record_id: string
+  segment_id: string
   sentence_id: string
   source: string
+  status: 'pending' | 'accepted' | 'rejected'
   before_text: string
   after_text: string
+  author: User | null
+  resolved_by: User | null
   created_at: string
+  resolved_at: string | null
 }
 
 export interface CommentCreatePayload extends CommentAnchorDraft {
