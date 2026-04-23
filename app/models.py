@@ -65,6 +65,10 @@ class FileRecord(Base):
         back_populates="file_record",
         cascade="all, delete-orphan",
     )
+    revisions: Mapped[list["SegmentRevision"]] = relationship(
+        "SegmentRevision",
+        back_populates="file_record",
+    )
 
 
 class User(Base):
@@ -126,6 +130,76 @@ class Segment(Base):
 
     file_record: Mapped["FileRecord"] = relationship("FileRecord", back_populates="segments")
     comments: Mapped[list["SegmentComment"]] = relationship("SegmentComment", back_populates="segment")
+    revisions: Mapped[list["SegmentRevision"]] = relationship(
+        "SegmentRevision",
+        back_populates="segment",
+    )
+
+
+class SegmentRevision(Base):
+    __tablename__ = "segment_revisions"
+    __table_args__ = (
+        Index("ix_segment_revisions_file_record_id", "file_record_id"),
+        Index("ix_segment_revisions_segment_id", "segment_id"),
+        Index("ix_segment_revisions_sentence_id", "sentence_id"),
+        Index("ix_segment_revisions_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    file_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    segment_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("segments.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sentence_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    before_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    after_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    author_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    resolved_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    resolved_at: Mapped[DateTime | None] = mapped_column(
+        DateTime(timezone=False),
+        nullable=True,
+    )
+
+    file_record: Mapped["FileRecord"] = relationship(
+        "FileRecord",
+        back_populates="revisions",
+    )
+    segment: Mapped["Segment"] = relationship(
+        "Segment",
+        back_populates="revisions",
+    )
+    author: Mapped["User | None"] = relationship(
+        "User",
+        foreign_keys=[author_id],
+    )
+    resolved_by: Mapped["User | None"] = relationship(
+        "User",
+        foreign_keys=[resolved_by_id],
+    )
 
 
 class SegmentComment(Base):

@@ -16,7 +16,6 @@ import type {
 
 const SEGMENT_PAGE_SIZE = 1000
 const AUTO_SYNC_DELAY_MS = 1500
-const REVISION_HISTORY_STORAGE_PREFIX = 'tm-workbench-history:'
 
 function parseSSEChunk(chunk: string) {
   const eventMatch = chunk.match(/^event:\s*(.+)$/m)
@@ -54,7 +53,6 @@ export const useSegmentStore = defineStore('segment', () => {
   const llmErrorCount = ref(0)
   const lastSyncedAt = ref<string | null>(null)
   const dirtyEntries = ref<Record<string, SegmentUpdatePayload>>({})
-  const manualRevisionBase = ref<Record<string, string>>({})
   const previewUpdateToken = ref(0)
   const lastPreviewUpdatedSentenceId = ref<string | null>(null)
   const lastPreviewUpdatedText = ref('')
@@ -84,51 +82,52 @@ export const useSegmentStore = defineStore('segment', () => {
     }
     return Math.min(100, Math.round((llmProcessedCount.value / llmPlannedCount.value) * 100))
   })
+  const pendingRevisionCount = computed(() => (
+    Object.values(revisionHistory.value).reduce((count, entries) => (
+      count + entries.filter((entry) => entry.status === 'pending').length
+    ), 0)
+  ))
 
-  function loadRevisionHistory(fileRecordId: string) {
-    try {
-      const raw = window.localStorage.getItem(`${REVISION_HISTORY_STORAGE_PREFIX}${fileRecordId}`)
-      if (!raw) {
-        revisionHistory.value = {}
-        return
-      }
-
-      const parsed = JSON.parse(raw) as Record<string, SegmentRevisionEntry[]>
-      revisionHistory.value = parsed && typeof parsed === 'object' ? parsed : {}
-    } catch {
-      revisionHistory.value = {}
+  function compareRevisionEntries(a: SegmentRevisionEntry, b: SegmentRevisionEntry) {
+    const timeDelta = new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    if (timeDelta !== 0) {
+      return timeDelta
     }
+    return b.id.localeCompare(a.id)
   }
 
-  function persistRevisionHistory() {
-    if (!fileRecord.value) {
-      return
+  function setRevisionEntries(entries: SegmentRevisionEntry[]) {
+    const nextHistory: Record<string, SegmentRevisionEntry[]> = {}
+    for (const entry of entries) {
+      const sentenceEntries = nextHistory[entry.sentence_id] || []
+      sentenceEntries.push(entry)
+      nextHistory[entry.sentence_id] = sentenceEntries
     }
-    window.localStorage.setItem(
-      `${REVISION_HISTORY_STORAGE_PREFIX}${fileRecord.value.id}`,
-      JSON.stringify(revisionHistory.value),
-    )
+
+    for (const sentenceId of Object.keys(nextHistory)) {
+      nextHistory[sentenceId] = nextHistory[sentenceId].slice().sort(compareRevisionEntries)
+    }
+
+    revisionHistory.value = nextHistory
   }
 
-  function recordRevision(sentenceId: string, beforeText: string, afterText: string, source: string) {
-    if (beforeText === afterText) {
-      return
+  function upsertRevisionEntry(entry: SegmentRevisionEntry) {
+    const nextHistory = { ...revisionHistory.value }
+    const sentenceEntries = [...(nextHistory[entry.sentence_id] || [])]
+    const index = sentenceEntries.findIndex((item) => item.id === entry.id)
+
+    if (index === -1) {
+      sentenceEntries.unshift(entry)
+    } else {
+      sentenceEntries[index] = entry
     }
 
-    const entry: SegmentRevisionEntry = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      sentence_id: sentenceId,
-      source,
-      before_text: beforeText,
-      after_text: afterText,
-      created_at: new Date().toISOString(),
-    }
+    nextHistory[entry.sentence_id] = sentenceEntries.sort(compareRevisionEntries)
+    revisionHistory.value = nextHistory
+  }
 
-    revisionHistory.value = {
-      ...revisionHistory.value,
-      [sentenceId]: [entry, ...(revisionHistory.value[sentenceId] || [])].slice(0, 20),
-    }
-    persistRevisionHistory()
+  function getPendingRevision(sentenceId: string) {
+    return revisionHistory.value[sentenceId]?.find((entry) => entry.status === 'pending') || null
   }
 
   function resetPreviewState() {
@@ -169,6 +168,12 @@ export const useSegmentStore = defineStore('segment', () => {
     return data
   }
 
+  async function loadRevisions(fileRecordId: string) {
+    const { data } = await http.get<SegmentRevisionEntry[]>(`/file-records/${fileRecordId}/revisions`)
+    setRevisionEntries(data)
+    return data
+  }
+
   function resetState() {
     if (syncTimer !== null) {
       window.clearTimeout(syncTimer)
@@ -192,7 +197,6 @@ export const useSegmentStore = defineStore('segment', () => {
     llmErrorCount.value = 0
     lastSyncedAt.value = null
     dirtyEntries.value = {}
-    manualRevisionBase.value = {}
     previewUpdateToken.value = 0
     lastPreviewUpdatedSentenceId.value = null
     lastPreviewUpdatedText.value = ''
@@ -212,9 +216,9 @@ export const useSegmentStore = defineStore('segment', () => {
         ...detail,
         segments: [],
       }
-      loadRevisionHistory(fileRecordId)
       totalSegmentCount.value = detail.total_segments
       resetSegments(detail.segments)
+      await loadRevisions(fileRecordId)
     } finally {
       loading.value = false
     }
@@ -334,12 +338,6 @@ export const useSegmentStore = defineStore('segment', () => {
     }
 
     const segment = segments.value[index]
-    if (!(sentenceId in manualRevisionBase.value) && segment.target_text !== targetText) {
-      manualRevisionBase.value = {
-        ...manualRevisionBase.value,
-        [sentenceId]: segment.target_text,
-      }
-    }
     segments.value[index] = {
       ...segment,
       target_text: targetText,
@@ -390,19 +388,53 @@ export const useSegmentStore = defineStore('segment', () => {
       await http.put(`/file-records/${fileRecord.value.id}/segments`, {
         updates,
       })
-      for (const update of updates) {
-        const beforeText = manualRevisionBase.value[update.sentence_id]
-        if (typeof beforeText === 'string') {
-          recordRevision(update.sentence_id, beforeText, update.target_text, update.source)
-        }
-      }
       dirtyEntries.value = {}
-      manualRevisionBase.value = {}
+      await loadRevisions(fileRecord.value.id)
       lastSyncedAt.value = new Date().toLocaleString('zh-CN', { hour12: false })
       syncMessage.value = translate('stores.segment.syncedAt', { time: lastSyncedAt.value })
     } finally {
       saving.value = false
     }
+  }
+
+  async function acceptRevision(id: string) {
+    const { data } = await http.patch<SegmentRevisionEntry>(`/revisions/${id}`, {
+      status: 'accepted',
+    })
+    upsertRevisionEntry(data)
+    return data
+  }
+
+  async function rejectRevision(id: string) {
+    const { data } = await http.patch<SegmentRevisionEntry>(`/revisions/${id}`, {
+      status: 'rejected',
+    })
+    upsertRevisionEntry(data)
+    return data
+  }
+
+  async function batchAcceptRevisions() {
+    if (!fileRecord.value) {
+      return 0
+    }
+
+    const { data } = await http.post<{ updated_count: number }>(
+      `/file-records/${fileRecord.value.id}/revisions/batch-accept`,
+    )
+    await loadRevisions(fileRecord.value.id)
+    return data.updated_count
+  }
+
+  async function batchRejectRevisions() {
+    if (!fileRecord.value) {
+      return 0
+    }
+
+    const { data } = await http.post<{ updated_count: number }>(
+      `/file-records/${fileRecord.value.id}/revisions/batch-reject`,
+    )
+    await loadRevisions(fileRecord.value.id)
+    return data.updated_count
   }
 
   function applyLLMUpdate(sentenceId: string, targetText: string, source = 'llm', status = 'confirmed') {
@@ -411,7 +443,6 @@ export const useSegmentStore = defineStore('segment', () => {
       return
     }
 
-    recordRevision(sentenceId, segments.value[index].target_text, targetText, source)
     segments.value[index] = {
       ...segments.value[index],
       target_text: targetText,
@@ -508,6 +539,9 @@ export const useSegmentStore = defineStore('segment', () => {
         if (event) {
           handleLLMEvent(event.event, event.data)
         }
+      }
+      if (!llmAbortRequested && fileRecord.value) {
+        await loadRevisions(fileRecord.value.id)
       }
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') {
@@ -639,6 +673,7 @@ export const useSegmentStore = defineStore('segment', () => {
     llmErrorCount,
     llmProgressPercent,
     dirtyCount,
+    pendingRevisionCount,
     loadedSegmentCount,
     totalSegmentCount,
     hasMoreSegments,
@@ -647,14 +682,20 @@ export const useSegmentStore = defineStore('segment', () => {
     lastPreviewUpdatedSentenceId,
     lastPreviewUpdatedText,
     revisionHistory,
+    getPendingRevision,
     loadTask,
     loadMoreSegments,
     ensureAllSegmentsLoaded,
     ensurePreviewLoaded,
     ensureSentenceLoaded,
+    loadRevisions,
     updateTarget,
     setActiveSentence,
     syncToBackend,
+    acceptRevision,
+    rejectRevision,
+    batchAcceptRevisions,
+    batchRejectRevisions,
     startLLMTranslation,
     abortLLM,
     downloadTranslatedDocx,

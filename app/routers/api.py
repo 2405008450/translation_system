@@ -57,6 +57,14 @@ from app.services.llm_service import (
 )
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
+from app.services.revision_service import (
+    accept_revision,
+    batch_accept_revisions,
+    batch_reject_revisions,
+    list_revisions,
+    reject_revision,
+    serialize_segment_revision,
+)
 from app.services.slate_parser import parse_docx_for_slate
 from app.services.tm_importer import XLSX_EXTENSIONS, import_tm_from_xlsx_upload
 from app.services.tm_vector import sync_tm_embeddings
@@ -74,6 +82,10 @@ class SegmentUpdate(BaseModel):
 
 class BatchSegmentUpdate(BaseModel):
     updates: list[SegmentUpdate]
+
+
+class RevisionResolvePayload(BaseModel):
+    status: Literal["accepted", "rejected"]
 
 
 class LLMTranslateRequest(BaseModel):
@@ -784,6 +796,7 @@ def update_segment(
     sentence_id: str,
     update: SegmentUpdate,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """更新单个片段的译文"""
     segment = update_segment_by_sentence_id(
@@ -792,6 +805,7 @@ def update_segment(
         sentence_id=sentence_id,
         target_text=update.target_text,
         source=update.source,
+        current_user=current_user,
     )
     if not segment:
         raise HTTPException(status_code=404, detail="片段不存在。")
@@ -811,12 +825,90 @@ def batch_update(
     file_record_id: UUID,
     batch: BatchSegmentUpdate,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """批量更新片段译文"""
     updated_count = batch_update_segments(
         db=db,
         file_record_id=file_record_id,
         updates=[u.model_dump() for u in batch.updates],
+        current_user=current_user,
+    )
+    return {"updated_count": updated_count}
+
+
+@router.get("/file-records/{file_record_id}/revisions")
+def get_file_record_revisions(
+    file_record_id: UUID,
+    sentence_id: str | None = None,
+    db: Session = Depends(get_db),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File record not found.")
+
+    revisions = list_revisions(
+        db,
+        file_record_id=file_record_id,
+        sentence_id=sentence_id,
+    )
+    return [serialize_segment_revision(revision) for revision in revisions]
+
+
+@router.patch("/revisions/{revision_id}")
+def resolve_revision(
+    revision_id: UUID,
+    payload: RevisionResolvePayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if payload.status == "accepted":
+        revision = accept_revision(
+            db,
+            revision_id=revision_id,
+            current_user=current_user,
+        )
+    else:
+        revision = reject_revision(
+            db,
+            revision_id=revision_id,
+            current_user=current_user,
+        )
+    return serialize_segment_revision(revision)
+
+
+@router.post("/file-records/{file_record_id}/revisions/batch-accept")
+def resolve_all_revisions_as_accepted(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File record not found.")
+
+    updated_count = batch_accept_revisions(
+        db,
+        file_record_id=file_record_id,
+        current_user=current_user,
+    )
+    return {"updated_count": updated_count}
+
+
+@router.post("/file-records/{file_record_id}/revisions/batch-reject")
+def resolve_all_revisions_as_rejected(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File record not found.")
+
+    updated_count = batch_reject_revisions(
+        db,
+        file_record_id=file_record_id,
+        current_user=current_user,
     )
     return {"updated_count": updated_count}
 
@@ -916,6 +1008,7 @@ async def llm_translate_file_record(
     request: Request,
     payload: LLMTranslateRequest | None = None,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """对指定范围的片段触发 LLM 译文修正，并通过 SSE 逐条返回结果。"""
     file_record = get_file_record_model(db, file_record_id)
@@ -986,6 +1079,7 @@ async def llm_translate_file_record(
                     file_record_id=file_record_id,
                     sentence_id=result.sentence_id,
                     target_text=result.translated_text,
+                    current_user=current_user,
                 )
             except Exception as exc:  # noqa: BLE001
                 db.rollback()

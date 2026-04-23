@@ -207,6 +207,9 @@ export default {
       creator: '创建人',
       access: '访问权限',
     },
+    summaries: {
+      createdAt: '创建时间',
+    },
     errors: {
       load: '项目列表加载失败。',
       create: '项目创建失败。',
