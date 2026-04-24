@@ -47,7 +47,7 @@ const loadingCollections = ref(false)
 const selectedCollectionIds = ref<string[]>([])
 const termBases = ref<TermBase[]>([])
 const loadingTermBases = ref(false)
-const selectedTermBaseId = ref<string | null>(null)
+const selectedTermBaseId = ref('')
 const showUploadForm = ref(false)
 const currentPage = ref(1)
 const pageSize = ref(50)
@@ -160,7 +160,7 @@ async function uploadFile() {
       selectedFile.value,
       threshold.value,
       selectedCollectionIds.value,
-      selectedTermBaseId.value,
+      selectedTermBaseId.value || null,
     )
     selectedFile.value = null
     const fileInput = document.getElementById('upload-file') as HTMLInputElement | null
@@ -310,7 +310,7 @@ onBeforeUnmount(() => {
             class="field__control"
             :disabled="loadingTermBases || termBases.length === 0"
           >
-            <option :value="null">{{ t('taskList.hints.noTermBase') }}</option>
+            <option value="">{{ t('taskList.hints.noTermBase') }}</option>
             <option v-for="termBase in termBases" :key="termBase.id" :value="termBase.id">
               {{ termBase.name }}（{{ formatLanguagePair(termBase.source_language, termBase.target_language) }} / {{ termBase.entry_count }} 条）
             </option>

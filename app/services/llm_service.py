@@ -12,6 +12,7 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from app.config import Settings, get_settings
+from app.services.language_pairs import LANGUAGE_LABELS
 from app.services.normalizer import normalize_text
 
 try:
@@ -47,6 +48,8 @@ class LLMTranslationTask:
     sentence_id: str
     status: str
     source_text: str
+    source_language: str | None = None
+    target_language: str | None = None
     block_type: str = "paragraph"
     matched_source_text: str | None = None
     tm_target_text: str | None = None
@@ -78,7 +81,38 @@ class ProviderConfig:
 
 NUMERIC_LIKE_FRAGMENT_RE = re.compile(r"^[0-9\s,.\-+/%()（）$€¥￥£:：]+$")
 MATH_PLACEHOLDER_RE = re.compile(r"⟦MATH_\d+⟧")
-STRICT_PRESERVE_SYMBOLS = frozenset({"□", "☐", "☑", "", "", "✓", "✔", "✗", "✘"})
+STRICT_PRESERVE_SYMBOLS = frozenset(
+    {
+        "□",
+        "☐",
+        "☑",
+        "☒",
+        "",
+        "",
+        "✓",
+        "✔",
+        "✗",
+        "✘",
+        "•",
+        "◦",
+        "·",
+        "●",
+        "○",
+        "■",
+        "▪",
+        "▫",
+        "◆",
+        "◇",
+        "▶",
+        "▷",
+        "→",
+        "←",
+        "↑",
+        "↓",
+        "★",
+        "☆",
+    }
+)
 
 
 def validate_provider_choice(
@@ -277,19 +311,25 @@ def _build_messages(
     strict_retry: bool = False,
     retry_reason: str | None = None,
 ) -> list[dict[str, str]]:
+    source_label = _format_language_for_prompt(task.source_language, "源语言")
+    target_label = _format_language_for_prompt(task.target_language, "目标语言")
+    language_pair = f"{source_label} -> {target_label}"
     system_prompt = (
-        "你是专业的中英翻译专家。"
+        f"你是专业的文档翻译专家，当前任务语言对为：{language_pair}。"
+        f"请将内容从{source_label}翻译为{target_label}。"
         "请保持术语一致，保留数字、单位、专有名词和格式。"
-        "如果原文包含复选框、勾选框、项目符号或特殊符号（如 □、☐、☑、、✓ 等），必须按原样保留这些符号本身及其顺序，不得新增、删除、替换，也不得自行改变其选中状态。"
+        "如果原文包含复选框、勾选框、项目符号、箭头、对错标记或特殊符号（如 □、☐、☑、☒、、✓、✗、•、○、●、→ 等），必须按原样保留这些符号本身及其顺序，不得新增、删除、替换，也不得自行改变其选中状态。"
+        "不要把这些文档符号翻译成文字，也不要替换成目标语言环境中的近似符号；只本地化可翻译文字和目标语言需要的普通标点。"
+        "序号、编号、变量、占位符、路径、URL、邮箱、代码片段、单位和表格结构标记应尽量保持原格式。"
         "如果原文包含形如 ⟦MATH_1⟧ 的占位符，这代表一个数学公式，必须原样保留该占位符本身。"
         "占位符的顺序和数量必须与原文一致，不得翻译、改写、删除、重排，也不得增删空格、括号或引号。"
-        "只输出最终英文译文，不要解释，不要引号，不要项目符号。"
+        f"只输出最终{target_label}译文，不要解释，不要引号，不要额外添加项目符号。"
     )
     retry_instruction = ""
     if strict_retry:
         retry_instruction = (
             "\n这是一次纠错重试。"
-            "请更严格地保留原文中的数字、格式、复选框和特殊符号，禁止擅自补充勾选状态或改写符号样式。"
+            "请更严格地保留原文中的数字、格式、复选框、项目符号、箭头和特殊符号，禁止擅自补充勾选状态或改写符号样式。"
             "请同时原样保留所有数学公式占位符 ⟦MATH_n⟧。"
         )
         if retry_reason:
@@ -301,7 +341,7 @@ def _build_messages(
             {
                 "role": "user",
                 "content": (
-                    "请基于翻译记忆库参考译文，修正当前句子的英文翻译。\n"
+                    f"请基于翻译记忆库参考译文，修正当前句子的{target_label}翻译。\n"
                     "这不是从零重译，而是以翻译记忆库译文为底稿进行定向修改。\n\n"
                     f"当前原文：{task.source_text}\n"
                     f"翻译记忆库匹配到的原文：{task.matched_source_text or '无'}\n"
@@ -311,9 +351,9 @@ def _build_messages(
                     "1. 把“翻译记忆库的译文”当作基础译文，优先保留其中仍然适用的表达、术语、句式和语气。\n"
                     "2. 重点根据两个原文之间的差异，对基础译文做对应修改，而不是忽略基础译文直接整句重译。\n"
                     "3. 必须让结果完整表达“当前原文”的全部含义；如果当前原文比记忆库原文多了信息，就补全；如果少了信息，就删去不再适用的内容；如果有替换，就准确改写对应部分。\n"
-                    "4. 保留数字、单位、标点风格、专有名词、复选框/勾选框/特殊符号和已存在的专业术语一致性，不得擅自增删或替换符号。\n"
-                    "5. 输出必须是最终可直接使用的完整英文译文，只输出译文本身。\n\n"
-                    f"请输出基于记忆库译文修订后的最终英文译文。{retry_instruction}"
+                    "4. 保留数字、单位、标点风格、专有名词、复选框/勾选框/项目符号/箭头/特殊符号和已存在的专业术语一致性，不得擅自增删或替换符号。\n"
+                    f"5. 输出必须是最终可直接使用的完整{target_label}译文，只输出译文本身。\n\n"
+                    f"请输出基于记忆库译文修订后的最终{target_label}译文。{retry_instruction}"
                 ),
             },
         ]
@@ -324,10 +364,10 @@ def _build_messages(
             {
                 "role": "user",
                 "content": (
-                    "请处理以下内容并输出英文目标文本。\n"
-                    "如果内容只是数字、金额、百分比、日期、编号或符号，并且在英文中通常可直接沿用，请原样输出。\n"
+                    f"请处理以下内容并输出{target_label}目标文本。\n"
+                    f"如果内容只是数字、金额、百分比、日期、编号或符号，并且在{target_label}中通常可直接沿用，请原样输出。\n"
                     "如果内容中包含可翻译文字，只翻译文字部分，并尽量保留数字和原有排版格式。\n"
-                    "除非原文明确体现需要转换的中文数字单位或本地格式，否则不要擅自改动千分位、小数点、货币符号、编号格式或特殊符号。\n\n"
+                    "除非原文明确体现需要按目标语言转换的数字单位或本地格式，否则不要擅自改动千分位、小数点、货币符号、编号格式或特殊符号。\n\n"
                     f"原文：{task.source_text}\n\n"
                     f"只输出最终结果。{retry_instruction}"
                 ),
@@ -339,14 +379,21 @@ def _build_messages(
         {
             "role": "user",
             "content": (
-                "请将以下内容作为独立片段翻译为英文。"
+                f"请将以下内容作为独立片段从{source_label}翻译为{target_label}。"
                 "不要补充未提供的上下文，也不要参考前后句。"
                 "\n"
                 f"原文：{task.source_text}\n\n"
-                f"请严格保留原文中的数字、复选框、勾选框和特殊符号，不得擅自新增或改变其状态。\n\n只输出英文译文。{retry_instruction}"
+                f"请严格保留原文中的数字、复选框、勾选框、项目符号、箭头和特殊符号，不得擅自新增、替换或改变其状态。\n\n只输出{target_label}译文。{retry_instruction}"
             ),
         },
     ]
+
+
+def _format_language_for_prompt(language_code: str | None, fallback: str) -> str:
+    if not language_code:
+        return fallback
+    label = LANGUAGE_LABELS.get(language_code, language_code)
+    return f"{label}（{language_code}）"
 
 
 def _is_numeric_like_fragment(text: str) -> bool:

@@ -22,6 +22,7 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   update: [sentenceId: string, value: string]
   focus: [sentenceId: string]
+  activateTarget: [sentenceId: string]
   acceptRevision: [revisionId: string]
   rejectRevision: [revisionId: string]
 }>()
@@ -122,6 +123,7 @@ const scorePercent = computed(() => {
           :aria-label="`translation for segment ${index + 1}`"
           spellcheck="false"
           @focus="emit('focus', segment.sentence_id)"
+          @click="emit('activateTarget', segment.sentence_id)"
           @input="emit('update', segment.sentence_id, ($event.target as HTMLTextAreaElement).value)"
         />
       </div>

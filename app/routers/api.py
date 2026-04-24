@@ -91,7 +91,7 @@ class RevisionResolvePayload(BaseModel):
 
 class LLMTranslateRequest(BaseModel):
     scope: Literal["fuzzy_only", "none_only", "all", "all_with_exact"] = "all"
-    provider: Literal["auto", "deepseek", "openrouter"] = "auto"
+    provider: Literal["auto", "deepseek", "openrouter"] = "deepseek"
 
 
 class TMCollectionPayload(BaseModel):
@@ -167,6 +167,9 @@ def _build_llm_translation_tasks(
     db: Session,
     file_record_id: UUID,
     scope: Literal["fuzzy_only", "none_only", "all", "all_with_exact"],
+    source_language: str | None = None,
+    target_language: str | None = None,
+    collection_id: UUID | None = None,
 ) -> list[LLMTranslationTask]:
     statuses_by_scope = {
         "fuzzy_only": {"fuzzy"},
@@ -179,6 +182,9 @@ def _build_llm_translation_tasks(
     tm_target_text_map = get_tm_target_text_map(
         db,
         [segment.matched_source_text for segment in segments if segment.matched_source_text],
+        collection_id=collection_id,
+        source_language=source_language,
+        target_language=target_language,
     )
 
     tasks: list[LLMTranslationTask] = []
@@ -186,16 +192,16 @@ def _build_llm_translation_tasks(
         if segment.status not in target_statuses:
             continue
 
-        tm_target_text = tm_target_text_map.get(
-            segment.matched_source_text or "",
-            segment.target_text if segment.source == "tm" else "",
-        )
+        segment_tm_target_text = segment.target_text if segment.source == "tm" else ""
+        tm_target_text = segment_tm_target_text or tm_target_text_map.get(segment.matched_source_text or "", "")
 
         tasks.append(
             LLMTranslationTask(
                 sentence_id=segment.sentence_id,
                 status=segment.status,
                 source_text=segment.source_text,
+                source_language=source_language,
+                target_language=target_language,
                 block_type=segment.block_type,
                 matched_source_text=segment.matched_source_text,
                 tm_target_text=tm_target_text,
@@ -261,6 +267,49 @@ def _resolve_collection_language_pair(
         collection.source_language = normalized_source_language
         collection.target_language = normalized_target_language
     return normalized_source_language, normalized_target_language
+
+
+def _resolve_file_record_language_pair(file_record: FileRecord) -> tuple[str, str]:
+    source_language = file_record.source_language
+    target_language = file_record.target_language
+
+    if (not source_language or not target_language) and file_record.collection:
+        source_language = source_language or file_record.collection.source_language
+        target_language = target_language or file_record.collection.target_language
+
+    try:
+        return require_language_pair(source_language, target_language)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="当前项目缺少源语言或目标语言，请先在项目任务中设置语言对。",
+        ) from exc
+
+
+def _apply_collection_language_pair(file_record: FileRecord, collection: TMCollection | None) -> None:
+    if not collection:
+        return
+    if not file_record.source_language:
+        file_record.source_language = collection.source_language
+    if not file_record.target_language:
+        file_record.target_language = collection.target_language
+
+
+def _ensure_resource_language_pair_matches(
+    resource,
+    source_language: str,
+    target_language: str,
+    resource_label: str,
+) -> None:
+    resource_source_language = getattr(resource, "source_language", None)
+    resource_target_language = getattr(resource, "target_language", None)
+    if not resource_source_language or not resource_target_language:
+        return
+    if (
+        resource_source_language != source_language
+        or resource_target_language != target_language
+    ):
+        raise HTTPException(status_code=400, detail=f"所选{resource_label}的语言对与项目任务语言对不一致。")
 
 
 def _validate_collection_ids(
@@ -409,6 +458,7 @@ async def create_file_record(
 
     selected_collection_ids = _validate_collection_ids(db, collection_ids)
     required_collection_ids = _require_selected_collection_ids(selected_collection_ids)
+    primary_collection = _get_collection_or_404(db, required_collection_ids[0])
 
     # 验证术语库是否存在
     term_base = None
@@ -416,6 +466,12 @@ async def create_file_record(
         term_base = db.query(TermBase).filter(TermBase.id == term_base_id).first()
         if term_base is None:
             raise HTTPException(status_code=404, detail="术语库不存在。")
+        _ensure_resource_language_pair_matches(
+            term_base,
+            primary_collection.source_language,
+            primary_collection.target_language,
+            "术语库",
+        )
 
     try:
         workspace_data = build_task_workspace(
@@ -436,6 +492,7 @@ async def create_file_record(
         # 写入绑定关系
         if required_collection_ids:
             file_record.collection_id = required_collection_ids[0]
+            _apply_collection_language_pair(file_record, primary_collection)
         if term_base is not None:
             file_record.term_base_id = term_base_id
         db.commit()
@@ -478,11 +535,18 @@ def create_project(
         if term_base is None:
             raise HTTPException(status_code=404, detail="术语库不存在。")
 
+    source_language, target_language = _require_tm_language_pair(
+        payload.source_language,
+        payload.target_language,
+    )
+    _ensure_resource_language_pair_matches(collection, source_language, target_language, "记忆库")
+    _ensure_resource_language_pair_matches(term_base, source_language, target_language, "术语库")
+
     project = FileRecord(
         filename=payload.name.strip(),
         status="draft",
-        source_language=payload.source_language,
-        target_language=payload.target_language,
+        source_language=source_language,
+        target_language=target_language,
         creator_id=current_user.id,
         deadline=deadline_dt,
         access_level=payload.access_level,
@@ -557,6 +621,8 @@ def _build_project_detail_payload(
     payload.update({
         "has_source_document": source_bytes is not None,
         "file_size_bytes": len(source_bytes) if source_bytes is not None else None,
+        "collection_id": project.collection_id,
+        "term_base_id": project.term_base_id,
     })
     return payload
 
@@ -619,6 +685,9 @@ def upload_project_source_document(
 
     selected_collection_ids = _validate_collection_ids(db, collection_ids)
     required_collection_ids = _require_selected_collection_ids(selected_collection_ids)
+    primary_collection = _get_collection_or_404(db, required_collection_ids[0])
+    project_source_language, project_target_language = _resolve_file_record_language_pair(project)
+    _ensure_resource_language_pair_matches(primary_collection, project_source_language, project_target_language, "记忆库")
 
     # 验证术语库是否存在
     term_base = None
@@ -626,6 +695,7 @@ def upload_project_source_document(
         term_base = db.query(TermBase).filter(TermBase.id == term_base_id).first()
         if term_base is None:
             raise HTTPException(status_code=404, detail="术语库不存在。")
+        _ensure_resource_language_pair_matches(term_base, project_source_language, project_target_language, "术语库")
 
     try:
         project = attach_source_document_to_file_record(
@@ -639,8 +709,8 @@ def upload_project_source_document(
         # 写入绑定关系
         if required_collection_ids:
             project.collection_id = required_collection_ids[0]
-        if term_base is not None:
-            project.term_base_id = term_base_id
+            _apply_collection_language_pair(project, primary_collection)
+        project.term_base_id = term_base_id
         db.commit()
     except Exception as exc:
         db.rollback()
@@ -1173,6 +1243,7 @@ async def llm_translate_file_record(
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    source_language, target_language = _resolve_file_record_language_pair(file_record)
     body = payload or LLMTranslateRequest()
     try:
         validate_provider_choice(body.provider)
@@ -1183,6 +1254,9 @@ async def llm_translate_file_record(
         db=db,
         file_record_id=file_record_id,
         scope=body.scope,
+        source_language=source_language,
+        target_language=target_language,
+        collection_id=file_record.collection_id,
     )
 
     async def event_stream():
@@ -1196,6 +1270,8 @@ async def llm_translate_file_record(
                 "file_record_id": str(file_record_id),
                 "scope": body.scope,
                 "provider": body.provider,
+                "source_language": source_language,
+                "target_language": target_language,
                 "total": total_count,
             },
         )

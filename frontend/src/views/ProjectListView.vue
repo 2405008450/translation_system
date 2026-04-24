@@ -24,6 +24,7 @@ import { useConfirm } from '../composables/useConfirm'
 import { useToast } from '../composables/useToast'
 import { getLanguageLabel, languageOptions } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
+import type { TermBase } from '../types/api'
 import { getProgressStyle } from '../utils/progress'
 
 interface ProjectItem {
@@ -68,6 +69,8 @@ const selectedIds = ref(new Set<string>())
 const sortKey = ref('')
 const sortOrder = ref<'asc' | 'desc'>('desc')
 const pageError = ref('')
+const termBases = ref<TermBase[]>([])
+const loadingTermBases = ref(false)
 
 const showCreateDialog = ref(false)
 const creating = ref(false)
@@ -77,6 +80,7 @@ const defaultForm = () => ({
   name: '',
   source_language: '',
   target_language: '',
+  term_base_id: '',
   deadline: '',
   access_level: 'team' as 'team' | 'private' | 'public',
 })
@@ -102,6 +106,16 @@ const columns = computed<DataTableColumn[]>(() => ([
 ]))
 
 const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
+const availableTermBases = computed(() => {
+  if (!form.source_language || !form.target_language) {
+    return termBases.value
+  }
+
+  return termBases.value.filter((termBase) => (
+    termBase.source_language === form.source_language
+    && termBase.target_language === form.target_language
+  ))
+})
 
 async function loadProjects() {
   loading.value = true
@@ -121,6 +135,18 @@ async function loadProjects() {
     pageError.value = error instanceof Error ? error.message : t('projectList.errors.load')
   } finally {
     loading.value = false
+  }
+}
+
+async function loadTermBases() {
+  loadingTermBases.value = true
+  try {
+    const { data } = await http.get<TermBase[]>('/term-bases')
+    termBases.value = data
+  } catch (error) {
+    console.error('Failed to load term bases:', error)
+  } finally {
+    loadingTermBases.value = false
   }
 }
 
@@ -159,6 +185,7 @@ async function createProject() {
       name: form.name.trim(),
       source_language: form.source_language,
       target_language: form.target_language,
+      term_base_id: form.term_base_id || null,
       deadline: form.deadline || null,
       access_level: form.access_level,
     })
@@ -280,12 +307,22 @@ watch(searchQuery, () => {
   }, 300)
 })
 
+watch(() => [form.source_language, form.target_language], () => {
+  if (
+    form.term_base_id
+    && !availableTermBases.value.some((termBase) => termBase.id === form.term_base_id)
+  ) {
+    form.term_base_id = ''
+  }
+})
+
 watch([currentPage, pageSize], () => {
   void loadProjects()
 })
 
 onMounted(() => {
   void loadProjects()
+  void loadTermBases()
 })
 </script>
 
@@ -490,6 +527,24 @@ onMounted(() => {
               :disabled="lang.code === form.source_language"
             >
               {{ lang.label }}
+            </option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span class="field__label">{{ t('taskList.fields.termBase') }}</span>
+          <select
+            v-model="form.term_base_id"
+            class="field__control"
+            :disabled="loadingTermBases"
+          >
+            <option value="">{{ t('taskList.hints.noTermBase') }}</option>
+            <option
+              v-for="termBase in availableTermBases"
+              :key="termBase.id"
+              :value="termBase.id"
+            >
+              {{ termBase.name }}（{{ getLanguageLabel(termBase.source_language) }} → {{ getLanguageLabel(termBase.target_language) }}）
             </option>
           </select>
         </label>

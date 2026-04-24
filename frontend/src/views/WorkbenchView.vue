@@ -79,7 +79,7 @@ const virtualListRef = ref<{
 
 const pageError = ref('')
 const llmScope = ref<LLMTranslateScope>('all')
-const llmProvider = ref<LLMProvider>('auto')
+const llmProvider = ref<LLMProvider>('deepseek')
 const itemHeight = ref(resolveItemHeight())
 const activeTool = ref<ToolKey | null>(null)
 const showImportDialog = ref(false)
@@ -268,13 +268,13 @@ const targetPreviewLoading = computed(() => {
 })
 
 const toolButtons = computed(() => ([
-  { key: 'source-preview' as const, label: t('workbench.tools.sourcePreview'), icon: FileText },
-  { key: 'target-preview' as const, label: t('workbench.tools.targetPreview'), icon: FileCheck },
-  { key: 'split-preview' as const, label: t('workbench.tools.splitPreview'), icon: Columns },
-  { key: 'match-info' as const, label: t('workbench.tools.matchInfo'), icon: Info },
-  { key: 'terms' as const, label: t('workbench.tools.terms'), icon: Languages },
-  { key: 'notes' as const, label: t('workbench.tools.notes'), icon: MessageSquare },
-  { key: 'history' as const, label: t('workbench.tools.history'), icon: History },
+  { key: 'source-preview' as const, label: t('workbench.tools.sourcePreview'), icon: FileText, tone: 'paper' },
+  { key: 'target-preview' as const, label: t('workbench.tools.targetPreview'), icon: FileCheck, tone: 'success' },
+  { key: 'split-preview' as const, label: t('workbench.tools.splitPreview'), icon: Columns, tone: 'layout' },
+  { key: 'match-info' as const, label: t('workbench.tools.matchInfo'), icon: Info, tone: 'info' },
+  { key: 'terms' as const, label: t('workbench.tools.terms'), icon: Languages, tone: 'language' },
+  { key: 'notes' as const, label: t('workbench.tools.notes'), icon: MessageSquare, tone: 'note' },
+  { key: 'history' as const, label: t('workbench.tools.history'), icon: History, tone: 'history' },
 ]))
 
 usePageHeader(() => ({
@@ -801,6 +801,30 @@ function handleAppendText(text: string) {
   toast.success(t('matchPanel.textInserted'))
 }
 
+async function ensureMatchInfoPanelOpen() {
+  pageError.value = ''
+  activeTool.value = 'match-info'
+
+  try {
+    if (termBases.value.length === 0 && !loadingTermBases.value) {
+      await loadTermBases()
+    }
+    if (!selectedTermBaseId.value && termBases.value.length > 0) {
+      selectedTermBaseId.value = termBases.value[0].id
+    }
+    if (selectedTermBaseId.value && termEntries.value.length === 0 && !loadingTermEntries.value) {
+      await loadTermEntries()
+    }
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('workbench.errors.sidePanel'))
+  }
+}
+
+function handleSegmentTargetActivate(sentenceId: string) {
+  segmentStore.setActiveSentence(sentenceId)
+  void ensureMatchInfoPanelOpen()
+}
+
 watch(() => props.id, () => {
   void loadTask()
 })
@@ -845,7 +869,7 @@ onBeforeRouteLeave(async () => {
   <div class="content-stack content-stack--workbench workbench-page">
     <section class="toolbar-panel workbench-toolbar">
       <div class="toolbar-panel__group">
-        <button class="button" type="button" @click="goBack">
+        <button class="button workbench-action workbench-action--back" type="button" @click="goBack">
           <ArrowLeft :size="14" />
           {{ hasProjectReturnContext ? t('workbench.backToProject') : t('workbench.backToTasks') }}
         </button>
@@ -868,20 +892,20 @@ onBeforeRouteLeave(async () => {
           </select>
         </label>
 
-        <button class="button" type="button" :disabled="segmentStore.saving" @click="saveNow">
+        <button class="button workbench-action workbench-action--save" type="button" :disabled="segmentStore.saving" @click="saveNow">
           <Loader2 v-if="segmentStore.saving" class="lucide-spin" :size="14" />
           <Save v-else :size="14" />
           {{ segmentStore.saving ? t('common.actions.saving') : t('workbench.saveNow') }}
         </button>
 
-        <button class="button" type="button" :disabled="!segmentStore.canExport" @click="exportTranslatedFile">
+        <button class="button workbench-action workbench-action--export" type="button" :disabled="!segmentStore.canExport" @click="exportTranslatedFile">
           <Download :size="14" />
           {{ exportButtonLabel }}
         </button>
 
         <div class="workbench-revision-menu">
           <button
-            class="button"
+            class="button workbench-action workbench-action--review"
             type="button"
             :disabled="segmentStore.pendingRevisionCount === 0"
             @click="openRevisionMenu = !openRevisionMenu"
@@ -911,7 +935,7 @@ onBeforeRouteLeave(async () => {
 
         <button
           v-if="!segmentStore.llmRunning"
-          class="button button--primary"
+          class="button workbench-action workbench-action--ai"
           type="button"
           @click="runLLMTranslation"
         >
@@ -920,7 +944,7 @@ onBeforeRouteLeave(async () => {
         </button>
         <button
           v-else
-          class="button button--danger"
+          class="button workbench-action workbench-action--stop"
           type="button"
           @click="stopLLMTranslation"
         >
@@ -928,7 +952,7 @@ onBeforeRouteLeave(async () => {
           {{ t('workbench.stopAi') }}
         </button>
 
-        <button class="button" type="button" @click="showShortcutHelp = true">
+        <button class="button workbench-action workbench-action--help" type="button" @click="showShortcutHelp = true">
           <CircleHelp :size="14" />
           {{ t('workbench.shortcuts') }}
         </button>
@@ -971,11 +995,11 @@ onBeforeRouteLeave(async () => {
         </div>
 
         <div class="workbench-resource-panel__actions">
-          <button class="button" type="button" @click="openImportDialog('tm')">
+          <button class="button workbench-action workbench-action--import-tm" type="button" @click="openImportDialog('tm')">
             <Upload :size="14" />
             {{ t('workbench.importTm') }}
           </button>
-          <button class="button" type="button" @click="openImportDialog('term')">
+          <button class="button workbench-action workbench-action--import-term" type="button" @click="openImportDialog('term')">
             <Upload :size="14" />
             {{ t('workbench.importTerm') }}
           </button>
@@ -1000,7 +1024,7 @@ onBeforeRouteLeave(async () => {
         </span>
         <button
           v-if="segmentStore.hasMoreSegments"
-          class="button"
+          class="button workbench-action workbench-action--load"
           type="button"
           :disabled="segmentStore.loadingAllSegments"
           @click="loadAllSegments"
@@ -1036,7 +1060,7 @@ onBeforeRouteLeave(async () => {
             </div>
             <button
               v-if="hasSegmentSearch"
-              class="button"
+              class="button workbench-action workbench-action--clear"
               type="button"
               @click="resetSegmentSearch"
             >
@@ -1070,7 +1094,7 @@ onBeforeRouteLeave(async () => {
 
             <div class="workbench-search-panel__actions">
               <button
-                class="button"
+                class="button workbench-action workbench-action--search"
                 type="button"
                 :disabled="searchLoadingAllSegments || editorSegments.length === 0"
                 @click="void focusMatchedSegment(-1)"
@@ -1079,7 +1103,7 @@ onBeforeRouteLeave(async () => {
                 {{ t('workbench.search.prev') }}
               </button>
               <button
-                class="button"
+                class="button workbench-action workbench-action--search"
                 type="button"
                 :disabled="searchLoadingAllSegments || editorSegments.length === 0"
                 @click="void focusMatchedSegment(1)"
@@ -1132,6 +1156,7 @@ onBeforeRouteLeave(async () => {
               :pending-revision="segmentStore.getPendingRevision(item.sentence_id)"
               :revision-busy="revisionActionLoading"
               @focus="segmentStore.setActiveSentence"
+              @activate-target="handleSegmentTargetActivate"
               @update="segmentStore.updateTarget"
               @accept-revision="handleAcceptRevision"
               @reject-revision="handleRejectRevision"
@@ -1248,7 +1273,7 @@ onBeforeRouteLeave(async () => {
             v-for="tool in toolButtons"
             :key="tool.key"
             class="workbench-rail__button"
-            :class="{ 'is-active': activeTool === tool.key }"
+            :class="[`workbench-rail__button--${tool.tone}`, { 'is-active': activeTool === tool.key }]"
             type="button"
             :title="tool.label"
             :aria-label="tool.label"
@@ -1302,6 +1327,111 @@ onBeforeRouteLeave(async () => {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.workbench-action {
+  --action-bg: linear-gradient(180deg, #f4f7f8, #e8eef1);
+  --action-border: #ccd9de;
+  --action-color: #2d4651;
+  --action-shadow: rgba(37, 61, 70, 0.1);
+  --action-hover-shadow: rgba(37, 61, 70, 0.16);
+
+  border-color: var(--action-border);
+  background: var(--action-bg);
+  color: var(--action-color);
+  font-weight: 600;
+  box-shadow: 0 8px 16px var(--action-shadow);
+}
+
+.workbench-action:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--action-border) 82%, #17313b);
+  box-shadow: 0 10px 20px var(--action-hover-shadow);
+}
+
+.workbench-action:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--action-border) 36%, transparent);
+  outline-offset: 2px;
+}
+
+.workbench-action--save,
+.workbench-action--ai {
+  --action-bg: linear-gradient(180deg, #2f9786, #0d7a68);
+  --action-border: #0d7a68;
+  --action-color: #ffffff;
+  --action-shadow: rgba(13, 122, 104, 0.2);
+  --action-hover-shadow: rgba(13, 122, 104, 0.28);
+}
+
+.workbench-action--export {
+  --action-bg: linear-gradient(180deg, #3f85c6, #2268a8);
+  --action-border: #2268a8;
+  --action-color: #ffffff;
+  --action-shadow: rgba(34, 104, 168, 0.18);
+  --action-hover-shadow: rgba(34, 104, 168, 0.26);
+}
+
+.workbench-action--review {
+  --action-bg: linear-gradient(180deg, #ffe8a8, #f4ce72);
+  --action-border: #dfb653;
+  --action-color: #68430c;
+  --action-shadow: rgba(154, 102, 13, 0.12);
+  --action-hover-shadow: rgba(154, 102, 13, 0.2);
+}
+
+.workbench-action--stop {
+  --action-bg: linear-gradient(180deg, #d75f63, #b83c41);
+  --action-border: #ad363a;
+  --action-color: #ffffff;
+  --action-shadow: rgba(184, 60, 65, 0.2);
+  --action-hover-shadow: rgba(184, 60, 65, 0.28);
+}
+
+.workbench-action--help {
+  --action-bg: linear-gradient(180deg, #eef1fb, #dde5f7);
+  --action-border: #c8d4ee;
+  --action-color: #33486f;
+  --action-shadow: rgba(51, 72, 111, 0.1);
+  --action-hover-shadow: rgba(51, 72, 111, 0.16);
+}
+
+.workbench-action--import-tm,
+.workbench-action--load {
+  --action-bg: linear-gradient(180deg, #e4f2fb, #cfe6f5);
+  --action-border: #afd1e7;
+  --action-color: #24506f;
+  --action-shadow: rgba(36, 80, 111, 0.1);
+  --action-hover-shadow: rgba(36, 80, 111, 0.16);
+}
+
+.workbench-action--import-term {
+  --action-bg: linear-gradient(180deg, #e6f4ef, #cfe9e0);
+  --action-border: #abd7c7;
+  --action-color: #145c4f;
+  --action-shadow: rgba(20, 92, 79, 0.1);
+  --action-hover-shadow: rgba(20, 92, 79, 0.16);
+}
+
+.workbench-action--clear {
+  --action-bg: linear-gradient(180deg, #f7eee9, #efdcd4);
+  --action-border: #dfbeb0;
+  --action-color: #87452c;
+  --action-shadow: rgba(135, 69, 44, 0.1);
+  --action-hover-shadow: rgba(135, 69, 44, 0.16);
+}
+
+.workbench-action--search,
+.workbench-action--back {
+  --action-bg: linear-gradient(180deg, #f3f7f8, #e7eef1);
+  --action-border: #cbd9df;
+  --action-color: #2d4651;
+  --action-shadow: rgba(45, 70, 81, 0.08);
+  --action-hover-shadow: rgba(45, 70, 81, 0.14);
+}
+
+.workbench-action--review .workbench-revision-menu__badge {
+  background: rgba(255, 255, 255, 0.54);
+  color: #5d3d0c;
+  box-shadow: inset 0 0 0 1px rgba(122, 80, 12, 0.12);
 }
 
 .workbench-load-all {
@@ -1415,6 +1545,101 @@ onBeforeRouteLeave(async () => {
 
 .workbench-revision-menu__dropdown button.is-danger:hover:not(:disabled) {
   background: rgba(194, 59, 63, 0.08);
+}
+
+.workbench-page .workbench-rail__button {
+  --rail-bg: linear-gradient(180deg, #f7faf9, #eaf1ef);
+  --rail-hover-bg: linear-gradient(180deg, #ffffff, #edf4f1);
+  --rail-active-bg: linear-gradient(180deg, #d8eee8, #bdded5);
+  --rail-border: #cedbd8;
+  --rail-hover-border: #b8cbc5;
+  --rail-active-border: #69ad9d;
+  --rail-color: #39565f;
+  --rail-active-text: #0b6658;
+  --rail-shadow: rgba(42, 68, 65, 0.08);
+  --rail-active-shadow: rgba(13, 122, 104, 0.16);
+
+  border-color: var(--rail-border);
+  background: var(--rail-bg);
+  color: var(--rail-color);
+  box-shadow: 0 8px 16px var(--rail-shadow);
+}
+
+.workbench-page .workbench-rail__button:hover {
+  border-color: var(--rail-hover-border);
+  background: var(--rail-hover-bg);
+  color: var(--rail-active-text);
+  box-shadow: 0 10px 18px var(--rail-shadow);
+}
+
+.workbench-page .workbench-rail__button.is-active {
+  border-color: var(--rail-active-border);
+  background: var(--rail-active-bg);
+  color: var(--rail-active-text);
+  box-shadow: 0 12px 22px var(--rail-active-shadow);
+}
+
+.workbench-rail__button--paper {
+  --rail-bg: linear-gradient(180deg, #f7fbfb, #e8f0f1);
+  --rail-hover-bg: linear-gradient(180deg, #ffffff, #eef5f5);
+  --rail-active-bg: linear-gradient(180deg, #d9ecef, #c2dde2);
+  --rail-active-border: #79aebb;
+  --rail-active-text: #285866;
+  --rail-active-shadow: rgba(40, 88, 102, 0.15);
+}
+
+.workbench-rail__button--success {
+  --rail-bg: linear-gradient(180deg, #f2faf6, #dcefe8);
+  --rail-hover-bg: linear-gradient(180deg, #ffffff, #e6f5ef);
+  --rail-active-bg: linear-gradient(180deg, #cdebe1, #a9d9c9);
+  --rail-active-border: #5ea891;
+  --rail-active-text: #116554;
+  --rail-active-shadow: rgba(17, 101, 84, 0.16);
+}
+
+.workbench-rail__button--layout {
+  --rail-bg: linear-gradient(180deg, #f2f6fb, #dde9f4);
+  --rail-hover-bg: linear-gradient(180deg, #ffffff, #e8f1f8);
+  --rail-active-bg: linear-gradient(180deg, #cfe2f5, #accce9);
+  --rail-active-border: #6fa1cc;
+  --rail-active-text: #2d5e87;
+  --rail-active-shadow: rgba(45, 94, 135, 0.16);
+}
+
+.workbench-rail__button--info {
+  --rail-bg: linear-gradient(180deg, #f1f5fb, #e1eafa);
+  --rail-hover-bg: linear-gradient(180deg, #ffffff, #eaf0fb);
+  --rail-active-bg: linear-gradient(180deg, #d4e1f6, #bacdf0);
+  --rail-active-border: #839ed5;
+  --rail-active-text: #3d558e;
+  --rail-active-shadow: rgba(61, 85, 142, 0.16);
+}
+
+.workbench-rail__button--language {
+  --rail-bg: linear-gradient(180deg, #f3faf7, #dfeee9);
+  --rail-hover-bg: linear-gradient(180deg, #ffffff, #eaf6f1);
+  --rail-active-bg: linear-gradient(180deg, #d1eadf, #b5dccc);
+  --rail-active-border: #76ab95;
+  --rail-active-text: #2b6754;
+  --rail-active-shadow: rgba(43, 103, 84, 0.16);
+}
+
+.workbench-rail__button--note {
+  --rail-bg: linear-gradient(180deg, #fbf6ed, #f2e4c8);
+  --rail-hover-bg: linear-gradient(180deg, #fffdf8, #f7ead2);
+  --rail-active-bg: linear-gradient(180deg, #f4dca8, #e4c27d);
+  --rail-active-border: #c89c4f;
+  --rail-active-text: #704d15;
+  --rail-active-shadow: rgba(112, 77, 21, 0.16);
+}
+
+.workbench-rail__button--history {
+  --rail-bg: linear-gradient(180deg, #f7f4fb, #e8e1f2);
+  --rail-hover-bg: linear-gradient(180deg, #ffffff, #f0eaf8);
+  --rail-active-bg: linear-gradient(180deg, #ddd1ee, #c9b7e1);
+  --rail-active-border: #9a82bf;
+  --rail-active-text: #5b4380;
+  --rail-active-shadow: rgba(91, 67, 128, 0.16);
 }
 
 .shortcut-list {

@@ -84,6 +84,7 @@ class FileRecord(Base):
     revisions: Mapped[list["SegmentRevision"]] = relationship(
         "SegmentRevision",
         back_populates="file_record",
+        cascade="all, delete-orphan",
     )
 
 
@@ -153,6 +154,7 @@ class Segment(Base):
     revisions: Mapped[list["SegmentRevision"]] = relationship(
         "SegmentRevision",
         back_populates="segment",
+        cascade="all, delete-orphan",
     )
 
 

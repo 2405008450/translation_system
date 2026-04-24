@@ -377,16 +377,23 @@ def list_segments_for_llm_translation(
 def get_tm_target_text_map(
     db: Session,
     source_texts: list[str],
+    collection_id: UUID | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
 ) -> dict[str, str]:
     unique_source_texts = [text for text in dict.fromkeys(source_texts) if text]
     if not unique_source_texts:
         return {}
 
-    matches = (
-        db.query(TranslationMemory)
-        .filter(TranslationMemory.source_text.in_(unique_source_texts))
-        .all()
-    )
+    query = db.query(TranslationMemory).filter(TranslationMemory.source_text.in_(unique_source_texts))
+    if collection_id is not None:
+        query = query.filter(TranslationMemory.collection_id == collection_id)
+    if source_language:
+        query = query.filter(TranslationMemory.source_language == source_language)
+    if target_language:
+        query = query.filter(TranslationMemory.target_language == target_language)
+
+    matches = query.all()
     return {match.source_text: match.target_text for match in matches}
 
 

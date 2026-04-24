@@ -31,14 +31,14 @@ export const llmScopeOptions: LLMOption<LLMTranslateScope>[] = [
 
 export const llmProviderOptions: LLMOption<LLMProvider>[] = [
   {
-    value: 'auto',
-    label: '自动选择',
-    description: '按当前配置自动选择可用模型。',
-  },
-  {
     value: 'deepseek',
     label: 'DeepSeek',
     description: '使用 DeepSeek 提供的模型。',
+  },
+  {
+    value: 'auto',
+    label: '自动选择',
+    description: '按当前配置自动选择可用模型。',
   },
   {
     value: 'openrouter',
