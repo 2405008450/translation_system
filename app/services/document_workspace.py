@@ -2336,12 +2336,20 @@ def build_document_html_from_segments(segments: list) -> str:
             table_rows = []
         current_table_index = None
 
+    def get_segment_value(segment: object, field_name: str, default: object = None) -> object:
+        if isinstance(segment, dict):
+            return segment.get(field_name, default)
+        return getattr(segment, field_name, default)
+
     for segment in segments:
-        block_type = getattr(segment, "block_type", "paragraph") or "paragraph"
-        sentence_id = getattr(segment, "sentence_id", "")
+        block_type = get_segment_value(segment, "block_type", "paragraph") or "paragraph"
+        sentence_id = (
+            get_segment_value(segment, "sentence_id", "")
+            or get_segment_value(segment, "segment_id", "")
+        )
         display_text = build_segment_display_html(
-            getattr(segment, "display_text", ""),
-            getattr(segment, "math_placeholders", None),
+            get_segment_value(segment, "display_text", ""),
+            get_segment_value(segment, "math_placeholders", None),
         )
         sentence_html = (
             f'<span class="doc-sentence" id="{sentence_id}" data-sentence-id="{sentence_id}">'
@@ -2351,15 +2359,15 @@ def build_document_html_from_segments(segments: list) -> str:
 
         if block_type == "table_cell":
             flush_paragraph()
-            table_index = getattr(segment, "block_index", 0)
+            table_index = get_segment_value(segment, "block_index", 0)
             if current_table_index is None:
                 current_table_index = table_index
             elif current_table_index != table_index:
                 flush_table()
                 current_table_index = table_index
 
-            row_index = getattr(segment, "row_index", 0) or 0
-            cell_index = getattr(segment, "cell_index", 0) or 0
+            row_index = get_segment_value(segment, "row_index", 0) or 0
+            cell_index = get_segment_value(segment, "cell_index", 0) or 0
             while len(table_rows) <= row_index:
                 table_rows.append([])
             while len(table_rows[row_index]) <= cell_index:
@@ -2368,7 +2376,7 @@ def build_document_html_from_segments(segments: list) -> str:
             continue
 
         flush_table()
-        paragraph_key = (getattr(segment, "block_index", 0), block_type)
+        paragraph_key = (get_segment_value(segment, "block_index", 0), block_type)
         if current_paragraph_key != paragraph_key:
             flush_paragraph()
             current_paragraph_key = paragraph_key

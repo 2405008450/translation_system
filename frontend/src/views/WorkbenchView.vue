@@ -37,6 +37,7 @@ import { http } from '../api/http'
 import { usePageHeader } from '../composables/usePageHeader'
 import { useToast } from '../composables/useToast'
 import { useWorkbenchShortcuts } from '../composables/useWorkbenchShortcuts'
+import { getTaskExportFormatLabel } from '../constants/taskFiles'
 import { llmProviderOptions, llmScopeOptions } from '../constants/llm'
 import { formatLanguagePair } from '../constants/languages'
 import { useAuthStore } from '../stores/auth'
@@ -244,6 +245,10 @@ const targetPreviewSupported = computed(() => {
   }
   return segmentStore.allSegmentsLoaded && segmentStore.segments.length > 0
 })
+
+const exportButtonLabel = computed(() => (
+  `${t('common.actions.export')} ${getTaskExportFormatLabel(segmentStore.fileRecord?.filename)}`
+))
 
 const sourcePreviewLoading = computed(() =>
   (activeTool.value === 'source-preview' || activeTool.value === 'split-preview')
@@ -606,12 +611,12 @@ async function saveNow() {
   }
 }
 
-async function exportDocx() {
+async function exportTranslatedFile() {
   pageError.value = ''
   try {
-    await segmentStore.downloadTranslatedDocx()
+    await segmentStore.downloadTranslatedFile()
   } catch (error) {
-    pageError.value = getErrorMessage(error, t('workbench.errors.export'))
+    pageError.value = getErrorMessage(error, '导出失败。')
   }
 }
 
@@ -799,9 +804,9 @@ onBeforeRouteLeave(async () => {
           {{ segmentStore.saving ? t('common.actions.saving') : t('workbench.saveNow') }}
         </button>
 
-        <button class="button" type="button" @click="exportDocx">
+        <button class="button" type="button" :disabled="!segmentStore.canExport" @click="exportTranslatedFile">
           <Download :size="14" />
-          {{ t('workbench.exportDocx') }}
+          {{ exportButtonLabel }}
         </button>
 
         <div class="workbench-revision-menu">

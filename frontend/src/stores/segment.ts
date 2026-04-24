@@ -3,6 +3,7 @@ import { defineStore } from 'pinia'
 
 import { http } from '../api/http'
 import { pushToast } from '../composables/useToast'
+import { buildTranslatedTaskFilename } from '../constants/taskFiles'
 import { translate } from '../i18n'
 import type {
   FileRecordDetail,
@@ -13,6 +14,7 @@ import type {
   SegmentRevisionEntry,
   SegmentUpdatePayload,
 } from '../types/api'
+import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 
 const SEGMENT_PAGE_SIZE = 1000
 const AUTO_SYNC_DELAY_MS = 1500
@@ -69,6 +71,7 @@ export const useSegmentStore = defineStore('segment', () => {
   let llmAbortRequested = false
 
   const dirtyCount = computed(() => Object.keys(dirtyEntries.value).length)
+  const canExport = computed(() => Boolean(fileRecord.value?.can_export))
   const loadedSegmentCount = computed(() => segments.value.length)
   const hasMoreSegments = computed(() => loadedSegmentCount.value < totalSegmentCount.value)
   const allSegmentsLoaded = computed(() => (
@@ -632,8 +635,8 @@ export const useSegmentStore = defineStore('segment', () => {
     llmMessage.value = translate('stores.segment.llmStopped')
   }
 
-  async function downloadTranslatedDocx() {
-    if (!fileRecord.value) {
+  async function downloadTranslatedFile() {
+    if (!fileRecord.value || !canExport.value) {
       return
     }
 
@@ -641,17 +644,14 @@ export const useSegmentStore = defineStore('segment', () => {
       await syncToBackend()
     }
 
-    const response = await http.get(`/file-records/${fileRecord.value.id}/export-docx`, {
+    const response = await http.get(`/file-records/${fileRecord.value.id}/export`, {
       responseType: 'blob',
     })
-    const blobUrl = window.URL.createObjectURL(response.data)
-    const link = document.createElement('a')
-    link.href = blobUrl
-    link.download = `${fileRecord.value.filename.replace(/\.docx$/i, '') || 'translated'}-translated.docx`
-    document.body.appendChild(link)
-    link.click()
-    link.remove()
-    window.URL.revokeObjectURL(blobUrl)
+    const filename = resolveDownloadFilename(
+      response.headers['content-disposition'],
+      buildTranslatedTaskFilename(fileRecord.value.filename),
+    )
+    downloadBlob(response.data, filename)
   }
 
   return {
@@ -673,6 +673,7 @@ export const useSegmentStore = defineStore('segment', () => {
     llmErrorCount,
     llmProgressPercent,
     dirtyCount,
+    canExport,
     pendingRevisionCount,
     loadedSegmentCount,
     totalSegmentCount,
@@ -698,7 +699,7 @@ export const useSegmentStore = defineStore('segment', () => {
     batchRejectRevisions,
     startLLMTranslation,
     abortLLM,
-    downloadTranslatedDocx,
+    downloadTranslatedFile,
     resetState,
   }
 })

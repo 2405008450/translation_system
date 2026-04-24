@@ -14,11 +14,9 @@ def save_source_file(file_record_id: UUID, filename: str, raw_bytes: bytes) -> P
 
 
 def load_source_file(file_record_id: UUID, filename: str) -> bytes | None:
-    path = get_source_file_path(file_record_id, filename)
-    if not path.exists():
-        path = _find_any_source_file(file_record_id)
-        if path is None:
-            return None
+    path = resolve_source_file_path(file_record_id, filename)
+    if path is None:
+        return None
     return path.read_bytes()
 
 
@@ -32,6 +30,13 @@ def delete_source_file(file_record_id: UUID, filename: str) -> None:
 def get_source_file_path(file_record_id: UUID, filename: str) -> Path:
     suffix = Path(filename).suffix.lower() or ".bin"
     return _get_storage_root() / f"{file_record_id}{suffix}"
+
+
+def resolve_source_file_path(file_record_id: UUID, filename: str) -> Path | None:
+    path = get_source_file_path(file_record_id, filename)
+    if path.exists():
+        return path
+    return _find_any_source_file(file_record_id)
 
 
 def _get_storage_root() -> Path:

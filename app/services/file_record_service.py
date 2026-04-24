@@ -6,9 +6,14 @@ from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.models import FileRecord, Segment, TranslationMemory, User
-from app.services.document_workspace import build_docx_workspace
-from app.services.document_storage import delete_source_file, load_source_file, save_source_file
+from app.services.document_storage import (
+    delete_source_file,
+    load_source_file,
+    resolve_source_file_path,
+    save_source_file,
+)
 from app.services.revision_service import create_revision
+from app.services.task_file_service import build_task_workspace
 
 
 SEGMENT_ORDERING = (
@@ -80,9 +85,10 @@ def create_file_record_with_segments(
     file_hash = hashlib.sha256(raw_bytes).hexdigest()
 
     if workspace_data is None:
-        workspace_data = build_docx_workspace(
+        workspace_data = build_task_workspace(
             db=db,
             raw_bytes=raw_bytes,
+            filename=filename,
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
         )
@@ -137,12 +143,12 @@ def _create_file_record_from_workspace(
     )
 
     try:
-        if raw_bytes is not None and _is_docx_filename(filename):
+        if raw_bytes is not None:
             save_source_file(file_record.id, filename, raw_bytes)
         db.commit()
     except Exception:
         db.rollback()
-        if raw_bytes is not None and _is_docx_filename(filename):
+        if raw_bytes is not None:
             delete_source_file(file_record.id, filename)
         raise
 
@@ -202,6 +208,24 @@ def load_file_record_source(file_record: FileRecord) -> bytes | None:
     return load_source_file(file_record.id, file_record.filename)
 
 
+def get_file_record_source_filename(file_record: FileRecord) -> str:
+    source_path = resolve_source_file_path(file_record.id, file_record.filename)
+    if source_path is None:
+        return file_record.filename
+
+    stored_extension = source_path.suffix.lower()
+    filename_extension = Path(file_record.filename).suffix.lower()
+    if not stored_extension or stored_extension == filename_extension:
+        return file_record.filename
+
+    base_name = (
+        file_record.filename[: -len(filename_extension)]
+        if filename_extension
+        else file_record.filename
+    )
+    return f"{base_name}{stored_extension}"
+
+
 def attach_source_document_to_file_record(
     db: Session,
     file_record: FileRecord,
@@ -211,9 +235,10 @@ def attach_source_document_to_file_record(
     collection_ids: list[UUID] | None = None,
 ) -> FileRecord:
     file_hash = hashlib.sha256(raw_bytes).hexdigest()
-    workspace_data = build_docx_workspace(
+    workspace_data = build_task_workspace(
         db=db,
         raw_bytes=raw_bytes,
+        filename=source_filename,
         similarity_threshold=similarity_threshold,
         collection_ids=collection_ids,
     )
@@ -503,7 +528,7 @@ def delete_file_record(db: Session, file_record_id: UUID) -> bool:
 
     db.delete(file_record)
     db.commit()
-    if _is_docx_filename(file_record.filename):
+    if file_record.filename:
         delete_source_file(file_record.id, file_record.filename)
     return True
 

@@ -22,16 +22,6 @@ from app.services.comment_service import (
     serialize_segment_comment,
     update_segment_comment,
 )
-from app.services.document_exporter import (
-    DOCX_MEDIA_TYPE,
-    build_translated_docx_filename,
-    export_translated_docx,
-)
-from app.services.document_workspace import (
-    build_docx_preview_html,
-    build_document_html_from_segments,
-    build_docx_workspace,
-)
 from app.services.file_record_service import (
     attach_source_document_to_file_record,
     batch_update_segments,
@@ -39,6 +29,7 @@ from app.services.file_record_service import (
     create_file_record_with_segments,
     delete_file_record,
     get_file_record as get_file_record_model,
+    get_file_record_source_filename,
     get_file_record_with_segments,
     get_tm_target_text_map,
     list_file_records,
@@ -66,6 +57,15 @@ from app.services.revision_service import (
     serialize_segment_revision,
 )
 from app.services.slate_parser import parse_docx_for_slate
+from app.services.task_file_service import (
+    build_task_preview_html,
+    build_task_workspace,
+    can_export_task_file,
+    export_translated_task_file,
+    get_supported_task_extensions,
+    get_task_file_extension,
+    supports_task_file,
+)
 from app.services.tm_importer import XLSX_EXTENSIONS, import_tm_from_xlsx_upload
 from app.services.tm_vector import sync_tm_embeddings
 from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_response
@@ -135,15 +135,18 @@ class ProjectUpdatePayload(BaseModel):
     access_level: Literal["team", "private", "public"] | None = None
 
 
-def _build_docx_download_response(filename: str, docx_bytes: bytes) -> StreamingResponse:
-    export_filename = build_translated_docx_filename(filename)
-    ascii_filename = export_filename.encode("ascii", "ignore").decode("ascii").strip() or "translated.docx"
+def _build_binary_download_response(
+    filename: str,
+    content: bytes,
+    media_type: str,
+) -> StreamingResponse:
+    ascii_filename = filename.encode("ascii", "ignore").decode("ascii").strip() or "translated.bin"
     ascii_filename = ascii_filename.replace('"', "")
-    quoted_filename = quote(export_filename)
+    quoted_filename = quote(filename)
 
     return StreamingResponse(
-        BytesIO(docx_bytes),
-        media_type=DOCX_MEDIA_TYPE,
+        BytesIO(content),
+        media_type=media_type,
         headers={
             "Content-Disposition": (
                 f'attachment; filename="{ascii_filename}"; '
@@ -202,6 +205,17 @@ def _build_llm_translation_tasks(
 def _validate_docx_upload(file: UploadFile) -> None:
     if not (file.filename or "").lower().endswith(".docx"):
         raise HTTPException(status_code=400, detail="仅支持 DOCX 文件。")
+
+
+def _validate_task_upload(file: UploadFile) -> None:
+    if supports_task_file(file.filename or ""):
+        return
+
+    supported_extensions = ", ".join(get_supported_task_extensions())
+    raise HTTPException(
+        status_code=400,
+        detail=f"暂不支持该文件格式。当前支持：{supported_extensions}",
+    )
 
 
 def _normalize_collection_name(name: str) -> str:
@@ -352,7 +366,7 @@ async def upload_for_workspace(
     collection_ids: list[UUID] | None = Form(default=None),
     db: Session = Depends(get_db),
 ):
-    _validate_docx_upload(file)
+    _validate_task_upload(file)
 
     raw_bytes = await file.read()
     if not raw_bytes:
@@ -361,9 +375,10 @@ async def upload_for_workspace(
     selected_collection_ids = _validate_collection_ids(db, collection_ids)
     required_collection_ids = _require_selected_collection_ids(selected_collection_ids)
     try:
-        return build_docx_workspace(
+        return build_task_workspace(
             db=db,
             raw_bytes=raw_bytes,
+            filename=file.filename or "untitled.txt",
             similarity_threshold=threshold,
             collection_ids=required_collection_ids,
         )
@@ -382,7 +397,7 @@ async def create_file_record(
     db: Session = Depends(get_db),
 ):
     """上传文档并创建持久化记录"""
-    _validate_docx_upload(file)
+    _validate_task_upload(file)
 
     raw_bytes = await file.read()
     if not raw_bytes:
@@ -391,11 +406,19 @@ async def create_file_record(
     selected_collection_ids = _validate_collection_ids(db, collection_ids)
     required_collection_ids = _require_selected_collection_ids(selected_collection_ids)
     try:
+        workspace_data = build_task_workspace(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=file.filename or "untitled.txt",
+            similarity_threshold=threshold,
+            collection_ids=required_collection_ids,
+        )
         file_record = create_file_record_with_segments(
             db=db,
             raw_bytes=raw_bytes,
-            filename=file.filename or "untitled.docx",
+            filename=file.filename or "untitled.txt",
             similarity_threshold=threshold,
+            workspace_data=workspace_data,
             collection_ids=required_collection_ids,
         )
         return {
@@ -538,7 +561,7 @@ def upload_project_source_document(
     collection_ids: list[UUID] | None = Form(default=None),
     db: Session = Depends(get_db),
 ):
-    _validate_docx_upload(file)
+    _validate_task_upload(file)
     project = get_file_record_model(db, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在。")
@@ -565,7 +588,7 @@ def upload_project_source_document(
             db=db,
             file_record=project,
             raw_bytes=raw_bytes,
-            source_filename=file.filename or "source.docx",
+            source_filename=file.filename or "source.txt",
             similarity_threshold=threshold,
             collection_ids=required_collection_ids,
         )
@@ -706,6 +729,8 @@ def get_file_record(
 
     file_record = result["file_record"]
     segments = result["segments"]
+    source_bytes = load_file_record_source(file_record)
+    source_filename = get_file_record_source_filename(file_record)
 
     return {
         "id": file_record.id,
@@ -718,6 +743,9 @@ def get_file_record(
         "total_segments": result["total_segments"],
         "skip": result["skip"],
         "limit": result["limit"],
+        "source_extension": get_task_file_extension(source_filename),
+        "has_source_document": source_bytes is not None,
+        "can_export": can_export_task_file(source_filename, has_source_file=source_bytes is not None),
         "segments": [
             {
                 "id": seg.id,
@@ -750,20 +778,25 @@ def get_file_record_preview(
         raise HTTPException(status_code=404, detail="文档不存在。")
 
     source_bytes = load_file_record_source(file_record)
-    if source_bytes:
-        preview_html = build_docx_preview_html(source_bytes)
-    else:
-        segments = list_segments_for_file_record(db, file_record_id)
-        preview_html = build_document_html_from_segments(segments) if segments else ""
+    source_filename = get_file_record_source_filename(file_record)
+    segments = list_segments_for_file_record(db, file_record_id)
+    preview_html = build_task_preview_html(
+        filename=source_filename,
+        segments=segments,
+        source_bytes=source_bytes,
+    )
 
     return {
         "id": file_record.id,
         "filename": file_record.filename,
+        "source_extension": get_task_file_extension(source_filename),
         "supports_preview": bool(preview_html),
         "preview_html": preview_html,
     }
 
 
+@router.get("/file-records/{file_record_id}/export")
+@router.get("/documents/{file_record_id}/export", include_in_schema=False)
 @router.get("/file-records/{file_record_id}/export-docx")
 @router.get("/documents/{file_record_id}/export-docx", include_in_schema=False)
 def export_file_record_docx(
@@ -775,18 +808,27 @@ def export_file_record_docx(
         raise HTTPException(status_code=404, detail="File record not found.")
 
     raw_bytes = load_file_record_source(file_record)
-    if raw_bytes is None:
-        raise HTTPException(status_code=400, detail="The source DOCX is unavailable for export.")
+    source_filename = get_file_record_source_filename(file_record)
+    if not can_export_task_file(source_filename, has_source_file=raw_bytes is not None):
+        raise HTTPException(status_code=400, detail="Current file format does not support original export yet.")
 
     segments = list_segments_for_file_record(db, file_record_id)
     try:
-        translated_docx = export_translated_docx(raw_bytes=raw_bytes, segments=segments)
+        exported_file = export_translated_task_file(
+            raw_bytes=raw_bytes,
+            filename=source_filename,
+            segments=segments,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    return _build_docx_download_response(file_record.filename, translated_docx)
+    return _build_binary_download_response(
+        filename=exported_file.filename,
+        content=exported_file.content,
+        media_type=exported_file.media_type,
+    )
 
 
 @router.put("/file-records/{file_record_id}/segments/{sentence_id}")
