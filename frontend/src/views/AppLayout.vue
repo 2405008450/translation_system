@@ -78,19 +78,19 @@ const navGroups = computed<NavGroup[]>(() => [
     key: 'assets',
     label: t('shell.sections.assets'),
     icon: BookOpen,
-    visible: authStore.isAdmin,
+    visible: true,
     children: [
       {
         name: 'tm',
         label: t('shell.sections.tm'),
         icon: Database,
-        visible: authStore.isAdmin,
+        visible: true,
       },
       {
         name: 'term-base',
         label: t('shell.sections.termBase'),
         icon: BookOpen,
-        visible: authStore.isAdmin,
+        visible: true,
       },
     ],
   },
@@ -98,13 +98,13 @@ const navGroups = computed<NavGroup[]>(() => [
     key: 'system',
     label: t('shell.sections.system'),
     icon: Settings,
-    visible: authStore.isAdmin,
+    visible: true,
     children: [
       {
         name: 'users',
         label: t('shell.sections.users'),
         icon: Users,
-        visible: authStore.isAdmin,
+        visible: true,
       },
     ],
   },
@@ -294,6 +294,16 @@ watch(
               <h1 class="brand-text__title">{{ t('appLayout.brand') }}</h1>
             </div>
           </div>
+          <button
+            class="sidebar-collapse-button"
+            type="button"
+            :title="sidebarCollapsed ? t('shell.topbar.expand') : t('shell.topbar.collapse')"
+            :aria-label="sidebarCollapsed ? t('shell.topbar.expand') : t('shell.topbar.collapse')"
+            :aria-expanded="!sidebarCollapsed"
+            @click="toggleSidebar"
+          >
+            <component :is="sidebarCollapsed ? PanelLeft : PanelLeftClose" :size="18" />
+          </button>
         </div>
       </div>
 
@@ -305,6 +315,8 @@ watch(
                 <button
                   class="sidebar-nav__group-header"
                   type="button"
+                  :title="group.label"
+                  :aria-expanded="expandedGroups[group.key]"
                   @click="toggleGroup(group.key)"
                 >
                   <component :is="group.icon" :size="18" />

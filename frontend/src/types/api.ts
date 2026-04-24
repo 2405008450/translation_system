@@ -32,6 +32,24 @@ export interface FileRecordSummary {
   updated_at: string
 }
 
+export interface TMMatchCandidate {
+  source_text: string
+  target_text: string
+  score: number
+  collection_name: string | null
+  creator_name: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface TermMatchCandidate {
+  source_text: string
+  target_text: string
+  term_base_name: string | null
+  creator_name: string | null
+  updated_at: string | null
+}
+
 export interface Segment {
   id: string
   sentence_id: string

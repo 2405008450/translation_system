@@ -753,6 +753,54 @@ async function handleDeleteComment(commentId: string) {
   }
 }
 
+function needsInlineSpace(leftText: string, rightText: string) {
+  if (!leftText || !rightText) {
+    return false
+  }
+
+  return /[A-Za-z0-9)]$/.test(leftText) && /^[A-Za-z0-9(]/.test(rightText)
+}
+
+function appendToCurrentText(currentText: string, nextText: string) {
+  if (!currentText) {
+    return nextText
+  }
+  if (!nextText) {
+    return currentText
+  }
+
+  const trimmedCurrent = currentText.trimEnd()
+  const trimmedNext = nextText.trim()
+  if (trimmedCurrent.endsWith(trimmedNext)) {
+    return currentText
+  }
+
+  const separator = /\s$/.test(currentText) || /^\s/.test(nextText)
+    ? ''
+    : (needsInlineSpace(currentText.slice(-1), nextText.charAt(0)) ? ' ' : '')
+
+  return `${currentText}${separator}${nextText}`
+}
+
+function handleReplaceText(text: string) {
+  if (!activeSegment.value) {
+    return
+  }
+
+  segmentStore.updateTarget(activeSegment.value.sentence_id, text)
+  toast.success(t('matchPanel.textInserted'))
+}
+
+function handleAppendText(text: string) {
+  if (!activeSegment.value) {
+    return
+  }
+
+  const nextText = appendToCurrentText(activeSegment.value.target_text || '', text)
+  segmentStore.updateTarget(activeSegment.value.sentence_id, nextText)
+  toast.success(t('matchPanel.textInserted'))
+}
+
 watch(() => props.id, () => {
   void loadTask()
 })
@@ -922,7 +970,7 @@ onBeforeRouteLeave(async () => {
           </p>
         </div>
 
-        <div v-if="authStore.isAdmin" class="workbench-resource-panel__actions">
+        <div class="workbench-resource-panel__actions">
           <button class="button" type="button" @click="openImportDialog('tm')">
             <Upload :size="14" />
             {{ t('workbench.importTm') }}
@@ -1157,10 +1205,15 @@ onBeforeRouteLeave(async () => {
             v-else-if="activeTool === 'match-info'"
             key="match-info"
             :segment="activeSegment"
+            :collection-id="segmentStore.fileRecord?.collection_id ?? null"
             :collection-name="segmentStore.fileRecord?.collection_name ?? null"
+            :term-base-id="segmentStore.fileRecord?.term_base_id ?? null"
             :term-base-name="segmentStore.fileRecord?.term_base_name ?? null"
             :term-entries="termEntries"
             :active-source-text="activeSegmentSourceText"
+            :file-record-id="segmentStore.fileRecord?.id ?? null"
+            @replace-text="handleReplaceText"
+            @append-text="handleAppendText"
           />
           <NotesPanel
             v-else-if="activeTool === 'notes'"

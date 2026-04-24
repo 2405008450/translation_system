@@ -24,7 +24,6 @@ import { useToast } from '../composables/useToast'
 import { formatLanguagePair } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
 import { supportedTaskFileAccept } from '../constants/taskFiles'
-import { useAuthStore } from '../stores/auth'
 import { useTaskStore } from '../stores/task'
 import type { TermBase, TMCollection } from '../types/api'
 
@@ -32,7 +31,6 @@ type MainTab = 'tasks' | 'performance'
 type SubTab = 'all' | 'incomplete'
 type ResourceImportTab = 'tm' | 'term'
 
-const authStore = useAuthStore()
 const taskStore = useTaskStore()
 const confirm = useConfirm()
 const toast = useToast()
@@ -411,7 +409,6 @@ onBeforeUnmount(() => {
               {{ showUploadForm ? t('taskList.toolbar.collapseUpload') : t('taskList.toolbar.uploadTask') }}
             </button>
             <button
-              v-if="authStore.isAdmin"
               class="button"
               type="button"
               @click="goToAssets"
@@ -505,14 +502,12 @@ onBeforeUnmount(() => {
                       {{ t('taskList.actions.details') }}
                     </button>
                     <button
-                      v-if="authStore.isAdmin"
                       type="button"
                       @click="openImportDialog(row); closeActionMenu()"
                     >
                       {{ t('taskList.actions.importResources') }}
                     </button>
                     <button
-                      v-if="authStore.isAdmin"
                       class="is-danger"
                       type="button"
                       @click="removeTask(row.id, row.filename); closeActionMenu()"

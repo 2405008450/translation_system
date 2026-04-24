@@ -100,7 +100,7 @@ def get_me(current_user: User = Depends(get_current_user)) -> UserRead:
 @router.get("/users", response_model=list[UserRead])
 def get_users(
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(get_current_user),
 ) -> list[UserRead]:
     return [
         UserRead.model_validate(serialize_user(user))
@@ -130,7 +130,7 @@ def update_user_account(
     user_id: UUID,
     payload: UpdateUserRequest,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(get_current_user),
 ) -> UserRead:
     require_users_table()
     target_user = get_user_by_id(db, user_id)

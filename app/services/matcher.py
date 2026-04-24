@@ -2,7 +2,7 @@
 
 import logging
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from time import perf_counter
 from typing import TypeVar
@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models import TranslationMemory
-from app.schemas import MatchResult
+from app.schemas import MatchResult, TMMatchCandidate
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
 from app.services.tm_vector import (
     TM_EMBEDDING_VERSION,
@@ -28,6 +28,7 @@ from app.services.tm_vector import (
 EXACT_MATCH_BATCH_SIZE = 1000
 FUZZY_MATCH_BATCH_SIZE = 200
 FUZZY_CANDIDATE_LIMIT = 3
+TM_CANDIDATES_LIMIT = 5
 T = TypeVar("T")
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ class PreparedSentence:
     auxiliary_hash: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass
 class ResolvedMatch:
     status: str
     score: float
@@ -54,6 +55,8 @@ class ResolvedMatch:
     matched_created_at: str | None = None
     matched_updated_at: str | None = None
     target_text: str | None = None
+    # 多个TM匹配候选
+    tm_candidates: list[TMMatchCandidate] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -129,6 +132,7 @@ def match_sentences_with_stats(
             matched_created_at=match.matched_created_at,
             matched_updated_at=match.matched_updated_at,
             target_text=match.target_text,
+            tm_candidates=match.tm_candidates,
         )
         for sentence, match in zip(prepared_sentences, resolved_matches, strict=False)
     ]
@@ -214,6 +218,7 @@ def _resolve_matches(
                 score=0.0,
                 matched_source_text=None,
                 target_text=None,
+                tm_candidates=[],
             )
             none_hits += 1
             continue
@@ -245,6 +250,16 @@ def _resolve_matches(
             creator_name = None
             if exact_match.creator:
                 creator_name = exact_match.creator.nickname or exact_match.creator.username
+            # 构建单个精确匹配候选
+            exact_candidate = TMMatchCandidate(
+                source_text=exact_match.source_text,
+                target_text=exact_match.target_text,
+                score=1.0,
+                collection_name=collection_name,
+                creator_name=creator_name,
+                created_at=exact_match.created_at.isoformat() if exact_match.created_at else None,
+                updated_at=exact_match.updated_at.isoformat() if exact_match.updated_at else None,
+            )
             resolved_matches[index] = ResolvedMatch(
                 status="exact",
                 score=1.0,
@@ -254,6 +269,7 @@ def _resolve_matches(
                 matched_created_at=exact_match.created_at.isoformat() if exact_match.created_at else None,
                 matched_updated_at=exact_match.updated_at.isoformat() if exact_match.updated_at else None,
                 target_text=exact_match.target_text,
+                tm_candidates=[exact_candidate],
             )
             exact_hits += 1
             continue
@@ -282,6 +298,7 @@ def _resolve_matches(
             score=0.0,
             matched_source_text=None,
             target_text=None,
+            tm_candidates=[],
         )
         none_hits += 1
 
@@ -510,14 +527,30 @@ FROM memory_entries AS tm
 
     matches: list[ResolvedMatch | None] = []
     for index, sentence in enumerate(prepared_sentences):
-        best_candidate = _pick_best_fuzzy_candidate(
+        top_candidates = _pick_best_fuzzy_candidates(
             sentence=sentence,
             candidates=list(grouped_candidates.get(index, {}).values()),
             similarity_threshold=similarity_threshold,
+            top_n=5,
         )
-        if best_candidate is None:
+        if not top_candidates:
             matches.append(None)
             continue
+
+        best_candidate = top_candidates[0]
+        # 构建所有候选列表
+        tm_candidates = [
+            TMMatchCandidate(
+                source_text=c["source_text"],
+                target_text=c["target_text"],
+                score=round(float(c["score"]), 4),
+                collection_name=c.get("collection_name"),
+                creator_name=c.get("creator_name"),
+                created_at=c.get("created_at"),
+                updated_at=c.get("updated_at"),
+            )
+            for c in top_candidates
+        ]
 
         matches.append(
             ResolvedMatch(
@@ -529,6 +562,7 @@ FROM memory_entries AS tm
                 matched_created_at=best_candidate.get("created_at"),
                 matched_updated_at=best_candidate.get("updated_at"),
                 target_text=best_candidate["target_text"],
+                tm_candidates=tm_candidates,
             )
         )
 
@@ -668,14 +702,14 @@ FROM memory_entries AS tm
             )
 
 
-def _pick_best_fuzzy_candidate(
+def _pick_best_fuzzy_candidates(
     sentence: PreparedSentence,
     candidates: list[dict],
     similarity_threshold: float,
-) -> dict | None:
-    best_candidate = None
-    best_score = 0.0
-    best_base_score = 0.0
+    top_n: int = 5,
+) -> list[dict]:
+    """返回Top N个最佳模糊匹配候选"""
+    scored_candidates = []
 
     for candidate in candidates:
         compare_text_raw = candidate.get("compare_text") or candidate["source_text"]
@@ -706,12 +740,8 @@ def _pick_best_fuzzy_candidate(
         if auxiliary_score > source_score:
             final_score += min(auxiliary_score - source_score, 0.05)
 
-        if final_score > best_score or (
-            final_score == best_score and base_score > best_base_score
-        ):
-            best_score = final_score
-            best_base_score = base_score
-            best_candidate = {
+        if final_score >= similarity_threshold:
+            scored_candidates.append({
                 "source_text": candidate["source_text"],
                 "target_text": candidate["target_text"],
                 "collection_name": candidate.get("collection_name"),
@@ -719,12 +749,24 @@ def _pick_best_fuzzy_candidate(
                 "created_at": candidate.get("created_at"),
                 "updated_at": candidate.get("updated_at"),
                 "score": final_score,
-            }
+                "base_score": base_score,
+            })
 
-    if best_candidate and best_base_score >= similarity_threshold:
-        return best_candidate
+    # 按分数排序，取Top N
+    scored_candidates.sort(key=lambda x: (x["score"], x["base_score"]), reverse=True)
+    return scored_candidates[:top_n]
 
-    return None
+
+def _pick_best_fuzzy_candidate(
+    sentence: PreparedSentence,
+    candidates: list[dict],
+    similarity_threshold: float,
+) -> dict | None:
+    """返回单个最佳模糊匹配（向后兼容）"""
+    top_candidates = _pick_best_fuzzy_candidates(
+        sentence, candidates, similarity_threshold, top_n=1
+    )
+    return top_candidates[0] if top_candidates else None
 
 
 def _get_trigram_prefilter_threshold(similarity_threshold: float) -> float:
@@ -765,4 +807,75 @@ def _apply_collection_filter(stmt, collection_ids: list[UUID] | None):
 
 def _chunked(items: list[T], chunk_size: int) -> list[list[T]]:
     return [items[index : index + chunk_size] for index in range(0, len(items), chunk_size)]
+
+
+def get_tm_candidates_for_text(
+    db: Session,
+    source_text: str,
+    similarity_threshold: float = 0.6,
+    collection_ids: list[UUID] | None = None,
+    top_n: int = TM_CANDIDATES_LIMIT,
+) -> list[TMMatchCandidate]:
+    """获取单个文本的TM匹配候选列表"""
+    if not source_text or not source_text.strip():
+        return []
+
+    prepared = _prepare_sentences([source_text])
+    if not prepared:
+        return []
+
+    sentence = prepared[0]
+
+    # 先尝试精确匹配
+    exact_matches_by_hash, exact_matches_by_normalized, exact_matches_by_source_text = _find_exact_matches(
+        db, [sentence], collection_ids=collection_ids
+    )
+
+    exact_match = exact_matches_by_hash.get(sentence.source_hash)
+    if exact_match is None:
+        exact_match = exact_matches_by_normalized.get(sentence.normalized_sentence)
+    if exact_match is None:
+        exact_match = exact_matches_by_normalized.get(sentence.match_text)
+    if exact_match is None:
+        exact_match = exact_matches_by_source_text.get(sentence.normalized_sentence)
+    if exact_match is None:
+        exact_match = exact_matches_by_source_text.get(sentence.match_text)
+
+    candidates: list[TMMatchCandidate] = []
+
+    # 如果有精确匹配，作为第一个候选
+    if exact_match:
+        collection_name = None
+        if exact_match.collection:
+            collection_name = exact_match.collection.name
+        creator_name = None
+        if exact_match.creator:
+            creator_name = exact_match.creator.nickname or exact_match.creator.username
+        candidates.append(TMMatchCandidate(
+            source_text=exact_match.source_text,
+            target_text=exact_match.target_text,
+            score=1.0,
+            collection_name=collection_name,
+            creator_name=creator_name,
+            created_at=exact_match.created_at.isoformat() if exact_match.created_at else None,
+            updated_at=exact_match.updated_at.isoformat() if exact_match.updated_at else None,
+        ))
+
+    # 获取模糊匹配候选
+    fuzzy_matches, _ = _find_fuzzy_matches(
+        db=db,
+        prepared_sentences=[sentence],
+        similarity_threshold=similarity_threshold,
+        collection_ids=collection_ids,
+    )
+
+    if fuzzy_matches and fuzzy_matches[0]:
+        fuzzy_match = fuzzy_matches[0]
+        # 添加模糊匹配候选
+        for candidate in fuzzy_match.tm_candidates:
+            # 避免重复（精确匹配已经在列表中）
+            if not any(c.source_text == candidate.source_text and c.target_text == candidate.target_text for c in candidates):
+                candidates.append(candidate)
+
+    return candidates[:top_n]
 

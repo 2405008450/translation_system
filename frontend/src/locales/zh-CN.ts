@@ -657,6 +657,7 @@ export default {
     tmMatch: '记忆库匹配',
     termMatch: '术语匹配',
     matchRate: '匹配率',
+    bestMatch: '最佳匹配',
     source: '来源',
     creator: '创建者',
     updateTime: '更新时间',
@@ -664,6 +665,9 @@ export default {
     noTermMatch: '无术语命中',
     tmDiff: 'TM 差异',
     tmReference: 'TM 译文参考',
+    loading: '加载中...',
+    dblClickHint: '双击插入译文',
+    textInserted: '译文已插入',
   },
   userManagement: {
     createTitle: '创建用户',

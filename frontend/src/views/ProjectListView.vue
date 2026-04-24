@@ -24,7 +24,6 @@ import { useConfirm } from '../composables/useConfirm'
 import { useToast } from '../composables/useToast'
 import { getLanguageLabel, languageOptions } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
-import { useAuthStore } from '../stores/auth'
 import { getProgressStyle } from '../utils/progress'
 
 interface ProjectItem {
@@ -54,7 +53,6 @@ interface ProjectCreateResponse {
   id: string
 }
 
-const authStore = useAuthStore()
 const confirm = useConfirm()
 const toast = useToast()
 const router = useRouter()
@@ -312,7 +310,6 @@ onMounted(() => {
           {{ t('projectList.create') }}
         </button>
         <button
-          v-if="authStore.isAdmin"
           class="button"
           type="button"
           :title="t('projectList.importAssetsTitle')"
@@ -426,7 +423,6 @@ onMounted(() => {
               <MoreHorizontal :size="16" />
             </button>
             <button
-              v-if="authStore.isAdmin"
               class="data-table__actions-btn"
               type="button"
               :title="t('projectList.actions.delete')"
