@@ -13,7 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.models import TranslationMemory
+from app.models import MemoryEntry
 from app.schemas import MatchResult
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
 from app.services.tm_vector import (
@@ -108,7 +108,7 @@ def get_tm_candidates(
 
     # 先检查精确匹配（hash 完全相同）
     normalized_collection_ids = _normalize_collection_ids(collection_ids)
-    exact_stmt = select(TranslationMemory).where(TranslationMemory.source_hash == source_hash)
+    exact_stmt = select(MemoryEntry).where(MemoryEntry.source_hash == source_hash)
     exact_stmt = _apply_collection_filter(exact_stmt, normalized_collection_ids)
     exact_match = db.execute(exact_stmt).scalars().first()
 
@@ -149,7 +149,7 @@ def get_tm_candidates(
             tm.target_text,
             tm.source_normalized,
             similarity(tm.source_normalized, :query_text) AS trigram_score
-        FROM translation_memory AS tm
+        FROM memory_entries AS tm
         WHERE tm.source_normalized IS NOT NULL
           AND tm.source_normalized % :query_text
           {collection_filter_sql}
@@ -417,9 +417,9 @@ def _find_exact_matches(
     sentences: Iterable[PreparedSentence],
     collection_ids: list[UUID] | None = None,
 ) -> tuple[
-    dict[str, TranslationMemory],
-    dict[str, TranslationMemory],
-    dict[str, TranslationMemory],
+    dict[str, MemoryEntry],
+    dict[str, MemoryEntry],
+    dict[str, MemoryEntry],
 ]:
     sentences = list(sentences)
     source_hashes = [
@@ -447,26 +447,26 @@ def _find_exact_matches(
     if not source_hashes and not normalized_candidates and not source_text_candidates:
         return {}, {}, {}
 
-    matches_by_hash: dict[str, TranslationMemory] = {}
-    matches_by_normalized: dict[str, TranslationMemory] = {}
-    matches_by_source_text: dict[str, TranslationMemory] = {}
+    matches_by_hash: dict[str, MemoryEntry] = {}
+    matches_by_normalized: dict[str, MemoryEntry] = {}
+    matches_by_source_text: dict[str, MemoryEntry] = {}
     normalized_collection_ids = _normalize_collection_ids(collection_ids)
     for chunk in _chunked(source_hashes, EXACT_MATCH_BATCH_SIZE):
-        stmt = select(TranslationMemory).where(TranslationMemory.source_hash.in_(chunk))
+        stmt = select(MemoryEntry).where(MemoryEntry.source_hash.in_(chunk))
         stmt = _apply_collection_filter(stmt, normalized_collection_ids)
         for match in db.execute(stmt).scalars():
             matches_by_hash.setdefault(match.source_hash, match)
 
     for chunk in _chunked(normalized_candidates, EXACT_MATCH_BATCH_SIZE):
-        stmt = select(TranslationMemory).where(
-            TranslationMemory.source_normalized.in_(chunk)
+        stmt = select(MemoryEntry).where(
+            MemoryEntry.source_normalized.in_(chunk)
         )
         stmt = _apply_collection_filter(stmt, normalized_collection_ids)
         for match in db.execute(stmt).scalars():
             matches_by_normalized.setdefault(match.source_normalized, match)
 
     for chunk in _chunked(source_text_candidates, EXACT_MATCH_BATCH_SIZE):
-        stmt = select(TranslationMemory).where(TranslationMemory.source_text.in_(chunk))
+        stmt = select(MemoryEntry).where(MemoryEntry.source_text.in_(chunk))
         stmt = _apply_collection_filter(stmt, normalized_collection_ids)
         for match in db.execute(stmt).scalars():
             matches_by_source_text.setdefault(match.source_text, match)
@@ -551,7 +551,7 @@ def _find_fuzzy_matches_chunk(
                 tm.source_text,
                 tm.target_text,
                 similarity(tm.source_normalized, input.query_text) AS trigram_score
-            FROM translation_memory AS tm
+            FROM memory_entries AS tm
             WHERE tm.source_normalized IS NOT NULL
               AND tm.source_normalized % input.query_text
               {collection_filter_sql}
@@ -701,7 +701,7 @@ def _merge_vector_candidates(
                 tm.source_text,
                 tm.target_text,
                 1 - (tm.source_embedding <=> input.query_vector) AS vector_score
-            FROM translation_memory AS tm
+            FROM memory_entries AS tm
             WHERE tm.source_embedding IS NOT NULL
               AND tm.source_embedding_version = :embedding_version
               AND 1 - (tm.source_embedding <=> input.query_vector) >= :vector_similarity_floor
@@ -837,7 +837,7 @@ def _normalize_collection_ids(collection_ids: list[UUID] | None) -> list[UUID] |
 def _apply_collection_filter(stmt, collection_ids: list[UUID] | None):
     if not collection_ids:
         return stmt
-    return stmt.where(TranslationMemory.collection_id.in_(collection_ids))
+    return stmt.where(MemoryEntry.collection_id.in_(collection_ids))
 
 
 def _chunked(items: list[T], chunk_size: int) -> list[list[T]]:

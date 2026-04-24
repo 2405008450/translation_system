@@ -229,3 +229,54 @@ class DitaExporter:
             return True
         except etree.XMLSyntaxError:
             return False
+
+    def export_with_translations(
+        self,
+        original_bytes: bytes,
+        translations: Dict[str, str],
+    ) -> bytes:
+        """基于原始文件和翻译映射导出
+        
+        Args:
+            original_bytes: 原始文件字节
+            translations: source_text -> target_text 映射
+            
+        Returns:
+            bytes: 导出的 DITA XML 字节
+        """
+        parser = etree.XMLParser(remove_blank_text=False, recover=True)
+        root = etree.fromstring(original_bytes, parser=parser)
+        
+        # 遍历所有文本节点并替换
+        self._replace_text_content(root, translations)
+        
+        return etree.tostring(
+            root,
+            encoding="UTF-8",
+            xml_declaration=True,
+            pretty_print=True,
+        )
+
+    def _replace_text_content(
+        self,
+        element: etree._Element,
+        translations: Dict[str, str],
+    ) -> None:
+        """递归替换元素中的文本内容"""
+        # 跳过 conref
+        if element.get("conref"):
+            return
+        
+        # 替换元素的直接文本
+        if element.text and element.text.strip():
+            text = element.text.strip()
+            if text in translations:
+                # 保留原始空白
+                original = element.text
+                leading = original[:len(original) - len(original.lstrip())]
+                trailing = original[len(original.rstrip()):]
+                element.text = leading + translations[text] + trailing
+        
+        # 递归处理子元素
+        for child in element:
+            self._replace_text_content(child, translations)

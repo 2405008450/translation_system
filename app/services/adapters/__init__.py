@@ -71,6 +71,26 @@ from app.services.adapters.yaml_adapter import YamlAdapter
 from app.services.adapters.json_adapter import JsonAdapter
 from app.services.adapters.php_adapter import PhpAdapter
 
+# V4 适配器 - 本地化和排版文件
+from app.services.adapters.html_adapter import HtmlAdapter
+from app.services.adapters.properties_adapter import PropertiesAdapter
+from app.services.adapters.po_adapter import PoAdapter
+from app.services.adapters.strings_adapter import StringsAdapter
+from app.services.adapters.markdown_adapter import MarkdownAdapter
+from app.services.adapters.srt_adapter import SrtAdapter
+from app.services.adapters.csv_adapter import CsvAdapter
+
+# V5 适配器 - 双语文件和工程文件
+from app.services.adapters.sdlxliff_adapter import SdlxliffAdapter
+from app.services.adapters.txml_adapter import TxmlAdapter
+from app.services.adapters.dxf_adapter import DxfAdapter
+from app.services.adapters.zip_adapter import ZipAdapter
+
+# V6 适配器 - 复杂格式
+from app.services.adapters.idml_adapter import IdmlAdapter
+from app.services.adapters.mif_adapter import MifAdapter
+from app.services.adapters.rar_adapter import RarAdapter
+
 # V2 导出器
 from app.services.adapters.dita_exporter import DitaExporter
 from app.services.adapters.svg_exporter import SvgExporter
@@ -78,6 +98,39 @@ from app.services.adapters.svg_exporter import SvgExporter
 # V3 导出器 - 行业标准格式
 from app.services.adapters.tmx_exporter import TmxExporter
 from app.services.adapters.xliff_exporter import XliffExporter, XliffImporter
+
+# V4 导出器 - 本地化和排版文件
+from app.services.adapters.html_exporter import HtmlExporter
+from app.services.adapters.properties_exporter import PropertiesExporter
+from app.services.adapters.po_exporter import PoExporter
+from app.services.adapters.strings_exporter import StringsExporter
+from app.services.adapters.markdown_exporter import MarkdownExporter
+from app.services.adapters.srt_exporter import SrtExporter
+from app.services.adapters.csv_exporter import CsvExporter
+
+# V5 导出器 - 双语文件和工程文件
+from app.services.adapters.sdlxliff_exporter import SdlxliffExporter
+from app.services.adapters.txml_exporter import TxmlExporter
+from app.services.adapters.dxf_exporter import DxfExporter
+from app.services.adapters.zip_exporter import ZipExporter
+
+# V6 导出器 - 复杂格式
+from app.services.adapters.idml_exporter import IdmlExporter
+from app.services.adapters.mif_exporter import MifExporter
+from app.services.adapters.rar_exporter import RarExporter
+
+# V7 多格式导出服务
+from app.services.adapters.export_formats import (
+    EXPORT_OPTIONS,
+    FORMAT_EXPORT_SUPPORT,
+    get_supported_exports,
+    get_export_option,
+)
+from app.services.adapters.multi_format_exporter import (
+    MultiFormatExporter,
+    get_export_options_for_file,
+    export_file,
+)
 
 
 def _register_default_adapters() -> None:
@@ -99,6 +152,26 @@ def _register_default_adapters() -> None:
     registry.register(YamlAdapter())
     registry.register(JsonAdapter())
     registry.register(PhpAdapter())
+    
+    # V4 适配器 - 本地化和排版文件
+    registry.register(HtmlAdapter())
+    registry.register(PropertiesAdapter())
+    registry.register(PoAdapter())
+    registry.register(StringsAdapter())
+    registry.register(MarkdownAdapter())
+    registry.register(SrtAdapter())
+    registry.register(CsvAdapter())
+    
+    # V5 适配器 - 双语文件和工程文件
+    registry.register(SdlxliffAdapter())
+    registry.register(TxmlAdapter())
+    registry.register(DxfAdapter())
+    registry.register(ZipAdapter())
+    
+    # V6 适配器 - 复杂格式
+    registry.register(IdmlAdapter())
+    registry.register(MifAdapter())
+    registry.register(RarAdapter())
 
 
 # 自动注册默认适配器
@@ -129,6 +202,26 @@ __all__ = [
     "JsonAdapter",
     "PhpAdapter",
     
+    # V4 适配器
+    "HtmlAdapter",
+    "PropertiesAdapter",
+    "PoAdapter",
+    "StringsAdapter",
+    "MarkdownAdapter",
+    "SrtAdapter",
+    "CsvAdapter",
+    
+    # V5 适配器
+    "SdlxliffAdapter",
+    "TxmlAdapter",
+    "DxfAdapter",
+    "ZipAdapter",
+    
+    # V6 适配器
+    "IdmlAdapter",
+    "MifAdapter",
+    "RarAdapter",
+    
     # V2 导出器
     "DitaExporter",
     "SvgExporter",
@@ -137,6 +230,35 @@ __all__ = [
     "TmxExporter",
     "XliffExporter",
     "XliffImporter",
+    
+    # V4 导出器 - 本地化和排版文件
+    "HtmlExporter",
+    "PropertiesExporter",
+    "PoExporter",
+    "StringsExporter",
+    "MarkdownExporter",
+    "SrtExporter",
+    "CsvExporter",
+    
+    # V5 导出器 - 双语文件和工程文件
+    "SdlxliffExporter",
+    "TxmlExporter",
+    "DxfExporter",
+    "ZipExporter",
+    
+    # V6 导出器 - 复杂格式
+    "IdmlExporter",
+    "MifExporter",
+    "RarExporter",
+    
+    # V7 多格式导出服务
+    "EXPORT_OPTIONS",
+    "FORMAT_EXPORT_SUPPORT",
+    "get_supported_exports",
+    "get_export_option",
+    "MultiFormatExporter",
+    "get_export_options_for_file",
+    "export_file",
     
     # 数据模型
     "DocumentAST",

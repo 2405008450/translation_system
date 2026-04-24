@@ -10,6 +10,7 @@ import SegmentEditorRow from '../components/SegmentEditorRow.vue'
 import SplitPreviewPanel from '../components/SplitPreviewPanel.vue'
 import TMMatchPanel from '../components/TMMatchPanel.vue'
 import VirtualList from '../components/VirtualList.vue'
+import { http } from '../api/http'
 import { useAuthStore } from '../stores/auth'
 import { useCommentStore } from '../stores/comment'
 import { useSegmentStore } from '../stores/segment'
@@ -72,6 +73,38 @@ const llmScope = ref<LLMTranslateScope>('all')
 const llmProvider = ref<LLMProvider>('auto')
 const itemHeight = ref(resolveItemHeight())
 const activeTool = ref<ToolKey | null>(null)
+
+// 导出相关状态
+const showExportMenu = ref(false)
+const exportOptions = ref<Array<{ id: string; name: string; description: string; extension: string }>>([])
+const loadingExportOptions = ref(false)
+const exporting = ref(false)
+
+// 导出格式映射（用于原格式导出按钮显示）
+const exportFormatMap: Record<string, { format: string; label: string; note?: string }> = {
+  '.rar': { format: 'zip', label: 'ZIP', note: 'RAR 将转换为 ZIP' },
+  '.pdf': { format: 'docx', label: 'DOCX', note: 'PDF 将转换为 DOCX' },
+}
+
+const exportInfo = computed(() => {
+  const filename = segmentStore.fileRecord?.filename || ''
+  const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase()
+  
+  if (exportFormatMap[ext]) {
+    return exportFormatMap[ext]
+  }
+  
+  // 默认导出原格式
+  const format = ext.replace('.', '').toUpperCase() || 'DOCX'
+  return { format: ext.replace('.', ''), label: format }
+})
+
+// 是否为 Office 格式（Office 格式只支持原格式导出）
+const isOfficeFormat = computed(() => {
+  const filename = segmentStore.fileRecord?.filename || ''
+  const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase()
+  return ['.docx', '.xlsx', '.pptx', '.pdf'].includes(ext)
+})
 
 function resolveItemHeight() {
   if (window.innerWidth <= 720) {
@@ -307,6 +340,88 @@ async function exportDocx() {
   }
 }
 
+async function loadExportOptions() {
+  if (!segmentStore.fileRecord) return
+  
+  loadingExportOptions.value = true
+  try {
+    const { data } = await http.get(`/file-records/${segmentStore.fileRecord.id}/export-options`)
+    exportOptions.value = data.export_options || []
+  } catch (error) {
+    console.error('加载导出选项失败:', error)
+    exportOptions.value = []
+  } finally {
+    loadingExportOptions.value = false
+  }
+}
+
+async function toggleExportMenu() {
+  if (showExportMenu.value) {
+    showExportMenu.value = false
+    return
+  }
+  
+  // 加载导出选项
+  await loadExportOptions()
+  showExportMenu.value = true
+}
+
+async function exportWithType(exportType: string) {
+  if (!segmentStore.fileRecord) return
+  
+  pageError.value = ''
+  exporting.value = true
+  showExportMenu.value = false
+  
+  try {
+    const response = await http.get(
+      `/file-records/${segmentStore.fileRecord.id}/export/${exportType}`,
+      { responseType: 'blob' }
+    )
+    
+    // 从响应头获取文件名
+    const contentDisposition = response.headers['content-disposition']
+    let filename = `export.${exportType}`
+    if (contentDisposition) {
+      const filenameMatch = contentDisposition.match(/filename\*=UTF-8''(.+?)(?:;|$)/)
+      if (filenameMatch) {
+        filename = decodeURIComponent(filenameMatch[1])
+      } else {
+        const simpleMatch = contentDisposition.match(/filename="?(.+?)"?(?:;|$)/)
+        if (simpleMatch) {
+          filename = simpleMatch[1]
+        }
+      }
+    }
+    
+    // 下载文件
+    const url = window.URL.createObjectURL(new Blob([response.data]))
+    const link = document.createElement('a')
+    link.href = url
+    link.setAttribute('download', filename)
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    window.URL.revokeObjectURL(url)
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      pageError.value = String(error.response?.data?.detail || '导出失败。')
+      return
+    }
+    pageError.value = error instanceof Error ? error.message : '导出失败。'
+  } finally {
+    exporting.value = false
+  }
+}
+
+// 点击外部关闭导出菜单
+function handleClickOutside(event: MouseEvent) {
+  const target = event.target as HTMLElement
+  if (!target.closest('.export-dropdown')) {
+    showExportMenu.value = false
+  }
+}
+
 async function handleCommentDraft(draft: CommentAnchorDraft) {
   commentStore.setDraftAnchor(draft)
   commentStore.setActiveComment(null)
@@ -399,11 +514,13 @@ watch(() => props.id, () => {
 
 onMounted(() => {
   window.addEventListener('resize', handleResize)
+  document.addEventListener('click', handleClickOutside)
   void loadTask()
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
+  document.removeEventListener('click', handleClickOutside)
   commentStore.stopPolling()
 })
 
@@ -433,9 +550,40 @@ onBeforeRouteLeave(async () => {
             <Save v-else />
             {{ segmentStore.saving ? '保存中...' : '立即保存' }}
           </button>
-          <button class="button" type="button" @click="exportDocx">
-            <Download /> 导出 DOCX
-          </button>
+          
+          <!-- 导出按钮组 -->
+          <div v-if="isOfficeFormat" class="export-single">
+            <button class="button" type="button" :title="exportInfo.note" @click="exportDocx">
+              <Download /> 导出 {{ exportInfo.label }}
+            </button>
+          </div>
+          <div v-else class="export-dropdown">
+            <button 
+              class="button" 
+              type="button" 
+              :disabled="exporting || loadingExportOptions"
+              @click.stop="toggleExportMenu"
+            >
+              <Loader2 v-if="exporting || loadingExportOptions" class="lucide-spin" />
+              <Download v-else />
+              {{ exporting ? '导出中...' : '导出' }}
+              <span class="dropdown-arrow">▼</span>
+            </button>
+            <div v-if="showExportMenu" class="export-menu">
+              <div 
+                v-for="option in exportOptions" 
+                :key="option.id"
+                class="export-menu-item"
+                @click="exportWithType(option.id)"
+              >
+                <span class="export-menu-name">{{ option.name }}</span>
+                <span class="export-menu-ext">{{ option.extension }}</span>
+              </div>
+              <div v-if="exportOptions.length === 0" class="export-menu-empty">
+                暂无可用导出格式
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 

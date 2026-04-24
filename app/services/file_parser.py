@@ -15,7 +15,17 @@ from app.services.document_workspace import parse_docx_workspace
 
 
 # 支持的文件扩展名
-SUPPORTED_EXTENSIONS = {".txt", ".docx", ".pdf", ".pptx", ".dita", ".ditamap", ".xml", ".svg", ".yaml", ".yml", ".json", ".php"}
+SUPPORTED_EXTENSIONS = {
+    ".txt", ".docx", ".pdf", ".pptx", ".dita", ".ditamap", ".xml", ".svg",
+    ".yaml", ".yml", ".json", ".php",
+    # V4 新增格式
+    ".html", ".htm", ".properties", ".po", ".pot", ".strings",
+    ".md", ".markdown", ".srt", ".csv",
+    # V5 新增格式
+    ".sdlxliff", ".txml", ".dxf", ".zip",
+    # V6 新增格式
+    ".idml", ".mif", ".rar",
+}
 
 
 async def parse_uploaded_file(upload_file: UploadFile) -> str:

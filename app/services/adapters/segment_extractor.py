@@ -11,8 +11,24 @@ from app.services.adapters.models import BlockNode, DocumentAST, NodeType, Segme
 
 
 # 句子结束标点
-SENTENCE_ENDINGS = "。？！!?."
+SENTENCE_ENDINGS = "。？！!?"
+# 英文句号需要特殊处理，避免在序号后分割
+ENGLISH_PERIOD = "."
 TRAILING_CLOSERS = '"\'\"\'》】）)]」』'
+
+# 序号模式：数字+点、字母+点、罗马数字+点
+# 例如: 1. 2. 3. | a. b. c. | i. ii. iii. | A. B. C.
+NUMBER_PREFIX_PATTERN = re.compile(
+    r'^(\d+|[a-zA-Z]|[ivxIVX]+)\.\s*$'
+)
+
+# 常见英文缩写（不应在其后分句）
+COMMON_ABBREVIATIONS = {
+    'mr', 'mrs', 'ms', 'dr', 'prof', 'sr', 'jr', 'vs', 'etc', 'inc', 'ltd', 'co',
+    'st', 'ave', 'blvd', 'rd', 'apt', 'no', 'vol', 'pp', 'ed', 'eds', 'trans',
+    'fig', 'figs', 'approx', 'dept', 'est', 'govt', 'intl', 'natl', 'univ',
+    'e.g', 'i.e', 'cf', 'al', 'et',
+}
 
 
 class SegmentExtractor:
@@ -96,12 +112,55 @@ class SegmentExtractor:
         while i < len(text):
             char = text[i]
             
+            # 检查是否是句子结束标点
+            is_sentence_end = False
+            
             if char in SENTENCE_ENDINGS:
+                is_sentence_end = True
+            elif char == ENGLISH_PERIOD:
+                # 英文句号需要特殊处理
+                # 检查是否是序号后的点（如 "1." "a." "i."）
+                prefix = text[start:i+1].strip()
+                if NUMBER_PREFIX_PATTERN.match(prefix):
+                    # 这是序号，不分割
+                    is_sentence_end = False
+                else:
+                    # 检查是否是缩写
+                    # 找到点号前的单词
+                    word_before = ""
+                    j = i - 1
+                    while j >= start and (text[j].isalpha() or text[j] == '.'):
+                        word_before = text[j] + word_before
+                        j -= 1
+                    word_before = word_before.rstrip('.')
+                    
+                    if word_before.lower() in COMMON_ABBREVIATIONS:
+                        # 这是缩写，不分割
+                        is_sentence_end = False
+                    elif i + 1 >= len(text):
+                        # 文本结束
+                        is_sentence_end = True
+                    elif i + 1 < len(text) and text[i + 1] in ' \n\r\t':
+                        # 点号后有空格
+                        # 检查是否是纯数字序号
+                        before_dot = text[start:i].strip()
+                        if before_dot and before_dot[-1].isdigit():
+                            words = before_dot.split()
+                            if words and words[-1].isdigit():
+                                is_sentence_end = False
+                            else:
+                                is_sentence_end = True
+                        else:
+                            is_sentence_end = True
+                    else:
+                        is_sentence_end = False
+            
+            if is_sentence_end:
                 # 找到句子结束标点
                 end = i + 1
                 
                 # 跳过连续的结束标点
-                while end < len(text) and text[end] in SENTENCE_ENDINGS:
+                while end < len(text) and text[end] in SENTENCE_ENDINGS + ENGLISH_PERIOD:
                     end += 1
                 
                 # 跳过尾随的引号等

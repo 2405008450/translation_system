@@ -4,7 +4,7 @@ import csv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from app.models import TranslationMemory
+from app.models import MemoryEntry
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
 
 
@@ -40,7 +40,7 @@ def main() -> None:
                     continue
 
                 session.add(
-                    TranslationMemory(
+                    MemoryEntry(
                         source_text=source_text,
                         target_text=target_text,
                         source_hash=build_source_hash(source_text),

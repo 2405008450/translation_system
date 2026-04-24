@@ -525,6 +525,73 @@ button {
   align-items: flex-start;
 }
 
+/* 导出下拉菜单样式 */
+.export-dropdown {
+  position: relative;
+  display: inline-block;
+}
+
+.export-dropdown .dropdown-arrow {
+  font-size: 10px;
+  margin-left: 4px;
+  opacity: 0.7;
+}
+
+.export-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 4px;
+  min-width: 200px;
+  background: var(--surface-0);
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  box-shadow: var(--shadow-medium);
+  z-index: 100;
+  overflow: hidden;
+}
+
+.export-menu-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 14px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.export-menu-item:hover {
+  background: var(--brand-050);
+}
+
+.export-menu-item:not(:last-child) {
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.export-menu-name {
+  font-size: 14px;
+  color: var(--ink-900);
+}
+
+.export-menu-ext {
+  font-size: 12px;
+  color: var(--ink-500);
+  background: var(--slate-050);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.export-menu-empty {
+  padding: 16px;
+  text-align: center;
+  color: var(--ink-500);
+  font-size: 13px;
+}
+
+.export-single {
+  display: inline-block;
+}
+
 .panel-header--compact {
   margin-bottom: 14px;
 }

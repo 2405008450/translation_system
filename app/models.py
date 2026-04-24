@@ -109,6 +109,7 @@ class Segment(Base):
 
     file_record: Mapped["FileRecord"] = relationship("FileRecord", back_populates="segments")
     comments: Mapped[list["SegmentComment"]] = relationship("SegmentComment", back_populates="segment")
+    history: Mapped[list["SegmentHistory"]] = relationship("SegmentHistory", back_populates="segment")
 
 
 class SegmentComment(Base):
@@ -180,11 +181,51 @@ class SegmentComment(Base):
     )
 
 
-class TMCollection(Base):
-    __tablename__ = "tm_collections"
+class SegmentHistory(Base):
+    __tablename__ = "segment_history"
     __table_args__ = (
-        Index("uq_tm_collections_name", "name", unique=True),
+        Index("ix_segment_history_segment_id", "segment_id"),
+        Index("ix_segment_history_file_record_id", "file_record_id"),
     )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    segment_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("segments.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    file_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sentence_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    source_text: Mapped[str] = mapped_column(Text, nullable=False)
+    target_text: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    source: Mapped[str] = mapped_column(String(20), nullable=False)
+    confirm_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    operator_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+
+    segment: Mapped["Segment"] = relationship("Segment", back_populates="history")
+    file_record: Mapped["FileRecord"] = relationship("FileRecord")
+    operator: Mapped["User | None"] = relationship("User")
+
+
+class MemoryBase(Base):
+    __tablename__ = "memory_bases"
 
     id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -194,6 +235,8 @@ class TMCollection(Base):
     )
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_language: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    target_language: Mapped[str | None] = mapped_column(String(10), nullable=True)
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -204,17 +247,14 @@ class TMCollection(Base):
         nullable=False,
     )
 
-    translation_memories: Mapped[list["TranslationMemory"]] = relationship(
-        "TranslationMemory",
+    entries: Mapped[list["MemoryEntry"]] = relationship(
+        "MemoryEntry",
         back_populates="collection",
     )
 
 
-class TermbaseCollection(Base):
-    __tablename__ = "termbase_collections"
-    __table_args__ = (
-        Index("uq_termbase_collections_name", "name", unique=True),
-    )
+class TermBase(Base):
+    __tablename__ = "term_bases"
 
     id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -224,6 +264,8 @@ class TermbaseCollection(Base):
     )
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_language: Mapped[str] = mapped_column(String(10), nullable=False)
+    target_language: Mapped[str] = mapped_column(String(10), nullable=False)
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -234,19 +276,19 @@ class TermbaseCollection(Base):
         nullable=False,
     )
 
-    terms: Mapped[list["Term"]] = relationship(
-        "Term",
-        back_populates="collection",
+    entries: Mapped[list["TermEntry"]] = relationship(
+        "TermEntry",
+        back_populates="term_base",
     )
 
 
-class Term(Base):
-    __tablename__ = "terms"
+class TermEntry(Base):
+    __tablename__ = "term_entries"
     __table_args__ = (
-        Index("ix_terms_collection_id", "collection_id"),
-        Index("ix_terms_source_text", "source_text"),
+        Index("ix_term_entries_term_base_id", "term_base_id"),
+        Index("ix_term_entries_source_text", "source_text"),
         Index(
-            "ix_terms_source_text_trgm",
+            "ix_term_entries_source_text_trgm",
             "source_text",
             postgresql_using="gin",
             postgresql_ops={"source_text": "gin_trgm_ops"},
@@ -259,13 +301,16 @@ class Term(Base):
         default=uuid.uuid4,
         server_default=UUID_SQL_DEFAULT,
     )
-    collection_id: Mapped[uuid.UUID | None] = mapped_column(
+    term_base_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("termbase_collections.id", ondelete="SET NULL"),
-        nullable=True,
+        ForeignKey("term_bases.id", ondelete="CASCADE"),
+        nullable=False,
     )
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
     target_text: Mapped[str] = mapped_column(Text, nullable=False)
+    source_normalized: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_language: Mapped[str] = mapped_column(String(10), nullable=False)
+    target_language: Mapped[str] = mapped_column(String(10), nullable=False)
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -276,33 +321,33 @@ class Term(Base):
         nullable=False,
     )
 
-    collection: Mapped[TermbaseCollection | None] = relationship(
-        "TermbaseCollection",
-        back_populates="terms",
+    term_base: Mapped[TermBase] = relationship(
+        "TermBase",
+        back_populates="entries",
     )
 
 
-class TranslationMemory(Base):
-    __tablename__ = "translation_memory"
+class MemoryEntry(Base):
+    __tablename__ = "memory_entries"
     __table_args__ = (
-        Index("ix_translation_memory_collection_id", "collection_id"),
-        Index("ix_translation_memory_collection_source_hash", "collection_id", "source_hash"),
+        Index("ix_memory_entries_collection_id", "collection_id"),
+        Index("ix_memory_entries_collection_source_hash", "collection_id", "source_hash"),
         Index(
-            "ix_translation_memory_collection_source_normalized",
+            "ix_memory_entries_collection_source_normalized",
             "collection_id",
             "source_normalized",
         ),
-        Index("ix_translation_memory_source_hash", "source_hash"),
-        Index("ix_translation_memory_source_text", "source_text"),
-        Index("ix_translation_memory_source_normalized", "source_normalized"),
+        Index("ix_memory_entries_source_hash", "source_hash"),
+        Index("ix_memory_entries_source_text", "source_text"),
+        Index("ix_memory_entries_source_normalized", "source_normalized"),
         Index(
-            "ix_translation_memory_source_text_trgm",
+            "ix_memory_entries_source_text_trgm",
             "source_text",
             postgresql_using="gin",
             postgresql_ops={"source_text": "gin_trgm_ops"},
         ),
         Index(
-            "ix_translation_memory_source_normalized_trgm",
+            "ix_memory_entries_source_normalized_trgm",
             "source_normalized",
             postgresql_using="gin",
             postgresql_ops={"source_normalized": "gin_trgm_ops"},
@@ -317,24 +362,26 @@ class TranslationMemory(Base):
     )
     collection_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("tm_collections.id", ondelete="SET NULL"),
+        ForeignKey("memory_bases.id", ondelete="SET NULL"),
         nullable=True,
     )
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
     target_text: Mapped[str] = mapped_column(Text, nullable=False)
     source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     source_normalized: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_language: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    target_language: Mapped[str | None] = mapped_column(String(10), nullable=True)
     created_at: Mapped[DateTime] = mapped_column(
-        DateTime(timezone=False), server_default=func.now(), nullable=False
+        DateTime(timezone=False), server_default=func.now(), nullable=True
     )
     updated_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False),
         server_default=func.now(),
         onupdate=func.now(),
-        nullable=False,
+        nullable=True,
     )
 
-    collection: Mapped[TMCollection | None] = relationship(
-        "TMCollection",
-        back_populates="translation_memories",
+    collection: Mapped[MemoryBase | None] = relationship(
+        "MemoryBase",
+        back_populates="entries",
     )

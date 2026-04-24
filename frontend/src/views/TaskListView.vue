@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { Upload, Loader2, ArrowRight, Trash2 } from 'lucide-vue-next'
+import { Upload, Loader2, ArrowRight, Trash2, ChevronUp } from 'lucide-vue-next'
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
@@ -19,6 +19,47 @@ const pageError = ref('')
 const tmCollections = ref<TMCollection[]>([])
 const loadingCollections = ref(false)
 const selectedCollectionIds = ref<string[]>([])
+const showFormatDetails = ref(false)
+
+// 支持的文件格式分类（共30种格式）
+const formatCategories = {
+  office: {
+    label: '办公文档',
+    formats: ['docx', 'txt', 'pdf', 'pptx', 'xlsx'],
+  },
+  localization: {
+    label: '本地化文件',
+    formats: ['properties', 'po', 'pot', 'strings', 'yaml', 'yml', 'json', 'php'],
+  },
+  web: {
+    label: '网页/排版',
+    formats: ['html', 'htm', 'md', 'markdown', 'csv', 'srt'],
+  },
+  technical: {
+    label: '技术写作',
+    formats: ['dita', 'ditamap', 'xml', 'svg'],
+  },
+  bilingual: {
+    label: '双语文件',
+    formats: ['sdlxliff', 'txml', 'xliff', 'xlf', 'tmx'],
+  },
+  engineering: {
+    label: '工程/设计',
+    formats: ['dxf', 'idml', 'mif'],
+  },
+  archive: {
+    label: '压缩包',
+    formats: ['zip', 'rar'],
+  },
+}
+
+// 所有支持的扩展名（用于 accept 属性）
+const allExtensions = Object.values(formatCategories)
+  .flatMap(cat => cat.formats)
+  .map(ext => `.${ext}`)
+  .join(',')
+
+const commonFormatsText = 'docx, txt, pdf, html, json, yaml 等 30 种格式'
 
 function formatTime(value: string) {
   return new Date(value).toLocaleString('zh-CN', { hour12: false })
@@ -121,8 +162,31 @@ onMounted(() => {
       <div class="section-title">上传新任务</div>
       <div class="upload-form upload-form--inline upload-form--task">
         <label class="field">
-          <span class="field__label">DOCX 文件</span>
-          <input id="upload-file" class="field__control" type="file" accept=".docx" @change="onFileChange" />
+          <span class="field__label">
+            上传文件
+            <span class="format-hint">
+              <span class="format-hint__summary">
+                支持的文件类型：{{ commonFormatsText }}
+                <button type="button" class="format-hint__toggle" @click.prevent="showFormatDetails = !showFormatDetails">
+                  {{ showFormatDetails ? '收起' : '更多' }}
+                  <ChevronUp :class="['format-hint__icon', { 'is-expanded': showFormatDetails }]" :size="14" />
+                </button>
+              </span>
+              <Transition name="format-expand">
+                <div v-if="showFormatDetails" class="format-hint__details">
+                  <div v-for="(category, key) in formatCategories" :key="key" class="format-category">
+                    <span class="format-category__label">{{ category.label }}：</span>
+                    <span class="format-category__list">{{ category.formats.join(', ') }}</span>
+                  </div>
+                  <div class="format-note">
+                    <span class="format-note__icon">ℹ️</span>
+                    <span>RAR 压缩包导出时将转换为 ZIP 格式</span>
+                  </div>
+                </div>
+              </Transition>
+            </span>
+          </span>
+          <input id="upload-file" class="field__control" type="file" :accept="allExtensions" @change="onFileChange" />
         </label>
 
         <label class="field field--compact">
@@ -209,3 +273,108 @@ onMounted(() => {
     </section>
   </div>
 </template>
+
+<style scoped>
+.field__label {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.format-hint {
+  font-size: 0.8125rem;
+  font-weight: normal;
+  color: var(--color-text-muted, #6b7280);
+  position: relative;
+}
+
+.format-hint__summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.format-hint__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.125rem;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--color-primary, #3b82f6);
+  font-size: inherit;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.format-hint__toggle:hover {
+  text-decoration: underline;
+}
+
+.format-hint__icon {
+  transition: transform 0.2s ease;
+  transform: rotate(180deg);
+}
+
+.format-hint__icon.is-expanded {
+  transform: rotate(0deg);
+}
+
+.format-hint__details {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  margin-bottom: 0.5rem;
+  padding: 0.75rem 1rem;
+  background: var(--color-surface, #fff);
+  border: 1px solid var(--color-border, #e5e7eb);
+  border-radius: 0.375rem;
+  box-shadow: 0 -4px 6px -1px rgb(0 0 0 / 0.1), 0 -2px 4px -2px rgb(0 0 0 / 0.1);
+  z-index: 10;
+  white-space: nowrap;
+}
+
+.format-category {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+  line-height: 1.5;
+}
+
+.format-category__label {
+  color: var(--color-text-muted, #6b7280);
+  white-space: nowrap;
+}
+
+.format-category__list {
+  color: var(--color-text, #374151);
+}
+
+.format-note {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--color-border, #e5e7eb);
+  font-size: 0.75rem;
+  color: var(--color-text-muted, #6b7280);
+}
+
+.format-note__icon {
+  font-size: 0.875rem;
+}
+
+/* 展开动画 */
+.format-expand-enter-active,
+.format-expand-leave-active {
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.format-expand-enter-from,
+.format-expand-leave-to {
+  opacity: 0;
+  transform: translateY(0.5rem);
+}
+</style>

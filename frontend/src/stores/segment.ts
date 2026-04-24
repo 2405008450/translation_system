@@ -375,13 +375,37 @@ export const useSegmentStore = defineStore('segment', () => {
       await syncToBackend()
     }
 
-    const response = await http.get(`/file-records/${fileRecord.value.id}/export-docx`, {
+    const response = await http.get(`/file-records/${fileRecord.value.id}/export`, {
       responseType: 'blob',
     })
+    
+    // 从响应头获取文件名，或根据原文件名生成
+    const contentDisposition = response.headers['content-disposition']
+    let downloadFilename = ''
+    
+    if (contentDisposition) {
+      const filenameMatch = contentDisposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';\n]+)["']?/i)
+      if (filenameMatch) {
+        downloadFilename = decodeURIComponent(filenameMatch[1])
+      }
+    }
+    
+    if (!downloadFilename) {
+      // 根据原文件名生成导出文件名
+      const originalName = fileRecord.value.filename
+      const lastDot = originalName.lastIndexOf('.')
+      const baseName = lastDot > 0 ? originalName.substring(0, lastDot) : originalName
+      const ext = lastDot > 0 ? originalName.substring(lastDot) : '.docx'
+      
+      // RAR 导出为 ZIP
+      const exportExt = ext.toLowerCase() === '.rar' ? '.zip' : ext
+      downloadFilename = `${baseName}-translated${exportExt}`
+    }
+    
     const blobUrl = window.URL.createObjectURL(response.data)
     const link = document.createElement('a')
     link.href = blobUrl
-    link.download = `${fileRecord.value.filename.replace(/\.docx$/i, '') || 'translated'}-translated.docx`
+    link.download = downloadFilename
     document.body.appendChild(link)
     link.click()
     link.remove()

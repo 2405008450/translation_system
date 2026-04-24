@@ -120,8 +120,12 @@ class DitaAdapter(FormatAdapter):
         Returns:
             List[BlockNode]: 块级节点列表
         """
+        # 跳过非元素节点（如处理指令、注释等）
+        if not isinstance(element.tag, str):
+            return []
+        
         nodes = []
-        tag = etree.QName(element).localname if isinstance(element.tag, str) else element.tag
+        tag = etree.QName(element).localname
         
         # 检查是否是 conref（内容引用）
         conref = element.get("conref")
@@ -148,7 +152,10 @@ class DitaAdapter(FormatAdapter):
             # 递归处理子元素
             children = []
             for child in element:
-                child_tag = etree.QName(child).localname if isinstance(child.tag, str) else child.tag
+                # 跳过非元素节点
+                if not isinstance(child.tag, str):
+                    continue
+                child_tag = etree.QName(child).localname
                 # 只递归处理块级子元素
                 if child_tag in DITA_ELEMENT_MAP:
                     child_nodes = self._parse_element(child)
@@ -176,6 +183,9 @@ class DitaAdapter(FormatAdapter):
         else:
             # 非映射元素，递归处理子元素
             for child in element:
+                # 跳过非元素节点
+                if not isinstance(child.tag, str):
+                    continue
                 child_nodes = self._parse_element(child)
                 nodes.extend(child_nodes)
         
@@ -199,7 +209,13 @@ class DitaAdapter(FormatAdapter):
         
         # 处理子元素
         for child in element:
-            child_tag = etree.QName(child).localname if isinstance(child.tag, str) else child.tag
+            # 跳过非元素节点（处理指令、注释等）
+            if not isinstance(child.tag, str):
+                if child.tail:
+                    text_parts.append(child.tail)
+                continue
+            
+            child_tag = etree.QName(child).localname
             
             if child_tag in INLINE_ELEMENTS:
                 # 记录内联标签

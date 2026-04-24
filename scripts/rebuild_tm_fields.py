@@ -4,7 +4,7 @@ from uuid import UUID
 from sqlalchemy import and_, create_engine, or_, select
 from sqlalchemy.orm import Session
 
-from app.models import TranslationMemory
+from app.models import MemoryEntry
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
 
 
@@ -33,17 +33,17 @@ def main() -> None:
     with Session(engine) as session:
         while True:
             stmt = (
-                select(TranslationMemory)
-                .order_by(TranslationMemory.created_at.asc(), TranslationMemory.id.asc())
+                select(MemoryEntry)
+                .order_by(MemoryEntry.created_at.asc(), MemoryEntry.id.asc())
                 .limit(args.batch_size)
             )
             if last_created_at is not None and last_id is not None:
                 stmt = stmt.where(
                     or_(
-                        TranslationMemory.created_at > last_created_at,
+                        MemoryEntry.created_at > last_created_at,
                         and_(
-                            TranslationMemory.created_at == last_created_at,
-                            TranslationMemory.id > last_id,
+                            MemoryEntry.created_at == last_created_at,
+                            MemoryEntry.id > last_id,
                         ),
                     )
                 )

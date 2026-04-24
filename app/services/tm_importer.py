@@ -7,7 +7,7 @@ from openpyxl import load_workbook
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from app.models import TranslationMemory
+from app.models import MemoryEntry
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
 from app.services.tm_vector import sync_tm_embeddings
 
@@ -155,22 +155,22 @@ def _flush_tm_batch(
     source_hashes = [row["source_hash"] for row in batch_rows]
     source_texts = [row["source_text"] for row in batch_rows]
     existing_query = (
-        db.query(TranslationMemory)
+        db.query(MemoryEntry)
         .filter(
             or_(
-                TranslationMemory.source_hash.in_(source_hashes),
-                TranslationMemory.source_text.in_(source_texts),
+                MemoryEntry.source_hash.in_(source_hashes),
+                MemoryEntry.source_text.in_(source_texts),
             )
         )
     )
     if collection_id is None:
-        existing_query = existing_query.filter(TranslationMemory.collection_id.is_(None))
+        existing_query = existing_query.filter(MemoryEntry.collection_id.is_(None))
     else:
-        existing_query = existing_query.filter(TranslationMemory.collection_id == collection_id)
+        existing_query = existing_query.filter(MemoryEntry.collection_id == collection_id)
     existing_rows = existing_query.all()
 
-    existing_by_hash: dict[str, TranslationMemory] = {}
-    existing_by_source_text: dict[str, TranslationMemory] = {}
+    existing_by_hash: dict[str, MemoryEntry] = {}
+    existing_by_source_text: dict[str, MemoryEntry] = {}
     for existing in existing_rows:
         if existing.source_hash:
             existing_by_hash.setdefault(existing.source_hash, existing)
@@ -178,13 +178,13 @@ def _flush_tm_batch(
 
     created_rows = 0
     updated_rows = 0
-    sync_candidates: list[TranslationMemory] = []
+    sync_candidates: list[MemoryEntry] = []
     for row in batch_rows:
         existing = existing_by_hash.get(row["source_hash"]) or existing_by_source_text.get(
             row["source_text"]
         )
         if existing is None:
-            tm_row = TranslationMemory(**row)
+            tm_row = MemoryEntry(**row)
             db.add(tm_row)
             sync_candidates.append(tm_row)
             created_rows += 1

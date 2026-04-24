@@ -21,7 +21,7 @@ from pydantic import BaseModel
 
 from app.auth import get_current_user, require_admin
 from app.database import get_db
-from app.models import Segment, Term, TermbaseCollection, TMCollection, TranslationMemory, User
+from app.models import Segment, TermEntry, TermBase, MemoryBase, MemoryEntry, User
 from app.services.comment_service import (
     create_segment_comment,
     create_segment_comment_reply,
@@ -42,6 +42,7 @@ from app.services.document_workspace import (
 )
 from app.services.file_record_service import (
     batch_update_segments,
+    create_file_record_via_adapter,
     create_file_record_with_segments,
     delete_file_record,
     get_file_record as get_file_record_model,
@@ -99,14 +100,18 @@ class LLMTranslateRequest(BaseModel):
     provider: Literal["auto", "deepseek", "openrouter"] = "auto"
 
 
-class TMCollectionPayload(BaseModel):
+class MemoryBasePayload(BaseModel):
     name: str
     description: str | None = None
+    source_language: str | None = None
+    target_language: str | None = None
 
 
-class TermbaseCollectionPayload(BaseModel):
+class TermBasePayload(BaseModel):
     name: str
     description: str | None = None
+    source_language: str = "zh"
+    target_language: str = "en"
 
 
 class TermPayload(BaseModel):
@@ -197,8 +202,23 @@ def _build_llm_translation_tasks(
 
     return tasks
 
-# 支持的文件扩展名
-SUPPORTED_EXTENSIONS = {".docx", ".txt", ".pdf", ".pptx", ".dita", ".ditamap", ".xml", ".svg"}
+# 支持的文件扩展名（30种格式）
+SUPPORTED_EXTENSIONS = {
+    # 办公文档
+    ".docx", ".txt", ".pdf", ".pptx", ".xlsx",
+    # 本地化文件
+    ".properties", ".po", ".pot", ".strings", ".yaml", ".yml", ".json", ".php",
+    # 网页/排版
+    ".html", ".htm", ".md", ".markdown", ".csv", ".srt",
+    # 技术写作
+    ".dita", ".ditamap", ".xml", ".svg",
+    # 双语文件
+    ".sdlxliff", ".txml",
+    # 工程/设计
+    ".dxf", ".idml", ".mif",
+    # 压缩包
+    ".zip", ".rar",
+}
 
 
 def _get_file_extension(filename: str) -> str:
@@ -250,8 +270,8 @@ def _validate_collection_ids(
 
     normalized_ids = list(dict.fromkeys(collection_ids))
     existing_collections = (
-        db.query(TMCollection)
-        .filter(TMCollection.id.in_(normalized_ids))
+        db.query(MemoryBase)
+        .filter(MemoryBase.id.in_(normalized_ids))
         .all()
     )
     existing_ids = {collection.id for collection in existing_collections}
@@ -262,11 +282,11 @@ def _validate_collection_ids(
     return normalized_ids
 
 
-def _get_collection_or_404(db: Session, collection_id: UUID | None) -> TMCollection | None:
+def _get_collection_or_404(db: Session, collection_id: UUID | None) -> MemoryBase | None:
     if collection_id is None:
         return None
 
-    collection = db.query(TMCollection).filter(TMCollection.id == collection_id).first()
+    collection = db.query(MemoryBase).filter(MemoryBase.id == collection_id).first()
     if collection is None:
         raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
     return collection
@@ -274,15 +294,17 @@ def _get_collection_or_404(db: Session, collection_id: UUID | None) -> TMCollect
 
 def _filter_tm_collection(query, collection_id: UUID | None):
     if collection_id is None:
-        return query.filter(TranslationMemory.collection_id.is_(None))
-    return query.filter(TranslationMemory.collection_id == collection_id)
+        return query.filter(MemoryEntry.collection_id.is_(None))
+    return query.filter(MemoryEntry.collection_id == collection_id)
 
 
-def _serialize_tm_collection(collection: TMCollection, entry_count: int = 0) -> dict:
+def _serialize_tm_collection(collection: MemoryBase, entry_count: int = 0) -> dict:
     return {
         "id": collection.id,
         "name": collection.name,
         "description": collection.description,
+        "source_language": collection.source_language,
+        "target_language": collection.target_language,
         "created_at": collection.created_at.isoformat(),
         "updated_at": collection.updated_at.isoformat(),
         "entry_count": entry_count,
@@ -664,28 +686,45 @@ async def create_file_record(
     collection_ids: list[UUID] | None = Form(default=None),
     db: Session = Depends(get_db),
 ):
-    """上传文档并创建持久化记录"""
-    _validate_docx_upload(file)
+    """上传文档并创建持久化记录（支持多格式）"""
+    ext = _validate_file_upload(file)
 
     raw_bytes = await file.read()
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="文件为空。")
 
     selected_collection_ids = _validate_collection_ids(db, collection_ids)
+    filename = file.filename or f"untitled{ext}"
+
     try:
-        file_record = create_file_record_with_segments(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=file.filename or "untitled.docx",
-            similarity_threshold=threshold,
-            collection_ids=selected_collection_ids,
-        )
+        if ext == ".docx":
+            # DOCX 走原有的专用流程（保留完整的 HTML 预览和结构化解析）
+            file_record = create_file_record_with_segments(
+                db=db,
+                raw_bytes=raw_bytes,
+                filename=filename,
+                similarity_threshold=threshold,
+                collection_ids=selected_collection_ids,
+            )
+        else:
+            # 其他格式走适配器系统
+            file_record = create_file_record_via_adapter(
+                db=db,
+                raw_bytes=raw_bytes,
+                filename=filename,
+                similarity_threshold=threshold,
+                collection_ids=selected_collection_ids,
+            )
         return {
             "id": file_record.id,
             "filename": file_record.filename,
             "status": file_record.status,
             "created_at": file_record.created_at.isoformat(),
         }
+    except (UnsupportedFormatError, FileTooLargeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ParseError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -775,10 +814,21 @@ def get_file_record_preview(
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
-    source_bytes = load_file_record_source(file_record)
-    if source_bytes:
-        preview_html = build_docx_preview_html(source_bytes)
-    else:
+    preview_html = ""
+    ext = Path(file_record.filename).suffix.lower()
+
+    # DOCX 文件使用专用的预览渲染
+    if ext == ".docx":
+        source_bytes = load_file_record_source(file_record)
+        if source_bytes:
+            try:
+                preview_html = build_docx_preview_html(source_bytes)
+            except Exception:
+                # DOCX 预览失败时回退到基于句段的预览
+                pass
+
+    # 非 DOCX 或 DOCX 预览失败时，基于句段生成简单预览
+    if not preview_html:
         segments = list_segments_for_file_record(db, file_record_id)
         preview_html = build_document_html_from_segments(segments) if segments else ""
 
@@ -813,6 +863,136 @@ def export_file_record_docx(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return _build_docx_download_response(file_record.filename, translated_docx)
+
+
+@router.get("/file-records/{file_record_id}/export-options")
+@router.get("/documents/{file_record_id}/export-options", include_in_schema=False)
+def get_file_record_export_options(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+):
+    """获取文件支持的导出格式选项"""
+    from app.services.adapters import get_export_options_for_file
+    
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+    
+    options = get_export_options_for_file(file_record.filename)
+    
+    return {
+        "file_record_id": str(file_record_id),
+        "filename": file_record.filename,
+        "export_options": options,
+    }
+
+
+@router.get("/file-records/{file_record_id}/export/{export_type}")
+@router.get("/documents/{file_record_id}/export/{export_type}", include_in_schema=False)
+def export_file_record_with_type(
+    file_record_id: UUID,
+    export_type: str,
+    db: Session = Depends(get_db),
+):
+    """多格式导出接口 - 支持原格式、双语、TMX、XLIFF 等导出类型
+    
+    Args:
+        file_record_id: 文件记录 ID
+        export_type: 导出类型 (original, bilingual, bilingual_txt, tmx, xliff, xliff2)
+    """
+    from app.services.adapters import export_file
+    
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    raw_bytes = load_file_record_source(file_record)
+    segments = list_segments_for_file_record(db, file_record_id)
+    
+    # 转换句段格式
+    segment_dicts = [
+        {
+            "segment_id": seg.sentence_id,
+            "source_text": seg.source_text,
+            "target_text": seg.target_text,
+            "status": seg.status,
+            "matched_source_text": seg.matched_source_text,
+        }
+        for seg in segments
+    ]
+    
+    try:
+        exported_bytes, mime_type, export_filename = export_file(
+            export_type=export_type,
+            segments=segment_dicts,
+            filename=file_record.filename,
+            original_bytes=raw_bytes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"导出失败: {str(exc)}") from exc
+
+    # 构建下载响应
+    ascii_filename = export_filename.encode("ascii", "ignore").decode("ascii").strip() or "exported"
+    ascii_filename = ascii_filename.replace('"', "")
+    quoted_filename = quote(export_filename)
+
+    return StreamingResponse(
+        BytesIO(exported_bytes),
+        media_type=mime_type,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_filename}"; '
+                f"filename*=UTF-8''{quoted_filename}"
+            )
+        },
+    )
+
+
+@router.get("/file-records/{file_record_id}/export")
+@router.get("/documents/{file_record_id}/export", include_in_schema=False)
+def export_file_record(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+):
+    """通用文件导出接口 - 根据原始格式自动选择导出器（原格式导出）"""
+    from app.services.universal_exporter import export_translated_file, get_export_info
+    
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    raw_bytes = load_file_record_source(file_record)
+    if raw_bytes is None:
+        raise HTTPException(status_code=400, detail="原始文件不可用，无法导出。")
+
+    segments = list_segments_for_file_record(db, file_record_id)
+    
+    try:
+        exported_bytes, mime_type, export_filename = export_translated_file(
+            original_bytes=raw_bytes,
+            filename=file_record.filename,
+            segments=segments,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"导出失败: {str(exc)}") from exc
+
+    # 构建下载响应
+    ascii_filename = export_filename.encode("ascii", "ignore").decode("ascii").strip() or "translated"
+    ascii_filename = ascii_filename.replace('"', "")
+    quoted_filename = quote(export_filename)
+
+    return StreamingResponse(
+        BytesIO(exported_bytes),
+        media_type=mime_type,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_filename}"; '
+                f"filename*=UTF-8''{quoted_filename}"
+            )
+        },
+    )
 
 
 @router.get("/file-records/{file_record_id}/segments/{sentence_id}/tm-candidates")
@@ -1160,10 +1340,10 @@ def list_tm_collections(
     db: Session = Depends(get_db),
 ):
     rows = (
-        db.query(TMCollection, func.count(TranslationMemory.id).label("entry_count"))
-        .outerjoin(TranslationMemory, TranslationMemory.collection_id == TMCollection.id)
-        .group_by(TMCollection.id)
-        .order_by(TMCollection.created_at.desc())
+        db.query(MemoryBase, func.count(MemoryEntry.id).label("entry_count"))
+        .outerjoin(MemoryEntry, MemoryEntry.collection_id == MemoryBase.id)
+        .group_by(MemoryBase.id)
+        .order_by(MemoryBase.created_at.desc())
         .all()
     )
     return [
@@ -1174,7 +1354,7 @@ def list_tm_collections(
 
 @router.post("/tm/collections")
 def create_tm_collection(
-    payload: TMCollectionPayload,
+    payload: MemoryBasePayload,
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
@@ -1182,9 +1362,11 @@ def create_tm_collection(
     if not name:
         raise HTTPException(status_code=400, detail="记忆库名称不能为空。")
 
-    collection = TMCollection(
+    collection = MemoryBase(
         name=name,
         description=normalize_text(payload.description or "") or None,
+        source_language=payload.source_language,
+        target_language=payload.target_language,
     )
     db.add(collection)
     try:
@@ -1200,7 +1382,7 @@ def create_tm_collection(
 @router.put("/tm/collections/{collection_id}")
 def update_tm_collection(
     collection_id: UUID,
-    payload: TMCollectionPayload,
+    payload: MemoryBasePayload,
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
@@ -1222,8 +1404,8 @@ def update_tm_collection(
 
     db.refresh(collection)
     entry_count = (
-        db.query(TranslationMemory)
-        .filter(TranslationMemory.collection_id == collection.id)
+        db.query(MemoryEntry)
+        .filter(MemoryEntry.collection_id == collection.id)
         .count()
     )
     return _serialize_tm_collection(collection, entry_count)
@@ -1240,8 +1422,8 @@ def delete_tm_collection(
         raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
 
     entry_count = (
-        db.query(TranslationMemory)
-        .filter(TranslationMemory.collection_id == collection.id)
+        db.query(MemoryEntry)
+        .filter(MemoryEntry.collection_id == collection.id)
         .count()
     )
     if entry_count:
@@ -1307,8 +1489,8 @@ def add_tm_entry(
     source_hash = build_source_hash(source_text)
 
     # 检查是否已存在
-    existing_query = db.query(TranslationMemory).filter(
-        TranslationMemory.source_hash == source_hash
+    existing_query = db.query(MemoryEntry).filter(
+        MemoryEntry.source_hash == source_hash
     )
     existing = _filter_tm_collection(existing_query, entry.collection_id).first()
 
@@ -1323,7 +1505,7 @@ def add_tm_entry(
         return {"status": "updated", "id": existing.id, "message": "已更新现有记录。"}
 
     # 不存在，新增
-    tm = TranslationMemory(
+    tm = MemoryEntry(
         collection_id=entry.collection_id,
         source_text=source_text,
         target_text=target_text,
@@ -1347,7 +1529,7 @@ def batch_add_tm_entries(
     created_count = 0
     updated_count = 0
     skipped_count = 0
-    sync_candidates: list[TranslationMemory] = []
+    sync_candidates: list[MemoryEntry] = []
     collection_ids = [
         collection_id
         for collection_id in (
@@ -1369,8 +1551,8 @@ def batch_add_tm_entries(
 
         source_hash = build_source_hash(source_text)
 
-        existing_query = db.query(TranslationMemory).filter(
-            TranslationMemory.source_hash == source_hash
+        existing_query = db.query(MemoryEntry).filter(
+            MemoryEntry.source_hash == source_hash
         )
         existing = _filter_tm_collection(existing_query, collection_id).first()
 
@@ -1383,7 +1565,7 @@ def batch_add_tm_entries(
             sync_candidates.append(existing)
             updated_count += 1
         else:
-            tm = TranslationMemory(
+            tm = MemoryEntry(
                 collection_id=collection_id,
                 source_text=source_text,
                 target_text=target_text,
@@ -1417,22 +1599,24 @@ def batch_add_tm_entries(
 
 # ========== 术语库管理 API ==========
 
-def _serialize_termbase_collection(collection: TermbaseCollection, entry_count: int = 0) -> dict:
+def _serialize_termbase_collection(collection: TermBase, entry_count: int = 0) -> dict:
     return {
         "id": collection.id,
         "name": collection.name,
         "description": collection.description,
+        "source_language": collection.source_language,
+        "target_language": collection.target_language,
         "created_at": collection.created_at.isoformat(),
         "updated_at": collection.updated_at.isoformat(),
         "entry_count": entry_count,
     }
 
 
-def _get_termbase_collection_or_404(db: Session, collection_id: UUID | None) -> TermbaseCollection | None:
+def _get_termbase_collection_or_404(db: Session, collection_id: UUID | None) -> TermBase | None:
     if collection_id is None:
         return None
 
-    collection = db.query(TermbaseCollection).filter(TermbaseCollection.id == collection_id).first()
+    collection = db.query(TermBase).filter(TermBase.id == collection_id).first()
     if collection is None:
         raise HTTPException(status_code=404, detail="术语库不存在。")
     return collection
@@ -1443,10 +1627,10 @@ def list_termbase_collections(
     db: Session = Depends(get_db),
 ):
     rows = (
-        db.query(TermbaseCollection, func.count(Term.id).label("entry_count"))
-        .outerjoin(Term, Term.collection_id == TermbaseCollection.id)
-        .group_by(TermbaseCollection.id)
-        .order_by(TermbaseCollection.created_at.desc())
+        db.query(TermBase, func.count(TermEntry.id).label("entry_count"))
+        .outerjoin(TermEntry, TermEntry.term_base_id == TermBase.id)
+        .group_by(TermBase.id)
+        .order_by(TermBase.created_at.desc())
         .all()
     )
     return [
@@ -1457,7 +1641,7 @@ def list_termbase_collections(
 
 @router.post("/termbase/collections")
 def create_termbase_collection(
-    payload: TermbaseCollectionPayload,
+    payload: TermBasePayload,
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
@@ -1465,9 +1649,11 @@ def create_termbase_collection(
     if not name:
         raise HTTPException(status_code=400, detail="术语库名称不能为空。")
 
-    collection = TermbaseCollection(
+    collection = TermBase(
         name=name,
         description=normalize_text(payload.description or "") or None,
+        source_language=payload.source_language,
+        target_language=payload.target_language,
     )
     db.add(collection)
     try:
@@ -1491,8 +1677,8 @@ def delete_termbase_collection(
         raise HTTPException(status_code=404, detail="术语库不存在。")
 
     entry_count = (
-        db.query(Term)
-        .filter(Term.collection_id == collection.id)
+        db.query(TermEntry)
+        .filter(TermEntry.term_base_id == collection.id)
         .count()
     )
     if entry_count:
@@ -1510,12 +1696,12 @@ def list_terms(
     limit: int = 100,
     db: Session = Depends(get_db),
 ):
-    query = db.query(Term)
+    query = db.query(TermEntry)
     if collection_id:
-        query = query.filter(Term.collection_id == collection_id)
+        query = query.filter(TermEntry.term_base_id == collection_id)
     
     total = query.count()
-    terms = query.order_by(Term.source_text).offset(skip).limit(limit).all()
+    terms = query.order_by(TermEntry.source_text).offset(skip).limit(limit).all()
     
     return {
         "total": total,
@@ -1526,7 +1712,7 @@ def list_terms(
                 "id": term.id,
                 "source_text": term.source_text,
                 "target_text": term.target_text,
-                "collection_id": term.collection_id,
+                "term_base_id": term.term_base_id,
                 "created_at": term.created_at.isoformat(),
             }
             for term in terms
@@ -1550,8 +1736,8 @@ def add_term(
 
     # 检查是否已存在相同原文的术语
     existing = (
-        db.query(Term)
-        .filter(Term.source_text == source_text, Term.collection_id == payload.collection_id)
+        db.query(TermEntry)
+        .filter(TermEntry.source_text == source_text, TermEntry.term_base_id == payload.collection_id)
         .first()
     )
 
@@ -1560,10 +1746,17 @@ def add_term(
         db.commit()
         return {"status": "updated", "id": existing.id, "message": "已更新现有术语。"}
 
-    term = Term(
-        collection_id=payload.collection_id,
+    # 获取术语库的语言设置
+    term_base = _get_termbase_collection_or_404(db, payload.collection_id)
+    source_lang = term_base.source_language if term_base else "zh"
+    target_lang = term_base.target_language if term_base else "en"
+
+    term = TermEntry(
+        term_base_id=payload.collection_id,
         source_text=source_text,
         target_text=target_text,
+        source_language=source_lang,
+        target_language=target_lang,
     )
     db.add(term)
     db.commit()
@@ -1578,7 +1771,7 @@ def delete_term(
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
-    term = db.query(Term).filter(Term.id == term_id).first()
+    term = db.query(TermEntry).filter(TermEntry.id == term_id).first()
     if not term:
         raise HTTPException(status_code=404, detail="术语不存在。")
 
@@ -1633,8 +1826,8 @@ async def import_termbase_xlsx(
                 continue
             
             existing = (
-                db.query(Term)
-                .filter(Term.source_text == source_text, Term.collection_id == collection_id)
+                db.query(TermEntry)
+                .filter(TermEntry.source_text == source_text, TermEntry.term_base_id == collection_id)
                 .first()
             )
             
@@ -1642,10 +1835,15 @@ async def import_termbase_xlsx(
                 existing.target_text = target_text
                 updated_count += 1
             else:
-                term = Term(
-                    collection_id=collection_id,
+                # 获取术语库的语言设置
+                source_lang = collection.source_language if collection else "zh"
+                target_lang = collection.target_language if collection else "en"
+                term = TermEntry(
+                    term_base_id=collection_id,
                     source_text=source_text,
                     target_text=target_text,
+                    source_language=source_lang,
+                    target_language=target_lang,
                 )
                 db.add(term)
                 created_count += 1
@@ -1678,9 +1876,9 @@ def match_terms(
     if not text:
         return {"matches": []}
     
-    query = db.query(Term)
+    query = db.query(TermEntry)
     if collection_ids:
-        query = query.filter(Term.collection_id.in_(collection_ids))
+        query = query.filter(TermEntry.term_base_id.in_(collection_ids))
     
     all_terms = query.all()
     
