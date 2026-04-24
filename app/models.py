@@ -36,6 +36,16 @@ class FileRecord(Base):
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
+    collection_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("memory_bases.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    term_base_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("term_bases.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     deadline: Mapped[DateTime | None] = mapped_column(
         DateTime(timezone=False), nullable=True
     )
@@ -54,6 +64,12 @@ class FileRecord(Base):
 
     creator: Mapped["User | None"] = relationship(
         "User", foreign_keys=[creator_id]
+    )
+    collection: Mapped["TMCollection | None"] = relationship(
+        "TMCollection", foreign_keys=[collection_id]
+    )
+    term_base: Mapped["TermBase | None"] = relationship(
+        "TermBase", foreign_keys=[term_base_id]
     )
     segments: Mapped[list["Segment"]] = relationship(
         "Segment",
@@ -113,6 +129,10 @@ class Segment(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="none")
     score: Mapped[float] = mapped_column(nullable=False, default=0.0)
     matched_source_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    matched_collection_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    matched_creator_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    matched_created_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    matched_updated_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
     source: Mapped[str] = mapped_column(String(20), nullable=False, default="tm")
     block_type: Mapped[str] = mapped_column(String(20), nullable=False, default="paragraph")
     block_index: Mapped[int] = mapped_column(nullable=False, default=0)
@@ -355,6 +375,11 @@ class TranslationMemory(Base):
     source_normalized: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
     target_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    creator_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -368,6 +393,9 @@ class TranslationMemory(Base):
     collection: Mapped[TMCollection | None] = relationship(
         "TMCollection",
         back_populates="translation_memories",
+    )
+    creator: Mapped["User | None"] = relationship(
+        "User", foreign_keys=[creator_id]
     )
 
 
@@ -434,6 +462,11 @@ class TermEntry(Base):
     source_normalized: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_language: Mapped[str] = mapped_column(String(20), nullable=False)
     target_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    creator_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -447,6 +480,9 @@ class TermEntry(Base):
     term_base: Mapped[TermBase] = relationship(
         "TermBase",
         back_populates="term_entries",
+    )
+    creator: Mapped["User | None"] = relationship(
+        "User", foreign_keys=[creator_id]
     )
 
 

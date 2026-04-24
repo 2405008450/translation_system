@@ -36,6 +36,10 @@ const hasSourceDiff = computed(() => (
   && Boolean(props.segment.matched_source_text)
 ))
 const hasPendingRevision = computed(() => Boolean(props.pendingRevision))
+const scorePercent = computed(() => {
+  if (!props.segment.score || props.segment.score <= 0) return null
+  return Math.round(props.segment.score * 100)
+})
 </script>
 
 <template>
@@ -51,8 +55,11 @@ const hasPendingRevision = computed(() => Boolean(props.pendingRevision))
       <span class="segment-row__index">#{{ index + 1 }}</span>
       <span class="segment-row__tag segment-row__tag--status">{{ statusMeta.label }}</span>
       <span class="segment-row__tag is-muted" :class="sourceClass">{{ sourceMeta.label }}</span>
-      <span v-if="segment.score" class="segment-row__tag is-muted">
-        {{ segment.score.toFixed(2) }}
+      <span v-if="scorePercent !== null" class="segment-row__tag segment-row__tag--score">
+        {{ scorePercent }}%
+      </span>
+      <span v-if="segment.matched_collection_name" class="segment-row__tag is-muted">
+        {{ segment.matched_collection_name }}
       </span>
     </div>
 
@@ -187,5 +194,10 @@ const hasPendingRevision = computed(() => Boolean(props.pendingRevision))
 .segment-row__revision-button--danger {
   border-color: rgba(194, 59, 63, 0.28);
   color: #a43a3d;
+}
+
+.segment-row__tag--score {
+  background: rgba(216, 183, 78, 0.18);
+  color: #8a6700;
 }
 </style>

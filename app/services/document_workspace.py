@@ -460,6 +460,10 @@ def build_docx_workspace(
             segment["status"] = match.status
             segment["score"] = match.score
             segment["matched_source_text"] = match.matched_source_text
+            segment["matched_collection_name"] = match.matched_collection_name
+            segment["matched_creator_name"] = match.matched_creator_name
+            segment["matched_created_at"] = match.matched_created_at
+            segment["matched_updated_at"] = match.matched_updated_at
             segment["target_text"] = match.target_text or ""
 
     return {

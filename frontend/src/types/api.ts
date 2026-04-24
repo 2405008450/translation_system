@@ -41,6 +41,10 @@ export interface Segment {
   status: string
   score: number
   matched_source_text: string | null
+  matched_collection_name: string | null
+  matched_creator_name: string | null
+  matched_created_at: string | null
+  matched_updated_at: string | null
   source: string
   block_type: string
   block_index: number
@@ -54,6 +58,10 @@ export interface FileRecordDetail {
   status: string
   source_language: string | null
   target_language: string | null
+  collection_id: string | null
+  collection_name: string | null
+  term_base_id: string | null
+  term_base_name: string | null
   created_at: string
   updated_at: string
   total_segments: number
@@ -142,6 +150,7 @@ export interface TermEntryRecord {
   target_text: string
   source_language: string
   target_language: string
+  creator_name: string | null
   created_at: string
   updated_at: string
 }

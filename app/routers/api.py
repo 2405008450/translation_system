@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import get_current_user, get_user_display_name, require_admin
 from app.database import get_db
-from app.models import FileRecord, Segment, TMCollection, TranslationMemory, User
+from app.models import FileRecord, Segment, TMCollection, TermBase, TranslationMemory, User
 from app.services.comment_service import (
     create_segment_comment,
     create_segment_comment_reply,
@@ -125,6 +125,8 @@ class ProjectCreatePayload(BaseModel):
     target_language: str
     deadline: str | None = None
     access_level: Literal["team", "private", "public"] = "team"
+    collection_id: UUID | None = None
+    term_base_id: UUID | None = None
 
 
 class ProjectUpdatePayload(BaseModel):
@@ -394,6 +396,7 @@ async def create_file_record(
     file: UploadFile = File(...),
     threshold: float = Form(default=0.6),
     collection_ids: list[UUID] | None = Form(default=None),
+    term_base_id: UUID | None = Form(default=None),
     db: Session = Depends(get_db),
 ):
     """上传文档并创建持久化记录"""
@@ -405,6 +408,14 @@ async def create_file_record(
 
     selected_collection_ids = _validate_collection_ids(db, collection_ids)
     required_collection_ids = _require_selected_collection_ids(selected_collection_ids)
+
+    # 验证术语库是否存在
+    term_base = None
+    if term_base_id is not None:
+        term_base = db.query(TermBase).filter(TermBase.id == term_base_id).first()
+        if term_base is None:
+            raise HTTPException(status_code=404, detail="术语库不存在。")
+
     try:
         workspace_data = build_task_workspace(
             db=db,
@@ -421,6 +432,12 @@ async def create_file_record(
             workspace_data=workspace_data,
             collection_ids=required_collection_ids,
         )
+        # 写入绑定关系
+        if required_collection_ids:
+            file_record.collection_id = required_collection_ids[0]
+        if term_base is not None:
+            file_record.term_base_id = term_base_id
+        db.commit()
         return {
             "id": file_record.id,
             "filename": file_record.filename,
@@ -448,6 +465,18 @@ def create_project(
         except ValueError:
             raise HTTPException(status_code=400, detail="截止期限格式不正确，请使用 ISO 格式。")
 
+    # 验证库是否存在
+    collection = None
+    if payload.collection_id is not None:
+        collection = db.query(TMCollection).filter(TMCollection.id == payload.collection_id).first()
+        if collection is None:
+            raise HTTPException(status_code=404, detail="记忆库不存在。")
+    term_base = None
+    if payload.term_base_id is not None:
+        term_base = db.query(TermBase).filter(TermBase.id == payload.term_base_id).first()
+        if term_base is None:
+            raise HTTPException(status_code=404, detail="术语库不存在。")
+
     project = FileRecord(
         filename=payload.name.strip(),
         status="draft",
@@ -456,6 +485,8 @@ def create_project(
         creator_id=current_user.id,
         deadline=deadline_dt,
         access_level=payload.access_level,
+        collection_id=payload.collection_id,
+        term_base_id=payload.term_base_id,
     )
     db.add(project)
     db.commit()
@@ -470,6 +501,10 @@ def create_project(
         "creator": get_user_display_name(current_user),
         "deadline": project.deadline.isoformat() if project.deadline else None,
         "access_level": project.access_level,
+        "collection_id": project.collection_id,
+        "collection_name": collection.name if collection else None,
+        "term_base_id": project.term_base_id,
+        "term_base_name": term_base.name if term_base else None,
         "created_at": project.created_at.isoformat(),
     }
 
@@ -559,6 +594,7 @@ def upload_project_source_document(
     file: UploadFile = File(...),
     threshold: float = Form(default=0.6),
     collection_ids: list[UUID] | None = Form(default=None),
+    term_base_id: UUID | None = Form(default=None),
     db: Session = Depends(get_db),
 ):
     _validate_task_upload(file)
@@ -583,6 +619,13 @@ def upload_project_source_document(
     selected_collection_ids = _validate_collection_ids(db, collection_ids)
     required_collection_ids = _require_selected_collection_ids(selected_collection_ids)
 
+    # 验证术语库是否存在
+    term_base = None
+    if term_base_id is not None:
+        term_base = db.query(TermBase).filter(TermBase.id == term_base_id).first()
+        if term_base is None:
+            raise HTTPException(status_code=404, detail="术语库不存在。")
+
     try:
         project = attach_source_document_to_file_record(
             db=db,
@@ -592,6 +635,12 @@ def upload_project_source_document(
             similarity_threshold=threshold,
             collection_ids=required_collection_ids,
         )
+        # 写入绑定关系
+        if required_collection_ids:
+            project.collection_id = required_collection_ids[0]
+        if term_base is not None:
+            project.term_base_id = term_base_id
+        db.commit()
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -732,12 +781,24 @@ def get_file_record(
     source_bytes = load_file_record_source(file_record)
     source_filename = get_file_record_source_filename(file_record)
 
+    # 获取绑定的库信息
+    collection_name = None
+    if file_record.collection:
+        collection_name = file_record.collection.name
+    term_base_name = None
+    if file_record.term_base:
+        term_base_name = file_record.term_base.name
+
     return {
         "id": file_record.id,
         "filename": file_record.filename,
         "status": file_record.status,
         "source_language": file_record.source_language,
         "target_language": file_record.target_language,
+        "collection_id": file_record.collection_id,
+        "collection_name": collection_name,
+        "term_base_id": file_record.term_base_id,
+        "term_base_name": term_base_name,
         "created_at": file_record.created_at.isoformat(),
         "updated_at": file_record.updated_at.isoformat(),
         "total_segments": result["total_segments"],
@@ -756,6 +817,10 @@ def get_file_record(
                 "status": seg.status,
                 "score": seg.score,
                 "matched_source_text": seg.matched_source_text,
+                "matched_collection_name": seg.matched_collection_name,
+                "matched_creator_name": seg.matched_creator_name,
+                "matched_created_at": seg.matched_created_at.isoformat() if seg.matched_created_at else None,
+                "matched_updated_at": seg.matched_updated_at.isoformat() if seg.matched_updated_at else None,
                 "source": seg.source,
                 "block_type": seg.block_type,
                 "block_index": seg.block_index,
@@ -1382,7 +1447,7 @@ async def import_tm_xlsx(
     source_language: str = Form(...),
     target_language: str = Form(...),
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
     if extension not in XLSX_EXTENSIONS:
@@ -1406,6 +1471,7 @@ async def import_tm_xlsx(
             collection_id=collection_id,
             source_language=resolved_source_language,
             target_language=resolved_target_language,
+            creator_id=current_user.id,
         )
     except Exception as exc:
         db.rollback()

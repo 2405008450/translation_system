@@ -143,6 +143,10 @@ def build_task_workspace(
                 "status": match_result.status,
                 "score": match_result.score,
                 "matched_source_text": match_result.matched_source_text or "",
+                "matched_collection_name": match_result.matched_collection_name,
+                "matched_creator_name": match_result.matched_creator_name,
+                "matched_created_at": match_result.matched_created_at,
+                "matched_updated_at": match_result.matched_updated_at,
                 **context,
             }
         )

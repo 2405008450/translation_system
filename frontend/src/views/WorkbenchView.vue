@@ -11,6 +11,7 @@ import {
   FileCheck,
   FileText,
   History,
+  Info,
   Languages,
   Loader2,
   MessageSquare,
@@ -32,6 +33,7 @@ import SegmentEditorRow from '../components/SegmentEditorRow.vue'
 import SplitPreviewPanel from '../components/SplitPreviewPanel.vue'
 import VirtualList from '../components/VirtualList.vue'
 import WorkbenchHistoryPanel from '../components/WorkbenchHistoryPanel.vue'
+import WorkbenchMatchPanel from '../components/WorkbenchMatchPanel.vue'
 import WorkbenchTermsPanel from '../components/WorkbenchTermsPanel.vue'
 import { http } from '../api/http'
 import { usePageHeader } from '../composables/usePageHeader'
@@ -59,7 +61,7 @@ const props = defineProps<{
   id: string
 }>()
 
-type ToolKey = 'source-preview' | 'target-preview' | 'split-preview' | 'terms' | 'notes' | 'history'
+type ToolKey = 'source-preview' | 'target-preview' | 'split-preview' | 'match-info' | 'terms' | 'notes' | 'history'
 type ResourceImportTab = 'tm' | 'term'
 
 const router = useRouter()
@@ -269,6 +271,7 @@ const toolButtons = computed(() => ([
   { key: 'source-preview' as const, label: t('workbench.tools.sourcePreview'), icon: FileText },
   { key: 'target-preview' as const, label: t('workbench.tools.targetPreview'), icon: FileCheck },
   { key: 'split-preview' as const, label: t('workbench.tools.splitPreview'), icon: Columns },
+  { key: 'match-info' as const, label: t('workbench.tools.matchInfo'), icon: Info },
   { key: 'terms' as const, label: t('workbench.tools.terms'), icon: Languages },
   { key: 'notes' as const, label: t('workbench.tools.notes'), icon: MessageSquare },
   { key: 'history' as const, label: t('workbench.tools.history'), icon: History },
@@ -383,6 +386,19 @@ async function openTool(tool: ToolKey) {
 
     if (tool === 'terms' && termBases.value.length === 0 && !loadingTermBases.value) {
       await loadTermBases()
+    }
+
+    if (tool === 'match-info') {
+      // 确保术语库列表和条目已加载
+      if (termBases.value.length === 0 && !loadingTermBases.value) {
+        await loadTermBases()
+      }
+      if (!selectedTermBaseId.value && termBases.value.length > 0) {
+        selectedTermBaseId.value = termBases.value[0].id
+      }
+      if (selectedTermBaseId.value && termEntries.value.length === 0 && !loadingTermEntries.value) {
+        await loadTermEntries()
+      }
     }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.sidePanel'))
@@ -583,6 +599,12 @@ async function loadTask() {
     }
 
     await loadTermBases()
+
+    // 如果有绑定的术语库，自动加载术语条目
+    const boundTermBaseId = segmentStore.fileRecord?.term_base_id
+    if (boundTermBaseId) {
+      selectedTermBaseId.value = boundTermBaseId
+    }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.taskLoad'))
   }
@@ -1130,6 +1152,15 @@ onBeforeRouteLeave(async () => {
             :loading-entries="loadingTermEntries"
             :message="termsMessage"
             @update:selected-term-base-id="selectedTermBaseId = $event"
+          />
+          <WorkbenchMatchPanel
+            v-else-if="activeTool === 'match-info'"
+            key="match-info"
+            :segment="activeSegment"
+            :collection-name="segmentStore.fileRecord?.collection_name ?? null"
+            :term-base-name="segmentStore.fileRecord?.term_base_name ?? null"
+            :term-entries="termEntries"
+            :active-source-text="activeSegmentSourceText"
           />
           <NotesPanel
             v-else-if="activeTool === 'notes'"

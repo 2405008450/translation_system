@@ -1,4 +1,5 @@
 import hashlib
+from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
@@ -128,6 +129,10 @@ def _create_file_record_from_workspace(
                 status=seg["status"],
                 score=seg["score"],
                 matched_source_text=seg["matched_source_text"],
+                matched_collection_name=seg.get("matched_collection_name"),
+                matched_creator_name=seg.get("matched_creator_name"),
+                matched_created_at=datetime.fromisoformat(seg["matched_created_at"]) if seg.get("matched_created_at") else None,
+                matched_updated_at=datetime.fromisoformat(seg["matched_updated_at"]) if seg.get("matched_updated_at") else None,
                 source="tm" if seg["status"] in ("exact", "fuzzy") else "none",
                 block_type=seg["block_type"],
                 block_index=seg["block_index"],
@@ -183,6 +188,7 @@ def create_txt_file_record_with_segments(
                 status=result.status,
                 score=result.score,
                 matched_source_text=result.matched_source_text,
+                matched_collection_name=getattr(result, "matched_collection_name", None),
                 source="tm" if result.status in ("exact", "fuzzy") else "none",
                 block_type="paragraph",
                 block_index=index,
@@ -257,6 +263,10 @@ def attach_source_document_to_file_record(
                 status=seg["status"],
                 score=seg["score"],
                 matched_source_text=seg["matched_source_text"],
+                matched_collection_name=seg.get("matched_collection_name"),
+                matched_creator_name=seg.get("matched_creator_name"),
+                matched_created_at=datetime.fromisoformat(seg["matched_created_at"]) if seg.get("matched_created_at") else None,
+                matched_updated_at=datetime.fromisoformat(seg["matched_updated_at"]) if seg.get("matched_updated_at") else None,
                 source="tm" if seg["status"] in ("exact", "fuzzy") else "none",
                 block_type=seg["block_type"],
                 block_index=seg["block_index"],
