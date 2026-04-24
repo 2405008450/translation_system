@@ -96,6 +96,9 @@ def _serialize_term_base(term_base: TermBase, entry_count: int = 0) -> dict:
 
 
 def _serialize_term_entry(entry: TermEntry) -> dict:
+    creator_name = None
+    if entry.creator:
+        creator_name = entry.creator.nickname or entry.creator.username
     return {
         "id": entry.id,
         "term_base_id": entry.term_base_id,
@@ -103,6 +106,7 @@ def _serialize_term_entry(entry: TermEntry) -> dict:
         "target_text": entry.target_text,
         "source_language": entry.source_language,
         "target_language": entry.target_language,
+        "creator_name": creator_name,
         "created_at": entry.created_at.isoformat(),
         "updated_at": entry.updated_at.isoformat(),
     }
@@ -366,7 +370,7 @@ def create_term_base_entry(
     term_base_id: UUID,
     payload: TermEntryUpdatePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
     source_text = normalize_text(payload.source_text)
@@ -398,6 +402,7 @@ def create_term_base_entry(
         source_normalized=source_normalized,
         source_language=term_base.source_language,
         target_language=term_base.target_language,
+        creator_id=current_user.id,
     )
     db.add(entry)
     db.commit()

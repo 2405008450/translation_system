@@ -47,6 +47,7 @@ def import_tm_from_xlsx_upload(
     target_language: str,
     batch_size: int = 5000,
     collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
 ) -> TMImportSummary:
     workbook = load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)
     return _import_workbook(
@@ -55,6 +56,7 @@ def import_tm_from_xlsx_upload(
         filename=filename,
         batch_size=batch_size,
         collection_id=collection_id,
+        creator_id=creator_id,
         source_language=source_language,
         target_language=target_language,
     )
@@ -67,6 +69,7 @@ def import_tm_from_xlsx_path(
     target_language: str,
     batch_size: int = 5000,
     collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
 ) -> TMImportSummary:
     workbook = load_workbook(Path(xlsx_path), read_only=True, data_only=True)
     return _import_workbook(
@@ -75,6 +78,7 @@ def import_tm_from_xlsx_path(
         filename=Path(xlsx_path).name,
         batch_size=batch_size,
         collection_id=collection_id,
+        creator_id=creator_id,
         source_language=source_language,
         target_language=target_language,
     )
@@ -88,6 +92,7 @@ def _import_workbook(
     source_language: str,
     target_language: str,
     collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
 ) -> TMImportSummary:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
@@ -118,6 +123,7 @@ def _import_workbook(
             source_language=normalized_source_language,
             target_language=normalized_target_language,
             collection_id=collection_id,
+            creator_id=creator_id,
         )
         batch_rows[tm_row["source_hash"]] = tm_row
 
@@ -126,6 +132,7 @@ def _import_workbook(
                 db=db,
                 batch_rows=list(batch_rows.values()),
                 collection_id=collection_id,
+                creator_id=creator_id,
                 source_language=normalized_source_language,
                 target_language=normalized_target_language,
             )
@@ -138,6 +145,7 @@ def _import_workbook(
             db=db,
             batch_rows=list(batch_rows.values()),
             collection_id=collection_id,
+            creator_id=creator_id,
             source_language=normalized_source_language,
             target_language=normalized_target_language,
         )
@@ -160,6 +168,7 @@ def _build_tm_row(
     source_language: str,
     target_language: str,
     collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
 ) -> dict:
     return {
         "collection_id": collection_id,
@@ -169,6 +178,7 @@ def _build_tm_row(
         "source_normalized": normalize_match_text(source_text) or normalize_text(source_text),
         "source_language": source_language,
         "target_language": target_language,
+        "creator_id": creator_id,
     }
 
 
@@ -178,6 +188,7 @@ def _flush_tm_batch(
     source_language: str,
     target_language: str,
     collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
 ) -> tuple[int, int]:
     if not batch_rows:
         return 0, 0

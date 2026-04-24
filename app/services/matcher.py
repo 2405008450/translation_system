@@ -49,7 +49,11 @@ class ResolvedMatch:
     status: str
     score: float
     matched_source_text: str | None
-    target_text: str | None
+    matched_collection_name: str | None = None
+    matched_creator_name: str | None = None
+    matched_created_at: str | None = None
+    matched_updated_at: str | None = None
+    target_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +124,10 @@ def match_sentences_with_stats(
             status=match.status,
             score=match.score,
             matched_source_text=match.matched_source_text,
+            matched_collection_name=match.matched_collection_name,
+            matched_creator_name=match.matched_creator_name,
+            matched_created_at=match.matched_created_at,
+            matched_updated_at=match.matched_updated_at,
             target_text=match.target_text,
         )
         for sentence, match in zip(prepared_sentences, resolved_matches, strict=False)
@@ -231,10 +239,20 @@ def _resolve_matches(
             exact_match = exact_matches_by_source_text.get(sentence.match_text)
 
         if exact_match:
+            collection_name = None
+            if exact_match.collection:
+                collection_name = exact_match.collection.name
+            creator_name = None
+            if exact_match.creator:
+                creator_name = exact_match.creator.nickname or exact_match.creator.username
             resolved_matches[index] = ResolvedMatch(
                 status="exact",
                 score=1.0,
                 matched_source_text=exact_match.source_text,
+                matched_collection_name=collection_name,
+                matched_creator_name=creator_name,
+                matched_created_at=exact_match.created_at.isoformat() if exact_match.created_at else None,
+                matched_updated_at=exact_match.updated_at.isoformat() if exact_match.updated_at else None,
                 target_text=exact_match.target_text,
             )
             exact_hits += 1
@@ -412,6 +430,10 @@ def _find_fuzzy_matches_chunk(
             matched.compare_text,
             matched.source_text,
             matched.target_text,
+            matched.collection_name,
+            matched.creator_name,
+            matched.created_at,
+            matched.updated_at,
             matched.trigram_score
         FROM input
         LEFT JOIN LATERAL (
@@ -419,8 +441,14 @@ def _find_fuzzy_matches_chunk(
                 tm.source_normalized AS compare_text,
                 tm.source_text,
                 tm.target_text,
+                mb.name AS collection_name,
+                COALESCE(u.nickname, u.username) AS creator_name,
+                tm.created_at,
+                tm.updated_at,
                 similarity(tm.source_normalized, input.query_text) AS trigram_score
 FROM memory_entries AS tm
+            LEFT JOIN memory_bases AS mb ON mb.id = tm.collection_id
+            LEFT JOIN users AS u ON u.id = tm.creator_id
             WHERE tm.source_normalized IS NOT NULL
               AND tm.source_normalized % input.query_text
               {collection_filter_sql}
@@ -451,6 +479,10 @@ FROM memory_entries AS tm
                 "compare_text": row["compare_text"],
                 "source_text": row["source_text"],
                 "target_text": row["target_text"],
+                "collection_name": row["collection_name"],
+                "creator_name": row["creator_name"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
                 "source_trigram_score": 0.0,
                 "auxiliary_trigram_score": 0.0,
                 "source_vector_score": 0.0,
@@ -492,6 +524,10 @@ FROM memory_entries AS tm
                 status="fuzzy",
                 score=round(float(best_candidate["score"]), 4),
                 matched_source_text=best_candidate["source_text"],
+                matched_collection_name=best_candidate.get("collection_name"),
+                matched_creator_name=best_candidate.get("creator_name"),
+                matched_created_at=best_candidate.get("created_at"),
+                matched_updated_at=best_candidate.get("updated_at"),
                 target_text=best_candidate["target_text"],
             )
         )
@@ -562,6 +598,10 @@ def _merge_vector_candidates(
             matched.compare_text,
             matched.source_text,
             matched.target_text,
+            matched.collection_name,
+            matched.creator_name,
+            matched.created_at,
+            matched.updated_at,
             matched.vector_score
         FROM input
         LEFT JOIN LATERAL (
@@ -569,8 +609,14 @@ def _merge_vector_candidates(
                 COALESCE(tm.source_normalized, tm.source_text) AS compare_text,
                 tm.source_text,
                 tm.target_text,
+                mb.name AS collection_name,
+                COALESCE(u.nickname, u.username) AS creator_name,
+                tm.created_at,
+                tm.updated_at,
                 1 - (tm.source_embedding <=> input.query_vector) AS vector_score
 FROM memory_entries AS tm
+            LEFT JOIN memory_bases AS mb ON mb.id = tm.collection_id
+            LEFT JOIN users AS u ON u.id = tm.creator_id
             WHERE tm.source_embedding IS NOT NULL
               AND tm.source_embedding_version = :embedding_version
               AND 1 - (tm.source_embedding <=> input.query_vector) >= :vector_similarity_floor
@@ -600,6 +646,10 @@ FROM memory_entries AS tm
                 "compare_text": row["compare_text"] or row["source_text"],
                 "source_text": row["source_text"],
                 "target_text": row["target_text"],
+                "collection_name": row["collection_name"],
+                "creator_name": row["creator_name"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
                 "source_trigram_score": 0.0,
                 "auxiliary_trigram_score": 0.0,
                 "source_vector_score": 0.0,
@@ -664,6 +714,10 @@ def _pick_best_fuzzy_candidate(
             best_candidate = {
                 "source_text": candidate["source_text"],
                 "target_text": candidate["target_text"],
+                "collection_name": candidate.get("collection_name"),
+                "creator_name": candidate.get("creator_name"),
+                "created_at": candidate.get("created_at"),
+                "updated_at": candidate.get("updated_at"),
                 "score": final_score,
             }
 

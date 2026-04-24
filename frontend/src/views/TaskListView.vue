@@ -26,7 +26,7 @@ import { getFileStatusMeta } from '../constants/status'
 import { supportedTaskFileAccept } from '../constants/taskFiles'
 import { useAuthStore } from '../stores/auth'
 import { useTaskStore } from '../stores/task'
-import type { TMCollection } from '../types/api'
+import type { TermBase, TMCollection } from '../types/api'
 
 type MainTab = 'tasks' | 'performance'
 type SubTab = 'all' | 'incomplete'
@@ -47,6 +47,9 @@ const pageError = ref('')
 const tmCollections = ref<TMCollection[]>([])
 const loadingCollections = ref(false)
 const selectedCollectionIds = ref<string[]>([])
+const termBases = ref<TermBase[]>([])
+const loadingTermBases = ref(false)
+const selectedTermBaseId = ref<string | null>(null)
 const showUploadForm = ref(false)
 const currentPage = ref(1)
 const pageSize = ref(50)
@@ -126,6 +129,19 @@ async function loadTMCollections() {
   }
 }
 
+async function loadTermBases() {
+  loadingTermBases.value = true
+  try {
+    const { data } = await http.get<TermBase[]>('/term-bases')
+    termBases.value = data
+  } catch (error) {
+    // 术语库加载失败不阻止上传
+    console.error('Failed to load term bases:', error)
+  } finally {
+    loadingTermBases.value = false
+  }
+}
+
 function onFileChange(event: Event) {
   selectedFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
 }
@@ -146,6 +162,7 @@ async function uploadFile() {
       selectedFile.value,
       threshold.value,
       selectedCollectionIds.value,
+      selectedTermBaseId.value,
     )
     selectedFile.value = null
     const fileInput = document.getElementById('upload-file') as HTMLInputElement | null
@@ -241,6 +258,7 @@ onMounted(() => {
   document.addEventListener('click', handleDocumentClick)
   void loadTasks()
   void loadTMCollections()
+  void loadTermBases()
 })
 
 onBeforeUnmount(() => {
@@ -285,6 +303,20 @@ onBeforeUnmount(() => {
           <span class="hint-text">
             {{ tmCollections.length ? t('taskList.hints.collections') : t('taskList.hints.noCollections') }}
           </span>
+        </label>
+
+        <label class="field field--compact">
+          <span class="field__label">{{ t('taskList.fields.termBase') }}</span>
+          <select
+            v-model="selectedTermBaseId"
+            class="field__control"
+            :disabled="loadingTermBases || termBases.length === 0"
+          >
+            <option :value="null">{{ t('taskList.hints.noTermBase') }}</option>
+            <option v-for="termBase in termBases" :key="termBase.id" :value="termBase.id">
+              {{ termBase.name }}（{{ formatLanguagePair(termBase.source_language, termBase.target_language) }} / {{ termBase.entry_count }} 条）
+            </option>
+          </select>
         </label>
 
         <button

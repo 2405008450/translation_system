@@ -53,7 +53,7 @@ export const useTaskStore = defineStore('task', () => {
     }
   }
 
-  async function uploadTask(file: File, threshold = 0.6, collectionIds: string[] = []) {
+  async function uploadTask(file: File, threshold = 0.6, collectionIds: string[] = [], termBaseId: string | null = null) {
     uploading.value = {
       active: true,
       percent: 0,
@@ -66,6 +66,9 @@ export const useTaskStore = defineStore('task', () => {
       collectionIds.forEach((collectionId) => {
         formData.append('collection_ids', collectionId)
       })
+      if (termBaseId) {
+        formData.append('term_base_id', termBaseId)
+      }
       const { data } = await http.post<{ id: string }>('/file-records', formData, {
         headers: {
           'Content-Type': 'multipart/form-data',
