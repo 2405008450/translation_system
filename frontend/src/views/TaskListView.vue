@@ -23,6 +23,7 @@ import { useConfirm } from '../composables/useConfirm'
 import { useToast } from '../composables/useToast'
 import { formatLanguagePair } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
+import { supportedTaskFileAccept } from '../constants/taskFiles'
 import { useAuthStore } from '../stores/auth'
 import { useTaskStore } from '../stores/task'
 import type { TMCollection } from '../types/api'
@@ -131,7 +132,7 @@ function onFileChange(event: Event) {
 
 async function uploadFile() {
   if (!selectedFile.value) {
-    pageError.value = t('taskList.errors.selectFile')
+    pageError.value = '请选择要上传的文件。'
     return
   }
   if (selectedCollectionIds.value.length === 0) {
@@ -253,8 +254,8 @@ onBeforeUnmount(() => {
       <div class="section-title">{{ t('taskList.uploadSection') }}</div>
       <div class="upload-form upload-form--inline upload-form--task">
         <label class="field">
-          <span class="field__label">{{ t('taskList.fields.docx') }}</span>
-          <input id="upload-file" class="field__control" type="file" accept=".docx" @change="onFileChange" />
+          <span class="field__label">任务文件</span>
+          <input id="upload-file" class="field__control" type="file" :accept="supportedTaskFileAccept" @change="onFileChange" />
         </label>
 
         <label class="field field--compact">

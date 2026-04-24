@@ -2,6 +2,8 @@
 import axios from 'axios'
 import {
   ArrowLeft,
+  ArrowDown,
+  ArrowUp,
   Bot,
   CircleHelp,
   Columns,
@@ -14,7 +16,9 @@ import {
   MessageSquare,
   MoreHorizontal,
   Save,
+  Search,
   Upload,
+  X,
 } from 'lucide-vue-next'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -33,6 +37,7 @@ import { http } from '../api/http'
 import { usePageHeader } from '../composables/usePageHeader'
 import { useToast } from '../composables/useToast'
 import { useWorkbenchShortcuts } from '../composables/useWorkbenchShortcuts'
+import { getTaskExportFormatLabel } from '../constants/taskFiles'
 import { llmProviderOptions, llmScopeOptions } from '../constants/llm'
 import { formatLanguagePair } from '../constants/languages'
 import { useAuthStore } from '../stores/auth'
@@ -80,6 +85,9 @@ const importDialogInitialTab = ref<ResourceImportTab>('tm')
 const showShortcutHelp = ref(false)
 const openRevisionMenu = ref(false)
 const revisionActionLoading = ref(false)
+const sourceSearchQuery = ref('')
+const targetSearchQuery = ref('')
+const searchLoadingAllSegments = ref(false)
 
 const termBases = ref<TermBase[]>([])
 const termEntries = ref<TermEntryRecord[]>([])
@@ -87,6 +95,7 @@ const selectedTermBaseId = ref('')
 const loadingTermBases = ref(false)
 const loadingTermEntries = ref(false)
 const termsMessage = ref(t('workbench.terms.defaultMessage'))
+let searchLoadRequestId = 0
 
 function resolveItemHeight() {
   if (window.innerWidth <= 720) {
@@ -158,6 +167,61 @@ const activeSegmentHistory = computed(() => (
 
 const activeSegmentSourceText = computed(() => activeSegment.value?.source_text || '')
 
+function normalizeSearchText(value: string) {
+  return value.replace(/\s+/g, ' ').trim().toLocaleLowerCase()
+}
+
+function buildSourceSearchableText(segment: Segment) {
+  const displayText = segment.display_text || ''
+  if (displayText && displayText !== segment.source_text) {
+    return `${displayText}\n${segment.source_text}`
+  }
+  return displayText || segment.source_text
+}
+
+function matchesSearchKeyword(value: string, keyword: string) {
+  if (!keyword) {
+    return true
+  }
+  return normalizeSearchText(value).includes(keyword)
+}
+
+const normalizedSourceSearchQuery = computed(() => normalizeSearchText(sourceSearchQuery.value))
+const normalizedTargetSearchQuery = computed(() => normalizeSearchText(targetSearchQuery.value))
+
+const hasSegmentSearch = computed(() => (
+  Boolean(normalizedSourceSearchQuery.value || normalizedTargetSearchQuery.value)
+))
+
+const editorSegments = computed(() => {
+  const sourceKeyword = normalizedSourceSearchQuery.value
+  const targetKeyword = normalizedTargetSearchQuery.value
+
+  if (!sourceKeyword && !targetKeyword) {
+    return segmentStore.segments
+  }
+
+  return segmentStore.segments.filter((segment) => (
+    matchesSearchKeyword(buildSourceSearchableText(segment), sourceKeyword)
+    && matchesSearchKeyword(segment.target_text || '', targetKeyword)
+  ))
+})
+
+const activeEditorIndex = computed(() => {
+  if (!segmentStore.activeSentenceId) {
+    return -1
+  }
+  return editorSegments.value.findIndex((segment) => segment.sentence_id === segmentStore.activeSentenceId)
+})
+
+const segmentOrdinalMap = computed(() => {
+  const nextMap = new Map<string, number>()
+  segmentStore.segments.forEach((segment, index) => {
+    nextMap.set(segment.sentence_id, index)
+  })
+  return nextMap
+})
+
 const targetPreviewRenderMode = computed<'static' | 'target'>(() => {
   if (segmentStore.previewSupported && segmentStore.previewHtml) {
     return 'target'
@@ -181,6 +245,10 @@ const targetPreviewSupported = computed(() => {
   }
   return segmentStore.allSegmentsLoaded && segmentStore.segments.length > 0
 })
+
+const exportButtonLabel = computed(() => (
+  `${t('common.actions.export')} ${getTaskExportFormatLabel(segmentStore.fileRecord?.filename)}`
+))
 
 const sourcePreviewLoading = computed(() =>
   (activeTool.value === 'source-preview' || activeTool.value === 'split-preview')
@@ -323,6 +391,10 @@ async function openTool(tool: ToolKey) {
 
 async function handleEditorReachEnd() {
   try {
+    if (hasSegmentSearch.value) {
+      await ensureSearchCorpusLoaded()
+      return
+    }
     await segmentStore.loadMoreSegments()
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.loadMore'))
@@ -334,33 +406,95 @@ function openImportDialog(tab: ResourceImportTab = 'tm') {
   showImportDialog.value = true
 }
 
-function getCurrentSegmentIndex() {
-  if (!segmentStore.activeSentenceId) {
-    return 0
-  }
-  return Math.max(0, segmentStore.segments.findIndex((segment) => segment.sentence_id === segmentStore.activeSentenceId))
+function resetSegmentSearch() {
+  searchLoadRequestId += 1
+  sourceSearchQuery.value = ''
+  targetSearchQuery.value = ''
+  searchLoadingAllSegments.value = false
 }
 
-async function focusSentenceByOffset(offset: number) {
-  let targetIndex = getCurrentSegmentIndex() + offset
-  targetIndex = Math.max(0, targetIndex)
-
-  while (targetIndex >= segmentStore.segments.length && segmentStore.hasMoreSegments) {
-    const loaded = await segmentStore.loadMoreSegments()
-    if (!loaded) {
-      break
-    }
+async function ensureSearchCorpusLoaded() {
+  if (!hasSegmentSearch.value || !segmentStore.hasMoreSegments) {
+    searchLoadingAllSegments.value = false
+    return
   }
 
-  targetIndex = Math.min(targetIndex, Math.max(segmentStore.segments.length - 1, 0))
-  const target = segmentStore.segments[targetIndex]
+  const requestId = ++searchLoadRequestId
+  searchLoadingAllSegments.value = true
+
+  try {
+    await segmentStore.ensureAllSegmentsLoaded()
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('workbench.errors.loadAll'))
+  } finally {
+    if (requestId === searchLoadRequestId) {
+      searchLoadingAllSegments.value = false
+    }
+  }
+}
+
+function getCurrentSegmentIndex() {
+  if (activeEditorIndex.value === -1) {
+    return 0
+  }
+  return activeEditorIndex.value
+}
+
+async function focusEditorSegmentAtIndex(index: number) {
+  const target = editorSegments.value[index]
   if (!target) {
     return
   }
 
   segmentStore.setActiveSentence(target.sentence_id)
   await nextTick()
-  await virtualListRef.value?.focusIndex(targetIndex, '[data-segment-target="true"]', 'nearest')
+  await virtualListRef.value?.focusIndex(index, '[data-segment-target="true"]', 'nearest')
+}
+
+async function focusMatchedSegment(offset: number) {
+  if (!hasSegmentSearch.value) {
+    return
+  }
+
+  await ensureSearchCorpusLoaded()
+
+  const matches = editorSegments.value
+  if (!matches.length) {
+    return
+  }
+
+  let targetIndex = activeEditorIndex.value
+  if (targetIndex === -1) {
+    targetIndex = offset > 0 ? 0 : matches.length - 1
+  } else {
+    targetIndex = (targetIndex + offset + matches.length) % matches.length
+  }
+
+  await focusEditorSegmentAtIndex(targetIndex)
+}
+
+async function focusSentenceByOffset(offset: number) {
+  if (hasSegmentSearch.value) {
+    await focusMatchedSegment(offset)
+    return
+  }
+
+  let targetIndex = getCurrentSegmentIndex() + offset
+  targetIndex = Math.max(0, targetIndex)
+
+  while (targetIndex >= editorSegments.value.length && segmentStore.hasMoreSegments) {
+    const loaded = await segmentStore.loadMoreSegments()
+    if (!loaded) {
+      break
+    }
+  }
+
+  targetIndex = Math.min(targetIndex, Math.max(editorSegments.value.length - 1, 0))
+  await focusEditorSegmentAtIndex(targetIndex)
+}
+
+function getEditorSegmentDisplayIndex(sentenceId: string, fallbackIndex: number) {
+  return segmentOrdinalMap.value.get(sentenceId) ?? fallbackIndex
 }
 
 function confirmCurrentSentence() {
@@ -429,6 +563,7 @@ async function loadTask() {
   pageError.value = ''
   activeTool.value = null
   openRevisionMenu.value = false
+  resetSegmentSearch()
   commentStore.stopPolling()
   termEntries.value = []
   termBases.value = []
@@ -476,12 +611,12 @@ async function saveNow() {
   }
 }
 
-async function exportDocx() {
+async function exportTranslatedFile() {
   pageError.value = ''
   try {
-    await segmentStore.downloadTranslatedDocx()
+    await segmentStore.downloadTranslatedFile()
   } catch (error) {
-    pageError.value = getErrorMessage(error, t('workbench.errors.export'))
+    pageError.value = getErrorMessage(error, '导出失败。')
   }
 }
 
@@ -504,6 +639,19 @@ async function loadAllSegments() {
 
 async function handlePreviewFocus(sentenceId: string) {
   segmentStore.setActiveSentence(sentenceId)
+
+  if (hasSegmentSearch.value) {
+    await ensureSearchCorpusLoaded()
+    const filteredIndex = editorSegments.value.findIndex((segment) => segment.sentence_id === sentenceId)
+    if (filteredIndex === -1) {
+      return
+    }
+
+    await nextTick()
+    await virtualListRef.value?.focusIndex(filteredIndex, '[data-segment-target="true"]', 'nearest')
+    return
+  }
+
   const index = await segmentStore.ensureSentenceLoaded(sentenceId)
   if (index === -1) {
     return
@@ -595,6 +743,18 @@ watch(selectedTermBaseId, () => {
   void loadTermEntries()
 })
 
+watch([sourceSearchQuery, targetSearchQuery], async () => {
+  if (hasSegmentSearch.value) {
+    void ensureSearchCorpusLoaded()
+  } else {
+    searchLoadRequestId += 1
+    searchLoadingAllSegments.value = false
+  }
+
+  await nextTick()
+  await virtualListRef.value?.scrollToIndex(0, 'start')
+})
+
 onMounted(() => {
   window.addEventListener('resize', handleResize)
   void loadTask()
@@ -644,9 +804,9 @@ onBeforeRouteLeave(async () => {
           {{ segmentStore.saving ? t('common.actions.saving') : t('workbench.saveNow') }}
         </button>
 
-        <button class="button" type="button" @click="exportDocx">
+        <button class="button" type="button" :disabled="!segmentStore.canExport" @click="exportTranslatedFile">
           <Download :size="14" />
-          {{ t('workbench.exportDocx') }}
+          {{ exportButtonLabel }}
         </button>
 
         <div class="workbench-revision-menu">
@@ -798,9 +958,97 @@ onBeforeRouteLeave(async () => {
           </div>
         </div>
 
+        <div class="workbench-search-panel">
+          <div class="workbench-search-panel__header">
+            <div>
+              <div class="section-title section-title--tight">{{ t('workbench.search.title') }}</div>
+              <p class="panel-subtitle">{{ t('workbench.search.description') }}</p>
+            </div>
+            <button
+              v-if="hasSegmentSearch"
+              class="button"
+              type="button"
+              @click="resetSegmentSearch"
+            >
+              <X :size="14" />
+              {{ t('workbench.search.clear') }}
+            </button>
+          </div>
+
+          <div class="workbench-search-panel__form">
+            <label class="field field--compact">
+              <span class="field__label">{{ t('workbench.search.sourceLabel') }}</span>
+              <input
+                v-model="sourceSearchQuery"
+                class="field__control"
+                type="text"
+                :placeholder="t('workbench.search.sourcePlaceholder')"
+                @keydown.enter.prevent="void focusMatchedSegment(1)"
+              />
+            </label>
+
+            <label class="field field--compact">
+              <span class="field__label">{{ t('workbench.search.targetLabel') }}</span>
+              <input
+                v-model="targetSearchQuery"
+                class="field__control"
+                type="text"
+                :placeholder="t('workbench.search.targetPlaceholder')"
+                @keydown.enter.prevent="void focusMatchedSegment(1)"
+              />
+            </label>
+
+            <div class="workbench-search-panel__actions">
+              <button
+                class="button"
+                type="button"
+                :disabled="searchLoadingAllSegments || editorSegments.length === 0"
+                @click="void focusMatchedSegment(-1)"
+              >
+                <ArrowUp :size="14" />
+                {{ t('workbench.search.prev') }}
+              </button>
+              <button
+                class="button"
+                type="button"
+                :disabled="searchLoadingAllSegments || editorSegments.length === 0"
+                @click="void focusMatchedSegment(1)"
+              >
+                <ArrowDown :size="14" />
+                {{ t('workbench.search.next') }}
+              </button>
+            </div>
+          </div>
+
+          <div class="workbench-search-panel__meta">
+            <span class="hint-text">
+              {{
+                hasSegmentSearch
+                  ? t('workbench.search.resultSummary', {
+                      count: editorSegments.length,
+                      total: segmentStore.totalSegmentCount,
+                    })
+                  : t('workbench.search.idle')
+              }}
+            </span>
+            <span v-if="searchLoadingAllSegments" class="hint-text">
+              {{ t('workbench.search.loadingAll') }}
+            </span>
+          </div>
+        </div>
+
+        <div
+          v-if="hasSegmentSearch && !searchLoadingAllSegments && editorSegments.length === 0"
+          class="empty-state workbench-search-empty"
+        >
+          <Search :size="28" />
+          {{ t('workbench.search.noMatch') }}
+        </div>
+
         <VirtualList
+          v-else
           ref="virtualListRef"
-          :items="segmentStore.segments"
+          :items="editorSegments"
           :item-height="itemHeight"
           :adaptive="true"
           :active-descendant="segmentStore.activeSentenceId ? `segment-${segmentStore.activeSentenceId}` : null"
@@ -809,7 +1057,7 @@ onBeforeRouteLeave(async () => {
           <template #default="{ item, index }">
             <SegmentEditorRow
               :segment="item"
-              :index="index"
+              :index="getEditorSegmentDisplayIndex(item.sentence_id, index)"
               :active="segmentStore.activeSentenceId === item.sentence_id"
               :pending-revision="segmentStore.getPendingRevision(item.sentence_id)"
               :revision-busy="revisionActionLoading"
@@ -960,7 +1208,8 @@ onBeforeRouteLeave(async () => {
 <style scoped>
 .workbench-toolbar,
 .workbench-toolbar__progress,
-.workbench-load-all {
+.workbench-load-all,
+.workbench-search-panel {
   display: grid;
   gap: 12px;
 }
@@ -973,6 +1222,48 @@ onBeforeRouteLeave(async () => {
 
 .workbench-load-all {
   margin-top: 14px;
+}
+
+.workbench-search-panel {
+  margin-bottom: 16px;
+  padding: 16px;
+  border: 1px solid var(--line-soft);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(248, 250, 252, 0.96), rgba(255, 255, 255, 0.98));
+}
+
+.workbench-search-panel__header,
+.workbench-search-panel__form,
+.workbench-search-panel__actions,
+.workbench-search-panel__meta {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.workbench-search-panel__header {
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.workbench-search-panel__form > .field {
+  flex: 1 1 260px;
+}
+
+.workbench-search-panel__actions {
+  margin-left: auto;
+}
+
+.workbench-search-panel__meta {
+  align-items: center;
+}
+
+.workbench-search-empty {
+  min-height: 240px;
+  border: 1px dashed var(--line-soft);
+  border-radius: 14px;
+  background: rgba(248, 250, 252, 0.72);
 }
 
 .workbench-resource-panel__actions {
@@ -1067,6 +1358,15 @@ onBeforeRouteLeave(async () => {
 }
 
 @media (max-width: 720px) {
+  .workbench-search-panel__actions {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .workbench-search-panel__actions .button {
+    flex: 1 1 0;
+  }
+
   .shortcut-item {
     flex-direction: column;
   }

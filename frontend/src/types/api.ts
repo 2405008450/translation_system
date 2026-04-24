@@ -59,12 +59,16 @@ export interface FileRecordDetail {
   total_segments: number
   skip: number
   limit: number
+  source_extension: string
+  has_source_document: boolean
+  can_export: boolean
   segments: Segment[]
 }
 
 export interface FileRecordPreview {
   id: string
   filename: string
+  source_extension: string
   supports_preview: boolean
   preview_html: string
 }

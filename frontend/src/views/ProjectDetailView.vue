@@ -32,8 +32,10 @@ import { usePageHeader } from '../composables/usePageHeader'
 import { useToast } from '../composables/useToast'
 import { formatLanguagePair, getLanguageLabel } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
+import { buildTranslatedTaskFilename, supportedTaskFileAccept } from '../constants/taskFiles'
 import { useAuthStore } from '../stores/auth'
 import type { TMCollection } from '../types/api'
+import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 import { getProgressStyle } from '../utils/progress'
 
 const props = defineProps<{
@@ -307,7 +309,7 @@ async function loadTMCollections() {
 
 async function uploadSourceDocument() {
   if (!selectedFile.value) {
-    uploadMessage.value = t('projectDetail.errors.selectFile')
+    uploadMessage.value = '请选择要上传的文件。'
     return
   }
 
@@ -358,22 +360,19 @@ async function exportProjectFile(row: ProjectRow) {
   closeActionMenu()
   pageError.value = ''
   const rowId = String(row.id)
-  const filename = String(row.filename || 'translated.docx')
+  const filename = String(row.filename || 'translated.txt')
 
   try {
-    const response = await http.get(`/file-records/${rowId}/export-docx`, {
+    const response = await http.get(`/file-records/${rowId}/export`, {
       responseType: 'blob',
     })
-    const blobUrl = window.URL.createObjectURL(response.data)
-    const link = document.createElement('a')
-    link.href = blobUrl
-    link.download = `${filename.replace(/\.docx$/i, '') || 'translated'}-translated.docx`
-    document.body.appendChild(link)
-    link.click()
-    link.remove()
-    window.URL.revokeObjectURL(blobUrl)
+    const downloadName = resolveDownloadFilename(
+      response.headers['content-disposition'],
+      buildTranslatedTaskFilename(filename),
+    )
+    downloadBlob(response.data, downloadName)
   } catch (error) {
-    pageError.value = getErrorMessage(error, t('projectDetail.errors.export'))
+    pageError.value = getErrorMessage(error, '导出失败。')
   }
 }
 
@@ -737,19 +736,19 @@ onBeforeUnmount(() => {
     <Modal
       :open="showUploadModal"
       :title="t('projectDetail.uploadDialog.title')"
-      :description="t('projectDetail.uploadDialog.description')"
+      description="支持 DOCX、TXT、CSV、HTML、Markdown、JSON、YAML、PO、SRT、SDLXLIFF、ZIP 等任务文件。"
       width="min(680px, calc(100vw - 32px))"
       @close="closeUploadDialog"
     >
       <div class="form-grid-2">
         <label class="field">
-          <span class="field__label">{{ t('projectDetail.fields.wordFile') }}</span>
+          <span class="field__label">源文件</span>
           <input
             :key="uploadInputKey"
             class="field__control"
             type="file"
-            accept=".docx"
-            :aria-label="t('projectDetail.fields.wordFile')"
+            :accept="supportedTaskFileAccept"
+            aria-label="源文件"
             @change="onFileChange"
           />
         </label>
