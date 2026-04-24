@@ -33,7 +33,6 @@ import { useToast } from '../composables/useToast'
 import { formatLanguagePair, getLanguageLabel } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
 import { buildTranslatedTaskFilename, supportedTaskFileAccept } from '../constants/taskFiles'
-import { useAuthStore } from '../stores/auth'
 import type { TMCollection } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 import { getProgressStyle } from '../utils/progress'
@@ -64,7 +63,6 @@ interface ProjectDetail {
 
 type ProjectRow = ProjectDetail | Record<string, any>
 
-const authStore = useAuthStore()
 const confirm = useConfirm()
 const router = useRouter()
 const toast = useToast()
@@ -200,7 +198,7 @@ function formatBytes(value: number | null | undefined) {
 }
 
 function canEnterWorkbench(row: ProjectRow) {
-  return Boolean(row.has_source_document) && Number(row.total_segments ?? 0) > 0
+  return Number(row.total_segments ?? 0) > 0
 }
 
 function getFileDetailHint(row: ProjectRow) {
@@ -211,10 +209,6 @@ function getFileDetailHint(row: ProjectRow) {
     return t('projectDetail.files.processingHint')
   }
   return t('projectDetail.common.uploadRequired')
-}
-
-function getDeleteTitle() {
-  return authStore.isAdmin ? '' : t('projectDetail.common.deleteRequiresAdmin')
 }
 
 function onFileChange(event: Event) {
@@ -378,10 +372,6 @@ async function exportProjectFile(row: ProjectRow) {
 
 async function deleteProject(row: ProjectRow) {
   closeActionMenu()
-
-  if (!authStore.isAdmin) {
-    return
-  }
 
   const rowId = String(row.id)
   const filename = String(row.filename || t('projectDetail.titleFallback'))
@@ -590,8 +580,7 @@ onBeforeUnmount(() => {
             <button
               class="button"
               type="button"
-              :disabled="!authStore.isAdmin || deleting"
-              :title="getDeleteTitle() || undefined"
+              :disabled="deleting"
               @click="deleteProject(project)"
             >
               <Trash2 :size="14" />
@@ -710,8 +699,7 @@ onBeforeUnmount(() => {
                   <button
                     class="is-danger"
                     type="button"
-                    :disabled="!authStore.isAdmin || deleting"
-                    :title="getDeleteTitle() || undefined"
+                    :disabled="deleting"
                     @click="deleteProject(row)"
                   >
                     {{ t('projectDetail.files.actions.delete') }}

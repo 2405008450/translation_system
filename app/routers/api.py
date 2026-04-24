@@ -11,7 +11,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.auth import get_current_user, get_user_display_name, require_admin
+from app.auth import get_current_user, get_user_display_name
 from app.database import get_db
 from app.models import FileRecord, Segment, TMCollection, TermBase, TranslationMemory, User
 from app.services.comment_service import (
@@ -47,6 +47,7 @@ from app.services.llm_service import (
     validate_provider_choice,
 )
 from app.services.language_pairs import require_language_pair
+from app.services.matcher import get_tm_candidates_for_text
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
 from app.services.revision_service import (
     accept_revision,
@@ -860,6 +861,56 @@ def get_file_record_preview(
     }
 
 
+@router.get("/file-records/{file_record_id}/segments/{segment_id}/tm-candidates")
+def get_segment_tm_candidates(
+    file_record_id: UUID,
+    segment_id: UUID,
+    threshold: float = 0.6,
+    db: Session = Depends(get_db),
+):
+    """获取指定句段的TM匹配候选列表"""
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    segment = db.query(Segment).filter(
+        Segment.id == segment_id,
+        Segment.file_record_id == file_record_id,
+    ).first()
+    if not segment:
+        raise HTTPException(status_code=404, detail="句段不存在。")
+
+    # 获取绑定的记忆库ID
+    collection_ids = None
+    if file_record.collection_id:
+        collection_ids = [file_record.collection_id]
+
+    candidates = get_tm_candidates_for_text(
+        db=db,
+        source_text=segment.source_text,
+        similarity_threshold=threshold,
+        collection_ids=collection_ids,
+        top_n=5,
+    )
+
+    return {
+        "segment_id": str(segment.id),
+        "source_text": segment.source_text,
+        "candidates": [
+            {
+                "source_text": c.source_text,
+                "target_text": c.target_text,
+                "score": c.score,
+                "collection_name": c.collection_name,
+                "creator_name": c.creator_name,
+                "created_at": c.created_at,
+                "updated_at": c.updated_at,
+            }
+            for c in candidates
+        ],
+    }
+
+
 @router.get("/file-records/{file_record_id}/export")
 @router.get("/documents/{file_record_id}/export", include_in_schema=False)
 @router.get("/file-records/{file_record_id}/export-docx")
@@ -1253,7 +1304,6 @@ async def llm_translate_file_record(
 def remove_file_record(
     file_record_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
 ):
     """删除文档及其所有片段"""
     success = delete_file_record(db, file_record_id)
@@ -1338,7 +1388,6 @@ def get_tm_collection(
 def create_tm_collection(
     payload: TMCollectionPayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
 ):
     name = _normalize_collection_name(payload.name)
     source_language, target_language = _require_tm_language_pair(
@@ -1371,7 +1420,6 @@ def update_tm_collection(
     collection_id: UUID,
     payload: TMCollectionPayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
 ):
     collection = _get_collection_or_404(db, collection_id)
     if collection is None:
@@ -1420,7 +1468,6 @@ def update_tm_collection(
 def delete_tm_collection(
     collection_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
 ):
     collection = _get_collection_or_404(db, collection_id)
     if collection is None:
@@ -1447,7 +1494,7 @@ async def import_tm_xlsx(
     source_language: str = Form(...),
     target_language: str = Form(...),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(get_current_user),
 ):
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
     if extension not in XLSX_EXTENSIONS:
@@ -1540,7 +1587,6 @@ def list_tm_collection_entries(
 def export_tm_collection_entries_xlsx(
     collection_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
 ):
     collection = _get_collection_or_404(db, collection_id)
     if collection is None:
@@ -1576,7 +1622,6 @@ def add_tm_collection_entry(
     collection_id: UUID,
     payload: TMEntryUpdatePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
 ):
     collection = _get_collection_or_404(db, collection_id)
     if collection is None:
@@ -1666,7 +1711,6 @@ def update_tm_entry(
     entry_id: UUID,
     payload: TMEntryUpdatePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
 ):
     entry = db.query(TranslationMemory).filter(TranslationMemory.id == entry_id).first()
     if entry is None:
@@ -1717,7 +1761,6 @@ def update_tm_entry(
 def delete_tm_entry(
     entry_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
 ):
     entry = db.query(TranslationMemory).filter(TranslationMemory.id == entry_id).first()
     if entry is None:

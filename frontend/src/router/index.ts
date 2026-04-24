@@ -85,7 +85,6 @@ const router = createRouter({
           name: 'tm',
           component: TMManagementView,
           meta: {
-            requiresAdmin: true,
             navSection: 'tm',
             pageTitle: '记忆库管理',
             pageDescription: '导入术语和双语句对，增强匹配效果',
@@ -100,7 +99,6 @@ const router = createRouter({
           component: TMCollectionEditView,
           props: true,
           meta: {
-            requiresAdmin: true,
             navSection: 'tm',
             pageTitle: '记忆库详情',
             pageDescription: '维护记忆库信息、TM 条目和导入导出操作',
@@ -113,7 +111,6 @@ const router = createRouter({
           name: 'term-base',
           component: TermBaseView,
           meta: {
-            requiresAdmin: true,
             navSection: 'term-base',
             pageTitle: '术语库管理',
             pageDescription: '管理术语库，维护翻译术语一致性',
@@ -128,7 +125,6 @@ const router = createRouter({
           component: TermBaseEditView,
           props: true,
           meta: {
-            requiresAdmin: true,
             navSection: 'term-base',
             pageTitle: '术语库详情',
             pageDescription: '维护术语库信息、术语条目和导入导出操作',
@@ -141,7 +137,6 @@ const router = createRouter({
           name: 'users',
           component: UserManagementView,
           meta: {
-            requiresAdmin: true,
             navSection: 'users',
             pageTitle: '用户管理',
             pageDescription: '创建和分配系统用户角色',
@@ -169,10 +164,6 @@ router.beforeEach(async (to) => {
       name: 'login',
       query: to.fullPath !== '/' ? { redirect: to.fullPath } : undefined,
     }
-  }
-
-  if (to.meta.requiresAdmin && !authStore.isAdmin) {
-    return { name: 'projects' }
   }
 
   return true

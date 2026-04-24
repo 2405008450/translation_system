@@ -41,6 +41,7 @@ const uiText = {
   loadFailed: '\u7528\u6237\u5217\u8868\u52a0\u8f7d\u5931\u8d25\u3002',
   createInvalid: '\u8bf7\u8f93\u5165\u81f3\u5c11 3 \u4f4d\u7528\u6237\u540d\u548c 6 \u4f4d\u5bc6\u7801\u3002',
   createFailed: '\u7528\u6237\u521b\u5efa\u5931\u8d25\u3002',
+  createForbidden: '\u53ea\u6709\u7ba1\u7406\u5458\u53ef\u4ee5\u65b0\u589e\u7528\u6237\u6216\u5206\u914d\u8d26\u53f7\u89d2\u8272\u3002',
   createSuccess: (username: string) => `\u7528\u6237 ${username} \u5df2\u521b\u5efa`,
   stats: {
     totalLabel: '\u7528\u6237\u603b\u6570',
@@ -63,6 +64,8 @@ const uiText = {
   activeStatus: '\u6b63\u5e38',
   inactiveStatus: '\u5df2\u505c\u7528',
   createHint: '\u65b0\u521b\u5efa\u7684\u8d26\u53f7\u4f1a\u7acb\u523b\u5237\u65b0\u5230\u4e0a\u65b9\u5217\u8868\uff0c\u9ed8\u8ba4\u6309\u521b\u5efa\u65f6\u95f4\u5012\u5e8f\u5c55\u793a\u3002',
+  createRestrictedTitle: '\u65b0\u589e\u7528\u6237\u5df2\u53d7\u9650',
+  createRestrictedMessage: '\u666e\u901a\u7528\u6237\u53ef\u4ee5\u67e5\u770b\u548c\u7ef4\u62a4\u8d26\u53f7\u57fa\u672c\u4fe1\u606f\uff0c\u65b0\u589e\u7528\u6237\u548c\u5206\u914d\u89d2\u8272\u4ecd\u9700\u8981\u7ba1\u7406\u5458\u64cd\u4f5c\u3002',
   operatorLabel: '\u5f53\u524d\u64cd\u4f5c\u8d26\u53f7',
   editDialogTitle: '\u7f16\u8f91\u7528\u6237',
   editDialogDescription: '\u53ef\u4fee\u6539\u6635\u79f0\u3001\u7528\u6237\u540d\u548c\u5bc6\u7801\uff0c\u5bc6\u7801\u7559\u7a7a\u5219\u4fdd\u6301\u4e0d\u53d8\u3002',
@@ -116,7 +119,12 @@ const totalUsers = computed(() => users.value.length)
 const adminUsers = computed(() => users.value.filter((item) => item.role === 'admin').length)
 const normalUsers = computed(() => users.value.filter((item) => item.role === 'user').length)
 const activeUsers = computed(() => users.value.filter((item) => item.is_active).length)
-const canCreateUser = computed(() => newUsername.value.trim().length >= 3 && newPassword.value.length >= 6)
+const canManageUserPermissions = computed(() => authStore.isAdmin)
+const canCreateUser = computed(() => (
+  canManageUserPermissions.value
+  && newUsername.value.trim().length >= 3
+  && newPassword.value.length >= 6
+))
 const editingUser = computed(() => users.value.find((item) => item.id === editingUserId.value) ?? null)
 const canUpdateUser = computed(() => (
   Boolean(editingUserId.value)
@@ -221,6 +229,12 @@ async function loadUsers() {
 }
 
 async function createUser() {
+  if (!canManageUserPermissions.value) {
+    createUserMessageTone.value = 'error'
+    createUserMessage.value = uiText.createForbidden
+    return
+  }
+
   if (!canCreateUser.value) {
     createUserMessageTone.value = 'error'
     createUserMessage.value = uiText.createInvalid
@@ -523,7 +537,7 @@ onMounted(() => {
     </section>
 
     <div class="user-management-grid">
-      <section class="panel">
+      <section v-if="canManageUserPermissions" class="panel">
         <div class="section-title">{{ t('userManagement.createTitle') }}</div>
         <div class="upload-form form-grid-2">
           <label class="field field--compact">
@@ -596,6 +610,11 @@ onMounted(() => {
         >
           {{ createUserMessage }}
         </p>
+      </section>
+
+      <section v-else class="panel user-restricted-panel">
+        <div class="section-title">{{ uiText.createRestrictedTitle }}</div>
+        <p class="user-section-note">{{ uiText.createRestrictedMessage }}</p>
       </section>
 
       <section class="panel">

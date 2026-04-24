@@ -8,6 +8,26 @@ NicknameStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length
 PasswordStr = Annotated[str, StringConstraints(min_length=6, max_length=128)]
 
 
+class TMMatchCandidate(BaseModel):
+    """单个TM匹配候选"""
+    source_text: str
+    target_text: str
+    score: float
+    collection_name: str | None = None
+    creator_name: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class TermMatchCandidate(BaseModel):
+    """单个术语匹配候选"""
+    source_text: str
+    target_text: str
+    term_base_name: str | None = None
+    creator_name: str | None = None
+    updated_at: str | None = None
+
+
 class MatchResult(BaseModel):
     source_sentence: str
     status: str = Field(pattern="^(exact|fuzzy|none)$")
@@ -19,6 +39,8 @@ class MatchResult(BaseModel):
     matched_updated_at: str | None = None
     target_text: str | None = None
     sentence_id: str = ""
+    # 多个TM匹配候选（Top 5）
+    tm_candidates: list[TMMatchCandidate] = []
 
 
 class UserRead(BaseModel):

@@ -314,6 +314,7 @@ body.modal-open {
   grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   min-height: 100vh;
   align-items: start;
+  transition: grid-template-columns 0.22s ease;
 }
 
 .app-frame.is-sidebar-collapsed {
@@ -346,6 +347,7 @@ body.modal-open {
   display: flex;
   align-items: center;
   gap: 10px;
+  position: relative;
   padding: 16px 16px 12px;
   border-bottom: 1px solid var(--sidebar-divider);
 }
@@ -427,6 +429,35 @@ body.modal-open {
 
 .sidebar-brand p {
   display: none;
+}
+
+.sidebar-collapse-button {
+  display: inline-grid;
+  place-items: center;
+  position: absolute;
+  top: 50%;
+  right: 0;
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--sidebar-text);
+  box-shadow: none;
+  transform: translateY(-50%);
+  transition: background 0.15s, color 0.15s;
+}
+
+.sidebar-collapse-button:hover {
+  background: var(--sidebar-hover-bg);
+  color: var(--sidebar-text-bright);
+}
+
+.sidebar-collapse-button .lucide {
+  width: 18px;
+  height: 18px;
 }
 
 .sidebar-toggle {
@@ -731,6 +762,19 @@ body.modal-open {
 
 .app-sidebar.is-collapsed .sidebar-brand__identity {
   justify-content: center;
+}
+
+.app-sidebar.is-collapsed .sidebar-collapse-button {
+  position: static;
+  width: 36px;
+  min-width: 36px;
+  height: 32px;
+  transform: none;
+}
+
+.app-sidebar.is-collapsed .sidebar-nav__group-header {
+  justify-content: center;
+  padding: 10px 6px;
 }
 
 .app-sidebar.is-collapsed .sidebar-nav__group-header span,
