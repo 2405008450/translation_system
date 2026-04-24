@@ -1,200 +1,196 @@
-﻿# AI Translation System
+# AI Translation System
 
-基于 **FastAPI + Vue 3 + PostgreSQL** 的全栈翻译记忆（TM）工作台，支持：
+基于 **FastAPI + Vue 3 + PostgreSQL** 的内部翻译项目工作台。系统围绕项目创建、语言资产导入、源文档解析、TM/术语辅助、AI 修正、人工审校和译后文件导出组织流程，当前前端已经从早期的单一 DOCX Demo 演进为项目管理 + 任务工作台 + 语言资产管理的一体化应用。
 
-- DOCX 上传解析、句段切分、TM 命中（精确 + trigram 模糊 + pgvector 语义）
-- 翻译工作台：段落 / 表格感知编辑、译文预览、DOCX 导出
-- LLM 二次润色修正（DeepSeek / OpenRouter，支持多 provider fallback 与 SSE 流式进度）
-- 多记忆库（TM Collections）与 XLSX 批量导入
-- 句段级批注（带锚点 + 嵌套回复 + 解决状态）
-- 用户 / 管理员体系（JWT + 首次安装初始化管理员）
+## 功能概览
 
----
+- **项目与任务管理**：创建翻译项目，维护源语言、目标语言、截止时间、访问级别、创建人、处理进度；项目详情页上传源文档，任务页进入工作台。
+- **多格式任务解析**：支持 DOCX 以及文本、本地化、网页、字幕、技术写作、双语交换和部分工程/设计文件的句段抽取与原格式导出。
+- **翻译记忆库（TM）**：按记忆库分组管理双语句对，支持 XLSX/CSV 导入、条目维护、XLSX 导出、精确匹配、trigram 模糊匹配和 pgvector 语义候选。
+- **术语库**：独立术语库与术语条目管理，支持 XLSX 导入导出，并在工作台按当前语言对和句段内容推荐术语。
+- **翻译工作台**：句段分页/懒加载、原文/译文/分屏预览、自动保存、TM 候选、术语面板、修改快照、批注与嵌套回复。
+- **AI 修正**：对 exact / fuzzy / none 不同范围触发 LLM 修正，支持 DeepSeek、OpenRouter 和自动选择，SSE 流式返回进度并写回句段。
+- **用户与权限**：首次初始化管理员、JWT 登录、管理员创建用户、用户昵称、基础角色区分。
+
+## 技术栈
+
+| 层级 | 技术 |
+| --- | --- |
+| 后端 | FastAPI、SQLAlchemy 2、Pydantic Settings、python-docx、openpyxl、httpx |
+| 前端 | Vue 3、Vite、TypeScript、Pinia、Vue Router、vue-i18n、Axios、lucide-vue-next |
+| 数据库 | PostgreSQL、pg_trgm、pgvector |
+| 缓存 | Redis 可选；未配置时使用进程内存缓存 |
+| AI Provider | DeepSeek、OpenRouter |
+
+## 当前支持的任务文件
+
+前端任务入口和后端任务白名单当前支持：
+
+```text
+.docx
+.txt, .csv
+.html, .htm, .md, .markdown
+.json, .yaml, .yml, .php, .properties
+.po, .pot, .strings, .srt
+.dita, .ditamap, .xml, .svg
+.sdlxliff, .txml
+.dxf, .idml, .mif
+.zip
+```
+
+说明：
+
+- DOCX 使用专用解析与导出逻辑，尽量保留段落、表格、页眉页脚、脚注、尾注、编号和部分内联样式。
+- 其他格式走 `app/services/adapters/` 下的格式适配器，译后导出优先使用原格式；部分格式也支持 TMX / XLIFF / 双语文本等导出能力。
+- 代码中存在 PDF、PPTX、XLSX、RAR 等适配器文件，但当前任务入口白名单与前端上传选择未开放这些格式。
 
 ## 目录结构
 
 ```text
-app/                          # FastAPI 后端
-  main.py                     # 入口：加载 SPA + 挂载 /api
-  config.py                   # pydantic-settings 配置
-  database.py                 # SQLAlchemy Engine
-  models.py                   # ORM 模型
-  schemas.py                  # 请求/响应 schema
-  auth.py                     # JWT + 口令校验
+app/                                  # FastAPI 后端
+  main.py                             # 应用入口，挂载 /api 与生产 SPA
+  config.py                           # 环境变量配置与启动校验
+  database.py                         # SQLAlchemy Engine / Session
+  models.py                           # ORM 模型
+  schemas.py                          # 请求/响应 Schema
+  auth.py                             # JWT、密码、用户工具
   routers/
-    auth.py                   # /api/auth/*
-    api.py                    # /api/* 业务端点
+    auth.py                           # /api/auth/*
+    api.py                            # 项目、任务、TM、批注、AI 等接口
+    term_base.py                      # /api/term-bases*
   services/
-    file_parser.py            # 通用文本解析
-    slate_parser.py           # DOCX 结构化解析
-    sentence_splitter.py      # 句段切分
-    normalizer.py             # 文本归一化 / 哈希
-    matcher.py                # TM 精确 + 模糊匹配
-    tm_vector.py              # pgvector 语义检索
-    tm_importer.py            # XLSX 导入
-    file_record_service.py    # 文档/句段 CRUD
-    document_workspace.py     # 工作台装配
-    document_storage.py       # 源 DOCX 存储
-    document_exporter.py      # 导出译文 DOCX
-    comment_service.py        # 批注逻辑
-    llm_service.py            # LLM 调用 + 多 provider
-    cache.py                  # Redis + 内存 fallback
-frontend/                     # Vue 3 + Vite 前端
+    task_file_service.py              # 多格式任务解析/预览/导出统一入口
+    document_workspace.py             # DOCX 解析与 HTML 预览
+    document_exporter.py              # DOCX 译后导出
+    file_record_service.py            # 项目/任务/句段持久化
+    matcher.py                        # TM 精确、模糊、语义匹配
+    tm_vector.py                      # pgvector embedding 同步
+    tm_importer.py                    # TM XLSX 导入
+    term_importer.py                  # 术语 XLSX 导入
+    revision_service.py               # 句段修改历史
+    comment_service.py                # 批注与回复
+    llm_service.py                    # LLM 调用、fallback、并发与重试
+    adapters/                         # 多格式解析与导出适配器
+
+frontend/                             # Vue 3 + Vite 前端
   src/
-    views/                    # 登录 / 工作台 / TM / 用户管理
-    components/               # 预览、编辑器、批注等组件
-    stores/                   # Pinia stores
-    router/                   # 前端路由
-scripts/
-  init_db.sql                 # 一次性建表脚本（推荐使用）
-  insert_test_data.sql        # 可选：塞一批示例 TM
-  import_tm.py                # 命令行：CSV 导入 TM
-  import_tm_xlsx.py           # 命令行：XLSX 导入 TM
-  rebuild_tm_fields.py        # 重建 source_hash / normalized
-  rebuild_tm_embeddings.py    # 重建 / 回填 pgvector embedding
-  deduplicate_tm_source_hash.py  # 按 source_hash 去重
-  add_tm_pgvector_support.sql    # 旧库补 pgvector 列（迁移用）
-  create_document_tables.sql     # 旧库补建文档相关表（迁移用）
-  rename_documents_to_file_records.sql  # 旧库 documents→file_records 改名
-  migrate_primary_keys_to_uuid.sql      # 旧库主键迁移到 UUID
+    views/                            # 项目、任务、工作台、TM、术语、用户页面
+    components/                       # 表格、预览、句段编辑、批注、资源导入等组件
+    stores/                           # Pinia：auth/task/segment/comment/shell/preferences
+    constants/                        # 语言、状态、LLM、任务文件配置
+    locales/                          # 中文文案
+    router/                           # 前端路由
+
+scripts/                              # 数据库初始化、迁移、导入与维护脚本
+tests/                                # pytest 测试
+data/file_records/                    # 默认源文件存储目录
 requirements.txt
 .env.example
 ```
 
-> 仅新部署：`scripts/init_db.sql` 已经是全量脚本，其他 `scripts/*.sql` 只在存量库迁移时才需要。
+## 环境准备
 
----
-
-## 1. 环境准备
-
-| 组件 | 版本 | 备注 |
+| 组件 | 建议版本 | 说明 |
 | --- | --- | --- |
-| Python | 3.11+ | 后端 |
-| Node.js | 18+（推荐 20 LTS） | 前端构建 |
-| PostgreSQL | 14+ | 需安装 `pg_trgm` 与 `pgvector` 扩展 |
-| Redis | 5+（可选） | 缓存；未配置时自动回退到内存 |
+| Python | 3.11+ | 后端运行环境 |
+| Node.js | 18+，推荐 20 LTS | 前端开发与构建 |
+| PostgreSQL | 14+ | 需要 `pg_trgm` 和 `pgvector` |
+| Redis | 5+，可选 | 配置 `REDIS_URL` 后用于缓存 |
 
-### 1.1 安装 PostgreSQL 扩展
+### PostgreSQL 扩展
 
-Windows 可直接使用 PostgreSQL 官方安装包，`pg_trgm` 自带；`pgvector` 需要额外安装：
+`pg_trgm` 通常随 PostgreSQL 自带；`pgvector` 需要额外安装到当前 PostgreSQL 实例。
 
-- 官方安装指引：https://github.com/pgvector/pgvector#installation
-- Windows 推荐下载 [pgvector 的 release zip](https://github.com/pgvector/pgvector/releases)，把 `vector.dll` / `vector--*.sql` / `vector.control` 按扩展名放到 PostgreSQL 对应目录（`lib/` 与 `share/extension/`）。
+- 官方文档：https://github.com/pgvector/pgvector#installation
+- Windows 可下载 pgvector release zip，将 `vector.dll`、`vector--*.sql`、`vector.control` 放到 PostgreSQL 对应的 `lib/` 和 `share/extension/` 目录。
 
-扩展本身的 `CREATE EXTENSION` 会在初始化 SQL 里执行，不用提前手动创建。
+初始化 SQL 会执行 `CREATE EXTENSION IF NOT EXISTS pg_trgm;` 与 `CREATE EXTENSION IF NOT EXISTS vector;`，因此执行初始化脚本时建议使用 PostgreSQL 超级用户。
 
----
+## 快速开始
 
-## 2. 克隆仓库
+### 1. 创建数据库
 
-```bash
-git clone <your-repo-url>.git
-cd AI_translation_system12312
-```
-
----
-
-## 3. 数据库初始化
-
-### 3.1 创建数据库与账号（超级用户下执行，只需一次）
+以 `postgres` 超级用户登录后执行一次：
 
 ```sql
--- 以 postgres 超级用户登录 psql 后执行
 CREATE USER tm_user WITH PASSWORD 'tm123456';
 CREATE DATABASE tm_demo OWNER tm_user;
 GRANT ALL PRIVILEGES ON DATABASE tm_demo TO tm_user;
 ```
 
-### 3.2 建表 + 扩展 + 索引（用超级用户连接 tm_demo 执行）
+### 2. 初始化当前 schema
+
+当前仓库里的 `init_db.sql` 覆盖基础表、扩展和多数索引；项目管理、资源绑定、创建者字段等最新增量由后续脚本补齐。新库建议按下面顺序全部执行一遍，脚本均按幂等方式编写：
 
 ```powershell
 psql -U postgres -d tm_demo -f scripts/init_db.sql
+psql -U postgres -d tm_demo -f scripts/add_user_nickname.sql
+psql -U postgres -d tm_demo -f scripts/create_segment_revisions.sql
+psql -U postgres -d tm_demo -f scripts/add_project_fields.sql
+psql -U postgres -d tm_demo -f scripts/add_file_record_resource_binding.sql
+psql -U postgres -d tm_demo -f scripts/add_creator_to_entries.sql
 ```
 
-> `CREATE EXTENSION pg_trgm / vector` 需要超级用户；建表后可以把日常读写权限交给 `tm_user`。
+涉及的核心表：
 
-`scripts/init_db.sql` 幂等，可以多次运行。涉及的表：
+- `users`：用户、昵称、角色、启用状态
+- `memory_bases` / `memory_entries`：TM 记忆库与双语句对
+- `term_bases` / `term_entries`：术语库与术语条目
+- `file_records`：项目/任务记录、语言对、资源绑定、截止时间
+- `segments`：句段、匹配状态、译文、结构定位、匹配来源信息
+- `segment_comments`：句段批注、选区锚点、嵌套回复
+- `segment_revisions`：人工修改与 AI 写回的修改快照
 
-- `memory_bases`：TM 记忆库分组
-- `memory_entries`：翻译记忆条目（含 trigram + pgvector 双路索引）
-- `file_records`：上传的文件 / 翻译任务记录
-- `segments`：句段及匹配状态
-- `users`：用户 / 角色（`admin` / `user`）
-- `segment_comments`：句段批注与嵌套回复
-
-如果你是从旧版库升级，且库里还存在 `tm_collections` / `translation_memory`，先执行：
+旧库升级时，如果仍存在 `tm_collections` / `translation_memory` 等旧表名，先执行：
 
 ```powershell
 psql -U postgres -d tm_demo -f scripts/rename_translation_memory_tables.sql
 ```
 
-该脚本会把旧 TM 表直接改名为 `memory_bases` / `memory_entries`，同时清理旧术语表 `termbase_collections` / `terms`。
-
-### 3.3（可选）导入示例 TM
+如果旧库仍是非 UUID 主键，再根据现场情况执行：
 
 ```powershell
-psql -U postgres -d tm_demo -f scripts/insert_test_data.sql
+psql -U postgres -d tm_demo -f scripts/migrate_primary_keys_to_uuid.sql
 ```
 
----
+### 3. 配置环境变量
 
-## 4. 环境变量
-
-复制模板后根据实际情况填写：
+复制模板：
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-关键项（完整字段见 `.env.example`）：
+重点配置项：
 
-- `DATABASE_URL`：SQLAlchemy 格式的 PostgreSQL 连接串
-- `JWT_SECRET_KEY`：**必须替换为一段长随机字符串**，否则后端会拒绝启动
-- `DEEPSEEK_API_KEY` / `OPENROUTER_API_KEY`：LLM 修正功能的 provider，至少配一个
-- `REDIS_URL`：可选；不配置时自动使用进程内存缓存
-- `TM_VECTOR_*`：语义向量检索的开关与权重
+| 变量 | 说明 |
+| --- | --- |
+| `DATABASE_URL` | SQLAlchemy PostgreSQL 连接串，例如 `postgresql+psycopg://tm_user:tm123456@localhost:5432/tm_demo` |
+| `JWT_SECRET_KEY` | 必须替换为长随机字符串；保持默认值会拒绝启动 |
+| `FILE_STORAGE_DIR` | 源文件存储目录，默认 `data/file_records` |
+| `UPLOAD_MAX_SIZE_MB` | 上传文件大小限制 |
+| `DEFAULT_SIMILARITY_THRESHOLD` | 默认 TM 模糊匹配阈值 |
+| `REDIS_URL` | 可选；不配置时使用内存缓存 |
+| `TM_VECTOR_*` | pgvector 语义检索开关、维度、候选数和权重 |
+| `DEEPSEEK_*` / `OPENROUTER_*` | LLM Provider 配置，AI 修正至少需要一个 API Key |
+| `LLM_TIMEOUT_SECONDS` / `LLM_MAX_CONCURRENCY` | LLM 超时与并发控制 |
 
-> `.env` 已在 `.gitignore` 中，仓库只保留 `.env.example`。敏感密钥请通过私聊/密管平台分发。
+`.env` 已在 `.gitignore` 中，密钥不要提交到仓库。
 
----
-
-## 5. 后端安装与启动
-
-### 5.1 创建虚拟环境并安装依赖
+### 4. 启动后端
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 19013 --reload
 ```
 
-### 5.2 启动开发服务
+- 开发后端：`http://127.0.0.1:19013`
+- API 文档：`http://127.0.0.1:19013/docs`
+- `--host 0.0.0.0` 用于允许局域网访问；Windows 防火墙需要放行端口。
 
-```powershell
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 19003 --reload
-```
-
-- `--host 0.0.0.0`：允许局域网访问
-- 本机访问：`http://127.0.0.1:19003`
-- 注意 Windows 防火墙要放行该端口
-
-### 5.3 首次初始化管理员
-
-打开前端 `http://<host>:19003/`，如果数据库里还没有任何用户，会进入首次初始化流程；也可以直接调用接口：
-
-```bash
-curl -X POST http://127.0.0.1:19003/api/auth/init \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"your-strong-password"}'
-```
-
-之后登录使用：`POST /api/auth/login`，拿到 JWT 后即可访问业务接口。
-
----
-
-## 6. 前端安装与启动
-
-### 6.1 开发模式（带热更新）
+### 5. 启动前端
 
 ```powershell
 cd frontend
@@ -202,14 +198,29 @@ npm install
 npm run dev
 ```
 
-默认监听 `http://127.0.0.1:5173`，并把 `/api` 代理到 `http://127.0.0.1:19013`。
-如果后端监听在其他端口（例如 `19003`），可以在 `frontend/` 下建 `.env.local`：
+开发前端默认地址：`http://127.0.0.1:5173`
+
+`frontend/vite.config.ts` 默认把 `/api` 代理到 `http://127.0.0.1:19013`。如果后端端口不同，在 `frontend/.env.local` 中覆盖：
 
 ```env
 VITE_API_PROXY_TARGET=http://127.0.0.1:19003
 ```
 
-### 6.2 生产模式（由 FastAPI 直接托管 SPA）
+### 6. 首次初始化管理员
+
+打开 `http://127.0.0.1:5173/login`。如果数据库中还没有任何用户，登录页会进入初始化管理员流程。
+
+也可以直接调用接口：
+
+```bash
+curl -X POST http://127.0.0.1:19013/api/auth/init \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","nickname":"管理员","password":"your-strong-password"}'
+```
+
+## 生产构建
+
+前端构建后由 FastAPI 直接托管：
 
 ```powershell
 cd frontend
@@ -217,99 +228,164 @@ npm install
 npm run build
 ```
 
-构建产物会输出到 `frontend/dist`。后端启动时会自动挂载：
+构建产物输出到 `frontend/dist`。后端启动后会挂载：
 
 - `/assets/*`：静态资源
-- `/`、`/*`：回退到 `frontend/dist/index.html` 以支持 Vue Router history 模式
+- `/` 与 `/*`：回退到 `frontend/dist/index.html`，支持 Vue Router history 模式
 
-此时只需访问后端端口（例如 `http://<host>:19003/`）即可使用整站。
+生产访问后端端口即可，例如 `http://127.0.0.1:19013/`。
 
----
-
-## 7. 常用维护脚本
-
-> 下面命令在激活虚拟环境 (`.\.venv\Scripts\activate`) 且已设置 `DATABASE_URL` 后执行。
-
-### 7.1 CSV 导入 TM
+## 常用开发命令
 
 ```powershell
-python scripts/import_tm.py --database-url "$env:DATABASE_URL" --csv-path sample_tm.csv
+# 后端开发
+.\.venv\Scripts\activate
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 19013 --reload
+
+# 前端开发
+cd frontend
+npm run dev
+
+# 前端类型检查与构建
+cd frontend
+npm run build
+
+# 后端测试（需要已安装 pytest）
+python -m pytest tests
 ```
 
-### 7.2 XLSX 导入 TM
+## 语言资产维护
+
+### TM CSV 导入
 
 ```powershell
-python scripts/import_tm_xlsx.py --database-url "$env:DATABASE_URL" --xlsx-path your_tm.xlsx --batch-size 5000
+python scripts/import_tm.py `
+  --database-url "$env:DATABASE_URL" `
+  --csv-path sample_tm.csv `
+  --source-language zh-CN `
+  --target-language en-US `
+  --collection-id <memory-base-uuid>
 ```
 
-### 7.3 重建 `source_hash` / `source_normalized`
+### TM XLSX 导入
+
+Excel 约定：第一列为源文，第二列为译文。
+
+```powershell
+python scripts/import_tm_xlsx.py `
+  --database-url "$env:DATABASE_URL" `
+  --xlsx-path your_tm.xlsx `
+  --source-language zh-CN `
+  --target-language en-US `
+  --collection-id <memory-base-uuid> `
+  --batch-size 5000
+```
+
+### 术语 XLSX 导入
+
+Excel 约定：第一列为源术语，第二列为目标术语。
+
+```powershell
+python scripts/import_term_xlsx.py `
+  --database-url "$env:DATABASE_URL" `
+  --xlsx-path your_terms.xlsx `
+  --term-base-id <term-base-uuid> `
+  --source-language zh-CN `
+  --target-language en-US `
+  --batch-size 5000
+```
+
+### 重建 TM 归一化字段
 
 ```powershell
 python scripts/rebuild_tm_fields.py --database-url "$env:DATABASE_URL" --batch-size 1000
 ```
 
-### 7.4 回填 / 重建 pgvector embedding
+### 回填 / 重建 pgvector embedding
 
 ```powershell
 python scripts/rebuild_tm_embeddings.py --database-url "$env:DATABASE_URL" --batch-size 500
 ```
 
-首次开启向量检索或修改 `TM_VECTOR_DIMENSIONS` 后都需要跑一次（可加 `--rebuild-all`）。
-
-### 7.5 按 `source_hash` 去重
+首次开启向量检索、重新安装 pgvector、修改 `TM_VECTOR_DIMENSIONS` 或需要全量刷新时使用：
 
 ```powershell
+python scripts/rebuild_tm_embeddings.py --database-url "$env:DATABASE_URL" --batch-size 500 --rebuild-all
+```
+
+### 按 source_hash 去重
+
+先 dry-run 查看，再确认执行：
+
+```powershell
+python scripts/deduplicate_tm_source_hash.py --database-url "$env:DATABASE_URL"
 python scripts/deduplicate_tm_source_hash.py --database-url "$env:DATABASE_URL" --apply
 ```
 
----
+## API 速查
 
-## 8. API 速查
+所有业务接口均带 `/api` 前缀。除 `/api/auth/init` 与 `/api/auth/login` 外，默认需要：
 
-所有业务接口都在 `/api` 前缀下，除 `/api/auth/*` 外默认需要 `Authorization: Bearer <token>`。
+```http
+Authorization: Bearer <token>
+```
 
 | 模块 | 方法 | 路径 | 说明 |
 | --- | --- | --- | --- |
 | 认证 | GET | `/api/auth/init` | 查询是否需要首次初始化 |
 | 认证 | POST | `/api/auth/init` | 首次创建管理员 |
-| 认证 | POST | `/api/auth/login` | 登录换取 JWT |
-| 认证 | GET | `/api/auth/me` | 当前用户信息 |
-| 认证 | POST | `/api/auth/register` | 管理员创建新用户 |
-| 文档 | POST | `/api/file-records` | 上传 DOCX 并创建翻译任务 |
-| 文档 | GET | `/api/file-records` | 文档列表 |
-| 文档 | GET | `/api/file-records/{id}` | 文档 + 分页句段 |
-| 文档 | GET | `/api/file-records/{id}/preview` | HTML 预览 |
-| 文档 | GET | `/api/file-records/{id}/export-docx` | 导出译文 DOCX |
-| 文档 | PUT | `/api/file-records/{id}/segments/{sentence_id}` | 更新单个译文 |
-| 文档 | PUT | `/api/file-records/{id}/segments` | 批量更新译文 |
-| 文档 | POST | `/api/file-records/{id}/llm-translate` | SSE 流式 LLM 修正 |
-| 文档 | DELETE | `/api/file-records/{id}` | 删除（管理员） |
-| 批注 | GET/POST | `/api/file-records/{id}/comments` | 列表 / 新建 |
-| 批注 | PATCH/DELETE | `/api/comments/{id}` | 更新 / 删除 |
-| 批注 | POST | `/api/comments/{id}/replies` | 嵌套回复 |
-| TM | GET/POST/PUT/DELETE | `/api/translation-memory/collections[/{id}]` | 记忆库 CRUD |
-| TM | POST | `/api/translation-memory/import-xlsx` | XLSX 导入（管理员） |
-| TM | POST | `/api/translation-memory/entries` | 单条新增（去重） |
-| TM | POST | `/api/translation-memory/entries/batch` | 批量新增（去重） |
-| 解析 | POST | `/api/parser/workspace` | 仅解析不落库，返回工作台结构 |
+| 认证 | POST | `/api/auth/login` | 登录并获取 JWT |
+| 认证 | GET | `/api/auth/me` | 当前用户 |
+| 用户 | GET | `/api/auth/users` | 用户列表 |
+| 用户 | POST | `/api/auth/register` | 管理员创建用户 |
+| 用户 | PATCH | `/api/auth/users/{id}` | 更新用户名、昵称或密码 |
+| 项目 | GET/POST | `/api/projects` | 项目列表 / 新建项目 |
+| 项目 | GET | `/api/projects/{id}` | 项目详情与进度 |
+| 项目 | POST | `/api/projects/{id}/source-document` | 为项目上传源文档并生成句段 |
+| 任务 | POST | `/api/file-records` | 直接上传任务文件 |
+| 任务 | GET | `/api/file-records` | 任务列表 |
+| 任务 | GET | `/api/file-records/{id}` | 任务详情与分页句段 |
+| 任务 | GET | `/api/file-records/{id}/preview` | 原文预览 HTML |
+| 任务 | GET | `/api/file-records/{id}/export` | 导出译后文件 |
+| 句段 | PUT | `/api/file-records/{id}/segments/{sentence_id}` | 更新单个译文 |
+| 句段 | PUT | `/api/file-records/{id}/segments` | 批量更新译文 |
+| 句段 | GET | `/api/file-records/{id}/segments/{segment_id}/tm-candidates` | 查看 TM 候选 |
+| 历史 | GET | `/api/file-records/{id}/revisions` | 修改快照列表 |
+| 历史 | PATCH | `/api/revisions/{revision_id}` | 接受或拒绝修改快照 |
+| 历史 | POST | `/api/file-records/{id}/revisions/batch-accept` | 批量接受 |
+| 历史 | POST | `/api/file-records/{id}/revisions/batch-reject` | 批量拒绝 |
+| 批注 | GET/POST | `/api/file-records/{id}/comments` | 批注列表 / 新建批注 |
+| 批注 | PATCH/DELETE | `/api/comments/{id}` | 更新 / 删除批注 |
+| 批注 | POST | `/api/comments/{id}/replies` | 创建嵌套回复 |
+| AI | POST | `/api/file-records/{id}/llm-translate` | SSE 流式 AI 修正 |
+| TM | GET/POST | `/api/translation-memory/collections` | 记忆库列表 / 新建 |
+| TM | GET/PUT/DELETE | `/api/translation-memory/collections/{id}` | 记忆库详情 / 更新 / 删除 |
+| TM | GET/POST | `/api/translation-memory/collections/{id}/entries` | 条目列表 / 新增 |
+| TM | PUT/DELETE | `/api/translation-memory/entries/{id}` | 更新 / 删除条目 |
+| TM | POST | `/api/translation-memory/import-xlsx` | XLSX 导入 TM |
+| TM | GET | `/api/translation-memory/collections/{id}/export-xlsx` | XLSX 导出 TM |
+| 术语 | GET/POST | `/api/term-bases` | 术语库列表 / 新建 |
+| 术语 | GET/PUT/DELETE | `/api/term-bases/{id}` | 术语库详情 / 更新 / 删除 |
+| 术语 | GET/POST | `/api/term-bases/{id}/entries` | 术语条目列表 / 新增 |
+| 术语 | PUT/DELETE | `/api/term-entries/{id}` | 更新 / 删除术语条目 |
+| 术语 | POST | `/api/term-bases/import-xlsx` | XLSX 导入术语 |
+| 术语 | GET | `/api/term-bases/{id}/export-xlsx` | XLSX 导出术语 |
+| 解析 | POST | `/api/parser/workspace` | 仅解析文件并返回工作台结构，不落库 |
 
-更多细节直接看 `app/routers/api.py` 与 FastAPI 自带的 `/docs` 页。
+`/api/documents/*` 与 `/api/tm/*` 仍保留为兼容旧前端的隐藏别名，新开发建议使用上表中的新路径。
 
----
+## 常见问题
 
-## 9. 常见问题
+- **启动报 `JWT_SECRET_KEY` 仍为默认值**：复制 `.env.example` 后必须修改 `JWT_SECRET_KEY`，并确认启动命令在项目根目录执行。
+- **前端 `/api` 请求失败**：开发模式默认代理到 `http://127.0.0.1:19013`，确认后端端口一致；否则配置 `frontend/.env.local` 的 `VITE_API_PROXY_TARGET`。
+- **`CREATE EXTENSION vector` 失败**：pgvector 未安装到当前 PostgreSQL 实例，安装后再执行初始化脚本。
+- **上传任务提示必须选择 TM 记忆库**：当前解析会限制在已选择的记忆库中做匹配，需要先创建并选择至少一个语言对一致的记忆库。
+- **语言对不一致**：项目、TM 记忆库和术语库都有语言对校验，上传或导入时需要保持一致。
+- **AI 修正不可用**：至少配置 `DEEPSEEK_API_KEY` 或 `OPENROUTER_API_KEY`；也要确认 `provider` 选择与实际配置一致。
+- **导出失败**：源文件缺失或当前格式未开放原格式导出时会失败；DOCX 需要保留原始源文件。
+- **TM 向量命中慢或为空**：确认已安装 pgvector、执行 `scripts/add_tm_pgvector_support.sql`，并运行 `scripts/rebuild_tm_embeddings.py` 回填 embedding。
+- **局域网无法访问**：后端启动使用 `--host 0.0.0.0`，并放行 Windows 防火墙端口。
 
-- **启动报 "JWT_SECRET_KEY 仍为默认值"**：检查 `.env` 是否真的生效（工作目录要在项目根），并替换为长随机字符串。
-- **`CREATE EXTENSION vector` 失败**：说明 pgvector 没装到当前 PostgreSQL 实例，参考第 1.1 节。
-- **`ix_memory_entries_source_embedding_ivfflat` 初次命中慢**：ivfflat 索引训练后建议执行 `VACUUM ANALYZE memory_entries;` 并调整 `lists` / `ivfflat.probes`。
-- **LLM 修正不可用**：至少配置 `DEEPSEEK_API_KEY` 或 `OPENROUTER_API_KEY`，否则调用 `llm-translate` 会返回 400。
-- **局域网无法访问**：后端启动参数用 `--host 0.0.0.0`，并放行 Windows 防火墙端口。
-- **前端开发时 `/api` 404**：检查 `frontend/.env.local` 中的 `VITE_API_PROXY_TARGET` 是否指向真正的后端端口。
+## 许可证
 
----
-
-## 10. 许可证
-
-内部项目，默认保留所有权利。需要开源请自行在此处补充 LICENSE。
-
-
+内部项目，默认保留所有权利。如需开源，请补充正式 LICENSE。

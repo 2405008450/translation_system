@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     )
     file_storage_dir: str = "data/file_records"
     upload_max_size_mb: int = 10
-    default_similarity_threshold: float = 0.60
+    default_similarity_threshold: float = 0.80
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-v4-flash*"

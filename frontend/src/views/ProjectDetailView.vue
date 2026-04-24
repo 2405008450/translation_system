@@ -33,7 +33,7 @@ import { useToast } from '../composables/useToast'
 import { formatLanguagePair, getLanguageLabel } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
 import { buildTranslatedTaskFilename, supportedTaskFileAccept } from '../constants/taskFiles'
-import type { TMCollection } from '../types/api'
+import type { TermBase, TMCollection } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 import { getProgressStyle } from '../utils/progress'
 
@@ -55,6 +55,7 @@ interface ProjectDetail {
   creator: string | null
   deadline: string | null
   access_level: string | null
+  term_base_id: string | null
   created_at: string
   updated_at: string
   has_source_document: boolean
@@ -73,13 +74,16 @@ const deleting = ref(false)
 const uploading = ref(false)
 const uploadPercent = ref(0)
 const loadingCollections = ref(false)
+const loadingTermBases = ref(false)
 const project = ref<ProjectDetail | null>(null)
 const pageError = ref('')
 const uploadMessage = ref('')
 const selectedFile = ref<File | null>(null)
 const threshold = ref(0.6)
 const tmCollections = ref<TMCollection[]>([])
+const termBases = ref<TermBase[]>([])
 const selectedCollectionIds = ref<string[]>([])
+const selectedTermBaseId = ref('')
 const basicCollapsed = ref(false)
 const activeTab = ref<ProjectTab>('files')
 const showUploadModal = ref(false)
@@ -132,6 +136,17 @@ const uploadButtonTitle = computed(() => {
     return t('projectDetail.hints.noCollections')
   }
   return ''
+})
+
+const availableTermBases = computed(() => {
+  if (!project.value?.source_language || !project.value?.target_language) {
+    return termBases.value
+  }
+
+  return termBases.value.filter((termBase) => (
+    termBase.source_language === project.value?.source_language
+    && termBase.target_language === project.value?.target_language
+  ))
 })
 
 usePageHeader(() => ({
@@ -228,6 +243,7 @@ function openUploadDialog() {
   }
 
   resetUploadForm()
+  selectedTermBaseId.value = project.value?.term_base_id || ''
   showUploadModal.value = true
 }
 
@@ -277,6 +293,7 @@ async function loadProject() {
   try {
     const { data } = await http.get<ProjectDetail>(`/projects/${props.id}`)
     project.value = data
+    selectedTermBaseId.value = data.term_base_id || ''
     currentPage.value = 1
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.load'))
@@ -298,6 +315,19 @@ async function loadTMCollections() {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.collectionsLoad'))
   } finally {
     loadingCollections.value = false
+  }
+}
+
+async function loadTermBases() {
+  loadingTermBases.value = true
+
+  try {
+    const { data } = await http.get<TermBase[]>('/term-bases')
+    termBases.value = data
+  } catch (error) {
+    console.error('Failed to load term bases:', error)
+  } finally {
+    loadingTermBases.value = false
   }
 }
 
@@ -324,6 +354,9 @@ async function uploadSourceDocument() {
     selectedCollectionIds.value.forEach((collectionId) => {
       formData.append('collection_ids', collectionId)
     })
+    if (selectedTermBaseId.value) {
+      formData.append('term_base_id', selectedTermBaseId.value)
+    }
 
     await http.post(`/projects/${props.id}/source-document`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
@@ -405,6 +438,7 @@ onMounted(() => {
   document.addEventListener('click', handleDocumentClick)
   void loadProject()
   void loadTMCollections()
+  void loadTermBases()
 })
 
 onBeforeUnmount(() => {
@@ -752,6 +786,24 @@ onBeforeUnmount(() => {
             max="1"
             :aria-label="t('projectDetail.fields.threshold')"
           />
+        </label>
+
+        <label class="field field--full">
+          <span class="field__label">{{ t('taskList.fields.termBase') }}</span>
+          <select
+            v-model="selectedTermBaseId"
+            class="field__control"
+            :disabled="loadingTermBases"
+          >
+            <option value="">{{ t('taskList.hints.noTermBase') }}</option>
+            <option
+              v-for="termBase in availableTermBases"
+              :key="termBase.id"
+              :value="termBase.id"
+            >
+              {{ termBase.name }}（{{ formatLanguagePair(termBase.source_language, termBase.target_language) }} / {{ termBase.entry_count }} 条）
+            </option>
+          </select>
         </label>
 
         <label class="field field--full">
