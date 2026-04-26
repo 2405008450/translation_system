@@ -1,4 +1,5 @@
 import hashlib
+import logging
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID
@@ -15,6 +16,11 @@ from app.services.document_storage import (
 )
 from app.services.revision_service import create_revision
 from app.services.task_file_service import build_task_workspace
+
+logger = logging.getLogger(__name__)
+
+# 支持通过 DOCX 专用流程处理的扩展名
+_DOCX_EXTENSIONS = {".docx"}
 
 
 SEGMENT_ORDERING = (
@@ -204,6 +210,67 @@ def create_txt_file_record_with_segments(
     db.commit()
     db.refresh(file_record)
     return file_record
+
+
+def create_file_record_via_adapter(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    similarity_threshold: float = 0.6,
+    collection_ids: list[UUID] | None = None,
+) -> FileRecord:
+    """通过适配器系统创建文件记录（支持多格式）"""
+    from app.services.adapters import get_registry, extract_segments
+    from app.services.matcher import match_sentences_with_stats
+
+    registry = get_registry()
+    adapter = registry.get_adapter(filename)
+    result = adapter.parse_with_validation(raw_bytes, filename)
+
+    segments_data = []
+    source_texts = []
+    for i, seg in enumerate(result.segments):
+        segments_data.append({
+            "sentence_id": seg.segment_id or f"sent-{i + 1:05d}",
+            "source_text": seg.source_text,
+            "display_text": seg.display_text,
+            "target_text": "",
+            "status": "none",
+            "score": 0.0,
+            "matched_source_text": None,
+            "block_type": "paragraph",
+            "block_index": i,
+            "row_index": None,
+            "cell_index": None,
+        })
+        source_texts.append(seg.source_text)
+
+    if source_texts:
+        match_results, _ = match_sentences_with_stats(
+            db=db,
+            sentences=source_texts,
+            auxiliary_sentences=source_texts,
+            similarity_threshold=similarity_threshold,
+            collection_ids=collection_ids,
+        )
+        for seg_data, match in zip(segments_data, match_results):
+            seg_data["status"] = match.status
+            seg_data["score"] = match.score
+            seg_data["matched_source_text"] = match.matched_source_text
+            seg_data["target_text"] = match.target_text or ""
+
+    workspace_data = {
+        "document_html": "",
+        "segments": segments_data,
+    }
+    return create_file_record_with_segments(
+        db=db,
+        raw_bytes=raw_bytes,
+        filename=filename,
+        similarity_threshold=similarity_threshold,
+        workspace_data=workspace_data,
+        collection_ids=collection_ids,
+    )
 
 
 def get_file_record(db: Session, file_record_id: UUID) -> FileRecord | None:

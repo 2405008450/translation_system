@@ -1,19 +1,47 @@
+"""
+API 路由模块 - 文件上传、解析和导出接口
+
+支持多种文档格式的上传、解析和导出。
+"""
 import json
 from io import BytesIO
-from typing import Literal
+from pathlib import Path
+from typing import Dict, List, Literal, Optional
 from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.auth import get_current_user, get_user_display_name
+from app.auth import get_current_user, get_user_display_name, require_admin
 from app.database import get_db
-from app.models import FileRecord, Segment, TMCollection, TermBase, TranslationMemory, User
+from app.models import (
+    FileRecord,
+    MemoryBase,
+    MemoryEntry,
+    Segment,
+    TMCollection,
+    TermBase,
+    TermEntry,
+    TranslationMemory,
+    User,
+)
+from app.services.adapters import (
+    DocumentAST,
+    ExportService,
+    FileTooLargeError,
+    ParseError,
+    UnsupportedFormatError,
+    get_registry,
+)
+from app.services.adapters.dita_exporter import DitaExporter
+from app.services.adapters.svg_exporter import SvgExporter
+from app.services.adapters.tmx_exporter import TmxExporter
+from app.services.adapters.xliff_exporter import XliffExporter, XliffImporter
 from app.services.comment_service import (
     create_segment_comment,
     create_segment_comment_reply,
@@ -94,11 +122,24 @@ class LLMTranslateRequest(BaseModel):
     provider: Literal["auto", "deepseek", "openrouter"] = "deepseek"
 
 
-class TMCollectionPayload(BaseModel):
+class MemoryBasePayload(BaseModel):
     name: str
     description: str | None = None
     source_language: str
     target_language: str
+
+
+class TermBasePayload(BaseModel):
+    name: str
+    description: str | None = None
+    source_language: str = "zh"
+    target_language: str = "en"
+
+
+class TermPayload(BaseModel):
+    source_text: str
+    target_text: str
+    collection_id: UUID | None = None
 
 
 class CommentCreateRequest(BaseModel):
@@ -210,10 +251,59 @@ def _build_llm_translation_tasks(
 
     return tasks
 
+# 支持的文件扩展名（30种格式）
+SUPPORTED_EXTENSIONS = {
+    # 办公文档
+    ".docx", ".txt", ".pdf", ".pptx", ".xlsx",
+    # 本地化文件
+    ".properties", ".po", ".pot", ".strings", ".yaml", ".yml", ".json", ".php",
+    # 网页/排版
+    ".html", ".htm", ".md", ".markdown", ".csv", ".srt",
+    # 技术写作
+    ".dita", ".ditamap", ".xml", ".svg",
+    # 双语文件
+    ".sdlxliff", ".txml",
+    # 工程/设计
+    ".dxf", ".idml", ".mif",
+    # 压缩包
+    ".zip", ".rar",
+}
+
+
+def _get_file_extension(filename: str) -> str:
+    """获取文件扩展名（小写）"""
+    return Path(filename or "").suffix.lower()
+
+
+def _validate_file_upload(file: UploadFile, allowed_extensions: set[str] | None = None) -> str:
+    """验证上传的文件
+
+    Args:
+        file: 上传的文件
+        allowed_extensions: 允许的扩展名集合，None 表示使用默认支持的扩展名
+
+    Returns:
+        str: 文件扩展名
+
+    Raises:
+        HTTPException: 当文件格式不支持时
+    """
+    ext = _get_file_extension(file.filename)
+    allowed = allowed_extensions or SUPPORTED_EXTENSIONS
+
+    if ext not in allowed:
+        supported_list = ", ".join(sorted(allowed))
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的文件格式 '{ext}'。支持的格式: {supported_list}"
+        )
+
+    return ext
+
 
 def _validate_docx_upload(file: UploadFile) -> None:
-    if not (file.filename or "").lower().endswith(".docx"):
-        raise HTTPException(status_code=400, detail="仅支持 DOCX 文件。")
+    """验证 DOCX 文件上传（向后兼容）"""
+    _validate_file_upload(file, {".docx"})
 
 
 def _validate_task_upload(file: UploadFile) -> None:
@@ -321,8 +411,8 @@ def _validate_collection_ids(
 
     normalized_ids = list(dict.fromkeys(collection_ids))
     existing_collections = (
-        db.query(TMCollection)
-        .filter(TMCollection.id.in_(normalized_ids))
+        db.query(MemoryBase)
+        .filter(MemoryBase.id.in_(normalized_ids))
         .all()
     )
     existing_ids = {collection.id for collection in existing_collections}
@@ -348,7 +438,7 @@ def _get_collection_or_404(db: Session, collection_id: UUID | None) -> TMCollect
     if collection_id is None:
         return None
 
-    collection = db.query(TMCollection).filter(TMCollection.id == collection_id).first()
+    collection = db.query(MemoryBase).filter(MemoryBase.id == collection_id).first()
     if collection is None:
         raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
     return collection
@@ -371,7 +461,7 @@ def _filter_tm_collection(
     return query
 
 
-def _serialize_tm_collection(collection: TMCollection, entry_count: int = 0) -> dict:
+def _serialize_tm_collection(collection: MemoryBase, entry_count: int = 0) -> dict:
     return {
         "id": collection.id,
         "name": collection.name,
@@ -391,6 +481,10 @@ async def upload_for_slate(
     collection_ids: list[UUID] | None = Form(default=None),
     db: Session = Depends(get_db),
 ):
+    """上传文件并解析为 Slate 编辑器格式
+
+    目前仅支持 DOCX 格式。
+    """
     _validate_docx_upload(file)
 
     raw_bytes = await file.read()
@@ -436,6 +530,312 @@ async def upload_for_workspace(
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/parser/parse")
+async def parse_document(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """通用文档解析接口
+
+    使用适配器系统解析多种格式的文档。
+    """
+    ext = _validate_file_upload(file)
+
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="文件为空。")
+
+    try:
+        registry = get_registry()
+        adapter = registry.get_adapter(file.filename)
+        result = adapter.parse_with_validation(raw_bytes, file.filename)
+
+        return {
+            "filename": file.filename,
+            "format": ext,
+            "ast": result.ast.to_dict(),
+            "segments": [seg.to_dict() for seg in result.segments],
+            "metadata": result.metadata,
+        }
+    except UnsupportedFormatError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except FileTooLargeError as e:
+        raise HTTPException(status_code=413, detail=str(e)) from e
+    except ParseError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"解析失败: {str(exc)}") from exc
+
+
+@router.get("/parser/formats")
+async def get_supported_formats():
+    """获取支持的文件格式列表"""
+    registry = get_registry()
+
+    formats = []
+    for ext in sorted(registry.list_supported_extensions()):
+        adapter = registry.get_adapter(f"test{ext}")
+        formats.append({
+            "extension": ext,
+            "adapter": adapter.__class__.__name__,
+            "max_size_mb": adapter.get_max_file_size() / (1024 * 1024),
+        })
+
+    return {
+        "formats": formats,
+        "total": len(formats),
+    }
+
+
+# ============== 适配器导出相关模型 ==============
+
+class AdapterExportRequest(BaseModel):
+    """导出请求模型"""
+    segments: List[dict]
+    format: str = "txt"
+    bilingual: bool = False
+    filename: Optional[str] = None
+
+
+class DitaExportRequest(BaseModel):
+    """DITA 导出请求模型"""
+    ast: dict
+    translations: Dict[str, str]
+    original_content: Optional[str] = None
+
+
+class SvgExportRequest(BaseModel):
+    """SVG 导出请求模型"""
+    original_content: str
+    translations: Dict[str, str]
+    bilingual: bool = False
+
+
+class TmxExportRequest(BaseModel):
+    """TMX 导出请求模型"""
+    segments: List[dict]
+    source_lang: str = "zh-CN"
+    target_lang: str = "en-US"
+    filename: Optional[str] = None
+
+
+class XliffExportRequest(BaseModel):
+    """XLIFF 导出请求模型"""
+    segments: List[dict]
+    source_lang: str = "zh-CN"
+    target_lang: str = "en-US"
+    filename: str = "document"
+    version: str = "1.2"
+
+
+# ============== 适配器导出接口 ==============
+
+@router.post("/export/txt")
+async def export_txt(request: AdapterExportRequest):
+    """导出为 TXT 格式"""
+    try:
+        service = ExportService()
+        from app.services.adapters.models import BlockNode, NodeType
+        nodes = []
+        for seg in request.segments:
+            text = seg.get("target_text") or seg.get("source_text", "")
+            if text:
+                nodes.append(BlockNode(node_type=NodeType.PARAGRAPH, text_content=text))
+
+        ast = DocumentAST(nodes=nodes, source_format=".txt")
+        translations = {
+            seg.get("segment_id", f"seg_{i}"): seg.get("target_text", "")
+            for i, seg in enumerate(request.segments)
+        }
+
+        if request.bilingual:
+            nodes_bilingual = []
+            for seg in request.segments:
+                source = seg.get("source_text", "")
+                if source:
+                    nodes_bilingual.append(BlockNode(node_type=NodeType.PARAGRAPH, text_content=source))
+            ast_bilingual = DocumentAST(nodes=nodes_bilingual, source_format=".txt")
+            content = service.export_bilingual(ast_bilingual, translations, format="txt")
+            filename = "bilingual_export.txt"
+        else:
+            content = service.export_txt(ast, translations)
+            filename = "export.txt"
+
+        return Response(
+            content=content,
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}") from e
+
+
+@router.post("/export/docx")
+async def export_adapter_docx(request: AdapterExportRequest):
+    """通过适配器导出为 DOCX 格式"""
+    try:
+        service = ExportService()
+        from app.services.adapters.models import BlockNode, NodeType
+        nodes = []
+        for seg in request.segments:
+            text = seg.get("target_text") or seg.get("source_text", "")
+            if text:
+                nodes.append(BlockNode(node_type=NodeType.PARAGRAPH, text_content=text))
+
+        ast = DocumentAST(nodes=nodes, source_format=".docx")
+        translations = {
+            seg.get("segment_id", f"seg_{i}"): seg.get("target_text", "")
+            for i, seg in enumerate(request.segments)
+        }
+
+        if request.bilingual:
+            nodes_bilingual = []
+            for seg in request.segments:
+                source = seg.get("source_text", "")
+                if source:
+                    nodes_bilingual.append(BlockNode(node_type=NodeType.PARAGRAPH, text_content=source))
+            ast_bilingual = DocumentAST(nodes=nodes_bilingual, source_format=".docx")
+            content = service.export_bilingual(ast_bilingual, translations, format="docx")
+            filename = "bilingual_export.docx"
+        else:
+            content = service.export_docx(ast, translations)
+            filename = "export.docx"
+
+        return Response(
+            content=content,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}") from e
+
+
+@router.post("/export/dita")
+async def export_dita(request: DitaExportRequest):
+    """导出为 DITA 格式"""
+    try:
+        import base64
+        exporter = DitaExporter()
+        ast = DocumentAST.from_dict(request.ast)
+        original_bytes = None
+        if request.original_content:
+            original_bytes = base64.b64decode(request.original_content)
+        content = exporter.export(ast, request.translations, original_bytes)
+        return Response(
+            content=content,
+            media_type="application/xml",
+            headers={"Content-Disposition": 'attachment; filename="export.dita"'},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DITA 导出失败: {str(e)}") from e
+
+
+@router.post("/export/svg")
+async def export_svg(request: SvgExportRequest):
+    """导出为 SVG 格式"""
+    try:
+        import base64
+        exporter = SvgExporter()
+        original_bytes = base64.b64decode(request.original_content)
+        if request.bilingual:
+            content, warnings = exporter.export_bilingual(original_bytes, request.translations)
+            filename = "bilingual_export.svg"
+        else:
+            content, warnings = exporter.export(original_bytes, request.translations)
+            filename = "export.svg"
+        return Response(
+            content=content,
+            media_type="image/svg+xml",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Export-Warnings": str(len(warnings)),
+            },
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"SVG 导出失败: {str(e)}") from e
+
+
+@router.get("/export/formats")
+async def get_export_formats():
+    """获取支持的导出格式列表"""
+    return {
+        "formats": [
+            {"id": "txt", "name": "纯文本 (TXT)", "extension": ".txt", "bilingual": True},
+            {"id": "docx", "name": "Word 文档 (DOCX)", "extension": ".docx", "bilingual": True},
+            {"id": "dita", "name": "DITA XML", "extension": ".dita", "bilingual": False},
+            {"id": "svg", "name": "SVG 矢量图", "extension": ".svg", "bilingual": True},
+            {"id": "tmx", "name": "翻译记忆库 (TMX)", "extension": ".tmx", "bilingual": False},
+            {"id": "xliff", "name": "XLIFF 离线文件", "extension": ".xlf", "bilingual": False},
+        ]
+    }
+
+
+@router.post("/export/tmx")
+async def export_tmx(request: TmxExportRequest):
+    """导出为 TMX 格式"""
+    try:
+        exporter = TmxExporter(source_lang=request.source_lang, target_lang=request.target_lang)
+        content = exporter.export(request.segments, request.filename)
+        filename = "export.tmx"
+        if request.filename:
+            base_name = request.filename.rsplit(".", 1)[0]
+            filename = f"{base_name}.tmx"
+        return Response(
+            content=content,
+            media_type="application/x-tmx+xml",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TMX 导出失败: {str(e)}") from e
+
+
+@router.post("/export/xliff")
+async def export_xliff(request: XliffExportRequest):
+    """导出为 XLIFF 格式"""
+    try:
+        exporter = XliffExporter(
+            source_lang=request.source_lang,
+            target_lang=request.target_lang,
+            version=request.version,
+        )
+        original_format = "plaintext"
+        if request.filename:
+            ext = request.filename.rsplit(".", 1)[-1].lower()
+            format_map = {
+                "docx": "winword", "pdf": "pdf", "pptx": "powerpoint",
+                "txt": "plaintext", "xml": "xml", "dita": "xml",
+            }
+            original_format = format_map.get(ext, "plaintext")
+        content = exporter.export(request.segments, request.filename or "document", original_format)
+        filename = "export.xlf"
+        if request.filename:
+            base_name = request.filename.rsplit(".", 1)[0]
+            filename = f"{base_name}.xlf"
+        return Response(
+            content=content,
+            media_type="application/xliff+xml",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"XLIFF 导出失败: {str(e)}") from e
+
+
+@router.post("/import/xliff")
+async def import_xliff(file: UploadFile = File(...)):
+    """导入 XLIFF 文件"""
+    if not file.filename or not file.filename.lower().endswith((".xlf", ".xliff")):
+        raise HTTPException(status_code=400, detail="请上传 XLIFF 文件 (.xlf 或 .xliff)")
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="文件为空")
+    try:
+        importer = XliffImporter()
+        segments = importer.import_xliff(raw_bytes)
+        return {"filename": file.filename, "segments": segments, "count": len(segments)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"XLIFF 导入失败: {str(e)}") from e
 
 
 # ========== 文档管理 API ==========
@@ -502,6 +902,10 @@ async def create_file_record(
             "status": file_record.status,
             "created_at": file_record.created_at.isoformat(),
         }
+    except (UnsupportedFormatError, FileTooLargeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ParseError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -931,26 +1335,40 @@ def get_file_record_preview(
     }
 
 
-@router.get("/file-records/{file_record_id}/segments/{segment_id}/tm-candidates")
+@router.get("/file-records/{file_record_id}/segments/{segment_ref}/tm-candidates")
 def get_segment_tm_candidates(
     file_record_id: UUID,
-    segment_id: UUID,
+    segment_ref: str,
     threshold: float = 0.6,
+    max_candidates: int = 5,
     db: Session = Depends(get_db),
 ):
-    """获取指定句段的TM匹配候选列表"""
+    """获取指定句段的 TM 匹配候选列表，兼容句段 UUID 和 sentence_id。"""
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
-    segment = db.query(Segment).filter(
-        Segment.id == segment_id,
-        Segment.file_record_id == file_record_id,
-    ).first()
+    segment = None
+    try:
+        segment_uuid = UUID(segment_ref)
+    except ValueError:
+        segment_uuid = None
+
+    if segment_uuid is not None:
+        segment = db.query(Segment).filter(
+            Segment.id == segment_uuid,
+            Segment.file_record_id == file_record_id,
+        ).first()
+
+    if segment is None:
+        segment = db.query(Segment).filter(
+            Segment.file_record_id == file_record_id,
+            Segment.sentence_id == segment_ref,
+        ).first()
+
     if not segment:
         raise HTTPException(status_code=404, detail="句段不存在。")
 
-    # 获取绑定的记忆库ID
     collection_ids = None
     if file_record.collection_id:
         collection_ids = [file_record.collection_id]
@@ -960,17 +1378,19 @@ def get_segment_tm_candidates(
         source_text=segment.source_text,
         similarity_threshold=threshold,
         collection_ids=collection_ids,
-        top_n=5,
+        top_n=max_candidates,
     )
 
     return {
         "segment_id": str(segment.id),
+        "sentence_id": segment.sentence_id,
         "source_text": segment.source_text,
         "candidates": [
             {
                 "source_text": c.source_text,
                 "target_text": c.target_text,
                 "score": c.score,
+                "diff_html": c.diff_html,
                 "collection_name": c.collection_name,
                 "creator_name": c.creator_name,
                 "created_at": c.created_at,
@@ -1014,6 +1434,91 @@ def export_file_record_docx(
         filename=exported_file.filename,
         content=exported_file.content,
         media_type=exported_file.media_type,
+    )
+
+
+@router.get("/file-records/{file_record_id}/export-options")
+@router.get("/documents/{file_record_id}/export-options", include_in_schema=False)
+def get_file_record_export_options(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+):
+    """获取文件支持的导出格式选项"""
+    from app.services.adapters import get_export_options_for_file
+
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    options = get_export_options_for_file(file_record.filename)
+
+    return {
+        "file_record_id": str(file_record_id),
+        "filename": file_record.filename,
+        "export_options": options,
+    }
+
+
+@router.get("/file-records/{file_record_id}/export/{export_type}")
+@router.get("/documents/{file_record_id}/export/{export_type}", include_in_schema=False)
+def export_file_record_with_type(
+    file_record_id: UUID,
+    export_type: str,
+    db: Session = Depends(get_db),
+):
+    """多格式导出接口 - 支持原格式、双语、TMX、XLIFF 等导出类型
+
+    Args:
+        file_record_id: 文件记录 ID
+        export_type: 导出类型 (original, bilingual, bilingual_txt, tmx, xliff, xliff2)
+    """
+    from app.services.adapters import export_file
+
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    raw_bytes = load_file_record_source(file_record)
+    segments = list_segments_for_file_record(db, file_record_id)
+
+    # 转换句段格式
+    segment_dicts = [
+        {
+            "segment_id": seg.sentence_id,
+            "source_text": seg.source_text,
+            "target_text": seg.target_text,
+            "status": seg.status,
+            "matched_source_text": seg.matched_source_text,
+        }
+        for seg in segments
+    ]
+
+    try:
+        exported_bytes, mime_type, export_filename = export_file(
+            export_type=export_type,
+            segments=segment_dicts,
+            filename=file_record.filename,
+            original_bytes=raw_bytes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"导出失败: {str(exc)}") from exc
+
+    # 构建下载响应
+    ascii_filename = export_filename.encode("ascii", "ignore").decode("ascii").strip() or "exported"
+    ascii_filename = ascii_filename.replace('"', "")
+    quoted_filename = quote(export_filename)
+
+    return StreamingResponse(
+        BytesIO(exported_bytes),
+        media_type=mime_type,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_filename}"; '
+                f"filename*=UTF-8''{quoted_filename}"
+            )
+        },
     )
 
 
@@ -1429,10 +1934,10 @@ def list_tm_collections(
     db: Session = Depends(get_db),
 ):
     rows = (
-        db.query(TMCollection, func.count(TranslationMemory.id).label("entry_count"))
-        .outerjoin(TranslationMemory, TranslationMemory.collection_id == TMCollection.id)
-        .group_by(TMCollection.id)
-        .order_by(TMCollection.created_at.desc())
+        db.query(MemoryBase, func.count(MemoryEntry.id).label("entry_count"))
+        .outerjoin(MemoryEntry, MemoryEntry.collection_id == MemoryBase.id)
+        .group_by(MemoryBase.id)
+        .order_by(MemoryBase.created_at.desc())
         .all()
     )
     return [
@@ -1462,7 +1967,7 @@ def get_tm_collection(
 @router.post("/translation-memory/collections")
 @router.post("/tm/collections", include_in_schema=False)
 def create_tm_collection(
-    payload: TMCollectionPayload,
+    payload: MemoryBasePayload,
     db: Session = Depends(get_db),
 ):
     name = _normalize_collection_name(payload.name)
@@ -1473,7 +1978,7 @@ def create_tm_collection(
     if not name:
         raise HTTPException(status_code=400, detail="记忆库名称不能为空。")
 
-    collection = TMCollection(
+    collection = MemoryBase(
         name=name,
         description=normalize_text(payload.description or "") or None,
         source_language=source_language,
@@ -1494,7 +1999,7 @@ def create_tm_collection(
 @router.put("/tm/collections/{collection_id}", include_in_schema=False)
 def update_tm_collection(
     collection_id: UUID,
-    payload: TMCollectionPayload,
+    payload: MemoryBasePayload,
     db: Session = Depends(get_db),
 ):
     collection = _get_collection_or_404(db, collection_id)
@@ -1532,8 +2037,8 @@ def update_tm_collection(
 
     db.refresh(collection)
     entry_count = (
-        db.query(TranslationMemory)
-        .filter(TranslationMemory.collection_id == collection.id)
+        db.query(MemoryEntry)
+        .filter(MemoryEntry.collection_id == collection.id)
         .count()
     )
     return _serialize_tm_collection(collection, entry_count)
@@ -1550,8 +2055,8 @@ def delete_tm_collection(
         raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
 
     entry_count = (
-        db.query(TranslationMemory)
-        .filter(TranslationMemory.collection_id == collection.id)
+        db.query(MemoryEntry)
+        .filter(MemoryEntry.collection_id == collection.id)
         .count()
     )
     if entry_count:
@@ -1741,8 +2246,8 @@ def add_tm_entry(
     source_hash = build_source_hash(source_text)
 
     # 检查是否已存在
-    existing_query = db.query(TranslationMemory).filter(
-        TranslationMemory.source_hash == source_hash
+    existing_query = db.query(MemoryEntry).filter(
+        MemoryEntry.source_hash == source_hash
     )
     existing = _filter_tm_collection(
         existing_query,
@@ -1764,7 +2269,7 @@ def add_tm_entry(
         return {"status": "updated", "id": existing.id, "message": "已更新现有记录。"}
 
     # 不存在，新增
-    tm = TranslationMemory(
+    tm = MemoryEntry(
         collection_id=entry.collection_id,
         source_text=source_text,
         target_text=target_text,
@@ -1857,7 +2362,7 @@ def batch_add_tm_entries(
     created_count = 0
     updated_count = 0
     skipped_count = 0
-    sync_candidates: list[TranslationMemory] = []
+    sync_candidates: list[MemoryEntry] = []
     collection_ids = [
         collection_id
         for collection_id in (
@@ -1885,8 +2390,8 @@ def batch_add_tm_entries(
             entry.target_language or batch.target_language,
         )
 
-        existing_query = db.query(TranslationMemory).filter(
-            TranslationMemory.source_hash == source_hash
+        existing_query = db.query(MemoryEntry).filter(
+            MemoryEntry.source_hash == source_hash
         )
         existing = _filter_tm_collection(
             existing_query,
@@ -1906,7 +2411,7 @@ def batch_add_tm_entries(
             sync_candidates.append(existing)
             updated_count += 1
         else:
-            tm = TranslationMemory(
+            tm = MemoryEntry(
                 collection_id=collection_id,
                 source_text=source_text,
                 target_text=target_text,
@@ -1938,3 +2443,329 @@ def batch_add_tm_entries(
         "updated": updated_count,
         "skipped": skipped_count,
     }
+
+
+# ========== 术语库管理 API ==========
+
+def _serialize_termbase_collection(collection: TermBase, entry_count: int = 0) -> dict:
+    return {
+        "id": collection.id,
+        "name": collection.name,
+        "description": collection.description,
+        "source_language": collection.source_language,
+        "target_language": collection.target_language,
+        "created_at": collection.created_at.isoformat(),
+        "updated_at": collection.updated_at.isoformat(),
+        "entry_count": entry_count,
+    }
+
+
+def _get_termbase_collection_or_404(db: Session, collection_id: UUID | None) -> TermBase | None:
+    if collection_id is None:
+        return None
+
+    collection = db.query(TermBase).filter(TermBase.id == collection_id).first()
+    if collection is None:
+        raise HTTPException(status_code=404, detail="术语库不存在。")
+    return collection
+
+
+@router.get("/termbase/collections")
+def list_termbase_collections(
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(TermBase, func.count(TermEntry.id).label("entry_count"))
+        .outerjoin(TermEntry, TermEntry.term_base_id == TermBase.id)
+        .group_by(TermBase.id)
+        .order_by(TermBase.created_at.desc())
+        .all()
+    )
+    return [
+        _serialize_termbase_collection(collection, int(entry_count))
+        for collection, entry_count in rows
+    ]
+
+
+@router.post("/termbase/collections")
+def create_termbase_collection(
+    payload: TermBasePayload,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    name = _normalize_collection_name(payload.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="术语库名称不能为空。")
+
+    collection = TermBase(
+        name=name,
+        description=normalize_text(payload.description or "") or None,
+        source_language=payload.source_language,
+        target_language=payload.target_language,
+    )
+    db.add(collection)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="同名术语库已存在。") from exc
+
+    db.refresh(collection)
+    return _serialize_termbase_collection(collection)
+
+
+@router.delete("/termbase/collections/{collection_id}")
+def delete_termbase_collection(
+    collection_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    collection = _get_termbase_collection_or_404(db, collection_id)
+    if collection is None:
+        raise HTTPException(status_code=404, detail="术语库不存在。")
+
+    entry_count = (
+        db.query(TermEntry)
+        .filter(TermEntry.term_base_id == collection.id)
+        .count()
+    )
+    if entry_count:
+        raise HTTPException(status_code=409, detail="请先清空该术语库中的术语记录。")
+
+    db.delete(collection)
+    db.commit()
+    return {"message": "术语库已删除。"}
+
+
+@router.get("/termbase/terms")
+def list_terms(
+    collection_id: UUID | None = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    query = db.query(TermEntry)
+    if collection_id:
+        query = query.filter(TermEntry.term_base_id == collection_id)
+
+    total = query.count()
+    terms = query.order_by(TermEntry.source_text).offset(skip).limit(limit).all()
+
+    return {
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "terms": [
+            {
+                "id": term.id,
+                "source_text": term.source_text,
+                "target_text": term.target_text,
+                "term_base_id": term.term_base_id,
+                "created_at": term.created_at.isoformat(),
+            }
+            for term in terms
+        ],
+    }
+
+
+@router.post("/termbase/terms")
+def add_term(
+    payload: TermPayload,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    source_text = normalize_text(payload.source_text)
+    target_text = normalize_text(payload.target_text)
+
+    if not source_text or not target_text:
+        raise HTTPException(status_code=400, detail="原文和译文不能为空。")
+
+    _get_termbase_collection_or_404(db, payload.collection_id)
+
+    # 检查是否已存在相同原文的术语
+    existing = (
+        db.query(TermEntry)
+        .filter(TermEntry.source_text == source_text, TermEntry.term_base_id == payload.collection_id)
+        .first()
+    )
+
+    if existing:
+        existing.target_text = target_text
+        db.commit()
+        return {"status": "updated", "id": existing.id, "message": "已更新现有术语。"}
+
+    # 获取术语库的语言设置
+    term_base = _get_termbase_collection_or_404(db, payload.collection_id)
+    source_lang = term_base.source_language if term_base else "zh"
+    target_lang = term_base.target_language if term_base else "en"
+
+    term = TermEntry(
+        term_base_id=payload.collection_id,
+        source_text=source_text,
+        target_text=target_text,
+        source_language=source_lang,
+        target_language=target_lang,
+    )
+    db.add(term)
+    db.commit()
+    db.refresh(term)
+
+    return {"status": "created", "id": term.id, "message": "已添加新术语。"}
+
+
+@router.delete("/termbase/terms/{term_id}")
+def delete_term(
+    term_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    term = db.query(TermEntry).filter(TermEntry.id == term_id).first()
+    if not term:
+        raise HTTPException(status_code=404, detail="术语不存在。")
+
+    db.delete(term)
+    db.commit()
+    return {"message": "术语已删除。"}
+
+
+@router.post("/termbase/import-xlsx")
+async def import_termbase_xlsx(
+    file: UploadFile = File(...),
+    collection_id: UUID | None = Form(default=None),
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
+    if extension not in XLSX_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="仅支持上传 .xlsx 文件。")
+
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="上传的 XLSX 文件为空。")
+
+    collection = _get_termbase_collection_or_404(db, collection_id)
+
+    try:
+        from openpyxl import load_workbook
+        from io import BytesIO
+
+        wb = load_workbook(filename=BytesIO(raw_bytes), read_only=True, data_only=True)
+        ws = wb.active
+
+        created_count = 0
+        updated_count = 0
+        skipped_count = 0
+
+        for row_idx, row in enumerate(ws.iter_rows(min_row=1, values_only=True), start=1):
+            if not row or len(row) < 2:
+                skipped_count += 1
+                continue
+
+            source_text = normalize_text(str(row[0] or ""))
+            target_text = normalize_text(str(row[1] or ""))
+
+            if not source_text or not target_text:
+                skipped_count += 1
+                continue
+
+            # 跳过表头
+            if row_idx == 1 and (source_text.lower() in ("source", "原文", "术语") or target_text.lower() in ("target", "译文", "翻译")):
+                skipped_count += 1
+                continue
+
+            existing = (
+                db.query(TermEntry)
+                .filter(TermEntry.source_text == source_text, TermEntry.term_base_id == collection_id)
+                .first()
+            )
+
+            if existing:
+                existing.target_text = target_text
+                updated_count += 1
+            else:
+                # 获取术语库的语言设置
+                source_lang = collection.source_language if collection else "zh"
+                target_lang = collection.target_language if collection else "en"
+                term = TermEntry(
+                    term_base_id=collection_id,
+                    source_text=source_text,
+                    target_text=target_text,
+                    source_language=source_lang,
+                    target_language=target_lang,
+                )
+                db.add(term)
+                created_count += 1
+
+        db.commit()
+        wb.close()
+
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"术语库导入失败：{exc}") from exc
+
+    return {
+        "filename": file.filename,
+        "created_rows": created_count,
+        "updated_rows": updated_count,
+        "skipped_rows": skipped_count,
+        "imported_rows": created_count + updated_count,
+        "collection_id": collection.id if collection else None,
+        "collection_name": collection.name if collection else None,
+    }
+
+
+@router.get("/termbase/match")
+def match_terms(
+    text: str,
+    collection_ids: list[UUID] | None = None,
+    db: Session = Depends(get_db),
+):
+    """匹配文本中的术语，返回匹配到的术语列表（长术语优先）"""
+    if not text:
+        return {"matches": []}
+
+    query = db.query(TermEntry)
+    if collection_ids:
+        query = query.filter(TermEntry.term_base_id.in_(collection_ids))
+
+    all_terms = query.all()
+
+    # 按原文长度降序排序（长术语优先）
+    sorted_terms = sorted(all_terms, key=lambda t: len(t.source_text), reverse=True)
+
+    matches = []
+    matched_positions = set()
+    text_lower = text.lower()
+
+    for term in sorted_terms:
+        term_lower = term.source_text.lower()
+        start = 0
+        while True:
+            pos = text_lower.find(term_lower, start)
+            if pos == -1:
+                break
+
+            end_pos = pos + len(term.source_text)
+            # 检查是否与已匹配的位置重叠
+            overlap = False
+            for matched_start, matched_end in matched_positions:
+                if not (end_pos <= matched_start or pos >= matched_end):
+                    overlap = True
+                    break
+
+            if not overlap:
+                matched_positions.add((pos, end_pos))
+                matches.append({
+                    "term_id": str(term.id),
+                    "source_text": term.source_text,
+                    "target_text": term.target_text,
+                    "start": pos,
+                    "end": end_pos,
+                })
+
+            start = pos + 1
+
+    # 按位置排序
+    matches.sort(key=lambda m: m["start"])
+
+    return {"matches": matches}

@@ -19,6 +19,7 @@ coverage/
 data/
 tests/__pycache__/
 tests/.tmp/
+.hypothesis/
 
 # frontend
 frontend/node_modules/

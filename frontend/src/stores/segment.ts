@@ -13,6 +13,7 @@ import type {
   Segment,
   SegmentRevisionEntry,
   SegmentUpdatePayload,
+  TermMatch,
 } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 
@@ -42,6 +43,8 @@ export const useSegmentStore = defineStore('segment', () => {
   const previewHtml = ref('')
   const previewSupported = ref(false)
   const activeSentenceId = ref<string | null>(null)
+  const activeSourceText = ref('')
+  const termMatchesMap = ref<Record<string, TermMatch[]>>({})
   const loading = ref(false)
   const loadingMoreSegments = ref(false)
   const loadingAllSegments = ref(false)
@@ -363,6 +366,34 @@ export const useSegmentStore = defineStore('segment', () => {
 
   function setActiveSentence(sentenceId: string | null) {
     activeSentenceId.value = sentenceId
+    if (sentenceId) {
+      const segment = segments.value.find((s) => s.sentence_id === sentenceId)
+      activeSourceText.value = segment?.source_text || ''
+      void loadTermMatches(sentenceId, activeSourceText.value)
+    } else {
+      activeSourceText.value = ''
+    }
+  }
+
+  async function loadTermMatches(sentenceId: string, sourceText: string) {
+    if (!sourceText) {
+      return
+    }
+    try {
+      const { data } = await http.get<{ matches: TermMatch[] }>('/termbase/match', {
+        params: { text: sourceText },
+      })
+      termMatchesMap.value = {
+        ...termMatchesMap.value,
+        [sentenceId]: data.matches,
+      }
+    } catch {
+      // 静默失败
+    }
+  }
+
+  function getTermMatches(sentenceId: string): TermMatch[] {
+    return termMatchesMap.value[sentenceId] || []
   }
 
   function scheduleSync() {
@@ -660,6 +691,8 @@ export const useSegmentStore = defineStore('segment', () => {
     previewHtml,
     previewSupported,
     activeSentenceId,
+    activeSourceText,
+    termMatchesMap,
     loading,
     loadingMoreSegments,
     loadingAllSegments,
@@ -692,6 +725,7 @@ export const useSegmentStore = defineStore('segment', () => {
     loadRevisions,
     updateTarget,
     setActiveSentence,
+    getTermMatches,
     syncToBackend,
     acceptRevision,
     rejectRevision,

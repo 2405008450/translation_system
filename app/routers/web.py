@@ -426,7 +426,7 @@ async def upload_and_match(
             r.sentence_id = f"sent-{i+1:05d}"
             r.source = "tm" if r.status in ("exact", "fuzzy") else "none"
             r.tm_target_text = r.target_text if r.source == "tm" else ""
-        
+
     logger.info(
         "match request file=%s total=%s prepared=%s unique=%s exact=%s fuzzy=%s none=%s "
         "parse_ms=%.2f split_ms=%.2f exact_ms=%.2f fuzzy_ms=%.2f route_match_ms=%.2f total_match_ms=%.2f candidates=%s",
@@ -520,9 +520,56 @@ async def open_workspace(
     threshold: float = Form(default=settings.default_similarity_threshold),
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
-    """已废弃，重定向到 /match"""
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url="/", status_code=303)
+    if not 0 <= threshold <= 1:
+        raise HTTPException(status_code=400, detail="模糊匹配阈值必须在 0 到 1 之间。")
+
+    filename = workspace_file.filename or ""
+    extension = f".{filename.split('.')[-1].lower()}" if filename else ""
+
+    # 支持的格式
+    supported_extensions = {".txt", ".docx", ".pdf", ".pptx", ".dita", ".ditamap", ".xml", ".svg", ".yaml", ".yml", ".json", ".php"}
+    if extension not in supported_extensions:
+        supported_list = ", ".join(sorted(supported_extensions))
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的文件格式 '{extension}'。支持的格式: {supported_list}"
+        )
+
+    raw_bytes = await workspace_file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="上传的文件为空。")
+
+    workspace_started_at = perf_counter()
+
+    # 使用适配器系统构建工作台
+    try:
+        workspace_data = build_workspace_with_adapters(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            similarity_threshold=threshold,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        logger.exception(f"解析文件失败: {filename}")
+        raise HTTPException(status_code=500, detail=f"解析文件失败: {str(e)}") from e
+
+    workspace_ms = (perf_counter() - workspace_started_at) * 1000
+
+    return templates.TemplateResponse(
+        request,
+        "workspace.html",
+        {
+            "request": request,
+            "filename": workspace_file.filename,
+            "threshold": threshold,
+            "document_html": workspace_data["document_html"],
+            "segments": workspace_data["segments"],
+            "match_stats": workspace_data["match_stats"],
+            "workspace_ms": round(workspace_ms, 2),
+        },
+    )
 
 
 @router.post("/import-xlsx", response_class=HTMLResponse)

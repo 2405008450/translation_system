@@ -2306,6 +2306,205 @@ def _build_empty_match_stats() -> MatchStats:
     )
 
 
+def build_workspace_with_adapters(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    similarity_threshold: float = 0.6,
+) -> dict:
+    """使用适配器系统构建翻译工作台
+
+    支持多种文档格式：TXT、DOCX、PDF、PPTX、DITA、SVG 等。
+
+    Args:
+        db: 数据库会话
+        raw_bytes: 文件字节内容
+        filename: 文件名
+        similarity_threshold: 模糊匹配阈值
+
+    Returns:
+        dict: 包含 document_html、segments、match_stats 的字典
+    """
+    from pathlib import Path
+    from app.services.adapters import get_registry, ParseError, FileTooLargeError
+
+    extension = Path(filename).suffix.lower()
+
+    # 对于 DOCX，使用原有的专用解析器以保持完整的格式支持
+    if extension == ".docx":
+        return build_docx_workspace(
+            db=db,
+            raw_bytes=raw_bytes,
+            similarity_threshold=similarity_threshold,
+        )
+
+    # 其他格式使用适配器系统
+    try:
+        registry = get_registry()
+        adapter = registry.get_adapter(filename)
+        result = adapter.parse_with_validation(raw_bytes, filename)
+    except (ParseError, FileTooLargeError) as e:
+        raise ValueError(str(e)) from e
+    except Exception as e:
+        # 捕获其他异常（如 OCRRequiredError）
+        raise ValueError(f"解析文件失败: {str(e)}") from e
+
+    # 构建 HTML 和 segments
+    sentence_counter = count(1)
+    html_parts: list[str] = []
+    segments: list[dict] = []
+
+    for block_index, node in enumerate(result.ast.nodes):
+        node_html, node_segments = _render_ast_node(
+            node=node,
+            sentence_counter=sentence_counter,
+            block_index=block_index,
+        )
+        html_parts.append(node_html)
+        segments.extend(node_segments)
+
+    # 执行 TM 匹配
+    match_stats = _build_empty_match_stats()
+    if segments:
+        match_results, match_stats = match_sentences_with_stats(
+            db=db,
+            sentences=[segment["source_text"] for segment in segments],
+            similarity_threshold=similarity_threshold,
+        )
+        for segment, match in zip(segments, match_results, strict=False):
+            segment["status"] = match.status
+            segment["score"] = match.score
+            segment["matched_source_text"] = match.matched_source_text
+            segment["target_text"] = match.target_text or ""
+
+    return {
+        "document_html": "".join(html_parts) or '<p class="doc-paragraph doc-empty"><br></p>',
+        "segments": segments,
+        "match_stats": {
+            "total_input_sentences": match_stats.total_input_sentences,
+            "prepared_sentences": match_stats.prepared_sentences,
+            "unique_sentences": match_stats.unique_sentences,
+            "exact_hits": match_stats.exact_hits,
+            "fuzzy_hits": match_stats.fuzzy_hits,
+            "none_hits": match_stats.none_hits,
+            "exact_phase_ms": match_stats.exact_phase_ms,
+            "fuzzy_phase_ms": match_stats.fuzzy_phase_ms,
+            "total_match_ms": match_stats.total_match_ms,
+            "fuzzy_candidates_evaluated": match_stats.fuzzy_candidates_evaluated,
+        },
+    }
+
+
+def _render_ast_node(
+    node,
+    sentence_counter,
+    block_index: int,
+    block_type: str = "paragraph",
+) -> tuple[str, list[dict]]:
+    """渲染 AST 节点为 HTML"""
+    from app.services.adapters.models import NodeType
+
+    html_parts: list[str] = []
+    segments: list[dict] = []
+
+    if node.text_content:
+        paragraph_html, paragraph_segments = _render_paragraph(
+            text=node.text_content,
+            sentence_counter=sentence_counter,
+            block_index=block_index,
+            block_type=block_type,
+        )
+        html_parts.append(paragraph_html)
+        segments.extend(paragraph_segments)
+
+    if node.children:
+        if node.node_type == NodeType.TABLE:
+            table_html, table_segments = _render_ast_table(
+                node=node,
+                sentence_counter=sentence_counter,
+                block_index=block_index,
+            )
+            html_parts.append(table_html)
+            segments.extend(table_segments)
+        else:
+            for child in node.children:
+                child_html, child_segments = _render_ast_node(
+                    node=child,
+                    sentence_counter=sentence_counter,
+                    block_index=block_index,
+                    block_type=block_type,
+                )
+                html_parts.append(child_html)
+                segments.extend(child_segments)
+
+    return "".join(html_parts), segments
+
+
+def _render_ast_table(
+    node,
+    sentence_counter,
+    block_index: int,
+) -> tuple[str, list[dict]]:
+    """渲染 AST 表格节点为 HTML"""
+    from app.services.adapters.models import NodeType
+
+    row_html_parts: list[str] = []
+    table_segments: list[dict] = []
+
+    if not node.children:
+        return "", []
+
+    for row_index, row_node in enumerate(node.children):
+        if row_node.node_type != NodeType.TABLE_ROW:
+            continue
+
+        cell_html_parts: list[str] = []
+
+        if row_node.children:
+            for cell_index, cell_node in enumerate(row_node.children):
+                cell_paragraphs: list[str] = []
+
+                if cell_node.text_content:
+                    paragraph_html, paragraph_segments = _render_paragraph(
+                        text=cell_node.text_content,
+                        sentence_counter=sentence_counter,
+                        block_index=block_index,
+                        block_type="table_cell",
+                        row_index=row_index,
+                        cell_index=cell_index,
+                    )
+                    cell_paragraphs.append(paragraph_html)
+                    table_segments.extend(paragraph_segments)
+
+                if cell_node.children:
+                    for child in cell_node.children:
+                        if child.text_content:
+                            paragraph_html, paragraph_segments = _render_paragraph(
+                                text=child.text_content,
+                                sentence_counter=sentence_counter,
+                                block_index=block_index,
+                                block_type="table_cell",
+                                row_index=row_index,
+                                cell_index=cell_index,
+                            )
+                            cell_paragraphs.append(paragraph_html)
+                            table_segments.extend(paragraph_segments)
+
+                if not cell_paragraphs:
+                    cell_paragraphs.append('<p class="doc-paragraph doc-empty"><br></p>')
+
+                cell_html_parts.append(
+                    f'<td class="doc-table-cell">{"".join(cell_paragraphs)}</td>'
+                )
+
+        row_html_parts.append(f'<tr>{"".join(cell_html_parts)}</tr>')
+
+    if not row_html_parts:
+        return "", []
+
+    return f'<table class="doc-table"><tbody>{"".join(row_html_parts)}</tbody></table>', table_segments
+
+
 def build_document_html_from_segments(segments: list) -> str:
     if not segments:
         return ""
