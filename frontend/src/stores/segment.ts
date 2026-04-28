@@ -405,6 +405,8 @@ export const useSegmentStore = defineStore('segment', () => {
       status: 'accepted',
     })
     upsertRevisionEntry(data)
+    // 接受修订：将 after_text 应用到 segment
+    applyLLMUpdate(data.sentence_id, data.after_text, data.source, 'confirmed')
     return data
   }
 
@@ -413,6 +415,8 @@ export const useSegmentStore = defineStore('segment', () => {
       status: 'rejected',
     })
     upsertRevisionEntry(data)
+    // 拒绝修订：恢复 before_text 到 segment
+    applyLLMUpdate(data.sentence_id, data.before_text, data.source, 'confirmed')
     return data
   }
 

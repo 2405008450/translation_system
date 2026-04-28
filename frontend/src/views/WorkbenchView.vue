@@ -5,6 +5,8 @@ import {
   ArrowDown,
   ArrowUp,
   Bot,
+  ChevronDown,
+  ChevronUp,
   CircleHelp,
   Columns,
   Download,
@@ -167,7 +169,23 @@ const activeSegmentHistory = computed(() => (
     : []
 ))
 
+const revisionSentenceIds = computed(() => (
+  Object.entries(segmentStore.revisionHistory)
+    .filter(([, entries]) => entries.some((e) => e.status === 'pending'))
+    .map(([sentenceId]) => sentenceId)
+))
+
 const activeSegmentSourceText = computed(() => activeSegment.value?.source_text || '')
+
+// 计算当前激活段落匹配的术语（用于原文高亮）
+const activeMatchedTerms = computed(() => {
+  if (!activeSegmentSourceText.value || termEntries.value.length === 0) return []
+  const sourceText = activeSegmentSourceText.value.toLowerCase()
+  return termEntries.value
+    .filter((entry) => sourceText.includes(entry.source_text.toLowerCase()))
+    .slice()
+    .sort((left, right) => right.source_text.length - left.source_text.length)
+})
 
 function normalizeSearchText(value: string) {
   return value.replace(/\s+/g, ' ').trim().toLocaleLowerCase()
@@ -575,6 +593,22 @@ async function handleBatchRejectRevisions() {
   }
 }
 
+async function focusRevisionByOffset(offset: 1 | -1) {
+  const ids = revisionSentenceIds.value
+  if (!ids.length) {
+    return
+  }
+
+  const currentIdx = segmentStore.activeSentenceId
+    ? ids.indexOf(segmentStore.activeSentenceId)
+    : -1
+  const nextIdx = currentIdx === -1
+    ? (offset > 0 ? 0 : ids.length - 1)
+    : (currentIdx + offset + ids.length) % ids.length
+
+  await handlePreviewFocus(ids[nextIdx])
+}
+
 async function loadTask() {
   pageError.value = ''
   activeTool.value = null
@@ -822,7 +856,11 @@ async function ensureMatchInfoPanelOpen() {
 
 function handleSegmentTargetActivate(sentenceId: string) {
   segmentStore.setActiveSentence(sentenceId)
-  void ensureMatchInfoPanelOpen()
+  // 只有当右侧面板未打开时才自动打开记忆匹配面板
+  // 如果已有面板打开（如原文预览），则保持当前面板，仅进行定位
+  if (!activeTool.value) {
+    void ensureMatchInfoPanelOpen()
+  }
 }
 
 watch(() => props.id, () => {
@@ -902,36 +940,6 @@ onBeforeRouteLeave(async () => {
           <Download :size="14" />
           {{ exportButtonLabel }}
         </button>
-
-        <div class="workbench-revision-menu">
-          <button
-            class="button workbench-action workbench-action--review"
-            type="button"
-            :disabled="segmentStore.pendingRevisionCount === 0"
-            @click="openRevisionMenu = !openRevisionMenu"
-          >
-            <MoreHorizontal :size="14" />
-            修订管理
-            <span class="workbench-revision-menu__badge">{{ segmentStore.pendingRevisionCount }}</span>
-          </button>
-          <div v-if="openRevisionMenu" class="workbench-revision-menu__dropdown">
-            <button
-              type="button"
-              :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
-              @click="void handleBatchAcceptRevisions()"
-            >
-              全部接受
-            </button>
-            <button
-              class="is-danger"
-              type="button"
-              :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
-              @click="void handleBatchRejectRevisions()"
-            >
-              全部拒绝
-            </button>
-          </div>
-        </div>
 
         <button
           v-if="!segmentStore.llmRunning"
@@ -1114,20 +1122,74 @@ onBeforeRouteLeave(async () => {
             </div>
           </div>
 
-          <div class="workbench-search-panel__meta">
-            <span class="hint-text">
-              {{
-                hasSegmentSearch
-                  ? t('workbench.search.resultSummary', {
-                      count: editorSegments.length,
-                      total: segmentStore.totalSegmentCount,
-                    })
-                  : t('workbench.search.idle')
-              }}
-            </span>
-            <span v-if="searchLoadingAllSegments" class="hint-text">
-              {{ t('workbench.search.loadingAll') }}
-            </span>
+          <div class="workbench-search-panel__row">
+            <div class="workbench-search-panel__meta">
+              <span class="hint-text">
+                {{
+                  hasSegmentSearch
+                    ? t('workbench.search.resultSummary', {
+                        count: editorSegments.length,
+                        total: segmentStore.totalSegmentCount,
+                      })
+                    : t('workbench.search.idle')
+                }}
+              </span>
+              <span v-if="searchLoadingAllSegments" class="hint-text">
+                {{ t('workbench.search.loadingAll') }}
+              </span>
+            </div>
+
+            <div class="workbench-search-panel__revision">
+              <div class="workbench-revision-menu">
+                <button
+                  class="button workbench-action workbench-action--search"
+                  type="button"
+                  :disabled="segmentStore.pendingRevisionCount === 0"
+                  @click="openRevisionMenu = !openRevisionMenu"
+                >
+                  <MoreHorizontal :size="14" />
+                  修订管理
+                  <span v-if="segmentStore.pendingRevisionCount > 0" class="workbench-search-panel__badge">
+                    {{ segmentStore.pendingRevisionCount }}
+                  </span>
+                </button>
+                <div v-if="openRevisionMenu" class="workbench-revision-menu__dropdown">
+                  <button
+                    type="button"
+                    :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
+                    @click="void handleBatchAcceptRevisions()"
+                  >
+                    全部接受
+                  </button>
+                  <button
+                    class="is-danger"
+                    type="button"
+                    :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
+                    @click="void handleBatchRejectRevisions()"
+                  >
+                    全部拒绝
+                  </button>
+                </div>
+              </div>
+              <button
+                class="button workbench-action workbench-action--search"
+                type="button"
+                :disabled="segmentStore.pendingRevisionCount === 0"
+                title="上一条修订"
+                @click="void focusRevisionByOffset(-1)"
+              >
+                <ChevronUp :size="14" />
+              </button>
+              <button
+                class="button workbench-action workbench-action--search"
+                type="button"
+                :disabled="segmentStore.pendingRevisionCount === 0"
+                title="下一条修订"
+                @click="void focusRevisionByOffset(1)"
+              >
+                <ChevronDown :size="14" />
+              </button>
+            </div>
           </div>
         </div>
 
@@ -1155,6 +1217,7 @@ onBeforeRouteLeave(async () => {
               :active="segmentStore.activeSentenceId === item.sentence_id"
               :pending-revision="segmentStore.getPendingRevision(item.sentence_id)"
               :revision-busy="revisionActionLoading"
+              :matched-terms="segmentStore.activeSentenceId === item.sentence_id ? activeMatchedTerms : []"
               @focus="segmentStore.setActiveSentence"
               @activate-target="handleSegmentTargetActivate"
               @update="segmentStore.updateTarget"
@@ -1169,6 +1232,7 @@ onBeforeRouteLeave(async () => {
         class="workbench-sidecar"
         :class="{ 'is-preview-open': activeTool && activeTool !== 'split-preview', 'is-split-open': activeTool === 'split-preview' }"
       >
+        <div v-if="activeTool" class="workbench-sidecar__panel">
         <Transition name="preview-drawer" mode="out-in">
           <SplitPreviewPanel
             v-if="activeTool === 'split-preview'"
@@ -1267,6 +1331,7 @@ onBeforeRouteLeave(async () => {
             :history="activeSegmentHistory"
           />
         </Transition>
+        </div>
 
         <aside class="workbench-rail" :aria-label="t('workbench.toolsLabel')">
           <button
@@ -1466,7 +1531,42 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-search-panel__actions {
+  display: flex;
+  gap: 6px;
   margin-left: auto;
+}
+
+.workbench-search-panel__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.workbench-search-panel__revision {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.workbench-search-panel__revision .workbench-action:last-child,
+.workbench-search-panel__revision .workbench-action:nth-last-child(2) {
+  min-width: 40px;
+  padding: 0 12px;
+}
+
+.workbench-search-panel__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: rgba(13, 122, 104, 0.14);
+  color: #0b6b5b;
+  font-size: 11px;
 }
 
 .workbench-search-panel__meta {

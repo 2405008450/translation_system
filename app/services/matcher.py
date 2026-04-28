@@ -197,11 +197,7 @@ def _resolve_matches(
     ]
 
     exact_started_at = perf_counter()
-    (
-        exact_matches_by_hash,
-        exact_matches_by_normalized,
-        exact_matches_by_source_text,
-    ) = _find_exact_matches(
+    exact_matches_by_hash = _find_exact_matches(
         db,
         [sentence for _, sentence in matchable_items],
         collection_ids=collection_ids,
@@ -223,25 +219,10 @@ def _resolve_matches(
             none_hits += 1
             continue
 
+        # 精确匹配只使用 source_hash，确保文本完全相同
         exact_match = exact_matches_by_hash.get(sentence.auxiliary_hash)
         if exact_match is None:
-            exact_match = exact_matches_by_normalized.get(sentence.auxiliary_normalized)
-        if exact_match is None:
-            exact_match = exact_matches_by_normalized.get(sentence.auxiliary_match_text)
-        if exact_match is None:
-            exact_match = exact_matches_by_source_text.get(sentence.auxiliary_normalized)
-        if exact_match is None:
-            exact_match = exact_matches_by_source_text.get(sentence.auxiliary_match_text)
-        if exact_match is None:
             exact_match = exact_matches_by_hash.get(sentence.source_hash)
-        if exact_match is None:
-            exact_match = exact_matches_by_normalized.get(sentence.normalized_sentence)
-        if exact_match is None:
-            exact_match = exact_matches_by_normalized.get(sentence.match_text)
-        if exact_match is None:
-            exact_match = exact_matches_by_source_text.get(sentence.normalized_sentence)
-        if exact_match is None:
-            exact_match = exact_matches_by_source_text.get(sentence.match_text)
 
         if exact_match:
             collection_name = None
@@ -320,11 +301,8 @@ def _find_exact_matches(
     db: Session,
     sentences: Iterable[PreparedSentence],
     collection_ids: list[UUID] | None = None,
-) -> tuple[
-    dict[str, TranslationMemory],
-    dict[str, TranslationMemory],
-    dict[str, TranslationMemory],
-]:
+) -> dict[str, TranslationMemory]:
+    """通过 source_hash 查找精确匹配，确保只有完全相同的文本才算精确匹配"""
     sentences = list(sentences)
     source_hashes = [
         source_hash
@@ -332,28 +310,11 @@ def _find_exact_matches(
         for source_hash in (sentence.auxiliary_hash, sentence.source_hash)
         if source_hash
     ]
-    normalized_candidates = list(
-        {
-            sentence.normalized_sentence
-            for sentence in sentences
-            if sentence.normalized_sentence
-        }
-        | {
-            sentence.auxiliary_normalized
-            for sentence in sentences
-            if sentence.auxiliary_normalized
-        }
-        | {sentence.match_text for sentence in sentences if sentence.match_text}
-        | {sentence.auxiliary_match_text for sentence in sentences if sentence.auxiliary_match_text}
-    )
-    source_text_candidates = normalized_candidates
 
-    if not source_hashes and not normalized_candidates and not source_text_candidates:
-        return {}, {}, {}
+    if not source_hashes:
+        return {}
 
     matches_by_hash: dict[str, TranslationMemory] = {}
-    matches_by_normalized: dict[str, TranslationMemory] = {}
-    matches_by_source_text: dict[str, TranslationMemory] = {}
     normalized_collection_ids = _normalize_collection_ids(collection_ids)
     for chunk in _chunked(source_hashes, EXACT_MATCH_BATCH_SIZE):
         stmt = select(TranslationMemory).where(TranslationMemory.source_hash.in_(chunk))
@@ -361,21 +322,7 @@ def _find_exact_matches(
         for match in db.execute(stmt).scalars():
             matches_by_hash.setdefault(match.source_hash, match)
 
-    for chunk in _chunked(normalized_candidates, EXACT_MATCH_BATCH_SIZE):
-        stmt = select(TranslationMemory).where(
-            TranslationMemory.source_normalized.in_(chunk)
-        )
-        stmt = _apply_collection_filter(stmt, normalized_collection_ids)
-        for match in db.execute(stmt).scalars():
-            matches_by_normalized.setdefault(match.source_normalized, match)
-
-    for chunk in _chunked(source_text_candidates, EXACT_MATCH_BATCH_SIZE):
-        stmt = select(TranslationMemory).where(TranslationMemory.source_text.in_(chunk))
-        stmt = _apply_collection_filter(stmt, normalized_collection_ids)
-        for match in db.execute(stmt).scalars():
-            matches_by_source_text.setdefault(match.source_text, match)
-
-    return matches_by_hash, matches_by_normalized, matches_by_source_text
+    return matches_by_hash
 
 
 def _find_fuzzy_matches(
@@ -826,20 +773,12 @@ def get_tm_candidates_for_text(
 
     sentence = prepared[0]
 
-    # 先尝试精确匹配
-    exact_matches_by_hash, exact_matches_by_normalized, exact_matches_by_source_text = _find_exact_matches(
+    # 先尝试精确匹配（只使用 source_hash）
+    exact_matches_by_hash = _find_exact_matches(
         db, [sentence], collection_ids=collection_ids
     )
 
     exact_match = exact_matches_by_hash.get(sentence.source_hash)
-    if exact_match is None:
-        exact_match = exact_matches_by_normalized.get(sentence.normalized_sentence)
-    if exact_match is None:
-        exact_match = exact_matches_by_normalized.get(sentence.match_text)
-    if exact_match is None:
-        exact_match = exact_matches_by_source_text.get(sentence.normalized_sentence)
-    if exact_match is None:
-        exact_match = exact_matches_by_source_text.get(sentence.match_text)
 
     candidates: list[TMMatchCandidate] = []
 
@@ -861,11 +800,16 @@ def get_tm_candidates_for_text(
             updated_at=exact_match.updated_at.isoformat() if exact_match.updated_at else None,
         ))
 
+    # 对于短文本，降低模糊匹配阈值以获得更多候选
+    effective_threshold = similarity_threshold
+    if len(sentence.match_text) <= 5:
+        effective_threshold = min(similarity_threshold, 0.3)
+
     # 获取模糊匹配候选
     fuzzy_matches, _ = _find_fuzzy_matches(
         db=db,
         prepared_sentences=[sentence],
-        similarity_threshold=similarity_threshold,
+        similarity_threshold=effective_threshold,
         collection_ids=collection_ids,
     )
 

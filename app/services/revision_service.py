@@ -218,6 +218,16 @@ def _resolve_revision(
     anchor_revision.status = normalized_status
     anchor_revision.resolved_by_id = current_user.id
     anchor_revision.resolved_at = datetime.utcnow()
+
+    # 同步更新 segment 的 target_text：
+    # 接受 → 保留 after_text；拒绝 → 恢复 before_text
+    segment = db.query(Segment).filter(Segment.id == anchor_revision.segment_id).first()
+    if segment is not None:
+        if normalized_status == "accepted":
+            segment.target_text = anchor_revision.after_text
+        else:
+            segment.target_text = anchor_revision.before_text
+
     db.commit()
     return get_revision_or_404(db, anchor_revision.id)
 
@@ -262,6 +272,15 @@ def _batch_resolve_revisions(
         anchor_revision.status = normalized_status
         anchor_revision.resolved_by_id = current_user.id
         anchor_revision.resolved_at = resolved_at
+
+        # 同步更新 segment 的 target_text
+        segment = db.query(Segment).filter(Segment.id == anchor_revision.segment_id).first()
+        if segment is not None:
+            if normalized_status == "accepted":
+                segment.target_text = anchor_revision.after_text
+            else:
+                segment.target_text = anchor_revision.before_text
+
         resolved_count += 1
 
     db.commit()
