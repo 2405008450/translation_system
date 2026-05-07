@@ -33,6 +33,7 @@ import PreviewPanel from '../components/PreviewPanel.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
 import SegmentEditorRow from '../components/SegmentEditorRow.vue'
 import SplitPreviewPanel from '../components/SplitPreviewPanel.vue'
+import TMMatchPanel from '../components/TMMatchPanel.vue'
 import VirtualList from '../components/VirtualList.vue'
 import WorkbenchHistoryPanel from '../components/WorkbenchHistoryPanel.vue'
 import WorkbenchMatchPanel from '../components/WorkbenchMatchPanel.vue'
@@ -100,6 +101,38 @@ const loadingTermBases = ref(false)
 const loadingTermEntries = ref(false)
 const termsMessage = ref(t('workbench.terms.defaultMessage'))
 let searchLoadRequestId = 0
+
+// 导出相关状态
+const showExportMenu = ref(false)
+const exportOptions = ref<Array<{ id: string; name: string; description: string; extension: string }>>([])
+const loadingExportOptions = ref(false)
+const exporting = ref(false)
+
+// 导出格式映射（用于原格式导出按钮显示）
+const exportFormatMap: Record<string, { format: string; label: string; note?: string }> = {
+  '.rar': { format: 'zip', label: 'ZIP', note: 'RAR 将转换为 ZIP' },
+  '.pdf': { format: 'docx', label: 'DOCX', note: 'PDF 将转换为 DOCX' },
+}
+
+const exportInfo = computed(() => {
+  const filename = segmentStore.fileRecord?.filename || ''
+  const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase()
+
+  if (exportFormatMap[ext]) {
+    return exportFormatMap[ext]
+  }
+
+  // 默认导出原格式
+  const format = ext.replace('.', '').toUpperCase() || 'DOCX'
+  return { format: ext.replace('.', ''), label: format }
+})
+
+// 是否为 Office 格式（Office 格式只支持原格式导出）
+const isOfficeFormat = computed(() => {
+  const filename = segmentStore.fileRecord?.filename || ''
+  const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase()
+  return ['.docx', '.xlsx', '.pptx', '.pdf'].includes(ext)
+})
 
 function resolveItemHeight() {
   if (window.innerWidth <= 720) {
@@ -609,6 +642,10 @@ async function focusRevisionByOffset(offset: 1 | -1) {
   await handlePreviewFocus(ids[nextIdx])
 }
 
+function handleApplyTMTarget(sentenceId: string, targetText: string) {
+  segmentStore.updateTarget(sentenceId, targetText)
+}
+
 async function loadTask() {
   pageError.value = ''
   activeTool.value = null
@@ -715,6 +752,88 @@ async function handlePreviewFocus(sentenceId: string) {
 
   await nextTick()
   await virtualListRef.value?.focusIndex(index, '[data-segment-target="true"]', 'nearest')
+}
+
+async function loadExportOptions() {
+  if (!segmentStore.fileRecord) return
+
+  loadingExportOptions.value = true
+  try {
+    const { data } = await http.get(`/file-records/${segmentStore.fileRecord.id}/export-options`)
+    exportOptions.value = data.export_options || []
+  } catch (error) {
+    console.error('加载导出选项失败:', error)
+    exportOptions.value = []
+  } finally {
+    loadingExportOptions.value = false
+  }
+}
+
+async function toggleExportMenu() {
+  if (showExportMenu.value) {
+    showExportMenu.value = false
+    return
+  }
+
+  // 加载导出选项
+  await loadExportOptions()
+  showExportMenu.value = true
+}
+
+async function exportWithType(exportType: string) {
+  if (!segmentStore.fileRecord) return
+
+  pageError.value = ''
+  exporting.value = true
+  showExportMenu.value = false
+
+  try {
+    const response = await http.get(
+      `/file-records/${segmentStore.fileRecord.id}/export/${exportType}`,
+      { responseType: 'blob' }
+    )
+
+    // 从响应头获取文件名
+    const contentDisposition = response.headers['content-disposition']
+    let filename = `export.${exportType}`
+    if (contentDisposition) {
+      const filenameMatch = contentDisposition.match(/filename\*=UTF-8''(.+?)(?:;|$)/)
+      if (filenameMatch) {
+        filename = decodeURIComponent(filenameMatch[1])
+      } else {
+        const simpleMatch = contentDisposition.match(/filename="?(.+?)"?(?:;|$)/)
+        if (simpleMatch) {
+          filename = simpleMatch[1]
+        }
+      }
+    }
+
+    // 下载文件
+    const url = window.URL.createObjectURL(new Blob([response.data]))
+    const link = document.createElement('a')
+    link.href = url
+    link.setAttribute('download', filename)
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    window.URL.revokeObjectURL(url)
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      pageError.value = String(error.response?.data?.detail || '导出失败。')
+      return
+    }
+    pageError.value = error instanceof Error ? error.message : '导出失败。'
+  } finally {
+    exporting.value = false
+  }
+}
+
+// 点击外部关闭导出菜单
+function handleClickOutside(event: MouseEvent) {
+  const target = event.target as HTMLElement
+  if (!target.closest('.export-dropdown')) {
+    showExportMenu.value = false
+  }
 }
 
 async function handleCommentDraft(draft: CommentAnchorDraft) {
@@ -889,11 +1008,13 @@ watch([sourceSearchQuery, targetSearchQuery], async () => {
 
 onMounted(() => {
   window.addEventListener('resize', handleResize)
+  document.addEventListener('click', handleClickOutside)
   void loadTask()
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
+  document.removeEventListener('click', handleClickOutside)
   commentStore.stopPolling()
 })
 

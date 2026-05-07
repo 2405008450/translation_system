@@ -239,7 +239,7 @@ class MultiFormatExporter:
         elif extension in {".dita", ".ditamap", ".xml"}:
             from app.services.adapters.dita_exporter import DitaExporter
 
-            content = DitaExporter().export(original_bytes, text_map)
+            content = DitaExporter().export_with_translations(original_bytes, text_map)
         elif extension == ".svg":
             from app.services.adapters.svg_exporter import SvgExporter
 

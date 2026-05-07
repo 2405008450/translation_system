@@ -7,8 +7,10 @@
 - tmx: TMX 翻译记忆库格式
 - xliff: XLIFF 工作流/离线文件
 """
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 
 @dataclass
@@ -137,6 +139,6 @@ def get_supported_exports(extension: str) -> List[ExportOption]:
     return [EXPORT_OPTIONS[opt_id] for opt_id in option_ids if opt_id in EXPORT_OPTIONS]
 
 
-def get_export_option(option_id: str) -> ExportOption | None:
+def get_export_option(option_id: str) -> Optional[ExportOption]:
     """获取导出选项详情"""
     return EXPORT_OPTIONS.get(option_id)

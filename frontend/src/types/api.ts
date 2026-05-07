@@ -36,6 +36,7 @@ export interface TMMatchCandidate {
   source_text: string
   target_text: string
   score: number
+  diff_html?: string | null
   collection_name: string | null
   creator_name: string | null
   created_at: string | null
@@ -247,4 +248,39 @@ export type LLMProvider = 'auto' | 'deepseek' | 'openrouter'
 export interface LLMEvent {
   event: string
   data: Record<string, unknown>
+}
+
+export interface TermbaseCollection {
+  id: string
+  name: string
+  description: string | null
+  created_at: string
+  updated_at: string
+  entry_count: number
+}
+
+export interface Term {
+  id: string
+  source_text: string
+  target_text: string
+  collection_id: string | null
+  created_at: string
+}
+
+export interface TermMatch {
+  term_id: string
+  source_text: string
+  target_text: string
+  start: number
+  end: number
+}
+
+export interface TermbaseImportSummary {
+  filename: string
+  created_rows: number
+  updated_rows: number
+  skipped_rows: number
+  imported_rows: number
+  collection_id: string | null
+  collection_name: string | null
 }

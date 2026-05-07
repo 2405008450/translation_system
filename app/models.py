@@ -401,6 +401,10 @@ class TranslationMemory(Base):
     )
 
 
+MemoryBase = TMCollection
+MemoryEntry = TranslationMemory
+
+
 class TermBase(Base):
     __tablename__ = "term_bases"
     __table_args__ = (

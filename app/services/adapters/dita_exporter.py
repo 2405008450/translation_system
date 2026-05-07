@@ -79,20 +79,19 @@ class DitaExporter:
         Returns:
             bytes: 导出的 DITA XML 字节
         """
+        # 使用 parse 而不是 fromstring 来保留注释和处理指令
         parser = etree.XMLParser(remove_blank_text=False, recover=True)
-        root = etree.fromstring(original_bytes, parser=parser)
+        tree = etree.parse(BytesIO(original_bytes), parser=parser)
+        root = tree.getroot()
         
         # 遍历所有文本节点并替换
         segment_index = 0
         self._replace_text_in_element(root, translations, [segment_index])
         
-        # 序列化为 XML
-        return etree.tostring(
-            root,
-            encoding="UTF-8",
-            xml_declaration=True,
-            pretty_print=True,
-        )
+        # 使用 tree.write 来保留注释和处理指令
+        output = BytesIO()
+        tree.write(output, encoding="UTF-8", xml_declaration=True)
+        return output.getvalue()
 
     def _replace_text_in_element(
         self,
@@ -244,18 +243,18 @@ class DitaExporter:
         Returns:
             bytes: 导出的 DITA XML 字节
         """
+        # 使用 parse 而不是 fromstring 来保留注释和处理指令
         parser = etree.XMLParser(remove_blank_text=False, recover=True)
-        root = etree.fromstring(original_bytes, parser=parser)
+        tree = etree.parse(BytesIO(original_bytes), parser=parser)
+        root = tree.getroot()
         
         # 遍历所有文本节点并替换
         self._replace_text_content(root, translations)
         
-        return etree.tostring(
-            root,
-            encoding="UTF-8",
-            xml_declaration=True,
-            pretty_print=True,
-        )
+        # 使用 tree.write 来保留注释和处理指令
+        output = BytesIO()
+        tree.write(output, encoding="UTF-8", xml_declaration=True)
+        return output.getvalue()
 
     def _replace_text_content(
         self,
