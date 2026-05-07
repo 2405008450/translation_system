@@ -101,9 +101,45 @@ function ensureLanguagePair(sourceLanguage: string, targetLanguage: string) {
 }
 
 function onTMFileChange(event: Event) {
-  selectedTMFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
-  if (selectedTMFile.value && !selectedCollectionId.value && !newCollectionName.value.trim()) {
-    newCollectionName.value = fileBaseName(selectedTMFile.value)
+  const file = (event.target as HTMLInputElement).files?.[0] ?? null
+  selectedTMFile.value = file
+  
+  if (!file) return
+  
+  // Auto-fill name from filename for non-SDLTM files
+  if (!selectedCollectionId.value && !newCollectionName.value.trim()) {
+    newCollectionName.value = fileBaseName(file)
+  }
+  
+  // For SDLTM files, fetch metadata to auto-fill language pair and name
+  if (file.name.toLowerCase().endsWith('.sdltm')) {
+    fetchSDLTMMetadata(file)
+  }
+}
+
+async function fetchSDLTMMetadata(file: File) {
+  try {
+    const formData = new FormData()
+    formData.append('file', file)
+    const { data } = await http.post<{
+      name: string
+      source_language: string
+      target_language: string
+      entry_count: number
+    }>('/translation-memory/preview-sdltm', formData)
+    
+    // Auto-fill fields if not already set
+    if (!newCollectionName.value.trim() && data.name) {
+      newCollectionName.value = data.name
+    }
+    if (!importSourceLanguage.value && data.source_language) {
+      importSourceLanguage.value = data.source_language
+    }
+    if (!importTargetLanguage.value && data.target_language) {
+      importTargetLanguage.value = data.target_language
+    }
+  } catch {
+    // Silently ignore preview errors, user can still manually select
   }
 }
 
@@ -230,7 +266,7 @@ async function deleteCollection(collection: any) {
 
 async function uploadTMWorkbook() {
   if (!selectedTMFile.value) {
-    tmImportMessage.value = '请先选择要导入的 Excel 文件。'
+    tmImportMessage.value = '请先选择要导入的文件。'
     return
   }
 
@@ -529,7 +565,7 @@ onMounted(() => {
         <div class="table-page__body">
           <div class="upload-panel" style="border: none; box-shadow: none; margin: 0; padding: 0;">
             <p class="hint-text" style="margin-bottom: 12px;">
-              Excel 约定：第一列为源文，第二列为译文。导入时必须明确选择语言对，系统会把语言标签同步写入记忆库和 TM 条目。
+              支持 Excel（.xlsx）和 SDL Trados 记忆库（.sdltm）格式。Excel 约定第一列为源文、第二列为译文；SDLTM 会自动读取语言对和名称。
             </p>
 
             <div class="upload-form form-grid-2" style="margin-top: 0;">
@@ -544,12 +580,12 @@ onMounted(() => {
               </label>
 
               <label class="field">
-                <span class="field__label">Excel 文件</span>
+                <span class="field__label">Excel / SDLTM 文件</span>
                 <input
                   id="tm-upload-file"
                   class="field__control"
                   type="file"
-                  accept=".xlsx"
+                  accept=".xlsx,.sdltm"
                   @change="onTMFileChange"
                 />
               </label>

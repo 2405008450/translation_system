@@ -16,6 +16,7 @@ htmlcov/
 coverage/
 *.log
 .claude/
+.kiro/
 data/
 tests/__pycache__/
 tests/.tmp/

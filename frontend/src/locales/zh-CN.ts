@@ -543,10 +543,10 @@ export default {
       term: '导入术语库',
     },
     tm: {
-      intro: 'Excel 约定：第一列为源文，第二列为译文。导入时会校验语言对，并写入对应的记忆库与 TM 条目。',
+      intro: '支持 Excel（.xlsx）和 SDL Trados 记忆库（.sdltm）格式。Excel 约定第一列为源文、第二列为译文；SDLTM 会自动读取语言对和名称。',
       target: '目标记忆库',
       createNew: '新建记忆库',
-      file: 'Excel 文件',
+      file: 'Excel / SDLTM 文件',
       newName: '新记忆库名称',
       newNamePlaceholder: '例如：产品手册中英记忆库',
       description: '说明',
@@ -557,7 +557,7 @@ export default {
       importing: '导入中... {percent}%',
       selectLanguage: '请选择',
       errors: {
-        selectFile: '请先选择要导入的 Excel 文件。',
+        selectFile: '请先选择要导入的文件。',
         selectLanguage: '请先选择语言对。',
         loadCollections: '记忆库列表加载失败。',
         createCollectionEmpty: '记忆库名称不能为空。',

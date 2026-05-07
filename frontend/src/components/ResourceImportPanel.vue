@@ -248,9 +248,45 @@ async function createTermBase(
 }
 
 function onTMFileChange(event: Event) {
-  selectedTMFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
-  if (selectedTMFile.value && !selectedTMCollectionId.value && !newTMCollectionName.value.trim()) {
-    newTMCollectionName.value = fileBaseName(selectedTMFile.value)
+  const file = (event.target as HTMLInputElement).files?.[0] ?? null
+  selectedTMFile.value = file
+  
+  if (!file) return
+  
+  // Auto-fill name from filename for non-SDLTM files
+  if (!selectedTMCollectionId.value && !newTMCollectionName.value.trim()) {
+    newTMCollectionName.value = fileBaseName(file)
+  }
+  
+  // For SDLTM files, fetch metadata to auto-fill language pair and name
+  if (file.name.toLowerCase().endsWith('.sdltm')) {
+    fetchSDLTMMetadata(file)
+  }
+}
+
+async function fetchSDLTMMetadata(file: File) {
+  try {
+    const formData = new FormData()
+    formData.append('file', file)
+    const { data } = await http.post<{
+      name: string
+      source_language: string
+      target_language: string
+      entry_count: number
+    }>('/translation-memory/preview-sdltm', formData)
+    
+    // Auto-fill fields if not already set
+    if (!newTMCollectionName.value.trim() && data.name) {
+      newTMCollectionName.value = data.name
+    }
+    if (!tmImportSourceLanguage.value && data.source_language) {
+      tmImportSourceLanguage.value = data.source_language
+    }
+    if (!tmImportTargetLanguage.value && data.target_language) {
+      tmImportTargetLanguage.value = data.target_language
+    }
+  } catch {
+    // Silently ignore preview errors, user can still manually select
   }
 }
 
@@ -478,7 +514,7 @@ onMounted(() => {
             ref="tmFileInput"
             class="field__control"
             type="file"
-            accept=".xlsx"
+            accept=".xlsx,.sdltm"
             @change="onTMFileChange"
           />
         </label>

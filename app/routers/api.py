@@ -95,7 +95,14 @@ from app.services.task_file_service import (
     get_task_file_extension,
     supports_task_file,
 )
-from app.services.tm_importer import XLSX_EXTENSIONS, import_tm_from_xlsx_upload
+from app.services.tm_importer import (
+    SDLTM_EXTENSIONS,
+    TM_IMPORT_EXTENSIONS,
+    XLSX_EXTENSIONS,
+    import_tm_from_sdltm_upload,
+    import_tm_from_xlsx_upload,
+    preview_sdltm_metadata,
+)
 from app.services.tm_vector import sync_tm_embeddings
 from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_response
 
@@ -2067,8 +2074,36 @@ def delete_tm_collection(
     return {"message": "记忆库已删除。"}
 
 
+@router.post("/translation-memory/preview-sdltm")
+@router.post("/tm/preview-sdltm", include_in_schema=False)
+async def preview_sdltm(
+    file: UploadFile = File(...),
+):
+    """Preview SDLTM file metadata without importing."""
+    extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
+    if extension not in SDLTM_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="仅支持 .sdltm 文件。")
+
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="上传的文件为空。")
+
+    try:
+        metadata = preview_sdltm_metadata(raw_bytes)
+        return {
+            "name": metadata.name,
+            "source_language": metadata.source_language,
+            "target_language": metadata.target_language,
+            "entry_count": metadata.entry_count,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"读取 SDLTM 元数据失败：{exc}") from exc
+
+
 @router.post("/translation-memory/import-xlsx")
 @router.post("/tm/import-xlsx", include_in_schema=False)
+@router.post("/translation-memory/import", include_in_schema=False)
+@router.post("/tm/import", include_in_schema=False)
 async def import_tm_xlsx(
     file: UploadFile = File(...),
     collection_id: UUID | None = Form(default=None),
@@ -2078,12 +2113,12 @@ async def import_tm_xlsx(
     current_user: User = Depends(get_current_user),
 ):
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
-    if extension not in XLSX_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="仅支持上传 .xlsx 文件。")
+    if extension not in TM_IMPORT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="仅支持上传 .xlsx 或 .sdltm 文件。")
 
     raw_bytes = await file.read()
     if not raw_bytes:
-        raise HTTPException(status_code=400, detail="上传的 XLSX 文件为空。")
+        raise HTTPException(status_code=400, detail="上传的文件为空。")
 
     collection = _get_collection_or_404(db, collection_id)
     resolved_source_language, resolved_target_language = _resolve_collection_language_pair(
@@ -2092,15 +2127,26 @@ async def import_tm_xlsx(
         target_language,
     )
     try:
-        import_summary = import_tm_from_xlsx_upload(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=file.filename or "uploaded.xlsx",
-            collection_id=collection_id,
-            source_language=resolved_source_language,
-            target_language=resolved_target_language,
-            creator_id=current_user.id,
-        )
+        if extension in SDLTM_EXTENSIONS:
+            import_summary = import_tm_from_sdltm_upload(
+                db=db,
+                raw_bytes=raw_bytes,
+                filename=file.filename or "uploaded.sdltm",
+                collection_id=collection_id,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                creator_id=current_user.id,
+            )
+        else:
+            import_summary = import_tm_from_xlsx_upload(
+                db=db,
+                raw_bytes=raw_bytes,
+                filename=file.filename or "uploaded.xlsx",
+                collection_id=collection_id,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                creator_id=current_user.id,
+            )
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"TM 导入失败：{exc}") from exc

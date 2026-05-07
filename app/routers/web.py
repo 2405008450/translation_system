@@ -37,7 +37,13 @@ from app.services.file_record_service import (
 from app.services.file_parser import parse_uploaded_file
 from app.services.matcher import match_sentences_with_stats
 from app.services.sentence_splitter import split_sentences
-from app.services.tm_importer import XLSX_EXTENSIONS, import_tm_from_xlsx_upload
+from app.services.tm_importer import (
+    SDLTM_EXTENSIONS,
+    TM_IMPORT_EXTENSIONS,
+    XLSX_EXTENSIONS,
+    import_tm_from_sdltm_upload,
+    import_tm_from_xlsx_upload,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -579,21 +585,30 @@ async def import_xlsx(
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
     extension = f".{(xlsx_file.filename or '').split('.')[-1].lower()}" if xlsx_file.filename else ""
-    if extension not in XLSX_EXTENSIONS:
-        return _render_index(request, error_message="仅支持上传 .xlsx 文件。")
+    if extension not in TM_IMPORT_EXTENSIONS:
+        return _render_index(request, error_message="仅支持上传 .xlsx 或 .sdltm 文件。")
 
     raw_bytes = await xlsx_file.read()
     if not raw_bytes:
-        return _render_index(request, error_message="上传的 XLSX 文件为空。")
+        return _render_index(request, error_message="上传的文件为空。")
 
     try:
-        import_summary = import_tm_from_xlsx_upload(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=xlsx_file.filename or "uploaded.xlsx",
-            source_language="zh-CN",
-            target_language="en-US",
-        )
+        if extension in SDLTM_EXTENSIONS:
+            import_summary = import_tm_from_sdltm_upload(
+                db=db,
+                raw_bytes=raw_bytes,
+                filename=xlsx_file.filename or "uploaded.sdltm",
+                source_language="zh-CN",
+                target_language="en-US",
+            )
+        else:
+            import_summary = import_tm_from_xlsx_upload(
+                db=db,
+                raw_bytes=raw_bytes,
+                filename=xlsx_file.filename or "uploaded.xlsx",
+                source_language="zh-CN",
+                target_language="en-US",
+            )
     except Exception as exc:
         db.rollback()
         return _render_index(request, error_message=f"导入失败：{exc}")

@@ -167,7 +167,44 @@ class HtmlExporter:
         # 使用智能替换
         result = self._smart_replace(content, normalized_translations)
         
+        # 后处理：清理括号内的多余空格
+        result = self._fix_bracket_spacing(result)
+        
         return result.encode('utf-8')
+
+    def _fix_bracket_spacing(self, content: str) -> str:
+        """修复括号内的多余空格
+        
+        将 "( 2 )" 这样的格式修复为 "(2)"
+        处理各种括号类型：() [] {} （）【】「」『』《》〈〉
+        """
+        # 定义括号对
+        bracket_pairs = [
+            (r'\(\s+', '('),      # ( 后的空格
+            (r'\s+\)', ')'),      # ) 前的空格
+            (r'\[\s+', '['),      # [ 后的空格
+            (r'\s+\]', ']'),      # ] 前的空格
+            (r'\{\s+', '{'),      # { 后的空格
+            (r'\s+\}', '}'),      # } 前的空格
+            (r'（\s+', '（'),     # （ 后的空格
+            (r'\s+）', '）'),     # ） 前的空格
+            (r'【\s+', '【'),     # 【 后的空格
+            (r'\s+】', '】'),     # 】 前的空格
+            (r'「\s+', '「'),     # 「 后的空格
+            (r'\s+」', '」'),     # 」 前的空格
+            (r'『\s+', '『'),     # 『 后的空格
+            (r'\s+』', '』'),     # 』 前的空格
+            (r'《\s+', '《'),     # 《 后的空格
+            (r'\s+》', '》'),     # 》 前的空格
+            (r'〈\s+', '〈'),     # 〈 后的空格
+            (r'\s+〉', '〉'),     # 〉 前的空格
+        ]
+        
+        result = content
+        for pattern, replacement in bracket_pairs:
+            result = re.sub(pattern, replacement, result)
+        
+        return result
 
     def _decode_content(self, raw_bytes: bytes) -> str:
         for encoding in ("utf-8", "utf-8-sig", "gb18030", "iso-8859-1"):
