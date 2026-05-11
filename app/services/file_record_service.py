@@ -14,6 +14,7 @@ from app.services.document_storage import (
     resolve_source_file_path,
     save_source_file,
 )
+from app.services.document_workspace import DOCUMENT_PARSE_MODE_FULL, normalize_document_parse_mode
 from app.services.revision_service import create_revision
 from app.services.task_file_service import build_task_workspace
 
@@ -88,8 +89,10 @@ def create_file_record_with_segments(
     similarity_threshold: float = 0.6,
     workspace_data: dict | None = None,
     collection_ids: list[UUID] | None = None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
 ) -> FileRecord:
     file_hash = hashlib.sha256(raw_bytes).hexdigest()
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
 
     if workspace_data is None:
         workspace_data = build_task_workspace(
@@ -98,6 +101,7 @@ def create_file_record_with_segments(
             filename=filename,
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
+            document_parse_mode=document_parse_mode,
         )
 
     return _create_file_record_from_workspace(
@@ -106,6 +110,7 @@ def create_file_record_with_segments(
         file_hash=file_hash,
         workspace_data=workspace_data,
         raw_bytes=raw_bytes,
+        document_parse_mode=document_parse_mode,
     )
 
 
@@ -115,11 +120,14 @@ def _create_file_record_from_workspace(
     file_hash: str,
     workspace_data: dict,
     raw_bytes: bytes | None = None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
 ) -> FileRecord:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     file_record = FileRecord(
         filename=filename,
         file_hash=file_hash,
         status="in_progress",
+        document_parse_mode=document_parse_mode,
     )
     db.add(file_record)
     db.flush()
@@ -306,18 +314,22 @@ def attach_source_document_to_file_record(
     source_filename: str,
     similarity_threshold: float = 0.6,
     collection_ids: list[UUID] | None = None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
 ) -> FileRecord:
     file_hash = hashlib.sha256(raw_bytes).hexdigest()
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     workspace_data = build_task_workspace(
         db=db,
         raw_bytes=raw_bytes,
         filename=source_filename,
         similarity_threshold=similarity_threshold,
         collection_ids=collection_ids,
+        document_parse_mode=document_parse_mode,
     )
 
     file_record.file_hash = file_hash
     file_record.status = "in_progress"
+    file_record.document_parse_mode = document_parse_mode
 
     for seg in workspace_data["segments"]:
         db.add(

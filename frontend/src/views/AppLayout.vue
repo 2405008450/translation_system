@@ -316,6 +316,7 @@ watch(
                   class="sidebar-nav__group-header"
                   type="button"
                   :title="group.label"
+                  :data-label="group.label"
                   :aria-expanded="expandedGroups[group.key]"
                   @click="toggleGroup(group.key)"
                 >
@@ -336,6 +337,7 @@ watch(
                     :class="{ 'is-active': isNavActive(child.name) }"
                     type="button"
                     :title="child.label"
+                    :data-label="child.label"
                     @click="navigateTo(child.name)"
                   >
                     <span class="sidebar-nav__mark">
@@ -355,6 +357,7 @@ watch(
                 :class="{ 'is-active': isGroupActive(group) }"
                 type="button"
                 :title="group.label"
+                :data-label="group.label"
                 @click="group.routeName && navigateTo(group.routeName)"
               >
                 <span class="sidebar-nav__mark">
@@ -496,6 +499,7 @@ watch(
 
       <section class="shell-body">
         <PageHeader
+          v-if="!route.meta.hidePageHeader"
           :title="pageTitle"
           :description="pageDescription"
           :breadcrumbs="breadcrumbs"

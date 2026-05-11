@@ -262,91 +262,82 @@ watch(
     role="group"
     :aria-label="`segment ${index + 1}`"
   >
-    <div class="segment-row__head">
+    <div class="segment-row__meta">
       <span class="segment-row__index">#{{ index + 1 }}</span>
       <span class="segment-row__tag segment-row__tag--status">{{ statusMeta.label }}</span>
       <span class="segment-row__tag is-muted" :class="sourceClass">{{ sourceMeta.label }}</span>
       <span v-if="scorePercent !== null" class="segment-row__tag segment-row__tag--score">
         {{ scorePercent }}%
       </span>
-      <span v-if="segment.matched_collection_name" class="segment-row__tag is-muted">
-        {{ segment.matched_collection_name }}
-      </span>
     </div>
 
-    <div class="segment-row__grid">
-      <div class="segment-row__cell segment-row__cell--source">
-        <div class="segment-row__label-row">
-          <div class="segment-row__label">原文</div>
-        </div>
-        <div class="segment-row__text">
-          <template v-if="highlightedSourceText">
-            <template v-for="(seg, idx) in highlightedSourceText" :key="idx">
-              <mark v-if="seg.highlight" class="segment-row__term-highlight">{{ seg.text }}</mark>
-              <template v-else>{{ seg.text }}</template>
-            </template>
+    <div class="segment-row__cell segment-row__cell--source">
+      <div class="segment-row__text">
+        <template v-if="highlightedSourceText">
+          <template v-for="(seg, idx) in highlightedSourceText" :key="idx">
+            <mark v-if="seg.highlight" class="segment-row__term-highlight">{{ seg.text }}</mark>
+            <template v-else>{{ seg.text }}</template>
           </template>
-          <template v-else>{{ segment.display_text || segment.source_text }}</template>
-        </div>
+        </template>
+        <template v-else>{{ segment.display_text || segment.source_text }}</template>
       </div>
+    </div>
 
-      <div class="segment-row__cell segment-row__cell--target" :class="{ 'is-pending': hasPendingRevision }">
-        <div class="segment-row__label-row">
-          <span class="segment-row__label">译文</span>
-          <span v-if="hasPendingRevision" class="segment-row__badge segment-row__badge--pending">待审核</span>
-        </div>
-        <div v-if="pendingRevision" class="segment-row__revision-panel">
-          <div class="segment-row__revision-head">
-            <strong>修订对比</strong>
-            <span>{{ revisionSourceMeta.label }}</span>
-          </div>
-          <DiffText
-            :old-text="pendingRevision.before_text"
-            :new-text="pendingRevision.after_text"
-            empty-text="空"
-          />
-          <div class="segment-row__revision-actions">
-            <button
-              class="button segment-row__revision-button"
-              type="button"
-              :disabled="disabled || revisionBusy"
-              @click.stop="emit('acceptRevision', pendingRevision.id)"
-            >
-              接受
-            </button>
-            <button
-              class="button segment-row__revision-button segment-row__revision-button--danger"
-              type="button"
-              :disabled="disabled || revisionBusy"
-              @click.stop="emit('rejectRevision', pendingRevision.id)"
-            >
-              拒绝
-            </button>
-          </div>
-        </div>
-        <div
-          ref="editorRef"
-          class="segment-row__editor"
-          :class="{ 'is-focused': isFocused }"
-          :contenteditable="!disabled"
-          tabindex="0"
-          data-segment-target="true"
-          :data-sentence-id="segment.sentence_id"
-          :aria-label="`translation for segment ${index + 1}`"
-          spellcheck="false"
-          @focus="handleFocus"
-          @blur="handleBlur"
-          @click="handleClick"
-          @input="handleInput"
-          v-html="targetHtmlContent"
-        />
+    <div class="segment-row__cell segment-row__cell--target" :class="{ 'is-pending': hasPendingRevision }">
+      <div v-if="hasPendingRevision" class="segment-row__pending-row">
+        <span class="segment-row__badge segment-row__badge--pending">待审核</span>
       </div>
+      <div v-if="pendingRevision" class="segment-row__revision-panel">
+        <div class="segment-row__revision-head">
+          <strong>修订对比</strong>
+          <span>{{ revisionSourceMeta.label }}</span>
+        </div>
+        <DiffText
+          :old-text="pendingRevision.before_text"
+          :new-text="pendingRevision.after_text"
+          empty-text="空"
+        />
+        <div class="segment-row__revision-actions">
+          <button
+            class="button segment-row__revision-button"
+            type="button"
+            :disabled="disabled || revisionBusy"
+            @click.stop="emit('acceptRevision', pendingRevision.id)"
+          >
+            接受
+          </button>
+          <button
+            class="button segment-row__revision-button segment-row__revision-button--danger"
+            type="button"
+            :disabled="disabled || revisionBusy"
+            @click.stop="emit('rejectRevision', pendingRevision.id)"
+          >
+            拒绝
+          </button>
+        </div>
+      </div>
+      <div
+        ref="editorRef"
+        class="segment-row__editor"
+        :class="{ 'is-focused': isFocused }"
+        :contenteditable="!disabled"
+        tabindex="0"
+        data-segment-target="true"
+        :data-sentence-id="segment.sentence_id"
+        :aria-label="`translation for segment ${index + 1}`"
+        spellcheck="false"
+        @focus="handleFocus"
+        @blur="handleBlur"
+        @click="handleClick"
+        @input="handleInput"
+        v-html="targetHtmlContent"
+      />
     </div>
   </article>
 </template>
 
 <style scoped>
-.segment-row__label-row,
+.segment-row__pending-row,
 .segment-row__revision-head,
 .segment-row__revision-actions {
   display: flex;
@@ -356,15 +347,20 @@ watch(
   flex-wrap: wrap;
 }
 
+.segment-row__pending-row {
+  justify-content: flex-end;
+  min-height: 18px;
+}
+
 .segment-row__badge {
   display: inline-flex;
   align-items: center;
-  min-height: 22px;
-  padding: 0 8px;
+  min-height: 18px;
+  padding: 0 6px;
   border-radius: 999px;
   background: rgba(216, 183, 78, 0.18);
   color: #8a6700;
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .segment-row__badge--pending {
@@ -374,15 +370,15 @@ watch(
 
 .segment-row__cell--target.is-pending {
   border-color: rgba(13, 122, 104, 0.35);
-  box-shadow: inset 3px 0 0 rgba(13, 122, 104, 0.48);
+  box-shadow: inset 2px 0 0 rgba(13, 122, 104, 0.42);
 }
 
 .segment-row__revision-panel {
   display: grid;
-  gap: 10px;
-  padding: 10px 12px;
+  gap: 6px;
+  padding: 6px 8px;
   border: 1px solid rgba(13, 122, 104, 0.16);
-  border-radius: 8px;
+  border-radius: 6px;
   background: rgba(243, 250, 247, 0.96);
 }
 
@@ -401,9 +397,9 @@ watch(
 }
 
 .segment-row__revision-button {
-  min-height: 30px;
-  padding: 6px 12px;
-  font-size: 13px;
+  min-height: 28px;
+  padding: 5px 10px;
+  font-size: 12px;
   box-shadow: none;
 }
 
@@ -435,25 +431,29 @@ watch(
 }
 
 .segment-row__editor {
+  flex: 1 1 auto;
   width: 100%;
-  min-height: 60px;
-  padding: 10px 12px;
-  border: 1px solid var(--line-soft);
-  border-radius: 8px;
-  background: var(--surface-input);
-  font-size: 14px;
-  line-height: 1.6;
+  height: 100%;
+  min-height: 64px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  font-size: 13px;
+  line-height: 1.45;
   color: var(--text-primary);
   outline: none;
   white-space: pre-wrap;
   word-break: break-word;
   overflow-wrap: anywhere;
+  overflow: auto;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .segment-row__editor:focus,
 .segment-row__editor.is-focused {
-  border-color: var(--accent-primary);
+  border-color: var(--brand-700);
+  background: var(--surface-panel);
   box-shadow: 0 0 0 3px rgba(13, 122, 104, 0.12);
 }
 
@@ -465,6 +465,6 @@ watch(
 
 .segment-row__editor:empty::before {
   content: '';
-  color: var(--text-tertiary);
+  color: var(--text-placeholder);
 }
 </style>

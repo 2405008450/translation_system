@@ -4,8 +4,13 @@ HTML 导出器 - 将翻译后的内容导出为 HTML 格式
 保留原始 HTML 结构，仅替换文本内容。
 """
 import re
+import logging
+from dataclasses import dataclass, field
 from html.parser import HTMLParser
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 # 块级元素
@@ -30,13 +35,25 @@ INLINE_ELEMENTS = {
 }
 
 
+@dataclass
+class TextNode:
+    """表示 HTML 中一个原始文本节点的位置"""
+
+    start_pos: int
+    end_pos: int
+    text: str
+    normalized_text: str
+
+
+@dataclass
 class TextBlock:
     """表示一个可翻译的文本块"""
-    def __init__(self, start_pos: int, end_pos: int, text: str, normalized_text: str):
-        self.start_pos = start_pos  # 在原始HTML中的起始位置
-        self.end_pos = end_pos      # 在原始HTML中的结束位置
-        self.text = text            # 原始文本（包含标签）
-        self.normalized_text = normalized_text  # 规范化后的纯文本
+
+    start_pos: int  # 在原始 HTML 中第一个文本节点的起始字符偏移
+    end_pos: int  # 在原始 HTML 中最后一个文本节点的结束字符偏移
+    text: str  # 按解析规则合并后的纯文本
+    normalized_text: str  # 规范化后的纯文本
+    text_nodes: List[TextNode] = field(default_factory=list)
 
 
 class HtmlTextExtractor(HTMLParser):
@@ -45,26 +62,37 @@ class HtmlTextExtractor(HTMLParser):
     def __init__(self, content: str):
         super().__init__()
         self.content = content
+        self.line_offsets = self._build_line_offsets(content)
         self.text_blocks: List[TextBlock] = []
         
         # 当前块的状态
-        self.current_block_start: Optional[int] = None
-        self.current_texts: List[str] = []  # 当前块内的文本片段
+        self.current_text = ""
+        self.current_nodes: List[TextNode] = []
         self.skip_depth = 0
         self.tag_stack: List[str] = []
         self.block_depth = 0
+
+    def _build_line_offsets(self, content: str) -> List[int]:
+        offsets = [0]
+        total = 0
+        for line in content.splitlines(keepends=True):
+            total += len(line)
+            offsets.append(total)
+        return offsets
         
     def get_pos(self) -> int:
-        """获取当前解析位置在原始内容中的字节位置"""
+        """获取当前解析位置在原始内容中的字符偏移"""
         line, col = self.getpos()
-        pos = 0
-        for i, l in enumerate(self.content.split('\n')):
-            if i < line - 1:
-                pos += len(l) + 1  # +1 for newline
-            else:
-                pos += col
-                break
-        return pos
+        line_index = max(line - 1, 0)
+        if line_index >= len(self.line_offsets):
+            return len(self.content)
+        return min(self.line_offsets[line_index] + col, len(self.content))
+
+    def _data_end_pos(self, start_pos: int) -> int:
+        next_tag = self.content.find("<", start_pos)
+        if next_tag == -1:
+            return len(self.content)
+        return next_tag
     
     def handle_starttag(self, tag: str, attrs: list):
         tag_lower = tag.lower()
@@ -105,32 +133,38 @@ class HtmlTextExtractor(HTMLParser):
         if self.skip_depth > 0:
             return
         
-        # 记录文本
-        if data.strip():
-            if self.current_block_start is None:
-                self.current_block_start = self.get_pos()
-            self.current_texts.append(data)
+        # 与 HtmlContentParser 保持一致：先合并空白，再在相邻文本片段间补一个空格。
+        text = ' '.join(data.split())
+        if text:
+            start_pos = self.get_pos()
+            end_pos = self._data_end_pos(start_pos)
+            if self.current_text and not self.current_text.endswith(' '):
+                self.current_text += ' '
+            self.current_text += text
+            self.current_nodes.append(TextNode(
+                start_pos=start_pos,
+                end_pos=end_pos,
+                text=data,
+                normalized_text=text,
+            ))
     
     def _flush_block(self):
         """保存当前文本块"""
-        if self.current_texts and self.current_block_start is not None:
-            # 合并所有文本片段
-            combined_text = ''.join(self.current_texts)
+        if self.current_nodes:
+            combined_text = self.current_text.strip()
             normalized = self._normalize_whitespace(combined_text)
             
             if normalized:
-                # 计算结束位置
-                end_pos = self.get_pos()
-                
                 self.text_blocks.append(TextBlock(
-                    start_pos=self.current_block_start,
-                    end_pos=end_pos,
+                    start_pos=self.current_nodes[0].start_pos,
+                    end_pos=self.current_nodes[-1].end_pos,
                     text=combined_text,
                     normalized_text=normalized,
+                    text_nodes=list(self.current_nodes),
                 ))
         
-        self.current_block_start = None
-        self.current_texts = []
+        self.current_text = ""
+        self.current_nodes = []
     
     def _normalize_whitespace(self, text: str) -> str:
         """规范化空白字符"""
@@ -138,8 +172,8 @@ class HtmlTextExtractor(HTMLParser):
     
     def close(self):
         """解析结束时刷新剩余内容"""
-        self._flush_block()
         super().close()
+        self._flush_block()
 
 
 class HtmlExporter:
@@ -171,6 +205,268 @@ class HtmlExporter:
         result = self._fix_bracket_spacing(result)
         
         return result.encode('utf-8')
+
+    def export_by_segments(
+        self,
+        original_bytes: bytes,
+        segments: List[Any],
+        fallback_translations: Optional[Dict[str, str]] = None,
+    ) -> bytes:
+        """按解析顺序和原始文本节点位置导出翻译后的 HTML。
+
+        这个路径保留 segment 的顺序信息，避免相同原文被压平成
+        source_text -> target_text 后丢失不同译文。
+        """
+        content = self._decode_content(original_bytes)
+        normalized_segments = self._normalize_export_segments(segments)
+        if fallback_translations is None:
+            fallback_translations = self._build_segment_translation_map(normalized_segments)
+
+        if not normalized_segments:
+            return self.export(original_bytes, fallback_translations)
+
+        try:
+            extractor = HtmlTextExtractor(content)
+            extractor.feed(content)
+            extractor.close()
+            result, success, unmatched = self._replace_by_segment_positions(
+                content,
+                extractor.text_blocks,
+                normalized_segments,
+            )
+        except Exception as exc:
+            logger.warning(
+                "HTML segment-position export failed, falling back to text-map replacement: %s",
+                exc,
+            )
+            return self.export(original_bytes, fallback_translations)
+
+        if not success:
+            logger.warning(
+                "HTML segment-position export could not align all translated segments; "
+                "falling back to text-map replacement. unmatched=%s",
+                unmatched,
+            )
+            return self.export(original_bytes, fallback_translations)
+
+        result = self._fix_bracket_spacing(result)
+        return result.encode('utf-8')
+
+    def _normalize_export_segments(self, segments: List[Any]) -> List[dict[str, str]]:
+        result: List[dict[str, str]] = []
+        for index, segment in enumerate(segments):
+            source_text = self._get_segment_value(segment, "source_text", "")
+            display_text = self._get_segment_value(segment, "display_text", "")
+            target_text = self._get_segment_value(segment, "target_text", "")
+            segment_id = (
+                self._get_segment_value(segment, "segment_id", "")
+                or self._get_segment_value(segment, "sentence_id", "")
+                or f"seg_{index}"
+            )
+            source_for_alignment = self._normalize_whitespace(
+                str(source_text or display_text or "")
+            )
+            if not source_for_alignment:
+                continue
+            result.append(
+                {
+                    "segment_id": str(segment_id),
+                    "source_text": source_for_alignment,
+                    "display_text": str(display_text or source_text or ""),
+                    "target_text": str(target_text or ""),
+                }
+            )
+        return result
+
+    def _get_segment_value(self, segment: Any, field_name: str, default: Any = "") -> Any:
+        if isinstance(segment, dict):
+            return segment.get(field_name, default)
+        return getattr(segment, field_name, default)
+
+    def _build_segment_translation_map(self, segments: List[dict[str, str]]) -> Dict[str, str]:
+        translations: Dict[str, str] = {}
+        for segment in segments:
+            target_text = segment.get("target_text", "").strip()
+            if not target_text:
+                continue
+            for key in (segment.get("display_text", ""), segment.get("source_text", "")):
+                key = self._normalize_whitespace(str(key or ""))
+                if key and key not in translations:
+                    translations[key] = target_text
+        return translations
+
+    def _replace_by_segment_positions(
+        self,
+        content: str,
+        text_blocks: List[TextBlock],
+        segments: List[dict[str, str]],
+    ) -> Tuple[str, bool, List[str]]:
+        replacements: List[Tuple[int, int, str]] = []
+        segment_index = 0
+
+        for block in text_blocks:
+            if segment_index >= len(segments):
+                break
+
+            group, next_index, separator = self._consume_segments_for_block(
+                block.normalized_text,
+                segments,
+                segment_index,
+            )
+            if group is None:
+                if self._has_translated_segments(segments[segment_index:]):
+                    return content, False, self._describe_segments(segments[segment_index:])
+                break
+
+            segment_index = next_index
+            if not self._has_translated_segments(group):
+                continue
+
+            replacement_text = self._build_block_translation(group, separator)
+            replacements.extend(
+                self._build_text_node_replacements(content, block, replacement_text)
+            )
+
+        if self._has_translated_segments(segments[segment_index:]):
+            return content, False, self._describe_segments(segments[segment_index:])
+
+        result = self._apply_replacements(content, replacements)
+        return result, True, []
+
+    def _consume_segments_for_block(
+        self,
+        block_text: str,
+        segments: List[dict[str, str]],
+        start_index: int,
+    ) -> Tuple[Optional[List[dict[str, str]]], int, str]:
+        block_text = self._normalize_whitespace(block_text)
+        group: List[dict[str, str]] = []
+        sources: List[str] = []
+
+        for index in range(start_index, len(segments)):
+            segment = segments[index]
+            source_text = self._normalize_whitespace(segment.get("source_text", ""))
+            if not source_text:
+                continue
+
+            group.append(segment)
+            sources.append(source_text)
+            match_state, separator = self._match_block_sources(block_text, sources)
+            if match_state == "exact":
+                return group, index + 1, separator
+            if match_state == "mismatch":
+                return None, start_index, " "
+
+        return None, start_index, " "
+
+    def _match_block_sources(
+        self,
+        block_text: str,
+        sources: List[str],
+    ) -> Tuple[str, str]:
+        spaced = self._normalize_whitespace(" ".join(sources))
+        compact = self._normalize_whitespace("".join(sources))
+        block_compact = self._compact_text(block_text)
+        spaced_compact = self._compact_text(spaced)
+
+        if spaced == block_text:
+            return "exact", " "
+        if compact == block_text:
+            return "exact", ""
+        if spaced_compact == block_compact:
+            return "exact", self._infer_source_separator(block_text, sources)
+
+        if block_text.startswith(spaced) or block_text.startswith(compact):
+            return "prefix", " "
+        if block_compact.startswith(spaced_compact):
+            return "prefix", " "
+        return "mismatch", " "
+
+    def _infer_source_separator(self, block_text: str, sources: List[str]) -> str:
+        if len(sources) <= 1:
+            return ""
+
+        cursor = 0
+        saw_whitespace_separator = False
+        for source in sources:
+            position = block_text.find(source, cursor)
+            if position < 0:
+                return ""
+            separator = block_text[cursor:position]
+            if separator.strip() == "" and separator:
+                saw_whitespace_separator = True
+            cursor = position + len(source)
+        return " " if saw_whitespace_separator else ""
+
+    def _compact_text(self, text: str) -> str:
+        return re.sub(r"\s+", "", text or "")
+
+    def _has_translated_segments(self, segments: List[dict[str, str]]) -> bool:
+        return any(segment.get("target_text", "").strip() for segment in segments)
+
+    def _describe_segments(self, segments: List[dict[str, str]]) -> List[str]:
+        return [
+            segment.get("segment_id", "") or segment.get("source_text", "")[:30]
+            for segment in segments
+            if segment.get("target_text", "").strip()
+        ][:10]
+
+    def _build_block_translation(
+        self,
+        segments: List[dict[str, str]],
+        separator: str,
+    ) -> str:
+        pieces: List[str] = []
+        for segment in segments:
+            piece = (
+                segment.get("target_text", "").strip()
+                or segment.get("display_text", "").strip()
+                or segment.get("source_text", "").strip()
+            )
+            if piece:
+                pieces.append(piece)
+        return separator.join(pieces)
+
+    def _build_text_node_replacements(
+        self,
+        content: str,
+        block: TextBlock,
+        replacement_text: str,
+    ) -> List[Tuple[int, int, str]]:
+        replacements: List[Tuple[int, int, str]] = []
+        first_content_node = True
+
+        for node in block.text_nodes:
+            original_text = content[node.start_pos:node.end_pos]
+            if not self._normalize_whitespace(node.text):
+                continue
+
+            leading, trailing = self._split_outer_whitespace(original_text)
+            if first_content_node:
+                new_text = f"{leading}{replacement_text}{trailing}"
+                first_content_node = False
+            else:
+                new_text = f"{leading}{trailing}"
+            replacements.append((node.start_pos, node.end_pos, new_text))
+
+        return replacements
+
+    def _split_outer_whitespace(self, text: str) -> Tuple[str, str]:
+        leading_length = len(text) - len(text.lstrip())
+        trailing_length = len(text) - len(text.rstrip())
+        leading = text[:leading_length]
+        trailing = text[len(text) - trailing_length:] if trailing_length else ""
+        return leading, trailing
+
+    def _apply_replacements(
+        self,
+        content: str,
+        replacements: List[Tuple[int, int, str]],
+    ) -> str:
+        result = content
+        for start, end, replacement in sorted(replacements, key=lambda item: item[0], reverse=True):
+            result = result[:start] + replacement + result[end:]
+        return result
 
     def _fix_bracket_spacing(self, content: str) -> str:
         """修复括号内的多余空格

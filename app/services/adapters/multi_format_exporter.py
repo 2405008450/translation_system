@@ -55,6 +55,7 @@ class MultiFormatExporter:
                 extension,
                 filename,
                 original_bytes,
+                normalized_segments,
                 translation_maps,
             )
         if export_type == "bilingual":
@@ -180,6 +181,7 @@ class MultiFormatExporter:
         extension: str,
         filename: str,
         original_bytes: bytes | None,
+        segments: list[dict[str, Any]],
         translation_maps: dict[str, dict[str, str]],
     ) -> tuple[bytes, str, str]:
         if original_bytes is None:
@@ -193,7 +195,7 @@ class MultiFormatExporter:
         elif extension in {".html", ".htm"}:
             from app.services.adapters.html_exporter import HtmlExporter
 
-            content = HtmlExporter().export(original_bytes, text_map)
+            content = HtmlExporter().export_by_segments(original_bytes, segments, text_map)
         elif extension in {".md", ".markdown"}:
             from app.services.adapters.markdown_exporter import MarkdownExporter
 
@@ -270,11 +272,11 @@ class MultiFormatExporter:
         elif extension == ".zip":
             from app.services.adapters.zip_exporter import ZipExporter
 
-            content = ZipExporter().export(original_bytes, text_map)
+            content = ZipExporter().export(original_bytes, text_map, segments=segments)
         elif extension == ".rar":
             from app.services.adapters.rar_exporter import RarExporter
 
-            content = RarExporter().export(original_bytes, text_map)
+            content = RarExporter().export(original_bytes, text_map, segments=segments)
         else:
             raise ValueError(f"Original export is not supported for {extension}.")
 

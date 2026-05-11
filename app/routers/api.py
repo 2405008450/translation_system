@@ -4,6 +4,7 @@ API 路由模块 - 文件上传、解析和导出接口
 支持多种文档格式的上传、解析和导出。
 """
 import json
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
@@ -23,6 +24,7 @@ from app.models import (
     FileRecord,
     MemoryBase,
     MemoryEntry,
+    Project,
     Segment,
     TMCollection,
     TermBase,
@@ -51,7 +53,6 @@ from app.services.comment_service import (
     update_segment_comment,
 )
 from app.services.file_record_service import (
-    attach_source_document_to_file_record,
     batch_update_segments,
     calculate_file_record_progress,
     create_file_record_with_segments,
@@ -75,7 +76,7 @@ from app.services.llm_service import (
     validate_provider_choice,
 )
 from app.services.language_pairs import require_language_pair
-from app.services.matcher import get_tm_candidates_for_text
+from app.services.matcher import get_tm_candidates_for_text, match_sentences_with_stats
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
 from app.services.revision_service import (
     accept_revision,
@@ -87,6 +88,7 @@ from app.services.revision_service import (
 )
 from app.services.slate_parser import parse_docx_for_slate
 from app.services.task_file_service import (
+    DOCUMENT_PARSE_MODE_FULL,
     build_task_preview_html,
     build_task_workspace,
     can_export_task_file,
@@ -129,11 +131,37 @@ class LLMTranslateRequest(BaseModel):
     provider: Literal["auto", "deepseek", "openrouter"] = "deepseek"
 
 
+class RematchRequest(BaseModel):
+    collection_ids: list[UUID]
+    threshold: float = 0.75
+    skip_confirmed: bool = True
+    overwrite_fuzzy: bool = True
+    auto_confirm_exact: bool = True
+
+
+class FileRecordBindingsRequest(BaseModel):
+    term_base_id: UUID | None = None
+    collection_id: UUID | None = None
+
+
+class SaveToTMRequest(BaseModel):
+    collection_id: UUID | None = None
+    collection_mode: Literal["existing", "new"] = "existing"
+    collection_name: str | None = None
+    scope: Literal["confirmed", "translated", "all"] = "translated"
+
+
 class MemoryBasePayload(BaseModel):
     name: str
     description: str | None = None
     source_language: str
     target_language: str
+
+
+class TMCollectionMergePayload(BaseModel):
+    source_collection_ids: list[UUID]
+    name: str
+    description: str | None = None
 
 
 class TermBasePayload(BaseModel):
@@ -170,8 +198,8 @@ class CommentReplyRequest(BaseModel):
 
 class ProjectCreatePayload(BaseModel):
     name: str
-    source_language: str
-    target_language: str
+    source_language: str | None = None
+    target_language: str | None = None
     deadline: str | None = None
     access_level: Literal["team", "private", "public"] = "team"
     collection_id: UUID | None = None
@@ -209,6 +237,16 @@ def _build_binary_download_response(
 
 def _sse_event(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _parse_optional_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    normalized = value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
 
 
 def _build_llm_translation_tasks(
@@ -328,6 +366,29 @@ def _normalize_collection_name(name: str) -> str:
     return " ".join(name.strip().split())
 
 
+def _build_default_save_to_tm_collection_name(file_record: FileRecord) -> str:
+    filename = (file_record.filename or "").strip()
+    stem = Path(filename).stem.strip() if filename else ""
+    base_name = stem or filename or "任务记忆库"
+    return _normalize_collection_name(f"{base_name} 记忆库")
+
+
+def _build_unique_memory_base_name(db: Session, name: str) -> str:
+    base_name = _normalize_collection_name(name) or "任务记忆库"
+    if len(base_name) > 255:
+        base_name = base_name[:255].rstrip() or "任务记忆库"
+
+    candidate = base_name
+    suffix_index = 2
+    while db.query(MemoryBase.id).filter(MemoryBase.name == candidate).first() is not None:
+        suffix = f" ({suffix_index})"
+        candidate_base = base_name[: 255 - len(suffix)].rstrip() or "任务记忆库"
+        candidate = f"{candidate_base}{suffix}"
+        suffix_index += 1
+
+    return candidate
+
+
 def _require_tm_language_pair(
     source_language: str | None,
     target_language: str | None,
@@ -441,6 +502,30 @@ def _require_selected_collection_ids(
     return collection_ids
 
 
+def _resolve_upload_language_pair(
+    source_language: str | None,
+    target_language: str | None,
+    primary_collection: TMCollection | None = None,
+) -> tuple[str, str]:
+    if source_language or target_language:
+        resolved_source_language, resolved_target_language = _require_tm_language_pair(
+            source_language,
+            target_language,
+        )
+        _ensure_resource_language_pair_matches(
+            primary_collection,
+            resolved_source_language,
+            resolved_target_language,
+            "记忆库",
+        )
+        return resolved_source_language, resolved_target_language
+
+    if primary_collection and primary_collection.source_language and primary_collection.target_language:
+        return primary_collection.source_language, primary_collection.target_language
+
+    raise HTTPException(status_code=400, detail="上传文件前请选择源语言和目标语言。")
+
+
 def _get_collection_or_404(db: Session, collection_id: UUID | None) -> TMCollection | None:
     if collection_id is None:
         return None
@@ -479,6 +564,34 @@ def _serialize_tm_collection(collection: MemoryBase, entry_count: int = 0) -> di
         "updated_at": collection.updated_at.isoformat(),
         "entry_count": entry_count,
     }
+
+
+def _require_same_tm_collection_language_pair(
+    collections: list[MemoryBase],
+) -> tuple[str, str]:
+    try:
+        source_language, target_language = require_language_pair(
+            collections[0].source_language,
+            collections[0].target_language,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="选中的记忆库缺少语言对，无法合并。") from exc
+
+    for collection in collections[1:]:
+        try:
+            candidate_source_language, candidate_target_language = require_language_pair(
+                collection.source_language,
+                collection.target_language,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="选中的记忆库缺少语言对，无法合并。") from exc
+        if (
+            candidate_source_language != source_language
+            or candidate_target_language != target_language
+        ):
+            raise HTTPException(status_code=400, detail="只能合并语言对一致的记忆库。")
+
+    return source_language, target_language
 
 
 @router.post("/parser/slate")
@@ -854,6 +967,9 @@ async def create_file_record(
     threshold: float = Form(default=0.6),
     collection_ids: list[UUID] | None = Form(default=None),
     term_base_id: UUID | None = Form(default=None),
+    source_language: str | None = Form(default=None),
+    target_language: str | None = Form(default=None),
+    document_parse_mode: str = Form(default=DOCUMENT_PARSE_MODE_FULL),
     db: Session = Depends(get_db),
 ):
     """上传文档并创建持久化记录"""
@@ -863,9 +979,16 @@ async def create_file_record(
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="文件为空。")
 
-    selected_collection_ids = _validate_collection_ids(db, collection_ids)
-    required_collection_ids = _require_selected_collection_ids(selected_collection_ids)
-    primary_collection = _get_collection_or_404(db, required_collection_ids[0])
+    selected_collection_ids = _validate_collection_ids(db, collection_ids) or []
+    primary_collection = _get_collection_or_404(
+        db,
+        selected_collection_ids[0] if selected_collection_ids else None,
+    )
+    resolved_source_language, resolved_target_language = _resolve_upload_language_pair(
+        source_language,
+        target_language,
+        primary_collection,
+    )
 
     # 验证术语库是否存在
     term_base = None
@@ -875,8 +998,8 @@ async def create_file_record(
             raise HTTPException(status_code=404, detail="术语库不存在。")
         _ensure_resource_language_pair_matches(
             term_base,
-            primary_collection.source_language,
-            primary_collection.target_language,
+            resolved_source_language,
+            resolved_target_language,
             "术语库",
         )
 
@@ -886,7 +1009,8 @@ async def create_file_record(
             raw_bytes=raw_bytes,
             filename=file.filename or "untitled.txt",
             similarity_threshold=threshold,
-            collection_ids=required_collection_ids,
+            collection_ids=selected_collection_ids,
+            document_parse_mode=document_parse_mode,
         )
         file_record = create_file_record_with_segments(
             db=db,
@@ -894,12 +1018,15 @@ async def create_file_record(
             filename=file.filename or "untitled.txt",
             similarity_threshold=threshold,
             workspace_data=workspace_data,
-            collection_ids=required_collection_ids,
+            collection_ids=selected_collection_ids,
+            document_parse_mode=document_parse_mode,
         )
         # 写入绑定关系
-        if required_collection_ids:
-            file_record.collection_id = required_collection_ids[0]
+        if selected_collection_ids:
+            file_record.collection_id = selected_collection_ids[0]
             _apply_collection_language_pair(file_record, primary_collection)
+        file_record.source_language = resolved_source_language
+        file_record.target_language = resolved_target_language
         if term_base is not None:
             file_record.term_base_id = term_base_id
         db.commit()
@@ -907,9 +1034,10 @@ async def create_file_record(
             "id": file_record.id,
             "filename": file_record.filename,
             "status": file_record.status,
+            "document_parse_mode": file_record.document_parse_mode,
             "created_at": file_record.created_at.isoformat(),
         }
-    except (UnsupportedFormatError, FileTooLargeError) as exc:
+    except (UnsupportedFormatError, FileTooLargeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ParseError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -934,35 +1062,26 @@ def create_project(
         except ValueError:
             raise HTTPException(status_code=400, detail="截止期限格式不正确，请使用 ISO 格式。")
 
-    # 验证库是否存在
-    collection = None
-    if payload.collection_id is not None:
-        collection = db.query(TMCollection).filter(TMCollection.id == payload.collection_id).first()
-        if collection is None:
-            raise HTTPException(status_code=404, detail="记忆库不存在。")
-    term_base = None
-    if payload.term_base_id is not None:
-        term_base = db.query(TermBase).filter(TermBase.id == payload.term_base_id).first()
-        if term_base is None:
-            raise HTTPException(status_code=404, detail="术语库不存在。")
+    project_name = payload.name.strip()
+    if not project_name:
+        raise HTTPException(status_code=400, detail="项目名称不能为空。")
 
-    source_language, target_language = _require_tm_language_pair(
-        payload.source_language,
-        payload.target_language,
-    )
-    _ensure_resource_language_pair_matches(collection, source_language, target_language, "记忆库")
-    _ensure_resource_language_pair_matches(term_base, source_language, target_language, "术语库")
+    source_language = None
+    target_language = None
+    if payload.source_language or payload.target_language:
+        source_language, target_language = _require_tm_language_pair(
+            payload.source_language,
+            payload.target_language,
+        )
 
-    project = FileRecord(
-        filename=payload.name.strip(),
+    project = Project(
+        name=project_name,
         status="draft",
         source_language=source_language,
         target_language=target_language,
         creator_id=current_user.id,
         deadline=deadline_dt,
         access_level=payload.access_level,
-        collection_id=payload.collection_id,
-        term_base_id=payload.term_base_id,
     )
     db.add(project)
     db.commit()
@@ -970,37 +1089,36 @@ def create_project(
 
     return {
         "id": str(project.id),
-        "filename": project.filename,
+        "name": project.name,
+        "filename": project.name,
         "status": project.status,
         "source_language": project.source_language,
         "target_language": project.target_language,
         "creator": get_user_display_name(current_user),
         "deadline": project.deadline.isoformat() if project.deadline else None,
         "access_level": project.access_level,
-        "collection_id": project.collection_id,
-        "collection_name": collection.name if collection else None,
-        "term_base_id": project.term_base_id,
-        "term_base_name": term_base.name if term_base else None,
         "created_at": project.created_at.isoformat(),
     }
 
 
 def _build_project_summary_payload(
-    project: FileRecord,
+    project: Project,
     total_segments: int,
     translated_segments: int,
+    file_count: int,
     creator_name: str | None = None,
 ) -> dict:
     progress = calculate_file_record_progress(total_segments, translated_segments)
-    effective_status = resolve_file_record_status(
-        project.status,
-        total_segments,
-        translated_segments,
+    effective_status = (
+        resolve_file_record_status("in_progress", total_segments, translated_segments)
+        if total_segments > 0
+        else project.status
     )
 
     return {
         "id": str(project.id),
-        "filename": project.filename,
+        "name": project.name,
+        "filename": project.name,
         "status": effective_status,
         "progress": progress,
         "total_segments": total_segments,
@@ -1010,31 +1128,128 @@ def _build_project_summary_payload(
         "creator": creator_name,
         "deadline": project.deadline.isoformat() if project.deadline else None,
         "access_level": project.access_level,
+        "file_count": file_count,
         "created_at": project.created_at.isoformat(),
         "updated_at": project.updated_at.isoformat(),
     }
 
 
-def _build_project_detail_payload(
-    project: FileRecord,
+def _build_project_file_payload(
+    file_record: FileRecord,
     total_segments: int,
     translated_segments: int,
 ) -> dict:
-    creator_name = get_user_display_name(project.creator)
-    source_bytes = load_file_record_source(project)
+    source_bytes = load_file_record_source(file_record)
+    progress = calculate_file_record_progress(total_segments, translated_segments)
+    effective_status = resolve_file_record_status(
+        file_record.status,
+        total_segments=total_segments,
+        translated_segments=translated_segments,
+    )
+
+    return {
+        "id": str(file_record.id),
+        "project_id": str(file_record.project_id) if file_record.project_id else None,
+        "filename": file_record.filename,
+        "status": effective_status,
+        "document_parse_mode": getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
+        "progress": progress,
+        "total_segments": total_segments,
+        "translated_segments": translated_segments,
+        "source_language": file_record.source_language,
+        "target_language": file_record.target_language,
+        "creator": get_user_display_name(file_record.creator) if file_record.creator else None,
+        "deadline": file_record.deadline.isoformat() if file_record.deadline else None,
+        "access_level": file_record.access_level,
+        "created_at": file_record.created_at.isoformat(),
+        "updated_at": file_record.updated_at.isoformat(),
+        "has_source_document": source_bytes is not None,
+        "file_size_bytes": len(source_bytes) if source_bytes is not None else None,
+        "collection_id": file_record.collection_id,
+        "term_base_id": file_record.term_base_id,
+    }
+
+
+def _get_file_segment_stats(db: Session, file_record_ids: list[UUID]) -> dict[UUID, dict]:
+    if not file_record_ids:
+        return {}
+
+    from sqlalchemy import case as sql_case
+
+    stats_rows = (
+        db.query(
+            Segment.file_record_id,
+            func.count(Segment.id).label("total"),
+            func.count(sql_case((Segment.target_text != "", 1))).label("filled"),
+        )
+        .filter(Segment.file_record_id.in_(file_record_ids))
+        .group_by(Segment.file_record_id)
+        .all()
+    )
+    return {
+        row.file_record_id: {
+            "total": row.total,
+            "filled": row.filled,
+        }
+        for row in stats_rows
+    }
+
+
+def _get_project_stats(db: Session, project_ids: list[UUID]) -> dict[UUID, dict]:
+    if not project_ids:
+        return {}
+
+    from sqlalchemy import case as sql_case
+
+    stats_rows = (
+        db.query(
+            FileRecord.project_id,
+            func.count(func.distinct(FileRecord.id)).label("file_count"),
+            func.count(Segment.id).label("total"),
+            func.count(sql_case((Segment.target_text != "", 1))).label("filled"),
+        )
+        .outerjoin(Segment, Segment.file_record_id == FileRecord.id)
+        .filter(FileRecord.project_id.in_(project_ids))
+        .group_by(FileRecord.project_id)
+        .all()
+    )
+    return {
+        row.project_id: {
+            "file_count": row.file_count,
+            "total": row.total,
+            "filled": row.filled,
+        }
+        for row in stats_rows
+    }
+
+
+def _build_project_detail_payload(
+    project: Project,
+    files: list[FileRecord],
+    file_stats: dict[UUID, dict],
+) -> dict:
+    total_segments = sum(file_stats.get(file.id, {"total": 0})["total"] for file in files)
+    translated_segments = sum(file_stats.get(file.id, {"filled": 0})["filled"] for file in files)
     payload = _build_project_summary_payload(
         project=project,
         total_segments=total_segments,
         translated_segments=translated_segments,
-        creator_name=creator_name,
+        file_count=len(files),
+        creator_name=get_user_display_name(project.creator),
     )
-
-    payload.update({
-        "has_source_document": source_bytes is not None,
-        "file_size_bytes": len(source_bytes) if source_bytes is not None else None,
-        "collection_id": project.collection_id,
-        "term_base_id": project.term_base_id,
-    })
+    payload["files"] = [
+        _build_project_file_payload(
+            file_record=file_record,
+            total_segments=file_stats.get(file_record.id, {"total": 0})["total"],
+            translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
+        )
+        for file_record in files
+    ]
+    payload["has_source_document"] = any(file_item["has_source_document"] for file_item in payload["files"])
+    payload["file_size_bytes"] = sum(
+        file_item["file_size_bytes"] or 0
+        for file_item in payload["files"]
+    ) or None
     return payload
 
 
@@ -1043,103 +1258,169 @@ def get_project_detail(
     project_id: UUID,
     db: Session = Depends(get_db),
 ):
-    project = db.query(FileRecord).filter(FileRecord.id == project_id).first()
+    from sqlalchemy.orm import joinedload
+
+    project = (
+        db.query(Project)
+        .options(joinedload(Project.creator))
+        .filter(Project.id == project_id)
+        .first()
+    )
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在。")
 
-    total_segments = (
-        db.query(func.count(Segment.id))
-        .filter(Segment.file_record_id == project_id)
-        .scalar()
-        or 0
+    files = (
+        db.query(FileRecord)
+        .filter(FileRecord.project_id == project_id)
+        .order_by(FileRecord.created_at.desc())
+        .all()
     )
-    translated_segments = (
-        db.query(func.count(Segment.id))
-        .filter(
-            Segment.file_record_id == project_id,
-            Segment.target_text != "",
-        )
-        .scalar()
-        or 0
-    )
+    file_stats = _get_file_segment_stats(db, [file_record.id for file_record in files])
+    return _build_project_detail_payload(project, files, file_stats)
 
-    return _build_project_detail_payload(project, total_segments, translated_segments)
+
+@router.delete("/projects/{project_id}")
+def delete_project(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+
+    file_record_ids = [
+        row.id
+        for row in db.query(FileRecord.id).filter(FileRecord.project_id == project_id).all()
+    ]
+    for file_record_id in file_record_ids:
+        delete_file_record(db, file_record_id)
+
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if project is not None:
+        db.delete(project)
+        db.commit()
+
+    return {"message": "项目已删除。"}
 
 
 @router.post("/projects/{project_id}/source-document")
-def upload_project_source_document(
+async def upload_project_source_document(
     project_id: UUID,
-    file: UploadFile = File(...),
+    files: list[UploadFile] | None = File(default=None),
+    file: UploadFile | None = File(default=None),
     threshold: float = Form(default=0.6),
     collection_ids: list[UUID] | None = Form(default=None),
     term_base_id: UUID | None = Form(default=None),
+    source_language: str | None = Form(default=None),
+    target_language: str | None = Form(default=None),
+    document_parse_mode: str = Form(default=DOCUMENT_PARSE_MODE_FULL),
     db: Session = Depends(get_db),
 ):
-    _validate_task_upload(file)
-    project = get_file_record_model(db, project_id)
+    project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在。")
-    if project.status != "draft":
-        raise HTTPException(status_code=400, detail="该项目已经上传过待翻译文档，请直接继续处理。")
 
-    existing_segments = (
-        db.query(Segment.id)
-        .filter(Segment.file_record_id == project_id)
-        .first()
+    uploaded_files = list(files or [])
+    if file is not None:
+        uploaded_files.append(file)
+    if not uploaded_files:
+        raise HTTPException(status_code=400, detail="请选择要上传的文件。")
+
+    for upload_file in uploaded_files:
+        _validate_task_upload(upload_file)
+
+    selected_collection_ids = _validate_collection_ids(db, collection_ids) or []
+    primary_collection = _get_collection_or_404(
+        db,
+        selected_collection_ids[0] if selected_collection_ids else None,
     )
-    if existing_segments or load_file_record_source(project) is not None:
-        raise HTTPException(status_code=400, detail="该项目已经存在源文档，请直接继续处理。")
+    resolved_source_language, resolved_target_language = _resolve_upload_language_pair(
+        source_language,
+        target_language,
+        primary_collection,
+    )
 
-    raw_bytes = file.file.read()
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail="文件为空。")
-
-    selected_collection_ids = _validate_collection_ids(db, collection_ids)
-    required_collection_ids = _require_selected_collection_ids(selected_collection_ids)
-    primary_collection = _get_collection_or_404(db, required_collection_ids[0])
-    project_source_language, project_target_language = _resolve_file_record_language_pair(project)
-    _ensure_resource_language_pair_matches(primary_collection, project_source_language, project_target_language, "记忆库")
-
-    # 验证术语库是否存在
     term_base = None
     if term_base_id is not None:
         term_base = db.query(TermBase).filter(TermBase.id == term_base_id).first()
         if term_base is None:
             raise HTTPException(status_code=404, detail="术语库不存在。")
-        _ensure_resource_language_pair_matches(term_base, project_source_language, project_target_language, "术语库")
-
-    try:
-        project = attach_source_document_to_file_record(
-            db=db,
-            file_record=project,
-            raw_bytes=raw_bytes,
-            source_filename=file.filename or "source.txt",
-            similarity_threshold=threshold,
-            collection_ids=required_collection_ids,
+        _ensure_resource_language_pair_matches(
+            term_base,
+            resolved_source_language,
+            resolved_target_language,
+            "术语库",
         )
-        # 写入绑定关系
-        if required_collection_ids:
-            project.collection_id = required_collection_ids[0]
-            _apply_collection_language_pair(project, primary_collection)
-        project.term_base_id = term_base_id
+
+    created_files = []
+    try:
+        for upload_file in uploaded_files:
+            raw_bytes = await upload_file.read()
+            if not raw_bytes:
+                raise HTTPException(status_code=400, detail=f"{upload_file.filename or '文件'} 为空。")
+
+            filename = upload_file.filename or "source.txt"
+            workspace_data = build_task_workspace(
+                db=db,
+                raw_bytes=raw_bytes,
+                filename=filename,
+                similarity_threshold=threshold,
+                collection_ids=selected_collection_ids,
+                document_parse_mode=document_parse_mode,
+            )
+            file_record = create_file_record_with_segments(
+                db=db,
+                raw_bytes=raw_bytes,
+                filename=filename,
+                similarity_threshold=threshold,
+                workspace_data=workspace_data,
+                collection_ids=selected_collection_ids,
+                document_parse_mode=document_parse_mode,
+            )
+            file_record.project_id = project.id
+            file_record.creator_id = project.creator_id
+            file_record.deadline = project.deadline
+            file_record.access_level = project.access_level
+            file_record.source_language = resolved_source_language
+            file_record.target_language = resolved_target_language
+            if selected_collection_ids:
+                file_record.collection_id = selected_collection_ids[0]
+            if term_base is not None:
+                file_record.term_base_id = term_base_id
+            db.commit()
+            db.refresh(file_record)
+            created_files.append(file_record)
+
+        project.status = "in_progress"
         db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except (UnsupportedFormatError, FileTooLargeError, ValueError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ParseError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    total_segments = (
-        db.query(func.count(Segment.id))
-        .filter(Segment.file_record_id == project_id)
-        .scalar()
-        or 0
-    )
+    file_stats = _get_file_segment_stats(db, [file_record.id for file_record in created_files])
 
     return {
         "id": str(project.id),
         "status": project.status,
-        "filename": project.filename,
-        "total_segments": total_segments,
-        "has_source_document": True,
+        "filename": project.name,
+        "uploaded_count": len(created_files),
+        "files": [
+            _build_project_file_payload(
+                file_record=file_record,
+                total_segments=file_stats.get(file_record.id, {"total": 0})["total"],
+                translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
+            )
+            for file_record in created_files
+        ],
     }
 
 
@@ -1151,58 +1432,42 @@ def list_projects(
     db: Session = Depends(get_db),
 ):
     """获取项目列表（分页、搜索），含翻译进度统计"""
-    from sqlalchemy import case as sql_case
     from sqlalchemy.orm import joinedload
 
-    base_query = db.query(FileRecord).options(joinedload(FileRecord.creator))
+    base_query = db.query(Project).options(joinedload(Project.creator))
     if search.strip():
-        base_query = base_query.filter(FileRecord.filename.ilike(f"%{search.strip()}%"))
+        base_query = base_query.filter(Project.name.ilike(f"%{search.strip()}%"))
 
     total = base_query.count()
     safe_skip = max(skip, 0)
     safe_limit = min(max(limit, 1), 200)
-    file_records = (
+    projects = (
         base_query
-        .order_by(FileRecord.created_at.desc())
+        .order_by(Project.created_at.desc())
         .offset(safe_skip)
         .limit(safe_limit)
         .all()
     )
 
-    fr_ids = [fr.id for fr in file_records]
-    segment_stats: dict = {}
-    if fr_ids:
-        stats_rows = (
-            db.query(
-                Segment.file_record_id,
-                func.count(Segment.id).label("total"),
-                func.count(sql_case((Segment.target_text != "", 1))).label("filled"),
-            )
-            .filter(Segment.file_record_id.in_(fr_ids))
-            .group_by(Segment.file_record_id)
-            .all()
-        )
-        for row in stats_rows:
-            segment_stats[row.file_record_id] = {
-                "total": row.total,
-                "filled": row.filled,
-            }
+    project_ids = [project.id for project in projects]
+    project_stats = _get_project_stats(db, project_ids)
 
     items = []
-    for fr in file_records:
-        st = segment_stats.get(fr.id, {"total": 0, "filled": 0})
+    for project in projects:
+        st = project_stats.get(project.id, {"file_count": 0, "total": 0, "filled": 0})
         total_segs = st["total"]
         filled_segs = st["filled"]
 
         creator_name = None
-        if fr.creator:
-            creator_name = get_user_display_name(fr.creator)
+        if project.creator:
+            creator_name = get_user_display_name(project.creator)
 
         items.append(
             _build_project_summary_payload(
-                project=fr,
+                project=project,
                 total_segments=total_segs,
                 translated_segments=filled_segs,
+                file_count=st["file_count"],
                 creator_name=creator_name,
             )
         )
@@ -1229,6 +1494,7 @@ def get_file_records(
             "id": file_record.id,
             "filename": file_record.filename,
             "status": file_record.status,
+            "document_parse_mode": getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
             "source_language": file_record.source_language,
             "target_language": file_record.target_language,
             "created_at": file_record.created_at.isoformat(),
@@ -1275,6 +1541,7 @@ def get_file_record(
         "id": file_record.id,
         "filename": file_record.filename,
         "status": file_record.status,
+        "document_parse_mode": getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
         "source_language": file_record.source_language,
         "target_language": file_record.target_language,
         "collection_id": file_record.collection_id,
@@ -1331,6 +1598,7 @@ def get_file_record_preview(
         filename=source_filename,
         segments=segments,
         source_bytes=source_bytes,
+        document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
     )
 
     return {
@@ -1376,9 +1644,7 @@ def get_segment_tm_candidates(
     if not segment:
         raise HTTPException(status_code=404, detail="句段不存在。")
 
-    collection_ids = None
-    if file_record.collection_id:
-        collection_ids = [file_record.collection_id]
+    collection_ids = [file_record.collection_id] if file_record.collection_id else []
 
     candidates = get_tm_candidates_for_text(
         db=db,
@@ -1408,6 +1674,153 @@ def get_segment_tm_candidates(
     }
 
 
+@router.post("/file-records/{file_record_id}/rematch")
+def rematch_file_record(
+    file_record_id: UUID,
+    payload: RematchRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    selected_collection_ids = _require_selected_collection_ids(
+        _validate_collection_ids(db, payload.collection_ids)
+    )
+    source_language, target_language = _resolve_file_record_language_pair(file_record)
+    collections = (
+        db.query(MemoryBase)
+        .filter(MemoryBase.id.in_(selected_collection_ids))
+        .all()
+    )
+    for collection in collections:
+        _ensure_resource_language_pair_matches(collection, source_language, target_language, "记忆库")
+
+    threshold = float(payload.threshold)
+    if threshold < 0.5 or threshold > 1:
+        raise HTTPException(status_code=400, detail="TM 匹配阈值必须在 0.50 到 1.00 之间。")
+
+    segments = list_segments_for_file_record(db, file_record_id)
+    if not segments:
+        return {"exact": 0, "fuzzy": 0, "skipped": 0, "updated": 0}
+
+    source_sentences = [segment.source_text for segment in segments]
+    auxiliary_sentences = [segment.display_text for segment in segments]
+    matches, _ = match_sentences_with_stats(
+        db=db,
+        sentences=source_sentences,
+        auxiliary_sentences=auxiliary_sentences,
+        similarity_threshold=threshold,
+        collection_ids=selected_collection_ids,
+    )
+
+    exact_count = 0
+    fuzzy_count = 0
+    skipped_count = 0
+    updated_count = 0
+
+    for segment, match in zip(segments, matches, strict=False):
+        before = (
+            segment.target_text,
+            segment.status,
+            segment.score,
+            segment.source,
+            segment.matched_source_text,
+            segment.matched_collection_name,
+            segment.matched_creator_name,
+            segment.matched_created_at,
+            segment.matched_updated_at,
+        )
+        if payload.skip_confirmed and segment.status == "confirmed":
+            skipped_count += 1
+            continue
+
+        segment.score = float(match.score or 0)
+        segment.matched_source_text = match.matched_source_text
+        segment.matched_collection_name = match.matched_collection_name
+        segment.matched_creator_name = match.matched_creator_name
+        segment.matched_created_at = _parse_optional_datetime(match.matched_created_at)
+        segment.matched_updated_at = _parse_optional_datetime(match.matched_updated_at)
+
+        if match.status == "exact" and match.target_text is not None:
+            segment.target_text = match.target_text
+            segment.source = "tm"
+            segment.status = "confirmed" if payload.auto_confirm_exact else "exact"
+            exact_count += 1
+        elif match.status == "fuzzy" and match.target_text is not None:
+            can_overwrite = payload.overwrite_fuzzy or (
+                segment.status in {"none", "fuzzy"} and segment.source != "user"
+            )
+            if can_overwrite:
+                segment.target_text = match.target_text
+                segment.source = "tm"
+                segment.status = "fuzzy"
+                fuzzy_count += 1
+
+        after = (
+            segment.target_text,
+            segment.status,
+            segment.score,
+            segment.source,
+            segment.matched_source_text,
+            segment.matched_collection_name,
+            segment.matched_creator_name,
+            segment.matched_created_at,
+            segment.matched_updated_at,
+        )
+        if before != after:
+            updated_count += 1
+
+    db.commit()
+    return {
+        "exact": exact_count,
+        "fuzzy": fuzzy_count,
+        "skipped": skipped_count,
+        "updated": updated_count,
+    }
+
+
+@router.patch("/file-records/{file_record_id}/bindings")
+def patch_file_record_bindings(
+    file_record_id: UUID,
+    payload: FileRecordBindingsRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    source_language, target_language = _resolve_file_record_language_pair(file_record)
+
+    if "collection_id" in payload.model_fields_set:
+        if payload.collection_id is None:
+            file_record.collection_id = None
+        else:
+            collection = _get_collection_or_404(db, payload.collection_id)
+            _ensure_resource_language_pair_matches(collection, source_language, target_language, "记忆库")
+            file_record.collection_id = payload.collection_id
+
+    if "term_base_id" in payload.model_fields_set:
+        if payload.term_base_id is None:
+            file_record.term_base_id = None
+        else:
+            term_base = db.query(TermBase).filter(TermBase.id == payload.term_base_id).first()
+            if not term_base:
+                raise HTTPException(status_code=404, detail="术语库不存在。")
+            _ensure_resource_language_pair_matches(term_base, source_language, target_language, "术语库")
+            file_record.term_base_id = payload.term_base_id
+
+    db.commit()
+    db.refresh(file_record)
+    return {
+        "id": str(file_record.id),
+        "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
+        "term_base_id": str(file_record.term_base_id) if file_record.term_base_id else None,
+    }
+
+
 @router.get("/file-records/{file_record_id}/export")
 @router.get("/documents/{file_record_id}/export", include_in_schema=False)
 @router.get("/file-records/{file_record_id}/export-docx")
@@ -1431,6 +1844,7 @@ def export_file_record_docx(
             raw_bytes=raw_bytes,
             filename=source_filename,
             segments=segments,
+            document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1575,6 +1989,118 @@ def batch_update(
         current_user=current_user,
     )
     return {"updated_count": updated_count}
+
+
+@router.post("/file-records/{file_record_id}/save-to-tm")
+def save_file_record_segments_to_tm(
+    file_record_id: UUID,
+    payload: SaveToTMRequest,
+    db: Session = Depends(get_db),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    source_language, target_language = _resolve_file_record_language_pair(file_record)
+
+    collection: TMCollection | None = None
+    created_collection = False
+    if payload.collection_mode == "existing":
+        target_collection_id = payload.collection_id or file_record.collection_id
+        if target_collection_id is None:
+            raise HTTPException(status_code=400, detail="请先选择要追加的目标记忆库。")
+        collection = _get_collection_or_404(db, target_collection_id)
+        _resolve_collection_language_pair(collection, source_language, target_language)
+    elif payload.collection_mode != "new":
+        raise HTTPException(status_code=400, detail="不支持的记忆库保存方式。")
+
+    segments = list_segments_for_file_record(db, file_record_id)
+    created_count = 0
+    updated_count = 0
+    skipped_count = 0
+    save_rows: list[tuple[str, str]] = []
+    sync_candidates: list[MemoryEntry] = []
+
+    for segment in segments:
+        if payload.scope == "confirmed" and segment.status != "confirmed":
+            skipped_count += 1
+            continue
+        if payload.scope == "translated" and not normalize_text(segment.target_text):
+            skipped_count += 1
+            continue
+
+        source_text = normalize_text(segment.source_text)
+        target_text = normalize_text(segment.target_text)
+        if not source_text or not target_text:
+            skipped_count += 1
+            continue
+
+        save_rows.append((source_text, target_text))
+
+    if payload.collection_mode == "new" and save_rows:
+        requested_name = payload.collection_name or _build_default_save_to_tm_collection_name(file_record)
+        collection_name = _build_unique_memory_base_name(db, requested_name)
+        collection = MemoryBase(
+            name=collection_name,
+            description=f"由任务「{file_record.filename}」保存生成",
+            source_language=source_language,
+            target_language=target_language,
+        )
+        db.add(collection)
+        db.flush()
+        created_collection = True
+
+    for source_text, target_text in save_rows:
+        if collection is None:
+            skipped_count += 1
+            continue
+
+        upsert_action, memory_entry = _upsert_tm_entry(
+            db=db,
+            source_text=source_text,
+            target_text=target_text,
+            collection_id=collection.id,
+            source_language=source_language,
+            target_language=target_language,
+        )
+        if upsert_action == "created":
+            created_count += 1
+        elif upsert_action == "updated":
+            updated_count += 1
+        else:
+            skipped_count += 1
+
+        if memory_entry is not None:
+            sync_candidates.append(memory_entry)
+
+    sync_rows: list[tuple[UUID, str]] = []
+    should_commit = (
+        bool(sync_candidates)
+        or created_collection
+        or (collection is not None and db.is_modified(collection))
+    )
+    if should_commit:
+        db.flush()
+        sync_rows = list(
+            {
+                row.id: row.source_text
+                for row in sync_candidates
+                if row.id is not None and row.source_text
+            }.items()
+        )
+        db.commit()
+
+    sync_tm_embeddings(db, sync_rows)
+
+    return {
+        "created_count": created_count,
+        "updated_count": updated_count,
+        "skipped_count": skipped_count,
+        "total_segments": len(segments),
+        "collection_id": collection.id if collection else None,
+        "collection_name": collection.name if collection else None,
+        "created_collection": created_collection,
+    }
 
 
 @router.get("/file-records/{file_record_id}/revisions")
@@ -2051,6 +2577,136 @@ def update_tm_collection(
     return _serialize_tm_collection(collection, entry_count)
 
 
+@router.post("/translation-memory/collections/merge")
+@router.post("/tm/collections/merge", include_in_schema=False)
+def merge_tm_collections(
+    payload: TMCollectionMergePayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    source_collection_ids = list(dict.fromkeys(payload.source_collection_ids))
+    if len(source_collection_ids) < 2:
+        raise HTTPException(status_code=400, detail="请至少选择两个记忆库进行合并。")
+
+    collections = (
+        db.query(MemoryBase)
+        .filter(MemoryBase.id.in_(source_collection_ids))
+        .all()
+    )
+    collection_by_id = {collection.id: collection for collection in collections}
+    missing_ids = [
+        collection_id
+        for collection_id in source_collection_ids
+        if collection_id not in collection_by_id
+    ]
+    if missing_ids:
+        raise HTTPException(status_code=404, detail="选择的记忆库不存在。")
+
+    ordered_collections = [
+        collection_by_id[collection_id]
+        for collection_id in source_collection_ids
+    ]
+    source_language, target_language = _require_same_tm_collection_language_pair(
+        ordered_collections,
+    )
+    name = _normalize_collection_name(payload.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="合并后的记忆库名称不能为空。")
+
+    target_collection = MemoryBase(
+        name=name,
+        description=normalize_text(payload.description or "") or None,
+        source_language=source_language,
+        target_language=target_language,
+    )
+    db.add(target_collection)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="同名记忆库已存在。") from exc
+
+    created_rows = 0
+    updated_rows = 0
+    skipped_rows = 0
+    merged_entries: list[MemoryEntry] = []
+    merged_by_hash: dict[str, MemoryEntry] = {}
+    merged_by_source_text: dict[str, MemoryEntry] = {}
+
+    for source_collection_id in source_collection_ids:
+        source_entries = (
+            db.query(MemoryEntry)
+            .filter(MemoryEntry.collection_id == source_collection_id)
+            .order_by(MemoryEntry.created_at.asc(), MemoryEntry.updated_at.asc())
+            .all()
+        )
+        for entry in source_entries:
+            source_text = normalize_text(entry.source_text)
+            target_text = normalize_text(entry.target_text)
+            if not source_text or not target_text:
+                skipped_rows += 1
+                continue
+
+            source_hash = entry.source_hash or build_source_hash(source_text)
+            source_normalized = entry.source_normalized or normalize_match_text(source_text) or source_text
+            existing = merged_by_hash.get(source_hash) or merged_by_source_text.get(source_text)
+            if existing is not None:
+                existing.source_text = source_text
+                existing.target_text = target_text
+                existing.source_hash = source_hash
+                existing.source_normalized = source_normalized
+                existing.source_language = source_language
+                existing.target_language = target_language
+                existing.creator_id = entry.creator_id or current_user.id
+                merged_by_hash[source_hash] = existing
+                merged_by_source_text[source_text] = existing
+                merged_entries.append(existing)
+                updated_rows += 1
+                continue
+
+            merged_entry = MemoryEntry(
+                collection_id=target_collection.id,
+                source_text=source_text,
+                target_text=target_text,
+                source_hash=source_hash,
+                source_normalized=source_normalized,
+                source_language=source_language,
+                target_language=target_language,
+                creator_id=entry.creator_id or current_user.id,
+            )
+            db.add(merged_entry)
+            merged_by_hash[source_hash] = merged_entry
+            merged_by_source_text[source_text] = merged_entry
+            merged_entries.append(merged_entry)
+            created_rows += 1
+
+    db.flush()
+    sync_rows = list(
+        {
+            row.id: row.source_text
+            for row in merged_entries
+            if row.id is not None and row.source_text
+        }.items()
+    )
+    db.commit()
+    sync_tm_embeddings(db, sync_rows)
+
+    entry_count = (
+        db.query(MemoryEntry)
+        .filter(MemoryEntry.collection_id == target_collection.id)
+        .count()
+    )
+    db.refresh(target_collection)
+    return {
+        "collection": _serialize_tm_collection(target_collection, entry_count),
+        "source_count": len(source_collection_ids),
+        "created_rows": created_rows,
+        "updated_rows": updated_rows,
+        "skipped_rows": skipped_rows,
+        "merged_rows": created_rows + updated_rows,
+    }
+
+
 @router.delete("/translation-memory/collections/{collection_id}")
 @router.delete("/tm/collections/{collection_id}", include_in_schema=False)
 def delete_tm_collection(
@@ -2066,12 +2722,20 @@ def delete_tm_collection(
         .filter(MemoryEntry.collection_id == collection.id)
         .count()
     )
-    if entry_count:
-        raise HTTPException(status_code=409, detail="请先清空该记忆库中的 TM 记录。")
+    (
+        db.query(FileRecord)
+        .filter(FileRecord.collection_id == collection.id)
+        .update({FileRecord.collection_id: None}, synchronize_session=False)
+    )
+    (
+        db.query(MemoryEntry)
+        .filter(MemoryEntry.collection_id == collection.id)
+        .delete(synchronize_session=False)
+    )
 
     db.delete(collection)
     db.commit()
-    return {"message": "记忆库已删除。"}
+    return {"message": "记忆库已删除。", "deleted_entries": entry_count}
 
 
 @router.post("/translation-memory/preview-sdltm")
@@ -2172,6 +2836,7 @@ def list_tm_collection_entries(
     skip: int = 0,
     limit: int = 50,
     search: str | None = None,
+    case_sensitive: bool = False,
     db: Session = Depends(get_db),
 ):
     collection = _get_collection_or_404(db, collection_id)
@@ -2187,12 +2852,20 @@ def list_tm_collection_entries(
     normalized_search = normalize_text(search or "")
     if normalized_search:
         like_pattern = f"%{normalized_search}%"
-        query = query.filter(
-            or_(
-                TranslationMemory.source_text.ilike(like_pattern),
-                TranslationMemory.target_text.ilike(like_pattern),
+        if case_sensitive:
+            query = query.filter(
+                or_(
+                    TranslationMemory.source_text.like(like_pattern),
+                    TranslationMemory.target_text.like(like_pattern),
+                )
             )
-        )
+        else:
+            query = query.filter(
+                or_(
+                    TranslationMemory.source_text.ilike(like_pattern),
+                    TranslationMemory.target_text.ilike(like_pattern),
+                )
+            )
 
     total = query.count()
     rows = (
@@ -2398,6 +3071,48 @@ def delete_tm_entry(
     return {"message": "TM 条目已删除。"}
 
 
+def _upsert_tm_entry(
+    db: Session,
+    source_text: str,
+    target_text: str,
+    collection_id: UUID,
+    source_language: str,
+    target_language: str,
+) -> tuple[Literal["created", "updated"], MemoryEntry]:
+    source_hash = build_source_hash(source_text)
+    existing_query = db.query(MemoryEntry).filter(
+        MemoryEntry.source_hash == source_hash
+    )
+    existing = _filter_tm_collection(
+        existing_query,
+        collection_id,
+        source_language=source_language,
+        target_language=target_language,
+    ).first()
+
+    if existing:
+        existing.source_text = source_text
+        existing.target_text = target_text
+        existing.source_hash = source_hash
+        existing.source_normalized = normalize_match_text(source_text) or source_text
+        existing.collection_id = collection_id
+        existing.source_language = source_language
+        existing.target_language = target_language
+        return "updated", existing
+
+    tm = MemoryEntry(
+        collection_id=collection_id,
+        source_text=source_text,
+        target_text=target_text,
+        source_hash=source_hash,
+        source_normalized=normalize_match_text(source_text) or source_text,
+        source_language=source_language,
+        target_language=target_language,
+    )
+    db.add(tm)
+    return "created", tm
+
+
 @router.post("/translation-memory/entries/batch")
 @router.post("/tm/batch-add", include_in_schema=False)
 def batch_add_tm_entries(
@@ -2428,46 +3143,24 @@ def batch_add_tm_entries(
             skipped_count += 1
             continue
 
-        source_hash = build_source_hash(source_text)
         collection = _get_collection_or_404(db, collection_id)
         source_language, target_language = _resolve_collection_language_pair(
             collection,
             entry.source_language or batch.source_language,
             entry.target_language or batch.target_language,
         )
-
-        existing_query = db.query(MemoryEntry).filter(
-            MemoryEntry.source_hash == source_hash
-        )
-        existing = _filter_tm_collection(
-            existing_query,
-            collection_id,
+        upsert_action, memory_entry = _upsert_tm_entry(
+            db=db,
+            source_text=source_text,
+            target_text=target_text,
+            collection_id=collection_id,
             source_language=source_language,
             target_language=target_language,
-        ).first()
-
-        if existing:
-            existing.source_text = source_text
-            existing.target_text = target_text
-            existing.source_hash = source_hash
-            existing.source_normalized = normalize_match_text(source_text) or source_text
-            existing.collection_id = collection_id
-            existing.source_language = source_language
-            existing.target_language = target_language
-            sync_candidates.append(existing)
+        )
+        sync_candidates.append(memory_entry)
+        if upsert_action == "updated":
             updated_count += 1
         else:
-            tm = MemoryEntry(
-                collection_id=collection_id,
-                source_text=source_text,
-                target_text=target_text,
-                source_hash=source_hash,
-                source_normalized=normalize_match_text(source_text) or source_text,
-                source_language=source_language,
-                target_language=target_language,
-            )
-            db.add(tm)
-            sync_candidates.append(tm)
             created_count += 1
 
     sync_rows: list[tuple[UUID, str]] = []

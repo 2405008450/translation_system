@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import get_current_user
 from app.database import get_db
-from app.models import TermBase, TermEntry, User
+from app.models import FileRecord, TermBase, TermEntry, User
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import normalize_match_text, normalize_text
 from app.services.term_importer import (
@@ -28,6 +28,12 @@ class TermBasePayload(BaseModel):
     description: str | None = None
     source_language: str
     target_language: str
+
+
+class TermBaseMergePayload(BaseModel):
+    source_term_base_ids: list[UUID]
+    name: str
+    description: str | None = None
 
 
 class TermEntryUpdatePayload(BaseModel):
@@ -93,6 +99,28 @@ def _serialize_term_base(term_base: TermBase, entry_count: int = 0) -> dict:
         "updated_at": term_base.updated_at.isoformat(),
         "entry_count": entry_count,
     }
+
+
+def _require_same_term_base_language_pair(
+    term_bases: list[TermBase],
+) -> tuple[str, str]:
+    source_language, target_language = _require_term_language_pair(
+        term_bases[0].source_language,
+        term_bases[0].target_language,
+    )
+
+    for term_base in term_bases[1:]:
+        candidate_source_language, candidate_target_language = _require_term_language_pair(
+            term_base.source_language,
+            term_base.target_language,
+        )
+        if (
+            candidate_source_language != source_language
+            or candidate_target_language != target_language
+        ):
+            raise HTTPException(status_code=400, detail="只能合并语言对一致的术语库。")
+
+    return source_language, target_language
 
 
 def _serialize_term_entry(entry: TermEntry) -> dict:
@@ -171,6 +199,123 @@ def create_term_base(
     return _serialize_term_base(term_base)
 
 
+@router.post("/term-bases/merge")
+def merge_term_bases(
+    payload: TermBaseMergePayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    source_term_base_ids = list(dict.fromkeys(payload.source_term_base_ids))
+    if len(source_term_base_ids) < 2:
+        raise HTTPException(status_code=400, detail="请至少选择两个术语库进行合并。")
+
+    term_bases = (
+        db.query(TermBase)
+        .filter(TermBase.id.in_(source_term_base_ids))
+        .all()
+    )
+    term_base_by_id = {term_base.id: term_base for term_base in term_bases}
+    missing_ids = [
+        term_base_id
+        for term_base_id in source_term_base_ids
+        if term_base_id not in term_base_by_id
+    ]
+    if missing_ids:
+        raise HTTPException(status_code=404, detail="选择的术语库不存在。")
+
+    ordered_term_bases = [
+        term_base_by_id[term_base_id]
+        for term_base_id in source_term_base_ids
+    ]
+    source_language, target_language = _require_same_term_base_language_pair(
+        ordered_term_bases,
+    )
+    name = _normalize_term_base_name(payload.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="合并后的术语库名称不能为空。")
+
+    target_term_base = TermBase(
+        name=name,
+        description=normalize_text(payload.description or "") or None,
+        source_language=source_language,
+        target_language=target_language,
+    )
+    db.add(target_term_base)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="同名术语库已存在。") from exc
+
+    created_rows = 0
+    updated_rows = 0
+    skipped_rows = 0
+    merged_by_source_normalized: dict[str, TermEntry] = {}
+    merged_by_source_text: dict[str, TermEntry] = {}
+
+    for source_term_base_id in source_term_base_ids:
+        source_entries = (
+            db.query(TermEntry)
+            .filter(TermEntry.term_base_id == source_term_base_id)
+            .order_by(TermEntry.created_at.asc(), TermEntry.updated_at.asc())
+            .all()
+        )
+        for entry in source_entries:
+            source_text = normalize_text(entry.source_text)
+            target_text = normalize_text(entry.target_text)
+            if not source_text or not target_text:
+                skipped_rows += 1
+                continue
+
+            source_normalized = entry.source_normalized or normalize_match_text(source_text) or source_text
+            existing = (
+                merged_by_source_normalized.get(source_normalized)
+                or merged_by_source_text.get(source_text)
+            )
+            if existing is not None:
+                existing.source_text = source_text
+                existing.target_text = target_text
+                existing.source_normalized = source_normalized
+                existing.source_language = source_language
+                existing.target_language = target_language
+                existing.creator_id = entry.creator_id or current_user.id
+                merged_by_source_normalized[source_normalized] = existing
+                merged_by_source_text[source_text] = existing
+                updated_rows += 1
+                continue
+
+            merged_entry = TermEntry(
+                term_base_id=target_term_base.id,
+                source_text=source_text,
+                target_text=target_text,
+                source_normalized=source_normalized,
+                source_language=source_language,
+                target_language=target_language,
+                creator_id=entry.creator_id or current_user.id,
+            )
+            db.add(merged_entry)
+            merged_by_source_normalized[source_normalized] = merged_entry
+            merged_by_source_text[source_text] = merged_entry
+            created_rows += 1
+
+    db.commit()
+
+    entry_count = (
+        db.query(TermEntry)
+        .filter(TermEntry.term_base_id == target_term_base.id)
+        .count()
+    )
+    db.refresh(target_term_base)
+    return {
+        "term_base": _serialize_term_base(target_term_base, entry_count),
+        "source_count": len(source_term_base_ids),
+        "created_rows": created_rows,
+        "updated_rows": updated_rows,
+        "skipped_rows": skipped_rows,
+        "merged_rows": created_rows + updated_rows,
+    }
+
+
 @router.put("/term-bases/{term_base_id}")
 def update_term_base(
     term_base_id: UUID,
@@ -228,12 +373,20 @@ def delete_term_base(
         .filter(TermEntry.term_base_id == term_base.id)
         .count()
     )
-    if entry_count:
-        raise HTTPException(status_code=409, detail="请先清空术语库中的术语条目。")
+    (
+        db.query(FileRecord)
+        .filter(FileRecord.term_base_id == term_base.id)
+        .update({FileRecord.term_base_id: None}, synchronize_session=False)
+    )
+    (
+        db.query(TermEntry)
+        .filter(TermEntry.term_base_id == term_base.id)
+        .delete(synchronize_session=False)
+    )
 
     db.delete(term_base)
     db.commit()
-    return {"message": "术语库已删除。"}
+    return {"message": "术语库已删除。", "deleted_entries": entry_count}
 
 
 @router.post("/term-bases/import-xlsx")
@@ -295,6 +448,7 @@ def list_term_base_entries(
     skip: int = 0,
     limit: int = 50,
     search: str | None = None,
+    case_sensitive: bool = False,
     db: Session = Depends(get_db),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
@@ -307,12 +461,20 @@ def list_term_base_entries(
     normalized_search = normalize_text(search or "")
     if normalized_search:
         like_pattern = f"%{normalized_search}%"
-        query = query.filter(
-            or_(
-                TermEntry.source_text.ilike(like_pattern),
-                TermEntry.target_text.ilike(like_pattern),
+        if case_sensitive:
+            query = query.filter(
+                or_(
+                    TermEntry.source_text.like(like_pattern),
+                    TermEntry.target_text.like(like_pattern),
+                )
             )
-        )
+        else:
+            query = query.filter(
+                or_(
+                    TermEntry.source_text.ilike(like_pattern),
+                    TermEntry.target_text.ilike(like_pattern),
+                )
+            )
 
     total = query.count()
     rows = (

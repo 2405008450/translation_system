@@ -5,6 +5,8 @@ import type { AxiosProgressEvent } from 'axios'
 import { http } from '../api/http'
 import type { FileRecordSummary } from '../types/api'
 
+type DocumentParseMode = 'full' | 'body_only'
+
 interface UploadingState {
   active: boolean
   percent: number
@@ -53,7 +55,15 @@ export const useTaskStore = defineStore('task', () => {
     }
   }
 
-  async function uploadTask(file: File, threshold = 0.6, collectionIds: string[] = [], termBaseId: string | null = null) {
+  async function uploadTask(
+    file: File,
+    threshold = 0.6,
+    collectionIds: string[] = [],
+    termBaseId: string | null = null,
+    sourceLanguage = '',
+    targetLanguage = '',
+    documentParseMode: DocumentParseMode = 'full',
+  ) {
     uploading.value = {
       active: true,
       percent: 0,
@@ -63,6 +73,9 @@ export const useTaskStore = defineStore('task', () => {
       const formData = new FormData()
       formData.append('file', file)
       formData.append('threshold', String(threshold))
+      formData.append('source_language', sourceLanguage)
+      formData.append('target_language', targetLanguage)
+      formData.append('document_parse_mode', documentParseMode)
       collectionIds.forEach((collectionId) => {
         formData.append('collection_ids', collectionId)
       })
@@ -75,7 +88,6 @@ export const useTaskStore = defineStore('task', () => {
         },
         onUploadProgress: handleUploadProgress,
       })
-      await fetchTasks()
       return data
     } finally {
       resetUploading()

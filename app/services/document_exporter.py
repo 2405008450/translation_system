@@ -18,6 +18,7 @@ from app.services.document_workspace import (
     CELL_PARAGRAPH_BREAK_SENTINEL,
     CELL_SENTENCE_END_CHARS,
     CELL_SHORT_PARAGRAPH_MAX_CHARS,
+    DOCUMENT_PARSE_MODE_FULL,
     DocxPackage,
     MATH_PLACEHOLDER_TEMPLATE,
     NS,
@@ -35,6 +36,7 @@ from app.services.document_workspace import (
     _qn,
     _resolve_paragraph_numbering_reference,
     _select_preferred_alternate_content_branch,
+    normalize_document_parse_mode,
 )
 from app.services.normalizer import normalize_text
 from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
@@ -77,11 +79,19 @@ class CellParagraphTokens:
     tokens: list[TextToken]
 
 
-def export_translated_docx(raw_bytes: bytes, segments: Iterable[Any]) -> bytes:
+def export_translated_docx(
+    raw_bytes: bytes,
+    segments: Iterable[Any],
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+) -> bytes:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     package = DocxPackage(raw_bytes)
-    stories = _build_story_parts(package)
+    stories = _build_story_parts(package, document_parse_mode=document_parse_mode)
     numbering_schema = _build_numbering_schema(package)
-    source_workspace = get_cached_docx_workspace(raw_bytes)
+    source_workspace = get_cached_docx_workspace(
+        raw_bytes,
+        document_parse_mode=document_parse_mode,
+    )
     math_placeholders_by_sentence_id = {
         str(segment["sentence_id"]): dict(segment.get("math_placeholders") or {})
         for segment in source_workspace["segments"]

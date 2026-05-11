@@ -26,6 +26,7 @@ export interface FileRecordSummary {
   id: string
   filename: string
   status: string
+  document_parse_mode?: 'full' | 'body_only'
   source_language: string | null
   target_language: string | null
   created_at: string
@@ -75,6 +76,7 @@ export interface FileRecordDetail {
   id: string
   filename: string
   status: string
+  document_parse_mode: 'full' | 'body_only'
   source_language: string | null
   target_language: string | null
   collection_id: string | null
@@ -192,6 +194,16 @@ export interface TMImportSummary {
   collection_name: string | null
   source_language: string
   target_language: string
+}
+
+export interface SaveToTMResult {
+  created_count: number
+  updated_count: number
+  skipped_count: number
+  total_segments: number
+  collection_id: string | null
+  collection_name: string | null
+  created_collection: boolean
 }
 
 export interface TermImportSummary {

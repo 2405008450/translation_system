@@ -104,6 +104,7 @@ const router = createRouter({
             pageDescription: '维护记忆库信息、TM 条目和导入导出操作',
             pageTitleKey: 'pages.tmEdit.title',
             pageDescriptionKey: 'pages.tmEdit.description',
+            hidePageHeader: true,
           },
         },
         {
@@ -130,6 +131,7 @@ const router = createRouter({
             pageDescription: '维护术语库信息、术语条目和导入导出操作',
             pageTitleKey: 'pages.termBaseEdit.title',
             pageDescriptionKey: 'pages.termBaseEdit.description',
+            hidePageHeader: true,
           },
         },
         {

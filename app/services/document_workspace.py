@@ -68,6 +68,12 @@ CELL_PARAGRAPH_BREAK_SENTINEL = "\uE000"
 PAGE_BREAK_SENTINEL = "\uE001"
 DOCX_PARSE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 DOCX_PARSE_CACHE_VERSION = "3"
+DOCUMENT_PARSE_MODE_FULL = "full"
+DOCUMENT_PARSE_MODE_BODY_ONLY = "body_only"
+SUPPORTED_DOCUMENT_PARSE_MODES = {
+    DOCUMENT_PARSE_MODE_FULL,
+    DOCUMENT_PARSE_MODE_BODY_ONLY,
+}
 EMU_PER_PIXEL = 9525
 MATH_PLACEHOLDER_TEMPLATE = "⟦MATH_{index}⟧"
 OMML_ATOMIC_TAGS = {
@@ -440,8 +446,10 @@ def build_docx_workspace(
     similarity_threshold: float = 0.6,
     include_matches: bool = True,
     collection_ids: list[UUID] | None = None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
 ) -> dict:
-    parsed_workspace = _get_cached_parsed_workspace(raw_bytes)
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    parsed_workspace = _get_cached_parsed_workspace(raw_bytes, document_parse_mode=document_parse_mode)
     segments = parsed_workspace["segments"]
     match_stats = _build_empty_match_stats()
 
@@ -484,7 +492,22 @@ def build_docx_workspace(
     }
 
 
-def parse_docx_workspace(raw_bytes: bytes) -> dict:
+def normalize_document_parse_mode(value: str | None) -> str:
+    normalized = (value or DOCUMENT_PARSE_MODE_FULL).strip().lower().replace("-", "_")
+    if normalized in {"complete", "rich"}:
+        normalized = DOCUMENT_PARSE_MODE_FULL
+    if normalized in {"body", "main_body"}:
+        normalized = DOCUMENT_PARSE_MODE_BODY_ONLY
+    if normalized not in SUPPORTED_DOCUMENT_PARSE_MODES:
+        raise ValueError("不支持的文档内容解析处理选项。")
+    return normalized
+
+
+def parse_docx_workspace(
+    raw_bytes: bytes,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+) -> dict:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     package = DocxPackage(raw_bytes)
     numbering_schema = _build_numbering_schema(package)
     sentence_counter = count(1)
@@ -492,7 +515,7 @@ def parse_docx_workspace(raw_bytes: bytes) -> dict:
 
     html_parts: list[str] = []
     segments: list[dict] = []
-    for story in _build_story_parts(package):
+    for story in _build_story_parts(package, document_parse_mode=document_parse_mode):
         numbering_state = NumberingState(schema=numbering_schema)
         story_html_parts, story_segments = _render_block_sequence(
             container=story.root,
@@ -522,26 +545,46 @@ def parse_docx_workspace(raw_bytes: bytes) -> dict:
     }
 
 
-def build_docx_preview_html(raw_bytes: bytes) -> str:
-    return _get_cached_parsed_workspace(raw_bytes)["document_html"]
+def build_docx_preview_html(
+    raw_bytes: bytes,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+) -> str:
+    return _get_cached_parsed_workspace(
+        raw_bytes,
+        document_parse_mode=document_parse_mode,
+    )["document_html"]
 
 
-def get_cached_docx_workspace(raw_bytes: bytes) -> dict:
-    return _get_cached_parsed_workspace(raw_bytes)
+def get_cached_docx_workspace(
+    raw_bytes: bytes,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+) -> dict:
+    return _get_cached_parsed_workspace(raw_bytes, document_parse_mode=document_parse_mode)
 
 
-def _get_cached_parsed_workspace(raw_bytes: bytes) -> dict:
-    cache_key = f"preview:workspace:v{DOCX_PARSE_CACHE_VERSION}:{hashlib.sha256(raw_bytes).hexdigest()}"
+def _get_cached_parsed_workspace(
+    raw_bytes: bytes,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+) -> dict:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    cache_key = (
+        f"preview:workspace:v{DOCX_PARSE_CACHE_VERSION}:"
+        f"{document_parse_mode}:{hashlib.sha256(raw_bytes).hexdigest()}"
+    )
     cached_workspace = get_json(cache_key)
     if isinstance(cached_workspace, dict):
         return copy.deepcopy(cached_workspace)
 
-    parsed_workspace = parse_docx_workspace(raw_bytes)
+    parsed_workspace = parse_docx_workspace(raw_bytes, document_parse_mode=document_parse_mode)
     set_json(cache_key, parsed_workspace, ttl_seconds=DOCX_PARSE_CACHE_TTL_SECONDS)
     return copy.deepcopy(parsed_workspace)
 
 
-def _build_story_parts(package: DocxPackage) -> list[StoryPart]:
+def _build_story_parts(
+    package: DocxPackage,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+) -> list[StoryPart]:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     document_part_name = "word/document.xml"
     document_root = package.read_xml(document_part_name)
     if document_root is None:
@@ -553,8 +596,17 @@ def _build_story_parts(package: DocxPackage) -> list[StoryPart]:
         raise ValueError("word/document.xml does not contain a body.")
 
     stories: list[StoryPart] = []
-    header_parts = _collect_story_reference_parts(body, document_rels, "headerReference")
-    footer_parts = _collect_story_reference_parts(body, document_rels, "footerReference")
+    include_extended_stories = document_parse_mode == DOCUMENT_PARSE_MODE_FULL
+    header_parts = (
+        _collect_story_reference_parts(body, document_rels, "headerReference")
+        if include_extended_stories
+        else []
+    )
+    footer_parts = (
+        _collect_story_reference_parts(body, document_rels, "footerReference")
+        if include_extended_stories
+        else []
+    )
 
     for index, part_name in enumerate(header_parts, start=1):
         root = package.read_xml(part_name)
@@ -581,8 +633,9 @@ def _build_story_parts(package: DocxPackage) -> list[StoryPart]:
             package=package,
         )
     )
-    stories.extend(_build_note_story_parts(package, "word/footnotes.xml", "footnote", "Footnote"))
-    stories.extend(_build_note_story_parts(package, "word/endnotes.xml", "endnote", "Endnote"))
+    if include_extended_stories:
+        stories.extend(_build_note_story_parts(package, "word/footnotes.xml", "footnote", "Footnote"))
+        stories.extend(_build_note_story_parts(package, "word/endnotes.xml", "endnote", "Endnote"))
 
     for index, part_name in enumerate(footer_parts, start=1):
         root = package.read_xml(part_name)

@@ -6,9 +6,11 @@ import ResourceImportPanel from './ResourceImportPanel.vue'
 import Modal from './base/Modal.vue'
 
 type ImportTab = 'tm' | 'term'
+type ImportMode = 'all' | ImportTab
 
 const props = withDefaults(defineProps<{
   open: boolean
+  mode?: ImportMode
   initialTab?: ImportTab
   title?: string
   sourceLanguage?: string | null
@@ -17,6 +19,7 @@ const props = withDefaults(defineProps<{
   fixedTMCollectionId?: string
   fixedTermBaseId?: string
 }>(), {
+  mode: 'all',
   initialTab: 'tm',
   title: '',
   sourceLanguage: null,
@@ -45,7 +48,7 @@ const emit = defineEmits<{
     @close="emit('close')"
   >
     <ResourceImportPanel
-      mode="all"
+      :mode="mode"
       :initial-tab="initialTab"
       :source-language="sourceLanguage"
       :target-language="targetLanguage"

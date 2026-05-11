@@ -280,14 +280,18 @@ def continue_task(
 
     source_bytes = load_file_record_source(file_record)
     if source_bytes:
-        source_workspace = get_cached_docx_workspace(source_bytes)
+        document_parse_mode = getattr(file_record, "document_parse_mode", "full")
+        source_workspace = get_cached_docx_workspace(
+            source_bytes,
+            document_parse_mode=document_parse_mode,
+        )
         source_html_by_sentence_id = _build_source_html_map_from_segments(source_workspace["segments"])
         results = _build_match_results(
             segments,
             tm_target_text_map=tm_target_text_map,
             source_html_by_sentence_id=source_html_by_sentence_id,
         )
-        document_html = build_docx_preview_html(source_bytes)
+        document_html = build_docx_preview_html(source_bytes, document_parse_mode=document_parse_mode)
     else:
         document_html = build_document_html_from_segments(segments) if segments else ""
     supports_preview = bool(document_html)
@@ -326,7 +330,11 @@ def export_task_docx(
 
     segments = list_segments_for_file_record(db, file_record_id)
     try:
-        translated_docx = export_translated_docx(raw_bytes=raw_bytes, segments=segments)
+        translated_docx = export_translated_docx(
+            raw_bytes=raw_bytes,
+            segments=segments,
+            document_parse_mode=getattr(file_record, "document_parse_mode", "full"),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -486,14 +494,18 @@ async def upload_and_match(
             source_bytes = load_file_record_source(doc_result["file_record"])
             can_export_docx = bool(source_bytes)
             if source_bytes:
-                source_workspace = get_cached_docx_workspace(source_bytes)
+                document_parse_mode = getattr(doc_result["file_record"], "document_parse_mode", "full")
+                source_workspace = get_cached_docx_workspace(
+                    source_bytes,
+                    document_parse_mode=document_parse_mode,
+                )
                 source_html_by_sentence_id = _build_source_html_map_from_segments(source_workspace["segments"])
                 display_results = _build_match_results(
                     doc_result["segments"],
                     tm_target_text_map=tm_target_text_map,
                     source_html_by_sentence_id=source_html_by_sentence_id,
                 )
-                document_html = build_docx_preview_html(source_bytes)
+                document_html = build_docx_preview_html(source_bytes, document_parse_mode=document_parse_mode)
             else:
                 document_html = build_document_html_from_segments(doc_result["segments"]) if doc_result["segments"] else ""
 

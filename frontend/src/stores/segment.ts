@@ -16,26 +16,10 @@ import type {
   TermMatch,
 } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
+import { consumeLLMStream } from '../utils/llmStream'
 
 const SEGMENT_PAGE_SIZE = 1000
 const AUTO_SYNC_DELAY_MS = 1500
-
-function parseSSEChunk(chunk: string) {
-  const eventMatch = chunk.match(/^event:\s*(.+)$/m)
-  const dataMatch = chunk.match(/^data:\s*(.+)$/m)
-  if (!eventMatch || !dataMatch) {
-    return null
-  }
-
-  try {
-    return {
-      event: eventMatch[1].trim(),
-      data: JSON.parse(dataMatch[1]),
-    }
-  } catch {
-    return null
-  }
-}
 
 export const useSegmentStore = defineStore('segment', () => {
   const fileRecord = ref<FileRecordDetail | null>(null)
@@ -542,42 +526,26 @@ export const useSegmentStore = defineStore('segment', () => {
         throw new Error(message)
       }
 
-      if (!response.body) {
-        throw new Error(translate('stores.segment.llmNoStream'))
+      try {
+        await consumeLLMStream(
+          response,
+          ({ event, data }) => {
+            if (llmAbortRequested) {
+              return
+            }
+            handleLLMEvent(event, data)
+          },
+          (reader) => {
+            llmReader = reader
+          },
+        )
+      } catch (error) {
+        if (error instanceof Error && error.message === 'SSE 响应体为空。') {
+          throw new Error(translate('stores.segment.llmNoStream'))
+        }
+        throw error
       }
 
-      llmReader = response.body.getReader()
-      const decoder = new TextDecoder('utf-8')
-      let buffer = ''
-
-      while (true) {
-        const { done, value } = await llmReader.read()
-        if (done) {
-          break
-        }
-
-        buffer += decoder.decode(value, { stream: true })
-        const parts = buffer.split('\n\n')
-        buffer = parts.pop() ?? ''
-
-        for (const part of parts) {
-          const event = parseSSEChunk(part)
-          if (!event) {
-            continue
-          }
-          if (llmAbortRequested) {
-            continue
-          }
-          handleLLMEvent(event.event, event.data)
-        }
-      }
-
-      if (!llmAbortRequested && buffer.trim()) {
-        const event = parseSSEChunk(buffer)
-        if (event) {
-          handleLLMEvent(event.event, event.data)
-        }
-      }
       if (!llmAbortRequested && fileRecord.value) {
         await loadRevisions(fileRecord.value.id)
       }

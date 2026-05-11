@@ -14,11 +14,12 @@ import {
   Loader2,
   MoreHorizontal,
   Settings2,
+  Sparkles,
   Trash2,
   Upload,
   Users,
 } from 'lucide-vue-next'
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 
@@ -26,11 +27,12 @@ import { http } from '../api/http'
 import Modal from '../components/base/Modal.vue'
 import DataTable from '../components/DataTable.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
+import PreTranslateDialog from '../components/PreTranslateDialog.vue'
 import Pagination from '../components/Pagination.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
 import { useToast } from '../composables/useToast'
-import { formatLanguagePair, getLanguageLabel } from '../constants/languages'
+import { formatLanguagePair, getLanguageLabel, languageOptions } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
 import { buildTranslatedTaskFilename, supportedTaskFileAccept } from '../constants/taskFiles'
 import type { TermBase, TMCollection } from '../types/api'
@@ -42,12 +44,15 @@ const props = defineProps<{
 }>()
 
 type ProjectTab = 'files' | 'settings' | 'stats' | 'summary' | 'quote'
+type DocumentParseMode = 'full' | 'body_only'
 
 interface ProjectDetail {
   id: string
+  name: string
   filename: string
   status: string
   progress: number
+  file_count: number
   total_segments: number
   translated_segments: number
   source_language: string | null
@@ -60,9 +65,32 @@ interface ProjectDetail {
   updated_at: string
   has_source_document: boolean
   file_size_bytes: number | null
+  files: ProjectFileItem[]
 }
 
-type ProjectRow = ProjectDetail | Record<string, any>
+interface ProjectFileItem {
+  id: string
+  project_id: string | null
+  filename: string
+  status: string
+  document_parse_mode: DocumentParseMode
+  progress: number
+  total_segments: number
+  translated_segments: number
+  source_language: string | null
+  target_language: string | null
+  creator: string | null
+  deadline: string | null
+  access_level: string | null
+  created_at: string
+  updated_at: string
+  has_source_document: boolean
+  file_size_bytes: number | null
+  collection_id: string | null
+  term_base_id: string | null
+}
+
+type ProjectRow = ProjectFileItem | Record<string, any>
 
 const confirm = useConfirm()
 const router = useRouter()
@@ -78,19 +106,24 @@ const loadingTermBases = ref(false)
 const project = ref<ProjectDetail | null>(null)
 const pageError = ref('')
 const uploadMessage = ref('')
-const selectedFile = ref<File | null>(null)
+const selectedFiles = ref<File[]>([])
 const threshold = ref(0.6)
 const tmCollections = ref<TMCollection[]>([])
 const termBases = ref<TermBase[]>([])
 const selectedCollectionIds = ref<string[]>([])
 const selectedTermBaseId = ref('')
+const uploadSourceLanguage = ref('')
+const uploadTargetLanguage = ref('')
+const documentParseMode = ref<DocumentParseMode>('full')
 const basicCollapsed = ref(false)
 const activeTab = ref<ProjectTab>('files')
 const showUploadModal = ref(false)
+const showPreTranslateDialog = ref(false)
 const uploadInputKey = ref(0)
 const openActionMenuId = ref<string | null>(null)
 const currentPage = ref(1)
 const pageSize = ref(10)
+const selectedFileIds = ref(new Set<string>())
 
 const tabs = computed(() => ([
   { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
@@ -100,16 +133,18 @@ const tabs = computed(() => ([
   { key: 'quote' as const, label: t('projectDetail.tabs.quote'), disabled: true },
 ]))
 
-const languagePairLabel = computed(() => (
-  formatLanguagePair(project.value?.source_language ?? null, project.value?.target_language ?? null)
-))
-
-const tableRows = computed(() => (project.value ? [project.value] : []))
+const tableRows = computed<ProjectFileItem[]>(() => project.value?.files ?? [])
 const pagedRows = computed(() => {
   const start = (currentPage.value - 1) * pageSize.value
   return tableRows.value.slice(start, start + pageSize.value)
 })
 const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
+const selectedProjectFiles = computed(() => (
+  tableRows.value.filter((row) => selectedFileIds.value.has(row.id))
+))
+const preTranslateButtonTitle = computed(() => (
+  selectedFileIds.value.size === 0 ? t('projectDetail.preTranslate.selectFileFirst') : ''
+))
 
 const columns = computed<DataTableColumn[]>(() => ([
   { key: 'filename', label: t('projectDetail.files.columns.details'), width: '280px' },
@@ -117,37 +152,47 @@ const columns = computed<DataTableColumn[]>(() => ([
   { key: 'taskManage', label: t('projectDetail.files.columns.task'), width: '150px' },
   { key: 'status', label: t('projectDetail.files.columns.status'), width: '120px' },
   { key: 'created_at', label: t('projectDetail.files.columns.createdAt'), width: '170px' },
+  { key: 'source_language', label: t('projectList.form.sourceLanguage'), width: '130px' },
   { key: 'target_language', label: t('projectDetail.files.columns.targetLang'), width: '130px' },
   { key: 'file_size_bytes', label: t('projectDetail.files.columns.size'), width: '120px', align: 'right' },
 ]))
 
-const canOpenUploadModal = computed(() => (
-  Boolean(project.value) && project.value?.has_source_document === false && tmCollections.value.length > 0
-))
+const canOpenUploadModal = computed(() => Boolean(project.value))
 
 const uploadButtonTitle = computed(() => {
-  if (project.value?.has_source_document) {
-    return t('projectDetail.common.alreadyUploaded')
-  }
   if (loadingCollections.value) {
     return t('projectDetail.loading')
-  }
-  if (tmCollections.value.length === 0) {
-    return t('projectDetail.hints.noCollections')
   }
   return ''
 })
 
+const availableTMCollections = computed(() => {
+  if (!uploadSourceLanguage.value || !uploadTargetLanguage.value) {
+    return tmCollections.value
+  }
+
+  return tmCollections.value.filter((collection) => (
+    (!collection.source_language || collection.source_language === uploadSourceLanguage.value)
+    && (!collection.target_language || collection.target_language === uploadTargetLanguage.value)
+  ))
+})
+
 const availableTermBases = computed(() => {
-  if (!project.value?.source_language || !project.value?.target_language) {
+  if (!uploadSourceLanguage.value || !uploadTargetLanguage.value) {
     return termBases.value
   }
 
   return termBases.value.filter((termBase) => (
-    termBase.source_language === project.value?.source_language
-    && termBase.target_language === project.value?.target_language
+    termBase.source_language === uploadSourceLanguage.value
+    && termBase.target_language === uploadTargetLanguage.value
   ))
 })
+
+const documentParseModeHint = computed(() => (
+  documentParseMode.value === 'body_only'
+    ? t('documentParsing.hints.bodyOnly')
+    : t('documentParsing.hints.full')
+))
 
 usePageHeader(() => ({
   title: project.value?.filename || t('projectDetail.titleFallback'),
@@ -227,13 +272,14 @@ function getFileDetailHint(row: ProjectRow) {
 }
 
 function onFileChange(event: Event) {
-  selectedFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
+  selectedFiles.value = Array.from((event.target as HTMLInputElement).files ?? [])
 }
 
 function resetUploadForm() {
-  selectedFile.value = null
+  selectedFiles.value = []
   uploadMessage.value = ''
   uploadPercent.value = 0
+  documentParseMode.value = 'full'
   uploadInputKey.value += 1
 }
 
@@ -243,7 +289,14 @@ function openUploadDialog() {
   }
 
   resetUploadForm()
-  selectedTermBaseId.value = project.value?.term_base_id || ''
+  uploadSourceLanguage.value = project.value?.source_language || ''
+  uploadTargetLanguage.value = project.value?.target_language || ''
+  selectedCollectionIds.value = selectedCollectionIds.value.filter((collectionId) => (
+    availableTMCollections.value.some((collection) => collection.id === collectionId)
+  ))
+  selectedTermBaseId.value = availableTermBases.value.some((termBase) => termBase.id === project.value?.term_base_id)
+    ? project.value?.term_base_id || ''
+    : ''
   showUploadModal.value = true
 }
 
@@ -254,6 +307,26 @@ function closeUploadDialog() {
 
   showUploadModal.value = false
   resetUploadForm()
+}
+
+function openPreTranslateDialog() {
+  if (selectedFileIds.value.size === 0) {
+    return
+  }
+  showPreTranslateDialog.value = true
+}
+
+function closePreTranslateDialog() {
+  if (loading.value) {
+    return
+  }
+  showPreTranslateDialog.value = false
+}
+
+async function handlePreTranslateDone() {
+  showPreTranslateDialog.value = false
+  selectedFileIds.value = new Set<string>()
+  await loadProject()
 }
 
 function closeActionMenu() {
@@ -282,7 +355,7 @@ function openWorkbench(row: ProjectRow) {
   void router.push({
     name: 'workbench',
     params: { id: rowId },
-    query: { from: 'project', pid: rowId },
+    query: { from: 'project', pid: props.id },
   })
 }
 
@@ -295,6 +368,7 @@ async function loadProject() {
     project.value = data
     selectedTermBaseId.value = data.term_base_id || ''
     currentPage.value = 1
+    selectedFileIds.value = new Set<string>()
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.load'))
   } finally {
@@ -308,9 +382,6 @@ async function loadTMCollections() {
   try {
     const { data } = await http.get<TMCollection[]>('/translation-memory/collections')
     tmCollections.value = data
-    if (selectedCollectionIds.value.length === 0 && data.length > 0) {
-      selectedCollectionIds.value = [data[0].id]
-    }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.collectionsLoad'))
   } finally {
@@ -332,13 +403,18 @@ async function loadTermBases() {
 }
 
 async function uploadSourceDocument() {
-  if (!selectedFile.value) {
-    uploadMessage.value = '请选择要上传的文件。'
+  if (selectedFiles.value.length === 0) {
+    uploadMessage.value = t('projectDetail.errors.selectFile')
     return
   }
 
-  if (selectedCollectionIds.value.length === 0) {
-    uploadMessage.value = t('projectDetail.errors.selectCollection')
+  if (!uploadSourceLanguage.value || !uploadTargetLanguage.value) {
+    uploadMessage.value = t('projectDetail.errors.selectLanguagePair')
+    return
+  }
+
+  if (uploadSourceLanguage.value === uploadTargetLanguage.value) {
+    uploadMessage.value = t('projectList.errors.sameLanguage')
     return
   }
 
@@ -349,8 +425,13 @@ async function uploadSourceDocument() {
 
   try {
     const formData = new FormData()
-    formData.append('file', selectedFile.value)
+    selectedFiles.value.forEach((file) => {
+      formData.append('files', file)
+    })
     formData.append('threshold', String(threshold.value))
+    formData.append('source_language', uploadSourceLanguage.value)
+    formData.append('target_language', uploadTargetLanguage.value)
+    formData.append('document_parse_mode', documentParseMode.value)
     selectedCollectionIds.value.forEach((collectionId) => {
       formData.append('collection_ids', collectionId)
     })
@@ -370,6 +451,7 @@ async function uploadSourceDocument() {
     await loadProject()
     showUploadModal.value = false
     resetUploadForm()
+    selectedFileIds.value = new Set<string>()
     toast.success(t('projectDetail.messages.uploaded'))
   } catch (error) {
     uploadMessage.value = getErrorMessage(error, t('projectDetail.errors.upload'))
@@ -399,11 +481,42 @@ async function exportProjectFile(row: ProjectRow) {
     )
     downloadBlob(response.data, downloadName)
   } catch (error) {
-    pageError.value = getErrorMessage(error, '导出失败。')
+    pageError.value = getErrorMessage(error, t('projectDetail.errors.export'))
   }
 }
 
-async function deleteProject(row: ProjectRow) {
+async function deleteCurrentProject() {
+  if (!project.value) {
+    return
+  }
+
+  const filename = project.value.filename || t('projectDetail.titleFallback')
+  const confirmed = await confirm({
+    title: t('projectDetail.files.actions.delete'),
+    message: t('projectDetail.messages.deleteConfirm', { name: filename }),
+    confirmText: t('common.actions.delete'),
+    danger: true,
+  })
+
+  if (!confirmed) {
+    return
+  }
+
+  deleting.value = true
+  pageError.value = ''
+
+  try {
+    await http.delete(`/projects/${props.id}`)
+    toast.success(t('projectDetail.messages.deleted', { name: filename }))
+    await router.push({ name: 'projects' })
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('projectDetail.errors.delete'))
+  } finally {
+    deleting.value = false
+  }
+}
+
+async function deleteProjectFile(row: ProjectRow) {
   closeActionMenu()
 
   const rowId = String(row.id)
@@ -426,7 +539,9 @@ async function deleteProject(row: ProjectRow) {
   try {
     await http.delete(`/file-records/${rowId}`)
     toast.success(t('projectDetail.messages.deleted', { name: filename }))
-    await router.push({ name: 'projects' })
+    selectedFileIds.value.delete(rowId)
+    selectedFileIds.value = new Set(selectedFileIds.value)
+    await loadProject()
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.delete'))
   } finally {
@@ -443,6 +558,18 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   document.removeEventListener('click', handleDocumentClick)
+})
+
+watch([uploadSourceLanguage, uploadTargetLanguage], () => {
+  selectedCollectionIds.value = selectedCollectionIds.value.filter((collectionId) => (
+    availableTMCollections.value.some((collection) => collection.id === collectionId)
+  ))
+  if (
+    selectedTermBaseId.value
+    && !availableTermBases.value.some((termBase) => termBase.id === selectedTermBaseId.value)
+  ) {
+    selectedTermBaseId.value = ''
+  }
 })
 </script>
 
@@ -523,10 +650,6 @@ onBeforeUnmount(() => {
             </span>
           </label>
           <label class="pd-field">
-            <span class="pd-field__label">{{ t('projectDetail.base.languagePair') }}</span>
-            <span class="pd-field__value">{{ languagePairLabel }}</span>
-          </label>
-          <label class="pd-field">
             <span class="pd-field__label">{{ t('projectDetail.base.workflow') }}</span>
             <span class="pd-field__value">{{ t('projectDetail.base.workflowValue') }}</span>
           </label>
@@ -574,6 +697,16 @@ onBeforeUnmount(() => {
             <button
               class="button button--primary"
               type="button"
+              :disabled="selectedFileIds.size === 0"
+              :title="preTranslateButtonTitle || undefined"
+              @click="openPreTranslateDialog"
+            >
+              <Sparkles :size="14" />
+              {{ t('projectDetail.preTranslate.button') }}
+            </button>
+            <button
+              class="button button--primary"
+              type="button"
               :disabled="!canOpenUploadModal"
               :title="uploadButtonTitle || undefined"
               @click="openUploadDialog"
@@ -596,9 +729,8 @@ onBeforeUnmount(() => {
             <button
               class="button"
               type="button"
-              :disabled="!project.has_source_document"
-              :title="!project.has_source_document ? t('projectDetail.common.uploadRequired') : undefined"
-              @click="exportProjectFile(project)"
+              disabled
+              :title="t('projectDetail.common.comingSoon')"
             >
               <Download :size="14" />
               {{ t('projectDetail.files.actions.export') }}
@@ -615,7 +747,7 @@ onBeforeUnmount(() => {
               class="button"
               type="button"
               :disabled="deleting"
-              @click="deleteProject(project)"
+              @click="deleteCurrentProject"
             >
               <Trash2 :size="14" />
               {{ t('projectDetail.files.actions.delete') }}
@@ -638,9 +770,12 @@ onBeforeUnmount(() => {
           :columns="columns"
           :data="pagedRows"
           :loading="loading"
+          :selectable="true"
+          :selected-ids="selectedFileIds"
           :show-index="true"
           :index-offset="indexOffset"
           :empty-text="t('projectDetail.files.empty')"
+          @select="selectedFileIds = $event"
         >
           <template #filename="{ row }">
             <div class="pd-file-cell">
@@ -692,6 +827,10 @@ onBeforeUnmount(() => {
             </div>
           </template>
 
+          <template #source_language="{ row }">
+            <span>{{ row.source_language ? getLanguageLabel(row.source_language) : getPlaceholder() }}</span>
+          </template>
+
           <template #target_language="{ row }">
             <span>{{ row.target_language ? getLanguageLabel(row.target_language) : getPlaceholder() }}</span>
           </template>
@@ -734,7 +873,7 @@ onBeforeUnmount(() => {
                     class="is-danger"
                     type="button"
                     :disabled="deleting"
-                    @click="deleteProject(row)"
+                    @click="deleteProjectFile(row)"
                   >
                     {{ t('projectDetail.files.actions.delete') }}
                   </button>
@@ -769,10 +908,41 @@ onBeforeUnmount(() => {
             :key="uploadInputKey"
             class="field__control"
             type="file"
+            multiple
             :accept="supportedTaskFileAccept"
             aria-label="源文件"
             @change="onFileChange"
           />
+        </label>
+
+        <label class="field">
+          <span class="field__label">{{ t('projectList.form.sourceLanguage') }} <span class="field__required">*</span></span>
+          <select v-model="uploadSourceLanguage" class="field__control">
+            <option value="" disabled>{{ t('projectList.form.sourcePlaceholder') }}</option>
+            <option
+              v-for="lang in languageOptions"
+              :key="lang.code"
+              :value="lang.code"
+              :disabled="lang.code === uploadTargetLanguage"
+            >
+              {{ lang.label }}
+            </option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span class="field__label">{{ t('projectList.form.targetLanguage') }} <span class="field__required">*</span></span>
+          <select v-model="uploadTargetLanguage" class="field__control">
+            <option value="" disabled>{{ t('projectList.form.targetPlaceholder') }}</option>
+            <option
+              v-for="lang in languageOptions"
+              :key="lang.code"
+              :value="lang.code"
+              :disabled="lang.code === uploadSourceLanguage"
+            >
+              {{ lang.label }}
+            </option>
+          </select>
         </label>
 
         <label class="field field--compact">
@@ -786,6 +956,15 @@ onBeforeUnmount(() => {
             max="1"
             :aria-label="t('projectDetail.fields.threshold')"
           />
+        </label>
+
+        <label class="field field--full">
+          <span class="field__label">{{ t('documentParsing.label') }}</span>
+          <select v-model="documentParseMode" class="field__control">
+            <option value="full">{{ t('documentParsing.modes.full') }}</option>
+            <option value="body_only">{{ t('documentParsing.modes.bodyOnly') }}</option>
+          </select>
+          <span class="hint-text">{{ documentParseModeHint }}</span>
         </label>
 
         <label class="field field--full">
@@ -812,15 +991,15 @@ onBeforeUnmount(() => {
             v-model="selectedCollectionIds"
             class="field__control field__control--multi"
             multiple
-            :disabled="loadingCollections || tmCollections.length === 0"
+            :disabled="loadingCollections || availableTMCollections.length === 0"
             :aria-label="t('projectDetail.fields.collections')"
           >
-            <option v-for="collection in tmCollections" :key="collection.id" :value="collection.id">
+            <option v-for="collection in availableTMCollections" :key="collection.id" :value="collection.id">
               {{ collection.name }}（{{ formatLanguagePair(collection.source_language, collection.target_language) }} / {{ collection.entry_count }} 条）
             </option>
           </select>
           <span class="hint-text">
-            {{ tmCollections.length ? t('projectDetail.hints.collections') : t('projectDetail.hints.noCollections') }}
+            {{ availableTMCollections.length ? t('projectDetail.hints.collections') : t('projectDetail.hints.noCollections') }}
           </span>
         </label>
       </div>
@@ -843,7 +1022,7 @@ onBeforeUnmount(() => {
         <button
           class="button button--primary"
           type="button"
-          :disabled="uploading || loadingCollections || tmCollections.length === 0 || selectedCollectionIds.length === 0"
+          :disabled="uploading || selectedFiles.length === 0 || !uploadSourceLanguage || !uploadTargetLanguage"
           @click="uploadSourceDocument"
         >
           <Loader2 v-if="uploading" class="lucide-spin" :size="14" />
@@ -852,6 +1031,15 @@ onBeforeUnmount(() => {
         </button>
       </template>
     </Modal>
+
+    <PreTranslateDialog
+      :open="showPreTranslateDialog"
+      :files="selectedProjectFiles"
+      :source-language="project?.source_language ?? null"
+      :target-language="project?.target_language ?? null"
+      @close="closePreTranslateDialog"
+      @done="handlePreTranslateDone"
+    />
   </div>
 </template>
 
@@ -861,36 +1049,46 @@ onBeforeUnmount(() => {
 }
 
 .pd-hero {
-  padding: 20px;
+  padding: 14px 16px;
 }
 
 .pd-hero__main {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 20px;
+  gap: 14px;
 }
 
 .pd-hero__left {
   display: flex;
   align-items: flex-start;
-  gap: 14px;
+  gap: 10px;
   min-width: 0;
 }
 
 .pd-hero__copy {
   display: grid;
-  gap: 6px;
+  gap: 2px;
+}
+
+.pd-hero__copy .section-title {
+  margin-bottom: 0;
+  font-size: 16px;
+}
+
+.pd-hero__copy .panel-subtitle {
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .pd-hero__progress {
-  width: min(320px, 100%);
+  width: min(260px, 100%);
   display: grid;
-  gap: 8px;
+  gap: 4px;
 }
 
 .pd-hero__progress-label {
-  font-size: 13px;
+  font-size: 12px;
   color: var(--text-muted);
 }
 
@@ -945,37 +1143,52 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 18px;
+  gap: 10px;
+  margin-bottom: 12px;
 }
 
 .pd-panel-head__copy {
   display: grid;
-  gap: 4px;
+  gap: 2px;
+}
+
+.pd-panel-head .section-title {
+  margin-bottom: 0;
+  font-size: 15px;
+}
+
+.pd-panel-head .panel-subtitle {
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .pd-panel-toggle {
   flex-shrink: 0;
+  min-height: 32px;
+  padding: 6px 10px;
+  font-size: 13px;
 }
 
 .pd-basic-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 16px 28px;
+  gap: 10px 20px;
 }
 
 .pd-field {
   display: grid;
-  gap: 6px;
+  gap: 4px;
 }
 
 .pd-field__label {
-  font-size: 12px;
+  font-size: 11px;
   color: var(--text-muted);
 }
 
 .pd-field__value {
   color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.35;
   word-break: break-word;
 }
 
@@ -1143,6 +1356,10 @@ onBeforeUnmount(() => {
 
 .field--full {
   grid-column: 1 / -1;
+}
+
+.field__required {
+  color: var(--state-danger);
 }
 
 @media (max-width: 960px) {

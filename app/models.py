@@ -17,6 +17,56 @@ UUID_SQL_DEFAULT = text(
 )
 
 
+class Project(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft")
+    document_parse_mode: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="full",
+        server_default=text("'full'"),
+    )
+    source_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    target_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    creator_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    deadline: Mapped[DateTime | None] = mapped_column(
+        DateTime(timezone=False), nullable=True
+    )
+    access_level: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="team", server_default=text("'team'")
+    )
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    creator: Mapped["User | None"] = relationship(
+        "User", foreign_keys=[creator_id]
+    )
+    file_records: Mapped[list["FileRecord"]] = relationship(
+        "FileRecord",
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
+
+
 class FileRecord(Base):
     __tablename__ = "file_records"
 
@@ -25,6 +75,11 @@ class FileRecord(Base):
         primary_key=True,
         default=uuid.uuid4,
         server_default=UUID_SQL_DEFAULT,
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=True,
     )
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     file_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -64,6 +119,9 @@ class FileRecord(Base):
 
     creator: Mapped["User | None"] = relationship(
         "User", foreign_keys=[creator_id]
+    )
+    project: Mapped["Project | None"] = relationship(
+        "Project", back_populates="file_records"
     )
     collection: Mapped["TMCollection | None"] = relationship(
         "TMCollection", foreign_keys=[collection_id]

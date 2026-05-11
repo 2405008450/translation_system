@@ -17,9 +17,11 @@ from app.services.document_exporter import (
     export_translated_docx,
 )
 from app.services.document_workspace import (
+    DOCUMENT_PARSE_MODE_FULL,
     build_docx_preview_html,
     build_docx_workspace,
     build_document_html_from_segments,
+    normalize_document_parse_mode,
 )
 from app.services.matcher import MatchStats, match_sentences_with_stats
 
@@ -103,13 +105,16 @@ def build_task_workspace(
     filename: str,
     similarity_threshold: float,
     collection_ids: list[UUID] | None = None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
 ) -> dict[str, Any]:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     if is_docx_task(filename):
         return build_docx_workspace(
             db=db,
             raw_bytes=raw_bytes,
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
+            document_parse_mode=document_parse_mode,
         )
 
     if not supports_task_file(filename):
@@ -162,9 +167,11 @@ def build_task_preview_html(
     filename: str,
     segments: list[Any],
     source_bytes: bytes | None = None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
 ) -> str:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     if source_bytes and is_docx_task(filename):
-        return build_docx_preview_html(source_bytes)
+        return build_docx_preview_html(source_bytes, document_parse_mode=document_parse_mode)
     return build_document_html_from_segments(segments) if segments else ""
 
 
@@ -172,12 +179,18 @@ def export_translated_task_file(
     raw_bytes: bytes | None,
     filename: str,
     segments: list[Any],
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
 ) -> ExportedTaskFile:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     if is_docx_task(filename):
         if raw_bytes is None:
             raise ValueError("DOCX 源文件缺失，暂时无法导出。")
         return ExportedTaskFile(
-            content=export_translated_docx(raw_bytes=raw_bytes, segments=segments),
+            content=export_translated_docx(
+                raw_bytes=raw_bytes,
+                segments=segments,
+                document_parse_mode=document_parse_mode,
+            ),
             media_type=DOCX_MEDIA_TYPE,
             filename=build_translated_docx_filename(filename),
         )
@@ -323,7 +336,7 @@ def _build_segment_context(
         context["index"] = subtitle_index
         context["subtitle_index"] = subtitle_index
 
-    for field in ("id", "tu_id", "start", "end"):
+    for field in ("id", "tu_id", "start", "end", "zip_path", "rar_path", "file_type"):
         value = metadata.get(field)
         if value is not None and not isinstance(value, (dict, list, set, tuple)):
             context[field] = value

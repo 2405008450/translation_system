@@ -21,15 +21,42 @@ import Pagination from '../components/Pagination.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { useToast } from '../composables/useToast'
-import { formatLanguagePair } from '../constants/languages'
+import { formatLanguagePair, languageOptions } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
 import { supportedTaskFileAccept } from '../constants/taskFiles'
 import { useTaskStore } from '../stores/task'
 import type { TermBase, TMCollection } from '../types/api'
+import { getProgressStyle } from '../utils/progress'
+
+interface ProjectRow {
+  id: string
+  name: string
+  filename: string
+  status: string
+  progress: number
+  file_count: number
+  total_segments: number
+  translated_segments: number
+  source_language: string | null
+  target_language: string | null
+  creator: string | null
+  deadline: string | null
+  access_level: string | null
+  created_at: string
+  updated_at: string
+}
+
+interface ProjectListResponse {
+  items: ProjectRow[]
+  total: number
+  skip: number
+  limit: number
+}
 
 type MainTab = 'tasks' | 'performance'
 type SubTab = 'all' | 'incomplete'
 type ResourceImportTab = 'tm' | 'term'
+type DocumentParseMode = 'full' | 'body_only'
 
 const taskStore = useTaskStore()
 const confirm = useConfirm()
@@ -48,13 +75,19 @@ const selectedCollectionIds = ref<string[]>([])
 const termBases = ref<TermBase[]>([])
 const loadingTermBases = ref(false)
 const selectedTermBaseId = ref('')
+const uploadSourceLanguage = ref('')
+const uploadTargetLanguage = ref('')
+const documentParseMode = ref<DocumentParseMode>('full')
 const showUploadForm = ref(false)
 const currentPage = ref(1)
 const pageSize = ref(50)
 const selectedIds = ref(new Set<string>())
 const sortKey = ref('')
-const sortOrder = ref<'asc' | 'desc'>('asc')
+const sortOrder = ref<'asc' | 'desc'>('desc')
 const searchQuery = ref('')
+const projects = ref<ProjectRow[]>([])
+const projectsLoading = ref(false)
+let searchTimer: ReturnType<typeof setTimeout> | null = null
 const showImportDialog = ref(false)
 const importDialogInitialTab = ref<ResourceImportTab>('tm')
 const openActionMenuId = ref<string | null>(null)
@@ -68,9 +101,39 @@ const importDialogContext = ref<{
   targetLanguage: null,
 })
 
+const availableTMCollections = computed(() => {
+  if (!uploadSourceLanguage.value || !uploadTargetLanguage.value) {
+    return tmCollections.value
+  }
+
+  return tmCollections.value.filter((collection) => (
+    (!collection.source_language || collection.source_language === uploadSourceLanguage.value)
+    && (!collection.target_language || collection.target_language === uploadTargetLanguage.value)
+  ))
+})
+
+const availableTermBases = computed(() => {
+  if (!uploadSourceLanguage.value || !uploadTargetLanguage.value) {
+    return termBases.value
+  }
+
+  return termBases.value.filter((termBase) => (
+    termBase.source_language === uploadSourceLanguage.value
+    && termBase.target_language === uploadTargetLanguage.value
+  ))
+})
+
+const documentParseModeHint = computed(() => (
+  documentParseMode.value === 'body_only'
+    ? t('documentParsing.hints.bodyOnly')
+    : t('documentParsing.hints.full')
+))
+
 const columns = computed<DataTableColumn[]>(() => ([
   { key: 'filename', label: t('taskList.columns.filename'), sortable: true },
   { key: 'status', label: t('taskList.columns.status'), width: '110px' },
+  { key: 'progress', label: t('projectList.status.progress'), width: '180px' },
+  { key: 'file_count', label: t('projectDetail.base.fileCount'), width: '110px', align: 'right' },
   { key: 'created_at', label: t('taskList.columns.createdAt'), width: '160px', sortable: true },
   { key: 'updated_at', label: t('taskList.columns.updatedAt'), width: '160px', sortable: true },
 ]))
@@ -103,12 +166,22 @@ function getErrorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback
 }
 
-async function loadTasks() {
+async function loadProjects() {
   pageError.value = ''
+  projectsLoading.value = true
   try {
-    await taskStore.fetchTasks()
+    const { data } = await http.get<ProjectListResponse>('/projects', {
+      params: {
+        skip: 0,
+        limit: 200,
+        search: searchQuery.value.trim(),
+      },
+    })
+    projects.value = data.items
   } catch (error) {
     pageError.value = getErrorMessage(error, t('taskList.errors.load'))
+  } finally {
+    projectsLoading.value = false
   }
 }
 
@@ -117,9 +190,6 @@ async function loadTMCollections() {
   try {
     const { data } = await http.get<TMCollection[]>('/translation-memory/collections')
     tmCollections.value = data
-    if (selectedCollectionIds.value.length === 0 && data.length > 0) {
-      selectedCollectionIds.value = [data[0].id]
-    }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('taskList.errors.collectionsLoad'))
   } finally {
@@ -146,11 +216,15 @@ function onFileChange(event: Event) {
 
 async function uploadFile() {
   if (!selectedFile.value) {
-    pageError.value = '请选择要上传的文件。'
+    pageError.value = t('taskList.errors.selectFile')
     return
   }
-  if (selectedCollectionIds.value.length === 0) {
-    pageError.value = t('taskList.errors.selectCollection')
+  if (!uploadSourceLanguage.value || !uploadTargetLanguage.value) {
+    pageError.value = t('taskList.errors.selectLanguagePair')
+    return
+  }
+  if (uploadSourceLanguage.value === uploadTargetLanguage.value) {
+    pageError.value = t('projectList.errors.sameLanguage')
     return
   }
 
@@ -161,6 +235,9 @@ async function uploadFile() {
       threshold.value,
       selectedCollectionIds.value,
       selectedTermBaseId.value || null,
+      uploadSourceLanguage.value,
+      uploadTargetLanguage.value,
+      documentParseMode.value,
     )
     selectedFile.value = null
     const fileInput = document.getElementById('upload-file') as HTMLInputElement | null
@@ -174,10 +251,10 @@ async function uploadFile() {
   }
 }
 
-async function removeTask(fileRecordId: string, filename: string) {
+async function removeProject(projectId: string, name: string) {
   const confirmed = await confirm({
     title: t('taskList.messages.deleting'),
-    message: t('taskList.messages.deleteConfirm', { name: filename }),
+    message: t('taskList.messages.deleteConfirm', { name }),
     confirmText: t('common.actions.delete'),
     danger: true,
   })
@@ -188,38 +265,47 @@ async function removeTask(fileRecordId: string, filename: string) {
 
   pageError.value = ''
   try {
-    await taskStore.deleteTask(fileRecordId)
-    toast.success(t('taskList.messages.deleted', { name: filename }))
+    await http.delete(`/projects/${projectId}`)
+    selectedIds.value.delete(projectId)
+    toast.success(t('taskList.messages.deleted', { name }))
+    await loadProjects()
   } catch (error) {
     pageError.value = getErrorMessage(error, t('taskList.errors.delete'))
   }
 }
 
-const filteredTasks = computed(() => {
-  let tasks = taskStore.tasks
+function getStatusClass(status: string) {
+  const meta = getFileStatusMeta(status)
+  return `project-status--${meta.tone}`
+}
+
+const filteredProjects = computed(() => {
+  let rows = [...projects.value]
 
   if (subTab.value === 'incomplete') {
-    tasks = tasks.filter((task) => task.status !== 'completed' && task.status !== 'translated')
-  }
-
-  if (searchQuery.value.trim()) {
-    const query = searchQuery.value.trim().toLowerCase()
-    tasks = tasks.filter((task) => task.filename.toLowerCase().includes(query))
+    rows = rows.filter((row) => row.status !== 'completed' && row.status !== 'translated')
   }
 
   if (sortKey.value) {
-    const key = sortKey.value as keyof typeof tasks[0]
+    const key = sortKey.value as keyof ProjectRow
     const direction = sortOrder.value === 'asc' ? 1 : -1
-    tasks = [...tasks].sort((left, right) => String(left[key]).localeCompare(String(right[key])) * direction)
+    rows.sort((left, right) => {
+      const leftVal = left[key]
+      const rightVal = right[key]
+      if (key === 'progress' || key === 'file_count') {
+        return ((Number(leftVal) || 0) - (Number(rightVal) || 0)) * direction
+      }
+      return String(leftVal ?? '').localeCompare(String(rightVal ?? '')) * direction
+    })
   }
 
-  return tasks
+  return rows
 })
 
-const totalCount = computed(() => filteredTasks.value.length)
-const pagedTasks = computed(() => {
+const totalCount = computed(() => filteredProjects.value.length)
+const pagedProjects = computed(() => {
   const start = (currentPage.value - 1) * pageSize.value
-  return filteredTasks.value.slice(start, start + pageSize.value)
+  return filteredProjects.value.slice(start, start + pageSize.value)
 })
 const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
 
@@ -249,18 +335,43 @@ function goToAssets() {
 }
 
 watch(searchQuery, () => {
+  if (searchTimer) {
+    clearTimeout(searchTimer)
+  }
+  searchTimer = setTimeout(() => {
+    currentPage.value = 1
+    void loadProjects()
+  }, 300)
+})
+
+watch(subTab, () => {
   currentPage.value = 1
+})
+
+watch([uploadSourceLanguage, uploadTargetLanguage], () => {
+  selectedCollectionIds.value = selectedCollectionIds.value.filter((collectionId) => (
+    availableTMCollections.value.some((collection) => collection.id === collectionId)
+  ))
+  if (
+    selectedTermBaseId.value
+    && !availableTermBases.value.some((termBase) => termBase.id === selectedTermBaseId.value)
+  ) {
+    selectedTermBaseId.value = ''
+  }
 })
 
 onMounted(() => {
   document.addEventListener('click', handleDocumentClick)
-  void loadTasks()
+  void loadProjects()
   void loadTMCollections()
   void loadTermBases()
 })
 
 onBeforeUnmount(() => {
   document.removeEventListener('click', handleDocumentClick)
+  if (searchTimer) {
+    clearTimeout(searchTimer)
+  }
 })
 </script>
 
@@ -275,6 +386,36 @@ onBeforeUnmount(() => {
         </label>
 
         <label class="field field--compact">
+          <span class="field__label">{{ t('projectList.form.sourceLanguage') }}</span>
+          <select v-model="uploadSourceLanguage" class="field__control">
+            <option value="" disabled>{{ t('projectList.form.sourcePlaceholder') }}</option>
+            <option
+              v-for="lang in languageOptions"
+              :key="lang.code"
+              :value="lang.code"
+              :disabled="lang.code === uploadTargetLanguage"
+            >
+              {{ lang.label }}
+            </option>
+          </select>
+        </label>
+
+        <label class="field field--compact">
+          <span class="field__label">{{ t('projectList.form.targetLanguage') }}</span>
+          <select v-model="uploadTargetLanguage" class="field__control">
+            <option value="" disabled>{{ t('projectList.form.targetPlaceholder') }}</option>
+            <option
+              v-for="lang in languageOptions"
+              :key="lang.code"
+              :value="lang.code"
+              :disabled="lang.code === uploadSourceLanguage"
+            >
+              {{ lang.label }}
+            </option>
+          </select>
+        </label>
+
+        <label class="field field--compact">
           <span class="field__label">{{ t('taskList.fields.threshold') }}</span>
           <input
             v-model.number="threshold"
@@ -286,20 +427,29 @@ onBeforeUnmount(() => {
           />
         </label>
 
+        <label class="field field--compact">
+          <span class="field__label">{{ t('documentParsing.label') }}</span>
+          <select v-model="documentParseMode" class="field__control">
+            <option value="full">{{ t('documentParsing.modes.full') }}</option>
+            <option value="body_only">{{ t('documentParsing.modes.bodyOnly') }}</option>
+          </select>
+          <span class="hint-text">{{ documentParseModeHint }}</span>
+        </label>
+
         <label class="field field--collections">
           <span class="field__label">{{ t('taskList.fields.collections') }}</span>
           <select
             v-model="selectedCollectionIds"
             class="field__control field__control--multi"
             multiple
-            :disabled="loadingCollections || tmCollections.length === 0"
+            :disabled="loadingCollections || availableTMCollections.length === 0"
           >
-            <option v-for="collection in tmCollections" :key="collection.id" :value="collection.id">
+            <option v-for="collection in availableTMCollections" :key="collection.id" :value="collection.id">
               {{ collection.name }}（{{ formatLanguagePair(collection.source_language, collection.target_language) }} / {{ collection.entry_count }} 条）
             </option>
           </select>
           <span class="hint-text">
-            {{ tmCollections.length ? t('taskList.hints.collections') : t('taskList.hints.noCollections') }}
+            {{ availableTMCollections.length ? t('taskList.hints.collections') : t('taskList.hints.noCollections') }}
           </span>
         </label>
 
@@ -308,10 +458,10 @@ onBeforeUnmount(() => {
           <select
             v-model="selectedTermBaseId"
             class="field__control"
-            :disabled="loadingTermBases || termBases.length === 0"
+            :disabled="loadingTermBases || availableTermBases.length === 0"
           >
             <option value="">{{ t('taskList.hints.noTermBase') }}</option>
-            <option v-for="termBase in termBases" :key="termBase.id" :value="termBase.id">
+            <option v-for="termBase in availableTermBases" :key="termBase.id" :value="termBase.id">
               {{ termBase.name }}（{{ formatLanguagePair(termBase.source_language, termBase.target_language) }} / {{ termBase.entry_count }} 条）
             </option>
           </select>
@@ -320,7 +470,7 @@ onBeforeUnmount(() => {
         <button
           class="button button--primary"
           type="button"
-          :disabled="taskStore.uploading.active || selectedCollectionIds.length === 0 || tmCollections.length === 0"
+          :disabled="taskStore.uploading.active || !selectedFile || !uploadSourceLanguage || !uploadTargetLanguage"
           @click="uploadFile"
         >
           <Loader2 v-if="taskStore.uploading.active" class="lucide-spin" />
@@ -436,8 +586,8 @@ onBeforeUnmount(() => {
         <div class="table-page__body">
           <DataTable
             :columns="columns"
-            :data="pagedTasks"
-            :loading="taskStore.loading"
+            :data="pagedProjects"
+            :loading="projectsLoading"
             :selectable="true"
             :selected-ids="selectedIds"
             :sort-key="sortKey"
@@ -450,18 +600,31 @@ onBeforeUnmount(() => {
           >
             <template #filename="{ row }">
               <button
-                class="text-link task-link"
+                class="text-link project-link"
                 type="button"
-                @click="router.push({ name: 'workbench', params: { id: row.id } })"
+                @click="router.push({ name: 'project-detail', params: { id: row.id } })"
               >
                 {{ row.filename }}
               </button>
             </template>
 
             <template #status="{ row }">
-              <span class="project-status" :class="`project-status--${getFileStatusMeta(row.status).tone}`">
+              <span class="project-status" :class="getStatusClass(row.status)">
                 {{ getFileStatusMeta(row.status).label }}
               </span>
+            </template>
+
+            <template #progress="{ row }">
+              <div class="progress-bar">
+                <div class="progress-bar__track">
+                  <div class="progress-bar__fill" :style="getProgressStyle(row.progress)" />
+                </div>
+                <span class="progress-bar__text">{{ row.progress }}%</span>
+              </div>
+            </template>
+
+            <template #file_count="{ row }">
+              <span>{{ row.file_count }}</span>
             </template>
 
             <template #created_at="{ row }">
@@ -483,7 +646,7 @@ onBeforeUnmount(() => {
                   type="button"
                   :title="t('taskList.actions.continue')"
                   :aria-label="t('taskList.actions.continue')"
-                  @click="router.push({ name: 'workbench', params: { id: row.id } })"
+                  @click="router.push({ name: 'project-detail', params: { id: row.id } })"
                 >
                   <ArrowRight :size="16" />
                 </button>
@@ -498,7 +661,7 @@ onBeforeUnmount(() => {
                     <MoreHorizontal :size="16" />
                   </button>
                   <div v-if="openActionMenuId === row.id" class="task-action-menu__dropdown">
-                    <button type="button" @click="router.push({ name: 'workbench', params: { id: row.id } }); closeActionMenu()">
+                    <button type="button" @click="router.push({ name: 'project-detail', params: { id: row.id } }); closeActionMenu()">
                       {{ t('taskList.actions.details') }}
                     </button>
                     <button
@@ -510,7 +673,7 @@ onBeforeUnmount(() => {
                     <button
                       class="is-danger"
                       type="button"
-                      @click="removeTask(row.id, row.filename); closeActionMenu()"
+                      @click="removeProject(row.id, row.filename); closeActionMenu()"
                     >
                       {{ t('taskList.actions.delete') }}
                     </button>
@@ -568,7 +731,7 @@ onBeforeUnmount(() => {
   margin-top: 12px;
 }
 
-.task-link {
+.project-link {
   padding: 0;
   border: none;
   background: transparent;

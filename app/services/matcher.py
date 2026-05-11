@@ -106,6 +106,9 @@ def get_tm_candidates(
     collection_ids: list[UUID] | None = None,
 ) -> list[TMCandidate]:
     """获取单个句子的 TM 匹配候选项，返回满足阈值的前 N 条记录"""
+    if collection_ids is not None and len(collection_ids) == 0:
+        return []
+
     normalized = normalize_text(source_text)
     if not normalized:
         return []
@@ -241,6 +244,32 @@ def match_sentences_with_stats(
             exact_phase_ms=0.0,
             fuzzy_phase_ms=0.0,
             total_match_ms=0.0,
+            fuzzy_candidates_evaluated=0,
+        )
+
+    if collection_ids is not None and len(collection_ids) == 0:
+        results = [
+            MatchResult(
+                source_sentence=sentence.source_sentence,
+                status="none",
+                score=0.0,
+                matched_source_text=None,
+                target_text=None,
+                tm_candidates=[],
+            )
+            for sentence in prepared_sentences
+        ]
+        total_match_ms = (perf_counter() - total_started_at) * 1000
+        return results, MatchStats(
+            total_input_sentences=len(sentences),
+            prepared_sentences=len(prepared_sentences),
+            unique_sentences=len({sentence.match_text for sentence in prepared_sentences if sentence.match_text}),
+            exact_hits=0,
+            fuzzy_hits=0,
+            none_hits=len(prepared_sentences),
+            exact_phase_ms=0.0,
+            fuzzy_phase_ms=0.0,
+            total_match_ms=round(total_match_ms, 2),
             fuzzy_candidates_evaluated=0,
         )
 
@@ -897,6 +926,9 @@ def get_tm_candidates_for_text(
     top_n: int = TM_CANDIDATES_LIMIT,
 ) -> list[TMMatchCandidate]:
     """获取单个文本的TM匹配候选列表"""
+    if collection_ids is not None and len(collection_ids) == 0:
+        return []
+
     if not source_text or not source_text.strip():
         return []
 

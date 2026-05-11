@@ -135,7 +135,7 @@ def _export_by_format(
 
     # HTML
     if ext in (".html", ".htm"):
-        return HtmlExporter().export(original_bytes, translations)
+        return HtmlExporter().export_by_segments(original_bytes, segments, translations)
 
     # Properties
     if ext == ".properties":
@@ -206,7 +206,7 @@ def _export_by_format(
 
     # ZIP
     if ext == ".zip":
-        return ZipExporter().export(original_bytes, translations)
+        return ZipExporter().export(original_bytes, translations, segments=segments)
 
     # IDML
     if ext == ".idml":
@@ -218,7 +218,7 @@ def _export_by_format(
 
     # RAR -> ZIP
     if ext == ".rar":
-        return RarExporter().export(original_bytes, translations)
+        return RarExporter().export(original_bytes, translations, segments=segments)
 
     # DOCX - 使用专用导出器
     if ext == ".docx":

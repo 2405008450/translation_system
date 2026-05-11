@@ -6,7 +6,7 @@ ZIP 导出器 - 将翻译后的内容导出为 ZIP 格式
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict
 
 
 class ZipExporter:
@@ -17,6 +17,7 @@ class ZipExporter:
         original_bytes: bytes,
         translations: Dict[str, str],
         file_translations: Dict[str, Dict[str, str]] = None,
+        segments: list[dict[str, Any]] | None = None,
     ) -> bytes:
         """导出翻译后的 ZIP 文件
         
@@ -29,6 +30,7 @@ class ZipExporter:
             bytes: 翻译后的 ZIP 文件字节
         """
         file_translations = file_translations or {}
+        file_segments = self._group_segments_by_path(segments, "zip_path")
         
         input_zip = zipfile.ZipFile(BytesIO(original_bytes), 'r')
         output_buffer = BytesIO()
@@ -49,14 +51,15 @@ class ZipExporter:
             # 获取该文件的翻译
             file_trans = file_translations.get(name, {})
             combined_trans = {**translations, **file_trans}
+            current_segments = file_segments.get(name, [])
             
-            if not combined_trans:
+            if not combined_trans and not current_segments:
                 output_zip.writestr(name, file_bytes)
                 continue
             
             # 尝试导出翻译后的文件
             try:
-                exported = self._export_file(name, file_bytes, combined_trans)
+                exported = self._export_file(name, file_bytes, combined_trans, current_segments)
                 output_zip.writestr(name, exported)
             except Exception:
                 # 导出失败，保留原文件
@@ -67,7 +70,13 @@ class ZipExporter:
         
         return output_buffer.getvalue()
 
-    def _export_file(self, name: str, file_bytes: bytes, translations: Dict[str, str]) -> bytes:
+    def _export_file(
+        self,
+        name: str,
+        file_bytes: bytes,
+        translations: Dict[str, str],
+        segments: list[dict[str, Any]] | None = None,
+    ) -> bytes:
         """导出单个文件"""
         ext = Path(name).suffix.lower()
         
@@ -91,6 +100,8 @@ class ZipExporter:
         
         exporter = exporters.get(ext)
         if exporter:
+            if ext in {'.html', '.htm'}:
+                return exporter(file_bytes, translations, segments or [])
             return exporter(file_bytes, translations)
         
         # 不支持的格式，返回原文件
@@ -102,8 +113,15 @@ class ZipExporter:
             content = content.replace(source, target)
         return content.encode('utf-8')
 
-    def _export_html(self, data: bytes, trans: Dict[str, str]) -> bytes:
+    def _export_html(
+        self,
+        data: bytes,
+        trans: Dict[str, str],
+        segments: list[dict[str, Any]] | None = None,
+    ) -> bytes:
         from app.services.adapters.html_exporter import HtmlExporter
+        if segments:
+            return HtmlExporter().export_by_segments(data, segments, trans)
         return HtmlExporter().export(data, trans)
 
     def _export_properties(self, data: bytes, trans: Dict[str, str]) -> bytes:
@@ -158,3 +176,27 @@ class ZipExporter:
                     obj[i] = trans[item]
                 else:
                     self._translate_json(item, trans)
+
+    def _group_segments_by_path(
+        self,
+        segments: list[dict[str, Any]] | None,
+        path_key: str,
+    ) -> dict[str, list[dict[str, Any]]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        if not segments:
+            return grouped
+
+        for segment in segments:
+            path = str(
+                self._get_segment_value(segment, path_key)
+                or self._get_segment_value(segment, "archive_path")
+                or ""
+            ).strip()
+            if path:
+                grouped.setdefault(path, []).append(segment)
+        return grouped
+
+    def _get_segment_value(self, segment: Any, field_name: str, default: Any = "") -> Any:
+        if isinstance(segment, dict):
+            return segment.get(field_name, default)
+        return getattr(segment, field_name, default)
