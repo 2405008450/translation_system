@@ -122,6 +122,10 @@ const termsMessage = ref(t('workbench.terms.defaultMessage'))
 let searchLoadRequestId = 0
 
 // 导出相关状态
+const showGuidelinesPanel = ref(false)
+const workbenchGuidelines = ref('')
+const savingGuidelinesInWorkbench = ref(false)
+
 const showExportMenu = ref(false)
 const exportOptions = ref<Array<{ id: string; name: string; description: string; extension: string }>>([])
 const loadingExportOptions = ref(false)
@@ -871,9 +875,10 @@ async function loadTask() {
       commentStore.message = getErrorMessage(error, t('workbench.errors.commentsUnavailable'))
     }
 
+    workbenchGuidelines.value = segmentStore.fileRecord?.translation_guidelines || ''
+
     await loadTermBases()
 
-    // 如果有绑定的术语库，自动加载术语条目
     const boundTermBaseId = segmentStore.fileRecord?.term_base_id
     if (boundTermBaseId) {
       selectedTermBaseId.value = boundTermBaseId
@@ -894,6 +899,26 @@ async function runLLMTranslation() {
 
 async function stopLLMTranslation() {
   await segmentStore.abortLLM()
+}
+
+async function saveGuidelinesFromWorkbench() {
+  const projectId = segmentStore.fileRecord?.project_id
+  if (!projectId || savingGuidelinesInWorkbench.value) {
+    return
+  }
+  savingGuidelinesInWorkbench.value = true
+  try {
+    await http.patch(`/projects/${projectId}`, {
+      translation_guidelines: workbenchGuidelines.value,
+    })
+    if (segmentStore.fileRecord) {
+      segmentStore.fileRecord.translation_guidelines = workbenchGuidelines.value
+    }
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('workbench.errors.guidelinesSaveFailed'))
+  } finally {
+    savingGuidelinesInWorkbench.value = false
+  }
 }
 
 async function loadTMCollections() {
@@ -1356,6 +1381,17 @@ onBeforeRouteLeave(async () => {
           </select>
         </label>
 
+        <button
+          class="button workbench-action"
+          type="button"
+          :class="{ 'is-active': showGuidelinesPanel }"
+          :title="t('workbench.guidelinesToggle')"
+          @click="showGuidelinesPanel = !showGuidelinesPanel"
+        >
+          <FileText :size="14" />
+          {{ t('workbench.guidelinesShort') }}
+        </button>
+
         <div class="workbench-toolbar__actions">
           <button class="button workbench-action workbench-action--save" type="button" :disabled="segmentStore.saving" @click="saveNow">
             <Loader2 v-if="segmentStore.saving" class="lucide-spin" :size="14" />
@@ -1436,6 +1472,27 @@ onBeforeRouteLeave(async () => {
           }) }}
         </span>
       </div>
+    </section>
+
+    <section v-if="showGuidelinesPanel" class="panel workbench-guidelines-panel">
+      <div class="workbench-guidelines-panel__head">
+        <span class="workbench-guidelines-panel__title">{{ t('workbench.guidelinesTitle') }}</span>
+        <button
+          class="button button--small"
+          type="button"
+          :disabled="savingGuidelinesInWorkbench"
+          @click="saveGuidelinesFromWorkbench"
+        >
+          {{ savingGuidelinesInWorkbench ? t('common.actions.saving') : t('common.actions.save') }}
+        </button>
+      </div>
+      <textarea
+        v-model="workbenchGuidelines"
+        class="field__control workbench-guidelines-panel__editor"
+        rows="4"
+        :placeholder="t('workbench.guidelinesPlaceholder')"
+      />
+      <p class="hint-text">{{ t('workbench.guidelinesHint') }}</p>
     </section>
 
     <section class="panel panel--header workbench-overview">
@@ -2033,6 +2090,37 @@ onBeforeRouteLeave(async () => {
   padding: 5px 10px;
   font-size: 12px;
   gap: 4px;
+}
+
+.workbench-toolbar .workbench-action.is-active {
+  background: var(--bg-accent, #e0e8f0);
+  border-color: var(--line-accent, #b0c0d0);
+}
+
+.workbench-guidelines-panel {
+  padding: 10px 14px;
+  display: grid;
+  gap: 8px;
+}
+
+.workbench-guidelines-panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.workbench-guidelines-panel__title {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.workbench-guidelines-panel__editor {
+  resize: vertical;
+  min-height: 60px;
+  max-height: 200px;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .workbench-action {

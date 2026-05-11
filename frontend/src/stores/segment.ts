@@ -511,6 +511,7 @@ export const useSegmentStore = defineStore('segment', () => {
         body: JSON.stringify({
           scope,
           provider,
+          translation_guidelines: fileRecord.value.translation_guidelines || '',
         }),
         signal: llmAbortController.signal,
       })

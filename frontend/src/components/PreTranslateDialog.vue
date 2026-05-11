@@ -21,6 +21,7 @@ const props = defineProps<{
   files: ProjectFileItem[]
   sourceLanguage: string | null
   targetLanguage: string | null
+  translationGuidelines: string
 }>()
 
 const emit = defineEmits<{
@@ -48,6 +49,7 @@ const tmAutoConfirmExact = ref(true)
 const useLlm = ref(false)
 const llmScope = ref<LLMTranslateScope>('all')
 const llmProvider = ref<LLMProvider>('deepseek')
+const llmGuidelines = ref('')
 
 const useTermBase = ref(false)
 const termBaseId = ref('')
@@ -125,6 +127,7 @@ watch(() => props.open, (open) => {
     resetProgress()
     errorMessage.value = ''
     stopRequested.value = false
+    llmGuidelines.value = props.translationGuidelines || ''
   }
 })
 
@@ -199,6 +202,7 @@ async function runLLMForFile(fileId: string) {
       body: JSON.stringify({
         scope: llmScope.value,
         provider: llmProvider.value,
+        translation_guidelines: llmGuidelines.value,
       }),
       signal: controller.signal,
     })
@@ -393,6 +397,16 @@ function stopPreTranslate() {
             </select>
           </label>
         </div>
+        <label class="field field--full">
+          <span class="field__label">{{ t('projectDetail.preTranslate.llm.guidelines') }}</span>
+          <textarea
+            v-model="llmGuidelines"
+            class="field__control ptd-guidelines"
+            rows="4"
+            :placeholder="t('projectDetail.preTranslate.llm.guidelinesPlaceholder')"
+            :disabled="running || !useLlm"
+          />
+        </label>
         <p class="hint-text">{{ t('projectDetail.preTranslate.llm.hint') }}</p>
       </div>
 
@@ -478,4 +492,5 @@ function stopPreTranslate() {
 .ptd-footer { width: 100%; display: flex; justify-content: space-between; gap: 10px; align-items: center; }
 .ptd-selected { color: var(--text-muted); font-size: 13px; }
 .ptd-actions { display: flex; gap: 8px; }
+.ptd-guidelines { resize: vertical; min-height: 60px; max-height: 200px; font-size: 13px; line-height: 1.5; }
 </style>

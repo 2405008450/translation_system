@@ -60,6 +60,7 @@ interface ProjectDetail {
   creator: string | null
   deadline: string | null
   access_level: string | null
+  translation_guidelines: string
   term_base_id: string | null
   created_at: string
   updated_at: string
@@ -124,10 +125,12 @@ const openActionMenuId = ref<string | null>(null)
 const currentPage = ref(1)
 const pageSize = ref(10)
 const selectedFileIds = ref(new Set<string>())
+const guidelinesText = ref('')
+const savingGuidelines = ref(false)
 
 const tabs = computed(() => ([
   { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
-  { key: 'settings' as const, label: t('projectDetail.tabs.settings'), disabled: true },
+  { key: 'settings' as const, label: t('projectDetail.tabs.settings'), disabled: false },
   { key: 'stats' as const, label: t('projectDetail.tabs.stats'), disabled: true },
   { key: 'summary' as const, label: t('projectDetail.tabs.summary'), disabled: true },
   { key: 'quote' as const, label: t('projectDetail.tabs.quote'), disabled: true },
@@ -367,12 +370,39 @@ async function loadProject() {
     const { data } = await http.get<ProjectDetail>(`/projects/${props.id}`)
     project.value = data
     selectedTermBaseId.value = data.term_base_id || ''
+    guidelinesText.value = data.translation_guidelines || ''
     currentPage.value = 1
     selectedFileIds.value = new Set<string>()
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.load'))
   } finally {
     loading.value = false
+  }
+}
+
+async function saveGuidelines() {
+  if (!project.value || savingGuidelines.value) {
+    return
+  }
+  savingGuidelines.value = true
+  try {
+    await http.patch(`/projects/${project.value.id}`, {
+      translation_guidelines: guidelinesText.value,
+    })
+    project.value.translation_guidelines = guidelinesText.value
+    toast.show({
+      tone: 'success',
+      title: t('projectDetail.settings.guidelinesSaved'),
+      message: '',
+    })
+  } catch (error) {
+    toast.show({
+      tone: 'error',
+      title: t('projectDetail.settings.guidelinesSaveFailed'),
+      message: getErrorMessage(error, ''),
+    })
+  } finally {
+    savingGuidelines.value = false
   }
 }
 
@@ -684,7 +714,41 @@ watch([uploadSourceLanguage, uploadTargetLanguage], () => {
         </div>
       </section>
 
-      <section class="panel">
+      <section v-if="activeTab === 'settings'" class="panel">
+        <div class="pd-panel-head">
+          <div class="pd-panel-head__copy">
+            <div class="section-title section-title--tight">{{ t('projectDetail.settings.guidelinesTitle') }}</div>
+            <p class="panel-subtitle">{{ t('projectDetail.settings.guidelinesDescription') }}</p>
+          </div>
+        </div>
+
+        <div class="pd-settings-form">
+          <label class="field field--full">
+            <span class="field__label">{{ t('projectDetail.settings.guidelinesLabel') }}</span>
+            <textarea
+              v-model="guidelinesText"
+              class="field__control pd-guidelines-editor"
+              rows="10"
+              :placeholder="t('projectDetail.settings.guidelinesPlaceholder')"
+            />
+          </label>
+          <p class="hint-text">{{ t('projectDetail.settings.guidelinesHint') }}</p>
+          <div class="pd-settings-actions">
+            <button
+              class="button button--primary"
+              type="button"
+              :disabled="savingGuidelines"
+              @click="saveGuidelines"
+            >
+              <Loader2 v-if="savingGuidelines" class="lucide-spin" :size="14" />
+              <Settings2 v-else :size="14" />
+              {{ savingGuidelines ? t('common.actions.saving') : t('common.actions.save') }}
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section v-if="activeTab === 'files'" class="panel">
         <div class="pd-panel-head">
           <div class="pd-panel-head__copy">
             <div class="section-title section-title--tight">{{ t('projectDetail.files.title') }}</div>
@@ -1037,6 +1101,7 @@ watch([uploadSourceLanguage, uploadTargetLanguage], () => {
       :files="selectedProjectFiles"
       :source-language="project?.source_language ?? null"
       :target-language="project?.target_language ?? null"
+      :translation-guidelines="project?.translation_guidelines ?? ''"
       @close="closePreTranslateDialog"
       @done="handlePreTranslateDone"
     />
@@ -1360,6 +1425,27 @@ watch([uploadSourceLanguage, uploadTargetLanguage], () => {
 
 .field__required {
   color: var(--state-danger);
+}
+
+.pd-settings-form {
+  display: grid;
+  gap: 12px;
+  padding: 0 16px 16px;
+}
+
+.pd-guidelines-editor {
+  resize: vertical;
+  min-height: 120px;
+  max-height: 400px;
+  font-size: 13px;
+  line-height: 1.6;
+  font-family: inherit;
+}
+
+.pd-settings-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
 }
 
 @media (max-width: 960px) {

@@ -47,6 +47,9 @@ class Project(Base):
     access_level: Mapped[str] = mapped_column(
         String(20), nullable=False, default="team", server_default=text("'team'")
     )
+    translation_guidelines: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=text("''")
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )

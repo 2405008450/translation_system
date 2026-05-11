@@ -129,6 +129,7 @@ class RevisionResolvePayload(BaseModel):
 class LLMTranslateRequest(BaseModel):
     scope: Literal["fuzzy_only", "none_only", "all", "all_with_exact"] = "all"
     provider: Literal["auto", "deepseek", "openrouter"] = "deepseek"
+    translation_guidelines: str = ""
 
 
 class RematchRequest(BaseModel):
@@ -212,6 +213,7 @@ class ProjectUpdatePayload(BaseModel):
     target_language: str | None = None
     deadline: str | None = None
     access_level: Literal["team", "private", "public"] | None = None
+    translation_guidelines: str | None = None
 
 
 def _build_binary_download_response(
@@ -1128,6 +1130,7 @@ def _build_project_summary_payload(
         "creator": creator_name,
         "deadline": project.deadline.isoformat() if project.deadline else None,
         "access_level": project.access_level,
+        "translation_guidelines": project.translation_guidelines or "",
         "file_count": file_count,
         "created_at": project.created_at.isoformat(),
         "updated_at": project.updated_at.isoformat(),
@@ -1301,6 +1304,51 @@ def delete_project(
         db.commit()
 
     return {"message": "项目已删除。"}
+
+
+@router.patch("/projects/{project_id}")
+def update_project(
+    project_id: UUID,
+    payload: ProjectUpdatePayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+
+    if payload.name is not None:
+        name = payload.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="项目名称不能为空。")
+        project.name = name
+
+    if payload.source_language is not None or payload.target_language is not None:
+        src = payload.source_language if payload.source_language is not None else project.source_language
+        tgt = payload.target_language if payload.target_language is not None else project.target_language
+        if src or tgt:
+            src, tgt = _require_tm_language_pair(src, tgt)
+        project.source_language = src
+        project.target_language = tgt
+
+    if payload.deadline is not None:
+        project.deadline = _parse_optional_datetime(payload.deadline)
+
+    if payload.access_level is not None:
+        project.access_level = payload.access_level
+
+    if payload.translation_guidelines is not None:
+        project.translation_guidelines = payload.translation_guidelines
+
+    db.commit()
+    db.refresh(project)
+
+    return {
+        "id": str(project.id),
+        "name": project.name,
+        "translation_guidelines": project.translation_guidelines or "",
+        "updated_at": project.updated_at.isoformat(),
+    }
 
 
 @router.post("/projects/{project_id}/source-document")
@@ -1537,8 +1585,15 @@ def get_file_record(
     if file_record.term_base:
         term_base_name = file_record.term_base.name
 
+    project_guidelines = ""
+    if file_record.project_id:
+        project = db.query(Project).filter(Project.id == file_record.project_id).first()
+        if project:
+            project_guidelines = project.translation_guidelines or ""
+
     return {
         "id": file_record.id,
+        "project_id": str(file_record.project_id) if file_record.project_id else None,
         "filename": file_record.filename,
         "status": file_record.status,
         "document_parse_mode": getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
@@ -1548,6 +1603,7 @@ def get_file_record(
         "collection_name": collection_name,
         "term_base_id": file_record.term_base_id,
         "term_base_name": term_base_name,
+        "translation_guidelines": project_guidelines,
         "created_at": file_record.created_at.isoformat(),
         "updated_at": file_record.updated_at.isoformat(),
         "total_segments": result["total_segments"],
@@ -2288,6 +2344,12 @@ async def llm_translate_file_record(
     except LLMConfigurationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    guidelines = (body.translation_guidelines or "").strip()
+    if not guidelines and file_record.project_id:
+        project = db.query(Project).filter(Project.id == file_record.project_id).first()
+        if project:
+            guidelines = (project.translation_guidelines or "").strip()
+
     translation_tasks = _build_llm_translation_tasks(
         db=db,
         file_record_id=file_record_id,
@@ -2329,6 +2391,7 @@ async def llm_translate_file_record(
         async for result in iter_batch_translate(
             translation_tasks,
             provider=body.provider,
+            translation_guidelines=guidelines,
         ):
             if await request.is_disconnected():
                 break

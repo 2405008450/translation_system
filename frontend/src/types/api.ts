@@ -74,6 +74,7 @@ export interface Segment {
 
 export interface FileRecordDetail {
   id: string
+  project_id: string | null
   filename: string
   status: string
   document_parse_mode: 'full' | 'body_only'
@@ -83,6 +84,7 @@ export interface FileRecordDetail {
   collection_name: string | null
   term_base_id: string | null
   term_base_name: string | null
+  translation_guidelines: string
   created_at: string
   updated_at: string
   total_segments: number

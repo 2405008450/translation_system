@@ -314,12 +314,15 @@ CREATE TABLE IF NOT EXISTS projects (
     creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
     deadline TIMESTAMP,
     access_level VARCHAR(20) NOT NULL DEFAULT 'team',
+    translation_guidelines TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
 ALTER TABLE IF EXISTS projects
     ADD COLUMN IF NOT EXISTS document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full';
+ALTER TABLE IF EXISTS projects
+    ADD COLUMN IF NOT EXISTS translation_guidelines TEXT NOT NULL DEFAULT '';
 
 CREATE INDEX IF NOT EXISTS ix_projects_creator_id
     ON projects (creator_id);
