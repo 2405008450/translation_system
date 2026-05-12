@@ -26,6 +26,7 @@ from app.config import get_settings
 from app.database import SessionLocal, get_db
 from app.models import (
     FileRecord,
+    IssueMarker,
     MemoryBase,
     MemoryEntry,
     Project,
@@ -55,6 +56,13 @@ from app.services.comment_service import (
     list_segment_comments_for_file_record,
     serialize_segment_comment,
     update_segment_comment,
+)
+from app.services.issue_marker_service import (
+    create_issue_marker,
+    delete_issue_marker,
+    list_issue_markers_for_project,
+    serialize_issue_marker,
+    update_issue_marker,
 )
 from app.services.cache import get_json as cache_get_json
 from app.services.cache import set_json as cache_set_json
@@ -604,6 +612,24 @@ class CommentUpdateRequest(BaseModel):
 
 class CommentReplyRequest(BaseModel):
     body: str
+
+
+class IssueMarkerCreateRequest(BaseModel):
+    file_record_id: UUID | None = None
+    title: str | None = None
+    description: str
+    category: Literal["bug", "translation", "format", "performance", "data", "other"] = "other"
+    severity: Literal["low", "medium", "high", "critical"] = "medium"
+    page_url: str | None = None
+    user_agent: str | None = None
+
+
+class IssueMarkerUpdateRequest(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    category: Literal["bug", "translation", "format", "performance", "data", "other"] | None = None
+    severity: Literal["low", "medium", "high", "critical"] | None = None
+    status: Literal["open", "resolved"] | None = None
 
 
 class ProjectCreatePayload(BaseModel):
@@ -1600,6 +1626,7 @@ def _build_project_summary_payload(
     translated_segments: int,
     file_count: int,
     creator_name: str | None = None,
+    issue_stats: dict[str, int] | None = None,
 ) -> dict:
     progress = calculate_file_record_progress(total_segments, translated_segments)
     effective_status = (
@@ -1607,6 +1634,7 @@ def _build_project_summary_payload(
         if total_segments > 0
         else project.status
     )
+    issue_stats = issue_stats or {"issue_count": 0, "open_issue_count": 0}
 
     return {
         "id": str(project.id),
@@ -1623,6 +1651,8 @@ def _build_project_summary_payload(
         "access_level": project.access_level,
         "translation_guidelines": project.translation_guidelines or "",
         "file_count": file_count,
+        "issue_count": issue_stats.get("issue_count", 0),
+        "open_issue_count": issue_stats.get("open_issue_count", 0),
         "created_at": project.created_at.isoformat(),
         "updated_at": project.updated_at.isoformat(),
     }
@@ -1632,6 +1662,7 @@ def _build_project_file_payload(
     file_record: FileRecord,
     total_segments: int,
     translated_segments: int,
+    issue_stats: dict[str, int] | None = None,
 ) -> dict:
     source_bytes = load_file_record_source(file_record)
     progress = calculate_file_record_progress(total_segments, translated_segments)
@@ -1640,6 +1671,7 @@ def _build_project_file_payload(
         total_segments=total_segments,
         translated_segments=translated_segments,
     )
+    issue_stats = issue_stats or {"issue_count": 0, "open_issue_count": 0}
 
     return {
         "id": str(file_record.id),
@@ -1661,6 +1693,8 @@ def _build_project_file_payload(
         "file_size_bytes": len(source_bytes) if source_bytes is not None else None,
         "collection_id": file_record.collection_id,
         "term_base_id": file_record.term_base_id,
+        "issue_count": issue_stats.get("issue_count", 0),
+        "open_issue_count": issue_stats.get("open_issue_count", 0),
     }
 
 
@@ -1717,27 +1751,88 @@ def _get_project_stats(db: Session, project_ids: list[UUID]) -> dict[UUID, dict]
     }
 
 
+def _get_project_issue_stats(db: Session, project_ids: list[UUID]) -> dict[UUID, dict[str, int]]:
+    if not project_ids:
+        return {}
+
+    from sqlalchemy import case as sql_case
+
+    stats_rows = (
+        db.query(
+            IssueMarker.project_id,
+            func.count(IssueMarker.id).label("issue_count"),
+            func.count(sql_case((IssueMarker.status == "open", 1))).label("open_issue_count"),
+        )
+        .filter(IssueMarker.project_id.in_(project_ids))
+        .group_by(IssueMarker.project_id)
+        .all()
+    )
+    return {
+        row.project_id: {
+            "issue_count": int(row.issue_count or 0),
+            "open_issue_count": int(row.open_issue_count or 0),
+        }
+        for row in stats_rows
+    }
+
+
+def _get_file_issue_stats(db: Session, file_record_ids: list[UUID]) -> dict[UUID, dict[str, int]]:
+    if not file_record_ids:
+        return {}
+
+    from sqlalchemy import case as sql_case
+
+    stats_rows = (
+        db.query(
+            IssueMarker.file_record_id,
+            func.count(IssueMarker.id).label("issue_count"),
+            func.count(sql_case((IssueMarker.status == "open", 1))).label("open_issue_count"),
+        )
+        .filter(IssueMarker.file_record_id.in_(file_record_ids))
+        .group_by(IssueMarker.file_record_id)
+        .all()
+    )
+    return {
+        row.file_record_id: {
+            "issue_count": int(row.issue_count or 0),
+            "open_issue_count": int(row.open_issue_count or 0),
+        }
+        for row in stats_rows
+        if row.file_record_id is not None
+    }
+
+
 def _build_project_detail_payload(
     project: Project,
     files: list[FileRecord],
     file_stats: dict[UUID, dict],
+    issue_markers: list[IssueMarker] | None = None,
+    project_issue_stats: dict[str, int] | None = None,
+    file_issue_stats: dict[UUID, dict[str, int]] | None = None,
 ) -> dict:
     total_segments = sum(file_stats.get(file.id, {"total": 0})["total"] for file in files)
     translated_segments = sum(file_stats.get(file.id, {"filled": 0})["filled"] for file in files)
+    file_issue_stats = file_issue_stats or {}
     payload = _build_project_summary_payload(
         project=project,
         total_segments=total_segments,
         translated_segments=translated_segments,
         file_count=len(files),
         creator_name=get_user_display_name(project.creator),
+        issue_stats=project_issue_stats,
     )
     payload["files"] = [
         _build_project_file_payload(
             file_record=file_record,
             total_segments=file_stats.get(file_record.id, {"total": 0})["total"],
             translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
+            issue_stats=file_issue_stats.get(file_record.id),
         )
         for file_record in files
+    ]
+    payload["issue_markers"] = [
+        serialize_issue_marker(marker)
+        for marker in (issue_markers or [])
     ]
     payload["has_source_document"] = any(file_item["has_source_document"] for file_item in payload["files"])
     payload["file_size_bytes"] = sum(
@@ -1770,7 +1865,17 @@ def get_project_detail(
         .all()
     )
     file_stats = _get_file_segment_stats(db, [file_record.id for file_record in files])
-    return _build_project_detail_payload(project, files, file_stats)
+    issue_markers = list_issue_markers_for_project(db, project_id)
+    project_issue_stats = _get_project_issue_stats(db, [project_id]).get(project_id)
+    file_issue_stats = _get_file_issue_stats(db, [file_record.id for file_record in files])
+    return _build_project_detail_payload(
+        project,
+        files,
+        file_stats,
+        issue_markers=issue_markers,
+        project_issue_stats=project_issue_stats,
+        file_issue_stats=file_issue_stats,
+    )
 
 
 @router.delete("/projects/{project_id}")
@@ -1840,6 +1945,81 @@ def update_project(
         "translation_guidelines": project.translation_guidelines or "",
         "updated_at": project.updated_at.isoformat(),
     }
+
+
+@router.get("/projects/{project_id}/issue-markers")
+def list_project_issue_markers(
+    project_id: UUID,
+    status: Literal["open", "resolved"] | None = None,
+    file_record_id: UUID | None = None,
+    db: Session = Depends(get_db),
+):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    markers = list_issue_markers_for_project(
+        db,
+        project_id,
+        status=status,
+        file_record_id=file_record_id,
+    )
+    return [serialize_issue_marker(marker) for marker in markers]
+
+
+@router.post("/projects/{project_id}/issue-markers")
+def create_project_issue_marker(
+    project_id: UUID,
+    payload: IssueMarkerCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    marker = create_issue_marker(
+        db,
+        project_id=project_id,
+        file_record_id=payload.file_record_id,
+        title=payload.title,
+        description=payload.description,
+        category=payload.category,
+        severity=payload.severity,
+        page_url=payload.page_url,
+        user_agent=payload.user_agent,
+        reporter=current_user,
+    )
+    return serialize_issue_marker(marker)
+
+
+@router.patch("/issue-markers/{marker_id}")
+def patch_issue_marker(
+    marker_id: UUID,
+    payload: IssueMarkerUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    marker = update_issue_marker(
+        db,
+        marker_id=marker_id,
+        title=payload.title,
+        description=payload.description,
+        category=payload.category,
+        severity=payload.severity,
+        status=payload.status,
+        current_user=current_user,
+    )
+    return serialize_issue_marker(marker)
+
+
+@router.delete("/issue-markers/{marker_id}")
+def remove_issue_marker(
+    marker_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    delete_issue_marker(
+        db,
+        marker_id=marker_id,
+        current_user=current_user,
+    )
+    return {"message": "问题标记已删除。"}
 
 
 @router.post("/projects/{project_id}/detect-source-language")
@@ -1963,6 +2143,7 @@ def list_projects(
 
     project_ids = [project.id for project in projects]
     project_stats = _get_project_stats(db, project_ids)
+    project_issue_stats = _get_project_issue_stats(db, project_ids)
 
     items = []
     for project in projects:
@@ -1981,6 +2162,7 @@ def list_projects(
                 translated_segments=filled_segs,
                 file_count=st["file_count"],
                 creator_name=creator_name,
+                issue_stats=project_issue_stats.get(project.id),
             )
         )
 
@@ -2055,6 +2237,11 @@ def get_file_record(
         if project:
             project_guidelines = project.translation_guidelines or ""
 
+    issue_stats = _get_file_issue_stats(db, [file_record.id]).get(
+        file_record.id,
+        {"issue_count": 0, "open_issue_count": 0},
+    )
+
     return {
         "id": file_record.id,
         "project_id": str(file_record.project_id) if file_record.project_id else None,
@@ -2076,6 +2263,8 @@ def get_file_record(
         "source_extension": get_task_file_extension(source_filename),
         "has_source_document": source_bytes is not None,
         "can_export": can_export_task_file(source_filename, has_source_file=source_bytes is not None),
+        "issue_count": issue_stats["issue_count"],
+        "open_issue_count": issue_stats["open_issue_count"],
         "segments": [
             {
                 "id": seg.id,

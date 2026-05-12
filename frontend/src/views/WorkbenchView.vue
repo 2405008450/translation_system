@@ -12,6 +12,7 @@ import {
   Download,
   FileCheck,
   FileText,
+  Flag,
   History,
   Info,
   Languages,
@@ -28,6 +29,7 @@ import { useI18n } from 'vue-i18n'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 
 import Modal from '../components/base/Modal.vue'
+import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import NotesPanel from '../components/NotesPanel.vue'
 import PreviewPanel from '../components/PreviewPanel.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
@@ -53,6 +55,7 @@ import type {
   CommentCreatePayload,
   CommentStatus,
   GuidelineTemplateSummary,
+  IssueMarker,
   LLMProvider,
   LLMTranslateScope,
   SaveToTMResult,
@@ -97,6 +100,7 @@ const llmProvider = ref<LLMProvider>('deepseek')
 const itemHeight = ref(resolveItemHeight())
 const activeTool = ref<ToolKey | null>(null)
 const showImportDialog = ref(false)
+const showIssueDialog = ref(false)
 const importDialogInitialTab = ref<ResourceImportTab>('tm')
 const showShortcutHelp = ref(false)
 const showSaveToTMDialog = ref(false)
@@ -491,6 +495,7 @@ const saveToTMPreviewStats = computed(() => {
 })
 
 const taskTMCollectionId = computed(() => segmentStore.fileRecord?.collection_id || '')
+const canOpenIssueDialog = computed(() => Boolean(segmentStore.fileRecord?.project_id))
 
 const orderedSaveToTMCollections = computed(() => {
   const selectedId = taskTMCollectionId.value
@@ -1098,6 +1103,23 @@ async function saveToTM() {
   }
 }
 
+function openIssueDialog() {
+  if (!canOpenIssueDialog.value) {
+    toast.warn(t('issueMarker.errors.missingProject'))
+    return
+  }
+  showIssueDialog.value = true
+}
+
+function handleIssueSaved(_marker: IssueMarker) {
+  showIssueDialog.value = false
+  if (segmentStore.fileRecord) {
+    segmentStore.fileRecord.issue_count += 1
+    segmentStore.fileRecord.open_issue_count += 1
+  }
+  toast.success(t('issueMarker.messages.saved'))
+}
+
 async function saveNow() {
   pageError.value = ''
   try {
@@ -1501,6 +1523,17 @@ onBeforeRouteLeave(async () => {
           >
             <FileCheck :size="14" />
             {{ t('workbench.saveToTM') }}
+          </button>
+
+          <button
+            class="button workbench-action workbench-action--issue"
+            type="button"
+            :disabled="!canOpenIssueDialog"
+            :title="canOpenIssueDialog ? t('issueMarker.actions.open') : t('issueMarker.errors.missingProject')"
+            @click="openIssueDialog"
+          >
+            <Flag :size="14" />
+            {{ t('issueMarker.actions.open') }}
           </button>
 
           <button
@@ -1998,6 +2031,14 @@ onBeforeRouteLeave(async () => {
       :target-language="segmentStore.fileRecord?.target_language ?? null"
       @close="showImportDialog = false"
     />
+    <IssueMarkerDialog
+      :open="showIssueDialog"
+      :project-id="segmentStore.fileRecord?.project_id ?? null"
+      :file-record-id="segmentStore.fileRecord?.id ?? null"
+      :context-label="segmentStore.fileRecord?.filename ? t('workbench.importContext', { name: segmentStore.fileRecord.filename }) : t('workbench.currentTask')"
+      @close="showIssueDialog = false"
+      @saved="handleIssueSaved"
+    />
 
     <Modal
       :open="showSaveToTMDialog"
@@ -2366,6 +2407,14 @@ onBeforeRouteLeave(async () => {
   --action-color: #68430c;
   --action-shadow: rgba(154, 102, 13, 0.12);
   --action-hover-shadow: rgba(154, 102, 13, 0.2);
+}
+
+.workbench-action--issue {
+  --action-bg: linear-gradient(180deg, #fff5df, #f4ddb2);
+  --action-border: #d9b86f;
+  --action-color: #6d4a12;
+  --action-shadow: rgba(148, 103, 20, 0.1);
+  --action-hover-shadow: rgba(148, 103, 20, 0.18);
 }
 
 .workbench-action--stop {

@@ -3,6 +3,7 @@ import axios from 'axios'
 import {
   ArrowRight,
   Download,
+  Flag,
   Loader2,
   MoreHorizontal,
   Search,
@@ -16,6 +17,7 @@ import { useRouter } from 'vue-router'
 
 import { http } from '../api/http'
 import DataTable from '../components/DataTable.vue'
+import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
 import Pagination from '../components/Pagination.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
@@ -25,7 +27,7 @@ import { formatLanguagePair, languageOptions } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
 import { supportedTaskFileAccept } from '../constants/taskFiles'
 import { useTaskStore } from '../stores/task'
-import type { TermBase, TMCollection } from '../types/api'
+import type { IssueMarker, TermBase, TMCollection } from '../types/api'
 import { getProgressStyle } from '../utils/progress'
 
 interface ProjectRow {
@@ -35,6 +37,8 @@ interface ProjectRow {
   status: string
   progress: number
   file_count: number
+  issue_count: number
+  open_issue_count: number
   total_segments: number
   translated_segments: number
   source_language: string | null
@@ -91,8 +95,10 @@ const projects = ref<ProjectRow[]>([])
 const projectsLoading = ref(false)
 let searchTimer: ReturnType<typeof setTimeout> | null = null
 const showImportDialog = ref(false)
+const showIssueDialog = ref(false)
 const importDialogInitialTab = ref<ResourceImportTab>('tm')
 const openActionMenuId = ref<string | null>(null)
+const issueTarget = ref<ProjectRow | null>(null)
 const importDialogContext = ref<{
   label: string
   sourceLanguage: string | null
@@ -147,6 +153,7 @@ const columns = computed<DataTableColumn[]>(() => ([
   { key: 'status', label: t('taskList.columns.status'), width: '110px' },
   { key: 'progress', label: t('projectList.status.progress'), width: '180px' },
   { key: 'file_count', label: t('projectDetail.base.fileCount'), width: '110px', align: 'right' },
+  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '120px' },
   { key: 'created_at', label: t('taskList.columns.createdAt'), width: '160px', sortable: true },
   { key: 'updated_at', label: t('taskList.columns.updatedAt'), width: '160px', sortable: true },
 ]))
@@ -369,6 +376,19 @@ function openProjectDetail(row: ProjectRow) {
     params: { id: row.id },
     query: { from: 'tasks' },
   })
+}
+
+function openIssueDialog(row: ProjectRow) {
+  closeActionMenu()
+  issueTarget.value = row
+  showIssueDialog.value = true
+}
+
+async function handleIssueSaved(_marker: IssueMarker) {
+  showIssueDialog.value = false
+  issueTarget.value = null
+  toast.success(t('issueMarker.messages.saved'))
+  await loadProjects()
 }
 
 watch(searchQuery, () => {
@@ -665,6 +685,19 @@ onBeforeUnmount(() => {
               <span>{{ row.file_count }}</span>
             </template>
 
+            <template #open_issue_count="{ row }">
+              <button
+                class="issue-badge"
+                :class="{ 'is-active': Number(row.open_issue_count || 0) > 0 }"
+                type="button"
+                :title="t('issueMarker.actions.open')"
+                @click="openIssueDialog(row as ProjectRow)"
+              >
+                <Flag :size="13" />
+                {{ Number(row.open_issue_count || 0) > 0 ? row.open_issue_count : t('common.none') }}
+              </button>
+            </template>
+
             <template #created_at="{ row }">
               <div class="date-cell">
                 {{ formatDate(row.created_at).date }}<br>{{ formatDate(row.created_at).time }}
@@ -688,6 +721,15 @@ onBeforeUnmount(() => {
                 >
                   <ArrowRight :size="16" />
                 </button>
+                <button
+                  class="data-table__actions-btn"
+                  type="button"
+                  :title="t('issueMarker.actions.open')"
+                  :aria-label="t('issueMarker.actions.open')"
+                  @click="openIssueDialog(row as ProjectRow)"
+                >
+                  <Flag :size="14" />
+                </button>
                 <div class="task-action-menu">
                   <button
                     class="data-table__actions-btn"
@@ -707,6 +749,9 @@ onBeforeUnmount(() => {
                       @click="openImportDialog(row); closeActionMenu()"
                     >
                       {{ t('taskList.actions.importResources') }}
+                    </button>
+                    <button type="button" @click="openIssueDialog(row as ProjectRow)">
+                      {{ t('issueMarker.actions.open') }}
                     </button>
                     <button
                       class="is-danger"
@@ -746,6 +791,13 @@ onBeforeUnmount(() => {
       :source-language="importDialogContext.sourceLanguage"
       :target-language="importDialogContext.targetLanguage"
       @close="showImportDialog = false"
+    />
+    <IssueMarkerDialog
+      :open="showIssueDialog"
+      :project-id="issueTarget?.id ?? null"
+      :context-label="issueTarget?.filename ?? ''"
+      @close="showIssueDialog = false"
+      @saved="handleIssueSaved"
     />
   </div>
 </template>
@@ -848,6 +900,26 @@ onBeforeUnmount(() => {
   gap: 4px;
   justify-content: center;
   position: relative;
+}
+
+.issue-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.issue-badge.is-active {
+  border-color: color-mix(in srgb, var(--state-warning) 45%, var(--line-soft));
+  background: var(--state-warning-bg);
+  color: var(--state-warning);
 }
 
 .task-action-menu {

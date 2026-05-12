@@ -93,6 +93,8 @@ export interface FileRecordDetail {
   source_extension: string
   has_source_document: boolean
   can_export: boolean
+  issue_count: number
+  open_issue_count: number
   segments: Segment[]
 }
 
@@ -131,6 +133,42 @@ export interface SegmentComment {
   created_at: string
   updated_at: string
   resolved_at: string | null
+}
+
+export type IssueCategory = 'bug' | 'translation' | 'format' | 'performance' | 'data' | 'other'
+export type IssueSeverity = 'low' | 'medium' | 'high' | 'critical'
+export type IssueStatus = 'open' | 'resolved'
+
+export interface IssueMarker {
+  id: string
+  project_id: string
+  project_name: string | null
+  file_record_id: string | null
+  file_record_name: string | null
+  title: string
+  description: string
+  category: IssueCategory
+  severity: IssueSeverity
+  status: IssueStatus
+  page_url: string | null
+  user_agent: string | null
+  reporter: User | null
+  reporter_name: string | null
+  resolved_by: User | null
+  resolved_by_name: string | null
+  created_at: string
+  updated_at: string
+  resolved_at: string | null
+}
+
+export interface IssueMarkerCreatePayload {
+  file_record_id?: string | null
+  title?: string | null
+  description: string
+  category: IssueCategory
+  severity: IssueSeverity
+  page_url?: string | null
+  user_agent?: string | null
 }
 
 export interface TermBase {

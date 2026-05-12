@@ -3,12 +3,14 @@ import axios from 'axios'
 import {
   ArrowLeft,
   BookOpen,
+  Check,
   ChevronDown,
   ChevronUp,
   Clock3,
   Download,
   FileText,
   Filter,
+  Flag,
   FolderOpen,
   Link,
   Loader2,
@@ -18,6 +20,7 @@ import {
   Trash2,
   Upload,
   Users,
+  RotateCcw,
 } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -31,6 +34,7 @@ import {
 import { http } from '../api/http'
 import DataTable from '../components/DataTable.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
+import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import PreTranslateDialog from '../components/PreTranslateDialog.vue'
 import Pagination from '../components/Pagination.vue'
 import { useConfirm } from '../composables/useConfirm'
@@ -41,12 +45,13 @@ import { getFileStatusMeta } from '../constants/status'
 import { buildTranslatedTaskFilename, supportedTaskFileAccept } from '../constants/taskFiles'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 import { getProgressStyle } from '../utils/progress'
+import type { IssueMarker, IssueStatus } from '../types/api'
 
 const props = defineProps<{
   id: string
 }>()
 
-type ProjectTab = 'files' | 'settings' | 'stats' | 'summary' | 'quote'
+type ProjectTab = 'files' | 'issues' | 'settings' | 'stats' | 'summary' | 'quote'
 type DocumentParseMode = 'full' | 'body_only'
 
 interface ProjectDetail {
@@ -69,6 +74,9 @@ interface ProjectDetail {
   updated_at: string
   has_source_document: boolean
   file_size_bytes: number | null
+  issue_count: number
+  open_issue_count: number
+  issue_markers: IssueMarker[]
   files: ProjectFileItem[]
 }
 
@@ -90,6 +98,8 @@ interface ProjectFileItem {
   updated_at: string
   has_source_document: boolean
   file_size_bytes: number | null
+  issue_count: number
+  open_issue_count: number
   collection_id: string | null
   term_base_id: string | null
 }
@@ -130,6 +140,7 @@ const basicCollapsed = ref(false)
 const activeTab = ref<ProjectTab>('files')
 const showUploadModal = ref(false)
 const showPreTranslateDialog = ref(false)
+const showIssueDialog = ref(false)
 const uploadInputKey = ref(0)
 const openActionMenuId = ref<string | null>(null)
 const actionMenuStyle = ref<Record<string, string>>({})
@@ -138,9 +149,19 @@ const pageSize = ref(10)
 const selectedFileIds = ref(new Set<string>())
 const guidelinesText = ref('')
 const savingGuidelines = ref(false)
+const issueDialogTarget = ref<{
+  fileRecordId: string | null
+  label: string
+} | null>(null)
+const updatingIssueId = ref<string | null>(null)
 
 const tabs = computed(() => ([
   { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
+  {
+    key: 'issues' as const,
+    label: `${t('projectDetail.tabs.issues')}${openIssueCount.value > 0 ? ` (${openIssueCount.value})` : ''}`,
+    disabled: false,
+  },
   { key: 'settings' as const, label: t('projectDetail.tabs.settings'), disabled: false },
   { key: 'stats' as const, label: t('projectDetail.tabs.stats'), disabled: true },
   { key: 'summary' as const, label: t('projectDetail.tabs.summary'), disabled: true },
@@ -148,6 +169,8 @@ const tabs = computed(() => ([
 ]))
 
 const tableRows = computed<ProjectFileItem[]>(() => project.value?.files ?? [])
+const issueMarkers = computed<IssueMarker[]>(() => project.value?.issue_markers ?? [])
+const openIssueCount = computed(() => issueMarkers.value.filter((marker) => marker.status === 'open').length)
 const actionMenuRow = computed<ProjectFileItem | null>(() => {
   const id = openActionMenuId.value
   if (!id) return null
@@ -170,6 +193,7 @@ const columns = computed<DataTableColumn[]>(() => ([
   { key: 'progress', label: t('projectDetail.files.columns.progress'), width: '180px' },
   { key: 'taskManage', label: t('projectDetail.files.columns.task'), width: '150px' },
   { key: 'status', label: t('projectDetail.files.columns.status'), width: '120px' },
+  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '120px' },
   { key: 'created_at', label: t('projectDetail.files.columns.createdAt'), width: '170px' },
   { key: 'source_language', label: t('projectList.form.sourceLanguage'), width: '130px' },
   { key: 'target_language', label: t('projectDetail.files.columns.targetLang'), width: '130px' },
@@ -177,6 +201,7 @@ const columns = computed<DataTableColumn[]>(() => ([
 ]))
 
 const canOpenUploadModal = computed(() => Boolean(project.value))
+const canOpenIssueDialog = computed(() => Boolean(project.value))
 
 const uploadButtonTitle = computed(() => '')
 
@@ -338,6 +363,65 @@ async function handlePreTranslateDone() {
   showPreTranslateDialog.value = false
   selectedFileIds.value = new Set<string>()
   await loadProject()
+}
+
+function openProjectIssueDialog() {
+  if (!project.value) {
+    return
+  }
+  issueDialogTarget.value = {
+    fileRecordId: null,
+    label: project.value.filename || t('projectDetail.titleFallback'),
+  }
+  showIssueDialog.value = true
+}
+
+function openFileIssueDialog(row: ProjectRow) {
+  if (!project.value) {
+    return
+  }
+  closeActionMenu()
+  issueDialogTarget.value = {
+    fileRecordId: String(row.id),
+    label: t('issueMarker.list.fileScope', { name: String(row.filename || '') }),
+  }
+  showIssueDialog.value = true
+}
+
+async function handleIssueSaved(_marker: IssueMarker) {
+  showIssueDialog.value = false
+  issueDialogTarget.value = null
+  toast.success(t('issueMarker.messages.saved'))
+  await loadProject()
+}
+
+function getIssueCategoryLabel(category: string) {
+  return t(`issueMarker.categories.${category}` as any)
+}
+
+function getIssueSeverityLabel(severity: string) {
+  return t(`issueMarker.severity.${severity}` as any)
+}
+
+function getIssueStatusLabel(status: string) {
+  return t(`issueMarker.status.${status}` as any)
+}
+
+async function setIssueStatus(marker: IssueMarker, status: IssueStatus) {
+  updatingIssueId.value = marker.id
+  try {
+    await http.patch(`/issue-markers/${marker.id}`, { status })
+    toast.success(t('issueMarker.messages.updated'))
+    await loadProject()
+  } catch (error) {
+    toast.show({
+      tone: 'error',
+      title: t('issueMarker.errors.save'),
+      message: getErrorMessage(error, ''),
+    })
+  } finally {
+    updatingIssueId.value = null
+  }
 }
 
 function closeActionMenu() {
@@ -950,6 +1034,12 @@ onBeforeUnmount(() => {
             <span class="pd-field__value">{{ tableRows.length }}</span>
           </label>
           <label class="pd-field">
+            <span class="pd-field__label">{{ t('issueMarker.list.title') }}</span>
+            <span class="pd-field__value">
+              {{ t('issueMarker.list.openCount', { count: openIssueCount }) }}
+            </span>
+          </label>
+          <label class="pd-field">
             <span class="pd-field__label">{{ t('projectDetail.base.creator') }}</span>
             <span class="pd-field__value">{{ project.creator || getPlaceholder() }}</span>
           </label>
@@ -994,6 +1084,72 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
+      <section v-if="activeTab === 'issues'" class="panel">
+        <div class="pd-panel-head">
+          <div class="pd-panel-head__copy">
+            <div class="section-title section-title--tight">{{ t('issueMarker.list.title') }}</div>
+            <p class="panel-subtitle">
+              {{ t('issueMarker.list.description') }}
+            </p>
+          </div>
+          <button
+            class="button button--primary"
+            type="button"
+            :disabled="!canOpenIssueDialog"
+            @click="openProjectIssueDialog"
+          >
+            <Flag :size="14" />
+            {{ t('issueMarker.actions.open') }}
+          </button>
+        </div>
+
+        <div class="issue-summary">
+          <span>{{ t('issueMarker.list.openCount', { count: openIssueCount }) }}</span>
+          <span>{{ t('issueMarker.list.totalCount', { count: issueMarkers.length }) }}</span>
+        </div>
+
+        <div v-if="issueMarkers.length === 0" class="empty-state issue-empty">
+          {{ t('issueMarker.list.empty') }}
+        </div>
+
+        <div v-else class="issue-list">
+          <article
+            v-for="marker in issueMarkers"
+            :key="marker.id"
+            class="issue-item"
+            :class="`issue-item--${marker.status}`"
+          >
+            <div class="issue-item__main">
+              <div class="issue-item__head">
+                <span class="issue-status" :class="`issue-status--${marker.status}`">
+                  {{ getIssueStatusLabel(marker.status) }}
+                </span>
+                <strong>{{ marker.title }}</strong>
+              </div>
+              <p class="issue-item__description">{{ marker.description }}</p>
+              <div class="issue-item__meta">
+                <span>{{ marker.file_record_name ? t('issueMarker.list.fileScope', { name: marker.file_record_name }) : t('issueMarker.list.projectScope') }}</span>
+                <span>{{ getIssueCategoryLabel(marker.category) }}</span>
+                <span>{{ getIssueSeverityLabel(marker.severity) }}</span>
+                <span>{{ t('issueMarker.list.reporter') }}：{{ marker.reporter_name || getPlaceholder() }}</span>
+                <span>{{ t('issueMarker.list.createdAt') }}：{{ formatDateText(marker.created_at) }}</span>
+              </div>
+            </div>
+            <button
+              class="button issue-item__action"
+              type="button"
+              :disabled="updatingIssueId === marker.id"
+              @click="setIssueStatus(marker, marker.status === 'open' ? 'resolved' : 'open')"
+            >
+              <Loader2 v-if="updatingIssueId === marker.id" class="lucide-spin" :size="14" />
+              <Check v-else-if="marker.status === 'open'" :size="14" />
+              <RotateCcw v-else :size="14" />
+              {{ marker.status === 'open' ? t('issueMarker.actions.resolve') : t('issueMarker.actions.reopen') }}
+            </button>
+          </article>
+        </div>
+      </section>
+
       <section v-if="activeTab === 'files'" class="panel">
         <div class="pd-panel-head">
           <div class="pd-panel-head__copy">
@@ -1023,6 +1179,15 @@ onBeforeUnmount(() => {
             >
               <Upload :size="14" />
               {{ t('projectDetail.files.actions.upload') }}
+            </button>
+            <button
+              class="button"
+              type="button"
+              :disabled="!canOpenIssueDialog"
+              @click="openProjectIssueDialog"
+            >
+              <Flag :size="14" />
+              {{ t('issueMarker.actions.open') }}
             </button>
             <button class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
               <Link :size="14" />
@@ -1131,6 +1296,19 @@ onBeforeUnmount(() => {
             </span>
           </template>
 
+          <template #open_issue_count="{ row }">
+            <button
+              class="issue-badge"
+              :class="{ 'is-active': Number(row.open_issue_count || 0) > 0 }"
+              type="button"
+              :title="t('issueMarker.actions.open')"
+              @click="openFileIssueDialog(row)"
+            >
+              <Flag :size="13" />
+              {{ Number(row.open_issue_count || 0) > 0 ? row.open_issue_count : t('common.none') }}
+            </button>
+          </template>
+
           <template #created_at="{ row }">
             <div class="date-cell">
               {{ formatDateParts(row.created_at).date }}<br>{{ formatDateParts(row.created_at).time }}
@@ -1202,6 +1380,12 @@ onBeforeUnmount(() => {
           {{ t('projectDetail.files.actions.export') }}
         </button>
         <button
+          type="button"
+          @click="openFileIssueDialog(actionMenuRow)"
+        >
+          {{ t('issueMarker.actions.open') }}
+        </button>
+        <button
           class="is-danger"
           type="button"
           :disabled="deleting"
@@ -1220,6 +1404,14 @@ onBeforeUnmount(() => {
       :translation-guidelines="project?.translation_guidelines ?? ''"
       @close="closePreTranslateDialog"
       @done="handlePreTranslateDone"
+    />
+    <IssueMarkerDialog
+      :open="showIssueDialog"
+      :project-id="project?.id ?? null"
+      :file-record-id="issueDialogTarget?.fileRecordId ?? null"
+      :context-label="issueDialogTarget?.label ?? ''"
+      @close="showIssueDialog = false"
+      @saved="handleIssueSaved"
     />
   </div>
 </template>
@@ -1787,6 +1979,129 @@ onBeforeUnmount(() => {
   gap: 4px;
 }
 
+.issue-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.issue-badge.is-active {
+  border-color: color-mix(in srgb, var(--state-warning) 45%, var(--line-soft));
+  background: var(--state-warning-bg);
+  color: var(--state-warning);
+}
+
+.issue-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.issue-summary span {
+  padding: 4px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  background: var(--surface-muted);
+}
+
+.issue-empty {
+  min-height: 180px;
+}
+
+.issue-list {
+  display: grid;
+  gap: 10px;
+}
+
+.issue-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+}
+
+.issue-item--resolved {
+  opacity: 0.78;
+}
+
+.issue-item__main {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.issue-item__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.issue-item__head strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.issue-status {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+}
+
+.issue-status--open {
+  color: var(--state-warning);
+  background: var(--state-warning-bg);
+}
+
+.issue-status--resolved {
+  color: var(--state-success);
+  background: var(--state-success-bg);
+}
+
+.issue-item__description {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.issue-item__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.issue-item__action {
+  flex: 0 0 auto;
+  min-height: 32px;
+  padding: 6px 10px;
+}
+
 .pd-inline-link {
   padding: 0;
   border: none;
@@ -2049,6 +2364,15 @@ onBeforeUnmount(() => {
 
   .pd-upload-picker {
     grid-template-columns: 1fr;
+  }
+
+  .issue-item {
+    flex-direction: column;
+  }
+
+  .issue-item__action {
+    width: 100%;
+    justify-content: center;
   }
 }
 </style>

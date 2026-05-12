@@ -4,6 +4,7 @@ import {
   Copy,
   Database,
   Filter,
+  Flag,
   Loader2,
   MoreHorizontal,
   Plus,
@@ -18,12 +19,14 @@ import { useRouter } from 'vue-router'
 import { http } from '../api/http'
 import Modal from '../components/base/Modal.vue'
 import DataTable from '../components/DataTable.vue'
+import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
 import Pagination from '../components/Pagination.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { useToast } from '../composables/useToast'
 import { getFileStatusMeta } from '../constants/status'
 import { getProgressStyle } from '../utils/progress'
+import type { IssueMarker } from '../types/api'
 
 interface ProjectItem {
   id: string
@@ -32,6 +35,8 @@ interface ProjectItem {
   status: string
   progress: number
   file_count: number
+  issue_count: number
+  open_issue_count: number
   total_segments: number
   translated_segments: number
   source_language: string | null
@@ -73,6 +78,8 @@ const pageError = ref('')
 const showCreateDialog = ref(false)
 const creating = ref(false)
 const formError = ref('')
+const showIssueDialog = ref(false)
+const issueTarget = ref<ProjectItem | null>(null)
 
 const defaultForm = () => ({
   name: '',
@@ -93,6 +100,7 @@ const columns = computed<DataTableColumn[]>(() => ([
   { key: 'status', label: t('projectList.status.current'), width: '110px' },
   { key: 'progress', label: t('projectList.status.progress'), width: '180px' },
   { key: 'file_count', label: t('projectDetail.base.fileCount'), width: '110px', align: 'right' },
+  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '120px' },
   { key: 'access_level', label: t('projectList.status.access'), width: '110px' },
   { key: 'creator', label: t('projectList.status.creator'), width: '130px' },
   { key: 'created_at', label: t('projectList.summaries.createdAt'), width: '120px', sortable: true },
@@ -252,6 +260,18 @@ function goToAssets() {
   void router.push({ name: 'tm' })
 }
 
+function openIssueDialog(row: ProjectItem) {
+  issueTarget.value = row
+  showIssueDialog.value = true
+}
+
+async function handleIssueSaved(_marker: IssueMarker) {
+  showIssueDialog.value = false
+  issueTarget.value = null
+  toast.success(t('issueMarker.messages.saved'))
+  await loadProjects()
+}
+
 let searchTimer: ReturnType<typeof setTimeout> | null = null
 
 watch(searchQuery, () => {
@@ -371,6 +391,19 @@ onMounted(() => {
           <span>{{ row.file_count }}</span>
         </template>
 
+        <template #open_issue_count="{ row }">
+          <button
+            class="issue-badge"
+            :class="{ 'is-active': Number(row.open_issue_count || 0) > 0 }"
+            type="button"
+            :title="t('issueMarker.actions.open')"
+            @click="openIssueDialog(row as ProjectItem)"
+          >
+            <Flag :size="13" />
+            {{ Number(row.open_issue_count || 0) > 0 ? row.open_issue_count : t('common.none') }}
+          </button>
+        </template>
+
         <template #access_level="{ row }">
           <span>{{ getAccessLabel(row.access_level) }}</span>
         </template>
@@ -393,6 +426,15 @@ onMounted(() => {
 
         <template #actions="{ row }">
           <div class="project-row-actions">
+            <button
+              class="data-table__actions-btn"
+              type="button"
+              :title="t('issueMarker.actions.open')"
+              :aria-label="t('issueMarker.actions.open')"
+              @click="openIssueDialog(row as ProjectItem)"
+            >
+              <Flag :size="14" />
+            </button>
             <button
               class="data-table__actions-btn"
               type="button"
@@ -483,6 +525,14 @@ onMounted(() => {
         </button>
       </template>
     </Modal>
+
+    <IssueMarkerDialog
+      :open="showIssueDialog"
+      :project-id="issueTarget?.id ?? null"
+      :context-label="issueTarget?.filename ?? ''"
+      @close="showIssueDialog = false"
+      @saved="handleIssueSaved"
+    />
   </div>
 </template>
 
@@ -523,6 +573,26 @@ onMounted(() => {
   display: flex;
   gap: 4px;
   justify-content: center;
+}
+
+.issue-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.issue-badge.is-active {
+  border-color: color-mix(in srgb, var(--state-warning) 45%, var(--line-soft));
+  background: var(--state-warning-bg);
+  color: var(--state-warning);
 }
 
 .project-status {

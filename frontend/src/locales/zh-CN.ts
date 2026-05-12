@@ -249,6 +249,7 @@ export default {
     },
     tabs: {
       files: '文件',
+      issues: '问题',
       settings: '项目设置',
       stats: '统计',
       summary: '汇总',
@@ -664,6 +665,70 @@ export default {
     replyPlaceholder: '输入回复内容',
     sendReply: '发送回复',
     sendingReply: '发送中...',
+  },
+  issueMarker: {
+    dialogTitle: '标记问题',
+    dialogDescription: '记录灰度测试中遇到的问题，后续可按项目和任务定位处理。',
+    dialogDescriptionWithContext: '当前标记对象：{context}',
+    hint: '系统会自动记录当前页面地址和浏览器信息，便于复现问题。',
+    fields: {
+      title: '问题标题',
+      category: '问题类型',
+      severity: '严重程度',
+      description: '问题描述',
+    },
+    placeholders: {
+      title: '可选，例如：导出后表格错位',
+      description: '请描述出现问题的操作步骤、现象、期望结果，必要时补充文件名或句段位置。',
+    },
+    categories: {
+      bug: '功能异常',
+      translation: '译文问题',
+      format: '格式问题',
+      performance: '性能问题',
+      data: '数据问题',
+      other: '其他',
+    },
+    severity: {
+      low: '轻微',
+      medium: '一般',
+      high: '严重',
+      critical: '阻断',
+    },
+    status: {
+      open: '待处理',
+      resolved: '已解决',
+    },
+    actions: {
+      open: '标记问题',
+      submit: '提交标记',
+      resolve: '标为已解决',
+      reopen: '重新打开',
+    },
+    list: {
+      title: '问题记录',
+      description: '汇总用户在项目和文件任务中提交的问题标记。',
+      empty: '当前还没有问题标记。',
+      openCount: '待处理 {count} 条',
+      totalCount: '全部 {count} 条',
+      fileScope: '任务：{name}',
+      projectScope: '项目级',
+      reporter: '提交人',
+      createdAt: '提交时间',
+    },
+    badge: {
+      open: '{count} 个问题',
+      none: '无问题',
+    },
+    errors: {
+      missingProject: '缺少项目上下文，无法提交问题标记。',
+      requiredDescription: '请输入问题描述。',
+      save: '问题标记提交失败。',
+    },
+    messages: {
+      saved: '问题标记已提交。',
+      updated: '问题状态已更新。',
+    },
   },
   resourceImport: {
     title: '导入语言资产',
