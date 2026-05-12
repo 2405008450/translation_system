@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
-from sqlalchemy import case, func
+from sqlalchemy import case, event, func, update
 from sqlalchemy.orm import Session
 
 from app.models import FileRecord, Segment, TranslationMemory, User
@@ -30,6 +30,33 @@ SEGMENT_ORDERING = (
     Segment.cell_index.asc().nullsfirst(),
     Segment.sentence_id.asc(),
 )
+
+_PENDING_SOURCE_FILES_KEY = "pending_source_files"
+
+
+@event.listens_for(Session, "after_commit")
+def _clear_committed_source_files(session: Session) -> None:
+    session.info.pop(_PENDING_SOURCE_FILES_KEY, None)
+
+
+@event.listens_for(Session, "after_rollback")
+def _cleanup_rolled_back_source_files(session: Session) -> None:
+    pending_source_files = session.info.pop(_PENDING_SOURCE_FILES_KEY, [])
+    for file_record_id, filename in pending_source_files:
+        try:
+            delete_source_file(file_record_id, filename)
+        except Exception:
+            logger.warning(
+                "failed to cleanup rolled back source file file_record_id=%s filename=%s",
+                file_record_id,
+                filename,
+                exc_info=True,
+            )
+
+
+def _remember_pending_source_file(db: Session, file_record_id: UUID, filename: str) -> None:
+    pending_source_files = db.info.setdefault(_PENDING_SOURCE_FILES_KEY, [])
+    pending_source_files.append((file_record_id, filename))
 
 
 def calculate_file_record_progress(total_segments: int, translated_segments: int) -> int:
@@ -64,18 +91,39 @@ def get_file_record_segment_counts(db: Session, file_record_id: UUID) -> tuple[i
 
 
 def sync_file_record_status(db: Session, file_record_id: UUID) -> str | None:
-    file_record = get_file_record(db, file_record_id)
-    if not file_record:
-        return None
-
     db.flush()
-    total_segments, translated_segments = get_file_record_segment_counts(db, file_record_id)
-    file_record.status = resolve_file_record_status(
-        file_record.status,
-        total_segments,
-        translated_segments,
+    total_segments = (
+        db.query(func.count(Segment.id))
+        .filter(Segment.file_record_id == file_record_id)
+        .scalar_subquery()
     )
-    return file_record.status
+    translated_segments = (
+        db.query(func.count(Segment.id))
+        .filter(
+            Segment.file_record_id == file_record_id,
+            Segment.target_text != "",
+        )
+        .scalar_subquery()
+    )
+    status_expr = case(
+        (FileRecord.status == "error", FileRecord.status),
+        (
+            total_segments > 0,
+            case(
+                (translated_segments >= total_segments, "completed"),
+                else_="in_progress",
+            ),
+        ),
+        else_=FileRecord.status,
+    )
+    result = db.execute(
+        update(FileRecord)
+        .where(FileRecord.id == file_record_id)
+        .values(status=status_expr)
+        .returning(FileRecord.status)
+        .execution_options(synchronize_session="fetch")
+    )
+    return result.scalar_one_or_none()
 
 
 def _count_filled_targets(items: list[dict]) -> int:
@@ -161,17 +209,10 @@ def _create_file_record_from_workspace(
         _count_filled_targets(workspace_data["segments"]),
     )
 
-    try:
-        if raw_bytes is not None:
-            save_source_file(file_record.id, filename, raw_bytes)
-        db.commit()
-    except Exception:
-        db.rollback()
-        if raw_bytes is not None:
-            delete_source_file(file_record.id, filename)
-        raise
-
-    db.refresh(file_record)
+    if raw_bytes is not None:
+        save_source_file(file_record.id, filename, raw_bytes)
+        _remember_pending_source_file(db, file_record.id, filename)
+    db.flush()
     return file_record
 
 
@@ -271,14 +312,21 @@ def create_file_record_via_adapter(
         "document_html": "",
         "segments": segments_data,
     }
-    return create_file_record_with_segments(
-        db=db,
-        raw_bytes=raw_bytes,
-        filename=filename,
-        similarity_threshold=similarity_threshold,
-        workspace_data=workspace_data,
-        collection_ids=collection_ids,
-    )
+    try:
+        file_record = create_file_record_with_segments(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            similarity_threshold=similarity_threshold,
+            workspace_data=workspace_data,
+            collection_ids=collection_ids,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(file_record)
+    return file_record
 
 
 def get_file_record(db: Session, file_record_id: UUID) -> FileRecord | None:

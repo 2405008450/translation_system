@@ -23,6 +23,11 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 
+import {
+  isImportTaskAccepted,
+  waitForImportTask,
+  type ImportTaskAccepted,
+} from '../api/importTasks'
 import { http } from '../api/http'
 import DataTable from '../components/DataTable.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
@@ -520,14 +525,19 @@ async function uploadSourceDocument() {
     formData.append('target_language', uploadTargetLanguage.value)
     formData.append('document_parse_mode', 'full')
 
-    await http.post(`/projects/${props.id}/source-document`, formData, {
+    const { data } = await http.post<unknown | ImportTaskAccepted>(`/projects/${props.id}/source-document`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
       onUploadProgress: (event) => {
         const total = event.total || 0
         const loaded = event.loaded || 0
-        uploadPercent.value = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0
+        uploadPercent.value = total > 0 ? Math.min(40, Math.round((loaded / total) * 40)) : 0
       },
     })
+    if (isImportTaskAccepted(data)) {
+      await waitForImportTask(data.task_id, (status) => {
+        uploadPercent.value = Math.min(100, 40 + Math.round(status.progress * 0.6))
+      })
+    }
 
     await loadProject()
     showUploadModal.value = false

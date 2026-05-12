@@ -3,23 +3,27 @@ API 路由模块 - 文件上传、解析和导出接口
 
 支持多种文档格式的上传、解析和导出。
 """
+import asyncio
 import json
+import logging
 from datetime import datetime
+from functools import partial
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
-from urllib.parse import quote
-from uuid import UUID
+from typing import Any, Dict, List, Literal, Optional
+from urllib.parse import quote, unquote, urlparse
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user, get_user_display_name, require_admin
-from app.database import get_db
+from app.config import get_settings
+from app.database import SessionLocal, get_db
 from app.models import (
     FileRecord,
     MemoryBase,
@@ -52,6 +56,8 @@ from app.services.comment_service import (
     serialize_segment_comment,
     update_segment_comment,
 )
+from app.services.cache import get_json as cache_get_json
+from app.services.cache import set_json as cache_set_json
 from app.services.file_record_service import (
     batch_update_segments,
     calculate_file_record_progress,
@@ -117,8 +123,396 @@ from app.services.tm_importer import (
 from app.services.tm_vector import sync_tm_embeddings
 from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_response
 
+try:
+    from arq import create_pool as arq_create_pool
+    from arq.connections import RedisSettings
+except ModuleNotFoundError:  # pragma: no cover - 本地未安装 ARQ 时使用 FastAPI 后台任务兜底
+    arq_create_pool = None
+    RedisSettings = None
 
+
+logger = logging.getLogger(__name__)
 router = APIRouter(dependencies=[Depends(get_current_user)])
+
+
+def _build_task_workspace_with_new_session(
+    raw_bytes: bytes,
+    filename: str,
+    similarity_threshold: float,
+    collection_ids: list[UUID] | None,
+    document_parse_mode: str,
+) -> dict:
+    with SessionLocal() as workspace_db:
+        return build_task_workspace(
+            db=workspace_db,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            similarity_threshold=similarity_threshold,
+            collection_ids=collection_ids,
+            document_parse_mode=document_parse_mode,
+        )
+
+
+async def _build_task_workspace_async(
+    raw_bytes: bytes,
+    filename: str,
+    similarity_threshold: float,
+    collection_ids: list[UUID] | None = None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+) -> dict:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        partial(
+            _build_task_workspace_with_new_session,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            similarity_threshold=similarity_threshold,
+            collection_ids=collection_ids,
+            document_parse_mode=document_parse_mode,
+        ),
+    )
+
+
+def _begin_repeatable_read_snapshot(db: Session) -> None:
+    if db.get_bind().dialect.name == "postgresql":
+        db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+
+
+IMPORT_TASK_TTL_SECONDS = 24 * 60 * 60
+
+
+def _import_task_cache_key(task_id: str) -> str:
+    return f"import-task:{task_id}"
+
+
+def _set_import_task_status(
+    task_id: str,
+    status: Literal["queued", "running", "completed", "failed"],
+    *,
+    progress: int = 0,
+    message: str = "",
+    result: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "task_id": task_id,
+        "status": status,
+        "progress": max(0, min(100, int(progress))),
+        "message": message,
+        "result": result,
+        "error": error,
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    cache_set_json(_import_task_cache_key(task_id), payload, ttl_seconds=IMPORT_TASK_TTL_SECONDS)
+    return payload
+
+
+def _get_import_task_status(task_id: str) -> dict[str, Any] | None:
+    payload = cache_get_json(_import_task_cache_key(task_id))
+    return payload if isinstance(payload, dict) else None
+
+
+def _build_arq_redis_settings(redis_url: str):
+    if RedisSettings is None:
+        return None
+
+    parsed = urlparse(redis_url)
+    database = int((parsed.path or "/0").lstrip("/") or "0")
+    kwargs = {
+        "host": parsed.hostname or "localhost",
+        "port": parsed.port or 6379,
+        "database": database,
+        "password": unquote(parsed.password) if parsed.password else None,
+        "ssl": parsed.scheme == "rediss",
+    }
+    if parsed.username:
+        kwargs["username"] = unquote(parsed.username)
+    try:
+        return RedisSettings(**kwargs)
+    except TypeError:
+        kwargs.pop("username", None)
+        return RedisSettings(**kwargs)
+
+
+async def _close_arq_pool(redis_pool) -> None:
+    close = getattr(redis_pool, "close", None)
+    if close is not None:
+        close_result = close()
+        if asyncio.iscoroutine(close_result):
+            await close_result
+
+    wait_closed = getattr(redis_pool, "wait_closed", None)
+    if wait_closed is not None:
+        wait_result = wait_closed()
+        if asyncio.iscoroutine(wait_result):
+            await wait_result
+
+
+async def _enqueue_arq_import_task(task_id: str, payload: dict[str, Any]) -> bool:
+    settings = get_settings()
+    if settings.import_queue_backend.lower() != "arq":
+        return False
+    if not settings.redis_url or arq_create_pool is None:
+        return False
+
+    redis_settings = _build_arq_redis_settings(settings.redis_url)
+    if redis_settings is None:
+        return False
+
+    redis_pool = None
+    try:
+        redis_pool = await arq_create_pool(redis_settings)
+        await redis_pool.enqueue_job("process_import_task_job", task_id, payload)
+        return True
+    except Exception:
+        logger.warning("enqueue ARQ import task failed, fallback to local background task", exc_info=True)
+        return False
+    finally:
+        if redis_pool is not None:
+            await _close_arq_pool(redis_pool)
+
+
+async def _queue_import_task(
+    background_tasks: BackgroundTasks,
+    payload: dict[str, Any],
+) -> JSONResponse:
+    task_id = str(uuid4())
+    _set_import_task_status(task_id, "queued", progress=0, message="任务已进入导入队列。")
+    if not await _enqueue_arq_import_task(task_id, payload):
+        background_tasks.add_task(_run_import_task, task_id, payload)
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "task_id": task_id,
+            "status": "queued",
+            "progress": 0,
+            "message": "任务已进入导入队列。",
+        },
+    )
+
+
+def _uuid_list(values: list[str] | None) -> list[UUID]:
+    return [UUID(value) for value in values or []]
+
+
+def _serialize_file_record_upload_result(file_record: FileRecord) -> dict[str, Any]:
+    return {
+        "id": str(file_record.id),
+        "filename": file_record.filename,
+        "status": file_record.status,
+        "document_parse_mode": file_record.document_parse_mode,
+        "created_at": file_record.created_at.isoformat(),
+    }
+
+
+def _json_ready_project_file_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    for key in ("collection_id", "term_base_id"):
+        if payload.get(key) is not None:
+            payload[key] = str(payload[key])
+    return payload
+
+
+def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
+    file_payload = payload["file"]
+    raw_bytes = file_payload["content"]
+    filename = file_payload["filename"] or "untitled.txt"
+    selected_collection_ids = _uuid_list(payload.get("collection_ids"))
+    term_base_id = UUID(payload["term_base_id"]) if payload.get("term_base_id") else None
+    document_parse_mode = payload.get("document_parse_mode") or DOCUMENT_PARSE_MODE_FULL
+    threshold = float(payload.get("threshold", 0.6))
+
+    primary_collection = _get_collection_or_404(
+        db,
+        selected_collection_ids[0] if selected_collection_ids else None,
+    )
+    resolved_source_language, resolved_target_language = _resolve_upload_language_pair(
+        payload.get("source_language"),
+        payload.get("target_language"),
+        primary_collection,
+    )
+
+    term_base = None
+    if term_base_id is not None:
+        term_base = db.query(TermBase).filter(TermBase.id == term_base_id).first()
+        if term_base is None:
+            raise HTTPException(status_code=404, detail="术语库不存在。")
+        _ensure_resource_language_pair_matches(
+            term_base,
+            resolved_source_language,
+            resolved_target_language,
+            "术语库",
+        )
+
+    workspace_data = build_task_workspace(
+        db=db,
+        raw_bytes=raw_bytes,
+        filename=filename,
+        similarity_threshold=threshold,
+        collection_ids=selected_collection_ids,
+        document_parse_mode=document_parse_mode,
+    )
+    file_record = create_file_record_with_segments(
+        db=db,
+        raw_bytes=raw_bytes,
+        filename=filename,
+        similarity_threshold=threshold,
+        workspace_data=workspace_data,
+        collection_ids=selected_collection_ids,
+        document_parse_mode=document_parse_mode,
+    )
+    if selected_collection_ids:
+        file_record.collection_id = selected_collection_ids[0]
+        _apply_collection_language_pair(file_record, primary_collection)
+    file_record.source_language = resolved_source_language
+    file_record.target_language = resolved_target_language
+    if term_base is not None:
+        file_record.term_base_id = term_base_id
+
+    db.commit()
+    db.refresh(file_record)
+    return _serialize_file_record_upload_result(file_record)
+
+
+def _process_project_source_import(db: Session, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    project_id = UUID(payload["project_id"])
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+
+    selected_collection_ids = _uuid_list(payload.get("collection_ids"))
+    term_base_id = UUID(payload["term_base_id"]) if payload.get("term_base_id") else None
+    document_parse_mode = payload.get("document_parse_mode") or DOCUMENT_PARSE_MODE_FULL
+    threshold = float(payload.get("threshold", 0.6))
+    primary_collection = _get_collection_or_404(
+        db,
+        selected_collection_ids[0] if selected_collection_ids else None,
+    )
+    resolved_source_language, resolved_target_language = _resolve_upload_language_pair(
+        payload.get("source_language"),
+        payload.get("target_language"),
+        primary_collection,
+    )
+
+    term_base = None
+    if term_base_id is not None:
+        term_base = db.query(TermBase).filter(TermBase.id == term_base_id).first()
+        if term_base is None:
+            raise HTTPException(status_code=404, detail="术语库不存在。")
+        _ensure_resource_language_pair_matches(
+            term_base,
+            resolved_source_language,
+            resolved_target_language,
+            "术语库",
+        )
+
+    file_payloads = payload["files"]
+    created_files: list[FileRecord] = []
+    for index, file_payload in enumerate(file_payloads, start=1):
+        filename = file_payload["filename"] or "source.txt"
+        _set_import_task_status(
+            task_id,
+            "running",
+            progress=10 + int((index - 1) / max(len(file_payloads), 1) * 80),
+            message=f"正在解析 {filename}",
+        )
+        workspace_data = build_task_workspace(
+            db=db,
+            raw_bytes=file_payload["content"],
+            filename=filename,
+            similarity_threshold=threshold,
+            collection_ids=selected_collection_ids,
+            document_parse_mode=document_parse_mode,
+        )
+        file_record = create_file_record_with_segments(
+            db=db,
+            raw_bytes=file_payload["content"],
+            filename=filename,
+            similarity_threshold=threshold,
+            workspace_data=workspace_data,
+            collection_ids=selected_collection_ids,
+            document_parse_mode=document_parse_mode,
+        )
+        file_record.project_id = project.id
+        file_record.creator_id = project.creator_id
+        file_record.deadline = project.deadline
+        file_record.access_level = project.access_level
+        file_record.source_language = resolved_source_language
+        file_record.target_language = resolved_target_language
+        if selected_collection_ids:
+            file_record.collection_id = selected_collection_ids[0]
+        if term_base is not None:
+            file_record.term_base_id = term_base_id
+        created_files.append(file_record)
+
+    project.status = "in_progress"
+    db.commit()
+    for file_record in created_files:
+        db.refresh(file_record)
+
+    file_stats = _get_file_segment_stats(db, [file_record.id for file_record in created_files])
+    return {
+        "id": str(project.id),
+        "status": project.status,
+        "filename": project.name,
+        "uploaded_count": len(created_files),
+        "files": [
+            _json_ready_project_file_payload(
+                _build_project_file_payload(
+                    file_record=file_record,
+                    total_segments=file_stats.get(file_record.id, {"total": 0})["total"],
+                    translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
+                )
+            )
+            for file_record in created_files
+        ],
+    }
+
+
+def _run_import_task(task_id: str, payload: dict[str, Any]) -> None:
+    _set_import_task_status(task_id, "running", progress=5, message="导入任务开始处理。")
+    with SessionLocal() as db:
+        try:
+            if payload.get("kind") == "project_source_document":
+                result = _process_project_source_import(db, task_id, payload)
+            else:
+                result = _process_file_record_import(db, payload)
+            _set_import_task_status(
+                task_id,
+                "completed",
+                progress=100,
+                message="导入完成。",
+                result=result,
+            )
+        except HTTPException as exc:
+            db.rollback()
+            _set_import_task_status(
+                task_id,
+                "failed",
+                progress=100,
+                message="导入失败。",
+                error=str(exc.detail),
+            )
+        except Exception as exc:
+            db.rollback()
+            logger.exception("import task failed task_id=%s", task_id)
+            _set_import_task_status(
+                task_id,
+                "failed",
+                progress=100,
+                message="导入失败。",
+                error=str(exc),
+            )
+
+
+async def process_import_task_job(ctx, task_id: str, payload: dict[str, Any]) -> None:
+    await asyncio.to_thread(_run_import_task, task_id, payload)
+
+
+class WorkerSettings:
+    functions = [process_import_task_job]
+    redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
 
 
 class SegmentUpdate(BaseModel):
@@ -758,12 +1152,12 @@ async def upload_for_workspace(
     selected_collection_ids = _validate_collection_ids(db, collection_ids)
     required_collection_ids = _require_selected_collection_ids(selected_collection_ids)
     try:
-        return build_task_workspace(
-            db=db,
+        return await _build_task_workspace_async(
             raw_bytes=raw_bytes,
             filename=file.filename or "untitled.txt",
             similarity_threshold=threshold,
             collection_ids=required_collection_ids,
+            document_parse_mode=DOCUMENT_PARSE_MODE_FULL,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -824,6 +1218,14 @@ async def get_supported_formats():
         "formats": formats,
         "total": len(formats),
     }
+
+
+@router.get("/import-tasks/{task_id}")
+def get_import_task(task_id: str):
+    status = _get_import_task_status(task_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="导入任务不存在或已过期。")
+    return status
 
 
 # ============== 适配器导出相关模型 ==============
@@ -1080,6 +1482,7 @@ async def import_xliff(file: UploadFile = File(...)):
 @router.post("/file-records")
 @router.post("/documents", include_in_schema=False)
 async def create_file_record(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     threshold: float = Form(default=0.6),
     collection_ids: list[UUID] | None = Form(default=None),
@@ -1120,47 +1523,20 @@ async def create_file_record(
             "术语库",
         )
 
-    try:
-        workspace_data = build_task_workspace(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=file.filename or "untitled.txt",
-            similarity_threshold=threshold,
-            collection_ids=selected_collection_ids,
-            document_parse_mode=document_parse_mode,
-        )
-        file_record = create_file_record_with_segments(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=file.filename or "untitled.txt",
-            similarity_threshold=threshold,
-            workspace_data=workspace_data,
-            collection_ids=selected_collection_ids,
-            document_parse_mode=document_parse_mode,
-        )
-        # 写入绑定关系
-        if selected_collection_ids:
-            file_record.collection_id = selected_collection_ids[0]
-            _apply_collection_language_pair(file_record, primary_collection)
-        file_record.source_language = resolved_source_language
-        file_record.target_language = resolved_target_language
-        if term_base is not None:
-            file_record.term_base_id = term_base_id
-        db.commit()
-        return {
-            "id": file_record.id,
-            "filename": file_record.filename,
-            "status": file_record.status,
-            "document_parse_mode": file_record.document_parse_mode,
-            "created_at": file_record.created_at.isoformat(),
-        }
-    except (UnsupportedFormatError, FileTooLargeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except ParseError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    payload = {
+        "kind": "file_record",
+        "file": {
+            "filename": file.filename or "untitled.txt",
+            "content": raw_bytes,
+        },
+        "threshold": threshold,
+        "collection_ids": [str(collection_id) for collection_id in selected_collection_ids],
+        "term_base_id": str(term_base_id) if term_base_id is not None else None,
+        "source_language": resolved_source_language,
+        "target_language": resolved_target_language,
+        "document_parse_mode": document_parse_mode,
+    }
+    return await _queue_import_task(background_tasks, payload)
 
 
 @router.post("/projects")
@@ -1487,6 +1863,7 @@ async def detect_project_source_language(
 @router.post("/projects/{project_id}/source-document")
 async def upload_project_source_document(
     project_id: UUID,
+    background_tasks: BackgroundTasks,
     files: list[UploadFile] | None = File(default=None),
     file: UploadFile | None = File(default=None),
     threshold: float = Form(default=0.6),
@@ -1533,76 +1910,30 @@ async def upload_project_source_document(
             "术语库",
         )
 
-    created_files = []
-    try:
-        for upload_file in uploaded_files:
-            raw_bytes = await upload_file.read()
-            if not raw_bytes:
-                raise HTTPException(status_code=400, detail=f"{upload_file.filename or '文件'} 为空。")
+    queued_files = []
+    for upload_file in uploaded_files:
+        raw_bytes = await upload_file.read()
+        if not raw_bytes:
+            raise HTTPException(status_code=400, detail=f"{upload_file.filename or '文件'} 为空。")
+        queued_files.append(
+            {
+                "filename": upload_file.filename or "source.txt",
+                "content": raw_bytes,
+            }
+        )
 
-            filename = upload_file.filename or "source.txt"
-            workspace_data = build_task_workspace(
-                db=db,
-                raw_bytes=raw_bytes,
-                filename=filename,
-                similarity_threshold=threshold,
-                collection_ids=selected_collection_ids,
-                document_parse_mode=document_parse_mode,
-            )
-            file_record = create_file_record_with_segments(
-                db=db,
-                raw_bytes=raw_bytes,
-                filename=filename,
-                similarity_threshold=threshold,
-                workspace_data=workspace_data,
-                collection_ids=selected_collection_ids,
-                document_parse_mode=document_parse_mode,
-            )
-            file_record.project_id = project.id
-            file_record.creator_id = project.creator_id
-            file_record.deadline = project.deadline
-            file_record.access_level = project.access_level
-            file_record.source_language = resolved_source_language
-            file_record.target_language = resolved_target_language
-            if selected_collection_ids:
-                file_record.collection_id = selected_collection_ids[0]
-            if term_base is not None:
-                file_record.term_base_id = term_base_id
-            db.commit()
-            db.refresh(file_record)
-            created_files.append(file_record)
-
-        project.status = "in_progress"
-        db.commit()
-    except HTTPException:
-        db.rollback()
-        raise
-    except (UnsupportedFormatError, FileTooLargeError, ValueError) as exc:
-        db.rollback()
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except ParseError as exc:
-        db.rollback()
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    file_stats = _get_file_segment_stats(db, [file_record.id for file_record in created_files])
-
-    return {
-        "id": str(project.id),
-        "status": project.status,
-        "filename": project.name,
-        "uploaded_count": len(created_files),
-        "files": [
-            _build_project_file_payload(
-                file_record=file_record,
-                total_segments=file_stats.get(file_record.id, {"total": 0})["total"],
-                translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
-            )
-            for file_record in created_files
-        ],
+    payload = {
+        "kind": "project_source_document",
+        "project_id": str(project.id),
+        "files": queued_files,
+        "threshold": threshold,
+        "collection_ids": [str(collection_id) for collection_id in selected_collection_ids],
+        "term_base_id": str(term_base_id) if term_base_id is not None else None,
+        "source_language": resolved_source_language,
+        "target_language": resolved_target_language,
+        "document_parse_mode": document_parse_mode,
     }
+    return await _queue_import_task(background_tasks, payload)
 
 
 @router.get("/projects")
@@ -2018,6 +2349,7 @@ def export_file_record_docx(
     file_record_id: UUID,
     db: Session = Depends(get_db),
 ):
+    _begin_repeatable_read_snapshot(db)
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="File record not found.")
@@ -2084,6 +2416,7 @@ def export_file_record_with_type(
     """
     from app.services.adapters import export_file
 
+    _begin_repeatable_read_snapshot(db)
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")

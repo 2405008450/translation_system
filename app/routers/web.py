@@ -375,13 +375,19 @@ async def upload_and_match(
         route_match_ms = (perf_counter() - workspace_started_at) * 1000
 
         # 使用预计算的 workspace 数据创建持久化文档，避免重复解析和匹配
-        file_record = create_file_record_with_segments(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=file.filename or "untitled.docx",
-            similarity_threshold=threshold,
-            workspace_data=workspace_data,
-        )
+        try:
+            file_record = create_file_record_with_segments(
+                db=db,
+                raw_bytes=raw_bytes,
+                filename=file.filename or "untitled.docx",
+                similarity_threshold=threshold,
+                workspace_data=workspace_data,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        db.refresh(file_record)
         file_record_id = file_record.id
 
         document_html = workspace_data["document_html"]
