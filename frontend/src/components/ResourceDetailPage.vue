@@ -5,10 +5,14 @@ import {
   ChevronDown,
   Download,
   Loader2,
+  Pencil,
   Plus,
   Search,
+  Save,
   TableProperties,
+  Trash2,
   Upload,
+  X,
 } from 'lucide-vue-next'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
@@ -17,6 +21,8 @@ import { http } from '../api/http'
 import Modal from '../components/base/Modal.vue'
 import Pagination from '../components/Pagination.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
+import { useConfirm } from '../composables/useConfirm'
+import { usePageHeader } from '../composables/usePageHeader'
 import { getLanguageLabel } from '../constants/languages'
 import type { PaginatedResponse, TermBase, TermEntryRecord, TMCollection, TMEntryRecord } from '../types/api'
 import { downloadBlob } from '../utils/download'
@@ -31,12 +37,15 @@ const props = defineProps<{
 }>()
 
 const router = useRouter()
+const confirm = useConfirm()
 
 const resource = ref<ResourceRecord | null>(null)
 const entries = ref<EntryRecord[]>([])
 const loadingResource = ref(false)
 const loadingEntries = ref(false)
 const creatingEntry = ref(false)
+const updatingEntryId = ref('')
+const deletingEntryId = ref('')
 const exportingEntries = ref(false)
 const pageError = ref('')
 const entryMessage = ref('')
@@ -54,15 +63,21 @@ const showSourceColumn = ref(true)
 const showTargetColumn = ref(true)
 const newSourceText = ref('')
 const newTargetText = ref('')
+const editingEntryId = ref('')
+const editSourceText = ref('')
+const editTargetText = ref('')
 let searchTimer: number | null = null
 
 const copy = computed(() => {
   if (props.mode === 'tm') {
     return {
       backRoute: 'tm',
+      backLabel: '返回记忆库',
       titlePrefix: '记忆库名称：',
       fallbackTitle: '记忆库详情',
       detailTitle: '记忆库详情',
+      description: '维护记忆库信息、双语条目和导入导出操作。',
+      assetLabel: '记忆库',
       entryName: '记录',
       entryCountLabel: '条目数',
       addTitle: '添加记忆库条目',
@@ -78,14 +93,19 @@ const copy = computed(() => {
       entriesEndpoint: `/translation-memory/collections/${props.id}/entries`,
       createEndpoint: `/translation-memory/collections/${props.id}/entries`,
       exportEndpoint: `/translation-memory/collections/${props.id}/export-xlsx`,
+      updateEntryEndpoint: (entryId: string) => `/translation-memory/entries/${entryId}`,
+      deleteEntryEndpoint: (entryId: string) => `/translation-memory/entries/${entryId}`,
     }
   }
 
   return {
     backRoute: 'term-base',
+    backLabel: '返回术语库',
     titlePrefix: '术语库名称：',
     fallbackTitle: '术语库详情',
     detailTitle: '术语库详情',
+    description: '维护术语库信息、术语条目和导入导出操作。',
+    assetLabel: '术语库',
     entryName: '术语',
     entryCountLabel: '条目数',
     addTitle: '添加术语条目',
@@ -101,6 +121,8 @@ const copy = computed(() => {
     entriesEndpoint: `/term-bases/${props.id}/entries`,
     createEndpoint: `/term-bases/${props.id}/entries`,
     exportEndpoint: `/term-bases/${props.id}/export-xlsx`,
+    updateEntryEndpoint: (entryId: string) => `/term-entries/${entryId}`,
+    deleteEntryEndpoint: (entryId: string) => `/term-entries/${entryId}`,
   }
 })
 
@@ -108,9 +130,11 @@ const sourceLanguageCode = computed(() => resource.value?.source_language || '')
 const targetLanguageCode = computed(() => resource.value?.target_language || '')
 const sourceLanguageLabel = computed(() => getDetailLanguageLabel(sourceLanguageCode.value))
 const targetLanguageLabel = computed(() => getDetailLanguageLabel(targetLanguageCode.value))
+const pageTitle = computed(() => resource.value?.name || copy.value.fallbackTitle)
 const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
 const tableColumnCount = computed(() => (
   Number(showIndexColumn.value) + Number(showSourceColumn.value) + Number(showTargetColumn.value)
+  + 1
 ))
 const entryCount = computed(() => resource.value?.entry_count ?? totalEntries.value)
 const entryCountText = computed(() => `${entryCount.value}`)
@@ -133,6 +157,16 @@ const metaColumns = computed(() => [
     { label: '分类标签', value: resource.value?.description || '-' },
   ],
 ])
+
+usePageHeader(() => ({
+  title: pageTitle.value,
+  description: copy.value.description,
+  breadcrumbs: [
+    { label: '语言资产' },
+    { label: copy.value.assetLabel, to: { name: copy.value.backRoute } },
+    { label: pageTitle.value },
+  ],
+}))
 
 function getDetailLanguageLabel(code: string | null | undefined) {
   if (code === 'zh-CN') {
@@ -166,6 +200,12 @@ function getErrorMessage(error: unknown, fallback: string) {
 function resetAddForm() {
   newSourceText.value = ''
   newTargetText.value = ''
+}
+
+function resetEditForm() {
+  editingEntryId.value = ''
+  editSourceText.value = ''
+  editTargetText.value = ''
 }
 
 function openAddDialog() {
@@ -248,6 +288,74 @@ async function createEntry() {
   }
 }
 
+function startEditEntry(entry: EntryRecord) {
+  editingEntryId.value = entry.id
+  editSourceText.value = entry.source_text
+  editTargetText.value = entry.target_text
+  entryMessage.value = ''
+}
+
+function isEditingEntry(entry: EntryRecord) {
+  return editingEntryId.value === entry.id
+}
+
+async function updateEntry(entry: EntryRecord) {
+  const sourceText = editSourceText.value.trim()
+  const targetText = editTargetText.value.trim()
+  if (!sourceText || !targetText) {
+    entryMessage.value = '原文和译文不能为空。'
+    return
+  }
+
+  updatingEntryId.value = entry.id
+  entryMessage.value = ''
+  try {
+    await http.put<EntryRecord>(copy.value.updateEntryEndpoint(entry.id), {
+      source_text: sourceText,
+      target_text: targetText,
+    })
+    resetEditForm()
+    await reloadPage()
+    entryMessage.value = `${copy.value.entryName}已更新。`
+  } catch (error) {
+    entryMessage.value = getErrorMessage(error, `${copy.value.entryName}更新失败。`)
+  } finally {
+    updatingEntryId.value = ''
+  }
+}
+
+async function deleteEntry(entry: EntryRecord) {
+  const confirmed = await confirm({
+    title: `删除${copy.value.entryName}`,
+    message: `确定删除这条${copy.value.entryName}吗？此操作不可恢复。`,
+    confirmText: '删除',
+    danger: true,
+  })
+  if (!confirmed) {
+    return
+  }
+
+  deletingEntryId.value = entry.id
+  entryMessage.value = ''
+  try {
+    await http.delete(copy.value.deleteEntryEndpoint(entry.id))
+    if (editingEntryId.value === entry.id) {
+      resetEditForm()
+    }
+    const remainingTotal = Math.max(totalEntries.value - 1, 0)
+    const maxPage = Math.max(Math.ceil(remainingTotal / pageSize.value), 1)
+    if (currentPage.value > maxPage) {
+      currentPage.value = maxPage
+    }
+    await reloadPage()
+    entryMessage.value = `${copy.value.entryName}已删除。`
+  } catch (error) {
+    entryMessage.value = getErrorMessage(error, `${copy.value.entryName}删除失败。`)
+  } finally {
+    deletingEntryId.value = ''
+  }
+}
+
 async function exportEntries() {
   if (!resource.value) {
     return
@@ -298,6 +406,7 @@ watch(() => [props.id, props.mode] as const, () => {
   showImportDialog.value = false
   showFieldMenu.value = false
   resetAddForm()
+  resetEditForm()
   void reloadPage()
 })
 
@@ -318,7 +427,7 @@ onUnmounted(() => {
       <div class="resource-detail-topbar__identity">
         <button class="resource-detail-back" type="button" @click="goBack">
           <ArrowLeft :size="14" />
-          返回
+          {{ copy.backLabel }}
         </button>
         <span class="resource-detail-topbar__divider" aria-hidden="true" />
         <strong class="resource-detail-topbar__title">
@@ -436,6 +545,7 @@ onUnmounted(() => {
                 <th v-if="showIndexColumn" class="resource-detail-table__index">序号</th>
                 <th v-if="showSourceColumn">{{ sourceLanguageLabel }}</th>
                 <th v-if="showTargetColumn">{{ targetLanguageLabel }}</th>
+                <th class="resource-detail-table__actions">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -455,10 +565,68 @@ onUnmounted(() => {
                   {{ indexOffset + entryIndex + 1 }}
                 </td>
                 <td v-if="showSourceColumn">
-                  <span>{{ entry.source_text }}</span>
+                  <textarea
+                    v-if="isEditingEntry(entry)"
+                    v-model="editSourceText"
+                    class="resource-detail-table__textarea"
+                    rows="3"
+                    :aria-label="`编辑${copy.sourceLabel}`"
+                  />
+                  <span v-else>{{ entry.source_text }}</span>
                 </td>
                 <td v-if="showTargetColumn">
-                  <span>{{ entry.target_text }}</span>
+                  <textarea
+                    v-if="isEditingEntry(entry)"
+                    v-model="editTargetText"
+                    class="resource-detail-table__textarea"
+                    rows="3"
+                    :aria-label="`编辑${copy.targetLabel}`"
+                  />
+                  <span v-else>{{ entry.target_text }}</span>
+                </td>
+                <td class="resource-detail-table__actions">
+                  <div v-if="isEditingEntry(entry)" class="resource-detail-row-actions">
+                    <button
+                      class="resource-detail-action-button"
+                      type="button"
+                      title="保存"
+                      :disabled="updatingEntryId === entry.id"
+                      @click="updateEntry(entry)"
+                    >
+                      <Loader2 v-if="updatingEntryId === entry.id" class="lucide-spin" :size="14" />
+                      <Save v-else :size="14" />
+                    </button>
+                    <button
+                      class="resource-detail-action-button"
+                      type="button"
+                      title="取消"
+                      :disabled="updatingEntryId === entry.id"
+                      @click="resetEditForm"
+                    >
+                      <X :size="14" />
+                    </button>
+                  </div>
+                  <div v-else class="resource-detail-row-actions">
+                    <button
+                      class="resource-detail-action-button"
+                      type="button"
+                      title="编辑"
+                      :disabled="Boolean(editingEntryId) || deletingEntryId === entry.id"
+                      @click="startEditEntry(entry)"
+                    >
+                      <Pencil :size="14" />
+                    </button>
+                    <button
+                      class="resource-detail-action-button resource-detail-action-button--danger"
+                      type="button"
+                      title="删除"
+                      :disabled="Boolean(editingEntryId) || deletingEntryId === entry.id"
+                      @click="deleteEntry(entry)"
+                    >
+                      <Loader2 v-if="deletingEntryId === entry.id" class="lucide-spin" :size="14" />
+                      <Trash2 v-else :size="14" />
+                    </button>
+                  </div>
                 </td>
               </tr>
             </tbody>
@@ -537,8 +705,11 @@ onUnmounted(() => {
 <style scoped>
 .resource-detail-page {
   min-height: calc(100vh - 96px);
-  background: #ffffff;
-  color: #111827;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  color: var(--text-primary);
+  overflow: hidden;
 }
 
 .resource-detail-topbar {
@@ -547,9 +718,9 @@ onUnmounted(() => {
   justify-content: space-between;
   gap: 16px;
   min-height: 58px;
-  padding: 0 28px;
-  border-bottom: 1px solid #e5e7eb;
-  background: #ffffff;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--surface-0);
 }
 
 .resource-detail-topbar__identity,
@@ -565,13 +736,13 @@ onUnmounted(() => {
 .resource-detail-topbar__divider {
   width: 1px;
   height: 24px;
-  background: #d7dce3;
+  background: var(--line-soft);
 }
 
 .resource-detail-topbar__title {
   min-width: 0;
   overflow: hidden;
-  color: #111827;
+  color: var(--text-primary);
   font-size: 14px;
   font-weight: 600;
   text-overflow: ellipsis;
@@ -586,10 +757,10 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  border: 1px solid #d8dee8;
-  border-radius: 4px;
-  background: #ffffff;
-  color: #111827;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--button-bg);
+  color: var(--text-primary);
   font-size: 13px;
   line-height: 1;
   box-shadow: none;
@@ -599,16 +770,33 @@ onUnmounted(() => {
   min-height: 32px;
   padding: 0;
   border-color: transparent;
+  background: transparent;
+  color: var(--text-secondary);
 }
 
 .resource-detail-button {
-  min-height: 28px;
+  min-height: 32px;
   padding: 0 14px;
 }
 
 .resource-detail-button--primary {
-  border-color: #338dfb;
-  background: #338dfb;
+  border-color: var(--brand-700);
+  background: var(--brand-700);
+  color: #ffffff;
+}
+
+.resource-detail-back:hover,
+.resource-detail-button:hover:not(:disabled),
+.resource-detail-icon-button:hover,
+.resource-detail-fields__trigger:hover {
+  border-color: var(--brand-700);
+  background: var(--brand-050);
+  color: var(--brand-700);
+}
+
+.resource-detail-button--primary:hover:not(:disabled) {
+  border-color: #0b6b5b;
+  background: #0b6b5b;
   color: #ffffff;
 }
 
@@ -622,14 +810,16 @@ onUnmounted(() => {
   height: 28px;
   padding: 0;
   border-color: transparent;
+  background: transparent;
 }
 
 .resource-detail-meta {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 34px;
-  padding: 14px 28px 12px;
-  border-bottom: 10px solid #f0f0f0;
+  gap: 28px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--surface-1);
 }
 
 .resource-detail-meta__column {
@@ -644,12 +834,12 @@ onUnmounted(() => {
   gap: 14px;
   min-height: 16px;
   align-items: center;
-  color: #111827;
+  color: var(--text-primary);
   font-size: 13px;
 }
 
 .resource-detail-meta__item span {
-  color: #4b5563;
+  color: var(--text-muted);
 }
 
 .resource-detail-meta__item strong {
@@ -659,15 +849,15 @@ onUnmounted(() => {
 }
 
 .resource-detail-content {
-  padding: 14px 28px 24px;
+  padding: 16px 20px 22px;
 }
 
 .resource-detail-content h2 {
   margin: 0 0 12px;
   padding-bottom: 10px;
-  border-bottom: 1px solid #e1e5eb;
-  color: #111827;
-  font-size: 20px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--text-primary);
+  font-size: 16px;
   font-weight: 600;
 }
 
@@ -695,10 +885,10 @@ onUnmounted(() => {
   width: 100%;
   height: 28px;
   padding: 0 10px 0 32px;
-  border: 1px solid #d5dce8;
-  border-radius: 4px;
-  background: #ffffff;
-  color: #111827;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--control-bg);
+  color: var(--text-primary);
   font-size: 13px;
 }
 
@@ -708,14 +898,15 @@ onUnmounted(() => {
 
 .resource-detail-search input:focus {
   outline: none;
-  border-color: #338dfb;
+  border-color: var(--brand-700);
+  box-shadow: 0 0 0 3px rgba(13, 122, 104, 0.08);
 }
 
 .resource-detail-checkbox {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  color: #111827;
+  color: var(--text-secondary);
   font-size: 13px;
   white-space: nowrap;
 }
@@ -724,7 +915,7 @@ onUnmounted(() => {
 .resource-detail-fields__menu input {
   width: 14px;
   height: 14px;
-  accent-color: #338dfb;
+  accent-color: var(--brand-700);
 }
 
 .resource-detail-fields {
@@ -735,7 +926,7 @@ onUnmounted(() => {
   min-height: 28px;
   padding: 0;
   border-color: transparent;
-  color: #111827;
+  color: var(--text-secondary);
 }
 
 .resource-detail-fields__menu {
@@ -747,10 +938,10 @@ onUnmounted(() => {
   right: 0;
   min-width: 150px;
   padding: 10px;
-  border: 1px solid #d8dee8;
+  border: 1px solid var(--line-soft);
   border-radius: 6px;
-  background: #ffffff;
-  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.12);
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-soft);
 }
 
 .resource-detail-fields__menu label {
@@ -763,8 +954,9 @@ onUnmounted(() => {
 
 .resource-detail-table-wrap {
   overflow-x: auto;
-  border: 1px solid #e1e5eb;
-  background: #ffffff;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-0);
 }
 
 .resource-detail-table {
@@ -778,10 +970,10 @@ onUnmounted(() => {
 .resource-detail-table th {
   height: 36px;
   padding: 0 10px;
-  border-right: 1px solid #e1e5eb;
-  border-bottom: 1px solid #e1e5eb;
-  background: #f4f5f7;
-  color: #111827;
+  border-right: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--brand-050);
+  color: var(--text-secondary);
   font-weight: 600;
   text-align: left;
 }
@@ -794,9 +986,9 @@ onUnmounted(() => {
 .resource-detail-table td {
   min-height: 44px;
   padding: 12px 10px;
-  border-right: 1px solid #edf0f5;
-  border-bottom: 1px solid #edf0f5;
-  color: #111827;
+  border-right: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--text-primary);
   vertical-align: top;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -807,9 +999,15 @@ onUnmounted(() => {
   text-align: center !important;
 }
 
+.resource-detail-table__actions {
+  width: 96px;
+  text-align: center !important;
+  vertical-align: middle !important;
+}
+
 .resource-detail-table__empty {
   height: 60px;
-  color: #6b7280;
+  color: var(--text-muted);
   text-align: center !important;
   vertical-align: middle !important;
 }
@@ -817,6 +1015,66 @@ onUnmounted(() => {
 .resource-detail-table__empty svg {
   margin-right: 8px;
   vertical-align: middle;
+}
+
+.resource-detail-table__textarea {
+  width: 100%;
+  min-height: 74px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--control-bg);
+  color: var(--text-primary);
+  font: inherit;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.resource-detail-table__textarea:focus {
+  outline: none;
+  border-color: var(--brand-700);
+  box-shadow: 0 0 0 3px rgba(13, 122, 104, 0.08);
+}
+
+.resource-detail-row-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+
+.resource-detail-action-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.resource-detail-action-button:not(:disabled):hover {
+  border-color: var(--line-strong);
+  background: var(--brand-050);
+  color: var(--brand-700);
+}
+
+.resource-detail-action-button--danger {
+  color: var(--state-danger);
+}
+
+.resource-detail-action-button--danger:not(:disabled):hover {
+  border-color: rgba(194, 59, 63, 0.24);
+  background: var(--state-danger-bg);
+  color: var(--state-danger);
+}
+
+.resource-detail-action-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 .resource-detail-add-form {
@@ -835,7 +1093,7 @@ onUnmounted(() => {
   justify-content: center;
   gap: 8px;
   min-height: 240px;
-  color: #6b7280;
+  color: var(--text-muted);
 }
 
 @media (max-width: 900px) {

@@ -362,6 +362,15 @@ function goToAssets() {
   void router.push({ name: 'tm' })
 }
 
+function openProjectDetail(row: ProjectRow) {
+  closeActionMenu()
+  void router.push({
+    name: 'project-detail',
+    params: { id: row.id },
+    query: { from: 'tasks' },
+  })
+}
+
 watch(searchQuery, () => {
   if (searchTimer) {
     clearTimeout(searchTimer)
@@ -631,7 +640,7 @@ onBeforeUnmount(() => {
               <button
                 class="text-link project-link"
                 type="button"
-                @click="router.push({ name: 'project-detail', params: { id: row.id } })"
+                @click="openProjectDetail(row as ProjectRow)"
               >
                 {{ row.filename }}
               </button>
@@ -675,7 +684,7 @@ onBeforeUnmount(() => {
                   type="button"
                   :title="t('taskList.actions.continue')"
                   :aria-label="t('taskList.actions.continue')"
-                  @click="router.push({ name: 'project-detail', params: { id: row.id } })"
+                  @click="openProjectDetail(row as ProjectRow)"
                 >
                   <ArrowRight :size="16" />
                 </button>
@@ -690,7 +699,7 @@ onBeforeUnmount(() => {
                     <MoreHorizontal :size="16" />
                   </button>
                   <div v-if="openActionMenuId === row.id" class="task-action-menu__dropdown">
-                    <button type="button" @click="router.push({ name: 'project-detail', params: { id: row.id } }); closeActionMenu()">
+                    <button type="button" @click="openProjectDetail(row as ProjectRow)">
                       {{ t('taskList.actions.details') }}
                     </button>
                     <button

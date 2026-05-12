@@ -69,6 +69,28 @@ def save_guideline_template(filename: str, raw_bytes: bytes) -> GuidelineTemplat
     return _read_template_from_path(target_path)
 
 
+def update_guideline_template(template_id: str, content: str) -> GuidelineTemplate:
+    path = _resolve_template_path(template_id)
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError("翻译细则模板不存在。")
+
+    normalized_content = (content or "").strip()
+    if not normalized_content:
+        raise ValueError("翻译规则内容不能为空。")
+    if len(normalized_content.encode("utf-8")) > MAX_GUIDELINE_TEMPLATE_BYTES:
+        raise ValueError("翻译规则内容过大，请控制在 256KB 以内。")
+
+    path.write_text(normalized_content + "\n", encoding="utf-8")
+    return _read_template_from_path(path)
+
+
+def delete_guideline_template(template_id: str) -> None:
+    path = _resolve_template_path(template_id)
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError("翻译细则模板不存在。")
+    path.unlink()
+
+
 def _decode_text(raw_bytes: bytes) -> str:
     for encoding in ("utf-8-sig", "utf-8", "gb18030"):
         try:

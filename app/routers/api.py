@@ -70,9 +70,11 @@ from app.services.file_record_service import (
 )
 from app.services.guideline_repository import (
     GuidelineTemplate,
+    delete_guideline_template,
     list_guideline_templates,
     read_guideline_template,
     save_guideline_template,
+    update_guideline_template,
 )
 from app.services.llm_service import (
     LLMConfigurationError,
@@ -81,6 +83,7 @@ from app.services.llm_service import (
     iter_batch_translate,
     validate_provider_choice,
 )
+from app.services.language_detection import detect_upload_language
 from app.services.language_pairs import require_language_pair
 from app.services.matcher import get_tm_candidates_for_text, match_sentences_with_stats
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
@@ -138,6 +141,10 @@ class LLMTranslateRequest(BaseModel):
     translation_guidelines: str = ""
     guideline_template_id: str | None = None
     temporary_prompt: str = ""
+
+
+class GuidelineTemplateUpdateRequest(BaseModel):
+    content: str
 
 
 class RematchRequest(BaseModel):
@@ -381,6 +388,29 @@ def get_translation_guideline_template(template_id: str):
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="翻译细则模板不存在。") from exc
     return _serialize_guideline_template(template, include_content=True)
+
+
+@router.put("/guideline-templates/{template_id}")
+def update_translation_guideline_template(
+    template_id: str,
+    payload: GuidelineTemplateUpdateRequest,
+):
+    try:
+        template = update_guideline_template(template_id, payload.content)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="翻译细则模板不存在。") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _serialize_guideline_template(template, include_content=True)
+
+
+@router.delete("/guideline-templates/{template_id}", status_code=204)
+def delete_translation_guideline_template(template_id: str):
+    try:
+        delete_guideline_template(template_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="翻译细则模板不存在。") from exc
+    return Response(status_code=204)
 
 
 # 支持的文件扩展名（30种格式）
@@ -1434,6 +1464,24 @@ def update_project(
         "translation_guidelines": project.translation_guidelines or "",
         "updated_at": project.updated_at.isoformat(),
     }
+
+
+@router.post("/projects/{project_id}/detect-source-language")
+async def detect_project_source_language(
+    project_id: UUID,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="文件为空，无法识别语言。")
+
+    result = detect_upload_language(file.filename or "", raw_bytes)
+    return result.to_dict()
 
 
 @router.post("/projects/{project_id}/source-document")

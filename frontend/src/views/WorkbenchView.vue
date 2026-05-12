@@ -104,6 +104,7 @@ const openRevisionMenu = ref(false)
 const revisionActionLoading = ref(false)
 const segmentSearchOpen = ref(false)
 const sourceSearchInputRef = ref<HTMLInputElement | null>(null)
+const guidelinesEditorRef = ref<HTMLTextAreaElement | null>(null)
 const sourceSearchQuery = ref('')
 const targetSearchQuery = ref('')
 const searchLoadingAllSegments = ref(false)
@@ -314,6 +315,10 @@ const hasProjectReturnContext = computed(() => (
 
 const projectReturnId = computed(() => (
   typeof route.query.pid === 'string' ? route.query.pid : ''
+))
+
+const projectReturnParent = computed(() => (
+  route.query.parent === 'tasks' ? 'tasks' : ''
 ))
 
 const statusSummary = computed(() => {
@@ -542,8 +547,18 @@ usePageHeader(() => ({
     : t('workbench.description'),
   breadcrumbs: hasProjectReturnContext.value
     ? [
-        { label: t('shell.sections.workspace'), to: { name: 'projects' } },
-        { label: t('workbench.breadcrumbProject'), to: { name: 'project-detail', params: { id: projectReturnId.value } } },
+        {
+          label: projectReturnParent.value ? t('shell.sections.tasks') : t('shell.sections.workspace'),
+          to: projectReturnParent.value ? { name: 'tasks' } : { name: 'projects' },
+        },
+        {
+          label: t('workbench.breadcrumbProject'),
+          to: {
+            name: 'project-detail',
+            params: { id: projectReturnId.value },
+            ...(projectReturnParent.value ? { query: { from: projectReturnParent.value } } : {}),
+          },
+        },
         { label: segmentStore.fileRecord?.filename || t('workbench.titleFallback') },
       ]
     : [
@@ -558,7 +573,7 @@ useWorkbenchShortcuts({
   focusPrev: () => { void focusSentenceByOffset(-1) },
   focusNext: () => { void focusSentenceByOffset(1) },
   confirmCurrent: () => { confirmCurrentSentence() },
-  closePanel: () => { activeTool.value = null },
+  closePanel: () => { closeActiveWorkbenchPanel() },
   toggleHelp: () => { showShortcutHelp.value = !showShortcutHelp.value },
 })
 
@@ -723,6 +738,30 @@ function openImportDialog(tab: ResourceImportTab = 'tm') {
   showImportDialog.value = true
 }
 
+function closeActiveWorkbenchPanel() {
+  if (segmentSearchOpen.value) {
+    closeSegmentSearchPanel()
+    return
+  }
+  if (showGuidelinesPanel.value) {
+    closeGuidelinesPanel()
+    return
+  }
+  activeTool.value = null
+}
+
+function closeGuidelinesPanel() {
+  showGuidelinesPanel.value = false
+}
+
+async function toggleGuidelinesPanel() {
+  showGuidelinesPanel.value = !showGuidelinesPanel.value
+  if (showGuidelinesPanel.value) {
+    await nextTick()
+    guidelinesEditorRef.value?.focus({ preventScroll: true })
+  }
+}
+
 function resetSegmentSearch() {
   searchLoadRequestId += 1
   segmentSearchOpen.value = false
@@ -731,11 +770,15 @@ function resetSegmentSearch() {
   searchLoadingAllSegments.value = false
 }
 
+function closeSegmentSearchPanel() {
+  segmentSearchOpen.value = false
+}
+
 async function toggleSegmentSearchPanel() {
   segmentSearchOpen.value = !segmentSearchOpen.value
   if (segmentSearchOpen.value) {
     await nextTick()
-    sourceSearchInputRef.value?.focus()
+    sourceSearchInputRef.value?.focus({ preventScroll: true })
   }
 }
 
@@ -1076,7 +1119,11 @@ async function exportTranslatedFile() {
 
 async function goBack() {
   if (hasProjectReturnContext.value) {
-    await router.push({ name: 'project-detail', params: { id: projectReturnId.value } })
+    await router.push({
+      name: 'project-detail',
+      params: { id: projectReturnId.value },
+      ...(projectReturnParent.value ? { query: { from: projectReturnParent.value } } : {}),
+    })
     return
   }
   await router.push({ name: 'tasks' })
@@ -1423,7 +1470,7 @@ onBeforeRouteLeave(async () => {
           type="button"
           :class="{ 'is-active': showGuidelinesPanel }"
           :title="t('workbench.guidelinesToggle')"
-          @click="showGuidelinesPanel = !showGuidelinesPanel"
+          @click="void toggleGuidelinesPanel()"
         >
           <FileText :size="14" />
           {{ t('workbench.guidelinesShort') }}
@@ -1511,47 +1558,65 @@ onBeforeRouteLeave(async () => {
       </div>
     </section>
 
-    <section v-if="showGuidelinesPanel" class="panel workbench-guidelines-panel">
-      <div class="workbench-guidelines-panel__head">
-        <span class="workbench-guidelines-panel__title">{{ t('workbench.guidelinesTitle') }}</span>
-        <button
-          class="button button--small"
-          type="button"
-          :disabled="importingGuidelineTemplate || loadingGuidelineTemplates"
-          @click="openGuidelineTemplateImport"
-        >
-          <Upload :size="13" />
-          {{ importingGuidelineTemplate ? t('common.actions.saving') : t('workbench.guidelineImport') }}
-        </button>
-      </div>
-      <input
-        ref="guidelineTemplateInputRef"
-        class="workbench-guidelines-panel__file"
-        type="file"
-        accept=".md,.markdown,.txt"
-        @change="importGuidelineTemplate"
+    <Transition name="workbench-panel-pop">
+      <section
+        v-if="showGuidelinesPanel"
+        class="panel workbench-guidelines-panel"
+        @keydown.esc.stop="closeGuidelinesPanel"
       >
-      <label class="field">
-        <span class="field__label">{{ t('workbench.guidelineTemplate') }}</span>
-        <select
-          v-model="selectedGuidelineTemplateId"
-          class="field__control"
-          :disabled="loadingGuidelineTemplates"
+        <div class="workbench-guidelines-panel__head">
+          <span class="workbench-guidelines-panel__title">{{ t('workbench.guidelinesTitle') }}</span>
+          <div class="workbench-guidelines-panel__actions">
+            <button
+              class="button button--small"
+              type="button"
+              :disabled="importingGuidelineTemplate || loadingGuidelineTemplates"
+              @click="openGuidelineTemplateImport"
+            >
+              <Upload :size="13" />
+              {{ importingGuidelineTemplate ? t('common.actions.saving') : t('workbench.guidelineImport') }}
+            </button>
+            <button
+              class="button button--small workbench-guidelines-panel__close"
+              type="button"
+              title="收起细则"
+              aria-label="收起细则"
+              @click="closeGuidelinesPanel"
+            >
+              <X :size="13" />
+            </button>
+          </div>
+        </div>
+        <input
+          ref="guidelineTemplateInputRef"
+          class="workbench-guidelines-panel__file"
+          type="file"
+          accept=".md,.markdown,.txt"
+          @change="importGuidelineTemplate"
         >
-          <option value="">{{ t('workbench.guidelineTemplateNone') }}</option>
-          <option v-for="template in guidelineTemplates" :key="template.id" :value="template.id">
-            {{ template.name }}
-          </option>
-        </select>
-      </label>
-      <textarea
-        v-model="workbenchGuidelines"
-        class="field__control workbench-guidelines-panel__editor"
-        rows="4"
-        :placeholder="t('workbench.guidelinesPlaceholder')"
-      />
-      <p class="hint-text">{{ t('workbench.guidelinesHint') }}</p>
-    </section>
+        <label class="field">
+          <span class="field__label">{{ t('workbench.guidelineTemplate') }}</span>
+          <select
+            v-model="selectedGuidelineTemplateId"
+            class="field__control"
+            :disabled="loadingGuidelineTemplates"
+          >
+            <option value="">{{ t('workbench.guidelineTemplateNone') }}</option>
+            <option v-for="template in guidelineTemplates" :key="template.id" :value="template.id">
+              {{ template.name }}
+            </option>
+          </select>
+        </label>
+        <textarea
+          ref="guidelinesEditorRef"
+          v-model="workbenchGuidelines"
+          class="field__control workbench-guidelines-panel__editor"
+          rows="4"
+          :placeholder="t('workbench.guidelinesPlaceholder')"
+        />
+        <p class="hint-text">{{ t('workbench.guidelinesHint') }}</p>
+      </section>
+    </Transition>
 
     <section class="panel panel--header workbench-overview">
       <div class="workbench-overview__line">
@@ -1604,6 +1669,7 @@ onBeforeRouteLeave(async () => {
           <div class="segment-editor-toolbar__actions">
             <button
               class="button workbench-action workbench-action--search segment-editor-toolbar__search"
+              :class="{ 'is-active': segmentSearchOpen }"
               type="button"
               :aria-expanded="segmentSearchOpen"
               aria-controls="workbench-segment-search"
@@ -1672,76 +1738,92 @@ onBeforeRouteLeave(async () => {
           </div>
         </div>
 
-        <div v-if="segmentSearchOpen" id="workbench-segment-search" class="workbench-search-panel">
-          <div class="workbench-search-panel__form">
-            <label class="field field--compact">
-              <span class="field__label">{{ t('workbench.search.sourceLabel') }}</span>
-              <input
-                ref="sourceSearchInputRef"
-                v-model="sourceSearchQuery"
-                class="field__control"
-                type="text"
-                :placeholder="t('workbench.search.sourcePlaceholder')"
-                @keydown.enter.prevent="void focusMatchedSegment(1)"
-              />
-            </label>
+        <Transition name="workbench-panel-pop">
+          <div
+            v-if="segmentSearchOpen"
+            id="workbench-segment-search"
+            class="workbench-search-panel"
+            @keydown.esc.stop="closeSegmentSearchPanel"
+          >
+            <div class="workbench-search-panel__form">
+              <label class="field field--compact">
+                <span class="field__label">{{ t('workbench.search.sourceLabel') }}</span>
+                <input
+                  ref="sourceSearchInputRef"
+                  v-model="sourceSearchQuery"
+                  class="field__control"
+                  type="text"
+                  :placeholder="t('workbench.search.sourcePlaceholder')"
+                  @keydown.enter.prevent="void focusMatchedSegment(1)"
+                />
+              </label>
 
-            <label class="field field--compact">
-              <span class="field__label">{{ t('workbench.search.targetLabel') }}</span>
-              <input
-                v-model="targetSearchQuery"
-                class="field__control"
-                type="text"
-                :placeholder="t('workbench.search.targetPlaceholder')"
-                @keydown.enter.prevent="void focusMatchedSegment(1)"
-              />
-            </label>
+              <label class="field field--compact">
+                <span class="field__label">{{ t('workbench.search.targetLabel') }}</span>
+                <input
+                  v-model="targetSearchQuery"
+                  class="field__control"
+                  type="text"
+                  :placeholder="t('workbench.search.targetPlaceholder')"
+                  @keydown.enter.prevent="void focusMatchedSegment(1)"
+                />
+              </label>
 
-            <div class="workbench-search-panel__actions">
-              <button
-                class="button workbench-action workbench-action--search"
-                type="button"
-                :disabled="searchLoadingAllSegments || editorSegments.length === 0"
-                @click="void focusMatchedSegment(-1)"
-              >
-                <ArrowUp :size="14" />
-                {{ t('workbench.search.prev') }}
-              </button>
-              <button
-                class="button workbench-action workbench-action--search"
-                type="button"
-                :disabled="searchLoadingAllSegments || editorSegments.length === 0"
-                @click="void focusMatchedSegment(1)"
-              >
-                <ArrowDown :size="14" />
-                {{ t('workbench.search.next') }}
-              </button>
-              <button
-                v-if="hasSegmentSearch"
-                class="button workbench-action workbench-action--clear"
-                type="button"
-                @click="resetSegmentSearch"
-              >
-                <X :size="14" />
-                {{ t('workbench.search.clear') }}
-              </button>
+              <div class="workbench-search-panel__actions">
+                <button
+                  class="button workbench-action workbench-action--search"
+                  type="button"
+                  :disabled="searchLoadingAllSegments || editorSegments.length === 0"
+                  @click="void focusMatchedSegment(-1)"
+                >
+                  <ArrowUp :size="14" />
+                  {{ t('workbench.search.prev') }}
+                </button>
+                <button
+                  class="button workbench-action workbench-action--search"
+                  type="button"
+                  :disabled="searchLoadingAllSegments || editorSegments.length === 0"
+                  @click="void focusMatchedSegment(1)"
+                >
+                  <ArrowDown :size="14" />
+                  {{ t('workbench.search.next') }}
+                </button>
+                <button
+                  v-if="hasSegmentSearch"
+                  class="button workbench-action workbench-action--clear"
+                  type="button"
+                  @click="resetSegmentSearch"
+                >
+                  <X :size="14" />
+                  {{ t('workbench.search.clear') }}
+                </button>
+                <button
+                  class="button workbench-action workbench-action--search workbench-search-panel__close"
+                  type="button"
+                  title="收起句段检索"
+                  aria-label="收起句段检索"
+                  @click="closeSegmentSearchPanel"
+                >
+                  <X :size="14" />
+                </button>
+              </div>
+            </div>
+
+            <div v-if="hasSegmentSearch || searchLoadingAllSegments" class="workbench-search-panel__meta">
+              <span v-if="hasSegmentSearch" class="hint-text">
+                {{
+                  t('workbench.search.resultSummary', {
+                    count: editorSegments.length,
+                    total: segmentStore.totalSegmentCount,
+                  })
+                }}
+              </span>
+              <span v-if="searchLoadingAllSegments" class="hint-text">
+                {{ t('workbench.search.loadingAll') }}
+              </span>
             </div>
           </div>
-
-          <div v-if="hasSegmentSearch || searchLoadingAllSegments" class="workbench-search-panel__meta">
-            <span v-if="hasSegmentSearch" class="hint-text">
-              {{
-                t('workbench.search.resultSummary', {
-                  count: editorSegments.length,
-                  total: segmentStore.totalSegmentCount,
-                })
-              }}
-            </span>
-            <span v-if="searchLoadingAllSegments" class="hint-text">
-              {{ t('workbench.search.loadingAll') }}
-            </span>
-          </div>
-        </div>
+        </Transition>
 
         <div
           v-if="hasSegmentSearch && !searchLoadingAllSegments && editorSegments.length === 0"
@@ -2020,26 +2102,47 @@ onBeforeRouteLeave(async () => {
   gap: 6px;
 }
 
+.workbench-toolbar {
+  min-height: var(--route-top-panel-min-height, 90px);
+  align-content: center;
+}
+
 .workbench-toolbar__group {
   display: flex;
   flex-wrap: wrap;
-  align-items: flex-end;
+  align-items: center;
   gap: 6px 8px;
 }
 
+.workbench-toolbar__group > .workbench-action--back {
+  align-self: center;
+  margin-top: 0;
+}
+
 .workbench-toolbar__field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 1 auto;
   min-width: 0;
-  max-width: min(200px, 34vw);
+  max-width: min(220px, 42vw);
+  min-height: 32px;
 }
 
 .workbench-toolbar__field .field__label {
-  font-size: 11px;
-  line-height: 1.2;
+  flex: 0 0 auto;
+  font-size: 12px;
+  line-height: 32px;
   color: var(--text-muted, #64748b);
+  white-space: nowrap;
 }
 
 .workbench-toolbar__field .field__control {
-  min-height: 30px;
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 120px;
+  min-height: 32px;
+  height: 32px;
   padding: 4px 8px;
   font-size: 12px;
   border-radius: 6px;
@@ -2049,16 +2152,23 @@ onBeforeRouteLeave(async () => {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
+  align-self: center;
   gap: 6px;
   margin-left: auto;
 }
 
 .workbench-toolbar__icon-btn {
   min-width: 34px;
-  min-height: 30px;
+  min-height: 32px;
   padding: 4px 8px;
   font-weight: 600;
   box-shadow: 0 2px 6px rgba(37, 61, 70, 0.08);
+}
+
+.workbench-action--back.workbench-toolbar__icon-btn {
+  min-width: 46px;
+  min-height: 32px;
+  padding-inline: 12px;
 }
 
 .workbench-toolbar__status {
@@ -2144,21 +2254,26 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-toolbar .workbench-action:not(.workbench-toolbar__icon-btn) {
-  min-height: 30px;
+  min-height: 32px;
   padding: 5px 10px;
   font-size: 12px;
   gap: 4px;
 }
 
 .workbench-toolbar .workbench-action.is-active {
-  background: var(--bg-accent, #e0e8f0);
-  border-color: var(--line-accent, #b0c0d0);
+  border-color: #69ad9d;
+  background: linear-gradient(180deg, #e2f2ee, #cbe6df);
+  color: #0b6658;
+  box-shadow: 0 5px 14px rgba(13, 122, 104, 0.16);
 }
 
 .workbench-guidelines-panel {
+  position: relative;
   padding: 10px 14px;
   display: grid;
   gap: 8px;
+  overflow: hidden;
+  transform-origin: top center;
 }
 
 .workbench-guidelines-panel__head {
@@ -2171,6 +2286,18 @@ onBeforeRouteLeave(async () => {
 .workbench-guidelines-panel__title {
   font-weight: 600;
   font-size: 13px;
+}
+
+.workbench-guidelines-panel__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.workbench-guidelines-panel__close,
+.workbench-search-panel__close {
+  min-width: 34px;
+  padding-inline: 9px;
 }
 
 .workbench-guidelines-panel__file {
@@ -2197,11 +2324,18 @@ onBeforeRouteLeave(async () => {
   color: var(--action-color);
   font-weight: 600;
   box-shadow: 0 3px 8px var(--action-shadow);
+  transition:
+    border-color 160ms ease,
+    background 160ms ease,
+    color 160ms ease,
+    box-shadow 160ms ease,
+    transform 160ms ease;
 }
 
 .workbench-action:not(:disabled):hover {
   border-color: color-mix(in srgb, var(--action-border) 82%, #17313b);
   box-shadow: 0 4px 12px var(--action-hover-shadow);
+  transform: translateY(-1px);
 }
 
 .workbench-action:focus-visible {
@@ -2305,6 +2439,8 @@ onBeforeRouteLeave(async () => {
   border: 1px solid var(--line-soft);
   border-radius: 8px;
   background: linear-gradient(180deg, rgba(248, 250, 252, 0.96), rgba(255, 255, 255, 0.98));
+  overflow: hidden;
+  transform-origin: top center;
 }
 
 .workbench-search-panel__header,
@@ -2394,6 +2530,13 @@ onBeforeRouteLeave(async () => {
   margin-bottom: 8px;
 }
 
+.segment-editor-toolbar__search.is-active {
+  border-color: #69ad9d;
+  background: linear-gradient(180deg, #edf7f4, #d7ece6);
+  color: #0b6658;
+  box-shadow: 0 6px 14px rgba(13, 122, 104, 0.12);
+}
+
 .segment-editor-toolbar__title {
   display: flex;
   align-items: center;
@@ -2419,6 +2562,39 @@ onBeforeRouteLeave(async () => {
   border: 1px dashed var(--line-soft);
   border-radius: 14px;
   background: rgba(248, 250, 252, 0.72);
+}
+
+.workbench-panel-pop-enter-active,
+.workbench-panel-pop-leave-active {
+  overflow: hidden;
+  transition:
+    opacity 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    transform 200ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    filter 180ms ease,
+    max-height 220ms ease,
+    margin 220ms ease,
+    padding-top 220ms ease,
+    padding-bottom 220ms ease;
+}
+
+.workbench-panel-pop-enter-from,
+.workbench-panel-pop-leave-to {
+  max-height: 0;
+  margin-top: 0;
+  margin-bottom: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  opacity: 0;
+  filter: blur(1px);
+  transform: translateY(-8px) scale(0.985);
+}
+
+.workbench-panel-pop-enter-to,
+.workbench-panel-pop-leave-from {
+  max-height: 520px;
+  opacity: 1;
+  filter: blur(0);
+  transform: translateY(0) scale(1);
 }
 
 .workbench-resource-panel__actions {
@@ -2512,6 +2688,7 @@ onBeforeRouteLeave(async () => {
   background: var(--rail-hover-bg);
   color: var(--rail-active-text);
   box-shadow: 0 10px 18px var(--rail-shadow);
+  transform: translateX(-1px);
 }
 
 .workbench-page .workbench-rail__button.is-active {
@@ -2519,6 +2696,7 @@ onBeforeRouteLeave(async () => {
   background: var(--rail-active-bg);
   color: var(--rail-active-text);
   box-shadow: 0 12px 22px var(--rail-active-shadow);
+  transform: translateX(-2px);
 }
 
 .workbench-rail__button--paper {
@@ -2629,8 +2807,31 @@ onBeforeRouteLeave(async () => {
     flex: 1 1 0;
   }
 
+  .workbench-guidelines-panel__head,
+  .workbench-guidelines-panel__actions {
+    align-items: stretch;
+  }
+
+  .workbench-guidelines-panel__head {
+    flex-direction: column;
+  }
+
   .shortcut-item {
     flex-direction: column;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workbench-action,
+  .workbench-panel-pop-enter-active,
+  .workbench-panel-pop-leave-active {
+    transition: none;
+  }
+
+  .workbench-action:not(:disabled):hover,
+  .workbench-panel-pop-enter-from,
+  .workbench-panel-pop-leave-to {
+    transform: none;
   }
 }
 </style>
