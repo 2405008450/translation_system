@@ -68,6 +68,12 @@ from app.services.file_record_service import (
     update_segment_by_sentence_id,
     update_segment_with_llm_result,
 )
+from app.services.guideline_repository import (
+    GuidelineTemplate,
+    list_guideline_templates,
+    read_guideline_template,
+    save_guideline_template,
+)
 from app.services.llm_service import (
     LLMConfigurationError,
     LLMTranslationFailure,
@@ -130,6 +136,8 @@ class LLMTranslateRequest(BaseModel):
     scope: Literal["fuzzy_only", "none_only", "all", "all_with_exact"] = "all"
     provider: Literal["auto", "deepseek", "openrouter"] = "deepseek"
     translation_guidelines: str = ""
+    guideline_template_id: str | None = None
+    temporary_prompt: str = ""
 
 
 class RematchRequest(BaseModel):
@@ -241,6 +249,53 @@ def _sse_event(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _serialize_guideline_template(template: GuidelineTemplate, include_content: bool = False) -> dict:
+    payload = {
+        "id": template.id,
+        "name": template.name,
+        "filename": template.filename,
+        "size_bytes": template.size_bytes,
+        "updated_at": template.updated_at.isoformat(),
+        "content_preview": template.content[:180],
+    }
+    if include_content:
+        payload["content"] = template.content
+    return payload
+
+
+def _resolve_llm_guidelines(
+    db: Session,
+    file_record: FileRecord,
+    body: LLMTranslateRequest,
+) -> str:
+    project_guidelines = ""
+    if file_record.project_id:
+        project = db.query(Project).filter(Project.id == file_record.project_id).first()
+        if project:
+            project_guidelines = (project.translation_guidelines or "").strip()
+
+    parts: list[str] = []
+    if project_guidelines:
+        parts.append(project_guidelines)
+
+    if body.guideline_template_id:
+        try:
+            template = read_guideline_template(body.guideline_template_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="选择的翻译细则模板不存在。") from exc
+        parts.append(f"【可复用细则：{template.name}】\n{template.content.strip()}")
+
+    temporary_prompt = (body.temporary_prompt or "").strip()
+    legacy_guidelines = (body.translation_guidelines or "").strip()
+    if legacy_guidelines and not temporary_prompt:
+        temporary_prompt = legacy_guidelines
+
+    if temporary_prompt and temporary_prompt != project_guidelines:
+        parts.append(f"【本次临时提示词】\n{temporary_prompt}")
+
+    return "\n\n".join(part for part in parts if part.strip())
+
+
 def _parse_optional_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -297,6 +352,36 @@ def _build_llm_translation_tasks(
         )
 
     return tasks
+
+
+@router.get("/guideline-templates")
+def list_translation_guideline_templates():
+    """列出仓库中可复用的 Markdown 翻译细则模板。"""
+    return [
+        _serialize_guideline_template(template)
+        for template in list_guideline_templates()
+    ]
+
+
+@router.post("/guideline-templates/import")
+async def import_translation_guideline_template(file: UploadFile = File(...)):
+    """导入 .md/.txt 翻译细则，并统一保存为仓库内 UTF-8 Markdown。"""
+    raw_bytes = await file.read()
+    try:
+        template = save_guideline_template(file.filename or "", raw_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _serialize_guideline_template(template, include_content=True)
+
+
+@router.get("/guideline-templates/{template_id}")
+def get_translation_guideline_template(template_id: str):
+    try:
+        template = read_guideline_template(template_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="翻译细则模板不存在。") from exc
+    return _serialize_guideline_template(template, include_content=True)
+
 
 # 支持的文件扩展名（30种格式）
 SUPPORTED_EXTENSIONS = {
@@ -2344,11 +2429,7 @@ async def llm_translate_file_record(
     except LLMConfigurationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    guidelines = (body.translation_guidelines or "").strip()
-    if not guidelines and file_record.project_id:
-        project = db.query(Project).filter(Project.id == file_record.project_id).first()
-        if project:
-            guidelines = (project.translation_guidelines or "").strip()
+    guidelines = _resolve_llm_guidelines(db, file_record, body)
 
     translation_tasks = _build_llm_translation_tasks(
         db=db,

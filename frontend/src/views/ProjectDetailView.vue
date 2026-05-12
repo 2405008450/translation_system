@@ -46,6 +46,8 @@ const props = defineProps<{
 type ProjectTab = 'files' | 'settings' | 'stats' | 'summary' | 'quote'
 type DocumentParseMode = 'full' | 'body_only'
 
+const NO_TM_COLLECTION_ID = '__NO_TM_COLLECTION__'
+
 interface ProjectDetail {
   id: string
   name: string
@@ -111,7 +113,7 @@ const selectedFiles = ref<File[]>([])
 const threshold = ref(0.6)
 const tmCollections = ref<TMCollection[]>([])
 const termBases = ref<TermBase[]>([])
-const selectedCollectionIds = ref<string[]>([])
+const selectedCollectionIds = ref<string[]>([NO_TM_COLLECTION_ID])
 const selectedTermBaseId = ref('')
 const uploadSourceLanguage = ref('')
 const uploadTargetLanguage = ref('')
@@ -169,6 +171,14 @@ const uploadButtonTitle = computed(() => {
   return ''
 })
 
+const uploadFileSummary = computed(() => (
+  selectedFiles.value.length > 0
+    ? `已选择 ${selectedFiles.value.length} 个文件`
+    : '可一次选择多个任务文件'
+))
+
+const uploadFilePreview = computed(() => selectedFiles.value.slice(0, 3).map((file) => file.name))
+
 const availableTMCollections = computed(() => {
   if (!uploadSourceLanguage.value || !uploadTargetLanguage.value) {
     return tmCollections.value
@@ -178,6 +188,17 @@ const availableTMCollections = computed(() => {
     (!collection.source_language || collection.source_language === uploadSourceLanguage.value)
     && (!collection.target_language || collection.target_language === uploadTargetLanguage.value)
   ))
+})
+
+const selectedUploadCollectionIds = computed(() => (
+  selectedCollectionIds.value.filter((collectionId) => collectionId !== NO_TM_COLLECTION_ID)
+))
+
+const selectedCollectionIdsModel = computed<string[]>({
+  get: () => selectedCollectionIds.value,
+  set: (collectionIds) => {
+    selectedCollectionIds.value = normalizeSelectedCollectionIds(collectionIds)
+  },
 })
 
 const availableTermBases = computed(() => {
@@ -278,6 +299,21 @@ function onFileChange(event: Event) {
   selectedFiles.value = Array.from((event.target as HTMLInputElement).files ?? [])
 }
 
+function normalizeSelectedCollectionIds(collectionIds: string[]) {
+  const availableIds = new Set(availableTMCollections.value.map((collection) => collection.id))
+  const wantsNoCollection = collectionIds.includes(NO_TM_COLLECTION_ID)
+  const hadNoCollection = selectedCollectionIds.value.includes(NO_TM_COLLECTION_ID)
+
+  if (wantsNoCollection && (!hadNoCollection || collectionIds.length === 1)) {
+    return [NO_TM_COLLECTION_ID]
+  }
+
+  const normalizedIds = collectionIds.filter((collectionId) => (
+    collectionId !== NO_TM_COLLECTION_ID && availableIds.has(collectionId)
+  ))
+  return normalizedIds.length > 0 ? normalizedIds : [NO_TM_COLLECTION_ID]
+}
+
 function resetUploadForm() {
   selectedFiles.value = []
   uploadMessage.value = ''
@@ -294,9 +330,7 @@ function openUploadDialog() {
   resetUploadForm()
   uploadSourceLanguage.value = project.value?.source_language || ''
   uploadTargetLanguage.value = project.value?.target_language || ''
-  selectedCollectionIds.value = selectedCollectionIds.value.filter((collectionId) => (
-    availableTMCollections.value.some((collection) => collection.id === collectionId)
-  ))
+  selectedCollectionIds.value = normalizeSelectedCollectionIds(selectedCollectionIds.value)
   selectedTermBaseId.value = availableTermBases.value.some((termBase) => termBase.id === project.value?.term_base_id)
     ? project.value?.term_base_id || ''
     : ''
@@ -462,7 +496,7 @@ async function uploadSourceDocument() {
     formData.append('source_language', uploadSourceLanguage.value)
     formData.append('target_language', uploadTargetLanguage.value)
     formData.append('document_parse_mode', documentParseMode.value)
-    selectedCollectionIds.value.forEach((collectionId) => {
+    selectedUploadCollectionIds.value.forEach((collectionId) => {
       formData.append('collection_ids', collectionId)
     })
     if (selectedTermBaseId.value) {
@@ -591,9 +625,7 @@ onBeforeUnmount(() => {
 })
 
 watch([uploadSourceLanguage, uploadTargetLanguage], () => {
-  selectedCollectionIds.value = selectedCollectionIds.value.filter((collectionId) => (
-    availableTMCollections.value.some((collection) => collection.id === collectionId)
-  ))
+  selectedCollectionIds.value = normalizeSelectedCollectionIds(selectedCollectionIds.value)
   if (
     selectedTermBaseId.value
     && !availableTermBases.value.some((termBase) => termBase.id === selectedTermBaseId.value)
@@ -759,7 +791,7 @@ watch([uploadSourceLanguage, uploadTargetLanguage], () => {
         <div class="table-toolbar pd-toolbar">
           <div class="table-toolbar__left pd-toolbar__left">
             <button
-              class="button button--primary"
+              class="button"
               type="button"
               :disabled="selectedFileIds.size === 0"
               :title="preTranslateButtonTitle || undefined"
@@ -808,7 +840,7 @@ watch([uploadSourceLanguage, uploadTargetLanguage], () => {
               {{ t('projectDetail.files.actions.mergeOpen') }}
             </button>
             <button
-              class="button"
+              class="button button--danger"
               type="button"
               :disabled="deleting"
               @click="deleteCurrentProject"
@@ -961,38 +993,54 @@ watch([uploadSourceLanguage, uploadTargetLanguage], () => {
     <Modal
       :open="showUploadModal"
       :title="t('projectDetail.uploadDialog.title')"
-      description="支持 DOCX、TXT、CSV、HTML、Markdown、JSON、YAML、PO、SRT、SDLXLIFF、ZIP 等任务文件。"
-      width="min(680px, calc(100vw - 32px))"
+      :description="t('projectDetail.uploadDialog.description')"
+      width="min(760px, calc(100vw - 32px))"
       @close="closeUploadDialog"
     >
-      <div class="form-grid-2">
-        <label class="field">
-          <span class="field__label">源文件</span>
-          <input
-            :key="uploadInputKey"
-            class="field__control"
-            type="file"
-            multiple
-            :accept="supportedTaskFileAccept"
-            aria-label="源文件"
-            @change="onFileChange"
-          />
-        </label>
+      <div class="pd-upload-dialog">
+        <section class="pd-upload-picker">
+          <div class="pd-upload-picker__icon">
+            <Upload :size="20" />
+          </div>
+          <label class="field pd-upload-picker__field">
+            <span class="field__label">源文件 <span class="field__required">*</span></span>
+            <input
+              :key="uploadInputKey"
+              class="field__control"
+              type="file"
+              multiple
+              :accept="supportedTaskFileAccept"
+              aria-label="源文件"
+              @change="onFileChange"
+            />
+          </label>
+          <div class="pd-upload-picker__summary">
+            <strong>{{ uploadFileSummary }}</strong>
+            <template v-if="selectedFiles.length === 0">
+              <span>DOCX、TXT、CSV、HTML、Markdown、JSON、YAML、PO、SRT、SDLXLIFF、ZIP</span>
+            </template>
+            <template v-else>
+              <span v-for="fileName in uploadFilePreview" :key="fileName">{{ fileName }}</span>
+              <span v-if="selectedFiles.length > uploadFilePreview.length">+{{ selectedFiles.length - uploadFilePreview.length }}</span>
+            </template>
+          </div>
+        </section>
 
-        <label class="field">
-          <span class="field__label">{{ t('projectList.form.sourceLanguage') }} <span class="field__required">*</span></span>
-          <select v-model="uploadSourceLanguage" class="field__control">
-            <option value="" disabled>{{ t('projectList.form.sourcePlaceholder') }}</option>
-            <option
-              v-for="lang in languageOptions"
-              :key="lang.code"
-              :value="lang.code"
-              :disabled="lang.code === uploadTargetLanguage"
-            >
-              {{ lang.label }}
-            </option>
-          </select>
-        </label>
+        <div class="form-grid-2 pd-upload-grid">
+          <label class="field">
+            <span class="field__label">{{ t('projectList.form.sourceLanguage') }} <span class="field__required">*</span></span>
+            <select v-model="uploadSourceLanguage" class="field__control">
+              <option value="" disabled>{{ t('projectList.form.sourcePlaceholder') }}</option>
+              <option
+                v-for="lang in languageOptions"
+                :key="lang.code"
+                :value="lang.code"
+                :disabled="lang.code === uploadTargetLanguage"
+              >
+                {{ lang.label }}
+              </option>
+            </select>
+          </label>
 
         <label class="field">
           <span class="field__label">{{ t('projectList.form.targetLanguage') }} <span class="field__required">*</span></span>
@@ -1052,12 +1100,15 @@ watch([uploadSourceLanguage, uploadTargetLanguage], () => {
         <label class="field field--full">
           <span class="field__label">{{ t('projectDetail.fields.collections') }}</span>
           <select
-            v-model="selectedCollectionIds"
+            v-model="selectedCollectionIdsModel"
             class="field__control field__control--multi"
             multiple
-            :disabled="loadingCollections || availableTMCollections.length === 0"
+            :disabled="loadingCollections"
             :aria-label="t('projectDetail.fields.collections')"
           >
+            <option :value="NO_TM_COLLECTION_ID">
+              {{ t('projectDetail.fields.noCollection') }}
+            </option>
             <option v-for="collection in availableTMCollections" :key="collection.id" :value="collection.id">
               {{ collection.name }}（{{ formatLanguagePair(collection.source_language, collection.target_language) }} / {{ collection.entry_count }} 条）
             </option>
@@ -1066,6 +1117,7 @@ watch([uploadSourceLanguage, uploadTargetLanguage], () => {
             {{ availableTMCollections.length ? t('projectDetail.hints.collections') : t('projectDetail.hints.noCollections') }}
           </span>
         </label>
+        </div>
       </div>
 
       <div v-if="uploading" class="pd-upload-progress">
@@ -1385,6 +1437,62 @@ watch([uploadSourceLanguage, uploadTargetLanguage], () => {
   margin-top: 12px;
 }
 
+.pd-upload-dialog {
+  display: grid;
+  gap: 16px;
+}
+
+.pd-upload-picker {
+  display: grid;
+  grid-template-columns: auto minmax(220px, 1fr) minmax(180px, 0.8fr);
+  gap: 14px;
+  align-items: center;
+  padding: 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-1);
+}
+
+.pd-upload-picker__icon {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--brand-050);
+  color: var(--brand-700);
+}
+
+.pd-upload-picker__field {
+  min-width: 0;
+}
+
+.pd-upload-picker__summary {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.pd-upload-picker__summary strong {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.pd-upload-picker__summary span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-upload-grid {
+  align-items: start;
+}
+
 .project-status {
   display: inline-flex;
   align-items: center;
@@ -1469,6 +1577,10 @@ watch([uploadSourceLanguage, uploadTargetLanguage], () => {
 
   .pd-tabs {
     overflow-x: auto;
+  }
+
+  .pd-upload-picker {
+    grid-template-columns: 1fr;
   }
 }
 </style>

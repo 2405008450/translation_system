@@ -221,6 +221,19 @@ export interface TermImportSummary {
   target_language: string
 }
 
+export interface GuidelineTemplateSummary {
+  id: string
+  name: string
+  filename: string
+  size_bytes: number
+  updated_at: string
+  content_preview: string
+}
+
+export interface GuidelineTemplateDetail extends GuidelineTemplateSummary {
+  content: string
+}
+
 export interface SegmentUpdatePayload {
   sentence_id: string
   target_text: string
@@ -258,6 +271,11 @@ export interface CommentReplyPayload {
 
 export type LLMTranslateScope = 'fuzzy_only' | 'none_only' | 'all' | 'all_with_exact'
 export type LLMProvider = 'auto' | 'deepseek' | 'openrouter'
+
+export interface LLMGuidelineOptions {
+  guidelineTemplateId?: string
+  temporaryPrompt?: string
+}
 
 export interface LLMEvent {
   event: string

@@ -87,6 +87,12 @@ class FileRecord(Base):
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     file_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft")
+    document_parse_mode: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="full",
+        server_default=text("'full'"),
+    )
     source_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
     target_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
     creator_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -551,5 +557,3 @@ class TermEntry(Base):
     creator: Mapped["User | None"] = relationship(
         "User", foreign_keys=[creator_id]
     )
-
-

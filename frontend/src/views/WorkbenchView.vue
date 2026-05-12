@@ -20,6 +20,7 @@ import {
   MoreHorizontal,
   Save,
   Search,
+  Upload,
   X,
 } from 'lucide-vue-next'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
@@ -51,6 +52,7 @@ import type {
   CommentAnchorDraft,
   CommentCreatePayload,
   CommentStatus,
+  GuidelineTemplateSummary,
   LLMProvider,
   LLMTranslateScope,
   SaveToTMResult,
@@ -124,7 +126,11 @@ let searchLoadRequestId = 0
 // 导出相关状态
 const showGuidelinesPanel = ref(false)
 const workbenchGuidelines = ref('')
-const savingGuidelinesInWorkbench = ref(false)
+const guidelineTemplates = ref<GuidelineTemplateSummary[]>([])
+const selectedGuidelineTemplateId = ref('')
+const loadingGuidelineTemplates = ref(false)
+const importingGuidelineTemplate = ref(false)
+const guidelineTemplateInputRef = ref<HTMLInputElement | null>(null)
 
 const showExportMenu = ref(false)
 const exportOptions = ref<Array<{ id: string; name: string; description: string; extension: string }>>([])
@@ -609,6 +615,53 @@ async function loadTermEntries() {
   }
 }
 
+async function loadGuidelineTemplates() {
+  loadingGuidelineTemplates.value = true
+  try {
+    const { data } = await http.get<GuidelineTemplateSummary[]>('/guideline-templates')
+    guidelineTemplates.value = data
+    if (
+      selectedGuidelineTemplateId.value
+      && !data.some((template) => template.id === selectedGuidelineTemplateId.value)
+    ) {
+      selectedGuidelineTemplateId.value = ''
+    }
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('workbench.errors.guidelineTemplatesLoad'))
+  } finally {
+    loadingGuidelineTemplates.value = false
+  }
+}
+
+function openGuidelineTemplateImport() {
+  guidelineTemplateInputRef.value?.click()
+}
+
+async function importGuidelineTemplate(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) {
+    return
+  }
+
+  importingGuidelineTemplate.value = true
+  pageError.value = ''
+  try {
+    const formData = new FormData()
+    formData.append('file', file)
+    const { data } = await http.post<GuidelineTemplateSummary>('/guideline-templates/import', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    await loadGuidelineTemplates()
+    selectedGuidelineTemplateId.value = data.id
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('workbench.errors.guidelineTemplateImport'))
+  } finally {
+    importingGuidelineTemplate.value = false
+  }
+}
+
 async function openTool(tool: ToolKey) {
   if (activeTool.value === tool) {
     activeTool.value = null
@@ -875,7 +928,7 @@ async function loadTask() {
       commentStore.message = getErrorMessage(error, t('workbench.errors.commentsUnavailable'))
     }
 
-    workbenchGuidelines.value = segmentStore.fileRecord?.translation_guidelines || ''
+    workbenchGuidelines.value = ''
 
     await loadTermBases()
 
@@ -891,7 +944,10 @@ async function loadTask() {
 async function runLLMTranslation() {
   pageError.value = ''
   try {
-    await segmentStore.startLLMTranslation(llmScope.value, llmProvider.value)
+    await segmentStore.startLLMTranslation(llmScope.value, llmProvider.value, {
+      guidelineTemplateId: selectedGuidelineTemplateId.value || undefined,
+      temporaryPrompt: workbenchGuidelines.value,
+    })
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.llm'))
   }
@@ -899,26 +955,6 @@ async function runLLMTranslation() {
 
 async function stopLLMTranslation() {
   await segmentStore.abortLLM()
-}
-
-async function saveGuidelinesFromWorkbench() {
-  const projectId = segmentStore.fileRecord?.project_id
-  if (!projectId || savingGuidelinesInWorkbench.value) {
-    return
-  }
-  savingGuidelinesInWorkbench.value = true
-  try {
-    await http.patch(`/projects/${projectId}`, {
-      translation_guidelines: workbenchGuidelines.value,
-    })
-    if (segmentStore.fileRecord) {
-      segmentStore.fileRecord.translation_guidelines = workbenchGuidelines.value
-    }
-  } catch (error) {
-    pageError.value = getErrorMessage(error, t('workbench.errors.guidelinesSaveFailed'))
-  } finally {
-    savingGuidelinesInWorkbench.value = false
-  }
 }
 
 async function loadTMCollections() {
@@ -1335,6 +1371,7 @@ onMounted(() => {
   window.addEventListener('resize', handleResize)
   document.addEventListener('click', handleClickOutside)
   void loadTask()
+  void loadGuidelineTemplates()
 })
 
 onBeforeUnmount(() => {
@@ -1480,12 +1517,33 @@ onBeforeRouteLeave(async () => {
         <button
           class="button button--small"
           type="button"
-          :disabled="savingGuidelinesInWorkbench"
-          @click="saveGuidelinesFromWorkbench"
+          :disabled="importingGuidelineTemplate || loadingGuidelineTemplates"
+          @click="openGuidelineTemplateImport"
         >
-          {{ savingGuidelinesInWorkbench ? t('common.actions.saving') : t('common.actions.save') }}
+          <Upload :size="13" />
+          {{ importingGuidelineTemplate ? t('common.actions.saving') : t('workbench.guidelineImport') }}
         </button>
       </div>
+      <input
+        ref="guidelineTemplateInputRef"
+        class="workbench-guidelines-panel__file"
+        type="file"
+        accept=".md,.markdown,.txt"
+        @change="importGuidelineTemplate"
+      >
+      <label class="field">
+        <span class="field__label">{{ t('workbench.guidelineTemplate') }}</span>
+        <select
+          v-model="selectedGuidelineTemplateId"
+          class="field__control"
+          :disabled="loadingGuidelineTemplates"
+        >
+          <option value="">{{ t('workbench.guidelineTemplateNone') }}</option>
+          <option v-for="template in guidelineTemplates" :key="template.id" :value="template.id">
+            {{ template.name }}
+          </option>
+        </select>
+      </label>
       <textarea
         v-model="workbenchGuidelines"
         class="field__control workbench-guidelines-panel__editor"
@@ -2113,6 +2171,10 @@ onBeforeRouteLeave(async () => {
 .workbench-guidelines-panel__title {
   font-weight: 600;
   font-size: 13px;
+}
+
+.workbench-guidelines-panel__file {
+  display: none;
 }
 
 .workbench-guidelines-panel__editor {

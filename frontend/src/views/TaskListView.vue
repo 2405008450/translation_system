@@ -58,6 +58,8 @@ type SubTab = 'all' | 'incomplete'
 type ResourceImportTab = 'tm' | 'term'
 type DocumentParseMode = 'full' | 'body_only'
 
+const NO_TM_COLLECTION_ID = '__NO_TM_COLLECTION__'
+
 const taskStore = useTaskStore()
 const confirm = useConfirm()
 const toast = useToast()
@@ -71,7 +73,7 @@ const threshold = ref(0.6)
 const pageError = ref('')
 const tmCollections = ref<TMCollection[]>([])
 const loadingCollections = ref(false)
-const selectedCollectionIds = ref<string[]>([])
+const selectedCollectionIds = ref<string[]>([NO_TM_COLLECTION_ID])
 const termBases = ref<TermBase[]>([])
 const loadingTermBases = ref(false)
 const selectedTermBaseId = ref('')
@@ -110,6 +112,17 @@ const availableTMCollections = computed(() => {
     (!collection.source_language || collection.source_language === uploadSourceLanguage.value)
     && (!collection.target_language || collection.target_language === uploadTargetLanguage.value)
   ))
+})
+
+const selectedUploadCollectionIds = computed(() => (
+  selectedCollectionIds.value.filter((collectionId) => collectionId !== NO_TM_COLLECTION_ID)
+))
+
+const selectedCollectionIdsModel = computed<string[]>({
+  get: () => selectedCollectionIds.value,
+  set: (collectionIds) => {
+    selectedCollectionIds.value = normalizeSelectedCollectionIds(collectionIds)
+  },
 })
 
 const availableTermBases = computed(() => {
@@ -214,6 +227,21 @@ function onFileChange(event: Event) {
   selectedFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
 }
 
+function normalizeSelectedCollectionIds(collectionIds: string[]) {
+  const availableIds = new Set(availableTMCollections.value.map((collection) => collection.id))
+  const wantsNoCollection = collectionIds.includes(NO_TM_COLLECTION_ID)
+  const hadNoCollection = selectedCollectionIds.value.includes(NO_TM_COLLECTION_ID)
+
+  if (wantsNoCollection && (!hadNoCollection || collectionIds.length === 1)) {
+    return [NO_TM_COLLECTION_ID]
+  }
+
+  const normalizedIds = collectionIds.filter((collectionId) => (
+    collectionId !== NO_TM_COLLECTION_ID && availableIds.has(collectionId)
+  ))
+  return normalizedIds.length > 0 ? normalizedIds : [NO_TM_COLLECTION_ID]
+}
+
 async function uploadFile() {
   if (!selectedFile.value) {
     pageError.value = t('taskList.errors.selectFile')
@@ -233,7 +261,7 @@ async function uploadFile() {
     const result = await taskStore.uploadTask(
       selectedFile.value,
       threshold.value,
-      selectedCollectionIds.value,
+      selectedUploadCollectionIds.value,
       selectedTermBaseId.value || null,
       uploadSourceLanguage.value,
       uploadTargetLanguage.value,
@@ -349,9 +377,7 @@ watch(subTab, () => {
 })
 
 watch([uploadSourceLanguage, uploadTargetLanguage], () => {
-  selectedCollectionIds.value = selectedCollectionIds.value.filter((collectionId) => (
-    availableTMCollections.value.some((collection) => collection.id === collectionId)
-  ))
+  selectedCollectionIds.value = normalizeSelectedCollectionIds(selectedCollectionIds.value)
   if (
     selectedTermBaseId.value
     && !availableTermBases.value.some((termBase) => termBase.id === selectedTermBaseId.value)
@@ -439,11 +465,14 @@ onBeforeUnmount(() => {
         <label class="field field--collections">
           <span class="field__label">{{ t('taskList.fields.collections') }}</span>
           <select
-            v-model="selectedCollectionIds"
+            v-model="selectedCollectionIdsModel"
             class="field__control field__control--multi"
             multiple
-            :disabled="loadingCollections || availableTMCollections.length === 0"
+            :disabled="loadingCollections"
           >
+            <option :value="NO_TM_COLLECTION_ID">
+              {{ t('taskList.fields.noCollection') }}
+            </option>
             <option v-for="collection in availableTMCollections" :key="collection.id" :value="collection.id">
               {{ collection.name }}（{{ formatLanguagePair(collection.source_language, collection.target_language) }} / {{ collection.entry_count }} 条）
             </option>
@@ -713,6 +742,39 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.upload-panel {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  box-shadow: none;
+}
+
+.upload-panel .section-title {
+  margin-bottom: 0;
+  font-size: 15px;
+}
+
+.upload-form--task {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  align-items: start;
+  margin-top: 0;
+}
+
+.upload-form--task > .field:first-child,
+.upload-form--task > .field--collections {
+  grid-column: span 2;
+}
+
+.upload-form--task > .button {
+  align-self: end;
+  min-height: 42px;
+}
+
 .task-subtabs {
   padding: 0 20px;
 }
@@ -820,5 +882,22 @@ onBeforeUnmount(() => {
 
 .task-action-menu__dropdown button.is-danger:hover {
   background: var(--state-danger-bg);
+}
+
+@media (max-width: 1100px) {
+  .upload-form--task {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .upload-form--task {
+    grid-template-columns: 1fr;
+  }
+
+  .upload-form--task > .field:first-child,
+  .upload-form--task > .field--collections {
+    grid-column: auto;
+  }
 }
 </style>
