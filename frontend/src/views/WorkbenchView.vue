@@ -89,6 +89,41 @@ const virtualListRef = ref<{
   focusIndex: (index: number, selector?: string, align?: ScrollLogicalPosition) => Promise<boolean>
 } | null>(null)
 
+const sidecarRef = ref<HTMLElement | null>(null)
+const sidecarWidth = ref<number | null>(null)
+const isResizing = ref(false)
+
+const sidecarWidthStyle = computed(() => {
+  if (sidecarWidth.value === null) return {}
+  return { width: `${sidecarWidth.value}px` }
+})
+
+function startResize(event: MouseEvent) {
+  event.preventDefault()
+  isResizing.value = true
+  const startX = event.clientX
+  const startWidth = sidecarRef.value?.offsetWidth || 400
+
+  function onMouseMove(e: MouseEvent) {
+    const delta = startX - e.clientX
+    const newWidth = Math.max(200, Math.min(startWidth + delta, window.innerWidth * 0.75))
+    sidecarWidth.value = newWidth
+  }
+
+  function onMouseUp() {
+    isResizing.value = false
+    document.removeEventListener('mousemove', onMouseMove)
+    document.removeEventListener('mouseup', onMouseUp)
+    document.body.style.cursor = ''
+    document.body.style.userSelect = ''
+  }
+
+  document.body.style.cursor = 'col-resize'
+  document.body.style.userSelect = 'none'
+  document.addEventListener('mousemove', onMouseMove)
+  document.addEventListener('mouseup', onMouseUp)
+}
+
 const pageError = ref('')
 const llmScope = ref<LLMTranslateScope>('all')
 const llmProvider = ref<LLMProvider>('deepseek')
@@ -608,11 +643,13 @@ async function loadTermEntries() {
 async function openTool(tool: ToolKey) {
   if (activeTool.value === tool) {
     activeTool.value = null
+    sidecarWidth.value = null
     return
   }
 
   pageError.value = ''
   activeTool.value = tool
+  sidecarWidth.value = null
 
   try {
     if (tool === 'source-preview') {
@@ -774,27 +811,14 @@ function confirmCurrentSentence() {
   toast.success(t('workbench.messages.confirmed'))
 }
 
-async function handleAcceptRevision(revisionId: string) {
+async function handleApplyPartialRevision(revisionId: string, newText: string) {
   pageError.value = ''
   revisionActionLoading.value = true
   try {
-    await segmentStore.acceptRevision(revisionId)
-    toast.success('修订已接受')
+    await segmentStore.applyPartialRevision(revisionId, newText)
+    toast.success('已应用修订')
   } catch (error) {
-    pageError.value = getErrorMessage(error, '接受修订失败')
-  } finally {
-    revisionActionLoading.value = false
-  }
-}
-
-async function handleRejectRevision(revisionId: string) {
-  pageError.value = ''
-  revisionActionLoading.value = true
-  try {
-    await segmentStore.rejectRevision(revisionId)
-    toast.success('修订已拒绝')
-  } catch (error) {
-    pageError.value = getErrorMessage(error, '拒绝修订失败')
+    pageError.value = getErrorMessage(error, '应用修订失败')
   } finally {
     revisionActionLoading.value = false
   }
@@ -1275,11 +1299,6 @@ async function ensureMatchInfoPanelOpen() {
 
 function handleSegmentTargetActivate(sentenceId: string) {
   segmentStore.setActiveSentence(sentenceId)
-  // 只有当右侧面板未打开时才自动打开记忆匹配面板
-  // 如果已有面板打开（如原文预览），则保持当前面板，仅进行定位
-  if (!activeTool.value) {
-    void ensureMatchInfoPanelOpen()
-  }
 }
 
 watch(() => props.id, () => {
@@ -1662,8 +1681,7 @@ onBeforeRouteLeave(async () => {
                 @focus="segmentStore.setActiveSentence"
                 @activate-target="handleSegmentTargetActivate"
                 @update="segmentStore.updateTarget"
-                @accept-revision="handleAcceptRevision"
-                @reject-revision="handleRejectRevision"
+                @apply-partial-revision="handleApplyPartialRevision"
               />
             </template>
           </VirtualList>
@@ -1671,8 +1689,18 @@ onBeforeRouteLeave(async () => {
       </section>
 
       <div
+        v-if="activeTool"
+        class="workbench-resizer"
+        @mousedown="startResize"
+      >
+        <div class="workbench-resizer__handle" />
+      </div>
+
+      <div
+        ref="sidecarRef"
         class="workbench-sidecar"
         :class="{ 'is-preview-open': activeTool && activeTool !== 'split-preview', 'is-split-open': activeTool === 'split-preview' }"
+        :style="sidecarWidthStyle"
       >
         <div v-if="activeTool" class="workbench-sidecar__panel">
         <Transition name="preview-drawer" mode="out-in">

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch, nextTick } from 'vue'
 
-import DiffText from './DiffText.vue'
+import InteractiveDiffText from './InteractiveDiffText.vue'
 
 import { getSegmentSourceMeta, getSegmentStatusMeta } from '../constants/status'
 import type { Segment, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
@@ -25,11 +25,11 @@ const emit = defineEmits<{
   update: [sentenceId: string, value: string]
   focus: [sentenceId: string]
   activateTarget: [sentenceId: string]
-  acceptRevision: [revisionId: string]
-  rejectRevision: [revisionId: string]
+  applyPartialRevision: [revisionId: string, newText: string]
 }>()
 
 const editorRef = ref<HTMLDivElement | null>(null)
+const diffTextRef = ref<InstanceType<typeof InteractiveDiffText> | null>(null)
 const isFocused = ref(false)
 
 const statusClass = computed(() => `segment-row--${props.segment.status || 'none'}`)
@@ -251,6 +251,53 @@ watch(
     }
   }
 )
+
+// 处理部分修订应用
+function handleApplyPartial(newText: string) {
+  if (props.pendingRevision) {
+    emit('applyPartialRevision', props.pendingRevision.id, newText)
+  }
+}
+
+// 处理所有修改都已处理完毕
+function handleAllResolved(newText: string) {
+  if (props.pendingRevision) {
+    emit('applyPartialRevision', props.pendingRevision.id, newText)
+  }
+}
+
+// 接受剩余/全部修改
+function handleAcceptRemaining() {
+  if (diffTextRef.value) {
+    diffTextRef.value.acceptAllRemaining()
+  }
+}
+
+// 拒绝剩余/全部修改
+function handleRejectRemaining() {
+  if (diffTextRef.value) {
+    diffTextRef.value.rejectAllRemaining()
+  }
+}
+
+// 计算按钮文案
+const acceptButtonLabel = computed(() => {
+  const pending = diffTextRef.value?.pendingCount ?? 0
+  const total = diffTextRef.value?.totalCount ?? 0
+  if (pending === total || pending === 0) {
+    return '全部接受'
+  }
+  return `接受剩余 (${pending})`
+})
+
+const rejectButtonLabel = computed(() => {
+  const pending = diffTextRef.value?.pendingCount ?? 0
+  const total = diffTextRef.value?.totalCount ?? 0
+  if (pending === total || pending === 0) {
+    return '全部拒绝'
+  }
+  return `拒绝剩余 (${pending})`
+})
 </script>
 
 <template>
@@ -271,7 +318,7 @@ watch(
       </span>
     </div>
 
-    <div class="segment-row__cell segment-row__cell--source">
+    <div class="segment-row__cell segment-row__cell--source" @click="handleClick">
       <div class="segment-row__text">
         <template v-if="highlightedSourceText">
           <template v-for="(seg, idx) in highlightedSourceText" :key="idx">
@@ -291,28 +338,32 @@ watch(
         <div class="segment-row__revision-head">
           <strong>修订对比</strong>
           <span>{{ revisionSourceMeta.label }}</span>
+          <span class="segment-row__revision-hint">右键点击修改处可单独操作</span>
         </div>
-        <DiffText
+        <InteractiveDiffText
+          ref="diffTextRef"
           :old-text="pendingRevision.before_text"
           :new-text="pendingRevision.after_text"
+          :disabled="disabled || revisionBusy"
           empty-text="空"
+          @all-resolved="handleAllResolved"
         />
         <div class="segment-row__revision-actions">
           <button
             class="button segment-row__revision-button"
             type="button"
             :disabled="disabled || revisionBusy"
-            @click.stop="emit('acceptRevision', pendingRevision.id)"
+            @click.stop="handleAcceptRemaining"
           >
-            接受
+            {{ acceptButtonLabel }}
           </button>
           <button
             class="button segment-row__revision-button segment-row__revision-button--danger"
             type="button"
             :disabled="disabled || revisionBusy"
-            @click.stop="emit('rejectRevision', pendingRevision.id)"
+            @click.stop="handleRejectRemaining"
           >
-            拒绝
+            {{ rejectButtonLabel }}
           </button>
         </div>
       </div>
@@ -466,5 +517,12 @@ watch(
 .segment-row__editor:empty::before {
   content: '';
   color: var(--text-placeholder);
+}
+
+.segment-row__revision-hint {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-weight: normal;
 }
 </style>

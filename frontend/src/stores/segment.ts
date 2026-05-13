@@ -459,6 +459,18 @@ export const useSegmentStore = defineStore('segment', () => {
     return data.updated_count
   }
 
+  async function applyPartialRevision(revisionId: string, newText: string) {
+    // 部分接受修订：更新修订的 after_text，然后接受
+    const { data } = await http.patch<SegmentRevisionEntry>(`/revisions/${revisionId}`, {
+      status: 'accepted',
+      after_text: newText,
+    })
+    upsertRevisionEntry(data)
+    // 应用新的文本到 segment
+    applyLLMUpdate(data.sentence_id, newText, data.source, 'confirmed')
+    return data
+  }
+
   function applyLLMUpdate(sentenceId: string, targetText: string, source = 'llm', status = 'confirmed') {
     const index = getSegmentIndex(sentenceId)
     if (index === -1) {
@@ -701,6 +713,7 @@ export const useSegmentStore = defineStore('segment', () => {
     syncToBackend,
     acceptRevision,
     rejectRevision,
+    applyPartialRevision,
     batchAcceptRevisions,
     batchRejectRevisions,
     startLLMTranslation,

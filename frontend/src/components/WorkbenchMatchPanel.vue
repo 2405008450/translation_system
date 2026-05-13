@@ -544,16 +544,20 @@ function getMatchScoreClass(score: number): string {
 }
 
 .candidate-item__diff :deep(.diff-text__segment--insert) {
-  background: rgba(13, 122, 104, 0.14);
-  color: #0b6b5b;
-  box-shadow: inset 0 0 0 1px rgba(13, 122, 104, 0.18);
+  text-decoration: underline;
+  text-decoration-color: rgba(71, 153, 89, 0.6);
+  text-underline-offset: 2px;
+  color: #1b5e3b;
+  background: none;
+  box-shadow: none;
 }
 
 .candidate-item__diff :deep(.diff-text__segment--delete) {
-  background: rgba(194, 59, 63, 0.14);
-  color: #a43a3d;
-  text-decoration-thickness: 1.5px;
-  box-shadow: inset 0 0 0 1px rgba(194, 59, 63, 0.16);
+  text-decoration: line-through;
+  text-decoration-color: rgba(182, 72, 72, 0.6);
+  color: #8b3232;
+  background: none;
+  box-shadow: none;
 }
 
 @media (max-width: 1280px) {
