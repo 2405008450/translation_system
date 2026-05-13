@@ -6,6 +6,7 @@ import { useI18n } from 'vue-i18n'
 
 import { http } from '../api/http'
 import { formatLanguagePair, languageOptions } from '../constants/languages'
+import { isProgressComplete } from '../utils/progress'
 import type {
   TMCollection,
   TMImportSummary,
@@ -584,7 +585,11 @@ onMounted(() => {
       <div v-if="tmImporting" class="resource-import-panel__progress">
         <div class="progress-bar">
           <div class="progress-bar__track">
-            <div class="progress-bar__fill" :style="{ width: `${tmUploadPercent}%` }" />
+            <div
+              class="progress-bar__fill"
+              :class="{ 'is-complete': isProgressComplete(tmUploadPercent) }"
+              :style="{ width: `${tmUploadPercent}%` }"
+            />
           </div>
           <span class="progress-bar__text">{{ tmUploadPercent }}%</span>
         </div>
@@ -733,7 +738,11 @@ onMounted(() => {
       <div v-if="termImporting" class="resource-import-panel__progress">
         <div class="progress-bar">
           <div class="progress-bar__track">
-            <div class="progress-bar__fill" :style="{ width: `${termUploadPercent}%` }" />
+            <div
+              class="progress-bar__fill"
+              :class="{ 'is-complete': isProgressComplete(termUploadPercent) }"
+              :style="{ width: `${termUploadPercent}%` }"
+            />
           </div>
           <span class="progress-bar__text">{{ termUploadPercent }}%</span>
         </div>

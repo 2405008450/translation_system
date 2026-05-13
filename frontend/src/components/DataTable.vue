@@ -41,7 +41,7 @@ const emit = defineEmits<{
   'row-action': [row: Record<string, any>, action: string]
 }>()
 
-defineSlots<{
+const slots = defineSlots<{
   [key: string]: (props: { row: Record<string, any>, index: number }) => any
 }>()
 
@@ -58,6 +58,13 @@ const someSelected = computed(() => {
   const count = props.data.filter(row => props.selectedIds.has(row[props.rowKey])).length
   return count > 0 && count < props.data.length
 })
+
+const tableColspan = computed(() => (
+  props.columns.length
+  + (props.selectable ? 1 : 0)
+  + (props.showIndex ? 1 : 0)
+  + (slots.actions ? 1 : 0)
+))
 
 function handleSort(col: DataTableColumn) {
   if (!col.sortable) return
@@ -99,7 +106,11 @@ watch([allSelected, someSelected], () => {
 </script>
 
 <template>
-  <div class="data-table-wrapper">
+  <div
+    class="data-table-wrapper"
+    :class="{ 'is-loading': loading }"
+    :aria-busy="loading"
+  >
     <table class="data-table">
       <thead>
         <tr>
@@ -130,18 +141,12 @@ watch([allSelected, someSelected], () => {
         </tr>
       </thead>
       <tbody>
-        <tr v-if="loading">
-          <td
-            :colspan="columns.length + (selectable ? 1 : 0) + (showIndex ? 1 : 0) + ($slots.actions ? 1 : 0)"
-            class="data-table__loading"
-          >
-            <Loader2 class="lucide-spin" :size="24" />
-            <span style="margin-left: 8px">{{ t('table.loading') }}</span>
-          </td>
+        <tr v-if="loading" class="data-table__loading-spacer" aria-hidden="true">
+          <td :colspan="tableColspan"></td>
         </tr>
         <tr v-else-if="data.length === 0">
           <td
-            :colspan="columns.length + (selectable ? 1 : 0) + (showIndex ? 1 : 0) + ($slots.actions ? 1 : 0)"
+            :colspan="tableColspan"
             class="data-table__empty"
           >
             {{ emptyText || t('table.empty') }}
@@ -178,5 +183,9 @@ watch([allSelected, someSelected], () => {
         </template>
       </tbody>
     </table>
+    <div v-if="loading" class="data-table__loading-overlay" role="status" aria-live="polite">
+      <Loader2 class="lucide-spin" :size="24" />
+      <span>{{ t('table.loading') }}</span>
+    </div>
   </div>
 </template>

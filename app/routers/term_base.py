@@ -104,21 +104,27 @@ def _serialize_term_base(term_base: TermBase, entry_count: int = 0) -> dict:
 def _require_same_term_base_language_pair(
     term_bases: list[TermBase],
 ) -> tuple[str, str]:
-    source_language, target_language = _require_term_language_pair(
-        term_bases[0].source_language,
-        term_bases[0].target_language,
-    )
+    try:
+        source_language, target_language = require_language_pair(
+            term_bases[0].source_language,
+            term_bases[0].target_language,
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="选中的术语库缺少语言对，无法合并。") from None
 
     for term_base in term_bases[1:]:
-        candidate_source_language, candidate_target_language = _require_term_language_pair(
-            term_base.source_language,
-            term_base.target_language,
-        )
+        try:
+            candidate_source_language, candidate_target_language = require_language_pair(
+                term_base.source_language,
+                term_base.target_language,
+            )
+        except ValueError:
+            raise HTTPException(status_code=400, detail="选中的术语库缺少语言对，无法合并。") from None
         if (
             candidate_source_language != source_language
             or candidate_target_language != target_language
         ):
-            raise HTTPException(status_code=400, detail="只能合并语言对一致的术语库。")
+            raise HTTPException(status_code=400, detail="只能合并语言对完全一致的术语库。")
 
     return source_language, target_language
 

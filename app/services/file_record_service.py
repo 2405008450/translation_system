@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +15,11 @@ from app.services.document_storage import (
     resolve_source_file_path,
     save_source_file,
 )
-from app.services.document_workspace import DOCUMENT_PARSE_MODE_FULL, normalize_document_parse_mode
+from app.services.document_workspace import (
+    DOCUMENT_PARSE_MODE_FULL,
+    normalize_document_parse_options,
+    normalize_document_parse_mode,
+)
 from app.services.revision_service import create_revision
 from app.services.task_file_service import build_task_workspace
 
@@ -60,7 +65,13 @@ def _remember_pending_source_file(db: Session, file_record_id: UUID, filename: s
 
 
 def calculate_file_record_progress(total_segments: int, translated_segments: int) -> int:
-    return round(translated_segments / total_segments * 100) if total_segments > 0 else 0
+    if total_segments <= 0:
+        return 0
+    if translated_segments >= total_segments:
+        return 100
+    if translated_segments <= 0:
+        return 0
+    return min(99, int(translated_segments / total_segments * 100))
 
 
 def resolve_file_record_status(
@@ -138,9 +149,11 @@ def create_file_record_with_segments(
     workspace_data: dict | None = None,
     collection_ids: list[UUID] | None = None,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: dict[str, object] | str | None = None,
 ) -> FileRecord:
     file_hash = hashlib.sha256(raw_bytes).hexdigest()
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
 
     if workspace_data is None:
         workspace_data = build_task_workspace(
@@ -150,6 +163,7 @@ def create_file_record_with_segments(
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
             document_parse_mode=document_parse_mode,
+            document_parse_options=document_parse_options,
         )
 
     return _create_file_record_from_workspace(
@@ -159,6 +173,7 @@ def create_file_record_with_segments(
         workspace_data=workspace_data,
         raw_bytes=raw_bytes,
         document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
     )
 
 
@@ -169,13 +184,16 @@ def _create_file_record_from_workspace(
     workspace_data: dict,
     raw_bytes: bytes | None = None,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: dict[str, object] | str | None = None,
 ) -> FileRecord:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
     file_record = FileRecord(
         filename=filename,
         file_hash=file_hash,
         status="in_progress",
         document_parse_mode=document_parse_mode,
+        document_parse_options=json.dumps(document_parse_options, ensure_ascii=False, sort_keys=True),
     )
     db.add(file_record)
     db.flush()
@@ -363,9 +381,11 @@ def attach_source_document_to_file_record(
     similarity_threshold: float = 0.6,
     collection_ids: list[UUID] | None = None,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: dict[str, object] | str | None = None,
 ) -> FileRecord:
     file_hash = hashlib.sha256(raw_bytes).hexdigest()
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
     workspace_data = build_task_workspace(
         db=db,
         raw_bytes=raw_bytes,
@@ -373,11 +393,13 @@ def attach_source_document_to_file_record(
         similarity_threshold=similarity_threshold,
         collection_ids=collection_ids,
         document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
     )
 
     file_record.file_hash = file_hash
     file_record.status = "in_progress"
     file_record.document_parse_mode = document_parse_mode
+    file_record.document_parse_options = json.dumps(document_parse_options, ensure_ascii=False, sort_keys=True)
 
     for seg in workspace_data["segments"]:
         db.add(
@@ -486,6 +508,17 @@ def list_segments_for_llm_translation(
         "all": ["fuzzy", "none"],
         "all_with_exact": ["exact", "fuzzy", "none"],
     }
+    if scope == "empty_target_only":
+        return (
+            db.query(Segment)
+            .filter(
+                Segment.file_record_id == file_record_id,
+                func.trim(Segment.target_text) == "",
+            )
+            .order_by(*SEGMENT_ORDERING)
+            .all()
+        )
+
     statuses = statuses_by_scope.get(scope)
     if statuses is None:
         raise ValueError(f"不支持的 scope: {scope}")

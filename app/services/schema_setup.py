@@ -46,17 +46,20 @@ REQUIRED_SCHEMA = {
         "id",
         "name",
         "status",
+        "document_parse_mode",
         "source_language",
         "target_language",
         "creator_id",
         "deadline",
         "access_level",
+        "translation_guidelines",
         "created_at",
         "updated_at",
     },
     "file_records": {
         "project_id",
         "document_parse_mode",
+        "document_parse_options",
         "source_language",
         "target_language",
         "creator_id",
@@ -363,14 +366,20 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
                 name VARCHAR(200) NOT NULL,
                 status VARCHAR(20) NOT NULL DEFAULT 'draft',
+                document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full',
                 source_language VARCHAR(20),
                 target_language VARCHAR(20),
                 creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
                 deadline TIMESTAMP,
                 access_level VARCHAR(20) NOT NULL DEFAULT 'team',
+                translation_guidelines TEXT NOT NULL DEFAULT '',
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full'
             """,
             """
             ALTER TABLE IF EXISTS projects
@@ -391,6 +400,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS projects
             ADD COLUMN IF NOT EXISTS access_level VARCHAR(20) NOT NULL DEFAULT 'team'
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS translation_guidelines TEXT NOT NULL DEFAULT ''
             """,
             """
             ALTER TABLE IF EXISTS projects
@@ -424,6 +437,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS file_records
             ADD COLUMN IF NOT EXISTS document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full'
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS document_parse_options TEXT NOT NULL DEFAULT '{}'
             """,
             """
             ALTER TABLE IF EXISTS file_records

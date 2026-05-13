@@ -36,6 +36,7 @@ from app.services.document_workspace import (
     _qn,
     _resolve_paragraph_numbering_reference,
     _select_preferred_alternate_content_branch,
+    normalize_document_parse_options,
     normalize_document_parse_mode,
 )
 from app.services.normalizer import normalize_text
@@ -83,14 +84,21 @@ def export_translated_docx(
     raw_bytes: bytes,
     segments: Iterable[Any],
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
 ) -> bytes:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
     package = DocxPackage(raw_bytes)
-    stories = _build_story_parts(package, document_parse_mode=document_parse_mode)
+    stories = _build_story_parts(
+        package,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
     numbering_schema = _build_numbering_schema(package)
     source_workspace = get_cached_docx_workspace(
         raw_bytes,
         document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
     )
     math_placeholders_by_sentence_id = {
         str(segment["sentence_id"]): dict(segment.get("math_placeholders") or {})
@@ -110,6 +118,8 @@ def export_translated_docx(
         )
 
     _localize_numbering_definitions(package)
+    if document_parse_options.get("clean_format"):
+        _clean_story_formatting(stories)
 
     return _build_modified_docx(
         raw_bytes=raw_bytes,
@@ -1060,6 +1070,29 @@ def _build_modified_docx(
     return output.getvalue()
 
 
+FORMATTING_ELEMENT_NAMES = {
+    "pPr",
+    "rPr",
+    "tblPr",
+    "tblGrid",
+    "trPr",
+    "tcPr",
+}
+
+
+def _clean_story_formatting(stories: Iterable[StoryPart]) -> None:
+    for story in stories:
+        _remove_formatting_elements(story.root)
+
+
+def _remove_formatting_elements(node: ET.Element) -> None:
+    for child in list(node):
+        if _local_name(child.tag) in FORMATTING_ELEMENT_NAMES:
+            node.remove(child)
+            continue
+        _remove_formatting_elements(child)
+
+
 def _register_namespaces(xml_bytes: bytes) -> None:
     seen_namespaces: set[tuple[str, str]] = set()
     for _, namespace in ET.iterparse(BytesIO(xml_bytes), events=("start-ns",)):
@@ -1074,7 +1107,7 @@ def _register_namespaces(xml_bytes: bytes) -> None:
 def _resolve_segment_block_type(story_kind: str, block_type: str) -> str:
     if block_type in {"table_cell", "textbox"}:
         return block_type
-    if story_kind in {"header", "footer", "footnote", "endnote"}:
+    if story_kind in {"header", "footer", "footnote", "endnote", "comment"}:
         return story_kind
     return "paragraph"
 

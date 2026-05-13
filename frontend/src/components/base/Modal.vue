@@ -114,47 +114,49 @@ onBeforeUnmount(() => {
 
 <template>
   <Teleport to="body">
-    <div
-      v-if="open"
-      class="modal-overlay"
-      role="presentation"
-      @click.self="closeOnOverlay && handleClose()"
-    >
-      <section
-        ref="panelRef"
-        class="modal-dialog"
-        :style="{ width }"
-        tabindex="-1"
-        role="dialog"
-        aria-modal="true"
-        :aria-label="title || undefined"
+    <Transition name="modal-pop">
+      <div
+        v-if="open"
+        class="modal-overlay"
+        role="presentation"
+        @click.self="closeOnOverlay && handleClose()"
       >
-        <header v-if="$slots.header || title || description" class="modal-header">
-          <slot name="header">
-            <div class="modal-header__copy">
-              <h3 v-if="title" class="modal-title">{{ title }}</h3>
-              <p v-if="description" class="modal-description">{{ description }}</p>
-            </div>
-          </slot>
-          <button
-            class="modal-close"
-            type="button"
-            aria-label="关闭弹窗"
-            title="关闭"
-            @click="handleClose"
-          >
-            ×
-          </button>
-        </header>
+        <section
+          ref="panelRef"
+          class="modal-dialog"
+          :style="{ width }"
+          tabindex="-1"
+          role="dialog"
+          aria-modal="true"
+          :aria-label="title || undefined"
+        >
+          <header v-if="$slots.header || title || description" class="modal-header">
+            <slot name="header">
+              <div class="modal-header__copy">
+                <h3 v-if="title" class="modal-title">{{ title }}</h3>
+                <p v-if="description" class="modal-description">{{ description }}</p>
+              </div>
+            </slot>
+            <button
+              class="modal-close"
+              type="button"
+              aria-label="关闭弹窗"
+              title="关闭"
+              @click="handleClose"
+            >
+              ×
+            </button>
+          </header>
 
-        <div class="modal-body">
-          <slot />
-        </div>
+          <div class="modal-body">
+            <slot />
+          </div>
 
-        <footer v-if="$slots.footer" class="modal-footer">
-          <slot name="footer" />
-        </footer>
-      </section>
-    </div>
+          <footer v-if="$slots.footer" class="modal-footer">
+            <slot name="footer" />
+          </footer>
+        </section>
+      </div>
+    </Transition>
   </Teleport>
 </template>

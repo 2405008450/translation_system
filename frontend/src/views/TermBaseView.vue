@@ -10,7 +10,7 @@ import type { DataTableColumn } from '../components/DataTable.vue'
 import Modal from '../components/base/Modal.vue'
 import Pagination from '../components/Pagination.vue'
 import { useConfirm } from '../composables/useConfirm'
-import { formatLanguagePair, languageOptions } from '../constants/languages'
+import { canonicalizeLanguagePair, formatLanguagePair, languageOptions } from '../constants/languages'
 import type { TermBase } from '../types/api'
 
 interface TermBaseMergeSummary {
@@ -72,7 +72,13 @@ const selectedTermBaseEntryCount = computed(() => (
 
 const mergeLanguagePairLabel = computed(() => {
   const first = selectedTermBases.value[0]
-  return first ? formatLanguagePair(first.source_language, first.target_language) : ''
+  if (!first) {
+    return ''
+  }
+  const pair = canonicalizeLanguagePair(first.source_language, first.target_language)
+  return pair
+    ? formatLanguagePair(pair.source, pair.target)
+    : formatLanguagePair(first.source_language, first.target_language)
 })
 
 const canMergeSelectedTermBases = computed(() => !getSelectedTermBasesMergeError())
@@ -186,12 +192,15 @@ function getSelectedTermBasesMergeError() {
   if (bases.length < 2) {
     return '请至少选择两个术语库进行合并。'
   }
-  const first = bases[0]
-  const hasMismatch = bases.some((termBase) => (
-    termBase.source_language !== first.source_language
-    || termBase.target_language !== first.target_language
-  ))
-  return hasMismatch ? '只能合并语言对一致的术语库。' : ''
+  const pairs = bases.map((b) => canonicalizeLanguagePair(b.source_language, b.target_language))
+  if (pairs.some((p) => p === null)) {
+    return '选中的术语库缺少有效语言对，无法合并。'
+  }
+  const first = pairs[0]!
+  const hasMismatch = pairs.some(
+    (p) => p!.source !== first.source || p!.target !== first.target,
+  )
+  return hasMismatch ? '只能合并语言对完全一致的术语库。' : ''
 }
 
 function openMergeDialog() {

@@ -417,6 +417,7 @@
                     <div class="d-flex flex-wrap gap-2 justify-content-end llm-toolbar">
                         <select class="form-select" id="llmScope" title="选择 AI 处理范围">
                             <option value="all" selected>处理全部</option>
+                            <option value="empty_target_only">仅空译文</option>
                             <option value="fuzzy_only">仅 fuzzy</option>
                             <option value="none_only">仅 none</option>
                         </select>
@@ -425,7 +426,7 @@
                             <option value="deepseek">DeepSeek</option>
                             <option value="openrouter">OpenRouter</option>
                         </select>
-                        <button class="btn btn-outline-primary" id="btnLlmTranslate" title="对 fuzzy / none 句子执行 AI 译文修正">
+                        <button class="btn btn-outline-primary" id="btnLlmTranslate" title="按所选范围执行 AI 译文修正">
                             AI 译文修正
                         </button>
                         <button class="btn btn-primary" id="btnSaveProgress" title="保存当前翻译进度">
@@ -436,7 +437,7 @@
                         {% endif %}
                         <a href="/" class="btn btn-outline-secondary">返回首页</a>
                     </div>
-                    <div class="small mt-2 text-muted llm-status" id="llmStatus">可对 fuzzy / none 句子执行 AI 译文修正。</div>
+                    <div class="small mt-2 text-muted llm-status" id="llmStatus">可按所选范围执行 AI 译文修正。</div>
                 </div>
             </div>
 

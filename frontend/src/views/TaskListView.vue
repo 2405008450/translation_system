@@ -17,6 +17,7 @@ import { useRouter } from 'vue-router'
 
 import { http } from '../api/http'
 import DataTable from '../components/DataTable.vue'
+import DocumentParseSettings from '../components/DocumentParseSettings.vue'
 import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
 import Pagination from '../components/Pagination.vue'
@@ -27,8 +28,16 @@ import { formatLanguagePair, languageOptions } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
 import { supportedTaskFileAccept } from '../constants/taskFiles'
 import { useTaskStore } from '../stores/task'
-import type { IssueMarker, TermBase, TMCollection } from '../types/api'
-import { getProgressStyle } from '../utils/progress'
+import type {
+  DocumentParseMode,
+  DocumentParseOptions,
+  IssueMarker,
+  TermBase,
+  TMCollection,
+  UploadCapabilitiesResponse,
+  UploadCapability,
+} from '../types/api'
+import { getProgressStyle, isProgressComplete } from '../utils/progress'
 
 interface ProjectRow {
   id: string
@@ -60,9 +69,14 @@ interface ProjectListResponse {
 type MainTab = 'tasks' | 'performance'
 type SubTab = 'all' | 'incomplete'
 type ResourceImportTab = 'tm' | 'term'
-type DocumentParseMode = 'full' | 'body_only'
 
 const NO_TM_COLLECTION_ID = '__NO_TM_COLLECTION__'
+const DEFAULT_DOCUMENT_PARSE_OPTIONS: DocumentParseOptions = {
+  include_headers_footers: true,
+  include_footnotes_endnotes: true,
+  include_comments: true,
+  clean_format: false,
+}
 
 const taskStore = useTaskStore()
 const confirm = useConfirm()
@@ -84,6 +98,10 @@ const selectedTermBaseId = ref('')
 const uploadSourceLanguage = ref('')
 const uploadTargetLanguage = ref('')
 const documentParseMode = ref<DocumentParseMode>('full')
+const documentParseOptions = ref<DocumentParseOptions>({ ...DEFAULT_DOCUMENT_PARSE_OPTIONS })
+const uploadCapabilities = ref<UploadCapability[]>([])
+const uploadFileAccept = ref(supportedTaskFileAccept)
+const loadingUploadCapabilities = ref(false)
 const showUploadForm = ref(false)
 const currentPage = ref(1)
 const pageSize = ref(50)
@@ -141,12 +159,6 @@ const availableTermBases = computed(() => {
     && termBase.target_language === uploadTargetLanguage.value
   ))
 })
-
-const documentParseModeHint = computed(() => (
-  documentParseMode.value === 'body_only'
-    ? t('documentParsing.hints.bodyOnly')
-    : t('documentParsing.hints.full')
-))
 
 const columns = computed<DataTableColumn[]>(() => ([
   { key: 'filename', label: t('taskList.columns.filename'), sortable: true },
@@ -230,6 +242,21 @@ async function loadTermBases() {
   }
 }
 
+async function loadUploadCapabilities() {
+  loadingUploadCapabilities.value = true
+  try {
+    const { data } = await http.get<UploadCapabilitiesResponse>('/file-records/upload-capabilities')
+    uploadCapabilities.value = data.formats
+    uploadFileAccept.value = data.accept || supportedTaskFileAccept
+  } catch (error) {
+    console.error('Failed to load upload capabilities:', error)
+    uploadCapabilities.value = []
+    uploadFileAccept.value = supportedTaskFileAccept
+  } finally {
+    loadingUploadCapabilities.value = false
+  }
+}
+
 function onFileChange(event: Event) {
   selectedFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
 }
@@ -273,6 +300,7 @@ async function uploadFile() {
       uploadSourceLanguage.value,
       uploadTargetLanguage.value,
       documentParseMode.value,
+      documentParseOptions.value,
     )
     selectedFile.value = null
     const fileInput = document.getElementById('upload-file') as HTMLInputElement | null
@@ -420,6 +448,7 @@ onMounted(() => {
   void loadProjects()
   void loadTMCollections()
   void loadTermBases()
+  void loadUploadCapabilities()
 })
 
 onBeforeUnmount(() => {
@@ -437,7 +466,7 @@ onBeforeUnmount(() => {
       <div class="upload-form upload-form--inline upload-form--task">
         <label class="field">
           <span class="field__label">任务文件</span>
-          <input id="upload-file" class="field__control" type="file" :accept="supportedTaskFileAccept" @change="onFileChange" />
+          <input id="upload-file" class="field__control" type="file" :accept="uploadFileAccept" @change="onFileChange" />
         </label>
 
         <label class="field field--compact">
@@ -482,14 +511,14 @@ onBeforeUnmount(() => {
           />
         </label>
 
-        <label class="field field--compact">
-          <span class="field__label">{{ t('documentParsing.label') }}</span>
-          <select v-model="documentParseMode" class="field__control">
-            <option value="full">{{ t('documentParsing.modes.full') }}</option>
-            <option value="body_only">{{ t('documentParsing.modes.bodyOnly') }}</option>
-          </select>
-          <span class="hint-text">{{ documentParseModeHint }}</span>
-        </label>
+        <DocumentParseSettings
+          v-model="documentParseMode"
+          v-model:parse-options="documentParseOptions"
+          :capabilities="uploadCapabilities"
+          :selected-files="selectedFile ? [selectedFile] : []"
+          :loading="loadingUploadCapabilities"
+          variant="inline"
+        />
 
         <label class="field field--collections">
           <span class="field__label">{{ t('taskList.fields.collections') }}</span>
@@ -540,7 +569,11 @@ onBeforeUnmount(() => {
       <div v-if="taskStore.uploading.active" class="task-upload-progress">
         <div class="progress-bar">
           <div class="progress-bar__track">
-            <div class="progress-bar__fill" :style="{ width: `${taskStore.uploading.percent}%` }" />
+            <div
+              class="progress-bar__fill"
+              :class="{ 'is-complete': isProgressComplete(taskStore.uploading.percent) }"
+              :style="{ width: `${taskStore.uploading.percent}%` }"
+            />
           </div>
           <span class="progress-bar__text">{{ taskStore.uploading.percent }}%</span>
         </div>
@@ -675,7 +708,11 @@ onBeforeUnmount(() => {
             <template #progress="{ row }">
               <div class="progress-bar">
                 <div class="progress-bar__track">
-                  <div class="progress-bar__fill" :style="getProgressStyle(row.progress)" />
+                  <div
+                    class="progress-bar__fill"
+                    :class="{ 'is-complete': isProgressComplete(row.progress) }"
+                    :style="getProgressStyle(row.progress, row.status)"
+                  />
                 </div>
                 <span class="progress-bar__text">{{ row.progress }}%</span>
               </div>

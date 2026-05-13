@@ -8,6 +8,7 @@ from html import escape
 import hashlib
 from io import BytesIO
 from itertools import count
+import json
 import mimetypes
 import posixpath
 import re
@@ -74,6 +75,13 @@ SUPPORTED_DOCUMENT_PARSE_MODES = {
     DOCUMENT_PARSE_MODE_FULL,
     DOCUMENT_PARSE_MODE_BODY_ONLY,
 }
+DEFAULT_DOCUMENT_PARSE_OPTIONS = {
+    "include_headers_footers": True,
+    "include_footnotes_endnotes": True,
+    "include_comments": True,
+    "clean_format": False,
+}
+DOCUMENT_PARSE_OPTION_FIELDS = set(DEFAULT_DOCUMENT_PARSE_OPTIONS)
 EMU_PER_PIXEL = 9525
 MATH_PLACEHOLDER_TEMPLATE = "⟦MATH_{index}⟧"
 OMML_ATOMIC_TAGS = {
@@ -150,6 +158,7 @@ class StoryPart:
     root: ET.Element
     rels: dict[str, str]
     package: DocxPackage
+    parse_options: dict[str, bool] = field(default_factory=lambda: dict(DEFAULT_DOCUMENT_PARSE_OPTIONS))
 
 
 @dataclass(frozen=True)
@@ -447,9 +456,15 @@ def build_docx_workspace(
     include_matches: bool = True,
     collection_ids: list[UUID] | None = None,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
 ) -> dict:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
-    parsed_workspace = _get_cached_parsed_workspace(raw_bytes, document_parse_mode=document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
+    parsed_workspace = _get_cached_parsed_workspace(
+        raw_bytes,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
     segments = parsed_workspace["segments"]
     match_stats = _build_empty_match_stats()
 
@@ -503,11 +518,46 @@ def normalize_document_parse_mode(value: str | None) -> str:
     return normalized
 
 
+def normalize_document_parse_options(
+    value: Mapping[str, object] | str | None = None,
+    document_parse_mode: str | None = None,
+) -> dict[str, bool]:
+    raw_options: Mapping[str, object] = {}
+    if isinstance(value, str) and value.strip():
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("文档设置不是有效的 JSON。") from exc
+        if not isinstance(decoded, Mapping):
+            raise ValueError("文档设置必须是对象。")
+        raw_options = decoded
+    elif isinstance(value, Mapping):
+        raw_options = value
+
+    options = dict(DEFAULT_DOCUMENT_PARSE_OPTIONS)
+    for key in DOCUMENT_PARSE_OPTION_FIELDS:
+        if key in raw_options:
+            options[key] = bool(raw_options[key])
+
+    if normalize_document_parse_mode(document_parse_mode) == DOCUMENT_PARSE_MODE_BODY_ONLY:
+        options["include_headers_footers"] = False
+        options["include_footnotes_endnotes"] = False
+        options["include_comments"] = False
+
+    return options
+
+
+def serialize_document_parse_options(options: Mapping[str, object] | str | None = None) -> str:
+    return json.dumps(normalize_document_parse_options(options), ensure_ascii=False, sort_keys=True)
+
+
 def parse_docx_workspace(
     raw_bytes: bytes,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
 ) -> dict:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
     package = DocxPackage(raw_bytes)
     numbering_schema = _build_numbering_schema(package)
     sentence_counter = count(1)
@@ -515,7 +565,11 @@ def parse_docx_workspace(
 
     html_parts: list[str] = []
     segments: list[dict] = []
-    for story in _build_story_parts(package, document_parse_mode=document_parse_mode):
+    for story in _build_story_parts(
+        package,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    ):
         numbering_state = NumberingState(schema=numbering_schema)
         story_html_parts, story_segments = _render_block_sequence(
             container=story.root,
@@ -548,34 +602,49 @@ def parse_docx_workspace(
 def build_docx_preview_html(
     raw_bytes: bytes,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
 ) -> str:
     return _get_cached_parsed_workspace(
         raw_bytes,
         document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
     )["document_html"]
 
 
 def get_cached_docx_workspace(
     raw_bytes: bytes,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
 ) -> dict:
-    return _get_cached_parsed_workspace(raw_bytes, document_parse_mode=document_parse_mode)
+    return _get_cached_parsed_workspace(
+        raw_bytes,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
 
 
 def _get_cached_parsed_workspace(
     raw_bytes: bytes,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
 ) -> dict:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
+    options_key = json.dumps(document_parse_options, ensure_ascii=False, sort_keys=True)
     cache_key = (
         f"preview:workspace:v{DOCX_PARSE_CACHE_VERSION}:"
-        f"{document_parse_mode}:{hashlib.sha256(raw_bytes).hexdigest()}"
+        f"{document_parse_mode}:{hashlib.sha256(options_key.encode('utf-8')).hexdigest()}:"
+        f"{hashlib.sha256(raw_bytes).hexdigest()}"
     )
     cached_workspace = get_json(cache_key)
     if isinstance(cached_workspace, dict):
         return copy.deepcopy(cached_workspace)
 
-    parsed_workspace = parse_docx_workspace(raw_bytes, document_parse_mode=document_parse_mode)
+    parsed_workspace = parse_docx_workspace(
+        raw_bytes,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
     set_json(cache_key, parsed_workspace, ttl_seconds=DOCX_PARSE_CACHE_TTL_SECONDS)
     return copy.deepcopy(parsed_workspace)
 
@@ -583,8 +652,10 @@ def _get_cached_parsed_workspace(
 def _build_story_parts(
     package: DocxPackage,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
 ) -> list[StoryPart]:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
     document_part_name = "word/document.xml"
     document_root = package.read_xml(document_part_name)
     if document_root is None:
@@ -599,12 +670,12 @@ def _build_story_parts(
     include_extended_stories = document_parse_mode == DOCUMENT_PARSE_MODE_FULL
     header_parts = (
         _collect_story_reference_parts(body, document_rels, "headerReference")
-        if include_extended_stories
+        if include_extended_stories and document_parse_options["include_headers_footers"]
         else []
     )
     footer_parts = (
         _collect_story_reference_parts(body, document_rels, "footerReference")
-        if include_extended_stories
+        if include_extended_stories and document_parse_options["include_headers_footers"]
         else []
     )
 
@@ -620,6 +691,7 @@ def _build_story_parts(
                 root=root,
                 rels=package.read_relationships(part_name),
                 package=package,
+                parse_options=document_parse_options,
             )
         )
 
@@ -631,11 +703,38 @@ def _build_story_parts(
             root=body,
             rels=document_rels,
             package=package,
+            parse_options=document_parse_options,
         )
     )
-    if include_extended_stories:
-        stories.extend(_build_note_story_parts(package, "word/footnotes.xml", "footnote", "Footnote"))
-        stories.extend(_build_note_story_parts(package, "word/endnotes.xml", "endnote", "Endnote"))
+    if include_extended_stories and document_parse_options["include_footnotes_endnotes"]:
+        stories.extend(
+            _build_note_story_parts(
+                package,
+                "word/footnotes.xml",
+                "footnote",
+                "Footnote",
+                document_parse_options=document_parse_options,
+            )
+        )
+        stories.extend(
+            _build_note_story_parts(
+                package,
+                "word/endnotes.xml",
+                "endnote",
+                "Endnote",
+                document_parse_options=document_parse_options,
+            )
+        )
+    if include_extended_stories and document_parse_options["include_comments"]:
+        stories.extend(
+            _build_note_story_parts(
+                package,
+                "word/comments.xml",
+                "comment",
+                "Comment",
+                document_parse_options=document_parse_options,
+            )
+        )
 
     for index, part_name in enumerate(footer_parts, start=1):
         root = package.read_xml(part_name)
@@ -649,6 +748,7 @@ def _build_story_parts(
                 root=root,
                 rels=package.read_relationships(part_name),
                 package=package,
+                parse_options=document_parse_options,
             )
         )
 
@@ -683,6 +783,7 @@ def _build_note_story_parts(
     part_name: str,
     kind: str,
     label_prefix: str,
+    document_parse_options: Mapping[str, bool] | None = None,
 ) -> list[StoryPart]:
     root = package.read_xml(part_name)
     if root is None:
@@ -705,6 +806,7 @@ def _build_note_story_parts(
                 root=note,
                 rels=rels,
                 package=package,
+                parse_options=dict(document_parse_options or DEFAULT_DOCUMENT_PARSE_OPTIONS),
             )
         )
     return stories
@@ -869,7 +971,7 @@ def _collect_paragraph_render_data(
         embedded_html_parts=embedded_html_parts,
         embedded_segments=embedded_segments,
         numbering_text=numbering_text,
-        paragraph_css=_build_paragraph_css(paragraph),
+        paragraph_css="" if story.parse_options.get("clean_format") else _build_paragraph_css(paragraph),
         suppressed_page_number_field=parse_state.suppressed_page_number_field,
     )
 
@@ -1052,7 +1154,7 @@ def _render_table(
             if not cell_inner_html_parts:
                 cell_inner_html_parts.append('<p class="doc-paragraph doc-empty"><br></p>')
 
-            cell_style = _build_cell_css(cell)
+            cell_style = "" if story.parse_options.get("clean_format") else _build_cell_css(cell)
             cell_style_attr = f' style="{cell_style}"' if cell_style else ""
             cell_span_attrs = _build_cell_span_attrs(cell)
             cell_html_parts.append(
@@ -1534,7 +1636,8 @@ def _collect_inline_content(
         hyperlink = _resolve_hyperlink_target(node, story.rels) or hyperlink
 
     if node.tag == _qn("w", "r"):
-        inherited_css = _merge_css(inherited_css, _build_run_css(node))
+        if not story.parse_options.get("clean_format"):
+            inherited_css = _merge_css(inherited_css, _build_run_css(node))
 
     if node.tag == _qn("w", "fldChar"):
         _update_field_state(node, story.kind, parse_state)
@@ -2304,7 +2407,7 @@ def _build_cell_span_attrs(cell: ET.Element) -> str:
 def _resolve_segment_block_type(story_kind: str, block_type: str) -> str:
     if block_type in {"table_cell", "textbox"}:
         return block_type
-    if story_kind in {"header", "footer", "footnote", "endnote"}:
+    if story_kind in {"header", "footer", "footnote", "endnote", "comment"}:
         return story_kind
     return "paragraph"
 

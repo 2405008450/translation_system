@@ -10,7 +10,7 @@ import type { DataTableColumn } from '../components/DataTable.vue'
 import Modal from '../components/base/Modal.vue'
 import Pagination from '../components/Pagination.vue'
 import { useConfirm } from '../composables/useConfirm'
-import { formatLanguagePair, languageOptions } from '../constants/languages'
+import { canonicalizeLanguagePair, formatLanguagePair, languageOptions } from '../constants/languages'
 import type { TMCollection } from '../types/api'
 
 interface TMCollectionMergeSummary {
@@ -72,7 +72,13 @@ const selectedCollectionEntryCount = computed(() => (
 
 const mergeLanguagePairLabel = computed(() => {
   const first = selectedCollections.value[0]
-  return first ? formatLanguagePair(first.source_language, first.target_language) : ''
+  if (!first) {
+    return ''
+  }
+  const pair = canonicalizeLanguagePair(first.source_language, first.target_language)
+  return pair
+    ? formatLanguagePair(pair.source, pair.target)
+    : formatLanguagePair(first.source_language, first.target_language)
 })
 
 const canMergeSelectedCollections = computed(() => !getSelectedCollectionsMergeError())
@@ -204,15 +210,15 @@ function getSelectedCollectionsMergeError() {
   if (collections.length < 2) {
     return '请至少选择两个记忆库进行合并。'
   }
-  if (collections.some((collection) => !collection.source_language || !collection.target_language)) {
-    return '选中的记忆库缺少语言对，无法合并。'
+  const pairs = collections.map((c) => canonicalizeLanguagePair(c.source_language, c.target_language))
+  if (pairs.some((p) => p === null)) {
+    return '选中的记忆库缺少有效语言对，无法合并。'
   }
-  const first = collections[0]
-  const hasMismatch = collections.some((collection) => (
-    collection.source_language !== first.source_language
-    || collection.target_language !== first.target_language
-  ))
-  return hasMismatch ? '只能合并语言对一致的记忆库。' : ''
+  const first = pairs[0]!
+  const hasMismatch = pairs.some(
+    (p) => p!.source !== first.source || p!.target !== first.target,
+  )
+  return hasMismatch ? '只能合并语言对完全一致的记忆库。' : ''
 }
 
 function openMergeDialog() {
