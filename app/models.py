@@ -98,6 +98,12 @@ class FileRecord(Base):
         default="full",
         server_default=text("'full'"),
     )
+    document_parse_options: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="{}",
+        server_default=text("'{}'"),
+    )
     source_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
     target_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
     creator_id: Mapped[uuid.UUID | None] = mapped_column(

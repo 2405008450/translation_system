@@ -18,6 +18,11 @@ export const llmScopeOptions: LLMOption<LLMTranslateScope>[] = [
     description: '连同精确匹配句段一起重跑。',
   },
   {
+    value: 'empty_target_only',
+    label: '仅空译文',
+    description: '只处理译文为空的句段，保留已有译文。',
+  },
+  {
     value: 'fuzzy_only',
     label: '仅模糊匹配',
     description: '只修正模糊匹配句段。',

@@ -8,9 +8,7 @@ import {
   type ImportTaskAccepted,
 } from '../api/importTasks'
 import { http } from '../api/http'
-import type { FileRecordSummary } from '../types/api'
-
-type DocumentParseMode = 'full' | 'body_only'
+import type { DocumentParseMode, DocumentParseOptions, FileRecordSummary } from '../types/api'
 
 interface UploadingState {
   active: boolean
@@ -68,6 +66,7 @@ export const useTaskStore = defineStore('task', () => {
     sourceLanguage = '',
     targetLanguage = '',
     documentParseMode: DocumentParseMode = 'full',
+    documentParseOptions: DocumentParseOptions | null = null,
   ) {
     uploading.value = {
       active: true,
@@ -81,6 +80,9 @@ export const useTaskStore = defineStore('task', () => {
       formData.append('source_language', sourceLanguage)
       formData.append('target_language', targetLanguage)
       formData.append('document_parse_mode', documentParseMode)
+      if (documentParseOptions) {
+        formData.append('document_parse_options', JSON.stringify(documentParseOptions))
+      }
       collectionIds.forEach((collectionId) => {
         formData.append('collection_ids', collectionId)
       })

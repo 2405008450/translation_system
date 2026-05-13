@@ -7,6 +7,7 @@ import { http } from '../api/http'
 import { pushToast } from '../composables/useToast'
 import type { GuidelineTemplateSummary, LLMProvider, LLMTranslateScope, TermBase, TMCollection } from '../types/api'
 import { consumeLLMStream } from '../utils/llmStream'
+import { isProgressComplete } from '../utils/progress'
 import Modal from './base/Modal.vue'
 
 interface ProjectFileItem {
@@ -76,6 +77,7 @@ const llmScopeOptions = computed<Array<{ value: LLMTranslateScope, label: string
   { value: 'all', label: t('projectDetail.preTranslate.llm.scopes.all') },
   { value: 'fuzzy_only', label: t('projectDetail.preTranslate.llm.scopes.fuzzyOnly') },
   { value: 'none_only', label: t('projectDetail.preTranslate.llm.scopes.noneOnly') },
+  { value: 'empty_target_only', label: t('projectDetail.preTranslate.llm.scopes.emptyTargetOnly') },
   { value: 'all_with_exact', label: t('projectDetail.preTranslate.llm.scopes.allWithExact') },
 ])
 
@@ -579,7 +581,11 @@ function stopPreTranslate() {
       <div v-if="running || Object.keys(progressByFileId).length > 0" class="ptd-progress">
         <div class="progress-bar">
           <div class="progress-bar__track">
-            <div class="progress-bar__fill" :style="{ width: `${overallProgress}%` }" />
+            <div
+              class="progress-bar__fill"
+              :class="{ 'is-complete': isProgressComplete(overallProgress) }"
+              :style="{ width: `${overallProgress}%` }"
+            />
           </div>
           <span class="progress-bar__text">{{ overallProgress }}%</span>
         </div>

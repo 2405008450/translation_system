@@ -25,7 +25,7 @@ import Pagination from '../components/Pagination.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { useToast } from '../composables/useToast'
 import { getFileStatusMeta } from '../constants/status'
-import { getProgressStyle } from '../utils/progress'
+import { getProgressStyle, isProgressComplete } from '../utils/progress'
 import type { IssueMarker } from '../types/api'
 
 interface ProjectItem {
@@ -381,7 +381,11 @@ onMounted(() => {
         <template #progress="{ row }">
           <div class="progress-bar">
             <div class="progress-bar__track">
-              <div class="progress-bar__fill" :style="getProgressStyle(row.progress)" />
+              <div
+                class="progress-bar__fill"
+                :class="{ 'is-complete': isProgressComplete(row.progress) }"
+                :style="getProgressStyle(row.progress, row.status)"
+              />
             </div>
             <span class="progress-bar__text">{{ row.progress }}%</span>
           </div>

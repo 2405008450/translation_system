@@ -9,6 +9,7 @@ import {
   Search,
   Trash2,
   Upload,
+  X,
 } from 'lucide-vue-next'
 import { computed, onMounted, ref } from 'vue'
 
@@ -58,7 +59,7 @@ const selectedHasChanges = computed(() => (
   selectedTemplate.value ? editorContent.value !== selectedTemplate.value.content : false
 ))
 
-const editorTitle = computed(() => selectedTemplate.value?.name || '选择翻译规则')
+const editorTitle = computed(() => selectedTemplate.value?.name || '翻译规则详情')
 
 usePageHeader(() => ({
   title: '翻译规则',
@@ -187,6 +188,23 @@ async function deleteSelectedTemplate() {
   }
 }
 
+async function closeEditor() {
+  if (selectedHasChanges.value) {
+    const confirmed = await confirm({
+      title: '关闭翻译规则',
+      message: '当前规则有未保存修改，关闭后会丢失这些修改。是否继续？',
+      confirmText: '继续关闭',
+    })
+    if (!confirmed) {
+      return
+    }
+  }
+
+  selectedTemplate.value = null
+  selectedTemplateId.value = ''
+  editorContent.value = ''
+}
+
 function openImportPicker() {
   ruleFileInputRef.value?.click()
 }
@@ -223,7 +241,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="translation-rules-page">
+  <div class="translation-rules-page" :class="{ 'has-editor': selectedTemplate }">
     <section class="table-page translation-rules-list">
       <div class="table-toolbar translation-rules-toolbar">
         <div class="table-toolbar__left">
@@ -309,12 +327,12 @@ onMounted(() => {
       </div>
     </section>
 
-    <section class="panel translation-rule-editor">
+    <section v-if="selectedTemplate" class="panel translation-rule-editor">
       <div class="translation-rule-editor__head">
         <div>
           <div class="section-title section-title--tight">{{ editorTitle }}</div>
           <p class="panel-subtitle">
-            {{ selectedTemplate ? selectedTemplate.filename : '从左侧选择一条规则后进行微调。' }}
+            {{ selectedTemplate.filename }}
           </p>
         </div>
         <div class="translation-rule-editor__actions">
@@ -338,13 +356,21 @@ onMounted(() => {
             <Trash2 v-else :size="14" />
             删除
           </button>
+          <button
+            class="button translation-rule-editor__close"
+            type="button"
+            title="关闭"
+            aria-label="关闭翻译规则详情"
+            @click="closeEditor"
+          >
+            <X :size="14" />
+          </button>
         </div>
       </div>
 
       <textarea
         v-model="editorContent"
         class="field__control translation-rule-editor__textarea"
-        :disabled="!selectedTemplate"
         placeholder="支持 Markdown。首个标题会作为规则名称显示，例如：# 医疗器械翻译规则"
       />
 
@@ -358,9 +384,13 @@ onMounted(() => {
 <style scoped>
 .translation-rules-page {
   display: grid;
-  grid-template-columns: minmax(0, 1.1fr) minmax(360px, 0.9fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
   align-items: start;
+}
+
+.translation-rules-page.has-editor {
+  grid-template-columns: minmax(0, 1.1fr) minmax(360px, 0.9fr);
 }
 
 .translation-rules-toolbar {
@@ -432,6 +462,12 @@ onMounted(() => {
   justify-content: flex-end;
 }
 
+.translation-rule-editor__close {
+  width: 36px;
+  min-width: 36px;
+  padding-inline: 0;
+}
+
 .translation-rule-editor__textarea {
   min-height: calc(100vh - 250px);
   resize: vertical;
@@ -440,7 +476,8 @@ onMounted(() => {
 }
 
 @media (max-width: 1120px) {
-  .translation-rules-page {
+  .translation-rules-page,
+  .translation-rules-page.has-editor {
     grid-template-columns: 1fr;
   }
 

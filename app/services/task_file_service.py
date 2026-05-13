@@ -8,6 +8,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.services.adapters import ensure_default_adapters_registered
+from app.services.adapters.base import DEFAULT_MAX_FILE_SIZE, FORMAT_SIZE_LIMITS
 from app.services.adapters.export_formats import get_supported_exports
 from app.services.adapters.models import BlockNode, DocumentAST, NodeType, ParseResult
 from app.services.adapters.multi_format_exporter import export_file as export_multi_format_file
@@ -21,6 +22,7 @@ from app.services.document_workspace import (
     build_docx_preview_html,
     build_docx_workspace,
     build_document_html_from_segments,
+    normalize_document_parse_options,
     normalize_document_parse_mode,
 )
 from app.services.matcher import MatchStats, match_sentences_with_stats
@@ -57,6 +59,175 @@ LOSSY_EXPORTABLE_TASK_EXTENSIONS = {
     ".html",
     ".htm",
 }
+
+DOCX_PARSE_MODE_CAPABILITIES = (
+    {
+        "id": "full",
+        "label": "完整解析",
+        "description": "解析正文、表格、页眉页脚、脚注尾注、文本框、编号、数学公式占位和 Word 批注。",
+    },
+    {
+        "id": "body_only",
+        "label": "仅正文解析",
+        "description": "仅解析正文相关内容，页眉页脚、脚注尾注和 Word 批注保留原文。",
+    },
+)
+
+AUTO_PARSE_MODE_CAPABILITY = {
+    "id": "auto",
+    "label": "按格式自动解析",
+    "description": "后端根据文件格式提取真实可翻译文本。",
+}
+
+_UPLOAD_CAPABILITY_SPECS = (
+    {
+        "extensions": (".docx",),
+        "label": "Word 文档",
+        "category": "office",
+        "features": (
+            "正文与表格",
+            "页眉页脚、脚注尾注",
+            "文本框、编号、数学公式占位",
+            "Word 批注",
+        ),
+        "settings": (
+            {
+                "id": "include_headers_footers",
+                "label": "翻译页眉页脚",
+                "default": True,
+            },
+            {
+                "id": "include_footnotes_endnotes",
+                "label": "翻译脚注尾注",
+                "default": True,
+            },
+            {
+                "id": "include_comments",
+                "label": "翻译批注",
+                "default": True,
+            },
+            {
+                "id": "clean_format",
+                "label": "清洗格式",
+                "default": False,
+            },
+        ),
+    },
+    {
+        "extensions": (".txt",),
+        "label": "纯文本",
+        "category": "text",
+        "features": ("按空行识别段落", "自动断句", "支持 UTF-8 / UTF-8-BOM / GB18030"),
+    },
+    {
+        "extensions": (".csv",),
+        "label": "CSV 表格",
+        "category": "table",
+        "features": ("自动识别分隔符", "提取非数字单元格", "保留行列位置"),
+    },
+    {
+        "extensions": (".html", ".htm"),
+        "label": "HTML 网页",
+        "category": "web",
+        "features": ("提取可见文本", "跳过脚本和样式", "支持原格式导出"),
+    },
+    {
+        "extensions": (".md", ".markdown"),
+        "label": "Markdown",
+        "category": "text",
+        "features": ("标题、段落、列表和引用可翻译", "代码块跳过", "保留 Markdown 结构定位"),
+    },
+    {
+        "extensions": (".json",),
+        "label": "JSON",
+        "category": "localization",
+        "features": ("递归提取字符串值", "保留键路径", "跳过非字符串值"),
+    },
+    {
+        "extensions": (".yaml", ".yml"),
+        "label": "YAML",
+        "category": "localization",
+        "features": ("提取字符串值", "保留配置路径", "跳过结构字段"),
+    },
+    {
+        "extensions": (".properties",),
+        "label": "Properties",
+        "category": "localization",
+        "features": ("提取键值文本", "保留 key", "支持原格式导出"),
+    },
+    {
+        "extensions": (".po", ".pot"),
+        "label": "PO / POT",
+        "category": "localization",
+        "features": ("提取 msgid", "保留条目顺序", "支持原格式导出"),
+    },
+    {
+        "extensions": (".strings",),
+        "label": "Apple Strings",
+        "category": "localization",
+        "features": ("提取字符串值", "保留 key", "支持原格式导出"),
+    },
+    {
+        "extensions": (".php",),
+        "label": "PHP 本地化",
+        "category": "localization",
+        "features": ("提取数组字符串", "保留键路径", "跳过代码逻辑"),
+    },
+    {
+        "extensions": (".srt",),
+        "label": "SRT 字幕",
+        "category": "subtitle",
+        "features": ("提取字幕文本", "保留时间轴", "支持原格式导出"),
+    },
+    {
+        "extensions": (".dita", ".ditamap", ".xml"),
+        "label": "DITA / XML",
+        "category": "technical",
+        "features": ("提取可翻译元素文本", "保留结构路径", "支持原格式导出"),
+    },
+    {
+        "extensions": (".svg",),
+        "label": "SVG",
+        "category": "design",
+        "features": ("提取 text / tspan 文本", "保留图形结构", "支持原格式导出"),
+    },
+    {
+        "extensions": (".sdlxliff",),
+        "label": "SDLXLIFF",
+        "category": "bilingual",
+        "features": ("提取双语交换句段", "保留单元 ID", "支持原格式导出"),
+    },
+    {
+        "extensions": (".txml",),
+        "label": "TXML",
+        "category": "bilingual",
+        "features": ("提取 Wordfast 句段", "保留单元 ID", "支持原格式导出"),
+    },
+    {
+        "extensions": (".dxf",),
+        "label": "DXF",
+        "category": "engineering",
+        "features": ("提取图纸文本", "保留文本实体定位", "支持原格式导出"),
+    },
+    {
+        "extensions": (".idml",),
+        "label": "IDML",
+        "category": "design",
+        "features": ("提取 InDesign Story 文本", "保留 story 路径", "支持原格式导出"),
+    },
+    {
+        "extensions": (".mif",),
+        "label": "MIF",
+        "category": "technical",
+        "features": ("提取 FrameMaker 文本", "保留结构定位", "支持原格式导出"),
+    },
+    {
+        "extensions": (".zip",),
+        "label": "ZIP 压缩包",
+        "category": "archive",
+        "features": ("递归解析包内支持格式", "跳过不支持文件", "按内部文件回写导出"),
+    },
+)
 
 
 @dataclass(frozen=True)
@@ -99,6 +270,48 @@ def can_export_task_file(filename: str, has_source_file: bool = True) -> bool:
     return any(option.id == "original" for option in get_supported_exports(extension))
 
 
+def get_upload_capabilities() -> dict[str, Any]:
+    supported_extensions = get_supported_task_extensions()
+    supported_set = set(supported_extensions)
+    formats: list[dict[str, Any]] = []
+
+    for spec in _UPLOAD_CAPABILITY_SPECS:
+        extensions = [extension for extension in spec["extensions"] if extension in supported_set]
+        if not extensions:
+            continue
+
+        is_docx = extensions == [".docx"]
+        formats.append(
+            {
+                "extensions": extensions,
+                "accept": ",".join(extensions),
+                "label": spec["label"],
+                "category": spec["category"],
+                "max_size_mb": max(_get_upload_max_size_mb(extension) for extension in extensions),
+                "can_export_original": any(can_export_task_file(f"file{extension}") for extension in extensions),
+                "parse_modes": list(DOCX_PARSE_MODE_CAPABILITIES if is_docx else (AUTO_PARSE_MODE_CAPABILITY,)),
+                "features": list(spec["features"]),
+                "settings": list(spec.get("settings", ())),
+            }
+        )
+
+    return {
+        "extensions": list(supported_extensions),
+        "accept": ",".join(supported_extensions),
+        "formats": formats,
+    }
+
+
+def _get_upload_max_size_mb(extension: str) -> float:
+    registry = ensure_default_adapters_registered()
+    try:
+        adapter = registry.get_adapter(f"file{extension}")
+        max_size = adapter.get_max_file_size()
+    except Exception:
+        max_size = FORMAT_SIZE_LIMITS.get(extension, DEFAULT_MAX_FILE_SIZE)
+    return round(max_size / (1024 * 1024), 2)
+
+
 def build_task_workspace(
     db: Session,
     raw_bytes: bytes,
@@ -106,8 +319,10 @@ def build_task_workspace(
     similarity_threshold: float,
     collection_ids: list[UUID] | None = None,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: dict[str, object] | str | None = None,
 ) -> dict[str, Any]:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
     if is_docx_task(filename):
         return build_docx_workspace(
             db=db,
@@ -115,6 +330,7 @@ def build_task_workspace(
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
             document_parse_mode=document_parse_mode,
+            document_parse_options=document_parse_options,
         )
 
     if not supports_task_file(filename):
@@ -168,10 +384,16 @@ def build_task_preview_html(
     segments: list[Any],
     source_bytes: bytes | None = None,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: dict[str, object] | str | None = None,
 ) -> str:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
     if source_bytes and is_docx_task(filename):
-        return build_docx_preview_html(source_bytes, document_parse_mode=document_parse_mode)
+        return build_docx_preview_html(
+            source_bytes,
+            document_parse_mode=document_parse_mode,
+            document_parse_options=document_parse_options,
+        )
     return build_document_html_from_segments(segments) if segments else ""
 
 
@@ -180,8 +402,10 @@ def export_translated_task_file(
     filename: str,
     segments: list[Any],
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: dict[str, object] | str | None = None,
 ) -> ExportedTaskFile:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
     if is_docx_task(filename):
         if raw_bytes is None:
             raise ValueError("DOCX 源文件缺失，暂时无法导出。")
@@ -190,6 +414,7 @@ def export_translated_task_file(
                 raw_bytes=raw_bytes,
                 segments=segments,
                 document_parse_mode=document_parse_mode,
+                document_parse_options=document_parse_options,
             ),
             media_type=DOCX_MEDIA_TYPE,
             filename=build_translated_docx_filename(filename),

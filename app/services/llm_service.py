@@ -24,7 +24,7 @@ except ModuleNotFoundError:  # pragma: no cover - 允许在无 httpx 环境下�
 logger = logging.getLogger(__name__)
 
 LLMProvider = Literal["auto", "deepseek", "openrouter"]
-LLMScope = Literal["fuzzy_only", "none_only", "all", "all_with_exact"]
+LLMScope = Literal["fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"]
 
 
 class LLMServiceError(RuntimeError):

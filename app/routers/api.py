@@ -116,8 +116,11 @@ from app.services.task_file_service import (
     build_task_workspace,
     can_export_task_file,
     export_translated_task_file,
+    get_upload_capabilities,
     get_supported_task_extensions,
     get_task_file_extension,
+    normalize_document_parse_options,
+    normalize_document_parse_mode,
     supports_task_file,
 )
 from app.services.tm_importer import (
@@ -149,6 +152,7 @@ def _build_task_workspace_with_new_session(
     similarity_threshold: float,
     collection_ids: list[UUID] | None,
     document_parse_mode: str,
+    document_parse_options: dict[str, object] | str | None = None,
 ) -> dict:
     with SessionLocal() as workspace_db:
         return build_task_workspace(
@@ -158,6 +162,7 @@ def _build_task_workspace_with_new_session(
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
             document_parse_mode=document_parse_mode,
+            document_parse_options=document_parse_options,
         )
 
 
@@ -167,6 +172,7 @@ async def _build_task_workspace_async(
     similarity_threshold: float,
     collection_ids: list[UUID] | None = None,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: dict[str, object] | str | None = None,
 ) -> dict:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
@@ -178,6 +184,7 @@ async def _build_task_workspace_async(
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
             document_parse_mode=document_parse_mode,
+            document_parse_options=document_parse_options,
         ),
     )
 
@@ -311,6 +318,7 @@ def _serialize_file_record_upload_result(file_record: FileRecord) -> dict[str, A
         "filename": file_record.filename,
         "status": file_record.status,
         "document_parse_mode": file_record.document_parse_mode,
+        "document_parse_options": _get_file_record_document_parse_options(file_record),
         "created_at": file_record.created_at.isoformat(),
     }
 
@@ -322,6 +330,13 @@ def _json_ready_project_file_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _get_file_record_document_parse_options(file_record: FileRecord) -> dict[str, bool]:
+    return normalize_document_parse_options(
+        getattr(file_record, "document_parse_options", None),
+        getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
+    )
+
+
 def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
     file_payload = payload["file"]
     raw_bytes = file_payload["content"]
@@ -329,6 +344,7 @@ def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[st
     selected_collection_ids = _uuid_list(payload.get("collection_ids"))
     term_base_id = UUID(payload["term_base_id"]) if payload.get("term_base_id") else None
     document_parse_mode = payload.get("document_parse_mode") or DOCUMENT_PARSE_MODE_FULL
+    document_parse_options = payload.get("document_parse_options")
     threshold = float(payload.get("threshold", 0.6))
 
     primary_collection = _get_collection_or_404(
@@ -360,6 +376,7 @@ def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[st
         similarity_threshold=threshold,
         collection_ids=selected_collection_ids,
         document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
     )
     file_record = create_file_record_with_segments(
         db=db,
@@ -369,6 +386,7 @@ def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[st
         workspace_data=workspace_data,
         collection_ids=selected_collection_ids,
         document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
     )
     if selected_collection_ids:
         file_record.collection_id = selected_collection_ids[0]
@@ -392,6 +410,7 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
     selected_collection_ids = _uuid_list(payload.get("collection_ids"))
     term_base_id = UUID(payload["term_base_id"]) if payload.get("term_base_id") else None
     document_parse_mode = payload.get("document_parse_mode") or DOCUMENT_PARSE_MODE_FULL
+    document_parse_options = payload.get("document_parse_options")
     threshold = float(payload.get("threshold", 0.6))
     primary_collection = _get_collection_or_404(
         db,
@@ -432,6 +451,7 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
             similarity_threshold=threshold,
             collection_ids=selected_collection_ids,
             document_parse_mode=document_parse_mode,
+            document_parse_options=document_parse_options,
         )
         file_record = create_file_record_with_segments(
             db=db,
@@ -441,6 +461,7 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
             workspace_data=workspace_data,
             collection_ids=selected_collection_ids,
             document_parse_mode=document_parse_mode,
+            document_parse_options=document_parse_options,
         )
         file_record.project_id = project.id
         file_record.creator_id = project.creator_id
@@ -538,7 +559,7 @@ class RevisionResolvePayload(BaseModel):
 
 
 class LLMTranslateRequest(BaseModel):
-    scope: Literal["fuzzy_only", "none_only", "all", "all_with_exact"] = "all"
+    scope: Literal["fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"] = "all"
     provider: Literal["auto", "deepseek", "openrouter"] = "deepseek"
     translation_guidelines: str = ""
     guideline_template_id: str | None = None
@@ -736,7 +757,7 @@ def _parse_optional_datetime(value: str | None) -> datetime | None:
 def _build_llm_translation_tasks(
     db: Session,
     file_record_id: UUID,
-    scope: Literal["fuzzy_only", "none_only", "all", "all_with_exact"],
+    scope: Literal["fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"],
     source_language: str | None = None,
     target_language: str | None = None,
     collection_id: UUID | None = None,
@@ -747,7 +768,11 @@ def _build_llm_translation_tasks(
         "all": {"fuzzy", "none"},
         "all_with_exact": {"exact", "fuzzy", "none"},
     }
-    target_statuses = statuses_by_scope[scope]
+    target_statuses: set[str] | None = None
+    if scope != "empty_target_only":
+        target_statuses = statuses_by_scope.get(scope)
+        if target_statuses is None:
+            raise ValueError(f"不支持的 scope: {scope}")
     segments = list_segments_for_file_record(db, file_record_id)
     tm_target_text_map = get_tm_target_text_map(
         db,
@@ -759,10 +784,13 @@ def _build_llm_translation_tasks(
 
     tasks: list[LLMTranslationTask] = []
     for segment in segments:
-        if segment.status not in target_statuses:
+        if scope == "empty_target_only":
+            if normalize_text(segment.target_text):
+                continue
+        elif target_statuses is None or segment.status not in target_statuses:
             continue
 
-        segment_tm_target_text = segment.target_text if segment.source == "tm" else ""
+        segment_tm_target_text = segment.target_text if segment.source == "tm" and normalize_text(segment.target_text) else ""
         tm_target_text = segment_tm_target_text or tm_target_text_map.get(segment.matched_source_text or "", "")
 
         tasks.append(
@@ -897,6 +925,23 @@ def _validate_task_upload(file: UploadFile) -> None:
         status_code=400,
         detail=f"暂不支持该文件格式。当前支持：{supported_extensions}",
     )
+
+
+def _normalize_upload_document_parse_mode(document_parse_mode: str | None) -> str:
+    try:
+        return normalize_document_parse_mode(document_parse_mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _normalize_upload_document_parse_options(
+    document_parse_options: str | None,
+    document_parse_mode: str,
+) -> dict[str, bool]:
+    try:
+        return normalize_document_parse_options(document_parse_options, document_parse_mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _normalize_collection_name(name: str) -> str:
@@ -1126,7 +1171,7 @@ def _require_same_tm_collection_language_pair(
             candidate_source_language != source_language
             or candidate_target_language != target_language
         ):
-            raise HTTPException(status_code=400, detail="只能合并语言对一致的记忆库。")
+            raise HTTPException(status_code=400, detail="只能合并语言对完全一致的记忆库。")
 
     return source_language, target_language
 
@@ -1516,10 +1561,13 @@ async def create_file_record(
     source_language: str | None = Form(default=None),
     target_language: str | None = Form(default=None),
     document_parse_mode: str = Form(default=DOCUMENT_PARSE_MODE_FULL),
+    document_parse_options: str | None = Form(default=None),
     db: Session = Depends(get_db),
 ):
     """上传文档并创建持久化记录"""
     _validate_task_upload(file)
+    document_parse_mode = _normalize_upload_document_parse_mode(document_parse_mode)
+    normalized_parse_options = _normalize_upload_document_parse_options(document_parse_options, document_parse_mode)
 
     raw_bytes = await file.read()
     if not raw_bytes:
@@ -1561,6 +1609,7 @@ async def create_file_record(
         "source_language": resolved_source_language,
         "target_language": resolved_target_language,
         "document_parse_mode": document_parse_mode,
+        "document_parse_options": normalized_parse_options,
     }
     return await _queue_import_task(background_tasks, payload)
 
@@ -1679,6 +1728,7 @@ def _build_project_file_payload(
         "filename": file_record.filename,
         "status": effective_status,
         "document_parse_mode": getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
+        "document_parse_options": _get_file_record_document_parse_options(file_record),
         "progress": progress,
         "total_segments": total_segments,
         "translated_segments": translated_segments,
@@ -2052,6 +2102,7 @@ async def upload_project_source_document(
     source_language: str | None = Form(default=None),
     target_language: str | None = Form(default=None),
     document_parse_mode: str = Form(default=DOCUMENT_PARSE_MODE_FULL),
+    document_parse_options: str | None = Form(default=None),
     db: Session = Depends(get_db),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
@@ -2066,6 +2117,8 @@ async def upload_project_source_document(
 
     for upload_file in uploaded_files:
         _validate_task_upload(upload_file)
+    document_parse_mode = _normalize_upload_document_parse_mode(document_parse_mode)
+    normalized_parse_options = _normalize_upload_document_parse_options(document_parse_options, document_parse_mode)
 
     selected_collection_ids = _validate_collection_ids(db, collection_ids) or []
     primary_collection = _get_collection_or_404(
@@ -2112,6 +2165,7 @@ async def upload_project_source_document(
         "source_language": resolved_source_language,
         "target_language": resolved_target_language,
         "document_parse_mode": document_parse_mode,
+        "document_parse_options": normalized_parse_options,
     }
     return await _queue_import_task(background_tasks, payload)
 
@@ -2174,6 +2228,12 @@ def list_projects(
     }
 
 
+@router.get("/file-records/upload-capabilities")
+def get_file_record_upload_capabilities():
+    """返回任务上传入口真实支持的格式和解析能力。"""
+    return get_upload_capabilities()
+
+
 @router.get("/file-records")
 @router.get("/documents", include_in_schema=False)
 def get_file_records(
@@ -2189,6 +2249,7 @@ def get_file_records(
             "filename": file_record.filename,
             "status": file_record.status,
             "document_parse_mode": getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
+            "document_parse_options": _get_file_record_document_parse_options(file_record),
             "source_language": file_record.source_language,
             "target_language": file_record.target_language,
             "created_at": file_record.created_at.isoformat(),
@@ -2248,6 +2309,7 @@ def get_file_record(
         "filename": file_record.filename,
         "status": file_record.status,
         "document_parse_mode": getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
+        "document_parse_options": _get_file_record_document_parse_options(file_record),
         "source_language": file_record.source_language,
         "target_language": file_record.target_language,
         "collection_id": file_record.collection_id,
@@ -2308,6 +2370,7 @@ def get_file_record_preview(
         segments=segments,
         source_bytes=source_bytes,
         document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
+        document_parse_options=_get_file_record_document_parse_options(file_record),
     )
 
     return {
@@ -2555,6 +2618,7 @@ def export_file_record_docx(
             filename=source_filename,
             segments=segments,
             document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
+            document_parse_options=_get_file_record_document_parse_options(file_record),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

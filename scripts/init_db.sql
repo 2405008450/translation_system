@@ -15,7 +15,7 @@
 -- 包含的对象：
 --   扩展：pg_trgm, vector
 --   表：memory_bases / memory_entries / projects / file_records / segments
---       users / segment_comments / segment_revisions
+--       users / segment_comments / issue_markers / segment_revisions
 --   触发器：统一维护 updated_at 字段
 -- =============================================================================
 
@@ -352,6 +352,7 @@ CREATE TABLE IF NOT EXISTS file_records (
     file_hash VARCHAR(64),
     status VARCHAR(20) NOT NULL DEFAULT 'draft',
     document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full',
+    document_parse_options TEXT NOT NULL DEFAULT '{}',
     source_language VARCHAR(20),
     target_language VARCHAR(20),
     creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -367,6 +368,8 @@ ALTER TABLE IF EXISTS file_records
     ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE;
 ALTER TABLE IF EXISTS file_records
     ADD COLUMN IF NOT EXISTS document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full';
+ALTER TABLE IF EXISTS file_records
+    ADD COLUMN IF NOT EXISTS document_parse_options TEXT NOT NULL DEFAULT '{}';
 ALTER TABLE IF EXISTS file_records
     ADD COLUMN IF NOT EXISTS source_language VARCHAR(20);
 ALTER TABLE IF EXISTS file_records
@@ -525,7 +528,50 @@ CREATE TRIGGER update_segment_comments_updated_at
     EXECUTE FUNCTION update_updated_at_column();
 
 -- -----------------------------------------------------------------------------
--- 8. Segment revisions
+-- 8. 灰度问题标记
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS issue_markers (
+    id UUID PRIMARY KEY DEFAULT (
+        lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
+        lpad(to_hex(floor(random() * 65536)::int), 4, '0') || '-' ||
+        '4' || substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        substr('89ab', floor(random() * 4)::int + 1, 1) ||
+        substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
+    )::uuid,
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    file_record_id UUID REFERENCES file_records(id) ON DELETE SET NULL,
+    title VARCHAR(160) NOT NULL DEFAULT '',
+    description TEXT NOT NULL,
+    category VARCHAR(30) NOT NULL DEFAULT 'other',
+    severity VARCHAR(20) NOT NULL DEFAULT 'medium',
+    status VARCHAR(20) NOT NULL DEFAULT 'open',
+    page_url TEXT,
+    user_agent TEXT,
+    reporter_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    resolved_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    resolved_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS ix_issue_markers_project_id
+    ON issue_markers (project_id);
+CREATE INDEX IF NOT EXISTS ix_issue_markers_file_record_id
+    ON issue_markers (file_record_id);
+CREATE INDEX IF NOT EXISTS ix_issue_markers_status
+    ON issue_markers (status);
+CREATE INDEX IF NOT EXISTS ix_issue_markers_reporter_id
+    ON issue_markers (reporter_id);
+
+DROP TRIGGER IF EXISTS update_issue_markers_updated_at ON issue_markers;
+CREATE TRIGGER update_issue_markers_updated_at
+    BEFORE UPDATE ON issue_markers
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- -----------------------------------------------------------------------------
+-- 9. Segment revisions
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS segment_revisions (
     id UUID PRIMARY KEY DEFAULT (
@@ -562,5 +608,3 @@ CREATE INDEX IF NOT EXISTS ix_segment_revisions_status
 -- 完成。首次运行后请通过前端 "/login" 页面使用首次初始化接口创建管理员账号：
 --   POST /api/auth/init  { "username": "admin", "password": "..." }
 -- =============================================================================
-
-

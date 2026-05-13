@@ -47,6 +47,7 @@ import { useWorkbenchShortcuts } from '../composables/useWorkbenchShortcuts'
 import { getTaskExportFormatLabel } from '../constants/taskFiles'
 import { llmProviderOptions, llmScopeOptions } from '../constants/llm'
 import { formatLanguagePair } from '../constants/languages'
+import { isProgressComplete } from '../utils/progress'
 import { useAuthStore } from '../stores/auth'
 import { useCommentStore } from '../stores/comment'
 import { useSegmentStore } from '../stores/segment'
@@ -74,6 +75,7 @@ type ToolKey = 'source-preview' | 'target-preview' | 'split-preview' | 'match-in
 type ResourceImportTab = 'tm' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
 type SaveToTMTargetMode = 'new' | 'existing'
+type SegmentDisplayScope = 'all' | 'fuzzy_only' | 'none_only' | 'empty_target'
 type SaveToTMPayload = {
   collection_mode: SaveToTMTargetMode
   collection_id?: string
@@ -144,6 +146,7 @@ const revisionActionLoading = ref(false)
 const segmentSearchOpen = ref(false)
 const sourceSearchInputRef = ref<HTMLInputElement | null>(null)
 const guidelinesEditorRef = ref<HTMLTextAreaElement | null>(null)
+const segmentDisplayScope = ref<SegmentDisplayScope>('all')
 const sourceSearchQuery = ref('')
 const targetSearchQuery = ref('')
 const searchLoadingAllSegments = ref(false)
@@ -443,15 +446,40 @@ const hasSegmentSearch = computed(() => (
   Boolean(normalizedSourceSearchQuery.value || normalizedTargetSearchQuery.value)
 ))
 
+const hasSegmentDisplayScope = computed(() => segmentDisplayScope.value !== 'all')
+const hasEditorSegmentFilter = computed(() => hasSegmentSearch.value || hasSegmentDisplayScope.value)
+
+const segmentDisplayScopeOptions = computed<Array<{ value: SegmentDisplayScope; label: string }>>(() => [
+  { value: 'all', label: t('workbench.search.scopes.all') },
+  { value: 'fuzzy_only', label: t('workbench.search.scopes.fuzzyOnly') },
+  { value: 'none_only', label: t('workbench.search.scopes.noneOnly') },
+  { value: 'empty_target', label: t('workbench.search.scopes.emptyTarget') },
+])
+
+function matchesSegmentDisplayScope(segment: Segment) {
+  if (segmentDisplayScope.value === 'fuzzy_only') {
+    return segment.status === 'fuzzy'
+  }
+  if (segmentDisplayScope.value === 'none_only') {
+    return segment.status === 'none'
+  }
+  if (segmentDisplayScope.value === 'empty_target') {
+    return !normalizeTextForSaveToTM(segment.target_text)
+  }
+  return true
+}
+
 const editorSegments = computed(() => {
   const sourceKeyword = normalizedSourceSearchQuery.value
   const targetKeyword = normalizedTargetSearchQuery.value
 
-  if (!sourceKeyword && !targetKeyword) {
+  if (!sourceKeyword && !targetKeyword && !hasSegmentDisplayScope.value) {
     return segmentStore.segments
   }
 
   return segmentStore.segments.filter((segment) => (
+    matchesSegmentDisplayScope(segment)
+    &&
     matchesSearchKeyword(buildSourceSearchableText(segment), sourceKeyword)
     && matchesSearchKeyword(segment.target_text || '', targetKeyword)
   ))
@@ -765,8 +793,8 @@ async function openTool(tool: ToolKey) {
 
 async function handleEditorReachEnd() {
   try {
-    if (hasSegmentSearch.value) {
-      await ensureSearchCorpusLoaded()
+    if (hasEditorSegmentFilter.value) {
+      await ensureFilteredCorpusLoaded()
       return
     }
     await segmentStore.loadMoreSegments()
@@ -807,6 +835,7 @@ async function toggleGuidelinesPanel() {
 function resetSegmentSearch() {
   searchLoadRequestId += 1
   segmentSearchOpen.value = false
+  segmentDisplayScope.value = 'all'
   sourceSearchQuery.value = ''
   targetSearchQuery.value = ''
   searchLoadingAllSegments.value = false
@@ -824,8 +853,8 @@ async function toggleSegmentSearchPanel() {
   }
 }
 
-async function ensureSearchCorpusLoaded() {
-  if (!hasSegmentSearch.value || !segmentStore.hasMoreSegments) {
+async function ensureFilteredCorpusLoaded() {
+  if (!hasEditorSegmentFilter.value || !segmentStore.hasMoreSegments) {
     searchLoadingAllSegments.value = false
     return
   }
@@ -863,11 +892,11 @@ async function focusEditorSegmentAtIndex(index: number) {
 }
 
 async function focusMatchedSegment(offset: number) {
-  if (!hasSegmentSearch.value) {
+  if (!hasEditorSegmentFilter.value) {
     return
   }
 
-  await ensureSearchCorpusLoaded()
+  await ensureFilteredCorpusLoaded()
 
   const matches = editorSegments.value
   if (!matches.length) {
@@ -885,7 +914,7 @@ async function focusMatchedSegment(offset: number) {
 }
 
 async function focusSentenceByOffset(offset: number) {
-  if (hasSegmentSearch.value) {
+  if (hasEditorSegmentFilter.value) {
     await focusMatchedSegment(offset)
     return
   }
@@ -1187,8 +1216,8 @@ async function loadAllSegments() {
 async function handlePreviewFocus(sentenceId: string) {
   segmentStore.setActiveSentence(sentenceId)
 
-  if (hasSegmentSearch.value) {
-    await ensureSearchCorpusLoaded()
+  if (hasEditorSegmentFilter.value) {
+    await ensureFilteredCorpusLoaded()
     const filteredIndex = editorSegments.value.findIndex((segment) => segment.sentence_id === sentenceId)
     if (filteredIndex === -1) {
       return
@@ -1443,9 +1472,9 @@ watch(selectedTermBaseId, () => {
   void loadTermEntries()
 })
 
-watch([sourceSearchQuery, targetSearchQuery], async () => {
-  if (hasSegmentSearch.value) {
-    void ensureSearchCorpusLoaded()
+watch([segmentDisplayScope, sourceSearchQuery, targetSearchQuery], async () => {
+  if (hasEditorSegmentFilter.value) {
+    void ensureFilteredCorpusLoaded()
   } else {
     searchLoadRequestId += 1
     searchLoadingAllSegments.value = false
@@ -1596,7 +1625,11 @@ onBeforeRouteLeave(async () => {
       <div v-if="segmentStore.llmRunning" class="workbench-toolbar__progress">
         <div class="progress-bar">
           <div class="progress-bar__track">
-            <div class="progress-bar__fill" :style="{ width: `${segmentStore.llmProgressPercent}%` }" />
+            <div
+              class="progress-bar__fill"
+              :class="{ 'is-complete': isProgressComplete(segmentStore.llmProgressPercent) }"
+              :style="{ width: `${segmentStore.llmProgressPercent}%` }"
+            />
           </div>
           <span class="progress-bar__text">{{ segmentStore.llmProgressPercent }}%</span>
         </div>
@@ -1729,7 +1762,7 @@ onBeforeRouteLeave(async () => {
             >
               <Search :size="14" />
               {{ t('workbench.search.title') }}
-              <span v-if="hasSegmentSearch" class="workbench-search-panel__badge">
+              <span v-if="hasEditorSegmentFilter" class="workbench-search-panel__badge">
                 {{ editorSegments.length }}
               </span>
               <ChevronUp v-if="segmentSearchOpen" :size="14" />
@@ -1798,6 +1831,15 @@ onBeforeRouteLeave(async () => {
             @keydown.esc.stop="closeSegmentSearchPanel"
           >
             <div class="workbench-search-panel__form">
+              <label class="field field--compact workbench-search-panel__scope">
+                <span class="field__label">{{ t('workbench.search.scopeLabel') }}</span>
+                <select v-model="segmentDisplayScope" class="field__control">
+                  <option v-for="option in segmentDisplayScopeOptions" :key="option.value" :value="option.value">
+                    {{ option.label }}
+                  </option>
+                </select>
+              </label>
+
               <label class="field field--compact">
                 <span class="field__label">{{ t('workbench.search.sourceLabel') }}</span>
                 <input
@@ -1841,7 +1883,7 @@ onBeforeRouteLeave(async () => {
                   {{ t('workbench.search.next') }}
                 </button>
                 <button
-                  v-if="hasSegmentSearch"
+                  v-if="hasEditorSegmentFilter"
                   class="button workbench-action workbench-action--clear"
                   type="button"
                   @click="resetSegmentSearch"
@@ -1861,8 +1903,8 @@ onBeforeRouteLeave(async () => {
               </div>
             </div>
 
-            <div v-if="hasSegmentSearch || searchLoadingAllSegments" class="workbench-search-panel__meta">
-              <span v-if="hasSegmentSearch" class="hint-text">
+            <div v-if="hasEditorSegmentFilter || searchLoadingAllSegments" class="workbench-search-panel__meta">
+              <span v-if="hasEditorSegmentFilter" class="hint-text">
                 {{
                   t('workbench.search.resultSummary', {
                     count: editorSegments.length,
@@ -1878,7 +1920,7 @@ onBeforeRouteLeave(async () => {
         </Transition>
 
         <div
-          v-if="hasSegmentSearch && !searchLoadingAllSegments && editorSegments.length === 0"
+          v-if="hasEditorSegmentFilter && !searchLoadingAllSegments && editorSegments.length === 0"
           class="empty-state workbench-search-empty"
         >
           <Search :size="28" />
@@ -2537,6 +2579,10 @@ onBeforeRouteLeave(async () => {
 
 .workbench-search-panel__form > .field {
   flex: 1 1 220px;
+}
+
+.workbench-search-panel__form > .workbench-search-panel__scope {
+  flex: 0 0 160px;
 }
 
 .workbench-search-panel .field__label {

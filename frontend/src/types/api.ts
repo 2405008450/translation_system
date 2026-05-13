@@ -26,11 +26,49 @@ export interface FileRecordSummary {
   id: string
   filename: string
   status: string
-  document_parse_mode?: 'full' | 'body_only'
+  document_parse_mode?: DocumentParseMode
+  document_parse_options?: DocumentParseOptions
   source_language: string | null
   target_language: string | null
   created_at: string
   updated_at: string
+}
+
+export type DocumentParseMode = 'full' | 'body_only'
+
+export interface DocumentParseOptions {
+  include_headers_footers: boolean
+  include_footnotes_endnotes: boolean
+  include_comments: boolean
+  clean_format: boolean
+}
+
+export interface UploadParseMode {
+  id: string
+  label: string
+  description: string
+}
+
+export interface UploadCapability {
+  extensions: string[]
+  accept: string
+  label: string
+  category: string
+  max_size_mb: number
+  can_export_original: boolean
+  parse_modes: UploadParseMode[]
+  settings?: Array<{
+    id: keyof DocumentParseOptions
+    label: string
+    default: boolean
+  }>
+  features: string[]
+}
+
+export interface UploadCapabilitiesResponse {
+  extensions: string[]
+  accept: string
+  formats: UploadCapability[]
 }
 
 export interface TMMatchCandidate {
@@ -77,7 +115,8 @@ export interface FileRecordDetail {
   project_id: string | null
   filename: string
   status: string
-  document_parse_mode: 'full' | 'body_only'
+  document_parse_mode: DocumentParseMode
+  document_parse_options: DocumentParseOptions
   source_language: string | null
   target_language: string | null
   collection_id: string | null
@@ -307,7 +346,7 @@ export interface CommentReplyPayload {
   body: string
 }
 
-export type LLMTranslateScope = 'fuzzy_only' | 'none_only' | 'all' | 'all_with_exact'
+export type LLMTranslateScope = 'fuzzy_only' | 'none_only' | 'empty_target_only' | 'all' | 'all_with_exact'
 export type LLMProvider = 'auto' | 'deepseek' | 'openrouter'
 
 export interface LLMGuidelineOptions {

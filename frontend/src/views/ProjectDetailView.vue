@@ -34,6 +34,7 @@ import {
 import { http } from '../api/http'
 import DataTable from '../components/DataTable.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
+import DocumentParseSettings from '../components/DocumentParseSettings.vue'
 import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import PreTranslateDialog from '../components/PreTranslateDialog.vue'
 import Pagination from '../components/Pagination.vue'
@@ -44,15 +45,21 @@ import { getLanguageLabel, languageOptions } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
 import { buildTranslatedTaskFilename, supportedTaskFileAccept } from '../constants/taskFiles'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
-import { getProgressStyle } from '../utils/progress'
-import type { IssueMarker, IssueStatus } from '../types/api'
+import { getProgressStyle, isProgressComplete } from '../utils/progress'
+import type {
+  DocumentParseMode,
+  DocumentParseOptions,
+  IssueMarker,
+  IssueStatus,
+  UploadCapabilitiesResponse,
+  UploadCapability,
+} from '../types/api'
 
 const props = defineProps<{
   id: string
 }>()
 
 type ProjectTab = 'files' | 'issues' | 'settings' | 'stats' | 'summary' | 'quote'
-type DocumentParseMode = 'full' | 'body_only'
 
 interface ProjectDetail {
   id: string
@@ -86,6 +93,7 @@ interface ProjectFileItem {
   filename: string
   status: string
   document_parse_mode: DocumentParseMode
+  document_parse_options: DocumentParseOptions
   progress: number
   total_segments: number
   translated_segments: number
@@ -105,6 +113,13 @@ interface ProjectFileItem {
 }
 
 type LanguageDetectTone = 'info' | 'success' | 'warning' | 'error'
+
+const DEFAULT_DOCUMENT_PARSE_OPTIONS: DocumentParseOptions = {
+  include_headers_footers: true,
+  include_footnotes_endnotes: true,
+  include_comments: true,
+  clean_format: false,
+}
 
 interface LanguageDetectResponse {
   language: string | null
@@ -136,6 +151,11 @@ const languageDetectTone = ref<LanguageDetectTone>('info')
 const selectedFiles = ref<File[]>([])
 const uploadSourceLanguage = ref('')
 const uploadTargetLanguage = ref('')
+const documentParseMode = ref<DocumentParseMode>('full')
+const documentParseOptions = ref<DocumentParseOptions>({ ...DEFAULT_DOCUMENT_PARSE_OPTIONS })
+const uploadCapabilities = ref<UploadCapability[]>([])
+const uploadFileAccept = ref(supportedTaskFileAccept)
+const loadingUploadCapabilities = ref(false)
 const basicCollapsed = ref(false)
 const activeTab = ref<ProjectTab>('files')
 const showUploadModal = ref(false)
@@ -206,6 +226,15 @@ const canOpenIssueDialog = computed(() => Boolean(project.value))
 const uploadButtonTitle = computed(() => '')
 
 const uploadFilePreview = computed(() => selectedFiles.value.slice(0, 3).map((file) => file.name))
+const uploadSupportedSummary = computed(() => {
+  if (uploadCapabilities.value.length === 0) {
+    return uploadFileAccept.value
+  }
+  return uploadCapabilities.value
+    .flatMap((capability) => capability.extensions)
+    .map((extension) => extension.replace('.', '').toUpperCase())
+    .join('、')
+})
 const canDetectSourceLanguage = computed(() => (
   selectedFiles.value.length > 0 && !uploading.value && !detectingLanguage.value
 ))
@@ -322,6 +351,8 @@ function resetUploadForm() {
   uploadMessage.value = ''
   clearLanguageDetectState()
   uploadPercent.value = 0
+  documentParseMode.value = 'full'
+  documentParseOptions.value = { ...DEFAULT_DOCUMENT_PARSE_OPTIONS }
   uploadInputKey.value += 1
 }
 
@@ -508,6 +539,21 @@ async function loadProject() {
   }
 }
 
+async function loadUploadCapabilities() {
+  loadingUploadCapabilities.value = true
+  try {
+    const { data } = await http.get<UploadCapabilitiesResponse>('/file-records/upload-capabilities')
+    uploadCapabilities.value = data.formats
+    uploadFileAccept.value = data.accept || supportedTaskFileAccept
+  } catch (error) {
+    console.error('Failed to load upload capabilities:', error)
+    uploadCapabilities.value = []
+    uploadFileAccept.value = supportedTaskFileAccept
+  } finally {
+    loadingUploadCapabilities.value = false
+  }
+}
+
 async function saveGuidelines() {
   if (!project.value || savingGuidelines.value) {
     return
@@ -607,7 +653,8 @@ async function uploadSourceDocument() {
     formData.append('threshold', '0.6')
     formData.append('source_language', uploadSourceLanguage.value)
     formData.append('target_language', uploadTargetLanguage.value)
-    formData.append('document_parse_mode', 'full')
+    formData.append('document_parse_mode', documentParseMode.value)
+    formData.append('document_parse_options', JSON.stringify(documentParseOptions.value))
 
     const { data } = await http.post<unknown | ImportTaskAccepted>(`/projects/${props.id}/source-document`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
@@ -729,6 +776,7 @@ onMounted(() => {
   window.addEventListener('scroll', handleDocumentScroll, { passive: true })
   window.addEventListener('resize', handleDocumentScroll)
   void loadProject()
+  void loadUploadCapabilities()
 })
 
 onBeforeUnmount(() => {
@@ -763,7 +811,7 @@ onBeforeUnmount(() => {
               class="sr-only"
               type="file"
               multiple
-              :accept="supportedTaskFileAccept"
+              :accept="uploadFileAccept"
               aria-label="上传文件"
               @change="onFileChange"
             />
@@ -774,9 +822,8 @@ onBeforeUnmount(() => {
         </div>
 
         <p class="upload-supported">
-          支持的文件类型：
-          <span>doc/docx</span>、<span>xls/xlsx</span>、<span>ppt/pptx</span>、<span>sdlxliff</span>、<span>dwg</span>、<span>dxf</span>、<span>pdf</span>
-          <button type="button">更多</button>
+          后端当前支持：
+          <span>{{ uploadSupportedSummary }}</span>
         </p>
 
         <section class="upload-language-panel">
@@ -851,7 +898,11 @@ onBeforeUnmount(() => {
           <div v-if="uploading" class="upload-page__progress">
             <div class="progress-bar">
               <div class="progress-bar__track">
-                <div class="progress-bar__fill" :style="{ width: `${uploadPercent}%` }" />
+                <div
+                  class="progress-bar__fill"
+                  :class="{ 'is-complete': isProgressComplete(uploadPercent) }"
+                  :style="{ width: `${uploadPercent}%` }"
+                />
               </div>
               <span class="progress-bar__text">{{ uploadPercent }}%</span>
             </div>
@@ -877,55 +928,14 @@ onBeforeUnmount(() => {
         </section>
       </section>
 
-      <aside class="doc-settings">
-        <h2>文档设置</h2>
-
-        <div class="doc-settings__grid">
-          <section class="doc-setting-card doc-setting-card--word">
-            <div class="doc-type-icon">W</div>
-            <label><input type="checkbox" checked /> 全选</label>
-            <label><input type="checkbox" checked /> 翻译页眉页脚</label>
-            <label><input type="checkbox" checked /> 翻译批注</label>
-            <label class="is-muted"><input type="checkbox" /> 翻译隐藏内容</label>
-            <label class="is-muted"><input type="checkbox" /> 翻译文档属性</label>
-            <label class="is-muted"><input type="checkbox" /> 清洗格式</label>
-          </section>
-
-          <section class="doc-setting-card doc-setting-card--ppt">
-            <div class="doc-type-icon">P</div>
-            <label><input type="checkbox" checked /> 全选</label>
-            <label><input type="checkbox" checked /> 翻译批注</label>
-            <label><input type="checkbox" checked /> 翻译备注</label>
-            <label class="is-muted"><input type="checkbox" /> 翻译文档属性</label>
-          </section>
-
-          <section class="doc-setting-card doc-setting-card--excel">
-            <div class="doc-type-icon">X</div>
-            <label><input type="checkbox" checked /> 全选</label>
-            <label><input type="checkbox" checked /> 翻译批注</label>
-            <label><input type="checkbox" checked /> 翻译图形文本</label>
-            <label class="is-muted"><input type="checkbox" /> 翻译工作表名</label>
-            <label class="is-muted"><input type="checkbox" /> 翻译隐藏内容</label>
-            <label class="is-muted"><input type="checkbox" /> 翻译文档属性</label>
-            <label class="is-muted"><input type="checkbox" /> 跳过应用所选背景色的单元格</label>
-            <div class="doc-color-swatches" aria-hidden="true">
-              <span v-for="color in ['#d7191c', '#f44336', '#ffc107', '#ffeb3b', '#8bc34a', '#4caf50', '#00bcd4', '#2196f3', '#0d47a1', '#7b1fa2']" :key="color" :style="{ background: color }" />
-            </div>
-          </section>
-
-          <section class="doc-setting-card doc-setting-card--mini">
-            <div class="doc-file-icon">MD</div>
-            <label><input type="checkbox" checked /> 全选</label>
-            <label><input type="checkbox" checked /> 翻译代码块</label>
-            <label class="is-muted"><input type="checkbox" /> 提取链接</label>
-          </section>
-
-          <section class="doc-setting-card doc-setting-card--mini">
-            <div class="doc-file-icon doc-file-icon--purple">DAT</div>
-            <label><input type="checkbox" checked /> 翻译代码块</label>
-          </section>
-        </div>
-      </aside>
+      <DocumentParseSettings
+        v-model="documentParseMode"
+        v-model:parse-options="documentParseOptions"
+        :capabilities="uploadCapabilities"
+        :selected-files="selectedFiles"
+        :loading="loadingUploadCapabilities"
+        variant="panel"
+      />
     </main>
   </div>
 
@@ -954,7 +964,11 @@ onBeforeUnmount(() => {
           <span class="pd-hero__progress-label">{{ t('projectDetail.totals.progressLabel') }}</span>
           <div class="progress-bar pd-hero__progress-bar">
             <div class="progress-bar__track">
-              <div class="progress-bar__fill" :style="getProgressStyle(project?.progress ?? 0)" />
+              <div
+                class="progress-bar__fill"
+                :class="{ 'is-complete': isProgressComplete(project?.progress ?? 0) }"
+                :style="getProgressStyle(project?.progress ?? 0)"
+              />
             </div>
             <span class="progress-bar__text">{{ project?.progress ?? 0 }}%</span>
           </div>
@@ -1273,7 +1287,11 @@ onBeforeUnmount(() => {
           <template #progress="{ row }">
             <div class="progress-bar">
               <div class="progress-bar__track">
-                <div class="progress-bar__fill" :style="getProgressStyle(row.progress)" />
+                <div
+                  class="progress-bar__fill"
+                  :class="{ 'is-complete': isProgressComplete(row.progress) }"
+                  :style="getProgressStyle(row.progress)"
+                />
               </div>
               <span class="progress-bar__text">{{ row.progress }}%</span>
             </div>
