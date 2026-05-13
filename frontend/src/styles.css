@@ -2261,12 +2261,8 @@ body.modal-open {
 .workbench-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
-  gap: 0;
+  gap: 12px;
   align-items: start;
-}
-
-.workbench-layout > .panel--editor {
-  padding-right: 6px;
 }
 
 .workbench-sidecar {

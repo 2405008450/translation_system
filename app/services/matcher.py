@@ -195,21 +195,34 @@ def get_tm_candidates(
     return candidates[:max_candidates]
 
 
+def _tokenize_for_diff(text: str) -> list[str]:
+    """将文本分割为单词和空白符的 token 列表，用于单词级别的差异比较"""
+    import re
+    # 英文单词（包括带连字符的复合词）作为整体
+    # 中文每个字符作为独立 token
+    # 标点符号和空白符单独处理
+    tokens = re.findall(r'[a-zA-Z0-9]+(?:[-\'][a-zA-Z0-9]+)*|[\u4e00-\u9fff]|\s+|[^\s\w\u4e00-\u9fff]+', text)
+    return tokens
+
+
 def _build_diff_html(source: str, matched: str) -> str:
-    """生成修订格式的 HTML，标记原文和匹配文本的差异"""
-    matcher = SequenceMatcher(None, source, matched)
+    """生成修订格式的 HTML，标记原文和匹配文本的差异（单词级别）"""
+    source_tokens = _tokenize_for_diff(source)
+    matched_tokens = _tokenize_for_diff(matched)
+    
+    matcher = SequenceMatcher(None, source_tokens, matched_tokens)
     result_parts: list[str] = []
 
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
-            result_parts.append(_escape_html(matched[j1:j2]))
+            result_parts.append(_escape_html("".join(matched_tokens[j1:j2])))
         elif tag == "replace":
-            result_parts.append(f'<del>{_escape_html(source[i1:i2])}</del>')
-            result_parts.append(f'<ins>{_escape_html(matched[j1:j2])}</ins>')
+            result_parts.append(f'<del>{_escape_html("".join(source_tokens[i1:i2]))}</del>')
+            result_parts.append(f'<ins>{_escape_html("".join(matched_tokens[j1:j2]))}</ins>')
         elif tag == "delete":
-            result_parts.append(f'<del>{_escape_html(source[i1:i2])}</del>')
+            result_parts.append(f'<del>{_escape_html("".join(source_tokens[i1:i2]))}</del>')
         elif tag == "insert":
-            result_parts.append(f'<ins>{_escape_html(matched[j1:j2])}</ins>')
+            result_parts.append(f'<ins>{_escape_html("".join(matched_tokens[j1:j2]))}</ins>')
 
     return "".join(result_parts)
 
