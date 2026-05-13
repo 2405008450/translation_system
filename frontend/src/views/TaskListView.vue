@@ -3,6 +3,7 @@ import axios from 'axios'
 import {
   ArrowRight,
   Download,
+  Flag,
   Loader2,
   MoreHorizontal,
   Search,
@@ -16,6 +17,7 @@ import { useRouter } from 'vue-router'
 
 import { http } from '../api/http'
 import DataTable from '../components/DataTable.vue'
+import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
 import Pagination from '../components/Pagination.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
@@ -25,7 +27,7 @@ import { formatLanguagePair, languageOptions } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
 import { supportedTaskFileAccept } from '../constants/taskFiles'
 import { useTaskStore } from '../stores/task'
-import type { TermBase, TMCollection } from '../types/api'
+import type { IssueMarker, TermBase, TMCollection } from '../types/api'
 import { getProgressStyle } from '../utils/progress'
 
 interface ProjectRow {
@@ -35,6 +37,8 @@ interface ProjectRow {
   status: string
   progress: number
   file_count: number
+  issue_count: number
+  open_issue_count: number
   total_segments: number
   translated_segments: number
   source_language: string | null
@@ -58,6 +62,8 @@ type SubTab = 'all' | 'incomplete'
 type ResourceImportTab = 'tm' | 'term'
 type DocumentParseMode = 'full' | 'body_only'
 
+const NO_TM_COLLECTION_ID = '__NO_TM_COLLECTION__'
+
 const taskStore = useTaskStore()
 const confirm = useConfirm()
 const toast = useToast()
@@ -71,7 +77,7 @@ const threshold = ref(0.6)
 const pageError = ref('')
 const tmCollections = ref<TMCollection[]>([])
 const loadingCollections = ref(false)
-const selectedCollectionIds = ref<string[]>([])
+const selectedCollectionIds = ref<string[]>([NO_TM_COLLECTION_ID])
 const termBases = ref<TermBase[]>([])
 const loadingTermBases = ref(false)
 const selectedTermBaseId = ref('')
@@ -89,8 +95,10 @@ const projects = ref<ProjectRow[]>([])
 const projectsLoading = ref(false)
 let searchTimer: ReturnType<typeof setTimeout> | null = null
 const showImportDialog = ref(false)
+const showIssueDialog = ref(false)
 const importDialogInitialTab = ref<ResourceImportTab>('tm')
 const openActionMenuId = ref<string | null>(null)
+const issueTarget = ref<ProjectRow | null>(null)
 const importDialogContext = ref<{
   label: string
   sourceLanguage: string | null
@@ -110,6 +118,17 @@ const availableTMCollections = computed(() => {
     (!collection.source_language || collection.source_language === uploadSourceLanguage.value)
     && (!collection.target_language || collection.target_language === uploadTargetLanguage.value)
   ))
+})
+
+const selectedUploadCollectionIds = computed(() => (
+  selectedCollectionIds.value.filter((collectionId) => collectionId !== NO_TM_COLLECTION_ID)
+))
+
+const selectedCollectionIdsModel = computed<string[]>({
+  get: () => selectedCollectionIds.value,
+  set: (collectionIds) => {
+    selectedCollectionIds.value = normalizeSelectedCollectionIds(collectionIds)
+  },
 })
 
 const availableTermBases = computed(() => {
@@ -134,6 +153,7 @@ const columns = computed<DataTableColumn[]>(() => ([
   { key: 'status', label: t('taskList.columns.status'), width: '110px' },
   { key: 'progress', label: t('projectList.status.progress'), width: '180px' },
   { key: 'file_count', label: t('projectDetail.base.fileCount'), width: '110px', align: 'right' },
+  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '120px' },
   { key: 'created_at', label: t('taskList.columns.createdAt'), width: '160px', sortable: true },
   { key: 'updated_at', label: t('taskList.columns.updatedAt'), width: '160px', sortable: true },
 ]))
@@ -214,6 +234,21 @@ function onFileChange(event: Event) {
   selectedFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
 }
 
+function normalizeSelectedCollectionIds(collectionIds: string[]) {
+  const availableIds = new Set(availableTMCollections.value.map((collection) => collection.id))
+  const wantsNoCollection = collectionIds.includes(NO_TM_COLLECTION_ID)
+  const hadNoCollection = selectedCollectionIds.value.includes(NO_TM_COLLECTION_ID)
+
+  if (wantsNoCollection && (!hadNoCollection || collectionIds.length === 1)) {
+    return [NO_TM_COLLECTION_ID]
+  }
+
+  const normalizedIds = collectionIds.filter((collectionId) => (
+    collectionId !== NO_TM_COLLECTION_ID && availableIds.has(collectionId)
+  ))
+  return normalizedIds.length > 0 ? normalizedIds : [NO_TM_COLLECTION_ID]
+}
+
 async function uploadFile() {
   if (!selectedFile.value) {
     pageError.value = t('taskList.errors.selectFile')
@@ -233,7 +268,7 @@ async function uploadFile() {
     const result = await taskStore.uploadTask(
       selectedFile.value,
       threshold.value,
-      selectedCollectionIds.value,
+      selectedUploadCollectionIds.value,
       selectedTermBaseId.value || null,
       uploadSourceLanguage.value,
       uploadTargetLanguage.value,
@@ -334,6 +369,28 @@ function goToAssets() {
   void router.push({ name: 'tm' })
 }
 
+function openProjectDetail(row: ProjectRow) {
+  closeActionMenu()
+  void router.push({
+    name: 'project-detail',
+    params: { id: row.id },
+    query: { from: 'tasks' },
+  })
+}
+
+function openIssueDialog(row: ProjectRow) {
+  closeActionMenu()
+  issueTarget.value = row
+  showIssueDialog.value = true
+}
+
+async function handleIssueSaved(_marker: IssueMarker) {
+  showIssueDialog.value = false
+  issueTarget.value = null
+  toast.success(t('issueMarker.messages.saved'))
+  await loadProjects()
+}
+
 watch(searchQuery, () => {
   if (searchTimer) {
     clearTimeout(searchTimer)
@@ -349,9 +406,7 @@ watch(subTab, () => {
 })
 
 watch([uploadSourceLanguage, uploadTargetLanguage], () => {
-  selectedCollectionIds.value = selectedCollectionIds.value.filter((collectionId) => (
-    availableTMCollections.value.some((collection) => collection.id === collectionId)
-  ))
+  selectedCollectionIds.value = normalizeSelectedCollectionIds(selectedCollectionIds.value)
   if (
     selectedTermBaseId.value
     && !availableTermBases.value.some((termBase) => termBase.id === selectedTermBaseId.value)
@@ -439,11 +494,14 @@ onBeforeUnmount(() => {
         <label class="field field--collections">
           <span class="field__label">{{ t('taskList.fields.collections') }}</span>
           <select
-            v-model="selectedCollectionIds"
+            v-model="selectedCollectionIdsModel"
             class="field__control field__control--multi"
             multiple
-            :disabled="loadingCollections || availableTMCollections.length === 0"
+            :disabled="loadingCollections"
           >
+            <option :value="NO_TM_COLLECTION_ID">
+              {{ t('taskList.fields.noCollection') }}
+            </option>
             <option v-for="collection in availableTMCollections" :key="collection.id" :value="collection.id">
               {{ collection.name }}（{{ formatLanguagePair(collection.source_language, collection.target_language) }} / {{ collection.entry_count }} 条）
             </option>
@@ -602,7 +660,7 @@ onBeforeUnmount(() => {
               <button
                 class="text-link project-link"
                 type="button"
-                @click="router.push({ name: 'project-detail', params: { id: row.id } })"
+                @click="openProjectDetail(row as ProjectRow)"
               >
                 {{ row.filename }}
               </button>
@@ -627,6 +685,19 @@ onBeforeUnmount(() => {
               <span>{{ row.file_count }}</span>
             </template>
 
+            <template #open_issue_count="{ row }">
+              <button
+                class="issue-badge"
+                :class="{ 'is-active': Number(row.open_issue_count || 0) > 0 }"
+                type="button"
+                :title="t('issueMarker.actions.open')"
+                @click="openIssueDialog(row as ProjectRow)"
+              >
+                <Flag :size="13" />
+                {{ Number(row.open_issue_count || 0) > 0 ? row.open_issue_count : t('common.none') }}
+              </button>
+            </template>
+
             <template #created_at="{ row }">
               <div class="date-cell">
                 {{ formatDate(row.created_at).date }}<br>{{ formatDate(row.created_at).time }}
@@ -646,9 +717,18 @@ onBeforeUnmount(() => {
                   type="button"
                   :title="t('taskList.actions.continue')"
                   :aria-label="t('taskList.actions.continue')"
-                  @click="router.push({ name: 'project-detail', params: { id: row.id } })"
+                  @click="openProjectDetail(row as ProjectRow)"
                 >
                   <ArrowRight :size="16" />
+                </button>
+                <button
+                  class="data-table__actions-btn"
+                  type="button"
+                  :title="t('issueMarker.actions.open')"
+                  :aria-label="t('issueMarker.actions.open')"
+                  @click="openIssueDialog(row as ProjectRow)"
+                >
+                  <Flag :size="14" />
                 </button>
                 <div class="task-action-menu">
                   <button
@@ -661,7 +741,7 @@ onBeforeUnmount(() => {
                     <MoreHorizontal :size="16" />
                   </button>
                   <div v-if="openActionMenuId === row.id" class="task-action-menu__dropdown">
-                    <button type="button" @click="router.push({ name: 'project-detail', params: { id: row.id } }); closeActionMenu()">
+                    <button type="button" @click="openProjectDetail(row as ProjectRow)">
                       {{ t('taskList.actions.details') }}
                     </button>
                     <button
@@ -669,6 +749,9 @@ onBeforeUnmount(() => {
                       @click="openImportDialog(row); closeActionMenu()"
                     >
                       {{ t('taskList.actions.importResources') }}
+                    </button>
+                    <button type="button" @click="openIssueDialog(row as ProjectRow)">
+                      {{ t('issueMarker.actions.open') }}
                     </button>
                     <button
                       class="is-danger"
@@ -709,10 +792,50 @@ onBeforeUnmount(() => {
       :target-language="importDialogContext.targetLanguage"
       @close="showImportDialog = false"
     />
+    <IssueMarkerDialog
+      :open="showIssueDialog"
+      :project-id="issueTarget?.id ?? null"
+      :context-label="issueTarget?.filename ?? ''"
+      @close="showIssueDialog = false"
+      @saved="handleIssueSaved"
+    />
   </div>
 </template>
 
 <style scoped>
+.upload-panel {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  box-shadow: none;
+}
+
+.upload-panel .section-title {
+  margin-bottom: 0;
+  font-size: 15px;
+}
+
+.upload-form--task {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  align-items: start;
+  margin-top: 0;
+}
+
+.upload-form--task > .field:first-child,
+.upload-form--task > .field--collections {
+  grid-column: span 2;
+}
+
+.upload-form--task > .button {
+  align-self: end;
+  min-height: 42px;
+}
+
 .task-subtabs {
   padding: 0 20px;
 }
@@ -779,6 +902,26 @@ onBeforeUnmount(() => {
   position: relative;
 }
 
+.issue-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.issue-badge.is-active {
+  border-color: color-mix(in srgb, var(--state-warning) 45%, var(--line-soft));
+  background: var(--state-warning-bg);
+  color: var(--state-warning);
+}
+
 .task-action-menu {
   position: relative;
 }
@@ -820,5 +963,22 @@ onBeforeUnmount(() => {
 
 .task-action-menu__dropdown button.is-danger:hover {
   background: var(--state-danger-bg);
+}
+
+@media (max-width: 1100px) {
+  .upload-form--task {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .upload-form--task {
+    grid-template-columns: 1fr;
+  }
+
+  .upload-form--task > .field:first-child,
+  .upload-form--task > .field--collections {
+    grid-column: auto;
+  }
 }
 </style>

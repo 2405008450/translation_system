@@ -10,6 +10,7 @@ import TermBaseEditView from '../views/TermBaseEditView.vue'
 import TermBaseView from '../views/TermBaseView.vue'
 import TMCollectionEditView from '../views/TMCollectionEditView.vue'
 import TMManagementView from '../views/TMManagementView.vue'
+import TranslationRulesView from '../views/TranslationRulesView.vue'
 import UserManagementView from '../views/UserManagementView.vue'
 import WorkbenchView from '../views/WorkbenchView.vue'
 
@@ -117,6 +118,18 @@ const router = createRouter({
             pageDescription: '管理术语库，维护翻译术语一致性',
             pageTitleKey: 'pages.termBase.title',
             pageDescriptionKey: 'pages.termBase.description',
+          },
+        },
+        {
+          path: 'translation-rules',
+          name: 'translation-rules',
+          component: TranslationRulesView,
+          meta: {
+            navSection: 'translation-rules',
+            pageTitle: '翻译规则',
+            pageDescription: '维护可复用的翻译规则，供 AI 翻译时选择',
+            pageTitleKey: 'pages.translationRules.title',
+            pageDescriptionKey: 'pages.translationRules.description',
           },
         },
         {

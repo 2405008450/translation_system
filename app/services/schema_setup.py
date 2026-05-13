@@ -79,6 +79,23 @@ REQUIRED_SCHEMA = {
         "created_at",
         "resolved_at",
     },
+    "issue_markers": {
+        "id",
+        "project_id",
+        "file_record_id",
+        "title",
+        "description",
+        "category",
+        "severity",
+        "status",
+        "page_url",
+        "user_agent",
+        "reporter_id",
+        "resolved_by_id",
+        "created_at",
+        "updated_at",
+        "resolved_at",
+    },
 }
 
 
@@ -451,6 +468,102 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_file_records_source_language
             ON file_records (source_language)
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS issue_markers (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID REFERENCES file_records(id) ON DELETE SET NULL,
+                title VARCHAR(160) NOT NULL DEFAULT '',
+                description TEXT NOT NULL,
+                category VARCHAR(30) NOT NULL DEFAULT 'other',
+                severity VARCHAR(20) NOT NULL DEFAULT 'medium',
+                status VARCHAR(20) NOT NULL DEFAULT 'open',
+                page_url TEXT,
+                user_agent TEXT,
+                reporter_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                resolved_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                resolved_at TIMESTAMP
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS file_record_id UUID REFERENCES file_records(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS title VARCHAR(160) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS description TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS category VARCHAR(30) NOT NULL DEFAULT 'other'
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS severity VARCHAR(20) NOT NULL DEFAULT 'medium'
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'open'
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS page_url TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS user_agent TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS reporter_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS resolved_by_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_issue_markers_project_id
+            ON issue_markers (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_issue_markers_file_record_id
+            ON issue_markers (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_issue_markers_status
+            ON issue_markers (status)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_issue_markers_reporter_id
+            ON issue_markers (reporter_id)
+            """,
+            """
+            DROP TRIGGER IF EXISTS update_issue_markers_updated_at ON issue_markers
+            """,
+            """
+            CREATE TRIGGER update_issue_markers_updated_at
+            BEFORE UPDATE ON issue_markers
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column()
             """,
             """
             INSERT INTO projects (

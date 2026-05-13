@@ -47,6 +47,9 @@ class Project(Base):
     access_level: Mapped[str] = mapped_column(
         String(20), nullable=False, default="team", server_default=text("'team'")
     )
+    translation_guidelines: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=text("''")
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -62,6 +65,11 @@ class Project(Base):
     )
     file_records: Mapped[list["FileRecord"]] = relationship(
         "FileRecord",
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
+    issue_markers: Mapped[list["IssueMarker"]] = relationship(
+        "IssueMarker",
         back_populates="project",
         cascade="all, delete-orphan",
     )
@@ -145,6 +153,11 @@ class FileRecord(Base):
         back_populates="file_record",
         cascade="all, delete-orphan",
     )
+    issue_markers: Mapped[list["IssueMarker"]] = relationship(
+        "IssueMarker",
+        back_populates="file_record",
+        passive_deletes=True,
+    )
     revisions: Mapped[list["SegmentRevision"]] = relationship(
         "SegmentRevision",
         back_populates="file_record",
@@ -170,6 +183,16 @@ class User(Base):
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
     comments: Mapped[list["SegmentComment"]] = relationship("SegmentComment", back_populates="author")
+    issue_markers: Mapped[list["IssueMarker"]] = relationship(
+        "IssueMarker",
+        foreign_keys="IssueMarker.reporter_id",
+        back_populates="reporter",
+    )
+    resolved_issue_markers: Mapped[list["IssueMarker"]] = relationship(
+        "IssueMarker",
+        foreign_keys="IssueMarker.resolved_by_id",
+        back_populates="resolved_by",
+    )
 
 
 class Segment(Base):
@@ -354,6 +377,76 @@ class SegmentComment(Base):
         "SegmentComment",
         back_populates="parent",
         cascade="all, delete-orphan",
+    )
+
+
+class IssueMarker(Base):
+    __tablename__ = "issue_markers"
+    __table_args__ = (
+        Index("ix_issue_markers_project_id", "project_id"),
+        Index("ix_issue_markers_file_record_id", "file_record_id"),
+        Index("ix_issue_markers_status", "status"),
+        Index("ix_issue_markers_reporter_id", "reporter_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    file_record_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    title: Mapped[str] = mapped_column(String(160), nullable=False, default="", server_default=text("''"))
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    category: Mapped[str] = mapped_column(String(30), nullable=False, default="other", server_default=text("'other'"))
+    severity: Mapped[str] = mapped_column(String(20), nullable=False, default="medium", server_default=text("'medium'"))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open", server_default=text("'open'"))
+    page_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reporter_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    resolved_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+    resolved_at: Mapped[DateTime | None] = mapped_column(
+        DateTime(timezone=False),
+        nullable=True,
+    )
+
+    project: Mapped["Project"] = relationship("Project", back_populates="issue_markers")
+    file_record: Mapped["FileRecord | None"] = relationship("FileRecord", back_populates="issue_markers")
+    reporter: Mapped["User | None"] = relationship(
+        "User",
+        foreign_keys=[reporter_id],
+        back_populates="issue_markers",
+    )
+    resolved_by: Mapped["User | None"] = relationship(
+        "User",
+        foreign_keys=[resolved_by_id],
+        back_populates="resolved_issue_markers",
     )
 
 
@@ -554,5 +647,3 @@ class TermEntry(Base):
     creator: Mapped["User | None"] = relationship(
         "User", foreign_keys=[creator_id]
     )
-
-

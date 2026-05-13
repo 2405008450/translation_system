@@ -74,6 +74,7 @@ export interface Segment {
 
 export interface FileRecordDetail {
   id: string
+  project_id: string | null
   filename: string
   status: string
   document_parse_mode: 'full' | 'body_only'
@@ -83,6 +84,7 @@ export interface FileRecordDetail {
   collection_name: string | null
   term_base_id: string | null
   term_base_name: string | null
+  translation_guidelines: string
   created_at: string
   updated_at: string
   total_segments: number
@@ -91,6 +93,8 @@ export interface FileRecordDetail {
   source_extension: string
   has_source_document: boolean
   can_export: boolean
+  issue_count: number
+  open_issue_count: number
   segments: Segment[]
 }
 
@@ -129,6 +133,42 @@ export interface SegmentComment {
   created_at: string
   updated_at: string
   resolved_at: string | null
+}
+
+export type IssueCategory = 'bug' | 'translation' | 'format' | 'performance' | 'data' | 'other'
+export type IssueSeverity = 'low' | 'medium' | 'high' | 'critical'
+export type IssueStatus = 'open' | 'resolved'
+
+export interface IssueMarker {
+  id: string
+  project_id: string
+  project_name: string | null
+  file_record_id: string | null
+  file_record_name: string | null
+  title: string
+  description: string
+  category: IssueCategory
+  severity: IssueSeverity
+  status: IssueStatus
+  page_url: string | null
+  user_agent: string | null
+  reporter: User | null
+  reporter_name: string | null
+  resolved_by: User | null
+  resolved_by_name: string | null
+  created_at: string
+  updated_at: string
+  resolved_at: string | null
+}
+
+export interface IssueMarkerCreatePayload {
+  file_record_id?: string | null
+  title?: string | null
+  description: string
+  category: IssueCategory
+  severity: IssueSeverity
+  page_url?: string | null
+  user_agent?: string | null
 }
 
 export interface TermBase {
@@ -219,6 +259,19 @@ export interface TermImportSummary {
   target_language: string
 }
 
+export interface GuidelineTemplateSummary {
+  id: string
+  name: string
+  filename: string
+  size_bytes: number
+  updated_at: string
+  content_preview: string
+}
+
+export interface GuidelineTemplateDetail extends GuidelineTemplateSummary {
+  content: string
+}
+
 export interface SegmentUpdatePayload {
   sentence_id: string
   target_text: string
@@ -256,6 +309,11 @@ export interface CommentReplyPayload {
 
 export type LLMTranslateScope = 'fuzzy_only' | 'none_only' | 'all' | 'all_with_exact'
 export type LLMProvider = 'auto' | 'deepseek' | 'openrouter'
+
+export interface LLMGuidelineOptions {
+  guidelineTemplateId?: string
+  temporaryPrompt?: string
+}
 
 export interface LLMEvent {
   event: string

@@ -8,6 +8,7 @@ import { translate } from '../i18n'
 import type {
   FileRecordDetail,
   FileRecordPreview,
+  LLMGuidelineOptions,
   LLMProvider,
   LLMTranslateScope,
   Segment,
@@ -490,7 +491,11 @@ export const useSegmentStore = defineStore('segment', () => {
     dirtyEntries.value = nextDirtyEntries
   }
 
-  async function startLLMTranslation(scope: LLMTranslateScope, provider: LLMProvider) {
+  async function startLLMTranslation(
+    scope: LLMTranslateScope,
+    provider: LLMProvider,
+    guidelineOptions: LLMGuidelineOptions = {},
+  ) {
     if (!fileRecord.value || llmRunning.value) {
       return
     }
@@ -523,6 +528,8 @@ export const useSegmentStore = defineStore('segment', () => {
         body: JSON.stringify({
           scope,
           provider,
+          guideline_template_id: guidelineOptions.guidelineTemplateId || null,
+          temporary_prompt: guidelineOptions.temporaryPrompt || '',
         }),
         signal: llmAbortController.signal,
       })

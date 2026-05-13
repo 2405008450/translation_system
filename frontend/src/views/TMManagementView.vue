@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { GitMerge, Loader2, Pencil, Plus, Search, Trash2 } from 'lucide-vue-next'
+import { GitMerge, Loader2, Pencil, Plus, Search, Trash2, X } from 'lucide-vue-next'
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
@@ -25,6 +25,8 @@ interface TMCollectionMergeSummary {
 const router = useRouter()
 const confirm = useConfirm()
 const searchQuery = ref('')
+const filterSourceLanguage = ref('')
+const filterTargetLanguage = ref('')
 const currentPage = ref(1)
 const pageSize = ref(50)
 const selectedIds = ref(new Set<string>())
@@ -74,6 +76,7 @@ const mergeLanguagePairLabel = computed(() => {
 })
 
 const canMergeSelectedCollections = computed(() => !getSelectedCollectionsMergeError())
+const hasLanguageFilter = computed(() => Boolean(filterSourceLanguage.value || filterTargetLanguage.value))
 
 function formatDate(value: string) {
   const d = new Date(value)
@@ -327,6 +330,12 @@ async function deleteSelectedCollections() {
 
 const filteredCollections = computed(() => {
   let data = tmCollections.value
+  if (filterSourceLanguage.value) {
+    data = data.filter((item) => item.source_language === filterSourceLanguage.value)
+  }
+  if (filterTargetLanguage.value) {
+    data = data.filter((item) => item.target_language === filterTargetLanguage.value)
+  }
   if (searchQuery.value.trim()) {
     const q = searchQuery.value.trim().toLowerCase()
     data = data.filter((item) => (
@@ -373,7 +382,12 @@ function handleSelect(ids: Set<string>) {
   selectedIds.value = ids
 }
 
-watch(searchQuery, () => {
+function clearLanguageFilter() {
+  filterSourceLanguage.value = ''
+  filterTargetLanguage.value = ''
+}
+
+watch([searchQuery, filterSourceLanguage, filterTargetLanguage], () => {
   currentPage.value = 1
 })
 
@@ -399,6 +413,30 @@ onMounted(() => {
               type="text"
               placeholder="搜索名称、说明或语言对..."
             />
+          </div>
+          <div class="resource-language-filter" aria-label="语言对筛选">
+            <select v-model="filterSourceLanguage" class="resource-language-filter__select" title="筛选源语言">
+              <option value="">源语言：全部</option>
+              <option v-for="option in languageOptions" :key="option.code" :value="option.code">
+                {{ option.label }}
+              </option>
+            </select>
+            <span class="resource-language-filter__arrow">→</span>
+            <select v-model="filterTargetLanguage" class="resource-language-filter__select" title="筛选目标语言">
+              <option value="">目标语言：全部</option>
+              <option v-for="option in languageOptions" :key="option.code" :value="option.code">
+                {{ option.label }}
+              </option>
+            </select>
+            <button
+              v-if="hasLanguageFilter"
+              class="resource-language-filter__clear"
+              type="button"
+              title="清空语言对筛选"
+              @click="clearLanguageFilter"
+            >
+              <X :size="14" />
+            </button>
           </div>
           <button class="button button--primary" type="button" @click="openCreateDialog">
             <Plus :size="14" /> 创建

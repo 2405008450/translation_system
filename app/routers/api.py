@@ -3,25 +3,30 @@ API 路由模块 - 文件上传、解析和导出接口
 
 支持多种文档格式的上传、解析和导出。
 """
+import asyncio
 import json
+import logging
 from datetime import datetime
+from functools import partial
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
-from urllib.parse import quote
-from uuid import UUID
+from typing import Any, Dict, List, Literal, Optional
+from urllib.parse import quote, unquote, urlparse
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user, get_user_display_name, require_admin
-from app.database import get_db
+from app.config import get_settings
+from app.database import SessionLocal, get_db
 from app.models import (
     FileRecord,
+    IssueMarker,
     MemoryBase,
     MemoryEntry,
     Project,
@@ -52,6 +57,15 @@ from app.services.comment_service import (
     serialize_segment_comment,
     update_segment_comment,
 )
+from app.services.issue_marker_service import (
+    create_issue_marker,
+    delete_issue_marker,
+    list_issue_markers_for_project,
+    serialize_issue_marker,
+    update_issue_marker,
+)
+from app.services.cache import get_json as cache_get_json
+from app.services.cache import set_json as cache_set_json
 from app.services.file_record_service import (
     batch_update_segments,
     calculate_file_record_progress,
@@ -68,6 +82,14 @@ from app.services.file_record_service import (
     update_segment_by_sentence_id,
     update_segment_with_llm_result,
 )
+from app.services.guideline_repository import (
+    GuidelineTemplate,
+    delete_guideline_template,
+    list_guideline_templates,
+    read_guideline_template,
+    save_guideline_template,
+    update_guideline_template,
+)
 from app.services.llm_service import (
     LLMConfigurationError,
     LLMTranslationFailure,
@@ -75,6 +97,7 @@ from app.services.llm_service import (
     iter_batch_translate,
     validate_provider_choice,
 )
+from app.services.language_detection import detect_upload_language
 from app.services.language_pairs import require_language_pair
 from app.services.matcher import get_tm_candidates_for_text, match_sentences_with_stats
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
@@ -108,8 +131,396 @@ from app.services.tm_importer import (
 from app.services.tm_vector import sync_tm_embeddings
 from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_response
 
+try:
+    from arq import create_pool as arq_create_pool
+    from arq.connections import RedisSettings
+except ModuleNotFoundError:  # pragma: no cover - 本地未安装 ARQ 时使用 FastAPI 后台任务兜底
+    arq_create_pool = None
+    RedisSettings = None
 
+
+logger = logging.getLogger(__name__)
 router = APIRouter(dependencies=[Depends(get_current_user)])
+
+
+def _build_task_workspace_with_new_session(
+    raw_bytes: bytes,
+    filename: str,
+    similarity_threshold: float,
+    collection_ids: list[UUID] | None,
+    document_parse_mode: str,
+) -> dict:
+    with SessionLocal() as workspace_db:
+        return build_task_workspace(
+            db=workspace_db,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            similarity_threshold=similarity_threshold,
+            collection_ids=collection_ids,
+            document_parse_mode=document_parse_mode,
+        )
+
+
+async def _build_task_workspace_async(
+    raw_bytes: bytes,
+    filename: str,
+    similarity_threshold: float,
+    collection_ids: list[UUID] | None = None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+) -> dict:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        partial(
+            _build_task_workspace_with_new_session,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            similarity_threshold=similarity_threshold,
+            collection_ids=collection_ids,
+            document_parse_mode=document_parse_mode,
+        ),
+    )
+
+
+def _begin_repeatable_read_snapshot(db: Session) -> None:
+    if db.get_bind().dialect.name == "postgresql":
+        db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+
+
+IMPORT_TASK_TTL_SECONDS = 24 * 60 * 60
+
+
+def _import_task_cache_key(task_id: str) -> str:
+    return f"import-task:{task_id}"
+
+
+def _set_import_task_status(
+    task_id: str,
+    status: Literal["queued", "running", "completed", "failed"],
+    *,
+    progress: int = 0,
+    message: str = "",
+    result: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "task_id": task_id,
+        "status": status,
+        "progress": max(0, min(100, int(progress))),
+        "message": message,
+        "result": result,
+        "error": error,
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    cache_set_json(_import_task_cache_key(task_id), payload, ttl_seconds=IMPORT_TASK_TTL_SECONDS)
+    return payload
+
+
+def _get_import_task_status(task_id: str) -> dict[str, Any] | None:
+    payload = cache_get_json(_import_task_cache_key(task_id))
+    return payload if isinstance(payload, dict) else None
+
+
+def _build_arq_redis_settings(redis_url: str):
+    if RedisSettings is None:
+        return None
+
+    parsed = urlparse(redis_url)
+    database = int((parsed.path or "/0").lstrip("/") or "0")
+    kwargs = {
+        "host": parsed.hostname or "localhost",
+        "port": parsed.port or 6379,
+        "database": database,
+        "password": unquote(parsed.password) if parsed.password else None,
+        "ssl": parsed.scheme == "rediss",
+    }
+    if parsed.username:
+        kwargs["username"] = unquote(parsed.username)
+    try:
+        return RedisSettings(**kwargs)
+    except TypeError:
+        kwargs.pop("username", None)
+        return RedisSettings(**kwargs)
+
+
+async def _close_arq_pool(redis_pool) -> None:
+    close = getattr(redis_pool, "close", None)
+    if close is not None:
+        close_result = close()
+        if asyncio.iscoroutine(close_result):
+            await close_result
+
+    wait_closed = getattr(redis_pool, "wait_closed", None)
+    if wait_closed is not None:
+        wait_result = wait_closed()
+        if asyncio.iscoroutine(wait_result):
+            await wait_result
+
+
+async def _enqueue_arq_import_task(task_id: str, payload: dict[str, Any]) -> bool:
+    settings = get_settings()
+    if settings.import_queue_backend.lower() != "arq":
+        return False
+    if not settings.redis_url or arq_create_pool is None:
+        return False
+
+    redis_settings = _build_arq_redis_settings(settings.redis_url)
+    if redis_settings is None:
+        return False
+
+    redis_pool = None
+    try:
+        redis_pool = await arq_create_pool(redis_settings)
+        await redis_pool.enqueue_job("process_import_task_job", task_id, payload)
+        return True
+    except Exception:
+        logger.warning("enqueue ARQ import task failed, fallback to local background task", exc_info=True)
+        return False
+    finally:
+        if redis_pool is not None:
+            await _close_arq_pool(redis_pool)
+
+
+async def _queue_import_task(
+    background_tasks: BackgroundTasks,
+    payload: dict[str, Any],
+) -> JSONResponse:
+    task_id = str(uuid4())
+    _set_import_task_status(task_id, "queued", progress=0, message="任务已进入导入队列。")
+    if not await _enqueue_arq_import_task(task_id, payload):
+        background_tasks.add_task(_run_import_task, task_id, payload)
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "task_id": task_id,
+            "status": "queued",
+            "progress": 0,
+            "message": "任务已进入导入队列。",
+        },
+    )
+
+
+def _uuid_list(values: list[str] | None) -> list[UUID]:
+    return [UUID(value) for value in values or []]
+
+
+def _serialize_file_record_upload_result(file_record: FileRecord) -> dict[str, Any]:
+    return {
+        "id": str(file_record.id),
+        "filename": file_record.filename,
+        "status": file_record.status,
+        "document_parse_mode": file_record.document_parse_mode,
+        "created_at": file_record.created_at.isoformat(),
+    }
+
+
+def _json_ready_project_file_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    for key in ("collection_id", "term_base_id"):
+        if payload.get(key) is not None:
+            payload[key] = str(payload[key])
+    return payload
+
+
+def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
+    file_payload = payload["file"]
+    raw_bytes = file_payload["content"]
+    filename = file_payload["filename"] or "untitled.txt"
+    selected_collection_ids = _uuid_list(payload.get("collection_ids"))
+    term_base_id = UUID(payload["term_base_id"]) if payload.get("term_base_id") else None
+    document_parse_mode = payload.get("document_parse_mode") or DOCUMENT_PARSE_MODE_FULL
+    threshold = float(payload.get("threshold", 0.6))
+
+    primary_collection = _get_collection_or_404(
+        db,
+        selected_collection_ids[0] if selected_collection_ids else None,
+    )
+    resolved_source_language, resolved_target_language = _resolve_upload_language_pair(
+        payload.get("source_language"),
+        payload.get("target_language"),
+        primary_collection,
+    )
+
+    term_base = None
+    if term_base_id is not None:
+        term_base = db.query(TermBase).filter(TermBase.id == term_base_id).first()
+        if term_base is None:
+            raise HTTPException(status_code=404, detail="术语库不存在。")
+        _ensure_resource_language_pair_matches(
+            term_base,
+            resolved_source_language,
+            resolved_target_language,
+            "术语库",
+        )
+
+    workspace_data = build_task_workspace(
+        db=db,
+        raw_bytes=raw_bytes,
+        filename=filename,
+        similarity_threshold=threshold,
+        collection_ids=selected_collection_ids,
+        document_parse_mode=document_parse_mode,
+    )
+    file_record = create_file_record_with_segments(
+        db=db,
+        raw_bytes=raw_bytes,
+        filename=filename,
+        similarity_threshold=threshold,
+        workspace_data=workspace_data,
+        collection_ids=selected_collection_ids,
+        document_parse_mode=document_parse_mode,
+    )
+    if selected_collection_ids:
+        file_record.collection_id = selected_collection_ids[0]
+        _apply_collection_language_pair(file_record, primary_collection)
+    file_record.source_language = resolved_source_language
+    file_record.target_language = resolved_target_language
+    if term_base is not None:
+        file_record.term_base_id = term_base_id
+
+    db.commit()
+    db.refresh(file_record)
+    return _serialize_file_record_upload_result(file_record)
+
+
+def _process_project_source_import(db: Session, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    project_id = UUID(payload["project_id"])
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+
+    selected_collection_ids = _uuid_list(payload.get("collection_ids"))
+    term_base_id = UUID(payload["term_base_id"]) if payload.get("term_base_id") else None
+    document_parse_mode = payload.get("document_parse_mode") or DOCUMENT_PARSE_MODE_FULL
+    threshold = float(payload.get("threshold", 0.6))
+    primary_collection = _get_collection_or_404(
+        db,
+        selected_collection_ids[0] if selected_collection_ids else None,
+    )
+    resolved_source_language, resolved_target_language = _resolve_upload_language_pair(
+        payload.get("source_language"),
+        payload.get("target_language"),
+        primary_collection,
+    )
+
+    term_base = None
+    if term_base_id is not None:
+        term_base = db.query(TermBase).filter(TermBase.id == term_base_id).first()
+        if term_base is None:
+            raise HTTPException(status_code=404, detail="术语库不存在。")
+        _ensure_resource_language_pair_matches(
+            term_base,
+            resolved_source_language,
+            resolved_target_language,
+            "术语库",
+        )
+
+    file_payloads = payload["files"]
+    created_files: list[FileRecord] = []
+    for index, file_payload in enumerate(file_payloads, start=1):
+        filename = file_payload["filename"] or "source.txt"
+        _set_import_task_status(
+            task_id,
+            "running",
+            progress=10 + int((index - 1) / max(len(file_payloads), 1) * 80),
+            message=f"正在解析 {filename}",
+        )
+        workspace_data = build_task_workspace(
+            db=db,
+            raw_bytes=file_payload["content"],
+            filename=filename,
+            similarity_threshold=threshold,
+            collection_ids=selected_collection_ids,
+            document_parse_mode=document_parse_mode,
+        )
+        file_record = create_file_record_with_segments(
+            db=db,
+            raw_bytes=file_payload["content"],
+            filename=filename,
+            similarity_threshold=threshold,
+            workspace_data=workspace_data,
+            collection_ids=selected_collection_ids,
+            document_parse_mode=document_parse_mode,
+        )
+        file_record.project_id = project.id
+        file_record.creator_id = project.creator_id
+        file_record.deadline = project.deadline
+        file_record.access_level = project.access_level
+        file_record.source_language = resolved_source_language
+        file_record.target_language = resolved_target_language
+        if selected_collection_ids:
+            file_record.collection_id = selected_collection_ids[0]
+        if term_base is not None:
+            file_record.term_base_id = term_base_id
+        created_files.append(file_record)
+
+    project.status = "in_progress"
+    db.commit()
+    for file_record in created_files:
+        db.refresh(file_record)
+
+    file_stats = _get_file_segment_stats(db, [file_record.id for file_record in created_files])
+    return {
+        "id": str(project.id),
+        "status": project.status,
+        "filename": project.name,
+        "uploaded_count": len(created_files),
+        "files": [
+            _json_ready_project_file_payload(
+                _build_project_file_payload(
+                    file_record=file_record,
+                    total_segments=file_stats.get(file_record.id, {"total": 0})["total"],
+                    translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
+                )
+            )
+            for file_record in created_files
+        ],
+    }
+
+
+def _run_import_task(task_id: str, payload: dict[str, Any]) -> None:
+    _set_import_task_status(task_id, "running", progress=5, message="导入任务开始处理。")
+    with SessionLocal() as db:
+        try:
+            if payload.get("kind") == "project_source_document":
+                result = _process_project_source_import(db, task_id, payload)
+            else:
+                result = _process_file_record_import(db, payload)
+            _set_import_task_status(
+                task_id,
+                "completed",
+                progress=100,
+                message="导入完成。",
+                result=result,
+            )
+        except HTTPException as exc:
+            db.rollback()
+            _set_import_task_status(
+                task_id,
+                "failed",
+                progress=100,
+                message="导入失败。",
+                error=str(exc.detail),
+            )
+        except Exception as exc:
+            db.rollback()
+            logger.exception("import task failed task_id=%s", task_id)
+            _set_import_task_status(
+                task_id,
+                "failed",
+                progress=100,
+                message="导入失败。",
+                error=str(exc),
+            )
+
+
+async def process_import_task_job(ctx, task_id: str, payload: dict[str, Any]) -> None:
+    await asyncio.to_thread(_run_import_task, task_id, payload)
+
+
+class WorkerSettings:
+    functions = [process_import_task_job]
+    redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
 
 
 class SegmentUpdate(BaseModel):
@@ -129,6 +540,13 @@ class RevisionResolvePayload(BaseModel):
 class LLMTranslateRequest(BaseModel):
     scope: Literal["fuzzy_only", "none_only", "all", "all_with_exact"] = "all"
     provider: Literal["auto", "deepseek", "openrouter"] = "deepseek"
+    translation_guidelines: str = ""
+    guideline_template_id: str | None = None
+    temporary_prompt: str = ""
+
+
+class GuidelineTemplateUpdateRequest(BaseModel):
+    content: str
 
 
 class RematchRequest(BaseModel):
@@ -196,6 +614,24 @@ class CommentReplyRequest(BaseModel):
     body: str
 
 
+class IssueMarkerCreateRequest(BaseModel):
+    file_record_id: UUID | None = None
+    title: str | None = None
+    description: str
+    category: Literal["bug", "translation", "format", "performance", "data", "other"] = "other"
+    severity: Literal["low", "medium", "high", "critical"] = "medium"
+    page_url: str | None = None
+    user_agent: str | None = None
+
+
+class IssueMarkerUpdateRequest(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    category: Literal["bug", "translation", "format", "performance", "data", "other"] | None = None
+    severity: Literal["low", "medium", "high", "critical"] | None = None
+    status: Literal["open", "resolved"] | None = None
+
+
 class ProjectCreatePayload(BaseModel):
     name: str
     source_language: str | None = None
@@ -212,6 +648,7 @@ class ProjectUpdatePayload(BaseModel):
     target_language: str | None = None
     deadline: str | None = None
     access_level: Literal["team", "private", "public"] | None = None
+    translation_guidelines: str | None = None
 
 
 def _build_binary_download_response(
@@ -237,6 +674,53 @@ def _build_binary_download_response(
 
 def _sse_event(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _serialize_guideline_template(template: GuidelineTemplate, include_content: bool = False) -> dict:
+    payload = {
+        "id": template.id,
+        "name": template.name,
+        "filename": template.filename,
+        "size_bytes": template.size_bytes,
+        "updated_at": template.updated_at.isoformat(),
+        "content_preview": template.content[:180],
+    }
+    if include_content:
+        payload["content"] = template.content
+    return payload
+
+
+def _resolve_llm_guidelines(
+    db: Session,
+    file_record: FileRecord,
+    body: LLMTranslateRequest,
+) -> str:
+    project_guidelines = ""
+    if file_record.project_id:
+        project = db.query(Project).filter(Project.id == file_record.project_id).first()
+        if project:
+            project_guidelines = (project.translation_guidelines or "").strip()
+
+    parts: list[str] = []
+    if project_guidelines:
+        parts.append(project_guidelines)
+
+    if body.guideline_template_id:
+        try:
+            template = read_guideline_template(body.guideline_template_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="选择的翻译细则模板不存在。") from exc
+        parts.append(f"【可复用细则：{template.name}】\n{template.content.strip()}")
+
+    temporary_prompt = (body.temporary_prompt or "").strip()
+    legacy_guidelines = (body.translation_guidelines or "").strip()
+    if legacy_guidelines and not temporary_prompt:
+        temporary_prompt = legacy_guidelines
+
+    if temporary_prompt and temporary_prompt != project_guidelines:
+        parts.append(f"【本次临时提示词】\n{temporary_prompt}")
+
+    return "\n\n".join(part for part in parts if part.strip())
 
 
 def _parse_optional_datetime(value: str | None) -> datetime | None:
@@ -295,6 +779,59 @@ def _build_llm_translation_tasks(
         )
 
     return tasks
+
+
+@router.get("/guideline-templates")
+def list_translation_guideline_templates():
+    """列出仓库中可复用的 Markdown 翻译细则模板。"""
+    return [
+        _serialize_guideline_template(template)
+        for template in list_guideline_templates()
+    ]
+
+
+@router.post("/guideline-templates/import")
+async def import_translation_guideline_template(file: UploadFile = File(...)):
+    """导入 .md/.txt 翻译细则，并统一保存为仓库内 UTF-8 Markdown。"""
+    raw_bytes = await file.read()
+    try:
+        template = save_guideline_template(file.filename or "", raw_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _serialize_guideline_template(template, include_content=True)
+
+
+@router.get("/guideline-templates/{template_id}")
+def get_translation_guideline_template(template_id: str):
+    try:
+        template = read_guideline_template(template_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="翻译细则模板不存在。") from exc
+    return _serialize_guideline_template(template, include_content=True)
+
+
+@router.put("/guideline-templates/{template_id}")
+def update_translation_guideline_template(
+    template_id: str,
+    payload: GuidelineTemplateUpdateRequest,
+):
+    try:
+        template = update_guideline_template(template_id, payload.content)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="翻译细则模板不存在。") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _serialize_guideline_template(template, include_content=True)
+
+
+@router.delete("/guideline-templates/{template_id}", status_code=204)
+def delete_translation_guideline_template(template_id: str):
+    try:
+        delete_guideline_template(template_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="翻译细则模板不存在。") from exc
+    return Response(status_code=204)
+
 
 # 支持的文件扩展名（30种格式）
 SUPPORTED_EXTENSIONS = {
@@ -641,12 +1178,12 @@ async def upload_for_workspace(
     selected_collection_ids = _validate_collection_ids(db, collection_ids)
     required_collection_ids = _require_selected_collection_ids(selected_collection_ids)
     try:
-        return build_task_workspace(
-            db=db,
+        return await _build_task_workspace_async(
             raw_bytes=raw_bytes,
             filename=file.filename or "untitled.txt",
             similarity_threshold=threshold,
             collection_ids=required_collection_ids,
+            document_parse_mode=DOCUMENT_PARSE_MODE_FULL,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -707,6 +1244,14 @@ async def get_supported_formats():
         "formats": formats,
         "total": len(formats),
     }
+
+
+@router.get("/import-tasks/{task_id}")
+def get_import_task(task_id: str):
+    status = _get_import_task_status(task_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="导入任务不存在或已过期。")
+    return status
 
 
 # ============== 适配器导出相关模型 ==============
@@ -963,6 +1508,7 @@ async def import_xliff(file: UploadFile = File(...)):
 @router.post("/file-records")
 @router.post("/documents", include_in_schema=False)
 async def create_file_record(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     threshold: float = Form(default=0.6),
     collection_ids: list[UUID] | None = Form(default=None),
@@ -1003,47 +1549,20 @@ async def create_file_record(
             "术语库",
         )
 
-    try:
-        workspace_data = build_task_workspace(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=file.filename or "untitled.txt",
-            similarity_threshold=threshold,
-            collection_ids=selected_collection_ids,
-            document_parse_mode=document_parse_mode,
-        )
-        file_record = create_file_record_with_segments(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=file.filename or "untitled.txt",
-            similarity_threshold=threshold,
-            workspace_data=workspace_data,
-            collection_ids=selected_collection_ids,
-            document_parse_mode=document_parse_mode,
-        )
-        # 写入绑定关系
-        if selected_collection_ids:
-            file_record.collection_id = selected_collection_ids[0]
-            _apply_collection_language_pair(file_record, primary_collection)
-        file_record.source_language = resolved_source_language
-        file_record.target_language = resolved_target_language
-        if term_base is not None:
-            file_record.term_base_id = term_base_id
-        db.commit()
-        return {
-            "id": file_record.id,
-            "filename": file_record.filename,
-            "status": file_record.status,
-            "document_parse_mode": file_record.document_parse_mode,
-            "created_at": file_record.created_at.isoformat(),
-        }
-    except (UnsupportedFormatError, FileTooLargeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except ParseError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    payload = {
+        "kind": "file_record",
+        "file": {
+            "filename": file.filename or "untitled.txt",
+            "content": raw_bytes,
+        },
+        "threshold": threshold,
+        "collection_ids": [str(collection_id) for collection_id in selected_collection_ids],
+        "term_base_id": str(term_base_id) if term_base_id is not None else None,
+        "source_language": resolved_source_language,
+        "target_language": resolved_target_language,
+        "document_parse_mode": document_parse_mode,
+    }
+    return await _queue_import_task(background_tasks, payload)
 
 
 @router.post("/projects")
@@ -1107,6 +1626,7 @@ def _build_project_summary_payload(
     translated_segments: int,
     file_count: int,
     creator_name: str | None = None,
+    issue_stats: dict[str, int] | None = None,
 ) -> dict:
     progress = calculate_file_record_progress(total_segments, translated_segments)
     effective_status = (
@@ -1114,6 +1634,7 @@ def _build_project_summary_payload(
         if total_segments > 0
         else project.status
     )
+    issue_stats = issue_stats or {"issue_count": 0, "open_issue_count": 0}
 
     return {
         "id": str(project.id),
@@ -1128,7 +1649,10 @@ def _build_project_summary_payload(
         "creator": creator_name,
         "deadline": project.deadline.isoformat() if project.deadline else None,
         "access_level": project.access_level,
+        "translation_guidelines": project.translation_guidelines or "",
         "file_count": file_count,
+        "issue_count": issue_stats.get("issue_count", 0),
+        "open_issue_count": issue_stats.get("open_issue_count", 0),
         "created_at": project.created_at.isoformat(),
         "updated_at": project.updated_at.isoformat(),
     }
@@ -1138,6 +1662,7 @@ def _build_project_file_payload(
     file_record: FileRecord,
     total_segments: int,
     translated_segments: int,
+    issue_stats: dict[str, int] | None = None,
 ) -> dict:
     source_bytes = load_file_record_source(file_record)
     progress = calculate_file_record_progress(total_segments, translated_segments)
@@ -1146,6 +1671,7 @@ def _build_project_file_payload(
         total_segments=total_segments,
         translated_segments=translated_segments,
     )
+    issue_stats = issue_stats or {"issue_count": 0, "open_issue_count": 0}
 
     return {
         "id": str(file_record.id),
@@ -1167,6 +1693,8 @@ def _build_project_file_payload(
         "file_size_bytes": len(source_bytes) if source_bytes is not None else None,
         "collection_id": file_record.collection_id,
         "term_base_id": file_record.term_base_id,
+        "issue_count": issue_stats.get("issue_count", 0),
+        "open_issue_count": issue_stats.get("open_issue_count", 0),
     }
 
 
@@ -1223,27 +1751,88 @@ def _get_project_stats(db: Session, project_ids: list[UUID]) -> dict[UUID, dict]
     }
 
 
+def _get_project_issue_stats(db: Session, project_ids: list[UUID]) -> dict[UUID, dict[str, int]]:
+    if not project_ids:
+        return {}
+
+    from sqlalchemy import case as sql_case
+
+    stats_rows = (
+        db.query(
+            IssueMarker.project_id,
+            func.count(IssueMarker.id).label("issue_count"),
+            func.count(sql_case((IssueMarker.status == "open", 1))).label("open_issue_count"),
+        )
+        .filter(IssueMarker.project_id.in_(project_ids))
+        .group_by(IssueMarker.project_id)
+        .all()
+    )
+    return {
+        row.project_id: {
+            "issue_count": int(row.issue_count or 0),
+            "open_issue_count": int(row.open_issue_count or 0),
+        }
+        for row in stats_rows
+    }
+
+
+def _get_file_issue_stats(db: Session, file_record_ids: list[UUID]) -> dict[UUID, dict[str, int]]:
+    if not file_record_ids:
+        return {}
+
+    from sqlalchemy import case as sql_case
+
+    stats_rows = (
+        db.query(
+            IssueMarker.file_record_id,
+            func.count(IssueMarker.id).label("issue_count"),
+            func.count(sql_case((IssueMarker.status == "open", 1))).label("open_issue_count"),
+        )
+        .filter(IssueMarker.file_record_id.in_(file_record_ids))
+        .group_by(IssueMarker.file_record_id)
+        .all()
+    )
+    return {
+        row.file_record_id: {
+            "issue_count": int(row.issue_count or 0),
+            "open_issue_count": int(row.open_issue_count or 0),
+        }
+        for row in stats_rows
+        if row.file_record_id is not None
+    }
+
+
 def _build_project_detail_payload(
     project: Project,
     files: list[FileRecord],
     file_stats: dict[UUID, dict],
+    issue_markers: list[IssueMarker] | None = None,
+    project_issue_stats: dict[str, int] | None = None,
+    file_issue_stats: dict[UUID, dict[str, int]] | None = None,
 ) -> dict:
     total_segments = sum(file_stats.get(file.id, {"total": 0})["total"] for file in files)
     translated_segments = sum(file_stats.get(file.id, {"filled": 0})["filled"] for file in files)
+    file_issue_stats = file_issue_stats or {}
     payload = _build_project_summary_payload(
         project=project,
         total_segments=total_segments,
         translated_segments=translated_segments,
         file_count=len(files),
         creator_name=get_user_display_name(project.creator),
+        issue_stats=project_issue_stats,
     )
     payload["files"] = [
         _build_project_file_payload(
             file_record=file_record,
             total_segments=file_stats.get(file_record.id, {"total": 0})["total"],
             translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
+            issue_stats=file_issue_stats.get(file_record.id),
         )
         for file_record in files
+    ]
+    payload["issue_markers"] = [
+        serialize_issue_marker(marker)
+        for marker in (issue_markers or [])
     ]
     payload["has_source_document"] = any(file_item["has_source_document"] for file_item in payload["files"])
     payload["file_size_bytes"] = sum(
@@ -1276,7 +1865,17 @@ def get_project_detail(
         .all()
     )
     file_stats = _get_file_segment_stats(db, [file_record.id for file_record in files])
-    return _build_project_detail_payload(project, files, file_stats)
+    issue_markers = list_issue_markers_for_project(db, project_id)
+    project_issue_stats = _get_project_issue_stats(db, [project_id]).get(project_id)
+    file_issue_stats = _get_file_issue_stats(db, [file_record.id for file_record in files])
+    return _build_project_detail_payload(
+        project,
+        files,
+        file_stats,
+        issue_markers=issue_markers,
+        project_issue_stats=project_issue_stats,
+        file_issue_stats=file_issue_stats,
+    )
 
 
 @router.delete("/projects/{project_id}")
@@ -1303,9 +1902,148 @@ def delete_project(
     return {"message": "项目已删除。"}
 
 
+@router.patch("/projects/{project_id}")
+def update_project(
+    project_id: UUID,
+    payload: ProjectUpdatePayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+
+    if payload.name is not None:
+        name = payload.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="项目名称不能为空。")
+        project.name = name
+
+    if payload.source_language is not None or payload.target_language is not None:
+        src = payload.source_language if payload.source_language is not None else project.source_language
+        tgt = payload.target_language if payload.target_language is not None else project.target_language
+        if src or tgt:
+            src, tgt = _require_tm_language_pair(src, tgt)
+        project.source_language = src
+        project.target_language = tgt
+
+    if payload.deadline is not None:
+        project.deadline = _parse_optional_datetime(payload.deadline)
+
+    if payload.access_level is not None:
+        project.access_level = payload.access_level
+
+    if payload.translation_guidelines is not None:
+        project.translation_guidelines = payload.translation_guidelines
+
+    db.commit()
+    db.refresh(project)
+
+    return {
+        "id": str(project.id),
+        "name": project.name,
+        "translation_guidelines": project.translation_guidelines or "",
+        "updated_at": project.updated_at.isoformat(),
+    }
+
+
+@router.get("/projects/{project_id}/issue-markers")
+def list_project_issue_markers(
+    project_id: UUID,
+    status: Literal["open", "resolved"] | None = None,
+    file_record_id: UUID | None = None,
+    db: Session = Depends(get_db),
+):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    markers = list_issue_markers_for_project(
+        db,
+        project_id,
+        status=status,
+        file_record_id=file_record_id,
+    )
+    return [serialize_issue_marker(marker) for marker in markers]
+
+
+@router.post("/projects/{project_id}/issue-markers")
+def create_project_issue_marker(
+    project_id: UUID,
+    payload: IssueMarkerCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    marker = create_issue_marker(
+        db,
+        project_id=project_id,
+        file_record_id=payload.file_record_id,
+        title=payload.title,
+        description=payload.description,
+        category=payload.category,
+        severity=payload.severity,
+        page_url=payload.page_url,
+        user_agent=payload.user_agent,
+        reporter=current_user,
+    )
+    return serialize_issue_marker(marker)
+
+
+@router.patch("/issue-markers/{marker_id}")
+def patch_issue_marker(
+    marker_id: UUID,
+    payload: IssueMarkerUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    marker = update_issue_marker(
+        db,
+        marker_id=marker_id,
+        title=payload.title,
+        description=payload.description,
+        category=payload.category,
+        severity=payload.severity,
+        status=payload.status,
+        current_user=current_user,
+    )
+    return serialize_issue_marker(marker)
+
+
+@router.delete("/issue-markers/{marker_id}")
+def remove_issue_marker(
+    marker_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    delete_issue_marker(
+        db,
+        marker_id=marker_id,
+        current_user=current_user,
+    )
+    return {"message": "问题标记已删除。"}
+
+
+@router.post("/projects/{project_id}/detect-source-language")
+async def detect_project_source_language(
+    project_id: UUID,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="文件为空，无法识别语言。")
+
+    result = detect_upload_language(file.filename or "", raw_bytes)
+    return result.to_dict()
+
+
 @router.post("/projects/{project_id}/source-document")
 async def upload_project_source_document(
     project_id: UUID,
+    background_tasks: BackgroundTasks,
     files: list[UploadFile] | None = File(default=None),
     file: UploadFile | None = File(default=None),
     threshold: float = Form(default=0.6),
@@ -1352,76 +2090,30 @@ async def upload_project_source_document(
             "术语库",
         )
 
-    created_files = []
-    try:
-        for upload_file in uploaded_files:
-            raw_bytes = await upload_file.read()
-            if not raw_bytes:
-                raise HTTPException(status_code=400, detail=f"{upload_file.filename or '文件'} 为空。")
+    queued_files = []
+    for upload_file in uploaded_files:
+        raw_bytes = await upload_file.read()
+        if not raw_bytes:
+            raise HTTPException(status_code=400, detail=f"{upload_file.filename or '文件'} 为空。")
+        queued_files.append(
+            {
+                "filename": upload_file.filename or "source.txt",
+                "content": raw_bytes,
+            }
+        )
 
-            filename = upload_file.filename or "source.txt"
-            workspace_data = build_task_workspace(
-                db=db,
-                raw_bytes=raw_bytes,
-                filename=filename,
-                similarity_threshold=threshold,
-                collection_ids=selected_collection_ids,
-                document_parse_mode=document_parse_mode,
-            )
-            file_record = create_file_record_with_segments(
-                db=db,
-                raw_bytes=raw_bytes,
-                filename=filename,
-                similarity_threshold=threshold,
-                workspace_data=workspace_data,
-                collection_ids=selected_collection_ids,
-                document_parse_mode=document_parse_mode,
-            )
-            file_record.project_id = project.id
-            file_record.creator_id = project.creator_id
-            file_record.deadline = project.deadline
-            file_record.access_level = project.access_level
-            file_record.source_language = resolved_source_language
-            file_record.target_language = resolved_target_language
-            if selected_collection_ids:
-                file_record.collection_id = selected_collection_ids[0]
-            if term_base is not None:
-                file_record.term_base_id = term_base_id
-            db.commit()
-            db.refresh(file_record)
-            created_files.append(file_record)
-
-        project.status = "in_progress"
-        db.commit()
-    except HTTPException:
-        db.rollback()
-        raise
-    except (UnsupportedFormatError, FileTooLargeError, ValueError) as exc:
-        db.rollback()
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except ParseError as exc:
-        db.rollback()
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    file_stats = _get_file_segment_stats(db, [file_record.id for file_record in created_files])
-
-    return {
-        "id": str(project.id),
-        "status": project.status,
-        "filename": project.name,
-        "uploaded_count": len(created_files),
-        "files": [
-            _build_project_file_payload(
-                file_record=file_record,
-                total_segments=file_stats.get(file_record.id, {"total": 0})["total"],
-                translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
-            )
-            for file_record in created_files
-        ],
+    payload = {
+        "kind": "project_source_document",
+        "project_id": str(project.id),
+        "files": queued_files,
+        "threshold": threshold,
+        "collection_ids": [str(collection_id) for collection_id in selected_collection_ids],
+        "term_base_id": str(term_base_id) if term_base_id is not None else None,
+        "source_language": resolved_source_language,
+        "target_language": resolved_target_language,
+        "document_parse_mode": document_parse_mode,
     }
+    return await _queue_import_task(background_tasks, payload)
 
 
 @router.get("/projects")
@@ -1451,6 +2143,7 @@ def list_projects(
 
     project_ids = [project.id for project in projects]
     project_stats = _get_project_stats(db, project_ids)
+    project_issue_stats = _get_project_issue_stats(db, project_ids)
 
     items = []
     for project in projects:
@@ -1469,6 +2162,7 @@ def list_projects(
                 translated_segments=filled_segs,
                 file_count=st["file_count"],
                 creator_name=creator_name,
+                issue_stats=project_issue_stats.get(project.id),
             )
         )
 
@@ -1537,8 +2231,20 @@ def get_file_record(
     if file_record.term_base:
         term_base_name = file_record.term_base.name
 
+    project_guidelines = ""
+    if file_record.project_id:
+        project = db.query(Project).filter(Project.id == file_record.project_id).first()
+        if project:
+            project_guidelines = project.translation_guidelines or ""
+
+    issue_stats = _get_file_issue_stats(db, [file_record.id]).get(
+        file_record.id,
+        {"issue_count": 0, "open_issue_count": 0},
+    )
+
     return {
         "id": file_record.id,
+        "project_id": str(file_record.project_id) if file_record.project_id else None,
         "filename": file_record.filename,
         "status": file_record.status,
         "document_parse_mode": getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
@@ -1548,6 +2254,7 @@ def get_file_record(
         "collection_name": collection_name,
         "term_base_id": file_record.term_base_id,
         "term_base_name": term_base_name,
+        "translation_guidelines": project_guidelines,
         "created_at": file_record.created_at.isoformat(),
         "updated_at": file_record.updated_at.isoformat(),
         "total_segments": result["total_segments"],
@@ -1556,6 +2263,8 @@ def get_file_record(
         "source_extension": get_task_file_extension(source_filename),
         "has_source_document": source_bytes is not None,
         "can_export": can_export_task_file(source_filename, has_source_file=source_bytes is not None),
+        "issue_count": issue_stats["issue_count"],
+        "open_issue_count": issue_stats["open_issue_count"],
         "segments": [
             {
                 "id": seg.id,
@@ -1829,6 +2538,7 @@ def export_file_record_docx(
     file_record_id: UUID,
     db: Session = Depends(get_db),
 ):
+    _begin_repeatable_read_snapshot(db)
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="File record not found.")
@@ -1895,6 +2605,7 @@ def export_file_record_with_type(
     """
     from app.services.adapters import export_file
 
+    _begin_repeatable_read_snapshot(db)
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
@@ -2288,6 +2999,8 @@ async def llm_translate_file_record(
     except LLMConfigurationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    guidelines = _resolve_llm_guidelines(db, file_record, body)
+
     translation_tasks = _build_llm_translation_tasks(
         db=db,
         file_record_id=file_record_id,
@@ -2329,6 +3042,7 @@ async def llm_translate_file_record(
         async for result in iter_batch_translate(
             translation_tasks,
             provider=body.provider,
+            translation_guidelines=guidelines,
         ):
             if await request.is_disconnected():
                 break

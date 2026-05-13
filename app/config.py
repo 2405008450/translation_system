@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.2
     llm_retry_attempts_per_provider: int = 2
     redis_url: str | None = None
+    import_queue_backend: str = "local"
     tm_vector_enabled: bool = True
     tm_vector_dimensions: int = 128
     tm_vector_candidate_limit: int = 6

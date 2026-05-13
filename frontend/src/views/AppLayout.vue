@@ -18,9 +18,8 @@ import {
 } from 'lucide-vue-next'
 import { computed, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { RouterView, useRoute, useRouter } from 'vue-router'
+import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 
-import PageHeader from '../components/base/PageHeader.vue'
 import { getLocaleLabel } from '../constants/languages'
 import { useAuthStore } from '../stores/auth'
 import { usePreferencesStore } from '../stores/preferences'
@@ -92,6 +91,12 @@ const navGroups = computed<NavGroup[]>(() => [
         icon: BookOpen,
         visible: true,
       },
+      {
+        name: 'translation-rules',
+        label: t('shell.sections.translationRules'),
+        icon: FileText,
+        visible: true,
+      },
     ],
   },
   {
@@ -119,15 +124,6 @@ const pageTitle = computed(() => {
     return t(route.meta.pageTitleKey)
   }
   return String(route.meta.pageTitle || t('pages.workbench.title'))
-})
-const pageDescription = computed(() => {
-  if (shellStore.pageContext.description) {
-    return String(shellStore.pageContext.description)
-  }
-  if (typeof route.meta.pageDescriptionKey === 'string') {
-    return t(route.meta.pageDescriptionKey)
-  }
-  return String(route.meta.pageDescription || '')
 })
 const currentSection = computed(() => String(route.meta.navSection || 'tasks'))
 const currentLocale = computed(() => getLocaleLabel(preferencesStore.locale))
@@ -160,15 +156,30 @@ const breadcrumbs = computed(() => {
         { label: pageTitle.value },
       ]
     case 'tm':
+      return [
+        { label: t('shell.sections.assets') },
+        { label: t('shell.sections.tm') },
+      ]
     case 'tm-edit':
       return [
-        { label: t('shell.sections.assets'), to: { name: 'tm' } },
+        { label: t('shell.sections.assets') },
+        { label: t('shell.sections.tm'), to: { name: 'tm' } },
         { label: pageTitle.value },
       ]
     case 'term-base':
+      return [
+        { label: t('shell.sections.assets') },
+        { label: t('shell.sections.termBase') },
+      ]
+    case 'translation-rules':
+      return [
+        { label: t('shell.sections.assets') },
+        { label: t('shell.sections.translationRules') },
+      ]
     case 'term-base-edit':
       return [
-        { label: t('shell.sections.assets'), to: { name: 'term-base' } },
+        { label: t('shell.sections.assets') },
+        { label: t('shell.sections.termBase'), to: { name: 'term-base' } },
         { label: pageTitle.value },
       ]
     case 'users':
@@ -194,6 +205,22 @@ function isGroupActive(group: NavGroup) {
 
 function toggleGroup(key: string) {
   expandedGroups[key] = !expandedGroups[key]
+}
+
+function getFirstVisibleChildName(group: NavGroup) {
+  return group.children?.find((child) => child.visible)?.name || ''
+}
+
+function handleGroupClick(group: NavGroup) {
+  if (sidebarCollapsed.value) {
+    const targetName = getFirstVisibleChildName(group)
+    if (targetName) {
+      navigateTo(targetName)
+    }
+    return
+  }
+
+  toggleGroup(group.key)
 }
 
 function navigateTo(name: string) {
@@ -239,11 +266,14 @@ function getRecentIcon(section: string) {
   if (section === 'tm' || section === 'term-base') {
     return BookOpen
   }
+  if (section === 'translation-rules') {
+    return FileText
+  }
   return FileText
 }
 
 watch(() => route.meta.navSection, (section) => {
-  if (section === 'tm' || section === 'term-base') {
+  if (section === 'tm' || section === 'term-base' || section === 'translation-rules') {
     expandedGroups.assets = true
   }
   if (section === 'users') {
@@ -294,16 +324,6 @@ watch(
               <h1 class="brand-text__title">{{ t('appLayout.brand') }}</h1>
             </div>
           </div>
-          <button
-            class="sidebar-collapse-button"
-            type="button"
-            :title="sidebarCollapsed ? t('shell.topbar.expand') : t('shell.topbar.collapse')"
-            :aria-label="sidebarCollapsed ? t('shell.topbar.expand') : t('shell.topbar.collapse')"
-            :aria-expanded="!sidebarCollapsed"
-            @click="toggleSidebar"
-          >
-            <component :is="sidebarCollapsed ? PanelLeft : PanelLeftClose" :size="18" />
-          </button>
         </div>
       </div>
 
@@ -314,11 +334,12 @@ watch(
               <div class="sidebar-nav__group">
                 <button
                   class="sidebar-nav__group-header"
+                  :class="{ 'is-active': isGroupActive(group), 'has-flyout': sidebarCollapsed }"
                   type="button"
                   :title="group.label"
                   :data-label="group.label"
                   :aria-expanded="expandedGroups[group.key]"
-                  @click="toggleGroup(group.key)"
+                  @click="handleGroupClick(group)"
                 >
                   <component :is="group.icon" :size="18" />
                   <span>{{ group.label }}</span>
@@ -328,7 +349,7 @@ watch(
                     :class="{ 'is-open': expandedGroups[group.key] }"
                   />
                 </button>
-                <div v-if="expandedGroups[group.key]" class="sidebar-nav__group-children">
+                <div v-if="!sidebarCollapsed && expandedGroups[group.key]" class="sidebar-nav__group-children">
                   <button
                     v-for="child in group.children"
                     v-show="child.visible"
@@ -346,6 +367,22 @@ watch(
                     <div v-if="!sidebarCollapsed" class="sidebar-nav__text">
                       <strong>{{ child.label }}</strong>
                     </div>
+                  </button>
+                </div>
+                <div v-else-if="sidebarCollapsed" class="sidebar-nav__flyout" role="menu">
+                  <div class="sidebar-nav__flyout-title">{{ group.label }}</div>
+                  <button
+                    v-for="child in group.children"
+                    v-show="child.visible"
+                    :key="child.name"
+                    class="sidebar-nav__flyout-item"
+                    :class="{ 'is-active': isNavActive(child.name) }"
+                    type="button"
+                    role="menuitem"
+                    @click="navigateTo(child.name)"
+                  >
+                    <component :is="child.icon" :size="15" />
+                    <span>{{ child.label }}</span>
                   </button>
                 </div>
               </div>
@@ -434,6 +471,21 @@ watch(
           >
             <component :is="sidebarCollapsed ? PanelLeft : PanelLeftClose" :size="20" />
           </button>
+          <nav v-if="breadcrumbs.length" class="shell-breadcrumb breadcrumb" aria-label="全局页面路径">
+            <template v-for="(item, index) in breadcrumbs" :key="`${item.label}-${index}`">
+              <RouterLink
+                v-if="item.to"
+                class="breadcrumb__item is-link"
+                :to="item.to"
+              >
+                {{ item.label }}
+              </RouterLink>
+              <span v-else class="breadcrumb__item is-current" :aria-current="index === breadcrumbs.length - 1 ? 'page' : undefined">
+                {{ item.label }}
+              </span>
+              <ChevronRight v-if="index < breadcrumbs.length - 1" :size="14" class="breadcrumb__sep" />
+            </template>
+          </nav>
         </div>
         <div class="shell-header__actions">
           <button
@@ -498,12 +550,6 @@ watch(
       </header>
 
       <section class="shell-body">
-        <PageHeader
-          v-if="!route.meta.hidePageHeader"
-          :title="pageTitle"
-          :description="pageDescription"
-          :breadcrumbs="breadcrumbs"
-        />
         <RouterView />
       </section>
     </div>
