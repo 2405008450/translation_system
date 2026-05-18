@@ -130,6 +130,8 @@ body,
 
 html {
   scroll-behavior: smooth;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
 }
 
 body {
@@ -2398,6 +2400,13 @@ body.modal-open {
   flex-wrap: wrap;
 }
 
+.workbench-overview__tip {
+  margin: 8px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .workbench-stat {
   display: inline-flex;
   align-items: center;
@@ -2407,9 +2416,15 @@ body.modal-open {
   border: 1px solid var(--line-soft);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.72);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
   transition:
     border-color var(--motion-base) var(--ease-standard),
     background var(--motion-base) var(--ease-standard),
+    box-shadow var(--motion-base) var(--ease-standard),
+    color var(--motion-base) var(--ease-standard),
     transform var(--motion-fast) var(--ease-press);
 }
 
@@ -2417,9 +2432,21 @@ body.modal-open {
   transform: translateY(-1px);
 }
 
+.workbench-stat.is-active {
+  border-color: #69ad9d;
+  background: linear-gradient(180deg, #edf7f4, #d7ece6);
+  color: #0b6658;
+  box-shadow: 0 0 0 3px rgba(13, 122, 104, 0.1);
+}
+
 .workbench-stat span {
   color: var(--ink-500);
   font-size: 12px;
+}
+
+.workbench-stat.is-active span,
+.workbench-stat.is-active strong {
+  color: #0b6658;
 }
 
 .workbench-stat strong {
@@ -2442,6 +2469,10 @@ body.modal-open {
 
 .workbench-stat--confirmed {
   background: linear-gradient(180deg, rgba(223, 241, 239, 0.94), rgba(255, 255, 255, 0.78));
+}
+
+.workbench-stat--empty {
+  background: linear-gradient(180deg, rgba(245, 247, 250, 0.96), rgba(255, 255, 255, 0.82));
 }
 
 .segment-table-head {

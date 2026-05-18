@@ -75,7 +75,7 @@ type ToolKey = 'source-preview' | 'target-preview' | 'split-preview' | 'match-in
 type ResourceImportTab = 'tm' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
 type SaveToTMTargetMode = 'new' | 'existing'
-type SegmentDisplayScope = 'all' | 'fuzzy_only' | 'none_only' | 'empty_target'
+type SegmentDisplayScope = 'all' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'confirmed_only' | 'empty_target'
 type SaveToTMPayload = {
   collection_mode: SaveToTMTargetMode
   collection_id?: string
@@ -150,6 +150,7 @@ const segmentDisplayScope = ref<SegmentDisplayScope>('all')
 const sourceSearchQuery = ref('')
 const targetSearchQuery = ref('')
 const searchLoadingAllSegments = ref(false)
+const retainedEmptyTargetSentenceIds = ref<Set<string>>(new Set())
 const tmCollections = ref<TMCollection[]>([])
 const loadingTMCollections = ref(false)
 const savingToTM = ref(false)
@@ -369,19 +370,59 @@ const statusSummary = computed(() => {
     fuzzy: 0,
     none: 0,
     confirmed: 0,
+    emptyTarget: 0,
   }
 
   for (const segment of segmentStore.segments) {
+    if (!normalizeTextForSaveToTM(segment.target_text)) {
+      counters.emptyTarget += 1
+    }
     if (segment.status in counters) {
       counters[segment.status as keyof typeof counters] += 1
     }
   }
 
   return [
-    { key: 'exact', label: t('workbench.statusSummary.exact'), value: counters.exact, tone: 'exact' },
-    { key: 'fuzzy', label: t('workbench.statusSummary.fuzzy'), value: counters.fuzzy, tone: 'fuzzy' },
-    { key: 'none', label: t('workbench.statusSummary.none'), value: counters.none, tone: 'none' },
-    { key: 'confirmed', label: t('workbench.statusSummary.confirmed'), value: counters.confirmed, tone: 'confirmed' },
+    {
+      key: 'exact',
+      label: t('workbench.statusSummary.exact'),
+      value: counters.exact,
+      tone: 'exact',
+      scope: 'exact_only' as const,
+      description: '精确匹配：原文与记忆库条目完全一致的句段。',
+    },
+    {
+      key: 'fuzzy',
+      label: t('workbench.statusSummary.fuzzy'),
+      value: counters.fuzzy,
+      tone: 'fuzzy',
+      scope: 'fuzzy_only' as const,
+      description: '模糊匹配：原文与记忆库条目相近，但仍需要人工确认的句段。',
+    },
+    {
+      key: 'none',
+      label: t('workbench.statusSummary.none'),
+      value: counters.none,
+      tone: 'none',
+      scope: 'none_only' as const,
+      description: '无匹配：没有从记忆库找到可用匹配的句段。',
+    },
+    {
+      key: 'confirmed',
+      label: '已确认译文',
+      value: counters.confirmed,
+      tone: 'confirmed',
+      scope: 'confirmed_only' as const,
+      description: '已确认译文：表示人工保存的译文，后续批处理默认会跳过。',
+    },
+    {
+      key: 'empty_target',
+      label: '空译文',
+      value: counters.emptyTarget,
+      tone: 'empty',
+      scope: 'empty_target' as const,
+      description: '空译文：当前译文为空的句段。',
+    },
   ]
 })
 
@@ -451,20 +492,29 @@ const hasEditorSegmentFilter = computed(() => hasSegmentSearch.value || hasSegme
 
 const segmentDisplayScopeOptions = computed<Array<{ value: SegmentDisplayScope; label: string }>>(() => [
   { value: 'all', label: t('workbench.search.scopes.all') },
+  { value: 'exact_only', label: t('workbench.statusSummary.exact') },
   { value: 'fuzzy_only', label: t('workbench.search.scopes.fuzzyOnly') },
   { value: 'none_only', label: t('workbench.search.scopes.noneOnly') },
-  { value: 'empty_target', label: t('workbench.search.scopes.emptyTarget') },
+  { value: 'confirmed_only', label: '已确认译文' },
+  { value: 'empty_target', label: '空译文' },
 ])
 
 function matchesSegmentDisplayScope(segment: Segment) {
+  if (segmentDisplayScope.value === 'exact_only') {
+    return segment.status === 'exact'
+  }
   if (segmentDisplayScope.value === 'fuzzy_only') {
     return segment.status === 'fuzzy'
   }
   if (segmentDisplayScope.value === 'none_only') {
     return segment.status === 'none'
   }
+  if (segmentDisplayScope.value === 'confirmed_only') {
+    return segment.status === 'confirmed'
+  }
   if (segmentDisplayScope.value === 'empty_target') {
     return !normalizeTextForSaveToTM(segment.target_text)
+      || retainedEmptyTargetSentenceIds.value.has(segment.sentence_id)
   }
   return true
 }
@@ -839,10 +889,44 @@ function resetSegmentSearch() {
   sourceSearchQuery.value = ''
   targetSearchQuery.value = ''
   searchLoadingAllSegments.value = false
+  retainedEmptyTargetSentenceIds.value = new Set()
 }
 
 function closeSegmentSearchPanel() {
   segmentSearchOpen.value = false
+}
+
+function setSegmentDisplayScope(scope: SegmentDisplayScope) {
+  if (segmentDisplayScope.value !== scope) {
+    retainedEmptyTargetSentenceIds.value = new Set()
+  }
+  segmentDisplayScope.value = scope
+}
+
+function handleSegmentDisplayScopeChange(event: Event) {
+  const value = (event.target as HTMLSelectElement).value as SegmentDisplayScope
+  setSegmentDisplayScope(value)
+}
+
+function toggleSegmentSummaryScope(scope: SegmentDisplayScope) {
+  setSegmentDisplayScope(segmentDisplayScope.value === scope ? 'all' : scope)
+}
+
+function retainEmptyTargetSegmentDuringEdit(sentenceId: string, previousTargetText: string | null | undefined) {
+  if (segmentDisplayScope.value !== 'empty_target' || normalizeTextForSaveToTM(previousTargetText)) {
+    return
+  }
+
+  retainedEmptyTargetSentenceIds.value = new Set([
+    ...retainedEmptyTargetSentenceIds.value,
+    sentenceId,
+  ])
+}
+
+function updateSegmentTarget(sentenceId: string, targetText: string) {
+  const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
+  retainEmptyTargetSegmentDuringEdit(sentenceId, segment?.target_text)
+  segmentStore.updateTarget(sentenceId, targetText)
 }
 
 async function toggleSegmentSearchPanel() {
@@ -941,7 +1025,7 @@ function confirmCurrentSentence() {
   if (!activeSegment.value) {
     return
   }
-  segmentStore.updateTarget(activeSegment.value.sentence_id, activeSegment.value.target_text || '')
+  updateSegmentTarget(activeSegment.value.sentence_id, activeSegment.value.target_text || '')
   toast.success(t('workbench.messages.confirmed'))
 }
 
@@ -1003,7 +1087,7 @@ async function focusRevisionByOffset(offset: 1 | -1) {
 }
 
 function handleApplyTMTarget(sentenceId: string, targetText: string) {
-  segmentStore.updateTarget(sentenceId, targetText)
+  updateSegmentTarget(sentenceId, targetText)
 }
 
 async function loadTask() {
@@ -1423,7 +1507,7 @@ function handleReplaceText(text: string) {
     return
   }
 
-  segmentStore.updateTarget(activeSegment.value.sentence_id, text)
+  updateSegmentTarget(activeSegment.value.sentence_id, text)
   toast.success(t('matchPanel.textInserted'))
 }
 
@@ -1433,7 +1517,7 @@ function handleAppendText(text: string) {
   }
 
   const nextText = appendToCurrentText(activeSegment.value.target_text || '', text)
-  segmentStore.updateTarget(activeSegment.value.sentence_id, nextText)
+  updateSegmentTarget(activeSegment.value.sentence_id, nextText)
   toast.success(t('matchPanel.textInserted'))
 }
 
@@ -1705,17 +1789,25 @@ onBeforeRouteLeave(async () => {
 
     <section class="panel panel--header workbench-overview">
       <div class="workbench-overview__line">
-        <div
+        <button
           v-for="item in statusSummary"
           :key="item.key"
           class="workbench-stat"
-          :class="`workbench-stat--${item.tone}`"
+          :class="[`workbench-stat--${item.tone}`, { 'is-active': segmentDisplayScope === item.scope }]"
+          type="button"
+          :aria-pressed="segmentDisplayScope === item.scope"
+          :title="item.description"
+          @click="toggleSegmentSummaryScope(item.scope)"
         >
           <span>{{ item.label }}</span>
           <strong>{{ item.value }}</strong>
-        </div>
+        </button>
 
       </div>
+
+      <p class="workbench-overview__tip">
+        Tips：已确认译文表示人工保存的译文，后续批处理默认会跳过。
+      </p>
 
       <div class="workbench-load-all">
         <span class="hint-text">
@@ -1752,6 +1844,23 @@ onBeforeRouteLeave(async () => {
             </span>
           </div>
           <div class="segment-editor-toolbar__actions">
+            <label class="segment-editor-toolbar__filter">
+              <span class="segment-editor-toolbar__filter-label">{{ t('workbench.search.scopeLabel') }}</span>
+              <select
+                class="field__control segment-editor-toolbar__filter-select"
+                :value="segmentDisplayScope"
+                @change="handleSegmentDisplayScopeChange"
+              >
+                <option
+                  v-for="option in segmentDisplayScopeOptions"
+                  :key="option.value"
+                  :value="option.value"
+                >
+                  {{ option.label }}
+                </option>
+              </select>
+            </label>
+
             <button
               class="button workbench-action workbench-action--search segment-editor-toolbar__search"
               :class="{ 'is-active': segmentSearchOpen }"
@@ -1762,8 +1871,12 @@ onBeforeRouteLeave(async () => {
             >
               <Search :size="14" />
               {{ t('workbench.search.title') }}
-              <span v-if="hasEditorSegmentFilter" class="workbench-search-panel__badge">
-                {{ editorSegments.length }}
+              <span
+                class="workbench-search-panel__badge"
+                :class="{ 'is-hidden': !hasEditorSegmentFilter }"
+                :aria-hidden="!hasEditorSegmentFilter"
+              >
+                {{ hasEditorSegmentFilter ? editorSegments.length : 0 }}
               </span>
               <ChevronUp v-if="segmentSearchOpen" :size="14" />
               <ChevronDown v-else :size="14" />
@@ -1831,15 +1944,6 @@ onBeforeRouteLeave(async () => {
             @keydown.esc.stop="closeSegmentSearchPanel"
           >
             <div class="workbench-search-panel__form">
-              <label class="field field--compact workbench-search-panel__scope">
-                <span class="field__label">{{ t('workbench.search.scopeLabel') }}</span>
-                <select v-model="segmentDisplayScope" class="field__control">
-                  <option v-for="option in segmentDisplayScopeOptions" :key="option.value" :value="option.value">
-                    {{ option.label }}
-                  </option>
-                </select>
-              </label>
-
               <label class="field field--compact">
                 <span class="field__label">{{ t('workbench.search.sourceLabel') }}</span>
                 <input
@@ -1883,9 +1987,12 @@ onBeforeRouteLeave(async () => {
                   {{ t('workbench.search.next') }}
                 </button>
                 <button
-                  v-if="hasEditorSegmentFilter"
                   class="button workbench-action workbench-action--clear"
+                  :class="{ 'is-layout-placeholder': !hasEditorSegmentFilter }"
                   type="button"
+                  :disabled="!hasEditorSegmentFilter"
+                  :aria-hidden="!hasEditorSegmentFilter"
+                  :tabindex="hasEditorSegmentFilter ? 0 : -1"
                   @click="resetSegmentSearch"
                 >
                   <X :size="14" />
@@ -1903,7 +2010,7 @@ onBeforeRouteLeave(async () => {
               </div>
             </div>
 
-            <div v-if="hasEditorSegmentFilter || searchLoadingAllSegments" class="workbench-search-panel__meta">
+            <div class="workbench-search-panel__meta">
               <span v-if="hasEditorSegmentFilter" class="hint-text">
                 {{
                   t('workbench.search.resultSummary', {
@@ -1919,45 +2026,49 @@ onBeforeRouteLeave(async () => {
           </div>
         </Transition>
 
-        <div
-          v-if="hasEditorSegmentFilter && !searchLoadingAllSegments && editorSegments.length === 0"
-          class="empty-state workbench-search-empty"
-        >
-          <Search :size="28" />
-          {{ t('workbench.search.noMatch') }}
-        </div>
-
-        <template v-else>
+        <div class="segment-editor-results">
           <div class="segment-table-head" aria-hidden="true">
             <span>句段</span>
             <span>原文</span>
             <span>译文</span>
           </div>
 
-          <VirtualList
-            ref="virtualListRef"
-            :items="editorSegments"
-            :item-height="itemHeight"
-            :adaptive="true"
-            :active-descendant="segmentStore.activeSentenceId ? `segment-${segmentStore.activeSentenceId}` : null"
-            @reach-end="handleEditorReachEnd"
-          >
-            <template #default="{ item, index }">
-              <SegmentEditorRow
-                :segment="item"
-                :index="getEditorSegmentDisplayIndex(item.sentence_id, index)"
-                :active="segmentStore.activeSentenceId === item.sentence_id"
-                :pending-revision="segmentStore.getPendingRevision(item.sentence_id)"
-                :revision-busy="revisionActionLoading"
-                :matched-terms="segmentStore.activeSentenceId === item.sentence_id ? activeMatchedTerms : []"
-                @focus="segmentStore.setActiveSentence"
-                @activate-target="handleSegmentTargetActivate"
-                @update="segmentStore.updateTarget"
-                @apply-partial-revision="handleApplyPartialRevision"
-              />
-            </template>
-          </VirtualList>
-        </template>
+          <div class="segment-editor-list-stage">
+            <div
+              v-if="hasEditorSegmentFilter && !searchLoadingAllSegments && editorSegments.length === 0"
+              class="empty-state workbench-search-empty"
+            >
+              <Search :size="28" />
+              {{ t('workbench.search.noMatch') }}
+            </div>
+
+            <VirtualList
+              v-else
+              ref="virtualListRef"
+              :items="editorSegments"
+              :item-height="itemHeight"
+              item-key="sentence_id"
+              :adaptive="true"
+              :active-descendant="segmentStore.activeSentenceId ? `segment-${segmentStore.activeSentenceId}` : null"
+              @reach-end="handleEditorReachEnd"
+            >
+              <template #default="{ item, index }">
+                <SegmentEditorRow
+                  :segment="item"
+                  :index="getEditorSegmentDisplayIndex(item.sentence_id, index)"
+                  :active="segmentStore.activeSentenceId === item.sentence_id"
+                  :pending-revision="segmentStore.getPendingRevision(item.sentence_id)"
+                  :revision-busy="revisionActionLoading"
+                  :matched-terms="segmentStore.activeSentenceId === item.sentence_id ? activeMatchedTerms : []"
+                  @focus="segmentStore.setActiveSentence"
+                  @activate-target="handleSegmentTargetActivate"
+                  @update="updateSegmentTarget"
+                  @apply-partial-revision="handleApplyPartialRevision"
+                />
+              </template>
+            </VirtualList>
+          </div>
+        </div>
       </section>
 
       <div
@@ -2211,6 +2322,11 @@ onBeforeRouteLeave(async () => {
 .workbench-search-panel {
   display: grid;
   gap: 6px;
+}
+
+.workbench-page {
+  overflow-x: hidden;
+  overflow-x: clip;
 }
 
 .workbench-toolbar {
@@ -2581,10 +2697,6 @@ onBeforeRouteLeave(async () => {
   flex: 1 1 220px;
 }
 
-.workbench-search-panel__form > .workbench-search-panel__scope {
-  flex: 0 0 160px;
-}
-
 .workbench-search-panel .field__label {
   font-size: 12px;
 }
@@ -2596,6 +2708,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-search-panel .button,
+.segment-editor-toolbar__filter-select,
 .segment-editor-toolbar__search,
 .segment-editor-toolbar__revision .workbench-action {
   min-height: 34px;
@@ -2634,7 +2747,7 @@ onBeforeRouteLeave(async () => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 20px;
+  min-width: 32px;
   min-height: 20px;
   padding: 0 5px;
   border-radius: 999px;
@@ -2643,9 +2756,18 @@ onBeforeRouteLeave(async () => {
   font-size: 11px;
 }
 
+.workbench-search-panel__badge.is-hidden {
+  visibility: hidden;
+}
+
 .workbench-search-panel__meta {
   align-items: center;
   min-height: 20px;
+}
+
+.workbench-search-panel__actions .is-layout-placeholder {
+  pointer-events: none;
+  visibility: hidden;
 }
 
 .segment-editor-toolbar {
@@ -2653,11 +2775,40 @@ onBeforeRouteLeave(async () => {
   margin-bottom: 8px;
 }
 
+.panel--editor,
+.segment-editor-results,
+.segment-editor-list-stage {
+  min-width: 0;
+  overflow-anchor: none;
+}
+
+.segment-editor-results {
+  display: grid;
+  grid-template-rows: auto minmax(390px, calc(100vh - 244px));
+  min-height: 0;
+}
+
+.segment-editor-list-stage {
+  height: calc(100vh - 244px);
+  min-height: 390px;
+  overflow: hidden;
+}
+
+.segment-editor-list-stage > .virtual-list {
+  height: 100%;
+  min-height: 0;
+}
+
 .segment-editor-toolbar__search.is-active {
   border-color: #69ad9d;
   background: linear-gradient(180deg, #edf7f4, #d7ece6);
   color: #0b6658;
   box-shadow: 0 6px 14px rgba(13, 122, 104, 0.12);
+}
+
+.segment-editor-toolbar .workbench-action:not(:disabled):hover,
+.segment-editor-toolbar .workbench-action:not(:disabled):active {
+  transform: none;
 }
 
 .segment-editor-toolbar__title {
@@ -2673,7 +2824,34 @@ onBeforeRouteLeave(async () => {
   justify-content: flex-end;
   gap: 8px;
   flex-wrap: wrap;
+  min-width: 0;
   margin-left: auto;
+}
+
+.segment-editor-toolbar__filter {
+  flex: 0 1 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  min-width: 0;
+  margin: 0;
+}
+
+.segment-editor-toolbar__filter-label {
+  flex: 0 0 auto;
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.segment-editor-toolbar__filter-select {
+  width: 148px;
+  min-width: 148px;
+  background-color: var(--surface-panel);
+  box-shadow: none;
 }
 
 .segment-editor-toolbar__revision {
@@ -2681,9 +2859,10 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-search-empty {
-  min-height: 240px;
+  min-height: 0;
+  height: 100%;
   border: 1px dashed var(--line-soft);
-  border-radius: 14px;
+  border-radius: 0 0 6px 6px;
   background: rgba(248, 250, 252, 0.72);
 }
 
@@ -2909,6 +3088,17 @@ onBeforeRouteLeave(async () => {
   text-align: right;
 }
 
+@media (max-width: 1180px) {
+  .segment-editor-results {
+    grid-template-rows: auto 420px;
+  }
+
+  .segment-editor-list-stage {
+    height: 420px;
+    min-height: 0;
+  }
+}
+
 @media (max-width: 720px) {
   .segment-editor-toolbar__actions {
     width: 100%;
@@ -2916,9 +3106,24 @@ onBeforeRouteLeave(async () => {
     margin-left: 0;
   }
 
+  .segment-editor-toolbar__filter,
   .segment-editor-toolbar__search,
   .segment-editor-toolbar__revision {
     flex: 1 1 100%;
+  }
+
+  .segment-editor-toolbar__filter {
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+
+  .segment-editor-toolbar__filter-label {
+    width: 100%;
+  }
+
+  .segment-editor-toolbar__filter-select {
+    width: 100%;
+    min-width: 0;
   }
 
   .workbench-search-panel__actions {
@@ -2928,6 +3133,15 @@ onBeforeRouteLeave(async () => {
 
   .workbench-search-panel__actions .button {
     flex: 1 1 0;
+  }
+
+  .segment-editor-results {
+    grid-template-rows: auto 520px;
+  }
+
+  .segment-editor-list-stage {
+    height: 520px;
+    min-height: 0;
   }
 
   .workbench-guidelines-panel__head,
