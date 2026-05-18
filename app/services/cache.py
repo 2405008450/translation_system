@@ -1,0 +1,159 @@
+from __future__ import annotations
+
+import json
+import logging
+import time
+import asyncio
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any
+
+from app.config import get_settings
+
+try:
+    from redis import Redis
+    from redis.exceptions import RedisError
+except ModuleNotFoundError:  # pragma: no cover - 允许在未安装 redis 的环境中走内存兜底
+    Redis = None
+
+    class RedisError(RuntimeError):
+        pass
+
+
+logger = logging.getLogger(__name__)
+REDIS_CONNECT_TIMEOUT_SECONDS = 0.3
+REDIS_OPERATION_TIMEOUT_SECONDS = 0.5
+
+
+@dataclass
+class _MemoryCacheEntry:
+    payload: str
+    expires_at: float | None
+
+
+class _InMemoryJsonCache:
+    def __init__(self) -> None:
+        self._entries: dict[str, _MemoryCacheEntry] = {}
+        self._lock = asyncio.Lock()
+
+    def get_json(self, key: str) -> Any | None:
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        if entry.expires_at is not None and entry.expires_at <= time.time():
+            self._entries.pop(key, None)
+            return None
+        return json.loads(entry.payload)
+
+    def set_json(self, key: str, value: Any, ttl_seconds: int | None = None) -> None:
+        expires_at = None if ttl_seconds is None else time.time() + ttl_seconds
+        payload = json.dumps(value, ensure_ascii=False)
+        self._entries[key] = _MemoryCacheEntry(payload=payload, expires_at=expires_at)
+
+    def delete(self, key: str) -> None:
+        self._entries.pop(key, None)
+
+    async def aget_json(self, key: str) -> Any | None:
+        async with self._lock:
+            return self.get_json(key)
+
+    async def aset_json(self, key: str, value: Any, ttl_seconds: int | None = None) -> None:
+        async with self._lock:
+            self.set_json(key, value, ttl_seconds)
+
+    async def adelete(self, key: str) -> None:
+        async with self._lock:
+            self.delete(key)
+
+
+class _RedisJsonCache:
+    def __init__(self, redis_url: str) -> None:
+        self._client = Redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
+            socket_timeout=REDIS_OPERATION_TIMEOUT_SECONDS,
+            retry_on_timeout=False,
+        )
+        self._client.ping()
+
+    def get_json(self, key: str) -> Any | None:
+        try:
+            payload = self._client.get(key)
+        except RedisError as exc:
+            logger.warning("cache redis get failed key=%s error=%s", key, exc)
+            return None
+        if payload is None:
+            return None
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            logger.warning("cache redis payload is not valid json key=%s", key)
+            return None
+
+    def set_json(self, key: str, value: Any, ttl_seconds: int | None = None) -> None:
+        payload = json.dumps(value, ensure_ascii=False)
+        try:
+            if ttl_seconds is None:
+                self._client.set(key, payload)
+            else:
+                self._client.set(key, payload, ex=ttl_seconds)
+        except RedisError as exc:
+            logger.warning("cache redis set failed key=%s error=%s", key, exc)
+
+    def delete(self, key: str) -> None:
+        try:
+            self._client.delete(key)
+        except RedisError as exc:
+            logger.warning("cache redis delete failed key=%s error=%s", key, exc)
+
+    async def aget_json(self, key: str) -> Any | None:
+        return await asyncio.to_thread(self.get_json, key)
+
+    async def aset_json(self, key: str, value: Any, ttl_seconds: int | None = None) -> None:
+        await asyncio.to_thread(self.set_json, key, value, ttl_seconds)
+
+    async def adelete(self, key: str) -> None:
+        await asyncio.to_thread(self.delete, key)
+
+
+@lru_cache
+def _get_cache_backend() -> _InMemoryJsonCache | _RedisJsonCache:
+    settings = get_settings()
+    if settings.redis_url and Redis is not None:
+        try:
+            backend = _RedisJsonCache(settings.redis_url)
+            logger.info("json cache backend initialized with redis")
+            return backend
+        except (RedisError, OSError) as exc:
+            logger.warning("redis cache unavailable, fallback to memory cache: %s", exc)
+            return _InMemoryJsonCache()
+
+    if settings.redis_url and Redis is None:
+        logger.warning("redis_url is configured but redis dependency is unavailable, fallback to memory cache")
+
+    return _InMemoryJsonCache()
+
+
+def get_json(key: str) -> Any | None:
+    return _get_cache_backend().get_json(key)
+
+
+def set_json(key: str, value: Any, ttl_seconds: int | None = None) -> None:
+    _get_cache_backend().set_json(key, value, ttl_seconds)
+
+
+def delete(key: str) -> None:
+    _get_cache_backend().delete(key)
+
+
+async def aget_json(key: str) -> Any | None:
+    return await _get_cache_backend().aget_json(key)
+
+
+async def aset_json(key: str, value: Any, ttl_seconds: int | None = None) -> None:
+    await _get_cache_backend().aset_json(key, value, ttl_seconds)
+
+
+async def adelete(key: str) -> None:
+    await _get_cache_backend().adelete(key)

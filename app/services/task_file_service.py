@@ -1,0 +1,630 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+from sqlalchemy.orm import Session
+
+from app.services.adapters import ensure_default_adapters_registered
+from app.services.adapters.base import DEFAULT_MAX_FILE_SIZE, FORMAT_SIZE_LIMITS
+from app.services.adapters.export_formats import get_supported_exports
+from app.services.adapters.models import BlockNode, DocumentAST, NodeType, ParseResult
+from app.services.adapters.multi_format_exporter import export_file as export_multi_format_file
+from app.services.document_exporter import (
+    DOCX_MEDIA_TYPE,
+    build_translated_docx_filename,
+    export_translated_docx,
+)
+from app.services.document_workspace import (
+    DOCUMENT_PARSE_MODE_FULL,
+    build_docx_preview_html,
+    build_docx_workspace,
+    build_document_html_from_segments,
+    normalize_document_parse_options,
+    normalize_document_parse_mode,
+)
+from app.services.matcher import MatchStats, match_sentences_with_stats
+
+TASK_ADAPTER_EXTENSIONS = {
+    ".txt",
+    ".csv",
+    ".html",
+    ".htm",
+    ".md",
+    ".markdown",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".php",
+    ".properties",
+    ".po",
+    ".pot",
+    ".strings",
+    ".srt",
+    ".dita",
+    ".ditamap",
+    ".xml",
+    ".svg",
+    ".sdlxliff",
+    ".txml",
+    ".dxf",
+    ".idml",
+    ".mif",
+    ".zip",
+}
+
+LOSSY_EXPORTABLE_TASK_EXTENSIONS = {
+    ".html",
+    ".htm",
+}
+
+DOCX_PARSE_MODE_CAPABILITIES = (
+    {
+        "id": "full",
+        "label": "完整解析",
+        "description": "解析正文、表格、页眉页脚、脚注尾注、文本框、编号、数学公式占位和 Word 批注。",
+    },
+    {
+        "id": "body_only",
+        "label": "仅正文解析",
+        "description": "仅解析正文相关内容，页眉页脚、脚注尾注和 Word 批注保留原文。",
+    },
+)
+
+AUTO_PARSE_MODE_CAPABILITY = {
+    "id": "auto",
+    "label": "按格式自动解析",
+    "description": "后端根据文件格式提取真实可翻译文本。",
+}
+
+_UPLOAD_CAPABILITY_SPECS = (
+    {
+        "extensions": (".docx",),
+        "label": "Word 文档",
+        "category": "office",
+        "features": (
+            "正文与表格",
+            "页眉页脚、脚注尾注",
+            "文本框、编号、数学公式占位",
+            "Word 批注",
+        ),
+        "settings": (
+            {
+                "id": "include_headers_footers",
+                "label": "翻译页眉页脚",
+                "default": True,
+            },
+            {
+                "id": "include_footnotes_endnotes",
+                "label": "翻译脚注尾注",
+                "default": True,
+            },
+            {
+                "id": "include_comments",
+                "label": "翻译批注",
+                "default": True,
+            },
+            {
+                "id": "clean_format",
+                "label": "清洗格式",
+                "default": False,
+            },
+        ),
+    },
+    {
+        "extensions": (".txt",),
+        "label": "纯文本",
+        "category": "text",
+        "features": ("按空行识别段落", "自动断句", "支持 UTF-8 / UTF-8-BOM / GB18030"),
+    },
+    {
+        "extensions": (".csv",),
+        "label": "CSV 表格",
+        "category": "table",
+        "features": ("自动识别分隔符", "提取非数字单元格", "保留行列位置"),
+    },
+    {
+        "extensions": (".html", ".htm"),
+        "label": "HTML 网页",
+        "category": "web",
+        "features": ("提取可见文本", "跳过脚本和样式", "支持原格式导出"),
+    },
+    {
+        "extensions": (".md", ".markdown"),
+        "label": "Markdown",
+        "category": "text",
+        "features": ("标题、段落、列表和引用可翻译", "代码块跳过", "保留 Markdown 结构定位"),
+    },
+    {
+        "extensions": (".json",),
+        "label": "JSON",
+        "category": "localization",
+        "features": ("递归提取字符串值", "保留键路径", "跳过非字符串值"),
+    },
+    {
+        "extensions": (".yaml", ".yml"),
+        "label": "YAML",
+        "category": "localization",
+        "features": ("提取字符串值", "保留配置路径", "跳过结构字段"),
+    },
+    {
+        "extensions": (".properties",),
+        "label": "Properties",
+        "category": "localization",
+        "features": ("提取键值文本", "保留 key", "支持原格式导出"),
+    },
+    {
+        "extensions": (".po", ".pot"),
+        "label": "PO / POT",
+        "category": "localization",
+        "features": ("提取 msgid", "保留条目顺序", "支持原格式导出"),
+    },
+    {
+        "extensions": (".strings",),
+        "label": "Apple Strings",
+        "category": "localization",
+        "features": ("提取字符串值", "保留 key", "支持原格式导出"),
+    },
+    {
+        "extensions": (".php",),
+        "label": "PHP 本地化",
+        "category": "localization",
+        "features": ("提取数组字符串", "保留键路径", "跳过代码逻辑"),
+    },
+    {
+        "extensions": (".srt",),
+        "label": "SRT 字幕",
+        "category": "subtitle",
+        "features": ("提取字幕文本", "保留时间轴", "支持原格式导出"),
+    },
+    {
+        "extensions": (".dita", ".ditamap", ".xml"),
+        "label": "DITA / XML",
+        "category": "technical",
+        "features": ("提取可翻译元素文本", "保留结构路径", "支持原格式导出"),
+    },
+    {
+        "extensions": (".svg",),
+        "label": "SVG",
+        "category": "design",
+        "features": ("提取 text / tspan 文本", "保留图形结构", "支持原格式导出"),
+    },
+    {
+        "extensions": (".sdlxliff",),
+        "label": "SDLXLIFF",
+        "category": "bilingual",
+        "features": ("提取双语交换句段", "保留单元 ID", "支持原格式导出"),
+    },
+    {
+        "extensions": (".txml",),
+        "label": "TXML",
+        "category": "bilingual",
+        "features": ("提取 Wordfast 句段", "保留单元 ID", "支持原格式导出"),
+    },
+    {
+        "extensions": (".dxf",),
+        "label": "DXF",
+        "category": "engineering",
+        "features": ("提取图纸文本", "保留文本实体定位", "支持原格式导出"),
+    },
+    {
+        "extensions": (".idml",),
+        "label": "IDML",
+        "category": "design",
+        "features": ("提取 InDesign Story 文本", "保留 story 路径", "支持原格式导出"),
+    },
+    {
+        "extensions": (".mif",),
+        "label": "MIF",
+        "category": "technical",
+        "features": ("提取 FrameMaker 文本", "保留结构定位", "支持原格式导出"),
+    },
+    {
+        "extensions": (".zip",),
+        "label": "ZIP 压缩包",
+        "category": "archive",
+        "features": ("递归解析包内支持格式", "跳过不支持文件", "按内部文件回写导出"),
+    },
+)
+
+
+@dataclass(frozen=True)
+class ExportedTaskFile:
+    content: bytes
+    media_type: str
+    filename: str
+
+
+def get_task_file_extension(filename: str) -> str:
+    return Path(filename or "").suffix.lower()
+
+
+def is_docx_task(filename: str) -> bool:
+    return get_task_file_extension(filename) == ".docx"
+
+
+def get_supported_task_extensions() -> tuple[str, ...]:
+    registry = ensure_default_adapters_registered()
+    extensions = {
+        extension
+        for extension in registry.list_supported_extensions()
+        if extension in TASK_ADAPTER_EXTENSIONS
+    }
+    extensions.add(".docx")
+    return tuple(sorted(extensions))
+
+
+def supports_task_file(filename: str) -> bool:
+    extension = get_task_file_extension(filename)
+    return extension in set(get_supported_task_extensions())
+
+
+def can_export_task_file(filename: str, has_source_file: bool = True) -> bool:
+    extension = get_task_file_extension(filename)
+    if extension == ".docx":
+        return has_source_file
+    if not has_source_file:
+        return extension in LOSSY_EXPORTABLE_TASK_EXTENSIONS
+    return any(option.id == "original" for option in get_supported_exports(extension))
+
+
+def get_upload_capabilities() -> dict[str, Any]:
+    supported_extensions = get_supported_task_extensions()
+    supported_set = set(supported_extensions)
+    formats: list[dict[str, Any]] = []
+
+    for spec in _UPLOAD_CAPABILITY_SPECS:
+        extensions = [extension for extension in spec["extensions"] if extension in supported_set]
+        if not extensions:
+            continue
+
+        is_docx = extensions == [".docx"]
+        formats.append(
+            {
+                "extensions": extensions,
+                "accept": ",".join(extensions),
+                "label": spec["label"],
+                "category": spec["category"],
+                "max_size_mb": max(_get_upload_max_size_mb(extension) for extension in extensions),
+                "can_export_original": any(can_export_task_file(f"file{extension}") for extension in extensions),
+                "parse_modes": list(DOCX_PARSE_MODE_CAPABILITIES if is_docx else (AUTO_PARSE_MODE_CAPABILITY,)),
+                "features": list(spec["features"]),
+                "settings": list(spec.get("settings", ())),
+            }
+        )
+
+    return {
+        "extensions": list(supported_extensions),
+        "accept": ",".join(supported_extensions),
+        "formats": formats,
+    }
+
+
+def _get_upload_max_size_mb(extension: str) -> float:
+    registry = ensure_default_adapters_registered()
+    try:
+        adapter = registry.get_adapter(f"file{extension}")
+        max_size = adapter.get_max_file_size()
+    except Exception:
+        max_size = FORMAT_SIZE_LIMITS.get(extension, DEFAULT_MAX_FILE_SIZE)
+    return round(max_size / (1024 * 1024), 2)
+
+
+def build_task_workspace(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    similarity_threshold: float,
+    collection_ids: list[UUID] | None = None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: dict[str, object] | str | None = None,
+) -> dict[str, Any]:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
+    if is_docx_task(filename):
+        return build_docx_workspace(
+            db=db,
+            raw_bytes=raw_bytes,
+            similarity_threshold=similarity_threshold,
+            collection_ids=collection_ids,
+            document_parse_mode=document_parse_mode,
+            document_parse_options=document_parse_options,
+        )
+
+    if not supports_task_file(filename):
+        raise ValueError(f"暂不支持 {get_task_file_extension(filename) or '该'} 文件格式。")
+
+    registry = ensure_default_adapters_registered()
+    adapter = registry.get_adapter(filename)
+    parse_result = adapter.parse_with_validation(raw_bytes, filename=filename)
+    if not parse_result.segments:
+        raise ValueError("文件中没有可翻译的内容。")
+
+    source_sentences = [segment.source_text for segment in parse_result.segments]
+    auxiliary_sentences = [segment.display_text for segment in parse_result.segments]
+    match_results, match_stats = match_sentences_with_stats(
+        db=db,
+        sentences=source_sentences,
+        similarity_threshold=similarity_threshold,
+        auxiliary_sentences=auxiliary_sentences,
+        collection_ids=collection_ids,
+    )
+
+    segments: list[dict[str, Any]] = []
+    for index, (segment, match_result) in enumerate(zip(parse_result.segments, match_results, strict=False)):
+        context = _build_segment_context(parse_result.ast, segment.block_path, fallback_index=index)
+        segments.append(
+            {
+                "sentence_id": segment.segment_id,
+                "source_text": segment.source_text,
+                "display_text": segment.display_text,
+                "target_text": match_result.target_text or "",
+                "status": match_result.status,
+                "score": match_result.score,
+                "matched_source_text": match_result.matched_source_text or "",
+                "matched_collection_name": match_result.matched_collection_name,
+                "matched_creator_name": match_result.matched_creator_name,
+                "matched_created_at": match_result.matched_created_at,
+                "matched_updated_at": match_result.matched_updated_at,
+                **context,
+            }
+        )
+
+    return {
+        "segments": segments,
+        "document_html": build_document_html_from_segments(segments),
+        "match_stats": asdict(match_stats),
+    }
+
+
+def build_task_preview_html(
+    filename: str,
+    segments: list[Any],
+    source_bytes: bytes | None = None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: dict[str, object] | str | None = None,
+) -> str:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
+    if source_bytes and is_docx_task(filename):
+        return build_docx_preview_html(
+            source_bytes,
+            document_parse_mode=document_parse_mode,
+            document_parse_options=document_parse_options,
+        )
+    return build_document_html_from_segments(segments) if segments else ""
+
+
+def export_translated_task_file(
+    raw_bytes: bytes | None,
+    filename: str,
+    segments: list[Any],
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: dict[str, object] | str | None = None,
+) -> ExportedTaskFile:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
+    if is_docx_task(filename):
+        if raw_bytes is None:
+            raise ValueError("DOCX 源文件缺失，暂时无法导出。")
+        return ExportedTaskFile(
+            content=export_translated_docx(
+                raw_bytes=raw_bytes,
+                segments=segments,
+                document_parse_mode=document_parse_mode,
+                document_parse_options=document_parse_options,
+            ),
+            media_type=DOCX_MEDIA_TYPE,
+            filename=build_translated_docx_filename(filename),
+        )
+
+    if raw_bytes is None:
+        return _export_translated_task_file_without_source(filename, segments)
+
+    if not can_export_task_file(filename, has_source_file=True):
+        raise ValueError(f"{get_task_file_extension(filename) or '该'} 文件暂不支持原格式导出。")
+
+    export_segments = build_export_segments_from_source(raw_bytes, filename, segments)
+    content, media_type, export_filename = export_multi_format_file(
+        export_type="original",
+        segments=export_segments,
+        filename=filename,
+        original_bytes=raw_bytes,
+    )
+    return ExportedTaskFile(content=content, media_type=media_type, filename=export_filename)
+
+
+def _export_translated_task_file_without_source(
+    filename: str,
+    segments: list[Any],
+) -> ExportedTaskFile:
+    extension = get_task_file_extension(filename)
+    if extension not in LOSSY_EXPORTABLE_TASK_EXTENSIONS:
+        raise ValueError("源文件缺失，当前格式暂时无法导出。")
+
+    translated_segments = _build_translated_render_segments(segments)
+    body_html = build_document_html_from_segments(translated_segments)
+    content = (
+        "<!DOCTYPE html>"
+        "<html>"
+        "<head><meta charset=\"utf-8\"></head>"
+        f"<body>{body_html}</body>"
+        "</html>"
+    ).encode("utf-8")
+    return ExportedTaskFile(
+        content=content,
+        media_type="text/html; charset=utf-8",
+        filename=_build_translated_filename(filename),
+    )
+
+
+def build_export_segments_from_source(
+    raw_bytes: bytes,
+    filename: str,
+    segments: list[Any],
+) -> list[dict[str, Any]]:
+    if is_docx_task(filename):
+        return [_normalize_existing_segment(segment) for segment in segments]
+
+    registry = ensure_default_adapters_registered()
+    adapter = registry.get_adapter(filename)
+    parse_result = adapter.parse_with_validation(raw_bytes, filename=filename)
+    translated_segments = {
+        str(_get_segment_value(segment, "sentence_id", _get_segment_value(segment, "segment_id", ""))): segment
+        for segment in segments
+    }
+
+    export_segments: list[dict[str, Any]] = []
+    for index, parsed_segment in enumerate(parse_result.segments):
+        translated_segment = translated_segments.get(parsed_segment.segment_id)
+        context = _build_segment_context(parse_result.ast, parsed_segment.block_path, fallback_index=index)
+        export_segments.append(
+            {
+                "segment_id": parsed_segment.segment_id,
+                "sentence_id": parsed_segment.segment_id,
+                "source_text": parsed_segment.source_text,
+                "display_text": parsed_segment.display_text,
+                "target_text": _get_segment_value(translated_segment, "target_text", ""),
+                "status": _get_segment_value(translated_segment, "status", "none"),
+                "matched_source_text": _get_segment_value(translated_segment, "matched_source_text", ""),
+                **context,
+            }
+        )
+
+    return export_segments
+
+
+def _normalize_existing_segment(segment: Any) -> dict[str, Any]:
+    return {
+        "segment_id": _get_segment_value(segment, "segment_id", _get_segment_value(segment, "sentence_id", "")),
+        "sentence_id": _get_segment_value(segment, "sentence_id", _get_segment_value(segment, "segment_id", "")),
+        "source_text": _get_segment_value(segment, "source_text", ""),
+        "display_text": _get_segment_value(segment, "display_text", ""),
+        "target_text": _get_segment_value(segment, "target_text", ""),
+        "status": _get_segment_value(segment, "status", "none"),
+        "matched_source_text": _get_segment_value(segment, "matched_source_text", ""),
+        "block_type": _get_segment_value(segment, "block_type", "paragraph"),
+        "block_index": _get_segment_value(segment, "block_index", 0),
+        "row_index": _get_segment_value(segment, "row_index"),
+        "cell_index": _get_segment_value(segment, "cell_index"),
+    }
+
+
+def _build_translated_render_segments(segments: list[Any]) -> list[dict[str, Any]]:
+    render_segments: list[dict[str, Any]] = []
+    for segment in segments:
+        normalized = _normalize_existing_segment(segment)
+        translated_text = str(
+            _get_segment_value(segment, "target_text")
+            or _get_segment_value(segment, "display_text")
+            or _get_segment_value(segment, "source_text")
+            or ""
+        )
+        normalized["display_text"] = translated_text
+        render_segments.append(normalized)
+    return render_segments
+
+
+def _build_segment_context(
+    ast: DocumentAST,
+    block_path: str,
+    fallback_index: int,
+) -> dict[str, Any]:
+    node = _resolve_node_by_path(ast, block_path)
+    root_index = _resolve_root_index(block_path, fallback_index)
+    metadata = dict(node.metadata or {}) if node else {}
+    block_type = "table_cell" if node and node.node_type == NodeType.TABLE_CELL else "paragraph"
+
+    block_index = root_index
+    if block_type == "table_cell":
+        if ".children." not in block_path and ("row" in metadata or "col" in metadata):
+            block_index = _to_int(metadata.get("table_index"), default=0)
+        else:
+            block_index = _to_int(metadata.get("table_index"), default=root_index)
+
+    context: dict[str, Any] = {
+        "block_type": block_type,
+        "block_index": block_index,
+        "row_index": _to_optional_int(metadata.get("row_index", metadata.get("row"))),
+        "cell_index": _to_optional_int(metadata.get("cell_index", metadata.get("col"))),
+    }
+
+    key = metadata.get("key")
+    if key is not None:
+        context["key"] = str(key)
+        context["metadata_path"] = str(key)
+
+    subtitle_index = metadata.get("index")
+    if subtitle_index is not None:
+        context["index"] = subtitle_index
+        context["subtitle_index"] = subtitle_index
+
+    for field in ("id", "tu_id", "start", "end", "zip_path", "rar_path", "file_type"):
+        value = metadata.get(field)
+        if value is not None and not isinstance(value, (dict, list, set, tuple)):
+            context[field] = value
+
+    return context
+
+
+def _resolve_node_by_path(ast: DocumentAST, block_path: str) -> BlockNode | None:
+    if not block_path:
+        return None
+
+    parts = block_path.split(".")
+    try:
+        node = ast.nodes[int(parts[0])]
+    except (IndexError, TypeError, ValueError):
+        return None
+
+    index = 1
+    while index < len(parts):
+        if parts[index] != "children" or index + 1 >= len(parts):
+            return None
+        try:
+            node = node.children[int(parts[index + 1])]
+        except (IndexError, TypeError, ValueError):
+            return None
+        index += 2
+
+    return node
+
+
+def _resolve_root_index(block_path: str, fallback_index: int) -> int:
+    if not block_path:
+        return fallback_index
+    try:
+        return int(block_path.split(".", 1)[0])
+    except (TypeError, ValueError):
+        return fallback_index
+
+
+def _get_segment_value(segment: Any, field_name: str, default: Any = None) -> Any:
+    if segment is None:
+        return default
+    if isinstance(segment, dict):
+        return segment.get(field_name, default)
+    return getattr(segment, field_name, default)
+
+
+def _to_optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(value: Any, default: int) -> int:
+    optional_value = _to_optional_int(value)
+    return default if optional_value is None else optional_value
+
+
+def _build_translated_filename(filename: str) -> str:
+    path = Path(filename or "translated.html")
+    extension = path.suffix or ".html"
+    stem = path.stem or "translated"
+    return f"{stem}_translated{extension}"

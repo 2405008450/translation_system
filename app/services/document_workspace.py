@@ -1,0 +1,2806 @@
+from __future__ import annotations
+
+import base64
+from collections.abc import Mapping
+import copy
+from dataclasses import dataclass, field
+from html import escape
+import hashlib
+from io import BytesIO
+from itertools import count
+import json
+import mimetypes
+import posixpath
+import re
+from uuid import UUID
+from zipfile import BadZipFile, ZipFile
+from xml.etree import ElementTree as ET
+
+from sqlalchemy.orm import Session
+
+from app.services.cache import get_json, set_json
+from app.services.matcher import MatchStats, match_sentences_with_stats
+from app.services.normalizer import normalize_text
+from app.services.omml_to_mathml import convert as convert_omml_to_mathml
+from app.services.omml_to_mathml import serialize_omml_xml
+from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
+
+
+NS = {
+    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "m": "http://schemas.openxmlformats.org/officeDocument/2006/math",
+    "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
+    "rels": "http://schemas.openxmlformats.org/package/2006/relationships",
+    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "v": "urn:schemas-microsoft-com:vml",
+    "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+}
+
+TRUTHY_VALUES = {"1", "on", "true"}
+FALSEY_VALUES = {"0", "false", "off", "none"}
+NOTE_REFERENCE_CSS = "vertical-align: super; font-size: 0.75em;"
+HIGHLIGHT_COLORS = {
+    "black": "#000000",
+    "blue": "#00b0f0",
+    "cyan": "#00ffff",
+    "darkBlue": "#00008b",
+    "darkCyan": "#008b8b",
+    "darkGray": "#a9a9a9",
+    "darkGreen": "#006400",
+    "darkMagenta": "#8b008b",
+    "darkRed": "#8b0000",
+    "darkYellow": "#b8860b",
+    "green": "#00ff00",
+    "lightGray": "#d3d3d3",
+    "magenta": "#ff00ff",
+    "red": "#ff0000",
+    "white": "#ffffff",
+    "yellow": "#ffff00",
+}
+PAGE_NUMBER_FIELD_NAMES = {"PAGE", "NUMPAGES", "SECTIONPAGES"}
+NUMBERING_PLACEHOLDER_RE = re.compile(r"%(\d+)")
+PAGE_NUMBER_WRAPPER_RE = re.compile(r"[\s\-\u2013\u2014\u2212\uff0d_./\\|:：()\[\]{}（）【】<>《》·•]+")
+CELL_SENTENCE_END_CHARS = frozenset("。？！?!.；;:：")
+CELL_SHORT_PARAGRAPH_MAX_CHARS = 20
+CELL_NEXT_PARAGRAPH_MAX_CHARS = 50
+CELL_GROUP_MAX_CHARS = 200
+CELL_PARAGRAPH_BREAK_SENTINEL = "\uE000"
+PAGE_BREAK_SENTINEL = "\uE001"
+DOCX_PARSE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+DOCX_PARSE_CACHE_VERSION = "3"
+DOCUMENT_PARSE_MODE_FULL = "full"
+DOCUMENT_PARSE_MODE_BODY_ONLY = "body_only"
+SUPPORTED_DOCUMENT_PARSE_MODES = {
+    DOCUMENT_PARSE_MODE_FULL,
+    DOCUMENT_PARSE_MODE_BODY_ONLY,
+}
+DEFAULT_DOCUMENT_PARSE_OPTIONS = {
+    "include_headers_footers": True,
+    "include_footnotes_endnotes": True,
+    "include_comments": True,
+    "clean_format": False,
+}
+DOCUMENT_PARSE_OPTION_FIELDS = set(DEFAULT_DOCUMENT_PARSE_OPTIONS)
+EMU_PER_PIXEL = 9525
+MATH_PLACEHOLDER_TEMPLATE = "⟦MATH_{index}⟧"
+OMML_ATOMIC_TAGS = {
+    f'{{{NS["m"]}}}oMath',
+    f'{{{NS["m"]}}}oMathPara',
+}
+SUPPORTED_BROWSER_IMAGE_MIME_TYPES = {
+    "image/bmp",
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/svg+xml",
+    "image/tiff",
+    "image/webp",
+    "image/x-icon",
+}
+
+
+@dataclass(frozen=True)
+class InlineFragment:
+    display_text: str
+    source_text: str
+    css: str = ""
+    href: str | None = None
+    render_html: str | None = None
+    is_math: bool = False
+    math_omml_xml: str | None = None
+
+
+CELL_PARAGRAPH_BREAK_FRAGMENT = InlineFragment(
+    display_text="\n",
+    source_text=CELL_PARAGRAPH_BREAK_SENTINEL,
+)
+
+
+@dataclass(frozen=True)
+class RenderableSentence:
+    span: SentenceSpan
+    sentence_id: str | None
+    display_text: str
+    source_text: str
+
+
+@dataclass
+class TrackedField:
+    instruction_parts: list[str] = field(default_factory=list)
+    collecting_instruction: bool = True
+    suppress_result: bool = False
+
+
+@dataclass
+class InlineParseState:
+    field_stack: list[TrackedField] = field(default_factory=list)
+    suppressed_page_number_field: bool = False
+    math_placeholder_index: int = 0
+
+
+@dataclass
+class ParsedParagraphRenderData:
+    paragraph: ET.Element
+    fragments: list[InlineFragment]
+    embedded_html_parts: list[str]
+    embedded_segments: list[dict]
+    numbering_text: str
+    paragraph_css: str
+    suppressed_page_number_field: bool
+
+
+@dataclass(frozen=True)
+class StoryPart:
+    kind: str
+    label: str
+    part_name: str
+    root: ET.Element
+    rels: dict[str, str]
+    package: DocxPackage
+    parse_options: dict[str, bool] = field(default_factory=lambda: dict(DEFAULT_DOCUMENT_PARSE_OPTIONS))
+
+
+@dataclass(frozen=True)
+class EmbeddedImage:
+    source: str
+    alt_text: str = ""
+    width_px: int | None = None
+    height_px: int | None = None
+
+
+@dataclass(frozen=True)
+class NumberingLevel:
+    ilvl: int
+    num_fmt: str
+    lvl_text: str
+    start: int = 1
+    suffix: str = "tab"
+    p_style: str | None = None
+
+
+@dataclass(frozen=True)
+class NumberingInstance:
+    num_id: str
+    abstract_num_id: str
+    level_overrides: dict[int, NumberingLevel]
+    start_overrides: dict[int, int]
+
+
+@dataclass(frozen=True)
+class StyleDefinition:
+    style_id: str
+    based_on: str | None
+    num_id: str | None
+    ilvl: int | None
+
+
+@dataclass(frozen=True)
+class NumberingSchema:
+    abstract_levels: dict[str, dict[int, NumberingLevel]]
+    instances: dict[str, NumberingInstance]
+    styles: dict[str, StyleDefinition]
+    style_numbering_map: dict[str, tuple[str, int]]
+
+
+@dataclass
+class NumberingState:
+    schema: NumberingSchema
+    counters: dict[str, dict[int, int]] = field(default_factory=dict)
+
+
+class DocxPackage:
+    def __init__(self, raw_bytes: bytes):
+        try:
+            self._archive = ZipFile(BytesIO(raw_bytes))
+        except BadZipFile as exc:
+            raise ValueError("Invalid DOCX package.") from exc
+        self._xml_cache: dict[str, ET.Element | None] = {}
+        self._rels_cache: dict[str, dict[str, str]] = {}
+        self._binary_cache: dict[str, bytes | None] = {}
+
+    def read_xml(self, part_name: str) -> ET.Element | None:
+        normalized_name = part_name.lstrip("/")
+        if normalized_name in self._xml_cache:
+            return self._xml_cache[normalized_name]
+
+        try:
+            xml_bytes = self._archive.read(normalized_name)
+        except KeyError:
+            self._xml_cache[normalized_name] = None
+            return None
+
+        root = ET.fromstring(xml_bytes)
+        self._xml_cache[normalized_name] = root
+        return root
+
+    def read_relationships(self, part_name: str) -> dict[str, str]:
+        normalized_name = part_name.lstrip("/")
+        if normalized_name in self._rels_cache:
+            return self._rels_cache[normalized_name]
+
+        directory = posixpath.dirname(normalized_name)
+        basename = posixpath.basename(normalized_name)
+        rels_name = posixpath.join(directory, "_rels", f"{basename}.rels")
+        root = self.read_xml(rels_name)
+        if root is None:
+            self._rels_cache[normalized_name] = {}
+            return {}
+
+        rels: dict[str, str] = {}
+        for rel in root.findall("rels:Relationship", NS):
+            rel_id = rel.get("Id")
+            target = rel.get("Target")
+            target_mode = rel.get("TargetMode")
+            if not rel_id or not target:
+                continue
+            if target_mode == "External":
+                rels[rel_id] = target
+                continue
+            rels[rel_id] = posixpath.normpath(posixpath.join(directory, target))
+
+        self._rels_cache[normalized_name] = rels
+        return rels
+
+    def read_binary(self, part_name: str) -> bytes | None:
+        normalized_name = part_name.lstrip("/")
+        if normalized_name in self._binary_cache:
+            return self._binary_cache[normalized_name]
+
+        try:
+            binary_bytes = self._archive.read(normalized_name)
+        except KeyError:
+            self._binary_cache[normalized_name] = None
+            return None
+
+        self._binary_cache[normalized_name] = binary_bytes
+        return binary_bytes
+
+
+def _build_numbering_schema(package: DocxPackage) -> NumberingSchema:
+    abstract_levels: dict[str, dict[int, NumberingLevel]] = {}
+    instances: dict[str, NumberingInstance] = {}
+    styles = _parse_style_definitions(package.read_xml("word/styles.xml"))
+
+    numbering_root = package.read_xml("word/numbering.xml")
+    if numbering_root is None:
+        return NumberingSchema(
+            abstract_levels={},
+            instances={},
+            styles=styles,
+            style_numbering_map={},
+        )
+
+    for abstract_num in numbering_root.findall("./w:abstractNum", NS):
+        abstract_num_id = abstract_num.get(_qn("w", "abstractNumId"))
+        if not abstract_num_id:
+            continue
+        levels: dict[int, NumberingLevel] = {}
+        for level in abstract_num.findall("./w:lvl", NS):
+            parsed_level = _parse_numbering_level(level)
+            if parsed_level is None:
+                continue
+            levels[parsed_level.ilvl] = parsed_level
+        abstract_levels[abstract_num_id] = levels
+
+    for num in numbering_root.findall("./w:num", NS):
+        num_id = num.get(_qn("w", "numId"))
+        abstract_num_id_element = num.find("./w:abstractNumId", NS)
+        abstract_num_id = (
+            None if abstract_num_id_element is None else abstract_num_id_element.get(_qn("w", "val"))
+        )
+        if not num_id or not abstract_num_id:
+            continue
+
+        level_overrides: dict[int, NumberingLevel] = {}
+        start_overrides: dict[int, int] = {}
+        for level_override in num.findall("./w:lvlOverride", NS):
+            ilvl_value = level_override.get(_qn("w", "ilvl"))
+            if ilvl_value is None or not ilvl_value.isdigit():
+                continue
+            ilvl = int(ilvl_value)
+
+            start_override = level_override.find("./w:startOverride", NS)
+            start_value = None if start_override is None else start_override.get(_qn("w", "val"))
+            if start_value and start_value.isdigit():
+                start_overrides[ilvl] = int(start_value)
+
+            level_element = level_override.find("./w:lvl", NS)
+            parsed_level = _parse_numbering_level(level_element)
+            if parsed_level is not None:
+                level_overrides[ilvl] = parsed_level
+
+        instances[num_id] = NumberingInstance(
+            num_id=num_id,
+            abstract_num_id=abstract_num_id,
+            level_overrides=level_overrides,
+            start_overrides=start_overrides,
+        )
+
+    style_numbering_map: dict[str, tuple[str, int]] = {}
+    for num_id, instance in instances.items():
+        for ilvl, level in _iter_instance_levels(instance, abstract_levels):
+            if level.p_style and level.p_style not in style_numbering_map:
+                style_numbering_map[level.p_style] = (num_id, ilvl)
+
+    return NumberingSchema(
+        abstract_levels=abstract_levels,
+        instances=instances,
+        styles=styles,
+        style_numbering_map=style_numbering_map,
+    )
+
+
+def _parse_style_definitions(styles_root: ET.Element | None) -> dict[str, StyleDefinition]:
+    if styles_root is None:
+        return {}
+
+    styles: dict[str, StyleDefinition] = {}
+    for style in styles_root.findall("./w:style", NS):
+        if style.get(_qn("w", "type")) != "paragraph":
+            continue
+
+        style_id = style.get(_qn("w", "styleId"))
+        if not style_id:
+            continue
+
+        based_on = None
+        based_on_element = style.find("./w:basedOn", NS)
+        if based_on_element is not None:
+            based_on = based_on_element.get(_qn("w", "val"))
+
+        num_id = None
+        ilvl = None
+        num_pr = style.find("./w:pPr/w:numPr", NS)
+        if num_pr is not None:
+            num_id_element = num_pr.find("./w:numId", NS)
+            ilvl_element = num_pr.find("./w:ilvl", NS)
+            if num_id_element is not None:
+                num_id = num_id_element.get(_qn("w", "val"))
+            if ilvl_element is not None:
+                ilvl_value = ilvl_element.get(_qn("w", "val"))
+                if ilvl_value and ilvl_value.isdigit():
+                    ilvl = int(ilvl_value)
+
+        styles[style_id] = StyleDefinition(
+            style_id=style_id,
+            based_on=based_on,
+            num_id=num_id,
+            ilvl=ilvl,
+        )
+
+    return styles
+
+
+def _parse_numbering_level(level: ET.Element | None) -> NumberingLevel | None:
+    if level is None:
+        return None
+
+    ilvl_value = level.get(_qn("w", "ilvl"))
+    if ilvl_value is None or not ilvl_value.isdigit():
+        return None
+
+    start_value = 1
+    start_element = level.find("./w:start", NS)
+    if start_element is not None:
+        raw_start = start_element.get(_qn("w", "val"))
+        if raw_start and raw_start.isdigit():
+            start_value = int(raw_start)
+
+    num_fmt = "decimal"
+    num_fmt_element = level.find("./w:numFmt", NS)
+    if num_fmt_element is not None:
+        num_fmt = num_fmt_element.get(_qn("w", "val"), "decimal")
+
+    lvl_text = f"%{int(ilvl_value) + 1}."
+    lvl_text_element = level.find("./w:lvlText", NS)
+    if lvl_text_element is not None:
+        lvl_text = lvl_text_element.get(_qn("w", "val"), lvl_text)
+
+    suffix = "tab"
+    suffix_element = level.find("./w:suff", NS)
+    if suffix_element is not None:
+        suffix = suffix_element.get(_qn("w", "val"), "tab")
+
+    p_style = None
+    p_style_element = level.find("./w:pStyle", NS)
+    if p_style_element is not None:
+        p_style = p_style_element.get(_qn("w", "val"))
+
+    return NumberingLevel(
+        ilvl=int(ilvl_value),
+        num_fmt=num_fmt,
+        lvl_text=lvl_text,
+        start=start_value,
+        suffix=suffix,
+        p_style=p_style,
+    )
+
+
+def _iter_instance_levels(
+    instance: NumberingInstance,
+    abstract_levels: dict[str, dict[int, NumberingLevel]],
+):
+    levels = abstract_levels.get(instance.abstract_num_id, {})
+    all_levels = set(levels) | set(instance.level_overrides)
+    for ilvl in sorted(all_levels):
+        resolved_level = instance.level_overrides.get(ilvl) or levels.get(ilvl)
+        if resolved_level is not None:
+            yield ilvl, resolved_level
+
+
+def build_docx_workspace(
+    db: Session,
+    raw_bytes: bytes,
+    similarity_threshold: float = 0.6,
+    include_matches: bool = True,
+    collection_ids: list[UUID] | None = None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
+) -> dict:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
+    parsed_workspace = _get_cached_parsed_workspace(
+        raw_bytes,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
+    segments = parsed_workspace["segments"]
+    match_stats = _build_empty_match_stats()
+
+    if include_matches and segments:
+        match_results, match_stats = match_sentences_with_stats(
+            db=db,
+            sentences=[segment["source_text"] for segment in segments],
+            auxiliary_sentences=[
+                _build_auxiliary_match_sentence(segment.get("numbering_text", ""), segment["source_text"])
+                for segment in segments
+            ],
+            similarity_threshold=similarity_threshold,
+            collection_ids=collection_ids,
+        )
+        for segment, match in zip(segments, match_results):
+            segment["status"] = match.status
+            segment["score"] = match.score
+            segment["matched_source_text"] = match.matched_source_text
+            segment["matched_collection_name"] = match.matched_collection_name
+            segment["matched_creator_name"] = match.matched_creator_name
+            segment["matched_created_at"] = match.matched_created_at
+            segment["matched_updated_at"] = match.matched_updated_at
+            segment["target_text"] = match.target_text or ""
+
+    return {
+        "document_html": parsed_workspace["document_html"],
+        "segments": segments,
+        "match_stats": {
+            "total_input_sentences": match_stats.total_input_sentences,
+            "prepared_sentences": match_stats.prepared_sentences,
+            "unique_sentences": match_stats.unique_sentences,
+            "exact_hits": match_stats.exact_hits,
+            "fuzzy_hits": match_stats.fuzzy_hits,
+            "none_hits": match_stats.none_hits,
+            "exact_phase_ms": match_stats.exact_phase_ms,
+            "fuzzy_phase_ms": match_stats.fuzzy_phase_ms,
+            "total_match_ms": match_stats.total_match_ms,
+            "fuzzy_candidates_evaluated": match_stats.fuzzy_candidates_evaluated,
+        },
+    }
+
+
+def normalize_document_parse_mode(value: str | None) -> str:
+    normalized = (value or DOCUMENT_PARSE_MODE_FULL).strip().lower().replace("-", "_")
+    if normalized in {"complete", "rich"}:
+        normalized = DOCUMENT_PARSE_MODE_FULL
+    if normalized in {"body", "main_body"}:
+        normalized = DOCUMENT_PARSE_MODE_BODY_ONLY
+    if normalized not in SUPPORTED_DOCUMENT_PARSE_MODES:
+        raise ValueError("不支持的文档内容解析处理选项。")
+    return normalized
+
+
+def normalize_document_parse_options(
+    value: Mapping[str, object] | str | None = None,
+    document_parse_mode: str | None = None,
+) -> dict[str, bool]:
+    raw_options: Mapping[str, object] = {}
+    if isinstance(value, str) and value.strip():
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("文档设置不是有效的 JSON。") from exc
+        if not isinstance(decoded, Mapping):
+            raise ValueError("文档设置必须是对象。")
+        raw_options = decoded
+    elif isinstance(value, Mapping):
+        raw_options = value
+
+    options = dict(DEFAULT_DOCUMENT_PARSE_OPTIONS)
+    for key in DOCUMENT_PARSE_OPTION_FIELDS:
+        if key in raw_options:
+            options[key] = bool(raw_options[key])
+
+    if normalize_document_parse_mode(document_parse_mode) == DOCUMENT_PARSE_MODE_BODY_ONLY:
+        options["include_headers_footers"] = False
+        options["include_footnotes_endnotes"] = False
+        options["include_comments"] = False
+
+    return options
+
+
+def serialize_document_parse_options(options: Mapping[str, object] | str | None = None) -> str:
+    return json.dumps(normalize_document_parse_options(options), ensure_ascii=False, sort_keys=True)
+
+
+def parse_docx_workspace(
+    raw_bytes: bytes,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
+) -> dict:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
+    package = DocxPackage(raw_bytes)
+    numbering_schema = _build_numbering_schema(package)
+    sentence_counter = count(1)
+    block_counter = count(0)
+
+    html_parts: list[str] = []
+    segments: list[dict] = []
+    for story in _build_story_parts(
+        package,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    ):
+        numbering_state = NumberingState(schema=numbering_schema)
+        story_html_parts, story_segments = _render_block_sequence(
+            container=story.root,
+            story=story,
+            sentence_counter=sentence_counter,
+            block_counter=block_counter,
+            numbering_state=numbering_state,
+        )
+        if not story_html_parts:
+            continue
+
+        story_html = "".join(story_html_parts)
+        if story.kind == "body":
+            html_parts.append(f'<section class="doc-story doc-story-body">{story_html}</section>')
+        else:
+            html_parts.append(
+                f'<section class="doc-story doc-story-{story.kind}">'
+                f'<div class="doc-story-label">{escape(story.label)}</div>'
+                f"{story_html}"
+                "</section>"
+            )
+        segments.extend(story_segments)
+
+    return {
+        "document_html": "".join(html_parts) or '<p class="doc-paragraph doc-empty"><br></p>',
+        "segments": segments,
+    }
+
+
+def build_docx_preview_html(
+    raw_bytes: bytes,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
+) -> str:
+    return _get_cached_parsed_workspace(
+        raw_bytes,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )["document_html"]
+
+
+def get_cached_docx_workspace(
+    raw_bytes: bytes,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
+) -> dict:
+    return _get_cached_parsed_workspace(
+        raw_bytes,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
+
+
+def _get_cached_parsed_workspace(
+    raw_bytes: bytes,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
+) -> dict:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
+    options_key = json.dumps(document_parse_options, ensure_ascii=False, sort_keys=True)
+    cache_key = (
+        f"preview:workspace:v{DOCX_PARSE_CACHE_VERSION}:"
+        f"{document_parse_mode}:{hashlib.sha256(options_key.encode('utf-8')).hexdigest()}:"
+        f"{hashlib.sha256(raw_bytes).hexdigest()}"
+    )
+    cached_workspace = get_json(cache_key)
+    if isinstance(cached_workspace, dict):
+        return copy.deepcopy(cached_workspace)
+
+    parsed_workspace = parse_docx_workspace(
+        raw_bytes,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
+    set_json(cache_key, parsed_workspace, ttl_seconds=DOCX_PARSE_CACHE_TTL_SECONDS)
+    return copy.deepcopy(parsed_workspace)
+
+
+def _build_story_parts(
+    package: DocxPackage,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
+) -> list[StoryPart]:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
+    document_part_name = "word/document.xml"
+    document_root = package.read_xml(document_part_name)
+    if document_root is None:
+        raise ValueError("word/document.xml is missing.")
+
+    document_rels = package.read_relationships(document_part_name)
+    body = document_root.find("w:body", NS)
+    if body is None:
+        raise ValueError("word/document.xml does not contain a body.")
+
+    stories: list[StoryPart] = []
+    include_extended_stories = document_parse_mode == DOCUMENT_PARSE_MODE_FULL
+    header_parts = (
+        _collect_story_reference_parts(body, document_rels, "headerReference")
+        if include_extended_stories and document_parse_options["include_headers_footers"]
+        else []
+    )
+    footer_parts = (
+        _collect_story_reference_parts(body, document_rels, "footerReference")
+        if include_extended_stories and document_parse_options["include_headers_footers"]
+        else []
+    )
+
+    for index, part_name in enumerate(header_parts, start=1):
+        root = package.read_xml(part_name)
+        if root is None:
+            continue
+        stories.append(
+            StoryPart(
+                kind="header",
+                label=f"Header {index}",
+                part_name=part_name,
+                root=root,
+                rels=package.read_relationships(part_name),
+                package=package,
+                parse_options=document_parse_options,
+            )
+        )
+
+    stories.append(
+        StoryPart(
+            kind="body",
+            label="Body",
+            part_name=document_part_name,
+            root=body,
+            rels=document_rels,
+            package=package,
+            parse_options=document_parse_options,
+        )
+    )
+    if include_extended_stories and document_parse_options["include_footnotes_endnotes"]:
+        stories.extend(
+            _build_note_story_parts(
+                package,
+                "word/footnotes.xml",
+                "footnote",
+                "Footnote",
+                document_parse_options=document_parse_options,
+            )
+        )
+        stories.extend(
+            _build_note_story_parts(
+                package,
+                "word/endnotes.xml",
+                "endnote",
+                "Endnote",
+                document_parse_options=document_parse_options,
+            )
+        )
+    if include_extended_stories and document_parse_options["include_comments"]:
+        stories.extend(
+            _build_note_story_parts(
+                package,
+                "word/comments.xml",
+                "comment",
+                "Comment",
+                document_parse_options=document_parse_options,
+            )
+        )
+
+    for index, part_name in enumerate(footer_parts, start=1):
+        root = package.read_xml(part_name)
+        if root is None:
+            continue
+        stories.append(
+            StoryPart(
+                kind="footer",
+                label=f"Footer {index}",
+                part_name=part_name,
+                root=root,
+                rels=package.read_relationships(part_name),
+                package=package,
+                parse_options=document_parse_options,
+            )
+        )
+
+    return stories
+
+
+def _collect_story_reference_parts(
+    container: ET.Element,
+    relationships: dict[str, str],
+    reference_tag: str,
+) -> list[str]:
+    part_names: list[str] = []
+    seen_parts: set[str] = set()
+
+    for reference in container.findall(f".//w:sectPr/w:{reference_tag}", NS):
+        rel_id = reference.get(_qn("r", "id"))
+        if not rel_id:
+            continue
+
+        part_name = relationships.get(rel_id)
+        if not part_name or part_name in seen_parts:
+            continue
+
+        seen_parts.add(part_name)
+        part_names.append(part_name)
+
+    return part_names
+
+
+def _build_note_story_parts(
+    package: DocxPackage,
+    part_name: str,
+    kind: str,
+    label_prefix: str,
+    document_parse_options: Mapping[str, bool] | None = None,
+) -> list[StoryPart]:
+    root = package.read_xml(part_name)
+    if root is None:
+        return []
+
+    rels = package.read_relationships(part_name)
+    note_type_attr = _qn("w", "type")
+    note_id_attr = _qn("w", "id")
+    stories: list[StoryPart] = []
+    for note in root.findall(f"./w:{kind}", NS):
+        if note.get(note_type_attr):
+            continue
+
+        note_id = note.get(note_id_attr, "?")
+        stories.append(
+            StoryPart(
+                kind=kind,
+                label=f"{label_prefix} {note_id}",
+                part_name=part_name,
+                root=note,
+                rels=rels,
+                package=package,
+                parse_options=dict(document_parse_options or DEFAULT_DOCUMENT_PARSE_OPTIONS),
+            )
+        )
+    return stories
+
+
+def _render_block_sequence(
+    container: ET.Element,
+    story: StoryPart,
+    sentence_counter,
+    block_counter,
+    numbering_state: NumberingState,
+    default_block_type: str = "paragraph",
+    fixed_block_index: int | None = None,
+    row_index: int | None = None,
+    cell_index: int | None = None,
+) -> tuple[list[str], list[dict]]:
+    html_parts: list[str] = []
+    segments: list[dict] = []
+
+    for block in _iter_block_nodes(container):
+        block_html, block_segments = _render_block(
+            block=block,
+            story=story,
+            sentence_counter=sentence_counter,
+            block_counter=block_counter,
+            numbering_state=numbering_state,
+            default_block_type=default_block_type,
+            fixed_block_index=fixed_block_index,
+            row_index=row_index,
+            cell_index=cell_index,
+        )
+        if block_html:
+            html_parts.append(block_html)
+        segments.extend(block_segments)
+
+    return html_parts, segments
+
+
+def _iter_block_nodes(container: ET.Element):
+    for child in list(container):
+        child_name = _local_name(child.tag)
+        if child_name in {"p", "tbl"}:
+            yield child
+            continue
+
+        if child_name == "sdt":
+            content = child.find("w:sdtContent", NS)
+            if content is not None:
+                yield from _iter_block_nodes(content)
+            continue
+
+        if child_name in {"customXml", "ins", "moveFrom", "moveTo", "smartTag"}:
+            yield from _iter_block_nodes(child)
+            continue
+
+        if child_name == "AlternateContent":
+            preferred_branch = _select_preferred_alternate_content_branch(child)
+            if preferred_branch is not None:
+                yield from _iter_block_nodes(preferred_branch)
+
+
+def _select_preferred_alternate_content_branch(node: ET.Element) -> ET.Element | None:
+    choice_branch: ET.Element | None = None
+    fallback_branch: ET.Element | None = None
+
+    for child in list(node):
+        child_name = _local_name(child.tag)
+        if child_name == "Choice" and choice_branch is None:
+            choice_branch = child
+        elif child_name == "Fallback" and fallback_branch is None:
+            fallback_branch = child
+
+    if choice_branch is not None:
+        return choice_branch
+    return fallback_branch
+
+
+def _render_block(
+    block: ET.Element,
+    story: StoryPart,
+    sentence_counter,
+    block_counter,
+    numbering_state: NumberingState,
+    default_block_type: str,
+    fixed_block_index: int | None,
+    row_index: int | None,
+    cell_index: int | None,
+) -> tuple[str, list[dict]]:
+    block_name = _local_name(block.tag)
+    if block_name == "p":
+        block_index = fixed_block_index if fixed_block_index is not None else next(block_counter)
+        return _render_paragraph(
+            paragraph=block,
+            story=story,
+            sentence_counter=sentence_counter,
+            block_counter=block_counter,
+            numbering_state=numbering_state,
+            block_index=block_index,
+            block_type=default_block_type,
+            row_index=row_index,
+            cell_index=cell_index,
+        )
+
+    if block_name == "tbl":
+        return _render_table(
+            table=block,
+            story=story,
+            sentence_counter=sentence_counter,
+            block_counter=block_counter,
+            numbering_state=numbering_state,
+        )
+
+    return "", []
+
+
+def _normalize_segment_source_text(text: str) -> str:
+    if not text:
+        return ""
+    return normalize_text(text.replace(CELL_PARAGRAPH_BREAK_SENTINEL, ""))
+
+
+def _build_paragraph_classes(story_kind: str, block_type: str) -> list[str]:
+    paragraph_classes = ["doc-paragraph"]
+    if block_type == "table_cell":
+        paragraph_classes.append("doc-table-paragraph")
+    if block_type == "textbox":
+        paragraph_classes.append("doc-textbox-paragraph")
+    if story_kind != "body":
+        paragraph_classes.append(f"doc-{story_kind}-paragraph")
+    return paragraph_classes
+
+
+def _collect_paragraph_render_data(
+    paragraph: ET.Element,
+    story: StoryPart,
+    sentence_counter,
+    block_counter,
+    numbering_state: NumberingState,
+) -> ParsedParagraphRenderData:
+    parse_state = InlineParseState()
+    numbering_text = _resolve_paragraph_numbering(paragraph, numbering_state)
+    fragments, embedded_html_parts, embedded_segments = _collect_inline_content(
+        node=paragraph,
+        story=story,
+        sentence_counter=sentence_counter,
+        block_counter=block_counter,
+        numbering_state=numbering_state,
+        parse_state=parse_state,
+    )
+    if numbering_text:
+        fragments = [
+            InlineFragment(
+                display_text=numbering_text,
+                source_text="".join(" " if not char.isspace() else char for char in numbering_text),
+            ),
+            *fragments,
+        ]
+
+    return ParsedParagraphRenderData(
+        paragraph=paragraph,
+        fragments=fragments,
+        embedded_html_parts=embedded_html_parts,
+        embedded_segments=embedded_segments,
+        numbering_text=numbering_text,
+        paragraph_css="" if story.parse_options.get("clean_format") else _build_paragraph_css(paragraph),
+        suppressed_page_number_field=parse_state.suppressed_page_number_field,
+    )
+
+
+def _cell_paragraph_text(fragments: list[InlineFragment]) -> str:
+    return normalize_text("".join(fragment.display_text for fragment in fragments))
+
+
+def _cell_paragraph_text_length(fragments: list[InlineFragment]) -> int:
+    return len(_cell_paragraph_text(fragments))
+
+
+def _cell_paragraph_looks_incomplete(fragments: list[InlineFragment]) -> bool:
+    text = "".join(fragment.display_text for fragment in fragments).rstrip()
+    if not text:
+        return False
+    return text[-1] not in CELL_SENTENCE_END_CHARS
+
+
+def _should_merge_cell_paragraphs(
+    current: ParsedParagraphRenderData,
+    next_paragraph: ParsedParagraphRenderData,
+) -> bool:
+    if not current.fragments or not next_paragraph.fragments:
+        return False
+    if current.embedded_html_parts or current.embedded_segments:
+        return False
+    if next_paragraph.embedded_html_parts or next_paragraph.embedded_segments:
+        return False
+    if next_paragraph.numbering_text:
+        return False
+    if not _cell_paragraph_looks_incomplete(current.fragments):
+        return False
+
+    next_length = _cell_paragraph_text_length(next_paragraph.fragments)
+    if next_length == 0 or next_length > CELL_NEXT_PARAGRAPH_MAX_CHARS:
+        return False
+    if next_length <= CELL_SHORT_PARAGRAPH_MAX_CHARS:
+        return True
+
+    return _cell_paragraph_text_length(current.fragments) + next_length <= CELL_GROUP_MAX_CHARS
+
+
+def _group_cell_paragraphs(
+    paragraphs: list[ParsedParagraphRenderData],
+) -> list[ParsedParagraphRenderData]:
+    grouped_paragraphs: list[ParsedParagraphRenderData] = []
+    current_group: ParsedParagraphRenderData | None = None
+
+    for paragraph in paragraphs:
+        paragraph_group = ParsedParagraphRenderData(
+            paragraph=paragraph.paragraph,
+            fragments=list(paragraph.fragments),
+            embedded_html_parts=list(paragraph.embedded_html_parts),
+            embedded_segments=list(paragraph.embedded_segments),
+            numbering_text=paragraph.numbering_text,
+            paragraph_css=paragraph.paragraph_css,
+            suppressed_page_number_field=paragraph.suppressed_page_number_field,
+        )
+        if current_group is None:
+            current_group = paragraph_group
+            continue
+
+        if _should_merge_cell_paragraphs(current_group, paragraph_group):
+            current_group.fragments.extend((CELL_PARAGRAPH_BREAK_FRAGMENT, *paragraph_group.fragments))
+            current_group.suppressed_page_number_field = (
+                current_group.suppressed_page_number_field or paragraph_group.suppressed_page_number_field
+            )
+            continue
+
+        grouped_paragraphs.append(current_group)
+        current_group = paragraph_group
+
+    if current_group is not None:
+        grouped_paragraphs.append(current_group)
+
+    return grouped_paragraphs
+
+
+def _render_table_cell(
+    cell: ET.Element,
+    story: StoryPart,
+    sentence_counter,
+    block_counter,
+    numbering_state: NumberingState,
+    block_index: int,
+    row_index: int,
+    cell_index: int,
+) -> tuple[list[str], list[dict]]:
+    cell_inner_html_parts: list[str] = []
+    cell_segments: list[dict] = []
+    paragraph_buffer: list[ParsedParagraphRenderData] = []
+    paragraph_classes = _build_paragraph_classes(story.kind, "table_cell")
+    segment_block_type = _resolve_segment_block_type(story.kind, "table_cell")
+
+    def flush_paragraphs() -> None:
+        nonlocal paragraph_buffer
+        if not paragraph_buffer:
+            return
+
+        for grouped_paragraph in _group_cell_paragraphs(paragraph_buffer):
+            paragraph_html, paragraph_segments = _render_paragraph_from_fragments(
+                fragments=grouped_paragraph.fragments,
+                sentence_counter=sentence_counter,
+                block_index=block_index,
+                block_type=segment_block_type,
+                paragraph_classes=paragraph_classes,
+                paragraph_css=grouped_paragraph.paragraph_css,
+                row_index=row_index,
+                cell_index=cell_index,
+                suppressed_page_number_field=grouped_paragraph.suppressed_page_number_field,
+                numbering_text=grouped_paragraph.numbering_text,
+            )
+            if paragraph_html:
+                cell_inner_html_parts.append(paragraph_html)
+            cell_inner_html_parts.extend(grouped_paragraph.embedded_html_parts)
+            cell_segments.extend(paragraph_segments)
+            cell_segments.extend(grouped_paragraph.embedded_segments)
+
+        paragraph_buffer = []
+
+    for block in _iter_block_nodes(cell):
+        block_name = _local_name(block.tag)
+        if block_name == "p":
+            paragraph_buffer.append(
+                _collect_paragraph_render_data(
+                    paragraph=block,
+                    story=story,
+                    sentence_counter=sentence_counter,
+                    block_counter=block_counter,
+                    numbering_state=numbering_state,
+                )
+            )
+            continue
+
+        if block_name == "tbl":
+            flush_paragraphs()
+            nested_table_html, nested_table_segments = _render_table(
+                table=block,
+                story=story,
+                sentence_counter=sentence_counter,
+                block_counter=block_counter,
+                numbering_state=numbering_state,
+            )
+            if nested_table_html:
+                cell_inner_html_parts.append(nested_table_html)
+            cell_segments.extend(nested_table_segments)
+
+    flush_paragraphs()
+    return cell_inner_html_parts, cell_segments
+
+
+def _render_table(
+    table: ET.Element,
+    story: StoryPart,
+    sentence_counter,
+    block_counter,
+    numbering_state: NumberingState,
+) -> tuple[str, list[dict]]:
+    block_index = next(block_counter)
+    row_html_parts: list[str] = []
+    table_segments: list[dict] = []
+
+    for row_index, row in enumerate(table.findall("./w:tr", NS)):
+        cell_html_parts: list[str] = []
+
+        for cell_index, cell in enumerate(row.findall("./w:tc", NS)):
+            cell_inner_html_parts, cell_segments = _render_table_cell(
+                cell=cell,
+                story=story,
+                sentence_counter=sentence_counter,
+                block_counter=block_counter,
+                numbering_state=numbering_state,
+                block_index=block_index,
+                row_index=row_index,
+                cell_index=cell_index,
+            )
+            table_segments.extend(cell_segments)
+
+            if not cell_inner_html_parts:
+                cell_inner_html_parts.append('<p class="doc-paragraph doc-empty"><br></p>')
+
+            cell_style = "" if story.parse_options.get("clean_format") else _build_cell_css(cell)
+            cell_style_attr = f' style="{cell_style}"' if cell_style else ""
+            cell_span_attrs = _build_cell_span_attrs(cell)
+            cell_html_parts.append(
+                f'<td class="doc-table-cell"{cell_span_attrs}{cell_style_attr}>'
+                f'{"".join(cell_inner_html_parts)}'
+                "</td>"
+            )
+
+        row_html_parts.append(f'<tr>{"".join(cell_html_parts)}</tr>')
+
+    return f'<table class="doc-table"><tbody>{"".join(row_html_parts)}</tbody></table>', table_segments
+
+
+def _render_paragraph(
+    paragraph: ET.Element,
+    story: StoryPart,
+    sentence_counter,
+    block_counter,
+    numbering_state: NumberingState,
+    block_index: int,
+    block_type: str,
+    row_index: int | None,
+    cell_index: int | None,
+) -> tuple[str, list[dict]]:
+    paragraph_data = _collect_paragraph_render_data(
+        paragraph=paragraph,
+        story=story,
+        sentence_counter=sentence_counter,
+        block_counter=block_counter,
+        numbering_state=numbering_state,
+    )
+    paragraph_html, paragraph_segments = _render_paragraph_from_fragments(
+        fragments=paragraph_data.fragments,
+        sentence_counter=sentence_counter,
+        block_index=block_index,
+        block_type=_resolve_segment_block_type(story.kind, block_type),
+        paragraph_classes=_build_paragraph_classes(story.kind, block_type),
+        paragraph_css=paragraph_data.paragraph_css,
+        row_index=row_index,
+        cell_index=cell_index,
+        suppressed_page_number_field=paragraph_data.suppressed_page_number_field,
+        numbering_text=paragraph_data.numbering_text,
+    )
+
+    html_parts: list[str] = []
+    if _paragraph_starts_new_page(paragraph):
+        html_parts.append(_build_page_break_html())
+    if paragraph_html:
+        html_parts.append(paragraph_html)
+    html_parts.extend(paragraph_data.embedded_html_parts)
+
+    return "".join(html_parts), paragraph_segments + paragraph_data.embedded_segments
+
+
+def _render_paragraph_from_fragments(
+    fragments: list[InlineFragment],
+    sentence_counter,
+    block_index: int,
+    block_type: str,
+    paragraph_classes: list[str],
+    paragraph_css: str = "",
+    row_index: int | None = None,
+    cell_index: int | None = None,
+    suppressed_page_number_field: bool = False,
+    numbering_text: str = "",
+) -> tuple[str, list[dict]]:
+    fragment_groups = _split_fragments_on_page_breaks(fragments)
+    if len(fragment_groups) > 1:
+        html_parts: list[str] = []
+        segments: list[dict] = []
+
+        for group_index, group in enumerate(fragment_groups):
+            group_html, group_segments = _render_paragraph_fragment_group(
+                fragments=group,
+                sentence_counter=sentence_counter,
+                block_index=block_index,
+                block_type=block_type,
+                paragraph_classes=paragraph_classes,
+                paragraph_css=paragraph_css,
+                row_index=row_index,
+                cell_index=cell_index,
+                suppressed_page_number_field=suppressed_page_number_field,
+                numbering_text=numbering_text if group_index == 0 else "",
+            )
+            if group_html:
+                html_parts.append(group_html)
+            segments.extend(group_segments)
+            if group_index < len(fragment_groups) - 1:
+                html_parts.append(_build_page_break_html())
+
+        return "".join(html_parts), segments
+
+    return _render_paragraph_fragment_group(
+        fragments=fragments,
+        sentence_counter=sentence_counter,
+        block_index=block_index,
+        block_type=block_type,
+        paragraph_classes=paragraph_classes,
+        paragraph_css=paragraph_css,
+        row_index=row_index,
+        cell_index=cell_index,
+        suppressed_page_number_field=suppressed_page_number_field,
+        numbering_text=numbering_text,
+    )
+
+
+def _render_paragraph_fragment_group(
+    fragments: list[InlineFragment],
+    sentence_counter,
+    block_index: int,
+    block_type: str,
+    paragraph_classes: list[str],
+    paragraph_css: str = "",
+    row_index: int | None = None,
+    cell_index: int | None = None,
+    suppressed_page_number_field: bool = False,
+    numbering_text: str = "",
+) -> tuple[str, list[dict]]:
+    display_text = "".join(fragment.display_text for fragment in fragments)
+    if not display_text:
+        return "", []
+    if suppressed_page_number_field and _is_page_number_wrapper_only(display_text, block_type):
+        return "", []
+
+    spans = split_sentence_spans(display_text)
+    if not spans and normalize_text(display_text):
+        spans = [_build_trimmed_span(display_text)]
+
+    renderable_sentences: list[RenderableSentence] = []
+    segments: list[dict] = []
+    numbering_available = bool(numbering_text)
+    for span in spans:
+        sentence_display = _collect_span_text(fragments, span, use_source=False)
+        sentence_source = _normalize_segment_source_text(_collect_span_text(fragments, span, use_source=True))
+        math_placeholders = _collect_span_math_placeholders(fragments, span)
+        sentence_id = None
+        segment_numbering_text = numbering_text if numbering_available else ""
+        if sentence_source:
+            sentence_id = f"sent-{next(sentence_counter):05d}"
+            segments.append(
+                {
+                    "sentence_id": sentence_id,
+                    "source_text": sentence_source,
+                    "display_text": sentence_display,
+                    "numbering_text": segment_numbering_text,
+                    "status": "none",
+                    "score": 0.0,
+                    "matched_source_text": None,
+                    "target_text": "",
+                    "block_type": block_type,
+                    "block_index": block_index,
+                    "row_index": row_index,
+                    "cell_index": cell_index,
+                    "math_placeholders": math_placeholders,
+                }
+            )
+            numbering_available = False
+
+        renderable_sentences.append(
+            RenderableSentence(
+                span=span,
+                sentence_id=sentence_id,
+                display_text=sentence_display,
+                source_text=sentence_source,
+            )
+        )
+
+    html_content = _render_fragments_with_sentences(fragments, renderable_sentences)
+    if not html_content:
+        html_content = "<br>"
+
+    class_attr = " ".join(paragraph_classes)
+    style_attr = f' style="{paragraph_css}"' if paragraph_css else ""
+    return f'<p class="{class_attr}"{style_attr}>{html_content}</p>', segments
+
+
+def _split_fragments_on_page_breaks(fragments: list[InlineFragment]) -> list[list[InlineFragment]]:
+    groups: list[list[InlineFragment]] = [[]]
+
+    for fragment in fragments:
+        if (
+            fragment.display_text == PAGE_BREAK_SENTINEL
+            and fragment.source_text == PAGE_BREAK_SENTINEL
+            and not fragment.css
+            and fragment.href is None
+        ):
+            groups.append([])
+            continue
+        groups[-1].append(fragment)
+
+    return groups
+
+
+def _build_page_break_html() -> str:
+    return '<div class="doc-page-break" aria-hidden="true"></div>'
+
+
+def _paragraph_starts_new_page(paragraph: ET.Element) -> bool:
+    properties = paragraph.find("w:pPr", NS)
+    if properties is None:
+        return False
+    return _is_enabled(properties, "pageBreakBefore")
+
+
+def _resolve_paragraph_numbering(
+    paragraph: ET.Element,
+    numbering_state: NumberingState,
+) -> str:
+    numbering_reference = _resolve_paragraph_numbering_reference(paragraph, numbering_state.schema)
+    if numbering_reference is None:
+        return ""
+
+    num_id, ilvl = numbering_reference
+    instance = numbering_state.schema.instances.get(num_id)
+    if instance is None:
+        return ""
+
+    level = _resolve_numbering_level(numbering_state.schema, instance, ilvl)
+    if level is None:
+        return ""
+
+    counters = numbering_state.counters.setdefault(num_id, {})
+    for deeper_level in [value for value in counters if value > ilvl]:
+        del counters[deeper_level]
+
+    start_value = instance.start_overrides.get(ilvl, level.start)
+    current_value = counters.get(ilvl, start_value - 1) + 1
+    counters[ilvl] = current_value
+
+    rendered_text = NUMBERING_PLACEHOLDER_RE.sub(
+        lambda match: _render_numbering_placeholder(
+            numbering_state.schema,
+            instance,
+            counters,
+            match.group(1),
+        ),
+        level.lvl_text,
+    )
+    if not rendered_text:
+        return ""
+
+    return f"{rendered_text}{_numbering_suffix_text(level.suffix)}"
+
+
+def _resolve_paragraph_numbering_reference(
+    paragraph: ET.Element,
+    numbering_schema: NumberingSchema,
+) -> tuple[str, int] | None:
+    direct_reference = _extract_numpr_reference(paragraph.find("./w:pPr/w:numPr", NS))
+    if direct_reference is not None:
+        return direct_reference
+
+    paragraph_style_id = _get_paragraph_style_id(paragraph)
+    if not paragraph_style_id:
+        return None
+
+    style_reference = _resolve_style_numbering_reference(paragraph_style_id, numbering_schema.styles)
+    if style_reference is not None:
+        return style_reference
+
+    return numbering_schema.style_numbering_map.get(paragraph_style_id)
+
+
+def _extract_numpr_reference(num_pr: ET.Element | None) -> tuple[str, int] | None:
+    if num_pr is None:
+        return None
+
+    num_id_element = num_pr.find("./w:numId", NS)
+    if num_id_element is None:
+        return None
+
+    num_id = num_id_element.get(_qn("w", "val"))
+    if not num_id or num_id == "0":
+        return None
+
+    ilvl = 0
+    ilvl_element = num_pr.find("./w:ilvl", NS)
+    if ilvl_element is not None:
+        ilvl_value = ilvl_element.get(_qn("w", "val"))
+        if ilvl_value and ilvl_value.isdigit():
+            ilvl = int(ilvl_value)
+
+    return num_id, ilvl
+
+
+def _get_paragraph_style_id(paragraph: ET.Element) -> str | None:
+    style_element = paragraph.find("./w:pPr/w:pStyle", NS)
+    if style_element is None:
+        return None
+    return style_element.get(_qn("w", "val"))
+
+
+def _resolve_style_numbering_reference(
+    style_id: str,
+    styles: dict[str, StyleDefinition],
+) -> tuple[str, int] | None:
+    current_style_id = style_id
+    visited: set[str] = set()
+
+    while current_style_id and current_style_id not in visited:
+        visited.add(current_style_id)
+        style = styles.get(current_style_id)
+        if style is None:
+            return None
+        if style.num_id:
+            return style.num_id, style.ilvl or 0
+        current_style_id = style.based_on
+
+    return None
+
+
+def _resolve_numbering_level(
+    numbering_schema: NumberingSchema,
+    instance: NumberingInstance,
+    ilvl: int,
+) -> NumberingLevel | None:
+    if ilvl in instance.level_overrides:
+        return instance.level_overrides[ilvl]
+    return numbering_schema.abstract_levels.get(instance.abstract_num_id, {}).get(ilvl)
+
+
+def _render_numbering_placeholder(
+    numbering_schema: NumberingSchema,
+    instance: NumberingInstance,
+    counters: dict[int, int],
+    placeholder_text: str,
+) -> str:
+    if not placeholder_text.isdigit():
+        return ""
+
+    target_level = int(placeholder_text) - 1
+    if target_level < 0:
+        return ""
+
+    level = _resolve_numbering_level(numbering_schema, instance, target_level)
+    value = counters.get(target_level)
+    if level is None or value is None:
+        return ""
+
+    return _format_numbering_value(value, level.num_fmt, level.lvl_text)
+
+
+def _numbering_suffix_text(suffix: str) -> str:
+    if suffix == "space":
+        return " "
+    if suffix == "nothing":
+        return ""
+    return "\t"
+
+
+def _format_numbering_value(value: int, num_fmt: str, lvl_text: str) -> str:
+    if num_fmt in {"bullet", "none"}:
+        return ""
+    if num_fmt == "decimalZero":
+        return f"{value:02d}"
+    if num_fmt in {"upperLetter", "lowerLetter"}:
+        rendered = _to_alpha_sequence(value)
+        return rendered.upper() if num_fmt == "upperLetter" else rendered.lower()
+    if num_fmt in {"upperRoman", "lowerRoman"}:
+        rendered = _to_roman(value)
+        return rendered.upper() if num_fmt == "upperRoman" else rendered.lower()
+    if num_fmt in {
+        "chineseCounting",
+        "chineseLegalSimplified",
+        "ideographDigital",
+        "chineseCountingThousand",
+    }:
+        return _to_simplified_chinese_number(value)
+    return str(value)
+
+
+def _to_alpha_sequence(value: int) -> str:
+    if value <= 0:
+        return str(value)
+
+    letters: list[str] = []
+    current = value
+    while current > 0:
+        current -= 1
+        letters.append(chr(ord("A") + (current % 26)))
+        current //= 26
+    return "".join(reversed(letters))
+
+
+def _to_roman(value: int) -> str:
+    if value <= 0:
+        return str(value)
+
+    numerals = (
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    )
+    current = value
+    parts: list[str] = []
+    for arabic, roman in numerals:
+        while current >= arabic:
+            parts.append(roman)
+            current -= arabic
+    return "".join(parts)
+
+
+def _to_simplified_chinese_number(value: int) -> str:
+    if value <= 0:
+        return str(value)
+    if value >= 100000:
+        return str(value)
+
+    digits = "零一二三四五六七八九"
+    units = ("", "十", "百", "千", "万")
+    parts: list[str] = []
+    zero_pending = False
+
+    for index, digit_char in enumerate(str(value)):
+        digit = int(digit_char)
+        place = len(str(value)) - index - 1
+        if digit == 0:
+            zero_pending = bool(parts)
+            continue
+        if zero_pending:
+            parts.append("零")
+            zero_pending = False
+        if not (digit == 1 and place == 1 and not parts):
+            parts.append(digits[digit])
+        parts.append(units[place])
+
+    return "".join(parts) or str(value)
+
+
+def _collect_inline_content(
+    node: ET.Element,
+    story: StoryPart,
+    sentence_counter,
+    block_counter,
+    numbering_state: NumberingState,
+    parse_state: InlineParseState,
+    hyperlink: str | None = None,
+    inherited_css: str = "",
+) -> tuple[list[InlineFragment], list[str], list[dict]]:
+    if node.tag in OMML_ATOMIC_TAGS:
+        return [_build_math_fragment(node, parse_state)], [], []
+
+    node_name = _local_name(node.tag)
+    if node_name in {"pPr", "rPr", "tblPr", "tblGrid", "trPr", "tcPr", "sectPr"}:
+        return [], [], []
+
+    if node_name == "AlternateContent":
+        preferred_branch = _select_preferred_alternate_content_branch(node)
+        if preferred_branch is None:
+            return [], [], []
+        return _collect_inline_content(
+            node=preferred_branch,
+            story=story,
+            sentence_counter=sentence_counter,
+            block_counter=block_counter,
+            numbering_state=numbering_state,
+            parse_state=parse_state,
+            hyperlink=hyperlink,
+            inherited_css=inherited_css,
+        )
+
+    if node.tag == _qn("w", "fldSimple"):
+        instruction = node.get(_qn("w", "instr"), "")
+        if _should_suppress_page_number_field(instruction, story.kind):
+            parse_state.suppressed_page_number_field = True
+            return [], [], []
+
+    if node.tag == _qn("w", "hyperlink"):
+        hyperlink = _resolve_hyperlink_target(node, story.rels) or hyperlink
+
+    if node.tag == _qn("w", "r"):
+        if not story.parse_options.get("clean_format"):
+            inherited_css = _merge_css(inherited_css, _build_run_css(node))
+
+    if node.tag == _qn("w", "fldChar"):
+        _update_field_state(node, story.kind, parse_state)
+        return [], [], []
+
+    if node.tag == _qn("w", "instrText"):
+        if parse_state.field_stack and parse_state.field_stack[-1].collecting_instruction:
+            parse_state.field_stack[-1].instruction_parts.append(node.text or "")
+        return [], [], []
+
+    if _is_inside_suppressed_page_number_field(parse_state.field_stack):
+        if node.tag in {
+            _qn("w", "t"),
+            _qn("w", "tab"),
+            _qn("w", "br"),
+            _qn("w", "cr"),
+            _qn("w", "noBreakHyphen"),
+            _qn("w", "sym"),
+            _qn("w", "footnoteReference"),
+            _qn("w", "endnoteReference"),
+            _qn("w", "drawing"),
+            _qn("w", "pict"),
+        }:
+            return [], [], []
+
+    if node.tag == _qn("w", "t"):
+        text_value = node.text or ""
+        return [InlineFragment(display_text=text_value, source_text=text_value, css=inherited_css, href=hyperlink)], [], []
+
+    if node.tag == _qn("w", "tab"):
+        return [InlineFragment(display_text="\t", source_text="\t", css=inherited_css, href=hyperlink)], [], []
+
+    if node.tag == _qn("w", "lastRenderedPageBreak"):
+        return [InlineFragment(display_text=PAGE_BREAK_SENTINEL, source_text=PAGE_BREAK_SENTINEL)], [], []
+
+    if node.tag in {_qn("w", "br"), _qn("w", "cr")}:
+        break_type = node.get(_qn("w", "type"))
+        if break_type == "page":
+            return [InlineFragment(display_text=PAGE_BREAK_SENTINEL, source_text=PAGE_BREAK_SENTINEL)], [], []
+        return [InlineFragment(display_text="\n", source_text="\n", css=inherited_css, href=hyperlink)], [], []
+
+    if node.tag == _qn("w", "noBreakHyphen"):
+        return [InlineFragment(display_text="-", source_text="-", css=inherited_css, href=hyperlink)], [], []
+
+    if node.tag == _qn("w", "sym"):
+        symbol_text = _decode_symbol(node)
+        if not symbol_text:
+            return [], [], []
+        return [InlineFragment(display_text=symbol_text, source_text=symbol_text, css=inherited_css, href=hyperlink)], [], []
+
+    if node.tag in {_qn("w", "footnoteReference"), _qn("w", "endnoteReference")}:
+        return [_build_note_reference_fragment(node, inherited_css)], [], []
+
+    if node.tag in {_qn("w", "drawing"), _qn("w", "pict")}:
+        embedded_html_parts, embedded_segments = _render_embedded_objects(
+            node=node,
+            story=story,
+            sentence_counter=sentence_counter,
+            block_counter=block_counter,
+            numbering_state=numbering_state,
+        )
+        return [], embedded_html_parts, embedded_segments
+
+    fragments: list[InlineFragment] = []
+    embedded_html_parts: list[str] = []
+    embedded_segments: list[dict] = []
+    for child in list(node):
+        child_fragments, child_embedded_html_parts, child_embedded_segments = _collect_inline_content(
+            node=child,
+            story=story,
+            sentence_counter=sentence_counter,
+            block_counter=block_counter,
+            numbering_state=numbering_state,
+            parse_state=parse_state,
+            hyperlink=hyperlink,
+            inherited_css=inherited_css,
+        )
+        fragments.extend(child_fragments)
+        embedded_html_parts.extend(child_embedded_html_parts)
+        embedded_segments.extend(child_embedded_segments)
+
+    return fragments, embedded_html_parts, embedded_segments
+
+
+def _build_math_fragment(node: ET.Element, parse_state: InlineParseState) -> InlineFragment:
+    parse_state.math_placeholder_index += 1
+    placeholder = MATH_PLACEHOLDER_TEMPLATE.format(index=parse_state.math_placeholder_index)
+    mathml_html = convert_omml_to_mathml(node)
+    wrapper_class = "doc-math doc-math--block" if _local_name(node.tag) == "oMathPara" else "doc-math"
+    return InlineFragment(
+        display_text=placeholder,
+        source_text=placeholder,
+        render_html=f'<span class="{wrapper_class}">{mathml_html}</span>',
+        is_math=True,
+        math_omml_xml=serialize_omml_xml(node),
+    )
+
+
+def _render_embedded_objects(
+    node: ET.Element,
+    story: StoryPart,
+    sentence_counter,
+    block_counter,
+    numbering_state: NumberingState,
+) -> tuple[list[str], list[dict]]:
+    embedded_html_parts = _render_embedded_images(node=node, story=story)
+    textbox_html_parts, textbox_segments = _render_embedded_textboxes(
+        node=node,
+        story=story,
+        sentence_counter=sentence_counter,
+        block_counter=block_counter,
+        numbering_state=numbering_state,
+    )
+    embedded_html_parts.extend(textbox_html_parts)
+    return embedded_html_parts, textbox_segments
+
+
+def _render_embedded_images(
+    node: ET.Element,
+    story: StoryPart,
+) -> list[str]:
+    image_html_parts: list[str] = []
+    seen_images: set[tuple[str, int | None, int | None, str]] = set()
+
+    for image in _extract_embedded_images(node=node, story=story):
+        image_key = (image.source, image.width_px, image.height_px, image.alt_text)
+        if image_key in seen_images:
+            continue
+        seen_images.add(image_key)
+
+        image_html = _build_embedded_image_html(package=story.package, image=image)
+        if image_html:
+            image_html_parts.append(image_html)
+
+    return image_html_parts
+
+
+def _render_embedded_textboxes(
+    node: ET.Element,
+    story: StoryPart,
+    sentence_counter,
+    block_counter,
+    numbering_state: NumberingState,
+) -> tuple[list[str], list[dict]]:
+    textbox_html_parts: list[str] = []
+    textbox_segments: list[dict] = []
+
+    for textbox_content in node.findall(".//w:txbxContent", NS):
+        inner_html_parts, inner_segments = _render_block_sequence(
+            container=textbox_content,
+            story=story,
+            sentence_counter=sentence_counter,
+            block_counter=block_counter,
+            numbering_state=numbering_state,
+            default_block_type="textbox",
+        )
+        if not inner_html_parts:
+            continue
+
+        textbox_html_parts.append(f'<div class="doc-textbox">{"".join(inner_html_parts)}</div>')
+        textbox_segments.extend(inner_segments)
+
+    if textbox_html_parts:
+        return textbox_html_parts, textbox_segments
+
+    fallback_parts = [element.text for element in node.findall(".//a:t", NS) if element.text]
+    fallback_text = "\n".join(part for part in fallback_parts if part)
+    if not normalize_text(fallback_text):
+        return [], []
+
+    paragraph_html, paragraph_segments = _render_paragraph_from_fragments(
+        fragments=[InlineFragment(display_text=fallback_text, source_text=fallback_text)],
+        sentence_counter=sentence_counter,
+        block_index=next(block_counter),
+        block_type=_resolve_segment_block_type(story.kind, "textbox"),
+        paragraph_classes=["doc-paragraph", "doc-textbox-paragraph"],
+    )
+    if not paragraph_html:
+        return [], []
+
+    return [f'<div class="doc-textbox">{paragraph_html}</div>'], paragraph_segments
+
+
+def _extract_embedded_images(
+    node: ET.Element,
+    story: StoryPart,
+) -> list[EmbeddedImage]:
+    images: list[EmbeddedImage] = []
+    drawing_alt_text = _resolve_drawing_alt_text(node)
+    drawing_width_px, drawing_height_px = _resolve_drawing_extent_pixels(node)
+
+    for blip in node.findall(".//a:blip", NS):
+        rel_id = blip.get(_qn("r", "embed")) or blip.get(_qn("r", "link"))
+        if not rel_id:
+            continue
+
+        source = story.rels.get(rel_id)
+        if not source:
+            continue
+
+        images.append(
+            EmbeddedImage(
+                source=source,
+                alt_text=drawing_alt_text,
+                width_px=drawing_width_px,
+                height_px=drawing_height_px,
+            )
+        )
+
+    vml_shapes = node.findall(".//v:shape", NS)
+    if vml_shapes:
+        for shape in vml_shapes:
+            imagedata = shape.find(".//v:imagedata", NS)
+            if imagedata is None:
+                continue
+
+            rel_id = imagedata.get(_qn("r", "id")) or imagedata.get(_qn("r", "href"))
+            if not rel_id:
+                continue
+
+            source = story.rels.get(rel_id)
+            if not source:
+                continue
+
+            width_px, height_px = _parse_vml_image_dimensions(shape.get("style", ""))
+            images.append(
+                EmbeddedImage(
+                    source=source,
+                    alt_text=imagedata.get("title", "") or drawing_alt_text,
+                    width_px=width_px,
+                    height_px=height_px,
+                )
+            )
+    else:
+        for imagedata in node.findall(".//v:imagedata", NS):
+            rel_id = imagedata.get(_qn("r", "id")) or imagedata.get(_qn("r", "href"))
+            if not rel_id:
+                continue
+
+            source = story.rels.get(rel_id)
+            if not source:
+                continue
+
+            images.append(
+                EmbeddedImage(
+                    source=source,
+                    alt_text=imagedata.get("title", "") or drawing_alt_text,
+                    width_px=drawing_width_px,
+                    height_px=drawing_height_px,
+                )
+            )
+
+    return images
+
+
+def _build_embedded_image_html(
+    package: DocxPackage,
+    image: EmbeddedImage,
+) -> str:
+    mime_type = _guess_embedded_image_mime_type(image.source)
+    image_src = _resolve_embedded_image_src(package=package, source=image.source)
+    if not image_src:
+        format_label = mime_type.split("/")[-1].upper() if mime_type else "UNKNOWN"
+        return (
+            '<div class="doc-image doc-image--placeholder">'
+            f"Image preview unavailable ({escape(format_label)})"
+            "</div>"
+        )
+
+    alt_text = image.alt_text.strip() or "Embedded image"
+    width_style = ""
+    if image.width_px is not None:
+        width_style = f"width: {image.width_px}px;"
+
+    css_parts = [width_style, "max-width: 100%;", "height: auto;"]
+    style_attr = escape(" ".join(part for part in css_parts if part).strip(), quote=True)
+    width_attr = f' width="{image.width_px}"' if image.width_px is not None else ""
+    height_attr = f' height="{image.height_px}"' if image.height_px is not None else ""
+    src_attr = escape(image_src, quote=True)
+    alt_attr = escape(alt_text, quote=True)
+    return (
+        '<div class="doc-image">'
+        f'<img class="doc-image__img" src="{src_attr}" alt="{alt_attr}"'
+        f'{width_attr}{height_attr} style="{style_attr}">'
+        "</div>"
+    )
+
+
+def _resolve_embedded_image_src(
+    package: DocxPackage,
+    source: str,
+) -> str:
+    if not source:
+        return ""
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", source):
+        return source
+
+    binary_bytes = package.read_binary(source)
+    if not binary_bytes:
+        return ""
+
+    mime_type = _guess_embedded_image_mime_type(source)
+    if mime_type not in SUPPORTED_BROWSER_IMAGE_MIME_TYPES:
+        return ""
+
+    encoded = base64.b64encode(binary_bytes).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _guess_embedded_image_mime_type(source: str) -> str:
+    return mimetypes.guess_type(source)[0] or "application/octet-stream"
+
+
+def _resolve_drawing_alt_text(node: ET.Element) -> str:
+    for element in node.findall(".//wp:docPr", NS):
+        alt_text = element.get("descr") or element.get("title") or element.get("name")
+        if alt_text:
+            return alt_text
+
+    for element in node.findall(".//pic:cNvPr", NS):
+        alt_text = element.get("descr") or element.get("title") or element.get("name")
+        if alt_text:
+            return alt_text
+
+    return ""
+
+
+def _resolve_drawing_extent_pixels(node: ET.Element) -> tuple[int | None, int | None]:
+    for extent in node.findall(".//wp:extent", NS):
+        width_px = _emu_to_pixels(extent.get("cx"))
+        height_px = _emu_to_pixels(extent.get("cy"))
+        if width_px is not None or height_px is not None:
+            return width_px, height_px
+
+    for extent in node.findall(".//a:ext", NS):
+        width_px = _emu_to_pixels(extent.get("cx"))
+        height_px = _emu_to_pixels(extent.get("cy"))
+        if width_px is not None or height_px is not None:
+            return width_px, height_px
+
+    return None, None
+
+
+def _emu_to_pixels(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        pixels = int(round(int(value) / EMU_PER_PIXEL))
+    except (TypeError, ValueError):
+        return None
+    return max(pixels, 1)
+
+
+def _parse_vml_image_dimensions(style_value: str) -> tuple[int | None, int | None]:
+    width_px = _parse_css_length_to_pixels(_extract_style_value(style_value, "width"))
+    height_px = _parse_css_length_to_pixels(_extract_style_value(style_value, "height"))
+    return width_px, height_px
+
+
+def _extract_style_value(style_value: str, property_name: str) -> str:
+    match = re.search(rf"(?:^|;)\s*{re.escape(property_name)}\s*:\s*([^;]+)", style_value, re.IGNORECASE)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def _parse_css_length_to_pixels(value: str) -> int | None:
+    if not value:
+        return None
+
+    match = re.match(r"(-?\d+(?:\.\d+)?)\s*(px|pt|in|cm|mm)?$", value.strip(), re.IGNORECASE)
+    if not match:
+        return None
+
+    numeric_value = float(match.group(1))
+    unit = (match.group(2) or "px").lower()
+    if unit == "px":
+        pixels = numeric_value
+    elif unit == "pt":
+        pixels = numeric_value * 96.0 / 72.0
+    elif unit == "in":
+        pixels = numeric_value * 96.0
+    elif unit == "cm":
+        pixels = numeric_value * 96.0 / 2.54
+    elif unit == "mm":
+        pixels = numeric_value * 96.0 / 25.4
+    else:
+        return None
+
+    return max(int(round(pixels)), 1)
+
+
+def _update_field_state(
+    node: ET.Element,
+    story_kind: str,
+    parse_state: InlineParseState,
+) -> None:
+    field_type = node.get(_qn("w", "fldCharType"))
+    if field_type == "begin":
+        parse_state.field_stack.append(TrackedField())
+        return
+
+    if not parse_state.field_stack:
+        return
+
+    current_field = parse_state.field_stack[-1]
+    if field_type == "separate":
+        current_field.collecting_instruction = False
+        current_field.suppress_result = _should_suppress_page_number_field(
+            "".join(current_field.instruction_parts),
+            story_kind,
+        )
+        if current_field.suppress_result:
+            parse_state.suppressed_page_number_field = True
+        return
+
+    if field_type == "end":
+        parse_state.field_stack.pop()
+
+
+def _should_suppress_page_number_field(instruction: str, story_kind: str) -> bool:
+    if story_kind not in {"header", "footer"}:
+        return False
+
+    normalized = " ".join(instruction.upper().split())
+    if not normalized:
+        return False
+
+    field_name_match = re.match(r"[A-Z]+", normalized)
+    if not field_name_match:
+        return False
+
+    return field_name_match.group(0) in PAGE_NUMBER_FIELD_NAMES
+
+
+def _is_inside_suppressed_page_number_field(field_stack: list[TrackedField]) -> bool:
+    return any(field.suppress_result and not field.collecting_instruction for field in field_stack)
+
+
+def _is_page_number_wrapper_only(text: str, block_type: str) -> bool:
+    if block_type not in {"header", "footer"}:
+        return False
+
+    compact_text = PAGE_NUMBER_WRAPPER_RE.sub("", text).lower()
+    if not compact_text:
+        return True
+
+    for token in ("pages", "page", "of", "第", "页", "共"):
+        compact_text = compact_text.replace(token, "")
+
+    return compact_text == ""
+
+
+def _render_fragments_with_sentences(
+    fragments: list[InlineFragment],
+    sentences: list[RenderableSentence],
+) -> str:
+    if not fragments:
+        return ""
+
+    html_parts: list[str] = []
+    sentence_index = 0
+    current_sentence = sentences[sentence_index] if sentence_index < len(sentences) else None
+    cursor = 0
+
+    for fragment in fragments:
+        fragment_length = len(fragment.display_text)
+        local_start = 0
+
+        while local_start < fragment_length:
+            absolute_start = cursor + local_start
+
+            while current_sentence is not None and absolute_start >= current_sentence.span.end:
+                if current_sentence.sentence_id:
+                    html_parts.append("</span>")
+                sentence_index += 1
+                current_sentence = sentences[sentence_index] if sentence_index < len(sentences) else None
+
+            next_boundary = cursor + fragment_length
+            if current_sentence is not None:
+                if absolute_start < current_sentence.span.start:
+                    next_boundary = min(next_boundary, current_sentence.span.start)
+                else:
+                    if absolute_start == current_sentence.span.start and current_sentence.sentence_id:
+                        html_parts.append(
+                            f'<span class="doc-sentence" id="{current_sentence.sentence_id}" '
+                            f'data-sentence-id="{current_sentence.sentence_id}">'
+                        )
+                    next_boundary = min(next_boundary, current_sentence.span.end)
+
+            piece_length = next_boundary - absolute_start
+            piece = fragment.display_text[local_start : local_start + piece_length]
+            html_parts.append(_render_fragment_piece(fragment, piece))
+            local_start += piece_length
+
+            if current_sentence is not None and cursor + local_start >= current_sentence.span.end:
+                if current_sentence.sentence_id:
+                    html_parts.append("</span>")
+                sentence_index += 1
+                current_sentence = sentences[sentence_index] if sentence_index < len(sentences) else None
+
+        cursor += fragment_length
+
+    return "".join(html_parts)
+
+
+def _render_fragment_piece(fragment: InlineFragment, piece: str) -> str:
+    if not piece:
+        return ""
+
+    if fragment.render_html is not None:
+        piece_html = fragment.render_html
+    else:
+        piece_html = escape(piece.expandtabs(4))
+    if fragment.css and fragment.render_html is None:
+        piece_html = f'<span class="doc-run" style="{fragment.css}">{piece_html}</span>'
+    if fragment.href:
+        href = escape(fragment.href, quote=True)
+        piece_html = (
+            f'<a href="{href}" target="_blank" rel="noopener noreferrer">'
+            f"{piece_html}"
+            "</a>"
+        )
+    return piece_html
+
+
+def _collect_span_math_placeholders(
+    fragments: list[InlineFragment],
+    span: SentenceSpan,
+) -> dict[str, str]:
+    placeholders: dict[str, str] = {}
+    cursor = 0
+    for fragment in fragments:
+        next_cursor = cursor + len(fragment.display_text)
+        overlap_start = max(span.start, cursor)
+        overlap_end = min(span.end, next_cursor)
+        if overlap_end > overlap_start and fragment.is_math and fragment.math_omml_xml:
+            placeholders[fragment.source_text] = fragment.math_omml_xml
+        cursor = next_cursor
+    return placeholders
+
+
+def _collect_span_text(
+    fragments: list[InlineFragment],
+    span: SentenceSpan,
+    use_source: bool,
+) -> str:
+    pieces: list[str] = []
+    cursor = 0
+
+    for fragment in fragments:
+        next_cursor = cursor + len(fragment.display_text)
+        overlap_start = max(span.start, cursor)
+        overlap_end = min(span.end, next_cursor)
+        if overlap_end > overlap_start:
+            local_start = overlap_start - cursor
+            local_end = overlap_end - cursor
+            base_text = fragment.source_text if use_source else fragment.display_text
+            pieces.append(base_text[local_start:local_end])
+        cursor = next_cursor
+
+    return "".join(pieces)
+
+
+def _build_trimmed_span(text: str) -> SentenceSpan:
+    start = 0
+    end = len(text)
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return SentenceSpan(start=start, end=end)
+
+
+def _build_auxiliary_match_sentence(numbering_text: str, source_text: str) -> str:
+    if not numbering_text:
+        return ""
+    return normalize_text(f"{numbering_text} {source_text}")
+
+
+def _build_note_reference_fragment(node: ET.Element, inherited_css: str) -> InlineFragment:
+    note_id = node.get(_qn("w", "id"), "")
+    marker = f"[{note_id}]" if note_id else "[*]"
+    return InlineFragment(
+        display_text=marker,
+        source_text=" " * len(marker),
+        css=_merge_css(inherited_css, NOTE_REFERENCE_CSS),
+    )
+
+
+def _resolve_hyperlink_target(node: ET.Element, relationships: dict[str, str]) -> str | None:
+    rel_id = node.get(_qn("r", "id"))
+    if rel_id and rel_id in relationships:
+        return relationships[rel_id]
+
+    anchor = node.get(_qn("w", "anchor"))
+    if anchor:
+        return f"#{anchor}"
+
+    return None
+
+
+def _decode_symbol(node: ET.Element) -> str:
+    char_value = node.get(_qn("w", "char"))
+    if not char_value:
+        return ""
+    try:
+        return chr(int(char_value, 16))
+    except ValueError:
+        return ""
+
+
+def _build_run_css(run: ET.Element) -> str:
+    properties = run.find("w:rPr", NS)
+    if properties is None:
+        return ""
+
+    styles: list[str] = []
+    if _is_enabled(properties, "b"):
+        styles.append("font-weight: 700")
+    if _is_enabled(properties, "i"):
+        styles.append("font-style: italic")
+
+    text_decorations: list[str] = []
+    underline = properties.find("w:u", NS)
+    if underline is not None and underline.get(_qn("w", "val"), "single") != "none":
+        text_decorations.append("underline")
+    if _is_enabled(properties, "strike") or _is_enabled(properties, "dstrike"):
+        text_decorations.append("line-through")
+    if text_decorations:
+        styles.append(f"text-decoration: {' '.join(text_decorations)}")
+
+    color = properties.find("w:color", NS)
+    color_value = None if color is None else color.get(_qn("w", "val"))
+    if color_value and color_value not in {"auto", "000000"}:
+        styles.append(f"color: #{color_value}")
+
+    shading = properties.find("w:shd", NS)
+    shading_fill = None if shading is None else shading.get(_qn("w", "fill"))
+    if shading_fill and shading_fill.lower() != "auto":
+        styles.append(f"background-color: #{shading_fill}")
+
+    highlight = properties.find("w:highlight", NS)
+    highlight_value = None if highlight is None else highlight.get(_qn("w", "val"))
+    if highlight_value and highlight_value in HIGHLIGHT_COLORS:
+        styles.append(f"background-color: {HIGHLIGHT_COLORS[highlight_value]}")
+
+    font_size = properties.find("w:sz", NS)
+    font_size_value = None if font_size is None else font_size.get(_qn("w", "val"))
+    if font_size_value and font_size_value.isdigit():
+        styles.append(f"font-size: {int(font_size_value) / 2:.1f}pt")
+
+    fonts = properties.find("w:rFonts", NS)
+    if fonts is not None:
+        font_family = (
+            fonts.get(_qn("w", "ascii"))
+            or fonts.get(_qn("w", "hAnsi"))
+            or fonts.get(_qn("w", "eastAsia"))
+            or fonts.get(_qn("w", "cs"))
+        )
+        if font_family:
+            safe_font_family = font_family.replace("'", r"\'")
+            styles.append(f"font-family: '{safe_font_family}'")
+
+    vertical_align = properties.find("w:vertAlign", NS)
+    vertical_align_value = None if vertical_align is None else vertical_align.get(_qn("w", "val"))
+    if vertical_align_value == "superscript":
+        styles.append("vertical-align: super")
+        styles.append("font-size: 0.75em")
+    elif vertical_align_value == "subscript":
+        styles.append("vertical-align: sub")
+        styles.append("font-size: 0.75em")
+
+    if _is_enabled(properties, "smallCaps"):
+        styles.append("font-variant: small-caps")
+    if _is_enabled(properties, "caps"):
+        styles.append("text-transform: uppercase")
+
+    return "; ".join(styles)
+
+
+def _build_paragraph_css(paragraph: ET.Element) -> str:
+    properties = paragraph.find("w:pPr", NS)
+    if properties is None:
+        return ""
+
+    styles: list[str] = []
+
+    alignment = properties.find("w:jc", NS)
+    alignment_value = None if alignment is None else alignment.get(_qn("w", "val"))
+    alignment_mapping = {
+        "both": "justify",
+        "center": "center",
+        "distribute": "justify",
+        "justify": "justify",
+        "left": "left",
+        "right": "right",
+    }
+    if alignment_value in alignment_mapping:
+        styles.append(f"text-align: {alignment_mapping[alignment_value]}")
+
+    indentation = properties.find("w:ind", NS)
+    if indentation is not None:
+        left = indentation.get(_qn("w", "left"))
+        right = indentation.get(_qn("w", "right"))
+        first_line = indentation.get(_qn("w", "firstLine"))
+        hanging = indentation.get(_qn("w", "hanging"))
+        if left and left.isdigit():
+            styles.append(f"margin-left: {_twips_to_points(left):.2f}pt")
+        if right and right.isdigit():
+            styles.append(f"margin-right: {_twips_to_points(right):.2f}pt")
+        if first_line and first_line.isdigit():
+            styles.append(f"text-indent: {_twips_to_points(first_line):.2f}pt")
+        elif hanging and hanging.isdigit():
+            styles.append(f"text-indent: -{_twips_to_points(hanging):.2f}pt")
+
+    spacing = properties.find("w:spacing", NS)
+    if spacing is not None:
+        before = spacing.get(_qn("w", "before"))
+        after = spacing.get(_qn("w", "after"))
+        if before and before.isdigit():
+            styles.append(f"margin-top: {_twips_to_points(before):.2f}pt")
+        if after and after.isdigit():
+            styles.append(f"margin-bottom: {_twips_to_points(after):.2f}pt")
+
+    shading = properties.find("w:shd", NS)
+    shading_fill = None if shading is None else shading.get(_qn("w", "fill"))
+    if shading_fill and shading_fill.lower() != "auto":
+        styles.append(f"background-color: #{shading_fill}")
+
+    return "; ".join(styles)
+
+
+def _build_cell_css(cell: ET.Element) -> str:
+    properties = cell.find("w:tcPr", NS)
+    if properties is None:
+        return ""
+
+    styles: list[str] = []
+    shading = properties.find("w:shd", NS)
+    shading_fill = None if shading is None else shading.get(_qn("w", "fill"))
+    if shading_fill and shading_fill.lower() != "auto":
+        styles.append(f"background-color: #{shading_fill}")
+
+    vertical_align = properties.find("w:vAlign", NS)
+    vertical_align_value = None if vertical_align is None else vertical_align.get(_qn("w", "val"))
+    if vertical_align_value in {"top", "center", "bottom"}:
+        css_value = "middle" if vertical_align_value == "center" else vertical_align_value
+        styles.append(f"vertical-align: {css_value}")
+
+    return "; ".join(styles)
+
+
+def _build_cell_span_attrs(cell: ET.Element) -> str:
+    properties = cell.find("w:tcPr", NS)
+    if properties is None:
+        return ""
+
+    grid_span = properties.find("w:gridSpan", NS)
+    grid_span_value = None if grid_span is None else grid_span.get(_qn("w", "val"))
+    if grid_span_value and grid_span_value.isdigit() and int(grid_span_value) > 1:
+        return f' colspan="{int(grid_span_value)}"'
+
+    return ""
+
+
+def _resolve_segment_block_type(story_kind: str, block_type: str) -> str:
+    if block_type in {"table_cell", "textbox"}:
+        return block_type
+    if story_kind in {"header", "footer", "footnote", "endnote", "comment"}:
+        return story_kind
+    return "paragraph"
+
+
+def _is_enabled(properties: ET.Element, tag_name: str) -> bool:
+    element = properties.find(f"w:{tag_name}", NS)
+    if element is None:
+        return False
+
+    value = element.get(_qn("w", "val"))
+    if value is None:
+        return True
+
+    normalized_value = value.strip().lower()
+    if normalized_value in FALSEY_VALUES:
+        return False
+    if normalized_value in TRUTHY_VALUES:
+        return True
+    return True
+
+
+def _twips_to_points(value: str) -> float:
+    return int(value) / 20.0
+
+
+def _merge_css(*values: str) -> str:
+    return "; ".join(value for value in values if value)
+
+
+def _qn(prefix: str, tag_name: str) -> str:
+    return f"{{{NS[prefix]}}}{tag_name}"
+
+
+def _local_name(tag: str) -> str:
+    if "}" not in tag:
+        return tag
+    return tag.rsplit("}", 1)[-1]
+
+
+def _build_empty_match_stats() -> MatchStats:
+    return MatchStats(
+        total_input_sentences=0,
+        prepared_sentences=0,
+        unique_sentences=0,
+        exact_hits=0,
+        fuzzy_hits=0,
+        none_hits=0,
+        exact_phase_ms=0.0,
+        fuzzy_phase_ms=0.0,
+        total_match_ms=0.0,
+        fuzzy_candidates_evaluated=0,
+    )
+
+
+def build_workspace_with_adapters(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    similarity_threshold: float = 0.6,
+) -> dict:
+    """使用适配器系统构建翻译工作台
+
+    支持多种文档格式：TXT、DOCX、PDF、PPTX、DITA、SVG 等。
+
+    Args:
+        db: 数据库会话
+        raw_bytes: 文件字节内容
+        filename: 文件名
+        similarity_threshold: 模糊匹配阈值
+
+    Returns:
+        dict: 包含 document_html、segments、match_stats 的字典
+    """
+    from pathlib import Path
+    from app.services.adapters import get_registry, ParseError, FileTooLargeError
+
+    extension = Path(filename).suffix.lower()
+
+    # 对于 DOCX，使用原有的专用解析器以保持完整的格式支持
+    if extension == ".docx":
+        return build_docx_workspace(
+            db=db,
+            raw_bytes=raw_bytes,
+            similarity_threshold=similarity_threshold,
+        )
+
+    # 其他格式使用适配器系统
+    try:
+        registry = get_registry()
+        adapter = registry.get_adapter(filename)
+        result = adapter.parse_with_validation(raw_bytes, filename)
+    except (ParseError, FileTooLargeError) as e:
+        raise ValueError(str(e)) from e
+    except Exception as e:
+        # 捕获其他异常（如 OCRRequiredError）
+        raise ValueError(f"解析文件失败: {str(e)}") from e
+
+    # 构建 HTML 和 segments
+    sentence_counter = count(1)
+    html_parts: list[str] = []
+    segments: list[dict] = []
+
+    for block_index, node in enumerate(result.ast.nodes):
+        node_html, node_segments = _render_ast_node(
+            node=node,
+            sentence_counter=sentence_counter,
+            block_index=block_index,
+        )
+        html_parts.append(node_html)
+        segments.extend(node_segments)
+
+    # 执行 TM 匹配
+    match_stats = _build_empty_match_stats()
+    if segments:
+        match_results, match_stats = match_sentences_with_stats(
+            db=db,
+            sentences=[segment["source_text"] for segment in segments],
+            similarity_threshold=similarity_threshold,
+        )
+        for segment, match in zip(segments, match_results, strict=False):
+            segment["status"] = match.status
+            segment["score"] = match.score
+            segment["matched_source_text"] = match.matched_source_text
+            segment["target_text"] = match.target_text or ""
+
+    return {
+        "document_html": "".join(html_parts) or '<p class="doc-paragraph doc-empty"><br></p>',
+        "segments": segments,
+        "match_stats": {
+            "total_input_sentences": match_stats.total_input_sentences,
+            "prepared_sentences": match_stats.prepared_sentences,
+            "unique_sentences": match_stats.unique_sentences,
+            "exact_hits": match_stats.exact_hits,
+            "fuzzy_hits": match_stats.fuzzy_hits,
+            "none_hits": match_stats.none_hits,
+            "exact_phase_ms": match_stats.exact_phase_ms,
+            "fuzzy_phase_ms": match_stats.fuzzy_phase_ms,
+            "total_match_ms": match_stats.total_match_ms,
+            "fuzzy_candidates_evaluated": match_stats.fuzzy_candidates_evaluated,
+        },
+    }
+
+
+def _render_ast_node(
+    node,
+    sentence_counter,
+    block_index: int,
+    block_type: str = "paragraph",
+) -> tuple[str, list[dict]]:
+    """渲染 AST 节点为 HTML"""
+    from app.services.adapters.models import NodeType
+
+    html_parts: list[str] = []
+    segments: list[dict] = []
+
+    if node.text_content:
+        paragraph_html, paragraph_segments = _render_paragraph(
+            text=node.text_content,
+            sentence_counter=sentence_counter,
+            block_index=block_index,
+            block_type=block_type,
+        )
+        html_parts.append(paragraph_html)
+        segments.extend(paragraph_segments)
+
+    if node.children:
+        if node.node_type == NodeType.TABLE:
+            table_html, table_segments = _render_ast_table(
+                node=node,
+                sentence_counter=sentence_counter,
+                block_index=block_index,
+            )
+            html_parts.append(table_html)
+            segments.extend(table_segments)
+        else:
+            for child in node.children:
+                child_html, child_segments = _render_ast_node(
+                    node=child,
+                    sentence_counter=sentence_counter,
+                    block_index=block_index,
+                    block_type=block_type,
+                )
+                html_parts.append(child_html)
+                segments.extend(child_segments)
+
+    return "".join(html_parts), segments
+
+
+def _render_ast_table(
+    node,
+    sentence_counter,
+    block_index: int,
+) -> tuple[str, list[dict]]:
+    """渲染 AST 表格节点为 HTML"""
+    from app.services.adapters.models import NodeType
+
+    row_html_parts: list[str] = []
+    table_segments: list[dict] = []
+
+    if not node.children:
+        return "", []
+
+    for row_index, row_node in enumerate(node.children):
+        if row_node.node_type != NodeType.TABLE_ROW:
+            continue
+
+        cell_html_parts: list[str] = []
+
+        if row_node.children:
+            for cell_index, cell_node in enumerate(row_node.children):
+                cell_paragraphs: list[str] = []
+
+                if cell_node.text_content:
+                    paragraph_html, paragraph_segments = _render_paragraph(
+                        text=cell_node.text_content,
+                        sentence_counter=sentence_counter,
+                        block_index=block_index,
+                        block_type="table_cell",
+                        row_index=row_index,
+                        cell_index=cell_index,
+                    )
+                    cell_paragraphs.append(paragraph_html)
+                    table_segments.extend(paragraph_segments)
+
+                if cell_node.children:
+                    for child in cell_node.children:
+                        if child.text_content:
+                            paragraph_html, paragraph_segments = _render_paragraph(
+                                text=child.text_content,
+                                sentence_counter=sentence_counter,
+                                block_index=block_index,
+                                block_type="table_cell",
+                                row_index=row_index,
+                                cell_index=cell_index,
+                            )
+                            cell_paragraphs.append(paragraph_html)
+                            table_segments.extend(paragraph_segments)
+
+                if not cell_paragraphs:
+                    cell_paragraphs.append('<p class="doc-paragraph doc-empty"><br></p>')
+
+                cell_html_parts.append(
+                    f'<td class="doc-table-cell">{"".join(cell_paragraphs)}</td>'
+                )
+
+        row_html_parts.append(f'<tr>{"".join(cell_html_parts)}</tr>')
+
+    if not row_html_parts:
+        return "", []
+
+    return f'<table class="doc-table"><tbody>{"".join(row_html_parts)}</tbody></table>', table_segments
+
+
+def build_document_html_from_segments(segments: list) -> str:
+    if not segments:
+        return ""
+
+    html_parts: list[str] = []
+    paragraph_buffer: list[str] = []
+    current_paragraph_key = None
+    current_table_index = None
+    table_rows: list[list[list[str]]] = []
+
+    def flush_paragraph() -> None:
+        nonlocal paragraph_buffer, current_paragraph_key
+        if paragraph_buffer:
+            html_parts.append(f'<p class="doc-paragraph">{"".join(paragraph_buffer)}</p>')
+            paragraph_buffer = []
+        current_paragraph_key = None
+
+    def flush_table() -> None:
+        nonlocal table_rows, current_table_index
+        if table_rows:
+            row_html: list[str] = []
+            for row in table_rows:
+                cell_html: list[str] = []
+                for cell_sentences in row:
+                    if cell_sentences:
+                        cell_content = f'<p class="doc-paragraph">{"".join(cell_sentences)}</p>'
+                    else:
+                        cell_content = '<p class="doc-paragraph doc-empty"><br></p>'
+                    cell_html.append(f'<td class="doc-table-cell">{cell_content}</td>')
+                row_html.append(f'<tr>{"".join(cell_html)}</tr>')
+            html_parts.append(f'<table class="doc-table"><tbody>{"".join(row_html)}</tbody></table>')
+            table_rows = []
+        current_table_index = None
+
+    def get_segment_value(segment: object, field_name: str, default: object = None) -> object:
+        if isinstance(segment, dict):
+            return segment.get(field_name, default)
+        return getattr(segment, field_name, default)
+
+    for segment in segments:
+        block_type = get_segment_value(segment, "block_type", "paragraph") or "paragraph"
+        sentence_id = (
+            get_segment_value(segment, "sentence_id", "")
+            or get_segment_value(segment, "segment_id", "")
+        )
+        display_text = build_segment_display_html(
+            get_segment_value(segment, "display_text", ""),
+            get_segment_value(segment, "math_placeholders", None),
+        )
+        sentence_html = (
+            f'<span class="doc-sentence" id="{sentence_id}" data-sentence-id="{sentence_id}">'
+            f"{display_text}"
+            "</span>"
+        )
+
+        if block_type == "table_cell":
+            flush_paragraph()
+            table_index = get_segment_value(segment, "block_index", 0)
+            if current_table_index is None:
+                current_table_index = table_index
+            elif current_table_index != table_index:
+                flush_table()
+                current_table_index = table_index
+
+            row_index = get_segment_value(segment, "row_index", 0) or 0
+            cell_index = get_segment_value(segment, "cell_index", 0) or 0
+            while len(table_rows) <= row_index:
+                table_rows.append([])
+            while len(table_rows[row_index]) <= cell_index:
+                table_rows[row_index].append([])
+            table_rows[row_index][cell_index].append(sentence_html)
+            continue
+
+        flush_table()
+        paragraph_key = (get_segment_value(segment, "block_index", 0), block_type)
+        if current_paragraph_key != paragraph_key:
+            flush_paragraph()
+            current_paragraph_key = paragraph_key
+        paragraph_buffer.append(sentence_html)
+
+    flush_paragraph()
+    flush_table()
+
+    return "".join(html_parts) or '<p class="doc-paragraph doc-empty"><br></p>'
+
+
+def build_segment_display_html(
+    display_text: str,
+    math_placeholders: Mapping[str, str] | None = None,
+) -> str:
+    if not display_text:
+        return ""
+    if not math_placeholders:
+        return escape(display_text)
+
+    html_parts: list[str] = []
+    cursor = 0
+    for start, end, placeholder, omml_xml in _iter_math_placeholder_occurrences(display_text, math_placeholders):
+        if start > cursor:
+            html_parts.append(escape(display_text[cursor:start]))
+        rendered_math = _render_math_placeholder_html(placeholder, omml_xml)
+        html_parts.append(rendered_math)
+        cursor = end
+    if cursor < len(display_text):
+        html_parts.append(escape(display_text[cursor:]))
+    return "".join(html_parts)
+
+
+def _iter_math_placeholder_occurrences(
+    text: str,
+    math_placeholders: Mapping[str, str],
+):
+    ordered_placeholders = sorted(
+        ((placeholder, omml_xml) for placeholder, omml_xml in math_placeholders.items() if placeholder),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+    cursor = 0
+    text_length = len(text)
+    while cursor < text_length:
+        match_item: tuple[str, str] | None = None
+        for placeholder, omml_xml in ordered_placeholders:
+            if text.startswith(placeholder, cursor):
+                match_item = (placeholder, omml_xml)
+                break
+        if match_item is None:
+            cursor += 1
+            continue
+        placeholder, omml_xml = match_item
+        start = cursor
+        end = start + len(placeholder)
+        yield start, end, placeholder, omml_xml
+        cursor = end
+
+
+def _render_math_placeholder_html(placeholder: str, omml_xml: str) -> str:
+    try:
+        math_node = ET.fromstring(omml_xml)
+        mathml_html = convert_omml_to_mathml(math_node)
+    except ET.ParseError:
+        return escape(placeholder)
+    wrapper_class = "doc-math doc-math--block" if _local_name(math_node.tag) == "oMathPara" else "doc-math"
+    return f'<span class="{wrapper_class}">{mathml_html}</span>'
