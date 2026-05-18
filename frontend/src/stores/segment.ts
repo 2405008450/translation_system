@@ -720,7 +720,6 @@ export const useSegmentStore = defineStore('segment', () => {
     syncToBackend,
     acceptRevision,
     rejectRevision,
-    applyPartialRevision,
     batchAcceptRevisions,
     batchRejectRevisions,
     startLLMTranslation,

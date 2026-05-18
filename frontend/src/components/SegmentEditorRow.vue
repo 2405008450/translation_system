@@ -518,11 +518,4 @@ const rejectButtonLabel = computed(() => {
   content: '';
   color: var(--text-placeholder);
 }
-
-.segment-row__revision-hint {
-  margin-left: auto;
-  font-size: 11px;
-  color: var(--text-muted);
-  font-weight: normal;
-}
 </style>
