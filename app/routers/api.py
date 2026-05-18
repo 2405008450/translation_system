@@ -401,6 +401,159 @@ def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[st
     return _serialize_file_record_upload_result(file_record)
 
 
+def _expand_archive_payloads(file_payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """展开压缩包文件为独立文件列表。
+
+    如果上传的文件是 .zip 或 .rar，则解压其中支持的文件，
+    每个文件作为独立的 file_payload 返回。非压缩包文件原样保留。
+    """
+    import zipfile
+    from io import BytesIO
+
+    expanded: list[dict[str, Any]] = []
+
+    for file_payload in file_payloads:
+        filename = file_payload.get("filename") or ""
+        ext = Path(filename).suffix.lower()
+
+        if ext == ".zip":
+            extracted = _extract_zip_files(file_payload["content"], filename)
+            if extracted:
+                expanded.extend(extracted)
+            else:
+                # 如果解压后没有支持的文件，保留原始 zip 处理方式
+                expanded.append(file_payload)
+        elif ext == ".rar":
+            extracted = _extract_rar_files(file_payload["content"], filename)
+            if extracted:
+                expanded.extend(extracted)
+            else:
+                expanded.append(file_payload)
+        else:
+            expanded.append(file_payload)
+
+    return expanded
+
+
+def _extract_zip_files(raw_bytes: bytes, archive_name: str) -> list[dict[str, Any]]:
+    """从 ZIP 文件中提取支持的文件。"""
+    import zipfile
+    from io import BytesIO
+
+    try:
+        zf = zipfile.ZipFile(BytesIO(raw_bytes), 'r')
+    except zipfile.BadZipFile:
+        return []
+
+    extracted: list[dict[str, Any]] = []
+
+    for info in zf.infolist():
+        # 跳过目录
+        if info.is_dir():
+            continue
+
+        # 获取文件名，处理编码问题
+        raw_filename = info.filename
+        decoded_filename = _decode_zip_filename(raw_filename, info)
+
+        # 跳过隐藏文件和系统文件
+        basename = Path(decoded_filename).name
+        if basename.startswith('__') or basename.startswith('.'):
+            continue
+
+        # 检查是否是支持的格式
+        if not supports_task_file(basename):
+            continue
+
+        try:
+            file_bytes = zf.read(info.filename)
+            if file_bytes:
+                extracted.append({
+                    "filename": basename,
+                    "content": file_bytes,
+                })
+        except Exception:
+            continue
+
+    zf.close()
+    return extracted
+
+
+def _extract_rar_files(raw_bytes: bytes, archive_name: str) -> list[dict[str, Any]]:
+    """从 RAR 文件中提取支持的文件。"""
+    try:
+        import rarfile
+        from io import BytesIO
+
+        rf = rarfile.RarFile(BytesIO(raw_bytes))
+    except Exception:
+        return []
+
+    extracted: list[dict[str, Any]] = []
+
+    try:
+        for info in rf.infolist():
+            if info.is_dir():
+                continue
+
+            decoded_filename = info.filename
+            basename = Path(decoded_filename).name
+
+            if basename.startswith('__') or basename.startswith('.'):
+                continue
+
+            if not supports_task_file(basename):
+                continue
+
+            try:
+                file_bytes = rf.read(info.filename)
+                if file_bytes:
+                    extracted.append({
+                        "filename": basename,
+                        "content": file_bytes,
+                    })
+            except Exception:
+                continue
+    finally:
+        rf.close()
+
+    return extracted
+
+
+def _decode_zip_filename(raw_filename: str, info: Any) -> str:
+    """解码 ZIP 文件名，处理中文等非 ASCII 编码问题。
+
+    Python zipfile 模块对非 UTF-8 文件名使用 CP437 解码，
+    这会导致中文文件名乱码。此函数尝试修复。
+    """
+    # 如果 flag_bits 的 bit 11 设置了，说明文件名是 UTF-8 编码
+    if info.flag_bits & 0x800:
+        return raw_filename
+
+    # 尝试将 CP437 解码的字符串重新编码回字节，再用正确编码解码
+    try:
+        raw_bytes = raw_filename.encode('cp437')
+        # 尝试 UTF-8
+        try:
+            return raw_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            pass
+        # 尝试 GBK（中文 Windows 常用）
+        try:
+            return raw_bytes.decode('gbk')
+        except UnicodeDecodeError:
+            pass
+        # 尝试 Shift-JIS（日文）
+        try:
+            return raw_bytes.decode('shift_jis')
+        except UnicodeDecodeError:
+            pass
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        pass
+
+    return raw_filename
+
+
 def _process_project_source_import(db: Session, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     project_id = UUID(payload["project_id"])
     project = db.query(Project).filter(Project.id == project_id).first()
@@ -435,13 +588,17 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
         )
 
     file_payloads = payload["files"]
+
+    # 展开压缩包：将 zip/rar 文件解压为独立文件
+    expanded_payloads = _expand_archive_payloads(file_payloads)
+
     created_files: list[FileRecord] = []
-    for index, file_payload in enumerate(file_payloads, start=1):
+    for index, file_payload in enumerate(expanded_payloads, start=1):
         filename = file_payload["filename"] or "source.txt"
         _set_import_task_status(
             task_id,
             "running",
-            progress=10 + int((index - 1) / max(len(file_payloads), 1) * 80),
+            progress=10 + int((index - 1) / max(len(expanded_payloads), 1) * 80),
             message=f"正在解析 {filename}",
         )
         workspace_data = build_task_workspace(
@@ -2479,7 +2636,6 @@ def rematch_file_record(
 
     source_sentences = [segment.source_text for segment in segments]
     auxiliary_sentences = [segment.display_text for segment in segments]
-
     matches, _ = match_sentences_with_stats(
         db=db,
         sentences=source_sentences,
@@ -2545,7 +2701,7 @@ def rematch_file_record(
         if before != after:
             updated_count += 1
 
-    # 更新 file_record 的 collection_id，以便匹配面板能查询到 TM 候选
+    # 保留当前文档绑定的记忆库，供右侧匹配面板查询 TM 候选。
     if selected_collection_ids:
         file_record.collection_id = selected_collection_ids[0]
 

@@ -239,16 +239,55 @@ def _export_by_format(
 
 
 def _export_txt(original_bytes: bytes, translations: Dict[str, str]) -> bytes:
-    """简单文本替换导出"""
+    """基于段落结构的文本替换导出"""
+    import re
+
     try:
         content = original_bytes.decode('utf-8')
     except UnicodeDecodeError:
-        content = original_bytes.decode('utf-8', errors='replace')
+        try:
+            content = original_bytes.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            content = original_bytes.decode('utf-8', errors='replace')
 
+    # 构建规范化文本 -> 译文的映射
+    normalized_map: Dict[str, str] = {}
     for source, target in translations.items():
-        content = content.replace(source, target)
+        normalized_map[source] = target
+        normalized_key = re.sub(r'\s+', ' ', source.strip())
+        if normalized_key != source:
+            normalized_map[normalized_key] = target
 
-    return content.encode('utf-8')
+    # 统一换行符
+    unified = content.replace("\r\n", "\n").replace("\r", "\n")
+
+    # 按空行分割段落（与 TxtAdapter._split_paragraphs 逻辑一致）
+    parts = re.split(r'(\n\s*\n)', unified)
+
+    result_parts: list = []
+    for part in parts:
+        if re.match(r'^\n\s*\n$', part):
+            result_parts.append(part)
+            continue
+
+        stripped = part.strip()
+        if not stripped:
+            result_parts.append(part)
+            continue
+
+        # 将段落文本规范化后尝试匹配
+        normalized_paragraph = re.sub(r'\s+', ' ', stripped)
+
+        if normalized_paragraph in normalized_map:
+            result_parts.append(normalized_map[normalized_paragraph])
+        else:
+            # 按句子级别替换
+            replaced = part
+            for source in sorted(normalized_map.keys(), key=len, reverse=True):
+                replaced = replaced.replace(source, normalized_map[source])
+            result_parts.append(replaced)
+
+    return "".join(result_parts).encode('utf-8')
 
 
 def _export_as_docx(segments: List) -> bytes:

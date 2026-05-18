@@ -204,6 +204,12 @@ class HtmlExporter:
         # 后处理：清理括号内的多余空格
         result = self._fix_bracket_spacing(result)
         
+        # 替换不支持中文的字体为标准字体
+        result = self._normalize_fonts(result)
+
+        # 确保 HTML 声明了 UTF-8 编码
+        result = self._ensure_utf8_charset(result)
+
         return result.encode('utf-8')
 
     def export_by_segments(
@@ -250,6 +256,10 @@ class HtmlExporter:
             return self.export(original_bytes, fallback_translations)
 
         result = self._fix_bracket_spacing(result)
+        # 替换不支持中文的字体为标准字体
+        result = self._normalize_fonts(result)
+        # 确保 HTML 声明了 UTF-8 编码
+        result = self._ensure_utf8_charset(result)
         return result.encode('utf-8')
 
     def _normalize_export_segments(self, segments: List[Any]) -> List[dict[str, str]]:
@@ -503,12 +513,157 @@ class HtmlExporter:
         return result
 
     def _decode_content(self, raw_bytes: bytes) -> str:
-        for encoding in ("utf-8", "utf-8-sig", "gb18030", "iso-8859-1"):
-            try:
-                return raw_bytes.decode(encoding)
-            except UnicodeDecodeError:
-                continue
-        return raw_bytes.decode('utf-8', errors='replace')
+        from app.services.adapters.html_adapter import _decode_html_bytes
+        return _decode_html_bytes(raw_bytes)
+
+    def _normalize_fonts(self, content: str) -> str:
+        """确保所有字体声明都包含支持中文的 fallback 字体。
+
+        翻译后的 HTML 中，原始字体可能不支持中文字符。此方法在保留
+        原始字体的前提下，追加中文 fallback 字体栈。
+        关键：不移除任何原有字体（包括 Symbol/Wingdings），因为原始
+        HTML 可能依赖这些符号字体把普通字符（如 'l'、'n'）映射为
+        bullet 等装饰符号。只在字体列表后追加 CJK fallback，让浏览器
+        在原字体不支持某字符时才 fallback 到中文字体。
+        """
+        # 中文 fallback 字体栈
+        _CJK_FALLBACK = (
+            '"Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", '
+            '"Noto Sans SC", "WenQuanYi Micro Hei", sans-serif'
+        )
+
+        # 检测字体列表中是否已包含中文字体
+        def _has_cjk_font(fonts_lower: list[str]) -> bool:
+            joined = ' '.join(fonts_lower)
+            return any(cjk in joined for cjk in (
+                'microsoft yahei', 'pingfang', 'hiragino', 'noto sans sc',
+                'noto sans cjk', 'wenquanyi', 'simhei', 'simsun', 'fangsong',
+                'kaiti', 'source han', 'yu gothic', 'meiryo', 'malgun',
+            ))
+
+        def _replace_font_family_value(match: re.Match) -> str:
+            prefix = match.group(1)
+            value = match.group(2)
+            suffix = match.group(3)
+
+            fonts = [f.strip().strip('"').strip("'") for f in value.split(',')]
+            lower_fonts = [f.lower() for f in fonts]
+            if _has_cjk_font(lower_fonts):
+                return match.group(0)
+
+            # 保留所有原有字体（不移除 Symbol/Wingdings），只追加 CJK fallback
+            kept = [f for f in fonts if f.strip()]
+            if kept:
+                new_value = ', '.join(f'"{f}"' if ' ' in f else f for f in kept)
+                new_value += ', ' + _CJK_FALLBACK
+            else:
+                new_value = _CJK_FALLBACK
+
+            return f'{prefix}{new_value}{suffix}'
+
+        # 处理 CSS font-family 声明
+        result = re.sub(
+            r'(font-family\s*:\s*)([^;"\'>}]+)([;"\'>}])',
+            _replace_font_family_value,
+            content,
+            flags=re.IGNORECASE,
+        )
+
+        # 处理 <font face="..."> 属性（同样保留原字体）
+        def _replace_face_attr(match: re.Match) -> str:
+            face_value = match.group(2)
+            fonts = [f.strip().strip('"').strip("'") for f in face_value.split(',')]
+            lower_fonts = [f.lower() for f in fonts]
+            if _has_cjk_font(lower_fonts):
+                return match.group(0)
+
+            kept = [f for f in fonts if f.strip()]
+            if kept:
+                new_face = ', '.join(kept) + ', Microsoft YaHei, PingFang SC, sans-serif'
+            else:
+                new_face = 'Microsoft YaHei, PingFang SC, sans-serif'
+            return f'{match.group(1)}{new_face}{match.group(3)}'
+
+        result = re.sub(
+            r'(face\s*=\s*["\'])([^"\']+)(["\'])',
+            _replace_face_attr,
+            result,
+            flags=re.IGNORECASE,
+        )
+
+        # 注入全局 CSS 兜底（不使用 !important，通过 @font-face + unicode-range
+        # 让中文字体只在 CJK 字符范围内生效，不影响 bullet/装饰符号）
+        global_css = (
+            '<style>\n'
+            '@font-face {\n'
+            '  font-family: "CJK Fallback";\n'
+            '  src: local("Microsoft YaHei"), local("PingFang SC"), '
+            'local("Hiragino Sans GB"), local("Noto Sans SC"), '
+            'local("WenQuanYi Micro Hei");\n'
+            '  unicode-range: U+2E80-9FFF, U+A000-A4FF, U+AC00-D7AF, '
+            'U+F900-FAFF, U+FE30-FE4F, U+1F200-1F2FF, U+20000-2FA1F;\n'
+            '}\n'
+            'body, p, li, td, th, span, div, h1, h2, h3, h4, h5, h6, a, label, '
+            'dt, dd, blockquote, figcaption, caption, summary {\n'
+            '  font-family: inherit, "CJK Fallback", "Microsoft YaHei", '
+            '"PingFang SC", sans-serif;\n'
+            '}\n'
+            '</style>'
+        )
+
+        head_close = re.search(r'</head>', result, re.IGNORECASE)
+        if head_close:
+            result = result[:head_close.start()] + '\n' + global_css + '\n' + result[head_close.start():]
+        else:
+            body_open = re.search(r'<body[^>]*>', result, re.IGNORECASE)
+            if body_open:
+                result = result[:body_open.start()] + global_css + '\n' + result[body_open.start():]
+            else:
+                result = global_css + '\n' + result
+
+        return result
+
+    def _ensure_utf8_charset(self, content: str) -> str:
+        """确保 HTML 中包含 UTF-8 编码声明。
+
+        如果已有 charset 声明则替换为 utf-8，否则在合适位置插入
+        <meta charset="utf-8">。
+        """
+        # 匹配已有的 <meta charset="..."> 或 <meta http-equiv="Content-Type" content="...charset=...">
+        charset_meta_re = re.compile(
+            r'<meta\s+charset\s*=\s*["\']?[^"\'>]+["\']?\s*/?>',
+            re.IGNORECASE,
+        )
+        http_equiv_re = re.compile(
+            r'<meta\s+http-equiv\s*=\s*["\']?Content-Type["\']?\s+content\s*=\s*["\'][^"\']*charset=[^"\']*["\'][^>]*/?>',
+            re.IGNORECASE,
+        )
+
+        utf8_meta = '<meta charset="utf-8">'
+
+        # 替换已有的 charset meta
+        if charset_meta_re.search(content):
+            return charset_meta_re.sub(utf8_meta, content, count=1)
+
+        if http_equiv_re.search(content):
+            return http_equiv_re.sub(utf8_meta, content, count=1)
+
+        # 没有 charset 声明，尝试插入到 <head> 内的最前面
+        head_re = re.compile(r'(<head[^>]*>)', re.IGNORECASE)
+        head_match = head_re.search(content)
+        if head_match:
+            insert_pos = head_match.end()
+            return content[:insert_pos] + '\n' + utf8_meta + content[insert_pos:]
+
+        # 没有 <head> 标签，在 <html> 后插入
+        html_re = re.compile(r'(<html[^>]*>)', re.IGNORECASE)
+        html_match = html_re.search(content)
+        if html_match:
+            insert_pos = html_match.end()
+            return content[:insert_pos] + '\n<head>' + utf8_meta + '</head>' + content[insert_pos:]
+
+        # 完全没有 HTML 结构，在文件开头插入
+        return utf8_meta + '\n' + content
 
     def _normalize_whitespace(self, text: str) -> str:
         """规范化空白字符，与解析时保持一致"""

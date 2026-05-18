@@ -3,6 +3,7 @@ HTML 适配器模块 - 解析 HTML/HTM 文件
 
 提取 HTML 中的可翻译文本内容，保留结构信息用于导出还原。
 """
+import re
 from typing import List, Optional
 from html.parser import HTMLParser
 
@@ -15,6 +16,96 @@ from app.services.adapters.models import (
     ParseResult,
 )
 from app.services.adapters.segment_extractor import extract_segments
+
+
+# ---------------------------------------------------------------------------
+# HTML 编码检测工具
+# ---------------------------------------------------------------------------
+
+# 用于从 HTML 原始字节中提取 charset 声明的正则（仅扫描前 4KB）
+_CHARSET_META_RE = re.compile(
+    rb'<meta[^>]+charset\s*=\s*["\']?\s*([a-zA-Z0-9_\-]+)',
+    re.IGNORECASE,
+)
+_HTTP_EQUIV_RE = re.compile(
+    rb'<meta[^>]+content\s*=\s*["\'][^"\']*charset=([a-zA-Z0-9_\-]+)',
+    re.IGNORECASE,
+)
+
+# 常见 charset 名称到 Python codec 名称的映射
+_CHARSET_ALIASES = {
+    "gb2312": "gb18030",
+    "gbk": "gb18030",
+    "big5": "big5hkscs",
+    "shift-jis": "shift_jis",
+    "shift_jis": "shift_jis",
+    "euc-jp": "euc_jp",
+    "euc-kr": "euc_kr",
+    "iso-8859-1": "cp1252",  # 实际网页中 iso-8859-1 几乎总是 windows-1252
+    "latin-1": "cp1252",
+    "ascii": "utf-8",
+}
+
+
+def _detect_charset_from_meta(raw_bytes: bytes) -> Optional[str]:
+    """从 HTML 前 4KB 中提取 meta charset 声明。"""
+    head = raw_bytes[:4096]
+    match = _CHARSET_META_RE.search(head) or _HTTP_EQUIV_RE.search(head)
+    if match:
+        declared = match.group(1).decode("ascii", errors="ignore").strip().lower()
+        return _CHARSET_ALIASES.get(declared, declared)
+    return None
+
+
+def _decode_html_bytes(raw_bytes: bytes) -> str:
+    """智能解码 HTML 字节内容。
+
+    优先级：
+    1. HTML meta charset 声明的编码
+    2. UTF-8 BOM
+    3. UTF-8 严格解码
+    4. charset_normalizer 自动检测
+    5. 最终 fallback: utf-8 replace
+    """
+    if not raw_bytes:
+        return ""
+
+    # 1. 检查 BOM
+    if raw_bytes.startswith(b'\xef\xbb\xbf'):
+        return raw_bytes.decode("utf-8-sig")
+
+    # 2. 尝试 HTML 中声明的编码
+    declared_charset = _detect_charset_from_meta(raw_bytes)
+    if declared_charset:
+        try:
+            return raw_bytes.decode(declared_charset)
+        except (UnicodeDecodeError, LookupError):
+            pass
+
+    # 3. 尝试 UTF-8 严格模式
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+
+    # 4. 使用 charset_normalizer 自动检测
+    try:
+        from charset_normalizer import from_bytes
+        detection = from_bytes(raw_bytes)
+        best = detection.best()
+        if best is not None:
+            return str(best)
+    except Exception:
+        pass
+
+    # 5. 常见中文编码 fallback
+    try:
+        return raw_bytes.decode("gb18030")
+    except UnicodeDecodeError:
+        pass
+
+    # 6. 最终 fallback
+    return raw_bytes.decode("utf-8", errors="replace")
 
 
 # 块级元素
@@ -174,9 +265,4 @@ class HtmlAdapter(FormatAdapter):
         )
 
     def _decode_content(self, raw_bytes: bytes) -> str:
-        for encoding in ("utf-8", "utf-8-sig", "gb18030", "iso-8859-1"):
-            try:
-                return raw_bytes.decode(encoding)
-            except UnicodeDecodeError:
-                continue
-        raise ParseError(filename="<unknown>", reason="无法识别文件编码")
+        return _decode_html_bytes(raw_bytes)
