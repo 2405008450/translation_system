@@ -12,7 +12,8 @@ function mergeSegment(segments: DiffSegment[], nextSegment: DiffSegment) {
 
   const lastSegment = segments[segments.length - 1]
   if (lastSegment && lastSegment.type === nextSegment.type) {
-    lastSegment.text += nextSegment.text
+    // 因为是倒序遍历，新的 token 应该放在前面
+    lastSegment.text = nextSegment.text + lastSegment.text
     return
   }
 

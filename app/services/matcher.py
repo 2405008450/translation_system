@@ -223,6 +223,12 @@ def _build_diff_html(source: str, matched: str) -> str:
             result_parts.append(f'<del>{_escape_html("".join(source_tokens[i1:i2]))}</del>')
         elif tag == "insert":
             result_parts.append(f'<ins>{_escape_html("".join(matched_tokens[j1:j2]))}</ins>')
+        elif tag == "delete":
+            # matched 中有但 source 中没有的 -> 删除线
+            result_parts.append(f'<del>{_escape_html("".join(matched_tokens[i1:i2]))}</del>')
+        elif tag == "insert":
+            # source 中有但 matched 中没有的 -> 插入标记
+            result_parts.append(f'<ins>{_escape_html("".join(source_tokens[j1:j2]))}</ins>')
 
     return "".join(result_parts)
 

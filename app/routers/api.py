@@ -2479,6 +2479,7 @@ def rematch_file_record(
 
     source_sentences = [segment.source_text for segment in segments]
     auxiliary_sentences = [segment.display_text for segment in segments]
+
     matches, _ = match_sentences_with_stats(
         db=db,
         sentences=source_sentences,
@@ -2543,6 +2544,10 @@ def rematch_file_record(
         )
         if before != after:
             updated_count += 1
+
+    # 更新 file_record 的 collection_id，以便匹配面板能查询到 TM 候选
+    if selected_collection_ids:
+        file_record.collection_id = selected_collection_ids[0]
 
     db.commit()
     return {
