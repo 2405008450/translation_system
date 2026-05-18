@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import re
+import sqlite3
+import tempfile
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -9,13 +12,15 @@ from openpyxl import load_workbook
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from app.models import TranslationMemory
+from app.models import MemoryEntry
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
 from app.services.tm_vector import sync_tm_embeddings
 
 
 XLSX_EXTENSIONS = {".xlsx"}
+SDLTM_EXTENSIONS = {".sdltm"}
+TM_IMPORT_EXTENSIONS = XLSX_EXTENSIONS | SDLTM_EXTENSIONS
 HEADER_ALIASES = {
     ("zh-cn", "en-us"),
     ("source", "target"),
@@ -37,6 +42,54 @@ class TMImportSummary:
     @property
     def imported_rows(self) -> int:
         return self.created_rows + self.updated_rows
+
+
+@dataclass
+class SDLTMMetadata:
+    """Metadata extracted from SDLTM file."""
+    name: str
+    source_language: str
+    target_language: str
+    entry_count: int
+
+
+def preview_sdltm_metadata(raw_bytes: bytes) -> SDLTMMetadata:
+    """Extract metadata from SDLTM file without importing."""
+    with tempfile.NamedTemporaryFile(suffix=".sdltm", delete=False) as tmp:
+        tmp.write(raw_bytes)
+        tmp_path = tmp.name
+
+    try:
+        conn = sqlite3.connect(tmp_path)
+        cursor = conn.cursor()
+
+        # Get TM metadata
+        cursor.execute("""
+            SELECT name, source_language, target_language
+            FROM translation_memories
+            LIMIT 1
+        """)
+        row = cursor.fetchone()
+
+        if row:
+            name, source_lang, target_lang = row
+        else:
+            name, source_lang, target_lang = "", "", ""
+
+        # Get entry count
+        cursor.execute("SELECT COUNT(*) FROM translation_units")
+        entry_count = cursor.fetchone()[0]
+
+        conn.close()
+
+        return SDLTMMetadata(
+            name=name or "",
+            source_language=source_lang or "",
+            target_language=target_lang or "",
+            entry_count=entry_count,
+        )
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 def import_tm_from_xlsx_upload(
@@ -196,24 +249,24 @@ def _flush_tm_batch(
     source_hashes = [row["source_hash"] for row in batch_rows]
     source_texts = [row["source_text"] for row in batch_rows]
     existing_query = (
-        db.query(TranslationMemory)
+        db.query(MemoryEntry)
         .filter(
             or_(
-                TranslationMemory.source_hash.in_(source_hashes),
-                TranslationMemory.source_text.in_(source_texts),
+                MemoryEntry.source_hash.in_(source_hashes),
+                MemoryEntry.source_text.in_(source_texts),
             ),
-            TranslationMemory.source_language == source_language,
-            TranslationMemory.target_language == target_language,
+            MemoryEntry.source_language == source_language,
+            MemoryEntry.target_language == target_language,
         )
     )
     if collection_id is None:
-        existing_query = existing_query.filter(TranslationMemory.collection_id.is_(None))
+        existing_query = existing_query.filter(MemoryEntry.collection_id.is_(None))
     else:
-        existing_query = existing_query.filter(TranslationMemory.collection_id == collection_id)
+        existing_query = existing_query.filter(MemoryEntry.collection_id == collection_id)
     existing_rows = existing_query.all()
 
-    existing_by_hash: dict[str, TranslationMemory] = {}
-    existing_by_source_text: dict[str, TranslationMemory] = {}
+    existing_by_hash: dict[str, MemoryEntry] = {}
+    existing_by_source_text: dict[str, MemoryEntry] = {}
     for existing in existing_rows:
         if existing.source_hash:
             existing_by_hash.setdefault(existing.source_hash, existing)
@@ -221,13 +274,13 @@ def _flush_tm_batch(
 
     created_rows = 0
     updated_rows = 0
-    sync_candidates: list[TranslationMemory] = []
+    sync_candidates: list[MemoryEntry] = []
     for row in batch_rows:
         existing = existing_by_hash.get(row["source_hash"]) or existing_by_source_text.get(
             row["source_text"]
         )
         if existing is None:
-            tm_row = TranslationMemory(**row)
+            tm_row = MemoryEntry(**row)
             db.add(tm_row)
             sync_candidates.append(tm_row)
             created_rows += 1
@@ -271,3 +324,174 @@ def _looks_like_header(source_text: str, target_text: str) -> bool:
 
     header_key = (source_text.lower(), target_text.lower())
     return header_key in HEADER_ALIASES
+
+
+# ============================================================================
+# SDLTM Import Functions
+# ============================================================================
+
+def import_tm_from_sdltm_upload(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
+) -> TMImportSummary:
+    """Import translation memory from an uploaded SDLTM file."""
+    with tempfile.NamedTemporaryFile(suffix=".sdltm", delete=False) as tmp:
+        tmp.write(raw_bytes)
+        tmp_path = tmp.name
+
+    try:
+        return _import_sdltm(
+            db=db,
+            sdltm_path=tmp_path,
+            filename=filename,
+            batch_size=batch_size,
+            collection_id=collection_id,
+            creator_id=creator_id,
+            source_language=source_language,
+            target_language=target_language,
+        )
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def import_tm_from_sdltm_path(
+    db: Session,
+    sdltm_path: str | Path,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
+) -> TMImportSummary:
+    """Import translation memory from an SDLTM file path."""
+    return _import_sdltm(
+        db=db,
+        sdltm_path=str(sdltm_path),
+        filename=Path(sdltm_path).name,
+        batch_size=batch_size,
+        collection_id=collection_id,
+        creator_id=creator_id,
+        source_language=source_language,
+        target_language=target_language,
+    )
+
+
+def _import_sdltm(
+    db: Session,
+    sdltm_path: str,
+    filename: str,
+    batch_size: int,
+    source_language: str,
+    target_language: str,
+    collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
+) -> TMImportSummary:
+    """Core SDLTM import logic."""
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+
+    batch_rows: dict[str, dict] = {}
+    created_rows = 0
+    updated_rows = 0
+    skipped_empty_rows = 0
+
+    conn = sqlite3.connect(sdltm_path)
+    try:
+        cursor = conn.cursor()
+
+        # SDLTM stores source/target as XML in translation_units table
+        query = """
+            SELECT
+                id,
+                source_segment,
+                target_segment
+            FROM translation_units
+            WHERE source_segment IS NOT NULL AND target_segment IS NOT NULL
+        """
+
+        cursor.execute(query)
+
+        for row in cursor.fetchall():
+            _, raw_source, raw_target = row
+
+            # Extract text from SDLTM XML format
+            source_text = normalize_text(_extract_sdltm_text(raw_source))
+            target_text = normalize_text(_extract_sdltm_text(raw_target))
+
+            if not source_text or not target_text:
+                skipped_empty_rows += 1
+                continue
+
+            tm_row = _build_tm_row(
+                source_text=source_text,
+                target_text=target_text,
+                source_language=normalized_source_language,
+                target_language=normalized_target_language,
+                collection_id=collection_id,
+                creator_id=creator_id,
+            )
+            batch_rows[tm_row["source_hash"]] = tm_row
+
+            if len(batch_rows) >= batch_size:
+                created_in_batch, updated_in_batch = _flush_tm_batch(
+                    db=db,
+                    batch_rows=list(batch_rows.values()),
+                    collection_id=collection_id,
+                    creator_id=creator_id,
+                    source_language=normalized_source_language,
+                    target_language=normalized_target_language,
+                )
+                created_rows += created_in_batch
+                updated_rows += updated_in_batch
+                batch_rows.clear()
+
+        if batch_rows:
+            created_in_batch, updated_in_batch = _flush_tm_batch(
+                db=db,
+                batch_rows=list(batch_rows.values()),
+                collection_id=collection_id,
+                creator_id=creator_id,
+                source_language=normalized_source_language,
+                target_language=normalized_target_language,
+            )
+            created_rows += created_in_batch
+            updated_rows += updated_in_batch
+
+    finally:
+        conn.close()
+
+    return TMImportSummary(
+        filename=filename,
+        created_rows=created_rows,
+        updated_rows=updated_rows,
+        skipped_empty_rows=skipped_empty_rows,
+        skipped_header_rows=0,
+    )
+
+
+def _extract_sdltm_text(xml_content: str) -> str:
+    """Extract plain text from SDLTM XML segment format.
+    
+    SDLTM stores segments as XML like:
+    <Segment><Elements><Text><Value>actual text</Value></Text></Elements>...</Segment>
+    """
+    if not xml_content:
+        return ""
+    
+    # Extract all text values from <Value> tags
+    values = re.findall(r"<Value>(.*?)</Value>", xml_content, re.DOTALL)
+    text = "".join(values)
+    
+    # Clean up any remaining XML entities
+    text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    text = text.replace("&quot;", '"').replace("&apos;", "'")
+    
+    return text.strip()

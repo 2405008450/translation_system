@@ -44,17 +44,16 @@ const hasVisibleContent = computed(() => segments.value.some((segment) => segmen
 }
 
 .diff-text__segment--insert {
-  background: rgba(118, 196, 132, 0.22);
-  border-radius: 4px;
-  box-shadow: inset 0 0 0 1px rgba(71, 153, 89, 0.18);
+  text-decoration: underline;
+  text-decoration-color: rgba(71, 153, 89, 0.6);
+  text-underline-offset: 2px;
+  color: #1b5e3b;
 }
 
 .diff-text__segment--delete {
-  background: rgba(218, 96, 96, 0.16);
-  border-radius: 4px;
-  color: #8b3232;
   text-decoration: line-through;
-  box-shadow: inset 0 0 0 1px rgba(182, 72, 72, 0.16);
+  text-decoration-color: rgba(182, 72, 72, 0.6);
+  color: #8b3232;
 }
 
 .diff-text__empty {

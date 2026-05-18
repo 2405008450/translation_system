@@ -1,24 +1,32 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { Loader2, Pencil, Plus, Search, Trash2, Upload } from 'lucide-vue-next'
+import { GitMerge, Loader2, Pencil, Plus, Search, Trash2, X } from 'lucide-vue-next'
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { http } from '../api/http'
 import DataTable from '../components/DataTable.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
+import Modal from '../components/base/Modal.vue'
 import Pagination from '../components/Pagination.vue'
-import ResourceImportPanel from '../components/ResourceImportPanel.vue'
 import { useConfirm } from '../composables/useConfirm'
-import { formatLanguagePair, languageOptions } from '../constants/languages'
-import type { TMCollection, TMImportSummary } from '../types/api'
+import { canonicalizeLanguagePair, formatLanguagePair, languageOptions } from '../constants/languages'
+import type { TMCollection } from '../types/api'
 
-type TabKey = 'collections' | 'import'
+interface TMCollectionMergeSummary {
+  collection: TMCollection
+  source_count: number
+  created_rows: number
+  updated_rows: number
+  skipped_rows: number
+  merged_rows: number
+}
 
 const router = useRouter()
 const confirm = useConfirm()
-const activeTab = ref<TabKey>('collections')
 const searchQuery = ref('')
+const filterSourceLanguage = ref('')
+const filterTargetLanguage = ref('')
 const currentPage = ref(1)
 const pageSize = ref(50)
 const selectedIds = ref(new Set<string>())
@@ -33,27 +41,15 @@ const newCollectionName = ref('')
 const newCollectionDescription = ref('')
 const newCollectionSourceLanguage = ref('')
 const newCollectionTargetLanguage = ref('')
-const showCreateForm = ref(false)
+const showCreateDialog = ref(false)
+const showMergeDialog = ref(false)
+const mergeName = ref('')
+const mergeDescription = ref('')
+const mergeMessage = ref('')
+const mergeSubmitting = ref(false)
+const deletingCollections = ref(false)
 
-const selectedTMFile = ref<File | null>(null)
-const tmImporting = ref(false)
-const tmImportMessage = ref('')
-const tmImportSummary = ref<TMImportSummary | null>(null)
 const selectedCollectionId = ref('')
-const importSourceLanguage = ref('')
-const importTargetLanguage = ref('')
-const tmImportSummaryResolved = computed<TMImportSummary>(() => tmImportSummary.value ?? {
-  filename: '',
-  created_rows: 0,
-  updated_rows: 0,
-  skipped_empty_rows: 0,
-  skipped_header_rows: 0,
-  imported_rows: 0,
-  collection_id: null,
-  collection_name: null,
-  source_language: '',
-  target_language: '',
-})
 
 const columns: DataTableColumn[] = [
   { key: 'name', label: '名称', sortable: true },
@@ -64,9 +60,29 @@ const columns: DataTableColumn[] = [
   { key: 'updated_at', label: '更新时间', width: '160px', sortable: true },
 ]
 
-const selectedCollection = computed(() => (
-  tmCollections.value.find((item) => item.id === selectedCollectionId.value) ?? null
+const selectedCollections = computed<TMCollection[]>(() => (
+  Array.from(selectedIds.value)
+    .map((id) => tmCollections.value.find((item) => item.id === id))
+    .filter((item): item is TMCollection => Boolean(item))
 ))
+
+const selectedCollectionEntryCount = computed(() => (
+  selectedCollections.value.reduce((total, collection) => total + collection.entry_count, 0)
+))
+
+const mergeLanguagePairLabel = computed(() => {
+  const first = selectedCollections.value[0]
+  if (!first) {
+    return ''
+  }
+  const pair = canonicalizeLanguagePair(first.source_language, first.target_language)
+  return pair
+    ? formatLanguagePair(pair.source, pair.target)
+    : formatLanguagePair(first.source_language, first.target_language)
+})
+
+const canMergeSelectedCollections = computed(() => !getSelectedCollectionsMergeError())
+const hasLanguageFilter = computed(() => Boolean(filterSourceLanguage.value || filterTargetLanguage.value))
 
 function formatDate(value: string) {
   const d = new Date(value)
@@ -87,23 +103,12 @@ function getErrorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback
 }
 
-function fileBaseName(file: File) {
-  return file.name.replace(/\.[^.]+$/, '')
-}
-
 function ensureLanguagePair(sourceLanguage: string, targetLanguage: string) {
   if (!sourceLanguage || !targetLanguage) {
     throw new Error('请先选择源语言和目标语言。')
   }
   if (sourceLanguage === targetLanguage) {
     throw new Error('源语言和目标语言不能相同。')
-  }
-}
-
-function onTMFileChange(event: Event) {
-  selectedTMFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
-  if (selectedTMFile.value && !selectedCollectionId.value && !newCollectionName.value.trim()) {
-    newCollectionName.value = fileBaseName(selectedTMFile.value)
   }
 }
 
@@ -130,6 +135,8 @@ async function loadCollections() {
   try {
     const { data } = await http.get<TMCollection[]>('/translation-memory/collections')
     tmCollections.value = data
+    const availableIds = new Set(data.map((item) => item.id))
+    selectedIds.value = new Set(Array.from(selectedIds.value).filter((id) => availableIds.has(id)))
     if (selectedCollectionId.value && !data.some((item) => item.id === selectedCollectionId.value)) {
       selectedCollectionId.value = ''
     }
@@ -176,7 +183,7 @@ async function createCollectionFromForm() {
     newCollectionDescription.value = ''
     newCollectionSourceLanguage.value = ''
     newCollectionTargetLanguage.value = ''
-    showCreateForm.value = false
+    showCreateDialog.value = false
     await navigateToCollectionDetail(collection.id)
     collectionMessage.value = `已创建记忆库：${collection.name}`
   } catch (error) {
@@ -186,29 +193,89 @@ async function createCollectionFromForm() {
   }
 }
 
-async function ensureImportCollection() {
-  if (selectedCollectionId.value) {
-    return selectedCollectionId.value
+function openCreateDialog() {
+  collectionMessage.value = ''
+  showCreateDialog.value = true
+}
+
+function closeCreateDialog() {
+  if (collectionSubmitting.value) {
+    return
   }
-  const fallbackName = selectedTMFile.value ? fileBaseName(selectedTMFile.value) : ''
-  const collection = await createCollection(
-    newCollectionName.value || fallbackName,
-    newCollectionDescription.value,
-    importSourceLanguage.value,
-    importTargetLanguage.value,
+  showCreateDialog.value = false
+}
+
+function getSelectedCollectionsMergeError() {
+  const collections = selectedCollections.value
+  if (collections.length < 2) {
+    return '请至少选择两个记忆库进行合并。'
+  }
+  const pairs = collections.map((c) => canonicalizeLanguagePair(c.source_language, c.target_language))
+  if (pairs.some((p) => p === null)) {
+    return '选中的记忆库缺少有效语言对，无法合并。'
+  }
+  const first = pairs[0]!
+  const hasMismatch = pairs.some(
+    (p) => p!.source !== first.source || p!.target !== first.target,
   )
-  selectedCollectionId.value = collection.id
-  return collection.id
+  return hasMismatch ? '只能合并语言对完全一致的记忆库。' : ''
+}
+
+function openMergeDialog() {
+  const error = getSelectedCollectionsMergeError()
+  if (error) {
+    collectionMessage.value = error
+    return
+  }
+  const first = selectedCollections.value[0]
+  mergeName.value = `${first.name}等${selectedCollections.value.length}个记忆库合并`
+  mergeDescription.value = ''
+  mergeMessage.value = ''
+  showMergeDialog.value = true
+}
+
+function closeMergeDialog() {
+  if (mergeSubmitting.value) {
+    return
+  }
+  showMergeDialog.value = false
+}
+
+async function mergeSelectedCollections() {
+  const error = getSelectedCollectionsMergeError()
+  if (error) {
+    mergeMessage.value = error
+    return
+  }
+  if (!mergeName.value.trim()) {
+    mergeMessage.value = '合并后的记忆库名称不能为空。'
+    return
+  }
+
+  mergeSubmitting.value = true
+  mergeMessage.value = ''
+  try {
+    const { data } = await http.post<TMCollectionMergeSummary>('/translation-memory/collections/merge', {
+      source_collection_ids: selectedCollections.value.map((collection) => collection.id),
+      name: mergeName.value,
+      description: mergeDescription.value,
+    })
+    showMergeDialog.value = false
+    await loadCollections()
+    selectedIds.value = new Set([data.collection.id])
+    selectedCollectionId.value = data.collection.id
+    collectionMessage.value = `已合并 ${data.source_count} 个记忆库，生成“${data.collection.name}”：新增 ${data.created_rows} 条，覆盖 ${data.updated_rows} 条。`
+  } catch (error) {
+    mergeMessage.value = getErrorMessage(error, '记忆库合并失败。')
+  } finally {
+    mergeSubmitting.value = false
+  }
 }
 
 async function deleteCollection(collection: any) {
-  if (collection.entry_count > 0) {
-    collectionMessage.value = '已有 TM 记录的记忆库不能直接删除。'
-    return
-  }
   const confirmed = await confirm({
     title: '删除记忆库',
-    message: `确定删除记忆库“${collection.name}”吗？`,
+    message: `确定删除记忆库“${collection.name}”吗？其中 ${collection.entry_count} 条 TM 记录也会一起删除。`,
     confirmText: '删除',
     danger: true,
   })
@@ -216,63 +283,65 @@ async function deleteCollection(collection: any) {
     return
   }
   collectionMessage.value = ''
+  deletingCollections.value = true
   try {
     await http.delete(`/translation-memory/collections/${collection.id}`)
     if (selectedCollectionId.value === collection.id) {
       selectedCollectionId.value = ''
     }
+    selectedIds.value = new Set(Array.from(selectedIds.value).filter((id) => id !== collection.id))
     await loadCollections()
     collectionMessage.value = '记忆库已删除。'
   } catch (error) {
     collectionMessage.value = getErrorMessage(error, '记忆库删除失败。')
+  } finally {
+    deletingCollections.value = false
   }
 }
 
-async function uploadTMWorkbook() {
-  if (!selectedTMFile.value) {
-    tmImportMessage.value = '请先选择要导入的 Excel 文件。'
+async function deleteSelectedCollections() {
+  const collections = selectedCollections.value
+  if (collections.length === 0) {
+    return
+  }
+  const confirmed = await confirm({
+    title: '删除选中的记忆库',
+    message: `确定删除选中的 ${collections.length} 个记忆库吗？其中 ${selectedCollectionEntryCount.value} 条 TM 记录也会一起删除。`,
+    confirmText: '删除',
+    danger: true,
+  })
+  if (!confirmed) {
     return
   }
 
+  collectionMessage.value = ''
+  deletingCollections.value = true
   try {
-    ensureLanguagePair(importSourceLanguage.value, importTargetLanguage.value)
-  } catch (error) {
-    tmImportMessage.value = error instanceof Error ? error.message : '请先选择语言对。'
-    tmImportSummary.value = null
-    return
-  }
-
-  tmImportMessage.value = ''
-  tmImportSummary.value = null
-  tmImporting.value = true
-  try {
-    const collectionId = await ensureImportCollection()
-    const formData = new FormData()
-    formData.append('file', selectedTMFile.value)
-    formData.append('collection_id', collectionId)
-    formData.append('source_language', importSourceLanguage.value)
-    formData.append('target_language', importTargetLanguage.value)
-
-    const { data } = await http.post<TMImportSummary>('/translation-memory/import-xlsx', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    })
-    tmImportSummary.value = data
-    tmImportMessage.value = `导入完成：${data.filename}`
-    selectedTMFile.value = null
-    const fileInput = document.getElementById('tm-upload-file') as HTMLInputElement | null
-    if (fileInput) {
-      fileInput.value = ''
+    for (const collection of collections) {
+      await http.delete(`/translation-memory/collections/${collection.id}`)
     }
+    if (collections.some((collection) => collection.id === selectedCollectionId.value)) {
+      selectedCollectionId.value = ''
+    }
+    selectedIds.value = new Set()
     await loadCollections()
+    collectionMessage.value = `已删除 ${collections.length} 个记忆库。`
   } catch (error) {
-    tmImportMessage.value = getErrorMessage(error, 'TM 记忆库导入失败。')
+    collectionMessage.value = getErrorMessage(error, '记忆库删除失败。')
+    await loadCollections()
   } finally {
-    tmImporting.value = false
+    deletingCollections.value = false
   }
 }
 
 const filteredCollections = computed(() => {
   let data = tmCollections.value
+  if (filterSourceLanguage.value) {
+    data = data.filter((item) => item.source_language === filterSourceLanguage.value)
+  }
+  if (filterTargetLanguage.value) {
+    data = data.filter((item) => item.target_language === filterTargetLanguage.value)
+  }
   if (searchQuery.value.trim()) {
     const q = searchQuery.value.trim().toLowerCase()
     data = data.filter((item) => (
@@ -319,20 +388,13 @@ function handleSelect(ids: Set<string>) {
   selectedIds.value = ids
 }
 
-watch(searchQuery, () => {
-  currentPage.value = 1
-})
+function clearLanguageFilter() {
+  filterSourceLanguage.value = ''
+  filterTargetLanguage.value = ''
+}
 
-watch(selectedCollection, (collection) => {
-  if (!collection) {
-    return
-  }
-  if (collection.source_language) {
-    importSourceLanguage.value = collection.source_language
-  }
-  if (collection.target_language) {
-    importTargetLanguage.value = collection.target_language
-  }
+watch([searchQuery, filterSourceLanguage, filterTargetLanguage], () => {
+  currentPage.value = 1
 })
 
 onMounted(() => {
@@ -342,105 +404,84 @@ onMounted(() => {
 
 <template>
   <div>
-    <div v-if="showCreateForm" class="upload-panel">
-      <div class="section-title">创建记忆库</div>
-      <div class="upload-form form-grid-2">
-        <label class="field">
-          <span class="field__label">记忆库名称</span>
-          <input
-            v-model="newCollectionName"
-            class="field__control"
-            type="text"
-            placeholder="例如：技术文档中英记忆库"
-          />
-        </label>
-
-        <label class="field">
-          <span class="field__label">说明</span>
-          <input
-            v-model="newCollectionDescription"
-            class="field__control"
-            type="text"
-            placeholder="可选"
-          />
-        </label>
-
-        <label class="field">
-          <span class="field__label">源语言</span>
-          <select v-model="newCollectionSourceLanguage" class="field__control">
-            <option value="">请选择</option>
-            <option v-for="option in languageOptions" :key="option.code" :value="option.code">
-              {{ option.label }}
-            </option>
-          </select>
-        </label>
-
-        <label class="field">
-          <span class="field__label">目标语言</span>
-          <select v-model="newCollectionTargetLanguage" class="field__control">
-            <option value="">请选择</option>
-            <option v-for="option in languageOptions" :key="option.code" :value="option.code">
-              {{ option.label }}
-            </option>
-          </select>
-        </label>
-
-        <div class="field-actions">
-          <button
-            class="button button--primary"
-            type="button"
-            :disabled="collectionSubmitting"
-            @click="createCollectionFromForm"
-          >
-            <Loader2 v-if="collectionSubmitting" class="lucide-spin" />
-            <span v-else>创建记忆库</span>
-          </button>
-        </div>
-      </div>
-      <p v-if="collectionMessage" class="form-message" style="margin-top: 8px;">{{ collectionMessage }}</p>
-    </div>
-
     <div class="table-page">
       <div class="table-page__header">
-        <div class="tab-bar" style="border-bottom: none;">
-          <button
-            class="tab-item"
-            :class="{ 'is-active': activeTab === 'collections' }"
-            @click="activeTab = 'collections'"
-          >记忆库集合</button>
-          <button
-            class="tab-item"
-            :class="{ 'is-active': activeTab === 'import' }"
-            @click="activeTab = 'import'"
-          >导入 TM</button>
+        <h2 class="table-page__title">记忆库集合</h2>
+      </div>
+
+      <div class="table-toolbar" style="padding: 8px 20px;">
+        <div class="table-toolbar__left">
+          <div class="table-page__search">
+            <Search :size="14" class="table-page__search-icon" />
+            <input
+              v-model="searchQuery"
+              class="table-page__search-input"
+              type="text"
+              placeholder="搜索名称、说明或语言对..."
+            />
+          </div>
+          <div class="resource-language-filter" aria-label="语言对筛选">
+            <select v-model="filterSourceLanguage" class="resource-language-filter__select" title="筛选源语言">
+              <option value="">源语言：全部</option>
+              <option v-for="option in languageOptions" :key="option.code" :value="option.code">
+                {{ option.label }}
+              </option>
+            </select>
+            <span class="resource-language-filter__arrow">→</span>
+            <select v-model="filterTargetLanguage" class="resource-language-filter__select" title="筛选目标语言">
+              <option value="">目标语言：全部</option>
+              <option v-for="option in languageOptions" :key="option.code" :value="option.code">
+                {{ option.label }}
+              </option>
+            </select>
+            <button
+              v-if="hasLanguageFilter"
+              class="resource-language-filter__clear"
+              type="button"
+              title="清空语言对筛选"
+              @click="clearLanguageFilter"
+            >
+              <X :size="14" />
+            </button>
+          </div>
+          <button class="button button--primary" type="button" @click="openCreateDialog">
+            <Plus :size="14" /> 创建
+          </button>
+          <button class="button" type="button" :disabled="loadingCollections" @click="loadCollections">
+            {{ loadingCollections ? '刷新中...' : '刷新' }}
+          </button>
+          <span style="font-size: 13px; color: var(--ink-500);">
+            已选择：{{ selectedIds.size }}　总数：{{ totalCount }}
+          </span>
         </div>
       </div>
 
-      <template v-if="activeTab === 'collections'">
-        <div class="table-toolbar" style="padding: 8px 20px;">
-          <div class="table-toolbar__left">
-            <div class="table-page__search">
-              <Search :size="14" class="table-page__search-icon" />
-              <input
-                v-model="searchQuery"
-                class="table-page__search-input"
-                type="text"
-                placeholder="搜索名称、说明或语言对..."
-              />
-            </div>
-            <span style="font-size: 13px; color: var(--ink-500);">
-              已选择：{{ selectedIds.size }}　总数：{{ totalCount }}
-            </span>
-          </div>
-          <div class="table-toolbar__right">
-            <button class="button" type="button" @click="showCreateForm = !showCreateForm">
-              <Plus :size="14" /> {{ showCreateForm ? '收起' : '创建' }}
+        <div v-if="selectedIds.size > 0" class="resource-bulk-bar">
+          <span>已选择 {{ selectedIds.size }} 个记忆库，包含 {{ selectedCollectionEntryCount }} 条 TM 记录</span>
+          <div class="resource-bulk-bar__actions">
+            <button
+              class="button"
+              type="button"
+              :disabled="!canMergeSelectedCollections || mergeSubmitting"
+              :title="canMergeSelectedCollections ? '合并选中的记忆库' : getSelectedCollectionsMergeError()"
+              @click="openMergeDialog"
+            >
+              <GitMerge :size="14" />
+              合并
             </button>
-            <button class="button" type="button" :disabled="loadingCollections" @click="loadCollections">
-              {{ loadingCollections ? '刷新中...' : '刷新' }}
+            <button
+              class="button button--danger"
+              type="button"
+              :disabled="deletingCollections"
+              @click="deleteSelectedCollections"
+            >
+              <Trash2 :size="14" />
+              删除
             </button>
           </div>
         </div>
+
+        <p v-if="collectionMessage" class="form-message table-page__message">{{ collectionMessage }}</p>
 
         <div class="table-page__body">
           <DataTable
@@ -505,7 +546,7 @@ onMounted(() => {
                   class="data-table__actions-btn"
                   type="button"
                   title="删除"
-                  :disabled="row.entry_count > 0"
+                  :disabled="deletingCollections"
                   @click="deleteCollection(row)"
                 >
                   <Trash2 :size="14" />
@@ -523,118 +564,132 @@ onMounted(() => {
             @update:page-size="pageSize = $event"
           />
         </div>
-      </template>
-
-      <template v-else-if="false">
-        <div class="table-page__body">
-          <div class="upload-panel" style="border: none; box-shadow: none; margin: 0; padding: 0;">
-            <p class="hint-text" style="margin-bottom: 12px;">
-              Excel 约定：第一列为源文，第二列为译文。导入时必须明确选择语言对，系统会把语言标签同步写入记忆库和 TM 条目。
-            </p>
-
-            <div class="upload-form form-grid-2" style="margin-top: 0;">
-              <label class="field">
-                <span class="field__label">目标记忆库</span>
-                <select v-model="selectedCollectionId" class="field__control">
-                  <option value="">新建记忆库</option>
-                  <option v-for="collection in tmCollections" :key="collection.id" :value="collection.id">
-                    {{ collection.name }}（{{ formatLanguagePair(collection.source_language, collection.target_language) }} / {{ collection.entry_count }} 条）
-                  </option>
-                </select>
-              </label>
-
-              <label class="field">
-                <span class="field__label">Excel 文件</span>
-                <input
-                  id="tm-upload-file"
-                  class="field__control"
-                  type="file"
-                  accept=".xlsx"
-                  @change="onTMFileChange"
-                />
-              </label>
-
-              <label class="field">
-                <span class="field__label">源语言</span>
-                <select v-model="importSourceLanguage" class="field__control">
-                  <option value="">请选择</option>
-                  <option v-for="option in languageOptions" :key="option.code" :value="option.code">
-                    {{ option.label }}
-                  </option>
-                </select>
-              </label>
-
-              <label class="field">
-                <span class="field__label">目标语言</span>
-                <select v-model="importTargetLanguage" class="field__control">
-                  <option value="">请选择</option>
-                  <option v-for="option in languageOptions" :key="option.code" :value="option.code">
-                    {{ option.label }}
-                  </option>
-                </select>
-              </label>
-
-              <div class="field-actions">
-                <button
-                  class="button button--primary"
-                  type="button"
-                  :disabled="tmImporting"
-                  @click="uploadTMWorkbook"
-                >
-                  <Loader2 v-if="tmImporting" class="lucide-spin" />
-                  <Upload v-else :size="14" />
-                  {{ tmImporting ? '导入中...' : '导入记忆库' }}
-                </button>
-              </div>
-            </div>
-
-            <p v-if="tmImportMessage" class="form-message" :class="{ 'is-error': !tmImportSummary }" style="margin-top: 12px;">
-              {{ tmImportMessage }}
-            </p>
-          </div>
-
-          <div v-if="tmImportSummary" style="margin-top: 16px;">
-            <div class="section-title">导入结果</div>
-            <div class="summary-grid summary-grid--wide">
-              <div class="summary-item">
-                <strong>{{ tmImportSummaryResolved.collection_name }}</strong>
-                <span>目标记忆库</span>
-              </div>
-              <div class="summary-item">
-                <strong>{{ formatLanguagePair(tmImportSummaryResolved.source_language, tmImportSummaryResolved.target_language) }}</strong>
-                <span>语言对</span>
-              </div>
-              <div class="summary-item">
-                <strong>{{ tmImportSummaryResolved.imported_rows }}</strong>
-                <span>写入总行数</span>
-              </div>
-              <div class="summary-item">
-                <strong>{{ tmImportSummaryResolved.created_rows }}</strong>
-                <span>新增</span>
-              </div>
-              <div class="summary-item">
-                <strong>{{ tmImportSummaryResolved.updated_rows }}</strong>
-                <span>更新</span>
-              </div>
-              <div class="summary-item">
-                <strong>{{ tmImportSummaryResolved.skipped_header_rows }}</strong>
-                <span>跳过表头</span>
-              </div>
-              <div class="summary-item">
-                <strong>{{ tmImportSummaryResolved.skipped_empty_rows }}</strong>
-                <span>跳过空行</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      </template>
-
-      <template v-else>
-        <div class="table-page__body">
-          <ResourceImportPanel mode="tm" @imported="loadCollections" />
-        </div>
-      </template>
     </div>
+
+    <Modal
+      :open="showCreateDialog"
+      title="创建记忆库"
+      description="填写名称、说明和语言对后创建新的记忆库。"
+      width="min(620px, calc(100vw - 32px))"
+      @close="closeCreateDialog"
+    >
+      <div class="upload-form form-grid-2">
+        <label class="field">
+          <span class="field__label">记忆库名称</span>
+          <input
+            v-model="newCollectionName"
+            class="field__control"
+            type="text"
+            placeholder="例如：技术文档中英记忆库"
+          />
+        </label>
+
+        <label class="field">
+          <span class="field__label">说明</span>
+          <input
+            v-model="newCollectionDescription"
+            class="field__control"
+            type="text"
+            placeholder="可选"
+          />
+        </label>
+
+        <label class="field">
+          <span class="field__label">源语言</span>
+          <select v-model="newCollectionSourceLanguage" class="field__control">
+            <option value="">请选择</option>
+            <option v-for="option in languageOptions" :key="option.code" :value="option.code">
+              {{ option.label }}
+            </option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span class="field__label">目标语言</span>
+          <select v-model="newCollectionTargetLanguage" class="field__control">
+            <option value="">请选择</option>
+            <option v-for="option in languageOptions" :key="option.code" :value="option.code">
+              {{ option.label }}
+            </option>
+          </select>
+        </label>
+      </div>
+
+      <p v-if="collectionMessage" class="form-message resource-modal-message">{{ collectionMessage }}</p>
+
+      <template #footer>
+        <button class="button" type="button" :disabled="collectionSubmitting" @click="closeCreateDialog">取消</button>
+        <button
+          class="button button--primary"
+          type="button"
+          :disabled="collectionSubmitting"
+          @click="createCollectionFromForm"
+        >
+          <Loader2 v-if="collectionSubmitting" class="lucide-spin" :size="14" />
+          <Plus v-else :size="14" />
+          {{ collectionSubmitting ? '创建中...' : '创建记忆库' }}
+        </button>
+      </template>
+    </Modal>
+
+    <Modal
+      :open="showMergeDialog"
+      title="合并记忆库"
+      :description="`将 ${selectedCollections.length} 个同语言对记忆库合并为一个新库。`"
+      width="min(680px, calc(100vw - 32px))"
+      @close="closeMergeDialog"
+    >
+      <div class="resource-merge-summary">
+        <span class="tag">语言对：{{ mergeLanguagePairLabel }}</span>
+        <span class="tag">来源：{{ selectedCollections.length }} 个</span>
+        <span class="tag">TM 记录：{{ selectedCollectionEntryCount }} 条</span>
+      </div>
+
+      <div class="resource-merge-list">
+        <div v-for="collection in selectedCollections" :key="collection.id" class="resource-merge-item">
+          <strong>{{ collection.name }}</strong>
+          <span>{{ formatLanguagePair(collection.source_language, collection.target_language) }} / {{ collection.entry_count }} 条</span>
+        </div>
+      </div>
+
+      <div class="upload-form form-grid-2 resource-merge-form">
+        <label class="field">
+          <span class="field__label">合并后名称</span>
+          <input
+            v-model="mergeName"
+            class="field__control"
+            type="text"
+            placeholder="例如：产品资料中英合并记忆库"
+          />
+        </label>
+
+        <label class="field">
+          <span class="field__label">说明</span>
+          <input
+            v-model="mergeDescription"
+            class="field__control"
+            type="text"
+            placeholder="可选"
+          />
+        </label>
+      </div>
+
+      <p v-if="mergeMessage" class="form-message is-error resource-modal-message">{{ mergeMessage }}</p>
+
+      <template #footer>
+        <button class="button" type="button" :disabled="mergeSubmitting" @click="closeMergeDialog">取消</button>
+        <button
+          class="button button--primary"
+          type="button"
+          :disabled="mergeSubmitting"
+          @click="mergeSelectedCollections"
+        >
+          <Loader2 v-if="mergeSubmitting" class="lucide-spin" :size="14" />
+          <GitMerge v-else :size="14" />
+          {{ mergeSubmitting ? '合并中...' : '合并记忆库' }}
+        </button>
+      </template>
+    </Modal>
   </div>
 </template>
 
@@ -650,5 +705,82 @@ onMounted(() => {
 
 .tm-link:hover {
   color: var(--brand-600);
+}
+
+.resource-bulk-bar {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  margin: 0 20px 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: var(--brand-050);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.resource-bulk-bar__actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.table-page__message {
+  margin: 0 20px 12px;
+}
+
+.resource-modal-message {
+  margin-top: 12px;
+}
+
+.resource-merge-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.resource-merge-list {
+  display: grid;
+  gap: 8px;
+  max-height: 180px;
+  overflow: auto;
+  margin-bottom: 16px;
+}
+
+.resource-merge-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-muted);
+}
+
+.resource-merge-item span {
+  color: var(--text-muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.resource-merge-form {
+  margin-top: 0;
+}
+
+@media (max-width: 720px) {
+  .resource-bulk-bar,
+  .resource-merge-item {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .resource-bulk-bar__actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
 }
 </style>

@@ -8,6 +8,7 @@ from html import escape
 import hashlib
 from io import BytesIO
 from itertools import count
+import json
 import mimetypes
 import posixpath
 import re
@@ -68,6 +69,19 @@ CELL_PARAGRAPH_BREAK_SENTINEL = "\uE000"
 PAGE_BREAK_SENTINEL = "\uE001"
 DOCX_PARSE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 DOCX_PARSE_CACHE_VERSION = "3"
+DOCUMENT_PARSE_MODE_FULL = "full"
+DOCUMENT_PARSE_MODE_BODY_ONLY = "body_only"
+SUPPORTED_DOCUMENT_PARSE_MODES = {
+    DOCUMENT_PARSE_MODE_FULL,
+    DOCUMENT_PARSE_MODE_BODY_ONLY,
+}
+DEFAULT_DOCUMENT_PARSE_OPTIONS = {
+    "include_headers_footers": True,
+    "include_footnotes_endnotes": True,
+    "include_comments": True,
+    "clean_format": False,
+}
+DOCUMENT_PARSE_OPTION_FIELDS = set(DEFAULT_DOCUMENT_PARSE_OPTIONS)
 EMU_PER_PIXEL = 9525
 MATH_PLACEHOLDER_TEMPLATE = "⟦MATH_{index}⟧"
 OMML_ATOMIC_TAGS = {
@@ -144,6 +158,7 @@ class StoryPart:
     root: ET.Element
     rels: dict[str, str]
     package: DocxPackage
+    parse_options: dict[str, bool] = field(default_factory=lambda: dict(DEFAULT_DOCUMENT_PARSE_OPTIONS))
 
 
 @dataclass(frozen=True)
@@ -440,8 +455,16 @@ def build_docx_workspace(
     similarity_threshold: float = 0.6,
     include_matches: bool = True,
     collection_ids: list[UUID] | None = None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
 ) -> dict:
-    parsed_workspace = _get_cached_parsed_workspace(raw_bytes)
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
+    parsed_workspace = _get_cached_parsed_workspace(
+        raw_bytes,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
     segments = parsed_workspace["segments"]
     match_stats = _build_empty_match_stats()
 
@@ -484,7 +507,57 @@ def build_docx_workspace(
     }
 
 
-def parse_docx_workspace(raw_bytes: bytes) -> dict:
+def normalize_document_parse_mode(value: str | None) -> str:
+    normalized = (value or DOCUMENT_PARSE_MODE_FULL).strip().lower().replace("-", "_")
+    if normalized in {"complete", "rich"}:
+        normalized = DOCUMENT_PARSE_MODE_FULL
+    if normalized in {"body", "main_body"}:
+        normalized = DOCUMENT_PARSE_MODE_BODY_ONLY
+    if normalized not in SUPPORTED_DOCUMENT_PARSE_MODES:
+        raise ValueError("不支持的文档内容解析处理选项。")
+    return normalized
+
+
+def normalize_document_parse_options(
+    value: Mapping[str, object] | str | None = None,
+    document_parse_mode: str | None = None,
+) -> dict[str, bool]:
+    raw_options: Mapping[str, object] = {}
+    if isinstance(value, str) and value.strip():
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("文档设置不是有效的 JSON。") from exc
+        if not isinstance(decoded, Mapping):
+            raise ValueError("文档设置必须是对象。")
+        raw_options = decoded
+    elif isinstance(value, Mapping):
+        raw_options = value
+
+    options = dict(DEFAULT_DOCUMENT_PARSE_OPTIONS)
+    for key in DOCUMENT_PARSE_OPTION_FIELDS:
+        if key in raw_options:
+            options[key] = bool(raw_options[key])
+
+    if normalize_document_parse_mode(document_parse_mode) == DOCUMENT_PARSE_MODE_BODY_ONLY:
+        options["include_headers_footers"] = False
+        options["include_footnotes_endnotes"] = False
+        options["include_comments"] = False
+
+    return options
+
+
+def serialize_document_parse_options(options: Mapping[str, object] | str | None = None) -> str:
+    return json.dumps(normalize_document_parse_options(options), ensure_ascii=False, sort_keys=True)
+
+
+def parse_docx_workspace(
+    raw_bytes: bytes,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
+) -> dict:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
     package = DocxPackage(raw_bytes)
     numbering_schema = _build_numbering_schema(package)
     sentence_counter = count(1)
@@ -492,7 +565,11 @@ def parse_docx_workspace(raw_bytes: bytes) -> dict:
 
     html_parts: list[str] = []
     segments: list[dict] = []
-    for story in _build_story_parts(package):
+    for story in _build_story_parts(
+        package,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    ):
         numbering_state = NumberingState(schema=numbering_schema)
         story_html_parts, story_segments = _render_block_sequence(
             container=story.root,
@@ -522,26 +599,63 @@ def parse_docx_workspace(raw_bytes: bytes) -> dict:
     }
 
 
-def build_docx_preview_html(raw_bytes: bytes) -> str:
-    return _get_cached_parsed_workspace(raw_bytes)["document_html"]
+def build_docx_preview_html(
+    raw_bytes: bytes,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
+) -> str:
+    return _get_cached_parsed_workspace(
+        raw_bytes,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )["document_html"]
 
 
-def get_cached_docx_workspace(raw_bytes: bytes) -> dict:
-    return _get_cached_parsed_workspace(raw_bytes)
+def get_cached_docx_workspace(
+    raw_bytes: bytes,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
+) -> dict:
+    return _get_cached_parsed_workspace(
+        raw_bytes,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
 
 
-def _get_cached_parsed_workspace(raw_bytes: bytes) -> dict:
-    cache_key = f"preview:workspace:v{DOCX_PARSE_CACHE_VERSION}:{hashlib.sha256(raw_bytes).hexdigest()}"
+def _get_cached_parsed_workspace(
+    raw_bytes: bytes,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
+) -> dict:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
+    options_key = json.dumps(document_parse_options, ensure_ascii=False, sort_keys=True)
+    cache_key = (
+        f"preview:workspace:v{DOCX_PARSE_CACHE_VERSION}:"
+        f"{document_parse_mode}:{hashlib.sha256(options_key.encode('utf-8')).hexdigest()}:"
+        f"{hashlib.sha256(raw_bytes).hexdigest()}"
+    )
     cached_workspace = get_json(cache_key)
     if isinstance(cached_workspace, dict):
         return copy.deepcopy(cached_workspace)
 
-    parsed_workspace = parse_docx_workspace(raw_bytes)
+    parsed_workspace = parse_docx_workspace(
+        raw_bytes,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
     set_json(cache_key, parsed_workspace, ttl_seconds=DOCX_PARSE_CACHE_TTL_SECONDS)
     return copy.deepcopy(parsed_workspace)
 
 
-def _build_story_parts(package: DocxPackage) -> list[StoryPart]:
+def _build_story_parts(
+    package: DocxPackage,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
+) -> list[StoryPart]:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
     document_part_name = "word/document.xml"
     document_root = package.read_xml(document_part_name)
     if document_root is None:
@@ -553,8 +667,17 @@ def _build_story_parts(package: DocxPackage) -> list[StoryPart]:
         raise ValueError("word/document.xml does not contain a body.")
 
     stories: list[StoryPart] = []
-    header_parts = _collect_story_reference_parts(body, document_rels, "headerReference")
-    footer_parts = _collect_story_reference_parts(body, document_rels, "footerReference")
+    include_extended_stories = document_parse_mode == DOCUMENT_PARSE_MODE_FULL
+    header_parts = (
+        _collect_story_reference_parts(body, document_rels, "headerReference")
+        if include_extended_stories and document_parse_options["include_headers_footers"]
+        else []
+    )
+    footer_parts = (
+        _collect_story_reference_parts(body, document_rels, "footerReference")
+        if include_extended_stories and document_parse_options["include_headers_footers"]
+        else []
+    )
 
     for index, part_name in enumerate(header_parts, start=1):
         root = package.read_xml(part_name)
@@ -568,6 +691,7 @@ def _build_story_parts(package: DocxPackage) -> list[StoryPart]:
                 root=root,
                 rels=package.read_relationships(part_name),
                 package=package,
+                parse_options=document_parse_options,
             )
         )
 
@@ -579,10 +703,38 @@ def _build_story_parts(package: DocxPackage) -> list[StoryPart]:
             root=body,
             rels=document_rels,
             package=package,
+            parse_options=document_parse_options,
         )
     )
-    stories.extend(_build_note_story_parts(package, "word/footnotes.xml", "footnote", "Footnote"))
-    stories.extend(_build_note_story_parts(package, "word/endnotes.xml", "endnote", "Endnote"))
+    if include_extended_stories and document_parse_options["include_footnotes_endnotes"]:
+        stories.extend(
+            _build_note_story_parts(
+                package,
+                "word/footnotes.xml",
+                "footnote",
+                "Footnote",
+                document_parse_options=document_parse_options,
+            )
+        )
+        stories.extend(
+            _build_note_story_parts(
+                package,
+                "word/endnotes.xml",
+                "endnote",
+                "Endnote",
+                document_parse_options=document_parse_options,
+            )
+        )
+    if include_extended_stories and document_parse_options["include_comments"]:
+        stories.extend(
+            _build_note_story_parts(
+                package,
+                "word/comments.xml",
+                "comment",
+                "Comment",
+                document_parse_options=document_parse_options,
+            )
+        )
 
     for index, part_name in enumerate(footer_parts, start=1):
         root = package.read_xml(part_name)
@@ -596,6 +748,7 @@ def _build_story_parts(package: DocxPackage) -> list[StoryPart]:
                 root=root,
                 rels=package.read_relationships(part_name),
                 package=package,
+                parse_options=document_parse_options,
             )
         )
 
@@ -630,6 +783,7 @@ def _build_note_story_parts(
     part_name: str,
     kind: str,
     label_prefix: str,
+    document_parse_options: Mapping[str, bool] | None = None,
 ) -> list[StoryPart]:
     root = package.read_xml(part_name)
     if root is None:
@@ -652,6 +806,7 @@ def _build_note_story_parts(
                 root=note,
                 rels=rels,
                 package=package,
+                parse_options=dict(document_parse_options or DEFAULT_DOCUMENT_PARSE_OPTIONS),
             )
         )
     return stories
@@ -816,7 +971,7 @@ def _collect_paragraph_render_data(
         embedded_html_parts=embedded_html_parts,
         embedded_segments=embedded_segments,
         numbering_text=numbering_text,
-        paragraph_css=_build_paragraph_css(paragraph),
+        paragraph_css="" if story.parse_options.get("clean_format") else _build_paragraph_css(paragraph),
         suppressed_page_number_field=parse_state.suppressed_page_number_field,
     )
 
@@ -999,7 +1154,7 @@ def _render_table(
             if not cell_inner_html_parts:
                 cell_inner_html_parts.append('<p class="doc-paragraph doc-empty"><br></p>')
 
-            cell_style = _build_cell_css(cell)
+            cell_style = "" if story.parse_options.get("clean_format") else _build_cell_css(cell)
             cell_style_attr = f' style="{cell_style}"' if cell_style else ""
             cell_span_attrs = _build_cell_span_attrs(cell)
             cell_html_parts.append(
@@ -1481,7 +1636,8 @@ def _collect_inline_content(
         hyperlink = _resolve_hyperlink_target(node, story.rels) or hyperlink
 
     if node.tag == _qn("w", "r"):
-        inherited_css = _merge_css(inherited_css, _build_run_css(node))
+        if not story.parse_options.get("clean_format"):
+            inherited_css = _merge_css(inherited_css, _build_run_css(node))
 
     if node.tag == _qn("w", "fldChar"):
         _update_field_state(node, story.kind, parse_state)
@@ -2251,7 +2407,7 @@ def _build_cell_span_attrs(cell: ET.Element) -> str:
 def _resolve_segment_block_type(story_kind: str, block_type: str) -> str:
     if block_type in {"table_cell", "textbox"}:
         return block_type
-    if story_kind in {"header", "footer", "footnote", "endnote"}:
+    if story_kind in {"header", "footer", "footnote", "endnote", "comment"}:
         return story_kind
     return "paragraph"
 
@@ -2304,6 +2460,205 @@ def _build_empty_match_stats() -> MatchStats:
         total_match_ms=0.0,
         fuzzy_candidates_evaluated=0,
     )
+
+
+def build_workspace_with_adapters(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    similarity_threshold: float = 0.6,
+) -> dict:
+    """使用适配器系统构建翻译工作台
+
+    支持多种文档格式：TXT、DOCX、PDF、PPTX、DITA、SVG 等。
+
+    Args:
+        db: 数据库会话
+        raw_bytes: 文件字节内容
+        filename: 文件名
+        similarity_threshold: 模糊匹配阈值
+
+    Returns:
+        dict: 包含 document_html、segments、match_stats 的字典
+    """
+    from pathlib import Path
+    from app.services.adapters import get_registry, ParseError, FileTooLargeError
+
+    extension = Path(filename).suffix.lower()
+
+    # 对于 DOCX，使用原有的专用解析器以保持完整的格式支持
+    if extension == ".docx":
+        return build_docx_workspace(
+            db=db,
+            raw_bytes=raw_bytes,
+            similarity_threshold=similarity_threshold,
+        )
+
+    # 其他格式使用适配器系统
+    try:
+        registry = get_registry()
+        adapter = registry.get_adapter(filename)
+        result = adapter.parse_with_validation(raw_bytes, filename)
+    except (ParseError, FileTooLargeError) as e:
+        raise ValueError(str(e)) from e
+    except Exception as e:
+        # 捕获其他异常（如 OCRRequiredError）
+        raise ValueError(f"解析文件失败: {str(e)}") from e
+
+    # 构建 HTML 和 segments
+    sentence_counter = count(1)
+    html_parts: list[str] = []
+    segments: list[dict] = []
+
+    for block_index, node in enumerate(result.ast.nodes):
+        node_html, node_segments = _render_ast_node(
+            node=node,
+            sentence_counter=sentence_counter,
+            block_index=block_index,
+        )
+        html_parts.append(node_html)
+        segments.extend(node_segments)
+
+    # 执行 TM 匹配
+    match_stats = _build_empty_match_stats()
+    if segments:
+        match_results, match_stats = match_sentences_with_stats(
+            db=db,
+            sentences=[segment["source_text"] for segment in segments],
+            similarity_threshold=similarity_threshold,
+        )
+        for segment, match in zip(segments, match_results, strict=False):
+            segment["status"] = match.status
+            segment["score"] = match.score
+            segment["matched_source_text"] = match.matched_source_text
+            segment["target_text"] = match.target_text or ""
+
+    return {
+        "document_html": "".join(html_parts) or '<p class="doc-paragraph doc-empty"><br></p>',
+        "segments": segments,
+        "match_stats": {
+            "total_input_sentences": match_stats.total_input_sentences,
+            "prepared_sentences": match_stats.prepared_sentences,
+            "unique_sentences": match_stats.unique_sentences,
+            "exact_hits": match_stats.exact_hits,
+            "fuzzy_hits": match_stats.fuzzy_hits,
+            "none_hits": match_stats.none_hits,
+            "exact_phase_ms": match_stats.exact_phase_ms,
+            "fuzzy_phase_ms": match_stats.fuzzy_phase_ms,
+            "total_match_ms": match_stats.total_match_ms,
+            "fuzzy_candidates_evaluated": match_stats.fuzzy_candidates_evaluated,
+        },
+    }
+
+
+def _render_ast_node(
+    node,
+    sentence_counter,
+    block_index: int,
+    block_type: str = "paragraph",
+) -> tuple[str, list[dict]]:
+    """渲染 AST 节点为 HTML"""
+    from app.services.adapters.models import NodeType
+
+    html_parts: list[str] = []
+    segments: list[dict] = []
+
+    if node.text_content:
+        paragraph_html, paragraph_segments = _render_paragraph(
+            text=node.text_content,
+            sentence_counter=sentence_counter,
+            block_index=block_index,
+            block_type=block_type,
+        )
+        html_parts.append(paragraph_html)
+        segments.extend(paragraph_segments)
+
+    if node.children:
+        if node.node_type == NodeType.TABLE:
+            table_html, table_segments = _render_ast_table(
+                node=node,
+                sentence_counter=sentence_counter,
+                block_index=block_index,
+            )
+            html_parts.append(table_html)
+            segments.extend(table_segments)
+        else:
+            for child in node.children:
+                child_html, child_segments = _render_ast_node(
+                    node=child,
+                    sentence_counter=sentence_counter,
+                    block_index=block_index,
+                    block_type=block_type,
+                )
+                html_parts.append(child_html)
+                segments.extend(child_segments)
+
+    return "".join(html_parts), segments
+
+
+def _render_ast_table(
+    node,
+    sentence_counter,
+    block_index: int,
+) -> tuple[str, list[dict]]:
+    """渲染 AST 表格节点为 HTML"""
+    from app.services.adapters.models import NodeType
+
+    row_html_parts: list[str] = []
+    table_segments: list[dict] = []
+
+    if not node.children:
+        return "", []
+
+    for row_index, row_node in enumerate(node.children):
+        if row_node.node_type != NodeType.TABLE_ROW:
+            continue
+
+        cell_html_parts: list[str] = []
+
+        if row_node.children:
+            for cell_index, cell_node in enumerate(row_node.children):
+                cell_paragraphs: list[str] = []
+
+                if cell_node.text_content:
+                    paragraph_html, paragraph_segments = _render_paragraph(
+                        text=cell_node.text_content,
+                        sentence_counter=sentence_counter,
+                        block_index=block_index,
+                        block_type="table_cell",
+                        row_index=row_index,
+                        cell_index=cell_index,
+                    )
+                    cell_paragraphs.append(paragraph_html)
+                    table_segments.extend(paragraph_segments)
+
+                if cell_node.children:
+                    for child in cell_node.children:
+                        if child.text_content:
+                            paragraph_html, paragraph_segments = _render_paragraph(
+                                text=child.text_content,
+                                sentence_counter=sentence_counter,
+                                block_index=block_index,
+                                block_type="table_cell",
+                                row_index=row_index,
+                                cell_index=cell_index,
+                            )
+                            cell_paragraphs.append(paragraph_html)
+                            table_segments.extend(paragraph_segments)
+
+                if not cell_paragraphs:
+                    cell_paragraphs.append('<p class="doc-paragraph doc-empty"><br></p>')
+
+                cell_html_parts.append(
+                    f'<td class="doc-table-cell">{"".join(cell_paragraphs)}</td>'
+                )
+
+        row_html_parts.append(f'<tr>{"".join(cell_html_parts)}</tr>')
+
+    if not row_html_parts:
+        return "", []
+
+    return f'<table class="doc-table"><tbody>{"".join(row_html_parts)}</tbody></table>', table_segments
 
 
 def build_document_html_from_segments(segments: list) -> str:

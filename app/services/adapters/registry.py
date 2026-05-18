@@ -3,9 +3,11 @@
 
 Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6
 """
+from __future__ import annotations
+
 import logging
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from app.services.adapters.base import FormatAdapter
 from app.services.adapters.exceptions import UnsupportedFormatError
@@ -90,7 +92,7 @@ class AdapterRegistry:
 
 
 # 全局注册表实例
-_global_registry: AdapterRegistry | None = None
+_global_registry: Optional[AdapterRegistry] = None
 
 
 def get_registry() -> AdapterRegistry:

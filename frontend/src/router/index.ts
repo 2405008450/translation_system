@@ -10,6 +10,7 @@ import TermBaseEditView from '../views/TermBaseEditView.vue'
 import TermBaseView from '../views/TermBaseView.vue'
 import TMCollectionEditView from '../views/TMCollectionEditView.vue'
 import TMManagementView from '../views/TMManagementView.vue'
+import TranslationRulesView from '../views/TranslationRulesView.vue'
 import UserManagementView from '../views/UserManagementView.vue'
 import WorkbenchView from '../views/WorkbenchView.vue'
 
@@ -104,6 +105,7 @@ const router = createRouter({
             pageDescription: '维护记忆库信息、TM 条目和导入导出操作',
             pageTitleKey: 'pages.tmEdit.title',
             pageDescriptionKey: 'pages.tmEdit.description',
+            hidePageHeader: true,
           },
         },
         {
@@ -119,6 +121,18 @@ const router = createRouter({
           },
         },
         {
+          path: 'translation-rules',
+          name: 'translation-rules',
+          component: TranslationRulesView,
+          meta: {
+            navSection: 'translation-rules',
+            pageTitle: '翻译规则',
+            pageDescription: '维护可复用的翻译规则，供 AI 翻译时选择',
+            pageTitleKey: 'pages.translationRules.title',
+            pageDescriptionKey: 'pages.translationRules.description',
+          },
+        },
+        {
           path: 'term-base/:id',
           alias: ['/term-base/:id/edit'],
           name: 'term-base-edit',
@@ -130,6 +144,7 @@ const router = createRouter({
             pageDescription: '维护术语库信息、术语条目和导入导出操作',
             pageTitleKey: 'pages.termBaseEdit.title',
             pageDescriptionKey: 'pages.termBaseEdit.description',
+            hidePageHeader: true,
           },
         },
         {

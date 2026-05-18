@@ -6,7 +6,7 @@ RAR 导出器 - 将翻译后的内容导出为 ZIP 格式
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict
 
 
 class RarExporter:
@@ -17,6 +17,7 @@ class RarExporter:
         original_bytes: bytes,
         translations: Dict[str, str],
         file_translations: Dict[str, Dict[str, str]] = None,
+        segments: list[dict[str, Any]] | None = None,
     ) -> bytes:
         """导出翻译后的文件为 ZIP 格式
         
@@ -29,6 +30,7 @@ class RarExporter:
             bytes: 翻译后的 ZIP 文件字节
         """
         file_translations = file_translations or {}
+        file_segments = self._group_segments_by_path(segments, "rar_path")
         
         try:
             import rarfile
@@ -63,10 +65,16 @@ class RarExporter:
                 # 获取翻译
                 file_trans = file_translations.get(name, {})
                 combined_trans = {**translations, **file_trans}
+                current_segments = file_segments.get(name, [])
                 
-                if combined_trans and registry.is_supported(name):
+                if (combined_trans or current_segments) and registry.is_supported(name):
                     try:
-                        exported = self._export_file(name, file_bytes, combined_trans)
+                        exported = self._export_file(
+                            name,
+                            file_bytes,
+                            combined_trans,
+                            current_segments,
+                        )
                         output_zip.writestr(name, exported)
                         continue
                     except Exception:
@@ -82,7 +90,13 @@ class RarExporter:
         
         return output_buffer.getvalue()
 
-    def _export_file(self, name: str, file_bytes: bytes, translations: Dict[str, str]) -> bytes:
+    def _export_file(
+        self,
+        name: str,
+        file_bytes: bytes,
+        translations: Dict[str, str],
+        segments: list[dict[str, Any]] | None = None,
+    ) -> bytes:
         """导出单个文件"""
         ext = Path(name).suffix.lower()
         
@@ -100,6 +114,8 @@ class RarExporter:
         
         exporter = exporters.get(ext)
         if exporter:
+            if ext in {'.html', '.htm'}:
+                return exporter(file_bytes, translations, segments or [])
             return exporter(file_bytes, translations)
         
         return file_bytes
@@ -110,8 +126,15 @@ class RarExporter:
             content = content.replace(source, target)
         return content.encode('utf-8')
 
-    def _export_html(self, data: bytes, trans: Dict[str, str]) -> bytes:
+    def _export_html(
+        self,
+        data: bytes,
+        trans: Dict[str, str],
+        segments: list[dict[str, Any]] | None = None,
+    ) -> bytes:
         from app.services.adapters.html_exporter import HtmlExporter
+        if segments:
+            return HtmlExporter().export_by_segments(data, segments, trans)
         return HtmlExporter().export(data, trans)
 
     def _export_properties(self, data: bytes, trans: Dict[str, str]) -> bytes:
@@ -149,3 +172,27 @@ class RarExporter:
                     obj[i] = trans[item]
                 else:
                     self._translate_obj(item, trans)
+
+    def _group_segments_by_path(
+        self,
+        segments: list[dict[str, Any]] | None,
+        path_key: str,
+    ) -> dict[str, list[dict[str, Any]]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        if not segments:
+            return grouped
+
+        for segment in segments:
+            path = str(
+                self._get_segment_value(segment, path_key)
+                or self._get_segment_value(segment, "archive_path")
+                or ""
+            ).strip()
+            if path:
+                grouped.setdefault(path, []).append(segment)
+        return grouped
+
+    def _get_segment_value(self, segment: Any, field_name: str, default: Any = "") -> Any:
+        if isinstance(segment, dict):
+            return segment.get(field_name, default)
+        return getattr(segment, field_name, default)

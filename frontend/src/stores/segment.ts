@@ -8,33 +8,19 @@ import { translate } from '../i18n'
 import type {
   FileRecordDetail,
   FileRecordPreview,
+  LLMGuidelineOptions,
   LLMProvider,
   LLMTranslateScope,
   Segment,
   SegmentRevisionEntry,
   SegmentUpdatePayload,
+  TermMatch,
 } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
+import { consumeLLMStream } from '../utils/llmStream'
 
 const SEGMENT_PAGE_SIZE = 1000
 const AUTO_SYNC_DELAY_MS = 1500
-
-function parseSSEChunk(chunk: string) {
-  const eventMatch = chunk.match(/^event:\s*(.+)$/m)
-  const dataMatch = chunk.match(/^data:\s*(.+)$/m)
-  if (!eventMatch || !dataMatch) {
-    return null
-  }
-
-  try {
-    return {
-      event: eventMatch[1].trim(),
-      data: JSON.parse(dataMatch[1]),
-    }
-  } catch {
-    return null
-  }
-}
 
 export const useSegmentStore = defineStore('segment', () => {
   const fileRecord = ref<FileRecordDetail | null>(null)
@@ -42,6 +28,8 @@ export const useSegmentStore = defineStore('segment', () => {
   const previewHtml = ref('')
   const previewSupported = ref(false)
   const activeSentenceId = ref<string | null>(null)
+  const activeSourceText = ref('')
+  const termMatchesMap = ref<Record<string, TermMatch[]>>({})
   const loading = ref(false)
   const loadingMoreSegments = ref(false)
   const loadingAllSegments = ref(false)
@@ -363,6 +351,34 @@ export const useSegmentStore = defineStore('segment', () => {
 
   function setActiveSentence(sentenceId: string | null) {
     activeSentenceId.value = sentenceId
+    if (sentenceId) {
+      const segment = segments.value.find((s) => s.sentence_id === sentenceId)
+      activeSourceText.value = segment?.source_text || ''
+      void loadTermMatches(sentenceId, activeSourceText.value)
+    } else {
+      activeSourceText.value = ''
+    }
+  }
+
+  async function loadTermMatches(sentenceId: string, sourceText: string) {
+    if (!sourceText) {
+      return
+    }
+    try {
+      const { data } = await http.get<{ matches: TermMatch[] }>('/termbase/match', {
+        params: { text: sourceText },
+      })
+      termMatchesMap.value = {
+        ...termMatchesMap.value,
+        [sentenceId]: data.matches,
+      }
+    } catch {
+      // 静默失败
+    }
+  }
+
+  function getTermMatches(sentenceId: string): TermMatch[] {
+    return termMatchesMap.value[sentenceId] || []
   }
 
   function scheduleSync() {
@@ -405,6 +421,8 @@ export const useSegmentStore = defineStore('segment', () => {
       status: 'accepted',
     })
     upsertRevisionEntry(data)
+    // 接受修订：将 after_text 应用到 segment
+    applyLLMUpdate(data.sentence_id, data.after_text, data.source, 'confirmed')
     return data
   }
 
@@ -413,6 +431,8 @@ export const useSegmentStore = defineStore('segment', () => {
       status: 'rejected',
     })
     upsertRevisionEntry(data)
+    // 拒绝修订：恢复 before_text 到 segment
+    applyLLMUpdate(data.sentence_id, data.before_text, data.source, 'confirmed')
     return data
   }
 
@@ -440,6 +460,18 @@ export const useSegmentStore = defineStore('segment', () => {
     return data.updated_count
   }
 
+  async function applyPartialRevision(revisionId: string, newText: string) {
+    // 部分接受修订：更新修订的 after_text，然后接受
+    const { data } = await http.patch<SegmentRevisionEntry>(`/revisions/${revisionId}`, {
+      status: 'accepted',
+      after_text: newText,
+    })
+    upsertRevisionEntry(data)
+    // 应用新的文本到 segment
+    applyLLMUpdate(data.sentence_id, newText, data.source, 'confirmed')
+    return data
+  }
+
   function applyLLMUpdate(sentenceId: string, targetText: string, source = 'llm', status = 'confirmed') {
     const index = getSegmentIndex(sentenceId)
     if (index === -1) {
@@ -459,7 +491,11 @@ export const useSegmentStore = defineStore('segment', () => {
     dirtyEntries.value = nextDirtyEntries
   }
 
-  async function startLLMTranslation(scope: LLMTranslateScope, provider: LLMProvider) {
+  async function startLLMTranslation(
+    scope: LLMTranslateScope,
+    provider: LLMProvider,
+    guidelineOptions: LLMGuidelineOptions = {},
+  ) {
     if (!fileRecord.value || llmRunning.value) {
       return
     }
@@ -492,6 +528,8 @@ export const useSegmentStore = defineStore('segment', () => {
         body: JSON.stringify({
           scope,
           provider,
+          guideline_template_id: guidelineOptions.guidelineTemplateId || null,
+          temporary_prompt: guidelineOptions.temporaryPrompt || '',
         }),
         signal: llmAbortController.signal,
       })
@@ -507,42 +545,26 @@ export const useSegmentStore = defineStore('segment', () => {
         throw new Error(message)
       }
 
-      if (!response.body) {
-        throw new Error(translate('stores.segment.llmNoStream'))
+      try {
+        await consumeLLMStream(
+          response,
+          ({ event, data }) => {
+            if (llmAbortRequested) {
+              return
+            }
+            handleLLMEvent(event, data)
+          },
+          (reader) => {
+            llmReader = reader
+          },
+        )
+      } catch (error) {
+        if (error instanceof Error && error.message === 'SSE 响应体为空。') {
+          throw new Error(translate('stores.segment.llmNoStream'))
+        }
+        throw error
       }
 
-      llmReader = response.body.getReader()
-      const decoder = new TextDecoder('utf-8')
-      let buffer = ''
-
-      while (true) {
-        const { done, value } = await llmReader.read()
-        if (done) {
-          break
-        }
-
-        buffer += decoder.decode(value, { stream: true })
-        const parts = buffer.split('\n\n')
-        buffer = parts.pop() ?? ''
-
-        for (const part of parts) {
-          const event = parseSSEChunk(part)
-          if (!event) {
-            continue
-          }
-          if (llmAbortRequested) {
-            continue
-          }
-          handleLLMEvent(event.event, event.data)
-        }
-      }
-
-      if (!llmAbortRequested && buffer.trim()) {
-        const event = parseSSEChunk(buffer)
-        if (event) {
-          handleLLMEvent(event.event, event.data)
-        }
-      }
       if (!llmAbortRequested && fileRecord.value) {
         await loadRevisions(fileRecord.value.id)
       }
@@ -660,6 +682,8 @@ export const useSegmentStore = defineStore('segment', () => {
     previewHtml,
     previewSupported,
     activeSentenceId,
+    activeSourceText,
+    termMatchesMap,
     loading,
     loadingMoreSegments,
     loadingAllSegments,
@@ -692,9 +716,11 @@ export const useSegmentStore = defineStore('segment', () => {
     loadRevisions,
     updateTarget,
     setActiveSentence,
+    getTermMatches,
     syncToBackend,
     acceptRevision,
     rejectRevision,
+    applyPartialRevision,
     batchAcceptRevisions,
     batchRejectRevisions,
     startLLMTranslation,

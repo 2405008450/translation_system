@@ -5,11 +5,14 @@ import {
   ArrowDown,
   ArrowUp,
   Bot,
+  ChevronDown,
+  ChevronUp,
   CircleHelp,
   Columns,
   Download,
   FileCheck,
   FileText,
+  Flag,
   History,
   Info,
   Languages,
@@ -26,11 +29,13 @@ import { useI18n } from 'vue-i18n'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 
 import Modal from '../components/base/Modal.vue'
+import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import NotesPanel from '../components/NotesPanel.vue'
 import PreviewPanel from '../components/PreviewPanel.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
 import SegmentEditorRow from '../components/SegmentEditorRow.vue'
 import SplitPreviewPanel from '../components/SplitPreviewPanel.vue'
+import TMMatchPanel from '../components/TMMatchPanel.vue'
 import VirtualList from '../components/VirtualList.vue'
 import WorkbenchHistoryPanel from '../components/WorkbenchHistoryPanel.vue'
 import WorkbenchMatchPanel from '../components/WorkbenchMatchPanel.vue'
@@ -42,6 +47,7 @@ import { useWorkbenchShortcuts } from '../composables/useWorkbenchShortcuts'
 import { getTaskExportFormatLabel } from '../constants/taskFiles'
 import { llmProviderOptions, llmScopeOptions } from '../constants/llm'
 import { formatLanguagePair } from '../constants/languages'
+import { isProgressComplete } from '../utils/progress'
 import { useAuthStore } from '../stores/auth'
 import { useCommentStore } from '../stores/comment'
 import { useSegmentStore } from '../stores/segment'
@@ -49,9 +55,13 @@ import type {
   CommentAnchorDraft,
   CommentCreatePayload,
   CommentStatus,
+  GuidelineTemplateSummary,
+  IssueMarker,
   LLMProvider,
   LLMTranslateScope,
+  SaveToTMResult,
   Segment,
+  TMCollection,
   TermBase,
   TermEntryRecord,
 } from '../types/api'
@@ -63,6 +73,15 @@ const props = defineProps<{
 
 type ToolKey = 'source-preview' | 'target-preview' | 'split-preview' | 'match-info' | 'terms' | 'notes' | 'history'
 type ResourceImportTab = 'tm' | 'term'
+type SaveToTMScope = 'translated' | 'confirmed'
+type SaveToTMTargetMode = 'new' | 'existing'
+type SegmentDisplayScope = 'all' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'confirmed_only' | 'empty_target'
+type SaveToTMPayload = {
+  collection_mode: SaveToTMTargetMode
+  collection_id?: string
+  collection_name?: string
+  scope: SaveToTMScope
+}
 
 const router = useRouter()
 const route = useRoute()
@@ -77,19 +96,68 @@ const virtualListRef = ref<{
   focusIndex: (index: number, selector?: string, align?: ScrollLogicalPosition) => Promise<boolean>
 } | null>(null)
 
+const sidecarRef = ref<HTMLElement | null>(null)
+const sidecarWidth = ref<number | null>(null)
+const isResizing = ref(false)
+
+const sidecarWidthStyle = computed(() => {
+  if (sidecarWidth.value === null) return {}
+  return { width: `${sidecarWidth.value}px` }
+})
+
+function startResize(event: MouseEvent) {
+  event.preventDefault()
+  isResizing.value = true
+  const startX = event.clientX
+  const startWidth = sidecarRef.value?.offsetWidth || 400
+
+  function onMouseMove(e: MouseEvent) {
+    const delta = startX - e.clientX
+    const newWidth = Math.max(200, Math.min(startWidth + delta, window.innerWidth * 0.75))
+    sidecarWidth.value = newWidth
+  }
+
+  function onMouseUp() {
+    isResizing.value = false
+    document.removeEventListener('mousemove', onMouseMove)
+    document.removeEventListener('mouseup', onMouseUp)
+    document.body.style.cursor = ''
+    document.body.style.userSelect = ''
+  }
+
+  document.body.style.cursor = 'col-resize'
+  document.body.style.userSelect = 'none'
+  document.addEventListener('mousemove', onMouseMove)
+  document.addEventListener('mouseup', onMouseUp)
+}
+
 const pageError = ref('')
 const llmScope = ref<LLMTranslateScope>('all')
 const llmProvider = ref<LLMProvider>('deepseek')
 const itemHeight = ref(resolveItemHeight())
 const activeTool = ref<ToolKey | null>(null)
 const showImportDialog = ref(false)
+const showIssueDialog = ref(false)
 const importDialogInitialTab = ref<ResourceImportTab>('tm')
 const showShortcutHelp = ref(false)
+const showSaveToTMDialog = ref(false)
 const openRevisionMenu = ref(false)
 const revisionActionLoading = ref(false)
+const segmentSearchOpen = ref(false)
+const sourceSearchInputRef = ref<HTMLInputElement | null>(null)
+const guidelinesEditorRef = ref<HTMLTextAreaElement | null>(null)
+const segmentDisplayScope = ref<SegmentDisplayScope>('all')
 const sourceSearchQuery = ref('')
 const targetSearchQuery = ref('')
 const searchLoadingAllSegments = ref(false)
+const retainedEmptyTargetSentenceIds = ref<Set<string>>(new Set())
+const tmCollections = ref<TMCollection[]>([])
+const loadingTMCollections = ref(false)
+const savingToTM = ref(false)
+const saveToTMScope = ref<SaveToTMScope>('translated')
+const saveToTMTargetMode = ref<SaveToTMTargetMode>('new')
+const saveToTMCollectionId = ref('')
+const saveToTMNewCollectionName = ref('')
 
 const termBases = ref<TermBase[]>([])
 const termEntries = ref<TermEntryRecord[]>([])
@@ -99,14 +167,54 @@ const loadingTermEntries = ref(false)
 const termsMessage = ref(t('workbench.terms.defaultMessage'))
 let searchLoadRequestId = 0
 
+// 导出相关状态
+const showGuidelinesPanel = ref(false)
+const workbenchGuidelines = ref('')
+const guidelineTemplates = ref<GuidelineTemplateSummary[]>([])
+const selectedGuidelineTemplateId = ref('')
+const loadingGuidelineTemplates = ref(false)
+const importingGuidelineTemplate = ref(false)
+const guidelineTemplateInputRef = ref<HTMLInputElement | null>(null)
+
+const showExportMenu = ref(false)
+const exportOptions = ref<Array<{ id: string; name: string; description: string; extension: string }>>([])
+const loadingExportOptions = ref(false)
+const exporting = ref(false)
+
+// 导出格式映射（用于原格式导出按钮显示）
+const exportFormatMap: Record<string, { format: string; label: string; note?: string }> = {
+  '.rar': { format: 'zip', label: 'ZIP', note: 'RAR 将转换为 ZIP' },
+  '.pdf': { format: 'docx', label: 'DOCX', note: 'PDF 将转换为 DOCX' },
+}
+
+const exportInfo = computed(() => {
+  const filename = segmentStore.fileRecord?.filename || ''
+  const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase()
+
+  if (exportFormatMap[ext]) {
+    return exportFormatMap[ext]
+  }
+
+  // 默认导出原格式
+  const format = ext.replace('.', '').toUpperCase() || 'DOCX'
+  return { format: ext.replace('.', ''), label: format }
+})
+
+// 是否为 Office 格式（Office 格式只支持原格式导出）
+const isOfficeFormat = computed(() => {
+  const filename = segmentStore.fileRecord?.filename || ''
+  const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase()
+  return ['.docx', '.xlsx', '.pptx', '.pdf'].includes(ext)
+})
+
 function resolveItemHeight() {
   if (window.innerWidth <= 720) {
-    return 388
+    return 276
   }
   if (window.innerWidth <= 1180) {
-    return 272
+    return 168
   }
-  return 244
+  return 124
 }
 
 function handleResize() {
@@ -120,6 +228,130 @@ function getErrorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback
 }
 
+function normalizeTextForSaveToTM(value: string | null | undefined) {
+  return (value || '').trim()
+}
+
+function buildDefaultSaveToTMCollectionName() {
+  const filename = segmentStore.fileRecord?.filename?.trim() || t('workbench.currentTask')
+  const baseName = filename.replace(/\.[^./\\]+$/, '').trim() || filename
+  return t('workbench.saveToTMDefaultCollectionName', { name: baseName })
+}
+
+function selectDefaultSaveToTMCollection() {
+  const boundCollectionId = taskTMCollectionId.value
+  if (boundCollectionId && tmCollections.value.some((collection) => collection.id === boundCollectionId)) {
+    saveToTMCollectionId.value = boundCollectionId
+    return
+  }
+  saveToTMCollectionId.value = orderedSaveToTMCollections.value[0]?.id || ''
+}
+
+function buildSaveToTMEntries(scope: SaveToTMScope) {
+  const entries: Array<{
+    source_text: string
+    target_text: string
+    source_language: string | null
+    target_language: string | null
+  }> = []
+
+  for (const segment of segmentStore.segments) {
+    const sourceText = normalizeTextForSaveToTM(segment.source_text)
+    const targetText = normalizeTextForSaveToTM(segment.target_text)
+    const inScope = scope === 'confirmed'
+      ? segment.status === 'confirmed'
+      : Boolean(targetText)
+
+    if (!inScope || !sourceText || !targetText) {
+      continue
+    }
+
+    entries.push({
+      source_text: sourceText,
+      target_text: targetText,
+      source_language: segmentStore.fileRecord?.source_language ?? null,
+      target_language: segmentStore.fileRecord?.target_language ?? null,
+    })
+  }
+
+  return entries
+}
+
+async function createSaveToTMCollection(name: string) {
+  const baseName = name.trim() || buildDefaultSaveToTMCollectionName()
+  const sourceLanguage = segmentStore.fileRecord?.source_language
+  const targetLanguage = segmentStore.fileRecord?.target_language
+
+  for (let index = 1; index <= 30; index += 1) {
+    const candidateName = index === 1 ? baseName : `${baseName} (${index})`
+    try {
+      const { data } = await http.post<TMCollection>('/translation-memory/collections', {
+        name: candidateName,
+        description: segmentStore.fileRecord?.filename
+          ? `由任务「${segmentStore.fileRecord.filename}」保存生成`
+          : '',
+        source_language: sourceLanguage,
+        target_language: targetLanguage,
+      })
+      return data
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 409) {
+        continue
+      }
+      throw error
+    }
+  }
+
+  throw new Error(t('workbench.errors.saveToTMCollectionCreateConflict'))
+}
+
+async function saveToTMThroughBatchFallback(payload: SaveToTMPayload): Promise<SaveToTMResult> {
+  const entries = buildSaveToTMEntries(payload.scope)
+  let collectionId = payload.collection_id || ''
+  let collectionName = ''
+  let createdCollection = false
+
+  if (payload.collection_mode === 'new') {
+    if (entries.length === 0) {
+      return {
+        created_count: 0,
+        updated_count: 0,
+        skipped_count: segmentStore.segments.length,
+        total_segments: segmentStore.segments.length,
+        collection_id: null,
+        collection_name: null,
+        created_collection: false,
+      }
+    }
+
+    const collection = await createSaveToTMCollection(payload.collection_name || buildDefaultSaveToTMCollectionName())
+    collectionId = collection.id
+    collectionName = collection.name
+    createdCollection = true
+  } else {
+    const collection = tmCollections.value.find((item) => item.id === collectionId)
+    collectionName = collection?.name || ''
+  }
+
+  const { data } = await http.post<{ created: number; updated: number; skipped: number }>('/translation-memory/entries/batch', {
+    collection_id: collectionId,
+    source_language: segmentStore.fileRecord?.source_language ?? null,
+    target_language: segmentStore.fileRecord?.target_language ?? null,
+    entries,
+  })
+
+  const skippedByScope = Math.max(segmentStore.segments.length - entries.length, 0)
+  return {
+    created_count: data.created,
+    updated_count: data.updated,
+    skipped_count: skippedByScope + data.skipped,
+    total_segments: segmentStore.segments.length,
+    collection_id: collectionId,
+    collection_name: collectionName,
+    created_collection: createdCollection,
+  }
+}
+
 const hasProjectReturnContext = computed(() => (
   route.query.from === 'project' && typeof route.query.pid === 'string'
 ))
@@ -128,25 +360,69 @@ const projectReturnId = computed(() => (
   typeof route.query.pid === 'string' ? route.query.pid : ''
 ))
 
+const projectReturnParent = computed(() => (
+  route.query.parent === 'tasks' ? 'tasks' : ''
+))
+
 const statusSummary = computed(() => {
   const counters = {
     exact: 0,
     fuzzy: 0,
     none: 0,
     confirmed: 0,
+    emptyTarget: 0,
   }
 
   for (const segment of segmentStore.segments) {
+    if (!normalizeTextForSaveToTM(segment.target_text)) {
+      counters.emptyTarget += 1
+    }
     if (segment.status in counters) {
       counters[segment.status as keyof typeof counters] += 1
     }
   }
 
   return [
-    { key: 'exact', label: t('workbench.statusSummary.exact'), value: counters.exact, tone: 'exact' },
-    { key: 'fuzzy', label: t('workbench.statusSummary.fuzzy'), value: counters.fuzzy, tone: 'fuzzy' },
-    { key: 'none', label: t('workbench.statusSummary.none'), value: counters.none, tone: 'none' },
-    { key: 'confirmed', label: t('workbench.statusSummary.confirmed'), value: counters.confirmed, tone: 'confirmed' },
+    {
+      key: 'exact',
+      label: t('workbench.statusSummary.exact'),
+      value: counters.exact,
+      tone: 'exact',
+      scope: 'exact_only' as const,
+      description: '精确匹配：原文与记忆库条目完全一致的句段。',
+    },
+    {
+      key: 'fuzzy',
+      label: t('workbench.statusSummary.fuzzy'),
+      value: counters.fuzzy,
+      tone: 'fuzzy',
+      scope: 'fuzzy_only' as const,
+      description: '模糊匹配：原文与记忆库条目相近，但仍需要人工确认的句段。',
+    },
+    {
+      key: 'none',
+      label: t('workbench.statusSummary.none'),
+      value: counters.none,
+      tone: 'none',
+      scope: 'none_only' as const,
+      description: '无匹配：没有从记忆库找到可用匹配的句段。',
+    },
+    {
+      key: 'confirmed',
+      label: '已确认译文',
+      value: counters.confirmed,
+      tone: 'confirmed',
+      scope: 'confirmed_only' as const,
+      description: '已确认译文：表示人工保存的译文，后续批处理默认会跳过。',
+    },
+    {
+      key: 'empty_target',
+      label: '空译文',
+      value: counters.emptyTarget,
+      tone: 'empty',
+      scope: 'empty_target' as const,
+      description: '空译文：当前译文为空的句段。',
+    },
   ]
 })
 
@@ -167,7 +443,23 @@ const activeSegmentHistory = computed(() => (
     : []
 ))
 
+const revisionSentenceIds = computed(() => (
+  Object.entries(segmentStore.revisionHistory)
+    .filter(([, entries]) => entries.some((e) => e.status === 'pending'))
+    .map(([sentenceId]) => sentenceId)
+))
+
 const activeSegmentSourceText = computed(() => activeSegment.value?.source_text || '')
+
+// 计算当前激活段落匹配的术语（用于原文高亮）
+const activeMatchedTerms = computed(() => {
+  if (!activeSegmentSourceText.value || termEntries.value.length === 0) return []
+  const sourceText = activeSegmentSourceText.value.toLowerCase()
+  return termEntries.value
+    .filter((entry) => sourceText.includes(entry.source_text.toLowerCase()))
+    .slice()
+    .sort((left, right) => right.source_text.length - left.source_text.length)
+})
 
 function normalizeSearchText(value: string) {
   return value.replace(/\s+/g, ' ').trim().toLocaleLowerCase()
@@ -195,15 +487,49 @@ const hasSegmentSearch = computed(() => (
   Boolean(normalizedSourceSearchQuery.value || normalizedTargetSearchQuery.value)
 ))
 
+const hasSegmentDisplayScope = computed(() => segmentDisplayScope.value !== 'all')
+const hasEditorSegmentFilter = computed(() => hasSegmentSearch.value || hasSegmentDisplayScope.value)
+
+const segmentDisplayScopeOptions = computed<Array<{ value: SegmentDisplayScope; label: string }>>(() => [
+  { value: 'all', label: t('workbench.search.scopes.all') },
+  { value: 'exact_only', label: t('workbench.statusSummary.exact') },
+  { value: 'fuzzy_only', label: t('workbench.search.scopes.fuzzyOnly') },
+  { value: 'none_only', label: t('workbench.search.scopes.noneOnly') },
+  { value: 'confirmed_only', label: '已确认译文' },
+  { value: 'empty_target', label: '空译文' },
+])
+
+function matchesSegmentDisplayScope(segment: Segment) {
+  if (segmentDisplayScope.value === 'exact_only') {
+    return segment.status === 'exact'
+  }
+  if (segmentDisplayScope.value === 'fuzzy_only') {
+    return segment.status === 'fuzzy'
+  }
+  if (segmentDisplayScope.value === 'none_only') {
+    return segment.status === 'none'
+  }
+  if (segmentDisplayScope.value === 'confirmed_only') {
+    return segment.status === 'confirmed'
+  }
+  if (segmentDisplayScope.value === 'empty_target') {
+    return !normalizeTextForSaveToTM(segment.target_text)
+      || retainedEmptyTargetSentenceIds.value.has(segment.sentence_id)
+  }
+  return true
+}
+
 const editorSegments = computed(() => {
   const sourceKeyword = normalizedSourceSearchQuery.value
   const targetKeyword = normalizedTargetSearchQuery.value
 
-  if (!sourceKeyword && !targetKeyword) {
+  if (!sourceKeyword && !targetKeyword && !hasSegmentDisplayScope.value) {
     return segmentStore.segments
   }
 
   return segmentStore.segments.filter((segment) => (
+    matchesSegmentDisplayScope(segment)
+    &&
     matchesSearchKeyword(buildSourceSearchableText(segment), sourceKeyword)
     && matchesSearchKeyword(segment.target_text || '', targetKeyword)
   ))
@@ -248,9 +574,60 @@ const targetPreviewSupported = computed(() => {
   return segmentStore.allSegmentsLoaded && segmentStore.segments.length > 0
 })
 
-const exportButtonLabel = computed(() => (
+const exportButtonLabel = computed(() => t('common.actions.export'))
+
+const exportButtonTitle = computed(() => (
   `${t('common.actions.export')} ${getTaskExportFormatLabel(segmentStore.fileRecord?.filename)}`
 ))
+
+const saveToTMPreviewStats = computed(() => {
+  let matchedCount = 0
+  let validCount = 0
+
+  for (const segment of segmentStore.segments) {
+    const sourceText = normalizeTextForSaveToTM(segment.source_text)
+    const targetText = normalizeTextForSaveToTM(segment.target_text)
+    const inScope = saveToTMScope.value === 'confirmed'
+      ? segment.status === 'confirmed'
+      : Boolean(targetText)
+
+    if (!inScope) {
+      continue
+    }
+    matchedCount += 1
+    if (sourceText && targetText) {
+      validCount += 1
+    }
+  }
+
+  return {
+    matchedCount,
+    validCount,
+    skippedCount: Math.max(matchedCount - validCount, 0),
+  }
+})
+
+const taskTMCollectionId = computed(() => segmentStore.fileRecord?.collection_id || '')
+const canOpenIssueDialog = computed(() => Boolean(segmentStore.fileRecord?.project_id))
+
+const orderedSaveToTMCollections = computed(() => {
+  const selectedId = taskTMCollectionId.value
+  return tmCollections.value.slice().sort((left, right) => {
+    if (left.id === selectedId) return -1
+    if (right.id === selectedId) return 1
+    return left.name.localeCompare(right.name)
+  })
+})
+
+const saveToTMCanSubmit = computed(() => {
+  if (savingToTM.value) {
+    return false
+  }
+  if (saveToTMTargetMode.value === 'new') {
+    return Boolean(saveToTMNewCollectionName.value.trim())
+  }
+  return Boolean(saveToTMCollectionId.value)
+})
 
 const sourcePreviewLoading = computed(() =>
   (activeTool.value === 'source-preview' || activeTool.value === 'split-preview')
@@ -288,8 +665,18 @@ usePageHeader(() => ({
     : t('workbench.description'),
   breadcrumbs: hasProjectReturnContext.value
     ? [
-        { label: t('shell.sections.workspace'), to: { name: 'projects' } },
-        { label: t('workbench.breadcrumbProject'), to: { name: 'project-detail', params: { id: projectReturnId.value } } },
+        {
+          label: projectReturnParent.value ? t('shell.sections.tasks') : t('shell.sections.workspace'),
+          to: projectReturnParent.value ? { name: 'tasks' } : { name: 'projects' },
+        },
+        {
+          label: t('workbench.breadcrumbProject'),
+          to: {
+            name: 'project-detail',
+            params: { id: projectReturnId.value },
+            ...(projectReturnParent.value ? { query: { from: projectReturnParent.value } } : {}),
+          },
+        },
         { label: segmentStore.fileRecord?.filename || t('workbench.titleFallback') },
       ]
     : [
@@ -304,7 +691,7 @@ useWorkbenchShortcuts({
   focusPrev: () => { void focusSentenceByOffset(-1) },
   focusNext: () => { void focusSentenceByOffset(1) },
   confirmCurrent: () => { confirmCurrentSentence() },
-  closePanel: () => { activeTool.value = null },
+  closePanel: () => { closeActiveWorkbenchPanel() },
   toggleHelp: () => { showShortcutHelp.value = !showShortcutHelp.value },
 })
 
@@ -361,14 +748,63 @@ async function loadTermEntries() {
   }
 }
 
+async function loadGuidelineTemplates() {
+  loadingGuidelineTemplates.value = true
+  try {
+    const { data } = await http.get<GuidelineTemplateSummary[]>('/guideline-templates')
+    guidelineTemplates.value = data
+    if (
+      selectedGuidelineTemplateId.value
+      && !data.some((template) => template.id === selectedGuidelineTemplateId.value)
+    ) {
+      selectedGuidelineTemplateId.value = ''
+    }
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('workbench.errors.guidelineTemplatesLoad'))
+  } finally {
+    loadingGuidelineTemplates.value = false
+  }
+}
+
+function openGuidelineTemplateImport() {
+  guidelineTemplateInputRef.value?.click()
+}
+
+async function importGuidelineTemplate(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) {
+    return
+  }
+
+  importingGuidelineTemplate.value = true
+  pageError.value = ''
+  try {
+    const formData = new FormData()
+    formData.append('file', file)
+    const { data } = await http.post<GuidelineTemplateSummary>('/guideline-templates/import', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    await loadGuidelineTemplates()
+    selectedGuidelineTemplateId.value = data.id
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('workbench.errors.guidelineTemplateImport'))
+  } finally {
+    importingGuidelineTemplate.value = false
+  }
+}
+
 async function openTool(tool: ToolKey) {
   if (activeTool.value === tool) {
     activeTool.value = null
+    sidecarWidth.value = null
     return
   }
 
   pageError.value = ''
   activeTool.value = tool
+  sidecarWidth.value = null
 
   try {
     if (tool === 'source-preview') {
@@ -407,8 +843,8 @@ async function openTool(tool: ToolKey) {
 
 async function handleEditorReachEnd() {
   try {
-    if (hasSegmentSearch.value) {
-      await ensureSearchCorpusLoaded()
+    if (hasEditorSegmentFilter.value) {
+      await ensureFilteredCorpusLoaded()
       return
     }
     await segmentStore.loadMoreSegments()
@@ -422,15 +858,87 @@ function openImportDialog(tab: ResourceImportTab = 'tm') {
   showImportDialog.value = true
 }
 
+function closeActiveWorkbenchPanel() {
+  if (segmentSearchOpen.value) {
+    closeSegmentSearchPanel()
+    return
+  }
+  if (showGuidelinesPanel.value) {
+    closeGuidelinesPanel()
+    return
+  }
+  activeTool.value = null
+}
+
+function closeGuidelinesPanel() {
+  showGuidelinesPanel.value = false
+}
+
+async function toggleGuidelinesPanel() {
+  showGuidelinesPanel.value = !showGuidelinesPanel.value
+  if (showGuidelinesPanel.value) {
+    await nextTick()
+    guidelinesEditorRef.value?.focus({ preventScroll: true })
+  }
+}
+
 function resetSegmentSearch() {
   searchLoadRequestId += 1
+  segmentSearchOpen.value = false
+  segmentDisplayScope.value = 'all'
   sourceSearchQuery.value = ''
   targetSearchQuery.value = ''
   searchLoadingAllSegments.value = false
+  retainedEmptyTargetSentenceIds.value = new Set()
 }
 
-async function ensureSearchCorpusLoaded() {
-  if (!hasSegmentSearch.value || !segmentStore.hasMoreSegments) {
+function closeSegmentSearchPanel() {
+  segmentSearchOpen.value = false
+}
+
+function setSegmentDisplayScope(scope: SegmentDisplayScope) {
+  if (segmentDisplayScope.value !== scope) {
+    retainedEmptyTargetSentenceIds.value = new Set()
+  }
+  segmentDisplayScope.value = scope
+}
+
+function handleSegmentDisplayScopeChange(event: Event) {
+  const value = (event.target as HTMLSelectElement).value as SegmentDisplayScope
+  setSegmentDisplayScope(value)
+}
+
+function toggleSegmentSummaryScope(scope: SegmentDisplayScope) {
+  setSegmentDisplayScope(segmentDisplayScope.value === scope ? 'all' : scope)
+}
+
+function retainEmptyTargetSegmentDuringEdit(sentenceId: string, previousTargetText: string | null | undefined) {
+  if (segmentDisplayScope.value !== 'empty_target' || normalizeTextForSaveToTM(previousTargetText)) {
+    return
+  }
+
+  retainedEmptyTargetSentenceIds.value = new Set([
+    ...retainedEmptyTargetSentenceIds.value,
+    sentenceId,
+  ])
+}
+
+function updateSegmentTarget(sentenceId: string, targetText: string) {
+  const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
+  retainEmptyTargetSegmentDuringEdit(sentenceId, segment?.target_text)
+  segmentStore.updateTarget(sentenceId, targetText)
+}
+
+async function toggleSegmentSearchPanel() {
+  segmentSearchOpen.value = !segmentSearchOpen.value
+  if (segmentSearchOpen.value) {
+    await nextTick()
+    sourceSearchInputRef.value?.focus({ preventScroll: true })
+  }
+}
+
+async function ensureFilteredCorpusLoaded() {
+  if (!hasEditorSegmentFilter.value || !segmentStore.hasMoreSegments) {
     searchLoadingAllSegments.value = false
     return
   }
@@ -468,11 +976,11 @@ async function focusEditorSegmentAtIndex(index: number) {
 }
 
 async function focusMatchedSegment(offset: number) {
-  if (!hasSegmentSearch.value) {
+  if (!hasEditorSegmentFilter.value) {
     return
   }
 
-  await ensureSearchCorpusLoaded()
+  await ensureFilteredCorpusLoaded()
 
   const matches = editorSegments.value
   if (!matches.length) {
@@ -490,7 +998,7 @@ async function focusMatchedSegment(offset: number) {
 }
 
 async function focusSentenceByOffset(offset: number) {
-  if (hasSegmentSearch.value) {
+  if (hasEditorSegmentFilter.value) {
     await focusMatchedSegment(offset)
     return
   }
@@ -517,31 +1025,18 @@ function confirmCurrentSentence() {
   if (!activeSegment.value) {
     return
   }
-  segmentStore.updateTarget(activeSegment.value.sentence_id, activeSegment.value.target_text || '')
+  updateSegmentTarget(activeSegment.value.sentence_id, activeSegment.value.target_text || '')
   toast.success(t('workbench.messages.confirmed'))
 }
 
-async function handleAcceptRevision(revisionId: string) {
+async function handleApplyPartialRevision(revisionId: string, newText: string) {
   pageError.value = ''
   revisionActionLoading.value = true
   try {
-    await segmentStore.acceptRevision(revisionId)
-    toast.success('修订已接受')
+    await segmentStore.applyPartialRevision(revisionId, newText)
+    toast.success('已应用修订')
   } catch (error) {
-    pageError.value = getErrorMessage(error, '接受修订失败')
-  } finally {
-    revisionActionLoading.value = false
-  }
-}
-
-async function handleRejectRevision(revisionId: string) {
-  pageError.value = ''
-  revisionActionLoading.value = true
-  try {
-    await segmentStore.rejectRevision(revisionId)
-    toast.success('修订已拒绝')
-  } catch (error) {
-    pageError.value = getErrorMessage(error, '拒绝修订失败')
+    pageError.value = getErrorMessage(error, '应用修订失败')
   } finally {
     revisionActionLoading.value = false
   }
@@ -575,6 +1070,26 @@ async function handleBatchRejectRevisions() {
   }
 }
 
+async function focusRevisionByOffset(offset: 1 | -1) {
+  const ids = revisionSentenceIds.value
+  if (!ids.length) {
+    return
+  }
+
+  const currentIdx = segmentStore.activeSentenceId
+    ? ids.indexOf(segmentStore.activeSentenceId)
+    : -1
+  const nextIdx = currentIdx === -1
+    ? (offset > 0 ? 0 : ids.length - 1)
+    : (currentIdx + offset + ids.length) % ids.length
+
+  await handlePreviewFocus(ids[nextIdx])
+}
+
+function handleApplyTMTarget(sentenceId: string, targetText: string) {
+  updateSegmentTarget(sentenceId, targetText)
+}
+
 async function loadTask() {
   pageError.value = ''
   activeTool.value = null
@@ -598,9 +1113,10 @@ async function loadTask() {
       commentStore.message = getErrorMessage(error, t('workbench.errors.commentsUnavailable'))
     }
 
+    workbenchGuidelines.value = ''
+
     await loadTermBases()
 
-    // 如果有绑定的术语库，自动加载术语条目
     const boundTermBaseId = segmentStore.fileRecord?.term_base_id
     if (boundTermBaseId) {
       selectedTermBaseId.value = boundTermBaseId
@@ -613,7 +1129,10 @@ async function loadTask() {
 async function runLLMTranslation() {
   pageError.value = ''
   try {
-    await segmentStore.startLLMTranslation(llmScope.value, llmProvider.value)
+    await segmentStore.startLLMTranslation(llmScope.value, llmProvider.value, {
+      guidelineTemplateId: selectedGuidelineTemplateId.value || undefined,
+      temporaryPrompt: workbenchGuidelines.value,
+    })
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.llm'))
   }
@@ -621,6 +1140,121 @@ async function runLLMTranslation() {
 
 async function stopLLMTranslation() {
   await segmentStore.abortLLM()
+}
+
+async function loadTMCollections() {
+  loadingTMCollections.value = true
+  try {
+    const { data } = await http.get<TMCollection[]>('/translation-memory/collections')
+    tmCollections.value = data
+    selectDefaultSaveToTMCollection()
+  } finally {
+    loadingTMCollections.value = false
+  }
+}
+
+async function openSaveToTMDialog() {
+  pageError.value = ''
+  saveToTMScope.value = 'translated'
+  saveToTMTargetMode.value = 'new'
+  saveToTMNewCollectionName.value = buildDefaultSaveToTMCollectionName()
+  if (!tmCollections.value.length) {
+    try {
+      await loadTMCollections()
+    } catch (error) {
+      pageError.value = getErrorMessage(error, t('workbench.errors.saveToTMCollectionsLoad'))
+      return
+    }
+  } else {
+    selectDefaultSaveToTMCollection()
+  }
+  showSaveToTMDialog.value = true
+}
+
+async function saveToTM() {
+  if (!segmentStore.fileRecord) {
+    return
+  }
+  if (saveToTMTargetMode.value === 'new' && !saveToTMNewCollectionName.value.trim()) {
+    toast.warn(t('workbench.errors.saveToTMCollectionNameRequired'))
+    return
+  }
+  if (saveToTMTargetMode.value === 'existing' && !saveToTMCollectionId.value) {
+    toast.warn(t('workbench.errors.saveToTMCollectionRequired'))
+    return
+  }
+
+  pageError.value = ''
+  savingToTM.value = true
+  try {
+    await segmentStore.syncToBackend()
+    if (segmentStore.hasMoreSegments) {
+      await segmentStore.ensureAllSegmentsLoaded()
+    }
+
+    const payload: SaveToTMPayload = saveToTMTargetMode.value === 'new'
+      ? {
+          collection_mode: 'new',
+          collection_name: saveToTMNewCollectionName.value.trim(),
+          scope: saveToTMScope.value,
+        }
+      : {
+          collection_mode: 'existing',
+          collection_id: saveToTMCollectionId.value,
+          scope: saveToTMScope.value,
+        }
+
+    let data: SaveToTMResult
+    try {
+      const response = await http.post<SaveToTMResult>(`/file-records/${segmentStore.fileRecord.id}/save-to-tm`, payload)
+      data = response.data
+    } catch (error) {
+      if (!axios.isAxiosError(error) || error.response?.status !== 405) {
+        throw error
+      }
+      data = await saveToTMThroughBatchFallback(payload)
+    }
+
+    if (data.created_collection) {
+      try {
+        await loadTMCollections()
+      } catch {
+        // 保存已经完成，列表刷新失败时保留当前选择，避免把成功结果误报为失败。
+      }
+    }
+    if (data.collection_id) {
+      saveToTMCollectionId.value = data.collection_id
+    }
+
+    toast.success(t('workbench.messages.saveToTMResult', {
+      collection: data.collection_name || saveToTMNewCollectionName.value || '',
+      created: data.created_count,
+      updated: data.updated_count,
+      skipped: data.skipped_count,
+    }))
+    showSaveToTMDialog.value = false
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('workbench.errors.saveToTM'))
+  } finally {
+    savingToTM.value = false
+  }
+}
+
+function openIssueDialog() {
+  if (!canOpenIssueDialog.value) {
+    toast.warn(t('issueMarker.errors.missingProject'))
+    return
+  }
+  showIssueDialog.value = true
+}
+
+function handleIssueSaved(_marker: IssueMarker) {
+  showIssueDialog.value = false
+  if (segmentStore.fileRecord) {
+    segmentStore.fileRecord.issue_count += 1
+    segmentStore.fileRecord.open_issue_count += 1
+  }
+  toast.success(t('issueMarker.messages.saved'))
 }
 
 async function saveNow() {
@@ -644,7 +1278,11 @@ async function exportTranslatedFile() {
 
 async function goBack() {
   if (hasProjectReturnContext.value) {
-    await router.push({ name: 'project-detail', params: { id: projectReturnId.value } })
+    await router.push({
+      name: 'project-detail',
+      params: { id: projectReturnId.value },
+      ...(projectReturnParent.value ? { query: { from: projectReturnParent.value } } : {}),
+    })
     return
   }
   await router.push({ name: 'tasks' })
@@ -662,8 +1300,8 @@ async function loadAllSegments() {
 async function handlePreviewFocus(sentenceId: string) {
   segmentStore.setActiveSentence(sentenceId)
 
-  if (hasSegmentSearch.value) {
-    await ensureSearchCorpusLoaded()
+  if (hasEditorSegmentFilter.value) {
+    await ensureFilteredCorpusLoaded()
     const filteredIndex = editorSegments.value.findIndex((segment) => segment.sentence_id === sentenceId)
     if (filteredIndex === -1) {
       return
@@ -681,6 +1319,88 @@ async function handlePreviewFocus(sentenceId: string) {
 
   await nextTick()
   await virtualListRef.value?.focusIndex(index, '[data-segment-target="true"]', 'nearest')
+}
+
+async function loadExportOptions() {
+  if (!segmentStore.fileRecord) return
+
+  loadingExportOptions.value = true
+  try {
+    const { data } = await http.get(`/file-records/${segmentStore.fileRecord.id}/export-options`)
+    exportOptions.value = data.export_options || []
+  } catch (error) {
+    console.error('加载导出选项失败:', error)
+    exportOptions.value = []
+  } finally {
+    loadingExportOptions.value = false
+  }
+}
+
+async function toggleExportMenu() {
+  if (showExportMenu.value) {
+    showExportMenu.value = false
+    return
+  }
+
+  // 加载导出选项
+  await loadExportOptions()
+  showExportMenu.value = true
+}
+
+async function exportWithType(exportType: string) {
+  if (!segmentStore.fileRecord) return
+
+  pageError.value = ''
+  exporting.value = true
+  showExportMenu.value = false
+
+  try {
+    const response = await http.get(
+      `/file-records/${segmentStore.fileRecord.id}/export/${exportType}`,
+      { responseType: 'blob' }
+    )
+
+    // 从响应头获取文件名
+    const contentDisposition = response.headers['content-disposition']
+    let filename = `export.${exportType}`
+    if (contentDisposition) {
+      const filenameMatch = contentDisposition.match(/filename\*=UTF-8''(.+?)(?:;|$)/)
+      if (filenameMatch) {
+        filename = decodeURIComponent(filenameMatch[1])
+      } else {
+        const simpleMatch = contentDisposition.match(/filename="?(.+?)"?(?:;|$)/)
+        if (simpleMatch) {
+          filename = simpleMatch[1]
+        }
+      }
+    }
+
+    // 下载文件
+    const url = window.URL.createObjectURL(new Blob([response.data]))
+    const link = document.createElement('a')
+    link.href = url
+    link.setAttribute('download', filename)
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    window.URL.revokeObjectURL(url)
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      pageError.value = String(error.response?.data?.detail || '导出失败。')
+      return
+    }
+    pageError.value = error instanceof Error ? error.message : '导出失败。'
+  } finally {
+    exporting.value = false
+  }
+}
+
+// 点击外部关闭导出菜单
+function handleClickOutside(event: MouseEvent) {
+  const target = event.target as HTMLElement
+  if (!target.closest('.export-dropdown')) {
+    showExportMenu.value = false
+  }
 }
 
 async function handleCommentDraft(draft: CommentAnchorDraft) {
@@ -787,7 +1507,7 @@ function handleReplaceText(text: string) {
     return
   }
 
-  segmentStore.updateTarget(activeSegment.value.sentence_id, text)
+  updateSegmentTarget(activeSegment.value.sentence_id, text)
   toast.success(t('matchPanel.textInserted'))
 }
 
@@ -797,7 +1517,7 @@ function handleAppendText(text: string) {
   }
 
   const nextText = appendToCurrentText(activeSegment.value.target_text || '', text)
-  segmentStore.updateTarget(activeSegment.value.sentence_id, nextText)
+  updateSegmentTarget(activeSegment.value.sentence_id, nextText)
   toast.success(t('matchPanel.textInserted'))
 }
 
@@ -822,7 +1542,6 @@ async function ensureMatchInfoPanelOpen() {
 
 function handleSegmentTargetActivate(sentenceId: string) {
   segmentStore.setActiveSentence(sentenceId)
-  void ensureMatchInfoPanelOpen()
 }
 
 watch(() => props.id, () => {
@@ -837,9 +1556,9 @@ watch(selectedTermBaseId, () => {
   void loadTermEntries()
 })
 
-watch([sourceSearchQuery, targetSearchQuery], async () => {
-  if (hasSegmentSearch.value) {
-    void ensureSearchCorpusLoaded()
+watch([segmentDisplayScope, sourceSearchQuery, targetSearchQuery], async () => {
+  if (hasEditorSegmentFilter.value) {
+    void ensureFilteredCorpusLoaded()
   } else {
     searchLoadRequestId += 1
     searchLoadingAllSegments.value = false
@@ -851,11 +1570,14 @@ watch([sourceSearchQuery, targetSearchQuery], async () => {
 
 onMounted(() => {
   window.addEventListener('resize', handleResize)
+  document.addEventListener('click', handleClickOutside)
   void loadTask()
+  void loadGuidelineTemplates()
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
+  document.removeEventListener('click', handleClickOutside)
   commentStore.stopPolling()
 })
 
@@ -868,106 +1590,130 @@ onBeforeRouteLeave(async () => {
 <template>
   <div class="content-stack content-stack--workbench workbench-page">
     <section class="toolbar-panel workbench-toolbar">
-      <div class="toolbar-panel__group">
-        <button class="button workbench-action workbench-action--back" type="button" @click="goBack">
-          <ArrowLeft :size="14" />
-          {{ hasProjectReturnContext ? t('workbench.backToProject') : t('workbench.backToTasks') }}
+      <div class="toolbar-panel__group workbench-toolbar__group">
+        <button
+          class="button workbench-action workbench-action--back workbench-toolbar__icon-btn"
+          type="button"
+          :title="hasProjectReturnContext ? t('workbench.backToProject') : t('workbench.backToTasks')"
+          :aria-label="hasProjectReturnContext ? t('workbench.backToProject') : t('workbench.backToTasks')"
+          @click="goBack"
+        >
+          <ArrowLeft :size="16" />
         </button>
 
-        <label class="field field--compact">
-          <span class="field__label">{{ t('workbench.aiScope') }}</span>
-          <select v-model="llmScope" class="field__control">
+        <label class="field field--compact workbench-toolbar__field">
+          <span class="field__label">{{ t('workbench.aiScopeShort') }}</span>
+          <select v-model="llmScope" class="field__control" :title="t('workbench.aiScope')">
             <option v-for="option in llmScopeOptions" :key="option.value" :value="option.value">
               {{ option.label }}
             </option>
           </select>
         </label>
 
-        <label class="field field--compact">
-          <span class="field__label">{{ t('workbench.aiProvider') }}</span>
-          <select v-model="llmProvider" class="field__control">
+        <label class="field field--compact workbench-toolbar__field">
+          <span class="field__label">{{ t('workbench.aiProviderShort') }}</span>
+          <select v-model="llmProvider" class="field__control" :title="t('workbench.aiProvider')">
             <option v-for="option in llmProviderOptions" :key="option.value" :value="option.value">
               {{ option.label }}
             </option>
           </select>
         </label>
 
-        <button class="button workbench-action workbench-action--save" type="button" :disabled="segmentStore.saving" @click="saveNow">
-          <Loader2 v-if="segmentStore.saving" class="lucide-spin" :size="14" />
-          <Save v-else :size="14" />
-          {{ segmentStore.saving ? t('common.actions.saving') : t('workbench.saveNow') }}
+        <button
+          class="button workbench-action"
+          type="button"
+          :class="{ 'is-active': showGuidelinesPanel }"
+          :title="t('workbench.guidelinesToggle')"
+          @click="void toggleGuidelinesPanel()"
+        >
+          <FileText :size="14" />
+          {{ t('workbench.guidelinesShort') }}
         </button>
 
-        <button class="button workbench-action workbench-action--export" type="button" :disabled="!segmentStore.canExport" @click="exportTranslatedFile">
-          <Download :size="14" />
-          {{ exportButtonLabel }}
-        </button>
-
-        <div class="workbench-revision-menu">
-          <button
-            class="button workbench-action workbench-action--review"
-            type="button"
-            :disabled="segmentStore.pendingRevisionCount === 0"
-            @click="openRevisionMenu = !openRevisionMenu"
-          >
-            <MoreHorizontal :size="14" />
-            修订管理
-            <span class="workbench-revision-menu__badge">{{ segmentStore.pendingRevisionCount }}</span>
+        <div class="workbench-toolbar__actions">
+          <button class="button workbench-action workbench-action--save" type="button" :disabled="segmentStore.saving" @click="saveNow">
+            <Loader2 v-if="segmentStore.saving" class="lucide-spin" :size="14" />
+            <Save v-else :size="14" />
+            {{ segmentStore.saving ? t('common.actions.saving') : t('workbench.saveNow') }}
           </button>
-          <div v-if="openRevisionMenu" class="workbench-revision-menu__dropdown">
-            <button
-              type="button"
-              :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
-              @click="void handleBatchAcceptRevisions()"
-            >
-              全部接受
-            </button>
-            <button
-              class="is-danger"
-              type="button"
-              :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
-              @click="void handleBatchRejectRevisions()"
-            >
-              全部拒绝
-            </button>
-          </div>
+
+          <button
+            class="button workbench-action workbench-action--export"
+            type="button"
+            :disabled="!segmentStore.canExport"
+            :title="exportButtonTitle"
+            @click="exportTranslatedFile"
+          >
+            <Download :size="14" />
+            {{ exportButtonLabel }}
+          </button>
+
+          <button
+            class="button workbench-action"
+            type="button"
+            @click="void openSaveToTMDialog()"
+          >
+            <FileCheck :size="14" />
+            {{ t('workbench.saveToTM') }}
+          </button>
+
+          <button
+            class="button workbench-action workbench-action--issue"
+            type="button"
+            :disabled="!canOpenIssueDialog"
+            :title="canOpenIssueDialog ? t('issueMarker.actions.open') : t('issueMarker.errors.missingProject')"
+            @click="openIssueDialog"
+          >
+            <Flag :size="14" />
+            {{ t('issueMarker.actions.open') }}
+          </button>
+
+          <button
+            v-if="!segmentStore.llmRunning"
+            class="button workbench-action workbench-action--ai"
+            type="button"
+            :title="segmentStore.llmMessage"
+            @click="runLLMTranslation"
+          >
+            <Bot :size="14" />
+            {{ t('workbench.runAi') }}
+          </button>
+          <button
+            v-else
+            class="button workbench-action workbench-action--stop"
+            type="button"
+            @click="stopLLMTranslation"
+          >
+            <Loader2 class="lucide-spin" :size="14" />
+            {{ t('workbench.stopAi') }}
+          </button>
+
+          <button
+            class="button workbench-action workbench-action--help workbench-toolbar__icon-btn"
+            type="button"
+            :title="t('workbench.shortcuts')"
+            :aria-label="t('workbench.shortcuts')"
+            @click="showShortcutHelp = true"
+          >
+            <CircleHelp :size="16" />
+          </button>
         </div>
-
-        <button
-          v-if="!segmentStore.llmRunning"
-          class="button workbench-action workbench-action--ai"
-          type="button"
-          @click="runLLMTranslation"
-        >
-          <Bot :size="14" />
-          {{ t('workbench.runAi') }}
-        </button>
-        <button
-          v-else
-          class="button workbench-action workbench-action--stop"
-          type="button"
-          @click="stopLLMTranslation"
-        >
-          <Loader2 class="lucide-spin" :size="14" />
-          {{ t('workbench.stopAi') }}
-        </button>
-
-        <button class="button workbench-action workbench-action--help" type="button" @click="showShortcutHelp = true">
-          <CircleHelp :size="14" />
-          {{ t('workbench.shortcuts') }}
-        </button>
       </div>
 
-      <div class="toolbar-panel__status workbench-toolbar__status">
-        <span>{{ t('workbench.pendingSync', { count: segmentStore.dirtyCount }) }}</span>
-        <span>{{ segmentStore.syncMessage }}</span>
-        <span>{{ segmentStore.llmMessage }}</span>
+      <div class="workbench-toolbar__status" role="status" :title="segmentStore.llmMessage">
+        <span class="workbench-toolbar__status-sync">{{ segmentStore.syncMessage }}</span>
+        <span class="workbench-toolbar__status-sep" aria-hidden="true">·</span>
+        <span class="workbench-toolbar__status-llm">{{ segmentStore.llmMessage }}</span>
       </div>
 
       <div v-if="segmentStore.llmRunning" class="workbench-toolbar__progress">
         <div class="progress-bar">
           <div class="progress-bar__track">
-            <div class="progress-bar__fill" :style="{ width: `${segmentStore.llmProgressPercent}%` }" />
+            <div
+              class="progress-bar__fill"
+              :class="{ 'is-complete': isProgressComplete(segmentStore.llmProgressPercent) }"
+              :style="{ width: `${segmentStore.llmProgressPercent}%` }"
+            />
           </div>
           <span class="progress-bar__text">{{ segmentStore.llmProgressPercent }}%</span>
         </div>
@@ -981,42 +1727,87 @@ onBeforeRouteLeave(async () => {
       </div>
     </section>
 
-    <section class="panel panel--header">
-      <div class="panel-header panel-header--compact">
-        <div>
-          <div class="section-title section-title--tight">{{ t('workbench.taskOverview') }}</div>
-          <p class="panel-subtitle">
-            {{ t('workbench.overviewDescription', {
-              pair: currentLanguagePair,
-              loaded: segmentStore.loadedSegmentCount,
-              total: segmentStore.totalSegmentCount,
-            }) }}
-          </p>
+    <Transition name="workbench-panel-pop">
+      <section
+        v-if="showGuidelinesPanel"
+        class="panel workbench-guidelines-panel"
+        @keydown.esc.stop="closeGuidelinesPanel"
+      >
+        <div class="workbench-guidelines-panel__head">
+          <span class="workbench-guidelines-panel__title">{{ t('workbench.guidelinesTitle') }}</span>
+          <div class="workbench-guidelines-panel__actions">
+            <button
+              class="button button--small"
+              type="button"
+              :disabled="importingGuidelineTemplate || loadingGuidelineTemplates"
+              @click="openGuidelineTemplateImport"
+            >
+              <Upload :size="13" />
+              {{ importingGuidelineTemplate ? t('common.actions.saving') : t('workbench.guidelineImport') }}
+            </button>
+            <button
+              class="button button--small workbench-guidelines-panel__close"
+              type="button"
+              title="收起细则"
+              aria-label="收起细则"
+              @click="closeGuidelinesPanel"
+            >
+              <X :size="13" />
+            </button>
+          </div>
         </div>
+        <input
+          ref="guidelineTemplateInputRef"
+          class="workbench-guidelines-panel__file"
+          type="file"
+          accept=".md,.markdown,.txt"
+          @change="importGuidelineTemplate"
+        >
+        <label class="field">
+          <span class="field__label">{{ t('workbench.guidelineTemplate') }}</span>
+          <select
+            v-model="selectedGuidelineTemplateId"
+            class="field__control"
+            :disabled="loadingGuidelineTemplates"
+          >
+            <option value="">{{ t('workbench.guidelineTemplateNone') }}</option>
+            <option v-for="template in guidelineTemplates" :key="template.id" :value="template.id">
+              {{ template.name }}
+            </option>
+          </select>
+        </label>
+        <textarea
+          ref="guidelinesEditorRef"
+          v-model="workbenchGuidelines"
+          class="field__control workbench-guidelines-panel__editor"
+          rows="4"
+          :placeholder="t('workbench.guidelinesPlaceholder')"
+        />
+        <p class="hint-text">{{ t('workbench.guidelinesHint') }}</p>
+      </section>
+    </Transition>
 
-        <div class="workbench-resource-panel__actions">
-          <button class="button workbench-action workbench-action--import-tm" type="button" @click="openImportDialog('tm')">
-            <Upload :size="14" />
-            {{ t('workbench.importTm') }}
-          </button>
-          <button class="button workbench-action workbench-action--import-term" type="button" @click="openImportDialog('term')">
-            <Upload :size="14" />
-            {{ t('workbench.importTerm') }}
-          </button>
-        </div>
-      </div>
-
-      <div class="workbench-stats">
-        <div
+    <section class="panel panel--header workbench-overview">
+      <div class="workbench-overview__line">
+        <button
           v-for="item in statusSummary"
           :key="item.key"
           class="workbench-stat"
-          :class="`workbench-stat--${item.tone}`"
+          :class="[`workbench-stat--${item.tone}`, { 'is-active': segmentDisplayScope === item.scope }]"
+          type="button"
+          :aria-pressed="segmentDisplayScope === item.scope"
+          :title="item.description"
+          @click="toggleSegmentSummaryScope(item.scope)"
         >
           <span>{{ item.label }}</span>
           <strong>{{ item.value }}</strong>
-        </div>
+        </button>
+
       </div>
+
+      <p class="workbench-overview__tip">
+        Tips：已确认译文表示人工保存的译文，后续批处理默认会跳过。
+      </p>
 
       <div class="workbench-load-all">
         <span class="hint-text">
@@ -1044,131 +1835,257 @@ onBeforeRouteLeave(async () => {
     </section>
 
     <section v-else class="workbench-layout">
-      <section class="panel panel--stretch panel--editor">
-        <div class="panel-header panel-header--compact">
-          <div>
+      <section class="panel panel--stretch panel--editor" :class="{ 'has-search-open': segmentSearchOpen }">
+        <div class="panel-header panel-header--compact segment-editor-toolbar">
+          <div class="segment-editor-toolbar__title">
             <div class="section-title section-title--tight">{{ t('workbench.editorTitle') }}</div>
-            <p class="panel-subtitle">{{ t('workbench.editorDescription') }}</p>
-          </div>
-        </div>
-
-        <div class="workbench-search-panel">
-          <div class="workbench-search-panel__header">
-            <div>
-              <div class="section-title section-title--tight">{{ t('workbench.search.title') }}</div>
-              <p class="panel-subtitle">{{ t('workbench.search.description') }}</p>
-            </div>
-            <button
-              v-if="hasSegmentSearch"
-              class="button workbench-action workbench-action--clear"
-              type="button"
-              @click="resetSegmentSearch"
-            >
-              <X :size="14" />
-              {{ t('workbench.search.clear') }}
-            </button>
-          </div>
-
-          <div class="workbench-search-panel__form">
-            <label class="field field--compact">
-              <span class="field__label">{{ t('workbench.search.sourceLabel') }}</span>
-              <input
-                v-model="sourceSearchQuery"
-                class="field__control"
-                type="text"
-                :placeholder="t('workbench.search.sourcePlaceholder')"
-                @keydown.enter.prevent="void focusMatchedSegment(1)"
-              />
-            </label>
-
-            <label class="field field--compact">
-              <span class="field__label">{{ t('workbench.search.targetLabel') }}</span>
-              <input
-                v-model="targetSearchQuery"
-                class="field__control"
-                type="text"
-                :placeholder="t('workbench.search.targetPlaceholder')"
-                @keydown.enter.prevent="void focusMatchedSegment(1)"
-              />
-            </label>
-
-            <div class="workbench-search-panel__actions">
-              <button
-                class="button workbench-action workbench-action--search"
-                type="button"
-                :disabled="searchLoadingAllSegments || editorSegments.length === 0"
-                @click="void focusMatchedSegment(-1)"
-              >
-                <ArrowUp :size="14" />
-                {{ t('workbench.search.prev') }}
-              </button>
-              <button
-                class="button workbench-action workbench-action--search"
-                type="button"
-                :disabled="searchLoadingAllSegments || editorSegments.length === 0"
-                @click="void focusMatchedSegment(1)"
-              >
-                <ArrowDown :size="14" />
-                {{ t('workbench.search.next') }}
-              </button>
-            </div>
-          </div>
-
-          <div class="workbench-search-panel__meta">
             <span class="hint-text">
-              {{
-                hasSegmentSearch
-                  ? t('workbench.search.resultSummary', {
-                      count: editorSegments.length,
-                      total: segmentStore.totalSegmentCount,
-                    })
-                  : t('workbench.search.idle')
-              }}
+              {{ segmentStore.loadedSegmentCount }} / {{ segmentStore.totalSegmentCount }}
             </span>
-            <span v-if="searchLoadingAllSegments" class="hint-text">
-              {{ t('workbench.search.loadingAll') }}
-            </span>
+          </div>
+          <div class="segment-editor-toolbar__actions">
+            <label class="segment-editor-toolbar__filter">
+              <span class="segment-editor-toolbar__filter-label">{{ t('workbench.search.scopeLabel') }}</span>
+              <select
+                class="field__control segment-editor-toolbar__filter-select"
+                :value="segmentDisplayScope"
+                @change="handleSegmentDisplayScopeChange"
+              >
+                <option
+                  v-for="option in segmentDisplayScopeOptions"
+                  :key="option.value"
+                  :value="option.value"
+                >
+                  {{ option.label }}
+                </option>
+              </select>
+            </label>
+
+            <button
+              class="button workbench-action workbench-action--search segment-editor-toolbar__search"
+              :class="{ 'is-active': segmentSearchOpen }"
+              type="button"
+              :aria-expanded="segmentSearchOpen"
+              aria-controls="workbench-segment-search"
+              @click="void toggleSegmentSearchPanel()"
+            >
+              <Search :size="14" />
+              {{ t('workbench.search.title') }}
+              <span
+                class="workbench-search-panel__badge"
+                :class="{ 'is-hidden': !hasEditorSegmentFilter }"
+                :aria-hidden="!hasEditorSegmentFilter"
+              >
+                {{ hasEditorSegmentFilter ? editorSegments.length : 0 }}
+              </span>
+              <ChevronUp v-if="segmentSearchOpen" :size="14" />
+              <ChevronDown v-else :size="14" />
+            </button>
+
+            <div class="workbench-search-panel__revision segment-editor-toolbar__revision">
+              <div class="workbench-revision-menu">
+                <button
+                  class="button workbench-action workbench-action--search"
+                  type="button"
+                  :disabled="segmentStore.pendingRevisionCount === 0"
+                  @click="openRevisionMenu = !openRevisionMenu"
+                >
+                  <MoreHorizontal :size="14" />
+                  修订
+                  <span v-if="segmentStore.pendingRevisionCount > 0" class="workbench-search-panel__badge">
+                    {{ segmentStore.pendingRevisionCount }}
+                  </span>
+                </button>
+                <div v-if="openRevisionMenu" class="workbench-revision-menu__dropdown">
+                  <button
+                    type="button"
+                    :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
+                    @click="void handleBatchAcceptRevisions()"
+                  >
+                    全部接受
+                  </button>
+                  <button
+                    class="is-danger"
+                    type="button"
+                    :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
+                    @click="void handleBatchRejectRevisions()"
+                  >
+                    全部拒绝
+                  </button>
+                </div>
+              </div>
+              <button
+                class="button workbench-action workbench-action--search"
+                type="button"
+                :disabled="segmentStore.pendingRevisionCount === 0"
+                title="上一条修订"
+                @click="void focusRevisionByOffset(-1)"
+              >
+                <ChevronUp :size="14" />
+              </button>
+              <button
+                class="button workbench-action workbench-action--search"
+                type="button"
+                :disabled="segmentStore.pendingRevisionCount === 0"
+                title="下一条修订"
+                @click="void focusRevisionByOffset(1)"
+              >
+                <ChevronDown :size="14" />
+              </button>
+            </div>
           </div>
         </div>
 
-        <div
-          v-if="hasSegmentSearch && !searchLoadingAllSegments && editorSegments.length === 0"
-          class="empty-state workbench-search-empty"
-        >
-          <Search :size="28" />
-          {{ t('workbench.search.noMatch') }}
-        </div>
+        <Transition name="workbench-panel-pop">
+          <div
+            v-if="segmentSearchOpen"
+            id="workbench-segment-search"
+            class="workbench-search-panel"
+            @keydown.esc.stop="closeSegmentSearchPanel"
+          >
+            <div class="workbench-search-panel__form">
+              <label class="field field--compact">
+                <span class="field__label">{{ t('workbench.search.sourceLabel') }}</span>
+                <input
+                  ref="sourceSearchInputRef"
+                  v-model="sourceSearchQuery"
+                  class="field__control"
+                  type="text"
+                  :placeholder="t('workbench.search.sourcePlaceholder')"
+                  @keydown.enter.prevent="void focusMatchedSegment(1)"
+                />
+              </label>
 
-        <VirtualList
-          v-else
-          ref="virtualListRef"
-          :items="editorSegments"
-          :item-height="itemHeight"
-          :adaptive="true"
-          :active-descendant="segmentStore.activeSentenceId ? `segment-${segmentStore.activeSentenceId}` : null"
-          @reach-end="handleEditorReachEnd"
-        >
-          <template #default="{ item, index }">
-            <SegmentEditorRow
-              :segment="item"
-              :index="getEditorSegmentDisplayIndex(item.sentence_id, index)"
-              :active="segmentStore.activeSentenceId === item.sentence_id"
-              :pending-revision="segmentStore.getPendingRevision(item.sentence_id)"
-              :revision-busy="revisionActionLoading"
-              @focus="segmentStore.setActiveSentence"
-              @activate-target="handleSegmentTargetActivate"
-              @update="segmentStore.updateTarget"
-              @accept-revision="handleAcceptRevision"
-              @reject-revision="handleRejectRevision"
-            />
-          </template>
-        </VirtualList>
+              <label class="field field--compact">
+                <span class="field__label">{{ t('workbench.search.targetLabel') }}</span>
+                <input
+                  v-model="targetSearchQuery"
+                  class="field__control"
+                  type="text"
+                  :placeholder="t('workbench.search.targetPlaceholder')"
+                  @keydown.enter.prevent="void focusMatchedSegment(1)"
+                />
+              </label>
+
+              <div class="workbench-search-panel__actions">
+                <button
+                  class="button workbench-action workbench-action--search"
+                  type="button"
+                  :disabled="searchLoadingAllSegments || editorSegments.length === 0"
+                  @click="void focusMatchedSegment(-1)"
+                >
+                  <ArrowUp :size="14" />
+                  {{ t('workbench.search.prev') }}
+                </button>
+                <button
+                  class="button workbench-action workbench-action--search"
+                  type="button"
+                  :disabled="searchLoadingAllSegments || editorSegments.length === 0"
+                  @click="void focusMatchedSegment(1)"
+                >
+                  <ArrowDown :size="14" />
+                  {{ t('workbench.search.next') }}
+                </button>
+                <button
+                  class="button workbench-action workbench-action--clear"
+                  :class="{ 'is-layout-placeholder': !hasEditorSegmentFilter }"
+                  type="button"
+                  :disabled="!hasEditorSegmentFilter"
+                  :aria-hidden="!hasEditorSegmentFilter"
+                  :tabindex="hasEditorSegmentFilter ? 0 : -1"
+                  @click="resetSegmentSearch"
+                >
+                  <X :size="14" />
+                  {{ t('workbench.search.clear') }}
+                </button>
+                <button
+                  class="button workbench-action workbench-action--search workbench-search-panel__close"
+                  type="button"
+                  title="收起句段检索"
+                  aria-label="收起句段检索"
+                  @click="closeSegmentSearchPanel"
+                >
+                  <X :size="14" />
+                </button>
+              </div>
+            </div>
+
+            <div class="workbench-search-panel__meta">
+              <span v-if="hasEditorSegmentFilter" class="hint-text">
+                {{
+                  t('workbench.search.resultSummary', {
+                    count: editorSegments.length,
+                    total: segmentStore.totalSegmentCount,
+                  })
+                }}
+              </span>
+              <span v-if="searchLoadingAllSegments" class="hint-text">
+                {{ t('workbench.search.loadingAll') }}
+              </span>
+            </div>
+          </div>
+        </Transition>
+
+        <div class="segment-editor-results">
+          <div class="segment-table-head" aria-hidden="true">
+            <span>句段</span>
+            <span>原文</span>
+            <span>译文</span>
+          </div>
+
+          <div class="segment-editor-list-stage">
+            <div
+              v-if="hasEditorSegmentFilter && !searchLoadingAllSegments && editorSegments.length === 0"
+              class="empty-state workbench-search-empty"
+            >
+              <Search :size="28" />
+              {{ t('workbench.search.noMatch') }}
+            </div>
+
+            <VirtualList
+              v-else
+              ref="virtualListRef"
+              :items="editorSegments"
+              :item-height="itemHeight"
+              item-key="sentence_id"
+              :adaptive="true"
+              :active-descendant="segmentStore.activeSentenceId ? `segment-${segmentStore.activeSentenceId}` : null"
+              @reach-end="handleEditorReachEnd"
+            >
+              <template #default="{ item, index }">
+                <SegmentEditorRow
+                  :segment="item"
+                  :index="getEditorSegmentDisplayIndex(item.sentence_id, index)"
+                  :active="segmentStore.activeSentenceId === item.sentence_id"
+                  :pending-revision="segmentStore.getPendingRevision(item.sentence_id)"
+                  :revision-busy="revisionActionLoading"
+                  :matched-terms="segmentStore.activeSentenceId === item.sentence_id ? activeMatchedTerms : []"
+                  @focus="segmentStore.setActiveSentence"
+                  @activate-target="handleSegmentTargetActivate"
+                  @update="updateSegmentTarget"
+                  @apply-partial-revision="handleApplyPartialRevision"
+                />
+              </template>
+            </VirtualList>
+          </div>
+        </div>
       </section>
 
       <div
+        v-if="activeTool"
+        class="workbench-resizer"
+        @mousedown="startResize"
+      >
+        <div class="workbench-resizer__handle" />
+      </div>
+
+      <div
+        ref="sidecarRef"
         class="workbench-sidecar"
         :class="{ 'is-preview-open': activeTool && activeTool !== 'split-preview', 'is-split-open': activeTool === 'split-preview' }"
+        :style="sidecarWidthStyle"
       >
+        <div v-if="activeTool" class="workbench-sidecar__panel">
         <Transition name="preview-drawer" mode="out-in">
           <SplitPreviewPanel
             v-if="activeTool === 'split-preview'"
@@ -1267,6 +2184,7 @@ onBeforeRouteLeave(async () => {
             :history="activeSegmentHistory"
           />
         </Transition>
+        </div>
 
         <aside class="workbench-rail" :aria-label="t('workbench.toolsLabel')">
           <button
@@ -1294,6 +2212,89 @@ onBeforeRouteLeave(async () => {
       :target-language="segmentStore.fileRecord?.target_language ?? null"
       @close="showImportDialog = false"
     />
+    <IssueMarkerDialog
+      :open="showIssueDialog"
+      :project-id="segmentStore.fileRecord?.project_id ?? null"
+      :file-record-id="segmentStore.fileRecord?.id ?? null"
+      :context-label="segmentStore.fileRecord?.filename ? t('workbench.importContext', { name: segmentStore.fileRecord.filename }) : t('workbench.currentTask')"
+      @close="showIssueDialog = false"
+      @saved="handleIssueSaved"
+    />
+
+    <Modal
+      :open="showSaveToTMDialog"
+      :title="t('workbench.saveToTMTitle')"
+      :description="t('workbench.saveToTMDescription')"
+      width="min(560px, calc(100vw - 32px))"
+      @close="showSaveToTMDialog = false"
+    >
+      <div class="save-to-tm-dialog">
+        <fieldset class="save-to-tm-dialog__scope" :disabled="savingToTM">
+          <legend>{{ t('workbench.saveToTMTargetModeLabel') }}</legend>
+          <label class="save-to-tm-dialog__scope-item">
+            <input v-model="saveToTMTargetMode" type="radio" value="new">
+            <span>{{ t('workbench.saveToTMTargetModes.new') }}</span>
+          </label>
+          <label class="save-to-tm-dialog__scope-item">
+            <input v-model="saveToTMTargetMode" type="radio" value="existing" :disabled="loadingTMCollections || tmCollections.length === 0">
+            <span>{{ t('workbench.saveToTMTargetModes.existing') }}</span>
+          </label>
+        </fieldset>
+
+        <label v-if="saveToTMTargetMode === 'new'" class="field">
+          <span class="field__label">{{ t('workbench.saveToTMNewCollectionName') }}</span>
+          <input
+            v-model="saveToTMNewCollectionName"
+            class="field__control"
+            type="text"
+            :placeholder="buildDefaultSaveToTMCollectionName()"
+            :disabled="savingToTM"
+          >
+        </label>
+
+        <label v-else class="field">
+          <span class="field__label">{{ t('workbench.saveToTMCollection') }}</span>
+          <select
+            v-model="saveToTMCollectionId"
+            class="field__control"
+            :disabled="loadingTMCollections || savingToTM"
+          >
+            <option value="">{{ t('workbench.saveToTMCollectionPlaceholder') }}</option>
+            <option v-for="collection in orderedSaveToTMCollections" :key="collection.id" :value="collection.id">
+              {{ collection.name }}{{ collection.id === taskTMCollectionId ? t('workbench.saveToTMTaskCollectionSuffix') : '' }}
+            </option>
+          </select>
+        </label>
+
+        <fieldset class="save-to-tm-dialog__scope" :disabled="savingToTM">
+          <legend>{{ t('workbench.saveToTMScopeLabel') }}</legend>
+          <label class="save-to-tm-dialog__scope-item">
+            <input v-model="saveToTMScope" type="radio" value="translated">
+            <span>{{ t('workbench.saveToTMScope.translated') }}</span>
+          </label>
+          <label class="save-to-tm-dialog__scope-item">
+            <input v-model="saveToTMScope" type="radio" value="confirmed">
+            <span>{{ t('workbench.saveToTMScope.confirmed') }}</span>
+          </label>
+        </fieldset>
+
+        <div class="save-to-tm-dialog__stats">
+          <span>{{ t('workbench.saveToTMPreviewMatched', { count: saveToTMPreviewStats.matchedCount }) }}</span>
+          <span>{{ t('workbench.saveToTMPreviewValid', { count: saveToTMPreviewStats.validCount }) }}</span>
+          <span>{{ t('workbench.saveToTMPreviewSkipped', { count: saveToTMPreviewStats.skippedCount }) }}</span>
+        </div>
+
+        <div class="save-to-tm-dialog__actions">
+          <button class="button button--ghost" type="button" :disabled="savingToTM" @click="showSaveToTMDialog = false">
+            {{ t('common.actions.cancel') }}
+          </button>
+          <button class="button" type="button" :disabled="!saveToTMCanSubmit" @click="void saveToTM()">
+            <Loader2 v-if="savingToTM" class="lucide-spin" :size="14" />
+            <span>{{ savingToTM ? t('common.actions.saving') : t('workbench.saveToTMSubmit') }}</span>
+          </button>
+        </div>
+      </div>
+    </Modal>
 
     <Modal
       :open="showShortcutHelp"
@@ -1320,32 +2321,248 @@ onBeforeRouteLeave(async () => {
 .workbench-load-all,
 .workbench-search-panel {
   display: grid;
-  gap: 12px;
+  gap: 6px;
+}
+
+.workbench-page {
+  overflow-x: hidden;
+  overflow-x: clip;
+}
+
+.workbench-toolbar {
+  min-height: var(--route-top-panel-min-height, 90px);
+  align-content: center;
+}
+
+.workbench-toolbar__group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+
+.workbench-toolbar__group > .workbench-action--back {
+  align-self: center;
+  margin-top: 0;
+}
+
+.workbench-toolbar__field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: min(220px, 42vw);
+  min-height: 32px;
+}
+
+.workbench-toolbar__field .field__label {
+  flex: 0 0 auto;
+  font-size: 12px;
+  line-height: 32px;
+  color: var(--text-muted, #64748b);
+  white-space: nowrap;
+}
+
+.workbench-toolbar__field .field__control {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 120px;
+  min-height: 32px;
+  height: 32px;
+  padding: 4px 8px;
+  font-size: 12px;
+  border-radius: 6px;
+}
+
+.workbench-toolbar__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  align-self: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.workbench-toolbar__icon-btn {
+  min-width: 34px;
+  min-height: 32px;
+  padding: 4px 8px;
+  font-weight: 600;
+  box-shadow: 0 2px 6px rgba(37, 61, 70, 0.08);
+}
+
+.workbench-action--back.workbench-toolbar__icon-btn {
+  min-width: 46px;
+  min-height: 32px;
+  padding-inline: 12px;
 }
 
 .workbench-toolbar__status {
   display: flex;
   flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 6px;
+  max-width: 100%;
+  padding: 2px 0 0;
+  border: none;
+  background: transparent;
+  color: var(--text-muted, #64748b);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.workbench-toolbar__status-sep {
+  opacity: 0.45;
+  user-select: none;
+}
+
+.workbench-toolbar__status-llm {
+  flex: 1 1 160px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workbench-toolbar__status-sync {
+  flex: 0 1 auto;
+  white-space: nowrap;
+}
+
+.save-to-tm-dialog {
+  display: grid;
+  gap: 12px;
+}
+
+.save-to-tm-dialog__scope {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color, #dbe3ea);
+  border-radius: 10px;
+  display: grid;
   gap: 8px;
+}
+
+.save-to-tm-dialog__scope-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.save-to-tm-dialog__stats {
+  display: grid;
+  gap: 4px;
+  color: var(--text-muted, #64748b);
+  font-size: 12px;
+}
+
+.save-to-tm-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.workbench-toolbar__progress {
+  gap: 4px;
+}
+
+.workbench-toolbar__progress .progress-bar__track {
+  height: 6px;
+}
+
+.workbench-toolbar__progress .progress-bar__text {
+  font-size: 11px;
+}
+
+.workbench-toolbar__progress .hint-text {
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.workbench-toolbar .workbench-action:not(.workbench-toolbar__icon-btn) {
+  min-height: 32px;
+  padding: 5px 10px;
+  font-size: 12px;
+  gap: 4px;
+}
+
+.workbench-toolbar .workbench-action.is-active {
+  border-color: #69ad9d;
+  background: linear-gradient(180deg, #e2f2ee, #cbe6df);
+  color: #0b6658;
+  box-shadow: 0 5px 14px rgba(13, 122, 104, 0.16);
+}
+
+.workbench-guidelines-panel {
+  position: relative;
+  padding: 10px 14px;
+  display: grid;
+  gap: 8px;
+  overflow: hidden;
+  transform-origin: top center;
+}
+
+.workbench-guidelines-panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.workbench-guidelines-panel__title {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.workbench-guidelines-panel__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.workbench-guidelines-panel__close,
+.workbench-search-panel__close {
+  min-width: 34px;
+  padding-inline: 9px;
+}
+
+.workbench-guidelines-panel__file {
+  display: none;
+}
+
+.workbench-guidelines-panel__editor {
+  resize: vertical;
+  min-height: 60px;
+  max-height: 200px;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .workbench-action {
   --action-bg: linear-gradient(180deg, #f4f7f8, #e8eef1);
   --action-border: #ccd9de;
   --action-color: #2d4651;
-  --action-shadow: rgba(37, 61, 70, 0.1);
-  --action-hover-shadow: rgba(37, 61, 70, 0.16);
+  --action-shadow: rgba(37, 61, 70, 0.08);
+  --action-hover-shadow: rgba(37, 61, 70, 0.12);
 
   border-color: var(--action-border);
   background: var(--action-bg);
   color: var(--action-color);
   font-weight: 600;
-  box-shadow: 0 8px 16px var(--action-shadow);
+  box-shadow: 0 3px 8px var(--action-shadow);
+  transition:
+    border-color 160ms ease,
+    background 160ms ease,
+    color 160ms ease,
+    box-shadow 160ms ease,
+    transform 160ms ease;
 }
 
 .workbench-action:not(:disabled):hover {
   border-color: color-mix(in srgb, var(--action-border) 82%, #17313b);
-  box-shadow: 0 10px 20px var(--action-hover-shadow);
+  box-shadow: 0 4px 12px var(--action-hover-shadow);
+  transform: translateY(-1px);
 }
 
 .workbench-action:focus-visible {
@@ -1376,6 +2593,14 @@ onBeforeRouteLeave(async () => {
   --action-color: #68430c;
   --action-shadow: rgba(154, 102, 13, 0.12);
   --action-hover-shadow: rgba(154, 102, 13, 0.2);
+}
+
+.workbench-action--issue {
+  --action-bg: linear-gradient(180deg, #fff5df, #f4ddb2);
+  --action-border: #d9b86f;
+  --action-color: #6d4a12;
+  --action-shadow: rgba(148, 103, 20, 0.1);
+  --action-hover-shadow: rgba(148, 103, 20, 0.18);
 }
 
 .workbench-action--stop {
@@ -1435,15 +2660,22 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-load-all {
-  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  flex-wrap: wrap;
 }
 
 .workbench-search-panel {
-  margin-bottom: 16px;
-  padding: 16px;
+  margin-bottom: 8px;
+  padding: 10px 12px;
   border: 1px solid var(--line-soft);
-  border-radius: 14px;
+  border-radius: 8px;
   background: linear-gradient(180deg, rgba(248, 250, 252, 0.96), rgba(255, 255, 255, 0.98));
+  overflow: hidden;
+  transform-origin: top center;
 }
 
 .workbench-search-panel__header,
@@ -1462,28 +2694,216 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-search-panel__form > .field {
-  flex: 1 1 260px;
+  flex: 1 1 220px;
+}
+
+.workbench-search-panel .field__label {
+  font-size: 12px;
+}
+
+.workbench-search-panel .field__control {
+  min-height: 34px;
+  padding: 7px 10px;
+  font-size: 13px;
+}
+
+.workbench-search-panel .button,
+.segment-editor-toolbar__filter-select,
+.segment-editor-toolbar__search,
+.segment-editor-toolbar__revision .workbench-action {
+  min-height: 34px;
+  padding: 7px 10px;
+  font-size: 13px;
+  box-shadow: none;
 }
 
 .workbench-search-panel__actions {
+  display: flex;
+  gap: 6px;
   margin-left: auto;
+}
+
+.workbench-search-panel__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.workbench-search-panel__revision {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.workbench-search-panel__revision .workbench-action:last-child,
+.workbench-search-panel__revision .workbench-action:nth-last-child(2) {
+  min-width: 40px;
+  padding: 0 12px;
+}
+
+.workbench-search-panel__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  min-height: 20px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: rgba(13, 122, 104, 0.14);
+  color: #0b6b5b;
+  font-size: 11px;
+}
+
+.workbench-search-panel__badge.is-hidden {
+  visibility: hidden;
 }
 
 .workbench-search-panel__meta {
   align-items: center;
+  min-height: 20px;
+}
+
+.workbench-search-panel__actions .is-layout-placeholder {
+  pointer-events: none;
+  visibility: hidden;
+}
+
+.segment-editor-toolbar {
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.panel--editor,
+.segment-editor-results,
+.segment-editor-list-stage {
+  min-width: 0;
+  overflow-anchor: none;
+}
+
+.segment-editor-results {
+  display: grid;
+  grid-template-rows: auto minmax(390px, calc(100vh - 244px));
+  min-height: 0;
+}
+
+.segment-editor-list-stage {
+  height: calc(100vh - 244px);
+  min-height: 390px;
+  overflow: hidden;
+}
+
+.segment-editor-list-stage > .virtual-list {
+  height: 100%;
+  min-height: 0;
+}
+
+.segment-editor-toolbar__search.is-active {
+  border-color: #69ad9d;
+  background: linear-gradient(180deg, #edf7f4, #d7ece6);
+  color: #0b6658;
+  box-shadow: 0 6px 14px rgba(13, 122, 104, 0.12);
+}
+
+.segment-editor-toolbar .workbench-action:not(:disabled):hover,
+.segment-editor-toolbar .workbench-action:not(:disabled):active {
+  transform: none;
+}
+
+.segment-editor-toolbar__title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.segment-editor-toolbar__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+  margin-left: auto;
+}
+
+.segment-editor-toolbar__filter {
+  flex: 0 1 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  min-width: 0;
+  margin: 0;
+}
+
+.segment-editor-toolbar__filter-label {
+  flex: 0 0 auto;
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.segment-editor-toolbar__filter-select {
+  width: 148px;
+  min-width: 148px;
+  background-color: var(--surface-panel);
+  box-shadow: none;
+}
+
+.segment-editor-toolbar__revision {
+  justify-content: flex-end;
 }
 
 .workbench-search-empty {
-  min-height: 240px;
+  min-height: 0;
+  height: 100%;
   border: 1px dashed var(--line-soft);
-  border-radius: 14px;
+  border-radius: 0 0 6px 6px;
   background: rgba(248, 250, 252, 0.72);
+}
+
+.workbench-panel-pop-enter-active,
+.workbench-panel-pop-leave-active {
+  overflow: hidden;
+  transition:
+    opacity 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    transform 200ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    filter 180ms ease,
+    max-height 220ms ease,
+    margin 220ms ease,
+    padding-top 220ms ease,
+    padding-bottom 220ms ease;
+}
+
+.workbench-panel-pop-enter-from,
+.workbench-panel-pop-leave-to {
+  max-height: 0;
+  margin-top: 0;
+  margin-bottom: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  opacity: 0;
+  filter: blur(1px);
+  transform: translateY(-8px) scale(0.985);
+}
+
+.workbench-panel-pop-enter-to,
+.workbench-panel-pop-leave-from {
+  max-height: 520px;
+  opacity: 1;
+  filter: blur(0);
+  transform: translateY(0) scale(1);
 }
 
 .workbench-resource-panel__actions {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
+  margin-left: auto;
 }
 
 .workbench-revision-menu {
@@ -1570,6 +2990,7 @@ onBeforeRouteLeave(async () => {
   background: var(--rail-hover-bg);
   color: var(--rail-active-text);
   box-shadow: 0 10px 18px var(--rail-shadow);
+  transform: translateX(-1px);
 }
 
 .workbench-page .workbench-rail__button.is-active {
@@ -1577,6 +2998,7 @@ onBeforeRouteLeave(async () => {
   background: var(--rail-active-bg);
   color: var(--rail-active-text);
   box-shadow: 0 12px 22px var(--rail-active-shadow);
+  transform: translateX(-2px);
 }
 
 .workbench-rail__button--paper {
@@ -1666,7 +3088,44 @@ onBeforeRouteLeave(async () => {
   text-align: right;
 }
 
+@media (max-width: 1180px) {
+  .segment-editor-results {
+    grid-template-rows: auto 420px;
+  }
+
+  .segment-editor-list-stage {
+    height: 420px;
+    min-height: 0;
+  }
+}
+
 @media (max-width: 720px) {
+  .segment-editor-toolbar__actions {
+    width: 100%;
+    justify-content: stretch;
+    margin-left: 0;
+  }
+
+  .segment-editor-toolbar__filter,
+  .segment-editor-toolbar__search,
+  .segment-editor-toolbar__revision {
+    flex: 1 1 100%;
+  }
+
+  .segment-editor-toolbar__filter {
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+
+  .segment-editor-toolbar__filter-label {
+    width: 100%;
+  }
+
+  .segment-editor-toolbar__filter-select {
+    width: 100%;
+    min-width: 0;
+  }
+
   .workbench-search-panel__actions {
     width: 100%;
     margin-left: 0;
@@ -1676,8 +3135,40 @@ onBeforeRouteLeave(async () => {
     flex: 1 1 0;
   }
 
+  .segment-editor-results {
+    grid-template-rows: auto 520px;
+  }
+
+  .segment-editor-list-stage {
+    height: 520px;
+    min-height: 0;
+  }
+
+  .workbench-guidelines-panel__head,
+  .workbench-guidelines-panel__actions {
+    align-items: stretch;
+  }
+
+  .workbench-guidelines-panel__head {
+    flex-direction: column;
+  }
+
   .shortcut-item {
     flex-direction: column;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workbench-action,
+  .workbench-panel-pop-enter-active,
+  .workbench-panel-pop-leave-active {
+    transition: none;
+  }
+
+  .workbench-action:not(:disabled):hover,
+  .workbench-panel-pop-enter-from,
+  .workbench-panel-pop-leave-to {
+    transform: none;
   }
 }
 </style>

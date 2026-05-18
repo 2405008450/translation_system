@@ -13,6 +13,7 @@ from app.services.adapters.exceptions import (
     ParseError,
     UnsupportedFormatError,
 )
+from app.services.adapters.export_service import ExportService
 from app.services.adapters.export_formats import (
     EXPORT_OPTIONS,
     FORMAT_EXPORT_SUPPORT,
@@ -48,6 +49,7 @@ class _AdapterSpec:
 
 _DEFAULT_ADAPTER_SPECS = (
     _AdapterSpec("app.services.adapters.txt_adapter", "TxtAdapter"),
+    _AdapterSpec("app.services.adapters.docx_adapter", "DocxAdapter"),
     _AdapterSpec("app.services.adapters.xlsx_adapter", "XlsxAdapter"),
     _AdapterSpec("app.services.adapters.pdf_adapter", "PdfAdapter"),
     _AdapterSpec("app.services.adapters.pptx_adapter", "PptxAdapter"),
@@ -134,6 +136,7 @@ __all__ = [
     "BlockNode",
     "DocumentAST",
     "EXPORT_OPTIONS",
+    "ExportService",
     "ExportError",
     "FORMAT_EXPORT_SUPPORT",
     "FileTooLargeError",

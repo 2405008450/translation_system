@@ -3,8 +3,10 @@ PDF 适配器模块 - 解析 PDF 文件
 
 Requirements: 8.1, 8.2, 8.3, 8.4, 8.5
 """
+from __future__ import annotations
+
 from io import BytesIO
-from typing import List
+from typing import List, Optional
 
 import fitz  # PyMuPDF
 
@@ -136,7 +138,7 @@ class PdfAdapter(FormatAdapter):
         
         return nodes
 
-    def _parse_table(self, table, page_num: int) -> BlockNode | None:
+    def _parse_table(self, table, page_num: int) -> Optional[BlockNode]:
         """解析表格
         
         Args:
@@ -144,7 +146,7 @@ class PdfAdapter(FormatAdapter):
             page_num: 页码
             
         Returns:
-            BlockNode | None: 表格节点
+            Optional[BlockNode]: 表格节点
         """
         try:
             data = table.extract()

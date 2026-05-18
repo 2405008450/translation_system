@@ -4,6 +4,7 @@ import {
   Copy,
   Database,
   Filter,
+  Flag,
   Loader2,
   MoreHorizontal,
   Plus,
@@ -18,20 +19,24 @@ import { useRouter } from 'vue-router'
 import { http } from '../api/http'
 import Modal from '../components/base/Modal.vue'
 import DataTable from '../components/DataTable.vue'
+import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
 import Pagination from '../components/Pagination.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { useToast } from '../composables/useToast'
-import { getLanguageLabel, languageOptions } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
-import type { TermBase } from '../types/api'
-import { getProgressStyle } from '../utils/progress'
+import { getProgressStyle, isProgressComplete } from '../utils/progress'
+import type { IssueMarker } from '../types/api'
 
 interface ProjectItem {
   id: string
+  name: string
   filename: string
   status: string
   progress: number
+  file_count: number
+  issue_count: number
+  open_issue_count: number
   total_segments: number
   translated_segments: number
   source_language: string | null
@@ -69,18 +74,15 @@ const selectedIds = ref(new Set<string>())
 const sortKey = ref('')
 const sortOrder = ref<'asc' | 'desc'>('desc')
 const pageError = ref('')
-const termBases = ref<TermBase[]>([])
-const loadingTermBases = ref(false)
 
 const showCreateDialog = ref(false)
 const creating = ref(false)
 const formError = ref('')
+const showIssueDialog = ref(false)
+const issueTarget = ref<ProjectItem | null>(null)
 
 const defaultForm = () => ({
   name: '',
-  source_language: '',
-  target_language: '',
-  term_base_id: '',
   deadline: '',
   access_level: 'team' as 'team' | 'private' | 'public',
 })
@@ -97,8 +99,8 @@ const columns = computed<DataTableColumn[]>(() => ([
   { key: 'filename', label: t('common.actions.details'), sortable: true },
   { key: 'status', label: t('projectList.status.current'), width: '110px' },
   { key: 'progress', label: t('projectList.status.progress'), width: '180px' },
-  { key: 'source_language', label: t('projectList.form.sourceLanguage'), width: '140px' },
-  { key: 'target_language', label: t('projectList.form.targetLanguage'), width: '140px' },
+  { key: 'file_count', label: t('projectDetail.base.fileCount'), width: '110px', align: 'right' },
+  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '120px' },
   { key: 'access_level', label: t('projectList.status.access'), width: '110px' },
   { key: 'creator', label: t('projectList.status.creator'), width: '130px' },
   { key: 'created_at', label: t('projectList.summaries.createdAt'), width: '120px', sortable: true },
@@ -106,16 +108,6 @@ const columns = computed<DataTableColumn[]>(() => ([
 ]))
 
 const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
-const availableTermBases = computed(() => {
-  if (!form.source_language || !form.target_language) {
-    return termBases.value
-  }
-
-  return termBases.value.filter((termBase) => (
-    termBase.source_language === form.source_language
-    && termBase.target_language === form.target_language
-  ))
-})
 
 async function loadProjects() {
   loading.value = true
@@ -138,18 +130,6 @@ async function loadProjects() {
   }
 }
 
-async function loadTermBases() {
-  loadingTermBases.value = true
-  try {
-    const { data } = await http.get<TermBase[]>('/term-bases')
-    termBases.value = data
-  } catch (error) {
-    console.error('Failed to load term bases:', error)
-  } finally {
-    loadingTermBases.value = false
-  }
-}
-
 function resetForm() {
   Object.assign(form, defaultForm())
   formError.value = ''
@@ -165,27 +145,12 @@ async function createProject() {
     formError.value = t('projectList.errors.requiredName')
     return
   }
-  if (!form.source_language) {
-    formError.value = t('projectList.errors.requiredSource')
-    return
-  }
-  if (!form.target_language) {
-    formError.value = t('projectList.errors.requiredTarget')
-    return
-  }
-  if (form.source_language === form.target_language) {
-    formError.value = t('projectList.errors.sameLanguage')
-    return
-  }
 
   creating.value = true
   formError.value = ''
   try {
     const { data } = await http.post<ProjectCreateResponse>('/projects', {
       name: form.name.trim(),
-      source_language: form.source_language,
-      target_language: form.target_language,
-      term_base_id: form.term_base_id || null,
       deadline: form.deadline || null,
       access_level: form.access_level,
     })
@@ -210,7 +175,7 @@ async function createProject() {
 async function deleteProjectIds(ids: string[], successMessage: string) {
   pageError.value = ''
   try {
-    await Promise.all(ids.map((id) => http.delete(`/file-records/${id}`)))
+    await Promise.all(ids.map((id) => http.delete(`/projects/${id}`)))
     selectedIds.value = new Set()
     await loadProjects()
     toast.success(successMessage)
@@ -295,6 +260,18 @@ function goToAssets() {
   void router.push({ name: 'tm' })
 }
 
+function openIssueDialog(row: ProjectItem) {
+  issueTarget.value = row
+  showIssueDialog.value = true
+}
+
+async function handleIssueSaved(_marker: IssueMarker) {
+  showIssueDialog.value = false
+  issueTarget.value = null
+  toast.success(t('issueMarker.messages.saved'))
+  await loadProjects()
+}
+
 let searchTimer: ReturnType<typeof setTimeout> | null = null
 
 watch(searchQuery, () => {
@@ -307,22 +284,12 @@ watch(searchQuery, () => {
   }, 300)
 })
 
-watch(() => [form.source_language, form.target_language], () => {
-  if (
-    form.term_base_id
-    && !availableTermBases.value.some((termBase) => termBase.id === form.term_base_id)
-  ) {
-    form.term_base_id = ''
-  }
-})
-
 watch([currentPage, pageSize], () => {
   void loadProjects()
 })
 
 onMounted(() => {
   void loadProjects()
-  void loadTermBases()
 })
 </script>
 
@@ -414,18 +381,31 @@ onMounted(() => {
         <template #progress="{ row }">
           <div class="progress-bar">
             <div class="progress-bar__track">
-              <div class="progress-bar__fill" :style="getProgressStyle(row.progress)" />
+              <div
+                class="progress-bar__fill"
+                :class="{ 'is-complete': isProgressComplete(row.progress) }"
+                :style="getProgressStyle(row.progress, row.status)"
+              />
             </div>
             <span class="progress-bar__text">{{ row.progress }}%</span>
           </div>
         </template>
 
-        <template #source_language="{ row }">
-          <span>{{ row.source_language ? getLanguageLabel(row.source_language) : '--' }}</span>
+        <template #file_count="{ row }">
+          <span>{{ row.file_count }}</span>
         </template>
 
-        <template #target_language="{ row }">
-          <span>{{ row.target_language ? getLanguageLabel(row.target_language) : '--' }}</span>
+        <template #open_issue_count="{ row }">
+          <button
+            class="issue-badge"
+            :class="{ 'is-active': Number(row.open_issue_count || 0) > 0 }"
+            type="button"
+            :title="t('issueMarker.actions.open')"
+            @click="openIssueDialog(row as ProjectItem)"
+          >
+            <Flag :size="13" />
+            {{ Number(row.open_issue_count || 0) > 0 ? row.open_issue_count : t('common.none') }}
+          </button>
         </template>
 
         <template #access_level="{ row }">
@@ -450,6 +430,15 @@ onMounted(() => {
 
         <template #actions="{ row }">
           <div class="project-row-actions">
+            <button
+              class="data-table__actions-btn"
+              type="button"
+              :title="t('issueMarker.actions.open')"
+              :aria-label="t('issueMarker.actions.open')"
+              @click="openIssueDialog(row as ProjectItem)"
+            >
+              <Flag :size="14" />
+            </button>
             <button
               class="data-table__actions-btn"
               type="button"
@@ -502,54 +491,6 @@ onMounted(() => {
         </label>
 
         <label class="field">
-          <span class="field__label">{{ t('projectList.form.sourceLanguage') }} <span class="field__required">*</span></span>
-          <select v-model="form.source_language" class="field__control">
-            <option value="" disabled>{{ t('projectList.form.sourcePlaceholder') }}</option>
-            <option
-              v-for="lang in languageOptions"
-              :key="lang.code"
-              :value="lang.code"
-              :disabled="lang.code === form.target_language"
-            >
-              {{ lang.label }}
-            </option>
-          </select>
-        </label>
-
-        <label class="field">
-          <span class="field__label">{{ t('projectList.form.targetLanguage') }} <span class="field__required">*</span></span>
-          <select v-model="form.target_language" class="field__control">
-            <option value="" disabled>{{ t('projectList.form.targetPlaceholder') }}</option>
-            <option
-              v-for="lang in languageOptions"
-              :key="lang.code"
-              :value="lang.code"
-              :disabled="lang.code === form.source_language"
-            >
-              {{ lang.label }}
-            </option>
-          </select>
-        </label>
-
-        <label class="field">
-          <span class="field__label">{{ t('taskList.fields.termBase') }}</span>
-          <select
-            v-model="form.term_base_id"
-            class="field__control"
-            :disabled="loadingTermBases"
-          >
-            <option value="">{{ t('taskList.hints.noTermBase') }}</option>
-            <option
-              v-for="termBase in availableTermBases"
-              :key="termBase.id"
-              :value="termBase.id"
-            >
-              {{ termBase.name }}（{{ getLanguageLabel(termBase.source_language) }} → {{ getLanguageLabel(termBase.target_language) }}）
-            </option>
-          </select>
-        </label>
-
-        <label class="field">
           <span class="field__label">{{ t('projectList.form.deadline') }}</span>
           <input
             v-model="form.deadline"
@@ -588,6 +529,14 @@ onMounted(() => {
         </button>
       </template>
     </Modal>
+
+    <IssueMarkerDialog
+      :open="showIssueDialog"
+      :project-id="issueTarget?.id ?? null"
+      :context-label="issueTarget?.filename ?? ''"
+      @close="showIssueDialog = false"
+      @saved="handleIssueSaved"
+    />
   </div>
 </template>
 
@@ -628,6 +577,26 @@ onMounted(() => {
   display: flex;
   gap: 4px;
   justify-content: center;
+}
+
+.issue-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.issue-badge.is-active {
+  border-color: color-mix(in srgb, var(--state-warning) 45%, var(--line-soft));
+  background: var(--state-warning-bg);
+  color: var(--state-warning);
 }
 
 .project-status {

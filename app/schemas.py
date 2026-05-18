@@ -13,6 +13,7 @@ class TMMatchCandidate(BaseModel):
     source_text: str
     target_text: str
     score: float
+    diff_html: str | None = None
     collection_name: str | None = None
     creator_name: str | None = None
     created_at: str | None = None

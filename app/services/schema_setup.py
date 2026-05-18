@@ -42,6 +42,32 @@ REQUIRED_SCHEMA = {
         "target_language",
     },
     "users": {"nickname"},
+    "projects": {
+        "id",
+        "name",
+        "status",
+        "document_parse_mode",
+        "source_language",
+        "target_language",
+        "creator_id",
+        "deadline",
+        "access_level",
+        "translation_guidelines",
+        "created_at",
+        "updated_at",
+    },
+    "file_records": {
+        "project_id",
+        "document_parse_mode",
+        "document_parse_options",
+        "source_language",
+        "target_language",
+        "creator_id",
+        "collection_id",
+        "term_base_id",
+        "deadline",
+        "access_level",
+    },
     "segment_revisions": {
         "id",
         "file_record_id",
@@ -54,6 +80,23 @@ REQUIRED_SCHEMA = {
         "author_id",
         "resolved_by_id",
         "created_at",
+        "resolved_at",
+    },
+    "issue_markers": {
+        "id",
+        "project_id",
+        "file_record_id",
+        "title",
+        "description",
+        "category",
+        "severity",
+        "status",
+        "page_url",
+        "user_agent",
+        "reporter_id",
+        "resolved_by_id",
+        "created_at",
+        "updated_at",
         "resolved_at",
     },
 }
@@ -317,6 +360,265 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 END IF;
             END
             $$;
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS projects (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                name VARCHAR(200) NOT NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'draft',
+                document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full',
+                source_language VARCHAR(20),
+                target_language VARCHAR(20),
+                creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                deadline TIMESTAMP,
+                access_level VARCHAR(20) NOT NULL DEFAULT 'team',
+                translation_guidelines TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full'
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS source_language VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS target_language VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS deadline TIMESTAMP
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS access_level VARCHAR(20) NOT NULL DEFAULT 'team'
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS translation_guidelines TEXT NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_projects_creator_id
+            ON projects (creator_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_projects_status
+            ON projects (status)
+            """,
+            """
+            DROP TRIGGER IF EXISTS update_projects_updated_at ON projects
+            """,
+            """
+            CREATE TRIGGER update_projects_updated_at
+            BEFORE UPDATE ON projects
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column()
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full'
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS document_parse_options TEXT NOT NULL DEFAULT '{}'
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS source_language VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS target_language VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS collection_id UUID REFERENCES memory_bases(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS term_base_id UUID REFERENCES term_bases(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS deadline TIMESTAMP
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS access_level VARCHAR(20) NOT NULL DEFAULT 'team'
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_file_records_project_id
+            ON file_records (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_file_records_creator_id
+            ON file_records (creator_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_file_records_status
+            ON file_records (status)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_file_records_source_language
+            ON file_records (source_language)
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS issue_markers (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID REFERENCES file_records(id) ON DELETE SET NULL,
+                title VARCHAR(160) NOT NULL DEFAULT '',
+                description TEXT NOT NULL,
+                category VARCHAR(30) NOT NULL DEFAULT 'other',
+                severity VARCHAR(20) NOT NULL DEFAULT 'medium',
+                status VARCHAR(20) NOT NULL DEFAULT 'open',
+                page_url TEXT,
+                user_agent TEXT,
+                reporter_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                resolved_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                resolved_at TIMESTAMP
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS file_record_id UUID REFERENCES file_records(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS title VARCHAR(160) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS description TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS category VARCHAR(30) NOT NULL DEFAULT 'other'
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS severity VARCHAR(20) NOT NULL DEFAULT 'medium'
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'open'
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS page_url TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS user_agent TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS reporter_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS resolved_by_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            ALTER TABLE IF EXISTS issue_markers
+            ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_issue_markers_project_id
+            ON issue_markers (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_issue_markers_file_record_id
+            ON issue_markers (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_issue_markers_status
+            ON issue_markers (status)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_issue_markers_reporter_id
+            ON issue_markers (reporter_id)
+            """,
+            """
+            DROP TRIGGER IF EXISTS update_issue_markers_updated_at ON issue_markers
+            """,
+            """
+            CREATE TRIGGER update_issue_markers_updated_at
+            BEFORE UPDATE ON issue_markers
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column()
+            """,
+            """
+            INSERT INTO projects (
+                id,
+                name,
+                status,
+                source_language,
+                target_language,
+                creator_id,
+                deadline,
+                access_level,
+                created_at,
+                updated_at
+            )
+            SELECT
+                fr.id,
+                fr.filename,
+                fr.status,
+                fr.source_language,
+                fr.target_language,
+                fr.creator_id,
+                fr.deadline,
+                COALESCE(NULLIF(fr.access_level, ''), 'team'),
+                fr.created_at,
+                fr.updated_at
+            FROM file_records AS fr
+            WHERE fr.project_id IS NULL
+            ON CONFLICT (id) DO NOTHING
+            """,
+            """
+            UPDATE file_records AS fr
+            SET project_id = fr.id
+            WHERE fr.project_id IS NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM projects AS p
+                  WHERE p.id = fr.id
+              )
             """,
             f"""
             CREATE TABLE IF NOT EXISTS segment_revisions (

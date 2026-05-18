@@ -2,8 +2,13 @@ import { ref } from 'vue'
 import { defineStore } from 'pinia'
 import type { AxiosProgressEvent } from 'axios'
 
+import {
+  isImportTaskAccepted,
+  waitForImportTask,
+  type ImportTaskAccepted,
+} from '../api/importTasks'
 import { http } from '../api/http'
-import type { FileRecordSummary } from '../types/api'
+import type { DocumentParseMode, DocumentParseOptions, FileRecordSummary } from '../types/api'
 
 interface UploadingState {
   active: boolean
@@ -49,11 +54,20 @@ export const useTaskStore = defineStore('task', () => {
     const loaded = event.loaded || 0
     uploading.value = {
       ...uploading.value,
-      percent: total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0,
+      percent: total > 0 ? Math.min(40, Math.round((loaded / total) * 40)) : 0,
     }
   }
 
-  async function uploadTask(file: File, threshold = 0.6, collectionIds: string[] = [], termBaseId: string | null = null) {
+  async function uploadTask(
+    file: File,
+    threshold = 0.6,
+    collectionIds: string[] = [],
+    termBaseId: string | null = null,
+    sourceLanguage = '',
+    targetLanguage = '',
+    documentParseMode: DocumentParseMode = 'full',
+    documentParseOptions: DocumentParseOptions | null = null,
+  ) {
     uploading.value = {
       active: true,
       percent: 0,
@@ -63,19 +77,32 @@ export const useTaskStore = defineStore('task', () => {
       const formData = new FormData()
       formData.append('file', file)
       formData.append('threshold', String(threshold))
+      formData.append('source_language', sourceLanguage)
+      formData.append('target_language', targetLanguage)
+      formData.append('document_parse_mode', documentParseMode)
+      if (documentParseOptions) {
+        formData.append('document_parse_options', JSON.stringify(documentParseOptions))
+      }
       collectionIds.forEach((collectionId) => {
         formData.append('collection_ids', collectionId)
       })
       if (termBaseId) {
         formData.append('term_base_id', termBaseId)
       }
-      const { data } = await http.post<{ id: string }>('/file-records', formData, {
+      const { data } = await http.post<{ id: string } | ImportTaskAccepted>('/file-records', formData, {
         headers: {
           'Content-Type': 'multipart/form-data',
         },
         onUploadProgress: handleUploadProgress,
       })
-      await fetchTasks()
+      if (isImportTaskAccepted(data)) {
+        return await waitForImportTask<{ id: string }>(data.task_id, (status) => {
+          uploading.value = {
+            ...uploading.value,
+            percent: Math.min(100, 40 + Math.round(status.progress * 0.6)),
+          }
+        })
+      }
       return data
     } finally {
       resetUploading()

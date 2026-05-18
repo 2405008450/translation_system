@@ -12,16 +12,29 @@ function mergeSegment(segments: DiffSegment[], nextSegment: DiffSegment) {
 
   const lastSegment = segments[segments.length - 1]
   if (lastSegment && lastSegment.type === nextSegment.type) {
-    lastSegment.text += nextSegment.text
+    // 因为是倒序遍历，新的 token 应该放在前面
+    lastSegment.text = nextSegment.text + lastSegment.text
     return
   }
 
   segments.push(nextSegment)
 }
 
+/**
+ * 将文本分割为 token 列表，用于单词级别的差异比较
+ * - 英文单词（包括带连字符的复合词）作为整体
+ * - 中文每个字符作为独立 token
+ * - 标点符号和空白符单独处理
+ */
+function tokenize(text: string): string[] {
+  if (!text) return []
+  // 匹配：英文单词（含连字符）| 中文字符 | 空白符 | 其他标点
+  return text.match(/[a-zA-Z0-9]+(?:[-'][a-zA-Z0-9]+)*|[\u4e00-\u9fff]|\s+|[^\s\w\u4e00-\u9fff]+/g) || []
+}
+
 export function computeDiff(oldText: string, newText: string): DiffSegment[] {
-  const oldTokens = Array.from(oldText || '')
-  const newTokens = Array.from(newText || '')
+  const oldTokens = tokenize(oldText)
+  const newTokens = tokenize(newText)
   const oldLength = oldTokens.length
   const newLength = newTokens.length
   const matrix = Array.from({ length: oldLength + 1 }, () => Array<number>(newLength + 1).fill(0))
@@ -70,7 +83,5 @@ export function computeDiff(oldText: string, newText: string): DiffSegment[] {
     }
   }
 
-  return segments
-    .reverse()
-    .map((segment) => ({ ...segment, text: Array.from(segment.text).reverse().join('') }))
+  return segments.reverse()
 }

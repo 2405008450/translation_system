@@ -37,7 +37,13 @@ from app.services.file_record_service import (
 from app.services.file_parser import parse_uploaded_file
 from app.services.matcher import match_sentences_with_stats
 from app.services.sentence_splitter import split_sentences
-from app.services.tm_importer import XLSX_EXTENSIONS, import_tm_from_xlsx_upload
+from app.services.tm_importer import (
+    SDLTM_EXTENSIONS,
+    TM_IMPORT_EXTENSIONS,
+    XLSX_EXTENSIONS,
+    import_tm_from_sdltm_upload,
+    import_tm_from_xlsx_upload,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -274,14 +280,18 @@ def continue_task(
 
     source_bytes = load_file_record_source(file_record)
     if source_bytes:
-        source_workspace = get_cached_docx_workspace(source_bytes)
+        document_parse_mode = getattr(file_record, "document_parse_mode", "full")
+        source_workspace = get_cached_docx_workspace(
+            source_bytes,
+            document_parse_mode=document_parse_mode,
+        )
         source_html_by_sentence_id = _build_source_html_map_from_segments(source_workspace["segments"])
         results = _build_match_results(
             segments,
             tm_target_text_map=tm_target_text_map,
             source_html_by_sentence_id=source_html_by_sentence_id,
         )
-        document_html = build_docx_preview_html(source_bytes)
+        document_html = build_docx_preview_html(source_bytes, document_parse_mode=document_parse_mode)
     else:
         document_html = build_document_html_from_segments(segments) if segments else ""
     supports_preview = bool(document_html)
@@ -320,7 +330,11 @@ def export_task_docx(
 
     segments = list_segments_for_file_record(db, file_record_id)
     try:
-        translated_docx = export_translated_docx(raw_bytes=raw_bytes, segments=segments)
+        translated_docx = export_translated_docx(
+            raw_bytes=raw_bytes,
+            segments=segments,
+            document_parse_mode=getattr(file_record, "document_parse_mode", "full"),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -361,13 +375,19 @@ async def upload_and_match(
         route_match_ms = (perf_counter() - workspace_started_at) * 1000
 
         # 使用预计算的 workspace 数据创建持久化文档，避免重复解析和匹配
-        file_record = create_file_record_with_segments(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=file.filename or "untitled.docx",
-            similarity_threshold=threshold,
-            workspace_data=workspace_data,
-        )
+        try:
+            file_record = create_file_record_with_segments(
+                db=db,
+                raw_bytes=raw_bytes,
+                filename=file.filename or "untitled.docx",
+                similarity_threshold=threshold,
+                workspace_data=workspace_data,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        db.refresh(file_record)
         file_record_id = file_record.id
 
         document_html = workspace_data["document_html"]
@@ -426,7 +446,7 @@ async def upload_and_match(
             r.sentence_id = f"sent-{i+1:05d}"
             r.source = "tm" if r.status in ("exact", "fuzzy") else "none"
             r.tm_target_text = r.target_text if r.source == "tm" else ""
-        
+
     logger.info(
         "match request file=%s total=%s prepared=%s unique=%s exact=%s fuzzy=%s none=%s "
         "parse_ms=%.2f split_ms=%.2f exact_ms=%.2f fuzzy_ms=%.2f route_match_ms=%.2f total_match_ms=%.2f candidates=%s",
@@ -480,14 +500,18 @@ async def upload_and_match(
             source_bytes = load_file_record_source(doc_result["file_record"])
             can_export_docx = bool(source_bytes)
             if source_bytes:
-                source_workspace = get_cached_docx_workspace(source_bytes)
+                document_parse_mode = getattr(doc_result["file_record"], "document_parse_mode", "full")
+                source_workspace = get_cached_docx_workspace(
+                    source_bytes,
+                    document_parse_mode=document_parse_mode,
+                )
                 source_html_by_sentence_id = _build_source_html_map_from_segments(source_workspace["segments"])
                 display_results = _build_match_results(
                     doc_result["segments"],
                     tm_target_text_map=tm_target_text_map,
                     source_html_by_sentence_id=source_html_by_sentence_id,
                 )
-                document_html = build_docx_preview_html(source_bytes)
+                document_html = build_docx_preview_html(source_bytes, document_parse_mode=document_parse_mode)
             else:
                 document_html = build_document_html_from_segments(doc_result["segments"]) if doc_result["segments"] else ""
 
@@ -520,9 +544,56 @@ async def open_workspace(
     threshold: float = Form(default=settings.default_similarity_threshold),
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
-    """已废弃，重定向到 /match"""
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url="/", status_code=303)
+    if not 0 <= threshold <= 1:
+        raise HTTPException(status_code=400, detail="模糊匹配阈值必须在 0 到 1 之间。")
+
+    filename = workspace_file.filename or ""
+    extension = f".{filename.split('.')[-1].lower()}" if filename else ""
+
+    # 支持的格式
+    supported_extensions = {".txt", ".docx", ".pdf", ".pptx", ".dita", ".ditamap", ".xml", ".svg", ".yaml", ".yml", ".json", ".php"}
+    if extension not in supported_extensions:
+        supported_list = ", ".join(sorted(supported_extensions))
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的文件格式 '{extension}'。支持的格式: {supported_list}"
+        )
+
+    raw_bytes = await workspace_file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="上传的文件为空。")
+
+    workspace_started_at = perf_counter()
+
+    # 使用适配器系统构建工作台
+    try:
+        workspace_data = build_workspace_with_adapters(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            similarity_threshold=threshold,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        logger.exception(f"解析文件失败: {filename}")
+        raise HTTPException(status_code=500, detail=f"解析文件失败: {str(e)}") from e
+
+    workspace_ms = (perf_counter() - workspace_started_at) * 1000
+
+    return templates.TemplateResponse(
+        request,
+        "workspace.html",
+        {
+            "request": request,
+            "filename": workspace_file.filename,
+            "threshold": threshold,
+            "document_html": workspace_data["document_html"],
+            "segments": workspace_data["segments"],
+            "match_stats": workspace_data["match_stats"],
+            "workspace_ms": round(workspace_ms, 2),
+        },
+    )
 
 
 @router.post("/import-xlsx", response_class=HTMLResponse)
@@ -532,21 +603,30 @@ async def import_xlsx(
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
     extension = f".{(xlsx_file.filename or '').split('.')[-1].lower()}" if xlsx_file.filename else ""
-    if extension not in XLSX_EXTENSIONS:
-        return _render_index(request, error_message="仅支持上传 .xlsx 文件。")
+    if extension not in TM_IMPORT_EXTENSIONS:
+        return _render_index(request, error_message="仅支持上传 .xlsx 或 .sdltm 文件。")
 
     raw_bytes = await xlsx_file.read()
     if not raw_bytes:
-        return _render_index(request, error_message="上传的 XLSX 文件为空。")
+        return _render_index(request, error_message="上传的文件为空。")
 
     try:
-        import_summary = import_tm_from_xlsx_upload(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=xlsx_file.filename or "uploaded.xlsx",
-            source_language="zh-CN",
-            target_language="en-US",
-        )
+        if extension in SDLTM_EXTENSIONS:
+            import_summary = import_tm_from_sdltm_upload(
+                db=db,
+                raw_bytes=raw_bytes,
+                filename=xlsx_file.filename or "uploaded.sdltm",
+                source_language="zh-CN",
+                target_language="en-US",
+            )
+        else:
+            import_summary = import_tm_from_xlsx_upload(
+                db=db,
+                raw_bytes=raw_bytes,
+                filename=xlsx_file.filename or "uploaded.xlsx",
+                source_language="zh-CN",
+                target_language="en-US",
+            )
     except Exception as exc:
         db.rollback()
         return _render_index(request, error_message=f"导入失败：{exc}")

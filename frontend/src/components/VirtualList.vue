@@ -1,10 +1,14 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 
+type VirtualItemKey = string | number
+type VirtualItemKeyResolver = string | ((item: any, index: number) => VirtualItemKey)
+
 const props = withDefaults(
   defineProps<{
     items: any[]
     itemHeight: number
+    itemKey?: VirtualItemKeyResolver
     overscan?: number
     adaptive?: boolean
     activeDescendant?: string | null
@@ -13,6 +17,7 @@ const props = withDefaults(
     overscan: 4,
     adaptive: false,
     activeDescendant: null,
+    itemKey: undefined,
   },
 )
 
@@ -26,6 +31,31 @@ const viewportHeight = ref(0)
 const heightCache = reactive<Record<number, number>>({})
 const rowObservers = new Map<number, ResizeObserver>()
 let containerResizeObserver: ResizeObserver | null = null
+
+function resolveItemKey(item: any, index: number): VirtualItemKey {
+  if (typeof props.itemKey === 'function') {
+    return props.itemKey(item, index)
+  }
+  if (typeof props.itemKey === 'string' && item && typeof item === 'object') {
+    const value = item[props.itemKey]
+    if (typeof value === 'string' || typeof value === 'number') {
+      return value
+    }
+  }
+  return index
+}
+
+const itemKeySignature = computed(() => (
+  props.items.map((item, index) => String(resolveItemKey(item, index))).join('\u001f')
+))
+
+function resetMeasuredHeights() {
+  Object.keys(heightCache).forEach((key) => {
+    delete heightCache[Number(key)]
+  })
+  rowObservers.forEach((observer) => observer.disconnect())
+  rowObservers.clear()
+}
 
 function getMeasuredHeight(index: number) {
   if (!props.adaptive) {
@@ -215,13 +245,11 @@ onMounted(async () => {
 })
 
 watch(
-  () => props.items.length,
-  async (length) => {
-    Object.keys(heightCache).forEach((key) => {
-      if (Number(key) >= length) {
-        delete heightCache[Number(key)]
-      }
-    })
+  itemKeySignature,
+  async () => {
+    if (props.adaptive) {
+      resetMeasuredHeights()
+    }
     await nextTick()
     updateViewportHeight()
     emitReachEndIfNeeded()
@@ -254,7 +282,7 @@ onBeforeUnmount(() => {
       >
         <div
           v-for="entry in visibleItems"
-          :key="entry.index"
+          :key="resolveItemKey(entry.item, entry.index)"
           :ref="(element) => setRowElement(element, entry.index)"
           class="virtual-list-row"
           role="listitem"

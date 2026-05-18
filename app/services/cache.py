@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import time
+import asyncio
 from dataclasses import dataclass
 from functools import lru_cache
-from threading import Lock
 from typing import Any
 
 from app.config import get_settings
@@ -34,27 +34,36 @@ class _MemoryCacheEntry:
 class _InMemoryJsonCache:
     def __init__(self) -> None:
         self._entries: dict[str, _MemoryCacheEntry] = {}
-        self._lock = Lock()
+        self._lock = asyncio.Lock()
 
     def get_json(self, key: str) -> Any | None:
-        with self._lock:
-            entry = self._entries.get(key)
-            if entry is None:
-                return None
-            if entry.expires_at is not None and entry.expires_at <= time.time():
-                self._entries.pop(key, None)
-                return None
-            return json.loads(entry.payload)
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        if entry.expires_at is not None and entry.expires_at <= time.time():
+            self._entries.pop(key, None)
+            return None
+        return json.loads(entry.payload)
 
     def set_json(self, key: str, value: Any, ttl_seconds: int | None = None) -> None:
         expires_at = None if ttl_seconds is None else time.time() + ttl_seconds
         payload = json.dumps(value, ensure_ascii=False)
-        with self._lock:
-            self._entries[key] = _MemoryCacheEntry(payload=payload, expires_at=expires_at)
+        self._entries[key] = _MemoryCacheEntry(payload=payload, expires_at=expires_at)
 
     def delete(self, key: str) -> None:
-        with self._lock:
-            self._entries.pop(key, None)
+        self._entries.pop(key, None)
+
+    async def aget_json(self, key: str) -> Any | None:
+        async with self._lock:
+            return self.get_json(key)
+
+    async def aset_json(self, key: str, value: Any, ttl_seconds: int | None = None) -> None:
+        async with self._lock:
+            self.set_json(key, value, ttl_seconds)
+
+    async def adelete(self, key: str) -> None:
+        async with self._lock:
+            self.delete(key)
 
 
 class _RedisJsonCache:
@@ -98,6 +107,15 @@ class _RedisJsonCache:
         except RedisError as exc:
             logger.warning("cache redis delete failed key=%s error=%s", key, exc)
 
+    async def aget_json(self, key: str) -> Any | None:
+        return await asyncio.to_thread(self.get_json, key)
+
+    async def aset_json(self, key: str, value: Any, ttl_seconds: int | None = None) -> None:
+        await asyncio.to_thread(self.set_json, key, value, ttl_seconds)
+
+    async def adelete(self, key: str) -> None:
+        await asyncio.to_thread(self.delete, key)
+
 
 @lru_cache
 def _get_cache_backend() -> _InMemoryJsonCache | _RedisJsonCache:
@@ -127,3 +145,15 @@ def set_json(key: str, value: Any, ttl_seconds: int | None = None) -> None:
 
 def delete(key: str) -> None:
     _get_cache_backend().delete(key)
+
+
+async def aget_json(key: str) -> Any | None:
+    return await _get_cache_backend().aget_json(key)
+
+
+async def aset_json(key: str, value: Any, ttl_seconds: int | None = None) -> None:
+    await _get_cache_backend().aset_json(key, value, ttl_seconds)
+
+
+async def adelete(key: str) -> None:
+    await _get_cache_backend().adelete(key)

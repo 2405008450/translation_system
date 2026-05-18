@@ -1,9 +1,11 @@
 import hashlib
+import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
-from sqlalchemy import case, func
+from sqlalchemy import case, event, func, update
 from sqlalchemy.orm import Session
 
 from app.models import FileRecord, Segment, TranslationMemory, User
@@ -13,8 +15,18 @@ from app.services.document_storage import (
     resolve_source_file_path,
     save_source_file,
 )
+from app.services.document_workspace import (
+    DOCUMENT_PARSE_MODE_FULL,
+    normalize_document_parse_options,
+    normalize_document_parse_mode,
+)
 from app.services.revision_service import create_revision
 from app.services.task_file_service import build_task_workspace
+
+logger = logging.getLogger(__name__)
+
+# 支持通过 DOCX 专用流程处理的扩展名
+_DOCX_EXTENSIONS = {".docx"}
 
 
 SEGMENT_ORDERING = (
@@ -24,9 +36,42 @@ SEGMENT_ORDERING = (
     Segment.sentence_id.asc(),
 )
 
+_PENDING_SOURCE_FILES_KEY = "pending_source_files"
+
+
+@event.listens_for(Session, "after_commit")
+def _clear_committed_source_files(session: Session) -> None:
+    session.info.pop(_PENDING_SOURCE_FILES_KEY, None)
+
+
+@event.listens_for(Session, "after_rollback")
+def _cleanup_rolled_back_source_files(session: Session) -> None:
+    pending_source_files = session.info.pop(_PENDING_SOURCE_FILES_KEY, [])
+    for file_record_id, filename in pending_source_files:
+        try:
+            delete_source_file(file_record_id, filename)
+        except Exception:
+            logger.warning(
+                "failed to cleanup rolled back source file file_record_id=%s filename=%s",
+                file_record_id,
+                filename,
+                exc_info=True,
+            )
+
+
+def _remember_pending_source_file(db: Session, file_record_id: UUID, filename: str) -> None:
+    pending_source_files = db.info.setdefault(_PENDING_SOURCE_FILES_KEY, [])
+    pending_source_files.append((file_record_id, filename))
+
 
 def calculate_file_record_progress(total_segments: int, translated_segments: int) -> int:
-    return round(translated_segments / total_segments * 100) if total_segments > 0 else 0
+    if total_segments <= 0:
+        return 0
+    if translated_segments >= total_segments:
+        return 100
+    if translated_segments <= 0:
+        return 0
+    return min(99, int(translated_segments / total_segments * 100))
 
 
 def resolve_file_record_status(
@@ -57,18 +102,39 @@ def get_file_record_segment_counts(db: Session, file_record_id: UUID) -> tuple[i
 
 
 def sync_file_record_status(db: Session, file_record_id: UUID) -> str | None:
-    file_record = get_file_record(db, file_record_id)
-    if not file_record:
-        return None
-
     db.flush()
-    total_segments, translated_segments = get_file_record_segment_counts(db, file_record_id)
-    file_record.status = resolve_file_record_status(
-        file_record.status,
-        total_segments,
-        translated_segments,
+    total_segments = (
+        db.query(func.count(Segment.id))
+        .filter(Segment.file_record_id == file_record_id)
+        .scalar_subquery()
     )
-    return file_record.status
+    translated_segments = (
+        db.query(func.count(Segment.id))
+        .filter(
+            Segment.file_record_id == file_record_id,
+            Segment.target_text != "",
+        )
+        .scalar_subquery()
+    )
+    status_expr = case(
+        (FileRecord.status == "error", FileRecord.status),
+        (
+            total_segments > 0,
+            case(
+                (translated_segments >= total_segments, "completed"),
+                else_="in_progress",
+            ),
+        ),
+        else_=FileRecord.status,
+    )
+    result = db.execute(
+        update(FileRecord)
+        .where(FileRecord.id == file_record_id)
+        .values(status=status_expr)
+        .returning(FileRecord.status)
+        .execution_options(synchronize_session="fetch")
+    )
+    return result.scalar_one_or_none()
 
 
 def _count_filled_targets(items: list[dict]) -> int:
@@ -82,8 +148,12 @@ def create_file_record_with_segments(
     similarity_threshold: float = 0.6,
     workspace_data: dict | None = None,
     collection_ids: list[UUID] | None = None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: dict[str, object] | str | None = None,
 ) -> FileRecord:
     file_hash = hashlib.sha256(raw_bytes).hexdigest()
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
 
     if workspace_data is None:
         workspace_data = build_task_workspace(
@@ -92,6 +162,8 @@ def create_file_record_with_segments(
             filename=filename,
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
+            document_parse_mode=document_parse_mode,
+            document_parse_options=document_parse_options,
         )
 
     return _create_file_record_from_workspace(
@@ -100,6 +172,8 @@ def create_file_record_with_segments(
         file_hash=file_hash,
         workspace_data=workspace_data,
         raw_bytes=raw_bytes,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
     )
 
 
@@ -109,11 +183,17 @@ def _create_file_record_from_workspace(
     file_hash: str,
     workspace_data: dict,
     raw_bytes: bytes | None = None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: dict[str, object] | str | None = None,
 ) -> FileRecord:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
     file_record = FileRecord(
         filename=filename,
         file_hash=file_hash,
         status="in_progress",
+        document_parse_mode=document_parse_mode,
+        document_parse_options=json.dumps(document_parse_options, ensure_ascii=False, sort_keys=True),
     )
     db.add(file_record)
     db.flush()
@@ -147,17 +227,10 @@ def _create_file_record_from_workspace(
         _count_filled_targets(workspace_data["segments"]),
     )
 
-    try:
-        if raw_bytes is not None:
-            save_source_file(file_record.id, filename, raw_bytes)
-        db.commit()
-    except Exception:
-        db.rollback()
-        if raw_bytes is not None:
-            delete_source_file(file_record.id, filename)
-        raise
-
-    db.refresh(file_record)
+    if raw_bytes is not None:
+        save_source_file(file_record.id, filename, raw_bytes)
+        _remember_pending_source_file(db, file_record.id, filename)
+    db.flush()
     return file_record
 
 
@@ -206,6 +279,74 @@ def create_txt_file_record_with_segments(
     return file_record
 
 
+def create_file_record_via_adapter(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    similarity_threshold: float = 0.6,
+    collection_ids: list[UUID] | None = None,
+) -> FileRecord:
+    """通过适配器系统创建文件记录（支持多格式）"""
+    from app.services.adapters import get_registry, extract_segments
+    from app.services.matcher import match_sentences_with_stats
+
+    registry = get_registry()
+    adapter = registry.get_adapter(filename)
+    result = adapter.parse_with_validation(raw_bytes, filename)
+
+    segments_data = []
+    source_texts = []
+    for i, seg in enumerate(result.segments):
+        segments_data.append({
+            "sentence_id": seg.segment_id or f"sent-{i + 1:05d}",
+            "source_text": seg.source_text,
+            "display_text": seg.display_text,
+            "target_text": "",
+            "status": "none",
+            "score": 0.0,
+            "matched_source_text": None,
+            "block_type": "paragraph",
+            "block_index": i,
+            "row_index": None,
+            "cell_index": None,
+        })
+        source_texts.append(seg.source_text)
+
+    if source_texts:
+        match_results, _ = match_sentences_with_stats(
+            db=db,
+            sentences=source_texts,
+            auxiliary_sentences=source_texts,
+            similarity_threshold=similarity_threshold,
+            collection_ids=collection_ids,
+        )
+        for seg_data, match in zip(segments_data, match_results):
+            seg_data["status"] = match.status
+            seg_data["score"] = match.score
+            seg_data["matched_source_text"] = match.matched_source_text
+            seg_data["target_text"] = match.target_text or ""
+
+    workspace_data = {
+        "document_html": "",
+        "segments": segments_data,
+    }
+    try:
+        file_record = create_file_record_with_segments(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            similarity_threshold=similarity_threshold,
+            workspace_data=workspace_data,
+            collection_ids=collection_ids,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(file_record)
+    return file_record
+
+
 def get_file_record(db: Session, file_record_id: UUID) -> FileRecord | None:
     return db.query(FileRecord).filter(FileRecord.id == file_record_id).first()
 
@@ -239,18 +380,26 @@ def attach_source_document_to_file_record(
     source_filename: str,
     similarity_threshold: float = 0.6,
     collection_ids: list[UUID] | None = None,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: dict[str, object] | str | None = None,
 ) -> FileRecord:
     file_hash = hashlib.sha256(raw_bytes).hexdigest()
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
     workspace_data = build_task_workspace(
         db=db,
         raw_bytes=raw_bytes,
         filename=source_filename,
         similarity_threshold=similarity_threshold,
         collection_ids=collection_ids,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
     )
 
     file_record.file_hash = file_hash
     file_record.status = "in_progress"
+    file_record.document_parse_mode = document_parse_mode
+    file_record.document_parse_options = json.dumps(document_parse_options, ensure_ascii=False, sort_keys=True)
 
     for seg in workspace_data["segments"]:
         db.add(
@@ -359,6 +508,17 @@ def list_segments_for_llm_translation(
         "all": ["fuzzy", "none"],
         "all_with_exact": ["exact", "fuzzy", "none"],
     }
+    if scope == "empty_target_only":
+        return (
+            db.query(Segment)
+            .filter(
+                Segment.file_record_id == file_record_id,
+                func.trim(Segment.target_text) == "",
+            )
+            .order_by(*SEGMENT_ORDERING)
+            .all()
+        )
+
     statuses = statuses_by_scope.get(scope)
     if statuses is None:
         raise ValueError(f"不支持的 scope: {scope}")
