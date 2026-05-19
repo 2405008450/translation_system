@@ -466,12 +466,19 @@ onBeforeUnmount(() => {
       <div class="upload-form upload-form--inline upload-form--task">
         <label class="field">
           <span class="field__label">任务文件</span>
-          <input id="upload-file" class="field__control" type="file" :accept="uploadFileAccept" @change="onFileChange" />
+          <input
+            id="upload-file"
+            class="field__control"
+            data-testid="task-upload-file-input"
+            type="file"
+            :accept="uploadFileAccept"
+            @change="onFileChange"
+          />
         </label>
 
         <label class="field field--compact">
           <span class="field__label">{{ t('projectList.form.sourceLanguage') }}</span>
-          <select v-model="uploadSourceLanguage" class="field__control">
+          <select v-model="uploadSourceLanguage" class="field__control" data-testid="task-upload-source-language">
             <option value="" disabled>{{ t('projectList.form.sourcePlaceholder') }}</option>
             <option
               v-for="lang in languageOptions"
@@ -486,7 +493,7 @@ onBeforeUnmount(() => {
 
         <label class="field field--compact">
           <span class="field__label">{{ t('projectList.form.targetLanguage') }}</span>
-          <select v-model="uploadTargetLanguage" class="field__control">
+          <select v-model="uploadTargetLanguage" class="field__control" data-testid="task-upload-target-language">
             <option value="" disabled>{{ t('projectList.form.targetPlaceholder') }}</option>
             <option
               v-for="lang in languageOptions"
@@ -556,6 +563,7 @@ onBeforeUnmount(() => {
 
         <button
           class="button button--primary"
+          data-testid="task-upload-submit"
           type="button"
           :disabled="taskStore.uploading.active || !selectedFile || !uploadSourceLanguage || !uploadTargetLanguage"
           @click="uploadFile"
@@ -645,7 +653,7 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <div class="table-toolbar__right">
-            <button class="button" type="button" @click="showUploadForm = !showUploadForm">
+            <button class="button" data-testid="task-upload-toggle" type="button" @click="showUploadForm = !showUploadForm">
               <Upload :size="14" />
               {{ showUploadForm ? t('taskList.toolbar.collapseUpload') : t('taskList.toolbar.uploadTask') }}
             </button>
@@ -676,6 +684,8 @@ onBeforeUnmount(() => {
 
         <div class="table-page__body">
           <DataTable
+            test-id="task-table"
+            row-test-id-prefix="task-row"
             :columns="columns"
             :data="pagedProjects"
             :loading="projectsLoading"

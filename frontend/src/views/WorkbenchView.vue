@@ -1588,7 +1588,7 @@ onBeforeRouteLeave(async () => {
 </script>
 
 <template>
-  <div class="content-stack content-stack--workbench workbench-page">
+  <div class="content-stack content-stack--workbench workbench-page" data-testid="workbench-page">
     <section class="toolbar-panel workbench-toolbar">
       <div class="toolbar-panel__group workbench-toolbar__group">
         <button
@@ -1631,7 +1631,13 @@ onBeforeRouteLeave(async () => {
         </button>
 
         <div class="workbench-toolbar__actions">
-          <button class="button workbench-action workbench-action--save" type="button" :disabled="segmentStore.saving" @click="saveNow">
+          <button
+            class="button workbench-action workbench-action--save"
+            data-testid="workbench-save-button"
+            type="button"
+            :disabled="segmentStore.saving"
+            @click="saveNow"
+          >
             <Loader2 v-if="segmentStore.saving" class="lucide-spin" :size="14" />
             <Save v-else :size="14" />
             {{ segmentStore.saving ? t('common.actions.saving') : t('workbench.saveNow') }}
@@ -1639,6 +1645,7 @@ onBeforeRouteLeave(async () => {
 
           <button
             class="button workbench-action workbench-action--export"
+            data-testid="workbench-export-button"
             type="button"
             :disabled="!segmentStore.canExport"
             :title="exportButtonTitle"

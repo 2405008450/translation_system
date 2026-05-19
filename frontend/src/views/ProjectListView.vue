@@ -309,7 +309,7 @@ onMounted(() => {
         <span class="table-toolbar__summary">{{ t('projectList.total', { total: totalCount }) }}</span>
       </div>
       <div class="table-toolbar__right">
-        <button class="button button--primary" type="button" @click="openCreateDialog">
+        <button class="button button--primary" data-testid="project-create-button" type="button" @click="openCreateDialog">
           <Plus :size="14" />
           {{ t('projectList.create') }}
         </button>
@@ -349,6 +349,8 @@ onMounted(() => {
 
     <div class="table-page__body">
       <DataTable
+        test-id="project-table"
+        row-test-id-prefix="project-row"
         :columns="columns"
         :data="projects"
         :loading="loading"
@@ -478,12 +480,13 @@ onMounted(() => {
       width="min(560px, calc(100vw - 32px))"
       @close="showCreateDialog = false"
     >
-      <div class="form-grid">
+      <div class="form-grid" data-testid="project-create-dialog">
         <label class="field field--full">
           <span class="field__label">{{ t('projectList.form.name') }} <span class="field__required">*</span></span>
           <input
             v-model="form.name"
             class="field__control"
+            data-testid="project-create-name"
             type="text"
             :placeholder="t('projectList.form.namePlaceholder')"
             maxlength="200"
@@ -519,6 +522,7 @@ onMounted(() => {
         <button class="button" type="button" @click="showCreateDialog = false">{{ t('common.actions.cancel') }}</button>
         <button
           class="button button--primary"
+          data-testid="project-create-submit"
           type="button"
           :disabled="creating"
           @click="createProject"

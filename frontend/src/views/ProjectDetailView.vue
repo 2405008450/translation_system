@@ -788,7 +788,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div v-if="showUploadModal" class="upload-page">
+  <div v-if="showUploadModal" class="upload-page" data-testid="project-upload-page">
     <header class="upload-page__topbar">
       <button class="upload-page__back" type="button" :disabled="uploading" @click="closeUploadDialog">
         <ArrowLeft :size="15" />
@@ -809,6 +809,7 @@ onBeforeUnmount(() => {
             <input
               :key="uploadInputKey"
               class="sr-only"
+              data-testid="project-upload-file-input"
               type="file"
               multiple
               :accept="uploadFileAccept"
@@ -847,7 +848,7 @@ onBeforeUnmount(() => {
           <div class="upload-language-grid">
             <label class="field">
               <span class="field__label">{{ t('projectList.form.sourceLanguage') }} <span class="field__required">*</span></span>
-              <select v-model="uploadSourceLanguage" class="field__control">
+              <select v-model="uploadSourceLanguage" class="field__control" data-testid="project-upload-source-language">
                 <option value="" disabled>{{ t('projectList.form.sourcePlaceholder') }}</option>
                 <option
                   v-for="lang in languageOptions"
@@ -862,7 +863,7 @@ onBeforeUnmount(() => {
 
             <label class="field">
               <span class="field__label">{{ t('projectList.form.targetLanguage') }} <span class="field__required">*</span></span>
-              <select v-model="uploadTargetLanguage" class="field__control">
+              <select v-model="uploadTargetLanguage" class="field__control" data-testid="project-upload-target-language">
                 <option value="" disabled>{{ t('projectList.form.targetPlaceholder') }}</option>
                 <option
                   v-for="lang in languageOptions"
@@ -916,6 +917,7 @@ onBeforeUnmount(() => {
             </button>
             <button
               class="button button--primary"
+              data-testid="project-upload-submit"
               type="button"
               :disabled="uploading || selectedFiles.length === 0 || !uploadSourceLanguage || !uploadTargetLanguage"
               @click="uploadSourceDocument"
@@ -1186,6 +1188,7 @@ onBeforeUnmount(() => {
             </button>
             <button
               class="button button--primary"
+              data-testid="project-upload-open"
               type="button"
               :disabled="!canOpenUploadModal"
               :title="uploadButtonTitle || undefined"
@@ -1256,6 +1259,8 @@ onBeforeUnmount(() => {
         </div>
 
         <DataTable
+          test-id="project-file-table"
+          row-test-id-prefix="project-file-row"
           :columns="columns"
           :data="pagedRows"
           :loading="loading"
@@ -1273,6 +1278,7 @@ onBeforeUnmount(() => {
                 <button
                   v-if="canEnterWorkbench(row)"
                   class="pd-link-button"
+                  data-testid="project-file-open-workbench"
                   type="button"
                   @click="openWorkbench(row)"
                 >
