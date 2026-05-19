@@ -390,6 +390,7 @@ def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[st
     )
     if selected_collection_ids:
         file_record.collection_id = selected_collection_ids[0]
+        file_record.collection_ids_json = json.dumps([str(cid) for cid in selected_collection_ids])
         _apply_collection_language_pair(file_record, primary_collection)
     file_record.source_language = resolved_source_language
     file_record.target_language = resolved_target_language
@@ -471,6 +472,7 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
         file_record.target_language = resolved_target_language
         if selected_collection_ids:
             file_record.collection_id = selected_collection_ids[0]
+            file_record.collection_ids_json = json.dumps([str(cid) for cid in selected_collection_ids])
         if term_base is not None:
             file_record.term_base_id = term_base_id
         created_files.append(file_record)
@@ -2416,7 +2418,16 @@ def get_segment_tm_candidates(
     if not segment:
         raise HTTPException(status_code=404, detail="句段不存在。")
 
-    collection_ids = [file_record.collection_id] if file_record.collection_id else []
+    # 优先使用 collection_ids_json（多记忆库），回退到 collection_id（单记忆库）
+    collection_ids: list[UUID] = []
+    if file_record.collection_ids_json and file_record.collection_ids_json != "[]":
+        try:
+            parsed_ids = json.loads(file_record.collection_ids_json)
+            collection_ids = [UUID(cid) for cid in parsed_ids if cid]
+        except (json.JSONDecodeError, ValueError):
+            pass
+    if not collection_ids and file_record.collection_id:
+        collection_ids = [file_record.collection_id]
 
     candidates = get_tm_candidates_for_text(
         db=db,
@@ -2545,9 +2556,10 @@ def rematch_file_record(
         if before != after:
             updated_count += 1
 
-    # 更新 file_record 的 collection_id，以便匹配面板能查询到 TM 候选
+    # 更新 file_record 的 collection_id 和 collection_ids_json，以便匹配面板能查询到 TM 候选
     if selected_collection_ids:
         file_record.collection_id = selected_collection_ids[0]
+        file_record.collection_ids_json = json.dumps([str(cid) for cid in selected_collection_ids])
 
     db.commit()
     return {
@@ -2574,10 +2586,13 @@ def patch_file_record_bindings(
     if "collection_id" in payload.model_fields_set:
         if payload.collection_id is None:
             file_record.collection_id = None
+            file_record.collection_ids_json = "[]"
         else:
             collection = _get_collection_or_404(db, payload.collection_id)
             _ensure_resource_language_pair_matches(collection, source_language, target_language, "记忆库")
             file_record.collection_id = payload.collection_id
+            # 同步更新 collection_ids_json，保持单记忆库场景的一致性
+            file_record.collection_ids_json = json.dumps([str(payload.collection_id)])
 
     if "term_base_id" in payload.model_fields_set:
         if payload.term_base_id is None:

@@ -116,6 +116,12 @@ class FileRecord(Base):
         ForeignKey("memory_bases.id", ondelete="SET NULL"),
         nullable=True,
     )
+    collection_ids_json: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="[]",
+        server_default=text("'[]'"),
+    )
     term_base_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("term_bases.id", ondelete="SET NULL"),
