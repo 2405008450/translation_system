@@ -72,6 +72,13 @@ class LLMTranslationFailure:
 
 
 @dataclass(frozen=True)
+class LLMChatCompletionResult:
+    content: str
+    provider: str
+    model: str
+
+
+@dataclass(frozen=True)
 class ProviderConfig:
     name: str
     api_key: str
@@ -325,13 +332,17 @@ async def _request_translation(
     messages: list[dict[str, str]],
     temperature: float,
     timeout_seconds: float,
+    model_override: str | None = None,
+    response_format: dict | None = None,
 ) -> str:
     payload = {
-        "model": provider.model,
+        "model": model_override or provider.model,
         "messages": messages,
         "temperature": temperature,
         "stream": False,
     }
+    if response_format:
+        payload["response_format"] = response_format
     headers = {
         "Authorization": f"Bearer {provider.api_key}",
         "Content-Type": "application/json",
@@ -356,6 +367,70 @@ async def _request_translation(
         raise LLMRequestError(f"{provider.name} 返回错误：{exc.response.text}") from exc
 
     return _extract_translation_from_payload(response.json(), provider.name)
+
+
+async def request_chat_completion(
+    messages: list[dict[str, str]],
+    provider: LLMProvider = "auto",
+    *,
+    model_override: str | None = None,
+    response_format: dict | None = None,
+    temperature: float | None = None,
+    settings: Settings | None = None,
+    allow_fallback: bool = True,
+) -> LLMChatCompletionResult:
+    config = settings or get_settings()
+    providers = validate_provider_choice(provider=provider, settings=config)
+    if not allow_fallback:
+        providers = providers[:1]
+
+    last_error: Exception | None = None
+    request_temperature = config.llm_temperature if temperature is None else temperature
+
+    async def _run_with_clients(clients: dict[str, "httpx.AsyncClient" | None]) -> LLMChatCompletionResult:
+        nonlocal last_error
+        for item in providers:
+            try:
+                content = await _request_translation(
+                    client=clients.get(item.name),
+                    provider=item,
+                    messages=messages,
+                    temperature=request_temperature,
+                    timeout_seconds=config.llm_timeout_seconds,
+                    model_override=model_override,
+                    response_format=response_format,
+                )
+                return LLMChatCompletionResult(
+                    content=content,
+                    provider=item.name,
+                    model=model_override or item.model,
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning(
+                    "llm chat completion failed provider=%s model=%s error=%s",
+                    item.name,
+                    model_override or item.model,
+                    exc,
+                )
+                if not allow_fallback:
+                    break
+        raise LLMRequestError(str(last_error) if last_error else "LLM 请求失败。")
+
+    if httpx is None:
+        return await _run_with_clients({item.name: None for item in providers})
+
+    async with AsyncExitStack() as stack:
+        clients = {
+            item.name: await stack.enter_async_context(
+                httpx.AsyncClient(
+                    base_url=item.base_url,
+                    timeout=httpx.Timeout(config.llm_timeout_seconds),
+                )
+            )
+            for item in providers
+        }
+        return await _run_with_clients(clients)
 
 
 def _build_messages(

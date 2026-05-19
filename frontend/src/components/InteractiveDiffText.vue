@@ -2,6 +2,7 @@
 import { computed, ref, onMounted, onBeforeUnmount, watch } from 'vue'
 
 import { computeDiff, type DiffSegment } from '../utils/textDiff'
+import type { UserRole } from '../types/api'
 
 const props = withDefaults(defineProps<{
   oldText: string
@@ -10,11 +11,13 @@ const props = withDefaults(defineProps<{
   disabled?: boolean
   showContextMenu?: boolean
   showPendingHint?: boolean
+  revisionAuthorRole?: UserRole | null
 }>(), {
   emptyText: '',
   disabled: false,
   showContextMenu: true,
   showPendingHint: true,
+  revisionAuthorRole: 'admin',
 })
 
 const emit = defineEmits<{
@@ -137,6 +140,9 @@ const pendingCount = computed(() => {
 })
 
 const hasVisibleContent = computed(() => renderSegments.value.some((segment) => segment.text.length > 0))
+const authorRoleClass = computed(() => (
+  props.revisionAuthorRole === 'user' ? 'diff-text--author-user' : 'diff-text--author-admin'
+))
 
 // 右键菜单状态
 const contextMenuVisible = ref(false)
@@ -289,7 +295,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="diff-text diff-text--interactive">
+  <div class="diff-text diff-text--interactive" :class="authorRoleClass">
     <template v-if="hasVisibleContent">
       <template v-for="(segment, index) in renderSegments" :key="`${segment.type}-${index}`">
         <!-- 已接受的修改 -->
@@ -391,6 +397,16 @@ onBeforeUnmount(() => {
   color: #d69a00;
 }
 
+.diff-text--author-user .diff-text__segment--insert {
+  text-decoration-color: rgba(46, 125, 50, 0.9);
+  color: #2e7d32;
+}
+
+.diff-text--author-user .diff-text__segment--delete {
+  text-decoration-color: rgba(198, 40, 40, 0.9);
+  color: #c62828;
+}
+
 /* 已接受的修改：新增文字，淡蓝色背景 + 下划线 */
 .diff-text__segment--accepted {
   background: rgba(0, 122, 204, 0.08);
@@ -399,6 +415,12 @@ onBeforeUnmount(() => {
   text-decoration-color: rgba(0, 122, 204, 0.65);
   text-underline-offset: 2px;
   color: #0070c0;
+}
+
+.diff-text--author-user .diff-text__segment--accepted {
+  background: rgba(46, 125, 50, 0.1);
+  text-decoration-color: rgba(46, 125, 50, 0.65);
+  color: #2e7d32;
 }
 
 /* 已拒绝的修改：保留原文，淡灰色背景 */

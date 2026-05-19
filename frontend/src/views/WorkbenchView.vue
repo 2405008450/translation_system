@@ -93,11 +93,21 @@ type ResourceImportTab = 'tm' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
 type SaveToTMTargetMode = 'new' | 'existing'
 type SegmentDisplayScope = 'all' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'confirmed_only' | 'empty_target'
+type RevisionMenuKind = 'track' | 'accept' | 'reject'
 type SaveToTMPayload = {
   collection_mode: SaveToTMTargetMode
   collection_id?: string
   collection_name?: string
   scope: SaveToTMScope
+}
+
+const REVISION_TRACE_VISIBLE_STORAGE_KEY = 'workbench.revisionTraceVisible'
+
+function getInitialRevisionTraceVisible() {
+  if (typeof window === 'undefined') {
+    return true
+  }
+  return window.localStorage.getItem(REVISION_TRACE_VISIBLE_STORAGE_KEY) !== 'false'
 }
 
 const router = useRouter()
@@ -159,7 +169,8 @@ const showIssueDialog = ref(false)
 const importDialogInitialTab = ref<ResourceImportTab>('tm')
 const showShortcutHelp = ref(false)
 const showSaveToTMDialog = ref(false)
-const openRevisionMenu = ref<'accept' | 'reject' | null>(null)
+const openRevisionMenu = ref<RevisionMenuKind | null>(null)
+const revisionTraceVisible = ref(getInitialRevisionTraceVisible())
 const revisionActionLoading = ref(false)
 const segmentSearchOpen = ref(false)
 const sourceSearchInputRef = ref<HTMLInputElement | null>(null)
@@ -454,6 +465,45 @@ const currentLanguagePair = computed(() => (
     segmentStore.fileRecord?.source_language ?? null,
     segmentStore.fileRecord?.target_language ?? null,
   )
+))
+
+function formatWorkbenchStatusTime(value: string | null | undefined) {
+  if (!value) {
+    return ''
+  }
+
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return value
+  }
+
+  return date
+    .toLocaleString('zh-CN', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    })
+    .replace(/\//g, '-')
+}
+
+const lastModifiedStatusText = computed(() => {
+  const modifiedAt = (
+    segmentStore.lastModifiedAt
+    || segmentStore.lastSyncedAt
+    || segmentStore.fileRecord?.updated_at
+    || null
+  )
+  const formatted = formatWorkbenchStatusTime(modifiedAt)
+  const pendingSuffix = segmentStore.dirtyCount > 0 ? `（待保存 ${segmentStore.dirtyCount} 条）` : ''
+  return `最后修改：${formatted || '--'}${pendingSuffix}`
+})
+
+const ribbonStatusTitle = computed(() => (
+  `${lastModifiedStatusText.value} · ${segmentStore.syncMessage} · ${segmentStore.llmMessage}`
 ))
 
 const activeSegment = computed(() => (
@@ -1254,8 +1304,20 @@ async function handleApplyPartialRevision(revisionId: string, newText: string) {
   }
 }
 
-function toggleRevisionMenu(kind: 'accept' | 'reject') {
+function toggleRevisionMenu(kind: RevisionMenuKind) {
   openRevisionMenu.value = openRevisionMenu.value === kind ? null : kind
+}
+
+function setRevisionTraceVisible(visible: boolean) {
+  revisionTraceVisible.value = visible
+  window.localStorage.setItem(REVISION_TRACE_VISIBLE_STORAGE_KEY, visible ? 'true' : 'false')
+  openRevisionMenu.value = null
+  toast.success(visible ? t('workbench.ribbon.messages.revisionTraceShown') : t('workbench.ribbon.messages.revisionTraceHidden'))
+}
+
+function openRevisionTraceSettings() {
+  openRevisionMenu.value = null
+  toast.info(t('workbench.ribbon.messages.revisionTraceSettingsHint'))
 }
 
 async function handleAcceptActiveRevision() {
@@ -1673,6 +1735,13 @@ function handleClickOutside(event: MouseEvent) {
   const target = event.target as HTMLElement
   if (!target.closest('.export-dropdown')) {
     showExportMenu.value = false
+  }
+  if (
+    !target.closest('.workbench-revision-menu')
+    && !target.closest('.workbench-revision-menu__dropdown')
+    && !target.closest('.workbench-revision-trigger')
+  ) {
+    openRevisionMenu.value = null
   }
 }
 
@@ -2126,8 +2195,15 @@ onBeforeRouteLeave(async () => {
         </div>
 
         <div class="tool-group tool-group--revision">
-          <button class="tool-col tool-col--big tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.trackChanges'))">
-            <span class="tool-line line1 with-big-icon active">
+          <button
+            class="tool-col tool-col--big tool-button workbench-revision-trigger"
+            type="button"
+            :class="{ active: revisionTraceVisible }"
+            :aria-expanded="openRevisionMenu === 'track'"
+            aria-haspopup="menu"
+            @click.stop="toggleRevisionMenu('track')"
+          >
+            <span class="tool-line line1 with-big-icon" :class="{ active: revisionTraceVisible }">
               <span class="icon-text-area has_dropdown">
                 <Type class="tool-single-icon" :size="27" />
               </span>
@@ -2135,8 +2211,33 @@ onBeforeRouteLeave(async () => {
                 <ChevronDown :size="12" />
               </span>
             </span>
-            <span class="tool-line active"><span class="label">{{ t('workbench.ribbon.trackChanges') }}</span></span>
+            <span class="tool-line" :class="{ active: revisionTraceVisible }"><span class="label">{{ t('workbench.ribbon.trackChanges') }}</span></span>
           </button>
+          <div v-if="openRevisionMenu === 'track'" class="workbench-revision-menu__dropdown workbench-revision-menu__dropdown--track" role="menu">
+            <button
+              type="button"
+              role="menuitemradio"
+              :aria-checked="revisionTraceVisible"
+              :class="{ 'is-selected': revisionTraceVisible }"
+              @click="setRevisionTraceVisible(true)"
+            >
+              <span>{{ t('workbench.ribbon.showRevisionTrace') }}</span>
+              <Check v-if="revisionTraceVisible" class="workbench-revision-menu__check" :size="14" />
+            </button>
+            <button
+              type="button"
+              role="menuitemradio"
+              :aria-checked="!revisionTraceVisible"
+              :class="{ 'is-selected': !revisionTraceVisible }"
+              @click="setRevisionTraceVisible(false)"
+            >
+              <span>{{ t('workbench.ribbon.hideRevisionTrace') }}</span>
+              <Check v-if="!revisionTraceVisible" class="workbench-revision-menu__check" :size="14" />
+            </button>
+            <button type="button" role="menuitem" @click="openRevisionTraceSettings">
+              <span>{{ t('workbench.ribbon.revisionTraceSettings') }}</span>
+            </button>
+          </div>
           <span class="tool-col align-left revision-action-col">
             <div class="workbench-revision-menu workbench-revision-menu--ribbon">
               <button
@@ -2283,7 +2384,9 @@ onBeforeRouteLeave(async () => {
         </div>
       </div>
 
-      <div class="workbench-ribbon__status" role="status" :title="segmentStore.llmMessage">
+      <div class="workbench-ribbon__status" role="status" :title="ribbonStatusTitle">
+        <span>{{ lastModifiedStatusText }}</span>
+        <span aria-hidden="true">·</span>
         <span>{{ segmentStore.syncMessage }}</span>
         <span aria-hidden="true">·</span>
         <span>{{ segmentStore.llmMessage }}</span>
@@ -2781,7 +2884,7 @@ onBeforeRouteLeave(async () => {
                     :segment="item"
                     :index="getEditorSegmentDisplayIndex(item.sentence_id, index)"
                     :active="segmentStore.activeSentenceId === item.sentence_id"
-                    :pending-revision="segmentStore.getPendingRevision(item.sentence_id)"
+                    :pending-revision="revisionTraceVisible ? segmentStore.getPendingRevision(item.sentence_id) : null"
                     :revision-busy="revisionActionLoading"
                     :matched-terms="segmentStore.activeSentenceId === item.sentence_id ? activeMatchedTerms : []"
                     @focus="segmentStore.setActiveSentence"
@@ -3068,7 +3171,7 @@ onBeforeRouteLeave(async () => {
 .workbench-ribbon {
   position: sticky;
   top: 0;
-  z-index: 30;
+  z-index: 1200;
   gap: 0;
   padding: 0;
   border-radius: 0;
@@ -3194,12 +3297,14 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-ribbon__container {
+  position: relative;
+  z-index: 3;
   display: flex;
   flex-wrap: wrap;
   align-items: stretch;
   gap: 0;
   min-height: 68px;
-  overflow: hidden;
+  overflow: visible;
   border-top: 1px solid #edf2f5;
   background: #fff;
 }
@@ -3306,6 +3411,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .tool-group--revision {
+  position: relative;
   gap: 4px;
   overflow: visible;
 }
@@ -3328,7 +3434,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .revision-action-col {
-  width: 92px;
+  width: 108px;
 }
 
 .tool-col--big {
@@ -3510,13 +3616,13 @@ onBeforeRouteLeave(async () => {
 
 .workbench-revision-menu--ribbon .tool-button {
   justify-content: space-between;
-  min-width: 90px;
+  min-width: 104px;
 }
 
 .workbench-revision-menu--ribbon .workbench-revision-menu__dropdown {
   top: calc(100% + 4px);
   left: 0;
-  z-index: 80;
+  z-index: 1250;
   min-width: 146px;
   padding: 4px;
   border-radius: 4px;
@@ -3528,6 +3634,34 @@ onBeforeRouteLeave(async () => {
   padding: 6px 9px;
   border-radius: 3px;
   font-size: 12px;
+}
+
+.workbench-revision-menu__dropdown.workbench-revision-menu__dropdown--track {
+  top: calc(100% + 4px);
+  left: 4px;
+  z-index: 1250;
+  min-width: 136px;
+  padding: 4px;
+  border-radius: 4px;
+  box-shadow: 0 8px 20px rgba(20, 45, 55, 0.16);
+}
+
+.workbench-revision-menu__dropdown.workbench-revision-menu__dropdown--track button {
+  justify-content: space-between;
+  min-height: 30px;
+  gap: 12px;
+  padding: 6px 9px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+
+.workbench-revision-menu__dropdown button.is-selected {
+  color: #0070c0;
+}
+
+.workbench-revision-menu__check {
+  flex: 0 0 auto;
+  stroke-width: 2.3;
 }
 
 .workbench-ribbon__status {
@@ -3542,11 +3676,25 @@ onBeforeRouteLeave(async () => {
   font-size: 11px;
 }
 
-.workbench-ribbon__status span:first-child,
-.workbench-ribbon__status span:last-child {
+.workbench-ribbon__status span:not([aria-hidden='true']) {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.workbench-ribbon__status span:first-child {
+  flex: 0 0 auto;
+  max-width: min(360px, 44vw);
+  color: #40515a;
+}
+
+.workbench-ribbon__status span:last-child {
+  flex: 1 1 auto;
+}
+
+.workbench-ribbon__status span[aria-hidden='true'] {
+  flex: 0 0 auto;
 }
 
 .workbench-page.is-standalone .workbench-sidecar {
@@ -4081,6 +4229,9 @@ onBeforeRouteLeave(async () => {
 }
 
 .segment-editor-results {
+  --segment-editor-grid-template: 128px minmax(0, 1fr) minmax(0, 1fr);
+  --segment-editor-scrollbar-gutter: 12px;
+  --virtual-list-inline-end-gap: 4px;
   display: grid;
   grid-template-rows: auto minmax(390px, var(--workbench-editor-stage-height));
   min-height: 0;
@@ -4162,6 +4313,10 @@ onBeforeRouteLeave(async () => {
 .segment-editor-list-stage > .virtual-list {
   height: 100%;
   min-height: 0;
+}
+
+.segment-editor-list-stage > .virtual-list::-webkit-scrollbar {
+  width: 8px;
 }
 
 .segment-editor-toolbar__search.is-active {

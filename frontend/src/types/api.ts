@@ -257,6 +257,59 @@ export interface TermEntryRecord {
   updated_at: string
 }
 
+export interface TermEntryConflict {
+  id: string
+  term_base_id: string
+  source_text: string
+  target_text: string
+  source_language: string
+  target_language: string
+}
+
+export interface ExtractedTermDraft {
+  index: number
+  source_text: string
+  target_text: string
+  source_normalized: string
+  has_conflict: boolean
+  conflict: TermEntryConflict | null
+}
+
+export interface TermExtractionResult {
+  file_record: {
+    id: string
+    filename: string
+    term_base_id: string | null
+    total_segments: number
+  }
+  term_base_id: string | null
+  source_language: string
+  target_language: string
+  provider: string
+  model: string
+  terms: ExtractedTermDraft[]
+  total: number
+}
+
+export interface TermBatchSaveItem {
+  index: number
+  source_text: string
+  target_text: string
+  source_normalized: string
+  action: 'add' | 'replace' | 'skip'
+  status: 'created' | 'updated' | 'skipped' | 'conflict'
+  message: string
+  conflict: TermEntryConflict | null
+}
+
+export interface TermBatchSaveResult {
+  created_count: number
+  updated_count: number
+  skipped_count: number
+  conflict_count: number
+  items: TermBatchSaveItem[]
+}
+
 export interface PaginatedResponse<T> {
   items: T[]
   total: number

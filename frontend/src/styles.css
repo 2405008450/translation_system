@@ -2533,9 +2533,9 @@ body.modal-open {
 
 .segment-table-head {
   display: grid;
-  grid-template-columns: 128px minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: var(--segment-editor-grid-template, 128px minmax(0, 1fr) minmax(0, 1fr));
   min-height: 30px;
-  margin: 4px 0 0;
+  margin: 4px var(--segment-editor-scrollbar-gutter, 0) 0 0;
   border: 1px solid #e4e7eb;
   border-radius: 6px 6px 0 0;
   background: #f5f7fa;
@@ -2559,7 +2559,7 @@ body.modal-open {
   height: calc(100vh - 244px);
   min-height: 390px;
   overflow: auto;
-  padding-right: 4px;
+  padding-right: var(--virtual-list-inline-end-gap, 4px);
   scrollbar-gutter: stable;
 }
 
@@ -2590,7 +2590,7 @@ body.modal-open {
   --segment-cell-stripe: rgba(255, 255, 255, 0);
   --segment-editor-stripe: rgba(255, 255, 255, 0);
   display: grid;
-  grid-template-columns: 128px minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: var(--segment-editor-grid-template, 128px minmax(0, 1fr) minmax(0, 1fr));
   gap: 0;
   align-items: stretch;
   height: 100%;

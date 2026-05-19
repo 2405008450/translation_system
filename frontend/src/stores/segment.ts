@@ -42,6 +42,7 @@ export const useSegmentStore = defineStore('segment', () => {
   const llmProcessedCount = ref(0)
   const llmErrorCount = ref(0)
   const lastSyncedAt = ref<string | null>(null)
+  const lastModifiedAt = ref<string | null>(null)
   const dirtyEntries = ref<Record<string, SegmentUpdatePayload>>({})
   const previewUpdateToken = ref(0)
   const lastPreviewUpdatedSentenceId = ref<string | null>(null)
@@ -187,6 +188,7 @@ export const useSegmentStore = defineStore('segment', () => {
     llmProcessedCount.value = 0
     llmErrorCount.value = 0
     lastSyncedAt.value = null
+    lastModifiedAt.value = null
     dirtyEntries.value = {}
     previewUpdateToken.value = 0
     lastPreviewUpdatedSentenceId.value = null
@@ -319,6 +321,7 @@ export const useSegmentStore = defineStore('segment', () => {
   function markPreviewUpdate(sentenceId: string, targetText: string) {
     lastPreviewUpdatedSentenceId.value = sentenceId
     lastPreviewUpdatedText.value = targetText
+    lastModifiedAt.value = new Date().toISOString()
     previewUpdateToken.value += 1
   }
 
@@ -411,8 +414,11 @@ export const useSegmentStore = defineStore('segment', () => {
       })
       dirtyEntries.value = {}
       await loadRevisions(fileRecord.value.id)
-      lastSyncedAt.value = new Date().toLocaleString('zh-CN', { hour12: false })
-      syncMessage.value = translate('stores.segment.syncedAt', { time: lastSyncedAt.value })
+      const syncedAt = new Date()
+      lastSyncedAt.value = syncedAt.toISOString()
+      syncMessage.value = translate('stores.segment.syncedAt', {
+        time: syncedAt.toLocaleString('zh-CN', { hour12: false }),
+      })
     } finally {
       saving.value = false
     }
@@ -708,6 +714,8 @@ export const useSegmentStore = defineStore('segment', () => {
     llmRunning,
     syncMessage,
     llmMessage,
+    lastSyncedAt,
+    lastModifiedAt,
     llmPlannedCount,
     llmProcessedCount,
     llmErrorCount,

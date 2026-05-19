@@ -40,6 +40,7 @@ import DocumentParseSettings from '../components/DocumentParseSettings.vue'
 import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import PreTranslateDialog from '../components/PreTranslateDialog.vue'
 import Pagination from '../components/Pagination.vue'
+import TermExtractionDialog from '../components/TermExtractionDialog.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
 import { useToast } from '../composables/useToast'
@@ -164,6 +165,8 @@ const activeTab = ref<ProjectTab>('files')
 const showUploadModal = ref(false)
 const showPreTranslateDialog = ref(false)
 const showIssueDialog = ref(false)
+const showTermExtractionDialog = ref(false)
+const termExtractionNeedsReload = ref(false)
 const uploadInputKey = ref(0)
 const openActionMenuId = ref<string | null>(null)
 const actionMenuStyle = ref<Record<string, string>>({})
@@ -207,9 +210,33 @@ const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
 const selectedProjectFiles = computed(() => (
   tableRows.value.filter((row) => selectedFileIds.value.has(row.id))
 ))
+const selectedTermExtractionFile = computed<ProjectFileItem | null>(() => (
+  selectedProjectFiles.value.length === 1 ? selectedProjectFiles.value[0] : null
+))
+const selectedTermExtractionSourceLanguage = computed(() => (
+  selectedTermExtractionFile.value?.source_language || project.value?.source_language || ''
+))
+const selectedTermExtractionTargetLanguage = computed(() => (
+  selectedTermExtractionFile.value?.target_language || project.value?.target_language || ''
+))
 const preTranslateButtonTitle = computed(() => (
   selectedFileIds.value.size === 0 ? t('projectDetail.preTranslate.selectFileFirst') : ''
 ))
+const termExtractionButtonTitle = computed(() => {
+  if (selectedFileIds.value.size === 0) {
+    return t('projectDetail.termExtraction.selectFileFirst')
+  }
+  if (selectedFileIds.value.size > 1) {
+    return t('projectDetail.termExtraction.selectOneFile')
+  }
+  if (!selectedTermExtractionFile.value || Number(selectedTermExtractionFile.value.total_segments || 0) <= 0) {
+    return t('projectDetail.termExtraction.noSegments')
+  }
+  if (!selectedTermExtractionSourceLanguage.value || !selectedTermExtractionTargetLanguage.value) {
+    return t('projectDetail.termExtraction.languageMissing')
+  }
+  return ''
+})
 const duplicateTemplateButtonTitle = computed(() => {
   if (selectedFileIds.value.size === 0) {
     return t('projectDetail.files.actions.duplicateTemplateSelectFirst')
@@ -220,6 +247,12 @@ const duplicateTemplateButtonTitle = computed(() => {
   return ''
 })
 const canDuplicateTemplate = computed(() => selectedFileIds.value.size === 1 && !duplicating.value)
+const canOpenTermExtraction = computed(() => (
+  Boolean(selectedTermExtractionFile.value)
+  && Number(selectedTermExtractionFile.value?.total_segments || 0) > 0
+  && Boolean(selectedTermExtractionSourceLanguage.value)
+  && Boolean(selectedTermExtractionTargetLanguage.value)
+))
 
 const columns = computed<DataTableColumn[]>(() => ([
   { key: 'filename', label: t('projectDetail.files.columns.details'), width: '280px' },
@@ -394,6 +427,26 @@ function openPreTranslateDialog() {
     return
   }
   showPreTranslateDialog.value = true
+}
+
+function openTermExtractionDialog() {
+  if (!canOpenTermExtraction.value) {
+    return
+  }
+  termExtractionNeedsReload.value = false
+  showTermExtractionDialog.value = true
+}
+
+async function closeTermExtractionDialog() {
+  showTermExtractionDialog.value = false
+  if (termExtractionNeedsReload.value) {
+    termExtractionNeedsReload.value = false
+    await loadProject()
+  }
+}
+
+function handleTermExtractionDone() {
+  termExtractionNeedsReload.value = true
 }
 
 function closePreTranslateDialog() {
@@ -1246,6 +1299,16 @@ onBeforeUnmount(() => {
             <button
               class="button"
               type="button"
+              :disabled="!canOpenTermExtraction"
+              :title="termExtractionButtonTitle || undefined"
+              @click="openTermExtractionDialog"
+            >
+              <BookOpen :size="14" />
+              {{ t('projectDetail.termExtraction.button') }}
+            </button>
+            <button
+              class="button"
+              type="button"
               :disabled="!canDuplicateTemplate"
               :title="duplicateTemplateButtonTitle || undefined"
               @click="duplicateSelectedTemplate"
@@ -1515,6 +1578,14 @@ onBeforeUnmount(() => {
       :translation-guidelines="project?.translation_guidelines ?? ''"
       @close="closePreTranslateDialog"
       @done="handlePreTranslateDone"
+    />
+    <TermExtractionDialog
+      :open="showTermExtractionDialog"
+      :file="selectedTermExtractionFile"
+      :project-source-language="project?.source_language ?? null"
+      :project-target-language="project?.target_language ?? null"
+      @close="closeTermExtractionDialog"
+      @done="handleTermExtractionDone"
     />
     <IssueMarkerDialog
       :open="showIssueDialog"

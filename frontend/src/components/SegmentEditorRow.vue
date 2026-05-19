@@ -55,6 +55,7 @@ const sourceTitle = computed(() => {
   return sourceMeta.value.label
 })
 const revisionSourceMeta = computed(() => getSegmentSourceMeta(props.pendingRevision?.source || 'manual'))
+const revisionAuthorRole = computed(() => props.pendingRevision?.author?.role || 'admin')
 const hasPendingRevision = computed(() => Boolean(props.pendingRevision))
 const scorePercent = computed(() => {
   if (!props.segment.score || props.segment.score <= 0) return null
@@ -330,6 +331,7 @@ watch(
           :disabled="disabled || revisionBusy"
           :show-context-menu="false"
           :show-pending-hint="false"
+          :revision-author-role="revisionAuthorRole"
           empty-text="空"
         />
       </div>

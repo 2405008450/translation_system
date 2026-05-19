@@ -16,7 +16,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -93,10 +93,17 @@ from app.services.guideline_repository import (
 )
 from app.services.llm_service import (
     LLMConfigurationError,
+    LLMRequestError,
+    LLMResponseValidationError,
     LLMTranslationFailure,
     LLMTranslationTask,
     iter_batch_translate,
     validate_provider_choice,
+)
+from app.services.term_entry_service import build_term_entry_conflict_items
+from app.services.term_extraction_service import (
+    TermExtractionError,
+    extract_terms_from_segments,
 )
 from app.services.language_detection import detect_upload_language
 from app.services.language_pairs import require_language_pair
@@ -722,6 +729,11 @@ class LLMTranslateRequest(BaseModel):
     translation_guidelines: str = ""
     guideline_template_id: str | None = None
     temporary_prompt: str = ""
+
+
+class TermExtractionRequest(BaseModel):
+    term_base_id: UUID | None = None
+    max_terms: int = Field(default=150, ge=1, le=300)
 
 
 class GuidelineTemplateUpdateRequest(BaseModel):
@@ -3238,6 +3250,91 @@ def create_comment_reply(
         author=current_user,
     )
     return serialize_segment_comment(comment)
+
+
+@router.post("/file-records/{file_record_id}/term-extraction")
+async def extract_file_record_terms(
+    file_record_id: UUID,
+    payload: TermExtractionRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    source_language, target_language = _resolve_file_record_language_pair(file_record)
+    body = payload or TermExtractionRequest()
+
+    term_base = None
+    target_term_base_id = body.term_base_id or file_record.term_base_id
+    if target_term_base_id is not None:
+        term_base = db.query(TermBase).filter(TermBase.id == target_term_base_id).first()
+        if not term_base:
+            raise HTTPException(status_code=404, detail="术语库不存在。")
+        _ensure_resource_language_pair_matches(term_base, source_language, target_language, "术语库")
+
+    segments = list_segments_for_file_record(db, file_record_id)
+    if not segments:
+        raise HTTPException(status_code=400, detail="当前文件没有可用于术语提取的已解析句段。")
+
+    try:
+        extraction = await extract_terms_from_segments(
+            segments=segments,
+            source_language=source_language,
+            target_language=target_language,
+            max_terms=body.max_terms,
+        )
+    except LLMConfigurationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LLMResponseValidationError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except LLMRequestError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except TermExtractionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    term_items = [
+        {
+            "source_text": item.source_text,
+            "target_text": item.target_text,
+            "source_normalized": item.source_normalized,
+        }
+        for item in extraction.terms
+    ]
+    if term_base is not None:
+        terms = build_term_entry_conflict_items(
+            db=db,
+            term_base=term_base,
+            entries=term_items,
+        )
+    else:
+        terms = [
+            {
+                "index": index,
+                "source_text": item["source_text"],
+                "target_text": item["target_text"],
+                "source_normalized": item["source_normalized"],
+                "has_conflict": False,
+                "conflict": None,
+            }
+            for index, item in enumerate(term_items)
+        ]
+
+    return {
+        "file_record": {
+            "id": str(file_record.id),
+            "filename": file_record.filename,
+            "term_base_id": str(file_record.term_base_id) if file_record.term_base_id else None,
+            "total_segments": len(segments),
+        },
+        "term_base_id": str(term_base.id) if term_base else None,
+        "source_language": source_language,
+        "target_language": target_language,
+        "provider": extraction.provider,
+        "model": extraction.model,
+        "terms": terms,
+        "total": len(terms),
+    }
 
 
 @router.post("/file-records/{file_record_id}/llm-translate")
