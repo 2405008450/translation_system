@@ -68,7 +68,6 @@ const pageSummary = computed(() => {
 
 let resizeObserver: ResizeObserver | null = null
 let scrollFrame = 0
-let selectionFrame = 0
 let programmaticScrollTimer = 0
 let ignoreScrollEvents = false
 let lastVisibleSentenceId: string | null = null
@@ -487,110 +486,11 @@ function highlightActiveComment(scrollIntoView = true) {
   }
 }
 
-function getSentenceElementFromNode(node: Node | null) {
-  if (!node) {
-    return null
-  }
-  if (node instanceof HTMLElement) {
-    return node.closest<HTMLElement>('.doc-sentence[data-sentence-id]')
-  }
-  return node.parentElement?.closest<HTMLElement>('.doc-sentence[data-sentence-id]') || null
-}
-
-function getTextOffsetWithin(root: HTMLElement, targetNode: Node, targetOffset: number) {
-  let total = 0
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
-
-  while (walker.nextNode()) {
-    const currentNode = walker.currentNode
-    if (currentNode === targetNode) {
-      return total + targetOffset
-    }
-    total += currentNode.textContent?.length || 0
-  }
-
-  return -1
-}
-
 function clearPendingCommentSelection(removeSelection = false) {
   pendingCommentSelection.value = null
   if (removeSelection) {
     window.getSelection()?.removeAllRanges()
   }
-}
-
-function syncPendingCommentSelection() {
-  if (!props.enableCommentSelection) {
-    clearPendingCommentSelection()
-    return
-  }
-
-  const container = containerRef.value
-  const selection = window.getSelection()
-  if (!container || !selection || selection.rangeCount === 0 || selection.isCollapsed) {
-    clearPendingCommentSelection()
-    return
-  }
-
-  const range = selection.getRangeAt(0)
-  if (!container.contains(range.commonAncestorContainer)) {
-    clearPendingCommentSelection()
-    return
-  }
-
-  const startSentence = getSentenceElementFromNode(range.startContainer)
-  const endSentence = getSentenceElementFromNode(range.endContainer)
-  if (!startSentence || !endSentence || startSentence !== endSentence) {
-    clearPendingCommentSelection()
-    return
-  }
-
-  const sentenceId = startSentence.dataset.sentenceId
-  if (!sentenceId) {
-    clearPendingCommentSelection()
-    return
-  }
-
-  const selectedText = selection.toString().trim()
-  if (!selectedText) {
-    clearPendingCommentSelection()
-    return
-  }
-
-  const startOffset = getTextOffsetWithin(startSentence, range.startContainer, range.startOffset)
-  const endOffset = getTextOffsetWithin(startSentence, range.endContainer, range.endOffset)
-  if (startOffset < 0 || endOffset <= startOffset) {
-    clearPendingCommentSelection()
-    return
-  }
-
-  const rect = range.getBoundingClientRect()
-  if (!rect.width && !rect.height) {
-    clearPendingCommentSelection()
-    return
-  }
-
-  pendingCommentSelection.value = {
-    top: Math.max(16, rect.top - 44),
-    left: Math.min(Math.max(rect.left + rect.width / 2, 88), window.innerWidth - 88),
-    draft: {
-      sentence_id: sentenceId,
-      anchor_mode: 'range',
-      range_start_offset: startOffset,
-      range_end_offset: endOffset,
-      anchor_text: selectedText,
-    },
-  }
-}
-
-function handleSelectionChange() {
-  if (selectionFrame) {
-    window.cancelAnimationFrame(selectionFrame)
-  }
-  selectionFrame = window.requestAnimationFrame(() => {
-    selectionFrame = 0
-    syncPendingCommentSelection()
-  })
 }
 
 function requestPendingComment() {
@@ -624,7 +524,42 @@ function handleClick(event: MouseEvent) {
   if (!sentenceId) {
     return
   }
+  clearPendingCommentSelection()
   emit('focusSentence', sentenceId)
+}
+
+function handleDoubleClick(event: MouseEvent) {
+  if (!props.enableCommentSelection) {
+    return
+  }
+
+  const target = event.target instanceof HTMLElement ? event.target : null
+  if (target?.closest<HTMLElement>('.doc-comment-anchor[data-comment-id]')) {
+    return
+  }
+
+  const sentence = target?.closest<HTMLElement>('.doc-sentence[data-sentence-id]')
+  const sentenceId = sentence?.dataset.sentenceId
+  if (!sentenceId) {
+    clearPendingCommentSelection(true)
+    return
+  }
+
+  event.preventDefault()
+  emit('focusSentence', sentenceId)
+  window.getSelection()?.removeAllRanges()
+
+  pendingCommentSelection.value = {
+    top: Math.max(16, event.clientY - 44),
+    left: Math.min(Math.max(event.clientX, 88), window.innerWidth - 88),
+    draft: {
+      sentence_id: sentenceId,
+      anchor_mode: 'sentence',
+      range_start_offset: null,
+      range_end_offset: null,
+      anchor_text: null,
+    },
+  }
 }
 
 onMounted(() => {
@@ -639,19 +574,13 @@ onMounted(() => {
       resizeObserver.observe(containerRef.value)
     }
   }
-
-  document.addEventListener('selectionchange', handleSelectionChange)
 })
 
 onBeforeUnmount(() => {
   if (scrollFrame) {
     window.cancelAnimationFrame(scrollFrame)
   }
-  if (selectionFrame) {
-    window.cancelAnimationFrame(selectionFrame)
-  }
   window.clearTimeout(programmaticScrollTimer)
-  document.removeEventListener('selectionchange', handleSelectionChange)
   resizeObserver?.disconnect()
 })
 
@@ -769,6 +698,7 @@ watch(() => props.syncSentenceId, (sentenceId) => {
           class="preview-panel__body"
           :aria-busy="loading || isRendering"
           @click="handleClick"
+          @dblclick="handleDoubleClick"
           @scroll="handleScroll"
         />
         <div v-else-if="loading" class="preview-panel__empty">预览准备中...</div>

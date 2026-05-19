@@ -71,29 +71,42 @@ test.describe.serial('核心 E2E 冒烟流程', () => {
     await expect(page.getByTestId('project-upload-page')).toBeHidden({ timeout: 45_000 })
     await expect(page.getByTestId('project-file-table')).toContainText('smoke-source.txt')
 
-    await page.getByTestId('project-file-open-workbench').click()
-    await expect(page).toHaveURL(/\/tasks\/[0-9a-f-]+/i)
-    await expect(page.getByTestId('workbench-page')).toBeVisible()
+    const focusPagePromise = page.waitForEvent('popup')
+    await page.getByTestId('project-file-open-workbench-focus').click()
+    const focusPage = await focusPagePromise
+    await expect(focusPage).toHaveURL(/\/tasks\/[0-9a-f-]+\/focus/i)
+    await expect(focusPage.getByTestId('workbench-page')).toBeVisible()
+    await expect(focusPage.locator('.app-sidebar')).toHaveCount(0)
+    await expect(focusPage.locator('.shell-header')).toHaveCount(0)
+    await expect(focusPage.getByTestId('workbench-ribbon')).toBeVisible()
 
-    const firstEditor = page.getByTestId('segment-target-editor').first()
-    await expect(firstEditor).toBeVisible()
-    await firstEditor.fill(translatedText)
+    const focusEditor = focusPage.getByTestId('segment-target-editor').first()
+    await expect(focusEditor).toBeVisible()
+    await focusEditor.fill(translatedText)
 
-    const saveResponse = page.waitForResponse((response) => (
+    const focusSaveResponse = focusPage.waitForResponse((response) => (
       response.url().includes('/segments')
       && response.request().method() === 'PUT'
       && response.status() < 400
     ))
-    await page.getByTestId('workbench-save-button').click()
-    await saveResponse
+    await focusPage.getByTestId('workbench-save-button').click()
+    await focusSaveResponse
 
-    await page.reload()
+    await focusPage.reload()
+    await expect(focusPage.getByTestId('segment-target-editor').first()).toContainText(translatedText)
+
+    const focusDownloadPromise = focusPage.waitForEvent('download')
+    await expect(focusPage.getByTestId('workbench-export-button')).toBeEnabled()
+    await focusPage.getByTestId('workbench-export-button').click()
+    const focusDownload = await focusDownloadPromise
+    expect(focusDownload.suggestedFilename()).toContain('smoke-source')
+    await focusPage.close()
+
+    await page.getByTestId('project-file-open-workbench').click()
+    await expect(page).toHaveURL(/\/tasks\/[0-9a-f-]+/i)
+    await expect(page.getByTestId('workbench-page')).toBeVisible()
+    await expect(page.locator('.app-sidebar')).toBeVisible()
+    await expect(page.locator('.shell-header')).toBeVisible()
     await expect(page.getByTestId('segment-target-editor').first()).toContainText(translatedText)
-
-    const downloadPromise = page.waitForEvent('download')
-    await expect(page.getByTestId('workbench-export-button')).toBeEnabled()
-    await page.getByTestId('workbench-export-button').click()
-    const download = await downloadPromise
-    expect(download.suggestedFilename()).toContain('smoke-source')
   })
 })

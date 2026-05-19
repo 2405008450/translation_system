@@ -10,47 +10,47 @@ DECLARE
         substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
         lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
     )::uuid$uuid$;
-    translation_memory_id_type text;
-    translation_memory_pk_name text;
+    memory_entries_id_type text;
+    memory_entries_pk_name text;
 BEGIN
     SELECT data_type
-    INTO translation_memory_id_type
+    INTO memory_entries_id_type
     FROM information_schema.columns
     WHERE table_schema = current_schema()
-      AND table_name = 'translation_memory'
+      AND table_name = 'memory_entries'
       AND column_name = 'id';
 
-    IF translation_memory_id_type IS NULL OR translation_memory_id_type = 'uuid' THEN
+    IF memory_entries_id_type IS NULL OR memory_entries_id_type = 'uuid' THEN
         RETURN;
     END IF;
 
-    EXECUTE 'ALTER TABLE translation_memory ADD COLUMN IF NOT EXISTS id_uuid UUID';
+    EXECUTE 'ALTER TABLE memory_entries ADD COLUMN IF NOT EXISTS id_uuid UUID';
     EXECUTE format(
-        'UPDATE translation_memory SET id_uuid = %s WHERE id_uuid IS NULL',
+        'UPDATE memory_entries SET id_uuid = %s WHERE id_uuid IS NULL',
         uuid_expr
     );
     EXECUTE format(
-        'ALTER TABLE translation_memory ALTER COLUMN id_uuid SET DEFAULT %s',
+        'ALTER TABLE memory_entries ALTER COLUMN id_uuid SET DEFAULT %s',
         uuid_expr
     );
-    EXECUTE 'ALTER TABLE translation_memory ALTER COLUMN id_uuid SET NOT NULL';
+    EXECUTE 'ALTER TABLE memory_entries ALTER COLUMN id_uuid SET NOT NULL';
 
     SELECT conname
-    INTO translation_memory_pk_name
+    INTO memory_entries_pk_name
     FROM pg_constraint
-    WHERE conrelid = 'translation_memory'::regclass
+    WHERE conrelid = 'memory_entries'::regclass
       AND contype = 'p';
 
-    IF translation_memory_pk_name IS NOT NULL THEN
+    IF memory_entries_pk_name IS NOT NULL THEN
         EXECUTE format(
-            'ALTER TABLE translation_memory DROP CONSTRAINT %I',
-            translation_memory_pk_name
+            'ALTER TABLE memory_entries DROP CONSTRAINT %I',
+            memory_entries_pk_name
         );
     END IF;
 
-    EXECUTE 'ALTER TABLE translation_memory DROP COLUMN id';
-    EXECUTE 'ALTER TABLE translation_memory RENAME COLUMN id_uuid TO id';
-    EXECUTE 'ALTER TABLE translation_memory ADD CONSTRAINT translation_memory_pkey PRIMARY KEY (id)';
+    EXECUTE 'ALTER TABLE memory_entries DROP COLUMN id';
+    EXECUTE 'ALTER TABLE memory_entries RENAME COLUMN id_uuid TO id';
+    EXECUTE 'ALTER TABLE memory_entries ADD CONSTRAINT memory_entries_pkey PRIMARY KEY (id)';
 END $$;
 
 DO $$
@@ -304,9 +304,11 @@ ALTER INDEX IF EXISTS ix_segments_document_id RENAME TO ix_segments_file_record_
 CREATE INDEX IF NOT EXISTS ix_segments_file_record_id
     ON segments (file_record_id);
 
-DROP SEQUENCE IF EXISTS translation_memory_id_seq;
+DROP SEQUENCE IF EXISTS memory_entries_id_seq;
 DROP SEQUENCE IF EXISTS documents_id_seq;
 DROP SEQUENCE IF EXISTS file_records_id_seq;
 DROP SEQUENCE IF EXISTS segments_id_seq;
 
 COMMIT;
+
+

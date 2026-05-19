@@ -10,9 +10,16 @@ CREATE TABLE IF NOT EXISTS file_records (
     filename VARCHAR(255) NOT NULL,
     file_hash VARCHAR(64),
     status VARCHAR(20) NOT NULL DEFAULT 'draft',
+    document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full',
+    document_parse_options TEXT NOT NULL DEFAULT '{}',
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE IF EXISTS file_records
+    ADD COLUMN IF NOT EXISTS document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full';
+ALTER TABLE IF EXISTS file_records
+    ADD COLUMN IF NOT EXISTS document_parse_options TEXT NOT NULL DEFAULT '{}';
 
 CREATE TABLE IF NOT EXISTS segments (
     id UUID PRIMARY KEY DEFAULT (
@@ -32,6 +39,8 @@ CREATE TABLE IF NOT EXISTS segments (
     score FLOAT NOT NULL DEFAULT 0.0,
     matched_source_text TEXT,
     source VARCHAR(20) NOT NULL DEFAULT 'tm',
+    llm_provider VARCHAR(40),
+    llm_model VARCHAR(200),
     block_type VARCHAR(20) NOT NULL DEFAULT 'paragraph',
     block_index INTEGER NOT NULL DEFAULT 0,
     row_index INTEGER,
@@ -42,6 +51,11 @@ CREATE TABLE IF NOT EXISTS segments (
 
 CREATE INDEX IF NOT EXISTS ix_segments_file_record_id
     ON segments (file_record_id);
+
+ALTER TABLE IF EXISTS segments
+    ADD COLUMN IF NOT EXISTS llm_provider VARCHAR(40);
+ALTER TABLE IF EXISTS segments
+    ADD COLUMN IF NOT EXISTS llm_model VARCHAR(200);
 
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$

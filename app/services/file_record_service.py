@@ -177,6 +177,103 @@ def create_file_record_with_segments(
     )
 
 
+def build_duplicate_filename(
+    db: Session,
+    filename: str,
+    project_id: UUID | None,
+) -> str:
+    path = Path(filename or "untitled.txt")
+    suffix = path.suffix
+    stem = path.name[: -len(suffix)] if suffix else path.name
+    stem = stem or "untitled"
+
+    base_name = f"{stem} - 副本{suffix}"
+    query = db.query(FileRecord.filename)
+    if project_id is None:
+        query = query.filter(FileRecord.project_id.is_(None))
+    else:
+        query = query.filter(FileRecord.project_id == project_id)
+    existing_names = {row.filename for row in query.all()}
+    if base_name not in existing_names:
+        return base_name
+
+    index = 2
+    while True:
+        candidate = f"{stem} - 副本 {index}{suffix}"
+        if candidate not in existing_names:
+            return candidate
+        index += 1
+
+
+def duplicate_file_record(
+    db: Session,
+    file_record_id: UUID,
+    *,
+    current_user: User | None = None,
+    filename: str | None = None,
+) -> FileRecord | None:
+    source_record = get_file_record(db, file_record_id)
+    if source_record is None:
+        return None
+
+    source_bytes = load_file_record_source(source_record)
+    next_filename = (filename or "").strip() or build_duplicate_filename(
+        db,
+        source_record.filename,
+        source_record.project_id,
+    )
+    duplicate = FileRecord(
+        project_id=source_record.project_id,
+        filename=next_filename,
+        file_hash=source_record.file_hash,
+        status=source_record.status,
+        document_parse_mode=source_record.document_parse_mode,
+        document_parse_options=source_record.document_parse_options,
+        source_language=source_record.source_language,
+        target_language=source_record.target_language,
+        creator_id=current_user.id if current_user is not None else source_record.creator_id,
+        collection_id=source_record.collection_id,
+        term_base_id=source_record.term_base_id,
+        deadline=source_record.deadline,
+        access_level=source_record.access_level,
+    )
+    db.add(duplicate)
+    db.flush()
+
+    source_segments = list_segments_for_file_record(db, source_record.id)
+    for segment in source_segments:
+        db.add(
+            Segment(
+                file_record_id=duplicate.id,
+                sentence_id=segment.sentence_id,
+                source_text=segment.source_text,
+                display_text=segment.display_text,
+                target_text=segment.target_text,
+                status=segment.status,
+                score=segment.score,
+                matched_source_text=segment.matched_source_text,
+                matched_collection_name=segment.matched_collection_name,
+                matched_creator_name=segment.matched_creator_name,
+                matched_created_at=segment.matched_created_at,
+                matched_updated_at=segment.matched_updated_at,
+                source=segment.source,
+                llm_provider=segment.llm_provider,
+                llm_model=segment.llm_model,
+                block_type=segment.block_type,
+                block_index=segment.block_index,
+                row_index=segment.row_index,
+                cell_index=segment.cell_index,
+            )
+        )
+
+    if source_bytes is not None:
+        save_source_file(duplicate.id, next_filename, source_bytes)
+        _remember_pending_source_file(db, duplicate.id, next_filename)
+
+    db.flush()
+    return duplicate
+
+
 def _create_file_record_from_workspace(
     db: Session,
     filename: str,
@@ -563,6 +660,8 @@ def update_segment_target(
     target_text: str,
     source: str = "manual",
     current_user: User | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> Segment | None:
     segment = db.query(Segment).filter(Segment.id == segment_id).first()
     if not segment:
@@ -571,6 +670,12 @@ def update_segment_target(
     before_text = segment.target_text
     segment.target_text = target_text
     segment.source = source
+    if source == "llm":
+        segment.llm_provider = llm_provider
+        segment.llm_model = llm_model
+    else:
+        segment.llm_provider = None
+        segment.llm_model = None
     if source == "manual":
         segment.status = "confirmed"
     create_revision(
@@ -596,6 +701,8 @@ def update_segment_by_sentence_id(
     target_text: str,
     source: str = "manual",
     current_user: User | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> Segment | None:
     segment = (
         db.query(Segment)
@@ -608,6 +715,12 @@ def update_segment_by_sentence_id(
     before_text = segment.target_text
     segment.target_text = target_text
     segment.source = source
+    if source == "llm":
+        segment.llm_provider = llm_provider
+        segment.llm_model = llm_model
+    else:
+        segment.llm_provider = None
+        segment.llm_model = None
     if source == "manual":
         segment.status = "confirmed"
     create_revision(
@@ -632,6 +745,8 @@ def update_segment_with_llm_result(
     sentence_id: str,
     target_text: str,
     current_user: User | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> Segment | None:
     return update_segment_by_sentence_id(
         db=db,
@@ -640,6 +755,8 @@ def update_segment_with_llm_result(
         target_text=target_text,
         source="llm",
         current_user=current_user,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
     )
 
 
@@ -678,6 +795,12 @@ def batch_update_segments(
         source = item.get("source", "manual")
         segment.target_text = target_text
         segment.source = source
+        if source == "llm":
+            segment.llm_provider = item.get("llm_provider")
+            segment.llm_model = item.get("llm_model")
+        else:
+            segment.llm_provider = None
+            segment.llm_model = None
         if source == "manual":
             segment.status = "confirmed"
         create_revision(

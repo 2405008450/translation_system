@@ -70,7 +70,6 @@ const totalCount = ref(0)
 const currentPage = ref(1)
 const pageSize = ref(10)
 const searchQuery = ref('')
-const selectedIds = ref(new Set<string>())
 const sortKey = ref('')
 const sortOrder = ref<'asc' | 'desc'>('desc')
 const pageError = ref('')
@@ -176,7 +175,6 @@ async function deleteProjectIds(ids: string[], successMessage: string) {
   pageError.value = ''
   try {
     await Promise.all(ids.map((id) => http.delete(`/projects/${id}`)))
-    selectedIds.value = new Set()
     await loadProjects()
     toast.success(successMessage)
   } catch (error) {
@@ -186,25 +184,6 @@ async function deleteProjectIds(ids: string[], successMessage: string) {
     }
     pageError.value = error instanceof Error ? error.message : t('projectList.errors.delete')
   }
-}
-
-async function deleteSelected() {
-  if (selectedIds.value.size === 0) {
-    return
-  }
-
-  const confirmed = await confirm({
-    title: t('projectList.actions.delete'),
-    message: t('projectList.messages.deleteSelectedConfirm', { count: selectedIds.value.size }),
-    confirmText: t('common.actions.delete'),
-    danger: true,
-  })
-
-  if (!confirmed) {
-    return
-  }
-
-  await deleteProjectIds(Array.from(selectedIds.value), t('projectList.messages.deletedMany'))
 }
 
 async function deleteRow(row: ProjectItem) {
@@ -250,10 +229,6 @@ function getStatusClass(status: string) {
 function handleSort(key: string, order: 'asc' | 'desc') {
   sortKey.value = key
   sortOrder.value = order
-}
-
-function handleSelect(ids: Set<string>) {
-  selectedIds.value = ids
 }
 
 function goToAssets() {
@@ -337,14 +312,6 @@ onMounted(() => {
       </div>
     </div>
 
-    <div v-if="selectedIds.size > 0" class="table-bulk-bar">
-      <span>{{ t('projectList.selectedSummary', { count: selectedIds.size }) }}</span>
-      <button class="button button--danger" type="button" @click="deleteSelected">
-        <Trash2 :size="14" />
-        {{ t('projectList.deleteSelected') }}
-      </button>
-    </div>
-
     <p v-if="pageError" class="form-message is-error table-page__message">{{ pageError }}</p>
 
     <div class="table-page__body">
@@ -354,15 +321,12 @@ onMounted(() => {
         :columns="columns"
         :data="projects"
         :loading="loading"
-        :selectable="true"
-        :selected-ids="selectedIds"
         :sort-key="sortKey"
         :sort-order="sortOrder"
         :show-index="true"
         :index-offset="indexOffset"
         :empty-text="t('projectList.empty')"
         @sort="handleSort"
-        @select="handleSelect"
       >
         <template #filename="{ row }">
           <button
@@ -554,18 +518,6 @@ onMounted(() => {
   font-size: 13px;
 }
 
-.table-bulk-bar {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  align-items: center;
-  margin: 0 20px 12px;
-  padding: 12px 14px;
-  border: 1px solid var(--line-soft);
-  border-radius: 10px;
-  background: var(--brand-050);
-}
-
 .table-page__message {
   margin: 0 20px 8px;
 }
@@ -651,10 +603,4 @@ onMounted(() => {
   font-size: 13px;
 }
 
-@media (max-width: 720px) {
-  .table-bulk-bar {
-    flex-direction: column;
-    align-items: stretch;
-  }
-}
 </style>

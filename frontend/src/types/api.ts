@@ -104,6 +104,8 @@ export interface Segment {
   matched_created_at: string | null
   matched_updated_at: string | null
   source: string
+  llm_provider: string | null
+  llm_model: string | null
   block_type: string
   block_index: number
   row_index?: number | null

@@ -7,7 +7,9 @@ import {
   ChevronDown,
   ChevronUp,
   Clock3,
+  Copy,
   Download,
+  ExternalLink,
   FileText,
   Filter,
   Flag,
@@ -140,6 +142,7 @@ const { t } = useI18n()
 
 const loading = ref(false)
 const deleting = ref(false)
+const duplicating = ref(false)
 const uploading = ref(false)
 const uploadPercent = ref(0)
 const project = ref<ProjectDetail | null>(null)
@@ -207,6 +210,16 @@ const selectedProjectFiles = computed(() => (
 const preTranslateButtonTitle = computed(() => (
   selectedFileIds.value.size === 0 ? t('projectDetail.preTranslate.selectFileFirst') : ''
 ))
+const duplicateTemplateButtonTitle = computed(() => {
+  if (selectedFileIds.value.size === 0) {
+    return t('projectDetail.files.actions.duplicateTemplateSelectFirst')
+  }
+  if (selectedFileIds.value.size > 1) {
+    return t('projectDetail.files.actions.duplicateTemplateSelectOne')
+  }
+  return ''
+})
+const canDuplicateTemplate = computed(() => selectedFileIds.value.size === 1 && !duplicating.value)
 
 const columns = computed<DataTableColumn[]>(() => ([
   { key: 'filename', label: t('projectDetail.files.columns.details'), width: '280px' },
@@ -522,6 +535,25 @@ function openWorkbench(row: ProjectRow) {
   })
 }
 
+function openWorkbenchInNewWindow(row: ProjectRow) {
+  if (!canEnterWorkbench(row)) {
+    return
+  }
+
+  closeActionMenu()
+  const rowId = String(row.id)
+  const resolved = router.resolve({
+    name: 'workbench-focus',
+    params: { id: rowId },
+    query: {
+      from: 'project',
+      pid: props.id,
+      ...(cameFromTasks.value ? { parent: 'tasks' } : {}),
+    },
+  })
+  window.open(resolved.href, '_blank', 'noopener,noreferrer')
+}
+
 async function loadProject() {
   loading.value = true
   pageError.value = ''
@@ -768,6 +800,31 @@ async function deleteProjectFile(row: ProjectRow) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.delete'))
   } finally {
     deleting.value = false
+  }
+}
+
+async function duplicateSelectedTemplate() {
+  if (!canDuplicateTemplate.value) {
+    return
+  }
+
+  const sourceFile = selectedProjectFiles.value[0]
+  if (!sourceFile) {
+    return
+  }
+
+  duplicating.value = true
+  pageError.value = ''
+
+  try {
+    const { data } = await http.post<ProjectFileItem>(`/file-records/${sourceFile.id}/duplicate`)
+    await loadProject()
+    selectedFileIds.value = new Set([data.id])
+    toast.success(t('projectDetail.messages.duplicated', { name: data.filename }))
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('projectDetail.errors.duplicate'))
+  } finally {
+    duplicating.value = false
   }
 }
 
@@ -1187,6 +1244,17 @@ onBeforeUnmount(() => {
               {{ t('projectDetail.preTranslate.button') }}
             </button>
             <button
+              class="button"
+              type="button"
+              :disabled="!canDuplicateTemplate"
+              :title="duplicateTemplateButtonTitle || undefined"
+              @click="duplicateSelectedTemplate"
+            >
+              <Loader2 v-if="duplicating" class="lucide-spin" :size="14" />
+              <Copy v-else :size="14" />
+              {{ t('projectDetail.files.actions.duplicateTemplate') }}
+            </button>
+            <button
               class="button button--primary"
               data-testid="project-upload-open"
               type="button"
@@ -1275,15 +1343,26 @@ onBeforeUnmount(() => {
             <div class="pd-file-cell">
               <FileText class="pd-file-cell__icon" :size="18" />
               <div class="pd-file-cell__content">
-                <button
-                  v-if="canEnterWorkbench(row)"
-                  class="pd-link-button"
-                  data-testid="project-file-open-workbench"
-                  type="button"
-                  @click="openWorkbench(row)"
-                >
-                  {{ row.filename }}
-                </button>
+                <div v-if="canEnterWorkbench(row)" class="pd-file-cell__title-row">
+                  <button
+                    class="pd-link-button"
+                    data-testid="project-file-open-workbench"
+                    type="button"
+                    @click="openWorkbench(row)"
+                  >
+                    {{ row.filename }}
+                  </button>
+                  <button
+                    class="pd-file-cell__focus-button"
+                    data-testid="project-file-open-workbench-focus"
+                    type="button"
+                    :title="t('projectDetail.files.actions.openFocus')"
+                    :aria-label="t('projectDetail.files.actions.openFocus')"
+                    @click.stop="openWorkbenchInNewWindow(row)"
+                  >
+                    <ExternalLink :size="14" />
+                  </button>
+                </div>
                 <span v-else class="pd-file-cell__title">{{ row.filename }}</span>
                 <span class="pd-file-cell__meta">{{ getFileDetailHint(row) }}</span>
               </div>
@@ -1394,6 +1473,14 @@ onBeforeUnmount(() => {
           @click="openWorkbench(actionMenuRow)"
         >
           {{ t('projectDetail.enterWorkbench') }}
+        </button>
+        <button
+          type="button"
+          :disabled="!canEnterWorkbench(actionMenuRow)"
+          :title="!canEnterWorkbench(actionMenuRow) ? getFileDetailHint(actionMenuRow) : undefined"
+          @click="openWorkbenchInNewWindow(actionMenuRow)"
+        >
+          {{ t('projectDetail.files.actions.openFocus') }}
         </button>
         <button
           type="button"
@@ -1974,6 +2061,13 @@ onBeforeUnmount(() => {
   min-width: 0;
 }
 
+.pd-file-cell__title-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
 .pd-link-button {
   padding: 0;
   border: none;
@@ -1985,6 +2079,24 @@ onBeforeUnmount(() => {
 
 .pd-link-button:hover {
   color: var(--brand-600);
+}
+
+.pd-file-cell__focus-button {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-panel);
+  color: var(--text-secondary);
+  box-shadow: none;
+}
+
+.pd-file-cell__focus-button:hover {
+  border-color: var(--brand-500);
+  color: var(--brand-700);
 }
 
 .pd-file-cell__title {

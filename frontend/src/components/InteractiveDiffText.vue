@@ -8,9 +8,13 @@ const props = withDefaults(defineProps<{
   newText: string
   emptyText?: string
   disabled?: boolean
+  showContextMenu?: boolean
+  showPendingHint?: boolean
 }>(), {
   emptyText: '',
   disabled: false,
+  showContextMenu: true,
+  showPendingHint: true,
 })
 
 const emit = defineEmits<{
@@ -140,7 +144,7 @@ const contextMenuPosition = ref({ x: 0, y: 0 })
 const contextMenuTargetGroup = ref<number | null>(null)
 
 function handleSegmentContextMenu(event: MouseEvent, segment: RenderSegment) {
-  if (props.disabled || segment.groupIndex === null || segment.decision !== null) {
+  if (!props.showContextMenu || props.disabled || segment.groupIndex === null || segment.decision !== null) {
     return
   }
   event.preventDefault()
@@ -272,8 +276,10 @@ function handleClickOutside(event: MouseEvent) {
 }
 
 onMounted(() => {
-  document.addEventListener('click', handleClickOutside)
-  document.addEventListener('contextmenu', handleClickOutside)
+  if (props.showContextMenu) {
+    document.addEventListener('click', handleClickOutside)
+    document.addEventListener('contextmenu', handleClickOutside)
+  }
 })
 
 onBeforeUnmount(() => {
@@ -314,7 +320,7 @@ onBeforeUnmount(() => {
             class="diff-text__segment"
             :class="[
               `diff-text__segment--${segment.type}`,
-              { 'is-clickable': segment.groupIndex !== null && !disabled }
+              { 'is-clickable': showContextMenu && segment.groupIndex !== null && !disabled }
             ]"
             @contextmenu="handleSegmentContextMenu($event, segment)"
           >
@@ -326,14 +332,14 @@ onBeforeUnmount(() => {
     <span v-else class="diff-text__empty">{{ emptyText }}</span>
 
     <!-- 待处理数量提示 -->
-    <div v-if="pendingCount > 0" class="diff-text__pending-hint">
+    <div v-if="showPendingHint && pendingCount > 0" class="diff-text__pending-hint">
       还有 {{ pendingCount }} 处修改待处理
     </div>
 
     <!-- 右键菜单 -->
     <Teleport to="body">
       <div
-        v-if="contextMenuVisible"
+        v-if="showContextMenu && contextMenuVisible"
         class="diff-context-menu"
         :style="{ left: contextMenuPosition.x + 'px', top: contextMenuPosition.y + 'px' }"
       >
@@ -372,25 +378,27 @@ onBeforeUnmount(() => {
 
 .diff-text__segment--insert {
   text-decoration: underline;
-  text-decoration-color: rgba(71, 153, 89, 0.6);
+  text-decoration-color: rgba(0, 122, 204, 0.9);
+  text-decoration-thickness: 1px;
   text-underline-offset: 2px;
-  color: #1b5e3b;
+  color: #0070c0;
 }
 
 .diff-text__segment--delete {
   text-decoration: line-through;
-  text-decoration-color: rgba(182, 72, 72, 0.6);
-  color: #8b3232;
+  text-decoration-color: rgba(214, 154, 0, 0.95);
+  text-decoration-thickness: 1px;
+  color: #d69a00;
 }
 
-/* 已接受的修改：新增文字，淡绿色背景 + 下划线 */
+/* 已接受的修改：新增文字，淡蓝色背景 + 下划线 */
 .diff-text__segment--accepted {
-  background: rgba(118, 196, 132, 0.15);
+  background: rgba(0, 122, 204, 0.08);
   border-radius: 3px;
   text-decoration: underline;
-  text-decoration-color: rgba(71, 153, 89, 0.5);
+  text-decoration-color: rgba(0, 122, 204, 0.65);
   text-underline-offset: 2px;
-  color: #1b5e3b;
+  color: #0070c0;
 }
 
 /* 已拒绝的修改：保留原文，淡灰色背景 */

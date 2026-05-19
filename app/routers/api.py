@@ -71,6 +71,7 @@ from app.services.file_record_service import (
     calculate_file_record_progress,
     create_file_record_with_segments,
     delete_file_record,
+    duplicate_file_record,
     get_file_record as get_file_record_model,
     get_file_record_source_filename,
     get_file_record_with_segments,
@@ -738,6 +739,10 @@ class RematchRequest(BaseModel):
 class FileRecordBindingsRequest(BaseModel):
     term_base_id: UUID | None = None
     collection_id: UUID | None = None
+
+
+class FileRecordDuplicateRequest(BaseModel):
+    filename: str | None = None
 
 
 class SaveToTMRequest(BaseModel):
@@ -2499,6 +2504,8 @@ def get_file_record(
                 "matched_created_at": seg.matched_created_at.isoformat() if seg.matched_created_at else None,
                 "matched_updated_at": seg.matched_updated_at.isoformat() if seg.matched_updated_at else None,
                 "source": seg.source,
+                "llm_provider": seg.llm_provider,
+                "llm_model": seg.llm_model,
                 "block_type": seg.block_type,
                 "block_index": seg.block_index,
                 "row_index": seg.row_index,
@@ -2507,6 +2514,36 @@ def get_file_record(
             for seg in segments
         ],
     }
+
+
+@router.post("/file-records/{file_record_id}/duplicate")
+def duplicate_file_record_task(
+    file_record_id: UUID,
+    payload: FileRecordDuplicateRequest | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """复制一个文件任务，保留源文件、句段和当前译文状态。"""
+    duplicate = duplicate_file_record(
+        db,
+        file_record_id,
+        current_user=current_user,
+        filename=payload.filename if payload else None,
+    )
+    if duplicate is None:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    db.commit()
+    db.refresh(duplicate)
+    file_stats = _get_file_segment_stats(db, [duplicate.id]).get(
+        duplicate.id,
+        {"total": 0, "filled": 0},
+    )
+    return _build_project_file_payload(
+        duplicate,
+        total_segments=file_stats["total"],
+        translated_segments=file_stats["filled"],
+    )
 
 
 @router.get("/file-records/{file_record_id}/preview")
@@ -3291,6 +3328,8 @@ async def llm_translate_file_record(
                     sentence_id=result.sentence_id,
                     target_text=result.translated_text,
                     current_user=current_user,
+                    llm_provider=result.provider,
+                    llm_model=result.model,
                 )
             except Exception as exc:  # noqa: BLE001
                 db.rollback()
