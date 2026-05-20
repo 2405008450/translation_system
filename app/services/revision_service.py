@@ -58,6 +58,7 @@ def list_revisions(
     *,
     file_record_id: UUID,
     sentence_id: str | None = None,
+    sentence_ids: list[str] | None = None,
 ) -> list[SegmentRevision]:
     require_revisions_table()
     query = (
@@ -70,6 +71,10 @@ def list_revisions(
     )
     if sentence_id:
         query = query.filter(SegmentRevision.sentence_id == sentence_id)
+    elif sentence_ids is not None:
+        if not sentence_ids:
+            return []
+        query = query.filter(SegmentRevision.sentence_id.in_(sentence_ids))
 
     revisions = (
         query

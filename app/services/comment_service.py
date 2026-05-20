@@ -57,18 +57,24 @@ def serialize_segment_comment(comment: SegmentComment) -> dict:
 def list_segment_comments_for_file_record(
     db: Session,
     file_record_id: UUID,
+    sentence_ids: list[str] | None = None,
 ) -> list[SegmentComment]:
     require_comments_table()
-    return (
+    query = (
         db.query(SegmentComment)
         .options(
             joinedload(SegmentComment.author),
             joinedload(SegmentComment.segment),
         )
         .filter(SegmentComment.file_record_id == file_record_id)
-        .order_by(SegmentComment.created_at.asc(), SegmentComment.id.asc())
-        .all()
     )
+    if sentence_ids is not None:
+        if not sentence_ids:
+            return []
+        query = query.join(Segment, Segment.id == SegmentComment.segment_id).filter(
+            Segment.sentence_id.in_(sentence_ids)
+        )
+    return query.order_by(SegmentComment.created_at.asc(), SegmentComment.id.asc()).all()
 
 
 def get_segment_comment_or_404(db: Session, comment_id: UUID) -> SegmentComment:

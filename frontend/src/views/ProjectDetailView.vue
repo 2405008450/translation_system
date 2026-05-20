@@ -1287,6 +1287,17 @@ onBeforeUnmount(() => {
         <div class="table-toolbar pd-toolbar">
           <div class="table-toolbar__left pd-toolbar__left">
             <button
+              class="button button--primary"
+              data-testid="project-upload-open"
+              type="button"
+              :disabled="!canOpenUploadModal"
+              :title="uploadButtonTitle || undefined"
+              @click="openUploadDialog"
+            >
+              <Upload :size="14" />
+              {{ t('projectDetail.files.actions.upload') }}
+            </button>
+            <button
               class="button"
               type="button"
               :disabled="selectedFileIds.size === 0"
@@ -1316,17 +1327,6 @@ onBeforeUnmount(() => {
               <Loader2 v-if="duplicating" class="lucide-spin" :size="14" />
               <Copy v-else :size="14" />
               {{ t('projectDetail.files.actions.duplicateTemplate') }}
-            </button>
-            <button
-              class="button button--primary"
-              data-testid="project-upload-open"
-              type="button"
-              :disabled="!canOpenUploadModal"
-              :title="uploadButtonTitle || undefined"
-              @click="openUploadDialog"
-            >
-              <Upload :size="14" />
-              {{ t('projectDetail.files.actions.upload') }}
             </button>
             <button
               class="button"
@@ -1390,6 +1390,7 @@ onBeforeUnmount(() => {
         </div>
 
         <DataTable
+          class="pd-file-table"
           test-id="project-file-table"
           row-test-id-prefix="project-file-row"
           :columns="columns"
@@ -1411,6 +1412,7 @@ onBeforeUnmount(() => {
                     class="pd-link-button"
                     data-testid="project-file-open-workbench"
                     type="button"
+                    :title="row.filename"
                     @click="openWorkbench(row)"
                   >
                     {{ row.filename }}
@@ -1426,7 +1428,7 @@ onBeforeUnmount(() => {
                     <ExternalLink :size="14" />
                   </button>
                 </div>
-                <span v-else class="pd-file-cell__title">{{ row.filename }}</span>
+                <span v-else class="pd-file-cell__title" :title="row.filename">{{ row.filename }}</span>
                 <span class="pd-file-cell__meta">{{ getFileDetailHint(row) }}</span>
               </div>
             </div>
@@ -2115,13 +2117,21 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
 }
 
+.pd-file-table :deep(.data-table) {
+  table-layout: fixed;
+  min-width: 1580px;
+}
+
 .pd-file-cell {
   display: flex;
   align-items: flex-start;
   gap: 10px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .pd-file-cell__icon {
+  flex: 0 0 auto;
   margin-top: 2px;
   color: var(--brand-700);
 }
@@ -2130,21 +2140,31 @@ onBeforeUnmount(() => {
   display: grid;
   gap: 4px;
   min-width: 0;
+  width: 100%;
+  overflow: hidden;
 }
 
 .pd-file-cell__title-row {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
+  max-width: 100%;
+  white-space: nowrap;
 }
 
 .pd-link-button {
+  display: block;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
   padding: 0;
   border: none;
   background: transparent;
   color: var(--brand-700);
   text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   box-shadow: none;
 }
 
@@ -2154,6 +2174,7 @@ onBeforeUnmount(() => {
 
 .pd-file-cell__focus-button {
   display: inline-grid;
+  flex: 0 0 24px;
   place-items: center;
   width: 24px;
   height: 24px;
@@ -2171,8 +2192,13 @@ onBeforeUnmount(() => {
 }
 
 .pd-file-cell__title {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
   color: var(--text-primary);
   font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pd-file-cell__meta {

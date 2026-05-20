@@ -2291,9 +2291,13 @@ body.modal-open {
 
 .workbench-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) 74px;
   gap: 12px;
   align-items: start;
+}
+
+.workbench-layout.has-active-tool {
+  grid-template-columns: minmax(0, 1fr) auto auto 74px;
 }
 
 .workbench-sidecar {
@@ -2561,6 +2565,32 @@ body.modal-open {
   overflow: auto;
   padding-right: var(--virtual-list-inline-end-gap, 4px);
   scrollbar-gutter: stable;
+}
+
+.segment-editor-list-stage > .virtual-list {
+  overflow-x: hidden;
+  overflow-y: scroll;
+  scrollbar-width: thin;
+  scrollbar-color: #52717a #e7f0ef;
+}
+
+.segment-editor-list-stage > .virtual-list::-webkit-scrollbar {
+  width: 12px;
+}
+
+.segment-editor-list-stage > .virtual-list::-webkit-scrollbar-track {
+  border-left: 1px solid #cfdfdd;
+  background: #e7f0ef;
+}
+
+.segment-editor-list-stage > .virtual-list::-webkit-scrollbar-thumb {
+  border: 2px solid #e7f0ef;
+  border-radius: 999px;
+  background-color: #52717a;
+}
+
+.segment-editor-list-stage > .virtual-list::-webkit-scrollbar-thumb:hover {
+  background-color: #31525b;
 }
 
 .virtual-list-spacer {
@@ -4064,7 +4094,8 @@ body.modal-open {
 }
 
 @media (max-width: 1180px) {
-  .workbench-layout {
+  .workbench-layout,
+  .workbench-layout.has-active-tool {
     grid-template-columns: 1fr;
   }
 

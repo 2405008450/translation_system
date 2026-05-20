@@ -136,6 +136,34 @@ export interface FileRecordDetail {
   can_export: boolean
   issue_count: number
   open_issue_count: number
+  status_stats: SegmentStatusStats
+  segments: Segment[]
+}
+
+export interface SegmentStatusStats {
+  total: number
+  exact: number
+  fuzzy: number
+  none: number
+  confirmed: number
+  empty_target: number
+}
+
+export interface SegmentPageFilters {
+  scope: string
+  source_query: string
+  target_query: string
+  search_fuzzy: boolean
+}
+
+export interface SegmentPageResponse {
+  file_record_id: string
+  total_segments: number
+  matched_segments: number
+  status_stats: SegmentStatusStats
+  skip: number
+  limit: number
+  filters: SegmentPageFilters
   segments: Segment[]
 }
 
@@ -145,6 +173,18 @@ export interface FileRecordPreview {
   source_extension: string
   supports_preview: boolean
   preview_html: string
+  preview_mode?: 'full' | 'window'
+  render_mode?: 'source' | 'target'
+  skip?: number
+  limit?: number
+  supports_full_preview?: boolean
+}
+
+export interface SaveToTMStats {
+  total_segments: number
+  matched_count: number
+  valid_count: number
+  skipped_count: number
 }
 
 export type CommentAnchorMode = 'sentence' | 'range'
@@ -275,6 +315,18 @@ export interface ExtractedTermDraft {
   conflict: TermEntryConflict | null
 }
 
+export interface TermExtractionModelResult {
+  provider: string
+  model: string
+  terms: ExtractedTermDraft[]
+  total: number
+}
+
+export interface TermExtractionModelError {
+  model: string
+  message: string
+}
+
 export interface TermExtractionResult {
   file_record: {
     id: string
@@ -287,8 +339,12 @@ export interface TermExtractionResult {
   target_language: string
   provider: string
   model: string
+  available_models?: string[]
+  results: TermExtractionModelResult[]
+  merged_terms: ExtractedTermDraft[]
   terms: ExtractedTermDraft[]
   total: number
+  errors?: TermExtractionModelError[]
 }
 
 export interface TermBatchSaveItem {

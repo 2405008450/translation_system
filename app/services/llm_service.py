@@ -386,35 +386,40 @@ async def request_chat_completion(
 
     last_error: Exception | None = None
     request_temperature = config.llm_temperature if temperature is None else temperature
+    retry_attempts = max(int(getattr(config, "llm_retry_attempts_per_provider", 2)), 1)
 
     async def _run_with_clients(clients: dict[str, "httpx.AsyncClient" | None]) -> LLMChatCompletionResult:
         nonlocal last_error
         for item in providers:
-            try:
-                content = await _request_translation(
-                    client=clients.get(item.name),
-                    provider=item,
-                    messages=messages,
-                    temperature=request_temperature,
-                    timeout_seconds=config.llm_timeout_seconds,
-                    model_override=model_override,
-                    response_format=response_format,
-                )
-                return LLMChatCompletionResult(
-                    content=content,
-                    provider=item.name,
-                    model=model_override or item.model,
-                )
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                logger.warning(
-                    "llm chat completion failed provider=%s model=%s error=%s",
-                    item.name,
-                    model_override or item.model,
-                    exc,
-                )
-                if not allow_fallback:
-                    break
+            for attempt_index in range(retry_attempts):
+                try:
+                    content = await _request_translation(
+                        client=clients.get(item.name),
+                        provider=item,
+                        messages=messages,
+                        temperature=request_temperature,
+                        timeout_seconds=config.llm_timeout_seconds,
+                        model_override=model_override,
+                        response_format=response_format,
+                    )
+                    return LLMChatCompletionResult(
+                        content=content,
+                        provider=item.name,
+                        model=model_override or item.model,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    logger.warning(
+                        "llm chat completion failed provider=%s model=%s attempt=%s error=%s",
+                        item.name,
+                        model_override or item.model,
+                        attempt_index + 1,
+                        exc,
+                    )
+                    if attempt_index + 1 < retry_attempts:
+                        await asyncio.sleep(min(0.5 * (attempt_index + 1), 2.0))
+            if not allow_fallback:
+                break
         raise LLMRequestError(str(last_error) if last_error else "LLM 请求失败。")
 
     if httpx is None:

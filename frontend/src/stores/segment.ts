@@ -12,15 +12,46 @@ import type {
   LLMProvider,
   LLMTranslateScope,
   Segment,
+  SegmentPageResponse,
   SegmentRevisionEntry,
+  SegmentStatusStats,
   SegmentUpdatePayload,
+  SaveToTMStats,
   TermMatch,
 } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 import { consumeLLMStream } from '../utils/llmStream'
 
-const SEGMENT_PAGE_SIZE = 1000
+const DEFAULT_SEGMENT_PAGE_SIZE = 200
 const AUTO_SYNC_DELAY_MS = 1500
+
+function createEmptySegmentStatusStats(): SegmentStatusStats {
+  return {
+    total: 0,
+    exact: 0,
+    fuzzy: 0,
+    none: 0,
+    confirmed: 0,
+    empty_target: 0,
+  }
+}
+
+function isCountedSegmentStatus(status: string): status is 'exact' | 'fuzzy' | 'none' | 'confirmed' {
+  return status === 'exact' || status === 'fuzzy' || status === 'none' || status === 'confirmed'
+}
+
+function hasEmptyTarget(value: string | null | undefined) {
+  return !(value || '').trim()
+}
+
+export interface SegmentPageQuery {
+  page?: number
+  pageSize?: number
+  scope?: string
+  sourceQuery?: string
+  targetQuery?: string
+  searchFuzzy?: boolean
+}
 
 export const useSegmentStore = defineStore('segment', () => {
   const fileRecord = ref<FileRecordDetail | null>(null)
@@ -48,6 +79,17 @@ export const useSegmentStore = defineStore('segment', () => {
   const lastPreviewUpdatedSentenceId = ref<string | null>(null)
   const lastPreviewUpdatedText = ref('')
   const totalSegmentCount = ref(0)
+  const matchedSegmentCount = ref(0)
+  const segmentStatusStats = ref<SegmentStatusStats>(createEmptySegmentStatusStats())
+  const currentPage = ref(1)
+  const pageSize = ref(DEFAULT_SEGMENT_PAGE_SIZE)
+  const segmentFilters = ref({
+    scope: 'all',
+    sourceQuery: '',
+    targetQuery: '',
+    searchFuzzy: false,
+  })
+  const saveToTMStats = ref<SaveToTMStats | null>(null)
   const revisionHistory = ref<Record<string, SegmentRevisionEntry[]>>({})
 
   const segmentIndexMap = new Map<string, number>()
@@ -55,6 +97,7 @@ export const useSegmentStore = defineStore('segment', () => {
   let loadMorePromise: Promise<boolean> | null = null
   let previewPromise: Promise<void> | null = null
   let previewLoaded = false
+  let previewCacheKey = ''
   let llmAbortController: AbortController | null = null
   let llmReader: ReadableStreamDefaultReader<Uint8Array> | null = null
   let llmAbortRequested = false
@@ -62,11 +105,15 @@ export const useSegmentStore = defineStore('segment', () => {
   const dirtyCount = computed(() => Object.keys(dirtyEntries.value).length)
   const canExport = computed(() => Boolean(fileRecord.value?.can_export))
   const loadedSegmentCount = computed(() => segments.value.length)
-  const hasMoreSegments = computed(() => loadedSegmentCount.value < totalSegmentCount.value)
+  const currentPageStart = computed(() => (
+    matchedSegmentCount.value === 0 ? 0 : (currentPage.value - 1) * pageSize.value + 1
+  ))
+  const currentPageEnd = computed(() => Math.min(currentPage.value * pageSize.value, matchedSegmentCount.value))
+  const hasMoreSegments = computed(() => currentPageEnd.value < matchedSegmentCount.value)
   const allSegmentsLoaded = computed(() => (
-    totalSegmentCount.value === 0
+    matchedSegmentCount.value === 0
       ? !loading.value && loadedSegmentCount.value === 0
-      : loadedSegmentCount.value >= totalSegmentCount.value
+      : currentPageEnd.value >= matchedSegmentCount.value
   ))
   const llmProgressPercent = computed(() => {
     if (llmPlannedCount.value <= 0) {
@@ -128,6 +175,7 @@ export const useSegmentStore = defineStore('segment', () => {
     previewLoading.value = false
     previewPromise = null
     previewLoaded = false
+    previewCacheKey = ''
   }
 
   function resetSegments(nextSegments: Segment[] = []) {
@@ -136,6 +184,27 @@ export const useSegmentStore = defineStore('segment', () => {
       segmentIndexMap.set(segment.sentence_id, index)
     })
     segments.value = nextSegments
+  }
+
+  function setSegmentStatusStats(stats?: SegmentStatusStats | null) {
+    segmentStatusStats.value = stats ? { ...createEmptySegmentStatusStats(), ...stats } : createEmptySegmentStatusStats()
+  }
+
+  function adjustSegmentStatusStats(previousSegment: Segment, nextSegment: Segment) {
+    const nextStats = { ...segmentStatusStats.value }
+    if (isCountedSegmentStatus(previousSegment.status)) {
+      nextStats[previousSegment.status] = Math.max(0, nextStats[previousSegment.status] - 1)
+    }
+    if (isCountedSegmentStatus(nextSegment.status)) {
+      nextStats[nextSegment.status] += 1
+    }
+
+    const wasEmptyTarget = hasEmptyTarget(previousSegment.target_text)
+    const isEmptyTarget = hasEmptyTarget(nextSegment.target_text)
+    if (wasEmptyTarget !== isEmptyTarget) {
+      nextStats.empty_target = Math.max(0, nextStats.empty_target + (isEmptyTarget ? 1 : -1))
+    }
+    segmentStatusStats.value = nextStats
   }
 
   function appendSegments(nextSegments: Segment[]) {
@@ -150,18 +219,55 @@ export const useSegmentStore = defineStore('segment', () => {
     })
   }
 
-  async function fetchSegmentPage(fileRecordId: string, skip: number, limit: number) {
+  function resolvePageQuery(query: SegmentPageQuery = {}) {
+    return {
+      page: Math.max(1, query.page ?? currentPage.value),
+      pageSize: Math.max(1, query.pageSize ?? pageSize.value),
+      scope: query.scope ?? segmentFilters.value.scope,
+      sourceQuery: query.sourceQuery ?? segmentFilters.value.sourceQuery,
+      targetQuery: query.targetQuery ?? segmentFilters.value.targetQuery,
+      searchFuzzy: query.searchFuzzy ?? segmentFilters.value.searchFuzzy,
+    }
+  }
+
+  function buildSegmentWindowParams(query: SegmentPageQuery = {}) {
+    const resolved = resolvePageQuery(query)
+    return {
+      skip: (resolved.page - 1) * resolved.pageSize,
+      limit: resolved.pageSize,
+      scope: resolved.scope,
+      source_query: resolved.sourceQuery,
+      target_query: resolved.targetQuery,
+      search_fuzzy: resolved.searchFuzzy,
+    }
+  }
+
+  async function fetchFileRecordDetail(fileRecordId: string, limit: number) {
     const { data } = await http.get<FileRecordDetail>(`/file-records/${fileRecordId}`, {
       params: {
-        skip,
+        skip: 0,
         limit,
       },
     })
     return data
   }
 
-  async function loadRevisions(fileRecordId: string) {
-    const { data } = await http.get<SegmentRevisionEntry[]>(`/file-records/${fileRecordId}/revisions`)
+  async function fetchSegmentPage(fileRecordId: string, query: SegmentPageQuery = {}) {
+    const resolved = resolvePageQuery(query)
+    const { data } = await http.get<SegmentPageResponse>(`/file-records/${fileRecordId}/segments`, {
+      params: buildSegmentWindowParams(resolved),
+    })
+    return { data, resolved }
+  }
+
+  async function loadRevisions(fileRecordId: string, query: SegmentPageQuery = {}) {
+    if (!segments.value.length) {
+      setRevisionEntries([])
+      return []
+    }
+    const { data } = await http.get<SegmentRevisionEntry[]>(`/file-records/${fileRecordId}/revisions`, {
+      params: buildSegmentWindowParams(query),
+    })
     setRevisionEntries(data)
     return data
   }
@@ -176,6 +282,17 @@ export const useSegmentStore = defineStore('segment', () => {
     resetSegments()
     resetPreviewState()
     totalSegmentCount.value = 0
+    matchedSegmentCount.value = 0
+    setSegmentStatusStats()
+    currentPage.value = 1
+    pageSize.value = DEFAULT_SEGMENT_PAGE_SIZE
+    segmentFilters.value = {
+      scope: 'all',
+      sourceQuery: '',
+      targetQuery: '',
+      searchFuzzy: false,
+    }
+    saveToTMStats.value = null
     activeSentenceId.value = null
     loading.value = false
     loadingMoreSegments.value = false
@@ -200,25 +317,55 @@ export const useSegmentStore = defineStore('segment', () => {
     llmAbortRequested = false
   }
 
-  async function loadTask(fileRecordId: string) {
+  async function loadTask(fileRecordId: string, query: SegmentPageQuery = {}) {
     resetState()
     loading.value = true
     try {
-      const detail = await fetchSegmentPage(fileRecordId, 0, SEGMENT_PAGE_SIZE)
+      const resolved = resolvePageQuery({
+        page: query.page ?? 1,
+        pageSize: query.pageSize ?? DEFAULT_SEGMENT_PAGE_SIZE,
+        scope: query.scope ?? 'all',
+        sourceQuery: query.sourceQuery ?? '',
+        targetQuery: query.targetQuery ?? '',
+        searchFuzzy: query.searchFuzzy ?? false,
+      })
+      pageSize.value = resolved.pageSize
+      currentPage.value = resolved.page
+      segmentFilters.value = {
+        scope: resolved.scope,
+        sourceQuery: resolved.sourceQuery,
+        targetQuery: resolved.targetQuery,
+        searchFuzzy: resolved.searchFuzzy,
+      }
+      const detail = await fetchFileRecordDetail(fileRecordId, resolved.pageSize)
       fileRecord.value = {
         ...detail,
         segments: [],
       }
       totalSegmentCount.value = detail.total_segments
-      resetSegments(detail.segments)
+      setSegmentStatusStats(detail.status_stats)
+      if (
+        resolved.page === 1
+        && resolved.scope === 'all'
+        && !resolved.sourceQuery
+        && !resolved.targetQuery
+      ) {
+        matchedSegmentCount.value = detail.total_segments
+        resetSegments(detail.segments)
+      } else {
+        const page = await fetchSegmentPage(fileRecordId, resolved)
+        matchedSegmentCount.value = page.data.matched_segments
+        totalSegmentCount.value = page.data.total_segments
+        resetSegments(page.data.segments)
+      }
       await loadRevisions(fileRecordId)
     } finally {
       loading.value = false
     }
   }
 
-  async function loadMoreSegments() {
-    if (!fileRecord.value || !hasMoreSegments.value) {
+  async function loadSegmentPage(query: SegmentPageQuery = {}) {
+    if (!fileRecord.value) {
       return false
     }
 
@@ -228,14 +375,27 @@ export const useSegmentStore = defineStore('segment', () => {
 
     loadingMoreSegments.value = true
     loadMorePromise = (async () => {
-      const detail = await fetchSegmentPage(
-        fileRecord.value!.id,
-        segments.value.length,
-        SEGMENT_PAGE_SIZE,
-      )
-      totalSegmentCount.value = detail.total_segments
-      appendSegments(detail.segments)
-      return detail.segments.length > 0
+      const { data, resolved } = await fetchSegmentPage(fileRecord.value!.id, query)
+      currentPage.value = resolved.page
+      pageSize.value = resolved.pageSize
+      segmentFilters.value = {
+        scope: resolved.scope,
+        sourceQuery: resolved.sourceQuery,
+        targetQuery: resolved.targetQuery,
+        searchFuzzy: resolved.searchFuzzy,
+      }
+      totalSegmentCount.value = data.total_segments
+      matchedSegmentCount.value = data.matched_segments
+      setSegmentStatusStats(data.status_stats)
+      resetSegments(data.segments)
+      resetPreviewState()
+      await loadRevisions(fileRecord.value!.id, resolved)
+      if (segments.value[0] && !segments.value.some((segment) => segment.sentence_id === activeSentenceId.value)) {
+        setActiveSentence(segments.value[0].sentence_id)
+      } else if (!segments.value.length) {
+        setActiveSentence(null)
+      }
+      return data.segments.length > 0
     })()
 
     try {
@@ -246,38 +406,35 @@ export const useSegmentStore = defineStore('segment', () => {
     }
   }
 
-  async function ensureAllSegmentsLoaded() {
+  async function loadMoreSegments() {
     if (!fileRecord.value || !hasMoreSegments.value) {
-      return
+      return false
     }
-
-    if (loadingAllSegments.value) {
-      while (loadingAllSegments.value) {
-        await new Promise<void>((resolve) => window.setTimeout(resolve, 60))
-      }
-      return
-    }
-
-    loadingAllSegments.value = true
-    try {
-      while (hasMoreSegments.value) {
-        const loaded = await loadMoreSegments()
-        if (!loaded) {
-          break
-        }
-      }
-    } finally {
-      loadingAllSegments.value = false
-    }
+    return loadSegmentPage({ page: currentPage.value + 1 })
   }
 
-  async function fetchPreview(fileRecordId: string) {
-    const { data } = await http.get<FileRecordPreview>(`/file-records/${fileRecordId}/preview`)
+  async function ensureAllSegmentsLoaded() {
+    // 大文档模式不再把全文加载到浏览器；保留方法名兼容旧调用。
+    return
+  }
+
+  async function fetchPreview(fileRecordId: string, mode: 'source' | 'target' = 'source') {
+    const { data } = await http.get<FileRecordPreview>(`/file-records/${fileRecordId}/preview`, {
+      params: {
+        skip: (currentPage.value - 1) * pageSize.value,
+        limit: pageSize.value,
+        mode,
+      },
+    })
     return data
   }
 
-  async function ensurePreviewLoaded() {
-    if (!fileRecord.value || previewLoaded) {
+  async function ensurePreviewLoaded(mode: 'source' | 'target' = 'source') {
+    if (!fileRecord.value) {
+      return
+    }
+    const nextPreviewKey = `${fileRecord.value.id}:${currentPage.value}:${pageSize.value}:${mode}`
+    if (previewLoaded && previewCacheKey === nextPreviewKey) {
       return
     }
 
@@ -287,10 +444,11 @@ export const useSegmentStore = defineStore('segment', () => {
 
     previewLoading.value = true
     previewPromise = (async () => {
-      const preview = await fetchPreview(fileRecord.value!.id)
+      const preview = await fetchPreview(fileRecord.value!.id, mode)
       previewHtml.value = preview.preview_html
       previewSupported.value = preview.supports_preview
       previewLoaded = true
+      previewCacheKey = nextPreviewKey
     })()
 
     try {
@@ -307,15 +465,7 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   async function ensureSentenceLoaded(sentenceId: string) {
-    let index = getSegmentIndex(sentenceId)
-    while (index === -1 && hasMoreSegments.value) {
-      const loaded = await loadMoreSegments()
-      if (!loaded) {
-        break
-      }
-      index = getSegmentIndex(sentenceId)
-    }
-    return index
+    return getSegmentIndex(sentenceId)
   }
 
   function markPreviewUpdate(sentenceId: string, targetText: string) {
@@ -332,7 +482,7 @@ export const useSegmentStore = defineStore('segment', () => {
     }
 
     const segment = segments.value[index]
-    segments.value[index] = {
+    const nextSegment = {
       ...segment,
       target_text: targetText,
       source: 'manual',
@@ -340,6 +490,8 @@ export const useSegmentStore = defineStore('segment', () => {
       llm_provider: null,
       llm_model: null,
     }
+    segments.value[index] = nextSegment
+    adjustSegmentStatusStats(segment, nextSegment)
     markPreviewUpdate(sentenceId, targetText)
 
     dirtyEntries.value = {
@@ -494,7 +646,7 @@ export const useSegmentStore = defineStore('segment', () => {
 
     const currentSegment = segments.value[index]
     const isLLMSource = source === 'llm'
-    segments.value[index] = {
+    const nextSegment = {
       ...currentSegment,
       target_text: targetText,
       source,
@@ -502,6 +654,8 @@ export const useSegmentStore = defineStore('segment', () => {
       llm_provider: isLLMSource ? (llmInfo.provider ?? currentSegment.llm_provider ?? null) : null,
       llm_model: isLLMSource ? (llmInfo.model ?? currentSegment.llm_model ?? null) : null,
     }
+    segments.value[index] = nextSegment
+    adjustSegmentStatusStats(currentSegment, nextSegment)
     markPreviewUpdate(sentenceId, targetText)
 
     const nextDirtyEntries = { ...dirtyEntries.value }
@@ -698,6 +852,19 @@ export const useSegmentStore = defineStore('segment', () => {
     downloadBlob(response.data, filename)
   }
 
+  async function loadSaveToTMStats(scope: 'translated' | 'confirmed' | 'all' = 'translated') {
+    if (!fileRecord.value) {
+      saveToTMStats.value = null
+      return null
+    }
+
+    const { data } = await http.get<SaveToTMStats>(`/file-records/${fileRecord.value.id}/save-to-tm/stats`, {
+      params: { scope },
+    })
+    saveToTMStats.value = data
+    return data
+  }
+
   return {
     fileRecord,
     segments,
@@ -725,6 +892,14 @@ export const useSegmentStore = defineStore('segment', () => {
     pendingRevisionCount,
     loadedSegmentCount,
     totalSegmentCount,
+    matchedSegmentCount,
+    segmentStatusStats,
+    currentPage,
+    pageSize,
+    currentPageStart,
+    currentPageEnd,
+    segmentFilters,
+    saveToTMStats,
     hasMoreSegments,
     allSegmentsLoaded,
     previewUpdateToken,
@@ -733,11 +908,13 @@ export const useSegmentStore = defineStore('segment', () => {
     revisionHistory,
     getPendingRevision,
     loadTask,
+    loadSegmentPage,
     loadMoreSegments,
     ensureAllSegmentsLoaded,
     ensurePreviewLoaded,
     ensureSentenceLoaded,
     loadRevisions,
+    loadSaveToTMStats,
     updateTarget,
     setActiveSentence,
     getTermMatches,
