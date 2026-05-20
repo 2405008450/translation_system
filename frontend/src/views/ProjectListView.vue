@@ -70,7 +70,6 @@ const totalCount = ref(0)
 const currentPage = ref(1)
 const pageSize = ref(10)
 const searchQuery = ref('')
-const selectedIds = ref(new Set<string>())
 const sortKey = ref('')
 const sortOrder = ref<'asc' | 'desc'>('desc')
 const pageError = ref('')
@@ -176,7 +175,6 @@ async function deleteProjectIds(ids: string[], successMessage: string) {
   pageError.value = ''
   try {
     await Promise.all(ids.map((id) => http.delete(`/projects/${id}`)))
-    selectedIds.value = new Set()
     await loadProjects()
     toast.success(successMessage)
   } catch (error) {
@@ -186,25 +184,6 @@ async function deleteProjectIds(ids: string[], successMessage: string) {
     }
     pageError.value = error instanceof Error ? error.message : t('projectList.errors.delete')
   }
-}
-
-async function deleteSelected() {
-  if (selectedIds.value.size === 0) {
-    return
-  }
-
-  const confirmed = await confirm({
-    title: t('projectList.actions.delete'),
-    message: t('projectList.messages.deleteSelectedConfirm', { count: selectedIds.value.size }),
-    confirmText: t('common.actions.delete'),
-    danger: true,
-  })
-
-  if (!confirmed) {
-    return
-  }
-
-  await deleteProjectIds(Array.from(selectedIds.value), t('projectList.messages.deletedMany'))
 }
 
 async function deleteRow(row: ProjectItem) {
@@ -250,10 +229,6 @@ function getStatusClass(status: string) {
 function handleSort(key: string, order: 'asc' | 'desc') {
   sortKey.value = key
   sortOrder.value = order
-}
-
-function handleSelect(ids: Set<string>) {
-  selectedIds.value = ids
 }
 
 function goToAssets() {
@@ -309,7 +284,7 @@ onMounted(() => {
         <span class="table-toolbar__summary">{{ t('projectList.total', { total: totalCount }) }}</span>
       </div>
       <div class="table-toolbar__right">
-        <button class="button button--primary" type="button" @click="openCreateDialog">
+        <button class="button button--primary" data-testid="project-create-button" type="button" @click="openCreateDialog">
           <Plus :size="14" />
           {{ t('projectList.create') }}
         </button>
@@ -337,30 +312,21 @@ onMounted(() => {
       </div>
     </div>
 
-    <div v-if="selectedIds.size > 0" class="table-bulk-bar">
-      <span>{{ t('projectList.selectedSummary', { count: selectedIds.size }) }}</span>
-      <button class="button button--danger" type="button" @click="deleteSelected">
-        <Trash2 :size="14" />
-        {{ t('projectList.deleteSelected') }}
-      </button>
-    </div>
-
     <p v-if="pageError" class="form-message is-error table-page__message">{{ pageError }}</p>
 
     <div class="table-page__body">
       <DataTable
+        test-id="project-table"
+        row-test-id-prefix="project-row"
         :columns="columns"
         :data="projects"
         :loading="loading"
-        :selectable="true"
-        :selected-ids="selectedIds"
         :sort-key="sortKey"
         :sort-order="sortOrder"
         :show-index="true"
         :index-offset="indexOffset"
         :empty-text="t('projectList.empty')"
         @sort="handleSort"
-        @select="handleSelect"
       >
         <template #filename="{ row }">
           <button
@@ -478,12 +444,13 @@ onMounted(() => {
       width="min(560px, calc(100vw - 32px))"
       @close="showCreateDialog = false"
     >
-      <div class="form-grid">
+      <div class="form-grid" data-testid="project-create-dialog">
         <label class="field field--full">
           <span class="field__label">{{ t('projectList.form.name') }} <span class="field__required">*</span></span>
           <input
             v-model="form.name"
             class="field__control"
+            data-testid="project-create-name"
             type="text"
             :placeholder="t('projectList.form.namePlaceholder')"
             maxlength="200"
@@ -519,6 +486,7 @@ onMounted(() => {
         <button class="button" type="button" @click="showCreateDialog = false">{{ t('common.actions.cancel') }}</button>
         <button
           class="button button--primary"
+          data-testid="project-create-submit"
           type="button"
           :disabled="creating"
           @click="createProject"
@@ -548,18 +516,6 @@ onMounted(() => {
 .table-toolbar__summary {
   color: var(--text-muted);
   font-size: 13px;
-}
-
-.table-bulk-bar {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  align-items: center;
-  margin: 0 20px 12px;
-  padding: 12px 14px;
-  border: 1px solid var(--line-soft);
-  border-radius: 10px;
-  background: var(--brand-050);
 }
 
 .table-page__message {
@@ -647,10 +603,4 @@ onMounted(() => {
   font-size: 13px;
 }
 
-@media (max-width: 720px) {
-  .table-bulk-bar {
-    flex-direction: column;
-    align-items: stretch;
-  }
-}
 </style>

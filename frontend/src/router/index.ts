@@ -23,6 +23,23 @@ const router = createRouter({
       component: LoginView,
     },
     {
+      path: '/tasks/:id/focus',
+      name: 'workbench-focus',
+      component: WorkbenchView,
+      props: (route) => ({
+        id: String(route.params.id),
+        standalone: true,
+      }),
+      meta: {
+        requiresAuth: true,
+        navSection: 'tasks',
+        pageTitle: '翻译工作台',
+        pageDescription: '专注处理当前翻译任务',
+        pageTitleKey: 'pages.workbench.title',
+        pageDescriptionKey: 'pages.workbench.description',
+      },
+    },
+    {
       path: '/',
       component: AppLayout,
       meta: { requiresAuth: true },

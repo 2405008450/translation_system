@@ -373,6 +373,11 @@ class MultiFormatExporter:
         content = exporter._decode_content(original_bytes)
         source_to_target = self._build_source_to_target_map(segments)
 
+        # 标记 <title> 区域，避免在其中插入双语标记
+        _SKIP_BILINGUAL_RE = re.compile(
+            r'(<title[^>]*>)(.*?)(</title>)', re.IGNORECASE | re.DOTALL
+        )
+
         def replace_text_node(match):
             text = match.group(1)
             stripped = text.strip()
@@ -381,10 +386,53 @@ class MultiFormatExporter:
                 return match.group(0)
             leading = text[: len(text) - len(text.lstrip())]
             trailing = text[len(text.rstrip()) :]
-            bilingual = f'{leading}{stripped}<br/><span style="color:#666;">{target}</span>{trailing}'
+            # 原文保持原样，译文紧跟其后，用不同颜色区分
+            bilingual = (
+                f'{leading}'
+                f'<span style="color:#333;">{stripped}</span>'
+                f'<br/>'
+                f'<span style="color:#0066cc; font-style:italic;">{target}</span>'
+                f'{trailing}'
+            )
             return f">{bilingual}<"
 
-        return re.sub(r">([^<]+)<", replace_text_node, content).encode("utf-8")
+        # 先保护 <title> 内容不被替换
+        title_placeholders: list[str] = []
+
+        def protect_title(m):
+            placeholder = f"__TITLE_PLACEHOLDER_{len(title_placeholders)}__"
+            title_placeholders.append(m.group(0))
+            return placeholder
+
+        protected = _SKIP_BILINGUAL_RE.sub(protect_title, content)
+
+        result = re.sub(r">([^<]+)<", replace_text_node, protected)
+
+        # 恢复 <title> 内容
+        for i, original_title in enumerate(title_placeholders):
+            result = result.replace(f"__TITLE_PLACEHOLDER_{i}__", original_title)
+
+        # 注入双语对照的样式
+        bilingual_style = (
+            '<style>\n'
+            '.bilingual-source { color: #333; display: block; margin-bottom: 2px; }\n'
+            '.bilingual-target { color: #0066cc; font-style: italic; display: block; '
+            'margin-bottom: 8px; padding-left: 0; }\n'
+            '</style>'
+        )
+        head_close = re.search(r'</head>', result, re.IGNORECASE)
+        if head_close:
+            result = result[:head_close.start()] + '\n' + bilingual_style + '\n' + result[head_close.start():]
+        else:
+            body_open = re.search(r'<body[^>]*>', result, re.IGNORECASE)
+            if body_open:
+                result = result[:body_open.start()] + bilingual_style + '\n' + result[body_open.start():]
+            else:
+                result = bilingual_style + '\n' + result
+
+        result = exporter._normalize_fonts(result)
+        result = exporter._ensure_utf8_charset(result)
+        return result.encode("utf-8")
 
     def _export_bilingual_srt(
         self,
@@ -524,9 +572,48 @@ class MultiFormatExporter:
 
     def _replace_plain_text(self, original_bytes: bytes, translations: dict[str, str]) -> bytes:
         content = self._decode_text_content(original_bytes)
-        for source_text in sorted(translations.keys(), key=len, reverse=True):
-            content = content.replace(source_text, translations[source_text])
-        return content.encode("utf-8")
+
+        # 构建规范化文本 -> 译文的映射（处理 source_text 被 normalize 过的情况）
+        normalized_map: dict[str, str] = {}
+        for source_text, target_text in translations.items():
+            normalized_map[source_text] = target_text
+            # 也用规范化后的 key 存一份，方便后续匹配
+            normalized_key = re.sub(r'\s+', ' ', source_text.strip())
+            if normalized_key != source_text:
+                normalized_map[normalized_key] = target_text
+
+        # 统一换行符
+        unified = content.replace("\r\n", "\n").replace("\r", "\n")
+
+        # 按空行分割段落（与 TxtAdapter._split_paragraphs 逻辑一致）
+        parts = re.split(r'(\n\s*\n)', unified)
+
+        result_parts: list[str] = []
+        for part in parts:
+            # 如果是段落分隔符（空行），保留原样
+            if re.match(r'^\n\s*\n$', part):
+                result_parts.append(part)
+                continue
+
+            stripped = part.strip()
+            if not stripped:
+                result_parts.append(part)
+                continue
+
+            # 将段落文本规范化后尝试匹配
+            normalized_paragraph = re.sub(r'\s+', ' ', stripped)
+
+            if normalized_paragraph in normalized_map:
+                # 整段匹配成功，替换为译文
+                result_parts.append(normalized_map[normalized_paragraph])
+            else:
+                # 尝试按句子级别替换（段落内可能有多个句子）
+                replaced = part
+                for source_text in sorted(normalized_map.keys(), key=len, reverse=True):
+                    replaced = replaced.replace(source_text, normalized_map[source_text])
+                result_parts.append(replaced)
+
+        return "".join(result_parts).encode("utf-8")
 
     def _export_json(
         self,

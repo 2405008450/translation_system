@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -13,6 +14,10 @@ from app.database import get_db
 from app.models import FileRecord, TermBase, TermEntry, User
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import normalize_match_text, normalize_text
+from app.services.term_entry_service import (
+    build_term_entry_conflict_items,
+    save_term_entries_batch,
+)
 from app.services.term_importer import (
     XLSX_EXTENSIONS,
     import_terms_from_xlsx_upload,
@@ -39,6 +44,20 @@ class TermBaseMergePayload(BaseModel):
 class TermEntryUpdatePayload(BaseModel):
     source_text: str
     target_text: str
+
+
+class TermEntryDraftPayload(BaseModel):
+    source_text: str
+    target_text: str
+    action: Literal["add", "replace", "skip"] = "add"
+
+
+class TermEntryConflictPayload(BaseModel):
+    entries: list[TermEntryDraftPayload]
+
+
+class TermEntryBatchPayload(BaseModel):
+    entries: list[TermEntryDraftPayload]
 
 
 def _normalize_term_base_name(name: str) -> str:
@@ -446,6 +465,41 @@ async def import_term_base_xlsx(
         "source_language": resolved_source_language,
         "target_language": resolved_target_language,
     }
+
+
+@router.post("/term-bases/{term_base_id}/entries/conflicts")
+def check_term_base_entry_conflicts(
+    term_base_id: UUID,
+    payload: TermEntryConflictPayload,
+    db: Session = Depends(get_db),
+):
+    term_base = _get_term_base_or_404(db, term_base_id)
+    items = build_term_entry_conflict_items(
+        db=db,
+        term_base=term_base,
+        entries=[entry.model_dump() for entry in payload.entries],
+    )
+    return {
+        "term_base_id": str(term_base.id),
+        "items": items,
+        "conflict_count": sum(1 for item in items if item["has_conflict"]),
+    }
+
+
+@router.post("/term-bases/{term_base_id}/entries/batch")
+def batch_save_term_base_entries(
+    term_base_id: UUID,
+    payload: TermEntryBatchPayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    term_base = _get_term_base_or_404(db, term_base_id)
+    return save_term_entries_batch(
+        db=db,
+        term_base=term_base,
+        entries=[entry.model_dump() for entry in payload.entries],
+        current_user=current_user,
+    )
 
 
 @router.get("/term-bases/{term_base_id}/entries")

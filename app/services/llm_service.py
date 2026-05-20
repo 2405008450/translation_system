@@ -72,6 +72,13 @@ class LLMTranslationFailure:
 
 
 @dataclass(frozen=True)
+class LLMChatCompletionResult:
+    content: str
+    provider: str
+    model: str
+
+
+@dataclass(frozen=True)
 class ProviderConfig:
     name: str
     api_key: str
@@ -92,6 +99,7 @@ class TaskGroup:
 
 NUMERIC_LIKE_FRAGMENT_RE = re.compile(r"^[0-9\s,.\-+/%()（）$€¥￥£:：]+$")
 MATH_PLACEHOLDER_RE = re.compile(r"⟦MATH_\d+⟧")
+SYMBOL_VALIDATION_ERROR_MESSAGE = "复选框或特殊符号未按原文原样保留。"
 STRICT_PRESERVE_SYMBOLS = frozenset(
     {
         "□",
@@ -124,6 +132,9 @@ STRICT_PRESERVE_SYMBOLS = frozenset(
         "☆",
     }
 )
+STRICT_PRESERVE_SYMBOL_CLASS = "".join(re.escape(char) for char in sorted(STRICT_PRESERVE_SYMBOLS))
+LINE_PREFIX_SYMBOL_RE = re.compile(rf"^(\s*(?:[{STRICT_PRESERVE_SYMBOL_CLASS}]\s*)+)(.*)$")
+UNSAFE_LOCALIZED_LIST_PREFIX_SYMBOLS = frozenset({"-", "–", "—", "*", "・", "∙", "⁃", "‣", "◾", "◽"})
 
 
 def validate_provider_choice(
@@ -294,7 +305,7 @@ async def _translate_single_task(
                     temperature=current_temperature,
                     timeout_seconds=settings.llm_timeout_seconds,
                 )
-                _validate_translation_output(task, translated_text)
+                translated_text = _validate_or_repair_translation_output(task, translated_text)
                 return LLMTranslationResult(
                     sentence_id=task.sentence_id,
                     translated_text=translated_text,
@@ -321,13 +332,17 @@ async def _request_translation(
     messages: list[dict[str, str]],
     temperature: float,
     timeout_seconds: float,
+    model_override: str | None = None,
+    response_format: dict | None = None,
 ) -> str:
     payload = {
-        "model": provider.model,
+        "model": model_override or provider.model,
         "messages": messages,
         "temperature": temperature,
         "stream": False,
     }
+    if response_format:
+        payload["response_format"] = response_format
     headers = {
         "Authorization": f"Bearer {provider.api_key}",
         "Content-Type": "application/json",
@@ -352,6 +367,70 @@ async def _request_translation(
         raise LLMRequestError(f"{provider.name} 返回错误：{exc.response.text}") from exc
 
     return _extract_translation_from_payload(response.json(), provider.name)
+
+
+async def request_chat_completion(
+    messages: list[dict[str, str]],
+    provider: LLMProvider = "auto",
+    *,
+    model_override: str | None = None,
+    response_format: dict | None = None,
+    temperature: float | None = None,
+    settings: Settings | None = None,
+    allow_fallback: bool = True,
+) -> LLMChatCompletionResult:
+    config = settings or get_settings()
+    providers = validate_provider_choice(provider=provider, settings=config)
+    if not allow_fallback:
+        providers = providers[:1]
+
+    last_error: Exception | None = None
+    request_temperature = config.llm_temperature if temperature is None else temperature
+
+    async def _run_with_clients(clients: dict[str, "httpx.AsyncClient" | None]) -> LLMChatCompletionResult:
+        nonlocal last_error
+        for item in providers:
+            try:
+                content = await _request_translation(
+                    client=clients.get(item.name),
+                    provider=item,
+                    messages=messages,
+                    temperature=request_temperature,
+                    timeout_seconds=config.llm_timeout_seconds,
+                    model_override=model_override,
+                    response_format=response_format,
+                )
+                return LLMChatCompletionResult(
+                    content=content,
+                    provider=item.name,
+                    model=model_override or item.model,
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning(
+                    "llm chat completion failed provider=%s model=%s error=%s",
+                    item.name,
+                    model_override or item.model,
+                    exc,
+                )
+                if not allow_fallback:
+                    break
+        raise LLMRequestError(str(last_error) if last_error else "LLM 请求失败。")
+
+    if httpx is None:
+        return await _run_with_clients({item.name: None for item in providers})
+
+    async with AsyncExitStack() as stack:
+        clients = {
+            item.name: await stack.enter_async_context(
+                httpx.AsyncClient(
+                    base_url=item.base_url,
+                    timeout=httpx.Timeout(config.llm_timeout_seconds),
+                )
+            )
+            for item in providers
+        }
+        return await _run_with_clients(clients)
 
 
 def _build_messages(
@@ -464,6 +543,23 @@ def _extract_math_placeholder_sequence(text: str) -> list[str]:
     return MATH_PLACEHOLDER_RE.findall(text)
 
 
+def _validate_or_repair_translation_output(task: LLMTranslationTask, translated_text: str) -> str:
+    try:
+        _validate_translation_output(task, translated_text)
+        return translated_text
+    except LLMResponseValidationError as exc:
+        if str(exc) != SYMBOL_VALIDATION_ERROR_MESSAGE:
+            raise
+
+        repaired_text = _repair_preserved_symbols(task.source_text, translated_text)
+        if repaired_text is None or repaired_text == translated_text:
+            raise
+
+        _validate_translation_output(task, repaired_text)
+        logger.info("llm output symbols repaired sentence_id=%s", task.sentence_id)
+        return repaired_text
+
+
 def _validate_translation_output(task: LLMTranslationTask, translated_text: str) -> None:
     normalized_output = normalize_text(translated_text)
     if not normalized_output:
@@ -477,13 +573,68 @@ def _validate_translation_output(task: LLMTranslationTask, translated_text: str)
     if source_symbols:
         output_symbols = _extract_preserved_symbol_sequence(translated_text)
         if output_symbols != source_symbols:
-            raise LLMResponseValidationError("复选框或特殊符号未按原文原样保留。")
+            raise LLMResponseValidationError(SYMBOL_VALIDATION_ERROR_MESSAGE)
 
     source_math_placeholders = _extract_math_placeholder_sequence(task.source_text)
     if source_math_placeholders:
         output_math_placeholders = _extract_math_placeholder_sequence(translated_text)
         if output_math_placeholders != source_math_placeholders:
             raise LLMResponseValidationError("数学公式占位符未按原文原样保留。")
+
+
+def _repair_preserved_symbols(source_text: str, translated_text: str) -> str | None:
+    source_symbols = _extract_preserved_symbol_sequence(source_text)
+    if not source_symbols:
+        return None
+
+    output_symbols = _extract_preserved_symbol_sequence(translated_text)
+    if len(output_symbols) == len(source_symbols):
+        source_iter = iter(source_symbols)
+        return "".join(
+            next(source_iter) if char in STRICT_PRESERVE_SYMBOLS else char
+            for char in translated_text
+        )
+
+    return _repair_line_prefix_symbols(source_text, translated_text)
+
+
+def _repair_line_prefix_symbols(source_text: str, translated_text: str) -> str | None:
+    source_lines = source_text.splitlines()
+    translated_lines = translated_text.splitlines(keepends=True)
+    if len(source_lines) < 2 or len(source_lines) != len(translated_lines):
+        return None
+
+    prefixes: list[str] = []
+    for source_line in source_lines:
+        if not source_line.strip():
+            return None
+        match = LINE_PREFIX_SYMBOL_RE.match(source_line)
+        if not match or not _extract_preserved_symbol_sequence(match.group(1)):
+            return None
+        prefixes.append(match.group(1))
+
+    repaired_lines: list[str] = []
+    for prefix, translated_line in zip(prefixes, translated_lines):
+        body, line_ending = _split_line_ending(translated_line)
+        stripped_body = body.lstrip()
+        if stripped_body and stripped_body[0] in UNSAFE_LOCALIZED_LIST_PREFIX_SYMBOLS:
+            return None
+
+        match = LINE_PREFIX_SYMBOL_RE.match(body)
+        translated_body = match.group(2).lstrip() if match else stripped_body
+        if not translated_body:
+            return None
+        repaired_lines.append(prefix + translated_body + line_ending)
+
+    return "".join(repaired_lines)
+
+
+def _split_line_ending(line: str) -> tuple[str, str]:
+    if line.endswith("\r\n"):
+        return line[:-2], "\r\n"
+    if line.endswith("\n") or line.endswith("\r"):
+        return line[:-1], line[-1]
+    return line, ""
 
 
 def _describe_diff(source_text: str, matched_source_text: str) -> str:
@@ -781,7 +932,7 @@ async def _translate_batch_group(
                 all_valid = True
                 for task, translated_text in zip(group.tasks, translations):
                     try:
-                        _validate_translation_output(task, translated_text)
+                        translated_text = _validate_or_repair_translation_output(task, translated_text)
                         results.append(LLMTranslationResult(
                             sentence_id=task.sentence_id,
                             translated_text=translated_text,

@@ -61,12 +61,13 @@ onMounted(async () => {
         <p>{{ subtitle }}</p>
       </div>
 
-      <form class="auth-form" @submit.prevent="submit">
+      <form class="auth-form" data-testid="auth-form" @submit.prevent="submit">
         <label class="field">
           <span class="field__label">{{ t('auth.username') }}</span>
           <input
             v-model.trim="username"
             class="field__control"
+            data-testid="auth-username"
             type="text"
             minlength="3"
             maxlength="50"
@@ -81,6 +82,7 @@ onMounted(async () => {
           <input
             v-model="password"
             class="field__control"
+            data-testid="auth-password"
             type="password"
             minlength="6"
             maxlength="128"
@@ -93,7 +95,7 @@ onMounted(async () => {
         <p v-if="errorMessage" class="form-message is-error">{{ errorMessage }}</p>
         <p v-if="authStore.initMessage" class="form-message is-error">{{ authStore.initMessage }}</p>
 
-        <button class="button button--primary" type="submit" :disabled="submitDisabled">
+        <button class="button button--primary" data-testid="auth-submit" type="submit" :disabled="submitDisabled">
           {{ authStore.loading ? t('auth.submitLoading') : title }}
         </button>
       </form>

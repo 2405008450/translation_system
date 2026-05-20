@@ -29,14 +29,33 @@ const emit = defineEmits<{
 }>()
 
 const editorRef = ref<HTMLDivElement | null>(null)
-const diffTextRef = ref<InstanceType<typeof InteractiveDiffText> | null>(null)
 const isFocused = ref(false)
 
 const statusClass = computed(() => `segment-row--${props.segment.status || 'none'}`)
+const parityClass = computed(() => (props.index % 2 === 0 ? 'segment-row--odd' : 'segment-row--even'))
 const sourceClass = computed(() => `segment-row__tag--source-${props.segment.source || 'none'}`)
+const isEmptyTarget = computed(() => {
+  const targetText = props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
+  return targetText.trim().length === 0
+})
 const statusMeta = computed(() => getSegmentStatusMeta(props.segment.status))
 const sourceMeta = computed(() => getSegmentSourceMeta(props.segment.source))
+const sourceLabel = computed(() => {
+  if (props.segment.source === 'llm') {
+    return props.segment.llm_model?.trim() || sourceMeta.value.label
+  }
+  return sourceMeta.value.label
+})
+const sourceTitle = computed(() => {
+  if (props.segment.source === 'llm' && props.segment.llm_model?.trim()) {
+    return props.segment.llm_provider
+      ? `${props.segment.llm_model} (${props.segment.llm_provider})`
+      : props.segment.llm_model
+  }
+  return sourceMeta.value.label
+})
 const revisionSourceMeta = computed(() => getSegmentSourceMeta(props.pendingRevision?.source || 'manual'))
+const revisionAuthorRole = computed(() => props.pendingRevision?.author?.role || 'admin')
 const hasPendingRevision = computed(() => Boolean(props.pendingRevision))
 const scorePercent = computed(() => {
   if (!props.segment.score || props.segment.score <= 0) return null
@@ -252,59 +271,14 @@ watch(
   }
 )
 
-// 处理部分修订应用
-function handleApplyPartial(newText: string) {
-  if (props.pendingRevision) {
-    emit('applyPartialRevision', props.pendingRevision.id, newText)
-  }
-}
-
-// 处理所有修改都已处理完毕
-function handleAllResolved(newText: string) {
-  if (props.pendingRevision) {
-    emit('applyPartialRevision', props.pendingRevision.id, newText)
-  }
-}
-
-// 接受剩余/全部修改
-function handleAcceptRemaining() {
-  if (diffTextRef.value) {
-    diffTextRef.value.acceptAllRemaining()
-  }
-}
-
-// 拒绝剩余/全部修改
-function handleRejectRemaining() {
-  if (diffTextRef.value) {
-    diffTextRef.value.rejectAllRemaining()
-  }
-}
-
-// 计算按钮文案
-const acceptButtonLabel = computed(() => {
-  const pending = diffTextRef.value?.pendingCount ?? 0
-  const total = diffTextRef.value?.totalCount ?? 0
-  if (pending === total || pending === 0) {
-    return '全部接受'
-  }
-  return `接受剩余 (${pending})`
-})
-
-const rejectButtonLabel = computed(() => {
-  const pending = diffTextRef.value?.pendingCount ?? 0
-  const total = diffTextRef.value?.totalCount ?? 0
-  if (pending === total || pending === 0) {
-    return '全部拒绝'
-  }
-  return `拒绝剩余 (${pending})`
-})
 </script>
 
 <template>
   <article
     class="segment-row"
-    :class="[statusClass, { 'is-active': active, 'has-pending-revision': hasPendingRevision }]"
+    :class="[statusClass, parityClass, { 'is-active': active, 'has-pending-revision': hasPendingRevision, 'is-empty-target': isEmptyTarget }]"
     :id="`segment-${segment.sentence_id}`"
+    data-testid="segment-row"
     :data-sentence-id="segment.sentence_id"
     role="group"
     :aria-label="`segment ${index + 1}`"
@@ -312,9 +286,16 @@ const rejectButtonLabel = computed(() => {
     <div class="segment-row__meta">
       <span class="segment-row__index">#{{ index + 1 }}</span>
       <span class="segment-row__tag segment-row__tag--status">{{ statusMeta.label }}</span>
-      <span class="segment-row__tag is-muted" :class="sourceClass">{{ sourceMeta.label }}</span>
+      <span class="segment-row__tag is-muted" :class="sourceClass" :title="sourceTitle">{{ sourceLabel }}</span>
       <span v-if="scorePercent !== null" class="segment-row__tag segment-row__tag--score">
         {{ scorePercent }}%
+      </span>
+      <span
+        v-if="hasPendingRevision"
+        class="segment-row__tag segment-row__tag--revision"
+        :title="`修订来源：${revisionSourceMeta.label}`"
+      >
+        待审核
       </span>
     </div>
 
@@ -331,48 +312,37 @@ const rejectButtonLabel = computed(() => {
     </div>
 
     <div class="segment-row__cell segment-row__cell--target" :class="{ 'is-pending': hasPendingRevision }">
-      <div v-if="hasPendingRevision" class="segment-row__pending-row">
-        <span class="segment-row__badge segment-row__badge--pending">待审核</span>
-      </div>
-      <div v-if="pendingRevision" class="segment-row__revision-panel">
-        <div class="segment-row__revision-head">
-          <strong>修订对比</strong>
-          <span>{{ revisionSourceMeta.label }}</span>
-          <span class="segment-row__revision-hint">右键点击修改处可单独操作</span>
-        </div>
+      <div
+        v-if="pendingRevision"
+        class="segment-row__revision-inline"
+        tabindex="0"
+        data-testid="segment-target-editor"
+        data-segment-target="true"
+        :data-sentence-id="segment.sentence_id"
+        :aria-label="`translation revision for segment ${index + 1}`"
+        @focus="handleFocus"
+        @blur="handleBlur"
+        @click="handleClick"
+      >
         <InteractiveDiffText
-          ref="diffTextRef"
+          class="segment-row__revision-diff"
           :old-text="pendingRevision.before_text"
           :new-text="pendingRevision.after_text"
           :disabled="disabled || revisionBusy"
+          :show-context-menu="false"
+          :show-pending-hint="false"
+          :revision-author-role="revisionAuthorRole"
           empty-text="空"
-          @all-resolved="handleAllResolved"
         />
-        <div class="segment-row__revision-actions">
-          <button
-            class="button segment-row__revision-button"
-            type="button"
-            :disabled="disabled || revisionBusy"
-            @click.stop="handleAcceptRemaining"
-          >
-            {{ acceptButtonLabel }}
-          </button>
-          <button
-            class="button segment-row__revision-button segment-row__revision-button--danger"
-            type="button"
-            :disabled="disabled || revisionBusy"
-            @click.stop="handleRejectRemaining"
-          >
-            {{ rejectButtonLabel }}
-          </button>
-        </div>
       </div>
       <div
+        v-else
         ref="editorRef"
         class="segment-row__editor"
         :class="{ 'is-focused': isFocused }"
         :contenteditable="!disabled"
         tabindex="0"
+        data-testid="segment-target-editor"
         data-segment-target="true"
         :data-sentence-id="segment.sentence_id"
         :aria-label="`translation for segment ${index + 1}`"
@@ -388,75 +358,49 @@ const rejectButtonLabel = computed(() => {
 </template>
 
 <style scoped>
-.segment-row__pending-row,
-.segment-row__revision-head,
-.segment-row__revision-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.segment-row__pending-row {
-  justify-content: flex-end;
-  min-height: 18px;
-}
-
-.segment-row__badge {
-  display: inline-flex;
-  align-items: center;
-  min-height: 18px;
-  padding: 0 6px;
-  border-radius: 999px;
-  background: rgba(216, 183, 78, 0.18);
-  color: #8a6700;
-  font-size: 11px;
-}
-
-.segment-row__badge--pending {
-  background: rgba(13, 122, 104, 0.14);
-  color: #0b6b5b;
-}
-
 .segment-row__cell--target.is-pending {
-  border-color: rgba(13, 122, 104, 0.35);
-  box-shadow: inset 2px 0 0 rgba(13, 122, 104, 0.42);
+  box-shadow: inset 2px 0 0 rgba(0, 122, 204, 0.36);
 }
 
-.segment-row__revision-panel {
-  display: grid;
-  gap: 6px;
+.segment-row__revision-inline {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 64px;
+  display: block;
   padding: 6px 8px;
-  border: 1px solid rgba(13, 122, 104, 0.16);
-  border-radius: 6px;
-  background: rgba(243, 250, 247, 0.96);
-}
-
-.segment-row__revision-head {
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
-.segment-row__revision-head strong {
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background:
+    linear-gradient(
+      0deg,
+      var(--segment-editor-stripe, transparent),
+      var(--segment-editor-stripe, transparent)
+    );
   color: var(--text-primary);
   font-size: 13px;
+  line-height: 1.45;
+  outline: none;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
-.segment-row__revision-actions {
-  justify-content: flex-end;
+.segment-row__revision-inline:focus {
+  border-color: rgba(0, 122, 204, 0.72);
+  background: var(--surface-panel);
+  box-shadow: 0 0 0 3px rgba(0, 122, 204, 0.12);
 }
 
-.segment-row__revision-button {
-  min-height: 28px;
-  padding: 5px 10px;
-  font-size: 12px;
-  box-shadow: none;
+.segment-row__revision-diff {
+  min-height: 0;
+  overflow: visible;
 }
 
-.segment-row__revision-button--danger {
-  border-color: rgba(194, 59, 63, 0.28);
-  color: #a43a3d;
+.segment-row__tag--revision {
+  background: rgba(0, 122, 204, 0.12);
+  color: #0070c0;
 }
 
 .segment-row__tag--score {
@@ -489,7 +433,12 @@ const rejectButtonLabel = computed(() => {
   padding: 6px 8px;
   border: 1px solid transparent;
   border-radius: 5px;
-  background: transparent;
+  background:
+    linear-gradient(
+      0deg,
+      var(--segment-editor-stripe, transparent),
+      var(--segment-editor-stripe, transparent)
+    );
   font-size: 13px;
   line-height: 1.45;
   color: var(--text-primary);
@@ -517,12 +466,5 @@ const rejectButtonLabel = computed(() => {
 .segment-row__editor:empty::before {
   content: '';
   color: var(--text-placeholder);
-}
-
-.segment-row__revision-hint {
-  margin-left: auto;
-  font-size: 11px;
-  color: var(--text-muted);
-  font-weight: normal;
 }
 </style>

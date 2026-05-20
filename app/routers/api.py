@@ -16,7 +16,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -71,6 +71,7 @@ from app.services.file_record_service import (
     calculate_file_record_progress,
     create_file_record_with_segments,
     delete_file_record,
+    duplicate_file_record,
     get_file_record as get_file_record_model,
     get_file_record_source_filename,
     get_file_record_with_segments,
@@ -92,10 +93,17 @@ from app.services.guideline_repository import (
 )
 from app.services.llm_service import (
     LLMConfigurationError,
+    LLMRequestError,
+    LLMResponseValidationError,
     LLMTranslationFailure,
     LLMTranslationTask,
     iter_batch_translate,
     validate_provider_choice,
+)
+from app.services.term_entry_service import build_term_entry_conflict_items
+from app.services.term_extraction_service import (
+    TermExtractionError,
+    extract_terms_from_segments,
 )
 from app.services.language_detection import detect_upload_language
 from app.services.language_pairs import require_language_pair
@@ -402,6 +410,159 @@ def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[st
     return _serialize_file_record_upload_result(file_record)
 
 
+def _expand_archive_payloads(file_payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """展开压缩包文件为独立文件列表。
+
+    如果上传的文件是 .zip 或 .rar，则解压其中支持的文件，
+    每个文件作为独立的 file_payload 返回。非压缩包文件原样保留。
+    """
+    import zipfile
+    from io import BytesIO
+
+    expanded: list[dict[str, Any]] = []
+
+    for file_payload in file_payloads:
+        filename = file_payload.get("filename") or ""
+        ext = Path(filename).suffix.lower()
+
+        if ext == ".zip":
+            extracted = _extract_zip_files(file_payload["content"], filename)
+            if extracted:
+                expanded.extend(extracted)
+            else:
+                # 如果解压后没有支持的文件，保留原始 zip 处理方式
+                expanded.append(file_payload)
+        elif ext == ".rar":
+            extracted = _extract_rar_files(file_payload["content"], filename)
+            if extracted:
+                expanded.extend(extracted)
+            else:
+                expanded.append(file_payload)
+        else:
+            expanded.append(file_payload)
+
+    return expanded
+
+
+def _extract_zip_files(raw_bytes: bytes, archive_name: str) -> list[dict[str, Any]]:
+    """从 ZIP 文件中提取支持的文件。"""
+    import zipfile
+    from io import BytesIO
+
+    try:
+        zf = zipfile.ZipFile(BytesIO(raw_bytes), 'r')
+    except zipfile.BadZipFile:
+        return []
+
+    extracted: list[dict[str, Any]] = []
+
+    for info in zf.infolist():
+        # 跳过目录
+        if info.is_dir():
+            continue
+
+        # 获取文件名，处理编码问题
+        raw_filename = info.filename
+        decoded_filename = _decode_zip_filename(raw_filename, info)
+
+        # 跳过隐藏文件和系统文件
+        basename = Path(decoded_filename).name
+        if basename.startswith('__') or basename.startswith('.'):
+            continue
+
+        # 检查是否是支持的格式
+        if not supports_task_file(basename):
+            continue
+
+        try:
+            file_bytes = zf.read(info.filename)
+            if file_bytes:
+                extracted.append({
+                    "filename": basename,
+                    "content": file_bytes,
+                })
+        except Exception:
+            continue
+
+    zf.close()
+    return extracted
+
+
+def _extract_rar_files(raw_bytes: bytes, archive_name: str) -> list[dict[str, Any]]:
+    """从 RAR 文件中提取支持的文件。"""
+    try:
+        import rarfile
+        from io import BytesIO
+
+        rf = rarfile.RarFile(BytesIO(raw_bytes))
+    except Exception:
+        return []
+
+    extracted: list[dict[str, Any]] = []
+
+    try:
+        for info in rf.infolist():
+            if info.is_dir():
+                continue
+
+            decoded_filename = info.filename
+            basename = Path(decoded_filename).name
+
+            if basename.startswith('__') or basename.startswith('.'):
+                continue
+
+            if not supports_task_file(basename):
+                continue
+
+            try:
+                file_bytes = rf.read(info.filename)
+                if file_bytes:
+                    extracted.append({
+                        "filename": basename,
+                        "content": file_bytes,
+                    })
+            except Exception:
+                continue
+    finally:
+        rf.close()
+
+    return extracted
+
+
+def _decode_zip_filename(raw_filename: str, info: Any) -> str:
+    """解码 ZIP 文件名，处理中文等非 ASCII 编码问题。
+
+    Python zipfile 模块对非 UTF-8 文件名使用 CP437 解码，
+    这会导致中文文件名乱码。此函数尝试修复。
+    """
+    # 如果 flag_bits 的 bit 11 设置了，说明文件名是 UTF-8 编码
+    if info.flag_bits & 0x800:
+        return raw_filename
+
+    # 尝试将 CP437 解码的字符串重新编码回字节，再用正确编码解码
+    try:
+        raw_bytes = raw_filename.encode('cp437')
+        # 尝试 UTF-8
+        try:
+            return raw_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            pass
+        # 尝试 GBK（中文 Windows 常用）
+        try:
+            return raw_bytes.decode('gbk')
+        except UnicodeDecodeError:
+            pass
+        # 尝试 Shift-JIS（日文）
+        try:
+            return raw_bytes.decode('shift_jis')
+        except UnicodeDecodeError:
+            pass
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        pass
+
+    return raw_filename
+
+
 def _process_project_source_import(db: Session, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     project_id = UUID(payload["project_id"])
     project = db.query(Project).filter(Project.id == project_id).first()
@@ -436,13 +597,17 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
         )
 
     file_payloads = payload["files"]
+
+    # 展开压缩包：将 zip/rar 文件解压为独立文件
+    expanded_payloads = _expand_archive_payloads(file_payloads)
+
     created_files: list[FileRecord] = []
-    for index, file_payload in enumerate(file_payloads, start=1):
+    for index, file_payload in enumerate(expanded_payloads, start=1):
         filename = file_payload["filename"] or "source.txt"
         _set_import_task_status(
             task_id,
             "running",
-            progress=10 + int((index - 1) / max(len(file_payloads), 1) * 80),
+            progress=10 + int((index - 1) / max(len(expanded_payloads), 1) * 80),
             message=f"正在解析 {filename}",
         )
         workspace_data = build_task_workspace(
@@ -568,6 +733,11 @@ class LLMTranslateRequest(BaseModel):
     temporary_prompt: str = ""
 
 
+class TermExtractionRequest(BaseModel):
+    term_base_id: UUID | None = None
+    max_terms: int = Field(default=150, ge=1, le=300)
+
+
 class GuidelineTemplateUpdateRequest(BaseModel):
     content: str
 
@@ -583,6 +753,10 @@ class RematchRequest(BaseModel):
 class FileRecordBindingsRequest(BaseModel):
     term_base_id: UUID | None = None
     collection_id: UUID | None = None
+
+
+class FileRecordDuplicateRequest(BaseModel):
+    filename: str | None = None
 
 
 class SaveToTMRequest(BaseModel):
@@ -2344,6 +2518,8 @@ def get_file_record(
                 "matched_created_at": seg.matched_created_at.isoformat() if seg.matched_created_at else None,
                 "matched_updated_at": seg.matched_updated_at.isoformat() if seg.matched_updated_at else None,
                 "source": seg.source,
+                "llm_provider": seg.llm_provider,
+                "llm_model": seg.llm_model,
                 "block_type": seg.block_type,
                 "block_index": seg.block_index,
                 "row_index": seg.row_index,
@@ -2352,6 +2528,36 @@ def get_file_record(
             for seg in segments
         ],
     }
+
+
+@router.post("/file-records/{file_record_id}/duplicate")
+def duplicate_file_record_task(
+    file_record_id: UUID,
+    payload: FileRecordDuplicateRequest | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """复制一个文件任务，保留源文件、句段和当前译文状态。"""
+    duplicate = duplicate_file_record(
+        db,
+        file_record_id,
+        current_user=current_user,
+        filename=payload.filename if payload else None,
+    )
+    if duplicate is None:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    db.commit()
+    db.refresh(duplicate)
+    file_stats = _get_file_segment_stats(db, [duplicate.id]).get(
+        duplicate.id,
+        {"total": 0, "filled": 0},
+    )
+    return _build_project_file_payload(
+        duplicate,
+        total_segments=file_stats["total"],
+        translated_segments=file_stats["filled"],
+    )
 
 
 @router.get("/file-records/{file_record_id}/preview")
@@ -2490,7 +2696,6 @@ def rematch_file_record(
 
     source_sentences = [segment.source_text for segment in segments]
     auxiliary_sentences = [segment.display_text for segment in segments]
-
     matches, _ = match_sentences_with_stats(
         db=db,
         sentences=source_sentences,
@@ -2556,7 +2761,7 @@ def rematch_file_record(
         if before != after:
             updated_count += 1
 
-    # 更新 file_record 的 collection_id 和 collection_ids_json，以便匹配面板能查询到 TM 候选
+    # 保留当前文档绑定的记忆库，供右侧匹配面板查询 TM 候选。
     if selected_collection_ids:
         file_record.collection_id = selected_collection_ids[0]
         file_record.collection_ids_json = json.dumps([str(cid) for cid in selected_collection_ids])
@@ -3062,6 +3267,91 @@ def create_comment_reply(
     return serialize_segment_comment(comment)
 
 
+@router.post("/file-records/{file_record_id}/term-extraction")
+async def extract_file_record_terms(
+    file_record_id: UUID,
+    payload: TermExtractionRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    source_language, target_language = _resolve_file_record_language_pair(file_record)
+    body = payload or TermExtractionRequest()
+
+    term_base = None
+    target_term_base_id = body.term_base_id or file_record.term_base_id
+    if target_term_base_id is not None:
+        term_base = db.query(TermBase).filter(TermBase.id == target_term_base_id).first()
+        if not term_base:
+            raise HTTPException(status_code=404, detail="术语库不存在。")
+        _ensure_resource_language_pair_matches(term_base, source_language, target_language, "术语库")
+
+    segments = list_segments_for_file_record(db, file_record_id)
+    if not segments:
+        raise HTTPException(status_code=400, detail="当前文件没有可用于术语提取的已解析句段。")
+
+    try:
+        extraction = await extract_terms_from_segments(
+            segments=segments,
+            source_language=source_language,
+            target_language=target_language,
+            max_terms=body.max_terms,
+        )
+    except LLMConfigurationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LLMResponseValidationError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except LLMRequestError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except TermExtractionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    term_items = [
+        {
+            "source_text": item.source_text,
+            "target_text": item.target_text,
+            "source_normalized": item.source_normalized,
+        }
+        for item in extraction.terms
+    ]
+    if term_base is not None:
+        terms = build_term_entry_conflict_items(
+            db=db,
+            term_base=term_base,
+            entries=term_items,
+        )
+    else:
+        terms = [
+            {
+                "index": index,
+                "source_text": item["source_text"],
+                "target_text": item["target_text"],
+                "source_normalized": item["source_normalized"],
+                "has_conflict": False,
+                "conflict": None,
+            }
+            for index, item in enumerate(term_items)
+        ]
+
+    return {
+        "file_record": {
+            "id": str(file_record.id),
+            "filename": file_record.filename,
+            "term_base_id": str(file_record.term_base_id) if file_record.term_base_id else None,
+            "total_segments": len(segments),
+        },
+        "term_base_id": str(term_base.id) if term_base else None,
+        "source_language": source_language,
+        "target_language": target_language,
+        "provider": extraction.provider,
+        "model": extraction.model,
+        "terms": terms,
+        "total": len(terms),
+    }
+
+
 @router.post("/file-records/{file_record_id}/llm-translate")
 @router.post("/documents/{file_record_id}/llm-translate", include_in_schema=False)
 async def llm_translate_file_record(
@@ -3150,6 +3440,8 @@ async def llm_translate_file_record(
                     sentence_id=result.sentence_id,
                     target_text=result.translated_text,
                     current_user=current_user,
+                    llm_provider=result.provider,
+                    llm_model=result.model,
                 )
             except Exception as exc:  # noqa: BLE001
                 db.rollback()

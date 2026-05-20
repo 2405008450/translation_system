@@ -7,7 +7,9 @@ import {
   ChevronDown,
   ChevronUp,
   Clock3,
+  Copy,
   Download,
+  ExternalLink,
   FileText,
   Filter,
   Flag,
@@ -38,6 +40,7 @@ import DocumentParseSettings from '../components/DocumentParseSettings.vue'
 import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import PreTranslateDialog from '../components/PreTranslateDialog.vue'
 import Pagination from '../components/Pagination.vue'
+import TermExtractionDialog from '../components/TermExtractionDialog.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
 import { useToast } from '../composables/useToast'
@@ -140,6 +143,7 @@ const { t } = useI18n()
 
 const loading = ref(false)
 const deleting = ref(false)
+const duplicating = ref(false)
 const uploading = ref(false)
 const uploadPercent = ref(0)
 const project = ref<ProjectDetail | null>(null)
@@ -161,6 +165,8 @@ const activeTab = ref<ProjectTab>('files')
 const showUploadModal = ref(false)
 const showPreTranslateDialog = ref(false)
 const showIssueDialog = ref(false)
+const showTermExtractionDialog = ref(false)
+const termExtractionNeedsReload = ref(false)
 const uploadInputKey = ref(0)
 const openActionMenuId = ref<string | null>(null)
 const actionMenuStyle = ref<Record<string, string>>({})
@@ -204,8 +210,48 @@ const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
 const selectedProjectFiles = computed(() => (
   tableRows.value.filter((row) => selectedFileIds.value.has(row.id))
 ))
+const selectedTermExtractionFile = computed<ProjectFileItem | null>(() => (
+  selectedProjectFiles.value.length === 1 ? selectedProjectFiles.value[0] : null
+))
+const selectedTermExtractionSourceLanguage = computed(() => (
+  selectedTermExtractionFile.value?.source_language || project.value?.source_language || ''
+))
+const selectedTermExtractionTargetLanguage = computed(() => (
+  selectedTermExtractionFile.value?.target_language || project.value?.target_language || ''
+))
 const preTranslateButtonTitle = computed(() => (
   selectedFileIds.value.size === 0 ? t('projectDetail.preTranslate.selectFileFirst') : ''
+))
+const termExtractionButtonTitle = computed(() => {
+  if (selectedFileIds.value.size === 0) {
+    return t('projectDetail.termExtraction.selectFileFirst')
+  }
+  if (selectedFileIds.value.size > 1) {
+    return t('projectDetail.termExtraction.selectOneFile')
+  }
+  if (!selectedTermExtractionFile.value || Number(selectedTermExtractionFile.value.total_segments || 0) <= 0) {
+    return t('projectDetail.termExtraction.noSegments')
+  }
+  if (!selectedTermExtractionSourceLanguage.value || !selectedTermExtractionTargetLanguage.value) {
+    return t('projectDetail.termExtraction.languageMissing')
+  }
+  return ''
+})
+const duplicateTemplateButtonTitle = computed(() => {
+  if (selectedFileIds.value.size === 0) {
+    return t('projectDetail.files.actions.duplicateTemplateSelectFirst')
+  }
+  if (selectedFileIds.value.size > 1) {
+    return t('projectDetail.files.actions.duplicateTemplateSelectOne')
+  }
+  return ''
+})
+const canDuplicateTemplate = computed(() => selectedFileIds.value.size === 1 && !duplicating.value)
+const canOpenTermExtraction = computed(() => (
+  Boolean(selectedTermExtractionFile.value)
+  && Number(selectedTermExtractionFile.value?.total_segments || 0) > 0
+  && Boolean(selectedTermExtractionSourceLanguage.value)
+  && Boolean(selectedTermExtractionTargetLanguage.value)
 ))
 
 const columns = computed<DataTableColumn[]>(() => ([
@@ -383,6 +429,26 @@ function openPreTranslateDialog() {
   showPreTranslateDialog.value = true
 }
 
+function openTermExtractionDialog() {
+  if (!canOpenTermExtraction.value) {
+    return
+  }
+  termExtractionNeedsReload.value = false
+  showTermExtractionDialog.value = true
+}
+
+async function closeTermExtractionDialog() {
+  showTermExtractionDialog.value = false
+  if (termExtractionNeedsReload.value) {
+    termExtractionNeedsReload.value = false
+    await loadProject()
+  }
+}
+
+function handleTermExtractionDone() {
+  termExtractionNeedsReload.value = true
+}
+
 function closePreTranslateDialog() {
   if (loading.value) {
     return
@@ -520,6 +586,25 @@ function openWorkbench(row: ProjectRow) {
       ...(cameFromTasks.value ? { parent: 'tasks' } : {}),
     },
   })
+}
+
+function openWorkbenchInNewWindow(row: ProjectRow) {
+  if (!canEnterWorkbench(row)) {
+    return
+  }
+
+  closeActionMenu()
+  const rowId = String(row.id)
+  const resolved = router.resolve({
+    name: 'workbench-focus',
+    params: { id: rowId },
+    query: {
+      from: 'project',
+      pid: props.id,
+      ...(cameFromTasks.value ? { parent: 'tasks' } : {}),
+    },
+  })
+  window.open(resolved.href, '_blank', 'noopener,noreferrer')
 }
 
 async function loadProject() {
@@ -771,6 +856,31 @@ async function deleteProjectFile(row: ProjectRow) {
   }
 }
 
+async function duplicateSelectedTemplate() {
+  if (!canDuplicateTemplate.value) {
+    return
+  }
+
+  const sourceFile = selectedProjectFiles.value[0]
+  if (!sourceFile) {
+    return
+  }
+
+  duplicating.value = true
+  pageError.value = ''
+
+  try {
+    const { data } = await http.post<ProjectFileItem>(`/file-records/${sourceFile.id}/duplicate`)
+    await loadProject()
+    selectedFileIds.value = new Set([data.id])
+    toast.success(t('projectDetail.messages.duplicated', { name: data.filename }))
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('projectDetail.errors.duplicate'))
+  } finally {
+    duplicating.value = false
+  }
+}
+
 onMounted(() => {
   document.addEventListener('click', handleDocumentClick)
   window.addEventListener('scroll', handleDocumentScroll, { passive: true })
@@ -788,7 +898,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div v-if="showUploadModal" class="upload-page">
+  <div v-if="showUploadModal" class="upload-page" data-testid="project-upload-page">
     <header class="upload-page__topbar">
       <button class="upload-page__back" type="button" :disabled="uploading" @click="closeUploadDialog">
         <ArrowLeft :size="15" />
@@ -809,6 +919,7 @@ onBeforeUnmount(() => {
             <input
               :key="uploadInputKey"
               class="sr-only"
+              data-testid="project-upload-file-input"
               type="file"
               multiple
               :accept="uploadFileAccept"
@@ -847,7 +958,7 @@ onBeforeUnmount(() => {
           <div class="upload-language-grid">
             <label class="field">
               <span class="field__label">{{ t('projectList.form.sourceLanguage') }} <span class="field__required">*</span></span>
-              <select v-model="uploadSourceLanguage" class="field__control">
+              <select v-model="uploadSourceLanguage" class="field__control" data-testid="project-upload-source-language">
                 <option value="" disabled>{{ t('projectList.form.sourcePlaceholder') }}</option>
                 <option
                   v-for="lang in languageOptions"
@@ -862,7 +973,7 @@ onBeforeUnmount(() => {
 
             <label class="field">
               <span class="field__label">{{ t('projectList.form.targetLanguage') }} <span class="field__required">*</span></span>
-              <select v-model="uploadTargetLanguage" class="field__control">
+              <select v-model="uploadTargetLanguage" class="field__control" data-testid="project-upload-target-language">
                 <option value="" disabled>{{ t('projectList.form.targetPlaceholder') }}</option>
                 <option
                   v-for="lang in languageOptions"
@@ -916,6 +1027,7 @@ onBeforeUnmount(() => {
             </button>
             <button
               class="button button--primary"
+              data-testid="project-upload-submit"
               type="button"
               :disabled="uploading || selectedFiles.length === 0 || !uploadSourceLanguage || !uploadTargetLanguage"
               @click="uploadSourceDocument"
@@ -1185,7 +1297,29 @@ onBeforeUnmount(() => {
               {{ t('projectDetail.preTranslate.button') }}
             </button>
             <button
+              class="button"
+              type="button"
+              :disabled="!canOpenTermExtraction"
+              :title="termExtractionButtonTitle || undefined"
+              @click="openTermExtractionDialog"
+            >
+              <BookOpen :size="14" />
+              {{ t('projectDetail.termExtraction.button') }}
+            </button>
+            <button
+              class="button"
+              type="button"
+              :disabled="!canDuplicateTemplate"
+              :title="duplicateTemplateButtonTitle || undefined"
+              @click="duplicateSelectedTemplate"
+            >
+              <Loader2 v-if="duplicating" class="lucide-spin" :size="14" />
+              <Copy v-else :size="14" />
+              {{ t('projectDetail.files.actions.duplicateTemplate') }}
+            </button>
+            <button
               class="button button--primary"
+              data-testid="project-upload-open"
               type="button"
               :disabled="!canOpenUploadModal"
               :title="uploadButtonTitle || undefined"
@@ -1256,6 +1390,8 @@ onBeforeUnmount(() => {
         </div>
 
         <DataTable
+          test-id="project-file-table"
+          row-test-id-prefix="project-file-row"
           :columns="columns"
           :data="pagedRows"
           :loading="loading"
@@ -1270,14 +1406,26 @@ onBeforeUnmount(() => {
             <div class="pd-file-cell">
               <FileText class="pd-file-cell__icon" :size="18" />
               <div class="pd-file-cell__content">
-                <button
-                  v-if="canEnterWorkbench(row)"
-                  class="pd-link-button"
-                  type="button"
-                  @click="openWorkbench(row)"
-                >
-                  {{ row.filename }}
-                </button>
+                <div v-if="canEnterWorkbench(row)" class="pd-file-cell__title-row">
+                  <button
+                    class="pd-link-button"
+                    data-testid="project-file-open-workbench"
+                    type="button"
+                    @click="openWorkbench(row)"
+                  >
+                    {{ row.filename }}
+                  </button>
+                  <button
+                    class="pd-file-cell__focus-button"
+                    data-testid="project-file-open-workbench-focus"
+                    type="button"
+                    :title="t('projectDetail.files.actions.openFocus')"
+                    :aria-label="t('projectDetail.files.actions.openFocus')"
+                    @click.stop="openWorkbenchInNewWindow(row)"
+                  >
+                    <ExternalLink :size="14" />
+                  </button>
+                </div>
                 <span v-else class="pd-file-cell__title">{{ row.filename }}</span>
                 <span class="pd-file-cell__meta">{{ getFileDetailHint(row) }}</span>
               </div>
@@ -1391,6 +1539,14 @@ onBeforeUnmount(() => {
         </button>
         <button
           type="button"
+          :disabled="!canEnterWorkbench(actionMenuRow)"
+          :title="!canEnterWorkbench(actionMenuRow) ? getFileDetailHint(actionMenuRow) : undefined"
+          @click="openWorkbenchInNewWindow(actionMenuRow)"
+        >
+          {{ t('projectDetail.files.actions.openFocus') }}
+        </button>
+        <button
+          type="button"
           :disabled="!actionMenuRow.has_source_document"
           :title="!actionMenuRow.has_source_document ? t('projectDetail.common.uploadRequired') : undefined"
           @click="exportProjectFile(actionMenuRow)"
@@ -1422,6 +1578,14 @@ onBeforeUnmount(() => {
       :translation-guidelines="project?.translation_guidelines ?? ''"
       @close="closePreTranslateDialog"
       @done="handlePreTranslateDone"
+    />
+    <TermExtractionDialog
+      :open="showTermExtractionDialog"
+      :file="selectedTermExtractionFile"
+      :project-source-language="project?.source_language ?? null"
+      :project-target-language="project?.target_language ?? null"
+      @close="closeTermExtractionDialog"
+      @done="handleTermExtractionDone"
     />
     <IssueMarkerDialog
       :open="showIssueDialog"
@@ -1968,6 +2132,13 @@ onBeforeUnmount(() => {
   min-width: 0;
 }
 
+.pd-file-cell__title-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
 .pd-link-button {
   padding: 0;
   border: none;
@@ -1979,6 +2150,24 @@ onBeforeUnmount(() => {
 
 .pd-link-button:hover {
   color: var(--brand-600);
+}
+
+.pd-file-cell__focus-button {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-panel);
+  color: var(--text-secondary);
+  box-shadow: none;
+}
+
+.pd-file-cell__focus-button:hover {
+  border-color: var(--brand-500);
+  color: var(--brand-700);
 }
 
 .pd-file-cell__title {

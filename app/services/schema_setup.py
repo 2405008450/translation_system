@@ -68,6 +68,10 @@ REQUIRED_SCHEMA = {
         "deadline",
         "access_level",
     },
+    "segments": {
+        "llm_provider",
+        "llm_model",
+    },
     "segment_revisions": {
         "id",
         "file_record_id",
@@ -485,6 +489,14 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_file_records_source_language
             ON file_records (source_language)
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS llm_provider VARCHAR(40)
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS llm_model VARCHAR(200)
             """,
             f"""
             CREATE TABLE IF NOT EXISTS issue_markers (

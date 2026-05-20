@@ -461,6 +461,8 @@ CREATE TABLE IF NOT EXISTS segments (
     matched_created_at TIMESTAMP,
     matched_updated_at TIMESTAMP,
     source VARCHAR(20) NOT NULL DEFAULT 'tm',
+    llm_provider VARCHAR(40),
+    llm_model VARCHAR(200),
     block_type VARCHAR(20) NOT NULL DEFAULT 'paragraph',
     block_index INTEGER NOT NULL DEFAULT 0,
     row_index INTEGER,
@@ -477,6 +479,10 @@ ALTER TABLE IF EXISTS segments
     ADD COLUMN IF NOT EXISTS matched_created_at TIMESTAMP;
 ALTER TABLE IF EXISTS segments
     ADD COLUMN IF NOT EXISTS matched_updated_at TIMESTAMP;
+ALTER TABLE IF EXISTS segments
+    ADD COLUMN IF NOT EXISTS llm_provider VARCHAR(40);
+ALTER TABLE IF EXISTS segments
+    ADD COLUMN IF NOT EXISTS llm_model VARCHAR(200);
 
 CREATE INDEX IF NOT EXISTS ix_segments_file_record_id
     ON segments (file_record_id);

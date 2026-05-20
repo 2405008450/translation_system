@@ -234,6 +234,8 @@ class Segment(Base):
     matched_created_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
     matched_updated_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
     source: Mapped[str] = mapped_column(String(20), nullable=False, default="tm")
+    llm_provider: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    llm_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
     block_type: Mapped[str] = mapped_column(String(20), nullable=False, default="paragraph")
     block_index: Mapped[int] = mapped_column(nullable=False, default=0)
     row_index: Mapped[int | None] = mapped_column(nullable=True)

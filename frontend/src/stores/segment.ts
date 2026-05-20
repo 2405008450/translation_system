@@ -42,6 +42,7 @@ export const useSegmentStore = defineStore('segment', () => {
   const llmProcessedCount = ref(0)
   const llmErrorCount = ref(0)
   const lastSyncedAt = ref<string | null>(null)
+  const lastModifiedAt = ref<string | null>(null)
   const dirtyEntries = ref<Record<string, SegmentUpdatePayload>>({})
   const previewUpdateToken = ref(0)
   const lastPreviewUpdatedSentenceId = ref<string | null>(null)
@@ -187,6 +188,7 @@ export const useSegmentStore = defineStore('segment', () => {
     llmProcessedCount.value = 0
     llmErrorCount.value = 0
     lastSyncedAt.value = null
+    lastModifiedAt.value = null
     dirtyEntries.value = {}
     previewUpdateToken.value = 0
     lastPreviewUpdatedSentenceId.value = null
@@ -319,6 +321,7 @@ export const useSegmentStore = defineStore('segment', () => {
   function markPreviewUpdate(sentenceId: string, targetText: string) {
     lastPreviewUpdatedSentenceId.value = sentenceId
     lastPreviewUpdatedText.value = targetText
+    lastModifiedAt.value = new Date().toISOString()
     previewUpdateToken.value += 1
   }
 
@@ -334,6 +337,8 @@ export const useSegmentStore = defineStore('segment', () => {
       target_text: targetText,
       source: 'manual',
       status: 'confirmed',
+      llm_provider: null,
+      llm_model: null,
     }
     markPreviewUpdate(sentenceId, targetText)
 
@@ -409,8 +414,11 @@ export const useSegmentStore = defineStore('segment', () => {
       })
       dirtyEntries.value = {}
       await loadRevisions(fileRecord.value.id)
-      lastSyncedAt.value = new Date().toLocaleString('zh-CN', { hour12: false })
-      syncMessage.value = translate('stores.segment.syncedAt', { time: lastSyncedAt.value })
+      const syncedAt = new Date()
+      lastSyncedAt.value = syncedAt.toISOString()
+      syncMessage.value = translate('stores.segment.syncedAt', {
+        time: syncedAt.toLocaleString('zh-CN', { hour12: false }),
+      })
     } finally {
       saving.value = false
     }
@@ -472,17 +480,27 @@ export const useSegmentStore = defineStore('segment', () => {
     return data
   }
 
-  function applyLLMUpdate(sentenceId: string, targetText: string, source = 'llm', status = 'confirmed') {
+  function applyLLMUpdate(
+    sentenceId: string,
+    targetText: string,
+    source = 'llm',
+    status = 'confirmed',
+    llmInfo: { provider?: string | null, model?: string | null } = {},
+  ) {
     const index = getSegmentIndex(sentenceId)
     if (index === -1) {
       return
     }
 
+    const currentSegment = segments.value[index]
+    const isLLMSource = source === 'llm'
     segments.value[index] = {
-      ...segments.value[index],
+      ...currentSegment,
       target_text: targetText,
       source,
       status,
+      llm_provider: isLLMSource ? (llmInfo.provider ?? currentSegment.llm_provider ?? null) : null,
+      llm_model: isLLMSource ? (llmInfo.model ?? currentSegment.llm_model ?? null) : null,
     }
     markPreviewUpdate(sentenceId, targetText)
 
@@ -603,6 +621,10 @@ export const useSegmentStore = defineStore('segment', () => {
         String(data.target_text || ''),
         String(data.source || 'llm'),
         'confirmed',
+        {
+          provider: typeof data.provider === 'string' ? data.provider : null,
+          model: typeof data.model === 'string' ? data.model : null,
+        },
       )
       llmMessage.value = translate('stores.segment.llmProgress', {
         processed: llmProcessedCount.value,
@@ -692,6 +714,8 @@ export const useSegmentStore = defineStore('segment', () => {
     llmRunning,
     syncMessage,
     llmMessage,
+    lastSyncedAt,
+    lastModifiedAt,
     llmPlannedCount,
     llmProcessedCount,
     llmErrorCount,

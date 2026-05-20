@@ -23,6 +23,8 @@ const props = withDefaults(defineProps<{
   showIndex?: boolean
   indexOffset?: number
   emptyText?: string
+  testId?: string
+  rowTestIdPrefix?: string
 }>(), {
   loading: false,
   selectable: false,
@@ -33,6 +35,8 @@ const props = withDefaults(defineProps<{
   showIndex: false,
   indexOffset: 0,
   emptyText: '',
+  testId: undefined,
+  rowTestIdPrefix: undefined,
 })
 
 const emit = defineEmits<{
@@ -110,6 +114,7 @@ watch([allSelected, someSelected], () => {
     class="data-table-wrapper"
     :class="{ 'is-loading': loading }"
     :aria-busy="loading"
+    :data-testid="testId"
   >
     <table class="data-table">
       <thead>
@@ -157,6 +162,7 @@ watch([allSelected, someSelected], () => {
             v-for="(row, rowIndex) in data"
             :key="row[rowKey]"
             :class="{ 'is-selected': selectedIds.has(row[rowKey]) }"
+            :data-testid="rowTestIdPrefix ? `${rowTestIdPrefix}-${row[rowKey]}` : undefined"
           >
             <td v-if="selectable" class="data-table__checkbox">
               <input
