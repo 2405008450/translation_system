@@ -486,6 +486,8 @@ ALTER TABLE IF EXISTS segments
 
 CREATE INDEX IF NOT EXISTS ix_segments_file_record_id
     ON segments (file_record_id);
+CREATE INDEX IF NOT EXISTS ix_segments_file_record_order
+    ON segments (file_record_id, block_index, row_index, cell_index, sentence_id);
 
 DROP TRIGGER IF EXISTS update_segments_updated_at ON segments;
 CREATE TRIGGER update_segments_updated_at

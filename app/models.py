@@ -209,7 +209,17 @@ class User(Base):
 
 class Segment(Base):
     __tablename__ = "segments"
-    __table_args__ = (Index("ix_segments_file_record_id", "file_record_id"),)
+    __table_args__ = (
+        Index("ix_segments_file_record_id", "file_record_id"),
+        Index(
+            "ix_segments_file_record_order",
+            "file_record_id",
+            "block_index",
+            "row_index",
+            "cell_index",
+            "sentence_id",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),

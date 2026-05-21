@@ -2,6 +2,7 @@
 import axios from 'axios'
 import {
   ExternalLink,
+  GitMerge,
   Loader2,
   Plus,
   RefreshCw,
@@ -20,7 +21,7 @@ import type {
   ExtractedTermDraft,
   TermBase,
   TermBatchSaveResult,
-  TermEntryConflict,
+  TermExtractionModelResult,
   TermExtractionResult,
 } from '../types/api'
 import Modal from './base/Modal.vue'
@@ -35,10 +36,24 @@ interface ProjectFileItem {
 }
 
 type TermDraftAction = 'add' | 'replace' | 'skip'
+type VersionKey = 'merged' | `model:${string}`
 
 interface TermDraftRow extends ExtractedTermDraft {
   row_id: string
   action: TermDraftAction
+}
+
+interface ModelOption {
+  id: string
+  name: string
+}
+
+interface VersionOption {
+  key: VersionKey
+  label: string
+  model: string | null
+  provider: string | null
+  terms: ExtractedTermDraft[]
 }
 
 const props = defineProps<{
@@ -56,6 +71,13 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const router = useRouter()
 
+const defaultModelId = 'google/gemini-3-flash-preview'
+const modelOptions: ModelOption[] = [
+  { id: defaultModelId, name: 'Gemini 3 Flash Preview' },
+  { id: 'openai/gpt-4o-mini', name: 'GPT-4o mini' },
+  { id: 'deepseek/deepseek-chat', name: 'DeepSeek Chat' },
+]
+
 const loadingBases = ref(false)
 const extracting = ref(false)
 const checkingConflicts = ref(false)
@@ -65,7 +87,12 @@ const creatingBase = ref(false)
 const termBases = ref<TermBase[]>([])
 const selectedTermBaseId = ref('')
 const drafts = ref<TermDraftRow[]>([])
-const extractionInfo = ref<{ provider: string, model: string } | null>(null)
+const selectedModels = ref<string[]>([defaultModelId])
+const customModelId = ref('')
+const extractionPrompt = ref('')
+const modelResults = ref<TermExtractionModelResult[]>([])
+const mergedTerms = ref<ExtractedTermDraft[]>([])
+const selectedVersionKey = ref<VersionKey | ''>('')
 const errorMessage = ref('')
 const saveResult = ref<TermBatchSaveResult | null>(null)
 const newBaseName = ref('')
@@ -90,11 +117,49 @@ const saveableCount = computed(() => drafts.value.filter((draft) => (
   && draft.target_text.trim()
   && draft.action !== 'skip'
 )).length)
-const canExtract = computed(() => Boolean(props.file && sourceLanguage.value && targetLanguage.value && !extracting.value))
+const hasExtractionResults = computed(() => modelResults.value.length > 0 || mergedTerms.value.length > 0)
+const versionOptions = computed<VersionOption[]>(() => {
+  const options: VersionOption[] = []
+  if (modelResults.value.length > 1) {
+    options.push({
+      key: 'merged',
+      label: t('projectDetail.termExtraction.mergedVersion'),
+      model: null,
+      provider: null,
+      terms: mergedTerms.value,
+    })
+  }
+  modelResults.value.forEach((result, index) => {
+    options.push({
+      key: getModelVersionKey(result, index),
+      label: getModelLabel(result.model),
+      model: result.model,
+      provider: result.provider,
+      terms: result.terms,
+    })
+  })
+  return options
+})
+const selectedVersion = computed(() => (
+  versionOptions.value.find((option) => option.key === selectedVersionKey.value) ?? null
+))
+const compareResults = computed(() => (
+  modelResults.value.length > 1 ? modelResults.value.slice(0, 2) : []
+))
+const selectedModelSummary = computed(() => selectedModels.value.map(getModelLabel).join(' / '))
+const canExtract = computed(() => Boolean(
+  props.file
+  && sourceLanguage.value
+  && targetLanguage.value
+  && selectedModels.value.length > 0
+  && selectedModels.value.length <= 2
+  && !extracting.value,
+))
 const canSave = computed(() => Boolean(
   props.file
   && selectedTermBaseId.value
   && drafts.value.length > 0
+  && saveableCount.value > 0
   && !saving.value
   && !extracting.value,
 ))
@@ -108,19 +173,111 @@ function getErrorMessage(error: unknown, fallback: string) {
 
 function resetState() {
   drafts.value = []
-  extractionInfo.value = null
+  modelResults.value = []
+  mergedTerms.value = []
+  selectedVersionKey.value = ''
+  selectedModels.value = [defaultModelId]
+  customModelId.value = ''
+  extractionPrompt.value = ''
   errorMessage.value = ''
   saveResult.value = null
   selectedTermBaseId.value = props.file?.term_base_id || ''
   newBaseName.value = props.file ? `${props.file.filename} 术语` : ''
 }
 
-function toDraftRows(terms: ExtractedTermDraft[]): TermDraftRow[] {
+function getModelLabel(modelId: string) {
+  if (modelId === 'deepseek-chat') {
+    return 'DeepSeek Chat'
+  }
+  return modelOptions.find((option) => option.id === modelId)?.name || modelId
+}
+
+function getModelVersionKey(result: TermExtractionModelResult, index: number): VersionKey {
+  return `model:${index}:${result.model}`
+}
+
+function countTermConflicts(terms: ExtractedTermDraft[]) {
+  return terms.filter((term) => term.has_conflict).length
+}
+
+function toggleModel(modelId: string, event: Event) {
+  const checked = (event.target as HTMLInputElement).checked
+  if (checked) {
+    if (selectedModels.value.includes(modelId)) {
+      return
+    }
+    if (selectedModels.value.length >= 2) {
+      ;(event.target as HTMLInputElement).checked = false
+      pushToast({
+        tone: 'warn',
+        title: t('projectDetail.termExtraction.modelLimit'),
+        message: t('projectDetail.termExtraction.modelCompareHint'),
+      })
+      return
+    }
+    selectedModels.value = [...selectedModels.value, modelId]
+    return
+  }
+  selectedModels.value = selectedModels.value.filter((selected) => selected !== modelId)
+}
+
+function addCustomModel() {
+  const modelId = customModelId.value.trim()
+  if (!modelId) {
+    return
+  }
+  if (selectedModels.value.includes(modelId)) {
+    customModelId.value = ''
+    return
+  }
+  if (selectedModels.value.length >= 2) {
+    pushToast({
+      tone: 'warn',
+      title: t('projectDetail.termExtraction.modelLimit'),
+      message: t('projectDetail.termExtraction.modelCompareHint'),
+    })
+    return
+  }
+  selectedModels.value = [...selectedModels.value, modelId]
+  customModelId.value = ''
+}
+
+function removeSelectedModel(modelId: string) {
+  selectedModels.value = selectedModels.value.filter((selected) => selected !== modelId)
+}
+
+function toDraftRows(terms: ExtractedTermDraft[], versionKey: string = 'manual'): TermDraftRow[] {
   return terms.map((term, index) => ({
     ...term,
-    row_id: `${Date.now()}-${index}-${term.source_normalized || term.source_text}`,
+    row_id: `${Date.now()}-${versionKey}-${index}-${term.source_normalized || term.source_text}`,
+    index,
     action: term.has_conflict ? 'skip' : 'add',
   }))
+}
+
+function applyVersion(versionKey: VersionKey) {
+  const version = versionOptions.value.find((option) => option.key === versionKey)
+  if (!version) {
+    return
+  }
+  selectedVersionKey.value = versionKey
+  drafts.value = toDraftRows(version.terms, versionKey)
+  saveResult.value = null
+}
+
+function applyDefaultVersion(data: TermExtractionResult) {
+  const results = data.results && data.results.length > 0
+    ? data.results
+    : [{
+        provider: data.provider,
+        model: data.model,
+        terms: data.terms,
+        total: data.total,
+      }]
+  modelResults.value = results
+  mergedTerms.value = data.merged_terms && data.merged_terms.length > 0 ? data.merged_terms : data.terms
+  const defaultVersionKey: VersionKey = results.length > 1 ? 'merged' : `model:0:${results[0].model}`
+  applyVersion(defaultVersionKey)
 }
 
 async function loadTermBases() {
@@ -152,14 +309,17 @@ async function runExtraction() {
       {
         term_base_id: selectedTermBaseId.value || null,
         max_terms: 150,
+        models: selectedModels.value,
+        extraction_prompt: extractionPrompt.value.trim(),
       },
     )
-    drafts.value = toDraftRows(data.terms)
-    extractionInfo.value = {
-      provider: data.provider,
-      model: data.model,
+    applyDefaultVersion(data)
+    if (data.errors && data.errors.length > 0) {
+      errorMessage.value = data.errors
+        .map((item) => `${getModelLabel(item.model)}：${item.message}`)
+        .join('\n')
     }
-    if (data.terms.length === 0) {
+    if (drafts.value.length === 0) {
       errorMessage.value = t('projectDetail.termExtraction.emptyResult')
     }
   } catch (error) {
@@ -328,7 +488,6 @@ watch(
     }
     resetState()
     await loadTermBases()
-    await runExtraction()
   },
 )
 
@@ -354,7 +513,8 @@ watch(selectedTermBaseId, async (next, previous) => {
       <div class="term-extract__summary">
         <span class="tag">{{ languagePairLabel }}</span>
         <span class="tag">{{ t('projectDetail.termExtraction.segmentCount', { count: file?.total_segments || 0 }) }}</span>
-        <span v-if="extractionInfo" class="tag">{{ extractionInfo.model }}</span>
+        <span v-if="selectedModelSummary" class="tag">{{ selectedModelSummary }}</span>
+        <span v-if="selectedVersion" class="tag">{{ selectedVersion.label }}</span>
         <span class="tag">{{ t('projectDetail.termExtraction.termCount', { count: drafts.length }) }}</span>
         <span v-if="conflictCount > 0" class="tag is-warning">
           {{ t('projectDetail.termExtraction.conflictCount', { count: conflictCount }) }}
@@ -396,11 +556,73 @@ watch(selectedTermBaseId, async (next, previous) => {
         </button>
       </section>
 
+      <section class="term-extract__config">
+        <div class="term-extract__config-head">
+          <span class="section-title section-title--tight">{{ t('projectDetail.termExtraction.modelConfig') }}</span>
+          <span class="term-extract__muted">{{ t('projectDetail.termExtraction.modelCompareHint') }}</span>
+        </div>
+        <div class="term-extract__model-grid">
+          <label
+            v-for="option in modelOptions"
+            :key="option.id"
+            class="term-extract__model-option"
+            :class="{ 'is-selected': selectedModels.includes(option.id) }"
+          >
+            <input
+              type="checkbox"
+              :checked="selectedModels.includes(option.id)"
+              :disabled="extracting || saving"
+              @change="toggleModel(option.id, $event)"
+            />
+            <span>
+              <strong>{{ option.name }}</strong>
+              <small>{{ option.id }}</small>
+            </span>
+          </label>
+        </div>
+        <div class="term-extract__custom-model">
+          <input
+            v-model.trim="customModelId"
+            class="field__control"
+            type="text"
+            :placeholder="t('projectDetail.termExtraction.customModelPlaceholder')"
+            :disabled="extracting || saving"
+            @keydown.enter.prevent="addCustomModel"
+          />
+          <button class="button" type="button" :disabled="extracting || saving || !customModelId.trim()" @click="addCustomModel">
+            <Plus :size="14" />
+            {{ t('projectDetail.termExtraction.addModel') }}
+          </button>
+        </div>
+        <div v-if="selectedModels.length > 0" class="term-extract__selected-models">
+          <button
+            v-for="modelId in selectedModels"
+            :key="modelId"
+            class="tag term-extract__model-chip"
+            type="button"
+            :disabled="extracting || saving"
+            @click="removeSelectedModel(modelId)"
+          >
+            {{ getModelLabel(modelId) }} ×
+          </button>
+        </div>
+        <label class="field">
+          <span class="field__label">{{ t('projectDetail.termExtraction.promptLabel') }}</span>
+          <textarea
+            v-model="extractionPrompt"
+            class="field__control term-extract__prompt"
+            rows="4"
+            :placeholder="t('projectDetail.termExtraction.promptPlaceholder')"
+            :disabled="extracting || saving"
+          />
+        </label>
+      </section>
+
       <div class="term-extract__tools">
         <button class="button" type="button" :disabled="!canExtract" @click="runExtraction">
           <Loader2 v-if="extracting" class="lucide-spin" :size="14" />
           <Sparkles v-else :size="14" />
-          {{ t('projectDetail.termExtraction.extractAgain') }}
+          {{ hasExtractionResults ? t('projectDetail.termExtraction.extractAgain') : t('projectDetail.termExtraction.startExtract') }}
         </button>
         <button
           class="button"
@@ -417,6 +639,91 @@ watch(selectedTermBaseId, async (next, previous) => {
           {{ t('projectDetail.termExtraction.addRow') }}
         </button>
       </div>
+
+      <section v-if="hasExtractionResults" class="term-extract__versions">
+        <div class="term-extract__config-head">
+          <span class="section-title section-title--tight">{{ t('projectDetail.termExtraction.versionTitle') }}</span>
+          <span class="term-extract__muted">{{ t('projectDetail.termExtraction.versionHint') }}</span>
+        </div>
+        <div v-if="compareResults.length === 2" class="term-extract__compare">
+          <article
+            v-for="(result, index) in compareResults"
+            :key="`${result.model}-${index}`"
+            class="term-extract__compare-pane"
+            :class="{ 'is-selected': selectedVersionKey === getModelVersionKey(result, index) }"
+          >
+            <div class="term-extract__compare-head">
+              <div>
+                <strong>{{ getModelLabel(result.model) }}</strong>
+                <small>{{ result.model }}</small>
+              </div>
+              <button
+                class="button"
+                type="button"
+                :disabled="extracting || saving"
+                @click="applyVersion(getModelVersionKey(result, index))"
+              >
+                <Sparkles :size="14" />
+                {{ t('projectDetail.termExtraction.useVersion') }}
+              </button>
+            </div>
+            <div class="term-extract__compare-table-wrap">
+              <table class="term-extract__compare-table">
+                <thead>
+                  <tr>
+                    <th>{{ t('projectDetail.termExtraction.columns.source') }}</th>
+                    <th>{{ t('projectDetail.termExtraction.columns.target') }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-if="result.terms.length === 0">
+                    <td colspan="2" class="term-extract__compare-empty">
+                      {{ t('projectDetail.termExtraction.emptyResult') }}
+                    </td>
+                  </tr>
+                  <tr
+                    v-for="term in result.terms"
+                    v-else
+                    :key="`${result.model}-${term.index}-${term.source_normalized || term.source_text}`"
+                    :class="{ 'has-conflict': term.has_conflict }"
+                  >
+                    <td>{{ term.source_text }}</td>
+                    <td>{{ term.target_text }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="term-extract__compare-meta">
+              <span>{{ t('projectDetail.termExtraction.termCount', { count: result.terms.length }) }}</span>
+              <span v-if="countTermConflicts(result.terms) > 0">
+                {{ t('projectDetail.termExtraction.conflictCount', { count: countTermConflicts(result.terms) }) }}
+              </span>
+            </div>
+          </article>
+        </div>
+        <div class="term-extract__version-grid" :class="{ 'is-compact': compareResults.length === 2 }">
+          <button
+            v-for="version in versionOptions"
+            :key="version.key"
+            v-show="compareResults.length !== 2 || version.key === 'merged'"
+            class="term-extract__version-card"
+            :class="{ 'is-selected': selectedVersionKey === version.key }"
+            type="button"
+            :disabled="extracting || saving"
+            @click="applyVersion(version.key)"
+          >
+            <GitMerge v-if="version.key === 'merged'" :size="16" />
+            <Sparkles v-else :size="16" />
+            <span>
+              <strong>{{ version.label }}</strong>
+              <small>
+                {{ t('projectDetail.termExtraction.termCount', { count: version.terms.length }) }}
+                <template v-if="version.provider"> · {{ version.provider }}</template>
+              </small>
+            </span>
+          </button>
+        </div>
+      </section>
 
       <div class="term-extract__table-wrap">
         <table class="term-extract__table">
@@ -471,7 +778,7 @@ watch(selectedTermBaseId, async (next, previous) => {
               </td>
               <td>
                 <button
-                  class="button term-extract__icon"
+                  class="button button--danger term-extract__icon"
                   type="button"
                   :title="t('common.actions.delete')"
                   @click="removeDraft(draft.row_id)"
@@ -543,6 +850,184 @@ watch(selectedTermBaseId, async (next, previous) => {
   grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) auto;
   gap: 10px;
   align-items: end;
+}
+
+.term-extract__config,
+.term-extract__versions {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+}
+
+.term-extract__config-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.term-extract__model-grid,
+.term-extract__version-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.term-extract__version-grid.is-compact {
+  grid-template-columns: minmax(240px, 360px);
+}
+
+.term-extract__model-option,
+.term-extract__version-card {
+  display: flex;
+  min-height: 62px;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-1);
+  color: var(--text-primary);
+}
+
+.term-extract__version-card {
+  text-align: left;
+  cursor: pointer;
+}
+
+.term-extract__model-option.is-selected,
+.term-extract__version-card.is-selected {
+  border-color: color-mix(in srgb, var(--brand-700) 58%, var(--line-soft));
+  background: color-mix(in srgb, var(--brand-050) 72%, var(--surface-1));
+}
+
+.term-extract__model-option span,
+.term-extract__version-card span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.term-extract__model-option small,
+.term-extract__version-card small {
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.term-extract__custom-model {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.term-extract__selected-models {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.term-extract__model-chip {
+  cursor: pointer;
+}
+
+.term-extract__prompt {
+  min-height: 88px;
+  resize: vertical;
+}
+
+.term-extract__compare {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.term-extract__compare-pane {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  min-height: 280px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-1);
+  overflow: hidden;
+}
+
+.term-extract__compare-pane.is-selected {
+  border-color: color-mix(in srgb, var(--brand-700) 58%, var(--line-soft));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--brand-700) 34%, transparent);
+}
+
+.term-extract__compare-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px;
+  border-bottom: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--surface-panel) 74%, var(--surface-1));
+}
+
+.term-extract__compare-head > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.term-extract__compare-head small {
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.term-extract__compare-table-wrap {
+  max-height: 320px;
+  overflow: auto;
+}
+
+.term-extract__compare-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 12px;
+}
+
+.term-extract__compare-table th,
+.term-extract__compare-table td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--line-soft);
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.term-extract__compare-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  color: var(--text-secondary);
+  background: var(--surface-1);
+}
+
+.term-extract__compare-table tr.has-conflict {
+  background: color-mix(in srgb, var(--state-warning-bg) 52%, transparent);
+}
+
+.term-extract__compare-empty {
+  height: 96px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.term-extract__compare-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+  border-top: 1px solid var(--line-soft);
 }
 
 .term-extract__table-wrap {
@@ -644,6 +1129,13 @@ watch(selectedTermBaseId, async (next, previous) => {
 
 @media (max-width: 760px) {
   .term-extract__target {
+    grid-template-columns: 1fr;
+  }
+
+  .term-extract__model-grid,
+  .term-extract__version-grid,
+  .term-extract__compare,
+  .term-extract__custom-model {
     grid-template-columns: 1fr;
   }
 

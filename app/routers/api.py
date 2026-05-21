@@ -6,6 +6,7 @@ API 路由模块 - 文件上传、解析和导出接口
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime
 from functools import partial
 from io import BytesIO
@@ -14,10 +15,10 @@ from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import quote, unquote, urlparse
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_
+from sqlalchemy import case, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -102,8 +103,12 @@ from app.services.llm_service import (
 )
 from app.services.term_entry_service import build_term_entry_conflict_items
 from app.services.term_extraction_service import (
+    TERM_EXTRACTION_MODEL,
+    TERM_EXTRACTION_MODEL_OPTIONS,
+    ExtractedTerm,
     TermExtractionError,
     extract_terms_from_segments,
+    merge_extracted_terms,
 )
 from app.services.language_detection import detect_upload_language
 from app.services.language_pairs import require_language_pair
@@ -721,6 +726,15 @@ class BatchSegmentUpdate(BaseModel):
     updates: list[SegmentUpdate]
 
 
+class SegmentReplaceRequest(BaseModel):
+    scope: str = "all"
+    source_query: str = ""
+    target_query: str
+    replace_text: str = ""
+    search_fuzzy: bool = False
+    replace_all: bool = True
+
+
 class RevisionResolvePayload(BaseModel):
     status: Literal["accepted", "rejected"]
 
@@ -736,6 +750,8 @@ class LLMTranslateRequest(BaseModel):
 class TermExtractionRequest(BaseModel):
     term_base_id: UUID | None = None
     max_terms: int = Field(default=150, ge=1, le=300)
+    models: list[str] = Field(default_factory=lambda: [TERM_EXTRACTION_MODEL])
+    extraction_prompt: str = Field(default="", max_length=4000)
 
 
 class GuidelineTemplateUpdateRequest(BaseModel):
@@ -2435,6 +2451,148 @@ def get_file_records(
     ]
 
 
+SEGMENT_PAGE_MAX_LIMIT = 1000
+
+
+def _normalize_segment_page_limit(limit: int) -> int:
+    return min(max(int(limit), 1), SEGMENT_PAGE_MAX_LIMIT)
+
+
+def _serialize_workbench_segment(seg: Segment) -> dict:
+    return {
+        "id": str(seg.id),
+        "sentence_id": seg.sentence_id,
+        "source_text": seg.source_text,
+        "display_text": seg.display_text,
+        "target_text": seg.target_text,
+        "status": seg.status,
+        "score": seg.score,
+        "matched_source_text": seg.matched_source_text,
+        "matched_collection_name": seg.matched_collection_name,
+        "matched_creator_name": seg.matched_creator_name,
+        "matched_created_at": seg.matched_created_at.isoformat() if seg.matched_created_at else None,
+        "matched_updated_at": seg.matched_updated_at.isoformat() if seg.matched_updated_at else None,
+        "source": seg.source,
+        "llm_provider": seg.llm_provider,
+        "llm_model": seg.llm_model,
+        "block_type": seg.block_type,
+        "block_index": seg.block_index,
+        "row_index": seg.row_index,
+        "cell_index": seg.cell_index,
+    }
+
+
+def _apply_segment_scope_filter(query, scope: str):
+    normalized_scope = (scope or "all").strip().lower()
+    if normalized_scope == "exact_only":
+        return query.filter(Segment.status == "exact")
+    if normalized_scope == "fuzzy_only":
+        return query.filter(Segment.status == "fuzzy")
+    if normalized_scope == "none_only":
+        return query.filter(Segment.status == "none")
+    if normalized_scope == "confirmed_only":
+        return query.filter(Segment.status == "confirmed")
+    if normalized_scope == "empty_target":
+        return query.filter(func.trim(Segment.target_text) == "")
+    return query
+
+
+def _apply_segment_text_filters(
+    query,
+    source_query: str | None,
+    target_query: str | None,
+):
+    source_keyword = (source_query or "").strip()
+    target_keyword = (target_query or "").strip()
+    if source_keyword:
+        source_pattern = f"%{source_keyword}%"
+        query = query.filter(
+            or_(
+                Segment.source_text.ilike(source_pattern),
+                Segment.display_text.ilike(source_pattern),
+            )
+        )
+    if target_keyword:
+        query = query.filter(Segment.target_text.ilike(f"%{target_keyword}%"))
+    return query
+
+
+def _order_segment_query(query):
+    return query.order_by(
+        Segment.block_index.asc(),
+        Segment.row_index.asc().nullsfirst(),
+        Segment.cell_index.asc().nullsfirst(),
+        Segment.sentence_id.asc(),
+    )
+
+
+def _build_preview_render_segments(segments: list[Segment], mode: str) -> list[dict]:
+    if mode != "target":
+        return [_serialize_workbench_segment(segment) for segment in segments]
+
+    rendered: list[dict] = []
+    for segment in segments:
+        item = _serialize_workbench_segment(segment)
+        item["display_text"] = segment.target_text or segment.display_text or segment.source_text
+        rendered.append(item)
+    return rendered
+
+
+def _get_segment_status_stats(db: Session, file_record_id: UUID) -> dict[str, int]:
+    empty_target_expr = func.trim(func.coalesce(Segment.target_text, "")) == ""
+    row = (
+        db.query(
+            func.count(Segment.id).label("total"),
+            func.coalesce(func.sum(case((Segment.status == "exact", 1), else_=0)), 0).label("exact"),
+            func.coalesce(func.sum(case((Segment.status == "fuzzy", 1), else_=0)), 0).label("fuzzy"),
+            func.coalesce(func.sum(case((Segment.status == "none", 1), else_=0)), 0).label("none"),
+            func.coalesce(func.sum(case((Segment.status == "confirmed", 1), else_=0)), 0).label("confirmed"),
+            func.coalesce(func.sum(case((empty_target_expr, 1), else_=0)), 0).label("empty_target"),
+        )
+        .filter(Segment.file_record_id == file_record_id)
+        .one()
+    )
+    return {
+        "total": int(row.total or 0),
+        "exact": int(row.exact or 0),
+        "fuzzy": int(row.fuzzy or 0),
+        "none": int(row.none or 0),
+        "confirmed": int(row.confirmed or 0),
+        "empty_target": int(row.empty_target or 0),
+    }
+
+
+def _get_segment_page_sentence_ids(
+    db: Session,
+    file_record_id: UUID,
+    *,
+    skip: int,
+    limit: int,
+    scope: str = "all",
+    source_query: str | None = None,
+    target_query: str | None = None,
+) -> list[str]:
+    safe_skip = max(skip, 0)
+    safe_limit = _normalize_segment_page_limit(limit)
+    query = db.query(Segment.sentence_id).filter(Segment.file_record_id == file_record_id)
+    query = _apply_segment_scope_filter(query, scope)
+    query = _apply_segment_text_filters(
+        query,
+        source_query=source_query,
+        target_query=target_query,
+    )
+    return [
+        sentence_id
+        for (sentence_id,) in (
+            _order_segment_query(query)
+            .offset(safe_skip)
+            .limit(safe_limit)
+            .all()
+        )
+        if sentence_id
+    ]
+
+
 @router.get("/file-records/{file_record_id}")
 @router.get("/documents/{file_record_id}", include_in_schema=False)
 def get_file_record(
@@ -2445,7 +2603,7 @@ def get_file_record(
 ):
     """获取文档详情及片段，支持分页"""
     safe_skip = max(skip, 0)
-    safe_limit = min(max(limit, 1), 1000)
+    safe_limit = _normalize_segment_page_limit(limit)
     result = get_file_record_with_segments(
         db,
         file_record_id,
@@ -2503,30 +2661,59 @@ def get_file_record(
         "can_export": can_export_task_file(source_filename, has_source_file=source_bytes is not None),
         "issue_count": issue_stats["issue_count"],
         "open_issue_count": issue_stats["open_issue_count"],
-        "segments": [
-            {
-                "id": seg.id,
-                "sentence_id": seg.sentence_id,
-                "source_text": seg.source_text,
-                "display_text": seg.display_text,
-                "target_text": seg.target_text,
-                "status": seg.status,
-                "score": seg.score,
-                "matched_source_text": seg.matched_source_text,
-                "matched_collection_name": seg.matched_collection_name,
-                "matched_creator_name": seg.matched_creator_name,
-                "matched_created_at": seg.matched_created_at.isoformat() if seg.matched_created_at else None,
-                "matched_updated_at": seg.matched_updated_at.isoformat() if seg.matched_updated_at else None,
-                "source": seg.source,
-                "llm_provider": seg.llm_provider,
-                "llm_model": seg.llm_model,
-                "block_type": seg.block_type,
-                "block_index": seg.block_index,
-                "row_index": seg.row_index,
-                "cell_index": seg.cell_index,
-            }
-            for seg in segments
-        ],
+        "status_stats": _get_segment_status_stats(db, file_record_id),
+        "segments": [_serialize_workbench_segment(seg) for seg in segments],
+    }
+
+
+@router.get("/file-records/{file_record_id}/segments")
+def get_file_record_segments(
+    file_record_id: UUID,
+    skip: int = 0,
+    limit: int = 200,
+    scope: str = "all",
+    source_query: str | None = None,
+    target_query: str | None = None,
+    search_fuzzy: bool = False,
+    db: Session = Depends(get_db),
+):
+    """分页获取工作台句段；搜索/筛选在服务端执行，避免前端加载全文。"""
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    safe_skip = max(skip, 0)
+    safe_limit = _normalize_segment_page_limit(limit)
+    base_query = db.query(Segment).filter(Segment.file_record_id == file_record_id)
+    total_segments = base_query.count()
+    filtered_query = _apply_segment_scope_filter(base_query, scope)
+    filtered_query = _apply_segment_text_filters(
+        filtered_query,
+        source_query=source_query,
+        target_query=target_query,
+    )
+    matched_segments = filtered_query.count()
+    page_segments = (
+        _order_segment_query(filtered_query)
+        .offset(safe_skip)
+        .limit(safe_limit)
+        .all()
+    )
+
+    return {
+        "file_record_id": str(file_record_id),
+        "total_segments": total_segments,
+        "matched_segments": matched_segments,
+        "status_stats": _get_segment_status_stats(db, file_record_id),
+        "skip": safe_skip,
+        "limit": safe_limit,
+        "filters": {
+            "scope": scope,
+            "source_query": source_query or "",
+            "target_query": target_query or "",
+            "search_fuzzy": search_fuzzy,
+        },
+        "segments": [_serialize_workbench_segment(seg) for seg in page_segments],
     }
 
 
@@ -2564,29 +2751,46 @@ def duplicate_file_record_task(
 @router.get("/documents/{file_record_id}/preview", include_in_schema=False)
 def get_file_record_preview(
     file_record_id: UUID,
+    skip: int = 0,
+    limit: int = 200,
+    mode: Literal["source", "target"] = "source",
     db: Session = Depends(get_db),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
-    source_bytes = load_file_record_source(file_record)
     source_filename = get_file_record_source_filename(file_record)
-    segments = list_segments_for_file_record(db, file_record_id)
+    safe_skip = max(skip, 0)
+    safe_limit = _normalize_segment_page_limit(limit)
+    page_segments = (
+        _order_segment_query(
+            db.query(Segment).filter(Segment.file_record_id == file_record_id)
+        )
+        .offset(safe_skip)
+        .limit(safe_limit)
+        .all()
+    )
+    render_segments = _build_preview_render_segments(page_segments, mode)
     preview_html = build_task_preview_html(
         filename=source_filename,
-        segments=segments,
-        source_bytes=source_bytes,
+        segments=render_segments,
+        source_bytes=None,
         document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
         document_parse_options=_get_file_record_document_parse_options(file_record),
     )
 
     return {
-        "id": file_record.id,
+        "id": str(file_record.id),
         "filename": file_record.filename,
         "source_extension": get_task_file_extension(source_filename),
         "supports_preview": bool(preview_html),
         "preview_html": preview_html,
+        "preview_mode": "window",
+        "render_mode": mode,
+        "skip": safe_skip,
+        "limit": safe_limit,
+        "supports_full_preview": False,
     }
 
 
@@ -2991,6 +3195,101 @@ def batch_update(
     return {"updated_count": updated_count}
 
 
+@router.post("/file-records/{file_record_id}/segments/replace")
+def replace_file_record_segment_targets(
+    file_record_id: UUID,
+    payload: SegmentReplaceRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """在服务端按筛选条件替换译文，避免前端加载全文后再逐条修改。"""
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    target_query = (payload.target_query or "").strip()
+    if not target_query:
+        raise HTTPException(status_code=400, detail="请先输入译文关键词用于替换。")
+
+    query = db.query(Segment).filter(Segment.file_record_id == file_record_id)
+    query = _apply_segment_scope_filter(query, payload.scope)
+    query = _apply_segment_text_filters(
+        query,
+        source_query=payload.source_query,
+        target_query=target_query,
+    )
+    segments = _order_segment_query(query).all()
+    if not segments:
+        return {"updated_count": 0, "occurrence_count": 0}
+
+    flags = re.IGNORECASE
+    pattern = re.compile(re.escape(target_query), flags)
+    occurrence_count = 0
+    updates: list[dict[str, str]] = []
+    for segment in segments:
+        target_text = segment.target_text or ""
+        next_text, count = pattern.subn(payload.replace_text or "", target_text)
+        if count <= 0 or next_text == target_text:
+            continue
+        occurrence_count += count
+        updates.append({
+            "sentence_id": segment.sentence_id,
+            "target_text": next_text,
+            "source": "manual",
+        })
+        if not payload.replace_all:
+            break
+
+    if not updates:
+        return {"updated_count": 0, "occurrence_count": 0}
+
+    updated_count = batch_update_segments(
+        db=db,
+        file_record_id=file_record_id,
+        updates=updates,
+        current_user=current_user,
+    )
+    return {"updated_count": updated_count, "occurrence_count": occurrence_count}
+
+
+@router.get("/file-records/{file_record_id}/save-to-tm/stats")
+def get_save_to_tm_stats(
+    file_record_id: UUID,
+    scope: Literal["confirmed", "translated", "all"] = "translated",
+    db: Session = Depends(get_db),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    total_segments = (
+        db.query(func.count(Segment.id))
+        .filter(Segment.file_record_id == file_record_id)
+        .scalar()
+        or 0
+    )
+    query = db.query(Segment).filter(Segment.file_record_id == file_record_id)
+    if scope == "confirmed":
+        query = query.filter(Segment.status == "confirmed")
+    elif scope == "translated":
+        query = query.filter(func.trim(Segment.target_text) != "")
+
+    matched_count = query.count()
+    valid_count = (
+        query.filter(
+            func.trim(Segment.source_text) != "",
+            func.trim(Segment.target_text) != "",
+        )
+        .count()
+    )
+    return {
+        "total_segments": int(total_segments),
+        "matched_count": matched_count,
+        "valid_count": valid_count,
+        "skipped_count": max(int(total_segments) - valid_count, 0),
+    }
+
+
 @router.post("/file-records/{file_record_id}/save-to-tm")
 def save_file_record_segments_to_tm(
     file_record_id: UUID,
@@ -3107,16 +3406,52 @@ def save_file_record_segments_to_tm(
 def get_file_record_revisions(
     file_record_id: UUID,
     sentence_id: str | None = None,
+    sentence_ids: list[str] | None = Query(default=None),
+    sentence_ids_bracket: list[str] | None = Query(default=None, alias="sentence_ids[]"),
+    skip: int = 0,
+    limit: int | None = None,
+    scope: str = "all",
+    source_query: str | None = None,
+    target_query: str | None = None,
+    search_fuzzy: bool = False,
     db: Session = Depends(get_db),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="File record not found.")
 
+    requested_sentence_ids = [item for item in ((sentence_ids or []) + (sentence_ids_bracket or [])) if item]
+    if sentence_id:
+        requested_sentence_ids.append(sentence_id)
+
+    if requested_sentence_ids:
+        revisions = list_revisions(
+            db,
+            file_record_id=file_record_id,
+            sentence_ids=list(dict.fromkeys(requested_sentence_ids)),
+        )
+        return [serialize_segment_revision(revision) for revision in revisions]
+
+    if limit is not None:
+        page_sentence_ids = _get_segment_page_sentence_ids(
+            db,
+            file_record_id,
+            skip=skip,
+            limit=limit,
+            scope=scope,
+            source_query=source_query,
+            target_query=target_query,
+        )
+        revisions = list_revisions(
+            db,
+            file_record_id=file_record_id,
+            sentence_ids=page_sentence_ids,
+        )
+        return [serialize_segment_revision(revision) for revision in revisions]
+
     revisions = list_revisions(
         db,
         file_record_id=file_record_id,
-        sentence_id=sentence_id,
     )
     return [serialize_segment_revision(revision) for revision in revisions]
 
@@ -3183,13 +3518,37 @@ def resolve_all_revisions_as_rejected(
 @router.get("/documents/{file_record_id}/comments", include_in_schema=False)
 def get_file_record_comments(
     file_record_id: UUID,
+    sentence_ids: list[str] | None = Query(default=None),
+    sentence_ids_bracket: list[str] | None = Query(default=None, alias="sentence_ids[]"),
+    skip: int = 0,
+    limit: int | None = None,
+    scope: str = "all",
+    source_query: str | None = None,
+    target_query: str | None = None,
+    search_fuzzy: bool = False,
     db: Session = Depends(get_db),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
-    comments = list_segment_comments_for_file_record(db, file_record_id)
+    requested_sentence_ids = [item for item in ((sentence_ids or []) + (sentence_ids_bracket or [])) if item]
+    if limit is not None and not requested_sentence_ids:
+        requested_sentence_ids = _get_segment_page_sentence_ids(
+            db,
+            file_record_id,
+            skip=skip,
+            limit=limit,
+            scope=scope,
+            source_query=source_query,
+            target_query=target_query,
+        )
+
+    comments = list_segment_comments_for_file_record(
+        db,
+        file_record_id,
+        sentence_ids=requested_sentence_ids if (limit is not None or requested_sentence_ids) else None,
+    )
     return [serialize_segment_comment(comment) for comment in comments]
 
 
@@ -3267,6 +3626,56 @@ def create_comment_reply(
     return serialize_segment_comment(comment)
 
 
+def _normalize_term_extraction_models(models: list[str] | None) -> list[str]:
+    requested = models or [TERM_EXTRACTION_MODEL]
+    normalized: list[str] = []
+    for model in requested:
+        model_text = normalize_text(str(model or ""))
+        if not model_text:
+            continue
+        if len(model_text) > 120:
+            raise HTTPException(status_code=400, detail="模型 ID 过长。")
+        if model_text not in normalized:
+            normalized.append(model_text)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="请至少选择一个提取模型。")
+    if len(normalized) > 2:
+        raise HTTPException(status_code=400, detail="最多只能选择两个模型进行比对。")
+    return normalized
+
+
+def _serialize_term_extraction_items(
+    db: Session,
+    term_base: TermBase | None,
+    terms: list[ExtractedTerm],
+) -> list[dict[str, Any]]:
+    term_items = [
+        {
+            "source_text": item.source_text,
+            "target_text": item.target_text,
+            "source_normalized": item.source_normalized,
+        }
+        for item in terms
+    ]
+    if term_base is not None:
+        return build_term_entry_conflict_items(
+            db=db,
+            term_base=term_base,
+            entries=term_items,
+        )
+    return [
+        {
+            "index": index,
+            "source_text": item["source_text"],
+            "target_text": item["target_text"],
+            "source_normalized": item["source_normalized"],
+            "has_conflict": False,
+            "conflict": None,
+        }
+        for index, item in enumerate(term_items)
+    ]
+
+
 @router.post("/file-records/{file_record_id}/term-extraction")
 async def extract_file_record_terms(
     file_record_id: UUID,
@@ -3279,6 +3688,7 @@ async def extract_file_record_terms(
 
     source_language, target_language = _resolve_file_record_language_pair(file_record)
     body = payload or TermExtractionRequest()
+    selected_models = _normalize_term_extraction_models(body.models)
 
     term_base = None
     target_term_base_id = body.term_base_id or file_record.term_base_id
@@ -3292,48 +3702,53 @@ async def extract_file_record_terms(
     if not segments:
         raise HTTPException(status_code=400, detail="当前文件没有可用于术语提取的已解析句段。")
 
-    try:
-        extraction = await extract_terms_from_segments(
-            segments=segments,
-            source_language=source_language,
-            target_language=target_language,
-            max_terms=body.max_terms,
-        )
-    except LLMConfigurationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except LLMResponseValidationError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except LLMRequestError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except TermExtractionError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    extractions = []
+    extraction_errors: list[dict[str, str | int]] = []
+    for model in selected_models:
+        try:
+            extractions.append(await extract_terms_from_segments(
+                segments=segments,
+                source_language=source_language,
+                target_language=target_language,
+                max_terms=body.max_terms,
+                model=model,
+                extraction_prompt=body.extraction_prompt,
+            ))
+        except LLMConfigurationError as exc:
+            extraction_errors.append({"model": model, "message": str(exc), "status_code": 400})
+        except LLMResponseValidationError as exc:
+            extraction_errors.append({"model": model, "message": str(exc), "status_code": 502})
+        except LLMRequestError as exc:
+            extraction_errors.append({"model": model, "message": str(exc), "status_code": 502})
+        except TermExtractionError as exc:
+            extraction_errors.append({"model": model, "message": str(exc), "status_code": 400})
 
-    term_items = [
-        {
-            "source_text": item.source_text,
-            "target_text": item.target_text,
-            "source_normalized": item.source_normalized,
-        }
-        for item in extraction.terms
-    ]
-    if term_base is not None:
-        terms = build_term_entry_conflict_items(
-            db=db,
-            term_base=term_base,
-            entries=term_items,
-        )
-    else:
-        terms = [
-            {
-                "index": index,
-                "source_text": item["source_text"],
-                "target_text": item["target_text"],
-                "source_normalized": item["source_normalized"],
-                "has_conflict": False,
-                "conflict": None,
-            }
-            for index, item in enumerate(term_items)
-        ]
+    if not extractions:
+        status_code = 502 if any(error["status_code"] == 502 for error in extraction_errors) else 400
+        detail = str(extraction_errors[0]["message"]) if extraction_errors else "术语提取失败。"
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    results = []
+    for extraction in extractions:
+        terms = _serialize_term_extraction_items(db, term_base, extraction.terms)
+        results.append({
+            "provider": extraction.provider,
+            "model": extraction.model,
+            "terms": terms,
+            "total": len(terms),
+        })
+    merged_terms = _serialize_term_extraction_items(
+        db,
+        term_base,
+        merge_extracted_terms(extractions, max_terms=body.max_terms),
+    )
+    default_terms = merged_terms if len(results) > 1 else (results[0]["terms"] if results else [])
+    primary_result = results[0] if results else {
+        "provider": "openrouter",
+        "model": selected_models[0],
+        "terms": [],
+        "total": 0,
+    }
 
     return {
         "file_record": {
@@ -3345,10 +3760,17 @@ async def extract_file_record_terms(
         "term_base_id": str(term_base.id) if term_base else None,
         "source_language": source_language,
         "target_language": target_language,
-        "provider": extraction.provider,
-        "model": extraction.model,
-        "terms": terms,
-        "total": len(terms),
+        "provider": primary_result["provider"],
+        "model": primary_result["model"],
+        "available_models": list(TERM_EXTRACTION_MODEL_OPTIONS),
+        "results": results,
+        "merged_terms": merged_terms,
+        "terms": default_terms,
+        "total": len(default_terms),
+        "errors": [
+            {"model": str(error["model"]), "message": str(error["message"])}
+            for error in extraction_errors
+        ],
     }
 
 

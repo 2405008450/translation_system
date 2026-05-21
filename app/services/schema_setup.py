@@ -498,6 +498,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ALTER TABLE IF EXISTS segments
             ADD COLUMN IF NOT EXISTS llm_model VARCHAR(200)
             """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_file_record_order
+            ON segments (file_record_id, block_index, row_index, cell_index, sentence_id)
+            """,
             f"""
             CREATE TABLE IF NOT EXISTS issue_markers (
                 id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},

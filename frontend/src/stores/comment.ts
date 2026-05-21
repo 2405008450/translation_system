@@ -14,6 +14,15 @@ import type {
 const DEFAULT_MESSAGE = translate('stores.comment.defaultMessage')
 const COMMENT_POLL_INTERVAL_MS = 8000
 
+export interface CommentWindowQuery {
+  page: number
+  pageSize: number
+  scope?: string
+  sourceQuery?: string
+  targetQuery?: string
+  searchFuzzy?: boolean
+}
+
 function sortComments(comments: SegmentComment[]) {
   return [...comments].sort((left, right) => {
     const timeDiff = new Date(left.created_at).getTime() - new Date(right.created_at).getTime()
@@ -28,6 +37,22 @@ function buildCommentsSignature(comments: SegmentComment[]) {
   return comments
     .map((comment) => `${comment.id}:${comment.updated_at}:${comment.status}:${comment.parent_id || ''}`)
     .join('|')
+}
+
+function buildCommentWindowParams(query?: CommentWindowQuery | null) {
+  if (!query) {
+    return undefined
+  }
+  const page = Math.max(1, query.page)
+  const pageSize = Math.max(1, query.pageSize)
+  return {
+    skip: (page - 1) * pageSize,
+    limit: pageSize,
+    scope: query.scope ?? 'all',
+    source_query: query.sourceQuery ?? '',
+    target_query: query.targetQuery ?? '',
+    search_fuzzy: query.searchFuzzy ?? false,
+  }
 }
 
 export const useCommentStore = defineStore('comment', () => {
@@ -70,13 +95,15 @@ export const useCommentStore = defineStore('comment', () => {
     lastSignature = buildCommentsSignature(comments.value)
   }
 
-  async function refreshComments(fileRecordId: string, silent = false) {
+  async function refreshComments(fileRecordId: string, silent = false, query?: CommentWindowQuery | null) {
     if (saving.value && silent) {
       return
     }
 
     try {
-      const { data } = await http.get<SegmentComment[]>(`/file-records/${fileRecordId}/comments`)
+      const { data } = await http.get<SegmentComment[]>(`/file-records/${fileRecordId}/comments`, {
+        params: buildCommentWindowParams(query),
+      })
       const sortedComments = sortComments(data)
       const nextSignature = buildCommentsSignature(sortedComments)
       const hasChanged = nextSignature !== lastSignature
@@ -105,21 +132,25 @@ export const useCommentStore = defineStore('comment', () => {
     }
   }
 
-  async function loadComments(fileRecordId: string) {
+  async function loadComments(fileRecordId: string, query?: CommentWindowQuery | null) {
     resetState()
     loading.value = true
     try {
-      await refreshComments(fileRecordId, false)
+      await refreshComments(fileRecordId, false, query)
     } finally {
       loading.value = false
     }
   }
 
-  function startPolling(fileRecordId: string) {
+  function startPolling(fileRecordId: string, getWindowQuery: () => CommentWindowQuery | null = () => null) {
     stopPolling()
     polling.value = true
     pollTimer = window.setInterval(() => {
-      void refreshComments(fileRecordId, true)
+      const query = getWindowQuery()
+      if (!query) {
+        return
+      }
+      void refreshComments(fileRecordId, true, query)
     }, COMMENT_POLL_INTERVAL_MS)
   }
 
