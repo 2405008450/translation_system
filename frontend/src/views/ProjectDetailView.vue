@@ -115,6 +115,16 @@ interface ProjectFileItem {
   term_base_id: string | null
 }
 
+interface PreTranslateProgressState {
+  progress: number
+  status: string
+  running: boolean
+}
+
+interface PreTranslateProgressPayload extends PreTranslateProgressState {
+  fileId: string
+}
+
 type LanguageDetectTone = 'info' | 'success' | 'warning' | 'error'
 
 const DEFAULT_DOCUMENT_PARSE_OPTIONS: DocumentParseOptions = {
@@ -175,6 +185,7 @@ const pageSize = ref(10)
 const selectedFileIds = ref(new Set<string>())
 const guidelinesText = ref('')
 const savingGuidelines = ref(false)
+const preTranslateProgressByFileId = ref<Record<string, PreTranslateProgressState>>({})
 const issueDialogTarget = ref<{
   fileRecordId: string | null
   label: string
@@ -426,6 +437,10 @@ function openPreTranslateDialog() {
   if (selectedFileIds.value.size === 0) {
     return
   }
+  const hasRunningProgress = Object.values(preTranslateProgressByFileId.value).some((state) => state.running)
+  if (!hasRunningProgress) {
+    preTranslateProgressByFileId.value = {}
+  }
   showPreTranslateDialog.value = true
 }
 
@@ -460,6 +475,32 @@ async function handlePreTranslateDone() {
   showPreTranslateDialog.value = false
   selectedFileIds.value = new Set<string>()
   await loadProject()
+  preTranslateProgressByFileId.value = {}
+}
+
+function handlePreTranslateProgress(payload: PreTranslateProgressPayload) {
+  preTranslateProgressByFileId.value = {
+    ...preTranslateProgressByFileId.value,
+    [payload.fileId]: {
+      progress: Math.max(0, Math.min(100, Math.round(payload.progress))),
+      status: payload.status,
+      running: payload.running,
+    },
+  }
+}
+
+function getFileDisplayProgress(row: ProjectRow) {
+  const progress = preTranslateProgressByFileId.value[String(row.id)]?.progress
+  return typeof progress === 'number' ? progress : Number(row.progress || 0)
+}
+
+function getFileDisplayProgressStatus(row: ProjectRow) {
+  const state = preTranslateProgressByFileId.value[String(row.id)]
+  return state && state.progress < 100 ? 'processing' : String(row.status || '')
+}
+
+function getFileDisplayProgressMessage(row: ProjectRow) {
+  return preTranslateProgressByFileId.value[String(row.id)]?.status || ''
 }
 
 function openProjectIssueDialog() {
@@ -1435,15 +1476,20 @@ onBeforeUnmount(() => {
           </template>
 
           <template #progress="{ row }">
-            <div class="progress-bar">
-              <div class="progress-bar__track">
-                <div
-                  class="progress-bar__fill"
-                  :class="{ 'is-complete': isProgressComplete(row.progress) }"
-                  :style="getProgressStyle(row.progress)"
-                />
+            <div class="pd-file-progress" :title="getFileDisplayProgressMessage(row) || undefined">
+              <div class="progress-bar">
+                <div class="progress-bar__track">
+                  <div
+                    class="progress-bar__fill"
+                    :class="{ 'is-complete': isProgressComplete(getFileDisplayProgress(row)) }"
+                    :style="getProgressStyle(getFileDisplayProgress(row), getFileDisplayProgressStatus(row))"
+                  />
+                </div>
+                <span class="progress-bar__text">{{ getFileDisplayProgress(row) }}%</span>
               </div>
-              <span class="progress-bar__text">{{ row.progress }}%</span>
+              <span v-if="getFileDisplayProgressMessage(row)" class="pd-file-progress__status">
+                {{ getFileDisplayProgressMessage(row) }}
+              </span>
             </div>
           </template>
 
@@ -1580,6 +1626,7 @@ onBeforeUnmount(() => {
       :translation-guidelines="project?.translation_guidelines ?? ''"
       @close="closePreTranslateDialog"
       @done="handlePreTranslateDone"
+      @progress="handlePreTranslateProgress"
     />
     <TermExtractionDialog
       :open="showTermExtractionDialog"
@@ -2204,6 +2251,22 @@ onBeforeUnmount(() => {
 .pd-file-cell__meta {
   font-size: 12px;
   color: var(--text-muted);
+}
+
+.pd-file-progress {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.pd-file-progress__status {
+  display: block;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pd-task-links {

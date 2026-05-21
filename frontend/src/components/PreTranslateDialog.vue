@@ -17,6 +17,13 @@ interface ProjectFileItem {
   target_language: string | null
 }
 
+interface PreTranslateProgressPayload {
+  fileId: string
+  progress: number
+  status: string
+  running: boolean
+}
+
 const props = defineProps<{
   open: boolean
   files: ProjectFileItem[]
@@ -28,6 +35,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   close: []
   done: []
+  progress: [payload: PreTranslateProgressPayload]
 }>()
 
 const NO_TM_COLLECTION_ID = '__NO_TM_COLLECTION__'
@@ -63,6 +71,7 @@ const termBaseId = ref('')
 
 const errorMessage = ref('')
 const finishedCount = ref(0)
+const runFiles = ref<ProjectFileItem[]>([])
 
 const progressByFileId = ref<Record<string, number>>({})
 const statusByFileId = ref<Record<string, string>>({})
@@ -133,23 +142,31 @@ const availableTermBases = computed(() => {
   ))
 })
 
-const selectedCount = computed(() => props.files.length)
-const selectedFilePreview = computed(() => props.files.slice(0, 4))
+const selectedDisplayFiles = computed(() => (
+  running.value && runFiles.value.length > 0 ? runFiles.value : props.files
+))
+const selectedCount = computed(() => selectedDisplayFiles.value.length)
+const selectedFilePreview = computed(() => selectedDisplayFiles.value.slice(0, 4))
 const configuredActionCount = computed(() => (
   Number(useTm.value) + Number(useLlm.value) + Number(useTermBase.value)
 ))
+const progressFiles = computed(() => (
+  runFiles.value.length > 0 ? runFiles.value : props.files
+))
 const overallProgress = computed(() => {
-  if (!props.files.length) {
+  if (!progressFiles.value.length) {
     return 0
   }
-  const total = props.files.reduce((sum, file) => sum + (progressByFileId.value[file.id] || 0), 0)
-  return Math.round(total / props.files.length)
+  const total = progressFiles.value.reduce((sum, file) => sum + (progressByFileId.value[file.id] || 0), 0)
+  return Math.round(total / progressFiles.value.length)
 })
 
 watch(() => props.open, (open) => {
   if (open) {
     void loadResources()
-    resetProgress()
+    if (!running.value) {
+      resetProgress()
+    }
     errorMessage.value = ''
     stopRequested.value = false
     llmGuidelines.value = props.translationGuidelines || ''
@@ -168,8 +185,71 @@ watch(availableTermBases, () => {
 
 function resetProgress() {
   finishedCount.value = 0
+  runFiles.value = []
   progressByFileId.value = {}
   statusByFileId.value = {}
+}
+
+function normalizeProgress(progress: number) {
+  const safeProgress = Number.isFinite(progress) ? progress : 0
+  return Math.max(0, Math.min(100, Math.round(safeProgress)))
+}
+
+function getRunActionCount() {
+  return Math.max(
+    1,
+    Number(shouldRunTm.value) + Number(useLlm.value) + Number(useTermBase.value),
+  )
+}
+
+function getActionProgress(completedActions: number, actionPercent: number, actionCount: number) {
+  return ((completedActions + Math.max(0, Math.min(100, actionPercent)) / 100) / actionCount) * 100
+}
+
+function setFileProgress(fileId: string, progress: number, status: string) {
+  const normalized = normalizeProgress(progress)
+  progressByFileId.value = {
+    ...progressByFileId.value,
+    [fileId]: normalized,
+  }
+  statusByFileId.value = {
+    ...statusByFileId.value,
+    [fileId]: status,
+  }
+  emit('progress', {
+    fileId,
+    progress: normalized,
+    status,
+    running: running.value,
+  })
+}
+
+function emitCurrentProgress(runningState = running.value) {
+  for (const file of runFiles.value) {
+    const progress = progressByFileId.value[file.id]
+    const status = statusByFileId.value[file.id]
+    if (typeof progress !== 'number' || !status) {
+      continue
+    }
+    emit('progress', {
+      fileId: file.id,
+      progress,
+      status,
+      running: runningState,
+    })
+  }
+}
+
+function requestClose() {
+  if (running.value) {
+    pushToast({
+      tone: 'info',
+      title: t('projectDetail.preTranslate.toast.closeRunningTitle'),
+      message: t('projectDetail.preTranslate.toast.closeRunningMessage'),
+      duration: 5200,
+    })
+  }
+  emit('close')
 }
 
 function normalizeTmCollectionIds(collectionIds: string[]) {
@@ -266,10 +346,21 @@ function validateBeforeStart() {
   return true
 }
 
-async function runLLMForFile(fileId: string) {
+async function runLLMForFile(fileId: string, completedActions: number, actionCount: number) {
   const token = window.localStorage.getItem('token')
   const controller = new AbortController()
+  let plannedCount = 0
+  let processedCount = 0
   currentAbortController.value = controller
+
+  const updateLLMProgress = (status: string, actionPercent: number) => {
+    setFileProgress(
+      fileId,
+      getActionProgress(completedActions, actionPercent, actionCount),
+      status,
+    )
+  }
+
   try {
     const response = await fetch(`/api/file-records/${fileId}/llm-translate`, {
       method: 'POST',
@@ -297,9 +388,49 @@ async function runLLMForFile(fileId: string) {
       throw new Error(message)
     }
 
-    await consumeLLMStream(response, () => {
+    await consumeLLMStream(response, ({ event, data }) => {
       if (stopRequested.value) {
         return
+      }
+
+      if (event === 'start') {
+        plannedCount = Number(data.total || 0)
+        processedCount = 0
+        updateLLMProgress(
+          plannedCount > 0
+            ? t('projectDetail.preTranslate.progress.llmRunning', { processed: 0, total: plannedCount })
+            : t('projectDetail.preTranslate.progress.llmStarting'),
+          0,
+        )
+        return
+      }
+
+      if (event === 'segment' || event === 'error') {
+        processedCount += 1
+        const total = Math.max(plannedCount, processedCount)
+        const actionPercent = total > 0 ? (processedCount / total) * 100 : 0
+        updateLLMProgress(
+          t('projectDetail.preTranslate.progress.llmRunning', {
+            processed: processedCount,
+            total,
+          }),
+          actionPercent,
+        )
+        return
+      }
+
+      if (event === 'complete') {
+        const total = Number(data.total || plannedCount || processedCount)
+        const updated = Number(data.updated_count || 0)
+        const error = Number(data.error_count || 0)
+        plannedCount = total
+        processedCount = Math.max(total, updated + error, processedCount)
+        updateLLMProgress(
+          total > 0
+            ? t('projectDetail.preTranslate.progress.llmDone', { updated, error })
+            : t('projectDetail.preTranslate.progress.llmSkipped'),
+          100,
+        )
       }
     })
   } finally {
@@ -315,18 +446,25 @@ async function startPreTranslate() {
   running.value = true
   stopRequested.value = false
   resetProgress()
+  runFiles.value = [...props.files]
+  const actionCount = getRunActionCount()
 
   try {
-    for (const file of props.files) {
+    for (const file of runFiles.value) {
       if (stopRequested.value) {
         break
       }
 
-      statusByFileId.value[file.id] = t('projectDetail.preTranslate.progress.running')
-      progressByFileId.value[file.id] = 0
+      let completedActions = 0
+      setFileProgress(file.id, 0, t('projectDetail.preTranslate.progress.running'))
 
       try {
         if (shouldRunTm.value) {
+          setFileProgress(
+            file.id,
+            getActionProgress(completedActions, 0, actionCount),
+            t('projectDetail.preTranslate.progress.tmRunning'),
+          )
           await http.post(`/file-records/${file.id}/rematch`, {
             collection_ids: selectedTmCollectionIds.value,
             threshold: tmThreshold.value,
@@ -334,15 +472,30 @@ async function startPreTranslate() {
             overwrite_fuzzy: tmOverwriteFuzzy.value,
             auto_confirm_exact: tmAutoConfirmExact.value,
           })
-          progressByFileId.value[file.id] = 34
+          completedActions += 1
+          setFileProgress(
+            file.id,
+            getActionProgress(completedActions, 0, actionCount),
+            t('projectDetail.preTranslate.progress.tmDone'),
+          )
         }
 
         if (useLlm.value && !stopRequested.value) {
-          await runLLMForFile(file.id)
-          progressByFileId.value[file.id] = useTermBase.value ? 67 : 100
+          await runLLMForFile(file.id, completedActions, actionCount)
+          completedActions += 1
+          setFileProgress(
+            file.id,
+            getActionProgress(completedActions, 0, actionCount),
+            t('projectDetail.preTranslate.progress.llmComplete'),
+          )
         }
 
         if (useTermBase.value && !stopRequested.value) {
+          setFileProgress(
+            file.id,
+            getActionProgress(completedActions, 0, actionCount),
+            t('projectDetail.preTranslate.progress.termBaseRunning'),
+          )
           const bindingsPayload: Record<string, string | null> = {
             term_base_id: termBaseId.value || null,
           }
@@ -350,18 +503,35 @@ async function startPreTranslate() {
             bindingsPayload.collection_id = selectedTmCollectionIds.value[0] || null
           }
           await http.patch(`/file-records/${file.id}/bindings`, bindingsPayload)
-          progressByFileId.value[file.id] = 100
+          completedActions += 1
+          setFileProgress(
+            file.id,
+            getActionProgress(completedActions, 0, actionCount),
+            t('projectDetail.preTranslate.progress.termBaseDone'),
+          )
         }
 
         if (!shouldRunTm.value && !useLlm.value && useTermBase.value) {
-          progressByFileId.value[file.id] = 100
+          setFileProgress(file.id, 100, t('projectDetail.preTranslate.progress.termBaseDone'))
         }
 
         finishedCount.value += 1
-        statusByFileId.value[file.id] = t('projectDetail.preTranslate.progress.done')
+        setFileProgress(file.id, 100, t('projectDetail.preTranslate.progress.done'))
       } catch (error) {
+        if (stopRequested.value) {
+          setFileProgress(
+            file.id,
+            progressByFileId.value[file.id] || 0,
+            t('projectDetail.preTranslate.progress.stopped'),
+          )
+          break
+        }
         const message = error instanceof Error ? error.message : t('projectDetail.preTranslate.errors.unknown')
-        statusByFileId.value[file.id] = t('projectDetail.preTranslate.progress.failed')
+        setFileProgress(
+          file.id,
+          progressByFileId.value[file.id] || 0,
+          t('projectDetail.preTranslate.progress.failed'),
+        )
         pushToast({
           tone: 'error',
           title: t('projectDetail.preTranslate.toast.fileFailedTitle', { name: file.filename }),
@@ -371,6 +541,8 @@ async function startPreTranslate() {
     }
 
     if (stopRequested.value) {
+      running.value = false
+      emitCurrentProgress(false)
       pushToast({
         tone: 'info',
         title: t('projectDetail.preTranslate.toast.stoppedTitle'),
@@ -384,9 +556,11 @@ async function startPreTranslate() {
       title: t('projectDetail.preTranslate.toast.doneTitle'),
       message: t('projectDetail.preTranslate.toast.doneMessage', {
         done: finishedCount.value,
-        total: selectedCount.value,
+        total: runFiles.value.length || selectedCount.value,
       }),
     })
+    running.value = false
+    emitCurrentProgress(false)
     emit('done')
   } finally {
     running.value = false
@@ -408,7 +582,7 @@ function stopPreTranslate() {
     :title="t('projectDetail.preTranslate.dialogTitle')"
     :description="t('projectDetail.preTranslate.dialogDescription')"
     width="min(940px, calc(100vw - 32px))"
-    @close="emit('close')"
+    @close="requestClose"
   >
     <div class="ptd-layout">
       <aside class="ptd-summary">
@@ -428,8 +602,8 @@ function stopPreTranslate() {
           >
             {{ file.filename }}
           </span>
-          <span v-if="files.length > selectedFilePreview.length" class="ptd-summary__more">
-            +{{ files.length - selectedFilePreview.length }}
+          <span v-if="selectedCount > selectedFilePreview.length" class="ptd-summary__more">
+            +{{ selectedCount - selectedFilePreview.length }}
           </span>
         </div>
       </aside>
@@ -579,6 +753,10 @@ function stopPreTranslate() {
       </div>
 
       <div v-if="running || Object.keys(progressByFileId).length > 0" class="ptd-progress">
+        <div class="ptd-progress__head">
+          <span>{{ t('projectDetail.preTranslate.progress.overall') }}</span>
+          <span v-if="running">{{ t('projectDetail.preTranslate.progress.closeHint') }}</span>
+        </div>
         <div class="progress-bar">
           <div class="progress-bar__track">
             <div
@@ -590,9 +768,23 @@ function stopPreTranslate() {
           <span class="progress-bar__text">{{ overallProgress }}%</span>
         </div>
         <div class="ptd-progress-list">
-          <div v-for="file in files" :key="file.id" class="ptd-progress-item">
-            <span class="ptd-progress-name">{{ file.filename }}</span>
-            <span class="ptd-progress-state">{{ statusByFileId[file.id] || t('projectDetail.preTranslate.progress.pending') }}</span>
+          <div v-for="file in progressFiles" :key="file.id" class="ptd-progress-item">
+            <div class="ptd-progress-item__top">
+              <span class="ptd-progress-name">{{ file.filename }}</span>
+              <span class="ptd-progress-state">{{ statusByFileId[file.id] || t('projectDetail.preTranslate.progress.pending') }}</span>
+            </div>
+            <div class="ptd-progress-item__bar">
+              <div class="progress-bar">
+                <div class="progress-bar__track">
+                  <div
+                    class="progress-bar__fill"
+                    :class="{ 'is-complete': isProgressComplete(progressByFileId[file.id] || 0) }"
+                    :style="{ width: `${progressByFileId[file.id] || 0}%` }"
+                  />
+                </div>
+                <span class="progress-bar__text">{{ progressByFileId[file.id] || 0 }}%</span>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -604,8 +796,8 @@ function stopPreTranslate() {
       <div class="ptd-footer">
         <span class="ptd-selected">{{ t('projectDetail.preTranslate.selectedSummary', { count: selectedCount }) }}</span>
         <div class="ptd-actions">
-          <button class="button" type="button" :disabled="running" @click="emit('close')">
-            {{ t('common.actions.cancel') }}
+          <button class="button" type="button" @click="requestClose">
+            {{ running ? t('common.actions.close') : t('common.actions.cancel') }}
           </button>
           <button
             v-if="running"
@@ -834,17 +1026,34 @@ function stopPreTranslate() {
   background: var(--surface-1);
 }
 
+.ptd-progress__head,
+.ptd-progress-item__top {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ptd-progress__head {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.ptd-progress__head span:last-child {
+  color: var(--state-info);
+  text-align: right;
+}
+
 .ptd-progress-list {
   display: grid;
-  gap: 6px;
+  gap: 10px;
   max-height: 180px;
   overflow: auto;
 }
 
 .ptd-progress-item {
-  display: flex;
-  justify-content: space-between;
-  gap: 10px;
+  display: grid;
+  gap: 6px;
   font-size: 13px;
 }
 
@@ -858,6 +1067,15 @@ function stopPreTranslate() {
 .ptd-progress-state {
   color: var(--text-muted);
   flex-shrink: 0;
+}
+
+.ptd-progress-item__bar .progress-bar__track {
+  height: 7px;
+}
+
+.ptd-progress-item__bar .progress-bar__text {
+  min-width: 36px;
+  font-size: 12px;
 }
 
 .ptd-footer {

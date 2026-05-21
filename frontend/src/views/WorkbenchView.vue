@@ -103,13 +103,13 @@ type SaveToTMPayload = {
   scope: SaveToTMScope
 }
 
-const REVISION_TRACE_VISIBLE_STORAGE_KEY = 'workbench.revisionTraceVisible'
+const REVISION_TRACE_VISIBLE_STORAGE_KEY = 'workbench.revisionTraceEnabled'
 
 function getInitialRevisionTraceVisible() {
   if (typeof window === 'undefined') {
-    return true
+    return false
   }
-  return window.localStorage.getItem(REVISION_TRACE_VISIBLE_STORAGE_KEY) !== 'false'
+  return window.localStorage.getItem(REVISION_TRACE_VISIBLE_STORAGE_KEY) === 'true'
 }
 
 const router = useRouter()
@@ -1295,6 +1295,11 @@ function toggleRevisionMenu(kind: RevisionMenuKind) {
 
 function setRevisionTraceVisible(visible: boolean) {
   revisionTraceVisible.value = visible
+  if (visible) {
+    segmentStore.startRevisionTracking()
+  } else {
+    segmentStore.stopRevisionTracking()
+  }
   window.localStorage.setItem(REVISION_TRACE_VISIBLE_STORAGE_KEY, visible ? 'true' : 'false')
   openRevisionMenu.value = null
   toast.success(visible ? t('workbench.ribbon.messages.revisionTraceShown') : t('workbench.ribbon.messages.revisionTraceHidden'))
@@ -1434,6 +1439,10 @@ async function loadTask() {
     if (segmentStore.segments[0] && !segmentStore.activeSentenceId) {
       segmentStore.setActiveSentence(segmentStore.segments[0].sentence_id)
     }
+    segmentStore.ensureRevisionTrackingBaselines()
+    if (revisionTraceVisible.value) {
+      segmentStore.startRevisionTracking()
+    }
 
     try {
       const commentQuery = getCommentWindowQuery()
@@ -1476,6 +1485,10 @@ async function refreshSegmentPage(page = segmentStore.currentPage, size = segmen
       targetQuery: targetSearchQuery.value,
       searchFuzzy: searchFuzzyEnabled.value,
     })
+    segmentStore.ensureRevisionTrackingBaselines()
+    if (revisionTraceVisible.value) {
+      segmentStore.startRevisionTracking()
+    }
     const commentQuery = getCommentWindowQuery()
     if (commentQuery) {
       await commentStore.loadComments(props.id, commentQuery)
@@ -2254,45 +2267,16 @@ onBeforeRouteLeave(async () => {
             class="tool-col tool-col--big tool-button workbench-revision-trigger"
             type="button"
             :class="{ active: revisionTraceVisible }"
-            :aria-expanded="openRevisionMenu === 'track'"
-            aria-haspopup="menu"
-            @click.stop="toggleRevisionMenu('track')"
+            :aria-pressed="revisionTraceVisible"
+            @click.stop="setRevisionTraceVisible(!revisionTraceVisible)"
           >
             <span class="tool-line line1 with-big-icon" :class="{ active: revisionTraceVisible }">
-              <span class="icon-text-area has_dropdown">
+              <span class="icon-text-area">
                 <Type class="tool-single-icon" :size="27" />
-              </span>
-              <span class="dropdown-link" aria-hidden="true">
-                <ChevronDown :size="12" />
               </span>
             </span>
             <span class="tool-line" :class="{ active: revisionTraceVisible }"><span class="label">{{ t('workbench.ribbon.trackChanges') }}</span></span>
           </button>
-          <div v-if="openRevisionMenu === 'track'" class="workbench-revision-menu__dropdown workbench-revision-menu__dropdown--track" role="menu">
-            <button
-              type="button"
-              role="menuitemradio"
-              :aria-checked="revisionTraceVisible"
-              :class="{ 'is-selected': revisionTraceVisible }"
-              @click="setRevisionTraceVisible(true)"
-            >
-              <span>{{ t('workbench.ribbon.showRevisionTrace') }}</span>
-              <Check v-if="revisionTraceVisible" class="workbench-revision-menu__check" :size="14" />
-            </button>
-            <button
-              type="button"
-              role="menuitemradio"
-              :aria-checked="!revisionTraceVisible"
-              :class="{ 'is-selected': !revisionTraceVisible }"
-              @click="setRevisionTraceVisible(false)"
-            >
-              <span>{{ t('workbench.ribbon.hideRevisionTrace') }}</span>
-              <Check v-if="!revisionTraceVisible" class="workbench-revision-menu__check" :size="14" />
-            </button>
-            <button type="button" role="menuitem" @click="openRevisionTraceSettings">
-              <span>{{ t('workbench.ribbon.revisionTraceSettings') }}</span>
-            </button>
-          </div>
           <span class="tool-col align-left revision-action-col">
             <div class="workbench-revision-menu workbench-revision-menu--ribbon">
               <button
@@ -2930,7 +2914,7 @@ onBeforeRouteLeave(async () => {
                     :segment="item"
                     :index="getEditorSegmentDisplayIndex(item.sentence_id, index)"
                     :active="segmentStore.activeSentenceId === item.sentence_id"
-                    :pending-revision="revisionTraceVisible ? segmentStore.getPendingRevision(item.sentence_id) : null"
+                    :pending-revision="revisionTraceVisible ? segmentStore.getRevisionTrace(item.sentence_id) : null"
                     :revision-busy="revisionActionLoading"
                     :matched-terms="segmentStore.activeSentenceId === item.sentence_id ? activeMatchedTerms : []"
                     @focus="segmentStore.setActiveSentence"

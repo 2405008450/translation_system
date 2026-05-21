@@ -91,6 +91,8 @@ export const useSegmentStore = defineStore('segment', () => {
   })
   const saveToTMStats = ref<SaveToTMStats | null>(null)
   const revisionHistory = ref<Record<string, SegmentRevisionEntry[]>>({})
+  const localRevisionDrafts = ref<Record<string, SegmentRevisionEntry>>({})
+  const localRevisionBaselines = ref<Record<string, string>>({})
 
   const segmentIndexMap = new Map<string, number>()
   let syncTimer: number | null = null
@@ -167,6 +169,93 @@ export const useSegmentStore = defineStore('segment', () => {
 
   function getPendingRevision(sentenceId: string) {
     return revisionHistory.value[sentenceId]?.find((entry) => entry.status === 'pending') || null
+  }
+
+  function getRevisionTrace(sentenceId: string) {
+    return localRevisionDrafts.value[sentenceId] || null
+  }
+
+  function hasLocalRevisionBaseline(sentenceId: string) {
+    return Object.prototype.hasOwnProperty.call(localRevisionBaselines.value, sentenceId)
+  }
+
+  function setLocalRevisionBaseline(sentenceId: string, targetText: string) {
+    localRevisionBaselines.value = {
+      ...localRevisionBaselines.value,
+      [sentenceId]: targetText,
+    }
+
+    const nextDrafts = { ...localRevisionDrafts.value }
+    delete nextDrafts[sentenceId]
+    localRevisionDrafts.value = nextDrafts
+  }
+
+  function upsertLocalRevisionDraft(segment: Segment, targetText: string) {
+    const sentenceId = segment.sentence_id
+    if (!hasLocalRevisionBaseline(sentenceId)) {
+      setLocalRevisionBaseline(sentenceId, segment.target_text || '')
+    }
+    const baselineText = localRevisionBaselines.value[sentenceId] ?? ''
+
+    const nextDrafts = { ...localRevisionDrafts.value }
+    if (targetText === baselineText) {
+      delete nextDrafts[sentenceId]
+      localRevisionDrafts.value = nextDrafts
+      return
+    }
+
+    nextDrafts[sentenceId] = {
+      id: `local-${sentenceId}`,
+      file_record_id: fileRecord.value?.id || '',
+      segment_id: segment.id,
+      sentence_id: sentenceId,
+      source: 'manual',
+      status: 'pending',
+      before_text: baselineText,
+      after_text: targetText,
+      author: null,
+      resolved_by: null,
+      created_at: new Date().toISOString(),
+      resolved_at: null,
+    }
+    localRevisionDrafts.value = nextDrafts
+  }
+
+  function startRevisionTracking() {
+    ensureRevisionTrackingBaselines()
+  }
+
+  function stopRevisionTracking() {
+    // 开关只控制修订痕迹是否显示；基准必须保留，避免再次开启时刷新快照。
+  }
+
+  function ensureRevisionTrackingBaselines() {
+    const nextBaselines = { ...localRevisionBaselines.value }
+    let changed = false
+    for (const segment of segments.value) {
+      if (!Object.prototype.hasOwnProperty.call(nextBaselines, segment.sentence_id)) {
+        nextBaselines[segment.sentence_id] = segment.target_text || ''
+        changed = true
+      }
+    }
+    if (changed) {
+      localRevisionBaselines.value = nextBaselines
+    }
+  }
+
+  function updateRevisionBaselineAfterPrefill(sentenceId: string, targetText: string) {
+    setLocalRevisionBaseline(sentenceId, targetText)
+  }
+
+  function clearLocalRevisionDrafts(sentenceIds: string[]) {
+    if (!sentenceIds.length) {
+      return
+    }
+    const nextDrafts = { ...localRevisionDrafts.value }
+    for (const sentenceId of sentenceIds) {
+      delete nextDrafts[sentenceId]
+    }
+    localRevisionDrafts.value = nextDrafts
   }
 
   function resetPreviewState() {
@@ -311,6 +400,8 @@ export const useSegmentStore = defineStore('segment', () => {
     lastPreviewUpdatedSentenceId.value = null
     lastPreviewUpdatedText.value = ''
     revisionHistory.value = {}
+    localRevisionDrafts.value = {}
+    localRevisionBaselines.value = {}
     loadMorePromise = null
     llmAbortController = null
     llmReader = null
@@ -482,6 +573,7 @@ export const useSegmentStore = defineStore('segment', () => {
     }
 
     const segment = segments.value[index]
+    upsertLocalRevisionDraft(segment, targetText)
     const nextSegment = {
       ...segment,
       target_text: targetText,
@@ -548,7 +640,12 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   async function syncToBackend() {
-    if (!fileRecord.value || dirtyCount.value === 0 || saving.value) {
+    if (!fileRecord.value || dirtyCount.value === 0) {
+      return
+    }
+
+    if (saving.value) {
+      scheduleSync()
       return
     }
 
@@ -564,13 +661,29 @@ export const useSegmentStore = defineStore('segment', () => {
       await http.put(`/file-records/${fileRecord.value.id}/segments`, {
         updates,
       })
-      dirtyEntries.value = {}
       await loadRevisions(fileRecord.value.id)
+      const nextDirtyEntries = { ...dirtyEntries.value }
+      for (const update of updates) {
+        const currentEntry = nextDirtyEntries[update.sentence_id]
+        if (
+          currentEntry
+          && currentEntry.target_text === update.target_text
+          && currentEntry.source === update.source
+        ) {
+          delete nextDirtyEntries[update.sentence_id]
+        }
+      }
+      dirtyEntries.value = nextDirtyEntries
       const syncedAt = new Date()
       lastSyncedAt.value = syncedAt.toISOString()
-      syncMessage.value = translate('stores.segment.syncedAt', {
-        time: syncedAt.toLocaleString('zh-CN', { hour12: false }),
-      })
+      if (dirtyCount.value > 0) {
+        syncMessage.value = translate('stores.segment.syncPending', { count: dirtyCount.value })
+        scheduleSync()
+      } else {
+        syncMessage.value = translate('stores.segment.syncedAt', {
+          time: syncedAt.toLocaleString('zh-CN', { hour12: false }),
+        })
+      }
     } finally {
       saving.value = false
     }
@@ -657,10 +770,12 @@ export const useSegmentStore = defineStore('segment', () => {
     segments.value[index] = nextSegment
     adjustSegmentStatusStats(currentSegment, nextSegment)
     markPreviewUpdate(sentenceId, targetText)
+    updateRevisionBaselineAfterPrefill(sentenceId, targetText)
 
     const nextDirtyEntries = { ...dirtyEntries.value }
     delete nextDirtyEntries[sentenceId]
     dirtyEntries.value = nextDirtyEntries
+    clearLocalRevisionDrafts([sentenceId])
   }
 
   async function startLLMTranslation(
@@ -907,6 +1022,10 @@ export const useSegmentStore = defineStore('segment', () => {
     lastPreviewUpdatedText,
     revisionHistory,
     getPendingRevision,
+    getRevisionTrace,
+    startRevisionTracking,
+    stopRevisionTracking,
+    ensureRevisionTrackingBaselines,
     loadTask,
     loadSegmentPage,
     loadMoreSegments,

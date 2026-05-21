@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onBeforeUnmount, watch } from 'vue'
 
-import { computeDiff, type DiffSegment } from '../utils/textDiff'
+import { computeDiff } from '../utils/textDiff'
 import type { UserRole } from '../types/api'
 
 const props = withDefaults(defineProps<{
@@ -36,10 +36,11 @@ interface ChangeGroup {
 
 // 每个修改组的决定状态：null=未决定, 'accept'=接受, 'reject'=拒绝
 const decisions = ref<Map<number, 'accept' | 'reject'>>(new Map())
+const diffSegments = computed(() => computeDiff(props.oldText, props.newText))
 
 // 计算修改组
 const changeGroups = computed((): ChangeGroup[] => {
-  const rawSegments = computeDiff(props.oldText, props.newText)
+  const rawSegments = diffSegments.value
   const groups: ChangeGroup[] = []
   let i = 0
   let groupIndex = 0
@@ -96,7 +97,7 @@ interface RenderSegment {
 }
 
 const renderSegments = computed((): RenderSegment[] => {
-  const rawSegments = computeDiff(props.oldText, props.newText)
+  const rawSegments = diffSegments.value
   const result: RenderSegment[] = []
   let segIdx = 0
   let groupIdx = 0
@@ -168,7 +169,7 @@ function closeContextMenu() {
 
 // 计算当前文本（基于已做的决定）
 function computeCurrentText(): string {
-  const rawSegments = computeDiff(props.oldText, props.newText)
+  const rawSegments = diffSegments.value
   const result: string[] = []
   let segIdx = 0
   let groupIdx = 0
