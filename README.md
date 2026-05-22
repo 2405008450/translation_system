@@ -14,13 +14,15 @@
 
 ## 技术栈
 
-| 层级 | 技术 |
-| --- | --- |
-| 后端 | FastAPI、SQLAlchemy 2、Pydantic Settings、python-docx、openpyxl、httpx |
-| 前端 | Vue 3、Vite、TypeScript、Pinia、Vue Router、vue-i18n、Axios、lucide-vue-next |
-| 数据库 | PostgreSQL、pg_trgm、pgvector |
-| 缓存 | Redis 可选；未配置时使用进程内存缓存 |
-| AI Provider | DeepSeek、OpenRouter |
+
+| 层级          | 技术                                                                    |
+| ----------- | --------------------------------------------------------------------- |
+| 后端          | FastAPI、SQLAlchemy 2、Pydantic Settings、python-docx、openpyxl、httpx     |
+| 前端          | Vue 3、Vite、TypeScript、Pinia、Vue Router、vue-i18n、Axios、lucide-vue-next |
+| 数据库         | PostgreSQL、pg_trgm、pgvector                                           |
+| 缓存          | Redis 可选；未配置时使用进程内存缓存                                                 |
+| AI Provider | DeepSeek、OpenRouter                                                   |
+
 
 ## 当前支持的任务文件
 
@@ -90,18 +92,20 @@ requirements.txt
 
 ## 环境准备
 
-| 组件 | 建议版本 | 说明 |
-| --- | --- | --- |
-| Python | 3.11+ | 后端运行环境 |
-| Node.js | 18+，推荐 20 LTS | 前端开发与构建 |
-| PostgreSQL | 14+ | 需要 `pg_trgm` 和 `pgvector` |
-| Redis | 5+，可选 | 配置 `REDIS_URL` 后用于缓存 |
+
+| 组件         | 建议版本          | 说明                        |
+| ---------- | ------------- | ------------------------- |
+| Python     | 3.11+         | 后端运行环境                    |
+| Node.js    | 18+，推荐 20 LTS | 前端开发与构建                   |
+| PostgreSQL | 14+           | 需要 `pg_trgm` 和 `pgvector` |
+| Redis      | 5+，可选         | 配置 `REDIS_URL` 后用于缓存      |
+
 
 ### PostgreSQL 扩展
 
 `pg_trgm` 通常随 PostgreSQL 自带；`pgvector` 需要额外安装到当前 PostgreSQL 实例。
 
-- 官方文档：https://github.com/pgvector/pgvector#installation
+- 官方文档：[https://github.com/pgvector/pgvector#installation](https://github.com/pgvector/pgvector#installation)
 - Windows 可下载 pgvector release zip，将 `vector.dll`、`vector--*.sql`、`vector.control` 放到 PostgreSQL 对应的 `lib/` 和 `share/extension/` 目录。
 
 初始化 SQL 会执行 `CREATE EXTENSION IF NOT EXISTS pg_trgm;` 与 `CREATE EXTENSION IF NOT EXISTS vector;`，因此执行初始化脚本时建议使用 PostgreSQL 超级用户。
@@ -163,17 +167,19 @@ Copy-Item .env.example .env
 
 重点配置项：
 
-| 变量 | 说明 |
-| --- | --- |
-| `DATABASE_URL` | SQLAlchemy PostgreSQL 连接串，例如 `postgresql+psycopg://tm_user:tm123456@localhost:5432/tm_demo` |
-| `JWT_SECRET_KEY` | 必须替换为长随机字符串；保持默认值会拒绝启动 |
-| `FILE_STORAGE_DIR` | 源文件存储目录，默认 `data/file_records` |
-| `UPLOAD_MAX_SIZE_MB` | 上传文件大小限制 |
-| `DEFAULT_SIMILARITY_THRESHOLD` | 默认 TM 模糊匹配阈值 |
-| `REDIS_URL` | 可选；不配置时使用内存缓存 |
-| `TM_VECTOR_*` | pgvector 语义检索开关、维度、候选数和权重 |
-| `DEEPSEEK_*` / `OPENROUTER_*` | LLM Provider 配置，AI 修正至少需要一个 API Key |
-| `LLM_TIMEOUT_SECONDS` / `LLM_MAX_CONCURRENCY` | LLM 超时与并发控制 |
+
+| 变量                                            | 说明                                                                                          |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`                                | SQLAlchemy PostgreSQL 连接串，例如 `postgresql+psycopg://tm_user:tm123456@localhost:5432/tm_demo` |
+| `JWT_SECRET_KEY`                              | 必须替换为长随机字符串；保持默认值会拒绝启动                                                                      |
+| `FILE_STORAGE_DIR`                            | 源文件存储目录，默认 `data/file_records`                                                              |
+| `UPLOAD_MAX_SIZE_MB`                          | 上传文件大小限制                                                                                    |
+| `DEFAULT_SIMILARITY_THRESHOLD`                | 默认 TM 模糊匹配阈值                                                                                |
+| `REDIS_URL`                                   | 可选；不配置时使用内存缓存                                                                               |
+| `TM_VECTOR_*`                                 | pgvector 语义检索开关、维度、候选数和权重                                                                   |
+| `DEEPSEEK_*` / `OPENROUTER_*`                 | LLM Provider 配置，AI 修正至少需要一个 API Key                                                         |
+| `LLM_TIMEOUT_SECONDS` / `LLM_MAX_CONCURRENCY` | LLM 超时与并发控制                                                                                 |
+
 
 `.env` 已在 `.gitignore` 中，密钥不要提交到仓库。
 
@@ -188,6 +194,7 @@ python -m pip install -r requirements.txt
 
 - 开发后端：`http://127.0.0.1:19013`
 - API 文档：`http://127.0.0.1:19013/docs`
+
 - `--host 0.0.0.0` 用于允许局域网访问；Windows 防火墙需要放行端口。
 
 ### 5. 启动前端
@@ -330,47 +337,49 @@ python scripts/deduplicate_tm_source_hash.py --database-url "$env:DATABASE_URL" 
 Authorization: Bearer <token>
 ```
 
-| 模块 | 方法 | 路径 | 说明 |
-| --- | --- | --- | --- |
-| 认证 | GET | `/api/auth/init` | 查询是否需要首次初始化 |
-| 认证 | POST | `/api/auth/init` | 首次创建管理员 |
-| 认证 | POST | `/api/auth/login` | 登录并获取 JWT |
-| 认证 | GET | `/api/auth/me` | 当前用户 |
-| 用户 | GET | `/api/auth/users` | 用户列表 |
-| 用户 | POST | `/api/auth/register` | 管理员创建用户 |
-| 用户 | PATCH | `/api/auth/users/{id}` | 更新用户名、昵称或密码 |
-| 项目 | GET/POST | `/api/projects` | 项目列表 / 新建项目 |
-| 项目 | GET | `/api/projects/{id}` | 项目详情与进度 |
-| 项目 | POST | `/api/projects/{id}/source-document` | 为项目上传源文档并生成句段 |
-| 任务 | POST | `/api/file-records` | 直接上传任务文件 |
-| 任务 | GET | `/api/file-records` | 任务列表 |
-| 任务 | GET | `/api/file-records/{id}` | 任务详情与分页句段 |
-| 任务 | GET | `/api/file-records/{id}/preview` | 原文预览 HTML |
-| 任务 | GET | `/api/file-records/{id}/export` | 导出译后文件 |
-| 句段 | PUT | `/api/file-records/{id}/segments/{sentence_id}` | 更新单个译文 |
-| 句段 | PUT | `/api/file-records/{id}/segments` | 批量更新译文 |
-| 句段 | GET | `/api/file-records/{id}/segments/{segment_id}/tm-candidates` | 查看 TM 候选 |
-| 历史 | GET | `/api/file-records/{id}/revisions` | 修改快照列表 |
-| 历史 | PATCH | `/api/revisions/{revision_id}` | 接受或拒绝修改快照 |
-| 历史 | POST | `/api/file-records/{id}/revisions/batch-accept` | 批量接受 |
-| 历史 | POST | `/api/file-records/{id}/revisions/batch-reject` | 批量拒绝 |
-| 批注 | GET/POST | `/api/file-records/{id}/comments` | 批注列表 / 新建批注 |
-| 批注 | PATCH/DELETE | `/api/comments/{id}` | 更新 / 删除批注 |
-| 批注 | POST | `/api/comments/{id}/replies` | 创建嵌套回复 |
-| AI | POST | `/api/file-records/{id}/llm-translate` | SSE 流式 AI 修正 |
-| TM | GET/POST | `/api/translation-memory/collections` | 记忆库列表 / 新建 |
-| TM | GET/PUT/DELETE | `/api/translation-memory/collections/{id}` | 记忆库详情 / 更新 / 删除 |
-| TM | GET/POST | `/api/translation-memory/collections/{id}/entries` | 条目列表 / 新增 |
-| TM | PUT/DELETE | `/api/translation-memory/entries/{id}` | 更新 / 删除条目 |
-| TM | POST | `/api/translation-memory/import-xlsx` | XLSX 导入 TM |
-| TM | GET | `/api/translation-memory/collections/{id}/export-xlsx` | XLSX 导出 TM |
-| 术语 | GET/POST | `/api/term-bases` | 术语库列表 / 新建 |
-| 术语 | GET/PUT/DELETE | `/api/term-bases/{id}` | 术语库详情 / 更新 / 删除 |
-| 术语 | GET/POST | `/api/term-bases/{id}/entries` | 术语条目列表 / 新增 |
-| 术语 | PUT/DELETE | `/api/term-entries/{id}` | 更新 / 删除术语条目 |
-| 术语 | POST | `/api/term-bases/import-xlsx` | XLSX 导入术语 |
-| 术语 | GET | `/api/term-bases/{id}/export-xlsx` | XLSX 导出术语 |
-| 解析 | POST | `/api/parser/workspace` | 仅解析文件并返回工作台结构，不落库 |
+
+| 模块  | 方法             | 路径                                                           | 说明                |
+| --- | -------------- | ------------------------------------------------------------ | ----------------- |
+| 认证  | GET            | `/api/auth/init`                                             | 查询是否需要首次初始化       |
+| 认证  | POST           | `/api/auth/init`                                             | 首次创建管理员           |
+| 认证  | POST           | `/api/auth/login`                                            | 登录并获取 JWT         |
+| 认证  | GET            | `/api/auth/me`                                               | 当前用户              |
+| 用户  | GET            | `/api/auth/users`                                            | 用户列表              |
+| 用户  | POST           | `/api/auth/register`                                         | 管理员创建用户           |
+| 用户  | PATCH          | `/api/auth/users/{id}`                                       | 更新用户名、昵称或密码       |
+| 项目  | GET/POST       | `/api/projects`                                              | 项目列表 / 新建项目       |
+| 项目  | GET            | `/api/projects/{id}`                                         | 项目详情与进度           |
+| 项目  | POST           | `/api/projects/{id}/source-document`                         | 为项目上传源文档并生成句段     |
+| 任务  | POST           | `/api/file-records`                                          | 直接上传任务文件          |
+| 任务  | GET            | `/api/file-records`                                          | 任务列表              |
+| 任务  | GET            | `/api/file-records/{id}`                                     | 任务详情与分页句段         |
+| 任务  | GET            | `/api/file-records/{id}/preview`                             | 原文预览 HTML         |
+| 任务  | GET            | `/api/file-records/{id}/export`                              | 导出译后文件            |
+| 句段  | PUT            | `/api/file-records/{id}/segments/{sentence_id}`              | 更新单个译文            |
+| 句段  | PUT            | `/api/file-records/{id}/segments`                            | 批量更新译文            |
+| 句段  | GET            | `/api/file-records/{id}/segments/{segment_id}/tm-candidates` | 查看 TM 候选          |
+| 历史  | GET            | `/api/file-records/{id}/revisions`                           | 修改快照列表            |
+| 历史  | PATCH          | `/api/revisions/{revision_id}`                               | 接受或拒绝修改快照         |
+| 历史  | POST           | `/api/file-records/{id}/revisions/batch-accept`              | 批量接受              |
+| 历史  | POST           | `/api/file-records/{id}/revisions/batch-reject`              | 批量拒绝              |
+| 批注  | GET/POST       | `/api/file-records/{id}/comments`                            | 批注列表 / 新建批注       |
+| 批注  | PATCH/DELETE   | `/api/comments/{id}`                                         | 更新 / 删除批注         |
+| 批注  | POST           | `/api/comments/{id}/replies`                                 | 创建嵌套回复            |
+| AI  | POST           | `/api/file-records/{id}/llm-translate`                       | SSE 流式 AI 修正      |
+| TM  | GET/POST       | `/api/translation-memory/collections`                        | 记忆库列表 / 新建        |
+| TM  | GET/PUT/DELETE | `/api/translation-memory/collections/{id}`                   | 记忆库详情 / 更新 / 删除   |
+| TM  | GET/POST       | `/api/translation-memory/collections/{id}/entries`           | 条目列表 / 新增         |
+| TM  | PUT/DELETE     | `/api/translation-memory/entries/{id}`                       | 更新 / 删除条目         |
+| TM  | POST           | `/api/translation-memory/import-xlsx`                        | XLSX 导入 TM        |
+| TM  | GET            | `/api/translation-memory/collections/{id}/export-xlsx`       | XLSX 导出 TM        |
+| 术语  | GET/POST       | `/api/term-bases`                                            | 术语库列表 / 新建        |
+| 术语  | GET/PUT/DELETE | `/api/term-bases/{id}`                                       | 术语库详情 / 更新 / 删除   |
+| 术语  | GET/POST       | `/api/term-bases/{id}/entries`                               | 术语条目列表 / 新增       |
+| 术语  | PUT/DELETE     | `/api/term-entries/{id}`                                     | 更新 / 删除术语条目       |
+| 术语  | POST           | `/api/term-bases/import-xlsx`                                | XLSX 导入术语         |
+| 术语  | GET            | `/api/term-bases/{id}/export-xlsx`                           | XLSX 导出术语         |
+| 解析  | POST           | `/api/parser/workspace`                                      | 仅解析文件并返回工作台结构，不落库 |
+
 
 `/api/documents/*` 与 `/api/tm/*` 仍保留为兼容旧前端的隐藏别名，新开发建议使用上表中的新路径。
 
@@ -378,7 +387,7 @@ Authorization: Bearer <token>
 
 - **启动报 `JWT_SECRET_KEY` 仍为默认值**：复制 `.env.example` 后必须修改 `JWT_SECRET_KEY`，并确认启动命令在项目根目录执行。
 - **前端 `/api` 请求失败**：开发模式默认代理到 `http://127.0.0.1:19013`，确认后端端口一致；否则配置 `frontend/.env.local` 的 `VITE_API_PROXY_TARGET`。
-- **`CREATE EXTENSION vector` 失败**：pgvector 未安装到当前 PostgreSQL 实例，安装后再执行初始化脚本。
+- `**CREATE EXTENSION vector` 失败**：pgvector 未安装到当前 PostgreSQL 实例，安装后再执行初始化脚本。
 - **上传任务提示必须选择 TM 记忆库**：当前解析会限制在已选择的记忆库中做匹配，需要先创建并选择至少一个语言对一致的记忆库。
 - **语言对不一致**：项目、TM 记忆库和术语库都有语言对校验，上传或导入时需要保持一致。
 - **AI 修正不可用**：至少配置 `DEEPSEEK_API_KEY` 或 `OPENROUTER_API_KEY`；也要确认 `provider` 选择与实际配置一致。

@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, ref, watch, nextTick } from 'vue'
+import { computed, onMounted, ref, watch, nextTick } from 'vue'
 
 import InteractiveDiffText from './InteractiveDiffText.vue'
 
 import { getSegmentSourceMeta, getSegmentStatusMeta } from '../constants/status'
 import type { Segment, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
+import { computeDiff } from '../utils/textDiff'
 
 const props = withDefaults(defineProps<{
   segment: Segment
@@ -35,6 +36,7 @@ const editorRef = ref<HTMLDivElement | null>(null)
 const sourceEditorRef = ref<HTMLDivElement | null>(null)
 const isFocused = ref(false)
 const isSourceFocused = ref(false)
+const isComposing = ref(false)
 
 const statusClass = computed(() => `segment-row--${props.segment.status || 'none'}`)
 const parityClass = computed(() => (props.index % 2 === 0 ? 'segment-row--odd' : 'segment-row--even'))
@@ -62,6 +64,9 @@ const sourceTitle = computed(() => {
 const revisionSourceMeta = computed(() => getSegmentSourceMeta(props.pendingRevision?.source || 'manual'))
 const revisionAuthorRole = computed(() => props.pendingRevision?.author?.role || 'admin')
 const hasPendingRevision = computed(() => Boolean(props.pendingRevision))
+const revisionAuthorClass = computed(() => (
+  revisionAuthorRole.value === 'user' ? 'is-revision-author-user' : 'is-revision-author-admin'
+))
 const scorePercent = computed(() => {
   if (!props.segment.score || props.segment.score <= 0) return null
   return Math.round(props.segment.score * 100)
@@ -156,11 +161,46 @@ const targetHtmlContent = computed(() => {
     .join('')
 })
 
+const editorHtmlContent = computed(() => {
+  const revision = props.pendingRevision
+  if (!revision) {
+    return targetHtmlContent.value
+  }
+  return computeDiff(revision.before_text || '', revision.after_text || '')
+    .map((segment) => {
+      const editableAttr = segment.type === 'delete' ? ' contenteditable="false"' : ''
+      return [
+        `<span class="segment-row__revision-segment segment-row__revision-${segment.type}"`,
+        ` data-revision-type="${segment.type}"`,
+        editableAttr,
+        '>',
+        renderTargetTextHtml(segment.text),
+        '</span>',
+      ].join('')
+    })
+    .join('')
+})
+
 function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+function renderTargetTextHtml(text: string): string {
+  const segments = highlightText(text, props.matchedTerms || [], 'target_text')
+  if (!segments) {
+    return escapeHtml(text)
+  }
+  return segments
+    .map((seg) =>
+      seg.highlight
+        ? `<mark class="segment-row__term-highlight">${escapeHtml(seg.text)}</mark>`
+        : escapeHtml(seg.text)
+    )
+    .join('')
 }
 
 // 保存和恢复光标位置
@@ -211,6 +251,131 @@ function restoreCaretPosition(el: HTMLElement, offset: number) {
   selection.addRange(range)
 }
 
+function isRevisionDeleteNode(node: Node): boolean {
+  const element = node.nodeType === Node.ELEMENT_NODE
+    ? node as Element
+    : node.parentElement
+  return Boolean(element?.closest('[data-revision-type="delete"]'))
+}
+
+function getSerializableNodeLength(node: Node): number {
+  if (isRevisionDeleteNode(node)) {
+    return 0
+  }
+  if (node.nodeType === Node.TEXT_NODE) {
+    return node.textContent?.length || 0
+  }
+  if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR') {
+    return 1
+  }
+  return Array.from(node.childNodes).reduce((total, child) => total + getSerializableNodeLength(child), 0)
+}
+
+function serializeEditorContent(node: Node): string {
+  if (isRevisionDeleteNode(node)) {
+    return ''
+  }
+  if (node.nodeType === Node.TEXT_NODE) {
+    return node.textContent || ''
+  }
+  if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR') {
+    return '\n'
+  }
+  return Array.from(node.childNodes).map(serializeEditorContent).join('')
+}
+
+function saveSerializableCaretPosition(el: HTMLElement): number {
+  const selection = window.getSelection()
+  if (!selection || selection.rangeCount === 0) return 0
+
+  const range = selection.getRangeAt(0)
+  if (!el.contains(range.startContainer)) {
+    return 0
+  }
+
+  let offset = 0
+  let found = false
+
+  function traverse(node: Node): boolean {
+    if (found) {
+      return true
+    }
+
+    if (node === range.startContainer) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        offset += isRevisionDeleteNode(node)
+          ? 0
+          : (node.textContent || '').slice(0, range.startOffset).length
+      } else {
+        const children = Array.from(node.childNodes).slice(0, range.startOffset)
+        offset += children.reduce((total, child) => total + getSerializableNodeLength(child), 0)
+      }
+      found = true
+      return true
+    }
+
+    if (node.nodeType === Node.TEXT_NODE || (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR')) {
+      offset += getSerializableNodeLength(node)
+      return false
+    }
+
+    for (const child of Array.from(node.childNodes)) {
+      if (traverse(child)) {
+        return true
+      }
+    }
+    return false
+  }
+
+  traverse(el)
+  return offset
+}
+
+function restoreSerializableCaretPosition(el: HTMLElement, offset: number) {
+  const selection = window.getSelection()
+  if (!selection) return
+
+  const range = document.createRange()
+  let currentOffset = 0
+  let found = false
+
+  function traverse(node: Node): boolean {
+    if (isRevisionDeleteNode(node)) {
+      return false
+    }
+    if (node.nodeType === Node.TEXT_NODE) {
+      const textLength = node.textContent?.length || 0
+      if (currentOffset + textLength >= offset) {
+        range.setStart(node, offset - currentOffset)
+        range.collapse(true)
+        return true
+      }
+      currentOffset += textLength
+    } else if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR') {
+      if (currentOffset + 1 >= offset) {
+        range.setStartBefore(node)
+        range.collapse(true)
+        return true
+      }
+      currentOffset += 1
+    } else {
+      for (const child of Array.from(node.childNodes)) {
+        if (traverse(child)) return true
+      }
+    }
+    return false
+  }
+
+  found = traverse(el)
+  if (!found) {
+    range.selectNodeContents(el)
+    range.collapse(false)
+  }
+
+  selection.removeAllRanges()
+  selection.addRange(range)
+}
+
 function handleFocus() {
   isFocused.value = true
   emit('focus', props.segment.sentence_id)
@@ -238,15 +403,39 @@ function handleSourceInput() {
   emit('updateSource', props.segment.sentence_id, text)
 }
 
+function handleEditorShellClick() {
+  handleClick()
+  void nextTick(() => {
+    editorRef.value?.focus({ preventScroll: true })
+  })
+}
+
 function handleInput() {
   if (!editorRef.value) return
+  if (isComposing.value) return
   
   // 获取纯文本内容
-  const text = editorRef.value.textContent || ''
+  const caretPos = saveSerializableCaretPosition(editorRef.value)
+  const text = serializeEditorContent(editorRef.value)
   emit('update', props.segment.sentence_id, text)
+  nextTick(() => {
+    if (editorRef.value && isFocused.value) {
+      editorRef.value.innerHTML = editorHtmlContent.value
+      restoreSerializableCaretPosition(editorRef.value, caretPos)
+    }
+  })
+  return
   
   // 保存光标位置
-  const caretPos = saveCaretPosition(editorRef.value)
+  if (props.pendingRevision) {
+    nextTick(() => {
+      if (editorRef.value && isFocused.value) {
+        editorRef.value.innerHTML = editorHtmlContent.value
+        restoreSerializableCaretPosition(editorRef.value, caretPos)
+      }
+    })
+    return
+  }
   
   // 更新高亮 HTML
   nextTick(() => {
@@ -270,19 +459,40 @@ function handleInput() {
 }
 
 // 监听外部数据变化，更新编辑器内容
+function handleCompositionStart() {
+  isComposing.value = true
+}
+
+function handleCompositionEnd() {
+  isComposing.value = false
+  handleInput()
+}
+
+function handlePaste(event: ClipboardEvent) {
+  event.preventDefault()
+  const text = event.clipboardData?.getData('text/plain') || ''
+  document.execCommand('insertText', false, text)
+}
+
+onMounted(() => {
+  if (editorRef.value) {
+    editorRef.value.innerHTML = editorHtmlContent.value
+  }
+})
+
 watch(
   () => props.segment.target_text,
   (newText) => {
     if (!isFocused.value && editorRef.value) {
       // 非聚焦状态，更新带高亮的 HTML
-      editorRef.value.innerHTML = targetHtmlContent.value
+      editorRef.value.innerHTML = editorHtmlContent.value
     }
   }
 )
 
 // 监听高亮内容变化
 watch(
-  targetHtmlContent,
+  editorHtmlContent,
   (html) => {
     if (!isFocused.value && editorRef.value) {
       editorRef.value.innerHTML = html
@@ -377,21 +587,22 @@ watch(
 
     <div class="segment-row__cell segment-row__cell--target" :class="{ 'is-pending': hasPendingRevision }">
       <div
-        v-if="pendingRevision"
+        class="segment-row__editor-shell"
+        :class="{ 'is-focused': isFocused, 'is-disabled': disabled, 'has-revision': hasPendingRevision }"
+        @click="handleEditorShellClick"
+      >
+      <div
+        v-if="false && pendingRevision"
         class="segment-row__revision-inline"
-        tabindex="0"
-        data-testid="segment-target-editor"
-        data-segment-target="true"
         :data-sentence-id="segment.sentence_id"
         :aria-label="`translation revision for segment ${index + 1}`"
-        @focus="handleFocus"
-        @blur="handleBlur"
         @click="handleClick"
       >
         <InteractiveDiffText
+          :key="`${pendingRevision?.id || ''}:${pendingRevision?.after_text || ''}`"
           class="segment-row__revision-diff"
-          :old-text="pendingRevision.before_text"
-          :new-text="pendingRevision.after_text"
+          :old-text="pendingRevision?.before_text || ''"
+          :new-text="pendingRevision?.after_text || ''"
           :disabled="disabled || revisionBusy"
           :show-context-menu="false"
           :show-pending-hint="false"
@@ -400,10 +611,12 @@ watch(
         />
       </div>
       <div
-        v-else
         ref="editorRef"
         class="segment-row__editor"
-        :class="{ 'is-focused': isFocused }"
+        :class="[
+          { 'is-focused': isFocused, 'has-revision': hasPendingRevision },
+          revisionAuthorClass,
+        ]"
         :contenteditable="!disabled"
         tabindex="0"
         data-testid="segment-target-editor"
@@ -414,9 +627,12 @@ watch(
         @focus="handleFocus"
         @blur="handleBlur"
         @click="handleClick"
+        @compositionstart="handleCompositionStart"
+        @compositionend="handleCompositionEnd"
         @input="handleInput"
-        v-html="targetHtmlContent"
+        @paste="handlePaste"
       />
+      </div>
     </div>
   </article>
 </template>
@@ -426,12 +642,13 @@ watch(
   box-shadow: inset 2px 0 0 rgba(0, 122, 204, 0.36);
 }
 
-.segment-row__revision-inline {
+.segment-row__editor-shell {
   flex: 1 1 auto;
   width: 100%;
+  height: 100%;
   min-height: 64px;
-  display: block;
-  padding: 6px 8px;
+  display: contents;
+  flex-direction: column;
   border: 1px solid transparent;
   border-radius: 5px;
   background:
@@ -441,6 +658,41 @@ watch(
       var(--segment-editor-stripe, transparent)
     );
   color: var(--text-primary);
+  overflow: hidden;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+}
+
+.segment-row__editor-shell.is-focused {
+  border-color: var(--brand-700);
+  background: var(--surface-panel);
+  box-shadow: 0 0 0 3px rgba(13, 122, 104, 0.12);
+}
+
+.segment-row__editor-shell.has-revision {
+  border-color: rgba(0, 122, 204, 0.28);
+}
+
+.segment-row__editor-shell.is-disabled {
+  background: var(--surface-muted);
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.segment-row__revision-inline {
+  flex: 0 0 auto;
+  width: 100%;
+  max-height: 96px;
+  display: block;
+  padding: 6px 8px 4px;
+  border-bottom: 1px dashed rgba(0, 122, 204, 0.24);
+  background:
+    linear-gradient(
+      0deg,
+      rgba(0, 122, 204, 0.035),
+      rgba(0, 122, 204, 0.035)
+    ),
+    transparent;
+  color: var(--text-primary);
   font-size: 13px;
   line-height: 1.45;
   outline: none;
@@ -448,13 +700,6 @@ watch(
   white-space: pre-wrap;
   word-break: break-word;
   overflow-wrap: anywhere;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
-}
-
-.segment-row__revision-inline:focus {
-  border-color: rgba(0, 122, 204, 0.72);
-  background: var(--surface-panel);
-  box-shadow: 0 0 0 3px rgba(0, 122, 204, 0.12);
 }
 
 .segment-row__revision-diff {
@@ -480,7 +725,7 @@ watch(
   font-weight: 500;
 }
 
-/* 穿透 scoped 样式，让 v-html 插入的 mark 标签也能应用样式 */
+/* 穿透 scoped 样式，让 innerHTML 插入的 mark 标签也能应用样式 */
 .segment-row__editor :deep(.segment-row__term-highlight) {
   background: rgba(216, 183, 78, 0.28);
   color: inherit;
@@ -519,6 +764,40 @@ watch(
   border-color: var(--brand-700);
   background: var(--surface-panel);
   box-shadow: 0 0 0 3px rgba(13, 122, 104, 0.12);
+}
+
+.segment-row__editor.has-revision {
+  border-color: rgba(0, 122, 204, 0.32);
+}
+
+.segment-row__editor :deep(.segment-row__revision-segment) {
+  white-space: pre-wrap;
+}
+
+.segment-row__editor :deep(.segment-row__revision-insert) {
+  color: #0070c0;
+  text-decoration: underline;
+  text-decoration-color: rgba(0, 122, 204, 0.9);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+.segment-row__editor :deep(.segment-row__revision-delete) {
+  color: #d69a00;
+  text-decoration: line-through;
+  text-decoration-color: rgba(214, 154, 0, 0.95);
+  text-decoration-thickness: 1px;
+  user-select: text;
+}
+
+.segment-row__editor.is-revision-author-user :deep(.segment-row__revision-insert) {
+  color: #2e7d32;
+  text-decoration-color: rgba(46, 125, 50, 0.9);
+}
+
+.segment-row__editor.is-revision-author-user :deep(.segment-row__revision-delete) {
+  color: #c62828;
+  text-decoration-color: rgba(198, 40, 40, 0.9);
 }
 
 .segment-row__editor[contenteditable="false"] {
