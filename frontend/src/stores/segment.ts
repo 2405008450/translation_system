@@ -506,6 +506,32 @@ export const useSegmentStore = defineStore('segment', () => {
     scheduleSync()
   }
 
+  async function updateSource(sentenceId: string, sourceText: string) {
+    const index = getSegmentIndex(sentenceId)
+    if (index === -1) {
+      return
+    }
+
+    const segment = segments.value[index]
+    const nextSegment = {
+      ...segment,
+      source_text: sourceText,
+      display_text: sourceText,
+    }
+    segments.value[index] = nextSegment
+
+    // 直接同步到后端
+    try {
+      await http.put(`/file-records/${fileRecord.value?.id}/segments/${sentenceId}/source`, {
+        source_text: sourceText,
+      })
+    } catch (error) {
+      // 恢复原值
+      segments.value[index] = segment
+      throw error
+    }
+  }
+
   function setActiveSentence(sentenceId: string | null) {
     activeSentenceId.value = sentenceId
     if (sentenceId) {
@@ -916,6 +942,7 @@ export const useSegmentStore = defineStore('segment', () => {
     loadRevisions,
     loadSaveToTMStats,
     updateTarget,
+    updateSource,
     setActiveSentence,
     getTermMatches,
     syncToBackend,

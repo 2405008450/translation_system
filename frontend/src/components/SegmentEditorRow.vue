@@ -11,11 +11,13 @@ const props = withDefaults(defineProps<{
   index: number
   active: boolean
   disabled?: boolean
+  sourceEditing?: boolean
   pendingRevision?: SegmentRevisionEntry | null
   revisionBusy?: boolean
   matchedTerms?: TermEntryRecord[]
 }>(), {
   disabled: false,
+  sourceEditing: false,
   pendingRevision: null,
   revisionBusy: false,
   matchedTerms: () => [],
@@ -23,13 +25,16 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{
   update: [sentenceId: string, value: string]
+  updateSource: [sentenceId: string, value: string]
   focus: [sentenceId: string]
   activateTarget: [sentenceId: string]
   applyPartialRevision: [revisionId: string, newText: string]
 }>()
 
 const editorRef = ref<HTMLDivElement | null>(null)
+const sourceEditorRef = ref<HTMLDivElement | null>(null)
 const isFocused = ref(false)
+const isSourceFocused = ref(false)
 
 const statusClass = computed(() => `segment-row--${props.segment.status || 'none'}`)
 const parityClass = computed(() => (props.index % 2 === 0 ? 'segment-row--odd' : 'segment-row--even'))
@@ -219,6 +224,20 @@ function handleClick() {
   emit('activateTarget', props.segment.sentence_id)
 }
 
+function handleSourceFocus() {
+  isSourceFocused.value = true
+}
+
+function handleSourceBlur() {
+  isSourceFocused.value = false
+}
+
+function handleSourceInput() {
+  if (!sourceEditorRef.value) return
+  const text = sourceEditorRef.value.textContent || ''
+  emit('updateSource', props.segment.sentence_id, text)
+}
+
 function handleInput() {
   if (!editorRef.value) return
   
@@ -271,6 +290,39 @@ watch(
   }
 )
 
+// 将光标移动到元素末尾
+function moveCursorToEnd(el: HTMLElement) {
+  const range = document.createRange()
+  const selection = window.getSelection()
+  if (!selection) return
+  
+  range.selectNodeContents(el)
+  range.collapse(false) // false 表示折叠到末尾
+  selection.removeAllRanges()
+  selection.addRange(range)
+}
+
+// 原文编辑器的当前文本（用于避免响应式干扰）
+const sourceEditText = ref('')
+
+// 监听 sourceEditing prop 变化，初始化编辑器内容并聚焦
+watch(
+  () => props.sourceEditing && props.active,
+  (shouldEdit) => {
+    if (shouldEdit) {
+      sourceEditText.value = props.segment.display_text || props.segment.source_text
+      nextTick(() => {
+        if (sourceEditorRef.value) {
+          sourceEditorRef.value.textContent = sourceEditText.value
+          sourceEditorRef.value.focus()
+          moveCursorToEnd(sourceEditorRef.value)
+        }
+      })
+    }
+  },
+  { immediate: true }
+)
+
 </script>
 
 <template>
@@ -300,7 +352,19 @@ watch(
     </div>
 
     <div class="segment-row__cell segment-row__cell--source" @click="handleClick">
-      <div class="segment-row__text">
+      <div
+        v-if="sourceEditing && active"
+        ref="sourceEditorRef"
+        class="segment-row__source-editor"
+        :class="{ 'is-focused': isSourceFocused }"
+        contenteditable="true"
+        tabindex="0"
+        spellcheck="false"
+        @focus="handleSourceFocus"
+        @blur="handleSourceBlur"
+        @input="handleSourceInput"
+      ></div>
+      <div v-else class="segment-row__text">
         <template v-if="highlightedSourceText">
           <template v-for="(seg, idx) in highlightedSourceText" :key="idx">
             <mark v-if="seg.highlight" class="segment-row__term-highlight">{{ seg.text }}</mark>
@@ -466,5 +530,29 @@ watch(
 .segment-row__editor:empty::before {
   content: '';
   color: var(--text-placeholder);
+}
+
+.segment-row__source-editor {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 64px;
+  padding: 6px 8px;
+  border: 1px solid var(--brand-700, #0d7a68);
+  border-radius: 5px;
+  background: var(--surface-panel, #fff);
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-primary);
+  outline: none;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  overflow: auto;
+  box-shadow: 0 0 0 3px rgba(13, 122, 104, 0.12);
+}
+
+.segment-row__source-editor.is-focused {
+  border-color: var(--brand-700, #0d7a68);
+  box-shadow: 0 0 0 3px rgba(13, 122, 104, 0.18);
 }
 </style>

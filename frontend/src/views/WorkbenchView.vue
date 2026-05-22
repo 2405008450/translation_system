@@ -175,6 +175,7 @@ const openRevisionMenu = ref<RevisionMenuKind | null>(null)
 const revisionTraceVisible = ref(getInitialRevisionTraceVisible())
 const revisionActionLoading = ref(false)
 const segmentSearchOpen = ref(false)
+const sourceEditing = ref(false)
 const sourceSearchInputRef = ref<HTMLInputElement | null>(null)
 const guidelinesEditorRef = ref<HTMLTextAreaElement | null>(null)
 const segmentDisplayScope = ref<SegmentDisplayScope>('all')
@@ -1061,6 +1062,14 @@ function updateSegmentTarget(sentenceId: string, targetText: string) {
   segmentStore.updateTarget(sentenceId, targetText)
 }
 
+async function updateSegmentSource(sentenceId: string, sourceText: string) {
+  try {
+    await segmentStore.updateSource(sentenceId, sourceText)
+  } catch (error) {
+    console.error('Failed to update source text:', error)
+  }
+}
+
 async function toggleSegmentSearchPanel() {
   segmentSearchOpen.value = !segmentSearchOpen.value
   if (segmentSearchOpen.value) {
@@ -1218,6 +1227,14 @@ function showRibbonPlaceholder(name: string) {
     title: t('workbench.ribbon.placeholderTitle'),
     message: t('workbench.ribbon.placeholderMessage', { name }),
   })
+}
+
+function toggleSourceEditing() {
+  if (!segmentStore.activeSentenceId) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+  sourceEditing.value = !sourceEditing.value
 }
 
 function copySourceToTarget() {
@@ -2207,7 +2224,7 @@ onBeforeRouteLeave(async () => {
         </div>
 
         <div class="tool-group">
-          <button class="tool-col tool-col--big tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.editSource'))">
+          <button class="tool-col tool-col--big tool-button" type="button" :class="{ active: sourceEditing }" @click="toggleSourceEditing">
             <span class="tool-line line1 with-big-icon">
               <span class="icon-text-area">
                 <SquarePen class="tool-single-icon" :size="27" />
@@ -2930,12 +2947,14 @@ onBeforeRouteLeave(async () => {
                     :segment="item"
                     :index="getEditorSegmentDisplayIndex(item.sentence_id, index)"
                     :active="segmentStore.activeSentenceId === item.sentence_id"
+                    :source-editing="sourceEditing"
                     :pending-revision="revisionTraceVisible ? segmentStore.getPendingRevision(item.sentence_id) : null"
                     :revision-busy="revisionActionLoading"
                     :matched-terms="segmentStore.activeSentenceId === item.sentence_id ? activeMatchedTerms : []"
                     @focus="segmentStore.setActiveSentence"
                     @activate-target="handleSegmentTargetActivate"
                     @update="updateSegmentTarget"
+                    @update-source="updateSegmentSource"
                     @apply-partial-revision="handleApplyPartialRevision"
                   />
                 </template>
@@ -3537,6 +3556,11 @@ onBeforeRouteLeave(async () => {
 .tool-button.active,
 .tool-button.active-soft {
   color: #0a705f;
+}
+
+.tool-button.active {
+  border-color: #b8cbd4;
+  background: linear-gradient(180deg, #f8fbfc 0%, #edf5f7 100%);
 }
 
 .tool-button {

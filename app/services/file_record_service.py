@@ -739,6 +739,28 @@ def update_segment_by_sentence_id(
     return segment
 
 
+def update_segment_source_text(
+    db: Session,
+    file_record_id: UUID,
+    sentence_id: str,
+    source_text: str,
+) -> Segment | None:
+    """更新片段的原文"""
+    segment = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not segment:
+        return None
+
+    segment.source_text = source_text
+    segment.display_text = source_text
+    db.commit()
+    db.refresh(segment)
+    return segment
+
+
 def update_segment_with_llm_result(
     db: Session,
     file_record_id: UUID,

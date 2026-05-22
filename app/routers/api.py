@@ -82,6 +82,7 @@ from app.services.file_record_service import (
     load_file_record_source,
     resolve_file_record_status,
     update_segment_by_sentence_id,
+    update_segment_source_text,
     update_segment_with_llm_result,
 )
 from app.services.guideline_repository import (
@@ -720,6 +721,10 @@ class SegmentUpdate(BaseModel):
     sentence_id: str
     target_text: str
     source: str = "manual"
+
+
+class SegmentSourceUpdate(BaseModel):
+    source_text: str
 
 
 class BatchSegmentUpdate(BaseModel):
@@ -3174,6 +3179,33 @@ def update_segment(
         "target_text": segment.target_text,
         "status": segment.status,
         "source": segment.source,
+    }
+
+
+@router.put("/file-records/{file_record_id}/segments/{sentence_id}/source")
+@router.put("/documents/{file_record_id}/segments/{sentence_id}/source", include_in_schema=False)
+def update_segment_source(
+    file_record_id: UUID,
+    sentence_id: str,
+    update: SegmentSourceUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """更新单个片段的原文"""
+    segment = update_segment_source_text(
+        db=db,
+        file_record_id=file_record_id,
+        sentence_id=sentence_id,
+        source_text=update.source_text,
+    )
+    if not segment:
+        raise HTTPException(status_code=404, detail="片段不存在。")
+
+    return {
+        "id": segment.id,
+        "sentence_id": segment.sentence_id,
+        "source_text": segment.source_text,
+        "display_text": segment.display_text,
     }
 
 
