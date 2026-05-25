@@ -71,6 +71,7 @@ REQUIRED_SCHEMA = {
     "segments": {
         "llm_provider",
         "llm_model",
+        "target_html",
     },
     "segment_revisions": {
         "id",
@@ -497,6 +498,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS segments
             ADD COLUMN IF NOT EXISTS llm_model VARCHAR(200)
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS target_html TEXT
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_segments_file_record_order

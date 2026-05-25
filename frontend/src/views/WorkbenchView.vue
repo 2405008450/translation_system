@@ -60,6 +60,7 @@ import WorkbenchTermsPanel from '../components/WorkbenchTermsPanel.vue'
 import { http } from '../api/http'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
+import { useRichTextEditor, type TextFormat, type CaseType } from '../composables/useRichTextEditor'
 import { useToast } from '../composables/useToast'
 import { useWorkbenchShortcuts } from '../composables/useWorkbenchShortcuts'
 import { getTaskExportFormatLabel } from '../constants/taskFiles'
@@ -172,6 +173,7 @@ const importDialogInitialTab = ref<ResourceImportTab>('tm')
 const showShortcutHelp = ref(false)
 const showSaveToTMDialog = ref(false)
 const openRevisionMenu = ref<RevisionMenuKind | null>(null)
+const openConfirmMenu = ref(false)
 const revisionTraceVisible = ref(getInitialRevisionTraceVisible())
 const revisionActionLoading = ref(false)
 const segmentSearchOpen = ref(false)
@@ -192,6 +194,22 @@ const saveToTMScope = ref<SaveToTMScope>('translated')
 const saveToTMTargetMode = ref<SaveToTMTargetMode>('new')
 const saveToTMCollectionId = ref('')
 const saveToTMNewCollectionName = ref('')
+
+// 富文本编辑相关
+const richTextEditor = useRichTextEditor()
+const showCaseMenu = ref(false)
+const showClearFormatMenu = ref(false)
+
+// 创建一个响应式的格式状态副本，确保传递给子组件时保持响应性
+const pendingFormatsForEditor = computed(() => ({
+  bold: richTextEditor.activeFormats.bold,
+  italic: richTextEditor.activeFormats.italic,
+  underline: richTextEditor.activeFormats.underline,
+  strikethrough: richTextEditor.activeFormats.strikethrough,
+  subscript: richTextEditor.activeFormats.subscript,
+  superscript: richTextEditor.activeFormats.superscript,
+  _overrideActive: richTextEditor.formatOverrideActive.value,
+}))
 
 const termBases = ref<TermBase[]>([])
 const termEntries = ref<TermEntryRecord[]>([])
@@ -1056,10 +1074,10 @@ function retainEmptyTargetSegmentDuringEdit(sentenceId: string, previousTargetTe
   ])
 }
 
-function updateSegmentTarget(sentenceId: string, targetText: string) {
+function updateSegmentTarget(sentenceId: string, targetText: string, targetHtml?: string) {
   const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
   retainEmptyTargetSegmentDuringEdit(sentenceId, segment?.target_text)
-  segmentStore.updateTarget(sentenceId, targetText)
+  segmentStore.updateTarget(sentenceId, targetText, targetHtml)
 }
 
 async function updateSegmentSource(sentenceId: string, sourceText: string) {
@@ -1213,6 +1231,10 @@ function getEditorSegmentDisplayIndex(sentenceId: string, fallbackIndex: number)
   return segmentOrdinalMap.value.get(sentenceId) ?? fallbackIndex
 }
 
+function toggleConfirmMenu() {
+  openConfirmMenu.value = !openConfirmMenu.value
+}
+
 function confirmCurrentSentence() {
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
@@ -1222,12 +1244,211 @@ function confirmCurrentSentence() {
   toast.success(t('workbench.messages.confirmed'))
 }
 
+async function confirmAndMoveToNextUnconfirmed() {
+  if (!activeSegment.value) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+  
+  // 先确认当前句段
+  updateSegmentTarget(activeSegment.value.sentence_id, activeSegment.value.target_text || '')
+  
+  // 找到下一个未确认的句段
+  const currentIndex = activeEditorIndex.value
+  const segments = editorSegments.value
+  
+  // 从当前位置向后查找未确认的句段
+  let nextUnconfirmedIndex = -1
+  for (let i = currentIndex + 1; i < segments.length; i++) {
+    if (segments[i].status !== 'confirmed') {
+      nextUnconfirmedIndex = i
+      break
+    }
+  }
+  
+  // 如果后面没有找到，从头开始查找
+  if (nextUnconfirmedIndex === -1) {
+    for (let i = 0; i < currentIndex; i++) {
+      if (segments[i].status !== 'confirmed') {
+        nextUnconfirmedIndex = i
+        break
+      }
+    }
+  }
+  
+  if (nextUnconfirmedIndex !== -1) {
+    await focusEditorSegmentAtIndex(nextUnconfirmedIndex)
+  }
+  
+  toast.success(t('workbench.messages.confirmed'))
+}
+
+async function confirmAllSegments() {
+  openConfirmMenu.value = false
+  
+  const segments = editorSegments.value
+  let confirmedCount = 0
+  
+  for (const segment of segments) {
+    if (segment.status !== 'confirmed') {
+      updateSegmentTarget(segment.sentence_id, segment.target_text || '')
+      confirmedCount++
+    }
+  }
+  
+  if (confirmedCount > 0) {
+    toast.success(t('workbench.messages.allConfirmed', { count: confirmedCount }))
+  } else {
+    toast.info(t('workbench.messages.noSegmentsToConfirm'))
+  }
+}
+
 function showRibbonPlaceholder(name: string) {
   toast.info({
     title: t('workbench.ribbon.placeholderTitle'),
     message: t('workbench.ribbon.placeholderMessage', { name }),
   })
 }
+
+// ========== 富文本格式化功能 ==========
+
+/**
+ * 获取当前活动的编辑器元素
+ */
+function getActiveEditorElement(): HTMLElement | null {
+  if (!segmentStore.activeSentenceId) return null
+  const selector = `[data-segment-target="true"][data-sentence-id="${segmentStore.activeSentenceId}"]`
+  return document.querySelector(selector)
+}
+
+/**
+ * 应用文本格式（粗体、斜体、下划线等）
+ */
+function applyTextFormat(format: TextFormat) {
+  const editor = getActiveEditorElement()
+  
+  if (editor) {
+    // 确保编辑器获得焦点
+    editor.focus()
+    
+    // 如果没有选区或选区不在编辑器内，将光标放到编辑器末尾
+    const selection = window.getSelection()
+    if (!selection || selection.rangeCount === 0 || !editor.contains(selection.anchorNode)) {
+      const range = document.createRange()
+      range.selectNodeContents(editor)
+      range.collapse(false)
+      selection?.removeAllRanges()
+      selection?.addRange(range)
+    }
+    
+    // 应用格式（会同时切换 activeFormats 状态）
+    richTextEditor.applyFormat(format, editor)
+    
+    // 触发 input 事件以同步数据
+    editor.dispatchEvent(new Event('input', { bubbles: true }))
+  } else {
+    // 没有活动编辑器时，只切换格式状态
+    richTextEditor.activeFormats[format] = !richTextEditor.activeFormats[format]
+    richTextEditor.formatOverrideActive.value = true
+  }
+}
+
+/**
+ * 清除格式
+ * - 有选中文本时：清除选中文本的格式
+ * - 没有选中文本时：清除整个段落的所有格式
+ */
+function clearSelectedFormat() {
+  const editor = getActiveEditorElement()
+  if (!editor) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+  
+  editor.focus()
+  
+  const selection = window.getSelection()
+  const hasSelectedText = selection && !selection.isCollapsed && editor.contains(selection.anchorNode)
+  
+  if (hasSelectedText) {
+    // 有选中文本：清除选中文本的格式
+    if (richTextEditor.clearFormat(editor)) {
+      editor.dispatchEvent(new Event('input', { bubbles: true }))
+      toast.success(t('workbench.ribbon.messages.formatCleared'))
+    }
+  } else {
+    // 没有选中文本：清除整个段落的所有格式
+    const plainText = richTextEditor.clearAllFormatInElement(editor)
+    if (activeSegment.value) {
+      updateSegmentTarget(activeSegment.value.sentence_id, plainText)
+    }
+    toast.success(t('workbench.ribbon.messages.allFormatCleared'))
+  }
+  
+  // 重置格式状态
+  richTextEditor.resetActiveFormats()
+  showClearFormatMenu.value = false
+}
+
+/**
+ * 清除整个段落的所有格式
+ */
+function clearAllFormat() {
+  const editor = getActiveEditorElement()
+  if (!editor) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+  
+  const plainText = richTextEditor.clearAllFormatInElement(editor)
+  if (activeSegment.value) {
+    updateSegmentTarget(activeSegment.value.sentence_id, plainText)
+  }
+  toast.success(t('workbench.ribbon.messages.allFormatCleared'))
+  showClearFormatMenu.value = false
+}
+
+/**
+ * 转换大小写
+ */
+function applyCase(caseType: CaseType) {
+  const editor = getActiveEditorElement()
+  if (!editor) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+  
+  editor.focus()
+  
+  if (richTextEditor.changeCase(caseType, editor)) {
+    editor.dispatchEvent(new Event('input', { bubbles: true }))
+  } else {
+    toast.warn(t('workbench.ribbon.messages.selectTextFirst'))
+  }
+  showCaseMenu.value = false
+}
+
+/**
+ * 切换显示标记
+ */
+function toggleVisibleCharacters() {
+  const enabled = richTextEditor.toggleVisibleCharacters()
+  if (enabled) {
+    toast.info(t('workbench.ribbon.messages.visibleCharsOn'))
+  } else {
+    toast.info(t('workbench.ribbon.messages.visibleCharsOff'))
+  }
+}
+
+/**
+ * 关闭所有下拉菜单
+ */
+function closeAllMenus() {
+  showCaseMenu.value = false
+  showClearFormatMenu.value = false
+}
+
+// ========== 富文本格式化功能结束 ==========
 
 function toggleSourceEditing() {
   if (!segmentStore.activeSentenceId) {
@@ -1823,6 +2044,16 @@ function handleClickOutside(event: MouseEvent) {
   ) {
     openRevisionMenu.value = null
   }
+  if (
+    !target.closest('.confirm-segment-menu')
+    && !target.closest('.confirm-segment-menu__dropdown')
+  ) {
+    openConfirmMenu.value = false
+  }
+  // 关闭格式化相关的下拉菜单
+  if (!target.closest('.case-menu') && !target.closest('.clear-format-menu')) {
+    closeAllMenus()
+  }
 }
 
 async function handleCommentDraft(draft: CommentAnchorDraft) {
@@ -1995,9 +2226,22 @@ watch([segmentDisplayScope, sourceSearchQuery, targetSearchQuery, searchFuzzyEna
   }
 })
 
+/**
+ * 处理选区变化，更新格式按钮状态
+ * 注意：只在有选中文本时才更新状态，避免覆盖手动设置的格式状态
+ */
+function handleSelectionChange() {
+  const selection = window.getSelection()
+  // 只有当有选中文本时才根据选区更新格式状态
+  if (selection && !selection.isCollapsed) {
+    richTextEditor.updateActiveFormats()
+  }
+}
+
 onMounted(() => {
   window.addEventListener('resize', handleResize)
   document.addEventListener('click', handleClickOutside)
+  document.addEventListener('selectionchange', handleSelectionChange)
   void loadTask()
   void loadGuidelineTemplates()
 })
@@ -2005,6 +2249,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
   document.removeEventListener('click', handleClickOutside)
+  document.removeEventListener('selectionchange', handleSelectionChange)
   commentStore.stopPolling()
 })
 
@@ -2121,22 +2366,37 @@ onBeforeRouteLeave(async () => {
 
       <div class="workbench-ribbon__container container">
         <div class="tool-group">
-          <button
-            class="tool-col tool-col--big tool-button"
-            type="button"
-            :disabled="!activeSegment"
-            @click="confirmCurrentSentence"
-          >
-            <span class="tool-line line1 with-big-icon">
-              <span class="icon-text-area has_dropdown">
-                <Check class="tool-single-icon tool-single-icon--confirm" :size="28" />
+          <div class="confirm-segment-menu">
+            <button
+              class="tool-col tool-col--big tool-button confirm-segment-menu__main"
+              type="button"
+              :disabled="!activeSegment"
+              @click="confirmAndMoveToNextUnconfirmed"
+            >
+              <span class="tool-line line1 with-big-icon">
+                <span class="icon-text-area">
+                  <Check class="tool-single-icon tool-single-icon--confirm" :size="28" />
+                </span>
               </span>
-              <span class="dropdown-link" aria-hidden="true">
-                <ChevronDown :size="12" />
-              </span>
-            </span>
-            <span class="tool-line"><span class="label">{{ t('workbench.ribbon.confirmSegment') }}</span></span>
-          </button>
+              <span class="tool-line"><span class="label">{{ t('workbench.ribbon.confirmSegment') }}</span></span>
+            </button>
+            <button
+              class="confirm-segment-menu__toggle"
+              type="button"
+              :disabled="!activeSegment"
+              @click.stop="toggleConfirmMenu"
+            >
+              <ChevronDown :size="12" />
+            </button>
+            <div v-if="openConfirmMenu" class="confirm-segment-menu__dropdown">
+              <button type="button" @click="confirmCurrentSentence(); openConfirmMenu = false">
+                {{ t('workbench.ribbon.confirmSegmentOnly') }}
+              </button>
+              <button type="button" @click="confirmAllSegments">
+                {{ t('workbench.ribbon.confirmAllSegments') }}
+              </button>
+            </div>
+          </div>
         </div>
 
         <div class="tool-group">
@@ -2186,54 +2446,79 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group custom-style">
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" aria-disabled="true" :title="t('workbench.ribbon.bold')" @click="showRibbonPlaceholder(t('workbench.ribbon.bold'))">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.bold }" :disabled="!activeSegment" :title="t('workbench.ribbon.bold')" @mousedown.prevent @click="applyTextFormat('bold')">
               <span class="icon-text-area"><span class="tool-item"><Bold class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" aria-disabled="true" :title="t('workbench.ribbon.strike')" @click="showRibbonPlaceholder(t('workbench.ribbon.strike'))">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.strikethrough }" :disabled="!activeSegment" :title="t('workbench.ribbon.strike')" @mousedown.prevent @click="applyTextFormat('strikethrough')">
               <span class="icon-text-area"><span class="tool-item"><Strikethrough class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" aria-disabled="true" :title="t('workbench.ribbon.italic')" @click="showRibbonPlaceholder(t('workbench.ribbon.italic'))">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.italic }" :disabled="!activeSegment" :title="t('workbench.ribbon.italic')" @mousedown.prevent @click="applyTextFormat('italic')">
               <span class="icon-text-area"><span class="tool-item"><Italic class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" aria-disabled="true" :title="t('workbench.ribbon.superscript')" @click="showRibbonPlaceholder(t('workbench.ribbon.superscript'))">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.superscript }" :disabled="!activeSegment" :title="t('workbench.ribbon.superscript')" @mousedown.prevent @click="applyTextFormat('superscript')">
               <span class="icon-text-area"><span class="tool-item"><Superscript class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" aria-disabled="true" :title="t('workbench.ribbon.underline')" @click="showRibbonPlaceholder(t('workbench.ribbon.underline'))">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.underline }" :disabled="!activeSegment" :title="t('workbench.ribbon.underline')" @mousedown.prevent @click="applyTextFormat('underline')">
               <span class="icon-text-area"><span class="tool-item"><Underline class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" aria-disabled="true" :title="t('workbench.ribbon.subscript')" @click="showRibbonPlaceholder(t('workbench.ribbon.subscript'))">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.subscript }" :disabled="!activeSegment" :title="t('workbench.ribbon.subscript')" @mousedown.prevent @click="applyTextFormat('subscript')">
               <span class="icon-text-area"><span class="tool-item"><Subscript class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" aria-disabled="true" :title="t('workbench.ribbon.caseChange')" @click="showRibbonPlaceholder(t('workbench.ribbon.caseChange'))">
-              <span class="icon-text-area has_dropdown"><span class="tool-item"><Type class="tool-label-icon" :size="15" /></span></span>
-              <span class="dropdown-link" aria-hidden="true">
-                <ChevronDown :size="10" />
-              </span>
-            </button>
-            <button class="tool-line style-item tool-button" type="button" aria-disabled="true" :title="t('workbench.ribbon.visibleCharacters')" @click="showRibbonPlaceholder(t('workbench.ribbon.visibleCharacters'))">
+            <div class="case-menu">
+              <button class="tool-line style-item tool-button" type="button" :disabled="!activeSegment" :title="t('workbench.ribbon.caseChange')" @mousedown.prevent @click.stop="showCaseMenu = !showCaseMenu">
+                <span class="icon-text-area has_dropdown"><span class="tool-item"><Type class="tool-label-icon" :size="15" /></span></span>
+                <span class="dropdown-link" aria-hidden="true">
+                  <ChevronDown :size="10" />
+                </span>
+              </button>
+              <div v-if="showCaseMenu" class="case-menu__dropdown">
+                <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('upper')">{{ t('workbench.ribbon.caseUpper') }}</button>
+                <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('lower')">{{ t('workbench.ribbon.caseLower') }}</button>
+                <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('capitalize')">{{ t('workbench.ribbon.caseCapitalize') }}</button>
+                <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('sentence')">{{ t('workbench.ribbon.caseSentence') }}</button>
+              </div>
+            </div>
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :disabled="!activeSegment" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
               <span class="icon-text-area"><span class="tool-item"><Sigma class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
         </div>
 
         <div class="tool-group">
-          <button class="tool-col tool-col--big tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.clearFormat'))">
-            <span class="tool-line line1 with-big-icon">
-              <span class="icon-text-area has_dropdown">
-                <BrushCleaning class="tool-single-icon" :size="27" />
+          <div class="clear-format-menu">
+            <button
+              class="tool-col tool-col--big tool-button clear-format-menu__main"
+              type="button"
+              :disabled="!activeSegment"
+              @mousedown.prevent
+              @click="clearSelectedFormat"
+            >
+              <span class="tool-line line1 with-big-icon">
+                <span class="icon-text-area">
+                  <BrushCleaning class="tool-single-icon" :size="27" />
+                </span>
               </span>
-              <span class="dropdown-link" aria-hidden="true">
-                <ChevronDown :size="12" />
-              </span>
-            </span>
-            <span class="tool-line"><span class="label">{{ t('workbench.ribbon.clearFormat') }}</span></span>
-          </button>
+              <span class="tool-line"><span class="label">{{ t('workbench.ribbon.clearFormat') }}</span></span>
+            </button>
+            <button
+              class="clear-format-menu__toggle"
+              type="button"
+              :disabled="!activeSegment"
+              @click.stop="showClearFormatMenu = !showClearFormatMenu"
+            >
+              <ChevronDown :size="12" />
+            </button>
+            <div v-if="showClearFormatMenu" class="clear-format-menu__dropdown">
+              <button type="button" class="clear-format-menu__item" @mousedown.prevent @click="clearSelectedFormat">{{ t('workbench.ribbon.clearSelectedFormat') }}</button>
+              <button type="button" class="clear-format-menu__item" @mousedown.prevent @click="clearAllFormat">{{ t('workbench.ribbon.clearAllFormat') }}</button>
+            </div>
+          </div>
         </div>
 
         <div class="tool-group">
@@ -2935,6 +3220,8 @@ onBeforeRouteLeave(async () => {
                     :pending-revision="revisionTraceVisible ? segmentStore.getRevisionTrace(item.sentence_id) : null"
                     :revision-busy="revisionActionLoading"
                     :matched-terms="segmentStore.activeSentenceId === item.sentence_id ? activeMatchedTerms : []"
+                    :show-visible-chars="richTextEditor.visibleCharactersEnabled.value"
+                    :pending-formats="pendingFormatsForEditor"
                     @focus="segmentStore.setActiveSentence"
                     @activate-target="handleSegmentTargetActivate"
                     @update="updateSegmentTarget"
@@ -4899,6 +5186,223 @@ onBeforeRouteLeave(async () => {
   .workbench-panel-pop-leave-to {
     transform: none;
   }
+}
+
+/* 确认句段下拉菜单 */
+.confirm-segment-menu {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+}
+
+.confirm-segment-menu__main {
+  border-radius: 4px 0 0 4px !important;
+  border-right: none !important;
+}
+
+.confirm-segment-menu__main:hover:not(:disabled),
+.confirm-segment-menu__main:focus-visible {
+  border-right: none !important;
+}
+
+.confirm-segment-menu__toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 0 4px 4px 0;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.confirm-segment-menu:hover .confirm-segment-menu__main:not(:disabled) {
+  border-color: #b8cbd4;
+  border-right: none !important;
+  background: linear-gradient(180deg, #f8fbfc 0%, #edf5f7 100%);
+}
+
+.confirm-segment-menu:hover .confirm-segment-menu__toggle:not(:disabled) {
+  border-color: #b8cbd4;
+  border-left: 1px solid #b8cbd4;
+  background: linear-gradient(180deg, #f8fbfc 0%, #edf5f7 100%);
+}
+
+.confirm-segment-menu__toggle:hover:not(:disabled) {
+  background: linear-gradient(180deg, #eef4f6 0%, #e3eef1 100%) !important;
+}
+
+.confirm-segment-menu__toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.confirm-segment-menu__dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 100;
+  min-width: 140px;
+  padding: 4px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+.confirm-segment-menu__dropdown button {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.confirm-segment-menu__dropdown button:hover {
+  background: rgba(13, 122, 104, 0.08);
+}
+
+/* 大小写转换下拉菜单 */
+.case-menu {
+  position: relative;
+  display: inline-flex;
+}
+
+.case-menu__dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  min-width: 120px;
+  padding: 4px 0;
+  border: 1px solid #d0d7dc;
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+.case-menu__item {
+  display: block;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  color: #43545c;
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.case-menu__item:hover {
+  background: rgba(13, 122, 104, 0.08);
+}
+
+/* 清除格式下拉菜单 */
+.clear-format-menu {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+}
+
+.clear-format-menu__main {
+  border-radius: 4px 0 0 4px !important;
+  border-right: none !important;
+}
+
+.clear-format-menu__main:hover:not(:disabled),
+.clear-format-menu__main:focus-visible {
+  border-right: none !important;
+}
+
+.clear-format-menu__toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 0 4px 4px 0;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.clear-format-menu:hover .clear-format-menu__main:not(:disabled) {
+  border-color: #b8cbd4;
+  border-right: none !important;
+  background: linear-gradient(180deg, #f8fbfc 0%, #edf5f7 100%);
+}
+
+.clear-format-menu:hover .clear-format-menu__toggle:not(:disabled) {
+  border-color: #b8cbd4;
+  border-left: 1px solid #b8cbd4;
+  background: linear-gradient(180deg, #f8fbfc 0%, #edf5f7 100%);
+}
+
+.clear-format-menu__toggle:hover:not(:disabled) {
+  background: linear-gradient(180deg, #eef4f6 0%, #e3eef1 100%) !important;
+}
+
+.clear-format-menu__toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.clear-format-menu__dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 100;
+  min-width: 140px;
+  padding: 4px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+.clear-format-menu__item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.clear-format-menu__item:hover {
+  background: rgba(13, 122, 104, 0.08);
+}
+
+/* 格式按钮激活状态（与 hover 一致） */
+.tool-button.is-active {
+  border-color: #b8cbd4;
+  background: linear-gradient(180deg, #f8fbfc 0%, #edf5f7 100%);
 }
 </style>
 

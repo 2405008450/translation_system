@@ -720,6 +720,7 @@ class WorkerSettings:
 class SegmentUpdate(BaseModel):
     sentence_id: str
     target_text: str
+    target_html: str | None = None
     source: str = "manual"
 
 
@@ -2470,6 +2471,7 @@ def _serialize_workbench_segment(seg: Segment) -> dict:
         "source_text": seg.source_text,
         "display_text": seg.display_text,
         "target_text": seg.target_text,
+        "target_html": seg.target_html,
         "status": seg.status,
         "score": seg.score,
         "matched_source_text": seg.matched_source_text,

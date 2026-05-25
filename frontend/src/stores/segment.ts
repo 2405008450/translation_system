@@ -566,7 +566,7 @@ export const useSegmentStore = defineStore('segment', () => {
     previewUpdateToken.value += 1
   }
 
-  function updateTarget(sentenceId: string, targetText: string) {
+  function updateTarget(sentenceId: string, targetText: string, targetHtml?: string) {
     const index = getSegmentIndex(sentenceId)
     if (index === -1) {
       return
@@ -577,6 +577,7 @@ export const useSegmentStore = defineStore('segment', () => {
     const nextSegment = {
       ...segment,
       target_text: targetText,
+      target_html: targetHtml || null,
       source: 'manual',
       status: 'confirmed',
       llm_provider: null,
@@ -591,6 +592,7 @@ export const useSegmentStore = defineStore('segment', () => {
       [sentenceId]: {
         sentence_id: sentenceId,
         target_text: targetText,
+        target_html: targetHtml || null,
         source: 'manual',
       },
     }
@@ -710,6 +712,17 @@ export const useSegmentStore = defineStore('segment', () => {
           time: syncedAt.toLocaleString('zh-CN', { hour12: false }),
         })
       }
+    } catch (error) {
+      console.error('Failed to sync segments:', error)
+      const message = (error as any)?.response?.data?.detail || '保存失败，请重试'
+      syncMessage.value = translate('stores.segment.syncFailed')
+      pushToast({
+        tone: 'error',
+        title: '保存失败',
+        message: String(message),
+      })
+      // 稍后重试
+      scheduleSync()
     } finally {
       saving.value = false
     }

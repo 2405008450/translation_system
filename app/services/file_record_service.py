@@ -814,8 +814,10 @@ def batch_update_segments(
 
         before_text = segment.target_text
         target_text = item.get("target_text", "")
+        target_html = item.get("target_html")
         source = item.get("source", "manual")
         segment.target_text = target_text
+        segment.target_html = target_html if target_html else None
         segment.source = source
         if source == "llm":
             segment.llm_provider = item.get("llm_provider")
