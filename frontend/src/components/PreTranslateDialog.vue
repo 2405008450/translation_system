@@ -15,6 +15,8 @@ interface ProjectFileItem {
   filename: string
   source_language: string | null
   target_language: string | null
+  is_edit_locked?: boolean
+  active_operation_message?: string
 }
 
 interface PreTranslateProgressPayload {
@@ -22,6 +24,14 @@ interface PreTranslateProgressPayload {
   progress: number
   status: string
   running: boolean
+}
+
+interface FileOperationLockResponse {
+  id: string
+  token: string
+  active_operation: string | null
+  active_operation_message: string
+  is_edit_locked: boolean
 }
 
 const props = defineProps<{
@@ -39,6 +49,8 @@ const emit = defineEmits<{
 }>()
 
 const NO_TM_COLLECTION_ID = '__NO_TM_COLLECTION__'
+const FILE_OPERATION_TOKEN_HEADER = 'X-File-Operation-Token'
+const LOCK_HEARTBEAT_INTERVAL_MS = 30_000
 
 const { t } = useI18n()
 
@@ -346,7 +358,40 @@ function validateBeforeStart() {
   return true
 }
 
-async function runLLMForFile(fileId: string, completedActions: number, actionCount: number) {
+function buildOperationHeaders(operationToken: string) {
+  return {
+    [FILE_OPERATION_TOKEN_HEADER]: operationToken,
+  }
+}
+
+async function acquirePreTranslateLock(fileId: string) {
+  const { data } = await http.post<FileOperationLockResponse>(`/file-records/${fileId}/operation-lock`, {
+    operation: 'pre_translate',
+  })
+  return data.token
+}
+
+async function heartbeatPreTranslateLock(fileId: string, operationToken: string) {
+  await http.patch(
+    `/file-records/${fileId}/operation-lock`,
+    {},
+    { headers: buildOperationHeaders(operationToken) },
+  )
+}
+
+async function releasePreTranslateLock(fileId: string, operationToken: string) {
+  await http.delete(`/file-records/${fileId}/operation-lock`, {
+    headers: buildOperationHeaders(operationToken),
+  })
+}
+
+function startLockHeartbeat(fileId: string, operationToken: string) {
+  return window.setInterval(() => {
+    void heartbeatPreTranslateLock(fileId, operationToken)
+  }, LOCK_HEARTBEAT_INTERVAL_MS)
+}
+
+async function runLLMForFile(fileId: string, completedActions: number, actionCount: number, operationToken: string) {
   const token = window.localStorage.getItem('token')
   const controller = new AbortController()
   let plannedCount = 0
@@ -368,6 +413,7 @@ async function runLLMForFile(fileId: string, completedActions: number, actionCou
         'Content-Type': 'application/json',
         Accept: 'text/event-stream',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...buildOperationHeaders(operationToken),
       },
       body: JSON.stringify({
         scope: llmScope.value,
@@ -456,9 +502,14 @@ async function startPreTranslate() {
       }
 
       let completedActions = 0
+      let operationToken = ''
+      let heartbeatTimer: number | null = null
       setFileProgress(file.id, 0, t('projectDetail.preTranslate.progress.running'))
 
       try {
+        operationToken = await acquirePreTranslateLock(file.id)
+        heartbeatTimer = startLockHeartbeat(file.id, operationToken)
+
         if (shouldRunTm.value) {
           setFileProgress(
             file.id,
@@ -471,6 +522,8 @@ async function startPreTranslate() {
             skip_confirmed: tmSkipConfirmed.value,
             overwrite_fuzzy: tmOverwriteFuzzy.value,
             auto_confirm_exact: tmAutoConfirmExact.value,
+          }, {
+            headers: buildOperationHeaders(operationToken),
           })
           completedActions += 1
           setFileProgress(
@@ -481,7 +534,7 @@ async function startPreTranslate() {
         }
 
         if (useLlm.value && !stopRequested.value) {
-          await runLLMForFile(file.id, completedActions, actionCount)
+          await runLLMForFile(file.id, completedActions, actionCount, operationToken)
           completedActions += 1
           setFileProgress(
             file.id,
@@ -502,7 +555,9 @@ async function startPreTranslate() {
           if (shouldRunTm.value) {
             bindingsPayload.collection_id = selectedTmCollectionIds.value[0] || null
           }
-          await http.patch(`/file-records/${file.id}/bindings`, bindingsPayload)
+          await http.patch(`/file-records/${file.id}/bindings`, bindingsPayload, {
+            headers: buildOperationHeaders(operationToken),
+          })
           completedActions += 1
           setFileProgress(
             file.id,
@@ -537,6 +592,17 @@ async function startPreTranslate() {
           title: t('projectDetail.preTranslate.toast.fileFailedTitle', { name: file.filename }),
           message,
         })
+      } finally {
+        if (heartbeatTimer !== null) {
+          window.clearInterval(heartbeatTimer)
+        }
+        if (operationToken) {
+          try {
+            await releasePreTranslateLock(file.id, operationToken)
+          } catch (error) {
+            console.warn('Failed to release pre-translate lock:', error)
+          }
+        }
       }
     }
 

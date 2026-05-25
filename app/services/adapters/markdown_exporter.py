@@ -30,6 +30,8 @@ class MarkdownExporter:
         
         in_code_block = False
         current_para = []
+        current_code_block = []
+        code_fence = ""
         
         for line in lines:
             # 代码块
@@ -37,12 +39,18 @@ class MarkdownExporter:
                 if current_para:
                     result_lines.extend(self._process_paragraph(current_para, translations))
                     current_para = []
-                in_code_block = not in_code_block
-                result_lines.append(line)
+                if in_code_block:
+                    result_lines.extend(self._process_code_block(code_fence, current_code_block, line, translations))
+                    current_code_block = []
+                    code_fence = ""
+                    in_code_block = False
+                else:
+                    in_code_block = True
+                    code_fence = line
                 continue
             
             if in_code_block:
-                result_lines.append(line)
+                current_code_block.append(line)
                 continue
             
             # 空行
@@ -96,6 +104,9 @@ class MarkdownExporter:
         
         if current_para:
             result_lines.extend(self._process_paragraph(current_para, translations))
+        if in_code_block:
+            result_lines.append(code_fence)
+            result_lines.extend(current_code_block)
         
         return '\n'.join(result_lines).encode('utf-8')
 
@@ -113,3 +124,18 @@ class MarkdownExporter:
         if text in translations:
             return [translations[text]]
         return lines
+
+    def _process_code_block(
+        self,
+        opening_fence: str,
+        lines: list,
+        closing_fence: str,
+        translations: Dict[str, str],
+    ) -> list:
+        """处理代码块。只有上传时勾选并产生译文时才会替换。"""
+        text = '\n'.join(lines).strip()
+        normalized_text = re.sub(r'\s+', ' ', text)
+        translated = translations.get(text) or translations.get(normalized_text)
+        if translated:
+            return [opening_fence, translated, closing_fence]
+        return [opening_fence, *lines, closing_fence]

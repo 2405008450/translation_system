@@ -4,11 +4,9 @@ import {
   ArrowRight,
   Download,
   Flag,
-  Loader2,
   MoreHorizontal,
   Search,
   Settings2,
-  Trash2,
   Upload,
 } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
@@ -17,26 +15,14 @@ import { useRouter } from 'vue-router'
 
 import { http } from '../api/http'
 import DataTable from '../components/DataTable.vue'
-import DocumentParseSettings from '../components/DocumentParseSettings.vue'
 import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
 import Pagination from '../components/Pagination.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { useToast } from '../composables/useToast'
-import { formatLanguagePair, languageOptions } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
-import { supportedTaskFileAccept } from '../constants/taskFiles'
-import { useTaskStore } from '../stores/task'
-import type {
-  DocumentParseMode,
-  DocumentParseOptions,
-  IssueMarker,
-  TermBase,
-  TMCollection,
-  UploadCapabilitiesResponse,
-  UploadCapability,
-} from '../types/api'
+import type { IssueMarker } from '../types/api'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
 
 interface ProjectRow {
@@ -70,15 +56,6 @@ type MainTab = 'tasks' | 'performance'
 type SubTab = 'all' | 'incomplete'
 type ResourceImportTab = 'tm' | 'term'
 
-const NO_TM_COLLECTION_ID = '__NO_TM_COLLECTION__'
-const DEFAULT_DOCUMENT_PARSE_OPTIONS: DocumentParseOptions = {
-  include_headers_footers: true,
-  include_footnotes_endnotes: true,
-  include_comments: true,
-  clean_format: false,
-}
-
-const taskStore = useTaskStore()
 const confirm = useConfirm()
 const toast = useToast()
 const router = useRouter()
@@ -86,23 +63,7 @@ const { t } = useI18n()
 
 const mainTab = ref<MainTab>('tasks')
 const subTab = ref<SubTab>('all')
-const selectedFile = ref<File | null>(null)
-const threshold = ref(0.6)
 const pageError = ref('')
-const tmCollections = ref<TMCollection[]>([])
-const loadingCollections = ref(false)
-const selectedCollectionIds = ref<string[]>([NO_TM_COLLECTION_ID])
-const termBases = ref<TermBase[]>([])
-const loadingTermBases = ref(false)
-const selectedTermBaseId = ref('')
-const uploadSourceLanguage = ref('')
-const uploadTargetLanguage = ref('')
-const documentParseMode = ref<DocumentParseMode>('full')
-const documentParseOptions = ref<DocumentParseOptions>({ ...DEFAULT_DOCUMENT_PARSE_OPTIONS })
-const uploadCapabilities = ref<UploadCapability[]>([])
-const uploadFileAccept = ref(supportedTaskFileAccept)
-const loadingUploadCapabilities = ref(false)
-const showUploadForm = ref(false)
 const currentPage = ref(1)
 const pageSize = ref(50)
 const selectedIds = ref(new Set<string>())
@@ -125,39 +86,6 @@ const importDialogContext = ref<{
   label: t('taskList.mainTab'),
   sourceLanguage: null,
   targetLanguage: null,
-})
-
-const availableTMCollections = computed(() => {
-  if (!uploadSourceLanguage.value || !uploadTargetLanguage.value) {
-    return tmCollections.value
-  }
-
-  return tmCollections.value.filter((collection) => (
-    (!collection.source_language || collection.source_language === uploadSourceLanguage.value)
-    && (!collection.target_language || collection.target_language === uploadTargetLanguage.value)
-  ))
-})
-
-const selectedUploadCollectionIds = computed(() => (
-  selectedCollectionIds.value.filter((collectionId) => collectionId !== NO_TM_COLLECTION_ID)
-))
-
-const selectedCollectionIdsModel = computed<string[]>({
-  get: () => selectedCollectionIds.value,
-  set: (collectionIds) => {
-    selectedCollectionIds.value = normalizeSelectedCollectionIds(collectionIds)
-  },
-})
-
-const availableTermBases = computed(() => {
-  if (!uploadSourceLanguage.value || !uploadTargetLanguage.value) {
-    return termBases.value
-  }
-
-  return termBases.value.filter((termBase) => (
-    termBase.source_language === uploadSourceLanguage.value
-    && termBase.target_language === uploadTargetLanguage.value
-  ))
 })
 
 const columns = computed<DataTableColumn[]>(() => ([
@@ -214,103 +142,6 @@ async function loadProjects() {
     pageError.value = getErrorMessage(error, t('taskList.errors.load'))
   } finally {
     projectsLoading.value = false
-  }
-}
-
-async function loadTMCollections() {
-  loadingCollections.value = true
-  try {
-    const { data } = await http.get<TMCollection[]>('/translation-memory/collections')
-    tmCollections.value = data
-  } catch (error) {
-    pageError.value = getErrorMessage(error, t('taskList.errors.collectionsLoad'))
-  } finally {
-    loadingCollections.value = false
-  }
-}
-
-async function loadTermBases() {
-  loadingTermBases.value = true
-  try {
-    const { data } = await http.get<TermBase[]>('/term-bases')
-    termBases.value = data
-  } catch (error) {
-    // 术语库加载失败不阻止上传
-    console.error('Failed to load term bases:', error)
-  } finally {
-    loadingTermBases.value = false
-  }
-}
-
-async function loadUploadCapabilities() {
-  loadingUploadCapabilities.value = true
-  try {
-    const { data } = await http.get<UploadCapabilitiesResponse>('/file-records/upload-capabilities')
-    uploadCapabilities.value = data.formats
-    uploadFileAccept.value = data.accept || supportedTaskFileAccept
-  } catch (error) {
-    console.error('Failed to load upload capabilities:', error)
-    uploadCapabilities.value = []
-    uploadFileAccept.value = supportedTaskFileAccept
-  } finally {
-    loadingUploadCapabilities.value = false
-  }
-}
-
-function onFileChange(event: Event) {
-  selectedFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
-}
-
-function normalizeSelectedCollectionIds(collectionIds: string[]) {
-  const availableIds = new Set(availableTMCollections.value.map((collection) => collection.id))
-  const wantsNoCollection = collectionIds.includes(NO_TM_COLLECTION_ID)
-  const hadNoCollection = selectedCollectionIds.value.includes(NO_TM_COLLECTION_ID)
-
-  if (wantsNoCollection && (!hadNoCollection || collectionIds.length === 1)) {
-    return [NO_TM_COLLECTION_ID]
-  }
-
-  const normalizedIds = collectionIds.filter((collectionId) => (
-    collectionId !== NO_TM_COLLECTION_ID && availableIds.has(collectionId)
-  ))
-  return normalizedIds.length > 0 ? normalizedIds : [NO_TM_COLLECTION_ID]
-}
-
-async function uploadFile() {
-  if (!selectedFile.value) {
-    pageError.value = t('taskList.errors.selectFile')
-    return
-  }
-  if (!uploadSourceLanguage.value || !uploadTargetLanguage.value) {
-    pageError.value = t('taskList.errors.selectLanguagePair')
-    return
-  }
-  if (uploadSourceLanguage.value === uploadTargetLanguage.value) {
-    pageError.value = t('projectList.errors.sameLanguage')
-    return
-  }
-
-  pageError.value = ''
-  try {
-    const result = await taskStore.uploadTask(
-      selectedFile.value,
-      threshold.value,
-      selectedUploadCollectionIds.value,
-      selectedTermBaseId.value || null,
-      uploadSourceLanguage.value,
-      uploadTargetLanguage.value,
-      documentParseMode.value,
-      documentParseOptions.value,
-    )
-    selectedFile.value = null
-    const fileInput = document.getElementById('upload-file') as HTMLInputElement | null
-    if (fileInput) {
-      fileInput.value = ''
-    }
-    toast.success(t('taskList.messages.uploaded'))
-    await router.push({ name: 'workbench', params: { id: result.id } })
-  } catch (error) {
-    pageError.value = getErrorMessage(error, t('taskList.errors.upload'))
   }
 }
 
@@ -433,22 +264,9 @@ watch(subTab, () => {
   currentPage.value = 1
 })
 
-watch([uploadSourceLanguage, uploadTargetLanguage], () => {
-  selectedCollectionIds.value = normalizeSelectedCollectionIds(selectedCollectionIds.value)
-  if (
-    selectedTermBaseId.value
-    && !availableTermBases.value.some((termBase) => termBase.id === selectedTermBaseId.value)
-  ) {
-    selectedTermBaseId.value = ''
-  }
-})
-
 onMounted(() => {
   document.addEventListener('click', handleDocumentClick)
   void loadProjects()
-  void loadTMCollections()
-  void loadTermBases()
-  void loadUploadCapabilities()
 })
 
 onBeforeUnmount(() => {
@@ -461,136 +279,6 @@ onBeforeUnmount(() => {
 
 <template>
   <div>
-    <div v-if="showUploadForm" class="upload-panel">
-      <div class="section-title">{{ t('taskList.uploadSection') }}</div>
-      <div class="upload-form upload-form--inline upload-form--task">
-        <label class="field">
-          <span class="field__label">任务文件</span>
-          <input
-            id="upload-file"
-            class="field__control"
-            data-testid="task-upload-file-input"
-            type="file"
-            :accept="uploadFileAccept"
-            @change="onFileChange"
-          />
-        </label>
-
-        <label class="field field--compact">
-          <span class="field__label">{{ t('projectList.form.sourceLanguage') }}</span>
-          <select v-model="uploadSourceLanguage" class="field__control" data-testid="task-upload-source-language">
-            <option value="" disabled>{{ t('projectList.form.sourcePlaceholder') }}</option>
-            <option
-              v-for="lang in languageOptions"
-              :key="lang.code"
-              :value="lang.code"
-              :disabled="lang.code === uploadTargetLanguage"
-            >
-              {{ lang.label }}
-            </option>
-          </select>
-        </label>
-
-        <label class="field field--compact">
-          <span class="field__label">{{ t('projectList.form.targetLanguage') }}</span>
-          <select v-model="uploadTargetLanguage" class="field__control" data-testid="task-upload-target-language">
-            <option value="" disabled>{{ t('projectList.form.targetPlaceholder') }}</option>
-            <option
-              v-for="lang in languageOptions"
-              :key="lang.code"
-              :value="lang.code"
-              :disabled="lang.code === uploadSourceLanguage"
-            >
-              {{ lang.label }}
-            </option>
-          </select>
-        </label>
-
-        <label class="field field--compact">
-          <span class="field__label">{{ t('taskList.fields.threshold') }}</span>
-          <input
-            v-model.number="threshold"
-            class="field__control"
-            type="number"
-            step="0.05"
-            min="0"
-            max="1"
-          />
-        </label>
-
-        <DocumentParseSettings
-          v-model="documentParseMode"
-          v-model:parse-options="documentParseOptions"
-          :capabilities="uploadCapabilities"
-          :selected-files="selectedFile ? [selectedFile] : []"
-          :loading="loadingUploadCapabilities"
-          variant="inline"
-        />
-
-        <label class="field field--collections">
-          <span class="field__label">{{ t('taskList.fields.collections') }}</span>
-          <select
-            v-model="selectedCollectionIdsModel"
-            class="field__control field__control--multi"
-            multiple
-            :disabled="loadingCollections"
-          >
-            <option :value="NO_TM_COLLECTION_ID">
-              {{ t('taskList.fields.noCollection') }}
-            </option>
-            <option v-for="collection in availableTMCollections" :key="collection.id" :value="collection.id">
-              {{ collection.name }}（{{ formatLanguagePair(collection.source_language, collection.target_language) }} / {{ collection.entry_count }} 条）
-            </option>
-          </select>
-          <span class="hint-text">
-            {{ availableTMCollections.length ? t('taskList.hints.collections') : t('taskList.hints.noCollections') }}
-          </span>
-        </label>
-
-        <label class="field field--compact">
-          <span class="field__label">{{ t('taskList.fields.termBase') }}</span>
-          <select
-            v-model="selectedTermBaseId"
-            class="field__control"
-            :disabled="loadingTermBases || availableTermBases.length === 0"
-          >
-            <option value="">{{ t('taskList.hints.noTermBase') }}</option>
-            <option v-for="termBase in availableTermBases" :key="termBase.id" :value="termBase.id">
-              {{ termBase.name }}（{{ formatLanguagePair(termBase.source_language, termBase.target_language) }} / {{ termBase.entry_count }} 条）
-            </option>
-          </select>
-        </label>
-
-        <button
-          class="button button--primary"
-          data-testid="task-upload-submit"
-          type="button"
-          :disabled="taskStore.uploading.active || !selectedFile || !uploadSourceLanguage || !uploadTargetLanguage"
-          @click="uploadFile"
-        >
-          <Loader2 v-if="taskStore.uploading.active" class="lucide-spin" />
-          <Upload v-else />
-          {{ taskStore.uploading.active ? t('taskList.messages.uploading', { percent: taskStore.uploading.percent }) : t('taskList.toolbar.uploadTask') }}
-        </button>
-      </div>
-
-      <div v-if="taskStore.uploading.active" class="task-upload-progress">
-        <div class="progress-bar">
-          <div class="progress-bar__track">
-            <div
-              class="progress-bar__fill"
-              :class="{ 'is-complete': isProgressComplete(taskStore.uploading.percent) }"
-              :style="{ width: `${taskStore.uploading.percent}%` }"
-            />
-          </div>
-          <span class="progress-bar__text">{{ taskStore.uploading.percent }}%</span>
-        </div>
-        <span class="hint-text">{{ t('taskList.messages.uploadingFile', { name: taskStore.uploading.fileName }) }}</span>
-      </div>
-
-      <p v-if="pageError" class="form-message is-error task-page__message">{{ pageError }}</p>
-    </div>
-
     <div class="table-page">
       <div class="table-page__header">
         <div class="tab-bar" style="border-bottom: none;">
@@ -653,10 +341,6 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <div class="table-toolbar__right">
-            <button class="button" data-testid="task-upload-toggle" type="button" @click="showUploadForm = !showUploadForm">
-              <Upload :size="14" />
-              {{ showUploadForm ? t('taskList.toolbar.collapseUpload') : t('taskList.toolbar.uploadTask') }}
-            </button>
             <button
               class="button"
               type="button"
@@ -680,7 +364,7 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <p v-if="pageError && !showUploadForm" class="form-message is-error task-page__message">{{ pageError }}</p>
+        <p v-if="pageError" class="form-message is-error task-page__message">{{ pageError }}</p>
 
         <div class="table-page__body">
           <DataTable
@@ -850,39 +534,6 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.upload-panel {
-  display: grid;
-  gap: 14px;
-  padding: 16px;
-  border: 1px solid var(--line-soft);
-  border-radius: 8px;
-  background: var(--surface-panel);
-  box-shadow: none;
-}
-
-.upload-panel .section-title {
-  margin-bottom: 0;
-  font-size: 15px;
-}
-
-.upload-form--task {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 14px;
-  align-items: start;
-  margin-top: 0;
-}
-
-.upload-form--task > .field:first-child,
-.upload-form--task > .field--collections {
-  grid-column: span 2;
-}
-
-.upload-form--task > .button {
-  align-self: end;
-  min-height: 42px;
-}
-
 .task-subtabs {
   padding: 0 20px;
 }
@@ -893,12 +544,6 @@ onBeforeUnmount(() => {
 
 .task-page__message {
   margin: 0 20px 12px;
-}
-
-.task-upload-progress {
-  display: grid;
-  gap: 8px;
-  margin-top: 12px;
 }
 
 .project-link {
@@ -1012,20 +657,4 @@ onBeforeUnmount(() => {
   background: var(--state-danger-bg);
 }
 
-@media (max-width: 1100px) {
-  .upload-form--task {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
-@media (max-width: 720px) {
-  .upload-form--task {
-    grid-template-columns: 1fr;
-  }
-
-  .upload-form--task > .field:first-child,
-  .upload-form--task > .field--collections {
-    grid-column: auto;
-  }
-}
 </style>

@@ -1,5 +1,6 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
+import axios from 'axios'
 
 import { http } from '../api/http'
 import { pushToast } from '../composables/useToast'
@@ -42,6 +43,17 @@ function isCountedSegmentStatus(status: string): status is 'exact' | 'fuzzy' | '
 
 function hasEmptyTarget(value: string | null | undefined) {
   return !(value || '').trim()
+}
+
+function isEditLockedError(error: unknown) {
+  return axios.isAxiosError(error) && error.response?.status === 409
+}
+
+function getEditLockedMessage(error: unknown) {
+  if (axios.isAxiosError(error)) {
+    return String(error.response?.data?.detail || translate('stores.segment.syncLocked'))
+  }
+  return translate('stores.segment.syncLocked')
 }
 
 export interface SegmentPageQuery {
@@ -125,7 +137,7 @@ export const useSegmentStore = defineStore('segment', () => {
   })
   const pendingRevisionCount = computed(() => (
     Object.values(revisionHistory.value).reduce((count, entries) => (
-      count + entries.filter((entry) => entry.status === 'pending').length
+      count + entries.filter((entry) => entry.status === 'pending' && entry.source === 'manual').length
     ), 0)
   ))
 
@@ -150,6 +162,7 @@ export const useSegmentStore = defineStore('segment', () => {
     }
 
     revisionHistory.value = nextHistory
+    syncRevisionBaselinesFromHistory(nextHistory)
   }
 
   function upsertRevisionEntry(entry: SegmentRevisionEntry) {
@@ -168,11 +181,33 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   function getPendingRevision(sentenceId: string) {
-    return revisionHistory.value[sentenceId]?.find((entry) => entry.status === 'pending') || null
+    return revisionHistory.value[sentenceId]?.find((entry) => (
+      entry.status === 'pending' && entry.source === 'manual'
+    )) || null
   }
 
   function getRevisionTrace(sentenceId: string) {
-    return localRevisionDrafts.value[sentenceId] || null
+    return localRevisionDrafts.value[sentenceId] || getPendingRevision(sentenceId)
+  }
+
+  function syncRevisionBaselinesFromHistory(history: Record<string, SegmentRevisionEntry[]>) {
+    const nextBaselines = { ...localRevisionBaselines.value }
+    let changed = false
+    for (const [sentenceId, entries] of Object.entries(history)) {
+      const pendingRevision = entries.find((entry) => (
+        entry.status === 'pending' && entry.source === 'manual'
+      ))
+      if (!pendingRevision) {
+        continue
+      }
+      if (nextBaselines[sentenceId] !== pendingRevision.before_text) {
+        nextBaselines[sentenceId] = pendingRevision.before_text || ''
+        changed = true
+      }
+    }
+    if (changed) {
+      localRevisionBaselines.value = nextBaselines
+    }
   }
 
   function hasLocalRevisionBaseline(sentenceId: string) {
@@ -641,12 +676,12 @@ export const useSegmentStore = defineStore('segment', () => {
 
   async function syncToBackend() {
     if (!fileRecord.value || dirtyCount.value === 0) {
-      return
+      return true
     }
 
     if (saving.value) {
       scheduleSync()
-      return
+      return false
     }
 
     if (syncTimer !== null) {
@@ -684,6 +719,19 @@ export const useSegmentStore = defineStore('segment', () => {
           time: syncedAt.toLocaleString('zh-CN', { hour12: false }),
         })
       }
+      return true
+    } catch (error) {
+      if (isEditLockedError(error)) {
+        const message = getEditLockedMessage(error)
+        syncMessage.value = message
+        pushToast({
+          tone: 'warn',
+          title: '文件暂时不可编辑',
+          message,
+        })
+        return false
+      }
+      throw error
     } finally {
       saving.value = false
     }
@@ -792,7 +840,10 @@ export const useSegmentStore = defineStore('segment', () => {
       syncTimer = null
     }
     if (dirtyCount.value > 0) {
-      await syncToBackend()
+      const synced = await syncToBackend()
+      if (!synced) {
+        return
+      }
     }
 
     llmRunning.value = true
@@ -954,7 +1005,10 @@ export const useSegmentStore = defineStore('segment', () => {
     }
 
     if (dirtyCount.value > 0) {
-      await syncToBackend()
+      const synced = await syncToBackend()
+      if (!synced) {
+        return
+      }
     }
 
     const response = await http.get(`/file-records/${fileRecord.value.id}/export`, {

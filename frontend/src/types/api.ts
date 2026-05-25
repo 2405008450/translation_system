@@ -22,12 +22,60 @@ export interface InitStatusResponse {
   message: string | null
 }
 
+export type AnalyticsGranularity = 'day' | 'month'
+
+export interface AnalyticsSummary {
+  total_projects: number
+  total_files: number
+  total_source_word_count: number
+  translated_source_word_count: number
+  llm_processed_source_word_count: number
+  active_users_today: number
+  translation_progress: number
+}
+
+export interface AnalyticsSeriesPoint {
+  bucket: string
+  project_created_count: number
+  translated_source_word_count: number
+  llm_processed_source_word_count: number
+  active_user_count: number
+}
+
+export interface AnalyticsLanguagePair {
+  source_language: string | null
+  target_language: string | null
+  project_count: number
+  file_count: number
+  translated_source_word_count: number
+  llm_processed_source_word_count: number
+}
+
+export interface AnalyticsSourceBreakdown {
+  source: string
+  label: string
+  event_count: number
+  source_word_count: number
+}
+
+export interface AnalyticsDashboardResponse {
+  granularity: AnalyticsGranularity
+  summary: AnalyticsSummary
+  series: AnalyticsSeriesPoint[]
+  language_pairs: AnalyticsLanguagePair[]
+  source_breakdown: AnalyticsSourceBreakdown[]
+}
+
 export interface FileRecordSummary {
   id: string
   filename: string
   status: string
+  active_operation?: string | null
+  active_operation_message?: string
+  is_edit_locked?: boolean
   document_parse_mode?: DocumentParseMode
   document_parse_options?: DocumentParseOptions
+  document_statistics?: DocumentStatistics
   source_language: string | null
   target_language: string | null
   created_at: string
@@ -41,6 +89,26 @@ export interface DocumentParseOptions {
   include_footnotes_endnotes: boolean
   include_comments: boolean
   clean_format: boolean
+  translate_code_blocks: boolean
+  extract_links: boolean
+  skip_non_translatable: boolean
+  xml_inline_elements_no_split: boolean
+  custom_parse_config: boolean
+  translate_idml_comments: boolean
+  translate_idml_hidden_layers: boolean
+}
+
+export interface DocumentStatistics {
+  source: string
+  engine: string | null
+  license_status: string | null
+  include_textboxes_footnotes_endnotes: boolean | null
+  pages: number | null
+  words: number | null
+  characters: number | null
+  characters_with_spaces: number | null
+  paragraphs: number | null
+  lines: number | null
 }
 
 export interface UploadParseMode {
@@ -61,7 +129,10 @@ export interface UploadCapability {
     id: keyof DocumentParseOptions
     label: string
     default: boolean
+    disabled?: boolean
+    description?: string
   }>
+  settings_select_all?: boolean
   features: string[]
 }
 
@@ -117,8 +188,12 @@ export interface FileRecordDetail {
   project_id: string | null
   filename: string
   status: string
+  active_operation: string | null
+  active_operation_message: string
+  is_edit_locked: boolean
   document_parse_mode: DocumentParseMode
   document_parse_options: DocumentParseOptions
+  document_statistics: DocumentStatistics
   source_language: string | null
   target_language: string | null
   collection_id: string | null

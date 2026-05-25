@@ -12,6 +12,7 @@ class Settings(BaseSettings):
         default="postgresql+psycopg://postgres:postgres@localhost:5432/tm_demo" 
     )
     file_storage_dir: str = "data/file_records"
+    export_task_dir: str = "data/export_tasks"
     upload_max_size_mb: int = 10
     default_similarity_threshold: float = 0.80
     deepseek_api_key: str | None = None
@@ -26,6 +27,7 @@ class Settings(BaseSettings):
     llm_retry_attempts_per_provider: int = 2
     redis_url: str | None = None
     import_queue_backend: str = "local"
+    aspose_words_license_path: str | None = None
     tm_vector_enabled: bool = True
     tm_vector_dimensions: int = 128
     tm_vector_candidate_limit: int = 6

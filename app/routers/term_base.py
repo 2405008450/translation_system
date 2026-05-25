@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
@@ -14,6 +15,12 @@ from app.database import get_db
 from app.models import FileRecord, TermBase, TermEntry, User
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import normalize_match_text, normalize_text
+from app.services.resource_export_queue import (
+    ResourceExportFormat,
+    build_resource_export_download_response,
+    ensure_export_task_status,
+    queue_resource_export,
+)
 from app.services.term_entry_service import (
     build_term_entry_conflict_items,
     save_term_entries_batch,
@@ -580,6 +587,33 @@ def export_term_base_entries_xlsx(
         ],
     )
     return build_xlsx_download_response(f"{term_base.name}-term-base.xlsx", xlsx_bytes)
+
+
+@router.post("/term-bases/{term_base_id}/exports")
+def queue_term_base_export(
+    term_base_id: UUID,
+    format: ResourceExportFormat = Query(default="xlsx"),
+    db: Session = Depends(get_db),
+):
+    term_base = _get_term_base_or_404(db, term_base_id)
+    return JSONResponse(
+        status_code=202,
+        content=queue_resource_export(
+            resource_type="term",
+            resource_id=term_base.id,
+            export_format=format,
+        ),
+    )
+
+
+@router.get("/term-bases/export-tasks/{task_id}")
+def get_term_base_export_task(task_id: str):
+    return ensure_export_task_status(task_id, expected_resource_type="term")
+
+
+@router.get("/term-bases/export-tasks/{task_id}/download")
+def download_term_base_export_task(task_id: str):
+    return build_resource_export_download_response(task_id, expected_resource_type="term")
 
 
 @router.post("/term-bases/{term_base_id}/entries")

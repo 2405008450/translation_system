@@ -24,7 +24,7 @@ import {
   Users,
   RotateCcw,
 } from 'lucide-vue-next'
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 
@@ -44,7 +44,7 @@ import TermExtractionDialog from '../components/TermExtractionDialog.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
 import { useToast } from '../composables/useToast'
-import { getLanguageLabel, languageOptions } from '../constants/languages'
+import { formatLanguagePair, getLanguageLabel, languageOptions } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
 import { buildTranslatedTaskFilename, supportedTaskFileAccept } from '../constants/taskFiles'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
@@ -52,6 +52,7 @@ import { getProgressStyle, isProgressComplete } from '../utils/progress'
 import type {
   DocumentParseMode,
   DocumentParseOptions,
+  DocumentStatistics,
   IssueMarker,
   IssueStatus,
   UploadCapabilitiesResponse,
@@ -63,6 +64,15 @@ const props = defineProps<{
 }>()
 
 type ProjectTab = 'files' | 'issues' | 'settings' | 'stats' | 'summary' | 'quote'
+type AccessLevel = 'team' | 'private' | 'public'
+type DocumentStatisticNumberKey =
+  | 'pages'
+  | 'words'
+  | 'characters'
+  | 'characters_with_spaces'
+  | 'paragraphs'
+  | 'lines'
+type DocumentStatisticsTotals = Record<DocumentStatisticNumberKey, number | null>
 
 interface ProjectDetail {
   id: string
@@ -77,7 +87,7 @@ interface ProjectDetail {
   target_language: string | null
   creator: string | null
   deadline: string | null
-  access_level: string | null
+  access_level: AccessLevel | null
   translation_guidelines: string
   term_base_id: string | null
   created_at: string
@@ -95,8 +105,12 @@ interface ProjectFileItem {
   project_id: string | null
   filename: string
   status: string
+  active_operation: string | null
+  active_operation_message: string
+  is_edit_locked: boolean
   document_parse_mode: DocumentParseMode
   document_parse_options: DocumentParseOptions
+  document_statistics?: DocumentStatistics
   progress: number
   total_segments: number
   translated_segments: number
@@ -104,7 +118,7 @@ interface ProjectFileItem {
   target_language: string | null
   creator: string | null
   deadline: string | null
-  access_level: string | null
+  access_level: AccessLevel | null
   created_at: string
   updated_at: string
   has_source_document: boolean
@@ -125,6 +139,10 @@ interface PreTranslateProgressPayload extends PreTranslateProgressState {
   fileId: string
 }
 
+interface ProjectDocumentStatisticsResponse {
+  files: ProjectFileItem[]
+}
+
 type LanguageDetectTone = 'info' | 'success' | 'warning' | 'error'
 
 const DEFAULT_DOCUMENT_PARSE_OPTIONS: DocumentParseOptions = {
@@ -132,7 +150,23 @@ const DEFAULT_DOCUMENT_PARSE_OPTIONS: DocumentParseOptions = {
   include_footnotes_endnotes: true,
   include_comments: true,
   clean_format: false,
+  translate_code_blocks: true,
+  extract_links: false,
+  skip_non_translatable: true,
+  xml_inline_elements_no_split: true,
+  custom_parse_config: false,
+  translate_idml_comments: false,
+  translate_idml_hidden_layers: false,
 }
+
+const DOCUMENT_STATISTIC_NUMBER_KEYS: DocumentStatisticNumberKey[] = [
+  'pages',
+  'words',
+  'characters',
+  'characters_with_spaces',
+  'paragraphs',
+  'lines',
+]
 
 interface LanguageDetectResponse {
   language: string | null
@@ -155,6 +189,7 @@ const loading = ref(false)
 const deleting = ref(false)
 const duplicating = ref(false)
 const uploading = ref(false)
+const statisticsLoading = ref(false)
 const uploadPercent = ref(0)
 const project = ref<ProjectDetail | null>(null)
 const pageError = ref('')
@@ -183,6 +218,15 @@ const actionMenuStyle = ref<Record<string, string>>({})
 const currentPage = ref(1)
 const pageSize = ref(10)
 const selectedFileIds = ref(new Set<string>())
+const statisticsSelectedFileIds = ref(new Set<string>())
+const statisticsResultFileIds = ref(new Set<string>())
+const settingsForm = reactive({
+  name: '',
+  deadline: '',
+  access_level: 'team' as AccessLevel,
+})
+const settingsError = ref('')
+const savingSettings = ref(false)
 const guidelinesText = ref('')
 const savingGuidelines = ref(false)
 const preTranslateProgressByFileId = ref<Record<string, PreTranslateProgressState>>({})
@@ -200,7 +244,7 @@ const tabs = computed(() => ([
     disabled: false,
   },
   { key: 'settings' as const, label: t('projectDetail.tabs.settings'), disabled: false },
-  { key: 'stats' as const, label: t('projectDetail.tabs.stats'), disabled: true },
+  { key: 'stats' as const, label: t('projectDetail.tabs.stats'), disabled: false },
   { key: 'summary' as const, label: t('projectDetail.tabs.summary'), disabled: true },
   { key: 'quote' as const, label: t('projectDetail.tabs.quote'), disabled: true },
 ]))
@@ -221,6 +265,30 @@ const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
 const selectedProjectFiles = computed(() => (
   tableRows.value.filter((row) => selectedFileIds.value.has(row.id))
 ))
+const hasSelectedLockedFile = computed(() => selectedProjectFiles.value.some((row) => row.is_edit_locked))
+const statisticsSelectedFiles = computed(() => (
+  tableRows.value.filter((row) => statisticsSelectedFileIds.value.has(row.id))
+))
+const statisticsResultRows = computed(() => (
+  tableRows.value.filter((row) => statisticsResultFileIds.value.has(row.id))
+))
+const canGenerateStatistics = computed(() => statisticsSelectedFileIds.value.size > 0 && !statisticsLoading.value)
+const statisticsAvailableCount = computed(() => (
+  statisticsResultRows.value.filter((row) => hasAnyDocumentStatistic(row.document_statistics)).length
+))
+const statisticsTotals = computed<DocumentStatisticsTotals>(() => {
+  const totals = createEmptyStatisticsTotals()
+  for (const row of statisticsResultRows.value) {
+    for (const key of DOCUMENT_STATISTIC_NUMBER_KEYS) {
+      const value = getStatisticNumber(row.document_statistics, key)
+      if (value == null) {
+        continue
+      }
+      totals[key] = (totals[key] ?? 0) + value
+    }
+  }
+  return totals
+})
 const selectedTermExtractionFile = computed<ProjectFileItem | null>(() => (
   selectedProjectFiles.value.length === 1 ? selectedProjectFiles.value[0] : null
 ))
@@ -231,7 +299,11 @@ const selectedTermExtractionTargetLanguage = computed(() => (
   selectedTermExtractionFile.value?.target_language || project.value?.target_language || ''
 ))
 const preTranslateButtonTitle = computed(() => (
-  selectedFileIds.value.size === 0 ? t('projectDetail.preTranslate.selectFileFirst') : ''
+  selectedFileIds.value.size === 0
+    ? t('projectDetail.preTranslate.selectFileFirst')
+    : hasSelectedLockedFile.value
+      ? t('projectDetail.preTranslate.fileLocked')
+      : ''
 ))
 const termExtractionButtonTitle = computed(() => {
   if (selectedFileIds.value.size === 0) {
@@ -277,10 +349,62 @@ const columns = computed<DataTableColumn[]>(() => ([
   { key: 'file_size_bytes', label: t('projectDetail.files.columns.size'), width: '120px', align: 'right' },
 ]))
 
+const statisticsFileColumns = computed<DataTableColumn[]>(() => ([
+  { key: 'filename', label: t('projectDetail.stats.columns.file'), width: '320px' },
+  { key: 'source_language', label: t('projectList.form.sourceLanguage'), width: '130px' },
+  { key: 'target_language', label: t('projectDetail.files.columns.targetLang'), width: '130px' },
+  { key: 'status', label: t('projectDetail.files.columns.status'), width: '120px' },
+  { key: 'statistics_status', label: t('projectDetail.stats.columns.statisticsStatus'), width: '160px' },
+]))
+
 const canOpenUploadModal = computed(() => Boolean(project.value))
 const canOpenIssueDialog = computed(() => Boolean(project.value))
 
 const uploadButtonTitle = computed(() => '')
+
+const accessOptions = computed(() => ([
+  { value: 'team' as const, label: t('projectList.form.team') },
+  { value: 'private' as const, label: t('projectList.form.private') },
+  { value: 'public' as const, label: t('projectList.form.public') },
+]))
+
+const projectFileLanguagePairs = computed(() => {
+  const pairs = new Map<string, { source: string; target: string }>()
+  for (const file of tableRows.value) {
+    if (!file.source_language || !file.target_language) {
+      continue
+    }
+    pairs.set(`${file.source_language}->${file.target_language}`, {
+      source: file.source_language,
+      target: file.target_language,
+    })
+  }
+  return Array.from(pairs.values())
+})
+
+const effectiveProjectSourceLanguage = computed(() => {
+  if (project.value?.source_language) {
+    return project.value.source_language
+  }
+  const sources = new Set(projectFileLanguagePairs.value.map((pair) => pair.source))
+  return sources.size === 1 ? Array.from(sources)[0] : null
+})
+
+const effectiveProjectTargetLanguage = computed(() => {
+  if (project.value?.target_language) {
+    return project.value.target_language
+  }
+  const targets = new Set(projectFileLanguagePairs.value.map((pair) => pair.target))
+  return targets.size === 1 ? Array.from(targets)[0] : null
+})
+
+const projectLanguagePairLabel = computed(() => (
+  project.value?.source_language && project.value?.target_language
+    ? formatLanguagePair(project.value.source_language, project.value.target_language)
+    : projectFileLanguagePairs.value.length > 1
+      ? t('projectDetail.settings.multipleLanguagePairs', { count: projectFileLanguagePairs.value.length })
+      : formatLanguagePair(effectiveProjectSourceLanguage.value, effectiveProjectTargetLanguage.value)
+))
 
 const uploadFilePreview = computed(() => selectedFiles.value.slice(0, 3).map((file) => file.name))
 const uploadSupportedSummary = computed(() => {
@@ -345,6 +469,28 @@ function formatDateText(value: string | null) {
   return parts.time ? `${parts.date} ${parts.time}` : parts.date
 }
 
+function formatDateTimeLocalValue(value: string | null) {
+  if (!value) {
+    return ''
+  }
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return ''
+  }
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return [
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
+    `${pad(date.getHours())}:${pad(date.getMinutes())}`,
+  ].join('T')
+}
+
+function syncSettingsForm(data: ProjectDetail) {
+  settingsForm.name = data.name || data.filename || ''
+  settingsForm.deadline = formatDateTimeLocalValue(data.deadline)
+  settingsForm.access_level = data.access_level || 'team'
+  settingsError.value = ''
+}
+
 function formatStatus(value: string) {
   return getFileStatusMeta(value).label
 }
@@ -371,11 +517,89 @@ function formatBytes(value: number | null | undefined) {
   return `${size.toFixed(decimals)} ${units[unitIndex]}`
 }
 
+function createEmptyStatisticsTotals(): DocumentStatisticsTotals {
+  return {
+    pages: null,
+    words: null,
+    characters: null,
+    characters_with_spaces: null,
+    paragraphs: null,
+    lines: null,
+  }
+}
+
+function getStatisticNumber(
+  statistics: DocumentStatistics | null | undefined,
+  key: DocumentStatisticNumberKey,
+) {
+  const value = statistics?.[key]
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function hasAnyDocumentStatistic(statistics: DocumentStatistics | null | undefined) {
+  return DOCUMENT_STATISTIC_NUMBER_KEYS.some((key) => getStatisticNumber(statistics, key) != null)
+}
+
+function formatStatisticNumber(value: number | null | undefined) {
+  if (value == null || Number.isNaN(value)) {
+    return getPlaceholder()
+  }
+  return new Intl.NumberFormat('zh-CN').format(value)
+}
+
+function getStatisticsSourceLabel(statistics: DocumentStatistics | null | undefined) {
+  if (!statistics?.source) {
+    return t('projectDetail.stats.sources.notReady')
+  }
+  if (statistics.source === 'aspose') {
+    return t('projectDetail.stats.sources.aspose')
+  }
+  if (statistics.source === 'openxml_computed') {
+    return t('projectDetail.stats.sources.openxmlComputed')
+  }
+  if (statistics.source === 'docprops_cached') {
+    return t('projectDetail.stats.sources.docpropsCached')
+  }
+  if (statistics.source === 'unavailable') {
+    return t('projectDetail.stats.sources.unavailable')
+  }
+  return statistics.source
+}
+
+function getStatisticsLicenseLabel(statistics: DocumentStatistics | null | undefined) {
+  const status = statistics?.license_status
+  if (!status) {
+    return getPlaceholder()
+  }
+  const labelKey = `projectDetail.stats.licenseStatus.${status}`
+  const label = t(labelKey)
+  return label === labelKey ? status : label
+}
+
+function getStatisticsStatusClass(statistics: DocumentStatistics | null | undefined) {
+  if (!statistics?.source) {
+    return 'project-status--default'
+  }
+  if (statistics.source === 'aspose') {
+    return 'project-status--success'
+  }
+  if (statistics.source === 'openxml_computed') {
+    return 'project-status--info'
+  }
+  if (statistics.source === 'docprops_cached') {
+    return 'project-status--warning'
+  }
+  return 'project-status--default'
+}
+
 function canEnterWorkbench(row: ProjectRow) {
-  return Number(row.total_segments ?? 0) > 0
+  return Number(row.total_segments ?? 0) > 0 && !row.is_edit_locked
 }
 
 function getFileDetailHint(row: ProjectRow) {
+  if (row.is_edit_locked) {
+    return row.active_operation_message || t('projectDetail.files.editLockedHint')
+  }
   if (canEnterWorkbench(row)) {
     return t('projectDetail.files.openHint')
   }
@@ -434,7 +658,7 @@ function closeUploadDialog() {
 }
 
 function openPreTranslateDialog() {
-  if (selectedFileIds.value.size === 0) {
+  if (selectedFileIds.value.size === 0 || hasSelectedLockedFile.value) {
     return
   }
   const hasRunningProgress = Object.values(preTranslateProgressByFileId.value).some((state) => state.running)
@@ -496,11 +720,11 @@ function getFileDisplayProgress(row: ProjectRow) {
 
 function getFileDisplayProgressStatus(row: ProjectRow) {
   const state = preTranslateProgressByFileId.value[String(row.id)]
-  return state && state.progress < 100 ? 'processing' : String(row.status || '')
+  return (state && state.progress < 100) || row.is_edit_locked ? 'processing' : String(row.status || '')
 }
 
 function getFileDisplayProgressMessage(row: ProjectRow) {
-  return preTranslateProgressByFileId.value[String(row.id)]?.status || ''
+  return preTranslateProgressByFileId.value[String(row.id)]?.status || row.active_operation_message || ''
 }
 
 function openProjectIssueDialog() {
@@ -611,6 +835,48 @@ function goBack() {
   void router.push(backRoute.value)
 }
 
+function switchProjectTab(tab: ProjectTab) {
+  activeTab.value = tab
+  if (tab === 'stats' && statisticsSelectedFileIds.value.size === 0 && selectedFileIds.value.size > 0) {
+    statisticsSelectedFileIds.value = new Set(selectedFileIds.value)
+  }
+}
+
+function updateStatisticsSelectedFileIds(ids: Set<string>) {
+  statisticsSelectedFileIds.value = new Set(ids)
+}
+
+async function generateDocumentStatisticsTable() {
+  if (!project.value || !canGenerateStatistics.value) {
+    return
+  }
+  statisticsLoading.value = true
+  pageError.value = ''
+  const fileIds = Array.from(statisticsSelectedFileIds.value)
+
+  try {
+    const { data } = await http.post<ProjectDocumentStatisticsResponse>(
+      `/projects/${project.value.id}/document-statistics`,
+      { file_ids: fileIds },
+    )
+    const updatedFiles = new Map(data.files.map((file) => [file.id, file]))
+    project.value = {
+      ...project.value,
+      files: project.value.files.map((file) => updatedFiles.get(file.id) ?? file),
+    }
+    statisticsResultFileIds.value = new Set(fileIds)
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('projectDetail.errors.statistics'))
+  } finally {
+    statisticsLoading.value = false
+  }
+}
+
+function clearDocumentStatisticsTable() {
+  statisticsSelectedFileIds.value = new Set<string>()
+  statisticsResultFileIds.value = new Set<string>()
+}
+
 function openWorkbench(row: ProjectRow) {
   if (!canEnterWorkbench(row)) {
     return
@@ -655,9 +921,12 @@ async function loadProject() {
   try {
     const { data } = await http.get<ProjectDetail>(`/projects/${props.id}`)
     project.value = data
+    syncSettingsForm(data)
     guidelinesText.value = data.translation_guidelines || ''
     currentPage.value = 1
     selectedFileIds.value = new Set<string>()
+    statisticsSelectedFileIds.value = new Set<string>()
+    statisticsResultFileIds.value = new Set<string>()
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.load'))
   } finally {
@@ -677,6 +946,52 @@ async function loadUploadCapabilities() {
     uploadFileAccept.value = supportedTaskFileAccept
   } finally {
     loadingUploadCapabilities.value = false
+  }
+}
+
+async function saveProjectSettings() {
+  if (!project.value || savingSettings.value) {
+    return
+  }
+
+  const name = settingsForm.name.trim()
+  if (!name) {
+    settingsError.value = t('projectDetail.settings.nameRequired')
+    return
+  }
+
+  savingSettings.value = true
+  settingsError.value = ''
+  try {
+    const { data } = await http.patch<Partial<ProjectDetail>>(`/projects/${project.value.id}`, {
+      name,
+      deadline: settingsForm.deadline || null,
+      access_level: settingsForm.access_level,
+    })
+    const updatedProject: ProjectDetail = {
+      ...project.value,
+      name: data.name ?? name,
+      filename: data.filename ?? data.name ?? name,
+      deadline: data.deadline ?? (settingsForm.deadline || null),
+      access_level: data.access_level ?? settingsForm.access_level,
+      updated_at: data.updated_at ?? project.value.updated_at,
+    }
+    project.value = updatedProject
+    syncSettingsForm(updatedProject)
+    toast.show({
+      tone: 'success',
+      title: t('projectDetail.settings.basicSaved'),
+      message: '',
+    })
+  } catch (error) {
+    settingsError.value = getErrorMessage(error, t('projectDetail.settings.basicSaveFailed'))
+    toast.show({
+      tone: 'error',
+      title: t('projectDetail.settings.basicSaveFailed'),
+      message: settingsError.value,
+    })
+  } finally {
+    savingSettings.value = false
   }
 }
 
@@ -1138,7 +1453,7 @@ onBeforeUnmount(() => {
         type="button"
         :disabled="tab.disabled"
         :title="tab.disabled ? t('projectDetail.common.comingSoon') : undefined"
-        @click="activeTab = tab.key"
+        @click="!tab.disabled && switchProjectTab(tab.key)"
       >
         {{ tab.label }}
       </button>
@@ -1175,6 +1490,10 @@ onBeforeUnmount(() => {
                 {{ formatStatus(project.status) }}
               </span>
             </span>
+          </label>
+          <label class="pd-field">
+            <span class="pd-field__label">{{ t('projectDetail.base.languagePair') }}</span>
+            <span class="pd-field__value">{{ projectLanguagePairLabel }}</span>
           </label>
           <label class="pd-field">
             <span class="pd-field__label">{{ t('projectDetail.base.workflow') }}</span>
@@ -1220,12 +1539,92 @@ onBeforeUnmount(() => {
       <section v-if="activeTab === 'settings'" class="panel">
         <div class="pd-panel-head">
           <div class="pd-panel-head__copy">
-            <div class="section-title section-title--tight">{{ t('projectDetail.settings.guidelinesTitle') }}</div>
-            <p class="panel-subtitle">{{ t('projectDetail.settings.guidelinesDescription') }}</p>
+            <div class="section-title section-title--tight">{{ t('projectDetail.settings.basicTitle') }}</div>
+            <p class="panel-subtitle">{{ t('projectDetail.settings.basicDescription') }}</p>
           </div>
         </div>
 
         <div class="pd-settings-form">
+          <div class="pd-settings-list">
+            <label class="field pd-settings-row pd-settings-row--name">
+              <span class="field__label">{{ t('projectDetail.settings.nameLabel') }} <span class="field__required">*</span></span>
+              <input
+                v-model="settingsForm.name"
+                class="field__control pd-settings-control pd-settings-control--name"
+                data-testid="project-settings-name"
+                type="text"
+                maxlength="200"
+                :placeholder="t('projectDetail.settings.namePlaceholder')"
+              />
+            </label>
+
+            <label class="field pd-settings-row">
+              <span class="field__label">{{ t('projectDetail.settings.deadlineLabel') }}</span>
+              <input
+                v-model="settingsForm.deadline"
+                class="field__control pd-settings-control"
+                data-testid="project-settings-deadline"
+                type="datetime-local"
+              />
+            </label>
+
+            <label class="field pd-settings-row">
+              <span class="field__label">{{ t('projectDetail.settings.accessLevelLabel') }}</span>
+              <select
+                v-model="settingsForm.access_level"
+                class="field__control pd-settings-control"
+                data-testid="project-settings-access-level"
+              >
+                <option v-for="option in accessOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </option>
+              </select>
+            </label>
+          </div>
+
+          <div class="pd-readonly-grid">
+            <label class="pd-readonly-field">
+              <span class="field__label">{{ t('projectDetail.base.languagePair') }}</span>
+              <span class="pd-readonly-value">{{ projectLanguagePairLabel }}</span>
+            </label>
+            <label class="pd-readonly-field">
+              <span class="field__label">{{ t('projectList.form.sourceLanguage') }}</span>
+              <span class="pd-readonly-value">{{ getLanguageLabel(effectiveProjectSourceLanguage) }}</span>
+            </label>
+            <label class="pd-readonly-field">
+              <span class="field__label">{{ t('projectList.form.targetLanguage') }}</span>
+              <span class="pd-readonly-value">{{ getLanguageLabel(effectiveProjectTargetLanguage) }}</span>
+            </label>
+            <label class="pd-readonly-field">
+              <span class="field__label">{{ t('projectDetail.base.createdAt') }}</span>
+              <span class="pd-readonly-value">{{ formatDateText(project.created_at) }}</span>
+            </label>
+          </div>
+
+          <p class="hint-text">{{ t('projectDetail.settings.languageLockedHint') }}</p>
+          <p v-if="settingsError" class="form-message is-error">{{ settingsError }}</p>
+
+          <div class="pd-settings-actions">
+            <button
+              class="button button--primary pd-settings-save"
+              data-testid="project-settings-save"
+              type="button"
+              :disabled="savingSettings"
+              @click="saveProjectSettings"
+            >
+              <Loader2 v-if="savingSettings" class="lucide-spin" :size="14" />
+              <Settings2 v-else :size="14" />
+              {{ savingSettings ? t('common.actions.saving') : t('projectDetail.settings.saveBasic') }}
+            </button>
+          </div>
+
+          <div class="pd-settings-divider" aria-hidden="true" />
+
+          <div class="pd-settings-section-head">
+            <div class="section-title section-title--tight">{{ t('projectDetail.settings.guidelinesTitle') }}</div>
+            <p class="panel-subtitle">{{ t('projectDetail.settings.guidelinesDescription') }}</p>
+          </div>
+
           <label class="field field--full">
             <span class="field__label">{{ t('projectDetail.settings.guidelinesLabel') }}</span>
             <textarea
@@ -1341,7 +1740,7 @@ onBeforeUnmount(() => {
             <button
               class="button"
               type="button"
-              :disabled="selectedFileIds.size === 0"
+              :disabled="selectedFileIds.size === 0 || hasSelectedLockedFile"
               :title="preTranslateButtonTitle || undefined"
               @click="openPreTranslateDialog"
             >
@@ -1566,6 +1965,161 @@ onBeforeUnmount(() => {
           @update:page="currentPage = $event"
           @update:page-size="pageSize = $event"
         />
+      </section>
+
+      <section v-if="activeTab === 'stats'" class="panel">
+        <div class="pd-panel-head">
+          <div class="pd-panel-head__copy">
+            <div class="section-title section-title--tight">{{ t('projectDetail.stats.title') }}</div>
+            <p class="panel-subtitle">{{ t('projectDetail.stats.description') }}</p>
+          </div>
+        </div>
+
+        <div class="table-toolbar pd-toolbar">
+          <div class="table-toolbar__left pd-toolbar__left">
+            <button
+              class="button button--primary"
+              data-testid="project-statistics-generate"
+              type="button"
+              :disabled="!canGenerateStatistics"
+              :title="statisticsSelectedFileIds.size === 0 ? t('projectDetail.stats.selectFileFirst') : undefined"
+              @click="generateDocumentStatisticsTable"
+            >
+              <Loader2 v-if="statisticsLoading" class="lucide-spin" :size="14" />
+              <Check v-else :size="14" />
+              {{ statisticsLoading ? t('projectDetail.stats.generating') : t('projectDetail.stats.generate') }}
+            </button>
+            <button
+              class="button"
+              type="button"
+              :disabled="statisticsLoading || (statisticsSelectedFileIds.size === 0 && statisticsResultFileIds.size === 0)"
+              @click="clearDocumentStatisticsTable"
+            >
+              <RotateCcw :size="14" />
+              {{ t('projectDetail.stats.clear') }}
+            </button>
+          </div>
+          <div class="table-toolbar__right pd-toolbar__right">
+            <span class="pd-statistics-selection">
+              {{ t('projectDetail.stats.selectedCount', { count: statisticsSelectedFiles.length }) }}
+            </span>
+          </div>
+        </div>
+
+        <DataTable
+          class="pd-file-table pd-statistics-file-table"
+          test-id="project-statistics-file-table"
+          row-test-id-prefix="project-statistics-file-row"
+          :columns="statisticsFileColumns"
+          :data="tableRows"
+          :loading="loading || statisticsLoading"
+          :selectable="true"
+          :selected-ids="statisticsSelectedFileIds"
+          :show-index="true"
+          :empty-text="t('projectDetail.files.empty')"
+          @select="updateStatisticsSelectedFileIds"
+        >
+          <template #filename="{ row }">
+            <div class="pd-file-cell">
+              <FileText class="pd-file-cell__icon" :size="18" />
+              <div class="pd-file-cell__content">
+                <span class="pd-file-cell__title" :title="row.filename">{{ row.filename }}</span>
+                <span class="pd-file-cell__meta">{{ formatBytes(row.file_size_bytes) }}</span>
+              </div>
+            </div>
+          </template>
+
+          <template #source_language="{ row }">
+            <span>{{ row.source_language ? getLanguageLabel(row.source_language) : getPlaceholder() }}</span>
+          </template>
+
+          <template #target_language="{ row }">
+            <span>{{ row.target_language ? getLanguageLabel(row.target_language) : getPlaceholder() }}</span>
+          </template>
+
+          <template #status="{ row }">
+            <span class="project-status" :class="getStatusClass(row.status)">
+              {{ formatStatus(row.status) }}
+            </span>
+          </template>
+
+          <template #statistics_status="{ row }">
+            <span class="project-status" :class="getStatisticsStatusClass(row.document_statistics)">
+              {{ getStatisticsSourceLabel(row.document_statistics) }}
+            </span>
+          </template>
+        </DataTable>
+
+        <div v-if="statisticsResultRows.length > 0" class="pd-statistics-result">
+          <div class="pd-statistics-summary">
+            <div class="pd-statistics-summary__item">
+              <span>{{ t('projectDetail.stats.summary.files') }}</span>
+              <strong>{{ formatStatisticNumber(statisticsResultRows.length) }}</strong>
+            </div>
+            <div class="pd-statistics-summary__item">
+              <span>{{ t('projectDetail.stats.summary.available') }}</span>
+              <strong>{{ formatStatisticNumber(statisticsAvailableCount) }}</strong>
+            </div>
+            <div class="pd-statistics-summary__item">
+              <span>{{ t('projectDetail.stats.columns.words') }}</span>
+              <strong>{{ formatStatisticNumber(statisticsTotals.words) }}</strong>
+            </div>
+            <div class="pd-statistics-summary__item">
+              <span>{{ t('projectDetail.stats.columns.charactersWithSpaces') }}</span>
+              <strong>{{ formatStatisticNumber(statisticsTotals.characters_with_spaces) }}</strong>
+            </div>
+          </div>
+
+          <div class="pd-statistics-grid-wrap">
+            <table class="pd-statistics-grid">
+              <thead>
+                <tr>
+                  <th>{{ t('projectDetail.stats.columns.file') }}</th>
+                  <th>{{ t('projectDetail.stats.columns.source') }}</th>
+                  <th>{{ t('projectDetail.stats.columns.pages') }}</th>
+                  <th>{{ t('projectDetail.stats.columns.words') }}</th>
+                  <th>{{ t('projectDetail.stats.columns.characters') }}</th>
+                  <th>{{ t('projectDetail.stats.columns.charactersWithSpaces') }}</th>
+                  <th>{{ t('projectDetail.stats.columns.paragraphs') }}</th>
+                  <th>{{ t('projectDetail.stats.columns.lines') }}</th>
+                  <th>{{ t('projectDetail.stats.columns.license') }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in statisticsResultRows" :key="row.id">
+                  <td>
+                    <span class="pd-statistics-file-name" :title="row.filename">{{ row.filename }}</span>
+                  </td>
+                  <td>{{ getStatisticsSourceLabel(row.document_statistics) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'pages')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'words')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'characters')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'characters_with_spaces')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'paragraphs')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'lines')) }}</td>
+                  <td>{{ getStatisticsLicenseLabel(row.document_statistics) }}</td>
+                </tr>
+              </tbody>
+              <tfoot>
+                <tr>
+                  <th>{{ t('projectDetail.stats.total') }}</th>
+                  <td>{{ getPlaceholder() }}</td>
+                  <td>{{ formatStatisticNumber(statisticsTotals.pages) }}</td>
+                  <td>{{ formatStatisticNumber(statisticsTotals.words) }}</td>
+                  <td>{{ formatStatisticNumber(statisticsTotals.characters) }}</td>
+                  <td>{{ formatStatisticNumber(statisticsTotals.characters_with_spaces) }}</td>
+                  <td>{{ formatStatisticNumber(statisticsTotals.paragraphs) }}</td>
+                  <td>{{ formatStatisticNumber(statisticsTotals.lines) }}</td>
+                  <td>{{ getPlaceholder() }}</td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+
+        <div v-else class="empty-state pd-statistics-empty">
+          {{ t('projectDetail.stats.emptyResult') }}
+        </div>
       </section>
     </template>
 
@@ -2169,6 +2723,123 @@ onBeforeUnmount(() => {
   min-width: 1580px;
 }
 
+.pd-statistics-file-table :deep(.data-table) {
+  min-width: 980px;
+}
+
+.pd-statistics-selection {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.pd-statistics-result {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.pd-statistics-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.pd-statistics-summary__item {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-muted);
+}
+
+.pd-statistics-summary__item span {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-statistics-summary__item strong {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 18px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-statistics-grid-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+}
+
+.pd-statistics-grid {
+  width: 100%;
+  min-width: 1120px;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 13px;
+}
+
+.pd-statistics-grid th,
+.pd-statistics-grid td {
+  padding: 9px 10px;
+  border-right: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--text-secondary);
+  text-align: right;
+  vertical-align: middle;
+}
+
+.pd-statistics-grid th:first-child,
+.pd-statistics-grid td:first-child,
+.pd-statistics-grid th:nth-child(2),
+.pd-statistics-grid td:nth-child(2),
+.pd-statistics-grid th:last-child,
+.pd-statistics-grid td:last-child {
+  text-align: left;
+}
+
+.pd-statistics-grid th:last-child,
+.pd-statistics-grid td:last-child {
+  border-right: 0;
+}
+
+.pd-statistics-grid thead th,
+.pd-statistics-grid tfoot th,
+.pd-statistics-grid tfoot td {
+  background: var(--surface-muted);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.pd-statistics-grid tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.pd-statistics-grid tfoot th,
+.pd-statistics-grid tfoot td {
+  border-bottom: 0;
+}
+
+.pd-statistics-file-name {
+  display: block;
+  overflow: hidden;
+  color: var(--text-primary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-statistics-empty {
+  margin-top: 16px;
+  min-height: 120px;
+}
+
 .pd-file-cell {
   display: flex;
   align-items: flex-start;
@@ -2577,8 +3248,77 @@ onBeforeUnmount(() => {
 
 .pd-settings-form {
   display: grid;
-  gap: 12px;
+  gap: 14px;
   padding: 0 16px 16px;
+}
+
+.pd-settings-list {
+  display: grid;
+  gap: 10px;
+  width: min(620px, 100%);
+}
+
+.pd-settings-row {
+  grid-template-columns: 112px minmax(0, 260px);
+  align-items: center;
+  gap: 10px;
+}
+
+.pd-settings-row--name {
+  grid-template-columns: 112px minmax(0, 360px);
+}
+
+.pd-settings-control {
+  min-height: 36px;
+  max-width: 260px;
+  padding: 7px 10px;
+}
+
+.pd-settings-control--name {
+  max-width: 360px;
+}
+
+.pd-readonly-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(180px, max-content));
+  gap: 6px 28px;
+  width: min(760px, 100%);
+  padding-top: 2px;
+}
+
+.pd-readonly-field {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.pd-readonly-value {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.pd-settings-divider {
+  height: 1px;
+  background: var(--line-soft);
+}
+
+.pd-settings-section-head {
+  display: grid;
+  gap: 2px;
+}
+
+.pd-settings-section-head .section-title {
+  margin-bottom: 0;
+  font-size: 15px;
+}
+
+.pd-settings-section-head .panel-subtitle {
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .pd-guidelines-editor {
@@ -2593,7 +3333,13 @@ onBeforeUnmount(() => {
 .pd-settings-actions {
   display: flex;
   gap: 8px;
-  justify-content: flex-end;
+  justify-content: flex-start;
+}
+
+.pd-settings-save {
+  min-height: 34px;
+  padding: 6px 12px;
+  font-size: 13px;
 }
 
 @media (max-width: 960px) {
@@ -2607,6 +3353,14 @@ onBeforeUnmount(() => {
   }
 
   .pd-basic-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .pd-readonly-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .pd-statistics-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
@@ -2632,6 +3386,26 @@ onBeforeUnmount(() => {
 
   .upload-language-grid,
   .doc-settings__grid {
+    grid-template-columns: 1fr;
+  }
+
+  .pd-settings-list,
+  .pd-readonly-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .pd-settings-row,
+  .pd-settings-row--name {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .pd-settings-control,
+  .pd-settings-control--name {
+    max-width: none;
+  }
+
+  .pd-statistics-summary {
     grid-template-columns: 1fr;
   }
 

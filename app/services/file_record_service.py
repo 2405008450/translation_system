@@ -15,11 +15,16 @@ from app.services.document_storage import (
     resolve_source_file_path,
     save_source_file,
 )
+from app.services.document_statistics import (
+    normalize_document_statistics,
+    serialize_document_statistics,
+)
 from app.services.document_workspace import (
     DOCUMENT_PARSE_MODE_FULL,
     normalize_document_parse_options,
     normalize_document_parse_mode,
 )
+from app.services.analytics_service import count_source_words, record_translation_metric_event
 from app.services.revision_service import create_revision
 from app.services.task_file_service import build_task_workspace
 
@@ -141,6 +146,21 @@ def _count_filled_targets(items: list[dict]) -> int:
     return sum(1 for item in items if item.get("target_text", "") != "")
 
 
+def _record_initial_translation_events(db: Session, segments: list[Segment]) -> None:
+    for segment in segments:
+        if not (segment.target_text or "").strip():
+            continue
+        record_translation_metric_event(
+            db,
+            segment=segment,
+            before_text="",
+            after_text=segment.target_text,
+            source=segment.source,
+            event_key=f"initial:{segment.id}",
+            created_at=segment.created_at,
+        )
+
+
 def create_file_record_with_segments(
     db: Session,
     raw_bytes: bytes,
@@ -229,6 +249,7 @@ def duplicate_file_record(
         status=source_record.status,
         document_parse_mode=source_record.document_parse_mode,
         document_parse_options=source_record.document_parse_options,
+        document_statistics=source_record.document_statistics,
         source_language=source_record.source_language,
         target_language=source_record.target_language,
         creator_id=current_user.id if current_user is not None else source_record.creator_id,
@@ -257,6 +278,7 @@ def duplicate_file_record(
                 matched_created_at=segment.matched_created_at,
                 matched_updated_at=segment.matched_updated_at,
                 source=segment.source,
+                source_word_count=segment.source_word_count,
                 llm_provider=segment.llm_provider,
                 llm_model=segment.llm_model,
                 block_type=segment.block_type,
@@ -291,32 +313,35 @@ def _create_file_record_from_workspace(
         status="in_progress",
         document_parse_mode=document_parse_mode,
         document_parse_options=json.dumps(document_parse_options, ensure_ascii=False, sort_keys=True),
+        document_statistics=serialize_document_statistics(workspace_data.get("document_statistics")),
     )
     db.add(file_record)
     db.flush()
 
+    created_segments: list[Segment] = []
     for seg in workspace_data["segments"]:
-        db.add(
-            Segment(
-                file_record_id=file_record.id,
-                sentence_id=seg["sentence_id"],
-                source_text=seg["source_text"],
-                display_text=seg["display_text"],
-                target_text=seg["target_text"],
-                status=seg["status"],
-                score=seg["score"],
-                matched_source_text=seg["matched_source_text"],
-                matched_collection_name=seg.get("matched_collection_name"),
-                matched_creator_name=seg.get("matched_creator_name"),
-                matched_created_at=datetime.fromisoformat(seg["matched_created_at"]) if seg.get("matched_created_at") else None,
-                matched_updated_at=datetime.fromisoformat(seg["matched_updated_at"]) if seg.get("matched_updated_at") else None,
-                source="tm" if seg["status"] in ("exact", "fuzzy") else "none",
-                block_type=seg["block_type"],
-                block_index=seg["block_index"],
-                row_index=seg.get("row_index"),
-                cell_index=seg.get("cell_index"),
-            )
+        segment = Segment(
+            file_record_id=file_record.id,
+            sentence_id=seg["sentence_id"],
+            source_text=seg["source_text"],
+            display_text=seg["display_text"],
+            target_text=seg["target_text"],
+            status=seg["status"],
+            score=seg["score"],
+            matched_source_text=seg["matched_source_text"],
+            matched_collection_name=seg.get("matched_collection_name"),
+            matched_creator_name=seg.get("matched_creator_name"),
+            matched_created_at=datetime.fromisoformat(seg["matched_created_at"]) if seg.get("matched_created_at") else None,
+            matched_updated_at=datetime.fromisoformat(seg["matched_updated_at"]) if seg.get("matched_updated_at") else None,
+            source="tm" if seg["status"] in ("exact", "fuzzy") else "none",
+            source_word_count=count_source_words(seg["source_text"]),
+            block_type=seg["block_type"],
+            block_index=seg["block_index"],
+            row_index=seg.get("row_index"),
+            cell_index=seg.get("cell_index"),
         )
+        db.add(segment)
+        created_segments.append(segment)
 
     file_record.status = resolve_file_record_status(
         file_record.status,
@@ -328,6 +353,7 @@ def _create_file_record_from_workspace(
         save_source_file(file_record.id, filename, raw_bytes)
         _remember_pending_source_file(db, file_record.id, filename)
     db.flush()
+    _record_initial_translation_events(db, created_segments)
     return file_record
 
 
@@ -347,23 +373,25 @@ def create_txt_file_record_with_segments(
     db.add(file_record)
     db.flush()
 
+    created_segments: list[Segment] = []
     for index, result in enumerate(results):
-        db.add(
-            Segment(
-                file_record_id=file_record.id,
-                sentence_id=f"sent-{index + 1:05d}",
-                source_text=result.source_sentence,
-                display_text=result.source_sentence,
-                target_text=result.target_text or "",
-                status=result.status,
-                score=result.score,
-                matched_source_text=result.matched_source_text,
-                matched_collection_name=getattr(result, "matched_collection_name", None),
-                source="tm" if result.status in ("exact", "fuzzy") else "none",
-                block_type="paragraph",
-                block_index=index,
-            )
+        segment = Segment(
+            file_record_id=file_record.id,
+            sentence_id=f"sent-{index + 1:05d}",
+            source_text=result.source_sentence,
+            display_text=result.source_sentence,
+            target_text=result.target_text or "",
+            status=result.status,
+            score=result.score,
+            matched_source_text=result.matched_source_text,
+            matched_collection_name=getattr(result, "matched_collection_name", None),
+            source="tm" if result.status in ("exact", "fuzzy") else "none",
+            source_word_count=count_source_words(result.source_sentence),
+            block_type="paragraph",
+            block_index=index,
         )
+        db.add(segment)
+        created_segments.append(segment)
 
     file_record.status = resolve_file_record_status(
         file_record.status,
@@ -371,6 +399,8 @@ def create_txt_file_record_with_segments(
         sum(1 for result in results if (result.target_text or "") != ""),
     )
 
+    db.flush()
+    _record_initial_translation_events(db, created_segments)
     db.commit()
     db.refresh(file_record)
     return file_record
@@ -470,6 +500,10 @@ def get_file_record_source_filename(file_record: FileRecord) -> str:
     return f"{base_name}{stored_extension}"
 
 
+def get_file_record_document_statistics(file_record: FileRecord) -> dict:
+    return normalize_document_statistics(getattr(file_record, "document_statistics", None))
+
+
 def attach_source_document_to_file_record(
     db: Session,
     file_record: FileRecord,
@@ -497,29 +531,32 @@ def attach_source_document_to_file_record(
     file_record.status = "in_progress"
     file_record.document_parse_mode = document_parse_mode
     file_record.document_parse_options = json.dumps(document_parse_options, ensure_ascii=False, sort_keys=True)
+    file_record.document_statistics = serialize_document_statistics(workspace_data.get("document_statistics"))
 
+    created_segments: list[Segment] = []
     for seg in workspace_data["segments"]:
-        db.add(
-            Segment(
-                file_record_id=file_record.id,
-                sentence_id=seg["sentence_id"],
-                source_text=seg["source_text"],
-                display_text=seg["display_text"],
-                target_text=seg["target_text"],
-                status=seg["status"],
-                score=seg["score"],
-                matched_source_text=seg["matched_source_text"],
-                matched_collection_name=seg.get("matched_collection_name"),
-                matched_creator_name=seg.get("matched_creator_name"),
-                matched_created_at=datetime.fromisoformat(seg["matched_created_at"]) if seg.get("matched_created_at") else None,
-                matched_updated_at=datetime.fromisoformat(seg["matched_updated_at"]) if seg.get("matched_updated_at") else None,
-                source="tm" if seg["status"] in ("exact", "fuzzy") else "none",
-                block_type=seg["block_type"],
-                block_index=seg["block_index"],
-                row_index=seg.get("row_index"),
-                cell_index=seg.get("cell_index"),
-            )
+        segment = Segment(
+            file_record_id=file_record.id,
+            sentence_id=seg["sentence_id"],
+            source_text=seg["source_text"],
+            display_text=seg["display_text"],
+            target_text=seg["target_text"],
+            status=seg["status"],
+            score=seg["score"],
+            matched_source_text=seg["matched_source_text"],
+            matched_collection_name=seg.get("matched_collection_name"),
+            matched_creator_name=seg.get("matched_creator_name"),
+            matched_created_at=datetime.fromisoformat(seg["matched_created_at"]) if seg.get("matched_created_at") else None,
+            matched_updated_at=datetime.fromisoformat(seg["matched_updated_at"]) if seg.get("matched_updated_at") else None,
+            source="tm" if seg["status"] in ("exact", "fuzzy") else "none",
+            source_word_count=count_source_words(seg["source_text"]),
+            block_type=seg["block_type"],
+            block_index=seg["block_index"],
+            row_index=seg.get("row_index"),
+            cell_index=seg.get("cell_index"),
         )
+        db.add(segment)
+        created_segments.append(segment)
 
     file_record.status = resolve_file_record_status(
         file_record.status,
@@ -529,6 +566,8 @@ def attach_source_document_to_file_record(
 
     try:
         save_source_file(file_record.id, source_filename, raw_bytes)
+        db.flush()
+        _record_initial_translation_events(db, created_segments)
         db.commit()
     except Exception:
         db.rollback()
@@ -670,6 +709,7 @@ def update_segment_target(
     before_text = segment.target_text
     segment.target_text = target_text
     segment.source = source
+    segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
     if source == "llm":
         segment.llm_provider = llm_provider
         segment.llm_model = llm_model
@@ -686,6 +726,14 @@ def update_segment_target(
         after_text=target_text,
         source=source,
         author=current_user,
+    )
+    record_translation_metric_event(
+        db,
+        segment=segment,
+        before_text=before_text,
+        after_text=target_text,
+        source=source,
+        current_user=current_user,
     )
 
     sync_file_record_status(db, segment.file_record_id)
@@ -715,6 +763,7 @@ def update_segment_by_sentence_id(
     before_text = segment.target_text
     segment.target_text = target_text
     segment.source = source
+    segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
     if source == "llm":
         segment.llm_provider = llm_provider
         segment.llm_model = llm_model
@@ -731,6 +780,14 @@ def update_segment_by_sentence_id(
         after_text=target_text,
         source=source,
         author=current_user,
+    )
+    record_translation_metric_event(
+        db,
+        segment=segment,
+        before_text=before_text,
+        after_text=target_text,
+        source=source,
+        current_user=current_user,
     )
 
     sync_file_record_status(db, segment.file_record_id)
@@ -795,6 +852,7 @@ def batch_update_segments(
         source = item.get("source", "manual")
         segment.target_text = target_text
         segment.source = source
+        segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
         if source == "llm":
             segment.llm_provider = item.get("llm_provider")
             segment.llm_model = item.get("llm_model")
@@ -811,6 +869,14 @@ def batch_update_segments(
             after_text=target_text,
             source=source,
             author=current_user,
+        )
+        record_translation_metric_event(
+            db,
+            segment=segment,
+            before_text=before_text,
+            after_text=target_text,
+            source=source,
+            current_user=current_user,
         )
         updated_count += 1
 

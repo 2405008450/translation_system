@@ -75,6 +75,7 @@ class UpdateUserRequest(BaseModel):
     username: UsernameStr | None = None
     nickname: NicknameStr | None = None
     password: PasswordStr | None = None
+    is_active: bool | None = None
 
 
 class AuthResponse(BaseModel):

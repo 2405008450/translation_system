@@ -19,6 +19,7 @@ from xml.etree import ElementTree as ET
 from sqlalchemy.orm import Session
 
 from app.services.cache import get_json, set_json
+from app.services.document_statistics import compute_docx_statistics
 from app.services.matcher import MatchStats, match_sentences_with_stats
 from app.services.normalizer import normalize_text
 from app.services.omml_to_mathml import convert as convert_omml_to_mathml
@@ -68,7 +69,7 @@ CELL_GROUP_MAX_CHARS = 200
 CELL_PARAGRAPH_BREAK_SENTINEL = "\uE000"
 PAGE_BREAK_SENTINEL = "\uE001"
 DOCX_PARSE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
-DOCX_PARSE_CACHE_VERSION = "3"
+DOCX_PARSE_CACHE_VERSION = "4"
 DOCUMENT_PARSE_MODE_FULL = "full"
 DOCUMENT_PARSE_MODE_BODY_ONLY = "body_only"
 SUPPORTED_DOCUMENT_PARSE_MODES = {
@@ -80,6 +81,13 @@ DEFAULT_DOCUMENT_PARSE_OPTIONS = {
     "include_footnotes_endnotes": True,
     "include_comments": True,
     "clean_format": False,
+    "translate_code_blocks": True,
+    "extract_links": False,
+    "skip_non_translatable": True,
+    "xml_inline_elements_no_split": True,
+    "custom_parse_config": False,
+    "translate_idml_comments": False,
+    "translate_idml_hidden_layers": False,
 }
 DOCUMENT_PARSE_OPTION_FIELDS = set(DEFAULT_DOCUMENT_PARSE_OPTIONS)
 EMU_PER_PIXEL = 9525
@@ -492,6 +500,7 @@ def build_docx_workspace(
     return {
         "document_html": parsed_workspace["document_html"],
         "segments": segments,
+        "document_statistics": parsed_workspace.get("document_statistics", {}),
         "match_stats": {
             "total_input_sentences": match_stats.total_input_sentences,
             "prepared_sentences": match_stats.prepared_sentences,
@@ -596,6 +605,7 @@ def parse_docx_workspace(
     return {
         "document_html": "".join(html_parts) or '<p class="doc-paragraph doc-empty"><br></p>',
         "segments": segments,
+        "document_statistics": compute_docx_statistics(raw_bytes),
     }
 
 

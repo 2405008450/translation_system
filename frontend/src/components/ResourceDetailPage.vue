@@ -4,6 +4,8 @@ import {
   ArrowLeft,
   ChevronDown,
   Download,
+  FileCode2,
+  FileSpreadsheet,
   Loader2,
   Pencil,
   Plus,
@@ -25,11 +27,30 @@ import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
 import { getLanguageLabel } from '../constants/languages'
 import type { PaginatedResponse, TermBase, TermEntryRecord, TMCollection, TMEntryRecord } from '../types/api'
-import { downloadBlob } from '../utils/download'
+import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 
 type ResourceMode = 'tm' | 'term'
+type ExportFormat = 'xlsx' | 'tmx'
 type ResourceRecord = TMCollection | TermBase
 type EntryRecord = TMEntryRecord | TermEntryRecord
+
+interface ResourceExportTask {
+  task_id: string
+  resource_type: ResourceMode
+  resource_id: string
+  format: ExportFormat
+  status: 'queued' | 'running' | 'completed' | 'failed'
+  progress: number
+  message: string
+  result: {
+    filename: string
+    size_bytes: number
+    total_entries: number
+  } | null
+  error: string | null
+  created_at: string
+  updated_at: string
+}
 
 const props = defineProps<{
   id: string
@@ -58,15 +79,19 @@ const totalEntries = ref(0)
 const showAddDialog = ref(false)
 const showImportDialog = ref(false)
 const showFieldMenu = ref(false)
+const showExportMenu = ref(false)
 const showIndexColumn = ref(true)
 const showSourceColumn = ref(true)
 const showTargetColumn = ref(true)
+const exportProgress = ref(0)
 const newSourceText = ref('')
 const newTargetText = ref('')
 const editingEntryId = ref('')
 const editSourceText = ref('')
 const editTargetText = ref('')
 let searchTimer: number | null = null
+let exportPollTimer: number | null = null
+let disposed = false
 
 const copy = computed(() => {
   if (props.mode === 'tm') {
@@ -92,7 +117,9 @@ const copy = computed(() => {
       detailEndpoint: `/translation-memory/collections/${props.id}`,
       entriesEndpoint: `/translation-memory/collections/${props.id}/entries`,
       createEndpoint: `/translation-memory/collections/${props.id}/entries`,
-      exportEndpoint: `/translation-memory/collections/${props.id}/export-xlsx`,
+      createExportEndpoint: `/translation-memory/collections/${props.id}/exports`,
+      exportTaskEndpoint: (taskId: string) => `/translation-memory/export-tasks/${taskId}`,
+      exportDownloadEndpoint: (taskId: string) => `/translation-memory/export-tasks/${taskId}/download`,
       updateEntryEndpoint: (entryId: string) => `/translation-memory/entries/${entryId}`,
       deleteEntryEndpoint: (entryId: string) => `/translation-memory/entries/${entryId}`,
     }
@@ -120,7 +147,9 @@ const copy = computed(() => {
     detailEndpoint: `/term-bases/${props.id}`,
     entriesEndpoint: `/term-bases/${props.id}/entries`,
     createEndpoint: `/term-bases/${props.id}/entries`,
-    exportEndpoint: `/term-bases/${props.id}/export-xlsx`,
+    createExportEndpoint: `/term-bases/${props.id}/exports`,
+    exportTaskEndpoint: (taskId: string) => `/term-bases/export-tasks/${taskId}`,
+    exportDownloadEndpoint: (taskId: string) => `/term-bases/export-tasks/${taskId}/download`,
     updateEntryEndpoint: (entryId: string) => `/term-entries/${entryId}`,
     deleteEntryEndpoint: (entryId: string) => `/term-entries/${entryId}`,
   }
@@ -139,6 +168,9 @@ const tableColumnCount = computed(() => (
 const entryCount = computed(() => resource.value?.entry_count ?? totalEntries.value)
 const entryCountText = computed(() => `${entryCount.value}`)
 const lastImportTime = computed(() => entries.value[0]?.updated_at ? formatDate(entries.value[0].updated_at) : '-')
+const exportButtonText = computed(() => (
+  exportingEntries.value ? `导出中 ${exportProgress.value}%` : '导出'
+))
 
 const metaColumns = computed(() => [
   [
@@ -195,6 +227,34 @@ function getErrorMessage(error: unknown, fallback: string) {
     return String(error.response?.data?.detail || fallback)
   }
   return error instanceof Error ? error.message : fallback
+}
+
+function getExportFormatLabel(format: ExportFormat) {
+  return format === 'xlsx' ? 'Excel' : 'TMX'
+}
+
+function getExportFilename(format: ExportFormat) {
+  if (!resource.value) {
+    return `export.${format}`
+  }
+  return `${resource.value.name}-${copy.value.exportFilenameSuffix}.${format}`
+}
+
+function clearExportPollTimer() {
+  if (exportPollTimer) {
+    window.clearTimeout(exportPollTimer)
+    exportPollTimer = null
+  }
+}
+
+function waitForExportPoll(ms: number) {
+  return new Promise<void>((resolve) => {
+    clearExportPollTimer()
+    exportPollTimer = window.setTimeout(() => {
+      exportPollTimer = null
+      resolve()
+    }, ms)
+  })
 }
 
 function resetAddForm() {
@@ -356,23 +416,57 @@ async function deleteEntry(entry: EntryRecord) {
   }
 }
 
-async function exportEntries() {
+async function waitForExportTask(task: ResourceExportTask) {
+  let currentTask = task
+  while (!disposed) {
+    exportProgress.value = currentTask.progress
+    entryMessage.value = currentTask.message || '导出任务处理中。'
+
+    if (currentTask.status === 'completed') {
+      return currentTask
+    }
+    if (currentTask.status === 'failed') {
+      throw new Error(currentTask.error || currentTask.message || '导出失败。')
+    }
+
+    await waitForExportPoll(1200)
+    const { data } = await http.get<ResourceExportTask>(copy.value.exportTaskEndpoint(currentTask.task_id))
+    currentTask = data
+  }
+  throw new Error('导出任务已取消。')
+}
+
+async function exportEntries(format: ExportFormat) {
   if (!resource.value) {
     return
   }
 
+  showExportMenu.value = false
   exportingEntries.value = true
+  exportProgress.value = 0
   entryMessage.value = ''
   try {
-    const response = await http.get(copy.value.exportEndpoint, {
+    const formatLabel = getExportFormatLabel(format)
+    const { data: task } = await http.post<ResourceExportTask>(copy.value.createExportEndpoint, null, {
+      params: { format },
+    })
+    entryMessage.value = `${formatLabel} 导出任务已提交。`
+    const completedTask = await waitForExportTask(task)
+    const response = await http.get(copy.value.exportDownloadEndpoint(completedTask.task_id), {
       responseType: 'blob',
     })
-    downloadBlob(response.data, `${resource.value.name}-${copy.value.exportFilenameSuffix}.xlsx`)
-    entryMessage.value = `${copy.value.entryName}已导出。`
+    const filename = resolveDownloadFilename(
+      response.headers['content-disposition'],
+      getExportFilename(format),
+    )
+    downloadBlob(response.data, filename)
+    entryMessage.value = `${copy.value.entryName}已导出为 ${formatLabel}。`
   } catch (error) {
     entryMessage.value = getErrorMessage(error, `${copy.value.entryName}导出失败。`)
   } finally {
+    clearExportPollTimer()
     exportingEntries.value = false
+    exportProgress.value = 0
   }
 }
 
@@ -405,19 +499,23 @@ watch(() => [props.id, props.mode] as const, () => {
   showAddDialog.value = false
   showImportDialog.value = false
   showFieldMenu.value = false
+  showExportMenu.value = false
   resetAddForm()
   resetEditForm()
   void reloadPage()
 })
 
 onMounted(() => {
+  disposed = false
   void reloadPage()
 })
 
 onUnmounted(() => {
+  disposed = true
   if (searchTimer) {
     window.clearTimeout(searchTimer)
   }
+  clearExportPollTimer()
 })
 </script>
 
@@ -445,17 +543,29 @@ onUnmounted(() => {
           <Upload :size="14" />
           导入
         </button>
-        <button
-          class="resource-detail-button"
-          type="button"
-          :disabled="!resource || exportingEntries"
-          @click="exportEntries"
-        >
-          <Loader2 v-if="exportingEntries" class="lucide-spin" :size="14" />
-          <Download v-else :size="14" />
-          导出
-          <ChevronDown :size="14" />
-        </button>
+        <div class="resource-detail-export">
+          <button
+            class="resource-detail-button"
+            type="button"
+            :disabled="!resource || exportingEntries"
+            @click="showExportMenu = !showExportMenu"
+          >
+            <Loader2 v-if="exportingEntries" class="lucide-spin" :size="14" />
+            <Download v-else :size="14" />
+            {{ exportButtonText }}
+            <ChevronDown :size="14" />
+          </button>
+          <div v-if="showExportMenu && !exportingEntries" class="resource-detail-export__menu">
+            <button type="button" @click="exportEntries('xlsx')">
+              <FileSpreadsheet :size="14" />
+              Excel
+            </button>
+            <button type="button" @click="exportEntries('tmx')">
+              <FileCode2 :size="14" />
+              TMX
+            </button>
+          </div>
+        </div>
         <button class="resource-detail-icon-button" type="button" title="更多">
           <ChevronDown :size="16" />
         </button>
@@ -805,6 +915,45 @@ onUnmounted(() => {
   opacity: 0.58;
 }
 
+.resource-detail-export {
+  position: relative;
+}
+
+.resource-detail-export__menu {
+  display: grid;
+  gap: 4px;
+  position: absolute;
+  z-index: 6;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 132px;
+  padding: 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-soft);
+}
+
+.resource-detail-export__menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+  text-align: left;
+}
+
+.resource-detail-export__menu button:hover {
+  background: var(--brand-050);
+  color: var(--brand-700);
+}
+
 .resource-detail-icon-button {
   width: 30px;
   height: 28px;
@@ -1124,6 +1273,11 @@ onUnmounted(() => {
   }
 
   .resource-detail-search {
+    width: 100%;
+  }
+
+  .resource-detail-export,
+  .resource-detail-export .resource-detail-button {
     width: 100%;
   }
 

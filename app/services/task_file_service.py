@@ -29,6 +29,7 @@ from app.services.matcher import MatchStats, match_sentences_with_stats
 
 TASK_ADAPTER_EXTENSIONS = {
     ".txt",
+    ".dat",
     ".csv",
     ".html",
     ".htm",
@@ -120,6 +121,19 @@ _UPLOAD_CAPABILITY_SPECS = (
         "features": ("按空行识别段落", "自动断句", "支持 UTF-8 / UTF-8-BOM / GB18030"),
     },
     {
+        "extensions": (".dat",),
+        "label": "DAT 文本",
+        "category": "text",
+        "features": ("按纯文本解析", "支持 UTF-8 / UTF-8-BOM / GB18030", "保留文本段落顺序"),
+        "settings": (
+            {
+                "id": "translate_code_blocks",
+                "label": "翻译代码块",
+                "default": True,
+            },
+        ),
+    },
+    {
         "extensions": (".csv",),
         "label": "CSV 表格",
         "category": "table",
@@ -135,7 +149,22 @@ _UPLOAD_CAPABILITY_SPECS = (
         "extensions": (".md", ".markdown"),
         "label": "Markdown",
         "category": "text",
-        "features": ("标题、段落、列表和引用可翻译", "代码块跳过", "保留 Markdown 结构定位"),
+        "features": ("标题、段落、列表和引用可翻译", "代码块可按设置提取", "保留 Markdown 结构定位"),
+        "settings_select_all": True,
+        "settings": (
+            {
+                "id": "translate_code_blocks",
+                "label": "翻译代码块",
+                "default": True,
+            },
+            {
+                "id": "extract_links",
+                "label": "提取链接",
+                "default": False,
+                "disabled": True,
+                "description": "当前上传解析保留 Markdown 链接结构，暂不单独抽取 URL。",
+            },
+        ),
     },
     {
         "extensions": (".json",),
@@ -148,6 +177,15 @@ _UPLOAD_CAPABILITY_SPECS = (
         "label": "YAML",
         "category": "localization",
         "features": ("提取字符串值", "保留配置路径", "跳过结构字段"),
+        "settings": (
+            {
+                "id": "custom_parse_config",
+                "label": "自定义解析配置",
+                "default": False,
+                "disabled": True,
+                "description": "当前上传接口还没有接收自定义解析配置文件。",
+            },
+        ),
     },
     {
         "extensions": (".properties",),
@@ -184,6 +222,20 @@ _UPLOAD_CAPABILITY_SPECS = (
         "label": "DITA / XML",
         "category": "technical",
         "features": ("提取可翻译元素文本", "保留结构路径", "支持原格式导出"),
+        "settings": (
+            {
+                "id": "xml_inline_elements_no_split",
+                "label": "将文本内所有元素视为内嵌元素(不断句)",
+                "default": True,
+            },
+            {
+                "id": "custom_parse_config",
+                "label": "自定义解析配置",
+                "default": False,
+                "disabled": True,
+                "description": "当前上传接口还没有接收自定义解析配置文件。",
+            },
+        ),
     },
     {
         "extensions": (".svg",),
@@ -208,12 +260,32 @@ _UPLOAD_CAPABILITY_SPECS = (
         "label": "DXF",
         "category": "engineering",
         "features": ("提取图纸文本", "保留文本实体定位", "支持原格式导出"),
+        "settings": (
+            {
+                "id": "skip_non_translatable",
+                "label": "非译元素(数字和符号)",
+                "default": True,
+            },
+        ),
     },
     {
         "extensions": (".idml",),
         "label": "IDML",
         "category": "design",
         "features": ("提取 InDesign Story 文本", "保留 story 路径", "支持原格式导出"),
+        "settings_select_all": True,
+        "settings": (
+            {
+                "id": "translate_idml_comments",
+                "label": "翻译附注",
+                "default": False,
+            },
+            {
+                "id": "translate_idml_hidden_layers",
+                "label": "翻译隐藏图层",
+                "default": False,
+            },
+        ),
     },
     {
         "extensions": (".mif",),
@@ -292,6 +364,7 @@ def get_upload_capabilities() -> dict[str, Any]:
                 "parse_modes": list(DOCX_PARSE_MODE_CAPABILITIES if is_docx else (AUTO_PARSE_MODE_CAPABILITY,)),
                 "features": list(spec["features"]),
                 "settings": list(spec.get("settings", ())),
+                "settings_select_all": bool(spec.get("settings_select_all", is_docx)),
             }
         )
 
@@ -338,7 +411,7 @@ def build_task_workspace(
 
     registry = ensure_default_adapters_registered()
     adapter = registry.get_adapter(filename)
-    parse_result = adapter.parse_with_validation(raw_bytes, filename=filename)
+    parse_result = adapter.parse_with_options(raw_bytes, filename=filename, options=document_parse_options)
     if not parse_result.segments:
         raise ValueError("文件中没有可翻译的内容。")
 
@@ -426,7 +499,12 @@ def export_translated_task_file(
     if not can_export_task_file(filename, has_source_file=True):
         raise ValueError(f"{get_task_file_extension(filename) or '该'} 文件暂不支持原格式导出。")
 
-    export_segments = build_export_segments_from_source(raw_bytes, filename, segments)
+    export_segments = build_export_segments_from_source(
+        raw_bytes,
+        filename,
+        segments,
+        document_parse_options=document_parse_options,
+    )
     content, media_type, export_filename = export_multi_format_file(
         export_type="original",
         segments=export_segments,
@@ -464,13 +542,15 @@ def build_export_segments_from_source(
     raw_bytes: bytes,
     filename: str,
     segments: list[Any],
+    document_parse_options: dict[str, object] | str | None = None,
 ) -> list[dict[str, Any]]:
     if is_docx_task(filename):
         return [_normalize_existing_segment(segment) for segment in segments]
 
     registry = ensure_default_adapters_registered()
     adapter = registry.get_adapter(filename)
-    parse_result = adapter.parse_with_validation(raw_bytes, filename=filename)
+    document_parse_options = normalize_document_parse_options(document_parse_options)
+    parse_result = adapter.parse_with_options(raw_bytes, filename=filename, options=document_parse_options)
     translated_segments = {
         str(_get_segment_value(segment, "sentence_id", _get_segment_value(segment, "segment_id", ""))): segment
         for segment in segments

@@ -24,6 +24,14 @@ class MarkdownAdapter(FormatAdapter):
         return [".md", ".markdown"]
 
     def parse(self, raw_bytes: bytes) -> ParseResult:
+        return self._parse_with_code_block_option(raw_bytes, include_code_blocks=False)
+
+    def parse_with_options(self, raw_bytes: bytes, filename: str = "<unknown>", options: dict | None = None) -> ParseResult:
+        self.validate_file_size(raw_bytes, filename)
+        include_code_blocks = bool((options or {}).get("translate_code_blocks", True))
+        return self._parse_with_code_block_option(raw_bytes, include_code_blocks=include_code_blocks)
+
+    def _parse_with_code_block_option(self, raw_bytes: bytes, include_code_blocks: bool) -> ParseResult:
         if not raw_bytes:
             return ParseResult(
                 ast=DocumentAST(nodes=[], source_format=".md"),
@@ -32,7 +40,7 @@ class MarkdownAdapter(FormatAdapter):
             )
         
         content = self._decode_content(raw_bytes)
-        nodes = self._parse_markdown(content)
+        nodes = self._parse_markdown(content, include_code_blocks=include_code_blocks)
         
         ast = DocumentAST(nodes=nodes, source_format=".md")
         segments = extract_segments(ast)
@@ -40,7 +48,7 @@ class MarkdownAdapter(FormatAdapter):
         return ParseResult(
             ast=ast,
             segments=segments,
-            metadata={"node_count": len(nodes)},
+            metadata={"node_count": len(nodes), "include_code_blocks": include_code_blocks},
         )
 
     def _decode_content(self, raw_bytes: bytes) -> str:
@@ -51,7 +59,7 @@ class MarkdownAdapter(FormatAdapter):
                 continue
         raise ParseError(filename="<unknown>", reason="无法识别文件编码")
 
-    def _parse_markdown(self, content: str) -> List[BlockNode]:
+    def _parse_markdown(self, content: str, include_code_blocks: bool = False) -> List[BlockNode]:
         """解析 Markdown 内容"""
         nodes = []
         lines = content.replace('\r\n', '\n').split('\n')
@@ -59,6 +67,8 @@ class MarkdownAdapter(FormatAdapter):
         i = 0
         in_code_block = False
         code_lang = ""
+        code_start_line = 0
+        code_lines = []
         current_para = []
         
         while i < len(lines):
@@ -67,17 +77,24 @@ class MarkdownAdapter(FormatAdapter):
             # 代码块
             if line.startswith('```'):
                 if in_code_block:
+                    if include_code_blocks:
+                        self._flush_code_block(code_lines, nodes, code_lang, code_start_line)
+                        code_lines = []
                     in_code_block = False
                     code_lang = ""
+                    code_start_line = 0
                 else:
                     self._flush_paragraph(current_para, nodes)
                     current_para = []
                     in_code_block = True
                     code_lang = line[3:].strip()
+                    code_start_line = i + 1
                 i += 1
                 continue
             
             if in_code_block:
+                if include_code_blocks:
+                    code_lines.append(line)
                 i += 1
                 continue
             
@@ -143,6 +160,8 @@ class MarkdownAdapter(FormatAdapter):
             i += 1
         
         self._flush_paragraph(current_para, nodes)
+        if in_code_block and include_code_blocks:
+            self._flush_code_block(code_lines, nodes, code_lang, code_start_line)
         return nodes
 
     def _flush_paragraph(self, lines: List[str], nodes: List[BlockNode]) -> None:
@@ -155,4 +174,20 @@ class MarkdownAdapter(FormatAdapter):
                 node_type=NodeType.PARAGRAPH,
                 text_content=text,
                 metadata={},
+            ))
+
+    def _flush_code_block(
+        self,
+        lines: List[str],
+        nodes: List[BlockNode],
+        language: str,
+        start_line: int,
+    ) -> None:
+        """保存可翻译代码块内容。"""
+        text = "\n".join(lines).strip()
+        if text:
+            nodes.append(BlockNode(
+                node_type=NodeType.CODE_BLOCK,
+                text_content=text,
+                metadata={"language": language, "line": start_line},
             ))

@@ -17,6 +17,7 @@ DEFAULT_MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 # 按格式的文件大小限制
 FORMAT_SIZE_LIMITS: Dict[str, int] = {
     ".txt": 10 * 1024 * 1024,    # 10 MB
+    ".dat": 10 * 1024 * 1024,    # 10 MB
     ".docx": 50 * 1024 * 1024,   # 50 MB
     ".xlsx": 50 * 1024 * 1024,   # 50 MB
     ".pdf": 100 * 1024 * 1024,   # 100 MB
@@ -93,6 +94,19 @@ class FormatAdapter(ABC):
         Raises:
             FileTooLargeError: 当文件超过大小限制时
             ParseError: 当文件内容损坏或无法解析时
+        """
+        self.validate_file_size(raw_bytes, filename)
+        return self.parse(raw_bytes)
+
+    def parse_with_options(
+        self,
+        raw_bytes: bytes,
+        filename: str = "<unknown>",
+        options: Optional[dict] = None,
+    ) -> ParseResult:
+        """带文件大小验证和解析选项的解析。
+
+        默认适配器不使用额外选项；需要格式专属开关时由子类覆盖。
         """
         self.validate_file_size(raw_bytes, filename)
         return self.parse(raw_bytes)

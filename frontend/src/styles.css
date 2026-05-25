@@ -220,10 +220,6 @@ body.modal-open {
   align-items: end;
 }
 
-.upload-form--task {
-  grid-template-columns: minmax(220px, 1.2fr) 160px minmax(220px, 1fr) auto;
-}
-
 .form-grid,
 .form-grid-2 {
   display: grid;
@@ -3926,24 +3922,6 @@ body.modal-open {
 .status-dot--info { background: #1890ff; }
 .status-dot--danger { background: #f5222d; }
 .status-dot--default { background: #d9d9d9; }
-
-/* ===== Upload Panel ===== */
-.upload-panel {
-  background: #fff;
-  border: 1px solid #e4e7eb;
-  border-radius: 8px;
-  padding: 16px 20px;
-  margin-bottom: 12px;
-}
-
-.upload-panel .section-title {
-  margin-bottom: 12px;
-  font-size: 14px;
-}
-
-.upload-panel .upload-form {
-  margin-top: 12px;
-}
 
 /* ===== Table Page Layout ===== */
 .table-page {

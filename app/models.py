@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import DateTime, ForeignKey, Index, String, Text, Uuid, func, text
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, Uuid, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -104,6 +104,23 @@ class FileRecord(Base):
         default="{}",
         server_default=text("'{}'"),
     )
+    document_statistics: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="{}",
+        server_default=text("'{}'"),
+    )
+    active_operation: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    active_operation_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    active_operation_updated_at: Mapped[DateTime | None] = mapped_column(
+        DateTime(timezone=False),
+        nullable=True,
+    )
+    active_operation_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     source_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
     target_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
     creator_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -139,6 +156,9 @@ class FileRecord(Base):
 
     creator: Mapped["User | None"] = relationship(
         "User", foreign_keys=[creator_id]
+    )
+    active_operation_user: Mapped["User | None"] = relationship(
+        "User", foreign_keys=[active_operation_user_id]
     )
     project: Mapped["Project | None"] = relationship(
         "Project", back_populates="file_records"
@@ -238,6 +258,7 @@ class Segment(Base):
     matched_created_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
     matched_updated_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
     source: Mapped[str] = mapped_column(String(20), nullable=False, default="tm")
+    source_word_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     llm_provider: Mapped[str | None] = mapped_column(String(40), nullable=True)
     llm_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
     block_type: Mapped[str] = mapped_column(String(20), nullable=False, default="paragraph")
@@ -327,6 +348,90 @@ class SegmentRevision(Base):
         "User",
         foreign_keys=[resolved_by_id],
     )
+
+
+class TranslationMetricEvent(Base):
+    __tablename__ = "translation_metric_events"
+    __table_args__ = (
+        UniqueConstraint("event_key", name="uq_translation_metric_events_event_key"),
+        Index("ix_translation_metric_events_created_at", "created_at"),
+        Index("ix_translation_metric_events_source", "source"),
+        Index("ix_translation_metric_events_language_pair", "source_language", "target_language"),
+        Index("ix_translation_metric_events_file_record_id", "file_record_id"),
+        Index("ix_translation_metric_events_segment_id", "segment_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    event_key: Mapped[str | None] = mapped_column(String(140), nullable=True)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    file_record_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    segment_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("segments.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")
+    source_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    target_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    source_word_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    target_was_empty: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=text("TRUE"))
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+
+    project: Mapped["Project | None"] = relationship("Project", foreign_keys=[project_id])
+    file_record: Mapped["FileRecord | None"] = relationship("FileRecord", foreign_keys=[file_record_id])
+    segment: Mapped["Segment | None"] = relationship("Segment", foreign_keys=[segment_id])
+    user: Mapped["User | None"] = relationship("User", foreign_keys=[user_id])
+
+
+class UserActivityDaily(Base):
+    __tablename__ = "user_activity_daily"
+    __table_args__ = (
+        UniqueConstraint("user_id", "activity_date", name="uq_user_activity_daily_user_date"),
+        Index("ix_user_activity_daily_activity_date", "activity_date"),
+        Index("ix_user_activity_daily_user_id", "user_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    activity_date: Mapped[Date] = mapped_column(Date, nullable=False)
+    request_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    first_seen_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    last_seen_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+
+    user: Mapped["User"] = relationship("User", foreign_keys=[user_id])
 
 
 class SegmentComment(Base):

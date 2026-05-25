@@ -5,6 +5,8 @@ import {
   Loader2,
   Pencil,
   Plus,
+  Power,
+  PowerOff,
   RefreshCw,
   Search,
   Shield,
@@ -65,6 +67,15 @@ const uiText = {
   nicknamePlaceholder: '\u4e0d\u586b\u65f6\u9ed8\u8ba4\u4f7f\u7528\u7528\u6237\u540d',
   activeStatus: '\u6b63\u5e38',
   inactiveStatus: '\u5df2\u505c\u7528',
+  enableUser: '\u542f\u7528\u7528\u6237',
+  disableUser: '\u505c\u7528\u7528\u6237',
+  statusUpdating: '\u66f4\u65b0\u4e2d...',
+  toggleForbidden: '\u53ea\u6709\u7ba1\u7406\u5458\u53ef\u4ee5\u542f\u7528\u6216\u505c\u7528\u7528\u6237\u3002',
+  toggleSelfBlocked: '\u4e0d\u80fd\u505c\u7528\u5f53\u524d\u767b\u5f55\u8d26\u53f7\u3002',
+  toggleLastAdminBlocked: '\u81f3\u5c11\u9700\u8981\u4fdd\u7559\u4e00\u4e2a\u542f\u7528\u4e2d\u7684\u7ba1\u7406\u5458\u8d26\u53f7\u3002',
+  toggleFailed: '\u7528\u6237\u72b6\u6001\u66f4\u65b0\u5931\u8d25\u3002',
+  enableSuccess: (username: string) => `\u7528\u6237 ${username} \u5df2\u542f\u7528`,
+  disableSuccess: (username: string) => `\u7528\u6237 ${username} \u5df2\u505c\u7528`,
   createHint: '\u65b0\u521b\u5efa\u7684\u8d26\u53f7\u4f1a\u7acb\u523b\u5237\u65b0\u5230\u4e0a\u65b9\u5217\u8868\uff0c\u9ed8\u8ba4\u6309\u521b\u5efa\u65f6\u95f4\u5012\u5e8f\u5c55\u793a\u3002',
   createRestrictedTitle: '\u65b0\u589e\u7528\u6237\u5df2\u53d7\u9650',
   createRestrictedMessage: '\u666e\u901a\u7528\u6237\u53ef\u4ee5\u67e5\u770b\u548c\u7ef4\u62a4\u8d26\u53f7\u57fa\u672c\u4fe1\u606f\uff0c\u65b0\u589e\u7528\u6237\u548c\u5206\u914d\u89d2\u8272\u4ecd\u9700\u8981\u7ba1\u7406\u5458\u64cd\u4f5c\u3002',
@@ -118,11 +129,13 @@ const editPassword = ref('')
 const editUserMessage = ref('')
 const editUserMessageTone = ref<'success' | 'error'>('success')
 const updatingUser = ref(false)
+const togglingUserId = ref('')
 
 const totalUsers = computed(() => users.value.length)
 const adminUsers = computed(() => users.value.filter((item) => item.role === 'admin').length)
 const normalUsers = computed(() => users.value.filter((item) => item.role === 'user').length)
 const activeUsers = computed(() => users.value.filter((item) => item.is_active).length)
+const activeAdminUsers = computed(() => users.value.filter((item) => item.role === 'admin' && item.is_active).length)
 const canManageUserPermissions = computed(() => authStore.isAdmin)
 const canCreateUser = computed(() => (
   canManageUserPermissions.value
@@ -372,6 +385,56 @@ async function updateUser() {
   }
 }
 
+function isLastActiveAdmin(user: Record<string, any>) {
+  return user.role === 'admin' && user.is_active && activeAdminUsers.value <= 1
+}
+
+function getToggleUserStatusTitle(user: Record<string, any>) {
+  if (togglingUserId.value === user.id) {
+    return uiText.statusUpdating
+  }
+  if (!canManageUserPermissions.value) {
+    return uiText.toggleForbidden
+  }
+  if (user.id === authStore.user?.id) {
+    return uiText.toggleSelfBlocked
+  }
+  if (isLastActiveAdmin(user)) {
+    return uiText.toggleLastAdminBlocked
+  }
+  return user.is_active ? uiText.disableUser : uiText.enableUser
+}
+
+function canToggleUserStatus(user: Record<string, any>) {
+  return (
+    canManageUserPermissions.value
+    && !togglingUserId.value
+    && user.id !== authStore.user?.id
+    && !isLastActiveAdmin(user)
+  )
+}
+
+async function toggleUserStatus(user: Record<string, any>) {
+  if (!canToggleUserStatus(user)) {
+    toast.error(getToggleUserStatusTitle(user))
+    return
+  }
+
+  togglingUserId.value = user.id
+  try {
+    const { data } = await http.patch<UserRecord>(`/auth/users/${user.id}`, {
+      is_active: !user.is_active,
+    })
+
+    users.value = users.value.map((item) => (item.id === data.id ? data : item))
+    toast.success(data.is_active ? uiText.enableSuccess(data.username) : uiText.disableSuccess(data.username))
+  } catch (error) {
+    toast.error(getErrorMessage(error, uiText.toggleFailed))
+  } finally {
+    togglingUserId.value = ''
+  }
+}
+
 function handleSort(key: string, order: 'asc' | 'desc') {
   sortKey.value = key as SortableUserKey
   sortOrder.value = order
@@ -570,15 +633,32 @@ onMounted(() => {
         </template>
 
         <template #actions="{ row }">
-          <button
-            class="data-table__actions-btn"
-            type="button"
-            :title="t('common.actions.edit')"
-            :aria-label="t('common.actions.edit')"
-            @click="openEditUser(row)"
-          >
-            <Pencil :size="14" />
-          </button>
+          <div class="user-actions-cell">
+            <button
+              class="data-table__actions-btn"
+              type="button"
+              :title="t('common.actions.edit')"
+              :aria-label="t('common.actions.edit')"
+              @click="openEditUser(row)"
+            >
+              <Pencil :size="14" />
+            </button>
+
+            <button
+              v-if="canManageUserPermissions"
+              class="data-table__actions-btn user-status-toggle"
+              :class="row.is_active ? 'is-danger' : 'is-success'"
+              type="button"
+              :disabled="!canToggleUserStatus(row)"
+              :title="getToggleUserStatusTitle(row)"
+              :aria-label="getToggleUserStatusTitle(row)"
+              @click="toggleUserStatus(row)"
+            >
+              <Loader2 v-if="togglingUserId === row.id" class="lucide-spin" :size="14" />
+              <PowerOff v-else-if="row.is_active" :size="14" />
+              <Power v-else :size="14" />
+            </button>
+          </div>
         </template>
       </DataTable>
 
@@ -978,6 +1058,41 @@ onMounted(() => {
 .user-table-shell :deep(.data-table-wrapper) {
   min-width: 0;
   max-width: 100%;
+}
+
+.user-table-shell :deep(.data-table__actions) {
+  width: 108px;
+}
+
+.user-actions-cell {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+
+.user-actions-cell .data-table__actions-btn:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.user-status-toggle.is-danger {
+  color: var(--state-danger);
+}
+
+.user-status-toggle.is-danger:hover:not(:disabled) {
+  background: var(--state-danger-bg);
+  color: var(--state-danger);
+}
+
+.user-status-toggle.is-success {
+  color: var(--state-success);
+}
+
+.user-status-toggle.is-success:hover:not(:disabled) {
+  background: var(--state-success-bg);
+  color: var(--state-success);
 }
 
 .user-identity-cell {

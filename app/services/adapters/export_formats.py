@@ -85,6 +85,7 @@ FORMAT_EXPORT_SUPPORT: Dict[str, List[str]] = {
     
     # 纯文本
     ".txt": ["original", "bilingual_txt", "tmx", "xliff"],
+    ".dat": ["original", "bilingual_txt", "tmx", "xliff"],
     
     # 本地化文件 - 支持所有导出选项
     ".properties": ["original", "bilingual", "bilingual_txt", "tmx", "xliff"],

@@ -190,7 +190,7 @@ class MultiFormatExporter:
         text_map = self._build_text_translation_map(translation_maps)
         export_filename = self._build_translated_filename(filename)
 
-        if extension == ".txt":
+        if extension in {".txt", ".dat"}:
             content = self._replace_plain_text(original_bytes, text_map)
         elif extension in {".html", ".htm"}:
             from app.services.adapters.html_exporter import HtmlExporter
@@ -536,6 +536,7 @@ class MultiFormatExporter:
             ".pdf": "pdf",
             ".pptx": "powerpoint",
             ".txt": "plaintext",
+            ".dat": "plaintext",
             ".html": "html",
             ".htm": "html",
             ".xml": "xml",
@@ -705,6 +706,7 @@ class MultiFormatExporter:
             ".svg": "image/svg+xml",
             ".txml": "application/octet-stream",
             ".txt": "text/plain; charset=utf-8",
+            ".dat": "text/plain; charset=utf-8",
             ".yaml": "application/yaml; charset=utf-8",
             ".yml": "application/yaml; charset=utf-8",
             ".zip": "application/zip",

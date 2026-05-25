@@ -32,6 +32,19 @@ const emit = defineEmits<{
 const editorRef = ref<HTMLDivElement | null>(null)
 const isFocused = ref(false)
 const isComposing = ref(false)
+const MAX_EDITOR_HISTORY_SIZE = 100
+
+interface EditorHistorySnapshot {
+  text: string
+  caretOffset: number
+}
+
+const undoStack = ref<EditorHistorySnapshot[]>([])
+const redoStack = ref<EditorHistorySnapshot[]>([])
+const isApplyingHistory = ref(false)
+const compositionSnapshotRecorded = ref(false)
+const canUndoEditorChange = computed(() => undoStack.value.length > 0)
+const canRedoEditorChange = computed(() => redoStack.value.length > 0)
 
 const statusClass = computed(() => `segment-row--${props.segment.status || 'none'}`)
 const parityClass = computed(() => (props.index % 2 === 0 ? 'segment-row--odd' : 'segment-row--even'))
@@ -371,6 +384,83 @@ function restoreSerializableCaretPosition(el: HTMLElement, offset: number) {
   selection.addRange(range)
 }
 
+function getCurrentEditorText(): string {
+  if (editorRef.value) {
+    return serializeEditorContent(editorRef.value)
+  }
+  return props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
+}
+
+function getCurrentEditorSnapshot(): EditorHistorySnapshot {
+  const text = getCurrentEditorText()
+  return {
+    text,
+    caretOffset: editorRef.value
+      ? saveSerializableCaretPosition(editorRef.value)
+      : text.length,
+  }
+}
+
+function pushHistorySnapshot(stack: EditorHistorySnapshot[], snapshot: EditorHistorySnapshot) {
+  const lastSnapshot = stack[stack.length - 1]
+  if (lastSnapshot?.text === snapshot.text) {
+    return
+  }
+  stack.push(snapshot)
+  if (stack.length > MAX_EDITOR_HISTORY_SIZE) {
+    stack.shift()
+  }
+}
+
+function clearEditorHistory() {
+  undoStack.value = []
+  redoStack.value = []
+  compositionSnapshotRecorded.value = false
+}
+
+function recordUndoSnapshot(clearRedo = true) {
+  if (props.disabled || !editorRef.value || isApplyingHistory.value || isComposing.value) {
+    return
+  }
+  pushHistorySnapshot(undoStack.value, getCurrentEditorSnapshot())
+  if (clearRedo) {
+    redoStack.value = []
+  }
+}
+
+function applyHistorySnapshot(snapshot: EditorHistorySnapshot) {
+  isApplyingHistory.value = true
+  emit('update', props.segment.sentence_id, snapshot.text)
+  void nextTick(() => {
+    if (editorRef.value) {
+      editorRef.value.innerHTML = editorHtmlContent.value
+      editorRef.value.focus({ preventScroll: true })
+      restoreSerializableCaretPosition(editorRef.value, snapshot.caretOffset)
+    }
+    isApplyingHistory.value = false
+  })
+}
+
+function undoEditorChange() {
+  const targetSnapshot = undoStack.value.pop()
+  if (!targetSnapshot) {
+    return false
+  }
+  pushHistorySnapshot(redoStack.value, getCurrentEditorSnapshot())
+  applyHistorySnapshot(targetSnapshot)
+  return true
+}
+
+function redoEditorChange() {
+  const targetSnapshot = redoStack.value.pop()
+  if (!targetSnapshot) {
+    return false
+  }
+  pushHistorySnapshot(undoStack.value, getCurrentEditorSnapshot())
+  applyHistorySnapshot(targetSnapshot)
+  return true
+}
+
 function handleFocus() {
   isFocused.value = true
   emit('focus', props.segment.sentence_id)
@@ -391,8 +481,70 @@ function handleEditorShellClick() {
   })
 }
 
+function handleBeforeInput(event: Event) {
+  const inputEvent = event as InputEvent
+  if (props.disabled || isApplyingHistory.value) {
+    return
+  }
+
+  if (inputEvent.inputType === 'historyUndo') {
+    inputEvent.preventDefault()
+    if (!isComposing.value) {
+      undoEditorChange()
+    }
+    return
+  }
+
+  if (inputEvent.inputType === 'historyRedo') {
+    inputEvent.preventDefault()
+    if (!isComposing.value) {
+      redoEditorChange()
+    }
+    return
+  }
+
+  if (isComposing.value || inputEvent.isComposing || inputEvent.inputType === 'insertFromPaste') {
+    return
+  }
+
+  recordUndoSnapshot()
+}
+
+function handleKeydown(event: KeyboardEvent) {
+  if (props.disabled || isApplyingHistory.value || event.altKey) {
+    return
+  }
+
+  const usesShortcutModifier = event.ctrlKey || event.metaKey
+  if (!usesShortcutModifier) {
+    return
+  }
+
+  const key = event.key.toLowerCase()
+  if (key === 'z') {
+    event.preventDefault()
+    if (isComposing.value) {
+      return
+    }
+    if (event.shiftKey) {
+      redoEditorChange()
+    } else {
+      undoEditorChange()
+    }
+    return
+  }
+
+  if (key === 'y') {
+    event.preventDefault()
+    if (!isComposing.value) {
+      redoEditorChange()
+    }
+  }
+}
+
 function handleInput() {
   if (!editorRef.value) return
+  if (isApplyingHistory.value) return
   if (isComposing.value) return
   
   // 获取纯文本内容
@@ -441,16 +593,22 @@ function handleInput() {
 
 // 监听外部数据变化，更新编辑器内容
 function handleCompositionStart() {
+  if (!compositionSnapshotRecorded.value) {
+    recordUndoSnapshot()
+    compositionSnapshotRecorded.value = true
+  }
   isComposing.value = true
 }
 
 function handleCompositionEnd() {
   isComposing.value = false
   handleInput()
+  compositionSnapshotRecorded.value = false
 }
 
 function handlePaste(event: ClipboardEvent) {
   event.preventDefault()
+  recordUndoSnapshot()
   const text = event.clipboardData?.getData('text/plain') || ''
   document.execCommand('insertText', false, text)
 }
@@ -462,11 +620,30 @@ onMounted(() => {
 })
 
 watch(
+  () => props.segment.sentence_id,
+  () => {
+    clearEditorHistory()
+  }
+)
+
+watch(
   () => props.segment.target_text,
-  (newText) => {
+  () => {
+    if (!isFocused.value && !isApplyingHistory.value) {
+      clearEditorHistory()
+    }
     if (!isFocused.value && editorRef.value) {
       // 非聚焦状态，更新带高亮的 HTML
       editorRef.value.innerHTML = editorHtmlContent.value
+    }
+  }
+)
+
+watch(
+  () => props.pendingRevision?.id ?? null,
+  () => {
+    if (!isFocused.value && !isApplyingHistory.value) {
+      clearEditorHistory()
     }
   }
 )
@@ -480,6 +657,13 @@ watch(
     }
   }
 )
+
+defineExpose({
+  undoEditorChange,
+  redoEditorChange,
+  canUndoEditorChange,
+  canRedoEditorChange,
+})
 
 </script>
 
@@ -563,6 +747,8 @@ watch(
         @focus="handleFocus"
         @blur="handleBlur"
         @click="handleClick"
+        @beforeinput="handleBeforeInput"
+        @keydown="handleKeydown"
         @compositionstart="handleCompositionStart"
         @compositionend="handleCompositionEnd"
         @input="handleInput"

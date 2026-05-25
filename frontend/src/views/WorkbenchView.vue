@@ -40,7 +40,7 @@ import {
   Upload,
   X,
 } from 'lucide-vue-next'
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicInstance } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 
@@ -96,6 +96,10 @@ type SaveToTMScope = 'translated' | 'confirmed'
 type SaveToTMTargetMode = 'new' | 'existing'
 type SegmentDisplayScope = 'all' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'confirmed_only' | 'empty_target'
 type RevisionMenuKind = 'track' | 'accept' | 'reject'
+type SegmentEditorRowPublic = ComponentPublicInstance & {
+  undoEditorChange: () => boolean
+  redoEditorChange: () => boolean
+}
 type SaveToTMPayload = {
   collection_mode: SaveToTMTargetMode
   collection_id?: string
@@ -125,6 +129,7 @@ const virtualListRef = ref<{
   scrollToIndex: (index: number, align?: ScrollLogicalPosition) => Promise<boolean>
   focusIndex: (index: number, selector?: string, align?: ScrollLogicalPosition) => Promise<boolean>
 } | null>(null)
+const segmentEditorRowRefs = ref<Record<string, SegmentEditorRowPublic>>({})
 
 const sidecarRef = ref<HTMLElement | null>(null)
 const sidecarWidth = ref<number | null>(null)
@@ -521,7 +526,7 @@ const activeSegmentHistory = computed(() => (
 ))
 
 const activePendingRevision = computed(() => (
-  activeSegmentHistory.value.find((entry) => entry.status === 'pending') || null
+  segmentStore.activeSentenceId ? segmentStore.getPendingRevision(segmentStore.activeSentenceId) : null
 ))
 
 const activeSegmentSourceText = computed(() => activeSegment.value?.source_text || '')
@@ -1161,7 +1166,10 @@ async function replaceAllSearchMatches() {
 
   pageError.value = ''
   try {
-    await segmentStore.syncToBackend()
+    const synced = await segmentStore.syncToBackend()
+    if (!synced) {
+      return
+    }
     const { data } = await http.post<{ updated_count: number; occurrence_count: number }>(
       `/file-records/${segmentStore.fileRecord.id}/segments/replace`,
       {
@@ -1218,6 +1226,45 @@ function showRibbonPlaceholder(name: string) {
     title: t('workbench.ribbon.placeholderTitle'),
     message: t('workbench.ribbon.placeholderMessage', { name }),
   })
+}
+
+function setSegmentEditorRowRef(sentenceId: string, instance: Element | ComponentPublicInstance | null) {
+  const nextRefs = { ...segmentEditorRowRefs.value }
+  if (instance) {
+    nextRefs[sentenceId] = instance as SegmentEditorRowPublic
+  } else {
+    delete nextRefs[sentenceId]
+  }
+  segmentEditorRowRefs.value = nextRefs
+}
+
+function getActiveSegmentEditorRow() {
+  const sentenceId = segmentStore.activeSentenceId
+  return sentenceId ? segmentEditorRowRefs.value[sentenceId] || null : null
+}
+
+function undoActiveSegmentEdit() {
+  if (!activeSegment.value) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+
+  const applied = getActiveSegmentEditorRow()?.undoEditorChange() ?? false
+  if (!applied) {
+    toast.warn('当前句段没有可撤回的编辑。')
+  }
+}
+
+function redoActiveSegmentEdit() {
+  if (!activeSegment.value) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+
+  const applied = getActiveSegmentEditorRow()?.redoEditorChange() ?? false
+  if (!applied) {
+    toast.warn('当前句段没有可恢复的编辑。')
+  }
 }
 
 function copySourceToTarget() {
@@ -1436,6 +1483,19 @@ async function loadTask() {
       targetQuery: targetSearchQuery.value,
       searchFuzzy: searchFuzzyEnabled.value,
     })
+    if (segmentStore.fileRecord?.is_edit_locked) {
+      const message = segmentStore.fileRecord.active_operation_message || t('workbench.errors.editLocked')
+      pageError.value = message
+      toast.warn({
+        title: t('workbench.errors.editLocked'),
+        message,
+      })
+      const projectId = segmentStore.fileRecord.project_id
+      if (projectId) {
+        void router.replace({ name: 'project-detail', params: { id: projectId } })
+      }
+      return
+    }
     if (segmentStore.segments[0] && !segmentStore.activeSentenceId) {
       segmentStore.setActiveSentence(segmentStore.segments[0].sentence_id)
     }
@@ -1476,7 +1536,10 @@ async function refreshSegmentPage(page = segmentStore.currentPage, size = segmen
 
   pageError.value = ''
   try {
-    await segmentStore.syncToBackend()
+    const synced = await segmentStore.syncToBackend()
+    if (!synced) {
+      return
+    }
     await segmentStore.loadSegmentPage({
       page,
       pageSize: size,
@@ -1584,7 +1647,10 @@ async function saveToTM() {
   pageError.value = ''
   savingToTM.value = true
   try {
-    await segmentStore.syncToBackend()
+    const synced = await segmentStore.syncToBackend()
+    if (!synced) {
+      return
+    }
 
     const payload: SaveToTMPayload = saveToTMTargetMode.value === 'new'
       ? {
@@ -1654,7 +1720,10 @@ function handleIssueSaved(_marker: IssueMarker) {
 async function saveNow() {
   pageError.value = ''
   try {
-    await segmentStore.syncToBackend()
+    const synced = await segmentStore.syncToBackend()
+    if (!synced) {
+      return
+    }
     toast.success(t('workbench.messages.synced'))
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.save'))
@@ -2124,7 +2193,7 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group">
           <span class="tool-col">
-            <button class="tool-line tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.undo'))">
+            <button class="tool-line tool-button" type="button" :disabled="!activeSegment" @click="undoActiveSegmentEdit">
               <span class="icon-text-area">
                 <span class="tool-item">
                   <Undo2 class="tool-label-icon" :size="16" />
@@ -2132,7 +2201,7 @@ onBeforeRouteLeave(async () => {
                 </span>
               </span>
             </button>
-            <button class="tool-line tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.redo'))">
+            <button class="tool-line tool-button" type="button" :disabled="!activeSegment" @click="redoActiveSegmentEdit">
               <span class="icon-text-area">
                 <span class="tool-item">
                   <Redo2 class="tool-label-icon" :size="16" />
@@ -2911,6 +2980,7 @@ onBeforeRouteLeave(async () => {
               >
                 <template #default="{ item, index }">
                   <SegmentEditorRow
+                    :ref="(instance) => setSegmentEditorRowRef(item.sentence_id, instance)"
                     :segment="item"
                     :index="getEditorSegmentDisplayIndex(item.sentence_id, index)"
                     :active="segmentStore.activeSentenceId === item.sentence_id"

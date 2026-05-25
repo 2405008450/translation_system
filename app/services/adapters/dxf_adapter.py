@@ -3,6 +3,7 @@ DXF 适配器模块 - 解析 AutoCAD DXF 文件中的文本
 
 提取 DXF 文件中的 TEXT、MTEXT 和 DIMENSION 实体的文本内容。
 """
+import re
 from typing import List, Optional
 
 from app.services.adapters.base import FormatAdapter
@@ -23,6 +24,16 @@ class DxfAdapter(FormatAdapter):
         return [".dxf"]
 
     def parse(self, raw_bytes: bytes) -> ParseResult:
+        return self._parse_with_options(raw_bytes, skip_non_translatable=False)
+
+    def parse_with_options(self, raw_bytes: bytes, filename: str = "<unknown>", options: dict | None = None) -> ParseResult:
+        self.validate_file_size(raw_bytes, filename)
+        return self._parse_with_options(
+            raw_bytes,
+            skip_non_translatable=bool((options or {}).get("skip_non_translatable", True)),
+        )
+
+    def _parse_with_options(self, raw_bytes: bytes, skip_non_translatable: bool) -> ParseResult:
         if not raw_bytes:
             return ParseResult(
                 ast=DocumentAST(nodes=[], source_format=".dxf"),
@@ -31,7 +42,7 @@ class DxfAdapter(FormatAdapter):
             )
         
         content = self._decode_content(raw_bytes)
-        nodes = self._parse_dxf(content)
+        nodes = self._parse_dxf(content, skip_non_translatable=skip_non_translatable)
         
         ast = DocumentAST(nodes=nodes, source_format=".dxf")
         segments = extract_segments(ast)
@@ -39,7 +50,7 @@ class DxfAdapter(FormatAdapter):
         return ParseResult(
             ast=ast,
             segments=segments,
-            metadata={"text_count": len(nodes)},
+            metadata={"text_count": len(nodes), "skip_non_translatable": skip_non_translatable},
         )
 
     def _decode_content(self, raw_bytes: bytes) -> str:
@@ -50,7 +61,7 @@ class DxfAdapter(FormatAdapter):
                 continue
         raise ParseError(filename="<unknown>", reason="无法识别文件编码")
 
-    def _parse_dxf(self, content: str) -> List[BlockNode]:
+    def _parse_dxf(self, content: str, skip_non_translatable: bool = False) -> List[BlockNode]:
         """解析 DXF 文件提取文本"""
         nodes = []
         lines = content.replace('\r\n', '\n').split('\n')
@@ -73,7 +84,10 @@ class DxfAdapter(FormatAdapter):
                         # 保存前一个实体
                         if current_entity in ('TEXT', 'MTEXT', 'ATTRIB', 'ATTDEF'):
                             node = self._create_text_node(current_entity, entity_data)
-                            if node:
+                            if node and (
+                                not skip_non_translatable
+                                or self._is_translatable_text(node.text_content or "")
+                            ):
                                 nodes.append(node)
                         
                         current_entity = value
@@ -91,7 +105,10 @@ class DxfAdapter(FormatAdapter):
         # 处理最后一个实体
         if current_entity in ('TEXT', 'MTEXT', 'ATTRIB', 'ATTDEF'):
             node = self._create_text_node(current_entity, entity_data)
-            if node:
+            if node and (
+                not skip_non_translatable
+                or self._is_translatable_text(node.text_content or "")
+            ):
                 nodes.append(node)
         
         return nodes
@@ -139,8 +156,7 @@ class DxfAdapter(FormatAdapter):
 
     def _clean_mtext(self, text: str) -> str:
         """清理 MTEXT 格式代码"""
-        import re
-        
+
         # 移除格式代码
         # \\P = 换行
         text = text.replace('\\P', '\n')
@@ -185,3 +201,7 @@ class DxfAdapter(FormatAdapter):
         text = text.replace('\\\\', '\\')
         
         return text
+
+    def _is_translatable_text(self, text: str) -> bool:
+        """判断 DXF 文本是否包含可翻译字符，纯数字和符号默认跳过。"""
+        return bool(re.search(r"[A-Za-z\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", text or ""))

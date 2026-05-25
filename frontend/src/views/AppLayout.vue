@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {
   Bell,
+  BarChart3,
   BookOpen,
   Briefcase,
   ChevronRight,
@@ -59,6 +60,13 @@ const expandedGroups = reactive<Record<string, boolean>>({
 })
 
 const navGroups = computed<NavGroup[]>(() => [
+  {
+    key: 'dashboard',
+    label: t('shell.sections.dashboard'),
+    icon: BarChart3,
+    routeName: 'dashboard',
+    visible: true,
+  },
   {
     key: 'workspace',
     label: t('shell.sections.workspace'),
@@ -141,6 +149,8 @@ const breadcrumbs = computed(() => {
   }
 
   switch (route.name) {
+    case 'dashboard':
+      return [{ label: t('shell.sections.dashboard') }]
     case 'projects':
       return [{ label: t('shell.sections.workspace') }]
     case 'project-detail':

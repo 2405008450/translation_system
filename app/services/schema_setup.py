@@ -60,6 +60,11 @@ REQUIRED_SCHEMA = {
         "project_id",
         "document_parse_mode",
         "document_parse_options",
+        "document_statistics",
+        "active_operation",
+        "active_operation_token",
+        "active_operation_updated_at",
+        "active_operation_user_id",
         "source_language",
         "target_language",
         "creator_id",
@@ -69,8 +74,31 @@ REQUIRED_SCHEMA = {
         "access_level",
     },
     "segments": {
+        "source_word_count",
         "llm_provider",
         "llm_model",
+    },
+    "translation_metric_events": {
+        "id",
+        "event_key",
+        "project_id",
+        "file_record_id",
+        "segment_id",
+        "user_id",
+        "source",
+        "source_language",
+        "target_language",
+        "source_word_count",
+        "target_was_empty",
+        "created_at",
+    },
+    "user_activity_daily": {
+        "id",
+        "user_id",
+        "activity_date",
+        "request_count",
+        "first_seen_at",
+        "last_seen_at",
     },
     "segment_revisions": {
         "id",
@@ -102,6 +130,18 @@ REQUIRED_SCHEMA = {
         "created_at",
         "updated_at",
         "resolved_at",
+    },
+}
+
+REQUIRED_INDEXES = {
+    "segments": {
+        "ix_segments_source_word_count",
+        "ix_segments_translated_source_word_count",
+        "ix_segments_source_word_backfill",
+        "ix_segments_translated_backfill",
+    },
+    "translation_metric_events": {
+        "ix_translation_metric_events_source_created_at",
     },
 }
 
@@ -167,6 +207,16 @@ def _collect_missing_schema(inspector) -> list[str]:
         }
         for column_name in sorted(required_columns - existing_columns):
             missing_items.append(f"{table_name}.{column_name}")
+
+    for table_name, required_indexes in REQUIRED_INDEXES.items():
+        if not inspector.has_table(table_name):
+            continue
+        existing_indexes = {
+            index["name"]
+            for index in inspector.get_indexes(table_name)
+        }
+        for index_name in sorted(required_indexes - existing_indexes):
+            missing_items.append(f"{table_name}.{index_name}")
     return missing_items
 
 
@@ -448,6 +498,26 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
             """
             ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS document_statistics TEXT NOT NULL DEFAULT '{}'
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS active_operation VARCHAR(40)
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS active_operation_token VARCHAR(64)
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS active_operation_updated_at TIMESTAMP
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS active_operation_user_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
             ADD COLUMN IF NOT EXISTS source_language VARCHAR(20)
             """,
             """
@@ -487,8 +557,16 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ON file_records (status)
             """,
             """
+            CREATE INDEX IF NOT EXISTS ix_file_records_active_operation
+            ON file_records (active_operation)
+            """,
+            """
             CREATE INDEX IF NOT EXISTS ix_file_records_source_language
             ON file_records (source_language)
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS source_word_count INTEGER NOT NULL DEFAULT 0
             """,
             """
             ALTER TABLE IF EXISTS segments
@@ -501,6 +579,156 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_segments_file_record_order
             ON segments (file_record_id, block_index, row_index, cell_index, sentence_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_source_word_count
+            ON segments (source_word_count)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_translated_source_word_count
+            ON segments (file_record_id, source_word_count)
+            WHERE target_text <> '' AND source_word_count > 0
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_source_word_backfill
+            ON segments (id)
+            WHERE source_word_count = 0 AND source_text <> ''
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_translated_backfill
+            ON segments (updated_at, id)
+            WHERE target_text <> '' AND source_word_count > 0
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS translation_metric_events (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                event_key VARCHAR(140),
+                project_id UUID REFERENCES projects(id) ON DELETE SET NULL,
+                file_record_id UUID REFERENCES file_records(id) ON DELETE SET NULL,
+                segment_id UUID REFERENCES segments(id) ON DELETE SET NULL,
+                user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                source VARCHAR(20) NOT NULL DEFAULT 'manual',
+                source_language VARCHAR(20),
+                target_language VARCHAR(20),
+                source_word_count INTEGER NOT NULL DEFAULT 0,
+                target_was_empty BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS translation_metric_events
+            ADD COLUMN IF NOT EXISTS event_key VARCHAR(140)
+            """,
+            """
+            ALTER TABLE IF EXISTS translation_metric_events
+            ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS translation_metric_events
+            ADD COLUMN IF NOT EXISTS file_record_id UUID REFERENCES file_records(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS translation_metric_events
+            ADD COLUMN IF NOT EXISTS segment_id UUID REFERENCES segments(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS translation_metric_events
+            ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS translation_metric_events
+            ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'manual'
+            """,
+            """
+            ALTER TABLE IF EXISTS translation_metric_events
+            ADD COLUMN IF NOT EXISTS source_language VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS translation_metric_events
+            ADD COLUMN IF NOT EXISTS target_language VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS translation_metric_events
+            ADD COLUMN IF NOT EXISTS source_word_count INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS translation_metric_events
+            ADD COLUMN IF NOT EXISTS target_was_empty BOOLEAN NOT NULL DEFAULT TRUE
+            """,
+            """
+            ALTER TABLE IF EXISTS translation_metric_events
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_translation_metric_events_event_key
+            ON translation_metric_events (event_key)
+            WHERE event_key IS NOT NULL
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_metric_events_created_at
+            ON translation_metric_events (created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_metric_events_source
+            ON translation_metric_events (source)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_metric_events_language_pair
+            ON translation_metric_events (source_language, target_language)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_metric_events_file_record_id
+            ON translation_metric_events (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_metric_events_segment_id
+            ON translation_metric_events (segment_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_translation_metric_events_source_created_at
+            ON translation_metric_events (source, created_at)
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS user_activity_daily (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                activity_date DATE NOT NULL,
+                request_count INTEGER NOT NULL DEFAULT 0,
+                first_seen_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                last_seen_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS user_activity_daily
+            ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS user_activity_daily
+            ADD COLUMN IF NOT EXISTS activity_date DATE
+            """,
+            """
+            ALTER TABLE IF EXISTS user_activity_daily
+            ADD COLUMN IF NOT EXISTS request_count INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS user_activity_daily
+            ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            ALTER TABLE IF EXISTS user_activity_daily
+            ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_user_activity_daily_user_date
+            ON user_activity_daily (user_id, activity_date)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_user_activity_daily_activity_date
+            ON user_activity_daily (activity_date)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_user_activity_daily_user_id
+            ON user_activity_daily (user_id)
             """,
             f"""
             CREATE TABLE IF NOT EXISTS issue_markers (

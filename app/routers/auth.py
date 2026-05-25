@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.auth import (
     authenticate_user,
     build_auth_response,
+    count_active_admins,
     count_users,
     create_user,
     get_current_user,
@@ -130,7 +131,7 @@ def update_user_account(
     user_id: UUID,
     payload: UpdateUserRequest,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ) -> UserRead:
     require_users_table()
     target_user = get_user_by_id(db, user_id)
@@ -141,14 +142,29 @@ def update_user_account(
     if not updated_fields:
         raise HTTPException(status_code=400, detail="\u8bf7\u81f3\u5c11\u63d0\u4ea4\u4e00\u4e2a\u9700\u8981\u4fee\u6539\u7684\u5b57\u6bb5\u3002")
 
+    if "is_active" in updated_fields:
+        if current_user.role != "admin":
+            raise HTTPException(status_code=403, detail="\u53ea\u6709\u7ba1\u7406\u5458\u53ef\u4ee5\u542f\u7528\u6216\u505c\u7528\u7528\u6237\u3002")
+        if target_user.id == current_user.id and payload.is_active is False:
+            raise HTTPException(status_code=400, detail="\u4e0d\u80fd\u505c\u7528\u5f53\u524d\u767b\u5f55\u8d26\u53f7\u3002")
+        if (
+            target_user.role == "admin"
+            and target_user.is_active
+            and payload.is_active is False
+            and count_active_admins(db) <= 1
+        ):
+            raise HTTPException(status_code=400, detail="\u81f3\u5c11\u9700\u8981\u4fdd\u7559\u4e00\u4e2a\u542f\u7528\u4e2d\u7684\u7ba1\u7406\u5458\u8d26\u53f7\u3002")
+
     user = update_user_profile(
         db=db,
         user=target_user,
         username=payload.username,
         nickname=payload.nickname,
         password=payload.password,
+        is_active=payload.is_active,
         update_username="username" in updated_fields,
         update_nickname="nickname" in updated_fields,
         update_password="password" in updated_fields,
+        update_is_active="is_active" in updated_fields,
     )
     return UserRead.model_validate(serialize_user(user))

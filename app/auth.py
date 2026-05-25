@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.database import engine, get_db
 from app.models import User
+from app.services.analytics_service import record_user_activity_safely
 
 
 USERS_TABLE_MISSING_MESSAGE = "users 表不存在，请先执行 scripts/create_users_table.sql。"
@@ -54,6 +55,15 @@ def get_user_by_id(db: Session, user_id: UUID) -> User | None:
 def count_users(db: Session) -> int:
     require_users_table()
     return db.query(User).count()
+
+
+def count_active_admins(db: Session) -> int:
+    require_users_table()
+    return (
+        db.query(User)
+        .filter(User.role == "admin", User.is_active.is_(True))
+        .count()
+    )
 
 
 def list_users(db: Session) -> list[User]:
@@ -103,9 +113,11 @@ def update_user_profile(
     username: str | None = None,
     nickname: str | None = None,
     password: str | None = None,
+    is_active: bool | None = None,
     update_username: bool = False,
     update_nickname: bool = False,
     update_password: bool = False,
+    update_is_active: bool = False,
 ) -> User:
     require_users_table()
 
@@ -129,6 +141,11 @@ def update_user_profile(
         if password is None:
             raise HTTPException(status_code=400, detail="\u5bc6\u7801\u4e0d\u80fd\u4e3a\u7a7a\u3002")
         user.hashed_password = hash_password(password)
+
+    if update_is_active:
+        if is_active is None:
+            raise HTTPException(status_code=400, detail="\u542f\u7528\u72b6\u6001\u4e0d\u80fd\u4e3a\u7a7a\u3002")
+        user.is_active = is_active
 
     db.add(user)
     db.commit()
@@ -174,7 +191,7 @@ def build_auth_response(user: User) -> dict[str, Any]:
         subject=str(user.id),
         extra_claims={
             "username": user.username,
-            "nickname": user.nickname,
+            "nickname": getattr(user, "nickname", None),
             "role": user.role,
         },
     )
@@ -189,7 +206,7 @@ def serialize_user(user: User) -> dict[str, Any]:
     return {
         "id": str(user.id),
         "username": user.username,
-        "nickname": user.nickname,
+        "nickname": getattr(user, "nickname", None),
         "role": user.role,
         "is_active": user.is_active,
         "created_at": user.created_at.isoformat(),
@@ -235,6 +252,7 @@ def get_current_user(
         raise credentials_exception
     if not user.is_active:
         raise HTTPException(status_code=403, detail="当前用户已被禁用。")
+    record_user_activity_safely(user.id)
     return user
 
 

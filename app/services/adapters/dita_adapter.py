@@ -3,6 +3,7 @@ DITA 适配器模块 - 解析 DITA XML 文件
 
 Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6
 """
+import hashlib
 from io import BytesIO
 from typing import List, Optional
 
@@ -15,6 +16,7 @@ from app.services.adapters.models import (
     DocumentAST,
     NodeType,
     ParseResult,
+    Segment,
 )
 from app.services.adapters.segment_extractor import extract_segments
 
@@ -69,6 +71,16 @@ class DitaAdapter(FormatAdapter):
         return [".dita", ".ditamap", ".xml"]
 
     def parse(self, raw_bytes: bytes) -> ParseResult:
+        return self._parse_with_options(raw_bytes, no_split=False)
+
+    def parse_with_options(self, raw_bytes: bytes, filename: str = "<unknown>", options: dict | None = None) -> ParseResult:
+        self.validate_file_size(raw_bytes, filename)
+        return self._parse_with_options(
+            raw_bytes,
+            no_split=bool((options or {}).get("xml_inline_elements_no_split", True)),
+        )
+
+    def _parse_with_options(self, raw_bytes: bytes, no_split: bool) -> ParseResult:
         """解析 DITA 文件
         
         Args:
@@ -103,12 +115,12 @@ class DitaAdapter(FormatAdapter):
         doc_type = root.tag
         
         ast = DocumentAST(nodes=nodes, source_format=".dita")
-        segments = extract_segments(ast)
+        segments = self._extract_unsplit_segments(ast) if no_split else extract_segments(ast)
         
         return ParseResult(
             ast=ast,
             segments=segments,
-            metadata={"doc_type": doc_type},
+            metadata={"doc_type": doc_type, "xml_inline_elements_no_split": no_split},
         )
 
     def _parse_element(self, element: etree._Element) -> List[BlockNode]:
@@ -250,3 +262,31 @@ class DitaAdapter(FormatAdapter):
             str: 所有文本内容
         """
         return "".join(element.itertext())
+
+    def _extract_unsplit_segments(self, ast: DocumentAST) -> List[Segment]:
+        """按块提取 XML 文本，不再对块内文本做二次断句。"""
+        segments: List[Segment] = []
+        position = 0
+
+        def visit(node: BlockNode, path: str) -> None:
+            nonlocal position
+            if node.text_content and node.text_content.strip():
+                display_text = node.text_content.strip()
+                source_text = " ".join(display_text.split())
+                content_hash = hashlib.md5(source_text.encode()).hexdigest()[:8]
+                segments.append(Segment(
+                    segment_id=Segment.generate_id(path, position, content_hash),
+                    source_text=source_text,
+                    display_text=display_text,
+                    block_path=path,
+                    position=position,
+                ))
+                position += 1
+
+            for child_index, child in enumerate(node.children or []):
+                visit(child, f"{path}.children.{child_index}")
+
+        for index, node in enumerate(ast.nodes):
+            visit(node, str(index))
+
+        return segments

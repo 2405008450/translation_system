@@ -97,10 +97,12 @@ def create_revision(
     normalized_before_text = before_text or ""
     normalized_after_text = after_text or ""
     normalized_source = _normalize_revision_source(source)
+    if normalized_source != "manual":
+        return None
     if normalized_before_text == normalized_after_text:
         return None
 
-    pending_revisions = _list_pending_revisions_for_segment(db, segment.id)
+    pending_revisions = _list_pending_revisions_for_segment(db, segment.id, source="manual")
     if pending_revisions:
         anchor_revision, duplicate_revisions = _merge_pending_revisions(
             pending_revisions,
@@ -214,7 +216,11 @@ def _resolve_revision(
     if revision.status != "pending":
         raise HTTPException(status_code=409, detail="Revision has already been resolved.")
 
-    pending_revisions = _list_pending_revisions_for_segment(db, revision.segment_id)
+    pending_revisions = _list_pending_revisions_for_segment(
+        db,
+        revision.segment_id,
+        source=revision.source,
+    )
     anchor_revision, duplicate_revisions = _merge_pending_revisions(pending_revisions)
 
     for duplicate_revision in duplicate_revisions:
@@ -252,6 +258,7 @@ def _batch_resolve_revisions(
         .filter(
             SegmentRevision.file_record_id == file_record_id,
             SegmentRevision.status == "pending",
+            SegmentRevision.source == "manual",
         )
         .order_by(
             SegmentRevision.segment_id.asc(),
@@ -295,16 +302,18 @@ def _batch_resolve_revisions(
 def _list_pending_revisions_for_segment(
     db: Session,
     segment_id: UUID,
+    source: str | None = None,
 ) -> list[SegmentRevision]:
-    return (
+    query = (
         db.query(SegmentRevision)
         .filter(
             SegmentRevision.segment_id == segment_id,
             SegmentRevision.status == "pending",
         )
-        .order_by(SegmentRevision.created_at.asc(), SegmentRevision.id.asc())
-        .all()
     )
+    if source:
+        query = query.filter(SegmentRevision.source == source)
+    return query.order_by(SegmentRevision.created_at.asc(), SegmentRevision.id.asc()).all()
 
 
 def _merge_pending_revisions(
@@ -331,10 +340,10 @@ def _merge_pending_revisions(
 def _collapse_pending_revisions_for_read(
     revisions: list[SegmentRevision],
 ) -> list[SegmentRevision]:
-    pending_groups: dict[UUID, list[SegmentRevision]] = {}
+    pending_groups: dict[tuple[UUID, str], list[SegmentRevision]] = {}
     for revision in revisions:
         if revision.status == "pending":
-            pending_groups.setdefault(revision.segment_id, []).append(revision)
+            pending_groups.setdefault((revision.segment_id, revision.source), []).append(revision)
 
     hidden_revision_ids: set[UUID] = set()
     collapsed_revision_by_id: dict[UUID, SegmentRevision] = {}

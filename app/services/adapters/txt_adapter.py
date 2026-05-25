@@ -29,7 +29,7 @@ class TxtAdapter(FormatAdapter):
     """
 
     def supported_extensions(self) -> List[str]:
-        return [".txt"]
+        return [".txt", ".dat"]
 
     def parse(self, raw_bytes: bytes) -> ParseResult:
         """解析 TXT 文件

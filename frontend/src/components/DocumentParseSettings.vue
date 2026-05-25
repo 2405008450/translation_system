@@ -4,6 +4,9 @@ import { FileText, Settings2 } from 'lucide-vue-next'
 
 import type { DocumentParseMode, DocumentParseOptions, UploadCapability } from '../types/api'
 
+type ParseOptionKey = keyof DocumentParseOptions
+type UploadCapabilitySetting = NonNullable<UploadCapability['settings']>[number]
+
 const props = withDefaults(defineProps<{
   modelValue: DocumentParseMode
   parseOptions: DocumentParseOptions
@@ -22,6 +25,28 @@ const emit = defineEmits<{
   'update:parseOptions': [value: DocumentParseOptions]
 }>()
 
+const optionDefaults: DocumentParseOptions = {
+  include_headers_footers: true,
+  include_footnotes_endnotes: true,
+  include_comments: true,
+  clean_format: false,
+  translate_code_blocks: true,
+  extract_links: false,
+  skip_non_translatable: true,
+  xml_inline_elements_no_split: true,
+  custom_parse_config: false,
+  translate_idml_comments: false,
+  translate_idml_hidden_layers: false,
+}
+
+const wordTranslationOptionKeys: ParseOptionKey[] = [
+  'include_headers_footers',
+  'include_footnotes_endnotes',
+  'include_comments',
+]
+
+const formatOrder = ['.docx', '.md', '.dat', '.dxf', '.idml', '.xml', '.yaml', '.yml']
+
 const selectedExtensions = computed(() => {
   const extensions = new Set<string>()
   props.selectedFiles.forEach((file) => {
@@ -34,23 +59,14 @@ const selectedExtensions = computed(() => {
 })
 
 const hasSelectedFiles = computed(() => props.selectedFiles.length > 0)
-const docxCapability = computed(() => props.capabilities.find((item) => item.extensions.includes('.docx')) ?? null)
 const hasCapabilityData = computed(() => props.capabilities.length > 0)
-const showWordSettings = computed(() => (
-  (!hasCapabilityData.value || Boolean(docxCapability.value))
-  && (!hasSelectedFiles.value || selectedExtensions.value.has('.docx'))
-))
 
 const visibleCapabilities = computed(() => {
-  if (!hasSelectedFiles.value) {
-    return props.capabilities.filter((item) => !item.extensions.includes('.docx'))
-  }
+  const capabilities = hasSelectedFiles.value
+    ? props.capabilities.filter((item) => item.extensions.some((extension) => selectedExtensions.value.has(extension)))
+    : props.capabilities.filter((item) => (item.settings?.length ?? 0) > 0)
 
-  const selected = selectedExtensions.value
-  return props.capabilities.filter((item) => (
-    !item.extensions.includes('.docx')
-    && item.extensions.some((extension) => selected.has(extension))
-  ))
+  return [...capabilities].sort((left, right) => capabilityOrder(left) - capabilityOrder(right))
 })
 
 const selectedFileSummary = computed(() => {
@@ -58,10 +74,7 @@ const selectedFileSummary = computed(() => {
     return '选择文件后会显示对应格式的真实解析能力。'
   }
 
-  const labels = [
-    ...(showWordSettings.value ? ['Word 文档'] : []),
-    ...visibleCapabilities.value.map((item) => item.label),
-  ]
+  const labels = visibleCapabilities.value.map((item) => item.label)
   if (labels.length === 0) {
     return '当前文件格式不在后端任务上传能力中。'
   }
@@ -78,34 +91,103 @@ const compactCapabilityText = computed(() => {
   return selectedFileSummary.value
 })
 
-const allWordTranslationOptions = computed(() => (
-  props.parseOptions.include_headers_footers
-  && props.parseOptions.include_footnotes_endnotes
-  && props.parseOptions.include_comments
-))
+function capabilityOrder(capability: UploadCapability) {
+  const indexes = capability.extensions
+    .map((extension) => formatOrder.indexOf(extension))
+    .filter((index) => index >= 0)
+  return indexes.length ? Math.min(...indexes) : 999
+}
 
-function updateOption(key: keyof DocumentParseOptions, value: boolean) {
+function canonicalExtension(capability: UploadCapability) {
+  const ordered = formatOrder.find((extension) => capability.extensions.includes(extension))
+  return ordered || capability.extensions[0] || ''
+}
+
+function iconText(capability: UploadCapability) {
+  const extension = canonicalExtension(capability)
+  if (extension === '.docx') return 'W'
+  if (extension === '.dxf') return 'A'
+  if (extension === '.idml') return 'ID'
+  if (extension === '.markdown') return 'MD'
+  return extension.replace('.', '').toUpperCase() || 'DOC'
+}
+
+function iconToneClass(capability: UploadCapability) {
+  return `doc-file-icon--${canonicalExtension(capability).replace('.', '') || 'generic'}`
+}
+
+function settingsForCapability(capability: UploadCapability) {
+  return capability.settings ?? []
+}
+
+function selectAllSettings(capability: UploadCapability) {
+  const settings = settingsForCapability(capability)
+  if (capability.extensions.includes('.docx')) {
+    return settings.filter((setting) => wordTranslationOptionKeys.includes(setting.id))
+  }
+  return settings
+}
+
+function selectableSettings(capability: UploadCapability) {
+  return selectAllSettings(capability).filter((setting) => !setting.disabled)
+}
+
+function getOptionValue(key: ParseOptionKey) {
+  return props.parseOptions[key] ?? optionDefaults[key]
+}
+
+function emitParseOptions(nextOptions: DocumentParseOptions) {
+  emit('update:parseOptions', nextOptions)
+}
+
+function updateWordParseMode(nextOptions: DocumentParseOptions) {
+  emit('update:modelValue', wordTranslationOptionKeys.some((key) => nextOptions[key]) ? 'full' : 'body_only')
+}
+
+function updateOption(setting: UploadCapabilitySetting, value: boolean) {
+  if (setting.disabled) {
+    return
+  }
+
+  const key = setting.id
   const nextOptions = {
     ...props.parseOptions,
     [key]: value,
   }
-  emit('update:parseOptions', nextOptions)
-  emit('update:modelValue', (
-    nextOptions.include_headers_footers
-    || nextOptions.include_footnotes_endnotes
-    || nextOptions.include_comments
-  ) ? 'full' : 'body_only')
+  emitParseOptions(nextOptions)
+  if (wordTranslationOptionKeys.includes(key)) {
+    updateWordParseMode(nextOptions)
+  }
 }
 
-function updateAllWordOptions(value: boolean) {
-  const nextOptions = {
-    ...props.parseOptions,
-    include_headers_footers: value,
-    include_footnotes_endnotes: value,
-    include_comments: value,
+function updateCapabilityOptions(capability: UploadCapability, value: boolean) {
+  const nextOptions = { ...props.parseOptions }
+  selectableSettings(capability).forEach((setting) => {
+    nextOptions[setting.id] = value
+  })
+  emitParseOptions(nextOptions)
+
+  if (capability.extensions.includes('.docx')) {
+    updateWordParseMode(nextOptions)
   }
-  emit('update:parseOptions', nextOptions)
-  emit('update:modelValue', value ? 'full' : 'body_only')
+}
+
+function isCapabilityAllSelected(capability: UploadCapability) {
+  const settings = selectAllSettings(capability)
+  return settings.length > 0 && settings.every((setting) => getOptionValue(setting.id))
+}
+
+function isCapabilityPartiallySelected(capability: UploadCapability) {
+  const settings = selectAllSettings(capability)
+  return settings.some((setting) => getOptionValue(setting.id)) && !isCapabilityAllSelected(capability)
+}
+
+function showSelectAll(capability: UploadCapability) {
+  return Boolean(capability.settings_select_all) && selectAllSettings(capability).length > 1
+}
+
+function selectAllLabel(capability: UploadCapability) {
+  return capability.extensions.includes('.docx') ? '全选可翻译范围' : '全选'
 }
 
 function formatExtensions(extensions: string[]) {
@@ -126,98 +208,81 @@ function formatExtensions(extensions: string[]) {
       <Settings2 :size="18" />
     </header>
 
-    <section v-if="showWordSettings" class="doc-setting-card doc-setting-card--word">
-      <div class="doc-type-icon">W</div>
-      <label>
-        <input
-          type="checkbox"
-          :checked="allWordTranslationOptions"
-          @change="updateAllWordOptions(($event.target as HTMLInputElement).checked)"
-        />
-        全选可翻译范围
-      </label>
-      <label>
-        <input
-          type="checkbox"
-          :checked="parseOptions.include_headers_footers"
-          @change="updateOption('include_headers_footers', ($event.target as HTMLInputElement).checked)"
-        />
-        翻译页眉页脚
-      </label>
-      <label>
-        <input
-          type="checkbox"
-          :checked="parseOptions.include_footnotes_endnotes"
-          @change="updateOption('include_footnotes_endnotes', ($event.target as HTMLInputElement).checked)"
-        />
-        翻译脚注尾注
-      </label>
-      <label>
-        <input
-          type="checkbox"
-          :checked="parseOptions.include_comments"
-          @change="updateOption('include_comments', ($event.target as HTMLInputElement).checked)"
-        />
-        翻译批注
-      </label>
-      <label>
-        <input
-          type="checkbox"
-          :checked="parseOptions.clean_format"
-          @change="updateOption('clean_format', ($event.target as HTMLInputElement).checked)"
-        />
-        清洗格式
-      </label>
-    </section>
-
-    <section class="document-parse-settings__formats">
+    <section v-if="visibleCapabilities.length" class="document-parse-settings__formats">
       <div
         v-for="capability in visibleCapabilities"
         :key="capability.extensions.join(',')"
         class="document-parse-settings__format"
       >
-        <div class="document-parse-settings__format-head">
-          <span class="doc-file-icon">
-            {{ capability.extensions[0].slice(1).toUpperCase() }}
-          </span>
-          <div>
-            <strong>{{ capability.label }}</strong>
-            <small>{{ formatExtensions(capability.extensions) }} · 最大 {{ capability.max_size_mb }} MB</small>
-          </div>
+        <span
+          class="doc-file-icon"
+          :class="iconToneClass(capability)"
+          :title="`${capability.label}（${formatExtensions(capability.extensions)}）`"
+        >
+          {{ iconText(capability) }}
+        </span>
+
+        <div v-if="settingsForCapability(capability).length" class="document-parse-settings__option-list">
+          <label v-if="showSelectAll(capability)" class="document-parse-settings__option">
+            <input
+              type="checkbox"
+              :checked="isCapabilityAllSelected(capability)"
+              :indeterminate="isCapabilityPartiallySelected(capability)"
+              :disabled="selectableSettings(capability).length === 0"
+              @change="updateCapabilityOptions(capability, ($event.target as HTMLInputElement).checked)"
+            />
+            <span>{{ selectAllLabel(capability) }}</span>
+          </label>
+
+          <label
+            v-for="setting in settingsForCapability(capability)"
+            :key="setting.id"
+            class="document-parse-settings__option"
+            :class="{ 'is-disabled': setting.disabled }"
+            :title="setting.description || setting.label"
+          >
+            <input
+              type="checkbox"
+              :checked="getOptionValue(setting.id)"
+              :disabled="setting.disabled"
+              @change="updateOption(setting, ($event.target as HTMLInputElement).checked)"
+            />
+            <span>{{ setting.label }}</span>
+            <Settings2 v-if="setting.id === 'custom_parse_config'" :size="13" />
+          </label>
         </div>
-        <ul>
+
+        <ul v-else class="document-parse-settings__features">
           <li v-for="feature in capability.features" :key="feature">{{ feature }}</li>
         </ul>
       </div>
     </section>
+
+    <p v-else-if="hasCapabilityData" class="document-parse-settings__empty">
+      选择文件后显示对应格式的文档设置。
+    </p>
   </aside>
 
   <div v-else class="document-parse-settings document-parse-settings--inline">
-    <div v-if="showWordSettings" class="document-parse-settings__inline-options">
-      <label>
-        <input
-          type="checkbox"
-          :checked="parseOptions.include_headers_footers"
-          @change="updateOption('include_headers_footers', ($event.target as HTMLInputElement).checked)"
-        />
-        页眉页脚
-      </label>
-      <label>
-        <input
-          type="checkbox"
-          :checked="parseOptions.include_comments"
-          @change="updateOption('include_comments', ($event.target as HTMLInputElement).checked)"
-        />
-        批注
-      </label>
-      <label>
-        <input
-          type="checkbox"
-          :checked="parseOptions.clean_format"
-          @change="updateOption('clean_format', ($event.target as HTMLInputElement).checked)"
-        />
-        清洗格式
-      </label>
+    <div v-if="visibleCapabilities.some((capability) => settingsForCapability(capability).length)" class="document-parse-settings__inline-options">
+      <template v-for="capability in visibleCapabilities" :key="capability.extensions.join(',')">
+        <label
+          v-for="setting in settingsForCapability(capability)"
+          :key="`${capability.extensions.join(',')}:${setting.id}`"
+          class="document-parse-settings__option"
+          :class="{ 'is-disabled': setting.disabled }"
+          :title="setting.description || `${capability.label}: ${setting.label}`"
+        >
+          <input
+            type="checkbox"
+            :checked="getOptionValue(setting.id)"
+            :disabled="setting.disabled"
+            @change="updateOption(setting, ($event.target as HTMLInputElement).checked)"
+          />
+          <span>{{ setting.label }}</span>
+          <Settings2 v-if="setting.id === 'custom_parse_config'" :size="13" />
+        </label>
+      </template>
     </div>
 
     <div class="document-parse-settings__inline-summary">
@@ -236,7 +301,7 @@ function formatExtensions(extensions: string[]) {
   min-height: 100%;
   display: grid;
   align-content: start;
-  gap: 20px;
+  gap: 22px;
   padding: 18px 20px 28px;
   border-left: 1px solid #dbe3e1;
   background: #ffffff;
@@ -262,101 +327,124 @@ function formatExtensions(extensions: string[]) {
   line-height: 1.5;
 }
 
-.doc-setting-card {
-  display: grid;
-  align-content: start;
-  gap: 11px;
-  min-width: 0;
-}
-
-.doc-type-icon,
-.doc-file-icon {
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  margin-bottom: 10px;
-  border-radius: 4px;
-  color: #ffffff;
-  font-weight: 700;
-}
-
-.doc-setting-card--word .doc-type-icon {
-  background: #2b5aa8;
-}
-
-.doc-file-icon {
-  width: 38px;
-  height: 38px;
-  flex: 0 0 auto;
-  background: #5fa2f3;
-  font-size: 12px;
-}
-
-.doc-setting-card label,
-.document-parse-settings__inline-options label {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  color: #1976d2;
-  font-size: 13px;
-  line-height: 1.3;
-}
-
-.doc-setting-card input[type="checkbox"],
-.document-parse-settings__inline-options input[type="checkbox"] {
-  width: 14px;
-  height: 14px;
-  margin: 0;
-  accent-color: #4596f6;
-}
-
 .document-parse-settings__formats {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(2, minmax(132px, 1fr));
+  gap: 30px 38px;
 }
 
 .document-parse-settings__format {
   min-width: 0;
-  padding: 12px;
-  border: 1px solid var(--line-soft);
-  border-radius: 8px;
-  background: var(--surface-1);
 }
 
-.document-parse-settings__format-head {
-  display: flex;
-  gap: 10px;
+.doc-file-icon {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  margin-bottom: 14px;
+  border-radius: 3px;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  box-shadow: inset 0 -12px 20px rgb(0 0 0 / 10%);
+}
+
+.doc-file-icon::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  border-top: 9px solid rgb(255 255 255 / 78%);
+  border-left: 9px solid rgb(255 255 255 / 30%);
+}
+
+.doc-file-icon--md {
+  background: linear-gradient(135deg, #2b8be9, #72b7ff);
+}
+
+.doc-file-icon--dat,
+.doc-file-icon--yaml,
+.doc-file-icon--yml {
+  background: linear-gradient(135deg, #18a4a7, #45d0d1);
+}
+
+.doc-file-icon--dxf {
+  background: linear-gradient(135deg, #c52026, #f07b66);
+  font-size: 26px;
+  font-family: Georgia, 'Times New Roman', serif;
+}
+
+.doc-file-icon--idml {
+  background: linear-gradient(135deg, #8b145f, #d749a9);
+}
+
+.doc-file-icon--xml {
+  background: linear-gradient(135deg, #f07c22, #ffb15d);
+}
+
+.doc-file-icon--docx {
+  background: linear-gradient(135deg, #2b5aa8, #5fa2f3);
+}
+
+.doc-file-icon--generic {
+  background: linear-gradient(135deg, #64748b, #94a3b8);
+}
+
+.document-parse-settings__option-list,
+.document-parse-settings__features {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+}
+
+.document-parse-settings__option,
+.document-parse-settings__inline-options label {
+  display: inline-flex;
   align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: #1680db;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.document-parse-settings__option span {
   min-width: 0;
 }
 
-.document-parse-settings__format strong,
-.document-parse-settings__format small {
-  display: block;
+.document-parse-settings__option svg {
+  flex: 0 0 auto;
+  color: #1f2937;
 }
 
-.document-parse-settings__format strong {
-  font-size: 13px;
-  font-weight: 600;
+.document-parse-settings__option.is-disabled {
+  color: #9aa6b2;
 }
 
-.document-parse-settings__format small {
-  margin-top: 3px;
-  color: var(--text-muted);
-  font-size: 12px;
-  line-height: 1.4;
+.document-parse-settings__option input[type="checkbox"],
+.document-parse-settings__inline-options input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  flex: 0 0 auto;
+  accent-color: #4596f6;
 }
 
-.document-parse-settings__format ul {
-  display: grid;
-  gap: 5px;
-  margin: 10px 0 0;
+.document-parse-settings__features {
   padding-left: 18px;
   color: var(--text-secondary);
   font-size: 12px;
   line-height: 1.45;
+}
+
+.document-parse-settings__empty {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .document-parse-settings--inline {

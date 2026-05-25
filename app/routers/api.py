@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import quote, unquote, urlparse
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import case, func, or_
@@ -46,6 +46,7 @@ from app.services.adapters import (
     UnsupportedFormatError,
     get_registry,
 )
+from app.services.analytics_service import get_dashboard_payload, run_analytics_backfill_once
 from app.services.adapters.dita_exporter import DitaExporter
 from app.services.adapters.svg_exporter import SvgExporter
 from app.services.adapters.tmx_exporter import TmxExporter
@@ -58,6 +59,7 @@ from app.services.comment_service import (
     serialize_segment_comment,
     update_segment_comment,
 )
+from app.services.document_statistics import compute_docx_statistics, serialize_document_statistics
 from app.services.issue_marker_service import (
     create_issue_marker,
     delete_issue_marker,
@@ -74,6 +76,7 @@ from app.services.file_record_service import (
     delete_file_record,
     duplicate_file_record,
     get_file_record as get_file_record_model,
+    get_file_record_document_statistics,
     get_file_record_source_filename,
     get_file_record_with_segments,
     get_tm_target_text_map,
@@ -83,6 +86,16 @@ from app.services.file_record_service import (
     resolve_file_record_status,
     update_segment_by_sentence_id,
     update_segment_with_llm_result,
+)
+from app.services.file_operation_lock_service import (
+    FILE_OPERATION_TOKEN_HEADER,
+    PRE_TRANSLATE_OPERATION,
+    acquire_file_operation_lock,
+    clear_stale_file_operation_lock,
+    ensure_file_record_write_allowed,
+    heartbeat_file_operation_lock,
+    release_file_operation_lock,
+    serialize_file_operation_state,
 )
 from app.services.guideline_repository import (
     GuidelineTemplate,
@@ -118,9 +131,16 @@ from app.services.revision_service import (
     accept_revision,
     batch_accept_revisions,
     batch_reject_revisions,
+    get_revision_or_404,
     list_revisions,
     reject_revision,
     serialize_segment_revision,
+)
+from app.services.resource_export_queue import (
+    ResourceExportFormat,
+    build_resource_export_download_response,
+    ensure_export_task_status,
+    queue_resource_export,
 )
 from app.services.slate_parser import parse_docx_for_slate
 from app.services.task_file_service import (
@@ -332,6 +352,7 @@ def _serialize_file_record_upload_result(file_record: FileRecord) -> dict[str, A
         "status": file_record.status,
         "document_parse_mode": file_record.document_parse_mode,
         "document_parse_options": _get_file_record_document_parse_options(file_record),
+        "document_statistics": get_file_record_document_statistics(file_record),
         "created_at": file_record.created_at.isoformat(),
     }
 
@@ -737,6 +758,10 @@ class RevisionResolvePayload(BaseModel):
     status: Literal["accepted", "rejected"]
 
 
+class FileOperationLockRequest(BaseModel):
+    operation: Literal["pre_translate"] = PRE_TRANSLATE_OPERATION
+
+
 class LLMTranslateRequest(BaseModel):
     scope: Literal["fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"] = "all"
     provider: Literal["auto", "deepseek", "openrouter"] = "deepseek"
@@ -860,6 +885,20 @@ class ProjectUpdatePayload(BaseModel):
     deadline: str | None = None
     access_level: Literal["team", "private", "public"] | None = None
     translation_guidelines: str | None = None
+
+
+class ProjectDocumentStatisticsPayload(BaseModel):
+    file_ids: list[UUID] = Field(default_factory=list)
+
+
+@router.get("/analytics/dashboard")
+def get_analytics_dashboard(
+    background_tasks: BackgroundTasks,
+    granularity: Literal["day", "month"] = "day",
+    db: Session = Depends(get_db),
+):
+    background_tasks.add_task(run_analytics_backfill_once)
+    return get_dashboard_payload(db, granularity=granularity)
 
 
 def _build_binary_download_response(
@@ -1054,7 +1093,7 @@ def delete_translation_guideline_template(template_id: str):
 # 支持的文件扩展名（30种格式）
 SUPPORTED_EXTENSIONS = {
     # 办公文档
-    ".docx", ".txt", ".pdf", ".pptx", ".xlsx",
+    ".docx", ".txt", ".dat", ".pdf", ".pptx", ".xlsx",
     # 本地化文件
     ".properties", ".po", ".pot", ".strings", ".yaml", ".yml", ".json", ".php",
     # 网页/排版
@@ -1904,6 +1943,7 @@ def _build_project_file_payload(
     issue_stats: dict[str, int] | None = None,
 ) -> dict:
     source_bytes = load_file_record_source(file_record)
+    operation_state = serialize_file_operation_state(file_record)
     progress = calculate_file_record_progress(total_segments, translated_segments)
     effective_status = resolve_file_record_status(
         file_record.status,
@@ -1919,6 +1959,7 @@ def _build_project_file_payload(
         "status": effective_status,
         "document_parse_mode": getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
         "document_parse_options": _get_file_record_document_parse_options(file_record),
+        "document_statistics": get_file_record_document_statistics(file_record),
         "progress": progress,
         "total_segments": total_segments,
         "translated_segments": translated_segments,
@@ -1935,6 +1976,7 @@ def _build_project_file_payload(
         "term_base_id": file_record.term_base_id,
         "issue_count": issue_stats.get("issue_count", 0),
         "open_issue_count": issue_stats.get("open_issue_count", 0),
+        **operation_state,
     }
 
 
@@ -2101,9 +2143,14 @@ def get_project_detail(
     files = (
         db.query(FileRecord)
         .filter(FileRecord.project_id == project_id)
-        .order_by(FileRecord.created_at.desc())
+        .order_by(FileRecord.created_at.asc(), FileRecord.id.asc())
         .all()
     )
+    stale_lock_cleared = False
+    for file_record in files:
+        stale_lock_cleared = clear_stale_file_operation_lock(db, file_record) or stale_lock_cleared
+    if stale_lock_cleared:
+        db.commit()
     file_stats = _get_file_segment_stats(db, [file_record.id for file_record in files])
     issue_markers = list_issue_markers_for_project(db, project_id)
     project_issue_stats = _get_project_issue_stats(db, [project_id]).get(project_id)
@@ -2116,6 +2163,70 @@ def get_project_detail(
         project_issue_stats=project_issue_stats,
         file_issue_stats=file_issue_stats,
     )
+
+
+@router.post("/projects/{project_id}/document-statistics")
+def compute_project_document_statistics(
+    project_id: UUID,
+    payload: ProjectDocumentStatisticsPayload,
+    db: Session = Depends(get_db),
+):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+
+    file_ids = list(dict.fromkeys(payload.file_ids))
+    if not file_ids:
+        raise HTTPException(status_code=400, detail="请先选择要统计的文件。")
+
+    files = (
+        db.query(FileRecord)
+        .filter(FileRecord.project_id == project_id, FileRecord.id.in_(file_ids))
+        .order_by(FileRecord.created_at.asc(), FileRecord.id.asc())
+        .all()
+    )
+    if len(files) != len(file_ids):
+        raise HTTPException(status_code=404, detail="部分文件不存在或不属于当前项目。")
+
+    unavailable_statistics = {
+        "source": "unavailable",
+        "engine": None,
+        "license_status": None,
+        "include_textboxes_footnotes_endnotes": None,
+        "pages": None,
+        "words": None,
+        "characters": None,
+        "characters_with_spaces": None,
+        "paragraphs": None,
+        "lines": None,
+    }
+
+    for file_record in files:
+        source_bytes = load_file_record_source(file_record)
+        source_filename = get_file_record_source_filename(file_record)
+        if source_bytes and Path(source_filename).suffix.lower() == ".docx":
+            statistics = compute_docx_statistics(source_bytes)
+        else:
+            statistics = unavailable_statistics
+        file_record.document_statistics = serialize_document_statistics(statistics)
+
+    db.commit()
+    for file_record in files:
+        db.refresh(file_record)
+
+    file_stats = _get_file_segment_stats(db, [file_record.id for file_record in files])
+    file_issue_stats = _get_file_issue_stats(db, [file_record.id for file_record in files])
+    return {
+        "files": [
+            _build_project_file_payload(
+                file_record=file_record,
+                total_segments=file_stats.get(file_record.id, {"total": 0})["total"],
+                translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
+                issue_stats=file_issue_stats.get(file_record.id),
+            )
+            for file_record in files
+        ]
+    }
 
 
 @router.delete("/projects/{project_id}")
@@ -2159,13 +2270,8 @@ def update_project(
             raise HTTPException(status_code=400, detail="项目名称不能为空。")
         project.name = name
 
-    if payload.source_language is not None or payload.target_language is not None:
-        src = payload.source_language if payload.source_language is not None else project.source_language
-        tgt = payload.target_language if payload.target_language is not None else project.target_language
-        if src or tgt:
-            src, tgt = _require_tm_language_pair(src, tgt)
-        project.source_language = src
-        project.target_language = tgt
+    if {"source_language", "target_language"} & payload.model_fields_set:
+        raise HTTPException(status_code=400, detail="项目语言对不允许修改。")
 
     if payload.deadline is not None:
         project.deadline = _parse_optional_datetime(payload.deadline)
@@ -2182,6 +2288,11 @@ def update_project(
     return {
         "id": str(project.id),
         "name": project.name,
+        "filename": project.name,
+        "source_language": project.source_language,
+        "target_language": project.target_language,
+        "deadline": project.deadline.isoformat() if project.deadline else None,
+        "access_level": project.access_level,
         "translation_guidelines": project.translation_guidelines or "",
         "updated_at": project.updated_at.isoformat(),
     }
@@ -2440,6 +2551,7 @@ def get_file_records(
             "status": file_record.status,
             "document_parse_mode": getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
             "document_parse_options": _get_file_record_document_parse_options(file_record),
+            "document_statistics": get_file_record_document_statistics(file_record),
             "source_language": file_record.source_language,
             "target_language": file_record.target_language,
             "created_at": file_record.created_at.isoformat(),
@@ -2612,6 +2724,9 @@ def get_file_record(
         raise HTTPException(status_code=404, detail="文档不存在。")
 
     file_record = result["file_record"]
+    if clear_stale_file_operation_lock(db, file_record):
+        db.commit()
+        db.refresh(file_record)
     segments = result["segments"]
     source_bytes = load_file_record_source(file_record)
     source_filename = get_file_record_source_filename(file_record)
@@ -2642,6 +2757,8 @@ def get_file_record(
         "status": file_record.status,
         "document_parse_mode": getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
         "document_parse_options": _get_file_record_document_parse_options(file_record),
+        "document_statistics": get_file_record_document_statistics(file_record),
+        **serialize_file_operation_state(file_record),
         "source_language": file_record.source_language,
         "target_language": file_record.target_language,
         "collection_id": file_record.collection_id,
@@ -2661,6 +2778,70 @@ def get_file_record(
         "open_issue_count": issue_stats["open_issue_count"],
         "status_stats": _get_segment_status_stats(db, file_record_id),
         "segments": [_serialize_workbench_segment(seg) for seg in segments],
+    }
+
+
+@router.post("/file-records/{file_record_id}/operation-lock")
+def acquire_file_record_operation_lock(
+    file_record_id: UUID,
+    payload: FileOperationLockRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record, token = acquire_file_operation_lock(
+        db,
+        file_record_id,
+        operation=payload.operation,
+        current_user=current_user,
+    )
+    return {
+        "id": str(file_record.id),
+        "token": token,
+        **serialize_file_operation_state(file_record),
+    }
+
+
+@router.patch("/file-records/{file_record_id}/operation-lock")
+def heartbeat_file_record_operation_lock(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文件不存在。")
+
+    heartbeat_file_operation_lock(
+        db,
+        file_record,
+        operation_token=operation_token,
+    )
+    return {
+        "id": str(file_record.id),
+        **serialize_file_operation_state(file_record),
+    }
+
+
+@router.delete("/file-records/{file_record_id}/operation-lock")
+def release_file_record_operation_lock(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文件不存在。")
+
+    release_file_operation_lock(
+        db,
+        file_record,
+        operation_token=operation_token,
+    )
+    return {
+        "id": str(file_record.id),
+        **serialize_file_operation_state(file_record),
     }
 
 
@@ -2862,11 +3043,13 @@ def rematch_file_record(
     payload: RematchRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
     selected_collection_ids = _require_selected_collection_ids(
         _validate_collection_ids(db, payload.collection_ids)
     )
@@ -2973,11 +3156,13 @@ def patch_file_record_bindings(
     payload: FileRecordBindingsRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
     source_language, target_language = _resolve_file_record_language_pair(file_record)
 
     if "collection_id" in payload.model_fields_set:
@@ -3132,6 +3317,22 @@ def export_file_record_with_type(
     )
 
 
+def _require_file_record_write_access(
+    db: Session,
+    file_record_id: UUID,
+    operation_token: str | None = None,
+) -> FileRecord:
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文件不存在。")
+    ensure_file_record_write_allowed(
+        db,
+        file_record,
+        operation_token=operation_token,
+    )
+    return file_record
+
+
 @router.put("/file-records/{file_record_id}/segments/{sentence_id}")
 @router.put("/documents/{file_record_id}/segments/{sentence_id}", include_in_schema=False)
 def update_segment(
@@ -3140,8 +3341,10 @@ def update_segment(
     update: SegmentUpdate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """更新单个片段的译文"""
+    _require_file_record_write_access(db, file_record_id, operation_token)
     segment = update_segment_by_sentence_id(
         db=db,
         file_record_id=file_record_id,
@@ -3169,8 +3372,10 @@ def batch_update(
     batch: BatchSegmentUpdate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """批量更新片段译文"""
+    _require_file_record_write_access(db, file_record_id, operation_token)
     updated_count = batch_update_segments(
         db=db,
         file_record_id=file_record_id,
@@ -3186,12 +3391,14 @@ def replace_file_record_segment_targets(
     payload: SegmentReplaceRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """在服务端按筛选条件替换译文，避免前端加载全文后再逐条修改。"""
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    _require_file_record_write_access(db, file_record_id, operation_token)
     target_query = (payload.target_query or "").strip()
     if not target_query:
         raise HTTPException(status_code=400, detail="请先输入译文关键词用于替换。")
@@ -3448,6 +3655,8 @@ def resolve_revision(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    existing_revision = get_revision_or_404(db, revision_id)
+    _require_file_record_write_access(db, existing_revision.file_record_id)
     if payload.status == "accepted":
         revision = accept_revision(
             db,
@@ -3469,9 +3678,7 @@ def resolve_all_revisions_as_accepted(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    file_record = get_file_record_model(db, file_record_id)
-    if not file_record:
-        raise HTTPException(status_code=404, detail="File record not found.")
+    _require_file_record_write_access(db, file_record_id)
 
     updated_count = batch_accept_revisions(
         db,
@@ -3487,9 +3694,7 @@ def resolve_all_revisions_as_rejected(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    file_record = get_file_record_model(db, file_record_id)
-    if not file_record:
-        raise HTTPException(status_code=404, detail="File record not found.")
+    _require_file_record_write_access(db, file_record_id)
 
     updated_count = batch_reject_revisions(
         db,
@@ -3767,12 +3972,14 @@ async def llm_translate_file_record(
     payload: LLMTranslateRequest | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """对指定范围的片段触发 LLM 译文修正，并通过 SSE 逐条返回结果。"""
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
     source_language, target_language = _resolve_file_record_language_pair(file_record)
     body = payload or LLMTranslateRequest()
     try:
@@ -3841,6 +4048,7 @@ async def llm_translate_file_record(
                 continue
 
             try:
+                ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
                 segment = update_segment_with_llm_result(
                     db=db,
                     file_record_id=file_record_id,
@@ -4412,6 +4620,36 @@ def export_tm_collection_entries_xlsx(
         rows=rows,
     )
     return build_xlsx_download_response(f"{collection.name}-tm.xlsx", xlsx_bytes)
+
+
+@router.post("/translation-memory/collections/{collection_id}/exports")
+def queue_tm_collection_export(
+    collection_id: UUID,
+    format: ResourceExportFormat = Query(default="xlsx"),
+    db: Session = Depends(get_db),
+):
+    collection = _get_collection_or_404(db, collection_id)
+    if collection is None:
+        raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
+
+    return JSONResponse(
+        status_code=202,
+        content=queue_resource_export(
+            resource_type="tm",
+            resource_id=collection.id,
+            export_format=format,
+        ),
+    )
+
+
+@router.get("/translation-memory/export-tasks/{task_id}")
+def get_tm_export_task(task_id: str):
+    return ensure_export_task_status(task_id, expected_resource_type="tm")
+
+
+@router.get("/translation-memory/export-tasks/{task_id}/download")
+def download_tm_export_task(task_id: str):
+    return build_resource_export_download_response(task_id, expected_resource_type="tm")
 
 
 @router.post("/translation-memory/collections/{collection_id}/entries")

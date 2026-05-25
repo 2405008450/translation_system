@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { GitMerge, Loader2, Pencil, Plus, Search, Trash2, X } from 'lucide-vue-next'
-import { computed, onMounted, ref, watch } from 'vue'
+import { FileCode2, FileSpreadsheet, GitMerge, Loader2, Pencil, Plus, Search, Trash2, X } from 'lucide-vue-next'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { http } from '../api/http'
@@ -9,9 +9,29 @@ import DataTable from '../components/DataTable.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
 import Modal from '../components/base/Modal.vue'
 import Pagination from '../components/Pagination.vue'
+import RowActionMenu from '../components/RowActionMenu.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { canonicalizeLanguagePair, formatLanguagePair, languageOptions } from '../constants/languages'
 import type { TMCollection } from '../types/api'
+import { downloadBlob, resolveDownloadFilename } from '../utils/download'
+
+type ExportFormat = 'xlsx' | 'tmx'
+
+interface ResourceExportTask {
+  task_id: string
+  resource_type: 'tm'
+  resource_id: string
+  format: ExportFormat
+  status: 'queued' | 'running' | 'completed' | 'failed'
+  progress: number
+  message: string
+  result: {
+    filename: string
+    size_bytes: number
+    total_entries: number
+  } | null
+  error: string | null
+}
 
 interface TMCollectionMergeSummary {
   collection: TMCollection
@@ -48,8 +68,11 @@ const mergeDescription = ref('')
 const mergeMessage = ref('')
 const mergeSubmitting = ref(false)
 const deletingCollections = ref(false)
+const exportingKey = ref('')
 
 const selectedCollectionId = ref('')
+let exportPollTimer: number | null = null
+let disposed = false
 
 const columns: DataTableColumn[] = [
   { key: 'name', label: '名称', sortable: true },
@@ -101,6 +124,83 @@ function getErrorMessage(error: unknown, fallback: string) {
     return String(error.response?.data?.detail || fallback)
   }
   return error instanceof Error ? error.message : fallback
+}
+
+function getExportKey(collectionId: string, format: ExportFormat) {
+  return `${collectionId}:${format}`
+}
+
+function isExporting(collectionId: string, format: ExportFormat) {
+  return exportingKey.value === getExportKey(collectionId, format)
+}
+
+function clearExportPollTimer() {
+  if (exportPollTimer) {
+    window.clearTimeout(exportPollTimer)
+    exportPollTimer = null
+  }
+}
+
+function waitForExportPoll(ms: number) {
+  return new Promise<void>((resolve) => {
+    clearExportPollTimer()
+    exportPollTimer = window.setTimeout(() => {
+      exportPollTimer = null
+      resolve()
+    }, ms)
+  })
+}
+
+async function waitForExportTask(task: ResourceExportTask) {
+  let currentTask = task
+  while (!disposed) {
+    collectionMessage.value = currentTask.message || `导出处理中：${currentTask.progress}%`
+
+    if (currentTask.status === 'completed') {
+      return currentTask
+    }
+    if (currentTask.status === 'failed') {
+      throw new Error(currentTask.error || currentTask.message || '导出失败。')
+    }
+
+    await waitForExportPoll(1200)
+    const { data } = await http.get<ResourceExportTask>(`/translation-memory/export-tasks/${currentTask.task_id}`)
+    currentTask = data
+  }
+  throw new Error('导出任务已取消。')
+}
+
+async function exportCollection(collection: TMCollection | Record<string, any>, format: ExportFormat) {
+  if (exportingKey.value) {
+    return
+  }
+  const currentCollection = collection as TMCollection
+  const formatLabel = format === 'xlsx' ? 'Excel' : 'TMX'
+  exportingKey.value = getExportKey(currentCollection.id, format)
+  collectionMessage.value = ''
+  try {
+    const { data: task } = await http.post<ResourceExportTask>(
+      `/translation-memory/collections/${currentCollection.id}/exports`,
+      null,
+      { params: { format } },
+    )
+    collectionMessage.value = `${currentCollection.name} 的 ${formatLabel} 导出任务已提交。`
+    const completedTask = await waitForExportTask(task)
+    const response = await http.get(`/translation-memory/export-tasks/${completedTask.task_id}/download`, {
+      responseType: 'blob',
+    })
+    const filename = resolveDownloadFilename(
+      response.headers['content-disposition'],
+      `${currentCollection.name}-tm.${format}`,
+    )
+    downloadBlob(response.data, filename)
+    collectionMessage.value = `${currentCollection.name} 已导出为 ${formatLabel}。`
+  } catch (error) {
+    collectionMessage.value = getErrorMessage(error, `${currentCollection.name} 导出失败。`)
+  } finally {
+    clearExportPollTimer()
+    exportingKey.value = ''
+  }
 }
 
 function ensureLanguagePair(sourceLanguage: string, targetLanguage: string) {
@@ -398,12 +498,18 @@ watch([searchQuery, filterSourceLanguage, filterTargetLanguage], () => {
 })
 
 onMounted(() => {
+  disposed = false
   void loadCollections()
+})
+
+onUnmounted(() => {
+  disposed = true
+  clearExportPollTimer()
 })
 </script>
 
 <template>
-  <div>
+  <div class="tm-management-page">
     <div class="table-page">
       <div class="table-page__header">
         <h2 class="table-page__title">记忆库集合</h2>
@@ -447,6 +553,26 @@ onMounted(() => {
           <button class="button button--primary" type="button" @click="openCreateDialog">
             <Plus :size="14" /> 创建
           </button>
+          <button
+            class="button"
+            type="button"
+            :disabled="!canMergeSelectedCollections || mergeSubmitting"
+            :title="canMergeSelectedCollections ? '合并选中的记忆库' : getSelectedCollectionsMergeError()"
+            @click="openMergeDialog"
+          >
+            <GitMerge :size="14" />
+            合并
+          </button>
+          <button
+            class="button button--danger"
+            type="button"
+            :disabled="selectedIds.size === 0 || deletingCollections"
+            :title="selectedIds.size === 0 ? '请先选择要删除的记忆库' : '删除选中的记忆库'"
+            @click="deleteSelectedCollections"
+          >
+            <Trash2 :size="14" />
+            删除
+          </button>
           <button class="button" type="button" :disabled="loadingCollections" @click="loadCollections">
             {{ loadingCollections ? '刷新中...' : '刷新' }}
           </button>
@@ -455,31 +581,6 @@ onMounted(() => {
           </span>
         </div>
       </div>
-
-        <div v-if="selectedIds.size > 0" class="resource-bulk-bar">
-          <span>已选择 {{ selectedIds.size }} 个记忆库，包含 {{ selectedCollectionEntryCount }} 条 TM 记录</span>
-          <div class="resource-bulk-bar__actions">
-            <button
-              class="button"
-              type="button"
-              :disabled="!canMergeSelectedCollections || mergeSubmitting"
-              :title="canMergeSelectedCollections ? '合并选中的记忆库' : getSelectedCollectionsMergeError()"
-              @click="openMergeDialog"
-            >
-              <GitMerge :size="14" />
-              合并
-            </button>
-            <button
-              class="button button--danger"
-              type="button"
-              :disabled="deletingCollections"
-              @click="deleteSelectedCollections"
-            >
-              <Trash2 :size="14" />
-              删除
-            </button>
-          </div>
-        </div>
 
         <p v-if="collectionMessage" class="form-message table-page__message">{{ collectionMessage }}</p>
 
@@ -533,24 +634,47 @@ onMounted(() => {
             </template>
 
             <template #actions="{ row }">
-              <div style="display: flex; gap: 4px; justify-content: center;">
-                <button
-                  class="data-table__actions-btn"
-                  type="button"
-                  title="查看详情"
-                  @click="navigateToCollectionDetail(row.id)"
-                >
-                  <Pencil :size="14" />
-                </button>
-                <button
-                  class="data-table__actions-btn"
-                  type="button"
-                  title="删除"
-                  :disabled="deletingCollections"
-                  @click="deleteCollection(row)"
-                >
-                  <Trash2 :size="14" />
-                </button>
+              <div class="resource-row-actions">
+                <RowActionMenu title="更多操作">
+                  <template #default="{ close }">
+                    <button type="button" role="menuitem" @click="navigateToCollectionDetail(row.id); close()">
+                      <Pencil :size="14" />
+                      查看详情
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      title="导出 Excel"
+                      :disabled="Boolean(exportingKey)"
+                      @click="close(); exportCollection(row, 'xlsx')"
+                    >
+                      <Loader2 v-if="isExporting(row.id, 'xlsx')" class="lucide-spin" :size="13" />
+                      <FileSpreadsheet v-else :size="13" />
+                      导出 Excel
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      title="导出 TMX"
+                      :disabled="Boolean(exportingKey)"
+                      @click="close(); exportCollection(row, 'tmx')"
+                    >
+                      <Loader2 v-if="isExporting(row.id, 'tmx')" class="lucide-spin" :size="13" />
+                      <FileCode2 v-else :size="13" />
+                      导出 TMX
+                    </button>
+                    <button
+                      class="is-danger"
+                      type="button"
+                      role="menuitem"
+                      :disabled="deletingCollections"
+                      @click="close(); deleteCollection(row)"
+                    >
+                      <Trash2 :size="14" />
+                      删除
+                    </button>
+                  </template>
+                </RowActionMenu>
               </div>
             </template>
           </DataTable>
@@ -695,40 +819,51 @@ onMounted(() => {
 
 <style scoped>
 .tm-link {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
   padding: 0;
   border: none;
   background: transparent;
   box-shadow: none;
   color: var(--brand-700);
   font-weight: 500;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+  white-space: nowrap;
 }
 
 .tm-link:hover {
   color: var(--brand-600);
 }
 
-.resource-bulk-bar {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  align-items: center;
-  margin: 0 20px 12px;
-  padding: 12px 14px;
-  border: 1px solid var(--line-soft);
-  border-radius: 10px;
-  background: var(--brand-050);
-  color: var(--text-secondary);
-  font-size: 13px;
-}
-
-.resource-bulk-bar__actions {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-}
-
 .table-page__message {
   margin: 0 20px 12px;
+}
+
+.resource-row-actions {
+  display: flex;
+  justify-content: center;
+  margin: 0 auto;
+}
+
+.tm-management-page :deep(.data-table) {
+  table-layout: fixed;
+}
+
+.tm-management-page :deep(.data-table th),
+.tm-management-page :deep(.data-table td) {
+  min-width: 0;
+}
+
+.tm-management-page :deep(.data-table td:not(.data-table__actions)) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tm-management-page :deep(.data-table__actions) {
+  width: 64px;
+  min-width: 64px;
 }
 
 .resource-modal-message {
@@ -772,15 +907,9 @@ onMounted(() => {
 }
 
 @media (max-width: 720px) {
-  .resource-bulk-bar,
   .resource-merge-item {
     align-items: flex-start;
     flex-direction: column;
-  }
-
-  .resource-bulk-bar__actions {
-    width: 100%;
-    justify-content: flex-end;
   }
 }
 </style>

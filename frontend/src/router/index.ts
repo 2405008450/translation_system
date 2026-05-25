@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 
 import { useAuthStore } from '../stores/auth'
 import AppLayout from '../views/AppLayout.vue'
+import DashboardView from '../views/DashboardView.vue'
 import LoginView from '../views/LoginView.vue'
 import ProjectDetailView from '../views/ProjectDetailView.vue'
 import ProjectListView from '../views/ProjectListView.vue'
@@ -47,6 +48,18 @@ const router = createRouter({
         {
           path: '',
           redirect: { name: 'projects' },
+        },
+        {
+          path: 'dashboard',
+          name: 'dashboard',
+          component: DashboardView,
+          meta: {
+            navSection: 'dashboard',
+            pageTitle: '数据看板',
+            pageDescription: '查看项目、翻译字数、LLM 处理量和用户活跃趋势',
+            pageTitleKey: 'pages.dashboard.title',
+            pageDescriptionKey: 'pages.dashboard.description',
+          },
         },
         {
           path: 'projects',
