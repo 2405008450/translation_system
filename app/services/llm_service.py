@@ -13,7 +13,7 @@ from urllib import request as urllib_request
 
 from app.config import Settings, get_settings
 from app.services.language_pairs import LANGUAGE_LABELS
-from app.services.normalizer import normalize_text
+from app.services.normalizer import build_source_hash, normalize_text
 
 try:
     import httpx
@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 LLMProvider = Literal["auto", "deepseek", "openrouter"]
 LLMScope = Literal["fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"]
+LLMTranslationUnit = Literal["sentence", "paragraph"]
 
 
 class LLMServiceError(RuntimeError):
@@ -51,8 +52,12 @@ class LLMTranslationTask:
     source_language: str | None = None
     target_language: str | None = None
     block_type: str = "paragraph"
+    block_index: int = 0
+    row_index: int | None = None
+    cell_index: int | None = None
     matched_source_text: str | None = None
     tm_target_text: str | None = None
+    should_translate: bool = True
 
 
 @dataclass(frozen=True)
@@ -95,6 +100,15 @@ BATCH_ITEM_RE = re.compile(r"^\[(\d+)\]\s*", re.MULTILINE)
 class TaskGroup:
     tasks: list[LLMTranslationTask]
     group_type: str  # "normal" | "fuzzy" | "numeric"
+
+
+@dataclass
+class ParagraphTaskGroup:
+    tasks: list[LLMTranslationTask]
+
+    @property
+    def translate_tasks(self) -> list[LLMTranslationTask]:
+        return [task for task in self.tasks if task.should_translate]
 
 
 NUMERIC_LIKE_FRAGMENT_RE = re.compile(r"^[0-9\s,.\-+/%()（）$€¥￥£:：]+$")
@@ -183,11 +197,16 @@ async def iter_batch_translate(
     provider: LLMProvider = "auto",
     translation_guidelines: str = "",
     settings: Settings | None = None,
+    translation_unit: LLMTranslationUnit = "paragraph",
 ) -> AsyncIterator[LLMTranslationResult | LLMTranslationFailure]:
     config = settings or get_settings()
     providers = validate_provider_choice(provider=provider, settings=config)
+    target_tasks = [task for task in tasks if task.should_translate]
 
-    if not tasks:
+    if translation_unit not in ("sentence", "paragraph"):
+        raise ValueError(f"Unsupported translation_unit: {translation_unit}")
+
+    if not target_tasks:
         return
 
     max_concurrency = max(int(config.llm_max_concurrency), 1)
@@ -218,7 +237,7 @@ async def iter_batch_translate(
                         error_message=str(exc),
                     )
 
-        futures = [asyncio.create_task(run_single(task)) for task in tasks]
+        futures = [asyncio.create_task(run_single(task)) for task in target_tasks]
         try:
             for future in asyncio.as_completed(futures):
                 yield await future
@@ -228,10 +247,10 @@ async def iter_batch_translate(
                     future.cancel()
 
     async def _run_batch_mode(clients: dict[str, "httpx.AsyncClient" | None]):
-        groups = _group_tasks_for_batch(tasks)
+        groups = _group_tasks_for_batch(target_tasks)
         logger.info(
             "batch translate: %d tasks -> %d groups (guidelines length=%d)",
-            len(tasks),
+            len(target_tasks),
             len(groups),
             len(translation_guidelines),
         )
@@ -257,7 +276,40 @@ async def iter_batch_translate(
                 if not future.done():
                     future.cancel()
 
-    run_fn = _run_batch_mode if use_batch else _run_single_mode
+    async def _run_paragraph_mode(clients: dict[str, "httpx.AsyncClient" | None]):
+        groups = _group_tasks_for_paragraph(tasks)
+        logger.info(
+            "paragraph translate: %d target tasks, %d context tasks -> %d groups",
+            len(target_tasks),
+            len(tasks) - len(target_tasks),
+            len(groups),
+        )
+
+        async def run_group(group: ParagraphTaskGroup):
+            async with semaphore:
+                return await _translate_paragraph_group(
+                    group=group,
+                    providers=providers,
+                    clients=clients,
+                    settings=config,
+                    translation_guidelines=translation_guidelines,
+                )
+
+        futures = [asyncio.create_task(run_group(g)) for g in groups]
+        try:
+            for future in asyncio.as_completed(futures):
+                group_results = await future
+                for item in group_results:
+                    yield item
+        finally:
+            for future in futures:
+                if not future.done():
+                    future.cancel()
+
+    if translation_unit == "paragraph":
+        run_fn = _run_paragraph_mode
+    else:
+        run_fn = _run_batch_mode if use_batch else _run_single_mode
 
     if httpx is None:
         async for item in run_fn({pc.name: None for pc in providers}):
@@ -779,6 +831,194 @@ def _group_tasks_for_batch(
     return groups
 
 
+def _task_block_key(task: LLMTranslationTask) -> tuple[str, int, int | None, int | None]:
+    return (
+        task.block_type or "paragraph",
+        int(task.block_index or 0),
+        task.row_index,
+        task.cell_index,
+    )
+
+
+def _task_source_hash(task: LLMTranslationTask) -> str:
+    return build_source_hash(task.source_text)
+
+
+def _group_tasks_for_paragraph(tasks: list[LLMTranslationTask]) -> list[ParagraphTaskGroup]:
+    grouped: dict[tuple[str, int, int | None, int | None], list[LLMTranslationTask]] = {}
+    for task in tasks:
+        grouped.setdefault(_task_block_key(task), []).append(task)
+
+    paragraph_groups: list[ParagraphTaskGroup] = []
+    for block_tasks in grouped.values():
+        paragraph_groups.extend(_split_paragraph_block(block_tasks))
+
+    return [group for group in paragraph_groups if group.translate_tasks]
+
+
+def _split_paragraph_block(tasks: list[LLMTranslationTask]) -> list[ParagraphTaskGroup]:
+    groups: list[ParagraphTaskGroup] = []
+    current: list[LLMTranslationTask] = []
+    current_chars = 0
+    current_targets = 0
+
+    for task in tasks:
+        task_chars = max(len(task.source_text), 1)
+        task_targets = 1 if task.should_translate else 0
+        would_exceed = (
+            current
+            and current_targets > 0
+            and (
+                current_targets + task_targets > BATCH_MAX_ITEMS
+                or current_chars + task_chars > BATCH_MAX_SOURCE_CHARS
+            )
+        )
+        if would_exceed:
+            groups.append(ParagraphTaskGroup(tasks=current))
+            current = []
+            current_chars = 0
+            current_targets = 0
+
+        current.append(task)
+        current_chars += task_chars
+        current_targets += task_targets
+
+    if current:
+        groups.append(ParagraphTaskGroup(tasks=current))
+
+    return groups
+
+
+def _build_paragraph_messages(
+    group: ParagraphTaskGroup,
+    translation_guidelines: str = "",
+    strict_retry: bool = False,
+    retry_reason: str | None = None,
+) -> list[dict[str, str]]:
+    first = group.translate_tasks[0] if group.translate_tasks else group.tasks[0]
+    source_label = _format_language_for_prompt(first.source_language, "源语言")
+    target_label = _format_language_for_prompt(first.target_language, "目标语言")
+    language_pair = f"{source_label} -> {target_label}"
+
+    system_prompt = (
+        f"你是专业的文档翻译专家，当前任务语言对为：{language_pair}。"
+        f"请把需要翻译的句子从{source_label}翻译为{target_label}。"
+        "你会收到同一段落或同一表格单元格中的句子列表，其中 translate=false 的句子只作为上下文。"
+        "必须严格保留数字、单位、占位符、公式占位符、复选框、项目符号和特殊符号。"
+        "只输出合法 JSON，不要输出解释、Markdown 或代码块。"
+    )
+    if translation_guidelines:
+        system_prompt += "\n\n以下是本项目的翻译细则，请严格遵守：\n" + translation_guidelines
+
+    retry_instruction = ""
+    if strict_retry:
+        retry_instruction = "\n这是一次纠错重试。请严格按 JSON 协议输出，禁止遗漏、改写或新增 sentence_id/source_hash。"
+        if retry_reason:
+            retry_instruction += f"\n上一轮失败原因：{retry_reason}"
+
+    sentences_payload = []
+    required_sentence_ids: list[str] = []
+    for task in group.tasks:
+        item = {
+            "sentence_id": task.sentence_id,
+            "source_hash": _task_source_hash(task),
+            "translate": task.should_translate,
+            "status": task.status,
+            "source_text": task.source_text,
+        }
+        if task.should_translate:
+            required_sentence_ids.append(task.sentence_id)
+        if task.status == "fuzzy":
+            item["matched_source_text"] = task.matched_source_text or ""
+            item["tm_target_text"] = task.tm_target_text or ""
+            item["diff"] = _describe_diff(task.source_text, task.matched_source_text or "")
+        sentences_payload.append(item)
+
+    request_payload = {
+        "required_sentence_ids": required_sentence_ids,
+        "sentences": sentences_payload,
+    }
+    response_contract = {
+        "translations": {
+            sentence_id: {
+                "source_hash": "<copy the exact source_hash for this sentence>",
+                "target_text": f"<final {target_label} translation>",
+            }
+            for sentence_id in required_sentence_ids
+        }
+    }
+
+    user_content = (
+        "请翻译 JSON 中 translate=true 的句子。translate=false 的句子只用于理解上下文，不要返回它们的译文。\n"
+        "返回 JSON 的 translations 键集合必须与 required_sentence_ids 完全一致；不要依赖顺序。\n"
+        "每个 source_hash 必须原样带回，target_text 只写最终译文。\n\n"
+        "输入：\n"
+        f"{json.dumps(request_payload, ensure_ascii=False, indent=2)}\n\n"
+        "输出格式必须严格等同于：\n"
+        f"{json.dumps(response_contract, ensure_ascii=False, indent=2)}"
+        f"{retry_instruction}"
+    )
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def _parse_paragraph_response(
+    raw_text: str,
+    group: ParagraphTaskGroup,
+) -> dict[str, str]:
+    text = _normalize_response_content(raw_text) if raw_text else ""
+    if not text:
+        raise LLMResponseValidationError("段落级翻译返回为空。")
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise LLMResponseValidationError("段落级翻译结果不是有效 JSON。") from None
+        try:
+            payload = json.loads(text[start : end + 1])
+        except json.JSONDecodeError as exc:
+            raise LLMResponseValidationError("段落级翻译结果不是有效 JSON。") from exc
+
+    if not isinstance(payload, dict):
+        raise LLMResponseValidationError("段落级翻译 JSON 顶层必须是对象。")
+
+    translations = payload.get("translations")
+    if not isinstance(translations, dict):
+        raise LLMResponseValidationError("段落级翻译 JSON 缺少 translations 对象。")
+
+    expected_tasks = {task.sentence_id: task for task in group.translate_tasks}
+    returned_ids = set(str(key) for key in translations.keys())
+    expected_ids = set(expected_tasks.keys())
+    if returned_ids != expected_ids:
+        missing = sorted(expected_ids - returned_ids)
+        extra = sorted(returned_ids - expected_ids)
+        raise LLMResponseValidationError(
+            f"段落级翻译 sentence_id 集合不匹配，缺少={missing}，多余={extra}。"
+        )
+
+    parsed: dict[str, str] = {}
+    for sentence_id, task in expected_tasks.items():
+        item = translations.get(sentence_id)
+        if not isinstance(item, dict):
+            raise LLMResponseValidationError(f"{sentence_id} 的翻译结果必须是对象。")
+
+        returned_hash = str(item.get("source_hash") or "")
+        expected_hash = _task_source_hash(task)
+        if returned_hash != expected_hash:
+            raise LLMResponseValidationError(f"{sentence_id} 的 source_hash 不匹配。")
+
+        target_text = str(item.get("target_text") or "").strip()
+        parsed[sentence_id] = _validate_or_repair_translation_output(task, target_text)
+
+    return parsed
+
+
 def _build_batch_messages(
     group: TaskGroup,
     translation_guidelines: str = "",
@@ -896,6 +1136,84 @@ def _parse_batch_response(
         result.append(val)
 
     return result
+
+
+async def _translate_paragraph_group(
+    group: ParagraphTaskGroup,
+    providers: list[ProviderConfig],
+    clients: dict[str, "httpx.AsyncClient" | None],
+    settings: Settings,
+    translation_guidelines: str = "",
+) -> list[LLMTranslationResult | LLMTranslationFailure]:
+    translate_tasks = group.translate_tasks
+    if not translate_tasks:
+        return []
+
+    last_error: Exception | None = None
+    retry_attempts = max(int(getattr(settings, "llm_retry_attempts_per_provider", 2)), 1)
+
+    for provider_index, provider in enumerate(providers):
+        for attempt_index in range(retry_attempts):
+            strict_retry = attempt_index > 0 or provider_index > 0
+            current_temperature = 0.0 if strict_retry else settings.llm_temperature
+            messages = _build_paragraph_messages(
+                group,
+                translation_guidelines=translation_guidelines,
+                strict_retry=strict_retry,
+                retry_reason=str(last_error) if strict_retry and last_error else None,
+            )
+            try:
+                raw_text = await _request_translation(
+                    client=clients.get(provider.name),
+                    provider=provider,
+                    messages=messages,
+                    temperature=current_temperature,
+                    timeout_seconds=settings.llm_timeout_seconds,
+                    response_format={"type": "json_object"},
+                )
+                translations = _parse_paragraph_response(raw_text, group)
+                return [
+                    LLMTranslationResult(
+                        sentence_id=task.sentence_id,
+                        translated_text=translations[task.sentence_id],
+                        status=task.status,
+                        provider=provider.name,
+                        model=provider.model,
+                    )
+                    for task in translate_tasks
+                ]
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning(
+                    "paragraph translate failed block_key=%s provider=%s attempt=%s error=%s",
+                    _task_block_key(translate_tasks[0]),
+                    provider.name,
+                    attempt_index + 1,
+                    exc,
+                )
+
+    logger.info(
+        "paragraph translate exhausted retries, falling back to per-task for %d items",
+        len(translate_tasks),
+    )
+    fallback_results: list[LLMTranslationResult | LLMTranslationFailure] = []
+    for task in translate_tasks:
+        try:
+            result = await _translate_single_task(
+                task=task,
+                providers=providers,
+                clients=clients,
+                settings=settings,
+                translation_guidelines=translation_guidelines,
+            )
+            fallback_results.append(result)
+        except Exception as exc:  # noqa: BLE001
+            fallback_results.append(LLMTranslationFailure(
+                sentence_id=task.sentence_id,
+                status=task.status,
+                error_message=str(exc),
+            ))
+    return fallback_results
 
 
 async def _translate_batch_group(
