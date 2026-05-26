@@ -701,6 +701,7 @@ def update_segment_target(
     current_user: User | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
+    track_revision: bool = True,
 ) -> Segment | None:
     segment = db.query(Segment).filter(Segment.id == segment_id).first()
     if not segment:
@@ -718,15 +719,16 @@ def update_segment_target(
         segment.llm_model = None
     if source == "manual":
         segment.status = "confirmed"
-    create_revision(
-        db,
-        file_record_id=segment.file_record_id,
-        segment=segment,
-        before_text=before_text,
-        after_text=target_text,
-        source=source,
-        author=current_user,
-    )
+    if track_revision:
+        create_revision(
+            db,
+            file_record_id=segment.file_record_id,
+            segment=segment,
+            before_text=before_text,
+            after_text=target_text,
+            source=source,
+            author=current_user,
+        )
     record_translation_metric_event(
         db,
         segment=segment,
@@ -751,6 +753,7 @@ def update_segment_by_sentence_id(
     current_user: User | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
+    track_revision: bool = True,
 ) -> Segment | None:
     segment = (
         db.query(Segment)
@@ -772,15 +775,16 @@ def update_segment_by_sentence_id(
         segment.llm_model = None
     if source == "manual":
         segment.status = "confirmed"
-    create_revision(
-        db,
-        file_record_id=file_record_id,
-        segment=segment,
-        before_text=before_text,
-        after_text=target_text,
-        source=source,
-        author=current_user,
-    )
+    if track_revision:
+        create_revision(
+            db,
+            file_record_id=file_record_id,
+            segment=segment,
+            before_text=before_text,
+            after_text=target_text,
+            source=source,
+            author=current_user,
+        )
     record_translation_metric_event(
         db,
         segment=segment,
@@ -850,6 +854,7 @@ def batch_update_segments(
         before_text = segment.target_text
         target_text = item.get("target_text", "")
         source = item.get("source", "manual")
+        track_revision = bool(item.get("track_revision", True))
         segment.target_text = target_text
         segment.source = source
         segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
@@ -861,15 +866,16 @@ def batch_update_segments(
             segment.llm_model = None
         if source == "manual":
             segment.status = "confirmed"
-        create_revision(
-            db,
-            file_record_id=file_record_id,
-            segment=segment,
-            before_text=before_text,
-            after_text=target_text,
-            source=source,
-            author=current_user,
-        )
+        if track_revision:
+            create_revision(
+                db,
+                file_record_id=file_record_id,
+                segment=segment,
+                before_text=before_text,
+                after_text=target_text,
+                source=source,
+                author=current_user,
+            )
         record_translation_metric_event(
             db,
             segment=segment,

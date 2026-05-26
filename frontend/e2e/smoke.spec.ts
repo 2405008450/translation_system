@@ -178,10 +178,12 @@ test.describe.serial('核心 E2E 冒烟流程', () => {
     const editor = focusPage.getByTestId('segment-target-editor').first()
     await expect(editor).toBeVisible()
 
+    await expect(focusPage.getByTestId('workbench-revision-toggle')).toHaveAttribute('aria-pressed', 'false')
+    await expect(focusPage.getByTestId('workbench-revision-accept-menu')).toBeDisabled()
     await editor.fill(originalText)
     await saveWorkbenchNow(focusPage)
-    await acceptCurrentRevision(focusPage)
     await expect(firstRow).toHaveAttribute('data-has-pending-revision', 'false')
+    await expect(focusPage.getByTestId('workbench-revision-accept-menu')).toBeDisabled()
 
     await focusPage.getByTestId('workbench-revision-toggle').click()
     await expect(focusPage.getByTestId('workbench-revision-toggle')).toHaveAttribute('aria-pressed', 'true')

@@ -739,6 +739,7 @@ class SegmentUpdate(BaseModel):
     sentence_id: str
     target_text: str
     source: str = "manual"
+    track_revision: bool = True
 
 
 class BatchSegmentUpdate(BaseModel):
@@ -3432,6 +3433,7 @@ def update_segment(
         target_text=update.target_text,
         source=update.source,
         current_user=current_user,
+        track_revision=update.track_revision,
     )
     if not segment:
         raise HTTPException(status_code=404, detail="片段不存在。")

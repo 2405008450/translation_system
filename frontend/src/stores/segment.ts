@@ -118,6 +118,7 @@ export const useSegmentStore = defineStore('segment', () => {
   const revisionHistory = ref<Record<string, SegmentRevisionEntry[]>>({})
   const localRevisionDrafts = ref<Record<string, SegmentRevisionEntry>>({})
   const localRevisionBaselines = ref<Record<string, string>>({})
+  const revisionTrackingEnabled = ref(false)
 
   const segmentIndexMap = new Map<string, number>()
   let syncTimer: number | null = null
@@ -289,10 +290,12 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   function startRevisionTracking() {
+    revisionTrackingEnabled.value = true
     ensureRevisionTrackingBaselines()
   }
 
   function stopRevisionTracking() {
+    revisionTrackingEnabled.value = false
     // 开关只控制修订痕迹是否显示；基准必须保留，避免再次开启时刷新快照。
   }
 
@@ -532,6 +535,7 @@ export const useSegmentStore = defineStore('segment', () => {
     revisionHistory.value = {}
     localRevisionDrafts.value = {}
     localRevisionBaselines.value = {}
+    revisionTrackingEnabled.value = false
     loadMorePromise = null
     llmAbortController = null
     llmReader = null
@@ -689,7 +693,9 @@ export const useSegmentStore = defineStore('segment', () => {
     }
 
     const segment = segments.value[index]
-    upsertLocalRevisionDraft(segment, targetText)
+    if (revisionTrackingEnabled.value) {
+      upsertLocalRevisionDraft(segment, targetText)
+    }
     const nextSegment = {
       ...segment,
       target_text: targetText,
@@ -708,6 +714,7 @@ export const useSegmentStore = defineStore('segment', () => {
         sentence_id: sentenceId,
         target_text: targetText,
         source: 'manual',
+        track_revision: revisionTrackingEnabled.value,
       },
     }
     syncMessage.value = translate('stores.segment.syncPending', { count: dirtyCount.value })

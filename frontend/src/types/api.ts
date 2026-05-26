@@ -520,6 +520,7 @@ export interface SegmentUpdatePayload {
   sentence_id: string
   target_text: string
   source: string
+  track_revision?: boolean
 }
 
 export interface SegmentRevisionEntry {

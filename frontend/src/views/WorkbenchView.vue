@@ -107,15 +107,6 @@ type SaveToTMPayload = {
   scope: SaveToTMScope
 }
 
-const REVISION_TRACE_VISIBLE_STORAGE_KEY = 'workbench.revisionTraceEnabled'
-
-function getInitialRevisionTraceVisible() {
-  if (typeof window === 'undefined') {
-    return false
-  }
-  return window.localStorage.getItem(REVISION_TRACE_VISIBLE_STORAGE_KEY) === 'true'
-}
-
 const router = useRouter()
 const route = useRoute()
 const authStore = useAuthStore()
@@ -177,7 +168,7 @@ const importDialogInitialTab = ref<ResourceImportTab>('tm')
 const showShortcutHelp = ref(false)
 const showSaveToTMDialog = ref(false)
 const openRevisionMenu = ref<RevisionMenuKind | null>(null)
-const revisionTraceVisible = ref(getInitialRevisionTraceVisible())
+const revisionTraceVisible = ref(false)
 const revisionActionLoading = ref(false)
 const segmentSearchOpen = ref(false)
 const sourceSearchInputRef = ref<HTMLInputElement | null>(null)
@@ -526,7 +517,9 @@ const activeSegmentHistory = computed(() => (
 ))
 
 const activePendingRevision = computed(() => (
-  segmentStore.activeSentenceId ? segmentStore.getRevisionTrace(segmentStore.activeSentenceId) : null
+  revisionTraceVisible.value && segmentStore.activeSentenceId
+    ? segmentStore.getRevisionTrace(segmentStore.activeSentenceId)
+    : null
 ))
 
 const activeSegmentSourceText = computed(() => activeSegment.value?.source_text || '')
@@ -1350,7 +1343,6 @@ function setRevisionTraceVisible(visible: boolean) {
   } else {
     segmentStore.stopRevisionTracking()
   }
-  window.localStorage.setItem(REVISION_TRACE_VISIBLE_STORAGE_KEY, visible ? 'true' : 'false')
   openRevisionMenu.value = null
   toast.success(visible ? t('workbench.ribbon.messages.revisionTraceShown') : t('workbench.ribbon.messages.revisionTraceHidden'))
 }
@@ -1502,7 +1494,6 @@ async function loadTask() {
     if (segmentStore.segments[0] && !segmentStore.activeSentenceId) {
       segmentStore.setActiveSentence(segmentStore.segments[0].sentence_id)
     }
-    segmentStore.ensureRevisionTrackingBaselines()
     if (revisionTraceVisible.value) {
       segmentStore.startRevisionTracking()
     }
@@ -1551,7 +1542,6 @@ async function refreshSegmentPage(page = segmentStore.currentPage, size = segmen
       targetQuery: targetSearchQuery.value,
       searchFuzzy: searchFuzzyEnabled.value,
     })
-    segmentStore.ensureRevisionTrackingBaselines()
     if (revisionTraceVisible.value) {
       segmentStore.startRevisionTracking()
     }
@@ -2360,7 +2350,7 @@ onBeforeRouteLeave(async () => {
                 class="tool-line tool-button"
                 data-testid="workbench-revision-accept-menu"
                 type="button"
-                :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
+                :disabled="revisionActionLoading || !revisionTraceVisible || segmentStore.pendingRevisionCount === 0"
                 @click="toggleRevisionMenu('accept')"
               >
                 <span class="icon-text-area has_dropdown">
@@ -2385,7 +2375,7 @@ onBeforeRouteLeave(async () => {
                 <button
                   data-testid="workbench-revision-accept-all"
                   type="button"
-                  :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
+                  :disabled="revisionActionLoading || !revisionTraceVisible || segmentStore.pendingRevisionCount === 0"
                   @click="void handleBatchAcceptRevisions()"
                 >
                   {{ t('workbench.ribbon.acceptAllRevisions') }}
@@ -2397,7 +2387,7 @@ onBeforeRouteLeave(async () => {
                 class="tool-line tool-button"
                 data-testid="workbench-revision-reject-menu"
                 type="button"
-                :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
+                :disabled="revisionActionLoading || !revisionTraceVisible || segmentStore.pendingRevisionCount === 0"
                 @click="toggleRevisionMenu('reject')"
               >
                 <span class="icon-text-area has_dropdown">
@@ -2424,7 +2414,7 @@ onBeforeRouteLeave(async () => {
                   class="is-danger"
                   data-testid="workbench-revision-reject-all"
                   type="button"
-                  :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
+                  :disabled="revisionActionLoading || !revisionTraceVisible || segmentStore.pendingRevisionCount === 0"
                   @click="void handleBatchRejectRevisions()"
                 >
                   {{ t('workbench.ribbon.rejectAllRevisions') }}
