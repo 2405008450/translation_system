@@ -36,7 +36,3 @@ frontend/.DS_Store
 .claude
 *.xlsx
 tests/
-!tests/
-!tests/conftest.py
-!tests/test_llm_service.py
-!tests/test_document_parsing.py
