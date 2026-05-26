@@ -15,11 +15,13 @@ const props = withDefaults(defineProps<{
   pendingRevision?: SegmentRevisionEntry | null
   revisionBusy?: boolean
   matchedTerms?: TermEntryRecord[]
+  sourceSearchQuery?: string
 }>(), {
   disabled: false,
   pendingRevision: null,
   revisionBusy: false,
   matchedTerms: () => [],
+  sourceSearchQuery: '',
 })
 
 const emit = defineEmits<{
@@ -38,6 +40,9 @@ interface EditorHistorySnapshot {
   text: string
   caretOffset: number
 }
+
+type HighlightKind = 'term' | 'search'
+type HighlightPart = { text: string; highlight: boolean; kind?: HighlightKind }
 
 const undoStack = ref<EditorHistorySnapshot[]>([])
 const redoStack = ref<EditorHistorySnapshot[]>([])
@@ -85,7 +90,7 @@ function highlightText(
   text: string,
   terms: TermEntryRecord[],
   field: 'source_text' | 'target_text'
-): Array<{ text: string; highlight: boolean }> | null {
+): HighlightPart[] | null {
   if (!text || terms.length === 0) {
     return null
   }
@@ -124,14 +129,14 @@ function highlightText(
   matches.sort((a, b) => a.start - b.start)
 
   // 构建分段
-  const segments: Array<{ text: string; highlight: boolean }> = []
+  const segments: HighlightPart[] = []
   let lastEnd = 0
 
   for (const match of matches) {
     if (match.start > lastEnd) {
       segments.push({ text: text.slice(lastEnd, match.start), highlight: false })
     }
-    segments.push({ text: text.slice(match.start, match.end), highlight: true })
+    segments.push({ text: text.slice(match.start, match.end), highlight: true, kind: 'term' })
     lastEnd = match.end
   }
 
@@ -143,9 +148,49 @@ function highlightText(
 }
 
 // 高亮原文中匹配的术语
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function highlightSearchText(text: string, keyword: string): HighlightPart[] | null {
+  const query = keyword.trim()
+  if (!text || !query) {
+    return null
+  }
+
+  const regexp = new RegExp(escapeRegExp(query), 'gi')
+  const matches = Array.from(text.matchAll(regexp))
+    .map((match) => ({
+      start: match.index ?? 0,
+      end: (match.index ?? 0) + match[0].length,
+    }))
+    .filter((match) => match.end > match.start)
+
+  if (matches.length === 0) {
+    return null
+  }
+
+  const segments: HighlightPart[] = []
+  let lastEnd = 0
+
+  for (const match of matches) {
+    if (match.start > lastEnd) {
+      segments.push({ text: text.slice(lastEnd, match.start), highlight: false })
+    }
+    segments.push({ text: text.slice(match.start, match.end), highlight: true, kind: 'search' })
+    lastEnd = match.end
+  }
+
+  if (lastEnd < text.length) {
+    segments.push({ text: text.slice(lastEnd), highlight: false })
+  }
+
+  return segments
+}
+
 const highlightedSourceText = computed(() => {
   const text = props.segment.display_text || props.segment.source_text
-  return highlightText(text, props.matchedTerms || [], 'source_text')
+  return highlightSearchText(text, props.sourceSearchQuery) || highlightText(text, props.matchedTerms || [], 'source_text')
 })
 
 // 高亮译文中匹配的术语
@@ -180,6 +225,7 @@ const editorHtmlContent = computed(() => {
       return [
         `<span class="segment-row__revision-segment segment-row__revision-${segment.type}"`,
         ` data-revision-type="${segment.type}"`,
+        ` data-testid="segment-revision-${segment.type}"`,
         editableAttr,
         '>',
         renderTargetTextHtml(segment.text),
@@ -613,6 +659,24 @@ function handlePaste(event: ClipboardEvent) {
   document.execCommand('insertText', false, text)
 }
 
+function syncEditorHtmlFromState(preserveCaret: boolean) {
+  const editor = editorRef.value
+  if (!editor || isApplyingHistory.value || isComposing.value) {
+    return
+  }
+
+  const nextHtml = editorHtmlContent.value
+  if (editor.innerHTML === nextHtml) {
+    return
+  }
+
+  const caretPos = preserveCaret ? saveSerializableCaretPosition(editor) : 0
+  editor.innerHTML = nextHtml
+  if (preserveCaret && isFocused.value) {
+    restoreSerializableCaretPosition(editor, caretPos)
+  }
+}
+
 onMounted(() => {
   if (editorRef.value) {
     editorRef.value.innerHTML = editorHtmlContent.value
@@ -651,11 +715,10 @@ watch(
 // 监听高亮内容变化
 watch(
   editorHtmlContent,
-  (html) => {
-    if (!isFocused.value && editorRef.value) {
-      editorRef.value.innerHTML = html
-    }
-  }
+  () => {
+    syncEditorHtmlFromState(isFocused.value)
+  },
+  { flush: 'post' },
 )
 
 defineExpose({
@@ -674,6 +737,7 @@ defineExpose({
     :id="`segment-${segment.sentence_id}`"
     data-testid="segment-row"
     :data-sentence-id="segment.sentence_id"
+    :data-has-pending-revision="hasPendingRevision ? 'true' : 'false'"
     role="group"
     :aria-label="`segment ${index + 1}`"
   >
@@ -687,6 +751,7 @@ defineExpose({
       <span
         v-if="hasPendingRevision"
         class="segment-row__tag segment-row__tag--revision"
+        data-testid="segment-revision-tag"
         :title="`修订来源：${revisionSourceMeta.label}`"
       >
         待审核
@@ -697,7 +762,12 @@ defineExpose({
       <div class="segment-row__text">
         <template v-if="highlightedSourceText">
           <template v-for="(seg, idx) in highlightedSourceText" :key="idx">
-            <mark v-if="seg.highlight" class="segment-row__term-highlight">{{ seg.text }}</mark>
+            <mark
+              v-if="seg.highlight"
+              :class="seg.kind === 'search' ? 'segment-row__search-highlight' : 'segment-row__term-highlight'"
+            >
+              {{ seg.text }}
+            </mark>
             <template v-else>{{ seg.text }}</template>
           </template>
         </template>
@@ -714,6 +784,7 @@ defineExpose({
       <div
         v-if="false && pendingRevision"
         class="segment-row__revision-inline"
+        data-testid="segment-revision-inline"
         :data-sentence-id="segment.sentence_id"
         :aria-label="`translation revision for segment ${index + 1}`"
         @click="handleClick"
@@ -740,6 +811,7 @@ defineExpose({
         :contenteditable="!disabled"
         tabindex="0"
         data-testid="segment-target-editor"
+        :data-revision-visible="hasPendingRevision ? 'true' : 'false'"
         data-segment-target="true"
         :data-sentence-id="segment.sentence_id"
         :aria-label="`translation for segment ${index + 1}`"
@@ -832,6 +904,12 @@ defineExpose({
 .segment-row__tag--revision {
   background: rgba(0, 122, 204, 0.12);
   color: #0070c0;
+  font-size: 0;
+}
+
+.segment-row__tag--revision::after {
+  content: '待审核';
+  font-size: 11px;
 }
 
 .segment-row__tag--score {
@@ -845,6 +923,15 @@ defineExpose({
   padding: 1px 2px;
   border-radius: 3px;
   font-weight: 500;
+}
+
+.segment-row__search-highlight {
+  background: #fff176;
+  color: inherit;
+  padding: 1px 2px;
+  border-radius: 3px;
+  box-shadow: inset 0 0 0 1px rgba(138, 103, 0, 0.2);
+  font-weight: 600;
 }
 
 /* 穿透 scoped 样式，让 innerHTML 插入的 mark 标签也能应用样式 */

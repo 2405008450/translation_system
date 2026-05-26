@@ -37,6 +37,19 @@ const optionDefaults: DocumentParseOptions = {
   custom_parse_config: false,
   translate_idml_comments: false,
   translate_idml_hidden_layers: false,
+  pptx_translate_comments: true,
+  pptx_translate_notes: true,
+  pptx_translate_document_properties: false,
+  xlsx_translate_comments: true,
+  xlsx_translate_drawing_text: true,
+  xlsx_translate_sheet_names: false,
+  xlsx_translate_hidden_content: true,
+  xlsx_translate_document_properties: false,
+  xlsx_translate_numeric_cells: true,
+  xlsx_translate_date_cells: true,
+  xlsx_translate_boolean_cells: true,
+  xlsx_translate_formula_cells: false,
+  xlsx_skip_fill_colors: [],
 }
 
 const wordTranslationOptionKeys: ParseOptionKey[] = [
@@ -45,7 +58,7 @@ const wordTranslationOptionKeys: ParseOptionKey[] = [
   'include_comments',
 ]
 
-const formatOrder = ['.docx', '.md', '.dat', '.dxf', '.idml', '.xml', '.yaml', '.yml']
+const formatOrder = ['.docx', '.pptx', '.xlsx', '.md', '.dat', '.dxf', '.idml', '.xml', '.yaml', '.yml']
 
 const selectedExtensions = computed(() => {
   const extensions = new Set<string>()
@@ -106,6 +119,8 @@ function canonicalExtension(capability: UploadCapability) {
 function iconText(capability: UploadCapability) {
   const extension = canonicalExtension(capability)
   if (extension === '.docx') return 'W'
+  if (extension === '.pptx') return 'P'
+  if (extension === '.xlsx') return 'X'
   if (extension === '.dxf') return 'A'
   if (extension === '.idml') return 'ID'
   if (extension === '.markdown') return 'MD'
@@ -123,9 +138,9 @@ function settingsForCapability(capability: UploadCapability) {
 function selectAllSettings(capability: UploadCapability) {
   const settings = settingsForCapability(capability)
   if (capability.extensions.includes('.docx')) {
-    return settings.filter((setting) => wordTranslationOptionKeys.includes(setting.id))
+    return settings.filter((setting) => setting.kind !== 'color_palette' && wordTranslationOptionKeys.includes(setting.id))
   }
-  return settings
+  return settings.filter((setting) => setting.kind !== 'color_palette')
 }
 
 function selectableSettings(capability: UploadCapability) {
@@ -134,6 +149,15 @@ function selectableSettings(capability: UploadCapability) {
 
 function getOptionValue(key: ParseOptionKey) {
   return props.parseOptions[key] ?? optionDefaults[key]
+}
+
+function getBooleanOptionValue(key: ParseOptionKey) {
+  return Boolean(getOptionValue(key))
+}
+
+function getColorOptionValue(key: ParseOptionKey) {
+  const value = getOptionValue(key)
+  return Array.isArray(value) ? value : []
 }
 
 function emitParseOptions(nextOptions: DocumentParseOptions) {
@@ -145,7 +169,7 @@ function updateWordParseMode(nextOptions: DocumentParseOptions) {
 }
 
 function updateOption(setting: UploadCapabilitySetting, value: boolean) {
-  if (setting.disabled) {
+  if (setting.disabled || setting.kind === 'color_palette') {
     return
   }
 
@@ -160,10 +184,40 @@ function updateOption(setting: UploadCapabilitySetting, value: boolean) {
   }
 }
 
+function updateColorOption(setting: UploadCapabilitySetting, color: string, selected: boolean) {
+  if (setting.disabled || setting.kind !== 'color_palette') {
+    return
+  }
+  const key = setting.id
+  const current = new Set(getColorOptionValue(key).map((item) => item.toUpperCase()))
+  const normalizedColor = color.toUpperCase()
+  if (selected) {
+    current.add(normalizedColor)
+  } else {
+    current.delete(normalizedColor)
+  }
+  emitParseOptions({
+    ...props.parseOptions,
+    [key]: Array.from(current),
+  })
+}
+
+function updateAllColorOptions(setting: UploadCapabilitySetting, selected: boolean) {
+  if (setting.disabled || setting.kind !== 'color_palette') {
+    return
+  }
+  const nextColors = selected ? (setting.options ?? []).map((option) => option.value.toUpperCase()) : []
+  emitParseOptions({
+    ...props.parseOptions,
+    [setting.id]: nextColors,
+  })
+}
+
 function updateCapabilityOptions(capability: UploadCapability, value: boolean) {
   const nextOptions = { ...props.parseOptions }
+  const mutableOptions = nextOptions as unknown as Record<string, boolean | string[]>
   selectableSettings(capability).forEach((setting) => {
-    nextOptions[setting.id] = value
+    mutableOptions[setting.id] = value
   })
   emitParseOptions(nextOptions)
 
@@ -174,12 +228,12 @@ function updateCapabilityOptions(capability: UploadCapability, value: boolean) {
 
 function isCapabilityAllSelected(capability: UploadCapability) {
   const settings = selectAllSettings(capability)
-  return settings.length > 0 && settings.every((setting) => getOptionValue(setting.id))
+  return settings.length > 0 && settings.every((setting) => getBooleanOptionValue(setting.id))
 }
 
 function isCapabilityPartiallySelected(capability: UploadCapability) {
   const settings = selectAllSettings(capability)
-  return settings.some((setting) => getOptionValue(setting.id)) && !isCapabilityAllSelected(capability)
+  return settings.some((setting) => getBooleanOptionValue(setting.id)) && !isCapabilityAllSelected(capability)
 }
 
 function showSelectAll(capability: UploadCapability) {
@@ -234,22 +288,59 @@ function formatExtensions(extensions: string[]) {
             <span>{{ selectAllLabel(capability) }}</span>
           </label>
 
-          <label
-            v-for="setting in settingsForCapability(capability)"
-            :key="setting.id"
-            class="document-parse-settings__option"
-            :class="{ 'is-disabled': setting.disabled }"
-            :title="setting.description || setting.label"
-          >
-            <input
-              type="checkbox"
-              :checked="getOptionValue(setting.id)"
-              :disabled="setting.disabled"
-              @change="updateOption(setting, ($event.target as HTMLInputElement).checked)"
-            />
-            <span>{{ setting.label }}</span>
-            <Settings2 v-if="setting.id === 'custom_parse_config'" :size="13" />
-          </label>
+          <template v-for="setting in settingsForCapability(capability)" :key="setting.id">
+            <div
+              v-if="setting.kind === 'color_palette'"
+              class="document-parse-settings__color-setting"
+              :class="{ 'is-disabled': setting.disabled }"
+              :title="setting.description || setting.label"
+            >
+              <label class="document-parse-settings__option">
+                <input
+                  type="checkbox"
+                  :checked="getColorOptionValue(setting.id).length > 0"
+                  :disabled="setting.disabled"
+                  @change="updateAllColorOptions(setting, ($event.target as HTMLInputElement).checked)"
+                />
+                <span>{{ setting.label }}</span>
+              </label>
+              <div class="document-parse-settings__swatches" role="group" :aria-label="setting.label">
+                <button
+                  v-for="option in setting.options || []"
+                  :key="option.value"
+                  class="document-parse-settings__swatch"
+                  :class="{ 'is-selected': getColorOptionValue(setting.id).includes(option.value.toUpperCase()) }"
+                  :style="{ backgroundColor: `#${option.value}` }"
+                  type="button"
+                  :disabled="setting.disabled"
+                  :title="option.label"
+                  @click="
+                    updateColorOption(
+                      setting,
+                      option.value,
+                      !getColorOptionValue(setting.id).includes(option.value.toUpperCase()),
+                    )
+                  "
+                />
+              </div>
+            </div>
+
+            <label
+              v-else
+              class="document-parse-settings__option"
+              :class="{ 'is-disabled': setting.disabled }"
+              :title="setting.description || setting.label"
+            >
+              <input
+                type="checkbox"
+                :checked="getBooleanOptionValue(setting.id)"
+                :disabled="setting.disabled"
+                @change="updateOption(setting, ($event.target as HTMLInputElement).checked)"
+              />
+              <span>{{ setting.label }}</span>
+              <Settings2 v-if="setting.id === 'custom_parse_config'" :size="13" />
+            </label>
+          </template>
         </div>
 
         <ul v-else class="document-parse-settings__features">
@@ -267,7 +358,7 @@ function formatExtensions(extensions: string[]) {
     <div v-if="visibleCapabilities.some((capability) => settingsForCapability(capability).length)" class="document-parse-settings__inline-options">
       <template v-for="capability in visibleCapabilities" :key="capability.extensions.join(',')">
         <label
-          v-for="setting in settingsForCapability(capability)"
+          v-for="setting in settingsForCapability(capability).filter((item) => item.kind !== 'color_palette')"
           :key="`${capability.extensions.join(',')}:${setting.id}`"
           class="document-parse-settings__option"
           :class="{ 'is-disabled': setting.disabled }"
@@ -275,7 +366,7 @@ function formatExtensions(extensions: string[]) {
         >
           <input
             type="checkbox"
-            :checked="getOptionValue(setting.id)"
+            :checked="getBooleanOptionValue(setting.id)"
             :disabled="setting.disabled"
             @change="updateOption(setting, ($event.target as HTMLInputElement).checked)"
           />
@@ -389,6 +480,14 @@ function formatExtensions(extensions: string[]) {
   background: linear-gradient(135deg, #2b5aa8, #5fa2f3);
 }
 
+.doc-file-icon--pptx {
+  background: linear-gradient(135deg, #c64a2b, #f18a5b);
+}
+
+.doc-file-icon--xlsx {
+  background: linear-gradient(135deg, #18723b, #49b96d);
+}
+
 .doc-file-icon--generic {
   background: linear-gradient(135deg, #64748b, #94a3b8);
 }
@@ -422,6 +521,40 @@ function formatExtensions(extensions: string[]) {
 
 .document-parse-settings__option.is-disabled {
   color: #9aa6b2;
+}
+
+.document-parse-settings__color-setting {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.document-parse-settings__color-setting.is-disabled {
+  opacity: 0.58;
+}
+
+.document-parse-settings__swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-left: 22px;
+}
+
+.document-parse-settings__swatch {
+  width: 18px;
+  height: 18px;
+  border: 2px solid #ffffff;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px #c7d0d8;
+  cursor: pointer;
+}
+
+.document-parse-settings__swatch.is-selected {
+  box-shadow: 0 0 0 2px #1f2937;
+}
+
+.document-parse-settings__swatch:disabled {
+  cursor: not-allowed;
 }
 
 .document-parse-settings__option input[type="checkbox"],

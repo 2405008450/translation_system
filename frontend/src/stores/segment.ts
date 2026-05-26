@@ -24,6 +24,7 @@ import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 import { consumeLLMStream } from '../utils/llmStream'
 
 const DEFAULT_SEGMENT_PAGE_SIZE = 200
+const MAX_SEGMENT_PAGE_SIZE = 1000
 const AUTO_SYNC_DELAY_MS = 1500
 
 function createEmptySegmentStatusStats(): SegmentStatusStats {
@@ -43,6 +44,18 @@ function isCountedSegmentStatus(status: string): status is 'exact' | 'fuzzy' | '
 
 function hasEmptyTarget(value: string | null | undefined) {
   return !(value || '').trim()
+}
+
+function normalizePositiveInt(value: unknown, fallback: number) {
+  const numberValue = Number(value)
+  if (!Number.isFinite(numberValue)) {
+    return fallback
+  }
+  return Math.max(1, Math.floor(numberValue))
+}
+
+function normalizePageSize(value: unknown, fallback = DEFAULT_SEGMENT_PAGE_SIZE) {
+  return Math.min(MAX_SEGMENT_PAGE_SIZE, normalizePositiveInt(value, fallback))
 }
 
 function isEditLockedError(error: unknown) {
@@ -135,11 +148,30 @@ export const useSegmentStore = defineStore('segment', () => {
     }
     return Math.min(100, Math.round((llmProcessedCount.value / llmPlannedCount.value) * 100))
   })
-  const pendingRevisionCount = computed(() => (
-    Object.values(revisionHistory.value).reduce((count, entries) => (
-      count + entries.filter((entry) => entry.status === 'pending' && entry.source === 'manual').length
-    ), 0)
-  ))
+  const pendingRevisionCount = computed(() => {
+    const sentenceIds = new Set<string>()
+    for (const entries of Object.values(revisionHistory.value)) {
+      for (const entry of entries) {
+        if (isPendingManualRevision(entry)) {
+          sentenceIds.add(entry.sentence_id)
+        }
+      }
+    }
+    for (const entry of Object.values(localRevisionDrafts.value)) {
+      if (isPendingManualRevision(entry)) {
+        sentenceIds.add(entry.sentence_id)
+      }
+    }
+    return sentenceIds.size
+  })
+
+  function isPendingManualRevision(entry: SegmentRevisionEntry) {
+    return entry.status === 'pending' && entry.source === 'manual'
+  }
+
+  function isLocalRevisionId(id: string) {
+    return id.startsWith('local-')
+  }
 
   function compareRevisionEntries(a: SegmentRevisionEntry, b: SegmentRevisionEntry) {
     const timeDelta = new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
@@ -181,22 +213,22 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   function getPendingRevision(sentenceId: string) {
-    return revisionHistory.value[sentenceId]?.find((entry) => (
-      entry.status === 'pending' && entry.source === 'manual'
-    )) || null
+    return revisionHistory.value[sentenceId]?.find(isPendingManualRevision) || null
   }
 
   function getRevisionTrace(sentenceId: string) {
     return localRevisionDrafts.value[sentenceId] || getPendingRevision(sentenceId)
   }
 
+  function getLocalRevisionDraftById(id: string) {
+    return Object.values(localRevisionDrafts.value).find((entry) => entry.id === id) || null
+  }
+
   function syncRevisionBaselinesFromHistory(history: Record<string, SegmentRevisionEntry[]>) {
     const nextBaselines = { ...localRevisionBaselines.value }
     let changed = false
     for (const [sentenceId, entries] of Object.entries(history)) {
-      const pendingRevision = entries.find((entry) => (
-        entry.status === 'pending' && entry.source === 'manual'
-      ))
+      const pendingRevision = entries.find(isPendingManualRevision)
       if (!pendingRevision) {
         continue
       }
@@ -345,8 +377,8 @@ export const useSegmentStore = defineStore('segment', () => {
 
   function resolvePageQuery(query: SegmentPageQuery = {}) {
     return {
-      page: Math.max(1, query.page ?? currentPage.value),
-      pageSize: Math.max(1, query.pageSize ?? pageSize.value),
+      page: normalizePositiveInt(query.page, currentPage.value || 1),
+      pageSize: normalizePageSize(query.pageSize, pageSize.value || DEFAULT_SEGMENT_PAGE_SIZE),
       scope: query.scope ?? segmentFilters.value.scope,
       sourceQuery: query.sourceQuery ?? segmentFilters.value.sourceQuery,
       targetQuery: query.targetQuery ?? segmentFilters.value.targetQuery,
@@ -366,6 +398,17 @@ export const useSegmentStore = defineStore('segment', () => {
     }
   }
 
+  function getCurrentPageQuery(): SegmentPageQuery {
+    return {
+      page: currentPage.value,
+      pageSize: pageSize.value,
+      scope: segmentFilters.value.scope,
+      sourceQuery: segmentFilters.value.sourceQuery,
+      targetQuery: segmentFilters.value.targetQuery,
+      searchFuzzy: segmentFilters.value.searchFuzzy,
+    }
+  }
+
   async function fetchFileRecordDetail(fileRecordId: string, limit: number) {
     const { data } = await http.get<FileRecordDetail>(`/file-records/${fileRecordId}`, {
       params: {
@@ -378,10 +421,62 @@ export const useSegmentStore = defineStore('segment', () => {
 
   async function fetchSegmentPage(fileRecordId: string, query: SegmentPageQuery = {}) {
     const resolved = resolvePageQuery(query)
-    const { data } = await http.get<SegmentPageResponse>(`/file-records/${fileRecordId}/segments`, {
-      params: buildSegmentWindowParams(resolved),
-    })
+    const requestPage = async (pageQuery: typeof resolved) => {
+      const { data } = await http.get<SegmentPageResponse>(`/file-records/${fileRecordId}/segments`, {
+        params: buildSegmentWindowParams(pageQuery),
+      })
+      return data
+    }
+
+    let data = await requestPage(resolved)
+    const maxPage = Math.max(1, Math.ceil(data.matched_segments / resolved.pageSize))
+    if (resolved.page > maxPage) {
+      const clamped = { ...resolved, page: maxPage }
+      data = await requestPage(clamped)
+      return { data, resolved: clamped }
+    }
     return { data, resolved }
+  }
+
+  function applySegmentPageData(
+    data: SegmentPageResponse,
+    resolved: {
+      page: number
+      pageSize: number
+      scope: string
+      sourceQuery: string
+      targetQuery: string
+      searchFuzzy: boolean
+    },
+  ) {
+    currentPage.value = resolved.page
+    pageSize.value = resolved.pageSize
+    segmentFilters.value = {
+      scope: resolved.scope,
+      sourceQuery: resolved.sourceQuery,
+      targetQuery: resolved.targetQuery,
+      searchFuzzy: resolved.searchFuzzy,
+    }
+    totalSegmentCount.value = data.total_segments
+    matchedSegmentCount.value = data.matched_segments
+    setSegmentStatusStats(data.status_stats)
+    resetSegments(data.segments)
+    resetPreviewState()
+  }
+
+  async function refreshCurrentSegmentPage() {
+    if (!fileRecord.value) {
+      return false
+    }
+    const { data, resolved } = await fetchSegmentPage(fileRecord.value.id, getCurrentPageQuery())
+    applySegmentPageData(data, resolved)
+    await loadRevisions(fileRecord.value.id, resolved)
+    if (segments.value[0] && !segments.value.some((segment) => segment.sentence_id === activeSentenceId.value)) {
+      setActiveSentence(segments.value[0].sentence_id)
+    } else if (!segments.value.length) {
+      setActiveSentence(null)
+    }
+    return true
   }
 
   async function loadRevisions(fileRecordId: string, query: SegmentPageQuery = {}) {
@@ -480,9 +575,7 @@ export const useSegmentStore = defineStore('segment', () => {
         resetSegments(detail.segments)
       } else {
         const page = await fetchSegmentPage(fileRecordId, resolved)
-        matchedSegmentCount.value = page.data.matched_segments
-        totalSegmentCount.value = page.data.total_segments
-        resetSegments(page.data.segments)
+        applySegmentPageData(page.data, page.resolved)
       }
       await loadRevisions(fileRecordId)
     } finally {
@@ -502,19 +595,7 @@ export const useSegmentStore = defineStore('segment', () => {
     loadingMoreSegments.value = true
     loadMorePromise = (async () => {
       const { data, resolved } = await fetchSegmentPage(fileRecord.value!.id, query)
-      currentPage.value = resolved.page
-      pageSize.value = resolved.pageSize
-      segmentFilters.value = {
-        scope: resolved.scope,
-        sourceQuery: resolved.sourceQuery,
-        targetQuery: resolved.targetQuery,
-        searchFuzzy: resolved.searchFuzzy,
-      }
-      totalSegmentCount.value = data.total_segments
-      matchedSegmentCount.value = data.matched_segments
-      setSegmentStatusStats(data.status_stats)
-      resetSegments(data.segments)
-      resetPreviewState()
+      applySegmentPageData(data, resolved)
       await loadRevisions(fileRecord.value!.id, resolved)
       if (segments.value[0] && !segments.value.some((segment) => segment.sentence_id === activeSentenceId.value)) {
         setActiveSentence(segments.value[0].sentence_id)
@@ -698,6 +779,7 @@ export const useSegmentStore = defineStore('segment', () => {
       })
       await loadRevisions(fileRecord.value.id)
       const nextDirtyEntries = { ...dirtyEntries.value }
+      const syncedSentenceIds: string[] = []
       for (const update of updates) {
         const currentEntry = nextDirtyEntries[update.sentence_id]
         if (
@@ -706,9 +788,11 @@ export const useSegmentStore = defineStore('segment', () => {
           && currentEntry.source === update.source
         ) {
           delete nextDirtyEntries[update.sentence_id]
+          syncedSentenceIds.push(update.sentence_id)
         }
       }
       dirtyEntries.value = nextDirtyEntries
+      clearLocalRevisionDrafts(syncedSentenceIds)
       const syncedAt = new Date()
       lastSyncedAt.value = syncedAt.toISOString()
       if (dirtyCount.value > 0) {
@@ -737,8 +821,31 @@ export const useSegmentStore = defineStore('segment', () => {
     }
   }
 
+  async function resolvePersistedRevisionId(revisionId: string) {
+    if (!isLocalRevisionId(revisionId)) {
+      return revisionId
+    }
+
+    const localDraft = getLocalRevisionDraftById(revisionId)
+    if (!localDraft) {
+      throw new Error('当前本地修订已失效，请刷新页面后重试。')
+    }
+
+    const synced = await syncToBackend()
+    if (!synced) {
+      throw new Error('修订尚未保存，无法继续处理。')
+    }
+
+    const persistedRevision = getPendingRevision(localDraft.sentence_id)
+    if (!persistedRevision) {
+      throw new Error('修订保存后未返回可处理记录，请刷新页面后重试。')
+    }
+    return persistedRevision.id
+  }
+
   async function acceptRevision(id: string) {
-    const { data } = await http.patch<SegmentRevisionEntry>(`/revisions/${id}`, {
+    const revisionId = await resolvePersistedRevisionId(id)
+    const { data } = await http.patch<SegmentRevisionEntry>(`/revisions/${revisionId}`, {
       status: 'accepted',
     })
     upsertRevisionEntry(data)
@@ -748,7 +855,8 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   async function rejectRevision(id: string) {
-    const { data } = await http.patch<SegmentRevisionEntry>(`/revisions/${id}`, {
+    const revisionId = await resolvePersistedRevisionId(id)
+    const { data } = await http.patch<SegmentRevisionEntry>(`/revisions/${revisionId}`, {
       status: 'rejected',
     })
     upsertRevisionEntry(data)
@@ -762,10 +870,15 @@ export const useSegmentStore = defineStore('segment', () => {
       return 0
     }
 
+    const synced = await syncToBackend()
+    if (!synced) {
+      return 0
+    }
+
     const { data } = await http.post<{ updated_count: number }>(
       `/file-records/${fileRecord.value.id}/revisions/batch-accept`,
     )
-    await loadRevisions(fileRecord.value.id)
+    await refreshCurrentSegmentPage()
     return data.updated_count
   }
 
@@ -774,16 +887,22 @@ export const useSegmentStore = defineStore('segment', () => {
       return 0
     }
 
+    const synced = await syncToBackend()
+    if (!synced) {
+      return 0
+    }
+
     const { data } = await http.post<{ updated_count: number }>(
       `/file-records/${fileRecord.value.id}/revisions/batch-reject`,
     )
-    await loadRevisions(fileRecord.value.id)
+    await refreshCurrentSegmentPage()
     return data.updated_count
   }
 
   async function applyPartialRevision(revisionId: string, newText: string) {
+    const persistedRevisionId = await resolvePersistedRevisionId(revisionId)
     // 部分接受修订：更新修订的 after_text，然后接受
-    const { data } = await http.patch<SegmentRevisionEntry>(`/revisions/${revisionId}`, {
+    const { data } = await http.patch<SegmentRevisionEntry>(`/revisions/${persistedRevisionId}`, {
       status: 'accepted',
       after_text: newText,
     })

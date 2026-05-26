@@ -1,4 +1,5 @@
 import path from 'node:path'
+import type { Page } from '@playwright/test'
 
 import { expect, test } from './test-fixtures'
 
@@ -6,7 +7,7 @@ const ADMIN_USERNAME = process.env.E2E_ADMIN_USERNAME || 'e2e_admin'
 const ADMIN_PASSWORD = process.env.E2E_ADMIN_PASSWORD || 'E2ePass123!'
 const FIXTURE_FILE = path.resolve(process.cwd(), 'e2e', 'fixtures', 'smoke-source.txt')
 
-async function initializeAdmin(page: import('@playwright/test').Page) {
+async function initializeAdmin(page: Page) {
   await page.goto('/login')
   await expect(page.getByTestId('auth-form')).toBeVisible()
   await page.getByTestId('auth-username').fill(ADMIN_USERNAME)
@@ -18,7 +19,7 @@ async function initializeAdmin(page: import('@playwright/test').Page) {
   ])
 }
 
-async function login(page: import('@playwright/test').Page) {
+async function login(page: Page) {
   await page.goto('/login')
   await expect(page.getByTestId('auth-form')).toBeVisible()
   await page.getByTestId('auth-username').fill(ADMIN_USERNAME)
@@ -28,6 +29,95 @@ async function login(page: import('@playwright/test').Page) {
     page.waitForURL(/\/projects(?:$|\?)/),
     page.getByTestId('auth-submit').click(),
   ])
+}
+
+async function createProjectWithFixtureAndOpenFocusWorkbench(page: Page, projectName: string) {
+  await page.getByTestId('project-create-button').click()
+  await expect(page.getByTestId('project-create-dialog')).toBeVisible()
+  await page.getByTestId('project-create-name').fill(projectName)
+  await Promise.all([
+    page.waitForURL(/\/projects\/[0-9a-f-]+/i),
+    page.getByTestId('project-create-submit').click(),
+  ])
+
+  await page.getByTestId('project-upload-open').click()
+  await expect(page.getByTestId('project-upload-page')).toBeVisible()
+  await page.getByTestId('project-upload-file-input').setInputFiles(FIXTURE_FILE)
+  await page.getByTestId('project-upload-source-language').selectOption('zh-CN')
+  await page.getByTestId('project-upload-target-language').selectOption('en-US')
+  await expect(page.getByTestId('project-upload-submit')).toBeEnabled()
+  await page.getByTestId('project-upload-submit').click()
+
+  await expect(page.getByTestId('project-upload-page')).toBeHidden({ timeout: 45_000 })
+  await expect(page.getByTestId('project-file-table')).toContainText('smoke-source.txt')
+
+  const focusPagePromise = page.waitForEvent('popup')
+  await page.getByTestId('project-file-open-workbench').click()
+  const focusPage = await focusPagePromise
+  await expect(focusPage).toHaveURL(/\/tasks\/[0-9a-f-]+\/focus/i)
+  await expect(focusPage.getByTestId('workbench-page')).toBeVisible()
+  await expect(focusPage.locator('.app-sidebar')).toHaveCount(0)
+  await expect(focusPage.locator('.shell-header')).toHaveCount(0)
+  await expect(focusPage.getByTestId('workbench-ribbon')).toBeVisible()
+  return focusPage
+}
+
+async function saveWorkbenchNow(page: Page) {
+  const saveResponse = page.waitForResponse((response) => (
+    response.url().includes('/segments')
+    && response.request().method() === 'PUT'
+    && response.status() < 400
+  ))
+  await page.getByTestId('workbench-save-button').click()
+  await saveResponse
+}
+
+async function acceptCurrentRevision(page: Page) {
+  const response = page.waitForResponse((item) => (
+    item.url().includes('/revisions/')
+    && item.request().method() === 'PATCH'
+    && item.status() < 400
+  ))
+  await page.getByTestId('workbench-revision-accept-menu').click()
+  await page.getByTestId('workbench-revision-accept-current').click()
+  await response
+}
+
+async function rejectCurrentRevision(page: Page) {
+  const response = page.waitForResponse((item) => (
+    item.url().includes('/revisions/')
+    && item.request().method() === 'PATCH'
+    && item.status() < 400
+  ))
+  await page.getByTestId('workbench-revision-reject-menu').click()
+  await page.getByTestId('workbench-revision-reject-current').click()
+  await response
+}
+
+async function acceptAllRevisions(page: Page) {
+  const response = page.waitForResponse((item) => (
+    item.url().includes('/revisions/batch-accept')
+    && item.request().method() === 'POST'
+    && item.status() < 400
+  ))
+  await page.getByTestId('workbench-revision-accept-menu').click()
+  await page.getByTestId('workbench-revision-accept-all').click()
+  await expect(page.getByTestId('confirm-accept')).toBeVisible()
+  await page.getByTestId('confirm-accept').click()
+  await response
+}
+
+async function rejectAllRevisions(page: Page) {
+  const response = page.waitForResponse((item) => (
+    item.url().includes('/revisions/batch-reject')
+    && item.request().method() === 'POST'
+    && item.status() < 400
+  ))
+  await page.getByTestId('workbench-revision-reject-menu').click()
+  await page.getByTestId('workbench-revision-reject-all').click()
+  await expect(page.getByTestId('confirm-accept')).toBeVisible()
+  await page.getByTestId('confirm-accept').click()
+  await response
 }
 
 test.describe.serial('核心 E2E 冒烟流程', () => {
@@ -47,50 +137,18 @@ test.describe.serial('核心 E2E 冒烟流程', () => {
   })
 
   test('创建项目、上传 TXT、编辑保存并导出', async ({ page }) => {
-    const projectName = `E2E Smoke ${Date.now()}`
     const translatedText = `E2E translated text ${Date.now()}`
 
     await login(page)
-
-    await page.getByTestId('project-create-button').click()
-    await expect(page.getByTestId('project-create-dialog')).toBeVisible()
-    await page.getByTestId('project-create-name').fill(projectName)
-    await Promise.all([
-      page.waitForURL(/\/projects\/[0-9a-f-]+/i),
-      page.getByTestId('project-create-submit').click(),
-    ])
-
-    await page.getByTestId('project-upload-open').click()
-    await expect(page.getByTestId('project-upload-page')).toBeVisible()
-    await page.getByTestId('project-upload-file-input').setInputFiles(FIXTURE_FILE)
-    await page.getByTestId('project-upload-source-language').selectOption('zh-CN')
-    await page.getByTestId('project-upload-target-language').selectOption('en-US')
-    await expect(page.getByTestId('project-upload-submit')).toBeEnabled()
-    await page.getByTestId('project-upload-submit').click()
-
-    await expect(page.getByTestId('project-upload-page')).toBeHidden({ timeout: 45_000 })
-    await expect(page.getByTestId('project-file-table')).toContainText('smoke-source.txt')
-
-    const focusPagePromise = page.waitForEvent('popup')
-    await page.getByTestId('project-file-open-workbench-focus').click()
-    const focusPage = await focusPagePromise
-    await expect(focusPage).toHaveURL(/\/tasks\/[0-9a-f-]+\/focus/i)
-    await expect(focusPage.getByTestId('workbench-page')).toBeVisible()
-    await expect(focusPage.locator('.app-sidebar')).toHaveCount(0)
-    await expect(focusPage.locator('.shell-header')).toHaveCount(0)
-    await expect(focusPage.getByTestId('workbench-ribbon')).toBeVisible()
+    const focusPage = await createProjectWithFixtureAndOpenFocusWorkbench(
+      page,
+      `E2E Smoke ${Date.now()}`,
+    )
 
     const focusEditor = focusPage.getByTestId('segment-target-editor').first()
     await expect(focusEditor).toBeVisible()
     await focusEditor.fill(translatedText)
-
-    const focusSaveResponse = focusPage.waitForResponse((response) => (
-      response.url().includes('/segments')
-      && response.request().method() === 'PUT'
-      && response.status() < 400
-    ))
-    await focusPage.getByTestId('workbench-save-button').click()
-    await focusSaveResponse
+    await saveWorkbenchNow(focusPage)
 
     await focusPage.reload()
     await expect(focusPage.getByTestId('segment-target-editor').first()).toContainText(translatedText)
@@ -101,12 +159,67 @@ test.describe.serial('核心 E2E 冒烟流程', () => {
     const focusDownload = await focusDownloadPromise
     expect(focusDownload.suggestedFilename()).toContain('smoke-source')
     await focusPage.close()
+  })
 
-    await page.getByTestId('project-file-open-workbench').click()
-    await expect(page).toHaveURL(/\/tasks\/[0-9a-f-]+/i)
-    await expect(page.getByTestId('workbench-page')).toBeVisible()
-    await expect(page.locator('.app-sidebar')).toBeVisible()
-    await expect(page.locator('.shell-header')).toBeVisible()
-    await expect(page.getByTestId('segment-target-editor').first()).toContainText(translatedText)
+  test('跟踪修订会在编辑、保存、接受/拒绝和批量操作后实时刷新', async ({ page }) => {
+    const originalText = `Revision original ${Date.now()}`
+    const acceptedText = `Revision accepted ${Date.now()}`
+    const rejectedText = `Revision rejected ${Date.now()}`
+    const batchAcceptedText = `Revision batch accepted ${Date.now()}`
+    const batchRejectedText = `Revision batch rejected ${Date.now()}`
+
+    await login(page)
+    const focusPage = await createProjectWithFixtureAndOpenFocusWorkbench(
+      page,
+      `E2E Revision ${Date.now()}`,
+    )
+
+    const firstRow = focusPage.getByTestId('segment-row').first()
+    const editor = focusPage.getByTestId('segment-target-editor').first()
+    await expect(editor).toBeVisible()
+
+    await editor.fill(originalText)
+    await saveWorkbenchNow(focusPage)
+    await acceptCurrentRevision(focusPage)
+    await expect(firstRow).toHaveAttribute('data-has-pending-revision', 'false')
+
+    await focusPage.getByTestId('workbench-revision-toggle').click()
+    await expect(focusPage.getByTestId('workbench-revision-toggle')).toHaveAttribute('aria-pressed', 'true')
+
+    await editor.fill(acceptedText)
+    await expect(firstRow.locator('[data-testid="segment-revision-insert"]')).toContainText(acceptedText)
+    await expect(firstRow.locator('[data-testid="segment-revision-delete"]')).toContainText(originalText)
+
+    await saveWorkbenchNow(focusPage)
+    await expect(firstRow).toHaveAttribute('data-has-pending-revision', 'true')
+    await expect(firstRow.locator('[data-testid="segment-revision-insert"]')).toContainText(acceptedText)
+    await expect(focusPage.getByTestId('workbench-revision-accept-menu')).toBeEnabled()
+
+    await acceptCurrentRevision(focusPage)
+    await expect(firstRow).toHaveAttribute('data-has-pending-revision', 'false')
+    await expect(editor).toContainText(acceptedText)
+
+    await editor.fill(rejectedText)
+    await saveWorkbenchNow(focusPage)
+    await expect(firstRow).toHaveAttribute('data-has-pending-revision', 'true')
+    await rejectCurrentRevision(focusPage)
+    await expect(firstRow).toHaveAttribute('data-has-pending-revision', 'false')
+    await expect(editor).toContainText(acceptedText)
+
+    await editor.fill(batchAcceptedText)
+    await saveWorkbenchNow(focusPage)
+    await expect(firstRow).toHaveAttribute('data-has-pending-revision', 'true')
+    await acceptAllRevisions(focusPage)
+    await expect(firstRow).toHaveAttribute('data-has-pending-revision', 'false')
+    await expect(editor).toContainText(batchAcceptedText)
+
+    await editor.fill(batchRejectedText)
+    await saveWorkbenchNow(focusPage)
+    await expect(firstRow).toHaveAttribute('data-has-pending-revision', 'true')
+    await rejectAllRevisions(focusPage)
+    await expect(firstRow).toHaveAttribute('data-has-pending-revision', 'false')
+    await expect(editor).toContainText(batchAcceptedText)
+
+    await focusPage.close()
   })
 })

@@ -9,7 +9,6 @@ import {
   Clock3,
   Copy,
   Download,
-  ExternalLink,
   FileText,
   Filter,
   Flag,
@@ -157,6 +156,19 @@ const DEFAULT_DOCUMENT_PARSE_OPTIONS: DocumentParseOptions = {
   custom_parse_config: false,
   translate_idml_comments: false,
   translate_idml_hidden_layers: false,
+  pptx_translate_comments: true,
+  pptx_translate_notes: true,
+  pptx_translate_document_properties: false,
+  xlsx_translate_comments: true,
+  xlsx_translate_drawing_text: true,
+  xlsx_translate_sheet_names: false,
+  xlsx_translate_hidden_content: true,
+  xlsx_translate_document_properties: false,
+  xlsx_translate_numeric_cells: true,
+  xlsx_translate_date_cells: true,
+  xlsx_translate_boolean_cells: true,
+  xlsx_translate_formula_cells: false,
+  xlsx_skip_fill_colors: [],
 }
 
 const DOCUMENT_STATISTIC_NUMBER_KEYS: DocumentStatisticNumberKey[] = [
@@ -878,24 +890,6 @@ function clearDocumentStatisticsTable() {
 }
 
 function openWorkbench(row: ProjectRow) {
-  if (!canEnterWorkbench(row)) {
-    return
-  }
-
-  closeActionMenu()
-  const rowId = String(row.id)
-  void router.push({
-    name: 'workbench',
-    params: { id: rowId },
-    query: {
-      from: 'project',
-      pid: props.id,
-      ...(cameFromTasks.value ? { parent: 'tasks' } : {}),
-    },
-  })
-}
-
-function openWorkbenchInNewWindow(row: ProjectRow) {
   if (!canEnterWorkbench(row)) {
     return
   }
@@ -1857,16 +1851,6 @@ onBeforeUnmount(() => {
                   >
                     {{ row.filename }}
                   </button>
-                  <button
-                    class="pd-file-cell__focus-button"
-                    data-testid="project-file-open-workbench-focus"
-                    type="button"
-                    :title="t('projectDetail.files.actions.openFocus')"
-                    :aria-label="t('projectDetail.files.actions.openFocus')"
-                    @click.stop="openWorkbenchInNewWindow(row)"
-                  >
-                    <ExternalLink :size="14" />
-                  </button>
                 </div>
                 <span v-else class="pd-file-cell__title" :title="row.filename">{{ row.filename }}</span>
                 <span class="pd-file-cell__meta">{{ getFileDetailHint(row) }}</span>
@@ -2138,14 +2122,6 @@ onBeforeUnmount(() => {
           @click="openWorkbench(actionMenuRow)"
         >
           {{ t('projectDetail.enterWorkbench') }}
-        </button>
-        <button
-          type="button"
-          :disabled="!canEnterWorkbench(actionMenuRow)"
-          :title="!canEnterWorkbench(actionMenuRow) ? getFileDetailHint(actionMenuRow) : undefined"
-          @click="openWorkbenchInNewWindow(actionMenuRow)"
-        >
-          {{ t('projectDetail.files.actions.openFocus') }}
         </button>
         <button
           type="button"
@@ -2888,25 +2864,6 @@ onBeforeUnmount(() => {
 
 .pd-link-button:hover {
   color: var(--brand-600);
-}
-
-.pd-file-cell__focus-button {
-  display: inline-grid;
-  flex: 0 0 24px;
-  place-items: center;
-  width: 24px;
-  height: 24px;
-  padding: 0;
-  border: 1px solid var(--line-soft);
-  border-radius: 6px;
-  background: var(--surface-panel);
-  color: var(--text-secondary);
-  box-shadow: none;
-}
-
-.pd-file-cell__focus-button:hover {
-  border-color: var(--brand-500);
-  color: var(--brand-700);
 }
 
 .pd-file-cell__title {

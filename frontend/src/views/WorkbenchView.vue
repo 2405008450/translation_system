@@ -526,7 +526,7 @@ const activeSegmentHistory = computed(() => (
 ))
 
 const activePendingRevision = computed(() => (
-  segmentStore.activeSentenceId ? segmentStore.getPendingRevision(segmentStore.activeSentenceId) : null
+  segmentStore.activeSentenceId ? segmentStore.getRevisionTrace(segmentStore.activeSentenceId) : null
 ))
 
 const activeSegmentSourceText = computed(() => activeSegment.value?.source_text || '')
@@ -661,7 +661,10 @@ const segmentOrdinalMap = computed(() => {
   const nextMap = new Map<string, number>()
   const startIndex = (segmentStore.currentPage - 1) * segmentStore.pageSize
   segmentStore.segments.forEach((segment, index) => {
-    nextMap.set(segment.sentence_id, startIndex + index)
+    const displayIndex = typeof segment.display_index === 'number' && Number.isFinite(segment.display_index)
+      ? segment.display_index
+      : startIndex + index
+    nextMap.set(segment.sentence_id, displayIndex)
   })
   return nextMap
 })
@@ -1553,11 +1556,15 @@ async function refreshSegmentPage(page = segmentStore.currentPage, size = segmen
       segmentStore.startRevisionTracking()
     }
     const commentQuery = getCommentWindowQuery()
-    if (commentQuery) {
-      await commentStore.loadComments(props.id, commentQuery)
-      commentStore.startPolling(props.id, getCommentWindowQuery)
-    } else {
-      commentStore.resetState()
+    try {
+      if (commentQuery) {
+        await commentStore.loadComments(props.id, commentQuery)
+        commentStore.startPolling(props.id, getCommentWindowQuery)
+      } else {
+        commentStore.resetState()
+      }
+    } catch (error) {
+      commentStore.message = getErrorMessage(error, t('workbench.errors.commentsUnavailable'))
     }
     await nextTick()
     await virtualListRef.value?.scrollToIndex(0, 'start')
@@ -2334,6 +2341,7 @@ onBeforeRouteLeave(async () => {
         <div class="tool-group tool-group--revision">
           <button
             class="tool-col tool-col--big tool-button workbench-revision-trigger"
+            data-testid="workbench-revision-toggle"
             type="button"
             :class="{ active: revisionTraceVisible }"
             :aria-pressed="revisionTraceVisible"
@@ -2350,6 +2358,7 @@ onBeforeRouteLeave(async () => {
             <div class="workbench-revision-menu workbench-revision-menu--ribbon">
               <button
                 class="tool-line tool-button"
+                data-testid="workbench-revision-accept-menu"
                 type="button"
                 :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
                 @click="toggleRevisionMenu('accept')"
@@ -2366,6 +2375,7 @@ onBeforeRouteLeave(async () => {
               </button>
               <div v-if="openRevisionMenu === 'accept'" class="workbench-revision-menu__dropdown">
                 <button
+                  data-testid="workbench-revision-accept-current"
                   type="button"
                   :disabled="revisionActionLoading || !activePendingRevision"
                   @click="void handleAcceptActiveRevision()"
@@ -2373,6 +2383,7 @@ onBeforeRouteLeave(async () => {
                   {{ t('workbench.ribbon.acceptCurrentRevision') }}
                 </button>
                 <button
+                  data-testid="workbench-revision-accept-all"
                   type="button"
                   :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
                   @click="void handleBatchAcceptRevisions()"
@@ -2384,6 +2395,7 @@ onBeforeRouteLeave(async () => {
             <div class="workbench-revision-menu workbench-revision-menu--ribbon">
               <button
                 class="tool-line tool-button"
+                data-testid="workbench-revision-reject-menu"
                 type="button"
                 :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
                 @click="toggleRevisionMenu('reject')"
@@ -2401,6 +2413,7 @@ onBeforeRouteLeave(async () => {
               <div v-if="openRevisionMenu === 'reject'" class="workbench-revision-menu__dropdown">
                 <button
                   class="is-danger"
+                  data-testid="workbench-revision-reject-current"
                   type="button"
                   :disabled="revisionActionLoading || !activePendingRevision"
                   @click="void handleRejectActiveRevision()"
@@ -2409,6 +2422,7 @@ onBeforeRouteLeave(async () => {
                 </button>
                 <button
                   class="is-danger"
+                  data-testid="workbench-revision-reject-all"
                   type="button"
                   :disabled="revisionActionLoading || segmentStore.pendingRevisionCount === 0"
                   @click="void handleBatchRejectRevisions()"
@@ -2778,7 +2792,7 @@ onBeforeRouteLeave(async () => {
           <div class="segment-editor-toolbar__title">
             <div class="section-title section-title--tight">{{ t('workbench.editorTitle') }}</div>
             <span class="hint-text">
-              当前页 {{ segmentStore.currentPageStart }}-{{ segmentStore.currentPageEnd }} / {{ segmentStore.matchedSegmentCount }}，总 {{ segmentStore.totalSegmentCount }}
+              当前句段 {{ segmentStore.currentPageStart }}-{{ segmentStore.currentPageEnd }} / {{ segmentStore.matchedSegmentCount }}，总句段 {{ segmentStore.totalSegmentCount }}
             </span>
           </div>
           <div class="segment-editor-toolbar__overview">
@@ -2987,6 +3001,7 @@ onBeforeRouteLeave(async () => {
                     :pending-revision="revisionTraceVisible ? segmentStore.getRevisionTrace(item.sentence_id) : null"
                     :revision-busy="revisionActionLoading"
                     :matched-terms="segmentStore.activeSentenceId === item.sentence_id ? activeMatchedTerms : []"
+                    :source-search-query="sourceSearchQuery"
                     @focus="segmentStore.setActiveSentence"
                     @activate-target="handleSegmentTargetActivate"
                     @update="updateSegmentTarget"

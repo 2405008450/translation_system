@@ -96,6 +96,19 @@ export interface DocumentParseOptions {
   custom_parse_config: boolean
   translate_idml_comments: boolean
   translate_idml_hidden_layers: boolean
+  pptx_translate_comments: boolean
+  pptx_translate_notes: boolean
+  pptx_translate_document_properties: boolean
+  xlsx_translate_comments: boolean
+  xlsx_translate_drawing_text: boolean
+  xlsx_translate_sheet_names: boolean
+  xlsx_translate_hidden_content: boolean
+  xlsx_translate_document_properties: boolean
+  xlsx_translate_numeric_cells: boolean
+  xlsx_translate_date_cells: boolean
+  xlsx_translate_boolean_cells: boolean
+  xlsx_translate_formula_cells: boolean
+  xlsx_skip_fill_colors: string[]
 }
 
 export interface DocumentStatistics {
@@ -128,7 +141,12 @@ export interface UploadCapability {
   settings?: Array<{
     id: keyof DocumentParseOptions
     label: string
-    default: boolean
+    kind?: 'checkbox' | 'color_palette'
+    default: boolean | string[]
+    options?: Array<{
+      label: string
+      value: string
+    }>
     disabled?: boolean
     description?: string
   }>
@@ -164,6 +182,7 @@ export interface TermMatchCandidate {
 export interface Segment {
   id: string
   sentence_id: string
+  display_index?: number | null
   source_text: string
   display_text: string
   target_text: string

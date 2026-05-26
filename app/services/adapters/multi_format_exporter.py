@@ -246,6 +246,14 @@ class MultiFormatExporter:
             from app.services.adapters.svg_exporter import SvgExporter
 
             content = SvgExporter().export(original_bytes, text_map)
+        elif extension == ".pptx":
+            from app.services.adapters.pptx_exporter import PptxExporter
+
+            content = PptxExporter().export(original_bytes, segments)
+        elif extension == ".xlsx":
+            from app.services.adapters.xlsx_exporter import XlsxExporter
+
+            content = XlsxExporter().export(original_bytes, segments)
         elif extension == ".sdlxliff":
             from app.services.adapters.sdlxliff_exporter import SdlxliffExporter
 
@@ -535,6 +543,7 @@ class MultiFormatExporter:
             ".docx": "winword",
             ".pdf": "pdf",
             ".pptx": "powerpoint",
+            ".xlsx": "x-excel",
             ".txt": "plaintext",
             ".dat": "plaintext",
             ".html": "html",
@@ -707,6 +716,8 @@ class MultiFormatExporter:
             ".txml": "application/octet-stream",
             ".txt": "text/plain; charset=utf-8",
             ".dat": "text/plain; charset=utf-8",
+            ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             ".yaml": "application/yaml; charset=utf-8",
             ".yml": "application/yaml; charset=utf-8",
             ".zip": "application/zip",

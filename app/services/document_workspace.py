@@ -88,8 +88,23 @@ DEFAULT_DOCUMENT_PARSE_OPTIONS = {
     "custom_parse_config": False,
     "translate_idml_comments": False,
     "translate_idml_hidden_layers": False,
+    "pptx_translate_comments": True,
+    "pptx_translate_notes": True,
+    "pptx_translate_document_properties": False,
+    "xlsx_translate_comments": True,
+    "xlsx_translate_drawing_text": True,
+    "xlsx_translate_sheet_names": False,
+    "xlsx_translate_hidden_content": True,
+    "xlsx_translate_document_properties": False,
+    "xlsx_translate_numeric_cells": True,
+    "xlsx_translate_date_cells": True,
+    "xlsx_translate_boolean_cells": True,
+    "xlsx_translate_formula_cells": False,
+    "xlsx_skip_fill_colors": [],
 }
 DOCUMENT_PARSE_OPTION_FIELDS = set(DEFAULT_DOCUMENT_PARSE_OPTIONS)
+DOCUMENT_PARSE_LIST_OPTION_FIELDS = {"xlsx_skip_fill_colors"}
+DOCUMENT_PARSE_BOOL_OPTION_FIELDS = DOCUMENT_PARSE_OPTION_FIELDS - DOCUMENT_PARSE_LIST_OPTION_FIELDS
 EMU_PER_PIXEL = 9525
 MATH_PLACEHOLDER_TEMPLATE = "⟦MATH_{index}⟧"
 OMML_ATOMIC_TAGS = {
@@ -544,9 +559,24 @@ def normalize_document_parse_options(
         raw_options = value
 
     options = dict(DEFAULT_DOCUMENT_PARSE_OPTIONS)
-    for key in DOCUMENT_PARSE_OPTION_FIELDS:
+    for key in DOCUMENT_PARSE_BOOL_OPTION_FIELDS:
         if key in raw_options:
             options[key] = bool(raw_options[key])
+    for key in DOCUMENT_PARSE_LIST_OPTION_FIELDS:
+        if key not in raw_options:
+            continue
+        raw_value = raw_options[key]
+        if isinstance(raw_value, str):
+            values = [raw_value]
+        elif isinstance(raw_value, list):
+            values = raw_value
+        else:
+            values = []
+        options[key] = [
+            item.strip().upper().lstrip("#")
+            for item in values
+            if isinstance(item, str) and item.strip()
+        ]
 
     if normalize_document_parse_mode(document_parse_mode) == DOCUMENT_PARSE_MODE_BODY_ONLY:
         options["include_headers_footers"] = False

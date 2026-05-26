@@ -16,7 +16,7 @@ from app.services.document_workspace import parse_docx_workspace
 
 # 支持的文件扩展名
 SUPPORTED_EXTENSIONS = {
-    ".txt", ".docx", ".pdf", ".pptx", ".dita", ".ditamap", ".xml", ".svg",
+    ".txt", ".docx", ".pdf", ".pptx", ".xlsx", ".dita", ".ditamap", ".xml", ".svg",
     ".yaml", ".yml", ".json", ".php",
     # V4 新增格式
     ".html", ".htm", ".properties", ".po", ".pot", ".strings",

@@ -1,5 +1,7 @@
 export const supportedTaskExtensions = [
   '.docx',
+  '.pptx',
+  '.xlsx',
   '.txt',
   '.csv',
   '.html',

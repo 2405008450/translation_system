@@ -94,6 +94,8 @@ class ProviderConfig:
 BATCH_MAX_ITEMS = 15
 BATCH_MAX_SOURCE_CHARS = 3000
 BATCH_ITEM_RE = re.compile(r"^\[(\d+)\]\s*", re.MULTILINE)
+LLM_REQUEST_TIMEOUT_GRACE_SECONDS = 5.0
+DEFAULT_LLM_STALL_TIMEOUT_SECONDS = 120.0
 
 
 @dataclass
@@ -109,6 +111,51 @@ class ParagraphTaskGroup:
     @property
     def translate_tasks(self) -> list[LLMTranslationTask]:
         return [task for task in self.tasks if task.should_translate]
+
+
+def _coerce_timeout_seconds(
+    value: float | int | str | None,
+    default: float,
+    minimum: float = 1.0,
+) -> float:
+    try:
+        seconds = float(value if value is not None else default)
+    except (TypeError, ValueError):
+        seconds = default
+    return max(seconds, minimum)
+
+
+def _format_timeout_seconds(seconds: float) -> str:
+    return str(int(seconds)) if float(seconds).is_integer() else f"{seconds:.1f}"
+
+
+def _llm_request_timeout_seconds(timeout_seconds: float | int | str | None) -> float:
+    return _coerce_timeout_seconds(timeout_seconds, 60.0)
+
+
+def _llm_stall_timeout_seconds(settings: Settings) -> float:
+    configured = getattr(settings, "llm_stall_timeout_seconds", DEFAULT_LLM_STALL_TIMEOUT_SECONDS)
+    return _coerce_timeout_seconds(configured, DEFAULT_LLM_STALL_TIMEOUT_SECONDS, minimum=0.1)
+
+
+def _llm_request_timeout_message(provider_name: str, timeout_seconds: float) -> str:
+    return f"{provider_name} 请求超过 {_format_timeout_seconds(timeout_seconds)} 秒未返回，已终止本次尝试。"
+
+
+def _llm_stall_timeout_message(timeout_seconds: float) -> str:
+    return f"LLM 超过 {_format_timeout_seconds(timeout_seconds)} 秒没有返回新结果，已跳过该片段。"
+
+
+def _failure_for_task(task: LLMTranslationTask, message: str) -> LLMTranslationFailure:
+    return LLMTranslationFailure(
+        sentence_id=task.sentence_id,
+        status=task.status,
+        error_message=message,
+    )
+
+
+def _failures_for_tasks(tasks: list[LLMTranslationTask], message: str) -> list[LLMTranslationFailure]:
+    return [_failure_for_task(task, message) for task in tasks if task.should_translate]
 
 
 NUMERIC_LIKE_FRAGMENT_RE = re.compile(r"^[0-9\s,.\-+/%()（）$€¥￥£:：]+$")
@@ -212,18 +259,30 @@ async def iter_batch_translate(
     max_concurrency = max(int(config.llm_max_concurrency), 1)
     semaphore = asyncio.Semaphore(max_concurrency)
     use_batch = bool(translation_guidelines)
+    stall_timeout = _llm_stall_timeout_seconds(config)
 
     async def _run_single_mode(clients: dict[str, "httpx.AsyncClient" | None]):
         async def run_single(task: LLMTranslationTask):
             async with semaphore:
                 try:
-                    return await _translate_single_task(
-                        task=task,
-                        providers=providers,
-                        clients=clients,
-                        settings=config,
-                        translation_guidelines=translation_guidelines,
+                    return await asyncio.wait_for(
+                        _translate_single_task(
+                            task=task,
+                            providers=providers,
+                            clients=clients,
+                            settings=config,
+                            translation_guidelines=translation_guidelines,
+                        ),
+                        timeout=stall_timeout,
                     )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "llm translate stalled sentence_id=%s provider=%s timeout=%.1fs",
+                        task.sentence_id,
+                        provider,
+                        stall_timeout,
+                    )
+                    return _failure_for_task(task, _llm_stall_timeout_message(stall_timeout))
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "llm translate failed sentence_id=%s provider=%s error=%s",
@@ -257,15 +316,29 @@ async def iter_batch_translate(
 
         async def run_group(group: TaskGroup):
             async with semaphore:
-                return await _translate_batch_group(
-                    group=group,
-                    providers=providers,
-                    clients=clients,
-                    settings=config,
-                    translation_guidelines=translation_guidelines,
-                )
+                try:
+                    return await asyncio.wait_for(
+                        _translate_batch_group(
+                            group=group,
+                            providers=providers,
+                            clients=clients,
+                            settings=config,
+                            translation_guidelines=translation_guidelines,
+                        ),
+                        timeout=stall_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "batch translate stalled group_size=%d timeout=%.1fs",
+                        len(group.tasks),
+                        stall_timeout,
+                    )
+                    return _failures_for_tasks(group.tasks, _llm_stall_timeout_message(stall_timeout))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("batch translate group failed error=%s", exc)
+                    return _failures_for_tasks(group.tasks, str(exc))
 
-        futures = [asyncio.create_task(run_group(g)) for g in groups]
+        futures = [asyncio.create_task(run_group(group)) for group in groups]
         try:
             for future in asyncio.as_completed(futures):
                 group_results = await future
@@ -287,15 +360,29 @@ async def iter_batch_translate(
 
         async def run_group(group: ParagraphTaskGroup):
             async with semaphore:
-                return await _translate_paragraph_group(
-                    group=group,
-                    providers=providers,
-                    clients=clients,
-                    settings=config,
-                    translation_guidelines=translation_guidelines,
-                )
+                try:
+                    return await asyncio.wait_for(
+                        _translate_paragraph_group(
+                            group=group,
+                            providers=providers,
+                            clients=clients,
+                            settings=config,
+                            translation_guidelines=translation_guidelines,
+                        ),
+                        timeout=stall_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "paragraph translate stalled group_size=%d timeout=%.1fs",
+                        len(group.translate_tasks),
+                        stall_timeout,
+                    )
+                    return _failures_for_tasks(group.translate_tasks, _llm_stall_timeout_message(stall_timeout))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("paragraph translate group failed error=%s", exc)
+                    return _failures_for_tasks(group.translate_tasks, str(exc))
 
-        futures = [asyncio.create_task(run_group(g)) for g in groups]
+        futures = [asyncio.create_task(run_group(group)) for group in groups]
         try:
             for future in asyncio.as_completed(futures):
                 group_results = await future
@@ -317,11 +404,12 @@ async def iter_batch_translate(
         return
 
     async with AsyncExitStack() as stack:
+        request_timeout = _llm_request_timeout_seconds(config.llm_timeout_seconds)
         clients = {
             item.name: await stack.enter_async_context(
                 httpx.AsyncClient(
                     base_url=item.base_url,
-                    timeout=httpx.Timeout(config.llm_timeout_seconds),
+                    timeout=httpx.Timeout(request_timeout),
                 )
             )
             for item in providers
@@ -403,16 +491,35 @@ async def _request_translation(
         headers["HTTP-Referer"] = "AI Translation System"
         headers["X-Title"] = "AI Translation System"
 
+    request_timeout = _llm_request_timeout_seconds(timeout_seconds)
+    hard_timeout = request_timeout + LLM_REQUEST_TIMEOUT_GRACE_SECONDS
     if client is None:
-        return await asyncio.to_thread(
-            _request_translation_with_urllib,
-            provider,
-            headers,
-            payload,
-            timeout_seconds,
-        )
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    _request_translation_with_urllib,
+                    provider,
+                    headers,
+                    payload,
+                    request_timeout,
+                ),
+                timeout=hard_timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            raise LLMRequestError(_llm_request_timeout_message(provider.name, request_timeout)) from exc
 
-    response = await client.post("/chat/completions", headers=headers, json=payload)
+    try:
+        response = await asyncio.wait_for(
+            client.post("/chat/completions", headers=headers, json=payload),
+            timeout=hard_timeout,
+        )
+    except asyncio.TimeoutError as exc:
+        raise LLMRequestError(_llm_request_timeout_message(provider.name, request_timeout)) from exc
+    except httpx.TimeoutException as exc:
+        raise LLMRequestError(_llm_request_timeout_message(provider.name, request_timeout)) from exc
+    except httpx.RequestError as exc:
+        raise LLMRequestError(f"{provider.name} 请求失败：{exc}") from exc
+
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
@@ -478,11 +585,12 @@ async def request_chat_completion(
         return await _run_with_clients({item.name: None for item in providers})
 
     async with AsyncExitStack() as stack:
+        request_timeout = _llm_request_timeout_seconds(config.llm_timeout_seconds)
         clients = {
             item.name: await stack.enter_async_context(
                 httpx.AsyncClient(
                     base_url=item.base_url,
-                    timeout=httpx.Timeout(config.llm_timeout_seconds),
+                    timeout=httpx.Timeout(request_timeout),
                 )
             )
             for item in providers

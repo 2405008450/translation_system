@@ -51,6 +51,7 @@ const emit = defineEmits<{
 const NO_TM_COLLECTION_ID = '__NO_TM_COLLECTION__'
 const FILE_OPERATION_TOKEN_HEADER = 'X-File-Operation-Token'
 const LOCK_HEARTBEAT_INTERVAL_MS = 30_000
+const LLM_STREAM_IDLE_TIMEOUT_MS = 150_000
 
 const { t } = useI18n()
 
@@ -396,6 +397,9 @@ async function runLLMForFile(fileId: string, completedActions: number, actionCou
   const controller = new AbortController()
   let plannedCount = 0
   let processedCount = 0
+  let sawComplete = false
+  let stalled = false
+  let idleTimer: number | null = null
   currentAbortController.value = controller
 
   const updateLLMProgress = (status: string, actionPercent: number) => {
@@ -406,7 +410,23 @@ async function runLLMForFile(fileId: string, completedActions: number, actionCou
     )
   }
 
+  const clearIdleTimer = () => {
+    if (idleTimer !== null) {
+      window.clearTimeout(idleTimer)
+      idleTimer = null
+    }
+  }
+
+  const refreshIdleTimer = () => {
+    clearIdleTimer()
+    idleTimer = window.setTimeout(() => {
+      stalled = true
+      controller.abort()
+    }, LLM_STREAM_IDLE_TIMEOUT_MS)
+  }
+
   try {
+    refreshIdleTimer()
     const response = await fetch(`/api/file-records/${fileId}/llm-translate`, {
       method: 'POST',
       headers: {
@@ -435,6 +455,7 @@ async function runLLMForFile(fileId: string, completedActions: number, actionCou
     }
 
     await consumeLLMStream(response, ({ event, data }) => {
+      refreshIdleTimer()
       if (stopRequested.value) {
         return
       }
@@ -466,6 +487,7 @@ async function runLLMForFile(fileId: string, completedActions: number, actionCou
       }
 
       if (event === 'complete') {
+        sawComplete = true
         const total = Number(data.total || plannedCount || processedCount)
         const updated = Number(data.updated_count || 0)
         const error = Number(data.error_count || 0)
@@ -479,7 +501,17 @@ async function runLLMForFile(fileId: string, completedActions: number, actionCou
         )
       }
     })
+
+    if (!sawComplete) {
+      throw new Error(t('projectDetail.preTranslate.errors.llmStreamInterrupted'))
+    }
+  } catch (error) {
+    if (stalled && !stopRequested.value) {
+      throw new Error(t('projectDetail.preTranslate.errors.llmStalled'))
+    }
+    throw error
   } finally {
+    clearIdleTimer()
     currentAbortController.value = null
   }
 }

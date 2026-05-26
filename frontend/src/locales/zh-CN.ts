@@ -517,6 +517,8 @@ export default {
         tmCollectionRequired: '已启用 TM，请至少选择一个记忆库。',
         termBaseRequired: '已启用术语库，请选择术语库。',
         llmFailed: 'LLM 预翻译请求失败。',
+        llmStalled: 'LLM 长时间没有返回进度，已自动中止本次请求。',
+        llmStreamInterrupted: 'LLM 预翻译连接提前中断，请稍后重试。',
         guidelineImport: '翻译细则导入失败。',
         unknown: '执行失败，请稍后重试。',
       },

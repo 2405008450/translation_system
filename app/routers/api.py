@@ -2580,8 +2580,8 @@ def _normalize_segment_page_limit(limit: int) -> int:
     return min(max(int(limit), 1), SEGMENT_PAGE_MAX_LIMIT)
 
 
-def _serialize_workbench_segment(seg: Segment) -> dict:
-    return {
+def _serialize_workbench_segment(seg: Segment, display_index: int | None = None) -> dict:
+    payload = {
         "id": str(seg.id),
         "sentence_id": seg.sentence_id,
         "source_text": seg.source_text,
@@ -2602,6 +2602,9 @@ def _serialize_workbench_segment(seg: Segment) -> dict:
         "row_index": seg.row_index,
         "cell_index": seg.cell_index,
     }
+    if display_index is not None:
+        payload["display_index"] = display_index
+    return payload
 
 
 def _apply_segment_scope_filter(query, scope: str):
@@ -2646,6 +2649,40 @@ def _order_segment_query(query):
         Segment.cell_index.asc().nullsfirst(),
         Segment.sentence_id.asc(),
     )
+
+
+def _get_segment_display_index_map(
+    db: Session,
+    file_record_id: UUID,
+    segments: list[Segment],
+) -> dict[UUID, int]:
+    segment_ids = [segment.id for segment in segments]
+    if not segment_ids:
+        return {}
+
+    ordered_segments = (
+        db.query(
+            Segment.id.label("id"),
+            func.row_number()
+            .over(
+                order_by=(
+                    Segment.block_index.asc(),
+                    Segment.row_index.asc().nullsfirst(),
+                    Segment.cell_index.asc().nullsfirst(),
+                    Segment.sentence_id.asc(),
+                )
+            )
+            .label("display_index"),
+        )
+        .filter(Segment.file_record_id == file_record_id)
+        .subquery()
+    )
+    rows = (
+        db.query(ordered_segments.c.id, ordered_segments.c.display_index)
+        .filter(ordered_segments.c.id.in_(segment_ids))
+        .all()
+    )
+    return {row.id: int(row.display_index) - 1 for row in rows}
 
 
 def _build_preview_render_segments(segments: list[Segment], mode: str) -> list[dict]:
@@ -2789,7 +2826,10 @@ def get_file_record(
         "issue_count": issue_stats["issue_count"],
         "open_issue_count": issue_stats["open_issue_count"],
         "status_stats": _get_segment_status_stats(db, file_record_id),
-        "segments": [_serialize_workbench_segment(seg) for seg in segments],
+        "segments": [
+            _serialize_workbench_segment(seg, display_index=result["skip"] + index)
+            for index, seg in enumerate(segments)
+        ],
     }
 
 
@@ -2890,6 +2930,7 @@ def get_file_record_segments(
         .limit(safe_limit)
         .all()
     )
+    display_index_map = _get_segment_display_index_map(db, file_record_id, page_segments)
 
     return {
         "file_record_id": str(file_record_id),
@@ -2904,7 +2945,10 @@ def get_file_record_segments(
             "target_query": target_query or "",
             "search_fuzzy": search_fuzzy,
         },
-        "segments": [_serialize_workbench_segment(seg) for seg in page_segments],
+        "segments": [
+            _serialize_workbench_segment(seg, display_index=display_index_map.get(seg.id))
+            for seg in page_segments
+        ],
     }
 
 
@@ -3288,7 +3332,31 @@ def export_file_record_with_type(
     raw_bytes = load_file_record_source(file_record)
     segments = list_segments_for_file_record(db, file_record_id)
 
-    # 转换句段格式
+    # 原格式导出需要按原文件重新写回，避免走通用导出器丢失格式。
+    if export_type == "original":
+        source_filename = get_file_record_source_filename(file_record)
+        if not can_export_task_file(source_filename, has_source_file=raw_bytes is not None):
+            raise HTTPException(status_code=400, detail="Current file format does not support original export yet.")
+        try:
+            exported_file = export_translated_task_file(
+                raw_bytes=raw_bytes,
+                filename=source_filename,
+                segments=segments,
+                document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
+                document_parse_options=_get_file_record_document_parse_options(file_record),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"导出失败: {str(exc)}") from exc
+
+        return _build_binary_download_response(
+            filename=exported_file.filename,
+            content=exported_file.content,
+            media_type=exported_file.media_type,
+        )
+
+    # 其他导出格式使用通用句段列表。
     segment_dicts = [
         {
             "segment_id": seg.sentence_id,

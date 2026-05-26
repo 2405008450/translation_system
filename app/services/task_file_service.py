@@ -30,6 +30,8 @@ from app.services.matcher import MatchStats, match_sentences_with_stats
 TASK_ADAPTER_EXTENSIONS = {
     ".txt",
     ".dat",
+    ".pptx",
+    ".xlsx",
     ".csv",
     ".html",
     ".htm",
@@ -119,6 +121,113 @@ _UPLOAD_CAPABILITY_SPECS = (
         "label": "纯文本",
         "category": "text",
         "features": ("按空行识别段落", "自动断句", "支持 UTF-8 / UTF-8-BOM / GB18030"),
+    },
+    {
+        "extensions": (".pptx",),
+        "label": "PowerPoint 演示文稿",
+        "category": "office",
+        "features": (
+            "提取幻灯片文本框和占位符",
+            "提取表格单元格",
+            "提取演讲者备注",
+            "支持原格式写回",
+        ),
+        "settings_select_all": True,
+        "settings": (
+            {
+                "id": "pptx_translate_comments",
+                "label": "翻译批注",
+                "default": True,
+            },
+            {
+                "id": "pptx_translate_notes",
+                "label": "翻译备注",
+                "default": True,
+            },
+            {
+                "id": "pptx_translate_document_properties",
+                "label": "翻译文档属性",
+                "default": False,
+            },
+        ),
+    },
+    {
+        "extensions": (".xlsx",),
+        "label": "Excel 工作簿",
+        "category": "office",
+        "features": (
+            "默认提取非空单元格，包含数字、日期、布尔值和隐藏内容",
+            "公式单元格可按设置纳入；纳入后会作为文本写回",
+            "支持批注、图形文本、工作表名和文档属性选项",
+            "支持按常见背景色跳过单元格",
+        ),
+        "settings_select_all": False,
+        "settings": (
+            {
+                "id": "xlsx_translate_numeric_cells",
+                "label": "纳入数字单元格",
+                "default": True,
+            },
+            {
+                "id": "xlsx_translate_date_cells",
+                "label": "纳入日期/时间单元格",
+                "default": True,
+            },
+            {
+                "id": "xlsx_translate_boolean_cells",
+                "label": "纳入布尔值单元格",
+                "default": True,
+            },
+            {
+                "id": "xlsx_translate_formula_cells",
+                "label": "纳入公式单元格（会转为文本）",
+                "default": False,
+                "description": "开启后公式内容会进入翻译并在导出时写回为文本，原公式不再保留。",
+            },
+            {
+                "id": "xlsx_translate_comments",
+                "label": "翻译批注",
+                "default": True,
+            },
+            {
+                "id": "xlsx_translate_drawing_text",
+                "label": "翻译图形文本",
+                "default": True,
+            },
+            {
+                "id": "xlsx_translate_sheet_names",
+                "label": "翻译工作表名",
+                "default": False,
+            },
+            {
+                "id": "xlsx_translate_hidden_content",
+                "label": "翻译隐藏内容",
+                "default": True,
+            },
+            {
+                "id": "xlsx_translate_document_properties",
+                "label": "翻译文档属性",
+                "default": False,
+            },
+            {
+                "id": "xlsx_skip_fill_colors",
+                "kind": "color_palette",
+                "label": "跳过应用所选背景色的单元格",
+                "default": [],
+                "options": (
+                    {"label": "深红", "value": "C00000"},
+                    {"label": "红色", "value": "FF0000"},
+                    {"label": "橙色", "value": "FFC000"},
+                    {"label": "黄色", "value": "FFFF00"},
+                    {"label": "浅绿", "value": "92D050"},
+                    {"label": "绿色", "value": "00B050"},
+                    {"label": "浅蓝", "value": "00B0F0"},
+                    {"label": "蓝色", "value": "0070C0"},
+                    {"label": "深蓝", "value": "002060"},
+                    {"label": "紫色", "value": "7030A0"},
+                ),
+            },
+        ),
     },
     {
         "extensions": (".dat",),
@@ -495,6 +604,45 @@ def export_translated_task_file(
 
     if raw_bytes is None:
         return _export_translated_task_file_without_source(filename, segments)
+
+    extension = get_task_file_extension(filename)
+    if extension == ".pptx":
+        from app.services.adapters.pptx_exporter import PPTX_MEDIA_TYPE, PptxExporter
+
+        export_segments = build_export_segments_from_source(
+            raw_bytes,
+            filename,
+            segments,
+            document_parse_options=document_parse_options,
+        )
+        return ExportedTaskFile(
+            content=PptxExporter().export(
+                raw_bytes,
+                export_segments,
+                document_parse_options=document_parse_options,
+            ),
+            media_type=PPTX_MEDIA_TYPE,
+            filename=_build_translated_filename(filename),
+        )
+
+    if extension == ".xlsx":
+        from app.services.adapters.xlsx_exporter import XLSX_MEDIA_TYPE, XlsxExporter
+
+        export_segments = build_export_segments_from_source(
+            raw_bytes,
+            filename,
+            segments,
+            document_parse_options=document_parse_options,
+        )
+        return ExportedTaskFile(
+            content=XlsxExporter().export(
+                raw_bytes,
+                export_segments,
+                document_parse_options=document_parse_options,
+            ),
+            media_type=XLSX_MEDIA_TYPE,
+            filename=_build_translated_filename(filename),
+        )
 
     if not can_export_task_file(filename, has_source_file=True):
         raise ValueError(f"{get_task_file_extension(filename) or '该'} 文件暂不支持原格式导出。")

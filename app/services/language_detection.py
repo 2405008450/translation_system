@@ -34,7 +34,8 @@ SUPPORTED_TEXT_EXTENSIONS = {
     ".yml",
 }
 SUPPORTED_DOCUMENT_EXTENSIONS = {".docx"}
-SUPPORTED_EXTENSIONS = SUPPORTED_TEXT_EXTENSIONS | SUPPORTED_DOCUMENT_EXTENSIONS
+SUPPORTED_OFFICE_EXTENSIONS = {".pptx", ".xlsx"}
+SUPPORTED_EXTENSIONS = SUPPORTED_TEXT_EXTENSIONS | SUPPORTED_DOCUMENT_EXTENSIONS | SUPPORTED_OFFICE_EXTENSIONS
 
 UNSUPPORTED_MESSAGE = "当前文件类型暂不支持自动识别，请手动选择源语言。"
 NO_TEXT_MESSAGE = "未读取到足够文本，请手动选择源语言。"
@@ -126,6 +127,10 @@ def _empty_result(*, supported: bool, message: str) -> LanguageDetectionResult:
 def _extract_sample_text(extension: str, raw_bytes: bytes) -> str:
     if extension == ".docx":
         return _extract_docx_text(raw_bytes)
+    if extension == ".pptx":
+        return _extract_pptx_text(raw_bytes)
+    if extension == ".xlsx":
+        return _extract_xlsx_text(raw_bytes)
 
     text = _decode_text(raw_bytes[:MAX_TEXT_BYTES])
     if not text:
@@ -179,6 +184,52 @@ def _extract_docx_text(raw_bytes: bytes) -> str:
                 if _joined_length(parts) >= MAX_SAMPLE_CHARS:
                     return _normalize_sample(" ".join(parts))
 
+    return _normalize_sample(" ".join(parts))
+
+
+def _extract_pptx_text(raw_bytes: bytes) -> str:
+    try:
+        from pptx import Presentation
+
+        presentation = Presentation(BytesIO(raw_bytes))
+    except Exception:
+        return ""
+
+    parts: list[str] = []
+    for slide in presentation.slides:
+        for shape in slide.shapes:
+            if getattr(shape, "has_text_frame", False):
+                _append_text_part(parts, shape.text)
+            if getattr(shape, "has_table", False):
+                for row in shape.table.rows:
+                    for cell in row.cells:
+                        _append_text_part(parts, cell.text)
+            if _joined_length(parts) >= MAX_SAMPLE_CHARS:
+                return _normalize_sample(" ".join(parts))
+    return _normalize_sample(" ".join(parts))
+
+
+def _extract_xlsx_text(raw_bytes: bytes) -> str:
+    try:
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)
+    except Exception:
+        return ""
+
+    parts: list[str] = []
+    try:
+        for worksheet in workbook.worksheets:
+            if worksheet.sheet_state != "visible":
+                continue
+            for row in worksheet.iter_rows(values_only=True):
+                for value in row:
+                    if isinstance(value, str):
+                        _append_text_part(parts, value)
+                    if _joined_length(parts) >= MAX_SAMPLE_CHARS:
+                        return _normalize_sample(" ".join(parts))
+    finally:
+        workbook.close()
     return _normalize_sample(" ".join(parts))
 
 

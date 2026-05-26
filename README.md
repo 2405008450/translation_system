@@ -178,7 +178,7 @@ Copy-Item .env.example .env
 | `REDIS_URL`                                   | 可选；不配置时使用内存缓存                                                                               |
 | `TM_VECTOR_*`                                 | pgvector 语义检索开关、维度、候选数和权重                                                                   |
 | `DEEPSEEK_*` / `OPENROUTER_*`                 | LLM Provider 配置，AI 修正至少需要一个 API Key                                                         |
-| `LLM_TIMEOUT_SECONDS` / `LLM_MAX_CONCURRENCY` | LLM 超时与并发控制                                                                                 |
+| `LLM_TIMEOUT_SECONDS` / `LLM_STALL_TIMEOUT_SECONDS` / `LLM_MAX_CONCURRENCY` | LLM 单次请求超时、无进展中止阈值与并发控制                                                                 |
 
 
 `.env` 已在 `.gitignore` 中，密钥不要提交到仓库。
