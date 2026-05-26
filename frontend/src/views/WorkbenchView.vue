@@ -120,7 +120,7 @@ const virtualListRef = ref<{
   scrollToIndex: (index: number, align?: ScrollLogicalPosition) => Promise<boolean>
   focusIndex: (index: number, selector?: string, align?: ScrollLogicalPosition) => Promise<boolean>
 } | null>(null)
-const segmentEditorRowRefs = ref<Record<string, SegmentEditorRowPublic>>({})
+const segmentEditorRowRefs = new Map<string, SegmentEditorRowPublic>()
 
 const sidecarRef = ref<HTMLElement | null>(null)
 const sidecarWidth = ref<number | null>(null)
@@ -198,7 +198,7 @@ const termsMessage = ref(t('workbench.terms.defaultMessage'))
 let searchLoadRequestId = 0
 let suppressSegmentFilterWatch = false
 
-const segmentPageSizes = [100, 200, 500, 1000]
+const segmentPageSizes = [100, 200, 500]
 
 function getCommentWindowQuery(): CommentWindowQuery | null {
   if (!segmentStore.segments.length) {
@@ -1225,18 +1225,16 @@ function showRibbonPlaceholder(name: string) {
 }
 
 function setSegmentEditorRowRef(sentenceId: string, instance: Element | ComponentPublicInstance | null) {
-  const nextRefs = { ...segmentEditorRowRefs.value }
   if (instance) {
-    nextRefs[sentenceId] = instance as SegmentEditorRowPublic
+    segmentEditorRowRefs.set(sentenceId, instance as SegmentEditorRowPublic)
   } else {
-    delete nextRefs[sentenceId]
+    segmentEditorRowRefs.delete(sentenceId)
   }
-  segmentEditorRowRefs.value = nextRefs
 }
 
 function getActiveSegmentEditorRow() {
   const sentenceId = segmentStore.activeSentenceId
-  return sentenceId ? segmentEditorRowRefs.value[sentenceId] || null : null
+  return sentenceId ? segmentEditorRowRefs.get(sentenceId) || null : null
 }
 
 function undoActiveSegmentEdit() {
@@ -1457,6 +1455,35 @@ function handleApplyTMTarget(sentenceId: string, targetText: string) {
   updateSegmentTarget(sentenceId, targetText)
 }
 
+function getRouteQueryString(value: unknown) {
+  if (Array.isArray(value)) {
+    return value[0] == null ? undefined : String(value[0])
+  }
+  return value == null ? undefined : String(value)
+}
+
+async function replaceSegmentPageQueryIfNeeded() {
+  const currentPageQuery = getRouteQueryString(route.query.page)
+  const currentPageSizeQuery = getRouteQueryString(route.query.pageSize)
+  if (currentPageQuery === undefined && currentPageSizeQuery === undefined) {
+    return
+  }
+
+  const nextPage = String(segmentStore.currentPage)
+  const nextPageSize = String(segmentStore.pageSize)
+  if (currentPageQuery === nextPage && currentPageSizeQuery === nextPageSize) {
+    return
+  }
+
+  await router.replace({
+    query: {
+      ...route.query,
+      page: nextPage,
+      pageSize: nextPageSize,
+    },
+  })
+}
+
 async function loadTask() {
   pageError.value = ''
   activeTool.value = null
@@ -1472,12 +1499,13 @@ async function loadTask() {
   try {
     await segmentStore.loadTask(props.id, {
       page: Number(route.query.page || 1),
-      pageSize: Number(route.query.pageSize || segmentStore.pageSize || 200),
+      pageSize: Number(route.query.pageSize || segmentStore.pageSize || 100),
       scope: segmentDisplayScope.value,
       sourceQuery: sourceSearchQuery.value,
       targetQuery: targetSearchQuery.value,
       searchFuzzy: searchFuzzyEnabled.value,
     })
+    await replaceSegmentPageQueryIfNeeded()
     if (segmentStore.fileRecord?.is_edit_locked) {
       const message = segmentStore.fileRecord.active_operation_message || t('workbench.errors.editLocked')
       pageError.value = message

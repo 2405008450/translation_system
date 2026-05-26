@@ -592,49 +592,9 @@ function handleInput() {
   if (!editorRef.value) return
   if (isApplyingHistory.value) return
   if (isComposing.value) return
-  
-  // 获取纯文本内容
-  const caretPos = saveSerializableCaretPosition(editorRef.value)
+
   const text = serializeEditorContent(editorRef.value)
   emit('update', props.segment.sentence_id, text)
-  nextTick(() => {
-    if (editorRef.value && isFocused.value) {
-      editorRef.value.innerHTML = editorHtmlContent.value
-      restoreSerializableCaretPosition(editorRef.value, caretPos)
-    }
-  })
-  return
-  
-  // 保存光标位置
-  if (props.pendingRevision) {
-    nextTick(() => {
-      if (editorRef.value && isFocused.value) {
-        editorRef.value.innerHTML = editorHtmlContent.value
-        restoreSerializableCaretPosition(editorRef.value, caretPos)
-      }
-    })
-    return
-  }
-  
-  // 更新高亮 HTML
-  nextTick(() => {
-    if (editorRef.value && isFocused.value) {
-      const segments = highlightText(text, props.matchedTerms || [], 'target_text')
-      if (segments) {
-        editorRef.value.innerHTML = segments
-          .map((seg) =>
-            seg.highlight
-              ? `<mark class="segment-row__term-highlight">${escapeHtml(seg.text)}</mark>`
-              : escapeHtml(seg.text)
-          )
-          .join('')
-      } else {
-        editorRef.value.innerHTML = escapeHtml(text)
-      }
-      // 恢复光标位置
-      restoreCaretPosition(editorRef.value, caretPos)
-    }
-  })
 }
 
 // 监听外部数据变化，更新编辑器内容
@@ -697,8 +657,7 @@ watch(
       clearEditorHistory()
     }
     if (!isFocused.value && editorRef.value) {
-      // 非聚焦状态，更新带高亮的 HTML
-      editorRef.value.innerHTML = editorHtmlContent.value
+      syncEditorHtmlFromState(false)
     }
   }
 )

@@ -23,8 +23,8 @@ import type {
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 import { consumeLLMStream } from '../utils/llmStream'
 
-const DEFAULT_SEGMENT_PAGE_SIZE = 200
-const MAX_SEGMENT_PAGE_SIZE = 1000
+const DEFAULT_SEGMENT_PAGE_SIZE = 100
+const MAX_SEGMENT_PAGE_SIZE = 500
 const AUTO_SYNC_DELAY_MS = 1500
 
 function createEmptySegmentStatusStats(): SegmentStatusStats {

@@ -2574,7 +2574,7 @@ def get_file_records(
     ]
 
 
-SEGMENT_PAGE_MAX_LIMIT = 1000
+SEGMENT_PAGE_MAX_LIMIT = 500
 
 
 def _normalize_segment_page_limit(limit: int) -> int:
@@ -2758,7 +2758,7 @@ def _get_segment_page_sentence_ids(
 def get_file_record(
     file_record_id: UUID,
     skip: int = 0,
-    limit: int = 200,
+    limit: int = 100,
     db: Session = Depends(get_db),
 ):
     """获取文档详情及片段，支持分页"""
@@ -2902,7 +2902,7 @@ def release_file_record_operation_lock(
 def get_file_record_segments(
     file_record_id: UUID,
     skip: int = 0,
-    limit: int = 200,
+    limit: int = 100,
     scope: str = "all",
     source_query: str | None = None,
     target_query: str | None = None,
@@ -2988,7 +2988,7 @@ def duplicate_file_record_task(
 def get_file_record_preview(
     file_record_id: UUID,
     skip: int = 0,
-    limit: int = 200,
+    limit: int = 100,
     mode: Literal["source", "target"] = "source",
     db: Session = Depends(get_db),
 ):

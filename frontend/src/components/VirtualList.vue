@@ -29,8 +29,13 @@ const containerRef = ref<HTMLElement | null>(null)
 const scrollTop = ref(0)
 const viewportHeight = ref(0)
 const heightCache = reactive<Record<number, number>>({})
+const rowElements = new Map<number, HTMLElement>()
 const rowObservers = new Map<number, ResizeObserver>()
+const pendingMeasuredHeights = new Map<number, number>()
 let containerResizeObserver: ResizeObserver | null = null
+let measureFrame: number | null = null
+let scrollFrame: number | null = null
+let pendingScrollTop = 0
 
 function resolveItemKey(item: any, index: number): VirtualItemKey {
   if (typeof props.itemKey === 'function') {
@@ -50,6 +55,12 @@ const itemKeySignature = computed(() => (
 ))
 
 function resetMeasuredHeights() {
+  pendingMeasuredHeights.clear()
+  rowElements.clear()
+  if (measureFrame !== null) {
+    window.cancelAnimationFrame(measureFrame)
+    measureFrame = null
+  }
   Object.keys(heightCache).forEach((key) => {
     delete heightCache[Number(key)]
   })
@@ -129,14 +140,62 @@ function updateViewportHeight() {
   viewportHeight.value = containerRef.value?.clientHeight ?? 0
 }
 
-function onScroll(event: Event) {
-  scrollTop.value = (event.target as HTMLElement).scrollTop
+function flushScrollTop() {
+  scrollFrame = null
+  scrollTop.value = pendingScrollTop
   emitReachEndIfNeeded()
+}
+
+function scheduleScrollTop(nextScrollTop: number) {
+  pendingScrollTop = nextScrollTop
+  if (scrollFrame !== null) {
+    return
+  }
+  scrollFrame = window.requestAnimationFrame(flushScrollTop)
+}
+
+function setScrollTopNow(nextScrollTop: number) {
+  pendingScrollTop = nextScrollTop
+  if (scrollFrame !== null) {
+    window.cancelAnimationFrame(scrollFrame)
+    scrollFrame = null
+  }
+  scrollTop.value = nextScrollTop
+  emitReachEndIfNeeded()
+}
+
+function onScroll(event: Event) {
+  scheduleScrollTop((event.target as HTMLElement).scrollTop)
 }
 
 function cleanupRowObserver(index: number) {
   rowObservers.get(index)?.disconnect()
   rowObservers.delete(index)
+  rowElements.delete(index)
+  pendingMeasuredHeights.delete(index)
+}
+
+function flushMeasuredHeights() {
+  measureFrame = null
+  let changed = false
+  pendingMeasuredHeights.forEach((height, index) => {
+    if (heightCache[index] !== height) {
+      heightCache[index] = height
+      changed = true
+    }
+  })
+  pendingMeasuredHeights.clear()
+  if (changed) {
+    emitReachEndIfNeeded()
+  }
+}
+
+function scheduleMeasuredHeight(index: number, height: number) {
+  pendingMeasuredHeights.set(index, height)
+  if (measureFrame !== null) {
+    return
+  }
+  measureFrame = window.requestAnimationFrame(flushMeasuredHeights)
 }
 
 function setRowElement(element: Element | { $el?: Element | null } | null, index: number) {
@@ -144,22 +203,27 @@ function setRowElement(element: Element | { $el?: Element | null } | null, index
     return
   }
 
-  cleanupRowObserver(index)
-
   const target = element instanceof HTMLElement
     ? element
     : element && '$el' in element
       ? element.$el
       : null
 
+  if (target && rowElements.get(index) === target && rowObservers.has(index)) {
+    return
+  }
+
+  cleanupRowObserver(index)
+
   if (!(target instanceof HTMLElement)) {
     return
   }
 
+  rowElements.set(index, target)
   const observer = new ResizeObserver((entries) => {
     const nextHeight = Math.ceil(entries[0]?.contentRect.height || 0)
     if (nextHeight > 0 && heightCache[index] !== nextHeight) {
-      heightCache[index] = nextHeight
+      scheduleMeasuredHeight(index, nextHeight)
     }
   })
 
@@ -197,7 +261,7 @@ async function scrollToIndex(index: number, align: ScrollLogicalPosition = 'cent
 
   const safeScrollTop = Math.min(maxScrollTop, Math.max(0, nextScrollTop))
   container.scrollTop = safeScrollTop
-  scrollTop.value = safeScrollTop
+  setScrollTopNow(safeScrollTop)
 
   await nextTick()
   await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()))
@@ -261,9 +325,17 @@ watch(endIndex, () => {
 })
 
 onBeforeUnmount(() => {
+  if (measureFrame !== null) {
+    window.cancelAnimationFrame(measureFrame)
+  }
+  if (scrollFrame !== null) {
+    window.cancelAnimationFrame(scrollFrame)
+  }
   containerResizeObserver?.disconnect()
   rowObservers.forEach((observer) => observer.disconnect())
   rowObservers.clear()
+  rowElements.clear()
+  pendingMeasuredHeights.clear()
 })
 </script>
 
@@ -273,7 +345,7 @@ onBeforeUnmount(() => {
     class="virtual-list"
     role="list"
     :aria-activedescendant="activeDescendant || undefined"
-    @scroll="onScroll"
+    @scroll.passive="onScroll"
   >
     <div :style="{ height: `${totalHeight}px` }" class="virtual-list-spacer">
       <div
