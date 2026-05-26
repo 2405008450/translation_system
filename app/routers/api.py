@@ -765,6 +765,7 @@ class FileOperationLockRequest(BaseModel):
 class LLMTranslateRequest(BaseModel):
     scope: Literal["fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"] = "all"
     provider: Literal["auto", "deepseek", "openrouter"] = "deepseek"
+    translation_unit: Literal["paragraph", "sentence"] = "paragraph"
     translation_guidelines: str = ""
     guideline_template_id: str | None = None
     temporary_prompt: str = ""
@@ -990,6 +991,7 @@ def _build_llm_translation_tasks(
     source_language: str | None = None,
     target_language: str | None = None,
     collection_id: UUID | None = None,
+    include_context: bool = False,
 ) -> list[LLMTranslationTask]:
     statuses_by_scope = {
         "fuzzy_only": {"fuzzy"},
@@ -1013,14 +1015,20 @@ def _build_llm_translation_tasks(
 
     tasks: list[LLMTranslationTask] = []
     for segment in segments:
+        should_translate = True
         if scope == "empty_target_only":
             if normalize_text(segment.target_text):
-                continue
+                should_translate = False
         elif target_statuses is None or segment.status not in target_statuses:
+            should_translate = False
+
+        if not should_translate and not include_context:
             continue
 
-        segment_tm_target_text = segment.target_text if segment.source == "tm" and normalize_text(segment.target_text) else ""
-        tm_target_text = segment_tm_target_text or tm_target_text_map.get(segment.matched_source_text or "", "")
+        segment_source = getattr(segment, "source", "none")
+        matched_source_text = getattr(segment, "matched_source_text", None)
+        segment_tm_target_text = segment.target_text if segment_source == "tm" and normalize_text(segment.target_text) else ""
+        tm_target_text = segment_tm_target_text or tm_target_text_map.get(matched_source_text or "", "")
 
         tasks.append(
             LLMTranslationTask(
@@ -1029,9 +1037,13 @@ def _build_llm_translation_tasks(
                 source_text=segment.source_text,
                 source_language=source_language,
                 target_language=target_language,
-                block_type=segment.block_type,
-                matched_source_text=segment.matched_source_text,
+                block_type=getattr(segment, "block_type", "paragraph") or "paragraph",
+                block_index=int(getattr(segment, "block_index", 0) or 0),
+                row_index=getattr(segment, "row_index", None),
+                cell_index=getattr(segment, "cell_index", None),
+                matched_source_text=matched_source_text,
                 tm_target_text=tm_target_text,
+                should_translate=should_translate,
             )
         )
 
@@ -3996,12 +4008,13 @@ async def llm_translate_file_record(
         source_language=source_language,
         target_language=target_language,
         collection_id=file_record.collection_id,
+        include_context=body.translation_unit == "paragraph",
     )
 
     async def event_stream():
         updated_count = 0
         error_count = 0
-        total_count = len(translation_tasks)
+        total_count = sum(1 for task in translation_tasks if task.should_translate)
 
         yield _sse_event(
             "start",
@@ -4009,6 +4022,7 @@ async def llm_translate_file_record(
                 "file_record_id": str(file_record_id),
                 "scope": body.scope,
                 "provider": body.provider,
+                "translation_unit": body.translation_unit,
                 "source_language": source_language,
                 "target_language": target_language,
                 "total": total_count,
@@ -4031,6 +4045,7 @@ async def llm_translate_file_record(
             translation_tasks,
             provider=body.provider,
             translation_guidelines=guidelines,
+            translation_unit=body.translation_unit,
         ):
             if await request.is_disconnected():
                 break
