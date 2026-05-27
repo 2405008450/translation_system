@@ -32,6 +32,7 @@ from app.models import (
     MemoryEntry,
     Project,
     Segment,
+    SegmentRevision,
     TMCollection,
     TermBase,
     TermEntry,
@@ -81,6 +82,7 @@ from app.services.file_record_service import (
     list_segments_for_file_record,
     load_file_record_source,
     resolve_file_record_status,
+    sync_file_record_status,
     update_segment_by_sentence_id,
     update_segment_source_text,
     update_segment_with_llm_result,
@@ -3869,6 +3871,17 @@ async def llm_translate_file_record(
             )
             return
 
+        # Pre-load all segments into memory to avoid per-item SELECT
+        all_segments = (
+            db.query(Segment)
+            .filter(Segment.file_record_id == file_record_id)
+            .all()
+        )
+        seg_map = {s.sentence_id: s for s in all_segments}
+
+        COMMIT_INTERVAL = 50
+        uncommitted_count = 0
+
         async for result in iter_batch_translate(
             translation_tasks,
             provider=body.provider,
@@ -3889,29 +3902,7 @@ async def llm_translate_file_record(
                 )
                 continue
 
-            try:
-                segment = update_segment_with_llm_result(
-                    db=db,
-                    file_record_id=file_record_id,
-                    sentence_id=result.sentence_id,
-                    target_text=result.translated_text,
-                    current_user=current_user,
-                    llm_provider=result.provider,
-                    llm_model=result.model,
-                )
-            except Exception as exc:  # noqa: BLE001
-                db.rollback()
-                error_count += 1
-                yield _sse_event(
-                    "error",
-                    {
-                        "sentence_id": result.sentence_id,
-                        "status": result.status,
-                        "message": f"数据库更新失败：{exc}",
-                    },
-                )
-                continue
-
+            segment = seg_map.get(result.sentence_id)
             if not segment:
                 error_count += 1
                 yield _sse_event(
@@ -3920,6 +3911,45 @@ async def llm_translate_file_record(
                         "sentence_id": result.sentence_id,
                         "status": result.status,
                         "message": "片段不存在，无法写回 LLM 译文。",
+                    },
+                )
+                continue
+
+            try:
+                before_text = segment.target_text
+                segment.target_text = result.translated_text
+                segment.source = "llm"
+                segment.llm_provider = result.provider
+                segment.llm_model = result.model
+
+                # Inline revision creation — skip pending query for LLM bulk writes
+                if (before_text or "") != (result.translated_text or ""):
+                    db.add(SegmentRevision(
+                        file_record_id=file_record_id,
+                        segment_id=segment.id,
+                        sentence_id=segment.sentence_id,
+                        before_text=before_text or "",
+                        after_text=result.translated_text or "",
+                        source="llm",
+                        status="pending",
+                        author_id=current_user.id if current_user else None,
+                    ))
+
+                uncommitted_count += 1
+                if uncommitted_count >= COMMIT_INTERVAL:
+                    db.commit()
+                    uncommitted_count = 0
+
+            except Exception as exc:  # noqa: BLE001
+                db.rollback()
+                uncommitted_count = 0
+                error_count += 1
+                yield _sse_event(
+                    "error",
+                    {
+                        "sentence_id": result.sentence_id,
+                        "status": result.status,
+                        "message": f"数据库更新失败：{exc}",
                     },
                 )
                 continue
@@ -3936,6 +3966,16 @@ async def llm_translate_file_record(
                     "model": result.model,
                 },
             )
+
+        # Final commit for remaining + sync status once
+        try:
+            if uncommitted_count > 0:
+                db.commit()
+            if updated_count > 0:
+                sync_file_record_status(db, file_record_id)
+                db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
 
         if not await request.is_disconnected():
             yield _sse_event(

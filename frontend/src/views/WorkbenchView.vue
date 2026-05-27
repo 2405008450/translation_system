@@ -199,6 +199,30 @@ const saveToTMNewCollectionName = ref('')
 const richTextEditor = useRichTextEditor()
 const showCaseMenu = ref(false)
 const showClearFormatMenu = ref(false)
+const showSpecialCharMenu = ref(false)
+const recentSpecialChars = ref<string[]>([])
+const RECENT_CHARS_STORAGE_KEY = 'workbench.recentSpecialChars'
+
+// 初始化最近使用的特殊字符
+function loadRecentSpecialChars() {
+  try {
+    const saved = window.localStorage.getItem(RECENT_CHARS_STORAGE_KEY)
+    if (saved) {
+      recentSpecialChars.value = JSON.parse(saved)
+    }
+  } catch {}
+}
+loadRecentSpecialChars()
+
+// 特殊字符列表（按行排列）
+const specialCharacters = [
+  ['&', '"', '@', '\\', '·', '^', '†', '‡', '°', '※'],
+  ['#', '№', '°', 'ª', '%', '‰', '‱', '+', '–', '×'],
+  ['÷', '=', '±', '≤', '≥', '≠', '~', '¶', '\'', '"'],
+  ['"', '§', '~', '_', '|', '¡', '©', '®', '℠', '™'],
+  ['™', '¤', '£', '$', '¥', '₩', '₫', 'ı', '€', '₭'],
+  ['₱', '₫', '₹', '₺', '≠', '♪', '₽', '₿', 'ß'],
+]
 
 // 创建一个响应式的格式状态副本，确保传递给子组件时保持响应性
 const pendingFormatsForEditor = computed(() => ({
@@ -1446,6 +1470,44 @@ function toggleVisibleCharacters() {
 function closeAllMenus() {
   showCaseMenu.value = false
   showClearFormatMenu.value = false
+  showSpecialCharMenu.value = false
+}
+
+/**
+ * 插入特殊字符到当前活动编辑器
+ */
+function insertSpecialChar(char: string) {
+  const editor = getActiveEditorElement()
+  if (!editor) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    showSpecialCharMenu.value = false
+    return
+  }
+
+  editor.focus()
+
+  // 确保光标在编辑器内
+  const selection = window.getSelection()
+  if (!selection || selection.rangeCount === 0 || !editor.contains(selection.anchorNode)) {
+    const range = document.createRange()
+    range.selectNodeContents(editor)
+    range.collapse(false)
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+  }
+
+  document.execCommand('insertText', false, char)
+  editor.dispatchEvent(new Event('input', { bubbles: true }))
+
+  // 记录到最近使用
+  const recent = recentSpecialChars.value.filter(c => c !== char)
+  recent.unshift(char)
+  recentSpecialChars.value = recent.slice(0, 10)
+  try {
+    window.localStorage.setItem(RECENT_CHARS_STORAGE_KEY, JSON.stringify(recentSpecialChars.value))
+  } catch {}
+
+  showSpecialCharMenu.value = false
 }
 
 // ========== 富文本格式化功能结束 ==========
@@ -2051,7 +2113,7 @@ function handleClickOutside(event: MouseEvent) {
     openConfirmMenu.value = false
   }
   // 关闭格式化相关的下拉菜单
-  if (!target.closest('.case-menu') && !target.closest('.clear-format-menu')) {
+  if (!target.closest('.case-menu') && !target.closest('.clear-format-menu') && !target.closest('.special-char-menu')) {
     closeAllMenus()
   }
 }
@@ -2667,14 +2729,45 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group">
           <span class="tool-col align-left">
-            <button class="tool-line tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.specialCharacters'))">
-              <span class="icon-text-area">
-                <span class="tool-item">
-                  <Sigma class="tool-label-icon" :size="16" />
-                  <span class="text">{{ t('workbench.ribbon.specialCharacters') }}</span>
+            <div class="special-char-menu">
+              <button class="tool-line tool-button" type="button" :disabled="!activeSegment" @mousedown.prevent @click.stop="showSpecialCharMenu = !showSpecialCharMenu">
+                <span class="icon-text-area">
+                  <span class="tool-item">
+                    <Sigma class="tool-label-icon" :size="16" />
+                    <span class="text">{{ t('workbench.ribbon.specialCharacters') }}</span>
+                  </span>
                 </span>
-              </span>
-            </button>
+              </button>
+              <div v-if="showSpecialCharMenu" class="special-char-menu__dropdown">
+                <div class="special-char-menu__title">{{ t('workbench.ribbon.specialCharacters') }}</div>
+                <div class="special-char-menu__grid">
+                  <template v-for="(row, rowIdx) in specialCharacters" :key="rowIdx">
+                    <button
+                      v-for="(char, colIdx) in row"
+                      :key="`${rowIdx}-${colIdx}`"
+                      type="button"
+                      class="special-char-menu__char"
+                      :title="char"
+                      @mousedown.prevent
+                      @click="insertSpecialChar(char)"
+                    >{{ char }}</button>
+                  </template>
+                </div>
+                <div v-if="recentSpecialChars.length" class="special-char-menu__recent">
+                  <div class="special-char-menu__recent-row">
+                    <button
+                      v-for="(char, idx) in recentSpecialChars"
+                      :key="idx"
+                      type="button"
+                      class="special-char-menu__char"
+                      :title="char"
+                      @mousedown.prevent
+                      @click="insertSpecialChar(char)"
+                    >{{ char }}</button>
+                  </div>
+                </div>
+              </div>
+            </div>
             <button class="tool-line tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.qaSettings'))">
               <span class="icon-text-area has_dropdown">
                 <span class="tool-item">
@@ -5403,6 +5496,77 @@ onBeforeRouteLeave(async () => {
 .tool-button.is-active {
   border-color: #b8cbd4;
   background: linear-gradient(180deg, #f8fbfc 0%, #edf5f7 100%);
+}
+
+/* 特殊字符下拉菜单 */
+.special-char-menu {
+  position: relative;
+  display: inline-flex;
+}
+
+.special-char-menu__dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 200;
+  padding: 12px;
+  border: 1px solid #d0d7dc;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
+  min-width: 320px;
+}
+
+.special-char-menu__title {
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #43545c;
+}
+
+.special-char-menu__grid {
+  display: grid;
+  grid-template-columns: repeat(10, 1fr);
+  gap: 2px;
+}
+
+.special-char-menu__char {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid #e8edf0;
+  border-radius: 4px;
+  background: #fff;
+  color: #2c3e50;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 0.12s ease, border-color 0.12s ease;
+}
+
+.special-char-menu__char:hover {
+  background: rgba(13, 122, 104, 0.08);
+  border-color: #0d7a68;
+  color: #0d7a68;
+}
+
+.special-char-menu__char:active {
+  background: rgba(13, 122, 104, 0.16);
+}
+
+.special-char-menu__recent {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #e8edf0;
+}
+
+.special-char-menu__recent-row {
+  display: flex;
+  gap: 2px;
+  flex-wrap: wrap;
 }
 </style>
 
