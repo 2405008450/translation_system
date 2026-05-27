@@ -353,6 +353,11 @@ CREATE TABLE IF NOT EXISTS file_records (
     status VARCHAR(20) NOT NULL DEFAULT 'draft',
     document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full',
     document_parse_options TEXT NOT NULL DEFAULT '{}',
+    document_statistics TEXT NOT NULL DEFAULT '{}',
+    active_operation VARCHAR(40),
+    active_operation_token VARCHAR(64),
+    active_operation_updated_at TIMESTAMP,
+    active_operation_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
     source_language VARCHAR(20),
     target_language VARCHAR(20),
     creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -370,6 +375,16 @@ ALTER TABLE IF EXISTS file_records
     ADD COLUMN IF NOT EXISTS document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full';
 ALTER TABLE IF EXISTS file_records
     ADD COLUMN IF NOT EXISTS document_parse_options TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE IF EXISTS file_records
+    ADD COLUMN IF NOT EXISTS document_statistics TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE IF EXISTS file_records
+    ADD COLUMN IF NOT EXISTS active_operation VARCHAR(40);
+ALTER TABLE IF EXISTS file_records
+    ADD COLUMN IF NOT EXISTS active_operation_token VARCHAR(64);
+ALTER TABLE IF EXISTS file_records
+    ADD COLUMN IF NOT EXISTS active_operation_updated_at TIMESTAMP;
+ALTER TABLE IF EXISTS file_records
+    ADD COLUMN IF NOT EXISTS active_operation_user_id UUID REFERENCES users(id) ON DELETE SET NULL;
 ALTER TABLE IF EXISTS file_records
     ADD COLUMN IF NOT EXISTS source_language VARCHAR(20);
 ALTER TABLE IF EXISTS file_records
@@ -393,6 +408,8 @@ CREATE INDEX IF NOT EXISTS ix_file_records_source_language
     ON file_records (source_language);
 CREATE INDEX IF NOT EXISTS ix_file_records_status
     ON file_records (status);
+CREATE INDEX IF NOT EXISTS ix_file_records_active_operation
+    ON file_records (active_operation);
 
 INSERT INTO projects (
     id,
