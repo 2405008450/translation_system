@@ -542,6 +542,8 @@ export default {
         loadFailedTitle: '资源加载失败',
         loadFailedMessage: '无法加载记忆库或术语库，请稍后重试。',
         fileFailedTitle: '文件处理失败：{name}',
+        releaseLockFailedTitle: '预翻译锁释放失败',
+        releaseLockFailedMessage: '翻译结果已写入，但文件仍可能暂时显示处理中。请刷新项目页，过期锁会自动清理。',
         stoppedTitle: '预翻译已停止',
         stoppedMessage: '当前任务已中止，未处理文件已跳过。',
         closeRunningTitle: '预翻译仍在继续',

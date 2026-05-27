@@ -52,6 +52,7 @@ const emit = defineEmits<{
 const FILE_OPERATION_TOKEN_HEADER = 'X-File-Operation-Token'
 const LOCK_HEARTBEAT_INTERVAL_MS = 30_000
 const LLM_STREAM_IDLE_TIMEOUT_MS = 150_000
+const RELEASE_LOCK_RETRY_DELAYS_MS = [600, 1_500, 3_000]
 
 const { t } = useI18n()
 
@@ -482,6 +483,31 @@ async function releasePreTranslateLock(fileId: string, operationToken: string) {
   })
 }
 
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, ms)
+  })
+}
+
+async function releasePreTranslateLockWithRetry(fileId: string, operationToken: string) {
+  let lastError: unknown = null
+  for (let attempt = 0; attempt <= RELEASE_LOCK_RETRY_DELAYS_MS.length; attempt += 1) {
+    try {
+      await releasePreTranslateLock(fileId, operationToken)
+      return true
+    } catch (error) {
+      lastError = error
+      const delay = RELEASE_LOCK_RETRY_DELAYS_MS[attempt]
+      if (typeof delay === 'number') {
+        await sleep(delay)
+      }
+    }
+  }
+
+  console.warn('Failed to release pre-translate lock:', lastError)
+  return false
+}
+
 function startLockHeartbeat(fileId: string, operationToken: string) {
   return window.setInterval(() => {
     void heartbeatPreTranslateLock(fileId, operationToken)
@@ -726,10 +752,14 @@ async function startPreTranslate() {
           window.clearInterval(heartbeatTimer)
         }
         if (operationToken) {
-          try {
-            await releasePreTranslateLock(file.id, operationToken)
-          } catch (error) {
-            console.warn('Failed to release pre-translate lock:', error)
+          const released = await releasePreTranslateLockWithRetry(file.id, operationToken)
+          if (!released) {
+            pushToast({
+              tone: 'warn',
+              title: t('projectDetail.preTranslate.toast.releaseLockFailedTitle'),
+              message: t('projectDetail.preTranslate.toast.releaseLockFailedMessage'),
+              duration: 7000,
+            })
           }
         }
       }
