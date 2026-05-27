@@ -737,8 +737,15 @@ export const useSegmentStore = defineStore('segment', () => {
       return
     }
     try {
+      const params = new URLSearchParams({ text: sourceText })
+      const boundTermBaseIds = fileRecord.value?.term_base_ids?.length
+        ? fileRecord.value.term_base_ids
+        : (fileRecord.value?.term_base_id ? [fileRecord.value.term_base_id] : [])
+      for (const termBaseId of boundTermBaseIds) {
+        params.append('collection_ids', termBaseId)
+      }
       const { data } = await http.get<{ matches: TermMatch[] }>('/termbase/match', {
-        params: { text: sourceText },
+        params,
       })
       termMatchesMap.value = {
         ...termMatchesMap.value,

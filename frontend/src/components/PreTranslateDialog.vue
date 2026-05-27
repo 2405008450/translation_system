@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { BookOpenCheck, Bot, Database, Loader2, Sparkles, Upload } from 'lucide-vue-next'
+import { BookOpenCheck, Bot, Check, Database, Loader2, Search, Sparkles, Upload, X } from 'lucide-vue-next'
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import { http } from '../api/http'
+import { canonicalizeLanguagePair, formatLanguagePair } from '../constants/languages'
 import { pushToast } from '../composables/useToast'
 import type { GuidelineTemplateSummary, LLMProvider, LLMTranslateScope, TermBase, TMCollection } from '../types/api'
 import { consumeLLMStream } from '../utils/llmStream'
@@ -48,7 +49,6 @@ const emit = defineEmits<{
   progress: [payload: PreTranslateProgressPayload]
 }>()
 
-const NO_TM_COLLECTION_ID = '__NO_TM_COLLECTION__'
 const FILE_OPERATION_TOKEN_HEADER = 'X-File-Operation-Token'
 const LOCK_HEARTBEAT_INTERVAL_MS = 30_000
 const LLM_STREAM_IDLE_TIMEOUT_MS = 150_000
@@ -65,7 +65,8 @@ const termBases = ref<TermBase[]>([])
 const guidelineTemplates = ref<GuidelineTemplateSummary[]>([])
 
 const useTm = ref(true)
-const tmCollectionIds = ref<string[]>([NO_TM_COLLECTION_ID])
+const tmCollectionIds = ref<string[]>([])
+const tmSearchQuery = ref('')
 const tmThreshold = ref(0.75)
 const tmSkipConfirmed = ref(true)
 const tmOverwriteFuzzy = ref(true)
@@ -80,7 +81,8 @@ const importingGuidelineTemplate = ref(false)
 const guidelineTemplateInputRef = ref<HTMLInputElement | null>(null)
 
 const useTermBase = ref(false)
-const termBaseId = ref('')
+const termBaseIds = ref<string[]>([])
+const termBaseSearchQuery = ref('')
 
 const errorMessage = ref('')
 const finishedCount = ref(0)
@@ -104,55 +106,103 @@ const llmScopeOptions = computed<Array<{ value: LLMTranslateScope, label: string
 ])
 
 const selectedFileLanguagePairs = computed(() => {
-  const pairSet = new Set<string>()
+  const pairMap = new Map<string, { source: string, target: string }>()
   for (const file of props.files) {
-    const source = file.source_language || props.sourceLanguage
-    const target = file.target_language || props.targetLanguage
-    if (!source || !target) {
+    const pair = canonicalizeLanguagePair(
+      file.source_language || props.sourceLanguage,
+      file.target_language || props.targetLanguage,
+    )
+    if (!pair) {
       continue
     }
-    pairSet.add(`${source}__${target}`)
+    pairMap.set(`${pair.source}__${pair.target}`, pair)
   }
-  return Array.from(pairSet)
+  return Array.from(pairMap.values())
 })
 
-function collectionMatchesSelectedFiles(collection: TMCollection) {
-  if (selectedFileLanguagePairs.value.length === 0) {
-    return true
+const filesWithInvalidLanguagePair = computed(() => (
+  props.files.filter((file) => !canonicalizeLanguagePair(
+    file.source_language || props.sourceLanguage,
+    file.target_language || props.targetLanguage,
+  ))
+))
+
+const selectedFileLanguagePair = computed(() => (
+  selectedFileLanguagePairs.value.length === 1 ? selectedFileLanguagePairs.value[0] : null
+))
+
+const selectedLanguagePairLabel = computed(() => (
+  selectedFileLanguagePair.value
+    ? formatLanguagePair(selectedFileLanguagePair.value.source, selectedFileLanguagePair.value.target)
+    : t('common.notSet')
+))
+
+const languagePairIssue = computed(() => {
+  if (props.files.length === 0) {
+    return ''
   }
-  if (!collection.source_language || !collection.target_language) {
+  if (filesWithInvalidLanguagePair.value.length > 0) {
+    return t('projectDetail.preTranslate.errors.fileLanguagePairRequired')
+  }
+  if (selectedFileLanguagePairs.value.length > 1) {
+    return t('projectDetail.preTranslate.errors.fileLanguagePairMixed', {
+      count: selectedFileLanguagePairs.value.length,
+    })
+  }
+  return ''
+})
+
+function resourceMatchesSelectedLanguagePair(resource: TMCollection | TermBase) {
+  const selectedPair = selectedFileLanguagePair.value
+  const resourcePair = canonicalizeLanguagePair(resource.source_language, resource.target_language)
+  if (!selectedPair || !resourcePair) {
     return false
   }
-  return selectedFileLanguagePairs.value.every((pairKey) => (
-    pairKey === `${collection.source_language}__${collection.target_language}`
-  ))
+  return resourcePair.source === selectedPair.source && resourcePair.target === selectedPair.target
 }
 
 const availableTMCollections = computed(() => {
-  return tmCollections.value.filter((collection) => collectionMatchesSelectedFiles(collection))
+  return tmCollections.value.filter((collection) => resourceMatchesSelectedLanguagePair(collection))
 })
 
 const selectedTmCollectionIds = computed(() => (
-  tmCollectionIds.value.filter((collectionId) => collectionId !== NO_TM_COLLECTION_ID)
+  normalizeResourceIds(tmCollectionIds.value, availableTMCollections.value)
 ))
 
 const shouldRunTm = computed(() => useTm.value && selectedTmCollectionIds.value.length > 0)
 
-const tmCollectionIdsModel = computed<string[]>({
-  get: () => tmCollectionIds.value,
-  set: (collectionIds) => {
-    tmCollectionIds.value = normalizeTmCollectionIds(collectionIds)
-  },
+const availableTermBases = computed(() => {
+  return termBases.value.filter((termBase) => resourceMatchesSelectedLanguagePair(termBase))
 })
 
-const availableTermBases = computed(() => {
-  if (!props.sourceLanguage || !props.targetLanguage) {
-    return termBases.value
-  }
-  return termBases.value.filter((termBase) => (
-    termBase.source_language === props.sourceLanguage
-    && termBase.target_language === props.targetLanguage
-  ))
+const selectedTermBaseIds = computed(() => (
+  normalizeResourceIds(termBaseIds.value, availableTermBases.value)
+))
+
+const filteredTMCollections = computed(() => (
+  filterResources(availableTMCollections.value, tmSearchQuery.value)
+))
+
+const filteredTermBases = computed(() => (
+  filterResources(availableTermBases.value, termBaseSearchQuery.value)
+))
+
+const hiddenTMCollectionCount = computed(() => (
+  Math.max(0, tmCollections.value.length - availableTMCollections.value.length)
+))
+
+const hiddenTermBaseCount = computed(() => (
+  Math.max(0, termBases.value.length - availableTermBases.value.length)
+))
+
+const selectedTMCollections = computed(() => {
+  const selectedIds = new Set(selectedTmCollectionIds.value)
+  return availableTMCollections.value.filter((collection) => selectedIds.has(collection.id))
+})
+
+const selectedTermBases = computed(() => {
+  const selectedIds = new Set(selectedTermBaseIds.value)
+  return availableTermBases.value.filter((termBase) => selectedIds.has(termBase.id))
 })
 
 const selectedDisplayFiles = computed(() => (
@@ -187,13 +237,11 @@ watch(() => props.open, (open) => {
 })
 
 watch(availableTMCollections, () => {
-  tmCollectionIds.value = normalizeTmCollectionIds(tmCollectionIds.value)
+  tmCollectionIds.value = normalizeResourceIds(tmCollectionIds.value, availableTMCollections.value)
 })
 
 watch(availableTermBases, () => {
-  if (termBaseId.value && !availableTermBases.value.some((termBase) => termBase.id === termBaseId.value)) {
-    termBaseId.value = ''
-  }
+  termBaseIds.value = normalizeResourceIds(termBaseIds.value, availableTermBases.value)
 })
 
 function resetProgress() {
@@ -265,19 +313,63 @@ function requestClose() {
   emit('close')
 }
 
-function normalizeTmCollectionIds(collectionIds: string[]) {
-  const availableIds = new Set(availableTMCollections.value.map((collection) => collection.id))
-  const wantsNoCollection = collectionIds.includes(NO_TM_COLLECTION_ID)
-  const hadNoCollection = tmCollectionIds.value.includes(NO_TM_COLLECTION_ID)
+function normalizeResourceIds<T extends { id: string }>(resourceIds: string[], resources: T[]) {
+  const availableIds = new Set(resources.map((resource) => resource.id))
+  return Array.from(new Set(resourceIds.filter((resourceId) => availableIds.has(resourceId))))
+}
 
-  if (wantsNoCollection && (!hadNoCollection || collectionIds.length === 1)) {
-    return [NO_TM_COLLECTION_ID]
+function filterResources<T extends { name: string, description: string | null }>(resources: T[], query: string) {
+  const normalizedQuery = query.trim().toLowerCase()
+  if (!normalizedQuery) {
+    return resources
   }
-
-  const normalizedIds = collectionIds.filter((collectionId) => (
-    collectionId !== NO_TM_COLLECTION_ID && availableIds.has(collectionId)
+  return resources.filter((resource) => (
+    resource.name.toLowerCase().includes(normalizedQuery)
+    || (resource.description || '').toLowerCase().includes(normalizedQuery)
   ))
-  return normalizedIds.length > 0 ? normalizedIds : [NO_TM_COLLECTION_ID]
+}
+
+function setSelectedResourceId(resourceIds: string[], resourceId: string, checked: boolean) {
+  if (checked) {
+    return Array.from(new Set([...resourceIds, resourceId]))
+  }
+  return resourceIds.filter((candidateId) => candidateId !== resourceId)
+}
+
+function toggleTmCollection(collectionId: string, event: Event) {
+  const checked = (event.target as HTMLInputElement).checked
+  tmCollectionIds.value = normalizeResourceIds(
+    setSelectedResourceId(tmCollectionIds.value, collectionId, checked),
+    availableTMCollections.value,
+  )
+}
+
+function toggleTermBase(termBaseId: string, event: Event) {
+  const checked = (event.target as HTMLInputElement).checked
+  termBaseIds.value = normalizeResourceIds(
+    setSelectedResourceId(termBaseIds.value, termBaseId, checked),
+    availableTermBases.value,
+  )
+}
+
+function selectAllTmCollections() {
+  tmCollectionIds.value = availableTMCollections.value.map((collection) => collection.id)
+}
+
+function selectAllTermBases() {
+  termBaseIds.value = availableTermBases.value.map((termBase) => termBase.id)
+}
+
+function clearTmCollections() {
+  tmCollectionIds.value = []
+}
+
+function clearTermBases() {
+  termBaseIds.value = []
+}
+
+function resourceEntryCountLabel(count: number) {
+  return t('projectDetail.preTranslate.resources.entryCount', { count })
 }
 
 async function loadResources() {
@@ -347,11 +439,15 @@ function validateBeforeStart() {
     errorMessage.value = t('projectDetail.preTranslate.errors.selectOneOption')
     return false
   }
+  if ((useTm.value || useTermBase.value) && languagePairIssue.value) {
+    errorMessage.value = languagePairIssue.value
+    return false
+  }
   if (useTm.value && selectedTmCollectionIds.value.length === 0) {
     errorMessage.value = t('projectDetail.preTranslate.errors.tmCollectionRequired')
     return false
   }
-  if (useTermBase.value && !termBaseId.value) {
+  if (useTermBase.value && selectedTermBaseIds.value.length === 0) {
     errorMessage.value = t('projectDetail.preTranslate.errors.termBaseRequired')
     return false
   }
@@ -581,8 +677,9 @@ async function startPreTranslate() {
             getActionProgress(completedActions, 0, actionCount),
             t('projectDetail.preTranslate.progress.termBaseRunning'),
           )
-          const bindingsPayload: Record<string, string | null> = {
-            term_base_id: termBaseId.value || null,
+          const bindingsPayload: Record<string, string | string[] | null> = {
+            term_base_id: selectedTermBaseIds.value[0] || null,
+            term_base_ids: selectedTermBaseIds.value,
           }
           if (shouldRunTm.value) {
             bindingsPayload.collection_id = selectedTmCollectionIds.value[0] || null
@@ -679,7 +776,7 @@ function stopPreTranslate() {
     :open="open"
     :title="t('projectDetail.preTranslate.dialogTitle')"
     :description="t('projectDetail.preTranslate.dialogDescription')"
-    width="min(940px, calc(100vw - 32px))"
+    width="min(1340px, calc(100vw - 32px))"
     @close="requestClose"
   >
     <div class="ptd-layout">
@@ -697,6 +794,7 @@ function stopPreTranslate() {
             v-for="file in selectedFilePreview"
             :key="file.id"
             class="ptd-summary__file"
+            :title="file.filename"
           >
             {{ file.filename }}
           </span>
@@ -707,57 +805,228 @@ function stopPreTranslate() {
       </aside>
 
       <div class="ptd-flow">
-      <div class="ptd-section" :class="{ 'is-disabled': !useTm }">
+        <div class="ptd-section ptd-section--tm" :class="{ 'is-disabled': !useTm }">
+          <div class="ptd-section__head">
+            <label class="ptd-switch">
+              <input v-model="useTm" type="checkbox" :disabled="running" />
+              <span class="ptd-switch__control" aria-hidden="true" />
+              <span class="ptd-section__icon"><Database :size="17" /></span>
+              <span>{{ t('projectDetail.preTranslate.sections.tm') }}</span>
+            </label>
+            <span class="ptd-section__meta">{{ Math.round(tmThreshold * 100) }}%</span>
+          </div>
+
+          <div class="ptd-resource">
+            <div class="ptd-resource__topline">
+              <span class="tag">{{ selectedLanguagePairLabel }}</span>
+              <span>
+                {{ t('projectDetail.preTranslate.resources.selectedCount', {
+                  selected: selectedTmCollectionIds.length,
+                  total: availableTMCollections.length,
+                }) }}
+              </span>
+            </div>
+            <div class="ptd-resource__toolbar">
+              <label class="ptd-resource-search">
+                <Search :size="15" />
+                <input
+                  v-model="tmSearchQuery"
+                  type="search"
+                  :placeholder="t('projectDetail.preTranslate.tm.searchPlaceholder')"
+                  :disabled="running || loadingResources || !useTm"
+                />
+              </label>
+              <div class="ptd-resource__buttons">
+                <button
+                  class="button button--ghost ptd-resource__button ptd-resource__button--select"
+                  type="button"
+                  :disabled="running || loadingResources || !useTm || availableTMCollections.length === 0"
+                  @click="selectAllTmCollections"
+                >
+                  {{ t('projectDetail.preTranslate.resources.selectAll') }}
+                </button>
+                <button
+                  class="button button--ghost ptd-resource__button ptd-resource__button--clear"
+                  type="button"
+                  :disabled="running || !useTm || selectedTmCollectionIds.length === 0"
+                  @click="clearTmCollections"
+                >
+                  <X :size="14" />
+                  {{ t('projectDetail.preTranslate.resources.clear') }}
+                </button>
+              </div>
+            </div>
+
+            <p v-if="hiddenTMCollectionCount > 0 && !languagePairIssue" class="ptd-resource__note">
+              {{ t('projectDetail.preTranslate.tm.hiddenByLanguagePair', { count: hiddenTMCollectionCount }) }}
+            </p>
+
+            <div v-if="languagePairIssue" class="ptd-resource-empty is-warning">
+              {{ languagePairIssue }}
+            </div>
+            <div v-else-if="loadingResources" class="ptd-resource-empty">
+              {{ t('projectDetail.preTranslate.resources.loading') }}
+            </div>
+            <div v-else-if="availableTMCollections.length === 0" class="ptd-resource-empty">
+              {{ t('projectDetail.preTranslate.tm.emptyForLanguagePair') }}
+            </div>
+            <div v-else class="ptd-resource-list">
+              <label
+                v-for="collection in filteredTMCollections"
+                :key="collection.id"
+                class="ptd-resource-item"
+                :class="{ 'is-selected': selectedTmCollectionIds.includes(collection.id), 'is-disabled': running || !useTm }"
+              >
+                <input
+                  type="checkbox"
+                  :checked="selectedTmCollectionIds.includes(collection.id)"
+                  :disabled="running || !useTm"
+                  @change="toggleTmCollection(collection.id, $event)"
+                />
+                <span class="ptd-resource-item__check" aria-hidden="true">
+                  <Check :size="14" />
+                </span>
+                <span class="ptd-resource-item__body">
+                  <strong>{{ collection.name }}</strong>
+                  <span>{{ formatLanguagePair(collection.source_language, collection.target_language) }}</span>
+                </span>
+                <span class="ptd-resource-item__count">{{ resourceEntryCountLabel(collection.entry_count) }}</span>
+              </label>
+              <div v-if="filteredTMCollections.length === 0" class="ptd-resource-empty">
+                {{ t('projectDetail.preTranslate.resources.noSearchResult') }}
+              </div>
+            </div>
+
+            <div v-if="selectedTMCollections.length > 0" class="ptd-selected-resources">
+              <span v-for="collection in selectedTMCollections" :key="collection.id" class="ptd-selected-resource">
+                {{ collection.name }}
+              </span>
+            </div>
+          </div>
+
+          <div class="ptd-grid ptd-grid--threshold">
+            <label class="field">
+              <span class="field__label">{{ t('projectDetail.preTranslate.tm.threshold') }}</span>
+              <input
+                v-model.number="tmThreshold"
+                class="field__control"
+                type="number"
+                min="0.5"
+                max="1"
+                step="0.01"
+                :disabled="running || !useTm"
+              />
+            </label>
+          </div>
+
+          <div class="ptd-checks">
+            <label><input v-model="tmSkipConfirmed" type="checkbox" :disabled="running || !useTm" />{{ t('projectDetail.preTranslate.tm.skipConfirmed') }}</label>
+            <label><input v-model="tmOverwriteFuzzy" type="checkbox" :disabled="running || !useTm" />{{ t('projectDetail.preTranslate.tm.overwriteFuzzy') }}</label>
+            <label><input v-model="tmAutoConfirmExact" type="checkbox" :disabled="running || !useTm" />{{ t('projectDetail.preTranslate.tm.autoConfirmExact') }}</label>
+          </div>
+        </div>
+
+      <div class="ptd-section ptd-section--term" :class="{ 'is-disabled': !useTermBase }">
         <div class="ptd-section__head">
           <label class="ptd-switch">
-            <input v-model="useTm" type="checkbox" :disabled="running" />
+            <input v-model="useTermBase" type="checkbox" :disabled="running" />
             <span class="ptd-switch__control" aria-hidden="true" />
-            <span class="ptd-section__icon"><Database :size="17" /></span>
-            <span>{{ t('projectDetail.preTranslate.sections.tm') }}</span>
+            <span class="ptd-section__icon"><BookOpenCheck :size="17" /></span>
+            <span>{{ t('projectDetail.preTranslate.sections.termBase') }}</span>
           </label>
-          <span class="ptd-section__meta">{{ Math.round(tmThreshold * 100) }}%</span>
         </div>
 
-        <div class="ptd-grid ptd-grid--tm">
-          <label class="field field--full">
-            <span class="field__label">{{ t('projectDetail.preTranslate.tm.collections') }}</span>
-            <select
-              v-model="tmCollectionIdsModel"
-              class="field__control field__control--multi"
-              multiple
-              :disabled="running || loadingResources || !useTm"
+        <div class="ptd-resource">
+          <div class="ptd-resource__topline">
+            <span class="tag">{{ selectedLanguagePairLabel }}</span>
+            <span>
+              {{ t('projectDetail.preTranslate.resources.selectedCount', {
+                selected: selectedTermBaseIds.length,
+                total: availableTermBases.length,
+              }) }}
+            </span>
+          </div>
+          <div class="ptd-resource__toolbar">
+            <label class="ptd-resource-search">
+              <Search :size="15" />
+              <input
+                v-model="termBaseSearchQuery"
+                type="search"
+                :placeholder="t('projectDetail.preTranslate.termBase.searchPlaceholder')"
+                :disabled="running || loadingResources || !useTermBase"
+              />
+            </label>
+            <div class="ptd-resource__buttons">
+              <button
+                class="button button--ghost ptd-resource__button ptd-resource__button--select"
+                type="button"
+                :disabled="running || loadingResources || !useTermBase || availableTermBases.length === 0"
+                @click="selectAllTermBases"
+              >
+                {{ t('projectDetail.preTranslate.resources.selectAll') }}
+              </button>
+              <button
+                class="button button--ghost ptd-resource__button ptd-resource__button--clear"
+                type="button"
+                :disabled="running || !useTermBase || selectedTermBaseIds.length === 0"
+                @click="clearTermBases"
+              >
+                <X :size="14" />
+                {{ t('projectDetail.preTranslate.resources.clear') }}
+              </button>
+            </div>
+          </div>
+
+          <p v-if="hiddenTermBaseCount > 0 && !languagePairIssue" class="ptd-resource__note">
+            {{ t('projectDetail.preTranslate.termBase.hiddenByLanguagePair', { count: hiddenTermBaseCount }) }}
+          </p>
+
+          <div v-if="languagePairIssue" class="ptd-resource-empty is-warning">
+            {{ languagePairIssue }}
+          </div>
+          <div v-else-if="loadingResources" class="ptd-resource-empty">
+            {{ t('projectDetail.preTranslate.resources.loading') }}
+          </div>
+          <div v-else-if="availableTermBases.length === 0" class="ptd-resource-empty">
+            {{ t('projectDetail.preTranslate.termBase.emptyForLanguagePair') }}
+          </div>
+          <div v-else class="ptd-resource-list">
+            <label
+              v-for="termBase in filteredTermBases"
+              :key="termBase.id"
+              class="ptd-resource-item"
+              :class="{ 'is-selected': selectedTermBaseIds.includes(termBase.id), 'is-disabled': running || !useTermBase }"
             >
-              <option :value="NO_TM_COLLECTION_ID">
-                {{ t('projectDetail.preTranslate.tm.noCollection') }}
-              </option>
-              <option v-for="collection in availableTMCollections" :key="collection.id" :value="collection.id">
-                {{ collection.name }}（{{ collection.entry_count }}）
-              </option>
-            </select>
-          </label>
+              <input
+                type="checkbox"
+                :checked="selectedTermBaseIds.includes(termBase.id)"
+                :disabled="running || !useTermBase"
+                @change="toggleTermBase(termBase.id, $event)"
+              />
+              <span class="ptd-resource-item__check" aria-hidden="true">
+                <Check :size="14" />
+              </span>
+              <span class="ptd-resource-item__body">
+                <strong>{{ termBase.name }}</strong>
+                <span>{{ formatLanguagePair(termBase.source_language, termBase.target_language) }}</span>
+              </span>
+              <span class="ptd-resource-item__count">{{ resourceEntryCountLabel(termBase.entry_count) }}</span>
+            </label>
+            <div v-if="filteredTermBases.length === 0" class="ptd-resource-empty">
+              {{ t('projectDetail.preTranslate.resources.noSearchResult') }}
+            </div>
+          </div>
 
-          <label class="field">
-            <span class="field__label">{{ t('projectDetail.preTranslate.tm.threshold') }}</span>
-            <input
-              v-model.number="tmThreshold"
-              class="field__control"
-              type="number"
-              min="0.5"
-              max="1"
-              step="0.01"
-              :disabled="running || !useTm"
-            />
-          </label>
+          <div v-if="selectedTermBases.length > 0" class="ptd-selected-resources">
+            <span v-for="termBase in selectedTermBases" :key="termBase.id" class="ptd-selected-resource">
+              {{ termBase.name }}
+            </span>
+          </div>
         </div>
-
-        <div class="ptd-checks">
-          <label><input v-model="tmSkipConfirmed" type="checkbox" :disabled="running || !useTm" />{{ t('projectDetail.preTranslate.tm.skipConfirmed') }}</label>
-          <label><input v-model="tmOverwriteFuzzy" type="checkbox" :disabled="running || !useTm" />{{ t('projectDetail.preTranslate.tm.overwriteFuzzy') }}</label>
-          <label><input v-model="tmAutoConfirmExact" type="checkbox" :disabled="running || !useTm" />{{ t('projectDetail.preTranslate.tm.autoConfirmExact') }}</label>
-        </div>
+        <p class="hint-text">{{ t('projectDetail.preTranslate.termBase.hint') }}</p>
       </div>
 
-      <div class="ptd-section" :class="{ 'is-disabled': !useLlm }">
+      <div class="ptd-section ptd-section--llm" :class="{ 'is-disabled': !useLlm }">
         <div class="ptd-section__head">
           <label class="ptd-switch">
             <input v-model="useLlm" type="checkbox" :disabled="running" />
@@ -826,27 +1095,6 @@ function stopPreTranslate() {
           />
         </label>
         <p class="hint-text">{{ t('projectDetail.preTranslate.llm.hint') }}</p>
-      </div>
-
-      <div class="ptd-section" :class="{ 'is-disabled': !useTermBase }">
-        <div class="ptd-section__head">
-          <label class="ptd-switch">
-            <input v-model="useTermBase" type="checkbox" :disabled="running" />
-            <span class="ptd-switch__control" aria-hidden="true" />
-            <span class="ptd-section__icon"><BookOpenCheck :size="17" /></span>
-            <span>{{ t('projectDetail.preTranslate.sections.termBase') }}</span>
-          </label>
-        </div>
-        <label class="field">
-          <span class="field__label">{{ t('projectDetail.preTranslate.termBase.select') }}</span>
-          <select v-model="termBaseId" class="field__control" :disabled="running || loadingResources || !useTermBase">
-            <option value="">{{ t('projectDetail.preTranslate.termBase.placeholder') }}</option>
-            <option v-for="termBase in availableTermBases" :key="termBase.id" :value="termBase.id">
-              {{ termBase.name }}（{{ termBase.entry_count }}）
-            </option>
-          </select>
-        </label>
-        <p class="hint-text">{{ t('projectDetail.preTranslate.termBase.hint') }}</p>
       </div>
       </div>
 
@@ -924,8 +1172,8 @@ function stopPreTranslate() {
 <style scoped>
 .ptd-layout {
   display: grid;
-  grid-template-columns: 190px minmax(0, 1fr);
-  gap: 16px;
+  grid-template-columns: 150px minmax(0, 1fr);
+  gap: 14px;
   align-items: start;
 }
 
@@ -933,15 +1181,15 @@ function stopPreTranslate() {
   position: sticky;
   top: 0;
   display: grid;
-  gap: 10px;
+  gap: 8px;
 }
 
 .ptd-summary__stat {
   display: grid;
   gap: 2px;
-  min-height: 70px;
+  min-height: 58px;
   align-content: center;
-  padding: 12px;
+  padding: 10px;
   border: 1px solid var(--line-soft);
   border-radius: 8px;
   background: var(--surface-1);
@@ -962,37 +1210,68 @@ function stopPreTranslate() {
 .ptd-summary__files {
   display: grid;
   gap: 6px;
-  padding: 10px;
+  max-height: 124px;
+  overflow: auto;
+  padding: 9px;
   border: 1px solid var(--line-soft);
   border-radius: 8px;
   background: var(--surface-1);
 }
 
 .ptd-summary__file {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
   color: var(--text-secondary);
   font-size: 12px;
+  line-height: 1.45;
 }
 
 .ptd-flow {
   display: grid;
+  grid-template-columns: minmax(340px, 1.08fr) minmax(340px, 1.08fr) minmax(320px, 0.84fr);
   gap: 12px;
+  align-items: start;
   min-width: 0;
 }
 
 .ptd-section {
+  --ptd-accent: var(--brand-700);
+  --ptd-accent-strong: var(--brand-700);
+
   display: grid;
   gap: 12px;
+  align-content: start;
+  min-width: 0;
   padding: 14px;
-  border: 1px solid var(--line-soft);
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 10%, var(--line-soft));
   border-radius: 8px;
-  background: var(--surface-panel);
+  background: color-mix(in srgb, var(--surface-panel) 96%, var(--ptd-accent) 4%);
+}
+
+.ptd-section--tm {
+  --ptd-accent: #0d7a68;
+  --ptd-accent-strong: var(--brand-700);
+
+  order: 1;
+}
+
+.ptd-section--term {
+  --ptd-accent: #2563eb;
+  --ptd-accent-strong: #1d4ed8;
+
+  order: 2;
+}
+
+.ptd-section--llm {
+  --ptd-accent: #b7791f;
+  --ptd-accent-strong: #a16207;
+
+  order: 3;
 }
 
 .ptd-section.is-disabled {
-  background: var(--surface-1);
+  background: color-mix(in srgb, var(--surface-1) 97%, var(--ptd-accent) 3%);
 }
 
 .ptd-section__head {
@@ -1000,6 +1279,11 @@ function stopPreTranslate() {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  margin: -4px -4px 0;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 10%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-panel) 94%, var(--ptd-accent) 6%);
 }
 
 .ptd-section__icon {
@@ -1007,10 +1291,10 @@ function stopPreTranslate() {
   place-items: center;
   width: 30px;
   height: 30px;
-  border: 1px solid var(--line-soft);
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 16%, var(--line-soft));
   border-radius: 6px;
-  background: var(--brand-050);
-  color: var(--brand-700);
+  background: color-mix(in srgb, var(--surface-panel) 88%, var(--ptd-accent) 12%);
+  color: var(--ptd-accent-strong);
 }
 
 .ptd-section__meta {
@@ -1056,12 +1340,12 @@ function stopPreTranslate() {
 }
 
 .ptd-switch input:checked + .ptd-switch__control {
-  border-color: var(--brand-700);
-  background: var(--brand-100);
+  border-color: var(--ptd-accent-strong);
+  background: color-mix(in srgb, var(--surface-panel) 76%, var(--ptd-accent) 24%);
 }
 
 .ptd-switch input:checked + .ptd-switch__control::after {
-  background: var(--brand-700);
+  background: var(--ptd-accent-strong);
   transform: translateX(14px);
 }
 
@@ -1076,17 +1360,275 @@ function stopPreTranslate() {
   align-items: end;
 }
 
-.ptd-grid--tm {
-  grid-template-columns: minmax(0, 1fr) 128px;
+.ptd-grid--threshold {
+  grid-template-columns: minmax(150px, 180px);
 }
 
 .ptd-grid--llm {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: 1fr;
+}
+
+.ptd-resource {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 8%, var(--line-soft));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-1) 96%, var(--ptd-accent) 4%);
+}
+
+.ptd-resource__topline,
+.ptd-resource__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ptd-resource__topline {
+  flex-wrap: wrap;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.ptd-resource__topline .tag {
+  border-color: color-mix(in srgb, var(--ptd-accent) 10%, var(--line-soft));
+  background: color-mix(in srgb, var(--surface-panel) 90%, var(--ptd-accent) 10%);
+  color: color-mix(in srgb, var(--ptd-accent-strong) 76%, var(--text-secondary));
+}
+
+.ptd-resource__toolbar {
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.ptd-resource-search {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 11px;
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 7%, var(--line-soft));
+  border-radius: 8px;
+  background: var(--surface-1);
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.ptd-resource-search:focus-within {
+  border-color: color-mix(in srgb, var(--ptd-accent) 52%, var(--line-strong));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ptd-accent) 10%, transparent);
+}
+
+.ptd-resource-search input {
+  min-width: 0;
+  width: 100%;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.ptd-resource__buttons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.ptd-resource__button {
+  min-width: 54px;
+  min-height: 32px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.2;
+  box-shadow: none;
+}
+
+.ptd-resource__button .lucide {
+  width: 13px;
+  height: 13px;
+}
+
+.ptd-resource__button--select {
+  border-color: color-mix(in srgb, var(--ptd-accent) 14%, var(--line-soft));
+  background: color-mix(in srgb, var(--surface-panel) 92%, var(--ptd-accent) 8%);
+  color: color-mix(in srgb, var(--ptd-accent-strong) 52%, var(--text-secondary));
+}
+
+.ptd-resource__button--select:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--ptd-accent) 28%, var(--line-strong));
+  background: color-mix(in srgb, var(--surface-panel) 86%, var(--ptd-accent) 14%);
+  color: color-mix(in srgb, var(--ptd-accent-strong) 72%, var(--text-primary));
+}
+
+.ptd-resource__button--clear {
+  border-color: color-mix(in srgb, var(--state-danger) 12%, var(--line-soft));
+  background: color-mix(in srgb, var(--surface-panel) 82%, var(--state-danger-bg) 18%);
+  color: color-mix(in srgb, var(--state-danger) 58%, var(--text-secondary));
+}
+
+.ptd-resource__button--clear:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--state-danger) 28%, var(--line-strong));
+  background: color-mix(in srgb, var(--surface-panel) 66%, var(--state-danger-bg) 34%);
+  color: var(--state-danger);
+}
+
+.ptd-resource__note {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.ptd-resource-list {
+  display: grid;
+  gap: 9px;
+  max-height: 246px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 7%, var(--line-soft));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-panel) 95%, var(--ptd-accent) 5%);
+}
+
+.ptd-resource-item {
+  position: relative;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) max-content;
+  gap: 11px;
+  align-items: center;
+  min-height: 62px;
+  padding: 11px 12px;
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 6%, var(--line-soft));
+  border-radius: 8px;
+  background: var(--surface-1);
+  cursor: pointer;
+  transition: border-color 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
+}
+
+.ptd-resource-item:hover {
+  border-color: color-mix(in srgb, var(--ptd-accent) 18%, var(--line-soft));
+  background: color-mix(in srgb, var(--surface-panel) 94%, var(--ptd-accent) 6%);
+}
+
+.ptd-resource-item.is-selected {
+  border-color: color-mix(in srgb, var(--ptd-accent) 34%, var(--line-strong));
+  background: color-mix(in srgb, var(--surface-panel) 90%, var(--ptd-accent) 10%);
+  box-shadow: inset 3px 0 0 var(--ptd-accent-strong);
+}
+
+.ptd-resource-item.is-disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.ptd-resource-item input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.ptd-resource-item__check {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 10%, var(--line-strong));
+  border-radius: 6px;
+  color: transparent;
+  background: var(--surface-panel);
+}
+
+.ptd-resource-item.is-selected .ptd-resource-item__check {
+  border-color: var(--ptd-accent-strong);
+  background: var(--ptd-accent-strong);
+  color: #fff;
+}
+
+.ptd-resource-item__body {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.ptd-resource-item__body strong,
+.ptd-resource-item__body span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ptd-resource-item__body strong {
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.ptd-resource-item__body span {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.ptd-resource-item__count {
+  align-self: center;
+  padding: 4px 7px;
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 7%, var(--line-soft));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface-muted) 90%, var(--ptd-accent) 10%);
+  color: color-mix(in srgb, var(--ptd-accent-strong) 40%, var(--text-secondary));
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.ptd-resource-empty {
+  display: grid;
+  place-items: center;
+  min-height: 58px;
+  padding: 12px;
+  border: 1px dashed var(--line-soft);
+  border-radius: 8px;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+  background: var(--surface-1);
+}
+
+.ptd-resource-empty.is-warning {
+  border-color: rgba(194, 120, 3, 0.28);
+  color: var(--state-warning);
+  background: var(--state-warning-bg);
+}
+
+.ptd-selected-resources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ptd-selected-resource {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 9%, transparent);
+  background: color-mix(in srgb, var(--surface-panel) 88%, var(--ptd-accent) 12%);
+  color: color-mix(in srgb, var(--ptd-accent-strong) 72%, var(--text-secondary));
+  font-size: 12px;
 }
 
 .ptd-guideline-tools {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: 1fr;
   gap: 8px;
   align-items: center;
 }
@@ -1099,6 +1641,10 @@ function stopPreTranslate() {
   display: flex;
   flex-wrap: wrap;
   gap: 8px 14px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 7%, var(--line-soft));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-1) 96%, var(--ptd-accent) 4%);
   color: var(--text-secondary);
   font-size: 13px;
 }
@@ -1111,7 +1657,32 @@ function stopPreTranslate() {
 
 .ptd-checks input,
 .ptd-section input[type="checkbox"] {
-  accent-color: var(--brand-700);
+  accent-color: var(--ptd-accent-strong);
+}
+
+.ptd-section .field {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 7%, var(--line-soft));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-1) 96%, var(--ptd-accent) 4%);
+}
+
+.ptd-section .field__label {
+  width: max-content;
+  max-width: 100%;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface-panel) 92%, var(--ptd-accent) 8%);
+  color: color-mix(in srgb, var(--ptd-accent-strong) 45%, var(--text-secondary));
+  font-weight: 600;
+}
+
+.ptd-section .hint-text {
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 6%, var(--line-soft));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-1) 97%, var(--ptd-accent) 3%);
 }
 
 .ptd-progress {
@@ -1196,22 +1767,61 @@ function stopPreTranslate() {
 
 .ptd-guidelines {
   resize: vertical;
-  min-height: 80px;
-  max-height: 220px;
+  min-height: 118px;
+  max-height: 180px;
   font-size: 13px;
   line-height: 1.5;
 }
 
-@media (max-width: 820px) {
-  .ptd-layout,
-  .ptd-grid--tm,
-  .ptd-grid--llm,
-  .ptd-guideline-tools {
+@media (max-width: 1180px) {
+  .ptd-layout {
     grid-template-columns: 1fr;
   }
 
   .ptd-summary {
     position: static;
+    grid-template-columns: 90px 90px minmax(0, 1fr);
+  }
+
+  .ptd-summary__files {
+    max-height: 58px;
+  }
+
+  .ptd-flow {
+    grid-template-columns: minmax(320px, 1.08fr) minmax(320px, 1.08fr) minmax(300px, 0.84fr);
+  }
+}
+
+@media (max-width: 1080px) {
+  .ptd-flow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .ptd-section--llm {
+    grid-column: 1 / -1;
+  }
+
+  .ptd-section--llm .ptd-grid--llm,
+  .ptd-section--llm .ptd-guideline-tools {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 820px) {
+  .ptd-flow,
+  .ptd-grid--threshold,
+  .ptd-grid--llm,
+  .ptd-guideline-tools,
+  .ptd-section--llm .ptd-grid--llm,
+  .ptd-section--llm .ptd-guideline-tools {
+    grid-template-columns: 1fr;
+  }
+
+  .ptd-section--llm {
+    grid-column: auto;
+  }
+
+  .ptd-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -1222,7 +1832,9 @@ function stopPreTranslate() {
 
 @media (max-width: 620px) {
   .ptd-footer,
-  .ptd-actions {
+  .ptd-actions,
+  .ptd-resource__toolbar,
+  .ptd-resource__buttons {
     flex-direction: column;
     align-items: stretch;
   }

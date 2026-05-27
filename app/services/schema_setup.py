@@ -70,6 +70,7 @@ REQUIRED_SCHEMA = {
         "creator_id",
         "collection_id",
         "term_base_id",
+        "term_base_ids",
         "deadline",
         "access_level",
     },
@@ -535,6 +536,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS file_records
             ADD COLUMN IF NOT EXISTS term_base_id UUID REFERENCES term_bases(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS term_base_ids TEXT NOT NULL DEFAULT '[]'
             """,
             """
             ALTER TABLE IF EXISTS file_records

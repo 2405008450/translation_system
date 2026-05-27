@@ -255,6 +255,7 @@ def duplicate_file_record(
         creator_id=current_user.id if current_user is not None else source_record.creator_id,
         collection_id=source_record.collection_id,
         term_base_id=source_record.term_base_id,
+        term_base_ids=source_record.term_base_ids,
         deadline=source_record.deadline,
         access_level=source_record.access_level,
     )

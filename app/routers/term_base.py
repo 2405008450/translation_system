@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Literal
 from uuid import UUID
 
@@ -170,6 +171,26 @@ def _serialize_term_entry(entry: TermEntry) -> dict:
         "created_at": entry.created_at.isoformat(),
         "updated_at": entry.updated_at.isoformat(),
     }
+
+
+def _load_bound_term_base_ids(file_record: FileRecord) -> list[str]:
+    raw_ids = getattr(file_record, "term_base_ids", "") or "[]"
+    try:
+        values = json.loads(raw_ids)
+    except (TypeError, ValueError):
+        values = []
+    if not isinstance(values, list):
+        values = []
+    ids = [str(value) for value in values if value]
+    if not ids and file_record.term_base_id:
+        ids.append(str(file_record.term_base_id))
+    return list(dict.fromkeys(ids))
+
+
+def _store_bound_term_base_ids(file_record: FileRecord, term_base_ids: list[str]) -> None:
+    normalized_ids = list(dict.fromkeys(term_base_ids))
+    file_record.term_base_id = UUID(normalized_ids[0]) if normalized_ids else None
+    file_record.term_base_ids = json.dumps(normalized_ids)
 
 
 @router.get("/term-bases")
@@ -410,6 +431,21 @@ def delete_term_base(
         .filter(FileRecord.term_base_id == term_base.id)
         .update({FileRecord.term_base_id: None}, synchronize_session=False)
     )
+    deleted_id = str(term_base.id)
+    bound_file_records = (
+        db.query(FileRecord)
+        .filter(FileRecord.term_base_ids.isnot(None))
+        .all()
+    )
+    for file_record in bound_file_records:
+        current_ids = _load_bound_term_base_ids(file_record)
+        next_ids = [
+            term_base_id
+            for term_base_id in current_ids
+            if term_base_id != deleted_id
+        ]
+        if len(next_ids) != len(current_ids):
+            _store_bound_term_base_ids(file_record, next_ids)
     (
         db.query(TermEntry)
         .filter(TermEntry.term_base_id == term_base.id)

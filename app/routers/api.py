@@ -345,6 +345,30 @@ def _uuid_list(values: list[str] | None) -> list[UUID]:
     return [UUID(value) for value in values or []]
 
 
+def _load_file_record_term_base_ids(file_record: FileRecord) -> list[UUID]:
+    raw_ids = getattr(file_record, "term_base_ids", "") or "[]"
+    parsed_ids: list[UUID] = []
+    try:
+        values = json.loads(raw_ids)
+    except (TypeError, ValueError):
+        values = []
+    if isinstance(values, list):
+        for value in values:
+            try:
+                parsed_ids.append(value if isinstance(value, UUID) else UUID(str(value)))
+            except (TypeError, ValueError):
+                continue
+    if not parsed_ids and file_record.term_base_id:
+        parsed_ids.append(file_record.term_base_id)
+    return list(dict.fromkeys(parsed_ids))
+
+
+def _store_file_record_term_base_ids(file_record: FileRecord, term_base_ids: list[UUID]) -> None:
+    normalized_ids = list(dict.fromkeys(term_base_ids))
+    file_record.term_base_id = normalized_ids[0] if normalized_ids else None
+    file_record.term_base_ids = json.dumps([str(term_base_id) for term_base_id in normalized_ids])
+
+
 def _serialize_file_record_upload_result(file_record: FileRecord) -> dict[str, Any]:
     return {
         "id": str(file_record.id),
@@ -428,7 +452,7 @@ def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[st
     file_record.source_language = resolved_source_language
     file_record.target_language = resolved_target_language
     if term_base is not None:
-        file_record.term_base_id = term_base_id
+        _store_file_record_term_base_ids(file_record, [term_base_id])
 
     db.commit()
     db.refresh(file_record)
@@ -663,7 +687,7 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
         if selected_collection_ids:
             file_record.collection_id = selected_collection_ids[0]
         if term_base is not None:
-            file_record.term_base_id = term_base_id
+            _store_file_record_term_base_ids(file_record, [term_base_id])
         created_files.append(file_record)
 
     project.status = "in_progress"
@@ -793,6 +817,7 @@ class RematchRequest(BaseModel):
 
 class FileRecordBindingsRequest(BaseModel):
     term_base_id: UUID | None = None
+    term_base_ids: list[UUID] | None = None
     collection_id: UUID | None = None
 
 
@@ -1313,6 +1338,27 @@ def _validate_collection_ids(
         raise HTTPException(status_code=404, detail="选择的 TM 记忆库不存在。")
 
     return normalized_ids
+
+
+def _validate_term_base_ids(
+    db: Session,
+    term_base_ids: list[UUID] | None,
+) -> list[TermBase]:
+    if not term_base_ids:
+        return []
+
+    normalized_ids = list(dict.fromkeys(term_base_ids))
+    term_bases = (
+        db.query(TermBase)
+        .filter(TermBase.id.in_(normalized_ids))
+        .all()
+    )
+    term_base_by_id = {term_base.id: term_base for term_base in term_bases}
+    missing_ids = [term_base_id for term_base_id in normalized_ids if term_base_id not in term_base_by_id]
+    if missing_ids:
+        raise HTTPException(status_code=404, detail="选择的术语库不存在。")
+
+    return [term_base_by_id[term_base_id] for term_base_id in normalized_ids]
 
 
 def _require_selected_collection_ids(
@@ -2788,6 +2834,22 @@ def get_file_record(
     term_base_name = None
     if file_record.term_base:
         term_base_name = file_record.term_base.name
+    term_base_ids = _load_file_record_term_base_ids(file_record)
+    term_base_names: list[str] = []
+    if term_base_ids:
+        term_bases = (
+            db.query(TermBase)
+            .filter(TermBase.id.in_(term_base_ids))
+            .all()
+        )
+        term_base_by_id = {term_base.id: term_base for term_base in term_bases}
+        term_base_names = [
+            term_base_by_id[term_base_id].name
+            for term_base_id in term_base_ids
+            if term_base_id in term_base_by_id
+        ]
+        if term_base_name is None and term_base_names:
+            term_base_name = term_base_names[0]
 
     project_guidelines = ""
     if file_record.project_id:
@@ -2815,6 +2877,8 @@ def get_file_record(
         "collection_name": collection_name,
         "term_base_id": file_record.term_base_id,
         "term_base_name": term_base_name,
+        "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
+        "term_base_names": term_base_names,
         "translation_guidelines": project_guidelines,
         "created_at": file_record.created_at.isoformat(),
         "updated_at": file_record.updated_at.isoformat(),
@@ -3230,22 +3294,29 @@ def patch_file_record_bindings(
             _ensure_resource_language_pair_matches(collection, source_language, target_language, "记忆库")
             file_record.collection_id = payload.collection_id
 
-    if "term_base_id" in payload.model_fields_set:
+    if "term_base_ids" in payload.model_fields_set:
+        term_bases = _validate_term_base_ids(db, payload.term_base_ids)
+        for term_base in term_bases:
+            _ensure_resource_language_pair_matches(term_base, source_language, target_language, "术语库")
+        _store_file_record_term_base_ids(file_record, [term_base.id for term_base in term_bases])
+    elif "term_base_id" in payload.model_fields_set:
         if payload.term_base_id is None:
-            file_record.term_base_id = None
+            _store_file_record_term_base_ids(file_record, [])
         else:
             term_base = db.query(TermBase).filter(TermBase.id == payload.term_base_id).first()
             if not term_base:
                 raise HTTPException(status_code=404, detail="术语库不存在。")
             _ensure_resource_language_pair_matches(term_base, source_language, target_language, "术语库")
-            file_record.term_base_id = payload.term_base_id
+            _store_file_record_term_base_ids(file_record, [payload.term_base_id])
 
     db.commit()
     db.refresh(file_record)
+    term_base_ids = _load_file_record_term_base_ids(file_record)
     return {
         "id": str(file_record.id),
         "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
         "term_base_id": str(file_record.term_base_id) if file_record.term_base_id else None,
+        "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
     }
 
 

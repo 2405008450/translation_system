@@ -8,9 +8,9 @@ const rootDir = path.resolve(__dirname, '..')
 const resetScript = path.join(rootDir, 'scripts', 'e2e_reset_db.py')
 
 const candidates = [
-  process.env.PYTHON,
   path.join(rootDir, '.venv', 'Scripts', 'python.exe'),
   path.join(rootDir, '.venv', 'bin', 'python'),
+  process.env.PYTHON,
   'python',
 ].filter(Boolean)
 

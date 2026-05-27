@@ -219,6 +219,8 @@ export interface FileRecordDetail {
   collection_name: string | null
   term_base_id: string | null
   term_base_name: string | null
+  term_base_ids: string[]
+  term_base_names: string[]
   translation_guidelines: string
   created_at: string
   updated_at: string

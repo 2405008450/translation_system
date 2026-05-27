@@ -138,6 +138,12 @@ class FileRecord(Base):
         ForeignKey("term_bases.id", ondelete="SET NULL"),
         nullable=True,
     )
+    term_base_ids: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="[]",
+        server_default=text("'[]'"),
+    )
     deadline: Mapped[DateTime | None] = mapped_column(
         DateTime(timezone=False), nullable=True
     )
