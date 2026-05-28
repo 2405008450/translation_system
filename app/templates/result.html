@@ -426,6 +426,28 @@
                             <option value="deepseek">DeepSeek</option>
                             <option value="openrouter">OpenRouter</option>
                         </select>
+                        <select class="form-select" id="llmModel" title="选择 LLM 模型">
+                            <option value="" selected>后端默认模型</option>
+                            <option value="google/gemini-3.5-flash" data-provider="openrouter">Gemini 3.5 Flash</option>
+                            <option value="google/gemini-3.1-pro-preview" data-provider="openrouter">Gemini 3.1 Pro Preview</option>
+                            <option value="google/gemini-3.1-flash-lite" data-provider="openrouter">Gemini 3.1 Flash Lite</option>
+                            <option value="google/gemini-3-flash-preview" data-provider="openrouter">Gemini 3 Flash Preview</option>
+                            <option value="google/gemini-2.5-pro" data-provider="openrouter">Gemini 2.5 Pro</option>
+                            <option value="google/gemini-2.5-flash" data-provider="openrouter">Gemini 2.5 Flash</option>
+                            <option value="google/gemini-2.5-flash-lite" data-provider="openrouter">Gemini 2.5 Flash Lite</option>
+                            <option value="openai/gpt-chat-latest" data-provider="openrouter">GPT Chat Latest</option>
+                            <option value="openai/gpt-5.4" data-provider="openrouter">GPT-5.4</option>
+                            <option value="openai/gpt-5.4-mini" data-provider="openrouter">GPT-5.4 Mini</option>
+                            <option value="openai/gpt-5.4-nano" data-provider="openrouter">GPT-5.4 Nano</option>
+                            <option value="openai/gpt-5.3-chat" data-provider="openrouter">GPT-5.3 Chat</option>
+                            <option value="openai/gpt-5.2" data-provider="openrouter">GPT-5.2</option>
+                            <option value="openai/gpt-5.2-chat" data-provider="openrouter">GPT-5.2 Chat</option>
+                            <option value="openai/gpt-5.1" data-provider="openrouter">GPT-5.1</option>
+                            <option value="openai/gpt-5.1-chat" data-provider="openrouter">GPT-5.1 Chat</option>
+                            <option value="openai/gpt-5-mini" data-provider="openrouter">GPT-5 Mini</option>
+                            <option value="openai/gpt-5-nano" data-provider="openrouter">GPT-5 Nano</option>
+                            <option value="deepseek/deepseek-chat" data-provider="deepseek">DeepSeek Chat</option>
+                        </select>
                         <button class="btn btn-outline-primary" id="btnLlmTranslate" title="按所选范围执行 AI 译文修正">
                             AI 译文修正
                         </button>
@@ -670,6 +692,7 @@
         const btnLlmTranslate = document.getElementById('btnLlmTranslate');
         const llmScope = document.getElementById('llmScope');
         const llmProvider = document.getElementById('llmProvider');
+        const llmModel = document.getElementById('llmModel');
         const llmStatus = document.getElementById('llmStatus');
         const fileRecordId = document.body.dataset.fileRecordId;
         const toolbarBtns = Array.from(document.querySelectorAll('.toolbar-btn'));
@@ -799,6 +822,7 @@
             }
             if (llmScope) llmScope.disabled = loading;
             if (llmProvider) llmProvider.disabled = loading;
+            if (llmModel) llmModel.disabled = loading;
         }
 
         function openPanel(source, matched, tmTarget, status, sourceHtml = '') {
@@ -1026,6 +1050,7 @@
                     body: JSON.stringify({
                         scope: llmScope.value,
                         provider: llmProvider.value,
+                        model: llmModel.value || null,
                     }),
                 });
 
@@ -1140,6 +1165,33 @@
 
         if (btnLlmTranslate) {
             btnLlmTranslate.addEventListener('click', runLlmTranslate);
+        }
+
+        if (llmModel && llmProvider) {
+            const syncLlmModelOptions = () => {
+                const provider = llmProvider.value;
+                Array.from(llmModel.options).forEach(option => {
+                    const optionProvider = option.dataset.provider || '';
+                    const visible = !optionProvider || provider === 'auto' || optionProvider === provider;
+                    option.hidden = !visible;
+                    option.disabled = !visible;
+                });
+                const currentOption = llmModel.selectedOptions[0];
+                if (currentOption && currentOption.disabled) {
+                    llmModel.value = '';
+                }
+            };
+            llmModel.addEventListener('change', () => {
+                const model = llmModel.value || '';
+                if (model.startsWith('google/') || model.startsWith('openai/')) {
+                    llmProvider.value = 'openrouter';
+                }
+                syncLlmModelOptions();
+            });
+            llmProvider.addEventListener('change', () => {
+                syncLlmModelOptions();
+            });
+            syncLlmModelOptions();
         }
 
         closeBtn.addEventListener('click', closePanel);

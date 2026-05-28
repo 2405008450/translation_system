@@ -19,10 +19,26 @@ from app.services.normalizer import normalize_match_text, normalize_text
 
 logger = logging.getLogger(__name__)
 
-TERM_EXTRACTION_MODEL = "google/gemini-3-flash-preview"
+TERM_EXTRACTION_MODEL = "google/gemini-3.5-flash"
 TERM_EXTRACTION_MODEL_OPTIONS = (
+    "google/gemini-3.5-flash",
+    "google/gemini-3.1-pro-preview",
+    "google/gemini-3.1-flash-lite",
     "google/gemini-3-flash-preview",
-    "openai/gpt-4o-mini",
+    "google/gemini-2.5-pro",
+    "google/gemini-2.5-flash",
+    "google/gemini-2.5-flash-lite",
+    "openai/gpt-chat-latest",
+    "openai/gpt-5.4",
+    "openai/gpt-5.4-mini",
+    "openai/gpt-5.4-nano",
+    "openai/gpt-5.3-chat",
+    "openai/gpt-5.2",
+    "openai/gpt-5.2-chat",
+    "openai/gpt-5.1",
+    "openai/gpt-5.1-chat",
+    "openai/gpt-5-mini",
+    "openai/gpt-5-nano",
     "deepseek/deepseek-chat",
 )
 TERM_EXTRACTION_CHUNK_MAX_CHARS = 8000

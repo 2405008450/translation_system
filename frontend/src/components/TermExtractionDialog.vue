@@ -16,6 +16,7 @@ import { useRouter } from 'vue-router'
 
 import { http } from '../api/http'
 import { pushToast } from '../composables/useToast'
+import { defaultLLMModelId, getLLMModelLabel, llmModelOptions } from '../constants/llm'
 import { formatLanguagePair } from '../constants/languages'
 import type {
   ExtractedTermDraft,
@@ -43,11 +44,6 @@ interface TermDraftRow extends ExtractedTermDraft {
   action: TermDraftAction
 }
 
-interface ModelOption {
-  id: string
-  name: string
-}
-
 interface VersionOption {
   key: VersionKey
   label: string
@@ -70,13 +66,7 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 const router = useRouter()
-
-const defaultModelId = 'google/gemini-3-flash-preview'
-const modelOptions: ModelOption[] = [
-  { id: defaultModelId, name: 'Gemini 3 Flash Preview' },
-  { id: 'openai/gpt-4o-mini', name: 'GPT-4o mini' },
-  { id: 'deepseek/deepseek-chat', name: 'DeepSeek Chat' },
-]
+const modelOptions = llmModelOptions
 
 const loadingBases = ref(false)
 const extracting = ref(false)
@@ -87,7 +77,7 @@ const creatingBase = ref(false)
 const termBases = ref<TermBase[]>([])
 const selectedTermBaseId = ref('')
 const drafts = ref<TermDraftRow[]>([])
-const selectedModels = ref<string[]>([defaultModelId])
+const selectedModels = ref<string[]>([defaultLLMModelId])
 const customModelId = ref('')
 const extractionPrompt = ref('')
 const modelResults = ref<TermExtractionModelResult[]>([])
@@ -176,7 +166,7 @@ function resetState() {
   modelResults.value = []
   mergedTerms.value = []
   selectedVersionKey.value = ''
-  selectedModels.value = [defaultModelId]
+  selectedModels.value = [defaultLLMModelId]
   customModelId.value = ''
   extractionPrompt.value = ''
   errorMessage.value = ''
@@ -189,7 +179,7 @@ function getModelLabel(modelId: string) {
   if (modelId === 'deepseek-chat') {
     return 'DeepSeek Chat'
   }
-  return modelOptions.find((option) => option.id === modelId)?.name || modelId
+  return getLLMModelLabel(modelId)
 }
 
 function getModelVersionKey(result: TermExtractionModelResult, index: number): VersionKey {

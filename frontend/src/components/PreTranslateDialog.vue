@@ -5,6 +5,7 @@ import { useI18n } from 'vue-i18n'
 
 import { http } from '../api/http'
 import { canonicalizeLanguagePair, formatLanguagePair } from '../constants/languages'
+import { llmModelOptions as baseLLMModelOptions } from '../constants/llm'
 import { pushToast } from '../composables/useToast'
 import type { GuidelineTemplateSummary, LLMProvider, LLMTranslateScope, TermBase, TMCollection } from '../types/api'
 import { consumeLLMStream } from '../utils/llmStream'
@@ -76,6 +77,7 @@ const tmAutoConfirmExact = ref(true)
 const useLlm = ref(false)
 const llmScope = ref<LLMTranslateScope>('all')
 const llmProvider = ref<LLMProvider>('deepseek')
+const llmModel = ref('')
 const llmGuidelines = ref('')
 const selectedGuidelineTemplateId = ref('')
 const importingGuidelineTemplate = ref(false)
@@ -96,6 +98,13 @@ const llmProviderOptions = computed<Array<{ value: LLMProvider, label: string }>
   { value: 'deepseek', label: t('projectDetail.preTranslate.llm.providers.deepseek') },
   { value: 'openrouter', label: t('projectDetail.preTranslate.llm.providers.openrouter') },
   { value: 'auto', label: t('projectDetail.preTranslate.llm.providers.auto') },
+])
+
+const llmModelOptions = computed(() => [
+  { id: '', name: t('projectDetail.preTranslate.llm.modelDefault') },
+  ...baseLLMModelOptions.filter((option) => (
+    llmProvider.value === 'auto' || option.provider === llmProvider.value
+  )),
 ])
 
 const llmScopeOptions = computed<Array<{ value: LLMTranslateScope, label: string }>>(() => [
@@ -243,6 +252,22 @@ watch(availableTMCollections, () => {
 
 watch(availableTermBases, () => {
   termBaseIds.value = normalizeResourceIds(termBaseIds.value, availableTermBases.value)
+})
+
+watch(llmModel, (modelId) => {
+  if (modelId.startsWith('google/') || modelId.startsWith('openai/')) {
+    llmProvider.value = 'openrouter'
+  }
+})
+
+watch(llmProvider, (provider) => {
+  if (!llmModel.value || provider === 'auto') {
+    return
+  }
+  const selectedModel = baseLLMModelOptions.find((option) => option.id === llmModel.value)
+  if (selectedModel && selectedModel.provider !== provider) {
+    llmModel.value = ''
+  }
 })
 
 function resetProgress() {
@@ -560,6 +585,7 @@ async function runLLMForFile(fileId: string, completedActions: number, actionCou
       body: JSON.stringify({
         scope: llmScope.value,
         provider: llmProvider.value,
+        model: llmModel.value || null,
         guideline_template_id: selectedGuidelineTemplateId.value || null,
         temporary_prompt: llmGuidelines.value,
       }),
@@ -1071,6 +1097,14 @@ function stopPreTranslate() {
             <select v-model="llmProvider" class="field__control" :disabled="running || !useLlm">
               <option v-for="option in llmProviderOptions" :key="option.value" :value="option.value">
                 {{ option.label }}
+              </option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field__label">{{ t('projectDetail.preTranslate.llm.model') }}</span>
+            <select v-model="llmModel" class="field__control" :disabled="running || !useLlm">
+              <option v-for="option in llmModelOptions" :key="option.id" :value="option.id">
+                {{ option.name }}
               </option>
             </select>
           </label>

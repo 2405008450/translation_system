@@ -63,7 +63,7 @@ import { usePageHeader } from '../composables/usePageHeader'
 import { useToast } from '../composables/useToast'
 import { useWorkbenchShortcuts } from '../composables/useWorkbenchShortcuts'
 import { getTaskExportFormatLabel } from '../constants/taskFiles'
-import { llmProviderOptions, llmScopeOptions } from '../constants/llm'
+import { llmModelOptions, llmProviderOptions, llmScopeOptions } from '../constants/llm'
 import { formatLanguagePair } from '../constants/languages'
 import { isProgressComplete } from '../utils/progress'
 import { useAuthStore } from '../stores/auth'
@@ -160,6 +160,7 @@ function startResize(event: MouseEvent) {
 const pageError = ref('')
 const llmScope = ref<LLMTranslateScope>('all')
 const llmProvider = ref<LLMProvider>('deepseek')
+const llmModel = ref('')
 const itemHeight = ref(resolveItemHeight())
 const activeTool = ref<ToolKey | null>(null)
 const showImportDialog = ref(false)
@@ -167,6 +168,8 @@ const showIssueDialog = ref(false)
 const importDialogInitialTab = ref<ResourceImportTab>('tm')
 const showShortcutHelp = ref(false)
 const showSaveToTMDialog = ref(false)
+const openConfirmMenu = ref(false)
+const confirmationActionLoading = ref(false)
 const openRevisionMenu = ref<RevisionMenuKind | null>(null)
 const revisionTraceVisible = ref(false)
 const revisionActionLoading = ref(false)
@@ -199,6 +202,29 @@ let searchLoadRequestId = 0
 let suppressSegmentFilterWatch = false
 
 const segmentPageSizes = [100, 200, 500]
+
+const llmModelSelectOptions = computed(() => [
+  { id: '', name: t('workbench.aiModelDefault') },
+  ...llmModelOptions.filter((option) => (
+    llmProvider.value === 'auto' || option.provider === llmProvider.value
+  )),
+])
+
+watch(llmModel, (modelId) => {
+  if (modelId.startsWith('google/') || modelId.startsWith('openai/')) {
+    llmProvider.value = 'openrouter'
+  }
+})
+
+watch(llmProvider, (provider) => {
+  if (!llmModel.value || provider === 'auto') {
+    return
+  }
+  const selectedModel = llmModelOptions.find((option) => option.id === llmModel.value)
+  if (selectedModel && selectedModel.provider !== provider) {
+    llmModel.value = ''
+  }
+})
 
 function getCommentWindowQuery(): CommentWindowQuery | null {
   if (!segmentStore.segments.length) {
@@ -459,6 +485,12 @@ const statusSummary = computed(() => {
     },
   ]
 })
+
+const confirmableSegmentCount = computed(() => Math.max(
+  0,
+  segmentStore.totalSegmentCount - segmentStore.segmentStatusStats.confirmed,
+))
+const confirmedSegmentCount = computed(() => segmentStore.segmentStatusStats.confirmed)
 
 const currentLanguagePair = computed(() => (
   formatLanguagePair(
@@ -1217,6 +1249,76 @@ function confirmCurrentSentence() {
   toast.success(t('workbench.messages.confirmed'))
 }
 
+function toggleConfirmMenu() {
+  if (confirmationActionLoading.value || segmentStore.totalSegmentCount === 0) {
+    return
+  }
+  openConfirmMenu.value = !openConfirmMenu.value
+  openRevisionMenu.value = null
+}
+
+function closeConfirmMenu() {
+  openConfirmMenu.value = false
+}
+
+function handleConfirmCurrentFromMenu() {
+  closeConfirmMenu()
+  confirmCurrentSentence()
+}
+
+async function handleConfirmAllSegments() {
+  if (confirmableSegmentCount.value === 0) {
+    toast.info('当前文件全部句段都已确认。')
+    closeConfirmMenu()
+    return
+  }
+
+  pageError.value = ''
+  confirmationActionLoading.value = true
+  try {
+    const updatedCount = await segmentStore.updateAllSegmentConfirmations('confirm')
+    toast.success(updatedCount > 0 ? `已确认 ${updatedCount} 个句段` : '没有需要确认的句段')
+    closeConfirmMenu()
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '全部确认失败')
+  } finally {
+    confirmationActionLoading.value = false
+  }
+}
+
+async function handleCancelAllSegmentConfirmations() {
+  const count = confirmedSegmentCount.value
+  if (count === 0) {
+    toast.info('当前文件没有已确认句段。')
+    closeConfirmMenu()
+    return
+  }
+
+  closeConfirmMenu()
+  const accepted = await confirm({
+    title: '确认全部取消',
+    message: `确定要取消当前文件全部 ${count} 个已确认句段的确认状态吗？译文内容会保留，但这些句段将不再显示为已确认。`,
+    confirmText: '全部取消',
+    cancelText: t('common.actions.cancel'),
+    danger: true,
+  })
+  if (!accepted) {
+    return
+  }
+
+  pageError.value = ''
+  confirmationActionLoading.value = true
+  try {
+    const updatedCount = await segmentStore.updateAllSegmentConfirmations('cancel')
+    toast.success(updatedCount > 0 ? `已取消确认 ${updatedCount} 个句段` : '没有需要取消确认的句段')
+    closeConfirmMenu()
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '全部取消失败')
+  } finally {
+    confirmationActionLoading.value = false
+  }
+}
+
 function showRibbonPlaceholder(name: string) {
   toast.info({
     title: t('workbench.ribbon.placeholderTitle'),
@@ -1332,6 +1434,7 @@ async function handleApplyPartialRevision(revisionId: string, newText: string) {
 
 function toggleRevisionMenu(kind: RevisionMenuKind) {
   openRevisionMenu.value = openRevisionMenu.value === kind ? null : kind
+  openConfirmMenu.value = false
 }
 
 function setRevisionTraceVisible(visible: boolean) {
@@ -1612,6 +1715,7 @@ async function runLLMTranslation() {
     await segmentStore.startLLMTranslation(llmScope.value, llmProvider.value, {
       guidelineTemplateId: selectedGuidelineTemplateId.value || undefined,
       temporaryPrompt: workbenchGuidelines.value,
+      model: llmModel.value || undefined,
     })
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.llm'))
@@ -1894,6 +1998,12 @@ function handleClickOutside(event: MouseEvent) {
     showExportMenu.value = false
   }
   if (
+    !target.closest('.workbench-confirm-menu')
+    && !target.closest('.workbench-confirm-menu__dropdown')
+  ) {
+    openConfirmMenu.value = false
+  }
+  if (
     !target.closest('.workbench-revision-menu')
     && !target.closest('.workbench-revision-menu__dropdown')
     && !target.closest('.workbench-revision-trigger')
@@ -2162,6 +2272,14 @@ onBeforeRouteLeave(async () => {
             </option>
           </select>
         </label>
+        <label class="ai-strip__field ai-strip__field--model">
+          <span>{{ t('workbench.aiModelShort') }}</span>
+          <select v-model="llmModel" class="field__control">
+            <option v-for="option in llmModelSelectOptions" :key="option.id" :value="option.id">
+              {{ option.name }}
+            </option>
+          </select>
+        </label>
         <button
           v-if="!segmentStore.llmRunning"
           class="ai-strip__button ai-strip__button--primary"
@@ -2197,16 +2315,21 @@ onBeforeRouteLeave(async () => {
       </div>
 
       <div class="workbench-ribbon__container container">
-        <div class="tool-group">
+        <div class="tool-group tool-group--confirm workbench-confirm-menu">
           <button
             class="tool-col tool-col--big tool-button"
+            data-testid="workbench-confirm-menu"
             type="button"
-            :disabled="!activeSegment"
-            @click="confirmCurrentSentence"
+            :class="{ active: openConfirmMenu }"
+            :disabled="confirmationActionLoading || segmentStore.totalSegmentCount === 0"
+            :aria-expanded="openConfirmMenu"
+            aria-haspopup="menu"
+            @click.stop="toggleConfirmMenu"
           >
             <span class="tool-line line1 with-big-icon">
               <span class="icon-text-area has_dropdown">
-                <Check class="tool-single-icon tool-single-icon--confirm" :size="28" />
+                <Loader2 v-if="confirmationActionLoading" class="lucide-spin tool-single-icon" :size="28" />
+                <Check v-else class="tool-single-icon tool-single-icon--confirm" :size="28" />
               </span>
               <span class="dropdown-link" aria-hidden="true">
                 <ChevronDown :size="12" />
@@ -2214,6 +2337,36 @@ onBeforeRouteLeave(async () => {
             </span>
             <span class="tool-line"><span class="label">{{ t('workbench.ribbon.confirmSegment') }}</span></span>
           </button>
+          <div v-if="openConfirmMenu" class="workbench-confirm-menu__dropdown" role="menu">
+            <button
+              data-testid="workbench-confirm-current"
+              type="button"
+              role="menuitem"
+              :disabled="confirmationActionLoading || !activeSegment"
+              @click="handleConfirmCurrentFromMenu"
+            >
+              确认当前句段
+            </button>
+            <button
+              data-testid="workbench-confirm-all"
+              type="button"
+              role="menuitem"
+              :disabled="confirmationActionLoading || confirmableSegmentCount === 0"
+              @click="void handleConfirmAllSegments()"
+            >
+              全部确认
+            </button>
+            <button
+              class="is-danger"
+              data-testid="workbench-cancel-all-confirmations"
+              type="button"
+              role="menuitem"
+              :disabled="confirmationActionLoading || confirmedSegmentCount === 0"
+              @click="void handleCancelAllSegmentConfirmations()"
+            >
+              全部取消
+            </button>
+          </div>
         </div>
 
         <div class="tool-group">
@@ -2579,6 +2732,15 @@ onBeforeRouteLeave(async () => {
           <select v-model="llmProvider" class="field__control" :title="t('workbench.aiProvider')">
             <option v-for="option in llmProviderOptions" :key="option.value" :value="option.value">
               {{ option.label }}
+            </option>
+          </select>
+        </label>
+
+        <label class="field field--compact workbench-toolbar__field workbench-toolbar__field--model">
+          <span class="field__label">{{ t('workbench.aiModelShort') }}</span>
+          <select v-model="llmModel" class="field__control" :title="t('workbench.aiModel')">
+            <option v-for="option in llmModelSelectOptions" :key="option.id" :value="option.id">
+              {{ option.name }}
             </option>
           </select>
         </label>
@@ -3487,6 +3649,10 @@ onBeforeRouteLeave(async () => {
   font-size: 11px;
 }
 
+.ai-strip__field--model {
+  grid-template-columns: auto minmax(150px, 240px);
+}
+
 .ai-strip__field .field__control {
   min-height: 25px;
   padding: 2px 18px 2px 6px;
@@ -3572,6 +3738,57 @@ onBeforeRouteLeave(async () => {
   position: relative;
   gap: 4px;
   overflow: visible;
+}
+
+.tool-group--confirm {
+  position: relative;
+  overflow: visible;
+}
+
+.workbench-confirm-menu__dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 4px;
+  z-index: 1250;
+  display: grid;
+  min-width: 136px;
+  padding: 4px;
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 8px 20px rgba(20, 45, 55, 0.16);
+}
+
+.workbench-confirm-menu__dropdown button {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 30px;
+  padding: 6px 9px;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.workbench-confirm-menu__dropdown button:hover:not(:disabled) {
+  background: rgba(13, 122, 104, 0.08);
+}
+
+.workbench-confirm-menu__dropdown button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.workbench-confirm-menu__dropdown button.is-danger {
+  color: #a43a3d;
+}
+
+.workbench-confirm-menu__dropdown button.is-danger:hover:not(:disabled) {
+  background: rgba(194, 59, 63, 0.08);
 }
 
 .tool-col {
@@ -3899,6 +4116,10 @@ onBeforeRouteLeave(async () => {
   min-width: 0;
   max-width: min(220px, 42vw);
   min-height: 32px;
+}
+
+.workbench-toolbar__field--model {
+  max-width: min(300px, 58vw);
 }
 
 .workbench-toolbar__field .field__label {

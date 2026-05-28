@@ -560,6 +560,7 @@ export type LLMProvider = 'auto' | 'deepseek' | 'openrouter'
 export interface LLMGuidelineOptions {
   guidelineTemplateId?: string
   temporaryPrompt?: string
+  model?: string
 }
 
 export interface LLMEvent {

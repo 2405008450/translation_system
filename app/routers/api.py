@@ -770,6 +770,10 @@ class BatchSegmentUpdate(BaseModel):
     updates: list[SegmentUpdate]
 
 
+class SegmentConfirmationBatchUpdate(BaseModel):
+    action: Literal["confirm", "cancel"]
+
+
 class SegmentReplaceRequest(BaseModel):
     scope: str = "all"
     source_query: str = ""
@@ -790,6 +794,7 @@ class FileOperationLockRequest(BaseModel):
 class LLMTranslateRequest(BaseModel):
     scope: Literal["fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"] = "all"
     provider: Literal["auto", "deepseek", "openrouter"] = "deepseek"
+    model: str | None = Field(default=None, max_length=120)
     translation_unit: Literal["paragraph", "sentence"] = "paragraph"
     translation_guidelines: str = ""
     guideline_template_id: str | None = None
@@ -2654,6 +2659,20 @@ def _serialize_workbench_segment(seg: Segment, display_index: int | None = None)
     return payload
 
 
+def _resolve_unconfirmed_segment_status(segment: Segment) -> str:
+    if not normalize_text(segment.target_text):
+        return "none"
+
+    score = float(segment.score or 0)
+    source_text = normalize_match_text(segment.source_text or "")
+    matched_source_text = normalize_match_text(segment.matched_source_text or "")
+    if score >= 0.999 or (matched_source_text and matched_source_text == source_text):
+        return "exact"
+    if score > 0 or matched_source_text:
+        return "fuzzy"
+    return "none"
+
+
 def _apply_segment_scope_filter(query, scope: str):
     normalized_scope = (scope or "all").strip().lower()
     if normalized_scope == "exact_only":
@@ -3538,6 +3557,52 @@ def batch_update(
     return {"updated_count": updated_count}
 
 
+@router.post("/file-records/{file_record_id}/segments/confirmation")
+@router.post("/documents/{file_record_id}/segments/confirmation", include_in_schema=False)
+def batch_update_segment_confirmation(
+    file_record_id: UUID,
+    payload: SegmentConfirmationBatchUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+):
+    """批量确认或取消确认当前文件的全部句段。"""
+    _require_file_record_write_access(db, file_record_id, operation_token)
+
+    if payload.action == "confirm":
+        segments = (
+            db.query(Segment)
+            .filter(
+                Segment.file_record_id == file_record_id,
+                or_(Segment.status.is_(None), Segment.status != "confirmed"),
+            )
+            .all()
+        )
+        next_status = "confirmed"
+        updated_count = 0
+        for segment in segments:
+            if segment.status != next_status:
+                segment.status = next_status
+                updated_count += 1
+    else:
+        segments = (
+            db.query(Segment)
+            .filter(Segment.file_record_id == file_record_id, Segment.status == "confirmed")
+            .all()
+        )
+        updated_count = 0
+        for segment in segments:
+            next_status = _resolve_unconfirmed_segment_status(segment)
+            if segment.status != next_status:
+                segment.status = next_status
+                updated_count += 1
+
+    if updated_count:
+        db.commit()
+
+    return {"updated_count": updated_count}
+
+
 @router.post("/file-records/{file_record_id}/segments/replace")
 def replace_file_record_segment_targets(
     file_record_id: UUID,
@@ -4135,8 +4200,9 @@ async def llm_translate_file_record(
     ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
     source_language, target_language = _resolve_file_record_language_pair(file_record)
     body = payload or LLMTranslateRequest()
+    requested_model = normalize_text(body.model or "") or None
     try:
-        validate_provider_choice(body.provider)
+        validate_provider_choice(body.provider, model_override=requested_model)
     except LLMConfigurationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -4163,6 +4229,7 @@ async def llm_translate_file_record(
                 "file_record_id": str(file_record_id),
                 "scope": body.scope,
                 "provider": body.provider,
+                "model": requested_model,
                 "translation_unit": body.translation_unit,
                 "source_language": source_language,
                 "target_language": target_language,
@@ -4187,6 +4254,7 @@ async def llm_translate_file_record(
             provider=body.provider,
             translation_guidelines=guidelines,
             translation_unit=body.translation_unit,
+            model_override=requested_model,
         ):
             if await request.is_disconnected():
                 break

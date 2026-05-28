@@ -201,9 +201,11 @@ UNSAFE_LOCALIZED_LIST_PREFIX_SYMBOLS = frozenset({"-", "–", "—", "*", "・",
 def validate_provider_choice(
     provider: LLMProvider = "auto",
     settings: Settings | None = None,
+    model_override: str | None = None,
 ) -> list[ProviderConfig]:
     config = settings or get_settings()
     available_providers: dict[str, ProviderConfig] = {}
+    selected_model = normalize_text(model_override or "") or None
 
     if config.deepseek_api_key:
         available_providers["deepseek"] = ProviderConfig(
@@ -233,11 +235,50 @@ def validate_provider_choice(
         ordered_names = ["openrouter", "deepseek"]
 
     providers = [available_providers[name] for name in ordered_names if name in available_providers]
+    if selected_model:
+        providers = [
+            resolved
+            for item in providers
+            if (resolved := _resolve_provider_model(item, selected_model, config)) is not None
+        ]
 
     if providers:
         return providers
 
+    if selected_model:
+        raise LLMConfigurationError(f"当前配置无法使用模型 {selected_model}。")
     raise LLMConfigurationError("未配置可用的 LLM API key。")
+
+
+def _resolve_provider_model(
+    provider: ProviderConfig,
+    selected_model: str,
+    settings: Settings,
+) -> ProviderConfig | None:
+    if provider.name == "openrouter":
+        return ProviderConfig(
+            name=provider.name,
+            api_key=provider.api_key,
+            base_url=provider.base_url,
+            model=selected_model,
+        )
+
+    if provider.name == "deepseek":
+        if selected_model.startswith("deepseek/"):
+            direct_model = normalize_text(selected_model.split("/", 1)[1]) or settings.deepseek_model
+        elif "/" not in selected_model:
+            direct_model = selected_model
+        else:
+            return None
+        return ProviderConfig(
+            name=provider.name,
+            api_key=provider.api_key,
+            base_url=provider.base_url,
+            model=direct_model,
+        )
+
+    return None
+
 
 async def iter_batch_translate(
     tasks: list[LLMTranslationTask],
@@ -245,9 +286,10 @@ async def iter_batch_translate(
     translation_guidelines: str = "",
     settings: Settings | None = None,
     translation_unit: LLMTranslationUnit = "paragraph",
+    model_override: str | None = None,
 ) -> AsyncIterator[LLMTranslationResult | LLMTranslationFailure]:
     config = settings or get_settings()
-    providers = validate_provider_choice(provider=provider, settings=config)
+    providers = validate_provider_choice(provider=provider, settings=config, model_override=model_override)
     target_tasks = [task for task in tasks if task.should_translate]
 
     if translation_unit not in ("sentence", "paragraph"):

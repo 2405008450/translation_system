@@ -913,6 +913,24 @@ export const useSegmentStore = defineStore('segment', () => {
     return data.updated_count
   }
 
+  async function updateAllSegmentConfirmations(action: 'confirm' | 'cancel') {
+    if (!fileRecord.value) {
+      return 0
+    }
+
+    const synced = await syncToBackend()
+    if (!synced) {
+      return 0
+    }
+
+    const { data } = await http.post<{ updated_count: number }>(
+      `/file-records/${fileRecord.value.id}/segments/confirmation`,
+      { action },
+    )
+    await refreshCurrentSegmentPage()
+    return data.updated_count
+  }
+
   async function applyPartialRevision(revisionId: string, newText: string) {
     const persistedRevisionId = await resolvePersistedRevisionId(revisionId)
     // 部分接受修订：更新修订的 after_text，然后接受
@@ -999,6 +1017,7 @@ export const useSegmentStore = defineStore('segment', () => {
         body: JSON.stringify({
           scope,
           provider,
+          model: guidelineOptions.model || null,
           guideline_template_id: guidelineOptions.guidelineTemplateId || null,
           temporary_prompt: guidelineOptions.temporaryPrompt || '',
         }),
@@ -1230,6 +1249,7 @@ export const useSegmentStore = defineStore('segment', () => {
     applyPartialRevision,
     batchAcceptRevisions,
     batchRejectRevisions,
+    updateAllSegmentConfirmations,
     startLLMTranslation,
     abortLLM,
     downloadTranslatedFile,
