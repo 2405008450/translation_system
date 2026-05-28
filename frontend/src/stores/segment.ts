@@ -555,6 +555,13 @@ export const useSegmentStore = defineStore('segment', () => {
     return typeof index === 'number' ? index : -1
   }
 
+  function rebuildSegmentIndexMap() {
+    segmentIndexMap.clear()
+    segments.value.forEach((segment, index) => {
+      segmentIndexMap.set(segment.sentence_id, index)
+    })
+  }
+
   async function ensureSentenceLoaded(sentenceId: string) {
     return getSegmentIndex(sentenceId)
   }
@@ -1019,6 +1026,61 @@ export const useSegmentStore = defineStore('segment', () => {
     return data
   }
 
+  async function splitSegment(sentenceId: string, splitOffset: number) {
+    if (!fileRecord.value) return null
+    // 先同步未保存的修改
+    if (dirtyCount.value > 0) {
+      await syncToBackend()
+    }
+    const { data } = await http.post<{ first: Segment; second: Segment }>(
+      `/file-records/${fileRecord.value.id}/segments/${sentenceId}/split`,
+      { split_offset: splitOffset },
+    )
+    // 更新本地 segments 列表
+    const index = getSegmentIndex(sentenceId)
+    if (index !== -1) {
+      segments.value.splice(index, 1, data.first, data.second)
+      rebuildSegmentIndexMap()
+      totalSegmentCount.value += 1
+      matchedSegmentCount.value += 1
+    }
+    // 使预览缓存失效，强制下次重新加载
+    invalidatePreviewCache()
+    return data
+  }
+
+  async function mergeSegment(sentenceId: string, targetSentenceId: string) {
+    if (!fileRecord.value) return null
+    // 先同步未保存的修改
+    if (dirtyCount.value > 0) {
+      await syncToBackend()
+    }
+    const { data } = await http.post<{ merged: Segment; deleted_sentence_id: string }>(
+      `/file-records/${fileRecord.value.id}/segments/${sentenceId}/merge`,
+      { target_sentence_id: targetSentenceId },
+    )
+    // 更新本地 segments 列表
+    const firstIndex = getSegmentIndex(sentenceId)
+    const secondIndex = getSegmentIndex(targetSentenceId)
+    if (firstIndex !== -1) {
+      segments.value[firstIndex] = data.merged
+    }
+    if (secondIndex !== -1) {
+      segments.value.splice(secondIndex, 1)
+    }
+    rebuildSegmentIndexMap()
+    totalSegmentCount.value -= 1
+    matchedSegmentCount.value -= 1
+    // 使预览缓存失效，强制下次重新加载
+    invalidatePreviewCache()
+    return data
+  }
+
+  function invalidatePreviewCache() {
+    previewLoaded = false
+    previewCacheKey = ''
+  }
+
   return {
     fileRecord,
     segments,
@@ -1086,6 +1148,8 @@ export const useSegmentStore = defineStore('segment', () => {
     startLLMTranslation,
     abortLLM,
     downloadTranslatedFile,
+    splitSegment,
+    mergeSegment,
     resetState,
   }
 })

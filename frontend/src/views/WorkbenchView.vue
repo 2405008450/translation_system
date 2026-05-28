@@ -1334,6 +1334,138 @@ function showRibbonPlaceholder(name: string) {
   })
 }
 
+// ========== 拆分/合并句段 ==========
+
+const selectedSentenceIds = ref<Set<string>>(new Set())
+const lastSourceCaretOffset = ref<number | null>(null)
+
+// 切换激活句段时清除光标缓存
+watch(() => segmentStore.activeSentenceId, () => {
+  lastSourceCaretOffset.value = null
+})
+
+function handleSegmentClick(sentenceId: string, event: MouseEvent) {
+  if (event.ctrlKey || event.metaKey) {
+    // Ctrl+Click 多选
+    const next = new Set(selectedSentenceIds.value)
+    if (next.has(sentenceId)) {
+      next.delete(sentenceId)
+    } else {
+      next.add(sentenceId)
+    }
+    selectedSentenceIds.value = next
+  } else {
+    // 普通点击清除多选
+    selectedSentenceIds.value = new Set()
+  }
+}
+
+/**
+ * 监听原文编辑器中的光标变化，实时缓存偏移量
+ */
+function trackSourceCaretPosition() {
+  if (!segmentStore.activeSentenceId) return
+  const row = document.querySelector(`[data-sentence-id="${segmentStore.activeSentenceId}"]`)
+  if (!row) return
+  const sourceEditor = row.querySelector('.segment-row__source-editor') as HTMLElement | null
+  if (!sourceEditor) return
+
+  const selection = window.getSelection()
+  if (!selection || selection.rangeCount === 0) return
+  if (!sourceEditor.contains(selection.anchorNode)) return
+
+  const range = selection.getRangeAt(0)
+  const preCaretRange = range.cloneRange()
+  preCaretRange.selectNodeContents(sourceEditor)
+  preCaretRange.setEnd(range.startContainer, range.startOffset)
+  lastSourceCaretOffset.value = preCaretRange.toString().length
+}
+
+const canSplitSegment = computed(() => {
+  if (!activeSegment.value) return false
+  return (activeSegment.value.source_text || '').length >= 2
+})
+
+const canMergeSegment = computed(() => {
+  return selectedSentenceIds.value.size >= 2
+})
+
+async function handleSplitSegment() {
+  if (!activeSegment.value || !canSplitSegment.value) return
+
+  const caretOffset = lastSourceCaretOffset.value
+  if (caretOffset === null || caretOffset <= 0) {
+    toast.warn({ message: t('workbench.messages.splitNoCaret') })
+    return
+  }
+
+  const sourceText = activeSegment.value.source_text || ''
+  if (caretOffset >= sourceText.length) {
+    toast.warn({ message: t('workbench.messages.splitNoCaret') })
+    return
+  }
+
+  try {
+    await segmentStore.splitSegment(activeSegment.value.sentence_id, caretOffset)
+    lastSourceCaretOffset.value = null
+    // 刷新预览（如果预览面板已打开）
+    if (activeTool.value === 'source-preview' || activeTool.value === 'split-preview') {
+      await segmentStore.ensurePreviewLoaded('source')
+    } else if (activeTool.value === 'target-preview') {
+      await segmentStore.ensurePreviewLoaded('target')
+    }
+    toast.success({ message: t('workbench.messages.splitSuccess') })
+  } catch (error: any) {
+    toast.error({ message: error?.response?.data?.detail || t('workbench.messages.splitFailed') })
+  }
+}
+
+async function handleMergeSegment() {
+  if (!canMergeSegment.value) {
+    toast.warn({ message: t('workbench.messages.mergeSelectAtLeast') })
+    return
+  }
+
+  // 按当前显示顺序排列选中的句段
+  const selectedIds = selectedSentenceIds.value
+  const orderedSegments = editorSegments.value.filter((s) => selectedIds.has(s.sentence_id))
+
+  if (orderedSegments.length < 2) {
+    toast.warn({ message: t('workbench.messages.mergeSelectAtLeast') })
+    return
+  }
+
+  // 检查是否属于同一段落
+  const first = orderedSegments[0]
+  const notSameBlock = orderedSegments.some(
+    (s) =>
+      s.block_index !== first.block_index
+      || s.row_index !== first.row_index
+      || s.cell_index !== first.cell_index,
+  )
+  if (notSameBlock) {
+    toast.warn({ message: t('workbench.messages.mergeDifferentBlock') })
+    return
+  }
+
+  try {
+    const baseSentenceId = orderedSegments[0].sentence_id
+    for (let i = 1; i < orderedSegments.length; i++) {
+      await segmentStore.mergeSegment(baseSentenceId, orderedSegments[i].sentence_id)
+    }
+    selectedSentenceIds.value = new Set()
+    // 刷新预览（如果预览面板已打开）
+    if (activeTool.value === 'source-preview' || activeTool.value === 'split-preview') {
+      await segmentStore.ensurePreviewLoaded('source')
+    } else if (activeTool.value === 'target-preview') {
+      await segmentStore.ensurePreviewLoaded('target')
+    }
+    toast.success({ message: t('workbench.messages.mergeSuccess') })
+  } catch (error: any) {
+    toast.error({ message: error?.response?.data?.detail || t('workbench.messages.mergeFailed') })
+  }
+}
+
 // ========== 富文本格式化功能 ==========
 
 /**
@@ -2298,6 +2430,8 @@ function handleSelectionChange() {
   if (selection && !selection.isCollapsed) {
     richTextEditor.updateActiveFormats()
   }
+  // 追踪原文编辑器中的光标位置（用于拆分句段）
+  trackSourceCaretPosition()
 }
 
 onMounted(() => {
@@ -2596,17 +2730,17 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group">
           <span class="tool-col align-left">
-            <button class="tool-line tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.mergeSegment'))">
+            <button class="tool-line tool-button" type="button" :disabled="!canMergeSegment" @click="handleMergeSegment">
               <span class="icon-text-area">
-                <span class="tool-item disabled">
+                <span class="tool-item" :class="{ disabled: !canMergeSegment }">
                   <Combine class="tool-label-icon" :size="16" />
                   <span class="text">{{ t('workbench.ribbon.mergeSegment') }}</span>
                 </span>
               </span>
             </button>
-            <button class="tool-line tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.splitSegment'))">
+            <button class="tool-line tool-button" type="button" :disabled="!canSplitSegment" @click="handleSplitSegment">
               <span class="icon-text-area">
-                <span class="tool-item">
+                <span class="tool-item" :class="{ disabled: !canSplitSegment }">
                   <Split class="tool-label-icon" :size="16" />
                   <span class="text">{{ t('workbench.ribbon.splitSegment') }}</span>
                 </span>
@@ -3310,6 +3444,7 @@ onBeforeRouteLeave(async () => {
                     :index="getEditorSegmentDisplayIndex(item.sentence_id, index)"
                     :active="segmentStore.activeSentenceId === item.sentence_id"
                     :source-editing="sourceEditing"
+                    :selected="selectedSentenceIds.has(item.sentence_id)"
                     :pending-revision="revisionTraceVisible ? segmentStore.getRevisionTrace(item.sentence_id) : null"
                     :revision-busy="revisionActionLoading"
                     :matched-terms="segmentStore.activeSentenceId === item.sentence_id ? activeMatchedTerms : []"
@@ -3320,6 +3455,7 @@ onBeforeRouteLeave(async () => {
                     @update="updateSegmentTarget"
                     @update-source="updateSegmentSource"
                     @apply-partial-revision="handleApplyPartialRevision"
+                    @ctrl-click="handleSegmentClick"
                   />
                 </template>
               </VirtualList>

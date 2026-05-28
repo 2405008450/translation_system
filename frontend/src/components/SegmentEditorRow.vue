@@ -14,6 +14,7 @@ const props = withDefaults(defineProps<{
   active: boolean
   disabled?: boolean
   sourceEditing?: boolean
+  selected?: boolean
   pendingRevision?: SegmentRevisionEntry | null
   revisionBusy?: boolean
   matchedTerms?: TermEntryRecord[]
@@ -22,6 +23,7 @@ const props = withDefaults(defineProps<{
 }>(), {
   disabled: false,
   sourceEditing: false,
+  selected: false,
   pendingRevision: null,
   revisionBusy: false,
   matchedTerms: () => [],
@@ -43,6 +45,7 @@ const emit = defineEmits<{
   focus: [sentenceId: string]
   activateTarget: [sentenceId: string]
   applyPartialRevision: [revisionId: string, newText: string]
+  ctrlClick: [sentenceId: string, event: MouseEvent]
 }>()
 
 const editorRef = ref<HTMLDivElement | null>(null)
@@ -450,7 +453,11 @@ function handleBlur() {
   isFocused.value = false
 }
 
-function handleClick() {
+function handleClick(event?: MouseEvent) {
+  if (event && (event.ctrlKey || event.metaKey)) {
+    emit('ctrlClick', props.segment.sentence_id, event)
+    return
+  }
   emit('activateTarget', props.segment.sentence_id)
 }
 
@@ -464,8 +471,29 @@ function handleSourceBlur() {
 
 function handleSourceInput() {
   if (!sourceEditorRef.value) return
+  if (!props.sourceEditing) {
+    // 非编辑模式下恢复原文内容
+    sourceEditorRef.value.textContent = props.segment.display_text || props.segment.source_text
+    return
+  }
   const text = sourceEditorRef.value.textContent || ''
   emit('updateSource', props.segment.sentence_id, text)
+}
+
+function handleSourceBeforeInput(event: Event) {
+  if (!props.sourceEditing) {
+    event.preventDefault()
+  }
+}
+
+function handleSourceKeydown(event: KeyboardEvent) {
+  if (!props.sourceEditing) {
+    // 允许光标移动键和选择键
+    const allowedKeys = ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End']
+    if (!allowedKeys.includes(event.key) && !event.ctrlKey && !event.metaKey) {
+      event.preventDefault()
+    }
+  }
 }
 
 function handleEditorShellClick() {
@@ -704,17 +732,15 @@ function moveCursorToEnd(el: HTMLElement) {
 // 原文编辑器的当前文本（用于避免响应式干扰）
 const sourceEditText = ref('')
 
-// 监听 sourceEditing prop 变化，初始化编辑器内容并聚焦
+// 监听 active 变化，初始化原文编辑器内容（允许放置光标）
 watch(
-  () => props.sourceEditing && props.active,
-  (shouldEdit) => {
-    if (shouldEdit) {
+  () => props.active,
+  (isActive) => {
+    if (isActive) {
       sourceEditText.value = props.segment.display_text || props.segment.source_text
       nextTick(() => {
         if (sourceEditorRef.value) {
           sourceEditorRef.value.textContent = sourceEditText.value
-          sourceEditorRef.value.focus()
-          moveCursorToEnd(sourceEditorRef.value)
         }
       })
     }
@@ -722,12 +748,27 @@ watch(
   { immediate: true }
 )
 
+// 进入原文编辑模式时聚焦
+watch(
+  () => props.sourceEditing && props.active,
+  (shouldEdit) => {
+    if (shouldEdit) {
+      nextTick(() => {
+        if (sourceEditorRef.value) {
+          sourceEditorRef.value.focus()
+          moveCursorToEnd(sourceEditorRef.value)
+        }
+      })
+    }
+  },
+)
+
 </script>
 
 <template>
   <article
     class="segment-row"
-    :class="[statusClass, parityClass, { 'is-active': active, 'has-pending-revision': hasPendingRevision, 'is-empty-target': isEmptyTarget }]"
+    :class="[statusClass, parityClass, { 'is-active': active, 'is-selected': selected, 'has-pending-revision': hasPendingRevision, 'is-empty-target': isEmptyTarget }]"
     :id="`segment-${segment.sentence_id}`"
     data-testid="segment-row"
     :data-sentence-id="segment.sentence_id"
@@ -752,16 +793,18 @@ watch(
 
     <div class="segment-row__cell segment-row__cell--source" @click="handleClick">
       <div
-        v-if="sourceEditing && active"
+        v-if="active"
         ref="sourceEditorRef"
         class="segment-row__source-editor"
-        :class="{ 'is-focused': isSourceFocused }"
-        contenteditable="true"
+        :class="{ 'is-focused': isSourceFocused, 'is-readonly': !sourceEditing }"
+        :contenteditable="true"
         tabindex="0"
         spellcheck="false"
         @focus="handleSourceFocus"
         @blur="handleSourceBlur"
         @input="handleSourceInput"
+        @keydown="handleSourceKeydown"
+        @beforeinput="handleSourceBeforeInput"
       ></div>
       <div v-else class="segment-row__text">
         <template v-if="highlightedSourceText">
@@ -828,6 +871,13 @@ watch(
 </template>
 
 <style scoped>
+.segment-row.is-selected {
+  background-color: rgba(13, 122, 104, 0.12);
+  outline: 2px solid rgba(13, 122, 104, 0.45);
+  outline-offset: -2px;
+  border-radius: 4px;
+}
+
 .segment-row__cell--target.is-pending {
   box-shadow: inset 2px 0 0 rgba(0, 122, 204, 0.36);
 }
@@ -1023,6 +1073,18 @@ watch(
 .segment-row__source-editor.is-focused {
   border-color: var(--brand-700, #0d7a68);
   box-shadow: 0 0 0 3px rgba(13, 122, 104, 0.18);
+}
+
+.segment-row__source-editor.is-readonly {
+  border-color: var(--border-muted, #e2e8f0);
+  background: var(--surface-panel, #fff);
+  box-shadow: none;
+  cursor: text;
+}
+
+.segment-row__source-editor.is-readonly.is-focused {
+  border-color: var(--brand-400, #5bb5a6);
+  box-shadow: 0 0 0 2px rgba(13, 122, 104, 0.08);
 }
 
 /* 显示标记样式 */

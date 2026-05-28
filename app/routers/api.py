@@ -734,6 +734,16 @@ class BatchSegmentUpdate(BaseModel):
     updates: list[SegmentUpdate]
 
 
+class SegmentSplitRequest(BaseModel):
+    """拆分句段请求"""
+    split_offset: int = Field(..., ge=1, description="在 source_text 中的拆分位置（字符偏移）")
+
+
+class SegmentMergeRequest(BaseModel):
+    """合并句段请求"""
+    target_sentence_id: str = Field(..., description="要合并的下一个句段的 sentence_id")
+
+
 class SegmentReplaceRequest(BaseModel):
     scope: str = "all"
     source_query: str = ""
@@ -2535,6 +2545,30 @@ def _order_segment_query(query):
     )
 
 
+def _generate_split_sentence_id(original_id: str, db: Session, file_record_id: UUID) -> str:
+    """为拆分生成新的 sentence_id，使用子编号方式（如 "5" → "5.1"）。"""
+    base = original_id
+    suffix = 1
+    while True:
+        candidate = f"{base}.{suffix}"
+        exists = (
+            db.query(Segment.id)
+            .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == candidate)
+            .first()
+        )
+        if not exists:
+            return candidate
+        suffix += 1
+
+
+def _is_cjk_text(text: str) -> bool:
+    """判断文本是否主要为中日韩文字（决定合并时是否加空格）。"""
+    if not text:
+        return False
+    cjk_count = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff' or '\u3000' <= ch <= '\u303f')
+    return cjk_count > len(text) * 0.3
+
+
 def _build_preview_render_segments(segments: list[Segment], mode: str) -> list[dict]:
     if mode != "target":
         return [_serialize_workbench_segment(segment) for segment in segments]
@@ -3210,6 +3244,167 @@ def update_segment_source(
         "sentence_id": segment.sentence_id,
         "source_text": segment.source_text,
         "display_text": segment.display_text,
+    }
+
+
+@router.post("/file-records/{file_record_id}/segments/{sentence_id}/split")
+def split_segment(
+    file_record_id: UUID,
+    sentence_id: str,
+    payload: SegmentSplitRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """拆分句段：在指定偏移位置将一个句段拆为两个。"""
+    segment = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not segment:
+        raise HTTPException(status_code=404, detail="片段不存在。")
+
+    source_text = segment.source_text or ""
+    if payload.split_offset <= 0 or payload.split_offset >= len(source_text):
+        raise HTTPException(status_code=400, detail="拆分位置无效，必须在文本范围内。")
+
+    # 拆分 source_text
+    first_source = source_text[:payload.split_offset].rstrip()
+    second_source = source_text[payload.split_offset:].lstrip()
+    if not first_source or not second_source:
+        raise HTTPException(status_code=400, detail="拆分后不能产生空句段。")
+
+    # 拆分 target_text（按同比例偏移，如果有译文的话）
+    target_text = segment.target_text or ""
+    target_html = segment.target_html
+    first_target = ""
+    second_target = ""
+    if target_text.strip():
+        # 按比例估算译文拆分点
+        ratio = payload.split_offset / len(source_text)
+        target_offset = round(ratio * len(target_text))
+        first_target = target_text[:target_offset].rstrip()
+        second_target = target_text[target_offset:].lstrip()
+
+    # 生成新的 sentence_id：使用子编号方式
+    new_sentence_id = _generate_split_sentence_id(sentence_id, db, file_record_id)
+
+    # 更新原句段
+    segment.source_text = first_source
+    segment.display_text = first_source
+    segment.target_text = first_target
+    segment.target_html = None
+    segment.status = "none" if not first_target.strip() else "confirmed"
+    segment.score = 0.0
+    segment.matched_source_text = None
+    segment.matched_collection_name = None
+    segment.matched_creator_name = None
+    segment.matched_created_at = None
+    segment.matched_updated_at = None
+
+    # 创建新句段
+    new_segment = Segment(
+        file_record_id=file_record_id,
+        sentence_id=new_sentence_id,
+        source_text=second_source,
+        display_text=second_source,
+        target_text=second_target,
+        target_html=None,
+        status="none" if not second_target.strip() else "confirmed",
+        score=0.0,
+        source="manual",
+        block_type=segment.block_type,
+        block_index=segment.block_index,
+        row_index=segment.row_index,
+        cell_index=segment.cell_index,
+    )
+    db.add(new_segment)
+
+    sync_file_record_status(db, file_record_id)
+    db.commit()
+    db.refresh(segment)
+    db.refresh(new_segment)
+
+    return {
+        "first": _serialize_workbench_segment(segment),
+        "second": _serialize_workbench_segment(new_segment),
+    }
+
+
+@router.post("/file-records/{file_record_id}/segments/{sentence_id}/merge")
+def merge_segment(
+    file_record_id: UUID,
+    sentence_id: str,
+    payload: SegmentMergeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """合并句段：将当前句段与指定的下一个句段合并为一个。"""
+    first_seg = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not first_seg:
+        raise HTTPException(status_code=404, detail="片段不存在。")
+
+    second_seg = (
+        db.query(Segment)
+        .filter(
+            Segment.file_record_id == file_record_id,
+            Segment.sentence_id == payload.target_sentence_id,
+        )
+        .first()
+    )
+    if not second_seg:
+        raise HTTPException(status_code=404, detail="目标合并片段不存在。")
+
+    # 校验两个句段必须在同一个 block 中
+    if (
+        first_seg.block_index != second_seg.block_index
+        or first_seg.row_index != second_seg.row_index
+        or first_seg.cell_index != second_seg.cell_index
+    ):
+        raise HTTPException(status_code=400, detail="只能合并同一区块内相邻的句段。")
+
+    # 合并文本
+    separator = "" if _is_cjk_text(first_seg.source_text) else " "
+    merged_source = first_seg.source_text.rstrip() + separator + second_seg.source_text.lstrip()
+    merged_target = ""
+    if (first_seg.target_text or "").strip() or (second_seg.target_text or "").strip():
+        merged_target = (first_seg.target_text or "").rstrip() + separator + (second_seg.target_text or "").lstrip()
+
+    # 更新第一个句段
+    first_seg.source_text = merged_source.strip()
+    first_seg.display_text = merged_source.strip()
+    first_seg.target_text = merged_target.strip()
+    first_seg.target_html = None
+    first_seg.status = "none" if not merged_target.strip() else "confirmed"
+    first_seg.score = 0.0
+    first_seg.source = "manual"
+    first_seg.matched_source_text = None
+    first_seg.matched_collection_name = None
+    first_seg.matched_creator_name = None
+    first_seg.matched_created_at = None
+    first_seg.matched_updated_at = None
+
+    # 迁移第二个句段的评论到第一个句段
+    for comment in second_seg.comments:
+        comment.segment_id = first_seg.id
+
+    # 删除第二个句段的修订记录
+    db.query(SegmentRevision).filter(SegmentRevision.segment_id == second_seg.id).delete()
+
+    # 删除第二个句段
+    db.delete(second_seg)
+
+    sync_file_record_status(db, file_record_id)
+    db.commit()
+    db.refresh(first_seg)
+
+    return {
+        "merged": _serialize_workbench_segment(first_seg),
+        "deleted_sentence_id": payload.target_sentence_id,
     }
 
 

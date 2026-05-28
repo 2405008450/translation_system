@@ -832,6 +832,13 @@ export default {
       noSegmentsToConfirm: '没有需要确认的句段。',
       synced: '修改已同步。',
       saveToTMResult: '已保存到「{collection}」：新增 {created} 条，更新 {updated} 条，跳过 {skipped} 条。',
+      splitSuccess: '句段已拆分。',
+      splitFailed: '句段拆分失败。',
+      splitNoCaret: '请先在原文编辑模式中将光标放置在要拆分的位置。',
+      mergeSuccess: '句段已合并。',
+      mergeFailed: '句段合并失败。',
+      mergeDifferentBlock: '选中的句段属于不同段落，无法合并。',
+      mergeSelectAtLeast: '请按住 Ctrl 点击选择至少两个句段。',
     },
   },
   notes: {
