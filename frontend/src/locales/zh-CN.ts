@@ -5,6 +5,7 @@ export default {
     notSet: '未设置',
     none: '无',
     empty: '暂无数据',
+    loading: '加载中...',
     actions: {
       close: '关闭',
       cancel: '取消',

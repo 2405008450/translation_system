@@ -2486,17 +2486,39 @@ onBeforeRouteLeave(async () => {
             <FileCheck :size="15" />
             <span>{{ t('workbench.saveToTM') }}</span>
           </button>
-          <button
-            class="workbench-ribbon__top-action"
-            data-testid="workbench-export-button"
-            type="button"
-            :disabled="!segmentStore.canExport"
-            :title="exportButtonTitle"
-            @click="exportTranslatedFile"
-          >
-            <Download :size="15" />
-            <span>{{ exportButtonLabel }}</span>
-          </button>
+          <div class="export-dropdown">
+            <button
+              class="workbench-ribbon__top-action"
+              data-testid="workbench-export-button"
+              type="button"
+              :disabled="!segmentStore.canExport"
+              :title="exportButtonTitle"
+              @click="toggleExportMenu"
+            >
+              <Download :size="15" />
+              <span>{{ exportButtonLabel }}</span>
+              <ChevronDown :size="12" />
+            </button>
+            <div v-if="showExportMenu" class="export-dropdown__menu">
+              <div v-if="loadingExportOptions" class="export-dropdown__loading">
+                <Loader2 class="lucide-spin" :size="14" />
+                <span>{{ t('common.loading') }}</span>
+              </div>
+              <template v-else>
+                <button
+                  v-for="option in exportOptions"
+                  :key="option.id"
+                  type="button"
+                  class="export-dropdown__item"
+                  :disabled="exporting"
+                  @click="exportWithType(option.id)"
+                >
+                  <span class="export-dropdown__item-name">{{ option.name }}</span>
+                  <span class="export-dropdown__item-desc">{{ option.description }}</span>
+                </button>
+              </template>
+            </div>
+          </div>
         </div>
         <button
           class="workbench-ribbon__help"
@@ -3035,17 +3057,39 @@ onBeforeRouteLeave(async () => {
             {{ segmentStore.saving ? t('common.actions.saving') : t('workbench.saveNow') }}
           </button>
 
-          <button
-            class="button workbench-action workbench-action--export"
-            data-testid="workbench-export-button"
-            type="button"
-            :disabled="!segmentStore.canExport"
-            :title="exportButtonTitle"
-            @click="exportTranslatedFile"
-          >
-            <Download :size="14" />
-            {{ exportButtonLabel }}
-          </button>
+          <div class="export-dropdown export-dropdown--toolbar">
+            <button
+              class="button workbench-action workbench-action--export"
+              data-testid="workbench-export-button-toolbar"
+              type="button"
+              :disabled="!segmentStore.canExport"
+              :title="exportButtonTitle"
+              @click="toggleExportMenu"
+            >
+              <Download :size="14" />
+              {{ exportButtonLabel }}
+              <ChevronDown :size="12" />
+            </button>
+            <div v-if="showExportMenu" class="export-dropdown__menu">
+              <div v-if="loadingExportOptions" class="export-dropdown__loading">
+                <Loader2 class="lucide-spin" :size="14" />
+                <span>{{ t('common.loading') }}</span>
+              </div>
+              <template v-else>
+                <button
+                  v-for="option in exportOptions"
+                  :key="option.id"
+                  type="button"
+                  class="export-dropdown__item"
+                  :disabled="exporting"
+                  @click="exportWithType(option.id)"
+                >
+                  <span class="export-dropdown__item-name">{{ option.name }}</span>
+                  <span class="export-dropdown__item-desc">{{ option.description }}</span>
+                </button>
+              </template>
+            </div>
+          </div>
 
           <button
             class="button workbench-action"
@@ -5703,6 +5747,90 @@ onBeforeRouteLeave(async () => {
   display: flex;
   gap: 2px;
   flex-wrap: wrap;
+}
+
+/* 导出下拉菜单 */
+.export-dropdown {
+  position: relative;
+}
+
+.export-dropdown .workbench-ribbon__top-action {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.export-dropdown__menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 100;
+  min-width: 240px;
+  padding: 4px;
+  border: 1px solid #e0e4e7;
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+.export-dropdown__loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px;
+  color: #6b7c85;
+  font-size: 13px;
+}
+
+.export-dropdown__item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.12s ease;
+}
+
+.export-dropdown__item:hover {
+  background: rgba(13, 122, 104, 0.08);
+}
+
+.export-dropdown__item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.export-dropdown__item-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: #2c3e50;
+}
+
+.export-dropdown__item-desc {
+  font-size: 11px;
+  color: #6b7c85;
+  margin-top: 2px;
+}
+
+.export-dropdown--toolbar {
+  display: inline-block;
+}
+
+.export-dropdown--toolbar .workbench-action--export {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.export-dropdown--toolbar .export-dropdown__menu {
+  left: 0;
+  right: auto;
 }
 </style>
 
