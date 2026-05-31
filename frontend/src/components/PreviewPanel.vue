@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import type { CommentAnchorDraft, SegmentComment } from '../types/api'
+import { buildTargetPreviewTextMap } from '../utils/targetTextSpacing'
 import FloatingCommentButton from './FloatingCommentButton.vue'
 
 interface PreviewSegment {
@@ -9,6 +10,10 @@ interface PreviewSegment {
   source_text: string
   display_text?: string | null
   target_text?: string | null
+  block_type?: string | null
+  block_index?: number | null
+  row_index?: number | null
+  cell_index?: number | null
 }
 
 const props = withDefaults(defineProps<{
@@ -114,10 +119,6 @@ function rebuildSentenceNodeMap(container: HTMLElement) {
       sentenceNodeMap.set(sentenceId, node)
     }
   }
-}
-
-function resolveSegmentPreviewText(segment: PreviewSegment) {
-  return segment.target_text || segment.display_text || segment.source_text || ''
 }
 
 function resolveCommentRange(text: string, comment: SegmentComment) {
@@ -283,8 +284,9 @@ function applyTargetSentenceTexts(force = false) {
     return
   }
 
+  const targetTextMap = buildTargetPreviewTextMap(props.segments)
   for (const segment of props.segments) {
-    applySentenceText(segment.sentence_id, resolveSegmentPreviewText(segment), force)
+    applySentenceText(segment.sentence_id, targetTextMap.get(segment.sentence_id) || '', force)
   }
 }
 

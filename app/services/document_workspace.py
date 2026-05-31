@@ -68,8 +68,9 @@ CELL_NEXT_PARAGRAPH_MAX_CHARS = 50
 CELL_GROUP_MAX_CHARS = 200
 CELL_PARAGRAPH_BREAK_SENTINEL = "\uE000"
 PAGE_BREAK_SENTINEL = "\uE001"
+PAGE_BREAK_HTML = '<span class="doc-page-break" aria-hidden="true"></span>'
 DOCX_PARSE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
-DOCX_PARSE_CACHE_VERSION = "4"
+DOCX_PARSE_CACHE_VERSION = "6"
 DOCUMENT_PARSE_MODE_FULL = "full"
 DOCUMENT_PARSE_MODE_BODY_ONLY = "body_only"
 SUPPORTED_DOCUMENT_PARSE_MODES = {
@@ -81,6 +82,7 @@ DEFAULT_DOCUMENT_PARSE_OPTIONS = {
     "include_footnotes_endnotes": True,
     "include_comments": True,
     "clean_format": False,
+    "preserve_hyperlinks": True,
     "translate_code_blocks": True,
     "extract_links": False,
     "skip_non_translatable": True,
@@ -137,6 +139,11 @@ class InlineFragment:
 CELL_PARAGRAPH_BREAK_FRAGMENT = InlineFragment(
     display_text="\n",
     source_text=CELL_PARAGRAPH_BREAK_SENTINEL,
+)
+PAGE_BREAK_FRAGMENT = InlineFragment(
+    display_text="\n",
+    source_text=PAGE_BREAK_SENTINEL,
+    render_html=PAGE_BREAK_HTML,
 )
 
 
@@ -965,7 +972,9 @@ def _render_block(
 def _normalize_segment_source_text(text: str) -> str:
     if not text:
         return ""
-    return normalize_text(text.replace(CELL_PARAGRAPH_BREAK_SENTINEL, ""))
+    return normalize_text(
+        text.replace(CELL_PARAGRAPH_BREAK_SENTINEL, "").replace(PAGE_BREAK_SENTINEL, "")
+    )
 
 
 def _build_paragraph_classes(story_kind: str, block_type: str) -> list[str]:
@@ -1389,7 +1398,7 @@ def _split_fragments_on_page_breaks(fragments: list[InlineFragment]) -> list[lis
 
 
 def _build_page_break_html() -> str:
-    return '<div class="doc-page-break" aria-hidden="true"></div>'
+    return PAGE_BREAK_HTML
 
 
 def _paragraph_starts_new_page(paragraph: ET.Element) -> bool:
@@ -1672,7 +1681,7 @@ def _collect_inline_content(
             parse_state.suppressed_page_number_field = True
             return [], [], []
 
-    if node.tag == _qn("w", "hyperlink"):
+    if node.tag == _qn("w", "hyperlink") and story.parse_options.get("preserve_hyperlinks", True):
         hyperlink = _resolve_hyperlink_target(node, story.rels) or hyperlink
 
     if node.tag == _qn("w", "r"):
@@ -1711,12 +1720,12 @@ def _collect_inline_content(
         return [InlineFragment(display_text="\t", source_text="\t", css=inherited_css, href=hyperlink)], [], []
 
     if node.tag == _qn("w", "lastRenderedPageBreak"):
-        return [InlineFragment(display_text=PAGE_BREAK_SENTINEL, source_text=PAGE_BREAK_SENTINEL)], [], []
+        return [PAGE_BREAK_FRAGMENT], [], []
 
     if node.tag in {_qn("w", "br"), _qn("w", "cr")}:
         break_type = node.get(_qn("w", "type"))
         if break_type == "page":
-            return [InlineFragment(display_text=PAGE_BREAK_SENTINEL, source_text=PAGE_BREAK_SENTINEL)], [], []
+            return [PAGE_BREAK_FRAGMENT], [], []
         return [InlineFragment(display_text="\n", source_text="\n", css=inherited_css, href=hyperlink)], [], []
 
     if node.tag == _qn("w", "noBreakHyphen"):

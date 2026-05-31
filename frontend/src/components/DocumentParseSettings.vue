@@ -30,6 +30,7 @@ const optionDefaults: DocumentParseOptions = {
   include_footnotes_endnotes: true,
   include_comments: true,
   clean_format: false,
+  preserve_hyperlinks: true,
   translate_code_blocks: true,
   extract_links: false,
   skip_non_translatable: true,

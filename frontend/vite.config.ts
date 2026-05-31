@@ -6,13 +6,13 @@ const projectRoot = fileURLToPath(new URL('.', import.meta.url))
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, projectRoot, '')
-  const apiProxyTarget = env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:19013'
+  const apiProxyTarget = env.VITE_API_PROXY_TARGET || 'http://0.0.0.0:19013'
 
   return {
     root: projectRoot,
     plugins: [vue()],
     server: {
-      host: '127.0.0.1',
+      host: '0.0.0.0',
       port: 5173,
       proxy: {
         '/api': {

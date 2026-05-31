@@ -89,6 +89,7 @@ export interface DocumentParseOptions {
   include_footnotes_endnotes: boolean
   include_comments: boolean
   clean_format: boolean
+  preserve_hyperlinks: boolean
   translate_code_blocks: boolean
   extract_links: boolean
   skip_non_translatable: boolean

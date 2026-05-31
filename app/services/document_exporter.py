@@ -48,6 +48,8 @@ XML_SPACE_ATTR = "{http://www.w3.org/XML/1998/namespace}space"
 EXPORT_FONT_FAMILY = "Times New Roman"
 BlockKey = tuple[str, int, int | None, int | None]
 MATH_PLACEHOLDER_RE = re.compile(r"⟦MATH_\d+⟧|\[\[MATH_\d+\]\]")
+ENGLISH_BOUNDARY_TRAILING_RE = re.compile(r"[,;:.!?][\"')\]\}]*$")
+ENGLISH_WORD_LEADING_RE = re.compile(r"^[\"'“‘(\[]*[A-Za-z0-9]")
 
 
 @dataclass(frozen=True)
@@ -72,6 +74,7 @@ class TextToken:
     edits: list[tuple[int, int, str]] = field(default_factory=list)
     apply_export_font: bool = False
     is_math: bool = False
+    is_hyperlink: bool = False
 
 
 @dataclass(frozen=True)
@@ -120,6 +123,8 @@ def export_translated_docx(
     _localize_numbering_definitions(package)
     if document_parse_options.get("clean_format"):
         _clean_story_formatting(stories)
+    if not document_parse_options.get("preserve_hyperlinks", True):
+        _strip_story_hyperlinks(stories)
 
     return _build_modified_docx(
         raw_bytes=raw_bytes,
@@ -432,6 +437,7 @@ def _collect_inline_tokens(
     current_run_container: ET.Element | None = None,
     parent_element: ET.Element | None = None,
     math_placeholder_counter: list[int] | None = None,
+    inside_hyperlink: bool = False,
 ) -> list[TextToken]:
     placeholder_counter = math_placeholder_counter if math_placeholder_counter is not None else [0]
     if node.tag in OMML_ATOMIC_TAGS:
@@ -465,7 +471,11 @@ def _collect_inline_tokens(
             current_run_container=current_run_container,
             parent_element=parent_element,
             math_placeholder_counter=placeholder_counter,
+            inside_hyperlink=inside_hyperlink,
         )
+
+    if node.tag == _qn("w", "hyperlink") and story.parse_options.get("preserve_hyperlinks", True):
+        inside_hyperlink = True
 
     if node.tag == _qn("w", "r"):
         current_run = node
@@ -479,9 +489,10 @@ def _collect_inline_tokens(
                 source_text=text_value,
                 element=node,
                 run_element=current_run,
-                anchor_element=current_run or node,
-                container_element=current_run_container or parent_element,
+                anchor_element=current_run if current_run is not None else node,
+                container_element=current_run_container if current_run_container is not None else parent_element,
                 original_text=text_value,
+                is_hyperlink=inside_hyperlink,
             )
         ]
 
@@ -531,6 +542,7 @@ def _collect_inline_tokens(
                 current_run_container=current_run_container,
                 parent_element=node,
                 math_placeholder_counter=placeholder_counter,
+                inside_hyperlink=inside_hyperlink,
             )
         )
 
@@ -607,6 +619,8 @@ def _replace_block_tokens(
         spans = [_build_trimmed_span(display_text)]
 
     segment_index = 0
+    previous_replacement = ""
+    previous_span: SentenceSpan | None = None
     for span in spans:
         sentence_source = _normalize_segment_source_text(_collect_span_text(tokens, span, use_source=True))
         if not sentence_source:
@@ -618,7 +632,16 @@ def _replace_block_tokens(
         segment = segments[segment_index]
         segment_index += 1
         replacement = segment.target_text
+        if previous_span is not None:
+            boundary_text = display_text[previous_span.end:span.start]
+            replacement = _normalize_adjacent_english_target_boundary(
+                previous_replacement=previous_replacement,
+                current_replacement=replacement,
+                boundary_text=boundary_text,
+            )
         if not normalize_text(replacement):
+            previous_replacement = ""
+            previous_span = span
             continue
 
         expected_math_placeholders = _extract_math_placeholders_from_tokens(tokens, span)
@@ -632,7 +655,37 @@ def _replace_block_tokens(
         else:
             _queue_sentence_replacement(tokens, span, replacement)
 
+        previous_replacement = replacement
+        previous_span = span
+
     _apply_token_edits(tokens)
+
+
+def _normalize_adjacent_english_target_boundary(
+    previous_replacement: str,
+    current_replacement: str,
+    boundary_text: str,
+) -> str:
+    if not _should_insert_english_boundary_space(previous_replacement, current_replacement, boundary_text):
+        return current_replacement
+    return f" {current_replacement}"
+
+
+def _should_insert_english_boundary_space(
+    previous_replacement: str,
+    current_replacement: str,
+    boundary_text: str,
+) -> bool:
+    if not previous_replacement or not current_replacement:
+        return False
+    if previous_replacement[-1].isspace() or current_replacement[0].isspace():
+        return False
+    if any(char.isspace() for char in boundary_text):
+        return False
+    return bool(
+        ENGLISH_BOUNDARY_TRAILING_RE.search(previous_replacement)
+        and ENGLISH_WORD_LEADING_RE.match(current_replacement)
+    )
 
 
 def _extract_math_placeholders_from_tokens(
@@ -730,12 +783,21 @@ def _queue_text_range_edit(
     writable_overlaps: list[tuple[TextToken, int, int]],
     replacement_text: str,
 ) -> None:
-    first_token, first_start, first_end = writable_overlaps[0]
-    first_token.edits.append((first_start, first_end, replacement_text))
-    first_token.apply_export_font = True
+    if not writable_overlaps:
+        return
 
-    for token, local_start, local_end in writable_overlaps[1:]:
-        token.edits.append((local_start, local_end, ""))
+    replacement_index = 0
+    for index, (token, _, _) in enumerate(writable_overlaps):
+        if token.is_hyperlink:
+            replacement_index = index
+            break
+
+    for index, (token, local_start, local_end) in enumerate(writable_overlaps):
+        if index == replacement_index:
+            token.edits.append((local_start, local_end, replacement_text))
+            token.apply_export_font = bool(replacement_text)
+        else:
+            token.edits.append((local_start, local_end, ""))
 
 
 def _insert_text_run_between_tokens(
@@ -842,15 +904,7 @@ def _queue_sentence_replacement(
             (token, overlap_start - token.start, overlap_end - token.start)
         )
 
-    if not writable_overlaps:
-        return
-
-    first_token, first_start, first_end = writable_overlaps[0]
-    first_token.edits.append((first_start, first_end, replacement))
-    first_token.apply_export_font = True
-
-    for token, local_start, local_end in writable_overlaps[1:]:
-        token.edits.append((local_start, local_end, ""))
+    _queue_text_range_edit(writable_overlaps, replacement)
 
 
 def _apply_token_edits(tokens: list[TextToken]) -> None:
@@ -1083,6 +1137,23 @@ FORMATTING_ELEMENT_NAMES = {
 def _clean_story_formatting(stories: Iterable[StoryPart]) -> None:
     for story in stories:
         _remove_formatting_elements(story.root)
+
+
+def _strip_story_hyperlinks(stories: Iterable[StoryPart]) -> None:
+    for story in stories:
+        _unwrap_hyperlink_elements(story.root)
+
+
+def _unwrap_hyperlink_elements(node: ET.Element) -> None:
+    for child in list(node):
+        _unwrap_hyperlink_elements(child)
+        if child.tag != _qn("w", "hyperlink"):
+            continue
+
+        index = list(node).index(child)
+        node.remove(child)
+        for offset, grandchild in enumerate(list(child)):
+            node.insert(index + offset, grandchild)
 
 
 def _remove_formatting_elements(node: ET.Element) -> None:

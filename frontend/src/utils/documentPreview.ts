@@ -1,4 +1,5 @@
 import type { Segment } from '../types/api'
+import { buildTargetPreviewTextMap, resolveTargetPreviewText } from './targetTextSpacing'
 
 function escapeHtml(value: string) {
   return value
@@ -30,6 +31,7 @@ export function buildDocumentPreviewHtml(
   let currentParagraphKey = ''
   let currentTableIndex: number | null = null
   let tableRows: string[][][] = []
+  const targetTextMap = mode === 'target' ? buildTargetPreviewTextMap(segments) : new Map<string, string>()
 
   function flushParagraph() {
     if (paragraphBuffer.length) {
@@ -68,7 +70,7 @@ export function buildDocumentPreviewHtml(
     const blockType = segment.block_type || 'paragraph'
     const sentenceId = segment.sentence_id || ''
     const text = mode === 'target'
-      ? (segment.target_text || segment.display_text || segment.source_text || '')
+      ? (targetTextMap.get(sentenceId) ?? resolveTargetPreviewText(segment))
       : (segment.display_text || segment.source_text || '')
     const sentenceHtml = renderSentence(sentenceId, text)
 

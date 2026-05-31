@@ -1,16 +1,6 @@
 import type { Segment } from '../types/api'
 import { buildDocumentPreviewHtml } from './documentPreview'
-
-function buildTargetMap(segments: Segment[]) {
-  const targetMap = new Map<string, string>()
-  for (const segment of segments) {
-    targetMap.set(
-      segment.sentence_id,
-      segment.target_text || segment.display_text || segment.source_text || '',
-    )
-  }
-  return targetMap
-}
+import { buildTargetPreviewTextMap } from './targetTextSpacing'
 
 export function renderTargetPreview(sourceHtml: string, segments: Segment[]) {
   const fallbackHtml = buildDocumentPreviewHtml(segments, 'target')
@@ -25,7 +15,7 @@ export function renderTargetPreview(sourceHtml: string, segments: Segment[]) {
     return fallbackHtml
   }
 
-  const targetMap = buildTargetMap(segments)
+  const targetMap = buildTargetPreviewTextMap(segments)
   const sentenceNodes = root.querySelectorAll<HTMLElement>('.doc-sentence[data-sentence-id]')
 
   sentenceNodes.forEach((node) => {

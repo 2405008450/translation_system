@@ -92,6 +92,7 @@ _UPLOAD_CAPABILITY_SPECS = (
             "页眉页脚、脚注尾注",
             "文本框、编号、数学公式占位",
             "Word 批注",
+            "默认保留超链接",
         ),
         "settings": (
             {
@@ -113,6 +114,12 @@ _UPLOAD_CAPABILITY_SPECS = (
                 "id": "clean_format",
                 "label": "清洗格式",
                 "default": False,
+            },
+            {
+                "id": "preserve_hyperlinks",
+                "label": "保留超链接",
+                "default": True,
+                "description": "关闭后导出 Word 时会去除超链接，仅保留文本内容。",
             },
         ),
     },
