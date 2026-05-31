@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID
@@ -42,6 +43,21 @@ SEGMENT_ORDERING = (
 )
 
 _PENDING_SOURCE_FILES_KEY = "pending_source_files"
+
+
+@dataclass
+class SegmentUpdateConflict:
+    sentence_id: str
+    current_version: int
+    attempted_version: int | None
+    current_target_text: str
+
+
+@dataclass
+class SegmentBatchUpdateResult:
+    updated_count: int
+    updated_segments: list[Segment]
+    conflicts: list[SegmentUpdateConflict]
 
 
 @event.listens_for(Session, "after_commit")
@@ -711,6 +727,7 @@ def update_segment_target(
     before_text = segment.target_text
     segment.target_text = target_text
     segment.source = source
+    segment.version = int(segment.version or 1) + 1
     segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
     if source == "llm":
         segment.llm_provider = llm_provider
@@ -767,6 +784,7 @@ def update_segment_by_sentence_id(
     before_text = segment.target_text
     segment.target_text = target_text
     segment.source = source
+    segment.version = int(segment.version or 1) + 1
     segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
     if source == "llm":
         segment.llm_provider = llm_provider
@@ -827,7 +845,9 @@ def batch_update_segments(
     file_record_id: UUID,
     updates: list[dict],
     current_user: User | None = None,
-) -> int:
+    *,
+    return_result: bool = False,
+) -> int | SegmentBatchUpdateResult:
     updates_by_sentence_id: dict[str, dict] = {}
     for item in updates:
         sentence_id = item.get("sentence_id")
@@ -835,7 +855,8 @@ def batch_update_segments(
             updates_by_sentence_id[sentence_id] = item
 
     if not updates_by_sentence_id:
-        return 0
+        empty_result = SegmentBatchUpdateResult(updated_count=0, updated_segments=[], conflicts=[])
+        return empty_result if return_result else 0
 
     segments = (
         db.query(Segment)
@@ -846,10 +867,25 @@ def batch_update_segments(
         .all()
     )
 
-    updated_count = 0
+    updated_segments: list[Segment] = []
+    conflicts: list[SegmentUpdateConflict] = []
     for segment in segments:
         item = updates_by_sentence_id.get(segment.sentence_id)
         if item is None:
+            continue
+
+        base_version = item.get("base_version")
+        attempted_version = int(base_version) if base_version is not None else None
+        current_version = int(segment.version or 1)
+        if attempted_version is not None and attempted_version != current_version:
+            conflicts.append(
+                SegmentUpdateConflict(
+                    sentence_id=segment.sentence_id,
+                    current_version=current_version,
+                    attempted_version=attempted_version,
+                    current_target_text=segment.target_text or "",
+                )
+            )
             continue
 
         before_text = segment.target_text
@@ -858,6 +894,7 @@ def batch_update_segments(
         track_revision = bool(item.get("track_revision", True))
         segment.target_text = target_text
         segment.source = source
+        segment.version = current_version + 1
         segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
         if source == "llm":
             segment.llm_provider = item.get("llm_provider")
@@ -885,13 +922,19 @@ def batch_update_segments(
             source=source,
             current_user=current_user,
         )
-        updated_count += 1
+        updated_segments.append(segment)
 
+    updated_count = len(updated_segments)
     if updated_count > 0:
         sync_file_record_status(db, file_record_id)
 
     db.commit()
-    return updated_count
+    result = SegmentBatchUpdateResult(
+        updated_count=updated_count,
+        updated_segments=updated_segments,
+        conflicts=conflicts,
+    )
+    return result if return_result else updated_count
 
 
 def delete_file_record(db: Session, file_record_id: UUID) -> bool:

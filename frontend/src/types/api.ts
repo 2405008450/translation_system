@@ -188,6 +188,7 @@ export interface Segment {
   display_text: string
   target_text: string
   status: string
+  version: number
   score: number
   matched_source_text: string | null
   matched_collection_name: string | null
@@ -201,6 +202,7 @@ export interface Segment {
   block_index: number
   row_index?: number | null
   cell_index?: number | null
+  updated_at: string | null
 }
 
 export interface FileRecordDetail {
@@ -225,6 +227,7 @@ export interface FileRecordDetail {
   translation_guidelines: string
   created_at: string
   updated_at: string
+  server_time?: string
   total_segments: number
   skip: number
   limit: number
@@ -261,6 +264,7 @@ export interface SegmentPageResponse {
   skip: number
   limit: number
   filters: SegmentPageFilters
+  server_time?: string
   segments: Segment[]
 }
 
@@ -524,6 +528,7 @@ export interface SegmentUpdatePayload {
   target_text: string
   source: string
   track_revision?: boolean
+  base_version?: number | null
 }
 
 export interface SegmentRevisionEntry {

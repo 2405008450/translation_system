@@ -47,6 +47,11 @@ from app.services.adapters import (
     get_registry,
 )
 from app.services.analytics_service import get_dashboard_payload, run_analytics_backfill_once
+from app.services.auto_tm_sync import (
+    AutoTMEnqueueSummary,
+    enqueue_confirmed_segments_for_auto_tm,
+    run_auto_tm_background_once,
+)
 from app.services.adapters.dita_exporter import DitaExporter
 from app.services.adapters.svg_exporter import SvgExporter
 from app.services.adapters.tmx_exporter import TmxExporter
@@ -165,6 +170,7 @@ from app.services.tm_importer import (
     preview_sdltm_metadata,
 )
 from app.services.tm_vector import sync_tm_embeddings
+from app.services.translation_memory_service import TMUpsertEntry, batch_upsert_tm_entries
 from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_response
 
 try:
@@ -764,6 +770,7 @@ class SegmentUpdate(BaseModel):
     target_text: str
     source: str = "manual"
     track_revision: bool = True
+    base_version: int | None = None
 
 
 class BatchSegmentUpdate(BaseModel):
@@ -2640,6 +2647,7 @@ def _serialize_workbench_segment(seg: Segment, display_index: int | None = None)
         "display_text": seg.display_text,
         "target_text": seg.target_text,
         "status": seg.status,
+        "version": int(seg.version or 1),
         "score": seg.score,
         "matched_source_text": seg.matched_source_text,
         "matched_collection_name": seg.matched_collection_name,
@@ -2653,10 +2661,32 @@ def _serialize_workbench_segment(seg: Segment, display_index: int | None = None)
         "block_index": seg.block_index,
         "row_index": seg.row_index,
         "cell_index": seg.cell_index,
+        "updated_at": seg.updated_at.isoformat() if seg.updated_at else None,
     }
     if display_index is not None:
         payload["display_index"] = display_index
     return payload
+
+
+def _serialize_segment_update_conflict(conflict) -> dict:
+    return {
+        "sentence_id": conflict.sentence_id,
+        "current_version": conflict.current_version,
+        "attempted_version": conflict.attempted_version,
+        "current_target_text": conflict.current_target_text,
+    }
+
+
+def _empty_auto_tm_summary() -> AutoTMEnqueueSummary:
+    return AutoTMEnqueueSummary()
+
+
+def _schedule_auto_tm_processing(
+    background_tasks: BackgroundTasks | None,
+    summary: AutoTMEnqueueSummary,
+) -> None:
+    if background_tasks is not None and summary.queued_count > 0:
+        background_tasks.add_task(run_auto_tm_background_once)
 
 
 def _resolve_unconfirmed_segment_status(segment: Segment) -> str:
@@ -2901,6 +2931,7 @@ def get_file_record(
         "translation_guidelines": project_guidelines,
         "created_at": file_record.created_at.isoformat(),
         "updated_at": file_record.updated_at.isoformat(),
+        "server_time": datetime.utcnow().isoformat(),
         "total_segments": result["total_segments"],
         "skip": result["skip"],
         "limit": result["limit"],
@@ -3029,9 +3060,47 @@ def get_file_record_segments(
             "target_query": target_query or "",
             "search_fuzzy": search_fuzzy,
         },
+        "server_time": datetime.utcnow().isoformat(),
         "segments": [
             _serialize_workbench_segment(seg, display_index=display_index_map.get(seg.id))
             for seg in page_segments
+        ],
+    }
+
+
+@router.get("/file-records/{file_record_id}/segments/changes")
+def get_file_record_segment_changes(
+    file_record_id: UUID,
+    since: str,
+    limit: int = 500,
+    db: Session = Depends(get_db),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文件不存在。")
+
+    try:
+        since_dt = datetime.fromisoformat(since.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="since 参数不是有效时间。") from exc
+
+    safe_limit = _normalize_segment_page_limit(limit)
+    changed_segments = (
+        _order_segment_query(
+            db.query(Segment).filter(
+                Segment.file_record_id == file_record_id,
+                Segment.updated_at > since_dt,
+            )
+        )
+        .limit(safe_limit)
+        .all()
+    )
+    return {
+        "file_record_id": str(file_record_id),
+        "server_time": datetime.utcnow().isoformat(),
+        "segments": [
+            _serialize_workbench_segment(segment)
+            for segment in changed_segments
         ],
     }
 
@@ -3275,6 +3344,7 @@ def rematch_file_record(
             segment.matched_updated_at,
         )
         if before != after:
+            segment.version = int(segment.version or 1) + 1
             updated_count += 1
 
     # 保留当前文档绑定的记忆库，供右侧匹配面板查询 TM 候选。
@@ -3510,12 +3580,36 @@ def update_segment(
     file_record_id: UUID,
     sentence_id: str,
     update: SegmentUpdate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """更新单个片段的译文"""
-    _require_file_record_write_access(db, file_record_id, operation_token)
+    file_record = _require_file_record_write_access(db, file_record_id, operation_token)
+    if update.base_version is not None:
+        current_segment = (
+            db.query(Segment)
+            .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+            .first()
+        )
+        if not current_segment:
+            raise HTTPException(status_code=404, detail="片段不存在。")
+        current_version = int(current_segment.version or 1)
+        if current_version != update.base_version:
+            return {
+                "updated_count": 0,
+                "conflicts": [
+                    {
+                        "sentence_id": current_segment.sentence_id,
+                        "current_version": current_version,
+                        "attempted_version": update.base_version,
+                        "current_target_text": current_segment.target_text or "",
+                    }
+                ],
+                "auto_tm": _empty_auto_tm_summary().to_dict(),
+                "segments": [_serialize_workbench_segment(current_segment)],
+            }
     segment = update_segment_by_sentence_id(
         db=db,
         file_record_id=file_record_id,
@@ -3528,12 +3622,30 @@ def update_segment(
     if not segment:
         raise HTTPException(status_code=404, detail="片段不存在。")
 
+    auto_tm_summary = _empty_auto_tm_summary()
+    if segment.status == "confirmed":
+        auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(
+            db,
+            file_record=file_record,
+            segments=[segment],
+            current_user=current_user,
+        )
+        if auto_tm_summary.queued_count > 0:
+            db.commit()
+            _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+
     return {
         "id": segment.id,
         "sentence_id": segment.sentence_id,
         "target_text": segment.target_text,
         "status": segment.status,
         "source": segment.source,
+        "version": int(segment.version or 1),
+        "updated_at": segment.updated_at.isoformat() if segment.updated_at else None,
+        "auto_tm": auto_tm_summary.to_dict(),
+        "updated_count": 1,
+        "conflicts": [],
+        "segments": [_serialize_workbench_segment(segment)],
     }
 
 
@@ -3542,19 +3654,35 @@ def update_segment(
 def batch_update(
     file_record_id: UUID,
     batch: BatchSegmentUpdate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """批量更新片段译文"""
-    _require_file_record_write_access(db, file_record_id, operation_token)
-    updated_count = batch_update_segments(
+    file_record = _require_file_record_write_access(db, file_record_id, operation_token)
+    result = batch_update_segments(
         db=db,
         file_record_id=file_record_id,
         updates=[u.model_dump() for u in batch.updates],
         current_user=current_user,
+        return_result=True,
     )
-    return {"updated_count": updated_count}
+    auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(
+        db,
+        file_record=file_record,
+        segments=result.updated_segments,
+        current_user=current_user,
+    )
+    if auto_tm_summary.queued_count > 0:
+        db.commit()
+        _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+    return {
+        "updated_count": result.updated_count,
+        "conflicts": [_serialize_segment_update_conflict(conflict) for conflict in result.conflicts],
+        "auto_tm": auto_tm_summary.to_dict(),
+        "segments": [_serialize_workbench_segment(segment) for segment in result.updated_segments],
+    }
 
 
 @router.post("/file-records/{file_record_id}/segments/confirmation")
@@ -3562,12 +3690,13 @@ def batch_update(
 def batch_update_segment_confirmation(
     file_record_id: UUID,
     payload: SegmentConfirmationBatchUpdate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """批量确认或取消确认当前文件的全部句段。"""
-    _require_file_record_write_access(db, file_record_id, operation_token)
+    file_record = _require_file_record_write_access(db, file_record_id, operation_token)
 
     if payload.action == "confirm":
         segments = (
@@ -3583,6 +3712,7 @@ def batch_update_segment_confirmation(
         for segment in segments:
             if segment.status != next_status:
                 segment.status = next_status
+                segment.version = int(segment.version or 1) + 1
                 updated_count += 1
     else:
         segments = (
@@ -3595,12 +3725,23 @@ def batch_update_segment_confirmation(
             next_status = _resolve_unconfirmed_segment_status(segment)
             if segment.status != next_status:
                 segment.status = next_status
+                segment.version = int(segment.version or 1) + 1
                 updated_count += 1
+
+    auto_tm_summary = _empty_auto_tm_summary()
+    if payload.action == "confirm" and updated_count:
+        auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(
+            db,
+            file_record=file_record,
+            segments=segments,
+            current_user=current_user,
+        )
 
     if updated_count:
         db.commit()
+        _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
 
-    return {"updated_count": updated_count}
+    return {"updated_count": updated_count, "auto_tm": auto_tm_summary.to_dict()}
 
 
 @router.post("/file-records/{file_record_id}/segments/replace")
@@ -3705,7 +3846,7 @@ def save_file_record_segments_to_tm(
     file_record_id: UUID,
     payload: SaveToTMRequest,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
@@ -3725,11 +3866,8 @@ def save_file_record_segments_to_tm(
         raise HTTPException(status_code=400, detail="不支持的记忆库保存方式。")
 
     segments = list_segments_for_file_record(db, file_record_id)
-    created_count = 0
-    updated_count = 0
     skipped_count = 0
     save_rows: list[tuple[str, str]] = []
-    sync_candidates: list[MemoryEntry] = []
 
     for segment in segments:
         if payload.scope == "confirmed" and segment.status != "confirmed":
@@ -3760,47 +3898,32 @@ def save_file_record_segments_to_tm(
         db.flush()
         created_collection = True
 
-    for source_text, target_text in save_rows:
-        if collection is None:
-            skipped_count += 1
-            continue
-
-        upsert_action, memory_entry = _upsert_tm_entry(
-            db=db,
-            source_text=source_text,
-            target_text=target_text,
-            collection_id=collection.id,
-            source_language=source_language,
-            target_language=target_language,
+    if collection is None:
+        skipped_count += len(save_rows)
+        upsert_summary = None
+    else:
+        upsert_summary = batch_upsert_tm_entries(
+            db,
+            [
+                TMUpsertEntry(
+                    collection_id=collection.id,
+                    source_text=source_text,
+                    target_text=target_text,
+                    source_language=source_language,
+                    target_language=target_language,
+                    creator_id=current_user.id,
+                )
+                for source_text, target_text in save_rows
+            ],
         )
-        if upsert_action == "created":
-            created_count += 1
-        elif upsert_action == "updated":
-            updated_count += 1
-        else:
-            skipped_count += 1
+        skipped_count += upsert_summary.skipped_count
 
-        if memory_entry is not None:
-            sync_candidates.append(memory_entry)
-
-    sync_rows: list[tuple[UUID, str]] = []
-    should_commit = (
-        bool(sync_candidates)
-        or created_collection
-        or (collection is not None and db.is_modified(collection))
-    )
-    if should_commit:
-        db.flush()
-        sync_rows = list(
-            {
-                row.id: row.source_text
-                for row in sync_candidates
-                if row.id is not None and row.source_text
-            }.items()
-        )
+    if created_collection or (upsert_summary is not None and upsert_summary.total_written > 0):
         db.commit()
+        sync_tm_embeddings(db, upsert_summary.sync_rows if upsert_summary is not None else [])
 
-    sync_tm_embeddings(db, sync_rows)
+    created_count = upsert_summary.created_count if upsert_summary is not None else 0
+    updated_count = upsert_summary.updated_count if upsert_summary is not None else 0
 
     return {
         "created_count": created_count,
@@ -5085,13 +5208,11 @@ def _upsert_tm_entry(
 def batch_add_tm_entries(
     batch: BatchTMEntry,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     """批量添加 TM 记录（去重）"""
-    created_count = 0
-    updated_count = 0
     skipped_count = 0
-    sync_candidates: list[MemoryEntry] = []
+    upsert_entries: list[TMUpsertEntry] = []
     collection_ids = [
         collection_id
         for collection_id in (
@@ -5117,37 +5238,26 @@ def batch_add_tm_entries(
             entry.source_language or batch.source_language,
             entry.target_language or batch.target_language,
         )
-        upsert_action, memory_entry = _upsert_tm_entry(
-            db=db,
-            source_text=source_text,
-            target_text=target_text,
-            collection_id=collection_id,
-            source_language=source_language,
-            target_language=target_language,
+        upsert_entries.append(
+            TMUpsertEntry(
+                collection_id=collection_id,
+                source_text=source_text,
+                target_text=target_text,
+                source_language=source_language,
+                target_language=target_language,
+                creator_id=current_user.id,
+            )
         )
-        sync_candidates.append(memory_entry)
-        if upsert_action == "updated":
-            updated_count += 1
-        else:
-            created_count += 1
 
-    sync_rows: list[tuple[UUID, str]] = []
-    if sync_candidates:
-        db.flush()
-        sync_rows = list(
-            {
-                row.id: row.source_text
-                for row in sync_candidates
-                if row.id is not None and row.source_text
-            }.items()
-        )
+    upsert_summary = batch_upsert_tm_entries(db, upsert_entries)
+    skipped_count += upsert_summary.skipped_count
+    if upsert_summary.total_written > 0:
         db.commit()
-
-    sync_tm_embeddings(db, sync_rows)
+        sync_tm_embeddings(db, upsert_summary.sync_rows or [])
 
     return {
-        "created": created_count,
-        "updated": updated_count,
+        "created": upsert_summary.created_count,
+        "updated": upsert_summary.updated_count,
         "skipped": skipped_count,
     }
 

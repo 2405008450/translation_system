@@ -257,6 +257,7 @@ class Segment(Base):
     display_text: Mapped[str] = mapped_column(Text, nullable=False)
     target_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="none")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
     score: Mapped[float] = mapped_column(nullable=False, default=0.0)
     matched_source_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     matched_collection_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
@@ -615,6 +616,13 @@ class TMCollection(Base):
 class TranslationMemory(Base):
     __tablename__ = "memory_entries"
     __table_args__ = (
+        UniqueConstraint(
+            "collection_id",
+            "source_hash",
+            "source_language",
+            "target_language",
+            name="uq_memory_entries_collection_source_hash_language_pair",
+        ),
         Index("ix_memory_entries_collection_id", "collection_id"),
         Index("ix_memory_entries_collection_source_hash", "collection_id", "source_hash"),
         Index(
@@ -689,6 +697,112 @@ class TranslationMemory(Base):
 
 MemoryBase = TMCollection
 MemoryEntry = TranslationMemory
+
+
+class AutoTMOutbox(Base):
+    __tablename__ = "auto_tm_outbox"
+    __table_args__ = (
+        UniqueConstraint(
+            "file_record_id",
+            "segment_id",
+            "collection_id",
+            name="uq_auto_tm_outbox_file_segment_collection",
+        ),
+        Index("ix_auto_tm_outbox_status_created_at", "status", "created_at"),
+        Index("ix_auto_tm_outbox_file_record_id", "file_record_id"),
+        Index("ix_auto_tm_outbox_collection_id", "collection_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    file_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    segment_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("segments.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sentence_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    collection_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("memory_bases.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_text: Mapped[str] = mapped_column(Text, nullable=False)
+    target_text: Mapped[str] = mapped_column(Text, nullable=False)
+    source_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    target_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    creator_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default=text("'pending'"))
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    last_enqueued_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        nullable=False,
+    )
+    processed_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class AutoTMRematchQueue(Base):
+    __tablename__ = "auto_tm_rematch_queue"
+    __table_args__ = (
+        UniqueConstraint("file_record_id", name="uq_auto_tm_rematch_queue_file_record"),
+        Index("ix_auto_tm_rematch_queue_status", "status"),
+        Index("ix_auto_tm_rematch_queue_first_pending_at", "first_pending_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    file_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    collection_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("memory_bases.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    pending_entry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default=text("'pending'"))
+    first_pending_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    last_pending_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    last_processed_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
 
 
 class TermBase(Base):

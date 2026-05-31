@@ -26,6 +26,7 @@ import { consumeLLMStream } from '../utils/llmStream'
 const DEFAULT_SEGMENT_PAGE_SIZE = 100
 const MAX_SEGMENT_PAGE_SIZE = 500
 const AUTO_SYNC_DELAY_MS = 1500
+const CHANGE_POLL_INTERVAL_MS = 10000
 
 function createEmptySegmentStatusStats(): SegmentStatusStats {
   return {
@@ -100,6 +101,7 @@ export const useSegmentStore = defineStore('segment', () => {
   const lastSyncedAt = ref<string | null>(null)
   const lastModifiedAt = ref<string | null>(null)
   const dirtyEntries = ref<Record<string, SegmentUpdatePayload>>({})
+  const conflictEntries = ref<Record<string, string>>({})
   const previewUpdateToken = ref(0)
   const lastPreviewUpdatedSentenceId = ref<string | null>(null)
   const lastPreviewUpdatedText = ref('')
@@ -122,6 +124,9 @@ export const useSegmentStore = defineStore('segment', () => {
 
   const segmentIndexMap = new Map<string, number>()
   let syncTimer: number | null = null
+  let changePollTimer: number | null = null
+  let changeCursor: string | null = null
+  let pollingChanges = false
   let loadMorePromise: Promise<boolean> | null = null
   let previewPromise: Promise<void> | null = null
   let previewLoaded = false
@@ -131,6 +136,7 @@ export const useSegmentStore = defineStore('segment', () => {
   let llmAbortRequested = false
 
   const dirtyCount = computed(() => Object.keys(dirtyEntries.value).length)
+  const conflictCount = computed(() => Object.keys(conflictEntries.value).length)
   const canExport = computed(() => Boolean(fileRecord.value?.can_export))
   const loadedSegmentCount = computed(() => segments.value.length)
   const currentPageStart = computed(() => (
@@ -345,6 +351,29 @@ export const useSegmentStore = defineStore('segment', () => {
     segments.value = nextSegments
   }
 
+  function applyServerSegment(nextSegment: Segment, markPreview = true) {
+    const index = getSegmentIndex(nextSegment.sentence_id)
+    if (index === -1) {
+      return
+    }
+
+    const previousSegment = segments.value[index]
+    segments.value[index] = nextSegment
+    adjustSegmentStatusStats(previousSegment, nextSegment)
+    if (activeSentenceId.value === nextSegment.sentence_id) {
+      activeSourceText.value = nextSegment.source_text || ''
+    }
+    if (markPreview && previousSegment.target_text !== nextSegment.target_text) {
+      markPreviewUpdate(nextSegment.sentence_id, nextSegment.target_text || '')
+    }
+  }
+
+  function applyServerSegments(nextSegments: Segment[], markPreview = true) {
+    for (const segment of nextSegments) {
+      applyServerSegment(segment, markPreview)
+    }
+  }
+
   function setSegmentStatusStats(stats?: SegmentStatusStats | null) {
     segmentStatusStats.value = stats ? { ...createEmptySegmentStatusStats(), ...stats } : createEmptySegmentStatusStats()
   }
@@ -464,7 +493,87 @@ export const useSegmentStore = defineStore('segment', () => {
     matchedSegmentCount.value = data.matched_segments
     setSegmentStatusStats(data.status_stats)
     resetSegments(data.segments)
+    if (data.server_time) {
+      changeCursor = data.server_time
+    }
     resetPreviewState()
+  }
+
+  function startChangePolling() {
+    stopChangePolling()
+    if (!fileRecord.value) {
+      return
+    }
+    changePollTimer = window.setInterval(() => {
+      void pollSegmentChanges()
+    }, CHANGE_POLL_INTERVAL_MS)
+  }
+
+  function stopChangePolling() {
+    if (changePollTimer !== null) {
+      window.clearInterval(changePollTimer)
+      changePollTimer = null
+    }
+    pollingChanges = false
+  }
+
+  async function pollSegmentChanges() {
+    if (!fileRecord.value || !changeCursor || pollingChanges) {
+      return
+    }
+
+    pollingChanges = true
+    try {
+      const { data } = await http.get<{
+        file_record_id: string
+        server_time: string
+        segments: Segment[]
+      }>(`/file-records/${fileRecord.value.id}/segments/changes`, {
+        params: {
+          since: changeCursor,
+          limit: MAX_SEGMENT_PAGE_SIZE,
+        },
+      })
+
+      const nextConflicts = { ...conflictEntries.value }
+      let conflictAdded = false
+      for (const remoteSegment of data.segments || []) {
+        const dirtyEntry = dirtyEntries.value[remoteSegment.sentence_id]
+        if (dirtyEntry) {
+          const baseVersion = Number(dirtyEntry.base_version || 0)
+          const remoteVersion = Number(remoteSegment.version || 1)
+          if (remoteVersion > baseVersion) {
+            nextConflicts[remoteSegment.sentence_id] = remoteSegment.target_text || ''
+            conflictAdded = true
+            const index = getSegmentIndex(remoteSegment.sentence_id)
+            if (index !== -1) {
+              segments.value[index] = {
+                ...segments.value[index],
+                version: remoteVersion,
+                updated_at: remoteSegment.updated_at,
+              }
+            }
+            continue
+          }
+        }
+        applyServerSegment(remoteSegment)
+      }
+
+      conflictEntries.value = nextConflicts
+      if (conflictAdded) {
+        syncMessage.value = '检测到其他用户已更新同一句段，请确认后再保存本地修改。'
+        pushToast({
+          tone: 'warn',
+          title: '发现协同冲突',
+          message: '有句段已被其他用户更新，本地修改已保留。',
+        })
+      }
+      changeCursor = data.server_time || new Date().toISOString()
+    } catch {
+      // 增量同步失败不打断当前编辑，下一轮继续尝试。
+    } finally {
+      pollingChanges = false
+    }
   }
 
   async function refreshCurrentSegmentPage() {
@@ -499,6 +608,7 @@ export const useSegmentStore = defineStore('segment', () => {
       window.clearTimeout(syncTimer)
       syncTimer = null
     }
+    stopChangePolling()
 
     fileRecord.value = null
     resetSegments()
@@ -529,6 +639,8 @@ export const useSegmentStore = defineStore('segment', () => {
     lastSyncedAt.value = null
     lastModifiedAt.value = null
     dirtyEntries.value = {}
+    conflictEntries.value = {}
+    changeCursor = null
     previewUpdateToken.value = 0
     lastPreviewUpdatedSentenceId.value = null
     lastPreviewUpdatedText.value = ''
@@ -567,6 +679,7 @@ export const useSegmentStore = defineStore('segment', () => {
         ...detail,
         segments: [],
       }
+      changeCursor = detail.server_time || new Date().toISOString()
       totalSegmentCount.value = detail.total_segments
       setSegmentStatusStats(detail.status_stats)
       if (
@@ -582,6 +695,7 @@ export const useSegmentStore = defineStore('segment', () => {
         applySegmentPageData(page.data, page.resolved)
       }
       await loadRevisions(fileRecordId)
+      startChangePolling()
     } finally {
       loading.value = false
     }
@@ -715,8 +829,12 @@ export const useSegmentStore = defineStore('segment', () => {
         target_text: targetText,
         source: 'manual',
         track_revision: revisionTrackingEnabled.value,
+        base_version: segment.version ?? 1,
       },
     }
+    const nextConflicts = { ...conflictEntries.value }
+    delete nextConflicts[sentenceId]
+    conflictEntries.value = nextConflicts
     syncMessage.value = translate('stores.segment.syncPending', { count: dirtyCount.value })
     scheduleSync()
   }
@@ -788,18 +906,37 @@ export const useSegmentStore = defineStore('segment', () => {
     saving.value = true
     syncMessage.value = translate('stores.segment.syncing', { count: updates.length })
     try {
-      await http.put(`/file-records/${fileRecord.value.id}/segments`, {
+      const { data } = await http.put<{
+        updated_count: number
+        conflicts?: Array<{
+          sentence_id: string
+          current_version: number
+          attempted_version: number | null
+          current_target_text: string
+        }>
+        auto_tm?: {
+          queued_count: number
+          skipped_no_collection_count: number
+          skipped_invalid_count?: number
+        }
+        segments?: Segment[]
+      }>(`/file-records/${fileRecord.value.id}/segments`, {
         updates,
       })
+      applyServerSegments(data.segments || [], false)
       await loadRevisions(fileRecord.value.id)
       const nextDirtyEntries = { ...dirtyEntries.value }
       const syncedSentenceIds: string[] = []
+      const updatedSentenceIds = new Set((data.segments || []).map((segment) => segment.sentence_id))
+      const conflictSentenceIds = new Set((data.conflicts || []).map((conflict) => conflict.sentence_id))
       for (const update of updates) {
         const currentEntry = nextDirtyEntries[update.sentence_id]
         if (
           currentEntry
           && currentEntry.target_text === update.target_text
           && currentEntry.source === update.source
+          && (updatedSentenceIds.size === 0 || updatedSentenceIds.has(update.sentence_id))
+          && !conflictSentenceIds.has(update.sentence_id)
         ) {
           delete nextDirtyEntries[update.sentence_id]
           syncedSentenceIds.push(update.sentence_id)
@@ -807,6 +944,34 @@ export const useSegmentStore = defineStore('segment', () => {
       }
       dirtyEntries.value = nextDirtyEntries
       clearLocalRevisionDrafts(syncedSentenceIds)
+      if ((data.conflicts || []).length > 0) {
+        const nextConflicts = { ...conflictEntries.value }
+        for (const conflict of data.conflicts || []) {
+          nextConflicts[conflict.sentence_id] = conflict.current_target_text
+          const index = getSegmentIndex(conflict.sentence_id)
+          if (index !== -1) {
+            segments.value[index] = {
+              ...segments.value[index],
+              version: conflict.current_version,
+            }
+          }
+        }
+        conflictEntries.value = nextConflicts
+        syncMessage.value = '检测到协同冲突，本地修改已保留。'
+        pushToast({
+          tone: 'warn',
+          title: '保存遇到协同冲突',
+          message: '其他用户已更新同一句段，请确认后再保存。',
+        })
+        return false
+      }
+      if (data.auto_tm?.skipped_no_collection_count) {
+        pushToast({
+          tone: 'info',
+          title: '未自动写入记忆库',
+          message: '当前文件未绑定记忆库，确认译文已保存。',
+        })
+      }
       const syncedAt = new Date()
       lastSyncedAt.value = syncedAt.toISOString()
       if (dirtyCount.value > 0) {
@@ -1209,6 +1374,7 @@ export const useSegmentStore = defineStore('segment', () => {
     llmErrorCount,
     llmProgressPercent,
     dirtyCount,
+    conflictCount,
     canExport,
     pendingRevisionCount,
     loadedSegmentCount,
@@ -1227,6 +1393,7 @@ export const useSegmentStore = defineStore('segment', () => {
     lastPreviewUpdatedSentenceId,
     lastPreviewUpdatedText,
     revisionHistory,
+    conflictEntries,
     getPendingRevision,
     getRevisionTrace,
     startRevisionTracking,

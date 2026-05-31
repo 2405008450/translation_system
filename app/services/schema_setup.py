@@ -78,6 +78,7 @@ REQUIRED_SCHEMA = {
         "source_word_count",
         "llm_provider",
         "llm_model",
+        "version",
     },
     "translation_metric_events": {
         "id",
@@ -132,6 +133,38 @@ REQUIRED_SCHEMA = {
         "updated_at",
         "resolved_at",
     },
+    "auto_tm_outbox": {
+        "id",
+        "file_record_id",
+        "segment_id",
+        "sentence_id",
+        "collection_id",
+        "source_text",
+        "target_text",
+        "source_language",
+        "target_language",
+        "creator_id",
+        "status",
+        "attempt_count",
+        "error_message",
+        "last_enqueued_at",
+        "processed_at",
+        "created_at",
+        "updated_at",
+    },
+    "auto_tm_rematch_queue": {
+        "id",
+        "file_record_id",
+        "collection_id",
+        "pending_entry_count",
+        "status",
+        "first_pending_at",
+        "last_pending_at",
+        "last_processed_at",
+        "error_message",
+        "created_at",
+        "updated_at",
+    },
 }
 
 REQUIRED_INDEXES = {
@@ -143,6 +176,17 @@ REQUIRED_INDEXES = {
     },
     "translation_metric_events": {
         "ix_translation_metric_events_source_created_at",
+    },
+    "memory_entries": {
+        "uq_memory_entries_collection_source_hash_language_pair",
+    },
+    "auto_tm_outbox": {
+        "uq_auto_tm_outbox_file_segment_collection",
+        "ix_auto_tm_outbox_status_created_at",
+    },
+    "auto_tm_rematch_queue": {
+        "uq_auto_tm_rematch_queue_file_record",
+        "ix_auto_tm_rematch_queue_status",
     },
 }
 
@@ -290,6 +334,31 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                   tm.source_language IS DISTINCT FROM collection.source_language
                   OR tm.target_language IS DISTINCT FROM collection.target_language
               )
+            """,
+            """
+            WITH ranked_entries AS (
+                SELECT
+                    id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY collection_id, source_hash, source_language, target_language
+                        ORDER BY updated_at DESC, created_at DESC, id DESC
+                    ) AS row_number
+                FROM memory_entries
+                WHERE collection_id IS NOT NULL
+                  AND source_hash IS NOT NULL
+                  AND source_language IS NOT NULL
+                  AND target_language IS NOT NULL
+            )
+            DELETE FROM memory_entries
+            WHERE id IN (
+                SELECT id
+                FROM ranked_entries
+                WHERE row_number > 1
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_entries_collection_source_hash_language_pair
+            ON memory_entries (collection_id, source_hash, source_language, target_language)
             """,
             f"""
             CREATE TABLE IF NOT EXISTS term_bases (
@@ -596,6 +665,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS segments
             ADD COLUMN IF NOT EXISTS source_word_count INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1
             """,
             """
             ALTER TABLE IF EXISTS segments
@@ -987,6 +1060,114 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 END IF;
             END
             $$;
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS auto_tm_outbox (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+                segment_id UUID NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+                sentence_id VARCHAR(20) NOT NULL,
+                collection_id UUID NOT NULL REFERENCES memory_bases(id) ON DELETE CASCADE,
+                source_text TEXT NOT NULL,
+                target_text TEXT NOT NULL,
+                source_language VARCHAR(20) NOT NULL,
+                target_language VARCHAR(20) NOT NULL,
+                creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT NOT NULL DEFAULT '',
+                last_enqueued_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                processed_at TIMESTAMP,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS auto_tm_outbox
+            ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS auto_tm_outbox
+            ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'pending'
+            """,
+            """
+            ALTER TABLE IF EXISTS auto_tm_outbox
+            ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS auto_tm_outbox
+            ADD COLUMN IF NOT EXISTS error_message TEXT NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS auto_tm_outbox
+            ADD COLUMN IF NOT EXISTS last_enqueued_at TIMESTAMP NOT NULL DEFAULT NOW()
+            """,
+            """
+            ALTER TABLE IF EXISTS auto_tm_outbox
+            ADD COLUMN IF NOT EXISTS processed_at TIMESTAMP
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_auto_tm_outbox_file_segment_collection
+            ON auto_tm_outbox (file_record_id, segment_id, collection_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_auto_tm_outbox_status_created_at
+            ON auto_tm_outbox (status, created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_auto_tm_outbox_file_record_id
+            ON auto_tm_outbox (file_record_id)
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS auto_tm_rematch_queue (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+                collection_id UUID NOT NULL REFERENCES memory_bases(id) ON DELETE CASCADE,
+                pending_entry_count INTEGER NOT NULL DEFAULT 0,
+                status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                first_pending_at TIMESTAMP,
+                last_pending_at TIMESTAMP,
+                last_processed_at TIMESTAMP,
+                error_message TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS auto_tm_rematch_queue
+            ADD COLUMN IF NOT EXISTS pending_entry_count INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS auto_tm_rematch_queue
+            ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'pending'
+            """,
+            """
+            ALTER TABLE IF EXISTS auto_tm_rematch_queue
+            ADD COLUMN IF NOT EXISTS first_pending_at TIMESTAMP
+            """,
+            """
+            ALTER TABLE IF EXISTS auto_tm_rematch_queue
+            ADD COLUMN IF NOT EXISTS last_pending_at TIMESTAMP
+            """,
+            """
+            ALTER TABLE IF EXISTS auto_tm_rematch_queue
+            ADD COLUMN IF NOT EXISTS last_processed_at TIMESTAMP
+            """,
+            """
+            ALTER TABLE IF EXISTS auto_tm_rematch_queue
+            ADD COLUMN IF NOT EXISTS error_message TEXT NOT NULL DEFAULT ''
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_auto_tm_rematch_queue_file_record
+            ON auto_tm_rematch_queue (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_auto_tm_rematch_queue_status
+            ON auto_tm_rematch_queue (status)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_auto_tm_rematch_queue_first_pending_at
+            ON auto_tm_rematch_queue (first_pending_at)
             """,
         ]
     )

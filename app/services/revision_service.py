@@ -238,6 +238,7 @@ def _resolve_revision(
             segment.target_text = anchor_revision.after_text
         else:
             segment.target_text = anchor_revision.before_text
+        segment.version = int(segment.version or 1) + 1
 
     db.commit()
     return get_revision_or_404(db, anchor_revision.id)
@@ -292,6 +293,7 @@ def _batch_resolve_revisions(
                 segment.target_text = anchor_revision.after_text
             else:
                 segment.target_text = anchor_revision.before_text
+            segment.version = int(segment.version or 1) + 1
 
         resolved_count += 1
 
