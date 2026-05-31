@@ -2857,11 +2857,11 @@ body.modal-open {
 .segment-row__textarea {
   min-height: 0;
   height: 100%;
-  padding: 6px 8px;
+  padding: 8px 10px;
   border: 1px solid transparent;
   border-radius: 5px;
   background: transparent;
-  font-size: 13px;
+  font-size: 15px;
 }
 
 .segment-row__text {
@@ -2871,7 +2871,7 @@ body.modal-open {
   word-break: break-word;
   overflow-wrap: anywhere;
   color: var(--ink-900);
-  line-height: 1.45;
+  line-height: 1.58;
 }
 
 .segment-row__textarea {
@@ -2882,7 +2882,7 @@ body.modal-open {
   overflow-wrap: anywhere;
   word-break: break-word;
   color: var(--ink-900);
-  line-height: 1.45;
+  line-height: 1.58;
 }
 
 .preview-panel {

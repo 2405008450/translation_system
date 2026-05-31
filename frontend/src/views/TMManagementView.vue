@@ -12,6 +12,7 @@ import Pagination from '../components/Pagination.vue'
 import RowActionMenu from '../components/RowActionMenu.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { canonicalizeLanguagePair, formatLanguagePair, languageOptions } from '../constants/languages'
+import { useAuthStore } from '../stores/auth'
 import type { TMCollection } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 
@@ -44,6 +45,7 @@ interface TMCollectionMergeSummary {
 
 const router = useRouter()
 const confirm = useConfirm()
+const authStore = useAuthStore()
 const searchQuery = ref('')
 const filterSourceLanguage = ref('')
 const filterTargetLanguage = ref('')
@@ -73,6 +75,8 @@ const exportingKey = ref('')
 const selectedCollectionId = ref('')
 let exportPollTimer: number | null = null
 let disposed = false
+
+const canManageResources = computed(() => authStore.isAdmin)
 
 const columns: DataTableColumn[] = [
   { key: 'name', label: '名称', sortable: true },
@@ -269,6 +273,10 @@ async function createCollection(
 }
 
 async function createCollectionFromForm() {
+  if (!canManageResources.value) {
+    collectionMessage.value = '当前账号只能查看和导出记忆库。'
+    return
+  }
   collectionMessage.value = ''
   collectionSubmitting.value = true
   try {
@@ -294,6 +302,10 @@ async function createCollectionFromForm() {
 }
 
 function openCreateDialog() {
+  if (!canManageResources.value) {
+    collectionMessage.value = '当前账号只能查看和导出记忆库。'
+    return
+  }
   collectionMessage.value = ''
   showCreateDialog.value = true
 }
@@ -322,6 +334,10 @@ function getSelectedCollectionsMergeError() {
 }
 
 function openMergeDialog() {
+  if (!canManageResources.value) {
+    collectionMessage.value = '当前账号只能查看和导出记忆库。'
+    return
+  }
   const error = getSelectedCollectionsMergeError()
   if (error) {
     collectionMessage.value = error
@@ -342,6 +358,10 @@ function closeMergeDialog() {
 }
 
 async function mergeSelectedCollections() {
+  if (!canManageResources.value) {
+    mergeMessage.value = '当前账号只能查看和导出记忆库。'
+    return
+  }
   const error = getSelectedCollectionsMergeError()
   if (error) {
     mergeMessage.value = error
@@ -373,6 +393,10 @@ async function mergeSelectedCollections() {
 }
 
 async function deleteCollection(collection: any) {
+  if (!canManageResources.value) {
+    collectionMessage.value = '当前账号只能查看和导出记忆库。'
+    return
+  }
   const confirmed = await confirm({
     title: '删除记忆库',
     message: `确定删除记忆库“${collection.name}”吗？其中 ${collection.entry_count} 条 TM 记录也会一起删除。`,
@@ -400,6 +424,10 @@ async function deleteCollection(collection: any) {
 }
 
 async function deleteSelectedCollections() {
+  if (!canManageResources.value) {
+    collectionMessage.value = '当前账号只能查看和导出记忆库。'
+    return
+  }
   const collections = selectedCollections.value
   if (collections.length === 0) {
     return
@@ -550,10 +578,11 @@ onUnmounted(() => {
               <X :size="14" />
             </button>
           </div>
-          <button class="button button--primary" type="button" @click="openCreateDialog">
+          <button v-if="canManageResources" class="button button--primary" type="button" @click="openCreateDialog">
             <Plus :size="14" /> 创建
           </button>
           <button
+            v-if="canManageResources"
             class="button"
             type="button"
             :disabled="!canMergeSelectedCollections || mergeSubmitting"
@@ -564,6 +593,7 @@ onUnmounted(() => {
             合并
           </button>
           <button
+            v-if="canManageResources"
             class="button button--danger"
             type="button"
             :disabled="selectedIds.size === 0 || deletingCollections"
@@ -589,7 +619,7 @@ onUnmounted(() => {
             :columns="columns"
             :data="pagedData"
             :loading="loadingCollections"
-            :selectable="true"
+            :selectable="canManageResources"
             :selected-ids="selectedIds"
             :sort-key="sortKey"
             :sort-order="sortOrder"
@@ -664,6 +694,7 @@ onUnmounted(() => {
                       导出 TMX
                     </button>
                     <button
+                      v-if="canManageResources"
                       class="is-danger"
                       type="button"
                       role="menuitem"

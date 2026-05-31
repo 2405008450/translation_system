@@ -25,7 +25,7 @@ import { useToast } from '../composables/useToast'
 import { useAuthStore } from '../stores/auth'
 import type { User as UserRecord } from '../types/api'
 
-type RoleFilter = 'all' | 'admin' | 'user'
+type RoleFilter = 'all' | 'super_admin' | 'admin' | 'user'
 type SortableUserKey = 'nickname' | 'username' | 'role' | 'is_active' | 'created_at'
 
 const authStore = useAuthStore()
@@ -45,13 +45,16 @@ const uiText = {
   loadFailed: '\u7528\u6237\u5217\u8868\u52a0\u8f7d\u5931\u8d25\u3002',
   createInvalid: '\u8bf7\u8f93\u5165\u81f3\u5c11 3 \u4f4d\u7528\u6237\u540d\u548c 6 \u4f4d\u5bc6\u7801\u3002',
   createFailed: '\u7528\u6237\u521b\u5efa\u5931\u8d25\u3002',
-  createForbidden: '\u53ea\u6709\u7ba1\u7406\u5458\u53ef\u4ee5\u65b0\u589e\u7528\u6237\u6216\u5206\u914d\u8d26\u53f7\u89d2\u8272\u3002',
+  createForbidden: '\u53ea\u6709\u7ba1\u7406\u5458\u6216\u8d85\u7ea7\u7ba1\u7406\u5458\u53ef\u4ee5\u65b0\u589e\u7528\u6237\u3002',
+  createAdminForbidden: '\u53ea\u6709\u8d85\u7ea7\u7ba1\u7406\u5458\u53ef\u4ee5\u521b\u5efa\u7ba1\u7406\u5458\u8d26\u53f7\u3002',
   createSuccess: (username: string) => `\u7528\u6237 ${username} \u5df2\u521b\u5efa`,
   stats: {
     totalLabel: '\u7528\u6237\u603b\u6570',
     totalMeta: '\u7cfb\u7edf\u5f53\u524d\u5df2\u521b\u5efa\u7684\u5168\u90e8\u8d26\u53f7',
+    superAdminLabel: '\u8d85\u7ea7\u7ba1\u7406\u5458',
+    superAdminMeta: '\u53ef\u521b\u5efa\u7ba1\u7406\u5458\u5e76\u7ba1\u7406\u6240\u6709\u8d26\u53f7',
     adminLabel: '\u7ba1\u7406\u5458',
-    adminMeta: '\u53ef\u914d\u7f6e\u7cfb\u7edf\u4e0e\u7ba1\u7406\u7528\u6237',
+    adminMeta: '\u53ef\u521b\u5efa\u548c\u542f\u505c\u666e\u901a\u7528\u6237',
     memberLabel: '\u666e\u901a\u7528\u6237',
     memberMeta: '\u53ef\u767b\u5f55\u3001\u5904\u7406\u4efb\u52a1\u4e0e\u7f16\u8f91\u53e5\u6bb5',
     activeLabel: '\u542f\u7528\u4e2d',
@@ -70,15 +73,16 @@ const uiText = {
   enableUser: '\u542f\u7528\u7528\u6237',
   disableUser: '\u505c\u7528\u7528\u6237',
   statusUpdating: '\u66f4\u65b0\u4e2d...',
-  toggleForbidden: '\u53ea\u6709\u7ba1\u7406\u5458\u53ef\u4ee5\u542f\u7528\u6216\u505c\u7528\u7528\u6237\u3002',
+  toggleForbidden: '\u53ea\u6709\u7ba1\u7406\u5458\u6216\u8d85\u7ea7\u7ba1\u7406\u5458\u53ef\u4ee5\u542f\u7528\u6216\u505c\u7528\u7528\u6237\u3002',
   toggleSelfBlocked: '\u4e0d\u80fd\u505c\u7528\u5f53\u524d\u767b\u5f55\u8d26\u53f7\u3002',
-  toggleLastAdminBlocked: '\u81f3\u5c11\u9700\u8981\u4fdd\u7559\u4e00\u4e2a\u542f\u7528\u4e2d\u7684\u7ba1\u7406\u5458\u8d26\u53f7\u3002',
+  toggleAdminTargetBlocked: '\u7ba1\u7406\u5458\u53ea\u80fd\u542f\u7528\u6216\u505c\u7528\u666e\u901a\u7528\u6237\u3002',
+  toggleLastSuperAdminBlocked: '\u81f3\u5c11\u9700\u8981\u4fdd\u7559\u4e00\u4e2a\u542f\u7528\u4e2d\u7684\u8d85\u7ea7\u7ba1\u7406\u5458\u8d26\u53f7\u3002',
   toggleFailed: '\u7528\u6237\u72b6\u6001\u66f4\u65b0\u5931\u8d25\u3002',
   enableSuccess: (username: string) => `\u7528\u6237 ${username} \u5df2\u542f\u7528`,
   disableSuccess: (username: string) => `\u7528\u6237 ${username} \u5df2\u505c\u7528`,
   createHint: '\u65b0\u521b\u5efa\u7684\u8d26\u53f7\u4f1a\u7acb\u523b\u5237\u65b0\u5230\u4e0a\u65b9\u5217\u8868\uff0c\u9ed8\u8ba4\u6309\u521b\u5efa\u65f6\u95f4\u5012\u5e8f\u5c55\u793a\u3002',
   createRestrictedTitle: '\u65b0\u589e\u7528\u6237\u5df2\u53d7\u9650',
-  createRestrictedMessage: '\u666e\u901a\u7528\u6237\u53ef\u4ee5\u67e5\u770b\u548c\u7ef4\u62a4\u8d26\u53f7\u57fa\u672c\u4fe1\u606f\uff0c\u65b0\u589e\u7528\u6237\u548c\u5206\u914d\u89d2\u8272\u4ecd\u9700\u8981\u7ba1\u7406\u5458\u64cd\u4f5c\u3002',
+  createRestrictedMessage: '\u7ba1\u7406\u5458\u53ef\u4ee5\u65b0\u589e\u548c\u542f\u505c\u666e\u901a\u7528\u6237\uff0c\u521b\u5efa\u7ba1\u7406\u5458\u9700\u8981\u8d85\u7ea7\u7ba1\u7406\u5458\u64cd\u4f5c\u3002',
   createDialogDescription: '\u8bbe\u7f6e\u8d26\u53f7\u57fa\u672c\u4fe1\u606f\u4e0e\u521d\u59cb\u89d2\u8272\u3002',
   operatorLabel: '\u5f53\u524d\u64cd\u4f5c\u8d26\u53f7',
   editDialogTitle: '\u7f16\u8f91\u7528\u6237',
@@ -132,19 +136,26 @@ const updatingUser = ref(false)
 const togglingUserId = ref('')
 
 const totalUsers = computed(() => users.value.length)
+const superAdminUsers = computed(() => users.value.filter((item) => item.role === 'super_admin').length)
 const adminUsers = computed(() => users.value.filter((item) => item.role === 'admin').length)
 const normalUsers = computed(() => users.value.filter((item) => item.role === 'user').length)
 const activeUsers = computed(() => users.value.filter((item) => item.is_active).length)
-const activeAdminUsers = computed(() => users.value.filter((item) => item.role === 'admin' && item.is_active).length)
+const activeSuperAdminUsers = computed(() => (
+  users.value.filter((item) => item.role === 'super_admin' && item.is_active).length
+))
 const canManageUserPermissions = computed(() => authStore.isAdmin)
+const canCreateSelectedRole = computed(() => newRole.value === 'user' || authStore.isSuperAdmin)
 const canCreateUser = computed(() => (
   canManageUserPermissions.value
+  && canCreateSelectedRole.value
   && newUsername.value.trim().length >= 3
   && newPassword.value.length >= 6
 ))
 const editingUser = computed(() => users.value.find((item) => item.id === editingUserId.value) ?? null)
 const canUpdateUser = computed(() => (
   Boolean(editingUserId.value)
+  && Boolean(editingUser.value)
+  && canEditUser(editingUser.value!)
   && editUsername.value.trim().length >= 3
   && (editPassword.value.length === 0 || editPassword.value.length >= 6)
 ))
@@ -207,6 +218,9 @@ function getErrorMessage(error: unknown, fallback: string) {
 }
 
 function getRoleLabel(role: UserRecord['role']) {
+  if (role === 'super_admin') {
+    return t('common.roles.superAdmin')
+  }
   return role === 'admin' ? t('common.roles.admin') : t('common.roles.user')
 }
 
@@ -260,6 +274,9 @@ function openCreateDialog() {
     return
   }
 
+  if (!authStore.isSuperAdmin && newRole.value === 'admin') {
+    newRole.value = 'user'
+  }
   createUserMessage.value = ''
   createUserMessageTone.value = 'success'
   showCreateDialog.value = true
@@ -276,6 +293,12 @@ async function createUser() {
   if (!canManageUserPermissions.value) {
     createUserMessageTone.value = 'error'
     createUserMessage.value = uiText.createForbidden
+    return
+  }
+
+  if (!canCreateSelectedRole.value) {
+    createUserMessageTone.value = 'error'
+    createUserMessage.value = uiText.createAdminForbidden
     return
   }
 
@@ -324,9 +347,13 @@ function resetEditState() {
 }
 
 function openEditUser(
-  user: { id?: string, username?: string | null, nickname?: string | null } | null | undefined,
+  user: Record<string, any> | null | undefined,
 ) {
   if (!user?.id || !user.username) {
+    return
+  }
+  if (!canEditUser(user)) {
+    toast.error('\u65e0\u6743\u7f16\u8f91\u8be5\u8d26\u53f7\u3002')
     return
   }
   editingUserId.value = user.id
@@ -385,8 +412,22 @@ async function updateUser() {
   }
 }
 
-function isLastActiveAdmin(user: Record<string, any>) {
-  return user.role === 'admin' && user.is_active && activeAdminUsers.value <= 1
+function canEditUser(user: Record<string, any>) {
+  if (authStore.isSuperAdmin) {
+    return true
+  }
+  if (authStore.user?.role === 'admin') {
+    return user.role === 'user' || user.id === authStore.user?.id
+  }
+  return user.id === authStore.user?.id
+}
+
+function isLastActiveSuperAdmin(user: Record<string, any>) {
+  return user.role === 'super_admin' && user.is_active && activeSuperAdminUsers.value <= 1
+}
+
+function isAdminRestrictedTarget(user: Record<string, any>) {
+  return authStore.user?.role === 'admin' && user.role !== 'user'
 }
 
 function getToggleUserStatusTitle(user: Record<string, any>) {
@@ -399,8 +440,11 @@ function getToggleUserStatusTitle(user: Record<string, any>) {
   if (user.id === authStore.user?.id) {
     return uiText.toggleSelfBlocked
   }
-  if (isLastActiveAdmin(user)) {
-    return uiText.toggleLastAdminBlocked
+  if (isAdminRestrictedTarget(user)) {
+    return uiText.toggleAdminTargetBlocked
+  }
+  if (isLastActiveSuperAdmin(user)) {
+    return uiText.toggleLastSuperAdminBlocked
   }
   return user.is_active ? uiText.disableUser : uiText.enableUser
 }
@@ -410,7 +454,8 @@ function canToggleUserStatus(user: Record<string, any>) {
     canManageUserPermissions.value
     && !togglingUserId.value
     && user.id !== authStore.user?.id
-    && !isLastActiveAdmin(user)
+    && !isAdminRestrictedTarget(user)
+    && !isLastActiveSuperAdmin(user)
   )
 }
 
@@ -448,6 +493,12 @@ watch(pageSize, () => {
   currentPage.value = 1
 })
 
+watch(() => authStore.isSuperAdmin, (isSuperAdmin) => {
+  if (!isSuperAdmin && newRole.value === 'admin') {
+    newRole.value = 'user'
+  }
+})
+
 watch(totalCount, (count) => {
   const maxPage = Math.max(1, Math.ceil(count / pageSize.value))
   if (currentPage.value > maxPage) {
@@ -475,7 +526,7 @@ onMounted(() => {
           <strong>{{ getUserDisplayName(authStore.user) || '--' }}</strong>
         </span>
         <span class="user-role-chip" :class="`is-${authStore.user?.role || 'user'}`">
-          {{ authStore.user?.role === 'admin' ? t('common.roles.admin') : t('common.roles.user') }}
+          {{ authStore.user ? getRoleLabel(authStore.user.role) : t('common.roles.user') }}
         </span>
       </div>
     </div>
@@ -488,6 +539,16 @@ onMounted(() => {
         <span class="user-overview-item__copy">
           <span>{{ uiText.stats.totalLabel }}</span>
           <strong>{{ totalUsers }}</strong>
+        </span>
+      </article>
+
+      <article class="user-overview-item">
+        <span class="user-overview-item__icon user-overview-item__icon--super-admin">
+          <Shield :size="17" />
+        </span>
+        <span class="user-overview-item__copy">
+          <span>{{ uiText.stats.superAdminLabel }}</span>
+          <strong>{{ superAdminUsers }}</strong>
         </span>
       </article>
 
@@ -536,6 +597,7 @@ onMounted(() => {
 
         <select v-model="roleFilter" class="user-filter" :aria-label="uiText.allRoles">
           <option value="all">{{ uiText.allRoles }}</option>
+          <option value="super_admin">{{ t('common.roles.superAdmin') }}</option>
           <option value="admin">{{ t('common.roles.admin') }}</option>
           <option value="user">{{ t('common.roles.user') }}</option>
         </select>
@@ -639,6 +701,7 @@ onMounted(() => {
               type="button"
               :title="t('common.actions.edit')"
               :aria-label="t('common.actions.edit')"
+              :disabled="!canEditUser(row)"
               @click="openEditUser(row)"
             >
               <Pencil :size="14" />
@@ -723,7 +786,7 @@ onMounted(() => {
           <span class="field__label">{{ t('userManagement.role') }}</span>
           <select v-model="newRole" class="field__control">
             <option value="user">{{ t('common.roles.user') }}</option>
-            <option value="admin">{{ t('common.roles.admin') }}</option>
+            <option v-if="authStore.isSuperAdmin" value="admin">{{ t('common.roles.admin') }}</option>
           </select>
         </label>
       </div>
@@ -925,7 +988,7 @@ onMounted(() => {
 
 .user-overview {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 10px;
   padding: 14px 20px 4px;
 }
@@ -950,6 +1013,11 @@ onMounted(() => {
   background: var(--brand-050);
   color: var(--brand-700);
   flex: none;
+}
+
+.user-overview-item__icon--super-admin {
+  background: #f7efff;
+  color: #7b3fc7;
 }
 
 .user-overview-item__icon--admin {
@@ -1150,6 +1218,11 @@ onMounted(() => {
   border: 1px solid color-mix(in srgb, var(--brand-700) 20%, transparent);
   background: var(--brand-050);
   color: var(--brand-700);
+}
+
+.user-role-chip.is-super_admin {
+  background: #f7efff;
+  color: #7b3fc7;
 }
 
 .user-role-chip.is-admin {

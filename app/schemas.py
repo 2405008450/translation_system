@@ -44,11 +44,15 @@ class MatchResult(BaseModel):
     tm_candidates: list[TMMatchCandidate] = []
 
 
+UserRole = Literal["super_admin", "admin", "user"]
+CreatableUserRole = Literal["admin", "user"]
+
+
 class UserRead(BaseModel):
     id: str
     username: str
     nickname: str | None
-    role: Literal["admin", "user"]
+    role: UserRole
     is_active: bool
     created_at: str
 
@@ -68,7 +72,7 @@ class RegisterRequest(BaseModel):
     username: UsernameStr
     nickname: NicknameStr | None = None
     password: PasswordStr
-    role: Literal["admin", "user"] = "user"
+    role: CreatableUserRole = "user"
 
 
 class UpdateUserRequest(BaseModel):

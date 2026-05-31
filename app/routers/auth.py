@@ -6,13 +6,18 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.auth import (
+    ADMIN_ROLE,
+    SUPER_ADMIN_ROLE,
+    USER_ROLE,
     authenticate_user,
     build_auth_response,
-    count_active_admins,
+    count_active_super_admins,
     count_users,
     create_user,
     get_current_user,
     get_user_by_id,
+    is_admin_role,
+    is_super_admin_role,
     list_users,
     require_admin,
     require_users_table,
@@ -34,6 +39,49 @@ from app.schemas import (
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+PROFILE_UPDATE_FIELDS = {"username", "nickname", "password"}
+
+
+def _can_update_user_profile(current_user: User, target_user: User) -> bool:
+    if current_user.id == target_user.id:
+        return True
+    if is_super_admin_role(current_user.role):
+        return True
+    return current_user.role == ADMIN_ROLE and target_user.role == USER_ROLE
+
+
+def _require_create_user_role_access(current_user: User, role: str) -> None:
+    if role == ADMIN_ROLE and not is_super_admin_role(current_user.role):
+        raise HTTPException(status_code=403, detail="只有超级管理员可以创建管理员账号。")
+
+
+def _require_status_update_access(
+    *,
+    db: Session,
+    current_user: User,
+    target_user: User,
+    next_is_active: bool | None,
+) -> None:
+    if not is_admin_role(current_user.role):
+        raise HTTPException(status_code=403, detail="只有管理员可以启用或停用用户。")
+
+    if target_user.id == current_user.id and next_is_active is False:
+        raise HTTPException(status_code=400, detail="不能停用当前登录账号。")
+
+    if is_super_admin_role(current_user.role):
+        if (
+            target_user.role == SUPER_ADMIN_ROLE
+            and target_user.is_active
+            and next_is_active is False
+            and count_active_super_admins(db) <= 1
+        ):
+            raise HTTPException(status_code=400, detail="至少需要保留一个启用中的超级管理员账号。")
+        return
+
+    if target_user.role != USER_ROLE:
+        raise HTTPException(status_code=403, detail="管理员只能启用或停用普通用户。")
 
 
 @router.get("/init", response_model=InitStatusResponse)
@@ -71,7 +119,7 @@ def init_admin_account(
         username=payload.username,
         nickname=payload.nickname,
         password=payload.password,
-        role="admin",
+        role=SUPER_ADMIN_ROLE,
     )
     return AuthResponse.model_validate(build_auth_response(user))
 
@@ -101,7 +149,7 @@ def get_me(current_user: User = Depends(get_current_user)) -> UserRead:
 @router.get("/users", response_model=list[UserRead])
 def get_users(
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    _: User = Depends(require_admin),
 ) -> list[UserRead]:
     return [
         UserRead.model_validate(serialize_user(user))
@@ -113,9 +161,10 @@ def get_users(
 def register_user(
     payload: RegisterRequest,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ) -> UserRead:
     require_users_table()
+    _require_create_user_role_access(current_user, payload.role)
     user = create_user(
         db=db,
         username=payload.username,
@@ -142,18 +191,16 @@ def update_user_account(
     if not updated_fields:
         raise HTTPException(status_code=400, detail="\u8bf7\u81f3\u5c11\u63d0\u4ea4\u4e00\u4e2a\u9700\u8981\u4fee\u6539\u7684\u5b57\u6bb5\u3002")
 
+    if updated_fields & PROFILE_UPDATE_FIELDS and not _can_update_user_profile(current_user, target_user):
+        raise HTTPException(status_code=403, detail="\u65e0\u6743\u4fee\u6539\u8be5\u8d26\u53f7\u7684\u57fa\u672c\u4fe1\u606f\u3002")
+
     if "is_active" in updated_fields:
-        if current_user.role != "admin":
-            raise HTTPException(status_code=403, detail="\u53ea\u6709\u7ba1\u7406\u5458\u53ef\u4ee5\u542f\u7528\u6216\u505c\u7528\u7528\u6237\u3002")
-        if target_user.id == current_user.id and payload.is_active is False:
-            raise HTTPException(status_code=400, detail="\u4e0d\u80fd\u505c\u7528\u5f53\u524d\u767b\u5f55\u8d26\u53f7\u3002")
-        if (
-            target_user.role == "admin"
-            and target_user.is_active
-            and payload.is_active is False
-            and count_active_admins(db) <= 1
-        ):
-            raise HTTPException(status_code=400, detail="\u81f3\u5c11\u9700\u8981\u4fdd\u7559\u4e00\u4e2a\u542f\u7528\u4e2d\u7684\u7ba1\u7406\u5458\u8d26\u53f7\u3002")
+        _require_status_update_access(
+            db=db,
+            current_user=current_user,
+            target_user=target_user,
+            next_is_active=payload.is_active,
+        )
 
     user = update_user_profile(
         db=db,

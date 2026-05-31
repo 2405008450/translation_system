@@ -3124,7 +3124,8 @@ onBeforeRouteLeave(async () => {
                   :aria-label="t('workbench.search.collapse')"
                   @click="closeSegmentSearchPanel"
                 >
-                  <X :size="14" />
+                  <ChevronUp :size="14" />
+                  <span>{{ t('workbench.search.collapseShort') }}</span>
                 </button>
               </div>
             </div>
@@ -4291,6 +4292,10 @@ onBeforeRouteLeave(async () => {
 .workbench-search-panel__close {
   min-width: 34px;
   padding-inline: 9px;
+}
+
+.workbench-search-panel__close {
+  min-width: 64px;
 }
 
 .workbench-guidelines-panel__file {

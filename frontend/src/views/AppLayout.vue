@@ -111,13 +111,13 @@ const navGroups = computed<NavGroup[]>(() => [
     key: 'system',
     label: t('shell.sections.system'),
     icon: Settings,
-    visible: true,
+    visible: authStore.isAdmin,
     children: [
       {
         name: 'users',
         label: t('shell.sections.users'),
         icon: Users,
-        visible: true,
+        visible: authStore.isAdmin,
       },
     ],
   },
@@ -264,6 +264,13 @@ function getUserDisplayName() {
 function getUserInitial() {
   const name = getUserDisplayName()
   return name.charAt(0).toUpperCase()
+}
+
+function getRoleLabel(role?: string | null) {
+  if (role === 'super_admin') {
+    return t('common.roles.superAdmin')
+  }
+  return role === 'admin' ? t('common.roles.admin') : t('common.roles.user')
 }
 
 function getRecentIcon(section: string) {
@@ -443,7 +450,7 @@ watch(
         <div class="sidebar-user-avatar">{{ getUserInitial() }}</div>
         <div v-if="!sidebarCollapsed" class="sidebar-user-info">
           <strong>{{ getUserDisplayName() || authStore.user?.username }}</strong>
-          <span>{{ authStore.user?.role === 'admin' ? t('common.roles.admin') : t('common.roles.user') }}</span>
+          <span>{{ getRoleLabel(authStore.user?.role) }}</span>
         </div>
         <button
           v-if="!sidebarCollapsed"

@@ -8,7 +8,7 @@ from sqlalchemy import inspect
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
 
-from app.auth import get_user_display_name, serialize_user
+from app.auth import get_user_display_name, is_admin_role, serialize_user
 from app.database import engine
 from app.models import FileRecord, IssueMarker, Project, User
 from app.services.normalizer import normalize_text_preserve_lines
@@ -278,6 +278,6 @@ def _normalize_status(status: str | None) -> str:
 
 
 def _require_marker_write_access(marker: IssueMarker, current_user: User) -> None:
-    if current_user.role == "admin" or marker.reporter_id == current_user.id:
+    if is_admin_role(current_user.role) or marker.reporter_id == current_user.id:
         return
     raise HTTPException(status_code=403, detail="只能修改自己创建的问题标记。")

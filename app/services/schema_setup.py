@@ -416,6 +416,30 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             END
             $$;
             """,
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'users'
+                ) THEN
+                    UPDATE users
+                    SET role = 'super_admin'
+                    WHERE id = (
+                        SELECT id
+                        FROM users
+                        WHERE role = 'admin'
+                        ORDER BY created_at ASC NULLS LAST, username ASC
+                        LIMIT 1
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM users WHERE role = 'super_admin'
+                    );
+                END IF;
+            END
+            $$;
+            """,
             f"""
             CREATE TABLE IF NOT EXISTS projects (
                 id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},

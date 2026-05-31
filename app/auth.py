@@ -19,9 +19,21 @@ from app.services.analytics_service import record_user_activity_safely
 
 
 USERS_TABLE_MISSING_MESSAGE = "users 表不存在，请先执行 scripts/create_users_table.sql。"
+SUPER_ADMIN_ROLE = "super_admin"
+ADMIN_ROLE = "admin"
+USER_ROLE = "user"
+ADMIN_ROLES = {SUPER_ADMIN_ROLE, ADMIN_ROLE}
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
+
+def is_super_admin_role(role: str | None) -> bool:
+    return role == SUPER_ADMIN_ROLE
+
+
+def is_admin_role(role: str | None) -> bool:
+    return role in ADMIN_ROLES
 
 
 def users_table_exists() -> bool:
@@ -61,7 +73,16 @@ def count_active_admins(db: Session) -> int:
     require_users_table()
     return (
         db.query(User)
-        .filter(User.role == "admin", User.is_active.is_(True))
+        .filter(User.role.in_(ADMIN_ROLES), User.is_active.is_(True))
+        .count()
+    )
+
+
+def count_active_super_admins(db: Session) -> int:
+    require_users_table()
+    return (
+        db.query(User)
+        .filter(User.role == SUPER_ADMIN_ROLE, User.is_active.is_(True))
         .count()
     )
 
@@ -257,6 +278,6 @@ def get_current_user(
 
 
 def require_admin(current_user: User = Depends(get_current_user)) -> User:
-    if current_user.role != "admin":
+    if not is_admin_role(current_user.role):
         raise HTTPException(status_code=403, detail="当前操作需要管理员权限。")
     return current_user

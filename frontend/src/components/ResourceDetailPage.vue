@@ -26,6 +26,7 @@ import ResourceImportDialog from '../components/ResourceImportDialog.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
 import { getLanguageLabel } from '../constants/languages'
+import { useAuthStore } from '../stores/auth'
 import type { PaginatedResponse, TermBase, TermEntryRecord, TMCollection, TMEntryRecord } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 
@@ -59,6 +60,7 @@ const props = defineProps<{
 
 const router = useRouter()
 const confirm = useConfirm()
+const authStore = useAuthStore()
 
 const resource = ref<ResourceRecord | null>(null)
 const entries = ref<EntryRecord[]>([])
@@ -161,9 +163,10 @@ const sourceLanguageLabel = computed(() => getDetailLanguageLabel(sourceLanguage
 const targetLanguageLabel = computed(() => getDetailLanguageLabel(targetLanguageCode.value))
 const pageTitle = computed(() => resource.value?.name || copy.value.fallbackTitle)
 const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
+const canManageResources = computed(() => authStore.isAdmin)
 const tableColumnCount = computed(() => (
   Number(showIndexColumn.value) + Number(showSourceColumn.value) + Number(showTargetColumn.value)
-  + 1
+  + Number(canManageResources.value)
 ))
 const entryCount = computed(() => resource.value?.entry_count ?? totalEntries.value)
 const entryCountText = computed(() => `${entryCount.value}`)
@@ -269,6 +272,10 @@ function resetEditForm() {
 }
 
 function openAddDialog() {
+  if (!canManageResources.value) {
+    entryMessage.value = `当前账号只能查看和导出${copy.value.assetLabel}。`
+    return
+  }
   resetAddForm()
   entryMessage.value = ''
   showAddDialog.value = true
@@ -318,7 +325,7 @@ async function reloadPage() {
 }
 
 async function createEntry() {
-  if (!resource.value) {
+  if (!resource.value || !canManageResources.value) {
     return
   }
 
@@ -349,6 +356,10 @@ async function createEntry() {
 }
 
 function startEditEntry(entry: EntryRecord) {
+  if (!canManageResources.value) {
+    entryMessage.value = `当前账号只能查看和导出${copy.value.assetLabel}。`
+    return
+  }
   editingEntryId.value = entry.id
   editSourceText.value = entry.source_text
   editTargetText.value = entry.target_text
@@ -360,6 +371,10 @@ function isEditingEntry(entry: EntryRecord) {
 }
 
 async function updateEntry(entry: EntryRecord) {
+  if (!canManageResources.value) {
+    entryMessage.value = `当前账号只能查看和导出${copy.value.assetLabel}。`
+    return
+  }
   const sourceText = editSourceText.value.trim()
   const targetText = editTargetText.value.trim()
   if (!sourceText || !targetText) {
@@ -385,6 +400,10 @@ async function updateEntry(entry: EntryRecord) {
 }
 
 async function deleteEntry(entry: EntryRecord) {
+  if (!canManageResources.value) {
+    entryMessage.value = `当前账号只能查看和导出${copy.value.assetLabel}。`
+    return
+  }
   const confirmed = await confirm({
     title: `删除${copy.value.entryName}`,
     message: `确定删除这条${copy.value.entryName}吗？此操作不可恢复。`,
@@ -535,6 +554,7 @@ onUnmounted(() => {
 
       <div class="resource-detail-topbar__actions">
         <button
+          v-if="canManageResources"
           class="resource-detail-button resource-detail-button--primary"
           type="button"
           :disabled="!resource"
@@ -598,7 +618,12 @@ onUnmounted(() => {
 
         <div class="resource-detail-toolbar">
           <div class="resource-detail-toolbar__left">
-            <button class="resource-detail-button resource-detail-button--primary" type="button" @click="openAddDialog">
+            <button
+              v-if="canManageResources"
+              class="resource-detail-button resource-detail-button--primary"
+              type="button"
+              @click="openAddDialog"
+            >
               <Plus :size="14" />
               添加
             </button>
@@ -655,7 +680,7 @@ onUnmounted(() => {
                 <th v-if="showIndexColumn" class="resource-detail-table__index">序号</th>
                 <th v-if="showSourceColumn">{{ sourceLanguageLabel }}</th>
                 <th v-if="showTargetColumn">{{ targetLanguageLabel }}</th>
-                <th class="resource-detail-table__actions">操作</th>
+                <th v-if="canManageResources" class="resource-detail-table__actions">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -694,7 +719,7 @@ onUnmounted(() => {
                   />
                   <span v-else>{{ entry.target_text }}</span>
                 </td>
-                <td class="resource-detail-table__actions">
+                <td v-if="canManageResources" class="resource-detail-table__actions">
                   <div v-if="isEditingEntry(entry)" class="resource-detail-row-actions">
                     <button
                       class="resource-detail-action-button"
@@ -756,6 +781,7 @@ onUnmounted(() => {
     </template>
 
     <Modal
+      v-if="canManageResources"
       :open="showAddDialog"
       :title="copy.addTitle"
       :description="copy.addDescription"
@@ -797,6 +823,7 @@ onUnmounted(() => {
     </Modal>
 
     <ResourceImportDialog
+      v-if="canManageResources"
       :open="showImportDialog"
       :mode="copy.importTab"
       :initial-tab="copy.importTab"

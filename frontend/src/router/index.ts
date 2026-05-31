@@ -182,6 +182,7 @@ const router = createRouter({
           name: 'users',
           component: UserManagementView,
           meta: {
+            requiresAdmin: true,
             navSection: 'users',
             pageTitle: '用户管理',
             pageDescription: '创建和分配系统用户角色',
@@ -209,6 +210,10 @@ router.beforeEach(async (to) => {
       name: 'login',
       query: to.fullPath !== '/' ? { redirect: to.fullPath } : undefined,
     }
+  }
+
+  if (to.meta.requiresAdmin && !authStore.isAdmin) {
+    return { name: 'projects' }
   }
 
   return true

@@ -846,8 +846,8 @@ defineExpose({
     ),
     transparent;
   color: var(--text-primary);
-  font-size: 13px;
-  line-height: 1.45;
+  font-size: 15px;
+  line-height: 1.58;
   outline: none;
   overflow: auto;
   white-space: pre-wrap;
@@ -906,8 +906,8 @@ defineExpose({
   flex: 1 1 auto;
   width: 100%;
   height: 100%;
-  min-height: 64px;
-  padding: 6px 8px;
+  min-height: 76px;
+  padding: 8px 10px;
   border: 1px solid transparent;
   border-radius: 5px;
   background:
@@ -916,8 +916,8 @@ defineExpose({
       var(--segment-editor-stripe, transparent),
       var(--segment-editor-stripe, transparent)
     );
-  font-size: 13px;
-  line-height: 1.45;
+  font-size: 15px;
+  line-height: 1.58;
   color: var(--text-primary);
   outline: none;
   white-space: pre-wrap;

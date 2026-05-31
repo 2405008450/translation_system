@@ -8,7 +8,7 @@ from sqlalchemy import inspect
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
 
-from app.auth import serialize_user
+from app.auth import is_admin_role, serialize_user
 from app.database import engine
 from app.models import Segment, SegmentComment, User
 from app.services.normalizer import normalize_text_preserve_lines
@@ -262,6 +262,6 @@ def _normalize_comment_body(body: str) -> str:
 
 
 def _require_comment_write_access(comment: SegmentComment, current_user: User) -> None:
-    if current_user.role == "admin" or comment.author_id == current_user.id:
+    if is_admin_role(current_user.role) or comment.author_id == current_user.id:
         return
     raise HTTPException(status_code=403, detail="只能修改自己创建的批注。")

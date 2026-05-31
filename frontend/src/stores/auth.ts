@@ -18,7 +18,8 @@ export const useAuthStore = defineStore('auth', () => {
   let bootstrapPromise: Promise<void> | null = null
 
   const isAuthenticated = computed(() => Boolean(token.value && user.value))
-  const isAdmin = computed(() => user.value?.role === 'admin')
+  const isSuperAdmin = computed(() => user.value?.role === 'super_admin')
+  const isAdmin = computed(() => user.value?.role === 'super_admin' || user.value?.role === 'admin')
 
   function persistToken(nextToken: string | null) {
     token.value = nextToken
@@ -159,6 +160,7 @@ export const useAuthStore = defineStore('auth', () => {
     ready,
     loading,
     isAuthenticated,
+    isSuperAdmin,
     isAdmin,
     bootstrap,
     checkInitStatus,

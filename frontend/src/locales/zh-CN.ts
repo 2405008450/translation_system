@@ -24,6 +24,7 @@ export default {
       reply: '回复',
     },
     roles: {
+      superAdmin: '超级管理员',
       admin: '管理员',
       user: '普通用户',
     },
@@ -107,9 +108,9 @@ export default {
   },
   auth: {
     login: '登录',
-    initialize: '初始化管理员',
+    initialize: '初始化超级管理员',
     subtitleLogin: '输入账号密码进入翻译工作台',
-    subtitleInit: '系统当前还没有用户，请先创建管理员账号',
+    subtitleInit: '系统当前还没有用户，请先创建超级管理员账号',
     username: '用户名',
     password: '密码',
     submitLoading: '提交中...',
@@ -787,6 +788,7 @@ export default {
       noMatch: '未找到匹配的句段',
       clear: '清空',
       collapse: '收起句段检索',
+      collapseShort: '收起',
       prev: '上一条',
       next: '下一条',
       targetRequiredForReplace: '请先输入译文关键词用于替换。',

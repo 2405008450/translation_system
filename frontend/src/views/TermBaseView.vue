@@ -12,6 +12,7 @@ import Pagination from '../components/Pagination.vue'
 import RowActionMenu from '../components/RowActionMenu.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { canonicalizeLanguagePair, formatLanguagePair, languageOptions } from '../constants/languages'
+import { useAuthStore } from '../stores/auth'
 import type { TermBase } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 
@@ -44,6 +45,7 @@ interface TermBaseMergeSummary {
 
 const router = useRouter()
 const confirm = useConfirm()
+const authStore = useAuthStore()
 const searchQuery = ref('')
 const filterSourceLanguage = ref('')
 const filterTargetLanguage = ref('')
@@ -73,6 +75,8 @@ const exportingKey = ref('')
 const selectedTermBaseId = ref('')
 let exportPollTimer: number | null = null
 let disposed = false
+
+const canManageResources = computed(() => authStore.isAdmin)
 
 const columns: DataTableColumn[] = [
   { key: 'name', label: '名称', sortable: true },
@@ -251,6 +255,10 @@ async function createTermBase(
 }
 
 async function createTermBaseFromForm() {
+  if (!canManageResources.value) {
+    baseMessage.value = '当前账号只能查看和导出术语库。'
+    return
+  }
   baseMessage.value = ''
   baseSubmitting.value = true
   try {
@@ -276,6 +284,10 @@ async function createTermBaseFromForm() {
 }
 
 function openCreateDialog() {
+  if (!canManageResources.value) {
+    baseMessage.value = '当前账号只能查看和导出术语库。'
+    return
+  }
   baseMessage.value = ''
   showCreateDialog.value = true
 }
@@ -304,6 +316,10 @@ function getSelectedTermBasesMergeError() {
 }
 
 function openMergeDialog() {
+  if (!canManageResources.value) {
+    baseMessage.value = '当前账号只能查看和导出术语库。'
+    return
+  }
   const error = getSelectedTermBasesMergeError()
   if (error) {
     baseMessage.value = error
@@ -324,6 +340,10 @@ function closeMergeDialog() {
 }
 
 async function mergeSelectedTermBases() {
+  if (!canManageResources.value) {
+    mergeMessage.value = '当前账号只能查看和导出术语库。'
+    return
+  }
   const error = getSelectedTermBasesMergeError()
   if (error) {
     mergeMessage.value = error
@@ -355,6 +375,10 @@ async function mergeSelectedTermBases() {
 }
 
 async function deleteTermBase(termBase: any) {
+  if (!canManageResources.value) {
+    baseMessage.value = '当前账号只能查看和导出术语库。'
+    return
+  }
   const confirmed = await confirm({
     title: '删除术语库',
     message: `确定删除术语库“${termBase.name}”吗？其中 ${termBase.entry_count} 条术语也会一起删除。`,
@@ -382,6 +406,10 @@ async function deleteTermBase(termBase: any) {
 }
 
 async function deleteSelectedTermBases() {
+  if (!canManageResources.value) {
+    baseMessage.value = '当前账号只能查看和导出术语库。'
+    return
+  }
   const bases = selectedTermBases.value
   if (bases.length === 0) {
     return
@@ -532,10 +560,11 @@ onUnmounted(() => {
               <X :size="14" />
             </button>
           </div>
-          <button class="button button--primary" type="button" @click="openCreateDialog">
+          <button v-if="canManageResources" class="button button--primary" type="button" @click="openCreateDialog">
             <Plus :size="14" /> 创建
           </button>
           <button
+            v-if="canManageResources"
             class="button"
             type="button"
             :disabled="!canMergeSelectedTermBases || mergeSubmitting"
@@ -546,6 +575,7 @@ onUnmounted(() => {
             合并
           </button>
           <button
+            v-if="canManageResources"
             class="button button--danger"
             type="button"
             :disabled="selectedIds.size === 0 || deletingBases"
@@ -571,7 +601,7 @@ onUnmounted(() => {
             :columns="columns"
             :data="pagedData"
             :loading="loadingBases"
-            :selectable="true"
+            :selectable="canManageResources"
             :selected-ids="selectedIds"
             :sort-key="sortKey"
             :sort-order="sortOrder"
@@ -650,6 +680,7 @@ onUnmounted(() => {
                       导出 TMX
                     </button>
                     <button
+                      v-if="canManageResources"
                       class="is-danger"
                       type="button"
                       role="menuitem"

@@ -3705,6 +3705,7 @@ def save_file_record_segments_to_tm(
     file_record_id: UUID,
     payload: SaveToTMRequest,
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
@@ -4431,6 +4432,7 @@ def get_tm_collection(
 def create_tm_collection(
     payload: MemoryBasePayload,
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     name = _normalize_collection_name(payload.name)
     source_language, target_language = _require_tm_language_pair(
@@ -4463,6 +4465,7 @@ def update_tm_collection(
     collection_id: UUID,
     payload: MemoryBasePayload,
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     collection = _get_collection_or_404(db, collection_id)
     if collection is None:
@@ -4511,7 +4514,7 @@ def update_tm_collection(
 def merge_tm_collections(
     payload: TMCollectionMergePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     source_collection_ids = list(dict.fromkeys(payload.source_collection_ids))
     if len(source_collection_ids) < 2:
@@ -4641,6 +4644,7 @@ def merge_tm_collections(
 def delete_tm_collection(
     collection_id: UUID,
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     collection = _get_collection_or_404(db, collection_id)
     if collection is None:
@@ -4703,7 +4707,7 @@ async def import_tm_xlsx(
     source_language: str = Form(...),
     target_language: str = Form(...),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
     if extension not in TM_IMPORT_EXTENSIONS:
@@ -4881,6 +4885,7 @@ def add_tm_collection_entry(
     collection_id: UUID,
     payload: TMEntryUpdatePayload,
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     collection = _get_collection_or_404(db, collection_id)
     if collection is None:
@@ -4907,6 +4912,7 @@ def add_tm_collection_entry(
 def add_tm_entry(
     entry: TMEntry,
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     """添加单条 TM 记录（去重：相同原文不重复添加）"""
     source_text = normalize_text(entry.source_text)
@@ -4970,6 +4976,7 @@ def update_tm_entry(
     entry_id: UUID,
     payload: TMEntryUpdatePayload,
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     entry = db.query(TranslationMemory).filter(TranslationMemory.id == entry_id).first()
     if entry is None:
@@ -5020,6 +5027,7 @@ def update_tm_entry(
 def delete_tm_entry(
     entry_id: UUID,
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     entry = db.query(TranslationMemory).filter(TranslationMemory.id == entry_id).first()
     if entry is None:
@@ -5077,6 +5085,7 @@ def _upsert_tm_entry(
 def batch_add_tm_entries(
     batch: BatchTMEntry,
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     """批量添加 TM 记录（去重）"""
     created_count = 0

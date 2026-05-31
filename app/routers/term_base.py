@@ -11,7 +11,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.auth import get_current_user
+from app.auth import get_current_user, require_admin
 from app.database import get_db
 from app.models import FileRecord, TermBase, TermEntry, User
 from app.services.language_pairs import require_language_pair
@@ -226,6 +226,7 @@ def get_term_base(
 def create_term_base(
     payload: TermBasePayload,
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     name = _normalize_term_base_name(payload.name)
     if not name:
@@ -256,7 +257,7 @@ def create_term_base(
 def merge_term_bases(
     payload: TermBaseMergePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     source_term_base_ids = list(dict.fromkeys(payload.source_term_base_ids))
     if len(source_term_base_ids) < 2:
@@ -374,6 +375,7 @@ def update_term_base(
     term_base_id: UUID,
     payload: TermBasePayload,
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
     name = _normalize_term_base_name(payload.name)
@@ -419,6 +421,7 @@ def update_term_base(
 def delete_term_base(
     term_base_id: UUID,
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
     entry_count = (
@@ -464,6 +467,7 @@ async def import_term_base_xlsx(
     source_language: str = Form(...),
     target_language: str = Form(...),
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     if term_base_id is None:
         raise HTTPException(status_code=400, detail="请先选择要导入的术语库。")
@@ -534,7 +538,7 @@ def batch_save_term_base_entries(
     term_base_id: UUID,
     payload: TermEntryBatchPayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
     return save_term_entries_batch(
@@ -657,7 +661,7 @@ def create_term_base_entry(
     term_base_id: UUID,
     payload: TermEntryUpdatePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
     source_text = normalize_text(payload.source_text)
@@ -702,6 +706,7 @@ def update_term_entry(
     entry_id: UUID,
     payload: TermEntryUpdatePayload,
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     entry = db.query(TermEntry).filter(TermEntry.id == entry_id).first()
     if entry is None:
@@ -748,6 +753,7 @@ def update_term_entry(
 def delete_term_entry(
     entry_id: UUID,
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     entry = db.query(TermEntry).filter(TermEntry.id == entry_id).first()
     if entry is None:
