@@ -789,6 +789,13 @@ export const useSegmentStore = defineStore('segment', () => {
     return typeof index === 'number' ? index : -1
   }
 
+  function rebuildSegmentIndexMap() {
+    segmentIndexMap.clear()
+    segments.value.forEach((segment, index) => {
+      segmentIndexMap.set(segment.sentence_id, index)
+    })
+  }
+
   async function ensureSentenceLoaded(sentenceId: string) {
     return getSegmentIndex(sentenceId)
   }
@@ -800,7 +807,7 @@ export const useSegmentStore = defineStore('segment', () => {
     previewUpdateToken.value += 1
   }
 
-  function updateTarget(sentenceId: string, targetText: string) {
+  function updateTarget(sentenceId: string, targetText: string, targetHtml?: string) {
     const index = getSegmentIndex(sentenceId)
     if (index === -1) {
       return
@@ -813,6 +820,7 @@ export const useSegmentStore = defineStore('segment', () => {
     const nextSegment = {
       ...segment,
       target_text: targetText,
+      target_html: targetHtml || null,
       source: 'manual',
       status: 'confirmed',
       llm_provider: null,
@@ -827,6 +835,7 @@ export const useSegmentStore = defineStore('segment', () => {
       [sentenceId]: {
         sentence_id: sentenceId,
         target_text: targetText,
+        target_html: targetHtml || null,
         source: 'manual',
         track_revision: revisionTrackingEnabled.value,
         base_version: segment.version ?? 1,
@@ -837,6 +846,32 @@ export const useSegmentStore = defineStore('segment', () => {
     conflictEntries.value = nextConflicts
     syncMessage.value = translate('stores.segment.syncPending', { count: dirtyCount.value })
     scheduleSync()
+  }
+
+  async function updateSource(sentenceId: string, sourceText: string) {
+    const index = getSegmentIndex(sentenceId)
+    if (index === -1) {
+      return
+    }
+
+    const segment = segments.value[index]
+    const nextSegment = {
+      ...segment,
+      source_text: sourceText,
+      display_text: sourceText,
+    }
+    segments.value[index] = nextSegment
+
+    // 直接同步到后端
+    try {
+      await http.put(`/file-records/${fileRecord.value?.id}/segments/${sentenceId}/source`, {
+        source_text: sourceText,
+      })
+    } catch (error) {
+      // 恢复原值
+      segments.value[index] = segment
+      throw error
+    }
   }
 
   function setActiveSentence(sentenceId: string | null) {
@@ -934,6 +969,7 @@ export const useSegmentStore = defineStore('segment', () => {
         if (
           currentEntry
           && currentEntry.target_text === update.target_text
+          && (currentEntry.target_html || null) === (update.target_html || null)
           && currentEntry.source === update.source
           && (updatedSentenceIds.size === 0 || updatedSentenceIds.has(update.sentence_id))
           && !conflictSentenceIds.has(update.sentence_id)
@@ -994,7 +1030,17 @@ export const useSegmentStore = defineStore('segment', () => {
         })
         return false
       }
-      throw error
+      console.error('Failed to sync segments:', error)
+      const message = (error as any)?.response?.data?.detail || '保存失败，请重试'
+      syncMessage.value = translate('stores.segment.syncFailed')
+      pushToast({
+        tone: 'error',
+        title: '保存失败',
+        message: String(message),
+      })
+      // 稍后重试
+      scheduleSync()
+      return false
     } finally {
       saving.value = false
     }
@@ -1351,6 +1397,61 @@ export const useSegmentStore = defineStore('segment', () => {
     return data
   }
 
+  async function splitSegment(sentenceId: string, splitOffset: number) {
+    if (!fileRecord.value) return null
+    // 先同步未保存的修改
+    if (dirtyCount.value > 0) {
+      await syncToBackend()
+    }
+    const { data } = await http.post<{ first: Segment; second: Segment }>(
+      `/file-records/${fileRecord.value.id}/segments/${sentenceId}/split`,
+      { split_offset: splitOffset },
+    )
+    // 更新本地 segments 列表
+    const index = getSegmentIndex(sentenceId)
+    if (index !== -1) {
+      segments.value.splice(index, 1, data.first, data.second)
+      rebuildSegmentIndexMap()
+      totalSegmentCount.value += 1
+      matchedSegmentCount.value += 1
+    }
+    // 使预览缓存失效，强制下次重新加载
+    invalidatePreviewCache()
+    return data
+  }
+
+  async function mergeSegment(sentenceId: string, targetSentenceId: string) {
+    if (!fileRecord.value) return null
+    // 先同步未保存的修改
+    if (dirtyCount.value > 0) {
+      await syncToBackend()
+    }
+    const { data } = await http.post<{ merged: Segment; deleted_sentence_id: string }>(
+      `/file-records/${fileRecord.value.id}/segments/${sentenceId}/merge`,
+      { target_sentence_id: targetSentenceId },
+    )
+    // 更新本地 segments 列表
+    const firstIndex = getSegmentIndex(sentenceId)
+    const secondIndex = getSegmentIndex(targetSentenceId)
+    if (firstIndex !== -1) {
+      segments.value[firstIndex] = data.merged
+    }
+    if (secondIndex !== -1) {
+      segments.value.splice(secondIndex, 1)
+    }
+    rebuildSegmentIndexMap()
+    totalSegmentCount.value -= 1
+    matchedSegmentCount.value -= 1
+    // 使预览缓存失效，强制下次重新加载
+    invalidatePreviewCache()
+    return data
+  }
+
+  function invalidatePreviewCache() {
+    previewLoaded = false
+    previewCacheKey = ''
+  }
+
   return {
     fileRecord,
     segments,
@@ -1408,6 +1509,7 @@ export const useSegmentStore = defineStore('segment', () => {
     loadRevisions,
     loadSaveToTMStats,
     updateTarget,
+    updateSource,
     setActiveSentence,
     getTermMatches,
     syncToBackend,
@@ -1420,6 +1522,8 @@ export const useSegmentStore = defineStore('segment', () => {
     startLLMTranslation,
     abortLLM,
     downloadTranslatedFile,
+    splitSegment,
+    mergeSegment,
     resetState,
   }
 })

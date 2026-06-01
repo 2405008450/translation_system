@@ -69,6 +69,7 @@ REQUIRED_SCHEMA = {
         "target_language",
         "creator_id",
         "collection_id",
+        "collection_ids_json",
         "term_base_id",
         "term_base_ids",
         "deadline",
@@ -79,6 +80,7 @@ REQUIRED_SCHEMA = {
         "llm_provider",
         "llm_model",
         "version",
+        "target_html",
     },
     "translation_metric_events": {
         "id",
@@ -628,6 +630,16 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
             """
             ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS collection_ids_json TEXT NOT NULL DEFAULT '[]'
+            """,
+            """
+            UPDATE file_records
+            SET collection_ids_json = json_build_array(collection_id)::text
+            WHERE collection_id IS NOT NULL
+              AND (collection_ids_json IS NULL OR collection_ids_json = '[]')
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
             ADD COLUMN IF NOT EXISTS term_base_id UUID REFERENCES term_bases(id) ON DELETE SET NULL
             """,
             """
@@ -677,6 +689,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS segments
             ADD COLUMN IF NOT EXISTS llm_model VARCHAR(200)
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS target_html TEXT
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_segments_file_record_order

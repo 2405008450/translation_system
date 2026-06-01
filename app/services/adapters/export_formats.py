@@ -81,8 +81,10 @@ EXPORT_OPTIONS = {
 # 键: 文件扩展名, 值: 支持的导出选项 ID 列表
 FORMAT_EXPORT_SUPPORT: Dict[str, List[str]] = {
     # 办公文档
-    ".pptx": ["original", "bilingual_txt", "tmx", "xliff"],
-    ".xlsx": ["original", "bilingual_txt", "tmx", "xliff"],
+    ".docx": ["original", "bilingual_docx", "bilingual_txt", "tmx", "xliff"],
+    ".pdf": ["bilingual_docx", "bilingual_txt", "tmx", "xliff"],  # PDF 无法原格式导出
+    ".pptx": ["original", "bilingual_docx", "bilingual_txt", "tmx", "xliff"],
+    ".xlsx": ["original", "bilingual_docx", "bilingual_txt", "tmx", "xliff"],
     
     # 纯文本
     ".txt": ["original", "bilingual_txt", "tmx", "xliff"],

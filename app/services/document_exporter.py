@@ -4,6 +4,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from io import BytesIO
 from itertools import count
 from pathlib import Path
@@ -50,6 +51,87 @@ BlockKey = tuple[str, int, int | None, int | None]
 MATH_PLACEHOLDER_RE = re.compile(r"⟦MATH_\d+⟧|\[\[MATH_\d+\]\]")
 ENGLISH_BOUNDARY_TRAILING_RE = re.compile(r"[,;:.!?][\"')\]\}]*$")
 ENGLISH_WORD_LEADING_RE = re.compile(r"^[\"'“‘(\[]*[A-Za-z0-9]")
+# 支持的格式标签
+FORMAT_TAG_RE = re.compile(r"<(/?)(b|strong|i|em|u|s|strike|del|sub|sup)>", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class FormattedTextFragment:
+    """带格式的文本片段"""
+    text: str
+    bold: bool = False
+    italic: bool = False
+    underline: bool = False
+    strike: bool = False
+    subscript: bool = False
+    superscript: bool = False
+
+
+def _has_format_tags(html: str | None) -> bool:
+    """检查 HTML 是否包含格式标签"""
+    if not html:
+        return False
+    return bool(FORMAT_TAG_RE.search(html))
+
+
+def _parse_formatted_html(html: str) -> list[FormattedTextFragment]:
+    """解析带格式的 HTML，返回格式化文本片段列表"""
+    fragments: list[FormattedTextFragment] = []
+
+    class FormatHTMLParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.format_stack: list[set[str]] = [set()]
+            self.current_formats: set[str] = set()
+
+        def handle_starttag(self, tag: str, attrs):
+            tag_lower = tag.lower()
+            if tag_lower in ('b', 'strong'):
+                self.current_formats.add('bold')
+            elif tag_lower in ('i', 'em'):
+                self.current_formats.add('italic')
+            elif tag_lower == 'u':
+                self.current_formats.add('underline')
+            elif tag_lower in ('s', 'strike', 'del'):
+                self.current_formats.add('strike')
+            elif tag_lower == 'sub':
+                self.current_formats.add('subscript')
+            elif tag_lower == 'sup':
+                self.current_formats.add('superscript')
+            self.format_stack.append(self.current_formats.copy())
+
+        def handle_endtag(self, tag: str):
+            tag_lower = tag.lower()
+            if tag_lower in ('b', 'strong'):
+                self.current_formats.discard('bold')
+            elif tag_lower in ('i', 'em'):
+                self.current_formats.discard('italic')
+            elif tag_lower == 'u':
+                self.current_formats.discard('underline')
+            elif tag_lower in ('s', 'strike', 'del'):
+                self.current_formats.discard('strike')
+            elif tag_lower == 'sub':
+                self.current_formats.discard('subscript')
+            elif tag_lower == 'sup':
+                self.current_formats.discard('superscript')
+            if self.format_stack:
+                self.format_stack.pop()
+
+        def handle_data(self, data: str):
+            if data:
+                fragments.append(FormattedTextFragment(
+                    text=data,
+                    bold='bold' in self.current_formats,
+                    italic='italic' in self.current_formats,
+                    underline='underline' in self.current_formats,
+                    strike='strike' in self.current_formats,
+                    subscript='subscript' in self.current_formats,
+                    superscript='superscript' in self.current_formats,
+                ))
+
+    parser = FormatHTMLParser()
+    parser.feed(html)
+    return fragments
 
 
 @dataclass(frozen=True)
@@ -57,6 +139,7 @@ class ExportSegment:
     sentence_id: str
     source_text: str
     target_text: str
+    target_html: str | None = None
     math_placeholders: dict[str, str] = field(default_factory=dict)
 
 
@@ -151,12 +234,14 @@ def _group_segments_by_block(
         row_index = _to_optional_int(_get_segment_value(segment, "row_index"))
         cell_index = _to_optional_int(_get_segment_value(segment, "cell_index"))
         sentence_id = str(_get_segment_value(segment, "sentence_id", "") or "")
+        target_html = _get_segment_value(segment, "target_html")
 
         grouped[(block_type, block_index, row_index, cell_index)].append(
             ExportSegment(
                 sentence_id=sentence_id,
                 source_text=str(_get_segment_value(segment, "source_text", "") or ""),
                 target_text=str(_get_segment_value(segment, "target_text", "") or ""),
+                target_html=str(target_html) if target_html else None,
                 math_placeholders=dict(math_map.get(sentence_id) or {}),
             )
         )
@@ -645,6 +730,10 @@ def _replace_block_tokens(
             continue
 
         expected_math_placeholders = _extract_math_placeholders_from_tokens(tokens, span)
+
+        # 检查是否有自定义格式（target_html 包含格式标签）
+        has_custom_format = _has_format_tags(segment.target_html)
+
         if expected_math_placeholders:
             _queue_math_sentence_replacement(
                 tokens=tokens,
@@ -652,6 +741,9 @@ def _replace_block_tokens(
                 replacement=replacement,
                 expected_math_placeholders=expected_math_placeholders,
             )
+        elif has_custom_format:
+            # 使用带格式的替换
+            _queue_formatted_sentence_replacement(tokens, span, segment.target_html)
         else:
             _queue_sentence_replacement(tokens, span, replacement)
 
@@ -883,6 +975,128 @@ def _collect_span_text(
         pieces.append(base_text[local_start:local_end])
 
     return "".join(pieces)
+
+
+def _queue_formatted_sentence_replacement(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+    target_html: str,
+) -> None:
+    """使用带格式的 HTML 替换句子"""
+    # 解析 HTML 获取格式化片段
+    fragments = _parse_formatted_html(target_html)
+    if not fragments:
+        return
+
+    # 找到可写入的 token
+    writable_overlaps: list[tuple[TextToken, int, int]] = []
+    for token in tokens:
+        if token.element is None:
+            continue
+        overlap_start = max(span.start, token.start)
+        overlap_end = min(span.end, token.end)
+        if overlap_end <= overlap_start:
+            continue
+        writable_overlaps.append(
+            (token, overlap_start - token.start, overlap_end - token.start)
+        )
+
+    if not writable_overlaps:
+        return
+
+    # 清空所有重叠 token 的文本
+    first_token, first_start, first_end = writable_overlaps[0]
+    for token, local_start, local_end in writable_overlaps:
+        token.edits.append((local_start, local_end, ""))
+
+    # 在第一个 token 位置插入格式化的 runs
+    if first_token.run_element is not None and first_token.container_element is not None:
+        parent = first_token.container_element
+        anchor = first_token.anchor_element or first_token.run_element
+        insert_index = list(parent).index(anchor)
+
+        # 为每个格式化片段创建一个 run
+        for i, fragment in enumerate(fragments):
+            if not fragment.text:
+                continue
+            run = _build_formatted_word_run(fragment, first_token.run_element)
+            parent.insert(insert_index + i, run)
+
+
+def _build_formatted_word_run(
+    fragment: FormattedTextFragment,
+    reference_run: ET.Element | None,
+) -> ET.Element:
+    """根据格式化片段构建 Word run 元素"""
+    # 复制参考 run 或创建新的
+    if reference_run is not None and _namespace_uri(reference_run.tag) == NS["w"]:
+        run_element = deepcopy(reference_run)
+        # 移除非 rPr 的子元素
+        for child in list(run_element):
+            if _local_name(child.tag) != "rPr":
+                run_element.remove(child)
+    else:
+        run_element = ET.Element(_qn("w", "r"))
+
+    # 获取或创建 rPr（run properties）
+    run_properties = run_element.find("w:rPr", NS)
+    if run_properties is None:
+        run_properties = ET.Element(_qn("w", "rPr"))
+        run_element.insert(0, run_properties)
+
+    # 应用格式
+    if fragment.bold:
+        _set_run_property(run_properties, "b")
+    if fragment.italic:
+        _set_run_property(run_properties, "i")
+    if fragment.underline:
+        _set_run_underline(run_properties)
+    if fragment.strike:
+        _set_run_property(run_properties, "strike")
+    if fragment.subscript:
+        _set_run_vertical_align(run_properties, "subscript")
+    if fragment.superscript:
+        _set_run_vertical_align(run_properties, "superscript")
+
+    # 创建文本元素
+    text_element = ET.Element(_qn("w", "t"))
+    text_element.text = fragment.text
+    if _needs_space_preserve(fragment.text):
+        text_element.set(XML_SPACE_ATTR, "preserve")
+    run_element.append(text_element)
+
+    # 应用导出字体
+    _apply_export_font(run_element)
+
+    return run_element
+
+
+def _set_run_property(run_properties: ET.Element, prop_name: str) -> None:
+    """设置 run 属性（如 bold, italic, strike）"""
+    prop = run_properties.find(f"w:{prop_name}", NS)
+    if prop is None:
+        prop = ET.Element(_qn("w", prop_name))
+        run_properties.append(prop)
+    # 确保属性启用（移除 val="false" 如果存在）
+    prop.attrib.pop(_qn("w", "val"), None)
+
+
+def _set_run_underline(run_properties: ET.Element) -> None:
+    """设置下划线"""
+    underline = run_properties.find("w:u", NS)
+    if underline is None:
+        underline = ET.Element(_qn("w", "u"))
+        run_properties.append(underline)
+    underline.set(_qn("w", "val"), "single")
+
+
+def _set_run_vertical_align(run_properties: ET.Element, align_type: str) -> None:
+    """设置垂直对齐（上标/下标）"""
+    vert_align = run_properties.find("w:vertAlign", NS)
+    if vert_align is None:
+        vert_align = ET.Element(_qn("w", "vertAlign"))
+        run_properties.append(vert_align)
+    vert_align.set(_qn("w", "val"), align_type)
 
 
 def _queue_sentence_replacement(

@@ -6,33 +6,54 @@ import InteractiveDiffText from './InteractiveDiffText.vue'
 import { getSegmentSourceMeta, getSegmentStatusMeta } from '../constants/status'
 import type { Segment, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
 import { computeDiff } from '../utils/textDiff'
+import type { TextFormat } from '../composables/useRichTextEditor'
 
 const props = withDefaults(defineProps<{
   segment: Segment
   index: number
   active: boolean
   disabled?: boolean
+  sourceEditing?: boolean
+  selected?: boolean
   pendingRevision?: SegmentRevisionEntry | null
   revisionBusy?: boolean
   matchedTerms?: TermEntryRecord[]
   sourceSearchQuery?: string
+  showVisibleChars?: boolean
+  pendingFormats?: Record<TextFormat, boolean> & { _overrideActive?: boolean }
 }>(), {
   disabled: false,
+  sourceEditing: false,
+  selected: false,
   pendingRevision: null,
   revisionBusy: false,
   matchedTerms: () => [],
   sourceSearchQuery: '',
+  showVisibleChars: false,
+  pendingFormats: () => ({
+    bold: false,
+    italic: false,
+    underline: false,
+    strikethrough: false,
+    subscript: false,
+    superscript: false,
+    _overrideActive: false,
+  }),
 })
 
 const emit = defineEmits<{
-  update: [sentenceId: string, value: string]
+  update: [sentenceId: string, value: string, html?: string]
+  updateSource: [sentenceId: string, value: string]
   focus: [sentenceId: string]
   activateTarget: [sentenceId: string]
   applyPartialRevision: [revisionId: string, newText: string]
+  ctrlClick: [sentenceId: string, event: MouseEvent]
 }>()
 
 const editorRef = ref<HTMLDivElement | null>(null)
+const sourceEditorRef = ref<HTMLDivElement | null>(null)
 const isFocused = ref(false)
+const isSourceFocused = ref(false)
 const isComposing = ref(false)
 const MAX_EDITOR_HISTORY_SIZE = 100
 
@@ -201,15 +222,20 @@ const highlightedTargetText = computed(() => {
 
 // 生成带高亮的 HTML
 const targetHtmlContent = computed(() => {
+  // 如果有保存的格式化 HTML，优先使用
+  if (props.segment.target_html) {
+    return props.segment.target_html
+  }
+
   const segments = highlightedTargetText.value
   if (!segments) {
-    return escapeHtml(props.segment.target_text || '')
+    return textToVisibleChars(props.segment.target_text || '')
   }
   return segments
     .map((seg) =>
       seg.highlight
-        ? `<mark class="segment-row__term-highlight">${escapeHtml(seg.text)}</mark>`
-        : escapeHtml(seg.text)
+        ? `<mark class="segment-row__term-highlight">${textToVisibleChars(seg.text)}</mark>`
+        : textToVisibleChars(seg.text)
     )
     .join('')
 })
@@ -243,16 +269,28 @@ function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;')
 }
 
+/**
+ * 将文本转换为显示标记模式（显示空格、制表符、换行符）
+ */
+function textToVisibleChars(text: string): string {
+  const escaped = escapeHtml(text)
+  if (!props.showVisibleChars) return escaped
+  return escaped
+    .replace(/ /g, '<span class="visible-char visible-char--space" contenteditable="false">·</span>')
+    .replace(/\t/g, '<span class="visible-char visible-char--tab" contenteditable="false">→</span>')
+    .replace(/\n/g, '<span class="visible-char visible-char--newline" contenteditable="false">¶</span>\n')
+}
+
 function renderTargetTextHtml(text: string): string {
   const segments = highlightText(text, props.matchedTerms || [], 'target_text')
   if (!segments) {
-    return escapeHtml(text)
+    return textToVisibleChars(text)
   }
   return segments
     .map((seg) =>
       seg.highlight
-        ? `<mark class="segment-row__term-highlight">${escapeHtml(seg.text)}</mark>`
-        : escapeHtml(seg.text)
+        ? `<mark class="segment-row__term-highlight">${textToVisibleChars(seg.text)}</mark>`
+        : textToVisibleChars(seg.text)
     )
     .join('')
 }
@@ -261,7 +299,7 @@ function renderTargetTextHtml(text: string): string {
 function saveCaretPosition(el: HTMLElement): number {
   const selection = window.getSelection()
   if (!selection || selection.rangeCount === 0) return 0
-  
+
   const range = selection.getRangeAt(0)
   const preCaretRange = range.cloneRange()
   preCaretRange.selectNodeContents(el)
@@ -316,6 +354,12 @@ function getSerializableNodeLength(node: Node): number {
   if (isRevisionDeleteNode(node)) {
     return 0
   }
+  if (
+    node.nodeType === Node.ELEMENT_NODE
+    && (node as HTMLElement).classList.contains('visible-char')
+  ) {
+    return 1
+  }
   if (node.nodeType === Node.TEXT_NODE) {
     return node.textContent?.length || 0
   }
@@ -329,6 +373,15 @@ function serializeEditorContent(node: Node): string {
   if (isRevisionDeleteNode(node)) {
     return ''
   }
+  if (
+    node.nodeType === Node.ELEMENT_NODE
+    && (node as HTMLElement).classList.contains('visible-char')
+  ) {
+    const el = node as HTMLElement
+    if (el.classList.contains('visible-char--space')) return ' '
+    if (el.classList.contains('visible-char--tab')) return '\t'
+    if (el.classList.contains('visible-char--newline')) return '\n'
+  }
   if (node.nodeType === Node.TEXT_NODE) {
     return node.textContent || ''
   }
@@ -336,6 +389,48 @@ function serializeEditorContent(node: Node): string {
     return '\n'
   }
   return Array.from(node.childNodes).map(serializeEditorContent).join('')
+}
+
+/**
+ * 序列化编辑器内容，保留格式标签
+ */
+function serializeEditorContentWithFormat(node: Node): string {
+  if (isRevisionDeleteNode(node)) {
+    return ''
+  }
+  if (
+    node.nodeType === Node.ELEMENT_NODE
+    && (node as HTMLElement).classList.contains('visible-char')
+  ) {
+    return escapeHtml(serializeEditorContent(node))
+  }
+  if (node.nodeType === Node.TEXT_NODE) {
+    return escapeHtml(node.textContent || '')
+  }
+  if (node.nodeType === Node.ELEMENT_NODE) {
+    const el = node as HTMLElement
+    const tagName = el.tagName.toLowerCase()
+
+    // BR 标签转换为换行
+    if (tagName === 'br') {
+      return '\n'
+    }
+
+    // 处理子节点
+    const childContent = Array.from(el.childNodes)
+      .map(child => serializeEditorContentWithFormat(child))
+      .join('')
+
+    // 保留格式标签
+    const formatTags = ['b', 'strong', 'i', 'em', 'u', 's', 'strike', 'del', 'sub', 'sup']
+    if (formatTags.includes(tagName)) {
+      const normalizedTag = normalizeTagName(tagName)
+      return `<${normalizedTag}>${childContent}</${normalizedTag}>`
+    }
+
+    return childContent
+  }
+  return ''
 }
 
 function saveSerializableCaretPosition(el: HTMLElement): number {
@@ -516,8 +611,47 @@ function handleBlur() {
   isFocused.value = false
 }
 
-function handleClick() {
+function handleClick(event?: MouseEvent) {
+  if (event && (event.ctrlKey || event.metaKey)) {
+    emit('ctrlClick', props.segment.sentence_id, event)
+    return
+  }
   emit('activateTarget', props.segment.sentence_id)
+}
+
+function handleSourceFocus() {
+  isSourceFocused.value = true
+}
+
+function handleSourceBlur() {
+  isSourceFocused.value = false
+}
+
+function handleSourceInput() {
+  if (!sourceEditorRef.value) return
+  if (!props.sourceEditing) {
+    // 非编辑模式下恢复原文内容
+    sourceEditorRef.value.textContent = props.segment.display_text || props.segment.source_text
+    return
+  }
+  const text = sourceEditorRef.value.textContent || ''
+  emit('updateSource', props.segment.sentence_id, text)
+}
+
+function handleSourceBeforeInput(event: Event) {
+  if (!props.sourceEditing) {
+    event.preventDefault()
+  }
+}
+
+function handleSourceKeydown(event: KeyboardEvent) {
+  if (!props.sourceEditing) {
+    // 允许光标移动键和选择键
+    const allowedKeys = ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End']
+    if (!allowedKeys.includes(event.key) && !event.ctrlKey && !event.metaKey) {
+      event.preventDefault()
+    }
+  }
 }
 
 function handleEditorShellClick() {
@@ -554,6 +688,21 @@ function handleBeforeInput(event: Event) {
   }
 
   recordUndoSnapshot()
+
+  if (inputEvent.inputType !== 'insertText' && inputEvent.inputType !== 'insertCompositionText') {
+    return
+  }
+  if (!props.pendingFormats?._overrideActive) {
+    return
+  }
+
+  const data = inputEvent.data
+  if (!data) return
+
+  inputEvent.preventDefault()
+  const wrappedHtml = wrapTextWithFormats(data)
+  document.execCommand('insertHTML', false, wrappedHtml)
+  handleInput()
 }
 
 function handleKeydown(event: KeyboardEvent) {
@@ -593,8 +742,70 @@ function handleInput() {
   if (isApplyingHistory.value) return
   if (isComposing.value) return
 
+  // 检查是否有格式标签
+  const cleanHtml = serializeEditorContentWithFormat(editorRef.value)
+  const hasFormatTags = /<(b|strong|i|em|u|s|strike|del|sub|sup)>/i.test(cleanHtml)
+
+  // 获取纯文本内容用于保存
   const text = serializeEditorContent(editorRef.value)
+
+  // 如果有格式标签，同时传递 HTML
+  if (hasFormatTags) {
+    // 清理 HTML，只保留格式标签
+    emit('update', props.segment.sentence_id, text, cleanHtml)
+    return
+  }
+
+  // 没有格式标签，只传递纯文本
   emit('update', props.segment.sentence_id, text)
+
+  // 没有格式标签时，可以重新渲染以显示术语高亮等
+  const caretPos = saveSerializableCaretPosition(editorRef.value)
+  nextTick(() => {
+    if (editorRef.value && isFocused.value) {
+      editorRef.value.innerHTML = editorHtmlContent.value
+      restoreSerializableCaretPosition(editorRef.value, caretPos)
+    }
+  })
+}
+
+/**
+ * 检查是否有待应用的格式
+ */
+function hasPendingFormats(): boolean {
+  if (!props.pendingFormats) return false
+  return Object.entries(props.pendingFormats)
+    .filter(([key]) => key !== '_overrideActive')
+    .some(([, value]) => value)
+}
+
+/**
+ * 根据待应用的格式包装文本
+ */
+function wrapTextWithFormats(text: string): string {
+  let result = escapeHtml(text)
+
+  // 按顺序应用格式标签
+  if (props.pendingFormats.subscript) {
+    result = `<sub>${result}</sub>`
+  }
+  if (props.pendingFormats.superscript) {
+    result = `<sup>${result}</sup>`
+  }
+  if (props.pendingFormats.strikethrough) {
+    result = `<s>${result}</s>`
+  }
+  if (props.pendingFormats.underline) {
+    result = `<u>${result}</u>`
+  }
+  if (props.pendingFormats.italic) {
+    result = `<i>${result}</i>`
+  }
+  if (props.pendingFormats.bold) {
+    result = `<b>${result}</b>`
+  }
+
+  return result
 }
 
 // 监听外部数据变化，更新编辑器内容
@@ -615,8 +826,79 @@ function handleCompositionEnd() {
 function handlePaste(event: ClipboardEvent) {
   event.preventDefault()
   recordUndoSnapshot()
+  // 优先获取 HTML 格式，保留格式标签
+  const html = event.clipboardData?.getData('text/html') || ''
   const text = event.clipboardData?.getData('text/plain') || ''
-  document.execCommand('insertText', false, text)
+
+  // 如果有待应用的格式且粘贴的是纯文本，应用格式
+  if (!html && text && hasPendingFormats()) {
+    const wrappedHtml = wrapTextWithFormats(text)
+    document.execCommand('insertHTML', false, wrappedHtml)
+    handleInput()
+    return
+  }
+
+  if (html) {
+    // 清理 HTML，只保留允许的格式标签
+    const cleanHtml = sanitizeHtml(html)
+    document.execCommand('insertHTML', false, cleanHtml)
+  } else {
+    document.execCommand('insertText', false, text)
+  }
+  handleInput()
+}
+
+/**
+ * 清理 HTML，只保留允许的格式标签
+ */
+function sanitizeHtml(html: string): string {
+  const allowedTags = ['b', 'strong', 'i', 'em', 'u', 's', 'strike', 'del', 'sub', 'sup']
+  const tempDiv = document.createElement('div')
+  tempDiv.innerHTML = html
+
+  // 递归处理节点
+  function processNode(node: Node): string {
+    if (node.nodeType === Node.TEXT_NODE) {
+      return escapeHtml(node.textContent || '')
+    }
+
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const el = node as HTMLElement
+      const tagName = el.tagName.toLowerCase()
+
+      // 处理子节点
+      const childContent = Array.from(el.childNodes)
+        .map(child => processNode(child))
+        .join('')
+
+      // 如果是允许的标签，保留它
+      if (allowedTags.includes(tagName)) {
+        // 规范化标签名
+        const normalizedTag = normalizeTagName(tagName)
+        return `<${normalizedTag}>${childContent}</${normalizedTag}>`
+      }
+
+      // 否则只返回内容
+      return childContent
+    }
+
+    return ''
+  }
+
+  return processNode(tempDiv)
+}
+
+/**
+ * 规范化标签名（strong -> b, em -> i 等）
+ */
+function normalizeTagName(tag: string): string {
+  const map: Record<string, string> = {
+    strong: 'b',
+    em: 'i',
+    strike: 's',
+    del: 's',
+  }
+  return map[tag] || tag
 }
 
 function syncEditorHtmlFromState(preserveCaret: boolean) {
@@ -687,12 +969,58 @@ defineExpose({
   canRedoEditorChange,
 })
 
+// 将光标移动到元素末尾
+function moveCursorToEnd(el: HTMLElement) {
+  const range = document.createRange()
+  const selection = window.getSelection()
+  if (!selection) return
+
+  range.selectNodeContents(el)
+  range.collapse(false) // false 表示折叠到末尾
+  selection.removeAllRanges()
+  selection.addRange(range)
+}
+
+// 原文编辑器的当前文本（用于避免响应式干扰）
+const sourceEditText = ref('')
+
+// 监听 active 变化，初始化原文编辑器内容（允许放置光标）
+watch(
+  () => props.active,
+  (isActive) => {
+    if (isActive) {
+      sourceEditText.value = props.segment.display_text || props.segment.source_text
+      nextTick(() => {
+        if (sourceEditorRef.value) {
+          sourceEditorRef.value.textContent = sourceEditText.value
+        }
+      })
+    }
+  },
+  { immediate: true }
+)
+
+// 进入原文编辑模式时聚焦
+watch(
+  () => props.sourceEditing && props.active,
+  (shouldEdit) => {
+    if (shouldEdit) {
+      nextTick(() => {
+        if (sourceEditorRef.value) {
+          sourceEditorRef.value.focus()
+          moveCursorToEnd(sourceEditorRef.value)
+        }
+      })
+    }
+  },
+)
+
 </script>
 
 <template>
   <article
     class="segment-row"
-    :class="[statusClass, parityClass, { 'is-active': active, 'has-pending-revision': hasPendingRevision, 'is-empty-target': isEmptyTarget }]"
+    :class="[statusClass, parityClass, { 'is-active': active, 'is-selected': selected, 'has-pending-revision': hasPendingRevision, 'is-empty-target': isEmptyTarget }]"
     :id="`segment-${segment.sentence_id}`"
     data-testid="segment-row"
     :data-sentence-id="segment.sentence_id"
@@ -718,7 +1046,21 @@ defineExpose({
     </div>
 
     <div class="segment-row__cell segment-row__cell--source" @click="handleClick">
-      <div class="segment-row__text">
+      <div
+        v-if="active"
+        ref="sourceEditorRef"
+        class="segment-row__source-editor"
+        :class="{ 'is-focused': isSourceFocused, 'is-readonly': !sourceEditing }"
+        :contenteditable="true"
+        tabindex="0"
+        spellcheck="false"
+        @focus="handleSourceFocus"
+        @blur="handleSourceBlur"
+        @input="handleSourceInput"
+        @keydown="handleSourceKeydown"
+        @beforeinput="handleSourceBeforeInput"
+      ></div>
+      <div v-else class="segment-row__text">
         <template v-if="highlightedSourceText">
           <template v-for="(seg, idx) in highlightedSourceText" :key="idx">
             <mark
@@ -778,10 +1120,10 @@ defineExpose({
         @focus="handleFocus"
         @blur="handleBlur"
         @click="handleClick"
-        @beforeinput="handleBeforeInput"
         @keydown="handleKeydown"
         @compositionstart="handleCompositionStart"
         @compositionend="handleCompositionEnd"
+        @beforeinput="handleBeforeInput"
         @input="handleInput"
         @paste="handlePaste"
       />
@@ -791,6 +1133,13 @@ defineExpose({
 </template>
 
 <style scoped>
+.segment-row.is-selected {
+  background-color: rgba(13, 122, 104, 0.12);
+  outline: 2px solid rgba(13, 122, 104, 0.45);
+  outline-offset: -2px;
+  border-radius: 4px;
+}
+
 .segment-row__cell--target.is-pending {
   box-shadow: inset 2px 0 0 rgba(0, 122, 204, 0.36);
 }
@@ -977,5 +1326,92 @@ defineExpose({
 .segment-row__editor:empty::before {
   content: '';
   color: var(--text-placeholder);
+}
+
+.segment-row__source-editor {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 64px;
+  padding: 6px 8px;
+  border: 1px solid var(--brand-700, #0d7a68);
+  border-radius: 5px;
+  background: var(--surface-panel, #fff);
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-primary);
+  outline: none;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  overflow: auto;
+  box-shadow: 0 0 0 3px rgba(13, 122, 104, 0.12);
+}
+
+.segment-row__source-editor.is-focused {
+  border-color: var(--brand-700, #0d7a68);
+  box-shadow: 0 0 0 3px rgba(13, 122, 104, 0.18);
+}
+
+.segment-row__source-editor.is-readonly {
+  border-color: var(--border-muted, #e2e8f0);
+  background: var(--surface-panel, #fff);
+  box-shadow: none;
+  cursor: text;
+}
+
+.segment-row__source-editor.is-readonly.is-focused {
+  border-color: var(--brand-400, #5bb5a6);
+  box-shadow: 0 0 0 2px rgba(13, 122, 104, 0.08);
+}
+
+/* 显示标记样式 */
+.segment-row__editor :deep(.visible-char) {
+  color: #9ca3af;
+  font-size: 0.85em;
+  user-select: none;
+  pointer-events: none;
+}
+
+.segment-row__editor :deep(.visible-char--space) {
+  color: #d1d5db;
+}
+
+.segment-row__editor :deep(.visible-char--tab) {
+  color: #93c5fd;
+}
+
+.segment-row__editor :deep(.visible-char--newline) {
+  color: #fca5a5;
+}
+
+/* 富文本格式样式 */
+.segment-row__editor :deep(b),
+.segment-row__editor :deep(strong) {
+  font-weight: 700;
+}
+
+.segment-row__editor :deep(i),
+.segment-row__editor :deep(em) {
+  font-style: italic;
+}
+
+.segment-row__editor :deep(u) {
+  text-decoration: underline;
+}
+
+.segment-row__editor :deep(s),
+.segment-row__editor :deep(strike),
+.segment-row__editor :deep(del) {
+  text-decoration: line-through;
+}
+
+.segment-row__editor :deep(sub) {
+  vertical-align: sub;
+  font-size: 0.75em;
+}
+
+.segment-row__editor :deep(sup) {
+  vertical-align: super;
+  font-size: 0.75em;
 }
 </style>

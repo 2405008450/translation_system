@@ -32,6 +32,7 @@ from app.models import (
     MemoryEntry,
     Project,
     Segment,
+    SegmentRevision,
     TMCollection,
     TermBase,
     TermEntry,
@@ -46,7 +47,12 @@ from app.services.adapters import (
     UnsupportedFormatError,
     get_registry,
 )
-from app.services.analytics_service import get_dashboard_payload, run_analytics_backfill_once
+from app.services.analytics_service import (
+    count_source_words,
+    get_dashboard_payload,
+    record_translation_metric_event,
+    run_analytics_backfill_once,
+)
 from app.services.auto_tm_sync import (
     AutoTMEnqueueSummary,
     enqueue_confirmed_segments_for_auto_tm,
@@ -89,8 +95,9 @@ from app.services.file_record_service import (
     list_segments_for_file_record,
     load_file_record_source,
     resolve_file_record_status,
+    sync_file_record_status,
     update_segment_by_sentence_id,
-    update_segment_with_llm_result,
+    update_segment_source_text,
 )
 from app.services.file_operation_lock_service import (
     FILE_OPERATION_TOKEN_HEADER,
@@ -454,6 +461,7 @@ def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[st
     )
     if selected_collection_ids:
         file_record.collection_id = selected_collection_ids[0]
+        file_record.collection_ids_json = json.dumps([str(cid) for cid in selected_collection_ids])
         _apply_collection_language_pair(file_record, primary_collection)
     file_record.source_language = resolved_source_language
     file_record.target_language = resolved_target_language
@@ -692,6 +700,7 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
         file_record.target_language = resolved_target_language
         if selected_collection_ids:
             file_record.collection_id = selected_collection_ids[0]
+            file_record.collection_ids_json = json.dumps([str(cid) for cid in selected_collection_ids])
         if term_base is not None:
             _store_file_record_term_base_ids(file_record, [term_base_id])
         created_files.append(file_record)
@@ -768,9 +777,14 @@ class WorkerSettings:
 class SegmentUpdate(BaseModel):
     sentence_id: str
     target_text: str
+    target_html: str | None = None
     source: str = "manual"
     track_revision: bool = True
     base_version: int | None = None
+
+
+class SegmentSourceUpdate(BaseModel):
+    source_text: str
 
 
 class BatchSegmentUpdate(BaseModel):
@@ -779,6 +793,16 @@ class BatchSegmentUpdate(BaseModel):
 
 class SegmentConfirmationBatchUpdate(BaseModel):
     action: Literal["confirm", "cancel"]
+
+
+class SegmentSplitRequest(BaseModel):
+    """拆分句段请求"""
+    split_offset: int = Field(..., ge=1, description="在 source_text 中的拆分位置（字符偏移）")
+
+
+class SegmentMergeRequest(BaseModel):
+    """合并句段请求"""
+    target_sentence_id: str = Field(..., description="要合并的下一个句段的 sentence_id")
 
 
 class SegmentReplaceRequest(BaseModel):
@@ -2646,6 +2670,7 @@ def _serialize_workbench_segment(seg: Segment, display_index: int | None = None)
         "source_text": seg.source_text,
         "display_text": seg.display_text,
         "target_text": seg.target_text,
+        "target_html": seg.target_html,
         "status": seg.status,
         "version": int(seg.version or 1),
         "score": seg.score,
@@ -2779,6 +2804,30 @@ def _get_segment_display_index_map(
         .all()
     )
     return {row.id: int(row.display_index) - 1 for row in rows}
+
+
+def _generate_split_sentence_id(original_id: str, db: Session, file_record_id: UUID) -> str:
+    """为拆分生成新的 sentence_id，使用子编号方式（如 "5" → "5.1"）。"""
+    base = original_id
+    suffix = 1
+    while True:
+        candidate = f"{base}.{suffix}"
+        exists = (
+            db.query(Segment.id)
+            .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == candidate)
+            .first()
+        )
+        if not exists:
+            return candidate
+        suffix += 1
+
+
+def _is_cjk_text(text: str) -> bool:
+    """判断文本是否主要为中日韩文字（决定合并时是否加空格）。"""
+    if not text:
+        return False
+    cjk_count = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff' or '\u3000' <= ch <= '\u303f')
+    return cjk_count > len(text) * 0.3
 
 
 def _build_preview_render_segments(segments: list[Segment], mode: str) -> list[dict]:
@@ -3216,7 +3265,16 @@ def get_segment_tm_candidates(
     if not segment:
         raise HTTPException(status_code=404, detail="句段不存在。")
 
-    collection_ids = [file_record.collection_id] if file_record.collection_id else []
+    # 优先使用 collection_ids_json（多记忆库），回退到 collection_id（单记忆库）
+    collection_ids: list[UUID] = []
+    if file_record.collection_ids_json and file_record.collection_ids_json != "[]":
+        try:
+            parsed_ids = json.loads(file_record.collection_ids_json)
+            collection_ids = [UUID(cid) for cid in parsed_ids if cid]
+        except (json.JSONDecodeError, ValueError):
+            pass
+    if not collection_ids and file_record.collection_id:
+        collection_ids = [file_record.collection_id]
 
     candidates = get_tm_candidates_for_text(
         db=db,
@@ -3350,6 +3408,7 @@ def rematch_file_record(
     # 保留当前文档绑定的记忆库，供右侧匹配面板查询 TM 候选。
     if selected_collection_ids:
         file_record.collection_id = selected_collection_ids[0]
+        file_record.collection_ids_json = json.dumps([str(cid) for cid in selected_collection_ids])
 
     db.commit()
     return {
@@ -3378,10 +3437,13 @@ def patch_file_record_bindings(
     if "collection_id" in payload.model_fields_set:
         if payload.collection_id is None:
             file_record.collection_id = None
+            file_record.collection_ids_json = "[]"
         else:
             collection = _get_collection_or_404(db, payload.collection_id)
             _ensure_resource_language_pair_matches(collection, source_language, target_language, "记忆库")
             file_record.collection_id = payload.collection_id
+            # 同步更新 collection_ids_json，保持单记忆库场景的一致性
+            file_record.collection_ids_json = json.dumps([str(payload.collection_id)])
 
     if "term_base_ids" in payload.model_fields_set:
         term_bases = _validate_term_base_ids(db, payload.term_base_ids)
@@ -3615,6 +3677,7 @@ def update_segment(
         file_record_id=file_record_id,
         sentence_id=sentence_id,
         target_text=update.target_text,
+        target_html=update.target_html,
         source=update.source,
         current_user=current_user,
         track_revision=update.track_revision,
@@ -3646,6 +3709,200 @@ def update_segment(
         "updated_count": 1,
         "conflicts": [],
         "segments": [_serialize_workbench_segment(segment)],
+    }
+
+
+@router.put("/file-records/{file_record_id}/segments/{sentence_id}/source")
+@router.put("/documents/{file_record_id}/segments/{sentence_id}/source", include_in_schema=False)
+def update_segment_source(
+    file_record_id: UUID,
+    sentence_id: str,
+    update: SegmentSourceUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+):
+    """更新单个片段的原文"""
+    _require_file_record_write_access(db, file_record_id, operation_token)
+    segment = update_segment_source_text(
+        db=db,
+        file_record_id=file_record_id,
+        sentence_id=sentence_id,
+        source_text=update.source_text,
+    )
+    if not segment:
+        raise HTTPException(status_code=404, detail="片段不存在。")
+
+    return {
+        "id": segment.id,
+        "sentence_id": segment.sentence_id,
+        "source_text": segment.source_text,
+        "display_text": segment.display_text,
+    }
+
+
+@router.post("/file-records/{file_record_id}/segments/{sentence_id}/split")
+def split_segment(
+    file_record_id: UUID,
+    sentence_id: str,
+    payload: SegmentSplitRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+):
+    """拆分句段：在指定偏移位置将一个句段拆为两个。"""
+    _require_file_record_write_access(db, file_record_id, operation_token)
+    segment = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not segment:
+        raise HTTPException(status_code=404, detail="片段不存在。")
+
+    source_text = segment.source_text or ""
+    if payload.split_offset <= 0 or payload.split_offset >= len(source_text):
+        raise HTTPException(status_code=400, detail="拆分位置无效，必须在文本范围内。")
+
+    # 拆分 source_text
+    first_source = source_text[:payload.split_offset].rstrip()
+    second_source = source_text[payload.split_offset:].lstrip()
+    if not first_source or not second_source:
+        raise HTTPException(status_code=400, detail="拆分后不能产生空句段。")
+
+    # 拆分 target_text（按同比例偏移，如果有译文的话）
+    target_text = segment.target_text or ""
+    target_html = segment.target_html
+    first_target = ""
+    second_target = ""
+    if target_text.strip():
+        # 按比例估算译文拆分点
+        ratio = payload.split_offset / len(source_text)
+        target_offset = round(ratio * len(target_text))
+        first_target = target_text[:target_offset].rstrip()
+        second_target = target_text[target_offset:].lstrip()
+
+    # 生成新的 sentence_id：使用子编号方式
+    new_sentence_id = _generate_split_sentence_id(sentence_id, db, file_record_id)
+
+    # 更新原句段
+    segment.source_text = first_source
+    segment.display_text = first_source
+    segment.target_text = first_target
+    segment.target_html = None
+    segment.status = "none" if not first_target.strip() else "confirmed"
+    segment.score = 0.0
+    segment.matched_source_text = None
+    segment.matched_collection_name = None
+    segment.matched_creator_name = None
+    segment.matched_created_at = None
+    segment.matched_updated_at = None
+
+    # 创建新句段
+    new_segment = Segment(
+        file_record_id=file_record_id,
+        sentence_id=new_sentence_id,
+        source_text=second_source,
+        display_text=second_source,
+        target_text=second_target,
+        target_html=None,
+        status="none" if not second_target.strip() else "confirmed",
+        score=0.0,
+        source="manual",
+        block_type=segment.block_type,
+        block_index=segment.block_index,
+        row_index=segment.row_index,
+        cell_index=segment.cell_index,
+    )
+    db.add(new_segment)
+
+    sync_file_record_status(db, file_record_id)
+    db.commit()
+    db.refresh(segment)
+    db.refresh(new_segment)
+
+    return {
+        "first": _serialize_workbench_segment(segment),
+        "second": _serialize_workbench_segment(new_segment),
+    }
+
+
+@router.post("/file-records/{file_record_id}/segments/{sentence_id}/merge")
+def merge_segment(
+    file_record_id: UUID,
+    sentence_id: str,
+    payload: SegmentMergeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+):
+    """合并句段：将当前句段与指定的下一个句段合并为一个。"""
+    _require_file_record_write_access(db, file_record_id, operation_token)
+    first_seg = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not first_seg:
+        raise HTTPException(status_code=404, detail="片段不存在。")
+
+    second_seg = (
+        db.query(Segment)
+        .filter(
+            Segment.file_record_id == file_record_id,
+            Segment.sentence_id == payload.target_sentence_id,
+        )
+        .first()
+    )
+    if not second_seg:
+        raise HTTPException(status_code=404, detail="目标合并片段不存在。")
+
+    # 校验两个句段必须在同一个 block 中
+    if (
+        first_seg.block_index != second_seg.block_index
+        or first_seg.row_index != second_seg.row_index
+        or first_seg.cell_index != second_seg.cell_index
+    ):
+        raise HTTPException(status_code=400, detail="只能合并同一区块内相邻的句段。")
+
+    # 合并文本
+    separator = "" if _is_cjk_text(first_seg.source_text) else " "
+    merged_source = first_seg.source_text.rstrip() + separator + second_seg.source_text.lstrip()
+    merged_target = ""
+    if (first_seg.target_text or "").strip() or (second_seg.target_text or "").strip():
+        merged_target = (first_seg.target_text or "").rstrip() + separator + (second_seg.target_text or "").lstrip()
+
+    # 更新第一个句段
+    first_seg.source_text = merged_source.strip()
+    first_seg.display_text = merged_source.strip()
+    first_seg.target_text = merged_target.strip()
+    first_seg.target_html = None
+    first_seg.status = "none" if not merged_target.strip() else "confirmed"
+    first_seg.score = 0.0
+    first_seg.source = "manual"
+    first_seg.matched_source_text = None
+    first_seg.matched_collection_name = None
+    first_seg.matched_creator_name = None
+    first_seg.matched_created_at = None
+    first_seg.matched_updated_at = None
+
+    # 迁移第二个句段的评论到第一个句段
+    for comment in second_seg.comments:
+        comment.segment_id = first_seg.id
+
+    # 删除第二个句段的修订记录
+    db.query(SegmentRevision).filter(SegmentRevision.segment_id == second_seg.id).delete()
+
+    # 删除第二个句段
+    db.delete(second_seg)
+
+    sync_file_record_status(db, file_record_id)
+    db.commit()
+    db.refresh(first_seg)
+
+    return {
+        "merged": _serialize_workbench_segment(first_seg),
+        "deleted_sentence_id": payload.target_sentence_id,
     }
 
 
@@ -4373,6 +4630,17 @@ async def llm_translate_file_record(
             )
             return
 
+        # Pre-load all segments into memory to avoid per-item SELECT
+        all_segments = (
+            db.query(Segment)
+            .filter(Segment.file_record_id == file_record_id)
+            .all()
+        )
+        seg_map = {s.sentence_id: s for s in all_segments}
+
+        COMMIT_INTERVAL = 50
+        uncommitted_count = 0
+
         async for result in iter_batch_translate(
             translation_tasks,
             provider=body.provider,
@@ -4397,15 +4665,6 @@ async def llm_translate_file_record(
 
             try:
                 ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
-                segment = update_segment_with_llm_result(
-                    db=db,
-                    file_record_id=file_record_id,
-                    sentence_id=result.sentence_id,
-                    target_text=result.translated_text,
-                    current_user=current_user,
-                    llm_provider=result.provider,
-                    llm_model=result.model,
-                )
             except Exception as exc:  # noqa: BLE001
                 db.rollback()
                 error_count += 1
@@ -4419,6 +4678,7 @@ async def llm_translate_file_record(
                 )
                 continue
 
+            segment = seg_map.get(result.sentence_id)
             if not segment:
                 error_count += 1
                 yield _sse_event(
@@ -4427,6 +4687,56 @@ async def llm_translate_file_record(
                         "sentence_id": result.sentence_id,
                         "status": result.status,
                         "message": "片段不存在，无法写回 LLM 译文。",
+                    },
+                )
+                continue
+
+            try:
+                before_text = segment.target_text
+                segment.target_text = result.translated_text
+                segment.target_html = None
+                segment.source = "llm"
+                segment.version = int(segment.version or 1) + 1
+                segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
+                segment.llm_provider = result.provider
+                segment.llm_model = result.model
+
+                # Inline revision creation — skip pending query for LLM bulk writes
+                if (before_text or "") != (result.translated_text or ""):
+                    db.add(SegmentRevision(
+                        file_record_id=file_record_id,
+                        segment_id=segment.id,
+                        sentence_id=segment.sentence_id,
+                        before_text=before_text or "",
+                        after_text=result.translated_text or "",
+                        source="llm",
+                        status="pending",
+                        author_id=current_user.id if current_user else None,
+                    ))
+                record_translation_metric_event(
+                    db,
+                    segment=segment,
+                    before_text=before_text,
+                    after_text=result.translated_text,
+                    source="llm",
+                    current_user=current_user,
+                )
+
+                uncommitted_count += 1
+                if uncommitted_count >= COMMIT_INTERVAL:
+                    db.commit()
+                    uncommitted_count = 0
+
+            except Exception as exc:  # noqa: BLE001
+                db.rollback()
+                uncommitted_count = 0
+                error_count += 1
+                yield _sse_event(
+                    "error",
+                    {
+                        "sentence_id": result.sentence_id,
+                        "status": result.status,
+                        "message": f"数据库更新失败：{exc}",
                     },
                 )
                 continue
@@ -4443,6 +4753,16 @@ async def llm_translate_file_record(
                     "model": result.model,
                 },
             )
+
+        # Final commit for remaining + sync status once
+        try:
+            if uncommitted_count > 0:
+                db.commit()
+            if updated_count > 0:
+                sync_file_record_status(db, file_record_id)
+                db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
 
         if not await request.is_disconnected():
             yield _sse_event(

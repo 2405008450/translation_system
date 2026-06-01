@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import axios from 'axios'
 import {
   ArrowLeft,
@@ -60,6 +60,7 @@ import WorkbenchTermsPanel from '../components/WorkbenchTermsPanel.vue'
 import { http } from '../api/http'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
+import { useRichTextEditor, type TextFormat, type CaseType } from '../composables/useRichTextEditor'
 import { useToast } from '../composables/useToast'
 import { useWorkbenchShortcuts } from '../composables/useWorkbenchShortcuts'
 import { getTaskExportFormatLabel } from '../constants/taskFiles'
@@ -105,6 +106,15 @@ type SaveToTMPayload = {
   collection_id?: string
   collection_name?: string
   scope: SaveToTMScope
+}
+
+const REVISION_TRACE_VISIBLE_STORAGE_KEY = 'workbench.revisionTraceEnabled'
+
+function getInitialRevisionTraceVisible() {
+  if (typeof window === 'undefined') {
+    return false
+  }
+  return window.localStorage.getItem(REVISION_TRACE_VISIBLE_STORAGE_KEY) === '1'
 }
 
 const router = useRouter()
@@ -171,9 +181,10 @@ const showSaveToTMDialog = ref(false)
 const openConfirmMenu = ref(false)
 const confirmationActionLoading = ref(false)
 const openRevisionMenu = ref<RevisionMenuKind | null>(null)
-const revisionTraceVisible = ref(false)
+const revisionTraceVisible = ref(getInitialRevisionTraceVisible())
 const revisionActionLoading = ref(false)
 const segmentSearchOpen = ref(false)
+const sourceEditing = ref(false)
 const sourceSearchInputRef = ref<HTMLInputElement | null>(null)
 const guidelinesEditorRef = ref<HTMLTextAreaElement | null>(null)
 const segmentDisplayScope = ref<SegmentDisplayScope>('all')
@@ -190,6 +201,46 @@ const saveToTMScope = ref<SaveToTMScope>('translated')
 const saveToTMTargetMode = ref<SaveToTMTargetMode>('new')
 const saveToTMCollectionId = ref('')
 const saveToTMNewCollectionName = ref('')
+
+// 富文本编辑相关
+const richTextEditor = useRichTextEditor()
+const showCaseMenu = ref(false)
+const showClearFormatMenu = ref(false)
+const showSpecialCharMenu = ref(false)
+const recentSpecialChars = ref<string[]>([])
+const RECENT_CHARS_STORAGE_KEY = 'workbench.recentSpecialChars'
+
+// 初始化最近使用的特殊字符
+function loadRecentSpecialChars() {
+  try {
+    const saved = window.localStorage.getItem(RECENT_CHARS_STORAGE_KEY)
+    if (saved) {
+      recentSpecialChars.value = JSON.parse(saved)
+    }
+  } catch {}
+}
+loadRecentSpecialChars()
+
+// 特殊字符列表（按行排列）
+const specialCharacters = [
+  ['&', '"', '@', '\\', '·', '^', '†', '‡', '°', '※'],
+  ['#', '№', '°', 'ª', '%', '‰', '‱', '+', '–', '×'],
+  ['÷', '=', '±', '≤', '≥', '≠', '~', '¶', '\'', '"'],
+  ['"', '§', '~', '_', '|', '¡', '©', '®', '℠', '™'],
+  ['™', '¤', '£', '$', '¥', '₩', '₫', 'ı', '€', '₭'],
+  ['₱', '₫', '₹', '₺', '≠', '♪', '₽', '₿', 'ß'],
+]
+
+// 创建一个响应式的格式状态副本，确保传递给子组件时保持响应性
+const pendingFormatsForEditor = computed(() => ({
+  bold: richTextEditor.activeFormats.bold,
+  italic: richTextEditor.activeFormats.italic,
+  underline: richTextEditor.activeFormats.underline,
+  strikethrough: richTextEditor.activeFormats.strikethrough,
+  subscript: richTextEditor.activeFormats.subscript,
+  superscript: richTextEditor.activeFormats.superscript,
+  _overrideActive: richTextEditor.formatOverrideActive.value,
+}))
 
 const termBases = ref<TermBase[]>([])
 const termEntries = ref<TermEntryRecord[]>([])
@@ -1088,10 +1139,18 @@ function retainEmptyTargetSegmentDuringEdit(sentenceId: string, previousTargetTe
   ])
 }
 
-function updateSegmentTarget(sentenceId: string, targetText: string) {
+function updateSegmentTarget(sentenceId: string, targetText: string, targetHtml?: string) {
   const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
   retainEmptyTargetSegmentDuringEdit(sentenceId, segment?.target_text)
-  segmentStore.updateTarget(sentenceId, targetText)
+  segmentStore.updateTarget(sentenceId, targetText, targetHtml)
+}
+
+async function updateSegmentSource(sentenceId: string, sourceText: string) {
+  try {
+    await segmentStore.updateSource(sentenceId, sourceText)
+  } catch (error) {
+    console.error('Failed to update source text:', error)
+  }
 }
 
 async function toggleSegmentSearchPanel() {
@@ -1266,6 +1325,38 @@ function handleConfirmCurrentFromMenu() {
   confirmCurrentSentence()
 }
 
+async function confirmAndMoveToNextUnconfirmed() {
+  if (!activeSegment.value) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+
+  confirmCurrentSentence()
+  const currentIndex = activeEditorIndex.value
+  const segments = editorSegments.value
+  let nextUnconfirmedIndex = -1
+
+  for (let i = currentIndex + 1; i < segments.length; i++) {
+    if (segments[i].status !== 'confirmed') {
+      nextUnconfirmedIndex = i
+      break
+    }
+  }
+
+  if (nextUnconfirmedIndex === -1) {
+    for (let i = 0; i < currentIndex; i++) {
+      if (segments[i].status !== 'confirmed') {
+        nextUnconfirmedIndex = i
+        break
+      }
+    }
+  }
+
+  if (nextUnconfirmedIndex !== -1) {
+    await focusEditorSegmentAtIndex(nextUnconfirmedIndex)
+  }
+}
+
 async function handleConfirmAllSegments() {
   if (confirmableSegmentCount.value === 0) {
     toast.info('当前文件全部句段都已确认。')
@@ -1363,6 +1454,324 @@ function redoActiveSegmentEdit() {
   }
 }
 
+// ========== 拆分/合并句段 ==========
+
+const selectedSentenceIds = ref<Set<string>>(new Set())
+const lastSourceCaretOffset = ref<number | null>(null)
+
+// 切换激活句段时清除光标缓存
+watch(() => segmentStore.activeSentenceId, () => {
+  lastSourceCaretOffset.value = null
+})
+
+function handleSegmentClick(sentenceId: string, event: MouseEvent) {
+  if (event.ctrlKey || event.metaKey) {
+    // Ctrl+Click 多选
+    const next = new Set(selectedSentenceIds.value)
+    if (next.has(sentenceId)) {
+      next.delete(sentenceId)
+    } else {
+      next.add(sentenceId)
+    }
+    selectedSentenceIds.value = next
+  } else {
+    // 普通点击清除多选
+    selectedSentenceIds.value = new Set()
+  }
+}
+
+/**
+ * 监听原文编辑器中的光标变化，实时缓存偏移量
+ */
+function trackSourceCaretPosition() {
+  if (!segmentStore.activeSentenceId) return
+  const row = document.querySelector(`[data-sentence-id="${segmentStore.activeSentenceId}"]`)
+  if (!row) return
+  const sourceEditor = row.querySelector('.segment-row__source-editor') as HTMLElement | null
+  if (!sourceEditor) return
+
+  const selection = window.getSelection()
+  if (!selection || selection.rangeCount === 0) return
+  if (!sourceEditor.contains(selection.anchorNode)) return
+
+  const range = selection.getRangeAt(0)
+  const preCaretRange = range.cloneRange()
+  preCaretRange.selectNodeContents(sourceEditor)
+  preCaretRange.setEnd(range.startContainer, range.startOffset)
+  lastSourceCaretOffset.value = preCaretRange.toString().length
+}
+
+const canSplitSegment = computed(() => {
+  if (!activeSegment.value) return false
+  return (activeSegment.value.source_text || '').length >= 2
+})
+
+const canMergeSegment = computed(() => {
+  return selectedSentenceIds.value.size >= 2
+})
+
+async function handleSplitSegment() {
+  if (!activeSegment.value || !canSplitSegment.value) return
+
+  const caretOffset = lastSourceCaretOffset.value
+  if (caretOffset === null || caretOffset <= 0) {
+    toast.warn({ message: t('workbench.messages.splitNoCaret') })
+    return
+  }
+
+  const sourceText = activeSegment.value.source_text || ''
+  if (caretOffset >= sourceText.length) {
+    toast.warn({ message: t('workbench.messages.splitNoCaret') })
+    return
+  }
+
+  try {
+    await segmentStore.splitSegment(activeSegment.value.sentence_id, caretOffset)
+    lastSourceCaretOffset.value = null
+    // 刷新预览（如果预览面板已打开）
+    if (activeTool.value === 'source-preview' || activeTool.value === 'split-preview') {
+      await segmentStore.ensurePreviewLoaded('source')
+    } else if (activeTool.value === 'target-preview') {
+      await segmentStore.ensurePreviewLoaded('target')
+    }
+    toast.success({ message: t('workbench.messages.splitSuccess') })
+  } catch (error: any) {
+    toast.error({ message: error?.response?.data?.detail || t('workbench.messages.splitFailed') })
+  }
+}
+
+async function handleMergeSegment() {
+  if (!canMergeSegment.value) {
+    toast.warn({ message: t('workbench.messages.mergeSelectAtLeast') })
+    return
+  }
+
+  // 按当前显示顺序排列选中的句段
+  const selectedIds = selectedSentenceIds.value
+  const orderedSegments = editorSegments.value.filter((s) => selectedIds.has(s.sentence_id))
+
+  if (orderedSegments.length < 2) {
+    toast.warn({ message: t('workbench.messages.mergeSelectAtLeast') })
+    return
+  }
+
+  // 检查是否属于同一段落
+  const first = orderedSegments[0]
+  const notSameBlock = orderedSegments.some(
+    (s) =>
+      s.block_index !== first.block_index
+      || s.row_index !== first.row_index
+      || s.cell_index !== first.cell_index,
+  )
+  if (notSameBlock) {
+    toast.warn({ message: t('workbench.messages.mergeDifferentBlock') })
+    return
+  }
+
+  try {
+    const baseSentenceId = orderedSegments[0].sentence_id
+    for (let i = 1; i < orderedSegments.length; i++) {
+      await segmentStore.mergeSegment(baseSentenceId, orderedSegments[i].sentence_id)
+    }
+    selectedSentenceIds.value = new Set()
+    // 刷新预览（如果预览面板已打开）
+    if (activeTool.value === 'source-preview' || activeTool.value === 'split-preview') {
+      await segmentStore.ensurePreviewLoaded('source')
+    } else if (activeTool.value === 'target-preview') {
+      await segmentStore.ensurePreviewLoaded('target')
+    }
+    toast.success({ message: t('workbench.messages.mergeSuccess') })
+  } catch (error: any) {
+    toast.error({ message: error?.response?.data?.detail || t('workbench.messages.mergeFailed') })
+  }
+}
+
+// ========== 富文本格式化功能 ==========
+
+/**
+ * 获取当前活动的编辑器元素
+ */
+function getActiveEditorElement(): HTMLElement | null {
+  if (!segmentStore.activeSentenceId) return null
+  const selector = `[data-segment-target="true"][data-sentence-id="${segmentStore.activeSentenceId}"]`
+  return document.querySelector(selector)
+}
+
+/**
+ * 应用文本格式（粗体、斜体、下划线等）
+ */
+function applyTextFormat(format: TextFormat) {
+  const editor = getActiveEditorElement()
+
+  if (editor) {
+    // 确保编辑器获得焦点
+    editor.focus()
+
+    // 如果没有选区或选区不在编辑器内，将光标放到编辑器末尾
+    const selection = window.getSelection()
+    if (!selection || selection.rangeCount === 0 || !editor.contains(selection.anchorNode)) {
+      const range = document.createRange()
+      range.selectNodeContents(editor)
+      range.collapse(false)
+      selection?.removeAllRanges()
+      selection?.addRange(range)
+    }
+
+    // 应用格式（会同时切换 activeFormats 状态）
+    richTextEditor.applyFormat(format, editor)
+
+    // 触发 input 事件以同步数据
+    editor.dispatchEvent(new Event('input', { bubbles: true }))
+  } else {
+    // 没有活动编辑器时，只切换格式状态
+    richTextEditor.activeFormats[format] = !richTextEditor.activeFormats[format]
+    richTextEditor.formatOverrideActive.value = true
+  }
+}
+
+/**
+ * 清除格式
+ * - 有选中文本时：清除选中文本的格式
+ * - 没有选中文本时：清除整个段落的所有格式
+ */
+function clearSelectedFormat() {
+  const editor = getActiveEditorElement()
+  if (!editor) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+
+  editor.focus()
+
+  const selection = window.getSelection()
+  const hasSelectedText = selection && !selection.isCollapsed && editor.contains(selection.anchorNode)
+
+  if (hasSelectedText) {
+    // 有选中文本：清除选中文本的格式
+    if (richTextEditor.clearFormat(editor)) {
+      editor.dispatchEvent(new Event('input', { bubbles: true }))
+      toast.success(t('workbench.ribbon.messages.formatCleared'))
+    }
+  } else {
+    // 没有选中文本：清除整个段落的所有格式
+    const plainText = richTextEditor.clearAllFormatInElement(editor)
+    if (activeSegment.value) {
+      updateSegmentTarget(activeSegment.value.sentence_id, plainText)
+    }
+    toast.success(t('workbench.ribbon.messages.allFormatCleared'))
+  }
+
+  // 重置格式状态
+  richTextEditor.resetActiveFormats()
+  showClearFormatMenu.value = false
+}
+
+/**
+ * 清除整个段落的所有格式
+ */
+function clearAllFormat() {
+  const editor = getActiveEditorElement()
+  if (!editor) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+
+  const plainText = richTextEditor.clearAllFormatInElement(editor)
+  if (activeSegment.value) {
+    updateSegmentTarget(activeSegment.value.sentence_id, plainText)
+  }
+  toast.success(t('workbench.ribbon.messages.allFormatCleared'))
+  showClearFormatMenu.value = false
+}
+
+/**
+ * 转换大小写
+ */
+function applyCase(caseType: CaseType) {
+  const editor = getActiveEditorElement()
+  if (!editor) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+
+  editor.focus()
+
+  if (richTextEditor.changeCase(caseType, editor)) {
+    editor.dispatchEvent(new Event('input', { bubbles: true }))
+  } else {
+    toast.warn(t('workbench.ribbon.messages.selectTextFirst'))
+  }
+  showCaseMenu.value = false
+}
+
+/**
+ * 切换显示标记
+ */
+function toggleVisibleCharacters() {
+  const enabled = richTextEditor.toggleVisibleCharacters()
+  if (enabled) {
+    toast.info(t('workbench.ribbon.messages.visibleCharsOn'))
+  } else {
+    toast.info(t('workbench.ribbon.messages.visibleCharsOff'))
+  }
+}
+
+/**
+ * 关闭所有下拉菜单
+ */
+function closeAllMenus() {
+  showCaseMenu.value = false
+  showClearFormatMenu.value = false
+  showSpecialCharMenu.value = false
+}
+
+/**
+ * 插入特殊字符到当前活动编辑器
+ */
+function insertSpecialChar(char: string) {
+  const editor = getActiveEditorElement()
+  if (!editor) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    showSpecialCharMenu.value = false
+    return
+  }
+
+  editor.focus()
+
+  // 确保光标在编辑器内
+  const selection = window.getSelection()
+  if (!selection || selection.rangeCount === 0 || !editor.contains(selection.anchorNode)) {
+    const range = document.createRange()
+    range.selectNodeContents(editor)
+    range.collapse(false)
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+  }
+
+  document.execCommand('insertText', false, char)
+  editor.dispatchEvent(new Event('input', { bubbles: true }))
+
+  // 记录到最近使用
+  const recent = recentSpecialChars.value.filter(c => c !== char)
+  recent.unshift(char)
+  recentSpecialChars.value = recent.slice(0, 10)
+  try {
+    window.localStorage.setItem(RECENT_CHARS_STORAGE_KEY, JSON.stringify(recentSpecialChars.value))
+  } catch {}
+
+  showSpecialCharMenu.value = false
+}
+
+// ========== 富文本格式化功能结束 ==========
+
+function toggleSourceEditing() {
+  if (!segmentStore.activeSentenceId) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+  sourceEditing.value = !sourceEditing.value
+}
+
 function copySourceToTarget() {
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
@@ -1439,6 +1848,9 @@ function toggleRevisionMenu(kind: RevisionMenuKind) {
 
 function setRevisionTraceVisible(visible: boolean) {
   revisionTraceVisible.value = visible
+  try {
+    window.localStorage.setItem(REVISION_TRACE_VISIBLE_STORAGE_KEY, visible ? '1' : '0')
+  } catch {}
   if (visible) {
     segmentStore.startRevisionTracking()
   } else {
@@ -2010,6 +2422,16 @@ function handleClickOutside(event: MouseEvent) {
   ) {
     openRevisionMenu.value = null
   }
+  if (
+    !target.closest('.confirm-segment-menu')
+    && !target.closest('.confirm-segment-menu__dropdown')
+  ) {
+    openConfirmMenu.value = false
+  }
+  // 关闭格式化相关的下拉菜单
+  if (!target.closest('.case-menu') && !target.closest('.clear-format-menu') && !target.closest('.special-char-menu')) {
+    closeAllMenus()
+  }
 }
 
 async function handleCommentDraft(draft: CommentAnchorDraft) {
@@ -2150,6 +2572,7 @@ async function ensureMatchInfoPanelOpen() {
 }
 
 function handleSegmentTargetActivate(sentenceId: string) {
+  selectedSentenceIds.value = new Set()
   segmentStore.setActiveSentence(sentenceId)
 }
 
@@ -2182,9 +2605,24 @@ watch([segmentDisplayScope, sourceSearchQuery, targetSearchQuery, searchFuzzyEna
   }
 })
 
+/**
+ * 处理选区变化，更新格式按钮状态
+ * 注意：只在有选中文本时才更新状态，避免覆盖手动设置的格式状态
+ */
+function handleSelectionChange() {
+  const selection = window.getSelection()
+  // 只有当有选中文本时才根据选区更新格式状态
+  if (selection && !selection.isCollapsed) {
+    richTextEditor.updateActiveFormats()
+  }
+  // 追踪原文编辑器中的光标位置（用于拆分句段）
+  trackSourceCaretPosition()
+}
+
 onMounted(() => {
   window.addEventListener('resize', handleResize)
   document.addEventListener('click', handleClickOutside)
+  document.addEventListener('selectionchange', handleSelectionChange)
   void loadTask()
   void loadGuidelineTemplates()
 })
@@ -2192,6 +2630,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
   document.removeEventListener('click', handleClickOutside)
+  document.removeEventListener('selectionchange', handleSelectionChange)
   commentStore.stopPolling()
 })
 
@@ -2232,17 +2671,39 @@ onBeforeRouteLeave(async () => {
             <FileCheck :size="15" />
             <span>{{ t('workbench.saveToTM') }}</span>
           </button>
-          <button
-            class="workbench-ribbon__top-action"
-            data-testid="workbench-export-button"
-            type="button"
-            :disabled="!segmentStore.canExport"
-            :title="exportButtonTitle"
-            @click="exportTranslatedFile"
-          >
-            <Download :size="15" />
-            <span>{{ exportButtonLabel }}</span>
-          </button>
+          <div class="export-dropdown">
+            <button
+              class="workbench-ribbon__top-action"
+              data-testid="workbench-export-button"
+              type="button"
+              :disabled="!segmentStore.canExport"
+              :title="exportButtonTitle"
+              @click="toggleExportMenu"
+            >
+              <Download :size="15" />
+              <span>{{ exportButtonLabel }}</span>
+              <ChevronDown :size="12" />
+            </button>
+            <div v-if="showExportMenu" class="export-dropdown__menu">
+              <div v-if="loadingExportOptions" class="export-dropdown__loading">
+                <Loader2 class="lucide-spin" :size="14" />
+                <span>{{ t('common.loading') }}</span>
+              </div>
+              <template v-else>
+                <button
+                  v-for="option in exportOptions"
+                  :key="option.id"
+                  type="button"
+                  class="export-dropdown__item"
+                  :disabled="exporting"
+                  @click="exportWithType(option.id)"
+                >
+                  <span class="export-dropdown__item-name">{{ option.name }}</span>
+                  <span class="export-dropdown__item-desc">{{ option.description }}</span>
+                </button>
+              </template>
+            </div>
+          </div>
         </div>
         <button
           class="workbench-ribbon__help"
@@ -2348,6 +2809,15 @@ onBeforeRouteLeave(async () => {
               确认当前句段
             </button>
             <button
+              data-testid="workbench-confirm-next"
+              type="button"
+              role="menuitem"
+              :disabled="confirmationActionLoading || !activeSegment"
+              @click="openConfirmMenu = false; void confirmAndMoveToNextUnconfirmed()"
+            >
+              确认并跳到下一个
+            </button>
+            <button
               data-testid="workbench-confirm-all"
               type="button"
               role="menuitem"
@@ -2416,58 +2886,83 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group custom-style">
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" aria-disabled="true" :title="t('workbench.ribbon.bold')" @click="showRibbonPlaceholder(t('workbench.ribbon.bold'))">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.bold }" :disabled="!activeSegment" :title="t('workbench.ribbon.bold')" @mousedown.prevent @click="applyTextFormat('bold')">
               <span class="icon-text-area"><span class="tool-item"><Bold class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" aria-disabled="true" :title="t('workbench.ribbon.strike')" @click="showRibbonPlaceholder(t('workbench.ribbon.strike'))">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.strikethrough }" :disabled="!activeSegment" :title="t('workbench.ribbon.strike')" @mousedown.prevent @click="applyTextFormat('strikethrough')">
               <span class="icon-text-area"><span class="tool-item"><Strikethrough class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" aria-disabled="true" :title="t('workbench.ribbon.italic')" @click="showRibbonPlaceholder(t('workbench.ribbon.italic'))">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.italic }" :disabled="!activeSegment" :title="t('workbench.ribbon.italic')" @mousedown.prevent @click="applyTextFormat('italic')">
               <span class="icon-text-area"><span class="tool-item"><Italic class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" aria-disabled="true" :title="t('workbench.ribbon.superscript')" @click="showRibbonPlaceholder(t('workbench.ribbon.superscript'))">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.superscript }" :disabled="!activeSegment" :title="t('workbench.ribbon.superscript')" @mousedown.prevent @click="applyTextFormat('superscript')">
               <span class="icon-text-area"><span class="tool-item"><Superscript class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" aria-disabled="true" :title="t('workbench.ribbon.underline')" @click="showRibbonPlaceholder(t('workbench.ribbon.underline'))">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.underline }" :disabled="!activeSegment" :title="t('workbench.ribbon.underline')" @mousedown.prevent @click="applyTextFormat('underline')">
               <span class="icon-text-area"><span class="tool-item"><Underline class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" aria-disabled="true" :title="t('workbench.ribbon.subscript')" @click="showRibbonPlaceholder(t('workbench.ribbon.subscript'))">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.subscript }" :disabled="!activeSegment" :title="t('workbench.ribbon.subscript')" @mousedown.prevent @click="applyTextFormat('subscript')">
               <span class="icon-text-area"><span class="tool-item"><Subscript class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" aria-disabled="true" :title="t('workbench.ribbon.caseChange')" @click="showRibbonPlaceholder(t('workbench.ribbon.caseChange'))">
-              <span class="icon-text-area has_dropdown"><span class="tool-item"><Type class="tool-label-icon" :size="15" /></span></span>
-              <span class="dropdown-link" aria-hidden="true">
-                <ChevronDown :size="10" />
-              </span>
-            </button>
-            <button class="tool-line style-item tool-button" type="button" aria-disabled="true" :title="t('workbench.ribbon.visibleCharacters')" @click="showRibbonPlaceholder(t('workbench.ribbon.visibleCharacters'))">
+            <div class="case-menu">
+              <button class="tool-line style-item tool-button" type="button" :disabled="!activeSegment" :title="t('workbench.ribbon.caseChange')" @mousedown.prevent @click.stop="showCaseMenu = !showCaseMenu">
+                <span class="icon-text-area has_dropdown"><span class="tool-item"><Type class="tool-label-icon" :size="15" /></span></span>
+                <span class="dropdown-link" aria-hidden="true">
+                  <ChevronDown :size="10" />
+                </span>
+              </button>
+              <div v-if="showCaseMenu" class="case-menu__dropdown">
+                <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('upper')">{{ t('workbench.ribbon.caseUpper') }}</button>
+                <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('lower')">{{ t('workbench.ribbon.caseLower') }}</button>
+                <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('capitalize')">{{ t('workbench.ribbon.caseCapitalize') }}</button>
+                <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('sentence')">{{ t('workbench.ribbon.caseSentence') }}</button>
+              </div>
+            </div>
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :disabled="!activeSegment" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
               <span class="icon-text-area"><span class="tool-item"><Sigma class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
         </div>
 
         <div class="tool-group">
-          <button class="tool-col tool-col--big tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.clearFormat'))">
-            <span class="tool-line line1 with-big-icon">
-              <span class="icon-text-area has_dropdown">
-                <BrushCleaning class="tool-single-icon" :size="27" />
+          <div class="clear-format-menu">
+            <button
+              class="tool-col tool-col--big tool-button clear-format-menu__main"
+              type="button"
+              :disabled="!activeSegment"
+              @mousedown.prevent
+              @click="clearSelectedFormat"
+            >
+              <span class="tool-line line1 with-big-icon">
+                <span class="icon-text-area">
+                  <BrushCleaning class="tool-single-icon" :size="27" />
+                </span>
               </span>
-              <span class="dropdown-link" aria-hidden="true">
-                <ChevronDown :size="12" />
-              </span>
-            </span>
-            <span class="tool-line"><span class="label">{{ t('workbench.ribbon.clearFormat') }}</span></span>
-          </button>
+              <span class="tool-line"><span class="label">{{ t('workbench.ribbon.clearFormat') }}</span></span>
+            </button>
+            <button
+              class="clear-format-menu__toggle"
+              type="button"
+              :disabled="!activeSegment"
+              @click.stop="showClearFormatMenu = !showClearFormatMenu"
+            >
+              <ChevronDown :size="12" />
+            </button>
+            <div v-if="showClearFormatMenu" class="clear-format-menu__dropdown">
+              <button type="button" class="clear-format-menu__item" @mousedown.prevent @click="clearSelectedFormat">{{ t('workbench.ribbon.clearSelectedFormat') }}</button>
+              <button type="button" class="clear-format-menu__item" @mousedown.prevent @click="clearAllFormat">{{ t('workbench.ribbon.clearAllFormat') }}</button>
+            </div>
+          </div>
         </div>
 
         <div class="tool-group">
-          <button class="tool-col tool-col--big tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.editSource'))">
+          <button class="tool-col tool-col--big tool-button" type="button" :class="{ active: sourceEditing }" @click="toggleSourceEditing">
             <span class="tool-line line1 with-big-icon">
               <span class="icon-text-area">
                 <SquarePen class="tool-single-icon" :size="27" />
@@ -2479,17 +2974,17 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group">
           <span class="tool-col align-left">
-            <button class="tool-line tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.mergeSegment'))">
+            <button class="tool-line tool-button" type="button" :disabled="!canMergeSegment" @click="handleMergeSegment">
               <span class="icon-text-area">
-                <span class="tool-item disabled">
+                <span class="tool-item" :class="{ disabled: !canMergeSegment }">
                   <Combine class="tool-label-icon" :size="16" />
                   <span class="text">{{ t('workbench.ribbon.mergeSegment') }}</span>
                 </span>
               </span>
             </button>
-            <button class="tool-line tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.splitSegment'))">
+            <button class="tool-line tool-button" type="button" :disabled="!canSplitSegment" @click="handleSplitSegment">
               <span class="icon-text-area">
-                <span class="tool-item">
+                <span class="tool-item" :class="{ disabled: !canSplitSegment }">
                   <Split class="tool-label-icon" :size="16" />
                   <span class="text">{{ t('workbench.ribbon.splitSegment') }}</span>
                 </span>
@@ -2619,14 +3114,45 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group">
           <span class="tool-col align-left">
-            <button class="tool-line tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.specialCharacters'))">
-              <span class="icon-text-area">
-                <span class="tool-item">
-                  <Sigma class="tool-label-icon" :size="16" />
-                  <span class="text">{{ t('workbench.ribbon.specialCharacters') }}</span>
+            <div class="special-char-menu">
+              <button class="tool-line tool-button" type="button" :disabled="!activeSegment" @mousedown.prevent @click.stop="showSpecialCharMenu = !showSpecialCharMenu">
+                <span class="icon-text-area">
+                  <span class="tool-item">
+                    <Sigma class="tool-label-icon" :size="16" />
+                    <span class="text">{{ t('workbench.ribbon.specialCharacters') }}</span>
+                  </span>
                 </span>
-              </span>
-            </button>
+              </button>
+              <div v-if="showSpecialCharMenu" class="special-char-menu__dropdown">
+                <div class="special-char-menu__title">{{ t('workbench.ribbon.specialCharacters') }}</div>
+                <div class="special-char-menu__grid">
+                  <template v-for="(row, rowIdx) in specialCharacters" :key="rowIdx">
+                    <button
+                      v-for="(char, colIdx) in row"
+                      :key="`${rowIdx}-${colIdx}`"
+                      type="button"
+                      class="special-char-menu__char"
+                      :title="char"
+                      @mousedown.prevent
+                      @click="insertSpecialChar(char)"
+                    >{{ char }}</button>
+                  </template>
+                </div>
+                <div v-if="recentSpecialChars.length" class="special-char-menu__recent">
+                  <div class="special-char-menu__recent-row">
+                    <button
+                      v-for="(char, idx) in recentSpecialChars"
+                      :key="idx"
+                      type="button"
+                      class="special-char-menu__char"
+                      :title="char"
+                      @mousedown.prevent
+                      @click="insertSpecialChar(char)"
+                    >{{ char }}</button>
+                  </div>
+                </div>
+              </div>
+            </div>
             <button class="tool-line tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.qaSettings'))">
               <span class="icon-text-area has_dropdown">
                 <span class="tool-item">
@@ -2769,17 +3295,39 @@ onBeforeRouteLeave(async () => {
             {{ segmentStore.saving ? t('common.actions.saving') : t('workbench.saveNow') }}
           </button>
 
-          <button
-            class="button workbench-action workbench-action--export"
-            data-testid="workbench-export-button"
-            type="button"
-            :disabled="!segmentStore.canExport"
-            :title="exportButtonTitle"
-            @click="exportTranslatedFile"
-          >
-            <Download :size="14" />
-            {{ exportButtonLabel }}
-          </button>
+          <div class="export-dropdown export-dropdown--toolbar">
+            <button
+              class="button workbench-action workbench-action--export"
+              data-testid="workbench-export-button-toolbar"
+              type="button"
+              :disabled="!segmentStore.canExport"
+              :title="exportButtonTitle"
+              @click="toggleExportMenu"
+            >
+              <Download :size="14" />
+              {{ exportButtonLabel }}
+              <ChevronDown :size="12" />
+            </button>
+            <div v-if="showExportMenu" class="export-dropdown__menu">
+              <div v-if="loadingExportOptions" class="export-dropdown__loading">
+                <Loader2 class="lucide-spin" :size="14" />
+                <span>{{ t('common.loading') }}</span>
+              </div>
+              <template v-else>
+                <button
+                  v-for="option in exportOptions"
+                  :key="option.id"
+                  type="button"
+                  class="export-dropdown__item"
+                  :disabled="exporting"
+                  @click="exportWithType(option.id)"
+                >
+                  <span class="export-dropdown__item-name">{{ option.name }}</span>
+                  <span class="export-dropdown__item-desc">{{ option.description }}</span>
+                </button>
+              </template>
+            </div>
+          </div>
 
           <button
             class="button workbench-action"
@@ -3179,14 +3727,20 @@ onBeforeRouteLeave(async () => {
                     :segment="item"
                     :index="getEditorSegmentDisplayIndex(item.sentence_id, index)"
                     :active="segmentStore.activeSentenceId === item.sentence_id"
+                    :source-editing="sourceEditing"
+                    :selected="selectedSentenceIds.has(item.sentence_id)"
                     :pending-revision="revisionTraceVisible ? segmentStore.getRevisionTrace(item.sentence_id) : null"
                     :revision-busy="revisionActionLoading"
                     :matched-terms="segmentStore.activeSentenceId === item.sentence_id ? activeMatchedTerms : []"
                     :source-search-query="sourceSearchQuery"
+                    :show-visible-chars="richTextEditor.visibleCharactersEnabled.value"
+                    :pending-formats="pendingFormatsForEditor"
                     @focus="segmentStore.setActiveSentence"
                     @activate-target="handleSegmentTargetActivate"
                     @update="updateSegmentTarget"
+                    @update-source="updateSegmentSource"
                     @apply-partial-revision="handleApplyPartialRevision"
+                    @ctrl-click="handleSegmentClick"
                   />
                 </template>
               </VirtualList>
@@ -3842,6 +4396,11 @@ onBeforeRouteLeave(async () => {
 .tool-button.active,
 .tool-button.active-soft {
   color: #0a705f;
+}
+
+.tool-button.active {
+  border-color: #b8cbd4;
+  background: linear-gradient(180deg, #f8fbfc 0%, #edf5f7 100%);
 }
 
 .tool-button {
@@ -5204,6 +5763,378 @@ onBeforeRouteLeave(async () => {
   .workbench-panel-pop-leave-to {
     transform: none;
   }
+}
+
+/* 确认句段下拉菜单 */
+.confirm-segment-menu {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+}
+
+.confirm-segment-menu__main {
+  border-radius: 4px 0 0 4px !important;
+  border-right: none !important;
+}
+
+.confirm-segment-menu__main:hover:not(:disabled),
+.confirm-segment-menu__main:focus-visible {
+  border-right: none !important;
+}
+
+.confirm-segment-menu__toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 0 4px 4px 0;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.confirm-segment-menu:hover .confirm-segment-menu__main:not(:disabled) {
+  border-color: #b8cbd4;
+  border-right: none !important;
+  background: linear-gradient(180deg, #f8fbfc 0%, #edf5f7 100%);
+}
+
+.confirm-segment-menu:hover .confirm-segment-menu__toggle:not(:disabled) {
+  border-color: #b8cbd4;
+  border-left: 1px solid #b8cbd4;
+  background: linear-gradient(180deg, #f8fbfc 0%, #edf5f7 100%);
+}
+
+.confirm-segment-menu__toggle:hover:not(:disabled) {
+  background: linear-gradient(180deg, #eef4f6 0%, #e3eef1 100%) !important;
+}
+
+.confirm-segment-menu__toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.confirm-segment-menu__dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 100;
+  min-width: 140px;
+  padding: 4px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+.confirm-segment-menu__dropdown button {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.confirm-segment-menu__dropdown button:hover {
+  background: rgba(13, 122, 104, 0.08);
+}
+
+/* 大小写转换下拉菜单 */
+.case-menu {
+  position: relative;
+  display: inline-flex;
+}
+
+.case-menu__dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  min-width: 120px;
+  padding: 4px 0;
+  border: 1px solid #d0d7dc;
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+.case-menu__item {
+  display: block;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  color: #43545c;
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.case-menu__item:hover {
+  background: rgba(13, 122, 104, 0.08);
+}
+
+/* 清除格式下拉菜单 */
+.clear-format-menu {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+}
+
+.clear-format-menu__main {
+  border-radius: 4px 0 0 4px !important;
+  border-right: none !important;
+}
+
+.clear-format-menu__main:hover:not(:disabled),
+.clear-format-menu__main:focus-visible {
+  border-right: none !important;
+}
+
+.clear-format-menu__toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 0 4px 4px 0;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.clear-format-menu:hover .clear-format-menu__main:not(:disabled) {
+  border-color: #b8cbd4;
+  border-right: none !important;
+  background: linear-gradient(180deg, #f8fbfc 0%, #edf5f7 100%);
+}
+
+.clear-format-menu:hover .clear-format-menu__toggle:not(:disabled) {
+  border-color: #b8cbd4;
+  border-left: 1px solid #b8cbd4;
+  background: linear-gradient(180deg, #f8fbfc 0%, #edf5f7 100%);
+}
+
+.clear-format-menu__toggle:hover:not(:disabled) {
+  background: linear-gradient(180deg, #eef4f6 0%, #e3eef1 100%) !important;
+}
+
+.clear-format-menu__toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.clear-format-menu__dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 100;
+  min-width: 140px;
+  padding: 4px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+.clear-format-menu__item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.clear-format-menu__item:hover {
+  background: rgba(13, 122, 104, 0.08);
+}
+
+/* 格式按钮激活状态（与 hover 一致） */
+.tool-button.is-active {
+  border-color: #b8cbd4;
+  background: linear-gradient(180deg, #f8fbfc 0%, #edf5f7 100%);
+}
+
+/* 特殊字符下拉菜单 */
+.special-char-menu {
+  position: relative;
+  display: inline-flex;
+}
+
+.special-char-menu__dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 200;
+  padding: 12px;
+  border: 1px solid #d0d7dc;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
+  min-width: 320px;
+}
+
+.special-char-menu__title {
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #43545c;
+}
+
+.special-char-menu__grid {
+  display: grid;
+  grid-template-columns: repeat(10, 1fr);
+  gap: 2px;
+}
+
+.special-char-menu__char {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid #e8edf0;
+  border-radius: 4px;
+  background: #fff;
+  color: #2c3e50;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 0.12s ease, border-color 0.12s ease;
+}
+
+.special-char-menu__char:hover {
+  background: rgba(13, 122, 104, 0.08);
+  border-color: #0d7a68;
+  color: #0d7a68;
+}
+
+.special-char-menu__char:active {
+  background: rgba(13, 122, 104, 0.16);
+}
+
+.special-char-menu__recent {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #e8edf0;
+}
+
+.special-char-menu__recent-row {
+  display: flex;
+  gap: 2px;
+  flex-wrap: wrap;
+}
+
+/* 导出下拉菜单 */
+.export-dropdown {
+  position: relative;
+}
+
+.export-dropdown .workbench-ribbon__top-action {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.export-dropdown__menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 100;
+  min-width: 240px;
+  padding: 4px;
+  border: 1px solid #e0e4e7;
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+.export-dropdown__loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px;
+  color: #6b7c85;
+  font-size: 13px;
+}
+
+.export-dropdown__item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.12s ease;
+}
+
+.export-dropdown__item:hover {
+  background: rgba(13, 122, 104, 0.08);
+}
+
+.export-dropdown__item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.export-dropdown__item-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: #2c3e50;
+}
+
+.export-dropdown__item-desc {
+  font-size: 11px;
+  color: #6b7c85;
+  margin-top: 2px;
+}
+
+.export-dropdown--toolbar {
+  display: inline-block;
+}
+
+.export-dropdown--toolbar .workbench-action--export {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.export-dropdown--toolbar .export-dropdown__menu {
+  left: 0;
+  right: auto;
 }
 </style>
 

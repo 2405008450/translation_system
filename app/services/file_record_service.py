@@ -270,6 +270,7 @@ def duplicate_file_record(
         target_language=source_record.target_language,
         creator_id=current_user.id if current_user is not None else source_record.creator_id,
         collection_id=source_record.collection_id,
+        collection_ids_json=source_record.collection_ids_json,
         term_base_id=source_record.term_base_id,
         term_base_ids=source_record.term_base_ids,
         deadline=source_record.deadline,
@@ -287,6 +288,7 @@ def duplicate_file_record(
                 source_text=segment.source_text,
                 display_text=segment.display_text,
                 target_text=segment.target_text,
+                target_html=segment.target_html,
                 status=segment.status,
                 score=segment.score,
                 matched_source_text=segment.matched_source_text,
@@ -714,6 +716,7 @@ def update_segment_target(
     db: Session,
     segment_id: UUID,
     target_text: str,
+    target_html: str | None = None,
     source: str = "manual",
     current_user: User | None = None,
     llm_provider: str | None = None,
@@ -726,6 +729,7 @@ def update_segment_target(
 
     before_text = segment.target_text
     segment.target_text = target_text
+    segment.target_html = target_html if target_html else None
     segment.source = source
     segment.version = int(segment.version or 1) + 1
     segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
@@ -767,6 +771,7 @@ def update_segment_by_sentence_id(
     file_record_id: UUID,
     sentence_id: str,
     target_text: str,
+    target_html: str | None = None,
     source: str = "manual",
     current_user: User | None = None,
     llm_provider: str | None = None,
@@ -783,6 +788,7 @@ def update_segment_by_sentence_id(
 
     before_text = segment.target_text
     segment.target_text = target_text
+    segment.target_html = target_html if target_html else None
     segment.source = source
     segment.version = int(segment.version or 1) + 1
     segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
@@ -814,6 +820,28 @@ def update_segment_by_sentence_id(
     )
 
     sync_file_record_status(db, segment.file_record_id)
+    db.commit()
+    db.refresh(segment)
+    return segment
+
+
+def update_segment_source_text(
+    db: Session,
+    file_record_id: UUID,
+    sentence_id: str,
+    source_text: str,
+) -> Segment | None:
+    """更新片段的原文"""
+    segment = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not segment:
+        return None
+
+    segment.source_text = source_text
+    segment.display_text = source_text
     db.commit()
     db.refresh(segment)
     return segment
@@ -890,9 +918,11 @@ def batch_update_segments(
 
         before_text = segment.target_text
         target_text = item.get("target_text", "")
+        target_html = item.get("target_html")
         source = item.get("source", "manual")
         track_revision = bool(item.get("track_revision", True))
         segment.target_text = target_text
+        segment.target_html = target_html if target_html else None
         segment.source = source
         segment.version = current_version + 1
         segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)

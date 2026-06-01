@@ -187,6 +187,7 @@ export interface Segment {
   source_text: string
   display_text: string
   target_text: string
+  target_html?: string | null
   status: string
   version: number
   score: number
@@ -526,6 +527,7 @@ export interface GuidelineTemplateDetail extends GuidelineTemplateSummary {
 export interface SegmentUpdatePayload {
   sentence_id: string
   target_text: string
+  target_html?: string | null
   source: string
   track_revision?: boolean
   base_version?: number | null

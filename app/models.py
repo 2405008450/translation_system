@@ -133,6 +133,12 @@ class FileRecord(Base):
         ForeignKey("memory_bases.id", ondelete="SET NULL"),
         nullable=True,
     )
+    collection_ids_json: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="[]",
+        server_default=text("'[]'"),
+    )
     term_base_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("term_bases.id", ondelete="SET NULL"),
@@ -256,6 +262,7 @@ class Segment(Base):
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
     display_text: Mapped[str] = mapped_column(Text, nullable=False)
     target_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    target_html: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="none")
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
     score: Mapped[float] = mapped_column(nullable=False, default=0.0)
