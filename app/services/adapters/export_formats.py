@@ -80,8 +80,10 @@ EXPORT_OPTIONS = {
 # 各格式支持的导出选项
 # 键: 文件扩展名, 值: 支持的导出选项 ID 列表
 FORMAT_EXPORT_SUPPORT: Dict[str, List[str]] = {
-    # 办公文档 - 由专用导出器处理，前端单独处理
-    # .docx, .pdf, .pptx, .xlsx 不在此配置
+    # 办公文档
+    ".docx": ["original", "bilingual", "bilingual_docx", "bilingual_txt", "tmx", "xliff"],
+    ".pdf": ["original", "bilingual_docx", "bilingual_txt", "tmx", "xliff"],
+    ".pptx": ["original", "bilingual_docx", "bilingual_txt", "tmx", "xliff"],
     
     # 纯文本
     ".txt": ["original", "bilingual_txt", "tmx", "xliff"],

@@ -1534,16 +1534,54 @@ onBeforeRouteLeave(async () => {
             {{ segmentStore.saving ? t('common.actions.saving') : t('workbench.saveNow') }}
           </button>
 
-          <button
-            class="button workbench-action workbench-action--export"
-            type="button"
-            :disabled="!segmentStore.canExport"
-            :title="exportButtonTitle"
-            @click="exportTranslatedFile"
-          >
-            <Download :size="14" />
-            {{ exportButtonLabel }}
-          </button>
+          <div class="export-dropdown" style="position: relative; display: inline-block;">
+            <button
+              class="button workbench-action workbench-action--export"
+              type="button"
+              :disabled="!segmentStore.canExport || exporting"
+              :title="exportButtonTitle"
+              @click="exportTranslatedFile"
+            >
+              <Loader2 v-if="exporting" class="lucide-spin" :size="14" />
+              <Download v-else :size="14" />
+              {{ exportButtonLabel }}
+            </button>
+            <button
+              class="button workbench-action workbench-action--export-toggle"
+              type="button"
+              :disabled="!segmentStore.canExport || exporting"
+              title="更多导出选项"
+              aria-label="更多导出选项"
+              @click="toggleExportMenu"
+              style="padding: 4px 6px; margin-left: -1px; border-left: 1px solid rgba(255,255,255,0.3);"
+            >
+              <ChevronDown :size="14" />
+            </button>
+            <div
+              v-if="showExportMenu"
+              class="export-dropdown__menu"
+              style="position: absolute; top: 100%; right: 0; z-index: 999; min-width: 200px; margin-top: 4px; background: var(--color-bg-elevated, #fff); border: 1px solid var(--color-border, #e0e0e0); border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); padding: 4px 0;"
+            >
+              <div v-if="loadingExportOptions" style="padding: 12px 16px; color: var(--color-text-secondary, #666); font-size: 13px;">
+                加载中...
+              </div>
+              <template v-else>
+                <button
+                  v-for="option in exportOptions"
+                  :key="option.id"
+                  class="export-dropdown__item"
+                  type="button"
+                  style="display: block; width: 100%; text-align: left; padding: 8px 16px; border: none; background: none; cursor: pointer; font-size: 13px; color: var(--color-text, #333); line-height: 1.4;"
+                  @mouseenter="($event.target as HTMLElement).style.background = 'var(--color-bg-hover, #f5f5f5)'"
+                  @mouseleave="($event.target as HTMLElement).style.background = 'none'"
+                  @click="exportWithType(option.id)"
+                >
+                  <div style="font-weight: 500;">{{ option.name }}</div>
+                  <div style="font-size: 12px; color: var(--color-text-secondary, #999); margin-top: 2px;">{{ option.description }}</div>
+                </button>
+              </template>
+            </div>
+          </div>
 
           <button
             class="button workbench-action"

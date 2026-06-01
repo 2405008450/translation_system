@@ -293,6 +293,14 @@ class MultiFormatExporter:
         if original_bytes is None:
             raise ValueError("Bilingual export requires the original source file.")
 
+        if extension == ".docx":
+            content = self._export_bilingual_docx_original(original_bytes, segments)
+            return (
+                content,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                f"{base_name}-bilingual.docx",
+            )
+
         if extension in {".properties", ".po", ".pot", ".strings", ".html", ".htm", ".srt"}:
             if extension == ".properties":
                 content = self._export_bilingual_properties(original_bytes, segments)
@@ -365,70 +373,141 @@ class MultiFormatExporter:
         original_bytes: bytes,
         segments: list[dict[str, Any]],
     ) -> bytes:
-        import re
+        """导出双语对照 HTML：基于句段级别对齐，一句原文对应一句译文。
 
-        from app.services.adapters.html_exporter import HtmlExporter
+        使用 segments 列表的顺序信息，逐句配对原文和译文，
+        在原始 HTML 结构中每个块级元素后插入对应的译文块。
+        支持一个段落包含多个句子的情况。
+        """
+        import re
+        from html import escape as html_escape
+
+        from app.services.adapters.html_exporter import HtmlExporter, HtmlTextExtractor
 
         exporter = HtmlExporter()
         content = exporter._decode_content(original_bytes)
-        source_to_target = self._build_source_to_target_map(segments)
 
-        # 标记 <title> 区域，避免在其中插入双语标记
-        _SKIP_BILINGUAL_RE = re.compile(
-            r'(<title[^>]*>)(.*?)(</title>)', re.IGNORECASE | re.DOTALL
-        )
+        # 提取 HTML 中的文本块及其位置
+        extractor = HtmlTextExtractor(content)
+        extractor.feed(content)
+        extractor.close()
+        text_blocks = extractor.text_blocks
 
-        def replace_text_node(match):
-            text = match.group(1)
-            stripped = text.strip()
-            target = source_to_target.get(stripped, "")
-            if not target:
-                return match.group(0)
-            leading = text[: len(text) - len(text.lstrip())]
-            trailing = text[len(text.rstrip()) :]
-            # 原文保持原样，译文紧跟其后，用不同颜色区分
-            bilingual = (
-                f'{leading}'
-                f'<span style="color:#333;">{stripped}</span>'
-                f'<br/>'
-                f'<span style="color:#0066cc; font-style:italic;">{target}</span>'
-                f'{trailing}'
+        # 构建按顺序的 segment 列表（只保留有译文的）
+        ordered_segments = [
+            {
+                "source": ' '.join(str(seg.get("source_text") or seg.get("display_text") or "").split()),
+                "target": str(seg.get("target_text") or "").strip(),
+            }
+            for seg in segments
+            if str(seg.get("source_text") or seg.get("display_text") or "").strip()
+        ]
+
+        # 将 segments 按顺序对齐到 text_blocks
+        # 一个 text_block 可能对应多个 segments（多句组成一段）
+        block_translations: list[tuple[int, int, list[str], list[str]]] = []
+        seg_cursor = 0
+
+        for block in text_blocks:
+            block_text = block.normalized_text
+            if not block_text:
+                continue
+
+            # 尝试消费 segments 直到覆盖整个 block
+            matched_sources: list[str] = []
+            matched_targets: list[str] = []
+            accumulated = ""
+
+            start_cursor = seg_cursor
+            while seg_cursor < len(ordered_segments):
+                seg = ordered_segments[seg_cursor]
+                source = seg["source"]
+                if not source:
+                    seg_cursor += 1
+                    continue
+
+                # 检查这个 segment 的 source 是否属于当前 block
+                test_accumulated = (accumulated + " " + source).strip() if accumulated else source
+                # 紧凑比较（忽略空白差异）
+                block_compact = re.sub(r'\s+', '', block_text)
+                test_compact = re.sub(r'\s+', '', test_accumulated)
+
+                if block_compact.startswith(test_compact) or block_compact == test_compact:
+                    accumulated = test_accumulated
+                    matched_sources.append(source)
+                    matched_targets.append(seg["target"])
+                    seg_cursor += 1
+
+                    if block_compact == test_compact:
+                        # 完全匹配，结束当前 block
+                        break
+                elif test_compact.startswith(block_compact):
+                    # segment 比 block 长，可能是跨块的情况，先消费
+                    accumulated = test_accumulated
+                    matched_sources.append(source)
+                    matched_targets.append(seg["target"])
+                    seg_cursor += 1
+                    break
+                else:
+                    # 不匹配，尝试单独匹配
+                    source_compact = re.sub(r'\s+', '', source)
+                    if source_compact in block_compact:
+                        accumulated = test_accumulated
+                        matched_sources.append(source)
+                        matched_targets.append(seg["target"])
+                        seg_cursor += 1
+                        continue
+                    # 完全不匹配，停止
+                    break
+
+            if matched_targets and any(t for t in matched_targets):
+                block_translations.append((
+                    block.start_pos,
+                    block.end_pos,
+                    matched_sources,
+                    matched_targets,
+                ))
+
+        # 从后往前插入译文，避免位置偏移
+        result = content
+        for start_pos, end_pos, sources, targets in reversed(block_translations):
+            # 找到包含此文本块的块级元素的结束标签位置
+            # 从 end_pos 开始向后找最近的块级结束标签
+            close_tag_pattern = re.compile(
+                r'</(?:p|div|h[1-6]|li|td|th|dt|dd|blockquote|figcaption|caption|summary)>',
+                re.IGNORECASE,
             )
-            return f">{bilingual}<"
-
-        # 先保护 <title> 内容不被替换
-        title_placeholders: list[str] = []
-
-        def protect_title(m):
-            placeholder = f"__TITLE_PLACEHOLDER_{len(title_placeholders)}__"
-            title_placeholders.append(m.group(0))
-            return placeholder
-
-        protected = _SKIP_BILINGUAL_RE.sub(protect_title, content)
-
-        result = re.sub(r">([^<]+)<", replace_text_node, protected)
-
-        # 恢复 <title> 内容
-        for i, original_title in enumerate(title_placeholders):
-            result = result.replace(f"__TITLE_PLACEHOLDER_{i}__", original_title)
-
-        # 注入双语对照的样式
-        bilingual_style = (
-            '<style>\n'
-            '.bilingual-source { color: #333; display: block; margin-bottom: 2px; }\n'
-            '.bilingual-target { color: #0066cc; font-style: italic; display: block; '
-            'margin-bottom: 8px; padding-left: 0; }\n'
-            '</style>'
-        )
-        head_close = re.search(r'</head>', result, re.IGNORECASE)
-        if head_close:
-            result = result[:head_close.start()] + '\n' + bilingual_style + '\n' + result[head_close.start():]
-        else:
-            body_open = re.search(r'<body[^>]*>', result, re.IGNORECASE)
-            if body_open:
-                result = result[:body_open.start()] + bilingual_style + '\n' + result[body_open.start():]
+            close_match = close_tag_pattern.search(result, end_pos)
+            if not close_match:
+                # 如果找不到结束标签，在 end_pos 后插入
+                insert_pos = end_pos
             else:
-                result = bilingual_style + '\n' + result
+                insert_pos = close_match.end()
+
+            # 构建译文内容：每句译文一行
+            translation_lines = [t for t in targets if t]
+            if not translation_lines:
+                continue
+
+            # 检测原始块使用的标签
+            # 从 start_pos 向前找开始标签
+            open_tag_pattern = re.compile(
+                r'<(p|div|h[1-6]|li|td|th|dt|dd|blockquote|figcaption|caption|summary)[^>]*>',
+                re.IGNORECASE,
+            )
+            # 在 start_pos 之前的内容中找最近的开始标签
+            preceding = result[:start_pos]
+            open_matches = list(open_tag_pattern.finditer(preceding))
+            tag_name = open_matches[-1].group(1) if open_matches else 'p'
+
+            # 构建译文段落
+            translation_text = html_escape(' '.join(translation_lines))
+            translation_block = (
+                f'\n<{tag_name} style="color: #1a56db; margin-top: 2px;">'
+                f'{translation_text}</{tag_name}>'
+            )
+
+            result = result[:insert_pos] + translation_block + result[insert_pos:]
 
         result = exporter._normalize_fonts(result)
         result = exporter._ensure_utf8_charset(result)
@@ -461,6 +540,174 @@ class MultiFormatExporter:
             else:
                 result_blocks.append(block)
         return "\n\n".join(result_blocks).encode("utf-8")
+
+    def _export_bilingual_docx_original(
+        self,
+        original_bytes: bytes,
+        segments: list[dict[str, Any]],
+    ) -> bytes:
+        """基于原始 DOCX 文件导出双语对照文档。
+
+        保持原始文档排版，在每个原文段落后插入蓝色译文段落。
+        使用 segments 的顺序信息做句子级对齐。
+        """
+        from copy import deepcopy
+        from io import BytesIO
+        from zipfile import ZipFile
+
+        from lxml import etree
+
+        WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        NSMAP = {"w": WORD_NS}
+
+        # 解压 DOCX
+        zip_buffer = BytesIO(original_bytes)
+        with ZipFile(zip_buffer, "r") as zf:
+            file_list = zf.namelist()
+            document_xml = zf.read("word/document.xml")
+
+        tree = etree.fromstring(document_xml)
+        body = tree.find(f".//{{{WORD_NS}}}body")
+        if body is None:
+            # fallback to table-based bilingual
+            return self._export_bilingual_docx(segments, "bilingual")[0]
+
+        # 收集所有段落及其文本
+        paragraphs = body.findall(f".//{{{WORD_NS}}}p")
+
+        # 构建有序 segment 列表
+        ordered_segments = []
+        for seg in segments:
+            source = ' '.join(str(seg.get("source_text") or seg.get("display_text") or "").split())
+            target = str(seg.get("target_text") or "").strip()
+            if source:
+                ordered_segments.append({"source": source, "target": target})
+
+        def _get_paragraph_text(para) -> str:
+            """提取段落的纯文本内容。"""
+            texts = []
+            for t_elem in para.iter(f"{{{WORD_NS}}}t"):
+                if t_elem.text:
+                    texts.append(t_elem.text)
+            return ' '.join(''.join(texts).split())
+
+        def _create_translation_paragraph(para, translation_text: str):
+            """基于原始段落创建译文段落，使用蓝色字体。"""
+            # 创建新段落
+            new_para = etree.Element(f"{{{WORD_NS}}}p")
+
+            # 复制段落属性（保持格式：缩进、对齐等）
+            pPr = para.find(f"{{{WORD_NS}}}pPr")
+            if pPr is not None:
+                new_pPr = deepcopy(pPr)
+                new_para.append(new_pPr)
+
+            # 创建 run 并设置蓝色字体
+            run = etree.SubElement(new_para, f"{{{WORD_NS}}}r")
+            rPr = etree.SubElement(run, f"{{{WORD_NS}}}rPr")
+
+            # 设置蓝色
+            color = etree.SubElement(rPr, f"{{{WORD_NS}}}color")
+            color.set(f"{{{WORD_NS}}}val", "1A56DB")
+
+            # 复制原始段落第一个 run 的字体大小等属性
+            first_run = para.find(f"{{{WORD_NS}}}r")
+            if first_run is not None:
+                orig_rPr = first_run.find(f"{{{WORD_NS}}}rPr")
+                if orig_rPr is not None:
+                    # 复制字体大小
+                    for prop_tag in ("sz", "szCs", "rFonts"):
+                        prop = orig_rPr.find(f"{{{WORD_NS}}}{prop_tag}")
+                        if prop is not None:
+                            rPr.append(deepcopy(prop))
+
+            # 设置中文字体
+            rFonts = rPr.find(f"{{{WORD_NS}}}rFonts")
+            if rFonts is None:
+                rFonts = etree.SubElement(rPr, f"{{{WORD_NS}}}rFonts")
+            rFonts.set(f"{{{WORD_NS}}}eastAsia", "Microsoft YaHei")
+            rFonts.set(f"{{{WORD_NS}}}hAnsi", "Microsoft YaHei")
+
+            # 添加文本
+            t_elem = etree.SubElement(run, f"{{{WORD_NS}}}t")
+            t_elem.text = translation_text
+            if translation_text and (translation_text[0] == ' ' or translation_text[-1] == ' '):
+                t_elem.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+
+            return new_para
+
+        # 对齐 segments 到段落
+        seg_cursor = 0
+        insertions: list[tuple[int, str]] = []  # (paragraph_index, translation_text)
+
+        for para_idx, para in enumerate(paragraphs):
+            para_text = _get_paragraph_text(para)
+            if not para_text:
+                continue
+
+            # 尝试消费 segments 直到覆盖整个段落
+            matched_targets: list[str] = []
+            accumulated = ""
+            start_cursor = seg_cursor
+
+            while seg_cursor < len(ordered_segments):
+                seg = ordered_segments[seg_cursor]
+                source = seg["source"]
+                if not source:
+                    seg_cursor += 1
+                    continue
+
+                test_accumulated = (accumulated + " " + source).strip() if accumulated else source
+                para_compact = re.sub(r'\s+', '', para_text)
+                test_compact = re.sub(r'\s+', '', test_accumulated)
+
+                if para_compact.startswith(test_compact) or para_compact == test_compact:
+                    accumulated = test_accumulated
+                    matched_targets.append(seg["target"])
+                    seg_cursor += 1
+                    if para_compact == test_compact:
+                        break
+                elif test_compact.startswith(para_compact):
+                    accumulated = test_accumulated
+                    matched_targets.append(seg["target"])
+                    seg_cursor += 1
+                    break
+                else:
+                    source_compact = re.sub(r'\s+', '', source)
+                    if source_compact in para_compact:
+                        accumulated = test_accumulated
+                        matched_targets.append(seg["target"])
+                        seg_cursor += 1
+                        continue
+                    break
+
+            translation_lines = [t for t in matched_targets if t]
+            if translation_lines:
+                insertions.append((para_idx, ' '.join(translation_lines)))
+
+        # 从后往前插入译文段落（避免索引偏移）
+        for para_idx, translation_text in reversed(insertions):
+            para = paragraphs[para_idx]
+            parent = para.getparent()
+            if parent is None:
+                continue
+            insert_index = list(parent).index(para) + 1
+            new_para = _create_translation_paragraph(para, translation_text)
+            parent.insert(insert_index, new_para)
+
+        # 重新打包 DOCX
+        modified_xml = etree.tostring(tree, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+        output_buffer = BytesIO()
+        with ZipFile(zip_buffer, "r") as zf_in:
+            with ZipFile(output_buffer, "w") as zf_out:
+                for item in zf_in.namelist():
+                    if item == "word/document.xml":
+                        zf_out.writestr(item, modified_xml)
+                    else:
+                        zf_out.writestr(item, zf_in.read(item))
+
+        return output_buffer.getvalue()
 
     def _export_bilingual_docx(
         self,
