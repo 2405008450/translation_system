@@ -46,6 +46,7 @@ class MatchResult(BaseModel):
 
 UserRole = Literal["super_admin", "admin", "user"]
 CreatableUserRole = Literal["admin", "user"]
+TranslatorType = Literal["internal", "external"]
 
 
 class UserRead(BaseModel):
@@ -53,6 +54,7 @@ class UserRead(BaseModel):
     username: str
     nickname: str | None
     role: UserRole
+    translator_type: TranslatorType
     is_active: bool
     created_at: str
 
@@ -73,12 +75,14 @@ class RegisterRequest(BaseModel):
     nickname: NicknameStr | None = None
     password: PasswordStr
     role: CreatableUserRole = "user"
+    translator_type: TranslatorType = "external"
 
 
 class UpdateUserRequest(BaseModel):
     username: UsernameStr | None = None
     nickname: NicknameStr | None = None
     password: PasswordStr | None = None
+    translator_type: TranslatorType | None = None
     is_active: bool | None = None
 
 

@@ -195,6 +195,14 @@ const router = createRouter({
   ],
 })
 
+function getDefaultRouteName(authStore: ReturnType<typeof useAuthStore>) {
+  return authStore.isExternalTranslator ? 'tasks' : 'projects'
+}
+
+function isExternalTranslatorBlockedRoute(name: unknown) {
+  return ['dashboard', 'projects'].includes(String(name || ''))
+}
+
 router.beforeEach(async (to) => {
   const authStore = useAuthStore()
   if (!authStore.ready) {
@@ -202,7 +210,7 @@ router.beforeEach(async (to) => {
   }
 
   if (to.name === 'login' && authStore.isAuthenticated) {
-    return { name: 'projects' }
+    return { name: getDefaultRouteName(authStore) }
   }
 
   if (to.meta.requiresAuth && !authStore.isAuthenticated) {
@@ -213,7 +221,11 @@ router.beforeEach(async (to) => {
   }
 
   if (to.meta.requiresAdmin && !authStore.isAdmin) {
-    return { name: 'projects' }
+    return { name: getDefaultRouteName(authStore) }
+  }
+
+  if (authStore.isAuthenticated && authStore.isExternalTranslator && isExternalTranslatorBlockedRoute(to.name)) {
+    return { name: 'tasks' }
   }
 
   return true

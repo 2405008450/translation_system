@@ -65,14 +65,14 @@ const navGroups = computed<NavGroup[]>(() => [
     label: t('shell.sections.dashboard'),
     icon: BarChart3,
     routeName: 'dashboard',
-    visible: true,
+    visible: !authStore.isExternalTranslator,
   },
   {
     key: 'workspace',
     label: t('shell.sections.workspace'),
     icon: Briefcase,
     routeName: 'projects',
-    visible: true,
+    visible: !authStore.isExternalTranslator,
   },
   {
     key: 'mytasks',
@@ -155,7 +155,10 @@ const breadcrumbs = computed(() => {
       return [{ label: t('shell.sections.workspace') }]
     case 'project-detail':
       return [
-        { label: t('shell.sections.workspace'), to: { name: 'projects' } },
+        {
+          label: authStore.isExternalTranslator ? t('shell.sections.tasks') : t('shell.sections.workspace'),
+          to: { name: authStore.isExternalTranslator ? 'tasks' : 'projects' },
+        },
         { label: pageTitle.value },
       ]
     case 'tasks':
@@ -312,7 +315,9 @@ watch(
     shellStore.trackRecent({
       id: `${String(name)}:${String(id || '')}`,
       label: title,
-      section: String(route.meta.navSection || 'projects'),
+      section: authStore.isExternalTranslator && route.meta.navSection === 'projects'
+        ? 'tasks'
+        : String(route.meta.navSection || 'projects'),
       route: {
         name: String(name),
         params: Object.fromEntries(

@@ -23,6 +23,9 @@ SUPER_ADMIN_ROLE = "super_admin"
 ADMIN_ROLE = "admin"
 USER_ROLE = "user"
 ADMIN_ROLES = {SUPER_ADMIN_ROLE, ADMIN_ROLE}
+INTERNAL_TRANSLATOR_TYPE = "internal"
+EXTERNAL_TRANSLATOR_TYPE = "external"
+TRANSLATOR_TYPES = {INTERNAL_TRANSLATOR_TYPE, EXTERNAL_TRANSLATOR_TYPE}
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
@@ -34,6 +37,36 @@ def is_super_admin_role(role: str | None) -> bool:
 
 def is_admin_role(role: str | None) -> bool:
     return role in ADMIN_ROLES
+
+
+def get_user_translator_type(user: User | None) -> str:
+    if user is None:
+        return INTERNAL_TRANSLATOR_TYPE
+    translator_type = (getattr(user, "translator_type", None) or INTERNAL_TRANSLATOR_TYPE).strip().lower()
+    return translator_type if translator_type in TRANSLATOR_TYPES else INTERNAL_TRANSLATOR_TYPE
+
+
+def is_external_translator(user: User | None) -> bool:
+    return (
+        getattr(user, "role", None) == USER_ROLE
+        and get_user_translator_type(user) == EXTERNAL_TRANSLATOR_TYPE
+    )
+
+
+def can_access_all_projects(user: User | None) -> bool:
+    role = getattr(user, "role", None)
+    return is_admin_role(role) or (
+        role == USER_ROLE and get_user_translator_type(user) == INTERNAL_TRANSLATOR_TYPE
+    )
+
+
+def normalize_translator_type(translator_type: str | None, role: str | None) -> str:
+    if role != USER_ROLE:
+        return INTERNAL_TRANSLATOR_TYPE
+    cleaned = (translator_type or EXTERNAL_TRANSLATOR_TYPE).strip().lower()
+    if cleaned not in TRANSLATOR_TYPES:
+        raise HTTPException(status_code=400, detail="译者类型只能是 internal 或 external。")
+    return cleaned
 
 
 def users_table_exists() -> bool:
@@ -106,6 +139,7 @@ def create_user(
     nickname: str | None,
     password: str,
     role: str = "user",
+    translator_type: str | None = None,
     is_active: bool = True,
 ) -> User:
     require_users_table()
@@ -119,6 +153,7 @@ def create_user(
         nickname=cleaned_nickname,
         hashed_password=hash_password(password),
         role=role,
+        translator_type=normalize_translator_type(translator_type, role),
         is_active=is_active,
     )
     db.add(user)
@@ -134,10 +169,12 @@ def update_user_profile(
     username: str | None = None,
     nickname: str | None = None,
     password: str | None = None,
+    translator_type: str | None = None,
     is_active: bool | None = None,
     update_username: bool = False,
     update_nickname: bool = False,
     update_password: bool = False,
+    update_translator_type: bool = False,
     update_is_active: bool = False,
 ) -> User:
     require_users_table()
@@ -162,6 +199,9 @@ def update_user_profile(
         if password is None:
             raise HTTPException(status_code=400, detail="\u5bc6\u7801\u4e0d\u80fd\u4e3a\u7a7a\u3002")
         user.hashed_password = hash_password(password)
+
+    if update_translator_type:
+        user.translator_type = normalize_translator_type(translator_type, user.role)
 
     if update_is_active:
         if is_active is None:
@@ -214,6 +254,7 @@ def build_auth_response(user: User) -> dict[str, Any]:
             "username": user.username,
             "nickname": getattr(user, "nickname", None),
             "role": user.role,
+            "translator_type": get_user_translator_type(user),
         },
     )
     return {
@@ -229,6 +270,7 @@ def serialize_user(user: User) -> dict[str, Any]:
         "username": user.username,
         "nickname": getattr(user, "nickname", None),
         "role": user.role,
+        "translator_type": get_user_translator_type(user),
         "is_active": user.is_active,
         "created_at": user.created_at.isoformat(),
     }

@@ -27,6 +27,7 @@ import { useToast } from '../composables/useToast'
 import { getFileStatusMeta } from '../constants/status'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
 import type { IssueMarker } from '../types/api'
+import { useAuthStore } from '../stores/auth'
 
 interface ProjectItem {
   id: string
@@ -44,6 +45,8 @@ interface ProjectItem {
   creator: string | null
   deadline: string | null
   access_level: string | null
+  can_manage?: boolean
+  can_write?: boolean
   created_at: string
   updated_at: string
 }
@@ -62,6 +65,7 @@ interface ProjectCreateResponse {
 const confirm = useConfirm()
 const toast = useToast()
 const router = useRouter()
+const authStore = useAuthStore()
 const { t } = useI18n()
 
 const loading = ref(false)
@@ -107,6 +111,7 @@ const columns = computed<DataTableColumn[]>(() => ([
 ]))
 
 const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
+const canManageProjects = computed(() => authStore.isAdmin)
 
 async function loadProjects() {
   loading.value = true
@@ -284,11 +289,18 @@ onMounted(() => {
         <span class="table-toolbar__summary">{{ t('projectList.total', { total: totalCount }) }}</span>
       </div>
       <div class="table-toolbar__right">
-        <button class="button button--primary" data-testid="project-create-button" type="button" @click="openCreateDialog">
+        <button
+          v-if="canManageProjects"
+          class="button button--primary"
+          data-testid="project-create-button"
+          type="button"
+          @click="openCreateDialog"
+        >
           <Plus :size="14" />
           {{ t('projectList.create') }}
         </button>
         <button
+          v-if="canManageProjects"
           class="button"
           type="button"
           :title="t('projectList.importAssetsTitle')"
@@ -397,6 +409,7 @@ onMounted(() => {
         <template #actions="{ row }">
           <div class="project-row-actions">
             <button
+              v-if="canManageProjects"
               class="data-table__actions-btn"
               type="button"
               :title="t('issueMarker.actions.open')"

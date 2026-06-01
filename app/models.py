@@ -121,6 +121,20 @@ class FileRecord(Base):
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
+    assignee_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    assigned_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    assigned_at: Mapped[DateTime | None] = mapped_column(
+        DateTime(timezone=False),
+        nullable=True,
+    )
     source_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
     target_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
     creator_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -172,6 +186,12 @@ class FileRecord(Base):
     active_operation_user: Mapped["User | None"] = relationship(
         "User", foreign_keys=[active_operation_user_id]
     )
+    assignee: Mapped["User | None"] = relationship(
+        "User", foreign_keys=[assignee_id]
+    )
+    assigned_by: Mapped["User | None"] = relationship(
+        "User", foreign_keys=[assigned_by_id]
+    )
     project: Mapped["Project | None"] = relationship(
         "Project", back_populates="file_records"
     )
@@ -216,6 +236,9 @@ class User(Base):
     nickname: Mapped[str | None] = mapped_column(String(50), nullable=True)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(20), nullable=False, default="user")
+    translator_type: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="internal", server_default=text("'internal'")
+    )
     is_active: Mapped[bool] = mapped_column(nullable=False, default=True)
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
@@ -261,6 +284,7 @@ class Segment(Base):
     sentence_id: Mapped[str] = mapped_column(String(20), nullable=False)
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
     display_text: Mapped[str] = mapped_column(Text, nullable=False)
+    source_html: Mapped[str | None] = mapped_column(Text, nullable=True)
     target_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
     target_html: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="none")

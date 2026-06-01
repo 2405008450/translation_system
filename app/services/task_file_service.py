@@ -13,8 +13,12 @@ from app.services.adapters.export_formats import get_supported_exports
 from app.services.adapters.models import BlockNode, DocumentAST, NodeType, ParseResult
 from app.services.adapters.multi_format_exporter import export_file as export_multi_format_file
 from app.services.document_exporter import (
+    BILINGUAL_LAYOUT_SOURCE_FIRST,
+    BILINGUAL_LAYOUT_TARGET_FIRST,
     DOCX_MEDIA_TYPE,
+    build_bilingual_docx_filename,
     build_translated_docx_filename,
+    export_bilingual_docx_with_layout,
     export_translated_docx,
 )
 from app.services.document_workspace import (
@@ -425,6 +429,12 @@ class ExportedTaskFile:
     filename: str
 
 
+BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS = {
+    "bilingual_docx_layout_source_first": BILINGUAL_LAYOUT_SOURCE_FIRST,
+    "bilingual_docx_layout_target_first": BILINGUAL_LAYOUT_TARGET_FIRST,
+}
+
+
 def get_task_file_extension(filename: str) -> str:
     return Path(filename or "").suffix.lower()
 
@@ -667,6 +677,34 @@ def export_translated_task_file(
         original_bytes=raw_bytes,
     )
     return ExportedTaskFile(content=content, media_type=media_type, filename=export_filename)
+
+
+def export_bilingual_task_docx_with_layout(
+    raw_bytes: bytes | None,
+    filename: str,
+    segments: list[Any],
+    order: str = BILINGUAL_LAYOUT_SOURCE_FIRST,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: dict[str, object] | str | None = None,
+) -> ExportedTaskFile:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
+    if not is_docx_task(filename):
+        raise ValueError("仅 DOCX 源文件支持保留排版的双语 Word 导出。")
+    if raw_bytes is None:
+        raise ValueError("DOCX 源文件缺失，暂时无法导出保留排版的双语 Word。")
+
+    return ExportedTaskFile(
+        content=export_bilingual_docx_with_layout(
+            raw_bytes=raw_bytes,
+            segments=segments,
+            order=order,
+            document_parse_mode=document_parse_mode,
+            document_parse_options=document_parse_options,
+        ),
+        media_type=DOCX_MEDIA_TYPE,
+        filename=build_bilingual_docx_filename(filename, order),
+    )
 
 
 def _export_translated_task_file_without_source(

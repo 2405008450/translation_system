@@ -1,10 +1,12 @@
 export type UserRole = 'super_admin' | 'admin' | 'user'
+export type TranslatorType = 'internal' | 'external'
 
 export interface User {
   id: string
   username: string
   nickname: string | null
   role: UserRole
+  translator_type: TranslatorType
   is_active: boolean
   created_at: string
 }
@@ -68,8 +70,14 @@ export interface AnalyticsDashboardResponse {
 
 export interface FileRecordSummary {
   id: string
+  project_id?: string | null
   filename: string
   status: string
+  progress?: number
+  total_segments?: number
+  translated_segments?: number
+  open_issue_count?: number
+  issue_count?: number
   active_operation?: string | null
   active_operation_message?: string
   is_edit_locked?: boolean
@@ -78,6 +86,11 @@ export interface FileRecordSummary {
   document_statistics?: DocumentStatistics
   source_language: string | null
   target_language: string | null
+  assignee_id?: string | null
+  assignee?: User | null
+  assigned_at?: string | null
+  can_manage?: boolean
+  can_write?: boolean
   created_at: string
   updated_at: string
 }
@@ -186,6 +199,7 @@ export interface Segment {
   display_index?: number | null
   source_text: string
   display_text: string
+  source_html?: string | null
   target_text: string
   target_html?: string | null
   status: string

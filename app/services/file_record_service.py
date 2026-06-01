@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
-from sqlalchemy import case, event, func, update
+from sqlalchemy import case, event, func, or_, update
 from sqlalchemy.orm import Session
 
 from app.models import FileRecord, Segment, TranslationMemory, User
@@ -24,6 +24,7 @@ from app.services.document_workspace import (
     DOCUMENT_PARSE_MODE_FULL,
     normalize_document_parse_options,
     normalize_document_parse_mode,
+    parse_docx_workspace,
 )
 from app.services.analytics_service import count_source_words, record_translation_metric_event
 from app.services.revision_service import create_revision
@@ -287,6 +288,7 @@ def duplicate_file_record(
                 sentence_id=segment.sentence_id,
                 source_text=segment.source_text,
                 display_text=segment.display_text,
+                source_html=segment.source_html,
                 target_text=segment.target_text,
                 target_html=segment.target_html,
                 status=segment.status,
@@ -344,6 +346,7 @@ def _create_file_record_from_workspace(
             sentence_id=seg["sentence_id"],
             source_text=seg["source_text"],
             display_text=seg["display_text"],
+            source_html=seg.get("source_html"),
             target_text=seg["target_text"],
             status=seg["status"],
             score=seg["score"],
@@ -519,6 +522,68 @@ def get_file_record_source_filename(file_record: FileRecord) -> str:
     return f"{base_name}{stored_extension}"
 
 
+def backfill_file_record_source_html(db: Session, file_record: FileRecord) -> int:
+    source_filename = get_file_record_source_filename(file_record)
+    if Path(source_filename).suffix.lower() not in _DOCX_EXTENSIONS:
+        return 0
+
+    document_parse_mode = normalize_document_parse_mode(
+        getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL)
+    )
+    document_parse_options = normalize_document_parse_options(
+        getattr(file_record, "document_parse_options", None),
+        document_parse_mode,
+    )
+    if document_parse_options.get("clean_format"):
+        return 0
+
+    missing_filter = or_(Segment.source_html.is_(None), Segment.source_html == "")
+    has_missing_source_html = (
+        db.query(Segment.id)
+        .filter(Segment.file_record_id == file_record.id, missing_filter)
+        .first()
+        is not None
+    )
+    if not has_missing_source_html:
+        return 0
+
+    raw_bytes = load_file_record_source(file_record)
+    if raw_bytes is None:
+        return 0
+
+    workspace = parse_docx_workspace(
+        raw_bytes,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
+    parsed_segments = {
+        str(seg.get("sentence_id")): seg
+        for seg in workspace.get("segments", [])
+        if seg.get("sentence_id") and seg.get("source_html")
+    }
+    if not parsed_segments:
+        return 0
+
+    updated_count = 0
+    segments = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record.id, missing_filter)
+        .all()
+    )
+    for segment in segments:
+        parsed_segment = parsed_segments.get(str(segment.sentence_id))
+        if not parsed_segment:
+            continue
+        if parsed_segment.get("source_text") != segment.source_text:
+            continue
+        segment.source_html = parsed_segment.get("source_html")
+        updated_count += 1
+
+    if updated_count:
+        db.flush()
+    return updated_count
+
+
 def get_file_record_document_statistics(file_record: FileRecord) -> dict:
     return normalize_document_statistics(getattr(file_record, "document_statistics", None))
 
@@ -559,6 +624,7 @@ def attach_source_document_to_file_record(
             sentence_id=seg["sentence_id"],
             source_text=seg["source_text"],
             display_text=seg["display_text"],
+            source_html=seg.get("source_html"),
             target_text=seg["target_text"],
             status=seg["status"],
             score=seg["score"],
@@ -842,6 +908,7 @@ def update_segment_source_text(
 
     segment.source_text = source_text
     segment.display_text = source_text
+    segment.source_html = None
     db.commit()
     db.refresh(segment)
     return segment

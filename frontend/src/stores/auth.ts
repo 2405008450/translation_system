@@ -20,6 +20,8 @@ export const useAuthStore = defineStore('auth', () => {
   const isAuthenticated = computed(() => Boolean(token.value && user.value))
   const isSuperAdmin = computed(() => user.value?.role === 'super_admin')
   const isAdmin = computed(() => user.value?.role === 'super_admin' || user.value?.role === 'admin')
+  const isInternalTranslator = computed(() => user.value?.role === 'user' && user.value?.translator_type !== 'external')
+  const isExternalTranslator = computed(() => user.value?.role === 'user' && user.value?.translator_type === 'external')
 
   function persistToken(nextToken: string | null) {
     token.value = nextToken
@@ -137,12 +139,14 @@ export const useAuthStore = defineStore('auth', () => {
     password: string,
     role: 'admin' | 'user',
     nickname?: string | null,
+    translatorType: 'internal' | 'external' = 'external',
   ) {
     const { data } = await http.post<User>('/auth/register', {
       username,
       nickname: nickname || null,
       password,
       role,
+      translator_type: translatorType,
     })
     return data
   }
@@ -162,6 +166,8 @@ export const useAuthStore = defineStore('auth', () => {
     isAuthenticated,
     isSuperAdmin,
     isAdmin,
+    isInternalTranslator,
+    isExternalTranslator,
     bootstrap,
     checkInitStatus,
     fetchMe,

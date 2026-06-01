@@ -46,6 +46,20 @@ EXPORT_OPTIONS = {
         extension=".docx",
         mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ),
+    "bilingual_docx_layout_source_first": ExportOption(
+        id="bilingual_docx_layout_source_first",
+        name="双语 Word（原文在前）",
+        description="保留原 Word 排版，按原文、译文顺序导出",
+        extension=".docx",
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ),
+    "bilingual_docx_layout_target_first": ExportOption(
+        id="bilingual_docx_layout_target_first",
+        name="双语 Word（译文在前）",
+        description="保留原 Word 排版，按译文、原文顺序导出",
+        extension=".docx",
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ),
     "bilingual_txt": ExportOption(
         id="bilingual_txt",
         name="双语文本",
@@ -81,7 +95,15 @@ EXPORT_OPTIONS = {
 # 键: 文件扩展名, 值: 支持的导出选项 ID 列表
 FORMAT_EXPORT_SUPPORT: Dict[str, List[str]] = {
     # 办公文档
-    ".docx": ["original", "bilingual_docx", "bilingual_txt", "tmx", "xliff"],
+    ".docx": [
+        "original",
+        "bilingual_docx_layout_source_first",
+        "bilingual_docx_layout_target_first",
+        "bilingual_docx",
+        "bilingual_txt",
+        "tmx",
+        "xliff",
+    ],
     ".pdf": ["bilingual_docx", "bilingual_txt", "tmx", "xliff"],  # PDF 无法原格式导出
     ".pptx": ["original", "bilingual_docx", "bilingual_txt", "tmx", "xliff"],
     ".xlsx": ["original", "bilingual_docx", "bilingual_txt", "tmx", "xliff"],

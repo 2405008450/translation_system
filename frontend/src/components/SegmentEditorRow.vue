@@ -209,8 +209,10 @@ function highlightSearchText(text: string, keyword: string): HighlightPart[] | n
   return segments
 }
 
+const sourceTextContent = computed(() => props.segment.display_text || props.segment.source_text || '')
+
 const highlightedSourceText = computed(() => {
-  const text = props.segment.display_text || props.segment.source_text
+  const text = sourceTextContent.value
   return highlightSearchText(text, props.sourceSearchQuery) || highlightText(text, props.matchedTerms || [], 'source_text')
 })
 
@@ -268,6 +270,76 @@ function escapeHtml(text: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
 }
+
+function renderHighlightPartsAsHtml(parts: HighlightPart[] | null, text: string): string {
+  const sourceParts: HighlightPart[] = parts || [{ text, highlight: false }]
+  return sourceParts
+    .map((seg) =>
+      seg.highlight
+        ? `<mark class="${seg.kind === 'search' ? 'segment-row__search-highlight' : 'segment-row__term-highlight'}">${escapeHtml(seg.text)}</mark>`
+        : escapeHtml(seg.text)
+    )
+    .join('')
+}
+
+function renderSourceTextWithHighlights(text: string): string {
+  return renderHighlightPartsAsHtml(
+    highlightSearchText(text, props.sourceSearchQuery)
+      || highlightText(text, props.matchedTerms || [], 'source_text'),
+    text,
+  )
+}
+
+function hasSourceHighlights(): boolean {
+  return Boolean(props.sourceSearchQuery.trim()) || (props.matchedTerms || []).some((term) => Boolean(term.source_text))
+}
+
+function renderSourceHtmlWithHighlights(sourceHtml: string): string {
+  if (!hasSourceHighlights() || typeof document === 'undefined') {
+    return sourceHtml
+  }
+
+  const template = document.createElement('template')
+  template.innerHTML = sourceHtml
+
+  function processNode(node: Node) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent || ''
+      if (!text) return
+      const wrapper = document.createElement('span')
+      wrapper.innerHTML = renderSourceTextWithHighlights(text)
+      const textNode = node as ChildNode
+      textNode.replaceWith(...Array.from(wrapper.childNodes))
+      return
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      return
+    }
+
+    const element = node as HTMLElement
+    if (
+      element.matches('script, style')
+      || element.classList.contains('doc-math')
+      || element.classList.contains('segment-row__term-highlight')
+      || element.classList.contains('segment-row__search-highlight')
+    ) {
+      return
+    }
+
+    Array.from(element.childNodes).forEach(processNode)
+  }
+
+  Array.from(template.content.childNodes).forEach(processNode)
+  return template.innerHTML
+}
+
+const sourceHtmlContent = computed(() => {
+  if (props.segment.source_html) {
+    return renderSourceHtmlWithHighlights(props.segment.source_html)
+  }
+  return renderHighlightPartsAsHtml(highlightedSourceText.value, sourceTextContent.value)
+})
 
 /**
  * 将文本转换为显示标记模式（显示空格、制表符、换行符）
@@ -631,7 +703,7 @@ function handleSourceInput() {
   if (!sourceEditorRef.value) return
   if (!props.sourceEditing) {
     // 非编辑模式下恢复原文内容
-    sourceEditorRef.value.textContent = props.segment.display_text || props.segment.source_text
+    syncSourceEditorFromState(true)
     return
   }
   const text = sourceEditorRef.value.textContent || ''
@@ -919,6 +991,29 @@ function syncEditorHtmlFromState(preserveCaret: boolean) {
   }
 }
 
+function syncSourceEditorFromState(preserveCaret: boolean) {
+  const editor = sourceEditorRef.value
+  if (!editor) {
+    return
+  }
+
+  const caretPos = preserveCaret ? saveCaretPosition(editor) : 0
+  if (props.sourceEditing) {
+    const nextText = sourceTextContent.value
+    if (editor.textContent !== nextText) {
+      editor.textContent = nextText
+    }
+  } else {
+    const nextHtml = sourceHtmlContent.value
+    if (editor.innerHTML !== nextHtml) {
+      editor.innerHTML = nextHtml
+    }
+  }
+  if (preserveCaret && isSourceFocused.value) {
+    restoreCaretPosition(editor, caretPos)
+  }
+}
+
 onMounted(() => {
   if (editorRef.value) {
     editorRef.value.innerHTML = editorHtmlContent.value
@@ -989,11 +1084,9 @@ watch(
   () => props.active,
   (isActive) => {
     if (isActive) {
-      sourceEditText.value = props.segment.display_text || props.segment.source_text
+      sourceEditText.value = sourceTextContent.value
       nextTick(() => {
-        if (sourceEditorRef.value) {
-          sourceEditorRef.value.textContent = sourceEditText.value
-        }
+        syncSourceEditorFromState(false)
       })
     }
   },
@@ -1004,15 +1097,28 @@ watch(
 watch(
   () => props.sourceEditing && props.active,
   (shouldEdit) => {
-    if (shouldEdit) {
-      nextTick(() => {
+    nextTick(() => {
+      syncSourceEditorFromState(false)
+      if (shouldEdit) {
         if (sourceEditorRef.value) {
           sourceEditorRef.value.focus()
           moveCursorToEnd(sourceEditorRef.value)
         }
+      }
+    })
+  },
+)
+
+watch(
+  sourceHtmlContent,
+  () => {
+    if (props.active) {
+      nextTick(() => {
+        syncSourceEditorFromState(isSourceFocused.value)
       })
     }
   },
+  { flush: 'post' },
 )
 
 </script>
@@ -1060,20 +1166,7 @@ watch(
         @keydown="handleSourceKeydown"
         @beforeinput="handleSourceBeforeInput"
       ></div>
-      <div v-else class="segment-row__text">
-        <template v-if="highlightedSourceText">
-          <template v-for="(seg, idx) in highlightedSourceText" :key="idx">
-            <mark
-              v-if="seg.highlight"
-              :class="seg.kind === 'search' ? 'segment-row__search-highlight' : 'segment-row__term-highlight'"
-            >
-              {{ seg.text }}
-            </mark>
-            <template v-else>{{ seg.text }}</template>
-          </template>
-        </template>
-        <template v-else>{{ segment.display_text || segment.source_text }}</template>
-      </div>
+      <div v-else class="segment-row__text" v-html="sourceHtmlContent"></div>
     </div>
 
     <div class="segment-row__cell segment-row__cell--target" :class="{ 'is-pending': hasPendingRevision }">
@@ -1243,6 +1336,25 @@ watch(
 }
 
 /* 穿透 scoped 样式，让 innerHTML 插入的 mark 标签也能应用样式 */
+.segment-row__text :deep(.segment-row__term-highlight),
+.segment-row__source-editor :deep(.segment-row__term-highlight) {
+  background: rgba(216, 183, 78, 0.28);
+  color: inherit;
+  padding: 1px 2px;
+  border-radius: 3px;
+  font-weight: 500;
+}
+
+.segment-row__text :deep(.segment-row__search-highlight),
+.segment-row__source-editor :deep(.segment-row__search-highlight) {
+  background: #fff176;
+  color: inherit;
+  padding: 1px 2px;
+  border-radius: 3px;
+  box-shadow: inset 0 0 0 1px rgba(138, 103, 0, 0.2);
+  font-weight: 600;
+}
+
 .segment-row__editor :deep(.segment-row__term-highlight) {
   background: rgba(216, 183, 78, 0.28);
   color: inherit;

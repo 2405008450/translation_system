@@ -41,7 +41,7 @@ REQUIRED_SCHEMA = {
         "source_language",
         "target_language",
     },
-    "users": {"nickname"},
+    "users": {"nickname", "translator_type"},
     "projects": {
         "id",
         "name",
@@ -65,6 +65,9 @@ REQUIRED_SCHEMA = {
         "active_operation_token",
         "active_operation_updated_at",
         "active_operation_user_id",
+        "assignee_id",
+        "assigned_by_id",
+        "assigned_at",
         "source_language",
         "target_language",
         "creator_id",
@@ -80,6 +83,7 @@ REQUIRED_SCHEMA = {
         "llm_provider",
         "llm_model",
         "version",
+        "source_html",
         "target_html",
     },
     "translation_metric_events": {
@@ -473,6 +477,16 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ADD COLUMN IF NOT EXISTS nickname VARCHAR(50)
             """,
             """
+            ALTER TABLE IF EXISTS users
+            ADD COLUMN IF NOT EXISTS translator_type VARCHAR(20) NOT NULL DEFAULT 'internal'
+            """,
+            """
+            UPDATE users
+            SET translator_type = 'internal'
+            WHERE translator_type IS NULL
+               OR translator_type NOT IN ('internal', 'external')
+            """,
+            """
             DO $$
             BEGIN
                 IF EXISTS (
@@ -614,6 +628,18 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
             """
             ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS assignee_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS assigned_by_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
             ADD COLUMN IF NOT EXISTS source_language VARCHAR(20)
             """,
             """
@@ -671,6 +697,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ON file_records (active_operation)
             """,
             """
+            CREATE INDEX IF NOT EXISTS ix_file_records_assignee_id
+            ON file_records (assignee_id)
+            """,
+            """
             CREATE INDEX IF NOT EXISTS ix_file_records_source_language
             ON file_records (source_language)
             """,
@@ -689,6 +719,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS segments
             ADD COLUMN IF NOT EXISTS llm_model VARCHAR(200)
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS source_html TEXT
             """,
             """
             ALTER TABLE IF EXISTS segments

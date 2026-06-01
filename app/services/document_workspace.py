@@ -220,9 +220,12 @@ class NumberingInstance:
 @dataclass(frozen=True)
 class StyleDefinition:
     style_id: str
+    style_type: str
     based_on: str | None
     num_id: str | None
     ilvl: int | None
+    paragraph_css: str = ""
+    run_css: str = ""
 
 
 @dataclass(frozen=True)
@@ -231,6 +234,8 @@ class NumberingSchema:
     instances: dict[str, NumberingInstance]
     styles: dict[str, StyleDefinition]
     style_numbering_map: dict[str, tuple[str, int]]
+    default_paragraph_css: str = ""
+    default_run_css: str = ""
 
 
 @dataclass
@@ -310,7 +315,9 @@ class DocxPackage:
 def _build_numbering_schema(package: DocxPackage) -> NumberingSchema:
     abstract_levels: dict[str, dict[int, NumberingLevel]] = {}
     instances: dict[str, NumberingInstance] = {}
-    styles = _parse_style_definitions(package.read_xml("word/styles.xml"))
+    styles_root = package.read_xml("word/styles.xml")
+    styles = _parse_style_definitions(styles_root)
+    default_paragraph_css, default_run_css = _parse_style_defaults(styles_root)
 
     numbering_root = package.read_xml("word/numbering.xml")
     if numbering_root is None:
@@ -319,6 +326,8 @@ def _build_numbering_schema(package: DocxPackage) -> NumberingSchema:
             instances={},
             styles=styles,
             style_numbering_map={},
+            default_paragraph_css=default_paragraph_css,
+            default_run_css=default_run_css,
         )
 
     for abstract_num in numbering_root.findall("./w:abstractNum", NS):
@@ -378,6 +387,8 @@ def _build_numbering_schema(package: DocxPackage) -> NumberingSchema:
         instances=instances,
         styles=styles,
         style_numbering_map=style_numbering_map,
+        default_paragraph_css=default_paragraph_css,
+        default_run_css=default_run_css,
     )
 
 
@@ -387,7 +398,8 @@ def _parse_style_definitions(styles_root: ET.Element | None) -> dict[str, StyleD
 
     styles: dict[str, StyleDefinition] = {}
     for style in styles_root.findall("./w:style", NS):
-        if style.get(_qn("w", "type")) != "paragraph":
+        style_type = style.get(_qn("w", "type")) or ""
+        if style_type not in {"paragraph", "character"}:
             continue
 
         style_id = style.get(_qn("w", "styleId"))
@@ -414,12 +426,56 @@ def _parse_style_definitions(styles_root: ET.Element | None) -> dict[str, StyleD
 
         styles[style_id] = StyleDefinition(
             style_id=style_id,
+            style_type=style_type,
             based_on=based_on,
             num_id=num_id,
             ilvl=ilvl,
+            paragraph_css=_build_paragraph_properties_css(style.find("./w:pPr", NS)),
+            run_css=_build_run_properties_css(style.find("./w:rPr", NS)),
         )
 
     return styles
+
+
+def _parse_style_defaults(styles_root: ET.Element | None) -> tuple[str, str]:
+    if styles_root is None:
+        return "", ""
+    paragraph_properties = styles_root.find("./w:docDefaults/w:pPrDefault/w:pPr", NS)
+    run_properties = styles_root.find("./w:docDefaults/w:rPrDefault/w:rPr", NS)
+    return (
+        _build_paragraph_properties_css(paragraph_properties),
+        _build_run_properties_css(run_properties),
+    )
+
+
+def _resolve_style_css(
+    style_id: str | None,
+    styles: dict[str, StyleDefinition],
+    *,
+    css_kind: str,
+    style_type: str | None = None,
+) -> str:
+    if not style_id:
+        return ""
+
+    chain: list[StyleDefinition] = []
+    visited: set[str] = set()
+    current_style_id = style_id
+    while current_style_id and current_style_id not in visited:
+        visited.add(current_style_id)
+        style = styles.get(current_style_id)
+        if style is None:
+            break
+        if style_type is None or style.style_type == style_type:
+            chain.append(style)
+        current_style_id = style.based_on
+
+    chain.reverse()
+    if css_kind == "paragraph":
+        return _merge_css(*(style.paragraph_css for style in chain))
+    if css_kind == "run":
+        return _merge_css(*(style.run_css for style in chain))
+    return ""
 
 
 def _parse_numbering_level(level: ET.Element | None) -> NumberingLevel | None:
@@ -997,6 +1053,31 @@ def _collect_paragraph_render_data(
 ) -> ParsedParagraphRenderData:
     parse_state = InlineParseState()
     numbering_text = _resolve_paragraph_numbering(paragraph, numbering_state)
+    clean_format = story.parse_options.get("clean_format")
+    paragraph_style_id = _get_paragraph_style_id(paragraph)
+    if clean_format:
+        paragraph_css = ""
+        paragraph_run_css = ""
+    else:
+        paragraph_css = _merge_css(
+            numbering_state.schema.default_paragraph_css,
+            _resolve_style_css(
+                paragraph_style_id,
+                numbering_state.schema.styles,
+                css_kind="paragraph",
+                style_type="paragraph",
+            ),
+            _build_paragraph_css(paragraph),
+        )
+        paragraph_run_css = _merge_css(
+            numbering_state.schema.default_run_css,
+            _resolve_style_css(
+                paragraph_style_id,
+                numbering_state.schema.styles,
+                css_kind="run",
+                style_type="paragraph",
+            ),
+        )
     fragments, embedded_html_parts, embedded_segments = _collect_inline_content(
         node=paragraph,
         story=story,
@@ -1004,12 +1085,14 @@ def _collect_paragraph_render_data(
         block_counter=block_counter,
         numbering_state=numbering_state,
         parse_state=parse_state,
+        inherited_css=paragraph_run_css,
     )
     if numbering_text:
         fragments = [
             InlineFragment(
                 display_text=numbering_text,
                 source_text="".join(" " if not char.isspace() else char for char in numbering_text),
+                css=paragraph_run_css,
             ),
             *fragments,
         ]
@@ -1020,7 +1103,7 @@ def _collect_paragraph_render_data(
         embedded_html_parts=embedded_html_parts,
         embedded_segments=embedded_segments,
         numbering_text=numbering_text,
-        paragraph_css="" if story.parse_options.get("clean_format") else _build_paragraph_css(paragraph),
+        paragraph_css=paragraph_css,
         suppressed_page_number_field=parse_state.suppressed_page_number_field,
     )
 
@@ -1339,6 +1422,13 @@ def _render_paragraph_fragment_group(
         sentence_display = _collect_span_text(fragments, span, use_source=False)
         sentence_source = _normalize_segment_source_text(_collect_span_text(fragments, span, use_source=True))
         math_placeholders = _collect_span_math_placeholders(fragments, span)
+        source_html = _collect_span_html(
+            fragments,
+            span,
+            sentence_display,
+            math_placeholders,
+            paragraph_css=paragraph_css,
+        )
         sentence_id = None
         segment_numbering_text = numbering_text if numbering_available else ""
         if sentence_source:
@@ -1348,6 +1438,7 @@ def _render_paragraph_fragment_group(
                     "sentence_id": sentence_id,
                     "source_text": sentence_source,
                     "display_text": sentence_display,
+                    "source_html": source_html,
                     "numbering_text": segment_numbering_text,
                     "status": "none",
                     "score": 0.0,
@@ -1491,6 +1582,13 @@ def _extract_numpr_reference(num_pr: ET.Element | None) -> tuple[str, int] | Non
 
 def _get_paragraph_style_id(paragraph: ET.Element) -> str | None:
     style_element = paragraph.find("./w:pPr/w:pStyle", NS)
+    if style_element is None:
+        return None
+    return style_element.get(_qn("w", "val"))
+
+
+def _get_run_style_id(run: ET.Element) -> str | None:
+    style_element = run.find("./w:rPr/w:rStyle", NS)
     if style_element is None:
         return None
     return style_element.get(_qn("w", "val"))
@@ -1686,7 +1784,16 @@ def _collect_inline_content(
 
     if node.tag == _qn("w", "r"):
         if not story.parse_options.get("clean_format"):
-            inherited_css = _merge_css(inherited_css, _build_run_css(node))
+            inherited_css = _merge_css(
+                inherited_css,
+                _resolve_style_css(
+                    _get_run_style_id(node),
+                    numbering_state.schema.styles,
+                    css_kind="run",
+                    style_type="character",
+                ),
+                _build_run_css(node),
+            )
 
     if node.tag == _qn("w", "fldChar"):
         _update_field_state(node, story.kind, parse_state)
@@ -2229,6 +2336,34 @@ def _collect_span_math_placeholders(
     return placeholders
 
 
+def _collect_span_html(
+    fragments: list[InlineFragment],
+    span: SentenceSpan,
+    display_text: str,
+    math_placeholders: Mapping[str, str] | None = None,
+    paragraph_css: str = "",
+) -> str | None:
+    html_parts: list[str] = []
+    cursor = 0
+
+    for fragment in fragments:
+        next_cursor = cursor + len(fragment.display_text)
+        overlap_start = max(span.start, cursor)
+        overlap_end = min(span.end, next_cursor)
+        if overlap_end > overlap_start:
+            local_start = overlap_start - cursor
+            local_end = overlap_end - cursor
+            piece = fragment.display_text[local_start:local_end]
+            html_parts.append(_render_fragment_piece(fragment, piece))
+        cursor = next_cursor
+
+    source_html = "".join(html_parts)
+    if paragraph_css:
+        source_html = f'<span class="doc-source-block" style="display: block; {paragraph_css}">{source_html}</span>'
+    plain_html = build_segment_display_html(display_text, math_placeholders)
+    return source_html if source_html and source_html != plain_html else None
+
+
 def _collect_span_text(
     fragments: list[InlineFragment],
     span: SentenceSpan,
@@ -2300,7 +2435,10 @@ def _decode_symbol(node: ET.Element) -> str:
 
 
 def _build_run_css(run: ET.Element) -> str:
-    properties = run.find("w:rPr", NS)
+    return _build_run_properties_css(run.find("w:rPr", NS))
+
+
+def _build_run_properties_css(properties: ET.Element | None) -> str:
     if properties is None:
         return ""
 
@@ -2369,7 +2507,10 @@ def _build_run_css(run: ET.Element) -> str:
 
 
 def _build_paragraph_css(paragraph: ET.Element) -> str:
-    properties = paragraph.find("w:pPr", NS)
+    return _build_paragraph_properties_css(paragraph.find("w:pPr", NS))
+
+
+def _build_paragraph_properties_css(properties: ET.Element | None) -> str:
     if properties is None:
         return ""
 
@@ -2755,7 +2896,8 @@ def build_document_html_from_segments(segments: list) -> str:
             get_segment_value(segment, "sentence_id", "")
             or get_segment_value(segment, "segment_id", "")
         )
-        display_text = build_segment_display_html(
+        source_html = get_segment_value(segment, "source_html")
+        display_text = str(source_html) if source_html else build_segment_display_html(
             get_segment_value(segment, "display_text", ""),
             get_segment_value(segment, "math_placeholders", None),
         )

@@ -22,34 +22,31 @@ import ResourceImportDialog from '../components/ResourceImportDialog.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { useToast } from '../composables/useToast'
 import { getFileStatusMeta } from '../constants/status'
+import { useAuthStore } from '../stores/auth'
 import type { IssueMarker } from '../types/api'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
 
 interface ProjectRow {
   id: string
+  project_id: string | null
   name: string
   filename: string
   status: string
   progress: number
-  file_count: number
-  issue_count: number
-  open_issue_count: number
+  file_count?: number
   total_segments: number
   translated_segments: number
+  issue_count: number
+  open_issue_count: number
   source_language: string | null
   target_language: string | null
   creator: string | null
   deadline: string | null
   access_level: string | null
+  can_manage?: boolean
+  can_write?: boolean
   created_at: string
   updated_at: string
-}
-
-interface ProjectListResponse {
-  items: ProjectRow[]
-  total: number
-  skip: number
-  limit: number
 }
 
 type MainTab = 'tasks' | 'performance'
@@ -59,6 +56,7 @@ type ResourceImportTab = 'tm' | 'term'
 const confirm = useConfirm()
 const toast = useToast()
 const router = useRouter()
+const authStore = useAuthStore()
 const { t } = useI18n()
 
 const mainTab = ref<MainTab>('tasks')
@@ -92,7 +90,7 @@ const columns = computed<DataTableColumn[]>(() => ([
   { key: 'filename', label: t('taskList.columns.filename'), sortable: true },
   { key: 'status', label: t('taskList.columns.status'), width: '110px' },
   { key: 'progress', label: t('projectList.status.progress'), width: '180px' },
-  { key: 'file_count', label: t('projectDetail.base.fileCount'), width: '110px', align: 'right' },
+  { key: 'total_segments', label: '句段数', width: '110px', align: 'right' },
   { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '120px' },
   { key: 'created_at', label: t('taskList.columns.createdAt'), width: '160px', sortable: true },
   { key: 'updated_at', label: t('taskList.columns.updatedAt'), width: '160px', sortable: true },
@@ -130,14 +128,16 @@ async function loadProjects() {
   pageError.value = ''
   projectsLoading.value = true
   try {
-    const { data } = await http.get<ProjectListResponse>('/projects', {
+    const { data } = await http.get<ProjectRow[]>('/file-records', {
       params: {
         skip: 0,
         limit: 200,
-        search: searchQuery.value.trim(),
       },
     })
-    projects.value = data.items
+    const keyword = searchQuery.value.trim().toLowerCase()
+    projects.value = keyword
+      ? data.filter((item) => item.filename.toLowerCase().includes(keyword))
+      : data
   } catch (error) {
     pageError.value = getErrorMessage(error, t('taskList.errors.load'))
   } finally {
@@ -159,7 +159,7 @@ async function removeProject(projectId: string, name: string) {
 
   pageError.value = ''
   try {
-    await http.delete(`/projects/${projectId}`)
+    await http.delete(`/file-records/${projectId}`)
     selectedIds.value.delete(projectId)
     toast.success(t('taskList.messages.deleted', { name }))
     await loadProjects()
@@ -186,7 +186,7 @@ const filteredProjects = computed(() => {
     rows.sort((left, right) => {
       const leftVal = left[key]
       const rightVal = right[key]
-      if (key === 'progress' || key === 'file_count') {
+      if (key === 'progress' || key === 'file_count' || key === 'total_segments') {
         return ((Number(leftVal) || 0) - (Number(rightVal) || 0)) * direction
       }
       return String(leftVal ?? '').localeCompare(String(rightVal ?? '')) * direction
@@ -231,14 +231,21 @@ function goToAssets() {
 function openProjectDetail(row: ProjectRow) {
   closeActionMenu()
   void router.push({
-    name: 'project-detail',
+    name: 'workbench',
     params: { id: row.id },
-    query: { from: 'tasks' },
+    query: {
+      from: 'project',
+      ...(row.project_id ? { pid: row.project_id, parent: 'tasks' } : {}),
+    },
   })
 }
 
 function openIssueDialog(row: ProjectRow) {
   closeActionMenu()
+  if (!row.project_id) {
+    toast.warn(t('issueMarker.errors.missingProject'))
+    return
+  }
   issueTarget.value = row
   showIssueDialog.value = true
 }
@@ -342,6 +349,7 @@ onBeforeUnmount(() => {
           </div>
           <div class="table-toolbar__right">
             <button
+              v-if="authStore.isAdmin"
               class="button"
               type="button"
               @click="goToAssets"
@@ -412,8 +420,8 @@ onBeforeUnmount(() => {
               </div>
             </template>
 
-            <template #file_count="{ row }">
-              <span>{{ row.file_count }}</span>
+            <template #total_segments="{ row }">
+              <span>{{ row.total_segments }}</span>
             </template>
 
             <template #open_issue_count="{ row }">
@@ -476,6 +484,7 @@ onBeforeUnmount(() => {
                       {{ t('taskList.actions.details') }}
                     </button>
                     <button
+                      v-if="authStore.isAdmin"
                       type="button"
                       @click="openImportDialog(row); closeActionMenu()"
                     >
@@ -485,6 +494,7 @@ onBeforeUnmount(() => {
                       {{ t('issueMarker.actions.open') }}
                     </button>
                     <button
+                      v-if="row.can_manage"
                       class="is-danger"
                       type="button"
                       @click="removeProject(row.id, row.filename); closeActionMenu()"
@@ -525,7 +535,8 @@ onBeforeUnmount(() => {
     />
     <IssueMarkerDialog
       :open="showIssueDialog"
-      :project-id="issueTarget?.id ?? null"
+      :project-id="issueTarget?.project_id ?? null"
+      :file-record-id="issueTarget?.id ?? null"
       :context-label="issueTarget?.filename ?? ''"
       @close="showIssueDialog = false"
       @saved="handleIssueSaved"

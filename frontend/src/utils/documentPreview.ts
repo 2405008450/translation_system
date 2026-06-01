@@ -10,10 +10,10 @@ function escapeHtml(value: string) {
     .replace(/'/g, '&#39;')
 }
 
-function renderSentence(sentenceId: string, text: string) {
+function renderSentence(sentenceId: string, content: string, isHtml = false) {
   return (
     `<span class="doc-sentence" id="${escapeHtml(sentenceId)}" data-sentence-id="${escapeHtml(sentenceId)}">` +
-    `${escapeHtml(text)}` +
+    `${isHtml ? content : escapeHtml(content)}` +
     '</span>'
   )
 }
@@ -69,10 +69,11 @@ export function buildDocumentPreviewHtml(
   for (const segment of segments) {
     const blockType = segment.block_type || 'paragraph'
     const sentenceId = segment.sentence_id || ''
+    const sourceHtml = mode === 'source' ? (segment.source_html || '') : ''
     const text = mode === 'target'
       ? (targetTextMap.get(sentenceId) ?? resolveTargetPreviewText(segment))
       : (segment.display_text || segment.source_text || '')
-    const sentenceHtml = renderSentence(sentenceId, text)
+    const sentenceHtml = renderSentence(sentenceId, sourceHtml || text, Boolean(sourceHtml))
 
     if (blockType === 'table_cell') {
       flushParagraph()

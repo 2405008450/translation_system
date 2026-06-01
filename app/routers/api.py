@@ -22,7 +22,17 @@ from sqlalchemy import case, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.auth import get_current_user, get_user_display_name, require_admin
+from app.auth import (
+    USER_ROLE,
+    can_access_all_projects,
+    get_current_user,
+    get_user_by_id,
+    get_user_display_name,
+    is_admin_role,
+    is_external_translator,
+    require_admin,
+    serialize_user,
+)
 from app.config import get_settings
 from app.database import SessionLocal, get_db
 from app.models import (
@@ -81,6 +91,7 @@ from app.services.issue_marker_service import (
 from app.services.cache import get_json as cache_get_json
 from app.services.cache import set_json as cache_set_json
 from app.services.file_record_service import (
+    backfill_file_record_source_html,
     batch_update_segments,
     calculate_file_record_progress,
     create_file_record_with_segments,
@@ -156,10 +167,12 @@ from app.services.resource_export_queue import (
 )
 from app.services.slate_parser import parse_docx_for_slate
 from app.services.task_file_service import (
+    BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS,
     DOCUMENT_PARSE_MODE_FULL,
     build_task_preview_html,
     build_task_workspace,
     can_export_task_file,
+    export_bilingual_task_docx_with_layout,
     export_translated_task_file,
     get_upload_capabilities,
     get_supported_task_extensions,
@@ -465,6 +478,8 @@ def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[st
         _apply_collection_language_pair(file_record, primary_collection)
     file_record.source_language = resolved_source_language
     file_record.target_language = resolved_target_language
+    if payload.get("creator_id"):
+        file_record.creator_id = UUID(payload["creator_id"])
     if term_base is not None:
         _store_file_record_term_base_ids(file_record, [term_base_id])
 
@@ -861,6 +876,10 @@ class FileRecordDuplicateRequest(BaseModel):
     filename: str | None = None
 
 
+class FileRecordAssignmentRequest(BaseModel):
+    assignee_id: UUID | None = None
+
+
 class SaveToTMRequest(BaseModel):
     collection_id: UUID | None = None
     collection_mode: Literal["existing", "new"] = "existing"
@@ -954,12 +973,67 @@ class ProjectDocumentStatisticsPayload(BaseModel):
     file_ids: list[UUID] = Field(default_factory=list)
 
 
+def _can_manage_workflow(current_user: User | None) -> bool:
+    return is_admin_role(getattr(current_user, "role", None))
+
+
+def _can_read_file_record(file_record: FileRecord, current_user: User | None) -> bool:
+    if current_user is None:
+        return False
+    if can_access_all_projects(current_user):
+        return True
+    return file_record.assignee_id == current_user.id
+
+
+def _can_write_file_record(file_record: FileRecord, current_user: User | None) -> bool:
+    return _can_read_file_record(file_record, current_user)
+
+
+def _require_file_record_read_access(file_record: FileRecord, current_user: User) -> None:
+    if not _can_read_file_record(file_record, current_user):
+        raise HTTPException(status_code=404, detail="任务不存在或未分配给当前用户。")
+
+
+def _require_file_record_work_access(file_record: FileRecord, current_user: User) -> None:
+    if not _can_write_file_record(file_record, current_user):
+        raise HTTPException(status_code=403, detail="当前账号没有处理该任务的权限。")
+
+
+def _apply_project_visibility_filter(query, db: Session, current_user: User):
+    if can_access_all_projects(current_user):
+        return query
+    assigned_project_ids = (
+        db.query(FileRecord.project_id)
+        .filter(
+            FileRecord.assignee_id == current_user.id,
+            FileRecord.project_id.is_not(None),
+        )
+        .distinct()
+    )
+    return query.filter(Project.id.in_(assigned_project_ids))
+
+
+def _visible_project_files(files: list[FileRecord], current_user: User) -> list[FileRecord]:
+    if can_access_all_projects(current_user):
+        return files
+    return [file_record for file_record in files if file_record.assignee_id == current_user.id]
+
+
+def _serialize_assignee(user: User | None) -> dict[str, Any] | None:
+    if user is None:
+        return None
+    return serialize_user(user)
+
+
 @router.get("/analytics/dashboard")
 def get_analytics_dashboard(
     background_tasks: BackgroundTasks,
     granularity: Literal["day", "month"] = "day",
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    if not can_access_all_projects(current_user):
+        raise HTTPException(status_code=403, detail="当前账号无权查看全局数据看板。")
     background_tasks.add_task(run_analytics_backfill_once)
     return get_dashboard_payload(db, granularity=granularity)
 
@@ -1887,6 +1961,7 @@ async def create_file_record(
     document_parse_mode: str = Form(default=DOCUMENT_PARSE_MODE_FULL),
     document_parse_options: str | None = Form(default=None),
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
 ):
     """上传文档并创建持久化记录"""
     _validate_task_upload(file)
@@ -1934,6 +2009,7 @@ async def create_file_record(
         "target_language": resolved_target_language,
         "document_parse_mode": document_parse_mode,
         "document_parse_options": normalized_parse_options,
+        "creator_id": str(current_user.id),
     }
     return await _queue_import_task(background_tasks, payload)
 
@@ -1942,7 +2018,7 @@ async def create_file_record(
 def create_project(
     payload: ProjectCreatePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     """仅填写基础信息创建项目，文档导入在项目详情页完成"""
     from datetime import datetime as _dt
@@ -2000,6 +2076,7 @@ def _build_project_summary_payload(
     file_count: int,
     creator_name: str | None = None,
     issue_stats: dict[str, int] | None = None,
+    current_user: User | None = None,
 ) -> dict:
     progress = calculate_file_record_progress(total_segments, translated_segments)
     effective_status = (
@@ -2026,6 +2103,8 @@ def _build_project_summary_payload(
         "file_count": file_count,
         "issue_count": issue_stats.get("issue_count", 0),
         "open_issue_count": issue_stats.get("open_issue_count", 0),
+        "can_manage": _can_manage_workflow(current_user),
+        "can_write": bool(current_user) and (can_access_all_projects(current_user) or file_count > 0),
         "created_at": project.created_at.isoformat(),
         "updated_at": project.updated_at.isoformat(),
     }
@@ -2036,6 +2115,7 @@ def _build_project_file_payload(
     total_segments: int,
     translated_segments: int,
     issue_stats: dict[str, int] | None = None,
+    current_user: User | None = None,
 ) -> dict:
     source_bytes = load_file_record_source(file_record)
     operation_state = serialize_file_operation_state(file_record)
@@ -2061,6 +2141,9 @@ def _build_project_file_payload(
         "source_language": file_record.source_language,
         "target_language": file_record.target_language,
         "creator": get_user_display_name(file_record.creator) if file_record.creator else None,
+        "assignee_id": str(file_record.assignee_id) if file_record.assignee_id else None,
+        "assignee": _serialize_assignee(file_record.assignee),
+        "assigned_at": file_record.assigned_at.isoformat() if file_record.assigned_at else None,
         "deadline": file_record.deadline.isoformat() if file_record.deadline else None,
         "access_level": file_record.access_level,
         "created_at": file_record.created_at.isoformat(),
@@ -2071,6 +2154,8 @@ def _build_project_file_payload(
         "term_base_id": file_record.term_base_id,
         "issue_count": issue_stats.get("issue_count", 0),
         "open_issue_count": issue_stats.get("open_issue_count", 0),
+        "can_manage": _can_manage_workflow(current_user),
+        "can_write": _can_write_file_record(file_record, current_user),
         **operation_state,
     }
 
@@ -2100,13 +2185,17 @@ def _get_file_segment_stats(db: Session, file_record_ids: list[UUID]) -> dict[UU
     }
 
 
-def _get_project_stats(db: Session, project_ids: list[UUID]) -> dict[UUID, dict]:
+def _get_project_stats(
+    db: Session,
+    project_ids: list[UUID],
+    current_user: User | None = None,
+) -> dict[UUID, dict]:
     if not project_ids:
         return {}
 
     from sqlalchemy import case as sql_case
 
-    stats_rows = (
+    query = (
         db.query(
             FileRecord.project_id,
             func.count(func.distinct(FileRecord.id)).label("file_count"),
@@ -2115,9 +2204,10 @@ def _get_project_stats(db: Session, project_ids: list[UUID]) -> dict[UUID, dict]
         )
         .outerjoin(Segment, Segment.file_record_id == FileRecord.id)
         .filter(FileRecord.project_id.in_(project_ids))
-        .group_by(FileRecord.project_id)
-        .all()
     )
+    if current_user is not None and is_external_translator(current_user):
+        query = query.filter(FileRecord.assignee_id == current_user.id)
+    stats_rows = query.group_by(FileRecord.project_id).all()
     return {
         row.project_id: {
             "file_count": row.file_count,
@@ -2128,22 +2218,34 @@ def _get_project_stats(db: Session, project_ids: list[UUID]) -> dict[UUID, dict]
     }
 
 
-def _get_project_issue_stats(db: Session, project_ids: list[UUID]) -> dict[UUID, dict[str, int]]:
+def _get_project_issue_stats(
+    db: Session,
+    project_ids: list[UUID],
+    current_user: User | None = None,
+) -> dict[UUID, dict[str, int]]:
     if not project_ids:
         return {}
 
     from sqlalchemy import case as sql_case
 
-    stats_rows = (
+    query = (
         db.query(
             IssueMarker.project_id,
             func.count(IssueMarker.id).label("issue_count"),
             func.count(sql_case((IssueMarker.status == "open", 1))).label("open_issue_count"),
         )
         .filter(IssueMarker.project_id.in_(project_ids))
-        .group_by(IssueMarker.project_id)
-        .all()
     )
+    if current_user is not None and is_external_translator(current_user):
+        assigned_file_ids = (
+            db.query(FileRecord.id)
+            .filter(
+                FileRecord.project_id.in_(project_ids),
+                FileRecord.assignee_id == current_user.id,
+            )
+        )
+        query = query.filter(IssueMarker.file_record_id.in_(assigned_file_ids))
+    stats_rows = query.group_by(IssueMarker.project_id).all()
     return {
         row.project_id: {
             "issue_count": int(row.issue_count or 0),
@@ -2186,6 +2288,7 @@ def _build_project_detail_payload(
     issue_markers: list[IssueMarker] | None = None,
     project_issue_stats: dict[str, int] | None = None,
     file_issue_stats: dict[UUID, dict[str, int]] | None = None,
+    current_user: User | None = None,
 ) -> dict:
     total_segments = sum(file_stats.get(file.id, {"total": 0})["total"] for file in files)
     translated_segments = sum(file_stats.get(file.id, {"filled": 0})["filled"] for file in files)
@@ -2197,6 +2300,7 @@ def _build_project_detail_payload(
         file_count=len(files),
         creator_name=get_user_display_name(project.creator),
         issue_stats=project_issue_stats,
+        current_user=current_user,
     )
     payload["files"] = [
         _build_project_file_payload(
@@ -2204,6 +2308,7 @@ def _build_project_detail_payload(
             total_segments=file_stats.get(file_record.id, {"total": 0})["total"],
             translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
             issue_stats=file_issue_stats.get(file_record.id),
+            current_user=current_user,
         )
         for file_record in files
     ]
@@ -2223,6 +2328,7 @@ def _build_project_detail_payload(
 def get_project_detail(
     project_id: UUID,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     from sqlalchemy.orm import joinedload
 
@@ -2237,19 +2343,38 @@ def get_project_detail(
 
     files = (
         db.query(FileRecord)
+        .options(joinedload(FileRecord.assignee))
         .filter(FileRecord.project_id == project_id)
         .order_by(FileRecord.created_at.asc(), FileRecord.id.asc())
         .all()
     )
+    files = _visible_project_files(files, current_user)
+    if is_external_translator(current_user) and not files:
+        raise HTTPException(status_code=404, detail="项目不存在或没有分配给当前用户的任务。")
     stale_lock_cleared = False
     for file_record in files:
         stale_lock_cleared = clear_stale_file_operation_lock(db, file_record) or stale_lock_cleared
     if stale_lock_cleared:
         db.commit()
     file_stats = _get_file_segment_stats(db, [file_record.id for file_record in files])
-    issue_markers = list_issue_markers_for_project(db, project_id)
-    project_issue_stats = _get_project_issue_stats(db, [project_id]).get(project_id)
+    if is_external_translator(current_user):
+        issue_markers = []
+        for file_record in files:
+            issue_markers.extend(list_issue_markers_for_project(
+                db,
+                project_id,
+                file_record_id=file_record.id,
+            ))
+    else:
+        issue_markers = list_issue_markers_for_project(db, project_id)
     file_issue_stats = _get_file_issue_stats(db, [file_record.id for file_record in files])
+    if is_external_translator(current_user):
+        project_issue_stats = {
+            "issue_count": sum(item.get("issue_count", 0) for item in file_issue_stats.values()),
+            "open_issue_count": sum(item.get("open_issue_count", 0) for item in file_issue_stats.values()),
+        }
+    else:
+        project_issue_stats = _get_project_issue_stats(db, [project_id]).get(project_id)
     return _build_project_detail_payload(
         project,
         files,
@@ -2257,6 +2382,7 @@ def get_project_detail(
         issue_markers=issue_markers,
         project_issue_stats=project_issue_stats,
         file_issue_stats=file_issue_stats,
+        current_user=current_user,
     )
 
 
@@ -2265,6 +2391,7 @@ def compute_project_document_statistics(
     project_id: UUID,
     payload: ProjectDocumentStatisticsPayload,
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
@@ -2318,6 +2445,7 @@ def compute_project_document_statistics(
                 total_segments=file_stats.get(file_record.id, {"total": 0})["total"],
                 translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
                 issue_stats=file_issue_stats.get(file_record.id),
+                current_user=current_user,
             )
             for file_record in files
         ]
@@ -2328,6 +2456,7 @@ def compute_project_document_statistics(
 def delete_project(
     project_id: UUID,
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
@@ -2353,7 +2482,7 @@ def update_project(
     project_id: UUID,
     payload: ProjectUpdatePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
@@ -2399,10 +2528,35 @@ def list_project_issue_markers(
     status: Literal["open", "resolved"] | None = None,
     file_record_id: UUID | None = None,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在。")
+    if is_external_translator(current_user):
+        assigned_file_ids = [
+            row.id
+            for row in (
+                db.query(FileRecord.id)
+                .filter(FileRecord.project_id == project_id, FileRecord.assignee_id == current_user.id)
+                .all()
+            )
+        ]
+        if not assigned_file_ids:
+            raise HTTPException(status_code=404, detail="项目不存在或没有分配给当前用户的任务。")
+        if file_record_id is not None and file_record_id not in assigned_file_ids:
+            raise HTTPException(status_code=404, detail="任务不存在或未分配给当前用户。")
+        if file_record_id is None:
+            markers = []
+            for assigned_file_id in assigned_file_ids:
+                markers.extend(list_issue_markers_for_project(
+                    db,
+                    project_id,
+                    status=status,
+                    file_record_id=assigned_file_id,
+                ))
+            return [serialize_issue_marker(marker) for marker in markers]
+
     markers = list_issue_markers_for_project(
         db,
         project_id,
@@ -2419,6 +2573,20 @@ def create_project_issue_marker(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    if is_external_translator(current_user):
+        if payload.file_record_id is None:
+            raise HTTPException(status_code=403, detail="外部译者只能在已分配任务上提交问题标记。")
+        assigned = (
+            db.query(FileRecord.id)
+            .filter(
+                FileRecord.project_id == project_id,
+                FileRecord.id == payload.file_record_id,
+                FileRecord.assignee_id == current_user.id,
+            )
+            .first()
+        )
+        if assigned is None:
+            raise HTTPException(status_code=404, detail="任务不存在或未分配给当前用户。")
     marker = create_issue_marker(
         db,
         project_id=project_id,
@@ -2473,6 +2641,7 @@ async def detect_project_source_language(
     project_id: UUID,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
@@ -2500,6 +2669,7 @@ async def upload_project_source_document(
     document_parse_mode: str = Form(default=DOCUMENT_PARSE_MODE_FULL),
     document_parse_options: str | None = Form(default=None),
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
@@ -2572,11 +2742,13 @@ def list_projects(
     limit: int = 50,
     search: str = "",
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """获取项目列表（分页、搜索），含翻译进度统计"""
     from sqlalchemy.orm import joinedload
 
     base_query = db.query(Project).options(joinedload(Project.creator))
+    base_query = _apply_project_visibility_filter(base_query, db, current_user)
     if search.strip():
         base_query = base_query.filter(Project.name.ilike(f"%{search.strip()}%"))
 
@@ -2592,8 +2764,8 @@ def list_projects(
     )
 
     project_ids = [project.id for project in projects]
-    project_stats = _get_project_stats(db, project_ids)
-    project_issue_stats = _get_project_issue_stats(db, project_ids)
+    project_stats = _get_project_stats(db, project_ids, current_user=current_user)
+    project_issue_stats = _get_project_issue_stats(db, project_ids, current_user=current_user)
 
     items = []
     for project in projects:
@@ -2613,6 +2785,7 @@ def list_projects(
                 file_count=st["file_count"],
                 creator_name=creator_name,
                 issue_stats=project_issue_stats.get(project.id),
+                current_user=current_user,
             )
         )
 
@@ -2636,19 +2809,49 @@ def get_file_records(
     skip: int = 0,
     limit: int = 50,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """获取文档列表"""
-    file_records = list_file_records(db, skip=skip, limit=limit)
+    from sqlalchemy.orm import joinedload
+
+    safe_skip = max(skip, 0)
+    safe_limit = min(max(limit, 1), 200)
+    query = db.query(FileRecord).options(joinedload(FileRecord.assignee))
+    if not can_access_all_projects(current_user):
+        query = query.filter(FileRecord.assignee_id == current_user.id)
+    file_records = (
+        query
+        .order_by(FileRecord.created_at.desc())
+        .offset(safe_skip)
+        .limit(safe_limit)
+        .all()
+    )
+    file_stats = _get_file_segment_stats(db, [file_record.id for file_record in file_records])
+    file_issue_stats = _get_file_issue_stats(db, [file_record.id for file_record in file_records])
     return [
         {
             "id": file_record.id,
+            "project_id": str(file_record.project_id) if file_record.project_id else None,
             "filename": file_record.filename,
             "status": file_record.status,
+            "progress": calculate_file_record_progress(
+                file_stats.get(file_record.id, {"total": 0})["total"],
+                file_stats.get(file_record.id, {"filled": 0})["filled"],
+            ),
+            "total_segments": file_stats.get(file_record.id, {"total": 0})["total"],
+            "translated_segments": file_stats.get(file_record.id, {"filled": 0})["filled"],
+            "issue_count": file_issue_stats.get(file_record.id, {}).get("issue_count", 0),
+            "open_issue_count": file_issue_stats.get(file_record.id, {}).get("open_issue_count", 0),
             "document_parse_mode": getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
             "document_parse_options": _get_file_record_document_parse_options(file_record),
             "document_statistics": get_file_record_document_statistics(file_record),
             "source_language": file_record.source_language,
             "target_language": file_record.target_language,
+            "assignee_id": str(file_record.assignee_id) if file_record.assignee_id else None,
+            "assignee": _serialize_assignee(file_record.assignee),
+            "assigned_at": file_record.assigned_at.isoformat() if file_record.assigned_at else None,
+            "can_manage": _can_manage_workflow(current_user),
+            "can_write": _can_write_file_record(file_record, current_user),
             "created_at": file_record.created_at.isoformat(),
             "updated_at": file_record.updated_at.isoformat(),
         }
@@ -2669,6 +2872,7 @@ def _serialize_workbench_segment(seg: Segment, display_index: int | None = None)
         "sentence_id": seg.sentence_id,
         "source_text": seg.source_text,
         "display_text": seg.display_text,
+        "source_html": seg.source_html,
         "target_text": seg.target_text,
         "target_html": seg.target_html,
         "status": seg.status,
@@ -2904,6 +3108,7 @@ def get_file_record(
     skip: int = 0,
     limit: int = 100,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """获取文档详情及片段，支持分页"""
     safe_skip = max(skip, 0)
@@ -2915,12 +3120,24 @@ def get_file_record(
         limit=safe_limit,
     )
     if not result:
-        raise HTTPException(status_code=404, detail="文档不存在。")
+        raise HTTPException(status_code=404, detail="\u4efb\u52a1\u4e0d\u5b58\u5728")
 
     file_record = result["file_record"]
+    _require_file_record_read_access(file_record, current_user)
     if clear_stale_file_operation_lock(db, file_record):
         db.commit()
         db.refresh(file_record)
+    if backfill_file_record_source_html(db, file_record):
+        db.commit()
+        result = get_file_record_with_segments(
+            db,
+            file_record_id,
+            skip=safe_skip,
+            limit=safe_limit,
+        )
+        if not result:
+            raise HTTPException(status_code=404, detail="\u4efb\u52a1\u4e0d\u5b58\u5728")
+        file_record = result["file_record"]
     segments = result["segments"]
     source_bytes = load_file_record_source(file_record)
     source_filename = get_file_record_source_filename(file_record)
@@ -2971,6 +3188,9 @@ def get_file_record(
         **serialize_file_operation_state(file_record),
         "source_language": file_record.source_language,
         "target_language": file_record.target_language,
+        "assignee_id": str(file_record.assignee_id) if file_record.assignee_id else None,
+        "assignee": _serialize_assignee(file_record.assignee),
+        "assigned_at": file_record.assigned_at.isoformat() if file_record.assigned_at else None,
         "collection_id": file_record.collection_id,
         "collection_name": collection_name,
         "term_base_id": file_record.term_base_id,
@@ -2987,6 +3207,8 @@ def get_file_record(
         "source_extension": get_task_file_extension(source_filename),
         "has_source_document": source_bytes is not None,
         "can_export": can_export_task_file(source_filename, has_source_file=source_bytes is not None),
+        "can_manage": _can_manage_workflow(current_user),
+        "can_write": _can_write_file_record(file_record, current_user),
         "issue_count": issue_stats["issue_count"],
         "open_issue_count": issue_stats["open_issue_count"],
         "status_stats": _get_segment_status_stats(db, file_record_id),
@@ -3004,6 +3226,10 @@ def acquire_file_record_operation_lock(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    existing_file_record = get_file_record_model(db, file_record_id)
+    if not existing_file_record:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    _require_file_record_work_access(existing_file_record, current_user)
     file_record, token = acquire_file_operation_lock(
         db,
         file_record_id,
@@ -3021,13 +3247,14 @@ def acquire_file_record_operation_lock(
 def heartbeat_file_record_operation_lock(
     file_record_id: UUID,
     db: Session = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文件不存在。")
 
+    _require_file_record_work_access(file_record, current_user)
     heartbeat_file_operation_lock(
         db,
         file_record,
@@ -3043,13 +3270,14 @@ def heartbeat_file_record_operation_lock(
 def release_file_record_operation_lock(
     file_record_id: UUID,
     db: Session = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文件不存在。")
 
+    _require_file_record_work_access(file_record, current_user)
     release_file_operation_lock(
         db,
         file_record,
@@ -3071,12 +3299,14 @@ def get_file_record_segments(
     target_query: str | None = None,
     search_fuzzy: bool = False,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """分页获取工作台句段；搜索/筛选在服务端执行，避免前端加载全文。"""
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    _require_file_record_read_access(file_record, current_user)
     safe_skip = max(skip, 0)
     safe_limit = _normalize_segment_page_limit(limit)
     base_query = db.query(Segment).filter(Segment.file_record_id == file_record_id)
@@ -3123,11 +3353,13 @@ def get_file_record_segment_changes(
     since: str,
     limit: int = 500,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文件不存在。")
 
+    _require_file_record_read_access(file_record, current_user)
     try:
         since_dt = datetime.fromisoformat(since.replace("Z", "+00:00")).replace(tzinfo=None)
     except ValueError as exc:
@@ -3159,7 +3391,7 @@ def duplicate_file_record_task(
     file_record_id: UUID,
     payload: FileRecordDuplicateRequest | None = None,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     """复制一个文件任务，保留源文件、句段和当前译文状态。"""
     duplicate = duplicate_file_record(
@@ -3181,6 +3413,44 @@ def duplicate_file_record_task(
         duplicate,
         total_segments=file_stats["total"],
         translated_segments=file_stats["filled"],
+        current_user=current_user,
+    )
+
+
+@router.patch("/file-records/{file_record_id}/assignment")
+def assign_file_record_task(
+    file_record_id: UUID,
+    payload: FileRecordAssignmentRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+
+    assignee: User | None = None
+    if payload.assignee_id is not None:
+        assignee = get_user_by_id(db, payload.assignee_id)
+        if assignee is None or not assignee.is_active or assignee.role != USER_ROLE:
+            raise HTTPException(status_code=400, detail="只能指派给启用中的普通译者账号。")
+
+    file_record.assignee_id = assignee.id if assignee else None
+    file_record.assigned_by_id = current_user.id if assignee else None
+    file_record.assigned_at = datetime.utcnow() if assignee else None
+    db.commit()
+    db.refresh(file_record)
+
+    file_stats = _get_file_segment_stats(db, [file_record.id]).get(
+        file_record.id,
+        {"total": 0, "filled": 0},
+    )
+    issue_stats = _get_file_issue_stats(db, [file_record.id]).get(file_record.id)
+    return _build_project_file_payload(
+        file_record,
+        total_segments=file_stats["total"],
+        translated_segments=file_stats["filled"],
+        issue_stats=issue_stats,
+        current_user=current_user,
     )
 
 
@@ -3192,11 +3462,13 @@ def get_file_record_preview(
     limit: int = 100,
     mode: Literal["source", "target"] = "source",
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    _require_file_record_read_access(file_record, current_user)
     source_filename = get_file_record_source_filename(file_record)
     safe_skip = max(skip, 0)
     safe_limit = _normalize_segment_page_limit(limit)
@@ -3238,12 +3510,14 @@ def get_segment_tm_candidates(
     threshold: float = 0.6,
     max_candidates: int = 5,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """获取指定句段的 TM 匹配候选列表，兼容句段 UUID 和 sentence_id。"""
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    _require_file_record_read_access(file_record, current_user)
     segment = None
     try:
         segment_uuid = UUID(segment_ref)
@@ -3316,6 +3590,7 @@ def rematch_file_record(
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    _require_file_record_work_access(file_record, current_user)
     ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
     selected_collection_ids = _require_selected_collection_ids(
         _validate_collection_ids(db, payload.collection_ids)
@@ -3431,6 +3706,7 @@ def patch_file_record_bindings(
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    _require_file_record_work_access(file_record, current_user)
     ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
     source_language, target_language = _resolve_file_record_language_pair(file_record)
 
@@ -3478,12 +3754,14 @@ def patch_file_record_bindings(
 def export_file_record_docx(
     file_record_id: UUID,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     _begin_repeatable_read_snapshot(db)
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="File record not found.")
 
+    _require_file_record_read_access(file_record, current_user)
     raw_bytes = load_file_record_source(file_record)
     source_filename = get_file_record_source_filename(file_record)
     if not can_export_task_file(source_filename, has_source_file=raw_bytes is not None):
@@ -3515,6 +3793,7 @@ def export_file_record_docx(
 def get_file_record_export_options(
     file_record_id: UUID,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """获取文件支持的导出格式选项"""
     from app.services.adapters import get_export_options_for_file
@@ -3523,6 +3802,7 @@ def get_file_record_export_options(
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    _require_file_record_read_access(file_record, current_user)
     options = get_export_options_for_file(file_record.filename)
 
     return {
@@ -3538,6 +3818,7 @@ def export_file_record_with_type(
     file_record_id: UUID,
     export_type: str,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """多格式导出接口 - 支持原格式、双语、TMX、XLIFF 等导出类型
 
@@ -3552,6 +3833,7 @@ def export_file_record_with_type(
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    _require_file_record_read_access(file_record, current_user)
     raw_bytes = load_file_record_source(file_record)
     segments = list_segments_for_file_record(db, file_record_id)
 
@@ -3565,6 +3847,30 @@ def export_file_record_with_type(
                 raw_bytes=raw_bytes,
                 filename=source_filename,
                 segments=segments,
+                document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
+                document_parse_options=_get_file_record_document_parse_options(file_record),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"导出失败: {str(exc)}") from exc
+
+        return _build_binary_download_response(
+            filename=exported_file.filename,
+            content=exported_file.content,
+            media_type=exported_file.media_type,
+        )
+
+    if export_type in BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS:
+        source_filename = get_file_record_source_filename(file_record)
+        if get_task_file_extension(source_filename) != ".docx":
+            raise HTTPException(status_code=400, detail="Only DOCX source files support layout-preserving bilingual Word export.")
+        try:
+            exported_file = export_bilingual_task_docx_with_layout(
+                raw_bytes=raw_bytes,
+                filename=source_filename,
+                segments=segments,
+                order=BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS[export_type],
                 document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
                 document_parse_options=_get_file_record_document_parse_options(file_record),
             )
@@ -3623,11 +3929,13 @@ def export_file_record_with_type(
 def _require_file_record_write_access(
     db: Session,
     file_record_id: UUID,
+    current_user: User,
     operation_token: str | None = None,
 ) -> FileRecord:
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文件不存在。")
+    _require_file_record_work_access(file_record, current_user)
     ensure_file_record_write_allowed(
         db,
         file_record,
@@ -3648,7 +3956,7 @@ def update_segment(
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """更新单个片段的译文"""
-    file_record = _require_file_record_write_access(db, file_record_id, operation_token)
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
     if update.base_version is not None:
         current_segment = (
             db.query(Segment)
@@ -3723,7 +4031,7 @@ def update_segment_source(
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """更新单个片段的原文"""
-    _require_file_record_write_access(db, file_record_id, operation_token)
+    _require_file_record_write_access(db, file_record_id, current_user, operation_token)
     segment = update_segment_source_text(
         db=db,
         file_record_id=file_record_id,
@@ -3738,6 +4046,7 @@ def update_segment_source(
         "sentence_id": segment.sentence_id,
         "source_text": segment.source_text,
         "display_text": segment.display_text,
+        "source_html": segment.source_html,
     }
 
 
@@ -3751,7 +4060,7 @@ def split_segment(
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """拆分句段：在指定偏移位置将一个句段拆为两个。"""
-    _require_file_record_write_access(db, file_record_id, operation_token)
+    _require_file_record_write_access(db, file_record_id, current_user, operation_token)
     segment = (
         db.query(Segment)
         .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
@@ -3788,6 +4097,7 @@ def split_segment(
     # 更新原句段
     segment.source_text = first_source
     segment.display_text = first_source
+    segment.source_html = None
     segment.target_text = first_target
     segment.target_html = None
     segment.status = "none" if not first_target.strip() else "confirmed"
@@ -3804,6 +4114,7 @@ def split_segment(
         sentence_id=new_sentence_id,
         source_text=second_source,
         display_text=second_source,
+        source_html=None,
         target_text=second_target,
         target_html=None,
         status="none" if not second_target.strip() else "confirmed",
@@ -3837,7 +4148,7 @@ def merge_segment(
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """合并句段：将当前句段与指定的下一个句段合并为一个。"""
-    _require_file_record_write_access(db, file_record_id, operation_token)
+    _require_file_record_write_access(db, file_record_id, current_user, operation_token)
     first_seg = (
         db.query(Segment)
         .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
@@ -3875,6 +4186,7 @@ def merge_segment(
     # 更新第一个句段
     first_seg.source_text = merged_source.strip()
     first_seg.display_text = merged_source.strip()
+    first_seg.source_html = None
     first_seg.target_text = merged_target.strip()
     first_seg.target_html = None
     first_seg.status = "none" if not merged_target.strip() else "confirmed"
@@ -3917,7 +4229,7 @@ def batch_update(
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """批量更新片段译文"""
-    file_record = _require_file_record_write_access(db, file_record_id, operation_token)
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
     result = batch_update_segments(
         db=db,
         file_record_id=file_record_id,
@@ -3953,7 +4265,7 @@ def batch_update_segment_confirmation(
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """批量确认或取消确认当前文件的全部句段。"""
-    file_record = _require_file_record_write_access(db, file_record_id, operation_token)
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
 
     if payload.action == "confirm":
         segments = (
@@ -4014,7 +4326,7 @@ def replace_file_record_segment_targets(
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
-    _require_file_record_write_access(db, file_record_id, operation_token)
+    _require_file_record_write_access(db, file_record_id, current_user, operation_token)
     target_query = (payload.target_query or "").strip()
     if not target_query:
         raise HTTPException(status_code=400, detail="请先输入译文关键词用于替换。")
@@ -4065,11 +4377,13 @@ def get_save_to_tm_stats(
     file_record_id: UUID,
     scope: Literal["confirmed", "translated", "all"] = "translated",
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    _require_file_record_read_access(file_record, current_user)
     total_segments = (
         db.query(func.count(Segment.id))
         .filter(Segment.file_record_id == file_record_id)
@@ -4206,11 +4520,13 @@ def get_file_record_revisions(
     target_query: str | None = None,
     search_fuzzy: bool = False,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="File record not found.")
 
+    _require_file_record_read_access(file_record, current_user)
     requested_sentence_ids = [item for item in ((sentence_ids or []) + (sentence_ids_bracket or [])) if item]
     if sentence_id:
         requested_sentence_ids.append(sentence_id)
@@ -4255,7 +4571,7 @@ def resolve_revision(
     current_user: User = Depends(get_current_user),
 ):
     existing_revision = get_revision_or_404(db, revision_id)
-    _require_file_record_write_access(db, existing_revision.file_record_id)
+    _require_file_record_write_access(db, existing_revision.file_record_id, current_user)
     if payload.status == "accepted":
         revision = accept_revision(
             db,
@@ -4277,7 +4593,7 @@ def resolve_all_revisions_as_accepted(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _require_file_record_write_access(db, file_record_id)
+    _require_file_record_write_access(db, file_record_id, current_user)
 
     updated_count = batch_accept_revisions(
         db,
@@ -4293,7 +4609,7 @@ def resolve_all_revisions_as_rejected(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _require_file_record_write_access(db, file_record_id)
+    _require_file_record_write_access(db, file_record_id, current_user)
 
     updated_count = batch_reject_revisions(
         db,
@@ -4316,12 +4632,14 @@ def get_file_record_comments(
     target_query: str | None = None,
     search_fuzzy: bool = False,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
     requested_sentence_ids = [item for item in ((sentence_ids or []) + (sentence_ids_bracket or [])) if item]
+    _require_file_record_read_access(file_record, current_user)
     if limit is not None and not requested_sentence_ids:
         requested_sentence_ids = _get_segment_page_sentence_ids(
             db,
@@ -4353,6 +4671,7 @@ def create_file_record_comment(
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    _require_file_record_read_access(file_record, current_user)
     comment = create_segment_comment(
         db,
         file_record_id=file_record_id,
@@ -4470,11 +4789,13 @@ async def extract_file_record_terms(
     file_record_id: UUID,
     payload: TermExtractionRequest | None = None,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    _require_file_record_read_access(file_record, current_user)
     source_language, target_language = _resolve_file_record_language_pair(file_record)
     body = payload or TermExtractionRequest()
     selected_models = _normalize_term_extraction_models(body.models)
@@ -4578,6 +4899,7 @@ async def llm_translate_file_record(
     if not file_record:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    _require_file_record_work_access(file_record, current_user)
     ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
     source_language, target_language = _resolve_file_record_language_pair(file_record)
     body = payload or LLMTranslateRequest()
@@ -4791,6 +5113,7 @@ async def llm_translate_file_record(
 def remove_file_record(
     file_record_id: UUID,
     db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
 ):
     """删除文档及其所有片段"""
     success = delete_file_record(db, file_record_id)

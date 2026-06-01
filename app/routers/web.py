@@ -141,7 +141,7 @@ def _build_match_results(
     return [
         type("MatchResult", (), {
             "source_sentence": seg.display_text,
-            "source_html": source_html_map.get(
+            "source_html": getattr(seg, "source_html", None) or source_html_map.get(
                 seg.sentence_id,
                 build_segment_display_html(
                     getattr(seg, "display_text", ""),
@@ -166,7 +166,8 @@ def _build_source_html_map_from_segments(segments) -> dict[str, str]:
         sentence_id = _get_segment_value(segment, "sentence_id", "")
         if not sentence_id:
             continue
-        html_map[str(sentence_id)] = build_segment_display_html(
+        source_html = _get_segment_value(segment, "source_html")
+        html_map[str(sentence_id)] = source_html or build_segment_display_html(
             str(_get_segment_value(segment, "display_text", "") or ""),
             _get_segment_value(segment, "math_placeholders"),
         )
@@ -395,7 +396,7 @@ async def upload_and_match(
         results = [
             type("MatchResult", (), {
                 "source_sentence": seg["display_text"],
-                "source_html": build_segment_display_html(
+                "source_html": seg.get("source_html") or build_segment_display_html(
                     seg["display_text"],
                     seg.get("math_placeholders"),
                 ),

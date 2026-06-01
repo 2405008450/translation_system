@@ -37,6 +37,7 @@ import DataTable from '../components/DataTable.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
 import DocumentParseSettings from '../components/DocumentParseSettings.vue'
 import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
+import Modal from '../components/base/Modal.vue'
 import PreTranslateDialog from '../components/PreTranslateDialog.vue'
 import Pagination from '../components/Pagination.vue'
 import TermExtractionDialog from '../components/TermExtractionDialog.vue'
@@ -46,6 +47,7 @@ import { useToast } from '../composables/useToast'
 import { formatLanguagePair, getLanguageLabel, languageOptions } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
 import { buildTranslatedTaskFilename, supportedTaskFileAccept } from '../constants/taskFiles'
+import { useAuthStore } from '../stores/auth'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
 import type {
@@ -56,6 +58,7 @@ import type {
   IssueStatus,
   UploadCapabilitiesResponse,
   UploadCapability,
+  User,
 } from '../types/api'
 
 const props = defineProps<{
@@ -95,6 +98,8 @@ interface ProjectDetail {
   file_size_bytes: number | null
   issue_count: number
   open_issue_count: number
+  can_manage?: boolean
+  can_write?: boolean
   issue_markers: IssueMarker[]
   files: ProjectFileItem[]
 }
@@ -116,6 +121,11 @@ interface ProjectFileItem {
   source_language: string | null
   target_language: string | null
   creator: string | null
+  assignee_id: string | null
+  assignee: User | null
+  assigned_at: string | null
+  can_manage?: boolean
+  can_write?: boolean
   deadline: string | null
   access_level: AccessLevel | null
   created_at: string
@@ -193,6 +203,7 @@ interface LanguageDetectResponse {
 type ProjectRow = ProjectFileItem | Record<string, any>
 
 const confirm = useConfirm()
+const authStore = useAuthStore()
 const route = useRoute()
 const router = useRouter()
 const toast = useToast()
@@ -224,6 +235,7 @@ const showUploadModal = ref(false)
 const showPreTranslateDialog = ref(false)
 const showIssueDialog = ref(false)
 const showTermExtractionDialog = ref(false)
+const showAssignmentDialog = ref(false)
 const termExtractionNeedsReload = ref(false)
 const uploadInputKey = ref(0)
 const openActionMenuId = ref<string | null>(null)
@@ -248,6 +260,11 @@ const issueDialogTarget = ref<{
   label: string
 } | null>(null)
 const updatingIssueId = ref<string | null>(null)
+const assignableUsers = ref<User[]>([])
+const loadingAssignableUsers = ref(false)
+const savingAssignment = ref(false)
+const assignmentTarget = ref<ProjectFileItem | null>(null)
+const assignmentAssigneeId = ref('')
 
 const tabs = computed(() => ([
   { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
@@ -256,8 +273,8 @@ const tabs = computed(() => ([
     label: `${t('projectDetail.tabs.issues')}${openIssueCount.value > 0 ? ` (${openIssueCount.value})` : ''}`,
     disabled: false,
   },
-  { key: 'settings' as const, label: t('projectDetail.tabs.settings'), disabled: false },
-  { key: 'stats' as const, label: t('projectDetail.tabs.stats'), disabled: false },
+  { key: 'settings' as const, label: t('projectDetail.tabs.settings'), disabled: !canManageProject.value },
+  { key: 'stats' as const, label: t('projectDetail.tabs.stats'), disabled: !canManageProject.value },
   { key: 'summary' as const, label: t('projectDetail.tabs.summary'), disabled: true },
   { key: 'quote' as const, label: t('projectDetail.tabs.quote'), disabled: true },
 ]))
@@ -279,13 +296,18 @@ const selectedProjectFiles = computed(() => (
   tableRows.value.filter((row) => selectedFileIds.value.has(row.id))
 ))
 const hasSelectedLockedFile = computed(() => selectedProjectFiles.value.some((row) => row.is_edit_locked))
+const hasSelectedNonWritableFile = computed(() => selectedProjectFiles.value.some((row) => !row.can_write))
 const statisticsSelectedFiles = computed(() => (
   tableRows.value.filter((row) => statisticsSelectedFileIds.value.has(row.id))
 ))
 const statisticsResultRows = computed(() => (
   tableRows.value.filter((row) => statisticsResultFileIds.value.has(row.id))
 ))
-const canGenerateStatistics = computed(() => statisticsSelectedFileIds.value.size > 0 && !statisticsLoading.value)
+const canGenerateStatistics = computed(() => (
+  canManageProject.value
+  && statisticsSelectedFileIds.value.size > 0
+  && !statisticsLoading.value
+))
 const statisticsAvailableCount = computed(() => (
   statisticsResultRows.value.filter((row) => hasAnyDocumentStatistic(row.document_statistics)).length
 ))
@@ -311,11 +333,29 @@ const selectedTermExtractionSourceLanguage = computed(() => (
 const selectedTermExtractionTargetLanguage = computed(() => (
   selectedTermExtractionFile.value?.target_language || project.value?.target_language || ''
 ))
+const canOpenPreTranslate = computed(() => (
+  selectedFileIds.value.size > 0
+  && !hasSelectedLockedFile.value
+  && !hasSelectedNonWritableFile.value
+))
 const preTranslateButtonTitle = computed(() => (
   selectedFileIds.value.size === 0
     ? t('projectDetail.preTranslate.selectFileFirst')
     : hasSelectedLockedFile.value
       ? t('projectDetail.preTranslate.fileLocked')
+      : hasSelectedNonWritableFile.value
+        ? '无权处理所选任务'
+        : ''
+))
+const canAssignSelectedFile = computed(() => (
+  canManageProject.value
+  && selectedProjectFiles.value.length === 1
+))
+const assignmentButtonTitle = computed(() => (
+  selectedProjectFiles.value.length === 0
+    ? '请先选择一个文件'
+    : selectedProjectFiles.value.length > 1
+      ? '一次只能分配一个文件'
       : ''
 ))
 const termExtractionButtonTitle = computed(() => {
@@ -327,6 +367,9 @@ const termExtractionButtonTitle = computed(() => {
   }
   if (!selectedTermExtractionFile.value || Number(selectedTermExtractionFile.value.total_segments || 0) <= 0) {
     return t('projectDetail.termExtraction.noSegments')
+  }
+  if (!selectedTermExtractionFile.value.can_write) {
+    return '无权处理所选任务'
   }
   if (!selectedTermExtractionSourceLanguage.value || !selectedTermExtractionTargetLanguage.value) {
     return t('projectDetail.termExtraction.languageMissing')
@@ -342,9 +385,10 @@ const duplicateTemplateButtonTitle = computed(() => {
   }
   return ''
 })
-const canDuplicateTemplate = computed(() => selectedFileIds.value.size === 1 && !duplicating.value)
+const canDuplicateTemplate = computed(() => canManageProject.value && selectedFileIds.value.size === 1 && !duplicating.value)
 const canOpenTermExtraction = computed(() => (
   Boolean(selectedTermExtractionFile.value)
+  && Boolean(selectedTermExtractionFile.value?.can_write)
   && Number(selectedTermExtractionFile.value?.total_segments || 0) > 0
   && Boolean(selectedTermExtractionSourceLanguage.value)
   && Boolean(selectedTermExtractionTargetLanguage.value)
@@ -353,7 +397,7 @@ const canOpenTermExtraction = computed(() => (
 const columns = computed<DataTableColumn[]>(() => ([
   { key: 'filename', label: t('projectDetail.files.columns.details'), width: '280px' },
   { key: 'progress', label: t('projectDetail.files.columns.progress'), width: '180px' },
-  { key: 'taskManage', label: t('projectDetail.files.columns.task'), width: '150px' },
+  { key: 'taskManage', label: t('projectDetail.files.columns.task'), width: '190px' },
   { key: 'status', label: t('projectDetail.files.columns.status'), width: '120px' },
   { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '120px' },
   { key: 'created_at', label: t('projectDetail.files.columns.createdAt'), width: '170px' },
@@ -370,10 +414,11 @@ const statisticsFileColumns = computed<DataTableColumn[]>(() => ([
   { key: 'statistics_status', label: t('projectDetail.stats.columns.statisticsStatus'), width: '160px' },
 ]))
 
-const canOpenUploadModal = computed(() => Boolean(project.value))
-const canOpenIssueDialog = computed(() => Boolean(project.value))
+const canManageProject = computed(() => Boolean(project.value?.can_manage))
+const canOpenUploadModal = computed(() => Boolean(project.value) && canManageProject.value)
+const canOpenProjectIssueDialog = computed(() => Boolean(project.value) && !authStore.isExternalTranslator)
 
-const uploadButtonTitle = computed(() => '')
+const uploadButtonTitle = computed(() => (canManageProject.value ? '' : '只有管理员可以上传项目文件'))
 
 const accessOptions = computed(() => ([
   { value: 'team' as const, label: t('projectList.form.team') },
@@ -480,6 +525,18 @@ function formatDateParts(value: string | null) {
 function formatDateText(value: string | null) {
   const parts = formatDateParts(value)
   return parts.time ? `${parts.date} ${parts.time}` : parts.date
+}
+
+function getAssigneeDisplayName(user: User | null | undefined) {
+  return user?.nickname || user?.username || ''
+}
+
+function getAssigneeLabel(row: ProjectRow) {
+  return getAssigneeDisplayName(row.assignee) || '未分配'
+}
+
+function getTranslatorTypeLabel(user: User) {
+  return user.translator_type === 'internal' ? '内部译者' : '外部译者'
 }
 
 function formatDateTimeLocalValue(value: string | null) {
@@ -606,7 +663,7 @@ function getStatisticsStatusClass(statistics: DocumentStatistics | null | undefi
 }
 
 function canEnterWorkbench(row: ProjectRow) {
-  return Number(row.total_segments ?? 0) > 0 && !row.is_edit_locked
+  return Boolean(row.can_write) && Number(row.total_segments ?? 0) > 0 && !row.is_edit_locked
 }
 
 function getFileDetailHint(row: ProjectRow) {
@@ -671,7 +728,7 @@ function closeUploadDialog() {
 }
 
 function openPreTranslateDialog() {
-  if (selectedFileIds.value.size === 0 || hasSelectedLockedFile.value) {
+  if (!canOpenPreTranslate.value) {
     return
   }
   const hasRunningProgress = Object.values(preTranslateProgressByFileId.value).some((state) => state.running)
@@ -687,6 +744,68 @@ function openTermExtractionDialog() {
   }
   termExtractionNeedsReload.value = false
   showTermExtractionDialog.value = true
+}
+
+async function loadAssignableUsers() {
+  if (assignableUsers.value.length > 0 || loadingAssignableUsers.value) {
+    return
+  }
+  loadingAssignableUsers.value = true
+  try {
+    const { data } = await http.get<User[]>('/auth/users')
+    assignableUsers.value = data.filter((user) => user.role === 'user' && user.is_active)
+  } catch (error) {
+    toast.error(getErrorMessage(error, '译者列表加载失败。'))
+  } finally {
+    loadingAssignableUsers.value = false
+  }
+}
+
+async function openAssignmentDialog(row?: ProjectFileItem | null) {
+  if (!canManageProject.value) {
+    return
+  }
+  closeActionMenu()
+  const target = row || (selectedProjectFiles.value.length === 1 ? selectedProjectFiles.value[0] : null)
+  if (!target) {
+    toast.warn(assignmentButtonTitle.value || '请选择一个要分配的文件。')
+    return
+  }
+  assignmentTarget.value = target
+  assignmentAssigneeId.value = target.assignee_id || ''
+  showAssignmentDialog.value = true
+  await loadAssignableUsers()
+}
+
+function closeAssignmentDialog() {
+  if (savingAssignment.value) {
+    return
+  }
+  showAssignmentDialog.value = false
+  assignmentTarget.value = null
+  assignmentAssigneeId.value = ''
+}
+
+async function saveAssignment() {
+  if (!assignmentTarget.value) {
+    return
+  }
+  savingAssignment.value = true
+  try {
+    const { data } = await http.patch<ProjectFileItem>(
+      `/file-records/${assignmentTarget.value.id}/assignment`,
+      { assignee_id: assignmentAssigneeId.value || null },
+    )
+    if (project.value) {
+      project.value.files = project.value.files.map((file) => (file.id === data.id ? data : file))
+    }
+    toast.success('任务指派已更新。')
+    closeAssignmentDialog()
+  } catch (error) {
+    toast.error(getErrorMessage(error, '任务指派失败。'))
+  } finally {
+    savingAssignment.value = false
+  }
 }
 
 async function closeTermExtractionDialog() {
@@ -741,7 +860,7 @@ function getFileDisplayProgressMessage(row: ProjectRow) {
 }
 
 function openProjectIssueDialog() {
-  if (!project.value) {
+  if (!project.value || !canOpenProjectIssueDialog.value) {
     return
   }
   issueDialogTarget.value = {
@@ -945,7 +1064,7 @@ async function loadUploadCapabilities() {
 }
 
 async function saveProjectSettings() {
-  if (!project.value || savingSettings.value) {
+  if (!project.value || savingSettings.value || !canManageProject.value) {
     return
   }
 
@@ -991,7 +1110,7 @@ async function saveProjectSettings() {
 }
 
 async function saveGuidelines() {
-  if (!project.value || savingGuidelines.value) {
+  if (!project.value || savingGuidelines.value || !canManageProject.value) {
     return
   }
   savingGuidelines.value = true
@@ -1017,6 +1136,10 @@ async function saveGuidelines() {
 }
 
 async function detectSourceLanguage() {
+  if (!canManageProject.value) {
+    return
+  }
+
   if (selectedFiles.value.length === 0) {
     languageDetectTone.value = 'warning'
     languageDetectMessage.value = '请先选择要识别的文件。'
@@ -1061,6 +1184,10 @@ async function detectSourceLanguage() {
 }
 
 async function uploadSourceDocument() {
+  if (!canManageProject.value) {
+    return
+  }
+
   if (selectedFiles.value.length === 0) {
     uploadMessage.value = t('projectDetail.errors.selectFile')
     return
@@ -1144,7 +1271,7 @@ async function exportProjectFile(row: ProjectRow) {
 }
 
 async function deleteCurrentProject() {
-  if (!project.value) {
+  if (!project.value || !canManageProject.value) {
     return
   }
 
@@ -1176,6 +1303,9 @@ async function deleteCurrentProject() {
 
 async function deleteProjectFile(row: ProjectRow) {
   closeActionMenu()
+  if (!canManageProject.value) {
+    return
+  }
 
   const rowId = String(row.id)
   const filename = String(row.filename || t('projectDetail.titleFallback'))
@@ -1208,7 +1338,7 @@ async function deleteProjectFile(row: ProjectRow) {
 }
 
 async function duplicateSelectedTemplate() {
-  if (!canDuplicateTemplate.value) {
+  if (!canDuplicateTemplate.value || !canManageProject.value) {
     return
   }
 
@@ -1656,7 +1786,7 @@ onBeforeUnmount(() => {
           <button
             class="button button--primary"
             type="button"
-            :disabled="!canOpenIssueDialog"
+            :disabled="!canOpenProjectIssueDialog"
             @click="openProjectIssueDialog"
           >
             <Flag :size="14" />
@@ -1722,6 +1852,7 @@ onBeforeUnmount(() => {
         <div class="table-toolbar pd-toolbar">
           <div class="table-toolbar__left pd-toolbar__left">
             <button
+              v-if="canManageProject"
               class="button button--primary"
               data-testid="project-upload-open"
               type="button"
@@ -1735,7 +1866,7 @@ onBeforeUnmount(() => {
             <button
               class="button"
               type="button"
-              :disabled="selectedFileIds.size === 0 || hasSelectedLockedFile"
+              :disabled="!canOpenPreTranslate"
               :title="preTranslateButtonTitle || undefined"
               @click="openPreTranslateDialog"
             >
@@ -1753,6 +1884,7 @@ onBeforeUnmount(() => {
               {{ t('projectDetail.termExtraction.button') }}
             </button>
             <button
+              v-if="canManageProject"
               class="button"
               type="button"
               :disabled="!canDuplicateTemplate"
@@ -1766,21 +1898,28 @@ onBeforeUnmount(() => {
             <button
               class="button"
               type="button"
-              :disabled="!canOpenIssueDialog"
+              :disabled="!canOpenProjectIssueDialog"
               @click="openProjectIssueDialog"
             >
               <Flag :size="14" />
               {{ t('issueMarker.actions.open') }}
             </button>
-            <button class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
+            <button v-if="canManageProject" class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
               <Link :size="14" />
               {{ t('projectDetail.files.actions.link') }}
             </button>
-            <button class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
+            <button v-if="canManageProject" class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
               <BookOpen :size="14" />
               {{ t('projectDetail.files.actions.glossary') }}
             </button>
-            <button class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
+            <button
+              v-if="canManageProject"
+              class="button"
+              type="button"
+              :disabled="!canAssignSelectedFile"
+              :title="assignmentButtonTitle || undefined"
+              @click="openAssignmentDialog()"
+            >
               <Users :size="14" />
               {{ t('projectDetail.files.actions.assign') }}
             </button>
@@ -1793,15 +1932,16 @@ onBeforeUnmount(() => {
               <Download :size="14" />
               {{ t('projectDetail.files.actions.export') }}
             </button>
-            <button class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
+            <button v-if="canManageProject" class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
               <Clock3 :size="14" />
               {{ t('projectDetail.files.actions.modifyTaskType') }}
             </button>
-            <button class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
+            <button v-if="canManageProject" class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
               <FolderOpen :size="14" />
               {{ t('projectDetail.files.actions.mergeOpen') }}
             </button>
             <button
+              v-if="canManageProject"
               class="button button--danger"
               type="button"
               :disabled="deleting"
@@ -1877,14 +2017,30 @@ onBeforeUnmount(() => {
             </div>
           </template>
 
-          <template #taskManage>
-            <div class="pd-task-links">
-              <button class="pd-inline-link" type="button" disabled :title="t('projectDetail.common.comingSoon')">
-                {{ t('projectDetail.files.task.assign') }}
-              </button>
-              <button class="pd-inline-link" type="button" disabled :title="t('projectDetail.common.comingSoon')">
-                {{ t('projectDetail.files.task.detail') }}
-              </button>
+          <template #taskManage="{ row }">
+            <div class="pd-task-cell">
+              <span class="pd-assignee" :class="{ 'is-empty': !row.assignee }">
+                {{ getAssigneeLabel(row) }}
+              </span>
+              <div class="pd-task-links">
+                <button
+                  v-if="canManageProject"
+                  class="pd-inline-link"
+                  type="button"
+                  @click.stop="openAssignmentDialog(row as ProjectFileItem)"
+                >
+                  {{ t('projectDetail.files.task.assign') }}
+                </button>
+                <button
+                  class="pd-inline-link"
+                  type="button"
+                  :disabled="!canEnterWorkbench(row)"
+                  :title="!canEnterWorkbench(row) ? getFileDetailHint(row) : undefined"
+                  @click.stop="openWorkbench(row)"
+                >
+                  {{ t('projectDetail.files.task.detail') }}
+                </button>
+              </div>
             </div>
           </template>
 
@@ -2125,6 +2281,13 @@ onBeforeUnmount(() => {
           {{ t('projectDetail.enterWorkbench') }}
         </button>
         <button
+          v-if="canManageProject"
+          type="button"
+          @click="openAssignmentDialog(actionMenuRow)"
+        >
+          {{ t('projectDetail.files.task.assign') }}
+        </button>
+        <button
           type="button"
           :disabled="!actionMenuRow.has_source_document"
           :title="!actionMenuRow.has_source_document ? t('projectDetail.common.uploadRequired') : undefined"
@@ -2139,6 +2302,7 @@ onBeforeUnmount(() => {
           {{ t('issueMarker.actions.open') }}
         </button>
         <button
+          v-if="canManageProject"
           class="is-danger"
           type="button"
           :disabled="deleting"
@@ -2148,6 +2312,52 @@ onBeforeUnmount(() => {
         </button>
       </div>
     </Teleport>
+
+    <Modal
+      :open="showAssignmentDialog"
+      title="分配任务"
+      :description="assignmentTarget ? `为 ${assignmentTarget.filename} 选择负责人` : ''"
+      width="min(520px, calc(100vw - 32px))"
+      :close-on-overlay="!savingAssignment"
+      :close-on-esc="!savingAssignment"
+      @close="closeAssignmentDialog"
+    >
+      <div class="pd-assignment-dialog">
+        <label class="field field--full">
+          <span class="field__label">负责人</span>
+          <select
+            v-model="assignmentAssigneeId"
+            class="field__control"
+            :disabled="loadingAssignableUsers || savingAssignment"
+          >
+            <option value="">未分配</option>
+            <option v-for="user in assignableUsers" :key="user.id" :value="user.id">
+              {{ getAssigneeDisplayName(user) }} · {{ getTranslatorTypeLabel(user) }}
+            </option>
+          </select>
+        </label>
+        <p v-if="loadingAssignableUsers" class="hint-text">正在加载译者列表...</p>
+        <p v-else-if="assignableUsers.length === 0" class="form-message is-error">
+          暂无可分配的启用译者账号。
+        </p>
+      </div>
+
+      <template #footer>
+        <button class="button" type="button" :disabled="savingAssignment" @click="closeAssignmentDialog">
+          {{ t('common.actions.cancel') }}
+        </button>
+        <button
+          class="button button--primary"
+          type="button"
+          :disabled="savingAssignment || loadingAssignableUsers"
+          @click="saveAssignment"
+        >
+          <Loader2 v-if="savingAssignment" class="lucide-spin" :size="14" />
+          <Users v-else :size="14" />
+          {{ savingAssignment ? t('common.actions.saving') : '保存分配' }}
+        </button>
+      </template>
+    </Modal>
 
     <PreTranslateDialog
       :open="showPreTranslateDialog"
@@ -2898,10 +3108,32 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.pd-task-links {
+.pd-task-cell {
   display: grid;
-  justify-items: start;
-  gap: 4px;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pd-assignee {
+  display: block;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-assignee.is-empty {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.pd-task-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
 }
 
 .issue-badge {
@@ -3031,12 +3263,17 @@ onBeforeUnmount(() => {
   padding: 0;
   border: none;
   background: transparent;
-  color: var(--text-secondary);
+  color: var(--brand-700);
   font-size: 13px;
   box-shadow: none;
 }
 
+.pd-inline-link:hover:not(:disabled) {
+  color: var(--brand-600);
+}
+
 .pd-inline-link:disabled {
+  color: var(--text-muted);
   opacity: 0.6;
   cursor: not-allowed;
 }
@@ -3104,6 +3341,11 @@ onBeforeUnmount(() => {
 
 .pd-upload-progress {
   margin-top: 12px;
+}
+
+.pd-assignment-dialog {
+  display: grid;
+  gap: 12px;
 }
 
 .pd-upload-dialog {

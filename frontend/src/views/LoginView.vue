@@ -22,6 +22,15 @@ const subtitle = computed(() =>
     : t('auth.subtitleInit'),
 )
 const submitDisabled = computed(() => authStore.loading || !authStore.tableExists)
+const externalTranslatorBlockedRedirects = new Set(['/dashboard', '/projects'])
+
+function getPostLoginRedirect() {
+  const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
+  if (authStore.isExternalTranslator && (redirect === '/' || externalTranslatorBlockedRedirects.has(redirect))) {
+    return '/tasks'
+  }
+  return redirect
+}
 
 async function submit() {
   errorMessage.value = ''
@@ -32,8 +41,7 @@ async function submit() {
       await authStore.initializeAdmin(username.value, password.value)
     }
 
-    const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
-    await router.replace(redirect)
+    await router.replace(getPostLoginRedirect())
   } catch (error) {
     if (axios.isAxiosError(error)) {
       errorMessage.value = String(error.response?.data?.detail || t('auth.requestError'))

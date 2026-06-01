@@ -26,7 +26,8 @@ import { useAuthStore } from '../stores/auth'
 import type { User as UserRecord } from '../types/api'
 
 type RoleFilter = 'all' | 'super_admin' | 'admin' | 'user'
-type SortableUserKey = 'nickname' | 'username' | 'role' | 'is_active' | 'created_at'
+type TranslatorType = 'internal' | 'external'
+type SortableUserKey = 'nickname' | 'username' | 'role' | 'translator_type' | 'is_active' | 'created_at'
 
 const authStore = useAuthStore()
 const toast = useToast()
@@ -37,6 +38,7 @@ const uiText = {
     nickname: '\u6635\u79f0',
     username: '\u7528\u6237\u540d',
     role: '\u89d2\u8272',
+    translatorType: '译者类型',
     status: '\u72b6\u6001',
     createdAt: '\u521b\u5efa\u65f6\u95f4',
   },
@@ -96,12 +98,15 @@ const uiText = {
   editSubmit: '\u4fdd\u5b58\u4fee\u6539',
   editSubmitting: '\u4fdd\u5b58\u4e2d...',
   editSuccess: (username: string) => `\u7528\u6237 ${username} \u5df2\u66f4\u65b0`,
+  translatorTypeInternal: '内部译者',
+  translatorTypeExternal: '外部译者',
 } as const
 
 const columns: DataTableColumn[] = [
   { key: 'nickname', label: uiText.columns.nickname, sortable: true },
   { key: 'username', label: uiText.columns.username, sortable: true },
   { key: 'role', label: uiText.columns.role, width: '120px', sortable: true },
+  { key: 'translator_type', label: uiText.columns.translatorType, width: '120px', sortable: true },
   { key: 'is_active', label: uiText.columns.status, width: '120px', sortable: true },
   { key: 'created_at', label: uiText.columns.createdAt, width: '180px', sortable: true },
 ]
@@ -125,11 +130,13 @@ const newUsername = ref('')
 const newNickname = ref('')
 const newPassword = ref('')
 const newRole = ref<'admin' | 'user'>('user')
+const newTranslatorType = ref<TranslatorType>('external')
 const editDialogOpen = ref(false)
 const editingUserId = ref('')
 const editUsername = ref('')
 const editNickname = ref('')
 const editPassword = ref('')
+const editTranslatorType = ref<TranslatorType>('external')
 const editUserMessage = ref('')
 const editUserMessageTone = ref<'success' | 'error'>('success')
 const updatingUser = ref(false)
@@ -173,6 +180,7 @@ const filteredUsers = computed(() => {
       getUserDisplayName(item).toLowerCase().includes(keyword)
       || item.username.toLowerCase().includes(keyword)
       || getRoleLabel(item.role).toLowerCase().includes(keyword)
+      || getTranslatorTypeLabel(item).toLowerCase().includes(keyword)
     ))
   }
 
@@ -185,6 +193,8 @@ const filteredUsers = computed(() => {
         return left.username.localeCompare(right.username, 'zh-CN') * direction
       case 'role':
         return left.role.localeCompare(right.role) * direction
+      case 'translator_type':
+        return getTranslatorTypeLabel(left).localeCompare(getTranslatorTypeLabel(right), 'zh-CN') * direction
       case 'is_active':
         return (Number(left.is_active) - Number(right.is_active)) * direction
       case 'created_at':
@@ -222,6 +232,13 @@ function getRoleLabel(role: UserRecord['role']) {
     return t('common.roles.superAdmin')
   }
   return role === 'admin' ? t('common.roles.admin') : t('common.roles.user')
+}
+
+function getTranslatorTypeLabel(user: { role?: string | null, translator_type?: string | null }) {
+  if (user.role !== 'user') {
+    return '--'
+  }
+  return user.translator_type === 'internal' ? uiText.translatorTypeInternal : uiText.translatorTypeExternal
 }
 
 function getUserDisplayName(
@@ -316,12 +333,14 @@ async function createUser() {
       newPassword.value,
       newRole.value,
       newNickname.value.trim() || null,
+      newTranslatorType.value,
     )
 
     newUsername.value = ''
     newNickname.value = ''
     newPassword.value = ''
     newRole.value = 'user'
+    newTranslatorType.value = 'external'
     createUserMessageTone.value = 'success'
     createUserMessage.value = uiText.createSuccess(createdUser.username)
     currentPage.value = 1
@@ -360,6 +379,7 @@ function openEditUser(
   editUsername.value = user.username
   editNickname.value = user.nickname || ''
   editPassword.value = ''
+  editTranslatorType.value = user.translator_type === 'internal' ? 'internal' : 'external'
   editUserMessage.value = ''
   editUserMessageTone.value = 'success'
   editDialogOpen.value = true
@@ -386,9 +406,14 @@ async function updateUser() {
       username: string
       nickname: string | null
       password?: string
+      translator_type?: TranslatorType
     } = {
       username: editUsername.value.trim(),
       nickname: editNickname.value.trim() || null,
+    }
+
+    if (editingUser.value.role === 'user' && canManageUserPermissions.value) {
+      payload.translator_type = editTranslatorType.value
     }
 
     if (editPassword.value) {
@@ -679,6 +704,12 @@ onMounted(() => {
           </span>
         </template>
 
+        <template #translator_type="{ row }">
+          <span class="user-role-chip" :class="row.translator_type === 'internal' ? 'is-internal' : 'is-external'">
+            {{ getTranslatorTypeLabel(row) }}
+          </span>
+        </template>
+
         <template #is_active="{ row }">
           <span
             class="user-status-chip"
@@ -789,6 +820,14 @@ onMounted(() => {
             <option v-if="authStore.isSuperAdmin" value="admin">{{ t('common.roles.admin') }}</option>
           </select>
         </label>
+
+        <label v-if="newRole === 'user'" class="field field--compact">
+          <span class="field__label">{{ uiText.columns.translatorType }}</span>
+          <select v-model="newTranslatorType" class="field__control">
+            <option value="external">{{ uiText.translatorTypeExternal }}</option>
+            <option value="internal">{{ uiText.translatorTypeInternal }}</option>
+          </select>
+        </label>
       </div>
 
       <p
@@ -873,6 +912,14 @@ onMounted(() => {
             :placeholder="uiText.editPasswordPlaceholder"
             :aria-label="uiText.editPasswordLabel"
           />
+        </label>
+
+        <label v-if="editingUser?.role === 'user' && canManageUserPermissions" class="field field--compact">
+          <span class="field__label">{{ uiText.columns.translatorType }}</span>
+          <select v-model="editTranslatorType" class="field__control">
+            <option value="external">{{ uiText.translatorTypeExternal }}</option>
+            <option value="internal">{{ uiText.translatorTypeInternal }}</option>
+          </select>
         </label>
       </div>
 
@@ -1233,6 +1280,16 @@ onMounted(() => {
 .user-role-chip.is-user {
   background: #f4f5f7;
   color: var(--text-secondary);
+}
+
+.user-role-chip.is-internal {
+  background: #ecfdf3;
+  color: #067647;
+}
+
+.user-role-chip.is-external {
+  background: #fff6ed;
+  color: #b54708;
 }
 
 .user-status-chip.is-active {

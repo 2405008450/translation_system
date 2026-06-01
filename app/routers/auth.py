@@ -57,6 +57,13 @@ def _require_create_user_role_access(current_user: User, role: str) -> None:
         raise HTTPException(status_code=403, detail="只有超级管理员可以创建管理员账号。")
 
 
+def _require_translator_type_update_access(current_user: User, target_user: User) -> None:
+    if target_user.role != USER_ROLE:
+        raise HTTPException(status_code=400, detail="只有普通用户账号可以设置译者类型。")
+    if not is_admin_role(current_user.role):
+        raise HTTPException(status_code=403, detail="只有管理员可以设置译者类型。")
+
+
 def _require_status_update_access(
     *,
     db: Session,
@@ -171,6 +178,7 @@ def register_user(
         nickname=payload.nickname,
         password=payload.password,
         role=payload.role,
+        translator_type=payload.translator_type,
     )
     return UserRead.model_validate(serialize_user(user))
 
@@ -202,16 +210,21 @@ def update_user_account(
             next_is_active=payload.is_active,
         )
 
+    if "translator_type" in updated_fields:
+        _require_translator_type_update_access(current_user, target_user)
+
     user = update_user_profile(
         db=db,
         user=target_user,
         username=payload.username,
         nickname=payload.nickname,
         password=payload.password,
+        translator_type=payload.translator_type,
         is_active=payload.is_active,
         update_username="username" in updated_fields,
         update_nickname="nickname" in updated_fields,
         update_password="password" in updated_fields,
+        update_translator_type="translator_type" in updated_fields,
         update_is_active="is_active" in updated_fields,
     )
     return UserRead.model_validate(serialize_user(user))

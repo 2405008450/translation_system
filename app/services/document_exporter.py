@@ -47,6 +47,8 @@ from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
 DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 XML_SPACE_ATTR = "{http://www.w3.org/XML/1998/namespace}space"
 EXPORT_FONT_FAMILY = "Times New Roman"
+BILINGUAL_LAYOUT_SOURCE_FIRST = "source_first"
+BILINGUAL_LAYOUT_TARGET_FIRST = "target_first"
 BlockKey = tuple[str, int, int | None, int | None]
 MATH_PLACEHOLDER_RE = re.compile(r"⟦MATH_\d+⟧|\[\[MATH_\d+\]\]")
 ENGLISH_BOUNDARY_TRAILING_RE = re.compile(r"[,;:.!?][\"')\]\}]*$")
@@ -166,6 +168,59 @@ class CellParagraphTokens:
     tokens: list[TextToken]
 
 
+def export_bilingual_docx_with_layout(
+    raw_bytes: bytes,
+    segments: Iterable[Any],
+    order: str = BILINGUAL_LAYOUT_SOURCE_FIRST,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
+) -> bytes:
+    order = _normalize_bilingual_layout_order(order)
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
+    package = DocxPackage(raw_bytes)
+    stories = _build_story_parts(
+        package,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
+    numbering_schema = _build_numbering_schema(package)
+    source_workspace = get_cached_docx_workspace(
+        raw_bytes,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    )
+    math_placeholders_by_sentence_id = {
+        str(segment["sentence_id"]): dict(segment.get("math_placeholders") or {})
+        for segment in source_workspace["segments"]
+        if segment.get("sentence_id")
+    }
+    segments_by_block = _group_segments_by_block(segments, math_placeholders_by_sentence_id)
+    block_counter = count(0)
+
+    for story in stories:
+        _export_bilingual_block_sequence(
+            container=story.root,
+            story=story,
+            block_counter=block_counter,
+            numbering_schema=numbering_schema,
+            segments_by_block=segments_by_block,
+            order=order,
+        )
+
+    _localize_numbering_definitions(package)
+    if document_parse_options.get("clean_format"):
+        _clean_story_formatting(stories)
+    if not document_parse_options.get("preserve_hyperlinks", True):
+        _strip_story_hyperlinks(stories)
+
+    return _build_modified_docx(
+        raw_bytes=raw_bytes,
+        package=package,
+        part_names={story.part_name for story in stories} | {"word/numbering.xml"},
+    )
+
+
 def export_translated_docx(
     raw_bytes: bytes,
     segments: Iterable[Any],
@@ -221,6 +276,19 @@ def build_translated_docx_filename(filename: str) -> str:
     return f"{source_path.stem}_translated.docx"
 
 
+def build_bilingual_docx_filename(filename: str, order: str = BILINGUAL_LAYOUT_SOURCE_FIRST) -> str:
+    order = _normalize_bilingual_layout_order(order)
+    source_path = Path(filename or "document.docx")
+    suffix = "bilingual_source_first" if order == BILINGUAL_LAYOUT_SOURCE_FIRST else "bilingual_target_first"
+    return f"{source_path.stem}_{suffix}.docx"
+
+
+def _normalize_bilingual_layout_order(order: str) -> str:
+    if order in {BILINGUAL_LAYOUT_SOURCE_FIRST, BILINGUAL_LAYOUT_TARGET_FIRST}:
+        return order
+    raise ValueError(f"Unsupported bilingual DOCX layout order: {order}")
+
+
 def _group_segments_by_block(
     segments: Iterable[Any],
     math_placeholders_by_sentence_id: Mapping[str, dict[str, str]] | None = None,
@@ -247,6 +315,105 @@ def _group_segments_by_block(
         )
 
     return grouped
+
+
+def _export_bilingual_block_sequence(
+    container: ET.Element,
+    story: StoryPart,
+    block_counter,
+    numbering_schema: NumberingSchema,
+    segments_by_block: dict[BlockKey, list[ExportSegment]],
+    order: str,
+    default_block_type: str = "paragraph",
+    fixed_block_index: int | None = None,
+    row_index: int | None = None,
+    cell_index: int | None = None,
+) -> None:
+    for child in list(container):
+        child_name = _local_name(child.tag)
+        if child_name == "p":
+            block_index = fixed_block_index if fixed_block_index is not None else next(block_counter)
+            _export_bilingual_paragraph(
+                parent=container,
+                paragraph=child,
+                story=story,
+                block_counter=block_counter,
+                numbering_schema=numbering_schema,
+                block_index=block_index,
+                block_type=default_block_type,
+                row_index=row_index,
+                cell_index=cell_index,
+                segments_by_block=segments_by_block,
+                order=order,
+            )
+            _export_bilingual_embedded_textboxes(
+                node=child,
+                story=story,
+                block_counter=block_counter,
+                numbering_schema=numbering_schema,
+                segments_by_block=segments_by_block,
+                order=order,
+            )
+            continue
+
+        if child_name == "tbl":
+            _export_bilingual_table(
+                table=child,
+                story=story,
+                block_counter=block_counter,
+                numbering_schema=numbering_schema,
+                segments_by_block=segments_by_block,
+                order=order,
+            )
+            continue
+
+        if child_name == "sdt":
+            content = child.find("w:sdtContent", NS)
+            if content is not None:
+                _export_bilingual_block_sequence(
+                    container=content,
+                    story=story,
+                    block_counter=block_counter,
+                    numbering_schema=numbering_schema,
+                    segments_by_block=segments_by_block,
+                    order=order,
+                    default_block_type=default_block_type,
+                    fixed_block_index=fixed_block_index,
+                    row_index=row_index,
+                    cell_index=cell_index,
+                )
+            continue
+
+        if child_name in {"customXml", "ins", "moveFrom", "moveTo", "smartTag"}:
+            _export_bilingual_block_sequence(
+                container=child,
+                story=story,
+                block_counter=block_counter,
+                numbering_schema=numbering_schema,
+                segments_by_block=segments_by_block,
+                order=order,
+                default_block_type=default_block_type,
+                fixed_block_index=fixed_block_index,
+                row_index=row_index,
+                cell_index=cell_index,
+            )
+            continue
+
+        if child_name == "AlternateContent":
+            preferred_branch = _select_preferred_alternate_content_branch(child)
+            if preferred_branch is not None:
+                _export_bilingual_block_sequence(
+                    container=preferred_branch,
+                    story=story,
+                    block_counter=block_counter,
+                    numbering_schema=numbering_schema,
+                    segments_by_block=segments_by_block,
+                    order=order,
+                    default_block_type=default_block_type,
+                    fixed_block_index=fixed_block_index,
+                    row_index=row_index,
+                    cell_index=cell_index,
+                )
 
 
 def _export_block_sequence(
@@ -309,6 +476,31 @@ def _export_block(
             numbering_schema=numbering_schema,
             segments_by_block=segments_by_block,
         )
+
+
+def _export_bilingual_table(
+    table: ET.Element,
+    story: StoryPart,
+    block_counter,
+    numbering_schema: NumberingSchema,
+    segments_by_block: dict[BlockKey, list[ExportSegment]],
+    order: str,
+) -> None:
+    block_index = next(block_counter)
+
+    for row_index, row in enumerate(table.findall("./w:tr", NS)):
+        for cell_index, cell in enumerate(row.findall("./w:tc", NS)):
+            _export_bilingual_table_cell(
+                cell=cell,
+                story=story,
+                block_counter=block_counter,
+                numbering_schema=numbering_schema,
+                segments_by_block=segments_by_block,
+                block_index=block_index,
+                row_index=row_index,
+                cell_index=cell_index,
+                order=order,
+            )
 
 
 def _export_table(
@@ -419,6 +611,140 @@ def _group_table_cell_paragraphs(
     return grouped_paragraphs
 
 
+def _group_table_cell_paragraph_groups(
+    paragraphs: list[CellParagraphTokens],
+    numbering_schema: NumberingSchema,
+) -> list[tuple[list[CellParagraphTokens], int]]:
+    grouped_paragraphs: list[tuple[list[CellParagraphTokens], int]] = []
+    current_paragraphs: list[CellParagraphTokens] = []
+    current_tokens: list[TextToken] = []
+
+    for paragraph in paragraphs:
+        if not paragraph.tokens:
+            continue
+
+        paragraph_tokens = list(paragraph.tokens)
+        if not current_paragraphs:
+            current_paragraphs = [paragraph]
+            current_tokens = paragraph_tokens
+            continue
+
+        if _should_merge_table_cell_paragraphs(current_tokens, paragraph, numbering_schema):
+            current_tokens.append(
+                TextToken(
+                    display_text="\n",
+                    source_text=CELL_PARAGRAPH_BREAK_SENTINEL,
+                )
+            )
+            current_tokens.extend(paragraph_tokens)
+            current_paragraphs.append(paragraph)
+            continue
+
+        grouped_paragraphs.append((current_paragraphs, _count_token_sentence_spans(current_tokens)))
+        current_paragraphs = [paragraph]
+        current_tokens = paragraph_tokens
+
+    if current_paragraphs:
+        grouped_paragraphs.append((current_paragraphs, _count_token_sentence_spans(current_tokens)))
+
+    return grouped_paragraphs
+
+
+def _export_bilingual_table_cell(
+    cell: ET.Element,
+    story: StoryPart,
+    block_counter,
+    numbering_schema: NumberingSchema,
+    segments_by_block: dict[BlockKey, list[ExportSegment]],
+    block_index: int,
+    row_index: int,
+    cell_index: int,
+    order: str,
+) -> None:
+    cell_segments = segments_by_block.get(
+        (_resolve_segment_block_type(story.kind, "table_cell"), block_index, row_index, cell_index),
+        [],
+    )
+    segment_cursor = 0
+    paragraph_buffer: list[CellParagraphTokens] = []
+
+    def flush_paragraphs() -> None:
+        nonlocal paragraph_buffer, segment_cursor
+        if not paragraph_buffer:
+            return
+
+        for paragraph_group, sentence_count in _group_table_cell_paragraph_groups(paragraph_buffer, numbering_schema):
+            if sentence_count == 0:
+                continue
+
+            group_segments = cell_segments[segment_cursor : segment_cursor + sentence_count]
+            segment_cursor += sentence_count
+            if not group_segments:
+                continue
+
+            target_paragraphs = [_clone_bilingual_paragraph(item.paragraph) for item in paragraph_group]
+            target_tokens = _collect_cell_group_tokens(
+                paragraphs=target_paragraphs,
+                story=story,
+                block_counter=block_counter,
+                numbering_schema=numbering_schema,
+                segments_by_block=segments_by_block,
+            )
+            _replace_block_tokens(
+                tokens=target_tokens,
+                segments=group_segments,
+                keep_source_when_empty=False,
+            )
+            _insert_cloned_blocks(
+                parent=cell,
+                anchors=[item.paragraph for item in paragraph_group],
+                clones=target_paragraphs,
+                order=order,
+            )
+
+        paragraph_buffer = []
+
+    for block in list(cell):
+        block_name = _local_name(block.tag)
+        if block_name == "p":
+            paragraph_buffer.append(
+                CellParagraphTokens(
+                    paragraph=block,
+                    tokens=_collect_inline_tokens(
+                        node=block,
+                        story=story,
+                        block_counter=block_counter,
+                        numbering_schema=numbering_schema,
+                        segments_by_block=segments_by_block,
+                        math_placeholder_counter=[0],
+                        process_embedded_textboxes=False,
+                    ),
+                )
+            )
+            _export_bilingual_embedded_textboxes(
+                node=block,
+                story=story,
+                block_counter=block_counter,
+                numbering_schema=numbering_schema,
+                segments_by_block=segments_by_block,
+                order=order,
+            )
+            continue
+
+        if block_name == "tbl":
+            flush_paragraphs()
+            _export_bilingual_table(
+                table=block,
+                story=story,
+                block_counter=block_counter,
+                numbering_schema=numbering_schema,
+                segments_by_block=segments_by_block,
+                order=order,
+            )
+
+    flush_paragraphs()
+
+
 def _export_table_cell(
     cell: ET.Element,
     story: StoryPart,
@@ -512,6 +838,62 @@ def _export_paragraph(
     )
 
 
+def _export_bilingual_paragraph(
+    parent: ET.Element,
+    paragraph: ET.Element,
+    story: StoryPart,
+    block_counter,
+    numbering_schema: NumberingSchema,
+    block_index: int,
+    block_type: str,
+    row_index: int | None,
+    cell_index: int | None,
+    segments_by_block: dict[BlockKey, list[ExportSegment]],
+    order: str,
+) -> None:
+    tokens = _collect_inline_tokens(
+        node=paragraph,
+        story=story,
+        block_counter=block_counter,
+        numbering_schema=numbering_schema,
+        segments_by_block=segments_by_block,
+        math_placeholder_counter=[0],
+        process_embedded_textboxes=False,
+    )
+    sentence_count = _count_token_sentence_spans(tokens)
+    if sentence_count == 0:
+        return
+
+    block_segments = segments_by_block.get(
+        (_resolve_segment_block_type(story.kind, block_type), block_index, row_index, cell_index),
+        [],
+    )
+    if not block_segments:
+        return
+
+    target_paragraph = _clone_bilingual_paragraph(paragraph)
+    target_tokens = _collect_inline_tokens(
+        node=target_paragraph,
+        story=story,
+        block_counter=block_counter,
+        numbering_schema=numbering_schema,
+        segments_by_block=segments_by_block,
+        math_placeholder_counter=[0],
+        process_embedded_textboxes=False,
+    )
+    _replace_block_tokens(
+        tokens=target_tokens,
+        segments=block_segments[:sentence_count],
+        keep_source_when_empty=False,
+    )
+    _insert_cloned_blocks(
+        parent=parent,
+        anchors=[paragraph],
+        clones=[target_paragraph],
+        order=order,
+    )
+
+
 def _collect_inline_tokens(
     node: ET.Element,
     story: StoryPart,
@@ -523,6 +905,7 @@ def _collect_inline_tokens(
     parent_element: ET.Element | None = None,
     math_placeholder_counter: list[int] | None = None,
     inside_hyperlink: bool = False,
+    process_embedded_textboxes: bool = True,
 ) -> list[TextToken]:
     placeholder_counter = math_placeholder_counter if math_placeholder_counter is not None else [0]
     if node.tag in OMML_ATOMIC_TAGS:
@@ -557,6 +940,7 @@ def _collect_inline_tokens(
             parent_element=parent_element,
             math_placeholder_counter=placeholder_counter,
             inside_hyperlink=inside_hyperlink,
+            process_embedded_textboxes=process_embedded_textboxes,
         )
 
     if node.tag == _qn("w", "hyperlink") and story.parse_options.get("preserve_hyperlinks", True):
@@ -602,6 +986,8 @@ def _collect_inline_tokens(
         return [TextToken(display_text=marker, source_text=" " * len(marker))]
 
     if node.tag in {_qn("w", "drawing"), _qn("w", "pict")}:
+        if not process_embedded_textboxes:
+            return []
         _export_embedded_textboxes(
             node=node,
             story=story,
@@ -628,10 +1014,71 @@ def _collect_inline_tokens(
                 parent_element=node,
                 math_placeholder_counter=placeholder_counter,
                 inside_hyperlink=inside_hyperlink,
+                process_embedded_textboxes=process_embedded_textboxes,
             )
         )
 
     return tokens
+
+
+def _export_bilingual_embedded_textboxes(
+    node: ET.Element,
+    story: StoryPart,
+    block_counter,
+    numbering_schema: NumberingSchema,
+    segments_by_block: dict[BlockKey, list[ExportSegment]],
+    order: str,
+) -> None:
+    textbox_contents = node.findall(".//w:txbxContent", NS)
+    if textbox_contents:
+        for textbox_content in textbox_contents:
+            _export_bilingual_block_sequence(
+                container=textbox_content,
+                story=story,
+                block_counter=block_counter,
+                numbering_schema=numbering_schema,
+                segments_by_block=segments_by_block,
+                order=order,
+                default_block_type="textbox",
+            )
+        return
+
+    text_elements = [element for element in node.findall(".//a:t", NS) if element.text]
+    if not text_elements:
+        return
+
+    tokens: list[TextToken] = []
+    for element in text_elements:
+        text_value = element.text or ""
+        if not text_value:
+            continue
+        if tokens:
+            tokens.append(TextToken(display_text="\n", source_text="\n"))
+        tokens.append(
+            TextToken(
+                display_text=text_value,
+                source_text=text_value,
+                element=element,
+                original_text=text_value,
+            )
+        )
+
+    display_text = "".join(token.display_text for token in tokens)
+    if not normalize_text(display_text):
+        return
+
+    block_segments = segments_by_block.get(
+        (_resolve_segment_block_type(story.kind, "textbox"), next(block_counter), None, None),
+        [],
+    )
+    if not block_segments:
+        return
+
+    _replace_block_tokens(
+        tokens=tokens,
+        segments=_build_inline_bilingual_segments(block_segments, order),
+        keep_source_when_empty=False,
+    )
 
 
 def _export_embedded_textboxes(
@@ -690,6 +1137,7 @@ def _export_embedded_textboxes(
 def _replace_block_tokens(
     tokens: list[TextToken],
     segments: list[ExportSegment],
+    keep_source_when_empty: bool = True,
 ) -> None:
     if not tokens or not segments:
         return
@@ -725,6 +1173,8 @@ def _replace_block_tokens(
                 boundary_text=boundary_text,
             )
         if not normalize_text(replacement):
+            if not keep_source_when_empty:
+                _queue_sentence_replacement(tokens, span, "")
             previous_replacement = ""
             previous_span = span
             continue
@@ -751,6 +1201,94 @@ def _replace_block_tokens(
         previous_span = span
 
     _apply_token_edits(tokens)
+
+
+def _collect_cell_group_tokens(
+    paragraphs: list[ET.Element],
+    story: StoryPart,
+    block_counter,
+    numbering_schema: NumberingSchema,
+    segments_by_block: dict[BlockKey, list[ExportSegment]],
+) -> list[TextToken]:
+    tokens: list[TextToken] = []
+    for index, paragraph in enumerate(paragraphs):
+        if index > 0:
+            tokens.append(
+                TextToken(
+                    display_text="\n",
+                    source_text=CELL_PARAGRAPH_BREAK_SENTINEL,
+                )
+            )
+        tokens.extend(
+            _collect_inline_tokens(
+                node=paragraph,
+                story=story,
+                block_counter=block_counter,
+                numbering_schema=numbering_schema,
+                segments_by_block=segments_by_block,
+                math_placeholder_counter=[0],
+                process_embedded_textboxes=False,
+            )
+        )
+    return tokens
+
+
+def _clone_bilingual_paragraph(paragraph: ET.Element) -> ET.Element:
+    clone = deepcopy(paragraph)
+    _remove_paragraph_section_properties(clone)
+    return clone
+
+
+def _remove_paragraph_section_properties(paragraph: ET.Element) -> None:
+    paragraph_properties = paragraph.find("w:pPr", NS)
+    if paragraph_properties is None:
+        return
+    for section_properties in list(paragraph_properties.findall("w:sectPr", NS)):
+        paragraph_properties.remove(section_properties)
+
+
+def _insert_cloned_blocks(
+    parent: ET.Element,
+    anchors: list[ET.Element],
+    clones: list[ET.Element],
+    order: str,
+) -> None:
+    if not anchors or not clones:
+        return
+
+    children = list(parent)
+    if order == BILINGUAL_LAYOUT_TARGET_FIRST:
+        insert_index = children.index(anchors[0])
+    else:
+        insert_index = children.index(anchors[-1]) + 1
+
+    for offset, clone in enumerate(clones):
+        parent.insert(insert_index + offset, clone)
+
+
+def _build_inline_bilingual_segments(
+    segments: list[ExportSegment],
+    order: str,
+) -> list[ExportSegment]:
+    bilingual_segments: list[ExportSegment] = []
+    for segment in segments:
+        source_text = segment.source_text
+        target_text = segment.target_text
+        has_target = bool(normalize_text(target_text))
+        if order == BILINGUAL_LAYOUT_TARGET_FIRST:
+            replacement = f"{target_text}\n{source_text}" if has_target else f"\n{source_text}"
+        else:
+            replacement = f"{source_text}\n{target_text}" if has_target else f"{source_text}\n"
+        bilingual_segments.append(
+            ExportSegment(
+                sentence_id=segment.sentence_id,
+                source_text=segment.source_text,
+                target_text=replacement,
+                target_html=None,
+                math_placeholders=segment.math_placeholders,
+            )
+        )
+    return bilingual_segments
 
 
 def _normalize_adjacent_english_target_boundary(
