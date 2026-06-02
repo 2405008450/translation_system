@@ -9,12 +9,19 @@ __pycache__/
 !.env.example
 .idea/
 .vscode/
+
+# Local logs and test runtime artifacts
+logs/*
+!logs/.gitkeep
+*.log
+
+# Python / pytest cache
 .pytest_cache/
+pytest-cache-files-*/
 .mypy_cache/
 .ruff_cache/
 htmlcov/
 coverage/
-*.log
 .claude/
 .kiro/
 data/

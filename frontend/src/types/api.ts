@@ -88,11 +88,72 @@ export interface FileRecordSummary {
   target_language: string | null
   assignee_id?: string | null
   assignee?: User | null
+  assignees?: User[]
   assigned_at?: string | null
   can_manage?: boolean
   can_write?: boolean
   created_at: string
   updated_at: string
+}
+
+export interface ProjectAssignmentItem {
+  id: string
+  assignee_id: string
+  assignee: User
+  file_record_ids: string[]
+  assigned_by_id: string | null
+  assigned_at: string
+}
+
+export interface ProjectAssignmentsResponse {
+  project_id: string
+  assignments: ProjectAssignmentItem[]
+}
+
+export interface ProjectAssignmentPayload {
+  assignments: Array<{
+    assignee_id: string
+    file_record_ids: string[]
+  }>
+}
+
+export interface AssignmentEvent {
+  id: string
+  project_id: string
+  project_name: string | null
+  file_record_id: string | null
+  file_record_name: string | null
+  assignee_id: string
+  assignee: User | null
+  actor_id: string | null
+  actor: User | null
+  action: string
+  before_payload: Record<string, unknown>
+  after_payload: Record<string, unknown>
+  created_at: string
+}
+
+export interface AssignmentEventsResponse {
+  items: AssignmentEvent[]
+}
+
+export interface NotificationItem {
+  id: string
+  type: string
+  title: string
+  body: string
+  project_id: string | null
+  project_name: string | null
+  file_record_id: string | null
+  file_record_name: string | null
+  related_event_id: string | null
+  read_at: string | null
+  created_at: string
+}
+
+export interface NotificationsResponse {
+  items: NotificationItem[]
+  unread_count: number
 }
 
 export type DocumentParseMode = 'full' | 'body_only'

@@ -73,6 +73,11 @@ class Project(Base):
         back_populates="project",
         cascade="all, delete-orphan",
     )
+    assignments: Mapped[list["ProjectAssignment"]] = relationship(
+        "ProjectAssignment",
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
 
 
 class FileRecord(Base):
@@ -221,6 +226,11 @@ class FileRecord(Base):
         back_populates="file_record",
         cascade="all, delete-orphan",
     )
+    file_assignments: Mapped[list["FileAssignment"]] = relationship(
+        "FileAssignment",
+        back_populates="file_record",
+        passive_deletes=True,
+    )
 
 
 class User(Base):
@@ -254,6 +264,214 @@ class User(Base):
         foreign_keys="IssueMarker.resolved_by_id",
         back_populates="resolved_by",
     )
+
+
+class ProjectAssignment(Base):
+    __tablename__ = "project_assignments"
+    __table_args__ = (
+        Index("ix_project_assignments_project_id", "project_id"),
+        Index("ix_project_assignments_assignee_id", "assignee_id"),
+        Index("ix_project_assignments_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    assignee_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    assigned_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    assigned_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        nullable=False,
+    )
+    revoked_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    revoked_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="active", server_default=text("'active'")
+    )
+
+    project: Mapped["Project"] = relationship("Project", back_populates="assignments")
+    assignee: Mapped["User"] = relationship("User", foreign_keys=[assignee_id])
+    assigned_by: Mapped["User | None"] = relationship("User", foreign_keys=[assigned_by_id])
+    revoked_by: Mapped["User | None"] = relationship("User", foreign_keys=[revoked_by_id])
+
+
+class FileAssignment(Base):
+    __tablename__ = "file_assignments"
+    __table_args__ = (
+        Index("ix_file_assignments_project_id", "project_id"),
+        Index("ix_file_assignments_file_record_id", "file_record_id"),
+        Index("ix_file_assignments_assignee_id", "assignee_id"),
+        Index("ix_file_assignments_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    file_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    assignee_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    assigned_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    assigned_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        nullable=False,
+    )
+    revoked_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    revoked_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="active", server_default=text("'active'")
+    )
+
+    file_record: Mapped["FileRecord"] = relationship("FileRecord", back_populates="file_assignments")
+    project: Mapped["Project"] = relationship("Project")
+    assignee: Mapped["User"] = relationship("User", foreign_keys=[assignee_id])
+    assigned_by: Mapped["User | None"] = relationship("User", foreign_keys=[assigned_by_id])
+    revoked_by: Mapped["User | None"] = relationship("User", foreign_keys=[revoked_by_id])
+
+
+class AssignmentEvent(Base):
+    __tablename__ = "assignment_events"
+    __table_args__ = (
+        Index("ix_assignment_events_project_id", "project_id"),
+        Index("ix_assignment_events_file_record_id", "file_record_id"),
+        Index("ix_assignment_events_assignee_id", "assignee_id"),
+        Index("ix_assignment_events_actor_id", "actor_id"),
+        Index("ix_assignment_events_created_at", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    file_record_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    assignee_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    actor_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    action: Mapped[str] = mapped_column(String(40), nullable=False)
+    before_payload: Mapped[str] = mapped_column(Text, nullable=False, default="{}", server_default=text("'{}'"))
+    after_payload: Mapped[str] = mapped_column(Text, nullable=False, default="{}", server_default=text("'{}'"))
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    project: Mapped["Project"] = relationship("Project")
+    file_record: Mapped["FileRecord | None"] = relationship("FileRecord")
+    assignee: Mapped["User"] = relationship("User", foreign_keys=[assignee_id])
+    actor: Mapped["User | None"] = relationship("User", foreign_keys=[actor_id])
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+    __table_args__ = (
+        Index("ix_notifications_user_id", "user_id"),
+        Index("ix_notifications_read_at", "read_at"),
+        Index("ix_notifications_created_at", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    type: Mapped[str] = mapped_column(String(40), nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    file_record_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    related_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("assignment_events.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    read_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    user: Mapped["User"] = relationship("User", foreign_keys=[user_id])
+    project: Mapped["Project | None"] = relationship("Project")
+    file_record: Mapped["FileRecord | None"] = relationship("FileRecord")
+    related_event: Mapped["AssignmentEvent | None"] = relationship("AssignmentEvent")
 
 
 class Segment(Base):

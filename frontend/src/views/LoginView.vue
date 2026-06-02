@@ -22,7 +22,7 @@ const subtitle = computed(() =>
     : t('auth.subtitleInit'),
 )
 const submitDisabled = computed(() => authStore.loading || !authStore.tableExists)
-const externalTranslatorBlockedRedirects = new Set(['/dashboard', '/projects'])
+const externalTranslatorBlockedRedirects = new Set(['/dashboard'])
 
 function getPostLoginRedirect() {
   const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/'

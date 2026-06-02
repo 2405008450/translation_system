@@ -17,14 +17,16 @@ import {
   Sun,
   Users,
 } from 'lucide-vue-next'
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 
 import { getLocaleLabel } from '../constants/languages'
+import { http } from '../api/http'
 import { useAuthStore } from '../stores/auth'
 import { usePreferencesStore } from '../stores/preferences'
 import { useShellStore } from '../stores/shell'
+import type { NotificationItem, NotificationsResponse } from '../types/api'
 
 interface NavChild {
   name: string
@@ -53,6 +55,10 @@ const SIDEBAR_STORAGE_KEY = 'tm-workbench-sidebar-collapsed'
 const sidebarCollapsed = ref(
   typeof window !== 'undefined' && window.localStorage.getItem(SIDEBAR_STORAGE_KEY) === '1',
 )
+const notificationsOpen = ref(false)
+const notificationsLoading = ref(false)
+const notifications = ref<NotificationItem[]>([])
+const unreadNotificationCount = ref(0)
 
 const expandedGroups = reactive<Record<string, boolean>>({
   assets: true,
@@ -72,7 +78,7 @@ const navGroups = computed<NavGroup[]>(() => [
     label: t('shell.sections.workspace'),
     icon: Briefcase,
     routeName: 'projects',
-    visible: !authStore.isExternalTranslator,
+    visible: true,
   },
   {
     key: 'mytasks',
@@ -113,6 +119,12 @@ const navGroups = computed<NavGroup[]>(() => [
     icon: Settings,
     visible: authStore.isAdmin,
     children: [
+      {
+        name: 'assignment-events',
+        label: '指派记录',
+        icon: ClipboardList,
+        visible: authStore.isAdmin,
+      },
       {
         name: 'users',
         label: t('shell.sections.users'),
@@ -200,6 +212,11 @@ const breadcrumbs = computed(() => {
         { label: t('shell.sections.system') },
         { label: pageTitle.value },
       ]
+    case 'assignment-events':
+      return [
+        { label: t('shell.sections.system') },
+        { label: pageTitle.value },
+      ]
     default:
       return [{ label: pageTitle.value }]
   }
@@ -218,6 +235,81 @@ function isGroupActive(group: NavGroup) {
 
 function toggleGroup(key: string) {
   expandedGroups[key] = !expandedGroups[key]
+}
+
+function formatNotificationDate(value: string) {
+  const date = new Date(value)
+  return date.toLocaleString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  })
+}
+
+async function loadNotifications() {
+  if (!authStore.isAuthenticated) {
+    return
+  }
+  notificationsLoading.value = true
+  try {
+    const { data } = await http.get<NotificationsResponse>('/notifications', {
+      params: { limit: 20 },
+    })
+    notifications.value = data.items
+    unreadNotificationCount.value = data.unread_count
+  } catch {
+    notifications.value = []
+    unreadNotificationCount.value = 0
+  } finally {
+    notificationsLoading.value = false
+  }
+}
+
+async function markNotificationRead(notification: NotificationItem) {
+  if (!notification.read_at) {
+    await http.patch(`/notifications/${notification.id}/read`)
+    notification.read_at = new Date().toISOString()
+    unreadNotificationCount.value = Math.max(0, unreadNotificationCount.value - 1)
+  }
+}
+
+async function markAllNotificationsRead() {
+  await http.patch('/notifications/read-all')
+  const now = new Date().toISOString()
+  notifications.value = notifications.value.map((item) => ({
+    ...item,
+    read_at: item.read_at || now,
+  }))
+  unreadNotificationCount.value = 0
+}
+
+async function openNotification(notification: NotificationItem) {
+  await markNotificationRead(notification)
+  notificationsOpen.value = false
+  if (notification.file_record_id) {
+    await router.push({ name: 'workbench', params: { id: notification.file_record_id } })
+    return
+  }
+  if (notification.project_id) {
+    await router.push({ name: 'project-detail', params: { id: notification.project_id } })
+  }
+}
+
+function toggleNotifications() {
+  notificationsOpen.value = !notificationsOpen.value
+  if (notificationsOpen.value) {
+    void loadNotifications()
+  }
+}
+
+function closeNotificationsOnOutsideClick(event: MouseEvent) {
+  const target = event.target as HTMLElement | null
+  if (!target?.closest?.('.shell-notifications')) {
+    notificationsOpen.value = false
+  }
 }
 
 function getFirstVisibleChildName(group: NavGroup) {
@@ -257,6 +349,8 @@ function toggleTheme() {
 
 async function logout() {
   authStore.logout()
+  notifications.value = []
+  unreadNotificationCount.value = 0
   await router.push({ name: 'login' })
 }
 
@@ -296,9 +390,30 @@ watch(() => route.meta.navSection, (section) => {
   if (section === 'tm' || section === 'term-base' || section === 'translation-rules') {
     expandedGroups.assets = true
   }
-  if (section === 'users') {
+  if (section === 'users' || section === 'assignment-events') {
     expandedGroups.system = true
   }
+})
+
+watch(
+  () => authStore.isAuthenticated,
+  (isAuthenticated) => {
+    if (isAuthenticated) {
+      void loadNotifications()
+    } else {
+      notifications.value = []
+      unreadNotificationCount.value = 0
+    }
+  },
+  { immediate: true },
+)
+
+onMounted(() => {
+  document.addEventListener('click', closeNotificationsOnOutsideClick)
+})
+
+onBeforeUnmount(() => {
+  document.removeEventListener('click', closeNotificationsOnOutsideClick)
 })
 
 watch(
@@ -521,16 +636,50 @@ watch(
             <span>{{ currentThemeLabel }}</span>
           </button>
 
-          <button
-            class="shell-header__placeholder"
-            type="button"
-            :title="t('common.comingSoon')"
-            :aria-label="t('shell.topbar.soon', { name: t('shell.topbar.notifications') })"
-            disabled
-          >
-            <Bell :size="16" />
-            <span>{{ t('shell.topbar.notifications') }}</span>
-          </button>
+          <div class="shell-notifications" @click.stop>
+            <button
+              class="shell-header__placeholder shell-notifications__trigger"
+              type="button"
+              :aria-expanded="notificationsOpen"
+              :aria-label="t('shell.topbar.notifications')"
+              @click="toggleNotifications"
+            >
+              <Bell :size="16" />
+              <span>{{ t('shell.topbar.notifications') }}</span>
+              <span v-if="unreadNotificationCount > 0" class="shell-notifications__badge">
+                {{ unreadNotificationCount > 99 ? '99+' : unreadNotificationCount }}
+              </span>
+            </button>
+            <div v-if="notificationsOpen" class="shell-notifications__panel">
+              <div class="shell-notifications__head">
+                <strong>{{ t('shell.topbar.notifications') }}</strong>
+                <button
+                  class="shell-notifications__link"
+                  type="button"
+                  :disabled="unreadNotificationCount === 0"
+                  @click="markAllNotificationsRead"
+                >
+                  全部已读
+                </button>
+              </div>
+              <div v-if="notificationsLoading" class="shell-notifications__empty">正在加载...</div>
+              <div v-else-if="notifications.length === 0" class="shell-notifications__empty">暂无消息</div>
+              <template v-else>
+                <button
+                  v-for="notification in notifications"
+                  :key="notification.id"
+                  class="shell-notification"
+                  :class="{ 'is-unread': !notification.read_at }"
+                  type="button"
+                  @click="openNotification(notification)"
+                >
+                  <span class="shell-notification__title">{{ notification.title }}</span>
+                  <span class="shell-notification__body">{{ notification.body }}</span>
+                  <span class="shell-notification__time">{{ formatNotificationDate(notification.created_at) }}</span>
+                </button>
+              </template>
+            </div>
+          </div>
 
           <button
             class="shell-header__placeholder"
@@ -577,3 +726,127 @@ watch(
     </div>
   </div>
 </template>
+
+<style scoped>
+.shell-notifications {
+  position: relative;
+}
+
+.shell-notifications__trigger {
+  position: relative;
+}
+
+.shell-notifications__badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border: 2px solid var(--surface-panel);
+  border-radius: 999px;
+  background: var(--state-danger);
+  color: #fff;
+  font-size: 11px;
+  line-height: 14px;
+  text-align: center;
+}
+
+.shell-notifications__panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 80;
+  width: min(360px, calc(100vw - 32px));
+  max-height: min(520px, calc(100vh - 96px));
+  overflow: auto;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-soft);
+}
+
+.shell-notifications__head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--surface-panel);
+}
+
+.shell-notifications__head strong {
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.shell-notifications__link {
+  min-height: 28px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--brand-700);
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.shell-notifications__link:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.shell-notifications__empty {
+  padding: 36px 14px;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.shell-notification {
+  width: 100%;
+  display: grid;
+  gap: 4px;
+  padding: 12px 14px;
+  border: 0;
+  border-bottom: 1px solid var(--line-soft);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  text-align: left;
+  box-shadow: none;
+}
+
+.shell-notification:hover {
+  background: var(--surface-muted);
+}
+
+.shell-notification:last-child {
+  border-bottom: 0;
+}
+
+.shell-notification.is-unread {
+  background: color-mix(in srgb, var(--brand-050) 70%, var(--surface-panel));
+}
+
+.shell-notification__title {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.shell-notification__body {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.shell-notification__time {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+</style>

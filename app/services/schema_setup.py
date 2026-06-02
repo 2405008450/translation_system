@@ -78,6 +78,50 @@ REQUIRED_SCHEMA = {
         "deadline",
         "access_level",
     },
+    "project_assignments": {
+        "id",
+        "project_id",
+        "assignee_id",
+        "assigned_by_id",
+        "assigned_at",
+        "revoked_by_id",
+        "revoked_at",
+        "status",
+    },
+    "file_assignments": {
+        "id",
+        "project_id",
+        "file_record_id",
+        "assignee_id",
+        "assigned_by_id",
+        "assigned_at",
+        "revoked_by_id",
+        "revoked_at",
+        "status",
+    },
+    "assignment_events": {
+        "id",
+        "project_id",
+        "file_record_id",
+        "assignee_id",
+        "actor_id",
+        "action",
+        "before_payload",
+        "after_payload",
+        "created_at",
+    },
+    "notifications": {
+        "id",
+        "user_id",
+        "type",
+        "title",
+        "body",
+        "project_id",
+        "file_record_id",
+        "related_event_id",
+        "read_at",
+        "created_at",
+    },
     "segments": {
         "source_word_count",
         "llm_provider",
@@ -699,6 +743,180 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_file_records_assignee_id
             ON file_records (assignee_id)
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS project_assignments (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                assignee_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                assigned_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                assigned_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                revoked_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                revoked_at TIMESTAMP,
+                status VARCHAR(20) NOT NULL DEFAULT 'active'
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS file_assignments (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+                assignee_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                assigned_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                assigned_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                revoked_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                revoked_at TIMESTAMP,
+                status VARCHAR(20) NOT NULL DEFAULT 'active'
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS assignment_events (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID REFERENCES file_records(id) ON DELETE CASCADE,
+                assignee_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                actor_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                action VARCHAR(40) NOT NULL,
+                before_payload TEXT NOT NULL DEFAULT '{{}}',
+                after_payload TEXT NOT NULL DEFAULT '{{}}',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS notifications (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                type VARCHAR(40) NOT NULL,
+                title VARCHAR(200) NOT NULL,
+                body TEXT NOT NULL DEFAULT '',
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID REFERENCES file_records(id) ON DELETE CASCADE,
+                related_event_id UUID REFERENCES assignment_events(id) ON DELETE SET NULL,
+                read_at TIMESTAMP,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_project_assignments_project_id
+            ON project_assignments (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_project_assignments_assignee_id
+            ON project_assignments (assignee_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_project_assignments_status
+            ON project_assignments (status)
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_project_assignments_active_project_user
+            ON project_assignments (project_id, assignee_id)
+            WHERE status = 'active'
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_file_assignments_project_id
+            ON file_assignments (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_file_assignments_file_record_id
+            ON file_assignments (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_file_assignments_assignee_id
+            ON file_assignments (assignee_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_file_assignments_status
+            ON file_assignments (status)
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_file_assignments_active_file_user
+            ON file_assignments (file_record_id, assignee_id)
+            WHERE status = 'active'
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_assignment_events_project_id
+            ON assignment_events (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_assignment_events_file_record_id
+            ON assignment_events (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_assignment_events_assignee_id
+            ON assignment_events (assignee_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_assignment_events_actor_id
+            ON assignment_events (actor_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_assignment_events_created_at
+            ON assignment_events (created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_notifications_user_id
+            ON notifications (user_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_notifications_read_at
+            ON notifications (read_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_notifications_created_at
+            ON notifications (created_at)
+            """,
+            """
+            INSERT INTO project_assignments (
+                project_id,
+                assignee_id,
+                assigned_by_id,
+                assigned_at,
+                status
+            )
+            SELECT DISTINCT
+                fr.project_id,
+                fr.assignee_id,
+                fr.assigned_by_id,
+                COALESCE(fr.assigned_at, NOW()),
+                'active'
+            FROM file_records AS fr
+            WHERE fr.project_id IS NOT NULL
+              AND fr.assignee_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM project_assignments AS pa
+                  WHERE pa.project_id = fr.project_id
+                    AND pa.assignee_id = fr.assignee_id
+                    AND pa.status = 'active'
+              )
+            """,
+            """
+            INSERT INTO file_assignments (
+                project_id,
+                file_record_id,
+                assignee_id,
+                assigned_by_id,
+                assigned_at,
+                status
+            )
+            SELECT
+                fr.project_id,
+                fr.id,
+                fr.assignee_id,
+                fr.assigned_by_id,
+                COALESCE(fr.assigned_at, NOW()),
+                'active'
+            FROM file_records AS fr
+            WHERE fr.project_id IS NOT NULL
+              AND fr.assignee_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM file_assignments AS fa
+                  WHERE fa.file_record_id = fr.id
+                    AND fa.assignee_id = fr.assignee_id
+                    AND fa.status = 'active'
+              )
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_file_records_source_language

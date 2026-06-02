@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 
 import { useAuthStore } from '../stores/auth'
 import AppLayout from '../views/AppLayout.vue'
+import AssignmentEventsView from '../views/AssignmentEventsView.vue'
 import DashboardView from '../views/DashboardView.vue'
 import LoginView from '../views/LoginView.vue'
 import ProjectDetailView from '../views/ProjectDetailView.vue'
@@ -178,6 +179,17 @@ const router = createRouter({
           },
         },
         {
+          path: 'assignment-events',
+          name: 'assignment-events',
+          component: AssignmentEventsView,
+          meta: {
+            requiresAdmin: true,
+            navSection: 'assignment-events',
+            pageTitle: '指派记录',
+            pageDescription: '查看项目和文件任务的指派、授权和取消记录',
+          },
+        },
+        {
           path: 'users',
           name: 'users',
           component: UserManagementView,
@@ -200,7 +212,7 @@ function getDefaultRouteName(authStore: ReturnType<typeof useAuthStore>) {
 }
 
 function isExternalTranslatorBlockedRoute(name: unknown) {
-  return ['dashboard', 'projects'].includes(String(name || ''))
+  return ['dashboard'].includes(String(name || ''))
 }
 
 router.beforeEach(async (to) => {

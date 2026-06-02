@@ -16,12 +16,14 @@ import {
   Link,
   Loader2,
   MoreHorizontal,
+  Search,
   Settings2,
   Sparkles,
   Trash2,
   Upload,
   Users,
   RotateCcw,
+  X,
 } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -54,8 +56,11 @@ import type {
   DocumentParseMode,
   DocumentParseOptions,
   DocumentStatistics,
+  AssignmentEvent,
+  AssignmentEventsResponse,
   IssueMarker,
   IssueStatus,
+  ProjectAssignmentsResponse,
   UploadCapabilitiesResponse,
   UploadCapability,
   User,
@@ -65,7 +70,7 @@ const props = defineProps<{
   id: string
 }>()
 
-type ProjectTab = 'files' | 'issues' | 'settings' | 'stats' | 'summary' | 'quote'
+type ProjectTab = 'files' | 'issues' | 'assignments' | 'settings' | 'stats' | 'summary' | 'quote'
 type AccessLevel = 'team' | 'private' | 'public'
 type DocumentStatisticNumberKey =
   | 'pages'
@@ -100,6 +105,7 @@ interface ProjectDetail {
   open_issue_count: number
   can_manage?: boolean
   can_write?: boolean
+  assigned_users?: User[]
   issue_markers: IssueMarker[]
   files: ProjectFileItem[]
 }
@@ -123,6 +129,7 @@ interface ProjectFileItem {
   creator: string | null
   assignee_id: string | null
   assignee: User | null
+  assignees?: User[]
   assigned_at: string | null
   can_manage?: boolean
   can_write?: boolean
@@ -137,6 +144,15 @@ interface ProjectFileItem {
   collection_id: string | null
   term_base_id: string | null
 }
+
+interface AssignmentDraft {
+  assignee_id: string
+  file_record_ids: Set<string>
+}
+
+type AssignmentUserTypeFilter = 'all' | 'internal' | 'external'
+type AssignmentUserStateFilter = 'all' | 'selected' | 'unselected'
+type AssignmentFileStateFilter = 'all' | 'checked' | 'unchecked'
 
 interface PreTranslateProgressState {
   progress: number
@@ -262,9 +278,18 @@ const issueDialogTarget = ref<{
 const updatingIssueId = ref<string | null>(null)
 const assignableUsers = ref<User[]>([])
 const loadingAssignableUsers = ref(false)
+const loadingAssignments = ref(false)
 const savingAssignment = ref(false)
-const assignmentTarget = ref<ProjectFileItem | null>(null)
-const assignmentAssigneeId = ref('')
+const assignmentDrafts = ref<AssignmentDraft[]>([])
+const assignmentUserSearch = ref('')
+const assignmentUserTypeFilter = ref<AssignmentUserTypeFilter>('all')
+const assignmentUserStateFilter = ref<AssignmentUserStateFilter>('all')
+const assignmentFileSearch = ref('')
+const assignmentFileStateFilter = ref<AssignmentFileStateFilter>('all')
+const assignmentTooltipText = ref('')
+const assignmentTooltipStyle = ref<Record<string, string>>({})
+const assignmentEvents = ref<AssignmentEvent[]>([])
+const assignmentEventsLoading = ref(false)
 
 const tabs = computed(() => ([
   { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
@@ -273,6 +298,7 @@ const tabs = computed(() => ([
     label: `${t('projectDetail.tabs.issues')}${openIssueCount.value > 0 ? ` (${openIssueCount.value})` : ''}`,
     disabled: false,
   },
+  { key: 'assignments' as const, label: '指派记录', disabled: !canManageProject.value },
   { key: 'settings' as const, label: t('projectDetail.tabs.settings'), disabled: !canManageProject.value },
   { key: 'stats' as const, label: t('projectDetail.tabs.stats'), disabled: !canManageProject.value },
   { key: 'summary' as const, label: t('projectDetail.tabs.summary'), disabled: true },
@@ -349,15 +375,30 @@ const preTranslateButtonTitle = computed(() => (
 ))
 const canAssignSelectedFile = computed(() => (
   canManageProject.value
-  && selectedProjectFiles.value.length === 1
+  && Boolean(project.value)
 ))
-const assignmentButtonTitle = computed(() => (
-  selectedProjectFiles.value.length === 0
-    ? '请先选择一个文件'
-    : selectedProjectFiles.value.length > 1
-      ? '一次只能分配一个文件'
-      : ''
-))
+const filteredAssignableUsers = computed<User[]>(() => {
+  let users = [...assignableUsers.value]
+
+  if (assignmentUserTypeFilter.value !== 'all') {
+    users = users.filter((user) => user.translator_type === assignmentUserTypeFilter.value)
+  }
+
+  if (assignmentUserStateFilter.value !== 'all') {
+    users = users.filter((user) => (
+      assignmentUserStateFilter.value === 'selected'
+        ? isUserInAssignmentDraft(user.id)
+        : !isUserInAssignmentDraft(user.id)
+    ))
+  }
+
+  const keyword = normalizeAssignmentKeyword(assignmentUserSearch.value)
+  if (keyword) {
+    users = users.filter((user) => getAssignmentUserSearchText(user).includes(keyword))
+  }
+
+  return users
+})
 const termExtractionButtonTitle = computed(() => {
   if (selectedFileIds.value.size === 0) {
     return t('projectDetail.termExtraction.selectFileFirst')
@@ -532,11 +573,40 @@ function getAssigneeDisplayName(user: User | null | undefined) {
 }
 
 function getAssigneeLabel(row: ProjectRow) {
+  const assignees = Array.isArray(row.assignees) ? row.assignees : []
+  if (assignees.length > 0) {
+    return assignees.map((user) => getAssigneeDisplayName(user)).filter(Boolean).join('、')
+  }
   return getAssigneeDisplayName(row.assignee) || '未分配'
 }
 
 function getTranslatorTypeLabel(user: User) {
   return user.translator_type === 'internal' ? '内部译者' : '外部译者'
+}
+
+function getAssigneeSecondaryLabel(user: User) {
+  const typeLabel = getTranslatorTypeLabel(user)
+  if (user.nickname && user.nickname !== user.username) {
+    return `${user.username} · ${typeLabel}`
+  }
+  return typeLabel
+}
+
+function getAssigneeTooltip(user: User) {
+  return `${getAssigneeDisplayName(user)} · ${getAssigneeSecondaryLabel(user)}`
+}
+
+function normalizeAssignmentKeyword(value: string | null | undefined) {
+  return String(value || '').trim().toLowerCase()
+}
+
+function getAssignmentUserSearchText(user: User) {
+  return [
+    getAssigneeDisplayName(user),
+    user.username,
+    getTranslatorTypeLabel(user),
+    user.translator_type,
+  ].map(normalizeAssignmentKeyword).join(' ')
 }
 
 function formatDateTimeLocalValue(value: string | null) {
@@ -761,20 +831,208 @@ async function loadAssignableUsers() {
   }
 }
 
-async function openAssignmentDialog(row?: ProjectFileItem | null) {
+async function loadProjectAssignments() {
+  if (!project.value) {
+    assignmentDrafts.value = []
+    return
+  }
+  loadingAssignments.value = true
+  try {
+    const { data } = await http.get<ProjectAssignmentsResponse>(`/projects/${project.value.id}/assignments`)
+    assignmentDrafts.value = data.assignments.map((assignment) => ({
+      assignee_id: assignment.assignee_id,
+      file_record_ids: new Set(assignment.file_record_ids),
+    }))
+  } catch (error) {
+    toast.error(getErrorMessage(error, '项目指派加载失败。'))
+  } finally {
+    loadingAssignments.value = false
+  }
+}
+
+async function loadAssignmentEvents() {
+  if (!project.value || !canManageProject.value) {
+    assignmentEvents.value = []
+    return
+  }
+  assignmentEventsLoading.value = true
+  try {
+    const { data } = await http.get<AssignmentEventsResponse>(`/projects/${project.value.id}/assignment-events`, {
+      params: { limit: 100 },
+    })
+    assignmentEvents.value = data.items
+  } catch (error) {
+    toast.error(getErrorMessage(error, '指派记录加载失败。'))
+  } finally {
+    assignmentEventsLoading.value = false
+  }
+}
+
+function isUserInAssignmentDraft(userId: string) {
+  return assignmentDrafts.value.some((draft) => draft.assignee_id === userId)
+}
+
+function getAssignmentDraft(userId: string) {
+  return assignmentDrafts.value.find((draft) => draft.assignee_id === userId) || null
+}
+
+function getAssignableUserById(userId: string) {
+  return assignableUsers.value.find((user) => user.id === userId) || null
+}
+
+function getAssignmentUserName(userId: string) {
+  return getAssigneeDisplayName(getAssignableUserById(userId)) || '未知译者'
+}
+
+function toggleAssignmentUser(user: User) {
+  if (isUserInAssignmentDraft(user.id)) {
+    assignmentDrafts.value = assignmentDrafts.value.filter((draft) => draft.assignee_id !== user.id)
+    return
+  }
+  assignmentDrafts.value = [
+    ...assignmentDrafts.value,
+    {
+      assignee_id: user.id,
+      file_record_ids: new Set<string>(),
+    },
+  ]
+}
+
+function isFileCheckedForUser(userId: string, fileRecordId: string) {
+  return getAssignmentDraft(userId)?.file_record_ids.has(fileRecordId) ?? false
+}
+
+function toggleAssignmentFile(userId: string, fileRecordId: string) {
+  assignmentDrafts.value = assignmentDrafts.value.map((draft) => {
+    if (draft.assignee_id !== userId) {
+      return draft
+    }
+    const nextFileIds = new Set(draft.file_record_ids)
+    if (nextFileIds.has(fileRecordId)) {
+      nextFileIds.delete(fileRecordId)
+    } else {
+      nextFileIds.add(fileRecordId)
+    }
+    return {
+      ...draft,
+      file_record_ids: nextFileIds,
+    }
+  })
+}
+
+function getFilteredAssignmentFiles(draft: AssignmentDraft) {
+  let files = [...tableRows.value]
+
+  const keyword = normalizeAssignmentKeyword(assignmentFileSearch.value)
+  if (keyword) {
+    files = files.filter((file) => normalizeAssignmentKeyword(file.filename).includes(keyword))
+  }
+
+  if (assignmentFileStateFilter.value !== 'all') {
+    files = files.filter((file) => {
+      const checked = draft.file_record_ids.has(file.id)
+      return assignmentFileStateFilter.value === 'checked' ? checked : !checked
+    })
+  }
+
+  return files
+}
+
+function updateFilteredAssignmentFiles(userId: string, checked: boolean) {
+  const draft = getAssignmentDraft(userId)
+  if (!draft) {
+    return
+  }
+  const filteredFileIds = getFilteredAssignmentFiles(draft).map((file) => file.id)
+  if (filteredFileIds.length === 0) {
+    return
+  }
+
+  assignmentDrafts.value = assignmentDrafts.value.map((item) => {
+    if (item.assignee_id !== userId) {
+      return item
+    }
+    const nextFileIds = new Set(item.file_record_ids)
+    for (const fileId of filteredFileIds) {
+      if (checked) {
+        nextFileIds.add(fileId)
+      } else {
+        nextFileIds.delete(fileId)
+      }
+    }
+    return {
+      ...item,
+      file_record_ids: nextFileIds,
+    }
+  })
+}
+
+function selectFilteredAssignmentFiles(userId: string) {
+  updateFilteredAssignmentFiles(userId, true)
+}
+
+function clearFilteredAssignmentFiles(userId: string) {
+  updateFilteredAssignmentFiles(userId, false)
+}
+
+function getAssignmentEventActionLabel(action: string) {
+  const labels: Record<string, string> = {
+    project_assigned: '项目指派',
+    project_unassigned: '取消项目指派',
+    file_permission_granted: '文件授权',
+    file_permission_revoked: '取消文件授权',
+  }
+  return labels[action] || action
+}
+
+function resetAssignmentFilters() {
+  assignmentUserSearch.value = ''
+  assignmentUserTypeFilter.value = 'all'
+  assignmentUserStateFilter.value = 'all'
+  assignmentFileSearch.value = ''
+  assignmentFileStateFilter.value = 'all'
+  hideAssignmentTooltip()
+}
+
+function resetAssignmentDialogState() {
+  assignmentDrafts.value = []
+  resetAssignmentFilters()
+}
+
+function updateAssignmentTooltipPosition(event: MouseEvent) {
+  const maxWidth = Math.min(340, Math.max(220, window.innerWidth - 32))
+  const left = Math.min(event.clientX + 14, window.innerWidth - maxWidth - 12)
+  const top = Math.min(event.clientY + 16, window.innerHeight - 80)
+  assignmentTooltipStyle.value = {
+    left: `${Math.max(12, left)}px`,
+    top: `${Math.max(12, top)}px`,
+    maxWidth: `${maxWidth}px`,
+  }
+}
+
+function showAssignmentTooltip(event: MouseEvent, text: string | null | undefined) {
+  const value = String(text || '').trim()
+  if (!value) {
+    hideAssignmentTooltip()
+    return
+  }
+  assignmentTooltipText.value = value
+  updateAssignmentTooltipPosition(event)
+}
+
+function hideAssignmentTooltip() {
+  assignmentTooltipText.value = ''
+  assignmentTooltipStyle.value = {}
+}
+
+async function openAssignmentDialog(_row?: ProjectFileItem | null) {
   if (!canManageProject.value) {
     return
   }
   closeActionMenu()
-  const target = row || (selectedProjectFiles.value.length === 1 ? selectedProjectFiles.value[0] : null)
-  if (!target) {
-    toast.warn(assignmentButtonTitle.value || '请选择一个要分配的文件。')
-    return
-  }
-  assignmentTarget.value = target
-  assignmentAssigneeId.value = target.assignee_id || ''
+  resetAssignmentFilters()
   showAssignmentDialog.value = true
-  await loadAssignableUsers()
+  await Promise.all([loadAssignableUsers(), loadProjectAssignments()])
 }
 
 function closeAssignmentDialog() {
@@ -782,27 +1040,28 @@ function closeAssignmentDialog() {
     return
   }
   showAssignmentDialog.value = false
-  assignmentTarget.value = null
-  assignmentAssigneeId.value = ''
+  resetAssignmentDialogState()
 }
 
 async function saveAssignment() {
-  if (!assignmentTarget.value) {
+  if (!project.value) {
     return
   }
   savingAssignment.value = true
   try {
-    const { data } = await http.patch<ProjectFileItem>(
-      `/file-records/${assignmentTarget.value.id}/assignment`,
-      { assignee_id: assignmentAssigneeId.value || null },
-    )
-    if (project.value) {
-      project.value.files = project.value.files.map((file) => (file.id === data.id ? data : file))
-    }
-    toast.success('任务指派已更新。')
-    closeAssignmentDialog()
+    await http.patch(`/projects/${project.value.id}/assignments`, {
+      assignments: assignmentDrafts.value.map((draft) => ({
+        assignee_id: draft.assignee_id,
+        file_record_ids: Array.from(draft.file_record_ids),
+      })),
+    })
+    toast.success('项目指派已更新。')
+    showAssignmentDialog.value = false
+    resetAssignmentDialogState()
+    await loadProject()
+    await loadAssignmentEvents()
   } catch (error) {
-    toast.error(getErrorMessage(error, '任务指派失败。'))
+    toast.error(getErrorMessage(error, '项目指派保存失败。'))
   } finally {
     savingAssignment.value = false
   }
@@ -1041,6 +1300,9 @@ async function loadProject() {
     selectedFileIds.value = new Set<string>()
     statisticsSelectedFileIds.value = new Set<string>()
     statisticsResultFileIds.value = new Set<string>()
+    if (data.can_manage) {
+      void loadAssignmentEvents()
+    }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.load'))
   } finally {
@@ -1366,7 +1628,12 @@ onMounted(() => {
   document.addEventListener('click', handleDocumentClick)
   window.addEventListener('scroll', handleDocumentScroll, { passive: true })
   window.addEventListener('resize', handleDocumentScroll)
-  void loadProject()
+  void (async () => {
+    await loadProject()
+    if (route.query.assign === '1' && canManageProject.value) {
+      await openAssignmentDialog()
+    }
+  })()
   void loadUploadCapabilities()
 })
 
@@ -1841,6 +2108,42 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
+      <section v-if="activeTab === 'assignments'" class="panel">
+        <div class="pd-panel-head">
+          <div class="pd-panel-head__copy">
+            <div class="section-title section-title--tight">指派记录</div>
+            <p class="panel-subtitle">查看当前项目的指派、授权和取消记录。</p>
+          </div>
+          <button class="button" type="button" :disabled="assignmentEventsLoading" @click="loadAssignmentEvents">
+            <Loader2 v-if="assignmentEventsLoading" class="lucide-spin" :size="14" />
+            <RotateCcw v-else :size="14" />
+            刷新
+          </button>
+        </div>
+
+        <div v-if="assignmentEventsLoading" class="empty-state issue-empty">
+          正在加载指派记录...
+        </div>
+        <div v-else-if="assignmentEvents.length === 0" class="empty-state issue-empty">
+          暂无指派记录
+        </div>
+        <div v-else class="assignment-event-list">
+          <article v-for="event in assignmentEvents" :key="event.id" class="assignment-event-item">
+            <div class="assignment-event-item__main">
+              <strong>{{ getAssignmentEventActionLabel(event.action) }}</strong>
+              <span>
+                {{ event.file_record_name || '项目级' }} ·
+                {{ getAssigneeDisplayName(event.assignee) || '--' }}
+              </span>
+            </div>
+            <div class="assignment-event-item__meta">
+              <span>操作人：{{ getAssigneeDisplayName(event.actor) || '--' }}</span>
+              <span>{{ formatDateText(event.created_at) }}</span>
+            </div>
+          </article>
+        </div>
+      </section>
+
       <section v-if="activeTab === 'files'" class="panel">
         <div class="pd-panel-head">
           <div class="pd-panel-head__copy">
@@ -1917,7 +2220,7 @@ onBeforeUnmount(() => {
               class="button"
               type="button"
               :disabled="!canAssignSelectedFile"
-              :title="assignmentButtonTitle || undefined"
+              :title="undefined"
               @click="openAssignmentDialog()"
             >
               <Users :size="14" />
@@ -2019,7 +2322,7 @@ onBeforeUnmount(() => {
 
           <template #taskManage="{ row }">
             <div class="pd-task-cell">
-              <span class="pd-assignee" :class="{ 'is-empty': !row.assignee }">
+              <span class="pd-assignee" :class="{ 'is-empty': !(row.assignees?.length || row.assignee) }">
                 {{ getAssigneeLabel(row) }}
               </span>
               <div class="pd-task-links">
@@ -2316,30 +2619,214 @@ onBeforeUnmount(() => {
     <Modal
       :open="showAssignmentDialog"
       title="分配任务"
-      :description="assignmentTarget ? `为 ${assignmentTarget.filename} 选择负责人` : ''"
-      width="min(520px, calc(100vw - 32px))"
+      width="min(980px, calc(100vw - 32px))"
       :close-on-overlay="!savingAssignment"
       :close-on-esc="!savingAssignment"
       @close="closeAssignmentDialog"
     >
-      <div class="pd-assignment-dialog">
-        <label class="field field--full">
-          <span class="field__label">负责人</span>
-          <select
-            v-model="assignmentAssigneeId"
-            class="field__control"
-            :disabled="loadingAssignableUsers || savingAssignment"
-          >
-            <option value="">未分配</option>
-            <option v-for="user in assignableUsers" :key="user.id" :value="user.id">
-              {{ getAssigneeDisplayName(user) }} · {{ getTranslatorTypeLabel(user) }}
-            </option>
-          </select>
-        </label>
-        <p v-if="loadingAssignableUsers" class="hint-text">正在加载译者列表...</p>
-        <p v-else-if="assignableUsers.length === 0" class="form-message is-error">
-          暂无可分配的启用译者账号。
-        </p>
+      <div class="pd-assignment-dialog pd-assignment-dialog--project">
+        <aside class="pd-assignment-panel pd-assignment-users">
+          <div class="pd-assignment-panel__head">
+            <div>
+              <strong>译者</strong>
+              <span>{{ filteredAssignableUsers.length }} / {{ assignableUsers.length }}</span>
+            </div>
+          </div>
+
+          <label class="pd-assignment-search">
+            <Search :size="14" />
+            <input
+              v-model="assignmentUserSearch"
+              type="search"
+              placeholder="搜索昵称、用户名或译者类型"
+              :disabled="loadingAssignableUsers || loadingAssignments || savingAssignment"
+            />
+            <button
+              v-if="assignmentUserSearch"
+              class="pd-assignment-clear"
+              type="button"
+              aria-label="清空搜索"
+              :disabled="loadingAssignableUsers || loadingAssignments || savingAssignment"
+              @mouseenter="showAssignmentTooltip($event, '清空搜索')"
+              @mousemove="updateAssignmentTooltipPosition"
+              @mouseleave="hideAssignmentTooltip"
+              @click="assignmentUserSearch = ''"
+            >
+              <X :size="13" />
+            </button>
+          </label>
+
+          <div class="pd-assignment-filter-row">
+            <select
+              v-model="assignmentUserTypeFilter"
+              class="pd-assignment-filter-select"
+              aria-label="译者类型筛选"
+              :disabled="loadingAssignableUsers || loadingAssignments || savingAssignment"
+            >
+              <option value="all">全部译者类型</option>
+              <option value="internal">内部译者</option>
+              <option value="external">外部译者</option>
+            </select>
+            <select
+              v-model="assignmentUserStateFilter"
+              class="pd-assignment-filter-select"
+              aria-label="译者选择状态筛选"
+              :disabled="loadingAssignableUsers || loadingAssignments || savingAssignment"
+            >
+              <option value="all">全部选择状态</option>
+              <option value="selected">已选择</option>
+              <option value="unselected">未选择</option>
+            </select>
+          </div>
+
+          <p v-if="loadingAssignableUsers || loadingAssignments" class="hint-text pd-assignment-state">
+            正在加载指派信息...
+          </p>
+          <p v-else-if="assignableUsers.length === 0" class="form-message is-error pd-assignment-state">
+            暂无可分配的启用译者账号。
+          </p>
+          <p v-else-if="filteredAssignableUsers.length === 0" class="pd-assignment-state">
+            没有符合条件的译者
+          </p>
+          <div v-else class="pd-assignment-user-list">
+            <button
+              v-for="user in filteredAssignableUsers"
+              :key="user.id"
+              class="pd-assignment-user"
+              :class="{ 'is-active': isUserInAssignmentDraft(user.id) }"
+              type="button"
+              :disabled="savingAssignment"
+              @mouseenter="showAssignmentTooltip($event, getAssigneeTooltip(user))"
+              @mousemove="updateAssignmentTooltipPosition"
+              @mouseleave="hideAssignmentTooltip"
+              @click="toggleAssignmentUser(user)"
+            >
+              <span>{{ getAssigneeDisplayName(user) }}</span>
+              <small>{{ getAssigneeSecondaryLabel(user) }}</small>
+            </button>
+          </div>
+        </aside>
+
+        <section class="pd-assignment-panel pd-assignment-files">
+          <div class="pd-assignment-panel__head pd-assignment-panel__head--files">
+            <div>
+              <strong>文件授权</strong>
+              <span>已选择 {{ assignmentDrafts.length }} 位译者</span>
+            </div>
+            <span>{{ tableRows.length }} 个文件</span>
+          </div>
+
+          <div class="pd-assignment-file-toolbar">
+            <label class="pd-assignment-search pd-assignment-search--files">
+              <Search :size="14" />
+              <input
+                v-model="assignmentFileSearch"
+                type="search"
+                placeholder="搜索文件名"
+                :disabled="savingAssignment || assignmentDrafts.length === 0"
+              />
+              <button
+                v-if="assignmentFileSearch"
+                class="pd-assignment-clear"
+                type="button"
+                aria-label="清空搜索"
+                :disabled="savingAssignment"
+                @mouseenter="showAssignmentTooltip($event, '清空搜索')"
+                @mousemove="updateAssignmentTooltipPosition"
+                @mouseleave="hideAssignmentTooltip"
+                @click="assignmentFileSearch = ''"
+              >
+                <X :size="13" />
+              </button>
+            </label>
+            <select
+              v-model="assignmentFileStateFilter"
+              class="pd-assignment-filter-select"
+              aria-label="文件授权状态筛选"
+              :disabled="savingAssignment || assignmentDrafts.length === 0"
+            >
+              <option value="all">全部文件</option>
+              <option value="checked">已授权</option>
+              <option value="unchecked">未授权</option>
+            </select>
+          </div>
+
+          <div v-if="assignmentDrafts.length === 0" class="empty-state pd-assignment-empty">
+            请选择至少一位译者。
+          </div>
+          <div v-else class="pd-assignment-file-groups">
+            <section
+              v-for="draft in assignmentDrafts"
+              :key="draft.assignee_id"
+              class="pd-assignment-file-group"
+            >
+              <div class="pd-assignment-file-group__head">
+                <div class="pd-assignment-file-group__title">
+                  <strong>{{ getAssignmentUserName(draft.assignee_id) }}</strong>
+                  <span>
+                    已授权 {{ draft.file_record_ids.size }} 个文件 · 当前筛选 {{ getFilteredAssignmentFiles(draft).length }} 个
+                  </span>
+                </div>
+                <div class="pd-assignment-file-group__actions">
+                  <button
+                    class="button pd-assignment-file-action"
+                    type="button"
+                    :disabled="savingAssignment || getFilteredAssignmentFiles(draft).length === 0"
+                    @click="selectFilteredAssignmentFiles(draft.assignee_id)"
+                  >
+                    <Check :size="13" />
+                    全选筛选结果
+                  </button>
+                  <button
+                    class="button pd-assignment-file-action"
+                    type="button"
+                    :disabled="savingAssignment || getFilteredAssignmentFiles(draft).length === 0"
+                    @click="clearFilteredAssignmentFiles(draft.assignee_id)"
+                  >
+                    <X :size="13" />
+                    清空筛选结果
+                  </button>
+                </div>
+              </div>
+
+              <p v-if="tableRows.length === 0" class="hint-text pd-assignment-mini-empty">
+                当前项目暂无文件，译者会先获得项目可见性。
+              </p>
+              <p v-else-if="getFilteredAssignmentFiles(draft).length === 0" class="pd-assignment-mini-empty">
+                没有符合条件的文件
+              </p>
+              <div v-else class="pd-assignment-file-list">
+                <label
+                  v-for="file in getFilteredAssignmentFiles(draft)"
+                  :key="`${draft.assignee_id}-${file.id}`"
+                  class="pd-assignment-file-option"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="isFileCheckedForUser(draft.assignee_id, file.id)"
+                  :disabled="savingAssignment"
+                  @change="toggleAssignmentFile(draft.assignee_id, file.id)"
+                />
+                  <span
+                    @mouseenter="showAssignmentTooltip($event, file.filename)"
+                    @mousemove="updateAssignmentTooltipPosition"
+                    @mouseleave="hideAssignmentTooltip"
+                  >
+                    {{ file.filename }}
+                  </span>
+                </label>
+              </div>
+            </section>
+          </div>
+        </section>
+      </div>
+      <div
+        v-if="assignmentTooltipText"
+        class="pd-assignment-tooltip"
+        :style="assignmentTooltipStyle"
+        role="tooltip"
+      >
+        {{ assignmentTooltipText }}
       </div>
 
       <template #footer>
@@ -2349,7 +2836,7 @@ onBeforeUnmount(() => {
         <button
           class="button button--primary"
           type="button"
-          :disabled="savingAssignment || loadingAssignableUsers"
+          :disabled="savingAssignment || loadingAssignableUsers || loadingAssignments"
           @click="saveAssignment"
         >
           <Loader2 v-if="savingAssignment" class="lucide-spin" :size="14" />
@@ -3348,6 +3835,420 @@ onBeforeUnmount(() => {
   gap: 12px;
 }
 
+.pd-assignment-dialog--project {
+  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
+  align-items: stretch;
+  gap: 16px;
+  min-height: min(560px, calc(100vh - 220px));
+}
+
+.pd-assignment-users,
+.pd-assignment-files {
+  min-height: 360px;
+  max-height: min(600px, calc(100vh - 220px));
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+}
+
+.pd-assignment-users {
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+  gap: 8px;
+  padding: 10px;
+}
+
+.pd-assignment-panel__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.pd-assignment-panel__head > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.pd-assignment-panel__head strong {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-assignment-panel__head span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.pd-assignment-panel__head--files {
+  align-items: center;
+}
+
+.pd-assignment-search {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-1);
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.pd-assignment-search:focus-within {
+  border-color: color-mix(in srgb, var(--brand-700) 45%, var(--line-strong));
+  box-shadow: var(--focus-ring);
+}
+
+.pd-assignment-search input {
+  min-width: 0;
+  width: 100%;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text-primary);
+}
+
+.pd-assignment-search input::placeholder {
+  color: var(--text-placeholder);
+}
+
+.pd-assignment-search input:disabled {
+  cursor: not-allowed;
+}
+
+.pd-assignment-clear {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  box-shadow: none;
+}
+
+.pd-assignment-clear:hover:not(:disabled) {
+  background: var(--surface-muted);
+  color: var(--text-primary);
+}
+
+.pd-assignment-filter-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.pd-assignment-filter-select {
+  min-width: 0;
+  width: 100%;
+  min-height: 36px;
+  padding: 0 28px 0 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-muted);
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.pd-assignment-filter-select:focus {
+  outline: none;
+  border-color: var(--brand-700);
+  background: var(--surface-panel);
+  box-shadow: var(--focus-ring);
+}
+
+.pd-assignment-state {
+  display: grid;
+  place-items: center;
+  min-height: 90px;
+  margin: 0;
+  padding: 12px;
+  border: 1px dashed var(--line-soft);
+  border-radius: 8px;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.pd-assignment-user-list {
+  min-height: 0;
+  display: grid;
+  grid-auto-rows: minmax(64px, auto);
+  align-content: start;
+  gap: 6px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.pd-assignment-user {
+  position: relative;
+  display: grid;
+  align-content: center;
+  gap: 4px;
+  justify-items: start;
+  min-height: 64px;
+  width: 100%;
+  padding: 10px 36px 10px 12px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  box-shadow: none;
+}
+
+.pd-assignment-user:hover:not(:disabled) {
+  border-color: var(--line-soft);
+  background: var(--surface-muted);
+  color: var(--text-primary);
+}
+
+.pd-assignment-user.is-active {
+  border-color: color-mix(in srgb, var(--brand-700) 58%, var(--line-strong));
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--brand-700) 12%, transparent), transparent 34%),
+    color-mix(in srgb, var(--brand-100) 74%, var(--surface-panel));
+  color: var(--text-primary);
+  box-shadow:
+    inset 4px 0 0 var(--brand-700),
+    0 0 0 1px color-mix(in srgb, var(--brand-700) 14%, transparent);
+}
+
+.pd-assignment-user.is-active::after {
+  content: "✓";
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: var(--brand-700);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.pd-assignment-user.is-active:hover:not(:disabled) {
+  border-color: var(--brand-700);
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--brand-700) 16%, transparent), transparent 36%),
+    color-mix(in srgb, var(--brand-100) 86%, var(--surface-panel));
+}
+
+.pd-assignment-user span {
+  max-width: 100%;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.pd-assignment-user small {
+  max-width: 100%;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.pd-assignment-files {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 10px;
+  padding: 12px;
+}
+
+.pd-assignment-file-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(132px, 160px);
+  gap: 8px;
+  align-items: center;
+}
+
+.pd-assignment-file-groups {
+  min-height: 0;
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.pd-assignment-empty {
+  min-height: 220px;
+}
+
+.pd-assignment-file-group {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-1);
+}
+
+.pd-assignment-file-group__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.pd-assignment-file-group__title {
+  min-width: 160px;
+  display: grid;
+  flex: 1 1 180px;
+  gap: 2px;
+}
+
+.pd-assignment-file-group__title strong {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-assignment-file-group__title span {
+  overflow: hidden;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-assignment-file-group__actions {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.pd-assignment-file-action {
+  min-height: 30px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.2;
+  box-shadow: none;
+}
+
+.pd-assignment-file-list {
+  display: grid;
+  gap: 4px;
+  max-height: 240px;
+  overflow: auto;
+  padding: 2px;
+}
+
+.pd-assignment-file-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-height: 30px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.pd-assignment-file-option:hover {
+  background: var(--surface-muted);
+}
+
+.pd-assignment-file-option span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.pd-assignment-mini-empty {
+  display: grid;
+  place-items: center;
+  min-height: 58px;
+  margin: 0;
+  padding: 10px;
+  border: 1px dashed var(--line-soft);
+  border-radius: 8px;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.pd-assignment-tooltip {
+  position: fixed;
+  z-index: 10000;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--brand-700) 54%, var(--line-strong));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-panel) 96%, var(--brand-050));
+  color: var(--text-primary);
+  box-shadow: 0 10px 28px rgba(17, 49, 42, 0.16);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+  white-space: normal;
+}
+
+.assignment-event-list {
+  display: grid;
+  gap: 10px;
+}
+
+.assignment-event-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+}
+
+.assignment-event-item__main,
+.assignment-event-item__meta {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.assignment-event-item__main strong {
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.assignment-event-item__main span,
+.assignment-event-item__meta {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 .pd-upload-dialog {
   display: grid;
   gap: 16px;
@@ -3598,6 +4499,39 @@ onBeforeUnmount(() => {
   .pd-settings-row--name {
     grid-template-columns: 1fr;
     align-items: stretch;
+  }
+
+  .pd-assignment-dialog--project {
+    grid-template-columns: 1fr;
+    min-height: 0;
+  }
+
+  .pd-assignment-users,
+  .pd-assignment-files {
+    min-height: 0;
+    max-height: none;
+  }
+
+  .pd-assignment-users {
+    max-height: 340px;
+  }
+
+  .pd-assignment-files {
+    max-height: 520px;
+  }
+
+  .pd-assignment-filter-row,
+  .pd-assignment-file-toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .pd-assignment-file-group__actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .pd-assignment-file-action {
+    flex: 1 1 140px;
   }
 
   .pd-settings-control,

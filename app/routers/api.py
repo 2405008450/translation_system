@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import case, func, or_
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from app.auth import (
     USER_ROLE,
@@ -36,11 +36,15 @@ from app.auth import (
 from app.config import get_settings
 from app.database import SessionLocal, get_db
 from app.models import (
+    AssignmentEvent,
+    FileAssignment,
     FileRecord,
     IssueMarker,
     MemoryBase,
     MemoryEntry,
+    Notification,
     Project,
+    ProjectAssignment,
     Segment,
     SegmentRevision,
     TMCollection,
@@ -880,6 +884,15 @@ class FileRecordAssignmentRequest(BaseModel):
     assignee_id: UUID | None = None
 
 
+class ProjectAssignmentEntryRequest(BaseModel):
+    assignee_id: UUID
+    file_record_ids: list[UUID] = Field(default_factory=list)
+
+
+class ProjectAssignmentsRequest(BaseModel):
+    assignments: list[ProjectAssignmentEntryRequest] = Field(default_factory=list)
+
+
 class SaveToTMRequest(BaseModel):
     collection_id: UUID | None = None
     collection_mode: Literal["existing", "new"] = "existing"
@@ -977,16 +990,83 @@ def _can_manage_workflow(current_user: User | None) -> bool:
     return is_admin_role(getattr(current_user, "role", None))
 
 
-def _can_read_file_record(file_record: FileRecord, current_user: User | None) -> bool:
+ASSIGNMENT_STATUS_ACTIVE = "active"
+ASSIGNMENT_STATUS_REVOKED = "revoked"
+ASSIGNMENT_EVENT_PROJECT_ASSIGNED = "project_assigned"
+ASSIGNMENT_EVENT_PROJECT_UNASSIGNED = "project_unassigned"
+ASSIGNMENT_EVENT_FILE_GRANTED = "file_permission_granted"
+ASSIGNMENT_EVENT_FILE_REVOKED = "file_permission_revoked"
+
+
+def _get_record_session(record: Any) -> Session | None:
+    try:
+        return object_session(record)
+    except Exception:
+        return None
+
+
+def _has_active_project_assignment(db: Session | None, project_id: UUID | None, user_id: UUID | None) -> bool:
+    if db is None or project_id is None or user_id is None:
+        return False
+    return (
+        db.query(ProjectAssignment.id)
+        .filter(
+            ProjectAssignment.project_id == project_id,
+            ProjectAssignment.assignee_id == user_id,
+            ProjectAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+        )
+        .first()
+        is not None
+    )
+
+
+def _has_active_file_assignment(db: Session | None, file_record: FileRecord, user_id: UUID | None) -> bool:
+    if db is None or user_id is None:
+        return False
+    if not _has_active_project_assignment(db, file_record.project_id, user_id):
+        return False
+    return (
+        db.query(FileAssignment.id)
+        .filter(
+            FileAssignment.file_record_id == file_record.id,
+            FileAssignment.assignee_id == user_id,
+            FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+        )
+        .first()
+        is not None
+    )
+
+
+def _can_read_project(project: Project, current_user: User | None, db: Session | None = None) -> bool:
     if current_user is None:
         return False
     if can_access_all_projects(current_user):
         return True
-    return file_record.assignee_id == current_user.id
+    session = db or _get_record_session(project)
+    return _has_active_project_assignment(session, project.id, current_user.id)
 
 
-def _can_write_file_record(file_record: FileRecord, current_user: User | None) -> bool:
-    return _can_read_file_record(file_record, current_user)
+def _require_project_read_access(project: Project, current_user: User, db: Session | None = None) -> None:
+    if not _can_read_project(project, current_user, db):
+        raise HTTPException(status_code=404, detail="项目不存在或未指派给当前用户。")
+
+
+def _can_read_file_record(file_record: FileRecord, current_user: User | None, db: Session | None = None) -> bool:
+    if current_user is None:
+        return False
+    if not hasattr(current_user, "id"):
+        return True
+    if can_access_all_projects(current_user):
+        return True
+    session = db or _get_record_session(file_record)
+    if session is not None:
+        return _has_active_file_assignment(session, file_record, current_user.id)
+    assignee_id = getattr(file_record, "assignee_id", None)
+    return assignee_id is None or assignee_id == current_user.id
+
+
+def _can_write_file_record(file_record: FileRecord, current_user: User | None, db: Session | None = None) -> bool:
+    return _can_read_file_record(file_record, current_user, db)
 
 
 def _require_file_record_read_access(file_record: FileRecord, current_user: User) -> None:
@@ -1003,26 +1083,264 @@ def _apply_project_visibility_filter(query, db: Session, current_user: User):
     if can_access_all_projects(current_user):
         return query
     assigned_project_ids = (
-        db.query(FileRecord.project_id)
+        db.query(ProjectAssignment.project_id)
         .filter(
-            FileRecord.assignee_id == current_user.id,
-            FileRecord.project_id.is_not(None),
+            ProjectAssignment.assignee_id == current_user.id,
+            ProjectAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
         )
         .distinct()
     )
     return query.filter(Project.id.in_(assigned_project_ids))
 
 
-def _visible_project_files(files: list[FileRecord], current_user: User) -> list[FileRecord]:
+def _visible_project_files(files: list[FileRecord], current_user: User, db: Session | None = None) -> list[FileRecord]:
     if can_access_all_projects(current_user):
         return files
-    return [file_record for file_record in files if file_record.assignee_id == current_user.id]
+    if not files:
+        return []
+    session = db or _get_record_session(files[0])
+    if session is None:
+        return [file_record for file_record in files if file_record.assignee_id == current_user.id]
+    file_ids = [file_record.id for file_record in files]
+    authorized_ids = {
+        row.file_record_id
+        for row in (
+            session.query(FileAssignment.file_record_id)
+            .filter(
+                FileAssignment.assignee_id == current_user.id,
+                FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+                FileAssignment.file_record_id.in_(file_ids),
+            )
+            .all()
+        )
+    }
+    return [file_record for file_record in files if file_record.id in authorized_ids]
 
 
 def _serialize_assignee(user: User | None) -> dict[str, Any] | None:
     if user is None:
         return None
     return serialize_user(user)
+
+
+def _get_active_project_assignees(db: Session, project_ids: list[UUID]) -> dict[UUID, list[User]]:
+    if not project_ids:
+        return {}
+    rows = (
+        db.query(ProjectAssignment.project_id, User)
+        .join(User, User.id == ProjectAssignment.assignee_id)
+        .filter(
+            ProjectAssignment.project_id.in_(project_ids),
+            ProjectAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+        )
+        .order_by(ProjectAssignment.assigned_at.asc(), User.username.asc())
+        .all()
+    )
+    result: dict[UUID, list[User]] = {}
+    for project_id, user in rows:
+        result.setdefault(project_id, []).append(user)
+    return result
+
+
+def _get_active_file_assignees(db: Session, file_record_ids: list[UUID]) -> dict[UUID, list[User]]:
+    if not file_record_ids:
+        return {}
+    rows = (
+        db.query(FileAssignment.file_record_id, User)
+        .join(User, User.id == FileAssignment.assignee_id)
+        .filter(
+            FileAssignment.file_record_id.in_(file_record_ids),
+            FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+        )
+        .order_by(FileAssignment.assigned_at.asc(), User.username.asc())
+        .all()
+    )
+    result: dict[UUID, list[User]] = {}
+    for file_record_id, user in rows:
+        result.setdefault(file_record_id, []).append(user)
+    return result
+
+
+def _serialize_user_list(users: list[User] | None) -> list[dict[str, Any]]:
+    return [serialize_user(user) for user in (users or [])]
+
+
+def _json_dumps(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _serialize_assignment_event(event: AssignmentEvent) -> dict[str, Any]:
+    return {
+        "id": str(event.id),
+        "project_id": str(event.project_id),
+        "project_name": event.project.name if event.project else None,
+        "file_record_id": str(event.file_record_id) if event.file_record_id else None,
+        "file_record_name": event.file_record.filename if event.file_record else None,
+        "assignee_id": str(event.assignee_id),
+        "assignee": _serialize_assignee(event.assignee),
+        "actor_id": str(event.actor_id) if event.actor_id else None,
+        "actor": _serialize_assignee(event.actor),
+        "action": event.action,
+        "before_payload": json.loads(event.before_payload or "{}"),
+        "after_payload": json.loads(event.after_payload or "{}"),
+        "created_at": event.created_at.isoformat(),
+    }
+
+
+def _serialize_notification(notification: Notification) -> dict[str, Any]:
+    return {
+        "id": str(notification.id),
+        "type": notification.type,
+        "title": notification.title,
+        "body": notification.body,
+        "project_id": str(notification.project_id) if notification.project_id else None,
+        "project_name": notification.project.name if notification.project else None,
+        "file_record_id": str(notification.file_record_id) if notification.file_record_id else None,
+        "file_record_name": notification.file_record.filename if notification.file_record else None,
+        "related_event_id": str(notification.related_event_id) if notification.related_event_id else None,
+        "read_at": notification.read_at.isoformat() if notification.read_at else None,
+        "created_at": notification.created_at.isoformat(),
+    }
+
+
+def _record_assignment_event(
+    db: Session,
+    *,
+    project_id: UUID,
+    assignee_id: UUID,
+    actor_id: UUID | None,
+    action: str,
+    file_record_id: UUID | None = None,
+    before_payload: dict[str, Any] | None = None,
+    after_payload: dict[str, Any] | None = None,
+) -> AssignmentEvent:
+    event = AssignmentEvent(
+        project_id=project_id,
+        file_record_id=file_record_id,
+        assignee_id=assignee_id,
+        actor_id=actor_id,
+        action=action,
+        before_payload=_json_dumps(before_payload or {}),
+        after_payload=_json_dumps(after_payload or {}),
+    )
+    db.add(event)
+    db.flush()
+    return event
+
+
+def _create_assignment_notification(
+    db: Session,
+    *,
+    user_id: UUID,
+    notification_type: str,
+    title: str,
+    body: str,
+    project_id: UUID | None = None,
+    file_record_id: UUID | None = None,
+    related_event_id: UUID | None = None,
+) -> Notification:
+    notification = Notification(
+        user_id=user_id,
+        type=notification_type,
+        title=title,
+        body=body,
+        project_id=project_id,
+        file_record_id=file_record_id,
+        related_event_id=related_event_id,
+    )
+    db.add(notification)
+    db.flush()
+    return notification
+
+
+def _get_project_or_404(db: Session, project_id: UUID) -> Project:
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    return project
+
+
+def _validate_assignment_payload(
+    db: Session,
+    project: Project,
+    payload: ProjectAssignmentsRequest,
+) -> dict[UUID, set[UUID]]:
+    project_file_ids = {
+        row.id
+        for row in db.query(FileRecord.id).filter(FileRecord.project_id == project.id).all()
+    }
+    desired: dict[UUID, set[UUID]] = {}
+    for entry in payload.assignments:
+        assignee = get_user_by_id(db, entry.assignee_id)
+        if assignee is None or not assignee.is_active or assignee.role != USER_ROLE:
+            raise HTTPException(status_code=400, detail="只能指派给启用中的普通译者账号。")
+        file_ids = set(entry.file_record_ids or [])
+        invalid_file_ids = file_ids - project_file_ids
+        if invalid_file_ids:
+            raise HTTPException(status_code=400, detail="存在不属于当前项目的文件授权。")
+        desired.setdefault(assignee.id, set()).update(file_ids)
+    return desired
+
+
+def _sync_legacy_file_assignees(db: Session, project_id: UUID) -> None:
+    file_records = (
+        db.query(FileRecord)
+        .filter(FileRecord.project_id == project_id)
+        .order_by(FileRecord.created_at.asc(), FileRecord.id.asc())
+        .all()
+    )
+    for file_record in file_records:
+        first_assignment = (
+            db.query(FileAssignment)
+            .filter(
+                FileAssignment.file_record_id == file_record.id,
+                FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            )
+            .order_by(FileAssignment.assigned_at.asc(), FileAssignment.id.asc())
+            .first()
+        )
+        file_record.assignee_id = first_assignment.assignee_id if first_assignment else None
+        file_record.assigned_by_id = first_assignment.assigned_by_id if first_assignment else None
+        file_record.assigned_at = first_assignment.assigned_at if first_assignment else None
+
+
+def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, Any]:
+    assignments = (
+        db.query(ProjectAssignment)
+        .join(User, User.id == ProjectAssignment.assignee_id)
+        .filter(
+            ProjectAssignment.project_id == project_id,
+            ProjectAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+        )
+        .order_by(ProjectAssignment.assigned_at.asc(), User.username.asc())
+        .all()
+    )
+    file_rows = (
+        db.query(FileAssignment)
+        .filter(
+            FileAssignment.project_id == project_id,
+            FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+        )
+        .order_by(FileAssignment.assigned_at.asc(), FileAssignment.id.asc())
+        .all()
+    )
+    files_by_user: dict[UUID, list[str]] = {}
+    for file_assignment in file_rows:
+        files_by_user.setdefault(file_assignment.assignee_id, []).append(str(file_assignment.file_record_id))
+    return {
+        "project_id": str(project_id),
+        "assignments": [
+            {
+                "id": str(assignment.id),
+                "assignee_id": str(assignment.assignee_id),
+                "assignee": serialize_user(assignment.assignee),
+                "file_record_ids": files_by_user.get(assignment.assignee_id, []),
+                "assigned_by_id": str(assignment.assigned_by_id) if assignment.assigned_by_id else None,
+                "assigned_at": assignment.assigned_at.isoformat(),
+            }
+            for assignment in assignments
+        ],
+    }
 
 
 @router.get("/analytics/dashboard")
@@ -1036,6 +1354,116 @@ def get_analytics_dashboard(
         raise HTTPException(status_code=403, detail="当前账号无权查看全局数据看板。")
     background_tasks.add_task(run_analytics_backfill_once)
     return get_dashboard_payload(db, granularity=granularity)
+
+
+@router.get("/notifications")
+def list_notifications(
+    unread_only: bool = False,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from sqlalchemy.orm import joinedload
+
+    safe_limit = min(max(limit, 1), 100)
+    query = (
+        db.query(Notification)
+        .options(
+            joinedload(Notification.project),
+            joinedload(Notification.file_record),
+        )
+        .filter(Notification.user_id == current_user.id)
+    )
+    if unread_only:
+        query = query.filter(Notification.read_at.is_(None))
+    notifications = (
+        query.order_by(Notification.created_at.desc())
+        .limit(safe_limit)
+        .all()
+    )
+    unread_count = (
+        db.query(Notification.id)
+        .filter(Notification.user_id == current_user.id, Notification.read_at.is_(None))
+        .count()
+    )
+    return {
+        "items": [_serialize_notification(notification) for notification in notifications],
+        "unread_count": unread_count,
+    }
+
+
+@router.patch("/notifications/read-all")
+def mark_all_notifications_read(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    now = datetime.utcnow()
+    (
+        db.query(Notification)
+        .filter(Notification.user_id == current_user.id, Notification.read_at.is_(None))
+        .update({Notification.read_at: now}, synchronize_session=False)
+    )
+    db.commit()
+    return {"read_at": now.isoformat()}
+
+
+@router.patch("/notifications/{notification_id}/read")
+def mark_notification_read(
+    notification_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    notification = (
+        db.query(Notification)
+        .filter(Notification.id == notification_id, Notification.user_id == current_user.id)
+        .first()
+    )
+    if notification is None:
+        raise HTTPException(status_code=404, detail="消息不存在。")
+    if notification.read_at is None:
+        notification.read_at = datetime.utcnow()
+        db.commit()
+        db.refresh(notification)
+    return _serialize_notification(notification)
+
+
+@router.get("/assignment-events")
+def list_assignment_events(
+    project_id: UUID | None = None,
+    assignee_id: UUID | None = None,
+    action: str | None = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    from sqlalchemy.orm import joinedload
+
+    safe_limit = min(max(limit, 1), 300)
+    query = db.query(AssignmentEvent).options(
+        joinedload(AssignmentEvent.project),
+        joinedload(AssignmentEvent.file_record),
+        joinedload(AssignmentEvent.assignee),
+        joinedload(AssignmentEvent.actor),
+    )
+    if project_id is not None:
+        query = query.filter(AssignmentEvent.project_id == project_id)
+    if assignee_id is not None:
+        query = query.filter(AssignmentEvent.assignee_id == assignee_id)
+    if action:
+        query = query.filter(AssignmentEvent.action == action)
+    events = query.order_by(AssignmentEvent.created_at.desc()).limit(safe_limit).all()
+    return {"items": [_serialize_assignment_event(event) for event in events]}
+
+
+@router.get("/projects/{project_id}/assignment-events")
+def list_project_assignment_events(
+    project_id: UUID,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    _get_project_or_404(db, project_id)
+    return list_assignment_events(project_id=project_id, limit=limit, db=db)
 
 
 def _build_binary_download_response(
@@ -2077,6 +2505,7 @@ def _build_project_summary_payload(
     creator_name: str | None = None,
     issue_stats: dict[str, int] | None = None,
     current_user: User | None = None,
+    assigned_users: list[User] | None = None,
 ) -> dict:
     progress = calculate_file_record_progress(total_segments, translated_segments)
     effective_status = (
@@ -2085,7 +2514,6 @@ def _build_project_summary_payload(
         else project.status
     )
     issue_stats = issue_stats or {"issue_count": 0, "open_issue_count": 0}
-
     return {
         "id": str(project.id),
         "name": project.name,
@@ -2103,6 +2531,7 @@ def _build_project_summary_payload(
         "file_count": file_count,
         "issue_count": issue_stats.get("issue_count", 0),
         "open_issue_count": issue_stats.get("open_issue_count", 0),
+        "assigned_users": _serialize_user_list(assigned_users),
         "can_manage": _can_manage_workflow(current_user),
         "can_write": bool(current_user) and (can_access_all_projects(current_user) or file_count > 0),
         "created_at": project.created_at.isoformat(),
@@ -2116,9 +2545,18 @@ def _build_project_file_payload(
     translated_segments: int,
     issue_stats: dict[str, int] | None = None,
     current_user: User | None = None,
+    assignees: list[User] | None = None,
 ) -> dict:
     source_bytes = load_file_record_source(file_record)
-    operation_state = serialize_file_operation_state(file_record)
+    operation_state = (
+        serialize_file_operation_state(file_record)
+        if hasattr(file_record, "active_operation")
+        else {
+            "active_operation": None,
+            "active_operation_message": "",
+            "is_edit_locked": False,
+        }
+    )
     progress = calculate_file_record_progress(total_segments, translated_segments)
     effective_status = resolve_file_record_status(
         file_record.status,
@@ -2126,6 +2564,10 @@ def _build_project_file_payload(
         translated_segments=translated_segments,
     )
     issue_stats = issue_stats or {"issue_count": 0, "open_issue_count": 0}
+    assignee_id = getattr(file_record, "assignee_id", None)
+    assignee = getattr(file_record, "assignee", None)
+    assigned_at = getattr(file_record, "assigned_at", None)
+    deadline = getattr(file_record, "deadline", None)
 
     return {
         "id": str(file_record.id),
@@ -2141,10 +2583,11 @@ def _build_project_file_payload(
         "source_language": file_record.source_language,
         "target_language": file_record.target_language,
         "creator": get_user_display_name(file_record.creator) if file_record.creator else None,
-        "assignee_id": str(file_record.assignee_id) if file_record.assignee_id else None,
-        "assignee": _serialize_assignee(file_record.assignee),
-        "assigned_at": file_record.assigned_at.isoformat() if file_record.assigned_at else None,
-        "deadline": file_record.deadline.isoformat() if file_record.deadline else None,
+        "assignee_id": str(assignee_id) if assignee_id else None,
+        "assignee": _serialize_assignee(assignee),
+        "assignees": _serialize_user_list(assignees),
+        "assigned_at": assigned_at.isoformat() if assigned_at else None,
+        "deadline": deadline.isoformat() if deadline else None,
         "access_level": file_record.access_level,
         "created_at": file_record.created_at.isoformat(),
         "updated_at": file_record.updated_at.isoformat(),
@@ -2206,7 +2649,13 @@ def _get_project_stats(
         .filter(FileRecord.project_id.in_(project_ids))
     )
     if current_user is not None and is_external_translator(current_user):
-        query = query.filter(FileRecord.assignee_id == current_user.id)
+        query = query.join(
+            FileAssignment,
+            FileAssignment.file_record_id == FileRecord.id,
+        ).filter(
+            FileAssignment.assignee_id == current_user.id,
+            FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+        )
     stats_rows = query.group_by(FileRecord.project_id).all()
     return {
         row.project_id: {
@@ -2238,10 +2687,12 @@ def _get_project_issue_stats(
     )
     if current_user is not None and is_external_translator(current_user):
         assigned_file_ids = (
-            db.query(FileRecord.id)
+            db.query(FileAssignment.file_record_id)
+            .join(FileRecord, FileRecord.id == FileAssignment.file_record_id)
             .filter(
                 FileRecord.project_id.in_(project_ids),
-                FileRecord.assignee_id == current_user.id,
+                FileAssignment.assignee_id == current_user.id,
+                FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
             )
         )
         query = query.filter(IssueMarker.file_record_id.in_(assigned_file_ids))
@@ -2289,6 +2740,8 @@ def _build_project_detail_payload(
     project_issue_stats: dict[str, int] | None = None,
     file_issue_stats: dict[UUID, dict[str, int]] | None = None,
     current_user: User | None = None,
+    assigned_users: list[User] | None = None,
+    file_assignees: dict[UUID, list[User]] | None = None,
 ) -> dict:
     total_segments = sum(file_stats.get(file.id, {"total": 0})["total"] for file in files)
     translated_segments = sum(file_stats.get(file.id, {"filled": 0})["filled"] for file in files)
@@ -2301,7 +2754,9 @@ def _build_project_detail_payload(
         creator_name=get_user_display_name(project.creator),
         issue_stats=project_issue_stats,
         current_user=current_user,
+        assigned_users=assigned_users,
     )
+    file_assignees = file_assignees or {}
     payload["files"] = [
         _build_project_file_payload(
             file_record=file_record,
@@ -2309,6 +2764,7 @@ def _build_project_detail_payload(
             translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
             issue_stats=file_issue_stats.get(file_record.id),
             current_user=current_user,
+            assignees=file_assignees.get(file_record.id),
         )
         for file_record in files
     ]
@@ -2322,6 +2778,182 @@ def _build_project_detail_payload(
         for file_item in payload["files"]
     ) or None
     return payload
+
+
+@router.get("/projects/{project_id}/assignments")
+def get_project_assignments(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    _get_project_or_404(db, project_id)
+    return _serialize_project_assignments(db, project_id)
+
+
+@router.patch("/projects/{project_id}/assignments")
+def update_project_assignments(
+    project_id: UUID,
+    payload: ProjectAssignmentsRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    project = _get_project_or_404(db, project_id)
+    desired = _validate_assignment_payload(db, project, payload)
+    now = datetime.utcnow()
+
+    current_project_assignments = {
+        assignment.assignee_id: assignment
+        for assignment in (
+            db.query(ProjectAssignment)
+            .filter(
+                ProjectAssignment.project_id == project_id,
+                ProjectAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            )
+            .all()
+        )
+    }
+    current_file_assignments: dict[UUID, dict[UUID, FileAssignment]] = {}
+    for assignment in (
+        db.query(FileAssignment)
+        .filter(
+            FileAssignment.project_id == project_id,
+            FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+        )
+        .all()
+    ):
+        current_file_assignments.setdefault(assignment.assignee_id, {})[assignment.file_record_id] = assignment
+
+    for assignee_id, assignment in list(current_project_assignments.items()):
+        if assignee_id in desired:
+            continue
+        assignment.status = ASSIGNMENT_STATUS_REVOKED
+        assignment.revoked_by_id = current_user.id
+        assignment.revoked_at = now
+        event = _record_assignment_event(
+            db,
+            project_id=project_id,
+            assignee_id=assignee_id,
+            actor_id=current_user.id,
+            action=ASSIGNMENT_EVENT_PROJECT_UNASSIGNED,
+            before_payload={"project_id": str(project_id), "status": ASSIGNMENT_STATUS_ACTIVE},
+            after_payload={"project_id": str(project_id), "status": ASSIGNMENT_STATUS_REVOKED},
+        )
+        _create_assignment_notification(
+            db,
+            user_id=assignee_id,
+            notification_type=ASSIGNMENT_EVENT_PROJECT_UNASSIGNED,
+            title="项目指派已取消",
+            body=f"你已不再负责项目「{project.name}」。",
+            project_id=project_id,
+            related_event_id=event.id,
+        )
+        for file_assignment in current_file_assignments.get(assignee_id, {}).values():
+            file_assignment.status = ASSIGNMENT_STATUS_REVOKED
+            file_assignment.revoked_by_id = current_user.id
+            file_assignment.revoked_at = now
+            _record_assignment_event(
+                db,
+                project_id=project_id,
+                file_record_id=file_assignment.file_record_id,
+                assignee_id=assignee_id,
+                actor_id=current_user.id,
+                action=ASSIGNMENT_EVENT_FILE_REVOKED,
+                before_payload={"file_record_id": str(file_assignment.file_record_id), "status": ASSIGNMENT_STATUS_ACTIVE},
+                after_payload={"file_record_id": str(file_assignment.file_record_id), "status": ASSIGNMENT_STATUS_REVOKED},
+            )
+
+    for assignee_id, desired_file_ids in desired.items():
+        project_assignment = current_project_assignments.get(assignee_id)
+        if project_assignment is None:
+            project_assignment = ProjectAssignment(
+                project_id=project_id,
+                assignee_id=assignee_id,
+                assigned_by_id=current_user.id,
+                assigned_at=now,
+                status=ASSIGNMENT_STATUS_ACTIVE,
+            )
+            db.add(project_assignment)
+            event = _record_assignment_event(
+                db,
+                project_id=project_id,
+                assignee_id=assignee_id,
+                actor_id=current_user.id,
+                action=ASSIGNMENT_EVENT_PROJECT_ASSIGNED,
+                before_payload={"project_id": str(project_id), "status": None},
+                after_payload={"project_id": str(project_id), "status": ASSIGNMENT_STATUS_ACTIVE},
+            )
+            _create_assignment_notification(
+                db,
+                user_id=assignee_id,
+                notification_type=ASSIGNMENT_EVENT_PROJECT_ASSIGNED,
+                title="你收到了新的项目指派",
+                body=f"项目「{project.name}」已分配给你。",
+                project_id=project_id,
+                related_event_id=event.id,
+            )
+
+        active_file_assignments = current_file_assignments.get(assignee_id, {})
+        active_file_ids = set(active_file_assignments)
+        for file_record_id in sorted(desired_file_ids - active_file_ids, key=str):
+            file_assignment = FileAssignment(
+                project_id=project_id,
+                file_record_id=file_record_id,
+                assignee_id=assignee_id,
+                assigned_by_id=current_user.id,
+                assigned_at=now,
+                status=ASSIGNMENT_STATUS_ACTIVE,
+            )
+            db.add(file_assignment)
+            event = _record_assignment_event(
+                db,
+                project_id=project_id,
+                file_record_id=file_record_id,
+                assignee_id=assignee_id,
+                actor_id=current_user.id,
+                action=ASSIGNMENT_EVENT_FILE_GRANTED,
+                before_payload={"file_record_id": str(file_record_id), "status": None},
+                after_payload={"file_record_id": str(file_record_id), "status": ASSIGNMENT_STATUS_ACTIVE},
+            )
+            _create_assignment_notification(
+                db,
+                user_id=assignee_id,
+                notification_type=ASSIGNMENT_EVENT_FILE_GRANTED,
+                title="你收到了新的文件任务",
+                body=f"项目「{project.name}」中有新的文件授权给你处理。",
+                project_id=project_id,
+                file_record_id=file_record_id,
+                related_event_id=event.id,
+            )
+
+        for file_record_id in sorted(active_file_ids - desired_file_ids, key=str):
+            file_assignment = active_file_assignments[file_record_id]
+            file_assignment.status = ASSIGNMENT_STATUS_REVOKED
+            file_assignment.revoked_by_id = current_user.id
+            file_assignment.revoked_at = now
+            event = _record_assignment_event(
+                db,
+                project_id=project_id,
+                file_record_id=file_record_id,
+                assignee_id=assignee_id,
+                actor_id=current_user.id,
+                action=ASSIGNMENT_EVENT_FILE_REVOKED,
+                before_payload={"file_record_id": str(file_record_id), "status": ASSIGNMENT_STATUS_ACTIVE},
+                after_payload={"file_record_id": str(file_record_id), "status": ASSIGNMENT_STATUS_REVOKED},
+            )
+            _create_assignment_notification(
+                db,
+                user_id=assignee_id,
+                notification_type=ASSIGNMENT_EVENT_FILE_REVOKED,
+                title="文件任务授权已取消",
+                body=f"项目「{project.name}」中有文件不再授权给你处理。",
+                project_id=project_id,
+                file_record_id=file_record_id,
+                related_event_id=event.id,
+            )
+
+    _sync_legacy_file_assignees(db, project_id)
+    db.commit()
+    return _serialize_project_assignments(db, project_id)
 
 
 @router.get("/projects/{project_id}")
@@ -2341,6 +2973,8 @@ def get_project_detail(
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在。")
 
+    _require_project_read_access(project, current_user, db)
+
     files = (
         db.query(FileRecord)
         .options(joinedload(FileRecord.assignee))
@@ -2348,8 +2982,8 @@ def get_project_detail(
         .order_by(FileRecord.created_at.asc(), FileRecord.id.asc())
         .all()
     )
-    files = _visible_project_files(files, current_user)
-    if is_external_translator(current_user) and not files:
+    files = _visible_project_files(files, current_user, db)
+    if False and is_external_translator(current_user) and not files:
         raise HTTPException(status_code=404, detail="项目不存在或没有分配给当前用户的任务。")
     stale_lock_cleared = False
     for file_record in files:
@@ -2375,6 +3009,8 @@ def get_project_detail(
         }
     else:
         project_issue_stats = _get_project_issue_stats(db, [project_id]).get(project_id)
+    assigned_users = _get_active_project_assignees(db, [project_id]).get(project_id, [])
+    file_assignees = _get_active_file_assignees(db, [file_record.id for file_record in files])
     return _build_project_detail_payload(
         project,
         files,
@@ -2383,6 +3019,8 @@ def get_project_detail(
         project_issue_stats=project_issue_stats,
         file_issue_stats=file_issue_stats,
         current_user=current_user,
+        assigned_users=assigned_users,
+        file_assignees=file_assignees,
     )
 
 
@@ -2535,10 +3173,15 @@ def list_project_issue_markers(
         raise HTTPException(status_code=404, detail="项目不存在。")
     if is_external_translator(current_user):
         assigned_file_ids = [
-            row.id
+            row.file_record_id
             for row in (
-                db.query(FileRecord.id)
-                .filter(FileRecord.project_id == project_id, FileRecord.assignee_id == current_user.id)
+                db.query(FileAssignment.file_record_id)
+                .join(FileRecord, FileRecord.id == FileAssignment.file_record_id)
+                .filter(
+                    FileRecord.project_id == project_id,
+                    FileAssignment.assignee_id == current_user.id,
+                    FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+                )
                 .all()
             )
         ]
@@ -2577,11 +3220,13 @@ def create_project_issue_marker(
         if payload.file_record_id is None:
             raise HTTPException(status_code=403, detail="外部译者只能在已分配任务上提交问题标记。")
         assigned = (
-            db.query(FileRecord.id)
+            db.query(FileAssignment.id)
+            .join(FileRecord, FileRecord.id == FileAssignment.file_record_id)
             .filter(
                 FileRecord.project_id == project_id,
                 FileRecord.id == payload.file_record_id,
-                FileRecord.assignee_id == current_user.id,
+                FileAssignment.assignee_id == current_user.id,
+                FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
             )
             .first()
         )
@@ -2766,6 +3411,7 @@ def list_projects(
     project_ids = [project.id for project in projects]
     project_stats = _get_project_stats(db, project_ids, current_user=current_user)
     project_issue_stats = _get_project_issue_stats(db, project_ids, current_user=current_user)
+    project_assignees = _get_active_project_assignees(db, project_ids)
 
     items = []
     for project in projects:
@@ -2786,6 +3432,7 @@ def list_projects(
                 creator_name=creator_name,
                 issue_stats=project_issue_stats.get(project.id),
                 current_user=current_user,
+                assigned_users=project_assignees.get(project.id),
             )
         )
 
@@ -2818,7 +3465,16 @@ def get_file_records(
     safe_limit = min(max(limit, 1), 200)
     query = db.query(FileRecord).options(joinedload(FileRecord.assignee))
     if not can_access_all_projects(current_user):
-        query = query.filter(FileRecord.assignee_id == current_user.id)
+        query = (
+            query.join(FileAssignment, FileAssignment.file_record_id == FileRecord.id)
+            .join(ProjectAssignment, ProjectAssignment.project_id == FileRecord.project_id)
+            .filter(
+                FileAssignment.assignee_id == current_user.id,
+                FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+                ProjectAssignment.assignee_id == current_user.id,
+                ProjectAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            )
+        )
     file_records = (
         query
         .order_by(FileRecord.created_at.desc())
@@ -2828,6 +3484,7 @@ def get_file_records(
     )
     file_stats = _get_file_segment_stats(db, [file_record.id for file_record in file_records])
     file_issue_stats = _get_file_issue_stats(db, [file_record.id for file_record in file_records])
+    file_assignees = _get_active_file_assignees(db, [file_record.id for file_record in file_records])
     return [
         {
             "id": file_record.id,
@@ -2849,6 +3506,7 @@ def get_file_records(
             "target_language": file_record.target_language,
             "assignee_id": str(file_record.assignee_id) if file_record.assignee_id else None,
             "assignee": _serialize_assignee(file_record.assignee),
+            "assignees": _serialize_user_list(file_assignees.get(file_record.id)),
             "assigned_at": file_record.assigned_at.isoformat() if file_record.assigned_at else None,
             "can_manage": _can_manage_workflow(current_user),
             "can_write": _can_write_file_record(file_record, current_user),
@@ -3176,6 +3834,7 @@ def get_file_record(
         file_record.id,
         {"issue_count": 0, "open_issue_count": 0},
     )
+    file_assignees = _get_active_file_assignees(db, [file_record.id]).get(file_record.id, [])
 
     return {
         "id": file_record.id,
@@ -3190,6 +3849,7 @@ def get_file_record(
         "target_language": file_record.target_language,
         "assignee_id": str(file_record.assignee_id) if file_record.assignee_id else None,
         "assignee": _serialize_assignee(file_record.assignee),
+        "assignees": _serialize_user_list(file_assignees),
         "assigned_at": file_record.assigned_at.isoformat() if file_record.assigned_at else None,
         "collection_id": file_record.collection_id,
         "collection_name": collection_name,

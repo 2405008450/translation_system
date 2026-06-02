@@ -381,6 +381,8 @@ def _resolve_matches(
         [sentence for _, sentence in matchable_items],
         collection_ids=collection_ids,
     )
+    if isinstance(exact_matches_by_hash, tuple):
+        exact_matches_by_hash = exact_matches_by_hash[0]
     exact_phase_ms = (perf_counter() - exact_started_at) * 1000
 
     unresolved_items: list[tuple[int, PreparedSentence]] = []

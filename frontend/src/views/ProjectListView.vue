@@ -5,12 +5,13 @@ import {
   Database,
   Filter,
   Flag,
+  FolderOpen,
   Loader2,
-  MoreHorizontal,
   Plus,
   Search,
   Settings2,
   Trash2,
+  Users,
 } from 'lucide-vue-next'
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -22,11 +23,12 @@ import DataTable from '../components/DataTable.vue'
 import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
 import Pagination from '../components/Pagination.vue'
+import RowActionMenu from '../components/RowActionMenu.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { useToast } from '../composables/useToast'
 import { getFileStatusMeta } from '../constants/status'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
-import type { IssueMarker } from '../types/api'
+import type { IssueMarker, User } from '../types/api'
 import { useAuthStore } from '../stores/auth'
 
 interface ProjectItem {
@@ -45,6 +47,7 @@ interface ProjectItem {
   creator: string | null
   deadline: string | null
   access_level: string | null
+  assigned_users?: User[]
   can_manage?: boolean
   can_write?: boolean
   created_at: string
@@ -113,15 +116,31 @@ const columns = computed<DataTableColumn[]>(() => ([
 const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
 const canManageProjects = computed(() => authStore.isAdmin)
 
+function isProjectAssignedToCurrentUser(project: ProjectItem) {
+  const currentUserId = authStore.user?.id
+  if (!authStore.isExternalTranslator || !currentUserId) {
+    return true
+  }
+  return (project.assigned_users || []).some((user) => user.id === currentUserId)
+}
+
 async function loadProjects() {
   loading.value = true
   pageError.value = ''
   try {
-    const skip = (currentPage.value - 1) * pageSize.value
+    const skip = authStore.isExternalTranslator ? 0 : (currentPage.value - 1) * pageSize.value
+    const limit = authStore.isExternalTranslator ? 200 : pageSize.value
     const { data } = await http.get<ProjectListResponse>('/projects', {
-      params: { skip, limit: pageSize.value, search: searchQuery.value.trim() },
+      params: { skip, limit, search: searchQuery.value.trim() },
     })
-    projects.value = data.items
+    const visibleItems = data.items.filter(isProjectAssignedToCurrentUser)
+    if (authStore.isExternalTranslator) {
+      const start = (currentPage.value - 1) * pageSize.value
+      projects.value = visibleItems.slice(start, start + pageSize.value)
+      totalCount.value = visibleItems.length
+      return
+    }
+    projects.value = visibleItems
     totalCount.value = data.total
   } catch (error) {
     if (axios.isAxiosError(error)) {
@@ -231,6 +250,11 @@ function getStatusClass(status: string) {
   return `project-status--${meta.tone}`
 }
 
+function getProjectLinkClass(status: string) {
+  const meta = getFileStatusMeta(status)
+  return `project-link--${meta.tone}`
+}
+
 function handleSort(key: string, order: 'asc' | 'desc') {
   sortKey.value = key
   sortOrder.value = order
@@ -238,6 +262,14 @@ function handleSort(key: string, order: 'asc' | 'desc') {
 
 function goToAssets() {
   void router.push({ name: 'tm' })
+}
+
+function openProjectDetail(row: ProjectItem) {
+  void router.push({ name: 'project-detail', params: { id: row.id } })
+}
+
+function openProjectAssignment(row: ProjectItem) {
+  void router.push({ name: 'project-detail', params: { id: row.id }, query: { assign: '1' } })
 }
 
 function openIssueDialog(row: ProjectItem) {
@@ -343,6 +375,7 @@ onMounted(() => {
         <template #filename="{ row }">
           <button
             class="text-link project-link"
+            :class="getProjectLinkClass(row.status)"
             type="button"
             @click="router.push({ name: 'project-detail', params: { id: row.id } })"
           >
@@ -408,34 +441,46 @@ onMounted(() => {
 
         <template #actions="{ row }">
           <div class="project-row-actions">
-            <button
-              v-if="canManageProjects"
-              class="data-table__actions-btn"
-              type="button"
-              :title="t('issueMarker.actions.open')"
-              :aria-label="t('issueMarker.actions.open')"
-              @click="openIssueDialog(row as ProjectItem)"
-            >
-              <Flag :size="14" />
-            </button>
-            <button
-              class="data-table__actions-btn"
-              type="button"
-              :title="t('projectList.actions.view')"
-              :aria-label="t('projectList.actions.view')"
-              @click="router.push({ name: 'project-detail', params: { id: row.id } })"
-            >
-              <MoreHorizontal :size="16" />
-            </button>
-            <button
-              class="data-table__actions-btn"
-              type="button"
-              :title="t('projectList.actions.delete')"
-              :aria-label="t('projectList.actions.delete')"
-              @click="deleteRow(row as ProjectItem)"
-            >
-              <Trash2 :size="14" />
-            </button>
+            <RowActionMenu title="更多操作" menu-label="项目操作" :min-width="156">
+              <template #default="{ close }">
+                <button
+                  type="button"
+                  role="menuitem"
+                  @click="openProjectDetail(row as ProjectItem); close()"
+                >
+                  <FolderOpen :size="14" />
+                  查看详情
+                </button>
+                <button
+                  v-if="canManageProjects"
+                  type="button"
+                  role="menuitem"
+                  @click="openProjectAssignment(row as ProjectItem); close()"
+                >
+                  <Users :size="14" />
+                  分配任务
+                </button>
+                <button
+                  v-if="canManageProjects"
+                  type="button"
+                  role="menuitem"
+                  @click="openIssueDialog(row as ProjectItem); close()"
+                >
+                  <Flag :size="14" />
+                  问题标记
+                </button>
+                <button
+                  v-if="canManageProjects"
+                  class="is-danger"
+                  type="button"
+                  role="menuitem"
+                  @click="close(); deleteRow(row as ProjectItem)"
+                >
+                  <Trash2 :size="14" />
+                  删除项目
+                </button>
+              </template>
+            </RowActionMenu>
           </div>
         </template>
       </DataTable>
@@ -540,6 +585,26 @@ onMounted(() => {
   border: none;
   background: transparent;
   box-shadow: none;
+}
+
+.project-link--info {
+  color: var(--state-info);
+}
+
+.project-link--success {
+  color: var(--state-success);
+}
+
+.project-link--warning {
+  color: var(--state-warning);
+}
+
+.project-link--danger {
+  color: var(--state-danger);
+}
+
+.project-link--default {
+  color: var(--text-secondary);
 }
 
 .project-row-actions {
