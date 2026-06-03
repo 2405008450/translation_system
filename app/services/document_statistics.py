@@ -12,6 +12,10 @@ from zipfile import BadZipFile, ZipFile
 from xml.etree import ElementTree as ET
 
 from app.config import get_settings
+from app.services.libreoffice_service import (
+    LibreOfficeError,
+    compute_libreoffice_document_statistics,
+)
 
 
 APP_PROPERTIES_NS = "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
@@ -24,8 +28,18 @@ STATISTIC_FIELDS = {
     "Paragraphs": "paragraphs",
     "Lines": "lines",
 }
+STATISTIC_NUMBER_KEYS = (
+    "pages",
+    "words",
+    "non_asian_words",
+    "asian_characters",
+    "characters",
+    "characters_with_spaces",
+    "paragraphs",
+    "lines",
+)
 NON_ASIAN_WORD_PATTERN = re.compile(
-    r"[A-Za-z0-9]+(?:[.,:/_-][A-Za-z0-9]+)*%?|[^\W_\d\s]+(?:[-'’][^\W_\d\s]+)*",
+    r"[A-Za-z0-9]+(?:[.,:/_-][A-Za-z0-9]+)*%?|[^\W_\d\s]+(?:[-'][^\W_\d\s]+)*",
     re.UNICODE,
 )
 
@@ -34,6 +48,35 @@ _LICENSE_STATUS: str | None = None
 
 
 def compute_docx_statistics(raw_bytes: bytes) -> dict[str, Any]:
+    """计算 DOCX 文档级统计，保留旧调用入口。"""
+    return compute_word_document_statistics(raw_bytes, "source.docx")
+
+
+def compute_word_document_statistics(raw_bytes: bytes, filename: str) -> dict[str, Any]:
+    """计算 Word 文档级统计，优先使用 LibreOffice。"""
+    libreoffice_statistics = _compute_with_libreoffice(raw_bytes, filename)
+    if libreoffice_statistics is not None:
+        return libreoffice_statistics
+
+    if Path(filename or "").suffix.lower() != ".docx":
+        return _build_statistics_payload(
+            source="unavailable",
+            engine=None,
+            include_textboxes_footnotes_endnotes=True,
+            license_status=None,
+        )
+
+    return _compute_docx_statistics_without_libreoffice(raw_bytes)
+
+
+def _compute_with_libreoffice(raw_bytes: bytes, filename: str) -> dict[str, Any] | None:
+    try:
+        return compute_libreoffice_document_statistics(raw_bytes, filename)
+    except LibreOfficeError:
+        return None
+
+
+def _compute_docx_statistics_without_libreoffice(raw_bytes: bytes) -> dict[str, Any]:
     """计算 DOCX 文档级统计，优先使用 Aspose，失败时用 OpenXML 直接重算文本统计。"""
     aspose_statistics = _compute_with_aspose(raw_bytes)
     if aspose_statistics is not None:
@@ -321,14 +364,16 @@ def _build_statistics_payload(
     engine: str | None,
     include_textboxes_footnotes_endnotes: bool | None,
     license_status: str | None,
+    engine_version: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "source": source,
         "engine": engine,
+        "engine_version": engine_version,
         "license_status": license_status,
         "include_textboxes_footnotes_endnotes": include_textboxes_footnotes_endnotes,
     }
-    for key in STATISTIC_FIELDS.values():
+    for key in STATISTIC_NUMBER_KEYS:
         payload[key] = None
     return payload
 
@@ -337,6 +382,11 @@ def _coerce_statistics_payload(value: dict[str, Any]) -> dict[str, Any]:
     payload = _build_statistics_payload(
         source=str(value.get("source") or ""),
         engine=value.get("engine") if value.get("engine") is None else str(value.get("engine")),
+        engine_version=(
+            value.get("engine_version")
+            if value.get("engine_version") is None
+            else str(value.get("engine_version"))
+        ),
         include_textboxes_footnotes_endnotes=_to_optional_bool(
             value.get("include_textboxes_footnotes_endnotes")
         ),
@@ -346,7 +396,7 @@ def _coerce_statistics_payload(value: dict[str, Any]) -> dict[str, Any]:
             else str(value.get("license_status"))
         ),
     )
-    for key in STATISTIC_FIELDS.values():
+    for key in STATISTIC_NUMBER_KEYS:
         payload[key] = _to_optional_int(value.get(key))
     return payload
 

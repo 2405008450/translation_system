@@ -16,8 +16,10 @@ import {
   Link,
   Loader2,
   MoreHorizontal,
+  Plus,
   Search,
   Settings2,
+  ShieldCheck,
   Sparkles,
   Trash2,
   Upload,
@@ -42,6 +44,7 @@ import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import Modal from '../components/base/Modal.vue'
 import PreTranslateDialog from '../components/PreTranslateDialog.vue'
 import Pagination from '../components/Pagination.vue'
+import StateView from '../components/base/StateView.vue'
 import TermExtractionDialog from '../components/TermExtractionDialog.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
@@ -61,6 +64,10 @@ import type {
   IssueMarker,
   IssueStatus,
   ProjectAssignmentsResponse,
+  ProjectTermBaseSettingGroup,
+  ProjectTermBaseSettingRow,
+  ProjectTermBaseSettingsResponse,
+  TermQAReport,
   UploadCapabilitiesResponse,
   UploadCapability,
   User,
@@ -75,6 +82,8 @@ type AccessLevel = 'team' | 'private' | 'public'
 type DocumentStatisticNumberKey =
   | 'pages'
   | 'words'
+  | 'non_asian_words'
+  | 'asian_characters'
   | 'characters'
   | 'characters_with_spaces'
   | 'paragraphs'
@@ -142,7 +151,11 @@ interface ProjectFileItem {
   issue_count: number
   open_issue_count: number
   collection_id: string | null
+  collection_ids: string[]
   term_base_id: string | null
+  term_base_ids: string[]
+  term_base_write_ids: string[]
+  qa_term_base_ids: string[]
 }
 
 interface AssignmentDraft {
@@ -201,6 +214,8 @@ const DEFAULT_DOCUMENT_PARSE_OPTIONS: DocumentParseOptions = {
 const DOCUMENT_STATISTIC_NUMBER_KEYS: DocumentStatisticNumberKey[] = [
   'pages',
   'words',
+  'non_asian_words',
+  'asian_characters',
   'characters',
   'characters_with_spaces',
   'paragraphs',
@@ -290,6 +305,14 @@ const assignmentTooltipText = ref('')
 const assignmentTooltipStyle = ref<Record<string, string>>({})
 const assignmentEvents = ref<AssignmentEvent[]>([])
 const assignmentEventsLoading = ref(false)
+const termBaseSettings = ref<ProjectTermBaseSettingsResponse | null>(null)
+const loadingTermBaseSettings = ref(false)
+const savingTermBaseSettings = ref(false)
+const creatingTermBasePair = ref('')
+const termBaseSettingsError = ref('')
+const generatingTermQAReport = ref(false)
+const termQAReport = ref<TermQAReport | null>(null)
+const downloadingTermQAReport = ref(false)
 
 const tabs = computed(() => ([
   { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
@@ -323,6 +346,11 @@ const selectedProjectFiles = computed(() => (
 ))
 const hasSelectedLockedFile = computed(() => selectedProjectFiles.value.some((row) => row.is_edit_locked))
 const hasSelectedNonWritableFile = computed(() => selectedProjectFiles.value.some((row) => !row.can_write))
+const canDeleteSelectedProjectFiles = computed(() => (
+  canManageProject.value
+  && selectedProjectFiles.value.length > 0
+  && !deleting.value
+))
 const statisticsSelectedFiles = computed(() => (
   tableRows.value.filter((row) => statisticsSelectedFileIds.value.has(row.id))
 ))
@@ -426,6 +454,11 @@ const duplicateTemplateButtonTitle = computed(() => {
   }
   return ''
 })
+const deleteSelectedFilesButtonTitle = computed(() => (
+  selectedProjectFiles.value.length === 0
+    ? t('projectDetail.files.actions.deleteSelectFirst')
+    : ''
+))
 const canDuplicateTemplate = computed(() => canManageProject.value && selectedFileIds.value.size === 1 && !duplicating.value)
 const canOpenTermExtraction = computed(() => (
   Boolean(selectedTermExtractionFile.value)
@@ -661,6 +694,8 @@ function createEmptyStatisticsTotals(): DocumentStatisticsTotals {
   return {
     pages: null,
     words: null,
+    non_asian_words: null,
+    asian_characters: null,
     characters: null,
     characters_with_spaces: null,
     paragraphs: null,
@@ -694,6 +729,9 @@ function getStatisticsSourceLabel(statistics: DocumentStatistics | null | undefi
   if (statistics.source === 'aspose') {
     return t('projectDetail.stats.sources.aspose')
   }
+  if (statistics.source === 'libreoffice') {
+    return t('projectDetail.stats.sources.libreOffice')
+  }
   if (statistics.source === 'openxml_computed') {
     return t('projectDetail.stats.sources.openxmlComputed')
   }
@@ -720,7 +758,7 @@ function getStatisticsStatusClass(statistics: DocumentStatistics | null | undefi
   if (!statistics?.source) {
     return 'project-status--default'
   }
-  if (statistics.source === 'aspose') {
+  if (statistics.source === 'aspose' || statistics.source === 'libreoffice') {
     return 'project-status--success'
   }
   if (statistics.source === 'openxml_computed') {
@@ -1302,11 +1340,189 @@ async function loadProject() {
     statisticsResultFileIds.value = new Set<string>()
     if (data.can_manage) {
       void loadAssignmentEvents()
+      void loadProjectTermBaseSettings()
+    } else {
+      termBaseSettings.value = null
     }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.load'))
   } finally {
     loading.value = false
+  }
+}
+
+async function loadProjectTermBaseSettings() {
+  if (!project.value?.can_manage) {
+    termBaseSettings.value = null
+    return
+  }
+  loadingTermBaseSettings.value = true
+  termBaseSettingsError.value = ''
+  try {
+    const { data } = await http.get<ProjectTermBaseSettingsResponse>(
+      `/projects/${project.value.id}/term-base-settings`,
+    )
+    termBaseSettings.value = data
+  } catch (error) {
+    termBaseSettingsError.value = getErrorMessage(error, '术语库设置加载失败。')
+  } finally {
+    loadingTermBaseSettings.value = false
+  }
+}
+
+function termBaseSettingGroupKey(group: ProjectTermBaseSettingGroup) {
+  return `${group.source_language}->${group.target_language}`
+}
+
+function getTermBaseSettingPairLabel(group: ProjectTermBaseSettingGroup) {
+  return formatLanguagePair(group.source_language, group.target_language)
+}
+
+function toggleTermBaseSetting(
+  row: ProjectTermBaseSettingRow,
+  field: 'enabled' | 'writable' | 'qa',
+  event: Event,
+) {
+  const checked = (event.target as HTMLInputElement).checked
+  row[field] = checked
+  if ((field === 'writable' || field === 'qa') && checked) {
+    row.enabled = true
+  }
+  if (field === 'enabled' && !checked) {
+    row.writable = false
+    row.qa = false
+  }
+}
+
+function buildTermBaseSettingsPayload() {
+  return {
+    settings: (termBaseSettings.value?.groups || []).map((group) => ({
+      source_language: group.source_language,
+      target_language: group.target_language,
+      enabled_term_base_ids: group.term_bases.filter((row) => row.enabled).map((row) => row.id),
+      writable_term_base_ids: group.term_bases.filter((row) => row.enabled && row.writable).map((row) => row.id),
+      qa_term_base_ids: group.term_bases.filter((row) => row.enabled && row.qa).map((row) => row.id),
+    })),
+  }
+}
+
+async function saveProjectTermBaseSettings() {
+  if (!project.value || savingTermBaseSettings.value || !canManageProject.value) {
+    return
+  }
+  savingTermBaseSettings.value = true
+  termBaseSettingsError.value = ''
+  try {
+    const { data } = await http.patch<ProjectTermBaseSettingsResponse>(
+      `/projects/${project.value.id}/term-base-settings`,
+      buildTermBaseSettingsPayload(),
+    )
+    termBaseSettings.value = data
+    toast.show({
+      tone: 'success',
+      title: '术语库设置已保存',
+      message: '',
+    })
+    await loadProject()
+  } catch (error) {
+    termBaseSettingsError.value = getErrorMessage(error, '术语库设置保存失败。')
+    toast.show({
+      tone: 'error',
+      title: '术语库设置保存失败',
+      message: termBaseSettingsError.value,
+    })
+  } finally {
+    savingTermBaseSettings.value = false
+  }
+}
+
+async function createTermBaseForGroup(group: ProjectTermBaseSettingGroup) {
+  if (!project.value || creatingTermBasePair.value) {
+    return
+  }
+  const pairLabel = getTermBaseSettingPairLabel(group)
+  const defaultName = `${project.value.name || project.value.filename || '项目'} ${pairLabel} 术语库`
+  const name = window.prompt('请输入术语库名称', defaultName)
+  if (!name?.trim()) {
+    return
+  }
+  creatingTermBasePair.value = termBaseSettingGroupKey(group)
+  try {
+    const { data } = await http.post<{ id: string }>('/term-bases', {
+      name: name.trim(),
+      description: '',
+      source_language: group.source_language,
+      target_language: group.target_language,
+    })
+    await loadProjectTermBaseSettings()
+    const nextGroup = termBaseSettings.value?.groups.find((item) => (
+      item.source_language === group.source_language && item.target_language === group.target_language
+    ))
+    const createdRow = nextGroup?.term_bases.find((row) => row.id === data.id)
+    if (createdRow) {
+      createdRow.enabled = true
+      createdRow.writable = true
+      createdRow.qa = false
+      await saveProjectTermBaseSettings()
+    }
+  } catch (error) {
+    toast.show({
+      tone: 'error',
+      title: '术语库创建失败',
+      message: getErrorMessage(error, '术语库创建失败。'),
+    })
+  } finally {
+    creatingTermBasePair.value = ''
+  }
+}
+
+async function generateProjectTermQAReport() {
+  if (!project.value || generatingTermQAReport.value) {
+    return
+  }
+  generatingTermQAReport.value = true
+  try {
+    const { data } = await http.post<TermQAReport>(`/projects/${project.value.id}/term-qa-reports`, {
+      file_ids: [],
+    })
+    termQAReport.value = data
+    toast.show({
+      tone: data.issue_count > 0 ? 'warn' : 'success',
+      title: '术语QA报告已生成',
+      message: `发现 ${data.issue_count} 条术语问题。`,
+    })
+  } catch (error) {
+    toast.show({
+      tone: 'error',
+      title: '术语QA报告生成失败',
+      message: getErrorMessage(error, '术语QA报告生成失败。'),
+    })
+  } finally {
+    generatingTermQAReport.value = false
+  }
+}
+
+async function downloadTermQAReport(report: TermQAReport | null) {
+  if (!report || downloadingTermQAReport.value) {
+    return
+  }
+  downloadingTermQAReport.value = true
+  try {
+    const response = await http.get(`/term-qa-reports/${report.id}/export-xlsx`, {
+      responseType: 'blob',
+    })
+    downloadBlob(
+      response.data,
+      resolveDownloadFilename(response.headers['content-disposition'], `term-qa-report-${report.id}.xlsx`),
+    )
+  } catch (error) {
+    toast.show({
+      tone: 'error',
+      title: '术语QA报告导出失败',
+      message: getErrorMessage(error, '术语QA报告导出失败。'),
+    })
+  } finally {
+    downloadingTermQAReport.value = false
   }
 }
 
@@ -1540,7 +1756,7 @@ async function deleteCurrentProject() {
   const filename = project.value.filename || t('projectDetail.titleFallback')
   const confirmed = await confirm({
     title: t('projectDetail.files.actions.delete'),
-    message: t('projectDetail.messages.deleteConfirm', { name: filename }),
+    message: t('projectDetail.messages.deleteProjectConfirm', { name: filename }),
     confirmText: t('common.actions.delete'),
     danger: true,
   })
@@ -1554,7 +1770,7 @@ async function deleteCurrentProject() {
 
   try {
     await http.delete(`/projects/${props.id}`)
-    toast.success(t('projectDetail.messages.deleted', { name: filename }))
+    toast.success(t('projectDetail.messages.projectDeleted', { name: filename }))
     await router.push({ name: 'projects' })
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.delete'))
@@ -1563,18 +1779,21 @@ async function deleteCurrentProject() {
   }
 }
 
-async function deleteProjectFile(row: ProjectRow) {
+async function deleteProjectFiles(rows: ProjectRow[]) {
   closeActionMenu()
-  if (!canManageProject.value) {
+  if (!canManageProject.value || rows.length === 0) {
     return
   }
 
-  const rowId = String(row.id)
-  const filename = String(row.filename || t('projectDetail.titleFallback'))
+  const fileCount = rows.length
+  const firstFile = rows[0]
+  const firstFilename = String(firstFile.filename || t('projectDetail.titleFallback'))
 
   const confirmed = await confirm({
     title: t('projectDetail.files.actions.delete'),
-    message: t('projectDetail.messages.deleteConfirm', { name: filename }),
+    message: fileCount === 1
+      ? t('projectDetail.messages.deleteFileConfirm', { name: firstFilename })
+      : t('projectDetail.messages.deleteFilesConfirm', { count: fileCount }),
     confirmText: t('common.actions.delete'),
     danger: true,
   })
@@ -1587,16 +1806,32 @@ async function deleteProjectFile(row: ProjectRow) {
   pageError.value = ''
 
   try {
-    await http.delete(`/file-records/${rowId}`)
-    toast.success(t('projectDetail.messages.deleted', { name: filename }))
-    selectedFileIds.value.delete(rowId)
-    selectedFileIds.value = new Set(selectedFileIds.value)
+    await Promise.all(rows.map((row) => http.delete(`/file-records/${String(row.id)}`)))
+    const deletedIds = new Set(rows.map((row) => String(row.id)))
+    selectedFileIds.value = new Set(
+      Array.from(selectedFileIds.value).filter((id) => !deletedIds.has(id)),
+    )
+    toast.success(fileCount === 1
+      ? t('projectDetail.messages.fileDeleted', { name: firstFilename })
+      : t('projectDetail.messages.filesDeleted', { count: fileCount }))
     await loadProject()
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.delete'))
   } finally {
     deleting.value = false
   }
+}
+
+async function deleteProjectFile(row: ProjectRow) {
+  await deleteProjectFiles([row])
+}
+
+async function deleteSelectedProjectFiles() {
+  if (!canDeleteSelectedProjectFiles.value) {
+    return
+  }
+
+  await deleteProjectFiles(selectedProjectFiles.value)
 }
 
 async function duplicateSelectedTemplate() {
@@ -2039,6 +2274,190 @@ onBeforeUnmount(() => {
               {{ savingGuidelines ? t('common.actions.saving') : t('common.actions.save') }}
             </button>
           </div>
+
+          <div class="pd-settings-divider" aria-hidden="true" />
+
+          <div class="pd-settings-section-head">
+            <div class="section-title section-title--tight">术语库设置</div>
+            <p class="panel-subtitle">按文件语言对启用术语提醒、控制写入入口，并指定术语 QA 标准库。</p>
+          </div>
+
+          <div class="term-settings">
+            <StateView
+              v-if="loadingTermBaseSettings"
+              kind="loading"
+              title="正在加载术语库设置"
+              message="正在读取项目文件语言对和可用术语库。"
+            />
+            <p v-else-if="termBaseSettingsError" class="form-message is-error">{{ termBaseSettingsError }}</p>
+            <div v-else-if="!termBaseSettings || termBaseSettings.groups.length === 0" class="empty-state">
+              当前项目还没有可配置语言对的文件。
+            </div>
+            <div v-else class="term-settings__groups">
+              <section
+                v-for="group in termBaseSettings.groups"
+                :key="termBaseSettingGroupKey(group)"
+                class="term-settings__group"
+              >
+                <div class="term-settings__group-head">
+                  <div>
+                    <strong>{{ getTermBaseSettingPairLabel(group) }}</strong>
+                    <span>{{ group.file_count }} 个文件</span>
+                  </div>
+                  <button
+                    class="button"
+                    type="button"
+                    :disabled="Boolean(creatingTermBasePair)"
+                    @click="createTermBaseForGroup(group)"
+                  >
+                    <Loader2 v-if="creatingTermBasePair === termBaseSettingGroupKey(group)" class="lucide-spin" :size="14" />
+                    <Plus v-else :size="14" />
+                    创建术语库
+                  </button>
+                </div>
+
+                <div class="term-settings__table-wrap">
+                  <table class="term-settings__table">
+                    <thead>
+                      <tr>
+                        <th>序号</th>
+                        <th>启用</th>
+                        <th>
+                          写入
+                          <span class="term-settings__tip" title="允许在本项目相关入口中编辑、增加和删除该术语库中的术语。">?</span>
+                        </th>
+                        <th>
+                          QA术语库
+                          <span class="term-settings__tip" title="QA术语库为质量检查的标准术语库。勾选“术语不一致”后，系统会用该库检查译文术语一致性。">?</span>
+                        </th>
+                        <th>术语库名称</th>
+                        <th>条目数</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-if="group.term_bases.length === 0">
+                        <td colspan="6">当前语言对暂无术语库。</td>
+                      </tr>
+                      <tr v-for="(row, rowIndex) in group.term_bases" :key="row.id">
+                        <td>{{ rowIndex + 1 }}</td>
+                        <td>
+                          <input
+                            type="checkbox"
+                            :checked="row.enabled"
+                            @change="toggleTermBaseSetting(row, 'enabled', $event)"
+                          />
+                        </td>
+                        <td>
+                          <input
+                            type="checkbox"
+                            :checked="row.writable"
+                            @change="toggleTermBaseSetting(row, 'writable', $event)"
+                          />
+                        </td>
+                        <td>
+                          <input
+                            type="checkbox"
+                            :checked="row.qa"
+                            @change="toggleTermBaseSetting(row, 'qa', $event)"
+                          />
+                        </td>
+                        <td>{{ row.name }}</td>
+                        <td>{{ row.entry_count }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            </div>
+
+            <p class="hint-text">
+              启用代表项目工作台会提示专有词汇；写入代表允许本项目相关入口写入术语；QA术语库用于后续“术语不一致”检查。
+            </p>
+
+            <div class="pd-settings-actions">
+              <button
+                class="button button--primary"
+                type="button"
+                :disabled="savingTermBaseSettings || loadingTermBaseSettings"
+                @click="saveProjectTermBaseSettings"
+              >
+                <Loader2 v-if="savingTermBaseSettings" class="lucide-spin" :size="14" />
+                <Settings2 v-else :size="14" />
+                {{ savingTermBaseSettings ? '保存中' : '保存术语库设置' }}
+              </button>
+            </div>
+          </div>
+
+          <div class="pd-settings-divider" aria-hidden="true" />
+
+          <div class="pd-settings-section-head">
+            <div class="section-title section-title--tight">术语 QA 报告</div>
+            <p class="panel-subtitle">检查原文命中的 QA 术语是否在译文中使用了对应译文。</p>
+          </div>
+
+          <div class="term-qa-report">
+            <div class="pd-settings-actions term-qa-report__actions">
+              <button
+                class="button button--primary"
+                type="button"
+                :disabled="generatingTermQAReport"
+                @click="generateProjectTermQAReport"
+              >
+                <Loader2 v-if="generatingTermQAReport" class="lucide-spin" :size="14" />
+                <ShieldCheck v-else :size="14" />
+                {{ generatingTermQAReport ? '生成中' : '生成术语 QA 报告' }}
+              </button>
+              <button
+                class="button"
+                type="button"
+                :disabled="!termQAReport || downloadingTermQAReport"
+                @click="downloadTermQAReport(termQAReport)"
+              >
+                <Loader2 v-if="downloadingTermQAReport" class="lucide-spin" :size="14" />
+                <Download v-else :size="14" />
+                导出 XLSX
+              </button>
+            </div>
+
+            <div v-if="termQAReport" class="term-qa-report__summary">
+              <span>检查文件：{{ termQAReport.total_files }}</span>
+              <span>检查句段：{{ termQAReport.checked_segments }}</span>
+              <span>总问题数：{{ termQAReport.issue_count }}</span>
+              <span>待处理：{{ termQAReport.active_issue_count }}</span>
+              <span>已忽略：{{ termQAReport.ignored_count }}</span>
+            </div>
+
+            <div v-if="termQAReport && termQAReport.items.length === 0" class="empty-state">
+              未发现术语不一致问题。
+            </div>
+            <div v-else-if="termQAReport" class="term-qa-report__table-wrap">
+              <table class="term-qa-report__table">
+                <thead>
+                  <tr>
+                    <th>文件</th>
+                    <th>句段</th>
+                    <th>原文术语</th>
+                    <th>期望译文</th>
+                    <th>当前译文</th>
+                    <th>状态</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="item in termQAReport.items.slice(0, 50)" :key="item.id">
+                    <td>{{ item.file_name }}</td>
+                    <td>{{ item.sentence_id }}</td>
+                    <td>{{ item.source_term }}</td>
+                    <td>{{ item.expected_target_term }}</td>
+                    <td>{{ item.target_text || getPlaceholder() }}</td>
+                    <td>{{ item.ignored ? '已忽略' : '待处理' }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <p v-if="termQAReport.items.length > 50" class="hint-text">
+                已显示前 50 条，完整报告请导出 XLSX。
+              </p>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -2246,12 +2665,14 @@ onBeforeUnmount(() => {
             <button
               v-if="canManageProject"
               class="button button--danger"
+              data-testid="project-file-delete-selected"
               type="button"
-              :disabled="deleting"
-              @click="deleteCurrentProject"
+              :disabled="!canDeleteSelectedProjectFiles"
+              :title="deleteSelectedFilesButtonTitle || undefined"
+              @click="deleteSelectedProjectFiles"
             >
               <Trash2 :size="14" />
-              {{ t('projectDetail.files.actions.delete') }}
+              {{ t('projectDetail.files.actions.deleteSelected') }}
             </button>
           </div>
 
@@ -2522,6 +2943,8 @@ onBeforeUnmount(() => {
                   <th>{{ t('projectDetail.stats.columns.source') }}</th>
                   <th>{{ t('projectDetail.stats.columns.pages') }}</th>
                   <th>{{ t('projectDetail.stats.columns.words') }}</th>
+                  <th>{{ t('projectDetail.stats.columns.nonAsianWords') }}</th>
+                  <th>{{ t('projectDetail.stats.columns.asianCharacters') }}</th>
                   <th>{{ t('projectDetail.stats.columns.characters') }}</th>
                   <th>{{ t('projectDetail.stats.columns.charactersWithSpaces') }}</th>
                   <th>{{ t('projectDetail.stats.columns.paragraphs') }}</th>
@@ -2537,6 +2960,8 @@ onBeforeUnmount(() => {
                   <td>{{ getStatisticsSourceLabel(row.document_statistics) }}</td>
                   <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'pages')) }}</td>
                   <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'words')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'non_asian_words')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'asian_characters')) }}</td>
                   <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'characters')) }}</td>
                   <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'characters_with_spaces')) }}</td>
                   <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'paragraphs')) }}</td>
@@ -2550,6 +2975,8 @@ onBeforeUnmount(() => {
                   <td>{{ getPlaceholder() }}</td>
                   <td>{{ formatStatisticNumber(statisticsTotals.pages) }}</td>
                   <td>{{ formatStatisticNumber(statisticsTotals.words) }}</td>
+                  <td>{{ formatStatisticNumber(statisticsTotals.non_asian_words) }}</td>
+                  <td>{{ formatStatisticNumber(statisticsTotals.asian_characters) }}</td>
                   <td>{{ formatStatisticNumber(statisticsTotals.characters) }}</td>
                   <td>{{ formatStatisticNumber(statisticsTotals.characters_with_spaces) }}</td>
                   <td>{{ formatStatisticNumber(statisticsTotals.paragraphs) }}</td>
@@ -4441,6 +4868,99 @@ onBeforeUnmount(() => {
   min-height: 34px;
   padding: 6px 12px;
   font-size: 13px;
+}
+
+.term-settings,
+.term-settings__groups,
+.term-qa-report {
+  display: grid;
+  gap: 14px;
+}
+
+.term-settings__group {
+  display: grid;
+  gap: 10px;
+}
+
+.term-settings__group-head,
+.term-qa-report__summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.term-settings__group-head > div,
+.term-qa-report__summary {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.term-settings__group-head strong {
+  display: block;
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.term-settings__table-wrap,
+.term-qa-report__table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+}
+
+.term-settings__table,
+.term-qa-report__table {
+  width: 100%;
+  min-width: 720px;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.term-settings__table th,
+.term-settings__table td,
+.term-qa-report__table th,
+.term-qa-report__table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  text-align: left;
+  vertical-align: top;
+}
+
+.term-settings__table th,
+.term-qa-report__table th {
+  color: var(--text-muted);
+  font-weight: 600;
+  background: var(--surface-muted);
+}
+
+.term-settings__table tr:last-child td,
+.term-qa-report__table tr:last-child td {
+  border-bottom: 0;
+}
+
+.term-settings__table input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--brand-700);
+}
+
+.term-settings__tip {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  margin-left: 4px;
+  border-radius: 50%;
+  color: var(--brand-700);
+  background: color-mix(in srgb, var(--brand-700) 12%, transparent);
+  font-size: 11px;
+  cursor: help;
+}
+
+.term-qa-report__actions {
+  justify-content: flex-start;
 }
 
 @media (max-width: 960px) {

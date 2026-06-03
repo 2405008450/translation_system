@@ -11,11 +11,13 @@ const props = withDefaults(
     itemKey?: VirtualItemKeyResolver
     overscan?: number
     adaptive?: boolean
+    virtualized?: boolean
     activeDescendant?: string | null
   }>(),
   {
     overscan: 4,
     adaptive: false,
+    virtualized: true,
     activeDescendant: null,
     itemKey: undefined,
   },
@@ -103,6 +105,9 @@ function findIndexForOffset(offset: number) {
 }
 
 const startIndex = computed(() => {
+  if (!props.virtualized) {
+    return 0
+  }
   if (!props.adaptive) {
     return Math.max(0, Math.floor(scrollTop.value / props.itemHeight) - props.overscan)
   }
@@ -110,6 +115,9 @@ const startIndex = computed(() => {
 })
 
 const endIndex = computed(() => {
+  if (!props.virtualized) {
+    return props.items.length
+  }
   if (!props.adaptive) {
     const visibleCount = Math.ceil(viewportHeight.value / props.itemHeight) + props.overscan * 2
     return Math.min(props.items.length, startIndex.value + visibleCount)
@@ -237,6 +245,17 @@ async function scrollToIndex(index: number, align: ScrollLogicalPosition = 'cent
     return false
   }
 
+  if (!props.virtualized) {
+    await nextTick()
+    const row = container.querySelector<HTMLElement>(`[data-virtual-index="${index}"]`)
+    if (!row) {
+      return false
+    }
+    row.scrollIntoView({ block: align, inline: 'nearest' })
+    setScrollTopNow(container.scrollTop)
+    return true
+  }
+
   const itemTop = prefixHeights.value[index] || 0
   const itemHeight = getMeasuredHeight(index)
   const maxScrollTop = Math.max(0, totalHeight.value - container.clientHeight)
@@ -343,11 +362,26 @@ onBeforeUnmount(() => {
   <div
     ref="containerRef"
     class="virtual-list"
+    :class="{ 'virtual-list--flow': !virtualized }"
     role="list"
     :aria-activedescendant="activeDescendant || undefined"
     @scroll.passive="onScroll"
   >
-    <div :style="{ height: `${totalHeight}px` }" class="virtual-list-spacer">
+    <div
+      v-if="!virtualized"
+      class="virtual-list-flow"
+    >
+      <div
+        v-for="entry in visibleItems"
+        :key="resolveItemKey(entry.item, entry.index)"
+        class="virtual-list-row"
+        role="listitem"
+        :data-virtual-index="entry.index"
+      >
+        <slot :item="entry.item" :index="entry.index" />
+      </div>
+    </div>
+    <div v-else :style="{ height: `${totalHeight}px` }" class="virtual-list-spacer">
       <div
         class="virtual-list-window"
         :style="{ transform: `translateY(${offsetY}px)` }"

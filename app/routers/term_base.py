@@ -173,8 +173,8 @@ def _serialize_term_entry(entry: TermEntry) -> dict:
     }
 
 
-def _load_bound_term_base_ids(file_record: FileRecord) -> list[str]:
-    raw_ids = getattr(file_record, "term_base_ids", "") or "[]"
+def _load_bound_ids(file_record: FileRecord, field_name: str) -> list[str]:
+    raw_ids = getattr(file_record, field_name, "") or "[]"
     try:
         values = json.loads(raw_ids)
     except (TypeError, ValueError):
@@ -182,15 +182,24 @@ def _load_bound_term_base_ids(file_record: FileRecord) -> list[str]:
     if not isinstance(values, list):
         values = []
     ids = [str(value) for value in values if value]
-    if not ids and file_record.term_base_id:
+    if field_name == "term_base_ids" and not ids and file_record.term_base_id:
         ids.append(str(file_record.term_base_id))
     return list(dict.fromkeys(ids))
+
+
+def _load_bound_term_base_ids(file_record: FileRecord) -> list[str]:
+    return _load_bound_ids(file_record, "term_base_ids")
 
 
 def _store_bound_term_base_ids(file_record: FileRecord, term_base_ids: list[str]) -> None:
     normalized_ids = list(dict.fromkeys(term_base_ids))
     file_record.term_base_id = UUID(normalized_ids[0]) if normalized_ids else None
     file_record.term_base_ids = json.dumps(normalized_ids)
+
+
+def _store_bound_ids(file_record: FileRecord, field_name: str, ids: list[str]) -> None:
+    if hasattr(file_record, field_name):
+        setattr(file_record, field_name, json.dumps(list(dict.fromkeys(ids))))
 
 
 @router.get("/term-bases")
@@ -449,6 +458,15 @@ def delete_term_base(
         ]
         if len(next_ids) != len(current_ids):
             _store_bound_term_base_ids(file_record, next_ids)
+        for field_name in ("term_base_write_ids", "qa_term_base_ids"):
+            current_extra_ids = _load_bound_ids(file_record, field_name)
+            next_extra_ids = [
+                term_base_id
+                for term_base_id in current_extra_ids
+                if term_base_id != deleted_id
+            ]
+            if len(next_extra_ids) != len(current_extra_ids):
+                _store_bound_ids(file_record, field_name, next_extra_ids)
     (
         db.query(TermEntry)
         .filter(TermEntry.term_base_id == term_base.id)

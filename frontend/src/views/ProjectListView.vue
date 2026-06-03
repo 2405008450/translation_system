@@ -3,6 +3,7 @@ import axios from 'axios'
 import {
   Copy,
   Database,
+  FileText,
   Filter,
   Flag,
   FolderOpen,
@@ -26,6 +27,7 @@ import Pagination from '../components/Pagination.vue'
 import RowActionMenu from '../components/RowActionMenu.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { useToast } from '../composables/useToast'
+import { formatLanguagePair } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
 import type { IssueMarker, User } from '../types/api'
@@ -65,6 +67,18 @@ interface ProjectCreateResponse {
   id: string
 }
 
+interface ProjectFileItem {
+  id: string
+  filename: string
+  source_language: string | null
+  target_language: string | null
+}
+
+interface ProjectDetailResponse extends ProjectItem {
+  translation_guidelines: string
+  files: ProjectFileItem[]
+}
+
 const confirm = useConfirm()
 const toast = useToast()
 const router = useRouter()
@@ -80,12 +94,20 @@ const searchQuery = ref('')
 const sortKey = ref('')
 const sortOrder = ref<'asc' | 'desc'>('desc')
 const pageError = ref('')
+const selectedProjectIds = ref(new Set<string>())
 
 const showCreateDialog = ref(false)
 const creating = ref(false)
 const formError = ref('')
 const showIssueDialog = ref(false)
 const issueTarget = ref<ProjectItem | null>(null)
+const showDuplicateDialog = ref(false)
+const loadingDuplicateDialog = ref(false)
+const duplicatingProject = ref(false)
+const duplicateError = ref('')
+const duplicateTemplates = ref<ProjectItem[]>([])
+const duplicateTemplateProjectId = ref('')
+const duplicateTemplateDetail = ref<ProjectDetailResponse | null>(null)
 
 const defaultForm = () => ({
   name: '',
@@ -94,6 +116,14 @@ const defaultForm = () => ({
 })
 
 const form = reactive(defaultForm())
+
+const defaultDuplicateForm = () => ({
+  name: '',
+  deadline: '',
+  access_level: 'team' as 'team' | 'private' | 'public',
+})
+
+const duplicateForm = reactive(defaultDuplicateForm())
 
 const accessOptions = computed(() => ([
   { value: 'team', label: t('projectList.form.team') },
@@ -115,6 +145,28 @@ const columns = computed<DataTableColumn[]>(() => ([
 
 const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
 const canManageProjects = computed(() => authStore.isAdmin)
+const selectedProjects = computed(() => (
+  projects.value.filter((project) => selectedProjectIds.value.has(project.id))
+))
+const duplicateButtonTitle = computed(() => {
+  if (selectedProjectIds.value.size > 1) {
+    return t('projectList.duplicate.selectOne')
+  }
+  if (selectedProjectIds.value.size === 1) {
+    return t('projectList.duplicate.useSelected')
+  }
+  return t('projectList.duplicate.selectHint')
+})
+const canOpenDuplicateDialog = computed(() => (
+  canManageProjects.value
+  && selectedProjectIds.value.size <= 1
+  && !loadingDuplicateDialog.value
+  && !duplicatingProject.value
+))
+const selectedDuplicateTemplate = computed(() => (
+  duplicateTemplates.value.find((project) => project.id === duplicateTemplateProjectId.value) || null
+))
+const duplicateTemplateFileCount = computed(() => duplicateTemplateDetail.value?.files.length ?? 0)
 
 function isProjectAssignedToCurrentUser(project: ProjectItem) {
   const currentUserId = authStore.user?.id
@@ -122,6 +174,13 @@ function isProjectAssignedToCurrentUser(project: ProjectItem) {
     return true
   }
   return (project.assigned_users || []).some((user) => user.id === currentUserId)
+}
+
+function getProjectListError(error: unknown, fallback: string) {
+  if (axios.isAxiosError(error)) {
+    return String(error.response?.data?.detail || fallback)
+  }
+  return error instanceof Error ? error.message : fallback
 }
 
 async function loadProjects() {
@@ -138,10 +197,12 @@ async function loadProjects() {
       const start = (currentPage.value - 1) * pageSize.value
       projects.value = visibleItems.slice(start, start + pageSize.value)
       totalCount.value = visibleItems.length
+      syncSelectedProjectsToVisibleRows()
       return
     }
     projects.value = visibleItems
     totalCount.value = data.total
+    syncSelectedProjectsToVisibleRows()
   } catch (error) {
     if (axios.isAxiosError(error)) {
       pageError.value = String(error.response?.data?.detail || t('projectList.errors.load'))
@@ -192,6 +253,148 @@ async function createProject() {
     formError.value = error instanceof Error ? error.message : t('projectList.errors.create')
   } finally {
     creating.value = false
+  }
+}
+
+function syncSelectedProjectsToVisibleRows() {
+  const visibleIds = new Set(projects.value.map((project) => project.id))
+  selectedProjectIds.value = new Set(
+    Array.from(selectedProjectIds.value).filter((id) => visibleIds.has(id)),
+  )
+}
+
+function handleProjectSelection(ids: Set<string>) {
+  selectedProjectIds.value = new Set(ids)
+}
+
+function resetDuplicateDialog() {
+  Object.assign(duplicateForm, defaultDuplicateForm())
+  duplicateError.value = ''
+  duplicateTemplateProjectId.value = ''
+  duplicateTemplateDetail.value = null
+}
+
+function formatDateTimeLocalValue(value: string | null) {
+  if (!value) {
+    return ''
+  }
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return ''
+  }
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return [
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
+    `${pad(date.getHours())}:${pad(date.getMinutes())}`,
+  ].join('T')
+}
+
+function buildDuplicateProjectName(name: string) {
+  const suffix = ' - 副本'
+  const baseName = (name || t('projectDetail.titleFallback')).trim()
+  return `${baseName.slice(0, Math.max(1, 200 - suffix.length))}${suffix}`
+}
+
+function normalizeAccessLevel(level: string | null | undefined): 'team' | 'private' | 'public' {
+  return level === 'private' || level === 'public' || level === 'team' ? level : 'team'
+}
+
+function syncDuplicateFormFromTemplate(detail: ProjectDetailResponse) {
+  duplicateForm.name = buildDuplicateProjectName(detail.name || detail.filename)
+  duplicateForm.deadline = formatDateTimeLocalValue(detail.deadline)
+  duplicateForm.access_level = normalizeAccessLevel(detail.access_level)
+}
+
+async function loadDuplicateTemplates() {
+  const { data } = await http.get<ProjectListResponse>('/projects', {
+    params: { skip: 0, limit: 500, search: '' },
+  })
+  duplicateTemplates.value = data.items.filter(isProjectAssignedToCurrentUser)
+}
+
+async function loadDuplicateTemplateDetail(projectId: string) {
+  if (!projectId) {
+    duplicateTemplateDetail.value = null
+    return
+  }
+  loadingDuplicateDialog.value = true
+  duplicateError.value = ''
+  duplicateTemplateDetail.value = null
+  try {
+    const { data } = await http.get<ProjectDetailResponse>(`/projects/${projectId}`)
+    duplicateTemplateDetail.value = data
+    syncDuplicateFormFromTemplate(data)
+  } catch (error) {
+    duplicateError.value = getProjectListError(error, t('projectList.errors.duplicateTemplateLoad'))
+  } finally {
+    loadingDuplicateDialog.value = false
+  }
+}
+
+async function openDuplicateDialog() {
+  if (!canOpenDuplicateDialog.value) {
+    return
+  }
+  const preferredTemplateId = selectedProjects.value.length === 1 ? selectedProjects.value[0].id : ''
+  resetDuplicateDialog()
+  showDuplicateDialog.value = true
+  loadingDuplicateDialog.value = true
+  try {
+    await loadDuplicateTemplates()
+    const preferredProject = duplicateTemplates.value.find((project) => project.id === preferredTemplateId)
+    const templateProject = preferredProject || duplicateTemplates.value[0]
+    if (templateProject) {
+      duplicateTemplateProjectId.value = templateProject.id
+      await loadDuplicateTemplateDetail(templateProject.id)
+    }
+  } catch (error) {
+    duplicateError.value = getProjectListError(error, t('projectList.errors.duplicateTemplateLoad'))
+  } finally {
+    loadingDuplicateDialog.value = false
+  }
+}
+
+function closeDuplicateDialog() {
+  if (duplicatingProject.value) {
+    return
+  }
+  showDuplicateDialog.value = false
+  resetDuplicateDialog()
+}
+
+async function handleDuplicateTemplateChange(event: Event) {
+  const projectId = (event.target as HTMLSelectElement).value
+  duplicateTemplateProjectId.value = projectId
+  await loadDuplicateTemplateDetail(projectId)
+}
+
+async function duplicateProjectFromTemplate() {
+  if (!duplicateTemplateProjectId.value) {
+    duplicateError.value = t('projectList.errors.duplicateTemplateRequired')
+    return
+  }
+  if (!duplicateForm.name.trim()) {
+    duplicateError.value = t('projectList.errors.requiredName')
+    return
+  }
+
+  duplicatingProject.value = true
+  duplicateError.value = ''
+  try {
+    const { data } = await http.post<ProjectDetailResponse>(`/projects/${duplicateTemplateProjectId.value}/duplicate`, {
+      name: duplicateForm.name.trim(),
+      deadline: duplicateForm.deadline || null,
+      access_level: duplicateForm.access_level,
+    })
+    showDuplicateDialog.value = false
+    resetDuplicateDialog()
+    toast.success(t('projectList.messages.duplicated', { name: data.name || data.filename }))
+    await loadProjects()
+    await router.push({ name: 'project-detail', params: { id: data.id } })
+  } catch (error) {
+    duplicateError.value = getProjectListError(error, t('projectList.errors.duplicate'))
+  } finally {
+    duplicatingProject.value = false
   }
 }
 
@@ -319,6 +522,13 @@ onMounted(() => {
           />
         </div>
         <span class="table-toolbar__summary">{{ t('projectList.total', { total: totalCount }) }}</span>
+        <span
+          v-if="canManageProjects && selectedProjectIds.size > 0"
+          class="table-toolbar__selected"
+          :class="{ 'is-warning': selectedProjectIds.size > 1 }"
+        >
+          {{ t('projectList.selectedSummary', { count: selectedProjectIds.size }) }}
+        </span>
       </div>
       <div class="table-toolbar__right">
         <button
@@ -341,7 +551,14 @@ onMounted(() => {
           <Database :size="14" />
           {{ t('projectList.importAssets') }}
         </button>
-        <button class="button" type="button" disabled :title="t('common.comingSoon')">
+        <button
+          v-if="canManageProjects"
+          class="button"
+          type="button"
+          :title="duplicateButtonTitle"
+          :disabled="!canOpenDuplicateDialog"
+          @click="openDuplicateDialog"
+        >
           <Copy :size="14" />
           {{ t('projectList.fromTemplate') }}
         </button>
@@ -365,12 +582,15 @@ onMounted(() => {
         :columns="columns"
         :data="projects"
         :loading="loading"
+        :selectable="canManageProjects"
+        :selected-ids="selectedProjectIds"
         :sort-key="sortKey"
         :sort-order="sortOrder"
         :show-index="true"
         :index-offset="indexOffset"
         :empty-text="t('projectList.empty')"
         @sort="handleSort"
+        @select="handleProjectSelection"
       >
         <template #filename="{ row }">
           <button
@@ -556,6 +776,105 @@ onMounted(() => {
       </template>
     </Modal>
 
+    <Modal
+      :open="showDuplicateDialog"
+      :title="t('projectList.duplicateDialogTitle')"
+      :description="t('projectList.duplicateDialogDescription')"
+      width="min(640px, calc(100vw - 32px))"
+      @close="closeDuplicateDialog"
+    >
+      <div class="duplicate-dialog" data-testid="project-duplicate-dialog">
+        <label class="field field--full">
+          <span class="field__label">{{ t('projectList.duplicate.templateProject') }}</span>
+          <select
+            class="field__control"
+            data-testid="project-duplicate-template"
+            :value="duplicateTemplateProjectId"
+            :disabled="loadingDuplicateDialog || duplicatingProject"
+            @change="handleDuplicateTemplateChange"
+          >
+            <option value="" disabled>{{ t('projectList.duplicate.templatePlaceholder') }}</option>
+            <option v-for="item in duplicateTemplates" :key="item.id" :value="item.id">
+              {{ item.filename }}
+            </option>
+          </select>
+        </label>
+
+        <p v-if="duplicateTemplates.length === 0 && !loadingDuplicateDialog" class="form-hint">
+          {{ t('projectList.duplicate.emptyTemplates') }}
+        </p>
+
+        <div v-if="loadingDuplicateDialog" class="duplicate-dialog__loading">
+          <Loader2 class="lucide-spin" :size="16" />
+          <span>{{ t('common.loading') }}</span>
+        </div>
+
+        <template v-if="duplicateTemplateDetail">
+          <section class="duplicate-dialog__section">
+            <div class="duplicate-dialog__section-title">
+              <FileText :size="15" />
+              <span>{{ t('projectList.duplicate.basicInfo') }}</span>
+            </div>
+            <div class="duplicate-dialog__summary">
+              <span>{{ t('projectList.duplicate.sourceProject') }}：{{ selectedDuplicateTemplate?.filename || duplicateTemplateDetail.filename }}</span>
+              <span>{{ t('projectList.duplicate.templateFileCount') }}：{{ duplicateTemplateFileCount }}</span>
+              <span>{{ t('projectList.duplicate.languagePair') }}：{{ formatLanguagePair(duplicateTemplateDetail.source_language, duplicateTemplateDetail.target_language) }}</span>
+            </div>
+            <p class="form-hint">{{ t('projectList.duplicate.basicOnlyHint') }}</p>
+            <div class="form-grid duplicate-dialog__form">
+              <label class="field field--full">
+                <span class="field__label">{{ t('projectList.form.name') }} <span class="field__required">*</span></span>
+                <input
+                  v-model="duplicateForm.name"
+                  class="field__control"
+                  data-testid="project-duplicate-name"
+                  type="text"
+                  maxlength="200"
+                  :disabled="duplicatingProject"
+                />
+              </label>
+              <label class="field">
+                <span class="field__label">{{ t('projectList.form.deadline') }}</span>
+                <input
+                  v-model="duplicateForm.deadline"
+                  class="field__control"
+                  type="datetime-local"
+                  :disabled="duplicatingProject"
+                />
+              </label>
+              <label class="field">
+                <span class="field__label">{{ t('projectList.form.accessLevel') }}</span>
+                <select v-model="duplicateForm.access_level" class="field__control" :disabled="duplicatingProject">
+                  <option v-for="option in accessOptions" :key="option.value" :value="option.value">
+                    {{ option.label }}
+                  </option>
+                </select>
+              </label>
+            </div>
+          </section>
+        </template>
+
+        <p v-if="duplicateError" class="form-message is-error">{{ duplicateError }}</p>
+      </div>
+
+      <template #footer>
+        <button class="button" type="button" :disabled="duplicatingProject" @click="closeDuplicateDialog">
+          {{ t('common.actions.cancel') }}
+        </button>
+        <button
+          class="button button--primary"
+          data-testid="project-duplicate-submit"
+          type="button"
+          :disabled="duplicatingProject || loadingDuplicateDialog || !duplicateTemplateProjectId || !duplicateForm.name.trim()"
+          @click="duplicateProjectFromTemplate"
+        >
+          <Loader2 v-if="duplicatingProject" class="lucide-spin" :size="14" />
+          <Copy v-else :size="14" />
+          {{ duplicatingProject ? t('projectList.actions.duplicating') : t('projectList.actions.duplicateSubmit') }}
+        </button>
+      </template>
+    </Modal>
+
     <IssueMarkerDialog
       :open="showIssueDialog"
       :project-id="issueTarget?.id ?? null"
@@ -574,6 +893,23 @@ onMounted(() => {
 .table-toolbar__summary {
   color: var(--text-muted);
   font-size: 13px;
+}
+
+.table-toolbar__selected {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--state-info-bg);
+  color: var(--state-info);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.table-toolbar__selected.is-warning {
+  background: var(--state-warning-bg);
+  color: var(--state-warning);
 }
 
 .table-page__message {
@@ -677,6 +1013,58 @@ onMounted(() => {
 
 .form-hint {
   margin: 12px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.duplicate-dialog {
+  display: grid;
+  gap: 16px;
+}
+
+.duplicate-dialog__loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.duplicate-dialog__section {
+  display: grid;
+  gap: 12px;
+  padding-top: 4px;
+}
+
+.duplicate-dialog__section-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.duplicate-dialog__summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.duplicate-dialog__summary span {
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--surface-muted);
+}
+
+.duplicate-dialog__form {
+  margin-top: 2px;
+}
+
+.duplicate-dialog__empty {
+  margin: 0;
   color: var(--text-muted);
   font-size: 13px;
 }

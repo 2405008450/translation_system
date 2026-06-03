@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     redis_url: str | None = None
     import_queue_backend: str = "local"
     aspose_words_license_path: str | None = None
+    libreoffice_soffice_path: str | None = None
+    libreoffice_python_path: str | None = None
+    libreoffice_timeout_seconds: float = 60.0
     tm_vector_enabled: bool = True
     tm_vector_dimensions: int = 128
     tm_vector_candidate_limit: int = 6

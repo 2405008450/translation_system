@@ -12,6 +12,7 @@ from typing import Any
 import yaml
 
 from app.services.language_pairs import LANGUAGE_LABELS
+from app.services.libreoffice_service import LibreOfficeError, convert_word_to_docx
 
 
 MAX_TEXT_BYTES = 512 * 1024
@@ -33,7 +34,7 @@ SUPPORTED_TEXT_EXTENSIONS = {
     ".yaml",
     ".yml",
 }
-SUPPORTED_DOCUMENT_EXTENSIONS = {".docx"}
+SUPPORTED_DOCUMENT_EXTENSIONS = {".doc", ".docx"}
 SUPPORTED_OFFICE_EXTENSIONS = {".pptx", ".xlsx"}
 SUPPORTED_EXTENSIONS = SUPPORTED_TEXT_EXTENSIONS | SUPPORTED_DOCUMENT_EXTENSIONS | SUPPORTED_OFFICE_EXTENSIONS
 
@@ -125,7 +126,12 @@ def _empty_result(*, supported: bool, message: str) -> LanguageDetectionResult:
 
 
 def _extract_sample_text(extension: str, raw_bytes: bytes) -> str:
-    if extension == ".docx":
+    if extension in {".doc", ".docx"}:
+        if extension == ".doc":
+            try:
+                raw_bytes = convert_word_to_docx(raw_bytes, "source.doc")
+            except LibreOfficeError:
+                return ""
         return _extract_docx_text(raw_bytes)
     if extension == ".pptx":
         return _extract_pptx_text(raw_bytes)

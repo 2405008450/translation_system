@@ -31,7 +31,7 @@ async function login(page: Page) {
   ])
 }
 
-async function createProjectWithFixtureAndOpenFocusWorkbench(page: Page, projectName: string) {
+async function createProjectWithFixture(page: Page, projectName: string) {
   await page.getByTestId('project-create-button').click()
   await expect(page.getByTestId('project-create-dialog')).toBeVisible()
   await page.getByTestId('project-create-name').fill(projectName)
@@ -50,6 +50,10 @@ async function createProjectWithFixtureAndOpenFocusWorkbench(page: Page, project
 
   await expect(page.getByTestId('project-upload-page')).toBeHidden({ timeout: 45_000 })
   await expect(page.getByTestId('project-file-table')).toContainText('smoke-source.txt')
+}
+
+async function createProjectWithFixtureAndOpenFocusWorkbench(page: Page, projectName: string) {
+  await createProjectWithFixture(page, projectName)
 
   const focusPagePromise = page.waitForEvent('popup')
   await page.getByTestId('project-file-open-workbench').click()
@@ -134,6 +138,42 @@ test.describe.serial('核心 E2E 冒烟流程', () => {
   test('系统初始化后可以重新登录', async ({ page }) => {
     await login(page)
     await expect(page.getByTestId('project-table')).toBeVisible()
+  })
+
+  test('项目详情工具栏删除只删除选中文件', async ({ page }) => {
+    const projectDeleteRequests: string[] = []
+    page.on('request', (request) => {
+      if (request.method() === 'DELETE' && /\/api\/projects\/[0-9a-f-]+/i.test(request.url())) {
+        projectDeleteRequests.push(request.url())
+      }
+    })
+
+    await login(page)
+    await createProjectWithFixture(page, `E2E Delete File ${Date.now()}`)
+    const detailUrl = page.url()
+
+    const deleteSelectedButton = page.getByTestId('project-file-delete-selected')
+    await expect(deleteSelectedButton).toBeDisabled()
+
+    const fileTable = page.getByTestId('project-file-table')
+    await fileTable.getByRole('checkbox', { name: '选择第 1 行' }).check()
+    await expect(deleteSelectedButton).toBeEnabled()
+
+    await deleteSelectedButton.click()
+    await expect(page.getByTestId('confirm-accept')).toBeVisible()
+    await expect(page.getByText('确定删除文件“smoke-source.txt”吗？删除后无法恢复。')).toBeVisible()
+
+    const deleteFileResponse = page.waitForResponse((response) => (
+      response.request().method() === 'DELETE'
+      && /\/api\/file-records\/[0-9a-f-]+/i.test(response.url())
+      && response.status() < 400
+    ))
+    await page.getByTestId('confirm-accept').click()
+    await deleteFileResponse
+
+    await expect(page).toHaveURL(detailUrl)
+    await expect(fileTable).not.toContainText('smoke-source.txt')
+    expect(projectDeleteRequests).toEqual([])
   })
 
   test('创建项目、上传 TXT、编辑保存并导出', async ({ page }) => {

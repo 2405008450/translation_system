@@ -59,7 +59,7 @@ const wordTranslationOptionKeys: ParseOptionKey[] = [
   'include_comments',
 ]
 
-const formatOrder = ['.docx', '.pptx', '.xlsx', '.md', '.dat', '.dxf', '.idml', '.xml', '.yaml', '.yml']
+const formatOrder = ['.docx', '.doc', '.pptx', '.xlsx', '.md', '.dat', '.dxf', '.idml', '.xml', '.yaml', '.yml']
 
 const selectedExtensions = computed(() => {
   const extensions = new Set<string>()

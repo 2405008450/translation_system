@@ -80,11 +80,16 @@ import type {
   LLMTranslateScope,
   SaveToTMResult,
   Segment,
+  SegmentPositionResponse,
   TMCollection,
   TermBase,
   TermEntryRecord,
+  TermQAReport,
+  TermQAReportItem,
+  TermQAReportListResponse,
 } from '../types/api'
 import { buildDocumentPreviewHtml } from '../utils/documentPreview'
+import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 
 const props = defineProps<{
   id: string
@@ -178,6 +183,7 @@ const showIssueDialog = ref(false)
 const importDialogInitialTab = ref<ResourceImportTab>('tm')
 const showShortcutHelp = ref(false)
 const showSaveToTMDialog = ref(false)
+const showTermQAReportDialog = ref(false)
 const openConfirmMenu = ref(false)
 const confirmationActionLoading = ref(false)
 const openRevisionMenu = ref<RevisionMenuKind | null>(null)
@@ -201,6 +207,13 @@ const saveToTMScope = ref<SaveToTMScope>('translated')
 const saveToTMTargetMode = ref<SaveToTMTargetMode>('new')
 const saveToTMCollectionId = ref('')
 const saveToTMNewCollectionName = ref('')
+const termQAReport = ref<TermQAReport | null>(null)
+const loadingTermQAReport = ref(false)
+const generatingTermQAReport = ref(false)
+const downloadingTermQAReport = ref(false)
+const locatingTermQAReportItemId = ref<string | null>(null)
+const updatingTermQAIgnore = ref(false)
+const selectedTermQAItemIds = ref<Set<string>>(new Set())
 
 // 富文本编辑相关
 const richTextEditor = useRichTextEditor()
@@ -248,6 +261,11 @@ const selectedTermBaseId = ref('')
 const loadingTermBases = ref(false)
 const loadingTermEntries = ref(false)
 const addingTerm = ref(false)
+const showAddTermDialog = ref(false)
+const addTermSourceText = ref('')
+const addTermTargetText = ref('')
+const addTermTargetBaseId = ref('')
+const addTermFormError = ref('')
 const termsMessage = ref(t('workbench.terms.defaultMessage'))
 let searchLoadRequestId = 0
 let suppressSegmentFilterWatch = false
@@ -328,10 +346,14 @@ const exportInfo = computed(() => {
 const isOfficeFormat = computed(() => {
   const filename = segmentStore.fileRecord?.filename || ''
   const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase()
-  return ['.docx', '.xlsx', '.pptx', '.pdf'].includes(ext)
+  return ['.doc', '.docx', '.xlsx', '.pptx', '.pdf'].includes(ext)
 })
 
 function resolveItemHeight() {
+  const stableGrid = Boolean(props.standalone)
+  if (stableGrid && window.innerWidth > 1180) {
+    return 56
+  }
   if (window.innerWidth <= 720) {
     return 276
   }
@@ -572,6 +594,29 @@ function formatWorkbenchStatusTime(value: string | null | undefined) {
     })
     .replace(/\//g, '-')
 }
+
+const activeTermQAReportItems = computed(() => termQAReport.value?.items.filter((item) => !item.ignored) ?? [])
+
+const ignoredTermQAReportItems = computed(() => termQAReport.value?.items.filter((item) => item.ignored) ?? [])
+
+const termQAReportPreviewItems = computed(() => activeTermQAReportItems.value.slice(0, 6))
+
+const selectedTermQAReportItems = computed(() => (
+  termQAReport.value?.items.filter((item) => selectedTermQAItemIds.value.has(item.id)) ?? []
+))
+
+const selectedActiveTermQAReportItems = computed(() => (
+  selectedTermQAReportItems.value.filter((item) => !item.ignored)
+))
+
+const allActiveTermQAItemsSelected = computed(() => (
+  activeTermQAReportItems.value.length > 0
+  && activeTermQAReportItems.value.every((item) => selectedTermQAItemIds.value.has(item.id))
+))
+
+const termQAReportCreatedAtText = computed(() => (
+  formatWorkbenchStatusTime(termQAReport.value?.created_at)
+))
 
 const lastModifiedStatusText = computed(() => {
   const modifiedAt = (
@@ -822,6 +867,35 @@ const saveToTMPreviewStats = computed(() => {
 const taskTMCollectionId = computed(() => segmentStore.fileRecord?.collection_id || '')
 const canOpenIssueDialog = computed(() => Boolean(segmentStore.fileRecord?.project_id))
 
+const boundTermBaseIds = computed(() => {
+  const fileRecord = segmentStore.fileRecord
+  if (!fileRecord) {
+    return []
+  }
+  if (fileRecord.term_base_ids?.length) {
+    return fileRecord.term_base_ids
+  }
+  return fileRecord.term_base_id ? [fileRecord.term_base_id] : []
+})
+
+const addTermTargetTermBases = computed(() => {
+  const boundIds = new Set(boundTermBaseIds.value)
+  const writableIds = segmentStore.fileRecord?.term_base_write_ids || []
+  const targetIds = writableIds.length > 0
+    ? writableIds.filter((id) => boundIds.has(id))
+    : boundTermBaseIds.value
+  const allowedIds = new Set(targetIds)
+  return termBases.value.filter((termBase) => allowedIds.has(termBase.id))
+})
+
+const addTermCanSubmit = computed(() => Boolean(
+  addTermSourceText.value.trim()
+  && addTermTargetText.value.trim()
+  && addTermTargetBaseId.value
+  && addTermTargetTermBases.value.some((termBase) => termBase.id === addTermTargetBaseId.value)
+  && !addingTerm.value,
+))
+
 const selectedTermBaseName = computed(() => (
   termBases.value.find((termBase) => termBase.id === selectedTermBaseId.value)?.name
   || segmentStore.fileRecord?.term_base_name
@@ -925,9 +999,10 @@ async function loadTermBases() {
     const filtered = data.filter((termBase) => (
       termBase.source_language === segmentStore.fileRecord?.source_language
       && termBase.target_language === segmentStore.fileRecord?.target_language
+      && boundTermBaseIds.value.includes(termBase.id)
     ))
 
-    termBases.value = filtered.length > 0 ? filtered : data
+    termBases.value = filtered
 
     const savedId = window.localStorage.getItem(getTermBaseStorageKey())
     const fallbackId = termBases.value[0]?.id || ''
@@ -1417,6 +1492,244 @@ function showRibbonPlaceholder(name: string) {
   })
 }
 
+function setCurrentTermQAReport(report: TermQAReport | null) {
+  termQAReport.value = report
+  const validIds = new Set(report?.items.filter((item) => !item.ignored).map((item) => item.id) ?? [])
+  selectedTermQAItemIds.value = new Set(
+    [...selectedTermQAItemIds.value].filter((id) => validIds.has(id)),
+  )
+}
+
+async function loadLatestTermQAReport() {
+  if (!segmentStore.fileRecord || loadingTermQAReport.value) {
+    return
+  }
+  loadingTermQAReport.value = true
+  try {
+    const { data } = await http.get<TermQAReportListResponse>(
+      `/file-records/${segmentStore.fileRecord.id}/term-qa-reports`,
+      {
+        params: {
+          limit: 1,
+          include_items: true,
+        },
+      },
+    )
+    setCurrentTermQAReport(data.items[0] || null)
+  } catch (error) {
+    console.error('Failed to load latest term QA report:', error)
+    setCurrentTermQAReport(null)
+  } finally {
+    loadingTermQAReport.value = false
+  }
+}
+
+async function generateCurrentFileTermQAReport() {
+  if (!segmentStore.fileRecord || generatingTermQAReport.value) {
+    return
+  }
+  generatingTermQAReport.value = true
+  try {
+    const synced = await segmentStore.syncToBackend()
+    if (!synced) {
+      return
+    }
+    const { data } = await http.post<TermQAReport>(
+      `/file-records/${segmentStore.fileRecord.id}/term-qa-reports`,
+    )
+    setCurrentTermQAReport(data)
+    showTermQAReportDialog.value = true
+    toast.show({
+      tone: data.issue_count > 0 ? 'warn' : 'success',
+      title: '术语QA报告已生成',
+      message: `发现 ${data.issue_count} 条术语问题。`,
+    })
+  } catch (error) {
+    toast.error({
+      title: '术语QA报告生成失败',
+      message: getErrorMessage(error, '术语QA报告生成失败。'),
+    })
+  } finally {
+    generatingTermQAReport.value = false
+  }
+}
+
+async function clearSegmentFiltersForTermQANavigation() {
+  if (!hasEditorSegmentFilter.value) {
+    return
+  }
+  suppressSegmentFilterWatch = true
+  resetSegmentSearch()
+  await nextTick()
+  suppressSegmentFilterWatch = false
+}
+
+function toggleTermQAItemSelection(itemId: string, checked: boolean) {
+  const next = new Set(selectedTermQAItemIds.value)
+  if (checked) {
+    next.add(itemId)
+  } else {
+    next.delete(itemId)
+  }
+  selectedTermQAItemIds.value = next
+}
+
+function handleTermQAItemSelectionChange(itemId: string, event: Event) {
+  toggleTermQAItemSelection(itemId, (event.target as HTMLInputElement).checked)
+}
+
+function toggleAllActiveTermQAItems(checked: boolean) {
+  if (!checked) {
+    selectedTermQAItemIds.value = new Set(
+      [...selectedTermQAItemIds.value].filter((id) => ignoredTermQAReportItems.value.some((item) => item.id === id)),
+    )
+    return
+  }
+  selectedTermQAItemIds.value = new Set([
+    ...selectedTermQAItemIds.value,
+    ...activeTermQAReportItems.value.map((item) => item.id),
+  ])
+}
+
+async function setTermQAReportItemsIgnored(itemIds: string[], ignored: boolean) {
+  if (!termQAReport.value || updatingTermQAIgnore.value || itemIds.length === 0) {
+    return
+  }
+  updatingTermQAIgnore.value = true
+  try {
+    const { data } = await http.patch<TermQAReport>(
+      `/term-qa-reports/${termQAReport.value.id}/items/ignore`,
+      {
+        item_ids: itemIds,
+        ignored,
+      },
+    )
+    setCurrentTermQAReport(data)
+    toast.success(ignored ? '已忽略所选术语 QA 项。' : '已恢复所选术语 QA 项。')
+  } catch (error) {
+    toast.error({
+      title: ignored ? '忽略失败' : '恢复失败',
+      message: getErrorMessage(error, ignored ? '忽略术语 QA 项失败。' : '恢复术语 QA 项失败。'),
+    })
+  } finally {
+    updatingTermQAIgnore.value = false
+  }
+}
+
+async function setSingleTermQAReportItemIgnored(item: TermQAReportItem, ignored: boolean) {
+  if (updatingTermQAIgnore.value) {
+    return
+  }
+  updatingTermQAIgnore.value = true
+  try {
+    const { data } = await http.patch<TermQAReport>(
+      `/term-qa-report-items/${item.id}/ignore`,
+      { ignored },
+    )
+    setCurrentTermQAReport(data)
+    toast.success(ignored ? '已忽略该术语 QA 项。' : '已恢复该术语 QA 项。')
+  } catch (error) {
+    toast.error({
+      title: ignored ? '忽略失败' : '恢复失败',
+      message: getErrorMessage(error, ignored ? '忽略术语 QA 项失败。' : '恢复术语 QA 项失败。'),
+    })
+  } finally {
+    updatingTermQAIgnore.value = false
+  }
+}
+
+async function ignoreSelectedTermQAReportItems() {
+  if (selectedActiveTermQAReportItems.value.length === 0) {
+    toast.warn('请先选择未忽略的术语 QA 项。')
+    return
+  }
+  await setTermQAReportItemsIgnored(
+    selectedActiveTermQAReportItems.value.map((item) => item.id),
+    true,
+  )
+}
+
+async function focusTermQAReportItem(item: TermQAReportItem) {
+  const fileRecord = segmentStore.fileRecord
+  if (!fileRecord || locatingTermQAReportItemId.value) {
+    return
+  }
+  if (item.file_record_id !== fileRecord.id) {
+    toast.warn('该报告项不属于当前文件。')
+    return
+  }
+
+  locatingTermQAReportItemId.value = item.id
+  try {
+    const currentPageIndex = editorSegments.value.findIndex(
+      (segment) => segment.sentence_id === item.sentence_id,
+    )
+    if (currentPageIndex >= 0) {
+      await focusEditorSegmentAtIndex(currentPageIndex)
+      showTermQAReportDialog.value = false
+      return
+    }
+
+    const synced = await segmentStore.syncToBackend()
+    if (!synced) {
+      return
+    }
+
+    const { data } = await http.get<SegmentPositionResponse>(
+      `/file-records/${fileRecord.id}/segments/${encodeURIComponent(item.sentence_id)}/position`,
+      {
+        params: {
+          page_size: segmentStore.pageSize,
+        },
+      },
+    )
+    await clearSegmentFiltersForTermQANavigation()
+    await refreshSegmentPage(data.page, data.page_size)
+    const targetIndex = editorSegments.value.findIndex(
+      (segment) => segment.sentence_id === item.sentence_id,
+    )
+    if (targetIndex === -1) {
+      toast.warn('已切换到目标页，但未找到对应句段。')
+      return
+    }
+    await focusEditorSegmentAtIndex(targetIndex)
+    showTermQAReportDialog.value = false
+  } catch (error) {
+    toast.error({
+      title: '跳转 QA 句段失败',
+      message: getErrorMessage(error, '无法定位报告中的句段。'),
+    })
+  } finally {
+    locatingTermQAReportItemId.value = null
+  }
+}
+
+async function downloadCurrentTermQAReport() {
+  if (!termQAReport.value || downloadingTermQAReport.value) {
+    return
+  }
+  downloadingTermQAReport.value = true
+  try {
+    const response = await http.get(`/term-qa-reports/${termQAReport.value.id}/export-xlsx`, {
+      responseType: 'blob',
+    })
+    downloadBlob(
+      response.data,
+      resolveDownloadFilename(
+        response.headers['content-disposition'],
+        `term-qa-report-${termQAReport.value.id}.xlsx`,
+      ),
+    )
+  } catch (error) {
+    toast.error({
+      title: '术语QA报告导出失败',
+      message: getErrorMessage(error, '术语QA报告导出失败。'),
+    })
+  } finally {
+    downloadingTermQAReport.value = false
+  }
+}
+
 function setSegmentEditorRowRef(sentenceId: string, instance: Element | ComponentPublicInstance | null) {
   if (instance) {
     segmentEditorRowRefs.set(sentenceId, instance as SegmentEditorRowPublic)
@@ -1793,36 +2106,81 @@ function clearActiveTarget() {
   toast.success(t('workbench.ribbon.messages.targetCleared'))
 }
 
-async function addActiveSegmentTerm() {
+function resolveAddTermTargetBaseId() {
+  const candidates = addTermTargetTermBases.value
+  if (candidates.some((termBase) => termBase.id === addTermTargetBaseId.value)) {
+    return addTermTargetBaseId.value
+  }
+  if (candidates.some((termBase) => termBase.id === selectedTermBaseId.value)) {
+    return selectedTermBaseId.value
+  }
+  const legacyBoundId = segmentStore.fileRecord?.term_base_id || ''
+  if (legacyBoundId && candidates.some((termBase) => termBase.id === legacyBoundId)) {
+    return legacyBoundId
+  }
+  return candidates[0]?.id || ''
+}
+
+async function openAddTermDialog() {
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
     return
   }
-  if (!selectedTermBaseId.value) {
-    toast.warn(t('workbench.ribbon.messages.selectTermBaseFirst'))
+
+  if (termBases.value.length === 0 && !loadingTermBases.value) {
+    await loadTermBases()
+  }
+
+  if (addTermTargetTermBases.value.length === 0) {
+    toast.warn('当前文件没有可写入的已启用术语库。')
     activeTool.value = 'terms'
     return
   }
 
-  const sourceText = normalizeTextForSaveToTM(activeSegment.value.source_text)
-  const targetText = normalizeTextForSaveToTM(activeSegment.value.target_text)
+  addTermSourceText.value = normalizeTextForSaveToTM(activeSegment.value.source_text || activeSegment.value.display_text || '')
+  addTermTargetText.value = normalizeTextForSaveToTM(activeSegment.value.target_text || '')
+  addTermTargetBaseId.value = resolveAddTermTargetBaseId()
+  addTermFormError.value = ''
+  showAddTermDialog.value = true
+}
+
+function closeAddTermDialog() {
+  if (addingTerm.value) {
+    return
+  }
+  showAddTermDialog.value = false
+  addTermFormError.value = ''
+}
+
+async function submitAddTermForm() {
+  const sourceText = normalizeTextForSaveToTM(addTermSourceText.value)
+  const targetText = normalizeTextForSaveToTM(addTermTargetText.value)
+  const targetBaseId = addTermTargetBaseId.value
+
   if (!sourceText || !targetText) {
-    toast.warn(t('workbench.ribbon.messages.termTextRequired'))
+    addTermFormError.value = '请填写原文内容和译文内容。'
+    return
+  }
+  if (!addTermTargetTermBases.value.some((termBase) => termBase.id === targetBaseId)) {
+    addTermFormError.value = '请选择当前文件可写入的已启用术语库。'
     return
   }
 
   addingTerm.value = true
   pageError.value = ''
+  addTermFormError.value = ''
   try {
-    await http.post(`/term-bases/${selectedTermBaseId.value}/entries`, {
+    await http.post(`/term-bases/${targetBaseId}/entries`, {
       source_text: sourceText,
       target_text: targetText,
     })
+    selectedTermBaseId.value = targetBaseId
     await loadTermEntries()
     activeTool.value = 'terms'
+    showAddTermDialog.value = false
     toast.success(t('workbench.ribbon.messages.termAdded'))
   } catch (error) {
-    pageError.value = getErrorMessage(error, t('workbench.ribbon.messages.termAddFailed'))
+    addTermFormError.value = getErrorMessage(error, t('workbench.ribbon.messages.termAddFailed'))
   } finally {
     addingTerm.value = false
   }
@@ -2010,6 +2368,7 @@ async function loadTask() {
   termEntries.value = []
   termBases.value = []
   selectedTermBaseId.value = ''
+  setCurrentTermQAReport(null)
 
   try {
     await segmentStore.loadTask(props.id, {
@@ -2056,6 +2415,7 @@ async function loadTask() {
     workbenchGuidelines.value = ''
 
     await loadTermBases()
+    await loadLatestTermQAReport()
 
     const boundTermBaseId = segmentStore.fileRecord?.term_base_id
     if (boundTermBaseId) {
@@ -2643,7 +3003,7 @@ onBeforeRouteLeave(async () => {
 <template>
   <div
     class="content-stack content-stack--workbench workbench-page"
-    :class="{ 'is-standalone': isStandaloneWorkbench }"
+    :class="{ 'is-standalone': isStandaloneWorkbench, 'is-stable-grid': isStandaloneWorkbench }"
     data-testid="workbench-page"
   >
     <section v-if="isStandaloneWorkbench" class="toolbar-panel workbench-toolbar workbench-ribbon" data-testid="workbench-ribbon">
@@ -3101,7 +3461,7 @@ onBeforeRouteLeave(async () => {
         </div>
 
         <div class="tool-group">
-          <button class="tool-col tool-col--big tool-button" type="button" :disabled="addingTerm" @click="void addActiveSegmentTerm()">
+          <button class="tool-col tool-col--big tool-button" type="button" :disabled="addingTerm" @click="void openAddTermDialog()">
             <span class="tool-line line1 with-big-icon">
               <span class="icon-text-area">
                 <Loader2 v-if="addingTerm" class="lucide-spin tool-single-icon" :size="27" />
@@ -3153,10 +3513,16 @@ onBeforeRouteLeave(async () => {
                 </div>
               </div>
             </div>
-            <button class="tool-line tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.qaSettings'))">
+            <button
+              class="tool-line tool-button"
+              type="button"
+              :disabled="generatingTermQAReport"
+              @click="generateCurrentFileTermQAReport"
+            >
               <span class="icon-text-area has_dropdown">
                 <span class="tool-item">
-                  <ShieldCheck class="tool-label-icon" :size="16" />
+                  <Loader2 v-if="generatingTermQAReport" class="tool-label-icon lucide-spin" :size="16" />
+                  <ShieldCheck v-else class="tool-label-icon" :size="16" />
                   <span class="text">{{ t('workbench.ribbon.qaSettings') }}</span>
                 </span>
               </span>
@@ -3717,7 +4083,9 @@ onBeforeRouteLeave(async () => {
                 :items="editorSegments"
                 :item-height="itemHeight"
                 item-key="sentence_id"
-                :adaptive="true"
+                :adaptive="!isStandaloneWorkbench"
+                :virtualized="!isStandaloneWorkbench"
+                :overscan="isStandaloneWorkbench ? 8 : 4"
                 :active-descendant="segmentStore.activeSentenceId ? `segment-${segmentStore.activeSentenceId}` : null"
                 @reach-end="handleEditorReachEnd"
               >
@@ -3905,6 +4273,112 @@ onBeforeRouteLeave(async () => {
           <component :is="tool.icon" :size="16" />
           <span>{{ tool.label }}</span>
         </button>
+
+        <div class="segment-editor-side-report" aria-label="术语 QA 报告">
+          <div class="segment-editor-side-report__header">
+            <div class="segment-editor-side-report__title">
+              <ShieldCheck :size="14" />
+              <span>术语QA</span>
+            </div>
+            <button
+              class="segment-editor-side-report__icon"
+              type="button"
+              title="刷新最近报告"
+              aria-label="刷新最近报告"
+              :disabled="loadingTermQAReport"
+              @click="void loadLatestTermQAReport()"
+            >
+              <Loader2 v-if="loadingTermQAReport" class="lucide-spin" :size="13" />
+              <Search v-else :size="13" />
+            </button>
+          </div>
+
+          <div v-if="loadingTermQAReport && !termQAReport" class="segment-editor-side-report__empty">
+            正在加载最近报告
+          </div>
+
+          <template v-else-if="termQAReport">
+            <button
+              class="segment-editor-side-report__summary"
+              type="button"
+              @click="showTermQAReportDialog = true"
+            >
+              <strong :class="{ 'is-clean': termQAReport.active_issue_count === 0 }">
+                {{ termQAReport.active_issue_count }}
+              </strong>
+              <span>条待处理</span>
+              <small>{{ termQAReportCreatedAtText || '最近报告' }}</small>
+              <small v-if="termQAReport.ignored_count > 0">已忽略 {{ termQAReport.ignored_count }} 条</small>
+            </button>
+
+            <div v-if="activeTermQAReportItems.length === 0" class="segment-editor-side-report__empty">
+              {{ termQAReport.issue_count === 0 ? '未发现术语不一致。' : '未忽略的问题已全部处理。' }}
+            </div>
+            <div v-else class="segment-editor-side-report__items">
+              <button
+                v-for="item in termQAReportPreviewItems"
+                :key="item.id"
+                class="segment-editor-side-report__item"
+                type="button"
+                :title="`${item.source_term} → ${item.expected_target_term}`"
+                :disabled="locatingTermQAReportItemId !== null"
+                @click="void focusTermQAReportItem(item)"
+              >
+                <Loader2
+                  v-if="locatingTermQAReportItemId === item.id"
+                  class="lucide-spin"
+                  :size="13"
+                />
+                <span>{{ item.source_term }}</span>
+                <small>{{ item.expected_target_term }}</small>
+                <em>句段 {{ item.sentence_id }}</em>
+              </button>
+            </div>
+
+            <button
+              v-if="activeTermQAReportItems.length > termQAReportPreviewItems.length || ignoredTermQAReportItems.length > 0"
+              class="segment-editor-side-report__link"
+              type="button"
+              @click="showTermQAReportDialog = true"
+            >
+              查看全部 {{ termQAReport.items.length }} 条
+            </button>
+
+            <div class="segment-editor-side-report__actions">
+              <button
+                class="segment-editor-side-report__button"
+                type="button"
+                :disabled="generatingTermQAReport"
+                @click="void generateCurrentFileTermQAReport()"
+              >
+                <Loader2 v-if="generatingTermQAReport" class="lucide-spin" :size="13" />
+                <span>{{ generatingTermQAReport ? '生成中' : '重新生成' }}</span>
+              </button>
+              <button
+                class="segment-editor-side-report__button"
+                type="button"
+                @click="showTermQAReportDialog = true"
+              >
+                详情
+              </button>
+            </div>
+          </template>
+
+          <template v-else>
+            <div class="segment-editor-side-report__empty">
+              暂无术语 QA 报告
+            </div>
+            <button
+              class="segment-editor-side-report__button"
+              type="button"
+              :disabled="generatingTermQAReport"
+              @click="void generateCurrentFileTermQAReport()"
+            >
+              <Loader2 v-if="generatingTermQAReport" class="lucide-spin" :size="13" />
+              <span>{{ generatingTermQAReport ? '生成中' : '生成报告' }}</span>
+            </button>
+          </template>
+        </div>
       </aside>
     </section>
 
@@ -3924,6 +4398,67 @@ onBeforeRouteLeave(async () => {
       @close="showIssueDialog = false"
       @saved="handleIssueSaved"
     />
+
+    <Modal
+      :open="showAddTermDialog"
+      title="添加术语"
+      :description="segmentStore.fileRecord?.filename || ''"
+      width="min(680px, calc(100vw - 32px))"
+      :close-on-overlay="!addingTerm"
+      :close-on-esc="!addingTerm"
+      @close="closeAddTermDialog"
+    >
+      <form class="add-term-dialog" @submit.prevent="void submitAddTermForm()">
+        <label class="field">
+          <span class="field__label">原文内容</span>
+          <textarea
+            v-model="addTermSourceText"
+            class="field__control add-term-dialog__textarea"
+            rows="3"
+            :disabled="addingTerm"
+            placeholder="请输入原文术语"
+          />
+        </label>
+
+        <label class="field">
+          <span class="field__label">译文内容</span>
+          <textarea
+            v-model="addTermTargetText"
+            class="field__control add-term-dialog__textarea"
+            rows="3"
+            :disabled="addingTerm"
+            placeholder="请输入对应译文"
+          />
+        </label>
+
+        <label class="field">
+          <span class="field__label">目标术语库</span>
+          <select
+            v-model="addTermTargetBaseId"
+            class="field__control"
+            :disabled="addingTerm || loadingTermBases"
+          >
+            <option value="">请选择目标术语库</option>
+            <option v-for="termBase in addTermTargetTermBases" :key="termBase.id" :value="termBase.id">
+              {{ termBase.name }}（{{ termBase.entry_count }} 条）
+            </option>
+          </select>
+        </label>
+
+        <p class="hint-text">仅显示当前文件已启用且允许写入的术语库。</p>
+        <p v-if="addTermFormError" class="form-message is-error">{{ addTermFormError }}</p>
+
+        <div class="add-term-dialog__actions">
+          <button class="button button--ghost" type="button" :disabled="addingTerm" @click="closeAddTermDialog">
+            {{ t('common.actions.cancel') }}
+          </button>
+          <button class="button" type="submit" :disabled="!addTermCanSubmit">
+            <Loader2 v-if="addingTerm" class="lucide-spin" :size="14" />
+            <span>{{ addingTerm ? t('common.actions.saving') : '添加术语' }}</span>
+          </button>
+        </div>
+      </form>
+    </Modal>
 
     <Modal
       :open="showSaveToTMDialog"
@@ -4000,6 +4535,134 @@ onBeforeRouteLeave(async () => {
     </Modal>
 
     <Modal
+      :open="showTermQAReportDialog"
+      title="术语 QA 报告"
+      :description="segmentStore.fileRecord?.filename || ''"
+      width="min(900px, calc(100vw - 32px))"
+      @close="showTermQAReportDialog = false"
+    >
+      <div class="term-qa-dialog">
+        <div v-if="termQAReport" class="term-qa-dialog__summary">
+          <span>检查句段：{{ termQAReport.checked_segments }}</span>
+          <span>总问题数：{{ termQAReport.issue_count }}</span>
+          <span>待处理：{{ termQAReport.active_issue_count }}</span>
+          <span>已忽略：{{ termQAReport.ignored_count }}</span>
+          <span>报告时间：{{ termQAReport.created_at || '' }}</span>
+        </div>
+
+        <div class="term-qa-dialog__actions">
+          <button
+            class="button button--ghost"
+            type="button"
+            :disabled="!termQAReport || activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
+            @click="toggleAllActiveTermQAItems(!allActiveTermQAItemsSelected)"
+          >
+            {{ allActiveTermQAItemsSelected ? '取消全选' : '全选未忽略' }}
+          </button>
+          <button
+            class="button button--ghost"
+            type="button"
+            :disabled="selectedActiveTermQAReportItems.length === 0 || updatingTermQAIgnore"
+            @click="void ignoreSelectedTermQAReportItems()"
+          >
+            <Loader2 v-if="updatingTermQAIgnore" class="lucide-spin" :size="14" />
+            忽略选中 {{ selectedActiveTermQAReportItems.length || '' }}
+          </button>
+          <button
+            class="button"
+            type="button"
+            :disabled="!termQAReport || downloadingTermQAReport"
+            @click="downloadCurrentTermQAReport"
+          >
+            <Loader2 v-if="downloadingTermQAReport" class="lucide-spin" :size="14" />
+            <Download v-else :size="14" />
+            导出 XLSX
+          </button>
+        </div>
+
+        <div v-if="termQAReport && termQAReport.items.length === 0" class="empty-state">
+          未发现术语不一致问题。
+        </div>
+        <div v-else-if="termQAReport" class="term-qa-dialog__table-wrap">
+          <table class="term-qa-dialog__table">
+            <thead>
+              <tr>
+                <th>选择</th>
+                <th>句段</th>
+                <th>原文术语</th>
+                <th>期望译文</th>
+                <th>当前译文</th>
+                <th>状态</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="item in termQAReport.items.slice(0, 50)"
+                :key="item.id"
+                class="term-qa-dialog__row"
+                :class="{
+                  'is-locating': locatingTermQAReportItemId === item.id,
+                  'is-ignored': item.ignored,
+                }"
+                tabindex="0"
+                :aria-label="`跳转到句段 ${item.sentence_id}`"
+                @click="void focusTermQAReportItem(item)"
+                @keydown.enter.prevent="void focusTermQAReportItem(item)"
+                @keydown.space.prevent="void focusTermQAReportItem(item)"
+              >
+                <td>
+                  <input
+                    type="checkbox"
+                    :checked="selectedTermQAItemIds.has(item.id)"
+                    :disabled="item.ignored"
+                    aria-label="选择报告项"
+                    @click.stop
+                    @change.stop="handleTermQAItemSelectionChange(item.id, $event)"
+                  >
+                </td>
+                <td>
+                  <span class="term-qa-dialog__segment">
+                    <Loader2
+                      v-if="locatingTermQAReportItemId === item.id"
+                      class="lucide-spin"
+                      :size="13"
+                    />
+                    {{ item.sentence_id }}
+                  </span>
+                </td>
+                <td>{{ item.source_term }}</td>
+                <td>{{ item.expected_target_term }}</td>
+                <td>{{ item.target_text || '未填写' }}</td>
+                <td>
+                  <span class="term-qa-dialog__status" :class="{ 'is-ignored': item.ignored }">
+                    {{ item.ignored ? '已忽略' : '待处理' }}
+                  </span>
+                  <small v-if="item.ignored_at" class="term-qa-dialog__ignored-meta">
+                    {{ item.ignored_by_name || item.ignored_by_id || '' }}
+                  </small>
+                </td>
+                <td>
+                  <button
+                    class="button button--ghost term-qa-dialog__inline-action"
+                    type="button"
+                    :disabled="updatingTermQAIgnore"
+                    @click.stop="void setSingleTermQAReportItemIgnored(item, !item.ignored)"
+                  >
+                    {{ item.ignored ? '恢复' : '忽略' }}
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <p v-if="termQAReport.items.length > 50" class="hint-text">
+            已显示前 50 条，完整报告请导出 XLSX。
+          </p>
+        </div>
+      </div>
+    </Modal>
+
+    <Modal
       :open="showShortcutHelp"
       :title="t('workbench.shortcutDialogTitle')"
       :description="t('workbench.shortcutDialogDescription')"
@@ -4034,11 +4697,83 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-page.is-standalone {
-  --workbench-editor-stage-height: clamp(420px, calc(100vh - 440px), 620px);
+  --workbench-editor-stage-height: clamp(460px, calc(100vh - 300px), 860px);
   min-height: 100vh;
   padding: 0 10px 14px;
   border-radius: 0;
   box-shadow: none;
+}
+
+.workbench-page.is-stable-grid {
+  gap: 8px;
+  background: #f3f6f8;
+}
+
+.workbench-page.is-stable-grid .workbench-ribbon {
+  box-shadow: 0 1px 0 #cfd8df;
+}
+
+.workbench-page.is-stable-grid .workbench-layout {
+  gap: 8px;
+  align-items: stretch;
+}
+
+.workbench-page.is-stable-grid .workbench-layout.has-active-tool {
+  grid-template-columns: minmax(0, 1fr) auto auto 192px;
+}
+
+.workbench-page.is-stable-grid .panel--editor {
+  border-radius: 0;
+  border-color: #d4dde5;
+}
+
+.workbench-page.is-stable-grid .segment-editor-results {
+  --segment-editor-grid-template: 92px minmax(320px, 1fr) minmax(360px, 1fr);
+  --virtual-list-inline-end-gap: 0;
+}
+
+.workbench-page.is-stable-grid .segment-table-head {
+  min-height: 32px;
+  margin-top: 0;
+  border-color: #cfd8df;
+  border-radius: 0;
+  background: #edf2f5;
+  color: #223843;
+  font-size: 13.5px;
+}
+
+.workbench-page.is-stable-grid .segment-editor-list-stage {
+  border-right: 1px solid #cfd8df;
+  border-bottom: 1px solid #cfd8df;
+  border-left: 1px solid #cfd8df;
+  background: #ffffff;
+}
+
+.workbench-page.is-stable-grid .segment-editor-list-stage > .virtual-list {
+  background: #ffffff;
+}
+
+.workbench-page.is-stable-grid .workbench-sidecar,
+.workbench-page.is-stable-grid .workbench-resizer__handle,
+.workbench-page.is-stable-grid .segment-editor-side-tool,
+.workbench-page.is-stable-grid .workbench-rail__button,
+.workbench-page.is-stable-grid .workbench-rail__button svg,
+.workbench-page.is-stable-grid .workbench-panel-pop-enter-active,
+.workbench-page.is-stable-grid .workbench-panel-pop-leave-active {
+  transition: none;
+}
+
+.workbench-page.is-stable-grid .workbench-rail__button:hover,
+.workbench-page.is-stable-grid .workbench-rail__button.is-active {
+  transform: none;
+}
+
+.workbench-page.is-stable-grid .workbench-panel-pop-enter-from,
+.workbench-page.is-stable-grid .workbench-panel-pop-leave-to,
+.workbench-page.is-stable-grid .workbench-panel-pop-enter-to,
+.workbench-page.is-stable-grid .workbench-panel-pop-leave-from {
+  filter: none;
+  transform: none;
 }
 
 .workbench-ribbon {
@@ -4756,9 +5491,22 @@ onBeforeRouteLeave(async () => {
   white-space: nowrap;
 }
 
+.add-term-dialog,
 .save-to-tm-dialog {
   display: grid;
   gap: 12px;
+}
+
+.add-term-dialog__textarea {
+  min-height: 96px;
+  resize: vertical;
+}
+
+.add-term-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .save-to-tm-dialog__scope {
@@ -4787,6 +5535,114 @@ onBeforeRouteLeave(async () => {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.term-qa-dialog {
+  display: grid;
+  gap: 12px;
+}
+
+.term-qa-dialog__summary,
+.term-qa-dialog__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.term-qa-dialog__summary {
+  color: var(--text-muted, #64748b);
+  font-size: 13px;
+}
+
+.term-qa-dialog__actions {
+  justify-content: flex-end;
+}
+
+.term-qa-dialog__table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border-color, #dbe3ea);
+  border-radius: 8px;
+}
+
+.term-qa-dialog__table {
+  width: 100%;
+  min-width: 920px;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.term-qa-dialog__table th,
+.term-qa-dialog__table td {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border-color, #dbe3ea);
+  text-align: left;
+  vertical-align: top;
+}
+
+.term-qa-dialog__table th {
+  color: var(--text-muted, #64748b);
+  background: var(--surface-muted, #f8fafc);
+  font-weight: 600;
+}
+
+.term-qa-dialog__table tr:last-child td {
+  border-bottom: 0;
+}
+
+.term-qa-dialog__row {
+  cursor: pointer;
+}
+
+.term-qa-dialog__row:hover,
+.term-qa-dialog__row:focus-visible,
+.term-qa-dialog__row.is-locating {
+  background: #f4faf9;
+  outline: none;
+}
+
+.term-qa-dialog__row.is-ignored {
+  color: #73828a;
+  background: #f8faf9;
+}
+
+.term-qa-dialog__segment {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #195d6a;
+  font-weight: 700;
+}
+
+.term-qa-dialog__status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #fff4e5;
+  color: #8a4b10;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.term-qa-dialog__status.is-ignored {
+  background: #edf2f3;
+  color: #64747c;
+}
+
+.term-qa-dialog__ignored-meta {
+  display: block;
+  margin-top: 4px;
+  color: #7c8b92;
+  font-size: 11px;
+}
+
+.term-qa-dialog__inline-action {
+  min-height: 28px;
+  padding: 4px 8px;
+  font-size: 12px;
 }
 
 .workbench-toolbar__progress {
@@ -5194,19 +6050,19 @@ onBeforeRouteLeave(async () => {
   flex-direction: column;
   align-items: stretch;
   gap: 8px;
-  width: 74px;
+  width: 216px;
   max-height: calc(100vh - 140px);
   overflow-y: auto;
-  padding: 8px 6px;
+  padding: 8px;
   border-left: 1px solid #d9e4e8;
   background: #f8fbfb;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
+  scrollbar-width: thin;
+  scrollbar-color: #adc7ca transparent;
 }
 
 .segment-editor-side-tools::-webkit-scrollbar {
-  width: 0;
-  height: 0;
+  width: 6px;
+  height: 6px;
 }
 
 .workbench-layout.has-active-tool .segment-editor-side-tools {
@@ -5215,13 +6071,13 @@ onBeforeRouteLeave(async () => {
 
 .segment-editor-side-tool {
   display: inline-flex;
-  flex-direction: column;
+  flex-direction: row;
   align-items: center;
-  justify-content: center;
-  gap: 5px;
-  width: 62px;
-  min-height: 70px;
-  padding: 8px 6px;
+  justify-content: flex-start;
+  gap: 8px;
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 10px;
   border: 1px solid #bfd5d8;
   border-radius: 7px;
   background: linear-gradient(180deg, #ffffff, #edf8f6);
@@ -5243,12 +6099,13 @@ onBeforeRouteLeave(async () => {
 .segment-editor-side-tool span {
   display: block;
   width: 100%;
-  max-width: 52px;
+  max-width: none;
   overflow: visible;
   line-height: 1.28;
   white-space: normal;
   word-break: normal;
   overflow-wrap: anywhere;
+  text-align: left;
 }
 
 .segment-editor-side-tool:hover,
@@ -5267,6 +6124,203 @@ onBeforeRouteLeave(async () => {
 
 .segment-editor-side-tool.is-active svg {
   color: #0b6658;
+}
+
+.segment-editor-side-report {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #c8dfe0;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #233f48;
+  box-shadow: 0 2px 8px rgba(31, 61, 70, 0.08);
+}
+
+.segment-editor-side-report__header,
+.segment-editor-side-report__title,
+.segment-editor-side-report__actions {
+  display: flex;
+  align-items: center;
+}
+
+.segment-editor-side-report__header {
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.segment-editor-side-report__title {
+  min-width: 0;
+  gap: 6px;
+  color: #163d48;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.segment-editor-side-report__title svg {
+  color: #2d6f7c;
+  flex: 0 0 auto;
+}
+
+.segment-editor-side-report__icon,
+.segment-editor-side-report__button,
+.segment-editor-side-report__link,
+.segment-editor-side-report__summary,
+.segment-editor-side-report__item {
+  font: inherit;
+}
+
+.segment-editor-side-report__icon {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid #c8d9dd;
+  border-radius: 6px;
+  background: #f6fbfb;
+  color: #2a6672;
+}
+
+.segment-editor-side-report__summary {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 8px;
+  align-items: center;
+  width: 100%;
+  padding: 8px;
+  border: 1px solid #d7e6e6;
+  border-radius: 7px;
+  background: #f8fbfb;
+  color: inherit;
+  text-align: left;
+}
+
+.segment-editor-side-report__summary strong {
+  grid-row: span 3;
+  min-width: 36px;
+  color: #a93a34;
+  font-size: 24px;
+  line-height: 1;
+  text-align: center;
+}
+
+.segment-editor-side-report__summary strong.is-clean {
+  color: #15795d;
+}
+
+.segment-editor-side-report__summary span {
+  color: #284b56;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.segment-editor-side-report__summary small {
+  color: #68808a;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.segment-editor-side-report__items {
+  display: grid;
+  gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.segment-editor-side-report__item {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid #d7e4e5;
+  border-radius: 7px;
+  background: #fbfdfd;
+  color: #223f48;
+  text-align: left;
+}
+
+.segment-editor-side-report__item:hover,
+.segment-editor-side-report__item:focus-visible,
+.segment-editor-side-report__summary:hover,
+.segment-editor-side-report__summary:focus-visible,
+.segment-editor-side-report__icon:hover,
+.segment-editor-side-report__icon:focus-visible,
+.segment-editor-side-report__button:hover,
+.segment-editor-side-report__button:focus-visible,
+.segment-editor-side-report__link:hover,
+.segment-editor-side-report__link:focus-visible {
+  border-color: #78adb4;
+  background: #ffffff;
+  outline: none;
+}
+
+.segment-editor-side-report__item span,
+.segment-editor-side-report__item small,
+.segment-editor-side-report__item em {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.segment-editor-side-report__item span {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.segment-editor-side-report__item small {
+  color: #315f69;
+  font-size: 12px;
+}
+
+.segment-editor-side-report__item em {
+  color: #6f838a;
+  font-size: 11px;
+  font-style: normal;
+}
+
+.segment-editor-side-report__empty {
+  padding: 8px;
+  border: 1px dashed #c9d9dd;
+  border-radius: 7px;
+  color: #667c84;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.segment-editor-side-report__actions {
+  gap: 6px;
+}
+
+.segment-editor-side-report__button,
+.segment-editor-side-report__link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 30px;
+  padding: 6px 8px;
+  border: 1px solid #c7dadd;
+  border-radius: 6px;
+  background: #f6fbfb;
+  color: #21515b;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.segment-editor-side-report__button {
+  flex: 1 1 0;
+  gap: 5px;
+}
+
+.segment-editor-side-report__link {
+  width: 100%;
+  background: #ffffff;
 }
 
 .segment-editor-list-stage {
@@ -5655,6 +6709,22 @@ onBeforeRouteLeave(async () => {
 
   .segment-editor-side-tool {
     flex: 0 0 64px;
+    width: 64px;
+    flex-direction: column;
+    justify-content: center;
+    gap: 5px;
+    padding: 8px 6px;
+  }
+
+  .segment-editor-side-tool span {
+    max-width: 52px;
+    text-align: center;
+  }
+
+  .segment-editor-side-report {
+    flex: 0 0 220px;
+    max-height: 240px;
+    overflow-y: auto;
   }
 
   .segment-editor-results {

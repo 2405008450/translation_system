@@ -56,10 +56,19 @@ const isFocused = ref(false)
 const isSourceFocused = ref(false)
 const isComposing = ref(false)
 const MAX_EDITOR_HISTORY_SIZE = 100
+const EDITOR_HISTORY_GROUP_TIMEOUT_MS = 1200
+const EDITOR_HISTORY_WORD_BOUNDARY_REGEXP = /[\s.,!?;:\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A]/
 
 interface EditorHistorySnapshot {
   text: string
+  html: string | null
   caretOffset: number
+}
+
+interface HistoryRecordOptions {
+  force?: boolean
+  inputType?: string
+  data?: string | null
 }
 
 type HighlightKind = 'term' | 'search'
@@ -69,6 +78,8 @@ const undoStack = ref<EditorHistorySnapshot[]>([])
 const redoStack = ref<EditorHistorySnapshot[]>([])
 const isApplyingHistory = ref(false)
 const compositionSnapshotRecorded = ref(false)
+let lastHistorySnapshotAt = 0
+let lastHistoryInputKind = ''
 const canUndoEditorChange = computed(() => undoStack.value.length > 0)
 const canRedoEditorChange = computed(() => redoStack.value.length > 0)
 
@@ -604,10 +615,19 @@ function getCurrentEditorText(): string {
   return props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
 }
 
+function getCurrentEditorHtml(): string | null {
+  if (!editorRef.value) {
+    return props.segment.target_html || null
+  }
+  const html = serializeEditorContentWithFormat(editorRef.value)
+  return /<(b|strong|i|em|u|s|strike|del|sub|sup)>/i.test(html) ? html : null
+}
+
 function getCurrentEditorSnapshot(): EditorHistorySnapshot {
   const text = getCurrentEditorText()
   return {
     text,
+    html: getCurrentEditorHtml(),
     caretOffset: editorRef.value
       ? saveSerializableCaretPosition(editorRef.value)
       : text.length,
@@ -616,7 +636,7 @@ function getCurrentEditorSnapshot(): EditorHistorySnapshot {
 
 function pushHistorySnapshot(stack: EditorHistorySnapshot[], snapshot: EditorHistorySnapshot) {
   const lastSnapshot = stack[stack.length - 1]
-  if (lastSnapshot?.text === snapshot.text) {
+  if (lastSnapshot?.text === snapshot.text && lastSnapshot.html === snapshot.html) {
     return
   }
   stack.push(snapshot)
@@ -629,13 +649,74 @@ function clearEditorHistory() {
   undoStack.value = []
   redoStack.value = []
   compositionSnapshotRecorded.value = false
+  resetHistoryGroup()
 }
 
-function recordUndoSnapshot(clearRedo = true) {
+function resetHistoryGroup() {
+  lastHistorySnapshotAt = 0
+  lastHistoryInputKind = ''
+}
+
+function getHistoryInputKind(inputType = '') {
+  if (inputType.startsWith('delete')) {
+    return 'delete'
+  }
+  if (inputType === 'insertFromPaste') {
+    return 'paste'
+  }
+  if (inputType === 'insertParagraph' || inputType === 'insertLineBreak') {
+    return 'line-break'
+  }
+  if (inputType.startsWith('format')) {
+    return 'format'
+  }
+  return inputType || 'edit'
+}
+
+function hasExpandedEditorSelection() {
+  const editor = editorRef.value
+  const selection = window.getSelection()
+  if (!editor || !selection || selection.rangeCount === 0 || selection.isCollapsed) {
+    return false
+  }
+  const range = selection.getRangeAt(0)
+  return editor.contains(range.commonAncestorContainer)
+}
+
+function shouldStartNewHistoryGroup(options: HistoryRecordOptions) {
+  if (options.force || hasExpandedEditorSelection()) {
+    return true
+  }
+
+  const inputKind = getHistoryInputKind(options.inputType)
+  const now = Date.now()
+
+  if (!lastHistorySnapshotAt || now - lastHistorySnapshotAt > EDITOR_HISTORY_GROUP_TIMEOUT_MS) {
+    return true
+  }
+  if (inputKind !== lastHistoryInputKind) {
+    return true
+  }
+  if (inputKind === 'line-break' || inputKind === 'paste' || inputKind === 'format') {
+    return true
+  }
+  if (inputKind === 'insertText' && EDITOR_HISTORY_WORD_BOUNDARY_REGEXP.test(options.data || '')) {
+    return true
+  }
+
+  return false
+}
+
+function recordUndoSnapshot(clearRedo = true, options: HistoryRecordOptions = {}) {
   if (props.disabled || !editorRef.value || isApplyingHistory.value || isComposing.value) {
     return
   }
+  if (!shouldStartNewHistoryGroup(options)) {
+    return
+  }
   pushHistorySnapshot(undoStack.value, getCurrentEditorSnapshot())
+  lastHistorySnapshotAt = Date.now()
+  lastHistoryInputKind = getHistoryInputKind(options.inputType)
   if (clearRedo) {
     redoStack.value = []
   }
@@ -643,7 +724,7 @@ function recordUndoSnapshot(clearRedo = true) {
 
 function applyHistorySnapshot(snapshot: EditorHistorySnapshot) {
   isApplyingHistory.value = true
-  emit('update', props.segment.sentence_id, snapshot.text)
+  emit('update', props.segment.sentence_id, snapshot.text, snapshot.html || undefined)
   void nextTick(() => {
     if (editorRef.value) {
       editorRef.value.innerHTML = editorHtmlContent.value
@@ -651,6 +732,7 @@ function applyHistorySnapshot(snapshot: EditorHistorySnapshot) {
       restoreSerializableCaretPosition(editorRef.value, snapshot.caretOffset)
     }
     isApplyingHistory.value = false
+    resetHistoryGroup()
   })
 }
 
@@ -660,6 +742,7 @@ function undoEditorChange() {
     return false
   }
   pushHistorySnapshot(redoStack.value, getCurrentEditorSnapshot())
+  resetHistoryGroup()
   applyHistorySnapshot(targetSnapshot)
   return true
 }
@@ -670,6 +753,7 @@ function redoEditorChange() {
     return false
   }
   pushHistorySnapshot(undoStack.value, getCurrentEditorSnapshot())
+  resetHistoryGroup()
   applyHistorySnapshot(targetSnapshot)
   return true
 }
@@ -681,9 +765,12 @@ function handleFocus() {
 
 function handleBlur() {
   isFocused.value = false
+  resetHistoryGroup()
+  void nextTick(() => syncEditorHtmlFromState(false))
 }
 
 function handleClick(event?: MouseEvent) {
+  resetHistoryGroup()
   if (event && (event.ctrlKey || event.metaKey)) {
     emit('ctrlClick', props.segment.sentence_id, event)
     return
@@ -759,7 +846,11 @@ function handleBeforeInput(event: Event) {
     return
   }
 
-  recordUndoSnapshot()
+  recordUndoSnapshot(true, {
+    inputType: inputEvent.inputType,
+    data: inputEvent.data,
+    force: inputEvent.inputType !== 'insertText' && inputEvent.inputType !== 'insertCompositionText',
+  })
 
   if (inputEvent.inputType !== 'insertText' && inputEvent.inputType !== 'insertCompositionText') {
     return
@@ -783,6 +874,11 @@ function handleKeydown(event: KeyboardEvent) {
   }
 
   const usesShortcutModifier = event.ctrlKey || event.metaKey
+  if (!usesShortcutModifier && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) {
+    resetHistoryGroup()
+    return
+  }
+
   if (!usesShortcutModifier) {
     return
   }
@@ -830,15 +926,6 @@ function handleInput() {
 
   // 没有格式标签，只传递纯文本
   emit('update', props.segment.sentence_id, text)
-
-  // 没有格式标签时，可以重新渲染以显示术语高亮等
-  const caretPos = saveSerializableCaretPosition(editorRef.value)
-  nextTick(() => {
-    if (editorRef.value && isFocused.value) {
-      editorRef.value.innerHTML = editorHtmlContent.value
-      restoreSerializableCaretPosition(editorRef.value, caretPos)
-    }
-  })
 }
 
 /**
@@ -883,7 +970,7 @@ function wrapTextWithFormats(text: string): string {
 // 监听外部数据变化，更新编辑器内容
 function handleCompositionStart() {
   if (!compositionSnapshotRecorded.value) {
-    recordUndoSnapshot()
+    recordUndoSnapshot(true, { force: true, inputType: 'insertCompositionText' })
     compositionSnapshotRecorded.value = true
   }
   isComposing.value = true
@@ -897,7 +984,7 @@ function handleCompositionEnd() {
 
 function handlePaste(event: ClipboardEvent) {
   event.preventDefault()
-  recordUndoSnapshot()
+  recordUndoSnapshot(true, { force: true, inputType: 'insertFromPaste' })
   // 优先获取 HTML 格式，保留格式标签
   const html = event.clipboardData?.getData('text/html') || ''
   const text = event.clipboardData?.getData('text/plain') || ''
@@ -1052,6 +1139,9 @@ watch(
 watch(
   editorHtmlContent,
   () => {
+    if (isFocused.value && !isApplyingHistory.value) {
+      return
+    }
     syncEditorHtmlFromState(isFocused.value)
   },
   { flush: 'post' },

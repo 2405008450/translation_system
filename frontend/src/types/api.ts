@@ -189,10 +189,13 @@ export interface DocumentParseOptions {
 export interface DocumentStatistics {
   source: string
   engine: string | null
+  engine_version: string | null
   license_status: string | null
   include_textboxes_footnotes_endnotes: boolean | null
   pages: number | null
   words: number | null
+  non_asian_words: number | null
+  asian_characters: number | null
   characters: number | null
   characters_with_spaces: number | null
   paragraphs: number | null
@@ -295,11 +298,16 @@ export interface FileRecordDetail {
   source_language: string | null
   target_language: string | null
   collection_id: string | null
+  collection_ids: string[]
   collection_name: string | null
   term_base_id: string | null
   term_base_name: string | null
   term_base_ids: string[]
   term_base_names: string[]
+  term_base_write_ids: string[]
+  term_base_write_names: string[]
+  qa_term_base_ids: string[]
+  qa_term_base_names: string[]
   translation_guidelines: string
   created_at: string
   updated_at: string
@@ -342,6 +350,17 @@ export interface SegmentPageResponse {
   filters: SegmentPageFilters
   server_time?: string
   segments: Segment[]
+}
+
+export interface SegmentPositionResponse {
+  file_record_id: string
+  sentence_id: string
+  segment_id: string
+  index: number
+  display_index: number
+  page: number
+  page_size: number
+  page_index: number
 }
 
 export interface FileRecordPreview {
@@ -438,6 +457,81 @@ export interface TermBase {
   created_at: string
   updated_at: string
   entry_count: number
+}
+
+export interface ProjectTermBaseSettingRow {
+  id: string
+  name: string
+  description: string | null
+  source_language: string
+  target_language: string
+  entry_count: number
+  enabled: boolean
+  writable: boolean
+  qa: boolean
+}
+
+export interface ProjectTermBaseSettingGroup {
+  source_language: string
+  target_language: string
+  file_count: number
+  enabled_term_base_ids: string[]
+  writable_term_base_ids: string[]
+  qa_term_base_ids: string[]
+  term_bases: ProjectTermBaseSettingRow[]
+}
+
+export interface ProjectTermBaseSettingsResponse {
+  project_id: string
+  groups: ProjectTermBaseSettingGroup[]
+}
+
+export interface TermQAReportItem {
+  id: string
+  report_id: string
+  project_id: string | null
+  file_record_id: string
+  segment_id: string | null
+  term_base_id: string | null
+  sentence_id: string
+  file_name: string
+  term_base_name: string
+  source_term: string
+  expected_target_term: string
+  source_text: string
+  target_text: string
+  block_index: number
+  row_index: number | null
+  cell_index: number | null
+  ignored: boolean
+  ignored_at: string | null
+  ignored_by_id: string | null
+  ignored_by_name: string | null
+  created_at: string | null
+}
+
+export interface TermQAReport {
+  id: string
+  project_id: string | null
+  file_record_id: string | null
+  created_by_id: string | null
+  scope: 'project' | 'file'
+  file_ids: string[]
+  term_base_ids: string[]
+  language_pairs: Array<{ source_language: string, target_language: string }>
+  total_files: number
+  total_segments: number
+  checked_segments: number
+  issue_count: number
+  active_issue_count: number
+  ignored_count: number
+  status: string
+  created_at: string | null
+  items: TermQAReportItem[]
+}
+
+export interface TermQAReportListResponse {
+  items: TermQAReport[]
 }
 
 export interface TMCollection {

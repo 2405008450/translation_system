@@ -1621,6 +1621,137 @@ body.modal-open {
   background: #fff;
 }
 
+.workbench-page.is-stable-grid .segment-row,
+.workbench-page.is-stable-grid .segment-row::before,
+.workbench-page.is-stable-grid .segment-row__tag,
+.workbench-page.is-stable-grid .segment-row__index,
+.workbench-page.is-stable-grid .segment-row__cell--source,
+.workbench-page.is-stable-grid .segment-row__editor,
+.workbench-page.is-stable-grid .segment-row__editor-shell,
+.workbench-page.is-stable-grid .segment-row__source-editor,
+.workbench-page.is-stable-grid .workbench-rail__button,
+.workbench-page.is-stable-grid .workbench-rail__button svg {
+  transition: none;
+}
+
+.workbench-page.is-stable-grid .virtual-list-row {
+  padding-bottom: 0;
+  border-bottom: 1px solid #dfe6ec;
+  overflow: visible;
+}
+
+.workbench-page.is-stable-grid .segment-row {
+  height: auto;
+  min-height: 48px;
+  border: 0;
+  border-radius: 0;
+  background: #ffffff;
+  box-shadow: none;
+}
+
+.workbench-page.is-stable-grid .segment-row::before {
+  display: none;
+}
+
+.workbench-page.is-stable-grid .segment-row:hover {
+  transform: none;
+  box-shadow: none;
+}
+
+.workbench-page.is-stable-grid .segment-row.is-active {
+  background: #fafdff;
+  box-shadow: inset 0 0 0 2px rgba(13, 122, 104, 0.34);
+}
+
+.workbench-page.is-stable-grid .segment-row.is-selected {
+  border-radius: 0;
+  background: #eef8f6;
+  outline-offset: -2px;
+}
+
+.workbench-page.is-stable-grid .segment-row--odd,
+.workbench-page.is-stable-grid .segment-row--even {
+  --segment-row-stripe: transparent;
+  --segment-cell-stripe: transparent;
+  --segment-editor-stripe: transparent;
+}
+
+.workbench-page.is-stable-grid .segment-row__meta {
+  gap: 3px;
+  padding: 5px 6px;
+  border-right: 1px solid #dfe6ec;
+  background: #f7fafc;
+}
+
+.workbench-page.is-stable-grid .segment-row__index,
+.workbench-page.is-stable-grid .segment-row__tag {
+  min-height: 19px;
+  border-radius: 3px;
+  font-size: 11.5px;
+  transform: none;
+}
+
+.workbench-page.is-stable-grid .segment-row:hover .segment-row__tag {
+  transform: none;
+}
+
+.workbench-page.is-stable-grid .segment-row__cell {
+  padding: 0;
+  min-height: 48px;
+}
+
+.workbench-page.is-stable-grid .segment-row__cell--source {
+  background: #fbfdff;
+}
+
+.workbench-page.is-stable-grid .segment-row__cell--source:hover {
+  background: #fbfdff;
+}
+
+.workbench-page.is-stable-grid .segment-row__cell--target {
+  border-left: 1px solid #dfe6ec;
+  background: #ffffff;
+}
+
+.workbench-page.is-stable-grid .segment-row__text,
+.workbench-page.is-stable-grid .segment-row__editor,
+.workbench-page.is-stable-grid .segment-row__source-editor {
+  height: auto;
+  min-height: 40px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  font-size: 16.5px;
+  line-height: 1.55;
+  overflow: visible;
+}
+
+.workbench-page.is-stable-grid .segment-row__editor:focus,
+.workbench-page.is-stable-grid .segment-row__editor.is-focused {
+  border-color: transparent;
+  background: #ffffff;
+  box-shadow: inset 0 0 0 2px rgba(13, 122, 104, 0.56);
+}
+
+.workbench-page.is-stable-grid .segment-row__editor-shell.is-focused {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+
+.workbench-page.is-stable-grid .segment-row__source-editor.is-focused,
+.workbench-page.is-stable-grid .segment-row__source-editor.is-readonly.is-focused {
+  border-color: transparent;
+  box-shadow: inset 0 0 0 2px rgba(13, 122, 104, 0.28);
+}
+
+.workbench-page.is-stable-grid .workbench-rail__button:hover,
+.workbench-page.is-stable-grid .workbench-rail__button.is-active {
+  transform: none;
+}
+
 .workbench-page .preview-panel__paper {
   border-color: #e4e7eb;
   border-radius: 6px;
@@ -2287,13 +2418,13 @@ body.modal-open {
 
 .workbench-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 74px;
+  grid-template-columns: minmax(0, 1fr) 216px;
   gap: 12px;
   align-items: start;
 }
 
 .workbench-layout.has-active-tool {
-  grid-template-columns: minmax(0, 1fr) auto auto 74px;
+  grid-template-columns: minmax(0, 1fr) auto auto 216px;
 }
 
 .workbench-sidecar {
@@ -2561,6 +2692,15 @@ body.modal-open {
   overflow: auto;
   padding-right: var(--virtual-list-inline-end-gap, 4px);
   scrollbar-gutter: stable;
+}
+
+.virtual-list--flow {
+  overflow-x: hidden;
+}
+
+.virtual-list-flow {
+  display: grid;
+  align-content: start;
 }
 
 .segment-editor-list-stage > .virtual-list {

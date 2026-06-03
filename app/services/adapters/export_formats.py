@@ -104,6 +104,15 @@ FORMAT_EXPORT_SUPPORT: Dict[str, List[str]] = {
         "tmx",
         "xliff",
     ],
+    ".doc": [
+        "original",
+        "bilingual_docx_layout_source_first",
+        "bilingual_docx_layout_target_first",
+        "bilingual_docx",
+        "bilingual_txt",
+        "tmx",
+        "xliff",
+    ],
     ".pdf": ["bilingual_docx", "bilingual_txt", "tmx", "xliff"],  # PDF 无法原格式导出
     ".pptx": ["original", "bilingual_docx", "bilingual_txt", "tmx", "xliff"],
     ".xlsx": ["original", "bilingual_docx", "bilingual_txt", "tmx", "xliff"],

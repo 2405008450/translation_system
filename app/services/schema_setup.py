@@ -75,8 +75,47 @@ REQUIRED_SCHEMA = {
         "collection_ids_json",
         "term_base_id",
         "term_base_ids",
+        "term_base_write_ids",
+        "qa_term_base_ids",
         "deadline",
         "access_level",
+    },
+    "term_qa_reports": {
+        "id",
+        "project_id",
+        "file_record_id",
+        "created_by_id",
+        "scope",
+        "file_ids",
+        "term_base_ids",
+        "language_pairs",
+        "total_files",
+        "total_segments",
+        "checked_segments",
+        "issue_count",
+        "status",
+        "created_at",
+    },
+    "term_qa_report_items": {
+        "id",
+        "report_id",
+        "project_id",
+        "file_record_id",
+        "segment_id",
+        "term_base_id",
+        "sentence_id",
+        "file_name",
+        "term_base_name",
+        "source_term",
+        "expected_target_term",
+        "source_text",
+        "target_text",
+        "block_index",
+        "row_index",
+        "cell_index",
+        "ignored_by_id",
+        "ignored_at",
+        "created_at",
     },
     "project_assignments": {
         "id",
@@ -718,6 +757,14 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
             """
             ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS term_base_write_ids TEXT NOT NULL DEFAULT '[]'
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS qa_term_base_ids TEXT NOT NULL DEFAULT '[]'
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
             ADD COLUMN IF NOT EXISTS deadline TIMESTAMP
             """,
             """
@@ -1195,6 +1242,211 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             BEFORE UPDATE ON issue_markers
             FOR EACH ROW
             EXECUTE FUNCTION update_updated_at_column()
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS term_qa_reports (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID REFERENCES file_records(id) ON DELETE CASCADE,
+                created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                scope VARCHAR(20) NOT NULL DEFAULT 'project',
+                file_ids TEXT NOT NULL DEFAULT '[]',
+                term_base_ids TEXT NOT NULL DEFAULT '[]',
+                language_pairs TEXT NOT NULL DEFAULT '[]',
+                total_files INTEGER NOT NULL DEFAULT 0,
+                total_segments INTEGER NOT NULL DEFAULT 0,
+                checked_segments INTEGER NOT NULL DEFAULT 0,
+                issue_count INTEGER NOT NULL DEFAULT 0,
+                status VARCHAR(20) NOT NULL DEFAULT 'completed',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_reports
+            ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_reports
+            ADD COLUMN IF NOT EXISTS file_record_id UUID REFERENCES file_records(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_reports
+            ADD COLUMN IF NOT EXISTS created_by_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_reports
+            ADD COLUMN IF NOT EXISTS scope VARCHAR(20) NOT NULL DEFAULT 'project'
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_reports
+            ADD COLUMN IF NOT EXISTS file_ids TEXT NOT NULL DEFAULT '[]'
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_reports
+            ADD COLUMN IF NOT EXISTS term_base_ids TEXT NOT NULL DEFAULT '[]'
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_reports
+            ADD COLUMN IF NOT EXISTS language_pairs TEXT NOT NULL DEFAULT '[]'
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_reports
+            ADD COLUMN IF NOT EXISTS total_files INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_reports
+            ADD COLUMN IF NOT EXISTS total_segments INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_reports
+            ADD COLUMN IF NOT EXISTS checked_segments INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_reports
+            ADD COLUMN IF NOT EXISTS issue_count INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_reports
+            ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'completed'
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_reports
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS term_qa_report_items (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                report_id UUID NOT NULL REFERENCES term_qa_reports(id) ON DELETE CASCADE,
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+                segment_id UUID REFERENCES segments(id) ON DELETE SET NULL,
+                term_base_id UUID REFERENCES term_bases(id) ON DELETE SET NULL,
+                sentence_id VARCHAR(40) NOT NULL DEFAULT '',
+                file_name VARCHAR(255) NOT NULL DEFAULT '',
+                term_base_name VARCHAR(200) NOT NULL DEFAULT '',
+                source_term TEXT NOT NULL,
+                expected_target_term TEXT NOT NULL,
+                source_text TEXT NOT NULL,
+                target_text TEXT NOT NULL DEFAULT '',
+                block_index INTEGER NOT NULL DEFAULT 0,
+                row_index INTEGER,
+                cell_index INTEGER,
+                ignored_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                ignored_at TIMESTAMP,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS report_id UUID REFERENCES term_qa_reports(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS file_record_id UUID REFERENCES file_records(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS segment_id UUID REFERENCES segments(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS term_base_id UUID REFERENCES term_bases(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS sentence_id VARCHAR(40) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS file_name VARCHAR(255) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS term_base_name VARCHAR(200) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS source_term TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS expected_target_term TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS source_text TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS target_text TEXT NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS block_index INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS row_index INTEGER
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS cell_index INTEGER
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS ignored_by_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS ignored_at TIMESTAMP
+            """,
+            """
+            ALTER TABLE IF EXISTS term_qa_report_items
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_qa_reports_project_id
+            ON term_qa_reports (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_qa_reports_file_record_id
+            ON term_qa_reports (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_qa_reports_created_by_id
+            ON term_qa_reports (created_by_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_qa_reports_created_at
+            ON term_qa_reports (created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_qa_report_items_report_id
+            ON term_qa_report_items (report_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_qa_report_items_project_id
+            ON term_qa_report_items (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_qa_report_items_file_record_id
+            ON term_qa_report_items (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_qa_report_items_segment_id
+            ON term_qa_report_items (segment_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_qa_report_items_term_base_id
+            ON term_qa_report_items (term_base_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_qa_report_items_ignored_at
+            ON term_qa_report_items (ignored_at)
             """,
             """
             INSERT INTO projects (

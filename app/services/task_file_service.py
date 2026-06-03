@@ -29,7 +29,15 @@ from app.services.document_workspace import (
     normalize_document_parse_options,
     normalize_document_parse_mode,
 )
+from app.services.document_statistics import compute_word_document_statistics
+from app.services.libreoffice_service import (
+    LibreOfficeError,
+    build_converted_docx_filename,
+    convert_word_to_docx,
+)
 from app.services.matcher import MatchStats, match_sentences_with_stats
+
+WORD_TASK_EXTENSIONS = {".doc", ".docx"}
 
 TASK_ADAPTER_EXTENSIONS = {
     ".txt",
@@ -88,7 +96,7 @@ AUTO_PARSE_MODE_CAPABILITY = {
 
 _UPLOAD_CAPABILITY_SPECS = (
     {
-        "extensions": (".docx",),
+        "extensions": (".doc", ".docx"),
         "label": "Word 文档",
         "category": "office",
         "features": (
@@ -443,6 +451,10 @@ def is_docx_task(filename: str) -> bool:
     return get_task_file_extension(filename) == ".docx"
 
 
+def is_word_task(filename: str) -> bool:
+    return get_task_file_extension(filename) in WORD_TASK_EXTENSIONS
+
+
 def get_supported_task_extensions() -> tuple[str, ...]:
     registry = ensure_default_adapters_registered()
     extensions = {
@@ -450,7 +462,7 @@ def get_supported_task_extensions() -> tuple[str, ...]:
         for extension in registry.list_supported_extensions()
         if extension in TASK_ADAPTER_EXTENSIONS
     }
-    extensions.add(".docx")
+    extensions.update(WORD_TASK_EXTENSIONS)
     return tuple(sorted(extensions))
 
 
@@ -461,7 +473,7 @@ def supports_task_file(filename: str) -> bool:
 
 def can_export_task_file(filename: str, has_source_file: bool = True) -> bool:
     extension = get_task_file_extension(filename)
-    if extension == ".docx":
+    if extension in WORD_TASK_EXTENSIONS:
         return has_source_file
     if not has_source_file:
         return extension in LOSSY_EXPORTABLE_TASK_EXTENSIONS
@@ -478,7 +490,7 @@ def get_upload_capabilities() -> dict[str, Any]:
         if not extensions:
             continue
 
-        is_docx = extensions == [".docx"]
+        is_word = set(extensions).issubset(WORD_TASK_EXTENSIONS)
         formats.append(
             {
                 "extensions": extensions,
@@ -487,10 +499,10 @@ def get_upload_capabilities() -> dict[str, Any]:
                 "category": spec["category"],
                 "max_size_mb": max(_get_upload_max_size_mb(extension) for extension in extensions),
                 "can_export_original": any(can_export_task_file(f"file{extension}") for extension in extensions),
-                "parse_modes": list(DOCX_PARSE_MODE_CAPABILITIES if is_docx else (AUTO_PARSE_MODE_CAPABILITY,)),
+                "parse_modes": list(DOCX_PARSE_MODE_CAPABILITIES if is_word else (AUTO_PARSE_MODE_CAPABILITY,)),
                 "features": list(spec["features"]),
                 "settings": list(spec.get("settings", ())),
-                "settings_select_all": bool(spec.get("settings_select_all", is_docx)),
+                "settings_select_all": bool(spec.get("settings_select_all", is_word)),
             }
         )
 
@@ -522,15 +534,30 @@ def build_task_workspace(
 ) -> dict[str, Any]:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
-    if is_docx_task(filename):
-        return build_docx_workspace(
+    if is_word_task(filename):
+        parse_bytes = raw_bytes
+        parse_filename = filename
+        original_filename = filename
+        if get_task_file_extension(filename) == ".doc":
+            try:
+                parse_bytes = convert_word_to_docx(raw_bytes, filename)
+            except LibreOfficeError as exc:
+                raise ValueError(f"DOC 转 DOCX 失败：{exc}") from exc
+            parse_filename = build_converted_docx_filename(filename)
+
+        workspace = build_docx_workspace(
             db=db,
-            raw_bytes=raw_bytes,
+            raw_bytes=parse_bytes,
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
         )
+        if get_task_file_extension(original_filename) == ".doc":
+            workspace["_source_bytes"] = parse_bytes
+            workspace["_source_filename"] = parse_filename
+            workspace["document_statistics"] = compute_word_document_statistics(raw_bytes, original_filename)
+        return workspace
 
     if not supports_task_file(filename):
         raise ValueError(f"暂不支持 {get_task_file_extension(filename) or '该'} 文件格式。")
@@ -587,9 +614,15 @@ def build_task_preview_html(
 ) -> str:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
-    if source_bytes and is_docx_task(filename):
+    if source_bytes and is_word_task(filename):
+        preview_bytes = source_bytes
+        if get_task_file_extension(filename) == ".doc":
+            try:
+                preview_bytes = convert_word_to_docx(source_bytes, filename)
+            except LibreOfficeError as exc:
+                raise ValueError(f"DOC 转 DOCX 失败：{exc}") from exc
         return build_docx_preview_html(
-            source_bytes,
+            preview_bytes,
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
         )
@@ -605,18 +638,26 @@ def export_translated_task_file(
 ) -> ExportedTaskFile:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
-    if is_docx_task(filename):
+    if is_word_task(filename):
         if raw_bytes is None:
-            raise ValueError("DOCX 源文件缺失，暂时无法导出。")
+            raise ValueError("Word 源文件缺失，暂时无法导出。")
+        export_bytes = raw_bytes
+        export_filename = filename
+        if get_task_file_extension(filename) == ".doc":
+            try:
+                export_bytes = convert_word_to_docx(raw_bytes, filename)
+            except LibreOfficeError as exc:
+                raise ValueError(f"DOC 转 DOCX 失败：{exc}") from exc
+            export_filename = build_converted_docx_filename(filename)
         return ExportedTaskFile(
             content=export_translated_docx(
-                raw_bytes=raw_bytes,
+                raw_bytes=export_bytes,
                 segments=segments,
                 document_parse_mode=document_parse_mode,
                 document_parse_options=document_parse_options,
             ),
             media_type=DOCX_MEDIA_TYPE,
-            filename=build_translated_docx_filename(filename),
+            filename=build_translated_docx_filename(export_filename),
         )
 
     if raw_bytes is None:
@@ -689,21 +730,30 @@ def export_bilingual_task_docx_with_layout(
 ) -> ExportedTaskFile:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
-    if not is_docx_task(filename):
-        raise ValueError("仅 DOCX 源文件支持保留排版的双语 Word 导出。")
+    if not is_word_task(filename):
+        raise ValueError("仅 Word 源文件支持保留排版的双语 Word 导出。")
     if raw_bytes is None:
-        raise ValueError("DOCX 源文件缺失，暂时无法导出保留排版的双语 Word。")
+        raise ValueError("Word 源文件缺失，暂时无法导出保留排版的双语 Word。")
+
+    export_bytes = raw_bytes
+    export_filename = filename
+    if get_task_file_extension(filename) == ".doc":
+        try:
+            export_bytes = convert_word_to_docx(raw_bytes, filename)
+        except LibreOfficeError as exc:
+            raise ValueError(f"DOC 转 DOCX 失败：{exc}") from exc
+        export_filename = build_converted_docx_filename(filename)
 
     return ExportedTaskFile(
         content=export_bilingual_docx_with_layout(
-            raw_bytes=raw_bytes,
+            raw_bytes=export_bytes,
             segments=segments,
             order=order,
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
         ),
         media_type=DOCX_MEDIA_TYPE,
-        filename=build_bilingual_docx_filename(filename, order),
+        filename=build_bilingual_docx_filename(export_filename, order),
     )
 
 
@@ -737,7 +787,7 @@ def build_export_segments_from_source(
     segments: list[Any],
     document_parse_options: dict[str, object] | str | None = None,
 ) -> list[dict[str, Any]]:
-    if is_docx_task(filename):
+    if is_word_task(filename):
         return [_normalize_existing_segment(segment) for segment in segments]
 
     registry = ensure_default_adapters_registered()

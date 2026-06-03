@@ -12,11 +12,16 @@ from app.services.adapters import (
     ParseError,
 )
 from app.services.document_workspace import parse_docx_workspace
+from app.services.libreoffice_service import (
+    LibreOfficeError,
+    build_converted_docx_filename,
+    convert_word_to_docx,
+)
 
 
 # 支持的文件扩展名
 SUPPORTED_EXTENSIONS = {
-    ".txt", ".docx", ".pdf", ".pptx", ".xlsx", ".dita", ".ditamap", ".xml", ".svg",
+    ".txt", ".doc", ".docx", ".pdf", ".pptx", ".xlsx", ".dita", ".ditamap", ".xml", ".svg",
     ".yaml", ".yml", ".json", ".php",
     # V4 新增格式
     ".html", ".htm", ".properties", ".po", ".pot", ".strings",
@@ -50,6 +55,13 @@ async def parse_uploaded_file(upload_file: UploadFile) -> str:
     raw_bytes = await upload_file.read()
     if not raw_bytes:
         return ""
+    if extension == ".doc":
+        try:
+            raw_bytes = convert_word_to_docx(raw_bytes, filename)
+        except LibreOfficeError as e:
+            raise ValueError(f"DOC 转 DOCX 失败：{e}") from e
+        filename = build_converted_docx_filename(filename)
+        extension = ".docx"
 
     try:
         registry = get_registry()

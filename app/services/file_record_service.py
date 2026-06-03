@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 
 # 支持通过 DOCX 专用流程处理的扩展名
 _DOCX_EXTENSIONS = {".docx"}
+_WORKSPACE_SOURCE_BYTES_KEY = "_source_bytes"
+_WORKSPACE_SOURCE_FILENAME_KEY = "_source_filename"
 
 
 SEGMENT_ORDERING = (
@@ -248,19 +250,21 @@ def duplicate_file_record(
     *,
     current_user: User | None = None,
     filename: str | None = None,
+    project_id: UUID | None = None,
 ) -> FileRecord | None:
     source_record = get_file_record(db, file_record_id)
     if source_record is None:
         return None
 
     source_bytes = load_file_record_source(source_record)
+    target_project_id = project_id if project_id is not None else source_record.project_id
     next_filename = (filename or "").strip() or build_duplicate_filename(
         db,
         source_record.filename,
-        source_record.project_id,
+        target_project_id,
     )
     duplicate = FileRecord(
-        project_id=source_record.project_id,
+        project_id=target_project_id,
         filename=next_filename,
         file_hash=source_record.file_hash,
         status=source_record.status,
@@ -274,6 +278,8 @@ def duplicate_file_record(
         collection_ids_json=source_record.collection_ids_json,
         term_base_id=source_record.term_base_id,
         term_base_ids=source_record.term_base_ids,
+        term_base_write_ids=getattr(source_record, "term_base_write_ids", "[]"),
+        qa_term_base_ids=getattr(source_record, "qa_term_base_ids", "[]"),
         deadline=source_record.deadline,
         access_level=source_record.access_level,
     )
@@ -292,6 +298,7 @@ def duplicate_file_record(
                 target_text=segment.target_text,
                 target_html=segment.target_html,
                 status=segment.status,
+                version=segment.version,
                 score=segment.score,
                 matched_source_text=segment.matched_source_text,
                 matched_collection_name=segment.matched_collection_name,
@@ -310,8 +317,12 @@ def duplicate_file_record(
         )
 
     if source_bytes is not None:
-        save_source_file(duplicate.id, next_filename, source_bytes)
-        _remember_pending_source_file(db, duplicate.id, next_filename)
+        duplicate_source_filename = _build_duplicate_source_filename(
+            source_record,
+            next_filename,
+        )
+        save_source_file(duplicate.id, duplicate_source_filename, source_bytes)
+        _remember_pending_source_file(db, duplicate.id, duplicate_source_filename)
 
     db.flush()
     return duplicate
@@ -371,9 +382,11 @@ def _create_file_record_from_workspace(
         _count_filled_targets(workspace_data["segments"]),
     )
 
-    if raw_bytes is not None:
-        save_source_file(file_record.id, filename, raw_bytes)
-        _remember_pending_source_file(db, file_record.id, filename)
+    source_bytes = workspace_data.get(_WORKSPACE_SOURCE_BYTES_KEY, raw_bytes)
+    source_filename = workspace_data.get(_WORKSPACE_SOURCE_FILENAME_KEY, filename)
+    if source_bytes is not None:
+        save_source_file(file_record.id, source_filename, source_bytes)
+        _remember_pending_source_file(db, file_record.id, source_filename)
     db.flush()
     _record_initial_translation_events(db, created_segments)
     return file_record
@@ -522,6 +535,22 @@ def get_file_record_source_filename(file_record: FileRecord) -> str:
     return f"{base_name}{stored_extension}"
 
 
+def _build_duplicate_source_filename(source_record: FileRecord, duplicate_filename: str) -> str:
+    source_filename = get_file_record_source_filename(source_record)
+    source_extension = Path(source_filename).suffix.lower()
+    original_extension = Path(source_record.filename).suffix.lower()
+    if not source_extension or source_extension == original_extension:
+        return duplicate_filename
+
+    duplicate_extension = Path(duplicate_filename).suffix
+    base_name = (
+        duplicate_filename[: -len(duplicate_extension)]
+        if duplicate_extension
+        else duplicate_filename
+    )
+    return f"{base_name}{source_extension}"
+
+
 def backfill_file_record_source_html(db: Session, file_record: FileRecord) -> int:
     source_filename = get_file_record_source_filename(file_record)
     if Path(source_filename).suffix.lower() not in _DOCX_EXTENSIONS:
@@ -649,14 +678,16 @@ def attach_source_document_to_file_record(
         _count_filled_targets(workspace_data["segments"]),
     )
 
+    stored_source_bytes = workspace_data.get(_WORKSPACE_SOURCE_BYTES_KEY, raw_bytes)
+    stored_source_filename = workspace_data.get(_WORKSPACE_SOURCE_FILENAME_KEY, source_filename)
     try:
-        save_source_file(file_record.id, source_filename, raw_bytes)
+        save_source_file(file_record.id, stored_source_filename, stored_source_bytes)
         db.flush()
         _record_initial_translation_events(db, created_segments)
         db.commit()
     except Exception:
         db.rollback()
-        delete_source_file(file_record.id, source_filename)
+        delete_source_file(file_record.id, stored_source_filename)
         raise
 
     db.refresh(file_record)

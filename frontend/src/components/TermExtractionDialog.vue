@@ -34,6 +34,7 @@ interface ProjectFileItem {
   source_language: string | null
   target_language: string | null
   term_base_id: string | null
+  term_base_write_ids?: string[]
 }
 
 type TermDraftAction = 'add' | 'replace' | 'skip'
@@ -97,6 +98,7 @@ const languagePairLabel = computed(() => (
 const availableTermBases = computed(() => termBases.value.filter((termBase) => (
   termBase.source_language === sourceLanguage.value
   && termBase.target_language === targetLanguage.value
+  && (props.file?.term_base_write_ids || []).includes(termBase.id)
 )))
 const selectedTermBase = computed(() => (
   termBases.value.find((termBase) => termBase.id === selectedTermBaseId.value) ?? null
@@ -171,7 +173,10 @@ function resetState() {
   extractionPrompt.value = ''
   errorMessage.value = ''
   saveResult.value = null
-  selectedTermBaseId.value = props.file?.term_base_id || ''
+  const writableIds = props.file?.term_base_write_ids || []
+  selectedTermBaseId.value = props.file?.term_base_id && writableIds.includes(props.file.term_base_id)
+    ? props.file.term_base_id
+    : (writableIds[0] || '')
   newBaseName.value = props.file ? `${props.file.filename} 术语` : ''
 }
 
@@ -275,7 +280,10 @@ async function loadTermBases() {
   try {
     const { data } = await http.get<TermBase[]>('/term-bases')
     termBases.value = data
-    if (selectedTermBaseId.value && !data.some((termBase) => termBase.id === selectedTermBaseId.value)) {
+    if (
+      selectedTermBaseId.value
+      && !availableTermBases.value.some((termBase) => termBase.id === selectedTermBaseId.value)
+    ) {
       selectedTermBaseId.value = ''
     }
   } catch (error) {
@@ -440,9 +448,6 @@ async function saveTerms() {
       },
     )
     saveResult.value = data
-    await http.patch(`/file-records/${props.file.id}/bindings`, {
-      term_base_id: selectedTermBaseId.value,
-    })
     await refreshConflicts()
     emit('done')
     pushToast({

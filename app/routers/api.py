@@ -48,6 +48,8 @@ from app.models import (
     Segment,
     SegmentRevision,
     TMCollection,
+    TermQAReport,
+    TermQAReportItem,
     TermBase,
     TermEntry,
     TranslationMemory,
@@ -84,7 +86,7 @@ from app.services.comment_service import (
     serialize_segment_comment,
     update_segment_comment,
 )
-from app.services.document_statistics import compute_docx_statistics, serialize_document_statistics
+from app.services.document_statistics import compute_word_document_statistics, serialize_document_statistics
 from app.services.issue_marker_service import (
     create_issue_marker,
     delete_issue_marker,
@@ -375,8 +377,13 @@ def _uuid_list(values: list[str] | None) -> list[UUID]:
     return [UUID(value) for value in values or []]
 
 
-def _load_file_record_term_base_ids(file_record: FileRecord) -> list[UUID]:
-    raw_ids = getattr(file_record, "term_base_ids", "") or "[]"
+def _load_file_record_uuid_ids(
+    file_record: FileRecord,
+    field_name: str,
+    *,
+    legacy_field_name: str | None = None,
+) -> list[UUID]:
+    raw_ids = getattr(file_record, field_name, "") or "[]"
     parsed_ids: list[UUID] = []
     try:
         values = json.loads(raw_ids)
@@ -388,15 +395,84 @@ def _load_file_record_term_base_ids(file_record: FileRecord) -> list[UUID]:
                 parsed_ids.append(value if isinstance(value, UUID) else UUID(str(value)))
             except (TypeError, ValueError):
                 continue
-    if not parsed_ids and file_record.term_base_id:
-        parsed_ids.append(file_record.term_base_id)
+    legacy_id = getattr(file_record, legacy_field_name, None) if legacy_field_name else None
+    if not parsed_ids and legacy_id:
+        parsed_ids.append(legacy_id if isinstance(legacy_id, UUID) else UUID(str(legacy_id)))
     return list(dict.fromkeys(parsed_ids))
+
+
+def _store_file_record_uuid_ids(
+    file_record: FileRecord,
+    field_name: str,
+    ids: list[UUID],
+    *,
+    legacy_field_name: str | None = None,
+) -> None:
+    normalized_ids = list(dict.fromkeys(ids))
+    if legacy_field_name:
+        setattr(file_record, legacy_field_name, normalized_ids[0] if normalized_ids else None)
+    if hasattr(file_record, field_name):
+        setattr(file_record, field_name, json.dumps([str(item_id) for item_id in normalized_ids]))
+
+
+def _load_file_record_collection_ids(file_record: FileRecord) -> list[UUID]:
+    return _load_file_record_uuid_ids(
+        file_record,
+        "collection_ids_json",
+        legacy_field_name="collection_id",
+    )
+
+
+def _store_file_record_collection_ids(file_record: FileRecord, collection_ids: list[UUID]) -> None:
+    _store_file_record_uuid_ids(
+        file_record,
+        "collection_ids_json",
+        collection_ids,
+        legacy_field_name="collection_id",
+    )
+
+
+def _load_file_record_term_base_ids(file_record: FileRecord) -> list[UUID]:
+    return _load_file_record_uuid_ids(
+        file_record,
+        "term_base_ids",
+        legacy_field_name="term_base_id",
+    )
+
+
+def _load_file_record_term_base_write_ids(file_record: FileRecord) -> list[UUID]:
+    return _load_file_record_uuid_ids(file_record, "term_base_write_ids")
+
+
+def _load_file_record_qa_term_base_ids(file_record: FileRecord) -> list[UUID]:
+    return _load_file_record_uuid_ids(file_record, "qa_term_base_ids")
 
 
 def _store_file_record_term_base_ids(file_record: FileRecord, term_base_ids: list[UUID]) -> None:
     normalized_ids = list(dict.fromkeys(term_base_ids))
-    file_record.term_base_id = normalized_ids[0] if normalized_ids else None
-    file_record.term_base_ids = json.dumps([str(term_base_id) for term_base_id in normalized_ids])
+    _store_file_record_uuid_ids(
+        file_record,
+        "term_base_ids",
+        normalized_ids,
+        legacy_field_name="term_base_id",
+    )
+    enabled_set = set(normalized_ids)
+    _store_file_record_term_base_write_ids(
+        file_record,
+        [term_base_id for term_base_id in _load_file_record_term_base_write_ids(file_record) if term_base_id in enabled_set],
+    )
+    _store_file_record_qa_term_base_ids(
+        file_record,
+        [term_base_id for term_base_id in _load_file_record_qa_term_base_ids(file_record) if term_base_id in enabled_set],
+    )
+
+
+def _store_file_record_term_base_write_ids(file_record: FileRecord, term_base_ids: list[UUID]) -> None:
+    _store_file_record_uuid_ids(file_record, "term_base_write_ids", term_base_ids)
+
+
+def _store_file_record_qa_term_base_ids(file_record: FileRecord, term_base_ids: list[UUID]) -> None:
+    _store_file_record_uuid_ids(file_record, "qa_term_base_ids", term_base_ids)
 
 
 def _serialize_file_record_upload_result(file_record: FileRecord) -> dict[str, Any]:
@@ -873,7 +949,41 @@ class RematchRequest(BaseModel):
 class FileRecordBindingsRequest(BaseModel):
     term_base_id: UUID | None = None
     term_base_ids: list[UUID] | None = None
+    term_base_write_ids: list[UUID] | None = None
+    qa_term_base_ids: list[UUID] | None = None
     collection_id: UUID | None = None
+
+
+class ProjectTermBaseSettingPayload(BaseModel):
+    source_language: str
+    target_language: str
+    enabled_term_base_ids: list[UUID] = Field(default_factory=list)
+    writable_term_base_ids: list[UUID] = Field(default_factory=list)
+    qa_term_base_ids: list[UUID] = Field(default_factory=list)
+
+
+class ProjectTermBaseSettingsRequest(BaseModel):
+    settings: list[ProjectTermBaseSettingPayload] = Field(default_factory=list)
+
+
+class ProjectDuplicatePayload(BaseModel):
+    name: str
+    deadline: str | None = None
+    access_level: Literal["team", "private", "public"] | None = None
+    translation_guidelines: str | None = None
+
+
+class TermQAReportCreateRequest(BaseModel):
+    file_ids: list[UUID] = Field(default_factory=list)
+
+
+class TermQAReportItemIgnoreRequest(BaseModel):
+    ignored: bool = True
+
+
+class TermQAReportItemsIgnoreRequest(BaseModel):
+    item_ids: list[UUID] = Field(default_factory=list)
+    ignored: bool = True
 
 
 class FileRecordDuplicateRequest(BaseModel):
@@ -1669,7 +1779,7 @@ def delete_translation_guideline_template(template_id: str):
 # 支持的文件扩展名（30种格式）
 SUPPORTED_EXTENSIONS = {
     # 办公文档
-    ".docx", ".txt", ".dat", ".pdf", ".pptx", ".xlsx",
+    ".doc", ".docx", ".txt", ".dat", ".pdf", ".pptx", ".xlsx",
     # 本地化文件
     ".properties", ".po", ".pot", ".strings", ".yaml", ".yml", ".json", ".php",
     # 网页/排版
@@ -2497,6 +2607,73 @@ def create_project(
     }
 
 
+@router.post("/projects/{project_id}/duplicate")
+def duplicate_project(
+    project_id: UUID,
+    payload: ProjectDuplicatePayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    source_project = (
+        db.query(Project)
+        .filter(Project.id == project_id)
+        .first()
+    )
+    if not source_project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+
+    project_name = payload.name.strip()
+    if not project_name:
+        raise HTTPException(status_code=400, detail="项目名称不能为空。")
+
+    if "deadline" in payload.model_fields_set:
+        deadline_dt = _parse_optional_datetime(payload.deadline)
+        if payload.deadline and deadline_dt is None:
+            raise HTTPException(status_code=400, detail="截止期限格式不正确，请使用 ISO 格式。")
+    else:
+        deadline_dt = source_project.deadline
+
+    source_language = source_project.source_language
+    target_language = source_project.target_language
+    source_files = (
+        db.query(FileRecord)
+        .filter(FileRecord.project_id == source_project.id)
+        .order_by(FileRecord.created_at.asc(), FileRecord.id.asc())
+        .all()
+    )
+    if not source_language or not target_language:
+        pair_map = _project_file_language_pair_map(source_files)
+        if len(pair_map) == 1:
+            source_language, target_language = next(iter(pair_map))
+
+    duplicate = Project(
+        name=project_name,
+        status="draft",
+        document_parse_mode=source_project.document_parse_mode,
+        source_language=source_language,
+        target_language=target_language,
+        creator_id=current_user.id,
+        deadline=deadline_dt,
+        access_level=payload.access_level or source_project.access_level or "team",
+        translation_guidelines=(
+            payload.translation_guidelines
+            if payload.translation_guidelines is not None
+            else source_project.translation_guidelines
+        ) or "",
+    )
+
+    db.add(duplicate)
+    db.commit()
+    db.refresh(duplicate)
+
+    return _build_project_detail_payload(
+        duplicate,
+        [],
+        {},
+        current_user=current_user,
+    )
+
+
 def _build_project_summary_payload(
     project: Project,
     total_segments: int,
@@ -2568,6 +2745,10 @@ def _build_project_file_payload(
     assignee = getattr(file_record, "assignee", None)
     assigned_at = getattr(file_record, "assigned_at", None)
     deadline = getattr(file_record, "deadline", None)
+    collection_ids = _load_file_record_collection_ids(file_record)
+    term_base_ids = _load_file_record_term_base_ids(file_record)
+    term_base_write_ids = _load_file_record_term_base_write_ids(file_record)
+    qa_term_base_ids = _load_file_record_qa_term_base_ids(file_record)
 
     return {
         "id": str(file_record.id),
@@ -2593,8 +2774,12 @@ def _build_project_file_payload(
         "updated_at": file_record.updated_at.isoformat(),
         "has_source_document": source_bytes is not None,
         "file_size_bytes": len(source_bytes) if source_bytes is not None else None,
-        "collection_id": file_record.collection_id,
+        "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
+        "collection_ids": [str(collection_id) for collection_id in collection_ids],
         "term_base_id": file_record.term_base_id,
+        "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
+        "term_base_write_ids": [str(term_base_id) for term_base_id in term_base_write_ids],
+        "qa_term_base_ids": [str(term_base_id) for term_base_id in qa_term_base_ids],
         "issue_count": issue_stats.get("issue_count", 0),
         "open_issue_count": issue_stats.get("open_issue_count", 0),
         "can_manage": _can_manage_workflow(current_user),
@@ -2730,6 +2915,398 @@ def _get_file_issue_stats(db: Session, file_record_ids: list[UUID]) -> dict[UUID
         for row in stats_rows
         if row.file_record_id is not None
     }
+
+
+def _project_file_language_pair_map(files: list[FileRecord]) -> dict[tuple[str, str], list[FileRecord]]:
+    pair_map: dict[tuple[str, str], list[FileRecord]] = {}
+    for file_record in files:
+        try:
+            source_language, target_language = require_language_pair(
+                file_record.source_language,
+                file_record.target_language,
+            )
+        except ValueError:
+            continue
+        pair_map.setdefault((source_language, target_language), []).append(file_record)
+    return pair_map
+
+
+def _serialize_project_term_base_settings(
+    db: Session,
+    project: Project,
+    files: list[FileRecord],
+) -> dict[str, Any]:
+    pair_map = _project_file_language_pair_map(files)
+    term_bases = db.query(TermBase).order_by(TermBase.name.asc(), TermBase.created_at.desc()).all()
+    term_base_ids = [term_base.id for term_base in term_bases]
+    entry_counts: dict[UUID, int] = {}
+    if term_base_ids:
+        entry_counts = {
+            term_base_id: int(entry_count or 0)
+            for term_base_id, entry_count in (
+                db.query(TermEntry.term_base_id, func.count(TermEntry.id))
+                .filter(TermEntry.term_base_id.in_(term_base_ids))
+                .group_by(TermEntry.term_base_id)
+                .all()
+            )
+        }
+
+    groups: list[dict[str, Any]] = []
+    for source_language, target_language in sorted(pair_map):
+        group_files = pair_map[(source_language, target_language)]
+        enabled_ids: list[UUID] = []
+        writable_ids: list[UUID] = []
+        qa_ids: list[UUID] = []
+        for file_record in group_files:
+            enabled_ids.extend(_load_file_record_term_base_ids(file_record))
+            writable_ids.extend(_load_file_record_term_base_write_ids(file_record))
+            qa_ids.extend(_load_file_record_qa_term_base_ids(file_record))
+        enabled_ids = list(dict.fromkeys(enabled_ids))
+        writable_ids = [term_base_id for term_base_id in dict.fromkeys(writable_ids) if term_base_id in set(enabled_ids)]
+        qa_ids = [term_base_id for term_base_id in dict.fromkeys(qa_ids) if term_base_id in set(enabled_ids)]
+        enabled_set = set(enabled_ids)
+        writable_set = set(writable_ids)
+        qa_set = set(qa_ids)
+        group_term_bases = [
+            term_base
+            for term_base in term_bases
+            if term_base.source_language == source_language and term_base.target_language == target_language
+        ]
+        groups.append({
+            "source_language": source_language,
+            "target_language": target_language,
+            "file_count": len(group_files),
+            "enabled_term_base_ids": [str(term_base_id) for term_base_id in enabled_ids],
+            "writable_term_base_ids": [str(term_base_id) for term_base_id in writable_ids],
+            "qa_term_base_ids": [str(term_base_id) for term_base_id in qa_ids],
+            "term_bases": [
+                {
+                    "id": str(term_base.id),
+                    "name": term_base.name,
+                    "description": term_base.description,
+                    "source_language": term_base.source_language,
+                    "target_language": term_base.target_language,
+                    "entry_count": entry_counts.get(term_base.id, 0),
+                    "enabled": term_base.id in enabled_set,
+                    "writable": term_base.id in writable_set,
+                    "qa": term_base.id in qa_set,
+                }
+                for term_base in group_term_bases
+            ],
+        })
+
+    return {
+        "project_id": str(project.id),
+        "groups": groups,
+    }
+
+
+def _validate_term_base_setting_ids(
+    db: Session,
+    ids: list[UUID],
+    source_language: str,
+    target_language: str,
+) -> list[TermBase]:
+    term_bases = _validate_term_base_ids(db, ids)
+    for term_base in term_bases:
+        _ensure_resource_language_pair_matches(term_base, source_language, target_language, "术语库")
+    return term_bases
+
+
+def _text_contains_case_insensitive(text: str | None, needle: str | None) -> bool:
+    clean_text = (text or "").casefold()
+    clean_needle = (needle or "").strip().casefold()
+    return bool(clean_needle and clean_needle in clean_text)
+
+
+def _load_json_list(raw_value: str | None) -> list[Any]:
+    try:
+        value = json.loads(raw_value or "[]")
+    except (TypeError, ValueError):
+        return []
+    return value if isinstance(value, list) else []
+
+
+def _serialize_term_qa_report_item(item: TermQAReportItem) -> dict[str, Any]:
+    ignored_by_name = None
+    if item.ignored_by_id:
+        try:
+            ignored_by = getattr(item, "ignored_by", None)
+            ignored_by_name = get_user_display_name(ignored_by) if ignored_by else None
+        except Exception:
+            ignored_by_name = None
+    return {
+        "id": str(item.id),
+        "report_id": str(item.report_id),
+        "project_id": str(item.project_id) if item.project_id else None,
+        "file_record_id": str(item.file_record_id),
+        "segment_id": str(item.segment_id) if item.segment_id else None,
+        "term_base_id": str(item.term_base_id) if item.term_base_id else None,
+        "sentence_id": item.sentence_id,
+        "file_name": item.file_name,
+        "term_base_name": item.term_base_name,
+        "source_term": item.source_term,
+        "expected_target_term": item.expected_target_term,
+        "source_text": item.source_text,
+        "target_text": item.target_text,
+        "block_index": item.block_index,
+        "row_index": item.row_index,
+        "cell_index": item.cell_index,
+        "ignored": item.ignored_at is not None,
+        "ignored_at": item.ignored_at.isoformat() if item.ignored_at else None,
+        "ignored_by_id": str(item.ignored_by_id) if item.ignored_by_id else None,
+        "ignored_by_name": ignored_by_name,
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+    }
+
+
+def _serialize_term_qa_report(
+    report: TermQAReport,
+    items: list[TermQAReportItem] | None = None,
+) -> dict[str, Any]:
+    report_items = list(items if items is not None else report.items)
+    ignored_count = sum(1 for item in report_items if item.ignored_at is not None)
+    active_issue_count = max(int(report.issue_count or 0) - ignored_count, 0)
+    return {
+        "id": str(report.id),
+        "project_id": str(report.project_id) if report.project_id else None,
+        "file_record_id": str(report.file_record_id) if report.file_record_id else None,
+        "created_by_id": str(report.created_by_id) if report.created_by_id else None,
+        "scope": report.scope,
+        "file_ids": [str(value) for value in _load_json_list(report.file_ids)],
+        "term_base_ids": [str(value) for value in _load_json_list(report.term_base_ids)],
+        "language_pairs": _load_json_list(report.language_pairs),
+        "total_files": report.total_files,
+        "total_segments": report.total_segments,
+        "checked_segments": report.checked_segments,
+        "issue_count": report.issue_count,
+        "active_issue_count": active_issue_count,
+        "ignored_count": ignored_count,
+        "status": report.status,
+        "created_at": report.created_at.isoformat() if report.created_at else None,
+        "items": [_serialize_term_qa_report_item(item) for item in report_items],
+    }
+
+
+def _create_term_qa_report(
+    db: Session,
+    *,
+    project_id: UUID | None,
+    files: list[FileRecord],
+    current_user: User,
+    scope: Literal["project", "file"],
+) -> TermQAReport:
+    if not files:
+        raise HTTPException(status_code=400, detail="请选择要检查的文件。")
+
+    file_ids = [file_record.id for file_record in files]
+    file_by_id = {file_record.id: file_record for file_record in files}
+    qa_ids_by_file_id = {
+        file_record.id: _load_file_record_qa_term_base_ids(file_record)
+        for file_record in files
+    }
+    configured_term_base_ids = list(dict.fromkeys(
+        term_base_id
+        for ids in qa_ids_by_file_id.values()
+        for term_base_id in ids
+    ))
+    if not configured_term_base_ids:
+        raise HTTPException(status_code=400, detail="未配置QA术语库。")
+
+    term_bases = (
+        db.query(TermBase)
+        .filter(TermBase.id.in_(configured_term_base_ids))
+        .all()
+    )
+    term_base_by_id = {term_base.id: term_base for term_base in term_bases}
+    entries = (
+        db.query(TermEntry)
+        .filter(TermEntry.term_base_id.in_(configured_term_base_ids))
+        .all()
+    )
+    entries_by_key: dict[tuple[str, str, UUID], list[TermEntry]] = {}
+    for entry in entries:
+        source_term = (entry.source_text or "").strip()
+        target_term = (entry.target_text or "").strip()
+        if not source_term or not target_term:
+            continue
+        entries_by_key.setdefault(
+            (entry.source_language, entry.target_language, entry.term_base_id),
+            [],
+        ).append(entry)
+
+    segments = (
+        db.query(Segment)
+        .filter(Segment.file_record_id.in_(file_ids))
+        .order_by(
+            Segment.file_record_id.asc(),
+            Segment.block_index.asc(),
+            Segment.row_index.asc().nullsfirst(),
+            Segment.cell_index.asc().nullsfirst(),
+            Segment.sentence_id.asc(),
+        )
+        .all()
+    )
+    segments_by_file_id: dict[UUID, list[Segment]] = {}
+    for segment in segments:
+        segments_by_file_id.setdefault(segment.file_record_id, []).append(segment)
+
+    language_pairs: list[dict[str, str]] = []
+    language_pair_keys: set[tuple[str, str]] = set()
+    report = TermQAReport(
+        project_id=project_id,
+        file_record_id=files[0].id if scope == "file" and len(files) == 1 else None,
+        created_by_id=getattr(current_user, "id", None),
+        scope=scope,
+        file_ids=json.dumps([str(file_id) for file_id in file_ids]),
+        term_base_ids=json.dumps([str(term_base_id) for term_base_id in configured_term_base_ids]),
+        language_pairs="[]",
+        total_files=len(files),
+        total_segments=len(segments),
+        checked_segments=0,
+        issue_count=0,
+        status="completed",
+    )
+    db.add(report)
+    db.flush()
+
+    issue_count = 0
+    checked_segments = 0
+    for file_record in files:
+        try:
+            source_language, target_language = require_language_pair(
+                file_record.source_language,
+                file_record.target_language,
+            )
+        except ValueError:
+            continue
+        pair_key = (source_language, target_language)
+        if pair_key not in language_pair_keys:
+            language_pair_keys.add(pair_key)
+            language_pairs.append({
+                "source_language": source_language,
+                "target_language": target_language,
+            })
+        qa_ids = [
+            term_base_id
+            for term_base_id in qa_ids_by_file_id.get(file_record.id, [])
+            if term_base_id in term_base_by_id
+        ]
+        if not qa_ids:
+            continue
+        applicable_entries = [
+            entry
+            for term_base_id in qa_ids
+            for entry in entries_by_key.get((source_language, target_language, term_base_id), [])
+        ]
+        if not applicable_entries:
+            continue
+        file_segments = segments_by_file_id.get(file_record.id, [])
+        checked_segments += len(file_segments)
+        for segment in file_segments:
+            source_text = segment.source_text or ""
+            target_text = segment.target_text or ""
+            for entry in applicable_entries:
+                source_term = (entry.source_text or "").strip()
+                expected_target_term = (entry.target_text or "").strip()
+                if not _text_contains_case_insensitive(source_text, source_term):
+                    continue
+                if _text_contains_case_insensitive(target_text, expected_target_term):
+                    continue
+                term_base = term_base_by_id.get(entry.term_base_id)
+                db.add(TermQAReportItem(
+                    report_id=report.id,
+                    project_id=project_id,
+                    file_record_id=file_record.id,
+                    segment_id=segment.id,
+                    term_base_id=entry.term_base_id,
+                    sentence_id=segment.sentence_id,
+                    file_name=file_record.filename,
+                    term_base_name=term_base.name if term_base else "",
+                    source_term=source_term,
+                    expected_target_term=expected_target_term,
+                    source_text=source_text,
+                    target_text=target_text,
+                    block_index=int(segment.block_index or 0),
+                    row_index=segment.row_index,
+                    cell_index=segment.cell_index,
+                ))
+                issue_count += 1
+
+    report.language_pairs = json.dumps(language_pairs)
+    report.checked_segments = checked_segments
+    report.issue_count = issue_count
+    db.commit()
+    db.refresh(report)
+    return report
+
+
+def _get_term_qa_report_or_404(db: Session, report_id: UUID) -> TermQAReport:
+    report = db.query(TermQAReport).filter(TermQAReport.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="术语QA报告不存在。")
+    return report
+
+
+def _require_term_qa_report_read_access(
+    report: TermQAReport,
+    current_user: User,
+    db: Session,
+) -> None:
+    if report.project_id:
+        project = db.query(Project).filter(Project.id == report.project_id).first()
+        if project:
+            _require_project_read_access(project, current_user, db)
+            return
+    if report.file_record_id:
+        file_record = get_file_record_model(db, report.file_record_id)
+        if file_record:
+            _require_file_record_read_access(file_record, current_user)
+            return
+    if not can_access_all_projects(current_user):
+        raise HTTPException(status_code=403, detail="无权访问该术语QA报告。")
+
+
+def _get_term_qa_report_item_or_404(db: Session, item_id: UUID) -> TermQAReportItem:
+    item = db.query(TermQAReportItem).filter(TermQAReportItem.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="术语QA报告项不存在。")
+    return item
+
+
+def _load_term_qa_report_items_for_response(db: Session, report_id: UUID) -> list[TermQAReportItem]:
+    return (
+        db.query(TermQAReportItem)
+        .filter(TermQAReportItem.report_id == report_id)
+        .order_by(TermQAReportItem.file_name.asc(), TermQAReportItem.block_index.asc(), TermQAReportItem.sentence_id.asc())
+        .all()
+    )
+
+
+def _require_term_qa_item_write_access(
+    db: Session,
+    item: TermQAReportItem,
+    current_user: User,
+) -> None:
+    file_record = get_file_record_model(db, item.file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="报告项对应文件不存在。")
+    _require_file_record_work_access(file_record, current_user)
+
+
+def _apply_term_qa_ignore_state(
+    items: list[TermQAReportItem],
+    current_user: User,
+    ignored: bool,
+) -> None:
+    now = datetime.utcnow()
+    for item in items:
+        if ignored:
+            item.ignored_at = item.ignored_at or now
+            item.ignored_by_id = current_user.id
+        else:
+            item.ignored_at = None
+            item.ignored_by_id = None
 
 
 def _build_project_detail_payload(
@@ -2956,6 +3533,292 @@ def update_project_assignments(
     return _serialize_project_assignments(db, project_id)
 
 
+@router.get("/projects/{project_id}/term-base-settings")
+def get_project_term_base_settings(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    project = _get_project_or_404(db, project_id)
+    files = (
+        db.query(FileRecord)
+        .filter(FileRecord.project_id == project_id)
+        .order_by(FileRecord.created_at.asc(), FileRecord.id.asc())
+        .all()
+    )
+    return _serialize_project_term_base_settings(db, project, files)
+
+
+@router.patch("/projects/{project_id}/term-base-settings")
+def update_project_term_base_settings(
+    project_id: UUID,
+    payload: ProjectTermBaseSettingsRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    project = _get_project_or_404(db, project_id)
+    files = (
+        db.query(FileRecord)
+        .filter(FileRecord.project_id == project_id)
+        .order_by(FileRecord.created_at.asc(), FileRecord.id.asc())
+        .all()
+    )
+    pair_map = _project_file_language_pair_map(files)
+
+    for item in payload.settings:
+        source_language, target_language = _require_tm_language_pair(
+            item.source_language,
+            item.target_language,
+        )
+        group_files = pair_map.get((source_language, target_language))
+        if not group_files:
+            raise HTTPException(status_code=400, detail="项目中不存在该语言对的文件。")
+
+        enabled_ids = list(dict.fromkeys(item.enabled_term_base_ids))
+        writable_ids = list(dict.fromkeys(item.writable_term_base_ids))
+        qa_ids = list(dict.fromkeys(item.qa_term_base_ids))
+        enabled_set = set(enabled_ids)
+        if not set(writable_ids).issubset(enabled_set):
+            raise HTTPException(status_code=400, detail="写入术语库必须先启用。")
+        if not set(qa_ids).issubset(enabled_set):
+            raise HTTPException(status_code=400, detail="QA术语库必须先启用。")
+
+        _validate_term_base_setting_ids(db, enabled_ids, source_language, target_language)
+        _validate_term_base_setting_ids(db, writable_ids, source_language, target_language)
+        _validate_term_base_setting_ids(db, qa_ids, source_language, target_language)
+
+        for file_record in group_files:
+            _store_file_record_term_base_ids(file_record, enabled_ids)
+            _store_file_record_term_base_write_ids(file_record, writable_ids)
+            _store_file_record_qa_term_base_ids(file_record, qa_ids)
+
+    db.commit()
+    files = (
+        db.query(FileRecord)
+        .filter(FileRecord.project_id == project_id)
+        .order_by(FileRecord.created_at.asc(), FileRecord.id.asc())
+        .all()
+    )
+    return _serialize_project_term_base_settings(db, project, files)
+
+
+@router.post("/projects/{project_id}/term-qa-reports")
+def create_project_term_qa_report(
+    project_id: UUID,
+    payload: TermQAReportCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    project = _get_project_or_404(db, project_id)
+    _require_project_read_access(project, current_user, db)
+    requested_file_ids = list(dict.fromkeys(payload.file_ids))
+    query = db.query(FileRecord).filter(FileRecord.project_id == project_id)
+    if requested_file_ids:
+        query = query.filter(FileRecord.id.in_(requested_file_ids))
+    files = query.order_by(FileRecord.created_at.asc(), FileRecord.id.asc()).all()
+    if requested_file_ids and len(files) != len(requested_file_ids):
+        raise HTTPException(status_code=404, detail="部分文件不存在或不属于当前项目。")
+    files = _visible_project_files(files, current_user, db)
+    report = _create_term_qa_report(
+        db,
+        project_id=project.id,
+        files=files,
+        current_user=current_user,
+        scope="project",
+    )
+    items = (
+        db.query(TermQAReportItem)
+        .filter(TermQAReportItem.report_id == report.id)
+        .order_by(TermQAReportItem.file_name.asc(), TermQAReportItem.block_index.asc(), TermQAReportItem.sentence_id.asc())
+        .all()
+    )
+    return _serialize_term_qa_report(report, items)
+
+
+@router.post("/file-records/{file_record_id}/term-qa-reports")
+def create_file_record_term_qa_report(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    report = _create_term_qa_report(
+        db,
+        project_id=file_record.project_id,
+        files=[file_record],
+        current_user=current_user,
+        scope="file",
+    )
+    items = (
+        db.query(TermQAReportItem)
+        .filter(TermQAReportItem.report_id == report.id)
+        .order_by(TermQAReportItem.block_index.asc(), TermQAReportItem.sentence_id.asc())
+        .all()
+    )
+    return _serialize_term_qa_report(report, items)
+
+
+@router.get("/file-records/{file_record_id}/term-qa-reports")
+def list_file_record_term_qa_reports(
+    file_record_id: UUID,
+    limit: int = 5,
+    include_items: bool = True,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    _require_file_record_read_access(file_record, current_user)
+
+    safe_limit = min(max(int(limit), 1), 20)
+    reports = (
+        db.query(TermQAReport)
+        .filter(TermQAReport.file_record_id == file_record.id)
+        .order_by(TermQAReport.created_at.desc(), TermQAReport.id.desc())
+        .limit(safe_limit)
+        .all()
+    )
+
+    items_by_report_id: dict[UUID, list[TermQAReportItem]] = {report.id: [] for report in reports}
+    if include_items and reports:
+        items = (
+            db.query(TermQAReportItem)
+            .filter(TermQAReportItem.report_id.in_([report.id for report in reports]))
+            .order_by(TermQAReportItem.block_index.asc(), TermQAReportItem.sentence_id.asc())
+            .all()
+        )
+        for item in items:
+            items_by_report_id.setdefault(item.report_id, []).append(item)
+
+    return {
+        "items": [
+            _serialize_term_qa_report(report, items_by_report_id.get(report.id, []))
+            for report in reports
+        ]
+    }
+
+
+@router.patch("/term-qa-report-items/{item_id}/ignore")
+def set_term_qa_report_item_ignored(
+    item_id: UUID,
+    payload: TermQAReportItemIgnoreRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_term_qa_report_item_or_404(db, item_id)
+    report = _get_term_qa_report_or_404(db, item.report_id)
+    _require_term_qa_item_write_access(db, item, current_user)
+    _apply_term_qa_ignore_state([item], current_user, payload.ignored)
+    db.commit()
+    db.refresh(report)
+    items = _load_term_qa_report_items_for_response(db, report.id)
+    return _serialize_term_qa_report(report, items)
+
+
+@router.patch("/term-qa-reports/{report_id}/items/ignore")
+def set_term_qa_report_items_ignored(
+    report_id: UUID,
+    payload: TermQAReportItemsIgnoreRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_term_qa_report_or_404(db, report_id)
+    _require_term_qa_report_read_access(report, current_user, db)
+    item_ids = list(dict.fromkeys(payload.item_ids))
+    if not item_ids:
+        raise HTTPException(status_code=400, detail="请选择要忽略的报告项。")
+    items = (
+        db.query(TermQAReportItem)
+        .filter(
+            TermQAReportItem.report_id == report.id,
+            TermQAReportItem.id.in_(item_ids),
+        )
+        .all()
+    )
+    if len(items) != len(item_ids):
+        raise HTTPException(status_code=404, detail="部分术语QA报告项不存在。")
+    for item in items:
+        _require_term_qa_item_write_access(db, item, current_user)
+    _apply_term_qa_ignore_state(items, current_user, payload.ignored)
+    db.commit()
+    db.refresh(report)
+    report_items = _load_term_qa_report_items_for_response(db, report.id)
+    return _serialize_term_qa_report(report, report_items)
+
+
+@router.get("/term-qa-reports/{report_id}")
+def get_term_qa_report(
+    report_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_term_qa_report_or_404(db, report_id)
+    _require_term_qa_report_read_access(report, current_user, db)
+    items = _load_term_qa_report_items_for_response(db, report.id)
+    return _serialize_term_qa_report(report, items)
+
+
+@router.get("/term-qa-reports/{report_id}/export-xlsx")
+def export_term_qa_report_xlsx(
+    report_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_term_qa_report_or_404(db, report_id)
+    _require_term_qa_report_read_access(report, current_user, db)
+    items = (
+        db.query(TermQAReportItem)
+        .filter(TermQAReportItem.report_id == report.id)
+        .order_by(TermQAReportItem.file_name.asc(), TermQAReportItem.block_index.asc(), TermQAReportItem.sentence_id.asc())
+        .all()
+    )
+    rows = [
+        [
+            item.file_name,
+            item.sentence_id,
+            item.term_base_name,
+            item.source_term,
+            item.expected_target_term,
+            item.source_text,
+            item.target_text,
+            "已忽略" if item.ignored_at else "待处理",
+            item.ignored_at.isoformat() if item.ignored_at else "",
+            get_user_display_name(item.ignored_by) if item.ignored_by else "",
+            item.block_index,
+            item.row_index if item.row_index is not None else "",
+            item.cell_index if item.cell_index is not None else "",
+        ]
+        for item in items
+    ]
+    xlsx_bytes = build_tabular_xlsx(
+        sheet_title="术语QA报告",
+        headers=[
+            "文件名",
+            "句段ID",
+            "QA术语库",
+            "原文术语",
+            "期望译文",
+            "原文",
+            "译文",
+            "处理状态",
+            "忽略时间",
+            "忽略人",
+            "块序号",
+            "行序号",
+            "单元格序号",
+        ],
+        rows=rows,
+    )
+    return build_xlsx_download_response(
+        f"term-qa-report-{report.id}",
+        xlsx_bytes,
+    )
+
+
 @router.get("/projects/{project_id}")
 def get_project_detail(
     project_id: UUID,
@@ -3051,10 +3914,13 @@ def compute_project_document_statistics(
     unavailable_statistics = {
         "source": "unavailable",
         "engine": None,
+        "engine_version": None,
         "license_status": None,
         "include_textboxes_footnotes_endnotes": None,
         "pages": None,
         "words": None,
+        "non_asian_words": None,
+        "asian_characters": None,
         "characters": None,
         "characters_with_spaces": None,
         "paragraphs": None,
@@ -3064,8 +3930,8 @@ def compute_project_document_statistics(
     for file_record in files:
         source_bytes = load_file_record_source(file_record)
         source_filename = get_file_record_source_filename(file_record)
-        if source_bytes and Path(source_filename).suffix.lower() == ".docx":
-            statistics = compute_docx_statistics(source_bytes)
+        if source_bytes and Path(source_filename).suffix.lower() in {".doc", ".docx"}:
+            statistics = compute_word_document_statistics(source_bytes, source_filename)
         else:
             statistics = unavailable_statistics
         file_record.document_statistics = serialize_document_statistics(statistics)
@@ -3801,6 +4667,7 @@ def get_file_record(
     source_filename = get_file_record_source_filename(file_record)
 
     # 获取绑定的库信息
+    collection_ids = _load_file_record_collection_ids(file_record)
     collection_name = None
     if file_record.collection:
         collection_name = file_record.collection.name
@@ -3808,11 +4675,15 @@ def get_file_record(
     if file_record.term_base:
         term_base_name = file_record.term_base.name
     term_base_ids = _load_file_record_term_base_ids(file_record)
+    term_base_write_ids = _load_file_record_term_base_write_ids(file_record)
+    qa_term_base_ids = _load_file_record_qa_term_base_ids(file_record)
     term_base_names: list[str] = []
-    if term_base_ids:
+    all_bound_term_base_ids = list(dict.fromkeys(term_base_ids + term_base_write_ids + qa_term_base_ids))
+    term_base_by_id: dict[UUID, TermBase] = {}
+    if all_bound_term_base_ids:
         term_bases = (
             db.query(TermBase)
-            .filter(TermBase.id.in_(term_base_ids))
+            .filter(TermBase.id.in_(all_bound_term_base_ids))
             .all()
         )
         term_base_by_id = {term_base.id: term_base for term_base in term_bases}
@@ -3851,12 +4722,25 @@ def get_file_record(
         "assignee": _serialize_assignee(file_record.assignee),
         "assignees": _serialize_user_list(file_assignees),
         "assigned_at": file_record.assigned_at.isoformat() if file_record.assigned_at else None,
-        "collection_id": file_record.collection_id,
+        "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
+        "collection_ids": [str(collection_id) for collection_id in collection_ids],
         "collection_name": collection_name,
         "term_base_id": file_record.term_base_id,
         "term_base_name": term_base_name,
         "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
         "term_base_names": term_base_names,
+        "term_base_write_ids": [str(term_base_id) for term_base_id in term_base_write_ids],
+        "term_base_write_names": [
+            term_base_by_id[term_base_id].name
+            for term_base_id in term_base_write_ids
+            if term_base_id in term_base_by_id
+        ],
+        "qa_term_base_ids": [str(term_base_id) for term_base_id in qa_term_base_ids],
+        "qa_term_base_names": [
+            term_base_by_id[term_base_id].name
+            for term_base_id in qa_term_base_ids
+            if term_base_id in term_base_by_id
+        ],
         "translation_guidelines": project_guidelines,
         "created_at": file_record.created_at.isoformat(),
         "updated_at": file_record.updated_at.isoformat(),
@@ -4043,6 +4927,63 @@ def get_file_record_segment_changes(
             _serialize_workbench_segment(segment)
             for segment in changed_segments
         ],
+    }
+
+
+@router.get("/file-records/{file_record_id}/segments/{sentence_id}/position")
+def get_file_record_segment_position(
+    file_record_id: UUID,
+    sentence_id: str,
+    page_size: int = 100,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文件不存在。")
+
+    _require_file_record_read_access(file_record, current_user)
+    safe_page_size = _normalize_segment_page_limit(page_size)
+    ordered_segments = (
+        db.query(
+            Segment.id.label("id"),
+            Segment.sentence_id.label("sentence_id"),
+            func.row_number()
+            .over(
+                order_by=(
+                    Segment.block_index.asc(),
+                    Segment.row_index.asc().nullsfirst(),
+                    Segment.cell_index.asc().nullsfirst(),
+                    Segment.sentence_id.asc(),
+                )
+            )
+            .label("position"),
+        )
+        .filter(Segment.file_record_id == file_record_id)
+        .subquery()
+    )
+    row = (
+        db.query(
+            ordered_segments.c.id,
+            ordered_segments.c.sentence_id,
+            ordered_segments.c.position,
+        )
+        .filter(ordered_segments.c.sentence_id == sentence_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="句段不存在。")
+
+    index = max(int(row.position) - 1, 0)
+    return {
+        "file_record_id": str(file_record_id),
+        "sentence_id": row.sentence_id,
+        "segment_id": str(row.id),
+        "index": index,
+        "display_index": int(row.position),
+        "page": (index // safe_page_size) + 1,
+        "page_size": safe_page_size,
+        "page_index": index % safe_page_size,
     }
 
 
@@ -4396,14 +5337,37 @@ def patch_file_record_bindings(
             _ensure_resource_language_pair_matches(term_base, source_language, target_language, "术语库")
             _store_file_record_term_base_ids(file_record, [payload.term_base_id])
 
+    enabled_term_base_ids = set(_load_file_record_term_base_ids(file_record))
+    if "term_base_write_ids" in payload.model_fields_set:
+        term_bases = _validate_term_base_ids(db, payload.term_base_write_ids)
+        write_ids = [term_base.id for term_base in term_bases]
+        for term_base in term_bases:
+            _ensure_resource_language_pair_matches(term_base, source_language, target_language, "术语库")
+        if not set(write_ids).issubset(enabled_term_base_ids):
+            raise HTTPException(status_code=400, detail="写入术语库必须先启用。")
+        _store_file_record_term_base_write_ids(file_record, write_ids)
+
+    if "qa_term_base_ids" in payload.model_fields_set:
+        term_bases = _validate_term_base_ids(db, payload.qa_term_base_ids)
+        qa_ids = [term_base.id for term_base in term_bases]
+        for term_base in term_bases:
+            _ensure_resource_language_pair_matches(term_base, source_language, target_language, "术语库")
+        if not set(qa_ids).issubset(enabled_term_base_ids):
+            raise HTTPException(status_code=400, detail="QA术语库必须先启用。")
+        _store_file_record_qa_term_base_ids(file_record, qa_ids)
+
     db.commit()
     db.refresh(file_record)
     term_base_ids = _load_file_record_term_base_ids(file_record)
+    term_base_write_ids = _load_file_record_term_base_write_ids(file_record)
+    qa_term_base_ids = _load_file_record_qa_term_base_ids(file_record)
     return {
         "id": str(file_record.id),
         "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
         "term_base_id": str(file_record.term_base_id) if file_record.term_base_id else None,
         "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
+        "term_base_write_ids": [str(term_base_id) for term_base_id in term_base_write_ids],
+        "qa_term_base_ids": [str(term_base_id) for term_base_id in qa_term_base_ids],
     }
 
 

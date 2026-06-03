@@ -1,4 +1,5 @@
 export const supportedTaskExtensions = [
+  '.doc',
   '.docx',
   '.pptx',
   '.xlsx',
@@ -46,6 +47,9 @@ export function getTaskFileExtension(filename: string | null | undefined) {
 
 export function getTaskExportFormatLabel(filename: string | null | undefined) {
   const extension = getTaskFileExtension(filename)
+  if (extension === '.doc') {
+    return 'DOCX'
+  }
   return extension ? extension.slice(1).toUpperCase() : 'FILE'
 }
 
@@ -53,5 +57,6 @@ export function buildTranslatedTaskFilename(filename: string | null | undefined)
   const safeName = filename || 'translated.txt'
   const extension = getTaskFileExtension(safeName) || '.txt'
   const stem = extension ? safeName.slice(0, -extension.length) : safeName
-  return `${stem || 'translated'}_translated${extension}`
+  const exportExtension = extension === '.doc' ? '.docx' : extension
+  return `${stem || 'translated'}_translated${exportExtension}`
 }

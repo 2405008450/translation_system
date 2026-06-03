@@ -18,6 +18,7 @@ DEFAULT_MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 FORMAT_SIZE_LIMITS: Dict[str, int] = {
     ".txt": 10 * 1024 * 1024,    # 10 MB
     ".dat": 10 * 1024 * 1024,    # 10 MB
+    ".doc": 50 * 1024 * 1024,    # 50 MB
     ".docx": 50 * 1024 * 1024,   # 50 MB
     ".xlsx": 50 * 1024 * 1024,   # 50 MB
     ".pdf": 100 * 1024 * 1024,   # 100 MB
