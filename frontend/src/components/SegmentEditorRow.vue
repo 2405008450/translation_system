@@ -73,6 +73,11 @@ interface HistoryRecordOptions {
 
 type HighlightKind = 'term' | 'search'
 type HighlightPart = { text: string; highlight: boolean; kind?: HighlightKind }
+type BasicFormatTag = 'b' | 'i' | 'u' | 's' | 'sub' | 'sup'
+
+const BASIC_FORMAT_TAGS = ['b', 'strong', 'i', 'em', 'u', 's', 'strike', 'del', 'sub', 'sup']
+const BASIC_FORMAT_RENDER_ORDER: BasicFormatTag[] = ['b', 'i', 'u', 's', 'sub', 'sup']
+const DROPPED_HTML_TAGS = new Set(['script', 'style', 'noscript', 'iframe', 'object', 'embed', 'link', 'meta'])
 
 const undoStack = ref<EditorHistorySnapshot[]>([])
 const redoStack = ref<EditorHistorySnapshot[]>([])
@@ -237,20 +242,10 @@ const highlightedTargetText = computed(() => {
 const targetHtmlContent = computed(() => {
   // 如果有保存的格式化 HTML，优先使用
   if (props.segment.target_html) {
-    return props.segment.target_html
+    return sanitizeHtml(props.segment.target_html)
   }
 
-  const segments = highlightedTargetText.value
-  if (!segments) {
-    return textToVisibleChars(props.segment.target_text || '')
-  }
-  return segments
-    .map((seg) =>
-      seg.highlight
-        ? `<mark class="segment-row__term-highlight">${textToVisibleChars(seg.text)}</mark>`
-        : textToVisibleChars(seg.text)
-    )
-    .join('')
+  return renderTargetWithSourceFormats(props.segment.target_text || '')
 })
 
 const editorHtmlContent = computed(() => {
@@ -347,7 +342,7 @@ function renderSourceHtmlWithHighlights(sourceHtml: string): string {
 
 const sourceHtmlContent = computed(() => {
   if (props.segment.source_html) {
-    return renderSourceHtmlWithHighlights(props.segment.source_html)
+    return renderSourceHtmlWithHighlights(sanitizeHtml(props.segment.source_html))
   }
   return renderHighlightPartsAsHtml(highlightedSourceText.value, sourceTextContent.value)
 })
@@ -379,6 +374,15 @@ function renderTargetTextHtml(text: string): string {
 }
 
 // 保存和恢复光标位置
+function renderTargetWithSourceFormats(text: string): string {
+  const targetHtml = renderTargetTextHtml(text)
+  if (!text || !props.segment.source_html) {
+    return targetHtml
+  }
+  const sourceFormatTags = getPrimarySourceFormatTags(props.segment.source_html)
+  return wrapWithBasicFormats(targetHtml, sourceFormatTags)
+}
+
 function saveCaretPosition(el: HTMLElement): number {
   const selection = window.getSelection()
   if (!selection || selection.rangeCount === 0) return 0
@@ -1011,7 +1015,10 @@ function handlePaste(event: ClipboardEvent) {
  * 清理 HTML，只保留允许的格式标签
  */
 function sanitizeHtml(html: string): string {
-  const allowedTags = ['b', 'strong', 'i', 'em', 'u', 's', 'strike', 'del', 'sub', 'sup']
+  if (typeof document === 'undefined') {
+    return escapeHtml(html)
+  }
+
   const tempDiv = document.createElement('div')
   tempDiv.innerHTML = html
 
@@ -1025,16 +1032,27 @@ function sanitizeHtml(html: string): string {
       const el = node as HTMLElement
       const tagName = el.tagName.toLowerCase()
 
+      if (DROPPED_HTML_TAGS.has(tagName)) {
+        return ''
+      }
+
+      if (tagName === 'br') {
+        return '\n'
+      }
+
       // 处理子节点
       const childContent = Array.from(el.childNodes)
         .map(child => processNode(child))
         .join('')
 
-      // 如果是允许的标签，保留它
-      if (allowedTags.includes(tagName)) {
-        // 规范化标签名
-        const normalizedTag = normalizeTagName(tagName)
-        return `<${normalizedTag}>${childContent}</${normalizedTag}>`
+      const formatTags: BasicFormatTag[] = []
+      const normalizedBasicTag = normalizeBasicFormatTag(tagName)
+      if (normalizedBasicTag) {
+        formatTags.push(normalizedBasicTag)
+      }
+      formatTags.push(...getStyleFormatTags(el))
+      if (formatTags.length > 0) {
+        return wrapWithBasicFormats(childContent, formatTags)
       }
 
       // 否则只返回内容
@@ -1048,8 +1066,105 @@ function sanitizeHtml(html: string): string {
 }
 
 /**
- * 规范化标签名（strong -> b, em -> i 等）
+ * 只把句段编辑中允许渲染的基础格式规范化为内部标签名。
  */
+function getPrimarySourceFormatTags(sourceHtml: string): BasicFormatTag[] {
+  if (typeof document === 'undefined') {
+    return []
+  }
+
+  const template = document.createElement('template')
+  template.innerHTML = sanitizeHtml(sourceHtml)
+  const textRuns: Array<{ text: string; tags: BasicFormatTag[] }> = []
+
+  function walk(node: Node, inheritedTags: BasicFormatTag[]) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent || ''
+      if (text) {
+        textRuns.push({ text, tags: normalizeFormatTagList(inheritedTags) })
+      }
+      return
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      return
+    }
+
+    const element = node as HTMLElement
+    const nextTags = [...inheritedTags]
+    const tag = normalizeBasicFormatTag(element.tagName.toLowerCase())
+    if (tag) {
+      nextTags.push(tag)
+    }
+    nextTags.push(...getStyleFormatTags(element))
+    Array.from(element.childNodes).forEach((child) => walk(child, nextTags))
+  }
+
+  Array.from(template.content.childNodes).forEach((child) => walk(child, []))
+  const firstNonEmptyRun = textRuns.find((run) => run.text.trim())
+  if (firstNonEmptyRun?.tags.length) {
+    return firstNonEmptyRun.tags
+  }
+  return textRuns.find((run) => run.tags.length)?.tags || []
+}
+
+function normalizeFormatTagList(tags: BasicFormatTag[]): BasicFormatTag[] {
+  return BASIC_FORMAT_RENDER_ORDER.filter((tag) => tags.includes(tag))
+}
+
+function normalizeBasicFormatTag(tag: string): BasicFormatTag | null {
+  if (!BASIC_FORMAT_TAGS.includes(tag)) {
+    return null
+  }
+  const normalizedTag = normalizeTagName(tag)
+  return BASIC_FORMAT_RENDER_ORDER.includes(normalizedTag as BasicFormatTag)
+    ? normalizedTag as BasicFormatTag
+    : null
+}
+
+function getStyleFormatTags(element: HTMLElement): BasicFormatTag[] {
+  const tags: BasicFormatTag[] = []
+  const style = element.style
+  const fontWeight = style.fontWeight.trim().toLowerCase()
+  const numericWeight = Number.parseInt(fontWeight, 10)
+
+  if (fontWeight === 'bold' || fontWeight === 'bolder' || numericWeight >= 600) {
+    tags.push('b')
+  }
+
+  const fontStyle = style.fontStyle.trim().toLowerCase()
+  if (fontStyle.includes('italic') || fontStyle.includes('oblique')) {
+    tags.push('i')
+  }
+
+  const textDecoration = `${style.textDecorationLine} ${style.textDecoration}`.toLowerCase()
+  if (textDecoration.includes('underline')) {
+    tags.push('u')
+  }
+  if (textDecoration.includes('line-through')) {
+    tags.push('s')
+  }
+
+  const verticalAlign = style.verticalAlign.trim().toLowerCase()
+  if (verticalAlign === 'sub') {
+    tags.push('sub')
+  }
+  if (verticalAlign === 'super') {
+    tags.push('sup')
+  }
+
+  return tags
+}
+
+function wrapWithBasicFormats(content: string, tags: BasicFormatTag[]): string {
+  if (!content || tags.length === 0) {
+    return content
+  }
+  return BASIC_FORMAT_RENDER_ORDER
+    .filter((tag) => tags.includes(tag))
+    .reduceRight((inner, tag) => `<${tag}>${inner}</${tag}>`, content)
+}
+
 function normalizeTagName(tag: string): string {
   const map: Record<string, string> = {
     strong: 'b',

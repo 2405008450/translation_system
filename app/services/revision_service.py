@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.auth import serialize_user
 from app.database import engine
 from app.models import Segment, SegmentRevision, User
+from app.services.segment_status import resolve_unconfirmed_segment_status
 
 
 REVISIONS_TABLE_MISSING_MESSAGE = (
@@ -238,6 +239,7 @@ def _resolve_revision(
             segment.target_text = anchor_revision.after_text
         else:
             segment.target_text = anchor_revision.before_text
+        segment.status = resolve_unconfirmed_segment_status(segment)
         segment.version = int(segment.version or 1) + 1
 
     db.commit()
@@ -293,6 +295,7 @@ def _batch_resolve_revisions(
                 segment.target_text = anchor_revision.after_text
             else:
                 segment.target_text = anchor_revision.before_text
+            segment.status = resolve_unconfirmed_segment_status(segment)
             segment.version = int(segment.version or 1) + 1
 
         resolved_count += 1

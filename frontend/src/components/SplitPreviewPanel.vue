@@ -36,6 +36,7 @@ const emit = defineEmits<{
   focusSentence: [sentenceId: string]
   focusComment: [commentId: string]
   requestComment: [draft: CommentAnchorDraft]
+  renderingChange: [rendering: boolean]
 }>()
 
 const layoutRef = ref<HTMLElement | null>(null)
@@ -43,6 +44,8 @@ const splitRatio = ref(0.5)
 const syncScroll = ref(true)
 const sourceSyncSentenceId = ref<string | null>(null)
 const targetSyncSentenceId = ref<string | null>(null)
+const sourceRendering = ref(false)
+const targetRendering = ref(false)
 
 let dragCleanup: (() => void) | null = null
 
@@ -105,6 +108,10 @@ watch(syncScroll, (enabled) => {
   }
 })
 
+watch([sourceRendering, targetRendering], ([source, target]) => {
+  emit('renderingChange', source || target)
+}, { immediate: true })
+
 onBeforeUnmount(() => {
   dragCleanup?.()
 })
@@ -148,6 +155,7 @@ onBeforeUnmount(() => {
           @focus-comment="emit('focusComment', $event)"
           @request-comment="emit('requestComment', $event)"
           @visible-sentence-change="handleVisibleSentence('source', $event)"
+          @rendering-change="sourceRendering = $event"
         />
       </div>
 
@@ -179,6 +187,7 @@ onBeforeUnmount(() => {
           @focus-comment="emit('focusComment', $event)"
           @request-comment="emit('requestComment', $event)"
           @visible-sentence-change="handleVisibleSentence('target', $event)"
+          @rendering-change="targetRendering = $event"
         />
       </div>
     </div>

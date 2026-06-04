@@ -96,7 +96,9 @@ const props = defineProps<{
   standalone?: boolean
 }>()
 
-type ToolKey = 'source-preview' | 'target-preview' | 'split-preview' | 'match-info' | 'terms' | 'notes' | 'history'
+type BottomToolKey = 'qa-result' | 'history' | 'source-preview' | 'target-preview' | 'split-preview'
+type BottomDrawerToolKey = Exclude<BottomToolKey, 'qa-result'>
+type SideToolKey = 'match-info' | 'terms' | 'notes'
 type ResourceImportTab = 'tm' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
 type SaveToTMTargetMode = 'new' | 'existing'
@@ -137,6 +139,7 @@ const virtualListRef = ref<{
 } | null>(null)
 const segmentEditorRowRefs = new Map<string, SegmentEditorRowPublic>()
 
+const bottomPanelRef = ref<HTMLElement | null>(null)
 const sidecarRef = ref<HTMLElement | null>(null)
 const sidecarWidth = ref<number | null>(null)
 const isResizing = ref(false)
@@ -177,13 +180,15 @@ const llmScope = ref<LLMTranslateScope>('all')
 const llmProvider = ref<LLMProvider>('deepseek')
 const llmModel = ref('')
 const itemHeight = ref(resolveItemHeight())
-const activeTool = ref<ToolKey | null>(null)
+const activeSideTool = ref<SideToolKey | null>(null)
+const activeBottomTool = ref<BottomToolKey | null>(null)
+const openingBottomTool = ref<BottomDrawerToolKey | null>(null)
+const previewPanelRendering = ref(false)
 const showImportDialog = ref(false)
 const showIssueDialog = ref(false)
 const importDialogInitialTab = ref<ResourceImportTab>('tm')
 const showShortcutHelp = ref(false)
 const showSaveToTMDialog = ref(false)
-const showTermQAReportDialog = ref(false)
 const openConfirmMenu = ref(false)
 const confirmationActionLoading = ref(false)
 const openRevisionMenu = ref<RevisionMenuKind | null>(null)
@@ -599,8 +604,6 @@ const activeTermQAReportItems = computed(() => termQAReport.value?.items.filter(
 
 const ignoredTermQAReportItems = computed(() => termQAReport.value?.items.filter((item) => item.ignored) ?? [])
 
-const termQAReportPreviewItems = computed(() => activeTermQAReportItems.value.slice(0, 6))
-
 const selectedTermQAReportItems = computed(() => (
   termQAReport.value?.items.filter((item) => selectedTermQAItemIds.value.has(item.id)) ?? []
 ))
@@ -798,13 +801,13 @@ const targetPreviewRenderMode = computed<'static' | 'target'>(() => {
 })
 
 const sourcePreviewHtml = computed(() => (
-  activeTool.value === 'split-preview'
+  activeBottomTool.value === 'split-preview'
     ? buildDocumentPreviewHtml(segmentStore.segments, 'source')
     : segmentStore.previewHtml
 ))
 
 const sourcePreviewSupported = computed(() => (
-  activeTool.value === 'split-preview'
+  activeBottomTool.value === 'split-preview'
     ? segmentStore.segments.length > 0
     : segmentStore.previewSupported
 ))
@@ -922,13 +925,16 @@ const saveToTMCanSubmit = computed(() => {
 })
 
 const sourcePreviewLoading = computed(() =>
-  activeTool.value === 'source-preview'
-  && segmentStore.previewLoading,
+  activeBottomTool.value === 'source-preview'
+  && (segmentStore.previewLoading || openingBottomTool.value === 'source-preview'),
 )
 
 const targetPreviewLoading = computed(() => {
-  if (activeTool.value !== 'target-preview' && activeTool.value !== 'split-preview') {
+  if (activeBottomTool.value !== 'target-preview' && activeBottomTool.value !== 'split-preview') {
     return false
+  }
+  if (openingBottomTool.value === 'target-preview' || openingBottomTool.value === 'split-preview') {
+    return true
   }
   if (targetPreviewRenderMode.value === 'target') {
     return segmentStore.previewLoading
@@ -936,14 +942,74 @@ const targetPreviewLoading = computed(() => {
   return false
 })
 
-const toolButtons = computed(() => ([
+const bottomToolButtons = computed(() => ([
+  { key: 'history' as const, label: '历史记录', icon: History, tone: 'history' },
   { key: 'source-preview' as const, label: t('workbench.tools.sourcePreview'), icon: FileText, tone: 'paper' },
   { key: 'target-preview' as const, label: t('workbench.tools.targetPreview'), icon: FileCheck, tone: 'success' },
-  { key: 'split-preview' as const, label: t('workbench.tools.splitPreview'), icon: Columns, tone: 'layout' },
+  { key: 'split-preview' as const, label: '对照预览', icon: Columns, tone: 'layout' },
+]))
+
+function isPreviewBottomTool(tool: BottomDrawerToolKey) {
+  return tool === 'source-preview' || tool === 'target-preview' || tool === 'split-preview'
+}
+
+function isBottomToolLoading(tool: BottomDrawerToolKey) {
+  if (tool === 'source-preview') {
+    return sourcePreviewLoading.value
+  }
+  if (tool === 'target-preview' || tool === 'split-preview') {
+    return targetPreviewLoading.value
+  }
+  return false
+}
+
+function isBottomToolDisabled(tool: BottomDrawerToolKey) {
+  if (!isPreviewBottomTool(tool)) {
+    return false
+  }
+  return isBottomToolLoading(tool) || Boolean(openingBottomTool.value) || segmentStore.previewLoading
+}
+
+const bottomDrawerPreviewLoading = computed(() => {
+  if (activeBottomTool.value === 'source-preview') {
+    return sourcePreviewLoading.value
+  }
+  if (activeBottomTool.value === 'target-preview' || activeBottomTool.value === 'split-preview') {
+    return targetPreviewLoading.value
+  }
+  return false
+})
+
+const bottomDrawerPreviewBusy = computed(() => bottomDrawerPreviewLoading.value || previewPanelRendering.value)
+
+const bottomDrawerPreviewLoadingTitle = computed(() => {
+  const action = previewPanelRendering.value && !bottomDrawerPreviewLoading.value ? '渲染中...' : '加载中...'
+  if (activeBottomTool.value === 'source-preview') {
+    return `原文预览${action}`
+  }
+  if (activeBottomTool.value === 'target-preview') {
+    return `译文预览${action}`
+  }
+  if (activeBottomTool.value === 'split-preview') {
+    return `对照预览${action}`
+  }
+  return `预览${action}`
+})
+
+const bottomDrawerPreviewLoadingMessage = computed(() => (
+  previewPanelRendering.value && !bottomDrawerPreviewLoading.value
+    ? '正在排版预览内容，请稍候'
+    : '正在准备预览内容，请稍候'
+))
+
+function handleBottomPreviewRenderingChange(rendering: boolean) {
+  previewPanelRendering.value = rendering
+}
+
+const sideToolButtons = computed(() => ([
   { key: 'match-info' as const, label: t('workbench.tools.matchInfo'), icon: Info, tone: 'info' },
   { key: 'terms' as const, label: t('workbench.tools.terms'), icon: Languages, tone: 'language' },
   { key: 'notes' as const, label: t('workbench.tools.notes'), icon: MessageSquare, tone: 'note' },
-  { key: 'history' as const, label: t('workbench.tools.history'), icon: History, tone: 'history' },
 ]))
 
 usePageHeader(() => ({
@@ -1088,16 +1154,58 @@ async function importGuidelineTemplate(event: Event) {
   }
 }
 
-async function openTool(tool: ToolKey) {
-  if (activeTool.value === tool) {
-    activeTool.value = null
-    sidecarWidth.value = null
+function closeBottomDrawer() {
+  openingBottomTool.value = null
+  previewPanelRendering.value = false
+  activeBottomTool.value = null
+}
+
+async function scrollBottomPanelIntoView() {
+  await nextTick()
+  await new Promise((resolve) => window.requestAnimationFrame(resolve))
+  const target = bottomPanelRef.value
+  if (!target) {
+    return
+  }
+
+  const stickyOffset = isStandaloneWorkbench.value ? 12 : 68
+  const targetRect = target.getBoundingClientRect()
+
+  let scrollParent: HTMLElement | null = target.parentElement
+  while (scrollParent && scrollParent !== document.body) {
+    const style = window.getComputedStyle(scrollParent)
+    if (
+      /(auto|scroll)/.test(style.overflowY)
+      && scrollParent.scrollHeight > scrollParent.clientHeight
+    ) {
+      const parentRect = scrollParent.getBoundingClientRect()
+      scrollParent.scrollTo({
+        top: scrollParent.scrollTop + targetRect.top - parentRect.top - stickyOffset,
+        behavior: 'smooth',
+      })
+      return
+    }
+    scrollParent = scrollParent.parentElement
+  }
+
+  const scrollingElement = document.scrollingElement || document.documentElement
+  scrollingElement.scrollTo({
+    top: scrollingElement.scrollTop + targetRect.top - stickyOffset,
+    behavior: 'smooth',
+  })
+}
+
+async function openBottomTool(tool: BottomDrawerToolKey) {
+  if (activeBottomTool.value === tool) {
+    closeBottomDrawer()
     return
   }
 
   pageError.value = ''
-  activeTool.value = tool
-  sidecarWidth.value = null
+  previewPanelRendering.value = false
+  openingBottomTool.value = tool
+  activeBottomTool.value = tool
+  await scrollBottomPanelIntoView()
 
   try {
     if (tool === 'source-preview') {
@@ -1107,9 +1215,28 @@ async function openTool(tool: ToolKey) {
 
     if (tool === 'target-preview' || tool === 'split-preview') {
       await segmentStore.ensurePreviewLoaded('target')
-      return
     }
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('workbench.errors.sidePanel'))
+  } finally {
+    if (openingBottomTool.value === tool) {
+      openingBottomTool.value = null
+    }
+  }
+}
 
+async function openSideTool(tool: SideToolKey) {
+  if (activeSideTool.value === tool) {
+    activeSideTool.value = null
+    sidecarWidth.value = null
+    return
+  }
+
+  pageError.value = ''
+  activeSideTool.value = tool
+  sidecarWidth.value = null
+
+  try {
     if (tool === 'terms' && termBases.value.length === 0 && !loadingTermBases.value) {
       await loadTermBases()
     }
@@ -1156,7 +1283,11 @@ function closeActiveWorkbenchPanel() {
     closeGuidelinesPanel()
     return
   }
-  activeTool.value = null
+  if (activeBottomTool.value) {
+    closeBottomDrawer()
+    return
+  }
+  activeSideTool.value = null
 }
 
 function closeGuidelinesPanel() {
@@ -1214,10 +1345,15 @@ function retainEmptyTargetSegmentDuringEdit(sentenceId: string, previousTargetTe
   ])
 }
 
-function updateSegmentTarget(sentenceId: string, targetText: string, targetHtml?: string) {
+function updateSegmentTarget(
+  sentenceId: string,
+  targetText: string,
+  targetHtml?: string,
+  options: { confirm?: boolean } = {},
+) {
   const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
   retainEmptyTargetSegmentDuringEdit(sentenceId, segment?.target_text)
-  segmentStore.updateTarget(sentenceId, targetText, targetHtml)
+  segmentStore.updateTarget(sentenceId, targetText, targetHtml, options)
 }
 
 async function updateSegmentSource(sentenceId: string, sourceText: string) {
@@ -1379,7 +1515,12 @@ function confirmCurrentSentence() {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
     return
   }
-  updateSegmentTarget(activeSegment.value.sentence_id, activeSegment.value.target_text || '')
+  updateSegmentTarget(
+    activeSegment.value.sentence_id,
+    activeSegment.value.target_text || '',
+    activeSegment.value.target_html ?? undefined,
+    { confirm: true },
+  )
   toast.success(t('workbench.messages.confirmed'))
 }
 
@@ -1538,7 +1679,8 @@ async function generateCurrentFileTermQAReport() {
       `/file-records/${segmentStore.fileRecord.id}/term-qa-reports`,
     )
     setCurrentTermQAReport(data)
-    showTermQAReportDialog.value = true
+    activeBottomTool.value = 'qa-result'
+    await scrollBottomPanelIntoView()
     toast.show({
       tone: data.issue_count > 0 ? 'warn' : 'success',
       title: '术语QA报告已生成',
@@ -1552,6 +1694,23 @@ async function generateCurrentFileTermQAReport() {
   } finally {
     generatingTermQAReport.value = false
   }
+}
+
+async function openTermQAResult() {
+  if (loadingTermQAReport.value || generatingTermQAReport.value) {
+    return
+  }
+  if (activeBottomTool.value === 'qa-result') {
+    closeBottomDrawer()
+    return
+  }
+  previewPanelRendering.value = false
+  activeBottomTool.value = 'qa-result'
+  await scrollBottomPanelIntoView()
+  if (termQAReport.value) {
+    return
+  }
+  await generateCurrentFileTermQAReport()
 }
 
 async function clearSegmentFiltersForTermQANavigation() {
@@ -1666,7 +1825,7 @@ async function focusTermQAReportItem(item: TermQAReportItem) {
     )
     if (currentPageIndex >= 0) {
       await focusEditorSegmentAtIndex(currentPageIndex)
-      showTermQAReportDialog.value = false
+      closeBottomDrawer()
       return
     }
 
@@ -1693,7 +1852,7 @@ async function focusTermQAReportItem(item: TermQAReportItem) {
       return
     }
     await focusEditorSegmentAtIndex(targetIndex)
-    showTermQAReportDialog.value = false
+    closeBottomDrawer()
   } catch (error) {
     toast.error({
       title: '跳转 QA 句段失败',
@@ -1842,9 +2001,9 @@ async function handleSplitSegment() {
     await segmentStore.splitSegment(activeSegment.value.sentence_id, caretOffset)
     lastSourceCaretOffset.value = null
     // 刷新预览（如果预览面板已打开）
-    if (activeTool.value === 'source-preview' || activeTool.value === 'split-preview') {
+    if (activeBottomTool.value === 'source-preview' || activeBottomTool.value === 'split-preview') {
       await segmentStore.ensurePreviewLoaded('source')
-    } else if (activeTool.value === 'target-preview') {
+    } else if (activeBottomTool.value === 'target-preview') {
       await segmentStore.ensurePreviewLoaded('target')
     }
     toast.success({ message: t('workbench.messages.splitSuccess') })
@@ -1888,9 +2047,9 @@ async function handleMergeSegment() {
     }
     selectedSentenceIds.value = new Set()
     // 刷新预览（如果预览面板已打开）
-    if (activeTool.value === 'source-preview' || activeTool.value === 'split-preview') {
+    if (activeBottomTool.value === 'source-preview' || activeBottomTool.value === 'split-preview') {
       await segmentStore.ensurePreviewLoaded('source')
-    } else if (activeTool.value === 'target-preview') {
+    } else if (activeBottomTool.value === 'target-preview') {
       await segmentStore.ensurePreviewLoaded('target')
     }
     toast.success({ message: t('workbench.messages.mergeSuccess') })
@@ -2133,7 +2292,7 @@ async function openAddTermDialog() {
 
   if (addTermTargetTermBases.value.length === 0) {
     toast.warn('当前文件没有可写入的已启用术语库。')
-    activeTool.value = 'terms'
+    activeSideTool.value = 'terms'
     return
   }
 
@@ -2176,7 +2335,7 @@ async function submitAddTermForm() {
     })
     selectedTermBaseId.value = targetBaseId
     await loadTermEntries()
-    activeTool.value = 'terms'
+    activeSideTool.value = 'terms'
     showAddTermDialog.value = false
     toast.success(t('workbench.ribbon.messages.termAdded'))
   } catch (error) {
@@ -2359,7 +2518,8 @@ async function replaceSegmentPageQueryIfNeeded() {
 
 async function loadTask() {
   pageError.value = ''
-  activeTool.value = null
+  activeSideTool.value = null
+  closeBottomDrawer()
   openRevisionMenu.value = null
   suppressSegmentFilterWatch = true
   resetSegmentSearch()
@@ -2799,7 +2959,7 @@ async function handleCommentDraft(draft: CommentAnchorDraft) {
   commentStore.setActiveComment(null)
   segmentStore.setActiveSentence(draft.sentence_id)
   await handlePreviewFocus(draft.sentence_id)
-  activeTool.value = 'notes'
+  activeSideTool.value = 'notes'
 }
 
 async function handleCommentFocus(commentId: string) {
@@ -2810,7 +2970,7 @@ async function handleCommentFocus(commentId: string) {
     segmentStore.setActiveSentence(comment.sentence_id)
     await handlePreviewFocus(comment.sentence_id)
   }
-  activeTool.value = 'notes'
+  activeSideTool.value = 'notes'
 }
 
 async function handleCreateComment(payload: CommentCreatePayload) {
@@ -2914,7 +3074,7 @@ function handleAppendText(text: string) {
 
 async function ensureMatchInfoPanelOpen() {
   pageError.value = ''
-  activeTool.value = 'match-info'
+  activeSideTool.value = 'match-info'
 
   try {
     if (termBases.value.length === 0 && !loadingTermBases.value) {
@@ -3880,7 +4040,7 @@ onBeforeRouteLeave(async () => {
       </div>
     </section>
 
-    <section v-else class="workbench-layout" :class="{ 'has-active-tool': activeTool }">
+    <section v-else class="workbench-layout" :class="{ 'has-active-tool': activeSideTool }">
       <section class="panel panel--stretch panel--editor" :class="{ 'has-search-open': segmentSearchOpen }">
         <div class="panel-header panel-header--compact segment-editor-toolbar">
           <div class="segment-editor-toolbar__title">
@@ -4115,6 +4275,7 @@ onBeforeRouteLeave(async () => {
             </div>
           </div>
 
+          <div class="segment-editor-footer">
           <Pagination
             :total="segmentStore.matchedSegmentCount"
             :page="segmentStore.currentPage"
@@ -4124,11 +4285,326 @@ onBeforeRouteLeave(async () => {
             @update:page-size="handleSegmentPageSizeChange"
           />
 
+          <div
+            ref="bottomPanelRef"
+            class="segment-editor-bottom-tools"
+            :class="{ 'is-docked': activeBottomTool }"
+            aria-label="工作台底部工具栏"
+          >
+            <button
+              class="segment-editor-bottom-tool segment-editor-bottom-tool--qa"
+              :class="{ 'is-active': activeBottomTool === 'qa-result' }"
+              type="button"
+              :title="termQAReport ? `QA结果：${termQAReport.active_issue_count} 条待处理` : '生成 QA 报告'"
+              :aria-pressed="activeBottomTool === 'qa-result'"
+              :disabled="loadingTermQAReport || generatingTermQAReport"
+              @click="void openTermQAResult()"
+            >
+              <Loader2 v-if="loadingTermQAReport || generatingTermQAReport" class="lucide-spin" :size="14" />
+              <ShieldCheck v-else :size="14" />
+              <span>QA结果</span>
+              <span
+                v-if="termQAReport"
+                class="segment-editor-bottom-tool__badge"
+                :class="{ 'is-clean': termQAReport.active_issue_count === 0 }"
+              >
+                {{ termQAReport.active_issue_count }}
+              </span>
+            </button>
+            <button
+              v-for="tool in bottomToolButtons"
+              :key="tool.key"
+              class="segment-editor-bottom-tool"
+              :class="[
+                `segment-editor-bottom-tool--${tool.tone}`,
+                {
+                  'is-active': activeBottomTool === tool.key,
+                  'is-loading': isBottomToolLoading(tool.key),
+                },
+              ]"
+              type="button"
+              :title="isBottomToolLoading(tool.key) ? t('common.loading') : tool.label"
+              :aria-pressed="activeBottomTool === tool.key"
+              :aria-busy="isBottomToolLoading(tool.key)"
+              :disabled="isBottomToolDisabled(tool.key)"
+              @click="void openBottomTool(tool.key)"
+            >
+              <Loader2 v-if="isBottomToolLoading(tool.key)" class="lucide-spin" :size="14" />
+              <component :is="tool.icon" v-else :size="14" />
+              <span>{{ isBottomToolLoading(tool.key) ? t('common.loading') : tool.label }}</span>
+            </button>
+          </div>
+
+          </div>
+
+          <Transition name="workbench-bottom-drawer">
+            <section
+              v-if="activeBottomTool"
+              class="workbench-bottom-drawer"
+              :class="[
+                `workbench-bottom-drawer--${activeBottomTool}`,
+                {
+                  'is-wide': activeBottomTool === 'split-preview' || activeBottomTool === 'qa-result',
+                  'is-loading': bottomDrawerPreviewBusy,
+                },
+              ]"
+              :aria-busy="bottomDrawerPreviewBusy"
+              @keydown.esc.stop="closeBottomDrawer"
+            >
+              <button
+                v-if="activeBottomTool === 'history'"
+                class="workbench-bottom-drawer__close"
+                type="button"
+                title="关闭"
+                aria-label="关闭"
+                @click="closeBottomDrawer"
+              >
+                <X :size="14" />
+              </button>
+
+              <div
+                v-if="bottomDrawerPreviewBusy"
+                class="workbench-bottom-drawer__loading"
+                role="status"
+                aria-live="polite"
+              >
+                <div class="workbench-bottom-drawer__loading-body">
+                  <Loader2 class="lucide-spin" :size="30" />
+                  <div>
+                    <strong>{{ bottomDrawerPreviewLoadingTitle }}</strong>
+                    <span>{{ bottomDrawerPreviewLoadingMessage }}</span>
+                  </div>
+                </div>
+              </div>
+
+              <SplitPreviewPanel
+                v-if="activeBottomTool === 'split-preview'"
+                key="bottom-split-preview"
+                class="workbench-bottom-drawer__preview workbench-bottom-drawer__preview--split"
+                :source-html="sourcePreviewHtml"
+                :target-html="targetPreviewHtml"
+                :source-supported="sourcePreviewSupported"
+                :target-supported="targetPreviewSupported"
+                :source-loading="sourcePreviewLoading"
+                :target-loading="targetPreviewLoading"
+                :active-sentence-id="segmentStore.activeSentenceId"
+                :target-render-mode="targetPreviewRenderMode"
+                :target-segments="targetPreviewRenderMode === 'target' ? segmentStore.segments : []"
+                :target-updated-sentence-id="segmentStore.lastPreviewUpdatedSentenceId"
+                :target-updated-sentence-text="segmentStore.lastPreviewUpdatedText"
+                :target-update-token="segmentStore.previewUpdateToken"
+                :comments="commentStore.comments"
+                :active-comment-id="commentStore.activeCommentId"
+                @close="closeBottomDrawer"
+                @focus-sentence="handlePreviewFocus"
+                @focus-comment="handleCommentFocus"
+                @request-comment="handleCommentDraft"
+                @rendering-change="handleBottomPreviewRenderingChange"
+              />
+
+              <PreviewPanel
+                v-else-if="activeBottomTool === 'source-preview' || activeBottomTool === 'target-preview'"
+                key="bottom-single-preview"
+                class="preview-panel--drawer workbench-bottom-drawer__preview"
+                :title="activeBottomTool === 'source-preview' ? t('workbench.tools.sourcePreview') : t('workbench.tools.targetPreview')"
+                :html="activeBottomTool === 'source-preview' ? segmentStore.previewHtml : targetPreviewHtml"
+                :supported="activeBottomTool === 'source-preview' ? segmentStore.previewSupported : targetPreviewSupported"
+                :loading="activeBottomTool === 'source-preview' ? sourcePreviewLoading : targetPreviewLoading"
+                :active-sentence-id="segmentStore.activeSentenceId"
+                :comments="commentStore.comments"
+                :active-comment-id="commentStore.activeCommentId"
+                :enable-comment-selection="true"
+                :render-mode="activeBottomTool === 'target-preview' ? targetPreviewRenderMode : 'static'"
+                :segments="activeBottomTool === 'target-preview' && targetPreviewRenderMode === 'target' ? segmentStore.segments : []"
+                :updated-sentence-id="activeBottomTool === 'target-preview' ? segmentStore.lastPreviewUpdatedSentenceId : null"
+                :updated-sentence-text="activeBottomTool === 'target-preview' ? segmentStore.lastPreviewUpdatedText : ''"
+                :update-token="activeBottomTool === 'target-preview' ? segmentStore.previewUpdateToken : 0"
+                @focus-sentence="handlePreviewFocus"
+                @focus-comment="handleCommentFocus"
+                @request-comment="handleCommentDraft"
+                @close="closeBottomDrawer"
+                @rendering-change="handleBottomPreviewRenderingChange"
+              />
+
+              <WorkbenchHistoryPanel
+                v-else-if="activeBottomTool === 'history'"
+                key="bottom-history"
+                class="workbench-bottom-drawer__history"
+                :active-sentence-id="segmentStore.activeSentenceId"
+                :comments="commentStore.comments"
+                :history="activeSegmentHistory"
+              />
+
+              <div v-else class="workbench-bottom-drawer__qa">
+                <div class="workbench-bottom-drawer__header">
+                  <div>
+                    <div class="section-title section-title--tight">术语 QA 报告</div>
+                    <p class="panel-subtitle">{{ segmentStore.fileRecord?.filename || '' }}</p>
+                  </div>
+                  <button
+                    class="button preview-panel__close"
+                    type="button"
+                    @click="closeBottomDrawer"
+                  >
+                    关闭
+                  </button>
+                </div>
+
+                <div v-if="loadingTermQAReport || (generatingTermQAReport && !termQAReport)" class="empty-state">
+                  <Loader2 class="lucide-spin" :size="28" />
+                  {{ generatingTermQAReport ? '正在生成术语 QA 报告' : '正在加载最近报告' }}
+                </div>
+
+                <template v-else-if="termQAReport">
+                  <div class="term-qa-dialog__summary">
+                    <span>检查句段：{{ termQAReport.checked_segments }}</span>
+                    <span>总问题数：{{ termQAReport.issue_count }}</span>
+                    <span>待处理：{{ termQAReport.active_issue_count }}</span>
+                    <span>已忽略：{{ termQAReport.ignored_count }}</span>
+                    <span>报告时间：{{ termQAReport.created_at || '' }}</span>
+                  </div>
+
+                  <div class="term-qa-dialog__actions">
+                    <button
+                      class="button button--ghost"
+                      type="button"
+                      :disabled="activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
+                      @click="toggleAllActiveTermQAItems(!allActiveTermQAItemsSelected)"
+                    >
+                      {{ allActiveTermQAItemsSelected ? '取消全选' : '全选未忽略' }}
+                    </button>
+                    <button
+                      class="button button--ghost"
+                      type="button"
+                      :disabled="selectedActiveTermQAReportItems.length === 0 || updatingTermQAIgnore"
+                      @click="void ignoreSelectedTermQAReportItems()"
+                    >
+                      <Loader2 v-if="updatingTermQAIgnore" class="lucide-spin" :size="14" />
+                      忽略选中 {{ selectedActiveTermQAReportItems.length || '' }}
+                    </button>
+                    <button
+                      class="button"
+                      type="button"
+                      :disabled="downloadingTermQAReport"
+                      @click="downloadCurrentTermQAReport"
+                    >
+                      <Loader2 v-if="downloadingTermQAReport" class="lucide-spin" :size="14" />
+                      <Download v-else :size="14" />
+                      导出 XLSX
+                    </button>
+                    <button
+                      class="button button--ghost"
+                      type="button"
+                      :disabled="generatingTermQAReport"
+                      @click="void generateCurrentFileTermQAReport()"
+                    >
+                      <Loader2 v-if="generatingTermQAReport" class="lucide-spin" :size="14" />
+                      重新生成
+                    </button>
+                  </div>
+
+                  <div v-if="termQAReport.items.length === 0" class="empty-state">
+                    未发现术语不一致问题。
+                  </div>
+                  <div v-else class="term-qa-dialog__table-wrap">
+                    <table class="term-qa-dialog__table">
+                      <thead>
+                        <tr>
+                          <th>选择</th>
+                          <th>句段</th>
+                          <th>原文术语</th>
+                          <th>期望译文</th>
+                          <th>当前译文</th>
+                          <th>状态</th>
+                          <th>操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr
+                          v-for="item in termQAReport.items.slice(0, 50)"
+                          :key="item.id"
+                          class="term-qa-dialog__row"
+                          :class="{
+                            'is-locating': locatingTermQAReportItemId === item.id,
+                            'is-ignored': item.ignored,
+                          }"
+                          tabindex="0"
+                          :aria-label="`跳转到句段 ${item.sentence_id}`"
+                          @click="void focusTermQAReportItem(item)"
+                          @keydown.enter.prevent="void focusTermQAReportItem(item)"
+                          @keydown.space.prevent="void focusTermQAReportItem(item)"
+                        >
+                          <td>
+                            <input
+                              type="checkbox"
+                              :checked="selectedTermQAItemIds.has(item.id)"
+                              :disabled="item.ignored"
+                              aria-label="选择报告项"
+                              @click.stop
+                              @change.stop="handleTermQAItemSelectionChange(item.id, $event)"
+                            >
+                          </td>
+                          <td>
+                            <span class="term-qa-dialog__segment">
+                              <Loader2
+                                v-if="locatingTermQAReportItemId === item.id"
+                                class="lucide-spin"
+                                :size="13"
+                              />
+                              {{ item.sentence_id }}
+                            </span>
+                          </td>
+                          <td>{{ item.source_term }}</td>
+                          <td>{{ item.expected_target_term }}</td>
+                          <td>{{ item.target_text || '未填写' }}</td>
+                          <td>
+                            <span class="term-qa-dialog__status" :class="{ 'is-ignored': item.ignored }">
+                              {{ item.ignored ? '已忽略' : '待处理' }}
+                            </span>
+                            <small v-if="item.ignored_at" class="term-qa-dialog__ignored-meta">
+                              {{ item.ignored_by_name || item.ignored_by_id || '' }}
+                            </small>
+                          </td>
+                          <td>
+                            <button
+                              class="button button--ghost term-qa-dialog__inline-action"
+                              type="button"
+                              :disabled="updatingTermQAIgnore"
+                              @click.stop="void setSingleTermQAReportItemIgnored(item, !item.ignored)"
+                            >
+                              {{ item.ignored ? '恢复' : '忽略' }}
+                            </button>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                    <p v-if="termQAReport.items.length > 50" class="hint-text">
+                      已显示前 50 条，完整报告请导出 XLSX。
+                    </p>
+                  </div>
+                </template>
+
+                <div v-else class="empty-state">
+                  暂无术语 QA 报告
+                  <button
+                    class="button"
+                    type="button"
+                    :disabled="generatingTermQAReport"
+                    @click="void generateCurrentFileTermQAReport()"
+                  >
+                    <Loader2 v-if="generatingTermQAReport" class="lucide-spin" :size="14" />
+                    生成报告
+                  </button>
+                </div>
+              </div>
+            </section>
+          </Transition>
+
         </div>
       </section>
 
       <div
-        v-if="activeTool"
+        v-if="activeSideTool"
         class="workbench-resizer"
         @mousedown="startResize"
       >
@@ -4136,60 +4612,15 @@ onBeforeRouteLeave(async () => {
       </div>
 
       <div
-        v-if="activeTool"
+        v-if="activeSideTool"
         ref="sidecarRef"
-        class="workbench-sidecar"
-        :class="{ 'is-preview-open': activeTool && activeTool !== 'split-preview', 'is-split-open': activeTool === 'split-preview' }"
+        class="workbench-sidecar is-preview-open"
         :style="sidecarWidthStyle"
       >
         <div class="workbench-sidecar__panel">
         <Transition name="preview-drawer" mode="out-in">
-          <SplitPreviewPanel
-            v-if="activeTool === 'split-preview'"
-            key="split-preview"
-            :source-html="sourcePreviewHtml"
-            :target-html="targetPreviewHtml"
-            :source-supported="sourcePreviewSupported"
-            :target-supported="targetPreviewSupported"
-            :source-loading="sourcePreviewLoading"
-            :target-loading="targetPreviewLoading"
-            :active-sentence-id="segmentStore.activeSentenceId"
-            :target-render-mode="targetPreviewRenderMode"
-            :target-segments="targetPreviewRenderMode === 'target' ? segmentStore.segments : []"
-            :target-updated-sentence-id="segmentStore.lastPreviewUpdatedSentenceId"
-            :target-updated-sentence-text="segmentStore.lastPreviewUpdatedText"
-            :target-update-token="segmentStore.previewUpdateToken"
-            :comments="commentStore.comments"
-            :active-comment-id="commentStore.activeCommentId"
-            @close="activeTool = null"
-            @focus-sentence="handlePreviewFocus"
-            @focus-comment="handleCommentFocus"
-            @request-comment="handleCommentDraft"
-          />
-          <PreviewPanel
-            v-else-if="activeTool === 'source-preview' || activeTool === 'target-preview'"
-            key="single-preview"
-            class="preview-panel--drawer"
-            :title="activeTool === 'source-preview' ? t('workbench.tools.sourcePreview') : t('workbench.tools.targetPreview')"
-            :html="activeTool === 'source-preview' ? segmentStore.previewHtml : targetPreviewHtml"
-            :supported="activeTool === 'source-preview' ? segmentStore.previewSupported : targetPreviewSupported"
-            :loading="activeTool === 'source-preview' ? sourcePreviewLoading : targetPreviewLoading"
-            :active-sentence-id="segmentStore.activeSentenceId"
-            :comments="commentStore.comments"
-            :active-comment-id="commentStore.activeCommentId"
-            :enable-comment-selection="true"
-            :render-mode="activeTool === 'target-preview' ? targetPreviewRenderMode : 'static'"
-            :segments="activeTool === 'target-preview' && targetPreviewRenderMode === 'target' ? segmentStore.segments : []"
-            :updated-sentence-id="activeTool === 'target-preview' ? segmentStore.lastPreviewUpdatedSentenceId : null"
-            :updated-sentence-text="activeTool === 'target-preview' ? segmentStore.lastPreviewUpdatedText : ''"
-            :update-token="activeTool === 'target-preview' ? segmentStore.previewUpdateToken : 0"
-            @focus-sentence="handlePreviewFocus"
-            @focus-comment="handleCommentFocus"
-            @request-comment="handleCommentDraft"
-            @close="activeTool = null"
-          />
           <WorkbenchMatchPanel
-            v-else-if="activeTool === 'match-info'"
+            v-if="activeSideTool === 'match-info'"
             key="match-info"
             :segment="activeSegment"
             :collection-id="segmentStore.fileRecord?.collection_id || null"
@@ -4203,7 +4634,7 @@ onBeforeRouteLeave(async () => {
             @append-text="handleAppendText"
           />
           <WorkbenchTermsPanel
-            v-else-if="activeTool === 'terms'"
+            v-else-if="activeSideTool === 'terms'"
             key="terms"
             :term-bases="termBases"
             v-model:selected-term-base-id="selectedTermBaseId"
@@ -4214,7 +4645,7 @@ onBeforeRouteLeave(async () => {
             :message="termsMessage"
           />
           <NotesPanel
-            v-else-if="activeTool === 'notes'"
+            v-else-if="activeSideTool === 'notes'"
             key="notes"
             class="notes-panel--drawer"
             :comments="commentStore.comments"
@@ -4225,20 +4656,13 @@ onBeforeRouteLeave(async () => {
             :draft-anchor="commentStore.draftAnchor"
             :current-user-id="authStore.user?.id || null"
             :message="commentStore.message"
-            @close="activeTool = null"
+            @close="activeSideTool = null"
             @select-comment="handleCommentFocus"
             @create-comment="handleCreateComment"
             @update-comment="handleUpdateComment"
             @delete-comment="handleDeleteComment"
             @reply-comment="handleReplyComment"
             @cancel-draft="commentStore.setDraftAnchor(null)"
-          />
-          <WorkbenchHistoryPanel
-            v-else-if="activeTool === 'history'"
-            key="history"
-            :active-sentence-id="segmentStore.activeSentenceId"
-            :comments="commentStore.comments"
-            :history="activeSegmentHistory"
           />
         </Transition>
         </div>
@@ -4258,127 +4682,22 @@ onBeforeRouteLeave(async () => {
           <span>{{ t('workbench.openFocus') }}</span>
         </button>
         <button
-          v-for="tool in toolButtons"
+          v-for="tool in sideToolButtons"
           :key="tool.key"
           class="button segment-editor-side-tool"
           :class="[
             `segment-editor-side-tool--${tool.tone}`,
-            { 'is-active': activeTool === tool.key },
+            { 'is-active': activeSideTool === tool.key },
           ]"
           type="button"
           :title="tool.label"
-          :aria-pressed="activeTool === tool.key"
-          @click="void openTool(tool.key)"
+          :aria-label="tool.label"
+          :aria-pressed="activeSideTool === tool.key"
+          @click="void openSideTool(tool.key)"
         >
-          <component :is="tool.icon" :size="16" />
+          <component :is="tool.icon" :size="15" />
           <span>{{ tool.label }}</span>
         </button>
-
-        <div class="segment-editor-side-report" aria-label="术语 QA 报告">
-          <div class="segment-editor-side-report__header">
-            <div class="segment-editor-side-report__title">
-              <ShieldCheck :size="14" />
-              <span>术语QA</span>
-            </div>
-            <button
-              class="segment-editor-side-report__icon"
-              type="button"
-              title="刷新最近报告"
-              aria-label="刷新最近报告"
-              :disabled="loadingTermQAReport"
-              @click="void loadLatestTermQAReport()"
-            >
-              <Loader2 v-if="loadingTermQAReport" class="lucide-spin" :size="13" />
-              <Search v-else :size="13" />
-            </button>
-          </div>
-
-          <div v-if="loadingTermQAReport && !termQAReport" class="segment-editor-side-report__empty">
-            正在加载最近报告
-          </div>
-
-          <template v-else-if="termQAReport">
-            <button
-              class="segment-editor-side-report__summary"
-              type="button"
-              @click="showTermQAReportDialog = true"
-            >
-              <strong :class="{ 'is-clean': termQAReport.active_issue_count === 0 }">
-                {{ termQAReport.active_issue_count }}
-              </strong>
-              <span>条待处理</span>
-              <small>{{ termQAReportCreatedAtText || '最近报告' }}</small>
-              <small v-if="termQAReport.ignored_count > 0">已忽略 {{ termQAReport.ignored_count }} 条</small>
-            </button>
-
-            <div v-if="activeTermQAReportItems.length === 0" class="segment-editor-side-report__empty">
-              {{ termQAReport.issue_count === 0 ? '未发现术语不一致。' : '未忽略的问题已全部处理。' }}
-            </div>
-            <div v-else class="segment-editor-side-report__items">
-              <button
-                v-for="item in termQAReportPreviewItems"
-                :key="item.id"
-                class="segment-editor-side-report__item"
-                type="button"
-                :title="`${item.source_term} → ${item.expected_target_term}`"
-                :disabled="locatingTermQAReportItemId !== null"
-                @click="void focusTermQAReportItem(item)"
-              >
-                <Loader2
-                  v-if="locatingTermQAReportItemId === item.id"
-                  class="lucide-spin"
-                  :size="13"
-                />
-                <span>{{ item.source_term }}</span>
-                <small>{{ item.expected_target_term }}</small>
-                <em>句段 {{ item.sentence_id }}</em>
-              </button>
-            </div>
-
-            <button
-              v-if="activeTermQAReportItems.length > termQAReportPreviewItems.length || ignoredTermQAReportItems.length > 0"
-              class="segment-editor-side-report__link"
-              type="button"
-              @click="showTermQAReportDialog = true"
-            >
-              查看全部 {{ termQAReport.items.length }} 条
-            </button>
-
-            <div class="segment-editor-side-report__actions">
-              <button
-                class="segment-editor-side-report__button"
-                type="button"
-                :disabled="generatingTermQAReport"
-                @click="void generateCurrentFileTermQAReport()"
-              >
-                <Loader2 v-if="generatingTermQAReport" class="lucide-spin" :size="13" />
-                <span>{{ generatingTermQAReport ? '生成中' : '重新生成' }}</span>
-              </button>
-              <button
-                class="segment-editor-side-report__button"
-                type="button"
-                @click="showTermQAReportDialog = true"
-              >
-                详情
-              </button>
-            </div>
-          </template>
-
-          <template v-else>
-            <div class="segment-editor-side-report__empty">
-              暂无术语 QA 报告
-            </div>
-            <button
-              class="segment-editor-side-report__button"
-              type="button"
-              :disabled="generatingTermQAReport"
-              @click="void generateCurrentFileTermQAReport()"
-            >
-              <Loader2 v-if="generatingTermQAReport" class="lucide-spin" :size="13" />
-              <span>{{ generatingTermQAReport ? '生成中' : '生成报告' }}</span>
-            </button>
-          </template>
-        </div>
       </aside>
     </section>
 
@@ -4535,134 +4854,6 @@ onBeforeRouteLeave(async () => {
     </Modal>
 
     <Modal
-      :open="showTermQAReportDialog"
-      title="术语 QA 报告"
-      :description="segmentStore.fileRecord?.filename || ''"
-      width="min(900px, calc(100vw - 32px))"
-      @close="showTermQAReportDialog = false"
-    >
-      <div class="term-qa-dialog">
-        <div v-if="termQAReport" class="term-qa-dialog__summary">
-          <span>检查句段：{{ termQAReport.checked_segments }}</span>
-          <span>总问题数：{{ termQAReport.issue_count }}</span>
-          <span>待处理：{{ termQAReport.active_issue_count }}</span>
-          <span>已忽略：{{ termQAReport.ignored_count }}</span>
-          <span>报告时间：{{ termQAReport.created_at || '' }}</span>
-        </div>
-
-        <div class="term-qa-dialog__actions">
-          <button
-            class="button button--ghost"
-            type="button"
-            :disabled="!termQAReport || activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
-            @click="toggleAllActiveTermQAItems(!allActiveTermQAItemsSelected)"
-          >
-            {{ allActiveTermQAItemsSelected ? '取消全选' : '全选未忽略' }}
-          </button>
-          <button
-            class="button button--ghost"
-            type="button"
-            :disabled="selectedActiveTermQAReportItems.length === 0 || updatingTermQAIgnore"
-            @click="void ignoreSelectedTermQAReportItems()"
-          >
-            <Loader2 v-if="updatingTermQAIgnore" class="lucide-spin" :size="14" />
-            忽略选中 {{ selectedActiveTermQAReportItems.length || '' }}
-          </button>
-          <button
-            class="button"
-            type="button"
-            :disabled="!termQAReport || downloadingTermQAReport"
-            @click="downloadCurrentTermQAReport"
-          >
-            <Loader2 v-if="downloadingTermQAReport" class="lucide-spin" :size="14" />
-            <Download v-else :size="14" />
-            导出 XLSX
-          </button>
-        </div>
-
-        <div v-if="termQAReport && termQAReport.items.length === 0" class="empty-state">
-          未发现术语不一致问题。
-        </div>
-        <div v-else-if="termQAReport" class="term-qa-dialog__table-wrap">
-          <table class="term-qa-dialog__table">
-            <thead>
-              <tr>
-                <th>选择</th>
-                <th>句段</th>
-                <th>原文术语</th>
-                <th>期望译文</th>
-                <th>当前译文</th>
-                <th>状态</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                v-for="item in termQAReport.items.slice(0, 50)"
-                :key="item.id"
-                class="term-qa-dialog__row"
-                :class="{
-                  'is-locating': locatingTermQAReportItemId === item.id,
-                  'is-ignored': item.ignored,
-                }"
-                tabindex="0"
-                :aria-label="`跳转到句段 ${item.sentence_id}`"
-                @click="void focusTermQAReportItem(item)"
-                @keydown.enter.prevent="void focusTermQAReportItem(item)"
-                @keydown.space.prevent="void focusTermQAReportItem(item)"
-              >
-                <td>
-                  <input
-                    type="checkbox"
-                    :checked="selectedTermQAItemIds.has(item.id)"
-                    :disabled="item.ignored"
-                    aria-label="选择报告项"
-                    @click.stop
-                    @change.stop="handleTermQAItemSelectionChange(item.id, $event)"
-                  >
-                </td>
-                <td>
-                  <span class="term-qa-dialog__segment">
-                    <Loader2
-                      v-if="locatingTermQAReportItemId === item.id"
-                      class="lucide-spin"
-                      :size="13"
-                    />
-                    {{ item.sentence_id }}
-                  </span>
-                </td>
-                <td>{{ item.source_term }}</td>
-                <td>{{ item.expected_target_term }}</td>
-                <td>{{ item.target_text || '未填写' }}</td>
-                <td>
-                  <span class="term-qa-dialog__status" :class="{ 'is-ignored': item.ignored }">
-                    {{ item.ignored ? '已忽略' : '待处理' }}
-                  </span>
-                  <small v-if="item.ignored_at" class="term-qa-dialog__ignored-meta">
-                    {{ item.ignored_by_name || item.ignored_by_id || '' }}
-                  </small>
-                </td>
-                <td>
-                  <button
-                    class="button button--ghost term-qa-dialog__inline-action"
-                    type="button"
-                    :disabled="updatingTermQAIgnore"
-                    @click.stop="void setSingleTermQAReportItemIgnored(item, !item.ignored)"
-                  >
-                    {{ item.ignored ? '恢复' : '忽略' }}
-                  </button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-          <p v-if="termQAReport.items.length > 50" class="hint-text">
-            已显示前 50 条，完整报告请导出 XLSX。
-          </p>
-        </div>
-      </div>
-    </Modal>
-
-    <Modal
       :open="showShortcutHelp"
       :title="t('workbench.shortcutDialogTitle')"
       :description="t('workbench.shortcutDialogDescription')"
@@ -4692,16 +4883,61 @@ onBeforeRouteLeave(async () => {
 
 .workbench-page {
   --workbench-editor-stage-height: clamp(420px, calc(100vh - 410px), 660px);
+  --workbench-bottom-panel-height: clamp(360px, 50vh, 520px);
+  --workbench-visible-bottom-panel-height: min(var(--workbench-bottom-panel-height), calc(100dvh - 70px));
+  --workbench-side-tools-width: 48px;
+  --workbench-toolbar-left: calc(var(--sidebar-width) + 24px);
+  --workbench-drawer-left: calc(var(--sidebar-width) + 16px);
+  --workbench-fixed-max: calc(100vw - var(--sidebar-width) - 48px);
+  padding-bottom: 20px;
   overflow-x: hidden;
   overflow-x: clip;
+  overflow-y: hidden;
 }
 
 .workbench-page.is-standalone {
   --workbench-editor-stage-height: clamp(460px, calc(100vh - 300px), 860px);
-  min-height: 100vh;
-  padding: 0 10px 14px;
+  --workbench-bottom-panel-height: clamp(380px, 50vh, 560px);
+  --workbench-visible-bottom-panel-height: min(var(--workbench-bottom-panel-height), calc(100dvh - 70px));
+  --workbench-toolbar-left: 16px;
+  --workbench-drawer-left: 16px;
+  --workbench-fixed-max: calc(100vw - 32px);
+  height: 100dvh;
+  min-height: 0;
+  padding: 0 10px 8px;
   border-radius: 0;
   box-shadow: none;
+}
+
+.workbench-page.is-standalone {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.workbench-page.is-standalone .workbench-layout,
+.workbench-page.is-standalone .panel--editor,
+.workbench-page.is-standalone .segment-editor-shell,
+.workbench-page.is-standalone .segment-editor-results {
+  min-height: 0;
+}
+
+.workbench-page.is-standalone .panel--editor {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.workbench-page.is-standalone .segment-editor-shell {
+  flex: 1 1 auto;
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+.workbench-page.is-standalone .segment-editor-results {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.workbench-page.is-standalone .segment-editor-list-stage {
+  height: auto;
+  min-height: 0;
 }
 
 .workbench-page.is-stable-grid {
@@ -4719,7 +4955,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-page.is-stable-grid .workbench-layout.has-active-tool {
-  grid-template-columns: minmax(0, 1fr) auto auto 192px;
+  grid-template-columns: minmax(0, 1fr) auto auto var(--workbench-side-tools-width);
 }
 
 .workbench-page.is-stable-grid .panel--editor {
@@ -5859,6 +6095,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-search-panel {
+  flex: 0 0 auto;
   margin-bottom: 8px;
   padding: 8px 10px;
   border: 1px solid #d4dee5;
@@ -6041,6 +6278,14 @@ onBeforeRouteLeave(async () => {
   min-height: 0;
 }
 
+.workbench-layout {
+  grid-template-columns: minmax(0, 1fr) var(--workbench-side-tools-width);
+}
+
+.workbench-layout.has-active-tool {
+  grid-template-columns: minmax(0, 1fr) auto auto var(--workbench-side-tools-width);
+}
+
 .segment-editor-side-tools {
   grid-column: 2;
   grid-row: 1;
@@ -6048,12 +6293,12 @@ onBeforeRouteLeave(async () => {
   top: 24px;
   display: flex;
   flex-direction: column;
-  align-items: stretch;
-  gap: 8px;
-  width: 216px;
+  align-items: center;
+  gap: 6px;
+  width: var(--workbench-side-tools-width);
   max-height: calc(100vh - 140px);
   overflow-y: auto;
-  padding: 8px;
+  padding: 4px;
   border-left: 1px solid #d9e4e8;
   background: #f8fbfb;
   scrollbar-width: thin;
@@ -6069,17 +6314,35 @@ onBeforeRouteLeave(async () => {
   grid-column: 4;
 }
 
+.segment-editor-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 44px;
+  min-width: 0;
+  padding: 6px 0 0;
+  background: transparent;
+}
+
+.segment-editor-footer :deep(.pagination) {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0;
+}
+
 .segment-editor-side-tool {
   display: inline-flex;
   flex-direction: row;
   align-items: center;
-  justify-content: flex-start;
-  gap: 8px;
-  width: 100%;
-  min-height: 44px;
-  padding: 8px 10px;
+  justify-content: center;
+  gap: 0;
+  width: 38px;
+  min-height: 38px;
+  height: 38px;
+  padding: 0;
   border: 1px solid #bfd5d8;
-  border-radius: 7px;
+  border-radius: 6px;
   background: linear-gradient(180deg, #ffffff, #edf8f6);
   color: #21515b;
   font-size: 12px;
@@ -6097,15 +6360,13 @@ onBeforeRouteLeave(async () => {
 }
 
 .segment-editor-side-tool span {
-  display: block;
-  width: 100%;
-  max-width: none;
-  overflow: visible;
-  line-height: 1.28;
-  white-space: normal;
-  word-break: normal;
-  overflow-wrap: anywhere;
-  text-align: left;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .segment-editor-side-tool:hover,
@@ -6126,201 +6387,394 @@ onBeforeRouteLeave(async () => {
   color: #0b6658;
 }
 
-.segment-editor-side-report {
-  display: grid;
-  gap: 8px;
-  width: 100%;
-  min-width: 0;
-  padding: 10px;
-  border: 1px solid #c8dfe0;
-  border-radius: 8px;
-  background: #ffffff;
-  color: #233f48;
-  box-shadow: 0 2px 8px rgba(31, 61, 70, 0.08);
-}
-
-.segment-editor-side-report__header,
-.segment-editor-side-report__title,
-.segment-editor-side-report__actions {
-  display: flex;
-  align-items: center;
-}
-
-.segment-editor-side-report__header {
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.segment-editor-side-report__title {
-  min-width: 0;
-  gap: 6px;
-  color: #163d48;
-  font-size: 13px;
-  font-weight: 700;
-}
-
-.segment-editor-side-report__title svg {
-  color: #2d6f7c;
+.segment-editor-bottom-tools {
+  position: static;
+  order: -1;
   flex: 0 0 auto;
-}
-
-.segment-editor-side-report__icon,
-.segment-editor-side-report__button,
-.segment-editor-side-report__link,
-.segment-editor-side-report__summary,
-.segment-editor-side-report__item {
-  font: inherit;
-}
-
-.segment-editor-side-report__icon {
-  display: inline-grid;
-  place-items: center;
-  width: 26px;
-  height: 26px;
-  padding: 0;
-  border: 1px solid #c8d9dd;
-  border-radius: 6px;
-  background: #f6fbfb;
-  color: #2a6672;
-}
-
-.segment-editor-side-report__summary {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 2px 8px;
+  right: auto;
+  bottom: auto;
+  left: auto;
+  z-index: 1710;
+  display: flex;
+  justify-content: flex-start;
   align-items: center;
-  width: 100%;
-  padding: 8px;
-  border: 1px solid #d7e6e6;
-  border-radius: 7px;
-  background: #f8fbfb;
-  color: inherit;
-  text-align: left;
-}
-
-.segment-editor-side-report__summary strong {
-  grid-row: span 3;
-  min-width: 36px;
-  color: #a93a34;
-  font-size: 24px;
-  line-height: 1;
-  text-align: center;
-}
-
-.segment-editor-side-report__summary strong.is-clean {
-  color: #15795d;
-}
-
-.segment-editor-side-report__summary span {
-  color: #284b56;
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.segment-editor-side-report__summary small {
-  color: #68808a;
-  font-size: 11px;
-  line-height: 1.2;
-}
-
-.segment-editor-side-report__items {
-  display: grid;
   gap: 6px;
-  max-height: 260px;
-  overflow-y: auto;
-  padding-right: 2px;
-}
-
-.segment-editor-side-report__item {
-  display: grid;
-  gap: 2px;
-  width: 100%;
+  min-height: 32px;
   min-width: 0;
-  padding: 7px 8px;
-  border: 1px solid #d7e4e5;
-  border-radius: 7px;
-  background: #fbfdfd;
-  color: #223f48;
-  text-align: left;
+  width: max-content;
+  max-width: min(540px, 48vw);
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  pointer-events: none;
+  scrollbar-width: none;
 }
 
-.segment-editor-side-report__item:hover,
-.segment-editor-side-report__item:focus-visible,
-.segment-editor-side-report__summary:hover,
-.segment-editor-side-report__summary:focus-visible,
-.segment-editor-side-report__icon:hover,
-.segment-editor-side-report__icon:focus-visible,
-.segment-editor-side-report__button:hover,
-.segment-editor-side-report__button:focus-visible,
-.segment-editor-side-report__link:hover,
-.segment-editor-side-report__link:focus-visible {
-  border-color: #78adb4;
+.segment-editor-bottom-tools::-webkit-scrollbar {
+  display: none;
+}
+
+.segment-editor-bottom-tools.is-docked {
+  position: static;
+  right: auto;
+  bottom: auto;
+  left: auto;
+  z-index: 1710;
+  width: max-content;
+  max-width: min(540px, 48vw);
+  min-height: 31px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.segment-editor-bottom-tool {
+  --bottom-tool-bg: linear-gradient(180deg, #f7fbff, #e6f0f7);
+  --bottom-tool-border: #afc1cc;
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 32px;
+  min-width: 100px;
+  padding: 0 13px;
+  border: 1px solid var(--bottom-tool-border);
+  border-radius: 4px;
+  background: var(--bottom-tool-bg);
+  color: #334852;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: 0;
+  white-space: nowrap;
+  box-shadow: 0 8px 18px rgba(24, 48, 58, 0.12);
+  pointer-events: auto;
+}
+
+.segment-editor-bottom-tool:first-child {
+  border-left: 1px solid var(--bottom-tool-border);
+  border-radius: 4px;
+}
+
+.segment-editor-bottom-tool:last-child {
+  border-radius: 4px;
+}
+
+.segment-editor-bottom-tool svg {
+  flex: 0 0 auto;
+  color: #697b85;
+}
+
+.segment-editor-bottom-tool span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.segment-editor-bottom-tool:hover:not(:disabled),
+.segment-editor-bottom-tool:focus-visible {
+  z-index: 1;
+  border-color: #72acd7;
   background: #ffffff;
+  color: #0070c0;
   outline: none;
 }
 
-.segment-editor-side-report__item span,
-.segment-editor-side-report__item small,
-.segment-editor-side-report__item em {
+.segment-editor-bottom-tool.is-active {
+  z-index: 2;
+  border-color: #8abfe8;
+  background: #ffffff;
+  color: #0070c0;
+  box-shadow: 0 8px 18px rgba(24, 48, 58, 0.14), inset 0 -2px 0 #1e9bff;
+}
+
+.segment-editor-bottom-tool.is-active svg {
+  color: #0070c0;
+}
+
+.segment-editor-bottom-tool.is-loading {
+  color: #0070c0;
+}
+
+.segment-editor-bottom-tool.is-loading svg {
+  color: #0070c0;
+}
+
+.segment-editor-bottom-tool:disabled {
+  cursor: wait;
+  opacity: 0.66;
+}
+
+.segment-editor-bottom-tool--qa {
+  --bottom-tool-bg: linear-gradient(180deg, #eef9f3, #d7eadf);
+  --bottom-tool-border: #9bc7ad;
+  padding-right: 26px;
+}
+
+.segment-editor-bottom-tool--qa svg {
+  color: #23805f;
+}
+
+.segment-editor-bottom-tool--history {
+  --bottom-tool-bg: linear-gradient(180deg, #f5f1fb, #e6ddf2);
+  --bottom-tool-border: #b9abd0;
+}
+
+.segment-editor-bottom-tool--history svg {
+  color: #6e5c91;
+}
+
+.segment-editor-bottom-tool--paper {
+  --bottom-tool-bg: linear-gradient(180deg, #eef8fb, #dcecf1);
+  --bottom-tool-border: #a5c4ce;
+}
+
+.segment-editor-bottom-tool--paper svg {
+  color: #376f7e;
+}
+
+.segment-editor-bottom-tool--success {
+  --bottom-tool-bg: linear-gradient(180deg, #effaf5, #d9efe5);
+  --bottom-tool-border: #9fcdb8;
+}
+
+.segment-editor-bottom-tool--success svg {
+  color: #1d7b61;
+}
+
+.segment-editor-bottom-tool--layout {
+  --bottom-tool-bg: linear-gradient(180deg, #eef6ff, #dce9f7);
+  --bottom-tool-border: #a7bdd7;
+}
+
+.segment-editor-bottom-tool--layout svg {
+  color: #346fa6;
+}
+
+.segment-editor-bottom-tool__badge {
+  position: absolute;
+  top: 2px;
+  right: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: #fff4e5;
+  color: #9b4d07;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.segment-editor-bottom-tool__badge.is-clean {
+  background: #e6f6ef;
+  color: #15795d;
+}
+
+.workbench-bottom-drawer {
+  position: fixed;
+  right: 16px;
+  bottom: 50px;
+  left: var(--workbench-drawer-left);
+  z-index: 1700;
+  width: auto;
+  height: var(--workbench-visible-bottom-panel-height);
+  min-height: min(260px, var(--workbench-visible-bottom-panel-height));
+  max-height: var(--workbench-visible-bottom-panel-height);
+  overflow: hidden;
+  border: 1px solid #cbd8de;
+  border-radius: 6px;
+  background: #ffffff;
+  box-shadow: 0 18px 40px rgba(24, 48, 58, 0.18);
+}
+
+.workbench-bottom-drawer.is-wide {
+  height: var(--workbench-visible-bottom-panel-height);
+}
+
+.workbench-bottom-drawer.is-loading {
+  background: #f6fafb;
+}
+
+.workbench-bottom-drawer__loading {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background:
+    linear-gradient(180deg, rgba(248, 252, 253, 0.96), rgba(238, 247, 248, 0.94));
+  color: #244851;
+}
+
+.workbench-bottom-drawer__loading-body {
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  max-width: min(420px, 92%);
+  padding: 16px 20px;
+  border: 1px solid #b7d3db;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 12px 28px rgba(36, 72, 81, 0.14);
+}
+
+.workbench-bottom-drawer__loading-body svg {
+  flex: 0 0 auto;
+  color: #0070c0;
+}
+
+.workbench-bottom-drawer__loading-body div {
+  display: grid;
+  gap: 4px;
   min-width: 0;
+}
+
+.workbench-bottom-drawer__loading-body strong,
+.workbench-bottom-drawer__loading-body span {
+  display: block;
+  min-width: 0;
+}
+
+.workbench-bottom-drawer__loading-body strong {
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.workbench-bottom-drawer__loading-body span {
+  color: #5a737b;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.workbench-bottom-drawer__close {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 3;
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid #cdd9de;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.92);
+  color: #40515a;
+  box-shadow: none;
+}
+
+.workbench-bottom-drawer__close:hover,
+.workbench-bottom-drawer__close:focus-visible {
+  border-color: #95c4e8;
+  background: #fff;
+  color: #0070c0;
+  outline: none;
+}
+
+.workbench-bottom-drawer__preview,
+.workbench-bottom-drawer__history,
+.workbench-bottom-drawer__qa {
+  height: 100%;
+  min-height: 0;
+}
+
+.workbench-bottom-drawer__history {
+  width: 100%;
+  max-width: none;
+  overflow-y: auto;
+  padding: 10px;
+}
+
+.workbench-bottom-drawer__qa {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 10px;
+  overflow: hidden;
+  padding: 12px;
+}
+
+.workbench-bottom-drawer__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.workbench-bottom-drawer__header > div {
+  min-width: 0;
+}
+
+.workbench-bottom-drawer__header .panel-subtitle {
+  max-width: min(760px, 70vw);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.segment-editor-side-report__item span {
-  font-size: 12px;
-  font-weight: 700;
+.workbench-bottom-drawer__qa > .empty-state {
+  min-height: 0;
 }
 
-.segment-editor-side-report__item small {
-  color: #315f69;
-  font-size: 12px;
+.workbench-bottom-drawer__qa .term-qa-dialog__table-wrap {
+  min-height: 0;
+  overflow: auto;
 }
 
-.segment-editor-side-report__item em {
-  color: #6f838a;
-  font-size: 11px;
-  font-style: normal;
+.workbench-bottom-drawer__qa .term-qa-dialog__table {
+  min-width: 980px;
 }
 
-.segment-editor-side-report__empty {
-  padding: 8px;
-  border: 1px dashed #c9d9dd;
-  border-radius: 7px;
-  color: #667c84;
-  font-size: 12px;
-  line-height: 1.45;
+.workbench-bottom-drawer :deep(.preview-panel),
+.workbench-bottom-drawer :deep(.split-preview) {
+  height: 100%;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
 }
 
-.segment-editor-side-report__actions {
-  gap: 6px;
+.workbench-bottom-drawer :deep(.preview-panel__viewport) {
+  height: 100%;
+  min-height: 0;
 }
 
-.segment-editor-side-report__button,
-.segment-editor-side-report__link {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 0;
-  min-height: 30px;
-  padding: 6px 8px;
-  border: 1px solid #c7dadd;
-  border-radius: 6px;
-  background: #f6fbfb;
-  color: #21515b;
-  font-size: 12px;
-  font-weight: 600;
+.workbench-bottom-drawer :deep(.preview-panel__paper) {
+  width: min(100%, 980px);
+  max-width: 100%;
+  height: 100%;
 }
 
-.segment-editor-side-report__button {
-  flex: 1 1 0;
-  gap: 5px;
+.workbench-bottom-drawer :deep(.split-preview__layout) {
+  height: 100%;
+  min-height: 0;
 }
 
-.segment-editor-side-report__link {
-  width: 100%;
-  background: #ffffff;
+.workbench-bottom-drawer-enter-active,
+.workbench-bottom-drawer-leave-active {
+  transition:
+    opacity 180ms ease,
+    transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.workbench-bottom-drawer-enter-from,
+.workbench-bottom-drawer-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
 }
 
 .segment-editor-list-stage {
@@ -6702,29 +7156,30 @@ onBeforeRouteLeave(async () => {
     max-height: none;
     overflow-x: auto;
     overflow-y: hidden;
-    padding: 6px 0;
+    padding: 4px 0;
     border-left: 0;
     border-bottom: 1px solid #d9e4e8;
   }
 
   .segment-editor-side-tool {
-    flex: 0 0 64px;
-    width: 64px;
-    flex-direction: column;
+    flex: 0 0 40px;
+    width: 40px;
+    height: 38px;
+    min-height: 38px;
+    flex-direction: row;
     justify-content: center;
-    gap: 5px;
-    padding: 8px 6px;
+    gap: 0;
+    padding: 0;
   }
 
   .segment-editor-side-tool span {
-    max-width: 52px;
-    text-align: center;
-  }
-
-  .segment-editor-side-report {
-    flex: 0 0 220px;
-    max-height: 240px;
-    overflow-y: auto;
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
 
   .segment-editor-results {
@@ -6734,6 +7189,37 @@ onBeforeRouteLeave(async () => {
   .segment-editor-list-stage {
     height: 420px;
     min-height: 0;
+  }
+}
+
+@media (max-width: 980px) {
+  .workbench-page {
+    --workbench-toolbar-left: 12px;
+    --workbench-drawer-left: 12px;
+    --workbench-fixed-max: calc(100vw - 24px);
+  }
+
+  .segment-editor-footer {
+    flex-wrap: wrap;
+  }
+
+  .segment-editor-footer :deep(.pagination) {
+    flex-basis: 100%;
+  }
+
+  .segment-editor-bottom-tools {
+    right: auto;
+    max-width: 100%;
+  }
+
+  .segment-editor-bottom-tools.is-docked {
+    right: auto;
+    max-width: 100%;
+  }
+
+  .workbench-bottom-drawer {
+    right: 12px;
+    left: var(--workbench-drawer-left);
   }
 }
 
@@ -6750,6 +7236,17 @@ onBeforeRouteLeave(async () => {
     width: 100%;
     justify-content: stretch;
     margin-left: 0;
+  }
+
+  .segment-editor-bottom-tool {
+    min-width: 88px;
+    height: 34px;
+    padding-inline: 10px;
+    font-size: 12px;
+  }
+
+  .segment-editor-bottom-tool--qa {
+    padding-right: 24px;
   }
 
   .segment-editor-toolbar__filter,

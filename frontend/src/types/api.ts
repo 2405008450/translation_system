@@ -60,17 +60,38 @@ export interface AnalyticsSourceBreakdown {
   source_word_count: number
 }
 
+export interface AnalyticsUserStat {
+  user_id: string | null
+  username: string | null
+  nickname: string | null
+  role: UserRole | null
+  translator_type: TranslatorType | null
+  is_active: boolean
+  display_name: string
+  active_day_count: number
+  request_count: number
+  estimated_active_minutes: number
+  first_seen_at: string | null
+  last_seen_at: string | null
+  new_source_word_count: number
+  modified_source_word_count: number
+  total_source_word_count: number
+  event_count: number
+}
+
 export interface AnalyticsDashboardResponse {
   granularity: AnalyticsGranularity
   summary: AnalyticsSummary
   series: AnalyticsSeriesPoint[]
   language_pairs: AnalyticsLanguagePair[]
   source_breakdown: AnalyticsSourceBreakdown[]
+  user_stats: AnalyticsUserStat[]
 }
 
 export interface FileRecordSummary {
   id: string
   project_id?: string | null
+  project_name?: string | null
   filename: string
   status: string
   progress?: number
@@ -700,6 +721,7 @@ export interface SegmentUpdatePayload {
   source: string
   track_revision?: boolean
   base_version?: number | null
+  confirm?: boolean
 }
 
 export interface SegmentRevisionEntry {

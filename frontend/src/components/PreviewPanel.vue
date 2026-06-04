@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { RotateCcw, ZoomIn, ZoomOut } from 'lucide-vue-next'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import type { CommentAnchorDraft, SegmentComment } from '../types/api'
@@ -53,17 +54,28 @@ const emit = defineEmits<{
   focusComment: [commentId: string]
   requestComment: [draft: CommentAnchorDraft]
   visibleSentenceChange: [sentenceId: string]
+  renderingChange: [rendering: boolean]
 }>()
 
 const containerRef = ref<HTMLElement | null>(null)
 const currentPage = ref(1)
 const totalPages = ref(1)
 const isRendering = ref(false)
+const previewZoom = ref(1)
 const pendingCommentSelection = ref<{
   top: number
   left: number
   draft: CommentAnchorDraft
 } | null>(null)
+const MIN_PREVIEW_ZOOM = 0.75
+const MAX_PREVIEW_ZOOM = 1.8
+const PREVIEW_ZOOM_STEP = 0.1
+const previewZoomPercent = computed(() => Math.round(previewZoom.value * 100))
+const canZoomOut = computed(() => previewZoom.value > MIN_PREVIEW_ZOOM)
+const canZoomIn = computed(() => previewZoom.value < MAX_PREVIEW_ZOOM)
+const previewZoomStyle = computed(() => ({
+  '--preview-zoom': String(previewZoom.value),
+}))
 const pageSummary = computed(() => {
   if (!props.supported || props.loading) {
     return ''
@@ -92,6 +104,33 @@ function escapeHtml(text: string) {
 
 function escapeAttribute(text: string) {
   return escapeHtml(text)
+}
+
+function clampPreviewZoom(value: number) {
+  return Math.min(MAX_PREVIEW_ZOOM, Math.max(MIN_PREVIEW_ZOOM, Math.round(value * 100) / 100))
+}
+
+async function refreshPreviewMetricsAfterZoom() {
+  await nextTick()
+  updatePagination()
+  notifyVisibleSentence()
+}
+
+function setPreviewZoom(value: number) {
+  const nextZoom = clampPreviewZoom(value)
+  if (nextZoom === previewZoom.value) {
+    return
+  }
+  previewZoom.value = nextZoom
+  void refreshPreviewMetricsAfterZoom()
+}
+
+function zoomPreview(delta: number) {
+  setPreviewZoom(previewZoom.value + delta)
+}
+
+function resetPreviewZoom() {
+  setPreviewZoom(1)
 }
 
 function getSentenceNode(sentenceId: string | null | undefined) {
@@ -298,7 +337,7 @@ async function renderPreviewContent(forceHtml = false) {
   }
 
   if (forceHtml || renderedHtmlSignature !== props.html) {
-    container.innerHTML = props.html
+    container.innerHTML = `<div class="preview-panel__content">${props.html}</div>`
     renderedHtmlSignature = props.html
     appliedSentenceTexts.clear()
     rebuildSentenceNodeMap(container)
@@ -618,6 +657,10 @@ watch(() => props.loading, (loading) => {
   }
 })
 
+watch(isRendering, (rendering) => {
+  emit('renderingChange', rendering)
+}, { immediate: true })
+
 watch(() => props.segments, (segments, previousSegments) => {
   if (
     props.renderMode !== 'target'
@@ -687,13 +730,46 @@ watch(() => props.syncSentenceId, (sentenceId) => {
         <div class="section-title section-title--tight">{{ title }}</div>
         <p v-if="pageSummary" class="preview-panel__meta">{{ pageSummary }}</p>
       </div>
+      <div class="preview-panel__zoom" aria-label="预览缩放">
+        <button
+          class="button preview-panel__zoom-button"
+          type="button"
+          title="缩小预览"
+          aria-label="缩小预览"
+          :disabled="!supported || !canZoomOut"
+          @click="zoomPreview(-PREVIEW_ZOOM_STEP)"
+        >
+          <ZoomOut :size="15" />
+        </button>
+        <span class="preview-panel__zoom-value" aria-live="polite">{{ previewZoomPercent }}%</span>
+        <button
+          class="button preview-panel__zoom-button"
+          type="button"
+          title="放大预览"
+          aria-label="放大预览"
+          :disabled="!supported || !canZoomIn"
+          @click="zoomPreview(PREVIEW_ZOOM_STEP)"
+        >
+          <ZoomIn :size="15" />
+        </button>
+        <button
+          class="button preview-panel__zoom-button"
+          type="button"
+          title="重置缩放"
+          aria-label="重置缩放"
+          :disabled="!supported || previewZoom === 1"
+          @click="resetPreviewZoom"
+        >
+          <RotateCcw :size="14" />
+        </button>
+      </div>
       <button v-if="closable" class="button preview-panel__close" type="button" @click="emit('close')">
         关闭
       </button>
     </div>
 
     <div class="preview-panel__viewport">
-      <div class="preview-panel__paper">
+      <div class="preview-panel__paper" :style="previewZoomStyle">
         <div
           v-if="supported"
           ref="containerRef"

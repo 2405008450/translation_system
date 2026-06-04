@@ -29,7 +29,7 @@ import { getProgressStyle, isProgressComplete } from '../utils/progress'
 interface ProjectRow {
   id: string
   project_id: string | null
-  name: string
+  project_name: string | null
   filename: string
   status: string
   progress: number
@@ -87,6 +87,7 @@ const importDialogContext = ref<{
 })
 
 const columns = computed<DataTableColumn[]>(() => ([
+  { key: 'project_name', label: t('taskList.columns.projectName'), sortable: true },
   { key: 'filename', label: t('taskList.columns.filename'), sortable: true },
   { key: 'status', label: t('taskList.columns.status'), width: '110px' },
   { key: 'progress', label: t('projectList.status.progress'), width: '180px' },
@@ -136,7 +137,10 @@ async function loadProjects() {
     })
     const keyword = searchQuery.value.trim().toLowerCase()
     projects.value = keyword
-      ? data.filter((item) => item.filename.toLowerCase().includes(keyword))
+      ? data.filter((item) => (
+          (item.project_name || '').toLowerCase().includes(keyword)
+          || item.filename.toLowerCase().includes(keyword)
+        ))
       : data
   } catch (error) {
     pageError.value = getErrorMessage(error, t('taskList.errors.load'))
@@ -231,7 +235,7 @@ function goToAssets() {
 function openProjectDetail(row: ProjectRow) {
   closeActionMenu()
   void router.push({
-    name: 'workbench',
+    name: 'workbench-focus',
     params: { id: row.id },
     query: {
       from: 'project',
@@ -391,10 +395,15 @@ onBeforeUnmount(() => {
             @sort="handleSort"
             @select="handleSelect"
           >
+            <template #project_name="{ row }">
+              <span>{{ row.project_name || t('common.notSet') }}</span>
+            </template>
+
             <template #filename="{ row }">
               <button
                 class="text-link project-link"
                 type="button"
+                :title="row.filename"
                 @click="openProjectDetail(row as ProjectRow)"
               >
                 {{ row.filename }}

@@ -876,6 +876,7 @@ class SegmentUpdate(BaseModel):
     source: str = "manual"
     track_revision: bool = True
     base_version: int | None = None
+    confirm: bool = False
 
 
 class SegmentSourceUpdate(BaseModel):
@@ -4329,7 +4330,10 @@ def get_file_records(
 
     safe_skip = max(skip, 0)
     safe_limit = min(max(limit, 1), 200)
-    query = db.query(FileRecord).options(joinedload(FileRecord.assignee))
+    query = db.query(FileRecord).options(
+        joinedload(FileRecord.assignee),
+        joinedload(FileRecord.project),
+    )
     if not can_access_all_projects(current_user):
         query = (
             query.join(FileAssignment, FileAssignment.file_record_id == FileRecord.id)
@@ -4355,6 +4359,7 @@ def get_file_records(
         {
             "id": file_record.id,
             "project_id": str(file_record.project_id) if file_record.project_id else None,
+            "project_name": file_record.project.name if file_record.project else None,
             "filename": file_record.filename,
             "status": file_record.status,
             "progress": calculate_file_record_progress(
@@ -5613,6 +5618,7 @@ def update_segment(
         source=update.source,
         current_user=current_user,
         track_revision=update.track_revision,
+        confirm=update.confirm,
     )
     if not segment:
         raise HTTPException(status_code=404, detail="片段不存在。")
@@ -5724,13 +5730,13 @@ def split_segment(
     segment.source_html = None
     segment.target_text = first_target
     segment.target_html = None
-    segment.status = "none" if not first_target.strip() else "confirmed"
     segment.score = 0.0
     segment.matched_source_text = None
     segment.matched_collection_name = None
     segment.matched_creator_name = None
     segment.matched_created_at = None
     segment.matched_updated_at = None
+    segment.status = _resolve_unconfirmed_segment_status(segment)
 
     # 创建新句段
     new_segment = Segment(
@@ -5741,7 +5747,7 @@ def split_segment(
         source_html=None,
         target_text=second_target,
         target_html=None,
-        status="none" if not second_target.strip() else "confirmed",
+        status="none",
         score=0.0,
         source="manual",
         block_type=segment.block_type,
@@ -5749,6 +5755,7 @@ def split_segment(
         row_index=segment.row_index,
         cell_index=segment.cell_index,
     )
+    new_segment.status = _resolve_unconfirmed_segment_status(new_segment)
     db.add(new_segment)
 
     sync_file_record_status(db, file_record_id)
@@ -5813,7 +5820,6 @@ def merge_segment(
     first_seg.source_html = None
     first_seg.target_text = merged_target.strip()
     first_seg.target_html = None
-    first_seg.status = "none" if not merged_target.strip() else "confirmed"
     first_seg.score = 0.0
     first_seg.source = "manual"
     first_seg.matched_source_text = None
@@ -5821,6 +5827,7 @@ def merge_segment(
     first_seg.matched_creator_name = None
     first_seg.matched_created_at = None
     first_seg.matched_updated_at = None
+    first_seg.status = _resolve_unconfirmed_segment_status(first_seg)
 
     # 迁移第二个句段的评论到第一个句段
     for comment in second_seg.comments:
@@ -6646,6 +6653,7 @@ async def llm_translate_file_record(
                 segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
                 segment.llm_provider = result.provider
                 segment.llm_model = result.model
+                segment.status = _resolve_unconfirmed_segment_status(segment)
 
                 # Inline revision creation — skip pending query for LLM bulk writes
                 if (before_text or "") != (result.translated_text or ""):

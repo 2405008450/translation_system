@@ -28,6 +28,7 @@ from app.services.document_workspace import (
 )
 from app.services.analytics_service import count_source_words, record_translation_metric_event
 from app.services.revision_service import create_revision
+from app.services.segment_status import resolve_unconfirmed_segment_status
 from app.services.task_file_service import build_task_workspace
 
 logger = logging.getLogger(__name__)
@@ -819,6 +820,7 @@ def update_segment_target(
     llm_provider: str | None = None,
     llm_model: str | None = None,
     track_revision: bool = True,
+    confirm: bool = False,
 ) -> Segment | None:
     segment = db.query(Segment).filter(Segment.id == segment_id).first()
     if not segment:
@@ -836,8 +838,10 @@ def update_segment_target(
     else:
         segment.llm_provider = None
         segment.llm_model = None
-    if source == "manual":
+    if confirm:
         segment.status = "confirmed"
+    else:
+        segment.status = resolve_unconfirmed_segment_status(segment)
     if track_revision:
         create_revision(
             db,
@@ -874,6 +878,7 @@ def update_segment_by_sentence_id(
     llm_provider: str | None = None,
     llm_model: str | None = None,
     track_revision: bool = True,
+    confirm: bool = False,
 ) -> Segment | None:
     segment = (
         db.query(Segment)
@@ -895,8 +900,10 @@ def update_segment_by_sentence_id(
     else:
         segment.llm_provider = None
         segment.llm_model = None
-    if source == "manual":
+    if confirm:
         segment.status = "confirmed"
+    else:
+        segment.status = resolve_unconfirmed_segment_status(segment)
     if track_revision:
         create_revision(
             db,
@@ -1019,6 +1026,7 @@ def batch_update_segments(
         target_html = item.get("target_html")
         source = item.get("source", "manual")
         track_revision = bool(item.get("track_revision", True))
+        confirm = bool(item.get("confirm", False))
         segment.target_text = target_text
         segment.target_html = target_html if target_html else None
         segment.source = source
@@ -1030,8 +1038,10 @@ def batch_update_segments(
         else:
             segment.llm_provider = None
             segment.llm_model = None
-        if source == "manual":
+        if confirm:
             segment.status = "confirmed"
+        else:
+            segment.status = resolve_unconfirmed_segment_status(segment)
         if track_revision:
             create_revision(
                 db,

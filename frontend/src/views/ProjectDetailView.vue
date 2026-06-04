@@ -2163,263 +2163,310 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <section v-if="activeTab === 'settings'" class="panel">
-        <div class="pd-panel-head">
-          <div class="pd-panel-head__copy">
-            <div class="section-title section-title--tight">{{ t('projectDetail.settings.basicTitle') }}</div>
-            <p class="panel-subtitle">{{ t('projectDetail.settings.basicDescription') }}</p>
-          </div>
-        </div>
+      <section v-if="activeTab === 'settings'" class="panel pd-settings-panel">
+        <div class="pd-settings-layout">
+          <aside class="pd-settings-rail" aria-label="项目设置分区">
+            <a class="pd-settings-rail__item" href="#project-settings-basic">
+              <Settings2 :size="15" />
+              <span>基础信息</span>
+            </a>
+            <a class="pd-settings-rail__item" href="#project-settings-guidelines">
+              <FileText :size="15" />
+              <span>翻译要求</span>
+            </a>
+            <a class="pd-settings-rail__item" href="#project-settings-terms">
+              <BookOpen :size="15" />
+              <span>术语库</span>
+            </a>
+            <a class="pd-settings-rail__item" href="#project-settings-term-qa">
+              <ShieldCheck :size="15" />
+              <span>术语 QA</span>
+            </a>
+          </aside>
 
-        <div class="pd-settings-form">
-          <div class="pd-settings-list">
-            <label class="field pd-settings-row pd-settings-row--name">
-              <span class="field__label">{{ t('projectDetail.settings.nameLabel') }} <span class="field__required">*</span></span>
-              <input
-                v-model="settingsForm.name"
-                class="field__control pd-settings-control pd-settings-control--name"
-                data-testid="project-settings-name"
-                type="text"
-                maxlength="200"
-                :placeholder="t('projectDetail.settings.namePlaceholder')"
-              />
-            </label>
-
-            <label class="field pd-settings-row">
-              <span class="field__label">{{ t('projectDetail.settings.deadlineLabel') }}</span>
-              <input
-                v-model="settingsForm.deadline"
-                class="field__control pd-settings-control"
-                data-testid="project-settings-deadline"
-                type="datetime-local"
-              />
-            </label>
-
-            <label class="field pd-settings-row">
-              <span class="field__label">{{ t('projectDetail.settings.accessLevelLabel') }}</span>
-              <select
-                v-model="settingsForm.access_level"
-                class="field__control pd-settings-control"
-                data-testid="project-settings-access-level"
-              >
-                <option v-for="option in accessOptions" :key="option.value" :value="option.value">
-                  {{ option.label }}
-                </option>
-              </select>
-            </label>
-          </div>
-
-          <div class="pd-readonly-grid">
-            <label class="pd-readonly-field">
-              <span class="field__label">{{ t('projectDetail.base.languagePair') }}</span>
-              <span class="pd-readonly-value">{{ projectLanguagePairLabel }}</span>
-            </label>
-            <label class="pd-readonly-field">
-              <span class="field__label">{{ t('projectList.form.sourceLanguage') }}</span>
-              <span class="pd-readonly-value">{{ getLanguageLabel(effectiveProjectSourceLanguage) }}</span>
-            </label>
-            <label class="pd-readonly-field">
-              <span class="field__label">{{ t('projectList.form.targetLanguage') }}</span>
-              <span class="pd-readonly-value">{{ getLanguageLabel(effectiveProjectTargetLanguage) }}</span>
-            </label>
-            <label class="pd-readonly-field">
-              <span class="field__label">{{ t('projectDetail.base.createdAt') }}</span>
-              <span class="pd-readonly-value">{{ formatDateText(project.created_at) }}</span>
-            </label>
-          </div>
-
-          <p class="hint-text">{{ t('projectDetail.settings.languageLockedHint') }}</p>
-          <p v-if="settingsError" class="form-message is-error">{{ settingsError }}</p>
-
-          <div class="pd-settings-actions">
-            <button
-              class="button button--primary pd-settings-save"
-              data-testid="project-settings-save"
-              type="button"
-              :disabled="savingSettings"
-              @click="saveProjectSettings"
-            >
-              <Loader2 v-if="savingSettings" class="lucide-spin" :size="14" />
-              <Settings2 v-else :size="14" />
-              {{ savingSettings ? t('common.actions.saving') : t('projectDetail.settings.saveBasic') }}
-            </button>
-          </div>
-
-          <div class="pd-settings-divider" aria-hidden="true" />
-
-          <div class="pd-settings-section-head">
-            <div class="section-title section-title--tight">{{ t('projectDetail.settings.guidelinesTitle') }}</div>
-            <p class="panel-subtitle">{{ t('projectDetail.settings.guidelinesDescription') }}</p>
-          </div>
-
-          <label class="field field--full">
-            <span class="field__label">{{ t('projectDetail.settings.guidelinesLabel') }}</span>
-            <textarea
-              v-model="guidelinesText"
-              class="field__control pd-guidelines-editor"
-              rows="10"
-              :placeholder="t('projectDetail.settings.guidelinesPlaceholder')"
-            />
-          </label>
-          <p class="hint-text">{{ t('projectDetail.settings.guidelinesHint') }}</p>
-          <div class="pd-settings-actions">
-            <button
-              class="button button--primary"
-              type="button"
-              :disabled="savingGuidelines"
-              @click="saveGuidelines"
-            >
-              <Loader2 v-if="savingGuidelines" class="lucide-spin" :size="14" />
-              <Settings2 v-else :size="14" />
-              {{ savingGuidelines ? t('common.actions.saving') : t('common.actions.save') }}
-            </button>
-          </div>
-
-          <div class="pd-settings-divider" aria-hidden="true" />
-
-          <div class="pd-settings-section-head">
-            <div class="section-title section-title--tight">术语库设置</div>
-            <p class="panel-subtitle">按文件语言对启用术语提醒、控制写入入口，并指定术语 QA 标准库。</p>
-          </div>
-
-          <div class="term-settings">
-            <StateView
-              v-if="loadingTermBaseSettings"
-              kind="loading"
-              title="正在加载术语库设置"
-              message="正在读取项目文件语言对和可用术语库。"
-            />
-            <p v-else-if="termBaseSettingsError" class="form-message is-error">{{ termBaseSettingsError }}</p>
-            <div v-else-if="!termBaseSettings || termBaseSettings.groups.length === 0" class="empty-state">
-              当前项目还没有可配置语言对的文件。
+          <div class="pd-settings-main">
+            <div class="pd-settings-overview">
+              <div class="pd-settings-overview__copy">
+                <div class="section-title section-title--tight">{{ t('projectDetail.tabs.settings') }}</div>
+                <p class="panel-subtitle">{{ t('projectDetail.settings.basicDescription') }}</p>
+              </div>
             </div>
-            <div v-else class="term-settings__groups">
-              <section
-                v-for="group in termBaseSettings.groups"
-                :key="termBaseSettingGroupKey(group)"
-                class="term-settings__group"
-              >
-                <div class="term-settings__group-head">
+
+            <section id="project-settings-basic" class="pd-settings-section">
+              <header class="pd-settings-section-head">
+                <div class="pd-settings-section-head__copy">
+                  <span class="pd-settings-section-icon">
+                    <Settings2 :size="17" />
+                  </span>
                   <div>
-                    <strong>{{ getTermBaseSettingPairLabel(group) }}</strong>
-                    <span>{{ group.file_count }} 个文件</span>
+                    <div class="section-title section-title--tight">{{ t('projectDetail.settings.basicTitle') }}</div>
+                    <p class="panel-subtitle">{{ t('projectDetail.settings.languageLockedHint') }}</p>
                   </div>
+                </div>
+                <button
+                  class="button button--primary pd-settings-save"
+                  data-testid="project-settings-save"
+                  type="button"
+                  :disabled="savingSettings"
+                  @click="saveProjectSettings"
+                >
+                  <Loader2 v-if="savingSettings" class="lucide-spin" :size="14" />
+                  <Settings2 v-else :size="14" />
+                  {{ savingSettings ? t('common.actions.saving') : t('projectDetail.settings.saveBasic') }}
+                </button>
+              </header>
+
+              <div class="pd-settings-section-body">
+                <div class="pd-settings-list">
+                  <label class="field pd-settings-row pd-settings-row--name">
+                    <span class="field__label">{{ t('projectDetail.settings.nameLabel') }} <span class="field__required">*</span></span>
+                    <input
+                      v-model="settingsForm.name"
+                      class="field__control pd-settings-control pd-settings-control--name"
+                      data-testid="project-settings-name"
+                      type="text"
+                      maxlength="200"
+                      :placeholder="t('projectDetail.settings.namePlaceholder')"
+                    />
+                  </label>
+
+                  <label class="field pd-settings-row">
+                    <span class="field__label">{{ t('projectDetail.settings.deadlineLabel') }}</span>
+                    <input
+                      v-model="settingsForm.deadline"
+                      class="field__control pd-settings-control"
+                      data-testid="project-settings-deadline"
+                      type="datetime-local"
+                    />
+                  </label>
+
+                  <label class="field pd-settings-row">
+                    <span class="field__label">{{ t('projectDetail.settings.accessLevelLabel') }}</span>
+                    <select
+                      v-model="settingsForm.access_level"
+                      class="field__control pd-settings-control"
+                      data-testid="project-settings-access-level"
+                    >
+                      <option v-for="option in accessOptions" :key="option.value" :value="option.value">
+                        {{ option.label }}
+                      </option>
+                    </select>
+                  </label>
+                </div>
+
+                <div class="pd-readonly-grid">
+                  <label class="pd-readonly-field">
+                    <span class="field__label">{{ t('projectDetail.base.languagePair') }}</span>
+                    <span class="pd-readonly-value">{{ projectLanguagePairLabel }}</span>
+                  </label>
+                  <label class="pd-readonly-field">
+                    <span class="field__label">{{ t('projectDetail.base.createdAt') }}</span>
+                    <span class="pd-readonly-value">{{ formatDateText(project.created_at) }}</span>
+                  </label>
+                </div>
+
+                <p v-if="settingsError" class="form-message is-error">{{ settingsError }}</p>
+              </div>
+            </section>
+
+            <section id="project-settings-guidelines" class="pd-settings-section">
+              <header class="pd-settings-section-head">
+                <div class="pd-settings-section-head__copy">
+                  <span class="pd-settings-section-icon">
+                    <FileText :size="17" />
+                  </span>
+                  <div>
+                    <div class="section-title section-title--tight">{{ t('projectDetail.settings.guidelinesTitle') }}</div>
+                    <p class="panel-subtitle">{{ t('projectDetail.settings.guidelinesDescription') }}</p>
+                  </div>
+                </div>
+                <button
+                  class="button button--primary pd-settings-save"
+                  type="button"
+                  :disabled="savingGuidelines"
+                  @click="saveGuidelines"
+                >
+                  <Loader2 v-if="savingGuidelines" class="lucide-spin" :size="14" />
+                  <Settings2 v-else :size="14" />
+                  {{ savingGuidelines ? t('common.actions.saving') : t('common.actions.save') }}
+                </button>
+              </header>
+
+              <div class="pd-settings-section-body">
+                <label class="field field--full">
+                  <span class="field__label">{{ t('projectDetail.settings.guidelinesLabel') }}</span>
+                  <textarea
+                    v-model="guidelinesText"
+                    class="field__control pd-guidelines-editor"
+                    rows="8"
+                    :placeholder="t('projectDetail.settings.guidelinesPlaceholder')"
+                  />
+                </label>
+                <p class="hint-text">{{ t('projectDetail.settings.guidelinesHint') }}</p>
+              </div>
+            </section>
+
+            <section id="project-settings-terms" class="pd-settings-section">
+              <header class="pd-settings-section-head">
+                <div class="pd-settings-section-head__copy">
+                  <span class="pd-settings-section-icon">
+                    <BookOpen :size="17" />
+                  </span>
+                  <div>
+                    <div class="section-title section-title--tight">术语库设置</div>
+                    <p class="panel-subtitle">按文件语言对启用术语提醒、控制写入入口，并指定术语 QA 标准库。</p>
+                  </div>
+                </div>
+                <button
+                  class="button button--primary pd-settings-save"
+                  type="button"
+                  :disabled="savingTermBaseSettings || loadingTermBaseSettings"
+                  @click="saveProjectTermBaseSettings"
+                >
+                  <Loader2 v-if="savingTermBaseSettings" class="lucide-spin" :size="14" />
+                  <Settings2 v-else :size="14" />
+                  {{ savingTermBaseSettings ? '保存中' : '保存术语库设置' }}
+                </button>
+              </header>
+
+              <div class="pd-settings-section-body term-settings">
+                <StateView
+                  v-if="loadingTermBaseSettings"
+                  kind="loading"
+                  title="正在加载术语库设置"
+                  message="正在读取项目文件语言对和可用术语库。"
+                />
+                <p v-else-if="termBaseSettingsError" class="form-message is-error">{{ termBaseSettingsError }}</p>
+                <div v-else-if="!termBaseSettings || termBaseSettings.groups.length === 0" class="empty-state">
+                  当前项目还没有可配置语言对的文件。
+                </div>
+                <div v-else class="term-settings__groups">
+                  <section
+                    v-for="group in termBaseSettings.groups"
+                    :key="termBaseSettingGroupKey(group)"
+                    class="term-settings__group"
+                  >
+                    <div class="term-settings__group-head">
+                      <div>
+                        <strong>{{ getTermBaseSettingPairLabel(group) }}</strong>
+                        <span>{{ group.file_count }} 个文件 · {{ group.term_bases.length }} 个术语库</span>
+                      </div>
+                      <button
+                        class="button term-settings__create"
+                        type="button"
+                        :disabled="Boolean(creatingTermBasePair)"
+                        @click="createTermBaseForGroup(group)"
+                      >
+                        <Loader2 v-if="creatingTermBasePair === termBaseSettingGroupKey(group)" class="lucide-spin" :size="14" />
+                        <Plus v-else :size="14" />
+                        创建术语库
+                      </button>
+                    </div>
+
+                    <div class="term-settings__table-wrap">
+                      <table class="term-settings__table">
+                        <thead>
+                          <tr>
+                            <th>术语库</th>
+                            <th>启用</th>
+                            <th>
+                              写入
+                              <span class="term-settings__tip" title="允许在本项目相关入口中编辑、增加和删除该术语库中的术语。">?</span>
+                            </th>
+                            <th>
+                              QA
+                              <span class="term-settings__tip" title="QA术语库为质量检查的标准术语库。勾选“术语不一致”后，系统会用该库检查译文术语一致性。">?</span>
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr v-if="group.term_bases.length === 0">
+                            <td colspan="4">当前语言对暂无术语库。</td>
+                          </tr>
+                          <tr v-for="row in group.term_bases" :key="row.id">
+                            <td>
+                              <span class="term-settings__name">{{ row.name }}</span>
+                              <span class="term-settings__meta">{{ row.entry_count }} 条术语</span>
+                            </td>
+                            <td>
+                              <label class="term-settings__toggle">
+                                <input
+                                  type="checkbox"
+                                  :checked="row.enabled"
+                                  :aria-label="`启用 ${row.name}`"
+                                  @change="toggleTermBaseSetting(row, 'enabled', $event)"
+                                />
+                                <span aria-hidden="true" />
+                              </label>
+                            </td>
+                            <td>
+                              <label class="term-settings__toggle">
+                                <input
+                                  type="checkbox"
+                                  :checked="row.writable"
+                                  :aria-label="`写入 ${row.name}`"
+                                  @change="toggleTermBaseSetting(row, 'writable', $event)"
+                                />
+                                <span aria-hidden="true" />
+                              </label>
+                            </td>
+                            <td>
+                              <label class="term-settings__toggle">
+                                <input
+                                  type="checkbox"
+                                  :checked="row.qa"
+                                  :aria-label="`QA术语库 ${row.name}`"
+                                  @change="toggleTermBaseSetting(row, 'qa', $event)"
+                                />
+                                <span aria-hidden="true" />
+                              </label>
+                            </td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </section>
+                </div>
+              </div>
+            </section>
+
+            <section id="project-settings-term-qa" class="pd-settings-section">
+              <header class="pd-settings-section-head">
+                <div class="pd-settings-section-head__copy">
+                  <span class="pd-settings-section-icon">
+                    <ShieldCheck :size="17" />
+                  </span>
+                  <div>
+                    <div class="section-title section-title--tight">术语 QA 报告</div>
+                    <p class="panel-subtitle">检查原文命中的 QA 术语是否在译文中使用了对应译文。</p>
+                  </div>
+                </div>
+                <div class="pd-settings-actions term-qa-report__actions">
+                  <button
+                    class="button button--primary"
+                    type="button"
+                    :disabled="generatingTermQAReport"
+                    @click="generateProjectTermQAReport"
+                  >
+                    <Loader2 v-if="generatingTermQAReport" class="lucide-spin" :size="14" />
+                    <ShieldCheck v-else :size="14" />
+                    {{ generatingTermQAReport ? '生成中' : '生成术语 QA 报告' }}
+                  </button>
                   <button
                     class="button"
                     type="button"
-                    :disabled="Boolean(creatingTermBasePair)"
-                    @click="createTermBaseForGroup(group)"
+                    :disabled="!termQAReport || downloadingTermQAReport"
+                    @click="downloadTermQAReport(termQAReport)"
                   >
-                    <Loader2 v-if="creatingTermBasePair === termBaseSettingGroupKey(group)" class="lucide-spin" :size="14" />
-                    <Plus v-else :size="14" />
-                    创建术语库
+                    <Loader2 v-if="downloadingTermQAReport" class="lucide-spin" :size="14" />
+                    <Download v-else :size="14" />
+                    导出 XLSX
                   </button>
                 </div>
+              </header>
 
-                <div class="term-settings__table-wrap">
-                  <table class="term-settings__table">
-                    <thead>
-                      <tr>
-                        <th>序号</th>
-                        <th>启用</th>
-                        <th>
-                          写入
-                          <span class="term-settings__tip" title="允许在本项目相关入口中编辑、增加和删除该术语库中的术语。">?</span>
-                        </th>
-                        <th>
-                          QA术语库
-                          <span class="term-settings__tip" title="QA术语库为质量检查的标准术语库。勾选“术语不一致”后，系统会用该库检查译文术语一致性。">?</span>
-                        </th>
-                        <th>术语库名称</th>
-                        <th>条目数</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <tr v-if="group.term_bases.length === 0">
-                        <td colspan="6">当前语言对暂无术语库。</td>
-                      </tr>
-                      <tr v-for="(row, rowIndex) in group.term_bases" :key="row.id">
-                        <td>{{ rowIndex + 1 }}</td>
-                        <td>
-                          <input
-                            type="checkbox"
-                            :checked="row.enabled"
-                            @change="toggleTermBaseSetting(row, 'enabled', $event)"
-                          />
-                        </td>
-                        <td>
-                          <input
-                            type="checkbox"
-                            :checked="row.writable"
-                            @change="toggleTermBaseSetting(row, 'writable', $event)"
-                          />
-                        </td>
-                        <td>
-                          <input
-                            type="checkbox"
-                            :checked="row.qa"
-                            @change="toggleTermBaseSetting(row, 'qa', $event)"
-                          />
-                        </td>
-                        <td>{{ row.name }}</td>
-                        <td>{{ row.entry_count }}</td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-              </section>
-            </div>
-
-            <p class="hint-text">
-              启用代表项目工作台会提示专有词汇；写入代表允许本项目相关入口写入术语；QA术语库用于后续“术语不一致”检查。
-            </p>
-
-            <div class="pd-settings-actions">
-              <button
-                class="button button--primary"
-                type="button"
-                :disabled="savingTermBaseSettings || loadingTermBaseSettings"
-                @click="saveProjectTermBaseSettings"
-              >
-                <Loader2 v-if="savingTermBaseSettings" class="lucide-spin" :size="14" />
-                <Settings2 v-else :size="14" />
-                {{ savingTermBaseSettings ? '保存中' : '保存术语库设置' }}
-              </button>
-            </div>
-          </div>
-
-          <div class="pd-settings-divider" aria-hidden="true" />
-
-          <div class="pd-settings-section-head">
-            <div class="section-title section-title--tight">术语 QA 报告</div>
-            <p class="panel-subtitle">检查原文命中的 QA 术语是否在译文中使用了对应译文。</p>
-          </div>
-
-          <div class="term-qa-report">
-            <div class="pd-settings-actions term-qa-report__actions">
-              <button
-                class="button button--primary"
-                type="button"
-                :disabled="generatingTermQAReport"
-                @click="generateProjectTermQAReport"
-              >
-                <Loader2 v-if="generatingTermQAReport" class="lucide-spin" :size="14" />
-                <ShieldCheck v-else :size="14" />
-                {{ generatingTermQAReport ? '生成中' : '生成术语 QA 报告' }}
-              </button>
-              <button
-                class="button"
-                type="button"
-                :disabled="!termQAReport || downloadingTermQAReport"
-                @click="downloadTermQAReport(termQAReport)"
-              >
-                <Loader2 v-if="downloadingTermQAReport" class="lucide-spin" :size="14" />
-                <Download v-else :size="14" />
-                导出 XLSX
-              </button>
-            </div>
-
-            <div v-if="termQAReport" class="term-qa-report__summary">
+              <div class="pd-settings-section-body term-qa-report">
+                <div v-if="termQAReport" class="term-qa-report__summary">
               <span>检查文件：{{ termQAReport.total_files }}</span>
               <span>检查句段：{{ termQAReport.checked_segments }}</span>
               <span>总问题数：{{ termQAReport.issue_count }}</span>
@@ -2457,6 +2504,8 @@ onBeforeUnmount(() => {
                 已显示前 50 条，完整报告请导出 XLSX。
               </p>
             </div>
+              </div>
+            </section>
           </div>
         </div>
       </section>
@@ -3716,39 +3765,56 @@ onBeforeUnmount(() => {
 .pd-tabs {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 0 6px;
-  border-bottom: 1px solid var(--line-soft);
+  gap: 4px;
+  width: fit-content;
+  max-width: 100%;
+  padding: 4px;
+  overflow-x: auto;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--surface-1) 88%, var(--azure-050)), var(--surface-muted));
 }
 
 .pd-tabs__item {
   position: relative;
-  padding: 12px 8px;
-  border: none;
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 7px 12px;
+  border: 1px solid transparent;
+  border-radius: 6px;
   background: transparent;
   color: var(--text-secondary);
   font-size: 14px;
-  font-weight: 500;
+  font-weight: 600;
   box-shadow: none;
+  transition:
+    border-color var(--motion-base) var(--ease-standard),
+    background var(--motion-base) var(--ease-standard),
+    color var(--motion-base) var(--ease-standard),
+    box-shadow var(--motion-base) var(--ease-standard);
 }
 
 .pd-tabs__item::after {
-  content: '';
-  position: absolute;
-  left: 8px;
-  right: 8px;
-  bottom: 0;
-  height: 2px;
-  border-radius: 999px;
-  background: transparent;
+  display: none;
+}
+
+.pd-tabs__item:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--surface-panel) 78%, var(--brand-050));
+  color: var(--brand-700);
 }
 
 .pd-tabs__item.is-active {
-  color: var(--text-primary);
+  border-color: color-mix(in srgb, var(--brand-700) 34%, var(--line-soft));
+  background: var(--surface-panel);
+  color: var(--brand-700);
+  box-shadow:
+    0 8px 18px rgba(17, 49, 42, 0.07),
+    inset 0 -2px 0 color-mix(in srgb, var(--brand-700) 72%, transparent);
 }
 
 .pd-tabs__item.is-active::after {
-  background: var(--brand-700);
+  display: none;
 }
 
 .pd-tabs__item:disabled {
@@ -4774,85 +4840,219 @@ onBeforeUnmount(() => {
   color: var(--state-danger);
 }
 
-.pd-settings-form {
+.pd-settings-panel {
+  padding: 0;
+  overflow: hidden;
+}
+
+.pd-settings-layout {
   display: grid;
-  gap: 14px;
-  padding: 0 16px 16px;
+  grid-template-columns: 140px minmax(0, 1fr);
+  min-height: 520px;
 }
 
-.pd-settings-list {
+.pd-settings-rail {
+  position: sticky;
+  top: 0;
+  align-self: start;
   display: grid;
-  gap: 10px;
-  width: min(620px, 100%);
+  gap: 4px;
+  padding: 12px 10px;
+  border-right: 1px solid var(--line-soft);
+  background: var(--surface-muted);
 }
 
-.pd-settings-row {
-  grid-template-columns: 112px minmax(0, 260px);
-  align-items: center;
-  gap: 10px;
-}
-
-.pd-settings-row--name {
-  grid-template-columns: 112px minmax(0, 360px);
-}
-
-.pd-settings-control {
-  min-height: 36px;
-  max-width: 260px;
-  padding: 7px 10px;
-}
-
-.pd-settings-control--name {
-  max-width: 360px;
-}
-
-.pd-readonly-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(180px, max-content));
-  gap: 6px 28px;
-  width: min(760px, 100%);
-  padding-top: 2px;
-}
-
-.pd-readonly-field {
-  min-width: 0;
+.pd-settings-rail__item {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
-}
-
-.pd-readonly-value {
+  align-items: center;
+  gap: 7px;
   min-width: 0;
+  min-height: 32px;
+  padding: 0 9px;
+  border: 1px solid transparent;
+  border-radius: 6px;
   color: var(--text-secondary);
-  font-size: 13px;
-  line-height: 1.35;
-  word-break: break-word;
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+  transition:
+    border-color var(--motion-base) var(--ease-standard),
+    background var(--motion-base) var(--ease-standard),
+    color var(--motion-base) var(--ease-standard);
 }
 
-.pd-settings-divider {
-  height: 1px;
-  background: var(--line-soft);
+.pd-settings-rail__item:hover {
+  border-color: color-mix(in srgb, var(--brand-700) 22%, var(--line-soft));
+  background: var(--surface-panel);
+  color: var(--brand-700);
 }
 
-.pd-settings-section-head {
+.pd-settings-rail__item svg {
+  flex: 0 0 auto;
+}
+
+.pd-settings-rail__item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-settings-main {
+  min-width: 0;
   display: grid;
-  gap: 2px;
+  align-content: start;
 }
 
-.pd-settings-section-head .section-title {
+.pd-settings-overview {
+  display: grid;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--surface-panel);
+}
+
+.pd-settings-overview__copy {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.pd-settings-overview .section-title {
   margin-bottom: 0;
   font-size: 15px;
 }
 
+.pd-settings-section {
+  scroll-margin-top: 16px;
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.pd-settings-section:last-child {
+  border-bottom: 0;
+}
+
+.pd-settings-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.pd-settings-section-head__copy {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.pd-settings-section-head .section-title {
+  margin-bottom: 0;
+  font-size: 14px;
+}
+
 .pd-settings-section-head .panel-subtitle {
   font-size: 12px;
+  line-height: 1.4;
+}
+
+.pd-settings-section-icon {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid color-mix(in srgb, var(--brand-700) 22%, var(--line-soft));
+  border-radius: 8px;
+  background: var(--brand-050);
+  color: var(--brand-700);
+}
+
+.pd-settings-section:nth-of-type(2) .pd-settings-section-icon {
+  border-color: color-mix(in srgb, var(--state-info) 22%, var(--line-soft));
+  background: var(--state-info-bg);
+  color: var(--state-info);
+}
+
+.pd-settings-section:nth-of-type(3) .pd-settings-section-icon {
+  border-color: color-mix(in srgb, var(--state-warning) 24%, var(--line-soft));
+  background: var(--state-warning-bg);
+  color: var(--state-warning);
+}
+
+.pd-settings-section:nth-of-type(4) .pd-settings-section-icon {
+  border-color: color-mix(in srgb, var(--state-success) 24%, var(--line-soft));
+  background: var(--state-success-bg);
+  color: var(--state-success);
+}
+
+.pd-settings-section-body {
+  display: grid;
+  gap: 12px;
+}
+
+.pd-settings-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.pd-settings-row {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+}
+
+.pd-settings-row--name {
+  grid-column: 1 / -1;
+}
+
+.pd-settings-control,
+.pd-settings-control--name {
+  width: 100%;
+  min-height: 34px;
+  max-width: none;
+  padding: 6px 10px;
+}
+
+.pd-readonly-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.pd-readonly-field {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-muted) 72%, var(--surface-panel));
+}
+
+.pd-readonly-value {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
   line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-settings-divider {
+  display: none;
 }
 
 .pd-guidelines-editor {
   resize: vertical;
-  min-height: 120px;
-  max-height: 400px;
+  min-height: 150px;
+  max-height: 420px;
   font-size: 13px;
   line-height: 1.6;
   font-family: inherit;
@@ -4860,13 +5060,27 @@ onBeforeUnmount(() => {
 
 .pd-settings-actions {
   display: flex;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 6px;
   justify-content: flex-start;
 }
 
+.pd-settings-panel .button {
+  min-height: 32px;
+  padding: 5px 10px;
+  gap: 5px;
+  font-size: 13px;
+}
+
+.pd-settings-panel .button .lucide {
+  width: 14px;
+  height: 14px;
+}
+
 .pd-settings-save {
-  min-height: 34px;
-  padding: 6px 12px;
+  flex: 0 0 auto;
+  min-height: 32px;
+  padding: 5px 10px;
   font-size: 13px;
 }
 
@@ -4874,33 +5088,42 @@ onBeforeUnmount(() => {
 .term-settings__groups,
 .term-qa-report {
   display: grid;
-  gap: 14px;
+  gap: 10px;
 }
 
 .term-settings__group {
   display: grid;
-  gap: 10px;
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
 }
 
-.term-settings__group-head,
-.term-qa-report__summary {
+.term-settings__group-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
   flex-wrap: wrap;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--surface-muted) 64%, var(--surface-panel));
 }
 
-.term-settings__group-head > div,
-.term-qa-report__summary {
+.term-settings__group-head > div {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
   color: var(--text-muted);
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .term-settings__group-head strong {
-  display: block;
+  overflow: hidden;
   color: var(--text-primary);
-  font-size: 14px;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .term-settings__table-wrap,
@@ -4908,31 +5131,80 @@ onBeforeUnmount(() => {
   overflow-x: auto;
   border: 1px solid var(--line-soft);
   border-radius: 8px;
+  background: var(--surface-panel);
+}
+
+.term-settings__table-wrap {
+  border: 0;
+  border-radius: 0;
 }
 
 .term-settings__table,
 .term-qa-report__table {
   width: 100%;
-  min-width: 720px;
   border-collapse: collapse;
   font-size: 13px;
+}
+
+.term-settings__table {
+  min-width: 520px;
+  table-layout: fixed;
+}
+
+.term-qa-report__table {
+  min-width: 720px;
 }
 
 .term-settings__table th,
 .term-settings__table td,
 .term-qa-report__table th,
 .term-qa-report__table td {
-  padding: 10px 12px;
+  padding: 9px 10px;
   border-bottom: 1px solid var(--line-soft);
+  color: var(--text-secondary);
   text-align: left;
-  vertical-align: top;
+  vertical-align: middle;
 }
 
 .term-settings__table th,
 .term-qa-report__table th {
   color: var(--text-muted);
+  font-weight: 700;
+  background: color-mix(in srgb, var(--surface-muted) 82%, var(--surface-panel));
+}
+
+.term-settings__table th:first-child,
+.term-settings__table td:first-child {
+  text-align: left;
+}
+
+.term-settings__table th:not(:first-child),
+.term-settings__table td:not(:first-child) {
+  text-align: center;
+}
+
+.term-settings__table th:first-child {
+  width: 58%;
+}
+
+.term-settings__name,
+.term-settings__meta {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.term-settings__name {
+  color: var(--text-primary);
   font-weight: 600;
-  background: var(--surface-muted);
+}
+
+.term-settings__meta {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 12px;
 }
 
 .term-settings__table tr:last-child td,
@@ -4940,18 +5212,69 @@ onBeforeUnmount(() => {
   border-bottom: 0;
 }
 
-.term-settings__table input[type='checkbox'] {
-  width: 16px;
-  height: 16px;
-  accent-color: var(--brand-700);
+.term-settings__toggle {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 20px;
+  cursor: pointer;
+}
+
+.term-settings__toggle input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.term-settings__toggle span {
+  position: relative;
+  width: 34px;
+  height: 20px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface-muted) 78%, var(--surface-panel));
+  transition:
+    border-color var(--motion-base) var(--ease-standard),
+    background var(--motion-base) var(--ease-standard);
+}
+
+.term-settings__toggle span::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  transition:
+    background var(--motion-base) var(--ease-standard),
+    transform var(--motion-base) var(--ease-standard);
+}
+
+.term-settings__toggle input:checked + span {
+  border-color: var(--brand-700);
+  background: color-mix(in srgb, var(--brand-700) 82%, var(--brand-500));
+}
+
+.term-settings__toggle input:checked + span::after {
+  background: #ffffff;
+  transform: translateX(15px);
+}
+
+.term-settings__toggle input:focus-visible + span {
+  box-shadow: var(--focus-ring);
 }
 
 .term-settings__tip {
   display: inline-grid;
   place-items: center;
-  width: 16px;
-  height: 16px;
-  margin-left: 4px;
+  width: 15px;
+  height: 15px;
+  margin-left: 3px;
   border-radius: 50%;
   color: var(--brand-700);
   background: color-mix(in srgb, var(--brand-700) 12%, transparent);
@@ -4960,7 +5283,25 @@ onBeforeUnmount(() => {
 }
 
 .term-qa-report__actions {
-  justify-content: flex-start;
+  justify-content: flex-end;
+}
+
+.term-qa-report__summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 8px;
+}
+
+.term-qa-report__summary span {
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-muted) 72%, var(--surface-panel));
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 960px) {
@@ -4977,8 +5318,24 @@ onBeforeUnmount(() => {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .pd-readonly-grid {
+  .pd-settings-layout {
     grid-template-columns: 1fr;
+  }
+
+  .pd-settings-rail {
+    position: static;
+    display: flex;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--line-soft);
+  }
+
+  .pd-settings-rail__item {
+    flex: 0 0 auto;
+  }
+
+  .pd-readonly-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .pd-statistics-summary {
@@ -5013,6 +5370,36 @@ onBeforeUnmount(() => {
   .pd-settings-list,
   .pd-readonly-grid {
     grid-template-columns: 1fr;
+  }
+
+  .pd-settings-section-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .pd-settings-section {
+    padding: 16px;
+  }
+
+  .pd-settings-section-head__copy {
+    grid-template-columns: 34px minmax(0, 1fr);
+  }
+
+  .pd-settings-actions,
+  .term-qa-report__actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .pd-settings-actions .button {
+    flex: 1 1 140px;
+    justify-content: center;
+  }
+
+  .pd-settings-save {
+    flex: 0 0 auto;
+    width: 100%;
+    justify-content: center;
   }
 
   .pd-settings-row,
@@ -5057,6 +5444,34 @@ onBeforeUnmount(() => {
   .pd-settings-control,
   .pd-settings-control--name {
     max-width: none;
+  }
+
+  .term-settings__table {
+    min-width: 0;
+  }
+
+  .term-settings__table th,
+  .term-settings__table td {
+    padding: 8px 6px;
+  }
+
+  .term-settings__table th:first-child {
+    width: 52%;
+  }
+
+  .term-settings__table th:not(:first-child),
+  .term-settings__table td:not(:first-child) {
+    width: 16%;
+  }
+
+  .term-settings__name,
+  .term-settings__meta {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .term-settings__tip {
+    display: none;
   }
 
   .pd-statistics-summary {

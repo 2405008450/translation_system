@@ -1,3 +1,4 @@
+import { ref } from 'vue'
 import { createRouter, createWebHistory } from 'vue-router'
 
 import { useAuthStore } from '../stores/auth'
@@ -15,6 +16,39 @@ import TMManagementView from '../views/TMManagementView.vue'
 import TranslationRulesView from '../views/TranslationRulesView.vue'
 import UserManagementView from '../views/UserManagementView.vue'
 import WorkbenchView from '../views/WorkbenchView.vue'
+
+export const routeLoading = ref(false)
+
+let routeLoadingShowTimer: ReturnType<typeof setTimeout> | null = null
+let routeLoadingHideTimer: ReturnType<typeof setTimeout> | null = null
+
+function startRouteLoading() {
+  if (routeLoadingHideTimer) {
+    clearTimeout(routeLoadingHideTimer)
+    routeLoadingHideTimer = null
+  }
+  if (routeLoading.value || routeLoadingShowTimer) {
+    return
+  }
+  routeLoadingShowTimer = setTimeout(() => {
+    routeLoading.value = true
+    routeLoadingShowTimer = null
+  }, 80)
+}
+
+function stopRouteLoading() {
+  if (routeLoadingShowTimer) {
+    clearTimeout(routeLoadingShowTimer)
+    routeLoadingShowTimer = null
+  }
+  if (!routeLoading.value) {
+    return
+  }
+  routeLoadingHideTimer = setTimeout(() => {
+    routeLoading.value = false
+    routeLoadingHideTimer = null
+  }, 220)
+}
 
 const router = createRouter({
   history: createWebHistory(),
@@ -216,6 +250,7 @@ function isExternalTranslatorBlockedRoute(name: unknown) {
 }
 
 router.beforeEach(async (to) => {
+  startRouteLoading()
   const authStore = useAuthStore()
   if (!authStore.ready) {
     await authStore.bootstrap()
@@ -241,6 +276,14 @@ router.beforeEach(async (to) => {
   }
 
   return true
+})
+
+router.afterEach(() => {
+  stopRouteLoading()
+})
+
+router.onError(() => {
+  stopRouteLoading()
 })
 
 export default router

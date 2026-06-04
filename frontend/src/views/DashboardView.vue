@@ -20,6 +20,7 @@ import type {
   AnalyticsDashboardResponse,
   AnalyticsGranularity,
   AnalyticsSeriesPoint,
+  AnalyticsUserStat,
 } from '../types/api'
 
 type SeriesKey = keyof Pick<
@@ -55,6 +56,7 @@ const chartPadding = {
 const summary = computed(() => dashboard.value?.summary)
 const series = computed(() => dashboard.value?.series ?? [])
 const topLanguagePairs = computed(() => (dashboard.value?.language_pairs ?? []).slice(0, 8))
+const userStats = computed(() => [...(dashboard.value?.user_stats ?? [])].sort(compareUserStats))
 const hasSeriesData = computed(() => series.value.some((item) => (
   item.project_created_count
   || item.translated_source_word_count
@@ -163,6 +165,74 @@ function formatNumber(value: number | null | undefined, maximumFractionDigits = 
   return Number(value || 0).toLocaleString('zh-CN', {
     maximumFractionDigits,
   })
+}
+
+function formatDuration(minutes: number | null | undefined) {
+  const totalMinutes = Math.max(0, Math.round(Number(minutes || 0)))
+  const hours = Math.floor(totalMinutes / 60)
+  const remainingMinutes = totalMinutes % 60
+  if (hours > 0 && remainingMinutes > 0) {
+    return t('dashboard.userStats.durationHoursMinutes', { hours, minutes: remainingMinutes })
+  }
+  if (hours > 0) {
+    return t('dashboard.userStats.durationHours', { hours })
+  }
+  return t('dashboard.userStats.durationMinutes', { minutes: totalMinutes })
+}
+
+function formatDateTime(value: string | null | undefined) {
+  if (!value) {
+    return '--'
+  }
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return '--'
+  }
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date)
+}
+
+function compareUserStats(left: AnalyticsUserStat, right: AnalyticsUserStat) {
+  return (
+    Number(right.total_source_word_count || 0) - Number(left.total_source_word_count || 0)
+    || Number(right.estimated_active_minutes || 0) - Number(left.estimated_active_minutes || 0)
+    || Number(right.request_count || 0) - Number(left.request_count || 0)
+    || left.display_name.localeCompare(right.display_name, 'zh-CN')
+  )
+}
+
+function getUserRoleLabel(user: AnalyticsUserStat) {
+  if (!user.user_id) {
+    return t('dashboard.userStats.historicalRole')
+  }
+  if (user.role === 'super_admin') {
+    return t('common.roles.superAdmin')
+  }
+  if (user.role === 'admin') {
+    return t('common.roles.admin')
+  }
+  return t('common.roles.user')
+}
+
+function getTranslatorTypeLabel(user: AnalyticsUserStat) {
+  if (!user.user_id || user.role !== 'user') {
+    return ''
+  }
+  return user.translator_type === 'internal'
+    ? t('dashboard.userStats.internalTranslator')
+    : t('dashboard.userStats.externalTranslator')
+}
+
+function getUserStatusLabel(user: AnalyticsUserStat) {
+  if (!user.user_id) {
+    return t('dashboard.userStats.historicalStatus')
+  }
+  return user.is_active ? t('dashboard.userStats.activeStatus') : t('dashboard.userStats.disabledStatus')
 }
 
 function getChartMax(lines: LineSpec[]) {
@@ -397,6 +467,64 @@ onMounted(() => {
           <div v-else class="dashboard-empty">{{ t('dashboard.empty.series') }}</div>
         </article>
 
+        <article class="dashboard-panel dashboard-panel--full">
+          <div class="dashboard-panel__header">
+            <div>
+              <h3>{{ t('dashboard.userStats.title') }}</h3>
+              <p>{{ t('dashboard.userStats.hint') }}</p>
+            </div>
+            <Users :size="20" />
+          </div>
+          <div v-if="userStats.length" class="user-stats-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>{{ t('dashboard.userStats.account') }}</th>
+                  <th>{{ t('dashboard.userStats.roleStatus') }}</th>
+                  <th>{{ t('dashboard.userStats.activeTime') }}</th>
+                  <th>{{ t('dashboard.userStats.activeDays') }}</th>
+                  <th>{{ t('dashboard.userStats.requests') }}</th>
+                  <th>{{ t('dashboard.userStats.newWords') }}</th>
+                  <th>{{ t('dashboard.userStats.modifiedWords') }}</th>
+                  <th>{{ t('dashboard.userStats.totalWords') }}</th>
+                  <th>{{ t('dashboard.userStats.lastSeen') }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="user in userStats" :key="user.user_id || 'unassigned'">
+                  <td>
+                    <div class="user-stat-account">
+                      <strong>{{ user.display_name }}</strong>
+                      <span>{{ user.username || t('dashboard.userStats.unassignedUsername') }}</span>
+                    </div>
+                  </td>
+                  <td>
+                    <div class="user-stat-role">
+                      <span class="user-stat-chip" :class="{ 'is-muted': !user.user_id }">
+                        {{ getUserRoleLabel(user) }}
+                      </span>
+                      <small>
+                        {{ getUserStatusLabel(user) }}
+                        <template v-if="getTranslatorTypeLabel(user)">
+                          / {{ getTranslatorTypeLabel(user) }}
+                        </template>
+                      </small>
+                    </div>
+                  </td>
+                  <td>{{ formatDuration(user.estimated_active_minutes) }}</td>
+                  <td>{{ formatNumber(user.active_day_count) }}</td>
+                  <td>{{ formatNumber(user.request_count) }}</td>
+                  <td>{{ formatNumber(user.new_source_word_count) }}</td>
+                  <td>{{ formatNumber(user.modified_source_word_count) }}</td>
+                  <td><strong>{{ formatNumber(user.total_source_word_count) }}</strong></td>
+                  <td>{{ formatDateTime(user.last_seen_at) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-else class="dashboard-empty">{{ t('dashboard.empty.userStats') }}</div>
+        </article>
+
         <article class="dashboard-panel">
           <div class="dashboard-panel__header">
             <div>
@@ -618,6 +746,10 @@ onMounted(() => {
   grid-column: span 1;
 }
 
+.dashboard-panel--full {
+  grid-column: 1 / -1;
+}
+
 .dashboard-panel__header {
   display: flex;
   align-items: flex-start;
@@ -744,6 +876,84 @@ onMounted(() => {
 
 .source-breakdown__item small {
   grid-column: 1 / -1;
+}
+
+.user-stats-table {
+  overflow-x: auto;
+}
+
+.user-stats-table table {
+  width: 100%;
+  min-width: 980px;
+  border-collapse: collapse;
+}
+
+.user-stats-table th,
+.user-stats-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--text-primary);
+  font-size: 13px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.user-stats-table th {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--surface-muted);
+}
+
+.user-stats-table th:first-child,
+.user-stats-table th:nth-child(2),
+.user-stats-table td:first-child,
+.user-stats-table td:nth-child(2) {
+  text-align: left;
+}
+
+.user-stats-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.user-stat-account,
+.user-stat-role {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.user-stat-account strong {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-stat-account span,
+.user-stat-role small {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.user-stat-chip {
+  display: inline-flex;
+  width: max-content;
+  max-width: 140px;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: #0f766e;
+  background: rgba(15, 118, 110, 0.1);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.user-stat-chip.is-muted {
+  color: #475569;
+  background: rgba(71, 85, 105, 0.1);
 }
 
 .dashboard-state,

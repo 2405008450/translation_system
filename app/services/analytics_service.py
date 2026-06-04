@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from copy import deepcopy
 from threading import Lock
@@ -81,6 +82,7 @@ def record_user_activity(db: Session, user_id: UUID, activity_date: date | None 
         existing.request_count += 1
         existing.last_seen_at = now
         db.add(existing)
+        _clear_dashboard_cache()
         return existing
 
     activity = UserActivityDaily(
@@ -216,6 +218,7 @@ def get_dashboard_payload(db: Session, granularity: str = "day") -> dict:
         llm_processed_source_words=llm_processed_source_words,
     )
     series = _build_series(db, labels, start_date, start_at, normalized_granularity)
+    user_stats = _build_user_stats(db, start_date=start_date, start_at=start_at)
 
     payload = {
         "granularity": normalized_granularity,
@@ -223,6 +226,7 @@ def get_dashboard_payload(db: Session, granularity: str = "day") -> dict:
         "series": series,
         "language_pairs": language_pairs,
         "source_breakdown": source_breakdown,
+        "user_stats": user_stats,
     }
     _set_cached_dashboard_payload(cache_key, payload)
     return deepcopy(payload)
@@ -633,6 +637,171 @@ def _build_series_postgres(
         }
         for label in labels
     ]
+
+
+def _build_user_stats(db: Session, *, start_date: date, start_at: datetime) -> list[dict]:
+    stats_by_key: dict[str | None, dict] = {}
+    user_id_values: dict[str, UUID | str] = {}
+
+    def ensure_user_stat(user_id: UUID | str | None) -> dict:
+        key = str(user_id) if user_id is not None else None
+        if key not in stats_by_key:
+            stats_by_key[key] = {
+                "user_id": key,
+                "username": "unassigned" if key is None else None,
+                "nickname": "未归属/历史数据" if key is None else None,
+                "role": None,
+                "translator_type": None,
+                "is_active": False,
+                "display_name": "未归属/历史数据" if key is None else "未知用户",
+                "active_day_count": 0,
+                "request_count": 0,
+                "estimated_active_minutes": 0,
+                "first_seen_at": None,
+                "last_seen_at": None,
+                "new_source_word_count": 0,
+                "modified_source_word_count": 0,
+                "total_source_word_count": 0,
+                "event_count": 0,
+                "_activity_dates": set(),
+                "_first_seen_at": None,
+                "_last_seen_at": None,
+            }
+        if key is not None and user_id is not None:
+            user_id_values[key] = user_id
+        return stats_by_key[key]
+
+    activities = (
+        db.query(
+            UserActivityDaily.user_id,
+            UserActivityDaily.activity_date,
+            UserActivityDaily.request_count,
+            UserActivityDaily.first_seen_at,
+            UserActivityDaily.last_seen_at,
+        )
+        .filter(UserActivityDaily.activity_date >= start_date)
+        .all()
+    )
+    for user_id, activity_date, request_count, first_seen_at, last_seen_at in activities:
+        stat = ensure_user_stat(user_id)
+        stat["_activity_dates"].add(str(activity_date))
+        stat["request_count"] += int(request_count or 0)
+        stat["estimated_active_minutes"] += _estimate_active_minutes(
+            first_seen_at,
+            last_seen_at,
+            request_count,
+        )
+        stat["_first_seen_at"] = _min_datetime(stat["_first_seen_at"], first_seen_at)
+        stat["_last_seen_at"] = _max_datetime(stat["_last_seen_at"], last_seen_at)
+
+    event_rows = (
+        db.query(
+            TranslationMetricEvent.user_id,
+            func.count(TranslationMetricEvent.id),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            TranslationMetricEvent.target_was_empty.is_(True),
+                            TranslationMetricEvent.source_word_count,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            TranslationMetricEvent.target_was_empty.is_(False),
+                            TranslationMetricEvent.source_word_count,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ),
+        )
+        .filter(TranslationMetricEvent.created_at >= start_at)
+        .group_by(TranslationMetricEvent.user_id)
+        .all()
+    )
+    for user_id, event_count, new_source_words, modified_source_words in event_rows:
+        stat = ensure_user_stat(user_id)
+        stat["event_count"] += int(event_count or 0)
+        stat["new_source_word_count"] += int(new_source_words or 0)
+        stat["modified_source_word_count"] += int(modified_source_words or 0)
+        stat["total_source_word_count"] = (
+            stat["new_source_word_count"] + stat["modified_source_word_count"]
+        )
+
+    if user_id_values:
+        users = db.query(User).filter(User.id.in_(list(user_id_values.values()))).all()
+        for user in users:
+            key = str(user.id)
+            stat = stats_by_key.get(key)
+            if stat is None:
+                continue
+            display_name = (getattr(user, "nickname", None) or "").strip() or user.username
+            stat.update(
+                {
+                    "username": user.username,
+                    "nickname": getattr(user, "nickname", None),
+                    "role": user.role,
+                    "translator_type": getattr(user, "translator_type", None),
+                    "is_active": bool(user.is_active),
+                    "display_name": display_name,
+                }
+            )
+
+    items: list[dict] = []
+    for stat in stats_by_key.values():
+        stat["active_day_count"] = len(stat.pop("_activity_dates"))
+        first_seen_at = stat.pop("_first_seen_at")
+        last_seen_at = stat.pop("_last_seen_at")
+        stat["first_seen_at"] = first_seen_at.isoformat() if first_seen_at else None
+        stat["last_seen_at"] = last_seen_at.isoformat() if last_seen_at else None
+        items.append(stat)
+
+    return sorted(
+        items,
+        key=lambda item: (
+            -int(item["total_source_word_count"] or 0),
+            -int(item["estimated_active_minutes"] or 0),
+            -int(item["request_count"] or 0),
+            item["display_name"] or "",
+        ),
+    )
+
+
+def _estimate_active_minutes(
+    first_seen_at: datetime | None,
+    last_seen_at: datetime | None,
+    request_count: int | None,
+) -> int:
+    if int(request_count or 0) <= 0:
+        return 0
+    if first_seen_at is None or last_seen_at is None:
+        return 1
+    elapsed_seconds = max((last_seen_at - first_seen_at).total_seconds(), 0)
+    return max(1, math.ceil(elapsed_seconds / 60))
+
+
+def _min_datetime(current_value: datetime | None, next_value: datetime | None) -> datetime | None:
+    if next_value is None:
+        return current_value
+    if current_value is None or next_value < current_value:
+        return next_value
+    return current_value
+
+
+def _max_datetime(current_value: datetime | None, next_value: datetime | None) -> datetime | None:
+    if next_value is None:
+        return current_value
+    if current_value is None or next_value > current_value:
+        return next_value
+    return current_value
 
 
 def _build_language_pairs(db: Session) -> list[dict]:

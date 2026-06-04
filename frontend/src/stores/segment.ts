@@ -47,6 +47,27 @@ function hasEmptyTarget(value: string | null | undefined) {
   return !(value || '').trim()
 }
 
+function normalizeMatchText(value: string | null | undefined) {
+  return (value || '').trim().replace(/\s+/g, ' ').toLowerCase()
+}
+
+function resolveUnconfirmedSegmentStatus(segment: Segment, targetText = segment.target_text) {
+  if (hasEmptyTarget(targetText)) {
+    return 'none'
+  }
+
+  const sourceText = normalizeMatchText(segment.source_text)
+  const matchedSourceText = normalizeMatchText(segment.matched_source_text)
+  const score = Number(segment.score || 0)
+  if (score >= 0.999 || (matchedSourceText && matchedSourceText === sourceText)) {
+    return 'exact'
+  }
+  if (score > 0 || matchedSourceText) {
+    return 'fuzzy'
+  }
+  return 'none'
+}
+
 function normalizePositiveInt(value: unknown, fallback: number) {
   const numberValue = Number(value)
   if (!Number.isFinite(numberValue)) {
@@ -807,13 +828,19 @@ export const useSegmentStore = defineStore('segment', () => {
     previewUpdateToken.value += 1
   }
 
-  function updateTarget(sentenceId: string, targetText: string, targetHtml?: string) {
+  function updateTarget(
+    sentenceId: string,
+    targetText: string,
+    targetHtml?: string,
+    options: { confirm?: boolean } = {},
+  ) {
     const index = getSegmentIndex(sentenceId)
     if (index === -1) {
       return
     }
 
     const segment = segments.value[index]
+    const confirm = options.confirm === true
     if (revisionTrackingEnabled.value) {
       upsertLocalRevisionDraft(segment, targetText)
     }
@@ -822,7 +849,7 @@ export const useSegmentStore = defineStore('segment', () => {
       target_text: targetText,
       target_html: targetHtml || null,
       source: 'manual',
-      status: 'confirmed',
+      status: confirm ? 'confirmed' : resolveUnconfirmedSegmentStatus(segment, targetText),
       llm_provider: null,
       llm_model: null,
     }
@@ -839,6 +866,7 @@ export const useSegmentStore = defineStore('segment', () => {
         source: 'manual',
         track_revision: revisionTrackingEnabled.value,
         base_version: segment.version ?? 1,
+        confirm,
       },
     }
     const nextConflicts = { ...conflictEntries.value }
@@ -972,6 +1000,7 @@ export const useSegmentStore = defineStore('segment', () => {
           && currentEntry.target_text === update.target_text
           && (currentEntry.target_html || null) === (update.target_html || null)
           && currentEntry.source === update.source
+          && Boolean(currentEntry.confirm) === Boolean(update.confirm)
           && (updatedSentenceIds.size === 0 || updatedSentenceIds.has(update.sentence_id))
           && !conflictSentenceIds.has(update.sentence_id)
         ) {
@@ -1076,7 +1105,7 @@ export const useSegmentStore = defineStore('segment', () => {
     })
     upsertRevisionEntry(data)
     // 接受修订：将 after_text 应用到 segment
-    applyLLMUpdate(data.sentence_id, data.after_text, data.source, 'confirmed')
+    applyLLMUpdate(data.sentence_id, data.after_text, data.source)
     return data
   }
 
@@ -1087,7 +1116,7 @@ export const useSegmentStore = defineStore('segment', () => {
     })
     upsertRevisionEntry(data)
     // 拒绝修订：恢复 before_text 到 segment
-    applyLLMUpdate(data.sentence_id, data.before_text, data.source, 'confirmed')
+    applyLLMUpdate(data.sentence_id, data.before_text, data.source)
     return data
   }
 
@@ -1152,7 +1181,7 @@ export const useSegmentStore = defineStore('segment', () => {
     })
     upsertRevisionEntry(data)
     // 应用新的文本到 segment
-    applyLLMUpdate(data.sentence_id, newText, data.source, 'confirmed')
+    applyLLMUpdate(data.sentence_id, newText, data.source)
     return data
   }
 
@@ -1160,7 +1189,7 @@ export const useSegmentStore = defineStore('segment', () => {
     sentenceId: string,
     targetText: string,
     source = 'llm',
-    status = 'confirmed',
+    status?: string | null,
     llmInfo: { provider?: string | null, model?: string | null } = {},
   ) {
     const index = getSegmentIndex(sentenceId)
@@ -1170,11 +1199,12 @@ export const useSegmentStore = defineStore('segment', () => {
 
     const currentSegment = segments.value[index]
     const isLLMSource = source === 'llm'
+    const nextStatus = status || resolveUnconfirmedSegmentStatus(currentSegment, targetText)
     const nextSegment = {
       ...currentSegment,
       target_text: targetText,
       source,
-      status,
+      status: nextStatus,
       llm_provider: isLLMSource ? (llmInfo.provider ?? currentSegment.llm_provider ?? null) : null,
       llm_model: isLLMSource ? (llmInfo.model ?? currentSegment.llm_model ?? null) : null,
     }
@@ -1304,7 +1334,7 @@ export const useSegmentStore = defineStore('segment', () => {
         String(data.sentence_id || ''),
         String(data.target_text || ''),
         String(data.source || 'llm'),
-        'confirmed',
+        typeof data.status === 'string' ? data.status : undefined,
         {
           provider: typeof data.provider === 'string' ? data.provider : null,
           model: typeof data.model === 'string' ? data.model : null,
