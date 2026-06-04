@@ -27,7 +27,7 @@ const segmentStatusMap: Record<string, StatusMeta> = {
 const sourceStatusMap: Record<string, StatusMeta> = {
   manual: { value: 'manual', label: '人工', tone: 'info' },
   llm: { value: 'llm', label: 'AI', tone: 'success' },
-  tm: { value: 'tm', label: '记忆库', tone: 'default' },
+  tm: { value: 'tm', label: 'TM', tone: 'default' },
   exact: { value: 'exact', label: '精确匹配', tone: 'success' },
   fuzzy: { value: 'fuzzy', label: '模糊匹配', tone: 'warning' },
 }

@@ -72,6 +72,9 @@ from app.services.analytics_service import (
 from app.services.auto_tm_sync import (
     AutoTMEnqueueSummary,
     enqueue_confirmed_segments_for_auto_tm,
+    process_due_auto_tm_rematches,
+    refresh_unconfirmed_segment_matches,
+    register_project_collections_rematch_work,
     run_auto_tm_background_once,
 )
 from app.services.adapters.dita_exporter import DitaExporter
@@ -953,6 +956,25 @@ class FileRecordBindingsRequest(BaseModel):
     term_base_write_ids: list[UUID] | None = None
     qa_term_base_ids: list[UUID] | None = None
     collection_id: UUID | None = None
+    collection_ids: list[UUID] | None = None
+
+
+class ProjectTranslationMemoryFileSettingPayload(BaseModel):
+    file_record_id: UUID
+    collection_ids: list[UUID] = Field(default_factory=list)
+    primary_collection_id: UUID | None = None
+
+
+class ProjectTranslationMemorySettingPayload(BaseModel):
+    source_language: str
+    target_language: str
+    collection_ids: list[UUID] = Field(default_factory=list)
+    primary_collection_id: UUID | None = None
+    files: list[ProjectTranslationMemoryFileSettingPayload] = Field(default_factory=list)
+
+
+class ProjectTranslationMemorySettingsRequest(BaseModel):
+    settings: list[ProjectTranslationMemorySettingPayload] = Field(default_factory=list)
 
 
 class ProjectTermBaseSettingPayload(BaseModel):
@@ -3002,6 +3024,92 @@ def _serialize_project_term_base_settings(
     }
 
 
+def _serialize_project_translation_memory_settings(
+    db: Session,
+    project: Project,
+    files: list[FileRecord],
+) -> dict[str, Any]:
+    pair_map = _project_file_language_pair_map(files)
+    collections = db.query(MemoryBase).order_by(MemoryBase.name.asc(), MemoryBase.created_at.desc()).all()
+    collection_ids = [collection.id for collection in collections]
+    entry_counts: dict[UUID, int] = {}
+    if collection_ids:
+        entry_counts = {
+            collection_id: int(entry_count or 0)
+            for collection_id, entry_count in (
+                db.query(MemoryEntry.collection_id, func.count(MemoryEntry.id))
+                .filter(MemoryEntry.collection_id.in_(collection_ids))
+                .group_by(MemoryEntry.collection_id)
+                .all()
+            )
+        }
+
+    groups: list[dict[str, Any]] = []
+    for source_language, target_language in sorted(pair_map):
+        group_files = pair_map[(source_language, target_language)]
+        group_collections = [
+            collection
+            for collection in collections
+            if collection.source_language == source_language and collection.target_language == target_language
+        ]
+        groups.append({
+            "source_language": source_language,
+            "target_language": target_language,
+            "file_count": len(group_files),
+            "collections": [
+                {
+                    "id": str(collection.id),
+                    "name": collection.name,
+                    "description": collection.description,
+                    "source_language": collection.source_language,
+                    "target_language": collection.target_language,
+                    "entry_count": entry_counts.get(collection.id, 0),
+                }
+                for collection in group_collections
+            ],
+            "files": [
+                {
+                    "id": str(file_record.id),
+                    "filename": file_record.filename,
+                    "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
+                    "collection_ids": [
+                        str(collection_id)
+                        for collection_id in _load_file_record_collection_ids(file_record)
+                    ],
+                }
+                for file_record in group_files
+            ],
+        })
+
+    return {
+        "project_id": str(project.id),
+        "groups": groups,
+    }
+
+
+def _validate_tm_setting_collection_ids(
+    db: Session,
+    ids: list[UUID],
+    source_language: str,
+    target_language: str,
+) -> list[MemoryBase]:
+    collections = _validate_collection_ids(db, ids) or []
+    collection_rows = (
+        db.query(MemoryBase)
+        .filter(MemoryBase.id.in_(collections))
+        .all()
+        if collections
+        else []
+    )
+    collection_by_id = {collection.id: collection for collection in collection_rows}
+    for collection_id in collections:
+        collection = collection_by_id.get(collection_id)
+        if collection is None:
+            raise HTTPException(status_code=404, detail="选择的记忆库不存在。")
+        _ensure_resource_language_pair_matches(collection, source_language, target_language, "记忆库")
+    return [collection_by_id[collection_id] for collection_id in collections]
+
+
 def _validate_term_base_setting_ids(
     db: Session,
     ids: list[UUID],
@@ -3601,6 +3709,109 @@ def update_project_term_base_settings(
         .all()
     )
     return _serialize_project_term_base_settings(db, project, files)
+
+
+@router.get("/projects/{project_id}/translation-memory-settings")
+def get_project_translation_memory_settings(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    project = _get_project_or_404(db, project_id)
+    files = (
+        db.query(FileRecord)
+        .filter(FileRecord.project_id == project_id)
+        .order_by(FileRecord.created_at.asc(), FileRecord.id.asc())
+        .all()
+    )
+    return _serialize_project_translation_memory_settings(db, project, files)
+
+
+@router.patch("/projects/{project_id}/translation-memory-settings")
+def update_project_translation_memory_settings(
+    project_id: UUID,
+    payload: ProjectTranslationMemorySettingsRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    project = _get_project_or_404(db, project_id)
+    files = (
+        db.query(FileRecord)
+        .filter(FileRecord.project_id == project_id)
+        .order_by(FileRecord.created_at.asc(), FileRecord.id.asc())
+        .all()
+    )
+    pair_map = _project_file_language_pair_map(files)
+    files_by_id = {file_record.id: file_record for file_record in files}
+    changed_files: list[FileRecord] = []
+
+    for item in payload.settings:
+        source_language, target_language = _require_tm_language_pair(
+            item.source_language,
+            item.target_language,
+        )
+        group_files = pair_map.get((source_language, target_language))
+        if not group_files:
+            raise HTTPException(status_code=400, detail="项目中不存在该语言对的文件。")
+
+        if item.files:
+            file_payloads = item.files
+        else:
+            file_payloads = [
+                ProjectTranslationMemoryFileSettingPayload(
+                    file_record_id=file_record.id,
+                    collection_ids=item.collection_ids,
+                    primary_collection_id=item.primary_collection_id,
+                )
+                for file_record in group_files
+            ]
+
+        group_file_ids = {file_record.id for file_record in group_files}
+        for file_payload in file_payloads:
+            file_record = files_by_id.get(file_payload.file_record_id)
+            if file_record is None or file_record.id not in group_file_ids:
+                raise HTTPException(status_code=404, detail="文件不存在或不属于当前项目语言对。")
+
+            selected_ids = list(dict.fromkeys(file_payload.collection_ids))
+            _validate_tm_setting_collection_ids(db, selected_ids, source_language, target_language)
+            primary_collection_id = file_payload.primary_collection_id
+            if primary_collection_id is not None and primary_collection_id not in selected_ids:
+                raise HTTPException(status_code=400, detail="主写入记忆库必须包含在绑定记忆库列表中。")
+            if primary_collection_id is None and selected_ids:
+                primary_collection_id = selected_ids[0]
+
+            before = (
+                tuple(_load_file_record_collection_ids(file_record)),
+                file_record.collection_id,
+            )
+            _store_file_record_collection_ids(file_record, selected_ids)
+            file_record.collection_id = primary_collection_id
+            after = (
+                tuple(_load_file_record_collection_ids(file_record)),
+                file_record.collection_id,
+            )
+            if before != after:
+                changed_files.append(file_record)
+
+    db.flush()
+    initial_match_updated_count = 0
+    for file_record in list(dict.fromkeys(changed_files)):
+        initial_match_updated_count += refresh_unconfirmed_segment_matches(
+            db,
+            file_record_id=file_record.id,
+            collection_ids=_load_file_record_collection_ids(file_record),
+        )
+
+    db.commit()
+    files = (
+        db.query(FileRecord)
+        .filter(FileRecord.project_id == project_id)
+        .order_by(FileRecord.created_at.asc(), FileRecord.id.asc())
+        .all()
+    )
+    response = _serialize_project_translation_memory_settings(db, project, files)
+    response["initial_match_updated_count"] = initial_match_updated_count
+    return response
 
 
 @router.post("/projects/{project_id}/term-qa-reports")
@@ -4445,6 +4656,22 @@ def _schedule_auto_tm_processing(
 ) -> None:
     if background_tasks is not None and summary.queued_count > 0:
         background_tasks.add_task(run_auto_tm_background_once)
+
+
+def _notify_tm_collections_changed(
+    db: Session,
+    collection_ids: list[UUID],
+    *,
+    source_file_record_id: UUID | None = None,
+) -> int:
+    queued_count = register_project_collections_rematch_work(
+        db,
+        collection_ids=collection_ids,
+        source_file_record_id=source_file_record_id,
+    )
+    if queued_count <= 0:
+        return 0
+    return process_due_auto_tm_rematches(db, force=True)
 
 
 def _resolve_unconfirmed_segment_status(segment: Segment) -> str:
@@ -5315,8 +5542,27 @@ def patch_file_record_bindings(
     _require_file_record_work_access(file_record, current_user)
     ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
     source_language, target_language = _resolve_file_record_language_pair(file_record)
+    before_collection_binding = (
+        tuple(_load_file_record_collection_ids(file_record)),
+        file_record.collection_id,
+    )
 
-    if "collection_id" in payload.model_fields_set:
+    if "collection_ids" in payload.model_fields_set:
+        selected_collection_ids = _validate_collection_ids(db, payload.collection_ids) or []
+        for collection_id in selected_collection_ids:
+            collection = _get_collection_or_404(db, collection_id)
+            _ensure_resource_language_pair_matches(collection, source_language, target_language, "记忆库")
+        if "collection_id" in payload.model_fields_set:
+            if payload.collection_id is not None and payload.collection_id not in selected_collection_ids:
+                raise HTTPException(status_code=400, detail="主写入记忆库必须包含在绑定记忆库列表中。")
+            primary_collection_id = payload.collection_id
+        else:
+            primary_collection_id = file_record.collection_id if file_record.collection_id in selected_collection_ids else None
+            if primary_collection_id is None and selected_collection_ids:
+                primary_collection_id = selected_collection_ids[0]
+        _store_file_record_collection_ids(file_record, selected_collection_ids)
+        file_record.collection_id = primary_collection_id
+    elif "collection_id" in payload.model_fields_set:
         if payload.collection_id is None:
             file_record.collection_id = None
             file_record.collection_ids_json = "[]"
@@ -5361,14 +5607,28 @@ def patch_file_record_bindings(
             raise HTTPException(status_code=400, detail="QA术语库必须先启用。")
         _store_file_record_qa_term_base_ids(file_record, qa_ids)
 
+    after_collection_binding = (
+        tuple(_load_file_record_collection_ids(file_record)),
+        file_record.collection_id,
+    )
+    if before_collection_binding != after_collection_binding:
+        db.flush()
+        refresh_unconfirmed_segment_matches(
+            db,
+            file_record_id=file_record.id,
+            collection_ids=_load_file_record_collection_ids(file_record),
+        )
+
     db.commit()
     db.refresh(file_record)
+    collection_ids = _load_file_record_collection_ids(file_record)
     term_base_ids = _load_file_record_term_base_ids(file_record)
     term_base_write_ids = _load_file_record_term_base_write_ids(file_record)
     qa_term_base_ids = _load_file_record_qa_term_base_ids(file_record)
     return {
         "id": str(file_record.id),
         "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
+        "collection_ids": [str(collection_id) for collection_id in collection_ids],
         "term_base_id": str(file_record.term_base_id) if file_record.term_base_id else None,
         "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
         "term_base_write_ids": [str(term_base_id) for term_base_id in term_base_write_ids],
@@ -6126,12 +6386,20 @@ def save_file_record_segments_to_tm(
 
     created_count = upsert_summary.created_count if upsert_summary is not None else 0
     updated_count = upsert_summary.updated_count if upsert_summary is not None else 0
+    refreshed_count = 0
+    if collection is not None and upsert_summary is not None and upsert_summary.total_written > 0:
+        refreshed_count = _notify_tm_collections_changed(
+            db,
+            [collection.id],
+            source_file_record_id=file_record.id,
+        )
 
     return {
         "created_count": created_count,
         "updated_count": updated_count,
         "skipped_count": skipped_count,
         "total_segments": len(segments),
+        "refreshed_segments": refreshed_count,
         "collection_id": collection.id if collection else None,
         "collection_name": collection.name if collection else None,
         "created_collection": created_collection,
@@ -7058,6 +7326,20 @@ def delete_tm_collection(
         .filter(FileRecord.collection_id == collection.id)
         .update({FileRecord.collection_id: None}, synchronize_session=False)
     )
+    deleted_id = collection.id
+    bound_file_records = (
+        db.query(FileRecord)
+        .filter(FileRecord.collection_ids_json.isnot(None))
+        .all()
+    )
+    for file_record in bound_file_records:
+        current_ids = _load_file_record_collection_ids(file_record)
+        if deleted_id not in current_ids:
+            continue
+        _store_file_record_collection_ids(
+            file_record,
+            [collection_id for collection_id in current_ids if collection_id != deleted_id],
+        )
     (
         db.query(MemoryEntry)
         .filter(MemoryEntry.collection_id == collection.id)
@@ -7146,6 +7428,10 @@ async def import_tm_xlsx(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"TM 导入失败：{exc}") from exc
 
+    refreshed_count = 0
+    if collection is not None and import_summary.imported_rows > 0:
+        refreshed_count = _notify_tm_collections_changed(db, [collection.id])
+
     return {
         "filename": import_summary.filename,
         "created_rows": import_summary.created_rows,
@@ -7153,6 +7439,7 @@ async def import_tm_xlsx(
         "skipped_empty_rows": import_summary.skipped_empty_rows,
         "skipped_header_rows": import_summary.skipped_header_rows,
         "imported_rows": import_summary.imported_rows,
+        "refreshed_segments": refreshed_count,
         "collection_id": collection.id if collection else None,
         "collection_name": collection.name if collection else None,
         "source_language": resolved_source_language,
@@ -7348,6 +7635,7 @@ def add_tm_entry(
         existing.target_language = target_language
         db.commit()
         sync_tm_embeddings(db, [(existing.id, existing.source_text)])
+        _notify_tm_collections_changed(db, [existing.collection_id] if existing.collection_id else [])
         return {"status": "updated", "id": existing.id, "message": "已更新现有记录。"}
 
     # 不存在，新增
@@ -7364,6 +7652,7 @@ def add_tm_entry(
     db.commit()
     db.refresh(tm)
     sync_tm_embeddings(db, [(tm.id, tm.source_text)])
+    _notify_tm_collections_changed(db, [tm.collection_id] if tm.collection_id else [])
 
     return {"status": "created", "id": tm.id, "message": "已添加新记录。"}
 
@@ -7417,6 +7706,7 @@ def update_tm_entry(
     db.commit()
     db.refresh(entry)
     sync_tm_embeddings(db, [(entry.id, entry.source_text)])
+    _notify_tm_collections_changed(db, [entry.collection_id] if entry.collection_id else [])
     return _serialize_tm_entry(entry)
 
 
@@ -7526,14 +7816,20 @@ def batch_add_tm_entries(
 
     upsert_summary = batch_upsert_tm_entries(db, upsert_entries)
     skipped_count += upsert_summary.skipped_count
+    refreshed_count = 0
     if upsert_summary.total_written > 0:
         db.commit()
         sync_tm_embeddings(db, upsert_summary.sync_rows or [])
+        refreshed_count = _notify_tm_collections_changed(
+            db,
+            [entry.collection_id for entry in upsert_entries],
+        )
 
     return {
         "created": upsert_summary.created_count,
         "updated": upsert_summary.updated_count,
         "skipped": skipped_count,
+        "refreshed_segments": refreshed_count,
     }
 
 

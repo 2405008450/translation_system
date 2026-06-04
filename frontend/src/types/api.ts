@@ -507,6 +507,36 @@ export interface ProjectTermBaseSettingsResponse {
   groups: ProjectTermBaseSettingGroup[]
 }
 
+export interface ProjectTranslationMemorySettingCollection {
+  id: string
+  name: string
+  description: string | null
+  source_language: string
+  target_language: string
+  entry_count: number
+}
+
+export interface ProjectTranslationMemorySettingFile {
+  id: string
+  filename: string
+  collection_id: string | null
+  collection_ids: string[]
+}
+
+export interface ProjectTranslationMemorySettingGroup {
+  source_language: string
+  target_language: string
+  file_count: number
+  collections: ProjectTranslationMemorySettingCollection[]
+  files: ProjectTranslationMemorySettingFile[]
+}
+
+export interface ProjectTranslationMemorySettingsResponse {
+  project_id: string
+  groups: ProjectTranslationMemorySettingGroup[]
+  initial_match_updated_count?: number
+}
+
 export interface TermQAReportItem {
   id: string
   report_id: string

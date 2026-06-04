@@ -27,7 +27,7 @@ import {
   RotateCcw,
   X,
 } from 'lucide-vue-next'
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 
@@ -67,6 +67,9 @@ import type {
   ProjectTermBaseSettingGroup,
   ProjectTermBaseSettingRow,
   ProjectTermBaseSettingsResponse,
+  ProjectTranslationMemorySettingFile,
+  ProjectTranslationMemorySettingGroup,
+  ProjectTranslationMemorySettingsResponse,
   TermQAReport,
   UploadCapabilitiesResponse,
   UploadCapability,
@@ -78,6 +81,7 @@ const props = defineProps<{
 }>()
 
 type ProjectTab = 'files' | 'issues' | 'assignments' | 'settings' | 'stats' | 'summary' | 'quote'
+type ProjectSettingsSection = 'basic' | 'guidelines' | 'translation-memory' | 'terms' | 'term-qa'
 type AccessLevel = 'team' | 'private' | 'public'
 type DocumentStatisticNumberKey =
   | 'pages'
@@ -261,7 +265,24 @@ const uploadCapabilities = ref<UploadCapability[]>([])
 const uploadFileAccept = ref(supportedTaskFileAccept)
 const loadingUploadCapabilities = ref(false)
 const basicCollapsed = ref(false)
-const activeTab = ref<ProjectTab>('files')
+function getProjectSettingsSectionFromHash(hash: string): ProjectSettingsSection {
+  switch (hash) {
+    case '#project-settings-guidelines':
+      return 'guidelines'
+    case '#project-settings-translation-memory':
+      return 'translation-memory'
+    case '#project-settings-terms':
+      return 'terms'
+    case '#project-settings-term-qa':
+      return 'term-qa'
+    case '#project-settings-basic':
+    default:
+      return 'basic'
+  }
+}
+
+const activeTab = ref<ProjectTab>(route.hash.startsWith('#project-settings-') ? 'settings' : 'files')
+const activeProjectSettingsSection = ref<ProjectSettingsSection>(getProjectSettingsSectionFromHash(route.hash))
 const showUploadModal = ref(false)
 const showPreTranslateDialog = ref(false)
 const showIssueDialog = ref(false)
@@ -305,6 +326,12 @@ const assignmentTooltipText = ref('')
 const assignmentTooltipStyle = ref<Record<string, string>>({})
 const assignmentEvents = ref<AssignmentEvent[]>([])
 const assignmentEventsLoading = ref(false)
+const translationMemorySettings = ref<ProjectTranslationMemorySettingsResponse | null>(null)
+const loadingTranslationMemorySettings = ref(false)
+const savingTranslationMemorySettings = ref(false)
+const creatingTranslationMemoryPair = ref('')
+const translationMemorySettingsError = ref('')
+const expandedTMCollectionKey = ref('')
 const termBaseSettings = ref<ProjectTermBaseSettingsResponse | null>(null)
 const loadingTermBaseSettings = ref(false)
 const savingTermBaseSettings = ref(false)
@@ -327,7 +354,6 @@ const tabs = computed(() => ([
   { key: 'summary' as const, label: t('projectDetail.tabs.summary'), disabled: true },
   { key: 'quote' as const, label: t('projectDetail.tabs.quote'), disabled: true },
 ]))
-
 const tableRows = computed<ProjectFileItem[]>(() => project.value?.files ?? [])
 const issueMarkers = computed<IssueMarker[]>(() => project.value?.issue_markers ?? [])
 const openIssueCount = computed(() => issueMarkers.value.filter((marker) => marker.status === 'open').length)
@@ -1271,6 +1297,31 @@ function switchProjectTab(tab: ProjectTab) {
   }
 }
 
+function getProjectSettingsSectionHash(section: ProjectSettingsSection) {
+  return `#project-settings-${section}`
+}
+
+function switchProjectSettingsSection(section: ProjectSettingsSection) {
+  activeTab.value = 'settings'
+  activeProjectSettingsSection.value = section
+  const hash = getProjectSettingsSectionHash(section)
+  if (route.hash !== hash) {
+    void router.replace({
+      path: route.path,
+      query: route.query,
+      hash,
+    })
+  }
+}
+
+function syncProjectSettingsHash() {
+  if (!route.hash.startsWith('#project-settings-')) {
+    return
+  }
+  activeTab.value = 'settings'
+  activeProjectSettingsSection.value = getProjectSettingsSectionFromHash(route.hash)
+}
+
 function updateStatisticsSelectedFileIds(ids: Set<string>) {
   statisticsSelectedFileIds.value = new Set(ids)
 }
@@ -1340,8 +1391,10 @@ async function loadProject() {
     statisticsResultFileIds.value = new Set<string>()
     if (data.can_manage) {
       void loadAssignmentEvents()
+      void loadProjectTranslationMemorySettings()
       void loadProjectTermBaseSettings()
     } else {
+      translationMemorySettings.value = null
       termBaseSettings.value = null
     }
   } catch (error) {
@@ -1367,6 +1420,268 @@ async function loadProjectTermBaseSettings() {
     termBaseSettingsError.value = getErrorMessage(error, '术语库设置加载失败。')
   } finally {
     loadingTermBaseSettings.value = false
+  }
+}
+
+async function loadProjectTranslationMemorySettings() {
+  if (!project.value?.can_manage) {
+    translationMemorySettings.value = null
+    return
+  }
+  loadingTranslationMemorySettings.value = true
+  translationMemorySettingsError.value = ''
+  try {
+    const { data } = await http.get<ProjectTranslationMemorySettingsResponse>(
+      `/projects/${project.value.id}/translation-memory-settings`,
+    )
+    translationMemorySettings.value = data
+  } catch (error) {
+    translationMemorySettingsError.value = getErrorMessage(error, '记忆库设置加载失败。')
+  } finally {
+    loadingTranslationMemorySettings.value = false
+  }
+}
+
+function translationMemorySettingGroupKey(group: ProjectTranslationMemorySettingGroup) {
+  return `${group.source_language}->${group.target_language}`
+}
+
+function getTranslationMemorySettingPairLabel(group: ProjectTranslationMemorySettingGroup) {
+  return formatLanguagePair(group.source_language, group.target_language)
+}
+
+function tmCollectionRowKey(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
+  return `${translationMemorySettingGroupKey(group)}:${collectionId}`
+}
+
+function getTMCollectionBoundFiles(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
+  return group.files.filter((file) => file.collection_ids.includes(collectionId))
+}
+
+function getTMCollectionBoundSummary(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
+  const count = getTMCollectionBoundFiles(group, collectionId).length
+  return `${count}/${group.files.length} 个文件`
+}
+
+function isTMCollectionEnabled(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
+  return getTMCollectionBoundFiles(group, collectionId).length > 0
+}
+
+function isTMCollectionWritable(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
+  return group.files.some((file) => file.collection_id === collectionId)
+}
+
+function toggleTMCollectionEnabled(
+  group: ProjectTranslationMemorySettingGroup,
+  collectionId: string,
+  event: Event,
+) {
+  const checked = (event.target as HTMLInputElement).checked
+  for (const file of group.files) {
+    if (checked && !file.collection_ids.includes(collectionId)) {
+      file.collection_ids = [...file.collection_ids, collectionId]
+    }
+    if (!checked) {
+      file.collection_ids = file.collection_ids.filter((id) => id !== collectionId)
+      if (file.collection_id === collectionId) {
+        file.collection_id = file.collection_ids[0] || null
+      }
+    }
+  }
+}
+
+function toggleTMCollectionWritable(
+  group: ProjectTranslationMemorySettingGroup,
+  collectionId: string,
+  event: Event,
+) {
+  const checked = (event.target as HTMLInputElement).checked
+  for (const file of group.files) {
+    if (checked) {
+      if (!file.collection_ids.includes(collectionId)) {
+        file.collection_ids = [...file.collection_ids, collectionId]
+      }
+      file.collection_id = collectionId
+    } else if (file.collection_id === collectionId) {
+      file.collection_id = file.collection_ids.find((id) => id !== collectionId) || null
+    }
+  }
+}
+
+function toggleTMCollectionDetails(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
+  const key = tmCollectionRowKey(group, collectionId)
+  expandedTMCollectionKey.value = expandedTMCollectionKey.value === key ? '' : key
+}
+
+function isTMCollectionDetailsOpen(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
+  return expandedTMCollectionKey.value === tmCollectionRowKey(group, collectionId)
+}
+
+function isFileTMCollectionBound(file: ProjectTranslationMemorySettingFile, collectionId: string) {
+  return file.collection_ids.includes(collectionId)
+}
+
+function toggleFileTMCollection(
+  file: ProjectTranslationMemorySettingFile,
+  collectionId: string,
+  event: Event,
+) {
+  const checked = (event.target as HTMLInputElement).checked
+  if (checked && !file.collection_ids.includes(collectionId)) {
+    file.collection_ids = [...file.collection_ids, collectionId]
+  }
+  if (!checked) {
+    file.collection_ids = file.collection_ids.filter((id) => id !== collectionId)
+    if (file.collection_id === collectionId) {
+      file.collection_id = file.collection_ids[0] || null
+    }
+  }
+  if (checked && !file.collection_id) {
+    file.collection_id = collectionId
+  }
+}
+
+function setFilePrimaryTMCollection(file: ProjectTranslationMemorySettingFile, event: Event) {
+  const collectionId = (event.target as HTMLSelectElement).value || null
+  file.collection_id = collectionId
+  if (collectionId && !file.collection_ids.includes(collectionId)) {
+    file.collection_ids = [...file.collection_ids, collectionId]
+  }
+}
+
+function isTMCollectionBoundForAll(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
+  return group.files.length > 0 && group.files.every((file) => file.collection_ids.includes(collectionId))
+}
+
+function toggleGroupTMCollection(
+  group: ProjectTranslationMemorySettingGroup,
+  collectionId: string,
+  event: Event,
+) {
+  const checked = (event.target as HTMLInputElement).checked
+  for (const file of group.files) {
+    if (checked && !file.collection_ids.includes(collectionId)) {
+      file.collection_ids = [...file.collection_ids, collectionId]
+    }
+    if (!checked) {
+      file.collection_ids = file.collection_ids.filter((id) => id !== collectionId)
+      if (file.collection_id === collectionId) {
+        file.collection_id = file.collection_ids[0] || null
+      }
+    }
+    if (checked && !file.collection_id) {
+      file.collection_id = collectionId
+    }
+  }
+}
+
+function getGroupPrimaryTMCollectionId(group: ProjectTranslationMemorySettingGroup) {
+  if (group.files.length === 0) {
+    return ''
+  }
+  const firstCollectionId = group.files[0].collection_id || ''
+  return group.files.every((file) => (file.collection_id || '') === firstCollectionId)
+    ? firstCollectionId
+    : ''
+}
+
+function setGroupPrimaryTMCollection(group: ProjectTranslationMemorySettingGroup, event: Event) {
+  const collectionId = (event.target as HTMLSelectElement).value || null
+  for (const file of group.files) {
+    file.collection_id = collectionId
+    if (collectionId && !file.collection_ids.includes(collectionId)) {
+      file.collection_ids = [...file.collection_ids, collectionId]
+    }
+  }
+}
+
+function buildTranslationMemorySettingsPayload() {
+  return {
+    settings: (translationMemorySettings.value?.groups || []).map((group) => ({
+      source_language: group.source_language,
+      target_language: group.target_language,
+      files: group.files.map((file) => ({
+        file_record_id: file.id,
+        collection_ids: file.collection_ids,
+        primary_collection_id: file.collection_id,
+      })),
+    })),
+  }
+}
+
+async function saveProjectTranslationMemorySettings() {
+  if (!project.value || savingTranslationMemorySettings.value || !canManageProject.value) {
+    return
+  }
+  savingTranslationMemorySettings.value = true
+  translationMemorySettingsError.value = ''
+  try {
+    const { data } = await http.patch<ProjectTranslationMemorySettingsResponse>(
+      `/projects/${project.value.id}/translation-memory-settings`,
+      buildTranslationMemorySettingsPayload(),
+    )
+    translationMemorySettings.value = data
+    toast.show({
+      tone: 'success',
+      title: '记忆库设置已保存',
+      message: data.initial_match_updated_count
+        ? `已同步更新 ${data.initial_match_updated_count} 个句段。`
+        : '',
+    })
+    await loadProject()
+  } catch (error) {
+    translationMemorySettingsError.value = getErrorMessage(error, '记忆库设置保存失败。')
+    toast.show({
+      tone: 'error',
+      title: '记忆库设置保存失败',
+      message: translationMemorySettingsError.value,
+    })
+  } finally {
+    savingTranslationMemorySettings.value = false
+  }
+}
+
+async function createTranslationMemoryForGroup(group: ProjectTranslationMemorySettingGroup) {
+  if (!project.value || creatingTranslationMemoryPair.value) {
+    return
+  }
+  const pairLabel = getTranslationMemorySettingPairLabel(group)
+  const defaultName = `${project.value.name || project.value.filename || '项目'} ${pairLabel} 记忆库`
+  const name = window.prompt('请输入记忆库名称', defaultName)
+  if (!name?.trim()) {
+    return
+  }
+  creatingTranslationMemoryPair.value = translationMemorySettingGroupKey(group)
+  try {
+    const { data } = await http.post<{ id: string }>('/translation-memory/collections', {
+      name: name.trim(),
+      description: '',
+      source_language: group.source_language,
+      target_language: group.target_language,
+    })
+    await loadProjectTranslationMemorySettings()
+    const nextGroup = translationMemorySettings.value?.groups.find((item) => (
+      item.source_language === group.source_language && item.target_language === group.target_language
+    ))
+    if (nextGroup?.collections.some((collection) => collection.id === data.id)) {
+      for (const file of nextGroup.files) {
+        if (!file.collection_ids.includes(data.id)) {
+          file.collection_ids = [...file.collection_ids, data.id]
+        }
+        if (!file.collection_id) {
+          file.collection_id = data.id
+        }
+      }
+      await saveProjectTranslationMemorySettings()
+    }
+  } catch (error) {
+    toast.show({
+      tone: 'error',
+      title: '记忆库创建失败',
+      message: getErrorMessage(error, '记忆库创建失败。'),
+    })
+  } finally {
+    creatingTranslationMemoryPair.value = ''
   }
 }
 
@@ -1863,13 +2178,19 @@ onMounted(() => {
   document.addEventListener('click', handleDocumentClick)
   window.addEventListener('scroll', handleDocumentScroll, { passive: true })
   window.addEventListener('resize', handleDocumentScroll)
+  syncProjectSettingsHash()
   void (async () => {
     await loadProject()
+    syncProjectSettingsHash()
     if (route.query.assign === '1' && canManageProject.value) {
       await openAssignmentDialog()
     }
   })()
   void loadUploadCapabilities()
+})
+
+watch(() => route.hash, () => {
+  syncProjectSettingsHash()
 })
 
 onBeforeUnmount(() => {
@@ -2165,24 +2486,53 @@ onBeforeUnmount(() => {
 
       <section v-if="activeTab === 'settings'" class="panel pd-settings-panel">
         <div class="pd-settings-layout">
-          <aside class="pd-settings-rail" aria-label="项目设置分区">
-            <a class="pd-settings-rail__item" href="#project-settings-basic">
+          <nav class="pd-settings-rail" aria-label="项目设置分区">
+            <button
+              class="pd-settings-rail__item"
+              :class="{ 'is-active': activeProjectSettingsSection === 'basic' }"
+              type="button"
+              @click="switchProjectSettingsSection('basic')"
+            >
               <Settings2 :size="15" />
               <span>基础信息</span>
-            </a>
-            <a class="pd-settings-rail__item" href="#project-settings-guidelines">
+            </button>
+            <button
+              class="pd-settings-rail__item"
+              :class="{ 'is-active': activeProjectSettingsSection === 'guidelines' }"
+              type="button"
+              @click="switchProjectSettingsSection('guidelines')"
+            >
               <FileText :size="15" />
               <span>翻译要求</span>
-            </a>
-            <a class="pd-settings-rail__item" href="#project-settings-terms">
+            </button>
+            <button
+              class="pd-settings-rail__item"
+              :class="{ 'is-active': activeProjectSettingsSection === 'translation-memory' }"
+              type="button"
+              @click="switchProjectSettingsSection('translation-memory')"
+            >
+              <BookOpen :size="15" />
+              <span>翻译记忆库</span>
+            </button>
+            <button
+              class="pd-settings-rail__item"
+              :class="{ 'is-active': activeProjectSettingsSection === 'terms' }"
+              type="button"
+              @click="switchProjectSettingsSection('terms')"
+            >
               <BookOpen :size="15" />
               <span>术语库</span>
-            </a>
-            <a class="pd-settings-rail__item" href="#project-settings-term-qa">
+            </button>
+            <button
+              class="pd-settings-rail__item"
+              :class="{ 'is-active': activeProjectSettingsSection === 'term-qa' }"
+              type="button"
+              @click="switchProjectSettingsSection('term-qa')"
+            >
               <ShieldCheck :size="15" />
               <span>术语 QA</span>
-            </a>
-          </aside>
+            </button>
+          </nav>
 
           <div class="pd-settings-main">
             <div class="pd-settings-overview">
@@ -2192,7 +2542,7 @@ onBeforeUnmount(() => {
               </div>
             </div>
 
-            <section id="project-settings-basic" class="pd-settings-section">
+            <section v-show="activeProjectSettingsSection === 'basic'" id="project-settings-basic" class="pd-settings-section">
               <header class="pd-settings-section-head">
                 <div class="pd-settings-section-head__copy">
                   <span class="pd-settings-section-icon">
@@ -2269,7 +2619,7 @@ onBeforeUnmount(() => {
               </div>
             </section>
 
-            <section id="project-settings-guidelines" class="pd-settings-section">
+            <section v-show="activeProjectSettingsSection === 'guidelines'" id="project-settings-guidelines" class="pd-settings-section">
               <header class="pd-settings-section-head">
                 <div class="pd-settings-section-head__copy">
                   <span class="pd-settings-section-icon">
@@ -2306,7 +2656,182 @@ onBeforeUnmount(() => {
               </div>
             </section>
 
-            <section id="project-settings-terms" class="pd-settings-section">
+            <section v-show="activeProjectSettingsSection === 'translation-memory'" id="project-settings-translation-memory" class="pd-settings-section">
+              <header class="pd-settings-section-head">
+                <div class="pd-settings-section-head__copy">
+                  <span class="pd-settings-section-icon">
+                    <BookOpen :size="17" />
+                  </span>
+                  <div>
+                    <div class="section-title section-title--tight">翻译记忆库</div>
+                    <p class="panel-subtitle">启用后参与匹配；勾选写入后作为主写入库，确认句段会实时写入更新。</p>
+                  </div>
+                </div>
+                <button
+                  class="button button--primary pd-settings-save"
+                  type="button"
+                  :disabled="savingTranslationMemorySettings || loadingTranslationMemorySettings"
+                  @click="saveProjectTranslationMemorySettings"
+                >
+                  <Loader2 v-if="savingTranslationMemorySettings" class="lucide-spin" :size="14" />
+                  <Settings2 v-else :size="14" />
+                  {{ savingTranslationMemorySettings ? '保存中' : '保存记忆库设置' }}
+                </button>
+              </header>
+
+              <div class="pd-settings-section-body tm-settings">
+                <StateView
+                  v-if="loadingTranslationMemorySettings"
+                  kind="loading"
+                  title="正在加载记忆库设置"
+                  message="正在读取项目文件语言对和可用记忆库。"
+                />
+                <p v-else-if="translationMemorySettingsError" class="form-message is-error">{{ translationMemorySettingsError }}</p>
+                <div v-else-if="!translationMemorySettings || translationMemorySettings.groups.length === 0" class="empty-state">
+                  当前项目还没有可配置语言对的文件。
+                </div>
+                <div v-else class="tm-settings__groups">
+                  <section
+                    v-for="group in translationMemorySettings.groups"
+                    :key="translationMemorySettingGroupKey(group)"
+                    class="tm-settings__panel"
+                  >
+                    <div class="tm-settings__panel-head">
+                      <div>
+                        <strong>{{ getTranslationMemorySettingPairLabel(group) }}</strong>
+                        <span>{{ group.file_count }} 个文件 · {{ group.collections.length }} 个记忆库</span>
+                      </div>
+                      <div class="tm-settings__panel-actions">
+                        <button
+                          class="button term-settings__create"
+                          type="button"
+                          :disabled="Boolean(creatingTranslationMemoryPair)"
+                          @click="createTranslationMemoryForGroup(group)"
+                        >
+                          <Loader2 v-if="creatingTranslationMemoryPair === translationMemorySettingGroupKey(group)" class="lucide-spin" :size="14" />
+                          <Plus v-else :size="14" />
+                          创建记忆库
+                        </button>
+                      </div>
+                    </div>
+
+                    <div v-if="group.collections.length === 0" class="empty-state">
+                      当前语言对暂无记忆库。
+                    </div>
+                    <div v-else class="tm-settings__table-wrap">
+                      <table class="tm-settings__full-table">
+                        <colgroup>
+                          <col class="tm-settings__full-col-index">
+                          <col class="tm-settings__full-col-toggle">
+                          <col class="tm-settings__full-col-write">
+                          <col class="tm-settings__full-col-name">
+                          <col class="tm-settings__full-col-status">
+                          <col class="tm-settings__full-col-lang">
+                          <col class="tm-settings__full-col-lang">
+                          <col class="tm-settings__full-col-count">
+                          <col class="tm-settings__full-col-files">
+                          <col class="tm-settings__full-col-action">
+                        </colgroup>
+                        <thead>
+                          <tr>
+                            <th>序号</th>
+                            <th>启用</th>
+                            <th title="勾选后，该记忆库会作为主写入库，确认句段将实时写入更新。">写入</th>
+                            <th>记忆库名称</th>
+                            <th>状态</th>
+                            <th>源语言</th>
+                            <th>目标语言</th>
+                            <th>条目数</th>
+                            <th>绑定文件</th>
+                            <th>操作</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <template v-for="(collection, collectionIndex) in group.collections" :key="collection.id">
+                            <tr>
+                              <td>{{ collectionIndex + 1 }}</td>
+                              <td>
+                                <label class="term-settings__toggle">
+                                  <input
+                                    type="checkbox"
+                                    :checked="isTMCollectionEnabled(group, collection.id)"
+                                    :aria-label="`启用 ${collection.name}`"
+                                    @change="toggleTMCollectionEnabled(group, collection.id, $event)"
+                                  />
+                                  <span aria-hidden="true" />
+                                </label>
+                              </td>
+                              <td>
+                                <input
+                                  class="tm-settings__checkbox"
+                                  type="checkbox"
+                                  :checked="isTMCollectionWritable(group, collection.id)"
+                                  :aria-label="`实时写入 ${collection.name}`"
+                                  title="勾选后实时写入更新"
+                                  @change="toggleTMCollectionWritable(group, collection.id, $event)"
+                                >
+                              </td>
+                              <td>
+                                <span class="term-settings__name">{{ collection.name }}</span>
+                                <span v-if="collection.description" class="term-settings__meta">{{ collection.description }}</span>
+                              </td>
+                              <td>正常</td>
+                              <td>{{ getLanguageLabel(collection.source_language) }}</td>
+                              <td>{{ getLanguageLabel(collection.target_language) }}</td>
+                              <td>{{ collection.entry_count }}</td>
+                              <td>{{ getTMCollectionBoundSummary(group, collection.id) }}</td>
+                              <td>
+                                <button
+                                  class="button tm-settings__file-button"
+                                  type="button"
+                                  @click="toggleTMCollectionDetails(group, collection.id)"
+                                >
+                                  {{ isTMCollectionDetailsOpen(group, collection.id) ? '收起' : '文件设置' }}
+                                </button>
+                              </td>
+                            </tr>
+                            <tr v-if="isTMCollectionDetailsOpen(group, collection.id)" class="tm-settings__detail-row">
+                              <td colspan="10">
+                                <div class="tm-settings__file-panel">
+                                  <div
+                                    v-for="file in group.files"
+                                    :key="file.id"
+                                    class="tm-settings__file-item"
+                                  >
+                                    <span class="tm-settings__file-name">{{ file.filename }}</span>
+                                    <label class="tm-settings__file-check">
+                                      <input
+                                        type="checkbox"
+                                        :checked="isFileTMCollectionBound(file, collection.id)"
+                                        @change="toggleFileTMCollection(file, collection.id, $event)"
+                                      >
+                                      <span>启用</span>
+                                    </label>
+                                    <label class="tm-settings__file-check">
+                                      <input
+                                        type="radio"
+                                        :name="`primary-${file.id}`"
+                                        :value="collection.id"
+                                        :disabled="!isFileTMCollectionBound(file, collection.id)"
+                                        :checked="file.collection_id === collection.id"
+                                        @change="setFilePrimaryTMCollection(file, $event)"
+                                      >
+                                      <span>主写入</span>
+                                    </label>
+                                  </div>
+                                </div>
+                              </td>
+                            </tr>
+                          </template>
+                        </tbody>
+                      </table>
+                    </div>
+                  </section>
+                </div>
+              </div>
+            </section>
+
+            <section v-show="activeProjectSettingsSection === 'terms'" id="project-settings-terms" class="pd-settings-section">
               <header class="pd-settings-section-head">
                 <div class="pd-settings-section-head__copy">
                   <span class="pd-settings-section-icon">
@@ -2330,6 +2855,13 @@ onBeforeUnmount(() => {
               </header>
 
               <div class="pd-settings-section-body term-settings">
+                <section class="resource-settings-block">
+                  <header class="resource-settings-block__head">
+                    <div>
+                      <strong>术语库设置</strong>
+                      <span>按文件语言对启用术语提醒、控制写入口，并指定术语 QA 标准库。</span>
+                    </div>
+                  </header>
                 <StateView
                   v-if="loadingTermBaseSettings"
                   kind="loading"
@@ -2427,10 +2959,11 @@ onBeforeUnmount(() => {
                     </div>
                   </section>
                 </div>
+                </section>
               </div>
             </section>
 
-            <section id="project-settings-term-qa" class="pd-settings-section">
+            <section v-show="activeProjectSettingsSection === 'term-qa'" id="project-settings-term-qa" class="pd-settings-section">
               <header class="pd-settings-section-head">
                 <div class="pd-settings-section-head__copy">
                   <span class="pd-settings-section-icon">
@@ -4842,38 +5375,49 @@ onBeforeUnmount(() => {
 
 .pd-settings-panel {
   padding: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .pd-settings-layout {
   display: grid;
-  grid-template-columns: 140px minmax(0, 1fr);
+  grid-template-columns: 192px minmax(0, 1fr);
+  align-items: start;
   min-height: 520px;
 }
 
 .pd-settings-rail {
   position: sticky;
-  top: 0;
-  align-self: start;
+  top: 72px;
+  align-self: stretch;
   display: grid;
+  align-content: start;
+  grid-auto-rows: min-content;
   gap: 4px;
-  padding: 12px 10px;
+  min-height: calc(100vh - 96px);
+  padding: 16px 0;
   border-right: 1px solid var(--line-soft);
-  background: var(--surface-muted);
+  background: var(--surface-panel);
 }
 
 .pd-settings-rail__item {
   display: flex;
   align-items: center;
-  gap: 7px;
+  justify-content: flex-end;
+  gap: 0;
+  width: 100%;
   min-width: 0;
-  min-height: 32px;
-  padding: 0 9px;
+  min-height: 40px;
+  padding: 0 18px;
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-right: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
   color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  text-align: right;
   text-decoration: none;
   transition:
     border-color var(--motion-base) var(--ease-standard),
@@ -4882,13 +5426,21 @@ onBeforeUnmount(() => {
 }
 
 .pd-settings-rail__item:hover {
-  border-color: color-mix(in srgb, var(--brand-700) 22%, var(--line-soft));
-  background: var(--surface-panel);
+  border-color: transparent;
+  border-right-color: color-mix(in srgb, var(--brand-700) 38%, transparent);
+  background: color-mix(in srgb, var(--brand-700) 7%, var(--surface-panel));
+  color: var(--brand-700);
+}
+
+.pd-settings-rail__item.is-active {
+  border-color: transparent;
+  border-right-color: var(--brand-700);
+  background: var(--brand-050);
   color: var(--brand-700);
 }
 
 .pd-settings-rail__item svg {
-  flex: 0 0 auto;
+  display: none;
 }
 
 .pd-settings-rail__item span {
@@ -5089,6 +5641,272 @@ onBeforeUnmount(() => {
 .term-qa-report {
   display: grid;
   gap: 10px;
+}
+
+.resource-settings-block {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-muted) 38%, var(--surface-panel));
+}
+
+.resource-settings-block__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.resource-settings-block__head > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.resource-settings-block__head strong {
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.resource-settings-block__head span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.tm-settings__bulk {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(190px, 260px);
+  gap: 10px;
+  align-items: end;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--surface-muted) 42%, var(--surface-panel));
+}
+
+.tm-settings__bulk-bindings {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.tm-settings__bulk-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 220px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.tm-settings__bulk-item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tm-settings__primary-select {
+  display: grid;
+  gap: 4px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.tm-settings__groups {
+  display: grid;
+  gap: 12px;
+}
+
+.tm-settings__panel {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+}
+
+.tm-settings__panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--surface-muted) 62%, var(--surface-panel));
+}
+
+.tm-settings__panel-head > div:first-child {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.tm-settings__panel-head strong {
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.tm-settings__panel-head span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.tm-settings__panel-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.tm-settings__table-wrap {
+  overflow-x: auto;
+  background: var(--surface-panel);
+}
+
+.tm-settings__full-table {
+  width: 100%;
+  min-width: 940px;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 13px;
+}
+
+.tm-settings__full-table th,
+.tm-settings__full-table td {
+  overflow: hidden;
+  padding: 10px 10px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--text-secondary);
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.tm-settings__full-table th {
+  color: var(--text-muted);
+  font-weight: 700;
+  background: color-mix(in srgb, var(--surface-muted) 82%, var(--surface-panel));
+}
+
+.tm-settings__full-table th:nth-child(4),
+.tm-settings__full-table td:nth-child(4) {
+  text-align: left;
+}
+
+.tm-settings__full-table td:last-child {
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.tm-settings__full-table tr:last-child td {
+  border-bottom: 0;
+}
+
+.tm-settings__full-col-index {
+  width: 52px;
+}
+
+.tm-settings__full-col-toggle,
+.tm-settings__full-col-write {
+  width: 66px;
+}
+
+.tm-settings__full-col-name {
+  width: auto;
+}
+
+.tm-settings__full-col-status {
+  width: 66px;
+}
+
+.tm-settings__full-col-lang {
+  width: 112px;
+}
+
+.tm-settings__full-col-count {
+  width: 84px;
+}
+
+.tm-settings__full-col-files {
+  width: 98px;
+}
+
+.tm-settings__full-col-action {
+  width: 96px;
+}
+
+.tm-settings__checkbox {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--brand-700);
+}
+
+.tm-settings__file-primary {
+  min-width: 150px;
+}
+
+.tm-settings__file-button {
+  min-width: 74px;
+  justify-content: center;
+}
+
+.tm-settings__full-table .tm-settings__detail-row td {
+  overflow: visible;
+  padding: 0;
+  background: color-mix(in srgb, var(--surface-muted) 58%, var(--surface-panel));
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.tm-settings__file-panel {
+  display: grid;
+  gap: 0;
+  padding: 6px 12px;
+  text-align: left;
+}
+
+.tm-settings__file-item {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) 84px 92px;
+  gap: 12px;
+  align-items: center;
+  min-height: 34px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.tm-settings__file-item:last-child {
+  border-bottom: 0;
+}
+
+.tm-settings__file-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tm-settings__file-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.tm-settings__file-check input {
+  accent-color: var(--brand-700);
 }
 
 .term-settings__group {
@@ -5326,12 +6144,18 @@ onBeforeUnmount(() => {
     position: static;
     display: flex;
     overflow-x: auto;
+    min-height: 0;
+    padding: 8px;
     border-right: 0;
     border-bottom: 1px solid var(--line-soft);
   }
 
   .pd-settings-rail__item {
     flex: 0 0 auto;
+    justify-content: center;
+    min-height: 34px;
+    padding: 0 12px;
+    border-radius: 6px;
   }
 
   .pd-readonly-grid {
@@ -5341,6 +6165,7 @@ onBeforeUnmount(() => {
   .pd-statistics-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
 }
 
 @media (max-width: 720px) {
@@ -5394,6 +6219,25 @@ onBeforeUnmount(() => {
   .pd-settings-actions .button {
     flex: 1 1 140px;
     justify-content: center;
+  }
+
+  .tm-settings__bulk {
+    grid-template-columns: 1fr;
+  }
+
+  .tm-settings__file-item {
+    grid-template-columns: 1fr;
+    gap: 6px;
+    align-items: start;
+    padding: 8px 0;
+  }
+
+  .tm-settings__file-check {
+    justify-content: flex-start;
+  }
+
+  .resource-settings-block__head {
+    align-items: stretch;
   }
 
   .pd-settings-save {

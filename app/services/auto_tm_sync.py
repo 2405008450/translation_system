@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -119,8 +121,8 @@ def enqueue_confirmed_segments_for_auto_tm(
 def run_auto_tm_background_once() -> None:
     with SessionLocal() as db:
         try:
-            process_auto_tm_outbox(db)
-            process_due_auto_tm_rematches(db)
+            processed_count = process_auto_tm_outbox(db)
+            process_due_auto_tm_rematches(db, force=processed_count > 0)
         except Exception:
             logger.exception("auto TM background task failed")
 
@@ -179,7 +181,7 @@ def process_auto_tm_outbox(db: Session, *, batch_size: int = AUTO_TM_BATCH_SIZE)
         return 0
 
 
-def process_due_auto_tm_rematches(db: Session) -> int:
+def process_due_auto_tm_rematches(db: Session, *, force: bool = False) -> int:
     now = datetime.utcnow()
     cutoff = now - AUTO_TM_REMATCH_AGE
     candidates = (
@@ -190,7 +192,15 @@ def process_due_auto_tm_rematches(db: Session) -> int:
     due_queues = [
         queue
         for queue in candidates
-        if queue.pending_entry_count >= AUTO_TM_REMATCH_COUNT_THRESHOLD
+        if (
+            force
+            and (
+                int(queue.pending_entry_count or 0) > 0
+                or queue.first_pending_at is not None
+                or queue.last_pending_at is not None
+            )
+        )
+        or queue.pending_entry_count >= AUTO_TM_REMATCH_COUNT_THRESHOLD
         or (queue.first_pending_at is not None and queue.first_pending_at <= cutoff)
     ]
     refreshed_count = 0
@@ -202,7 +212,6 @@ def process_due_auto_tm_rematches(db: Session) -> int:
             updated_count = refresh_unconfirmed_segment_matches(
                 db,
                 file_record_id=queue.file_record_id,
-                collection_id=queue.collection_id,
             )
             queue.pending_entry_count = 0
             queue.first_pending_at = None
@@ -227,9 +236,23 @@ def refresh_unconfirmed_segment_matches(
     db: Session,
     *,
     file_record_id: UUID,
-    collection_id: UUID,
+    collection_id: UUID | None = None,
+    collection_ids: list[UUID] | None = None,
 ) -> int:
     settings = get_settings()
+    file_record = db.query(FileRecord).filter(FileRecord.id == file_record_id).first()
+    if file_record is None:
+        return 0
+
+    selected_collection_ids = _resolve_refresh_collection_ids(
+        db,
+        file_record=file_record,
+        collection_id=collection_id,
+        collection_ids=collection_ids,
+    )
+    if not selected_collection_ids:
+        return 0
+
     updated_count = 0
     offset = 0
     while True:
@@ -259,11 +282,15 @@ def refresh_unconfirmed_segment_matches(
             sentences=source_sentences,
             auxiliary_sentences=auxiliary_sentences,
             similarity_threshold=settings.default_similarity_threshold,
-            collection_ids=[collection_id],
+            collection_ids=selected_collection_ids,
         )
 
         for segment, match in zip(segments, matches, strict=False):
             before = (
+                segment.target_text,
+                segment.target_html,
+                segment.status,
+                segment.source,
                 segment.score,
                 segment.matched_source_text,
                 segment.matched_collection_name,
@@ -277,7 +304,20 @@ def refresh_unconfirmed_segment_matches(
             segment.matched_creator_name = match.matched_creator_name
             segment.matched_created_at = _parse_optional_datetime(match.matched_created_at)
             segment.matched_updated_at = _parse_optional_datetime(match.matched_updated_at)
+            if (
+                match.target_text is not None
+                and match.status in {"exact", "fuzzy"}
+                and not normalize_text(segment.target_text)
+            ):
+                segment.target_text = match.target_text
+                segment.target_html = None
+                segment.status = match.status
+                segment.source = "tm"
             after = (
+                segment.target_text,
+                segment.target_html,
+                segment.status,
+                segment.source,
                 segment.score,
                 segment.matched_source_text,
                 segment.matched_collection_name,
@@ -296,35 +336,155 @@ def refresh_unconfirmed_segment_matches(
 
 
 def _register_rematch_work(db: Session, rows: list[AutoTMOutbox]) -> None:
-    now = datetime.utcnow()
     grouped: dict[tuple[UUID, UUID], int] = {}
     for row in rows:
         grouped[(row.file_record_id, row.collection_id)] = grouped.get((row.file_record_id, row.collection_id), 0) + 1
 
     for (file_record_id, collection_id), count in grouped.items():
-        queue = (
-            db.query(AutoTMRematchQueue)
-            .filter(AutoTMRematchQueue.file_record_id == file_record_id)
+        register_project_collection_rematch_work(
+            db,
+            collection_id=collection_id,
+            source_file_record_id=file_record_id,
+            count=count,
+        )
+
+
+def register_project_collection_rematch_work(
+    db: Session,
+    *,
+    collection_id: UUID,
+    source_file_record_id: UUID | None = None,
+    count: int = 1,
+) -> int:
+    collection = db.query(MemoryBase).filter(MemoryBase.id == collection_id).first()
+    if collection is None or not collection.source_language or not collection.target_language:
+        return 0
+
+    source_file_record = None
+    if source_file_record_id is not None:
+        source_file_record = (
+            db.query(FileRecord)
+            .filter(FileRecord.id == source_file_record_id)
             .first()
         )
-        if queue is None:
-            db.add(
-                AutoTMRematchQueue(
-                    file_record_id=file_record_id,
-                    collection_id=collection_id,
-                    pending_entry_count=count,
-                    first_pending_at=now,
-                    last_pending_at=now,
-                )
-            )
-            continue
 
-        queue.collection_id = collection_id
-        queue.pending_entry_count = int(queue.pending_entry_count or 0) + count
-        queue.status = "pending"
-        if queue.first_pending_at is None:
-            queue.first_pending_at = now
-        queue.last_pending_at = now
+    query = db.query(FileRecord).filter(
+        FileRecord.source_language == collection.source_language,
+        FileRecord.target_language == collection.target_language,
+    )
+    if source_file_record and source_file_record.project_id:
+        query = query.filter(FileRecord.project_id == source_file_record.project_id)
+    elif source_file_record:
+        query = query.filter(FileRecord.id == source_file_record.id)
+
+    queued_count = 0
+    for file_record in query.all():
+        if collection.id not in _load_file_record_collection_ids(file_record):
+            continue
+        _upsert_rematch_queue(
+            db,
+            file_record_id=file_record.id,
+            collection_id=collection.id,
+            count=count,
+        )
+        queued_count += 1
+
+    return queued_count
+
+
+def register_project_collections_rematch_work(
+    db: Session,
+    *,
+    collection_ids: list[UUID],
+    source_file_record_id: UUID | None = None,
+    count: int = 1,
+) -> int:
+    queued_count = 0
+    for collection_id in list(dict.fromkeys(collection_ids)):
+        queued_count += register_project_collection_rematch_work(
+            db,
+            collection_id=collection_id,
+            source_file_record_id=source_file_record_id,
+            count=count,
+        )
+    return queued_count
+
+
+def _upsert_rematch_queue(
+    db: Session,
+    *,
+    file_record_id: UUID,
+    collection_id: UUID,
+    count: int,
+) -> None:
+    now = datetime.utcnow()
+    queue = (
+        db.query(AutoTMRematchQueue)
+        .filter(AutoTMRematchQueue.file_record_id == file_record_id)
+        .first()
+    )
+    if queue is None:
+        db.add(
+            AutoTMRematchQueue(
+                file_record_id=file_record_id,
+                collection_id=collection_id,
+                pending_entry_count=count,
+                first_pending_at=now,
+                last_pending_at=now,
+            )
+        )
+        return
+
+    queue.collection_id = collection_id
+    queue.pending_entry_count = int(queue.pending_entry_count or 0) + count
+    queue.status = "pending"
+    if queue.first_pending_at is None:
+        queue.first_pending_at = now
+    queue.last_pending_at = now
+
+
+def _resolve_refresh_collection_ids(
+    db: Session,
+    *,
+    file_record: FileRecord,
+    collection_id: UUID | None,
+    collection_ids: list[UUID] | None,
+) -> list[UUID]:
+    selected_ids = list(dict.fromkeys(collection_ids or ([] if collection_id is None else [collection_id])))
+    if not selected_ids:
+        selected_ids = _load_file_record_collection_ids(file_record)
+    if not selected_ids or not file_record.source_language or not file_record.target_language:
+        return []
+
+    collections = (
+        db.query(MemoryBase)
+        .filter(
+            MemoryBase.id.in_(selected_ids),
+            or_(MemoryBase.source_language.is_(None), MemoryBase.source_language == file_record.source_language),
+            or_(MemoryBase.target_language.is_(None), MemoryBase.target_language == file_record.target_language),
+        )
+        .all()
+    )
+    existing_ids = {collection.id for collection in collections}
+    return [collection_id for collection_id in selected_ids if collection_id in existing_ids]
+
+
+def _load_file_record_collection_ids(file_record: FileRecord) -> list[UUID]:
+    raw_ids = getattr(file_record, "collection_ids_json", "") or "[]"
+    parsed_ids: list[UUID] = []
+    try:
+        values = json.loads(raw_ids)
+    except (TypeError, ValueError):
+        values = []
+    if isinstance(values, list):
+        for value in values:
+            try:
+                parsed_ids.append(value if isinstance(value, UUID) else UUID(str(value)))
+            except (TypeError, ValueError):
+                continue
+    if not parsed_ids and file_record.collection_id:
+        parsed_ids.append(file_record.collection_id)
+    return list(dict.fromkeys(parsed_ids))
 
 
 def _parse_optional_datetime(value: str | datetime | None) -> datetime | None:

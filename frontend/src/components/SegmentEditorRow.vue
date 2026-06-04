@@ -103,6 +103,17 @@ const sourceLabel = computed(() => {
   }
   return sourceMeta.value.label
 })
+const showStatusTag = computed(() => {
+  const status = props.segment.status || 'none'
+  return status !== 'none' && status !== 'fuzzy'
+})
+const showSourceTag = computed(() => {
+  if (props.segment.status === 'none' || props.segment.status === 'fuzzy') {
+    return false
+  }
+  const source = props.segment.source || 'none'
+  return source !== 'none' && source !== 'fuzzy'
+})
 const sourceTitle = computed(() => {
   if (props.segment.source === 'llm' && props.segment.llm_model?.trim()) {
     return props.segment.llm_provider
@@ -1341,8 +1352,8 @@ watch(
   >
     <div class="segment-row__meta">
       <span class="segment-row__index">#{{ index + 1 }}</span>
-      <span class="segment-row__tag segment-row__tag--status">{{ statusMeta.label }}</span>
-      <span class="segment-row__tag is-muted" :class="sourceClass" :title="sourceTitle">{{ sourceLabel }}</span>
+      <span v-if="showStatusTag" class="segment-row__tag segment-row__tag--status">{{ statusMeta.label }}</span>
+      <span v-if="showSourceTag" class="segment-row__tag is-muted" :class="sourceClass" :title="sourceTitle">{{ sourceLabel }}</span>
       <span v-if="scorePercent !== null" class="segment-row__tag segment-row__tag--score">
         {{ scorePercent }}%
       </span>
