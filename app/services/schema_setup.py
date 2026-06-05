@@ -41,6 +41,21 @@ REQUIRED_SCHEMA = {
         "source_language",
         "target_language",
     },
+    "glossary_bases": {
+        "id",
+        "name",
+        "source_language",
+        "target_language",
+    },
+    "glossary_entries": {
+        "id",
+        "glossary_base_id",
+        "source_text",
+        "target_text",
+        "note",
+        "source_language",
+        "target_language",
+    },
     "users": {"nickname", "translator_type"},
     "projects": {
         "id",
@@ -77,6 +92,7 @@ REQUIRED_SCHEMA = {
         "term_base_ids",
         "term_base_write_ids",
         "qa_term_base_ids",
+        "glossary_base_ids",
         "deadline",
         "access_level",
     },
@@ -588,6 +604,126 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             FOR EACH ROW
             EXECUTE FUNCTION update_updated_at_column()
             """,
+            f"""
+            CREATE TABLE IF NOT EXISTS glossary_bases (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                name VARCHAR(120) NOT NULL,
+                description TEXT,
+                source_language VARCHAR(20) NOT NULL,
+                target_language VARCHAR(20) NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_bases
+            ADD COLUMN IF NOT EXISTS description TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_bases
+            ADD COLUMN IF NOT EXISTS source_language VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_bases
+            ADD COLUMN IF NOT EXISTS target_language VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_bases
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_bases
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_glossary_bases_name
+            ON glossary_bases (name)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_bases_language_pair
+            ON glossary_bases (source_language, target_language)
+            """,
+            """
+            DROP TRIGGER IF EXISTS update_glossary_bases_updated_at ON glossary_bases
+            """,
+            """
+            CREATE TRIGGER update_glossary_bases_updated_at
+            BEFORE UPDATE ON glossary_bases
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column()
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS glossary_entries (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                glossary_base_id UUID NOT NULL REFERENCES glossary_bases(id) ON DELETE CASCADE,
+                source_text TEXT NOT NULL,
+                target_text TEXT NOT NULL,
+                note TEXT,
+                source_normalized TEXT,
+                source_language VARCHAR(20) NOT NULL,
+                target_language VARCHAR(20) NOT NULL,
+                creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_entries
+            ADD COLUMN IF NOT EXISTS note TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_entries
+            ADD COLUMN IF NOT EXISTS source_normalized TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_entries
+            ADD COLUMN IF NOT EXISTS source_language VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_entries
+            ADD COLUMN IF NOT EXISTS target_language VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_entries
+            ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_entries
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_entries
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_entries_creator_id
+            ON glossary_entries (creator_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_entries_glossary_base_id
+            ON glossary_entries (glossary_base_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_entries_base_source_text
+            ON glossary_entries (glossary_base_id, source_text)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_entries_base_source_normalized
+            ON glossary_entries (glossary_base_id, source_normalized)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_entries_language_pair
+            ON glossary_entries (source_language, target_language)
+            """,
+            """
+            DROP TRIGGER IF EXISTS update_glossary_entries_updated_at ON glossary_entries
+            """,
+            """
+            CREATE TRIGGER update_glossary_entries_updated_at
+            BEFORE UPDATE ON glossary_entries
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column()
+            """,
             """
             ALTER TABLE IF EXISTS users
             ADD COLUMN IF NOT EXISTS nickname VARCHAR(50)
@@ -795,6 +931,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS file_records
             ADD COLUMN IF NOT EXISTS qa_term_base_ids TEXT NOT NULL DEFAULT '[]'
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS glossary_base_ids TEXT NOT NULL DEFAULT '[]'
             """,
             """
             ALTER TABLE IF EXISTS file_records

@@ -41,6 +41,7 @@ from app.models import (
     DocumentStatisticsReportItem,
     FileAssignment,
     FileRecord,
+    GlossaryBase,
     IssueMarker,
     MemoryBase,
     MemoryEntry,
@@ -144,6 +145,7 @@ from app.services.guideline_repository import (
     save_guideline_template,
     update_guideline_template,
 )
+from app.services.glossary_matcher import build_glossary_matches_by_text
 from app.services.llm_service import (
     LLMConfigurationError,
     LLMRequestError,
@@ -458,6 +460,10 @@ def _load_file_record_qa_term_base_ids(file_record: FileRecord) -> list[UUID]:
     return _load_file_record_uuid_ids(file_record, "qa_term_base_ids")
 
 
+def _load_file_record_glossary_base_ids(file_record: FileRecord) -> list[UUID]:
+    return _load_file_record_uuid_ids(file_record, "glossary_base_ids")
+
+
 def _store_file_record_term_base_ids(file_record: FileRecord, term_base_ids: list[UUID]) -> None:
     normalized_ids = list(dict.fromkeys(term_base_ids))
     _store_file_record_uuid_ids(
@@ -483,6 +489,10 @@ def _store_file_record_term_base_write_ids(file_record: FileRecord, term_base_id
 
 def _store_file_record_qa_term_base_ids(file_record: FileRecord, term_base_ids: list[UUID]) -> None:
     _store_file_record_uuid_ids(file_record, "qa_term_base_ids", term_base_ids)
+
+
+def _store_file_record_glossary_base_ids(file_record: FileRecord, glossary_base_ids: list[UUID]) -> None:
+    _store_file_record_uuid_ids(file_record, "glossary_base_ids", glossary_base_ids)
 
 
 def _serialize_file_record_upload_result(file_record: FileRecord) -> dict[str, Any]:
@@ -936,6 +946,7 @@ class LLMTranslateRequest(BaseModel):
     translation_guidelines: str = ""
     guideline_template_id: str | None = None
     temporary_prompt: str = ""
+    glossary_base_ids: list[UUID] | None = None
 
 
 class TermExtractionRequest(BaseModel):
@@ -962,6 +973,7 @@ class FileRecordBindingsRequest(BaseModel):
     term_base_ids: list[UUID] | None = None
     term_base_write_ids: list[UUID] | None = None
     qa_term_base_ids: list[UUID] | None = None
+    glossary_base_ids: list[UUID] | None = None
     collection_id: UUID | None = None
     collection_ids: list[UUID] | None = None
 
@@ -1807,6 +1819,7 @@ def _build_llm_translation_tasks(
     source_language: str | None = None,
     target_language: str | None = None,
     collection_id: UUID | None = None,
+    glossary_base_ids: list[UUID] | None = None,
     include_context: bool = False,
 ) -> list[LLMTranslationTask]:
     statuses_by_scope = {
@@ -1825,6 +1838,13 @@ def _build_llm_translation_tasks(
         db,
         [segment.matched_source_text for segment in segments if segment.matched_source_text],
         collection_id=collection_id,
+        source_language=source_language,
+        target_language=target_language,
+    )
+    glossary_matches_by_source = build_glossary_matches_by_text(
+        db,
+        [segment.source_text for segment in segments if segment.source_text],
+        glossary_base_ids or [],
         source_language=source_language,
         target_language=target_language,
     )
@@ -1859,6 +1879,7 @@ def _build_llm_translation_tasks(
                 cell_index=getattr(segment, "cell_index", None),
                 matched_source_text=matched_source_text,
                 tm_target_text=tm_target_text,
+                glossary_matches=glossary_matches_by_source.get(segment.source_text, []),
                 should_translate=should_translate,
             )
         )
@@ -2149,6 +2170,31 @@ def _validate_term_base_ids(
         raise HTTPException(status_code=404, detail="选择的术语库不存在。")
 
     return [term_base_by_id[term_base_id] for term_base_id in normalized_ids]
+
+
+def _validate_glossary_base_ids(
+    db: Session,
+    glossary_base_ids: list[UUID] | None,
+) -> list[GlossaryBase]:
+    if not glossary_base_ids:
+        return []
+
+    normalized_ids = list(dict.fromkeys(glossary_base_ids))
+    glossary_bases = (
+        db.query(GlossaryBase)
+        .filter(GlossaryBase.id.in_(normalized_ids))
+        .all()
+    )
+    glossary_base_by_id = {glossary_base.id: glossary_base for glossary_base in glossary_bases}
+    missing_ids = [
+        glossary_base_id
+        for glossary_base_id in normalized_ids
+        if glossary_base_id not in glossary_base_by_id
+    ]
+    if missing_ids:
+        raise HTTPException(status_code=404, detail="选择的词汇表不存在。")
+
+    return [glossary_base_by_id[glossary_base_id] for glossary_base_id in normalized_ids]
 
 
 def _require_selected_collection_ids(
@@ -2891,6 +2937,7 @@ def _build_project_file_payload(
     term_base_ids = _load_file_record_term_base_ids(file_record)
     term_base_write_ids = _load_file_record_term_base_write_ids(file_record)
     qa_term_base_ids = _load_file_record_qa_term_base_ids(file_record)
+    glossary_base_ids = _load_file_record_glossary_base_ids(file_record)
 
     return {
         "id": str(file_record.id),
@@ -2922,6 +2969,7 @@ def _build_project_file_payload(
         "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
         "term_base_write_ids": [str(term_base_id) for term_base_id in term_base_write_ids],
         "qa_term_base_ids": [str(term_base_id) for term_base_id in qa_term_base_ids],
+        "glossary_base_ids": [str(glossary_base_id) for glossary_base_id in glossary_base_ids],
         "issue_count": issue_stats.get("issue_count", 0),
         "open_issue_count": issue_stats.get("open_issue_count", 0),
         "can_manage": _can_manage_workflow(current_user),
@@ -5096,6 +5144,7 @@ def get_file_record(
     term_base_ids = _load_file_record_term_base_ids(file_record)
     term_base_write_ids = _load_file_record_term_base_write_ids(file_record)
     qa_term_base_ids = _load_file_record_qa_term_base_ids(file_record)
+    glossary_base_ids = _load_file_record_glossary_base_ids(file_record)
     term_base_names: list[str] = []
     all_bound_term_base_ids = list(dict.fromkeys(term_base_ids + term_base_write_ids + qa_term_base_ids))
     term_base_by_id: dict[UUID, TermBase] = {}
@@ -5113,6 +5162,19 @@ def get_file_record(
         ]
         if term_base_name is None and term_base_names:
             term_base_name = term_base_names[0]
+    glossary_base_names: list[str] = []
+    if glossary_base_ids:
+        glossary_bases = (
+            db.query(GlossaryBase)
+            .filter(GlossaryBase.id.in_(glossary_base_ids))
+            .all()
+        )
+        glossary_base_by_id = {glossary_base.id: glossary_base for glossary_base in glossary_bases}
+        glossary_base_names = [
+            glossary_base_by_id[glossary_base_id].name
+            for glossary_base_id in glossary_base_ids
+            if glossary_base_id in glossary_base_by_id
+        ]
 
     project_guidelines = ""
     if file_record.project_id:
@@ -5160,6 +5222,8 @@ def get_file_record(
             for term_base_id in qa_term_base_ids
             if term_base_id in term_base_by_id
         ],
+        "glossary_base_ids": [str(glossary_base_id) for glossary_base_id in glossary_base_ids],
+        "glossary_base_names": glossary_base_names,
         "translation_guidelines": project_guidelines,
         "created_at": file_record.created_at.isoformat(),
         "updated_at": file_record.updated_at.isoformat(),
@@ -5413,7 +5477,7 @@ def duplicate_file_record_task(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    """复制一个文件任务，保留源文件、句段和当前译文状态。"""
+    """复制一个文件任务，保留源文件和句段原文，不复制译文。"""
     duplicate = duplicate_file_record(
         db,
         file_record_id,
@@ -5794,6 +5858,15 @@ def patch_file_record_bindings(
             raise HTTPException(status_code=400, detail="QA术语库必须先启用。")
         _store_file_record_qa_term_base_ids(file_record, qa_ids)
 
+    if "glossary_base_ids" in payload.model_fields_set:
+        glossary_bases = _validate_glossary_base_ids(db, payload.glossary_base_ids)
+        for glossary_base in glossary_bases:
+            _ensure_resource_language_pair_matches(glossary_base, source_language, target_language, "词汇表")
+        _store_file_record_glossary_base_ids(
+            file_record,
+            [glossary_base.id for glossary_base in glossary_bases],
+        )
+
     after_collection_binding = (
         tuple(_load_file_record_collection_ids(file_record)),
         file_record.collection_id,
@@ -5812,6 +5885,7 @@ def patch_file_record_bindings(
     term_base_ids = _load_file_record_term_base_ids(file_record)
     term_base_write_ids = _load_file_record_term_base_write_ids(file_record)
     qa_term_base_ids = _load_file_record_qa_term_base_ids(file_record)
+    glossary_base_ids = _load_file_record_glossary_base_ids(file_record)
     return {
         "id": str(file_record.id),
         "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
@@ -5820,6 +5894,7 @@ def patch_file_record_bindings(
         "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
         "term_base_write_ids": [str(term_base_id) for term_base_id in term_base_write_ids],
         "qa_term_base_ids": [str(term_base_id) for term_base_id in qa_term_base_ids],
+        "glossary_base_ids": [str(glossary_base_id) for glossary_base_id in glossary_base_ids],
     }
 
 
@@ -6996,6 +7071,19 @@ async def llm_translate_file_record(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     guidelines = _resolve_llm_guidelines(db, file_record, body)
+    if "glossary_base_ids" in body.model_fields_set:
+        glossary_bases = _validate_glossary_base_ids(db, body.glossary_base_ids)
+        glossary_base_ids = [glossary_base.id for glossary_base in glossary_bases]
+    else:
+        glossary_base_ids = _load_file_record_glossary_base_ids(file_record)
+        glossary_bases = _validate_glossary_base_ids(db, glossary_base_ids)
+    for glossary_base in glossary_bases:
+        _ensure_resource_language_pair_matches(
+            glossary_base,
+            source_language,
+            target_language,
+            "词汇表",
+        )
 
     translation_tasks = _build_llm_translation_tasks(
         db=db,
@@ -7004,6 +7092,7 @@ async def llm_translate_file_record(
         source_language=source_language,
         target_language=target_language,
         collection_id=file_record.collection_id,
+        glossary_base_ids=glossary_base_ids,
         include_context=body.translation_unit == "paragraph",
     )
 
@@ -7022,6 +7111,7 @@ async def llm_translate_file_record(
                 "translation_unit": body.translation_unit,
                 "source_language": source_language,
                 "target_language": target_language,
+                "glossary_base_ids": [str(glossary_base_id) for glossary_base_id in glossary_base_ids],
                 "total": total_count,
             },
         )

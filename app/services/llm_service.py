@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import AsyncIterator, Literal
 from urllib import error as urllib_error
@@ -14,6 +14,7 @@ from urllib import request as urllib_request
 from app.config import Settings, get_settings
 from app.services.language_pairs import LANGUAGE_LABELS
 from app.services.normalizer import build_source_hash, normalize_text
+from app.services.glossary_matcher import GlossaryMatch
 
 try:
     import httpx
@@ -57,6 +58,7 @@ class LLMTranslationTask:
     cell_index: int | None = None
     matched_source_text: str | None = None
     tm_target_text: str | None = None
+    glossary_matches: list[GlossaryMatch] = field(default_factory=list)
     should_translate: bool = True
 
 
@@ -665,6 +667,8 @@ def _build_messages(
             "\n\n以下是本项目的翻译细则，请在翻译时严格遵守：\n"
             + translation_guidelines
         )
+    if _has_glossary_matches(group.tasks):
+        system_prompt += "\n\n" + _glossary_system_instruction()
     retry_instruction = ""
     if strict_retry:
         retry_instruction = (
@@ -687,6 +691,7 @@ def _build_messages(
                     f"翻译记忆库匹配到的原文：{task.matched_source_text or '无'}\n"
                     f"翻译记忆库的译文：{task.tm_target_text or '无'}\n"
                     f"两个原文之间的差异：{_describe_diff(task.source_text, task.matched_source_text or '')}\n\n"
+                    f"{_optional_glossary_prompt_block(task)}"
                     "请严格遵守以下要求：\n"
                     "1. 把“翻译记忆库的译文”当作基础译文，优先保留其中仍然适用的表达、术语、句式和语气。\n"
                     "2. 重点根据两个原文之间的差异，对基础译文做对应修改，而不是忽略基础译文直接整句重译。\n"
@@ -709,6 +714,7 @@ def _build_messages(
                     "如果内容中包含可翻译文字，只翻译文字部分，并尽量保留数字和原有排版格式。\n"
                     "除非原文明确体现需要按目标语言转换的数字单位或本地格式，否则不要擅自改动千分位、小数点、货币符号、编号格式或特殊符号。\n\n"
                     f"原文：{task.source_text}\n\n"
+                    f"{_optional_glossary_prompt_block(task)}"
                     f"只输出最终结果。{retry_instruction}"
                 ),
             },
@@ -723,6 +729,7 @@ def _build_messages(
                 "不要补充未提供的上下文，也不要参考前后句。"
                 "\n"
                 f"原文：{task.source_text}\n\n"
+                f"{_optional_glossary_prompt_block(task)}"
                 f"请严格保留原文中的数字、复选框、勾选框、项目符号、箭头和特殊符号，不得擅自新增、替换或改变其状态。\n\n只输出{target_label}译文。{retry_instruction}"
             ),
         },
@@ -741,6 +748,41 @@ def _is_numeric_like_fragment(text: str) -> bool:
     if not normalized:
         return False
     return bool(NUMERIC_LIKE_FRAGMENT_RE.fullmatch(normalized))
+
+
+def _has_glossary_matches(tasks: list[LLMTranslationTask]) -> bool:
+    return any(task.glossary_matches for task in tasks)
+
+
+def _glossary_matches_payload(task: LLMTranslationTask) -> list[dict[str, str]]:
+    return [match.as_prompt_payload() for match in task.glossary_matches]
+
+
+def _format_glossary_matches_for_prompt(task: LLMTranslationTask) -> str:
+    if not task.glossary_matches:
+        return "无"
+
+    lines: list[str] = []
+    for index, match in enumerate(task.glossary_matches, 1):
+        line = f"{index}. {match.source_text} => {match.target_text}"
+        if match.note:
+            line += f"；备注：{match.note}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _optional_glossary_prompt_block(task: LLMTranslationTask) -> str:
+    if not task.glossary_matches:
+        return ""
+    return f"词汇表命中：\n{_format_glossary_matches_for_prompt(task)}\n\n"
+
+
+def _glossary_system_instruction() -> str:
+    return (
+        "如果输入中提供了 glossary_matches，它们来自用户维护的预翻译词汇表。"
+        "命中词汇默认必须采用给定译文；备注用于判断适用场景，只有在当前上下文明显不适用时才可不采用。"
+    )
+
 
 def _extract_preserved_symbol_sequence(text: str) -> list[str]:
     return [char for char in text if char in STRICT_PRESERVE_SYMBOLS]
@@ -1059,6 +1101,8 @@ def _build_paragraph_messages(
     )
     if translation_guidelines:
         system_prompt += "\n\n以下是本项目的翻译细则，请严格遵守：\n" + translation_guidelines
+    if _has_glossary_matches(group.tasks):
+        system_prompt += "\n\n" + _glossary_system_instruction()
 
     retry_instruction = ""
     if strict_retry:
@@ -1082,6 +1126,8 @@ def _build_paragraph_messages(
             item["matched_source_text"] = task.matched_source_text or ""
             item["tm_target_text"] = task.tm_target_text or ""
             item["diff"] = _describe_diff(task.source_text, task.matched_source_text or "")
+        if task.glossary_matches:
+            item["glossary_matches"] = _glossary_matches_payload(task)
         sentences_payload.append(item)
 
     request_payload = {
@@ -1215,6 +1261,7 @@ def _build_batch_messages(
                 f"    记忆库原文：{task.matched_source_text or '无'}\n"
                 f"    记忆库译文：{task.tm_target_text or '无'}\n"
                 f"    差异：{diff}"
+                + (f"\n    词汇表命中：{_format_glossary_matches_for_prompt(task)}" if task.glossary_matches else "")
             )
         user_content = (
             f"请基于翻译记忆库参考译文，逐条修正以下句子的{target_label}翻译。\n"
@@ -1225,7 +1272,11 @@ def _build_batch_messages(
             + retry_instruction
         )
     elif group.group_type == "numeric":
-        lines = [f"[{idx}] {task.source_text}" for idx, task in enumerate(group.tasks, 1)]
+        lines = [
+            f"[{idx}] {task.source_text}"
+            + (f"\n    词汇表命中：{_format_glossary_matches_for_prompt(task)}" if task.glossary_matches else "")
+            for idx, task in enumerate(group.tasks, 1)
+        ]
         user_content = (
             f"请处理以下内容并输出{target_label}目标文本。\n"
             f"如果内容只是数字、金额、百分比、日期、编号或符号，并且在{target_label}中通常可直接沿用，请原样输出。\n"
@@ -1236,7 +1287,11 @@ def _build_batch_messages(
             + retry_instruction
         )
     else:
-        lines = [f"[{idx}] {task.source_text}" for idx, task in enumerate(group.tasks, 1)]
+        lines = [
+            f"[{idx}] {task.source_text}"
+            + (f"\n    词汇表命中：{_format_glossary_matches_for_prompt(task)}" if task.glossary_matches else "")
+            for idx, task in enumerate(group.tasks, 1)
+        ]
         user_content = (
             f"请将以下编号片段从{source_label}翻译为{target_label}。\n"
             "逐条独立翻译，不要补充未提供的上下文。\n"

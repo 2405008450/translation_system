@@ -25,7 +25,7 @@ from app.services.xlsx_exporter import XLSX_MEDIA_TYPE
 
 logger = logging.getLogger(__name__)
 
-ResourceExportKind = Literal["tm", "term"]
+ResourceExportKind = Literal["tm", "term", "glossary"]
 ResourceExportFormat = Literal["xlsx", "tmx"]
 ResourceExportStatus = Literal["queued", "running", "completed", "failed"]
 ProgressCallback = Callable[[int, str], None]
@@ -224,12 +224,65 @@ def export_term_base_now(
     )
 
 
+def export_glossary_base_now(
+    *,
+    db: Session,
+    glossary_base_id: UUID,
+    export_format: ResourceExportFormat,
+    output_path: Path,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    from app.models import GlossaryBase, GlossaryEntry
+
+    glossary_base = db.query(GlossaryBase).filter(GlossaryBase.id == glossary_base_id).first()
+    if glossary_base is None:
+        raise ValueError("词汇表不存在。")
+
+    total_entries = (
+        db.query(GlossaryEntry)
+        .filter(GlossaryEntry.glossary_base_id == glossary_base.id)
+        .count()
+    )
+    progress = progress_callback or _noop_progress_callback
+    progress(10, "正在读取词汇表条目。")
+    if export_format == "xlsx":
+        _write_xlsx_file(
+            output_path=output_path,
+            sheet_title=glossary_base.name,
+            headers=["原文", "译文", "备注", "源语言", "目标语言", "创建时间", "更新时间"],
+            row_iter=_iter_glossary_xlsx_rows(db, glossary_base.id),
+            total_entries=total_entries,
+            progress_callback=progress,
+        )
+    elif export_format == "tmx":
+        _write_tmx_file(
+            output_path=output_path,
+            source_language=glossary_base.source_language or "und",
+            target_language=glossary_base.target_language or "und",
+            rows=_iter_glossary_tmx_rows(db, glossary_base.id),
+            total_entries=total_entries,
+            progress_callback=progress,
+            filename=glossary_base.name,
+            tuid_prefix="glossary",
+        )
+    else:
+        raise ValueError("不支持的导出格式。")
+
+    return _build_export_result(
+        resource_name=glossary_base.name,
+        filename_suffix="glossary",
+        export_format=export_format,
+        output_path=output_path,
+        total_entries=total_entries,
+    )
+
+
 def _run_resource_export_task(task_id: str, payload: dict[str, Any]) -> None:
     resource_type = payload.get("resource_type")
     export_format = payload.get("format")
     try:
         resource_id = UUID(str(payload["resource_id"]))
-        if resource_type not in ("tm", "term") or export_format not in ("xlsx", "tmx"):
+        if resource_type not in ("tm", "term", "glossary") or export_format not in ("xlsx", "tmx"):
             raise ValueError("导出任务参数不正确。")
 
         output_dir = _ensure_export_dir()
@@ -257,10 +310,18 @@ def _run_resource_export_task(task_id: str, payload: dict[str, Any]) -> None:
                     output_path=output_path,
                     progress_callback=update_progress,
                 )
-            else:
+            elif resource_type == "term":
                 result = export_term_base_now(
                     db=db,
                     term_base_id=resource_id,
+                    export_format=export_format,
+                    output_path=output_path,
+                    progress_callback=update_progress,
+                )
+            else:
+                result = export_glossary_base_now(
+                    db=db,
+                    glossary_base_id=resource_id,
                     export_format=export_format,
                     output_path=output_path,
                     progress_callback=update_progress,
@@ -429,6 +490,35 @@ def _iter_term_xlsx_rows(db: Session, term_base_id: UUID):
         ]
 
 
+def _iter_glossary_xlsx_rows(db: Session, glossary_base_id: UUID):
+    from app.models import GlossaryEntry
+
+    query = (
+        db.query(
+            GlossaryEntry.source_text,
+            GlossaryEntry.target_text,
+            GlossaryEntry.note,
+            GlossaryEntry.source_language,
+            GlossaryEntry.target_language,
+            GlossaryEntry.created_at,
+            GlossaryEntry.updated_at,
+        )
+        .filter(GlossaryEntry.glossary_base_id == glossary_base_id)
+        .order_by(GlossaryEntry.updated_at.desc(), GlossaryEntry.created_at.desc())
+        .execution_options(stream_results=True)
+    )
+    for row in query.yield_per(EXPORT_QUERY_BATCH_SIZE):
+        yield [
+            row.source_text,
+            row.target_text,
+            row.note or "",
+            row.source_language or "",
+            row.target_language or "",
+            _format_datetime(row.created_at),
+            _format_datetime(row.updated_at),
+        ]
+
+
 def _iter_tm_tmx_rows(db: Session, collection_id: UUID):
     from app.models import TranslationMemory
 
@@ -457,6 +547,23 @@ def _iter_term_tmx_rows(db: Session, term_base_id: UUID):
         )
         .filter(TermEntry.term_base_id == term_base_id)
         .order_by(TermEntry.updated_at.desc(), TermEntry.created_at.desc())
+        .execution_options(stream_results=True)
+    )
+    for row in query.yield_per(EXPORT_QUERY_BATCH_SIZE):
+        yield row.id, row.source_text, row.target_text
+
+
+def _iter_glossary_tmx_rows(db: Session, glossary_base_id: UUID):
+    from app.models import GlossaryEntry
+
+    query = (
+        db.query(
+            GlossaryEntry.id,
+            GlossaryEntry.source_text,
+            GlossaryEntry.target_text,
+        )
+        .filter(GlossaryEntry.glossary_base_id == glossary_base_id)
+        .order_by(GlossaryEntry.updated_at.desc(), GlossaryEntry.created_at.desc())
         .execution_options(stream_results=True)
     )
     for row in query.yield_per(EXPORT_QUERY_BATCH_SIZE):

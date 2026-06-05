@@ -115,6 +115,7 @@ export interface FileRecordSummary {
   can_write?: boolean
   created_at: string
   updated_at: string
+  glossary_base_ids?: string[]
 }
 
 export interface ProjectAssignmentItem {
@@ -371,6 +372,8 @@ export interface FileRecordDetail {
   term_base_write_names: string[]
   qa_term_base_ids: string[]
   qa_term_base_names: string[]
+  glossary_base_ids: string[]
+  glossary_base_names: string[]
   translation_guidelines: string
   created_at: string
   updated_at: string
@@ -522,6 +525,17 @@ export interface TermBase {
   entry_count: number
 }
 
+export interface GlossaryBase {
+  id: string
+  name: string
+  description: string | null
+  source_language: string
+  target_language: string
+  created_at: string
+  updated_at: string
+  entry_count: number
+}
+
 export interface ProjectTermBaseSettingRow {
   id: string
   name: string
@@ -661,6 +675,25 @@ export interface TermEntryRecord {
   updated_at: string
 }
 
+export interface GlossaryEntryRecord {
+  id: string
+  glossary_base_id: string
+  source_text: string
+  target_text: string
+  note: string | null
+  source_language: string
+  target_language: string
+  creator_name: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface GlossaryMatch {
+  source_text: string
+  target_text: string
+  note: string | null
+}
+
 export interface TermEntryConflict {
   id: string
   term_base_id: string
@@ -769,6 +802,19 @@ export interface TermImportSummary {
   imported_rows: number
   term_base_id: string
   term_base_name: string
+  source_language: string
+  target_language: string
+}
+
+export interface GlossaryImportSummary {
+  filename: string
+  created_rows: number
+  updated_rows: number
+  skipped_empty_rows: number
+  skipped_header_rows: number
+  imported_rows: number
+  glossary_base_id: string
+  glossary_base_name: string
   source_language: string
   target_language: string
 }

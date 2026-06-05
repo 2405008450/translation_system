@@ -106,6 +106,12 @@ const navGroups = computed<NavGroup[]>(() => [
         visible: true,
       },
       {
+        name: 'glossary',
+        label: t('shell.sections.glossary'),
+        icon: FileText,
+        visible: true,
+      },
+      {
         name: 'translation-rules',
         label: t('shell.sections.translationRules'),
         icon: FileText,
@@ -195,6 +201,17 @@ const breadcrumbs = computed(() => {
       return [
         { label: t('shell.sections.assets') },
         { label: t('shell.sections.termBase') },
+      ]
+    case 'glossary':
+      return [
+        { label: t('shell.sections.assets') },
+        { label: t('shell.sections.glossary') },
+      ]
+    case 'glossary-edit':
+      return [
+        { label: t('shell.sections.assets') },
+        { label: t('shell.sections.glossary'), to: { name: 'glossary' } },
+        { label: pageTitle.value },
       ]
     case 'translation-rules':
       return [
@@ -377,7 +394,7 @@ function getRecentIcon(section: string) {
   if (section === 'tasks') {
     return ClipboardList
   }
-  if (section === 'tm' || section === 'term-base') {
+  if (section === 'tm' || section === 'term-base' || section === 'glossary') {
     return BookOpen
   }
   if (section === 'translation-rules') {
@@ -387,7 +404,7 @@ function getRecentIcon(section: string) {
 }
 
 watch(() => route.meta.navSection, (section) => {
-  if (section === 'tm' || section === 'term-base' || section === 'translation-rules') {
+  if (section === 'tm' || section === 'term-base' || section === 'glossary' || section === 'translation-rules') {
     expandedGroups.assets = true
   }
   if (section === 'users' || section === 'assignment-events') {
@@ -423,7 +440,7 @@ watch(
       return
     }
 
-    if (!['project-detail', 'workbench', 'tm-edit', 'term-base-edit'].includes(String(name))) {
+    if (!['project-detail', 'workbench', 'tm-edit', 'term-base-edit', 'glossary-edit'].includes(String(name))) {
       return
     }
 

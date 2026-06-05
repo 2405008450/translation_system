@@ -181,6 +181,12 @@ class FileRecord(Base):
         default="[]",
         server_default=text("'[]'"),
     )
+    glossary_base_ids: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="[]",
+        server_default=text("'[]'"),
+    )
     deadline: Mapped[DateTime | None] = mapped_column(
         DateTime(timezone=False), nullable=True
     )
@@ -1358,6 +1364,94 @@ class TermEntry(Base):
     term_base: Mapped[TermBase] = relationship(
         "TermBase",
         back_populates="term_entries",
+    )
+    creator: Mapped["User | None"] = relationship(
+        "User", foreign_keys=[creator_id]
+    )
+
+
+class GlossaryBase(Base):
+    __tablename__ = "glossary_bases"
+    __table_args__ = (
+        Index("uq_glossary_bases_name", "name", unique=True),
+        Index("ix_glossary_bases_language_pair", "source_language", "target_language"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    target_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    entries: Mapped[list["GlossaryEntry"]] = relationship(
+        "GlossaryEntry",
+        back_populates="glossary_base",
+        cascade="all, delete-orphan",
+    )
+
+
+class GlossaryEntry(Base):
+    __tablename__ = "glossary_entries"
+    __table_args__ = (
+        Index("ix_glossary_entries_glossary_base_id", "glossary_base_id"),
+        Index("ix_glossary_entries_base_source_text", "glossary_base_id", "source_text"),
+        Index(
+            "ix_glossary_entries_base_source_normalized",
+            "glossary_base_id",
+            "source_normalized",
+        ),
+        Index("ix_glossary_entries_language_pair", "source_language", "target_language"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    glossary_base_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("glossary_bases.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_text: Mapped[str] = mapped_column(Text, nullable=False)
+    target_text: Mapped[str] = mapped_column(Text, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_normalized: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    target_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    creator_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    glossary_base: Mapped[GlossaryBase] = relationship(
+        "GlossaryBase",
+        back_populates="entries",
     )
     creator: Mapped["User | None"] = relationship(
         "User", foreign_keys=[creator_id]

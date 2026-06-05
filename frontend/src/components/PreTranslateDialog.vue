@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { BookOpenCheck, Bot, Check, Database, Loader2, Search, Sparkles, Upload, X } from 'lucide-vue-next'
+import { BookOpen, BookOpenCheck, Bot, Check, Database, Loader2, Search, Sparkles, Upload, X } from 'lucide-vue-next'
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
@@ -7,7 +7,7 @@ import { http } from '../api/http'
 import { canonicalizeLanguagePair, formatLanguagePair } from '../constants/languages'
 import { llmModelOptions as baseLLMModelOptions } from '../constants/llm'
 import { pushToast } from '../composables/useToast'
-import type { GuidelineTemplateSummary, LLMProvider, LLMTranslateScope, TermBase, TMCollection } from '../types/api'
+import type { GlossaryBase, GuidelineTemplateSummary, LLMProvider, LLMTranslateScope, TermBase, TMCollection } from '../types/api'
 import { consumeLLMStream } from '../utils/llmStream'
 import { isProgressComplete } from '../utils/progress'
 import Modal from './base/Modal.vue'
@@ -17,6 +17,7 @@ interface ProjectFileItem {
   filename: string
   source_language: string | null
   target_language: string | null
+  glossary_base_ids?: string[]
   is_edit_locked?: boolean
   active_operation_message?: string
 }
@@ -64,6 +65,7 @@ const currentAbortController = ref<AbortController | null>(null)
 
 const tmCollections = ref<TMCollection[]>([])
 const termBases = ref<TermBase[]>([])
+const glossaryBases = ref<GlossaryBase[]>([])
 const guidelineTemplates = ref<GuidelineTemplateSummary[]>([])
 
 const useTm = ref(true)
@@ -86,6 +88,10 @@ const guidelineTemplateInputRef = ref<HTMLInputElement | null>(null)
 const useTermBase = ref(false)
 const termBaseIds = ref<string[]>([])
 const termBaseSearchQuery = ref('')
+
+const useGlossary = ref(false)
+const glossaryBaseIds = ref<string[]>([])
+const glossarySearchQuery = ref('')
 
 const errorMessage = ref('')
 const finishedCount = ref(0)
@@ -162,7 +168,7 @@ const languagePairIssue = computed(() => {
   return ''
 })
 
-function resourceMatchesSelectedLanguagePair(resource: TMCollection | TermBase) {
+function resourceMatchesSelectedLanguagePair(resource: TMCollection | TermBase | GlossaryBase) {
   const selectedPair = selectedFileLanguagePair.value
   const resourcePair = canonicalizeLanguagePair(resource.source_language, resource.target_language)
   if (!selectedPair || !resourcePair) {
@@ -189,6 +195,14 @@ const selectedTermBaseIds = computed(() => (
   normalizeResourceIds(termBaseIds.value, availableTermBases.value)
 ))
 
+const availableGlossaryBases = computed(() => {
+  return glossaryBases.value.filter((glossaryBase) => resourceMatchesSelectedLanguagePair(glossaryBase))
+})
+
+const selectedGlossaryBaseIds = computed(() => (
+  normalizeResourceIds(glossaryBaseIds.value, availableGlossaryBases.value)
+))
+
 const filteredTMCollections = computed(() => (
   filterResources(availableTMCollections.value, tmSearchQuery.value)
 ))
@@ -197,12 +211,20 @@ const filteredTermBases = computed(() => (
   filterResources(availableTermBases.value, termBaseSearchQuery.value)
 ))
 
+const filteredGlossaryBases = computed(() => (
+  filterResources(availableGlossaryBases.value, glossarySearchQuery.value)
+))
+
 const hiddenTMCollectionCount = computed(() => (
   Math.max(0, tmCollections.value.length - availableTMCollections.value.length)
 ))
 
 const hiddenTermBaseCount = computed(() => (
   Math.max(0, termBases.value.length - availableTermBases.value.length)
+))
+
+const hiddenGlossaryBaseCount = computed(() => (
+  Math.max(0, glossaryBases.value.length - availableGlossaryBases.value.length)
 ))
 
 const selectedTMCollections = computed(() => {
@@ -215,13 +237,18 @@ const selectedTermBases = computed(() => {
   return availableTermBases.value.filter((termBase) => selectedIds.has(termBase.id))
 })
 
+const selectedGlossaryBases = computed(() => {
+  const selectedIds = new Set(selectedGlossaryBaseIds.value)
+  return availableGlossaryBases.value.filter((glossaryBase) => selectedIds.has(glossaryBase.id))
+})
+
 const selectedDisplayFiles = computed(() => (
   running.value && runFiles.value.length > 0 ? runFiles.value : props.files
 ))
 const selectedCount = computed(() => selectedDisplayFiles.value.length)
 const selectedFilePreview = computed(() => selectedDisplayFiles.value.slice(0, 4))
 const configuredActionCount = computed(() => (
-  Number(useTm.value) + Number(useLlm.value) + Number(useTermBase.value)
+  Number(useTm.value) + Number(useGlossary.value) + Number(useLlm.value) + Number(useTermBase.value)
 ))
 const progressFiles = computed(() => (
   runFiles.value.length > 0 ? runFiles.value : props.files
@@ -252,6 +279,11 @@ watch(availableTMCollections, () => {
 
 watch(availableTermBases, () => {
   termBaseIds.value = normalizeResourceIds(termBaseIds.value, availableTermBases.value)
+})
+
+watch(availableGlossaryBases, () => {
+  glossaryBaseIds.value = normalizeResourceIds(glossaryBaseIds.value, availableGlossaryBases.value)
+  applyGlossaryDefaultsFromFiles()
 })
 
 watch(llmModel, (modelId) => {
@@ -285,7 +317,7 @@ function normalizeProgress(progress: number) {
 function getRunActionCount() {
   return Math.max(
     1,
-    Number(shouldRunTm.value) + Number(useLlm.value) + Number(useTermBase.value),
+    Number(shouldRunTm.value) + Number(useGlossary.value) + Number(useLlm.value) + Number(useTermBase.value),
   )
 }
 
@@ -378,12 +410,24 @@ function toggleTermBase(termBaseId: string, event: Event) {
   )
 }
 
+function toggleGlossaryBase(glossaryBaseId: string, event: Event) {
+  const checked = (event.target as HTMLInputElement).checked
+  glossaryBaseIds.value = normalizeResourceIds(
+    setSelectedResourceId(glossaryBaseIds.value, glossaryBaseId, checked),
+    availableGlossaryBases.value,
+  )
+}
+
 function selectAllTmCollections() {
   tmCollectionIds.value = availableTMCollections.value.map((collection) => collection.id)
 }
 
 function selectAllTermBases() {
   termBaseIds.value = availableTermBases.value.map((termBase) => termBase.id)
+}
+
+function selectAllGlossaryBases() {
+  glossaryBaseIds.value = availableGlossaryBases.value.map((glossaryBase) => glossaryBase.id)
 }
 
 function clearTmCollections() {
@@ -394,6 +438,35 @@ function clearTermBases() {
   termBaseIds.value = []
 }
 
+function clearGlossaryBases() {
+  glossaryBaseIds.value = []
+}
+
+function getBoundGlossaryBaseIdsFromFiles() {
+  const orderedIds: string[] = []
+  const seenIds = new Set<string>()
+  for (const file of props.files) {
+    for (const glossaryBaseId of file.glossary_base_ids || []) {
+      if (!seenIds.has(glossaryBaseId)) {
+        seenIds.add(glossaryBaseId)
+        orderedIds.push(glossaryBaseId)
+      }
+    }
+  }
+  return orderedIds
+}
+
+function applyGlossaryDefaultsFromFiles() {
+  if (running.value || glossaryBaseIds.value.length > 0) {
+    return
+  }
+  const boundIds = normalizeResourceIds(getBoundGlossaryBaseIdsFromFiles(), availableGlossaryBases.value)
+  if (boundIds.length > 0) {
+    glossaryBaseIds.value = boundIds
+    useGlossary.value = true
+  }
+}
+
 function resourceEntryCountLabel(count: number) {
   return t('projectDetail.preTranslate.resources.entryCount', { count })
 }
@@ -401,14 +474,17 @@ function resourceEntryCountLabel(count: number) {
 async function loadResources() {
   loadingResources.value = true
   try {
-    const [{ data: collections }, { data: bases }, { data: templates }] = await Promise.all([
+    const [{ data: collections }, { data: bases }, { data: glossaries }, { data: templates }] = await Promise.all([
       http.get<TMCollection[]>('/translation-memory/collections'),
       http.get<TermBase[]>('/term-bases'),
+      http.get<GlossaryBase[]>('/glossary-bases'),
       http.get<GuidelineTemplateSummary[]>('/guideline-templates'),
     ])
     tmCollections.value = collections
     termBases.value = bases
+    glossaryBases.value = glossaries
     guidelineTemplates.value = templates
+    applyGlossaryDefaultsFromFiles()
     if (
       selectedGuidelineTemplateId.value
       && !templates.some((template) => template.id === selectedGuidelineTemplateId.value)
@@ -461,16 +537,20 @@ async function importGuidelineTemplate(event: Event) {
 }
 
 function validateBeforeStart() {
-  if (!useTm.value && !useLlm.value && !useTermBase.value) {
+  if (!useTm.value && !useGlossary.value && !useLlm.value && !useTermBase.value) {
     errorMessage.value = t('projectDetail.preTranslate.errors.selectOneOption')
     return false
   }
-  if ((useTm.value || useTermBase.value) && languagePairIssue.value) {
+  if ((useTm.value || useGlossary.value || useTermBase.value) && languagePairIssue.value) {
     errorMessage.value = languagePairIssue.value
     return false
   }
   if (useTm.value && selectedTmCollectionIds.value.length === 0) {
     errorMessage.value = t('projectDetail.preTranslate.errors.tmCollectionRequired')
+    return false
+  }
+  if (useGlossary.value && selectedGlossaryBaseIds.value.length === 0) {
+    errorMessage.value = t('projectDetail.preTranslate.errors.glossaryBaseRequired')
     return false
   }
   if (useTermBase.value && selectedTermBaseIds.value.length === 0) {
@@ -588,6 +668,7 @@ async function runLLMForFile(fileId: string, completedActions: number, actionCou
         model: llmModel.value || null,
         guideline_template_id: selectedGuidelineTemplateId.value || null,
         temporary_prompt: llmGuidelines.value,
+        glossary_base_ids: useGlossary.value ? selectedGlossaryBaseIds.value : [],
       }),
       signal: controller.signal,
     })
@@ -710,6 +791,25 @@ async function startPreTranslate() {
             file.id,
             getActionProgress(completedActions, 0, actionCount),
             t('projectDetail.preTranslate.progress.tmDone'),
+          )
+        }
+
+        if (useGlossary.value && !stopRequested.value) {
+          setFileProgress(
+            file.id,
+            getActionProgress(completedActions, 0, actionCount),
+            t('projectDetail.preTranslate.progress.glossaryRunning'),
+          )
+          await http.patch(`/file-records/${file.id}/bindings`, {
+            glossary_base_ids: selectedGlossaryBaseIds.value,
+          }, {
+            headers: buildOperationHeaders(operationToken),
+          })
+          completedActions += 1
+          setFileProgress(
+            file.id,
+            getActionProgress(completedActions, 0, actionCount),
+            t('projectDetail.preTranslate.progress.glossaryDone'),
           )
         }
 
@@ -981,6 +1081,106 @@ function stopPreTranslate() {
             <label><input v-model="tmAutoConfirmExact" type="checkbox" :disabled="running || !useTm" />{{ t('projectDetail.preTranslate.tm.autoConfirmExact') }}</label>
           </div>
         </div>
+
+      <div class="ptd-section ptd-section--glossary" :class="{ 'is-disabled': !useGlossary }">
+        <div class="ptd-section__head">
+          <label class="ptd-switch">
+            <input v-model="useGlossary" type="checkbox" :disabled="running" />
+            <span class="ptd-switch__control" aria-hidden="true" />
+            <span class="ptd-section__icon"><BookOpen :size="17" /></span>
+            <span>{{ t('projectDetail.preTranslate.sections.glossary') }}</span>
+          </label>
+        </div>
+
+        <div class="ptd-resource">
+          <div class="ptd-resource__topline">
+            <span class="tag">{{ selectedLanguagePairLabel }}</span>
+            <span>
+              {{ t('projectDetail.preTranslate.resources.selectedCount', {
+                selected: selectedGlossaryBaseIds.length,
+                total: availableGlossaryBases.length,
+              }) }}
+            </span>
+          </div>
+          <div class="ptd-resource__toolbar">
+            <label class="ptd-resource-search">
+              <Search :size="15" />
+              <input
+                v-model="glossarySearchQuery"
+                type="search"
+                :placeholder="t('projectDetail.preTranslate.glossary.searchPlaceholder')"
+                :disabled="running || loadingResources || !useGlossary"
+              />
+            </label>
+            <div class="ptd-resource__buttons">
+              <button
+                class="button button--ghost ptd-resource__button ptd-resource__button--select"
+                type="button"
+                :disabled="running || loadingResources || !useGlossary || availableGlossaryBases.length === 0"
+                @click="selectAllGlossaryBases"
+              >
+                {{ t('projectDetail.preTranslate.resources.selectAll') }}
+              </button>
+              <button
+                class="button button--ghost ptd-resource__button ptd-resource__button--clear"
+                type="button"
+                :disabled="running || !useGlossary || selectedGlossaryBaseIds.length === 0"
+                @click="clearGlossaryBases"
+              >
+                <X :size="14" />
+                {{ t('projectDetail.preTranslate.resources.clear') }}
+              </button>
+            </div>
+          </div>
+
+          <p v-if="hiddenGlossaryBaseCount > 0 && !languagePairIssue" class="ptd-resource__note">
+            {{ t('projectDetail.preTranslate.glossary.hiddenByLanguagePair', { count: hiddenGlossaryBaseCount }) }}
+          </p>
+
+          <div v-if="languagePairIssue" class="ptd-resource-empty is-warning">
+            {{ languagePairIssue }}
+          </div>
+          <div v-else-if="loadingResources" class="ptd-resource-empty">
+            {{ t('projectDetail.preTranslate.resources.loading') }}
+          </div>
+          <div v-else-if="availableGlossaryBases.length === 0" class="ptd-resource-empty">
+            {{ t('projectDetail.preTranslate.glossary.emptyForLanguagePair') }}
+          </div>
+          <div v-else class="ptd-resource-list">
+            <label
+              v-for="glossaryBase in filteredGlossaryBases"
+              :key="glossaryBase.id"
+              class="ptd-resource-item"
+              :class="{ 'is-selected': selectedGlossaryBaseIds.includes(glossaryBase.id), 'is-disabled': running || !useGlossary }"
+            >
+              <input
+                type="checkbox"
+                :checked="selectedGlossaryBaseIds.includes(glossaryBase.id)"
+                :disabled="running || !useGlossary"
+                @change="toggleGlossaryBase(glossaryBase.id, $event)"
+              />
+              <span class="ptd-resource-item__check" aria-hidden="true">
+                <Check :size="14" />
+              </span>
+              <span class="ptd-resource-item__body">
+                <strong>{{ glossaryBase.name }}</strong>
+                <span>{{ formatLanguagePair(glossaryBase.source_language, glossaryBase.target_language) }}</span>
+              </span>
+              <span class="ptd-resource-item__count">{{ resourceEntryCountLabel(glossaryBase.entry_count) }}</span>
+            </label>
+            <div v-if="filteredGlossaryBases.length === 0" class="ptd-resource-empty">
+              {{ t('projectDetail.preTranslate.resources.noSearchResult') }}
+            </div>
+          </div>
+
+          <div v-if="selectedGlossaryBases.length > 0" class="ptd-selected-resources">
+            <span v-for="glossaryBase in selectedGlossaryBases" :key="glossaryBase.id" class="ptd-selected-resource">
+              {{ glossaryBase.name }}
+            </span>
+          </div>
+        </div>
+        <p class="hint-text">{{ t('projectDetail.preTranslate.glossary.hint') }}</p>
+      </div>
 
       <div class="ptd-section ptd-section--term" :class="{ 'is-disabled': !useTermBase }">
         <div class="ptd-section__head">
@@ -1293,7 +1493,7 @@ function stopPreTranslate() {
 
 .ptd-flow {
   display: grid;
-  grid-template-columns: minmax(340px, 1.08fr) minmax(340px, 1.08fr) minmax(320px, 0.84fr);
+  grid-template-columns: repeat(2, minmax(320px, 1fr));
   gap: 12px;
   align-items: start;
   min-width: 0;
@@ -1323,6 +1523,13 @@ function stopPreTranslate() {
 .ptd-section--term {
   --ptd-accent: #2563eb;
   --ptd-accent-strong: #1d4ed8;
+
+  order: 4;
+}
+
+.ptd-section--glossary {
+  --ptd-accent: #0891b2;
+  --ptd-accent-strong: #0e7490;
 
   order: 2;
 }
@@ -1852,7 +2059,7 @@ function stopPreTranslate() {
   }
 
   .ptd-flow {
-    grid-template-columns: minmax(320px, 1.08fr) minmax(320px, 1.08fr) minmax(300px, 0.84fr);
+    grid-template-columns: repeat(2, minmax(300px, 1fr));
   }
 }
 

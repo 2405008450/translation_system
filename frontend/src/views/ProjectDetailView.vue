@@ -163,6 +163,7 @@ interface ProjectFileItem {
   term_base_ids: string[]
   term_base_write_ids: string[]
   qa_term_base_ids: string[]
+  glossary_base_ids: string[]
 }
 
 interface AssignmentDraft {

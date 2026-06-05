@@ -5,6 +5,8 @@ import { useAuthStore } from '../stores/auth'
 import AppLayout from '../views/AppLayout.vue'
 import AssignmentEventsView from '../views/AssignmentEventsView.vue'
 import DashboardView from '../views/DashboardView.vue'
+import GlossaryBaseEditView from '../views/GlossaryBaseEditView.vue'
+import GlossaryBaseView from '../views/GlossaryBaseView.vue'
 import LoginView from '../views/LoginView.vue'
 import ProjectDetailView from '../views/ProjectDetailView.vue'
 import ProjectListView from '../views/ProjectListView.vue'
@@ -179,8 +181,8 @@ const router = createRouter({
           component: TermBaseView,
           meta: {
             navSection: 'term-base',
-            pageTitle: '术语库管理',
-            pageDescription: '管理术语库，维护翻译术语一致性',
+            pageTitle: 'QA术语库管理',
+            pageDescription: '管理译后检查术语库，维护翻译术语一致性',
             pageTitleKey: 'pages.termBase.title',
             pageDescriptionKey: 'pages.termBase.description',
           },
@@ -198,6 +200,33 @@ const router = createRouter({
           },
         },
         {
+          path: 'glossary',
+          name: 'glossary',
+          component: GlossaryBaseView,
+          meta: {
+            navSection: 'glossary',
+            pageTitle: '词汇表管理',
+            pageDescription: '管理 AI 预翻译专用词汇表，按原文命中后注入 LLM 上下文',
+            pageTitleKey: 'pages.glossary.title',
+            pageDescriptionKey: 'pages.glossary.description',
+          },
+        },
+        {
+          path: 'glossary/:id',
+          alias: ['/glossary/:id/edit'],
+          name: 'glossary-edit',
+          component: GlossaryBaseEditView,
+          props: true,
+          meta: {
+            navSection: 'glossary',
+            pageTitle: '词汇表详情',
+            pageDescription: '维护词汇表信息、词条和导入导出操作',
+            pageTitleKey: 'pages.glossaryEdit.title',
+            pageDescriptionKey: 'pages.glossaryEdit.description',
+            hidePageHeader: true,
+          },
+        },
+        {
           path: 'term-base/:id',
           alias: ['/term-base/:id/edit'],
           name: 'term-base-edit',
@@ -205,8 +234,8 @@ const router = createRouter({
           props: true,
           meta: {
             navSection: 'term-base',
-            pageTitle: '术语库详情',
-            pageDescription: '维护术语库信息、术语条目和导入导出操作',
+            pageTitle: 'QA术语库详情',
+            pageDescription: '维护译后检查术语库信息、术语条目和导入导出操作',
             pageTitleKey: 'pages.termBaseEdit.title',
             pageDescriptionKey: 'pages.termBaseEdit.description',
             hidePageHeader: true,
