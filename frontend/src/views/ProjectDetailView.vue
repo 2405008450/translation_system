@@ -59,6 +59,10 @@ import type {
   DocumentParseMode,
   DocumentParseOptions,
   DocumentStatistics,
+  DocumentStatisticsReport,
+  DocumentStatisticsReportItem,
+  DocumentStatisticsReportsResponse,
+  DocumentStatisticsTotals,
   AssignmentEvent,
   AssignmentEventsResponse,
   IssueMarker,
@@ -92,7 +96,6 @@ type DocumentStatisticNumberKey =
   | 'characters_with_spaces'
   | 'paragraphs'
   | 'lines'
-type DocumentStatisticsTotals = Record<DocumentStatisticNumberKey, number | null>
 
 interface ProjectDetail {
   id: string
@@ -183,6 +186,7 @@ interface PreTranslateProgressPayload extends PreTranslateProgressState {
 
 interface ProjectDocumentStatisticsResponse {
   files: ProjectFileItem[]
+  report: DocumentStatisticsReport
 }
 
 type LanguageDetectTone = 'info' | 'success' | 'warning' | 'error'
@@ -249,6 +253,7 @@ const deleting = ref(false)
 const duplicating = ref(false)
 const uploading = ref(false)
 const statisticsLoading = ref(false)
+const statisticsReportsLoading = ref(false)
 const uploadPercent = ref(0)
 const project = ref<ProjectDetail | null>(null)
 const pageError = ref('')
@@ -297,6 +302,8 @@ const pageSize = ref(10)
 const selectedFileIds = ref(new Set<string>())
 const statisticsSelectedFileIds = ref(new Set<string>())
 const statisticsResultFileIds = ref(new Set<string>())
+const statisticsReports = ref<DocumentStatisticsReport[]>([])
+const activeStatisticsReportId = ref('')
 const settingsForm = reactive({
   name: '',
   deadline: '',
@@ -380,8 +387,20 @@ const canDeleteSelectedProjectFiles = computed(() => (
 const statisticsSelectedFiles = computed(() => (
   tableRows.value.filter((row) => statisticsSelectedFileIds.value.has(row.id))
 ))
-const statisticsResultRows = computed(() => (
-  tableRows.value.filter((row) => statisticsResultFileIds.value.has(row.id))
+const activeStatisticsReport = computed<DocumentStatisticsReport | null>(() => (
+  statisticsReports.value.find((report) => report.id === activeStatisticsReportId.value) ?? null
+))
+const activeStatisticsItemsByFileId = computed(() => {
+  const items = new Map<string, DocumentStatisticsReportItem>()
+  for (const item of activeStatisticsReport.value?.items ?? []) {
+    if (item.file_record_id) {
+      items.set(item.file_record_id, item)
+    }
+  }
+  return items
+})
+const statisticsResultRows = computed<DocumentStatisticsReportItem[]>(() => (
+  activeStatisticsReport.value?.items ?? []
 ))
 const canGenerateStatistics = computed(() => (
   canManageProject.value
@@ -389,13 +408,17 @@ const canGenerateStatistics = computed(() => (
   && !statisticsLoading.value
 ))
 const statisticsAvailableCount = computed(() => (
-  statisticsResultRows.value.filter((row) => hasAnyDocumentStatistic(row.document_statistics)).length
+  activeStatisticsReport.value?.available_files
+  ?? statisticsResultRows.value.filter((row) => hasAnyDocumentStatistic(row.statistics)).length
 ))
 const statisticsTotals = computed<DocumentStatisticsTotals>(() => {
+  if (activeStatisticsReport.value) {
+    return normalizeStatisticsTotals(activeStatisticsReport.value.totals)
+  }
   const totals = createEmptyStatisticsTotals()
   for (const row of statisticsResultRows.value) {
     for (const key of DOCUMENT_STATISTIC_NUMBER_KEYS) {
-      const value = getStatisticNumber(row.document_statistics, key)
+      const value = getStatisticNumber(row.statistics, key)
       if (value == null) {
         continue
       }
@@ -729,6 +752,18 @@ function createEmptyStatisticsTotals(): DocumentStatisticsTotals {
   }
 }
 
+function normalizeStatisticsTotals(totals: DocumentStatisticsTotals | null | undefined): DocumentStatisticsTotals {
+  const normalized = createEmptyStatisticsTotals()
+  if (!totals) {
+    return normalized
+  }
+  for (const key of DOCUMENT_STATISTIC_NUMBER_KEYS) {
+    const value = totals[key]
+    normalized[key] = typeof value === 'number' && Number.isFinite(value) ? value : null
+  }
+  return normalized
+}
+
 function getStatisticNumber(
   statistics: DocumentStatistics | null | undefined,
   key: DocumentStatisticNumberKey,
@@ -752,22 +787,12 @@ function getStatisticsSourceLabel(statistics: DocumentStatistics | null | undefi
   if (!statistics?.source) {
     return t('projectDetail.stats.sources.notReady')
   }
-  if (statistics.source === 'aspose') {
-    return t('projectDetail.stats.sources.aspose')
-  }
-  if (statistics.source === 'libreoffice') {
-    return t('projectDetail.stats.sources.libreOffice')
-  }
-  if (statistics.source === 'openxml_computed') {
-    return t('projectDetail.stats.sources.openxmlComputed')
-  }
-  if (statistics.source === 'docprops_cached') {
-    return t('projectDetail.stats.sources.docpropsCached')
-  }
   if (statistics.source === 'unavailable') {
     return t('projectDetail.stats.sources.unavailable')
   }
-  return statistics.source
+  return hasAnyDocumentStatistic(statistics)
+    ? t('projectDetail.stats.sources.completed')
+    : t('projectDetail.stats.sources.unavailable')
 }
 
 function getStatisticsLicenseLabel(statistics: DocumentStatistics | null | undefined) {
@@ -794,6 +819,47 @@ function getStatisticsStatusClass(statistics: DocumentStatistics | null | undefi
     return 'project-status--warning'
   }
   return 'project-status--default'
+}
+
+function getStatisticsForFile(row: ProjectRow) {
+  const rowId = String(row.id || '')
+  return activeStatisticsItemsByFileId.value.get(rowId)?.statistics ?? (row as ProjectFileItem).document_statistics
+}
+
+function sortDocumentStatisticsReports(reports: DocumentStatisticsReport[]) {
+  return [...reports].sort((left, right) => (
+    new Date(right.created_at || 0).getTime() - new Date(left.created_at || 0).getTime()
+  ))
+}
+
+function mergeDocumentStatisticsReports(reports: DocumentStatisticsReport[]) {
+  const merged = new Map<string, DocumentStatisticsReport>()
+  for (const report of statisticsReports.value) {
+    merged.set(report.id, report)
+  }
+  for (const report of reports) {
+    merged.set(report.id, report)
+  }
+  statisticsReports.value = sortDocumentStatisticsReports(Array.from(merged.values()))
+}
+
+function selectDocumentStatisticsReport(reportId: string, syncSelection = true) {
+  activeStatisticsReportId.value = reportId
+  const report = statisticsReports.value.find((item) => item.id === reportId) ?? null
+  statisticsResultFileIds.value = new Set(report?.file_ids ?? [])
+  if (syncSelection && report) {
+    statisticsSelectedFileIds.value = new Set(report.file_ids)
+  }
+}
+
+function formatStatisticsReportOption(report: DocumentStatisticsReport) {
+  const createdAt = formatDateText(report.created_at)
+  const words = formatStatisticNumber(report.totals?.words)
+  return t('projectDetail.stats.reportOption', {
+    createdAt,
+    files: report.total_files,
+    words,
+  })
 }
 
 function canEnterWorkbench(row: ProjectRow) {
@@ -1295,6 +1361,9 @@ function switchProjectTab(tab: ProjectTab) {
   if (tab === 'stats' && statisticsSelectedFileIds.value.size === 0 && selectedFileIds.value.size > 0) {
     statisticsSelectedFileIds.value = new Set(selectedFileIds.value)
   }
+  if (tab === 'stats' && canManageProject.value && statisticsReports.value.length === 0) {
+    void loadDocumentStatisticsReports()
+  }
 }
 
 function getProjectSettingsSectionHash(section: ProjectSettingsSection) {
@@ -1344,6 +1413,10 @@ async function generateDocumentStatisticsTable() {
       ...project.value,
       files: project.value.files.map((file) => updatedFiles.get(file.id) ?? file),
     }
+    if (data.report) {
+      mergeDocumentStatisticsReports([data.report])
+      selectDocumentStatisticsReport(data.report.id)
+    }
     statisticsResultFileIds.value = new Set(fileIds)
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.statistics'))
@@ -1352,9 +1425,36 @@ async function generateDocumentStatisticsTable() {
   }
 }
 
+async function loadDocumentStatisticsReports() {
+  if (!project.value || !canManageProject.value || statisticsReportsLoading.value) {
+    return
+  }
+  statisticsReportsLoading.value = true
+  try {
+    const { data } = await http.get<DocumentStatisticsReportsResponse>(
+      `/projects/${project.value.id}/document-statistics-reports`,
+      { params: { limit: 30, include_items: true } },
+    )
+    statisticsReports.value = sortDocumentStatisticsReports(data.items)
+    if (activeStatisticsReportId.value && statisticsReports.value.some((report) => report.id === activeStatisticsReportId.value)) {
+      selectDocumentStatisticsReport(activeStatisticsReportId.value, false)
+    } else if (statisticsReports.value.length > 0) {
+      selectDocumentStatisticsReport(statisticsReports.value[0].id, false)
+    } else {
+      activeStatisticsReportId.value = ''
+      statisticsResultFileIds.value = new Set<string>()
+    }
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('projectDetail.errors.statisticsReports'))
+  } finally {
+    statisticsReportsLoading.value = false
+  }
+}
+
 function clearDocumentStatisticsTable() {
   statisticsSelectedFileIds.value = new Set<string>()
   statisticsResultFileIds.value = new Set<string>()
+  activeStatisticsReportId.value = ''
 }
 
 function openWorkbench(row: ProjectRow) {
@@ -1389,10 +1489,15 @@ async function loadProject() {
     selectedFileIds.value = new Set<string>()
     statisticsSelectedFileIds.value = new Set<string>()
     statisticsResultFileIds.value = new Set<string>()
+    statisticsReports.value = []
+    activeStatisticsReportId.value = ''
     if (data.can_manage) {
       void loadAssignmentEvents()
       void loadProjectTranslationMemorySettings()
       void loadProjectTermBaseSettings()
+      if (activeTab.value === 'stats') {
+        void loadDocumentStatisticsReports()
+      }
     } else {
       translationMemorySettings.value = null
       termBaseSettings.value = null
@@ -3328,23 +3433,13 @@ onBeforeUnmount(() => {
               <span class="pd-assignee" :class="{ 'is-empty': !(row.assignees?.length || row.assignee) }">
                 {{ getAssigneeLabel(row) }}
               </span>
-              <div class="pd-task-links">
+              <div v-if="canManageProject" class="pd-task-links">
                 <button
-                  v-if="canManageProject"
                   class="pd-inline-link"
                   type="button"
                   @click.stop="openAssignmentDialog(row as ProjectFileItem)"
                 >
                   {{ t('projectDetail.files.task.assign') }}
-                </button>
-                <button
-                  class="pd-inline-link"
-                  type="button"
-                  :disabled="!canEnterWorkbench(row)"
-                  :title="!canEnterWorkbench(row) ? getFileDetailHint(row) : undefined"
-                  @click.stop="openWorkbench(row)"
-                >
-                  {{ t('projectDetail.files.task.detail') }}
                 </button>
               </div>
             </div>
@@ -3439,7 +3534,7 @@ onBeforeUnmount(() => {
             <button
               class="button"
               type="button"
-              :disabled="statisticsLoading || (statisticsSelectedFileIds.size === 0 && statisticsResultFileIds.size === 0)"
+              :disabled="statisticsLoading || (statisticsSelectedFileIds.size === 0 && statisticsResultFileIds.size === 0 && !activeStatisticsReportId)"
               @click="clearDocumentStatisticsTable"
             >
               <RotateCcw :size="14" />
@@ -3447,6 +3542,30 @@ onBeforeUnmount(() => {
             </button>
           </div>
           <div class="table-toolbar__right pd-toolbar__right">
+            <label class="pd-statistics-report-picker">
+              <span>{{ t('projectDetail.stats.historyLabel') }}</span>
+              <select
+                v-model="activeStatisticsReportId"
+                class="field__control pd-statistics-report-picker__select"
+                :disabled="statisticsReportsLoading || statisticsReports.length === 0"
+                @change="selectDocumentStatisticsReport(activeStatisticsReportId)"
+              >
+                <option value="">{{ t('projectDetail.stats.historyPlaceholder') }}</option>
+                <option v-for="report in statisticsReports" :key="report.id" :value="report.id">
+                  {{ formatStatisticsReportOption(report) }}
+                </option>
+              </select>
+            </label>
+            <button
+              class="button"
+              type="button"
+              :disabled="statisticsReportsLoading"
+              @click="loadDocumentStatisticsReports"
+            >
+              <Loader2 v-if="statisticsReportsLoading" class="lucide-spin" :size="14" />
+              <RotateCcw v-else :size="14" />
+              {{ statisticsReportsLoading ? t('projectDetail.stats.loadingReports') : t('projectDetail.stats.refreshReports') }}
+            </button>
             <span class="pd-statistics-selection">
               {{ t('projectDetail.stats.selectedCount', { count: statisticsSelectedFiles.length }) }}
             </span>
@@ -3459,7 +3578,7 @@ onBeforeUnmount(() => {
           row-test-id-prefix="project-statistics-file-row"
           :columns="statisticsFileColumns"
           :data="tableRows"
-          :loading="loading || statisticsLoading"
+          :loading="loading || statisticsLoading || statisticsReportsLoading"
           :selectable="true"
           :selected-ids="statisticsSelectedFileIds"
           :show-index="true"
@@ -3491,17 +3610,21 @@ onBeforeUnmount(() => {
           </template>
 
           <template #statistics_status="{ row }">
-            <span class="project-status" :class="getStatisticsStatusClass(row.document_statistics)">
-              {{ getStatisticsSourceLabel(row.document_statistics) }}
+            <span class="project-status" :class="getStatisticsStatusClass(getStatisticsForFile(row))">
+              {{ getStatisticsSourceLabel(getStatisticsForFile(row)) }}
             </span>
           </template>
         </DataTable>
 
         <div v-if="statisticsResultRows.length > 0" class="pd-statistics-result">
+          <div v-if="activeStatisticsReport" class="pd-statistics-report-meta">
+            <span>{{ t('projectDetail.stats.reportCreatedAt') }}：{{ formatDateText(activeStatisticsReport.created_at) }}</span>
+            <span>{{ t('projectDetail.stats.reportCreator') }}：{{ activeStatisticsReport.created_by_name || getPlaceholder() }}</span>
+          </div>
           <div class="pd-statistics-summary">
             <div class="pd-statistics-summary__item">
               <span>{{ t('projectDetail.stats.summary.files') }}</span>
-              <strong>{{ formatStatisticNumber(statisticsResultRows.length) }}</strong>
+              <strong>{{ formatStatisticNumber(activeStatisticsReport?.total_files ?? statisticsResultRows.length) }}</strong>
             </div>
             <div class="pd-statistics-summary__item">
               <span>{{ t('projectDetail.stats.summary.available') }}</span>
@@ -3537,18 +3660,18 @@ onBeforeUnmount(() => {
               <tbody>
                 <tr v-for="row in statisticsResultRows" :key="row.id">
                   <td>
-                    <span class="pd-statistics-file-name" :title="row.filename">{{ row.filename }}</span>
+                    <span class="pd-statistics-file-name" :title="row.file_name">{{ row.file_name }}</span>
                   </td>
-                  <td>{{ getStatisticsSourceLabel(row.document_statistics) }}</td>
-                  <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'pages')) }}</td>
-                  <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'words')) }}</td>
-                  <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'non_asian_words')) }}</td>
-                  <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'asian_characters')) }}</td>
-                  <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'characters')) }}</td>
-                  <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'characters_with_spaces')) }}</td>
-                  <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'paragraphs')) }}</td>
-                  <td>{{ formatStatisticNumber(getStatisticNumber(row.document_statistics, 'lines')) }}</td>
-                  <td>{{ getStatisticsLicenseLabel(row.document_statistics) }}</td>
+                  <td>{{ getStatisticsSourceLabel(row.statistics) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'pages')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'words')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'non_asian_words')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'asian_characters')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'characters')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'characters_with_spaces')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'paragraphs')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'lines')) }}</td>
+                  <td>{{ getStatisticsLicenseLabel(row.statistics) }}</td>
                 </tr>
               </tbody>
               <tfoot>
@@ -4428,6 +4551,34 @@ onBeforeUnmount(() => {
 }
 
 .pd-statistics-selection {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.pd-statistics-report-picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.pd-statistics-report-picker span {
+  flex: 0 0 auto;
+}
+
+.pd-statistics-report-picker__select {
+  width: min(360px, 52vw);
+  min-width: 220px;
+  height: 34px;
+  padding: 0 10px;
+}
+
+.pd-statistics-report-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
   color: var(--text-muted);
   font-size: 13px;
 }

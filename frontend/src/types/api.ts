@@ -223,6 +223,48 @@ export interface DocumentStatistics {
   lines: number | null
 }
 
+export interface DocumentStatisticsTotals {
+  pages: number | null
+  words: number | null
+  non_asian_words: number | null
+  asian_characters: number | null
+  characters: number | null
+  characters_with_spaces: number | null
+  paragraphs: number | null
+  lines: number | null
+}
+
+export interface DocumentStatisticsReportItem {
+  id: string
+  report_id: string
+  project_id: string
+  file_record_id: string | null
+  file_name: string
+  source_language: string | null
+  target_language: string | null
+  file_size_bytes: number | null
+  statistics: DocumentStatistics
+  created_at: string | null
+}
+
+export interface DocumentStatisticsReport {
+  id: string
+  project_id: string
+  created_by_id: string | null
+  created_by_name: string | null
+  file_ids: string[]
+  total_files: number
+  available_files: number
+  totals: DocumentStatisticsTotals
+  status: string
+  created_at: string | null
+  items: DocumentStatisticsReportItem[]
+}
+
+export interface DocumentStatisticsReportsResponse {
+  items: DocumentStatisticsReport[]
+}
+
 export interface UploadParseMode {
   id: string
   label: string

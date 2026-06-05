@@ -37,6 +37,8 @@ from app.config import get_settings
 from app.database import SessionLocal, get_db
 from app.models import (
     AssignmentEvent,
+    DocumentStatisticsReport,
+    DocumentStatisticsReportItem,
     FileAssignment,
     FileRecord,
     IssueMarker,
@@ -89,7 +91,12 @@ from app.services.comment_service import (
     serialize_segment_comment,
     update_segment_comment,
 )
-from app.services.document_statistics import compute_word_document_statistics, serialize_document_statistics
+from app.services.document_statistics import (
+    STATISTIC_NUMBER_KEYS,
+    compute_word_document_statistics,
+    normalize_document_statistics,
+    serialize_document_statistics,
+)
 from app.services.issue_marker_service import (
     create_issue_marker,
     delete_issue_marker,
@@ -1117,6 +1124,118 @@ class ProjectUpdatePayload(BaseModel):
 
 class ProjectDocumentStatisticsPayload(BaseModel):
     file_ids: list[UUID] = Field(default_factory=list)
+
+
+def _build_unavailable_document_statistics() -> dict[str, Any]:
+    statistics = {
+        "source": "unavailable",
+        "engine": None,
+        "engine_version": None,
+        "license_status": None,
+        "include_textboxes_footnotes_endnotes": None,
+    }
+    for key in STATISTIC_NUMBER_KEYS:
+        statistics[key] = None
+    return statistics
+
+
+def _create_empty_document_statistics_totals() -> dict[str, int | None]:
+    return {key: None for key in STATISTIC_NUMBER_KEYS}
+
+
+def _has_any_document_statistic(statistics: dict[str, Any] | None) -> bool:
+    if not statistics:
+        return False
+    return any(isinstance(statistics.get(key), int) for key in STATISTIC_NUMBER_KEYS)
+
+
+def _sum_document_statistics(statistics_list: list[dict[str, Any]]) -> dict[str, int | None]:
+    totals = _create_empty_document_statistics_totals()
+    for raw_statistics in statistics_list:
+        statistics = normalize_document_statistics(raw_statistics)
+        for key in STATISTIC_NUMBER_KEYS:
+            value = statistics.get(key)
+            if not isinstance(value, int):
+                continue
+            totals[key] = (totals[key] or 0) + value
+    return totals
+
+
+def _load_document_statistics_totals(raw_value: str | None) -> dict[str, int | None]:
+    try:
+        value = json.loads(raw_value or "{}")
+    except (TypeError, ValueError):
+        value = {}
+    totals = _create_empty_document_statistics_totals()
+    if isinstance(value, dict):
+        for key in STATISTIC_NUMBER_KEYS:
+            raw_number = value.get(key)
+            if isinstance(raw_number, int):
+                totals[key] = raw_number
+            elif isinstance(raw_number, str) and raw_number.strip().isdigit():
+                totals[key] = int(raw_number)
+    return totals
+
+
+def _serialize_document_statistics_report_item(
+    item: DocumentStatisticsReportItem,
+) -> dict[str, Any]:
+    return {
+        "id": str(item.id),
+        "report_id": str(item.report_id),
+        "project_id": str(item.project_id),
+        "file_record_id": str(item.file_record_id) if item.file_record_id else None,
+        "file_name": item.file_name,
+        "source_language": item.source_language,
+        "target_language": item.target_language,
+        "file_size_bytes": item.file_size_bytes,
+        "statistics": normalize_document_statistics(item.statistics),
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+    }
+
+
+def _serialize_document_statistics_report(
+    report: DocumentStatisticsReport,
+    items: list[DocumentStatisticsReportItem] | None = None,
+) -> dict[str, Any]:
+    report_items = list(items if items is not None else report.items)
+    return {
+        "id": str(report.id),
+        "project_id": str(report.project_id),
+        "created_by_id": str(report.created_by_id) if report.created_by_id else None,
+        "created_by_name": get_user_display_name(report.created_by) if report.created_by else None,
+        "file_ids": [str(value) for value in _load_json_list(report.file_ids)],
+        "total_files": report.total_files,
+        "available_files": report.available_files,
+        "totals": _load_document_statistics_totals(report.totals),
+        "status": report.status,
+        "created_at": report.created_at.isoformat() if report.created_at else None,
+        "items": [_serialize_document_statistics_report_item(item) for item in report_items],
+    }
+
+
+def _load_document_statistics_report_items_for_response(
+    db: Session,
+    report_ids: list[UUID],
+) -> dict[UUID, list[DocumentStatisticsReportItem]]:
+    items_by_report_id: dict[UUID, list[DocumentStatisticsReportItem]] = {
+        report_id: [] for report_id in report_ids
+    }
+    if not report_ids:
+        return items_by_report_id
+    items = (
+        db.query(DocumentStatisticsReportItem)
+        .filter(DocumentStatisticsReportItem.report_id.in_(report_ids))
+        .order_by(
+            DocumentStatisticsReportItem.file_name.asc(),
+            DocumentStatisticsReportItem.created_at.asc(),
+            DocumentStatisticsReportItem.id.asc(),
+        )
+        .all()
+    )
+    for item in items:
+        items_by_report_id.setdefault(item.report_id, []).append(item)
+    return items_by_report_id
 
 
 def _can_manage_workflow(current_user: User | None) -> bool:
@@ -4123,21 +4242,19 @@ def compute_project_document_statistics(
     if len(files) != len(file_ids):
         raise HTTPException(status_code=404, detail="部分文件不存在或不属于当前项目。")
 
-    unavailable_statistics = {
-        "source": "unavailable",
-        "engine": None,
-        "engine_version": None,
-        "license_status": None,
-        "include_textboxes_footnotes_endnotes": None,
-        "pages": None,
-        "words": None,
-        "non_asian_words": None,
-        "asian_characters": None,
-        "characters": None,
-        "characters_with_spaces": None,
-        "paragraphs": None,
-        "lines": None,
-    }
+    unavailable_statistics = _build_unavailable_document_statistics()
+    report_statistics: list[dict[str, Any]] = []
+    report = DocumentStatisticsReport(
+        project_id=project.id,
+        created_by_id=getattr(current_user, "id", None),
+        file_ids=json.dumps([str(file_record.id) for file_record in files]),
+        total_files=len(files),
+        available_files=0,
+        totals=json.dumps(_create_empty_document_statistics_totals(), ensure_ascii=False, sort_keys=True),
+        status="completed",
+    )
+    db.add(report)
+    db.flush()
 
     for file_record in files:
         source_bytes = load_file_record_source(file_record)
@@ -4146,15 +4263,34 @@ def compute_project_document_statistics(
             statistics = compute_word_document_statistics(source_bytes, source_filename)
         else:
             statistics = unavailable_statistics
-        file_record.document_statistics = serialize_document_statistics(statistics)
+        normalized_statistics = normalize_document_statistics(statistics)
+        serialized_statistics = serialize_document_statistics(normalized_statistics)
+        file_record.document_statistics = serialized_statistics
+        report_statistics.append(normalized_statistics)
+        db.add(DocumentStatisticsReportItem(
+            report_id=report.id,
+            project_id=project.id,
+            file_record_id=file_record.id,
+            file_name=file_record.filename,
+            source_language=file_record.source_language,
+            target_language=file_record.target_language,
+            file_size_bytes=len(source_bytes) if source_bytes is not None else None,
+            statistics=serialized_statistics,
+        ))
+
+    report.available_files = sum(1 for statistics in report_statistics if _has_any_document_statistic(statistics))
+    report.totals = json.dumps(_sum_document_statistics(report_statistics), ensure_ascii=False, sort_keys=True)
 
     db.commit()
+    db.refresh(report)
     for file_record in files:
         db.refresh(file_record)
+    report_items = _load_document_statistics_report_items_for_response(db, [report.id]).get(report.id, [])
 
     file_stats = _get_file_segment_stats(db, [file_record.id for file_record in files])
     file_issue_stats = _get_file_issue_stats(db, [file_record.id for file_record in files])
     return {
+        "report": _serialize_document_statistics_report(report, report_items),
         "files": [
             _build_project_file_payload(
                 file_record=file_record,
@@ -4166,6 +4302,57 @@ def compute_project_document_statistics(
             for file_record in files
         ]
     }
+
+
+@router.get("/projects/{project_id}/document-statistics-reports")
+def list_project_document_statistics_reports(
+    project_id: UUID,
+    limit: int = 20,
+    include_items: bool = True,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+
+    safe_limit = min(max(int(limit), 1), 50)
+    reports = (
+        db.query(DocumentStatisticsReport)
+        .filter(DocumentStatisticsReport.project_id == project_id)
+        .order_by(DocumentStatisticsReport.created_at.desc(), DocumentStatisticsReport.id.desc())
+        .limit(safe_limit)
+        .all()
+    )
+    items_by_report_id = (
+        _load_document_statistics_report_items_for_response(db, [report.id for report in reports])
+        if include_items
+        else {report.id: [] for report in reports}
+    )
+    return {
+        "items": [
+            _serialize_document_statistics_report(report, items_by_report_id.get(report.id, []))
+            for report in reports
+        ]
+    }
+
+
+@router.get("/document-statistics-reports/{report_id}")
+def get_document_statistics_report(
+    report_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    report = (
+        db.query(DocumentStatisticsReport)
+        .filter(DocumentStatisticsReport.id == report_id)
+        .first()
+    )
+    if not report:
+        raise HTTPException(status_code=404, detail="字数统计报告不存在。")
+
+    report_items = _load_document_statistics_report_items_for_response(db, [report.id]).get(report.id, [])
+    return _serialize_document_statistics_report(report, report_items)
 
 
 @router.delete("/projects/{project_id}")

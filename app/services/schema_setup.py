@@ -80,6 +80,29 @@ REQUIRED_SCHEMA = {
         "deadline",
         "access_level",
     },
+    "document_statistics_reports": {
+        "id",
+        "project_id",
+        "created_by_id",
+        "file_ids",
+        "total_files",
+        "available_files",
+        "totals",
+        "status",
+        "created_at",
+    },
+    "document_statistics_report_items": {
+        "id",
+        "report_id",
+        "project_id",
+        "file_record_id",
+        "file_name",
+        "source_language",
+        "target_language",
+        "file_size_bytes",
+        "statistics",
+        "created_at",
+    },
     "term_qa_reports": {
         "id",
         "project_id",
@@ -276,6 +299,16 @@ REQUIRED_INDEXES = {
     "auto_tm_rematch_queue": {
         "uq_auto_tm_rematch_queue_file_record",
         "ix_auto_tm_rematch_queue_status",
+    },
+    "document_statistics_reports": {
+        "ix_document_statistics_reports_project_id",
+        "ix_document_statistics_reports_created_by_id",
+        "ix_document_statistics_reports_created_at",
+    },
+    "document_statistics_report_items": {
+        "ix_document_statistics_report_items_report_id",
+        "ix_document_statistics_report_items_project_id",
+        "ix_document_statistics_report_items_file_record_id",
     },
 }
 
@@ -790,6 +823,57 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_file_records_assignee_id
             ON file_records (assignee_id)
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS document_statistics_reports (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                file_ids TEXT NOT NULL DEFAULT '[]',
+                total_files INTEGER NOT NULL DEFAULT 0,
+                available_files INTEGER NOT NULL DEFAULT 0,
+                totals TEXT NOT NULL DEFAULT '{{}}',
+                status VARCHAR(20) NOT NULL DEFAULT 'completed',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS document_statistics_report_items (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                report_id UUID NOT NULL REFERENCES document_statistics_reports(id) ON DELETE CASCADE,
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID REFERENCES file_records(id) ON DELETE SET NULL,
+                file_name VARCHAR(255) NOT NULL,
+                source_language VARCHAR(20),
+                target_language VARCHAR(20),
+                file_size_bytes INTEGER,
+                statistics TEXT NOT NULL DEFAULT '{{}}',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_statistics_reports_project_id
+            ON document_statistics_reports (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_statistics_reports_created_by_id
+            ON document_statistics_reports (created_by_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_statistics_reports_created_at
+            ON document_statistics_reports (created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_statistics_report_items_report_id
+            ON document_statistics_report_items (report_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_statistics_report_items_project_id
+            ON document_statistics_report_items (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_statistics_report_items_file_record_id
+            ON document_statistics_report_items (file_record_id)
             """,
             f"""
             CREATE TABLE IF NOT EXISTS project_assignments (
