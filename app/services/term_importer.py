@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -14,7 +15,10 @@ from app.services.language_pairs import require_language_pair
 from app.services.normalizer import normalize_match_text, normalize_text
 
 
+CSV_EXTENSIONS = {".csv"}
+XLS_EXTENSIONS = {".xls"}
 XLSX_EXTENSIONS = {".xlsx"}
+TERM_IMPORT_EXTENSIONS = CSV_EXTENSIONS | XLS_EXTENSIONS | XLSX_EXTENSIONS
 HEADER_ALIASES = {
     ("source", "target"),
     ("source_term", "target_term"),
@@ -48,10 +52,72 @@ def import_terms_from_xlsx_upload(
     batch_size: int = 5000,
     term_base_id: UUID | None = None,
 ) -> TermImportSummary:
+    extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
+    if extension in CSV_EXTENSIONS:
+        return import_terms_from_csv_upload(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            source_language=source_language,
+            target_language=target_language,
+            batch_size=batch_size,
+            term_base_id=term_base_id,
+        )
+    if extension in XLS_EXTENSIONS:
+        return import_terms_from_xls_upload(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            source_language=source_language,
+            target_language=target_language,
+            batch_size=batch_size,
+            term_base_id=term_base_id,
+        )
+
     workbook = load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)
     return _import_workbook(
         db=db,
         workbook=workbook,
+        filename=filename,
+        batch_size=batch_size,
+        term_base_id=term_base_id,
+        source_language=source_language,
+        target_language=target_language,
+    )
+
+
+def import_terms_from_csv_upload(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    term_base_id: UUID | None = None,
+) -> TermImportSummary:
+    return _import_text_rows(
+        db=db,
+        rows=_iter_csv_rows(raw_bytes),
+        filename=filename,
+        batch_size=batch_size,
+        term_base_id=term_base_id,
+        source_language=source_language,
+        target_language=target_language,
+    )
+
+
+def import_terms_from_xls_upload(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    term_base_id: UUID | None = None,
+) -> TermImportSummary:
+    return _import_text_rows(
+        db=db,
+        rows=_iter_xls_rows(raw_bytes),
         filename=filename,
         batch_size=batch_size,
         term_base_id=term_base_id,
@@ -89,18 +155,41 @@ def _import_workbook(
     target_language: str,
     term_base_id: UUID | None = None,
 ) -> TermImportSummary:
+    worksheet = workbook.active
+    try:
+        return _import_text_rows(
+            db=db,
+            rows=worksheet.iter_rows(values_only=True),
+            filename=filename,
+            batch_size=batch_size,
+            term_base_id=term_base_id,
+            source_language=source_language,
+            target_language=target_language,
+        )
+    finally:
+        workbook.close()
+
+
+def _import_text_rows(
+    db: Session,
+    rows,
+    filename: str,
+    batch_size: int,
+    source_language: str,
+    target_language: str,
+    term_base_id: UUID | None = None,
+) -> TermImportSummary:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
         target_language,
     )
-    worksheet = workbook.active
     batch_rows: dict[str, dict] = {}
     created_rows = 0
     updated_rows = 0
     skipped_empty_rows = 0
     skipped_header_rows = 0
 
-    for row_index, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+    for row_index, row in enumerate(rows, start=1):
         source_text = normalize_text(_cell_to_text(row, 0))
         target_text = normalize_text(_cell_to_text(row, 1))
 
@@ -144,7 +233,6 @@ def _import_workbook(
         created_rows += created_in_batch
         updated_rows += updated_in_batch
 
-    workbook.close()
     return TermImportSummary(
         filename=filename,
         created_rows=created_rows,
@@ -152,6 +240,39 @@ def _import_workbook(
         skipped_empty_rows=skipped_empty_rows,
         skipped_header_rows=skipped_header_rows,
     )
+
+
+def _iter_csv_rows(raw_bytes: bytes):
+    text = _decode_csv_bytes(raw_bytes)
+    sample = text[:4096]
+    try:
+        dialect = csv.Sniffer().sniff(sample)
+    except csv.Error:
+        dialect = csv.excel
+    reader = csv.reader(text.splitlines(), dialect)
+    for row in reader:
+        yield tuple(row)
+
+
+def _iter_xls_rows(raw_bytes: bytes):
+    try:
+        import xlrd
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("导入 .xls 文件需要安装 xlrd 依赖。") from exc
+
+    workbook = xlrd.open_workbook(file_contents=raw_bytes)
+    sheet = workbook.sheet_by_index(0)
+    for row_index in range(sheet.nrows):
+        yield tuple(sheet.cell_value(row_index, column_index) for column_index in range(sheet.ncols))
+
+
+def _decode_csv_bytes(raw_bytes: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            return raw_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw_bytes.decode("utf-8", errors="replace")
 
 
 def _build_term_row(

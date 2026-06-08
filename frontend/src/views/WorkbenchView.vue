@@ -58,6 +58,7 @@ import WorkbenchHistoryPanel from '../components/WorkbenchHistoryPanel.vue'
 import WorkbenchMatchPanel from '../components/WorkbenchMatchPanel.vue'
 import WorkbenchTermsPanel from '../components/WorkbenchTermsPanel.vue'
 import { http } from '../api/http'
+import { refreshGlobalNotifications } from '../utils/notifications'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
 import { useRichTextEditor, type TextFormat, type CaseType } from '../composables/useRichTextEditor'
@@ -226,6 +227,7 @@ const targetSearchQuery = ref('')
 const replaceSearchText = ref('')
 const searchFuzzyEnabled = ref(false)
 const searchLoadingAllSegments = ref(false)
+const segmentSearchReturnTarget = ref<{ sentenceId: string; displayIndex: number | null; page: number } | null>(null)
 const retainedEmptyTargetSentenceIds = ref<Set<string>>(new Set())
 const tmCollections = ref<TMCollection[]>([])
 const loadingTMCollections = ref(false)
@@ -1087,7 +1089,7 @@ useWorkbenchShortcuts({
   focusPrev: () => { void focusSentenceByOffset(-1) },
   focusNext: () => { void focusSentenceByOffset(1) },
   confirmCurrent: () => { confirmCurrentSentence() },
-  closePanel: () => { closeActiveWorkbenchPanel() },
+  closePanel: () => { void closeActiveWorkbenchPanel() },
   toggleHelp: () => { showShortcutHelp.value = !showShortcutHelp.value },
 })
 
@@ -1373,9 +1375,9 @@ async function handleResourceImported(payload: { tab: ResourceImportTab }) {
   }
 }
 
-function closeActiveWorkbenchPanel() {
+async function closeActiveWorkbenchPanel() {
   if (segmentSearchOpen.value) {
-    closeSegmentSearchPanel()
+    await closeSegmentSearchPanel()
     return
   }
   if (showGuidelinesPanel.value) {
@@ -1410,11 +1412,90 @@ function resetSegmentSearch() {
   replaceSearchText.value = ''
   searchFuzzyEnabled.value = false
   searchLoadingAllSegments.value = false
+  segmentSearchReturnTarget.value = null
   retainedEmptyTargetSentenceIds.value = new Set()
 }
 
-function closeSegmentSearchPanel() {
+function captureSegmentSearchReturnTarget() {
+  const sentenceId = segmentStore.activeSentenceId
+  if (!sentenceId) {
+    segmentSearchReturnTarget.value = null
+    return
+  }
+
+  const segment = editorSegments.value.find((item) => item.sentence_id === sentenceId)
+  const displayIndex = typeof segment?.display_index === 'number' && Number.isFinite(segment.display_index)
+    ? segment.display_index
+    : (segmentOrdinalMap.value.get(sentenceId) ?? null)
+  segmentSearchReturnTarget.value = {
+    sentenceId,
+    displayIndex,
+    page: segmentStore.currentPage,
+  }
+}
+
+function clearSegmentSearchFilters() {
+  searchLoadRequestId += 1
+  segmentDisplayScope.value = 'all'
+  sourceSearchQuery.value = ''
+  targetSearchQuery.value = ''
+  replaceSearchText.value = ''
+  searchFuzzyEnabled.value = false
+  searchLoadingAllSegments.value = false
+  retainedEmptyTargetSentenceIds.value = new Set()
+}
+
+async function resetSegmentSearchAndRestore() {
+  const target = segmentSearchReturnTarget.value
+  const targetPage = target ? getReturnTargetPage(target) : 1
+  suppressSegmentFilterWatch = true
+  resetSegmentSearch()
+  suppressSegmentFilterWatch = false
+  await refreshSegmentPage(targetPage, segmentStore.pageSize)
+  if (target) {
+    await focusEditorSegmentBySentenceId(target.sentenceId)
+  }
+}
+
+async function focusEditorSegmentBySentenceId(sentenceId: string) {
+  const index = editorSegments.value.findIndex((segment) => segment.sentence_id === sentenceId)
+  if (index < 0) {
+    return false
+  }
+  await focusEditorSegmentAtIndex(index)
+  return true
+}
+
+function getReturnTargetPage(target: { displayIndex: number | null; page: number }) {
+  if (typeof target.displayIndex === 'number' && Number.isFinite(target.displayIndex) && target.displayIndex >= 0) {
+    return Math.floor(target.displayIndex / segmentStore.pageSize) + 1
+  }
+  return target.page
+}
+
+async function restoreSegmentSearchReturnTarget() {
+  const target = segmentSearchReturnTarget.value
+  segmentSearchReturnTarget.value = null
+  if (!target) {
+    return
+  }
+
+  if (await focusEditorSegmentBySentenceId(target.sentenceId)) {
+    return
+  }
+
+  const targetPage = getReturnTargetPage(target)
+  suppressSegmentFilterWatch = true
+  clearSegmentSearchFilters()
+  suppressSegmentFilterWatch = false
+  await refreshSegmentPage(targetPage, segmentStore.pageSize)
+  await focusEditorSegmentBySentenceId(target.sentenceId)
+}
+
+async function closeSegmentSearchPanel() {
   segmentSearchOpen.value = false
+  await nextTick()
+  await restoreSegmentSearchReturnTarget()
 }
 
 function setSegmentDisplayScope(scope: SegmentDisplayScope) {
@@ -1468,7 +1549,13 @@ async function toggleProjectSegmentSync(sentenceId: string, disabled: boolean) {
 }
 
 async function toggleSegmentSearchPanel() {
-  segmentSearchOpen.value = !segmentSearchOpen.value
+  if (segmentSearchOpen.value) {
+    await closeSegmentSearchPanel()
+    return
+  }
+
+  captureSegmentSearchReturnTarget()
+  segmentSearchOpen.value = true
   if (segmentSearchOpen.value) {
     await nextTick()
     sourceSearchInputRef.value?.focus({ preventScroll: true })
@@ -2399,8 +2486,8 @@ async function openAddTermDialog() {
     return
   }
 
-  addTermSourceText.value = normalizeTextForSaveToTM(activeSegment.value.source_text || activeSegment.value.display_text || '')
-  addTermTargetText.value = normalizeTextForSaveToTM(activeSegment.value.target_text || '')
+  addTermSourceText.value = ''
+  addTermTargetText.value = ''
   addTermTargetBaseId.value = resolveAddTermTargetBaseId()
   addTermFormError.value = ''
   showAddTermDialog.value = true
@@ -2858,6 +2945,9 @@ async function saveToTM() {
       updated: data.updated_count,
       skipped: data.skipped_count,
     }))
+    if (data.created_count + data.updated_count > 0) {
+      refreshGlobalNotifications()
+    }
     showSaveToTMDialog.value = false
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.saveToTM'))
@@ -4206,7 +4296,7 @@ onBeforeRouteLeave(async () => {
             v-if="segmentSearchOpen"
             id="workbench-segment-search"
             class="workbench-search-panel"
-            @keydown.esc.stop="closeSegmentSearchPanel"
+            @keydown.esc.stop="void closeSegmentSearchPanel()"
           >
             <div class="workbench-search-panel__form workbench-search-panel__form--compact">
               <div class="workbench-search-panel__line">
@@ -4297,7 +4387,7 @@ onBeforeRouteLeave(async () => {
                   :disabled="!hasEditorSegmentFilter && !replaceSearchText"
                   :aria-hidden="!hasEditorSegmentFilter && !replaceSearchText"
                   :tabindex="hasEditorSegmentFilter || replaceSearchText ? 0 : -1"
-                  @click="resetSegmentSearch"
+                  @click="void resetSegmentSearchAndRestore()"
                 >
                   <X :size="14" />
                   {{ t('workbench.search.clear') }}
@@ -4307,7 +4397,7 @@ onBeforeRouteLeave(async () => {
                   type="button"
                   :title="t('workbench.search.collapse')"
                   :aria-label="t('workbench.search.collapse')"
-                  @click="closeSegmentSearchPanel"
+                  @click="void closeSegmentSearchPanel()"
                 >
                   <ChevronUp :size="14" />
                   <span>{{ t('workbench.search.collapseShort') }}</span>
@@ -4372,6 +4462,7 @@ onBeforeRouteLeave(async () => {
                     :revision-busy="revisionActionLoading"
                     :matched-terms="segmentStore.activeSentenceId === item.sentence_id ? activeMatchedTerms : []"
                     :source-search-query="sourceSearchQuery"
+                    :target-search-query="targetSearchQuery"
                     :show-visible-chars="richTextEditor.visibleCharactersEnabled.value"
                     :pending-formats="pendingFormatsForEditor"
                     @focus="segmentStore.setActiveSentence"

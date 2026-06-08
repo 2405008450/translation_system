@@ -98,6 +98,10 @@ from app.services.document_statistics import (
     normalize_document_statistics,
     serialize_document_statistics,
 )
+from app.services.document_repetition_statistics import (
+    compute_document_repetition_statistics,
+    empty_repetition_statistics,
+)
 from app.services.issue_marker_service import (
     create_issue_marker,
     delete_issue_marker,
@@ -168,10 +172,19 @@ from app.services.language_detection import detect_upload_language
 from app.services.language_pairs import require_language_pair
 from app.services.matcher import get_tm_candidates_for_text, match_sentences_with_stats
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
+from app.services.notification_service import (
+    build_resource_import_notification,
+    build_save_to_tm_notification,
+    create_operation_notification,
+)
 from app.services.project_segment_sync import (
     empty_project_segment_sync_summary,
     sync_project_repeated_segments_from_file,
     sync_project_repeated_segments_from_segments,
+)
+from app.services.term_importer import (
+    TERM_IMPORT_EXTENSIONS,
+    import_terms_from_xlsx_upload,
 )
 from app.services.revision_service import (
     accept_revision,
@@ -209,7 +222,7 @@ from app.services.tm_importer import (
     TM_IMPORT_EXTENSIONS,
     XLSX_EXTENSIONS,
     import_tm_from_sdltm_upload,
-    import_tm_from_xlsx_upload,
+    import_tm_from_upload,
     preview_sdltm_metadata,
 )
 from app.services.tm_vector import sync_tm_embeddings
@@ -991,12 +1004,14 @@ class FileRecordBindingsRequest(BaseModel):
     glossary_base_ids: list[UUID] | None = None
     collection_id: UUID | None = None
     collection_ids: list[UUID] | None = None
+    tm_match_threshold: float | None = None
 
 
 class ProjectTranslationMemoryFileSettingPayload(BaseModel):
     file_record_id: UUID
     collection_ids: list[UUID] = Field(default_factory=list)
     primary_collection_id: UUID | None = None
+    tm_match_threshold: float | None = None
 
 
 class ProjectTranslationMemorySettingPayload(BaseModel):
@@ -1004,6 +1019,7 @@ class ProjectTranslationMemorySettingPayload(BaseModel):
     target_language: str
     collection_ids: list[UUID] = Field(default_factory=list)
     primary_collection_id: UUID | None = None
+    tm_match_threshold: float | None = None
     files: list[ProjectTranslationMemoryFileSettingPayload] = Field(default_factory=list)
 
 
@@ -1263,6 +1279,33 @@ def _load_document_statistics_report_items_for_response(
     for item in items:
         items_by_report_id.setdefault(item.report_id, []).append(item)
     return items_by_report_id
+
+
+def _load_document_repetition_statistics_for_files(
+    db: Session,
+    file_ids: list[UUID],
+) -> dict[UUID, dict[str, int]]:
+    file_segments: dict[UUID, list[str]] = {file_id: [] for file_id in file_ids}
+    if not file_segments:
+        return {}
+
+    segments = (
+        db.query(Segment.file_record_id, Segment.source_text)
+        .filter(Segment.file_record_id.in_(file_ids))
+        .order_by(
+            Segment.file_record_id.asc(),
+            Segment.block_index.asc(),
+            Segment.row_index.asc().nullsfirst(),
+            Segment.cell_index.asc().nullsfirst(),
+            Segment.sentence_id.asc(),
+            Segment.id.asc(),
+        )
+        .all()
+    )
+    for file_record_id, source_text in segments:
+        file_segments.setdefault(file_record_id, []).append(source_text or "")
+
+    return compute_document_repetition_statistics(file_segments)
 
 
 def _can_manage_workflow(current_user: User | None) -> bool:
@@ -2980,6 +3023,7 @@ def _build_project_file_payload(
         "file_size_bytes": len(source_bytes) if source_bytes is not None else None,
         "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
         "collection_ids": [str(collection_id) for collection_id in collection_ids],
+        "tm_match_threshold": _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
         "term_base_id": file_record.term_base_id,
         "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
         "term_base_write_ids": [str(term_base_id) for term_base_id in term_base_write_ids],
@@ -3172,11 +3216,22 @@ def _serialize_project_term_base_settings(
         enabled_set = set(enabled_ids)
         writable_set = set(writable_ids)
         qa_set = set(qa_ids)
+        qa_priority_by_id = {
+            term_base_id: index + 1
+            for index, term_base_id in enumerate(qa_ids)
+        }
         group_term_bases = [
             term_base
             for term_base in term_bases
             if term_base.source_language == source_language and term_base.target_language == target_language
         ]
+        group_term_bases.sort(
+            key=lambda term_base: (
+                0 if term_base.id in qa_priority_by_id else 1,
+                qa_priority_by_id.get(term_base.id, 9999),
+                term_base.name.casefold(),
+            )
+        )
         groups.append({
             "source_language": source_language,
             "target_language": target_language,
@@ -3195,6 +3250,7 @@ def _serialize_project_term_base_settings(
                     "enabled": term_base.id in enabled_set,
                     "writable": term_base.id in writable_set,
                     "qa": term_base.id in qa_set,
+                    "qa_priority": qa_priority_by_id.get(term_base.id),
                 }
                 for term_base in group_term_bases
             ],
@@ -3258,6 +3314,9 @@ def _serialize_project_translation_memory_settings(
                         str(collection_id)
                         for collection_id in _load_file_record_collection_ids(file_record)
                     ],
+                    "tm_match_threshold": _normalize_tm_match_threshold(
+                        getattr(file_record, "tm_match_threshold", None),
+                    ),
                 }
                 for file_record in group_files
             ],
@@ -3267,6 +3326,15 @@ def _serialize_project_translation_memory_settings(
         "project_id": str(project.id),
         "groups": groups,
     }
+
+
+def _normalize_tm_match_threshold(value: float | None) -> float:
+    if value is None:
+        value = get_settings().default_similarity_threshold
+    threshold = round(float(value), 2)
+    if threshold < 0.5 or threshold > 1:
+        raise HTTPException(status_code=400, detail="TM 匹配阈值必须在 0.50 到 1.00 之间。")
+    return threshold
 
 
 def _validate_tm_setting_collection_ids(
@@ -3308,6 +3376,43 @@ def _text_contains_case_insensitive(text: str | None, needle: str | None) -> boo
     clean_text = (text or "").casefold()
     clean_needle = (needle or "").strip().casefold()
     return bool(clean_needle and clean_needle in clean_text)
+
+
+def _term_qa_source_key(source_text: str | None) -> str:
+    return normalize_match_text(source_text or "") or normalize_text(source_text or "").casefold()
+
+
+def _term_qa_terms_are_similar(left: str, right: str) -> bool:
+    left_key = _term_qa_source_key(left)
+    right_key = _term_qa_source_key(right)
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    return left_key in right_key or right_key in left_key
+
+
+def _deduplicate_term_qa_entries(
+    entries: list[TermEntry],
+    priority_by_term_base_id: dict[UUID, int],
+) -> list[TermEntry]:
+    sorted_entries = sorted(
+        entries,
+        key=lambda entry: (
+            priority_by_term_base_id.get(entry.term_base_id, 9999),
+            -len(_term_qa_source_key(entry.source_text)),
+            str(entry.id),
+        ),
+    )
+    selected_entries: list[TermEntry] = []
+    for entry in sorted_entries:
+        source_term = (entry.source_text or "").strip()
+        if not source_term:
+            continue
+        if any(_term_qa_terms_are_similar(source_term, selected.source_text or "") for selected in selected_entries):
+            continue
+        selected_entries.append(entry)
+    return selected_entries
 
 
 def _load_json_list(raw_value: str | None) -> list[Any]:
@@ -3402,7 +3507,7 @@ def _create_term_qa_report(
         for term_base_id in ids
     ))
     if not configured_term_base_ids:
-        raise HTTPException(status_code=400, detail="未配置QA术语库。")
+        raise HTTPException(status_code=400, detail="未配置用于 QA 的术语库。")
 
     term_bases = (
         db.query(TermBase)
@@ -3485,11 +3590,18 @@ def _create_term_qa_report(
         ]
         if not qa_ids:
             continue
-        applicable_entries = [
-            entry
-            for term_base_id in qa_ids
-            for entry in entries_by_key.get((source_language, target_language, term_base_id), [])
-        ]
+        qa_priority_by_id = {
+            term_base_id: index
+            for index, term_base_id in enumerate(qa_ids)
+        }
+        applicable_entries = _deduplicate_term_qa_entries(
+            [
+                entry
+                for term_base_id in qa_ids
+                for entry in entries_by_key.get((source_language, target_language, term_base_id), [])
+            ],
+            qa_priority_by_id,
+        )
         if not applicable_entries:
             continue
         file_segments = segments_by_file_id.get(file_record.id, [])
@@ -3872,7 +3984,7 @@ def update_project_term_base_settings(
         if not set(writable_ids).issubset(enabled_set):
             raise HTTPException(status_code=400, detail="写入术语库必须先启用。")
         if not set(qa_ids).issubset(enabled_set):
-            raise HTTPException(status_code=400, detail="QA术语库必须先启用。")
+            raise HTTPException(status_code=400, detail="用于 QA 的术语库必须先启用。")
 
         _validate_term_base_setting_ids(db, enabled_ids, source_language, target_language)
         _validate_term_base_setting_ids(db, writable_ids, source_language, target_language)
@@ -3944,6 +4056,7 @@ def update_project_translation_memory_settings(
                     file_record_id=file_record.id,
                     collection_ids=item.collection_ids,
                     primary_collection_id=item.primary_collection_id,
+                    tm_match_threshold=item.tm_match_threshold,
                 )
                 for file_record in group_files
             ]
@@ -3961,16 +4074,24 @@ def update_project_translation_memory_settings(
                 raise HTTPException(status_code=400, detail="主写入记忆库必须包含在绑定记忆库列表中。")
             if primary_collection_id is None and selected_ids:
                 primary_collection_id = selected_ids[0]
+            next_threshold = _normalize_tm_match_threshold(
+                file_payload.tm_match_threshold
+                if file_payload.tm_match_threshold is not None
+                else getattr(file_record, "tm_match_threshold", None),
+            )
 
             before = (
                 tuple(_load_file_record_collection_ids(file_record)),
                 file_record.collection_id,
+                _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
             )
             _store_file_record_collection_ids(file_record, selected_ids)
             file_record.collection_id = primary_collection_id
+            file_record.tm_match_threshold = next_threshold
             after = (
                 tuple(_load_file_record_collection_ids(file_record)),
                 file_record.collection_id,
+                _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
             )
             if before != after:
                 changed_files.append(file_record)
@@ -4193,7 +4314,7 @@ def export_term_qa_report_xlsx(
         headers=[
             "文件名",
             "句段ID",
-            "QA术语库",
+            "术语库",
             "原文术语",
             "期望译文",
             "原文",
@@ -4319,6 +4440,10 @@ def compute_project_document_statistics(
     db.add(report)
     db.flush()
 
+    repetition_statistics_by_file_id = _load_document_repetition_statistics_for_files(
+        db,
+        [file_record.id for file_record in files],
+    )
     for file_record in files:
         source_bytes = load_file_record_source(file_record)
         source_filename = get_file_record_source_filename(file_record)
@@ -4327,6 +4452,9 @@ def compute_project_document_statistics(
         else:
             statistics = unavailable_statistics
         normalized_statistics = normalize_document_statistics(statistics)
+        normalized_statistics.update(
+            repetition_statistics_by_file_id.get(file_record.id, empty_repetition_statistics())
+        )
         serialized_statistics = serialize_document_statistics(normalized_statistics)
         file_record.document_statistics = serialized_statistics
         report_statistics.append(normalized_statistics)
@@ -5221,6 +5349,7 @@ def get_file_record(
         "assigned_at": file_record.assigned_at.isoformat() if file_record.assigned_at else None,
         "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
         "collection_ids": [str(collection_id) for collection_id in collection_ids],
+        "tm_match_threshold": _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
         "collection_name": collection_name,
         "term_base_id": file_record.term_base_id,
         "term_base_name": term_base_name,
@@ -5607,7 +5736,7 @@ def get_file_record_preview(
 def get_segment_tm_candidates(
     file_record_id: UUID,
     segment_ref: str,
-    threshold: float = 0.6,
+    threshold: float | None = None,
     max_candidates: int = 5,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -5653,7 +5782,9 @@ def get_segment_tm_candidates(
     candidates = get_tm_candidates_for_text(
         db=db,
         source_text=segment.source_text,
-        similarity_threshold=threshold,
+        similarity_threshold=_normalize_tm_match_threshold(
+            threshold if threshold is not None else getattr(file_record, "tm_match_threshold", None),
+        ),
         collection_ids=collection_ids,
         top_n=max_candidates,
     )
@@ -5707,6 +5838,7 @@ def rematch_file_record(
     threshold = float(payload.threshold)
     if threshold < 0.5 or threshold > 1:
         raise HTTPException(status_code=400, detail="TM 匹配阈值必须在 0.50 到 1.00 之间。")
+    threshold = round(threshold, 2)
 
     segments = list_segments_for_file_record(db, file_record_id)
     if not segments:
@@ -5784,6 +5916,7 @@ def rematch_file_record(
     if selected_collection_ids:
         file_record.collection_id = selected_collection_ids[0]
         file_record.collection_ids_json = json.dumps([str(cid) for cid in selected_collection_ids])
+    file_record.tm_match_threshold = threshold
 
     db.commit()
     return {
@@ -5812,6 +5945,7 @@ def patch_file_record_bindings(
     before_collection_binding = (
         tuple(_load_file_record_collection_ids(file_record)),
         file_record.collection_id,
+        _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
     )
 
     if "collection_ids" in payload.model_fields_set:
@@ -5839,6 +5973,9 @@ def patch_file_record_bindings(
             file_record.collection_id = payload.collection_id
             # 同步更新 collection_ids_json，保持单记忆库场景的一致性
             file_record.collection_ids_json = json.dumps([str(payload.collection_id)])
+
+    if "tm_match_threshold" in payload.model_fields_set:
+        file_record.tm_match_threshold = _normalize_tm_match_threshold(payload.tm_match_threshold)
 
     if "term_base_ids" in payload.model_fields_set:
         term_bases = _validate_term_base_ids(db, payload.term_base_ids)
@@ -5871,7 +6008,7 @@ def patch_file_record_bindings(
         for term_base in term_bases:
             _ensure_resource_language_pair_matches(term_base, source_language, target_language, "术语库")
         if not set(qa_ids).issubset(enabled_term_base_ids):
-            raise HTTPException(status_code=400, detail="QA术语库必须先启用。")
+            raise HTTPException(status_code=400, detail="用于 QA 的术语库必须先启用。")
         _store_file_record_qa_term_base_ids(file_record, qa_ids)
 
     if "glossary_base_ids" in payload.model_fields_set:
@@ -5886,6 +6023,7 @@ def patch_file_record_bindings(
     after_collection_binding = (
         tuple(_load_file_record_collection_ids(file_record)),
         file_record.collection_id,
+        _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
     )
     if before_collection_binding != after_collection_binding:
         db.flush()
@@ -5906,6 +6044,7 @@ def patch_file_record_bindings(
         "id": str(file_record.id),
         "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
         "collection_ids": [str(collection_id) for collection_id in collection_ids],
+        "tm_match_threshold": _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
         "term_base_id": str(file_record.term_base_id) if file_record.term_base_id else None,
         "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
         "term_base_write_ids": [str(term_base_id) for term_base_id in term_base_write_ids],
@@ -6748,6 +6887,24 @@ def save_file_record_segments_to_tm(
             [collection.id],
             source_file_record_id=file_record.id,
         )
+        notification_title, notification_body = build_save_to_tm_notification(
+            filename=file_record.filename,
+            collection_name=collection.name,
+            created_count=created_count,
+            updated_count=updated_count,
+            skipped_count=skipped_count,
+            refreshed_count=refreshed_count,
+        )
+        create_operation_notification(
+            db,
+            user_id=current_user.id,
+            notification_type="save_to_tm",
+            title=notification_title,
+            body=notification_body,
+            project_id=file_record.project_id,
+            file_record_id=file_record.id,
+        )
+        db.commit()
 
     return {
         "created_count": created_count,
@@ -7889,7 +8046,7 @@ async def import_tm_xlsx(
 ):
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
     if extension not in TM_IMPORT_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="仅支持上传 .xlsx 或 .sdltm 文件。")
+        raise HTTPException(status_code=400, detail="仅支持上传 .tmx、.sdltm、.xls、.xlsx 或 .csv 文件。")
 
     raw_bytes = await file.read()
     if not raw_bytes:
@@ -7913,7 +8070,7 @@ async def import_tm_xlsx(
                 creator_id=current_user.id,
             )
         else:
-            import_summary = import_tm_from_xlsx_upload(
+            import_summary = import_tm_from_upload(
                 db=db,
                 raw_bytes=raw_bytes,
                 filename=file.filename or "uploaded.xlsx",
@@ -7929,6 +8086,27 @@ async def import_tm_xlsx(
     refreshed_count = 0
     if collection is not None and import_summary.imported_rows > 0:
         refreshed_count = _notify_tm_collections_changed(db, [collection.id])
+    if collection is not None:
+        notification_title, notification_body = build_resource_import_notification(
+            resource_label="记忆库",
+            resource_name=collection.name,
+            filename=import_summary.filename,
+            imported_rows=import_summary.imported_rows,
+            created_rows=import_summary.created_rows,
+            updated_rows=import_summary.updated_rows,
+            skipped_empty_rows=import_summary.skipped_empty_rows,
+            skipped_header_rows=import_summary.skipped_header_rows,
+            source_language=resolved_source_language,
+            target_language=resolved_target_language,
+        )
+        create_operation_notification(
+            db,
+            user_id=current_user.id,
+            notification_type="resource_import",
+            title=notification_title,
+            body=notification_body,
+        )
+        db.commit()
 
     return {
         "filename": import_summary.filename,
@@ -8519,82 +8697,61 @@ async def import_termbase_xlsx(
     file: UploadFile = File(...),
     collection_id: UUID | None = Form(default=None),
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
-    if extension not in XLSX_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="仅支持上传 .xlsx 文件。")
+    if extension not in TERM_IMPORT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="仅支持上传 .xls、.xlsx 或 .csv 文件。")
 
     raw_bytes = await file.read()
     if not raw_bytes:
-        raise HTTPException(status_code=400, detail="上传的 XLSX 文件为空。")
+        raise HTTPException(status_code=400, detail="上传的术语文件为空。")
 
     collection = _get_termbase_collection_or_404(db, collection_id)
 
     try:
-        from openpyxl import load_workbook
-        from io import BytesIO
-
-        wb = load_workbook(filename=BytesIO(raw_bytes), read_only=True, data_only=True)
-        ws = wb.active
-
-        created_count = 0
-        updated_count = 0
-        skipped_count = 0
-
-        for row_idx, row in enumerate(ws.iter_rows(min_row=1, values_only=True), start=1):
-            if not row or len(row) < 2:
-                skipped_count += 1
-                continue
-
-            source_text = normalize_text(str(row[0] or ""))
-            target_text = normalize_text(str(row[1] or ""))
-
-            if not source_text or not target_text:
-                skipped_count += 1
-                continue
-
-            # 跳过表头
-            if row_idx == 1 and (source_text.lower() in ("source", "原文", "术语") or target_text.lower() in ("target", "译文", "翻译")):
-                skipped_count += 1
-                continue
-
-            existing = (
-                db.query(TermEntry)
-                .filter(TermEntry.source_text == source_text, TermEntry.term_base_id == collection_id)
-                .first()
-            )
-
-            if existing:
-                existing.target_text = target_text
-                updated_count += 1
-            else:
-                # 获取术语库的语言设置
-                source_lang = collection.source_language if collection else "zh"
-                target_lang = collection.target_language if collection else "en"
-                term = TermEntry(
-                    term_base_id=collection_id,
-                    source_text=source_text,
-                    target_text=target_text,
-                    source_language=source_lang,
-                    target_language=target_lang,
-                )
-                db.add(term)
-                created_count += 1
-
-        db.commit()
-        wb.close()
-
+        import_summary = import_terms_from_xlsx_upload(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=file.filename or "uploaded.xlsx",
+            term_base_id=collection_id,
+            source_language=collection.source_language if collection else "zh",
+            target_language=collection.target_language if collection else "en",
+        )
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"术语库导入失败：{exc}") from exc
 
+    if collection is not None:
+        notification_title, notification_body = build_resource_import_notification(
+            resource_label="术语库",
+            resource_name=collection.name,
+            filename=import_summary.filename,
+            imported_rows=import_summary.imported_rows,
+            created_rows=import_summary.created_rows,
+            updated_rows=import_summary.updated_rows,
+            skipped_empty_rows=import_summary.skipped_empty_rows,
+            skipped_header_rows=import_summary.skipped_header_rows,
+            source_language=collection.source_language if collection else "zh",
+            target_language=collection.target_language if collection else "en",
+        )
+        create_operation_notification(
+            db,
+            user_id=current_user.id,
+            notification_type="resource_import",
+            title=notification_title,
+            body=notification_body,
+        )
+        db.commit()
+
     return {
-        "filename": file.filename,
-        "created_rows": created_count,
-        "updated_rows": updated_count,
-        "skipped_rows": skipped_count,
-        "imported_rows": created_count + updated_count,
+        "filename": import_summary.filename,
+        "created_rows": import_summary.created_rows,
+        "updated_rows": import_summary.updated_rows,
+        "skipped_rows": import_summary.skipped_empty_rows + import_summary.skipped_header_rows,
+        "skipped_empty_rows": import_summary.skipped_empty_rows,
+        "skipped_header_rows": import_summary.skipped_header_rows,
+        "imported_rows": import_summary.imported_rows,
         "collection_id": collection.id if collection else None,
         "collection_name": collection.name if collection else None,
     }

@@ -60,7 +60,7 @@ export default {
       description: '维护记忆库信息、TM 条目和导入导出操作',
     },
     termBase: {
-      title: 'QA术语库管理',
+      title: '术语库管理',
       description: '管理译后检查术语库，维护翻译术语一致性',
     },
     glossary: {
@@ -76,7 +76,7 @@ export default {
       description: '维护可复用的翻译规则，供 AI 翻译时选择',
     },
     termBaseEdit: {
-      title: 'QA术语库详情',
+      title: '术语库详情',
       description: '维护译后检查术语库信息、术语条目和导入导出操作',
     },
     users: {
@@ -88,7 +88,7 @@ export default {
       description: '查看项目和文件任务的指派、授权和取消记录',
     },
   },
-  shell: {
+    shell: {
     mainNav: '主导航',
     sections: {
       dashboard: '数据看板',
@@ -96,11 +96,12 @@ export default {
       tasks: '我的任务',
       assets: '语言资产',
       tm: '记忆库',
-      termBase: 'QA术语库',
+      termBase: '术语库',
       glossary: '词汇表',
       translationRules: '翻译规则',
       system: '系统',
       users: '用户管理',
+      assignmentEvents: '指派记录',
     },
     recent: {
       title: '最近打开',
@@ -117,6 +118,9 @@ export default {
       language: '语言切换',
       logout: '退出登录',
       soon: '{name}，即将上线',
+      markAllRead: '全部已读',
+      noNotifications: '暂无消息',
+      globalBreadcrumb: '全局页面路径',
     },
     userFallback: '管理员',
   },
@@ -481,6 +485,10 @@ export default {
         charactersWithSpaces: '字符数(含空格)',
         paragraphs: '段落数',
         lines: '行数',
+        internalRepeatedWords: '内部重复字数',
+        internalRepeatedCharacters: '内部重复字符数',
+        crossFileRepeatedWords: '跨文件重复字数',
+        crossFileRepeatedCharacters: '跨文件重复字符数',
         license: '许可证',
       },
       summary: {
@@ -530,14 +538,14 @@ export default {
       selectFileFirst: '请先勾选文件',
       fileLocked: '所选文件正在预翻译中，请完成后再操作',
       dialogTitle: '批量预翻译',
-      dialogDescription: '按 TM、词汇表、AI 和 QA 术语库选项批量处理已选文件。',
+      dialogDescription: '按 TM、词汇表、AI 和术语库选项批量处理已选文件。',
       selectedSummary: '已选 {count} 个文件',
       start: '开始预翻译',
       sections: {
         tm: '启用 TM 预匹配',
         llm: '启用 LLM 翻译',
         glossary: '启用词汇表（AI 预翻译）',
-        termBase: '启用QA术语库',
+        termBase: '启用术语库',
       },
       summary: {
         files: '已选文件',
@@ -594,11 +602,11 @@ export default {
         hint: '词汇表只在 LLM 预翻译时按当前原文检索注入，不在工作台展示，也不会写入句段。',
       },
       termBase: {
-        select: 'QA术语库（多选）',
-        placeholder: '请选择QA术语库',
-        searchPlaceholder: '搜索QA术语库名称或说明',
-        hiddenByLanguagePair: '已隐藏 {count} 个语言对不一致的QA术语库。',
-        emptyForLanguagePair: '当前语言对没有可用QA术语库。',
+        select: '术语库（多选）',
+        placeholder: '请选择术语库',
+        searchPlaceholder: '搜索术语库名称或说明',
+        hiddenByLanguagePair: '已隐藏 {count} 个语言对不一致的术语库。',
+        emptyForLanguagePair: '当前语言对没有可用术语库。',
         hint: '绑定到所选文件，工作台和译后检查会提示术语；本次不会直接替换译文。',
       },
       progress: {
@@ -625,7 +633,7 @@ export default {
         selectOneOption: '请至少勾选一项执行内容。',
         tmCollectionRequired: '已启用 TM，请至少选择一个记忆库。',
         glossaryBaseRequired: '已启用词汇表，请至少选择一个词汇表。',
-        termBaseRequired: '已启用QA术语库，请选择QA术语库。',
+        termBaseRequired: '已启用术语库，请选择术语库。',
         fileLanguagePairRequired: '所选文件缺少有效语言对，请先补全源语言和目标语言。',
         fileLanguagePairMixed: '当前选择包含 {count} 个不同语言对，请分语言对分别预翻译。',
         llmFailed: 'LLM 预翻译请求失败。',

@@ -16,6 +16,10 @@ from app.database import get_db
 from app.models import FileRecord, TermBase, TermEntry, User
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import normalize_match_text, normalize_text
+from app.services.notification_service import (
+    build_resource_import_notification,
+    create_operation_notification,
+)
 from app.services.resource_export_queue import (
     ResourceExportFormat,
     build_resource_export_download_response,
@@ -27,7 +31,7 @@ from app.services.term_entry_service import (
     save_term_entries_batch,
 )
 from app.services.term_importer import (
-    XLSX_EXTENSIONS,
+    TERM_IMPORT_EXTENSIONS,
     import_terms_from_xlsx_upload,
 )
 from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_response
@@ -491,12 +495,12 @@ async def import_term_base_xlsx(
         raise HTTPException(status_code=400, detail="请先选择要导入的术语库。")
 
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
-    if extension not in XLSX_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="仅支持上传 .xlsx 文件。")
+    if extension not in TERM_IMPORT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="仅支持上传 .xls、.xlsx 或 .csv 文件。")
 
     raw_bytes = await file.read()
     if not raw_bytes:
-        raise HTTPException(status_code=400, detail="上传的 XLSX 文件为空。")
+        raise HTTPException(status_code=400, detail="上传的术语文件为空。")
 
     term_base = _get_term_base_or_404(db, term_base_id)
     resolved_source_language, resolved_target_language = _resolve_term_base_language_pair(
@@ -517,6 +521,27 @@ async def import_term_base_xlsx(
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"术语库导入失败：{exc}") from exc
+
+    notification_title, notification_body = build_resource_import_notification(
+        resource_label="术语库",
+        resource_name=term_base.name,
+        filename=import_summary.filename,
+        imported_rows=import_summary.imported_rows,
+        created_rows=import_summary.created_rows,
+        updated_rows=import_summary.updated_rows,
+        skipped_empty_rows=import_summary.skipped_empty_rows,
+        skipped_header_rows=import_summary.skipped_header_rows,
+        source_language=resolved_source_language,
+        target_language=resolved_target_language,
+    )
+    create_operation_notification(
+        db,
+        user_id=current_user.id,
+        notification_type="resource_import",
+        title=notification_title,
+        body=notification_body,
+    )
+    db.commit()
 
     return {
         "filename": import_summary.filename,

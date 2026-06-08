@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import re
+import csv
 import sqlite3
 import tempfile
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from xml.etree import ElementTree as ET
 from uuid import UUID
 
 from openpyxl import load_workbook
@@ -18,9 +20,13 @@ from app.services.normalizer import build_source_hash, normalize_match_text, nor
 from app.services.tm_vector import sync_tm_embeddings
 
 
+CSV_EXTENSIONS = {".csv"}
+TMX_EXTENSIONS = {".tmx"}
+XLS_EXTENSIONS = {".xls"}
 XLSX_EXTENSIONS = {".xlsx"}
 SDLTM_EXTENSIONS = {".sdltm"}
-TM_IMPORT_EXTENSIONS = XLSX_EXTENSIONS | SDLTM_EXTENSIONS
+WORKBOOK_EXTENSIONS = XLSX_EXTENSIONS | XLS_EXTENSIONS
+TM_IMPORT_EXTENSIONS = CSV_EXTENSIONS | TMX_EXTENSIONS | WORKBOOK_EXTENSIONS | SDLTM_EXTENSIONS
 HEADER_ALIASES = {
     ("zh-cn", "en-us"),
     ("source", "target"),
@@ -92,6 +98,51 @@ def preview_sdltm_metadata(raw_bytes: bytes) -> SDLTMMetadata:
         Path(tmp_path).unlink(missing_ok=True)
 
 
+def import_tm_from_upload(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
+) -> TMImportSummary:
+    extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
+    if extension in CSV_EXTENSIONS:
+        return import_tm_from_csv_upload(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            source_language=source_language,
+            target_language=target_language,
+            batch_size=batch_size,
+            collection_id=collection_id,
+            creator_id=creator_id,
+        )
+    if extension in TMX_EXTENSIONS:
+        return import_tm_from_tmx_upload(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            source_language=source_language,
+            target_language=target_language,
+            batch_size=batch_size,
+            collection_id=collection_id,
+            creator_id=creator_id,
+        )
+    return import_tm_from_xlsx_upload(
+        db=db,
+        raw_bytes=raw_bytes,
+        filename=filename,
+        source_language=source_language,
+        target_language=target_language,
+        batch_size=batch_size,
+        collection_id=collection_id,
+        creator_id=creator_id,
+    )
+
+
 def import_tm_from_xlsx_upload(
     db: Session,
     raw_bytes: bytes,
@@ -102,6 +153,20 @@ def import_tm_from_xlsx_upload(
     collection_id: UUID | None = None,
     creator_id: UUID | None = None,
 ) -> TMImportSummary:
+    extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
+    if extension in XLS_EXTENSIONS:
+        rows = _iter_xls_rows(raw_bytes)
+        return _import_text_rows(
+            db=db,
+            rows=rows,
+            filename=filename,
+            batch_size=batch_size,
+            collection_id=collection_id,
+            creator_id=creator_id,
+            source_language=source_language,
+            target_language=target_language,
+        )
+
     workbook = load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)
     return _import_workbook(
         db=db,
@@ -137,9 +202,156 @@ def import_tm_from_xlsx_path(
     )
 
 
+def import_tm_from_csv_upload(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
+) -> TMImportSummary:
+    rows = _iter_csv_rows(raw_bytes)
+    return _import_text_rows(
+        db=db,
+        rows=rows,
+        filename=filename,
+        batch_size=batch_size,
+        collection_id=collection_id,
+        creator_id=creator_id,
+        source_language=source_language,
+        target_language=target_language,
+    )
+
+
+def import_tm_from_tmx_upload(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
+) -> TMImportSummary:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    rows = _iter_tmx_rows(raw_bytes, normalized_source_language, normalized_target_language)
+    return _import_text_rows(
+        db=db,
+        rows=rows,
+        filename=filename,
+        batch_size=batch_size,
+        collection_id=collection_id,
+        creator_id=creator_id,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
+    )
+
+
+def _iter_csv_rows(raw_bytes: bytes):
+    text = _decode_csv_bytes(raw_bytes)
+    sample = text[:4096]
+    try:
+        dialect = csv.Sniffer().sniff(sample)
+    except csv.Error:
+        dialect = csv.excel
+    reader = csv.reader(text.splitlines(), dialect)
+    for row in reader:
+        yield tuple(row)
+
+
+def _iter_xls_rows(raw_bytes: bytes):
+    try:
+        import xlrd
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("导入 .xls 文件需要安装 xlrd 依赖。") from exc
+
+    workbook = xlrd.open_workbook(file_contents=raw_bytes)
+    sheet = workbook.sheet_by_index(0)
+    for row_index in range(sheet.nrows):
+        yield tuple(sheet.cell_value(row_index, column_index) for column_index in range(sheet.ncols))
+
+
+def _iter_tmx_rows(raw_bytes: bytes, source_language: str, target_language: str):
+    root = ET.fromstring(raw_bytes)
+    for translation_unit in root.findall(".//{*}tu"):
+        language_segments: list[tuple[str, str]] = []
+        for tuv in translation_unit.findall("{*}tuv"):
+            language = (
+                tuv.attrib.get("{http://www.w3.org/XML/1998/namespace}lang")
+                or tuv.attrib.get("lang")
+                or tuv.attrib.get("xml:lang")
+                or ""
+            )
+            segment = tuv.find("{*}seg")
+            if segment is None:
+                continue
+            text = normalize_text("".join(segment.itertext()))
+            if text:
+                language_segments.append((language, text))
+
+        source_text = _find_tmx_language_text(language_segments, source_language)
+        target_text = _find_tmx_language_text(language_segments, target_language)
+        if (not source_text or not target_text) and len(language_segments) >= 2:
+            source_text = source_text or language_segments[0][1]
+            target_text = target_text or language_segments[1][1]
+        yield (source_text, target_text)
+
+
+def _decode_csv_bytes(raw_bytes: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            return raw_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw_bytes.decode("utf-8", errors="replace")
+
+
+def _find_tmx_language_text(language_segments: list[tuple[str, str]], language: str) -> str:
+    normalized_language = _normalize_language_tag(language)
+    for candidate_language, text in language_segments:
+        if _normalize_language_tag(candidate_language) == normalized_language:
+            return text
+    primary_language = normalized_language.split("-", 1)[0]
+    for candidate_language, text in language_segments:
+        if _normalize_language_tag(candidate_language).split("-", 1)[0] == primary_language:
+            return text
+    return ""
+
+
 def _import_workbook(
     db: Session,
     workbook,
+    filename: str,
+    batch_size: int,
+    source_language: str,
+    target_language: str,
+    collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
+) -> TMImportSummary:
+    worksheet = workbook.active
+    try:
+        return _import_text_rows(
+            db=db,
+            rows=worksheet.iter_rows(values_only=True),
+            filename=filename,
+            batch_size=batch_size,
+            collection_id=collection_id,
+            creator_id=creator_id,
+            source_language=source_language,
+            target_language=target_language,
+        )
+    finally:
+        workbook.close()
+
+
+def _import_text_rows(
+    db: Session,
+    rows,
     filename: str,
     batch_size: int,
     source_language: str,
@@ -151,14 +363,13 @@ def _import_workbook(
         source_language,
         target_language,
     )
-    worksheet = workbook.active
     batch_rows: dict[str, dict] = {}
     created_rows = 0
     updated_rows = 0
     skipped_empty_rows = 0
     skipped_header_rows = 0
 
-    for row_index, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+    for row_index, row in enumerate(rows, start=1):
         source_text = normalize_text(_cell_to_text(row, 0))
         target_text = normalize_text(_cell_to_text(row, 1))
 
@@ -205,7 +416,6 @@ def _import_workbook(
         created_rows += created_in_batch
         updated_rows += updated_in_batch
 
-    workbook.close()
     return TMImportSummary(
         filename=filename,
         created_rows=created_rows,
@@ -316,6 +526,10 @@ def _cell_to_text(row: tuple, index: int) -> str:
         return ""
     value = row[index]
     return "" if value is None else str(value)
+
+
+def _normalize_language_tag(language: str) -> str:
+    return (language or "").strip().lower().replace("_", "-")
 
 
 def _looks_like_header(source_text: str, target_text: str) -> bool:

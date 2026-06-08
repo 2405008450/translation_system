@@ -222,6 +222,10 @@ export interface DocumentStatistics {
   characters_with_spaces: number | null
   paragraphs: number | null
   lines: number | null
+  internal_repeated_words: number | null
+  internal_repeated_characters: number | null
+  cross_file_repeated_words: number | null
+  cross_file_repeated_characters: number | null
 }
 
 export interface DocumentStatisticsTotals {
@@ -233,6 +237,10 @@ export interface DocumentStatisticsTotals {
   characters_with_spaces: number | null
   paragraphs: number | null
   lines: number | null
+  internal_repeated_words: number | null
+  internal_repeated_characters: number | null
+  cross_file_repeated_words: number | null
+  cross_file_repeated_characters: number | null
 }
 
 export interface DocumentStatisticsReportItem {
@@ -370,6 +378,7 @@ export interface FileRecordDetail {
   target_language: string | null
   collection_id: string | null
   collection_ids: string[]
+  tm_match_threshold: number
   collection_name: string | null
   term_base_id: string | null
   term_base_name: string | null
@@ -553,6 +562,7 @@ export interface ProjectTermBaseSettingRow {
   enabled: boolean
   writable: boolean
   qa: boolean
+  qa_priority: number | null
 }
 
 export interface ProjectTermBaseSettingGroup {
@@ -584,6 +594,7 @@ export interface ProjectTranslationMemorySettingFile {
   filename: string
   collection_id: string | null
   collection_ids: string[]
+  tm_match_threshold: number
 }
 
 export interface ProjectTranslationMemorySettingGroup {

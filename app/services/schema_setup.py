@@ -931,6 +931,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ADD COLUMN IF NOT EXISTS collection_ids_json TEXT NOT NULL DEFAULT '[]'
             """,
             """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS tm_match_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.8
+            """,
+            """
             UPDATE file_records
             SET collection_ids_json = json_build_array(collection_id)::text
             WHERE collection_id IS NOT NULL

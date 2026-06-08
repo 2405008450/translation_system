@@ -37,6 +37,10 @@ STATISTIC_NUMBER_KEYS = (
     "characters_with_spaces",
     "paragraphs",
     "lines",
+    "internal_repeated_words",
+    "internal_repeated_characters",
+    "cross_file_repeated_words",
+    "cross_file_repeated_characters",
 )
 NON_ASIAN_WORD_PATTERN = re.compile(
     r"[A-Za-z0-9]+(?:[.,:/_-][A-Za-z0-9]+)*%?|[^\W_\d\s]+(?:[-'][^\W_\d\s]+)*",

@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, Uuid, func, text
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, Uuid, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -157,6 +157,12 @@ class FileRecord(Base):
         nullable=False,
         default="[]",
         server_default=text("'[]'"),
+    )
+    tm_match_threshold: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=0.8,
+        server_default=text("0.8"),
     )
     term_base_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),

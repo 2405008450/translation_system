@@ -19,6 +19,7 @@ const props = withDefaults(defineProps<{
   revisionBusy?: boolean
   matchedTerms?: TermEntryRecord[]
   sourceSearchQuery?: string
+  targetSearchQuery?: string
   showVisibleChars?: boolean
   pendingFormats?: Record<TextFormat, boolean> & { _overrideActive?: boolean }
 }>(), {
@@ -29,6 +30,7 @@ const props = withDefaults(defineProps<{
   revisionBusy: false,
   matchedTerms: () => [],
   sourceSearchQuery: '',
+  targetSearchQuery: '',
   showVisibleChars: false,
   pendingFormats: () => ({
     bold: false,
@@ -251,14 +253,14 @@ const highlightedSourceText = computed(() => {
 // 高亮译文中匹配的术语
 const highlightedTargetText = computed(() => {
   const text = props.segment.target_text || ''
-  return highlightText(text, props.matchedTerms || [], 'target_text')
+  return highlightSearchText(text, props.targetSearchQuery) || highlightText(text, props.matchedTerms || [], 'target_text')
 })
 
 // 生成带高亮的 HTML
 const targetHtmlContent = computed(() => {
   // 如果有保存的格式化 HTML，优先使用
   if (props.segment.target_html) {
-    return sanitizeHtml(props.segment.target_html)
+    return renderTargetHtmlWithHighlights(sanitizeHtml(props.segment.target_html))
   }
 
   return renderTargetWithSourceFormats(props.segment.target_text || '')
@@ -316,6 +318,25 @@ function hasSourceHighlights(): boolean {
   return Boolean(props.sourceSearchQuery.trim()) || (props.matchedTerms || []).some((term) => Boolean(term.source_text))
 }
 
+function renderTargetTextWithHighlights(text: string): string {
+  const parts = highlightSearchText(text, props.targetSearchQuery)
+    || highlightText(text, props.matchedTerms || [], 'target_text')
+  if (!parts) {
+    return textToVisibleChars(text)
+  }
+  return parts
+    .map((seg) =>
+      seg.highlight
+        ? `<mark class="${seg.kind === 'search' ? 'segment-row__search-highlight' : 'segment-row__term-highlight'}">${textToVisibleChars(seg.text)}</mark>`
+        : textToVisibleChars(seg.text)
+    )
+    .join('')
+}
+
+function hasTargetHighlights(): boolean {
+  return Boolean(props.targetSearchQuery.trim()) || (props.matchedTerms || []).some((term) => Boolean(term.target_text))
+}
+
 function renderSourceHtmlWithHighlights(sourceHtml: string): string {
   if (!hasSourceHighlights() || typeof document === 'undefined') {
     return sourceHtml
@@ -330,6 +351,46 @@ function renderSourceHtmlWithHighlights(sourceHtml: string): string {
       if (!text) return
       const wrapper = document.createElement('span')
       wrapper.innerHTML = renderSourceTextWithHighlights(text)
+      const textNode = node as ChildNode
+      textNode.replaceWith(...Array.from(wrapper.childNodes))
+      return
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      return
+    }
+
+    const element = node as HTMLElement
+    if (
+      element.matches('script, style')
+      || element.classList.contains('doc-math')
+      || element.classList.contains('segment-row__term-highlight')
+      || element.classList.contains('segment-row__search-highlight')
+    ) {
+      return
+    }
+
+    Array.from(element.childNodes).forEach(processNode)
+  }
+
+  Array.from(template.content.childNodes).forEach(processNode)
+  return template.innerHTML
+}
+
+function renderTargetHtmlWithHighlights(targetHtml: string): string {
+  if (!hasTargetHighlights() || typeof document === 'undefined') {
+    return targetHtml
+  }
+
+  const template = document.createElement('template')
+  template.innerHTML = targetHtml
+
+  function processNode(node: Node) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent || ''
+      if (!text) return
+      const wrapper = document.createElement('span')
+      wrapper.innerHTML = renderTargetTextWithHighlights(text)
       const textNode = node as ChildNode
       textNode.replaceWith(...Array.from(wrapper.childNodes))
       return
@@ -376,17 +437,7 @@ function textToVisibleChars(text: string): string {
 }
 
 function renderTargetTextHtml(text: string): string {
-  const segments = highlightText(text, props.matchedTerms || [], 'target_text')
-  if (!segments) {
-    return textToVisibleChars(text)
-  }
-  return segments
-    .map((seg) =>
-      seg.highlight
-        ? `<mark class="segment-row__term-highlight">${textToVisibleChars(seg.text)}</mark>`
-        : textToVisibleChars(seg.text)
-    )
-    .join('')
+  return renderTargetTextWithHighlights(text)
 }
 
 // 保存和恢复光标位置
@@ -1612,6 +1663,15 @@ watch(
   padding: 1px 2px;
   border-radius: 3px;
   font-weight: 500;
+}
+
+.segment-row__editor :deep(.segment-row__search-highlight) {
+  background: #fff176;
+  color: inherit;
+  padding: 1px 2px;
+  border-radius: 3px;
+  box-shadow: inset 0 0 0 1px rgba(138, 103, 0, 0.2);
+  font-weight: 600;
 }
 
 .segment-row__editor {

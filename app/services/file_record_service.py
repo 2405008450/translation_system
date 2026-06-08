@@ -278,6 +278,7 @@ def duplicate_file_record(
         creator_id=current_user.id if current_user is not None else source_record.creator_id,
         collection_id=source_record.collection_id,
         collection_ids_json=source_record.collection_ids_json,
+        tm_match_threshold=getattr(source_record, "tm_match_threshold", 0.8),
         term_base_id=source_record.term_base_id,
         term_base_ids=source_record.term_base_ids,
         term_base_write_ids=getattr(source_record, "term_base_write_ids", "[]"),

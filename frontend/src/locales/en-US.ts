@@ -65,7 +65,7 @@ const overrides = {
       description: 'Maintain TM metadata, entries, imports, and exports',
     },
     termBase: {
-      title: 'QA Termbase',
+      title: 'Termbase',
       description: 'Manage post-translation QA terminology and consistency checks',
     },
     glossary: {
@@ -81,7 +81,7 @@ const overrides = {
       description: 'Maintain reusable translation rules for AI translation',
     },
     termBaseEdit: {
-      title: 'QA Termbase Details',
+      title: 'Termbase Details',
       description: 'Maintain termbase metadata, term entries, imports, and exports',
     },
     users: {
@@ -101,7 +101,7 @@ const overrides = {
       tasks: 'My Tasks',
       assets: 'Language Assets',
       tm: 'Translation Memory',
-      termBase: 'QA Termbase',
+      termBase: 'Termbase',
       glossary: 'Glossary',
       translationRules: 'Translation Rules',
       system: 'System',
@@ -258,6 +258,12 @@ const overrides = {
       clear: 'Clear Selection',
       selectedCount: '{count} files selected',
       total: 'Total',
+      columns: {
+        internalRepeatedWords: 'Internal repeated words',
+        internalRepeatedCharacters: 'Internal repeated characters',
+        crossFileRepeatedWords: 'Cross-file repeated words',
+        crossFileRepeatedCharacters: 'Cross-file repeated characters',
+      },
     },
   },
   documentParsing: {

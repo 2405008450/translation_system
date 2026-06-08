@@ -27,6 +27,7 @@ import { formatLanguagePair, languageOptions } from '../constants/languages'
 import { useAuthStore } from '../stores/auth'
 import type { GlossaryBase, GlossaryEntryRecord, GlossaryImportSummary, PaginatedResponse } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
+import { refreshGlobalNotifications } from '../utils/notifications'
 
 type ExportFormat = 'xlsx' | 'tmx'
 
@@ -455,6 +456,7 @@ async function uploadGlossaryWorkbook() {
     })
     importSummary.value = data
     importMessage.value = `导入完成：${data.filename}`
+    refreshGlobalNotifications()
     selectedImportFile.value = null
     if (importFileInput.value) {
       importFileInput.value.value = ''

@@ -252,6 +252,11 @@ def refresh_unconfirmed_segment_matches(
     )
     if not selected_collection_ids:
         return 0
+    similarity_threshold = round(
+        float(getattr(file_record, "tm_match_threshold", None) or settings.default_similarity_threshold),
+        2,
+    )
+    similarity_threshold = min(max(similarity_threshold, 0.5), 1.0)
 
     updated_count = 0
     offset = 0
@@ -281,7 +286,7 @@ def refresh_unconfirmed_segment_matches(
             db=db,
             sentences=source_sentences,
             auxiliary_sentences=auxiliary_sentences,
-            similarity_threshold=settings.default_similarity_threshold,
+            similarity_threshold=similarity_threshold,
             collection_ids=selected_collection_ids,
         )
 

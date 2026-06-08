@@ -181,7 +181,7 @@ const router = createRouter({
           component: TermBaseView,
           meta: {
             navSection: 'term-base',
-            pageTitle: 'QA术语库管理',
+            pageTitle: '术语库管理',
             pageDescription: '管理译后检查术语库，维护翻译术语一致性',
             pageTitleKey: 'pages.termBase.title',
             pageDescriptionKey: 'pages.termBase.description',
@@ -234,7 +234,7 @@ const router = createRouter({
           props: true,
           meta: {
             navSection: 'term-base',
-            pageTitle: 'QA术语库详情',
+            pageTitle: '术语库详情',
             pageDescription: '维护译后检查术语库信息、术语条目和导入导出操作',
             pageTitleKey: 'pages.termBaseEdit.title',
             pageDescriptionKey: 'pages.termBaseEdit.description',

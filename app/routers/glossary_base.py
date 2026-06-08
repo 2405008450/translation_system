@@ -19,6 +19,10 @@ from app.services.glossary_importer import (
 )
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import normalize_match_text, normalize_text
+from app.services.notification_service import (
+    build_resource_import_notification,
+    create_operation_notification,
+)
 from app.services.resource_export_queue import (
     ResourceExportFormat,
     build_resource_export_download_response,
@@ -304,6 +308,27 @@ async def import_glossary_base_xlsx(
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"词汇表导入失败：{exc}") from exc
+
+    notification_title, notification_body = build_resource_import_notification(
+        resource_label="词汇表",
+        resource_name=glossary_base.name,
+        filename=import_summary.filename,
+        imported_rows=import_summary.imported_rows,
+        created_rows=import_summary.created_rows,
+        updated_rows=import_summary.updated_rows,
+        skipped_empty_rows=import_summary.skipped_empty_rows,
+        skipped_header_rows=import_summary.skipped_header_rows,
+        source_language=resolved_source_language,
+        target_language=resolved_target_language,
+    )
+    create_operation_notification(
+        db,
+        user_id=current_user.id,
+        notification_type="resource_import",
+        title=notification_title,
+        body=notification_body,
+    )
+    db.commit()
 
     return {
         "filename": import_summary.filename,

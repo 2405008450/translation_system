@@ -6,6 +6,7 @@ import { useI18n } from 'vue-i18n'
 
 import { http } from '../api/http'
 import { formatLanguagePair, languageOptions } from '../constants/languages'
+import { refreshGlobalNotifications } from '../utils/notifications'
 import { isProgressComplete } from '../utils/progress'
 import type {
   TMCollection,
@@ -372,6 +373,7 @@ async function uploadTMWorkbook() {
 
     tmImportSummary.value = data
     tmImportMessage.value = t('resourceImport.tm.success.imported', { filename: data.filename })
+    refreshGlobalNotifications()
     selectedTMFile.value = null
     if (tmFileInput.value) {
       tmFileInput.value.value = ''
@@ -426,6 +428,7 @@ async function uploadTermWorkbook() {
 
     termImportSummary.value = data
     termImportMessage.value = t('resourceImport.term.success.imported', { filename: data.filename })
+    refreshGlobalNotifications()
     selectedTermFile.value = null
     if (termFileInput.value) {
       termFileInput.value.value = ''
@@ -515,7 +518,7 @@ onMounted(() => {
             ref="tmFileInput"
             class="field__control"
             type="file"
-            accept=".xlsx,.sdltm"
+            accept=".tmx,.sdltm,.xls,.xlsx,.csv"
             @change="onTMFileChange"
           />
         </label>
@@ -668,7 +671,7 @@ onMounted(() => {
             ref="termFileInput"
             class="field__control"
             type="file"
-            accept=".xlsx"
+            accept=".xls,.xlsx,.csv"
             @change="onTermFileChange"
           />
         </label>

@@ -17,7 +17,12 @@ interface ProjectFileItem {
   filename: string
   source_language: string | null
   target_language: string | null
+  collection_id?: string | null
+  collection_ids?: string[]
   glossary_base_ids?: string[]
+  term_base_id?: string | null
+  term_base_ids?: string[]
+  tm_match_threshold?: number
   is_edit_locked?: boolean
   active_operation_message?: string
 }
@@ -261,11 +266,32 @@ const overallProgress = computed(() => {
   return Math.round(total / progressFiles.value.length)
 })
 
+function normalizeTMThreshold(value: unknown) {
+  const numericValue = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(numericValue)) {
+    return 0.75
+  }
+  return Math.min(1, Math.max(0.5, Math.round(numericValue * 100) / 100))
+}
+
+function applyTMThresholdDefaultFromFiles() {
+  const firstThreshold = props.files.find((file) => file.tm_match_threshold != null)?.tm_match_threshold
+  tmThreshold.value = normalizeTMThreshold(firstThreshold ?? tmThreshold.value)
+}
+
+function applyResourceDefaultsFromFiles(force = false) {
+  applyTMDefaultsFromFiles(force)
+  applyTermBaseDefaultsFromFiles(force)
+  applyGlossaryDefaultsFromFiles(force)
+}
+
 watch(() => props.open, (open) => {
   if (open) {
     void loadResources()
     if (!running.value) {
       resetProgress()
+      applyTMThresholdDefaultFromFiles()
+      applyResourceDefaultsFromFiles(true)
     }
     errorMessage.value = ''
     stopRequested.value = false
@@ -275,10 +301,12 @@ watch(() => props.open, (open) => {
 
 watch(availableTMCollections, () => {
   tmCollectionIds.value = normalizeResourceIds(tmCollectionIds.value, availableTMCollections.value)
+  applyTMDefaultsFromFiles()
 })
 
 watch(availableTermBases, () => {
   termBaseIds.value = normalizeResourceIds(termBaseIds.value, availableTermBases.value)
+  applyTermBaseDefaultsFromFiles()
 })
 
 watch(availableGlossaryBases, () => {
@@ -442,6 +470,42 @@ function clearGlossaryBases() {
   glossaryBaseIds.value = []
 }
 
+function getBoundTMCollectionIdsFromFiles() {
+  const orderedIds: string[] = []
+  const seenIds = new Set<string>()
+  for (const file of props.files) {
+    for (const collectionId of file.collection_ids || []) {
+      if (!seenIds.has(collectionId)) {
+        seenIds.add(collectionId)
+        orderedIds.push(collectionId)
+      }
+    }
+    if (file.collection_id && !seenIds.has(file.collection_id)) {
+      seenIds.add(file.collection_id)
+      orderedIds.push(file.collection_id)
+    }
+  }
+  return orderedIds
+}
+
+function getBoundTermBaseIdsFromFiles() {
+  const orderedIds: string[] = []
+  const seenIds = new Set<string>()
+  for (const file of props.files) {
+    for (const termBaseId of file.term_base_ids || []) {
+      if (!seenIds.has(termBaseId)) {
+        seenIds.add(termBaseId)
+        orderedIds.push(termBaseId)
+      }
+    }
+    if (file.term_base_id && !seenIds.has(file.term_base_id)) {
+      seenIds.add(file.term_base_id)
+      orderedIds.push(file.term_base_id)
+    }
+  }
+  return orderedIds
+}
+
 function getBoundGlossaryBaseIdsFromFiles() {
   const orderedIds: string[] = []
   const seenIds = new Set<string>()
@@ -456,14 +520,38 @@ function getBoundGlossaryBaseIdsFromFiles() {
   return orderedIds
 }
 
-function applyGlossaryDefaultsFromFiles() {
-  if (running.value || glossaryBaseIds.value.length > 0) {
+function applyTMDefaultsFromFiles(force = false) {
+  if (running.value || (!force && tmCollectionIds.value.length > 0)) {
+    return
+  }
+  const boundIds = normalizeResourceIds(getBoundTMCollectionIdsFromFiles(), availableTMCollections.value)
+  if (force || boundIds.length > 0) {
+    tmCollectionIds.value = boundIds
+    if (boundIds.length > 0) {
+      useTm.value = true
+    }
+  }
+}
+
+function applyTermBaseDefaultsFromFiles(force = false) {
+  if (running.value || (!force && termBaseIds.value.length > 0)) {
+    return
+  }
+  const boundIds = normalizeResourceIds(getBoundTermBaseIdsFromFiles(), availableTermBases.value)
+  if (force || boundIds.length > 0) {
+    termBaseIds.value = boundIds
+    useTermBase.value = boundIds.length > 0
+  }
+}
+
+function applyGlossaryDefaultsFromFiles(force = false) {
+  if (running.value || (!force && glossaryBaseIds.value.length > 0)) {
     return
   }
   const boundIds = normalizeResourceIds(getBoundGlossaryBaseIdsFromFiles(), availableGlossaryBases.value)
-  if (boundIds.length > 0) {
+  if (force || boundIds.length > 0) {
     glossaryBaseIds.value = boundIds
-    useGlossary.value = true
+    useGlossary.value = boundIds.length > 0
   }
 }
 
@@ -484,7 +572,7 @@ async function loadResources() {
     termBases.value = bases
     glossaryBases.value = glossaries
     guidelineTemplates.value = templates
-    applyGlossaryDefaultsFromFiles()
+    applyResourceDefaultsFromFiles()
     if (
       selectedGuidelineTemplateId.value
       && !templates.some((template) => template.id === selectedGuidelineTemplateId.value)
@@ -779,7 +867,7 @@ async function startPreTranslate() {
           )
           await http.post(`/file-records/${file.id}/rematch`, {
             collection_ids: selectedTmCollectionIds.value,
-            threshold: tmThreshold.value,
+            threshold: normalizeTMThreshold(tmThreshold.value),
             skip_confirmed: tmSkipConfirmed.value,
             overwrite_fuzzy: tmOverwriteFuzzy.value,
             auto_confirm_exact: tmAutoConfirmExact.value,
@@ -792,6 +880,16 @@ async function startPreTranslate() {
             getActionProgress(completedActions, 0, actionCount),
             t('projectDetail.preTranslate.progress.tmDone'),
           )
+        }
+
+        if (shouldRunTm.value && !stopRequested.value) {
+          await http.patch(`/file-records/${file.id}/bindings`, {
+            collection_id: selectedTmCollectionIds.value[0] || null,
+            collection_ids: selectedTmCollectionIds.value,
+            tm_match_threshold: normalizeTMThreshold(tmThreshold.value),
+          }, {
+            headers: buildOperationHeaders(operationToken),
+          })
         }
 
         if (useGlossary.value && !stopRequested.value) {
@@ -829,12 +927,15 @@ async function startPreTranslate() {
             getActionProgress(completedActions, 0, actionCount),
             t('projectDetail.preTranslate.progress.termBaseRunning'),
           )
-          const bindingsPayload: Record<string, string | string[] | null> = {
+          const bindingsPayload: Record<string, string | string[] | number | null> = {
             term_base_id: selectedTermBaseIds.value[0] || null,
             term_base_ids: selectedTermBaseIds.value,
+            qa_term_base_ids: selectedTermBaseIds.value,
           }
           if (shouldRunTm.value) {
             bindingsPayload.collection_id = selectedTmCollectionIds.value[0] || null
+            bindingsPayload.collection_ids = selectedTmCollectionIds.value
+            bindingsPayload.tm_match_threshold = normalizeTMThreshold(tmThreshold.value)
           }
           await http.patch(`/file-records/${file.id}/bindings`, bindingsPayload, {
             headers: buildOperationHeaders(operationToken),

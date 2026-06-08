@@ -27,6 +27,7 @@ import { useAuthStore } from '../stores/auth'
 import { usePreferencesStore } from '../stores/preferences'
 import { useShellStore } from '../stores/shell'
 import type { NotificationItem, NotificationsResponse } from '../types/api'
+import { GLOBAL_NOTIFICATIONS_REFRESH_EVENT } from '../utils/notifications'
 
 interface NavChild {
   name: string
@@ -339,6 +340,10 @@ function closeNotificationsOnOutsideClick(event: MouseEvent) {
   }
 }
 
+function handleNotificationsRefresh() {
+  void loadNotifications()
+}
+
 function getFirstVisibleChildName(group: NavGroup) {
   return group.children?.find((child) => child.visible)?.name || ''
 }
@@ -442,10 +447,12 @@ watch(
 
 onMounted(() => {
   document.addEventListener('click', closeNotificationsOnOutsideClick)
+  window.addEventListener(GLOBAL_NOTIFICATIONS_REFRESH_EVENT, handleNotificationsRefresh)
 })
 
 onBeforeUnmount(() => {
   document.removeEventListener('click', closeNotificationsOnOutsideClick)
+  window.removeEventListener(GLOBAL_NOTIFICATIONS_REFRESH_EVENT, handleNotificationsRefresh)
 })
 
 watch(

@@ -47,7 +47,7 @@ async function loadCandidates() {
       candidates: TMCandidate[]
     }>(`/file-records/${props.fileRecordId}/segments/${props.activeSentenceId}/tm-candidates`, {
       params: {
-        threshold: props.threshold ?? 0.6,
+        ...(props.threshold == null ? {} : { threshold: props.threshold }),
         max_candidates: 5,
       },
     })
