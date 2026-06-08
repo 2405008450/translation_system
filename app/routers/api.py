@@ -168,6 +168,11 @@ from app.services.language_detection import detect_upload_language
 from app.services.language_pairs import require_language_pair
 from app.services.matcher import get_tm_candidates_for_text, match_sentences_with_stats
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
+from app.services.project_segment_sync import (
+    empty_project_segment_sync_summary,
+    sync_project_repeated_segments_from_file,
+    sync_project_repeated_segments_from_segments,
+)
 from app.services.revision_service import (
     accept_revision,
     batch_accept_revisions,
@@ -818,6 +823,12 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
             file_record.collection_ids_json = json.dumps([str(cid) for cid in selected_collection_ids])
         if term_base is not None:
             _store_file_record_term_base_ids(file_record, [term_base_id])
+        db.flush()
+        sync_project_repeated_segments_from_file(
+            db,
+            file_record=file_record,
+            current_user=None,
+        )
         created_files.append(file_record)
 
     project.status = "in_progress"
@@ -901,6 +912,10 @@ class SegmentUpdate(BaseModel):
 
 class SegmentSourceUpdate(BaseModel):
     source_text: str
+
+
+class SegmentProjectSyncUpdate(BaseModel):
+    disabled: bool
 
 
 class BatchSegmentUpdate(BaseModel):
@@ -4851,6 +4866,7 @@ def _serialize_workbench_segment(seg: Segment, display_index: int | None = None)
         "target_text": seg.target_text,
         "target_html": seg.target_html,
         "status": seg.status,
+        "project_sync_disabled": bool(getattr(seg, "project_sync_disabled", False)),
         "version": int(seg.version or 1),
         "score": seg.score,
         "matched_source_text": seg.matched_source_text,
@@ -6129,6 +6145,7 @@ def update_segment(
                     }
                 ],
                 "auto_tm": _empty_auto_tm_summary().to_dict(),
+                "project_sync": empty_project_segment_sync_summary().to_dict(),
                 "segments": [_serialize_workbench_segment(current_segment)],
             }
     segment = update_segment_by_sentence_id(
@@ -6145,6 +6162,15 @@ def update_segment(
     if not segment:
         raise HTTPException(status_code=404, detail="片段不存在。")
 
+    project_sync_summary = empty_project_segment_sync_summary()
+    if segment.status == "confirmed" and normalize_text(segment.target_text):
+        project_sync_summary = sync_project_repeated_segments_from_segments(
+            db,
+            file_record=file_record,
+            source_segments=[segment],
+            current_user=current_user,
+        )
+
     auto_tm_summary = _empty_auto_tm_summary()
     if segment.status == "confirmed":
         auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(
@@ -6153,9 +6179,9 @@ def update_segment(
             segments=[segment],
             current_user=current_user,
         )
-        if auto_tm_summary.queued_count > 0:
-            db.commit()
-            _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+    if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0:
+        db.commit()
+        _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
 
     return {
         "id": segment.id,
@@ -6166,9 +6192,13 @@ def update_segment(
         "version": int(segment.version or 1),
         "updated_at": segment.updated_at.isoformat() if segment.updated_at else None,
         "auto_tm": auto_tm_summary.to_dict(),
+        "project_sync": project_sync_summary.to_dict(),
         "updated_count": 1,
         "conflicts": [],
-        "segments": [_serialize_workbench_segment(segment)],
+        "segments": [
+            _serialize_workbench_segment(item)
+            for item in [segment, *project_sync_summary.current_file_segments]
+        ],
     }
 
 
@@ -6183,7 +6213,7 @@ def update_segment_source(
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """更新单个片段的原文"""
-    _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
     segment = update_segment_source_text(
         db=db,
         file_record_id=file_record_id,
@@ -6200,6 +6230,32 @@ def update_segment_source(
         "display_text": segment.display_text,
         "source_html": segment.source_html,
     }
+
+
+@router.patch("/file-records/{file_record_id}/segments/{sentence_id}/project-sync")
+def update_segment_project_sync(
+    file_record_id: UUID,
+    sentence_id: str,
+    payload: SegmentProjectSyncUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+):
+    """开启或关闭单个句段的项目内重复句段同步。"""
+    _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    segment = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not segment:
+        raise HTTPException(status_code=404, detail="片段不存在。")
+
+    segment.project_sync_disabled = payload.disabled
+    segment.version = int(segment.version or 1) + 1
+    db.commit()
+    db.refresh(segment)
+    return _serialize_workbench_segment(segment)
 
 
 @router.post("/file-records/{file_record_id}/segments/{sentence_id}/split")
@@ -6248,6 +6304,7 @@ def split_segment(
 
     # 更新原句段
     segment.source_text = first_source
+    segment.source_hash = build_source_hash(first_source)
     segment.display_text = first_source
     segment.source_html = None
     segment.target_text = first_target
@@ -6265,6 +6322,7 @@ def split_segment(
         file_record_id=file_record_id,
         sentence_id=new_sentence_id,
         source_text=second_source,
+        source_hash=build_source_hash(second_source),
         display_text=second_source,
         source_html=None,
         target_text=second_target,
@@ -6338,6 +6396,7 @@ def merge_segment(
 
     # 更新第一个句段
     first_seg.source_text = merged_source.strip()
+    first_seg.source_hash = build_source_hash(first_seg.source_text)
     first_seg.display_text = merged_source.strip()
     first_seg.source_html = None
     first_seg.target_text = merged_target.strip()
@@ -6390,20 +6449,37 @@ def batch_update(
         current_user=current_user,
         return_result=True,
     )
+    confirmed_segments_for_sync = [
+        segment
+        for segment in result.updated_segments
+        if segment.status == "confirmed" and normalize_text(segment.target_text)
+    ]
+    project_sync_summary = empty_project_segment_sync_summary()
+    if confirmed_segments_for_sync:
+        project_sync_summary = sync_project_repeated_segments_from_segments(
+            db,
+            file_record=file_record,
+            source_segments=confirmed_segments_for_sync,
+            current_user=current_user,
+        )
     auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(
         db,
         file_record=file_record,
         segments=result.updated_segments,
         current_user=current_user,
     )
-    if auto_tm_summary.queued_count > 0:
+    if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0:
         db.commit()
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
     return {
         "updated_count": result.updated_count,
         "conflicts": [_serialize_segment_update_conflict(conflict) for conflict in result.conflicts],
         "auto_tm": auto_tm_summary.to_dict(),
-        "segments": [_serialize_workbench_segment(segment) for segment in result.updated_segments],
+        "project_sync": project_sync_summary.to_dict(),
+        "segments": [
+            _serialize_workbench_segment(segment)
+            for segment in [*result.updated_segments, *project_sync_summary.current_file_segments]
+        ],
     }
 
 
@@ -6451,7 +6527,20 @@ def batch_update_segment_confirmation(
                 updated_count += 1
 
     auto_tm_summary = _empty_auto_tm_summary()
+    project_sync_summary = empty_project_segment_sync_summary()
     if payload.action == "confirm" and updated_count:
+        confirmed_segments_for_sync = [
+            segment
+            for segment in segments
+            if segment.status == "confirmed" and normalize_text(segment.target_text)
+        ]
+        if confirmed_segments_for_sync:
+            project_sync_summary = sync_project_repeated_segments_from_segments(
+                db,
+                file_record=file_record,
+                source_segments=confirmed_segments_for_sync,
+                current_user=current_user,
+            )
         auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(
             db,
             file_record=file_record,
@@ -6463,7 +6552,11 @@ def batch_update_segment_confirmation(
         db.commit()
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
 
-    return {"updated_count": updated_count, "auto_tm": auto_tm_summary.to_dict()}
+    return {
+        "updated_count": updated_count,
+        "auto_tm": auto_tm_summary.to_dict(),
+        "project_sync": project_sync_summary.to_dict(),
+    }
 
 
 @router.post("/file-records/{file_record_id}/segments/replace")

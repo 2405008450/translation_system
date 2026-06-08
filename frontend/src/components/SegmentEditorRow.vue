@@ -48,6 +48,7 @@ const emit = defineEmits<{
   activateTarget: [sentenceId: string]
   applyPartialRevision: [revisionId: string, newText: string]
   ctrlClick: [sentenceId: string, event: MouseEvent]
+  toggleProjectSync: [sentenceId: string, disabled: boolean]
 }>()
 
 const editorRef = ref<HTMLDivElement | null>(null)
@@ -114,6 +115,10 @@ const showSourceTag = computed(() => {
   const source = props.segment.source || 'none'
   return source !== 'none' && source !== 'fuzzy'
 })
+const showProjectSyncToggle = computed(() => props.segment.source === 'project_sync' || Boolean(props.segment.project_sync_disabled))
+const projectSyncToggleLabel = computed(() => (
+  props.segment.project_sync_disabled ? '开启同步' : '关闭同步'
+))
 const sourceTitle = computed(() => {
   if (props.segment.source === 'llm' && props.segment.llm_model?.trim()) {
     return props.segment.llm_provider
@@ -793,6 +798,10 @@ function handleClick(event?: MouseEvent) {
   emit('activateTarget', props.segment.sentence_id)
 }
 
+function handleProjectSyncToggle() {
+  emit('toggleProjectSync', props.segment.sentence_id, !props.segment.project_sync_disabled)
+}
+
 function handleSourceFocus() {
   isSourceFocused.value = true
 }
@@ -1354,6 +1363,15 @@ watch(
       <span class="segment-row__index">#{{ index + 1 }}</span>
       <span v-if="showStatusTag" class="segment-row__tag segment-row__tag--status">{{ statusMeta.label }}</span>
       <span v-if="showSourceTag" class="segment-row__tag is-muted" :class="sourceClass" :title="sourceTitle">{{ sourceLabel }}</span>
+      <button
+        v-if="showProjectSyncToggle"
+        class="segment-row__sync-toggle"
+        type="button"
+        :aria-pressed="!segment.project_sync_disabled"
+        @click.stop="handleProjectSyncToggle"
+      >
+        {{ projectSyncToggleLabel }}
+      </button>
       <span v-if="scorePercent !== null" class="segment-row__tag segment-row__tag--score">
         {{ scorePercent }}%
       </span>
@@ -1532,6 +1550,23 @@ watch(
 .segment-row__tag--score {
   background: rgba(216, 183, 78, 0.18);
   color: #8a6700;
+}
+
+.segment-row__sync-toggle {
+  min-height: 24px;
+  padding: 2px 8px;
+  border: 1px solid rgba(34, 127, 88, 0.28);
+  border-radius: 6px;
+  background: rgba(34, 127, 88, 0.08);
+  color: #146c49;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+
+.segment-row__sync-toggle:hover {
+  background: rgba(34, 127, 88, 0.14);
 }
 
 .segment-row__term-highlight {

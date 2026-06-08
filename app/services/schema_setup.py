@@ -201,6 +201,8 @@ REQUIRED_SCHEMA = {
         "created_at",
     },
     "segments": {
+        "source_hash",
+        "project_sync_disabled",
         "source_word_count",
         "llm_provider",
         "llm_model",
@@ -298,6 +300,8 @@ REQUIRED_SCHEMA = {
 REQUIRED_INDEXES = {
     "segments": {
         "ix_segments_source_word_count",
+        "ix_segments_source_hash",
+        "ix_segments_file_source_hash",
         "ix_segments_translated_source_word_count",
         "ix_segments_source_word_backfill",
         "ix_segments_translated_backfill",
@@ -497,6 +501,22 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_entries_collection_source_hash_language_pair
             ON memory_entries (collection_id, source_hash, source_language, target_language)
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS source_hash VARCHAR(64)
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS project_sync_disabled BOOLEAN NOT NULL DEFAULT FALSE
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_source_hash
+            ON segments (source_hash)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_file_source_hash
+            ON segments (file_record_id, source_hash)
             """,
             f"""
             CREATE TABLE IF NOT EXISTS term_bases (

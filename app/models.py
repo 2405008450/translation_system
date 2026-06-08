@@ -584,6 +584,8 @@ class Segment(Base):
     __tablename__ = "segments"
     __table_args__ = (
         Index("ix_segments_file_record_id", "file_record_id"),
+        Index("ix_segments_source_hash", "source_hash"),
+        Index("ix_segments_file_source_hash", "file_record_id", "source_hash"),
         Index(
             "ix_segments_file_record_order",
             "file_record_id",
@@ -607,11 +609,18 @@ class Segment(Base):
     )
     sentence_id: Mapped[str] = mapped_column(String(20), nullable=False)
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
+    source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     display_text: Mapped[str] = mapped_column(Text, nullable=False)
     source_html: Mapped[str | None] = mapped_column(Text, nullable=True)
     target_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
     target_html: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="none")
+    project_sync_disabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+    )
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
     score: Mapped[float] = mapped_column(nullable=False, default=0.0)
     matched_source_text: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -28,6 +28,7 @@ const sourceStatusMap: Record<string, StatusMeta> = {
   manual: { value: 'manual', label: '人工', tone: 'info' },
   llm: { value: 'llm', label: 'AI', tone: 'success' },
   tm: { value: 'tm', label: 'TM', tone: 'default' },
+  project_sync: { value: 'project_sync', label: '项目同步', tone: 'success' },
   exact: { value: 'exact', label: '精确匹配', tone: 'success' },
   fuzzy: { value: 'fuzzy', label: '模糊匹配', tone: 'warning' },
 }

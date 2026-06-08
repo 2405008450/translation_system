@@ -1364,6 +1364,10 @@ async function updateSegmentSource(sentenceId: string, sourceText: string) {
   }
 }
 
+async function toggleProjectSegmentSync(sentenceId: string, disabled: boolean) {
+  await segmentStore.setProjectSyncDisabled(sentenceId, disabled)
+}
+
 async function toggleSegmentSearchPanel() {
   segmentSearchOpen.value = !segmentSearchOpen.value
   if (segmentSearchOpen.value) {
@@ -4267,6 +4271,7 @@ onBeforeRouteLeave(async () => {
                     @activate-target="handleSegmentTargetActivate"
                     @update="updateSegmentTarget"
                     @update-source="updateSegmentSource"
+                    @toggle-project-sync="toggleProjectSegmentSync"
                     @apply-partial-revision="handleApplyPartialRevision"
                     @ctrl-click="handleSegmentClick"
                   />

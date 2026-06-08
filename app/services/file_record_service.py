@@ -27,6 +27,7 @@ from app.services.document_workspace import (
     parse_docx_workspace,
 )
 from app.services.analytics_service import count_source_words, record_translation_metric_event
+from app.services.normalizer import build_source_hash
 from app.services.revision_service import create_revision
 from app.services.segment_status import resolve_unconfirmed_segment_status
 from app.services.task_file_service import build_task_workspace
@@ -295,6 +296,7 @@ def duplicate_file_record(
                 file_record_id=duplicate.id,
                 sentence_id=segment.sentence_id,
                 source_text=segment.source_text,
+                source_hash=segment.source_hash or build_source_hash(segment.source_text),
                 display_text=segment.display_text,
                 source_html=segment.source_html,
                 target_text="",
@@ -358,6 +360,7 @@ def _create_file_record_from_workspace(
             file_record_id=file_record.id,
             sentence_id=seg["sentence_id"],
             source_text=seg["source_text"],
+            source_hash=build_source_hash(seg["source_text"]),
             display_text=seg["display_text"],
             source_html=seg.get("source_html"),
             target_text=seg["target_text"],
@@ -416,6 +419,7 @@ def create_txt_file_record_with_segments(
             file_record_id=file_record.id,
             sentence_id=f"sent-{index + 1:05d}",
             source_text=result.source_sentence,
+            source_hash=build_source_hash(result.source_sentence),
             display_text=result.source_sentence,
             target_text=result.target_text or "",
             status=result.status,
@@ -654,6 +658,7 @@ def attach_source_document_to_file_record(
             file_record_id=file_record.id,
             sentence_id=seg["sentence_id"],
             source_text=seg["source_text"],
+            source_hash=build_source_hash(seg["source_text"]),
             display_text=seg["display_text"],
             source_html=seg.get("source_html"),
             target_text=seg["target_text"],
@@ -946,6 +951,7 @@ def update_segment_source_text(
         return None
 
     segment.source_text = source_text
+    segment.source_hash = build_source_hash(source_text)
     segment.display_text = source_text
     segment.source_html = None
     db.commit()

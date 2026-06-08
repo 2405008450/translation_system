@@ -12,6 +12,7 @@ import type {
   LLMGuidelineOptions,
   LLMProvider,
   LLMTranslateScope,
+  ProjectSegmentSyncSummary,
   Segment,
   SegmentPageResponse,
   SegmentRevisionEntry,
@@ -903,6 +904,33 @@ export const useSegmentStore = defineStore('segment', () => {
     }
   }
 
+  async function setProjectSyncDisabled(sentenceId: string, disabled: boolean) {
+    if (!fileRecord.value) {
+      return
+    }
+    try {
+      const { data } = await http.patch<Segment>(
+        `/file-records/${fileRecord.value.id}/segments/${sentenceId}/project-sync`,
+        { disabled },
+      )
+      applyServerSegments([data], false)
+      pushToast({
+        tone: 'success',
+        title: disabled ? '已关闭项目同步' : '已开启项目同步',
+        message: disabled
+          ? '该句段会保留当前译文，后续不再被相同原文自动同步覆盖。'
+          : '该句段已恢复项目内相同原文自动同步。',
+      })
+    } catch (error) {
+      console.error('Failed to update project sync:', error)
+      pushToast({
+        tone: 'error',
+        title: '同步开关更新失败',
+        message: String((error as any)?.response?.data?.detail || '请稍后重试。'),
+      })
+    }
+  }
+
   function setActiveSentence(sentenceId: string | null) {
     activeSentenceId.value = sentenceId
     if (sentenceId) {
@@ -983,6 +1011,7 @@ export const useSegmentStore = defineStore('segment', () => {
           skipped_no_collection_count: number
           skipped_invalid_count?: number
         }
+        project_sync?: ProjectSegmentSyncSummary
         segments?: Segment[]
       }>(`/file-records/${fileRecord.value.id}/segments`, {
         updates,
@@ -1036,6 +1065,13 @@ export const useSegmentStore = defineStore('segment', () => {
           tone: 'info',
           title: '未自动写入记忆库',
           message: '当前文件未绑定记忆库，确认译文已保存。',
+        })
+      }
+      if (data.project_sync?.filled_count) {
+        pushToast({
+          tone: 'success',
+          title: '项目同步完成',
+          message: `已自动填充 ${data.project_sync.filled_count} 条相同原文句段。`,
         })
       }
       const syncedAt = new Date()
@@ -1541,6 +1577,7 @@ export const useSegmentStore = defineStore('segment', () => {
     loadSaveToTMStats,
     updateTarget,
     updateSource,
+    setProjectSyncDisabled,
     setActiveSentence,
     getTermMatches,
     syncToBackend,

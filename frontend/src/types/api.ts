@@ -331,6 +331,7 @@ export interface Segment {
   target_text: string
   target_html?: string | null
   status: string
+  project_sync_disabled?: boolean
   version: number
   score: number
   matched_source_text: string | null
@@ -346,6 +347,12 @@ export interface Segment {
   row_index?: number | null
   cell_index?: number | null
   updated_at: string | null
+}
+
+export interface ProjectSegmentSyncSummary {
+  filled_count: number
+  conflict_count: number
+  affected_file_count: number
 }
 
 export interface FileRecordDetail {
