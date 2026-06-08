@@ -1,4 +1,5 @@
 import type { LLMProvider, LLMTranslateScope } from '../types/api'
+import { translate } from '../i18n'
 
 export interface LLMOption<T extends string> {
   value: T
@@ -135,28 +136,28 @@ export const llmModelOptions: LLMModelOption[] = [
 export const llmScopeOptions: LLMOption<LLMTranslateScope>[] = [
   {
     value: 'all',
-    label: '全部未确认译文',
-    description: '处理模糊匹配和无匹配句段。',
+    get label() { return translate('llm.scope.all.label') },
+    get description() { return translate('llm.scope.all.description') },
   },
   {
     value: 'all_with_exact',
-    label: '全部句段',
-    description: '连同精确匹配句段一起重跑。',
+    get label() { return translate('llm.scope.allWithExact.label') },
+    get description() { return translate('llm.scope.allWithExact.description') },
   },
   {
     value: 'empty_target_only',
-    label: '仅空译文',
-    description: '只处理译文为空的句段，保留已有译文。',
+    get label() { return translate('llm.scope.emptyTargetOnly.label') },
+    get description() { return translate('llm.scope.emptyTargetOnly.description') },
   },
   {
     value: 'fuzzy_only',
-    label: '仅模糊匹配',
-    description: '只修正模糊匹配句段。',
+    get label() { return translate('llm.scope.fuzzyOnly.label') },
+    get description() { return translate('llm.scope.fuzzyOnly.description') },
   },
   {
     value: 'none_only',
-    label: '仅无匹配',
-    description: '只处理没有匹配结果的句段。',
+    get label() { return translate('llm.scope.noneOnly.label') },
+    get description() { return translate('llm.scope.noneOnly.description') },
   },
 ]
 
@@ -164,17 +165,17 @@ export const llmProviderOptions: LLMOption<LLMProvider>[] = [
   {
     value: 'deepseek',
     label: 'DeepSeek',
-    description: '使用 DeepSeek 提供的模型。',
+    get description() { return translate('llm.provider.deepseek.description') },
   },
   {
     value: 'auto',
-    label: '自动选择',
-    description: '按当前配置自动选择可用模型。',
+    get label() { return translate('llm.provider.auto.label') },
+    get description() { return translate('llm.provider.auto.description') },
   },
   {
     value: 'openrouter',
     label: 'OpenRouter',
-    description: '使用 OpenRouter 提供的模型。',
+    get description() { return translate('llm.provider.openrouter.description') },
   },
 ]
 

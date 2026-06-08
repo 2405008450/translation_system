@@ -83,6 +83,10 @@ export default {
       title: '用户管理',
       description: '创建和分配系统用户角色',
     },
+    assignmentEvents: {
+      title: '指派记录',
+      description: '查看项目和文件任务的指派、授权和取消记录',
+    },
   },
   shell: {
     mainNav: '主导航',
@@ -148,6 +152,14 @@ export default {
     empty: '暂无数据',
     error: '加载失败',
     forbidden: '暂无权限',
+  },
+  confirm: {
+    title: '请确认',
+  },
+  errors: {
+    requestFailed: '请求失败',
+    network: '网络异常，请稍后重试。',
+    importFailed: '导入失败。',
   },
   stores: {
     auth: {
@@ -1218,6 +1230,17 @@ export default {
   },
   documentParsing: {
     label: '文档内容解析处理',
+    settingsTitle: '文档设置',
+    selectAll: '全选',
+    selectAllTranslatable: '全选可翻译范围',
+    emptySettings: '选择文件后显示对应格式的文档设置。',
+    selectedFileSummary: {
+      empty: '选择文件后会显示对应格式的真实解析能力。',
+      unsupported: '当前文件格式不在后端任务上传能力中。',
+      current: '当前文件将使用：{labels}。',
+      loading: '正在读取后端解析能力...',
+      fallback: '暂未获取到后端解析能力，将使用上传接口校验。',
+    },
     modes: {
       full: '完整解析',
       bodyOnly: '仅正文解析',
@@ -1278,6 +1301,66 @@ export default {
     loading: '加载中...',
     dblClickHint: '双击插入译文',
     textInserted: '译文已插入',
+  },
+  status: {
+    unknownStatus: '未知状态',
+    unknownSource: '未知来源',
+    file: {
+      draft: '草稿',
+      inProgress: '处理中',
+      pending: '待处理',
+      processing: '处理中',
+      completed: '已完成',
+      translated: '已翻译',
+      error: '异常',
+    },
+    segment: {
+      exact: '精确匹配',
+      fuzzy: '模糊匹配',
+      none: '无匹配',
+      confirmed: '已确认',
+      manual: '人工处理',
+    },
+    source: {
+      manual: '人工',
+      projectSync: '项目同步',
+    },
+  },
+  llm: {
+    scope: {
+      all: {
+        label: '全部未确认译文',
+        description: '处理模糊匹配和无匹配句段。',
+      },
+      allWithExact: {
+        label: '全部句段',
+        description: '连同精确匹配句段一起重跑。',
+      },
+      emptyTargetOnly: {
+        label: '仅空译文',
+        description: '只处理译文为空的句段，保留已有译文。',
+      },
+      fuzzyOnly: {
+        label: '仅模糊匹配',
+        description: '只修正模糊匹配句段。',
+      },
+      noneOnly: {
+        label: '仅无匹配',
+        description: '只处理没有匹配结果的句段。',
+      },
+    },
+    provider: {
+      deepseek: {
+        description: '使用 DeepSeek 提供的模型。',
+      },
+      auto: {
+        label: '自动选择',
+        description: '按当前配置自动选择可用模型。',
+      },
+      openrouter: {
+        description: '使用 OpenRouter 提供的模型。',
+      },
+    },
   },
   userManagement: {
     createTitle: '创建用户',

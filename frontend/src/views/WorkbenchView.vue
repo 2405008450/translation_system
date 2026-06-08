@@ -98,12 +98,13 @@ const props = defineProps<{
 
 type BottomToolKey = 'qa-result' | 'history' | 'source-preview' | 'target-preview' | 'split-preview'
 type BottomDrawerToolKey = Exclude<BottomToolKey, 'qa-result'>
-type SideToolKey = 'match-info' | 'terms' | 'notes'
+type SideToolKey = 'match-info' | 'terms' | 'resource-search' | 'notes'
 type ResourceImportTab = 'tm' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
 type SaveToTMTargetMode = 'new' | 'existing'
 type SegmentDisplayScope = 'all' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'confirmed_only' | 'empty_target'
 type RevisionMenuKind = 'track' | 'accept' | 'reject'
+type ResourceSearchMode = 'exact' | 'fuzzy'
 type SegmentEditorRowPublic = ComponentPublicInstance & {
   undoEditorChange: () => boolean
   redoEditorChange: () => boolean
@@ -113,6 +114,27 @@ type SaveToTMPayload = {
   collection_id?: string
   collection_name?: string
   scope: SaveToTMScope
+}
+type ResourceSearchItem = {
+  id: string
+  type: 'tm' | 'term'
+  library_id: string | null
+  library_name: string | null
+  source_text: string
+  target_text: string
+  source_language: string | null
+  target_language: string | null
+  updated_at: string | null
+}
+type ResourceSearchResponse = {
+  items: ResourceSearchItem[]
+  total: number
+  tm_total: number
+  term_total: number
+  collection_ids: string[]
+  term_base_ids: string[]
+  query: string
+  mode: ResourceSearchMode
 }
 
 const REVISION_TRACE_VISIBLE_STORAGE_KEY = 'workbench.revisionTraceEnabled'
@@ -265,6 +287,15 @@ const termEntries = ref<TermEntryRecord[]>([])
 const selectedTermBaseId = ref('')
 const loadingTermBases = ref(false)
 const loadingTermEntries = ref(false)
+const resourceSearchQuery = ref('')
+const resourceSearchMode = ref<ResourceSearchMode>('exact')
+const resourceSearchLoading = ref(false)
+const resourceSearchMessage = ref('请输入关键词，搜索当前文件绑定的记忆库和术语库。')
+const resourceSearchItems = ref<ResourceSearchItem[]>([])
+const resourceSearchTotal = ref(0)
+const resourceSearchTMTotal = ref(0)
+const resourceSearchTermTotal = ref(0)
+let resourceSearchRequestId = 0
 const addingTerm = ref(false)
 const showAddTermDialog = ref(false)
 const addTermSourceText = ref('')
@@ -881,6 +912,12 @@ const boundTermBaseIds = computed(() => {
   return fileRecord.term_base_id ? [fileRecord.term_base_id] : []
 })
 
+const boundResourceSummary = computed(() => {
+  const collectionCount = segmentStore.fileRecord?.collection_ids?.length || (segmentStore.fileRecord?.collection_id ? 1 : 0)
+  const termBaseCount = boundTermBaseIds.value.length
+  return `已绑定 ${collectionCount} 个记忆库、${termBaseCount} 个术语库`
+})
+
 const addTermTargetTermBases = computed(() => {
   const boundIds = new Set(boundTermBaseIds.value)
   const writableIds = segmentStore.fileRecord?.term_base_write_ids || []
@@ -1009,6 +1046,7 @@ function handleBottomPreviewRenderingChange(rendering: boolean) {
 const sideToolButtons = computed(() => ([
   { key: 'match-info' as const, label: t('workbench.tools.matchInfo'), icon: Info, tone: 'info' },
   { key: 'terms' as const, label: t('workbench.tools.terms'), icon: Languages, tone: 'language' },
+  { key: 'resource-search' as const, label: '搜索', icon: Search, tone: 'search' },
   { key: 'notes' as const, label: t('workbench.tools.notes'), icon: MessageSquare, tone: 'note' },
 ]))
 
@@ -1104,6 +1142,60 @@ async function loadTermEntries() {
     termsMessage.value = getErrorMessage(error, t('workbench.errors.termEntriesLoad'))
   } finally {
     loadingTermEntries.value = false
+  }
+}
+
+function resetResourceSearchResults(message = '请输入关键词，搜索当前文件绑定的记忆库和术语库。') {
+  resourceSearchItems.value = []
+  resourceSearchTotal.value = 0
+  resourceSearchTMTotal.value = 0
+  resourceSearchTermTotal.value = 0
+  resourceSearchMessage.value = message
+}
+
+async function runResourceSearch() {
+  const keyword = resourceSearchQuery.value.trim()
+  if (!keyword) {
+    resetResourceSearchResults()
+    return
+  }
+
+  const fileRecordId = segmentStore.fileRecord?.id || props.id
+  const requestId = ++resourceSearchRequestId
+  resourceSearchLoading.value = true
+  resourceSearchMessage.value = '正在搜索绑定的资源库...'
+  try {
+    const { data } = await http.get<ResourceSearchResponse>(`/file-records/${fileRecordId}/resource-search`, {
+      params: {
+        q: keyword,
+        mode: resourceSearchMode.value,
+        limit: 80,
+      },
+    })
+    if (requestId !== resourceSearchRequestId) {
+      return
+    }
+    resourceSearchItems.value = data.items
+    resourceSearchTotal.value = data.total
+    resourceSearchTMTotal.value = data.tm_total
+    resourceSearchTermTotal.value = data.term_total
+    resourceSearchMessage.value = data.total
+      ? `找到 ${data.total} 条结果：记忆库 ${data.tm_total} 条，术语库 ${data.term_total} 条。`
+      : '未找到匹配的记忆库或术语库句段。'
+  } catch (error) {
+    if (requestId === resourceSearchRequestId) {
+      resetResourceSearchResults(getErrorMessage(error, '资源库搜索失败。'))
+    }
+  } finally {
+    if (requestId === resourceSearchRequestId) {
+      resourceSearchLoading.value = false
+    }
+  }
+}
+
+function prepareResourceSearchQuery() {
+  if (!resourceSearchQuery.value.trim() && activeSegmentSourceText.value.trim()) {
+    resourceSearchQuery.value = activeSegmentSourceText.value.trim()
   }
 }
 
@@ -1239,6 +1331,13 @@ async function openSideTool(tool: SideToolKey) {
   try {
     if (tool === 'terms' && termBases.value.length === 0 && !loadingTermBases.value) {
       await loadTermBases()
+    }
+
+    if (tool === 'resource-search') {
+      prepareResourceSearchQuery()
+      if (resourceSearchQuery.value.trim() && resourceSearchItems.value.length === 0) {
+        await runResourceSearch()
+      }
     }
 
     if (tool === 'match-info') {
@@ -2532,6 +2631,8 @@ async function loadTask() {
   termEntries.value = []
   termBases.value = []
   selectedTermBaseId.value = ''
+  resourceSearchQuery.value = ''
+  resetResourceSearchResults()
   setCurrentTermQAReport(null)
 
   try {
@@ -3110,6 +3211,12 @@ watch(selectedTermBaseId, () => {
     return
   }
   void loadTermEntries()
+})
+
+watch(resourceSearchMode, () => {
+  if (activeSideTool.value === 'resource-search' && resourceSearchQuery.value.trim()) {
+    void runResourceSearch()
+  }
 })
 
 watch(saveToTMScope, () => {
@@ -4649,6 +4756,74 @@ onBeforeRouteLeave(async () => {
             :loading-entries="loadingTermEntries"
             :message="termsMessage"
           />
+          <section
+            v-else-if="activeSideTool === 'resource-search'"
+            key="resource-search"
+            class="resource-search-panel"
+          >
+            <div class="resource-search-panel__header">
+              <div>
+                <div class="section-title section-title--tight">资源库搜索</div>
+                <p class="panel-subtitle">{{ boundResourceSummary }}</p>
+              </div>
+            </div>
+
+            <form class="resource-search-panel__bar" @submit.prevent="void runResourceSearch()">
+              <select v-model="resourceSearchMode" class="resource-search-panel__select" aria-label="搜索模式">
+                <option value="exact">精确匹配</option>
+                <option value="fuzzy">模糊匹配</option>
+              </select>
+              <input
+                v-model="resourceSearchQuery"
+                class="resource-search-panel__input"
+                type="search"
+                placeholder="输入原文或译文关键词"
+              />
+              <button
+                class="button resource-search-panel__button"
+                type="submit"
+                :disabled="resourceSearchLoading"
+                title="搜索"
+                aria-label="搜索"
+              >
+                <Loader2 v-if="resourceSearchLoading" class="lucide-spin" :size="16" />
+                <Search v-else :size="16" />
+              </button>
+            </form>
+
+            <div class="resource-search-panel__message">{{ resourceSearchMessage }}</div>
+
+            <div v-if="resourceSearchItems.length" class="resource-search-panel__table-wrap">
+              <table class="resource-search-panel__table">
+                <thead>
+                  <tr>
+                    <th>类型</th>
+                    <th>原文</th>
+                    <th>译文</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="item in resourceSearchItems" :key="`${item.type}-${item.id}`">
+                    <td>
+                      <span
+                        class="resource-search-panel__badge"
+                        :class="`is-${item.type}`"
+                        :title="item.library_name || ''"
+                      >
+                        {{ item.type === 'tm' ? 'TM' : 'TB' }}
+                      </span>
+                    </td>
+                    <td>{{ item.source_text }}</td>
+                    <td>{{ item.target_text }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div v-else-if="!resourceSearchLoading" class="empty-state resource-search-panel__empty">
+              暂无搜索结果
+            </div>
+          </section>
           <NotesPanel
             v-else-if="activeSideTool === 'notes'"
             key="notes"
@@ -6390,6 +6565,145 @@ onBeforeRouteLeave(async () => {
 
 .segment-editor-side-tool.is-active svg {
   color: #0b6658;
+}
+
+.segment-editor-side-tool--search svg {
+  color: #0d7bdc;
+}
+
+.resource-search-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  height: 100%;
+  padding: 14px;
+  background: #f8fbfb;
+}
+
+.resource-search-panel__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.resource-search-panel__bar {
+  display: grid;
+  grid-template-columns: 118px minmax(0, 1fr) 44px;
+  align-items: center;
+  overflow: hidden;
+  border: 1px solid #c9d7dd;
+  border-radius: 4px;
+  background: #fff;
+}
+
+.resource-search-panel__select,
+.resource-search-panel__input {
+  min-width: 0;
+  height: 34px;
+  border: 0;
+  background: transparent;
+  color: #233943;
+  font-size: 13px;
+  line-height: 1.2;
+  outline: none;
+}
+
+.resource-search-panel__select {
+  padding: 0 8px;
+  border-right: 1px solid #dbe5ea;
+}
+
+.resource-search-panel__input {
+  padding: 0 10px;
+  border-right: 1px solid #dbe5ea;
+}
+
+.resource-search-panel__button {
+  width: 44px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: #fff;
+  color: #1f6fbc;
+}
+
+.resource-search-panel__button:hover,
+.resource-search-panel__button:focus-visible {
+  background: #eef6ff;
+}
+
+.resource-search-panel__message {
+  min-height: 20px;
+  color: #647780;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.resource-search-panel__table-wrap {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid #d6e1e5;
+  background: #fff;
+}
+
+.resource-search-panel__table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 13px;
+  color: #21343d;
+}
+
+.resource-search-panel__table th,
+.resource-search-panel__table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid #dce7ec;
+  text-align: left;
+  vertical-align: top;
+}
+
+.resource-search-panel__table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #eef5f7;
+  color: #49616b;
+  font-weight: 600;
+}
+
+.resource-search-panel__table th:first-child,
+.resource-search-panel__table td:first-child {
+  width: 58px;
+  text-align: center;
+}
+
+.resource-search-panel__table tbody tr:nth-child(even) {
+  background: #edf6ff;
+}
+
+.resource-search-panel__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  min-height: 24px;
+  border-radius: 2px;
+  background: #987bdc;
+  color: #fff;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.resource-search-panel__badge.is-tm {
+  background: #5b8edc;
+}
+
+.resource-search-panel__empty {
+  margin-top: 16px;
 }
 
 .segment-editor-bottom-tools {

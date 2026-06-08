@@ -1,5 +1,7 @@
 import { reactive } from 'vue'
 
+import { translate } from '../i18n'
+
 export interface ConfirmOptions {
   title?: string
   message: string
@@ -14,8 +16,8 @@ export const confirmState = reactive({
   open: false,
   title: '',
   message: '',
-  confirmText: '确认',
-  cancelText: '取消',
+  confirmText: translate('common.actions.confirm'),
+  cancelText: translate('common.actions.cancel'),
   danger: false,
 })
 
@@ -45,10 +47,10 @@ export function useConfirm() {
     }
 
     confirmState.open = true
-    confirmState.title = options.title || '请确认'
+    confirmState.title = options.title || translate('confirm.title')
     confirmState.message = options.message
-    confirmState.confirmText = options.confirmText || '确认'
-    confirmState.cancelText = options.cancelText || '取消'
+    confirmState.confirmText = options.confirmText || translate('common.actions.confirm')
+    confirmState.cancelText = options.cancelText || translate('common.actions.cancel')
     confirmState.danger = Boolean(options.danger)
 
     return new Promise<boolean>((resolve) => {

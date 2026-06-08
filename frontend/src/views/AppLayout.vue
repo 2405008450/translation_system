@@ -56,6 +56,7 @@ const sidebarCollapsed = ref(
   typeof window !== 'undefined' && window.localStorage.getItem(SIDEBAR_STORAGE_KEY) === '1',
 )
 const notificationsOpen = ref(false)
+const languageMenuOpen = ref(false)
 const notificationsLoading = ref(false)
 const notifications = ref<NotificationItem[]>([])
 const unreadNotificationCount = ref(0)
@@ -127,7 +128,7 @@ const navGroups = computed<NavGroup[]>(() => [
     children: [
       {
         name: 'assignment-events',
-        label: '指派记录',
+        label: t('shell.sections.assignmentEvents'),
         icon: ClipboardList,
         visible: authStore.isAdmin,
       },
@@ -256,7 +257,7 @@ function toggleGroup(key: string) {
 
 function formatNotificationDate(value: string) {
   const date = new Date(value)
-  return date.toLocaleString('zh-CN', {
+  return date.toLocaleString(preferencesStore.locale, {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
@@ -317,15 +318,24 @@ async function openNotification(notification: NotificationItem) {
 
 function toggleNotifications() {
   notificationsOpen.value = !notificationsOpen.value
+  languageMenuOpen.value = false
   if (notificationsOpen.value) {
     void loadNotifications()
   }
+}
+
+function toggleLanguageMenu() {
+  languageMenuOpen.value = !languageMenuOpen.value
+  notificationsOpen.value = false
 }
 
 function closeNotificationsOnOutsideClick(event: MouseEvent) {
   const target = event.target as HTMLElement | null
   if (!target?.closest?.('.shell-notifications')) {
     notificationsOpen.value = false
+  }
+  if (!target?.closest?.('.shell-language')) {
+    languageMenuOpen.value = false
   }
 }
 
@@ -362,6 +372,11 @@ function toggleSidebar() {
 
 function toggleTheme() {
   preferencesStore.setTheme(preferencesStore.theme === 'dark' ? 'light' : 'dark')
+}
+
+function setLocale(locale: 'zh-CN' | 'en-US') {
+  preferencesStore.setLocale(locale)
+  languageMenuOpen.value = false
 }
 
 async function logout() {
@@ -625,7 +640,7 @@ watch(
           >
             <component :is="sidebarCollapsed ? PanelLeft : PanelLeftClose" :size="20" />
           </button>
-          <nav v-if="breadcrumbs.length" class="shell-breadcrumb breadcrumb" aria-label="全局页面路径">
+          <nav v-if="breadcrumbs.length" class="shell-breadcrumb breadcrumb" :aria-label="t('shell.topbar.globalBreadcrumb')">
             <template v-for="(item, index) in breadcrumbs" :key="`${item.label}-${index}`">
               <RouterLink
                 v-if="item.to"
@@ -676,11 +691,11 @@ watch(
                   :disabled="unreadNotificationCount === 0"
                   @click="markAllNotificationsRead"
                 >
-                  全部已读
+                  {{ t('shell.topbar.markAllRead') }}
                 </button>
               </div>
-              <div v-if="notificationsLoading" class="shell-notifications__empty">正在加载...</div>
-              <div v-else-if="notifications.length === 0" class="shell-notifications__empty">暂无消息</div>
+              <div v-if="notificationsLoading" class="shell-notifications__empty">{{ t('common.loading') }}</div>
+              <div v-else-if="notifications.length === 0" class="shell-notifications__empty">{{ t('shell.topbar.noNotifications') }}</div>
               <template v-else>
                 <button
                   v-for="notification in notifications"
@@ -709,16 +724,41 @@ watch(
             <span>{{ t('shell.topbar.settings') }}</span>
           </button>
 
-          <button
-            class="shell-header__placeholder"
-            type="button"
-            :title="t('common.comingSoon')"
-            :aria-label="t('shell.topbar.soon', { name: t('shell.topbar.language') })"
-            disabled
-          >
-            <Globe :size="16" />
-            <span>{{ currentLocale }}</span>
-          </button>
+          <div class="shell-language" @click.stop>
+            <button
+              class="shell-header__placeholder"
+              type="button"
+              :title="t('shell.topbar.language')"
+              :aria-label="t('shell.topbar.language')"
+              :aria-expanded="languageMenuOpen"
+              @click="toggleLanguageMenu"
+            >
+              <Globe :size="16" />
+              <span>{{ currentLocale }}</span>
+            </button>
+            <div v-if="languageMenuOpen" class="shell-language__menu" role="menu">
+              <button
+                class="shell-language__item"
+                :class="{ 'is-active': preferencesStore.locale === 'zh-CN' }"
+                type="button"
+                role="menuitemradio"
+                :aria-checked="preferencesStore.locale === 'zh-CN'"
+                @click="setLocale('zh-CN')"
+              >
+                中文
+              </button>
+              <button
+                class="shell-language__item"
+                :class="{ 'is-active': preferencesStore.locale === 'en-US' }"
+                type="button"
+                role="menuitemradio"
+                :aria-checked="preferencesStore.locale === 'en-US'"
+                @click="setLocale('en-US')"
+              >
+                English
+              </button>
+            </div>
+          </div>
 
           <div class="shell-header__user-display">
             <div class="shell-header__user-avatar">{{ getUserInitial() }}</div>
@@ -747,6 +787,42 @@ watch(
 <style scoped>
 .shell-notifications {
   position: relative;
+}
+
+.shell-language {
+  position: relative;
+}
+
+.shell-language__menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 80;
+  min-width: 136px;
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-soft);
+}
+
+.shell-language__item {
+  width: 100%;
+  min-height: 36px;
+  justify-content: flex-start;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  box-shadow: none;
+  text-align: left;
+}
+
+.shell-language__item:hover,
+.shell-language__item.is-active {
+  background: var(--surface-muted);
+  color: var(--text-primary);
 }
 
 .shell-notifications__trigger {

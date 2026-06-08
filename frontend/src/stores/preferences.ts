@@ -1,7 +1,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 
-import { DEFAULT_LOCALE } from '../constants/languages'
+import { DEFAULT_LOCALE, isSupportedUILocale } from '../constants/languages'
 import { i18n, type AppLocale } from '../i18n'
 
 export type ThemeMode = 'light' | 'dark'
@@ -10,7 +10,7 @@ const LOCALE_STORAGE_KEY = 'tm-workbench-locale'
 const THEME_STORAGE_KEY = 'tm-workbench-theme'
 
 function normalizeLocale(value: string | null | undefined): AppLocale {
-  return value === DEFAULT_LOCALE ? value : DEFAULT_LOCALE
+  return isSupportedUILocale(value) ? value : DEFAULT_LOCALE
 }
 
 export const usePreferencesStore = defineStore('preferences', () => {
@@ -25,6 +25,7 @@ export const usePreferencesStore = defineStore('preferences', () => {
 
   function applyLocale() {
     i18n.global.locale.value = locale.value
+    document.documentElement.lang = locale.value
   }
 
   function bootstrap() {

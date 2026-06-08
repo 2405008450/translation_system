@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 
 const props = withDefaults(defineProps<{
   open: boolean
@@ -19,6 +20,8 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   close: []
 }>()
+
+const { t } = useI18n()
 
 const panelRef = ref<HTMLElement | null>(null)
 let previousActiveElement: HTMLElement | null = null
@@ -140,8 +143,8 @@ onBeforeUnmount(() => {
             <button
               class="modal-close"
               type="button"
-              aria-label="关闭弹窗"
-              title="关闭"
+              :aria-label="t('common.actions.close')"
+              :title="t('common.actions.close')"
               @click="handleClose"
             >
               ×

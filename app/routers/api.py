@@ -7427,6 +7427,134 @@ def _serialize_tm_entry(entry: TranslationMemory) -> dict:
     }
 
 
+def _serialize_resource_search_tm_row(entry: TranslationMemory, collection_name: str | None) -> dict:
+    return {
+        "id": str(entry.id),
+        "type": "tm",
+        "library_id": str(entry.collection_id) if entry.collection_id else None,
+        "library_name": collection_name,
+        "source_text": entry.source_text,
+        "target_text": entry.target_text,
+        "source_language": entry.source_language,
+        "target_language": entry.target_language,
+        "updated_at": entry.updated_at.isoformat() if entry.updated_at else None,
+    }
+
+
+def _serialize_resource_search_term_row(entry: TermEntry, term_base_name: str | None) -> dict:
+    return {
+        "id": str(entry.id),
+        "type": "term",
+        "library_id": str(entry.term_base_id),
+        "library_name": term_base_name,
+        "source_text": entry.source_text,
+        "target_text": entry.target_text,
+        "source_language": entry.source_language,
+        "target_language": entry.target_language,
+        "updated_at": entry.updated_at.isoformat() if entry.updated_at else None,
+    }
+
+
+@router.get("/file-records/{file_record_id}/resource-search")
+def search_file_record_bound_resources(
+    file_record_id: UUID,
+    q: str = Query(default="", max_length=200),
+    mode: Literal["exact", "fuzzy"] = Query(default="exact"),
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文件不存在。")
+
+    _require_file_record_read_access(file_record, current_user)
+    query_text = normalize_text(q or "")
+    safe_limit = min(max(limit, 1), 100)
+    collection_ids = _load_file_record_collection_ids(file_record)
+    term_base_ids = _load_file_record_term_base_ids(file_record)
+
+    if not query_text:
+        return {
+            "items": [],
+            "total": 0,
+            "tm_total": 0,
+            "term_total": 0,
+            "collection_ids": [str(collection_id) for collection_id in collection_ids],
+            "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
+            "query": query_text,
+            "mode": mode,
+        }
+
+    like_pattern = f"%{query_text}%"
+
+    tm_rows: list[tuple[TranslationMemory, str | None]] = []
+    tm_total = 0
+    if collection_ids:
+        tm_query = (
+            db.query(TranslationMemory, MemoryBase.name.label("collection_name"))
+            .outerjoin(MemoryBase, TranslationMemory.collection_id == MemoryBase.id)
+            .filter(TranslationMemory.collection_id.in_(collection_ids))
+        )
+        if mode == "exact":
+            tm_query = tm_query.filter(TranslationMemory.source_text.ilike(like_pattern))
+        else:
+            tm_query = tm_query.filter(
+                or_(
+                    TranslationMemory.source_text.ilike(like_pattern),
+                    TranslationMemory.target_text.ilike(like_pattern),
+                )
+            )
+        tm_total = tm_query.count()
+        tm_rows = (
+            tm_query
+            .order_by(TranslationMemory.updated_at.desc(), TranslationMemory.created_at.desc())
+            .limit(safe_limit)
+            .all()
+        )
+
+    term_rows: list[tuple[TermEntry, str | None]] = []
+    term_total = 0
+    if term_base_ids:
+        term_query = (
+            db.query(TermEntry, TermBase.name.label("term_base_name"))
+            .outerjoin(TermBase, TermEntry.term_base_id == TermBase.id)
+            .filter(TermEntry.term_base_id.in_(term_base_ids))
+        )
+        if mode == "exact":
+            term_query = term_query.filter(TermEntry.source_text.ilike(like_pattern))
+        else:
+            term_query = term_query.filter(
+                or_(
+                    TermEntry.source_text.ilike(like_pattern),
+                    TermEntry.target_text.ilike(like_pattern),
+                )
+            )
+        term_total = term_query.count()
+        term_rows = (
+            term_query
+            .order_by(TermEntry.updated_at.desc(), TermEntry.created_at.desc())
+            .limit(safe_limit)
+            .all()
+        )
+
+    items = [
+        *[_serialize_resource_search_tm_row(entry, collection_name) for entry, collection_name in tm_rows],
+        *[_serialize_resource_search_term_row(entry, term_base_name) for entry, term_base_name in term_rows],
+    ][:safe_limit]
+
+    return {
+        "items": items,
+        "total": tm_total + term_total,
+        "tm_total": tm_total,
+        "term_total": term_total,
+        "collection_ids": [str(collection_id) for collection_id in collection_ids],
+        "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
+        "query": query_text,
+        "mode": mode,
+    }
+
+
 @router.get("/translation-memory/collections")
 @router.get("/tm/collections", include_in_schema=False)
 def list_tm_collections(

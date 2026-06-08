@@ -250,6 +250,8 @@ const router = createRouter({
             navSection: 'assignment-events',
             pageTitle: '指派记录',
             pageDescription: '查看项目和文件任务的指派、授权和取消记录',
+            pageTitleKey: 'pages.assignmentEvents.title',
+            pageDescriptionKey: 'pages.assignmentEvents.description',
           },
         },
         {
