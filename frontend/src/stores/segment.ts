@@ -1296,6 +1296,7 @@ export const useSegmentStore = defineStore('segment', () => {
           scope,
           provider,
           model: guidelineOptions.model || null,
+          sentence_id: guidelineOptions.sentenceId || null,
           guideline_template_id: guidelineOptions.guidelineTemplateId || null,
           temporary_prompt: guidelineOptions.temporaryPrompt || '',
         }),

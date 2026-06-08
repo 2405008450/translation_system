@@ -102,6 +102,13 @@ function getSortArrow(col: DataTableColumn) {
   return props.sortOrder === 'asc' ? '↑' : '↓'
 }
 
+function getColumnStyle(col: DataTableColumn) {
+  return {
+    ...(col.width ? { width: col.width, minWidth: col.width } : {}),
+    ...(col.align ? { textAlign: col.align } : {}),
+  }
+}
+
 watch([allSelected, someSelected], () => {
   if (selectAllRef.value) {
     selectAllRef.value.indeterminate = someSelected.value && !allSelected.value
@@ -136,7 +143,7 @@ watch([allSelected, someSelected], () => {
               'is-sortable': col.sortable,
               'is-sorted': sortKey === col.key,
             }"
-            :style="col.width ? { width: col.width, minWidth: col.width } : undefined"
+            :style="getColumnStyle(col)"
             @click="handleSort(col)"
           >
             {{ col.label }}
@@ -176,7 +183,7 @@ watch([allSelected, someSelected], () => {
             <td
               v-for="col in columns"
               :key="col.key"
-              :style="col.align ? { textAlign: col.align } : undefined"
+              :style="getColumnStyle(col)"
             >
               <slot :name="col.key" :row="row" :index="rowIndex">
                 {{ row[col.key] ?? '-' }}

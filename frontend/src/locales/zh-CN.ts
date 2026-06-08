@@ -315,6 +315,7 @@ export default {
       current: '当前状态',
       languagePair: '语言对',
       progress: '处理进度',
+      confirmedProgress: '确认进度',
       totalSegments: '句段总数',
       creator: '创建人',
       access: '访问权限',
@@ -425,7 +426,8 @@ export default {
       columns: {
         index: '序号',
         details: '文件详情',
-        progress: '进度',
+        progress: '确认进度',
+        pretranslationProgress: '预翻译进度',
         task: '任务管理',
         status: '状态',
         createdAt: '创建时间',
@@ -827,7 +829,7 @@ export default {
     guidelineTemplateNone: '不使用模板',
     guidelineImport: '导入细则',
     guidelinesPlaceholder: '输入本次临时提示词，例如术语规范、语气风格、格式要求等...',
-    guidelinesHint: '项目固定细则会自动带入；可选择仓库中的 Markdown 细则模板复用，手动输入只在本次 AI 修正中生效，不保存。',
+    guidelinesHint: '项目固定细则会自动带入；可选择仓库中的 Markdown 细则模板复用，手动输入会在当前页面保留，刷新页面后清除。',
     saveNow: '保存',
     exportDocx: '导出 DOCX',
     saveToTM: '保存到记忆库',
@@ -1336,6 +1338,10 @@ export default {
   },
   llm: {
     scope: {
+      currentSegment: {
+        label: '当前句段',
+        description: '仅修正当前选中的句段。',
+      },
       all: {
         label: '全部未确认译文',
         description: '处理模糊匹配和无匹配句段。',

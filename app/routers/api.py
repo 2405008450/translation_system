@@ -861,6 +861,7 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
                     file_record=file_record,
                     total_segments=file_stats.get(file_record.id, {"total": 0})["total"],
                     translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
+                    pretranslated_segments=file_stats.get(file_record.id, {}).get("pretranslated", 0),
                 )
             )
             for file_record in created_files
@@ -967,9 +968,10 @@ class FileOperationLockRequest(BaseModel):
 
 
 class LLMTranslateRequest(BaseModel):
-    scope: Literal["fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"] = "all"
+    scope: Literal["current_segment", "fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"] = "all"
     provider: Literal["auto", "deepseek", "openrouter"] = "deepseek"
     model: str | None = Field(default=None, max_length=120)
+    sentence_id: str | None = None
     translation_unit: Literal["paragraph", "sentence"] = "paragraph"
     translation_guidelines: str = ""
     guideline_template_id: str | None = None
@@ -1873,12 +1875,13 @@ def _parse_optional_datetime(value: str | None) -> datetime | None:
 def _build_llm_translation_tasks(
     db: Session,
     file_record_id: UUID,
-    scope: Literal["fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"],
+    scope: Literal["current_segment", "fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"],
     source_language: str | None = None,
     target_language: str | None = None,
     collection_id: UUID | None = None,
     glossary_base_ids: list[UUID] | None = None,
     include_context: bool = False,
+    sentence_id: str | None = None,
 ) -> list[LLMTranslationTask]:
     statuses_by_scope = {
         "fuzzy_only": {"fuzzy"},
@@ -1887,7 +1890,11 @@ def _build_llm_translation_tasks(
         "all_with_exact": {"exact", "fuzzy", "none"},
     }
     target_statuses: set[str] | None = None
-    if scope != "empty_target_only":
+    current_sentence_id = normalize_text(sentence_id or "")
+    if scope == "current_segment":
+        if not current_sentence_id:
+            raise ValueError("当前句段范围需要提供 sentence_id。")
+    elif scope != "empty_target_only":
         target_statuses = statuses_by_scope.get(scope)
         if target_statuses is None:
             raise ValueError(f"不支持的 scope: {scope}")
@@ -1910,7 +1917,9 @@ def _build_llm_translation_tasks(
     tasks: list[LLMTranslationTask] = []
     for segment in segments:
         should_translate = True
-        if scope == "empty_target_only":
+        if scope == "current_segment":
+            should_translate = segment.sentence_id == current_sentence_id
+        elif scope == "empty_target_only":
             if normalize_text(segment.target_text):
                 should_translate = False
         elif target_statuses is None or segment.status not in target_statuses:
@@ -2925,12 +2934,14 @@ def _build_project_summary_payload(
     total_segments: int,
     translated_segments: int,
     file_count: int,
+    pretranslated_segments: int = 0,
     creator_name: str | None = None,
     issue_stats: dict[str, int] | None = None,
     current_user: User | None = None,
     assigned_users: list[User] | None = None,
 ) -> dict:
     progress = calculate_file_record_progress(total_segments, translated_segments)
+    pretranslation_progress = calculate_file_record_progress(total_segments, pretranslated_segments)
     effective_status = (
         resolve_file_record_status("in_progress", total_segments, translated_segments)
         if total_segments > 0
@@ -2945,6 +2956,9 @@ def _build_project_summary_payload(
         "progress": progress,
         "total_segments": total_segments,
         "translated_segments": translated_segments,
+        "confirmed_segments": translated_segments,
+        "pretranslated_segments": pretranslated_segments,
+        "pretranslation_progress": pretranslation_progress,
         "source_language": project.source_language,
         "target_language": project.target_language,
         "creator": creator_name,
@@ -2966,6 +2980,7 @@ def _build_project_file_payload(
     file_record: FileRecord,
     total_segments: int,
     translated_segments: int,
+    pretranslated_segments: int = 0,
     issue_stats: dict[str, int] | None = None,
     current_user: User | None = None,
     assignees: list[User] | None = None,
@@ -2981,6 +2996,7 @@ def _build_project_file_payload(
         }
     )
     progress = calculate_file_record_progress(total_segments, translated_segments)
+    pretranslation_progress = calculate_file_record_progress(total_segments, pretranslated_segments)
     effective_status = resolve_file_record_status(
         file_record.status,
         total_segments=total_segments,
@@ -3008,6 +3024,9 @@ def _build_project_file_payload(
         "progress": progress,
         "total_segments": total_segments,
         "translated_segments": translated_segments,
+        "confirmed_segments": translated_segments,
+        "pretranslated_segments": pretranslated_segments,
+        "pretranslation_progress": pretranslation_progress,
         "source_language": file_record.source_language,
         "target_language": file_record.target_language,
         "creator": get_user_display_name(file_record.creator) if file_record.creator else None,
@@ -3047,7 +3066,8 @@ def _get_file_segment_stats(db: Session, file_record_ids: list[UUID]) -> dict[UU
         db.query(
             Segment.file_record_id,
             func.count(Segment.id).label("total"),
-            func.count(sql_case((Segment.target_text != "", 1))).label("filled"),
+            func.count(sql_case((Segment.status == "confirmed", 1))).label("confirmed"),
+            func.count(sql_case((Segment.target_text != "", 1))).label("pretranslated"),
         )
         .filter(Segment.file_record_id.in_(file_record_ids))
         .group_by(Segment.file_record_id)
@@ -3056,7 +3076,9 @@ def _get_file_segment_stats(db: Session, file_record_ids: list[UUID]) -> dict[UU
     return {
         row.file_record_id: {
             "total": row.total,
-            "filled": row.filled,
+            "filled": row.confirmed,
+            "confirmed": row.confirmed,
+            "pretranslated": row.pretranslated,
         }
         for row in stats_rows
     }
@@ -3077,7 +3099,8 @@ def _get_project_stats(
             FileRecord.project_id,
             func.count(func.distinct(FileRecord.id)).label("file_count"),
             func.count(Segment.id).label("total"),
-            func.count(sql_case((Segment.target_text != "", 1))).label("filled"),
+            func.count(sql_case((Segment.status == "confirmed", 1))).label("confirmed"),
+            func.count(sql_case((Segment.target_text != "", 1))).label("pretranslated"),
         )
         .outerjoin(Segment, Segment.file_record_id == FileRecord.id)
         .filter(FileRecord.project_id.in_(project_ids))
@@ -3095,7 +3118,9 @@ def _get_project_stats(
         row.project_id: {
             "file_count": row.file_count,
             "total": row.total,
-            "filled": row.filled,
+            "filled": row.confirmed,
+            "confirmed": row.confirmed,
+            "pretranslated": row.pretranslated,
         }
         for row in stats_rows
     }
@@ -3725,11 +3750,15 @@ def _build_project_detail_payload(
 ) -> dict:
     total_segments = sum(file_stats.get(file.id, {"total": 0})["total"] for file in files)
     translated_segments = sum(file_stats.get(file.id, {"filled": 0})["filled"] for file in files)
+    pretranslated_segments = sum(
+        file_stats.get(file.id, {}).get("pretranslated", 0) for file in files
+    )
     file_issue_stats = file_issue_stats or {}
     payload = _build_project_summary_payload(
         project=project,
         total_segments=total_segments,
         translated_segments=translated_segments,
+        pretranslated_segments=pretranslated_segments,
         file_count=len(files),
         creator_name=get_user_display_name(project.creator),
         issue_stats=project_issue_stats,
@@ -3742,6 +3771,7 @@ def _build_project_detail_payload(
             file_record=file_record,
             total_segments=file_stats.get(file_record.id, {"total": 0})["total"],
             translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
+            pretranslated_segments=file_stats.get(file_record.id, {}).get("pretranslated", 0),
             issue_stats=file_issue_stats.get(file_record.id),
             current_user=current_user,
             assignees=file_assignees.get(file_record.id),
@@ -4487,6 +4517,7 @@ def compute_project_document_statistics(
                 file_record=file_record,
                 total_segments=file_stats.get(file_record.id, {"total": 0})["total"],
                 translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
+                pretranslated_segments=file_stats.get(file_record.id, {}).get("pretranslated", 0),
                 issue_stats=file_issue_stats.get(file_record.id),
                 current_user=current_user,
             )
@@ -4871,9 +4902,10 @@ def list_projects(
 
     items = []
     for project in projects:
-        st = project_stats.get(project.id, {"file_count": 0, "total": 0, "filled": 0})
+        st = project_stats.get(project.id, {"file_count": 0, "total": 0, "filled": 0, "pretranslated": 0})
         total_segs = st["total"]
         filled_segs = st["filled"]
+        pretranslated_segs = st["pretranslated"]
 
         creator_name = None
         if project.creator:
@@ -4884,6 +4916,7 @@ def list_projects(
                 project=project,
                 total_segments=total_segs,
                 translated_segments=filled_segs,
+                pretranslated_segments=pretranslated_segs,
                 file_count=st["file_count"],
                 creator_name=creator_name,
                 issue_stats=project_issue_stats.get(project.id),
@@ -4957,6 +4990,12 @@ def get_file_records(
             ),
             "total_segments": file_stats.get(file_record.id, {"total": 0})["total"],
             "translated_segments": file_stats.get(file_record.id, {"filled": 0})["filled"],
+            "confirmed_segments": file_stats.get(file_record.id, {"filled": 0})["filled"],
+            "pretranslated_segments": file_stats.get(file_record.id, {}).get("pretranslated", 0),
+            "pretranslation_progress": calculate_file_record_progress(
+                file_stats.get(file_record.id, {"total": 0})["total"],
+                file_stats.get(file_record.id, {}).get("pretranslated", 0),
+            ),
             "issue_count": file_issue_stats.get(file_record.id, {}).get("issue_count", 0),
             "open_issue_count": file_issue_stats.get(file_record.id, {}).get("open_issue_count", 0),
             "document_parse_mode": getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
@@ -5636,12 +5675,13 @@ def duplicate_file_record_task(
     db.refresh(duplicate)
     file_stats = _get_file_segment_stats(db, [duplicate.id]).get(
         duplicate.id,
-        {"total": 0, "filled": 0},
+        {"total": 0, "filled": 0, "pretranslated": 0},
     )
     return _build_project_file_payload(
         duplicate,
         total_segments=file_stats["total"],
         translated_segments=file_stats["filled"],
+        pretranslated_segments=file_stats["pretranslated"],
         current_user=current_user,
     )
 
@@ -5671,13 +5711,14 @@ def assign_file_record_task(
 
     file_stats = _get_file_segment_stats(db, [file_record.id]).get(
         file_record.id,
-        {"total": 0, "filled": 0},
+        {"total": 0, "filled": 0, "pretranslated": 0},
     )
     issue_stats = _get_file_issue_stats(db, [file_record.id]).get(file_record.id)
     return _build_project_file_payload(
         file_record,
         total_segments=file_stats["total"],
         translated_segments=file_stats["filled"],
+        pretranslated_segments=file_stats["pretranslated"],
         issue_stats=issue_stats,
         current_user=current_user,
     )
@@ -6688,6 +6729,7 @@ def batch_update_segment_confirmation(
         )
 
     if updated_count:
+        sync_file_record_status(db, file_record_id)
         db.commit()
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
 
@@ -7314,6 +7356,8 @@ async def llm_translate_file_record(
     ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
     source_language, target_language = _resolve_file_record_language_pair(file_record)
     body = payload or LLMTranslateRequest()
+    if body.scope == "current_segment" and not normalize_text(body.sentence_id or ""):
+        raise HTTPException(status_code=400, detail="当前句段范围需要提供 sentence_id。")
     requested_model = normalize_text(body.model or "") or None
     try:
         validate_provider_choice(body.provider, model_override=requested_model)
@@ -7344,6 +7388,7 @@ async def llm_translate_file_record(
         collection_id=file_record.collection_id,
         glossary_base_ids=glossary_base_ids,
         include_context=body.translation_unit == "paragraph",
+        sentence_id=body.sentence_id,
     )
 
     async def event_stream():

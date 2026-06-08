@@ -199,7 +199,7 @@ function startResize(event: MouseEvent) {
 }
 
 const pageError = ref('')
-const llmScope = ref<LLMTranslateScope>('all')
+const llmScope = ref<LLMTranslateScope>('current_segment')
 const llmProvider = ref<LLMProvider>('deepseek')
 const llmModel = ref('')
 const itemHeight = ref(resolveItemHeight())
@@ -1439,22 +1439,9 @@ function clearSegmentSearchFilters() {
   segmentDisplayScope.value = 'all'
   sourceSearchQuery.value = ''
   targetSearchQuery.value = ''
-  replaceSearchText.value = ''
   searchFuzzyEnabled.value = false
   searchLoadingAllSegments.value = false
   retainedEmptyTargetSentenceIds.value = new Set()
-}
-
-async function resetSegmentSearchAndRestore() {
-  const target = segmentSearchReturnTarget.value
-  const targetPage = target ? getReturnTargetPage(target) : 1
-  suppressSegmentFilterWatch = true
-  resetSegmentSearch()
-  suppressSegmentFilterWatch = false
-  await refreshSegmentPage(targetPage, segmentStore.pageSize)
-  if (target) {
-    await focusEditorSegmentBySentenceId(target.sentenceId)
-  }
 }
 
 async function focusEditorSegmentBySentenceId(sentenceId: string) {
@@ -1473,6 +1460,25 @@ function getReturnTargetPage(target: { displayIndex: number | null; page: number
   return target.page
 }
 
+async function resolveSegmentReturnTargetPage(target: { sentenceId: string; displayIndex: number | null; page: number }) {
+  const localPage = getReturnTargetPage(target)
+  if (typeof target.displayIndex === 'number' && Number.isFinite(target.displayIndex) && target.displayIndex >= 0) {
+    return localPage
+  }
+
+  const fileRecordId = segmentStore.fileRecord?.id || props.id
+  try {
+    const { data } = await http.get<SegmentPositionResponse>(
+      `/file-records/${fileRecordId}/segments/${encodeURIComponent(target.sentenceId)}/position`,
+      { params: { page_size: segmentStore.pageSize } },
+    )
+    return data.page || localPage
+  } catch (error) {
+    console.warn('Failed to resolve segment return page:', error)
+    return localPage
+  }
+}
+
 async function restoreSegmentSearchReturnTarget() {
   const target = segmentSearchReturnTarget.value
   segmentSearchReturnTarget.value = null
@@ -1484,12 +1490,35 @@ async function restoreSegmentSearchReturnTarget() {
     return
   }
 
-  const targetPage = getReturnTargetPage(target)
+  const targetPage = await resolveSegmentReturnTargetPage(target)
   suppressSegmentFilterWatch = true
   clearSegmentSearchFilters()
   suppressSegmentFilterWatch = false
   await refreshSegmentPage(targetPage, segmentStore.pageSize)
   await focusEditorSegmentBySentenceId(target.sentenceId)
+}
+
+async function clearSourceSegmentSearchQuery() {
+  const target = segmentSearchReturnTarget.value
+  const targetPage = target ? await resolveSegmentReturnTargetPage(target) : segmentStore.currentPage
+  searchLoadRequestId += 1
+  searchLoadingAllSegments.value = false
+  suppressSegmentFilterWatch = true
+  sourceSearchQuery.value = ''
+  await nextTick()
+  suppressSegmentFilterWatch = false
+
+  if (segmentStore.fileRecord) {
+    await refreshSegmentPage(targetPage, segmentStore.pageSize)
+  }
+
+  if (target) {
+    await focusEditorSegmentBySentenceId(target.sentenceId)
+    return
+  }
+
+  await nextTick()
+  sourceSearchInputRef.value?.focus({ preventScroll: true })
 }
 
 async function closeSegmentSearchPanel() {
@@ -2835,11 +2864,17 @@ async function handleSegmentPageSizeChange(size: number) {
 
 async function runLLMTranslation() {
   pageError.value = ''
+  const currentSentenceId = activeSegment.value?.sentence_id || ''
+  if (llmScope.value === 'current_segment' && !currentSentenceId) {
+    toast.warn('请先选中一个句段。')
+    return
+  }
   try {
     await segmentStore.startLLMTranslation(llmScope.value, llmProvider.value, {
       guidelineTemplateId: selectedGuidelineTemplateId.value || undefined,
       temporaryPrompt: workbenchGuidelines.value,
       model: llmModel.value || undefined,
+      sentenceId: llmScope.value === 'current_segment' ? currentSentenceId : undefined,
     })
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.llm'))
@@ -4135,12 +4170,12 @@ onBeforeRouteLeave(async () => {
       </div>
     </section>
 
-    <Transition name="workbench-panel-pop">
-      <section
-        v-if="showGuidelinesPanel"
-        class="panel workbench-guidelines-panel"
-        @keydown.esc.stop="closeGuidelinesPanel"
-      >
+    <Modal
+      :open="showGuidelinesPanel"
+      width="min(760px, calc(100vw - 32px))"
+      @close="closeGuidelinesPanel"
+    >
+      <div class="workbench-guidelines-panel">
         <div class="workbench-guidelines-panel__head">
           <span class="workbench-guidelines-panel__title">{{ t('workbench.guidelinesTitle') }}</span>
           <div class="workbench-guidelines-panel__actions">
@@ -4192,8 +4227,8 @@ onBeforeRouteLeave(async () => {
           :placeholder="t('workbench.guidelinesPlaceholder')"
         />
         <p class="hint-text">{{ t('workbench.guidelinesHint') }}</p>
-      </section>
-    </Transition>
+      </div>
+    </Modal>
 
     <section v-if="false" class="panel panel--header workbench-overview">
       <div class="workbench-overview__line">
@@ -4302,14 +4337,28 @@ onBeforeRouteLeave(async () => {
               <div class="workbench-search-panel__line">
                 <label class="workbench-search-panel__field">
                   <span>{{ t('workbench.search.sourceShortLabel') }}</span>
-                  <input
-                    ref="sourceSearchInputRef"
-                    v-model="sourceSearchQuery"
-                    class="field__control"
-                    type="text"
-                    :placeholder="t('workbench.search.sourcePlaceholder')"
-                    @keydown.enter.prevent="void focusMatchedSegment(1)"
-                  />
+                  <span class="workbench-search-panel__input-wrap">
+                    <input
+                      ref="sourceSearchInputRef"
+                      v-model="sourceSearchQuery"
+                      class="field__control"
+                      :class="{ 'has-clear-action': sourceSearchQuery }"
+                      type="text"
+                      :placeholder="t('workbench.search.sourcePlaceholder')"
+                      @keydown.enter.prevent="void focusMatchedSegment(1)"
+                    />
+                    <button
+                      v-if="sourceSearchQuery"
+                      class="workbench-search-panel__input-clear"
+                      type="button"
+                      :title="t('workbench.search.clear')"
+                      :aria-label="t('workbench.search.clear')"
+                      @mousedown.prevent
+                      @click="void clearSourceSegmentSearchQuery()"
+                    >
+                      <X :size="12" />
+                    </button>
+                  </span>
                 </label>
 
                 <label class="workbench-search-panel__field">
@@ -4379,18 +4428,6 @@ onBeforeRouteLeave(async () => {
                   @click="void replaceAllSearchMatches()"
                 >
                   {{ t('workbench.search.replaceAll', { count: segmentStore.matchedSegmentCount }) }}
-                </button>
-                <button
-                  class="button workbench-action workbench-action--clear"
-                  :class="{ 'is-layout-placeholder': !hasEditorSegmentFilter && !replaceSearchText }"
-                  type="button"
-                  :disabled="!hasEditorSegmentFilter && !replaceSearchText"
-                  :aria-hidden="!hasEditorSegmentFilter && !replaceSearchText"
-                  :tabindex="hasEditorSegmentFilter || replaceSearchText ? 0 : -1"
-                  @click="void resetSegmentSearchAndRestore()"
-                >
-                  <X :size="14" />
-                  {{ t('workbench.search.clear') }}
                 </button>
                 <button
                   class="button workbench-action workbench-action--search workbench-search-panel__close"
@@ -6329,14 +6366,6 @@ onBeforeRouteLeave(async () => {
   --action-hover-shadow: rgba(20, 92, 79, 0.16);
 }
 
-.workbench-action--clear {
-  --action-bg: linear-gradient(180deg, #f7eee9, #efdcd4);
-  --action-border: #dfbeb0;
-  --action-color: #87452c;
-  --action-shadow: rgba(135, 69, 44, 0.1);
-  --action-hover-shadow: rgba(135, 69, 44, 0.16);
-}
-
 .workbench-action--search,
 .workbench-action--back {
   --action-bg: linear-gradient(180deg, #f3f7f8, #e7eef1);
@@ -6402,12 +6431,19 @@ onBeforeRouteLeave(async () => {
   margin: 0;
 }
 
-.workbench-search-panel__field > span {
+.workbench-search-panel__field > span:not(.workbench-search-panel__input-wrap) {
   flex: 0 0 auto;
   color: #2f3d45;
   font-size: 13px;
   line-height: 1;
   white-space: nowrap;
+}
+
+.workbench-search-panel__input-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
 }
 
 .workbench-search-panel__field .field__control {
@@ -6419,6 +6455,35 @@ onBeforeRouteLeave(async () => {
   background: #fff;
   font-size: 13px;
   box-shadow: inset 0 1px 2px rgba(17, 34, 51, 0.04);
+}
+
+.workbench-search-panel__field .field__control.has-clear-action {
+  padding-right: 28px;
+}
+
+.workbench-search-panel__input-clear {
+  position: absolute;
+  right: 5px;
+  top: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #657580;
+  cursor: pointer;
+  transform: translateY(-50%);
+}
+
+.workbench-search-panel__input-clear:hover,
+.workbench-search-panel__input-clear:focus-visible {
+  background: #e8eef2;
+  color: #26343d;
+  outline: none;
 }
 
 .workbench-search-panel__field--replace .field__control {

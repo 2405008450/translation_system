@@ -119,7 +119,7 @@ def get_file_record_segment_counts(db: Session, file_record_id: UUID) -> tuple[i
     total_segments, translated_segments = (
         db.query(
             func.count(Segment.id),
-            func.count(case((Segment.target_text != "", 1))),
+            func.count(case((Segment.status == "confirmed", 1))),
         )
         .filter(Segment.file_record_id == file_record_id)
         .one()
@@ -138,7 +138,7 @@ def sync_file_record_status(db: Session, file_record_id: UUID) -> str | None:
         db.query(func.count(Segment.id))
         .filter(
             Segment.file_record_id == file_record_id,
-            Segment.target_text != "",
+            Segment.status == "confirmed",
         )
         .scalar_subquery()
     )
@@ -165,6 +165,10 @@ def sync_file_record_status(db: Session, file_record_id: UUID) -> str | None:
 
 def _count_filled_targets(items: list[dict]) -> int:
     return sum(1 for item in items if item.get("target_text", "") != "")
+
+
+def _count_confirmed_segments(items: list[dict]) -> int:
+    return sum(1 for item in items if item.get("status") == "confirmed")
 
 
 def _record_initial_translation_events(db: Session, segments: list[Segment]) -> None:
@@ -385,7 +389,7 @@ def _create_file_record_from_workspace(
     file_record.status = resolve_file_record_status(
         file_record.status,
         len(workspace_data["segments"]),
-        _count_filled_targets(workspace_data["segments"]),
+        _count_confirmed_segments(workspace_data["segments"]),
     )
 
     source_bytes = workspace_data.get(_WORKSPACE_SOURCE_BYTES_KEY, raw_bytes)
@@ -438,7 +442,7 @@ def create_txt_file_record_with_segments(
     file_record.status = resolve_file_record_status(
         file_record.status,
         len(results),
-        sum(1 for result in results if (result.target_text or "") != ""),
+        sum(1 for result in results if getattr(result, "status", None) == "confirmed"),
     )
 
     db.flush()
@@ -683,7 +687,7 @@ def attach_source_document_to_file_record(
     file_record.status = resolve_file_record_status(
         file_record.status,
         len(workspace_data["segments"]),
-        _count_filled_targets(workspace_data["segments"]),
+        _count_confirmed_segments(workspace_data["segments"]),
     )
 
     stored_source_bytes = workspace_data.get(_WORKSPACE_SOURCE_BYTES_KEY, raw_bytes)

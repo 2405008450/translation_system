@@ -97,6 +97,9 @@ export interface FileRecordSummary {
   progress?: number
   total_segments?: number
   translated_segments?: number
+  confirmed_segments?: number
+  pretranslated_segments?: number
+  pretranslation_progress?: number
   open_issue_count?: number
   issue_count?: number
   active_operation?: string | null
@@ -889,13 +892,14 @@ export interface CommentReplyPayload {
   body: string
 }
 
-export type LLMTranslateScope = 'fuzzy_only' | 'none_only' | 'empty_target_only' | 'all' | 'all_with_exact'
+export type LLMTranslateScope = 'current_segment' | 'fuzzy_only' | 'none_only' | 'empty_target_only' | 'all' | 'all_with_exact'
 export type LLMProvider = 'auto' | 'deepseek' | 'openrouter'
 
 export interface LLMGuidelineOptions {
   guidelineTemplateId?: string
   temporaryPrompt?: string
   model?: string
+  sentenceId?: string
 }
 
 export interface LLMEvent {

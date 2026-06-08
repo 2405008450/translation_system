@@ -214,6 +214,9 @@ const overrides = {
     empty: 'No projects',
     createDialogTitle: 'New Project',
     createDialogDescription: 'After creating a project, upload documents from the project details page.',
+    status: {
+      confirmedProgress: 'Confirmed progress',
+    },
   },
   projectDetail: {
     titleFallback: 'Project Details',
@@ -242,6 +245,10 @@ const overrides = {
       empty: 'No files to display.',
       openHint: 'Open the translation workbench',
       processingHint: 'The source document is uploaded and will be available after processing.',
+      columns: {
+        progress: 'Confirmed progress',
+        pretranslationProgress: 'Pre-translation progress',
+      },
       actions: {
         upload: 'Upload File',
         assign: 'Assign File',
@@ -322,6 +329,10 @@ const overrides = {
   },
   llm: {
     scope: {
+      currentSegment: {
+        label: 'Current segment',
+        description: 'Only revise the currently selected segment.',
+      },
       all: {
         label: 'All unconfirmed targets',
         description: 'Process fuzzy matches and unmatched segments.',

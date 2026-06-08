@@ -114,6 +114,9 @@ interface ProjectDetail {
   file_count: number
   total_segments: number
   translated_segments: number
+  confirmed_segments: number
+  pretranslated_segments: number
+  pretranslation_progress: number
   source_language: string | null
   target_language: string | null
   creator: string | null
@@ -148,6 +151,9 @@ interface ProjectFileItem {
   progress: number
   total_segments: number
   translated_segments: number
+  confirmed_segments: number
+  pretranslated_segments: number
+  pretranslation_progress: number
   source_language: string | null
   target_language: string | null
   creator: string | null
@@ -556,15 +562,12 @@ const canOpenTermExtraction = computed(() => (
 ))
 
 const columns = computed<DataTableColumn[]>(() => ([
-  { key: 'filename', label: t('projectDetail.files.columns.details'), width: '280px' },
-  { key: 'progress', label: t('projectDetail.files.columns.progress'), width: '180px' },
-  { key: 'taskManage', label: t('projectDetail.files.columns.task'), width: '190px' },
-  { key: 'status', label: t('projectDetail.files.columns.status'), width: '120px' },
-  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '120px' },
-  { key: 'created_at', label: t('projectDetail.files.columns.createdAt'), width: '170px' },
-  { key: 'source_language', label: t('projectList.form.sourceLanguage'), width: '130px' },
-  { key: 'target_language', label: t('projectDetail.files.columns.targetLang'), width: '130px' },
-  { key: 'file_size_bytes', label: t('projectDetail.files.columns.size'), width: '120px', align: 'right' },
+  { key: 'filename', label: t('projectDetail.files.columns.details'), width: '300px' },
+  { key: 'progress', label: t('projectDetail.files.columns.progress'), width: '150px' },
+  { key: 'pretranslation_progress', label: t('projectDetail.files.columns.pretranslationProgress'), width: '150px' },
+  { key: 'taskManage', label: t('projectDetail.files.columns.task'), width: '140px' },
+  { key: 'status', label: t('projectDetail.files.columns.status'), width: '100px' },
+  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '90px' },
 ]))
 
 const statisticsFileColumns = computed<DataTableColumn[]>(() => ([
@@ -919,6 +922,18 @@ function getFileDetailHint(row: ProjectRow) {
     return t('projectDetail.files.processingHint')
   }
   return t('projectDetail.common.uploadRequired')
+}
+
+function getFileMetaText(row: ProjectRow) {
+  const languagePair = formatLanguagePair(row.source_language, row.target_language)
+  const fileSize = formatBytes(row.file_size_bytes)
+  const createdAt = formatDateParts(row.created_at).date
+  return [
+    getFileDetailHint(row),
+    languagePair,
+    fileSize,
+    createdAt,
+  ].filter((item) => item && item !== getPlaceholder()).join(' · ')
 }
 
 function clearLanguageDetectState() {
@@ -1277,17 +1292,35 @@ function handlePreTranslateProgress(payload: PreTranslateProgressPayload) {
 }
 
 function getFileDisplayProgress(row: ProjectRow) {
-  const progress = preTranslateProgressByFileId.value[String(row.id)]?.progress
-  return typeof progress === 'number' ? progress : Number(row.progress || 0)
+  return Number(row.progress || 0)
 }
 
 function getFileDisplayProgressStatus(row: ProjectRow) {
+  return String(row.status || '')
+}
+
+function getFileDisplayProgressMessage(row: ProjectRow) {
+  return row.active_operation && row.active_operation !== 'pre_translate'
+    ? String(row.active_operation_message || '')
+    : ''
+}
+
+function getFilePretranslationProgress(row: ProjectRow) {
+  const progress = preTranslateProgressByFileId.value[String(row.id)]?.progress
+  return typeof progress === 'number'
+    ? progress
+    : Number(row.pretranslation_progress || 0)
+}
+
+function getFilePretranslationProgressStatus(row: ProjectRow) {
   const state = preTranslateProgressByFileId.value[String(row.id)]
   return (state && state.progress < 100) || row.is_edit_locked ? 'processing' : String(row.status || '')
 }
 
-function getFileDisplayProgressMessage(row: ProjectRow) {
-  return preTranslateProgressByFileId.value[String(row.id)]?.status || row.active_operation_message || ''
+function getFilePretranslationProgressMessage(row: ProjectRow) {
+  return preTranslateProgressByFileId.value[String(row.id)]?.status
+    || (row.active_operation === 'pre_translate' ? row.active_operation_message : '')
+    || ''
 }
 
 function openProjectIssueDialog() {
@@ -3721,7 +3754,7 @@ onBeforeUnmount(() => {
                   </button>
                 </div>
                 <span v-else class="pd-file-cell__title" :title="row.filename">{{ row.filename }}</span>
-                <span class="pd-file-cell__meta">{{ getFileDetailHint(row) }}</span>
+                <span class="pd-file-cell__meta" :title="getFileMetaText(row)">{{ getFileMetaText(row) }}</span>
               </div>
             </div>
           </template>
@@ -3740,6 +3773,24 @@ onBeforeUnmount(() => {
               </div>
               <span v-if="getFileDisplayProgressMessage(row)" class="pd-file-progress__status">
                 {{ getFileDisplayProgressMessage(row) }}
+              </span>
+            </div>
+          </template>
+
+          <template #pretranslation_progress="{ row }">
+            <div class="pd-file-progress" :title="getFilePretranslationProgressMessage(row) || undefined">
+              <div class="progress-bar">
+                <div class="progress-bar__track">
+                  <div
+                    class="progress-bar__fill"
+                    :class="{ 'is-complete': isProgressComplete(getFilePretranslationProgress(row)) }"
+                    :style="getProgressStyle(getFilePretranslationProgress(row), getFilePretranslationProgressStatus(row))"
+                  />
+                </div>
+                <span class="progress-bar__text">{{ getFilePretranslationProgress(row) }}%</span>
+              </div>
+              <span v-if="getFilePretranslationProgressMessage(row)" class="pd-file-progress__status">
+                {{ getFilePretranslationProgressMessage(row) }}
               </span>
             </div>
           </template>
@@ -3778,24 +3829,6 @@ onBeforeUnmount(() => {
               <Flag :size="13" />
               {{ Number(row.open_issue_count || 0) > 0 ? row.open_issue_count : t('common.none') }}
             </button>
-          </template>
-
-          <template #created_at="{ row }">
-            <div class="date-cell">
-              {{ formatDateParts(row.created_at).date }}<br>{{ formatDateParts(row.created_at).time }}
-            </div>
-          </template>
-
-          <template #source_language="{ row }">
-            <span>{{ row.source_language ? getLanguageLabel(row.source_language) : getPlaceholder() }}</span>
-          </template>
-
-          <template #target_language="{ row }">
-            <span>{{ row.target_language ? getLanguageLabel(row.target_language) : getPlaceholder() }}</span>
-          </template>
-
-          <template #file_size_bytes="{ row }">
-            <span>{{ formatBytes(row.file_size_bytes) }}</span>
           </template>
 
           <template #actions="{ row }">
@@ -4905,7 +4938,7 @@ onBeforeUnmount(() => {
 
 .pd-file-table :deep(.data-table) {
   table-layout: fixed;
-  min-width: 1580px;
+  min-width: 1080px;
 }
 
 .pd-statistics-file-table :deep(.data-table) {
@@ -5114,8 +5147,12 @@ onBeforeUnmount(() => {
 }
 
 .pd-file-cell__meta {
+  display: block;
+  overflow: hidden;
   font-size: 12px;
   color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pd-file-progress {

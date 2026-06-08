@@ -3876,6 +3876,12 @@ body.modal-open {
   text-align: center;
 }
 
+.data-table th.data-table__checkbox,
+.data-table th.data-table__index,
+.data-table th.data-table__actions {
+  text-align: center;
+}
+
 .data-table__actions-btn {
   display: inline-grid;
   place-items: center;

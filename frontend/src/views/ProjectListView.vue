@@ -44,6 +44,9 @@ interface ProjectItem {
   open_issue_count: number
   total_segments: number
   translated_segments: number
+  confirmed_segments: number
+  pretranslated_segments: number
+  pretranslation_progress: number
   source_language: string | null
   target_language: string | null
   creator: string | null
@@ -132,15 +135,11 @@ const accessOptions = computed(() => ([
 ]))
 
 const columns = computed<DataTableColumn[]>(() => ([
-  { key: 'filename', label: t('common.actions.details'), sortable: true },
-  { key: 'status', label: t('projectList.status.current'), width: '110px' },
-  { key: 'progress', label: t('projectList.status.progress'), width: '180px' },
-  { key: 'file_count', label: t('projectDetail.base.fileCount'), width: '110px', align: 'right' },
-  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '120px' },
-  { key: 'access_level', label: t('projectList.status.access'), width: '110px' },
-  { key: 'creator', label: t('projectList.status.creator'), width: '130px' },
-  { key: 'created_at', label: t('projectList.summaries.createdAt'), width: '120px', sortable: true },
-  { key: 'deadline', label: t('projectList.form.deadline'), width: '120px', sortable: true },
+  { key: 'filename', label: t('common.actions.details'), width: '320px', sortable: true },
+  { key: 'status', label: t('projectList.status.current'), width: '90px', align: 'center' },
+  { key: 'progress', label: t('projectList.status.confirmedProgress'), width: '140px', align: 'center' },
+  { key: 'file_count', label: t('projectDetail.base.fileCount'), width: '70px', align: 'center' },
+  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '80px', align: 'center' },
 ]))
 
 const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
@@ -448,6 +447,17 @@ function getAccessLabel(level: string | null) {
   return labels[level || 'team'] || t('projectList.form.team')
 }
 
+function getProjectMetaText(row: ProjectItem) {
+  const created = formatDate(row.created_at)
+  const deadline = formatDate(row.deadline)
+  return [
+    getAccessLabel(row.access_level),
+    row.creator || '--',
+    `${t('projectList.summaries.createdAt')} ${created.date}`,
+    `${t('projectList.form.deadline')} ${deadline.date}`,
+  ].join(' · ')
+}
+
 function getStatusClass(status: string) {
   const meta = getFileStatusMeta(status)
   return `project-status--${meta.tone}`
@@ -577,6 +587,7 @@ onMounted(() => {
 
     <div class="table-page__body">
       <DataTable
+        class="project-table"
         test-id="project-table"
         row-test-id-prefix="project-row"
         :columns="columns"
@@ -593,14 +604,20 @@ onMounted(() => {
         @select="handleProjectSelection"
       >
         <template #filename="{ row }">
-          <button
-            class="text-link project-link"
-            :class="getProjectLinkClass(row.status)"
-            type="button"
-            @click="router.push({ name: 'project-detail', params: { id: row.id } })"
-          >
-            {{ row.filename }}
-          </button>
+          <div class="project-main-cell">
+            <button
+              class="text-link project-link"
+              :class="getProjectLinkClass(row.status)"
+              type="button"
+              :title="row.filename"
+              @click="router.push({ name: 'project-detail', params: { id: row.id } })"
+            >
+              {{ row.filename }}
+            </button>
+            <span class="project-main-cell__meta" :title="getProjectMetaText(row as ProjectItem)">
+              {{ getProjectMetaText(row as ProjectItem) }}
+            </span>
+          </div>
         </template>
 
         <template #status="{ row }">
@@ -637,26 +654,6 @@ onMounted(() => {
             <Flag :size="13" />
             {{ Number(row.open_issue_count || 0) > 0 ? row.open_issue_count : t('common.none') }}
           </button>
-        </template>
-
-        <template #access_level="{ row }">
-          <span>{{ getAccessLabel(row.access_level) }}</span>
-        </template>
-
-        <template #creator="{ row }">
-          <span>{{ row.creator || '--' }}</span>
-        </template>
-
-        <template #created_at="{ row }">
-          <div class="date-cell">
-            {{ formatDate(row.created_at).date }}<br>{{ formatDate(row.created_at).time }}
-          </div>
-        </template>
-
-        <template #deadline="{ row }">
-          <div class="date-cell">
-            {{ formatDate(row.deadline).date }}<br>{{ formatDate(row.deadline).time }}
-          </div>
         </template>
 
         <template #actions="{ row }">
@@ -916,11 +913,36 @@ onMounted(() => {
   margin: 0 20px 8px;
 }
 
+.project-table :deep(.data-table) {
+  table-layout: fixed;
+}
+
 .project-link {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
   padding: 0;
   border: none;
   background: transparent;
   box-shadow: none;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-main-cell {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.project-main-cell__meta {
+  display: block;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .project-link--info {

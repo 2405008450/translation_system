@@ -135,6 +135,11 @@ export const llmModelOptions: LLMModelOption[] = [
 
 export const llmScopeOptions: LLMOption<LLMTranslateScope>[] = [
   {
+    value: 'current_segment',
+    get label() { return translate('llm.scope.currentSegment.label') },
+    get description() { return translate('llm.scope.currentSegment.description') },
+  },
+  {
     value: 'all',
     get label() { return translate('llm.scope.all.label') },
     get description() { return translate('llm.scope.all.description') },
