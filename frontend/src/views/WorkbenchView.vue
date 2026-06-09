@@ -24,6 +24,7 @@ import {
   Languages,
   Loader2,
   MessageSquare,
+  Pilcrow,
   Redo2,
   Save,
   Search,
@@ -40,7 +41,7 @@ import {
   Upload,
   X,
 } from 'lucide-vue-next'
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicInstance } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch, type ComponentPublicInstance } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 
@@ -107,6 +108,8 @@ type SegmentDisplayScope = 'all' | 'exact_only' | 'fuzzy_only' | 'none_only' | '
 type RevisionMenuKind = 'track' | 'accept' | 'reject'
 type ResourceSearchMode = 'exact' | 'fuzzy'
 type FileExportStatus = 'queued' | 'running' | 'completed' | 'failed'
+type WorkflowTransitionDirection = 'forward' | 'back'
+type WorkflowSourceStatus = 'none' | 'exact' | 'fuzzy' | 'confirmed'
 interface FileExportTask {
   task_id: string
   status: FileExportStatus
@@ -147,6 +150,10 @@ type ResourceSearchResponse = {
 }
 
 const REVISION_TRACE_VISIBLE_STORAGE_KEY = 'workbench.revisionTraceEnabled'
+const BOTTOM_DRAWER_MIN_HEIGHT = 260
+const BOTTOM_DRAWER_TOP_GUTTER = 70
+const BOTTOM_DRAWER_KEYBOARD_STEP = 32
+const BOTTOM_DRAWER_KEYBOARD_LARGE_STEP = 80
 
 function getInitialRevisionTraceVisible() {
   if (typeof window === 'undefined') {
@@ -171,14 +178,36 @@ const virtualListRef = ref<{
 const segmentEditorRowRefs = new Map<string, SegmentEditorRowPublic>()
 
 const bottomPanelRef = ref<HTMLElement | null>(null)
+const bottomDrawerRef = ref<HTMLElement | null>(null)
 const sidecarRef = ref<HTMLElement | null>(null)
 const sidecarWidth = ref<number | null>(null)
+const bottomDrawerHeight = ref<number | null>(null)
 const isResizing = ref(false)
+const isBottomDrawerResizing = ref(false)
+const viewportHeight = ref(window.innerHeight)
+let stopBottomDrawerResize: (() => void) | null = null
 
 const sidecarWidthStyle = computed(() => {
   if (sidecarWidth.value === null) return {}
   return { width: `${sidecarWidth.value}px` }
 })
+
+const bottomDrawerMaxHeight = computed(() =>
+  Math.max(BOTTOM_DRAWER_MIN_HEIGHT, viewportHeight.value - BOTTOM_DRAWER_TOP_GUTTER),
+)
+
+const bottomDrawerHeightStyle = computed(() => {
+  if (bottomDrawerHeight.value === null) return {}
+  const height = `${bottomDrawerHeight.value}px`
+  return {
+    '--workbench-bottom-panel-height': height,
+    '--workbench-visible-bottom-panel-height': height,
+  }
+})
+
+const bottomDrawerResizeValue = computed(() =>
+  bottomDrawerHeight.value ?? resolveDefaultBottomDrawerHeight(),
+)
 
 function startResize(event: MouseEvent) {
   event.preventDefault()
@@ -204,6 +233,85 @@ function startResize(event: MouseEvent) {
   document.body.style.userSelect = 'none'
   document.addEventListener('mousemove', onMouseMove)
   document.addEventListener('mouseup', onMouseUp)
+}
+
+function resolveDefaultBottomDrawerHeight() {
+  const minHeight = props.standalone ? 380 : 360
+  const maxHeight = props.standalone ? 560 : 520
+  const preferredHeight = Math.round(viewportHeight.value * 0.5)
+  return clampBottomDrawerHeight(Math.min(Math.max(preferredHeight, minHeight), maxHeight))
+}
+
+function clampBottomDrawerHeight(height: number) {
+  return Math.round(Math.min(Math.max(height, BOTTOM_DRAWER_MIN_HEIGHT), bottomDrawerMaxHeight.value))
+}
+
+function setBottomDrawerHeight(height: number) {
+  bottomDrawerHeight.value = clampBottomDrawerHeight(height)
+}
+
+function startBottomDrawerResize(event: PointerEvent) {
+  if (!isPreviewDrawerResizable.value) {
+    return
+  }
+
+  event.preventDefault()
+  stopBottomDrawerResize?.()
+  isBottomDrawerResizing.value = true
+
+  const startY = event.clientY
+  const startHeight = bottomDrawerRef.value?.offsetHeight ?? bottomDrawerResizeValue.value
+  const previousCursor = document.body.style.cursor
+  const previousUserSelect = document.body.style.userSelect
+
+  function onPointerMove(pointerEvent: PointerEvent) {
+    const deltaY = startY - pointerEvent.clientY
+    setBottomDrawerHeight(startHeight + deltaY)
+  }
+
+  function stopResize() {
+    isBottomDrawerResizing.value = false
+    document.removeEventListener('pointermove', onPointerMove)
+    document.removeEventListener('pointerup', stopResize)
+    document.removeEventListener('pointercancel', stopResize)
+    document.body.style.cursor = previousCursor
+    document.body.style.userSelect = previousUserSelect
+    stopBottomDrawerResize = null
+  }
+
+  document.body.style.cursor = 'ns-resize'
+  document.body.style.userSelect = 'none'
+  document.addEventListener('pointermove', onPointerMove)
+  document.addEventListener('pointerup', stopResize)
+  document.addEventListener('pointercancel', stopResize)
+  stopBottomDrawerResize = stopResize
+}
+
+function handleBottomDrawerResizeKeydown(event: KeyboardEvent) {
+  const currentHeight = bottomDrawerRef.value?.offsetHeight ?? bottomDrawerResizeValue.value
+  const step = event.shiftKey ? BOTTOM_DRAWER_KEYBOARD_LARGE_STEP : BOTTOM_DRAWER_KEYBOARD_STEP
+  let nextHeight: number | null = null
+
+  if (event.key === 'ArrowUp') {
+    nextHeight = currentHeight + step
+  } else if (event.key === 'ArrowDown') {
+    nextHeight = currentHeight - step
+  } else if (event.key === 'PageUp') {
+    nextHeight = currentHeight + BOTTOM_DRAWER_KEYBOARD_LARGE_STEP
+  } else if (event.key === 'PageDown') {
+    nextHeight = currentHeight - BOTTOM_DRAWER_KEYBOARD_LARGE_STEP
+  } else if (event.key === 'Home') {
+    nextHeight = BOTTOM_DRAWER_MIN_HEIGHT
+  } else if (event.key === 'End') {
+    nextHeight = bottomDrawerMaxHeight.value
+  }
+
+  if (nextHeight === null) {
+    return
+  }
+
+  event.preventDefault()
+  setBottomDrawerHeight(nextHeight)
 }
 
 const pageError = ref('')
@@ -251,6 +359,21 @@ const downloadingTermQAReport = ref(false)
 const locatingTermQAReportItemId = ref<string | null>(null)
 const updatingTermQAIgnore = ref(false)
 const selectedTermQAItemIds = ref<Set<string>>(new Set())
+const showWorkflowTransitionDialog = ref(false)
+const workflowTransitionDirection = ref<WorkflowTransitionDirection>('forward')
+const workflowTransitionLoading = ref(false)
+const workflowTransitionPreviewLoading = ref(false)
+const workflowTransitionMatchedCount = ref<number | null>(null)
+const workflowTransitionForm = reactive({
+  all_segments: true,
+  range_start: 1,
+  range_end: 1,
+  from_step_id: '',
+  source_status: 'all' as 'all' | 'confirmed' | 'unconfirmed',
+  source_statuses: ['none', 'exact', 'fuzzy', 'confirmed'] as WorkflowSourceStatus[],
+  target_step_id: '',
+  target_status: 'unconfirmed' as 'confirmed' | 'unconfirmed',
+})
 
 // 富文本编辑相关
 const richTextEditor = useRichTextEditor()
@@ -401,7 +524,7 @@ const isOfficeFormat = computed(() => {
 function resolveItemHeight() {
   const stableGrid = Boolean(props.standalone)
   if (stableGrid && window.innerWidth > 1180) {
-    return 56
+    return 52
   }
   if (window.innerWidth <= 720) {
     return 276
@@ -413,7 +536,11 @@ function resolveItemHeight() {
 }
 
 function handleResize() {
+  viewportHeight.value = window.innerHeight
   itemHeight.value = resolveItemHeight()
+  if (bottomDrawerHeight.value !== null) {
+    setBottomDrawerHeight(bottomDrawerHeight.value)
+  }
 }
 
 function getErrorMessage(error: unknown, fallback: string) {
@@ -684,6 +811,55 @@ const ribbonStatusTitle = computed(() => (
 const activeSegment = computed(() => (
   segmentStore.segments.find((segment) => segment.sentence_id === segmentStore.activeSentenceId) ?? null
 ))
+const activeSegmentCanWrite = computed(() => Boolean(activeSegment.value?.can_write))
+const workflowSteps = computed(() => segmentStore.fileRecord?.workflow_steps || [])
+const workflowStepById = computed(() => new Map(workflowSteps.value.map((step) => [step.id, step])))
+const workflowTargetSteps = computed(() => {
+  const sourceStep = workflowStepById.value.get(workflowTransitionForm.from_step_id)
+  if (!sourceStep) return []
+  return workflowSteps.value.filter((step) => (
+    workflowTransitionDirection.value === 'forward'
+      ? step.sort_order > sourceStep.sort_order
+      : step.sort_order < sourceStep.sort_order
+  ))
+})
+const canOpenWorkflowTransition = computed(() => (
+  Boolean(activeSegment.value?.workflow_step_id)
+  && activeSegmentCanWrite.value
+  && workflowSteps.value.length > 1
+))
+const workflowSourceStatusOptions: Array<{ value: WorkflowSourceStatus; label: string }> = [
+  { value: 'none', label: '未翻译' },
+  { value: 'exact', label: '完全匹配' },
+  { value: 'fuzzy', label: '模糊匹配' },
+  { value: 'confirmed', label: '已确认' },
+]
+const workflowTransitionHasSourceStatus = computed(() => workflowTransitionForm.source_statuses.length > 0)
+
+function hasWorkflowTransitionTarget(direction: WorkflowTransitionDirection) {
+  const stepId = activeSegment.value?.workflow_step_id
+  const sourceStep = stepId ? workflowStepById.value.get(stepId) : null
+  if (!sourceStep || !activeSegmentCanWrite.value) return false
+  return workflowSteps.value.some((step) => (
+    direction === 'forward'
+      ? step.sort_order > sourceStep.sort_order
+      : step.sort_order < sourceStep.sort_order
+  ))
+}
+
+function isWorkflowSourceStatusChecked(status: WorkflowSourceStatus) {
+  return workflowTransitionForm.source_statuses.includes(status)
+}
+
+function toggleWorkflowSourceStatus(status: WorkflowSourceStatus, checked: boolean) {
+  if (checked) {
+    if (!workflowTransitionForm.source_statuses.includes(status)) {
+      workflowTransitionForm.source_statuses = [...workflowTransitionForm.source_statuses, status]
+    }
+    return
+  }
+  workflowTransitionForm.source_statuses = workflowTransitionForm.source_statuses.filter((item) => item !== status)
+}
 
 const activeSegmentHistory = computed(() => (
   segmentStore.activeSentenceId
@@ -1006,6 +1182,12 @@ const bottomToolButtons = computed(() => ([
 function isPreviewBottomTool(tool: BottomDrawerToolKey) {
   return tool === 'source-preview' || tool === 'target-preview' || tool === 'split-preview'
 }
+
+const isPreviewDrawerResizable = computed(() =>
+  activeBottomTool.value === 'source-preview'
+  || activeBottomTool.value === 'target-preview'
+  || activeBottomTool.value === 'split-preview',
+)
 
 function isBottomToolLoading(tool: BottomDrawerToolKey) {
   if (tool === 'source-preview') {
@@ -1576,11 +1758,20 @@ function updateSegmentTarget(
   options: { confirm?: boolean } = {},
 ) {
   const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
+  if (segment && !segment.can_write) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
   retainEmptyTargetSegmentDuringEdit(sentenceId, segment?.target_text)
   segmentStore.updateTarget(sentenceId, targetText, targetHtml, options)
 }
 
 async function updateSegmentSource(sentenceId: string, sourceText: string) {
+  const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
+  if (segment && !segment.can_write) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
   try {
     await segmentStore.updateSource(sentenceId, sourceText)
   } catch (error) {
@@ -1589,6 +1780,11 @@ async function updateSegmentSource(sentenceId: string, sourceText: string) {
 }
 
 async function toggleProjectSegmentSync(sentenceId: string, disabled: boolean) {
+  const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
+  if (segment && !segment.can_write) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
   await segmentStore.setProjectSyncDisabled(sentenceId, disabled)
 }
 
@@ -1749,6 +1945,10 @@ function confirmCurrentSentence() {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
     return
   }
+  if (!activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
   updateSegmentTarget(
     activeSegment.value.sentence_id,
     activeSegment.value.target_text || '',
@@ -1866,6 +2066,115 @@ function showRibbonPlaceholder(name: string) {
     message: t('workbench.ribbon.placeholderMessage', { name }),
   })
 }
+
+function buildWorkflowTransitionPayload() {
+  const sourceStatuses = [...workflowTransitionForm.source_statuses]
+  const hasConfirmed = sourceStatuses.includes('confirmed')
+  const hasUnconfirmed = sourceStatuses.some((item) => item !== 'confirmed')
+  return {
+    from_step_id: workflowTransitionForm.from_step_id,
+    target_step_id: workflowTransitionForm.target_step_id,
+    all_segments: workflowTransitionForm.all_segments,
+    range_start: Number(workflowTransitionForm.range_start || 1),
+    range_end: Number(workflowTransitionForm.range_end || workflowTransitionForm.range_start || 1),
+    source_status: hasConfirmed && hasUnconfirmed ? 'all' : hasConfirmed ? 'confirmed' : 'unconfirmed',
+    source_statuses: sourceStatuses,
+    target_status: workflowTransitionForm.target_status,
+  }
+}
+
+async function refreshWorkflowTransitionPreview() {
+  if (!segmentStore.fileRecord || !workflowTransitionForm.from_step_id || !workflowTransitionForm.target_step_id) {
+    workflowTransitionMatchedCount.value = null
+    return
+  }
+  workflowTransitionPreviewLoading.value = true
+  try {
+    const { data } = await http.post<{ matched_count: number }>(
+      `/file-records/${segmentStore.fileRecord.id}/workflow/transition/preview`,
+      buildWorkflowTransitionPayload(),
+    )
+    workflowTransitionMatchedCount.value = data.matched_count
+  } catch (error) {
+    workflowTransitionMatchedCount.value = null
+    toast.error(getErrorMessage(error, '流程预览失败'))
+  } finally {
+    workflowTransitionPreviewLoading.value = false
+  }
+}
+
+function openWorkflowTransitionDialog(direction: WorkflowTransitionDirection) {
+  if (!canOpenWorkflowTransition.value || !activeSegment.value) {
+    toast.warn('当前句段无可流转的编辑权限')
+    return
+  }
+  workflowTransitionDirection.value = direction
+  workflowTransitionForm.all_segments = true
+  workflowTransitionForm.range_start = 1
+  workflowTransitionForm.range_end = segmentStore.totalSegmentCount || 1
+  workflowTransitionForm.from_step_id = activeSegment.value.workflow_step_id || workflowSteps.value[0]?.id || ''
+  workflowTransitionForm.source_status = 'all'
+  workflowTransitionForm.source_statuses = ['none', 'exact', 'fuzzy', 'confirmed']
+  workflowTransitionForm.target_status = 'unconfirmed'
+  const target = workflowTargetSteps.value[direction === 'forward' ? 0 : workflowTargetSteps.value.length - 1]
+  if (!target) {
+    toast.warn(direction === 'forward' ? '没有可前进的目标流程' : '没有可退回的目标流程')
+    return
+  }
+  workflowTransitionForm.target_step_id = target?.id || ''
+  workflowTransitionMatchedCount.value = null
+  showWorkflowTransitionDialog.value = true
+  void refreshWorkflowTransitionPreview()
+}
+
+async function submitWorkflowTransition() {
+  if (!segmentStore.fileRecord || !workflowTransitionForm.target_step_id) {
+    return
+  }
+  workflowTransitionLoading.value = true
+  try {
+    await segmentStore.syncToBackend()
+    const { data } = await http.post<{ updated_count: number }>(
+      `/file-records/${segmentStore.fileRecord.id}/workflow/transition`,
+      buildWorkflowTransitionPayload(),
+    )
+    await segmentStore.refreshCurrentSegmentPage()
+    showWorkflowTransitionDialog.value = false
+    toast.success(`已流转 ${data.updated_count} 个句段`)
+  } catch (error) {
+    toast.error(getErrorMessage(error, '流程流转失败'))
+  } finally {
+    workflowTransitionLoading.value = false
+  }
+}
+
+watch(
+  () => [
+    showWorkflowTransitionDialog.value,
+    workflowTransitionForm.all_segments,
+    workflowTransitionForm.range_start,
+    workflowTransitionForm.range_end,
+    workflowTransitionForm.from_step_id,
+    workflowTransitionForm.source_statuses.join(','),
+    workflowTransitionForm.target_step_id,
+    workflowTransitionForm.target_status,
+  ],
+  () => {
+    if (showWorkflowTransitionDialog.value) {
+      void refreshWorkflowTransitionPreview()
+    }
+  },
+)
+
+watch(
+  () => [workflowTransitionDirection.value, workflowTransitionForm.from_step_id],
+  () => {
+    if (!showWorkflowTransitionDialog.value) return
+    if (!workflowTargetSteps.value.some((step) => step.id === workflowTransitionForm.target_step_id)) {
+      workflowTransitionForm.target_step_id = workflowTargetSteps.value[0]?.id || ''
+    }
+  },
+)
 
 function setCurrentTermQAReport(report: TermQAReport | null) {
   termQAReport.value = report
@@ -2209,11 +2518,15 @@ function trackSourceCaretPosition() {
 
 const canSplitSegment = computed(() => {
   if (!activeSegment.value) return false
-  return (activeSegment.value.source_text || '').length >= 2
+  return activeSegmentCanWrite.value && (activeSegment.value.source_text || '').length >= 2
 })
 
 const canMergeSegment = computed(() => {
-  return selectedSentenceIds.value.size >= 2
+  if (selectedSentenceIds.value.size < 2) return false
+  return Array.from(selectedSentenceIds.value).every((sentenceId) => {
+    const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
+    return Boolean(segment?.can_write)
+  })
 })
 
 async function handleSplitSegment() {
@@ -2475,12 +2788,20 @@ function toggleSourceEditing() {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
     return
   }
+  if (!activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
   sourceEditing.value = !sourceEditing.value
 }
 
 function copySourceToTarget() {
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+  if (!activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
     return
   }
 
@@ -2492,6 +2813,10 @@ function copySourceToTarget() {
 function clearActiveTarget() {
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+  if (!activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
     return
   }
 
@@ -2880,6 +3205,10 @@ async function handleSegmentPageSizeChange(size: number) {
 async function runLLMTranslation() {
   pageError.value = ''
   const currentSentenceId = activeSegment.value?.sentence_id || ''
+  if (llmScope.value === 'current_segment' && currentSentenceId && !activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
   if (llmScope.value === 'current_segment' && !currentSentenceId) {
     toast.warn('请先选中一个句段。')
     return
@@ -3429,6 +3758,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  stopBottomDrawerResize?.()
   window.removeEventListener('resize', handleResize)
   document.removeEventListener('click', handleClickOutside)
   document.removeEventListener('selectionchange', handleSelectionChange)
@@ -3588,7 +3918,7 @@ onBeforeRouteLeave(async () => {
             :disabled="confirmationActionLoading || segmentStore.totalSegmentCount === 0"
             :aria-expanded="openConfirmMenu"
             aria-haspopup="menu"
-            @click.stop="openConfirmMenu = false; void confirmAndMoveToNextUnconfirmed()"
+            @click.stop="toggleConfirmMenu"
           >
             <span class="tool-line line1 with-big-icon">
               <span class="icon-text-area has_dropdown">
@@ -3606,7 +3936,7 @@ onBeforeRouteLeave(async () => {
               data-testid="workbench-confirm-current"
               type="button"
               role="menuitem"
-              :disabled="confirmationActionLoading || !activeSegment"
+              :disabled="confirmationActionLoading || !activeSegmentCanWrite"
               @click="handleConfirmCurrentFromMenu"
             >
               确认当前句段
@@ -3615,7 +3945,7 @@ onBeforeRouteLeave(async () => {
               data-testid="workbench-confirm-next"
               type="button"
               role="menuitem"
-              :disabled="confirmationActionLoading || !activeSegment"
+              :disabled="confirmationActionLoading || !activeSegmentCanWrite"
               @click="openConfirmMenu = false; void confirmAndMoveToNextUnconfirmed()"
             >
               确认并跳到下一个
@@ -3644,7 +3974,7 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group">
           <span class="tool-col">
-            <button class="tool-line tool-button" type="button" :disabled="!activeSegment" @click="undoActiveSegmentEdit">
+            <button class="tool-line tool-button" type="button" :disabled="!activeSegmentCanWrite" @click="undoActiveSegmentEdit">
               <span class="icon-text-area">
                 <span class="tool-item">
                   <Undo2 class="tool-label-icon" :size="16" />
@@ -3652,7 +3982,7 @@ onBeforeRouteLeave(async () => {
                 </span>
               </span>
             </button>
-            <button class="tool-line tool-button" type="button" :disabled="!activeSegment" @click="redoActiveSegmentEdit">
+            <button class="tool-line tool-button" type="button" :disabled="!activeSegmentCanWrite" @click="redoActiveSegmentEdit">
               <span class="icon-text-area">
                 <span class="tool-item">
                   <Redo2 class="tool-label-icon" :size="16" />
@@ -3665,7 +3995,7 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group">
           <span class="tool-col align-left">
-            <button class="tool-line tool-button" type="button" :disabled="!activeSegment" @click="copySourceToTarget">
+            <button class="tool-line tool-button" type="button" :disabled="!activeSegmentCanWrite" @click="copySourceToTarget">
               <span class="icon-text-area has_dropdown">
                 <span class="tool-item">
                   <Copy class="tool-label-icon" :size="16" />
@@ -3676,7 +4006,7 @@ onBeforeRouteLeave(async () => {
                 <ChevronDown :size="11" />
               </span>
             </button>
-            <button class="tool-line tool-button" type="button" :disabled="!activeSegment" @click="clearActiveTarget">
+            <button class="tool-line tool-button" type="button" :disabled="!activeSegmentCanWrite" @click="clearActiveTarget">
               <span class="icon-text-area">
                 <span class="tool-item">
                   <X class="tool-label-icon" :size="16" />
@@ -3689,32 +4019,32 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group custom-style">
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.bold }" :disabled="!activeSegment" :title="t('workbench.ribbon.bold')" @mousedown.prevent @click="applyTextFormat('bold')">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.bold }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.bold')" @mousedown.prevent @click="applyTextFormat('bold')">
               <span class="icon-text-area"><span class="tool-item"><Bold class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.strikethrough }" :disabled="!activeSegment" :title="t('workbench.ribbon.strike')" @mousedown.prevent @click="applyTextFormat('strikethrough')">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.strikethrough }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.strike')" @mousedown.prevent @click="applyTextFormat('strikethrough')">
               <span class="icon-text-area"><span class="tool-item"><Strikethrough class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.italic }" :disabled="!activeSegment" :title="t('workbench.ribbon.italic')" @mousedown.prevent @click="applyTextFormat('italic')">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.italic }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.italic')" @mousedown.prevent @click="applyTextFormat('italic')">
               <span class="icon-text-area"><span class="tool-item"><Italic class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.superscript }" :disabled="!activeSegment" :title="t('workbench.ribbon.superscript')" @mousedown.prevent @click="applyTextFormat('superscript')">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.superscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.superscript')" @mousedown.prevent @click="applyTextFormat('superscript')">
               <span class="icon-text-area"><span class="tool-item"><Superscript class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.underline }" :disabled="!activeSegment" :title="t('workbench.ribbon.underline')" @mousedown.prevent @click="applyTextFormat('underline')">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.underline }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.underline')" @mousedown.prevent @click="applyTextFormat('underline')">
               <span class="icon-text-area"><span class="tool-item"><Underline class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.subscript }" :disabled="!activeSegment" :title="t('workbench.ribbon.subscript')" @mousedown.prevent @click="applyTextFormat('subscript')">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.subscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.subscript')" @mousedown.prevent @click="applyTextFormat('subscript')">
               <span class="icon-text-area"><span class="tool-item"><Subscript class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
             <div class="case-menu">
-              <button class="tool-line style-item tool-button" type="button" :disabled="!activeSegment" :title="t('workbench.ribbon.caseChange')" @mousedown.prevent @click.stop="showCaseMenu = !showCaseMenu">
+              <button class="tool-line style-item tool-button" type="button" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.caseChange')" @mousedown.prevent @click.stop="showCaseMenu = !showCaseMenu">
                 <span class="icon-text-area has_dropdown"><span class="tool-item"><Type class="tool-label-icon" :size="15" /></span></span>
                 <span class="dropdown-link" aria-hidden="true">
                   <ChevronDown :size="10" />
@@ -3727,8 +4057,8 @@ onBeforeRouteLeave(async () => {
                 <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('sentence')">{{ t('workbench.ribbon.caseSentence') }}</button>
               </div>
             </div>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :disabled="!activeSegment" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
-              <span class="icon-text-area"><span class="tool-item"><Sigma class="tool-label-icon" :size="15" /></span></span>
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
+              <span class="icon-text-area"><span class="tool-item"><Pilcrow class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
         </div>
@@ -3738,7 +4068,7 @@ onBeforeRouteLeave(async () => {
             <button
               class="tool-col tool-col--big tool-button clear-format-menu__main"
               type="button"
-              :disabled="!activeSegment"
+              :disabled="!activeSegmentCanWrite"
               @mousedown.prevent
               @click="clearSelectedFormat"
             >
@@ -3752,7 +4082,7 @@ onBeforeRouteLeave(async () => {
             <button
               class="clear-format-menu__toggle"
               type="button"
-              :disabled="!activeSegment"
+              :disabled="!activeSegmentCanWrite"
               @click.stop="showClearFormatMenu = !showClearFormatMenu"
             >
               <ChevronDown :size="12" />
@@ -3978,15 +4308,25 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group">
           <span class="tool-col align-left">
-            <button class="tool-line tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.workflowForward'))">
+            <button
+              class="tool-line tool-button"
+              type="button"
+              :disabled="!canOpenWorkflowTransition || !hasWorkflowTransitionTarget('forward')"
+              @click="openWorkflowTransitionDialog('forward')"
+            >
               <span class="icon-text-area">
-                <span class="tool-item disabled">
+                <span class="tool-item">
                   <ArrowRight class="tool-label-icon" :size="16" />
                   <span class="text">{{ t('workbench.ribbon.workflowForward') }}</span>
                 </span>
               </span>
             </button>
-            <button class="tool-line tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.workflowBack'))">
+            <button
+              class="tool-line tool-button"
+              type="button"
+              :disabled="!canOpenWorkflowTransition || !hasWorkflowTransitionTarget('back')"
+              @click="openWorkflowTransitionDialog('back')"
+            >
               <span class="icon-text-area has_dropdown">
                 <span class="tool-item">
                   <ArrowLeft class="tool-label-icon" :size="16" />
@@ -4512,6 +4852,8 @@ onBeforeRouteLeave(async () => {
               <span>句段</span>
               <span>原文</span>
               <span>译文</span>
+              <span>状态</span>
+              <span>阶段</span>
             </div>
 
             <div class="segment-editor-list-stage">
@@ -4541,6 +4883,7 @@ onBeforeRouteLeave(async () => {
                     :segment="item"
                     :index="getEditorSegmentDisplayIndex(item.sentence_id, index)"
                     :active="segmentStore.activeSentenceId === item.sentence_id"
+                    :disabled="!item.can_write"
                     :source-editing="sourceEditing"
                     :selected="selectedSentenceIds.has(item.sentence_id)"
                     :pending-revision="revisionTraceVisible ? segmentStore.getRevisionTrace(item.sentence_id) : null"
@@ -4628,17 +4971,36 @@ onBeforeRouteLeave(async () => {
           <Transition name="workbench-bottom-drawer">
             <section
               v-if="activeBottomTool"
+              ref="bottomDrawerRef"
               class="workbench-bottom-drawer"
               :class="[
                 `workbench-bottom-drawer--${activeBottomTool}`,
                 {
                   'is-wide': activeBottomTool === 'split-preview' || activeBottomTool === 'qa-result',
                   'is-loading': bottomDrawerPreviewBusy,
+                  'is-resizable': isPreviewDrawerResizable,
+                  'is-resizing': isBottomDrawerResizing,
                 },
               ]"
+              :style="isPreviewDrawerResizable ? bottomDrawerHeightStyle : undefined"
               :aria-busy="bottomDrawerPreviewBusy"
               @keydown.esc.stop="closeBottomDrawer"
             >
+              <div
+                v-if="isPreviewDrawerResizable"
+                class="workbench-bottom-drawer__resize-handle"
+                role="separator"
+                tabindex="0"
+                title="拖动调整预览高度"
+                aria-label="拖动调整预览高度"
+                aria-orientation="horizontal"
+                :aria-valuemin="BOTTOM_DRAWER_MIN_HEIGHT"
+                :aria-valuemax="bottomDrawerMaxHeight"
+                :aria-valuenow="bottomDrawerResizeValue"
+                @pointerdown="startBottomDrawerResize"
+                @keydown="handleBottomDrawerResizeKeydown"
+              />
+
               <button
                 v-if="activeBottomTool === 'history'"
                 class="workbench-bottom-drawer__close"
@@ -5075,6 +5437,90 @@ onBeforeRouteLeave(async () => {
     />
 
     <Modal
+      :open="showWorkflowTransitionDialog"
+      :title="workflowTransitionDirection === 'forward' ? '前进句段' : '退回句段'"
+      width="min(720px, calc(100vw - 32px))"
+      :close-on-overlay="!workflowTransitionLoading"
+      :close-on-esc="!workflowTransitionLoading"
+      @close="showWorkflowTransitionDialog = false"
+    >
+      <div class="workflow-transition-dialog">
+        <div class="workflow-transition-grid">
+          <label class="field">
+            <span class="field__label">句段范围</span>
+            <input v-model.number="workflowTransitionForm.range_start" class="field__control" type="number" min="1" :disabled="workflowTransitionForm.all_segments" />
+          </label>
+          <label class="field">
+            <span class="field__label">&nbsp;</span>
+            <input v-model.number="workflowTransitionForm.range_end" class="field__control" type="number" min="1" :disabled="workflowTransitionForm.all_segments" />
+          </label>
+          <label class="workflow-transition-check">
+            <input v-model="workflowTransitionForm.all_segments" type="checkbox" />
+            <span>全部句段</span>
+          </label>
+
+          <label class="field">
+            <span class="field__label">当前流程</span>
+            <select v-model="workflowTransitionForm.from_step_id" class="field__control">
+              <option v-for="step in workflowSteps" :key="step.id" :value="step.id">{{ step.name }}</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field__label">当前状态</span>
+            <div class="workflow-source-statuses">
+              <label
+                v-for="option in workflowSourceStatusOptions"
+                :key="option.value"
+                class="workflow-source-status"
+              >
+                <input
+                  type="checkbox"
+                  :checked="isWorkflowSourceStatusChecked(option.value)"
+                  @change="toggleWorkflowSourceStatus(option.value, ($event.target as HTMLInputElement).checked)"
+                />
+                <span>{{ option.label }}</span>
+              </label>
+            </div>
+          </label>
+
+          <label class="field">
+            <span class="field__label">目标流程</span>
+            <select v-model="workflowTransitionForm.target_step_id" class="field__control">
+              <option v-for="step in workflowTargetSteps" :key="step.id" :value="step.id">{{ step.name }}</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field__label">目标状态</span>
+            <select v-model="workflowTransitionForm.target_status" class="field__control">
+              <option value="unconfirmed">未确认</option>
+              <option value="confirmed">已确认</option>
+            </select>
+          </label>
+        </div>
+        <p class="workflow-transition-count">
+          {{ workflowTransitionPreviewLoading ? '正在查询命中句段...' : `已查询出 ${workflowTransitionMatchedCount ?? 0} 个句段` }}
+        </p>
+      </div>
+
+      <template #footer>
+        <button class="button" type="button" :disabled="workflowTransitionLoading" @click="showWorkflowTransitionDialog = false">
+          {{ t('common.actions.cancel') }}
+        </button>
+        <button
+          class="button button--primary"
+          type="button"
+          :disabled="workflowTransitionLoading || !workflowTransitionForm.target_step_id || !workflowTransitionHasSourceStatus || (workflowTransitionMatchedCount ?? 0) === 0"
+          @click="void submitWorkflowTransition()"
+        >
+          <Loader2 v-if="workflowTransitionLoading" class="lucide-spin" :size="14" />
+          <ArrowRight v-else-if="workflowTransitionDirection === 'forward'" :size="14" />
+          <ArrowLeft v-else :size="14" />
+          {{ workflowTransitionDirection === 'forward' ? '前进句段' : '退回句段' }}
+        </button>
+      </template>
+    </Modal>
+
+    <Modal
       :open="showAddTermDialog"
       title="添加术语"
       :description="segmentStore.fileRecord?.filename || ''"
@@ -5320,7 +5766,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-page.is-stable-grid .segment-editor-results {
-  --segment-editor-grid-template: 92px minmax(320px, 1fr) minmax(360px, 1fr);
+  --segment-editor-grid-template: 64px minmax(320px, 1fr) minmax(360px, 1fr) 70px 72px;
   --virtual-list-inline-end-gap: 0;
 }
 
@@ -6601,6 +7047,53 @@ onBeforeRouteLeave(async () => {
   opacity: 0.52;
 }
 
+.workflow-transition-dialog {
+  display: grid;
+  gap: 14px;
+}
+
+.workflow-transition-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+  align-items: end;
+  gap: 12px;
+}
+
+.workflow-transition-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.workflow-source-statuses {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  min-height: 38px;
+  padding: 7px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-panel);
+}
+
+.workflow-source-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.workflow-transition-count {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
 .workbench-search-panel__badge {
   display: inline-flex;
   align-items: center;
@@ -6654,7 +7147,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .segment-editor-results {
-  --segment-editor-grid-template: 128px minmax(0, 1fr) minmax(0, 1fr);
+  --segment-editor-grid-template: 72px minmax(0, 1fr) minmax(0, 1fr) 76px 76px;
   --segment-editor-scrollbar-gutter: 12px;
   --virtual-list-inline-end-gap: 4px;
   display: grid;
@@ -7122,6 +7615,57 @@ onBeforeRouteLeave(async () => {
   box-shadow: 0 18px 40px rgba(24, 48, 58, 0.18);
 }
 
+.workbench-bottom-drawer.is-resizable {
+  padding-top: 8px;
+  border-top-color: #9eb9c4;
+}
+
+.workbench-bottom-drawer.is-resizing {
+  border-top-color: #0070c0;
+}
+
+.workbench-bottom-drawer__resize-handle {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  z-index: 10;
+  height: 12px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: ns-resize;
+  touch-action: none;
+}
+
+.workbench-bottom-drawer__resize-handle::before {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 50%;
+  width: 74px;
+  height: 4px;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  background: #a9bec7;
+  opacity: 0.85;
+  transition:
+    background-color 140ms ease,
+    opacity 140ms ease;
+}
+
+.workbench-bottom-drawer__resize-handle:hover::before,
+.workbench-bottom-drawer__resize-handle:focus-visible::before,
+.workbench-bottom-drawer.is-resizing .workbench-bottom-drawer__resize-handle::before {
+  background: #0070c0;
+  opacity: 1;
+}
+
+.workbench-bottom-drawer__resize-handle:focus-visible {
+  outline: 2px solid rgba(0, 112, 192, 0.28);
+  outline-offset: -2px;
+}
+
 .workbench-bottom-drawer.is-wide {
   height: var(--workbench-visible-bottom-panel-height);
 }
@@ -7268,11 +7812,85 @@ onBeforeRouteLeave(async () => {
   min-height: 0;
   border: 0;
   border-radius: 0;
+  gap: 8px;
+  padding: 8px 12px 12px;
   box-shadow: none;
 }
 
-.workbench-bottom-drawer :deep(.preview-panel__viewport) {
+.workbench-bottom-drawer :deep(.preview-panel__header),
+.workbench-bottom-drawer :deep(.split-preview__header) {
+  align-items: center;
+  min-height: 32px;
+  gap: 8px;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel__header > div:first-child),
+.workbench-bottom-drawer :deep(.split-preview__header > div:first-child) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 10px;
+  max-width: min(560px, 48vw);
+}
+
+.workbench-bottom-drawer :deep(.preview-panel__header .section-title),
+.workbench-bottom-drawer :deep(.split-preview__header .section-title) {
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel__meta) {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.workbench-bottom-drawer :deep(.split-preview__header .panel-subtitle) {
+  display: none;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel__zoom-button) {
+  width: 26px;
+  height: 26px;
+  min-height: 26px;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel__zoom-value) {
+  min-width: 42px;
+  height: 26px;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel__close) {
+  min-height: 30px;
+  padding: 4px 10px;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel--drawer) {
+  position: relative;
+  display: block;
+  gap: 0;
+  overflow: hidden;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel--drawer .preview-panel__header) {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  left: 12px;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel--drawer .preview-panel__header > *) {
+  pointer-events: auto;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel--drawer .preview-panel__viewport) {
   height: 100%;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel__viewport) {
+  height: auto;
   min-height: 0;
 }
 
@@ -7283,7 +7901,8 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-bottom-drawer :deep(.split-preview__layout) {
-  height: 100%;
+  flex: 1;
+  height: auto;
   min-height: 0;
 }
 

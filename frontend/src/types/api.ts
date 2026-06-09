@@ -88,6 +88,26 @@ export interface AnalyticsDashboardResponse {
   user_stats: AnalyticsUserStat[]
 }
 
+export interface WorkflowStep {
+  id: string
+  step_key: string
+  name: string
+  step_type: string
+  sort_order: number
+}
+
+export interface WorkflowTemplate {
+  id: string
+  name: string
+  steps: Array<Omit<WorkflowStep, 'id'> & { id?: string }>
+}
+
+export interface WorkflowProgress extends WorkflowStep {
+  total_segments: number
+  completed_segments: number
+  progress: number
+}
+
 export interface FileRecordSummary {
   id: string
   project_id?: string | null
@@ -114,6 +134,8 @@ export interface FileRecordSummary {
   assignee?: User | null
   assignees?: User[]
   assigned_at?: string | null
+  workflow_steps?: WorkflowStep[]
+  workflow_progress?: WorkflowProgress[]
   can_manage?: boolean
   can_write?: boolean
   created_at: string
@@ -123,8 +145,11 @@ export interface FileRecordSummary {
 
 export interface ProjectAssignmentItem {
   id: string
+  project_assignment_id?: string
   assignee_id: string
   assignee: User
+  workflow_step_id?: string
+  workflow_step?: WorkflowStep | null
   file_record_ids: string[]
   assigned_by_id: string | null
   assigned_at: string
@@ -132,12 +157,14 @@ export interface ProjectAssignmentItem {
 
 export interface ProjectAssignmentsResponse {
   project_id: string
+  workflow_steps?: WorkflowStep[]
   assignments: ProjectAssignmentItem[]
 }
 
 export interface ProjectAssignmentPayload {
   assignments: Array<{
     assignee_id: string
+    workflow_step_id?: string
     file_record_ids: string[]
   }>
 }
@@ -357,6 +384,10 @@ export interface Segment {
   block_index: number
   row_index?: number | null
   cell_index?: number | null
+  workflow_step_id?: string | null
+  workflow_step_name?: string | null
+  workflow_step_order?: number | null
+  can_write?: boolean
   updated_at: string | null
 }
 
@@ -403,6 +434,10 @@ export interface FileRecordDetail {
   source_extension: string
   has_source_document: boolean
   can_export: boolean
+  can_manage?: boolean
+  can_write?: boolean
+  workflow_steps?: WorkflowStep[]
+  workflow_progress?: WorkflowProgress[]
   issue_count: number
   open_issue_count: number
   status_stats: SegmentStatusStats

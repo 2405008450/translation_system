@@ -106,6 +106,7 @@ const sourceLabel = computed(() => {
   }
   return sourceMeta.value.label
 })
+const workflowLabel = computed(() => props.segment.workflow_step_name || '翻译')
 const showStatusTag = computed(() => {
   const status = props.segment.status || 'none'
   return status !== 'none' && status !== 'fuzzy'
@@ -852,6 +853,9 @@ function handleClick(event?: MouseEvent) {
 }
 
 function handleProjectSyncToggle() {
+  if (props.disabled) {
+    return
+  }
   emit('toggleProjectSync', props.segment.sentence_id, !props.segment.project_sync_disabled)
 }
 
@@ -865,7 +869,7 @@ function handleSourceBlur() {
 
 function handleSourceInput() {
   if (!sourceEditorRef.value) return
-  if (!props.sourceEditing) {
+  if (!props.sourceEditing || props.disabled) {
     // 非编辑模式下恢复原文内容
     syncSourceEditorFromState(true)
     return
@@ -875,7 +879,7 @@ function handleSourceInput() {
 }
 
 function handleSourceBeforeInput(event: Event) {
-  if (!props.sourceEditing) {
+  if (!props.sourceEditing || props.disabled) {
     event.preventDefault()
   }
 }
@@ -1428,29 +1432,7 @@ watch(
     :aria-label="`segment ${index + 1}`"
   >
     <div class="segment-row__meta">
-      <span class="segment-row__index">#{{ index + 1 }}</span>
-      <span v-if="showStatusTag" class="segment-row__tag segment-row__tag--status">{{ statusMeta.label }}</span>
-      <span v-if="showSourceTag" class="segment-row__tag is-muted" :class="sourceClass" :title="sourceTitle">{{ sourceLabel }}</span>
-      <button
-        v-if="showProjectSyncToggle"
-        class="segment-row__sync-toggle"
-        type="button"
-        :aria-pressed="!segment.project_sync_disabled"
-        @click.stop="handleProjectSyncToggle"
-      >
-        {{ projectSyncToggleLabel }}
-      </button>
-      <span v-if="scorePercent !== null" class="segment-row__tag segment-row__tag--score">
-        {{ scorePercent }}%
-      </span>
-      <span
-        v-if="hasPendingRevision"
-        class="segment-row__tag segment-row__tag--revision"
-        data-testid="segment-revision-tag"
-        :title="`修订来源：${revisionSourceMeta.label}`"
-      >
-        待审核
-      </span>
+      <span class="segment-row__index">{{ index + 1 }}</span>
     </div>
 
     <div class="segment-row__cell segment-row__cell--source" @click="handleClick">
@@ -1459,7 +1441,7 @@ watch(
         ref="sourceEditorRef"
         class="segment-row__source-editor"
         :class="{ 'is-focused': isSourceFocused, 'is-readonly': !sourceEditing }"
-        :contenteditable="true"
+        :contenteditable="sourceEditing && !disabled"
         tabindex="0"
         spellcheck="false"
         @focus="handleSourceFocus"
@@ -1524,6 +1506,48 @@ watch(
       />
       </div>
     </div>
+
+    <div class="segment-row__cell segment-row__cell--state" :title="statusMeta.label">
+      <span
+        v-if="segment.status === 'confirmed'"
+        class="segment-row__confirm-mark"
+        aria-label="已确认"
+      >√</span>
+      <span v-if="scorePercent !== null" class="segment-row__match-rate">
+        {{ scorePercent }}%
+      </span>
+      <span
+        v-if="showStatusTag && segment.status !== 'confirmed' && scorePercent === null"
+        class="segment-row__compact-tag segment-row__compact-tag--status"
+      >
+        {{ statusMeta.label }}
+      </span>
+      <span v-if="showSourceTag" class="segment-row__compact-tag" :class="sourceClass" :title="sourceTitle">
+        {{ sourceLabel }}
+      </span>
+      <button
+        v-if="showProjectSyncToggle"
+        class="segment-row__sync-toggle"
+        type="button"
+        :aria-pressed="!segment.project_sync_disabled"
+        :disabled="disabled"
+        @click.stop="handleProjectSyncToggle"
+      >
+        {{ projectSyncToggleLabel }}
+      </button>
+      <span
+        v-if="hasPendingRevision"
+        class="segment-row__compact-tag segment-row__tag--revision"
+        data-testid="segment-revision-tag"
+        :title="`修订来源：${revisionSourceMeta.label}`"
+      >
+        待审校
+      </span>
+    </div>
+
+    <div class="segment-row__cell segment-row__cell--workflow">
+      <span class="segment-row__workflow-label">{{ workflowLabel }}</span>
+    </div>
   </article>
 </template>
 
@@ -1537,6 +1561,83 @@ watch(
 
 .segment-row__cell--target.is-pending {
   box-shadow: inset 2px 0 0 rgba(0, 122, 204, 0.36);
+}
+
+.segment-row__cell--state,
+.segment-row__cell--workflow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 0;
+  padding: 6px 4px;
+  border-left: 1px solid rgba(214, 226, 222, 0.9);
+  background:
+    linear-gradient(0deg, var(--segment-cell-stripe, transparent), var(--segment-cell-stripe, transparent)),
+    rgba(248, 250, 252, 0.92);
+  color: var(--text-primary);
+}
+
+.segment-row__cell--state {
+  flex-direction: column;
+  gap: 3px;
+}
+
+.segment-row__cell--workflow {
+  color: #1f4f7a;
+  font-size: 0;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.segment-row__workflow-label {
+  font-size: 13px;
+}
+
+.segment-row__confirm-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  min-height: 18px;
+  color: #4fa873;
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.segment-row__match-rate {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 18px;
+  padding: 0 4px;
+  border-radius: 2px;
+  background: #4fa873;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.segment-row__compact-tag {
+  max-width: 100%;
+  min-height: 16px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(232, 239, 241, 0.96);
+  color: #556d72;
+  font-size: 10px;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.segment-row__compact-tag--status {
+  color: #0d726b;
+  background: rgba(223, 241, 239, 0.96);
 }
 
 .segment-row__editor-shell {

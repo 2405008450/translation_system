@@ -30,7 +30,7 @@ import { useToast } from '../composables/useToast'
 import { formatLanguagePair } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
-import type { IssueMarker, User } from '../types/api'
+import type { IssueMarker, User, WorkflowProgress, WorkflowStep, WorkflowTemplate } from '../types/api'
 import { useAuthStore } from '../stores/auth'
 
 interface ProjectItem {
@@ -47,6 +47,8 @@ interface ProjectItem {
   confirmed_segments: number
   pretranslated_segments: number
   pretranslation_progress: number
+  workflow_steps?: WorkflowStep[]
+  workflow_progress?: WorkflowProgress[]
   source_language: string | null
   target_language: string | null
   creator: string | null
@@ -82,6 +84,12 @@ interface ProjectDetailResponse extends ProjectItem {
   files: ProjectFileItem[]
 }
 
+interface EditableWorkflowStep {
+  step_key: string
+  name: string
+  step_type: string
+}
+
 const confirm = useConfirm()
 const toast = useToast()
 const router = useRouter()
@@ -111,11 +119,15 @@ const duplicateError = ref('')
 const duplicateTemplates = ref<ProjectItem[]>([])
 const duplicateTemplateProjectId = ref('')
 const duplicateTemplateDetail = ref<ProjectDetailResponse | null>(null)
+const workflowTemplates = ref<WorkflowTemplate[]>([])
+const loadingWorkflowTemplates = ref(false)
 
 const defaultForm = () => ({
   name: '',
   deadline: '',
   access_level: 'team' as 'team' | 'private' | 'public',
+  workflow_template_id: '',
+  workflow_steps: [] as EditableWorkflowStep[],
 })
 
 const form = reactive(defaultForm())
@@ -133,6 +145,13 @@ const accessOptions = computed(() => ([
   { value: 'private', label: t('projectList.form.private') },
   { value: 'public', label: t('projectList.form.public') },
 ]))
+const canSubmitCreate = computed(() => (
+  !creating.value
+  && Boolean(form.name.trim())
+  && Boolean(form.workflow_template_id)
+  && form.workflow_steps.length > 0
+  && form.workflow_steps.every((step) => step.name.trim())
+))
 
 const columns = computed<DataTableColumn[]>(() => ([
   { key: 'filename', label: t('common.actions.details'), width: '320px', sortable: true },
@@ -166,6 +185,59 @@ const selectedDuplicateTemplate = computed(() => (
   duplicateTemplates.value.find((project) => project.id === duplicateTemplateProjectId.value) || null
 ))
 const duplicateTemplateFileCount = computed(() => duplicateTemplateDetail.value?.files.length ?? 0)
+
+function normalizeWorkflowStepKey(value: string, index: number) {
+  const normalized = value.trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '')
+  return normalized || (index === 0 ? 'translate' : `step_${index + 1}`)
+}
+
+function cloneWorkflowSteps(template: WorkflowTemplate): EditableWorkflowStep[] {
+  return template.steps.map((step, index) => ({
+    step_key: index === 0 ? 'translate' : normalizeWorkflowStepKey(step.step_key || '', index),
+    name: index === 0 ? '翻译' : step.name,
+    step_type: index === 0 ? 'translation' : (step.step_type || 'custom'),
+  }))
+}
+
+async function loadWorkflowTemplates() {
+  if (workflowTemplates.value.length > 0 || loadingWorkflowTemplates.value) {
+    return
+  }
+  loadingWorkflowTemplates.value = true
+  try {
+    const { data } = await http.get<{ items: WorkflowTemplate[] }>('/workflow-templates')
+    workflowTemplates.value = data.items || []
+  } catch (error) {
+    formError.value = getProjectListError(error, '工作流模板加载失败')
+  } finally {
+    loadingWorkflowTemplates.value = false
+  }
+}
+
+function handleWorkflowTemplateChange() {
+  const template = workflowTemplates.value.find((item) => item.id === form.workflow_template_id)
+  form.workflow_steps = template ? cloneWorkflowSteps(template) : []
+}
+
+function addWorkflowStep() {
+  const index = form.workflow_steps.length
+  form.workflow_steps.push({
+    step_key: `step_${index + 1}`,
+    name: `阶段 ${index + 1}`,
+    step_type: 'custom',
+  })
+}
+
+function removeWorkflowStep(index: number) {
+  if (index <= 0) {
+    return
+  }
+  form.workflow_steps.splice(index, 1)
+}
+
+function getWorkflowProgressItems(row: ProjectItem) {
+  return row.workflow_progress || []
+}
 
 function isProjectAssignedToCurrentUser(project: ProjectItem) {
   const currentUserId = authStore.user?.id
@@ -221,6 +293,7 @@ function resetForm() {
 function openCreateDialog() {
   resetForm()
   showCreateDialog.value = true
+  void loadWorkflowTemplates()
 }
 
 async function createProject() {
@@ -228,6 +301,15 @@ async function createProject() {
     formError.value = t('projectList.errors.requiredName')
     return
   }
+  if (!form.workflow_template_id || form.workflow_steps.length === 0) {
+    formError.value = '请选择工作流模板'
+    return
+  }
+  const workflowSteps = form.workflow_steps.map((step, index) => ({
+    step_key: index === 0 ? 'translate' : normalizeWorkflowStepKey(step.step_key, index),
+    name: index === 0 ? '翻译' : step.name.trim(),
+    step_type: index === 0 ? 'translation' : (step.step_type || 'custom'),
+  }))
 
   creating.value = true
   formError.value = ''
@@ -236,6 +318,8 @@ async function createProject() {
       name: form.name.trim(),
       deadline: form.deadline || null,
       access_level: form.access_level,
+      workflow_template_id: form.workflow_template_id,
+      workflow_steps: workflowSteps,
     })
     showCreateDialog.value = false
     resetForm()
@@ -515,6 +599,7 @@ watch([currentPage, pageSize], () => {
 
 onMounted(() => {
   void loadProjects()
+  void loadWorkflowTemplates()
 })
 </script>
 
@@ -627,7 +712,24 @@ onMounted(() => {
         </template>
 
         <template #progress="{ row }">
-          <div class="progress-bar">
+          <div v-if="getWorkflowProgressItems(row as ProjectItem).length > 0" class="workflow-progress-mini">
+            <div
+              v-for="item in getWorkflowProgressItems(row as ProjectItem)"
+              :key="item.id"
+              class="workflow-progress-mini__item"
+            >
+              <span class="workflow-progress-mini__label">{{ item.name }}</span>
+              <div class="progress-bar__track">
+                <div
+                  class="progress-bar__fill"
+                  :class="{ 'is-complete': isProgressComplete(item.progress) }"
+                  :style="getProgressStyle(item.progress, row.status)"
+                />
+              </div>
+              <span class="workflow-progress-mini__value">{{ item.progress }}%</span>
+            </div>
+          </div>
+          <div v-else class="progress-bar">
             <div class="progress-bar__track">
               <div
                 class="progress-bar__fill"
@@ -749,6 +851,51 @@ onMounted(() => {
             </option>
           </select>
         </label>
+
+        <label class="field field--full">
+          <span class="field__label">工作流模板 <span class="field__required">*</span></span>
+          <select
+            v-model="form.workflow_template_id"
+            class="field__control"
+            data-testid="project-create-workflow-template"
+            :disabled="loadingWorkflowTemplates"
+            @change="handleWorkflowTemplateChange"
+          >
+            <option value="" disabled>{{ loadingWorkflowTemplates ? '模板加载中...' : '请选择工作流模板' }}</option>
+            <option v-for="template in workflowTemplates" :key="template.id" :value="template.id">
+              {{ template.name }}
+            </option>
+          </select>
+        </label>
+
+        <div v-if="form.workflow_steps.length > 0" class="workflow-editor field--full">
+          <div
+            v-for="(step, index) in form.workflow_steps"
+            :key="`${step.step_key}-${index}`"
+            class="workflow-editor__row"
+          >
+            <span class="workflow-editor__order">{{ index + 1 }}</span>
+            <input
+              v-model="step.name"
+              class="field__control"
+              type="text"
+              :disabled="index === 0"
+              maxlength="80"
+            />
+            <button
+              v-if="index > 0"
+              class="button button--ghost workflow-editor__remove"
+              type="button"
+              @click="removeWorkflowStep(index)"
+            >
+              删除
+            </button>
+          </div>
+          <button class="button button--ghost workflow-editor__add" type="button" @click="addWorkflowStep">
+            <Plus :size="14" />
+            添加阶段
+          </button>
+        </div>
       </div>
 
       <p class="form-hint">
@@ -763,7 +910,7 @@ onMounted(() => {
           class="button button--primary"
           data-testid="project-create-submit"
           type="button"
-          :disabled="creating"
+          :disabled="!canSubmitCreate"
           @click="createProject"
         >
           <Loader2 v-if="creating" class="lucide-spin" :size="14" />
@@ -1037,6 +1184,66 @@ onMounted(() => {
   margin: 12px 0 0;
   color: var(--text-muted);
   font-size: 13px;
+}
+
+.workflow-progress-mini {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.workflow-progress-mini__item {
+  display: grid;
+  grid-template-columns: minmax(34px, 48px) minmax(42px, 1fr) 34px;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.workflow-progress-mini__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workflow-progress-mini__value {
+  text-align: right;
+  color: var(--text-muted);
+}
+
+.workflow-editor {
+  display: grid;
+  gap: 8px;
+}
+
+.workflow-editor__row {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.workflow-editor__order {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.workflow-editor__remove {
+  padding-inline: 10px;
+}
+
+.workflow-editor__add {
+  justify-self: start;
 }
 
 .duplicate-dialog {

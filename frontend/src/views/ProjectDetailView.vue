@@ -82,6 +82,8 @@ import type {
   UploadCapabilitiesResponse,
   UploadCapability,
   User,
+  WorkflowProgress,
+  WorkflowStep,
 } from '../types/api'
 
 const props = defineProps<{
@@ -117,6 +119,8 @@ interface ProjectDetail {
   confirmed_segments: number
   pretranslated_segments: number
   pretranslation_progress: number
+  workflow_steps?: WorkflowStep[]
+  workflow_progress?: WorkflowProgress[]
   source_language: string | null
   target_language: string | null
   creator: string | null
@@ -154,6 +158,8 @@ interface ProjectFileItem {
   confirmed_segments: number
   pretranslated_segments: number
   pretranslation_progress: number
+  workflow_steps?: WorkflowStep[]
+  workflow_progress?: WorkflowProgress[]
   source_language: string | null
   target_language: string | null
   creator: string | null
@@ -183,6 +189,7 @@ interface ProjectFileItem {
 
 interface AssignmentDraft {
   assignee_id: string
+  workflow_step_id: string
   file_record_ids: Set<string>
 }
 
@@ -354,6 +361,7 @@ const loadingAssignableUsers = ref(false)
 const loadingAssignments = ref(false)
 const savingAssignment = ref(false)
 const assignmentDrafts = ref<AssignmentDraft[]>([])
+const activeAssignmentWorkflowStepId = ref('')
 const assignmentUserSearch = ref('')
 const assignmentUserTypeFilter = ref<AssignmentUserTypeFilter>('all')
 const assignmentUserStateFilter = ref<AssignmentUserStateFilter>('all')
@@ -418,6 +426,13 @@ const tabs = computed(() => ([
   { key: 'quote' as const, label: t('projectDetail.tabs.quote'), disabled: true },
 ]))
 const tableRows = computed<ProjectFileItem[]>(() => project.value?.files ?? [])
+const projectWorkflowSteps = computed<WorkflowStep[]>(() => project.value?.workflow_steps ?? [])
+const activeAssignmentWorkflowStep = computed(() => (
+  projectWorkflowSteps.value.find((step) => step.id === activeAssignmentWorkflowStepId.value) ?? projectWorkflowSteps.value[0] ?? null
+))
+const activeAssignmentDrafts = computed(() => (
+  assignmentDrafts.value.filter((draft) => draft.workflow_step_id === activeAssignmentWorkflowStepId.value)
+))
 const issueMarkers = computed<IssueMarker[]>(() => project.value?.issue_markers ?? [])
 const openIssueCount = computed(() => issueMarkers.value.filter((marker) => marker.status === 'open').length)
 const actionMenuRow = computed<ProjectFileItem | null>(() => {
@@ -705,6 +720,14 @@ function formatDateText(value: string | null) {
 
 function getAssigneeDisplayName(user: User | null | undefined) {
   return user?.nickname || user?.username || ''
+}
+
+function ensureActiveAssignmentWorkflowStep() {
+  if (activeAssignmentWorkflowStep.value) {
+    activeAssignmentWorkflowStepId.value = activeAssignmentWorkflowStep.value.id
+    return
+  }
+  activeAssignmentWorkflowStepId.value = projectWorkflowSteps.value[0]?.id ?? ''
 }
 
 function getAssigneeLabel(row: ProjectRow) {
@@ -1038,8 +1061,12 @@ async function loadProjectAssignments() {
   loadingAssignments.value = true
   try {
     const { data } = await http.get<ProjectAssignmentsResponse>(`/projects/${project.value.id}/assignments`)
+    if (!activeAssignmentWorkflowStepId.value) {
+      activeAssignmentWorkflowStepId.value = data.workflow_steps?.[0]?.id || projectWorkflowSteps.value[0]?.id || ''
+    }
     assignmentDrafts.value = data.assignments.map((assignment) => ({
       assignee_id: assignment.assignee_id,
+      workflow_step_id: assignment.workflow_step_id || activeAssignmentWorkflowStepId.value,
       file_record_ids: new Set(assignment.file_record_ids),
     }))
   } catch (error) {
@@ -1068,11 +1095,15 @@ async function loadAssignmentEvents() {
 }
 
 function isUserInAssignmentDraft(userId: string) {
-  return assignmentDrafts.value.some((draft) => draft.assignee_id === userId)
+  const workflowStepId = activeAssignmentWorkflowStepId.value
+  return assignmentDrafts.value.some((draft) => draft.assignee_id === userId && draft.workflow_step_id === workflowStepId)
 }
 
 function getAssignmentDraft(userId: string) {
-  return assignmentDrafts.value.find((draft) => draft.assignee_id === userId) || null
+  const workflowStepId = activeAssignmentWorkflowStepId.value
+  return assignmentDrafts.value.find((draft) => (
+    draft.assignee_id === userId && draft.workflow_step_id === workflowStepId
+  )) || null
 }
 
 function getAssignableUserById(userId: string) {
@@ -1084,14 +1115,21 @@ function getAssignmentUserName(userId: string) {
 }
 
 function toggleAssignmentUser(user: User) {
+  const workflowStepId = activeAssignmentWorkflowStepId.value
+  if (!workflowStepId) {
+    return
+  }
   if (isUserInAssignmentDraft(user.id)) {
-    assignmentDrafts.value = assignmentDrafts.value.filter((draft) => draft.assignee_id !== user.id)
+    assignmentDrafts.value = assignmentDrafts.value.filter((draft) => !(
+      draft.assignee_id === user.id && draft.workflow_step_id === workflowStepId
+    ))
     return
   }
   assignmentDrafts.value = [
     ...assignmentDrafts.value,
     {
       assignee_id: user.id,
+      workflow_step_id: workflowStepId,
       file_record_ids: new Set<string>(),
     },
   ]
@@ -1102,8 +1140,9 @@ function isFileCheckedForUser(userId: string, fileRecordId: string) {
 }
 
 function toggleAssignmentFile(userId: string, fileRecordId: string) {
+  const workflowStepId = activeAssignmentWorkflowStepId.value
   assignmentDrafts.value = assignmentDrafts.value.map((draft) => {
-    if (draft.assignee_id !== userId) {
+    if (draft.assignee_id !== userId || draft.workflow_step_id !== workflowStepId) {
       return draft
     }
     const nextFileIds = new Set(draft.file_record_ids)
@@ -1148,7 +1187,7 @@ function updateFilteredAssignmentFiles(userId: string, checked: boolean) {
   }
 
   assignmentDrafts.value = assignmentDrafts.value.map((item) => {
-    if (item.assignee_id !== userId) {
+    if (item.assignee_id !== userId || item.workflow_step_id !== draft.workflow_step_id) {
       return item
     }
     const nextFileIds = new Set(item.file_record_ids)
@@ -1230,6 +1269,7 @@ async function openAssignmentDialog(_row?: ProjectFileItem | null) {
   }
   closeActionMenu()
   resetAssignmentFilters()
+  ensureActiveAssignmentWorkflowStep()
   showAssignmentDialog.value = true
   await Promise.all([loadAssignableUsers(), loadProjectAssignments()])
 }
@@ -1251,6 +1291,7 @@ async function saveAssignment() {
     await http.patch(`/projects/${project.value.id}/assignments`, {
       assignments: assignmentDrafts.value.map((draft) => ({
         assignee_id: draft.assignee_id,
+        workflow_step_id: draft.workflow_step_id,
         file_record_ids: Array.from(draft.file_record_ids),
       })),
     })
@@ -1570,6 +1611,7 @@ async function loadProject() {
   try {
     const { data } = await http.get<ProjectDetail>(`/projects/${props.id}`)
     project.value = data
+    ensureActiveAssignmentWorkflowStep()
     syncSettingsForm(data)
     guidelinesText.value = data.translation_guidelines || ''
     currentPage.value = 1
@@ -4295,6 +4337,20 @@ onBeforeUnmount(() => {
             <span>{{ tableRows.length }} 个文件</span>
           </div>
 
+          <div v-if="projectWorkflowSteps.length > 0" class="pd-assignment-workflow-tabs">
+            <button
+              v-for="step in projectWorkflowSteps"
+              :key="step.id"
+              class="pd-assignment-workflow-tab"
+              :class="{ 'is-active': step.id === activeAssignmentWorkflowStepId }"
+              type="button"
+              :disabled="savingAssignment"
+              @click="activeAssignmentWorkflowStepId = step.id"
+            >
+              {{ step.name }}
+            </button>
+          </div>
+
           <div class="pd-assignment-file-toolbar">
             <label class="pd-assignment-search pd-assignment-search--files">
               <Search :size="14" />
@@ -4302,7 +4358,7 @@ onBeforeUnmount(() => {
                 v-model="assignmentFileSearch"
                 type="search"
                 placeholder="搜索文件名"
-                :disabled="savingAssignment || assignmentDrafts.length === 0"
+                :disabled="savingAssignment || activeAssignmentDrafts.length === 0"
               />
               <button
                 v-if="assignmentFileSearch"
@@ -4322,7 +4378,7 @@ onBeforeUnmount(() => {
               v-model="assignmentFileStateFilter"
               class="pd-assignment-filter-select"
               aria-label="文件授权状态筛选"
-              :disabled="savingAssignment || assignmentDrafts.length === 0"
+              :disabled="savingAssignment || activeAssignmentDrafts.length === 0"
             >
               <option value="all">全部文件</option>
               <option value="checked">已授权</option>
@@ -4330,13 +4386,13 @@ onBeforeUnmount(() => {
             </select>
           </div>
 
-          <div v-if="assignmentDrafts.length === 0" class="empty-state pd-assignment-empty">
+          <div v-if="activeAssignmentDrafts.length === 0" class="empty-state pd-assignment-empty">
             请选择至少一位译者。
           </div>
           <div v-else class="pd-assignment-file-groups">
             <section
-              v-for="draft in assignmentDrafts"
-              :key="draft.assignee_id"
+              v-for="draft in activeAssignmentDrafts"
+              :key="`${draft.workflow_step_id}-${draft.assignee_id}`"
               class="pd-assignment-file-group"
             >
               <div class="pd-assignment-file-group__head">
@@ -5737,6 +5793,30 @@ onBeforeUnmount(() => {
   grid-template-columns: minmax(0, 1fr) minmax(132px, 160px);
   gap: 8px;
   align-items: center;
+}
+
+.pd-assignment-workflow-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.pd-assignment-workflow-tab {
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-panel);
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.pd-assignment-workflow-tab.is-active {
+  border-color: var(--brand-600);
+  color: var(--brand-700);
+  background: color-mix(in srgb, var(--brand-100) 82%, var(--surface-panel));
 }
 
 .pd-assignment-file-groups {

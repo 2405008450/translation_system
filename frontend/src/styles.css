@@ -1694,6 +1694,8 @@ body.modal-open {
 .workbench-page.is-stable-grid .segment-row__tag,
 .workbench-page.is-stable-grid .segment-row__index,
 .workbench-page.is-stable-grid .segment-row__cell--source,
+.workbench-page.is-stable-grid .segment-row__cell--state,
+.workbench-page.is-stable-grid .segment-row__cell--workflow,
 .workbench-page.is-stable-grid .segment-row__editor,
 .workbench-page.is-stable-grid .segment-row__editor-shell,
 .workbench-page.is-stable-grid .segment-row__source-editor,
@@ -1779,6 +1781,32 @@ body.modal-open {
 .workbench-page.is-stable-grid .segment-row__cell--target {
   border-left: 1px solid #dfe6ec;
   background: #ffffff;
+}
+
+.workbench-page.is-stable-grid .segment-row__cell--state,
+.workbench-page.is-stable-grid .segment-row__cell--workflow {
+  min-height: 48px;
+  padding: 4px;
+  border-left: 1px solid #dfe6ec;
+  background: #f8fafc;
+}
+
+.workbench-page.is-stable-grid .segment-row__cell--workflow {
+  color: #1f4f7a;
+  font-size: 13px;
+}
+
+.workbench-page.is-stable-grid .segment-row__confirm-mark {
+  min-width: 16px;
+  min-height: 16px;
+  font-size: 18px;
+}
+
+.workbench-page.is-stable-grid .segment-row__match-rate {
+  min-height: 18px;
+  padding: 0 4px;
+  border-radius: 2px;
+  font-size: 11px;
 }
 
 .workbench-page.is-stable-grid .segment-row__text,
@@ -2734,7 +2762,7 @@ body.modal-open {
 
 .segment-table-head {
   display: grid;
-  grid-template-columns: var(--segment-editor-grid-template, 128px minmax(0, 1fr) minmax(0, 1fr));
+  grid-template-columns: var(--segment-editor-grid-template, 72px minmax(0, 1fr) minmax(0, 1fr) 76px 76px);
   min-height: 30px;
   margin: 4px var(--segment-editor-scrollbar-gutter, 0) 0 0;
   border: 1px solid #e4e7eb;
@@ -2826,7 +2854,7 @@ body.modal-open {
   --segment-cell-stripe: rgba(255, 255, 255, 0);
   --segment-editor-stripe: rgba(255, 255, 255, 0);
   display: grid;
-  grid-template-columns: var(--segment-editor-grid-template, 128px minmax(0, 1fr) minmax(0, 1fr));
+  grid-template-columns: var(--segment-editor-grid-template, 72px minmax(0, 1fr) minmax(0, 1fr) 76px 76px);
   gap: 0;
   align-items: stretch;
   height: 100%;
@@ -4539,7 +4567,9 @@ body.modal-open {
     border-bottom: 1px solid rgba(214, 226, 222, 0.9);
   }
 
-  .segment-row__cell--target {
+  .segment-row__cell--target,
+  .segment-row__cell--state,
+  .segment-row__cell--workflow {
     border-left: 0;
     border-top: 1px solid rgba(214, 226, 222, 0.9);
   }

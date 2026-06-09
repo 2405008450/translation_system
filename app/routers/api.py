@@ -49,6 +49,7 @@ from app.models import (
     Notification,
     Project,
     ProjectAssignment,
+    ProjectWorkflowStep,
     Segment,
     SegmentRevision,
     TMCollection,
@@ -845,6 +846,7 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
         if term_base is not None:
             _store_file_record_term_base_ids(file_record, [term_base_id])
         db.flush()
+        _assign_file_segments_to_first_workflow_step(db, file_record)
         sync_project_repeated_segments_from_file(
             db,
             file_record=file_record,
@@ -1079,11 +1081,34 @@ class FileRecordAssignmentRequest(BaseModel):
 
 class ProjectAssignmentEntryRequest(BaseModel):
     assignee_id: UUID
+    workflow_step_id: UUID | None = None
     file_record_ids: list[UUID] = Field(default_factory=list)
 
 
 class ProjectAssignmentsRequest(BaseModel):
     assignments: list[ProjectAssignmentEntryRequest] = Field(default_factory=list)
+
+
+class WorkflowStepRequest(BaseModel):
+    id: UUID | None = None
+    step_key: str | None = None
+    name: str
+    step_type: str | None = None
+
+
+class WorkflowTransitionPreviewRequest(BaseModel):
+    from_step_id: UUID
+    target_step_id: UUID
+    range_start: int = Field(default=1, ge=1)
+    range_end: int | None = Field(default=None, ge=1)
+    all_segments: bool = True
+    source_status: Literal["all", "confirmed", "unconfirmed"] = "all"
+    source_statuses: list[Literal["none", "exact", "fuzzy", "confirmed"]] = Field(default_factory=list)
+    target_status: Literal["confirmed", "unconfirmed"] = "unconfirmed"
+
+
+class WorkflowTransitionRequest(WorkflowTransitionPreviewRequest):
+    pass
 
 
 class SaveToTMRequest(BaseModel):
@@ -1164,6 +1189,8 @@ class ProjectCreatePayload(BaseModel):
     access_level: Literal["team", "private", "public"] = "team"
     collection_id: UUID | None = None
     term_base_id: UUID | None = None
+    workflow_template_id: str | None = None
+    workflow_steps: list[WorkflowStepRequest] = Field(default_factory=list)
 
 
 class ProjectUpdatePayload(BaseModel):
@@ -1322,6 +1349,307 @@ def _can_manage_workflow(current_user: User | None) -> bool:
     return is_admin_role(getattr(current_user, "role", None))
 
 
+WORKFLOW_TEMPLATE_DEFINITIONS: list[dict[str, Any]] = [
+    {
+        "id": "translate",
+        "name": "翻译",
+        "steps": [
+            {"step_key": "translate", "name": "翻译", "step_type": "translation"},
+        ],
+    },
+    {
+        "id": "translate_review",
+        "name": "翻译-审校",
+        "steps": [
+            {"step_key": "translate", "name": "翻译", "step_type": "translation"},
+            {"step_key": "review", "name": "审校", "step_type": "review"},
+        ],
+    },
+    {
+        "id": "translate_review_proofread",
+        "name": "翻译-审校-校对",
+        "steps": [
+            {"step_key": "translate", "name": "翻译", "step_type": "translation"},
+            {"step_key": "review", "name": "审校", "step_type": "review"},
+            {"step_key": "proofread", "name": "校对", "step_type": "proofread"},
+        ],
+    },
+]
+WORKFLOW_TEMPLATE_BY_ID = {
+    str(template["id"]): template
+    for template in WORKFLOW_TEMPLATE_DEFINITIONS
+}
+
+
+def _serialize_workflow_template(template: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": template["id"],
+        "name": template["name"],
+        "steps": [
+            {
+                "step_key": step["step_key"],
+                "name": step["name"],
+                "step_type": step["step_type"],
+                "sort_order": index,
+            }
+            for index, step in enumerate(template["steps"])
+        ],
+    }
+
+
+def _serialize_workflow_step(step: ProjectWorkflowStep) -> dict[str, Any]:
+    return {
+        "id": str(step.id),
+        "step_key": step.step_key,
+        "name": step.name,
+        "step_type": step.step_type,
+        "sort_order": int(step.sort_order or 0),
+    }
+
+
+def _load_project_workflow_steps(db: Session, project_id: UUID | None) -> list[ProjectWorkflowStep]:
+    if project_id is None:
+        return []
+    return (
+        db.query(ProjectWorkflowStep)
+        .filter(ProjectWorkflowStep.project_id == project_id)
+        .order_by(ProjectWorkflowStep.sort_order.asc(), ProjectWorkflowStep.id.asc())
+        .all()
+    )
+
+
+def _load_workflow_steps_by_project(
+    db: Session,
+    project_ids: list[UUID],
+) -> dict[UUID, list[ProjectWorkflowStep]]:
+    if not project_ids:
+        return {}
+    rows = (
+        db.query(ProjectWorkflowStep)
+        .filter(ProjectWorkflowStep.project_id.in_(project_ids))
+        .order_by(ProjectWorkflowStep.project_id.asc(), ProjectWorkflowStep.sort_order.asc(), ProjectWorkflowStep.id.asc())
+        .all()
+    )
+    result: dict[UUID, list[ProjectWorkflowStep]] = {}
+    for step in rows:
+        result.setdefault(step.project_id, []).append(step)
+    return result
+
+
+def _create_project_workflow_steps(
+    db: Session,
+    project: Project,
+    requested_steps: list[WorkflowStepRequest],
+    template_id: str | None,
+) -> list[ProjectWorkflowStep]:
+    template = WORKFLOW_TEMPLATE_BY_ID.get((template_id or "").strip())
+    if template is None:
+        raise HTTPException(status_code=400, detail="请选择有效的工作流模板。")
+
+    source_steps = requested_steps or [
+        WorkflowStepRequest(
+            step_key=str(step["step_key"]),
+            name=str(step["name"]),
+            step_type=str(step["step_type"]),
+        )
+        for step in template["steps"]
+    ]
+    if not source_steps:
+        raise HTTPException(status_code=400, detail="工作流至少需要一个阶段。")
+    if len(source_steps) > 8:
+        raise HTTPException(status_code=400, detail="工作流阶段最多支持 8 个。")
+
+    normalized: list[ProjectWorkflowStep] = []
+    used_keys: set[str] = set()
+    for index, item in enumerate(source_steps):
+        name = (item.name or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="工作流阶段名称不能为空。")
+        if index == 0 and name != "翻译":
+            raise HTTPException(status_code=400, detail="工作流第一个阶段必须是“翻译”。")
+
+        raw_key = (item.step_key or "").strip().lower()
+        step_key = raw_key or ("translate" if index == 0 else f"step_{index + 1}")
+        step_key = re.sub(r"[^a-z0-9_]+", "_", step_key).strip("_") or f"step_{index + 1}"
+        if index == 0:
+            step_key = "translate"
+        base_key = step_key
+        suffix = 2
+        while step_key in used_keys:
+            step_key = f"{base_key}_{suffix}"
+            suffix += 1
+        used_keys.add(step_key)
+
+        step_type = (item.step_type or ("translation" if index == 0 else "custom")).strip().lower()
+        if index == 0:
+            step_type = "translation"
+
+        normalized.append(
+            ProjectWorkflowStep(
+                project_id=project.id,
+                step_key=step_key,
+                name=name,
+                step_type=step_type[:20] or "custom",
+                sort_order=index,
+            )
+        )
+
+    for step in normalized:
+        db.add(step)
+    db.flush()
+    return normalized
+
+
+def _copy_project_workflow_steps(
+    db: Session,
+    source_project_id: UUID,
+    target_project: Project,
+) -> list[ProjectWorkflowStep]:
+    source_steps = _load_project_workflow_steps(db, source_project_id)
+    if not source_steps:
+        source_steps = [
+            ProjectWorkflowStep(
+                project_id=source_project_id,
+                step_key="translate",
+                name="翻译",
+                step_type="translation",
+                sort_order=0,
+            )
+        ]
+    copied_steps = [
+        ProjectWorkflowStep(
+            project_id=target_project.id,
+            step_key=step.step_key,
+            name=step.name,
+            step_type=step.step_type,
+            sort_order=int(step.sort_order or 0),
+        )
+        for step in source_steps
+    ]
+    for step in copied_steps:
+        db.add(step)
+    db.flush()
+    return copied_steps
+
+
+def _get_first_workflow_step_id(db: Session, project_id: UUID | None) -> UUID | None:
+    steps = _load_project_workflow_steps(db, project_id)
+    return steps[0].id if steps else None
+
+
+def _assign_file_segments_to_first_workflow_step(db: Session, file_record: FileRecord) -> UUID | None:
+    first_step_id = _get_first_workflow_step_id(db, file_record.project_id)
+    if first_step_id is None:
+        return None
+    db.query(Segment).filter(
+        Segment.file_record_id == file_record.id,
+        Segment.workflow_step_id.is_(None),
+    ).update(
+        {"workflow_step_id": first_step_id},
+        synchronize_session=False,
+    )
+    return first_step_id
+
+
+def _build_workflow_progress_payload(
+    steps: list[ProjectWorkflowStep],
+    total_segments: int,
+    grouped_counts: list[tuple[UUID | None, str | None, int]],
+) -> list[dict[str, Any]]:
+    if not steps:
+        return []
+
+    order_by_step_id = {step.id: int(step.sort_order or 0) for step in steps}
+    first_order = int(steps[0].sort_order or 0)
+    payload: list[dict[str, Any]] = []
+    for step in steps:
+        step_order = int(step.sort_order or 0)
+        completed = 0
+        for current_step_id, status, count in grouped_counts:
+            current_order = order_by_step_id.get(current_step_id, first_order)
+            if current_order > step_order or (current_order == step_order and status == "confirmed"):
+                completed += int(count or 0)
+        payload.append({
+            **_serialize_workflow_step(step),
+            "total_segments": int(total_segments or 0),
+            "completed_segments": completed,
+            "progress": calculate_file_record_progress(int(total_segments or 0), completed),
+        })
+    return payload
+
+
+def _get_file_workflow_progress(db: Session, file_record_ids: list[UUID]) -> dict[UUID, list[dict[str, Any]]]:
+    if not file_record_ids:
+        return {}
+    file_rows = (
+        db.query(FileRecord.id, FileRecord.project_id)
+        .filter(FileRecord.id.in_(file_record_ids))
+        .all()
+    )
+    project_ids = sorted({row.project_id for row in file_rows if row.project_id}, key=str)
+    steps_by_project = _load_workflow_steps_by_project(db, project_ids)
+    segment_rows = (
+        db.query(
+            Segment.file_record_id,
+            Segment.workflow_step_id,
+            Segment.status,
+            func.count(Segment.id).label("count"),
+        )
+        .filter(Segment.file_record_id.in_(file_record_ids))
+        .group_by(Segment.file_record_id, Segment.workflow_step_id, Segment.status)
+        .all()
+    )
+    grouped_by_file: dict[UUID, list[tuple[UUID | None, str | None, int]]] = {}
+    total_by_file: dict[UUID, int] = {}
+    for row in segment_rows:
+        count = int(row.count or 0)
+        grouped_by_file.setdefault(row.file_record_id, []).append((row.workflow_step_id, row.status, count))
+        total_by_file[row.file_record_id] = total_by_file.get(row.file_record_id, 0) + count
+
+    result: dict[UUID, list[dict[str, Any]]] = {}
+    for row in file_rows:
+        steps = steps_by_project.get(row.project_id, []) if row.project_id else []
+        result[row.id] = _build_workflow_progress_payload(
+            steps,
+            total_by_file.get(row.id, 0),
+            grouped_by_file.get(row.id, []),
+        )
+    return result
+
+
+def _get_project_workflow_progress(db: Session, project_ids: list[UUID]) -> dict[UUID, list[dict[str, Any]]]:
+    if not project_ids:
+        return {}
+    steps_by_project = _load_workflow_steps_by_project(db, project_ids)
+    segment_rows = (
+        db.query(
+            FileRecord.project_id,
+            Segment.workflow_step_id,
+            Segment.status,
+            func.count(Segment.id).label("count"),
+        )
+        .join(FileRecord, FileRecord.id == Segment.file_record_id)
+        .filter(FileRecord.project_id.in_(project_ids))
+        .group_by(FileRecord.project_id, Segment.workflow_step_id, Segment.status)
+        .all()
+    )
+    grouped_by_project: dict[UUID, list[tuple[UUID | None, str | None, int]]] = {}
+    total_by_project: dict[UUID, int] = {}
+    for row in segment_rows:
+        count = int(row.count or 0)
+        grouped_by_project.setdefault(row.project_id, []).append((row.workflow_step_id, row.status, count))
+        total_by_project[row.project_id] = total_by_project.get(row.project_id, 0) + count
+
+    return {
+        project_id: _build_workflow_progress_payload(
+            steps_by_project.get(project_id, []),
+            total_by_project.get(project_id, 0),
+            grouped_by_project.get(project_id, []),
+        )
+        for project_id in project_ids
+    }
+
+
 ASSIGNMENT_STATUS_ACTIVE = "active"
 ASSIGNMENT_STATUS_REVOKED = "revoked"
 ASSIGNMENT_EVENT_PROJECT_ASSIGNED = "project_assigned"
@@ -1369,6 +1697,116 @@ def _has_active_file_assignment(db: Session | None, file_record: FileRecord, use
     )
 
 
+def _get_active_file_assignment_step_ids(
+    db: Session | None,
+    file_record: FileRecord,
+    user_id: UUID | None,
+) -> set[UUID]:
+    if db is None or user_id is None:
+        return set()
+    if not _has_active_project_assignment(db, file_record.project_id, user_id):
+        return set()
+    rows = (
+        db.query(FileAssignment.workflow_step_id)
+        .filter(
+            FileAssignment.file_record_id == file_record.id,
+            FileAssignment.assignee_id == user_id,
+            FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            FileAssignment.workflow_step_id.isnot(None),
+        )
+        .all()
+    )
+    return {row.workflow_step_id for row in rows if row.workflow_step_id is not None}
+
+
+def _has_active_file_assignment_for_step(
+    db: Session | None,
+    file_record: FileRecord,
+    user_id: UUID | None,
+    workflow_step_id: UUID | None,
+) -> bool:
+    if db is None or user_id is None or workflow_step_id is None:
+        return False
+    if not _has_active_project_assignment(db, file_record.project_id, user_id):
+        return False
+    return (
+        db.query(FileAssignment.id)
+        .filter(
+            FileAssignment.file_record_id == file_record.id,
+            FileAssignment.assignee_id == user_id,
+            FileAssignment.workflow_step_id == workflow_step_id,
+            FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+        )
+        .first()
+        is not None
+    )
+
+
+def _ensure_segment_workflow_step(db: Session, file_record: FileRecord, segment: Segment) -> UUID | None:
+    if segment.workflow_step_id is not None:
+        return segment.workflow_step_id
+    first_step_id = _get_first_workflow_step_id(db, file_record.project_id)
+    if first_step_id is not None:
+        segment.workflow_step_id = first_step_id
+        db.flush()
+    return segment.workflow_step_id
+
+
+def _get_file_record_writable_workflow_step_ids(
+    db: Session,
+    file_record: FileRecord,
+    current_user: User | None,
+) -> set[UUID]:
+    if current_user is None:
+        return set()
+    if can_access_all_projects(current_user):
+        return {step.id for step in _load_project_workflow_steps(db, file_record.project_id)}
+    return _get_active_file_assignment_step_ids(db, file_record, current_user.id)
+
+
+def _can_write_workflow_step(
+    db: Session,
+    file_record: FileRecord,
+    current_user: User | None,
+    workflow_step_id: UUID | None,
+) -> bool:
+    if current_user is None:
+        return False
+    if can_access_all_projects(current_user):
+        return True
+    return _has_active_file_assignment_for_step(db, file_record, current_user.id, workflow_step_id)
+
+
+def _require_segment_work_access(
+    db: Session,
+    file_record: FileRecord,
+    segment: Segment,
+    current_user: User,
+) -> None:
+    workflow_step_id = _ensure_segment_workflow_step(db, file_record, segment)
+    if not _can_write_workflow_step(db, file_record, current_user, workflow_step_id):
+        raise HTTPException(status_code=403, detail="当前账号没有编辑该流程阶段句段的权限。")
+
+
+def _filter_writable_segments(
+    db: Session,
+    file_record: FileRecord,
+    current_user: User,
+    segments: list[Segment],
+) -> list[Segment]:
+    if can_access_all_projects(current_user):
+        for segment in segments:
+            _ensure_segment_workflow_step(db, file_record, segment)
+        return segments
+    writable_step_ids = _get_file_record_writable_workflow_step_ids(db, file_record, current_user)
+    result: list[Segment] = []
+    for segment in segments:
+        workflow_step_id = _ensure_segment_workflow_step(db, file_record, segment)
+        if workflow_step_id in writable_step_ids:
+            result.append(segment)
+    return result
+
+
 def _can_read_project(project: Project, current_user: User | None, db: Session | None = None) -> bool:
     if current_user is None:
         return False
@@ -1398,7 +1836,12 @@ def _can_read_file_record(file_record: FileRecord, current_user: User | None, db
 
 
 def _can_write_file_record(file_record: FileRecord, current_user: User | None, db: Session | None = None) -> bool:
-    return _can_read_file_record(file_record, current_user, db)
+    if current_user is None:
+        return False
+    if can_access_all_projects(current_user):
+        return True
+    session = db or _get_record_session(file_record)
+    return _has_active_file_assignment(session, file_record, current_user.id)
 
 
 def _require_file_record_read_access(file_record: FileRecord, current_user: User) -> None:
@@ -1488,7 +1931,12 @@ def _get_active_file_assignees(db: Session, file_record_ids: list[UUID]) -> dict
         .all()
     )
     result: dict[UUID, list[User]] = {}
+    seen: set[tuple[UUID, UUID]] = set()
     for file_record_id, user in rows:
+        key = (file_record_id, user.id)
+        if key in seen:
+            continue
+        seen.add(key)
         result.setdefault(file_record_id, []).append(user)
     return result
 
@@ -1596,22 +2044,38 @@ def _validate_assignment_payload(
     db: Session,
     project: Project,
     payload: ProjectAssignmentsRequest,
-) -> dict[UUID, set[UUID]]:
+) -> tuple[dict[tuple[UUID, UUID], set[UUID]], set[UUID]]:
     project_file_ids = {
         row.id
         for row in db.query(FileRecord.id).filter(FileRecord.project_id == project.id).all()
     }
-    desired: dict[UUID, set[UUID]] = {}
+    workflow_steps = _load_project_workflow_steps(db, project.id)
+    if not workflow_steps:
+        workflow_steps = _create_project_workflow_steps(
+            db,
+            project,
+            requested_steps=[],
+            template_id="translate",
+        )
+    workflow_step_ids = {step.id for step in workflow_steps}
+    first_step_id = workflow_steps[0].id
+
+    desired: dict[tuple[UUID, UUID], set[UUID]] = {}
+    desired_user_ids: set[UUID] = set()
     for entry in payload.assignments:
         assignee = get_user_by_id(db, entry.assignee_id)
         if assignee is None or not assignee.is_active or assignee.role != USER_ROLE:
             raise HTTPException(status_code=400, detail="只能指派给启用中的普通译者账号。")
+        workflow_step_id = entry.workflow_step_id or first_step_id
+        if workflow_step_id not in workflow_step_ids:
+            raise HTTPException(status_code=400, detail="存在不属于当前项目的流程阶段授权。")
         file_ids = set(entry.file_record_ids or [])
         invalid_file_ids = file_ids - project_file_ids
         if invalid_file_ids:
             raise HTTPException(status_code=400, detail="存在不属于当前项目的文件授权。")
-        desired.setdefault(assignee.id, set()).update(file_ids)
-    return desired
+        desired_user_ids.add(assignee.id)
+        desired.setdefault((assignee.id, workflow_step_id), set()).update(file_ids)
+    return desired, desired_user_ids
 
 
 def _sync_legacy_file_assignees(db: Session, project_id: UUID) -> None:
@@ -1637,6 +2101,9 @@ def _sync_legacy_file_assignees(db: Session, project_id: UUID) -> None:
 
 
 def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, Any]:
+    workflow_steps = _load_project_workflow_steps(db, project_id)
+    workflow_step_by_id = {step.id: step for step in workflow_steps}
+    first_step_id = workflow_steps[0].id if workflow_steps else None
     assignments = (
         db.query(ProjectAssignment)
         .join(User, User.id == ProjectAssignment.assignee_id)
@@ -1656,23 +2123,206 @@ def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, A
         .order_by(FileAssignment.assigned_at.asc(), FileAssignment.id.asc())
         .all()
     )
-    files_by_user: dict[UUID, list[str]] = {}
+    files_by_user_step: dict[tuple[UUID, UUID], list[str]] = {}
+    first_file_assignment_by_user_step: dict[tuple[UUID, UUID], FileAssignment] = {}
     for file_assignment in file_rows:
-        files_by_user.setdefault(file_assignment.assignee_id, []).append(str(file_assignment.file_record_id))
-    return {
-        "project_id": str(project_id),
-        "assignments": [
-            {
-                "id": str(assignment.id),
+        workflow_step_id = file_assignment.workflow_step_id or first_step_id
+        if workflow_step_id is None:
+            continue
+        key = (file_assignment.assignee_id, workflow_step_id)
+        files_by_user_step.setdefault(key, []).append(str(file_assignment.file_record_id))
+        first_file_assignment_by_user_step.setdefault(key, file_assignment)
+
+    assignment_items: list[dict[str, Any]] = []
+    for assignment in assignments:
+        keys = [
+            key
+            for key in files_by_user_step
+            if key[0] == assignment.assignee_id
+        ]
+        if not keys and first_step_id is not None:
+            keys = [(assignment.assignee_id, first_step_id)]
+        for _, workflow_step_id in sorted(
+            keys,
+            key=lambda key: int(workflow_step_by_id[key[1]].sort_order or 0)
+            if key[1] in workflow_step_by_id
+            else 0,
+        ):
+            workflow_step = workflow_step_by_id.get(workflow_step_id)
+            file_assignment = first_file_assignment_by_user_step.get((assignment.assignee_id, workflow_step_id))
+            assigned_by_id = (
+                file_assignment.assigned_by_id
+                if file_assignment is not None and file_assignment.assigned_by_id
+                else assignment.assigned_by_id
+            )
+            assigned_at = (
+                file_assignment.assigned_at
+                if file_assignment is not None
+                else assignment.assigned_at
+            )
+            assignment_items.append({
+                "id": str(file_assignment.id if file_assignment is not None else assignment.id),
+                "project_assignment_id": str(assignment.id),
                 "assignee_id": str(assignment.assignee_id),
                 "assignee": serialize_user(assignment.assignee),
-                "file_record_ids": files_by_user.get(assignment.assignee_id, []),
-                "assigned_by_id": str(assignment.assigned_by_id) if assignment.assigned_by_id else None,
-                "assigned_at": assignment.assigned_at.isoformat(),
-            }
-            for assignment in assignments
-        ],
+                "workflow_step_id": str(workflow_step_id),
+                "workflow_step": _serialize_workflow_step(workflow_step) if workflow_step is not None else None,
+                "file_record_ids": files_by_user_step.get((assignment.assignee_id, workflow_step_id), []),
+                "assigned_by_id": str(assigned_by_id) if assigned_by_id else None,
+                "assigned_at": assigned_at.isoformat(),
+            })
+    return {
+        "project_id": str(project_id),
+        "workflow_steps": [_serialize_workflow_step(step) for step in workflow_steps],
+        "assignments": assignment_items,
     }
+
+
+def _update_project_assignments_by_workflow(
+    db: Session,
+    *,
+    project_id: UUID,
+    project: Project,
+    payload: ProjectAssignmentsRequest,
+    current_user: User,
+) -> dict[str, Any]:
+    desired, desired_user_ids = _validate_assignment_payload(db, project, payload)
+    now = datetime.utcnow()
+    workflow_steps = _load_project_workflow_steps(db, project_id)
+    first_step_id = workflow_steps[0].id if workflow_steps else None
+
+    current_project_assignments = {
+        assignment.assignee_id: assignment
+        for assignment in (
+            db.query(ProjectAssignment)
+            .filter(
+                ProjectAssignment.project_id == project_id,
+                ProjectAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            )
+            .all()
+        )
+    }
+
+    current_file_assignments: dict[tuple[UUID, UUID], dict[UUID, FileAssignment]] = {}
+    for assignment in (
+        db.query(FileAssignment)
+        .filter(
+            FileAssignment.project_id == project_id,
+            FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+        )
+        .all()
+    ):
+        workflow_step_id = assignment.workflow_step_id or first_step_id
+        if workflow_step_id is None:
+            continue
+        current_file_assignments.setdefault(
+            (assignment.assignee_id, workflow_step_id),
+            {},
+        )[assignment.file_record_id] = assignment
+
+    for assignee_id, assignment in list(current_project_assignments.items()):
+        if assignee_id in desired_user_ids:
+            continue
+        assignment.status = ASSIGNMENT_STATUS_REVOKED
+        assignment.revoked_by_id = current_user.id
+        assignment.revoked_at = now
+        _record_assignment_event(
+            db,
+            project_id=project_id,
+            assignee_id=assignee_id,
+            actor_id=current_user.id,
+            action=ASSIGNMENT_EVENT_PROJECT_UNASSIGNED,
+            before_payload={"project_id": str(project_id), "status": ASSIGNMENT_STATUS_ACTIVE},
+            after_payload={"project_id": str(project_id), "status": ASSIGNMENT_STATUS_REVOKED},
+        )
+
+    for assignee_id in sorted(desired_user_ids, key=str):
+        project_assignment = current_project_assignments.get(assignee_id)
+        if project_assignment is not None:
+            continue
+        project_assignment = ProjectAssignment(
+            project_id=project_id,
+            assignee_id=assignee_id,
+            assigned_by_id=current_user.id,
+            assigned_at=now,
+            status=ASSIGNMENT_STATUS_ACTIVE,
+        )
+        db.add(project_assignment)
+        current_project_assignments[assignee_id] = project_assignment
+        _record_assignment_event(
+            db,
+            project_id=project_id,
+            assignee_id=assignee_id,
+            actor_id=current_user.id,
+            action=ASSIGNMENT_EVENT_PROJECT_ASSIGNED,
+            before_payload={"project_id": str(project_id), "status": None},
+            after_payload={"project_id": str(project_id), "status": ASSIGNMENT_STATUS_ACTIVE},
+        )
+
+    for key, active_by_file_id in current_file_assignments.items():
+        assignee_id, workflow_step_id = key
+        desired_file_ids = desired.get(key, set())
+        for file_record_id, file_assignment in active_by_file_id.items():
+            if assignee_id in desired_user_ids and file_record_id in desired_file_ids:
+                continue
+            file_assignment.status = ASSIGNMENT_STATUS_REVOKED
+            file_assignment.revoked_by_id = current_user.id
+            file_assignment.revoked_at = now
+            _record_assignment_event(
+                db,
+                project_id=project_id,
+                file_record_id=file_record_id,
+                assignee_id=assignee_id,
+                actor_id=current_user.id,
+                action=ASSIGNMENT_EVENT_FILE_REVOKED,
+                before_payload={
+                    "file_record_id": str(file_record_id),
+                    "workflow_step_id": str(workflow_step_id),
+                    "status": ASSIGNMENT_STATUS_ACTIVE,
+                },
+                after_payload={
+                    "file_record_id": str(file_record_id),
+                    "workflow_step_id": str(workflow_step_id),
+                    "status": ASSIGNMENT_STATUS_REVOKED,
+                },
+            )
+
+    for (assignee_id, workflow_step_id), desired_file_ids in desired.items():
+        active_file_assignments = current_file_assignments.get((assignee_id, workflow_step_id), {})
+        active_file_ids = set(active_file_assignments)
+        for file_record_id in sorted(desired_file_ids - active_file_ids, key=str):
+            file_assignment = FileAssignment(
+                project_id=project_id,
+                file_record_id=file_record_id,
+                workflow_step_id=workflow_step_id,
+                assignee_id=assignee_id,
+                assigned_by_id=current_user.id,
+                assigned_at=now,
+                status=ASSIGNMENT_STATUS_ACTIVE,
+            )
+            db.add(file_assignment)
+            _record_assignment_event(
+                db,
+                project_id=project_id,
+                file_record_id=file_record_id,
+                assignee_id=assignee_id,
+                actor_id=current_user.id,
+                action=ASSIGNMENT_EVENT_FILE_GRANTED,
+                before_payload={
+                    "file_record_id": str(file_record_id),
+                    "workflow_step_id": str(workflow_step_id),
+                    "status": None,
+                },
+                after_payload={
+                    "file_record_id": str(file_record_id),
+                    "workflow_step_id": str(workflow_step_id),
+                    "status": ASSIGNMENT_STATUS_ACTIVE,
+                },
+            )
+
+    _sync_legacy_file_assignees(db, project_id)
+    db.commit()
+    return _serialize_project_assignments(db, project_id)
 
 
 @router.get("/analytics/dashboard")
@@ -2815,6 +3465,16 @@ async def create_file_record(
     return await _queue_import_task(background_tasks, payload)
 
 
+@router.get("/workflow-templates")
+def list_workflow_templates(_: User = Depends(get_current_user)):
+    return {
+        "items": [
+            _serialize_workflow_template(template)
+            for template in WORKFLOW_TEMPLATE_DEFINITIONS
+        ]
+    }
+
+
 @router.post("/projects")
 def create_project(
     payload: ProjectCreatePayload,
@@ -2853,6 +3513,13 @@ def create_project(
         access_level=payload.access_level,
     )
     db.add(project)
+    db.flush()
+    _create_project_workflow_steps(
+        db,
+        project,
+        requested_steps=payload.workflow_steps,
+        template_id=payload.workflow_template_id,
+    )
     db.commit()
     db.refresh(project)
 
@@ -2926,10 +3593,13 @@ def duplicate_project(
     )
 
     db.add(duplicate)
+    db.flush()
+    _copy_project_workflow_steps(db, source_project.id, duplicate)
     db.commit()
     db.refresh(duplicate)
 
     return _build_project_detail_payload(
+        db,
         duplicate,
         [],
         {},
@@ -2947,8 +3617,12 @@ def _build_project_summary_payload(
     issue_stats: dict[str, int] | None = None,
     current_user: User | None = None,
     assigned_users: list[User] | None = None,
+    workflow_steps: list[ProjectWorkflowStep] | None = None,
+    workflow_progress: list[dict[str, Any]] | None = None,
 ) -> dict:
     progress = calculate_file_record_progress(total_segments, translated_segments)
+    if workflow_progress:
+        progress = int(workflow_progress[-1].get("progress", progress))
     pretranslation_progress = calculate_file_record_progress(total_segments, pretranslated_segments)
     effective_status = (
         resolve_file_record_status("in_progress", total_segments, translated_segments)
@@ -2977,6 +3651,8 @@ def _build_project_summary_payload(
         "issue_count": issue_stats.get("issue_count", 0),
         "open_issue_count": issue_stats.get("open_issue_count", 0),
         "assigned_users": _serialize_user_list(assigned_users),
+        "workflow_steps": [_serialize_workflow_step(step) for step in (workflow_steps or [])],
+        "workflow_progress": workflow_progress or [],
         "can_manage": _can_manage_workflow(current_user),
         "can_write": bool(current_user) and (can_access_all_projects(current_user) or file_count > 0),
         "created_at": project.created_at.isoformat(),
@@ -2992,6 +3668,8 @@ def _build_project_file_payload(
     issue_stats: dict[str, int] | None = None,
     current_user: User | None = None,
     assignees: list[User] | None = None,
+    workflow_steps: list[ProjectWorkflowStep] | None = None,
+    workflow_progress: list[dict[str, Any]] | None = None,
 ) -> dict:
     source_bytes = load_file_record_source(file_record)
     operation_state = (
@@ -3004,6 +3682,8 @@ def _build_project_file_payload(
         }
     )
     progress = calculate_file_record_progress(total_segments, translated_segments)
+    if workflow_progress:
+        progress = int(workflow_progress[-1].get("progress", progress))
     pretranslation_progress = calculate_file_record_progress(total_segments, pretranslated_segments)
     effective_status = resolve_file_record_status(
         file_record.status,
@@ -3042,6 +3722,8 @@ def _build_project_file_payload(
         "assignee": _serialize_assignee(assignee),
         "assignees": _serialize_user_list(assignees),
         "assigned_at": assigned_at.isoformat() if assigned_at else None,
+        "workflow_steps": [_serialize_workflow_step(step) for step in (workflow_steps or [])],
+        "workflow_progress": workflow_progress or [],
         "deadline": deadline.isoformat() if deadline else None,
         "access_level": file_record.access_level,
         "created_at": file_record.created_at.isoformat(),
@@ -3746,6 +4428,7 @@ def _apply_term_qa_ignore_state(
 
 
 def _build_project_detail_payload(
+    db: Session,
     project: Project,
     files: list[FileRecord],
     file_stats: dict[UUID, dict],
@@ -3761,6 +4444,9 @@ def _build_project_detail_payload(
     pretranslated_segments = sum(
         file_stats.get(file.id, {}).get("pretranslated", 0) for file in files
     )
+    workflow_steps = _load_project_workflow_steps(db, project.id)
+    workflow_progress = _get_project_workflow_progress(db, [project.id]).get(project.id, [])
+    file_workflow_progress = _get_file_workflow_progress(db, [file.id for file in files])
     file_issue_stats = file_issue_stats or {}
     payload = _build_project_summary_payload(
         project=project,
@@ -3772,6 +4458,8 @@ def _build_project_detail_payload(
         issue_stats=project_issue_stats,
         current_user=current_user,
         assigned_users=assigned_users,
+        workflow_steps=workflow_steps,
+        workflow_progress=workflow_progress,
     )
     file_assignees = file_assignees or {}
     payload["files"] = [
@@ -3783,6 +4471,8 @@ def _build_project_detail_payload(
             issue_stats=file_issue_stats.get(file_record.id),
             current_user=current_user,
             assignees=file_assignees.get(file_record.id),
+            workflow_steps=workflow_steps,
+            workflow_progress=file_workflow_progress.get(file_record.id, []),
         )
         for file_record in files
     ]
@@ -3816,6 +4506,13 @@ def update_project_assignments(
     current_user: User = Depends(require_admin),
 ):
     project = _get_project_or_404(db, project_id)
+    return _update_project_assignments_by_workflow(
+        db,
+        project_id=project_id,
+        project=project,
+        payload=payload,
+        current_user=current_user,
+    )
     desired = _validate_assignment_payload(db, project, payload)
     now = datetime.utcnow()
 
@@ -4428,6 +5125,7 @@ def get_project_detail(
     assigned_users = _get_active_project_assignees(db, [project_id]).get(project_id, [])
     file_assignees = _get_active_file_assignees(db, [file_record.id for file_record in files])
     return _build_project_detail_payload(
+        db,
         project,
         files,
         file_stats,
@@ -4907,6 +5605,8 @@ def list_projects(
     project_stats = _get_project_stats(db, project_ids, current_user=current_user)
     project_issue_stats = _get_project_issue_stats(db, project_ids, current_user=current_user)
     project_assignees = _get_active_project_assignees(db, project_ids)
+    workflow_steps_by_project = _load_workflow_steps_by_project(db, project_ids)
+    workflow_progress_by_project = _get_project_workflow_progress(db, project_ids)
 
     items = []
     for project in projects:
@@ -4930,6 +5630,8 @@ def list_projects(
                 issue_stats=project_issue_stats.get(project.id),
                 current_user=current_user,
                 assigned_users=project_assignees.get(project.id),
+                workflow_steps=workflow_steps_by_project.get(project.id, []),
+                workflow_progress=workflow_progress_by_project.get(project.id, []),
             )
         )
 
@@ -4974,6 +5676,7 @@ def get_file_records(
                 ProjectAssignment.assignee_id == current_user.id,
                 ProjectAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
             )
+            .distinct()
         )
     file_records = (
         query
@@ -4985,6 +5688,13 @@ def get_file_records(
     file_stats = _get_file_segment_stats(db, [file_record.id for file_record in file_records])
     file_issue_stats = _get_file_issue_stats(db, [file_record.id for file_record in file_records])
     file_assignees = _get_active_file_assignees(db, [file_record.id for file_record in file_records])
+    file_record_ids = [file_record.id for file_record in file_records]
+    project_ids = sorted(
+        {file_record.project_id for file_record in file_records if file_record.project_id},
+        key=str,
+    )
+    workflow_steps_by_project = _load_workflow_steps_by_project(db, project_ids)
+    file_workflow_progress = _get_file_workflow_progress(db, file_record_ids)
     return [
         {
             "id": file_record.id,
@@ -4992,9 +5702,13 @@ def get_file_records(
             "project_name": file_record.project.name if file_record.project else None,
             "filename": file_record.filename,
             "status": file_record.status,
-            "progress": calculate_file_record_progress(
-                file_stats.get(file_record.id, {"total": 0})["total"],
-                file_stats.get(file_record.id, {"filled": 0})["filled"],
+            "progress": (
+                int(file_workflow_progress.get(file_record.id, [{}])[-1].get("progress", 0))
+                if file_workflow_progress.get(file_record.id)
+                else calculate_file_record_progress(
+                    file_stats.get(file_record.id, {"total": 0})["total"],
+                    file_stats.get(file_record.id, {"filled": 0})["filled"],
+                )
             ),
             "total_segments": file_stats.get(file_record.id, {"total": 0})["total"],
             "translated_segments": file_stats.get(file_record.id, {"filled": 0})["filled"],
@@ -5015,8 +5729,13 @@ def get_file_records(
             "assignee": _serialize_assignee(file_record.assignee),
             "assignees": _serialize_user_list(file_assignees.get(file_record.id)),
             "assigned_at": file_record.assigned_at.isoformat() if file_record.assigned_at else None,
+            "workflow_steps": [
+                _serialize_workflow_step(step)
+                for step in workflow_steps_by_project.get(file_record.project_id, [])
+            ],
+            "workflow_progress": file_workflow_progress.get(file_record.id, []),
             "can_manage": _can_manage_workflow(current_user),
-            "can_write": _can_write_file_record(file_record, current_user),
+            "can_write": _can_write_file_record(file_record, current_user, db),
             "created_at": file_record.created_at.isoformat(),
             "updated_at": file_record.updated_at.isoformat(),
         }
@@ -5031,7 +5750,35 @@ def _normalize_segment_page_limit(limit: int) -> int:
     return min(max(int(limit), 1), SEGMENT_PAGE_MAX_LIMIT)
 
 
-def _serialize_workbench_segment(seg: Segment, display_index: int | None = None) -> dict:
+def _build_segment_workflow_context(
+    db: Session,
+    file_record: FileRecord,
+    current_user: User | None,
+) -> tuple[dict[UUID, ProjectWorkflowStep], set[UUID] | None, bool]:
+    _assign_file_segments_to_first_workflow_step(db, file_record)
+    workflow_steps = _load_project_workflow_steps(db, file_record.project_id)
+    can_manage = _can_manage_workflow(current_user)
+    writable_step_ids: set[UUID] | None = None
+    if current_user is not None:
+        writable_step_ids = _get_file_record_writable_workflow_step_ids(db, file_record, current_user)
+    return {step.id: step for step in workflow_steps}, writable_step_ids, can_manage
+
+
+def _serialize_workbench_segment(
+    seg: Segment,
+    display_index: int | None = None,
+    *,
+    workflow_step_by_id: dict[UUID, ProjectWorkflowStep] | None = None,
+    writable_workflow_step_ids: set[UUID] | None = None,
+    can_manage: bool = False,
+) -> dict:
+    resolved_workflow_step_id = seg.workflow_step_id
+    if resolved_workflow_step_id is None and workflow_step_by_id:
+        resolved_workflow_step_id = next(iter(workflow_step_by_id.keys()), None)
+    workflow_step = workflow_step_by_id.get(resolved_workflow_step_id) if workflow_step_by_id else None
+    can_write = True
+    if writable_workflow_step_ids is not None:
+        can_write = bool(can_manage or (resolved_workflow_step_id in writable_workflow_step_ids))
     payload = {
         "id": str(seg.id),
         "sentence_id": seg.sentence_id,
@@ -5056,6 +5803,10 @@ def _serialize_workbench_segment(seg: Segment, display_index: int | None = None)
         "block_index": seg.block_index,
         "row_index": seg.row_index,
         "cell_index": seg.cell_index,
+        "workflow_step_id": str(resolved_workflow_step_id) if resolved_workflow_step_id else None,
+        "workflow_step_name": workflow_step.name if workflow_step else "翻译",
+        "workflow_step_order": int(workflow_step.sort_order or 0) if workflow_step else 0,
+        "can_write": can_write,
         "updated_at": seg.updated_at.isoformat() if seg.updated_at else None,
     }
     if display_index is not None:
@@ -5283,6 +6034,180 @@ def _get_segment_page_sentence_ids(
     ]
 
 
+def _get_workflow_step_for_file_record(
+    db: Session,
+    file_record: FileRecord,
+    workflow_step_id: UUID,
+) -> ProjectWorkflowStep:
+    step = (
+        db.query(ProjectWorkflowStep)
+        .filter(
+            ProjectWorkflowStep.id == workflow_step_id,
+            ProjectWorkflowStep.project_id == file_record.project_id,
+        )
+        .first()
+    )
+    if step is None:
+        raise HTTPException(status_code=400, detail="流程阶段不属于当前文件所在项目。")
+    return step
+
+
+def _apply_workflow_transition_filters(
+    db: Session,
+    query,
+    file_record_id: UUID,
+    payload: WorkflowTransitionPreviewRequest,
+):
+    query = query.filter(
+        Segment.file_record_id == file_record_id,
+        Segment.workflow_step_id == payload.from_step_id,
+    )
+    selected_statuses = set(payload.source_statuses or [])
+    if selected_statuses:
+        query = query.filter(Segment.status.in_(sorted(selected_statuses)))
+    elif payload.source_status == "confirmed":
+        query = query.filter(Segment.status == "confirmed")
+    elif payload.source_status == "unconfirmed":
+        query = query.filter(or_(Segment.status.is_(None), Segment.status != "confirmed"))
+
+    if not payload.all_segments:
+        range_end = payload.range_end if payload.range_end is not None else payload.range_start
+        if payload.range_start > range_end:
+            raise HTTPException(status_code=400, detail="句段范围起始值不能大于结束值。")
+        ordered_segments = (
+            db.query(
+                Segment.id.label("id"),
+                func.row_number()
+                .over(
+                    order_by=(
+                        Segment.block_index.asc(),
+                        Segment.row_index.asc().nullsfirst(),
+                        Segment.cell_index.asc().nullsfirst(),
+                        Segment.sentence_id.asc(),
+                    )
+                )
+                .label("display_index"),
+            )
+            .filter(Segment.file_record_id == file_record_id)
+            .subquery()
+        )
+        query = (
+            query.join(ordered_segments, ordered_segments.c.id == Segment.id)
+            .filter(
+                ordered_segments.c.display_index >= payload.range_start,
+                ordered_segments.c.display_index <= range_end,
+            )
+        )
+    return query
+
+
+def _resolve_workflow_transition_context(
+    db: Session,
+    file_record: FileRecord,
+    payload: WorkflowTransitionPreviewRequest,
+    current_user: User,
+) -> tuple[ProjectWorkflowStep, ProjectWorkflowStep]:
+    _assign_file_segments_to_first_workflow_step(db, file_record)
+    from_step = _get_workflow_step_for_file_record(db, file_record, payload.from_step_id)
+    target_step = _get_workflow_step_for_file_record(db, file_record, payload.target_step_id)
+    if from_step.id == target_step.id:
+        raise HTTPException(status_code=400, detail="目标流程必须与当前流程不同。")
+    if int(from_step.sort_order or 0) == int(target_step.sort_order or 0):
+        raise HTTPException(status_code=400, detail="目标流程顺序必须与当前流程不同。")
+    if not _can_write_workflow_step(db, file_record, current_user, from_step.id):
+        raise HTTPException(status_code=403, detail="当前账号没有推进该来源流程阶段的权限。")
+    return from_step, target_step
+
+
+@router.post("/file-records/{file_record_id}/workflow/transition/preview")
+def preview_file_record_workflow_transition(
+    file_record_id: UUID,
+    payload: WorkflowTransitionPreviewRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文件不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    from_step, target_step = _resolve_workflow_transition_context(db, file_record, payload, current_user)
+    query = _apply_workflow_transition_filters(
+        db,
+        db.query(Segment),
+        file_record_id,
+        payload,
+    )
+    matched_count = query.count()
+    return {
+        "file_record_id": str(file_record_id),
+        "from_step": _serialize_workflow_step(from_step),
+        "target_step": _serialize_workflow_step(target_step),
+        "matched_count": int(matched_count or 0),
+        "source_status": payload.source_status,
+        "source_statuses": payload.source_statuses,
+        "target_status": payload.target_status,
+    }
+
+
+@router.post("/file-records/{file_record_id}/workflow/transition")
+def transition_file_record_workflow(
+    file_record_id: UUID,
+    payload: WorkflowTransitionRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+):
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    from_step, target_step = _resolve_workflow_transition_context(db, file_record, payload, current_user)
+    segments = _order_segment_query(
+        _apply_workflow_transition_filters(
+            db,
+            db.query(Segment),
+            file_record_id,
+            payload,
+        )
+    ).all()
+    matched_count = len(segments)
+    updated_count = 0
+    confirmed_segments: list[Segment] = []
+    for segment in segments:
+        next_status = "confirmed" if payload.target_status == "confirmed" else _resolve_unconfirmed_segment_status(segment)
+        if segment.workflow_step_id != target_step.id or segment.status != next_status:
+            segment.workflow_step_id = target_step.id
+            segment.status = next_status
+            segment.version = int(segment.version or 1) + 1
+            updated_count += 1
+        if segment.status == "confirmed" and normalize_text(segment.target_text):
+            confirmed_segments.append(segment)
+
+    auto_tm_summary = _empty_auto_tm_summary()
+    if confirmed_segments:
+        auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(
+            db,
+            file_record=file_record,
+            segments=confirmed_segments,
+            current_user=current_user,
+        )
+    if updated_count:
+        sync_file_record_status(db, file_record_id)
+    db.commit()
+    _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+    return {
+        "file_record_id": str(file_record_id),
+        "from_step": _serialize_workflow_step(from_step),
+        "target_step": _serialize_workflow_step(target_step),
+        "matched_count": matched_count,
+        "updated_count": updated_count,
+        "source_status": payload.source_status,
+        "source_statuses": payload.source_statuses,
+        "target_status": payload.target_status,
+        "status_stats": _get_segment_status_stats(db, file_record_id),
+        "workflow_progress": _get_file_workflow_progress(db, [file_record_id]).get(file_record_id, []),
+        "auto_tm": auto_tm_summary.to_dict(),
+    }
+
+
 @router.get("/file-records/{file_record_id}")
 @router.get("/documents/{file_record_id}", include_in_schema=False)
 def get_file_record(
@@ -5378,6 +6303,13 @@ def get_file_record(
         {"issue_count": 0, "open_issue_count": 0},
     )
     file_assignees = _get_active_file_assignees(db, [file_record.id]).get(file_record.id, [])
+    workflow_steps = _load_project_workflow_steps(db, file_record.project_id)
+    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+        db,
+        file_record,
+        current_user,
+    )
+    workflow_progress = _get_file_workflow_progress(db, [file_record.id]).get(file_record.id, [])
 
     return {
         "id": file_record.id,
@@ -5427,12 +6359,20 @@ def get_file_record(
         "has_source_document": source_bytes is not None,
         "can_export": can_export_task_file(source_filename, has_source_file=source_bytes is not None),
         "can_manage": _can_manage_workflow(current_user),
-        "can_write": _can_write_file_record(file_record, current_user),
+        "can_write": _can_write_file_record(file_record, current_user, db),
+        "workflow_steps": [_serialize_workflow_step(step) for step in workflow_steps],
+        "workflow_progress": workflow_progress,
         "issue_count": issue_stats["issue_count"],
         "open_issue_count": issue_stats["open_issue_count"],
         "status_stats": _get_segment_status_stats(db, file_record_id),
         "segments": [
-            _serialize_workbench_segment(seg, display_index=result["skip"] + index)
+            _serialize_workbench_segment(
+                seg,
+                display_index=result["skip"] + index,
+                workflow_step_by_id=workflow_step_by_id,
+                writable_workflow_step_ids=writable_workflow_step_ids,
+                can_manage=can_manage,
+            )
             for index, seg in enumerate(segments)
         ],
     }
@@ -5544,6 +6484,11 @@ def get_file_record_segments(
         .all()
     )
     display_index_map = _get_segment_display_index_map(db, file_record_id, page_segments)
+    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+        db,
+        file_record,
+        current_user,
+    )
 
     return {
         "file_record_id": str(file_record_id),
@@ -5560,7 +6505,13 @@ def get_file_record_segments(
         },
         "server_time": datetime.utcnow().isoformat(),
         "segments": [
-            _serialize_workbench_segment(seg, display_index=display_index_map.get(seg.id))
+            _serialize_workbench_segment(
+                seg,
+                display_index=display_index_map.get(seg.id),
+                workflow_step_by_id=workflow_step_by_id,
+                writable_workflow_step_ids=writable_workflow_step_ids,
+                can_manage=can_manage,
+            )
             for seg in page_segments
         ],
     }
@@ -5595,11 +6546,21 @@ def get_file_record_segment_changes(
         .limit(safe_limit)
         .all()
     )
+    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+        db,
+        file_record,
+        current_user,
+    )
     return {
         "file_record_id": str(file_record_id),
         "server_time": datetime.utcnow().isoformat(),
         "segments": [
-            _serialize_workbench_segment(segment)
+            _serialize_workbench_segment(
+                segment,
+                workflow_step_by_id=workflow_step_by_id,
+                writable_workflow_step_ids=writable_workflow_step_ids,
+                can_manage=can_manage,
+            )
             for segment in changed_segments
         ],
     }
@@ -5679,18 +6640,23 @@ def duplicate_file_record_task(
     if duplicate is None:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    _assign_file_segments_to_first_workflow_step(db, duplicate)
     db.commit()
     db.refresh(duplicate)
     file_stats = _get_file_segment_stats(db, [duplicate.id]).get(
         duplicate.id,
         {"total": 0, "filled": 0, "pretranslated": 0},
     )
+    workflow_steps = _load_project_workflow_steps(db, duplicate.project_id)
+    workflow_progress = _get_file_workflow_progress(db, [duplicate.id]).get(duplicate.id, [])
     return _build_project_file_payload(
         duplicate,
         total_segments=file_stats["total"],
         translated_segments=file_stats["filled"],
         pretranslated_segments=file_stats["pretranslated"],
         current_user=current_user,
+        workflow_steps=workflow_steps,
+        workflow_progress=workflow_progress,
     )
 
 
@@ -5890,6 +6856,7 @@ def rematch_file_record(
     threshold = round(threshold, 2)
 
     segments = list_segments_for_file_record(db, file_record_id)
+    segments = _filter_writable_segments(db, file_record, current_user, segments)
     if not segments:
         return {"exact": 0, "fuzzy": 0, "skipped": 0, "updated": 0}
 
@@ -6393,6 +7360,14 @@ def update_segment(
 ):
     """更新单个片段的译文"""
     file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    current_segment = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not current_segment:
+        raise HTTPException(status_code=404, detail="片段不存在。")
+    _require_segment_work_access(db, file_record, current_segment, current_user)
     if update.base_version is not None:
         current_segment = (
             db.query(Segment)
@@ -6403,6 +7378,11 @@ def update_segment(
             raise HTTPException(status_code=404, detail="片段不存在。")
         current_version = int(current_segment.version or 1)
         if current_version != update.base_version:
+            workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+                db,
+                file_record,
+                current_user,
+            )
             return {
                 "updated_count": 0,
                 "conflicts": [
@@ -6415,7 +7395,14 @@ def update_segment(
                 ],
                 "auto_tm": _empty_auto_tm_summary().to_dict(),
                 "project_sync": empty_project_segment_sync_summary().to_dict(),
-                "segments": [_serialize_workbench_segment(current_segment)],
+                "segments": [
+                    _serialize_workbench_segment(
+                        current_segment,
+                        workflow_step_by_id=workflow_step_by_id,
+                        writable_workflow_step_ids=writable_workflow_step_ids,
+                        can_manage=can_manage,
+                    )
+                ],
             }
     segment = update_segment_by_sentence_id(
         db=db,
@@ -6451,6 +7438,11 @@ def update_segment(
     if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0:
         db.commit()
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+        db,
+        file_record,
+        current_user,
+    )
 
     return {
         "id": segment.id,
@@ -6465,7 +7457,12 @@ def update_segment(
         "updated_count": 1,
         "conflicts": [],
         "segments": [
-            _serialize_workbench_segment(item)
+            _serialize_workbench_segment(
+                item,
+                workflow_step_by_id=workflow_step_by_id,
+                writable_workflow_step_ids=writable_workflow_step_ids,
+                can_manage=can_manage,
+            )
             for item in [segment, *project_sync_summary.current_file_segments]
         ],
     }
@@ -6483,6 +7480,14 @@ def update_segment_source(
 ):
     """更新单个片段的原文"""
     file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    existing_segment = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not existing_segment:
+        raise HTTPException(status_code=404, detail="片段不存在。")
+    _require_segment_work_access(db, file_record, existing_segment, current_user)
     segment = update_segment_source_text(
         db=db,
         file_record_id=file_record_id,
@@ -6511,7 +7516,7 @@ def update_segment_project_sync(
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """开启或关闭单个句段的项目内重复句段同步。"""
-    _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
     segment = (
         db.query(Segment)
         .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
@@ -6520,11 +7525,22 @@ def update_segment_project_sync(
     if not segment:
         raise HTTPException(status_code=404, detail="片段不存在。")
 
+    _require_segment_work_access(db, file_record, segment, current_user)
     segment.project_sync_disabled = payload.disabled
     segment.version = int(segment.version or 1) + 1
     db.commit()
     db.refresh(segment)
-    return _serialize_workbench_segment(segment)
+    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+        db,
+        file_record,
+        current_user,
+    )
+    return _serialize_workbench_segment(
+        segment,
+        workflow_step_by_id=workflow_step_by_id,
+        writable_workflow_step_ids=writable_workflow_step_ids,
+        can_manage=can_manage,
+    )
 
 
 @router.post("/file-records/{file_record_id}/segments/{sentence_id}/split")
@@ -6537,7 +7553,7 @@ def split_segment(
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """拆分句段：在指定偏移位置将一个句段拆为两个。"""
-    _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
     segment = (
         db.query(Segment)
         .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
@@ -6546,6 +7562,7 @@ def split_segment(
     if not segment:
         raise HTTPException(status_code=404, detail="片段不存在。")
 
+    _require_segment_work_access(db, file_record, segment, current_user)
     source_text = segment.source_text or ""
     if payload.split_offset <= 0 or payload.split_offset >= len(source_text):
         raise HTTPException(status_code=400, detail="拆分位置无效，必须在文本范围内。")
@@ -6589,6 +7606,7 @@ def split_segment(
     # 创建新句段
     new_segment = Segment(
         file_record_id=file_record_id,
+        workflow_step_id=segment.workflow_step_id,
         sentence_id=new_sentence_id,
         source_text=second_source,
         source_hash=build_source_hash(second_source),
@@ -6611,10 +7629,25 @@ def split_segment(
     db.commit()
     db.refresh(segment)
     db.refresh(new_segment)
+    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+        db,
+        file_record,
+        current_user,
+    )
 
     return {
-        "first": _serialize_workbench_segment(segment),
-        "second": _serialize_workbench_segment(new_segment),
+        "first": _serialize_workbench_segment(
+            segment,
+            workflow_step_by_id=workflow_step_by_id,
+            writable_workflow_step_ids=writable_workflow_step_ids,
+            can_manage=can_manage,
+        ),
+        "second": _serialize_workbench_segment(
+            new_segment,
+            workflow_step_by_id=workflow_step_by_id,
+            writable_workflow_step_ids=writable_workflow_step_ids,
+            can_manage=can_manage,
+        ),
     }
 
 
@@ -6628,7 +7661,7 @@ def merge_segment(
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """合并句段：将当前句段与指定的下一个句段合并为一个。"""
-    _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
     first_seg = (
         db.query(Segment)
         .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
@@ -6649,6 +7682,11 @@ def merge_segment(
         raise HTTPException(status_code=404, detail="目标合并片段不存在。")
 
     # 校验两个句段必须在同一个 block 中
+    _require_segment_work_access(db, file_record, first_seg, current_user)
+    _require_segment_work_access(db, file_record, second_seg, current_user)
+    if first_seg.workflow_step_id != second_seg.workflow_step_id:
+        raise HTTPException(status_code=400, detail="只能合并处于同一流程阶段的句段。")
+
     if (
         first_seg.block_index != second_seg.block_index
         or first_seg.row_index != second_seg.row_index
@@ -6692,9 +7730,19 @@ def merge_segment(
     sync_file_record_status(db, file_record_id)
     db.commit()
     db.refresh(first_seg)
+    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+        db,
+        file_record,
+        current_user,
+    )
 
     return {
-        "merged": _serialize_workbench_segment(first_seg),
+        "merged": _serialize_workbench_segment(
+            first_seg,
+            workflow_step_by_id=workflow_step_by_id,
+            writable_workflow_step_ids=writable_workflow_step_ids,
+            can_manage=can_manage,
+        ),
         "deleted_sentence_id": payload.target_sentence_id,
     }
 
@@ -6711,10 +7759,27 @@ def batch_update(
 ):
     """批量更新片段译文"""
     file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    update_items = [u.model_dump() for u in batch.updates]
+    requested_sentence_ids = [
+        item.get("sentence_id")
+        for item in update_items
+        if item.get("sentence_id")
+    ]
+    if requested_sentence_ids:
+        target_segments = (
+            db.query(Segment)
+            .filter(
+                Segment.file_record_id == file_record_id,
+                Segment.sentence_id.in_(requested_sentence_ids),
+            )
+            .all()
+        )
+        for target_segment in target_segments:
+            _require_segment_work_access(db, file_record, target_segment, current_user)
     result = batch_update_segments(
         db=db,
         file_record_id=file_record_id,
-        updates=[u.model_dump() for u in batch.updates],
+        updates=update_items,
         current_user=current_user,
         return_result=True,
     )
@@ -6740,13 +7805,23 @@ def batch_update(
     if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0:
         db.commit()
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+        db,
+        file_record,
+        current_user,
+    )
     return {
         "updated_count": result.updated_count,
         "conflicts": [_serialize_segment_update_conflict(conflict) for conflict in result.conflicts],
         "auto_tm": auto_tm_summary.to_dict(),
         "project_sync": project_sync_summary.to_dict(),
         "segments": [
-            _serialize_workbench_segment(segment)
+            _serialize_workbench_segment(
+                segment,
+                workflow_step_by_id=workflow_step_by_id,
+                writable_workflow_step_ids=writable_workflow_step_ids,
+                can_manage=can_manage,
+            )
             for segment in [*result.updated_segments, *project_sync_summary.current_file_segments]
         ],
     }
@@ -6774,6 +7849,7 @@ def batch_update_segment_confirmation(
             )
             .all()
         )
+        segments = _filter_writable_segments(db, file_record, current_user, segments)
         next_status = "confirmed"
         updated_count = 0
         for segment in segments:
@@ -6787,6 +7863,7 @@ def batch_update_segment_confirmation(
             .filter(Segment.file_record_id == file_record_id, Segment.status == "confirmed")
             .all()
         )
+        segments = _filter_writable_segments(db, file_record, current_user, segments)
         updated_count = 0
         for segment in segments:
             next_status = _resolve_unconfirmed_segment_status(segment)
@@ -6855,6 +7932,7 @@ def replace_file_record_segment_targets(
         target_query=target_query,
     )
     segments = _order_segment_query(query).all()
+    segments = _filter_writable_segments(db, file_record, current_user, segments)
     if not segments:
         return {"updated_count": 0, "occurrence_count": 0}
 
@@ -7569,6 +8647,20 @@ async def llm_translate_file_record(
                         "sentence_id": result.sentence_id,
                         "status": result.status,
                         "message": "片段不存在，无法写回 LLM 译文。",
+                    },
+                )
+                continue
+
+            try:
+                _require_segment_work_access(db, file_record, segment, current_user)
+            except HTTPException as exc:
+                error_count += 1
+                yield _sse_event(
+                    "error",
+                    {
+                        "sentence_id": result.sentence_id,
+                        "status": result.status,
+                        "message": str(exc.detail),
                     },
                 )
                 continue

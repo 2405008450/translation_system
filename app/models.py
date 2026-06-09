@@ -78,6 +78,46 @@ class Project(Base):
         back_populates="project",
         cascade="all, delete-orphan",
     )
+    workflow_steps: Mapped[list["ProjectWorkflowStep"]] = relationship(
+        "ProjectWorkflowStep",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="ProjectWorkflowStep.sort_order",
+    )
+
+
+class ProjectWorkflowStep(Base):
+    __tablename__ = "project_workflow_steps"
+    __table_args__ = (
+        Index("ix_project_workflow_steps_project_id", "project_id"),
+        Index("ix_project_workflow_steps_project_order", "project_id", "sort_order"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    step_key: Mapped[str] = mapped_column(String(40), nullable=False)
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
+    step_type: Mapped[str] = mapped_column(String(20), nullable=False, default="custom")
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+
+    project: Mapped["Project"] = relationship("Project", back_populates="workflow_steps")
+    segments: Mapped[list["Segment"]] = relationship("Segment", back_populates="workflow_step")
+    file_assignments: Mapped[list["FileAssignment"]] = relationship(
+        "FileAssignment",
+        back_populates="workflow_step",
+    )
 
 
 class FileRecord(Base):
@@ -501,6 +541,11 @@ class FileAssignment(Base):
         ForeignKey("file_records.id", ondelete="CASCADE"),
         nullable=False,
     )
+    workflow_step_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("project_workflow_steps.id", ondelete="CASCADE"),
+        nullable=True,
+    )
     assignee_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
@@ -528,6 +573,10 @@ class FileAssignment(Base):
 
     file_record: Mapped["FileRecord"] = relationship("FileRecord", back_populates="file_assignments")
     project: Mapped["Project"] = relationship("Project")
+    workflow_step: Mapped["ProjectWorkflowStep | None"] = relationship(
+        "ProjectWorkflowStep",
+        back_populates="file_assignments",
+    )
     assignee: Mapped["User"] = relationship("User", foreign_keys=[assignee_id])
     assigned_by: Mapped["User | None"] = relationship("User", foreign_keys=[assigned_by_id])
     revoked_by: Mapped["User | None"] = relationship("User", foreign_keys=[revoked_by_id])
@@ -661,6 +710,11 @@ class Segment(Base):
         ForeignKey("file_records.id", ondelete="CASCADE"),
         nullable=False,
     )
+    workflow_step_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("project_workflow_steps.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     sentence_id: Mapped[str] = mapped_column(String(20), nullable=False)
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
     source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -701,6 +755,10 @@ class Segment(Base):
     )
 
     file_record: Mapped["FileRecord"] = relationship("FileRecord", back_populates="segments")
+    workflow_step: Mapped["ProjectWorkflowStep | None"] = relationship(
+        "ProjectWorkflowStep",
+        back_populates="segments",
+    )
     comments: Mapped[list["SegmentComment"]] = relationship("SegmentComment", back_populates="segment")
     revisions: Mapped[list["SegmentRevision"]] = relationship(
         "SegmentRevision",

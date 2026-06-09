@@ -441,6 +441,48 @@ CREATE TRIGGER update_projects_updated_at
 -- -----------------------------------------------------------------------------
 -- 5. 翻译工作台：文件记录
 -- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS project_workflow_steps (
+    id UUID PRIMARY KEY DEFAULT (
+        lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
+        lpad(to_hex(floor(random() * 65536)::int), 4, '0') || '-' ||
+        '4' || substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        substr('89ab', floor(random() * 4)::int + 1, 1) ||
+        substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
+    )::uuid,
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    step_key VARCHAR(40) NOT NULL,
+    name VARCHAR(80) NOT NULL,
+    step_type VARCHAR(20) NOT NULL DEFAULT 'custom',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE IF EXISTS project_workflow_steps
+    ADD COLUMN IF NOT EXISTS step_key VARCHAR(40) NOT NULL DEFAULT 'translate';
+ALTER TABLE IF EXISTS project_workflow_steps
+    ADD COLUMN IF NOT EXISTS name VARCHAR(80) NOT NULL DEFAULT '翻译';
+ALTER TABLE IF EXISTS project_workflow_steps
+    ADD COLUMN IF NOT EXISTS step_type VARCHAR(20) NOT NULL DEFAULT 'custom';
+ALTER TABLE IF EXISTS project_workflow_steps
+    ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE IF EXISTS project_workflow_steps
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW();
+
+CREATE INDEX IF NOT EXISTS ix_project_workflow_steps_project_id
+    ON project_workflow_steps (project_id);
+CREATE INDEX IF NOT EXISTS ix_project_workflow_steps_project_order
+    ON project_workflow_steps (project_id, sort_order);
+
+INSERT INTO project_workflow_steps (project_id, step_key, name, step_type, sort_order)
+SELECT p.id, 'translate', '翻译', 'translation', 0
+FROM projects AS p
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM project_workflow_steps AS pws
+    WHERE pws.project_id = p.id
+);
+
 CREATE TABLE IF NOT EXISTS file_records (
     id UUID PRIMARY KEY DEFAULT (
         lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
@@ -654,6 +696,7 @@ CREATE TABLE IF NOT EXISTS file_assignments (
     )::uuid,
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+    workflow_step_id UUID REFERENCES project_workflow_steps(id) ON DELETE CASCADE,
     assignee_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     assigned_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
     assigned_at TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -661,6 +704,9 @@ CREATE TABLE IF NOT EXISTS file_assignments (
     revoked_at TIMESTAMP,
     status VARCHAR(20) NOT NULL DEFAULT 'active'
 );
+
+ALTER TABLE IF EXISTS file_assignments
+    ADD COLUMN IF NOT EXISTS workflow_step_id UUID REFERENCES project_workflow_steps(id) ON DELETE CASCADE;
 
 CREATE TABLE IF NOT EXISTS assignment_events (
     id UUID PRIMARY KEY DEFAULT (
@@ -719,8 +765,9 @@ CREATE INDEX IF NOT EXISTS ix_file_assignments_assignee_id
     ON file_assignments (assignee_id);
 CREATE INDEX IF NOT EXISTS ix_file_assignments_status
     ON file_assignments (status);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_file_assignments_active_file_user
-    ON file_assignments (file_record_id, assignee_id)
+DROP INDEX IF EXISTS uq_file_assignments_active_file_user;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_file_assignments_active_file_step_user
+    ON file_assignments (file_record_id, workflow_step_id, assignee_id)
     WHERE status = 'active';
 
 CREATE INDEX IF NOT EXISTS ix_assignment_events_project_id
@@ -768,6 +815,7 @@ WHERE fr.project_id IS NOT NULL
 INSERT INTO file_assignments (
     project_id,
     file_record_id,
+    workflow_step_id,
     assignee_id,
     assigned_by_id,
     assigned_at,
@@ -776,6 +824,13 @@ INSERT INTO file_assignments (
 SELECT
     fr.project_id,
     fr.id,
+    (
+        SELECT pws.id
+        FROM project_workflow_steps AS pws
+        WHERE pws.project_id = fr.project_id
+        ORDER BY pws.sort_order ASC, pws.id ASC
+        LIMIT 1
+    ),
     fr.assignee_id,
     fr.assigned_by_id,
     COALESCE(fr.assigned_at, NOW()),
@@ -790,6 +845,18 @@ WHERE fr.project_id IS NOT NULL
         AND fa.assignee_id = fr.assignee_id
         AND fa.status = 'active'
   );
+
+UPDATE file_assignments AS fa
+SET workflow_step_id = first_step.id
+FROM (
+    SELECT DISTINCT ON (project_id)
+        id,
+        project_id
+    FROM project_workflow_steps
+    ORDER BY project_id, sort_order ASC, id ASC
+) AS first_step
+WHERE fa.workflow_step_id IS NULL
+  AND fa.project_id = first_step.project_id;
 
 DROP TRIGGER IF EXISTS update_file_records_updated_at ON file_records;
 CREATE TRIGGER update_file_records_updated_at
@@ -810,6 +877,7 @@ CREATE TABLE IF NOT EXISTS segments (
         lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
     )::uuid,
     file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+    workflow_step_id UUID REFERENCES project_workflow_steps(id) ON DELETE SET NULL,
     sentence_id VARCHAR(20) NOT NULL,
     source_text TEXT NOT NULL,
     source_hash VARCHAR(64),
@@ -834,6 +902,21 @@ CREATE TABLE IF NOT EXISTS segments (
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE IF EXISTS segments
+    ADD COLUMN IF NOT EXISTS workflow_step_id UUID REFERENCES project_workflow_steps(id) ON DELETE SET NULL;
+UPDATE segments AS s
+SET workflow_step_id = first_step.id
+FROM file_records AS fr
+JOIN (
+    SELECT DISTINCT ON (project_id)
+        id,
+        project_id
+    FROM project_workflow_steps
+    ORDER BY project_id, sort_order ASC, id ASC
+) AS first_step ON first_step.project_id = fr.project_id
+WHERE s.workflow_step_id IS NULL
+  AND s.file_record_id = fr.id;
 
 ALTER TABLE IF EXISTS segments
     ADD COLUMN IF NOT EXISTS source_hash VARCHAR(64);
@@ -862,6 +945,8 @@ CREATE INDEX IF NOT EXISTS ix_segments_file_source_hash
     ON segments (file_record_id, source_hash);
 CREATE INDEX IF NOT EXISTS ix_segments_file_record_order
     ON segments (file_record_id, block_index, row_index, cell_index, sentence_id);
+CREATE INDEX IF NOT EXISTS ix_segments_workflow_step_id
+    ON segments (workflow_step_id);
 
 DROP TRIGGER IF EXISTS update_segments_updated_at ON segments;
 CREATE TRIGGER update_segments_updated_at

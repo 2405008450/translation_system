@@ -1601,6 +1601,7 @@ export const useSegmentStore = defineStore('segment', () => {
     ensureRevisionTrackingBaselines,
     loadTask,
     loadSegmentPage,
+    refreshCurrentSegmentPage,
     loadMoreSegments,
     ensureAllSegmentsLoaded,
     ensurePreviewLoaded,
