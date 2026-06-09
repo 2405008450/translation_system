@@ -106,6 +106,14 @@ type SaveToTMTargetMode = 'new' | 'existing'
 type SegmentDisplayScope = 'all' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'confirmed_only' | 'empty_target'
 type RevisionMenuKind = 'track' | 'accept' | 'reject'
 type ResourceSearchMode = 'exact' | 'fuzzy'
+type FileExportStatus = 'queued' | 'running' | 'completed' | 'failed'
+interface FileExportTask {
+  task_id: string
+  status: FileExportStatus
+  progress: number
+  message?: string
+  error?: string | null
+}
 type SegmentEditorRowPublic = ComponentPublicInstance & {
   undoEditorChange: () => boolean
   redoEditorChange: () => boolean
@@ -360,6 +368,9 @@ const showExportMenu = ref(false)
 const exportOptions = ref<Array<{ id: string; name: string; description: string; extension: string }>>([])
 const loadingExportOptions = ref(false)
 const exporting = ref(false)
+const exportProgress = ref(0)
+const exportMessage = ref('')
+let exportPollTimer: number | null = null
 
 // 导出格式映射（用于原格式导出按钮显示）
 const exportFormatMap: Record<string, { format: string; label: string; note?: string }> = {
@@ -859,10 +870,14 @@ const targetPreviewSupported = computed(() => {
   return segmentStore.segments.length > 0
 })
 
-const exportButtonLabel = computed(() => t('common.actions.export'))
+const exportButtonLabel = computed(() => (
+  exporting.value ? `导出中 ${exportProgress.value}%` : t('common.actions.export')
+))
 
 const exportButtonTitle = computed(() => (
-  `${t('common.actions.export')} ${getTaskExportFormatLabel(segmentStore.fileRecord?.filename)}`
+  exporting.value
+    ? (exportMessage.value || `导出中 ${exportProgress.value}%`)
+    : `${t('common.actions.export')} ${getTaskExportFormatLabel(segmentStore.fileRecord?.filename)}`
 ))
 
 const saveToTMPreviewStats = computed(() => {
@@ -3095,6 +3110,9 @@ async function loadExportOptions() {
 }
 
 async function toggleExportMenu() {
+  if (exporting.value) {
+    return
+  }
   if (showExportMenu.value) {
     showExportMenu.value = false
     return
@@ -3105,43 +3123,67 @@ async function toggleExportMenu() {
   showExportMenu.value = true
 }
 
+function clearExportPollTimer() {
+  if (exportPollTimer !== null) {
+    window.clearTimeout(exportPollTimer)
+    exportPollTimer = null
+  }
+}
+
+function waitForExportPoll(ms: number) {
+  clearExportPollTimer()
+  return new Promise<void>((resolve) => {
+    exportPollTimer = window.setTimeout(() => {
+      exportPollTimer = null
+      resolve()
+    }, ms)
+  })
+}
+
+async function waitForFileExportTask(task: FileExportTask) {
+  let currentTask = task
+  while (true) {
+    exportProgress.value = currentTask.progress
+    exportMessage.value = currentTask.message || `导出处理中：${currentTask.progress}%`
+
+    if (currentTask.status === 'completed') {
+      return currentTask
+    }
+    if (currentTask.status === 'failed') {
+      throw new Error(currentTask.error || currentTask.message || '导出失败。')
+    }
+
+    await waitForExportPoll(1200)
+    const { data } = await http.get<FileExportTask>(`/file-records/export-tasks/${currentTask.task_id}`)
+    currentTask = data
+  }
+}
+
 async function exportWithType(exportType: string) {
-  if (!segmentStore.fileRecord) return
+  if (!segmentStore.fileRecord || exporting.value) return
 
   pageError.value = ''
   exporting.value = true
+  exportProgress.value = 0
+  exportMessage.value = '导出任务提交中。'
   showExportMenu.value = false
 
   try {
+    const { data: task } = await http.post<FileExportTask>(
+      `/file-records/${segmentStore.fileRecord.id}/exports`,
+      null,
+      { params: { type: exportType } },
+    )
+    const completedTask = await waitForFileExportTask(task)
     const response = await http.get(
-      `/file-records/${segmentStore.fileRecord.id}/export/${exportType}`,
-      { responseType: 'blob' }
+      `/file-records/export-tasks/${completedTask.task_id}/download`,
+      { responseType: 'blob' },
     )
 
     // 从响应头获取文件名
-    const contentDisposition = response.headers['content-disposition']
-    let filename = `export.${exportType}`
-    if (contentDisposition) {
-      const filenameMatch = contentDisposition.match(/filename\*=UTF-8''(.+?)(?:;|$)/)
-      if (filenameMatch) {
-        filename = decodeURIComponent(filenameMatch[1])
-      } else {
-        const simpleMatch = contentDisposition.match(/filename="?(.+?)"?(?:;|$)/)
-        if (simpleMatch) {
-          filename = simpleMatch[1]
-        }
-      }
-    }
-
-    // 下载文件
-    const url = window.URL.createObjectURL(new Blob([response.data]))
-    const link = document.createElement('a')
-    link.href = url
-    link.setAttribute('download', filename)
-    document.body.appendChild(link)
-    link.click()
-    link.remove()
-    window.URL.revokeObjectURL(url)
+    const resolvedFilename = resolveDownloadFilename(response.headers['content-disposition'], `export.${exportType}`)
+    downloadBlob(response.data, resolvedFilename)
+    toast.success('导出完成，文件已开始下载。')
   } catch (error) {
     if (axios.isAxiosError(error)) {
       pageError.value = String(error.response?.data?.detail || '导出失败。')
@@ -3149,7 +3191,10 @@ async function exportWithType(exportType: string) {
     }
     pageError.value = error instanceof Error ? error.message : '导出失败。'
   } finally {
+    clearExportPollTimer()
     exporting.value = false
+    exportProgress.value = 0
+    exportMessage.value = ''
   }
 }
 
@@ -3387,6 +3432,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
   document.removeEventListener('click', handleClickOutside)
   document.removeEventListener('selectionchange', handleSelectionChange)
+  clearExportPollTimer()
   commentStore.stopPolling()
 })
 
@@ -3432,11 +3478,12 @@ onBeforeRouteLeave(async () => {
               class="workbench-ribbon__top-action"
               data-testid="workbench-export-button"
               type="button"
-              :disabled="!segmentStore.canExport"
+              :disabled="!segmentStore.canExport || exporting"
               :title="exportButtonTitle"
               @click="toggleExportMenu"
             >
-              <Download :size="15" />
+              <Loader2 v-if="exporting" class="lucide-spin" :size="15" />
+              <Download v-else :size="15" />
               <span>{{ exportButtonLabel }}</span>
               <ChevronDown :size="12" />
             </button>
@@ -3541,7 +3588,7 @@ onBeforeRouteLeave(async () => {
             :disabled="confirmationActionLoading || segmentStore.totalSegmentCount === 0"
             :aria-expanded="openConfirmMenu"
             aria-haspopup="menu"
-            @click.stop="toggleConfirmMenu"
+            @click.stop="openConfirmMenu = false; void confirmAndMoveToNextUnconfirmed()"
           >
             <span class="tool-line line1 with-big-icon">
               <span class="icon-text-area has_dropdown">
@@ -4062,11 +4109,12 @@ onBeforeRouteLeave(async () => {
               class="button workbench-action workbench-action--export"
               data-testid="workbench-export-button-toolbar"
               type="button"
-              :disabled="!segmentStore.canExport"
+              :disabled="!segmentStore.canExport || exporting"
               :title="exportButtonTitle"
               @click="toggleExportMenu"
             >
-              <Download :size="14" />
+              <Loader2 v-if="exporting" class="lucide-spin" :size="14" />
+              <Download v-else :size="14" />
               {{ exportButtonLabel }}
               <ChevronDown :size="12" />
             </button>

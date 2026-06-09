@@ -40,6 +40,7 @@ from app.models import (
     DocumentStatisticsReport,
     DocumentStatisticsReportItem,
     FileAssignment,
+    FileExportTask,
     FileRecord,
     GlossaryBase,
     IssueMarker,
@@ -176,6 +177,13 @@ from app.services.notification_service import (
     build_resource_import_notification,
     build_save_to_tm_notification,
     create_operation_notification,
+)
+from app.services.file_export_queue import (
+    build_file_export_download_response,
+    get_file_export_task,
+    queue_file_export,
+    serialize_file_export_task,
+    wait_for_file_export_task,
 )
 from app.services.project_segment_sync import (
     empty_project_segment_sync_summary,
@@ -6094,6 +6102,91 @@ def patch_file_record_bindings(
     }
 
 
+def _require_file_export_task_read_access(
+    task: FileExportTask,
+    current_user: User,
+) -> None:
+    if task.file_record is None:
+        raise HTTPException(status_code=404, detail="File record not found.")
+    _require_file_record_read_access(task.file_record, current_user)
+
+
+def _queue_file_record_export_for_current_user(
+    *,
+    file_record_id: UUID,
+    export_type: str,
+    db: Session,
+    current_user: User,
+) -> dict[str, Any]:
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File record not found.")
+
+    _require_file_record_read_access(file_record, current_user)
+    raw_bytes = load_file_record_source(file_record)
+    from app.services.adapters import get_export_options_for_file
+
+    export_option_ids = {option.get("id") for option in get_export_options_for_file(file_record.filename)}
+    if export_type not in export_option_ids:
+        raise HTTPException(status_code=400, detail="Current file format does not support this export type.")
+
+    if export_type == "original" and not can_export_task_file(
+        get_file_record_source_filename(file_record),
+        has_source_file=raw_bytes is not None,
+    ):
+        raise HTTPException(status_code=400, detail="Current file format does not support original export yet.")
+
+    return queue_file_export(
+        db,
+        file_record_id=file_record_id,
+        export_type=export_type,
+        current_user=current_user,
+    )
+
+
+@router.post("/file-records/{file_record_id}/exports")
+@router.post("/documents/{file_record_id}/exports", include_in_schema=False)
+def create_file_record_export_task(
+    file_record_id: UUID,
+    type: str = Query(default="original"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return JSONResponse(
+        status_code=202,
+        content=_queue_file_record_export_for_current_user(
+            file_record_id=file_record_id,
+            export_type=type,
+            db=db,
+            current_user=current_user,
+        ),
+    )
+
+
+@router.get("/file-records/export-tasks/{task_id}")
+@router.get("/documents/export-tasks/{task_id}", include_in_schema=False)
+def get_file_record_export_task(
+    task_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    task = get_file_export_task(db, task_id)
+    _require_file_export_task_read_access(task, current_user)
+    return serialize_file_export_task(task)
+
+
+@router.get("/file-records/export-tasks/{task_id}/download")
+@router.get("/documents/export-tasks/{task_id}/download", include_in_schema=False)
+def download_file_record_export_task(
+    task_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    task = get_file_export_task(db, task_id)
+    _require_file_export_task_read_access(task, current_user)
+    return build_file_export_download_response(task)
+
+
 @router.get("/file-records/{file_record_id}/export")
 @router.get("/documents/{file_record_id}/export", include_in_schema=False)
 @router.get("/file-records/{file_record_id}/export-docx")
@@ -6103,36 +6196,14 @@ def export_file_record_docx(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _begin_repeatable_read_snapshot(db)
-    file_record = get_file_record_model(db, file_record_id)
-    if not file_record:
-        raise HTTPException(status_code=404, detail="File record not found.")
-
-    _require_file_record_read_access(file_record, current_user)
-    raw_bytes = load_file_record_source(file_record)
-    source_filename = get_file_record_source_filename(file_record)
-    if not can_export_task_file(source_filename, has_source_file=raw_bytes is not None):
-        raise HTTPException(status_code=400, detail="Current file format does not support original export yet.")
-
-    segments = list_segments_for_file_record(db, file_record_id)
-    try:
-        exported_file = export_translated_task_file(
-            raw_bytes=raw_bytes,
-            filename=source_filename,
-            segments=segments,
-            document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
-            document_parse_options=_get_file_record_document_parse_options(file_record),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    return _build_binary_download_response(
-        filename=exported_file.filename,
-        content=exported_file.content,
-        media_type=exported_file.media_type,
+    queued_task = _queue_file_record_export_for_current_user(
+        file_record_id=file_record_id,
+        export_type="original",
+        db=db,
+        current_user=current_user,
     )
+    task = wait_for_file_export_task(UUID(queued_task["task_id"]))
+    return build_file_export_download_response(task)
 
 
 @router.get("/file-records/{file_record_id}/export-options")
@@ -6160,6 +6231,24 @@ def get_file_record_export_options(
 
 
 @router.get("/file-records/{file_record_id}/export/{export_type}")
+@router.get("/documents/{file_record_id}/export/{export_type}", include_in_schema=False)
+def export_file_record_with_type_queued(
+    file_record_id: UUID,
+    export_type: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    queued_task = _queue_file_record_export_for_current_user(
+        file_record_id=file_record_id,
+        export_type=export_type,
+        db=db,
+        current_user=current_user,
+    )
+    task = wait_for_file_export_task(UUID(queued_task["task_id"]))
+    return build_file_export_download_response(task)
+
+
+@router.get("/file-records/{file_record_id}/export/{export_type}", include_in_schema=False)
 @router.get("/documents/{file_record_id}/export/{export_type}", include_in_schema=False)
 def export_file_record_with_type(
     file_record_id: UUID,

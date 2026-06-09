@@ -260,6 +260,14 @@ interface LanguageDetectResponse {
 }
 
 type ProjectRow = ProjectFileItem | Record<string, any>
+type FileExportStatus = 'queued' | 'running' | 'completed' | 'failed'
+interface FileExportTask {
+  task_id: string
+  status: FileExportStatus
+  progress: number
+  message?: string
+  error?: string | null
+}
 
 const confirm = useConfirm()
 const authStore = useAuthStore()
@@ -391,6 +399,10 @@ const termImportDialogContext = ref<{
 const generatingTermQAReport = ref(false)
 const termQAReport = ref<TermQAReport | null>(null)
 const downloadingTermQAReport = ref(false)
+const exportingFileId = ref('')
+const exportFileProgress = ref(0)
+const exportFileMessage = ref('')
+let exportPollTimer: number | null = null
 
 const tabs = computed(() => ([
   { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
@@ -2415,8 +2427,58 @@ async function uploadSourceDocument() {
   }
 }
 
+function clearExportPollTimer() {
+  if (exportPollTimer !== null) {
+    window.clearTimeout(exportPollTimer)
+    exportPollTimer = null
+  }
+}
+
+function waitForExportPoll(ms: number) {
+  clearExportPollTimer()
+  return new Promise<void>((resolve) => {
+    exportPollTimer = window.setTimeout(() => {
+      exportPollTimer = null
+      resolve()
+    }, ms)
+  })
+}
+
+function isProjectFileExporting(row: ProjectRow | null) {
+  return Boolean(row && exportingFileId.value === String(row.id))
+}
+
+function getProjectFileExportLabel(row: ProjectRow | null) {
+  if (!isProjectFileExporting(row)) {
+    return t('projectDetail.files.actions.export')
+  }
+  return `导出中 ${exportFileProgress.value}%`
+}
+
+async function waitForFileExportTask(task: FileExportTask) {
+  let currentTask = task
+  while (true) {
+    exportFileProgress.value = currentTask.progress
+    exportFileMessage.value = currentTask.message || `导出处理中：${currentTask.progress}%`
+
+    if (currentTask.status === 'completed') {
+      return currentTask
+    }
+    if (currentTask.status === 'failed') {
+      throw new Error(currentTask.error || currentTask.message || '导出失败。')
+    }
+
+    await waitForExportPoll(1200)
+    const { data } = await http.get<FileExportTask>(`/file-records/export-tasks/${currentTask.task_id}`)
+    currentTask = data
+  }
+}
+
 async function exportProjectFile(row: ProjectRow) {
   if (!row.has_source_document) {
+    return
+  }
+  if (exportingFileId.value) {
     return
   }
 
@@ -2424,9 +2486,18 @@ async function exportProjectFile(row: ProjectRow) {
   pageError.value = ''
   const rowId = String(row.id)
   const filename = String(row.filename || 'translated.txt')
+  exportingFileId.value = rowId
+  exportFileProgress.value = 0
+  exportFileMessage.value = '导出任务提交中。'
 
   try {
-    const response = await http.get(`/file-records/${rowId}/export`, {
+    const { data: task } = await http.post<FileExportTask>(
+      `/file-records/${rowId}/exports`,
+      null,
+      { params: { type: 'original' } },
+    )
+    const completedTask = await waitForFileExportTask(task)
+    const response = await http.get(`/file-records/export-tasks/${completedTask.task_id}/download`, {
       responseType: 'blob',
     })
     const downloadName = resolveDownloadFilename(
@@ -2434,8 +2505,14 @@ async function exportProjectFile(row: ProjectRow) {
       buildTranslatedTaskFilename(filename),
     )
     downloadBlob(response.data, downloadName)
+    toast.success('导出完成，文件已开始下载。')
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.export'))
+  } finally {
+    clearExportPollTimer()
+    exportingFileId.value = ''
+    exportFileProgress.value = 0
+    exportFileMessage.value = ''
   }
 }
 
@@ -2573,6 +2650,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('click', handleDocumentClick)
   window.removeEventListener('scroll', handleDocumentScroll)
   window.removeEventListener('resize', handleDocumentScroll)
+  clearExportPollTimer()
 })
 
 </script>
@@ -4093,11 +4171,11 @@ onBeforeUnmount(() => {
         </button>
         <button
           type="button"
-          :disabled="!actionMenuRow.has_source_document"
-          :title="!actionMenuRow.has_source_document ? t('projectDetail.common.uploadRequired') : undefined"
+          :disabled="!actionMenuRow.has_source_document || Boolean(exportingFileId)"
+          :title="isProjectFileExporting(actionMenuRow) ? exportFileMessage : (!actionMenuRow.has_source_document ? t('projectDetail.common.uploadRequired') : undefined)"
           @click="exportProjectFile(actionMenuRow)"
         >
-          {{ t('projectDetail.files.actions.export') }}
+          {{ getProjectFileExportLabel(actionMenuRow) }}
         </button>
         <button
           type="button"

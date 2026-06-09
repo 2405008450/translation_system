@@ -96,6 +96,23 @@ REQUIRED_SCHEMA = {
         "deadline",
         "access_level",
     },
+    "file_export_tasks": {
+        "id",
+        "file_record_id",
+        "export_type",
+        "status",
+        "progress",
+        "message",
+        "result_path",
+        "filename",
+        "media_type",
+        "size_bytes",
+        "error",
+        "created_by_id",
+        "created_at",
+        "updated_at",
+        "expires_at",
+    },
     "document_statistics_reports": {
         "id",
         "project_id",
@@ -329,6 +346,11 @@ REQUIRED_INDEXES = {
         "ix_document_statistics_report_items_report_id",
         "ix_document_statistics_report_items_project_id",
         "ix_document_statistics_report_items_file_record_id",
+    },
+    "file_export_tasks": {
+        "ix_file_export_tasks_file_record_type",
+        "ix_file_export_tasks_status",
+        "ix_file_export_tasks_expires_at",
     },
 }
 
@@ -983,6 +1005,37 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_file_records_active_operation
             ON file_records (active_operation)
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS file_export_tasks (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+                export_type VARCHAR(40) NOT NULL DEFAULT 'original',
+                status VARCHAR(20) NOT NULL DEFAULT 'queued',
+                progress INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL DEFAULT '',
+                result_path TEXT,
+                filename VARCHAR(255),
+                media_type VARCHAR(120),
+                size_bytes INTEGER,
+                error TEXT,
+                created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMP NOT NULL
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_file_export_tasks_file_record_type
+            ON file_export_tasks (file_record_id, export_type)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_file_export_tasks_status
+            ON file_export_tasks (status)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_file_export_tasks_expires_at
+            ON file_export_tasks (expires_at)
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_file_records_assignee_id

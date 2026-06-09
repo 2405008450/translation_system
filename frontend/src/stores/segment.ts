@@ -28,6 +28,15 @@ const DEFAULT_SEGMENT_PAGE_SIZE = 100
 const MAX_SEGMENT_PAGE_SIZE = 500
 const AUTO_SYNC_DELAY_MS = 1500
 const CHANGE_POLL_INTERVAL_MS = 10000
+const EXPORT_POLL_INTERVAL_MS = 1200
+
+interface FileExportTask {
+  task_id: string
+  status: 'queued' | 'running' | 'completed' | 'failed'
+  progress: number
+  message?: string
+  error?: string | null
+}
 
 function createEmptySegmentStatusStats(): SegmentStatusStats {
   return {
@@ -1442,7 +1451,13 @@ export const useSegmentStore = defineStore('segment', () => {
       }
     }
 
-    const response = await http.get(`/file-records/${fileRecord.value.id}/export`, {
+    const { data: task } = await http.post<FileExportTask>(
+      `/file-records/${fileRecord.value.id}/exports`,
+      null,
+      { params: { type: 'original' } },
+    )
+    const completedTask = await waitForFileExportTask(task)
+    const response = await http.get(`/file-records/export-tasks/${completedTask.task_id}/download`, {
       responseType: 'blob',
     })
     const filename = resolveDownloadFilename(
@@ -1450,6 +1465,22 @@ export const useSegmentStore = defineStore('segment', () => {
       buildTranslatedTaskFilename(fileRecord.value.filename),
     )
     downloadBlob(response.data, filename)
+  }
+
+  async function waitForFileExportTask(task: FileExportTask) {
+    let currentTask = task
+    while (true) {
+      if (currentTask.status === 'completed') {
+        return currentTask
+      }
+      if (currentTask.status === 'failed') {
+        throw new Error(currentTask.error || currentTask.message || '导出失败。')
+      }
+
+      await new Promise((resolve) => window.setTimeout(resolve, EXPORT_POLL_INTERVAL_MS))
+      const { data } = await http.get<FileExportTask>(`/file-records/export-tasks/${currentTask.task_id}`)
+      currentTask = data
+    }
   }
 
   async function loadSaveToTMStats(scope: 'translated' | 'confirmed' | 'all' = 'translated') {

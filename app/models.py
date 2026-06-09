@@ -257,6 +257,54 @@ class FileRecord(Base):
     )
 
 
+class FileExportTask(Base):
+    __tablename__ = "file_export_tasks"
+    __table_args__ = (
+        Index("ix_file_export_tasks_file_record_type", "file_record_id", "export_type"),
+        Index("ix_file_export_tasks_status", "status"),
+        Index("ix_file_export_tasks_expires_at", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    file_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    export_type: Mapped[str] = mapped_column(String(40), nullable=False, default="original")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="queued")
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    result_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    media_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+    expires_at: Mapped[DateTime] = mapped_column(DateTime(timezone=False), nullable=False)
+
+    file_record: Mapped["FileRecord"] = relationship("FileRecord")
+    created_by: Mapped["User | None"] = relationship("User", foreign_keys=[created_by_id])
+
+
 class DocumentStatisticsReport(Base):
     __tablename__ = "document_statistics_reports"
     __table_args__ = (

@@ -300,8 +300,8 @@ function renderHighlightPartsAsHtml(parts: HighlightPart[] | null, text: string)
   return sourceParts
     .map((seg) =>
       seg.highlight
-        ? `<mark class="${seg.kind === 'search' ? 'segment-row__search-highlight' : 'segment-row__term-highlight'}">${escapeHtml(seg.text)}</mark>`
-        : escapeHtml(seg.text)
+        ? `<mark class="${seg.kind === 'search' ? 'segment-row__search-highlight' : 'segment-row__term-highlight'}">${textToVisibleChars(seg.text)}</mark>`
+        : textToVisibleChars(seg.text)
     )
     .join('')
 }
@@ -338,7 +338,7 @@ function hasTargetHighlights(): boolean {
 }
 
 function renderSourceHtmlWithHighlights(sourceHtml: string): string {
-  if (!hasSourceHighlights() || typeof document === 'undefined') {
+  if (typeof document === 'undefined') {
     return sourceHtml
   }
 
@@ -350,7 +350,9 @@ function renderSourceHtmlWithHighlights(sourceHtml: string): string {
       const text = node.textContent || ''
       if (!text) return
       const wrapper = document.createElement('span')
-      wrapper.innerHTML = renderSourceTextWithHighlights(text)
+      wrapper.innerHTML = hasSourceHighlights()
+        ? renderSourceTextWithHighlights(text)
+        : textToVisibleChars(text)
       const textNode = node as ChildNode
       textNode.replaceWith(...Array.from(wrapper.childNodes))
       return
@@ -1074,18 +1076,29 @@ function handlePaste(event: ClipboardEvent) {
 
   if (html) {
     // 清理 HTML，只保留允许的格式标签
-    const cleanHtml = sanitizeHtml(html)
-    document.execCommand('insertHTML', false, cleanHtml)
+    const cleanHtml = sanitizeHtml(html, { dropStructuralWhitespace: true })
+    if (hasSerializableFormatTags(cleanHtml)) {
+      document.execCommand('insertHTML', false, cleanHtml)
+    } else {
+      document.execCommand('insertText', false, text)
+    }
   } else {
     document.execCommand('insertText', false, text)
   }
   handleInput()
 }
 
+function hasSerializableFormatTags(html: string): boolean {
+  return /<(b|i|u|s|sub|sup)>/i.test(html)
+}
+
 /**
  * 清理 HTML，只保留允许的格式标签
  */
-function sanitizeHtml(html: string): string {
+function sanitizeHtml(
+  html: string,
+  options: { dropStructuralWhitespace?: boolean } = {},
+): string {
   if (typeof document === 'undefined') {
     return escapeHtml(html)
   }
@@ -1096,7 +1109,11 @@ function sanitizeHtml(html: string): string {
   // 递归处理节点
   function processNode(node: Node): string {
     if (node.nodeType === Node.TEXT_NODE) {
-      return escapeHtml(node.textContent || '')
+      const text = node.textContent || ''
+      if (options.dropStructuralWhitespace && /^[\t\n\r ]+$/.test(text) && /[\t\n\r]/.test(text)) {
+        return ''
+      }
+      return escapeHtml(text)
     }
 
     if (node.nodeType === Node.ELEMENT_NODE) {
@@ -1788,23 +1805,32 @@ watch(
 }
 
 /* 显示标记样式 */
+.segment-row__text :deep(.visible-char),
+.segment-row__source-editor :deep(.visible-char),
 .segment-row__editor :deep(.visible-char) {
-  color: #9ca3af;
+  color: #64748b;
   font-size: 0.85em;
+  font-weight: 700;
   user-select: none;
   pointer-events: none;
 }
 
+.segment-row__text :deep(.visible-char--space),
+.segment-row__source-editor :deep(.visible-char--space),
 .segment-row__editor :deep(.visible-char--space) {
-  color: #d1d5db;
+  color: #6b7280;
 }
 
+.segment-row__text :deep(.visible-char--tab),
+.segment-row__source-editor :deep(.visible-char--tab),
 .segment-row__editor :deep(.visible-char--tab) {
-  color: #93c5fd;
+  color: #3b82f6;
 }
 
+.segment-row__text :deep(.visible-char--newline),
+.segment-row__source-editor :deep(.visible-char--newline),
 .segment-row__editor :deep(.visible-char--newline) {
-  color: #fca5a5;
+  color: #ef4444;
 }
 
 /* 富文本格式样式 */

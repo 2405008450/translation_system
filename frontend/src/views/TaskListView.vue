@@ -87,15 +87,31 @@ const importDialogContext = ref<{
 })
 
 const columns = computed<DataTableColumn[]>(() => ([
-  { key: 'project_name', label: t('taskList.columns.projectName'), sortable: true },
-  { key: 'filename', label: t('taskList.columns.filename'), sortable: true },
-  { key: 'status', label: t('taskList.columns.status'), width: '110px' },
-  { key: 'progress', label: t('projectList.status.progress'), width: '180px' },
+  { key: 'project_name', label: t('taskList.columns.projectName'), width: '150px', sortable: true },
+  { key: 'filename', label: t('taskList.columns.filename'), width: '260px', sortable: true },
+  { key: 'status', label: t('taskList.columns.status'), width: '96px' },
+  { key: 'progress', label: t('projectList.status.progress'), width: '150px' },
   { key: 'total_segments', label: '句段数', width: '110px', align: 'right' },
-  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '120px' },
-  { key: 'created_at', label: t('taskList.columns.createdAt'), width: '160px', sortable: true },
-  { key: 'updated_at', label: t('taskList.columns.updatedAt'), width: '160px', sortable: true },
+  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '96px' },
+  { key: 'created_at', label: t('taskList.columns.createdAt'), width: '132px', sortable: true },
+  { key: 'updated_at', label: t('taskList.columns.updatedAt'), width: '132px', sortable: true },
 ]))
+
+function compactFilename(filename: string, maxLength = 54) {
+  if (filename.length <= maxLength) {
+    return filename
+  }
+
+  const dotIndex = filename.lastIndexOf('.')
+  const extension = dotIndex > 0 && filename.length - dotIndex <= 12
+    ? filename.slice(dotIndex)
+    : ''
+  const body = extension ? filename.slice(0, -extension.length) : filename
+  const headLength = Math.max(18, Math.floor((maxLength - extension.length - 3) * 0.55))
+  const tailLength = Math.max(10, maxLength - extension.length - headLength - 3)
+
+  return `${body.slice(0, headLength)}...${body.slice(-tailLength)}${extension}`
+}
 
 function openImportDialog(
   task?: Partial<{ filename: string; source_language: string | null; target_language: string | null }> | null,
@@ -396,7 +412,9 @@ onBeforeUnmount(() => {
             @select="handleSelect"
           >
             <template #project_name="{ row }">
-              <span>{{ row.project_name || t('common.notSet') }}</span>
+              <span class="task-name-cell" :title="row.project_name || t('common.notSet')">
+                {{ row.project_name || t('common.notSet') }}
+              </span>
             </template>
 
             <template #filename="{ row }">
@@ -406,7 +424,7 @@ onBeforeUnmount(() => {
                 :title="row.filename"
                 @click="openProjectDetail(row as ProjectRow)"
               >
-                {{ row.filename }}
+                {{ compactFilename(row.filename) }}
               </button>
             </template>
 
@@ -567,10 +585,37 @@ onBeforeUnmount(() => {
 }
 
 .project-link {
+  display: inline-block;
+  max-width: 100%;
   padding: 0;
   border: none;
   background: transparent;
   box-shadow: none;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.task-name-cell {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.table-page__body :deep(.data-table) {
+  table-layout: fixed;
+  min-width: 1180px;
+}
+
+.table-page__body :deep(.data-table th),
+.table-page__body :deep(.data-table td) {
+  padding-right: 10px;
+  padding-left: 10px;
 }
 
 .project-status {
