@@ -59,6 +59,21 @@ def is_word_document_filename(filename: str | None) -> bool:
     return Path(filename).suffix.lower() in WORD_DOCUMENT_EXTENSIONS
 
 
+def get_automatic_numbering_text(
+    *,
+    source_text: str,
+    display_text: str | None = None,
+    numbering_text: str | None = None,
+) -> str:
+    prefixes = _source_prefixes(
+        source_text=source_text,
+        display_text=display_text,
+        numbering_text=numbering_text,
+        reference_texts=None,
+    )
+    return prefixes[0] if prefixes else ""
+
+
 def strip_segment_automatic_numbering_prefix(
     segment: Any,
     text: str | None,
@@ -179,6 +194,8 @@ def _looks_like_numbering_prefix(prefix: str) -> bool:
     normalized = normalize_text(prefix)
     if not normalized or len(normalized) > 40:
         return False
+    if re.fullmatch(r"[\(（]\s*\d+(?:\.\d+)*\s*[\)）]", normalized):
+        return True
     if re.fullmatch(r"\d+(?:\.\d+)*[.)、]?", normalized):
         return True
     if re.fullmatch(r"[A-Za-z][.)、]?", normalized):

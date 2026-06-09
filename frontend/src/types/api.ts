@@ -365,6 +365,8 @@ export interface Segment {
   display_index?: number | null
   source_text: string
   display_text: string
+  source_body_text?: string
+  automatic_numbering_text?: string | null
   source_html?: string | null
   target_text: string
   target_html?: string | null

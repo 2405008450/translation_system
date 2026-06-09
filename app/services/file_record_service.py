@@ -27,6 +27,10 @@ from app.services.document_workspace import (
     parse_docx_workspace,
 )
 from app.services.analytics_service import count_source_words, record_translation_metric_event
+from app.services.automatic_numbering import (
+    is_word_document_filename,
+    strip_segment_automatic_numbering_prefix,
+)
 from app.services.normalizer import build_source_hash
 from app.services.revision_service import create_revision
 from app.services.segment_status import resolve_unconfirmed_segment_status
@@ -821,6 +825,31 @@ def get_tm_target_text_map(
     return {match.source_text: match.target_text for match in matches}
 
 
+def _clean_segment_target_for_automatic_numbering(
+    segment: Segment,
+    target_text: str | None,
+    target_html: str | None,
+    *,
+    clean_numbering: bool | None = None,
+) -> tuple[str, str | None]:
+    original_target_text = target_text or ""
+    should_clean = clean_numbering
+    if should_clean is None:
+        should_clean = is_word_document_filename(
+            getattr(getattr(segment, "file_record", None), "filename", None)
+        )
+    if not should_clean:
+        return original_target_text, target_html
+
+    cleaned_target_text = strip_segment_automatic_numbering_prefix(
+        segment,
+        original_target_text,
+        reference_texts=[segment.matched_source_text],
+    )
+    cleaned_target_html = None if cleaned_target_text != original_target_text else target_html
+    return cleaned_target_text, cleaned_target_html
+
+
 def update_segment_target(
     db: Session,
     segment_id: UUID,
@@ -837,6 +866,11 @@ def update_segment_target(
     if not segment:
         return None
 
+    target_text, target_html = _clean_segment_target_for_automatic_numbering(
+        segment,
+        target_text,
+        target_html,
+    )
     before_text = segment.target_text
     segment.target_text = target_text
     segment.target_html = target_html if target_html else None
@@ -899,6 +933,11 @@ def update_segment_by_sentence_id(
     if not segment:
         return None
 
+    target_text, target_html = _clean_segment_target_for_automatic_numbering(
+        segment,
+        target_text,
+        target_html,
+    )
     before_text = segment.target_text
     segment.target_text = target_text
     segment.target_html = target_html if target_html else None
@@ -1011,6 +1050,8 @@ def batch_update_segments(
         )
         .all()
     )
+    file_record = db.query(FileRecord).filter(FileRecord.id == file_record_id).first()
+    clean_numbering = is_word_document_filename(file_record.filename if file_record else None)
 
     updated_segments: list[Segment] = []
     conflicts: list[SegmentUpdateConflict] = []
@@ -1036,6 +1077,12 @@ def batch_update_segments(
         before_text = segment.target_text
         target_text = item.get("target_text", "")
         target_html = item.get("target_html")
+        target_text, target_html = _clean_segment_target_for_automatic_numbering(
+            segment,
+            target_text,
+            target_html,
+            clean_numbering=clean_numbering,
+        )
         source = item.get("source", "manual")
         track_revision = bool(item.get("track_revision", True))
         confirm = bool(item.get("confirm", False))

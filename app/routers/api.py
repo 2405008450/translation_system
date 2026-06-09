@@ -75,6 +75,7 @@ from app.services.analytics_service import (
     run_analytics_backfill_once,
 )
 from app.services.automatic_numbering import (
+    get_automatic_numbering_text,
     is_word_document_filename,
     strip_automatic_numbering_prefix,
 )
@@ -5788,10 +5789,22 @@ def _serialize_workbench_segment(
     seg: Segment,
     display_index: int | None = None,
     *,
+    source_filename: str | None = None,
     workflow_step_by_id: dict[UUID, ProjectWorkflowStep] | None = None,
     writable_workflow_step_ids: set[UUID] | None = None,
     can_manage: bool = False,
 ) -> dict:
+    resolved_source_filename = source_filename
+    if resolved_source_filename is None:
+        resolved_source_filename = getattr(getattr(seg, "file_record", None), "filename", None)
+    automatic_numbering_text = (
+        get_automatic_numbering_text(
+            source_text=seg.source_text,
+            display_text=seg.display_text,
+        )
+        if is_word_document_filename(resolved_source_filename)
+        else ""
+    )
     resolved_workflow_step_id = seg.workflow_step_id
     if resolved_workflow_step_id is None and workflow_step_by_id:
         resolved_workflow_step_id = next(iter(workflow_step_by_id.keys()), None)
@@ -5804,6 +5817,8 @@ def _serialize_workbench_segment(
         "sentence_id": seg.sentence_id,
         "source_text": seg.source_text,
         "display_text": seg.display_text,
+        "source_body_text": seg.source_text,
+        "automatic_numbering_text": automatic_numbering_text or None,
         "source_html": seg.source_html,
         "target_text": seg.target_text,
         "target_html": seg.target_html,
@@ -5987,13 +6002,18 @@ def _is_cjk_text(text: str) -> bool:
     return cjk_count > len(text) * 0.3
 
 
-def _build_preview_render_segments(segments: list[Segment], mode: str) -> list[dict]:
+def _build_preview_render_segments(
+    segments: list[Segment],
+    mode: str,
+    *,
+    source_filename: str | None = None,
+) -> list[dict]:
     if mode != "target":
-        return [_serialize_workbench_segment(segment) for segment in segments]
+        return [_serialize_workbench_segment(segment, source_filename=source_filename) for segment in segments]
 
     rendered: list[dict] = []
     for segment in segments:
-        item = _serialize_workbench_segment(segment)
+        item = _serialize_workbench_segment(segment, source_filename=source_filename)
         item["display_text"] = segment.target_text or segment.display_text or segment.source_text
         rendered.append(item)
     return rendered
@@ -6389,6 +6409,7 @@ def get_file_record(
             _serialize_workbench_segment(
                 seg,
                 display_index=result["skip"] + index,
+                source_filename=source_filename,
                 workflow_step_by_id=workflow_step_by_id,
                 writable_workflow_step_ids=writable_workflow_step_ids,
                 can_manage=can_manage,
@@ -6528,6 +6549,7 @@ def get_file_record_segments(
             _serialize_workbench_segment(
                 seg,
                 display_index=display_index_map.get(seg.id),
+                source_filename=file_record.filename,
                 workflow_step_by_id=workflow_step_by_id,
                 writable_workflow_step_ids=writable_workflow_step_ids,
                 can_manage=can_manage,
@@ -6577,6 +6599,7 @@ def get_file_record_segment_changes(
         "segments": [
             _serialize_workbench_segment(
                 segment,
+                source_filename=file_record.filename,
                 workflow_step_by_id=workflow_step_by_id,
                 writable_workflow_step_ids=writable_workflow_step_ids,
                 can_manage=can_manage,
@@ -6744,7 +6767,11 @@ def get_file_record_preview(
         .limit(safe_limit)
         .all()
     )
-    render_segments = _build_preview_render_segments(page_segments, mode)
+    render_segments = _build_preview_render_segments(
+        page_segments,
+        mode,
+        source_filename=source_filename,
+    )
     preview_html = build_task_preview_html(
         filename=source_filename,
         segments=render_segments,
@@ -7445,6 +7472,7 @@ def update_segment(
                 "segments": [
                     _serialize_workbench_segment(
                         current_segment,
+                        source_filename=file_record.filename,
                         workflow_step_by_id=workflow_step_by_id,
                         writable_workflow_step_ids=writable_workflow_step_ids,
                         can_manage=can_manage,
@@ -7506,6 +7534,7 @@ def update_segment(
         "segments": [
             _serialize_workbench_segment(
                 item,
+                source_filename=file_record.filename,
                 workflow_step_by_id=workflow_step_by_id,
                 writable_workflow_step_ids=writable_workflow_step_ids,
                 can_manage=can_manage,
@@ -7584,6 +7613,7 @@ def update_segment_project_sync(
     )
     return _serialize_workbench_segment(
         segment,
+        source_filename=file_record.filename,
         workflow_step_by_id=workflow_step_by_id,
         writable_workflow_step_ids=writable_workflow_step_ids,
         can_manage=can_manage,
@@ -7685,12 +7715,14 @@ def split_segment(
     return {
         "first": _serialize_workbench_segment(
             segment,
+            source_filename=file_record.filename,
             workflow_step_by_id=workflow_step_by_id,
             writable_workflow_step_ids=writable_workflow_step_ids,
             can_manage=can_manage,
         ),
         "second": _serialize_workbench_segment(
             new_segment,
+            source_filename=file_record.filename,
             workflow_step_by_id=workflow_step_by_id,
             writable_workflow_step_ids=writable_workflow_step_ids,
             can_manage=can_manage,
@@ -7786,6 +7818,7 @@ def merge_segment(
     return {
         "merged": _serialize_workbench_segment(
             first_seg,
+            source_filename=file_record.filename,
             workflow_step_by_id=workflow_step_by_id,
             writable_workflow_step_ids=writable_workflow_step_ids,
             can_manage=can_manage,
@@ -7865,6 +7898,7 @@ def batch_update(
         "segments": [
             _serialize_workbench_segment(
                 segment,
+                source_filename=file_record.filename,
                 workflow_step_by_id=workflow_step_by_id,
                 writable_workflow_step_ids=writable_workflow_step_ids,
                 can_manage=can_manage,

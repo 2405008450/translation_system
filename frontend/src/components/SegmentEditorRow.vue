@@ -244,7 +244,15 @@ function highlightSearchText(text: string, keyword: string): HighlightPart[] | n
   return segments
 }
 
-const sourceTextContent = computed(() => props.segment.display_text || props.segment.source_text || '')
+const automaticNumberingTitle = 'Word 自动编号，导出时会自动生成，译文无需输入编号'
+const automaticNumberingText = computed(() => (props.segment.automatic_numbering_text || '').trim())
+const hasAutomaticNumbering = computed(() => automaticNumberingText.value.length > 0)
+const sourceTextContent = computed(() => {
+  if (hasAutomaticNumbering.value) {
+    return props.segment.source_body_text || props.segment.source_text || ''
+  }
+  return props.segment.display_text || props.segment.source_text || ''
+})
 
 const highlightedSourceText = computed(() => {
   const text = sourceTextContent.value
@@ -260,7 +268,7 @@ const highlightedTargetText = computed(() => {
 // 生成带高亮的 HTML
 const targetHtmlContent = computed(() => {
   // 如果有保存的格式化 HTML，优先使用
-  if (props.segment.target_html) {
+  if (props.segment.target_html && !hasAutomaticNumbering.value) {
     return renderTargetHtmlWithHighlights(sanitizeHtml(props.segment.target_html))
   }
 
@@ -421,7 +429,7 @@ function renderTargetHtmlWithHighlights(targetHtml: string): string {
 }
 
 const sourceHtmlContent = computed(() => {
-  if (props.segment.source_html) {
+  if (props.segment.source_html && !hasAutomaticNumbering.value) {
     return renderSourceHtmlWithHighlights(sanitizeHtml(props.segment.source_html))
   }
   return renderHighlightPartsAsHtml(highlightedSourceText.value, sourceTextContent.value)
@@ -1436,21 +1444,32 @@ watch(
     </div>
 
     <div class="segment-row__cell segment-row__cell--source" @click="handleClick">
-      <div
-        v-if="active"
-        ref="sourceEditorRef"
-        class="segment-row__source-editor"
-        :class="{ 'is-focused': isSourceFocused, 'is-readonly': !sourceEditing }"
-        :contenteditable="sourceEditing && !disabled"
-        tabindex="0"
-        spellcheck="false"
-        @focus="handleSourceFocus"
-        @blur="handleSourceBlur"
-        @input="handleSourceInput"
-        @keydown="handleSourceKeydown"
-        @beforeinput="handleSourceBeforeInput"
-      ></div>
-      <div v-else class="segment-row__text" v-html="sourceHtmlContent"></div>
+      <div class="segment-row__source-content">
+        <span
+          v-if="hasAutomaticNumbering"
+          class="segment-row__automatic-numbering-badge"
+          :title="automaticNumberingTitle"
+          aria-hidden="true"
+          contenteditable="false"
+        >
+          {{ automaticNumberingText }}
+        </span>
+        <div
+          v-if="active"
+          ref="sourceEditorRef"
+          class="segment-row__source-editor"
+          :class="{ 'is-focused': isSourceFocused, 'is-readonly': !sourceEditing }"
+          :contenteditable="sourceEditing && !disabled"
+          tabindex="0"
+          spellcheck="false"
+          @focus="handleSourceFocus"
+          @blur="handleSourceBlur"
+          @input="handleSourceInput"
+          @keydown="handleSourceKeydown"
+          @beforeinput="handleSourceBeforeInput"
+        ></div>
+        <div v-else class="segment-row__text" v-html="sourceHtmlContent"></div>
+      </div>
     </div>
 
     <div class="segment-row__cell segment-row__cell--target" :class="{ 'is-pending': hasPendingRevision }">
@@ -1479,31 +1498,42 @@ watch(
           empty-text="空"
         />
       </div>
-      <div
-        ref="editorRef"
-        class="segment-row__editor"
-        :class="[
-          { 'is-focused': isFocused, 'has-revision': hasPendingRevision },
-          revisionAuthorClass,
-        ]"
-        :contenteditable="!disabled"
-        tabindex="0"
-        data-testid="segment-target-editor"
-        :data-revision-visible="hasPendingRevision ? 'true' : 'false'"
-        data-segment-target="true"
-        :data-sentence-id="segment.sentence_id"
-        :aria-label="`translation for segment ${index + 1}`"
-        spellcheck="false"
-        @focus="handleFocus"
-        @blur="handleBlur"
-        @click="handleClick"
-        @keydown="handleKeydown"
-        @compositionstart="handleCompositionStart"
-        @compositionend="handleCompositionEnd"
-        @beforeinput="handleBeforeInput"
-        @input="handleInput"
-        @paste="handlePaste"
-      />
+      <div class="segment-row__target-content">
+        <span
+          v-if="hasAutomaticNumbering"
+          class="segment-row__automatic-numbering-badge segment-row__automatic-numbering-badge--target"
+          :title="automaticNumberingTitle"
+          aria-hidden="true"
+          contenteditable="false"
+        >
+          {{ automaticNumberingText }}
+        </span>
+        <div
+          ref="editorRef"
+          class="segment-row__editor"
+          :class="[
+            { 'is-focused': isFocused, 'has-revision': hasPendingRevision },
+            revisionAuthorClass,
+          ]"
+          :contenteditable="!disabled"
+          tabindex="0"
+          data-testid="segment-target-editor"
+          :data-revision-visible="hasPendingRevision ? 'true' : 'false'"
+          data-segment-target="true"
+          :data-sentence-id="segment.sentence_id"
+          :aria-label="`translation for segment ${index + 1}`"
+          spellcheck="false"
+          @focus="handleFocus"
+          @blur="handleBlur"
+          @click="handleClick"
+          @keydown="handleKeydown"
+          @compositionstart="handleCompositionStart"
+          @compositionend="handleCompositionEnd"
+          @beforeinput="handleBeforeInput"
+          @input="handleInput"
+          @paste="handlePaste"
+        />
+      </div>
       </div>
     </div>
 
@@ -1561,6 +1591,46 @@ watch(
 
 .segment-row__cell--target.is-pending {
   box-shadow: inset 2px 0 0 rgba(0, 122, 204, 0.36);
+}
+
+.segment-row__source-content,
+.segment-row__target-content {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.segment-row__source-content .segment-row__text,
+.segment-row__source-content .segment-row__source-editor,
+.segment-row__target-content .segment-row__editor {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.segment-row__automatic-numbering-badge {
+  flex: 0 0 auto;
+  max-width: 72px;
+  margin-top: 8px;
+  padding: 1px 6px;
+  border: 1px solid rgba(91, 115, 132, 0.24);
+  border-radius: 4px;
+  background: rgba(241, 245, 249, 0.92);
+  color: #526574;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.45;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: none;
+}
+
+.segment-row__automatic-numbering-badge--target {
+  margin-top: 9px;
 }
 
 .segment-row__cell--state,

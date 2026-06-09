@@ -901,6 +901,13 @@ function buildSourceSearchableText(segment: Segment) {
   return displayText || segment.source_text
 }
 
+function getSegmentCopyableSourceText(segment: Segment) {
+  if (segment.automatic_numbering_text) {
+    return segment.source_body_text || segment.source_text || ''
+  }
+  return segment.display_text || segment.source_text || ''
+}
+
 function isSubsequenceMatch(value: string, keyword: string) {
   const normalizedValue = normalizeFuzzySearchText(value)
   const normalizedKeyword = normalizeFuzzySearchText(keyword)
@@ -2805,7 +2812,7 @@ function copySourceToTarget() {
     return
   }
 
-  const sourceText = activeSegment.value.display_text || activeSegment.value.source_text || ''
+  const sourceText = getSegmentCopyableSourceText(activeSegment.value)
   updateSegmentTarget(activeSegment.value.sentence_id, sourceText)
   toast.success(t('workbench.ribbon.messages.sourceCopied'))
 }
