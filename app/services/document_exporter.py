@@ -13,6 +13,7 @@ from typing import Any
 from zipfile import ZipFile
 from xml.etree import ElementTree as ET
 
+from app.services.automatic_numbering import strip_automatic_numbering_prefix
 from app.services.document_workspace import (
     CELL_GROUP_MAX_CHARS,
     CELL_NEXT_PARAGRAPH_MAX_CHARS,
@@ -141,6 +142,9 @@ class ExportSegment:
     sentence_id: str
     source_text: str
     target_text: str
+    display_text: str = ""
+    numbering_text: str = ""
+    matched_source_text: str = ""
     target_html: str | None = None
     math_placeholders: dict[str, str] = field(default_factory=dict)
 
@@ -309,6 +313,9 @@ def _group_segments_by_block(
                 sentence_id=sentence_id,
                 source_text=str(_get_segment_value(segment, "source_text", "") or ""),
                 target_text=str(_get_segment_value(segment, "target_text", "") or ""),
+                display_text=str(_get_segment_value(segment, "display_text", "") or ""),
+                numbering_text=str(_get_segment_value(segment, "numbering_text", "") or ""),
+                matched_source_text=str(_get_segment_value(segment, "matched_source_text", "") or ""),
                 target_html=str(target_html) if target_html else None,
                 math_placeholders=dict(math_map.get(sentence_id) or {}),
             )
@@ -1164,7 +1171,13 @@ def _replace_block_tokens(
 
         segment = segments[segment_index]
         segment_index += 1
-        replacement = segment.target_text
+        replacement = strip_automatic_numbering_prefix(
+            segment.target_text,
+            source_text=segment.source_text,
+            display_text=segment.display_text,
+            numbering_text=segment.numbering_text,
+            reference_texts=[segment.matched_source_text],
+        )
         if previous_span is not None:
             boundary_text = display_text[previous_span.end:span.start]
             replacement = _normalize_adjacent_english_target_boundary(
@@ -1284,6 +1297,9 @@ def _build_inline_bilingual_segments(
                 sentence_id=segment.sentence_id,
                 source_text=segment.source_text,
                 target_text=replacement,
+                display_text=segment.display_text,
+                numbering_text=segment.numbering_text,
+                matched_source_text=segment.matched_source_text,
                 target_html=None,
                 math_placeholders=segment.math_placeholders,
             )

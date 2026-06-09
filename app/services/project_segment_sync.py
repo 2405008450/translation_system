@@ -9,6 +9,10 @@ from sqlalchemy.orm import Session
 
 from app.models import FileRecord, Segment
 from app.services.analytics_service import count_source_words, record_translation_metric_event
+from app.services.automatic_numbering import (
+    is_word_document_filename,
+    strip_segment_automatic_numbering_prefix,
+)
 from app.services.normalizer import build_source_hash, normalize_text
 
 
@@ -266,10 +270,22 @@ def _build_candidate(segment: Segment) -> _SyncCandidate | None:
     confirmed_priority = 1 if segment.status == "confirmed" else 0
     source_priority = _SOURCE_PRIORITY.get(segment.source or "", -1)
     updated_at = segment.updated_at or datetime.min
+    filename = getattr(getattr(segment, "file_record", None), "filename", None)
+    target_text = (
+        strip_segment_automatic_numbering_prefix(
+            segment,
+            segment.target_text,
+            reference_texts=[segment.matched_source_text],
+        )
+        if is_word_document_filename(filename)
+        else segment.target_text or ""
+    )
+    if not normalize_text(target_text):
+        return None
     return _SyncCandidate(
         segment=segment,
         source_hash=source_hash,
-        target_text=segment.target_text or "",
+        target_text=target_text,
         rank=(confirmed_priority, source_priority, updated_at),
     )
 

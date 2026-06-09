@@ -667,7 +667,7 @@ def _build_messages(
             "\n\n以下是本项目的翻译细则，请在翻译时严格遵守：\n"
             + translation_guidelines
         )
-    if _has_glossary_matches(group.tasks):
+    if _has_glossary_matches([task]):
         system_prompt += "\n\n" + _glossary_system_instruction()
     retry_instruction = ""
     if strict_retry:

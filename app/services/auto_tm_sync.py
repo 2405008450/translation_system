@@ -12,6 +12,10 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.database import SessionLocal
 from app.models import AutoTMOutbox, AutoTMRematchQueue, FileRecord, MemoryBase, Segment, User
+from app.services.automatic_numbering import (
+    is_word_document_filename,
+    strip_automatic_numbering_prefix,
+)
 from app.services.matcher import match_sentences_with_stats
 from app.services.normalizer import normalize_text
 from app.services.tm_vector import sync_tm_embeddings
@@ -83,10 +87,24 @@ def enqueue_confirmed_segments_for_auto_tm(
     )
     existing_by_segment_id = {row.segment_id: row for row in existing_rows}
 
+    clean_numbering = is_word_document_filename(file_record.filename)
     queued_count = 0
+    skipped_invalid_count = 0
     for segment in eligible_segments:
         source_text = normalize_text(segment.source_text)
-        target_text = normalize_text(segment.target_text)
+        target_text = normalize_text(
+            strip_automatic_numbering_prefix(
+                segment.target_text,
+                source_text=segment.source_text,
+                display_text=segment.display_text,
+                reference_texts=[segment.matched_source_text],
+            )
+            if clean_numbering
+            else segment.target_text
+        )
+        if not source_text or not target_text:
+            skipped_invalid_count += 1
+            continue
         existing = existing_by_segment_id.get(segment.id)
         if existing is not None:
             existing.sentence_id = segment.sentence_id
@@ -115,7 +133,7 @@ def enqueue_confirmed_segments_for_auto_tm(
             )
         queued_count += 1
 
-    return AutoTMEnqueueSummary(queued_count=queued_count)
+    return AutoTMEnqueueSummary(queued_count=queued_count, skipped_invalid_count=skipped_invalid_count)
 
 
 def run_auto_tm_background_once() -> None:
@@ -257,6 +275,7 @@ def refresh_unconfirmed_segment_matches(
         2,
     )
     similarity_threshold = min(max(similarity_threshold, 0.5), 1.0)
+    clean_numbering = is_word_document_filename(file_record.filename)
 
     updated_count = 0
     offset = 0
@@ -314,7 +333,19 @@ def refresh_unconfirmed_segment_matches(
                 and match.status in {"exact", "fuzzy"}
                 and not normalize_text(segment.target_text)
             ):
-                segment.target_text = match.target_text
+                target_text = (
+                    strip_automatic_numbering_prefix(
+                        match.target_text,
+                        source_text=segment.source_text,
+                        display_text=segment.display_text,
+                        reference_texts=[match.matched_source_text],
+                    )
+                    if clean_numbering
+                    else match.target_text
+                )
+                if not normalize_text(target_text):
+                    continue
+                segment.target_text = target_text
                 segment.target_html = None
                 segment.status = match.status
                 segment.source = "tm"

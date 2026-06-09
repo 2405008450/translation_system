@@ -4,6 +4,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
+from app.services.automatic_numbering import strip_automatic_numbering_prefix
 from app.services.document_workspace import parse_docx_workspace
 from app.services.matcher import match_sentences
 
@@ -49,7 +50,13 @@ def parse_docx_for_slate(
                 "id": segment["sentence_id"],
                 "source": segment["source_text"],
                 "display_text": segment["display_text"],
-                "target": match.target_text or "",
+                "target": strip_automatic_numbering_prefix(
+                    match.target_text or "",
+                    source_text=segment["source_text"],
+                    display_text=segment.get("display_text", ""),
+                    numbering_text=segment.get("numbering_text", ""),
+                    reference_texts=[match.matched_source_text],
+                ),
                 "status": match.status,
                 "score": match.score,
             }

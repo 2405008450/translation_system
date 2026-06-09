@@ -19,6 +19,7 @@ from xml.etree import ElementTree as ET
 from sqlalchemy.orm import Session
 
 from app.services.cache import get_json, set_json
+from app.services.automatic_numbering import strip_automatic_numbering_prefix
 from app.services.document_statistics import compute_docx_statistics
 from app.services.matcher import MatchStats, match_sentences_with_stats
 from app.services.normalizer import normalize_text
@@ -573,7 +574,13 @@ def build_docx_workspace(
             segment["matched_creator_name"] = match.matched_creator_name
             segment["matched_created_at"] = match.matched_created_at
             segment["matched_updated_at"] = match.matched_updated_at
-            segment["target_text"] = match.target_text or ""
+            segment["target_text"] = strip_automatic_numbering_prefix(
+                match.target_text or "",
+                source_text=segment["source_text"],
+                display_text=segment.get("display_text", ""),
+                numbering_text=segment.get("numbering_text", ""),
+                reference_texts=[match.matched_source_text],
+            )
 
     return {
         "document_html": parsed_workspace["document_html"],

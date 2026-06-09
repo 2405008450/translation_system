@@ -74,6 +74,10 @@ from app.services.analytics_service import (
     record_translation_metric_event,
     run_analytics_backfill_once,
 )
+from app.services.automatic_numbering import (
+    is_word_document_filename,
+    strip_automatic_numbering_prefix,
+)
 from app.services.auto_tm_sync import (
     AutoTMEnqueueSummary,
     enqueue_confirmed_segments_for_auto_tm,
@@ -2540,6 +2544,7 @@ def _build_llm_translation_tasks(
     glossary_base_ids: list[UUID] | None = None,
     include_context: bool = False,
     sentence_id: str | None = None,
+    source_filename: str | None = None,
 ) -> list[LLMTranslationTask]:
     statuses_by_scope = {
         "fuzzy_only": {"fuzzy"},
@@ -2572,6 +2577,7 @@ def _build_llm_translation_tasks(
         target_language=target_language,
     )
 
+    clean_numbering = is_word_document_filename(source_filename)
     tasks: list[LLMTranslationTask] = []
     for segment in segments:
         should_translate = True
@@ -2590,6 +2596,20 @@ def _build_llm_translation_tasks(
         matched_source_text = getattr(segment, "matched_source_text", None)
         segment_tm_target_text = segment.target_text if segment_source == "tm" and normalize_text(segment.target_text) else ""
         tm_target_text = segment_tm_target_text or tm_target_text_map.get(matched_source_text or "", "")
+        if clean_numbering:
+            raw_matched_source_text = matched_source_text
+            matched_source_text = strip_automatic_numbering_prefix(
+                matched_source_text or "",
+                source_text=segment.source_text,
+                display_text=getattr(segment, "display_text", "") or "",
+                reference_texts=[raw_matched_source_text],
+            ) or None
+            tm_target_text = strip_automatic_numbering_prefix(
+                tm_target_text,
+                source_text=segment.source_text,
+                display_text=getattr(segment, "display_text", "") or "",
+                reference_texts=[raw_matched_source_text],
+            )
 
         tasks.append(
             LLMTranslationTask(
@@ -6874,6 +6894,7 @@ def rematch_file_record(
     fuzzy_count = 0
     skipped_count = 0
     updated_count = 0
+    clean_numbering = is_word_document_filename(file_record.filename)
 
     for segment, match in zip(segments, matches, strict=False):
         before = (
@@ -6899,7 +6920,20 @@ def rematch_file_record(
         segment.matched_updated_at = _parse_optional_datetime(match.matched_updated_at)
 
         if match.status == "exact" and match.target_text is not None:
-            segment.target_text = match.target_text
+            target_text = (
+                strip_automatic_numbering_prefix(
+                    match.target_text,
+                    source_text=segment.source_text,
+                    display_text=segment.display_text,
+                    reference_texts=[match.matched_source_text],
+                )
+                if clean_numbering
+                else match.target_text
+            )
+            if not normalize_text(target_text):
+                skipped_count += 1
+                continue
+            segment.target_text = target_text
             segment.source = "tm"
             segment.status = "confirmed" if payload.auto_confirm_exact else "exact"
             exact_count += 1
@@ -6908,7 +6942,20 @@ def rematch_file_record(
                 segment.status in {"none", "fuzzy"} and segment.source != "user"
             )
             if can_overwrite:
-                segment.target_text = match.target_text
+                target_text = (
+                    strip_automatic_numbering_prefix(
+                        match.target_text,
+                        source_text=segment.source_text,
+                        display_text=segment.display_text,
+                        reference_texts=[match.matched_source_text],
+                    )
+                    if clean_numbering
+                    else match.target_text
+                )
+                if not normalize_text(target_text):
+                    skipped_count += 1
+                    continue
+                segment.target_text = target_text
                 segment.source = "tm"
                 segment.status = "fuzzy"
                 fuzzy_count += 1
@@ -8033,6 +8080,7 @@ def save_file_record_segments_to_tm(
     segments = list_segments_for_file_record(db, file_record_id)
     skipped_count = 0
     save_rows: list[tuple[str, str]] = []
+    clean_numbering = is_word_document_filename(file_record.filename)
 
     for segment in segments:
         if payload.scope == "confirmed" and segment.status != "confirmed":
@@ -8043,7 +8091,16 @@ def save_file_record_segments_to_tm(
             continue
 
         source_text = normalize_text(segment.source_text)
-        target_text = normalize_text(segment.target_text)
+        target_text = normalize_text(
+            strip_automatic_numbering_prefix(
+                segment.target_text,
+                source_text=segment.source_text,
+                display_text=segment.display_text,
+                reference_texts=[segment.matched_source_text],
+            )
+            if clean_numbering
+            else segment.target_text
+        )
         if not source_text or not target_text:
             skipped_count += 1
             continue
@@ -8556,6 +8613,7 @@ async def llm_translate_file_record(
         glossary_base_ids=glossary_base_ids,
         include_context=body.translation_unit == "paragraph",
         sentence_id=body.sentence_id,
+        source_filename=file_record.filename,
     )
 
     async def event_stream():
@@ -8667,7 +8725,17 @@ async def llm_translate_file_record(
 
             try:
                 before_text = segment.target_text
-                segment.target_text = result.translated_text
+                translated_text = (
+                    strip_automatic_numbering_prefix(
+                        result.translated_text,
+                        source_text=segment.source_text,
+                        display_text=segment.display_text,
+                        reference_texts=[segment.matched_source_text],
+                    )
+                    if is_word_document_filename(file_record.filename)
+                    else result.translated_text
+                )
+                segment.target_text = translated_text
                 segment.target_html = None
                 segment.source = "llm"
                 segment.version = int(segment.version or 1) + 1
@@ -8677,13 +8745,13 @@ async def llm_translate_file_record(
                 segment.status = _resolve_unconfirmed_segment_status(segment)
 
                 # Inline revision creation — skip pending query for LLM bulk writes
-                if (before_text or "") != (result.translated_text or ""):
+                if (before_text or "") != (translated_text or ""):
                     db.add(SegmentRevision(
                         file_record_id=file_record_id,
                         segment_id=segment.id,
                         sentence_id=segment.sentence_id,
                         before_text=before_text or "",
-                        after_text=result.translated_text or "",
+                        after_text=translated_text or "",
                         source="llm",
                         status="pending",
                         author_id=current_user.id if current_user else None,
@@ -8692,7 +8760,7 @@ async def llm_translate_file_record(
                     db,
                     segment=segment,
                     before_text=before_text,
-                    after_text=result.translated_text,
+                    after_text=translated_text,
                     source="llm",
                     current_user=current_user,
                 )
