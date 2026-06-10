@@ -5777,7 +5777,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-page.is-stable-grid .segment-editor-results {
-  --segment-editor-grid-template: 64px minmax(320px, 1fr) minmax(360px, 1fr) 70px 72px;
+  --segment-editor-grid-template: 64px minmax(320px, 1fr) minmax(360px, 1fr) 78px 64px;
   --virtual-list-inline-end-gap: 0;
 }
 

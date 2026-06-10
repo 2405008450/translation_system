@@ -337,6 +337,7 @@ def _build_exported_file(db: Session, file_record: FileRecord, export_type: str)
             segments=segments,
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
+            target_language=getattr(file_record, "target_language", None),
         )
 
     if export_type in BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS:
@@ -349,6 +350,7 @@ def _build_exported_file(db: Session, file_record: FileRecord, export_type: str)
             order=BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS[export_type],
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
+            target_language=getattr(file_record, "target_language", None),
         )
 
     segment_dicts = [

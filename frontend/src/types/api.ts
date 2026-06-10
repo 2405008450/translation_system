@@ -209,6 +209,7 @@ export interface NotificationsResponse {
 }
 
 export type DocumentParseMode = 'full' | 'body_only'
+export type DocxNumberingLocalization = 'auto' | 'preserve'
 
 export interface DocumentParseOptions {
   include_headers_footers: boolean
@@ -236,6 +237,7 @@ export interface DocumentParseOptions {
   xlsx_translate_boolean_cells: boolean
   xlsx_translate_formula_cells: boolean
   xlsx_skip_fill_colors: string[]
+  docx_numbering_localization?: DocxNumberingLocalization
 }
 
 export interface DocumentStatistics {
@@ -367,6 +369,7 @@ export interface Segment {
   display_text: string
   source_body_text?: string
   automatic_numbering_text?: string | null
+  target_automatic_numbering_text?: string | null
   source_html?: string | null
   target_text: string
   target_html?: string | null

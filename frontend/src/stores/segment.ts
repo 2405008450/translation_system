@@ -899,6 +899,7 @@ export const useSegmentStore = defineStore('segment', () => {
       display_text: sourceText,
       source_body_text: sourceText,
       automatic_numbering_text: null,
+      target_automatic_numbering_text: null,
       source_html: null,
     }
     segments.value[index] = nextSegment

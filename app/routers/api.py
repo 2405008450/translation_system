@@ -231,6 +231,7 @@ from app.services.task_file_service import (
     normalize_document_parse_mode,
     supports_task_file,
 )
+from app.services.document_workspace import build_docx_target_numbering_text_map
 from app.services.tm_importer import (
     SDLTM_EXTENSIONS,
     TM_IMPORT_EXTENSIONS,
@@ -547,7 +548,7 @@ def _json_ready_project_file_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _get_file_record_document_parse_options(file_record: FileRecord) -> dict[str, bool]:
+def _get_file_record_document_parse_options(file_record: FileRecord) -> dict[str, object]:
     return normalize_document_parse_options(
         getattr(file_record, "document_parse_options", None),
         getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
@@ -2762,7 +2763,7 @@ def _normalize_upload_document_parse_mode(document_parse_mode: str | None) -> st
 def _normalize_upload_document_parse_options(
     document_parse_options: str | None,
     document_parse_mode: str,
-) -> dict[str, bool]:
+) -> dict[str, object]:
     try:
         return normalize_document_parse_options(document_parse_options, document_parse_mode)
     except ValueError as exc:
@@ -5786,11 +5787,38 @@ def _build_segment_workflow_context(
     return {step.id: step for step in workflow_steps}, writable_step_ids, can_manage
 
 
+def _build_target_automatic_numbering_text_map(
+    file_record: FileRecord,
+) -> dict[str, str]:
+    source_filename = get_file_record_source_filename(file_record)
+    if get_task_file_extension(source_filename) != ".docx":
+        return {}
+
+    raw_bytes = load_file_record_source(file_record)
+    if raw_bytes is None:
+        return {}
+
+    try:
+        return build_docx_target_numbering_text_map(
+            raw_bytes,
+            document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
+            document_parse_options=_get_file_record_document_parse_options(file_record),
+            target_language=file_record.target_language,
+        )
+    except Exception:
+        logger.exception(
+            "failed to build target automatic numbering map file_record_id=%s",
+            getattr(file_record, "id", None),
+        )
+        return {}
+
+
 def _serialize_workbench_segment(
     seg: Segment,
     display_index: int | None = None,
     *,
     source_filename: str | None = None,
+    target_automatic_numbering_by_sentence_id: dict[str, str] | None = None,
     workflow_step_by_id: dict[UUID, ProjectWorkflowStep] | None = None,
     writable_workflow_step_ids: set[UUID] | None = None,
     can_manage: bool = False,
@@ -5806,6 +5834,11 @@ def _serialize_workbench_segment(
         if is_word_document_filename(resolved_source_filename)
         else ""
     )
+    target_automatic_numbering_text = ""
+    if automatic_numbering_text and target_automatic_numbering_by_sentence_id:
+        target_automatic_numbering_text = (
+            target_automatic_numbering_by_sentence_id.get(str(seg.sentence_id), "") or ""
+        ).strip()
     resolved_workflow_step_id = seg.workflow_step_id
     if resolved_workflow_step_id is None and workflow_step_by_id:
         resolved_workflow_step_id = next(iter(workflow_step_by_id.keys()), None)
@@ -5820,6 +5853,7 @@ def _serialize_workbench_segment(
         "display_text": seg.display_text,
         "source_body_text": seg.source_text,
         "automatic_numbering_text": automatic_numbering_text or None,
+        "target_automatic_numbering_text": target_automatic_numbering_text or None,
         "source_html": seg.source_html,
         "target_text": seg.target_text,
         "target_html": seg.target_html,
@@ -6351,6 +6385,7 @@ def get_file_record(
         current_user,
     )
     workflow_progress = _get_file_workflow_progress(db, [file_record.id]).get(file_record.id, [])
+    target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
 
     return {
         "id": file_record.id,
@@ -6411,6 +6446,7 @@ def get_file_record(
                 seg,
                 display_index=result["skip"] + index,
                 source_filename=source_filename,
+                target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
                 workflow_step_by_id=workflow_step_by_id,
                 writable_workflow_step_ids=writable_workflow_step_ids,
                 can_manage=can_manage,
@@ -6531,6 +6567,7 @@ def get_file_record_segments(
         file_record,
         current_user,
     )
+    target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
 
     return {
         "file_record_id": str(file_record_id),
@@ -6550,7 +6587,8 @@ def get_file_record_segments(
             _serialize_workbench_segment(
                 seg,
                 display_index=display_index_map.get(seg.id),
-                source_filename=file_record.filename,
+                source_filename=get_file_record_source_filename(file_record),
+                target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
                 workflow_step_by_id=workflow_step_by_id,
                 writable_workflow_step_ids=writable_workflow_step_ids,
                 can_manage=can_manage,
@@ -6594,13 +6632,15 @@ def get_file_record_segment_changes(
         file_record,
         current_user,
     )
+    target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
     return {
         "file_record_id": str(file_record_id),
         "server_time": datetime.utcnow().isoformat(),
         "segments": [
             _serialize_workbench_segment(
                 segment,
-                source_filename=file_record.filename,
+                source_filename=get_file_record_source_filename(file_record),
+                target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
                 workflow_step_by_id=workflow_step_by_id,
                 writable_workflow_step_ids=writable_workflow_step_ids,
                 can_manage=can_manage,
@@ -7327,6 +7367,7 @@ def export_file_record_with_type(
                 segments=segments,
                 document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
                 document_parse_options=_get_file_record_document_parse_options(file_record),
+                target_language=file_record.target_language,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -7351,6 +7392,7 @@ def export_file_record_with_type(
                 order=BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS[export_type],
                 document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
                 document_parse_options=_get_file_record_document_parse_options(file_record),
+                target_language=file_record.target_language,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -7458,6 +7500,7 @@ def update_segment(
                 file_record,
                 current_user,
             )
+            target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
             return {
                 "updated_count": 0,
                 "conflicts": [
@@ -7473,7 +7516,8 @@ def update_segment(
                 "segments": [
                     _serialize_workbench_segment(
                         current_segment,
-                        source_filename=file_record.filename,
+                        source_filename=get_file_record_source_filename(file_record),
+                        target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
                         workflow_step_by_id=workflow_step_by_id,
                         writable_workflow_step_ids=writable_workflow_step_ids,
                         can_manage=can_manage,
@@ -7519,6 +7563,7 @@ def update_segment(
         file_record,
         current_user,
     )
+    target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
 
     return {
         "id": segment.id,
@@ -7535,7 +7580,8 @@ def update_segment(
         "segments": [
             _serialize_workbench_segment(
                 item,
-                source_filename=file_record.filename,
+                source_filename=get_file_record_source_filename(file_record),
+                target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
                 workflow_step_by_id=workflow_step_by_id,
                 writable_workflow_step_ids=writable_workflow_step_ids,
                 can_manage=can_manage,
@@ -7612,9 +7658,11 @@ def update_segment_project_sync(
         file_record,
         current_user,
     )
+    target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
     return _serialize_workbench_segment(
         segment,
-        source_filename=file_record.filename,
+        source_filename=get_file_record_source_filename(file_record),
+        target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
         workflow_step_by_id=workflow_step_by_id,
         writable_workflow_step_ids=writable_workflow_step_ids,
         can_manage=can_manage,
@@ -7712,18 +7760,21 @@ def split_segment(
         file_record,
         current_user,
     )
+    target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
 
     return {
         "first": _serialize_workbench_segment(
             segment,
-            source_filename=file_record.filename,
+            source_filename=get_file_record_source_filename(file_record),
+            target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
             workflow_step_by_id=workflow_step_by_id,
             writable_workflow_step_ids=writable_workflow_step_ids,
             can_manage=can_manage,
         ),
         "second": _serialize_workbench_segment(
             new_segment,
-            source_filename=file_record.filename,
+            source_filename=get_file_record_source_filename(file_record),
+            target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
             workflow_step_by_id=workflow_step_by_id,
             writable_workflow_step_ids=writable_workflow_step_ids,
             can_manage=can_manage,
@@ -7815,11 +7866,13 @@ def merge_segment(
         file_record,
         current_user,
     )
+    target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
 
     return {
         "merged": _serialize_workbench_segment(
             first_seg,
-            source_filename=file_record.filename,
+            source_filename=get_file_record_source_filename(file_record),
+            target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
             workflow_step_by_id=workflow_step_by_id,
             writable_workflow_step_ids=writable_workflow_step_ids,
             can_manage=can_manage,
@@ -7891,6 +7944,7 @@ def batch_update(
         file_record,
         current_user,
     )
+    target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
     return {
         "updated_count": result.updated_count,
         "conflicts": [_serialize_segment_update_conflict(conflict) for conflict in result.conflicts],
@@ -7899,7 +7953,8 @@ def batch_update(
         "segments": [
             _serialize_workbench_segment(
                 segment,
-                source_filename=file_record.filename,
+                source_filename=get_file_record_source_filename(file_record),
+                target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
                 workflow_step_by_id=workflow_step_by_id,
                 writable_workflow_step_ids=writable_workflow_step_ids,
                 can_manage=can_manage,
@@ -8648,7 +8703,7 @@ async def llm_translate_file_record(
         glossary_base_ids=glossary_base_ids,
         include_context=body.translation_unit == "paragraph",
         sentence_id=body.sentence_id,
-        source_filename=file_record.filename,
+        source_filename=get_file_record_source_filename(file_record),
     )
 
     async def event_stream():

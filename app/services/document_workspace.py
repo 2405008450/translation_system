@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Mapping
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from html import escape
 import hashlib
 from io import BytesIO
@@ -19,7 +19,12 @@ from xml.etree import ElementTree as ET
 from sqlalchemy.orm import Session
 
 from app.services.cache import get_json, set_json
-from app.services.automatic_numbering import strip_automatic_numbering_prefix
+from app.services.automatic_numbering import (
+    DOCX_NUMBERING_LOCALIZATION_AUTO,
+    build_localized_docx_numbering_definition,
+    normalize_docx_numbering_localization,
+    strip_automatic_numbering_prefix,
+)
 from app.services.document_statistics import compute_docx_statistics
 from app.services.matcher import MatchStats, match_sentences_with_stats
 from app.services.normalizer import normalize_text
@@ -104,10 +109,16 @@ DEFAULT_DOCUMENT_PARSE_OPTIONS = {
     "xlsx_translate_boolean_cells": True,
     "xlsx_translate_formula_cells": False,
     "xlsx_skip_fill_colors": [],
+    "docx_numbering_localization": DOCX_NUMBERING_LOCALIZATION_AUTO,
 }
 DOCUMENT_PARSE_OPTION_FIELDS = set(DEFAULT_DOCUMENT_PARSE_OPTIONS)
 DOCUMENT_PARSE_LIST_OPTION_FIELDS = {"xlsx_skip_fill_colors"}
-DOCUMENT_PARSE_BOOL_OPTION_FIELDS = DOCUMENT_PARSE_OPTION_FIELDS - DOCUMENT_PARSE_LIST_OPTION_FIELDS
+DOCUMENT_PARSE_STRING_OPTION_FIELDS = {"docx_numbering_localization"}
+DOCUMENT_PARSE_BOOL_OPTION_FIELDS = (
+    DOCUMENT_PARSE_OPTION_FIELDS
+    - DOCUMENT_PARSE_LIST_OPTION_FIELDS
+    - DOCUMENT_PARSE_STRING_OPTION_FIELDS
+)
 EMU_PER_PIXEL = 9525
 MATH_PLACEHOLDER_TEMPLATE = "⟦MATH_{index}⟧"
 OMML_ATOMIC_TAGS = {
@@ -189,7 +200,7 @@ class StoryPart:
     root: ET.Element
     rels: dict[str, str]
     package: DocxPackage
-    parse_options: dict[str, bool] = field(default_factory=lambda: dict(DEFAULT_DOCUMENT_PARSE_OPTIONS))
+    parse_options: dict[str, object] = field(default_factory=lambda: dict(DEFAULT_DOCUMENT_PARSE_OPTIONS))
 
 
 @dataclass(frozen=True)
@@ -536,6 +547,79 @@ def _iter_instance_levels(
             yield ilvl, resolved_level
 
 
+def _localize_numbering_schema(
+    numbering_schema: NumberingSchema,
+    *,
+    target_language: str | None = None,
+    strategy: object = None,
+) -> NumberingSchema:
+    changed = False
+    abstract_levels: dict[str, dict[int, NumberingLevel]] = {}
+    for abstract_num_id, levels in numbering_schema.abstract_levels.items():
+        localized_levels: dict[int, NumberingLevel] = {}
+        for ilvl, level in levels.items():
+            localized_level = _localize_numbering_level(
+                level,
+                target_language=target_language,
+                strategy=strategy,
+            )
+            if localized_level is not level:
+                changed = True
+            localized_levels[ilvl] = localized_level
+        abstract_levels[abstract_num_id] = localized_levels
+
+    instances: dict[str, NumberingInstance] = {}
+    for num_id, instance in numbering_schema.instances.items():
+        localized_overrides: dict[int, NumberingLevel] = {}
+        overrides_changed = False
+        for ilvl, level in instance.level_overrides.items():
+            localized_level = _localize_numbering_level(
+                level,
+                target_language=target_language,
+                strategy=strategy,
+            )
+            if localized_level is not level:
+                overrides_changed = True
+                changed = True
+            localized_overrides[ilvl] = localized_level
+        instances[num_id] = (
+            replace(instance, level_overrides=localized_overrides)
+            if overrides_changed
+            else instance
+        )
+
+    if not changed:
+        return numbering_schema
+
+    return replace(
+        numbering_schema,
+        abstract_levels=abstract_levels,
+        instances=instances,
+    )
+
+
+def _localize_numbering_level(
+    level: NumberingLevel,
+    *,
+    target_language: str | None = None,
+    strategy: object = None,
+) -> NumberingLevel:
+    localized_definition = build_localized_docx_numbering_definition(
+        num_fmt=level.num_fmt,
+        lvl_text=level.lvl_text,
+        suffix=level.suffix,
+        target_language=target_language,
+        strategy=strategy,
+    )
+    if localized_definition is None:
+        return level
+
+    num_fmt, lvl_text, suffix = localized_definition
+    if (num_fmt, lvl_text, suffix) == (level.num_fmt, level.lvl_text, level.suffix):
+        return level
+    return replace(level, num_fmt=num_fmt, lvl_text=lvl_text, suffix=suffix)
+
+
 def build_docx_workspace(
     db: Session,
     raw_bytes: bytes,
@@ -615,7 +699,7 @@ def normalize_document_parse_mode(value: str | None) -> str:
 def normalize_document_parse_options(
     value: Mapping[str, object] | str | None = None,
     document_parse_mode: str | None = None,
-) -> dict[str, bool]:
+) -> dict[str, object]:
     raw_options: Mapping[str, object] = {}
     if isinstance(value, str) and value.strip():
         try:
@@ -647,6 +731,11 @@ def normalize_document_parse_options(
             for item in values
             if isinstance(item, str) and item.strip()
         ]
+    for key in DOCUMENT_PARSE_STRING_OPTION_FIELDS:
+        if key not in raw_options:
+            continue
+        if key == "docx_numbering_localization":
+            options[key] = normalize_docx_numbering_localization(raw_options[key])
 
     if normalize_document_parse_mode(document_parse_mode) == DOCUMENT_PARSE_MODE_BODY_ONLY:
         options["include_headers_footers"] = False
@@ -707,6 +796,69 @@ def parse_docx_workspace(
         "segments": segments,
         "document_statistics": compute_docx_statistics(raw_bytes),
     }
+
+
+def build_docx_target_numbering_text_map(
+    raw_bytes: bytes,
+    document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
+    document_parse_options: Mapping[str, object] | str | None = None,
+    target_language: str | None = None,
+) -> dict[str, str]:
+    document_parse_mode = normalize_document_parse_mode(document_parse_mode)
+    document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
+    options_key = json.dumps(
+        {
+            "document_parse_options": document_parse_options,
+            "target_language": target_language or "",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    cache_key = (
+        f"preview:target-numbering:v{DOCX_PARSE_CACHE_VERSION}:"
+        f"{document_parse_mode}:{hashlib.sha256(options_key.encode('utf-8')).hexdigest()}:"
+        f"{hashlib.sha256(raw_bytes).hexdigest()}"
+    )
+    cached_map = get_json(cache_key)
+    if isinstance(cached_map, dict):
+        return {str(key): str(value) for key, value in cached_map.items() if value}
+
+    package = DocxPackage(raw_bytes)
+    numbering_schema = _build_numbering_schema(package)
+    target_numbering_schema = _localize_numbering_schema(
+        numbering_schema,
+        target_language=target_language,
+        strategy=document_parse_options.get("docx_numbering_localization"),
+    )
+    if target_numbering_schema is numbering_schema:
+        set_json(cache_key, {}, ttl_seconds=DOCX_PARSE_CACHE_TTL_SECONDS)
+        return {}
+
+    sentence_counter = count(1)
+    block_counter = count(0)
+    target_numbering_by_sentence_id: dict[str, str] = {}
+
+    for story in _build_story_parts(
+        package,
+        document_parse_mode=document_parse_mode,
+        document_parse_options=document_parse_options,
+    ):
+        numbering_state = NumberingState(schema=target_numbering_schema)
+        _, story_segments = _render_block_sequence(
+            container=story.root,
+            story=story,
+            sentence_counter=sentence_counter,
+            block_counter=block_counter,
+            numbering_state=numbering_state,
+        )
+        for segment in story_segments:
+            sentence_id = str(segment.get("sentence_id") or "")
+            numbering_text = str(segment.get("numbering_text") or "").strip()
+            if sentence_id and numbering_text:
+                target_numbering_by_sentence_id[sentence_id] = numbering_text
+
+    set_json(cache_key, target_numbering_by_sentence_id, ttl_seconds=DOCX_PARSE_CACHE_TTL_SECONDS)
+    return target_numbering_by_sentence_id
 
 
 def build_docx_preview_html(
@@ -893,7 +1045,7 @@ def _build_note_story_parts(
     part_name: str,
     kind: str,
     label_prefix: str,
-    document_parse_options: Mapping[str, bool] | None = None,
+    document_parse_options: Mapping[str, object] | None = None,
 ) -> list[StoryPart]:
     root = package.read_xml(part_name)
     if root is None:

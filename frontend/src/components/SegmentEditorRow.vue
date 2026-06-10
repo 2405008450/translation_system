@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { Link2, Link2Off } from 'lucide-vue-next'
 import { computed, onMounted, ref, watch, nextTick } from 'vue'
 
 import InteractiveDiffText from './InteractiveDiffText.vue'
@@ -106,6 +107,9 @@ const sourceLabel = computed(() => {
   }
   return sourceMeta.value.label
 })
+const compactSourceLabel = computed(() => (
+  props.segment.source === 'project_sync' ? '同步' : sourceLabel.value
+))
 const workflowLabel = computed(() => props.segment.workflow_step_name || '翻译')
 const showStatusTag = computed(() => {
   const status = props.segment.status || 'none'
@@ -247,6 +251,10 @@ function highlightSearchText(text: string, keyword: string): HighlightPart[] | n
 const automaticNumberingTitle = 'Word 自动编号，导出时会自动生成，译文无需输入编号'
 const automaticNumberingText = computed(() => (props.segment.automatic_numbering_text || '').trim())
 const hasAutomaticNumbering = computed(() => automaticNumberingText.value.length > 0)
+const targetAutomaticNumberingText = computed(() => (
+  props.segment.target_automatic_numbering_text || automaticNumberingText.value
+).trim())
+const hasTargetAutomaticNumbering = computed(() => targetAutomaticNumberingText.value.length > 0)
 const sourceTextContent = computed(() => {
   if (hasAutomaticNumbering.value) {
     return props.segment.source_body_text || props.segment.source_text || ''
@@ -1500,13 +1508,13 @@ watch(
       </div>
       <div class="segment-row__target-content">
         <span
-          v-if="hasAutomaticNumbering"
+          v-if="hasTargetAutomaticNumbering"
           class="segment-row__automatic-numbering-badge segment-row__automatic-numbering-badge--target"
           :title="automaticNumberingTitle"
           aria-hidden="true"
           contenteditable="false"
         >
-          {{ automaticNumberingText }}
+          {{ targetAutomaticNumberingText }}
         </span>
         <div
           ref="editorRef"
@@ -1553,17 +1561,26 @@ watch(
         {{ statusMeta.label }}
       </span>
       <span v-if="showSourceTag" class="segment-row__compact-tag" :class="sourceClass" :title="sourceTitle">
-        {{ sourceLabel }}
+        {{ compactSourceLabel }}
       </span>
       <button
         v-if="showProjectSyncToggle"
         class="segment-row__sync-toggle"
+        :class="{ 'is-disabled-sync': segment.project_sync_disabled }"
         type="button"
+        :title="projectSyncToggleLabel"
+        :aria-label="projectSyncToggleLabel"
         :aria-pressed="!segment.project_sync_disabled"
         :disabled="disabled"
         @click.stop="handleProjectSyncToggle"
       >
-        {{ projectSyncToggleLabel }}
+        <component
+          :is="segment.project_sync_disabled ? Link2 : Link2Off"
+          :size="13"
+          :stroke-width="2.2"
+          aria-hidden="true"
+        />
+        <span class="sr-only">{{ projectSyncToggleLabel }}</span>
       </button>
       <span
         v-if="hasPendingRevision"
@@ -1792,20 +1809,30 @@ watch(
 }
 
 .segment-row__sync-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
   min-height: 24px;
-  padding: 2px 8px;
+  padding: 0;
   border: 1px solid rgba(34, 127, 88, 0.28);
   border-radius: 6px;
   background: rgba(34, 127, 88, 0.08);
   color: #146c49;
-  font: inherit;
-  font-size: 12px;
-  line-height: 1.2;
+  line-height: 1;
   cursor: pointer;
 }
 
 .segment-row__sync-toggle:hover {
   background: rgba(34, 127, 88, 0.14);
+}
+
+.segment-row__sync-toggle.is-disabled-sync {
+  border-color: rgba(91, 115, 132, 0.26);
+  background: rgba(91, 115, 132, 0.08);
+  color: #526574;
 }
 
 .segment-row__term-highlight {

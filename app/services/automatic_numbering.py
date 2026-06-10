@@ -9,6 +9,33 @@ from app.services.normalizer import normalize_text
 
 
 WORD_DOCUMENT_EXTENSIONS = {".doc", ".docx"}
+DOCX_NUMBERING_LOCALIZATION_AUTO = "auto"
+DOCX_NUMBERING_LOCALIZATION_PRESERVE = "preserve"
+SUPPORTED_DOCX_NUMBERING_LOCALIZATIONS = {
+    DOCX_NUMBERING_LOCALIZATION_AUTO,
+    DOCX_NUMBERING_LOCALIZATION_PRESERVE,
+}
+CHINESE_NUMBERING_FORMATS = {
+    "chineseCounting",
+    "chineseLegalSimplified",
+    "ideographDigital",
+    "chineseCountingThousand",
+}
+DOCX_NUMBERING_LABELS_EN = {
+    "\u7ae0": "Chapter",
+    "\u8282": "Section",
+    "\u6761": "Article",
+    "\u6b3e": "Clause",
+}
+DOCX_NUMBERING_PUNCTUATION_TOKENS = (
+    "\u3001",
+    "\u3002",
+    "\uff0e",
+    "\uff08",
+    "\uff09",
+    "\u3010",
+    "\u3011",
+)
 CHINESE_NUMBER_CHARS = "零〇一二三四五六七八九十百千万两壹贰叁肆伍陆柒捌玖拾佰仟"
 CHINESE_DIGIT_VALUES = {
     "零": 0,
@@ -57,6 +84,84 @@ def is_word_document_filename(filename: str | None) -> bool:
     if not filename:
         return False
     return Path(filename).suffix.lower() in WORD_DOCUMENT_EXTENSIONS
+
+
+def normalize_docx_numbering_localization(value: object = None) -> str:
+    normalized = str(value or DOCX_NUMBERING_LOCALIZATION_AUTO).strip().lower()
+    if normalized not in SUPPORTED_DOCX_NUMBERING_LOCALIZATIONS:
+        return DOCX_NUMBERING_LOCALIZATION_AUTO
+    return normalized
+
+
+def should_localize_docx_numbering(
+    target_language: str | None = None,
+    strategy: object = DOCX_NUMBERING_LOCALIZATION_AUTO,
+) -> bool:
+    if normalize_docx_numbering_localization(strategy) == DOCX_NUMBERING_LOCALIZATION_PRESERVE:
+        return False
+
+    normalized_language = (target_language or "").strip().lower().replace("_", "-")
+    if not normalized_language:
+        return True
+    return normalized_language.startswith("en") or "english" in normalized_language
+
+
+def build_localized_docx_numbering_definition(
+    *,
+    num_fmt: str,
+    lvl_text: str,
+    suffix: str = "tab",
+    target_language: str | None = None,
+    strategy: object = DOCX_NUMBERING_LOCALIZATION_AUTO,
+) -> tuple[str, str, str] | None:
+    if not lvl_text or not should_localize_docx_numbering(target_language, strategy):
+        return None
+
+    for chinese_marker, english_label in DOCX_NUMBERING_LABELS_EN.items():
+        if chinese_marker in lvl_text and "%1" in lvl_text:
+            return "decimal", f"{english_label} %1", "space"
+
+    normalized_text = _normalize_docx_numbering_pattern(lvl_text)
+    if normalized_text != lvl_text or num_fmt in CHINESE_NUMBERING_FORMATS:
+        if _has_only_placeholders_and_ascii_punctuation(normalized_text):
+            return "decimal", normalized_text or "%1.", "space"
+
+    if (
+        any(token in lvl_text for token in DOCX_NUMBERING_PUNCTUATION_TOKENS)
+        and _has_only_placeholders_and_ascii_punctuation(normalized_text)
+    ):
+        return "decimal", normalized_text or "%1.", "space"
+
+    return None
+
+
+def _normalize_docx_numbering_pattern(lvl_text: str) -> str:
+    normalized = lvl_text
+    for source, target in (
+        ("\uff08", "("),
+        ("\uff09", ")"),
+        ("\u3010", "["),
+        ("\u3011", "]"),
+        ("\u3001", "."),
+        ("\u3002", "."),
+        ("\uff0e", "."),
+        ("\u7b2c", ""),
+        ("\u7ae0", ""),
+        ("\u8282", ""),
+        ("\u6761", ""),
+        ("\u6b3e", ""),
+    ):
+        normalized = normalized.replace(source, target)
+    return normalized.strip()
+
+
+def _has_only_placeholders_and_ascii_punctuation(text: str) -> bool:
+    stripped = text
+    for placeholder in ("%1", "%2", "%3", "%4", "%5", "%6", "%7", "%8", "%9"):
+        stripped = stripped.replace(placeholder, "")
+    stripped = stripped.replace("(", "").replace(")", "").replace("[", "").replace("]", "")
+    stripped = stripped.replace(".", "").replace("-", "").replace(" ", "")
+    return stripped == ""
 
 
 def get_automatic_numbering_text(

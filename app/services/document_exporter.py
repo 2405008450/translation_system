@@ -13,7 +13,10 @@ from typing import Any
 from zipfile import ZipFile
 from xml.etree import ElementTree as ET
 
-from app.services.automatic_numbering import strip_automatic_numbering_prefix
+from app.services.automatic_numbering import (
+    build_localized_docx_numbering_definition,
+    strip_automatic_numbering_prefix,
+)
 from app.services.document_workspace import (
     CELL_GROUP_MAX_CHARS,
     CELL_NEXT_PARAGRAPH_MAX_CHARS,
@@ -178,6 +181,7 @@ def export_bilingual_docx_with_layout(
     order: str = BILINGUAL_LAYOUT_SOURCE_FIRST,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
     document_parse_options: Mapping[str, object] | str | None = None,
+    target_language: str | None = None,
 ) -> bytes:
     order = _normalize_bilingual_layout_order(order)
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
@@ -212,7 +216,11 @@ def export_bilingual_docx_with_layout(
             order=order,
         )
 
-    _localize_numbering_definitions(package)
+    _localize_numbering_definitions(
+        package,
+        target_language=target_language,
+        strategy=document_parse_options.get("docx_numbering_localization"),
+    )
     if document_parse_options.get("clean_format"):
         _clean_story_formatting(stories)
     if not document_parse_options.get("preserve_hyperlinks", True):
@@ -230,6 +238,7 @@ def export_translated_docx(
     segments: Iterable[Any],
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
     document_parse_options: Mapping[str, object] | str | None = None,
+    target_language: str | None = None,
 ) -> bytes:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
@@ -262,7 +271,11 @@ def export_translated_docx(
             segments_by_block=segments_by_block,
         )
 
-    _localize_numbering_definitions(package)
+    _localize_numbering_definitions(
+        package,
+        target_language=target_language,
+        strategy=document_parse_options.get("docx_numbering_localization"),
+    )
     if document_parse_options.get("clean_format"):
         _clean_story_formatting(stories)
     if not document_parse_options.get("preserve_hyperlinks", True):
@@ -1747,13 +1760,22 @@ def _namespace_uri(tag: str) -> str:
     return ""
 
 
-def _localize_numbering_definitions(package: DocxPackage) -> None:
+def _localize_numbering_definitions(
+    package: DocxPackage,
+    *,
+    target_language: str | None = None,
+    strategy: object = None,
+) -> None:
     numbering_root = package.read_xml("word/numbering.xml")
     if numbering_root is None:
         return
 
     for level in numbering_root.findall(".//w:lvl", NS):
-        localized_definition = _build_localized_numbering_definition(level)
+        localized_definition = _build_localized_numbering_definition(
+            level,
+            target_language=target_language,
+            strategy=strategy,
+        )
         if localized_definition is None:
             continue
 
@@ -1766,6 +1788,9 @@ def _localize_numbering_definitions(package: DocxPackage) -> None:
 
 def _build_localized_numbering_definition(
     level: ET.Element,
+    *,
+    target_language: str | None = None,
+    strategy: object = None,
 ) -> tuple[str, str, str] | None:
     lvl_text_element = level.find("./w:lvlText", NS)
     if lvl_text_element is None:
@@ -1779,6 +1804,14 @@ def _build_localized_numbering_definition(
     num_fmt_value = "decimal" if num_fmt_element is None else num_fmt_element.get(_qn("w", "val"), "decimal")
     suffix_element = level.find("./w:suff", NS)
     suffix_value = "tab" if suffix_element is None else suffix_element.get(_qn("w", "val"), "tab")
+
+    return build_localized_docx_numbering_definition(
+        num_fmt=num_fmt_value,
+        lvl_text=lvl_text_value,
+        suffix=suffix_value,
+        target_language=target_language,
+        strategy=strategy,
+    )
 
     for chinese_marker, english_label in (
         ("章", "Chapter"),
