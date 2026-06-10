@@ -1855,27 +1855,46 @@ function isTMCollectionBoundForAll(group: ProjectTranslationMemorySettingGroup, 
   return group.files.length > 0 && group.files.every((file) => file.collection_ids.includes(collectionId))
 }
 
+function setTMCollectionBindingForAll(
+  group: ProjectTranslationMemorySettingGroup,
+  collectionId: string,
+  enabled: boolean,
+) {
+  for (const file of group.files) {
+    if (enabled && !file.collection_ids.includes(collectionId)) {
+      file.collection_ids = [...file.collection_ids, collectionId]
+    }
+    if (!enabled) {
+      file.collection_ids = file.collection_ids.filter((id) => id !== collectionId)
+      if (file.collection_id === collectionId) {
+        file.collection_id = file.collection_ids[0] || null
+      }
+    }
+    if (enabled && !file.collection_id) {
+      file.collection_id = collectionId
+    }
+  }
+  sortTMCollectionsByEnabled(group, enabled ? collectionId : '')
+}
+
+function toggleTMCollectionBindingForAll(
+  group: ProjectTranslationMemorySettingGroup,
+  collectionId: string,
+) {
+  setTMCollectionBindingForAll(
+    group,
+    collectionId,
+    !isTMCollectionBoundForAll(group, collectionId),
+  )
+}
+
 function toggleGroupTMCollection(
   group: ProjectTranslationMemorySettingGroup,
   collectionId: string,
   event: Event,
 ) {
   const checked = (event.target as HTMLInputElement).checked
-  for (const file of group.files) {
-    if (checked && !file.collection_ids.includes(collectionId)) {
-      file.collection_ids = [...file.collection_ids, collectionId]
-    }
-    if (!checked) {
-      file.collection_ids = file.collection_ids.filter((id) => id !== collectionId)
-      if (file.collection_id === collectionId) {
-        file.collection_id = file.collection_ids[0] || null
-      }
-    }
-    if (checked && !file.collection_id) {
-      file.collection_id = collectionId
-    }
-  }
-  sortTMCollectionsByEnabled(group, checked ? collectionId : '')
+  setTMCollectionBindingForAll(group, collectionId, checked)
 }
 
 function getGroupPrimaryTMCollectionId(group: ProjectTranslationMemorySettingGroup) {
@@ -3321,7 +3340,20 @@ onBeforeUnmount(() => {
                                       <strong>文件设置</strong>
                                       <span>为当前记忆库配置各文件的启用、主写入和匹配阈值。</span>
                                     </div>
-                                    <span>{{ getTMCollectionBoundSummary(group, collection.id) }}</span>
+                                    <div class="tm-settings__file-panel-actions">
+                                      <span class="tm-settings__file-summary">{{ getTMCollectionBoundSummary(group, collection.id) }}</span>
+                                      <button
+                                        class="button tm-settings__batch-button"
+                                        type="button"
+                                        :class="{ 'is-active': isTMCollectionBoundForAll(group, collection.id) }"
+                                        :title="isTMCollectionBoundForAll(group, collection.id) ? '取消当前记忆库在全部文件中的启用' : '为当前记忆库批量启用全部文件'"
+                                        @click="toggleTMCollectionBindingForAll(group, collection.id)"
+                                      >
+                                        <Check v-if="!isTMCollectionBoundForAll(group, collection.id)" :size="13" />
+                                        <X v-else :size="13" />
+                                        {{ isTMCollectionBoundForAll(group, collection.id) ? '取消全选' : '批量启用' }}
+                                      </button>
+                                    </div>
                                   </div>
                                   <div class="tm-settings__file-header" aria-hidden="true">
                                     <span>文件</span>
@@ -6626,7 +6658,7 @@ onBeforeUnmount(() => {
   padding-bottom: 4px;
 }
 
-.tm-settings__file-panel-head > div {
+.tm-settings__file-panel-head > div:first-child {
   display: grid;
   gap: 2px;
   min-width: 0;
@@ -6642,12 +6674,57 @@ onBeforeUnmount(() => {
   font-size: 12px;
 }
 
+.tm-settings__file-summary {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.tm-settings__file-panel-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+}
+
 .tm-settings__file-header,
 .tm-settings__file-item {
   display: grid;
   grid-template-columns: minmax(240px, 1fr) 96px 108px 120px;
   gap: 12px;
   align-items: center;
+}
+
+.tm-settings__batch-button {
+  width: auto;
+  min-width: 86px;
+  min-height: 28px;
+  justify-content: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border-color: var(--line-soft);
+  background: var(--surface-panel);
+  color: var(--text-secondary);
+  box-shadow: none;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.tm-settings__batch-button:not(:disabled):hover {
+  border-color: var(--line-strong);
+  background: var(--surface-muted);
+  color: var(--brand-700);
+  box-shadow: none;
+}
+
+.tm-settings__batch-button.is-active {
+  border-color: color-mix(in srgb, var(--brand-700) 34%, var(--line-soft));
+  background: color-mix(in srgb, var(--brand-050) 70%, var(--surface-panel));
+  color: var(--brand-700);
+}
+
+.tm-settings__batch-button .lucide {
+  width: 13px;
+  height: 13px;
 }
 
 .tm-settings__file-header {
@@ -7057,6 +7134,15 @@ onBeforeUnmount(() => {
     gap: 6px;
     align-items: start;
     padding: 10px;
+  }
+
+  .tm-settings__file-panel-actions {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
+  .tm-settings__batch-button {
+    flex: 0 1 auto;
   }
 
   .tm-settings__file-header {

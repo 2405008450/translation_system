@@ -449,8 +449,9 @@ const llmModelSelectOptions = computed(() => [
 ])
 
 watch(llmModel, (modelId) => {
-  if (modelId.startsWith('google/') || modelId.startsWith('openai/')) {
-    llmProvider.value = 'openrouter'
+  const selectedModel = llmModelOptions.find((option) => option.id === modelId)
+  if (selectedModel) {
+    llmProvider.value = selectedModel.provider
   }
 })
 

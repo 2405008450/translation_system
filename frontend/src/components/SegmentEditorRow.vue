@@ -4,6 +4,7 @@ import { computed, onMounted, ref, watch, nextTick } from 'vue'
 
 import InteractiveDiffText from './InteractiveDiffText.vue'
 
+import { getLLMModelShortLabel } from '../constants/llm'
 import { getSegmentSourceMeta, getSegmentStatusMeta } from '../constants/status'
 import type { Segment, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
 import { computeDiff } from '../utils/textDiff'
@@ -103,7 +104,8 @@ const statusMeta = computed(() => getSegmentStatusMeta(props.segment.status))
 const sourceMeta = computed(() => getSegmentSourceMeta(props.segment.source))
 const sourceLabel = computed(() => {
   if (props.segment.source === 'llm') {
-    return props.segment.llm_model?.trim() || sourceMeta.value.label
+    const modelId = props.segment.llm_model?.trim()
+    return modelId ? getLLMModelShortLabel(modelId) : sourceMeta.value.label
   }
   return sourceMeta.value.label
 })
@@ -116,11 +118,14 @@ const showStatusTag = computed(() => {
   return status !== 'none' && status !== 'fuzzy'
 })
 const showSourceTag = computed(() => {
-  if (props.segment.status === 'none' || props.segment.status === 'fuzzy') {
+  const source = props.segment.source || 'none'
+  if (source === 'none' || source === 'fuzzy') {
     return false
   }
-  const source = props.segment.source || 'none'
-  return source !== 'none' && source !== 'fuzzy'
+  if (source === 'llm') {
+    return !isEmptyTarget.value
+  }
+  return props.segment.status !== 'none' && props.segment.status !== 'fuzzy'
 })
 const showProjectSyncToggle = computed(() => props.segment.source === 'project_sync' || Boolean(props.segment.project_sync_disabled))
 const projectSyncToggleLabel = computed(() => (

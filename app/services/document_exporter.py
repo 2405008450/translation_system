@@ -50,6 +50,7 @@ from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
 
 DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 XML_SPACE_ATTR = "{http://www.w3.org/XML/1998/namespace}space"
+MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 EXPORT_FONT_FAMILY = "Times New Roman"
 BILINGUAL_LAYOUT_SOURCE_FIRST = "source_first"
 BILINGUAL_LAYOUT_TARGET_FIRST = "target_first"
@@ -1492,6 +1493,7 @@ def _pick_reference_run(
 
 
 def _build_inserted_word_run(text: str, reference_run: ET.Element | None) -> ET.Element:
+    text = _sanitize_xml_text(text)
     if reference_run is not None and _namespace_uri(reference_run.tag) == NS["w"]:
         run_element = deepcopy(reference_run)
         for child in list(run_element):
@@ -1626,9 +1628,10 @@ def _build_formatted_word_run(
         _set_run_vertical_align(run_properties, "superscript")
 
     # 创建文本元素
+    fragment_text = _sanitize_xml_text(fragment.text)
     text_element = ET.Element(_qn("w", "t"))
-    text_element.text = fragment.text
-    if _needs_space_preserve(fragment.text):
+    text_element.text = fragment_text
+    if _needs_space_preserve(fragment_text):
         text_element.set(XML_SPACE_ATTR, "preserve")
     run_element.append(text_element)
 
@@ -1697,6 +1700,7 @@ def _apply_token_edits(tokens: list[TextToken]) -> None:
         for start, end, replacement in sorted(token.edits, key=lambda item: item[0], reverse=True):
             text_value = f"{text_value[:start]}{replacement}{text_value[end:]}"
 
+        text_value = _sanitize_xml_text(text_value)
         token.element.text = text_value
         if _needs_space_preserve(text_value):
             token.element.set(XML_SPACE_ATTR, "preserve")
@@ -1907,12 +1911,9 @@ def _build_modified_docx(
             if root is None:
                 continue
 
-            _register_namespaces(source_archive.read(normalized_name))
-            modified_xml[normalized_name] = ET.tostring(
-                root,
-                encoding="utf-8",
-                xml_declaration=True,
-            )
+            original_xml = source_archive.read(normalized_name)
+            _register_namespaces(original_xml)
+            modified_xml[normalized_name] = _serialize_xml(root, original_xml)
 
         output = BytesIO()
         with ZipFile(output, "w") as target_archive:
@@ -1974,6 +1975,72 @@ def _register_namespaces(xml_bytes: bytes) -> None:
             continue
         seen_namespaces.add(key)
         ET.register_namespace(prefix or "", uri)
+
+
+def _serialize_xml(root: ET.Element, original_xml: bytes) -> bytes:
+    _restore_compatibility_namespace_declarations(root, original_xml)
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _restore_compatibility_namespace_declarations(root: ET.Element, original_xml: bytes) -> None:
+    namespaces = _extract_namespace_declarations(original_xml)
+    compatibility_prefixes = _collect_markup_compatibility_prefixes(root)
+
+    for prefix in compatibility_prefixes:
+        uri = namespaces.get(prefix)
+        if not uri or _namespace_uri_is_used(root, uri):
+            continue
+        root.set(f"xmlns:{prefix}", uri)
+
+
+def _extract_namespace_declarations(xml_bytes: bytes) -> dict[str, str]:
+    namespaces: dict[str, str] = {}
+    for _, namespace in ET.iterparse(BytesIO(xml_bytes), events=("start-ns",)):
+        prefix, uri = namespace
+        namespaces.setdefault(prefix or "", uri)
+    return namespaces
+
+
+def _collect_markup_compatibility_prefixes(root: ET.Element) -> set[str]:
+    prefixes: set[str] = set()
+    for element in root.iter():
+        if element.tag == f"{{{MC_NS}}}Choice":
+            prefixes.update(_extract_prefixes_from_compatibility_value(element.get("Requires", "")))
+        for attr_name, attr_value in element.attrib.items():
+            if attr_name.startswith(f"{{{MC_NS}}}") and attr_value:
+                prefixes.update(_extract_prefixes_from_compatibility_value(str(attr_value)))
+    return prefixes
+
+
+def _extract_prefixes_from_compatibility_value(value: str) -> set[str]:
+    prefixes: set[str] = set()
+    for token in value.split():
+        prefix = token.split(":", 1)[0].strip()
+        if prefix:
+            prefixes.add(prefix)
+    return prefixes
+
+
+def _namespace_uri_is_used(root: ET.Element, uri: str) -> bool:
+    namespace_prefix = f"{{{uri}}}"
+    for element in root.iter():
+        if element.tag.startswith(namespace_prefix):
+            return True
+        for attr_name in element.attrib:
+            if attr_name.startswith(namespace_prefix):
+                return True
+    return False
+
+
+def _sanitize_xml_text(text: str) -> str:
+    return "".join(
+        char
+        for char in str(text)
+        if char in "\t\n\r"
+        or 0x20 <= ord(char) <= 0xD7FF
+        or 0xE000 <= ord(char) <= 0xFFFD
+        or 0x10000 <= ord(char) <= 0x10FFFF
+    )
 
 
 def _resolve_segment_block_type(story_kind: str, block_type: str) -> str:

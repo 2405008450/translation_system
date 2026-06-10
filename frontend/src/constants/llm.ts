@@ -16,6 +16,29 @@ export interface LLMModelOption {
 
 export const defaultLLMModelId = 'google/gemini-3.5-flash'
 
+export const llmModelShortLabelMap: Record<string, string> = {
+  'google/gemini-3.5-flash': 'Gemini 3.5',
+  'google/gemini-3.1-pro-preview': 'Gemini 3.1 Pro',
+  'google/gemini-3.1-flash-lite': 'Gemini 3.1 Lite',
+  'google/gemini-3-flash-preview': 'Gemini 3 Flash',
+  'google/gemini-2.5-pro': 'Gemini 2.5 Pro',
+  'google/gemini-2.5-flash': 'Gemini 2.5 Flash',
+  'google/gemini-2.5-flash-lite': 'Gemini 2.5 Lite',
+  'openai/gpt-chat-latest': 'GPT Chat',
+  'openai/gpt-5.4': 'GPT-5.4',
+  'openai/gpt-5.4-mini': 'GPT-5.4 Mini',
+  'openai/gpt-5.4-nano': 'GPT-5.4 Nano',
+  'openai/gpt-5.3-chat': 'GPT-5.3 Chat',
+  'openai/gpt-5.2': 'GPT-5.2',
+  'openai/gpt-5.2-chat': 'GPT-5.2 Chat',
+  'openai/gpt-5.1': 'GPT-5.1',
+  'openai/gpt-5.1-chat': 'GPT-5.1 Chat',
+  'openai/gpt-5-mini': 'GPT-5 Mini',
+  'openai/gpt-5-nano': 'GPT-5 Nano',
+  'deepseek/deepseek-chat': 'DeepSeek Chat',
+  'deepseek-chat': 'DeepSeek Chat',
+}
+
 export const llmModelOptions: LLMModelOption[] = [
   {
     id: defaultLLMModelId,
@@ -194,4 +217,39 @@ export function getLLMProviderLabel(provider: LLMProvider) {
 
 export function getLLMModelLabel(modelId: string) {
   return llmModelOptions.find((item) => item.id === modelId)?.name || modelId
+}
+
+function formatUnknownLLMModelShortLabel(modelId: string) {
+  const rawName = modelId.split('/').pop()?.replace(/:.+$/, '') || modelId
+  const tokenMap: Record<string, string> = {
+    chat: 'Chat',
+    claude: 'Claude',
+    deepseek: 'DeepSeek',
+    flash: 'Flash',
+    gemini: 'Gemini',
+    gpt: 'GPT',
+    haiku: 'Haiku',
+    latest: 'Latest',
+    lite: 'Lite',
+    mini: 'Mini',
+    nano: 'Nano',
+    opus: 'Opus',
+    preview: 'Preview',
+    pro: 'Pro',
+    sonnet: 'Sonnet',
+  }
+
+  return rawName
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map((token) => tokenMap[token.toLowerCase()] || token)
+    .join(' ')
+}
+
+export function getLLMModelShortLabel(modelId: string) {
+  const normalizedModelId = modelId.trim()
+  if (!normalizedModelId) {
+    return ''
+  }
+  return llmModelShortLabelMap[normalizedModelId] || formatUnknownLLMModelShortLabel(normalizedModelId)
 }
