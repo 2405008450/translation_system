@@ -12,7 +12,8 @@ from uuid import UUID
 
 from fastapi import HTTPException
 from fastapi.responses import FileResponse
-from sqlalchemy import text
+from sqlalchemy import inspect, text
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -142,6 +143,29 @@ _FILE_EXPORT_SCHEMA_STATEMENTS = [
     ON file_export_tasks (expires_at)
     """,
 ]
+
+_FILE_EXPORT_REQUIRED_COLUMNS = {
+    "id",
+    "file_record_id",
+    "export_type",
+    "status",
+    "progress",
+    "message",
+    "result_path",
+    "filename",
+    "media_type",
+    "size_bytes",
+    "error",
+    "created_by_id",
+    "created_at",
+    "updated_at",
+    "expires_at",
+}
+_FILE_EXPORT_REQUIRED_INDEXES = {
+    "ix_file_export_tasks_file_record_type",
+    "ix_file_export_tasks_status",
+    "ix_file_export_tasks_expires_at",
+}
 
 
 def utcnow() -> datetime:
@@ -274,10 +298,50 @@ def ensure_file_export_tasks_schema() -> None:
     with _SCHEMA_LOCK:
         if _SCHEMA_READY:
             return
-        with engine.begin() as connection:
-            for statement in _FILE_EXPORT_SCHEMA_STATEMENTS:
-                connection.execute(text(statement))
+        with engine.connect() as connection:
+            missing_items = _collect_file_export_schema_missing_items(connection)
+            if not missing_items:
+                _SCHEMA_READY = True
+                return
+
+        try:
+            with engine.begin() as connection:
+                for statement in _FILE_EXPORT_SCHEMA_STATEMENTS:
+                    connection.execute(text(statement))
+        except ProgrammingError as exc:
+            missing_text = ", ".join(missing_items)
+            raise RuntimeError(
+                "数据库账号缺少导出任务表结构升级权限，请使用有权限的账号执行 "
+                "scripts/add_file_export_tasks.sql 后再导出。"
+                f" 当前缺失项: {missing_text}"
+            ) from exc
         _SCHEMA_READY = True
+
+
+def _collect_file_export_schema_missing_items(connection) -> list[str]:
+    inspector = inspect(connection)
+    table_name = "file_export_tasks"
+    if not inspector.has_table(table_name):
+        return [table_name]
+
+    existing_columns = {
+        column["name"]
+        for column in inspector.get_columns(table_name)
+    }
+    missing_items = [
+        f"{table_name}.{column_name}"
+        for column_name in sorted(_FILE_EXPORT_REQUIRED_COLUMNS - existing_columns)
+    ]
+
+    existing_indexes = {
+        index["name"]
+        for index in inspector.get_indexes(table_name)
+    }
+    missing_items.extend(
+        f"{table_name}.{index_name}"
+        for index_name in sorted(_FILE_EXPORT_REQUIRED_INDEXES - existing_indexes)
+    )
+    return missing_items
 
 
 def normalize_file_export_type(export_type: str | None) -> str:
