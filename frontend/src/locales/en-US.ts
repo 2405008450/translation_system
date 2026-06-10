@@ -11,6 +11,10 @@ const overrides = {
     none: 'None',
     empty: 'No data',
     loading: 'Loading...',
+    progress: {
+      total: 'Overall progress',
+      workflowDetail: 'Workflow progress',
+    },
     actions: {
       close: 'Close',
       cancel: 'Cancel',

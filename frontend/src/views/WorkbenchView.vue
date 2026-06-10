@@ -175,6 +175,7 @@ const virtualListRef = ref<{
   scrollToIndex: (index: number, align?: ScrollLogicalPosition) => Promise<boolean>
   focusIndex: (index: number, selector?: string, align?: ScrollLogicalPosition) => Promise<boolean>
 } | null>(null)
+const segmentEditorResultsRef = ref<HTMLElement | null>(null)
 const segmentEditorRowRefs = new Map<string, SegmentEditorRowPublic>()
 
 const bottomPanelRef = ref<HTMLElement | null>(null)
@@ -186,6 +187,8 @@ const isResizing = ref(false)
 const isBottomDrawerResizing = ref(false)
 const viewportHeight = ref(window.innerHeight)
 let stopBottomDrawerResize: (() => void) | null = null
+let segmentEditorResizeObserver: ResizeObserver | null = null
+let segmentEditorScrollbarFrame: number | null = null
 
 const sidecarWidthStyle = computed(() => {
   if (sidecarWidth.value === null) return {}
@@ -539,8 +542,53 @@ function resolveItemHeight() {
 function handleResize() {
   viewportHeight.value = window.innerHeight
   itemHeight.value = resolveItemHeight()
+  scheduleSegmentEditorScrollbarGutterUpdate()
   if (bottomDrawerHeight.value !== null) {
     setBottomDrawerHeight(bottomDrawerHeight.value)
+  }
+}
+
+function updateSegmentEditorScrollbarGutter() {
+  const results = segmentEditorResultsRef.value
+    ?? document.querySelector<HTMLElement>('.workbench-page .segment-editor-results')
+  if (!results) return
+
+  const scrollContainer = results.querySelector<HTMLElement>('.segment-editor-list-stage > .virtual-list')
+  let gutter = 0
+  if (scrollContainer) {
+    const style = window.getComputedStyle(scrollContainer)
+    const paddingInlineStart = Number.parseFloat(style.paddingInlineStart) || 0
+    const paddingInlineEnd = Number.parseFloat(style.paddingInlineEnd) || 0
+    gutter = Math.max(
+      0,
+      scrollContainer.offsetWidth - scrollContainer.clientWidth + paddingInlineStart + paddingInlineEnd,
+    )
+  }
+  results.style.setProperty('--segment-editor-scrollbar-gutter', `${gutter}px`)
+}
+
+function scheduleSegmentEditorScrollbarGutterUpdate() {
+  if (segmentEditorScrollbarFrame !== null) {
+    window.cancelAnimationFrame(segmentEditorScrollbarFrame)
+  }
+  segmentEditorScrollbarFrame = window.requestAnimationFrame(() => {
+    segmentEditorScrollbarFrame = null
+    updateSegmentEditorScrollbarGutter()
+  })
+}
+
+function observeSegmentEditorResults() {
+  segmentEditorResizeObserver?.disconnect()
+  const results = segmentEditorResultsRef.value
+    ?? document.querySelector<HTMLElement>('.workbench-page .segment-editor-results')
+  if (!results || typeof ResizeObserver === 'undefined') return
+
+  segmentEditorResizeObserver = new ResizeObserver(scheduleSegmentEditorScrollbarGutterUpdate)
+  segmentEditorResizeObserver.observe(results)
+
+  const scrollContainer = results.querySelector<HTMLElement>('.segment-editor-list-stage > .virtual-list')
+  if (scrollContainer) {
+    segmentEditorResizeObserver.observe(scrollContainer)
   }
 }
 
@@ -3152,6 +3200,10 @@ async function loadTask() {
     }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.taskLoad'))
+  } finally {
+    await nextTick()
+    observeSegmentEditorResults()
+    scheduleSegmentEditorScrollbarGutterUpdate()
   }
 }
 
@@ -3190,6 +3242,8 @@ async function refreshSegmentPage(page = segmentStore.currentPage, size = segmen
     }
     await nextTick()
     await virtualListRef.value?.scrollToIndex(0, 'start')
+    observeSegmentEditorResults()
+    scheduleSegmentEditorScrollbarGutterUpdate()
     await router.replace({
       query: {
         ...route.query,
@@ -3743,6 +3797,21 @@ watch([segmentDisplayScope, sourceSearchQuery, targetSearchQuery, searchFuzzyEna
   }
 })
 
+watch(
+  () => [
+    editorSegments.value.length,
+    hasEditorSegmentFilter.value,
+    searchLoadingAllSegments.value,
+    isStandaloneWorkbench.value,
+  ],
+  async () => {
+    await nextTick()
+    observeSegmentEditorResults()
+    scheduleSegmentEditorScrollbarGutterUpdate()
+  },
+  { flush: 'post', immediate: true },
+)
+
 /**
  * 处理选区变化，更新格式按钮状态
  * 注意：只在有选中文本时才更新状态，避免覆盖手动设置的格式状态
@@ -3761,12 +3830,20 @@ onMounted(() => {
   window.addEventListener('resize', handleResize)
   document.addEventListener('click', handleClickOutside)
   document.addEventListener('selectionchange', handleSelectionChange)
+  void nextTick(() => {
+    observeSegmentEditorResults()
+    scheduleSegmentEditorScrollbarGutterUpdate()
+  })
   void loadTask()
   void loadGuidelineTemplates()
 })
 
 onBeforeUnmount(() => {
   stopBottomDrawerResize?.()
+  segmentEditorResizeObserver?.disconnect()
+  if (segmentEditorScrollbarFrame !== null) {
+    window.cancelAnimationFrame(segmentEditorScrollbarFrame)
+  }
   window.removeEventListener('resize', handleResize)
   document.removeEventListener('click', handleClickOutside)
   document.removeEventListener('selectionchange', handleSelectionChange)
@@ -4855,7 +4932,7 @@ onBeforeRouteLeave(async () => {
         </Transition>
 
         <div class="segment-editor-shell">
-          <div class="segment-editor-results">
+          <div ref="segmentEditorResultsRef" class="segment-editor-results">
             <div class="segment-table-head" aria-hidden="true">
               <span>句段</span>
               <span>原文</span>
@@ -7160,7 +7237,7 @@ onBeforeRouteLeave(async () => {
 
 .segment-editor-results {
   --segment-editor-grid-template: 72px minmax(0, 1fr) minmax(0, 1fr) 76px 76px;
-  --segment-editor-scrollbar-gutter: 12px;
+  --segment-editor-scrollbar-gutter: 10px;
   --virtual-list-inline-end-gap: 4px;
   display: grid;
   grid-template-rows: auto minmax(390px, var(--workbench-editor-stage-height));

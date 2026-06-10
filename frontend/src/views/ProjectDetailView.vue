@@ -49,6 +49,7 @@ import Pagination from '../components/Pagination.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
 import StateView from '../components/base/StateView.vue'
 import TermExtractionDialog from '../components/TermExtractionDialog.vue'
+import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
 import { useToast } from '../composables/useToast'
@@ -427,6 +428,12 @@ const tabs = computed(() => ([
 ]))
 const tableRows = computed<ProjectFileItem[]>(() => project.value?.files ?? [])
 const projectWorkflowSteps = computed<WorkflowStep[]>(() => project.value?.workflow_steps ?? [])
+const projectWorkflowProgress = computed<WorkflowProgress[]>(() => project.value?.workflow_progress ?? [])
+const projectWorkflowLabel = computed(() => (
+  projectWorkflowSteps.value.length > 0
+    ? projectWorkflowSteps.value.map((step) => step.name).join(' / ')
+    : getPlaceholder()
+))
 const activeAssignmentWorkflowStep = computed(() => (
   projectWorkflowSteps.value.find((step) => step.id === activeAssignmentWorkflowStepId.value) ?? projectWorkflowSteps.value[0] ?? null
 ))
@@ -1356,6 +1363,10 @@ function getFileDisplayProgressMessage(row: ProjectRow) {
   return row.active_operation && row.active_operation !== 'pre_translate'
     ? String(row.active_operation_message || '')
     : ''
+}
+
+function getFileWorkflowProgress(row: ProjectRow) {
+  return (row.workflow_progress || []) as WorkflowProgress[]
 }
 
 function getFilePretranslationProgress(row: ProjectRow) {
@@ -2893,16 +2904,14 @@ onBeforeUnmount(() => {
 
         <div class="pd-hero__progress">
           <span class="pd-hero__progress-label">{{ t('projectDetail.totals.progressLabel') }}</span>
-          <div class="progress-bar pd-hero__progress-bar">
-            <div class="progress-bar__track">
-              <div
-                class="progress-bar__fill"
-                :class="{ 'is-complete': isProgressComplete(project?.progress ?? 0) }"
-                :style="getProgressStyle(project?.progress ?? 0)"
-              />
-            </div>
-            <span class="progress-bar__text">{{ project?.progress ?? 0 }}%</span>
-          </div>
+          <WorkflowProgressSummary
+            class="pd-hero__progress-bar"
+            :progress="project?.progress ?? 0"
+            :status="project?.status || ''"
+            :workflow-progress="projectWorkflowProgress"
+            :label="t('common.progress.total')"
+            :detail-title="t('common.progress.workflowDetail')"
+          />
         </div>
       </div>
     </section>
@@ -2960,7 +2969,7 @@ onBeforeUnmount(() => {
           </label>
           <label class="pd-field">
             <span class="pd-field__label">{{ t('projectDetail.base.workflow') }}</span>
-            <span class="pd-field__value">{{ t('projectDetail.base.workflowValue') }}</span>
+            <span class="pd-field__value">{{ projectWorkflowLabel }}</span>
           </label>
           <label class="pd-field">
             <span class="pd-field__label">{{ t('projectDetail.base.createdAt') }}</span>
@@ -3913,16 +3922,14 @@ onBeforeUnmount(() => {
 
           <template #progress="{ row }">
             <div class="pd-file-progress" :title="getFileDisplayProgressMessage(row) || undefined">
-              <div class="progress-bar">
-                <div class="progress-bar__track">
-                  <div
-                    class="progress-bar__fill"
-                    :class="{ 'is-complete': isProgressComplete(getFileDisplayProgress(row)) }"
-                    :style="getProgressStyle(getFileDisplayProgress(row), getFileDisplayProgressStatus(row))"
-                  />
-                </div>
-                <span class="progress-bar__text">{{ getFileDisplayProgress(row) }}%</span>
-              </div>
+              <WorkflowProgressSummary
+                compact
+                :progress="getFileDisplayProgress(row)"
+                :status="getFileDisplayProgressStatus(row)"
+                :workflow-progress="getFileWorkflowProgress(row)"
+                :label="t('common.progress.total')"
+                :detail-title="t('common.progress.workflowDetail')"
+              />
               <span v-if="getFileDisplayProgressMessage(row)" class="pd-file-progress__status">
                 {{ getFileDisplayProgressMessage(row) }}
               </span>

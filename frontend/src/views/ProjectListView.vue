@@ -25,11 +25,11 @@ import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
 import Pagination from '../components/Pagination.vue'
 import RowActionMenu from '../components/RowActionMenu.vue'
+import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { useToast } from '../composables/useToast'
 import { formatLanguagePair } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
-import { getProgressStyle, isProgressComplete } from '../utils/progress'
 import type { IssueMarker, User, WorkflowProgress, WorkflowStep, WorkflowTemplate } from '../types/api'
 import { useAuthStore } from '../stores/auth'
 
@@ -712,33 +712,14 @@ onMounted(() => {
         </template>
 
         <template #progress="{ row }">
-          <div v-if="getWorkflowProgressItems(row as ProjectItem).length > 0" class="workflow-progress-mini">
-            <div
-              v-for="item in getWorkflowProgressItems(row as ProjectItem)"
-              :key="item.id"
-              class="workflow-progress-mini__item"
-            >
-              <span class="workflow-progress-mini__label">{{ item.name }}</span>
-              <div class="progress-bar__track">
-                <div
-                  class="progress-bar__fill"
-                  :class="{ 'is-complete': isProgressComplete(item.progress) }"
-                  :style="getProgressStyle(item.progress, row.status)"
-                />
-              </div>
-              <span class="workflow-progress-mini__value">{{ item.progress }}%</span>
-            </div>
-          </div>
-          <div v-else class="progress-bar">
-            <div class="progress-bar__track">
-              <div
-                class="progress-bar__fill"
-                :class="{ 'is-complete': isProgressComplete(row.progress) }"
-                :style="getProgressStyle(row.progress, row.status)"
-              />
-            </div>
-            <span class="progress-bar__text">{{ row.progress }}%</span>
-          </div>
+          <WorkflowProgressSummary
+            compact
+            :progress="row.progress"
+            :status="row.status"
+            :workflow-progress="getWorkflowProgressItems(row as ProjectItem)"
+            :label="t('common.progress.total')"
+            :detail-title="t('common.progress.workflowDetail')"
+          />
         </template>
 
         <template #file_count="{ row }">
@@ -1184,33 +1165,6 @@ onMounted(() => {
   margin: 12px 0 0;
   color: var(--text-muted);
   font-size: 13px;
-}
-
-.workflow-progress-mini {
-  display: grid;
-  gap: 4px;
-  min-width: 0;
-}
-
-.workflow-progress-mini__item {
-  display: grid;
-  grid-template-columns: minmax(34px, 48px) minmax(42px, 1fr) 34px;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  font-size: 11px;
-  color: var(--text-secondary);
-}
-
-.workflow-progress-mini__label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.workflow-progress-mini__value {
-  text-align: right;
-  color: var(--text-muted);
 }
 
 .workflow-editor {

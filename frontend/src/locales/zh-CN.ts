@@ -6,6 +6,10 @@ export default {
     none: '无',
     empty: '暂无数据',
     loading: '加载中...',
+    progress: {
+      total: '总进度',
+      workflowDetail: '阶段进度',
+    },
     actions: {
       close: '关闭',
       cancel: '取消',
