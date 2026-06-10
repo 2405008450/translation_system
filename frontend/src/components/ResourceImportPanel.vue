@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { BookOpen, Database, Loader2, Upload } from 'lucide-vue-next'
+import { BookOpen, CheckCircle2, Database, Eye, Loader2 } from 'lucide-vue-next'
 import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
@@ -10,13 +10,16 @@ import { refreshGlobalNotifications } from '../utils/notifications'
 import { isProgressComplete } from '../utils/progress'
 import type {
   TMCollection,
+  TMImportPreview,
   TMImportSummary,
   TermBase,
+  TermImportPreview,
   TermImportSummary,
 } from '../types/api'
 
 type ImportTab = 'tm' | 'term'
 type ImportMode = 'all' | ImportTab
+type ImportPreviewRow = { row_index: number, status: string, message: string }
 
 const props = withDefaults(defineProps<{
   mode?: ImportMode
@@ -24,6 +27,8 @@ const props = withDefaults(defineProps<{
   sourceLanguage?: string | null
   targetLanguage?: string | null
   contextLabel?: string
+  defaultTMCollectionId?: string
+  defaultTermBaseId?: string
   fixedTMCollectionId?: string
   fixedTermBaseId?: string
 }>(), {
@@ -32,6 +37,8 @@ const props = withDefaults(defineProps<{
   sourceLanguage: null,
   targetLanguage: null,
   contextLabel: '',
+  defaultTMCollectionId: '',
+  defaultTermBaseId: '',
   fixedTMCollectionId: '',
   fixedTermBaseId: '',
 })
@@ -58,9 +65,12 @@ const newTMCollectionDescription = ref('')
 const tmImportSourceLanguage = ref('')
 const tmImportTargetLanguage = ref('')
 const tmImporting = ref(false)
+const tmPreviewing = ref(false)
 const tmUploadPercent = ref(0)
 const tmImportMessage = ref('')
 const tmImportSummary = ref<TMImportSummary | null>(null)
+const tmImportPreview = ref<TMImportPreview | null>(null)
+const tmKeepDuplicateRowIndexes = ref<Set<number>>(new Set())
 
 const selectedTermFile = ref<File | null>(null)
 const selectedTermBaseId = ref('')
@@ -69,9 +79,12 @@ const newTermBaseDescription = ref('')
 const termImportSourceLanguage = ref('')
 const termImportTargetLanguage = ref('')
 const termImporting = ref(false)
+const termPreviewing = ref(false)
 const termUploadPercent = ref(0)
 const termImportMessage = ref('')
 const termImportSummary = ref<TermImportSummary | null>(null)
+const termImportPreview = ref<TermImportPreview | null>(null)
+const termKeepDuplicateRowIndexes = ref<Set<number>>(new Set())
 
 const selectedTMCollection = computed(() => (
   tmCollections.value.find((item) => item.id === selectedTMCollectionId.value) ?? null
@@ -93,6 +106,18 @@ const contextLanguagePair = computed(() => (
 
 const showTMCreateFields = computed(() => !props.fixedTMCollectionId && !selectedTMCollectionId.value)
 const showTermCreateFields = computed(() => !props.fixedTermBaseId && !selectedTermBaseId.value)
+const tmPreviewRowsHidden = computed(() => {
+  const preview = tmImportPreview.value
+  return preview ? Math.max(0, preview.total_rows - preview.rows.length) : 0
+})
+const termPreviewRowsHidden = computed(() => {
+  const preview = termImportPreview.value
+  return preview ? Math.max(0, preview.total_rows - preview.rows.length) : 0
+})
+const fixedTMTargetLabel = computed(() => props.contextLabel || selectedTMCollection.value?.name || '当前记忆库')
+const fixedTermTargetLabel = computed(() => props.contextLabel || selectedTermBase.value?.name || '当前术语库')
+const tmKeptDuplicateRows = computed(() => countKeptDuplicateRows(tmImportPreview.value?.rows ?? [], tmKeepDuplicateRowIndexes.value))
+const termKeptDuplicateRows = computed(() => countKeptDuplicateRows(termImportPreview.value?.rows ?? [], termKeepDuplicateRowIndexes.value))
 
 watch(() => props.mode, (mode) => {
   if (mode !== 'all') {
@@ -112,8 +137,20 @@ watch(() => props.fixedTMCollectionId, (value) => {
   }
 }, { immediate: true })
 
+watch(() => props.defaultTMCollectionId, (value) => {
+  if (!props.fixedTMCollectionId && value && !selectedTMCollectionId.value) {
+    selectedTMCollectionId.value = value
+  }
+}, { immediate: true })
+
 watch(() => props.fixedTermBaseId, (value) => {
   if (value) {
+    selectedTermBaseId.value = value
+  }
+}, { immediate: true })
+
+watch(() => props.defaultTermBaseId, (value) => {
+  if (!props.fixedTermBaseId && value && !selectedTermBaseId.value) {
     selectedTermBaseId.value = value
   }
 }, { immediate: true })
@@ -141,6 +178,7 @@ watch(selectedTMCollection, (collection) => {
   if (!collection) {
     return
   }
+  resetTMPreview()
   if (collection.source_language) {
     tmImportSourceLanguage.value = collection.source_language
   }
@@ -149,12 +187,29 @@ watch(selectedTMCollection, (collection) => {
   }
 })
 
+watch([selectedTMCollectionId, tmImportSourceLanguage, tmImportTargetLanguage], () => {
+  resetTMPreview()
+})
+
+watch([tmImportSourceLanguage, tmImportTargetLanguage], () => {
+  ensureDefaultTMCollectionSelection()
+})
+
 watch(selectedTermBase, (termBase) => {
   if (!termBase) {
     return
   }
+  resetTermPreview()
   termImportSourceLanguage.value = termBase.source_language
   termImportTargetLanguage.value = termBase.target_language
+})
+
+watch([selectedTermBaseId, termImportSourceLanguage, termImportTargetLanguage], () => {
+  resetTermPreview()
+})
+
+watch([termImportSourceLanguage, termImportTargetLanguage], () => {
+  ensureDefaultTermBaseSelection()
 })
 
 function getErrorMessage(error: unknown, fallback: string) {
@@ -177,14 +232,139 @@ function ensureLanguagePair(sourceLanguage: string, targetLanguage: string) {
   }
 }
 
+function findMatchingTMCollectionId() {
+  const sourceLanguage = tmImportSourceLanguage.value || props.sourceLanguage || ''
+  const targetLanguage = tmImportTargetLanguage.value || props.targetLanguage || ''
+  if (!sourceLanguage || !targetLanguage) {
+    return ''
+  }
+  return tmCollections.value.find((collection) => (
+    collection.source_language === sourceLanguage
+    && collection.target_language === targetLanguage
+  ))?.id || ''
+}
+
+function findMatchingTermBaseId() {
+  const sourceLanguage = termImportSourceLanguage.value || props.sourceLanguage || ''
+  const targetLanguage = termImportTargetLanguage.value || props.targetLanguage || ''
+  if (!sourceLanguage || !targetLanguage) {
+    return ''
+  }
+  return termBases.value.find((termBase) => (
+    termBase.source_language === sourceLanguage
+    && termBase.target_language === targetLanguage
+  ))?.id || ''
+}
+
+function ensureDefaultTMCollectionSelection() {
+  if (props.fixedTMCollectionId) {
+    selectedTMCollectionId.value = props.fixedTMCollectionId
+    return
+  }
+  if (selectedTMCollectionId.value) {
+    return
+  }
+  const defaultId = props.defaultTMCollectionId || findMatchingTMCollectionId()
+  if (defaultId && tmCollections.value.some((collection) => collection.id === defaultId)) {
+    selectedTMCollectionId.value = defaultId
+  }
+}
+
+function ensureDefaultTermBaseSelection() {
+  if (props.fixedTermBaseId) {
+    selectedTermBaseId.value = props.fixedTermBaseId
+    return
+  }
+  if (selectedTermBaseId.value) {
+    return
+  }
+  const defaultId = props.defaultTermBaseId || findMatchingTermBaseId()
+  if (defaultId && termBases.value.some((termBase) => termBase.id === defaultId)) {
+    selectedTermBaseId.value = defaultId
+  }
+}
+
+function isDuplicatePreviewRow(row: ImportPreviewRow) {
+  return row.status === 'update' || row.status === 'keep' || row.status === 'duplicate'
+}
+
+function getInitialKeepDuplicateRowIndexes(rows: ImportPreviewRow[]) {
+  return new Set(rows.filter(isDuplicatePreviewRow).map((row) => row.row_index))
+}
+
+function countKeptDuplicateRows(rows: ImportPreviewRow[], rowIndexes: Set<number>) {
+  return rows.filter((row) => isDuplicatePreviewRow(row) && rowIndexes.has(row.row_index)).length
+}
+
+function appendSkippedDuplicateRows(formData: FormData, rowIndexes: Set<number>) {
+  formData.append('skip_duplicate_row_indexes', JSON.stringify([...rowIndexes].sort((a, b) => a - b)))
+}
+
+function isTMDuplicateRowKept(row: ImportPreviewRow) {
+  return isDuplicatePreviewRow(row) && tmKeepDuplicateRowIndexes.value.has(row.row_index)
+}
+
+function isTermDuplicateRowKept(row: ImportPreviewRow) {
+  return isDuplicatePreviewRow(row) && termKeepDuplicateRowIndexes.value.has(row.row_index)
+}
+
+function setTMDuplicateRowKeep(rowIndex: number, keep: boolean) {
+  const next = new Set(tmKeepDuplicateRowIndexes.value)
+  if (keep) {
+    next.add(rowIndex)
+  } else {
+    next.delete(rowIndex)
+  }
+  tmKeepDuplicateRowIndexes.value = next
+}
+
+function setTermDuplicateRowKeep(rowIndex: number, keep: boolean) {
+  const next = new Set(termKeepDuplicateRowIndexes.value)
+  if (keep) {
+    next.add(rowIndex)
+  } else {
+    next.delete(rowIndex)
+  }
+  termKeepDuplicateRowIndexes.value = next
+}
+
+function getTMPreviewMessage(row: ImportPreviewRow) {
+  if (row.status === 'duplicate') {
+    return isTMDuplicateRowKept(row)
+      ? '文件内重复，将跳过此行并保留前一条导入数据。'
+      : '文件内重复，将使用此行作为本次导入数据。'
+  }
+  if (row.status === 'update' || row.status === 'keep') {
+    return isTMDuplicateRowKept(row)
+      ? '当前记忆库已有相同源文，将保留现有数据。'
+      : '当前记忆库已有相同源文，将使用导入译文覆盖。'
+  }
+  return row.message
+}
+
+function getTermPreviewMessage(row: ImportPreviewRow) {
+  if (row.status === 'duplicate') {
+    return isTermDuplicateRowKept(row)
+      ? '文件内重复，将跳过此行并保留前一条术语数据。'
+      : '文件内重复，将使用此行作为本次导入数据。'
+  }
+  if (row.status === 'update' || row.status === 'keep') {
+    return isTermDuplicateRowKept(row)
+      ? '当前术语库已有相同源术语，将保留现有数据。'
+      : '当前术语库已有相同源术语，将使用导入目标术语覆盖。'
+  }
+  return row.message
+}
+
 async function loadTMCollections() {
   loadingTMCollections.value = true
   try {
     const { data } = await http.get<TMCollection[]>('/translation-memory/collections')
     tmCollections.value = data
-    if (selectedTMCollectionId.value && !data.some((item) => item.id === selectedTMCollectionId.value)) {
+    if (!props.fixedTMCollectionId && selectedTMCollectionId.value && !data.some((item) => item.id === selectedTMCollectionId.value)) {
       selectedTMCollectionId.value = ''
     }
+    ensureDefaultTMCollectionSelection()
   } catch (error) {
     tmImportMessage.value = getErrorMessage(error, t('resourceImport.tm.errors.loadCollections'))
   } finally {
@@ -197,9 +377,10 @@ async function loadTermBases() {
   try {
     const { data } = await http.get<TermBase[]>('/term-bases')
     termBases.value = data
-    if (selectedTermBaseId.value && !data.some((item) => item.id === selectedTermBaseId.value)) {
+    if (!props.fixedTermBaseId && selectedTermBaseId.value && !data.some((item) => item.id === selectedTermBaseId.value)) {
       selectedTermBaseId.value = ''
     }
+    ensureDefaultTermBaseSelection()
   } catch (error) {
     termImportMessage.value = getErrorMessage(error, t('resourceImport.term.errors.loadBases'))
   } finally {
@@ -252,6 +433,7 @@ async function createTermBase(
 function onTMFileChange(event: Event) {
   const file = (event.target as HTMLInputElement).files?.[0] ?? null
   selectedTMFile.value = file
+  resetTMPreview()
   
   if (!file) return
   
@@ -294,8 +476,128 @@ async function fetchSDLTMMetadata(file: File) {
 
 function onTermFileChange(event: Event) {
   selectedTermFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
+  resetTermPreview()
   if (selectedTermFile.value && !selectedTermBaseId.value && !newTermBaseName.value.trim()) {
     newTermBaseName.value = fileBaseName(selectedTermFile.value)
+  }
+}
+
+function resetTMPreview() {
+  tmImportPreview.value = null
+  tmImportSummary.value = null
+  tmImportMessage.value = ''
+  tmKeepDuplicateRowIndexes.value = new Set()
+}
+
+function buildTMImportFormData(collectionId?: string, includeDuplicateDecisions = false) {
+  if (!selectedTMFile.value) {
+    throw new Error(t('resourceImport.tm.errors.selectFile'))
+  }
+  const formData = new FormData()
+  formData.append('file', selectedTMFile.value)
+  if (collectionId) {
+    formData.append('collection_id', collectionId)
+  }
+  formData.append('source_language', tmImportSourceLanguage.value)
+  formData.append('target_language', tmImportTargetLanguage.value)
+  formData.append('duplicate_policy', 'overwrite')
+  if (includeDuplicateDecisions) {
+    appendSkippedDuplicateRows(formData, tmKeepDuplicateRowIndexes.value)
+  }
+  return formData
+}
+
+async function previewTMWorkbook() {
+  if (!selectedTMFile.value) {
+    tmImportMessage.value = t('resourceImport.tm.errors.selectFile')
+    return
+  }
+
+  try {
+    ensureLanguagePair(tmImportSourceLanguage.value, tmImportTargetLanguage.value)
+  } catch (error) {
+    resetTMPreview()
+    tmImportMessage.value = error instanceof Error ? error.message : t('resourceImport.tm.errors.selectLanguage')
+    return
+  }
+
+  tmPreviewing.value = true
+  tmImportMessage.value = ''
+  tmImportSummary.value = null
+
+  try {
+    const formData = buildTMImportFormData(selectedTMCollectionId.value || props.fixedTMCollectionId)
+    formData.append('preview_limit', '500')
+    const { data } = await http.post<TMImportPreview>('/translation-memory/import-xlsx/preview', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    tmImportPreview.value = data
+    tmKeepDuplicateRowIndexes.value = getInitialKeepDuplicateRowIndexes(data.rows)
+    tmImportMessage.value = `预览完成：读取 ${data.valid_rows} 条有效记忆。`
+  } catch (error) {
+    tmImportPreview.value = null
+    tmImportMessage.value = getErrorMessage(error, '记忆库预览失败。')
+  } finally {
+    tmPreviewing.value = false
+  }
+}
+
+function resetTermPreview() {
+  termImportPreview.value = null
+  termImportSummary.value = null
+  termImportMessage.value = ''
+  termKeepDuplicateRowIndexes.value = new Set()
+}
+
+function buildTermImportFormData(termBaseId?: string, includeDuplicateDecisions = false) {
+  if (!selectedTermFile.value) {
+    throw new Error(t('resourceImport.term.errors.selectFile'))
+  }
+  const formData = new FormData()
+  formData.append('file', selectedTermFile.value)
+  if (termBaseId) {
+    formData.append('term_base_id', termBaseId)
+  }
+  formData.append('source_language', termImportSourceLanguage.value)
+  formData.append('target_language', termImportTargetLanguage.value)
+  if (includeDuplicateDecisions) {
+    appendSkippedDuplicateRows(formData, termKeepDuplicateRowIndexes.value)
+  }
+  return formData
+}
+
+async function previewTermWorkbook() {
+  if (!selectedTermFile.value) {
+    termImportMessage.value = t('resourceImport.term.errors.selectFile')
+    return
+  }
+
+  try {
+    ensureLanguagePair(termImportSourceLanguage.value, termImportTargetLanguage.value)
+  } catch (error) {
+    resetTermPreview()
+    termImportMessage.value = error instanceof Error ? error.message : t('resourceImport.term.errors.selectLanguage')
+    return
+  }
+
+  termPreviewing.value = true
+  termImportMessage.value = ''
+  termImportSummary.value = null
+
+  try {
+    const formData = buildTermImportFormData(selectedTermBaseId.value || props.fixedTermBaseId)
+    formData.append('preview_limit', '500')
+    const { data } = await http.post<TermImportPreview>('/term-bases/import-xlsx/preview', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    termImportPreview.value = data
+    termKeepDuplicateRowIndexes.value = getInitialKeepDuplicateRowIndexes(data.rows)
+    termImportMessage.value = `预览完成：读取 ${data.valid_rows} 条有效术语。`
+  } catch (error) {
+    termImportPreview.value = null
+    termImportMessage.value = getErrorMessage(error, '术语库预览失败。')
+  } finally {
+    termPreviewing.value = false
   }
 }
 
@@ -356,11 +658,7 @@ async function uploadTMWorkbook() {
 
   try {
     const collectionId = await ensureImportCollection()
-    const formData = new FormData()
-    formData.append('file', selectedTMFile.value)
-    formData.append('collection_id', collectionId)
-    formData.append('source_language', tmImportSourceLanguage.value)
-    formData.append('target_language', tmImportTargetLanguage.value)
+    const formData = buildTMImportFormData(collectionId, true)
 
     const { data } = await http.post<TMImportSummary>('/translation-memory/import-xlsx', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
@@ -372,6 +670,7 @@ async function uploadTMWorkbook() {
     })
 
     tmImportSummary.value = data
+    tmImportPreview.value = null
     tmImportMessage.value = t('resourceImport.tm.success.imported', { filename: data.filename })
     refreshGlobalNotifications()
     selectedTMFile.value = null
@@ -411,11 +710,7 @@ async function uploadTermWorkbook() {
 
   try {
     const termBaseId = await ensureImportTermBase()
-    const formData = new FormData()
-    formData.append('file', selectedTermFile.value)
-    formData.append('term_base_id', termBaseId)
-    formData.append('source_language', termImportSourceLanguage.value)
-    formData.append('target_language', termImportTargetLanguage.value)
+    const formData = buildTermImportFormData(termBaseId, true)
 
     const { data } = await http.post<TermImportSummary>('/term-bases/import-xlsx', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
@@ -427,6 +722,7 @@ async function uploadTermWorkbook() {
     })
 
     termImportSummary.value = data
+    termImportPreview.value = null
     termImportMessage.value = t('resourceImport.term.success.imported', { filename: data.filename })
     refreshGlobalNotifications()
     selectedTermFile.value = null
@@ -501,14 +797,19 @@ onMounted(() => {
             class="field__control"
             :disabled="loadingTMCollections || Boolean(props.fixedTMCollectionId)"
           >
-            <option value="">{{ t('resourceImport.tm.createNew') }}</option>
-            <option
-              v-for="collection in tmCollections"
-              :key="collection.id"
-              :value="collection.id"
-            >
-              {{ collection.name }}（{{ formatLanguagePair(collection.source_language, collection.target_language) }} / {{ collection.entry_count }} 条）
-            </option>
+            <template v-if="props.fixedTMCollectionId">
+              <option :value="props.fixedTMCollectionId">{{ fixedTMTargetLabel }}（当前记忆库）</option>
+            </template>
+            <template v-else>
+              <option value="">{{ t('resourceImport.tm.createNew') }}</option>
+              <option
+                v-for="collection in tmCollections"
+                :key="collection.id"
+                :value="collection.id"
+              >
+                {{ collection.name }}（{{ formatLanguagePair(collection.source_language, collection.target_language) }} / {{ collection.entry_count }} 条）
+              </option>
+            </template>
           </select>
         </label>
 
@@ -574,14 +875,24 @@ onMounted(() => {
 
       <div class="resource-import-panel__actions">
         <button
+          class="button"
+          type="button"
+          :disabled="tmImporting || tmPreviewing"
+          @click="previewTMWorkbook"
+        >
+          <Loader2 v-if="tmPreviewing" class="lucide-spin" />
+          <Eye v-else :size="14" />
+          {{ tmPreviewing ? '预览中...' : '预览数据' }}
+        </button>
+        <button
           class="button button--primary"
           type="button"
-          :disabled="tmImporting"
+          :disabled="tmImporting || tmPreviewing || !tmImportPreview"
           @click="uploadTMWorkbook"
         >
           <Loader2 v-if="tmImporting" class="lucide-spin" />
-          <Upload v-else :size="14" />
-          {{ tmImporting ? t('resourceImport.tm.importing', { percent: tmUploadPercent }) : t('resourceImport.tm.importAction') }}
+          <CheckCircle2 v-else :size="14" />
+          {{ tmImporting ? t('resourceImport.tm.importing', { percent: tmUploadPercent }) : '确认导入' }}
         </button>
       </div>
 
@@ -601,10 +912,79 @@ onMounted(() => {
       <p
         v-if="tmImportMessage"
         class="form-message"
-        :class="{ 'is-error': !tmImportSummary }"
+        :class="{ 'is-error': !tmImportSummary && !tmImportPreview }"
       >
         {{ tmImportMessage }}
       </p>
+
+      <div v-if="tmImportPreview" class="resource-import-panel__preview">
+        <div class="resource-import-panel__preview-head">
+          <div>
+            <div class="section-title">导入预览</div>
+            <p class="hint-text">
+              {{ tmImportPreview.filename }}，将导入到 {{ tmImportPreview.collection_name || (newTMCollectionName || '新记忆库') }}
+            </p>
+          </div>
+          <div class="resource-import-panel__preview-stats">
+            <span>有效 {{ tmImportPreview.valid_rows }}</span>
+            <span>新增 {{ tmImportPreview.create_rows }}</span>
+            <span>覆盖 {{ tmImportPreview.update_rows }}</span>
+            <span>保留 {{ tmKeptDuplicateRows }}</span>
+            <span>重复 {{ tmImportPreview.duplicate_rows }}</span>
+            <span>跳过 {{ tmImportPreview.skipped_empty_rows + tmImportPreview.skipped_header_rows }}</span>
+          </div>
+        </div>
+
+        <div class="resource-import-panel__preview-table-wrap">
+          <table class="resource-import-panel__preview-table">
+            <thead>
+              <tr>
+                <th>行号</th>
+                <th>源文</th>
+                <th>译文</th>
+                <th>结果</th>
+                <th>重复处理</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in tmImportPreview.rows" :key="row.row_index" :class="`is-${row.status}`">
+                <td>{{ row.row_index }}</td>
+                <td>{{ row.source_text || '-' }}</td>
+                <td>{{ row.target_text || '-' }}</td>
+                <td>
+                  <strong>{{ getTMPreviewMessage(row) }}</strong>
+                </td>
+                <td>
+                  <div v-if="isDuplicatePreviewRow(row)" class="resource-import-panel__row-actions">
+                    <button
+                      class="resource-import-panel__choice"
+                      :class="{ 'is-active': isTMDuplicateRowKept(row) }"
+                      type="button"
+                      :disabled="tmImporting || tmPreviewing"
+                      @click="setTMDuplicateRowKeep(row.row_index, true)"
+                    >
+                      {{ row.status === 'duplicate' ? '保留前一条' : '保留现有' }}
+                    </button>
+                    <button
+                      class="resource-import-panel__choice"
+                      :class="{ 'is-active': !isTMDuplicateRowKept(row) }"
+                      type="button"
+                      :disabled="tmImporting || tmPreviewing"
+                      @click="setTMDuplicateRowKeep(row.row_index, false)"
+                    >
+                      {{ row.status === 'duplicate' ? '使用此行' : '使用导入' }}
+                    </button>
+                  </div>
+                  <span v-else class="resource-import-panel__row-empty">-</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p v-if="tmPreviewRowsHidden > 0" class="hint-text">
+          仅显示前 {{ tmImportPreview.rows.length }} 行，还有 {{ tmPreviewRowsHidden }} 行未展示；未展示行不会参与逐行保留选择。
+        </p>
+      </div>
 
       <div v-if="tmImportSummary" class="resource-import-panel__summary">
         <div class="section-title">{{ t('resourceImport.tm.summary.title') }}</div>
@@ -628,6 +1008,10 @@ onMounted(() => {
           <div class="summary-item">
             <strong>{{ tmImportSummary.updated_rows }}</strong>
             <span>{{ t('resourceImport.tm.summary.updatedRows') }}</span>
+          </div>
+          <div class="summary-item">
+            <strong>{{ tmImportSummary.skipped_duplicate_rows || 0 }}</strong>
+            <span>重复跳过</span>
           </div>
           <div class="summary-item">
             <strong>{{ tmImportSummary.skipped_header_rows }}</strong>
@@ -654,14 +1038,19 @@ onMounted(() => {
             class="field__control"
             :disabled="loadingTermBases || Boolean(props.fixedTermBaseId)"
           >
-            <option value="">{{ t('resourceImport.term.createNew') }}</option>
-            <option
-              v-for="termBase in termBases"
-              :key="termBase.id"
-              :value="termBase.id"
-            >
-              {{ termBase.name }}（{{ formatLanguagePair(termBase.source_language, termBase.target_language) }} / {{ termBase.entry_count }} 条）
-            </option>
+            <template v-if="props.fixedTermBaseId">
+              <option :value="props.fixedTermBaseId">{{ fixedTermTargetLabel }}（当前术语库）</option>
+            </template>
+            <template v-else>
+              <option value="">{{ t('resourceImport.term.createNew') }}</option>
+              <option
+                v-for="termBase in termBases"
+                :key="termBase.id"
+                :value="termBase.id"
+              >
+                {{ termBase.name }}（{{ formatLanguagePair(termBase.source_language, termBase.target_language) }} / {{ termBase.entry_count }} 条）
+              </option>
+            </template>
           </select>
         </label>
 
@@ -727,14 +1116,24 @@ onMounted(() => {
 
       <div class="resource-import-panel__actions">
         <button
+          class="button"
+          type="button"
+          :disabled="termImporting || termPreviewing"
+          @click="previewTermWorkbook"
+        >
+          <Loader2 v-if="termPreviewing" class="lucide-spin" />
+          <Eye v-else :size="14" />
+          {{ termPreviewing ? '预览中...' : '预览数据' }}
+        </button>
+        <button
           class="button button--primary"
           type="button"
-          :disabled="termImporting"
+          :disabled="termImporting || termPreviewing || !termImportPreview"
           @click="uploadTermWorkbook"
         >
           <Loader2 v-if="termImporting" class="lucide-spin" />
-          <Upload v-else :size="14" />
-          {{ termImporting ? t('resourceImport.term.importing', { percent: termUploadPercent }) : t('resourceImport.term.importAction') }}
+          <CheckCircle2 v-else :size="14" />
+          {{ termImporting ? t('resourceImport.term.importing', { percent: termUploadPercent }) : '确认导入' }}
         </button>
       </div>
 
@@ -754,10 +1153,79 @@ onMounted(() => {
       <p
         v-if="termImportMessage"
         class="form-message"
-        :class="{ 'is-error': !termImportSummary }"
+        :class="{ 'is-error': !termImportSummary && !termImportPreview }"
       >
         {{ termImportMessage }}
       </p>
+
+      <div v-if="termImportPreview" class="resource-import-panel__preview">
+        <div class="resource-import-panel__preview-head">
+          <div>
+            <div class="section-title">导入预览</div>
+            <p class="hint-text">
+              {{ termImportPreview.filename }}，将导入到 {{ termImportPreview.term_base_name || (newTermBaseName || '新术语库') }}
+            </p>
+          </div>
+          <div class="resource-import-panel__preview-stats">
+            <span>有效 {{ termImportPreview.valid_rows }}</span>
+            <span>新增 {{ termImportPreview.create_rows }}</span>
+            <span>覆盖 {{ termImportPreview.update_rows }}</span>
+            <span>保留 {{ termKeptDuplicateRows }}</span>
+            <span>重复 {{ termImportPreview.duplicate_rows }}</span>
+            <span>跳过 {{ termImportPreview.skipped_empty_rows + termImportPreview.skipped_header_rows }}</span>
+          </div>
+        </div>
+
+        <div class="resource-import-panel__preview-table-wrap">
+          <table class="resource-import-panel__preview-table">
+            <thead>
+              <tr>
+                <th>行号</th>
+                <th>源术语</th>
+                <th>目标术语</th>
+                <th>结果</th>
+                <th>重复处理</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in termImportPreview.rows" :key="row.row_index" :class="`is-${row.status}`">
+                <td>{{ row.row_index }}</td>
+                <td>{{ row.source_text || '-' }}</td>
+                <td>{{ row.target_text || '-' }}</td>
+                <td>
+                  <strong>{{ getTermPreviewMessage(row) }}</strong>
+                </td>
+                <td>
+                  <div v-if="isDuplicatePreviewRow(row)" class="resource-import-panel__row-actions">
+                    <button
+                      class="resource-import-panel__choice"
+                      :class="{ 'is-active': isTermDuplicateRowKept(row) }"
+                      type="button"
+                      :disabled="termImporting || termPreviewing"
+                      @click="setTermDuplicateRowKeep(row.row_index, true)"
+                    >
+                      {{ row.status === 'duplicate' ? '保留前一条' : '保留现有' }}
+                    </button>
+                    <button
+                      class="resource-import-panel__choice"
+                      :class="{ 'is-active': !isTermDuplicateRowKept(row) }"
+                      type="button"
+                      :disabled="termImporting || termPreviewing"
+                      @click="setTermDuplicateRowKeep(row.row_index, false)"
+                    >
+                      {{ row.status === 'duplicate' ? '使用此行' : '使用导入' }}
+                    </button>
+                  </div>
+                  <span v-else class="resource-import-panel__row-empty">-</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p v-if="termPreviewRowsHidden > 0" class="hint-text">
+          仅显示前 {{ termImportPreview.rows.length }} 行，还有 {{ termPreviewRowsHidden }} 行未展示；未展示行不会参与逐行保留选择。
+        </p>
+      </div>
 
       <div v-if="termImportSummary" class="resource-import-panel__summary">
         <div class="section-title">{{ t('resourceImport.term.summary.title') }}</div>
@@ -781,6 +1249,10 @@ onMounted(() => {
           <div class="summary-item">
             <strong>{{ termImportSummary.updated_rows }}</strong>
             <span>{{ t('resourceImport.term.summary.updatedRows') }}</span>
+          </div>
+          <div class="summary-item">
+            <strong>{{ termImportSummary.skipped_duplicate_rows || 0 }}</strong>
+            <span>重复跳过</span>
           </div>
           <div class="summary-item">
             <strong>{{ termImportSummary.skipped_header_rows }}</strong>
@@ -844,6 +1316,7 @@ onMounted(() => {
 
 .resource-import-panel__actions {
   display: flex;
+  gap: 10px;
   justify-content: flex-end;
 }
 
@@ -855,6 +1328,146 @@ onMounted(() => {
 .resource-import-panel__summary {
   display: grid;
   gap: 12px;
+}
+
+.resource-import-panel__preview {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-0);
+}
+
+.resource-import-panel__preview-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.resource-import-panel__preview-head .hint-text {
+  margin: 4px 0 0;
+}
+
+.resource-import-panel__preview-stats {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.resource-import-panel__preview-stats span {
+  min-height: 24px;
+  padding: 4px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.resource-import-panel__preview-table-wrap {
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+}
+
+.resource-import-panel__preview-table {
+  width: 100%;
+  min-width: 820px;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 13px;
+}
+
+.resource-import-panel__preview-table th,
+.resource-import-panel__preview-table td {
+  padding: 10px;
+  border-right: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line-soft);
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.resource-import-panel__preview-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--brand-050);
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.resource-import-panel__preview-table th:first-child,
+.resource-import-panel__preview-table td:first-child {
+  width: 64px;
+  text-align: center;
+}
+
+.resource-import-panel__preview-table th:last-child,
+.resource-import-panel__preview-table td:last-child {
+  width: 190px;
+  border-right: 0;
+}
+
+.resource-import-panel__preview-table th:nth-last-child(2),
+.resource-import-panel__preview-table td:nth-last-child(2) {
+  width: 240px;
+}
+
+.resource-import-panel__row-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.resource-import-panel__choice {
+  min-height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.resource-import-panel__choice.is-active {
+  border-color: var(--brand-500);
+  background: var(--brand-050);
+  color: var(--brand-700);
+  font-weight: 600;
+}
+
+.resource-import-panel__choice:disabled {
+  cursor: not-allowed;
+  opacity: 0.56;
+}
+
+.resource-import-panel__row-empty {
+  color: var(--text-muted);
+}
+
+.resource-import-panel__preview-table tr.is-create td:nth-last-child(2) {
+  color: var(--state-success, #0b7a55);
+}
+
+.resource-import-panel__preview-table tr.is-update td:nth-last-child(2) {
+  color: var(--brand-700);
+}
+
+.resource-import-panel__preview-table tr.is-keep td:nth-last-child(2) {
+  color: var(--text-secondary);
+}
+
+.resource-import-panel__preview-table tr.is-duplicate td:nth-last-child(2),
+.resource-import-panel__preview-table tr.is-empty td:nth-last-child(2),
+.resource-import-panel__preview-table tr.is-header td:nth-last-child(2) {
+  color: var(--text-muted);
 }
 
 @media (max-width: 720px) {
@@ -869,6 +1482,14 @@ onMounted(() => {
 
   .resource-import-panel__actions .button {
     width: 100%;
+  }
+
+  .resource-import-panel__preview-head {
+    display: grid;
+  }
+
+  .resource-import-panel__preview-stats {
+    justify-content: flex-start;
   }
 }
 </style>

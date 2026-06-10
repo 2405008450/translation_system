@@ -237,6 +237,7 @@ from app.services.tm_importer import (
     XLSX_EXTENSIONS,
     import_tm_from_sdltm_upload,
     import_tm_from_upload,
+    preview_tm_from_upload,
     preview_sdltm_metadata,
 )
 from app.services.tm_vector import sync_tm_embeddings
@@ -9360,6 +9361,109 @@ async def preview_sdltm(
         raise HTTPException(status_code=500, detail=f"读取 SDLTM 元数据失败：{exc}") from exc
 
 
+def _validate_tm_import_upload(file: UploadFile, raw_bytes: bytes | None = None) -> str:
+    extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
+    if extension not in TM_IMPORT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="仅支持上传 .tmx、.sdltm、.xls、.xlsx 或 .csv 文件。")
+    if raw_bytes is not None and not raw_bytes:
+        raise HTTPException(status_code=400, detail="上传的文件为空。")
+    return extension
+
+
+def _normalize_duplicate_policy(value: str | None) -> Literal["overwrite", "keep"]:
+    return "keep" if value == "keep" else "overwrite"
+
+
+def _parse_import_row_indexes(value: str | None) -> set[int]:
+    if not value:
+        return set()
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        parsed = [item.strip() for item in value.split(",") if item.strip()]
+    if not isinstance(parsed, list):
+        raise HTTPException(status_code=400, detail="重复行处理参数格式不正确。")
+
+    row_indexes: set[int] = set()
+    for item in parsed:
+        try:
+            row_index = int(item)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="重复行处理参数必须是行号列表。") from exc
+        if row_index > 0:
+            row_indexes.add(row_index)
+    return row_indexes
+
+
+@router.post("/translation-memory/import-xlsx/preview")
+@router.post("/tm/import-xlsx/preview", include_in_schema=False)
+@router.post("/translation-memory/import/preview", include_in_schema=False)
+@router.post("/tm/import/preview", include_in_schema=False)
+async def preview_tm_xlsx(
+    file: UploadFile = File(...),
+    collection_id: UUID | None = Form(default=None),
+    source_language: str = Form(...),
+    target_language: str = Form(...),
+    duplicate_policy: str = Form(default="overwrite"),
+    preview_limit: int = Form(default=100),
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    _validate_tm_import_upload(file)
+    raw_bytes = await file.read()
+    _validate_tm_import_upload(file, raw_bytes)
+
+    collection = _get_collection_or_404(db, collection_id)
+    resolved_source_language, resolved_target_language = _resolve_collection_language_pair(
+        collection,
+        source_language,
+        target_language,
+    )
+    normalized_duplicate_policy = _normalize_duplicate_policy(duplicate_policy)
+
+    try:
+        preview = preview_tm_from_upload(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=file.filename or "uploaded.xlsx",
+            collection_id=collection_id,
+            source_language=resolved_source_language,
+            target_language=resolved_target_language,
+            duplicate_policy=normalized_duplicate_policy,
+            preview_limit=max(1, min(preview_limit, 500)),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"TM 预览失败：{exc}") from exc
+
+    return {
+        "filename": preview.filename,
+        "rows": [
+            {
+                "row_index": row.row_index,
+                "source_text": row.source_text,
+                "target_text": row.target_text,
+                "status": row.status,
+                "message": row.message,
+            }
+            for row in preview.rows
+        ],
+        "total_rows": preview.total_rows,
+        "valid_rows": preview.valid_rows,
+        "create_rows": preview.create_rows,
+        "update_rows": preview.update_rows,
+        "keep_rows": preview.keep_rows,
+        "duplicate_rows": preview.duplicate_rows,
+        "skipped_empty_rows": preview.skipped_empty_rows,
+        "skipped_header_rows": preview.skipped_header_rows,
+        "preview_limit": preview.preview_limit,
+        "duplicate_policy": preview.duplicate_policy,
+        "collection_id": str(collection.id) if collection else None,
+        "collection_name": collection.name if collection else "",
+        "source_language": resolved_source_language,
+        "target_language": resolved_target_language,
+    }
+
+
 @router.post("/translation-memory/import-xlsx")
 @router.post("/tm/import-xlsx", include_in_schema=False)
 @router.post("/translation-memory/import", include_in_schema=False)
@@ -9369,16 +9473,15 @@ async def import_tm_xlsx(
     collection_id: UUID | None = Form(default=None),
     source_language: str = Form(...),
     target_language: str = Form(...),
+    duplicate_policy: str = Form(default="overwrite"),
+    skip_duplicate_row_indexes: str = Form(default="[]"),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
-    if extension not in TM_IMPORT_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="仅支持上传 .tmx、.sdltm、.xls、.xlsx 或 .csv 文件。")
+    extension = _validate_tm_import_upload(file)
 
     raw_bytes = await file.read()
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail="上传的文件为空。")
+    _validate_tm_import_upload(file, raw_bytes)
 
     collection = _get_collection_or_404(db, collection_id)
     resolved_source_language, resolved_target_language = _resolve_collection_language_pair(
@@ -9386,6 +9489,8 @@ async def import_tm_xlsx(
         source_language,
         target_language,
     )
+    normalized_duplicate_policy = _normalize_duplicate_policy(duplicate_policy)
+    skipped_row_indexes = _parse_import_row_indexes(skip_duplicate_row_indexes)
     try:
         if extension in SDLTM_EXTENSIONS:
             import_summary = import_tm_from_sdltm_upload(
@@ -9396,6 +9501,8 @@ async def import_tm_xlsx(
                 source_language=resolved_source_language,
                 target_language=resolved_target_language,
                 creator_id=current_user.id,
+                duplicate_policy=normalized_duplicate_policy,
+                skip_duplicate_row_indexes=skipped_row_indexes,
             )
         else:
             import_summary = import_tm_from_upload(
@@ -9406,6 +9513,8 @@ async def import_tm_xlsx(
                 source_language=resolved_source_language,
                 target_language=resolved_target_language,
                 creator_id=current_user.id,
+                duplicate_policy=normalized_duplicate_policy,
+                skip_duplicate_row_indexes=skipped_row_indexes,
             )
     except Exception as exc:
         db.rollback()
@@ -9440,6 +9549,7 @@ async def import_tm_xlsx(
         "filename": import_summary.filename,
         "created_rows": import_summary.created_rows,
         "updated_rows": import_summary.updated_rows,
+        "skipped_duplicate_rows": import_summary.skipped_duplicate_rows,
         "skipped_empty_rows": import_summary.skipped_empty_rows,
         "skipped_header_rows": import_summary.skipped_header_rows,
         "imported_rows": import_summary.imported_rows,

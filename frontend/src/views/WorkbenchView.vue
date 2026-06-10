@@ -5430,6 +5430,10 @@ onBeforeRouteLeave(async () => {
       :open="showImportDialog"
       :initial-tab="importDialogInitialTab"
       :context-label="t('workbench.importContext', { name: segmentStore.fileRecord?.filename || t('workbench.currentTask') })"
+      :source-language="segmentStore.fileRecord?.source_language || null"
+      :target-language="segmentStore.fileRecord?.target_language || null"
+      :default-tm-collection-id="segmentStore.fileRecord?.collection_id || ''"
+      :default-term-base-id="segmentStore.fileRecord?.term_base_id || ''"
       @close="showImportDialog = false"
       @imported="handleResourceImported"
     />

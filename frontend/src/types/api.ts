@@ -832,11 +832,41 @@ export interface TMImportSummary {
   filename: string
   created_rows: number
   updated_rows: number
+  skipped_duplicate_rows?: number
   skipped_empty_rows: number
   skipped_header_rows: number
   imported_rows: number
   collection_id: string | null
   collection_name: string | null
+  source_language: string
+  target_language: string
+}
+
+export type ImportPreviewStatus = 'create' | 'update' | 'keep' | 'duplicate' | 'empty' | 'header' | 'pending'
+
+export interface TMImportPreviewRow {
+  row_index: number
+  source_text: string
+  target_text: string
+  status: ImportPreviewStatus
+  message: string
+}
+
+export interface TMImportPreview {
+  filename: string
+  rows: TMImportPreviewRow[]
+  total_rows: number
+  valid_rows: number
+  create_rows: number
+  update_rows: number
+  keep_rows: number
+  duplicate_rows: number
+  skipped_empty_rows: number
+  skipped_header_rows: number
+  preview_limit: number
+  duplicate_policy: 'overwrite' | 'keep'
+  collection_id: string | null
+  collection_name: string
   source_language: string
   target_language: string
 }
@@ -855,10 +885,36 @@ export interface TermImportSummary {
   filename: string
   created_rows: number
   updated_rows: number
+  skipped_duplicate_rows?: number
   skipped_empty_rows: number
   skipped_header_rows: number
   imported_rows: number
   term_base_id: string
+  term_base_name: string
+  source_language: string
+  target_language: string
+}
+
+export interface TermImportPreviewRow {
+  row_index: number
+  source_text: string
+  target_text: string
+  status: ImportPreviewStatus
+  message: string
+}
+
+export interface TermImportPreview {
+  filename: string
+  rows: TermImportPreviewRow[]
+  total_rows: number
+  valid_rows: number
+  create_rows: number
+  update_rows: number
+  duplicate_rows: number
+  skipped_empty_rows: number
+  skipped_header_rows: number
+  preview_limit: number
+  term_base_id: string | null
   term_base_name: string
   source_language: string
   target_language: string

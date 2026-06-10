@@ -33,6 +33,7 @@ from app.services.term_entry_service import (
 from app.services.term_importer import (
     TERM_IMPORT_EXTENSIONS,
     import_terms_from_xlsx_upload,
+    preview_terms_from_upload,
 )
 from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_response
 
@@ -175,6 +176,35 @@ def _serialize_term_entry(entry: TermEntry) -> dict:
         "created_at": entry.created_at.isoformat(),
         "updated_at": entry.updated_at.isoformat(),
     }
+
+
+def _validate_term_import_upload(file: UploadFile, raw_bytes: bytes | None = None) -> None:
+    extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
+    if extension not in TERM_IMPORT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="仅支持上传 .xls、.xlsx 或 .csv 文件。")
+    if raw_bytes is not None and not raw_bytes:
+        raise HTTPException(status_code=400, detail="上传的术语文件为空。")
+
+
+def _parse_import_row_indexes(value: str | None) -> set[int]:
+    if not value:
+        return set()
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        parsed = [item.strip() for item in value.split(",") if item.strip()]
+    if not isinstance(parsed, list):
+        raise HTTPException(status_code=400, detail="重复行处理参数格式不正确。")
+
+    row_indexes: set[int] = set()
+    for item in parsed:
+        try:
+            row_index = int(item)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="重复行处理参数必须是行号列表。") from exc
+        if row_index > 0:
+            row_indexes.add(row_index)
+    return row_indexes
 
 
 def _load_bound_ids(file_record: FileRecord, field_name: str) -> list[str]:
@@ -482,25 +512,90 @@ def delete_term_base(
     return {"message": "术语库已删除。", "deleted_entries": entry_count}
 
 
+@router.post("/term-bases/import-xlsx/preview")
+async def preview_term_base_xlsx(
+    file: UploadFile = File(...),
+    term_base_id: UUID | None = Form(default=None),
+    source_language: str = Form(...),
+    target_language: str = Form(...),
+    preview_limit: int = Form(default=100),
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    _validate_term_import_upload(file)
+    raw_bytes = await file.read()
+    _validate_term_import_upload(file, raw_bytes)
+
+    term_base = _get_term_base_or_404(db, term_base_id) if term_base_id else None
+    if term_base is not None:
+        resolved_source_language, resolved_target_language = _resolve_term_base_language_pair(
+            term_base,
+            source_language,
+            target_language,
+        )
+    else:
+        resolved_source_language, resolved_target_language = _require_term_language_pair(
+            source_language,
+            target_language,
+        )
+
+    try:
+        preview = preview_terms_from_upload(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=file.filename or "uploaded.xlsx",
+            term_base_id=term_base_id,
+            source_language=resolved_source_language,
+            target_language=resolved_target_language,
+            preview_limit=max(1, min(preview_limit, 500)),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"术语库预览失败：{exc}") from exc
+
+    return {
+        "filename": preview.filename,
+        "rows": [
+            {
+                "row_index": row.row_index,
+                "source_text": row.source_text,
+                "target_text": row.target_text,
+                "status": row.status,
+                "message": row.message,
+            }
+            for row in preview.rows
+        ],
+        "total_rows": preview.total_rows,
+        "valid_rows": preview.valid_rows,
+        "create_rows": preview.create_rows,
+        "update_rows": preview.update_rows,
+        "duplicate_rows": preview.duplicate_rows,
+        "skipped_empty_rows": preview.skipped_empty_rows,
+        "skipped_header_rows": preview.skipped_header_rows,
+        "preview_limit": preview.preview_limit,
+        "term_base_id": str(term_base.id) if term_base else None,
+        "term_base_name": term_base.name if term_base else "",
+        "source_language": resolved_source_language,
+        "target_language": resolved_target_language,
+    }
+
+
 @router.post("/term-bases/import-xlsx")
 async def import_term_base_xlsx(
     file: UploadFile = File(...),
     term_base_id: UUID | None = Form(default=None),
     source_language: str = Form(...),
     target_language: str = Form(...),
+    skip_duplicate_row_indexes: str = Form(default="[]"),
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     if term_base_id is None:
         raise HTTPException(status_code=400, detail="请先选择要导入的术语库。")
 
-    extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
-    if extension not in TERM_IMPORT_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="仅支持上传 .xls、.xlsx 或 .csv 文件。")
+    _validate_term_import_upload(file)
 
     raw_bytes = await file.read()
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail="上传的术语文件为空。")
+    _validate_term_import_upload(file, raw_bytes)
 
     term_base = _get_term_base_or_404(db, term_base_id)
     resolved_source_language, resolved_target_language = _resolve_term_base_language_pair(
@@ -508,6 +603,7 @@ async def import_term_base_xlsx(
         source_language,
         target_language,
     )
+    skipped_row_indexes = _parse_import_row_indexes(skip_duplicate_row_indexes)
 
     try:
         import_summary = import_terms_from_xlsx_upload(
@@ -517,6 +613,7 @@ async def import_term_base_xlsx(
             term_base_id=term_base_id,
             source_language=resolved_source_language,
             target_language=resolved_target_language,
+            skip_duplicate_row_indexes=skipped_row_indexes,
         )
     except Exception as exc:
         db.rollback()
@@ -547,6 +644,7 @@ async def import_term_base_xlsx(
         "filename": import_summary.filename,
         "created_rows": import_summary.created_rows,
         "updated_rows": import_summary.updated_rows,
+        "skipped_duplicate_rows": import_summary.skipped_duplicate_rows,
         "skipped_empty_rows": import_summary.skipped_empty_rows,
         "skipped_header_rows": import_summary.skipped_header_rows,
         "imported_rows": import_summary.imported_rows,
