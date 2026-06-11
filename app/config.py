@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     llm_max_concurrency: int = 5
     llm_temperature: float = 0.2
     llm_retry_attempts_per_provider: int = 2
+    # 参考分析专用 LLM 配置（可与翻译用的 LLM 分开）
+    reference_llm_provider: str = "openrouter"
+    reference_llm_api_key: str | None = None
+    reference_llm_model: str = "google/gemini-3.5-flash"
+    reference_llm_base_url: str = "https://openrouter.ai/api/v1"
     redis_url: str | None = None
     import_queue_backend: str = "local"
     aspose_words_license_path: str | None = None

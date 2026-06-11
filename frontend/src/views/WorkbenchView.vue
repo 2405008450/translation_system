@@ -57,6 +57,7 @@ import VirtualList from '../components/VirtualList.vue'
 import WorkbenchHistoryPanel from '../components/WorkbenchHistoryPanel.vue'
 import WorkbenchMatchPanel from '../components/WorkbenchMatchPanel.vue'
 import WorkbenchTermsPanel from '../components/WorkbenchTermsPanel.vue'
+import ReferencePanel from '../components/ReferencePanel.vue'
 import { http } from '../api/http'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
@@ -98,7 +99,7 @@ const props = defineProps<{
 
 type BottomToolKey = 'qa-result' | 'history' | 'source-preview' | 'target-preview' | 'split-preview'
 type BottomDrawerToolKey = Exclude<BottomToolKey, 'qa-result'>
-type SideToolKey = 'match-info' | 'terms' | 'notes'
+type SideToolKey = 'match-info' | 'terms' | 'notes' | 'reference'
 type ResourceImportTab = 'tm' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
 type SaveToTMTargetMode = 'new' | 'existing'
@@ -272,6 +273,10 @@ const addTermTargetText = ref('')
 const addTermTargetBaseId = ref('')
 const addTermFormError = ref('')
 const termsMessage = ref(t('workbench.terms.defaultMessage'))
+
+// 参考文件匹配结果
+const referenceMatchResult = ref<import('../types/api').ReferenceMatchResult | null>(null)
+
 let searchLoadRequestId = 0
 let suppressSegmentFilterWatch = false
 
@@ -1010,6 +1015,7 @@ const sideToolButtons = computed(() => ([
   { key: 'match-info' as const, label: t('workbench.tools.matchInfo'), icon: Info, tone: 'info' },
   { key: 'terms' as const, label: t('workbench.tools.terms'), icon: Languages, tone: 'language' },
   { key: 'notes' as const, label: t('workbench.tools.notes'), icon: MessageSquare, tone: 'note' },
+  { key: 'reference' as const, label: '参考文件', icon: FileText, tone: 'reference' },
 ]))
 
 usePageHeader(() => ({
@@ -2576,6 +2582,9 @@ async function loadTask() {
 
     await loadTermBases()
     await loadLatestTermQAReport()
+    
+    // 加载参考文件匹配结果
+    await loadReferenceMatchResult()
 
     const boundTermBaseId = segmentStore.fileRecord?.term_base_id
     if (boundTermBaseId) {
@@ -3070,6 +3079,72 @@ function handleAppendText(text: string) {
   const nextText = appendToCurrentText(activeSegment.value.target_text || '', text)
   updateSegmentTarget(activeSegment.value.sentence_id, nextText)
   toast.success(t('matchPanel.textInserted'))
+}
+
+// 加载参考文件匹配结果（工作台初始化时调用）
+async function loadReferenceMatchResult() {
+  const fileRecordId = segmentStore.fileRecord?.id
+  if (!fileRecordId) return
+  
+  try {
+    const res = await http.get<import('../types/api').ReferenceMatchResult | null>(
+      `/reference/file-records/${fileRecordId}/match-result`
+    )
+    if (res.data) {
+      referenceMatchResult.value = res.data
+    }
+  } catch {
+    // 没有匹配结果或加载失败，静默处理
+    referenceMatchResult.value = null
+  }
+}
+
+// 参考文件匹配处理
+function handleReferenceMatchesLoaded(matches: import('../types/api').ReferenceMatchResult) {
+  // 保存匹配结果供 WorkbenchMatchPanel 使用
+  referenceMatchResult.value = matches
+  
+  // 匹配结果加载后显示详细提示
+  const messages: string[] = []
+  
+  if (matches.exact_count > 0) {
+    messages.push(`精确匹配 ${matches.exact_count} 条`)
+  }
+  if (matches.fuzzy_count > 0) {
+    messages.push(`模糊匹配 ${matches.fuzzy_count} 条`)
+  }
+  if (matches.term_count > 0) {
+    messages.push(`术语匹配 ${matches.term_count} 条`)
+  }
+  
+  if (messages.length > 0) {
+    toast.info(`参考匹配完成: ${messages.join('，')}`)
+  } else {
+    toast.info('未找到匹配的参考内容')
+  }
+}
+
+async function handleReferenceApplyExactMatches() {
+  // 精确匹配应用后重新加载句段
+  toast.success('精确匹配已应用，正在刷新...')
+  await segmentStore.fetchSegments({ 
+    fileRecordId: props.id, 
+    skip: 0, 
+    limit: segmentStore.pageSize 
+  })
+}
+
+async function handleReferenceAITranslateComplete(result: { updated_count: number; error_count: number }) {
+  // AI翻译完成后重新加载句段
+  const message = result.error_count > 0 
+    ? `AI翻译完成: 成功 ${result.updated_count} 条，失败 ${result.error_count} 条`
+    : `AI翻译完成: 成功翻译 ${result.updated_count} 条`
+  toast.success(message)
+  await segmentStore.fetchSegments({ 
+    fileRecordId: props.id, 
+    skip: 0, 
+    limit: segmentStore.pageSize 
+  })
 }
 
 async function ensureMatchInfoPanelOpen() {
@@ -4630,6 +4705,7 @@ onBeforeRouteLeave(async () => {
             :term-entries="termEntries"
             :active-source-text="activeSegmentSourceText"
             :file-record-id="segmentStore.fileRecord?.id || null"
+            :reference-match-result="referenceMatchResult"
             @replace-text="handleReplaceText"
             @append-text="handleAppendText"
           />
@@ -4663,6 +4739,14 @@ onBeforeRouteLeave(async () => {
             @delete-comment="handleDeleteComment"
             @reply-comment="handleReplyComment"
             @cancel-draft="commentStore.setDraftAnchor(null)"
+          />
+          <ReferencePanel
+            v-else-if="activeSideTool === 'reference'"
+            key="reference"
+            :file-record-id="segmentStore.fileRecord?.id || null"
+            @matches-loaded="handleReferenceMatchesLoaded"
+            @apply-exact-matches="handleReferenceApplyExactMatches"
+            @ai-translate-complete="handleReferenceAITranslateComplete"
           />
         </Transition>
         </div>

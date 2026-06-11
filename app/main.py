@@ -12,6 +12,7 @@ from app.logging import configure_logging
 from app.routers.api import router as api_router
 from app.routers.auth import router as auth_router
 from app.routers.term_base import router as term_base_router
+from app.routers.reference import router as reference_router
 from app.services.schema_setup import ensure_runtime_schema
 
 
@@ -35,6 +36,7 @@ app.add_middleware(
 app.include_router(auth_router, prefix="/api")
 app.include_router(api_router, prefix="/api")
 app.include_router(term_base_router, prefix="/api")
+app.include_router(reference_router, prefix="/api")
 
 
 if frontend_assets_dir.exists():
