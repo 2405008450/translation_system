@@ -8,6 +8,7 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  CircleHelp,
   Clock3,
   Copy,
   Download,
@@ -72,8 +73,8 @@ import type {
   IssueMarker,
   IssueStatus,
   ProjectAssignmentsResponse,
+  ProjectSyncDisableResult,
   QualityQASettingsResponse,
-  SegmentQAIssueSeverity,
   ProjectTranslationMemorySettingCollection,
   ProjectTermBaseSettingGroup,
   ProjectTermBaseSettingRow,
@@ -94,7 +95,7 @@ const props = defineProps<{
 }>()
 
 type ProjectTab = 'files' | 'issues' | 'assignments' | 'settings' | 'stats' | 'summary' | 'quote'
-type ProjectSettingsSection = 'basic' | 'guidelines' | 'translation-memory' | 'terms' | 'quality-qa' | 'term-qa'
+type ProjectSettingsSection = 'basic' | 'guidelines' | 'translation-memory' | 'terms' | 'automation' | 'quality-qa' | 'term-qa'
 type AccessLevel = 'team' | 'private' | 'public'
 type DocumentStatisticNumberKey =
   | 'pages'
@@ -122,6 +123,8 @@ interface ProjectDetail {
   confirmed_segments: number
   pretranslated_segments: number
   pretranslation_progress: number
+  project_sync_segment_count: number
+  project_sync_disabled_count: number
   workflow_steps?: WorkflowStep[]
   workflow_progress?: WorkflowProgress[]
   source_language: string | null
@@ -316,6 +319,8 @@ function getProjectSettingsSectionFromHash(hash: string): ProjectSettingsSection
       return 'translation-memory'
     case '#project-settings-terms':
       return 'terms'
+    case '#project-settings-automation':
+      return 'automation'
     case '#project-settings-quality-qa':
       return 'quality-qa'
     case '#project-settings-term-qa':
@@ -413,12 +418,120 @@ const qualityQASettings = ref<QualityQASettingsResponse | null>(null)
 const loadingQualityQASettings = ref(false)
 const savingQualityQASettings = ref(false)
 const qualityQASettingsError = ref('')
+const projectSyncToggleLoading = ref(false)
+
+const qualityQARules = [
+  { key: 'target_without_tag', label: '译文无标记', defaultEnabled: true },
+  { key: 'target_tag_missing', label: '译文标记丢失', defaultEnabled: true },
+  { key: 'unmatched_closing_tag', label: '结束标记无匹配的开始标记', defaultEnabled: true },
+  { key: 'unmatched_opening_tag', label: '开始标记无匹配的结束标记', defaultEnabled: true },
+  { key: 'target_placeholder_missing', label: '译文占位符标记丢失', defaultEnabled: true },
+  { key: 'spelling_grammar', label: '译文有拼写或语法错误（查看支持的语种）', defaultEnabled: true },
+  { key: 'term_inconsistency', label: '术语不一致', defaultEnabled: false },
+  { key: 'paired_punctuation_missing', label: '成对标点符号丢失', defaultEnabled: false },
+  { key: 'ending_punctuation_mismatch', label: '原文和译文的结束标点不同', defaultEnabled: false },
+  { key: 'repeated_punctuation', label: '重复标点', defaultEnabled: false },
+  { key: 'extra_space_after_punctuation', label: '标点符号后有多余空格', defaultEnabled: false },
+  { key: 'missing_space_after_punctuation', label: '标点符号后遗漏空格', defaultEnabled: false },
+] as const
+
+type QualityQAPlaceholderRule = {
+  key: string
+  label: string
+  percent?: number
+  suffix?: string
+}
+
+const qualityQAPlaceholderRules: readonly QualityQAPlaceholderRule[] = [
+  { key: 'punctuation_leading_extra_space', label: '标点符号前有多余空格' },
+  { key: 'punctuation_leading_missing_space', label: '标点符号前遗漏空格' },
+  { key: 'multiple_spaces', label: '多个空格' },
+  { key: 'segment_trailing_extra_space', label: '句段结束后有多余空格' },
+  { key: 'source_target_initial_case_mismatch', label: '原文和译文首字母大小写不一致' },
+  { key: 'target_word_multiple_upper_initials', label: '译文一个单词中有多个大写首字母' },
+  { key: 'source_target_same_word_case_mismatch', label: '原文和译文的同一单词首字母有不同的大小写' },
+  { key: 'target_word_count_exceeds_source', label: '译文字数超过原文字数的', percent: 50, suffix: '%' },
+  { key: 'target_word_count_below_source', label: '译文字数少于原文字数的', percent: 50, suffix: '%' },
+  { key: 'source_target_word_count_gap_too_large', label: '译文与原文字数相差过大' },
+  { key: 'context_translation_mismatch', label: '翻译与上下文匹配不一致' },
+  { key: 'number_mismatch', label: '原文和译文数字不一致' },
+  { key: 'parameter_mismatch', label: '原文与译文参数不一致' },
+  { key: 'email_mismatch', label: '原文与译文邮件信息不一致' },
+  { key: 'link_mismatch', label: '原文和译文链接信息不一致' },
+  { key: 'consecutive_duplicate_words', label: '连续重复单词' },
+  { key: 'source_target_identical', label: '原文和译文相同' },
+  { key: 'special_symbol_mismatch', label: '特殊符号不一致' },
+]
+
+type QualityQARuleKey = typeof qualityQARules[number]['key']
+type QualityQARuleDraft = Record<QualityQARuleKey, boolean>
+
+function createQualityQARuleDraft(): QualityQARuleDraft {
+  return qualityQARules.reduce((draft, rule) => {
+    draft[rule.key] = rule.defaultEnabled
+    return draft
+  }, {} as QualityQARuleDraft)
+}
+
 const qualityQADraft = reactive({
-  spelling_grammar: {
-    enabled: false,
-    severity: 'medium' as SegmentQAIssueSeverity,
-  },
+  rules: createQualityQARuleDraft(),
 })
+
+const enabledQualityQARuleCount = computed(() => (
+  qualityQARules.filter((rule) => qualityQADraft.rules[rule.key]).length
+))
+const allQualityQARulesEnabled = computed(() => enabledQualityQARuleCount.value === qualityQARules.length)
+const partiallyEnabledQualityQARules = computed(() => (
+  enabledQualityQARuleCount.value > 0 && !allQualityQARulesEnabled.value
+))
+const spellingGrammarQAEnabled = computed(() => qualityQADraft.rules.spelling_grammar)
+function getSavedQualityQARuleEnabled(rule: typeof qualityQARules[number]) {
+  const ruleSetting = qualityQASettings.value?.settings.rules?.[rule.key]
+  if (typeof ruleSetting?.enabled === 'boolean') {
+    return ruleSetting.enabled
+  }
+  if (rule.key === 'spelling_grammar') {
+    return Boolean(qualityQASettings.value?.settings.spelling_grammar.enabled)
+  }
+  return rule.defaultEnabled
+}
+const qualityQASettingsDirty = computed(() => (
+  qualityQARules.some((rule) => qualityQADraft.rules[rule.key] !== getSavedQualityQARuleEnabled(rule))
+))
+const qualityQARuleStatusText = computed(() => {
+  if (enabledQualityQARuleCount.value === 0) {
+    return '全部关闭'
+  }
+  if (enabledQualityQARuleCount.value === qualityQARules.length) {
+    return `全部启用（${enabledQualityQARuleCount.value}/${qualityQARules.length}）`
+  }
+  return `已启用 ${enabledQualityQARuleCount.value}/${qualityQARules.length}`
+})
+const qualityQARuleStatusClass = computed(() => (
+  enabledQualityQARuleCount.value > 0 ? 'is-ok' : 'is-warn'
+))
+const qualityQARuleStatusHint = computed(() => (
+  qualityQASettingsDirty.value
+    ? '有未保存更改'
+    : `已保存 · ${qualityQAPlaceholderRules.length} 项占位`
+))
+
+const autoLocalizationOptions = [
+  '日期',
+  '时间',
+  '数字',
+  '度量单位',
+  '首字母缩写词',
+  '字母数字字符串',
+]
+
+const lockPlaceholderOptions = [
+  '内部重复',
+  '跨文件重复',
+  '100%记忆库匹配',
+  '101%记忆库匹配',
+  '102%记忆库匹配',
+]
 const generatingTermQAReport = ref(false)
 const termQAReport = ref<TermQAReport | null>(null)
 const downloadingTermQAReport = ref(false)
@@ -631,6 +744,45 @@ const canOpenUploadModal = computed(() => Boolean(project.value) && canManagePro
 const canOpenProjectIssueDialog = computed(() => Boolean(project.value) && !authStore.isExternalTranslator)
 
 const uploadButtonTitle = computed(() => (canManageProject.value ? '' : '只有管理员可以上传项目文件'))
+const projectSyncSegmentCount = computed(() => Number(project.value?.project_sync_segment_count || 0))
+const projectSyncDisabledCount = computed(() => {
+  const total = projectSyncSegmentCount.value
+  const disabled = Number(project.value?.project_sync_disabled_count || 0)
+  return Math.max(0, Math.min(disabled, total))
+})
+const projectSyncAllEnabled = computed(() => (
+  projectSyncSegmentCount.value > 0 && projectSyncDisabledCount.value === 0
+))
+const projectSyncMixed = computed(() => (
+  projectSyncDisabledCount.value > 0 && projectSyncDisabledCount.value < projectSyncSegmentCount.value
+))
+const projectSyncStatusLabel = computed(() => {
+  if (projectSyncSegmentCount.value === 0) {
+    return '暂无句段'
+  }
+  if (projectSyncDisabledCount.value === 0) {
+    return ''
+  }
+  if (projectSyncDisabledCount.value >= projectSyncSegmentCount.value) {
+    return `已全部关闭（${projectSyncDisabledCount.value}/${projectSyncSegmentCount.value}）`
+  }
+  return `已关闭 ${projectSyncDisabledCount.value}/${projectSyncSegmentCount.value}`
+})
+const projectSyncToggleDisabled = computed(() => (
+  projectSyncToggleLoading.value
+  || !project.value
+  || !canManageProject.value
+  || projectSyncSegmentCount.value === 0
+))
+const projectSyncToggleTitle = computed(() => {
+  if (projectSyncSegmentCount.value === 0) {
+    return '项目内暂无可同步句段'
+  }
+  if (projectSyncMixed.value) {
+    return '部分句段已关闭同步，点击后恢复全项目同步'
+  }
+  return projectSyncAllEnabled.value ? '点击关闭全项目同步' : '点击开启全项目同步'
+})
 
 const accessOptions = computed(() => ([
   { value: 'team' as const, label: t('projectList.form.team') },
@@ -1705,6 +1857,31 @@ async function loadProjectTranslationMemorySettings() {
   }
 }
 
+function syncQualityQADraftFromSettings(data: QualityQASettingsResponse) {
+  for (const rule of qualityQARules) {
+    const ruleSetting = data.settings.rules?.[rule.key]
+    qualityQADraft.rules[rule.key] = typeof ruleSetting?.enabled === 'boolean'
+      ? ruleSetting.enabled
+      : (rule.key === 'spelling_grammar' ? data.settings.spelling_grammar.enabled : rule.defaultEnabled)
+  }
+}
+
+function buildQualityQARulesPayload() {
+  return qualityQARules.reduce((payload, rule) => {
+    payload[rule.key] = {
+      enabled: qualityQADraft.rules[rule.key],
+    }
+    return payload
+  }, {} as Record<QualityQARuleKey, { enabled: boolean }>)
+}
+
+function toggleAllQualityQARules(event: Event) {
+  const checked = (event.target as HTMLInputElement | null)?.checked ?? false
+  for (const rule of qualityQARules) {
+    qualityQADraft.rules[rule.key] = checked
+  }
+}
+
 async function loadProjectQualityQASettings() {
   if (!project.value?.can_manage) {
     qualityQASettings.value = null
@@ -1717,8 +1894,7 @@ async function loadProjectQualityQASettings() {
       `/projects/${project.value.id}/quality-qa-settings`,
     )
     qualityQASettings.value = data
-    qualityQADraft.spelling_grammar.enabled = data.settings.spelling_grammar.enabled
-    qualityQADraft.spelling_grammar.severity = data.settings.spelling_grammar.severity
+    syncQualityQADraftFromSettings(data)
   } catch (error) {
     qualityQASettingsError.value = getErrorMessage(error, '质量保证设置加载失败。')
   } finally {
@@ -1736,15 +1912,14 @@ async function saveProjectQualityQASettings() {
     const { data } = await http.patch<QualityQASettingsResponse>(
       `/projects/${project.value.id}/quality-qa-settings`,
       {
+        rules: buildQualityQARulesPayload(),
         spelling_grammar: {
-          enabled: qualityQADraft.spelling_grammar.enabled,
-          severity: qualityQADraft.spelling_grammar.severity,
+          enabled: qualityQADraft.rules.spelling_grammar,
         },
       },
     )
     qualityQASettings.value = data
-    qualityQADraft.spelling_grammar.enabled = data.settings.spelling_grammar.enabled
-    qualityQADraft.spelling_grammar.severity = data.settings.spelling_grammar.severity
+    syncQualityQADraftFromSettings(data)
     toast.success('质量保证设置已保存')
   } catch (error) {
     qualityQASettingsError.value = getErrorMessage(error, '质量保证设置保存失败。')
@@ -1753,11 +1928,74 @@ async function saveProjectQualityQASettings() {
   }
 }
 
-const qualityQASeverityOptions: Array<{ value: SegmentQAIssueSeverity; label: string }> = [
-  { value: 'low', label: '低' },
-  { value: 'medium', label: '一般' },
-  { value: 'high', label: '高' },
-]
+async function setProjectSyncForProject(enabled: boolean): Promise<boolean> {
+  if (!project.value || projectSyncToggleLoading.value || !canManageProject.value) {
+    return false
+  }
+
+  const disabled = !enabled
+  if (disabled) {
+    const accepted = await confirm({
+      title: '关闭项目同步',
+      message: '将关闭当前项目全部文件的重复句段自动同步，并清除由项目同步生成的译文。人工、AI 和记忆库译文不会被清除。',
+      confirmText: '关闭并清除',
+      cancelText: t('common.actions.cancel'),
+      danger: true,
+    })
+    if (!accepted) {
+      return false
+    }
+  }
+
+  projectSyncToggleLoading.value = true
+  pageError.value = ''
+  try {
+    const { data } = await http.patch<ProjectSyncDisableResult>(
+      `/projects/${project.value.id}/segments/project-sync`,
+      { disabled },
+    )
+    await loadProject()
+    if (disabled) {
+      if (data.updated_count > 0) {
+        toast.success({
+          title: '项目同步已关闭',
+          message: `已处理 ${data.updated_count} 个句段，关闭 ${data.disabled_count} 个同步开关，清除 ${data.cleared_count} 条项目同步译文。`,
+        })
+      } else {
+        toast.info('当前项目没有需要关闭的项目同步句段。')
+      }
+    } else if (data.updated_count > 0) {
+      toast.success({
+        title: '项目同步已开启',
+        message: `已恢复 ${data.updated_count} 个句段的重复句段自动同步。`,
+      })
+    } else {
+      toast.info('当前项目同步已处于开启状态。')
+    }
+    return true
+  } catch (error) {
+    pageError.value = getErrorMessage(error, disabled ? '关闭项目同步失败。' : '开启项目同步失败。')
+    toast.error({
+      title: disabled ? '关闭项目同步失败' : '开启项目同步失败',
+      message: pageError.value,
+    })
+    return false
+  } finally {
+    projectSyncToggleLoading.value = false
+  }
+}
+
+async function handleProjectSyncToggle(event: Event) {
+  const input = event.target as HTMLInputElement | null
+  if (!input) {
+    return
+  }
+
+  await setProjectSyncForProject(input.checked)
+  input.checked = projectSyncAllEnabled.value
+  input.indeterminate = projectSyncMixed.value
+}
+
 
 function translationMemorySettingGroupKey(group: ProjectTranslationMemorySettingGroup) {
   return `${group.source_language}->${group.target_language}`
@@ -3119,6 +3357,15 @@ onBeforeUnmount(() => {
             </button>
             <button
               class="pd-settings-rail__item"
+              :class="{ 'is-active': activeProjectSettingsSection === 'automation' }"
+              type="button"
+              @click="switchProjectSettingsSection('automation')"
+            >
+              <Sparkles :size="15" />
+              <span>自动应用与锁定</span>
+            </button>
+            <button
+              class="pd-settings-rail__item"
               :class="{ 'is-active': activeProjectSettingsSection === 'quality-qa' }"
               type="button"
               @click="switchProjectSettingsSection('quality-qa')"
@@ -3657,6 +3904,74 @@ onBeforeUnmount(() => {
               </div>
             </section>
 
+            <section v-show="activeProjectSettingsSection === 'automation'" id="project-settings-automation" class="pd-settings-section">
+              <header class="pd-settings-section-head">
+                <div class="pd-settings-section-head__copy">
+                  <span class="pd-settings-section-icon">
+                    <Sparkles :size="17" />
+                  </span>
+                  <div>
+                    <div class="section-title section-title--tight">自动应用与锁定</div>
+                    <p class="panel-subtitle">管理重复句段同步、内置自动本地化，以及后续可接入的锁定规则。</p>
+                  </div>
+                </div>
+              </header>
+
+              <div class="pd-settings-section-body automation-settings">
+                <section class="automation-settings__group">
+                  <h3>自动应用</h3>
+                  <label
+                    class="automation-settings__check is-connected"
+                    :class="{ 'is-busy': projectSyncToggleLoading }"
+                    :title="projectSyncToggleTitle"
+                  >
+                    <input
+                      type="checkbox"
+                      :checked="projectSyncAllEnabled"
+                      :indeterminate.prop="projectSyncMixed"
+                      :disabled="projectSyncToggleDisabled"
+                      @change="handleProjectSyncToggle"
+                    />
+                    <span>自动同步重复句段</span>
+                    <small v-if="projectSyncStatusLabel">{{ projectSyncStatusLabel }}</small>
+                  </label>
+                  <label class="automation-settings__check is-placeholder" title="内置自动本地化占位，后续接入项目级保存。">
+                    <input type="checkbox" checked disabled />
+                    <span>自动替换</span>
+                    <CircleHelp :size="13" />
+                  </label>
+                  <div class="automation-settings__children">
+                    <label
+                      v-for="option in autoLocalizationOptions"
+                      :key="option"
+                      class="automation-settings__check is-placeholder"
+                    >
+                      <input type="checkbox" checked disabled />
+                      <span>{{ option }}</span>
+                    </label>
+                  </div>
+                  <label class="automation-settings__check is-placeholder" title="沿用导入和导出中的自动编号/排序处理，占位展示。">
+                    <input type="checkbox" checked disabled />
+                    <span>自动排序</span>
+                  </label>
+                </section>
+
+                <section class="automation-settings__group">
+                  <h3>锁定</h3>
+                  <div class="automation-settings__lock-grid">
+                    <label
+                      v-for="option in lockPlaceholderOptions"
+                      :key="option"
+                      class="automation-settings__check is-placeholder"
+                    >
+                      <input type="checkbox" disabled />
+                      <span>{{ option }}</span>
+                    </label>
+                  </div>
+                </section>
+              </div>
+            </section>
+
             <section v-show="activeProjectSettingsSection === 'quality-qa'" id="project-settings-quality-qa" class="pd-settings-section">
               <header class="pd-settings-section-head">
                 <div class="pd-settings-section-head__copy">
@@ -3689,31 +4004,84 @@ onBeforeUnmount(() => {
                 />
                 <p v-else-if="qualityQASettingsError" class="form-message is-error">{{ qualityQASettingsError }}</p>
                 <div v-else class="quality-qa-settings__content">
-                  <label class="quality-qa-settings__toggle-row">
-                    <span>
-                      <strong>拼写/语法检查</strong>
-                      <small>自托管 LanguageTool，后台最佳努力执行，不阻塞译文保存。</small>
-                    </span>
-                    <span class="term-settings__toggle">
-                      <input v-model="qualityQADraft.spelling_grammar.enabled" type="checkbox" />
-                      <span aria-hidden="true" />
-                    </span>
-                  </label>
+                  <div class="quality-qa-settings__rule-table-wrap">
+                    <table class="quality-qa-settings__rule-table">
+                      <thead>
+                        <tr>
+                          <th>序号</th>
+                          <th class="quality-qa-settings__check-cell">
+                            <label class="quality-qa-settings__rule-check" title="全选/取消全选">
+                              <input
+                                type="checkbox"
+                                :checked="allQualityQARulesEnabled"
+                                :indeterminate.prop="partiallyEnabledQualityQARules"
+                                :disabled="savingQualityQASettings || loadingQualityQASettings"
+                                aria-label="全选质量保证规则"
+                                @change="toggleAllQualityQARules"
+                              />
+                            </label>
+                          </th>
+                          <th>规则</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="(rule, index) in qualityQARules" :key="rule.key">
+                          <td>{{ index + 1 }}</td>
+                          <td class="quality-qa-settings__check-cell">
+                            <label class="quality-qa-settings__rule-check">
+                              <input
+                                v-model="qualityQADraft.rules[rule.key]"
+                                type="checkbox"
+                                :disabled="savingQualityQASettings || loadingQualityQASettings"
+                                :aria-label="`启用${rule.label}`"
+                              />
+                            </label>
+                          </td>
+                          <td>{{ rule.label }}</td>
+                        </tr>
+                        <tr
+                          v-for="(rule, index) in qualityQAPlaceholderRules"
+                          :key="rule.key"
+                          class="is-placeholder"
+                          title="占位展示，后端暂未接入。"
+                        >
+                          <td>{{ qualityQARules.length + index + 1 }}</td>
+                          <td class="quality-qa-settings__check-cell">
+                            <label class="quality-qa-settings__rule-check">
+                              <input
+                                type="checkbox"
+                                disabled
+                                :aria-label="`占位${rule.label}`"
+                              />
+                            </label>
+                          </td>
+                          <td>
+                            <span class="quality-qa-settings__rule-text">
+                              <template v-if="typeof rule.percent === 'number'">
+                                <span>{{ rule.label }}</span>
+                                <input
+                                  class="quality-qa-settings__inline-number"
+                                  type="number"
+                                  :value="rule.percent"
+                                  disabled
+                                />
+                                <span>{{ rule.suffix }}</span>
+                              </template>
+                              <template v-else>{{ rule.label }}</template>
+                            </span>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
 
-                  <label class="field quality-qa-settings__severity">
-                    <span class="field__label">严重级别</span>
-                    <select
-                      v-model="qualityQADraft.spelling_grammar.severity"
-                      class="field__control pd-settings-control"
-                      :disabled="!qualityQADraft.spelling_grammar.enabled"
-                    >
-                      <option v-for="option in qualityQASeverityOptions" :key="option.value" :value="option.value">
-                        {{ option.label }}
-                      </option>
-                    </select>
-                  </label>
 
                   <div class="quality-qa-settings__status-grid">
+                    <div class="quality-qa-settings__status-item">
+                      <span>规则状态</span>
+                      <strong :class="qualityQARuleStatusClass">{{ qualityQARuleStatusText }}</strong>
+                      <small>{{ qualityQARuleStatusHint }}</small>
+                    </div>
                     <div class="quality-qa-settings__status-item">
                       <span>LanguageTool</span>
                       <strong :class="qualityQASettings?.languagetool_configured ? 'is-ok' : 'is-warn'">
@@ -3747,7 +4115,7 @@ onBeforeUnmount(() => {
                     </div>
                   </div>
 
-                  <p v-if="qualityQADraft.spelling_grammar.enabled && !qualityQASettings?.languagetool_configured" class="form-message is-error">
+                  <p v-if="spellingGrammarQAEnabled && !qualityQASettings?.languagetool_configured" class="form-message is-error">
                     已启用检查，但后端尚未配置 LANGUAGETOOL_BASE_URL，保存译文不会被阻塞，QA 检查会自动跳过。
                   </p>
                 </div>
@@ -7186,35 +7554,186 @@ onBeforeUnmount(() => {
   cursor: help;
 }
 
+.automation-settings {
+  max-width: 680px;
+  gap: 18px;
+}
+
+.automation-settings__group {
+  display: grid;
+  gap: 8px;
+}
+
+.automation-settings__group h3 {
+  margin: 0 0 2px;
+  color: var(--text-primary);
+  font-size: 18px;
+  line-height: 1.25;
+}
+
+.automation-settings__check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  min-height: 24px;
+  color: var(--brand-700);
+  font-size: 14px;
+  line-height: 1.3;
+}
+
+.automation-settings__check.is-connected {
+  cursor: pointer;
+}
+
+.automation-settings__check.is-connected.is-busy {
+  opacity: 0.72;
+  pointer-events: none;
+}
+
+.automation-settings__check input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--brand-700);
+}
+
+.automation-settings__check input:not(:disabled) {
+  cursor: pointer;
+}
+
+.automation-settings__check small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.automation-settings__check.is-placeholder {
+  opacity: 0.84;
+}
+
+.automation-settings__check.is-placeholder input {
+  cursor: not-allowed;
+}
+
+.automation-settings__check svg {
+  color: var(--brand-700);
+}
+
+.automation-settings__children,
+.automation-settings__lock-grid {
+  display: grid;
+  gap: 7px;
+  padding-left: 24px;
+}
+
 .quality-qa-settings__content {
   display: grid;
   gap: 16px;
 }
 
-.quality-qa-settings__toggle-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 14px;
-  border: 1px solid var(--border-muted);
-  border-radius: 8px;
-  background: var(--surface-muted);
-}
-
-.quality-qa-settings__toggle-row > span:first-child {
-  display: grid;
-  gap: 4px;
-}
-
-.quality-qa-settings__toggle-row small,
+.quality-qa-settings__status-item small,
 .quality-qa-settings__language-chip small,
 .quality-qa-settings__language-head span {
   color: var(--text-muted);
 }
 
-.quality-qa-settings__severity {
-  max-width: 260px;
+.quality-qa-settings__rule-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border-muted);
+  border-radius: 8px;
+  background: var(--surface-primary);
+}
+
+.quality-qa-settings__rule-table {
+  width: 100%;
+  min-width: 560px;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.quality-qa-settings__rule-table th,
+.quality-qa-settings__rule-table td {
+  height: 49px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--border-muted);
+  color: var(--text-primary);
+  font-size: 14px;
+  text-align: left;
+  vertical-align: middle;
+}
+
+.quality-qa-settings__rule-table th {
+  background: var(--surface-muted);
+  font-weight: 700;
+}
+
+.quality-qa-settings__rule-table th:first-child,
+.quality-qa-settings__rule-table td:first-child {
+  width: 58px;
+  text-align: center;
+}
+
+.quality-qa-settings__rule-table th:nth-child(2),
+.quality-qa-settings__rule-table td:nth-child(2) {
+  width: 48px;
+}
+
+.quality-qa-settings__rule-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.quality-qa-settings__rule-table tbody tr:hover {
+  background: color-mix(in srgb, var(--brand-050) 48%, transparent);
+}
+
+.quality-qa-settings__rule-table tbody tr.is-placeholder td {
+  color: var(--text-secondary);
+}
+
+.quality-qa-settings__check-cell {
+  text-align: center;
+}
+
+.quality-qa-settings__rule-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+}
+
+.quality-qa-settings__rule-check input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--brand-700);
+}
+
+.quality-qa-settings__rule-check input:not(:disabled) {
+  cursor: pointer;
+}
+
+.quality-qa-settings__rule-check input:disabled {
+  cursor: not-allowed;
+}
+
+.quality-qa-settings__rule-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.quality-qa-settings__inline-number {
+  width: 40px;
+  height: 24px;
+  padding: 0 4px;
+  border: 1px solid var(--border-muted);
+  border-radius: 3px;
+  background: var(--surface-muted);
+  color: var(--text-primary);
+  font: inherit;
+  text-align: center;
 }
 
 .quality-qa-settings__status-grid,

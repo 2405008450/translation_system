@@ -430,6 +430,7 @@ export interface SegmentQAIssue {
 
 export interface ProjectSegmentSyncSummary {
   filled_count: number
+  updated_count: number
   conflict_count: number
   affected_file_count: number
 }
@@ -668,6 +669,9 @@ export interface ProjectTermBaseSettingsResponse {
 export interface QualityQASettingsResponse {
   project_id: string
   settings: {
+    rules: Record<string, {
+      enabled: boolean
+    }>
     spelling_grammar: {
       enabled: boolean
       severity: SegmentQAIssueSeverity

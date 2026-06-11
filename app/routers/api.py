@@ -18,7 +18,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import case, func, or_
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, object_session
 
@@ -207,8 +207,10 @@ from app.services.file_export_queue import (
     wait_for_file_export_task,
 )
 from app.services.project_segment_sync import (
+    ProjectSyncDisableSummary,
     disable_project_sync_for_segments,
     empty_project_segment_sync_summary,
+    enable_project_sync_for_segments,
     sync_project_repeated_segments_from_file,
     sync_project_repeated_segments_from_segments,
 )
@@ -1116,7 +1118,7 @@ class TermQAReportItemsIgnoreRequest(BaseModel):
 
 
 class SpellingGrammarQASettingsRequest(BaseModel):
-    enabled: bool = False
+    enabled: bool = True
     severity: Literal["low", "medium", "high"] = "medium"
 
 
@@ -1124,6 +1126,7 @@ class QualityQASettingsRequest(BaseModel):
     spelling_grammar: SpellingGrammarQASettingsRequest = Field(
         default_factory=SpellingGrammarQASettingsRequest
     )
+    rules: dict[str, Any] = Field(default_factory=dict)
 
 
 class SegmentQAIssueIgnoreRequest(BaseModel):
@@ -4532,6 +4535,25 @@ def _apply_term_qa_ignore_state(
             item.ignored_by_id = None
 
 
+def _get_project_sync_segment_stats(db: Session | None, project_id: UUID) -> tuple[int, int]:
+    if db is None:
+        return 0, 0
+
+    total_count, disabled_count = (
+        db.query(
+            func.count(Segment.id),
+            func.coalesce(
+                func.sum(case((Segment.project_sync_disabled.is_(True), 1), else_=0)),
+                0,
+            ),
+        )
+        .join(FileRecord, Segment.file_record_id == FileRecord.id)
+        .filter(FileRecord.project_id == project_id)
+        .one()
+    )
+    return int(total_count or 0), int(disabled_count or 0)
+
+
 def _build_project_detail_payload(
     db: Session | Project,
     project: Project | list[FileRecord],
@@ -4590,6 +4612,9 @@ def _build_project_detail_payload(
         )
         for file_record in files
     ]
+    project_sync_segment_count, project_sync_disabled_count = _get_project_sync_segment_stats(db, project.id)
+    payload["project_sync_segment_count"] = project_sync_segment_count
+    payload["project_sync_disabled_count"] = project_sync_disabled_count
     payload["issue_markers"] = [
         serialize_issue_marker(marker)
         for marker in (issue_markers or [])
@@ -6937,6 +6962,29 @@ def get_file_record_segments(
     }
 
 
+def _parse_segment_change_cursor(cursor: str) -> tuple[datetime, UUID | None]:
+    cursor = (cursor or "").strip()
+    raw_timestamp = cursor
+    raw_id: str | None = None
+    if "|" in cursor:
+        raw_timestamp, raw_id = cursor.split("|", 1)
+    try:
+        since_dt = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="since 参数不是有效时间。") from exc
+    if not raw_id:
+        return since_dt, None
+    try:
+        return since_dt, UUID(raw_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="since 游标不是有效格式。") from exc
+
+
+def _format_segment_change_cursor(segment: Segment) -> str:
+    updated_at = segment.updated_at or datetime.utcnow()
+    return f"{updated_at.isoformat()}|{segment.id}"
+
+
 @router.get("/file-records/{file_record_id}/segments/changes")
 def get_file_record_segment_changes(
     file_record_id: UUID,
@@ -6950,22 +6998,27 @@ def get_file_record_segment_changes(
         raise HTTPException(status_code=404, detail="文件不存在。")
 
     _require_file_record_read_access(file_record, current_user)
-    try:
-        since_dt = datetime.fromisoformat(since.replace("Z", "+00:00")).replace(tzinfo=None)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="since 参数不是有效时间。") from exc
-
+    since_dt, since_id = _parse_segment_change_cursor(since)
     safe_limit = _normalize_segment_page_limit(limit)
-    changed_segments = (
-        _order_segment_query(
-            db.query(Segment).filter(
-                Segment.file_record_id == file_record_id,
-                Segment.updated_at > since_dt,
-            )
+    cursor_condition = Segment.updated_at > since_dt
+    if since_id is not None:
+        cursor_condition = or_(
+            Segment.updated_at > since_dt,
+            and_(Segment.updated_at == since_dt, Segment.id > since_id),
         )
+    changed_segments = (
+        db.query(Segment)
+        .filter(
+            Segment.file_record_id == file_record_id,
+            cursor_condition,
+        )
+        .order_by(Segment.updated_at.asc(), Segment.id.asc())
         .limit(safe_limit)
         .all()
     )
+    server_time = datetime.utcnow().isoformat()
+    has_more = len(changed_segments) >= safe_limit
+    next_cursor = _format_segment_change_cursor(changed_segments[-1]) if has_more and changed_segments else server_time
     workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
         db,
         file_record,
@@ -6975,7 +7028,9 @@ def get_file_record_segment_changes(
     qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, changed_segments)
     return {
         "file_record_id": str(file_record_id),
-        "server_time": datetime.utcnow().isoformat(),
+        "server_time": server_time,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
         "segments": [
             _serialize_workbench_segment(
                 segment,
@@ -7882,7 +7937,7 @@ def update_segment(
         raise HTTPException(status_code=404, detail="片段不存在。")
 
     project_sync_summary = empty_project_segment_sync_summary()
-    if segment.status == "confirmed" and normalize_text(segment.target_text):
+    if normalize_text(segment.target_text) and not segment.project_sync_disabled:
         project_sync_summary = sync_project_repeated_segments_from_segments(
             db,
             file_record=file_record,
@@ -7898,7 +7953,7 @@ def update_segment(
             segments=[segment],
             current_user=current_user,
         )
-    if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0:
+    if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0 or project_sync_summary.updated_count > 0:
         db.commit()
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
     workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
@@ -8041,6 +8096,73 @@ def disable_file_record_project_sync(
         sync_file_record_status(db, file_record_id)
     db.commit()
     return ProjectSyncDisableResponse(**summary.to_dict())
+
+
+def _extend_project_sync_update_summary(
+    summary: ProjectSyncDisableSummary,
+    current_summary: ProjectSyncDisableSummary,
+) -> None:
+    summary.updated_count += current_summary.updated_count
+    summary.disabled_count += current_summary.disabled_count
+    summary.cleared_count += current_summary.cleared_count
+    summary.updated_segments.extend(current_summary.updated_segments)
+
+
+def _set_project_sync_disabled_for_project(
+    db: Session,
+    project_id: UUID,
+    disabled: bool,
+) -> ProjectSyncDisableSummary:
+    _get_project_or_404(db, project_id)
+    file_records = (
+        db.query(FileRecord)
+        .filter(FileRecord.project_id == project_id)
+        .order_by(FileRecord.created_at.asc(), FileRecord.id.asc())
+        .all()
+    )
+    summary = ProjectSyncDisableSummary()
+    for file_record in file_records:
+        ensure_file_record_write_allowed(db, file_record)
+        segments = (
+            db.query(Segment)
+            .filter(Segment.file_record_id == file_record.id)
+            .all()
+        )
+        current_summary = (
+            disable_project_sync_for_segments(segments)
+            if disabled
+            else enable_project_sync_for_segments(segments)
+        )
+        _extend_project_sync_update_summary(summary, current_summary)
+        if disabled and current_summary.updated_count:
+            sync_file_record_status(db, file_record.id)
+
+    return summary
+
+
+@router.patch("/projects/{project_id}/segments/project-sync")
+def update_project_sync_for_project(
+    project_id: UUID,
+    payload: SegmentProjectSyncUpdate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> ProjectSyncDisableResponse:
+    """开启或关闭项目下全部文件的项目同步。关闭时清空项目同步生成的译文。"""
+    summary = _set_project_sync_disabled_for_project(db, project_id, payload.disabled)
+    db.commit()
+    return ProjectSyncDisableResponse(**summary.to_dict())
+
+
+@router.post("/projects/{project_id}/segments/project-sync/disable")
+def disable_project_sync_for_project(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> ProjectSyncDisableResponse:
+    """一键关闭项目下全部文件的项目同步，并清空项目同步生成的译文。"""
+    disable_summary = _set_project_sync_disabled_for_project(db, project_id, True)
+    db.commit()
+    return ProjectSyncDisableResponse(**disable_summary.to_dict())
 
 
 @router.post("/file-records/{file_record_id}/segments/{sentence_id}/split")
@@ -8291,17 +8413,17 @@ def batch_update(
         current_user=current_user,
         return_result=True,
     )
-    confirmed_segments_for_sync = [
+    segments_for_project_sync = [
         segment
         for segment in result.updated_segments
-        if segment.status == "confirmed" and normalize_text(segment.target_text)
+        if normalize_text(segment.target_text) and not segment.project_sync_disabled
     ]
     project_sync_summary = empty_project_segment_sync_summary()
-    if confirmed_segments_for_sync:
+    if segments_for_project_sync:
         project_sync_summary = sync_project_repeated_segments_from_segments(
             db,
             file_record=file_record,
-            source_segments=confirmed_segments_for_sync,
+            source_segments=segments_for_project_sync,
             current_user=current_user,
         )
     auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(
@@ -8310,7 +8432,7 @@ def batch_update(
         segments=result.updated_segments,
         current_user=current_user,
     )
-    if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0:
+    if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0 or project_sync_summary.updated_count > 0:
         db.commit()
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
     workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(

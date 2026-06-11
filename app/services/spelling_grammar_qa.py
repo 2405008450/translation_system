@@ -21,14 +21,44 @@ from app.services.normalizer import normalize_text
 logger = logging.getLogger(__name__)
 
 QA_RULE_SPELLING_GRAMMAR = "spelling_grammar"
+QA_RULE_TARGET_WITHOUT_TAG = "target_without_tag"
+QA_RULE_TARGET_TAG_MISSING = "target_tag_missing"
+QA_RULE_UNMATCHED_CLOSING_TAG = "unmatched_closing_tag"
+QA_RULE_UNMATCHED_OPENING_TAG = "unmatched_opening_tag"
+QA_RULE_TARGET_PLACEHOLDER_MISSING = "target_placeholder_missing"
+QA_RULE_TERM_INCONSISTENCY = "term_inconsistency"
+QA_RULE_PAIRED_PUNCTUATION_MISSING = "paired_punctuation_missing"
+QA_RULE_ENDING_PUNCTUATION_MISMATCH = "ending_punctuation_mismatch"
+QA_RULE_REPEATED_PUNCTUATION = "repeated_punctuation"
+QA_RULE_EXTRA_SPACE_AFTER_PUNCTUATION = "extra_space_after_punctuation"
+QA_RULE_MISSING_SPACE_AFTER_PUNCTUATION = "missing_space_after_punctuation"
 QA_ISSUE_STATUS_OPEN = "open"
 QA_ISSUE_STATUS_IGNORED = "ignored"
 QA_ISSUE_STATUS_RESOLVED = "resolved"
 QUALITY_QA_SEVERITIES = {"low", "medium", "high"}
 
+QUALITY_QA_RULE_DEFINITIONS: tuple[dict[str, Any], ...] = (
+    {"key": QA_RULE_TARGET_WITHOUT_TAG, "default_enabled": True},
+    {"key": QA_RULE_TARGET_TAG_MISSING, "default_enabled": True},
+    {"key": QA_RULE_UNMATCHED_CLOSING_TAG, "default_enabled": True},
+    {"key": QA_RULE_UNMATCHED_OPENING_TAG, "default_enabled": True},
+    {"key": QA_RULE_TARGET_PLACEHOLDER_MISSING, "default_enabled": True},
+    {"key": QA_RULE_SPELLING_GRAMMAR, "default_enabled": True},
+    {"key": QA_RULE_TERM_INCONSISTENCY, "default_enabled": False},
+    {"key": QA_RULE_PAIRED_PUNCTUATION_MISSING, "default_enabled": False},
+    {"key": QA_RULE_ENDING_PUNCTUATION_MISMATCH, "default_enabled": False},
+    {"key": QA_RULE_REPEATED_PUNCTUATION, "default_enabled": False},
+    {"key": QA_RULE_EXTRA_SPACE_AFTER_PUNCTUATION, "default_enabled": False},
+    {"key": QA_RULE_MISSING_SPACE_AFTER_PUNCTUATION, "default_enabled": False},
+)
+
 DEFAULT_QUALITY_QA_SETTINGS: dict[str, Any] = {
+    "rules": {
+        str(rule["key"]): {"enabled": bool(rule["default_enabled"])}
+        for rule in QUALITY_QA_RULE_DEFINITIONS
+    },
     "spelling_grammar": {
-        "enabled": False,
+        "enabled": True,
         "severity": "medium",
     }
 }
@@ -90,8 +120,20 @@ class CleanedLanguageToolIssue:
         )
 
 
+def _clone_default_quality_qa_settings() -> dict[str, Any]:
+    return json.loads(json.dumps(DEFAULT_QUALITY_QA_SETTINGS))
+
+
+def _normalize_rule_enabled(raw: Any, fallback: bool) -> bool:
+    if isinstance(raw, dict):
+        return bool(raw.get("enabled", fallback))
+    if isinstance(raw, bool):
+        return raw
+    return fallback
+
+
 def normalize_quality_qa_settings(raw: Any) -> dict[str, Any]:
-    settings = json.loads(json.dumps(DEFAULT_QUALITY_QA_SETTINGS))
+    settings = _clone_default_quality_qa_settings()
     if isinstance(raw, str):
         try:
             raw = json.loads(raw or "{}")
@@ -102,9 +144,24 @@ def normalize_quality_qa_settings(raw: Any) -> dict[str, Any]:
 
     spelling_grammar = raw.get(QA_RULE_SPELLING_GRAMMAR)
     if isinstance(spelling_grammar, dict):
-        settings[QA_RULE_SPELLING_GRAMMAR]["enabled"] = bool(spelling_grammar.get("enabled", False))
+        enabled = bool(spelling_grammar.get("enabled", settings[QA_RULE_SPELLING_GRAMMAR]["enabled"]))
+        settings[QA_RULE_SPELLING_GRAMMAR]["enabled"] = enabled
+        settings["rules"][QA_RULE_SPELLING_GRAMMAR]["enabled"] = enabled
         severity = str(spelling_grammar.get("severity") or "medium").strip().lower()
         settings[QA_RULE_SPELLING_GRAMMAR]["severity"] = severity if severity in QUALITY_QA_SEVERITIES else "medium"
+
+    rules = raw.get("rules")
+    if isinstance(rules, dict):
+        for definition in QUALITY_QA_RULE_DEFINITIONS:
+            key = str(definition["key"])
+            settings["rules"][key]["enabled"] = _normalize_rule_enabled(
+                rules.get(key),
+                bool(settings["rules"][key]["enabled"]),
+            )
+
+    settings[QA_RULE_SPELLING_GRAMMAR]["enabled"] = bool(
+        settings["rules"][QA_RULE_SPELLING_GRAMMAR]["enabled"]
+    )
     return settings
 
 
@@ -120,7 +177,7 @@ def store_quality_qa_settings(project: Project, settings: Any) -> dict[str, Any]
 
 def is_spelling_grammar_enabled(project: Project | None) -> bool:
     settings = load_quality_qa_settings(project)
-    return bool(settings[QA_RULE_SPELLING_GRAMMAR]["enabled"])
+    return bool(settings["rules"][QA_RULE_SPELLING_GRAMMAR]["enabled"])
 
 
 def is_languagetool_configured() -> bool:

@@ -129,6 +129,14 @@ export interface SegmentPageQuery {
   workflowStepIds?: string[]
 }
 
+interface SegmentChangeResponse {
+  file_record_id: string
+  server_time: string
+  next_cursor?: string
+  has_more?: boolean
+  segments: Segment[]
+}
+
 export const useSegmentStore = defineStore('segment', () => {
   const fileRecord = ref<FileRecordDetail | null>(null)
   const segments = ref<Segment[]>([])
@@ -617,39 +625,45 @@ export const useSegmentStore = defineStore('segment', () => {
 
     pollingChanges = true
     try {
-      const { data } = await http.get<{
-        file_record_id: string
-        server_time: string
-        segments: Segment[]
-      }>(`/file-records/${fileRecord.value.id}/segments/changes`, {
-        params: {
-          since: changeCursor,
-          limit: MAX_SEGMENT_PAGE_SIZE,
-        },
-      })
-
+      const currentFileRecordId = fileRecord.value.id
       const nextConflicts = { ...conflictEntries.value }
       let conflictAdded = false
-      for (const remoteSegment of data.segments || []) {
-        const dirtyEntry = dirtyEntries.value[remoteSegment.sentence_id]
-        if (dirtyEntry) {
-          const baseVersion = Number(dirtyEntry.base_version || 0)
-          const remoteVersion = Number(remoteSegment.version || 1)
-          if (remoteVersion > baseVersion) {
-            nextConflicts[remoteSegment.sentence_id] = remoteSegment.target_text || ''
-            conflictAdded = true
-            const index = getSegmentIndex(remoteSegment.sentence_id)
-            if (index !== -1) {
-              segments.value[index] = {
-                ...segments.value[index],
-                version: remoteVersion,
-                updated_at: remoteSegment.updated_at,
+      let hasMore = true
+      let pageGuard = 0
+
+      while (fileRecord.value && changeCursor && hasMore && pageGuard < 20) {
+        pageGuard += 1
+        const response: { data: SegmentChangeResponse } = await http.get<SegmentChangeResponse>(`/file-records/${currentFileRecordId}/segments/changes`, {
+          params: {
+            since: changeCursor,
+            limit: MAX_SEGMENT_PAGE_SIZE,
+          },
+        })
+        const data: SegmentChangeResponse = response.data
+
+        for (const remoteSegment of data.segments || []) {
+          const dirtyEntry = dirtyEntries.value[remoteSegment.sentence_id]
+          if (dirtyEntry) {
+            const baseVersion = Number(dirtyEntry.base_version || 0)
+            const remoteVersion = Number(remoteSegment.version || 1)
+            if (remoteVersion > baseVersion) {
+              nextConflicts[remoteSegment.sentence_id] = remoteSegment.target_text || ''
+              conflictAdded = true
+              const index = getSegmentIndex(remoteSegment.sentence_id)
+              if (index !== -1) {
+                segments.value[index] = {
+                  ...segments.value[index],
+                  version: remoteVersion,
+                  updated_at: remoteSegment.updated_at,
+                }
               }
+              continue
             }
-            continue
           }
+          applyServerSegment(remoteSegment)
         }
-        applyServerSegment(remoteSegment)
+        changeCursor = data.next_cursor || data.server_time || new Date().toISOString()
+        hasMore = Boolean(data.has_more)
       }
 
       conflictEntries.value = nextConflicts
@@ -661,7 +675,6 @@ export const useSegmentStore = defineStore('segment', () => {
           message: '有句段已被其他用户更新，本地修改已保留。',
         })
       }
-      changeCursor = data.server_time || new Date().toISOString()
     } catch {
       // 增量同步失败不打断当前编辑，下一轮继续尝试。
     } finally {
@@ -1193,6 +1206,13 @@ export const useSegmentStore = defineStore('segment', () => {
           tone: 'success',
           title: '项目同步完成',
           message: `已自动填充 ${data.project_sync.filled_count} 条相同原文句段。`,
+        })
+      }
+      if (data.project_sync?.updated_count) {
+        pushToast({
+          tone: 'success',
+          title: '项目同步已更新',
+          message: `已自动更新 ${data.project_sync.updated_count} 条重复句段译文。`,
         })
       }
       const syncedAt = new Date()

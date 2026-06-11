@@ -23,7 +23,6 @@ import {
   Info,
   Italic,
   Languages,
-  Link2Off,
   Loader2,
   MessageSquare,
   Pilcrow,
@@ -345,7 +344,6 @@ const confirmationActionLoading = ref(false)
 const openRevisionMenu = ref<RevisionMenuKind | null>(null)
 const revisionTraceVisible = ref(getInitialRevisionTraceVisible())
 const revisionActionLoading = ref(false)
-const projectSyncActionLoading = ref(false)
 const segmentSearchOpen = ref(false)
 const segmentScreeningPopoverOpen = ref(false)
 const sourceEditing = ref(false)
@@ -2035,41 +2033,6 @@ async function toggleProjectSegmentSync(sentenceId: string, disabled: boolean) {
     return
   }
   await segmentStore.setProjectSyncDisabled(sentenceId, disabled)
-}
-
-async function handleDisableProjectSyncForFile() {
-  if (!segmentStore.fileRecord || projectSyncActionLoading.value) {
-    return
-  }
-
-  const accepted = await confirm({
-    title: '关闭项目同步',
-    message: '将关闭当前文件所有可写句段的项目同步，并清除已由项目同步填充的译文。人工、AI 和记忆库译文不会被清除。',
-    confirmText: '关闭并清除',
-    cancelText: t('common.actions.cancel'),
-    danger: true,
-  })
-  if (!accepted) {
-    return
-  }
-
-  pageError.value = ''
-  projectSyncActionLoading.value = true
-  try {
-    const result = await segmentStore.disableProjectSyncForCurrentFile()
-    if (result.updated_count > 0) {
-      toast.success({
-        title: '项目同步已关闭',
-        message: `已处理 ${result.updated_count} 个句段，关闭 ${result.disabled_count} 个同步开关，清除 ${result.cleared_count} 条项目同步译文。`,
-      })
-    } else {
-      toast.info('当前文件没有需要关闭的项目同步句段。')
-    }
-  } catch (error) {
-    pageError.value = getErrorMessage(error, '关闭项目同步失败。')
-  } finally {
-    projectSyncActionLoading.value = false
-  }
 }
 
 async function toggleSegmentSearchPanel() {
@@ -4120,18 +4083,6 @@ onBeforeRouteLeave(async () => {
             <FileCheck :size="15" />
             <span>{{ t('workbench.saveToTM') }}</span>
           </button>
-          <button
-            class="workbench-ribbon__top-action workbench-ribbon__top-action--sync"
-            type="button"
-            :disabled="projectSyncActionLoading || segmentStore.saving || segmentStore.totalSegmentCount === 0"
-            title="关闭当前文件项目同步并清除项目同步译文"
-            aria-label="关闭当前文件项目同步并清除项目同步译文"
-            @click="void handleDisableProjectSyncForFile()"
-          >
-            <Loader2 v-if="projectSyncActionLoading" class="lucide-spin" :size="15" />
-            <Link2Off v-else :size="15" />
-            <span>{{ projectSyncActionLoading ? '正在关闭' : '关闭同步' }}</span>
-          </button>
           <div class="export-dropdown">
             <button
               class="workbench-ribbon__top-action"
@@ -4815,19 +4766,6 @@ onBeforeRouteLeave(async () => {
           >
             <FileCheck :size="14" />
             {{ t('workbench.saveToTM') }}
-          </button>
-
-          <button
-            class="button workbench-action workbench-action--sync"
-            type="button"
-            :disabled="projectSyncActionLoading || segmentStore.saving || segmentStore.totalSegmentCount === 0"
-            title="关闭当前文件项目同步并清除项目同步译文"
-            aria-label="关闭当前文件项目同步并清除项目同步译文"
-            @click="void handleDisableProjectSyncForFile()"
-          >
-            <Loader2 v-if="projectSyncActionLoading" class="lucide-spin" :size="14" />
-            <Link2Off v-else :size="14" />
-            {{ projectSyncActionLoading ? '正在关闭' : '关闭同步' }}
           </button>
 
           <button
@@ -6649,10 +6587,6 @@ onBeforeRouteLeave(async () => {
   color: #74b8e9;
 }
 
-.workbench-ribbon__top-action--sync svg {
-  color: #b85a4f;
-}
-
 .workbench-ribbon__top-action span {
   flex: 0 0 auto;
 }
@@ -7572,14 +7506,6 @@ onBeforeRouteLeave(async () => {
   --action-color: #6d4a12;
   --action-shadow: rgba(148, 103, 20, 0.1);
   --action-hover-shadow: rgba(148, 103, 20, 0.18);
-}
-
-.workbench-action--sync {
-  --action-bg: linear-gradient(180deg, #fff1ef, #f4d7d3);
-  --action-border: #dfaaa3;
-  --action-color: #73342f;
-  --action-shadow: rgba(155, 68, 60, 0.1);
-  --action-hover-shadow: rgba(155, 68, 60, 0.18);
 }
 
 .workbench-action--stop {

@@ -129,7 +129,7 @@ const showSourceTag = computed(() => {
   }
   return props.segment.status !== 'none' && props.segment.status !== 'fuzzy'
 })
-const showProjectSyncToggle = computed(() => props.segment.source === 'project_sync' || Boolean(props.segment.project_sync_disabled))
+const showProjectSyncToggle = computed(() => true)
 const projectSyncToggleLabel = computed(() => (
   props.segment.project_sync_disabled ? '开启同步' : '关闭同步'
 ))
