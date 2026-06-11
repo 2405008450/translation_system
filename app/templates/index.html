@@ -43,7 +43,7 @@
                 <div class="d-flex justify-content-between align-items-start mb-4">
                     <div>
                         <h1 class="h3 mb-2">翻译记忆库检索 Demo</h1>
-                        <p class="text-muted mb-0">支持文本匹配与翻译记忆库 XLSX 导入。匹配入口和 TM 导入入口共用同一个页面。</p>
+                        <p class="text-muted mb-0">支持文本匹配与翻译记忆库 TMX、SDLTM、Excel/CSV 导入。匹配入口和 TM 导入入口共用同一个页面。</p>
                     </div>
                     <a href="/tasks" class="btn btn-outline-primary">
                         <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 4px; vertical-align: -2px;">
@@ -119,13 +119,13 @@
             <div class="col-lg-5">
                 <div class="card shadow-sm h-100">
                     <div class="card-body p-4">
-                        <h2 class="h5 mb-3">XLSX 导入 TM</h2>
-                        <p class="text-muted small mb-4">上传 `.xlsx` 文件后，默认读取第一个工作表，按 A 列中文原文、B 列英文译文批量导入数据库。</p>
+                        <h2 class="h5 mb-3">导入 TM</h2>
+                        <p class="text-muted small mb-4">支持上传 `.tmx`、`.sdltm`、`.xls`、`.xlsx` 或 `.csv` 文件。表格文件默认按 A 列中文原文、B 列英文译文批量导入数据库。</p>
 
                         <form action="/import-xlsx" method="post" enctype="multipart/form-data">
                             <div class="mb-3">
-                                <label for="xlsx_file" class="form-label">上传 XLSX</label>
-                                <input class="form-control" type="file" id="xlsx_file" name="xlsx_file" accept=".xlsx" required>
+                                <label for="xlsx_file" class="form-label">上传 TM 文件</label>
+                                <input class="form-control" type="file" id="xlsx_file" name="xlsx_file" accept=".tmx,.sdltm,.xls,.xlsx,.csv" required>
                                 <div class="form-text">A 列：中文原文，B 列：英文译文。支持首行表头，如 `zh-CN / en-US`。</div>
                             </div>
 
@@ -133,7 +133,7 @@
                                 大文件导入建议耐心等待；导入时会自动计算 `source_hash` 和 `source_normalized`，同源文本会更新现有记录而不是重复插入。
                             </div>
 
-                            <button type="submit" class="btn btn-success">导入 XLSX 到数据库</button>
+                            <button type="submit" class="btn btn-success">导入到数据库</button>
                         </form>
                     </div>
                 </div>

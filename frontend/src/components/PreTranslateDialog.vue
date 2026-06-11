@@ -10,6 +10,7 @@ import { pushToast } from '../composables/useToast'
 import type { GlossaryBase, GuidelineTemplateSummary, LLMProvider, LLMTranslateScope, TermBase, TMCollection } from '../types/api'
 import { consumeLLMStream } from '../utils/llmStream'
 import { isProgressComplete } from '../utils/progress'
+import ResourceImportDialog from './ResourceImportDialog.vue'
 import Modal from './base/Modal.vue'
 
 interface ProjectFileItem {
@@ -41,6 +42,8 @@ interface FileOperationLockResponse {
   active_operation_message: string
   is_edit_locked: boolean
 }
+
+type ResourceImportTab = 'tm' | 'glossary' | 'term'
 
 const props = defineProps<{
   open: boolean
@@ -101,6 +104,7 @@ const glossarySearchQuery = ref('')
 const errorMessage = ref('')
 const finishedCount = ref(0)
 const runFiles = ref<ProjectFileItem[]>([])
+const activeResourceImportTab = ref<ResourceImportTab | null>(null)
 
 const progressByFileId = ref<Record<string, number>>({})
 const statusByFileId = ref<Record<string, string>>({})
@@ -257,6 +261,22 @@ const configuredActionCount = computed(() => (
 ))
 const progressFiles = computed(() => (
   runFiles.value.length > 0 ? runFiles.value : props.files
+))
+
+const resourceImportDialogTab = computed<ResourceImportTab>(() => activeResourceImportTab.value || 'tm')
+
+const resourceImportDialogTitle = computed(() => {
+  if (resourceImportDialogTab.value === 'tm') {
+    return '导入记忆库'
+  }
+  if (resourceImportDialogTab.value === 'glossary') {
+    return '导入词汇表'
+  }
+  return '导入术语库'
+})
+
+const resourceImportContextLabel = computed(() => (
+  `预翻译：${selectedLanguagePairLabel.value}`
 ))
 const overallProgress = computed(() => {
   if (!progressFiles.value.length) {
@@ -469,6 +489,40 @@ function clearTermBases() {
 
 function clearGlossaryBases() {
   glossaryBaseIds.value = []
+}
+
+function openResourceImport(tab: ResourceImportTab) {
+  activeResourceImportTab.value = tab
+}
+
+function closeResourceImport() {
+  activeResourceImportTab.value = null
+}
+
+async function handleResourceImported(payload: { tab: ResourceImportTab, resourceId?: string }) {
+  await loadResources()
+  if (payload.tab === 'tm' && payload.resourceId) {
+    useTm.value = true
+    tmCollectionIds.value = normalizeResourceIds(
+      [...tmCollectionIds.value, payload.resourceId],
+      availableTMCollections.value,
+    )
+  }
+  if (payload.tab === 'glossary' && payload.resourceId) {
+    useGlossary.value = true
+    glossaryBaseIds.value = normalizeResourceIds(
+      [...glossaryBaseIds.value, payload.resourceId],
+      availableGlossaryBases.value,
+    )
+  }
+  if (payload.tab === 'term' && payload.resourceId) {
+    useTermBase.value = true
+    termBaseIds.value = normalizeResourceIds(
+      [...termBaseIds.value, payload.resourceId],
+      availableTermBases.value,
+    )
+  }
+  closeResourceImport()
 }
 
 function getBoundTMCollectionIdsFromFiles() {
@@ -1096,6 +1150,15 @@ function stopPreTranslate() {
               </label>
               <div class="ptd-resource__buttons">
                 <button
+                  class="button button--ghost ptd-resource__button ptd-resource__button--import"
+                  type="button"
+                  :disabled="running || loadingResources || Boolean(languagePairIssue)"
+                  @click="openResourceImport('tm')"
+                >
+                  <Upload :size="14" />
+                  导入
+                </button>
+                <button
                   class="button button--ghost ptd-resource__button ptd-resource__button--select"
                   type="button"
                   :disabled="running || loadingResources || !useTm || availableTMCollections.length === 0"
@@ -1216,6 +1279,15 @@ function stopPreTranslate() {
             </label>
             <div class="ptd-resource__buttons">
               <button
+                class="button button--ghost ptd-resource__button ptd-resource__button--import"
+                type="button"
+                :disabled="running || loadingResources || Boolean(languagePairIssue)"
+                @click="openResourceImport('glossary')"
+              >
+                <Upload :size="14" />
+                导入
+              </button>
+              <button
                 class="button button--ghost ptd-resource__button ptd-resource__button--select"
                 type="button"
                 :disabled="running || loadingResources || !useGlossary || availableGlossaryBases.length === 0"
@@ -1315,6 +1387,15 @@ function stopPreTranslate() {
               />
             </label>
             <div class="ptd-resource__buttons">
+              <button
+                class="button button--ghost ptd-resource__button ptd-resource__button--import"
+                type="button"
+                :disabled="running || loadingResources || Boolean(languagePairIssue)"
+                @click="openResourceImport('term')"
+              >
+                <Upload :size="14" />
+                导入
+              </button>
               <button
                 class="button button--ghost ptd-resource__button ptd-resource__button--select"
                 type="button"
@@ -1533,6 +1614,18 @@ function stopPreTranslate() {
       </div>
     </template>
   </Modal>
+
+  <ResourceImportDialog
+    :open="Boolean(activeResourceImportTab)"
+    :mode="resourceImportDialogTab"
+    :initial-tab="resourceImportDialogTab"
+    :title="resourceImportDialogTitle"
+    :context-label="resourceImportContextLabel"
+    :source-language="selectedFileLanguagePair?.source || props.sourceLanguage"
+    :target-language="selectedFileLanguagePair?.target || props.targetLanguage"
+    @close="closeResourceImport"
+    @imported="handleResourceImported"
+  />
 </template>
 
 <style scoped>
@@ -1604,6 +1697,7 @@ function stopPreTranslate() {
 .ptd-section {
   --ptd-accent: var(--brand-700);
   --ptd-accent-strong: var(--brand-700);
+  --ptd-accent-soft: color-mix(in srgb, var(--ptd-accent) 14%, transparent);
 
   display: grid;
   gap: 12px;
@@ -1613,6 +1707,7 @@ function stopPreTranslate() {
   border: 1px solid color-mix(in srgb, var(--ptd-accent) 10%, var(--line-soft));
   border-radius: 8px;
   background: color-mix(in srgb, var(--surface-panel) 96%, var(--ptd-accent) 4%);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
 }
 
 .ptd-section--tm {
@@ -1645,6 +1740,12 @@ function stopPreTranslate() {
 
 .ptd-section.is-disabled {
   background: color-mix(in srgb, var(--surface-1) 97%, var(--ptd-accent) 3%);
+  opacity: 0.78;
+}
+
+.ptd-section:not(.is-disabled) {
+  border-color: color-mix(in srgb, var(--ptd-accent) 30%, var(--line-soft));
+  box-shadow: 0 10px 24px color-mix(in srgb, var(--ptd-accent) 8%, transparent);
 }
 
 .ptd-section__head {
@@ -1657,6 +1758,15 @@ function stopPreTranslate() {
   border: 1px solid color-mix(in srgb, var(--ptd-accent) 10%, transparent);
   border-radius: 8px;
   background: color-mix(in srgb, var(--surface-panel) 94%, var(--ptd-accent) 6%);
+}
+
+.ptd-section:not(.is-disabled) .ptd-section__head {
+  border-color: color-mix(in srgb, var(--ptd-accent) 28%, transparent);
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--surface-panel) 82%, var(--ptd-accent) 18%),
+    color-mix(in srgb, var(--surface-panel) 94%, var(--ptd-accent) 6%)
+  );
 }
 
 .ptd-section__icon {
@@ -1692,38 +1802,44 @@ function stopPreTranslate() {
 
 .ptd-switch__control {
   position: relative;
-  width: 34px;
-  height: 20px;
-  border: 1px solid var(--line-strong);
+  width: 46px;
+  height: 26px;
+  border: 1px solid color-mix(in srgb, var(--line-strong) 80%, var(--ptd-accent) 20%);
   border-radius: 999px;
-  background: var(--surface-muted);
+  background: #cbd5e1;
   flex-shrink: 0;
+  box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.12);
+  transition: background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
 }
 
 .ptd-switch__control::after {
   content: '';
   position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 14px;
-  height: 14px;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
   border-radius: 999px;
-  background: var(--text-muted);
-  transition: transform 0.18s ease, background 0.18s ease;
+  background: #ffffff;
+  box-shadow: 0 2px 5px rgba(15, 23, 42, 0.24);
+  transition: transform 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
 }
 
 .ptd-switch input:checked + .ptd-switch__control {
   border-color: var(--ptd-accent-strong);
-  background: color-mix(in srgb, var(--surface-panel) 76%, var(--ptd-accent) 24%);
+  background: linear-gradient(135deg, var(--ptd-accent-strong), color-mix(in srgb, var(--ptd-accent) 76%, #ffffff 24%));
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--ptd-accent) 18%, transparent),
+    0 8px 18px color-mix(in srgb, var(--ptd-accent) 20%, transparent);
 }
 
 .ptd-switch input:checked + .ptd-switch__control::after {
-  background: var(--ptd-accent-strong);
-  transform: translateX(14px);
+  background: #ffffff;
+  transform: translateX(20px);
 }
 
 .ptd-switch input:focus-visible + .ptd-switch__control {
-  outline: 2px solid rgba(13, 122, 104, 0.18);
+  outline: 2px solid color-mix(in srgb, var(--ptd-accent) 32%, transparent);
   outline-offset: 2px;
 }
 
@@ -1826,6 +1942,18 @@ function stopPreTranslate() {
 .ptd-resource__button .lucide {
   width: 13px;
   height: 13px;
+}
+
+.ptd-resource__button--import {
+  border-color: color-mix(in srgb, var(--ptd-accent) 34%, var(--line-soft));
+  background: color-mix(in srgb, var(--surface-panel) 78%, var(--ptd-accent) 22%);
+  color: var(--ptd-accent-strong);
+  font-weight: 600;
+}
+
+.ptd-resource__button--import:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--ptd-accent) 48%, var(--line-strong));
+  background: color-mix(in srgb, var(--surface-panel) 68%, var(--ptd-accent) 32%);
 }
 
 .ptd-resource__button--select {

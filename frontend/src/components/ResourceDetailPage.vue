@@ -489,7 +489,7 @@ async function exportEntries(format: ExportFormat) {
   }
 }
 
-async function handleImported(payload: { tab: 'tm' | 'term' }) {
+async function handleImported(payload: { tab: 'tm' | 'glossary' | 'term' }) {
   if (payload.tab !== copy.value.importTab) {
     return
   }

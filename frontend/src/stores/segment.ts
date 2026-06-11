@@ -13,6 +13,7 @@ import type {
   LLMProvider,
   LLMTranslateScope,
   ProjectSegmentSyncSummary,
+  ProjectSyncDisableResult,
   Segment,
   SegmentPageResponse,
   SegmentRevisionEntry,
@@ -90,6 +91,19 @@ function normalizePageSize(value: unknown, fallback = DEFAULT_SEGMENT_PAGE_SIZE)
   return Math.min(MAX_SEGMENT_PAGE_SIZE, normalizePositiveInt(value, fallback))
 }
 
+function normalizeStringArray(value: unknown) {
+  if (!Array.isArray(value)) {
+    return []
+  }
+  return value
+    .map((item) => String(item).trim())
+    .filter(Boolean)
+}
+
+function serializeFilterArray(value: string[]) {
+  return value.length > 0 ? value.join(',') : undefined
+}
+
 function isEditLockedError(error: unknown) {
   return axios.isAxiosError(error) && error.response?.status === 409
 }
@@ -108,6 +122,10 @@ export interface SegmentPageQuery {
   sourceQuery?: string
   targetQuery?: string
   searchFuzzy?: boolean
+  statusFilters?: string[]
+  matchFilters?: string[]
+  sourceFilters?: string[]
+  workflowStepIds?: string[]
 }
 
 export const useSegmentStore = defineStore('segment', () => {
@@ -146,6 +164,10 @@ export const useSegmentStore = defineStore('segment', () => {
     sourceQuery: '',
     targetQuery: '',
     searchFuzzy: false,
+    statusFilters: [] as string[],
+    matchFilters: [] as string[],
+    sourceFilters: [] as string[],
+    workflowStepIds: [] as string[],
   })
   const saveToTMStats = ref<SaveToTMStats | null>(null)
   const revisionHistory = ref<Record<string, SegmentRevisionEntry[]>>({})
@@ -446,6 +468,10 @@ export const useSegmentStore = defineStore('segment', () => {
       sourceQuery: query.sourceQuery ?? segmentFilters.value.sourceQuery,
       targetQuery: query.targetQuery ?? segmentFilters.value.targetQuery,
       searchFuzzy: query.searchFuzzy ?? segmentFilters.value.searchFuzzy,
+      statusFilters: normalizeStringArray(query.statusFilters ?? segmentFilters.value.statusFilters),
+      matchFilters: normalizeStringArray(query.matchFilters ?? segmentFilters.value.matchFilters),
+      sourceFilters: normalizeStringArray(query.sourceFilters ?? segmentFilters.value.sourceFilters),
+      workflowStepIds: normalizeStringArray(query.workflowStepIds ?? segmentFilters.value.workflowStepIds),
     }
   }
 
@@ -458,6 +484,10 @@ export const useSegmentStore = defineStore('segment', () => {
       source_query: resolved.sourceQuery,
       target_query: resolved.targetQuery,
       search_fuzzy: resolved.searchFuzzy,
+      status_filters: serializeFilterArray(resolved.statusFilters),
+      match_filters: serializeFilterArray(resolved.matchFilters),
+      source_filters: serializeFilterArray(resolved.sourceFilters),
+      workflow_step_ids: serializeFilterArray(resolved.workflowStepIds),
     }
   }
 
@@ -469,6 +499,10 @@ export const useSegmentStore = defineStore('segment', () => {
       sourceQuery: segmentFilters.value.sourceQuery,
       targetQuery: segmentFilters.value.targetQuery,
       searchFuzzy: segmentFilters.value.searchFuzzy,
+      statusFilters: [...segmentFilters.value.statusFilters],
+      matchFilters: [...segmentFilters.value.matchFilters],
+      sourceFilters: [...segmentFilters.value.sourceFilters],
+      workflowStepIds: [...segmentFilters.value.workflowStepIds],
     }
   }
 
@@ -510,6 +544,10 @@ export const useSegmentStore = defineStore('segment', () => {
       sourceQuery: string
       targetQuery: string
       searchFuzzy: boolean
+      statusFilters: string[]
+      matchFilters: string[]
+      sourceFilters: string[]
+      workflowStepIds: string[]
     },
   ) {
     currentPage.value = resolved.page
@@ -519,6 +557,10 @@ export const useSegmentStore = defineStore('segment', () => {
       sourceQuery: resolved.sourceQuery,
       targetQuery: resolved.targetQuery,
       searchFuzzy: resolved.searchFuzzy,
+      statusFilters: [...resolved.statusFilters],
+      matchFilters: [...resolved.matchFilters],
+      sourceFilters: [...resolved.sourceFilters],
+      workflowStepIds: [...resolved.workflowStepIds],
     }
     totalSegmentCount.value = data.total_segments
     matchedSegmentCount.value = data.matched_segments
@@ -654,6 +696,10 @@ export const useSegmentStore = defineStore('segment', () => {
       sourceQuery: '',
       targetQuery: '',
       searchFuzzy: false,
+      statusFilters: [],
+      matchFilters: [],
+      sourceFilters: [],
+      workflowStepIds: [],
     }
     saveToTMStats.value = null
     activeSentenceId.value = null
@@ -696,6 +742,10 @@ export const useSegmentStore = defineStore('segment', () => {
         sourceQuery: query.sourceQuery ?? '',
         targetQuery: query.targetQuery ?? '',
         searchFuzzy: query.searchFuzzy ?? false,
+        statusFilters: query.statusFilters ?? [],
+        matchFilters: query.matchFilters ?? [],
+        sourceFilters: query.sourceFilters ?? [],
+        workflowStepIds: query.workflowStepIds ?? [],
       })
       pageSize.value = resolved.pageSize
       currentPage.value = resolved.page
@@ -704,6 +754,10 @@ export const useSegmentStore = defineStore('segment', () => {
         sourceQuery: resolved.sourceQuery,
         targetQuery: resolved.targetQuery,
         searchFuzzy: resolved.searchFuzzy,
+        statusFilters: [...resolved.statusFilters],
+        matchFilters: [...resolved.matchFilters],
+        sourceFilters: [...resolved.sourceFilters],
+        workflowStepIds: [...resolved.workflowStepIds],
       }
       const detail = await fetchFileRecordDetail(fileRecordId, resolved.pageSize)
       fileRecord.value = {
@@ -718,6 +772,10 @@ export const useSegmentStore = defineStore('segment', () => {
         && resolved.scope === 'all'
         && !resolved.sourceQuery
         && !resolved.targetQuery
+        && resolved.statusFilters.length === 0
+        && resolved.matchFilters.length === 0
+        && resolved.sourceFilters.length === 0
+        && resolved.workflowStepIds.length === 0
       ) {
         matchedSegmentCount.value = detail.total_segments
         resetSegments(detail.segments)
@@ -920,17 +978,26 @@ export const useSegmentStore = defineStore('segment', () => {
     if (!fileRecord.value) {
       return
     }
+    const index = getSegmentIndex(sentenceId)
+    const previousSegment = index === -1 ? null : segments.value[index]
+    const willClearProjectSyncedTarget = Boolean(
+      disabled
+      && previousSegment?.source === 'project_sync'
+      && (previousSegment.target_text || '').trim(),
+    )
     try {
       const { data } = await http.patch<Segment>(
         `/file-records/${fileRecord.value.id}/segments/${sentenceId}/project-sync`,
         { disabled },
       )
-      applyServerSegments([data], false)
+      applyServerSegments([data])
       pushToast({
         tone: 'success',
         title: disabled ? '已关闭项目同步' : '已开启项目同步',
         message: disabled
-          ? '该句段会保留当前译文，后续不再被相同原文自动同步覆盖。'
+          ? (willClearProjectSyncedTarget
+              ? '已清空该句段由项目同步生成的译文，后续不再被相同原文自动同步覆盖。'
+              : '该句段后续不再被相同原文自动同步覆盖。')
           : '该句段已恢复项目内相同原文自动同步。',
       })
     } catch (error) {
@@ -941,6 +1008,28 @@ export const useSegmentStore = defineStore('segment', () => {
         message: String((error as any)?.response?.data?.detail || '请稍后重试。'),
       })
     }
+  }
+
+  async function disableProjectSyncForCurrentFile(): Promise<ProjectSyncDisableResult> {
+    if (!fileRecord.value) {
+      return { updated_count: 0, disabled_count: 0, cleared_count: 0 }
+    }
+
+    const synced = await syncToBackend()
+    if (!synced) {
+      return { updated_count: 0, disabled_count: 0, cleared_count: 0 }
+    }
+
+    const { data } = await http.post<ProjectSyncDisableResult>(
+      `/file-records/${fileRecord.value.id}/segments/project-sync/disable`,
+    )
+    await refreshCurrentSegmentPage()
+    const syncedAt = new Date()
+    lastSyncedAt.value = syncedAt.toISOString()
+    syncMessage.value = translate('stores.segment.syncedAt', {
+      time: syncedAt.toLocaleString('zh-CN', { hour12: false }),
+    })
+    return data
   }
 
   function setActiveSentence(sentenceId: string | null) {
@@ -1614,6 +1703,7 @@ export const useSegmentStore = defineStore('segment', () => {
     updateTarget,
     updateSource,
     setProjectSyncDisabled,
+    disableProjectSyncForCurrentFile,
     setActiveSentence,
     getTermMatches,
     syncToBackend,

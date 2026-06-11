@@ -122,7 +122,7 @@ async function deleteCollection(collection: TermbaseCollection) {
 
 async function uploadWorkbook() {
   if (!selectedFile.value) {
-    importMessage.value = '请先选择要导入的 Excel 文件。'
+    importMessage.value = '请先选择要导入的术语文件。'
     return
   }
 
@@ -137,7 +137,7 @@ async function uploadWorkbook() {
     if (collectionId) {
       formData.append('collection_id', collectionId)
     }
-    const { data } = await http.post<TermbaseImportSummary>('/termbase/import-xlsx', formData, {
+    const { data } = await http.post<TermbaseImportSummary>('/termbase/import', formData, {
       headers: {
         'Content-Type': 'multipart/form-data',
       },
@@ -227,7 +227,7 @@ onMounted(() => {
       <div class="section-title">导入术语库</div>
       <div class="upload-form">
         <p class="hint-text">
-          Excel 约定：第一列原文术语，第二列译文，首行可以保留表头。重复原文会按现有记录更新。
+          支持 TMX、Excel 和 CSV 文件。表格文件约定第一列原文术语，第二列译文，首行可以保留表头。重复原文会按现有记录更新。
         </p>
 
         <label class="field">
@@ -241,16 +241,16 @@ onMounted(() => {
         </label>
 
         <p v-if="!selectedCollectionId" class="hint-text">
-          未选择现有术语库时，会用上方名称或 Excel 文件名创建新术语库。
+          未选择现有术语库时，会用上方名称或文件名创建新术语库。
         </p>
 
         <label class="field">
-          <span class="field__label">Excel 文件</span>
+          <span class="field__label">术语文件</span>
           <input
             id="termbase-upload-file"
             class="field__control"
             type="file"
-            accept=".xlsx"
+            accept=".tmx,.xls,.xlsx,.csv"
             @change="onFileChange"
           />
         </label>

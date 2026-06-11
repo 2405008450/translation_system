@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { BookOpen, CheckCircle2, Database, Eye, Loader2 } from 'lucide-vue-next'
+import { BookOpen, BookOpenCheck, CheckCircle2, Database, Eye, Loader2 } from 'lucide-vue-next'
 import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
@@ -10,6 +10,8 @@ import { refreshGlobalNotifications } from '../utils/notifications'
 import { isProgressComplete } from '../utils/progress'
 import type {
   TMCollection,
+  GlossaryBase,
+  GlossaryImportSummary,
   TMImportPreview,
   TMImportSummary,
   TermBase,
@@ -17,7 +19,7 @@ import type {
   TermImportSummary,
 } from '../types/api'
 
-type ImportTab = 'tm' | 'term'
+type ImportTab = 'tm' | 'glossary' | 'term'
 type ImportMode = 'all' | ImportTab
 type ImportPreviewRow = { row_index: number, status: string, message: string }
 
@@ -28,8 +30,10 @@ const props = withDefaults(defineProps<{
   targetLanguage?: string | null
   contextLabel?: string
   defaultTMCollectionId?: string
+  defaultGlossaryBaseId?: string
   defaultTermBaseId?: string
   fixedTMCollectionId?: string
+  fixedGlossaryBaseId?: string
   fixedTermBaseId?: string
 }>(), {
   mode: 'all',
@@ -38,24 +42,29 @@ const props = withDefaults(defineProps<{
   targetLanguage: null,
   contextLabel: '',
   defaultTMCollectionId: '',
+  defaultGlossaryBaseId: '',
   defaultTermBaseId: '',
   fixedTMCollectionId: '',
+  fixedGlossaryBaseId: '',
   fixedTermBaseId: '',
 })
 
 const emit = defineEmits<{
-  imported: [payload: { tab: ImportTab }]
+  imported: [payload: { tab: ImportTab, resourceId?: string }]
 }>()
 const { t } = useI18n()
 
 const activeTab = ref<ImportTab>(props.mode === 'all' ? props.initialTab : props.mode)
 
 const tmCollections = ref<TMCollection[]>([])
+const glossaryBases = ref<GlossaryBase[]>([])
 const termBases = ref<TermBase[]>([])
 const loadingTMCollections = ref(false)
+const loadingGlossaryBases = ref(false)
 const loadingTermBases = ref(false)
 
 const tmFileInput = ref<HTMLInputElement | null>(null)
+const glossaryFileInput = ref<HTMLInputElement | null>(null)
 const termFileInput = ref<HTMLInputElement | null>(null)
 
 const selectedTMFile = ref<File | null>(null)
@@ -71,6 +80,19 @@ const tmImportMessage = ref('')
 const tmImportSummary = ref<TMImportSummary | null>(null)
 const tmImportPreview = ref<TMImportPreview | null>(null)
 const tmKeepDuplicateRowIndexes = ref<Set<number>>(new Set())
+const tmSkipHeader = ref(false)
+
+const selectedGlossaryFile = ref<File | null>(null)
+const selectedGlossaryBaseId = ref('')
+const newGlossaryBaseName = ref('')
+const newGlossaryBaseDescription = ref('')
+const glossaryImportSourceLanguage = ref('')
+const glossaryImportTargetLanguage = ref('')
+const glossaryImporting = ref(false)
+const glossaryUploadPercent = ref(0)
+const glossaryImportMessage = ref('')
+const glossaryImportSummary = ref<GlossaryImportSummary | null>(null)
+const glossarySkipHeader = ref(false)
 
 const selectedTermFile = ref<File | null>(null)
 const selectedTermBaseId = ref('')
@@ -85,9 +107,14 @@ const termImportMessage = ref('')
 const termImportSummary = ref<TermImportSummary | null>(null)
 const termImportPreview = ref<TermImportPreview | null>(null)
 const termKeepDuplicateRowIndexes = ref<Set<number>>(new Set())
+const termSkipHeader = ref(false)
 
 const selectedTMCollection = computed(() => (
   tmCollections.value.find((item) => item.id === selectedTMCollectionId.value) ?? null
+))
+
+const selectedGlossaryBase = computed(() => (
+  glossaryBases.value.find((item) => item.id === selectedGlossaryBaseId.value) ?? null
 ))
 
 const selectedTermBase = computed(() => (
@@ -105,6 +132,7 @@ const contextLanguagePair = computed(() => (
 ))
 
 const showTMCreateFields = computed(() => !props.fixedTMCollectionId && !selectedTMCollectionId.value)
+const showGlossaryCreateFields = computed(() => !props.fixedGlossaryBaseId && !selectedGlossaryBaseId.value)
 const showTermCreateFields = computed(() => !props.fixedTermBaseId && !selectedTermBaseId.value)
 const tmPreviewRowsHidden = computed(() => {
   const preview = tmImportPreview.value
@@ -115,6 +143,7 @@ const termPreviewRowsHidden = computed(() => {
   return preview ? Math.max(0, preview.total_rows - preview.rows.length) : 0
 })
 const fixedTMTargetLabel = computed(() => props.contextLabel || selectedTMCollection.value?.name || '当前记忆库')
+const fixedGlossaryTargetLabel = computed(() => props.contextLabel || selectedGlossaryBase.value?.name || '当前词汇表')
 const fixedTermTargetLabel = computed(() => props.contextLabel || selectedTermBase.value?.name || '当前术语库')
 const tmKeptDuplicateRows = computed(() => countKeptDuplicateRows(tmImportPreview.value?.rows ?? [], tmKeepDuplicateRowIndexes.value))
 const termKeptDuplicateRows = computed(() => countKeptDuplicateRows(termImportPreview.value?.rows ?? [], termKeepDuplicateRowIndexes.value))
@@ -137,9 +166,21 @@ watch(() => props.fixedTMCollectionId, (value) => {
   }
 }, { immediate: true })
 
+watch(() => props.fixedGlossaryBaseId, (value) => {
+  if (value) {
+    selectedGlossaryBaseId.value = value
+  }
+}, { immediate: true })
+
 watch(() => props.defaultTMCollectionId, (value) => {
   if (!props.fixedTMCollectionId && value && !selectedTMCollectionId.value) {
     selectedTMCollectionId.value = value
+  }
+}, { immediate: true })
+
+watch(() => props.defaultGlossaryBaseId, (value) => {
+  if (!props.fixedGlossaryBaseId && value && !selectedGlossaryBaseId.value) {
+    selectedGlossaryBaseId.value = value
   }
 }, { immediate: true })
 
@@ -163,6 +204,12 @@ watch(
     }
     if (targetLanguage && !tmImportTargetLanguage.value) {
       tmImportTargetLanguage.value = targetLanguage
+    }
+    if (sourceLanguage && !glossaryImportSourceLanguage.value) {
+      glossaryImportSourceLanguage.value = sourceLanguage
+    }
+    if (targetLanguage && !glossaryImportTargetLanguage.value) {
+      glossaryImportTargetLanguage.value = targetLanguage
     }
     if (sourceLanguage && !termImportSourceLanguage.value) {
       termImportSourceLanguage.value = sourceLanguage
@@ -193,6 +240,23 @@ watch([selectedTMCollectionId, tmImportSourceLanguage, tmImportTargetLanguage], 
 
 watch([tmImportSourceLanguage, tmImportTargetLanguage], () => {
   ensureDefaultTMCollectionSelection()
+})
+
+watch(selectedGlossaryBase, (glossaryBase) => {
+  if (!glossaryBase) {
+    return
+  }
+  resetGlossaryImport()
+  glossaryImportSourceLanguage.value = glossaryBase.source_language
+  glossaryImportTargetLanguage.value = glossaryBase.target_language
+})
+
+watch([selectedGlossaryBaseId, glossaryImportSourceLanguage, glossaryImportTargetLanguage], () => {
+  resetGlossaryImport()
+})
+
+watch([glossaryImportSourceLanguage, glossaryImportTargetLanguage], () => {
+  ensureDefaultGlossaryBaseSelection()
 })
 
 watch(selectedTermBase, (termBase) => {
@@ -244,6 +308,18 @@ function findMatchingTMCollectionId() {
   ))?.id || ''
 }
 
+function findMatchingGlossaryBaseId() {
+  const sourceLanguage = glossaryImportSourceLanguage.value || props.sourceLanguage || ''
+  const targetLanguage = glossaryImportTargetLanguage.value || props.targetLanguage || ''
+  if (!sourceLanguage || !targetLanguage) {
+    return ''
+  }
+  return glossaryBases.value.find((glossaryBase) => (
+    glossaryBase.source_language === sourceLanguage
+    && glossaryBase.target_language === targetLanguage
+  ))?.id || ''
+}
+
 function findMatchingTermBaseId() {
   const sourceLanguage = termImportSourceLanguage.value || props.sourceLanguage || ''
   const targetLanguage = termImportTargetLanguage.value || props.targetLanguage || ''
@@ -267,6 +343,20 @@ function ensureDefaultTMCollectionSelection() {
   const defaultId = props.defaultTMCollectionId || findMatchingTMCollectionId()
   if (defaultId && tmCollections.value.some((collection) => collection.id === defaultId)) {
     selectedTMCollectionId.value = defaultId
+  }
+}
+
+function ensureDefaultGlossaryBaseSelection() {
+  if (props.fixedGlossaryBaseId) {
+    selectedGlossaryBaseId.value = props.fixedGlossaryBaseId
+    return
+  }
+  if (selectedGlossaryBaseId.value) {
+    return
+  }
+  const defaultId = props.defaultGlossaryBaseId || findMatchingGlossaryBaseId()
+  if (defaultId && glossaryBases.value.some((glossaryBase) => glossaryBase.id === defaultId)) {
+    selectedGlossaryBaseId.value = defaultId
   }
 }
 
@@ -372,6 +462,22 @@ async function loadTMCollections() {
   }
 }
 
+async function loadGlossaryBases() {
+  loadingGlossaryBases.value = true
+  try {
+    const { data } = await http.get<GlossaryBase[]>('/glossary-bases')
+    glossaryBases.value = data
+    if (!props.fixedGlossaryBaseId && selectedGlossaryBaseId.value && !data.some((item) => item.id === selectedGlossaryBaseId.value)) {
+      selectedGlossaryBaseId.value = ''
+    }
+    ensureDefaultGlossaryBaseSelection()
+  } catch (error) {
+    glossaryImportMessage.value = getErrorMessage(error, '词汇表列表加载失败。')
+  } finally {
+    loadingGlossaryBases.value = false
+  }
+}
+
 async function loadTermBases() {
   loadingTermBases.value = true
   try {
@@ -406,6 +512,27 @@ async function createTMCollection(
     target_language: targetLanguage,
   })
   await loadTMCollections()
+  return data
+}
+
+async function createGlossaryBase(
+  name: string,
+  description = '',
+  sourceLanguage = '',
+  targetLanguage = '',
+) {
+  const cleanedName = name.trim()
+  if (!cleanedName) {
+    throw new Error('词汇表名称不能为空。')
+  }
+  ensureLanguagePair(sourceLanguage, targetLanguage)
+  const { data } = await http.post<GlossaryBase>('/glossary-bases', {
+    name: cleanedName,
+    description: description.trim() || null,
+    source_language: sourceLanguage,
+    target_language: targetLanguage,
+  })
+  await loadGlossaryBases()
   return data
 }
 
@@ -474,6 +601,14 @@ async function fetchSDLTMMetadata(file: File) {
   }
 }
 
+function onGlossaryFileChange(event: Event) {
+  selectedGlossaryFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
+  resetGlossaryImport()
+  if (selectedGlossaryFile.value && !selectedGlossaryBaseId.value && !newGlossaryBaseName.value.trim()) {
+    newGlossaryBaseName.value = fileBaseName(selectedGlossaryFile.value)
+  }
+}
+
 function onTermFileChange(event: Event) {
   selectedTermFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
   resetTermPreview()
@@ -489,6 +624,11 @@ function resetTMPreview() {
   tmKeepDuplicateRowIndexes.value = new Set()
 }
 
+function resetGlossaryImport() {
+  glossaryImportSummary.value = null
+  glossaryImportMessage.value = ''
+}
+
 function buildTMImportFormData(collectionId?: string, includeDuplicateDecisions = false) {
   if (!selectedTMFile.value) {
     throw new Error(t('resourceImport.tm.errors.selectFile'))
@@ -501,9 +641,23 @@ function buildTMImportFormData(collectionId?: string, includeDuplicateDecisions 
   formData.append('source_language', tmImportSourceLanguage.value)
   formData.append('target_language', tmImportTargetLanguage.value)
   formData.append('duplicate_policy', 'overwrite')
+  formData.append('skip_header', tmSkipHeader.value ? 'true' : 'false')
   if (includeDuplicateDecisions) {
     appendSkippedDuplicateRows(formData, tmKeepDuplicateRowIndexes.value)
   }
+  return formData
+}
+
+function buildGlossaryImportFormData(glossaryBaseId: string) {
+  if (!selectedGlossaryFile.value) {
+    throw new Error('请先选择要导入的词汇表文件。')
+  }
+  const formData = new FormData()
+  formData.append('file', selectedGlossaryFile.value)
+  formData.append('glossary_base_id', glossaryBaseId)
+  formData.append('source_language', glossaryImportSourceLanguage.value)
+  formData.append('target_language', glossaryImportTargetLanguage.value)
+  formData.append('skip_header', glossarySkipHeader.value ? 'true' : 'false')
   return formData
 }
 
@@ -528,7 +682,7 @@ async function previewTMWorkbook() {
   try {
     const formData = buildTMImportFormData(selectedTMCollectionId.value || props.fixedTMCollectionId)
     formData.append('preview_limit', '500')
-    const { data } = await http.post<TMImportPreview>('/translation-memory/import-xlsx/preview', formData, {
+    const { data } = await http.post<TMImportPreview>('/translation-memory/import/preview', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
     tmImportPreview.value = data
@@ -560,6 +714,7 @@ function buildTermImportFormData(termBaseId?: string, includeDuplicateDecisions 
   }
   formData.append('source_language', termImportSourceLanguage.value)
   formData.append('target_language', termImportTargetLanguage.value)
+  formData.append('skip_header', termSkipHeader.value ? 'true' : 'false')
   if (includeDuplicateDecisions) {
     appendSkippedDuplicateRows(formData, termKeepDuplicateRowIndexes.value)
   }
@@ -587,7 +742,7 @@ async function previewTermWorkbook() {
   try {
     const formData = buildTermImportFormData(selectedTermBaseId.value || props.fixedTermBaseId)
     formData.append('preview_limit', '500')
-    const { data } = await http.post<TermImportPreview>('/term-bases/import-xlsx/preview', formData, {
+    const { data } = await http.post<TermImportPreview>('/term-bases/import/preview', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
     termImportPreview.value = data
@@ -617,6 +772,24 @@ async function ensureImportCollection() {
   )
   selectedTMCollectionId.value = collection.id
   return collection.id
+}
+
+async function ensureImportGlossaryBase() {
+  if (props.fixedGlossaryBaseId) {
+    return props.fixedGlossaryBaseId
+  }
+  if (selectedGlossaryBaseId.value) {
+    return selectedGlossaryBaseId.value
+  }
+  const fallbackName = selectedGlossaryFile.value ? fileBaseName(selectedGlossaryFile.value) : ''
+  const glossaryBase = await createGlossaryBase(
+    newGlossaryBaseName.value || fallbackName,
+    newGlossaryBaseDescription.value,
+    glossaryImportSourceLanguage.value,
+    glossaryImportTargetLanguage.value,
+  )
+  selectedGlossaryBaseId.value = glossaryBase.id
+  return glossaryBase.id
 }
 
 async function ensureImportTermBase() {
@@ -660,7 +833,7 @@ async function uploadTMWorkbook() {
     const collectionId = await ensureImportCollection()
     const formData = buildTMImportFormData(collectionId, true)
 
-    const { data } = await http.post<TMImportSummary>('/translation-memory/import-xlsx', formData, {
+    const { data } = await http.post<TMImportSummary>('/translation-memory/import', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
       onUploadProgress: (event) => {
         const total = event.total || 0
@@ -679,13 +852,64 @@ async function uploadTMWorkbook() {
     }
     newTMCollectionName.value = ''
     newTMCollectionDescription.value = ''
-    emit('imported', { tab: 'tm' })
+    emit('imported', { tab: 'tm', resourceId: data.collection_id || collectionId })
     await loadTMCollections()
   } catch (error) {
     tmImportMessage.value = getErrorMessage(error, t('resourceImport.tm.errors.importFailed'))
   } finally {
     tmImporting.value = false
     tmUploadPercent.value = 0
+  }
+}
+
+async function uploadGlossaryWorkbook() {
+  if (!selectedGlossaryFile.value) {
+    glossaryImportMessage.value = '请先选择要导入的词汇表文件。'
+    return
+  }
+
+  try {
+    ensureLanguagePair(glossaryImportSourceLanguage.value, glossaryImportTargetLanguage.value)
+  } catch (error) {
+    glossaryImportMessage.value = error instanceof Error ? error.message : t('resourceImport.errors.selectLanguage')
+    glossaryImportSummary.value = null
+    return
+  }
+
+  glossaryImporting.value = true
+  glossaryUploadPercent.value = 0
+  glossaryImportMessage.value = ''
+  glossaryImportSummary.value = null
+
+  try {
+    const glossaryBaseId = await ensureImportGlossaryBase()
+    const formData = buildGlossaryImportFormData(glossaryBaseId)
+
+    const { data } = await http.post<GlossaryImportSummary>('/glossary-bases/import-xlsx', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress: (event) => {
+        const total = event.total || 0
+        const loaded = event.loaded || 0
+        glossaryUploadPercent.value = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0
+      },
+    })
+
+    glossaryImportSummary.value = data
+    glossaryImportMessage.value = `导入完成：${data.filename}`
+    refreshGlobalNotifications()
+    selectedGlossaryFile.value = null
+    if (glossaryFileInput.value) {
+      glossaryFileInput.value.value = ''
+    }
+    newGlossaryBaseName.value = ''
+    newGlossaryBaseDescription.value = ''
+    emit('imported', { tab: 'glossary', resourceId: data.glossary_base_id || glossaryBaseId })
+    await loadGlossaryBases()
+  } catch (error) {
+    glossaryImportMessage.value = getErrorMessage(error, '词汇表导入失败。')
+  } finally {
+    glossaryImporting.value = false
+    glossaryUploadPercent.value = 0
   }
 }
 
@@ -712,7 +936,7 @@ async function uploadTermWorkbook() {
     const termBaseId = await ensureImportTermBase()
     const formData = buildTermImportFormData(termBaseId, true)
 
-    const { data } = await http.post<TermImportSummary>('/term-bases/import-xlsx', formData, {
+    const { data } = await http.post<TermImportSummary>('/term-bases/import', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
       onUploadProgress: (event) => {
         const total = event.total || 0
@@ -731,7 +955,7 @@ async function uploadTermWorkbook() {
     }
     newTermBaseName.value = ''
     newTermBaseDescription.value = ''
-    emit('imported', { tab: 'term' })
+    emit('imported', { tab: 'term', resourceId: data.term_base_id || termBaseId })
     await loadTermBases()
   } catch (error) {
     termImportMessage.value = getErrorMessage(error, t('resourceImport.term.errors.importFailed'))
@@ -744,6 +968,9 @@ async function uploadTermWorkbook() {
 onMounted(() => {
   if (props.mode === 'all' || props.mode === 'tm') {
     void loadTMCollections()
+  }
+  if (props.mode === 'all' || props.mode === 'glossary') {
+    void loadGlossaryBases()
   }
   if (props.mode === 'all' || props.mode === 'term') {
     void loadTermBases()
@@ -775,11 +1002,20 @@ onMounted(() => {
       </button>
       <button
         class="tab-item"
+        :class="{ 'is-active': activeTab === 'glossary' }"
+        type="button"
+        @click="activeTab = 'glossary'"
+      >
+        <BookOpen :size="14" />
+        {{ t('resourceImport.tabs.glossary') }}
+      </button>
+      <button
+        class="tab-item"
         :class="{ 'is-active': activeTab === 'term' }"
         type="button"
         @click="activeTab = 'term'"
       >
-        <BookOpen :size="14" />
+        <BookOpenCheck :size="14" />
         {{ t('resourceImport.tabs.term') }}
       </button>
     </div>
@@ -870,6 +1106,15 @@ onMounted(() => {
               {{ option.label }}
             </option>
           </select>
+        </label>
+
+        <label class="resource-import-panel__toggle">
+          <input v-model="tmSkipHeader" type="checkbox" />
+          <span class="resource-import-panel__toggle-control" aria-hidden="true" />
+          <span>
+            <strong>{{ t('resourceImport.options.skipHeader') }}</strong>
+            <small>{{ t('resourceImport.options.skipHeaderHint') }}</small>
+          </span>
         </label>
       </div>
 
@@ -1025,6 +1270,173 @@ onMounted(() => {
       </div>
     </section>
 
+    <section v-else-if="activeTab === 'glossary'" class="resource-import-panel__section">
+      <p class="hint-text">
+        {{ t('resourceImport.glossary.intro') }}
+      </p>
+
+      <div class="upload-form form-grid-2 resource-import-panel__form">
+        <label class="field">
+          <span class="field__label">{{ t('resourceImport.glossary.target') }}</span>
+          <select
+            v-model="selectedGlossaryBaseId"
+            class="field__control"
+            :disabled="loadingGlossaryBases || Boolean(props.fixedGlossaryBaseId)"
+          >
+            <template v-if="props.fixedGlossaryBaseId">
+              <option :value="props.fixedGlossaryBaseId">{{ fixedGlossaryTargetLabel }}（当前词汇表）</option>
+            </template>
+            <template v-else>
+              <option value="">{{ t('resourceImport.glossary.createNew') }}</option>
+              <option
+                v-for="glossaryBase in glossaryBases"
+                :key="glossaryBase.id"
+                :value="glossaryBase.id"
+              >
+                {{ glossaryBase.name }}（{{ formatLanguagePair(glossaryBase.source_language, glossaryBase.target_language) }} / {{ glossaryBase.entry_count }} 条）
+              </option>
+            </template>
+          </select>
+        </label>
+
+        <label class="field">
+          <span class="field__label">{{ t('resourceImport.glossary.file') }}</span>
+          <input
+            ref="glossaryFileInput"
+            class="field__control"
+            type="file"
+            accept=".xlsx"
+            @change="onGlossaryFileChange"
+          />
+        </label>
+
+        <label v-if="showGlossaryCreateFields" class="field">
+          <span class="field__label">{{ t('resourceImport.glossary.newName') }}</span>
+          <input
+            v-model="newGlossaryBaseName"
+            class="field__control"
+            type="text"
+            :placeholder="t('resourceImport.glossary.newNamePlaceholder')"
+          />
+        </label>
+
+        <label v-if="showGlossaryCreateFields" class="field">
+          <span class="field__label">{{ t('resourceImport.glossary.description') }}</span>
+          <input
+            v-model="newGlossaryBaseDescription"
+            class="field__control"
+            type="text"
+            :placeholder="t('resourceImport.glossary.descriptionPlaceholder')"
+          />
+        </label>
+
+        <label class="field">
+          <span class="field__label">{{ t('resourceImport.glossary.sourceLanguage') }}</span>
+          <select v-model="glossaryImportSourceLanguage" class="field__control">
+            <option value="">{{ t('resourceImport.glossary.selectLanguage') }}</option>
+            <option
+              v-for="option in languageOptions"
+              :key="option.code"
+              :value="option.code"
+            >
+              {{ option.label }}
+            </option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span class="field__label">{{ t('resourceImport.glossary.targetLanguage') }}</span>
+          <select v-model="glossaryImportTargetLanguage" class="field__control">
+            <option value="">{{ t('resourceImport.glossary.selectLanguage') }}</option>
+            <option
+              v-for="option in languageOptions"
+              :key="option.code"
+              :value="option.code"
+            >
+              {{ option.label }}
+            </option>
+          </select>
+        </label>
+
+        <label class="resource-import-panel__toggle">
+          <input v-model="glossarySkipHeader" type="checkbox" />
+          <span class="resource-import-panel__toggle-control" aria-hidden="true" />
+          <span>
+            <strong>{{ t('resourceImport.options.skipHeader') }}</strong>
+            <small>{{ t('resourceImport.options.skipHeaderHint') }}</small>
+          </span>
+        </label>
+      </div>
+
+      <div class="resource-import-panel__actions">
+        <button
+          class="button button--primary"
+          type="button"
+          :disabled="glossaryImporting"
+          @click="uploadGlossaryWorkbook"
+        >
+          <Loader2 v-if="glossaryImporting" class="lucide-spin" />
+          <CheckCircle2 v-else :size="14" />
+          {{ glossaryImporting ? t('resourceImport.glossary.importing', { percent: glossaryUploadPercent }) : t('resourceImport.glossary.importAction') }}
+        </button>
+      </div>
+
+      <div v-if="glossaryImporting" class="resource-import-panel__progress">
+        <div class="progress-bar">
+          <div class="progress-bar__track">
+            <div
+              class="progress-bar__fill"
+              :class="{ 'is-complete': isProgressComplete(glossaryUploadPercent) }"
+              :style="{ width: `${glossaryUploadPercent}%` }"
+            />
+          </div>
+          <span class="progress-bar__text">{{ glossaryUploadPercent }}%</span>
+        </div>
+      </div>
+
+      <p
+        v-if="glossaryImportMessage"
+        class="form-message"
+        :class="{ 'is-error': !glossaryImportSummary }"
+      >
+        {{ glossaryImportMessage }}
+      </p>
+
+      <div v-if="glossaryImportSummary" class="resource-import-panel__summary">
+        <div class="section-title">{{ t('resourceImport.glossary.summary.title') }}</div>
+        <div class="summary-grid summary-grid--wide">
+          <div class="summary-item">
+            <strong>{{ glossaryImportSummary.glossary_base_name }}</strong>
+            <span>{{ t('resourceImport.glossary.summary.target') }}</span>
+          </div>
+          <div class="summary-item">
+            <strong>{{ formatLanguagePair(glossaryImportSummary.source_language, glossaryImportSummary.target_language) }}</strong>
+            <span>{{ t('resourceImport.glossary.summary.pair') }}</span>
+          </div>
+          <div class="summary-item">
+            <strong>{{ glossaryImportSummary.imported_rows }}</strong>
+            <span>{{ t('resourceImport.glossary.summary.importedRows') }}</span>
+          </div>
+          <div class="summary-item">
+            <strong>{{ glossaryImportSummary.created_rows }}</strong>
+            <span>{{ t('resourceImport.glossary.summary.createdRows') }}</span>
+          </div>
+          <div class="summary-item">
+            <strong>{{ glossaryImportSummary.updated_rows }}</strong>
+            <span>{{ t('resourceImport.glossary.summary.updatedRows') }}</span>
+          </div>
+          <div class="summary-item">
+            <strong>{{ glossaryImportSummary.skipped_header_rows }}</strong>
+            <span>{{ t('resourceImport.glossary.summary.skippedHeaderRows') }}</span>
+          </div>
+          <div class="summary-item">
+            <strong>{{ glossaryImportSummary.skipped_empty_rows }}</strong>
+            <span>{{ t('resourceImport.glossary.summary.skippedEmptyRows') }}</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section v-else class="resource-import-panel__section">
       <p class="hint-text">
         {{ t('resourceImport.term.intro') }}
@@ -1060,7 +1472,7 @@ onMounted(() => {
             ref="termFileInput"
             class="field__control"
             type="file"
-            accept=".xls,.xlsx,.csv"
+            accept=".tmx,.xls,.xlsx,.csv"
             @change="onTermFileChange"
           />
         </label>
@@ -1111,6 +1523,15 @@ onMounted(() => {
               {{ option.label }}
             </option>
           </select>
+        </label>
+
+        <label class="resource-import-panel__toggle">
+          <input v-model="termSkipHeader" type="checkbox" />
+          <span class="resource-import-panel__toggle-control" aria-hidden="true" />
+          <span>
+            <strong>{{ t('resourceImport.options.skipHeader') }}</strong>
+            <small>{{ t('resourceImport.options.skipHeaderHint') }}</small>
+          </span>
         </label>
       </div>
 
@@ -1312,6 +1733,70 @@ onMounted(() => {
 
 .resource-import-panel__form {
   margin-top: 0;
+}
+
+.resource-import-panel__toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 42px;
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, var(--brand-500) 18%, var(--line-soft));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-1) 88%, var(--brand-050) 12%);
+  color: var(--text-primary);
+}
+
+.resource-import-panel__toggle input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.resource-import-panel__toggle-control {
+  position: relative;
+  width: 42px;
+  height: 24px;
+  flex-shrink: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: #dbe3ea;
+  transition: background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.resource-import-panel__toggle-control::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.2);
+  transition: transform 0.18s ease;
+}
+
+.resource-import-panel__toggle input:checked + .resource-import-panel__toggle-control {
+  border-color: var(--brand-600);
+  background: linear-gradient(135deg, var(--brand-600), var(--brand-500));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand-500) 18%, transparent);
+}
+
+.resource-import-panel__toggle input:checked + .resource-import-panel__toggle-control::after {
+  transform: translateX(18px);
+}
+
+.resource-import-panel__toggle strong,
+.resource-import-panel__toggle small {
+  display: block;
+  line-height: 1.25;
+}
+
+.resource-import-panel__toggle small {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 12px;
 }
 
 .resource-import-panel__actions {

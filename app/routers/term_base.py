@@ -181,7 +181,7 @@ def _serialize_term_entry(entry: TermEntry) -> dict:
 def _validate_term_import_upload(file: UploadFile, raw_bytes: bytes | None = None) -> None:
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
     if extension not in TERM_IMPORT_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="仅支持上传 .xls、.xlsx 或 .csv 文件。")
+        raise HTTPException(status_code=400, detail="仅支持上传 .tmx、.xls、.xlsx 或 .csv 文件。")
     if raw_bytes is not None and not raw_bytes:
         raise HTTPException(status_code=400, detail="上传的术语文件为空。")
 
@@ -513,12 +513,14 @@ def delete_term_base(
 
 
 @router.post("/term-bases/import-xlsx/preview")
+@router.post("/term-bases/import/preview", include_in_schema=False)
 async def preview_term_base_xlsx(
     file: UploadFile = File(...),
     term_base_id: UUID | None = Form(default=None),
     source_language: str = Form(...),
     target_language: str = Form(...),
     preview_limit: int = Form(default=100),
+    skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
@@ -548,6 +550,7 @@ async def preview_term_base_xlsx(
             source_language=resolved_source_language,
             target_language=resolved_target_language,
             preview_limit=max(1, min(preview_limit, 500)),
+            skip_header=skip_header,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"术语库预览失败：{exc}") from exc
@@ -580,12 +583,14 @@ async def preview_term_base_xlsx(
 
 
 @router.post("/term-bases/import-xlsx")
+@router.post("/term-bases/import", include_in_schema=False)
 async def import_term_base_xlsx(
     file: UploadFile = File(...),
     term_base_id: UUID | None = Form(default=None),
     source_language: str = Form(...),
     target_language: str = Form(...),
     skip_duplicate_row_indexes: str = Form(default="[]"),
+    skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
@@ -614,6 +619,7 @@ async def import_term_base_xlsx(
             source_language=resolved_source_language,
             target_language=resolved_target_language,
             skip_duplicate_row_indexes=skipped_row_indexes,
+            skip_header=skip_header,
         )
     except Exception as exc:
         db.rollback()

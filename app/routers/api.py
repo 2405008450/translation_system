@@ -192,6 +192,7 @@ from app.services.file_export_queue import (
     wait_for_file_export_task,
 )
 from app.services.project_segment_sync import (
+    disable_project_sync_for_segments,
     empty_project_segment_sync_summary,
     sync_project_repeated_segments_from_file,
     sync_project_repeated_segments_from_segments,
@@ -949,6 +950,12 @@ class SegmentProjectSyncUpdate(BaseModel):
     disabled: bool
 
 
+class ProjectSyncDisableResponse(BaseModel):
+    updated_count: int
+    disabled_count: int
+    cleared_count: int
+
+
 class BatchSegmentUpdate(BaseModel):
     updates: list[SegmentUpdate]
 
@@ -974,6 +981,10 @@ class SegmentReplaceRequest(BaseModel):
     replace_text: str = ""
     search_fuzzy: bool = False
     replace_all: bool = True
+    status_filters: list[str] = Field(default_factory=list)
+    match_filters: list[str] = Field(default_factory=list)
+    source_filters: list[str] = Field(default_factory=list)
+    workflow_step_ids: list[str] = Field(default_factory=list)
 
 
 class RevisionResolvePayload(BaseModel):
@@ -5970,6 +5981,78 @@ def _apply_segment_text_filters(
     return query
 
 
+def _normalize_segment_filter_values(*values: Any) -> list[str]:
+    normalized: list[str] = []
+    for value in values:
+        if value is None:
+            continue
+        items = value if isinstance(value, list) else [value]
+        for item in items:
+            for part in str(item).split(","):
+                filter_value = part.strip().lower()
+                if filter_value:
+                    normalized.append(filter_value)
+    return list(dict.fromkeys(normalized))
+
+
+def _apply_segment_screening_filters(
+    query,
+    *,
+    status_filters: list[str] | None = None,
+    match_filters: list[str] | None = None,
+    source_filters: list[str] | None = None,
+    workflow_step_ids: list[str] | None = None,
+):
+    status_values = set(_normalize_segment_filter_values(status_filters))
+    if status_values:
+        conditions = []
+        if "empty_target" in status_values:
+            conditions.append(func.trim(func.coalesce(Segment.target_text, "")) == "")
+        if "confirmed" in status_values:
+            conditions.append(Segment.status == "confirmed")
+        if "unconfirmed" in status_values:
+            conditions.append(or_(Segment.status.is_(None), Segment.status != "confirmed"))
+        if conditions:
+            query = query.filter(or_(*conditions))
+
+    match_values = set(_normalize_segment_filter_values(match_filters))
+    if match_values:
+        conditions = []
+        if "exact" in match_values:
+            conditions.append(Segment.status == "exact")
+        if "fuzzy" in match_values:
+            conditions.append(Segment.status == "fuzzy")
+        if "none" in match_values:
+            conditions.append(Segment.status == "none")
+        if "machine_translation" in match_values:
+            conditions.append(Segment.source == "llm")
+        if "tm" in match_values:
+            conditions.append(Segment.source == "tm")
+        if "project_sync" in match_values:
+            conditions.append(Segment.source == "project_sync")
+        if conditions:
+            query = query.filter(or_(*conditions))
+
+    source_values = [
+        value
+        for value in _normalize_segment_filter_values(source_filters)
+        if value in {"tm", "manual", "llm", "project_sync"}
+    ]
+    if source_values:
+        query = query.filter(Segment.source.in_(source_values))
+
+    workflow_step_values: list[UUID] = []
+    for value in _normalize_segment_filter_values(workflow_step_ids):
+        try:
+            workflow_step_values.append(UUID(value))
+        except ValueError:
+            continue
+    if workflow_step_values:
+        query = query.filter(Segment.workflow_step_id.in_(workflow_step_values))
+
+    return query
+
+
 def _order_segment_query(query):
     return query.order_by(
         Segment.block_index.asc(),
@@ -6087,6 +6170,10 @@ def _get_segment_page_sentence_ids(
     scope: str = "all",
     source_query: str | None = None,
     target_query: str | None = None,
+    status_filters: list[str] | None = None,
+    match_filters: list[str] | None = None,
+    source_filters: list[str] | None = None,
+    workflow_step_ids: list[str] | None = None,
 ) -> list[str]:
     safe_skip = max(skip, 0)
     safe_limit = _normalize_segment_page_limit(limit)
@@ -6096,6 +6183,13 @@ def _get_segment_page_sentence_ids(
         query,
         source_query=source_query,
         target_query=target_query,
+    )
+    query = _apply_segment_screening_filters(
+        query,
+        status_filters=status_filters,
+        match_filters=match_filters,
+        source_filters=source_filters,
+        workflow_step_ids=workflow_step_ids,
     )
     return [
         sentence_id
@@ -6535,6 +6629,14 @@ def get_file_record_segments(
     source_query: str | None = None,
     target_query: str | None = None,
     search_fuzzy: bool = False,
+    status_filters: str | None = None,
+    status_filters_bracket: list[str] | None = Query(default=None, alias="status_filters[]"),
+    match_filters: str | None = None,
+    match_filters_bracket: list[str] | None = Query(default=None, alias="match_filters[]"),
+    source_filters: str | None = None,
+    source_filters_bracket: list[str] | None = Query(default=None, alias="source_filters[]"),
+    workflow_step_ids: str | None = None,
+    workflow_step_ids_bracket: list[str] | None = Query(default=None, alias="workflow_step_ids[]"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -6553,6 +6655,17 @@ def get_file_record_segments(
         filtered_query,
         source_query=source_query,
         target_query=target_query,
+    )
+    normalized_status_filters = _normalize_segment_filter_values(status_filters, status_filters_bracket)
+    normalized_match_filters = _normalize_segment_filter_values(match_filters, match_filters_bracket)
+    normalized_source_filters = _normalize_segment_filter_values(source_filters, source_filters_bracket)
+    normalized_workflow_step_ids = _normalize_segment_filter_values(workflow_step_ids, workflow_step_ids_bracket)
+    filtered_query = _apply_segment_screening_filters(
+        filtered_query,
+        status_filters=normalized_status_filters,
+        match_filters=normalized_match_filters,
+        source_filters=normalized_source_filters,
+        workflow_step_ids=normalized_workflow_step_ids,
     )
     matched_segments = filtered_query.count()
     page_segments = (
@@ -6581,6 +6694,10 @@ def get_file_record_segments(
             "source_query": source_query or "",
             "target_query": target_query or "",
             "search_fuzzy": search_fuzzy,
+            "status_filters": normalized_status_filters,
+            "match_filters": normalized_match_filters,
+            "source_filters": normalized_source_filters,
+            "workflow_step_ids": normalized_workflow_step_ids,
         },
         "server_time": datetime.utcnow().isoformat(),
         "segments": [
@@ -7649,8 +7766,13 @@ def update_segment_project_sync(
         raise HTTPException(status_code=404, detail="片段不存在。")
 
     _require_segment_work_access(db, file_record, segment, current_user)
-    segment.project_sync_disabled = payload.disabled
-    segment.version = int(segment.version or 1) + 1
+    if payload.disabled:
+        summary = disable_project_sync_for_segments([segment])
+        if summary.updated_count:
+            sync_file_record_status(db, file_record_id)
+    elif segment.project_sync_disabled:
+        segment.project_sync_disabled = False
+        segment.version = int(segment.version or 1) + 1
     db.commit()
     db.refresh(segment)
     workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
@@ -7667,6 +7789,28 @@ def update_segment_project_sync(
         writable_workflow_step_ids=writable_workflow_step_ids,
         can_manage=can_manage,
     )
+
+
+@router.post("/file-records/{file_record_id}/segments/project-sync/disable")
+def disable_file_record_project_sync(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+) -> ProjectSyncDisableResponse:
+    """一键关闭当前文件可写句段的项目同步，并清空项目同步生成的译文。"""
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    segments = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id)
+        .all()
+    )
+    writable_segments = _filter_writable_segments(db, file_record, current_user, segments)
+    summary = disable_project_sync_for_segments(writable_segments)
+    if summary.updated_count:
+        sync_file_record_status(db, file_record_id)
+    db.commit()
+    return ProjectSyncDisableResponse(**summary.to_dict())
 
 
 @router.post("/file-records/{file_record_id}/segments/{sentence_id}/split")
@@ -8068,6 +8212,13 @@ def replace_file_record_segment_targets(
         source_query=payload.source_query,
         target_query=target_query,
     )
+    query = _apply_segment_screening_filters(
+        query,
+        status_filters=payload.status_filters,
+        match_filters=payload.match_filters,
+        source_filters=payload.source_filters,
+        workflow_step_ids=payload.workflow_step_ids,
+    )
     segments = _order_segment_query(query).all()
     segments = _filter_writable_segments(db, file_record, current_user, segments)
     if not segments:
@@ -8286,6 +8437,14 @@ def get_file_record_revisions(
     source_query: str | None = None,
     target_query: str | None = None,
     search_fuzzy: bool = False,
+    status_filters: str | None = None,
+    status_filters_bracket: list[str] | None = Query(default=None, alias="status_filters[]"),
+    match_filters: str | None = None,
+    match_filters_bracket: list[str] | None = Query(default=None, alias="match_filters[]"),
+    source_filters: str | None = None,
+    source_filters_bracket: list[str] | None = Query(default=None, alias="source_filters[]"),
+    workflow_step_ids: str | None = None,
+    workflow_step_ids_bracket: list[str] | None = Query(default=None, alias="workflow_step_ids[]"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -8315,6 +8474,10 @@ def get_file_record_revisions(
             scope=scope,
             source_query=source_query,
             target_query=target_query,
+            status_filters=_normalize_segment_filter_values(status_filters, status_filters_bracket),
+            match_filters=_normalize_segment_filter_values(match_filters, match_filters_bracket),
+            source_filters=_normalize_segment_filter_values(source_filters, source_filters_bracket),
+            workflow_step_ids=_normalize_segment_filter_values(workflow_step_ids, workflow_step_ids_bracket),
         )
         revisions = list_revisions(
             db,
@@ -8398,6 +8561,14 @@ def get_file_record_comments(
     source_query: str | None = None,
     target_query: str | None = None,
     search_fuzzy: bool = False,
+    status_filters: str | None = None,
+    status_filters_bracket: list[str] | None = Query(default=None, alias="status_filters[]"),
+    match_filters: str | None = None,
+    match_filters_bracket: list[str] | None = Query(default=None, alias="match_filters[]"),
+    source_filters: str | None = None,
+    source_filters_bracket: list[str] | None = Query(default=None, alias="source_filters[]"),
+    workflow_step_ids: str | None = None,
+    workflow_step_ids_bracket: list[str] | None = Query(default=None, alias="workflow_step_ids[]"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -8416,6 +8587,10 @@ def get_file_record_comments(
             scope=scope,
             source_query=source_query,
             target_query=target_query,
+            status_filters=_normalize_segment_filter_values(status_filters, status_filters_bracket),
+            match_filters=_normalize_segment_filter_values(match_filters, match_filters_bracket),
+            source_filters=_normalize_segment_filter_values(source_filters, source_filters_bracket),
+            workflow_step_ids=_normalize_segment_filter_values(workflow_step_ids, workflow_step_ids_bracket),
         )
 
     comments = list_segment_comments_for_file_record(
@@ -9461,6 +9636,7 @@ async def preview_tm_xlsx(
     target_language: str = Form(...),
     duplicate_policy: str = Form(default="overwrite"),
     preview_limit: int = Form(default=100),
+    skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
@@ -9486,6 +9662,7 @@ async def preview_tm_xlsx(
             target_language=resolved_target_language,
             duplicate_policy=normalized_duplicate_policy,
             preview_limit=max(1, min(preview_limit, 500)),
+            skip_header=skip_header,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"TM 预览失败：{exc}") from exc
@@ -9530,6 +9707,7 @@ async def import_tm_xlsx(
     target_language: str = Form(...),
     duplicate_policy: str = Form(default="overwrite"),
     skip_duplicate_row_indexes: str = Form(default="[]"),
+    skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
@@ -9570,6 +9748,7 @@ async def import_tm_xlsx(
                 creator_id=current_user.id,
                 duplicate_policy=normalized_duplicate_policy,
                 skip_duplicate_row_indexes=skipped_row_indexes,
+                skip_header=skip_header,
             )
     except Exception as exc:
         db.rollback()
@@ -10186,6 +10365,7 @@ def delete_term(
 
 
 @router.post("/termbase/import-xlsx")
+@router.post("/termbase/import", include_in_schema=False)
 async def import_termbase_xlsx(
     file: UploadFile = File(...),
     collection_id: UUID | None = Form(default=None),
@@ -10194,7 +10374,7 @@ async def import_termbase_xlsx(
 ):
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
     if extension not in TERM_IMPORT_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="仅支持上传 .xls、.xlsx 或 .csv 文件。")
+        raise HTTPException(status_code=400, detail="仅支持上传 .tmx、.xls、.xlsx 或 .csv 文件。")
 
     raw_bytes = await file.read()
     if not raw_bytes:

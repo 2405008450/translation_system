@@ -21,6 +21,10 @@ export interface CommentWindowQuery {
   sourceQuery?: string
   targetQuery?: string
   searchFuzzy?: boolean
+  statusFilters?: string[]
+  matchFilters?: string[]
+  sourceFilters?: string[]
+  workflowStepIds?: string[]
 }
 
 function sortComments(comments: SegmentComment[]) {
@@ -45,6 +49,7 @@ function buildCommentWindowParams(query?: CommentWindowQuery | null) {
   }
   const page = Math.max(1, query.page)
   const pageSize = Math.max(1, query.pageSize)
+  const serializeArray = (value?: string[]) => (value && value.length > 0 ? value.join(',') : undefined)
   return {
     skip: (page - 1) * pageSize,
     limit: pageSize,
@@ -52,6 +57,10 @@ function buildCommentWindowParams(query?: CommentWindowQuery | null) {
     source_query: query.sourceQuery ?? '',
     target_query: query.targetQuery ?? '',
     search_fuzzy: query.searchFuzzy ?? false,
+    status_filters: serializeArray(query.statusFilters),
+    match_filters: serializeArray(query.matchFilters),
+    source_filters: serializeArray(query.sourceFilters),
+    workflow_step_ids: serializeArray(query.workflowStepIds),
   }
 }
 

@@ -402,6 +402,12 @@ export interface ProjectSegmentSyncSummary {
   affected_file_count: number
 }
 
+export interface ProjectSyncDisableResult {
+  updated_count: number
+  disabled_count: number
+  cleared_count: number
+}
+
 export interface FileRecordDetail {
   id: string
   project_id: string | null
@@ -463,6 +469,10 @@ export interface SegmentPageFilters {
   source_query: string
   target_query: string
   search_fuzzy: boolean
+  status_filters?: string[]
+  match_filters?: string[]
+  source_filters?: string[]
+  workflow_step_ids?: string[]
 }
 
 export interface SegmentPageResponse {

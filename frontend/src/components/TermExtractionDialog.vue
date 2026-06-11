@@ -34,7 +34,9 @@ interface ProjectFileItem {
   source_language: string | null
   target_language: string | null
   term_base_id: string | null
+  term_base_ids?: string[]
   term_base_write_ids?: string[]
+  qa_term_base_ids?: string[]
 }
 
 type TermDraftAction = 'add' | 'replace' | 'skip'
@@ -68,6 +70,7 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const router = useRouter()
 const modelOptions = llmModelOptions
+const CREATE_NEW_TERM_BASE_OPTION = '__create_new_term_base__'
 
 const loadingBases = ref(false)
 const extracting = ref(false)
@@ -87,6 +90,8 @@ const selectedVersionKey = ref<VersionKey | ''>('')
 const errorMessage = ref('')
 const saveResult = ref<TermBatchSaveResult | null>(null)
 const newBaseName = ref('')
+const createNewTermBaseSelected = ref(false)
+const ensuredWritableTermBaseIds = ref<string[]>([])
 
 const sourceLanguage = computed(() => props.file?.source_language || props.projectSourceLanguage || '')
 const targetLanguage = computed(() => props.file?.target_language || props.projectTargetLanguage || '')
@@ -98,10 +103,25 @@ const languagePairLabel = computed(() => (
 const availableTermBases = computed(() => termBases.value.filter((termBase) => (
   termBase.source_language === sourceLanguage.value
   && termBase.target_language === targetLanguage.value
-  && (props.file?.term_base_write_ids || []).includes(termBase.id)
 )))
 const selectedTermBase = computed(() => (
   termBases.value.find((termBase) => termBase.id === selectedTermBaseId.value) ?? null
+))
+const selectedTermBaseChoice = computed({
+  get: () => (createNewTermBaseSelected.value ? CREATE_NEW_TERM_BASE_OPTION : selectedTermBaseId.value),
+  set: (value: string) => {
+    saveResult.value = null
+    if (value === CREATE_NEW_TERM_BASE_OPTION) {
+      createNewTermBaseSelected.value = true
+      selectedTermBaseId.value = ''
+      return
+    }
+    createNewTermBaseSelected.value = false
+    selectedTermBaseId.value = value
+  },
+})
+const showCreateTermBaseFields = computed(() => (
+  createNewTermBaseSelected.value || availableTermBases.value.length === 0
 ))
 const conflictCount = computed(() => drafts.value.filter((draft) => draft.has_conflict).length)
 const saveableCount = computed(() => drafts.value.filter((draft) => (
@@ -173,11 +193,78 @@ function resetState() {
   extractionPrompt.value = ''
   errorMessage.value = ''
   saveResult.value = null
-  const writableIds = props.file?.term_base_write_ids || []
-  selectedTermBaseId.value = props.file?.term_base_id && writableIds.includes(props.file.term_base_id)
-    ? props.file.term_base_id
-    : (writableIds[0] || '')
+  createNewTermBaseSelected.value = false
+  ensuredWritableTermBaseIds.value = []
+  selectedTermBaseId.value = props.file?.term_base_id || props.file?.term_base_write_ids?.[0] || ''
   newBaseName.value = props.file ? `${props.file.filename} 术语` : ''
+}
+
+function uniqueIds(ids: Array<string | null | undefined>) {
+  return Array.from(new Set(ids.filter((id): id is string => Boolean(id))))
+}
+
+function isTermBaseWritable(termBaseId: string) {
+  return [
+    ...(props.file?.term_base_write_ids || []),
+    ...ensuredWritableTermBaseIds.value,
+  ].includes(termBaseId)
+}
+
+function isTermBaseEnabled(termBaseId: string) {
+  return props.file?.term_base_id === termBaseId || (props.file?.term_base_ids || []).includes(termBaseId)
+}
+
+function resolveInitialTermBaseId() {
+  const candidates = uniqueIds([
+    selectedTermBaseId.value,
+    props.file?.term_base_id,
+    ...(props.file?.term_base_write_ids || []),
+    ...(props.file?.term_base_ids || []),
+  ])
+  return candidates.find((candidate) => (
+    availableTermBases.value.some((termBase) => termBase.id === candidate)
+  )) || ''
+}
+
+function syncSelectedTermBaseAfterLoad() {
+  if (createNewTermBaseSelected.value) {
+    return
+  }
+  selectedTermBaseId.value = resolveInitialTermBaseId()
+  createNewTermBaseSelected.value = !selectedTermBaseId.value && availableTermBases.value.length === 0
+}
+
+async function ensureTermBaseWritable(termBaseId: string) {
+  if (!props.file || !termBaseId || (isTermBaseEnabled(termBaseId) && isTermBaseWritable(termBaseId))) {
+    return true
+  }
+  const enabledIds = uniqueIds([
+    termBaseId,
+    ...(props.file.term_base_ids || []),
+    props.file.term_base_id,
+    ...(props.file.term_base_write_ids || []),
+    ...ensuredWritableTermBaseIds.value,
+  ])
+  const writableIds = uniqueIds([
+    termBaseId,
+    ...(props.file.term_base_write_ids || []),
+    ...ensuredWritableTermBaseIds.value,
+  ])
+  const qaIds = uniqueIds(props.file.qa_term_base_ids || [])
+    .filter((id) => enabledIds.includes(id))
+  try {
+    await http.patch(`/file-records/${props.file.id}/bindings`, {
+      term_base_ids: enabledIds,
+      term_base_write_ids: writableIds,
+      qa_term_base_ids: qaIds,
+    })
+    ensuredWritableTermBaseIds.value = uniqueIds([...ensuredWritableTermBaseIds.value, termBaseId])
+    emit('done')
+    return true
+  } catch (error) {
+    console.warn('Failed to bind term base for extraction target.', error)
+    return false
+  }
 }
 
 function getModelLabel(modelId: string) {
@@ -280,12 +367,7 @@ async function loadTermBases() {
   try {
     const { data } = await http.get<TermBase[]>('/term-bases')
     termBases.value = data
-    if (
-      selectedTermBaseId.value
-      && !availableTermBases.value.some((termBase) => termBase.id === selectedTermBaseId.value)
-    ) {
-      selectedTermBaseId.value = ''
-    }
+    syncSelectedTermBaseAfterLoad()
   } catch (error) {
     errorMessage.value = getErrorMessage(error, t('projectDetail.termExtraction.errors.loadTermBases'))
   } finally {
@@ -393,6 +475,13 @@ async function createTermBase() {
       source_language: sourceLanguage.value,
       target_language: targetLanguage.value,
     })
+    termBases.value = [
+      data,
+      ...termBases.value.filter((termBase) => termBase.id !== data.id),
+    ]
+    createNewTermBaseSelected.value = false
+    selectedTermBaseId.value = data.id
+    await ensureTermBaseWritable(data.id)
     await loadTermBases()
     selectedTermBaseId.value = data.id
     await refreshConflicts()
@@ -436,9 +525,11 @@ async function saveTerms() {
   saving.value = true
   errorMessage.value = ''
   saveResult.value = null
+  const targetTermBaseId = selectedTermBaseId.value
   try {
+    await ensureTermBaseWritable(targetTermBaseId)
     const { data } = await http.post<TermBatchSaveResult>(
-      `/term-bases/${selectedTermBaseId.value}/entries/batch`,
+      `/term-bases/${targetTermBaseId}/entries/batch`,
       {
         entries: drafts.value.map((draft) => ({
           source_text: draft.source_text,
@@ -516,11 +607,11 @@ watch(selectedTermBaseId, async (next, previous) => {
         </span>
       </div>
 
-      <section class="term-extract__target">
+      <section class="term-extract__target" :class="{ 'is-create-mode': showCreateTermBaseFields }">
         <label class="field">
           <span class="field__label">{{ t('projectDetail.termExtraction.targetBase') }}</span>
           <select
-            v-model="selectedTermBaseId"
+            v-model="selectedTermBaseChoice"
             class="field__control"
             :disabled="loadingBases || extracting || saving"
           >
@@ -528,9 +619,12 @@ watch(selectedTermBaseId, async (next, previous) => {
             <option v-for="termBase in availableTermBases" :key="termBase.id" :value="termBase.id">
               {{ termBase.name }}（{{ termBase.entry_count }}）
             </option>
+            <option :value="CREATE_NEW_TERM_BASE_OPTION">
+              {{ t('projectDetail.termExtraction.createBaseOption') }}
+            </option>
           </select>
         </label>
-        <label class="field">
+        <label v-if="showCreateTermBaseFields" class="field">
           <span class="field__label">{{ t('projectDetail.termExtraction.newBaseName') }}</span>
           <input
             v-model="newBaseName"
@@ -540,6 +634,7 @@ watch(selectedTermBaseId, async (next, previous) => {
           />
         </label>
         <button
+          v-if="showCreateTermBaseFields"
           class="button"
           type="button"
           :disabled="creatingBase || extracting || saving"
@@ -842,9 +937,13 @@ watch(selectedTermBaseId, async (next, previous) => {
 
 .term-extract__target {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) auto;
+  grid-template-columns: minmax(220px, 1fr);
   gap: 10px;
   align-items: end;
+}
+
+.term-extract__target.is-create-mode {
+  grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) auto;
 }
 
 .term-extract__config,

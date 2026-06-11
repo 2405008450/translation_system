@@ -18,10 +18,12 @@ import {
   FileCheck,
   FileText,
   Flag,
+  Filter,
   History,
   Info,
   Italic,
   Languages,
+  Link2Off,
   Loader2,
   MessageSquare,
   Pilcrow,
@@ -101,7 +103,7 @@ const props = defineProps<{
 type BottomToolKey = 'qa-result' | 'history' | 'source-preview' | 'target-preview' | 'split-preview'
 type BottomDrawerToolKey = Exclude<BottomToolKey, 'qa-result'>
 type SideToolKey = 'match-info' | 'terms' | 'resource-search' | 'notes'
-type ResourceImportTab = 'tm' | 'term'
+type ResourceImportTab = 'tm' | 'glossary' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
 type SaveToTMTargetMode = 'new' | 'existing'
 type SegmentDisplayScope = 'all' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'confirmed_only' | 'empty_target'
@@ -110,6 +112,13 @@ type ResourceSearchMode = 'exact' | 'fuzzy'
 type FileExportStatus = 'queued' | 'running' | 'completed' | 'failed'
 type WorkflowTransitionDirection = 'forward' | 'back'
 type WorkflowSourceStatus = 'none' | 'exact' | 'fuzzy' | 'confirmed'
+type SegmentScreeningGroup = 'status' | 'match' | 'source' | 'workflow'
+interface SegmentScreeningOption {
+  value: string
+  label: string
+  disabled?: boolean
+  hint?: string
+}
 interface FileExportTask {
   task_id: string
   status: FileExportStatus
@@ -254,7 +263,7 @@ function setBottomDrawerHeight(height: number) {
 }
 
 function startBottomDrawerResize(event: PointerEvent) {
-  if (!isPreviewDrawerResizable.value) {
+  if (!isBottomDrawerResizable.value) {
     return
   }
 
@@ -336,7 +345,9 @@ const confirmationActionLoading = ref(false)
 const openRevisionMenu = ref<RevisionMenuKind | null>(null)
 const revisionTraceVisible = ref(getInitialRevisionTraceVisible())
 const revisionActionLoading = ref(false)
+const projectSyncActionLoading = ref(false)
 const segmentSearchOpen = ref(false)
+const segmentScreeningPopoverOpen = ref(false)
 const sourceEditing = ref(false)
 const sourceSearchInputRef = ref<HTMLInputElement | null>(null)
 const guidelinesEditorRef = ref<HTMLTextAreaElement | null>(null)
@@ -345,6 +356,12 @@ const sourceSearchQuery = ref('')
 const targetSearchQuery = ref('')
 const replaceSearchText = ref('')
 const searchFuzzyEnabled = ref(false)
+const segmentScreeningDisplayRange = ref('my_tasks')
+const segmentScreeningNumberInput = ref('1')
+const segmentScreeningStatusFilters = ref<string[]>([])
+const segmentScreeningMatchFilters = ref<string[]>([])
+const segmentScreeningSourceFilters = ref<string[]>([])
+const segmentScreeningWorkflowStepIds = ref<string[]>([])
 const searchLoadingAllSegments = ref(false)
 const segmentSearchReturnTarget = ref<{ sentenceId: string; displayIndex: number | null; page: number } | null>(null)
 const retainedEmptyTargetSentenceIds = ref<Set<string>>(new Set())
@@ -479,6 +496,25 @@ function getCommentWindowQuery(): CommentWindowQuery | null {
     sourceQuery: sourceSearchQuery.value,
     targetQuery: targetSearchQuery.value,
     searchFuzzy: searchFuzzyEnabled.value,
+    statusFilters: [...segmentScreeningStatusFilters.value],
+    matchFilters: [...segmentScreeningMatchFilters.value],
+    sourceFilters: [...segmentScreeningSourceFilters.value],
+    workflowStepIds: [...segmentScreeningWorkflowStepIds.value],
+  }
+}
+
+function getSegmentWindowQuery(page = segmentStore.currentPage, pageSize = segmentStore.pageSize) {
+  return {
+    page,
+    pageSize,
+    scope: segmentDisplayScope.value,
+    sourceQuery: sourceSearchQuery.value,
+    targetQuery: targetSearchQuery.value,
+    searchFuzzy: searchFuzzyEnabled.value,
+    statusFilters: [...segmentScreeningStatusFilters.value],
+    matchFilters: [...segmentScreeningMatchFilters.value],
+    sourceFilters: [...segmentScreeningSourceFilters.value],
+    workflowStepIds: [...segmentScreeningWorkflowStepIds.value],
   }
 }
 
@@ -863,6 +899,66 @@ const activeSegment = computed(() => (
 const activeSegmentCanWrite = computed(() => Boolean(activeSegment.value?.can_write))
 const workflowSteps = computed(() => segmentStore.fileRecord?.workflow_steps || [])
 const workflowStepById = computed(() => new Map(workflowSteps.value.map((step) => [step.id, step])))
+const segmentScreeningDisplayRangeOptions: SegmentScreeningOption[] = [
+  { value: 'my_tasks', label: '我的任务' },
+]
+const segmentScreeningStatusOptions: SegmentScreeningOption[] = [
+  { value: 'empty_target', label: '空译文' },
+  { value: 'confirmed', label: '已确认' },
+  { value: 'unconfirmed', label: '未确认' },
+  { value: 'delivered', label: '已交付', disabled: true, hint: '暂无已交付字段，后续接入。' },
+]
+const segmentScreeningMatchOptions: SegmentScreeningOption[] = [
+  { value: 'context_102', label: '102%匹配', disabled: true, hint: '暂无上下文匹配字段，先占位。' },
+  { value: 'context_101', label: '101%匹配', disabled: true, hint: '暂无上下文匹配字段，先占位。' },
+  { value: 'exact', label: '100%匹配' },
+  { value: 'fuzzy', label: '模糊匹配' },
+  { value: 'none', label: '无匹配' },
+  { value: 'machine_translation', label: '机器翻译' },
+  { value: 'post_edit', label: '自动译后编辑', disabled: true, hint: '暂无自动译后编辑状态字段，先占位。' },
+  { value: 'non_translatable', label: '自动填充的非译元素', disabled: true, hint: '暂无非译元素字段，先占位。' },
+  { value: 'tm_replace', label: '自动替换（记忆库）', disabled: true, hint: '暂无自动替换来源字段，先占位。' },
+]
+const segmentScreeningSourceContentOptions: SegmentScreeningOption[] = [
+  { value: 'repeat_first', label: '重复首句', disabled: true },
+  { value: 'internal_repeat', label: '内部重复', disabled: true },
+  { value: 'cross_file_repeat', label: '跨文件重复', disabled: true },
+  { value: 'not_repeat', label: '不重复', disabled: true },
+  { value: 'term_not_sync', label: '标记为不同步', disabled: true },
+]
+const segmentScreeningModifyOptions: SegmentScreeningOption[] = [
+  { value: 'modified', label: '已修改', disabled: true },
+  { value: 'unmodified', label: '未修改', disabled: true },
+]
+const segmentScreeningFlagOptions: SegmentScreeningOption[] = [
+  { value: 'note', label: '带备注', disabled: true },
+  { value: 'qa', label: '带QA提醒', disabled: true },
+  { value: 'language_error', label: '带语言错误类型', disabled: true },
+  { value: 'limited_repair', label: '带限修修订', disabled: true },
+  { value: 'unadded_language_error', label: '未添加语言错误类型', disabled: true },
+  { value: 'marked', label: '带标记', disabled: true },
+]
+const segmentScreeningWorkflowOptions = computed(() => (
+  workflowSteps.value.map((step) => ({ value: step.id, label: step.name }))
+))
+const segmentScreeningQueryKey = computed(() => JSON.stringify({
+  status: segmentScreeningStatusFilters.value,
+  match: segmentScreeningMatchFilters.value,
+  source: segmentScreeningSourceFilters.value,
+  workflow: segmentScreeningWorkflowStepIds.value,
+}))
+const hasSegmentScreeningFilters = computed(() => (
+  segmentScreeningStatusFilters.value.length > 0
+  || segmentScreeningMatchFilters.value.length > 0
+  || segmentScreeningSourceFilters.value.length > 0
+  || segmentScreeningWorkflowStepIds.value.length > 0
+))
+const segmentScreeningActiveCount = computed(() => (
+  segmentScreeningStatusFilters.value.length
+  + segmentScreeningMatchFilters.value.length
+  + segmentScreeningSourceFilters.value.length
+  + segmentScreeningWorkflowStepIds.value.length
+))
 const workflowTargetSteps = computed(() => {
   const sourceStep = workflowStepById.value.get(workflowTransitionForm.from_step_id)
   if (!sourceStep) return []
@@ -993,7 +1089,11 @@ const hasSegmentSearch = computed(() => (
 ))
 
 const hasSegmentDisplayScope = computed(() => segmentDisplayScope.value !== 'all')
-const hasEditorSegmentFilter = computed(() => hasSegmentSearch.value || hasSegmentDisplayScope.value)
+const hasEditorSegmentFilter = computed(() => (
+  hasSegmentSearch.value
+  || hasSegmentDisplayScope.value
+  || hasSegmentScreeningFilters.value
+))
 
 function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -1239,11 +1339,7 @@ function isPreviewBottomTool(tool: BottomDrawerToolKey) {
   return tool === 'source-preview' || tool === 'target-preview' || tool === 'split-preview'
 }
 
-const isPreviewDrawerResizable = computed(() =>
-  activeBottomTool.value === 'source-preview'
-  || activeBottomTool.value === 'target-preview'
-  || activeBottomTool.value === 'split-preview',
-)
+const isBottomDrawerResizable = computed(() => activeBottomTool.value !== null)
 
 function isBottomToolLoading(tool: BottomDrawerToolKey) {
   if (tool === 'source-preview') {
@@ -1629,6 +1725,10 @@ async function handleResourceImported(payload: { tab: ResourceImportTab }) {
 }
 
 async function closeActiveWorkbenchPanel() {
+  if (segmentScreeningPopoverOpen.value) {
+    segmentScreeningPopoverOpen.value = false
+    return
+  }
   if (segmentSearchOpen.value) {
     await closeSegmentSearchPanel()
     return
@@ -1659,11 +1759,13 @@ async function toggleGuidelinesPanel() {
 function resetSegmentSearch() {
   searchLoadRequestId += 1
   segmentSearchOpen.value = false
+  segmentScreeningPopoverOpen.value = false
   segmentDisplayScope.value = 'all'
   sourceSearchQuery.value = ''
   targetSearchQuery.value = ''
   replaceSearchText.value = ''
   searchFuzzyEnabled.value = false
+  resetSegmentScreeningFilters()
   searchLoadingAllSegments.value = false
   segmentSearchReturnTarget.value = null
   retainedEmptyTargetSentenceIds.value = new Set()
@@ -1693,8 +1795,89 @@ function clearSegmentSearchFilters() {
   sourceSearchQuery.value = ''
   targetSearchQuery.value = ''
   searchFuzzyEnabled.value = false
+  resetSegmentScreeningFilters()
   searchLoadingAllSegments.value = false
   retainedEmptyTargetSentenceIds.value = new Set()
+}
+
+function resetSegmentScreeningFilters() {
+  segmentScreeningDisplayRange.value = 'my_tasks'
+  segmentScreeningStatusFilters.value = []
+  segmentScreeningMatchFilters.value = []
+  segmentScreeningSourceFilters.value = []
+  segmentScreeningWorkflowStepIds.value = []
+}
+
+function getSegmentScreeningGroupValues(group: SegmentScreeningGroup) {
+  if (group === 'status') {
+    return segmentScreeningStatusFilters.value
+  }
+  if (group === 'match') {
+    return segmentScreeningMatchFilters.value
+  }
+  if (group === 'source') {
+    return segmentScreeningSourceFilters.value
+  }
+  return segmentScreeningWorkflowStepIds.value
+}
+
+function setSegmentScreeningGroupValues(group: SegmentScreeningGroup, values: string[]) {
+  const nextValues = Array.from(new Set(values.filter(Boolean)))
+  if (group === 'status') {
+    segmentScreeningStatusFilters.value = nextValues
+  } else if (group === 'match') {
+    segmentScreeningMatchFilters.value = nextValues
+  } else if (group === 'source') {
+    segmentScreeningSourceFilters.value = nextValues
+  } else {
+    segmentScreeningWorkflowStepIds.value = nextValues
+  }
+}
+
+function isSegmentScreeningChecked(group: SegmentScreeningGroup, value: string) {
+  return getSegmentScreeningGroupValues(group).includes(value)
+}
+
+function toggleSegmentScreeningFilter(group: SegmentScreeningGroup, value: string, checked: boolean) {
+  const currentValues = getSegmentScreeningGroupValues(group)
+  if (checked) {
+    setSegmentScreeningGroupValues(group, [...currentValues, value])
+    return
+  }
+  setSegmentScreeningGroupValues(group, currentValues.filter((item) => item !== value))
+}
+
+function clearSegmentScreeningFilters() {
+  searchLoadRequestId += 1
+  resetSegmentScreeningFilters()
+  searchLoadingAllSegments.value = false
+}
+
+function toggleSegmentScreeningPopover() {
+  const nextOpen = !segmentScreeningPopoverOpen.value
+  segmentScreeningPopoverOpen.value = nextOpen
+  if (nextOpen) {
+    segmentSearchOpen.value = false
+  }
+}
+
+async function goToSegmentScreeningNumber() {
+  const targetNumber = Number(segmentScreeningNumberInput.value)
+  if (!Number.isInteger(targetNumber) || targetNumber <= 0) {
+    toast.warn('请输入有效的句段编号。')
+    return
+  }
+  if (segmentStore.matchedSegmentCount > 0 && targetNumber > segmentStore.matchedSegmentCount) {
+    toast.warn(`当前筛查范围只有 ${segmentStore.matchedSegmentCount} 个句段。`)
+    return
+  }
+  const targetPage = Math.floor((targetNumber - 1) / segmentStore.pageSize) + 1
+  const pageIndex = (targetNumber - 1) % segmentStore.pageSize
+  await refreshSegmentPage(targetPage, segmentStore.pageSize)
+  const index = Math.min(pageIndex, Math.max(editorSegments.value.length - 1, 0))
+  if (index >= 0) {
+    await focusEditorSegmentAtIndex(index)
+  }
 }
 
 async function focusEditorSegmentBySentenceId(sentenceId: string) {
@@ -1844,6 +2027,41 @@ async function toggleProjectSegmentSync(sentenceId: string, disabled: boolean) {
   await segmentStore.setProjectSyncDisabled(sentenceId, disabled)
 }
 
+async function handleDisableProjectSyncForFile() {
+  if (!segmentStore.fileRecord || projectSyncActionLoading.value) {
+    return
+  }
+
+  const accepted = await confirm({
+    title: '关闭项目同步',
+    message: '将关闭当前文件所有可写句段的项目同步，并清除已由项目同步填充的译文。人工、AI 和记忆库译文不会被清除。',
+    confirmText: '关闭并清除',
+    cancelText: t('common.actions.cancel'),
+    danger: true,
+  })
+  if (!accepted) {
+    return
+  }
+
+  pageError.value = ''
+  projectSyncActionLoading.value = true
+  try {
+    const result = await segmentStore.disableProjectSyncForCurrentFile()
+    if (result.updated_count > 0) {
+      toast.success({
+        title: '项目同步已关闭',
+        message: `已处理 ${result.updated_count} 个句段，关闭 ${result.disabled_count} 个同步开关，清除 ${result.cleared_count} 条项目同步译文。`,
+      })
+    } else {
+      toast.info('当前文件没有需要关闭的项目同步句段。')
+    }
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '关闭项目同步失败。')
+  } finally {
+    projectSyncActionLoading.value = false
+  }
+}
+
 async function toggleSegmentSearchPanel() {
   if (segmentSearchOpen.value) {
     await closeSegmentSearchPanel()
@@ -1963,6 +2181,10 @@ async function replaceAllSearchMatches() {
         replace_text: replaceSearchText.value,
         search_fuzzy: searchFuzzyEnabled.value,
         replace_all: true,
+        status_filters: [...segmentScreeningStatusFilters.value],
+        match_filters: [...segmentScreeningMatchFilters.value],
+        source_filters: [...segmentScreeningSourceFilters.value],
+        workflow_step_ids: [...segmentScreeningWorkflowStepIds.value],
       },
     )
     if (data.updated_count === 0) {
@@ -3149,12 +3371,10 @@ async function loadTask() {
 
   try {
     await segmentStore.loadTask(props.id, {
-      page: Number(route.query.page || 1),
-      pageSize: Number(route.query.pageSize || segmentStore.pageSize || 100),
-      scope: segmentDisplayScope.value,
-      sourceQuery: sourceSearchQuery.value,
-      targetQuery: targetSearchQuery.value,
-      searchFuzzy: searchFuzzyEnabled.value,
+      ...getSegmentWindowQuery(
+        Number(route.query.page || 1),
+        Number(route.query.pageSize || segmentStore.pageSize || 100),
+      ),
     })
     await replaceSegmentPageQueryIfNeeded()
     if (segmentStore.fileRecord?.is_edit_locked) {
@@ -3219,12 +3439,7 @@ async function refreshSegmentPage(page = segmentStore.currentPage, size = segmen
       return
     }
     await segmentStore.loadSegmentPage({
-      page,
-      pageSize: size,
-      scope: segmentDisplayScope.value,
-      sourceQuery: sourceSearchQuery.value,
-      targetQuery: targetSearchQuery.value,
-      searchFuzzy: searchFuzzyEnabled.value,
+      ...getSegmentWindowQuery(page, size),
     })
     if (revisionTraceVisible.value) {
       segmentStore.startRevisionTracking()
@@ -3614,6 +3829,13 @@ function handleClickOutside(event: MouseEvent) {
   ) {
     openConfirmMenu.value = false
   }
+  if (
+    segmentScreeningPopoverOpen.value
+    && !target.closest('.segment-screening-popover')
+    && !target.closest('.segment-editor-toolbar__screening')
+  ) {
+    segmentScreeningPopoverOpen.value = false
+  }
   // 关闭格式化相关的下拉菜单
   if (!target.closest('.case-menu') && !target.closest('.clear-format-menu') && !target.closest('.special-char-menu')) {
     closeAllMenus()
@@ -3786,7 +4008,7 @@ watch(saveToTMScope, () => {
   }
 })
 
-watch([segmentDisplayScope, sourceSearchQuery, targetSearchQuery, searchFuzzyEnabled], async () => {
+watch([segmentDisplayScope, sourceSearchQuery, targetSearchQuery, searchFuzzyEnabled, segmentScreeningQueryKey], async () => {
   if (suppressSegmentFilterWatch) {
     return
   }
@@ -3887,6 +4109,18 @@ onBeforeRouteLeave(async () => {
           <button class="workbench-ribbon__top-action" type="button" @click="void openSaveToTMDialog()">
             <FileCheck :size="15" />
             <span>{{ t('workbench.saveToTM') }}</span>
+          </button>
+          <button
+            class="workbench-ribbon__top-action workbench-ribbon__top-action--sync"
+            type="button"
+            :disabled="projectSyncActionLoading || segmentStore.saving || segmentStore.totalSegmentCount === 0"
+            title="关闭当前文件项目同步并清除项目同步译文"
+            aria-label="关闭当前文件项目同步并清除项目同步译文"
+            @click="void handleDisableProjectSyncForFile()"
+          >
+            <Loader2 v-if="projectSyncActionLoading" class="lucide-spin" :size="15" />
+            <Link2Off v-else :size="15" />
+            <span>{{ projectSyncActionLoading ? '正在关闭' : '关闭同步' }}</span>
           </button>
           <div class="export-dropdown">
             <button
@@ -4574,6 +4808,19 @@ onBeforeRouteLeave(async () => {
           </button>
 
           <button
+            class="button workbench-action workbench-action--sync"
+            type="button"
+            :disabled="projectSyncActionLoading || segmentStore.saving || segmentStore.totalSegmentCount === 0"
+            title="关闭当前文件项目同步并清除项目同步译文"
+            aria-label="关闭当前文件项目同步并清除项目同步译文"
+            @click="void handleDisableProjectSyncForFile()"
+          >
+            <Loader2 v-if="projectSyncActionLoading" class="lucide-spin" :size="14" />
+            <Link2Off v-else :size="14" />
+            {{ projectSyncActionLoading ? '正在关闭' : '关闭同步' }}
+          </button>
+
+          <button
             class="button workbench-action workbench-action--issue"
             type="button"
             :disabled="!canOpenIssueDialog"
@@ -4796,8 +5043,214 @@ onBeforeRouteLeave(async () => {
                 </option>
               </select>
             </label>
+            <button
+              class="button segment-editor-toolbar__screening"
+              :class="{ 'is-active': segmentScreeningPopoverOpen || hasSegmentScreeningFilters }"
+              type="button"
+              title="句段筛查"
+              aria-label="句段筛查"
+              :aria-pressed="segmentScreeningPopoverOpen"
+              @click.stop="toggleSegmentScreeningPopover"
+            >
+              <Filter :size="16" />
+              <span v-if="segmentScreeningActiveCount > 0" class="segment-editor-toolbar__screening-count">
+                {{ segmentScreeningActiveCount }}
+              </span>
+            </button>
           </div>
         </div>
+
+        <Transition name="segment-screening-popover">
+          <section
+            v-if="segmentScreeningPopoverOpen"
+            class="segment-screening-panel segment-screening-popover"
+            @keydown.esc.stop="segmentScreeningPopoverOpen = false"
+          >
+            <div class="segment-screening-panel__header">
+              <div class="segment-screening-panel__title">
+                <span class="section-title section-title--tight">句段筛查</span>
+                <span v-if="segmentScreeningActiveCount > 0" class="segment-screening-panel__count">
+                  {{ segmentScreeningActiveCount }}
+                </span>
+              </div>
+              <div class="segment-screening-panel__header-actions">
+                <button
+                  class="segment-screening-panel__clear"
+                  type="button"
+                  :disabled="!hasSegmentScreeningFilters"
+                  @click="clearSegmentScreeningFilters"
+                >
+                  清空
+                </button>
+                <button
+                  class="segment-screening-panel__close"
+                  type="button"
+                  title="关闭"
+                  aria-label="关闭句段筛查"
+                  @click="segmentScreeningPopoverOpen = false"
+                >
+                  <X :size="14" />
+                </button>
+              </div>
+            </div>
+
+            <div class="segment-screening-panel__range">
+              <label class="segment-screening-panel__field">
+                <span>显示范围：</span>
+                <select v-model="segmentScreeningDisplayRange" class="field__control">
+                  <option
+                    v-for="option in segmentScreeningDisplayRangeOptions"
+                    :key="option.value"
+                    :value="option.value"
+                  >
+                    {{ option.label }}
+                  </option>
+                </select>
+              </label>
+
+              <form class="segment-screening-panel__goto" @submit.prevent="void goToSegmentScreeningNumber()">
+                <label class="segment-screening-panel__field">
+                  <span>句段编号：</span>
+                  <input
+                    v-model="segmentScreeningNumberInput"
+                    class="field__control"
+                    type="number"
+                    min="1"
+                    inputmode="numeric"
+                  />
+                </label>
+                <button class="button" type="submit" :disabled="segmentStore.loadingMoreSegments">
+                  前往
+                </button>
+              </form>
+            </div>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段状态：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningStatusOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check"
+                  :class="{ 'is-disabled': option.disabled }"
+                  :title="option.hint || ''"
+                >
+                  <input
+                    type="checkbox"
+                    :disabled="option.disabled"
+                    :checked="isSegmentScreeningChecked('status', option.value)"
+                    @change="toggleSegmentScreeningFilter('status', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段流程：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningWorkflowOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="isSegmentScreeningChecked('workflow', option.value)"
+                    @change="toggleSegmentScreeningFilter('workflow', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span>{{ option.label }}</span>
+                </label>
+                <label v-if="segmentScreeningWorkflowOptions.length === 0" class="segment-screening-panel__check is-disabled">
+                  <input type="checkbox" disabled />
+                  <span>暂无流程阶段</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段匹配类型：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningMatchOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check"
+                  :class="{ 'is-disabled': option.disabled }"
+                  :title="option.hint || ''"
+                >
+                  <input
+                    type="checkbox"
+                    :disabled="option.disabled"
+                    :checked="isSegmentScreeningChecked('match', option.value)"
+                    @change="toggleSegmentScreeningFilter('match', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段修改状态：</span>
+                <CircleHelp :size="12" />
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningModifyOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check is-disabled"
+                >
+                  <input type="checkbox" disabled />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>原文内容：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningSourceContentOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check is-disabled"
+                >
+                  <input type="checkbox" disabled />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段标识：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningFlagOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check is-disabled"
+                >
+                  <input type="checkbox" disabled />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+          </section>
+        </Transition>
 
         <Transition name="workbench-panel-pop">
           <div
@@ -5063,21 +5516,21 @@ onBeforeRouteLeave(async () => {
                 {
                   'is-wide': activeBottomTool === 'split-preview' || activeBottomTool === 'qa-result',
                   'is-loading': bottomDrawerPreviewBusy,
-                  'is-resizable': isPreviewDrawerResizable,
+                  'is-resizable': isBottomDrawerResizable,
                   'is-resizing': isBottomDrawerResizing,
                 },
               ]"
-              :style="isPreviewDrawerResizable ? bottomDrawerHeightStyle : undefined"
+              :style="isBottomDrawerResizable ? bottomDrawerHeightStyle : undefined"
               :aria-busy="bottomDrawerPreviewBusy"
               @keydown.esc.stop="closeBottomDrawer"
             >
               <div
-                v-if="isPreviewDrawerResizable"
+                v-if="isBottomDrawerResizable"
                 class="workbench-bottom-drawer__resize-handle"
                 role="separator"
                 tabindex="0"
-                title="拖动调整预览高度"
-                aria-label="拖动调整预览高度"
+                title="拖动调整窗口高度"
+                aria-label="拖动调整窗口高度"
                 aria-orientation="horizontal"
                 :aria-valuemin="BOTTOM_DRAWER_MIN_HEIGHT"
                 :aria-valuemax="bottomDrawerMaxHeight"
@@ -5354,8 +5807,186 @@ onBeforeRouteLeave(async () => {
       >
         <div class="workbench-sidecar__panel">
         <Transition name="preview-drawer" mode="out-in">
+          <section
+            v-if="false"
+            key="segment-screening"
+            class="segment-screening-panel"
+          >
+            <div class="segment-screening-panel__header">
+              <div class="segment-screening-panel__title">
+                <span class="section-title section-title--tight">句段筛查</span>
+                <span v-if="segmentScreeningActiveCount > 0" class="segment-screening-panel__count">
+                  {{ segmentScreeningActiveCount }}
+                </span>
+              </div>
+              <button
+                class="segment-screening-panel__clear"
+                type="button"
+                :disabled="!hasSegmentScreeningFilters"
+                @click="clearSegmentScreeningFilters"
+              >
+                清空
+              </button>
+            </div>
+
+            <div class="segment-screening-panel__range">
+              <label class="segment-screening-panel__field">
+                <span>显示范围：</span>
+                <select v-model="segmentScreeningDisplayRange" class="field__control">
+                  <option
+                    v-for="option in segmentScreeningDisplayRangeOptions"
+                    :key="option.value"
+                    :value="option.value"
+                  >
+                    {{ option.label }}
+                  </option>
+                </select>
+              </label>
+
+              <form class="segment-screening-panel__goto" @submit.prevent="void goToSegmentScreeningNumber()">
+                <label class="segment-screening-panel__field">
+                  <span>句段编号：</span>
+                  <input
+                    v-model="segmentScreeningNumberInput"
+                    class="field__control"
+                    type="number"
+                    min="1"
+                    inputmode="numeric"
+                  />
+                </label>
+                <button class="button" type="submit" :disabled="segmentStore.loadingMoreSegments">
+                  前往
+                </button>
+              </form>
+            </div>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段状态：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningStatusOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check"
+                  :class="{ 'is-disabled': option.disabled }"
+                  :title="option.hint || ''"
+                >
+                  <input
+                    type="checkbox"
+                    :disabled="option.disabled"
+                    :checked="isSegmentScreeningChecked('status', option.value)"
+                    @change="toggleSegmentScreeningFilter('status', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段流程：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningWorkflowOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="isSegmentScreeningChecked('workflow', option.value)"
+                    @change="toggleSegmentScreeningFilter('workflow', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span>{{ option.label }}</span>
+                </label>
+                <label v-if="segmentScreeningWorkflowOptions.length === 0" class="segment-screening-panel__check is-disabled">
+                  <input type="checkbox" disabled />
+                  <span>暂无流程阶段</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段匹配类型：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningMatchOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check"
+                  :class="{ 'is-disabled': option.disabled }"
+                  :title="option.hint || ''"
+                >
+                  <input
+                    type="checkbox"
+                    :disabled="option.disabled"
+                    :checked="isSegmentScreeningChecked('match', option.value)"
+                    @change="toggleSegmentScreeningFilter('match', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段修改状态：</span>
+                <CircleHelp :size="12" />
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningModifyOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check is-disabled"
+                >
+                  <input type="checkbox" disabled />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>原文内容：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningSourceContentOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check is-disabled"
+                >
+                  <input type="checkbox" disabled />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段标识：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningFlagOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check is-disabled"
+                >
+                  <input type="checkbox" disabled />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+          </section>
           <WorkbenchMatchPanel
-            v-if="activeSideTool === 'match-info'"
+            v-else-if="activeSideTool === 'match-info'"
             key="match-info"
             :segment="activeSegment"
             :collection-id="segmentStore.fileRecord?.collection_id || null"
@@ -5993,6 +6624,10 @@ onBeforeRouteLeave(async () => {
 .workbench-ribbon__top-action svg {
   flex: 0 0 auto;
   color: #74b8e9;
+}
+
+.workbench-ribbon__top-action--sync svg {
+  color: #b85a4f;
 }
 
 .workbench-ribbon__top-action span {
@@ -6916,6 +7551,14 @@ onBeforeRouteLeave(async () => {
   --action-hover-shadow: rgba(148, 103, 20, 0.18);
 }
 
+.workbench-action--sync {
+  --action-bg: linear-gradient(180deg, #fff1ef, #f4d7d3);
+  --action-border: #dfaaa3;
+  --action-color: #73342f;
+  --action-shadow: rgba(155, 68, 60, 0.1);
+  --action-hover-shadow: rgba(155, 68, 60, 0.18);
+}
+
 .workbench-action--stop {
   --action-bg: linear-gradient(180deg, #d75f63, #b83c41);
   --action-border: #ad363a;
@@ -7228,6 +7871,10 @@ onBeforeRouteLeave(async () => {
   overflow-anchor: none;
 }
 
+.panel--editor {
+  position: relative;
+}
+
 .segment-editor-shell {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -7355,6 +8002,223 @@ onBeforeRouteLeave(async () => {
 
 .segment-editor-side-tool--search svg {
   color: #0d7bdc;
+}
+
+.segment-editor-side-tool--filter svg {
+  color: #7a55b8;
+}
+
+.segment-screening-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  height: 100%;
+  padding: 12px 14px 14px;
+  overflow-y: auto;
+  background: #fbfcfd;
+  color: #233943;
+}
+
+.segment-screening-popover {
+  position: absolute;
+  top: 46px;
+  right: 12px;
+  z-index: 1800;
+  width: min(378px, calc(100vw - 32px));
+  max-height: min(640px, calc(100vh - 160px));
+  height: auto;
+  border: 1px solid #d7e1e7;
+  border-radius: 8px;
+  box-shadow: 0 18px 42px rgba(20, 45, 55, 0.18);
+}
+
+.segment-screening-popover-enter-active,
+.segment-screening-popover-leave-active {
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+
+.segment-screening-popover-enter-from,
+.segment-screening-popover-leave-to {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+
+.segment-screening-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 32px;
+}
+
+.segment-screening-panel__title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.segment-screening-panel__count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #e6f2ef;
+  color: #0b6658;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.segment-screening-panel__header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.segment-screening-panel__clear {
+  border: 0;
+  background: transparent;
+  color: #0070c9;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.segment-screening-panel__clear:disabled {
+  color: #98a6ad;
+  cursor: not-allowed;
+}
+
+.segment-screening-panel__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid #d2dee4;
+  border-radius: 4px;
+  background: #fff;
+  color: #4a626d;
+  cursor: pointer;
+}
+
+.segment-screening-panel__close:hover {
+  border-color: #b8cbd4;
+  background: #f4f8fa;
+  color: #1f333c;
+}
+
+.segment-screening-panel__range {
+  display: grid;
+  gap: 6px;
+}
+
+.segment-screening-panel__field,
+.segment-screening-panel__goto {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.segment-screening-panel__field {
+  flex: 1 1 auto;
+}
+
+.segment-screening-panel__field > span {
+  flex: 0 0 66px;
+  color: #445a64;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.segment-screening-panel__field .field__control {
+  min-width: 0;
+  height: 29px;
+  padding: 4px 8px;
+  border-color: #c7d3da;
+  border-radius: 4px;
+  background-color: #fff;
+  font-size: 13px;
+  box-shadow: none;
+}
+
+.segment-screening-panel__goto .button {
+  flex: 0 0 auto;
+  min-height: 29px;
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+  box-shadow: none;
+}
+
+.segment-screening-panel__group {
+  display: grid;
+  gap: 5px;
+  padding-top: 3px;
+  border-top: 1px solid #eef2f4;
+}
+
+.segment-screening-panel__group-title {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  min-height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #384f59;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.segment-screening-panel__group-title span {
+  flex: 1 1 auto;
+}
+
+.segment-screening-panel__checks {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 12px;
+}
+
+.segment-screening-panel__check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  min-height: 19px;
+  color: #2e4650;
+  font-size: 13px;
+  line-height: 1.2;
+}
+
+.segment-screening-panel__check input {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: #0d7a68;
+}
+
+.segment-screening-panel__check span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.segment-screening-panel__check.is-disabled {
+  color: #8a98a1;
+}
+
+.segment-screening-panel__check.is-disabled input {
+  accent-color: #c7d0d5;
 }
 
 .resource-search-panel {
@@ -8146,6 +9010,46 @@ onBeforeRouteLeave(async () => {
   box-shadow: none;
 }
 
+.segment-editor-toolbar__screening {
+  position: relative;
+  flex: 0 0 34px;
+  width: 34px;
+  min-width: 34px;
+  min-height: 34px;
+  padding: 0;
+  justify-content: center;
+  gap: 0;
+  border-color: #cbd9df;
+  border-radius: 4px;
+  background: #fff;
+  color: #2d4651;
+  box-shadow: none;
+}
+
+.segment-editor-toolbar__screening:hover,
+.segment-editor-toolbar__screening.is-active {
+  border-color: #8db9c4;
+  background: #edf8f6;
+  color: #0b6658;
+}
+
+.segment-editor-toolbar__screening-count {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: rgba(13, 122, 104, 0.14);
+  color: #0b6658;
+  font-size: 11px;
+  line-height: 1;
+}
+
 .workbench-search-empty {
   min-height: 0;
   height: 100%;
@@ -8421,6 +9325,10 @@ onBeforeRouteLeave(async () => {
     height: 420px;
     min-height: 0;
   }
+
+  .segment-screening-panel__checks {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 @media (max-width: 980px) {
@@ -8483,6 +9391,10 @@ onBeforeRouteLeave(async () => {
   .segment-editor-toolbar__filter,
   .segment-editor-toolbar__search {
     flex: 1 1 100%;
+  }
+
+  .segment-editor-toolbar__screening {
+    flex: 0 0 34px;
   }
 
   .segment-editor-toolbar__filter {

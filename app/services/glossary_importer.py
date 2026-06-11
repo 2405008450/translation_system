@@ -43,6 +43,7 @@ def import_glossary_from_xlsx_upload(
     glossary_base_id: UUID,
     creator_id: UUID | None = None,
     batch_size: int = 5000,
+    skip_header: bool = False,
 ) -> GlossaryImportSummary:
     workbook = load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)
     return _import_workbook(
@@ -54,6 +55,7 @@ def import_glossary_from_xlsx_upload(
         source_language=source_language,
         target_language=target_language,
         creator_id=creator_id,
+        skip_header=skip_header,
     )
 
 
@@ -66,6 +68,7 @@ def import_glossary_from_xlsx_path(
     glossary_base_id: UUID,
     creator_id: UUID | None = None,
     batch_size: int = 5000,
+    skip_header: bool = False,
 ) -> GlossaryImportSummary:
     workbook = load_workbook(Path(xlsx_path), read_only=True, data_only=True)
     return _import_workbook(
@@ -77,6 +80,7 @@ def import_glossary_from_xlsx_path(
         source_language=source_language,
         target_language=target_language,
         creator_id=creator_id,
+        skip_header=skip_header,
     )
 
 
@@ -89,6 +93,7 @@ def _import_workbook(
     source_language: str,
     target_language: str,
     creator_id: UUID | None = None,
+    skip_header: bool = False,
 ) -> GlossaryImportSummary:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
@@ -107,6 +112,9 @@ def _import_workbook(
             detected = _detect_header_indexes(row)
             if detected is not None:
                 column_indexes = detected
+                skipped_header_rows += 1
+                continue
+            if skip_header:
                 skipped_header_rows += 1
                 continue
 

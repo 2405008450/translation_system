@@ -139,6 +139,7 @@ def import_tm_from_upload(
     creator_id: UUID | None = None,
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
 ) -> TMImportSummary:
     extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
     if extension in CSV_EXTENSIONS:
@@ -153,6 +154,7 @@ def import_tm_from_upload(
             creator_id=creator_id,
             duplicate_policy=duplicate_policy,
             skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+            skip_header=skip_header,
         )
     if extension in TMX_EXTENSIONS:
         return import_tm_from_tmx_upload(
@@ -178,6 +180,7 @@ def import_tm_from_upload(
         creator_id=creator_id,
         duplicate_policy=duplicate_policy,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        skip_header=skip_header,
     )
 
 
@@ -192,6 +195,7 @@ def import_tm_from_xlsx_upload(
     creator_id: UUID | None = None,
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
 ) -> TMImportSummary:
     extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
     if extension in XLS_EXTENSIONS:
@@ -205,6 +209,7 @@ def import_tm_from_xlsx_upload(
             creator_id=creator_id,
             duplicate_policy=duplicate_policy,
             skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+            skip_header=skip_header,
             source_language=source_language,
             target_language=target_language,
         )
@@ -219,6 +224,7 @@ def import_tm_from_xlsx_upload(
         creator_id=creator_id,
         duplicate_policy=duplicate_policy,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        skip_header=skip_header,
         source_language=source_language,
         target_language=target_language,
     )
@@ -234,6 +240,7 @@ def import_tm_from_xlsx_path(
     creator_id: UUID | None = None,
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
 ) -> TMImportSummary:
     workbook = load_workbook(Path(xlsx_path), read_only=True, data_only=True)
     return _import_workbook(
@@ -245,6 +252,7 @@ def import_tm_from_xlsx_path(
         creator_id=creator_id,
         duplicate_policy=duplicate_policy,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        skip_header=skip_header,
         source_language=source_language,
         target_language=target_language,
     )
@@ -261,6 +269,7 @@ def import_tm_from_csv_upload(
     creator_id: UUID | None = None,
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
 ) -> TMImportSummary:
     rows = _iter_csv_rows(raw_bytes)
     return _import_text_rows(
@@ -272,6 +281,7 @@ def import_tm_from_csv_upload(
         creator_id=creator_id,
         duplicate_policy=duplicate_policy,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        skip_header=skip_header,
         source_language=source_language,
         target_language=target_language,
     )
@@ -317,6 +327,7 @@ def preview_tm_from_upload(
     collection_id: UUID | None,
     duplicate_policy: DuplicatePolicy = "overwrite",
     preview_limit: int = 100,
+    skip_header: bool = False,
 ) -> TMImportPreview:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
@@ -342,12 +353,12 @@ def preview_tm_from_upload(
         source_text = normalize_text(_cell_to_text(row, 0))
         target_text = normalize_text(_cell_to_text(row, 1))
 
-        if row_index == 1 and _looks_like_header(source_text, target_text):
+        if _should_skip_header_row(filename, row_index, source_text, target_text, skip_header):
             skipped_header_rows += 1
             _append_preview_row(
                 preview_rows,
                 preview_limit,
-                TMImportPreviewRow(row_index, source_text, target_text, "header", "识别为表头，导入时会跳过。"),
+                TMImportPreviewRow(row_index, source_text, target_text, "header", "表头行，导入时会跳过。"),
             )
             continue
 
@@ -618,6 +629,7 @@ def _import_workbook(
     creator_id: UUID | None = None,
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
 ) -> TMImportSummary:
     worksheet = workbook.active
     try:
@@ -630,6 +642,7 @@ def _import_workbook(
             creator_id=creator_id,
             duplicate_policy=duplicate_policy,
             skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+            skip_header=skip_header,
             source_language=source_language,
             target_language=target_language,
         )
@@ -648,6 +661,7 @@ def _import_text_rows(
     creator_id: UUID | None = None,
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
 ) -> TMImportSummary:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
@@ -665,7 +679,7 @@ def _import_text_rows(
         source_text = normalize_text(_cell_to_text(row, 0))
         target_text = normalize_text(_cell_to_text(row, 1))
 
-        if row_index == 1 and _looks_like_header(source_text, target_text):
+        if _should_skip_header_row(filename, row_index, source_text, target_text, skip_header):
             skipped_header_rows += 1
             continue
 
@@ -850,6 +864,23 @@ def _looks_like_header(source_text: str, target_text: str) -> bool:
 
     header_key = (source_text.lower(), target_text.lower())
     return header_key in HEADER_ALIASES
+
+
+def _is_table_import(filename: str) -> bool:
+    extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
+    return extension in CSV_EXTENSIONS or extension in XLS_EXTENSIONS or extension in XLSX_EXTENSIONS
+
+
+def _should_skip_header_row(
+    filename: str,
+    row_index: int,
+    source_text: str,
+    target_text: str,
+    skip_header: bool,
+) -> bool:
+    if row_index != 1:
+        return False
+    return _looks_like_header(source_text, target_text) or (skip_header and _is_table_import(filename))
 
 
 # ============================================================================

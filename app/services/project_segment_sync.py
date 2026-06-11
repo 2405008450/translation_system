@@ -52,6 +52,21 @@ class ProjectSegmentSyncSummary:
         }
 
 
+@dataclass
+class ProjectSyncDisableSummary:
+    updated_count: int = 0
+    disabled_count: int = 0
+    cleared_count: int = 0
+    updated_segments: list[Segment] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "updated_count": self.updated_count,
+            "disabled_count": self.disabled_count,
+            "cleared_count": self.cleared_count,
+        }
+
+
 @dataclass(frozen=True)
 class _SyncCandidate:
     segment: Segment
@@ -62,6 +77,32 @@ class _SyncCandidate:
 
 def empty_project_segment_sync_summary() -> ProjectSegmentSyncSummary:
     return ProjectSegmentSyncSummary()
+
+
+def disable_project_sync_for_segments(segments: list[Segment]) -> ProjectSyncDisableSummary:
+    """关闭句段项目同步；对已由项目同步填充的译文同步清空。"""
+    summary = ProjectSyncDisableSummary()
+
+    for segment in segments:
+        changed = False
+
+        if not segment.project_sync_disabled:
+            segment.project_sync_disabled = True
+            summary.disabled_count += 1
+            changed = True
+
+        if (segment.source or "") == PROJECT_SYNC_SOURCE:
+            if normalize_text(segment.target_text):
+                summary.cleared_count += 1
+            if _clear_project_synced_segment_fields(segment):
+                changed = True
+
+        if changed:
+            segment.version = int(segment.version or 1) + 1
+            summary.updated_count += 1
+            summary.updated_segments.append(segment)
+
+    return summary
 
 
 def sync_project_repeated_segments_from_file(
@@ -288,6 +329,29 @@ def _build_candidate(segment: Segment) -> _SyncCandidate | None:
         target_text=target_text,
         rank=(confirmed_priority, source_priority, updated_at),
     )
+
+
+def _clear_project_synced_segment_fields(segment: Segment) -> bool:
+    changed = False
+    fields = {
+        "target_text": "",
+        "target_html": None,
+        "status": "none",
+        "source": "none",
+        "score": 0.0,
+        "matched_source_text": None,
+        "matched_collection_name": None,
+        "matched_creator_name": None,
+        "matched_created_at": None,
+        "matched_updated_at": None,
+        "llm_provider": None,
+        "llm_model": None,
+    }
+    for field_name, next_value in fields.items():
+        if getattr(segment, field_name) != next_value:
+            setattr(segment, field_name, next_value)
+            changed = True
+    return changed
 
 
 def _resolve_candidate(candidates: list[_SyncCandidate]) -> _SyncCandidate | None:

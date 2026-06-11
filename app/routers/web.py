@@ -40,9 +40,8 @@ from app.services.sentence_splitter import split_sentences
 from app.services.tm_importer import (
     SDLTM_EXTENSIONS,
     TM_IMPORT_EXTENSIONS,
-    XLSX_EXTENSIONS,
     import_tm_from_sdltm_upload,
-    import_tm_from_xlsx_upload,
+    import_tm_from_upload,
 )
 
 
@@ -605,7 +604,7 @@ async def import_xlsx(
 ) -> HTMLResponse:
     extension = f".{(xlsx_file.filename or '').split('.')[-1].lower()}" if xlsx_file.filename else ""
     if extension not in TM_IMPORT_EXTENSIONS:
-        return _render_index(request, error_message="仅支持上传 .xlsx 或 .sdltm 文件。")
+        return _render_index(request, error_message="仅支持上传 .tmx、.sdltm、.xls、.xlsx 或 .csv 文件。")
 
     raw_bytes = await xlsx_file.read()
     if not raw_bytes:
@@ -621,7 +620,7 @@ async def import_xlsx(
                 target_language="en-US",
             )
         else:
-            import_summary = import_tm_from_xlsx_upload(
+            import_summary = import_tm_from_upload(
                 db=db,
                 raw_bytes=raw_bytes,
                 filename=xlsx_file.filename or "uploaded.xlsx",

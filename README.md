@@ -6,8 +6,8 @@
 
 - **项目与任务管理**：创建翻译项目，维护源语言、目标语言、截止时间、访问级别、创建人、处理进度；项目详情页上传源文档，任务页进入工作台。
 - **多格式任务解析**：支持 DOCX 以及文本、本地化、网页、字幕、技术写作、双语交换和部分工程/设计文件的句段抽取与原格式导出。
-- **翻译记忆库（TM）**：按记忆库分组管理双语句对，支持 XLSX/CSV 导入、条目维护、XLSX 导出、精确匹配、trigram 模糊匹配和 pgvector 语义候选。
-- **术语库**：独立术语库与术语条目管理，支持 XLSX 导入导出，并在工作台按当前语言对和句段内容推荐术语。
+- **翻译记忆库（TM）**：按记忆库分组管理双语句对，支持 TMX/SDLTM/XLS/XLSX/CSV 导入、条目维护、XLSX/TMX 导出、精确匹配、trigram 模糊匹配和 pgvector 语义候选。
+- **术语库**：独立术语库与术语条目管理，支持 TMX/XLS/XLSX/CSV 导入与 XLSX/TMX 导出，并在工作台按当前语言对和句段内容推荐术语。
 - **翻译工作台**：句段分页/懒加载、原文/译文/分屏预览、自动保存、TM 候选、术语面板、修改快照、批注与嵌套回复。
 - **AI 修正**：对 exact / fuzzy / none 不同范围触发 LLM 修正，支持 DeepSeek、OpenRouter 和自动选择，SSE 流式返回进度并写回句段。
 - **用户与权限**：首次初始化管理员、JWT 登录、管理员创建用户、用户昵称、基础角色区分。
@@ -67,8 +67,8 @@ app/                                  # FastAPI 后端
     file_record_service.py            # 项目/任务/句段持久化
     matcher.py                        # TM 精确、模糊、语义匹配
     tm_vector.py                      # pgvector embedding 同步
-    tm_importer.py                    # TM XLSX 导入
-    term_importer.py                  # 术语 XLSX 导入
+    tm_importer.py                    # TM 多格式导入
+    term_importer.py                  # 术语多格式导入
     revision_service.py               # 句段修改历史
     comment_service.py                # 批注与回复
     llm_service.py                    # LLM 调用、fallback、并发与重试
@@ -274,7 +274,7 @@ python scripts/import_tm.py `
   --collection-id <memory-base-uuid>
 ```
 
-### TM XLSX 导入
+### TM 表格导入
 
 Excel 约定：第一列为源文，第二列为译文。
 
@@ -288,7 +288,7 @@ python scripts/import_tm_xlsx.py `
   --batch-size 5000
 ```
 
-### 术语 XLSX 导入
+### 术语表格导入
 
 Excel 约定：第一列为源术语，第二列为目标术语。
 
@@ -370,13 +370,13 @@ Authorization: Bearer <token>
 | TM  | GET/PUT/DELETE | `/api/translation-memory/collections/{id}`                   | 记忆库详情 / 更新 / 删除   |
 | TM  | GET/POST       | `/api/translation-memory/collections/{id}/entries`           | 条目列表 / 新增         |
 | TM  | PUT/DELETE     | `/api/translation-memory/entries/{id}`                       | 更新 / 删除条目         |
-| TM  | POST           | `/api/translation-memory/import-xlsx`                        | XLSX 导入 TM        |
+| TM  | POST           | `/api/translation-memory/import`                             | TMX/SDLTM/表格导入 TM |
 | TM  | GET            | `/api/translation-memory/collections/{id}/export-xlsx`       | XLSX 导出 TM        |
 | 术语  | GET/POST       | `/api/term-bases`                                            | 术语库列表 / 新建        |
 | 术语  | GET/PUT/DELETE | `/api/term-bases/{id}`                                       | 术语库详情 / 更新 / 删除   |
 | 术语  | GET/POST       | `/api/term-bases/{id}/entries`                               | 术语条目列表 / 新增       |
 | 术语  | PUT/DELETE     | `/api/term-entries/{id}`                                     | 更新 / 删除术语条目       |
-| 术语  | POST           | `/api/term-bases/import-xlsx`                                | XLSX 导入术语         |
+| 术语  | POST           | `/api/term-bases/import`                                     | TMX/表格导入术语       |
 | 术语  | GET            | `/api/term-bases/{id}/export-xlsx`                           | XLSX 导出术语         |
 | 解析  | POST           | `/api/parser/workspace`                                      | 仅解析文件并返回工作台结构，不落库 |
 

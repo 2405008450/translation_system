@@ -277,6 +277,7 @@ async def import_glossary_base_xlsx(
     glossary_base_id: UUID | None = Form(default=None),
     source_language: str = Form(...),
     target_language: str = Form(...),
+    skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
@@ -304,6 +305,7 @@ async def import_glossary_base_xlsx(
             source_language=resolved_source_language,
             target_language=resolved_target_language,
             creator_id=current_user.id,
+            skip_header=skip_header,
         )
     except Exception as exc:
         db.rollback()

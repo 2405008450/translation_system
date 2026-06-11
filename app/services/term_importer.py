@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from uuid import UUID
+from xml.etree import ElementTree as ET
 
 from openpyxl import load_workbook
 from sqlalchemy import or_
@@ -16,9 +17,10 @@ from app.services.normalizer import normalize_match_text, normalize_text
 
 
 CSV_EXTENSIONS = {".csv"}
+TMX_EXTENSIONS = {".tmx"}
 XLS_EXTENSIONS = {".xls"}
 XLSX_EXTENSIONS = {".xlsx"}
-TERM_IMPORT_EXTENSIONS = CSV_EXTENSIONS | XLS_EXTENSIONS | XLSX_EXTENSIONS
+TERM_IMPORT_EXTENSIONS = CSV_EXTENSIONS | TMX_EXTENSIONS | XLS_EXTENSIONS | XLSX_EXTENSIONS
 HEADER_ALIASES = {
     ("source", "target"),
     ("source_term", "target_term"),
@@ -76,10 +78,23 @@ def import_terms_from_xlsx_upload(
     batch_size: int = 5000,
     term_base_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
 ) -> TermImportSummary:
     extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
     if extension in CSV_EXTENSIONS:
         return import_terms_from_csv_upload(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            source_language=source_language,
+            target_language=target_language,
+            batch_size=batch_size,
+            term_base_id=term_base_id,
+            skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+            skip_header=skip_header,
+        )
+    if extension in TMX_EXTENSIONS:
+        return import_terms_from_tmx_upload(
             db=db,
             raw_bytes=raw_bytes,
             filename=filename,
@@ -99,6 +114,7 @@ def import_terms_from_xlsx_upload(
             batch_size=batch_size,
             term_base_id=term_base_id,
             skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+            skip_header=skip_header,
         )
 
     workbook = load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)
@@ -109,6 +125,7 @@ def import_terms_from_xlsx_upload(
         batch_size=batch_size,
         term_base_id=term_base_id,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        skip_header=skip_header,
         source_language=source_language,
         target_language=target_language,
     )
@@ -123,6 +140,7 @@ def import_terms_from_csv_upload(
     batch_size: int = 5000,
     term_base_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
 ) -> TermImportSummary:
     return _import_text_rows(
         db=db,
@@ -131,8 +149,39 @@ def import_terms_from_csv_upload(
         batch_size=batch_size,
         term_base_id=term_base_id,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        skip_header=skip_header,
         source_language=source_language,
         target_language=target_language,
+    )
+
+
+def import_terms_from_tmx_upload(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    term_base_id: UUID | None = None,
+    skip_duplicate_row_indexes: set[int] | None = None,
+) -> TermImportSummary:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    return _import_text_rows(
+        db=db,
+        rows=_iter_tmx_rows(
+            raw_bytes,
+            normalized_source_language,
+            normalized_target_language,
+        ),
+        filename=filename,
+        batch_size=batch_size,
+        term_base_id=term_base_id,
+        skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
     )
 
 
@@ -145,6 +194,7 @@ def import_terms_from_xls_upload(
     batch_size: int = 5000,
     term_base_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
 ) -> TermImportSummary:
     return _import_text_rows(
         db=db,
@@ -153,6 +203,7 @@ def import_terms_from_xls_upload(
         batch_size=batch_size,
         term_base_id=term_base_id,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        skip_header=skip_header,
         source_language=source_language,
         target_language=target_language,
     )
@@ -166,12 +217,18 @@ def preview_terms_from_upload(
     target_language: str,
     term_base_id: UUID | None,
     preview_limit: int = 100,
+    skip_header: bool = False,
 ) -> TermImportPreview:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
         target_language,
     )
-    rows = _iter_upload_rows(raw_bytes, filename)
+    rows = _iter_upload_rows(
+        raw_bytes,
+        filename,
+        normalized_source_language,
+        normalized_target_language,
+    )
     preview_rows: list[TermImportPreviewRow] = []
     source_normalized_values: set[str] = set()
     source_texts: set[str] = set()
@@ -186,7 +243,7 @@ def preview_terms_from_upload(
         source_text = normalize_text(_cell_to_text(row, 0))
         target_text = normalize_text(_cell_to_text(row, 1))
 
-        if row_index == 1 and _looks_like_header(source_text, target_text):
+        if _should_skip_header_row(filename, row_index, source_text, target_text, skip_header):
             skipped_header_rows += 1
             _append_preview_row(
                 preview_rows,
@@ -196,7 +253,7 @@ def preview_terms_from_upload(
                     source_text=source_text,
                     target_text=target_text,
                     status="header",
-                    message="识别为表头，导入时会跳过。",
+                    message="表头行，导入时会跳过。",
                 ),
             )
             continue
@@ -301,6 +358,7 @@ def import_terms_from_xlsx_path(
     batch_size: int = 5000,
     term_base_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
 ) -> TermImportSummary:
     workbook = load_workbook(Path(xlsx_path), read_only=True, data_only=True)
     return _import_workbook(
@@ -310,19 +368,22 @@ def import_terms_from_xlsx_path(
         batch_size=batch_size,
         term_base_id=term_base_id,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        skip_header=skip_header,
         source_language=source_language,
         target_language=target_language,
     )
 
 
-def _iter_upload_rows(raw_bytes: bytes, filename: str):
+def _iter_upload_rows(raw_bytes: bytes, filename: str, source_language: str, target_language: str):
     extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
     if extension in CSV_EXTENSIONS:
         return _iter_csv_rows(raw_bytes)
+    if extension in TMX_EXTENSIONS:
+        return _iter_tmx_rows(raw_bytes, source_language, target_language)
     if extension in XLS_EXTENSIONS:
         return _iter_xls_rows(raw_bytes)
     if extension not in XLSX_EXTENSIONS:
-        raise RuntimeError("仅支持上传 .xls、.xlsx 或 .csv 文件。")
+        raise RuntimeError("仅支持上传 .tmx、.xls、.xlsx 或 .csv 文件。")
 
     workbook = load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)
 
@@ -344,6 +405,7 @@ def _import_workbook(
     target_language: str,
     term_base_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
 ) -> TermImportSummary:
     worksheet = workbook.active
     try:
@@ -354,6 +416,7 @@ def _import_workbook(
             batch_size=batch_size,
             term_base_id=term_base_id,
             skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+            skip_header=skip_header,
             source_language=source_language,
             target_language=target_language,
         )
@@ -370,6 +433,7 @@ def _import_text_rows(
     target_language: str,
     term_base_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
 ) -> TermImportSummary:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
@@ -387,7 +451,7 @@ def _import_text_rows(
         source_text = normalize_text(_cell_to_text(row, 0))
         target_text = normalize_text(_cell_to_text(row, 1))
 
-        if row_index == 1 and _looks_like_header(source_text, target_text):
+        if _should_skip_header_row(filename, row_index, source_text, target_text, skip_header):
             skipped_header_rows += 1
             continue
 
@@ -507,6 +571,32 @@ def _iter_xls_rows(raw_bytes: bytes):
         yield tuple(sheet.cell_value(row_index, column_index) for column_index in range(sheet.ncols))
 
 
+def _iter_tmx_rows(raw_bytes: bytes, source_language: str, target_language: str):
+    root = ET.fromstring(raw_bytes)
+    for translation_unit in root.findall(".//{*}tu"):
+        language_segments: list[tuple[str, str]] = []
+        for tuv in translation_unit.findall("{*}tuv"):
+            language = (
+                tuv.attrib.get("{http://www.w3.org/XML/1998/namespace}lang")
+                or tuv.attrib.get("lang")
+                or tuv.attrib.get("xml:lang")
+                or ""
+            )
+            segment = tuv.find("{*}seg")
+            if segment is None:
+                continue
+            text = normalize_text("".join(segment.itertext()))
+            if text:
+                language_segments.append((language, text))
+
+        source_text = _find_tmx_language_text(language_segments, source_language)
+        target_text = _find_tmx_language_text(language_segments, target_language)
+        if (not source_text or not target_text) and len(language_segments) >= 2:
+            source_text = source_text or language_segments[0][1]
+            target_text = target_text or language_segments[1][1]
+        yield (source_text, target_text)
+
+
 def _decode_csv_bytes(raw_bytes: bytes) -> str:
     for encoding in ("utf-8-sig", "utf-8", "gb18030"):
         try:
@@ -514,6 +604,18 @@ def _decode_csv_bytes(raw_bytes: bytes) -> str:
         except UnicodeDecodeError:
             continue
     return raw_bytes.decode("utf-8", errors="replace")
+
+
+def _find_tmx_language_text(language_segments: list[tuple[str, str]], language: str) -> str:
+    normalized_language = _normalize_language_tag(language)
+    for candidate_language, text in language_segments:
+        if _normalize_language_tag(candidate_language) == normalized_language:
+            return text
+    primary_language = normalized_language.split("-", 1)[0]
+    for candidate_language, text in language_segments:
+        if _normalize_language_tag(candidate_language).split("-", 1)[0] == primary_language:
+            return text
+    return ""
 
 
 def _build_term_row(
@@ -531,6 +633,10 @@ def _build_term_row(
         "source_language": source_language,
         "target_language": target_language,
     }
+
+
+def _normalize_language_tag(language: str) -> str:
+    return (language or "").strip().lower().replace("_", "-")
 
 
 def _flush_term_batch(
@@ -602,3 +708,20 @@ def _looks_like_header(source_text: str, target_text: str) -> bool:
 
     header_key = (source_text.lower(), target_text.lower())
     return header_key in HEADER_ALIASES
+
+
+def _is_table_import(filename: str) -> bool:
+    extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
+    return extension in CSV_EXTENSIONS or extension in XLS_EXTENSIONS or extension in XLSX_EXTENSIONS
+
+
+def _should_skip_header_row(
+    filename: str,
+    row_index: int,
+    source_text: str,
+    target_text: str,
+    skip_header: bool,
+) -> bool:
+    if row_index != 1:
+        return False
+    return _looks_like_header(source_text, target_text) or (skip_header and _is_table_import(filename))
