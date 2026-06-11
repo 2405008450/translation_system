@@ -1,6 +1,7 @@
 import axios from 'axios'
 
 import { pushToast } from '../composables/useToast'
+import { translate } from '../i18n'
 
 let unauthorizedHandler: (() => void | Promise<void>) | null = null
 
@@ -35,11 +36,11 @@ http.interceptors.response.use(
       const message = String(
         error.response?.data?.detail
         || error.message
-        || '网络异常，请稍后重试。',
+        || translate('errors.network'),
       )
       pushToast({
         tone: 'error',
-        title: '请求失败',
+        title: translate('errors.requestFailed'),
         message,
       })
     }

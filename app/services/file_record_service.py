@@ -27,6 +27,11 @@ from app.services.document_workspace import (
     parse_docx_workspace,
 )
 from app.services.analytics_service import count_source_words, record_translation_metric_event
+from app.services.automatic_numbering import (
+    is_word_document_filename,
+    strip_segment_automatic_numbering_prefix,
+)
+from app.services.normalizer import build_source_hash
 from app.services.revision_service import create_revision
 from app.services.segment_status import resolve_unconfirmed_segment_status
 from app.services.task_file_service import build_task_workspace
@@ -118,7 +123,7 @@ def get_file_record_segment_counts(db: Session, file_record_id: UUID) -> tuple[i
     total_segments, translated_segments = (
         db.query(
             func.count(Segment.id),
-            func.count(case((Segment.target_text != "", 1))),
+            func.count(case((Segment.status == "confirmed", 1))),
         )
         .filter(Segment.file_record_id == file_record_id)
         .one()
@@ -137,7 +142,7 @@ def sync_file_record_status(db: Session, file_record_id: UUID) -> str | None:
         db.query(func.count(Segment.id))
         .filter(
             Segment.file_record_id == file_record_id,
-            Segment.target_text != "",
+            Segment.status == "confirmed",
         )
         .scalar_subquery()
     )
@@ -164,6 +169,10 @@ def sync_file_record_status(db: Session, file_record_id: UUID) -> str | None:
 
 def _count_filled_targets(items: list[dict]) -> int:
     return sum(1 for item in items if item.get("target_text", "") != "")
+
+
+def _count_confirmed_segments(items: list[dict]) -> int:
+    return sum(1 for item in items if item.get("status") == "confirmed")
 
 
 def _record_initial_translation_events(db: Session, segments: list[Segment]) -> None:
@@ -268,7 +277,7 @@ def duplicate_file_record(
         project_id=target_project_id,
         filename=next_filename,
         file_hash=source_record.file_hash,
-        status=source_record.status,
+        status="in_progress",
         document_parse_mode=source_record.document_parse_mode,
         document_parse_options=source_record.document_parse_options,
         document_statistics=source_record.document_statistics,
@@ -277,10 +286,12 @@ def duplicate_file_record(
         creator_id=current_user.id if current_user is not None else source_record.creator_id,
         collection_id=source_record.collection_id,
         collection_ids_json=source_record.collection_ids_json,
+        tm_match_threshold=getattr(source_record, "tm_match_threshold", 0.8),
         term_base_id=source_record.term_base_id,
         term_base_ids=source_record.term_base_ids,
         term_base_write_ids=getattr(source_record, "term_base_write_ids", "[]"),
         qa_term_base_ids=getattr(source_record, "qa_term_base_ids", "[]"),
+        glossary_base_ids=getattr(source_record, "glossary_base_ids", "[]"),
         deadline=source_record.deadline,
         access_level=source_record.access_level,
     )
@@ -294,22 +305,23 @@ def duplicate_file_record(
                 file_record_id=duplicate.id,
                 sentence_id=segment.sentence_id,
                 source_text=segment.source_text,
+                source_hash=segment.source_hash or build_source_hash(segment.source_text),
                 display_text=segment.display_text,
                 source_html=segment.source_html,
-                target_text=segment.target_text,
-                target_html=segment.target_html,
-                status=segment.status,
-                version=segment.version,
-                score=segment.score,
-                matched_source_text=segment.matched_source_text,
-                matched_collection_name=segment.matched_collection_name,
-                matched_creator_name=segment.matched_creator_name,
-                matched_created_at=segment.matched_created_at,
-                matched_updated_at=segment.matched_updated_at,
-                source=segment.source,
+                target_text="",
+                target_html=None,
+                status="none",
+                version=1,
+                score=0.0,
+                matched_source_text=None,
+                matched_collection_name=None,
+                matched_creator_name=None,
+                matched_created_at=None,
+                matched_updated_at=None,
+                source="none",
                 source_word_count=segment.source_word_count,
-                llm_provider=segment.llm_provider,
-                llm_model=segment.llm_model,
+                llm_provider=None,
+                llm_model=None,
                 block_type=segment.block_type,
                 block_index=segment.block_index,
                 row_index=segment.row_index,
@@ -357,6 +369,7 @@ def _create_file_record_from_workspace(
             file_record_id=file_record.id,
             sentence_id=seg["sentence_id"],
             source_text=seg["source_text"],
+            source_hash=build_source_hash(seg["source_text"]),
             display_text=seg["display_text"],
             source_html=seg.get("source_html"),
             target_text=seg["target_text"],
@@ -380,7 +393,7 @@ def _create_file_record_from_workspace(
     file_record.status = resolve_file_record_status(
         file_record.status,
         len(workspace_data["segments"]),
-        _count_filled_targets(workspace_data["segments"]),
+        _count_confirmed_segments(workspace_data["segments"]),
     )
 
     source_bytes = workspace_data.get(_WORKSPACE_SOURCE_BYTES_KEY, raw_bytes)
@@ -415,6 +428,7 @@ def create_txt_file_record_with_segments(
             file_record_id=file_record.id,
             sentence_id=f"sent-{index + 1:05d}",
             source_text=result.source_sentence,
+            source_hash=build_source_hash(result.source_sentence),
             display_text=result.source_sentence,
             target_text=result.target_text or "",
             status=result.status,
@@ -432,7 +446,7 @@ def create_txt_file_record_with_segments(
     file_record.status = resolve_file_record_status(
         file_record.status,
         len(results),
-        sum(1 for result in results if (result.target_text or "") != ""),
+        sum(1 for result in results if getattr(result, "status", None) == "confirmed"),
     )
 
     db.flush()
@@ -653,6 +667,7 @@ def attach_source_document_to_file_record(
             file_record_id=file_record.id,
             sentence_id=seg["sentence_id"],
             source_text=seg["source_text"],
+            source_hash=build_source_hash(seg["source_text"]),
             display_text=seg["display_text"],
             source_html=seg.get("source_html"),
             target_text=seg["target_text"],
@@ -676,7 +691,7 @@ def attach_source_document_to_file_record(
     file_record.status = resolve_file_record_status(
         file_record.status,
         len(workspace_data["segments"]),
-        _count_filled_targets(workspace_data["segments"]),
+        _count_confirmed_segments(workspace_data["segments"]),
     )
 
     stored_source_bytes = workspace_data.get(_WORKSPACE_SOURCE_BYTES_KEY, raw_bytes)
@@ -810,6 +825,31 @@ def get_tm_target_text_map(
     return {match.source_text: match.target_text for match in matches}
 
 
+def _clean_segment_target_for_automatic_numbering(
+    segment: Segment,
+    target_text: str | None,
+    target_html: str | None,
+    *,
+    clean_numbering: bool | None = None,
+) -> tuple[str, str | None]:
+    original_target_text = target_text or ""
+    should_clean = clean_numbering
+    if should_clean is None:
+        should_clean = is_word_document_filename(
+            getattr(getattr(segment, "file_record", None), "filename", None)
+        )
+    if not should_clean:
+        return original_target_text, target_html
+
+    cleaned_target_text = strip_segment_automatic_numbering_prefix(
+        segment,
+        original_target_text,
+        reference_texts=[segment.matched_source_text],
+    )
+    cleaned_target_html = None if cleaned_target_text != original_target_text else target_html
+    return cleaned_target_text, cleaned_target_html
+
+
 def update_segment_target(
     db: Session,
     segment_id: UUID,
@@ -826,6 +866,11 @@ def update_segment_target(
     if not segment:
         return None
 
+    target_text, target_html = _clean_segment_target_for_automatic_numbering(
+        segment,
+        target_text,
+        target_html,
+    )
     before_text = segment.target_text
     segment.target_text = target_text
     segment.target_html = target_html if target_html else None
@@ -888,6 +933,11 @@ def update_segment_by_sentence_id(
     if not segment:
         return None
 
+    target_text, target_html = _clean_segment_target_for_automatic_numbering(
+        segment,
+        target_text,
+        target_html,
+    )
     before_text = segment.target_text
     segment.target_text = target_text
     segment.target_html = target_html if target_html else None
@@ -945,6 +995,7 @@ def update_segment_source_text(
         return None
 
     segment.source_text = source_text
+    segment.source_hash = build_source_hash(source_text)
     segment.display_text = source_text
     segment.source_html = None
     db.commit()
@@ -999,6 +1050,8 @@ def batch_update_segments(
         )
         .all()
     )
+    file_record = db.query(FileRecord).filter(FileRecord.id == file_record_id).first()
+    clean_numbering = is_word_document_filename(file_record.filename if file_record else None)
 
     updated_segments: list[Segment] = []
     conflicts: list[SegmentUpdateConflict] = []
@@ -1024,6 +1077,12 @@ def batch_update_segments(
         before_text = segment.target_text
         target_text = item.get("target_text", "")
         target_html = item.get("target_html")
+        target_text, target_html = _clean_segment_target_for_automatic_numbering(
+            segment,
+            target_text,
+            target_html,
+            clean_numbering=clean_numbering,
+        )
         source = item.get("source", "manual")
         track_revision = bool(item.get("track_revision", True))
         confirm = bool(item.get("confirm", False))

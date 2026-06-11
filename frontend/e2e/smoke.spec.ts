@@ -35,6 +35,7 @@ async function createProjectWithFixture(page: Page, projectName: string) {
   await page.getByTestId('project-create-button').click()
   await expect(page.getByTestId('project-create-dialog')).toBeVisible()
   await page.getByTestId('project-create-name').fill(projectName)
+  await page.getByTestId('project-create-workflow-template').selectOption('translate')
   await Promise.all([
     page.waitForURL(/\/projects\/[0-9a-f-]+/i),
     page.getByTestId('project-create-submit').click(),

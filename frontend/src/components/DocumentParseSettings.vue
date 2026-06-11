@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { FileText, Settings2 } from 'lucide-vue-next'
+import { useI18n } from 'vue-i18n'
 
 import type { DocumentParseMode, DocumentParseOptions, UploadCapability } from '../types/api'
 
@@ -24,6 +25,8 @@ const emit = defineEmits<{
   'update:modelValue': [value: DocumentParseMode]
   'update:parseOptions': [value: DocumentParseOptions]
 }>()
+
+const { t } = useI18n()
 
 const optionDefaults: DocumentParseOptions = {
   include_headers_footers: true,
@@ -85,22 +88,22 @@ const visibleCapabilities = computed(() => {
 
 const selectedFileSummary = computed(() => {
   if (!hasSelectedFiles.value) {
-    return '选择文件后会显示对应格式的真实解析能力。'
+    return t('documentParsing.selectedFileSummary.empty')
   }
 
   const labels = visibleCapabilities.value.map((item) => item.label)
   if (labels.length === 0) {
-    return '当前文件格式不在后端任务上传能力中。'
+    return t('documentParsing.selectedFileSummary.unsupported')
   }
-  return `当前文件将使用：${labels.join('、')}。`
+  return t('documentParsing.selectedFileSummary.current', { labels: labels.join(' / ') })
 })
 
 const compactCapabilityText = computed(() => {
   if (props.loading) {
-    return '正在读取后端解析能力...'
+    return t('documentParsing.selectedFileSummary.loading')
   }
   if (!props.capabilities.length) {
-    return '暂未获取到后端解析能力，将使用上传接口校验。'
+    return t('documentParsing.selectedFileSummary.fallback')
   }
   return selectedFileSummary.value
 })
@@ -242,7 +245,7 @@ function showSelectAll(capability: UploadCapability) {
 }
 
 function selectAllLabel(capability: UploadCapability) {
-  return capability.extensions.includes('.docx') ? '全选可翻译范围' : '全选'
+  return capability.extensions.includes('.docx') ? t('documentParsing.selectAllTranslatable') : t('documentParsing.selectAll')
 }
 
 function formatExtensions(extensions: string[]) {
@@ -257,7 +260,7 @@ function formatExtensions(extensions: string[]) {
   >
     <header class="document-parse-settings__header">
       <div>
-        <h2>文档设置</h2>
+        <h2>{{ t('documentParsing.settingsTitle') }}</h2>
         <p>{{ compactCapabilityText }}</p>
       </div>
       <Settings2 :size="18" />
@@ -351,7 +354,7 @@ function formatExtensions(extensions: string[]) {
     </section>
 
     <p v-else-if="hasCapabilityData" class="document-parse-settings__empty">
-      选择文件后显示对应格式的文档设置。
+      {{ t('documentParsing.emptySettings') }}
     </p>
   </aside>
 

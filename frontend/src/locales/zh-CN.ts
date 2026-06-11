@@ -6,6 +6,10 @@ export default {
     none: '无',
     empty: '暂无数据',
     loading: '加载中...',
+    progress: {
+      total: '总进度',
+      workflowDetail: '阶段进度',
+    },
     actions: {
       close: '关闭',
       cancel: '取消',
@@ -61,7 +65,15 @@ export default {
     },
     termBase: {
       title: '术语库管理',
-      description: '管理术语库，维护翻译术语一致性',
+      description: '管理译后检查术语库，维护翻译术语一致性',
+    },
+    glossary: {
+      title: '词汇表管理',
+      description: '管理 AI 预翻译专用词汇表，按原文命中后注入 LLM 上下文',
+    },
+    glossaryEdit: {
+      title: '词汇表详情',
+      description: '维护词汇表信息、三列词条和导入导出操作',
     },
     translationRules: {
       title: '翻译规则',
@@ -69,14 +81,18 @@ export default {
     },
     termBaseEdit: {
       title: '术语库详情',
-      description: '维护术语库信息、术语条目和导入导出操作',
+      description: '维护译后检查术语库信息、术语条目和导入导出操作',
     },
     users: {
       title: '用户管理',
       description: '创建和分配系统用户角色',
     },
+    assignmentEvents: {
+      title: '指派记录',
+      description: '查看项目和文件任务的指派、授权和取消记录',
+    },
   },
-  shell: {
+    shell: {
     mainNav: '主导航',
     sections: {
       dashboard: '数据看板',
@@ -85,9 +101,11 @@ export default {
       assets: '语言资产',
       tm: '记忆库',
       termBase: '术语库',
+      glossary: '词汇表',
       translationRules: '翻译规则',
       system: '系统',
       users: '用户管理',
+      assignmentEvents: '指派记录',
     },
     recent: {
       title: '最近打开',
@@ -104,6 +122,9 @@ export default {
       language: '语言切换',
       logout: '退出登录',
       soon: '{name}，即将上线',
+      markAllRead: '全部已读',
+      noNotifications: '暂无消息',
+      globalBreadcrumb: '全局页面路径',
     },
     userFallback: '管理员',
   },
@@ -139,6 +160,14 @@ export default {
     empty: '暂无数据',
     error: '加载失败',
     forbidden: '暂无权限',
+  },
+  confirm: {
+    title: '请确认',
+  },
+  errors: {
+    requestFailed: '请求失败',
+    network: '网络异常，请稍后重试。',
+    importFailed: '导入失败。',
   },
   stores: {
     auth: {
@@ -290,6 +319,7 @@ export default {
       current: '当前状态',
       languagePair: '语言对',
       progress: '处理进度',
+      confirmedProgress: '确认进度',
       totalSegments: '句段总数',
       creator: '创建人',
       access: '访问权限',
@@ -400,7 +430,8 @@ export default {
       columns: {
         index: '序号',
         details: '文件详情',
-        progress: '进度',
+        progress: '确认进度',
+        pretranslationProgress: '预翻译进度',
         task: '任务管理',
         status: '状态',
         createdAt: '创建时间',
@@ -440,10 +471,17 @@ export default {
       selectFileFirst: '请先勾选要统计的文件',
       selectedCount: '已选 {count} 个文件',
       emptyResult: '选择文件后点击“统计”，这里会显示网格统计表。',
+      historyLabel: '历史报告',
+      historyPlaceholder: '暂无历史报告',
+      refreshReports: '刷新报告',
+      loadingReports: '加载中',
+      reportCreatedAt: '报告时间',
+      reportCreator: '统计人',
+      reportOption: '{createdAt} · {files} 个文件 · {words} 字',
       total: '合计',
       columns: {
         file: '文件',
-        source: '来源',
+        source: '统计状态',
         statisticsStatus: '统计状态',
         pages: '页数',
         words: '字数',
@@ -453,6 +491,10 @@ export default {
         charactersWithSpaces: '字符数(含空格)',
         paragraphs: '段落数',
         lines: '行数',
+        internalRepeatedWords: '内部重复字数',
+        internalRepeatedCharacters: '内部重复字符数',
+        crossFileRepeatedWords: '跨文件重复字数',
+        crossFileRepeatedCharacters: '跨文件重复字符数',
         license: '许可证',
       },
       summary: {
@@ -460,10 +502,11 @@ export default {
         available: '可用统计',
       },
       sources: {
-        libreOffice: 'LibreOffice 统计',
-        aspose: 'Aspose 统计',
-        openxmlComputed: 'OpenXML 重算',
-        docpropsCached: 'Word 缓存',
+        completed: '已统计',
+        libreOffice: '已统计',
+        aspose: '已统计',
+        openxmlComputed: '已统计',
+        docpropsCached: '已统计',
         unavailable: '无统计',
         notReady: '未统计',
       },
@@ -501,12 +544,13 @@ export default {
       selectFileFirst: '请先勾选文件',
       fileLocked: '所选文件正在预翻译中，请完成后再操作',
       dialogTitle: '批量预翻译',
-      dialogDescription: '按 TM、AI 和术语库选项批量处理已选文件。',
+      dialogDescription: '按 TM、词汇表、AI 和术语库选项批量处理已选文件。',
       selectedSummary: '已选 {count} 个文件',
       start: '开始预翻译',
       sections: {
         tm: '启用 TM 预匹配',
         llm: '启用 LLM 翻译',
+        glossary: '启用词汇表（AI 预翻译）',
         termBase: '启用术语库',
       },
       summary: {
@@ -556,13 +600,20 @@ export default {
           allWithExact: '全部含精确匹配',
         },
       },
+      glossary: {
+        select: '词汇表（多选）',
+        searchPlaceholder: '搜索词汇表名称或说明',
+        hiddenByLanguagePair: '已隐藏 {count} 个语言对不一致的词汇表。',
+        emptyForLanguagePair: '当前语言对没有可用词汇表。',
+        hint: '词汇表只在 LLM 预翻译时按当前原文检索注入，不在工作台展示，也不会写入句段。',
+      },
       termBase: {
         select: '术语库（多选）',
         placeholder: '请选择术语库',
         searchPlaceholder: '搜索术语库名称或说明',
         hiddenByLanguagePair: '已隐藏 {count} 个语言对不一致的术语库。',
         emptyForLanguagePair: '当前语言对没有可用术语库。',
-        hint: '绑定到所选文件，工作台会提示术语；本次不会直接替换译文。',
+        hint: '绑定到所选文件，工作台和译后检查会提示术语；本次不会直接替换译文。',
       },
       progress: {
         overall: '整体进度',
@@ -571,6 +622,8 @@ export default {
         running: '处理中',
         tmRunning: 'TM 预匹配中',
         tmDone: 'TM 预匹配完成',
+        glossaryRunning: '词汇表绑定中',
+        glossaryDone: '词汇表绑定完成',
         llmStarting: 'LLM 翻译准备中',
         llmRunning: 'LLM 已处理 {processed}/{total} 条',
         llmDone: 'LLM 完成：更新 {updated} 条，失败 {error} 条',
@@ -585,6 +638,7 @@ export default {
       errors: {
         selectOneOption: '请至少勾选一项执行内容。',
         tmCollectionRequired: '已启用 TM，请至少选择一个记忆库。',
+        glossaryBaseRequired: '已启用词汇表，请至少选择一个词汇表。',
         termBaseRequired: '已启用术语库，请选择术语库。',
         fileLanguagePairRequired: '所选文件缺少有效语言对，请先补全源语言和目标语言。',
         fileLanguagePairMixed: '当前选择包含 {count} 个不同语言对，请分语言对分别预翻译。',
@@ -596,7 +650,7 @@ export default {
       },
       toast: {
         loadFailedTitle: '资源加载失败',
-        loadFailedMessage: '无法加载记忆库或术语库，请稍后重试。',
+        loadFailedMessage: '无法加载记忆库、词汇表或术语库，请稍后重试。',
         fileFailedTitle: '文件处理失败：{name}',
         releaseLockFailedTitle: '预翻译锁释放失败',
         releaseLockFailedMessage: '翻译结果已写入，但文件仍可能暂时显示处理中。请刷新项目页，过期锁会自动清理。',
@@ -699,6 +753,7 @@ export default {
       export: 'DOCX 导出失败。',
       duplicate: '创建副本失败。',
       statistics: '文档统计失败。',
+      statisticsReports: '统计报告加载失败。',
       delete: '删除失败。',
     },
     messages: {
@@ -778,7 +833,7 @@ export default {
     guidelineTemplateNone: '不使用模板',
     guidelineImport: '导入细则',
     guidelinesPlaceholder: '输入本次临时提示词，例如术语规范、语气风格、格式要求等...',
-    guidelinesHint: '项目固定细则会自动带入；可选择仓库中的 Markdown 细则模板复用，手动输入只在本次 AI 修正中生效，不保存。',
+    guidelinesHint: '项目固定细则会自动带入；可选择仓库中的 Markdown 细则模板复用，手动输入会在当前页面保留，刷新页面后清除。',
     saveNow: '保存',
     exportDocx: '导出 DOCX',
     saveToTM: '保存到记忆库',
@@ -1189,6 +1244,17 @@ export default {
   },
   documentParsing: {
     label: '文档内容解析处理',
+    settingsTitle: '文档设置',
+    selectAll: '全选',
+    selectAllTranslatable: '全选可翻译范围',
+    emptySettings: '选择文件后显示对应格式的文档设置。',
+    selectedFileSummary: {
+      empty: '选择文件后会显示对应格式的真实解析能力。',
+      unsupported: '当前文件格式不在后端任务上传能力中。',
+      current: '当前文件将使用：{labels}。',
+      loading: '正在读取后端解析能力...',
+      fallback: '暂未获取到后端解析能力，将使用上传接口校验。',
+    },
     modes: {
       full: '完整解析',
       bodyOnly: '仅正文解析',
@@ -1249,6 +1315,70 @@ export default {
     loading: '加载中...',
     dblClickHint: '双击插入译文',
     textInserted: '译文已插入',
+  },
+  status: {
+    unknownStatus: '未知状态',
+    unknownSource: '未知来源',
+    file: {
+      draft: '草稿',
+      inProgress: '处理中',
+      pending: '待处理',
+      processing: '处理中',
+      completed: '已完成',
+      translated: '已翻译',
+      error: '异常',
+    },
+    segment: {
+      exact: '精确匹配',
+      fuzzy: '模糊匹配',
+      none: '无匹配',
+      confirmed: '已确认',
+      manual: '人工处理',
+    },
+    source: {
+      manual: '人工',
+      projectSync: '项目同步',
+    },
+  },
+  llm: {
+    scope: {
+      currentSegment: {
+        label: '当前句段',
+        description: '仅修正当前选中的句段。',
+      },
+      all: {
+        label: '全部未确认译文',
+        description: '处理模糊匹配和无匹配句段。',
+      },
+      allWithExact: {
+        label: '全部句段',
+        description: '连同精确匹配句段一起重跑。',
+      },
+      emptyTargetOnly: {
+        label: '仅空译文',
+        description: '只处理译文为空的句段，保留已有译文。',
+      },
+      fuzzyOnly: {
+        label: '仅模糊匹配',
+        description: '只修正模糊匹配句段。',
+      },
+      noneOnly: {
+        label: '仅无匹配',
+        description: '只处理没有匹配结果的句段。',
+      },
+    },
+    provider: {
+      deepseek: {
+        description: '使用 DeepSeek 提供的模型。',
+      },
+      auto: {
+        label: '自动选择',
+        description: '按当前配置自动选择可用模型。',
+      },
+      openrouter: {
+        description: '使用 OpenRouter 提供的模型。',
+      },
+    },
   },
   userManagement: {
     createTitle: '创建用户',

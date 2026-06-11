@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type { RouteLocationRaw } from 'vue-router'
 import { RouterLink } from 'vue-router'
+import { useI18n } from 'vue-i18n'
 
 export interface PageBreadcrumbItem {
   label: string
@@ -15,12 +16,14 @@ withDefaults(defineProps<{
   description: '',
   breadcrumbs: () => [],
 })
+
+const { t } = useI18n()
 </script>
 
 <template>
   <section class="page-header">
     <div class="page-header__copy">
-      <nav v-if="breadcrumbs.length" class="breadcrumb" aria-label="页面路径">
+      <nav v-if="breadcrumbs.length" class="breadcrumb" :aria-label="t('shell.topbar.globalBreadcrumb')">
         <template v-for="(item, index) in breadcrumbs" :key="`${item.label}-${index}`">
           <RouterLink
             v-if="item.to"

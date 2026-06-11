@@ -41,6 +41,21 @@ REQUIRED_SCHEMA = {
         "source_language",
         "target_language",
     },
+    "glossary_bases": {
+        "id",
+        "name",
+        "source_language",
+        "target_language",
+    },
+    "glossary_entries": {
+        "id",
+        "glossary_base_id",
+        "source_text",
+        "target_text",
+        "note",
+        "source_language",
+        "target_language",
+    },
     "users": {"nickname", "translator_type"},
     "projects": {
         "id",
@@ -77,8 +92,49 @@ REQUIRED_SCHEMA = {
         "term_base_ids",
         "term_base_write_ids",
         "qa_term_base_ids",
+        "glossary_base_ids",
         "deadline",
         "access_level",
+    },
+    "file_export_tasks": {
+        "id",
+        "file_record_id",
+        "export_type",
+        "status",
+        "progress",
+        "message",
+        "result_path",
+        "filename",
+        "media_type",
+        "size_bytes",
+        "error",
+        "created_by_id",
+        "created_at",
+        "updated_at",
+        "expires_at",
+    },
+    "document_statistics_reports": {
+        "id",
+        "project_id",
+        "created_by_id",
+        "file_ids",
+        "total_files",
+        "available_files",
+        "totals",
+        "status",
+        "created_at",
+    },
+    "document_statistics_report_items": {
+        "id",
+        "report_id",
+        "project_id",
+        "file_record_id",
+        "file_name",
+        "source_language",
+        "target_language",
+        "file_size_bytes",
+        "statistics",
+        "created_at",
     },
     "term_qa_reports": {
         "id",
@@ -127,10 +183,20 @@ REQUIRED_SCHEMA = {
         "revoked_at",
         "status",
     },
+    "project_workflow_steps": {
+        "id",
+        "project_id",
+        "step_key",
+        "name",
+        "step_type",
+        "sort_order",
+        "created_at",
+    },
     "file_assignments": {
         "id",
         "project_id",
         "file_record_id",
+        "workflow_step_id",
         "assignee_id",
         "assigned_by_id",
         "assigned_at",
@@ -162,6 +228,9 @@ REQUIRED_SCHEMA = {
         "created_at",
     },
     "segments": {
+        "workflow_step_id",
+        "source_hash",
+        "project_sync_disabled",
         "source_word_count",
         "llm_provider",
         "llm_model",
@@ -258,7 +327,10 @@ REQUIRED_SCHEMA = {
 
 REQUIRED_INDEXES = {
     "segments": {
+        "ix_segments_workflow_step_id",
         "ix_segments_source_word_count",
+        "ix_segments_source_hash",
+        "ix_segments_file_source_hash",
         "ix_segments_translated_source_word_count",
         "ix_segments_source_word_backfill",
         "ix_segments_translated_backfill",
@@ -276,6 +348,25 @@ REQUIRED_INDEXES = {
     "auto_tm_rematch_queue": {
         "uq_auto_tm_rematch_queue_file_record",
         "ix_auto_tm_rematch_queue_status",
+    },
+    "document_statistics_reports": {
+        "ix_document_statistics_reports_project_id",
+        "ix_document_statistics_reports_created_by_id",
+        "ix_document_statistics_reports_created_at",
+    },
+    "document_statistics_report_items": {
+        "ix_document_statistics_report_items_report_id",
+        "ix_document_statistics_report_items_project_id",
+        "ix_document_statistics_report_items_file_record_id",
+    },
+    "file_export_tasks": {
+        "ix_file_export_tasks_file_record_type",
+        "ix_file_export_tasks_status",
+        "ix_file_export_tasks_expires_at",
+    },
+    "project_workflow_steps": {
+        "ix_project_workflow_steps_project_id",
+        "ix_project_workflow_steps_project_order",
     },
 }
 
@@ -449,6 +540,22 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_entries_collection_source_hash_language_pair
             ON memory_entries (collection_id, source_hash, source_language, target_language)
             """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS source_hash VARCHAR(64)
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS project_sync_disabled BOOLEAN NOT NULL DEFAULT FALSE
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_source_hash
+            ON segments (source_hash)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_file_source_hash
+            ON segments (file_record_id, source_hash)
+            """,
             f"""
             CREATE TABLE IF NOT EXISTS term_bases (
                 id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
@@ -552,6 +659,126 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE TRIGGER update_term_entries_updated_at
             BEFORE UPDATE ON term_entries
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column()
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS glossary_bases (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                name VARCHAR(120) NOT NULL,
+                description TEXT,
+                source_language VARCHAR(20) NOT NULL,
+                target_language VARCHAR(20) NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_bases
+            ADD COLUMN IF NOT EXISTS description TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_bases
+            ADD COLUMN IF NOT EXISTS source_language VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_bases
+            ADD COLUMN IF NOT EXISTS target_language VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_bases
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_bases
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_glossary_bases_name
+            ON glossary_bases (name)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_bases_language_pair
+            ON glossary_bases (source_language, target_language)
+            """,
+            """
+            DROP TRIGGER IF EXISTS update_glossary_bases_updated_at ON glossary_bases
+            """,
+            """
+            CREATE TRIGGER update_glossary_bases_updated_at
+            BEFORE UPDATE ON glossary_bases
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column()
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS glossary_entries (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                glossary_base_id UUID NOT NULL REFERENCES glossary_bases(id) ON DELETE CASCADE,
+                source_text TEXT NOT NULL,
+                target_text TEXT NOT NULL,
+                note TEXT,
+                source_normalized TEXT,
+                source_language VARCHAR(20) NOT NULL,
+                target_language VARCHAR(20) NOT NULL,
+                creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_entries
+            ADD COLUMN IF NOT EXISTS note TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_entries
+            ADD COLUMN IF NOT EXISTS source_normalized TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_entries
+            ADD COLUMN IF NOT EXISTS source_language VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_entries
+            ADD COLUMN IF NOT EXISTS target_language VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_entries
+            ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_entries
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_entries
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_entries_creator_id
+            ON glossary_entries (creator_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_entries_glossary_base_id
+            ON glossary_entries (glossary_base_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_entries_base_source_text
+            ON glossary_entries (glossary_base_id, source_text)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_entries_base_source_normalized
+            ON glossary_entries (glossary_base_id, source_normalized)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_entries_language_pair
+            ON glossary_entries (source_language, target_language)
+            """,
+            """
+            DROP TRIGGER IF EXISTS update_glossary_entries_updated_at ON glossary_entries
+            """,
+            """
+            CREATE TRIGGER update_glossary_entries_updated_at
+            BEFORE UPDATE ON glossary_entries
             FOR EACH ROW
             EXECUTE FUNCTION update_updated_at_column()
             """,
@@ -742,6 +969,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ADD COLUMN IF NOT EXISTS collection_ids_json TEXT NOT NULL DEFAULT '[]'
             """,
             """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS tm_match_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.8
+            """,
+            """
             UPDATE file_records
             SET collection_ids_json = json_build_array(collection_id)::text
             WHERE collection_id IS NOT NULL
@@ -762,6 +993,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS file_records
             ADD COLUMN IF NOT EXISTS qa_term_base_ids TEXT NOT NULL DEFAULT '[]'
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS glossary_base_ids TEXT NOT NULL DEFAULT '[]'
             """,
             """
             ALTER TABLE IF EXISTS file_records
@@ -787,9 +1022,151 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             CREATE INDEX IF NOT EXISTS ix_file_records_active_operation
             ON file_records (active_operation)
             """,
+            f"""
+            CREATE TABLE IF NOT EXISTS file_export_tasks (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+                export_type VARCHAR(40) NOT NULL DEFAULT 'original',
+                status VARCHAR(20) NOT NULL DEFAULT 'queued',
+                progress INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL DEFAULT '',
+                result_path TEXT,
+                filename VARCHAR(255),
+                media_type VARCHAR(120),
+                size_bytes INTEGER,
+                error TEXT,
+                created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMP NOT NULL
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_file_export_tasks_file_record_type
+            ON file_export_tasks (file_record_id, export_type)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_file_export_tasks_status
+            ON file_export_tasks (status)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_file_export_tasks_expires_at
+            ON file_export_tasks (expires_at)
+            """,
             """
             CREATE INDEX IF NOT EXISTS ix_file_records_assignee_id
             ON file_records (assignee_id)
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS document_statistics_reports (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                file_ids TEXT NOT NULL DEFAULT '[]',
+                total_files INTEGER NOT NULL DEFAULT 0,
+                available_files INTEGER NOT NULL DEFAULT 0,
+                totals TEXT NOT NULL DEFAULT '{{}}',
+                status VARCHAR(20) NOT NULL DEFAULT 'completed',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS document_statistics_report_items (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                report_id UUID NOT NULL REFERENCES document_statistics_reports(id) ON DELETE CASCADE,
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID REFERENCES file_records(id) ON DELETE SET NULL,
+                file_name VARCHAR(255) NOT NULL,
+                source_language VARCHAR(20),
+                target_language VARCHAR(20),
+                file_size_bytes INTEGER,
+                statistics TEXT NOT NULL DEFAULT '{{}}',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_statistics_reports_project_id
+            ON document_statistics_reports (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_statistics_reports_created_by_id
+            ON document_statistics_reports (created_by_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_statistics_reports_created_at
+            ON document_statistics_reports (created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_statistics_report_items_report_id
+            ON document_statistics_report_items (report_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_statistics_report_items_project_id
+            ON document_statistics_report_items (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_document_statistics_report_items_file_record_id
+            ON document_statistics_report_items (file_record_id)
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS project_workflow_steps (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                step_key VARCHAR(40) NOT NULL,
+                name VARCHAR(80) NOT NULL,
+                step_type VARCHAR(20) NOT NULL DEFAULT 'custom',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS project_workflow_steps
+            ADD COLUMN IF NOT EXISTS step_key VARCHAR(40) NOT NULL DEFAULT 'translate'
+            """,
+            """
+            ALTER TABLE IF EXISTS project_workflow_steps
+            ADD COLUMN IF NOT EXISTS name VARCHAR(80) NOT NULL DEFAULT '翻译'
+            """,
+            """
+            ALTER TABLE IF EXISTS project_workflow_steps
+            ADD COLUMN IF NOT EXISTS step_type VARCHAR(20) NOT NULL DEFAULT 'custom'
+            """,
+            """
+            ALTER TABLE IF EXISTS project_workflow_steps
+            ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS project_workflow_steps
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_project_workflow_steps_project_id
+            ON project_workflow_steps (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_project_workflow_steps_project_order
+            ON project_workflow_steps (project_id, sort_order)
+            """,
+            """
+            INSERT INTO project_workflow_steps (
+                project_id,
+                step_key,
+                name,
+                step_type,
+                sort_order
+            )
+            SELECT
+                p.id,
+                'translate',
+                '翻译',
+                'translation',
+                0
+            FROM projects AS p
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM project_workflow_steps AS pws
+                WHERE pws.project_id = p.id
+            )
             """,
             f"""
             CREATE TABLE IF NOT EXISTS project_assignments (
@@ -808,6 +1185,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
                 project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                 file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+                workflow_step_id UUID REFERENCES project_workflow_steps(id) ON DELETE CASCADE,
                 assignee_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 assigned_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
                 assigned_at TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -815,6 +1193,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 revoked_at TIMESTAMP,
                 status VARCHAR(20) NOT NULL DEFAULT 'active'
             )
+            """,
+            """
+            ALTER TABLE IF EXISTS file_assignments
+            ADD COLUMN IF NOT EXISTS workflow_step_id UUID REFERENCES project_workflow_steps(id) ON DELETE CASCADE
             """,
             f"""
             CREATE TABLE IF NOT EXISTS assignment_events (
@@ -877,8 +1259,11 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ON file_assignments (status)
             """,
             """
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_file_assignments_active_file_user
-            ON file_assignments (file_record_id, assignee_id)
+            DROP INDEX IF EXISTS uq_file_assignments_active_file_user
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_file_assignments_active_file_step_user
+            ON file_assignments (file_record_id, workflow_step_id, assignee_id)
             WHERE status = 'active'
             """,
             """
@@ -942,6 +1327,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             INSERT INTO file_assignments (
                 project_id,
                 file_record_id,
+                workflow_step_id,
                 assignee_id,
                 assigned_by_id,
                 assigned_at,
@@ -950,6 +1336,13 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             SELECT
                 fr.project_id,
                 fr.id,
+                (
+                    SELECT pws.id
+                    FROM project_workflow_steps AS pws
+                    WHERE pws.project_id = fr.project_id
+                    ORDER BY pws.sort_order ASC, pws.id ASC
+                    LIMIT 1
+                ),
                 fr.assignee_id,
                 fr.assigned_by_id,
                 COALESCE(fr.assigned_at, NOW()),
@@ -966,8 +1359,39 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
               )
             """,
             """
+            UPDATE file_assignments AS fa
+            SET workflow_step_id = first_step.id
+            FROM (
+                SELECT DISTINCT ON (project_id)
+                    id,
+                    project_id
+                FROM project_workflow_steps
+                ORDER BY project_id, sort_order ASC, id ASC
+            ) AS first_step
+            WHERE fa.workflow_step_id IS NULL
+              AND fa.project_id = first_step.project_id
+            """,
+            """
             CREATE INDEX IF NOT EXISTS ix_file_records_source_language
             ON file_records (source_language)
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS workflow_step_id UUID REFERENCES project_workflow_steps(id) ON DELETE SET NULL
+            """,
+            """
+            UPDATE segments AS s
+            SET workflow_step_id = first_step.id
+            FROM file_records AS fr
+            JOIN (
+                SELECT DISTINCT ON (project_id)
+                    id,
+                    project_id
+                FROM project_workflow_steps
+                ORDER BY project_id, sort_order ASC, id ASC
+            ) AS first_step ON first_step.project_id = fr.project_id
+            WHERE s.workflow_step_id IS NULL
+              AND s.file_record_id = fr.id
             """,
             """
             ALTER TABLE IF EXISTS segments
@@ -996,6 +1420,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_segments_file_record_order
             ON segments (file_record_id, block_index, row_index, cell_index, sentence_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_workflow_step_id
+            ON segments (workflow_step_id)
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_segments_source_word_count

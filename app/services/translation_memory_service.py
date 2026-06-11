@@ -128,7 +128,7 @@ def _batch_upsert_tm_entries_postgres(db: Session, rows: list[dict]) -> list[tup
         }
         for row in rows
     ]
-    result = db.execute(
+    db.execute(
         text(
             """
             INSERT INTO memory_entries (
@@ -163,12 +163,42 @@ def _batch_upsert_tm_entries_postgres(db: Session, rows: list[dict]) -> list[tup
                 target_language = EXCLUDED.target_language,
                 creator_id = COALESCE(EXCLUDED.creator_id, memory_entries.creator_id),
                 updated_at = NOW()
-            RETURNING id, source_text
             """
         ),
         payload,
-    ).mappings()
-    return [(row["id"], row["source_text"]) for row in result]
+    )
+    return _fetch_touched_tm_entries(db, rows)
+
+
+def _fetch_touched_tm_entries(db: Session, rows: list[dict]) -> list[tuple[UUID, str]]:
+    collection_ids = {row["collection_id"] for row in rows}
+    source_hashes = {row["source_hash"] for row in rows}
+    source_languages = {row["source_language"] for row in rows}
+    target_languages = {row["target_language"] for row in rows}
+    touched_entries = (
+        db.query(MemoryEntry)
+        .filter(
+            MemoryEntry.collection_id.in_(collection_ids),
+            MemoryEntry.source_hash.in_(source_hashes),
+            MemoryEntry.source_language.in_(source_languages),
+            MemoryEntry.target_language.in_(target_languages),
+        )
+        .all()
+    )
+    entries_by_key = {
+        (
+            entry.collection_id,
+            entry.source_hash,
+            entry.source_language,
+            entry.target_language,
+        ): entry
+        for entry in touched_entries
+    }
+    return [
+        (entry.id, entry.source_text)
+        for key in (row["key"] for row in rows)
+        if (entry := entries_by_key.get(key)) is not None and entry.id is not None and entry.source_text
+    ]
 
 
 def _batch_upsert_tm_entries_orm(db: Session, rows: list[dict]) -> list[tuple[UUID, str]]:

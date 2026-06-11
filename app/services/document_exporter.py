@@ -13,6 +13,10 @@ from typing import Any
 from zipfile import ZipFile
 from xml.etree import ElementTree as ET
 
+from app.services.automatic_numbering import (
+    build_localized_docx_numbering_definition,
+    strip_automatic_numbering_prefix,
+)
 from app.services.document_workspace import (
     CELL_GROUP_MAX_CHARS,
     CELL_NEXT_PARAGRAPH_MAX_CHARS,
@@ -46,6 +50,7 @@ from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
 
 DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 XML_SPACE_ATTR = "{http://www.w3.org/XML/1998/namespace}space"
+MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 EXPORT_FONT_FAMILY = "Times New Roman"
 BILINGUAL_LAYOUT_SOURCE_FIRST = "source_first"
 BILINGUAL_LAYOUT_TARGET_FIRST = "target_first"
@@ -141,6 +146,9 @@ class ExportSegment:
     sentence_id: str
     source_text: str
     target_text: str
+    display_text: str = ""
+    numbering_text: str = ""
+    matched_source_text: str = ""
     target_html: str | None = None
     math_placeholders: dict[str, str] = field(default_factory=dict)
 
@@ -174,6 +182,7 @@ def export_bilingual_docx_with_layout(
     order: str = BILINGUAL_LAYOUT_SOURCE_FIRST,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
     document_parse_options: Mapping[str, object] | str | None = None,
+    target_language: str | None = None,
 ) -> bytes:
     order = _normalize_bilingual_layout_order(order)
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
@@ -208,7 +217,11 @@ def export_bilingual_docx_with_layout(
             order=order,
         )
 
-    _localize_numbering_definitions(package)
+    _localize_numbering_definitions(
+        package,
+        target_language=target_language,
+        strategy=document_parse_options.get("docx_numbering_localization"),
+    )
     if document_parse_options.get("clean_format"):
         _clean_story_formatting(stories)
     if not document_parse_options.get("preserve_hyperlinks", True):
@@ -226,6 +239,7 @@ def export_translated_docx(
     segments: Iterable[Any],
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
     document_parse_options: Mapping[str, object] | str | None = None,
+    target_language: str | None = None,
 ) -> bytes:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
@@ -258,7 +272,11 @@ def export_translated_docx(
             segments_by_block=segments_by_block,
         )
 
-    _localize_numbering_definitions(package)
+    _localize_numbering_definitions(
+        package,
+        target_language=target_language,
+        strategy=document_parse_options.get("docx_numbering_localization"),
+    )
     if document_parse_options.get("clean_format"):
         _clean_story_formatting(stories)
     if not document_parse_options.get("preserve_hyperlinks", True):
@@ -309,6 +327,9 @@ def _group_segments_by_block(
                 sentence_id=sentence_id,
                 source_text=str(_get_segment_value(segment, "source_text", "") or ""),
                 target_text=str(_get_segment_value(segment, "target_text", "") or ""),
+                display_text=str(_get_segment_value(segment, "display_text", "") or ""),
+                numbering_text=str(_get_segment_value(segment, "numbering_text", "") or ""),
+                matched_source_text=str(_get_segment_value(segment, "matched_source_text", "") or ""),
                 target_html=str(target_html) if target_html else None,
                 math_placeholders=dict(math_map.get(sentence_id) or {}),
             )
@@ -1164,7 +1185,13 @@ def _replace_block_tokens(
 
         segment = segments[segment_index]
         segment_index += 1
-        replacement = segment.target_text
+        replacement = strip_automatic_numbering_prefix(
+            segment.target_text,
+            source_text=segment.source_text,
+            display_text=segment.display_text,
+            numbering_text=segment.numbering_text,
+            reference_texts=[segment.matched_source_text],
+        )
         if previous_span is not None:
             boundary_text = display_text[previous_span.end:span.start]
             replacement = _normalize_adjacent_english_target_boundary(
@@ -1284,6 +1311,9 @@ def _build_inline_bilingual_segments(
                 sentence_id=segment.sentence_id,
                 source_text=segment.source_text,
                 target_text=replacement,
+                display_text=segment.display_text,
+                numbering_text=segment.numbering_text,
+                matched_source_text=segment.matched_source_text,
                 target_html=None,
                 math_placeholders=segment.math_placeholders,
             )
@@ -1463,6 +1493,7 @@ def _pick_reference_run(
 
 
 def _build_inserted_word_run(text: str, reference_run: ET.Element | None) -> ET.Element:
+    text = _sanitize_xml_text(text)
     if reference_run is not None and _namespace_uri(reference_run.tag) == NS["w"]:
         run_element = deepcopy(reference_run)
         for child in list(run_element):
@@ -1597,9 +1628,10 @@ def _build_formatted_word_run(
         _set_run_vertical_align(run_properties, "superscript")
 
     # 创建文本元素
+    fragment_text = _sanitize_xml_text(fragment.text)
     text_element = ET.Element(_qn("w", "t"))
-    text_element.text = fragment.text
-    if _needs_space_preserve(fragment.text):
+    text_element.text = fragment_text
+    if _needs_space_preserve(fragment_text):
         text_element.set(XML_SPACE_ATTR, "preserve")
     run_element.append(text_element)
 
@@ -1668,6 +1700,7 @@ def _apply_token_edits(tokens: list[TextToken]) -> None:
         for start, end, replacement in sorted(token.edits, key=lambda item: item[0], reverse=True):
             text_value = f"{text_value[:start]}{replacement}{text_value[end:]}"
 
+        text_value = _sanitize_xml_text(text_value)
         token.element.text = text_value
         if _needs_space_preserve(text_value):
             token.element.set(XML_SPACE_ATTR, "preserve")
@@ -1731,13 +1764,22 @@ def _namespace_uri(tag: str) -> str:
     return ""
 
 
-def _localize_numbering_definitions(package: DocxPackage) -> None:
+def _localize_numbering_definitions(
+    package: DocxPackage,
+    *,
+    target_language: str | None = None,
+    strategy: object = None,
+) -> None:
     numbering_root = package.read_xml("word/numbering.xml")
     if numbering_root is None:
         return
 
     for level in numbering_root.findall(".//w:lvl", NS):
-        localized_definition = _build_localized_numbering_definition(level)
+        localized_definition = _build_localized_numbering_definition(
+            level,
+            target_language=target_language,
+            strategy=strategy,
+        )
         if localized_definition is None:
             continue
 
@@ -1750,6 +1792,9 @@ def _localize_numbering_definitions(package: DocxPackage) -> None:
 
 def _build_localized_numbering_definition(
     level: ET.Element,
+    *,
+    target_language: str | None = None,
+    strategy: object = None,
 ) -> tuple[str, str, str] | None:
     lvl_text_element = level.find("./w:lvlText", NS)
     if lvl_text_element is None:
@@ -1763,6 +1808,14 @@ def _build_localized_numbering_definition(
     num_fmt_value = "decimal" if num_fmt_element is None else num_fmt_element.get(_qn("w", "val"), "decimal")
     suffix_element = level.find("./w:suff", NS)
     suffix_value = "tab" if suffix_element is None else suffix_element.get(_qn("w", "val"), "tab")
+
+    return build_localized_docx_numbering_definition(
+        num_fmt=num_fmt_value,
+        lvl_text=lvl_text_value,
+        suffix=suffix_value,
+        target_language=target_language,
+        strategy=strategy,
+    )
 
     for chinese_marker, english_label in (
         ("章", "Chapter"),
@@ -1858,12 +1911,9 @@ def _build_modified_docx(
             if root is None:
                 continue
 
-            _register_namespaces(source_archive.read(normalized_name))
-            modified_xml[normalized_name] = ET.tostring(
-                root,
-                encoding="utf-8",
-                xml_declaration=True,
-            )
+            original_xml = source_archive.read(normalized_name)
+            _register_namespaces(original_xml)
+            modified_xml[normalized_name] = _serialize_xml(root, original_xml)
 
         output = BytesIO()
         with ZipFile(output, "w") as target_archive:
@@ -1925,6 +1975,72 @@ def _register_namespaces(xml_bytes: bytes) -> None:
             continue
         seen_namespaces.add(key)
         ET.register_namespace(prefix or "", uri)
+
+
+def _serialize_xml(root: ET.Element, original_xml: bytes) -> bytes:
+    _restore_compatibility_namespace_declarations(root, original_xml)
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _restore_compatibility_namespace_declarations(root: ET.Element, original_xml: bytes) -> None:
+    namespaces = _extract_namespace_declarations(original_xml)
+    compatibility_prefixes = _collect_markup_compatibility_prefixes(root)
+
+    for prefix in compatibility_prefixes:
+        uri = namespaces.get(prefix)
+        if not uri or _namespace_uri_is_used(root, uri):
+            continue
+        root.set(f"xmlns:{prefix}", uri)
+
+
+def _extract_namespace_declarations(xml_bytes: bytes) -> dict[str, str]:
+    namespaces: dict[str, str] = {}
+    for _, namespace in ET.iterparse(BytesIO(xml_bytes), events=("start-ns",)):
+        prefix, uri = namespace
+        namespaces.setdefault(prefix or "", uri)
+    return namespaces
+
+
+def _collect_markup_compatibility_prefixes(root: ET.Element) -> set[str]:
+    prefixes: set[str] = set()
+    for element in root.iter():
+        if element.tag == f"{{{MC_NS}}}Choice":
+            prefixes.update(_extract_prefixes_from_compatibility_value(element.get("Requires", "")))
+        for attr_name, attr_value in element.attrib.items():
+            if attr_name.startswith(f"{{{MC_NS}}}") and attr_value:
+                prefixes.update(_extract_prefixes_from_compatibility_value(str(attr_value)))
+    return prefixes
+
+
+def _extract_prefixes_from_compatibility_value(value: str) -> set[str]:
+    prefixes: set[str] = set()
+    for token in value.split():
+        prefix = token.split(":", 1)[0].strip()
+        if prefix:
+            prefixes.add(prefix)
+    return prefixes
+
+
+def _namespace_uri_is_used(root: ET.Element, uri: str) -> bool:
+    namespace_prefix = f"{{{uri}}}"
+    for element in root.iter():
+        if element.tag.startswith(namespace_prefix):
+            return True
+        for attr_name in element.attrib:
+            if attr_name.startswith(namespace_prefix):
+                return True
+    return False
+
+
+def _sanitize_xml_text(text: str) -> str:
+    return "".join(
+        char
+        for char in str(text)
+        if char in "\t\n\r"
+        or 0x20 <= ord(char) <= 0xD7FF
+        or 0xE000 <= ord(char) <= 0xFFFD
+        or 0x10000 <= ord(char) <= 0x10FFFF
+    )
 
 
 def _resolve_segment_block_type(story_kind: str, block_type: str) -> str:

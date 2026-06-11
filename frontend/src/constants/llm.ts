@@ -1,4 +1,5 @@
 import type { LLMProvider, LLMTranslateScope } from '../types/api'
+import { translate } from '../i18n'
 
 export interface LLMOption<T extends string> {
   value: T
@@ -14,6 +15,29 @@ export interface LLMModelOption {
 }
 
 export const defaultLLMModelId = 'google/gemini-3.5-flash'
+
+export const llmModelShortLabelMap: Record<string, string> = {
+  'google/gemini-3.5-flash': 'Gemini 3.5',
+  'google/gemini-3.1-pro-preview': 'Gemini 3.1 Pro',
+  'google/gemini-3.1-flash-lite': 'Gemini 3.1 Lite',
+  'google/gemini-3-flash-preview': 'Gemini 3 Flash',
+  'google/gemini-2.5-pro': 'Gemini 2.5 Pro',
+  'google/gemini-2.5-flash': 'Gemini 2.5 Flash',
+  'google/gemini-2.5-flash-lite': 'Gemini 2.5 Lite',
+  'openai/gpt-chat-latest': 'GPT Chat',
+  'openai/gpt-5.4': 'GPT-5.4',
+  'openai/gpt-5.4-mini': 'GPT-5.4 Mini',
+  'openai/gpt-5.4-nano': 'GPT-5.4 Nano',
+  'openai/gpt-5.3-chat': 'GPT-5.3 Chat',
+  'openai/gpt-5.2': 'GPT-5.2',
+  'openai/gpt-5.2-chat': 'GPT-5.2 Chat',
+  'openai/gpt-5.1': 'GPT-5.1',
+  'openai/gpt-5.1-chat': 'GPT-5.1 Chat',
+  'openai/gpt-5-mini': 'GPT-5 Mini',
+  'openai/gpt-5-nano': 'GPT-5 Nano',
+  'deepseek/deepseek-chat': 'DeepSeek Chat',
+  'deepseek-chat': 'DeepSeek Chat',
+}
 
 export const llmModelOptions: LLMModelOption[] = [
   {
@@ -134,29 +158,34 @@ export const llmModelOptions: LLMModelOption[] = [
 
 export const llmScopeOptions: LLMOption<LLMTranslateScope>[] = [
   {
+    value: 'current_segment',
+    get label() { return translate('llm.scope.currentSegment.label') },
+    get description() { return translate('llm.scope.currentSegment.description') },
+  },
+  {
     value: 'all',
-    label: '全部未确认译文',
-    description: '处理模糊匹配和无匹配句段。',
+    get label() { return translate('llm.scope.all.label') },
+    get description() { return translate('llm.scope.all.description') },
   },
   {
     value: 'all_with_exact',
-    label: '全部句段',
-    description: '连同精确匹配句段一起重跑。',
+    get label() { return translate('llm.scope.allWithExact.label') },
+    get description() { return translate('llm.scope.allWithExact.description') },
   },
   {
     value: 'empty_target_only',
-    label: '仅空译文',
-    description: '只处理译文为空的句段，保留已有译文。',
+    get label() { return translate('llm.scope.emptyTargetOnly.label') },
+    get description() { return translate('llm.scope.emptyTargetOnly.description') },
   },
   {
     value: 'fuzzy_only',
-    label: '仅模糊匹配',
-    description: '只修正模糊匹配句段。',
+    get label() { return translate('llm.scope.fuzzyOnly.label') },
+    get description() { return translate('llm.scope.fuzzyOnly.description') },
   },
   {
     value: 'none_only',
-    label: '仅无匹配',
-    description: '只处理没有匹配结果的句段。',
+    get label() { return translate('llm.scope.noneOnly.label') },
+    get description() { return translate('llm.scope.noneOnly.description') },
   },
 ]
 
@@ -164,17 +193,17 @@ export const llmProviderOptions: LLMOption<LLMProvider>[] = [
   {
     value: 'deepseek',
     label: 'DeepSeek',
-    description: '使用 DeepSeek 提供的模型。',
+    get description() { return translate('llm.provider.deepseek.description') },
   },
   {
     value: 'auto',
-    label: '自动选择',
-    description: '按当前配置自动选择可用模型。',
+    get label() { return translate('llm.provider.auto.label') },
+    get description() { return translate('llm.provider.auto.description') },
   },
   {
     value: 'openrouter',
     label: 'OpenRouter',
-    description: '使用 OpenRouter 提供的模型。',
+    get description() { return translate('llm.provider.openrouter.description') },
   },
 ]
 
@@ -188,4 +217,39 @@ export function getLLMProviderLabel(provider: LLMProvider) {
 
 export function getLLMModelLabel(modelId: string) {
   return llmModelOptions.find((item) => item.id === modelId)?.name || modelId
+}
+
+function formatUnknownLLMModelShortLabel(modelId: string) {
+  const rawName = modelId.split('/').pop()?.replace(/:.+$/, '') || modelId
+  const tokenMap: Record<string, string> = {
+    chat: 'Chat',
+    claude: 'Claude',
+    deepseek: 'DeepSeek',
+    flash: 'Flash',
+    gemini: 'Gemini',
+    gpt: 'GPT',
+    haiku: 'Haiku',
+    latest: 'Latest',
+    lite: 'Lite',
+    mini: 'Mini',
+    nano: 'Nano',
+    opus: 'Opus',
+    preview: 'Preview',
+    pro: 'Pro',
+    sonnet: 'Sonnet',
+  }
+
+  return rawName
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map((token) => tokenMap[token.toLowerCase()] || token)
+    .join(' ')
+}
+
+export function getLLMModelShortLabel(modelId: string) {
+  const normalizedModelId = modelId.trim()
+  if (!normalizedModelId) {
+    return ''
+  }
+  return llmModelShortLabelMap[normalizedModelId] || formatUnknownLLMModelShortLabel(normalizedModelId)
 }

@@ -7,10 +7,12 @@ import {
   X,
 } from 'lucide-vue-next'
 import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 
 import { useToast } from '../../composables/useToast'
 
 const toast = useToast()
+const { t } = useI18n()
 
 const iconMap = {
   success: CheckCircle2,
@@ -42,8 +44,8 @@ const toasts = computed(() => toast.toasts.value)
           <button
             class="toast__close"
             type="button"
-            aria-label="关闭通知"
-            title="关闭"
+            :aria-label="t('common.actions.close')"
+            :title="t('common.actions.close')"
             @click="toast.remove(item.id)"
           >
             <X :size="14" />

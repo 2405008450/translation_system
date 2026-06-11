@@ -12,6 +12,7 @@ import type {
   LLMGuidelineOptions,
   LLMProvider,
   LLMTranslateScope,
+  ProjectSegmentSyncSummary,
   Segment,
   SegmentPageResponse,
   SegmentRevisionEntry,
@@ -27,6 +28,15 @@ const DEFAULT_SEGMENT_PAGE_SIZE = 100
 const MAX_SEGMENT_PAGE_SIZE = 500
 const AUTO_SYNC_DELAY_MS = 1500
 const CHANGE_POLL_INTERVAL_MS = 10000
+const EXPORT_POLL_INTERVAL_MS = 1200
+
+interface FileExportTask {
+  task_id: string
+  status: 'queued' | 'running' | 'completed' | 'failed'
+  progress: number
+  message?: string
+  error?: string | null
+}
 
 function createEmptySegmentStatusStats(): SegmentStatusStats {
   return {
@@ -887,6 +897,9 @@ export const useSegmentStore = defineStore('segment', () => {
       ...segment,
       source_text: sourceText,
       display_text: sourceText,
+      source_body_text: sourceText,
+      automatic_numbering_text: null,
+      target_automatic_numbering_text: null,
       source_html: null,
     }
     segments.value[index] = nextSegment
@@ -900,6 +913,33 @@ export const useSegmentStore = defineStore('segment', () => {
       // 恢复原值
       segments.value[index] = segment
       throw error
+    }
+  }
+
+  async function setProjectSyncDisabled(sentenceId: string, disabled: boolean) {
+    if (!fileRecord.value) {
+      return
+    }
+    try {
+      const { data } = await http.patch<Segment>(
+        `/file-records/${fileRecord.value.id}/segments/${sentenceId}/project-sync`,
+        { disabled },
+      )
+      applyServerSegments([data], false)
+      pushToast({
+        tone: 'success',
+        title: disabled ? '已关闭项目同步' : '已开启项目同步',
+        message: disabled
+          ? '该句段会保留当前译文，后续不再被相同原文自动同步覆盖。'
+          : '该句段已恢复项目内相同原文自动同步。',
+      })
+    } catch (error) {
+      console.error('Failed to update project sync:', error)
+      pushToast({
+        tone: 'error',
+        title: '同步开关更新失败',
+        message: String((error as any)?.response?.data?.detail || '请稍后重试。'),
+      })
     }
   }
 
@@ -983,6 +1023,7 @@ export const useSegmentStore = defineStore('segment', () => {
           skipped_no_collection_count: number
           skipped_invalid_count?: number
         }
+        project_sync?: ProjectSegmentSyncSummary
         segments?: Segment[]
       }>(`/file-records/${fileRecord.value.id}/segments`, {
         updates,
@@ -1036,6 +1077,13 @@ export const useSegmentStore = defineStore('segment', () => {
           tone: 'info',
           title: '未自动写入记忆库',
           message: '当前文件未绑定记忆库，确认译文已保存。',
+        })
+      }
+      if (data.project_sync?.filled_count) {
+        pushToast({
+          tone: 'success',
+          title: '项目同步完成',
+          message: `已自动填充 ${data.project_sync.filled_count} 条相同原文句段。`,
         })
       }
       const syncedAt = new Date()
@@ -1260,6 +1308,7 @@ export const useSegmentStore = defineStore('segment', () => {
           scope,
           provider,
           model: guidelineOptions.model || null,
+          sentence_id: guidelineOptions.sentenceId || null,
           guideline_template_id: guidelineOptions.guidelineTemplateId || null,
           temporary_prompt: guidelineOptions.temporaryPrompt || '',
         }),
@@ -1405,7 +1454,13 @@ export const useSegmentStore = defineStore('segment', () => {
       }
     }
 
-    const response = await http.get(`/file-records/${fileRecord.value.id}/export`, {
+    const { data: task } = await http.post<FileExportTask>(
+      `/file-records/${fileRecord.value.id}/exports`,
+      null,
+      { params: { type: 'original' } },
+    )
+    const completedTask = await waitForFileExportTask(task)
+    const response = await http.get(`/file-records/export-tasks/${completedTask.task_id}/download`, {
       responseType: 'blob',
     })
     const filename = resolveDownloadFilename(
@@ -1413,6 +1468,22 @@ export const useSegmentStore = defineStore('segment', () => {
       buildTranslatedTaskFilename(fileRecord.value.filename),
     )
     downloadBlob(response.data, filename)
+  }
+
+  async function waitForFileExportTask(task: FileExportTask) {
+    let currentTask = task
+    while (true) {
+      if (currentTask.status === 'completed') {
+        return currentTask
+      }
+      if (currentTask.status === 'failed') {
+        throw new Error(currentTask.error || currentTask.message || '导出失败。')
+      }
+
+      await new Promise((resolve) => window.setTimeout(resolve, EXPORT_POLL_INTERVAL_MS))
+      const { data } = await http.get<FileExportTask>(`/file-records/export-tasks/${currentTask.task_id}`)
+      currentTask = data
+    }
   }
 
   async function loadSaveToTMStats(scope: 'translated' | 'confirmed' | 'all' = 'translated') {
@@ -1533,6 +1604,7 @@ export const useSegmentStore = defineStore('segment', () => {
     ensureRevisionTrackingBaselines,
     loadTask,
     loadSegmentPage,
+    refreshCurrentSegmentPage,
     loadMoreSegments,
     ensureAllSegmentsLoaded,
     ensurePreviewLoaded,
@@ -1541,6 +1613,7 @@ export const useSegmentStore = defineStore('segment', () => {
     loadSaveToTMStats,
     updateTarget,
     updateSource,
+    setProjectSyncDisabled,
     setActiveSentence,
     getTermMatches,
     syncToBackend,

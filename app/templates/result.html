@@ -1187,9 +1187,9 @@
                 }
             };
             llmModel.addEventListener('change', () => {
-                const model = llmModel.value || '';
-                if (model.startsWith('google/') || model.startsWith('openai/')) {
-                    llmProvider.value = 'openrouter';
+                const selectedProvider = llmModel.selectedOptions[0]?.dataset.provider || '';
+                if (selectedProvider) {
+                    llmProvider.value = selectedProvider;
                 }
                 syncLlmModelOptions();
             });

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import re
+import csv
 import sqlite3
 import tempfile
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from typing import Literal
+from xml.etree import ElementTree as ET
 from uuid import UUID
 
 from openpyxl import load_workbook
@@ -18,9 +21,13 @@ from app.services.normalizer import build_source_hash, normalize_match_text, nor
 from app.services.tm_vector import sync_tm_embeddings
 
 
+CSV_EXTENSIONS = {".csv"}
+TMX_EXTENSIONS = {".tmx"}
+XLS_EXTENSIONS = {".xls"}
 XLSX_EXTENSIONS = {".xlsx"}
 SDLTM_EXTENSIONS = {".sdltm"}
-TM_IMPORT_EXTENSIONS = XLSX_EXTENSIONS | SDLTM_EXTENSIONS
+WORKBOOK_EXTENSIONS = XLSX_EXTENSIONS | XLS_EXTENSIONS
+TM_IMPORT_EXTENSIONS = CSV_EXTENSIONS | TMX_EXTENSIONS | WORKBOOK_EXTENSIONS | SDLTM_EXTENSIONS
 HEADER_ALIASES = {
     ("zh-cn", "en-us"),
     ("source", "target"),
@@ -38,10 +45,39 @@ class TMImportSummary:
     updated_rows: int
     skipped_empty_rows: int
     skipped_header_rows: int
+    skipped_duplicate_rows: int = 0
 
     @property
     def imported_rows(self) -> int:
         return self.created_rows + self.updated_rows
+
+
+@dataclass
+class TMImportPreviewRow:
+    row_index: int
+    source_text: str
+    target_text: str
+    status: str
+    message: str
+
+
+@dataclass
+class TMImportPreview:
+    filename: str
+    rows: list[TMImportPreviewRow]
+    total_rows: int
+    valid_rows: int
+    create_rows: int
+    update_rows: int
+    keep_rows: int
+    duplicate_rows: int
+    skipped_empty_rows: int
+    skipped_header_rows: int
+    preview_limit: int
+    duplicate_policy: str
+
+
+DuplicatePolicy = Literal["overwrite", "keep"]
 
 
 @dataclass
@@ -92,6 +128,59 @@ def preview_sdltm_metadata(raw_bytes: bytes) -> SDLTMMetadata:
         Path(tmp_path).unlink(missing_ok=True)
 
 
+def import_tm_from_upload(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+    skip_duplicate_row_indexes: set[int] | None = None,
+) -> TMImportSummary:
+    extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
+    if extension in CSV_EXTENSIONS:
+        return import_tm_from_csv_upload(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            source_language=source_language,
+            target_language=target_language,
+            batch_size=batch_size,
+            collection_id=collection_id,
+            creator_id=creator_id,
+            duplicate_policy=duplicate_policy,
+            skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        )
+    if extension in TMX_EXTENSIONS:
+        return import_tm_from_tmx_upload(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            source_language=source_language,
+            target_language=target_language,
+            batch_size=batch_size,
+            collection_id=collection_id,
+            creator_id=creator_id,
+            duplicate_policy=duplicate_policy,
+            skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        )
+    return import_tm_from_xlsx_upload(
+        db=db,
+        raw_bytes=raw_bytes,
+        filename=filename,
+        source_language=source_language,
+        target_language=target_language,
+        batch_size=batch_size,
+        collection_id=collection_id,
+        creator_id=creator_id,
+        duplicate_policy=duplicate_policy,
+        skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+    )
+
+
 def import_tm_from_xlsx_upload(
     db: Session,
     raw_bytes: bytes,
@@ -101,7 +190,25 @@ def import_tm_from_xlsx_upload(
     batch_size: int = 5000,
     collection_id: UUID | None = None,
     creator_id: UUID | None = None,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+    skip_duplicate_row_indexes: set[int] | None = None,
 ) -> TMImportSummary:
+    extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
+    if extension in XLS_EXTENSIONS:
+        rows = _iter_xls_rows(raw_bytes)
+        return _import_text_rows(
+            db=db,
+            rows=rows,
+            filename=filename,
+            batch_size=batch_size,
+            collection_id=collection_id,
+            creator_id=creator_id,
+            duplicate_policy=duplicate_policy,
+            skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+            source_language=source_language,
+            target_language=target_language,
+        )
+
     workbook = load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)
     return _import_workbook(
         db=db,
@@ -110,6 +217,8 @@ def import_tm_from_xlsx_upload(
         batch_size=batch_size,
         collection_id=collection_id,
         creator_id=creator_id,
+        duplicate_policy=duplicate_policy,
+        skip_duplicate_row_indexes=skip_duplicate_row_indexes,
         source_language=source_language,
         target_language=target_language,
     )
@@ -123,6 +232,8 @@ def import_tm_from_xlsx_path(
     batch_size: int = 5000,
     collection_id: UUID | None = None,
     creator_id: UUID | None = None,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+    skip_duplicate_row_indexes: set[int] | None = None,
 ) -> TMImportSummary:
     workbook = load_workbook(Path(xlsx_path), read_only=True, data_only=True)
     return _import_workbook(
@@ -132,9 +243,368 @@ def import_tm_from_xlsx_path(
         batch_size=batch_size,
         collection_id=collection_id,
         creator_id=creator_id,
+        duplicate_policy=duplicate_policy,
+        skip_duplicate_row_indexes=skip_duplicate_row_indexes,
         source_language=source_language,
         target_language=target_language,
     )
+
+
+def import_tm_from_csv_upload(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+    skip_duplicate_row_indexes: set[int] | None = None,
+) -> TMImportSummary:
+    rows = _iter_csv_rows(raw_bytes)
+    return _import_text_rows(
+        db=db,
+        rows=rows,
+        filename=filename,
+        batch_size=batch_size,
+        collection_id=collection_id,
+        creator_id=creator_id,
+        duplicate_policy=duplicate_policy,
+        skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        source_language=source_language,
+        target_language=target_language,
+    )
+
+
+def import_tm_from_tmx_upload(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+    skip_duplicate_row_indexes: set[int] | None = None,
+) -> TMImportSummary:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    rows = _iter_tmx_rows(raw_bytes, normalized_source_language, normalized_target_language)
+    return _import_text_rows(
+        db=db,
+        rows=rows,
+        filename=filename,
+        batch_size=batch_size,
+        collection_id=collection_id,
+        creator_id=creator_id,
+        duplicate_policy=duplicate_policy,
+        skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
+    )
+
+
+def preview_tm_from_upload(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    collection_id: UUID | None,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+    preview_limit: int = 100,
+) -> TMImportPreview:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    rows = _iter_upload_rows(
+        raw_bytes,
+        filename,
+        normalized_source_language,
+        normalized_target_language,
+    )
+    preview_rows: list[TMImportPreviewRow] = []
+    source_hashes: set[str] = set()
+    source_texts: set[str] = set()
+    final_candidates: dict[str, dict] = {}
+    skipped_empty_rows = 0
+    skipped_header_rows = 0
+    total_rows = 0
+    duplicate_rows = 0
+
+    for row_index, row in enumerate(rows, start=1):
+        total_rows += 1
+        source_text = normalize_text(_cell_to_text(row, 0))
+        target_text = normalize_text(_cell_to_text(row, 1))
+
+        if row_index == 1 and _looks_like_header(source_text, target_text):
+            skipped_header_rows += 1
+            _append_preview_row(
+                preview_rows,
+                preview_limit,
+                TMImportPreviewRow(row_index, source_text, target_text, "header", "识别为表头，导入时会跳过。"),
+            )
+            continue
+
+        if not source_text or not target_text:
+            skipped_empty_rows += 1
+            _append_preview_row(
+                preview_rows,
+                preview_limit,
+                TMImportPreviewRow(row_index, source_text, target_text, "empty", "源文或译文为空，导入时会跳过。"),
+            )
+            continue
+
+        tm_row = _build_tm_row(
+            source_text=source_text,
+            target_text=target_text,
+            source_language=normalized_source_language,
+            target_language=normalized_target_language,
+            collection_id=collection_id,
+        )
+        source_hash = tm_row["source_hash"]
+        status = "pending"
+        message = "待导入。"
+        if source_hash in source_hashes or source_text in source_texts:
+            duplicate_rows += 1
+            status = "duplicate"
+            message = "文件内重复，导入时会保留首次出现的数据。" if duplicate_policy == "keep" else "文件内重复，导入时以后出现的这一条为准。"
+            if duplicate_policy == "keep":
+                _append_preview_row(
+                    preview_rows,
+                    preview_limit,
+                    TMImportPreviewRow(row_index, source_text, target_text, status, message),
+                )
+                continue
+
+        source_hashes.add(source_hash)
+        source_texts.add(source_text)
+        final_candidates[source_hash] = tm_row
+        _append_preview_row(
+            preview_rows,
+            preview_limit,
+            TMImportPreviewRow(row_index, source_text, target_text, status, message),
+        )
+
+    existing_status = _load_existing_tm_status(
+        db=db,
+        collection_id=collection_id,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
+        source_hashes=list(source_hashes),
+        source_texts=list(source_texts),
+    )
+
+    create_rows = 0
+    update_rows = 0
+    keep_rows = 0
+    for candidate in final_candidates.values():
+        exists = candidate["source_hash"] in existing_status or candidate["source_text"] in existing_status
+        if not exists:
+            create_rows += 1
+        elif duplicate_policy == "keep":
+            keep_rows += 1
+        else:
+            update_rows += 1
+
+    for preview_row in preview_rows:
+        if preview_row.status != "pending":
+            continue
+        source_hash = build_source_hash(preview_row.source_text)
+        exists = source_hash in existing_status or preview_row.source_text in existing_status
+        if not exists:
+            preview_row.status = "create"
+            preview_row.message = "导入时会新增。"
+        elif duplicate_policy == "keep":
+            preview_row.status = "keep"
+            preview_row.message = "记忆库中已有相同源文，导入时会保留旧数据并跳过这一条。"
+        else:
+            preview_row.status = "update"
+            preview_row.message = "记忆库中已有相同源文，导入时会用新译文覆盖。"
+
+    return TMImportPreview(
+        filename=filename,
+        rows=preview_rows,
+        total_rows=total_rows,
+        valid_rows=len(final_candidates),
+        create_rows=create_rows,
+        update_rows=update_rows,
+        keep_rows=keep_rows,
+        duplicate_rows=duplicate_rows,
+        skipped_empty_rows=skipped_empty_rows,
+        skipped_header_rows=skipped_header_rows,
+        preview_limit=preview_limit,
+        duplicate_policy=duplicate_policy,
+    )
+
+
+def _iter_upload_rows(raw_bytes: bytes, filename: str, source_language: str, target_language: str):
+    extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
+    if extension in CSV_EXTENSIONS:
+        return _iter_csv_rows(raw_bytes)
+    if extension in TMX_EXTENSIONS:
+        return _iter_tmx_rows(raw_bytes, source_language, target_language)
+    if extension in SDLTM_EXTENSIONS:
+        return _iter_sdltm_rows(raw_bytes)
+    if extension in XLS_EXTENSIONS:
+        return _iter_xls_rows(raw_bytes)
+    if extension not in XLSX_EXTENSIONS:
+        raise RuntimeError("仅支持上传 .tmx、.sdltm、.xls、.xlsx 或 .csv 文件。")
+
+    workbook = load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)
+
+    def iter_workbook_rows():
+        try:
+            yield from workbook.active.iter_rows(values_only=True)
+        finally:
+            workbook.close()
+
+    return iter_workbook_rows()
+
+
+def _append_preview_row(
+    rows: list[TMImportPreviewRow],
+    preview_limit: int,
+    row: TMImportPreviewRow,
+) -> None:
+    if len(rows) < preview_limit:
+        rows.append(row)
+
+
+def _load_existing_tm_status(
+    db: Session,
+    collection_id: UUID | None,
+    source_language: str,
+    target_language: str,
+    source_hashes: list[str],
+    source_texts: list[str],
+) -> set[str]:
+    if not source_hashes and not source_texts:
+        return set()
+
+    existing_query = (
+        db.query(MemoryEntry.source_hash, MemoryEntry.source_text)
+        .filter(
+            or_(
+                MemoryEntry.source_hash.in_(source_hashes or [""]),
+                MemoryEntry.source_text.in_(source_texts or [""]),
+            ),
+            MemoryEntry.source_language == source_language,
+            MemoryEntry.target_language == target_language,
+        )
+    )
+    if collection_id is None:
+        existing_query = existing_query.filter(MemoryEntry.collection_id.is_(None))
+    else:
+        existing_query = existing_query.filter(MemoryEntry.collection_id == collection_id)
+
+    keys: set[str] = set()
+    for source_hash, source_text in existing_query.all():
+        if source_hash:
+            keys.add(source_hash)
+        if source_text:
+            keys.add(source_text)
+    return keys
+
+
+def _iter_csv_rows(raw_bytes: bytes):
+    text = _decode_csv_bytes(raw_bytes)
+    sample = text[:4096]
+    try:
+        dialect = csv.Sniffer().sniff(sample)
+    except csv.Error:
+        dialect = csv.excel
+    reader = csv.reader(text.splitlines(), dialect)
+    for row in reader:
+        yield tuple(row)
+
+
+def _iter_xls_rows(raw_bytes: bytes):
+    try:
+        import xlrd
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("导入 .xls 文件需要安装 xlrd 依赖。") from exc
+
+    workbook = xlrd.open_workbook(file_contents=raw_bytes)
+    sheet = workbook.sheet_by_index(0)
+    for row_index in range(sheet.nrows):
+        yield tuple(sheet.cell_value(row_index, column_index) for column_index in range(sheet.ncols))
+
+
+def _iter_tmx_rows(raw_bytes: bytes, source_language: str, target_language: str):
+    root = ET.fromstring(raw_bytes)
+    for translation_unit in root.findall(".//{*}tu"):
+        language_segments: list[tuple[str, str]] = []
+        for tuv in translation_unit.findall("{*}tuv"):
+            language = (
+                tuv.attrib.get("{http://www.w3.org/XML/1998/namespace}lang")
+                or tuv.attrib.get("lang")
+                or tuv.attrib.get("xml:lang")
+                or ""
+            )
+            segment = tuv.find("{*}seg")
+            if segment is None:
+                continue
+            text = normalize_text("".join(segment.itertext()))
+            if text:
+                language_segments.append((language, text))
+
+        source_text = _find_tmx_language_text(language_segments, source_language)
+        target_text = _find_tmx_language_text(language_segments, target_language)
+        if (not source_text or not target_text) and len(language_segments) >= 2:
+            source_text = source_text or language_segments[0][1]
+            target_text = target_text or language_segments[1][1]
+        yield (source_text, target_text)
+
+
+def _iter_sdltm_rows(raw_bytes: bytes):
+    with tempfile.NamedTemporaryFile(suffix=".sdltm", delete=False) as tmp:
+        tmp.write(raw_bytes)
+        tmp_path = tmp.name
+
+    conn = None
+    try:
+        conn = sqlite3.connect(tmp_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT source_segment, target_segment
+            FROM translation_units
+            WHERE source_segment IS NOT NULL AND target_segment IS NOT NULL
+            """
+        )
+        for raw_source, raw_target in cursor.fetchall():
+            yield (_extract_sdltm_text(raw_source), _extract_sdltm_text(raw_target))
+    finally:
+        if conn is not None:
+            conn.close()
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def _decode_csv_bytes(raw_bytes: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            return raw_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw_bytes.decode("utf-8", errors="replace")
+
+
+def _find_tmx_language_text(language_segments: list[tuple[str, str]], language: str) -> str:
+    normalized_language = _normalize_language_tag(language)
+    for candidate_language, text in language_segments:
+        if _normalize_language_tag(candidate_language) == normalized_language:
+            return text
+    primary_language = normalized_language.split("-", 1)[0]
+    for candidate_language, text in language_segments:
+        if _normalize_language_tag(candidate_language).split("-", 1)[0] == primary_language:
+            return text
+    return ""
 
 
 def _import_workbook(
@@ -146,19 +616,52 @@ def _import_workbook(
     target_language: str,
     collection_id: UUID | None = None,
     creator_id: UUID | None = None,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+    skip_duplicate_row_indexes: set[int] | None = None,
+) -> TMImportSummary:
+    worksheet = workbook.active
+    try:
+        return _import_text_rows(
+            db=db,
+            rows=worksheet.iter_rows(values_only=True),
+            filename=filename,
+            batch_size=batch_size,
+            collection_id=collection_id,
+            creator_id=creator_id,
+            duplicate_policy=duplicate_policy,
+            skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+            source_language=source_language,
+            target_language=target_language,
+        )
+    finally:
+        workbook.close()
+
+
+def _import_text_rows(
+    db: Session,
+    rows,
+    filename: str,
+    batch_size: int,
+    source_language: str,
+    target_language: str,
+    collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+    skip_duplicate_row_indexes: set[int] | None = None,
 ) -> TMImportSummary:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
         target_language,
     )
-    worksheet = workbook.active
     batch_rows: dict[str, dict] = {}
     created_rows = 0
     updated_rows = 0
     skipped_empty_rows = 0
     skipped_header_rows = 0
+    skipped_duplicate_rows = 0
+    skipped_row_indexes = skip_duplicate_row_indexes or set()
 
-    for row_index, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+    for row_index, row in enumerate(rows, start=1):
         source_text = normalize_text(_cell_to_text(row, 0))
         target_text = normalize_text(_cell_to_text(row, 1))
 
@@ -170,6 +673,10 @@ def _import_workbook(
             skipped_empty_rows += 1
             continue
 
+        if row_index in skipped_row_indexes:
+            skipped_duplicate_rows += 1
+            continue
+
         tm_row = _build_tm_row(
             source_text=source_text,
             target_text=target_text,
@@ -178,40 +685,47 @@ def _import_workbook(
             collection_id=collection_id,
             creator_id=creator_id,
         )
+        if duplicate_policy == "keep" and tm_row["source_hash"] in batch_rows:
+            skipped_duplicate_rows += 1
+            continue
         batch_rows[tm_row["source_hash"]] = tm_row
 
         if len(batch_rows) >= batch_size:
-            created_in_batch, updated_in_batch = _flush_tm_batch(
+            created_in_batch, updated_in_batch, skipped_duplicate_in_batch = _flush_tm_batch(
                 db=db,
                 batch_rows=list(batch_rows.values()),
                 collection_id=collection_id,
                 creator_id=creator_id,
+                duplicate_policy=duplicate_policy,
                 source_language=normalized_source_language,
                 target_language=normalized_target_language,
             )
             created_rows += created_in_batch
             updated_rows += updated_in_batch
+            skipped_duplicate_rows += skipped_duplicate_in_batch
             batch_rows.clear()
 
     if batch_rows:
-        created_in_batch, updated_in_batch = _flush_tm_batch(
+        created_in_batch, updated_in_batch, skipped_duplicate_in_batch = _flush_tm_batch(
             db=db,
             batch_rows=list(batch_rows.values()),
             collection_id=collection_id,
             creator_id=creator_id,
+            duplicate_policy=duplicate_policy,
             source_language=normalized_source_language,
             target_language=normalized_target_language,
         )
         created_rows += created_in_batch
         updated_rows += updated_in_batch
+        skipped_duplicate_rows += skipped_duplicate_in_batch
 
-    workbook.close()
     return TMImportSummary(
         filename=filename,
         created_rows=created_rows,
         updated_rows=updated_rows,
         skipped_empty_rows=skipped_empty_rows,
         skipped_header_rows=skipped_header_rows,
+        skipped_duplicate_rows=skipped_duplicate_rows,
     )
 
 
@@ -242,9 +756,10 @@ def _flush_tm_batch(
     target_language: str,
     collection_id: UUID | None = None,
     creator_id: UUID | None = None,
-) -> tuple[int, int]:
+    duplicate_policy: DuplicatePolicy = "overwrite",
+) -> tuple[int, int, int]:
     if not batch_rows:
-        return 0, 0
+        return 0, 0, 0
 
     source_hashes = [row["source_hash"] for row in batch_rows]
     source_texts = [row["source_text"] for row in batch_rows]
@@ -274,6 +789,7 @@ def _flush_tm_batch(
 
     created_rows = 0
     updated_rows = 0
+    skipped_duplicate_rows = 0
     sync_candidates: list[MemoryEntry] = []
     for row in batch_rows:
         existing = existing_by_hash.get(row["source_hash"]) or existing_by_source_text.get(
@@ -284,6 +800,12 @@ def _flush_tm_batch(
             db.add(tm_row)
             sync_candidates.append(tm_row)
             created_rows += 1
+            continue
+
+        if duplicate_policy == "keep":
+            existing_by_hash[row["source_hash"]] = existing
+            existing_by_source_text[row["source_text"]] = existing
+            skipped_duplicate_rows += 1
             continue
 
         existing.source_text = row["source_text"]
@@ -308,7 +830,7 @@ def _flush_tm_batch(
     )
     db.commit()
     sync_tm_embeddings(db, sync_rows)
-    return created_rows, updated_rows
+    return created_rows, updated_rows, skipped_duplicate_rows
 
 
 def _cell_to_text(row: tuple, index: int) -> str:
@@ -316,6 +838,10 @@ def _cell_to_text(row: tuple, index: int) -> str:
         return ""
     value = row[index]
     return "" if value is None else str(value)
+
+
+def _normalize_language_tag(language: str) -> str:
+    return (language or "").strip().lower().replace("_", "-")
 
 
 def _looks_like_header(source_text: str, target_text: str) -> bool:
@@ -339,6 +865,8 @@ def import_tm_from_sdltm_upload(
     batch_size: int = 5000,
     collection_id: UUID | None = None,
     creator_id: UUID | None = None,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+    skip_duplicate_row_indexes: set[int] | None = None,
 ) -> TMImportSummary:
     """Import translation memory from an uploaded SDLTM file."""
     with tempfile.NamedTemporaryFile(suffix=".sdltm", delete=False) as tmp:
@@ -353,6 +881,8 @@ def import_tm_from_sdltm_upload(
             batch_size=batch_size,
             collection_id=collection_id,
             creator_id=creator_id,
+            duplicate_policy=duplicate_policy,
+            skip_duplicate_row_indexes=skip_duplicate_row_indexes,
             source_language=source_language,
             target_language=target_language,
         )
@@ -368,6 +898,8 @@ def import_tm_from_sdltm_path(
     batch_size: int = 5000,
     collection_id: UUID | None = None,
     creator_id: UUID | None = None,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+    skip_duplicate_row_indexes: set[int] | None = None,
 ) -> TMImportSummary:
     """Import translation memory from an SDLTM file path."""
     return _import_sdltm(
@@ -377,6 +909,8 @@ def import_tm_from_sdltm_path(
         batch_size=batch_size,
         collection_id=collection_id,
         creator_id=creator_id,
+        duplicate_policy=duplicate_policy,
+        skip_duplicate_row_indexes=skip_duplicate_row_indexes,
         source_language=source_language,
         target_language=target_language,
     )
@@ -391,6 +925,8 @@ def _import_sdltm(
     target_language: str,
     collection_id: UUID | None = None,
     creator_id: UUID | None = None,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+    skip_duplicate_row_indexes: set[int] | None = None,
 ) -> TMImportSummary:
     """Core SDLTM import logic."""
     normalized_source_language, normalized_target_language = require_language_pair(
@@ -402,6 +938,8 @@ def _import_sdltm(
     created_rows = 0
     updated_rows = 0
     skipped_empty_rows = 0
+    skipped_duplicate_rows = 0
+    skipped_row_indexes = skip_duplicate_row_indexes or set()
 
     conn = sqlite3.connect(sdltm_path)
     try:
@@ -419,7 +957,7 @@ def _import_sdltm(
 
         cursor.execute(query)
 
-        for row in cursor.fetchall():
+        for row_index, row in enumerate(cursor.fetchall(), start=1):
             _, raw_source, raw_target = row
 
             # Extract text from SDLTM XML format
@@ -430,6 +968,10 @@ def _import_sdltm(
                 skipped_empty_rows += 1
                 continue
 
+            if row_index in skipped_row_indexes:
+                skipped_duplicate_rows += 1
+                continue
+
             tm_row = _build_tm_row(
                 source_text=source_text,
                 target_text=target_text,
@@ -438,32 +980,39 @@ def _import_sdltm(
                 collection_id=collection_id,
                 creator_id=creator_id,
             )
+            if duplicate_policy == "keep" and tm_row["source_hash"] in batch_rows:
+                skipped_duplicate_rows += 1
+                continue
             batch_rows[tm_row["source_hash"]] = tm_row
 
             if len(batch_rows) >= batch_size:
-                created_in_batch, updated_in_batch = _flush_tm_batch(
+                created_in_batch, updated_in_batch, skipped_duplicate_in_batch = _flush_tm_batch(
                     db=db,
                     batch_rows=list(batch_rows.values()),
                     collection_id=collection_id,
                     creator_id=creator_id,
+                    duplicate_policy=duplicate_policy,
                     source_language=normalized_source_language,
                     target_language=normalized_target_language,
                 )
                 created_rows += created_in_batch
                 updated_rows += updated_in_batch
+                skipped_duplicate_rows += skipped_duplicate_in_batch
                 batch_rows.clear()
 
         if batch_rows:
-            created_in_batch, updated_in_batch = _flush_tm_batch(
+            created_in_batch, updated_in_batch, skipped_duplicate_in_batch = _flush_tm_batch(
                 db=db,
                 batch_rows=list(batch_rows.values()),
                 collection_id=collection_id,
                 creator_id=creator_id,
+                duplicate_policy=duplicate_policy,
                 source_language=normalized_source_language,
                 target_language=normalized_target_language,
             )
             created_rows += created_in_batch
             updated_rows += updated_in_batch
+            skipped_duplicate_rows += skipped_duplicate_in_batch
 
     finally:
         conn.close()
@@ -474,6 +1023,7 @@ def _import_sdltm(
         updated_rows=updated_rows,
         skipped_empty_rows=skipped_empty_rows,
         skipped_header_rows=0,
+        skipped_duplicate_rows=skipped_duplicate_rows,
     )
 
 

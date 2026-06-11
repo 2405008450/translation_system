@@ -1,8 +1,10 @@
 <script setup lang="ts">
+import { Link2, Link2Off } from 'lucide-vue-next'
 import { computed, onMounted, ref, watch, nextTick } from 'vue'
 
 import InteractiveDiffText from './InteractiveDiffText.vue'
 
+import { getLLMModelShortLabel } from '../constants/llm'
 import { getSegmentSourceMeta, getSegmentStatusMeta } from '../constants/status'
 import type { Segment, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
 import { computeDiff } from '../utils/textDiff'
@@ -19,6 +21,7 @@ const props = withDefaults(defineProps<{
   revisionBusy?: boolean
   matchedTerms?: TermEntryRecord[]
   sourceSearchQuery?: string
+  targetSearchQuery?: string
   showVisibleChars?: boolean
   pendingFormats?: Record<TextFormat, boolean> & { _overrideActive?: boolean }
 }>(), {
@@ -29,6 +32,7 @@ const props = withDefaults(defineProps<{
   revisionBusy: false,
   matchedTerms: () => [],
   sourceSearchQuery: '',
+  targetSearchQuery: '',
   showVisibleChars: false,
   pendingFormats: () => ({
     bold: false,
@@ -48,6 +52,7 @@ const emit = defineEmits<{
   activateTarget: [sentenceId: string]
   applyPartialRevision: [revisionId: string, newText: string]
   ctrlClick: [sentenceId: string, event: MouseEvent]
+  toggleProjectSync: [sentenceId: string, disabled: boolean]
 }>()
 
 const editorRef = ref<HTMLDivElement | null>(null)
@@ -99,21 +104,33 @@ const statusMeta = computed(() => getSegmentStatusMeta(props.segment.status))
 const sourceMeta = computed(() => getSegmentSourceMeta(props.segment.source))
 const sourceLabel = computed(() => {
   if (props.segment.source === 'llm') {
-    return props.segment.llm_model?.trim() || sourceMeta.value.label
+    const modelId = props.segment.llm_model?.trim()
+    return modelId ? getLLMModelShortLabel(modelId) : sourceMeta.value.label
   }
   return sourceMeta.value.label
 })
+const compactSourceLabel = computed(() => (
+  props.segment.source === 'project_sync' ? '同步' : sourceLabel.value
+))
+const workflowLabel = computed(() => props.segment.workflow_step_name || '翻译')
 const showStatusTag = computed(() => {
   const status = props.segment.status || 'none'
   return status !== 'none' && status !== 'fuzzy'
 })
 const showSourceTag = computed(() => {
-  if (props.segment.status === 'none' || props.segment.status === 'fuzzy') {
+  const source = props.segment.source || 'none'
+  if (source === 'none' || source === 'fuzzy') {
     return false
   }
-  const source = props.segment.source || 'none'
-  return source !== 'none' && source !== 'fuzzy'
+  if (source === 'llm') {
+    return !isEmptyTarget.value
+  }
+  return props.segment.status !== 'none' && props.segment.status !== 'fuzzy'
 })
+const showProjectSyncToggle = computed(() => props.segment.source === 'project_sync' || Boolean(props.segment.project_sync_disabled))
+const projectSyncToggleLabel = computed(() => (
+  props.segment.project_sync_disabled ? '开启同步' : '关闭同步'
+))
 const sourceTitle = computed(() => {
   if (props.segment.source === 'llm' && props.segment.llm_model?.trim()) {
     return props.segment.llm_provider
@@ -236,7 +253,19 @@ function highlightSearchText(text: string, keyword: string): HighlightPart[] | n
   return segments
 }
 
-const sourceTextContent = computed(() => props.segment.display_text || props.segment.source_text || '')
+const automaticNumberingTitle = 'Word 自动编号，导出时会自动生成，译文无需输入编号'
+const automaticNumberingText = computed(() => (props.segment.automatic_numbering_text || '').trim())
+const hasAutomaticNumbering = computed(() => automaticNumberingText.value.length > 0)
+const targetAutomaticNumberingText = computed(() => (
+  props.segment.target_automatic_numbering_text || automaticNumberingText.value
+).trim())
+const hasTargetAutomaticNumbering = computed(() => targetAutomaticNumberingText.value.length > 0)
+const sourceTextContent = computed(() => {
+  if (hasAutomaticNumbering.value) {
+    return props.segment.source_body_text || props.segment.source_text || ''
+  }
+  return props.segment.display_text || props.segment.source_text || ''
+})
 
 const highlightedSourceText = computed(() => {
   const text = sourceTextContent.value
@@ -246,14 +275,14 @@ const highlightedSourceText = computed(() => {
 // 高亮译文中匹配的术语
 const highlightedTargetText = computed(() => {
   const text = props.segment.target_text || ''
-  return highlightText(text, props.matchedTerms || [], 'target_text')
+  return highlightSearchText(text, props.targetSearchQuery) || highlightText(text, props.matchedTerms || [], 'target_text')
 })
 
 // 生成带高亮的 HTML
 const targetHtmlContent = computed(() => {
   // 如果有保存的格式化 HTML，优先使用
-  if (props.segment.target_html) {
-    return sanitizeHtml(props.segment.target_html)
+  if (props.segment.target_html && !hasAutomaticNumbering.value) {
+    return renderTargetHtmlWithHighlights(sanitizeHtml(props.segment.target_html))
   }
 
   return renderTargetWithSourceFormats(props.segment.target_text || '')
@@ -293,8 +322,8 @@ function renderHighlightPartsAsHtml(parts: HighlightPart[] | null, text: string)
   return sourceParts
     .map((seg) =>
       seg.highlight
-        ? `<mark class="${seg.kind === 'search' ? 'segment-row__search-highlight' : 'segment-row__term-highlight'}">${escapeHtml(seg.text)}</mark>`
-        : escapeHtml(seg.text)
+        ? `<mark class="${seg.kind === 'search' ? 'segment-row__search-highlight' : 'segment-row__term-highlight'}">${textToVisibleChars(seg.text)}</mark>`
+        : textToVisibleChars(seg.text)
     )
     .join('')
 }
@@ -311,8 +340,27 @@ function hasSourceHighlights(): boolean {
   return Boolean(props.sourceSearchQuery.trim()) || (props.matchedTerms || []).some((term) => Boolean(term.source_text))
 }
 
+function renderTargetTextWithHighlights(text: string): string {
+  const parts = highlightSearchText(text, props.targetSearchQuery)
+    || highlightText(text, props.matchedTerms || [], 'target_text')
+  if (!parts) {
+    return textToVisibleChars(text)
+  }
+  return parts
+    .map((seg) =>
+      seg.highlight
+        ? `<mark class="${seg.kind === 'search' ? 'segment-row__search-highlight' : 'segment-row__term-highlight'}">${textToVisibleChars(seg.text)}</mark>`
+        : textToVisibleChars(seg.text)
+    )
+    .join('')
+}
+
+function hasTargetHighlights(): boolean {
+  return Boolean(props.targetSearchQuery.trim()) || (props.matchedTerms || []).some((term) => Boolean(term.target_text))
+}
+
 function renderSourceHtmlWithHighlights(sourceHtml: string): string {
-  if (!hasSourceHighlights() || typeof document === 'undefined') {
+  if (typeof document === 'undefined') {
     return sourceHtml
   }
 
@@ -324,7 +372,49 @@ function renderSourceHtmlWithHighlights(sourceHtml: string): string {
       const text = node.textContent || ''
       if (!text) return
       const wrapper = document.createElement('span')
-      wrapper.innerHTML = renderSourceTextWithHighlights(text)
+      wrapper.innerHTML = hasSourceHighlights()
+        ? renderSourceTextWithHighlights(text)
+        : textToVisibleChars(text)
+      const textNode = node as ChildNode
+      textNode.replaceWith(...Array.from(wrapper.childNodes))
+      return
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      return
+    }
+
+    const element = node as HTMLElement
+    if (
+      element.matches('script, style')
+      || element.classList.contains('doc-math')
+      || element.classList.contains('segment-row__term-highlight')
+      || element.classList.contains('segment-row__search-highlight')
+    ) {
+      return
+    }
+
+    Array.from(element.childNodes).forEach(processNode)
+  }
+
+  Array.from(template.content.childNodes).forEach(processNode)
+  return template.innerHTML
+}
+
+function renderTargetHtmlWithHighlights(targetHtml: string): string {
+  if (!hasTargetHighlights() || typeof document === 'undefined') {
+    return targetHtml
+  }
+
+  const template = document.createElement('template')
+  template.innerHTML = targetHtml
+
+  function processNode(node: Node) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent || ''
+      if (!text) return
+      const wrapper = document.createElement('span')
+      wrapper.innerHTML = renderTargetTextWithHighlights(text)
       const textNode = node as ChildNode
       textNode.replaceWith(...Array.from(wrapper.childNodes))
       return
@@ -352,7 +442,7 @@ function renderSourceHtmlWithHighlights(sourceHtml: string): string {
 }
 
 const sourceHtmlContent = computed(() => {
-  if (props.segment.source_html) {
+  if (props.segment.source_html && !hasAutomaticNumbering.value) {
     return renderSourceHtmlWithHighlights(sanitizeHtml(props.segment.source_html))
   }
   return renderHighlightPartsAsHtml(highlightedSourceText.value, sourceTextContent.value)
@@ -371,17 +461,7 @@ function textToVisibleChars(text: string): string {
 }
 
 function renderTargetTextHtml(text: string): string {
-  const segments = highlightText(text, props.matchedTerms || [], 'target_text')
-  if (!segments) {
-    return textToVisibleChars(text)
-  }
-  return segments
-    .map((seg) =>
-      seg.highlight
-        ? `<mark class="segment-row__term-highlight">${textToVisibleChars(seg.text)}</mark>`
-        : textToVisibleChars(seg.text)
-    )
-    .join('')
+  return renderTargetTextWithHighlights(text)
 }
 
 // 保存和恢复光标位置
@@ -793,6 +873,13 @@ function handleClick(event?: MouseEvent) {
   emit('activateTarget', props.segment.sentence_id)
 }
 
+function handleProjectSyncToggle() {
+  if (props.disabled) {
+    return
+  }
+  emit('toggleProjectSync', props.segment.sentence_id, !props.segment.project_sync_disabled)
+}
+
 function handleSourceFocus() {
   isSourceFocused.value = true
 }
@@ -803,7 +890,7 @@ function handleSourceBlur() {
 
 function handleSourceInput() {
   if (!sourceEditorRef.value) return
-  if (!props.sourceEditing) {
+  if (!props.sourceEditing || props.disabled) {
     // 非编辑模式下恢复原文内容
     syncSourceEditorFromState(true)
     return
@@ -813,7 +900,7 @@ function handleSourceInput() {
 }
 
 function handleSourceBeforeInput(event: Event) {
-  if (!props.sourceEditing) {
+  if (!props.sourceEditing || props.disabled) {
     event.preventDefault()
   }
 }
@@ -1014,18 +1101,29 @@ function handlePaste(event: ClipboardEvent) {
 
   if (html) {
     // 清理 HTML，只保留允许的格式标签
-    const cleanHtml = sanitizeHtml(html)
-    document.execCommand('insertHTML', false, cleanHtml)
+    const cleanHtml = sanitizeHtml(html, { dropStructuralWhitespace: true })
+    if (hasSerializableFormatTags(cleanHtml)) {
+      document.execCommand('insertHTML', false, cleanHtml)
+    } else {
+      document.execCommand('insertText', false, text)
+    }
   } else {
     document.execCommand('insertText', false, text)
   }
   handleInput()
 }
 
+function hasSerializableFormatTags(html: string): boolean {
+  return /<(b|i|u|s|sub|sup)>/i.test(html)
+}
+
 /**
  * 清理 HTML，只保留允许的格式标签
  */
-function sanitizeHtml(html: string): string {
+function sanitizeHtml(
+  html: string,
+  options: { dropStructuralWhitespace?: boolean } = {},
+): string {
   if (typeof document === 'undefined') {
     return escapeHtml(html)
   }
@@ -1036,7 +1134,11 @@ function sanitizeHtml(html: string): string {
   // 递归处理节点
   function processNode(node: Node): string {
     if (node.nodeType === Node.TEXT_NODE) {
-      return escapeHtml(node.textContent || '')
+      const text = node.textContent || ''
+      if (options.dropStructuralWhitespace && /^[\t\n\r ]+$/.test(text) && /[\t\n\r]/.test(text)) {
+        return ''
+      }
+      return escapeHtml(text)
     }
 
     if (node.nodeType === Node.ELEMENT_NODE) {
@@ -1351,38 +1453,36 @@ watch(
     :aria-label="`segment ${index + 1}`"
   >
     <div class="segment-row__meta">
-      <span class="segment-row__index">#{{ index + 1 }}</span>
-      <span v-if="showStatusTag" class="segment-row__tag segment-row__tag--status">{{ statusMeta.label }}</span>
-      <span v-if="showSourceTag" class="segment-row__tag is-muted" :class="sourceClass" :title="sourceTitle">{{ sourceLabel }}</span>
-      <span v-if="scorePercent !== null" class="segment-row__tag segment-row__tag--score">
-        {{ scorePercent }}%
-      </span>
-      <span
-        v-if="hasPendingRevision"
-        class="segment-row__tag segment-row__tag--revision"
-        data-testid="segment-revision-tag"
-        :title="`修订来源：${revisionSourceMeta.label}`"
-      >
-        待审核
-      </span>
+      <span class="segment-row__index">{{ index + 1 }}</span>
     </div>
 
     <div class="segment-row__cell segment-row__cell--source" @click="handleClick">
-      <div
-        v-if="active"
-        ref="sourceEditorRef"
-        class="segment-row__source-editor"
-        :class="{ 'is-focused': isSourceFocused, 'is-readonly': !sourceEditing }"
-        :contenteditable="true"
-        tabindex="0"
-        spellcheck="false"
-        @focus="handleSourceFocus"
-        @blur="handleSourceBlur"
-        @input="handleSourceInput"
-        @keydown="handleSourceKeydown"
-        @beforeinput="handleSourceBeforeInput"
-      ></div>
-      <div v-else class="segment-row__text" v-html="sourceHtmlContent"></div>
+      <div class="segment-row__source-content">
+        <span
+          v-if="hasAutomaticNumbering"
+          class="segment-row__automatic-numbering-badge"
+          :title="automaticNumberingTitle"
+          aria-hidden="true"
+          contenteditable="false"
+        >
+          {{ automaticNumberingText }}
+        </span>
+        <div
+          v-if="active"
+          ref="sourceEditorRef"
+          class="segment-row__source-editor"
+          :class="{ 'is-focused': isSourceFocused, 'is-readonly': !sourceEditing }"
+          :contenteditable="sourceEditing && !disabled"
+          tabindex="0"
+          spellcheck="false"
+          @focus="handleSourceFocus"
+          @blur="handleSourceBlur"
+          @input="handleSourceInput"
+          @keydown="handleSourceKeydown"
+          @beforeinput="handleSourceBeforeInput"
+        ></div>
+        <div v-else class="segment-row__text" v-html="sourceHtmlContent"></div>
+      </div>
     </div>
 
     <div class="segment-row__cell segment-row__cell--target" :class="{ 'is-pending': hasPendingRevision }">
@@ -1411,32 +1511,94 @@ watch(
           empty-text="空"
         />
       </div>
-      <div
-        ref="editorRef"
-        class="segment-row__editor"
-        :class="[
-          { 'is-focused': isFocused, 'has-revision': hasPendingRevision },
-          revisionAuthorClass,
-        ]"
-        :contenteditable="!disabled"
-        tabindex="0"
-        data-testid="segment-target-editor"
-        :data-revision-visible="hasPendingRevision ? 'true' : 'false'"
-        data-segment-target="true"
-        :data-sentence-id="segment.sentence_id"
-        :aria-label="`translation for segment ${index + 1}`"
-        spellcheck="false"
-        @focus="handleFocus"
-        @blur="handleBlur"
-        @click="handleClick"
-        @keydown="handleKeydown"
-        @compositionstart="handleCompositionStart"
-        @compositionend="handleCompositionEnd"
-        @beforeinput="handleBeforeInput"
-        @input="handleInput"
-        @paste="handlePaste"
-      />
+      <div class="segment-row__target-content">
+        <span
+          v-if="hasTargetAutomaticNumbering"
+          class="segment-row__automatic-numbering-badge segment-row__automatic-numbering-badge--target"
+          :title="automaticNumberingTitle"
+          aria-hidden="true"
+          contenteditable="false"
+        >
+          {{ targetAutomaticNumberingText }}
+        </span>
+        <div
+          ref="editorRef"
+          class="segment-row__editor"
+          :class="[
+            { 'is-focused': isFocused, 'has-revision': hasPendingRevision },
+            revisionAuthorClass,
+          ]"
+          :contenteditable="!disabled"
+          tabindex="0"
+          data-testid="segment-target-editor"
+          :data-revision-visible="hasPendingRevision ? 'true' : 'false'"
+          data-segment-target="true"
+          :data-sentence-id="segment.sentence_id"
+          :aria-label="`translation for segment ${index + 1}`"
+          spellcheck="false"
+          @focus="handleFocus"
+          @blur="handleBlur"
+          @click="handleClick"
+          @keydown="handleKeydown"
+          @compositionstart="handleCompositionStart"
+          @compositionend="handleCompositionEnd"
+          @beforeinput="handleBeforeInput"
+          @input="handleInput"
+          @paste="handlePaste"
+        />
       </div>
+      </div>
+    </div>
+
+    <div class="segment-row__cell segment-row__cell--state" :title="statusMeta.label">
+      <span
+        v-if="segment.status === 'confirmed'"
+        class="segment-row__confirm-mark"
+        aria-label="已确认"
+      >√</span>
+      <span v-if="scorePercent !== null" class="segment-row__match-rate">
+        {{ scorePercent }}%
+      </span>
+      <span
+        v-if="showStatusTag && segment.status !== 'confirmed' && scorePercent === null"
+        class="segment-row__compact-tag segment-row__compact-tag--status"
+      >
+        {{ statusMeta.label }}
+      </span>
+      <span v-if="showSourceTag" class="segment-row__compact-tag" :class="sourceClass" :title="sourceTitle">
+        {{ compactSourceLabel }}
+      </span>
+      <button
+        v-if="showProjectSyncToggle"
+        class="segment-row__sync-toggle"
+        :class="{ 'is-disabled-sync': segment.project_sync_disabled }"
+        type="button"
+        :title="projectSyncToggleLabel"
+        :aria-label="projectSyncToggleLabel"
+        :aria-pressed="!segment.project_sync_disabled"
+        :disabled="disabled"
+        @click.stop="handleProjectSyncToggle"
+      >
+        <component
+          :is="segment.project_sync_disabled ? Link2 : Link2Off"
+          :size="13"
+          :stroke-width="2.2"
+          aria-hidden="true"
+        />
+        <span class="sr-only">{{ projectSyncToggleLabel }}</span>
+      </button>
+      <span
+        v-if="hasPendingRevision"
+        class="segment-row__compact-tag segment-row__tag--revision"
+        data-testid="segment-revision-tag"
+        :title="`修订来源：${revisionSourceMeta.label}`"
+      >
+        待审校
+      </span>
+    </div>
+
+    <div class="segment-row__cell segment-row__cell--workflow">
+      <span class="segment-row__workflow-label">{{ workflowLabel }}</span>
     </div>
   </article>
 </template>
@@ -1451,6 +1613,123 @@ watch(
 
 .segment-row__cell--target.is-pending {
   box-shadow: inset 2px 0 0 rgba(0, 122, 204, 0.36);
+}
+
+.segment-row__source-content,
+.segment-row__target-content {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.segment-row__source-content .segment-row__text,
+.segment-row__source-content .segment-row__source-editor,
+.segment-row__target-content .segment-row__editor {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.segment-row__automatic-numbering-badge {
+  flex: 0 0 auto;
+  max-width: 72px;
+  margin-top: 8px;
+  padding: 1px 6px;
+  border: 1px solid rgba(91, 115, 132, 0.24);
+  border-radius: 4px;
+  background: rgba(241, 245, 249, 0.92);
+  color: #526574;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.45;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: none;
+}
+
+.segment-row__automatic-numbering-badge--target {
+  margin-top: 9px;
+}
+
+.segment-row__cell--state,
+.segment-row__cell--workflow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 0;
+  padding: 6px 4px;
+  border-left: 1px solid rgba(214, 226, 222, 0.9);
+  background:
+    linear-gradient(0deg, var(--segment-cell-stripe, transparent), var(--segment-cell-stripe, transparent)),
+    rgba(248, 250, 252, 0.92);
+  color: var(--text-primary);
+}
+
+.segment-row__cell--state {
+  flex-direction: column;
+  gap: 3px;
+}
+
+.segment-row__cell--workflow {
+  color: #1f4f7a;
+  font-size: 0;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.segment-row__workflow-label {
+  font-size: 13px;
+}
+
+.segment-row__confirm-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  min-height: 18px;
+  color: #4fa873;
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.segment-row__match-rate {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 18px;
+  padding: 0 4px;
+  border-radius: 2px;
+  background: #4fa873;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.segment-row__compact-tag {
+  max-width: 100%;
+  min-height: 16px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(232, 239, 241, 0.96);
+  color: #556d72;
+  font-size: 10px;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.segment-row__compact-tag--status {
+  color: #0d726b;
+  background: rgba(223, 241, 239, 0.96);
 }
 
 .segment-row__editor-shell {
@@ -1534,6 +1813,33 @@ watch(
   color: #8a6700;
 }
 
+.segment-row__sync-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+  border: 1px solid rgba(34, 127, 88, 0.28);
+  border-radius: 6px;
+  background: rgba(34, 127, 88, 0.08);
+  color: #146c49;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.segment-row__sync-toggle:hover {
+  background: rgba(34, 127, 88, 0.14);
+}
+
+.segment-row__sync-toggle.is-disabled-sync {
+  border-color: rgba(91, 115, 132, 0.26);
+  background: rgba(91, 115, 132, 0.08);
+  color: #526574;
+}
+
 .segment-row__term-highlight {
   background: rgba(216, 183, 78, 0.28);
   color: inherit;
@@ -1577,6 +1883,15 @@ watch(
   padding: 1px 2px;
   border-radius: 3px;
   font-weight: 500;
+}
+
+.segment-row__editor :deep(.segment-row__search-highlight) {
+  background: #fff176;
+  color: inherit;
+  padding: 1px 2px;
+  border-radius: 3px;
+  box-shadow: inset 0 0 0 1px rgba(138, 103, 0, 0.2);
+  font-weight: 600;
 }
 
 .segment-row__editor {
@@ -1693,23 +2008,32 @@ watch(
 }
 
 /* 显示标记样式 */
+.segment-row__text :deep(.visible-char),
+.segment-row__source-editor :deep(.visible-char),
 .segment-row__editor :deep(.visible-char) {
-  color: #9ca3af;
+  color: #64748b;
   font-size: 0.85em;
+  font-weight: 700;
   user-select: none;
   pointer-events: none;
 }
 
+.segment-row__text :deep(.visible-char--space),
+.segment-row__source-editor :deep(.visible-char--space),
 .segment-row__editor :deep(.visible-char--space) {
-  color: #d1d5db;
+  color: #6b7280;
 }
 
+.segment-row__text :deep(.visible-char--tab),
+.segment-row__source-editor :deep(.visible-char--tab),
 .segment-row__editor :deep(.visible-char--tab) {
-  color: #93c5fd;
+  color: #3b82f6;
 }
 
+.segment-row__text :deep(.visible-char--newline),
+.segment-row__source-editor :deep(.visible-char--newline),
 .segment-row__editor :deep(.visible-char--newline) {
-  color: #fca5a5;
+  color: #ef4444;
 }
 
 /* 富文本格式样式 */

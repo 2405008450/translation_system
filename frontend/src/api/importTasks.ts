@@ -1,4 +1,5 @@
 import { http } from './http'
+import { translate } from '../i18n'
 
 export interface ImportTaskStatus<T = unknown> {
   task_id: string
@@ -43,7 +44,7 @@ export async function waitForImportTask<T>(
     }
 
     if (data.status === 'failed') {
-      throw new Error(data.error || data.message || '导入失败。')
+      throw new Error(data.error || data.message || translate('errors.importFailed'))
     }
 
     await delay(1000)

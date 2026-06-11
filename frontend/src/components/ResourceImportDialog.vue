@@ -16,6 +16,8 @@ const props = withDefaults(defineProps<{
   sourceLanguage?: string | null
   targetLanguage?: string | null
   contextLabel?: string
+  defaultTMCollectionId?: string
+  defaultTermBaseId?: string
   fixedTMCollectionId?: string
   fixedTermBaseId?: string
 }>(), {
@@ -25,6 +27,8 @@ const props = withDefaults(defineProps<{
   sourceLanguage: null,
   targetLanguage: null,
   contextLabel: '',
+  defaultTMCollectionId: '',
+  defaultTermBaseId: '',
   fixedTMCollectionId: '',
   fixedTermBaseId: '',
 })
@@ -53,6 +57,8 @@ const emit = defineEmits<{
       :source-language="sourceLanguage"
       :target-language="targetLanguage"
       :context-label="contextLabel"
+      :default-tm-collection-id="defaultTMCollectionId"
+      :default-term-base-id="defaultTermBaseId"
       :fixed-tm-collection-id="fixedTMCollectionId"
       :fixed-term-base-id="fixedTermBaseId"
       @imported="emit('imported', $event)"

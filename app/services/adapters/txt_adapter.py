@@ -77,6 +77,8 @@ class TxtAdapter(FormatAdapter):
         
         ast = DocumentAST(nodes=nodes, source_format=".txt")
         segments = extract_segments(ast)
+        for index, segment in enumerate(segments, start=1):
+            segment.segment_id = f"sent-{index:05d}"
         
         return ParseResult(
             ast=ast,

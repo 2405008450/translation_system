@@ -88,6 +88,26 @@ export interface AnalyticsDashboardResponse {
   user_stats: AnalyticsUserStat[]
 }
 
+export interface WorkflowStep {
+  id: string
+  step_key: string
+  name: string
+  step_type: string
+  sort_order: number
+}
+
+export interface WorkflowTemplate {
+  id: string
+  name: string
+  steps: Array<Omit<WorkflowStep, 'id'> & { id?: string }>
+}
+
+export interface WorkflowProgress extends WorkflowStep {
+  total_segments: number
+  completed_segments: number
+  progress: number
+}
+
 export interface FileRecordSummary {
   id: string
   project_id?: string | null
@@ -97,6 +117,9 @@ export interface FileRecordSummary {
   progress?: number
   total_segments?: number
   translated_segments?: number
+  confirmed_segments?: number
+  pretranslated_segments?: number
+  pretranslation_progress?: number
   open_issue_count?: number
   issue_count?: number
   active_operation?: string | null
@@ -111,16 +134,22 @@ export interface FileRecordSummary {
   assignee?: User | null
   assignees?: User[]
   assigned_at?: string | null
+  workflow_steps?: WorkflowStep[]
+  workflow_progress?: WorkflowProgress[]
   can_manage?: boolean
   can_write?: boolean
   created_at: string
   updated_at: string
+  glossary_base_ids?: string[]
 }
 
 export interface ProjectAssignmentItem {
   id: string
+  project_assignment_id?: string
   assignee_id: string
   assignee: User
+  workflow_step_id?: string
+  workflow_step?: WorkflowStep | null
   file_record_ids: string[]
   assigned_by_id: string | null
   assigned_at: string
@@ -128,12 +157,14 @@ export interface ProjectAssignmentItem {
 
 export interface ProjectAssignmentsResponse {
   project_id: string
+  workflow_steps?: WorkflowStep[]
   assignments: ProjectAssignmentItem[]
 }
 
 export interface ProjectAssignmentPayload {
   assignments: Array<{
     assignee_id: string
+    workflow_step_id?: string
     file_record_ids: string[]
   }>
 }
@@ -178,6 +209,7 @@ export interface NotificationsResponse {
 }
 
 export type DocumentParseMode = 'full' | 'body_only'
+export type DocxNumberingLocalization = 'auto' | 'preserve'
 
 export interface DocumentParseOptions {
   include_headers_footers: boolean
@@ -205,6 +237,7 @@ export interface DocumentParseOptions {
   xlsx_translate_boolean_cells: boolean
   xlsx_translate_formula_cells: boolean
   xlsx_skip_fill_colors: string[]
+  docx_numbering_localization?: DocxNumberingLocalization
 }
 
 export interface DocumentStatistics {
@@ -221,6 +254,56 @@ export interface DocumentStatistics {
   characters_with_spaces: number | null
   paragraphs: number | null
   lines: number | null
+  internal_repeated_words: number | null
+  internal_repeated_characters: number | null
+  cross_file_repeated_words: number | null
+  cross_file_repeated_characters: number | null
+}
+
+export interface DocumentStatisticsTotals {
+  pages: number | null
+  words: number | null
+  non_asian_words: number | null
+  asian_characters: number | null
+  characters: number | null
+  characters_with_spaces: number | null
+  paragraphs: number | null
+  lines: number | null
+  internal_repeated_words: number | null
+  internal_repeated_characters: number | null
+  cross_file_repeated_words: number | null
+  cross_file_repeated_characters: number | null
+}
+
+export interface DocumentStatisticsReportItem {
+  id: string
+  report_id: string
+  project_id: string
+  file_record_id: string | null
+  file_name: string
+  source_language: string | null
+  target_language: string | null
+  file_size_bytes: number | null
+  statistics: DocumentStatistics
+  created_at: string | null
+}
+
+export interface DocumentStatisticsReport {
+  id: string
+  project_id: string
+  created_by_id: string | null
+  created_by_name: string | null
+  file_ids: string[]
+  total_files: number
+  available_files: number
+  totals: DocumentStatisticsTotals
+  status: string
+  created_at: string | null
+  items: DocumentStatisticsReportItem[]
+}
+
+export interface DocumentStatisticsReportsResponse {
+  items: DocumentStatisticsReport[]
 }
 
 export interface UploadParseMode {
@@ -284,10 +367,14 @@ export interface Segment {
   display_index?: number | null
   source_text: string
   display_text: string
+  source_body_text?: string
+  automatic_numbering_text?: string | null
+  target_automatic_numbering_text?: string | null
   source_html?: string | null
   target_text: string
   target_html?: string | null
   status: string
+  project_sync_disabled?: boolean
   version: number
   score: number
   matched_source_text: string | null
@@ -302,7 +389,17 @@ export interface Segment {
   block_index: number
   row_index?: number | null
   cell_index?: number | null
+  workflow_step_id?: string | null
+  workflow_step_name?: string | null
+  workflow_step_order?: number | null
+  can_write?: boolean
   updated_at: string | null
+}
+
+export interface ProjectSegmentSyncSummary {
+  filled_count: number
+  conflict_count: number
+  affected_file_count: number
 }
 
 export interface FileRecordDetail {
@@ -320,6 +417,7 @@ export interface FileRecordDetail {
   target_language: string | null
   collection_id: string | null
   collection_ids: string[]
+  tm_match_threshold: number
   collection_name: string | null
   term_base_id: string | null
   term_base_name: string | null
@@ -329,6 +427,8 @@ export interface FileRecordDetail {
   term_base_write_names: string[]
   qa_term_base_ids: string[]
   qa_term_base_names: string[]
+  glossary_base_ids: string[]
+  glossary_base_names: string[]
   translation_guidelines: string
   created_at: string
   updated_at: string
@@ -339,6 +439,10 @@ export interface FileRecordDetail {
   source_extension: string
   has_source_document: boolean
   can_export: boolean
+  can_manage?: boolean
+  can_write?: boolean
+  workflow_steps?: WorkflowStep[]
+  workflow_progress?: WorkflowProgress[]
   issue_count: number
   open_issue_count: number
   status_stats: SegmentStatusStats
@@ -480,6 +584,17 @@ export interface TermBase {
   entry_count: number
 }
 
+export interface GlossaryBase {
+  id: string
+  name: string
+  description: string | null
+  source_language: string
+  target_language: string
+  created_at: string
+  updated_at: string
+  entry_count: number
+}
+
 export interface ProjectTermBaseSettingRow {
   id: string
   name: string
@@ -490,6 +605,7 @@ export interface ProjectTermBaseSettingRow {
   enabled: boolean
   writable: boolean
   qa: boolean
+  qa_priority: number | null
 }
 
 export interface ProjectTermBaseSettingGroup {
@@ -521,6 +637,7 @@ export interface ProjectTranslationMemorySettingFile {
   filename: string
   collection_id: string | null
   collection_ids: string[]
+  tm_match_threshold: number
 }
 
 export interface ProjectTranslationMemorySettingGroup {
@@ -619,6 +736,25 @@ export interface TermEntryRecord {
   updated_at: string
 }
 
+export interface GlossaryEntryRecord {
+  id: string
+  glossary_base_id: string
+  source_text: string
+  target_text: string
+  note: string | null
+  source_language: string
+  target_language: string
+  creator_name: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface GlossaryMatch {
+  source_text: string
+  target_text: string
+  note: string | null
+}
+
 export interface TermEntryConflict {
   id: string
   term_base_id: string
@@ -699,11 +835,41 @@ export interface TMImportSummary {
   filename: string
   created_rows: number
   updated_rows: number
+  skipped_duplicate_rows?: number
   skipped_empty_rows: number
   skipped_header_rows: number
   imported_rows: number
   collection_id: string | null
   collection_name: string | null
+  source_language: string
+  target_language: string
+}
+
+export type ImportPreviewStatus = 'create' | 'update' | 'keep' | 'duplicate' | 'empty' | 'header' | 'pending'
+
+export interface TMImportPreviewRow {
+  row_index: number
+  source_text: string
+  target_text: string
+  status: ImportPreviewStatus
+  message: string
+}
+
+export interface TMImportPreview {
+  filename: string
+  rows: TMImportPreviewRow[]
+  total_rows: number
+  valid_rows: number
+  create_rows: number
+  update_rows: number
+  keep_rows: number
+  duplicate_rows: number
+  skipped_empty_rows: number
+  skipped_header_rows: number
+  preview_limit: number
+  duplicate_policy: 'overwrite' | 'keep'
+  collection_id: string | null
+  collection_name: string
   source_language: string
   target_language: string
 }
@@ -722,11 +888,50 @@ export interface TermImportSummary {
   filename: string
   created_rows: number
   updated_rows: number
+  skipped_duplicate_rows?: number
   skipped_empty_rows: number
   skipped_header_rows: number
   imported_rows: number
   term_base_id: string
   term_base_name: string
+  source_language: string
+  target_language: string
+}
+
+export interface TermImportPreviewRow {
+  row_index: number
+  source_text: string
+  target_text: string
+  status: ImportPreviewStatus
+  message: string
+}
+
+export interface TermImportPreview {
+  filename: string
+  rows: TermImportPreviewRow[]
+  total_rows: number
+  valid_rows: number
+  create_rows: number
+  update_rows: number
+  duplicate_rows: number
+  skipped_empty_rows: number
+  skipped_header_rows: number
+  preview_limit: number
+  term_base_id: string | null
+  term_base_name: string
+  source_language: string
+  target_language: string
+}
+
+export interface GlossaryImportSummary {
+  filename: string
+  created_rows: number
+  updated_rows: number
+  skipped_empty_rows: number
+  skipped_header_rows: number
+  imported_rows: number
+  glossary_base_id: string
+  glossary_base_name: string
   source_language: string
   target_language: string
 }
@@ -783,13 +988,14 @@ export interface CommentReplyPayload {
   body: string
 }
 
-export type LLMTranslateScope = 'fuzzy_only' | 'none_only' | 'empty_target_only' | 'all' | 'all_with_exact'
+export type LLMTranslateScope = 'current_segment' | 'fuzzy_only' | 'none_only' | 'empty_target_only' | 'all' | 'all_with_exact'
 export type LLMProvider = 'auto' | 'deepseek' | 'openrouter'
 
 export interface LLMGuidelineOptions {
   guidelineTemplateId?: string
   temporaryPrompt?: string
   model?: string
+  sentenceId?: string
 }
 
 export interface LLMEvent {

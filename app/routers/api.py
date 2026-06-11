@@ -37,14 +37,19 @@ from app.config import get_settings
 from app.database import SessionLocal, get_db
 from app.models import (
     AssignmentEvent,
+    DocumentStatisticsReport,
+    DocumentStatisticsReportItem,
     FileAssignment,
+    FileExportTask,
     FileRecord,
+    GlossaryBase,
     IssueMarker,
     MemoryBase,
     MemoryEntry,
     Notification,
     Project,
     ProjectAssignment,
+    ProjectWorkflowStep,
     Segment,
     SegmentRevision,
     TMCollection,
@@ -69,6 +74,11 @@ from app.services.analytics_service import (
     record_translation_metric_event,
     run_analytics_backfill_once,
 )
+from app.services.automatic_numbering import (
+    get_automatic_numbering_text,
+    is_word_document_filename,
+    strip_automatic_numbering_prefix,
+)
 from app.services.auto_tm_sync import (
     AutoTMEnqueueSummary,
     enqueue_confirmed_segments_for_auto_tm,
@@ -89,7 +99,16 @@ from app.services.comment_service import (
     serialize_segment_comment,
     update_segment_comment,
 )
-from app.services.document_statistics import compute_word_document_statistics, serialize_document_statistics
+from app.services.document_statistics import (
+    STATISTIC_NUMBER_KEYS,
+    compute_word_document_statistics,
+    normalize_document_statistics,
+    serialize_document_statistics,
+)
+from app.services.document_repetition_statistics import (
+    compute_document_repetition_statistics,
+    empty_repetition_statistics,
+)
 from app.services.issue_marker_service import (
     create_issue_marker,
     delete_issue_marker,
@@ -137,6 +156,7 @@ from app.services.guideline_repository import (
     save_guideline_template,
     update_guideline_template,
 )
+from app.services.glossary_matcher import build_glossary_matches_by_text
 from app.services.llm_service import (
     LLMConfigurationError,
     LLMRequestError,
@@ -159,6 +179,27 @@ from app.services.language_detection import detect_upload_language
 from app.services.language_pairs import require_language_pair
 from app.services.matcher import get_tm_candidates_for_text, match_sentences_with_stats
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
+from app.services.notification_service import (
+    build_resource_import_notification,
+    build_save_to_tm_notification,
+    create_operation_notification,
+)
+from app.services.file_export_queue import (
+    build_file_export_download_response,
+    get_file_export_task,
+    queue_file_export,
+    serialize_file_export_task,
+    wait_for_file_export_task,
+)
+from app.services.project_segment_sync import (
+    empty_project_segment_sync_summary,
+    sync_project_repeated_segments_from_file,
+    sync_project_repeated_segments_from_segments,
+)
+from app.services.term_importer import (
+    TERM_IMPORT_EXTENSIONS,
+    import_terms_from_xlsx_upload,
+)
 from app.services.revision_service import (
     accept_revision,
     batch_accept_revisions,
@@ -190,12 +231,14 @@ from app.services.task_file_service import (
     normalize_document_parse_mode,
     supports_task_file,
 )
+from app.services.document_workspace import build_docx_target_numbering_text_map
 from app.services.tm_importer import (
     SDLTM_EXTENSIONS,
     TM_IMPORT_EXTENSIONS,
     XLSX_EXTENSIONS,
     import_tm_from_sdltm_upload,
-    import_tm_from_xlsx_upload,
+    import_tm_from_upload,
+    preview_tm_from_upload,
     preview_sdltm_metadata,
 )
 from app.services.tm_vector import sync_tm_embeddings
@@ -451,6 +494,10 @@ def _load_file_record_qa_term_base_ids(file_record: FileRecord) -> list[UUID]:
     return _load_file_record_uuid_ids(file_record, "qa_term_base_ids")
 
 
+def _load_file_record_glossary_base_ids(file_record: FileRecord) -> list[UUID]:
+    return _load_file_record_uuid_ids(file_record, "glossary_base_ids")
+
+
 def _store_file_record_term_base_ids(file_record: FileRecord, term_base_ids: list[UUID]) -> None:
     normalized_ids = list(dict.fromkeys(term_base_ids))
     _store_file_record_uuid_ids(
@@ -478,6 +525,10 @@ def _store_file_record_qa_term_base_ids(file_record: FileRecord, term_base_ids: 
     _store_file_record_uuid_ids(file_record, "qa_term_base_ids", term_base_ids)
 
 
+def _store_file_record_glossary_base_ids(file_record: FileRecord, glossary_base_ids: list[UUID]) -> None:
+    _store_file_record_uuid_ids(file_record, "glossary_base_ids", glossary_base_ids)
+
+
 def _serialize_file_record_upload_result(file_record: FileRecord) -> dict[str, Any]:
     return {
         "id": str(file_record.id),
@@ -497,7 +548,7 @@ def _json_ready_project_file_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _get_file_record_document_parse_options(file_record: FileRecord) -> dict[str, bool]:
+def _get_file_record_document_parse_options(file_record: FileRecord) -> dict[str, object]:
     return normalize_document_parse_options(
         getattr(file_record, "document_parse_options", None),
         getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
@@ -801,6 +852,13 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
             file_record.collection_ids_json = json.dumps([str(cid) for cid in selected_collection_ids])
         if term_base is not None:
             _store_file_record_term_base_ids(file_record, [term_base_id])
+        db.flush()
+        _assign_file_segments_to_first_workflow_step(db, file_record)
+        sync_project_repeated_segments_from_file(
+            db,
+            file_record=file_record,
+            current_user=None,
+        )
         created_files.append(file_record)
 
     project.status = "in_progress"
@@ -820,6 +878,7 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
                     file_record=file_record,
                     total_segments=file_stats.get(file_record.id, {"total": 0})["total"],
                     translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
+                    pretranslated_segments=file_stats.get(file_record.id, {}).get("pretranslated", 0),
                 )
             )
             for file_record in created_files
@@ -886,6 +945,10 @@ class SegmentSourceUpdate(BaseModel):
     source_text: str
 
 
+class SegmentProjectSyncUpdate(BaseModel):
+    disabled: bool
+
+
 class BatchSegmentUpdate(BaseModel):
     updates: list[SegmentUpdate]
 
@@ -922,13 +985,15 @@ class FileOperationLockRequest(BaseModel):
 
 
 class LLMTranslateRequest(BaseModel):
-    scope: Literal["fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"] = "all"
+    scope: Literal["current_segment", "fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"] = "all"
     provider: Literal["auto", "deepseek", "openrouter"] = "deepseek"
     model: str | None = Field(default=None, max_length=120)
+    sentence_id: str | None = None
     translation_unit: Literal["paragraph", "sentence"] = "paragraph"
     translation_guidelines: str = ""
     guideline_template_id: str | None = None
     temporary_prompt: str = ""
+    glossary_base_ids: list[UUID] | None = None
 
 
 class TermExtractionRequest(BaseModel):
@@ -955,14 +1020,17 @@ class FileRecordBindingsRequest(BaseModel):
     term_base_ids: list[UUID] | None = None
     term_base_write_ids: list[UUID] | None = None
     qa_term_base_ids: list[UUID] | None = None
+    glossary_base_ids: list[UUID] | None = None
     collection_id: UUID | None = None
     collection_ids: list[UUID] | None = None
+    tm_match_threshold: float | None = None
 
 
 class ProjectTranslationMemoryFileSettingPayload(BaseModel):
     file_record_id: UUID
     collection_ids: list[UUID] = Field(default_factory=list)
     primary_collection_id: UUID | None = None
+    tm_match_threshold: float | None = None
 
 
 class ProjectTranslationMemorySettingPayload(BaseModel):
@@ -970,6 +1038,7 @@ class ProjectTranslationMemorySettingPayload(BaseModel):
     target_language: str
     collection_ids: list[UUID] = Field(default_factory=list)
     primary_collection_id: UUID | None = None
+    tm_match_threshold: float | None = None
     files: list[ProjectTranslationMemoryFileSettingPayload] = Field(default_factory=list)
 
 
@@ -1019,11 +1088,34 @@ class FileRecordAssignmentRequest(BaseModel):
 
 class ProjectAssignmentEntryRequest(BaseModel):
     assignee_id: UUID
+    workflow_step_id: UUID | None = None
     file_record_ids: list[UUID] = Field(default_factory=list)
 
 
 class ProjectAssignmentsRequest(BaseModel):
     assignments: list[ProjectAssignmentEntryRequest] = Field(default_factory=list)
+
+
+class WorkflowStepRequest(BaseModel):
+    id: UUID | None = None
+    step_key: str | None = None
+    name: str
+    step_type: str | None = None
+
+
+class WorkflowTransitionPreviewRequest(BaseModel):
+    from_step_id: UUID
+    target_step_id: UUID
+    range_start: int = Field(default=1, ge=1)
+    range_end: int | None = Field(default=None, ge=1)
+    all_segments: bool = True
+    source_status: Literal["all", "confirmed", "unconfirmed"] = "all"
+    source_statuses: list[Literal["none", "exact", "fuzzy", "confirmed"]] = Field(default_factory=list)
+    target_status: Literal["confirmed", "unconfirmed"] = "unconfirmed"
+
+
+class WorkflowTransitionRequest(WorkflowTransitionPreviewRequest):
+    pass
 
 
 class SaveToTMRequest(BaseModel):
@@ -1104,6 +1196,8 @@ class ProjectCreatePayload(BaseModel):
     access_level: Literal["team", "private", "public"] = "team"
     collection_id: UUID | None = None
     term_base_id: UUID | None = None
+    workflow_template_id: str | None = None
+    workflow_steps: list[WorkflowStepRequest] = Field(default_factory=list)
 
 
 class ProjectUpdatePayload(BaseModel):
@@ -1119,8 +1213,448 @@ class ProjectDocumentStatisticsPayload(BaseModel):
     file_ids: list[UUID] = Field(default_factory=list)
 
 
+def _build_unavailable_document_statistics() -> dict[str, Any]:
+    statistics = {
+        "source": "unavailable",
+        "engine": None,
+        "engine_version": None,
+        "license_status": None,
+        "include_textboxes_footnotes_endnotes": None,
+    }
+    for key in STATISTIC_NUMBER_KEYS:
+        statistics[key] = None
+    return statistics
+
+
+def _create_empty_document_statistics_totals() -> dict[str, int | None]:
+    return {key: None for key in STATISTIC_NUMBER_KEYS}
+
+
+def _has_any_document_statistic(statistics: dict[str, Any] | None) -> bool:
+    if not statistics:
+        return False
+    return any(isinstance(statistics.get(key), int) for key in STATISTIC_NUMBER_KEYS)
+
+
+def _sum_document_statistics(statistics_list: list[dict[str, Any]]) -> dict[str, int | None]:
+    totals = _create_empty_document_statistics_totals()
+    for raw_statistics in statistics_list:
+        statistics = normalize_document_statistics(raw_statistics)
+        for key in STATISTIC_NUMBER_KEYS:
+            value = statistics.get(key)
+            if not isinstance(value, int):
+                continue
+            totals[key] = (totals[key] or 0) + value
+    return totals
+
+
+def _load_document_statistics_totals(raw_value: str | None) -> dict[str, int | None]:
+    try:
+        value = json.loads(raw_value or "{}")
+    except (TypeError, ValueError):
+        value = {}
+    totals = _create_empty_document_statistics_totals()
+    if isinstance(value, dict):
+        for key in STATISTIC_NUMBER_KEYS:
+            raw_number = value.get(key)
+            if isinstance(raw_number, int):
+                totals[key] = raw_number
+            elif isinstance(raw_number, str) and raw_number.strip().isdigit():
+                totals[key] = int(raw_number)
+    return totals
+
+
+def _serialize_document_statistics_report_item(
+    item: DocumentStatisticsReportItem,
+) -> dict[str, Any]:
+    return {
+        "id": str(item.id),
+        "report_id": str(item.report_id),
+        "project_id": str(item.project_id),
+        "file_record_id": str(item.file_record_id) if item.file_record_id else None,
+        "file_name": item.file_name,
+        "source_language": item.source_language,
+        "target_language": item.target_language,
+        "file_size_bytes": item.file_size_bytes,
+        "statistics": normalize_document_statistics(item.statistics),
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+    }
+
+
+def _serialize_document_statistics_report(
+    report: DocumentStatisticsReport,
+    items: list[DocumentStatisticsReportItem] | None = None,
+) -> dict[str, Any]:
+    report_items = list(items if items is not None else report.items)
+    return {
+        "id": str(report.id),
+        "project_id": str(report.project_id),
+        "created_by_id": str(report.created_by_id) if report.created_by_id else None,
+        "created_by_name": get_user_display_name(report.created_by) if report.created_by else None,
+        "file_ids": [str(value) for value in _load_json_list(report.file_ids)],
+        "total_files": report.total_files,
+        "available_files": report.available_files,
+        "totals": _load_document_statistics_totals(report.totals),
+        "status": report.status,
+        "created_at": report.created_at.isoformat() if report.created_at else None,
+        "items": [_serialize_document_statistics_report_item(item) for item in report_items],
+    }
+
+
+def _load_document_statistics_report_items_for_response(
+    db: Session,
+    report_ids: list[UUID],
+) -> dict[UUID, list[DocumentStatisticsReportItem]]:
+    items_by_report_id: dict[UUID, list[DocumentStatisticsReportItem]] = {
+        report_id: [] for report_id in report_ids
+    }
+    if not report_ids:
+        return items_by_report_id
+    items = (
+        db.query(DocumentStatisticsReportItem)
+        .filter(DocumentStatisticsReportItem.report_id.in_(report_ids))
+        .order_by(
+            DocumentStatisticsReportItem.file_name.asc(),
+            DocumentStatisticsReportItem.created_at.asc(),
+            DocumentStatisticsReportItem.id.asc(),
+        )
+        .all()
+    )
+    for item in items:
+        items_by_report_id.setdefault(item.report_id, []).append(item)
+    return items_by_report_id
+
+
+def _load_document_repetition_statistics_for_files(
+    db: Session,
+    file_ids: list[UUID],
+) -> dict[UUID, dict[str, int]]:
+    file_segments: dict[UUID, list[str]] = {file_id: [] for file_id in file_ids}
+    if not file_segments:
+        return {}
+
+    segments = (
+        db.query(Segment.file_record_id, Segment.source_text)
+        .filter(Segment.file_record_id.in_(file_ids))
+        .order_by(
+            Segment.file_record_id.asc(),
+            Segment.block_index.asc(),
+            Segment.row_index.asc().nullsfirst(),
+            Segment.cell_index.asc().nullsfirst(),
+            Segment.sentence_id.asc(),
+            Segment.id.asc(),
+        )
+        .all()
+    )
+    for file_record_id, source_text in segments:
+        file_segments.setdefault(file_record_id, []).append(source_text or "")
+
+    return compute_document_repetition_statistics(file_segments)
+
+
 def _can_manage_workflow(current_user: User | None) -> bool:
     return is_admin_role(getattr(current_user, "role", None))
+
+
+WORKFLOW_TEMPLATE_DEFINITIONS: list[dict[str, Any]] = [
+    {
+        "id": "translate",
+        "name": "翻译",
+        "steps": [
+            {"step_key": "translate", "name": "翻译", "step_type": "translation"},
+        ],
+    },
+    {
+        "id": "translate_review",
+        "name": "翻译-审校",
+        "steps": [
+            {"step_key": "translate", "name": "翻译", "step_type": "translation"},
+            {"step_key": "review", "name": "审校", "step_type": "review"},
+        ],
+    },
+    {
+        "id": "translate_review_proofread",
+        "name": "翻译-审校-校对",
+        "steps": [
+            {"step_key": "translate", "name": "翻译", "step_type": "translation"},
+            {"step_key": "review", "name": "审校", "step_type": "review"},
+            {"step_key": "proofread", "name": "校对", "step_type": "proofread"},
+        ],
+    },
+]
+WORKFLOW_TEMPLATE_BY_ID = {
+    str(template["id"]): template
+    for template in WORKFLOW_TEMPLATE_DEFINITIONS
+}
+
+
+def _serialize_workflow_template(template: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": template["id"],
+        "name": template["name"],
+        "steps": [
+            {
+                "step_key": step["step_key"],
+                "name": step["name"],
+                "step_type": step["step_type"],
+                "sort_order": index,
+            }
+            for index, step in enumerate(template["steps"])
+        ],
+    }
+
+
+def _serialize_workflow_step(step: ProjectWorkflowStep) -> dict[str, Any]:
+    return {
+        "id": str(step.id),
+        "step_key": step.step_key,
+        "name": step.name,
+        "step_type": step.step_type,
+        "sort_order": int(step.sort_order or 0),
+    }
+
+
+def _load_project_workflow_steps(db: Session, project_id: UUID | None) -> list[ProjectWorkflowStep]:
+    if project_id is None:
+        return []
+    return (
+        db.query(ProjectWorkflowStep)
+        .filter(ProjectWorkflowStep.project_id == project_id)
+        .order_by(ProjectWorkflowStep.sort_order.asc(), ProjectWorkflowStep.id.asc())
+        .all()
+    )
+
+
+def _load_workflow_steps_by_project(
+    db: Session,
+    project_ids: list[UUID],
+) -> dict[UUID, list[ProjectWorkflowStep]]:
+    if not project_ids:
+        return {}
+    rows = (
+        db.query(ProjectWorkflowStep)
+        .filter(ProjectWorkflowStep.project_id.in_(project_ids))
+        .order_by(ProjectWorkflowStep.project_id.asc(), ProjectWorkflowStep.sort_order.asc(), ProjectWorkflowStep.id.asc())
+        .all()
+    )
+    result: dict[UUID, list[ProjectWorkflowStep]] = {}
+    for step in rows:
+        result.setdefault(step.project_id, []).append(step)
+    return result
+
+
+def _create_project_workflow_steps(
+    db: Session,
+    project: Project,
+    requested_steps: list[WorkflowStepRequest],
+    template_id: str | None,
+) -> list[ProjectWorkflowStep]:
+    template = WORKFLOW_TEMPLATE_BY_ID.get((template_id or "").strip())
+    if template is None:
+        raise HTTPException(status_code=400, detail="请选择有效的工作流模板。")
+
+    source_steps = requested_steps or [
+        WorkflowStepRequest(
+            step_key=str(step["step_key"]),
+            name=str(step["name"]),
+            step_type=str(step["step_type"]),
+        )
+        for step in template["steps"]
+    ]
+    if not source_steps:
+        raise HTTPException(status_code=400, detail="工作流至少需要一个阶段。")
+    if len(source_steps) > 8:
+        raise HTTPException(status_code=400, detail="工作流阶段最多支持 8 个。")
+
+    normalized: list[ProjectWorkflowStep] = []
+    used_keys: set[str] = set()
+    for index, item in enumerate(source_steps):
+        name = (item.name or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="工作流阶段名称不能为空。")
+        if index == 0 and name != "翻译":
+            raise HTTPException(status_code=400, detail="工作流第一个阶段必须是“翻译”。")
+
+        raw_key = (item.step_key or "").strip().lower()
+        step_key = raw_key or ("translate" if index == 0 else f"step_{index + 1}")
+        step_key = re.sub(r"[^a-z0-9_]+", "_", step_key).strip("_") or f"step_{index + 1}"
+        if index == 0:
+            step_key = "translate"
+        base_key = step_key
+        suffix = 2
+        while step_key in used_keys:
+            step_key = f"{base_key}_{suffix}"
+            suffix += 1
+        used_keys.add(step_key)
+
+        step_type = (item.step_type or ("translation" if index == 0 else "custom")).strip().lower()
+        if index == 0:
+            step_type = "translation"
+
+        normalized.append(
+            ProjectWorkflowStep(
+                project_id=project.id,
+                step_key=step_key,
+                name=name,
+                step_type=step_type[:20] or "custom",
+                sort_order=index,
+            )
+        )
+
+    for step in normalized:
+        db.add(step)
+    db.flush()
+    return normalized
+
+
+def _copy_project_workflow_steps(
+    db: Session,
+    source_project_id: UUID,
+    target_project: Project,
+) -> list[ProjectWorkflowStep]:
+    source_steps = _load_project_workflow_steps(db, source_project_id)
+    if not source_steps:
+        source_steps = [
+            ProjectWorkflowStep(
+                project_id=source_project_id,
+                step_key="translate",
+                name="翻译",
+                step_type="translation",
+                sort_order=0,
+            )
+        ]
+    copied_steps = [
+        ProjectWorkflowStep(
+            project_id=target_project.id,
+            step_key=step.step_key,
+            name=step.name,
+            step_type=step.step_type,
+            sort_order=int(step.sort_order or 0),
+        )
+        for step in source_steps
+    ]
+    for step in copied_steps:
+        db.add(step)
+    db.flush()
+    return copied_steps
+
+
+def _get_first_workflow_step_id(db: Session, project_id: UUID | None) -> UUID | None:
+    steps = _load_project_workflow_steps(db, project_id)
+    return steps[0].id if steps else None
+
+
+def _assign_file_segments_to_first_workflow_step(db: Session, file_record: FileRecord) -> UUID | None:
+    first_step_id = _get_first_workflow_step_id(db, file_record.project_id)
+    if first_step_id is None:
+        return None
+    db.query(Segment).filter(
+        Segment.file_record_id == file_record.id,
+        Segment.workflow_step_id.is_(None),
+    ).update(
+        {"workflow_step_id": first_step_id},
+        synchronize_session=False,
+    )
+    return first_step_id
+
+
+def _build_workflow_progress_payload(
+    steps: list[ProjectWorkflowStep],
+    total_segments: int,
+    grouped_counts: list[tuple[UUID | None, str | None, int]],
+) -> list[dict[str, Any]]:
+    if not steps:
+        return []
+
+    order_by_step_id = {step.id: int(step.sort_order or 0) for step in steps}
+    first_order = int(steps[0].sort_order or 0)
+    payload: list[dict[str, Any]] = []
+    for step in steps:
+        step_order = int(step.sort_order or 0)
+        completed = 0
+        for current_step_id, status, count in grouped_counts:
+            current_order = order_by_step_id.get(current_step_id, first_order)
+            if current_order > step_order or (current_order == step_order and status == "confirmed"):
+                completed += int(count or 0)
+        payload.append({
+            **_serialize_workflow_step(step),
+            "total_segments": int(total_segments or 0),
+            "completed_segments": completed,
+            "progress": calculate_file_record_progress(int(total_segments or 0), completed),
+        })
+    return payload
+
+
+def _get_file_workflow_progress(db: Session, file_record_ids: list[UUID]) -> dict[UUID, list[dict[str, Any]]]:
+    if not file_record_ids:
+        return {}
+    file_rows = (
+        db.query(FileRecord.id, FileRecord.project_id)
+        .filter(FileRecord.id.in_(file_record_ids))
+        .all()
+    )
+    project_ids = sorted({row.project_id for row in file_rows if row.project_id}, key=str)
+    steps_by_project = _load_workflow_steps_by_project(db, project_ids)
+    segment_rows = (
+        db.query(
+            Segment.file_record_id,
+            Segment.workflow_step_id,
+            Segment.status,
+            func.count(Segment.id).label("count"),
+        )
+        .filter(Segment.file_record_id.in_(file_record_ids))
+        .group_by(Segment.file_record_id, Segment.workflow_step_id, Segment.status)
+        .all()
+    )
+    grouped_by_file: dict[UUID, list[tuple[UUID | None, str | None, int]]] = {}
+    total_by_file: dict[UUID, int] = {}
+    for row in segment_rows:
+        count = int(row.count or 0)
+        grouped_by_file.setdefault(row.file_record_id, []).append((row.workflow_step_id, row.status, count))
+        total_by_file[row.file_record_id] = total_by_file.get(row.file_record_id, 0) + count
+
+    result: dict[UUID, list[dict[str, Any]]] = {}
+    for row in file_rows:
+        steps = steps_by_project.get(row.project_id, []) if row.project_id else []
+        result[row.id] = _build_workflow_progress_payload(
+            steps,
+            total_by_file.get(row.id, 0),
+            grouped_by_file.get(row.id, []),
+        )
+    return result
+
+
+def _get_project_workflow_progress(db: Session, project_ids: list[UUID]) -> dict[UUID, list[dict[str, Any]]]:
+    if not project_ids:
+        return {}
+    steps_by_project = _load_workflow_steps_by_project(db, project_ids)
+    segment_rows = (
+        db.query(
+            FileRecord.project_id,
+            Segment.workflow_step_id,
+            Segment.status,
+            func.count(Segment.id).label("count"),
+        )
+        .join(FileRecord, FileRecord.id == Segment.file_record_id)
+        .filter(FileRecord.project_id.in_(project_ids))
+        .group_by(FileRecord.project_id, Segment.workflow_step_id, Segment.status)
+        .all()
+    )
+    grouped_by_project: dict[UUID, list[tuple[UUID | None, str | None, int]]] = {}
+    total_by_project: dict[UUID, int] = {}
+    for row in segment_rows:
+        count = int(row.count or 0)
+        grouped_by_project.setdefault(row.project_id, []).append((row.workflow_step_id, row.status, count))
+        total_by_project[row.project_id] = total_by_project.get(row.project_id, 0) + count
+
+    return {
+        project_id: _build_workflow_progress_payload(
+            steps_by_project.get(project_id, []),
+            total_by_project.get(project_id, 0),
+            grouped_by_project.get(project_id, []),
+        )
+        for project_id in project_ids
+    }
 
 
 ASSIGNMENT_STATUS_ACTIVE = "active"
@@ -1170,6 +1704,116 @@ def _has_active_file_assignment(db: Session | None, file_record: FileRecord, use
     )
 
 
+def _get_active_file_assignment_step_ids(
+    db: Session | None,
+    file_record: FileRecord,
+    user_id: UUID | None,
+) -> set[UUID]:
+    if db is None or user_id is None:
+        return set()
+    if not _has_active_project_assignment(db, file_record.project_id, user_id):
+        return set()
+    rows = (
+        db.query(FileAssignment.workflow_step_id)
+        .filter(
+            FileAssignment.file_record_id == file_record.id,
+            FileAssignment.assignee_id == user_id,
+            FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            FileAssignment.workflow_step_id.isnot(None),
+        )
+        .all()
+    )
+    return {row.workflow_step_id for row in rows if row.workflow_step_id is not None}
+
+
+def _has_active_file_assignment_for_step(
+    db: Session | None,
+    file_record: FileRecord,
+    user_id: UUID | None,
+    workflow_step_id: UUID | None,
+) -> bool:
+    if db is None or user_id is None or workflow_step_id is None:
+        return False
+    if not _has_active_project_assignment(db, file_record.project_id, user_id):
+        return False
+    return (
+        db.query(FileAssignment.id)
+        .filter(
+            FileAssignment.file_record_id == file_record.id,
+            FileAssignment.assignee_id == user_id,
+            FileAssignment.workflow_step_id == workflow_step_id,
+            FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+        )
+        .first()
+        is not None
+    )
+
+
+def _ensure_segment_workflow_step(db: Session, file_record: FileRecord, segment: Segment) -> UUID | None:
+    if segment.workflow_step_id is not None:
+        return segment.workflow_step_id
+    first_step_id = _get_first_workflow_step_id(db, file_record.project_id)
+    if first_step_id is not None:
+        segment.workflow_step_id = first_step_id
+        db.flush()
+    return segment.workflow_step_id
+
+
+def _get_file_record_writable_workflow_step_ids(
+    db: Session,
+    file_record: FileRecord,
+    current_user: User | None,
+) -> set[UUID]:
+    if current_user is None:
+        return set()
+    if can_access_all_projects(current_user):
+        return {step.id for step in _load_project_workflow_steps(db, file_record.project_id)}
+    return _get_active_file_assignment_step_ids(db, file_record, current_user.id)
+
+
+def _can_write_workflow_step(
+    db: Session,
+    file_record: FileRecord,
+    current_user: User | None,
+    workflow_step_id: UUID | None,
+) -> bool:
+    if current_user is None:
+        return False
+    if can_access_all_projects(current_user):
+        return True
+    return _has_active_file_assignment_for_step(db, file_record, current_user.id, workflow_step_id)
+
+
+def _require_segment_work_access(
+    db: Session,
+    file_record: FileRecord,
+    segment: Segment,
+    current_user: User,
+) -> None:
+    workflow_step_id = _ensure_segment_workflow_step(db, file_record, segment)
+    if not _can_write_workflow_step(db, file_record, current_user, workflow_step_id):
+        raise HTTPException(status_code=403, detail="当前账号没有编辑该流程阶段句段的权限。")
+
+
+def _filter_writable_segments(
+    db: Session,
+    file_record: FileRecord,
+    current_user: User,
+    segments: list[Segment],
+) -> list[Segment]:
+    if can_access_all_projects(current_user):
+        for segment in segments:
+            _ensure_segment_workflow_step(db, file_record, segment)
+        return segments
+    writable_step_ids = _get_file_record_writable_workflow_step_ids(db, file_record, current_user)
+    result: list[Segment] = []
+    for segment in segments:
+        workflow_step_id = _ensure_segment_workflow_step(db, file_record, segment)
+        if workflow_step_id in writable_step_ids:
+            result.append(segment)
+    return result
+
+
 def _can_read_project(project: Project, current_user: User | None, db: Session | None = None) -> bool:
     if current_user is None:
         return False
@@ -1199,7 +1843,12 @@ def _can_read_file_record(file_record: FileRecord, current_user: User | None, db
 
 
 def _can_write_file_record(file_record: FileRecord, current_user: User | None, db: Session | None = None) -> bool:
-    return _can_read_file_record(file_record, current_user, db)
+    if current_user is None:
+        return False
+    if can_access_all_projects(current_user):
+        return True
+    session = db or _get_record_session(file_record)
+    return _has_active_file_assignment(session, file_record, current_user.id)
 
 
 def _require_file_record_read_access(file_record: FileRecord, current_user: User) -> None:
@@ -1289,7 +1938,12 @@ def _get_active_file_assignees(db: Session, file_record_ids: list[UUID]) -> dict
         .all()
     )
     result: dict[UUID, list[User]] = {}
+    seen: set[tuple[UUID, UUID]] = set()
     for file_record_id, user in rows:
+        key = (file_record_id, user.id)
+        if key in seen:
+            continue
+        seen.add(key)
         result.setdefault(file_record_id, []).append(user)
     return result
 
@@ -1397,22 +2051,38 @@ def _validate_assignment_payload(
     db: Session,
     project: Project,
     payload: ProjectAssignmentsRequest,
-) -> dict[UUID, set[UUID]]:
+) -> tuple[dict[tuple[UUID, UUID], set[UUID]], set[UUID]]:
     project_file_ids = {
         row.id
         for row in db.query(FileRecord.id).filter(FileRecord.project_id == project.id).all()
     }
-    desired: dict[UUID, set[UUID]] = {}
+    workflow_steps = _load_project_workflow_steps(db, project.id)
+    if not workflow_steps:
+        workflow_steps = _create_project_workflow_steps(
+            db,
+            project,
+            requested_steps=[],
+            template_id="translate",
+        )
+    workflow_step_ids = {step.id for step in workflow_steps}
+    first_step_id = workflow_steps[0].id
+
+    desired: dict[tuple[UUID, UUID], set[UUID]] = {}
+    desired_user_ids: set[UUID] = set()
     for entry in payload.assignments:
         assignee = get_user_by_id(db, entry.assignee_id)
         if assignee is None or not assignee.is_active or assignee.role != USER_ROLE:
             raise HTTPException(status_code=400, detail="只能指派给启用中的普通译者账号。")
+        workflow_step_id = entry.workflow_step_id or first_step_id
+        if workflow_step_id not in workflow_step_ids:
+            raise HTTPException(status_code=400, detail="存在不属于当前项目的流程阶段授权。")
         file_ids = set(entry.file_record_ids or [])
         invalid_file_ids = file_ids - project_file_ids
         if invalid_file_ids:
             raise HTTPException(status_code=400, detail="存在不属于当前项目的文件授权。")
-        desired.setdefault(assignee.id, set()).update(file_ids)
-    return desired
+        desired_user_ids.add(assignee.id)
+        desired.setdefault((assignee.id, workflow_step_id), set()).update(file_ids)
+    return desired, desired_user_ids
 
 
 def _sync_legacy_file_assignees(db: Session, project_id: UUID) -> None:
@@ -1438,6 +2108,9 @@ def _sync_legacy_file_assignees(db: Session, project_id: UUID) -> None:
 
 
 def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, Any]:
+    workflow_steps = _load_project_workflow_steps(db, project_id)
+    workflow_step_by_id = {step.id: step for step in workflow_steps}
+    first_step_id = workflow_steps[0].id if workflow_steps else None
     assignments = (
         db.query(ProjectAssignment)
         .join(User, User.id == ProjectAssignment.assignee_id)
@@ -1457,23 +2130,206 @@ def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, A
         .order_by(FileAssignment.assigned_at.asc(), FileAssignment.id.asc())
         .all()
     )
-    files_by_user: dict[UUID, list[str]] = {}
+    files_by_user_step: dict[tuple[UUID, UUID], list[str]] = {}
+    first_file_assignment_by_user_step: dict[tuple[UUID, UUID], FileAssignment] = {}
     for file_assignment in file_rows:
-        files_by_user.setdefault(file_assignment.assignee_id, []).append(str(file_assignment.file_record_id))
-    return {
-        "project_id": str(project_id),
-        "assignments": [
-            {
-                "id": str(assignment.id),
+        workflow_step_id = file_assignment.workflow_step_id or first_step_id
+        if workflow_step_id is None:
+            continue
+        key = (file_assignment.assignee_id, workflow_step_id)
+        files_by_user_step.setdefault(key, []).append(str(file_assignment.file_record_id))
+        first_file_assignment_by_user_step.setdefault(key, file_assignment)
+
+    assignment_items: list[dict[str, Any]] = []
+    for assignment in assignments:
+        keys = [
+            key
+            for key in files_by_user_step
+            if key[0] == assignment.assignee_id
+        ]
+        if not keys and first_step_id is not None:
+            keys = [(assignment.assignee_id, first_step_id)]
+        for _, workflow_step_id in sorted(
+            keys,
+            key=lambda key: int(workflow_step_by_id[key[1]].sort_order or 0)
+            if key[1] in workflow_step_by_id
+            else 0,
+        ):
+            workflow_step = workflow_step_by_id.get(workflow_step_id)
+            file_assignment = first_file_assignment_by_user_step.get((assignment.assignee_id, workflow_step_id))
+            assigned_by_id = (
+                file_assignment.assigned_by_id
+                if file_assignment is not None and file_assignment.assigned_by_id
+                else assignment.assigned_by_id
+            )
+            assigned_at = (
+                file_assignment.assigned_at
+                if file_assignment is not None
+                else assignment.assigned_at
+            )
+            assignment_items.append({
+                "id": str(file_assignment.id if file_assignment is not None else assignment.id),
+                "project_assignment_id": str(assignment.id),
                 "assignee_id": str(assignment.assignee_id),
                 "assignee": serialize_user(assignment.assignee),
-                "file_record_ids": files_by_user.get(assignment.assignee_id, []),
-                "assigned_by_id": str(assignment.assigned_by_id) if assignment.assigned_by_id else None,
-                "assigned_at": assignment.assigned_at.isoformat(),
-            }
-            for assignment in assignments
-        ],
+                "workflow_step_id": str(workflow_step_id),
+                "workflow_step": _serialize_workflow_step(workflow_step) if workflow_step is not None else None,
+                "file_record_ids": files_by_user_step.get((assignment.assignee_id, workflow_step_id), []),
+                "assigned_by_id": str(assigned_by_id) if assigned_by_id else None,
+                "assigned_at": assigned_at.isoformat(),
+            })
+    return {
+        "project_id": str(project_id),
+        "workflow_steps": [_serialize_workflow_step(step) for step in workflow_steps],
+        "assignments": assignment_items,
     }
+
+
+def _update_project_assignments_by_workflow(
+    db: Session,
+    *,
+    project_id: UUID,
+    project: Project,
+    payload: ProjectAssignmentsRequest,
+    current_user: User,
+) -> dict[str, Any]:
+    desired, desired_user_ids = _validate_assignment_payload(db, project, payload)
+    now = datetime.utcnow()
+    workflow_steps = _load_project_workflow_steps(db, project_id)
+    first_step_id = workflow_steps[0].id if workflow_steps else None
+
+    current_project_assignments = {
+        assignment.assignee_id: assignment
+        for assignment in (
+            db.query(ProjectAssignment)
+            .filter(
+                ProjectAssignment.project_id == project_id,
+                ProjectAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            )
+            .all()
+        )
+    }
+
+    current_file_assignments: dict[tuple[UUID, UUID], dict[UUID, FileAssignment]] = {}
+    for assignment in (
+        db.query(FileAssignment)
+        .filter(
+            FileAssignment.project_id == project_id,
+            FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+        )
+        .all()
+    ):
+        workflow_step_id = assignment.workflow_step_id or first_step_id
+        if workflow_step_id is None:
+            continue
+        current_file_assignments.setdefault(
+            (assignment.assignee_id, workflow_step_id),
+            {},
+        )[assignment.file_record_id] = assignment
+
+    for assignee_id, assignment in list(current_project_assignments.items()):
+        if assignee_id in desired_user_ids:
+            continue
+        assignment.status = ASSIGNMENT_STATUS_REVOKED
+        assignment.revoked_by_id = current_user.id
+        assignment.revoked_at = now
+        _record_assignment_event(
+            db,
+            project_id=project_id,
+            assignee_id=assignee_id,
+            actor_id=current_user.id,
+            action=ASSIGNMENT_EVENT_PROJECT_UNASSIGNED,
+            before_payload={"project_id": str(project_id), "status": ASSIGNMENT_STATUS_ACTIVE},
+            after_payload={"project_id": str(project_id), "status": ASSIGNMENT_STATUS_REVOKED},
+        )
+
+    for assignee_id in sorted(desired_user_ids, key=str):
+        project_assignment = current_project_assignments.get(assignee_id)
+        if project_assignment is not None:
+            continue
+        project_assignment = ProjectAssignment(
+            project_id=project_id,
+            assignee_id=assignee_id,
+            assigned_by_id=current_user.id,
+            assigned_at=now,
+            status=ASSIGNMENT_STATUS_ACTIVE,
+        )
+        db.add(project_assignment)
+        current_project_assignments[assignee_id] = project_assignment
+        _record_assignment_event(
+            db,
+            project_id=project_id,
+            assignee_id=assignee_id,
+            actor_id=current_user.id,
+            action=ASSIGNMENT_EVENT_PROJECT_ASSIGNED,
+            before_payload={"project_id": str(project_id), "status": None},
+            after_payload={"project_id": str(project_id), "status": ASSIGNMENT_STATUS_ACTIVE},
+        )
+
+    for key, active_by_file_id in current_file_assignments.items():
+        assignee_id, workflow_step_id = key
+        desired_file_ids = desired.get(key, set())
+        for file_record_id, file_assignment in active_by_file_id.items():
+            if assignee_id in desired_user_ids and file_record_id in desired_file_ids:
+                continue
+            file_assignment.status = ASSIGNMENT_STATUS_REVOKED
+            file_assignment.revoked_by_id = current_user.id
+            file_assignment.revoked_at = now
+            _record_assignment_event(
+                db,
+                project_id=project_id,
+                file_record_id=file_record_id,
+                assignee_id=assignee_id,
+                actor_id=current_user.id,
+                action=ASSIGNMENT_EVENT_FILE_REVOKED,
+                before_payload={
+                    "file_record_id": str(file_record_id),
+                    "workflow_step_id": str(workflow_step_id),
+                    "status": ASSIGNMENT_STATUS_ACTIVE,
+                },
+                after_payload={
+                    "file_record_id": str(file_record_id),
+                    "workflow_step_id": str(workflow_step_id),
+                    "status": ASSIGNMENT_STATUS_REVOKED,
+                },
+            )
+
+    for (assignee_id, workflow_step_id), desired_file_ids in desired.items():
+        active_file_assignments = current_file_assignments.get((assignee_id, workflow_step_id), {})
+        active_file_ids = set(active_file_assignments)
+        for file_record_id in sorted(desired_file_ids - active_file_ids, key=str):
+            file_assignment = FileAssignment(
+                project_id=project_id,
+                file_record_id=file_record_id,
+                workflow_step_id=workflow_step_id,
+                assignee_id=assignee_id,
+                assigned_by_id=current_user.id,
+                assigned_at=now,
+                status=ASSIGNMENT_STATUS_ACTIVE,
+            )
+            db.add(file_assignment)
+            _record_assignment_event(
+                db,
+                project_id=project_id,
+                file_record_id=file_record_id,
+                assignee_id=assignee_id,
+                actor_id=current_user.id,
+                action=ASSIGNMENT_EVENT_FILE_GRANTED,
+                before_payload={
+                    "file_record_id": str(file_record_id),
+                    "workflow_step_id": str(workflow_step_id),
+                    "status": None,
+                },
+                after_payload={
+                    "file_record_id": str(file_record_id),
+                    "workflow_step_id": str(workflow_step_id),
+                    "status": ASSIGNMENT_STATUS_ACTIVE,
+                },
+            )
+
+    _sync_legacy_file_assignees(db, project_id)
+    db.commit()
+    return _serialize_project_assignments(db, project_id)
 
 
 @router.get("/analytics/dashboard")
@@ -1684,11 +2540,14 @@ def _parse_optional_datetime(value: str | None) -> datetime | None:
 def _build_llm_translation_tasks(
     db: Session,
     file_record_id: UUID,
-    scope: Literal["fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"],
+    scope: Literal["current_segment", "fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"],
     source_language: str | None = None,
     target_language: str | None = None,
     collection_id: UUID | None = None,
+    glossary_base_ids: list[UUID] | None = None,
     include_context: bool = False,
+    sentence_id: str | None = None,
+    source_filename: str | None = None,
 ) -> list[LLMTranslationTask]:
     statuses_by_scope = {
         "fuzzy_only": {"fuzzy"},
@@ -1697,7 +2556,11 @@ def _build_llm_translation_tasks(
         "all_with_exact": {"exact", "fuzzy", "none"},
     }
     target_statuses: set[str] | None = None
-    if scope != "empty_target_only":
+    current_sentence_id = normalize_text(sentence_id or "")
+    if scope == "current_segment":
+        if not current_sentence_id:
+            raise ValueError("当前句段范围需要提供 sentence_id。")
+    elif scope != "empty_target_only":
         target_statuses = statuses_by_scope.get(scope)
         if target_statuses is None:
             raise ValueError(f"不支持的 scope: {scope}")
@@ -1709,11 +2572,21 @@ def _build_llm_translation_tasks(
         source_language=source_language,
         target_language=target_language,
     )
+    glossary_matches_by_source = build_glossary_matches_by_text(
+        db,
+        [segment.source_text for segment in segments if segment.source_text],
+        glossary_base_ids or [],
+        source_language=source_language,
+        target_language=target_language,
+    )
 
+    clean_numbering = is_word_document_filename(source_filename)
     tasks: list[LLMTranslationTask] = []
     for segment in segments:
         should_translate = True
-        if scope == "empty_target_only":
+        if scope == "current_segment":
+            should_translate = segment.sentence_id == current_sentence_id
+        elif scope == "empty_target_only":
             if normalize_text(segment.target_text):
                 should_translate = False
         elif target_statuses is None or segment.status not in target_statuses:
@@ -1726,6 +2599,20 @@ def _build_llm_translation_tasks(
         matched_source_text = getattr(segment, "matched_source_text", None)
         segment_tm_target_text = segment.target_text if segment_source == "tm" and normalize_text(segment.target_text) else ""
         tm_target_text = segment_tm_target_text or tm_target_text_map.get(matched_source_text or "", "")
+        if clean_numbering:
+            raw_matched_source_text = matched_source_text
+            matched_source_text = strip_automatic_numbering_prefix(
+                matched_source_text or "",
+                source_text=segment.source_text,
+                display_text=getattr(segment, "display_text", "") or "",
+                reference_texts=[raw_matched_source_text],
+            ) or None
+            tm_target_text = strip_automatic_numbering_prefix(
+                tm_target_text,
+                source_text=segment.source_text,
+                display_text=getattr(segment, "display_text", "") or "",
+                reference_texts=[raw_matched_source_text],
+            )
 
         tasks.append(
             LLMTranslationTask(
@@ -1740,6 +2627,7 @@ def _build_llm_translation_tasks(
                 cell_index=getattr(segment, "cell_index", None),
                 matched_source_text=matched_source_text,
                 tm_target_text=tm_target_text,
+                glossary_matches=glossary_matches_by_source.get(segment.source_text, []),
                 should_translate=should_translate,
             )
         )
@@ -1875,7 +2763,7 @@ def _normalize_upload_document_parse_mode(document_parse_mode: str | None) -> st
 def _normalize_upload_document_parse_options(
     document_parse_options: str | None,
     document_parse_mode: str,
-) -> dict[str, bool]:
+) -> dict[str, object]:
     try:
         return normalize_document_parse_options(document_parse_options, document_parse_mode)
     except ValueError as exc:
@@ -2030,6 +2918,31 @@ def _validate_term_base_ids(
         raise HTTPException(status_code=404, detail="选择的术语库不存在。")
 
     return [term_base_by_id[term_base_id] for term_base_id in normalized_ids]
+
+
+def _validate_glossary_base_ids(
+    db: Session,
+    glossary_base_ids: list[UUID] | None,
+) -> list[GlossaryBase]:
+    if not glossary_base_ids:
+        return []
+
+    normalized_ids = list(dict.fromkeys(glossary_base_ids))
+    glossary_bases = (
+        db.query(GlossaryBase)
+        .filter(GlossaryBase.id.in_(normalized_ids))
+        .all()
+    )
+    glossary_base_by_id = {glossary_base.id: glossary_base for glossary_base in glossary_bases}
+    missing_ids = [
+        glossary_base_id
+        for glossary_base_id in normalized_ids
+        if glossary_base_id not in glossary_base_by_id
+    ]
+    if missing_ids:
+        raise HTTPException(status_code=404, detail="选择的词汇表不存在。")
+
+    return [glossary_base_by_id[glossary_base_id] for glossary_base_id in normalized_ids]
 
 
 def _require_selected_collection_ids(
@@ -2575,6 +3488,16 @@ async def create_file_record(
     return await _queue_import_task(background_tasks, payload)
 
 
+@router.get("/workflow-templates")
+def list_workflow_templates(_: User = Depends(get_current_user)):
+    return {
+        "items": [
+            _serialize_workflow_template(template)
+            for template in WORKFLOW_TEMPLATE_DEFINITIONS
+        ]
+    }
+
+
 @router.post("/projects")
 def create_project(
     payload: ProjectCreatePayload,
@@ -2613,6 +3536,13 @@ def create_project(
         access_level=payload.access_level,
     )
     db.add(project)
+    db.flush()
+    _create_project_workflow_steps(
+        db,
+        project,
+        requested_steps=payload.workflow_steps,
+        template_id=payload.workflow_template_id,
+    )
     db.commit()
     db.refresh(project)
 
@@ -2686,10 +3616,13 @@ def duplicate_project(
     )
 
     db.add(duplicate)
+    db.flush()
+    _copy_project_workflow_steps(db, source_project.id, duplicate)
     db.commit()
     db.refresh(duplicate)
 
     return _build_project_detail_payload(
+        db,
         duplicate,
         [],
         {},
@@ -2702,12 +3635,18 @@ def _build_project_summary_payload(
     total_segments: int,
     translated_segments: int,
     file_count: int,
+    pretranslated_segments: int = 0,
     creator_name: str | None = None,
     issue_stats: dict[str, int] | None = None,
     current_user: User | None = None,
     assigned_users: list[User] | None = None,
+    workflow_steps: list[ProjectWorkflowStep] | None = None,
+    workflow_progress: list[dict[str, Any]] | None = None,
 ) -> dict:
     progress = calculate_file_record_progress(total_segments, translated_segments)
+    if workflow_progress:
+        progress = int(workflow_progress[-1].get("progress", progress))
+    pretranslation_progress = calculate_file_record_progress(total_segments, pretranslated_segments)
     effective_status = (
         resolve_file_record_status("in_progress", total_segments, translated_segments)
         if total_segments > 0
@@ -2722,6 +3661,9 @@ def _build_project_summary_payload(
         "progress": progress,
         "total_segments": total_segments,
         "translated_segments": translated_segments,
+        "confirmed_segments": translated_segments,
+        "pretranslated_segments": pretranslated_segments,
+        "pretranslation_progress": pretranslation_progress,
         "source_language": project.source_language,
         "target_language": project.target_language,
         "creator": creator_name,
@@ -2732,6 +3674,8 @@ def _build_project_summary_payload(
         "issue_count": issue_stats.get("issue_count", 0),
         "open_issue_count": issue_stats.get("open_issue_count", 0),
         "assigned_users": _serialize_user_list(assigned_users),
+        "workflow_steps": [_serialize_workflow_step(step) for step in (workflow_steps or [])],
+        "workflow_progress": workflow_progress or [],
         "can_manage": _can_manage_workflow(current_user),
         "can_write": bool(current_user) and (can_access_all_projects(current_user) or file_count > 0),
         "created_at": project.created_at.isoformat(),
@@ -2743,9 +3687,12 @@ def _build_project_file_payload(
     file_record: FileRecord,
     total_segments: int,
     translated_segments: int,
+    pretranslated_segments: int = 0,
     issue_stats: dict[str, int] | None = None,
     current_user: User | None = None,
     assignees: list[User] | None = None,
+    workflow_steps: list[ProjectWorkflowStep] | None = None,
+    workflow_progress: list[dict[str, Any]] | None = None,
 ) -> dict:
     source_bytes = load_file_record_source(file_record)
     operation_state = (
@@ -2758,6 +3705,9 @@ def _build_project_file_payload(
         }
     )
     progress = calculate_file_record_progress(total_segments, translated_segments)
+    if workflow_progress:
+        progress = int(workflow_progress[-1].get("progress", progress))
+    pretranslation_progress = calculate_file_record_progress(total_segments, pretranslated_segments)
     effective_status = resolve_file_record_status(
         file_record.status,
         total_segments=total_segments,
@@ -2772,6 +3722,7 @@ def _build_project_file_payload(
     term_base_ids = _load_file_record_term_base_ids(file_record)
     term_base_write_ids = _load_file_record_term_base_write_ids(file_record)
     qa_term_base_ids = _load_file_record_qa_term_base_ids(file_record)
+    glossary_base_ids = _load_file_record_glossary_base_ids(file_record)
 
     return {
         "id": str(file_record.id),
@@ -2784,6 +3735,9 @@ def _build_project_file_payload(
         "progress": progress,
         "total_segments": total_segments,
         "translated_segments": translated_segments,
+        "confirmed_segments": translated_segments,
+        "pretranslated_segments": pretranslated_segments,
+        "pretranslation_progress": pretranslation_progress,
         "source_language": file_record.source_language,
         "target_language": file_record.target_language,
         "creator": get_user_display_name(file_record.creator) if file_record.creator else None,
@@ -2791,6 +3745,8 @@ def _build_project_file_payload(
         "assignee": _serialize_assignee(assignee),
         "assignees": _serialize_user_list(assignees),
         "assigned_at": assigned_at.isoformat() if assigned_at else None,
+        "workflow_steps": [_serialize_workflow_step(step) for step in (workflow_steps or [])],
+        "workflow_progress": workflow_progress or [],
         "deadline": deadline.isoformat() if deadline else None,
         "access_level": file_record.access_level,
         "created_at": file_record.created_at.isoformat(),
@@ -2799,10 +3755,12 @@ def _build_project_file_payload(
         "file_size_bytes": len(source_bytes) if source_bytes is not None else None,
         "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
         "collection_ids": [str(collection_id) for collection_id in collection_ids],
+        "tm_match_threshold": _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
         "term_base_id": file_record.term_base_id,
         "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
         "term_base_write_ids": [str(term_base_id) for term_base_id in term_base_write_ids],
         "qa_term_base_ids": [str(term_base_id) for term_base_id in qa_term_base_ids],
+        "glossary_base_ids": [str(glossary_base_id) for glossary_base_id in glossary_base_ids],
         "issue_count": issue_stats.get("issue_count", 0),
         "open_issue_count": issue_stats.get("open_issue_count", 0),
         "can_manage": _can_manage_workflow(current_user),
@@ -2821,7 +3779,8 @@ def _get_file_segment_stats(db: Session, file_record_ids: list[UUID]) -> dict[UU
         db.query(
             Segment.file_record_id,
             func.count(Segment.id).label("total"),
-            func.count(sql_case((Segment.target_text != "", 1))).label("filled"),
+            func.count(sql_case((Segment.status == "confirmed", 1))).label("confirmed"),
+            func.count(sql_case((Segment.target_text != "", 1))).label("pretranslated"),
         )
         .filter(Segment.file_record_id.in_(file_record_ids))
         .group_by(Segment.file_record_id)
@@ -2830,7 +3789,9 @@ def _get_file_segment_stats(db: Session, file_record_ids: list[UUID]) -> dict[UU
     return {
         row.file_record_id: {
             "total": row.total,
-            "filled": row.filled,
+            "filled": row.confirmed,
+            "confirmed": row.confirmed,
+            "pretranslated": row.pretranslated,
         }
         for row in stats_rows
     }
@@ -2851,7 +3812,8 @@ def _get_project_stats(
             FileRecord.project_id,
             func.count(func.distinct(FileRecord.id)).label("file_count"),
             func.count(Segment.id).label("total"),
-            func.count(sql_case((Segment.target_text != "", 1))).label("filled"),
+            func.count(sql_case((Segment.status == "confirmed", 1))).label("confirmed"),
+            func.count(sql_case((Segment.target_text != "", 1))).label("pretranslated"),
         )
         .outerjoin(Segment, Segment.file_record_id == FileRecord.id)
         .filter(FileRecord.project_id.in_(project_ids))
@@ -2869,7 +3831,9 @@ def _get_project_stats(
         row.project_id: {
             "file_count": row.file_count,
             "total": row.total,
-            "filled": row.filled,
+            "filled": row.confirmed,
+            "confirmed": row.confirmed,
+            "pretranslated": row.pretranslated,
         }
         for row in stats_rows
     }
@@ -2990,11 +3954,22 @@ def _serialize_project_term_base_settings(
         enabled_set = set(enabled_ids)
         writable_set = set(writable_ids)
         qa_set = set(qa_ids)
+        qa_priority_by_id = {
+            term_base_id: index + 1
+            for index, term_base_id in enumerate(qa_ids)
+        }
         group_term_bases = [
             term_base
             for term_base in term_bases
             if term_base.source_language == source_language and term_base.target_language == target_language
         ]
+        group_term_bases.sort(
+            key=lambda term_base: (
+                0 if term_base.id in qa_priority_by_id else 1,
+                qa_priority_by_id.get(term_base.id, 9999),
+                term_base.name.casefold(),
+            )
+        )
         groups.append({
             "source_language": source_language,
             "target_language": target_language,
@@ -3013,6 +3988,7 @@ def _serialize_project_term_base_settings(
                     "enabled": term_base.id in enabled_set,
                     "writable": term_base.id in writable_set,
                     "qa": term_base.id in qa_set,
+                    "qa_priority": qa_priority_by_id.get(term_base.id),
                 }
                 for term_base in group_term_bases
             ],
@@ -3076,6 +4052,9 @@ def _serialize_project_translation_memory_settings(
                         str(collection_id)
                         for collection_id in _load_file_record_collection_ids(file_record)
                     ],
+                    "tm_match_threshold": _normalize_tm_match_threshold(
+                        getattr(file_record, "tm_match_threshold", None),
+                    ),
                 }
                 for file_record in group_files
             ],
@@ -3085,6 +4064,15 @@ def _serialize_project_translation_memory_settings(
         "project_id": str(project.id),
         "groups": groups,
     }
+
+
+def _normalize_tm_match_threshold(value: float | None) -> float:
+    if value is None:
+        value = get_settings().default_similarity_threshold
+    threshold = round(float(value), 2)
+    if threshold < 0.5 or threshold > 1:
+        raise HTTPException(status_code=400, detail="TM 匹配阈值必须在 0.50 到 1.00 之间。")
+    return threshold
 
 
 def _validate_tm_setting_collection_ids(
@@ -3126,6 +4114,43 @@ def _text_contains_case_insensitive(text: str | None, needle: str | None) -> boo
     clean_text = (text or "").casefold()
     clean_needle = (needle or "").strip().casefold()
     return bool(clean_needle and clean_needle in clean_text)
+
+
+def _term_qa_source_key(source_text: str | None) -> str:
+    return normalize_match_text(source_text or "") or normalize_text(source_text or "").casefold()
+
+
+def _term_qa_terms_are_similar(left: str, right: str) -> bool:
+    left_key = _term_qa_source_key(left)
+    right_key = _term_qa_source_key(right)
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    return left_key in right_key or right_key in left_key
+
+
+def _deduplicate_term_qa_entries(
+    entries: list[TermEntry],
+    priority_by_term_base_id: dict[UUID, int],
+) -> list[TermEntry]:
+    sorted_entries = sorted(
+        entries,
+        key=lambda entry: (
+            priority_by_term_base_id.get(entry.term_base_id, 9999),
+            -len(_term_qa_source_key(entry.source_text)),
+            str(entry.id),
+        ),
+    )
+    selected_entries: list[TermEntry] = []
+    for entry in sorted_entries:
+        source_term = (entry.source_text or "").strip()
+        if not source_term:
+            continue
+        if any(_term_qa_terms_are_similar(source_term, selected.source_text or "") for selected in selected_entries):
+            continue
+        selected_entries.append(entry)
+    return selected_entries
 
 
 def _load_json_list(raw_value: str | None) -> list[Any]:
@@ -3220,7 +4245,7 @@ def _create_term_qa_report(
         for term_base_id in ids
     ))
     if not configured_term_base_ids:
-        raise HTTPException(status_code=400, detail="未配置QA术语库。")
+        raise HTTPException(status_code=400, detail="未配置用于 QA 的术语库。")
 
     term_bases = (
         db.query(TermBase)
@@ -3303,11 +4328,18 @@ def _create_term_qa_report(
         ]
         if not qa_ids:
             continue
-        applicable_entries = [
-            entry
-            for term_base_id in qa_ids
-            for entry in entries_by_key.get((source_language, target_language, term_base_id), [])
-        ]
+        qa_priority_by_id = {
+            term_base_id: index
+            for index, term_base_id in enumerate(qa_ids)
+        }
+        applicable_entries = _deduplicate_term_qa_entries(
+            [
+                entry
+                for term_base_id in qa_ids
+                for entry in entries_by_key.get((source_language, target_language, term_base_id), [])
+            ],
+            qa_priority_by_id,
+        )
         if not applicable_entries:
             continue
         file_segments = segments_by_file_id.get(file_record.id, [])
@@ -3419,6 +4451,7 @@ def _apply_term_qa_ignore_state(
 
 
 def _build_project_detail_payload(
+    db: Session,
     project: Project,
     files: list[FileRecord],
     file_stats: dict[UUID, dict],
@@ -3431,16 +4464,25 @@ def _build_project_detail_payload(
 ) -> dict:
     total_segments = sum(file_stats.get(file.id, {"total": 0})["total"] for file in files)
     translated_segments = sum(file_stats.get(file.id, {"filled": 0})["filled"] for file in files)
+    pretranslated_segments = sum(
+        file_stats.get(file.id, {}).get("pretranslated", 0) for file in files
+    )
+    workflow_steps = _load_project_workflow_steps(db, project.id)
+    workflow_progress = _get_project_workflow_progress(db, [project.id]).get(project.id, [])
+    file_workflow_progress = _get_file_workflow_progress(db, [file.id for file in files])
     file_issue_stats = file_issue_stats or {}
     payload = _build_project_summary_payload(
         project=project,
         total_segments=total_segments,
         translated_segments=translated_segments,
+        pretranslated_segments=pretranslated_segments,
         file_count=len(files),
         creator_name=get_user_display_name(project.creator),
         issue_stats=project_issue_stats,
         current_user=current_user,
         assigned_users=assigned_users,
+        workflow_steps=workflow_steps,
+        workflow_progress=workflow_progress,
     )
     file_assignees = file_assignees or {}
     payload["files"] = [
@@ -3448,9 +4490,12 @@ def _build_project_detail_payload(
             file_record=file_record,
             total_segments=file_stats.get(file_record.id, {"total": 0})["total"],
             translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
+            pretranslated_segments=file_stats.get(file_record.id, {}).get("pretranslated", 0),
             issue_stats=file_issue_stats.get(file_record.id),
             current_user=current_user,
             assignees=file_assignees.get(file_record.id),
+            workflow_steps=workflow_steps,
+            workflow_progress=file_workflow_progress.get(file_record.id, []),
         )
         for file_record in files
     ]
@@ -3484,6 +4529,13 @@ def update_project_assignments(
     current_user: User = Depends(require_admin),
 ):
     project = _get_project_or_404(db, project_id)
+    return _update_project_assignments_by_workflow(
+        db,
+        project_id=project_id,
+        project=project,
+        payload=payload,
+        current_user=current_user,
+    )
     desired = _validate_assignment_payload(db, project, payload)
     now = datetime.utcnow()
 
@@ -3690,7 +4742,7 @@ def update_project_term_base_settings(
         if not set(writable_ids).issubset(enabled_set):
             raise HTTPException(status_code=400, detail="写入术语库必须先启用。")
         if not set(qa_ids).issubset(enabled_set):
-            raise HTTPException(status_code=400, detail="QA术语库必须先启用。")
+            raise HTTPException(status_code=400, detail="用于 QA 的术语库必须先启用。")
 
         _validate_term_base_setting_ids(db, enabled_ids, source_language, target_language)
         _validate_term_base_setting_ids(db, writable_ids, source_language, target_language)
@@ -3762,6 +4814,7 @@ def update_project_translation_memory_settings(
                     file_record_id=file_record.id,
                     collection_ids=item.collection_ids,
                     primary_collection_id=item.primary_collection_id,
+                    tm_match_threshold=item.tm_match_threshold,
                 )
                 for file_record in group_files
             ]
@@ -3779,16 +4832,24 @@ def update_project_translation_memory_settings(
                 raise HTTPException(status_code=400, detail="主写入记忆库必须包含在绑定记忆库列表中。")
             if primary_collection_id is None and selected_ids:
                 primary_collection_id = selected_ids[0]
+            next_threshold = _normalize_tm_match_threshold(
+                file_payload.tm_match_threshold
+                if file_payload.tm_match_threshold is not None
+                else getattr(file_record, "tm_match_threshold", None),
+            )
 
             before = (
                 tuple(_load_file_record_collection_ids(file_record)),
                 file_record.collection_id,
+                _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
             )
             _store_file_record_collection_ids(file_record, selected_ids)
             file_record.collection_id = primary_collection_id
+            file_record.tm_match_threshold = next_threshold
             after = (
                 tuple(_load_file_record_collection_ids(file_record)),
                 file_record.collection_id,
+                _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
             )
             if before != after:
                 changed_files.append(file_record)
@@ -4011,7 +5072,7 @@ def export_term_qa_report_xlsx(
         headers=[
             "文件名",
             "句段ID",
-            "QA术语库",
+            "术语库",
             "原文术语",
             "期望译文",
             "原文",
@@ -4087,6 +5148,7 @@ def get_project_detail(
     assigned_users = _get_active_project_assignees(db, [project_id]).get(project_id, [])
     file_assignees = _get_active_file_assignees(db, [file_record.id for file_record in files])
     return _build_project_detail_payload(
+        db,
         project,
         files,
         file_stats,
@@ -4123,22 +5185,24 @@ def compute_project_document_statistics(
     if len(files) != len(file_ids):
         raise HTTPException(status_code=404, detail="部分文件不存在或不属于当前项目。")
 
-    unavailable_statistics = {
-        "source": "unavailable",
-        "engine": None,
-        "engine_version": None,
-        "license_status": None,
-        "include_textboxes_footnotes_endnotes": None,
-        "pages": None,
-        "words": None,
-        "non_asian_words": None,
-        "asian_characters": None,
-        "characters": None,
-        "characters_with_spaces": None,
-        "paragraphs": None,
-        "lines": None,
-    }
+    unavailable_statistics = _build_unavailable_document_statistics()
+    report_statistics: list[dict[str, Any]] = []
+    report = DocumentStatisticsReport(
+        project_id=project.id,
+        created_by_id=getattr(current_user, "id", None),
+        file_ids=json.dumps([str(file_record.id) for file_record in files]),
+        total_files=len(files),
+        available_files=0,
+        totals=json.dumps(_create_empty_document_statistics_totals(), ensure_ascii=False, sort_keys=True),
+        status="completed",
+    )
+    db.add(report)
+    db.flush()
 
+    repetition_statistics_by_file_id = _load_document_repetition_statistics_for_files(
+        db,
+        [file_record.id for file_record in files],
+    )
     for file_record in files:
         source_bytes = load_file_record_source(file_record)
         source_filename = get_file_record_source_filename(file_record)
@@ -4146,26 +5210,100 @@ def compute_project_document_statistics(
             statistics = compute_word_document_statistics(source_bytes, source_filename)
         else:
             statistics = unavailable_statistics
-        file_record.document_statistics = serialize_document_statistics(statistics)
+        normalized_statistics = normalize_document_statistics(statistics)
+        normalized_statistics.update(
+            repetition_statistics_by_file_id.get(file_record.id, empty_repetition_statistics())
+        )
+        serialized_statistics = serialize_document_statistics(normalized_statistics)
+        file_record.document_statistics = serialized_statistics
+        report_statistics.append(normalized_statistics)
+        db.add(DocumentStatisticsReportItem(
+            report_id=report.id,
+            project_id=project.id,
+            file_record_id=file_record.id,
+            file_name=file_record.filename,
+            source_language=file_record.source_language,
+            target_language=file_record.target_language,
+            file_size_bytes=len(source_bytes) if source_bytes is not None else None,
+            statistics=serialized_statistics,
+        ))
+
+    report.available_files = sum(1 for statistics in report_statistics if _has_any_document_statistic(statistics))
+    report.totals = json.dumps(_sum_document_statistics(report_statistics), ensure_ascii=False, sort_keys=True)
 
     db.commit()
+    db.refresh(report)
     for file_record in files:
         db.refresh(file_record)
+    report_items = _load_document_statistics_report_items_for_response(db, [report.id]).get(report.id, [])
 
     file_stats = _get_file_segment_stats(db, [file_record.id for file_record in files])
     file_issue_stats = _get_file_issue_stats(db, [file_record.id for file_record in files])
     return {
+        "report": _serialize_document_statistics_report(report, report_items),
         "files": [
             _build_project_file_payload(
                 file_record=file_record,
                 total_segments=file_stats.get(file_record.id, {"total": 0})["total"],
                 translated_segments=file_stats.get(file_record.id, {"filled": 0})["filled"],
+                pretranslated_segments=file_stats.get(file_record.id, {}).get("pretranslated", 0),
                 issue_stats=file_issue_stats.get(file_record.id),
                 current_user=current_user,
             )
             for file_record in files
         ]
     }
+
+
+@router.get("/projects/{project_id}/document-statistics-reports")
+def list_project_document_statistics_reports(
+    project_id: UUID,
+    limit: int = 20,
+    include_items: bool = True,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+
+    safe_limit = min(max(int(limit), 1), 50)
+    reports = (
+        db.query(DocumentStatisticsReport)
+        .filter(DocumentStatisticsReport.project_id == project_id)
+        .order_by(DocumentStatisticsReport.created_at.desc(), DocumentStatisticsReport.id.desc())
+        .limit(safe_limit)
+        .all()
+    )
+    items_by_report_id = (
+        _load_document_statistics_report_items_for_response(db, [report.id for report in reports])
+        if include_items
+        else {report.id: [] for report in reports}
+    )
+    return {
+        "items": [
+            _serialize_document_statistics_report(report, items_by_report_id.get(report.id, []))
+            for report in reports
+        ]
+    }
+
+
+@router.get("/document-statistics-reports/{report_id}")
+def get_document_statistics_report(
+    report_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    report = (
+        db.query(DocumentStatisticsReport)
+        .filter(DocumentStatisticsReport.id == report_id)
+        .first()
+    )
+    if not report:
+        raise HTTPException(status_code=404, detail="字数统计报告不存在。")
+
+    report_items = _load_document_statistics_report_items_for_response(db, [report.id]).get(report.id, [])
+    return _serialize_document_statistics_report(report, report_items)
 
 
 @router.delete("/projects/{project_id}")
@@ -4490,12 +5628,15 @@ def list_projects(
     project_stats = _get_project_stats(db, project_ids, current_user=current_user)
     project_issue_stats = _get_project_issue_stats(db, project_ids, current_user=current_user)
     project_assignees = _get_active_project_assignees(db, project_ids)
+    workflow_steps_by_project = _load_workflow_steps_by_project(db, project_ids)
+    workflow_progress_by_project = _get_project_workflow_progress(db, project_ids)
 
     items = []
     for project in projects:
-        st = project_stats.get(project.id, {"file_count": 0, "total": 0, "filled": 0})
+        st = project_stats.get(project.id, {"file_count": 0, "total": 0, "filled": 0, "pretranslated": 0})
         total_segs = st["total"]
         filled_segs = st["filled"]
+        pretranslated_segs = st["pretranslated"]
 
         creator_name = None
         if project.creator:
@@ -4506,11 +5647,14 @@ def list_projects(
                 project=project,
                 total_segments=total_segs,
                 translated_segments=filled_segs,
+                pretranslated_segments=pretranslated_segs,
                 file_count=st["file_count"],
                 creator_name=creator_name,
                 issue_stats=project_issue_stats.get(project.id),
                 current_user=current_user,
                 assigned_users=project_assignees.get(project.id),
+                workflow_steps=workflow_steps_by_project.get(project.id, []),
+                workflow_progress=workflow_progress_by_project.get(project.id, []),
             )
         )
 
@@ -4555,6 +5699,7 @@ def get_file_records(
                 ProjectAssignment.assignee_id == current_user.id,
                 ProjectAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
             )
+            .distinct()
         )
     file_records = (
         query
@@ -4566,6 +5711,13 @@ def get_file_records(
     file_stats = _get_file_segment_stats(db, [file_record.id for file_record in file_records])
     file_issue_stats = _get_file_issue_stats(db, [file_record.id for file_record in file_records])
     file_assignees = _get_active_file_assignees(db, [file_record.id for file_record in file_records])
+    file_record_ids = [file_record.id for file_record in file_records]
+    project_ids = sorted(
+        {file_record.project_id for file_record in file_records if file_record.project_id},
+        key=str,
+    )
+    workflow_steps_by_project = _load_workflow_steps_by_project(db, project_ids)
+    file_workflow_progress = _get_file_workflow_progress(db, file_record_ids)
     return [
         {
             "id": file_record.id,
@@ -4573,12 +5725,22 @@ def get_file_records(
             "project_name": file_record.project.name if file_record.project else None,
             "filename": file_record.filename,
             "status": file_record.status,
-            "progress": calculate_file_record_progress(
-                file_stats.get(file_record.id, {"total": 0})["total"],
-                file_stats.get(file_record.id, {"filled": 0})["filled"],
+            "progress": (
+                int(file_workflow_progress.get(file_record.id, [{}])[-1].get("progress", 0))
+                if file_workflow_progress.get(file_record.id)
+                else calculate_file_record_progress(
+                    file_stats.get(file_record.id, {"total": 0})["total"],
+                    file_stats.get(file_record.id, {"filled": 0})["filled"],
+                )
             ),
             "total_segments": file_stats.get(file_record.id, {"total": 0})["total"],
             "translated_segments": file_stats.get(file_record.id, {"filled": 0})["filled"],
+            "confirmed_segments": file_stats.get(file_record.id, {"filled": 0})["filled"],
+            "pretranslated_segments": file_stats.get(file_record.id, {}).get("pretranslated", 0),
+            "pretranslation_progress": calculate_file_record_progress(
+                file_stats.get(file_record.id, {"total": 0})["total"],
+                file_stats.get(file_record.id, {}).get("pretranslated", 0),
+            ),
             "issue_count": file_issue_stats.get(file_record.id, {}).get("issue_count", 0),
             "open_issue_count": file_issue_stats.get(file_record.id, {}).get("open_issue_count", 0),
             "document_parse_mode": getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
@@ -4590,8 +5752,13 @@ def get_file_records(
             "assignee": _serialize_assignee(file_record.assignee),
             "assignees": _serialize_user_list(file_assignees.get(file_record.id)),
             "assigned_at": file_record.assigned_at.isoformat() if file_record.assigned_at else None,
+            "workflow_steps": [
+                _serialize_workflow_step(step)
+                for step in workflow_steps_by_project.get(file_record.project_id, [])
+            ],
+            "workflow_progress": file_workflow_progress.get(file_record.id, []),
             "can_manage": _can_manage_workflow(current_user),
-            "can_write": _can_write_file_record(file_record, current_user),
+            "can_write": _can_write_file_record(file_record, current_user, db),
             "created_at": file_record.created_at.isoformat(),
             "updated_at": file_record.updated_at.isoformat(),
         }
@@ -4606,16 +5773,92 @@ def _normalize_segment_page_limit(limit: int) -> int:
     return min(max(int(limit), 1), SEGMENT_PAGE_MAX_LIMIT)
 
 
-def _serialize_workbench_segment(seg: Segment, display_index: int | None = None) -> dict:
+def _build_segment_workflow_context(
+    db: Session,
+    file_record: FileRecord,
+    current_user: User | None,
+) -> tuple[dict[UUID, ProjectWorkflowStep], set[UUID] | None, bool]:
+    _assign_file_segments_to_first_workflow_step(db, file_record)
+    workflow_steps = _load_project_workflow_steps(db, file_record.project_id)
+    can_manage = _can_manage_workflow(current_user)
+    writable_step_ids: set[UUID] | None = None
+    if current_user is not None:
+        writable_step_ids = _get_file_record_writable_workflow_step_ids(db, file_record, current_user)
+    return {step.id: step for step in workflow_steps}, writable_step_ids, can_manage
+
+
+def _build_target_automatic_numbering_text_map(
+    file_record: FileRecord,
+) -> dict[str, str]:
+    source_filename = get_file_record_source_filename(file_record)
+    if get_task_file_extension(source_filename) != ".docx":
+        return {}
+
+    raw_bytes = load_file_record_source(file_record)
+    if raw_bytes is None:
+        return {}
+
+    try:
+        return build_docx_target_numbering_text_map(
+            raw_bytes,
+            document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
+            document_parse_options=_get_file_record_document_parse_options(file_record),
+            target_language=file_record.target_language,
+        )
+    except Exception:
+        logger.exception(
+            "failed to build target automatic numbering map file_record_id=%s",
+            getattr(file_record, "id", None),
+        )
+        return {}
+
+
+def _serialize_workbench_segment(
+    seg: Segment,
+    display_index: int | None = None,
+    *,
+    source_filename: str | None = None,
+    target_automatic_numbering_by_sentence_id: dict[str, str] | None = None,
+    workflow_step_by_id: dict[UUID, ProjectWorkflowStep] | None = None,
+    writable_workflow_step_ids: set[UUID] | None = None,
+    can_manage: bool = False,
+) -> dict:
+    resolved_source_filename = source_filename
+    if resolved_source_filename is None:
+        resolved_source_filename = getattr(getattr(seg, "file_record", None), "filename", None)
+    automatic_numbering_text = (
+        get_automatic_numbering_text(
+            source_text=seg.source_text,
+            display_text=seg.display_text,
+        )
+        if is_word_document_filename(resolved_source_filename)
+        else ""
+    )
+    target_automatic_numbering_text = ""
+    if automatic_numbering_text and target_automatic_numbering_by_sentence_id:
+        target_automatic_numbering_text = (
+            target_automatic_numbering_by_sentence_id.get(str(seg.sentence_id), "") or ""
+        ).strip()
+    resolved_workflow_step_id = seg.workflow_step_id
+    if resolved_workflow_step_id is None and workflow_step_by_id:
+        resolved_workflow_step_id = next(iter(workflow_step_by_id.keys()), None)
+    workflow_step = workflow_step_by_id.get(resolved_workflow_step_id) if workflow_step_by_id else None
+    can_write = True
+    if writable_workflow_step_ids is not None:
+        can_write = bool(can_manage or (resolved_workflow_step_id in writable_workflow_step_ids))
     payload = {
         "id": str(seg.id),
         "sentence_id": seg.sentence_id,
         "source_text": seg.source_text,
         "display_text": seg.display_text,
+        "source_body_text": seg.source_text,
+        "automatic_numbering_text": automatic_numbering_text or None,
+        "target_automatic_numbering_text": target_automatic_numbering_text or None,
         "source_html": seg.source_html,
         "target_text": seg.target_text,
         "target_html": seg.target_html,
         "status": seg.status,
+        "project_sync_disabled": bool(getattr(seg, "project_sync_disabled", False)),
         "version": int(seg.version or 1),
         "score": seg.score,
         "matched_source_text": seg.matched_source_text,
@@ -4630,6 +5873,10 @@ def _serialize_workbench_segment(seg: Segment, display_index: int | None = None)
         "block_index": seg.block_index,
         "row_index": seg.row_index,
         "cell_index": seg.cell_index,
+        "workflow_step_id": str(resolved_workflow_step_id) if resolved_workflow_step_id else None,
+        "workflow_step_name": workflow_step.name if workflow_step else "翻译",
+        "workflow_step_order": int(workflow_step.sort_order or 0) if workflow_step else 0,
+        "can_write": can_write,
         "updated_at": seg.updated_at.isoformat() if seg.updated_at else None,
     }
     if display_index is not None:
@@ -4790,13 +6037,18 @@ def _is_cjk_text(text: str) -> bool:
     return cjk_count > len(text) * 0.3
 
 
-def _build_preview_render_segments(segments: list[Segment], mode: str) -> list[dict]:
+def _build_preview_render_segments(
+    segments: list[Segment],
+    mode: str,
+    *,
+    source_filename: str | None = None,
+) -> list[dict]:
     if mode != "target":
-        return [_serialize_workbench_segment(segment) for segment in segments]
+        return [_serialize_workbench_segment(segment, source_filename=source_filename) for segment in segments]
 
     rendered: list[dict] = []
     for segment in segments:
-        item = _serialize_workbench_segment(segment)
+        item = _serialize_workbench_segment(segment, source_filename=source_filename)
         item["display_text"] = segment.target_text or segment.display_text or segment.source_text
         rendered.append(item)
     return rendered
@@ -4857,6 +6109,180 @@ def _get_segment_page_sentence_ids(
     ]
 
 
+def _get_workflow_step_for_file_record(
+    db: Session,
+    file_record: FileRecord,
+    workflow_step_id: UUID,
+) -> ProjectWorkflowStep:
+    step = (
+        db.query(ProjectWorkflowStep)
+        .filter(
+            ProjectWorkflowStep.id == workflow_step_id,
+            ProjectWorkflowStep.project_id == file_record.project_id,
+        )
+        .first()
+    )
+    if step is None:
+        raise HTTPException(status_code=400, detail="流程阶段不属于当前文件所在项目。")
+    return step
+
+
+def _apply_workflow_transition_filters(
+    db: Session,
+    query,
+    file_record_id: UUID,
+    payload: WorkflowTransitionPreviewRequest,
+):
+    query = query.filter(
+        Segment.file_record_id == file_record_id,
+        Segment.workflow_step_id == payload.from_step_id,
+    )
+    selected_statuses = set(payload.source_statuses or [])
+    if selected_statuses:
+        query = query.filter(Segment.status.in_(sorted(selected_statuses)))
+    elif payload.source_status == "confirmed":
+        query = query.filter(Segment.status == "confirmed")
+    elif payload.source_status == "unconfirmed":
+        query = query.filter(or_(Segment.status.is_(None), Segment.status != "confirmed"))
+
+    if not payload.all_segments:
+        range_end = payload.range_end if payload.range_end is not None else payload.range_start
+        if payload.range_start > range_end:
+            raise HTTPException(status_code=400, detail="句段范围起始值不能大于结束值。")
+        ordered_segments = (
+            db.query(
+                Segment.id.label("id"),
+                func.row_number()
+                .over(
+                    order_by=(
+                        Segment.block_index.asc(),
+                        Segment.row_index.asc().nullsfirst(),
+                        Segment.cell_index.asc().nullsfirst(),
+                        Segment.sentence_id.asc(),
+                    )
+                )
+                .label("display_index"),
+            )
+            .filter(Segment.file_record_id == file_record_id)
+            .subquery()
+        )
+        query = (
+            query.join(ordered_segments, ordered_segments.c.id == Segment.id)
+            .filter(
+                ordered_segments.c.display_index >= payload.range_start,
+                ordered_segments.c.display_index <= range_end,
+            )
+        )
+    return query
+
+
+def _resolve_workflow_transition_context(
+    db: Session,
+    file_record: FileRecord,
+    payload: WorkflowTransitionPreviewRequest,
+    current_user: User,
+) -> tuple[ProjectWorkflowStep, ProjectWorkflowStep]:
+    _assign_file_segments_to_first_workflow_step(db, file_record)
+    from_step = _get_workflow_step_for_file_record(db, file_record, payload.from_step_id)
+    target_step = _get_workflow_step_for_file_record(db, file_record, payload.target_step_id)
+    if from_step.id == target_step.id:
+        raise HTTPException(status_code=400, detail="目标流程必须与当前流程不同。")
+    if int(from_step.sort_order or 0) == int(target_step.sort_order or 0):
+        raise HTTPException(status_code=400, detail="目标流程顺序必须与当前流程不同。")
+    if not _can_write_workflow_step(db, file_record, current_user, from_step.id):
+        raise HTTPException(status_code=403, detail="当前账号没有推进该来源流程阶段的权限。")
+    return from_step, target_step
+
+
+@router.post("/file-records/{file_record_id}/workflow/transition/preview")
+def preview_file_record_workflow_transition(
+    file_record_id: UUID,
+    payload: WorkflowTransitionPreviewRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文件不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    from_step, target_step = _resolve_workflow_transition_context(db, file_record, payload, current_user)
+    query = _apply_workflow_transition_filters(
+        db,
+        db.query(Segment),
+        file_record_id,
+        payload,
+    )
+    matched_count = query.count()
+    return {
+        "file_record_id": str(file_record_id),
+        "from_step": _serialize_workflow_step(from_step),
+        "target_step": _serialize_workflow_step(target_step),
+        "matched_count": int(matched_count or 0),
+        "source_status": payload.source_status,
+        "source_statuses": payload.source_statuses,
+        "target_status": payload.target_status,
+    }
+
+
+@router.post("/file-records/{file_record_id}/workflow/transition")
+def transition_file_record_workflow(
+    file_record_id: UUID,
+    payload: WorkflowTransitionRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+):
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    from_step, target_step = _resolve_workflow_transition_context(db, file_record, payload, current_user)
+    segments = _order_segment_query(
+        _apply_workflow_transition_filters(
+            db,
+            db.query(Segment),
+            file_record_id,
+            payload,
+        )
+    ).all()
+    matched_count = len(segments)
+    updated_count = 0
+    confirmed_segments: list[Segment] = []
+    for segment in segments:
+        next_status = "confirmed" if payload.target_status == "confirmed" else _resolve_unconfirmed_segment_status(segment)
+        if segment.workflow_step_id != target_step.id or segment.status != next_status:
+            segment.workflow_step_id = target_step.id
+            segment.status = next_status
+            segment.version = int(segment.version or 1) + 1
+            updated_count += 1
+        if segment.status == "confirmed" and normalize_text(segment.target_text):
+            confirmed_segments.append(segment)
+
+    auto_tm_summary = _empty_auto_tm_summary()
+    if confirmed_segments:
+        auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(
+            db,
+            file_record=file_record,
+            segments=confirmed_segments,
+            current_user=current_user,
+        )
+    if updated_count:
+        sync_file_record_status(db, file_record_id)
+    db.commit()
+    _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+    return {
+        "file_record_id": str(file_record_id),
+        "from_step": _serialize_workflow_step(from_step),
+        "target_step": _serialize_workflow_step(target_step),
+        "matched_count": matched_count,
+        "updated_count": updated_count,
+        "source_status": payload.source_status,
+        "source_statuses": payload.source_statuses,
+        "target_status": payload.target_status,
+        "status_stats": _get_segment_status_stats(db, file_record_id),
+        "workflow_progress": _get_file_workflow_progress(db, [file_record_id]).get(file_record_id, []),
+        "auto_tm": auto_tm_summary.to_dict(),
+    }
+
+
 @router.get("/file-records/{file_record_id}")
 @router.get("/documents/{file_record_id}", include_in_schema=False)
 def get_file_record(
@@ -4909,6 +6335,7 @@ def get_file_record(
     term_base_ids = _load_file_record_term_base_ids(file_record)
     term_base_write_ids = _load_file_record_term_base_write_ids(file_record)
     qa_term_base_ids = _load_file_record_qa_term_base_ids(file_record)
+    glossary_base_ids = _load_file_record_glossary_base_ids(file_record)
     term_base_names: list[str] = []
     all_bound_term_base_ids = list(dict.fromkeys(term_base_ids + term_base_write_ids + qa_term_base_ids))
     term_base_by_id: dict[UUID, TermBase] = {}
@@ -4926,6 +6353,19 @@ def get_file_record(
         ]
         if term_base_name is None and term_base_names:
             term_base_name = term_base_names[0]
+    glossary_base_names: list[str] = []
+    if glossary_base_ids:
+        glossary_bases = (
+            db.query(GlossaryBase)
+            .filter(GlossaryBase.id.in_(glossary_base_ids))
+            .all()
+        )
+        glossary_base_by_id = {glossary_base.id: glossary_base for glossary_base in glossary_bases}
+        glossary_base_names = [
+            glossary_base_by_id[glossary_base_id].name
+            for glossary_base_id in glossary_base_ids
+            if glossary_base_id in glossary_base_by_id
+        ]
 
     project_guidelines = ""
     if file_record.project_id:
@@ -4938,6 +6378,14 @@ def get_file_record(
         {"issue_count": 0, "open_issue_count": 0},
     )
     file_assignees = _get_active_file_assignees(db, [file_record.id]).get(file_record.id, [])
+    workflow_steps = _load_project_workflow_steps(db, file_record.project_id)
+    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+        db,
+        file_record,
+        current_user,
+    )
+    workflow_progress = _get_file_workflow_progress(db, [file_record.id]).get(file_record.id, [])
+    target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
 
     return {
         "id": file_record.id,
@@ -4956,6 +6404,7 @@ def get_file_record(
         "assigned_at": file_record.assigned_at.isoformat() if file_record.assigned_at else None,
         "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
         "collection_ids": [str(collection_id) for collection_id in collection_ids],
+        "tm_match_threshold": _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
         "collection_name": collection_name,
         "term_base_id": file_record.term_base_id,
         "term_base_name": term_base_name,
@@ -4973,6 +6422,8 @@ def get_file_record(
             for term_base_id in qa_term_base_ids
             if term_base_id in term_base_by_id
         ],
+        "glossary_base_ids": [str(glossary_base_id) for glossary_base_id in glossary_base_ids],
+        "glossary_base_names": glossary_base_names,
         "translation_guidelines": project_guidelines,
         "created_at": file_record.created_at.isoformat(),
         "updated_at": file_record.updated_at.isoformat(),
@@ -4984,12 +6435,22 @@ def get_file_record(
         "has_source_document": source_bytes is not None,
         "can_export": can_export_task_file(source_filename, has_source_file=source_bytes is not None),
         "can_manage": _can_manage_workflow(current_user),
-        "can_write": _can_write_file_record(file_record, current_user),
+        "can_write": _can_write_file_record(file_record, current_user, db),
+        "workflow_steps": [_serialize_workflow_step(step) for step in workflow_steps],
+        "workflow_progress": workflow_progress,
         "issue_count": issue_stats["issue_count"],
         "open_issue_count": issue_stats["open_issue_count"],
         "status_stats": _get_segment_status_stats(db, file_record_id),
         "segments": [
-            _serialize_workbench_segment(seg, display_index=result["skip"] + index)
+            _serialize_workbench_segment(
+                seg,
+                display_index=result["skip"] + index,
+                source_filename=source_filename,
+                target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
+                workflow_step_by_id=workflow_step_by_id,
+                writable_workflow_step_ids=writable_workflow_step_ids,
+                can_manage=can_manage,
+            )
             for index, seg in enumerate(segments)
         ],
     }
@@ -5101,6 +6562,12 @@ def get_file_record_segments(
         .all()
     )
     display_index_map = _get_segment_display_index_map(db, file_record_id, page_segments)
+    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+        db,
+        file_record,
+        current_user,
+    )
+    target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
 
     return {
         "file_record_id": str(file_record_id),
@@ -5117,7 +6584,15 @@ def get_file_record_segments(
         },
         "server_time": datetime.utcnow().isoformat(),
         "segments": [
-            _serialize_workbench_segment(seg, display_index=display_index_map.get(seg.id))
+            _serialize_workbench_segment(
+                seg,
+                display_index=display_index_map.get(seg.id),
+                source_filename=get_file_record_source_filename(file_record),
+                target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
+                workflow_step_by_id=workflow_step_by_id,
+                writable_workflow_step_ids=writable_workflow_step_ids,
+                can_manage=can_manage,
+            )
             for seg in page_segments
         ],
     }
@@ -5152,11 +6627,24 @@ def get_file_record_segment_changes(
         .limit(safe_limit)
         .all()
     )
+    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+        db,
+        file_record,
+        current_user,
+    )
+    target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
     return {
         "file_record_id": str(file_record_id),
         "server_time": datetime.utcnow().isoformat(),
         "segments": [
-            _serialize_workbench_segment(segment)
+            _serialize_workbench_segment(
+                segment,
+                source_filename=get_file_record_source_filename(file_record),
+                target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
+                workflow_step_by_id=workflow_step_by_id,
+                writable_workflow_step_ids=writable_workflow_step_ids,
+                can_manage=can_manage,
+            )
             for segment in changed_segments
         ],
     }
@@ -5226,7 +6714,7 @@ def duplicate_file_record_task(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    """复制一个文件任务，保留源文件、句段和当前译文状态。"""
+    """复制一个文件任务，保留源文件和句段原文，不复制译文。"""
     duplicate = duplicate_file_record(
         db,
         file_record_id,
@@ -5236,17 +6724,23 @@ def duplicate_file_record_task(
     if duplicate is None:
         raise HTTPException(status_code=404, detail="文档不存在。")
 
+    _assign_file_segments_to_first_workflow_step(db, duplicate)
     db.commit()
     db.refresh(duplicate)
     file_stats = _get_file_segment_stats(db, [duplicate.id]).get(
         duplicate.id,
-        {"total": 0, "filled": 0},
+        {"total": 0, "filled": 0, "pretranslated": 0},
     )
+    workflow_steps = _load_project_workflow_steps(db, duplicate.project_id)
+    workflow_progress = _get_file_workflow_progress(db, [duplicate.id]).get(duplicate.id, [])
     return _build_project_file_payload(
         duplicate,
         total_segments=file_stats["total"],
         translated_segments=file_stats["filled"],
+        pretranslated_segments=file_stats["pretranslated"],
         current_user=current_user,
+        workflow_steps=workflow_steps,
+        workflow_progress=workflow_progress,
     )
 
 
@@ -5275,13 +6769,14 @@ def assign_file_record_task(
 
     file_stats = _get_file_segment_stats(db, [file_record.id]).get(
         file_record.id,
-        {"total": 0, "filled": 0},
+        {"total": 0, "filled": 0, "pretranslated": 0},
     )
     issue_stats = _get_file_issue_stats(db, [file_record.id]).get(file_record.id)
     return _build_project_file_payload(
         file_record,
         total_segments=file_stats["total"],
         translated_segments=file_stats["filled"],
+        pretranslated_segments=file_stats["pretranslated"],
         issue_stats=issue_stats,
         current_user=current_user,
     )
@@ -5313,7 +6808,11 @@ def get_file_record_preview(
         .limit(safe_limit)
         .all()
     )
-    render_segments = _build_preview_render_segments(page_segments, mode)
+    render_segments = _build_preview_render_segments(
+        page_segments,
+        mode,
+        source_filename=source_filename,
+    )
     preview_html = build_task_preview_html(
         filename=source_filename,
         segments=render_segments,
@@ -5340,7 +6839,7 @@ def get_file_record_preview(
 def get_segment_tm_candidates(
     file_record_id: UUID,
     segment_ref: str,
-    threshold: float = 0.6,
+    threshold: float | None = None,
     max_candidates: int = 5,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -5386,7 +6885,9 @@ def get_segment_tm_candidates(
     candidates = get_tm_candidates_for_text(
         db=db,
         source_text=segment.source_text,
-        similarity_threshold=threshold,
+        similarity_threshold=_normalize_tm_match_threshold(
+            threshold if threshold is not None else getattr(file_record, "tm_match_threshold", None),
+        ),
         collection_ids=collection_ids,
         top_n=max_candidates,
     )
@@ -5440,8 +6941,10 @@ def rematch_file_record(
     threshold = float(payload.threshold)
     if threshold < 0.5 or threshold > 1:
         raise HTTPException(status_code=400, detail="TM 匹配阈值必须在 0.50 到 1.00 之间。")
+    threshold = round(threshold, 2)
 
     segments = list_segments_for_file_record(db, file_record_id)
+    segments = _filter_writable_segments(db, file_record, current_user, segments)
     if not segments:
         return {"exact": 0, "fuzzy": 0, "skipped": 0, "updated": 0}
 
@@ -5459,6 +6962,7 @@ def rematch_file_record(
     fuzzy_count = 0
     skipped_count = 0
     updated_count = 0
+    clean_numbering = is_word_document_filename(file_record.filename)
 
     for segment, match in zip(segments, matches, strict=False):
         before = (
@@ -5484,7 +6988,20 @@ def rematch_file_record(
         segment.matched_updated_at = _parse_optional_datetime(match.matched_updated_at)
 
         if match.status == "exact" and match.target_text is not None:
-            segment.target_text = match.target_text
+            target_text = (
+                strip_automatic_numbering_prefix(
+                    match.target_text,
+                    source_text=segment.source_text,
+                    display_text=segment.display_text,
+                    reference_texts=[match.matched_source_text],
+                )
+                if clean_numbering
+                else match.target_text
+            )
+            if not normalize_text(target_text):
+                skipped_count += 1
+                continue
+            segment.target_text = target_text
             segment.source = "tm"
             segment.status = "confirmed" if payload.auto_confirm_exact else "exact"
             exact_count += 1
@@ -5493,7 +7010,20 @@ def rematch_file_record(
                 segment.status in {"none", "fuzzy"} and segment.source != "user"
             )
             if can_overwrite:
-                segment.target_text = match.target_text
+                target_text = (
+                    strip_automatic_numbering_prefix(
+                        match.target_text,
+                        source_text=segment.source_text,
+                        display_text=segment.display_text,
+                        reference_texts=[match.matched_source_text],
+                    )
+                    if clean_numbering
+                    else match.target_text
+                )
+                if not normalize_text(target_text):
+                    skipped_count += 1
+                    continue
+                segment.target_text = target_text
                 segment.source = "tm"
                 segment.status = "fuzzy"
                 fuzzy_count += 1
@@ -5517,6 +7047,7 @@ def rematch_file_record(
     if selected_collection_ids:
         file_record.collection_id = selected_collection_ids[0]
         file_record.collection_ids_json = json.dumps([str(cid) for cid in selected_collection_ids])
+    file_record.tm_match_threshold = threshold
 
     db.commit()
     return {
@@ -5545,6 +7076,7 @@ def patch_file_record_bindings(
     before_collection_binding = (
         tuple(_load_file_record_collection_ids(file_record)),
         file_record.collection_id,
+        _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
     )
 
     if "collection_ids" in payload.model_fields_set:
@@ -5572,6 +7104,9 @@ def patch_file_record_bindings(
             file_record.collection_id = payload.collection_id
             # 同步更新 collection_ids_json，保持单记忆库场景的一致性
             file_record.collection_ids_json = json.dumps([str(payload.collection_id)])
+
+    if "tm_match_threshold" in payload.model_fields_set:
+        file_record.tm_match_threshold = _normalize_tm_match_threshold(payload.tm_match_threshold)
 
     if "term_base_ids" in payload.model_fields_set:
         term_bases = _validate_term_base_ids(db, payload.term_base_ids)
@@ -5604,12 +7139,22 @@ def patch_file_record_bindings(
         for term_base in term_bases:
             _ensure_resource_language_pair_matches(term_base, source_language, target_language, "术语库")
         if not set(qa_ids).issubset(enabled_term_base_ids):
-            raise HTTPException(status_code=400, detail="QA术语库必须先启用。")
+            raise HTTPException(status_code=400, detail="用于 QA 的术语库必须先启用。")
         _store_file_record_qa_term_base_ids(file_record, qa_ids)
+
+    if "glossary_base_ids" in payload.model_fields_set:
+        glossary_bases = _validate_glossary_base_ids(db, payload.glossary_base_ids)
+        for glossary_base in glossary_bases:
+            _ensure_resource_language_pair_matches(glossary_base, source_language, target_language, "词汇表")
+        _store_file_record_glossary_base_ids(
+            file_record,
+            [glossary_base.id for glossary_base in glossary_bases],
+        )
 
     after_collection_binding = (
         tuple(_load_file_record_collection_ids(file_record)),
         file_record.collection_id,
+        _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
     )
     if before_collection_binding != after_collection_binding:
         db.flush()
@@ -5625,15 +7170,103 @@ def patch_file_record_bindings(
     term_base_ids = _load_file_record_term_base_ids(file_record)
     term_base_write_ids = _load_file_record_term_base_write_ids(file_record)
     qa_term_base_ids = _load_file_record_qa_term_base_ids(file_record)
+    glossary_base_ids = _load_file_record_glossary_base_ids(file_record)
     return {
         "id": str(file_record.id),
         "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
         "collection_ids": [str(collection_id) for collection_id in collection_ids],
+        "tm_match_threshold": _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
         "term_base_id": str(file_record.term_base_id) if file_record.term_base_id else None,
         "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
         "term_base_write_ids": [str(term_base_id) for term_base_id in term_base_write_ids],
         "qa_term_base_ids": [str(term_base_id) for term_base_id in qa_term_base_ids],
+        "glossary_base_ids": [str(glossary_base_id) for glossary_base_id in glossary_base_ids],
     }
+
+
+def _require_file_export_task_read_access(
+    task: FileExportTask,
+    current_user: User,
+) -> None:
+    if task.file_record is None:
+        raise HTTPException(status_code=404, detail="File record not found.")
+    _require_file_record_read_access(task.file_record, current_user)
+
+
+def _queue_file_record_export_for_current_user(
+    *,
+    file_record_id: UUID,
+    export_type: str,
+    db: Session,
+    current_user: User,
+) -> dict[str, Any]:
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File record not found.")
+
+    _require_file_record_read_access(file_record, current_user)
+    raw_bytes = load_file_record_source(file_record)
+    from app.services.adapters import get_export_options_for_file
+
+    export_option_ids = {option.get("id") for option in get_export_options_for_file(file_record.filename)}
+    if export_type not in export_option_ids:
+        raise HTTPException(status_code=400, detail="Current file format does not support this export type.")
+
+    if export_type == "original" and not can_export_task_file(
+        get_file_record_source_filename(file_record),
+        has_source_file=raw_bytes is not None,
+    ):
+        raise HTTPException(status_code=400, detail="Current file format does not support original export yet.")
+
+    return queue_file_export(
+        db,
+        file_record_id=file_record_id,
+        export_type=export_type,
+        current_user=current_user,
+    )
+
+
+@router.post("/file-records/{file_record_id}/exports")
+@router.post("/documents/{file_record_id}/exports", include_in_schema=False)
+def create_file_record_export_task(
+    file_record_id: UUID,
+    type: str = Query(default="original"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return JSONResponse(
+        status_code=202,
+        content=_queue_file_record_export_for_current_user(
+            file_record_id=file_record_id,
+            export_type=type,
+            db=db,
+            current_user=current_user,
+        ),
+    )
+
+
+@router.get("/file-records/export-tasks/{task_id}")
+@router.get("/documents/export-tasks/{task_id}", include_in_schema=False)
+def get_file_record_export_task(
+    task_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    task = get_file_export_task(db, task_id)
+    _require_file_export_task_read_access(task, current_user)
+    return serialize_file_export_task(task)
+
+
+@router.get("/file-records/export-tasks/{task_id}/download")
+@router.get("/documents/export-tasks/{task_id}/download", include_in_schema=False)
+def download_file_record_export_task(
+    task_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    task = get_file_export_task(db, task_id)
+    _require_file_export_task_read_access(task, current_user)
+    return build_file_export_download_response(task)
 
 
 @router.get("/file-records/{file_record_id}/export")
@@ -5645,36 +7278,14 @@ def export_file_record_docx(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _begin_repeatable_read_snapshot(db)
-    file_record = get_file_record_model(db, file_record_id)
-    if not file_record:
-        raise HTTPException(status_code=404, detail="File record not found.")
-
-    _require_file_record_read_access(file_record, current_user)
-    raw_bytes = load_file_record_source(file_record)
-    source_filename = get_file_record_source_filename(file_record)
-    if not can_export_task_file(source_filename, has_source_file=raw_bytes is not None):
-        raise HTTPException(status_code=400, detail="Current file format does not support original export yet.")
-
-    segments = list_segments_for_file_record(db, file_record_id)
-    try:
-        exported_file = export_translated_task_file(
-            raw_bytes=raw_bytes,
-            filename=source_filename,
-            segments=segments,
-            document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
-            document_parse_options=_get_file_record_document_parse_options(file_record),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    return _build_binary_download_response(
-        filename=exported_file.filename,
-        content=exported_file.content,
-        media_type=exported_file.media_type,
+    queued_task = _queue_file_record_export_for_current_user(
+        file_record_id=file_record_id,
+        export_type="original",
+        db=db,
+        current_user=current_user,
     )
+    task = wait_for_file_export_task(UUID(queued_task["task_id"]))
+    return build_file_export_download_response(task)
 
 
 @router.get("/file-records/{file_record_id}/export-options")
@@ -5702,6 +7313,24 @@ def get_file_record_export_options(
 
 
 @router.get("/file-records/{file_record_id}/export/{export_type}")
+@router.get("/documents/{file_record_id}/export/{export_type}", include_in_schema=False)
+def export_file_record_with_type_queued(
+    file_record_id: UUID,
+    export_type: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    queued_task = _queue_file_record_export_for_current_user(
+        file_record_id=file_record_id,
+        export_type=export_type,
+        db=db,
+        current_user=current_user,
+    )
+    task = wait_for_file_export_task(UUID(queued_task["task_id"]))
+    return build_file_export_download_response(task)
+
+
+@router.get("/file-records/{file_record_id}/export/{export_type}", include_in_schema=False)
 @router.get("/documents/{file_record_id}/export/{export_type}", include_in_schema=False)
 def export_file_record_with_type(
     file_record_id: UUID,
@@ -5738,6 +7367,7 @@ def export_file_record_with_type(
                 segments=segments,
                 document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
                 document_parse_options=_get_file_record_document_parse_options(file_record),
+                target_language=file_record.target_language,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -5762,6 +7392,7 @@ def export_file_record_with_type(
                 order=BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS[export_type],
                 document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
                 document_parse_options=_get_file_record_document_parse_options(file_record),
+                target_language=file_record.target_language,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -5846,6 +7477,14 @@ def update_segment(
 ):
     """更新单个片段的译文"""
     file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    current_segment = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not current_segment:
+        raise HTTPException(status_code=404, detail="片段不存在。")
+    _require_segment_work_access(db, file_record, current_segment, current_user)
     if update.base_version is not None:
         current_segment = (
             db.query(Segment)
@@ -5856,6 +7495,12 @@ def update_segment(
             raise HTTPException(status_code=404, detail="片段不存在。")
         current_version = int(current_segment.version or 1)
         if current_version != update.base_version:
+            workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+                db,
+                file_record,
+                current_user,
+            )
+            target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
             return {
                 "updated_count": 0,
                 "conflicts": [
@@ -5867,7 +7512,17 @@ def update_segment(
                     }
                 ],
                 "auto_tm": _empty_auto_tm_summary().to_dict(),
-                "segments": [_serialize_workbench_segment(current_segment)],
+                "project_sync": empty_project_segment_sync_summary().to_dict(),
+                "segments": [
+                    _serialize_workbench_segment(
+                        current_segment,
+                        source_filename=get_file_record_source_filename(file_record),
+                        target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
+                        workflow_step_by_id=workflow_step_by_id,
+                        writable_workflow_step_ids=writable_workflow_step_ids,
+                        can_manage=can_manage,
+                    )
+                ],
             }
     segment = update_segment_by_sentence_id(
         db=db,
@@ -5883,6 +7538,15 @@ def update_segment(
     if not segment:
         raise HTTPException(status_code=404, detail="片段不存在。")
 
+    project_sync_summary = empty_project_segment_sync_summary()
+    if segment.status == "confirmed" and normalize_text(segment.target_text):
+        project_sync_summary = sync_project_repeated_segments_from_segments(
+            db,
+            file_record=file_record,
+            source_segments=[segment],
+            current_user=current_user,
+        )
+
     auto_tm_summary = _empty_auto_tm_summary()
     if segment.status == "confirmed":
         auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(
@@ -5891,9 +7555,15 @@ def update_segment(
             segments=[segment],
             current_user=current_user,
         )
-        if auto_tm_summary.queued_count > 0:
-            db.commit()
-            _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+    if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0:
+        db.commit()
+        _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+        db,
+        file_record,
+        current_user,
+    )
+    target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
 
     return {
         "id": segment.id,
@@ -5904,9 +7574,20 @@ def update_segment(
         "version": int(segment.version or 1),
         "updated_at": segment.updated_at.isoformat() if segment.updated_at else None,
         "auto_tm": auto_tm_summary.to_dict(),
+        "project_sync": project_sync_summary.to_dict(),
         "updated_count": 1,
         "conflicts": [],
-        "segments": [_serialize_workbench_segment(segment)],
+        "segments": [
+            _serialize_workbench_segment(
+                item,
+                source_filename=get_file_record_source_filename(file_record),
+                target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
+                workflow_step_by_id=workflow_step_by_id,
+                writable_workflow_step_ids=writable_workflow_step_ids,
+                can_manage=can_manage,
+            )
+            for item in [segment, *project_sync_summary.current_file_segments]
+        ],
     }
 
 
@@ -5921,7 +7602,15 @@ def update_segment_source(
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """更新单个片段的原文"""
-    _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    existing_segment = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not existing_segment:
+        raise HTTPException(status_code=404, detail="片段不存在。")
+    _require_segment_work_access(db, file_record, existing_segment, current_user)
     segment = update_segment_source_text(
         db=db,
         file_record_id=file_record_id,
@@ -5940,6 +7629,46 @@ def update_segment_source(
     }
 
 
+@router.patch("/file-records/{file_record_id}/segments/{sentence_id}/project-sync")
+def update_segment_project_sync(
+    file_record_id: UUID,
+    sentence_id: str,
+    payload: SegmentProjectSyncUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+):
+    """开启或关闭单个句段的项目内重复句段同步。"""
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    segment = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
+        .first()
+    )
+    if not segment:
+        raise HTTPException(status_code=404, detail="片段不存在。")
+
+    _require_segment_work_access(db, file_record, segment, current_user)
+    segment.project_sync_disabled = payload.disabled
+    segment.version = int(segment.version or 1) + 1
+    db.commit()
+    db.refresh(segment)
+    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+        db,
+        file_record,
+        current_user,
+    )
+    target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
+    return _serialize_workbench_segment(
+        segment,
+        source_filename=get_file_record_source_filename(file_record),
+        target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
+        workflow_step_by_id=workflow_step_by_id,
+        writable_workflow_step_ids=writable_workflow_step_ids,
+        can_manage=can_manage,
+    )
+
+
 @router.post("/file-records/{file_record_id}/segments/{sentence_id}/split")
 def split_segment(
     file_record_id: UUID,
@@ -5950,7 +7679,7 @@ def split_segment(
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """拆分句段：在指定偏移位置将一个句段拆为两个。"""
-    _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
     segment = (
         db.query(Segment)
         .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
@@ -5959,6 +7688,7 @@ def split_segment(
     if not segment:
         raise HTTPException(status_code=404, detail="片段不存在。")
 
+    _require_segment_work_access(db, file_record, segment, current_user)
     source_text = segment.source_text or ""
     if payload.split_offset <= 0 or payload.split_offset >= len(source_text):
         raise HTTPException(status_code=400, detail="拆分位置无效，必须在文本范围内。")
@@ -5986,6 +7716,7 @@ def split_segment(
 
     # 更新原句段
     segment.source_text = first_source
+    segment.source_hash = build_source_hash(first_source)
     segment.display_text = first_source
     segment.source_html = None
     segment.target_text = first_target
@@ -6001,8 +7732,10 @@ def split_segment(
     # 创建新句段
     new_segment = Segment(
         file_record_id=file_record_id,
+        workflow_step_id=segment.workflow_step_id,
         sentence_id=new_sentence_id,
         source_text=second_source,
+        source_hash=build_source_hash(second_source),
         display_text=second_source,
         source_html=None,
         target_text=second_target,
@@ -6022,10 +7755,30 @@ def split_segment(
     db.commit()
     db.refresh(segment)
     db.refresh(new_segment)
+    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+        db,
+        file_record,
+        current_user,
+    )
+    target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
 
     return {
-        "first": _serialize_workbench_segment(segment),
-        "second": _serialize_workbench_segment(new_segment),
+        "first": _serialize_workbench_segment(
+            segment,
+            source_filename=get_file_record_source_filename(file_record),
+            target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
+            workflow_step_by_id=workflow_step_by_id,
+            writable_workflow_step_ids=writable_workflow_step_ids,
+            can_manage=can_manage,
+        ),
+        "second": _serialize_workbench_segment(
+            new_segment,
+            source_filename=get_file_record_source_filename(file_record),
+            target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
+            workflow_step_by_id=workflow_step_by_id,
+            writable_workflow_step_ids=writable_workflow_step_ids,
+            can_manage=can_manage,
+        ),
     }
 
 
@@ -6039,7 +7792,7 @@ def merge_segment(
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
     """合并句段：将当前句段与指定的下一个句段合并为一个。"""
-    _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
     first_seg = (
         db.query(Segment)
         .filter(Segment.file_record_id == file_record_id, Segment.sentence_id == sentence_id)
@@ -6060,6 +7813,11 @@ def merge_segment(
         raise HTTPException(status_code=404, detail="目标合并片段不存在。")
 
     # 校验两个句段必须在同一个 block 中
+    _require_segment_work_access(db, file_record, first_seg, current_user)
+    _require_segment_work_access(db, file_record, second_seg, current_user)
+    if first_seg.workflow_step_id != second_seg.workflow_step_id:
+        raise HTTPException(status_code=400, detail="只能合并处于同一流程阶段的句段。")
+
     if (
         first_seg.block_index != second_seg.block_index
         or first_seg.row_index != second_seg.row_index
@@ -6076,6 +7834,7 @@ def merge_segment(
 
     # 更新第一个句段
     first_seg.source_text = merged_source.strip()
+    first_seg.source_hash = build_source_hash(first_seg.source_text)
     first_seg.display_text = merged_source.strip()
     first_seg.source_html = None
     first_seg.target_text = merged_target.strip()
@@ -6102,9 +7861,22 @@ def merge_segment(
     sync_file_record_status(db, file_record_id)
     db.commit()
     db.refresh(first_seg)
+    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+        db,
+        file_record,
+        current_user,
+    )
+    target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
 
     return {
-        "merged": _serialize_workbench_segment(first_seg),
+        "merged": _serialize_workbench_segment(
+            first_seg,
+            source_filename=get_file_record_source_filename(file_record),
+            target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
+            workflow_step_by_id=workflow_step_by_id,
+            writable_workflow_step_ids=writable_workflow_step_ids,
+            can_manage=can_manage,
+        ),
         "deleted_sentence_id": payload.target_sentence_id,
     }
 
@@ -6121,27 +7893,74 @@ def batch_update(
 ):
     """批量更新片段译文"""
     file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
+    update_items = [u.model_dump() for u in batch.updates]
+    requested_sentence_ids = [
+        item.get("sentence_id")
+        for item in update_items
+        if item.get("sentence_id")
+    ]
+    if requested_sentence_ids:
+        target_segments = (
+            db.query(Segment)
+            .filter(
+                Segment.file_record_id == file_record_id,
+                Segment.sentence_id.in_(requested_sentence_ids),
+            )
+            .all()
+        )
+        for target_segment in target_segments:
+            _require_segment_work_access(db, file_record, target_segment, current_user)
     result = batch_update_segments(
         db=db,
         file_record_id=file_record_id,
-        updates=[u.model_dump() for u in batch.updates],
+        updates=update_items,
         current_user=current_user,
         return_result=True,
     )
+    confirmed_segments_for_sync = [
+        segment
+        for segment in result.updated_segments
+        if segment.status == "confirmed" and normalize_text(segment.target_text)
+    ]
+    project_sync_summary = empty_project_segment_sync_summary()
+    if confirmed_segments_for_sync:
+        project_sync_summary = sync_project_repeated_segments_from_segments(
+            db,
+            file_record=file_record,
+            source_segments=confirmed_segments_for_sync,
+            current_user=current_user,
+        )
     auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(
         db,
         file_record=file_record,
         segments=result.updated_segments,
         current_user=current_user,
     )
-    if auto_tm_summary.queued_count > 0:
+    if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0:
         db.commit()
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+        db,
+        file_record,
+        current_user,
+    )
+    target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
     return {
         "updated_count": result.updated_count,
         "conflicts": [_serialize_segment_update_conflict(conflict) for conflict in result.conflicts],
         "auto_tm": auto_tm_summary.to_dict(),
-        "segments": [_serialize_workbench_segment(segment) for segment in result.updated_segments],
+        "project_sync": project_sync_summary.to_dict(),
+        "segments": [
+            _serialize_workbench_segment(
+                segment,
+                source_filename=get_file_record_source_filename(file_record),
+                target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
+                workflow_step_by_id=workflow_step_by_id,
+                writable_workflow_step_ids=writable_workflow_step_ids,
+                can_manage=can_manage,
+            )
+            for segment in [*result.updated_segments, *project_sync_summary.current_file_segments]
+        ],
     }
 
 
@@ -6167,6 +7986,7 @@ def batch_update_segment_confirmation(
             )
             .all()
         )
+        segments = _filter_writable_segments(db, file_record, current_user, segments)
         next_status = "confirmed"
         updated_count = 0
         for segment in segments:
@@ -6180,6 +8000,7 @@ def batch_update_segment_confirmation(
             .filter(Segment.file_record_id == file_record_id, Segment.status == "confirmed")
             .all()
         )
+        segments = _filter_writable_segments(db, file_record, current_user, segments)
         updated_count = 0
         for segment in segments:
             next_status = _resolve_unconfirmed_segment_status(segment)
@@ -6189,7 +8010,20 @@ def batch_update_segment_confirmation(
                 updated_count += 1
 
     auto_tm_summary = _empty_auto_tm_summary()
+    project_sync_summary = empty_project_segment_sync_summary()
     if payload.action == "confirm" and updated_count:
+        confirmed_segments_for_sync = [
+            segment
+            for segment in segments
+            if segment.status == "confirmed" and normalize_text(segment.target_text)
+        ]
+        if confirmed_segments_for_sync:
+            project_sync_summary = sync_project_repeated_segments_from_segments(
+                db,
+                file_record=file_record,
+                source_segments=confirmed_segments_for_sync,
+                current_user=current_user,
+            )
         auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(
             db,
             file_record=file_record,
@@ -6198,10 +8032,15 @@ def batch_update_segment_confirmation(
         )
 
     if updated_count:
+        sync_file_record_status(db, file_record_id)
         db.commit()
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
 
-    return {"updated_count": updated_count, "auto_tm": auto_tm_summary.to_dict()}
+    return {
+        "updated_count": updated_count,
+        "auto_tm": auto_tm_summary.to_dict(),
+        "project_sync": project_sync_summary.to_dict(),
+    }
 
 
 @router.post("/file-records/{file_record_id}/segments/replace")
@@ -6230,6 +8069,7 @@ def replace_file_record_segment_targets(
         target_query=target_query,
     )
     segments = _order_segment_query(query).all()
+    segments = _filter_writable_segments(db, file_record, current_user, segments)
     if not segments:
         return {"updated_count": 0, "occurrence_count": 0}
 
@@ -6330,6 +8170,7 @@ def save_file_record_segments_to_tm(
     segments = list_segments_for_file_record(db, file_record_id)
     skipped_count = 0
     save_rows: list[tuple[str, str]] = []
+    clean_numbering = is_word_document_filename(file_record.filename)
 
     for segment in segments:
         if payload.scope == "confirmed" and segment.status != "confirmed":
@@ -6340,7 +8181,16 @@ def save_file_record_segments_to_tm(
             continue
 
         source_text = normalize_text(segment.source_text)
-        target_text = normalize_text(segment.target_text)
+        target_text = normalize_text(
+            strip_automatic_numbering_prefix(
+                segment.target_text,
+                source_text=segment.source_text,
+                display_text=segment.display_text,
+                reference_texts=[segment.matched_source_text],
+            )
+            if clean_numbering
+            else segment.target_text
+        )
         if not source_text or not target_text:
             skipped_count += 1
             continue
@@ -6393,6 +8243,24 @@ def save_file_record_segments_to_tm(
             [collection.id],
             source_file_record_id=file_record.id,
         )
+        notification_title, notification_body = build_save_to_tm_notification(
+            filename=file_record.filename,
+            collection_name=collection.name,
+            created_count=created_count,
+            updated_count=updated_count,
+            skipped_count=skipped_count,
+            refreshed_count=refreshed_count,
+        )
+        create_operation_notification(
+            db,
+            user_id=current_user.id,
+            notification_type="save_to_tm",
+            title=notification_title,
+            body=notification_body,
+            project_id=file_record.project_id,
+            file_record_id=file_record.id,
+        )
+        db.commit()
 
     return {
         "created_count": created_count,
@@ -6802,6 +8670,8 @@ async def llm_translate_file_record(
     ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
     source_language, target_language = _resolve_file_record_language_pair(file_record)
     body = payload or LLMTranslateRequest()
+    if body.scope == "current_segment" and not normalize_text(body.sentence_id or ""):
+        raise HTTPException(status_code=400, detail="当前句段范围需要提供 sentence_id。")
     requested_model = normalize_text(body.model or "") or None
     try:
         validate_provider_choice(body.provider, model_override=requested_model)
@@ -6809,6 +8679,19 @@ async def llm_translate_file_record(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     guidelines = _resolve_llm_guidelines(db, file_record, body)
+    if "glossary_base_ids" in body.model_fields_set:
+        glossary_bases = _validate_glossary_base_ids(db, body.glossary_base_ids)
+        glossary_base_ids = [glossary_base.id for glossary_base in glossary_bases]
+    else:
+        glossary_base_ids = _load_file_record_glossary_base_ids(file_record)
+        glossary_bases = _validate_glossary_base_ids(db, glossary_base_ids)
+    for glossary_base in glossary_bases:
+        _ensure_resource_language_pair_matches(
+            glossary_base,
+            source_language,
+            target_language,
+            "词汇表",
+        )
 
     translation_tasks = _build_llm_translation_tasks(
         db=db,
@@ -6817,7 +8700,10 @@ async def llm_translate_file_record(
         source_language=source_language,
         target_language=target_language,
         collection_id=file_record.collection_id,
+        glossary_base_ids=glossary_base_ids,
         include_context=body.translation_unit == "paragraph",
+        sentence_id=body.sentence_id,
+        source_filename=get_file_record_source_filename(file_record),
     )
 
     async def event_stream():
@@ -6835,6 +8721,7 @@ async def llm_translate_file_record(
                 "translation_unit": body.translation_unit,
                 "source_language": source_language,
                 "target_language": target_language,
+                "glossary_base_ids": [str(glossary_base_id) for glossary_base_id in glossary_base_ids],
                 "total": total_count,
             },
         )
@@ -6913,8 +8800,32 @@ async def llm_translate_file_record(
                 continue
 
             try:
+                _require_segment_work_access(db, file_record, segment, current_user)
+            except HTTPException as exc:
+                error_count += 1
+                yield _sse_event(
+                    "error",
+                    {
+                        "sentence_id": result.sentence_id,
+                        "status": result.status,
+                        "message": str(exc.detail),
+                    },
+                )
+                continue
+
+            try:
                 before_text = segment.target_text
-                segment.target_text = result.translated_text
+                translated_text = (
+                    strip_automatic_numbering_prefix(
+                        result.translated_text,
+                        source_text=segment.source_text,
+                        display_text=segment.display_text,
+                        reference_texts=[segment.matched_source_text],
+                    )
+                    if is_word_document_filename(file_record.filename)
+                    else result.translated_text
+                )
+                segment.target_text = translated_text
                 segment.target_html = None
                 segment.source = "llm"
                 segment.version = int(segment.version or 1) + 1
@@ -6924,13 +8835,13 @@ async def llm_translate_file_record(
                 segment.status = _resolve_unconfirmed_segment_status(segment)
 
                 # Inline revision creation — skip pending query for LLM bulk writes
-                if (before_text or "") != (result.translated_text or ""):
+                if (before_text or "") != (translated_text or ""):
                     db.add(SegmentRevision(
                         file_record_id=file_record_id,
                         segment_id=segment.id,
                         sentence_id=segment.sentence_id,
                         before_text=before_text or "",
-                        after_text=result.translated_text or "",
+                        after_text=translated_text or "",
                         source="llm",
                         status="pending",
                         author_id=current_user.id if current_user else None,
@@ -6939,7 +8850,7 @@ async def llm_translate_file_record(
                     db,
                     segment=segment,
                     before_text=before_text,
-                    after_text=result.translated_text,
+                    after_text=translated_text,
                     source="llm",
                     current_user=current_user,
                 )
@@ -7054,6 +8965,134 @@ def _serialize_tm_entry(entry: TranslationMemory) -> dict:
         "target_language": entry.target_language,
         "created_at": entry.created_at.isoformat(),
         "updated_at": entry.updated_at.isoformat(),
+    }
+
+
+def _serialize_resource_search_tm_row(entry: TranslationMemory, collection_name: str | None) -> dict:
+    return {
+        "id": str(entry.id),
+        "type": "tm",
+        "library_id": str(entry.collection_id) if entry.collection_id else None,
+        "library_name": collection_name,
+        "source_text": entry.source_text,
+        "target_text": entry.target_text,
+        "source_language": entry.source_language,
+        "target_language": entry.target_language,
+        "updated_at": entry.updated_at.isoformat() if entry.updated_at else None,
+    }
+
+
+def _serialize_resource_search_term_row(entry: TermEntry, term_base_name: str | None) -> dict:
+    return {
+        "id": str(entry.id),
+        "type": "term",
+        "library_id": str(entry.term_base_id),
+        "library_name": term_base_name,
+        "source_text": entry.source_text,
+        "target_text": entry.target_text,
+        "source_language": entry.source_language,
+        "target_language": entry.target_language,
+        "updated_at": entry.updated_at.isoformat() if entry.updated_at else None,
+    }
+
+
+@router.get("/file-records/{file_record_id}/resource-search")
+def search_file_record_bound_resources(
+    file_record_id: UUID,
+    q: str = Query(default="", max_length=200),
+    mode: Literal["exact", "fuzzy"] = Query(default="exact"),
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文件不存在。")
+
+    _require_file_record_read_access(file_record, current_user)
+    query_text = normalize_text(q or "")
+    safe_limit = min(max(limit, 1), 100)
+    collection_ids = _load_file_record_collection_ids(file_record)
+    term_base_ids = _load_file_record_term_base_ids(file_record)
+
+    if not query_text:
+        return {
+            "items": [],
+            "total": 0,
+            "tm_total": 0,
+            "term_total": 0,
+            "collection_ids": [str(collection_id) for collection_id in collection_ids],
+            "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
+            "query": query_text,
+            "mode": mode,
+        }
+
+    like_pattern = f"%{query_text}%"
+
+    tm_rows: list[tuple[TranslationMemory, str | None]] = []
+    tm_total = 0
+    if collection_ids:
+        tm_query = (
+            db.query(TranslationMemory, MemoryBase.name.label("collection_name"))
+            .outerjoin(MemoryBase, TranslationMemory.collection_id == MemoryBase.id)
+            .filter(TranslationMemory.collection_id.in_(collection_ids))
+        )
+        if mode == "exact":
+            tm_query = tm_query.filter(TranslationMemory.source_text.ilike(like_pattern))
+        else:
+            tm_query = tm_query.filter(
+                or_(
+                    TranslationMemory.source_text.ilike(like_pattern),
+                    TranslationMemory.target_text.ilike(like_pattern),
+                )
+            )
+        tm_total = tm_query.count()
+        tm_rows = (
+            tm_query
+            .order_by(TranslationMemory.updated_at.desc(), TranslationMemory.created_at.desc())
+            .limit(safe_limit)
+            .all()
+        )
+
+    term_rows: list[tuple[TermEntry, str | None]] = []
+    term_total = 0
+    if term_base_ids:
+        term_query = (
+            db.query(TermEntry, TermBase.name.label("term_base_name"))
+            .outerjoin(TermBase, TermEntry.term_base_id == TermBase.id)
+            .filter(TermEntry.term_base_id.in_(term_base_ids))
+        )
+        if mode == "exact":
+            term_query = term_query.filter(TermEntry.source_text.ilike(like_pattern))
+        else:
+            term_query = term_query.filter(
+                or_(
+                    TermEntry.source_text.ilike(like_pattern),
+                    TermEntry.target_text.ilike(like_pattern),
+                )
+            )
+        term_total = term_query.count()
+        term_rows = (
+            term_query
+            .order_by(TermEntry.updated_at.desc(), TermEntry.created_at.desc())
+            .limit(safe_limit)
+            .all()
+        )
+
+    items = [
+        *[_serialize_resource_search_tm_row(entry, collection_name) for entry, collection_name in tm_rows],
+        *[_serialize_resource_search_term_row(entry, term_base_name) for entry, term_base_name in term_rows],
+    ][:safe_limit]
+
+    return {
+        "items": items,
+        "total": tm_total + term_total,
+        "tm_total": tm_total,
+        "term_total": term_total,
+        "collection_ids": [str(collection_id) for collection_id in collection_ids],
+        "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
+        "query": query_text,
+        "mode": mode,
     }
 
 
@@ -7377,6 +9416,109 @@ async def preview_sdltm(
         raise HTTPException(status_code=500, detail=f"读取 SDLTM 元数据失败：{exc}") from exc
 
 
+def _validate_tm_import_upload(file: UploadFile, raw_bytes: bytes | None = None) -> str:
+    extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
+    if extension not in TM_IMPORT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="仅支持上传 .tmx、.sdltm、.xls、.xlsx 或 .csv 文件。")
+    if raw_bytes is not None and not raw_bytes:
+        raise HTTPException(status_code=400, detail="上传的文件为空。")
+    return extension
+
+
+def _normalize_duplicate_policy(value: str | None) -> Literal["overwrite", "keep"]:
+    return "keep" if value == "keep" else "overwrite"
+
+
+def _parse_import_row_indexes(value: str | None) -> set[int]:
+    if not value:
+        return set()
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        parsed = [item.strip() for item in value.split(",") if item.strip()]
+    if not isinstance(parsed, list):
+        raise HTTPException(status_code=400, detail="重复行处理参数格式不正确。")
+
+    row_indexes: set[int] = set()
+    for item in parsed:
+        try:
+            row_index = int(item)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="重复行处理参数必须是行号列表。") from exc
+        if row_index > 0:
+            row_indexes.add(row_index)
+    return row_indexes
+
+
+@router.post("/translation-memory/import-xlsx/preview")
+@router.post("/tm/import-xlsx/preview", include_in_schema=False)
+@router.post("/translation-memory/import/preview", include_in_schema=False)
+@router.post("/tm/import/preview", include_in_schema=False)
+async def preview_tm_xlsx(
+    file: UploadFile = File(...),
+    collection_id: UUID | None = Form(default=None),
+    source_language: str = Form(...),
+    target_language: str = Form(...),
+    duplicate_policy: str = Form(default="overwrite"),
+    preview_limit: int = Form(default=100),
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    _validate_tm_import_upload(file)
+    raw_bytes = await file.read()
+    _validate_tm_import_upload(file, raw_bytes)
+
+    collection = _get_collection_or_404(db, collection_id)
+    resolved_source_language, resolved_target_language = _resolve_collection_language_pair(
+        collection,
+        source_language,
+        target_language,
+    )
+    normalized_duplicate_policy = _normalize_duplicate_policy(duplicate_policy)
+
+    try:
+        preview = preview_tm_from_upload(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=file.filename or "uploaded.xlsx",
+            collection_id=collection_id,
+            source_language=resolved_source_language,
+            target_language=resolved_target_language,
+            duplicate_policy=normalized_duplicate_policy,
+            preview_limit=max(1, min(preview_limit, 500)),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"TM 预览失败：{exc}") from exc
+
+    return {
+        "filename": preview.filename,
+        "rows": [
+            {
+                "row_index": row.row_index,
+                "source_text": row.source_text,
+                "target_text": row.target_text,
+                "status": row.status,
+                "message": row.message,
+            }
+            for row in preview.rows
+        ],
+        "total_rows": preview.total_rows,
+        "valid_rows": preview.valid_rows,
+        "create_rows": preview.create_rows,
+        "update_rows": preview.update_rows,
+        "keep_rows": preview.keep_rows,
+        "duplicate_rows": preview.duplicate_rows,
+        "skipped_empty_rows": preview.skipped_empty_rows,
+        "skipped_header_rows": preview.skipped_header_rows,
+        "preview_limit": preview.preview_limit,
+        "duplicate_policy": preview.duplicate_policy,
+        "collection_id": str(collection.id) if collection else None,
+        "collection_name": collection.name if collection else "",
+        "source_language": resolved_source_language,
+        "target_language": resolved_target_language,
+    }
+
+
 @router.post("/translation-memory/import-xlsx")
 @router.post("/tm/import-xlsx", include_in_schema=False)
 @router.post("/translation-memory/import", include_in_schema=False)
@@ -7386,16 +9528,15 @@ async def import_tm_xlsx(
     collection_id: UUID | None = Form(default=None),
     source_language: str = Form(...),
     target_language: str = Form(...),
+    duplicate_policy: str = Form(default="overwrite"),
+    skip_duplicate_row_indexes: str = Form(default="[]"),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
-    if extension not in TM_IMPORT_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="仅支持上传 .xlsx 或 .sdltm 文件。")
+    extension = _validate_tm_import_upload(file)
 
     raw_bytes = await file.read()
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail="上传的文件为空。")
+    _validate_tm_import_upload(file, raw_bytes)
 
     collection = _get_collection_or_404(db, collection_id)
     resolved_source_language, resolved_target_language = _resolve_collection_language_pair(
@@ -7403,6 +9544,8 @@ async def import_tm_xlsx(
         source_language,
         target_language,
     )
+    normalized_duplicate_policy = _normalize_duplicate_policy(duplicate_policy)
+    skipped_row_indexes = _parse_import_row_indexes(skip_duplicate_row_indexes)
     try:
         if extension in SDLTM_EXTENSIONS:
             import_summary = import_tm_from_sdltm_upload(
@@ -7413,9 +9556,11 @@ async def import_tm_xlsx(
                 source_language=resolved_source_language,
                 target_language=resolved_target_language,
                 creator_id=current_user.id,
+                duplicate_policy=normalized_duplicate_policy,
+                skip_duplicate_row_indexes=skipped_row_indexes,
             )
         else:
-            import_summary = import_tm_from_xlsx_upload(
+            import_summary = import_tm_from_upload(
                 db=db,
                 raw_bytes=raw_bytes,
                 filename=file.filename or "uploaded.xlsx",
@@ -7423,6 +9568,8 @@ async def import_tm_xlsx(
                 source_language=resolved_source_language,
                 target_language=resolved_target_language,
                 creator_id=current_user.id,
+                duplicate_policy=normalized_duplicate_policy,
+                skip_duplicate_row_indexes=skipped_row_indexes,
             )
     except Exception as exc:
         db.rollback()
@@ -7431,11 +9578,33 @@ async def import_tm_xlsx(
     refreshed_count = 0
     if collection is not None and import_summary.imported_rows > 0:
         refreshed_count = _notify_tm_collections_changed(db, [collection.id])
+    if collection is not None:
+        notification_title, notification_body = build_resource_import_notification(
+            resource_label="记忆库",
+            resource_name=collection.name,
+            filename=import_summary.filename,
+            imported_rows=import_summary.imported_rows,
+            created_rows=import_summary.created_rows,
+            updated_rows=import_summary.updated_rows,
+            skipped_empty_rows=import_summary.skipped_empty_rows,
+            skipped_header_rows=import_summary.skipped_header_rows,
+            source_language=resolved_source_language,
+            target_language=resolved_target_language,
+        )
+        create_operation_notification(
+            db,
+            user_id=current_user.id,
+            notification_type="resource_import",
+            title=notification_title,
+            body=notification_body,
+        )
+        db.commit()
 
     return {
         "filename": import_summary.filename,
         "created_rows": import_summary.created_rows,
         "updated_rows": import_summary.updated_rows,
+        "skipped_duplicate_rows": import_summary.skipped_duplicate_rows,
         "skipped_empty_rows": import_summary.skipped_empty_rows,
         "skipped_header_rows": import_summary.skipped_header_rows,
         "imported_rows": import_summary.imported_rows,
@@ -8021,82 +10190,61 @@ async def import_termbase_xlsx(
     file: UploadFile = File(...),
     collection_id: UUID | None = Form(default=None),
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
-    if extension not in XLSX_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="仅支持上传 .xlsx 文件。")
+    if extension not in TERM_IMPORT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="仅支持上传 .xls、.xlsx 或 .csv 文件。")
 
     raw_bytes = await file.read()
     if not raw_bytes:
-        raise HTTPException(status_code=400, detail="上传的 XLSX 文件为空。")
+        raise HTTPException(status_code=400, detail="上传的术语文件为空。")
 
     collection = _get_termbase_collection_or_404(db, collection_id)
 
     try:
-        from openpyxl import load_workbook
-        from io import BytesIO
-
-        wb = load_workbook(filename=BytesIO(raw_bytes), read_only=True, data_only=True)
-        ws = wb.active
-
-        created_count = 0
-        updated_count = 0
-        skipped_count = 0
-
-        for row_idx, row in enumerate(ws.iter_rows(min_row=1, values_only=True), start=1):
-            if not row or len(row) < 2:
-                skipped_count += 1
-                continue
-
-            source_text = normalize_text(str(row[0] or ""))
-            target_text = normalize_text(str(row[1] or ""))
-
-            if not source_text or not target_text:
-                skipped_count += 1
-                continue
-
-            # 跳过表头
-            if row_idx == 1 and (source_text.lower() in ("source", "原文", "术语") or target_text.lower() in ("target", "译文", "翻译")):
-                skipped_count += 1
-                continue
-
-            existing = (
-                db.query(TermEntry)
-                .filter(TermEntry.source_text == source_text, TermEntry.term_base_id == collection_id)
-                .first()
-            )
-
-            if existing:
-                existing.target_text = target_text
-                updated_count += 1
-            else:
-                # 获取术语库的语言设置
-                source_lang = collection.source_language if collection else "zh"
-                target_lang = collection.target_language if collection else "en"
-                term = TermEntry(
-                    term_base_id=collection_id,
-                    source_text=source_text,
-                    target_text=target_text,
-                    source_language=source_lang,
-                    target_language=target_lang,
-                )
-                db.add(term)
-                created_count += 1
-
-        db.commit()
-        wb.close()
-
+        import_summary = import_terms_from_xlsx_upload(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=file.filename or "uploaded.xlsx",
+            term_base_id=collection_id,
+            source_language=collection.source_language if collection else "zh",
+            target_language=collection.target_language if collection else "en",
+        )
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"术语库导入失败：{exc}") from exc
 
+    if collection is not None:
+        notification_title, notification_body = build_resource_import_notification(
+            resource_label="术语库",
+            resource_name=collection.name,
+            filename=import_summary.filename,
+            imported_rows=import_summary.imported_rows,
+            created_rows=import_summary.created_rows,
+            updated_rows=import_summary.updated_rows,
+            skipped_empty_rows=import_summary.skipped_empty_rows,
+            skipped_header_rows=import_summary.skipped_header_rows,
+            source_language=collection.source_language if collection else "zh",
+            target_language=collection.target_language if collection else "en",
+        )
+        create_operation_notification(
+            db,
+            user_id=current_user.id,
+            notification_type="resource_import",
+            title=notification_title,
+            body=notification_body,
+        )
+        db.commit()
+
     return {
-        "filename": file.filename,
-        "created_rows": created_count,
-        "updated_rows": updated_count,
-        "skipped_rows": skipped_count,
-        "imported_rows": created_count + updated_count,
+        "filename": import_summary.filename,
+        "created_rows": import_summary.created_rows,
+        "updated_rows": import_summary.updated_rows,
+        "skipped_rows": import_summary.skipped_empty_rows + import_summary.skipped_header_rows,
+        "skipped_empty_rows": import_summary.skipped_empty_rows,
+        "skipped_header_rows": import_summary.skipped_header_rows,
+        "imported_rows": import_summary.imported_rows,
         "collection_id": collection.id if collection else None,
         "collection_name": collection.name if collection else None,
     }

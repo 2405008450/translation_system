@@ -1,3 +1,5 @@
+import { translate } from '../i18n'
+
 export type StatusTone = 'info' | 'success' | 'warning' | 'danger' | 'default'
 
 export interface StatusMeta {
@@ -7,39 +9,50 @@ export interface StatusMeta {
 }
 
 const fileStatusMap: Record<string, StatusMeta> = {
-  draft: { value: 'draft', label: '草稿', tone: 'warning' },
-  in_progress: { value: 'in_progress', label: '处理中', tone: 'info' },
-  pending: { value: 'pending', label: '待处理', tone: 'warning' },
-  processing: { value: 'processing', label: '处理中', tone: 'info' },
-  completed: { value: 'completed', label: '已完成', tone: 'success' },
-  translated: { value: 'translated', label: '已翻译', tone: 'success' },
-  error: { value: 'error', label: '异常', tone: 'danger' },
+  draft: { value: 'draft', label: 'status.file.draft', tone: 'warning' },
+  in_progress: { value: 'in_progress', label: 'status.file.inProgress', tone: 'info' },
+  pending: { value: 'pending', label: 'status.file.pending', tone: 'warning' },
+  processing: { value: 'processing', label: 'status.file.processing', tone: 'info' },
+  completed: { value: 'completed', label: 'status.file.completed', tone: 'success' },
+  translated: { value: 'translated', label: 'status.file.translated', tone: 'success' },
+  error: { value: 'error', label: 'status.file.error', tone: 'danger' },
 }
 
 const segmentStatusMap: Record<string, StatusMeta> = {
-  exact: { value: 'exact', label: '精确匹配', tone: 'success' },
-  fuzzy: { value: 'fuzzy', label: '模糊匹配', tone: 'warning' },
-  none: { value: 'none', label: '无匹配', tone: 'default' },
-  confirmed: { value: 'confirmed', label: '已确认', tone: 'info' },
-  manual: { value: 'manual', label: '人工处理', tone: 'info' },
+  exact: { value: 'exact', label: 'status.segment.exact', tone: 'success' },
+  fuzzy: { value: 'fuzzy', label: 'status.segment.fuzzy', tone: 'warning' },
+  none: { value: 'none', label: 'status.segment.none', tone: 'default' },
+  confirmed: { value: 'confirmed', label: 'status.segment.confirmed', tone: 'info' },
+  manual: { value: 'manual', label: 'status.segment.manual', tone: 'info' },
 }
 
 const sourceStatusMap: Record<string, StatusMeta> = {
-  manual: { value: 'manual', label: '人工', tone: 'info' },
+  manual: { value: 'manual', label: 'status.source.manual', tone: 'info' },
   llm: { value: 'llm', label: 'AI', tone: 'success' },
   tm: { value: 'tm', label: 'TM', tone: 'default' },
-  exact: { value: 'exact', label: '精确匹配', tone: 'success' },
-  fuzzy: { value: 'fuzzy', label: '模糊匹配', tone: 'warning' },
+  project_sync: { value: 'project_sync', label: 'status.source.projectSync', tone: 'success' },
+  exact: { value: 'exact', label: 'status.segment.exact', tone: 'success' },
+  fuzzy: { value: 'fuzzy', label: 'status.segment.fuzzy', tone: 'warning' },
+}
+
+function resolveStatusMeta(meta: StatusMeta | undefined, value: string, fallbackKey: string): StatusMeta {
+  if (!meta) {
+    return { value, label: value || translate(fallbackKey), tone: 'default' as const }
+  }
+  return {
+    ...meta,
+    label: meta.label.includes('.') ? translate(meta.label) : meta.label,
+  }
 }
 
 export function getFileStatusMeta(status: string) {
-  return fileStatusMap[status] || { value: status, label: status || '未知状态', tone: 'default' as const }
+  return resolveStatusMeta(fileStatusMap[status], status, 'status.unknownStatus')
 }
 
 export function getSegmentStatusMeta(status: string) {
-  return segmentStatusMap[status] || { value: status, label: status || '未知状态', tone: 'default' as const }
+  return resolveStatusMeta(segmentStatusMap[status], status, 'status.unknownStatus')
 }
 
 export function getSegmentSourceMeta(source: string) {
-  return sourceStatusMap[source] || { value: source, label: source || '未知来源', tone: 'default' as const }
+  return resolveStatusMeta(sourceStatusMap[source], source, 'status.unknownSource')
 }

@@ -4,6 +4,7 @@ import { onMounted, ref } from 'vue'
 
 import { http } from '../api/http'
 import type { TermbaseCollection, TermbaseImportSummary } from '../types/api'
+import { refreshGlobalNotifications } from '../utils/notifications'
 
 const selectedFile = ref<File | null>(null)
 const importing = ref(false)
@@ -144,6 +145,7 @@ async function uploadWorkbook() {
 
     importSummary.value = data
     importMessage.value = `导入完成：${data.filename}`
+    refreshGlobalNotifications()
     selectedFile.value = null
     selectedCollectionId.value = ''
     const fileInput = document.getElementById('termbase-upload-file') as HTMLInputElement | null

@@ -24,6 +24,7 @@ import {
   Languages,
   Loader2,
   MessageSquare,
+  Pilcrow,
   Redo2,
   Save,
   Search,
@@ -40,7 +41,7 @@ import {
   Upload,
   X,
 } from 'lucide-vue-next'
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicInstance } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch, type ComponentPublicInstance } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 
@@ -59,6 +60,7 @@ import WorkbenchMatchPanel from '../components/WorkbenchMatchPanel.vue'
 import WorkbenchTermsPanel from '../components/WorkbenchTermsPanel.vue'
 import ReferencePanel from '../components/ReferencePanel.vue'
 import { http } from '../api/http'
+import { refreshGlobalNotifications } from '../utils/notifications'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
 import { useRichTextEditor, type TextFormat, type CaseType } from '../composables/useRichTextEditor'
@@ -99,12 +101,23 @@ const props = defineProps<{
 
 type BottomToolKey = 'qa-result' | 'history' | 'source-preview' | 'target-preview' | 'split-preview'
 type BottomDrawerToolKey = Exclude<BottomToolKey, 'qa-result'>
-type SideToolKey = 'match-info' | 'terms' | 'notes' | 'reference'
+type SideToolKey = 'match-info' | 'terms' | 'resource-search' | 'notes' | 'reference'
 type ResourceImportTab = 'tm' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
 type SaveToTMTargetMode = 'new' | 'existing'
 type SegmentDisplayScope = 'all' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'confirmed_only' | 'empty_target'
 type RevisionMenuKind = 'track' | 'accept' | 'reject'
+type ResourceSearchMode = 'exact' | 'fuzzy'
+type FileExportStatus = 'queued' | 'running' | 'completed' | 'failed'
+type WorkflowTransitionDirection = 'forward' | 'back'
+type WorkflowSourceStatus = 'none' | 'exact' | 'fuzzy' | 'confirmed'
+interface FileExportTask {
+  task_id: string
+  status: FileExportStatus
+  progress: number
+  message?: string
+  error?: string | null
+}
 type SegmentEditorRowPublic = ComponentPublicInstance & {
   undoEditorChange: () => boolean
   redoEditorChange: () => boolean
@@ -115,8 +128,33 @@ type SaveToTMPayload = {
   collection_name?: string
   scope: SaveToTMScope
 }
+type ResourceSearchItem = {
+  id: string
+  type: 'tm' | 'term'
+  library_id: string | null
+  library_name: string | null
+  source_text: string
+  target_text: string
+  source_language: string | null
+  target_language: string | null
+  updated_at: string | null
+}
+type ResourceSearchResponse = {
+  items: ResourceSearchItem[]
+  total: number
+  tm_total: number
+  term_total: number
+  collection_ids: string[]
+  term_base_ids: string[]
+  query: string
+  mode: ResourceSearchMode
+}
 
 const REVISION_TRACE_VISIBLE_STORAGE_KEY = 'workbench.revisionTraceEnabled'
+const BOTTOM_DRAWER_MIN_HEIGHT = 260
+const BOTTOM_DRAWER_TOP_GUTTER = 70
+const BOTTOM_DRAWER_KEYBOARD_STEP = 32
+const BOTTOM_DRAWER_KEYBOARD_LARGE_STEP = 80
 
 function getInitialRevisionTraceVisible() {
   if (typeof window === 'undefined') {
@@ -138,17 +176,42 @@ const virtualListRef = ref<{
   scrollToIndex: (index: number, align?: ScrollLogicalPosition) => Promise<boolean>
   focusIndex: (index: number, selector?: string, align?: ScrollLogicalPosition) => Promise<boolean>
 } | null>(null)
+const segmentEditorResultsRef = ref<HTMLElement | null>(null)
 const segmentEditorRowRefs = new Map<string, SegmentEditorRowPublic>()
 
 const bottomPanelRef = ref<HTMLElement | null>(null)
+const bottomDrawerRef = ref<HTMLElement | null>(null)
 const sidecarRef = ref<HTMLElement | null>(null)
 const sidecarWidth = ref<number | null>(null)
+const bottomDrawerHeight = ref<number | null>(null)
 const isResizing = ref(false)
+const isBottomDrawerResizing = ref(false)
+const viewportHeight = ref(window.innerHeight)
+let stopBottomDrawerResize: (() => void) | null = null
+let segmentEditorResizeObserver: ResizeObserver | null = null
+let segmentEditorScrollbarFrame: number | null = null
 
 const sidecarWidthStyle = computed(() => {
   if (sidecarWidth.value === null) return {}
   return { width: `${sidecarWidth.value}px` }
 })
+
+const bottomDrawerMaxHeight = computed(() =>
+  Math.max(BOTTOM_DRAWER_MIN_HEIGHT, viewportHeight.value - BOTTOM_DRAWER_TOP_GUTTER),
+)
+
+const bottomDrawerHeightStyle = computed(() => {
+  if (bottomDrawerHeight.value === null) return {}
+  const height = `${bottomDrawerHeight.value}px`
+  return {
+    '--workbench-bottom-panel-height': height,
+    '--workbench-visible-bottom-panel-height': height,
+  }
+})
+
+const bottomDrawerResizeValue = computed(() =>
+  bottomDrawerHeight.value ?? resolveDefaultBottomDrawerHeight(),
+)
 
 function startResize(event: MouseEvent) {
   event.preventDefault()
@@ -176,8 +239,87 @@ function startResize(event: MouseEvent) {
   document.addEventListener('mouseup', onMouseUp)
 }
 
+function resolveDefaultBottomDrawerHeight() {
+  const minHeight = props.standalone ? 380 : 360
+  const maxHeight = props.standalone ? 560 : 520
+  const preferredHeight = Math.round(viewportHeight.value * 0.5)
+  return clampBottomDrawerHeight(Math.min(Math.max(preferredHeight, minHeight), maxHeight))
+}
+
+function clampBottomDrawerHeight(height: number) {
+  return Math.round(Math.min(Math.max(height, BOTTOM_DRAWER_MIN_HEIGHT), bottomDrawerMaxHeight.value))
+}
+
+function setBottomDrawerHeight(height: number) {
+  bottomDrawerHeight.value = clampBottomDrawerHeight(height)
+}
+
+function startBottomDrawerResize(event: PointerEvent) {
+  if (!isPreviewDrawerResizable.value) {
+    return
+  }
+
+  event.preventDefault()
+  stopBottomDrawerResize?.()
+  isBottomDrawerResizing.value = true
+
+  const startY = event.clientY
+  const startHeight = bottomDrawerRef.value?.offsetHeight ?? bottomDrawerResizeValue.value
+  const previousCursor = document.body.style.cursor
+  const previousUserSelect = document.body.style.userSelect
+
+  function onPointerMove(pointerEvent: PointerEvent) {
+    const deltaY = startY - pointerEvent.clientY
+    setBottomDrawerHeight(startHeight + deltaY)
+  }
+
+  function stopResize() {
+    isBottomDrawerResizing.value = false
+    document.removeEventListener('pointermove', onPointerMove)
+    document.removeEventListener('pointerup', stopResize)
+    document.removeEventListener('pointercancel', stopResize)
+    document.body.style.cursor = previousCursor
+    document.body.style.userSelect = previousUserSelect
+    stopBottomDrawerResize = null
+  }
+
+  document.body.style.cursor = 'ns-resize'
+  document.body.style.userSelect = 'none'
+  document.addEventListener('pointermove', onPointerMove)
+  document.addEventListener('pointerup', stopResize)
+  document.addEventListener('pointercancel', stopResize)
+  stopBottomDrawerResize = stopResize
+}
+
+function handleBottomDrawerResizeKeydown(event: KeyboardEvent) {
+  const currentHeight = bottomDrawerRef.value?.offsetHeight ?? bottomDrawerResizeValue.value
+  const step = event.shiftKey ? BOTTOM_DRAWER_KEYBOARD_LARGE_STEP : BOTTOM_DRAWER_KEYBOARD_STEP
+  let nextHeight: number | null = null
+
+  if (event.key === 'ArrowUp') {
+    nextHeight = currentHeight + step
+  } else if (event.key === 'ArrowDown') {
+    nextHeight = currentHeight - step
+  } else if (event.key === 'PageUp') {
+    nextHeight = currentHeight + BOTTOM_DRAWER_KEYBOARD_LARGE_STEP
+  } else if (event.key === 'PageDown') {
+    nextHeight = currentHeight - BOTTOM_DRAWER_KEYBOARD_LARGE_STEP
+  } else if (event.key === 'Home') {
+    nextHeight = BOTTOM_DRAWER_MIN_HEIGHT
+  } else if (event.key === 'End') {
+    nextHeight = bottomDrawerMaxHeight.value
+  }
+
+  if (nextHeight === null) {
+    return
+  }
+
+  event.preventDefault()
+  setBottomDrawerHeight(nextHeight)
+}
+
 const pageError = ref('')
-const llmScope = ref<LLMTranslateScope>('all')
+const llmScope = ref<LLMTranslateScope>('current_segment')
 const llmProvider = ref<LLMProvider>('deepseek')
 const llmModel = ref('')
 const itemHeight = ref(resolveItemHeight())
@@ -205,6 +347,7 @@ const targetSearchQuery = ref('')
 const replaceSearchText = ref('')
 const searchFuzzyEnabled = ref(false)
 const searchLoadingAllSegments = ref(false)
+const segmentSearchReturnTarget = ref<{ sentenceId: string; displayIndex: number | null; page: number } | null>(null)
 const retainedEmptyTargetSentenceIds = ref<Set<string>>(new Set())
 const tmCollections = ref<TMCollection[]>([])
 const loadingTMCollections = ref(false)
@@ -220,6 +363,21 @@ const downloadingTermQAReport = ref(false)
 const locatingTermQAReportItemId = ref<string | null>(null)
 const updatingTermQAIgnore = ref(false)
 const selectedTermQAItemIds = ref<Set<string>>(new Set())
+const showWorkflowTransitionDialog = ref(false)
+const workflowTransitionDirection = ref<WorkflowTransitionDirection>('forward')
+const workflowTransitionLoading = ref(false)
+const workflowTransitionPreviewLoading = ref(false)
+const workflowTransitionMatchedCount = ref<number | null>(null)
+const workflowTransitionForm = reactive({
+  all_segments: true,
+  range_start: 1,
+  range_end: 1,
+  from_step_id: '',
+  source_status: 'all' as 'all' | 'confirmed' | 'unconfirmed',
+  source_statuses: ['none', 'exact', 'fuzzy', 'confirmed'] as WorkflowSourceStatus[],
+  target_step_id: '',
+  target_status: 'unconfirmed' as 'confirmed' | 'unconfirmed',
+})
 
 // 富文本编辑相关
 const richTextEditor = useRichTextEditor()
@@ -266,6 +424,15 @@ const termEntries = ref<TermEntryRecord[]>([])
 const selectedTermBaseId = ref('')
 const loadingTermBases = ref(false)
 const loadingTermEntries = ref(false)
+const resourceSearchQuery = ref('')
+const resourceSearchMode = ref<ResourceSearchMode>('exact')
+const resourceSearchLoading = ref(false)
+const resourceSearchMessage = ref('请输入关键词，搜索当前文件绑定的记忆库和术语库。')
+const resourceSearchItems = ref<ResourceSearchItem[]>([])
+const resourceSearchTotal = ref(0)
+const resourceSearchTMTotal = ref(0)
+const resourceSearchTermTotal = ref(0)
+let resourceSearchRequestId = 0
 const addingTerm = ref(false)
 const showAddTermDialog = ref(false)
 const addTermSourceText = ref('')
@@ -290,8 +457,9 @@ const llmModelSelectOptions = computed(() => [
 ])
 
 watch(llmModel, (modelId) => {
-  if (modelId.startsWith('google/') || modelId.startsWith('openai/')) {
-    llmProvider.value = 'openrouter'
+  const selectedModel = llmModelOptions.find((option) => option.id === modelId)
+  if (selectedModel) {
+    llmProvider.value = selectedModel.provider
   }
 })
 
@@ -332,6 +500,9 @@ const showExportMenu = ref(false)
 const exportOptions = ref<Array<{ id: string; name: string; description: string; extension: string }>>([])
 const loadingExportOptions = ref(false)
 const exporting = ref(false)
+const exportProgress = ref(0)
+const exportMessage = ref('')
+let exportPollTimer: number | null = null
 
 // 导出格式映射（用于原格式导出按钮显示）
 const exportFormatMap: Record<string, { format: string; label: string; note?: string }> = {
@@ -362,7 +533,7 @@ const isOfficeFormat = computed(() => {
 function resolveItemHeight() {
   const stableGrid = Boolean(props.standalone)
   if (stableGrid && window.innerWidth > 1180) {
-    return 56
+    return 52
   }
   if (window.innerWidth <= 720) {
     return 276
@@ -374,7 +545,56 @@ function resolveItemHeight() {
 }
 
 function handleResize() {
+  viewportHeight.value = window.innerHeight
   itemHeight.value = resolveItemHeight()
+  scheduleSegmentEditorScrollbarGutterUpdate()
+  if (bottomDrawerHeight.value !== null) {
+    setBottomDrawerHeight(bottomDrawerHeight.value)
+  }
+}
+
+function updateSegmentEditorScrollbarGutter() {
+  const results = segmentEditorResultsRef.value
+    ?? document.querySelector<HTMLElement>('.workbench-page .segment-editor-results')
+  if (!results) return
+
+  const scrollContainer = results.querySelector<HTMLElement>('.segment-editor-list-stage > .virtual-list')
+  let gutter = 0
+  if (scrollContainer) {
+    const style = window.getComputedStyle(scrollContainer)
+    const paddingInlineStart = Number.parseFloat(style.paddingInlineStart) || 0
+    const paddingInlineEnd = Number.parseFloat(style.paddingInlineEnd) || 0
+    gutter = Math.max(
+      0,
+      scrollContainer.offsetWidth - scrollContainer.clientWidth + paddingInlineStart + paddingInlineEnd,
+    )
+  }
+  results.style.setProperty('--segment-editor-scrollbar-gutter', `${gutter}px`)
+}
+
+function scheduleSegmentEditorScrollbarGutterUpdate() {
+  if (segmentEditorScrollbarFrame !== null) {
+    window.cancelAnimationFrame(segmentEditorScrollbarFrame)
+  }
+  segmentEditorScrollbarFrame = window.requestAnimationFrame(() => {
+    segmentEditorScrollbarFrame = null
+    updateSegmentEditorScrollbarGutter()
+  })
+}
+
+function observeSegmentEditorResults() {
+  segmentEditorResizeObserver?.disconnect()
+  const results = segmentEditorResultsRef.value
+    ?? document.querySelector<HTMLElement>('.workbench-page .segment-editor-results')
+  if (!results || typeof ResizeObserver === 'undefined') return
+
+  segmentEditorResizeObserver = new ResizeObserver(scheduleSegmentEditorScrollbarGutterUpdate)
+  segmentEditorResizeObserver.observe(results)
+
+  const scrollContainer = results.querySelector<HTMLElement>('.segment-editor-list-stage > .virtual-list')
+  if (scrollContainer) {
+    segmentEditorResizeObserver.observe(scrollContainer)
+  }
 }
 
 function getErrorMessage(error: unknown, fallback: string) {
@@ -645,6 +865,55 @@ const ribbonStatusTitle = computed(() => (
 const activeSegment = computed(() => (
   segmentStore.segments.find((segment) => segment.sentence_id === segmentStore.activeSentenceId) ?? null
 ))
+const activeSegmentCanWrite = computed(() => Boolean(activeSegment.value?.can_write))
+const workflowSteps = computed(() => segmentStore.fileRecord?.workflow_steps || [])
+const workflowStepById = computed(() => new Map(workflowSteps.value.map((step) => [step.id, step])))
+const workflowTargetSteps = computed(() => {
+  const sourceStep = workflowStepById.value.get(workflowTransitionForm.from_step_id)
+  if (!sourceStep) return []
+  return workflowSteps.value.filter((step) => (
+    workflowTransitionDirection.value === 'forward'
+      ? step.sort_order > sourceStep.sort_order
+      : step.sort_order < sourceStep.sort_order
+  ))
+})
+const canOpenWorkflowTransition = computed(() => (
+  Boolean(activeSegment.value?.workflow_step_id)
+  && activeSegmentCanWrite.value
+  && workflowSteps.value.length > 1
+))
+const workflowSourceStatusOptions: Array<{ value: WorkflowSourceStatus; label: string }> = [
+  { value: 'none', label: '未翻译' },
+  { value: 'exact', label: '完全匹配' },
+  { value: 'fuzzy', label: '模糊匹配' },
+  { value: 'confirmed', label: '已确认' },
+]
+const workflowTransitionHasSourceStatus = computed(() => workflowTransitionForm.source_statuses.length > 0)
+
+function hasWorkflowTransitionTarget(direction: WorkflowTransitionDirection) {
+  const stepId = activeSegment.value?.workflow_step_id
+  const sourceStep = stepId ? workflowStepById.value.get(stepId) : null
+  if (!sourceStep || !activeSegmentCanWrite.value) return false
+  return workflowSteps.value.some((step) => (
+    direction === 'forward'
+      ? step.sort_order > sourceStep.sort_order
+      : step.sort_order < sourceStep.sort_order
+  ))
+}
+
+function isWorkflowSourceStatusChecked(status: WorkflowSourceStatus) {
+  return workflowTransitionForm.source_statuses.includes(status)
+}
+
+function toggleWorkflowSourceStatus(status: WorkflowSourceStatus, checked: boolean) {
+  if (checked) {
+    if (!workflowTransitionForm.source_statuses.includes(status)) {
+      workflowTransitionForm.source_statuses = [...workflowTransitionForm.source_statuses, status]
+    }
+    return
+  }
+  workflowTransitionForm.source_statuses = workflowTransitionForm.source_statuses.filter((item) => item !== status)
+}
 
 const activeSegmentHistory = computed(() => (
   segmentStore.activeSentenceId
@@ -684,6 +953,13 @@ function buildSourceSearchableText(segment: Segment) {
     return `${displayText}\n${segment.source_text}`
   }
   return displayText || segment.source_text
+}
+
+function getSegmentCopyableSourceText(segment: Segment) {
+  if (segment.automatic_numbering_text) {
+    return segment.source_body_text || segment.source_text || ''
+  }
+  return segment.display_text || segment.source_text || ''
 }
 
 function isSubsequenceMatch(value: string, keyword: string) {
@@ -831,10 +1107,14 @@ const targetPreviewSupported = computed(() => {
   return segmentStore.segments.length > 0
 })
 
-const exportButtonLabel = computed(() => t('common.actions.export'))
+const exportButtonLabel = computed(() => (
+  exporting.value ? `导出中 ${exportProgress.value}%` : t('common.actions.export')
+))
 
 const exportButtonTitle = computed(() => (
-  `${t('common.actions.export')} ${getTaskExportFormatLabel(segmentStore.fileRecord?.filename)}`
+  exporting.value
+    ? (exportMessage.value || `导出中 ${exportProgress.value}%`)
+    : `${t('common.actions.export')} ${getTaskExportFormatLabel(segmentStore.fileRecord?.filename)}`
 ))
 
 const saveToTMPreviewStats = computed(() => {
@@ -884,6 +1164,12 @@ const boundTermBaseIds = computed(() => {
     return fileRecord.term_base_ids
   }
   return fileRecord.term_base_id ? [fileRecord.term_base_id] : []
+})
+
+const boundResourceSummary = computed(() => {
+  const collectionCount = segmentStore.fileRecord?.collection_ids?.length || (segmentStore.fileRecord?.collection_id ? 1 : 0)
+  const termBaseCount = boundTermBaseIds.value.length
+  return `已绑定 ${collectionCount} 个记忆库、${termBaseCount} 个术语库`
 })
 
 const addTermTargetTermBases = computed(() => {
@@ -958,6 +1244,12 @@ function isPreviewBottomTool(tool: BottomDrawerToolKey) {
   return tool === 'source-preview' || tool === 'target-preview' || tool === 'split-preview'
 }
 
+const isPreviewDrawerResizable = computed(() =>
+  activeBottomTool.value === 'source-preview'
+  || activeBottomTool.value === 'target-preview'
+  || activeBottomTool.value === 'split-preview',
+)
+
 function isBottomToolLoading(tool: BottomDrawerToolKey) {
   if (tool === 'source-preview') {
     return sourcePreviewLoading.value
@@ -1014,6 +1306,7 @@ function handleBottomPreviewRenderingChange(rendering: boolean) {
 const sideToolButtons = computed(() => ([
   { key: 'match-info' as const, label: t('workbench.tools.matchInfo'), icon: Info, tone: 'info' },
   { key: 'terms' as const, label: t('workbench.tools.terms'), icon: Languages, tone: 'language' },
+  { key: 'resource-search' as const, label: '搜索', icon: Search, tone: 'search' },
   { key: 'notes' as const, label: t('workbench.tools.notes'), icon: MessageSquare, tone: 'note' },
   { key: 'reference' as const, label: '参考文件', icon: FileText, tone: 'reference' },
 ]))
@@ -1055,7 +1348,7 @@ useWorkbenchShortcuts({
   focusPrev: () => { void focusSentenceByOffset(-1) },
   focusNext: () => { void focusSentenceByOffset(1) },
   confirmCurrent: () => { confirmCurrentSentence() },
-  closePanel: () => { closeActiveWorkbenchPanel() },
+  closePanel: () => { void closeActiveWorkbenchPanel() },
   toggleHelp: () => { showShortcutHelp.value = !showShortcutHelp.value },
 })
 
@@ -1110,6 +1403,60 @@ async function loadTermEntries() {
     termsMessage.value = getErrorMessage(error, t('workbench.errors.termEntriesLoad'))
   } finally {
     loadingTermEntries.value = false
+  }
+}
+
+function resetResourceSearchResults(message = '请输入关键词，搜索当前文件绑定的记忆库和术语库。') {
+  resourceSearchItems.value = []
+  resourceSearchTotal.value = 0
+  resourceSearchTMTotal.value = 0
+  resourceSearchTermTotal.value = 0
+  resourceSearchMessage.value = message
+}
+
+async function runResourceSearch() {
+  const keyword = resourceSearchQuery.value.trim()
+  if (!keyword) {
+    resetResourceSearchResults()
+    return
+  }
+
+  const fileRecordId = segmentStore.fileRecord?.id || props.id
+  const requestId = ++resourceSearchRequestId
+  resourceSearchLoading.value = true
+  resourceSearchMessage.value = '正在搜索绑定的资源库...'
+  try {
+    const { data } = await http.get<ResourceSearchResponse>(`/file-records/${fileRecordId}/resource-search`, {
+      params: {
+        q: keyword,
+        mode: resourceSearchMode.value,
+        limit: 80,
+      },
+    })
+    if (requestId !== resourceSearchRequestId) {
+      return
+    }
+    resourceSearchItems.value = data.items
+    resourceSearchTotal.value = data.total
+    resourceSearchTMTotal.value = data.tm_total
+    resourceSearchTermTotal.value = data.term_total
+    resourceSearchMessage.value = data.total
+      ? `找到 ${data.total} 条结果：记忆库 ${data.tm_total} 条，术语库 ${data.term_total} 条。`
+      : '未找到匹配的记忆库或术语库句段。'
+  } catch (error) {
+    if (requestId === resourceSearchRequestId) {
+      resetResourceSearchResults(getErrorMessage(error, '资源库搜索失败。'))
+    }
+  } finally {
+    if (requestId === resourceSearchRequestId) {
+      resourceSearchLoading.value = false
+    }
+  }
+}
+
+function prepareResourceSearchQuery() {
+  if (!resourceSearchQuery.value.trim() && activeSegmentSourceText.value.trim()) {
+    resourceSearchQuery.value = activeSegmentSourceText.value.trim()
   }
 }
 
@@ -1247,6 +1594,13 @@ async function openSideTool(tool: SideToolKey) {
       await loadTermBases()
     }
 
+    if (tool === 'resource-search') {
+      prepareResourceSearchQuery()
+      if (resourceSearchQuery.value.trim() && resourceSearchItems.value.length === 0) {
+        await runResourceSearch()
+      }
+    }
+
     if (tool === 'match-info') {
       // 确保术语库列表和条目已加载
       if (termBases.value.length === 0 && !loadingTermBases.value) {
@@ -1280,9 +1634,9 @@ async function handleResourceImported(payload: { tab: ResourceImportTab }) {
   }
 }
 
-function closeActiveWorkbenchPanel() {
+async function closeActiveWorkbenchPanel() {
   if (segmentSearchOpen.value) {
-    closeSegmentSearchPanel()
+    await closeSegmentSearchPanel()
     return
   }
   if (showGuidelinesPanel.value) {
@@ -1317,11 +1671,119 @@ function resetSegmentSearch() {
   replaceSearchText.value = ''
   searchFuzzyEnabled.value = false
   searchLoadingAllSegments.value = false
+  segmentSearchReturnTarget.value = null
   retainedEmptyTargetSentenceIds.value = new Set()
 }
 
-function closeSegmentSearchPanel() {
+function captureSegmentSearchReturnTarget() {
+  const sentenceId = segmentStore.activeSentenceId
+  if (!sentenceId) {
+    segmentSearchReturnTarget.value = null
+    return
+  }
+
+  const segment = editorSegments.value.find((item) => item.sentence_id === sentenceId)
+  const displayIndex = typeof segment?.display_index === 'number' && Number.isFinite(segment.display_index)
+    ? segment.display_index
+    : (segmentOrdinalMap.value.get(sentenceId) ?? null)
+  segmentSearchReturnTarget.value = {
+    sentenceId,
+    displayIndex,
+    page: segmentStore.currentPage,
+  }
+}
+
+function clearSegmentSearchFilters() {
+  searchLoadRequestId += 1
+  segmentDisplayScope.value = 'all'
+  sourceSearchQuery.value = ''
+  targetSearchQuery.value = ''
+  searchFuzzyEnabled.value = false
+  searchLoadingAllSegments.value = false
+  retainedEmptyTargetSentenceIds.value = new Set()
+}
+
+async function focusEditorSegmentBySentenceId(sentenceId: string) {
+  const index = editorSegments.value.findIndex((segment) => segment.sentence_id === sentenceId)
+  if (index < 0) {
+    return false
+  }
+  await focusEditorSegmentAtIndex(index)
+  return true
+}
+
+function getReturnTargetPage(target: { displayIndex: number | null; page: number }) {
+  if (typeof target.displayIndex === 'number' && Number.isFinite(target.displayIndex) && target.displayIndex >= 0) {
+    return Math.floor(target.displayIndex / segmentStore.pageSize) + 1
+  }
+  return target.page
+}
+
+async function resolveSegmentReturnTargetPage(target: { sentenceId: string; displayIndex: number | null; page: number }) {
+  const localPage = getReturnTargetPage(target)
+  if (typeof target.displayIndex === 'number' && Number.isFinite(target.displayIndex) && target.displayIndex >= 0) {
+    return localPage
+  }
+
+  const fileRecordId = segmentStore.fileRecord?.id || props.id
+  try {
+    const { data } = await http.get<SegmentPositionResponse>(
+      `/file-records/${fileRecordId}/segments/${encodeURIComponent(target.sentenceId)}/position`,
+      { params: { page_size: segmentStore.pageSize } },
+    )
+    return data.page || localPage
+  } catch (error) {
+    console.warn('Failed to resolve segment return page:', error)
+    return localPage
+  }
+}
+
+async function restoreSegmentSearchReturnTarget() {
+  const target = segmentSearchReturnTarget.value
+  segmentSearchReturnTarget.value = null
+  if (!target) {
+    return
+  }
+
+  if (await focusEditorSegmentBySentenceId(target.sentenceId)) {
+    return
+  }
+
+  const targetPage = await resolveSegmentReturnTargetPage(target)
+  suppressSegmentFilterWatch = true
+  clearSegmentSearchFilters()
+  suppressSegmentFilterWatch = false
+  await refreshSegmentPage(targetPage, segmentStore.pageSize)
+  await focusEditorSegmentBySentenceId(target.sentenceId)
+}
+
+async function clearSourceSegmentSearchQuery() {
+  const target = segmentSearchReturnTarget.value
+  const targetPage = target ? await resolveSegmentReturnTargetPage(target) : segmentStore.currentPage
+  searchLoadRequestId += 1
+  searchLoadingAllSegments.value = false
+  suppressSegmentFilterWatch = true
+  sourceSearchQuery.value = ''
+  await nextTick()
+  suppressSegmentFilterWatch = false
+
+  if (segmentStore.fileRecord) {
+    await refreshSegmentPage(targetPage, segmentStore.pageSize)
+  }
+
+  if (target) {
+    await focusEditorSegmentBySentenceId(target.sentenceId)
+    return
+  }
+
+  await nextTick()
+  sourceSearchInputRef.value?.focus({ preventScroll: true })
+}
+
+async function closeSegmentSearchPanel() {
   segmentSearchOpen.value = false
+  await nextTick()
+  await restoreSegmentSearchReturnTarget()
 }
 
 function setSegmentDisplayScope(scope: SegmentDisplayScope) {
@@ -1358,11 +1820,20 @@ function updateSegmentTarget(
   options: { confirm?: boolean } = {},
 ) {
   const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
+  if (segment && !segment.can_write) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
   retainEmptyTargetSegmentDuringEdit(sentenceId, segment?.target_text)
   segmentStore.updateTarget(sentenceId, targetText, targetHtml, options)
 }
 
 async function updateSegmentSource(sentenceId: string, sourceText: string) {
+  const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
+  if (segment && !segment.can_write) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
   try {
     await segmentStore.updateSource(sentenceId, sourceText)
   } catch (error) {
@@ -1370,8 +1841,23 @@ async function updateSegmentSource(sentenceId: string, sourceText: string) {
   }
 }
 
+async function toggleProjectSegmentSync(sentenceId: string, disabled: boolean) {
+  const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
+  if (segment && !segment.can_write) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
+  await segmentStore.setProjectSyncDisabled(sentenceId, disabled)
+}
+
 async function toggleSegmentSearchPanel() {
-  segmentSearchOpen.value = !segmentSearchOpen.value
+  if (segmentSearchOpen.value) {
+    await closeSegmentSearchPanel()
+    return
+  }
+
+  captureSegmentSearchReturnTarget()
+  segmentSearchOpen.value = true
   if (segmentSearchOpen.value) {
     await nextTick()
     sourceSearchInputRef.value?.focus({ preventScroll: true })
@@ -1521,6 +2007,10 @@ function confirmCurrentSentence() {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
     return
   }
+  if (!activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
   updateSegmentTarget(
     activeSegment.value.sentence_id,
     activeSegment.value.target_text || '',
@@ -1638,6 +2128,115 @@ function showRibbonPlaceholder(name: string) {
     message: t('workbench.ribbon.placeholderMessage', { name }),
   })
 }
+
+function buildWorkflowTransitionPayload() {
+  const sourceStatuses = [...workflowTransitionForm.source_statuses]
+  const hasConfirmed = sourceStatuses.includes('confirmed')
+  const hasUnconfirmed = sourceStatuses.some((item) => item !== 'confirmed')
+  return {
+    from_step_id: workflowTransitionForm.from_step_id,
+    target_step_id: workflowTransitionForm.target_step_id,
+    all_segments: workflowTransitionForm.all_segments,
+    range_start: Number(workflowTransitionForm.range_start || 1),
+    range_end: Number(workflowTransitionForm.range_end || workflowTransitionForm.range_start || 1),
+    source_status: hasConfirmed && hasUnconfirmed ? 'all' : hasConfirmed ? 'confirmed' : 'unconfirmed',
+    source_statuses: sourceStatuses,
+    target_status: workflowTransitionForm.target_status,
+  }
+}
+
+async function refreshWorkflowTransitionPreview() {
+  if (!segmentStore.fileRecord || !workflowTransitionForm.from_step_id || !workflowTransitionForm.target_step_id) {
+    workflowTransitionMatchedCount.value = null
+    return
+  }
+  workflowTransitionPreviewLoading.value = true
+  try {
+    const { data } = await http.post<{ matched_count: number }>(
+      `/file-records/${segmentStore.fileRecord.id}/workflow/transition/preview`,
+      buildWorkflowTransitionPayload(),
+    )
+    workflowTransitionMatchedCount.value = data.matched_count
+  } catch (error) {
+    workflowTransitionMatchedCount.value = null
+    toast.error(getErrorMessage(error, '流程预览失败'))
+  } finally {
+    workflowTransitionPreviewLoading.value = false
+  }
+}
+
+function openWorkflowTransitionDialog(direction: WorkflowTransitionDirection) {
+  if (!canOpenWorkflowTransition.value || !activeSegment.value) {
+    toast.warn('当前句段无可流转的编辑权限')
+    return
+  }
+  workflowTransitionDirection.value = direction
+  workflowTransitionForm.all_segments = true
+  workflowTransitionForm.range_start = 1
+  workflowTransitionForm.range_end = segmentStore.totalSegmentCount || 1
+  workflowTransitionForm.from_step_id = activeSegment.value.workflow_step_id || workflowSteps.value[0]?.id || ''
+  workflowTransitionForm.source_status = 'all'
+  workflowTransitionForm.source_statuses = ['none', 'exact', 'fuzzy', 'confirmed']
+  workflowTransitionForm.target_status = 'unconfirmed'
+  const target = workflowTargetSteps.value[direction === 'forward' ? 0 : workflowTargetSteps.value.length - 1]
+  if (!target) {
+    toast.warn(direction === 'forward' ? '没有可前进的目标流程' : '没有可退回的目标流程')
+    return
+  }
+  workflowTransitionForm.target_step_id = target?.id || ''
+  workflowTransitionMatchedCount.value = null
+  showWorkflowTransitionDialog.value = true
+  void refreshWorkflowTransitionPreview()
+}
+
+async function submitWorkflowTransition() {
+  if (!segmentStore.fileRecord || !workflowTransitionForm.target_step_id) {
+    return
+  }
+  workflowTransitionLoading.value = true
+  try {
+    await segmentStore.syncToBackend()
+    const { data } = await http.post<{ updated_count: number }>(
+      `/file-records/${segmentStore.fileRecord.id}/workflow/transition`,
+      buildWorkflowTransitionPayload(),
+    )
+    await segmentStore.refreshCurrentSegmentPage()
+    showWorkflowTransitionDialog.value = false
+    toast.success(`已流转 ${data.updated_count} 个句段`)
+  } catch (error) {
+    toast.error(getErrorMessage(error, '流程流转失败'))
+  } finally {
+    workflowTransitionLoading.value = false
+  }
+}
+
+watch(
+  () => [
+    showWorkflowTransitionDialog.value,
+    workflowTransitionForm.all_segments,
+    workflowTransitionForm.range_start,
+    workflowTransitionForm.range_end,
+    workflowTransitionForm.from_step_id,
+    workflowTransitionForm.source_statuses.join(','),
+    workflowTransitionForm.target_step_id,
+    workflowTransitionForm.target_status,
+  ],
+  () => {
+    if (showWorkflowTransitionDialog.value) {
+      void refreshWorkflowTransitionPreview()
+    }
+  },
+)
+
+watch(
+  () => [workflowTransitionDirection.value, workflowTransitionForm.from_step_id],
+  () => {
+    if (!showWorkflowTransitionDialog.value) return
+    if (!workflowTargetSteps.value.some((step) => step.id === workflowTransitionForm.target_step_id)) {
+      workflowTransitionForm.target_step_id = workflowTargetSteps.value[0]?.id || ''
+    }
+  },
+)
 
 function setCurrentTermQAReport(report: TermQAReport | null) {
   termQAReport.value = report
@@ -1981,11 +2580,15 @@ function trackSourceCaretPosition() {
 
 const canSplitSegment = computed(() => {
   if (!activeSegment.value) return false
-  return (activeSegment.value.source_text || '').length >= 2
+  return activeSegmentCanWrite.value && (activeSegment.value.source_text || '').length >= 2
 })
 
 const canMergeSegment = computed(() => {
-  return selectedSentenceIds.value.size >= 2
+  if (selectedSentenceIds.value.size < 2) return false
+  return Array.from(selectedSentenceIds.value).every((sentenceId) => {
+    const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
+    return Boolean(segment?.can_write)
+  })
 })
 
 async function handleSplitSegment() {
@@ -2247,6 +2850,10 @@ function toggleSourceEditing() {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
     return
   }
+  if (!activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
   sourceEditing.value = !sourceEditing.value
 }
 
@@ -2255,8 +2862,12 @@ function copySourceToTarget() {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
     return
   }
+  if (!activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
 
-  const sourceText = activeSegment.value.display_text || activeSegment.value.source_text || ''
+  const sourceText = getSegmentCopyableSourceText(activeSegment.value)
   updateSegmentTarget(activeSegment.value.sentence_id, sourceText)
   toast.success(t('workbench.ribbon.messages.sourceCopied'))
 }
@@ -2264,6 +2875,10 @@ function copySourceToTarget() {
 function clearActiveTarget() {
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+  if (!activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
     return
   }
 
@@ -2302,8 +2917,8 @@ async function openAddTermDialog() {
     return
   }
 
-  addTermSourceText.value = normalizeTextForSaveToTM(activeSegment.value.source_text || activeSegment.value.display_text || '')
-  addTermTargetText.value = normalizeTextForSaveToTM(activeSegment.value.target_text || '')
+  addTermSourceText.value = ''
+  addTermTargetText.value = ''
   addTermTargetBaseId.value = resolveAddTermTargetBaseId()
   addTermFormError.value = ''
   showAddTermDialog.value = true
@@ -2534,6 +3149,8 @@ async function loadTask() {
   termEntries.value = []
   termBases.value = []
   selectedTermBaseId.value = ''
+  resourceSearchQuery.value = ''
+  resetResourceSearchResults()
   setCurrentTermQAReport(null)
 
   try {
@@ -2592,6 +3209,10 @@ async function loadTask() {
     }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.taskLoad'))
+  } finally {
+    await nextTick()
+    observeSegmentEditorResults()
+    scheduleSegmentEditorScrollbarGutterUpdate()
   }
 }
 
@@ -2630,6 +3251,8 @@ async function refreshSegmentPage(page = segmentStore.currentPage, size = segmen
     }
     await nextTick()
     await virtualListRef.value?.scrollToIndex(0, 'start')
+    observeSegmentEditorResults()
+    scheduleSegmentEditorScrollbarGutterUpdate()
     await router.replace({
       query: {
         ...route.query,
@@ -2652,11 +3275,21 @@ async function handleSegmentPageSizeChange(size: number) {
 
 async function runLLMTranslation() {
   pageError.value = ''
+  const currentSentenceId = activeSegment.value?.sentence_id || ''
+  if (llmScope.value === 'current_segment' && currentSentenceId && !activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
+  if (llmScope.value === 'current_segment' && !currentSentenceId) {
+    toast.warn('请先选中一个句段。')
+    return
+  }
   try {
     await segmentStore.startLLMTranslation(llmScope.value, llmProvider.value, {
       guidelineTemplateId: selectedGuidelineTemplateId.value || undefined,
       temporaryPrompt: workbenchGuidelines.value,
       model: llmModel.value || undefined,
+      sentenceId: llmScope.value === 'current_segment' ? currentSentenceId : undefined,
     })
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.llm'))
@@ -2762,6 +3395,9 @@ async function saveToTM() {
       updated: data.updated_count,
       skipped: data.skipped_count,
     }))
+    if (data.created_count + data.updated_count > 0) {
+      refreshGlobalNotifications()
+    }
     showSaveToTMDialog.value = false
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.saveToTM'))
@@ -2874,6 +3510,9 @@ async function loadExportOptions() {
 }
 
 async function toggleExportMenu() {
+  if (exporting.value) {
+    return
+  }
   if (showExportMenu.value) {
     showExportMenu.value = false
     return
@@ -2884,43 +3523,67 @@ async function toggleExportMenu() {
   showExportMenu.value = true
 }
 
+function clearExportPollTimer() {
+  if (exportPollTimer !== null) {
+    window.clearTimeout(exportPollTimer)
+    exportPollTimer = null
+  }
+}
+
+function waitForExportPoll(ms: number) {
+  clearExportPollTimer()
+  return new Promise<void>((resolve) => {
+    exportPollTimer = window.setTimeout(() => {
+      exportPollTimer = null
+      resolve()
+    }, ms)
+  })
+}
+
+async function waitForFileExportTask(task: FileExportTask) {
+  let currentTask = task
+  while (true) {
+    exportProgress.value = currentTask.progress
+    exportMessage.value = currentTask.message || `导出处理中：${currentTask.progress}%`
+
+    if (currentTask.status === 'completed') {
+      return currentTask
+    }
+    if (currentTask.status === 'failed') {
+      throw new Error(currentTask.error || currentTask.message || '导出失败。')
+    }
+
+    await waitForExportPoll(1200)
+    const { data } = await http.get<FileExportTask>(`/file-records/export-tasks/${currentTask.task_id}`)
+    currentTask = data
+  }
+}
+
 async function exportWithType(exportType: string) {
-  if (!segmentStore.fileRecord) return
+  if (!segmentStore.fileRecord || exporting.value) return
 
   pageError.value = ''
   exporting.value = true
+  exportProgress.value = 0
+  exportMessage.value = '导出任务提交中。'
   showExportMenu.value = false
 
   try {
+    const { data: task } = await http.post<FileExportTask>(
+      `/file-records/${segmentStore.fileRecord.id}/exports`,
+      null,
+      { params: { type: exportType } },
+    )
+    const completedTask = await waitForFileExportTask(task)
     const response = await http.get(
-      `/file-records/${segmentStore.fileRecord.id}/export/${exportType}`,
-      { responseType: 'blob' }
+      `/file-records/export-tasks/${completedTask.task_id}/download`,
+      { responseType: 'blob' },
     )
 
     // 从响应头获取文件名
-    const contentDisposition = response.headers['content-disposition']
-    let filename = `export.${exportType}`
-    if (contentDisposition) {
-      const filenameMatch = contentDisposition.match(/filename\*=UTF-8''(.+?)(?:;|$)/)
-      if (filenameMatch) {
-        filename = decodeURIComponent(filenameMatch[1])
-      } else {
-        const simpleMatch = contentDisposition.match(/filename="?(.+?)"?(?:;|$)/)
-        if (simpleMatch) {
-          filename = simpleMatch[1]
-        }
-      }
-    }
-
-    // 下载文件
-    const url = window.URL.createObjectURL(new Blob([response.data]))
-    const link = document.createElement('a')
-    link.href = url
-    link.setAttribute('download', filename)
-    document.body.appendChild(link)
-    link.click()
-    link.remove()
-    window.URL.revokeObjectURL(url)
+    const resolvedFilename = resolveDownloadFilename(response.headers['content-disposition'], `export.${exportType}`)
+    downloadBlob(response.data, resolvedFilename)
+    toast.success('导出完成，文件已开始下载。')
   } catch (error) {
     if (axios.isAxiosError(error)) {
       pageError.value = String(error.response?.data?.detail || '导出失败。')
@@ -2928,7 +3591,10 @@ async function exportWithType(exportType: string) {
     }
     pageError.value = error instanceof Error ? error.message : '导出失败。'
   } finally {
+    clearExportPollTimer()
     exporting.value = false
+    exportProgress.value = 0
+    exportMessage.value = ''
   }
 }
 
@@ -3183,6 +3849,12 @@ watch(selectedTermBaseId, () => {
   void loadTermEntries()
 })
 
+watch(resourceSearchMode, () => {
+  if (activeSideTool.value === 'resource-search' && resourceSearchQuery.value.trim()) {
+    void runResourceSearch()
+  }
+})
+
 watch(saveToTMScope, () => {
   if (showSaveToTMDialog.value) {
     void segmentStore.loadSaveToTMStats(saveToTMScope.value)
@@ -3199,6 +3871,21 @@ watch([segmentDisplayScope, sourceSearchQuery, targetSearchQuery, searchFuzzyEna
     await refreshSegmentPage(1, segmentStore.pageSize)
   }
 })
+
+watch(
+  () => [
+    editorSegments.value.length,
+    hasEditorSegmentFilter.value,
+    searchLoadingAllSegments.value,
+    isStandaloneWorkbench.value,
+  ],
+  async () => {
+    await nextTick()
+    observeSegmentEditorResults()
+    scheduleSegmentEditorScrollbarGutterUpdate()
+  },
+  { flush: 'post', immediate: true },
+)
 
 /**
  * 处理选区变化，更新格式按钮状态
@@ -3218,14 +3905,24 @@ onMounted(() => {
   window.addEventListener('resize', handleResize)
   document.addEventListener('click', handleClickOutside)
   document.addEventListener('selectionchange', handleSelectionChange)
+  void nextTick(() => {
+    observeSegmentEditorResults()
+    scheduleSegmentEditorScrollbarGutterUpdate()
+  })
   void loadTask()
   void loadGuidelineTemplates()
 })
 
 onBeforeUnmount(() => {
+  stopBottomDrawerResize?.()
+  segmentEditorResizeObserver?.disconnect()
+  if (segmentEditorScrollbarFrame !== null) {
+    window.cancelAnimationFrame(segmentEditorScrollbarFrame)
+  }
   window.removeEventListener('resize', handleResize)
   document.removeEventListener('click', handleClickOutside)
   document.removeEventListener('selectionchange', handleSelectionChange)
+  clearExportPollTimer()
   commentStore.stopPolling()
 })
 
@@ -3271,11 +3968,12 @@ onBeforeRouteLeave(async () => {
               class="workbench-ribbon__top-action"
               data-testid="workbench-export-button"
               type="button"
-              :disabled="!segmentStore.canExport"
+              :disabled="!segmentStore.canExport || exporting"
               :title="exportButtonTitle"
               @click="toggleExportMenu"
             >
-              <Download :size="15" />
+              <Loader2 v-if="exporting" class="lucide-spin" :size="15" />
+              <Download v-else :size="15" />
               <span>{{ exportButtonLabel }}</span>
               <ChevronDown :size="12" />
             </button>
@@ -3398,7 +4096,7 @@ onBeforeRouteLeave(async () => {
               data-testid="workbench-confirm-current"
               type="button"
               role="menuitem"
-              :disabled="confirmationActionLoading || !activeSegment"
+              :disabled="confirmationActionLoading || !activeSegmentCanWrite"
               @click="handleConfirmCurrentFromMenu"
             >
               确认当前句段
@@ -3407,7 +4105,7 @@ onBeforeRouteLeave(async () => {
               data-testid="workbench-confirm-next"
               type="button"
               role="menuitem"
-              :disabled="confirmationActionLoading || !activeSegment"
+              :disabled="confirmationActionLoading || !activeSegmentCanWrite"
               @click="openConfirmMenu = false; void confirmAndMoveToNextUnconfirmed()"
             >
               确认并跳到下一个
@@ -3436,7 +4134,7 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group">
           <span class="tool-col">
-            <button class="tool-line tool-button" type="button" :disabled="!activeSegment" @click="undoActiveSegmentEdit">
+            <button class="tool-line tool-button" type="button" :disabled="!activeSegmentCanWrite" @click="undoActiveSegmentEdit">
               <span class="icon-text-area">
                 <span class="tool-item">
                   <Undo2 class="tool-label-icon" :size="16" />
@@ -3444,7 +4142,7 @@ onBeforeRouteLeave(async () => {
                 </span>
               </span>
             </button>
-            <button class="tool-line tool-button" type="button" :disabled="!activeSegment" @click="redoActiveSegmentEdit">
+            <button class="tool-line tool-button" type="button" :disabled="!activeSegmentCanWrite" @click="redoActiveSegmentEdit">
               <span class="icon-text-area">
                 <span class="tool-item">
                   <Redo2 class="tool-label-icon" :size="16" />
@@ -3457,7 +4155,7 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group">
           <span class="tool-col align-left">
-            <button class="tool-line tool-button" type="button" :disabled="!activeSegment" @click="copySourceToTarget">
+            <button class="tool-line tool-button" type="button" :disabled="!activeSegmentCanWrite" @click="copySourceToTarget">
               <span class="icon-text-area has_dropdown">
                 <span class="tool-item">
                   <Copy class="tool-label-icon" :size="16" />
@@ -3468,7 +4166,7 @@ onBeforeRouteLeave(async () => {
                 <ChevronDown :size="11" />
               </span>
             </button>
-            <button class="tool-line tool-button" type="button" :disabled="!activeSegment" @click="clearActiveTarget">
+            <button class="tool-line tool-button" type="button" :disabled="!activeSegmentCanWrite" @click="clearActiveTarget">
               <span class="icon-text-area">
                 <span class="tool-item">
                   <X class="tool-label-icon" :size="16" />
@@ -3481,32 +4179,32 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group custom-style">
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.bold }" :disabled="!activeSegment" :title="t('workbench.ribbon.bold')" @mousedown.prevent @click="applyTextFormat('bold')">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.bold }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.bold')" @mousedown.prevent @click="applyTextFormat('bold')">
               <span class="icon-text-area"><span class="tool-item"><Bold class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.strikethrough }" :disabled="!activeSegment" :title="t('workbench.ribbon.strike')" @mousedown.prevent @click="applyTextFormat('strikethrough')">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.strikethrough }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.strike')" @mousedown.prevent @click="applyTextFormat('strikethrough')">
               <span class="icon-text-area"><span class="tool-item"><Strikethrough class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.italic }" :disabled="!activeSegment" :title="t('workbench.ribbon.italic')" @mousedown.prevent @click="applyTextFormat('italic')">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.italic }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.italic')" @mousedown.prevent @click="applyTextFormat('italic')">
               <span class="icon-text-area"><span class="tool-item"><Italic class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.superscript }" :disabled="!activeSegment" :title="t('workbench.ribbon.superscript')" @mousedown.prevent @click="applyTextFormat('superscript')">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.superscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.superscript')" @mousedown.prevent @click="applyTextFormat('superscript')">
               <span class="icon-text-area"><span class="tool-item"><Superscript class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.underline }" :disabled="!activeSegment" :title="t('workbench.ribbon.underline')" @mousedown.prevent @click="applyTextFormat('underline')">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.underline }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.underline')" @mousedown.prevent @click="applyTextFormat('underline')">
               <span class="icon-text-area"><span class="tool-item"><Underline class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.subscript }" :disabled="!activeSegment" :title="t('workbench.ribbon.subscript')" @mousedown.prevent @click="applyTextFormat('subscript')">
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.subscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.subscript')" @mousedown.prevent @click="applyTextFormat('subscript')">
               <span class="icon-text-area"><span class="tool-item"><Subscript class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
             <div class="case-menu">
-              <button class="tool-line style-item tool-button" type="button" :disabled="!activeSegment" :title="t('workbench.ribbon.caseChange')" @mousedown.prevent @click.stop="showCaseMenu = !showCaseMenu">
+              <button class="tool-line style-item tool-button" type="button" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.caseChange')" @mousedown.prevent @click.stop="showCaseMenu = !showCaseMenu">
                 <span class="icon-text-area has_dropdown"><span class="tool-item"><Type class="tool-label-icon" :size="15" /></span></span>
                 <span class="dropdown-link" aria-hidden="true">
                   <ChevronDown :size="10" />
@@ -3519,8 +4217,8 @@ onBeforeRouteLeave(async () => {
                 <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('sentence')">{{ t('workbench.ribbon.caseSentence') }}</button>
               </div>
             </div>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :disabled="!activeSegment" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
-              <span class="icon-text-area"><span class="tool-item"><Sigma class="tool-label-icon" :size="15" /></span></span>
+            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
+              <span class="icon-text-area"><span class="tool-item"><Pilcrow class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
         </div>
@@ -3530,7 +4228,7 @@ onBeforeRouteLeave(async () => {
             <button
               class="tool-col tool-col--big tool-button clear-format-menu__main"
               type="button"
-              :disabled="!activeSegment"
+              :disabled="!activeSegmentCanWrite"
               @mousedown.prevent
               @click="clearSelectedFormat"
             >
@@ -3544,7 +4242,7 @@ onBeforeRouteLeave(async () => {
             <button
               class="clear-format-menu__toggle"
               type="button"
-              :disabled="!activeSegment"
+              :disabled="!activeSegmentCanWrite"
               @click.stop="showClearFormatMenu = !showClearFormatMenu"
             >
               <ChevronDown :size="12" />
@@ -3770,15 +4468,25 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group">
           <span class="tool-col align-left">
-            <button class="tool-line tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.workflowForward'))">
+            <button
+              class="tool-line tool-button"
+              type="button"
+              :disabled="!canOpenWorkflowTransition || !hasWorkflowTransitionTarget('forward')"
+              @click="openWorkflowTransitionDialog('forward')"
+            >
               <span class="icon-text-area">
-                <span class="tool-item disabled">
+                <span class="tool-item">
                   <ArrowRight class="tool-label-icon" :size="16" />
                   <span class="text">{{ t('workbench.ribbon.workflowForward') }}</span>
                 </span>
               </span>
             </button>
-            <button class="tool-line tool-button" type="button" aria-disabled="true" @click="showRibbonPlaceholder(t('workbench.ribbon.workflowBack'))">
+            <button
+              class="tool-line tool-button"
+              type="button"
+              :disabled="!canOpenWorkflowTransition || !hasWorkflowTransitionTarget('back')"
+              @click="openWorkflowTransitionDialog('back')"
+            >
               <span class="icon-text-area has_dropdown">
                 <span class="tool-item">
                   <ArrowLeft class="tool-label-icon" :size="16" />
@@ -3901,11 +4609,12 @@ onBeforeRouteLeave(async () => {
               class="button workbench-action workbench-action--export"
               data-testid="workbench-export-button-toolbar"
               type="button"
-              :disabled="!segmentStore.canExport"
+              :disabled="!segmentStore.canExport || exporting"
               :title="exportButtonTitle"
               @click="toggleExportMenu"
             >
-              <Download :size="14" />
+              <Loader2 v-if="exporting" class="lucide-spin" :size="14" />
+              <Download v-else :size="14" />
               {{ exportButtonLabel }}
               <ChevronDown :size="12" />
             </button>
@@ -4009,12 +4718,12 @@ onBeforeRouteLeave(async () => {
       </div>
     </section>
 
-    <Transition name="workbench-panel-pop">
-      <section
-        v-if="showGuidelinesPanel"
-        class="panel workbench-guidelines-panel"
-        @keydown.esc.stop="closeGuidelinesPanel"
-      >
+    <Modal
+      :open="showGuidelinesPanel"
+      width="min(760px, calc(100vw - 32px))"
+      @close="closeGuidelinesPanel"
+    >
+      <div class="workbench-guidelines-panel">
         <div class="workbench-guidelines-panel__head">
           <span class="workbench-guidelines-panel__title">{{ t('workbench.guidelinesTitle') }}</span>
           <div class="workbench-guidelines-panel__actions">
@@ -4066,8 +4775,8 @@ onBeforeRouteLeave(async () => {
           :placeholder="t('workbench.guidelinesPlaceholder')"
         />
         <p class="hint-text">{{ t('workbench.guidelinesHint') }}</p>
-      </section>
-    </Transition>
+      </div>
+    </Modal>
 
     <section v-if="false" class="panel panel--header workbench-overview">
       <div class="workbench-overview__line">
@@ -4170,20 +4879,34 @@ onBeforeRouteLeave(async () => {
             v-if="segmentSearchOpen"
             id="workbench-segment-search"
             class="workbench-search-panel"
-            @keydown.esc.stop="closeSegmentSearchPanel"
+            @keydown.esc.stop="void closeSegmentSearchPanel()"
           >
             <div class="workbench-search-panel__form workbench-search-panel__form--compact">
               <div class="workbench-search-panel__line">
                 <label class="workbench-search-panel__field">
                   <span>{{ t('workbench.search.sourceShortLabel') }}</span>
-                  <input
-                    ref="sourceSearchInputRef"
-                    v-model="sourceSearchQuery"
-                    class="field__control"
-                    type="text"
-                    :placeholder="t('workbench.search.sourcePlaceholder')"
-                    @keydown.enter.prevent="void focusMatchedSegment(1)"
-                  />
+                  <span class="workbench-search-panel__input-wrap">
+                    <input
+                      ref="sourceSearchInputRef"
+                      v-model="sourceSearchQuery"
+                      class="field__control"
+                      :class="{ 'has-clear-action': sourceSearchQuery }"
+                      type="text"
+                      :placeholder="t('workbench.search.sourcePlaceholder')"
+                      @keydown.enter.prevent="void focusMatchedSegment(1)"
+                    />
+                    <button
+                      v-if="sourceSearchQuery"
+                      class="workbench-search-panel__input-clear"
+                      type="button"
+                      :title="t('workbench.search.clear')"
+                      :aria-label="t('workbench.search.clear')"
+                      @mousedown.prevent
+                      @click="void clearSourceSegmentSearchQuery()"
+                    >
+                      <X :size="12" />
+                    </button>
+                  </span>
                 </label>
 
                 <label class="workbench-search-panel__field">
@@ -4255,23 +4978,11 @@ onBeforeRouteLeave(async () => {
                   {{ t('workbench.search.replaceAll', { count: segmentStore.matchedSegmentCount }) }}
                 </button>
                 <button
-                  class="button workbench-action workbench-action--clear"
-                  :class="{ 'is-layout-placeholder': !hasEditorSegmentFilter && !replaceSearchText }"
-                  type="button"
-                  :disabled="!hasEditorSegmentFilter && !replaceSearchText"
-                  :aria-hidden="!hasEditorSegmentFilter && !replaceSearchText"
-                  :tabindex="hasEditorSegmentFilter || replaceSearchText ? 0 : -1"
-                  @click="resetSegmentSearch"
-                >
-                  <X :size="14" />
-                  {{ t('workbench.search.clear') }}
-                </button>
-                <button
                   class="button workbench-action workbench-action--search workbench-search-panel__close"
                   type="button"
                   :title="t('workbench.search.collapse')"
                   :aria-label="t('workbench.search.collapse')"
-                  @click="closeSegmentSearchPanel"
+                  @click="void closeSegmentSearchPanel()"
                 >
                   <ChevronUp :size="14" />
                   <span>{{ t('workbench.search.collapseShort') }}</span>
@@ -4296,11 +5007,13 @@ onBeforeRouteLeave(async () => {
         </Transition>
 
         <div class="segment-editor-shell">
-          <div class="segment-editor-results">
+          <div ref="segmentEditorResultsRef" class="segment-editor-results">
             <div class="segment-table-head" aria-hidden="true">
               <span>句段</span>
               <span>原文</span>
               <span>译文</span>
+              <span>状态</span>
+              <span>阶段</span>
             </div>
 
             <div class="segment-editor-list-stage">
@@ -4330,18 +5043,21 @@ onBeforeRouteLeave(async () => {
                     :segment="item"
                     :index="getEditorSegmentDisplayIndex(item.sentence_id, index)"
                     :active="segmentStore.activeSentenceId === item.sentence_id"
+                    :disabled="!item.can_write"
                     :source-editing="sourceEditing"
                     :selected="selectedSentenceIds.has(item.sentence_id)"
                     :pending-revision="revisionTraceVisible ? segmentStore.getRevisionTrace(item.sentence_id) : null"
                     :revision-busy="revisionActionLoading"
                     :matched-terms="segmentStore.activeSentenceId === item.sentence_id ? activeMatchedTerms : []"
                     :source-search-query="sourceSearchQuery"
+                    :target-search-query="targetSearchQuery"
                     :show-visible-chars="richTextEditor.visibleCharactersEnabled.value"
                     :pending-formats="pendingFormatsForEditor"
                     @focus="segmentStore.setActiveSentence"
                     @activate-target="handleSegmentTargetActivate"
                     @update="updateSegmentTarget"
                     @update-source="updateSegmentSource"
+                    @toggle-project-sync="toggleProjectSegmentSync"
                     @apply-partial-revision="handleApplyPartialRevision"
                     @ctrl-click="handleSegmentClick"
                   />
@@ -4415,17 +5131,36 @@ onBeforeRouteLeave(async () => {
           <Transition name="workbench-bottom-drawer">
             <section
               v-if="activeBottomTool"
+              ref="bottomDrawerRef"
               class="workbench-bottom-drawer"
               :class="[
                 `workbench-bottom-drawer--${activeBottomTool}`,
                 {
                   'is-wide': activeBottomTool === 'split-preview' || activeBottomTool === 'qa-result',
                   'is-loading': bottomDrawerPreviewBusy,
+                  'is-resizable': isPreviewDrawerResizable,
+                  'is-resizing': isBottomDrawerResizing,
                 },
               ]"
+              :style="isPreviewDrawerResizable ? bottomDrawerHeightStyle : undefined"
               :aria-busy="bottomDrawerPreviewBusy"
               @keydown.esc.stop="closeBottomDrawer"
             >
+              <div
+                v-if="isPreviewDrawerResizable"
+                class="workbench-bottom-drawer__resize-handle"
+                role="separator"
+                tabindex="0"
+                title="拖动调整预览高度"
+                aria-label="拖动调整预览高度"
+                aria-orientation="horizontal"
+                :aria-valuemin="BOTTOM_DRAWER_MIN_HEIGHT"
+                :aria-valuemax="bottomDrawerMaxHeight"
+                :aria-valuenow="bottomDrawerResizeValue"
+                @pointerdown="startBottomDrawerResize"
+                @keydown="handleBottomDrawerResizeKeydown"
+              />
+
               <button
                 v-if="activeBottomTool === 'history'"
                 class="workbench-bottom-drawer__close"
@@ -4720,6 +5455,74 @@ onBeforeRouteLeave(async () => {
             :loading-entries="loadingTermEntries"
             :message="termsMessage"
           />
+          <section
+            v-else-if="activeSideTool === 'resource-search'"
+            key="resource-search"
+            class="resource-search-panel"
+          >
+            <div class="resource-search-panel__header">
+              <div>
+                <div class="section-title section-title--tight">资源库搜索</div>
+                <p class="panel-subtitle">{{ boundResourceSummary }}</p>
+              </div>
+            </div>
+
+            <form class="resource-search-panel__bar" @submit.prevent="void runResourceSearch()">
+              <select v-model="resourceSearchMode" class="resource-search-panel__select" aria-label="搜索模式">
+                <option value="exact">精确匹配</option>
+                <option value="fuzzy">模糊匹配</option>
+              </select>
+              <input
+                v-model="resourceSearchQuery"
+                class="resource-search-panel__input"
+                type="search"
+                placeholder="输入原文或译文关键词"
+              />
+              <button
+                class="button resource-search-panel__button"
+                type="submit"
+                :disabled="resourceSearchLoading"
+                title="搜索"
+                aria-label="搜索"
+              >
+                <Loader2 v-if="resourceSearchLoading" class="lucide-spin" :size="16" />
+                <Search v-else :size="16" />
+              </button>
+            </form>
+
+            <div class="resource-search-panel__message">{{ resourceSearchMessage }}</div>
+
+            <div v-if="resourceSearchItems.length" class="resource-search-panel__table-wrap">
+              <table class="resource-search-panel__table">
+                <thead>
+                  <tr>
+                    <th>类型</th>
+                    <th>原文</th>
+                    <th>译文</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="item in resourceSearchItems" :key="`${item.type}-${item.id}`">
+                    <td>
+                      <span
+                        class="resource-search-panel__badge"
+                        :class="`is-${item.type}`"
+                        :title="item.library_name || ''"
+                      >
+                        {{ item.type === 'tm' ? 'TM' : 'TB' }}
+                      </span>
+                    </td>
+                    <td>{{ item.source_text }}</td>
+                    <td>{{ item.target_text }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div v-else-if="!resourceSearchLoading" class="empty-state resource-search-panel__empty">
+              暂无搜索结果
+            </div>
+          </section>
           <NotesPanel
             v-else-if="activeSideTool === 'notes'"
             key="notes"
@@ -4789,6 +5592,10 @@ onBeforeRouteLeave(async () => {
       :open="showImportDialog"
       :initial-tab="importDialogInitialTab"
       :context-label="t('workbench.importContext', { name: segmentStore.fileRecord?.filename || t('workbench.currentTask') })"
+      :source-language="segmentStore.fileRecord?.source_language || null"
+      :target-language="segmentStore.fileRecord?.target_language || null"
+      :default-tm-collection-id="segmentStore.fileRecord?.collection_id || ''"
+      :default-term-base-id="segmentStore.fileRecord?.term_base_id || ''"
       @close="showImportDialog = false"
       @imported="handleResourceImported"
     />
@@ -4801,6 +5608,90 @@ onBeforeRouteLeave(async () => {
       @close="showIssueDialog = false"
       @saved="handleIssueSaved"
     />
+
+    <Modal
+      :open="showWorkflowTransitionDialog"
+      :title="workflowTransitionDirection === 'forward' ? '前进句段' : '退回句段'"
+      width="min(720px, calc(100vw - 32px))"
+      :close-on-overlay="!workflowTransitionLoading"
+      :close-on-esc="!workflowTransitionLoading"
+      @close="showWorkflowTransitionDialog = false"
+    >
+      <div class="workflow-transition-dialog">
+        <div class="workflow-transition-grid">
+          <label class="field">
+            <span class="field__label">句段范围</span>
+            <input v-model.number="workflowTransitionForm.range_start" class="field__control" type="number" min="1" :disabled="workflowTransitionForm.all_segments" />
+          </label>
+          <label class="field">
+            <span class="field__label">&nbsp;</span>
+            <input v-model.number="workflowTransitionForm.range_end" class="field__control" type="number" min="1" :disabled="workflowTransitionForm.all_segments" />
+          </label>
+          <label class="workflow-transition-check">
+            <input v-model="workflowTransitionForm.all_segments" type="checkbox" />
+            <span>全部句段</span>
+          </label>
+
+          <label class="field">
+            <span class="field__label">当前流程</span>
+            <select v-model="workflowTransitionForm.from_step_id" class="field__control">
+              <option v-for="step in workflowSteps" :key="step.id" :value="step.id">{{ step.name }}</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field__label">当前状态</span>
+            <div class="workflow-source-statuses">
+              <label
+                v-for="option in workflowSourceStatusOptions"
+                :key="option.value"
+                class="workflow-source-status"
+              >
+                <input
+                  type="checkbox"
+                  :checked="isWorkflowSourceStatusChecked(option.value)"
+                  @change="toggleWorkflowSourceStatus(option.value, ($event.target as HTMLInputElement).checked)"
+                />
+                <span>{{ option.label }}</span>
+              </label>
+            </div>
+          </label>
+
+          <label class="field">
+            <span class="field__label">目标流程</span>
+            <select v-model="workflowTransitionForm.target_step_id" class="field__control">
+              <option v-for="step in workflowTargetSteps" :key="step.id" :value="step.id">{{ step.name }}</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field__label">目标状态</span>
+            <select v-model="workflowTransitionForm.target_status" class="field__control">
+              <option value="unconfirmed">未确认</option>
+              <option value="confirmed">已确认</option>
+            </select>
+          </label>
+        </div>
+        <p class="workflow-transition-count">
+          {{ workflowTransitionPreviewLoading ? '正在查询命中句段...' : `已查询出 ${workflowTransitionMatchedCount ?? 0} 个句段` }}
+        </p>
+      </div>
+
+      <template #footer>
+        <button class="button" type="button" :disabled="workflowTransitionLoading" @click="showWorkflowTransitionDialog = false">
+          {{ t('common.actions.cancel') }}
+        </button>
+        <button
+          class="button button--primary"
+          type="button"
+          :disabled="workflowTransitionLoading || !workflowTransitionForm.target_step_id || !workflowTransitionHasSourceStatus || (workflowTransitionMatchedCount ?? 0) === 0"
+          @click="void submitWorkflowTransition()"
+        >
+          <Loader2 v-if="workflowTransitionLoading" class="lucide-spin" :size="14" />
+          <ArrowRight v-else-if="workflowTransitionDirection === 'forward'" :size="14" />
+          <ArrowLeft v-else :size="14" />
+          {{ workflowTransitionDirection === 'forward' ? '前进句段' : '退回句段' }}
+        </button>
+      </template>
+    </Modal>
 
     <Modal
       :open="showAddTermDialog"
@@ -5048,7 +5939,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-page.is-stable-grid .segment-editor-results {
-  --segment-editor-grid-template: 92px minmax(320px, 1fr) minmax(360px, 1fr);
+  --segment-editor-grid-template: 64px minmax(320px, 1fr) minmax(360px, 1fr) 78px 64px;
   --virtual-list-inline-end-gap: 0;
 }
 
@@ -6142,14 +7033,6 @@ onBeforeRouteLeave(async () => {
   --action-hover-shadow: rgba(20, 92, 79, 0.16);
 }
 
-.workbench-action--clear {
-  --action-bg: linear-gradient(180deg, #f7eee9, #efdcd4);
-  --action-border: #dfbeb0;
-  --action-color: #87452c;
-  --action-shadow: rgba(135, 69, 44, 0.1);
-  --action-hover-shadow: rgba(135, 69, 44, 0.16);
-}
-
 .workbench-action--search,
 .workbench-action--back {
   --action-bg: linear-gradient(180deg, #f3f7f8, #e7eef1);
@@ -6215,12 +7098,19 @@ onBeforeRouteLeave(async () => {
   margin: 0;
 }
 
-.workbench-search-panel__field > span {
+.workbench-search-panel__field > span:not(.workbench-search-panel__input-wrap) {
   flex: 0 0 auto;
   color: #2f3d45;
   font-size: 13px;
   line-height: 1;
   white-space: nowrap;
+}
+
+.workbench-search-panel__input-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
 }
 
 .workbench-search-panel__field .field__control {
@@ -6232,6 +7122,35 @@ onBeforeRouteLeave(async () => {
   background: #fff;
   font-size: 13px;
   box-shadow: inset 0 1px 2px rgba(17, 34, 51, 0.04);
+}
+
+.workbench-search-panel__field .field__control.has-clear-action {
+  padding-right: 28px;
+}
+
+.workbench-search-panel__input-clear {
+  position: absolute;
+  right: 5px;
+  top: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #657580;
+  cursor: pointer;
+  transform: translateY(-50%);
+}
+
+.workbench-search-panel__input-clear:hover,
+.workbench-search-panel__input-clear:focus-visible {
+  background: #e8eef2;
+  color: #26343d;
+  outline: none;
 }
 
 .workbench-search-panel__field--replace .field__control {
@@ -6301,6 +7220,53 @@ onBeforeRouteLeave(async () => {
   opacity: 0.52;
 }
 
+.workflow-transition-dialog {
+  display: grid;
+  gap: 14px;
+}
+
+.workflow-transition-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+  align-items: end;
+  gap: 12px;
+}
+
+.workflow-transition-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.workflow-source-statuses {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  min-height: 38px;
+  padding: 7px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-panel);
+}
+
+.workflow-source-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.workflow-transition-count {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
 .workbench-search-panel__badge {
   display: inline-flex;
   align-items: center;
@@ -6354,8 +7320,8 @@ onBeforeRouteLeave(async () => {
 }
 
 .segment-editor-results {
-  --segment-editor-grid-template: 128px minmax(0, 1fr) minmax(0, 1fr);
-  --segment-editor-scrollbar-gutter: 12px;
+  --segment-editor-grid-template: 72px minmax(0, 1fr) minmax(0, 1fr) 76px 76px;
+  --segment-editor-scrollbar-gutter: 10px;
   --virtual-list-inline-end-gap: 4px;
   display: grid;
   grid-template-rows: auto minmax(390px, var(--workbench-editor-stage-height));
@@ -6469,6 +7435,145 @@ onBeforeRouteLeave(async () => {
 
 .segment-editor-side-tool.is-active svg {
   color: #0b6658;
+}
+
+.segment-editor-side-tool--search svg {
+  color: #0d7bdc;
+}
+
+.resource-search-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  height: 100%;
+  padding: 14px;
+  background: #f8fbfb;
+}
+
+.resource-search-panel__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.resource-search-panel__bar {
+  display: grid;
+  grid-template-columns: 118px minmax(0, 1fr) 44px;
+  align-items: center;
+  overflow: hidden;
+  border: 1px solid #c9d7dd;
+  border-radius: 4px;
+  background: #fff;
+}
+
+.resource-search-panel__select,
+.resource-search-panel__input {
+  min-width: 0;
+  height: 34px;
+  border: 0;
+  background: transparent;
+  color: #233943;
+  font-size: 13px;
+  line-height: 1.2;
+  outline: none;
+}
+
+.resource-search-panel__select {
+  padding: 0 8px;
+  border-right: 1px solid #dbe5ea;
+}
+
+.resource-search-panel__input {
+  padding: 0 10px;
+  border-right: 1px solid #dbe5ea;
+}
+
+.resource-search-panel__button {
+  width: 44px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: #fff;
+  color: #1f6fbc;
+}
+
+.resource-search-panel__button:hover,
+.resource-search-panel__button:focus-visible {
+  background: #eef6ff;
+}
+
+.resource-search-panel__message {
+  min-height: 20px;
+  color: #647780;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.resource-search-panel__table-wrap {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid #d6e1e5;
+  background: #fff;
+}
+
+.resource-search-panel__table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 13px;
+  color: #21343d;
+}
+
+.resource-search-panel__table th,
+.resource-search-panel__table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid #dce7ec;
+  text-align: left;
+  vertical-align: top;
+}
+
+.resource-search-panel__table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #eef5f7;
+  color: #49616b;
+  font-weight: 600;
+}
+
+.resource-search-panel__table th:first-child,
+.resource-search-panel__table td:first-child {
+  width: 58px;
+  text-align: center;
+}
+
+.resource-search-panel__table tbody tr:nth-child(even) {
+  background: #edf6ff;
+}
+
+.resource-search-panel__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  min-height: 24px;
+  border-radius: 2px;
+  background: #987bdc;
+  color: #fff;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.resource-search-panel__badge.is-tm {
+  background: #5b8edc;
+}
+
+.resource-search-panel__empty {
+  margin-top: 16px;
 }
 
 .segment-editor-bottom-tools {
@@ -6683,6 +7788,57 @@ onBeforeRouteLeave(async () => {
   box-shadow: 0 18px 40px rgba(24, 48, 58, 0.18);
 }
 
+.workbench-bottom-drawer.is-resizable {
+  padding-top: 8px;
+  border-top-color: #9eb9c4;
+}
+
+.workbench-bottom-drawer.is-resizing {
+  border-top-color: #0070c0;
+}
+
+.workbench-bottom-drawer__resize-handle {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  z-index: 10;
+  height: 12px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: ns-resize;
+  touch-action: none;
+}
+
+.workbench-bottom-drawer__resize-handle::before {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 50%;
+  width: 74px;
+  height: 4px;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  background: #a9bec7;
+  opacity: 0.85;
+  transition:
+    background-color 140ms ease,
+    opacity 140ms ease;
+}
+
+.workbench-bottom-drawer__resize-handle:hover::before,
+.workbench-bottom-drawer__resize-handle:focus-visible::before,
+.workbench-bottom-drawer.is-resizing .workbench-bottom-drawer__resize-handle::before {
+  background: #0070c0;
+  opacity: 1;
+}
+
+.workbench-bottom-drawer__resize-handle:focus-visible {
+  outline: 2px solid rgba(0, 112, 192, 0.28);
+  outline-offset: -2px;
+}
+
 .workbench-bottom-drawer.is-wide {
   height: var(--workbench-visible-bottom-panel-height);
 }
@@ -6829,11 +7985,85 @@ onBeforeRouteLeave(async () => {
   min-height: 0;
   border: 0;
   border-radius: 0;
+  gap: 8px;
+  padding: 8px 12px 12px;
   box-shadow: none;
 }
 
-.workbench-bottom-drawer :deep(.preview-panel__viewport) {
+.workbench-bottom-drawer :deep(.preview-panel__header),
+.workbench-bottom-drawer :deep(.split-preview__header) {
+  align-items: center;
+  min-height: 32px;
+  gap: 8px;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel__header > div:first-child),
+.workbench-bottom-drawer :deep(.split-preview__header > div:first-child) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 10px;
+  max-width: min(560px, 48vw);
+}
+
+.workbench-bottom-drawer :deep(.preview-panel__header .section-title),
+.workbench-bottom-drawer :deep(.split-preview__header .section-title) {
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel__meta) {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.workbench-bottom-drawer :deep(.split-preview__header .panel-subtitle) {
+  display: none;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel__zoom-button) {
+  width: 26px;
+  height: 26px;
+  min-height: 26px;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel__zoom-value) {
+  min-width: 42px;
+  height: 26px;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel__close) {
+  min-height: 30px;
+  padding: 4px 10px;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel--drawer) {
+  position: relative;
+  display: block;
+  gap: 0;
+  overflow: hidden;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel--drawer .preview-panel__header) {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  left: 12px;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel--drawer .preview-panel__header > *) {
+  pointer-events: auto;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel--drawer .preview-panel__viewport) {
   height: 100%;
+}
+
+.workbench-bottom-drawer :deep(.preview-panel__viewport) {
+  height: auto;
   min-height: 0;
 }
 
@@ -6844,7 +8074,8 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-bottom-drawer :deep(.split-preview__layout) {
-  height: 100%;
+  flex: 1;
+  height: auto;
   min-height: 0;
 }
 

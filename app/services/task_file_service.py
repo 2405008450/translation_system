@@ -635,6 +635,7 @@ def export_translated_task_file(
     segments: list[Any],
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
     document_parse_options: dict[str, object] | str | None = None,
+    target_language: str | None = None,
 ) -> ExportedTaskFile:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
@@ -655,6 +656,7 @@ def export_translated_task_file(
                 segments=segments,
                 document_parse_mode=document_parse_mode,
                 document_parse_options=document_parse_options,
+                target_language=target_language,
             ),
             media_type=DOCX_MEDIA_TYPE,
             filename=build_translated_docx_filename(export_filename),
@@ -727,6 +729,7 @@ def export_bilingual_task_docx_with_layout(
     order: str = BILINGUAL_LAYOUT_SOURCE_FIRST,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
     document_parse_options: dict[str, object] | str | None = None,
+    target_language: str | None = None,
 ) -> ExportedTaskFile:
     document_parse_mode = normalize_document_parse_mode(document_parse_mode)
     document_parse_options = normalize_document_parse_options(document_parse_options, document_parse_mode)
@@ -751,6 +754,7 @@ def export_bilingual_task_docx_with_layout(
             order=order,
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
+            target_language=target_language,
         ),
         media_type=DOCX_MEDIA_TYPE,
         filename=build_bilingual_docx_filename(export_filename, order),

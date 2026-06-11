@@ -1,10 +1,12 @@
 import { createI18n } from 'vue-i18n'
 
 import { DEFAULT_LOCALE } from './constants/languages'
+import enUS from './locales/en-US'
 import zhCN from './locales/zh-CN'
 
 export const messages = {
   'zh-CN': zhCN,
+  'en-US': enUS,
 } as const
 
 export type AppLocale = keyof typeof messages

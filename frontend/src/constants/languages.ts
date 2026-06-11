@@ -3,29 +3,71 @@ export interface LanguageOption {
   label: string
 }
 
-export const DEFAULT_LOCALE = 'zh-CN'
+export const DEFAULT_LOCALE = 'zh-CN' as const
+export const SUPPORTED_UI_LOCALES = ['zh-CN', 'en-US'] as const
+export type UILocale = typeof SUPPORTED_UI_LOCALES[number]
 
-export const languageOptions: LanguageOption[] = [
-  { code: 'zh-CN', label: '中文（简体）' },
-  { code: 'zh-TW', label: '中文（繁体）' },
-  { code: 'zh-HK', label: '中文（香港）' },
-  { code: 'zh-MO', label: '中文（繁体澳门）' },
-  { code: 'en-US', label: '英语（美国）' },
-  { code: 'en-GB', label: '英语（英国）' },
-  { code: 'ja-JP', label: '日语' },
-  { code: 'ko-KR', label: '韩语' },
-  { code: 'fr-FR', label: '法语' },
-  { code: 'de-DE', label: '德语' },
-  { code: 'es-ES', label: '西班牙语' },
-  { code: 'pt-BR', label: '葡萄牙语（巴西）' },
-  { code: 'it-IT', label: '意大利语' },
-  { code: 'ru-RU', label: '俄语' },
-  { code: 'ar-SA', label: '阿拉伯语' },
-  { code: 'th-TH', label: '泰语' },
-  { code: 'vi-VN', label: '越南语' },
-]
+export function isSupportedUILocale(value: string | null | undefined): value is UILocale {
+  return SUPPORTED_UI_LOCALES.includes(value as UILocale)
+}
 
-const languageLabelMap = new Map(languageOptions.map((item) => [item.code, item.label]))
+function getActiveUILocale(): UILocale {
+  if (typeof document !== 'undefined' && document.documentElement.lang === 'en-US') {
+    return 'en-US'
+  }
+  if (typeof window !== 'undefined' && window.localStorage.getItem('tm-workbench-locale') === 'en-US') {
+    return 'en-US'
+  }
+  return DEFAULT_LOCALE
+}
+
+const chineseLanguageLabels: Record<string, string> = {
+  'zh-CN': '中文（简体）',
+  'zh-TW': '中文（繁体）',
+  'zh-HK': '中文（香港）',
+  'zh-MO': '中文（繁体澳门）',
+  'en-US': '英语（美国）',
+  'en-GB': '英语（英国）',
+  'ja-JP': '日语',
+  'ko-KR': '韩语',
+  'fr-FR': '法语',
+  'de-DE': '德语',
+  'es-ES': '西班牙语',
+  'pt-BR': '葡萄牙语（巴西）',
+  'it-IT': '意大利语',
+  'ru-RU': '俄语',
+  'ar-SA': '阿拉伯语',
+  'th-TH': '泰语',
+  'vi-VN': '越南语',
+}
+
+export const languageOptions: LanguageOption[] = Object.keys(chineseLanguageLabels).map((code) => ({
+  code,
+  get label() {
+    return getLanguageLabel(code)
+  },
+}))
+
+const languageLabelMap = new Map(Object.entries(chineseLanguageLabels))
+const englishLanguageLabelMap = new Map<string, string>([
+  ['zh-CN', 'Chinese (Simplified)'],
+  ['zh-TW', 'Chinese (Traditional)'],
+  ['zh-HK', 'Chinese (Hong Kong)'],
+  ['zh-MO', 'Chinese (Macau)'],
+  ['en-US', 'English (US)'],
+  ['en-GB', 'English (UK)'],
+  ['ja-JP', 'Japanese'],
+  ['ko-KR', 'Korean'],
+  ['fr-FR', 'French'],
+  ['de-DE', 'German'],
+  ['es-ES', 'Spanish'],
+  ['pt-BR', 'Portuguese (Brazil)'],
+  ['it-IT', 'Italian'],
+  ['ru-RU', 'Russian'],
+  ['ar-SA', 'Arabic'],
+  ['th-TH', 'Thai'],
+  ['vi-VN', 'Vietnamese'],
+])
 
 /** 与后端 `app/services/language_pairs.py` 的 LANGUAGE_ALIASES 保持一致，用于合并等场景的语言码规范化。 */
 const LANGUAGE_ALIASES: Record<string, string> = {
@@ -103,14 +145,18 @@ export function canonicalizeLanguagePair(
 }
 
 export function getLanguageLabel(code: string | null | undefined) {
+  const locale = getActiveUILocale()
   if (!code) {
-    return '未设置'
+    return locale === 'en-US' ? 'Not set' : '未设置'
+  }
+  if (locale === 'en-US') {
+    return englishLanguageLabelMap.get(code) || code
   }
   return languageLabelMap.get(code) || code
 }
 
 export function getLocaleLabel(code: string | null | undefined) {
-  return getLanguageLabel(code || DEFAULT_LOCALE)
+  return code === 'en-US' ? 'English' : '中文'
 }
 
 export function formatLanguagePair(
@@ -118,7 +164,7 @@ export function formatLanguagePair(
   targetLanguage: string | null | undefined,
 ) {
   if (!sourceLanguage || !targetLanguage) {
-    return '未设置语言对'
+    return getActiveUILocale() === 'en-US' ? 'Language pair not set' : '未设置语言对'
   }
   return `${getLanguageLabel(sourceLanguage)} -> ${getLanguageLabel(targetLanguage)}`
 }
