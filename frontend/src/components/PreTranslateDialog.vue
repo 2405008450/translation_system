@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { BookOpen, BookOpenCheck, Bot, Check, Database, Loader2, Search, Sparkles, Upload, X } from 'lucide-vue-next'
+import { BookOpen, BookOpenCheck, Bot, Check, Database, Loader2, Plus, Search, Sparkles, Upload, X } from 'lucide-vue-next'
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
@@ -11,6 +11,7 @@ import type { GlossaryBase, GuidelineTemplateSummary, LLMProvider, LLMTranslateS
 import { consumeLLMStream } from '../utils/llmStream'
 import { isProgressComplete } from '../utils/progress'
 import Modal from './base/Modal.vue'
+import ResourceCreateDialog from './ResourceCreateDialog.vue'
 
 interface ProjectFileItem {
   id: string
@@ -104,6 +105,9 @@ const runFiles = ref<ProjectFileItem[]>([])
 
 const progressByFileId = ref<Record<string, number>>({})
 const statusByFileId = ref<Record<string, string>>({})
+
+const showTermBaseCreateDialog = ref(false)
+const showGlossaryCreateDialog = ref(false)
 
 const llmProviderOptions = computed<Array<{ value: LLMProvider, label: string }>>(() => [
   { value: 'deepseek', label: t('projectDetail.preTranslate.llm.providers.deepseek') },
@@ -1027,6 +1031,48 @@ function stopPreTranslate() {
   stopRequested.value = true
   currentAbortController.value?.abort()
 }
+
+function openTermBaseCreateDialog() {
+  showTermBaseCreateDialog.value = true
+}
+
+function openGlossaryCreateDialog() {
+  showGlossaryCreateDialog.value = true
+}
+
+async function handleTermBaseCreated(newTermBase: TermBase) {
+  showTermBaseCreateDialog.value = false
+  await loadResources()
+  if (resourceMatchesSelectedLanguagePair(newTermBase)) {
+    termBaseIds.value = normalizeResourceIds(
+      [...termBaseIds.value, newTermBase.id],
+      availableTermBases.value,
+    )
+    useTermBase.value = true
+  }
+  pushToast({
+    tone: 'success',
+    title: t('projectDetail.preTranslate.toast.termBaseCreatedTitle'),
+    message: t('projectDetail.preTranslate.toast.termBaseCreatedMessage', { name: newTermBase.name }),
+  })
+}
+
+async function handleGlossaryCreated(newGlossary: GlossaryBase) {
+  showGlossaryCreateDialog.value = false
+  await loadResources()
+  if (resourceMatchesSelectedLanguagePair(newGlossary)) {
+    glossaryBaseIds.value = normalizeResourceIds(
+      [...glossaryBaseIds.value, newGlossary.id],
+      availableGlossaryBases.value,
+    )
+    useGlossary.value = true
+  }
+  pushToast({
+    tone: 'success',
+    title: t('projectDetail.preTranslate.toast.glossaryCreatedTitle'),
+    message: t('projectDetail.preTranslate.toast.glossaryCreatedMessage', { name: newGlossary.name }),
+  })
+}
 </script>
 
 <template>
@@ -1216,6 +1262,15 @@ function stopPreTranslate() {
             </label>
             <div class="ptd-resource__buttons">
               <button
+                class="button button--ghost ptd-resource__button ptd-resource__button--create"
+                type="button"
+                :disabled="running || loadingResources || !useGlossary || !selectedFileLanguagePair"
+                @click="openGlossaryCreateDialog"
+              >
+                <Plus :size="14" />
+                {{ t('projectDetail.preTranslate.resources.create') }}
+              </button>
+              <button
                 class="button button--ghost ptd-resource__button ptd-resource__button--select"
                 type="button"
                 :disabled="running || loadingResources || !useGlossary || availableGlossaryBases.length === 0"
@@ -1315,6 +1370,15 @@ function stopPreTranslate() {
               />
             </label>
             <div class="ptd-resource__buttons">
+              <button
+                class="button button--ghost ptd-resource__button ptd-resource__button--create"
+                type="button"
+                :disabled="running || loadingResources || !useTermBase || !selectedFileLanguagePair"
+                @click="openTermBaseCreateDialog"
+              >
+                <Plus :size="14" />
+                {{ t('projectDetail.preTranslate.resources.create') }}
+              </button>
               <button
                 class="button button--ghost ptd-resource__button ptd-resource__button--select"
                 type="button"
@@ -1533,6 +1597,24 @@ function stopPreTranslate() {
       </div>
     </template>
   </Modal>
+
+  <ResourceCreateDialog
+    :open="showTermBaseCreateDialog"
+    resource-type="termBase"
+    :source-language="selectedFileLanguagePair?.source || ''"
+    :target-language="selectedFileLanguagePair?.target || ''"
+    @close="showTermBaseCreateDialog = false"
+    @created="handleTermBaseCreated"
+  />
+
+  <ResourceCreateDialog
+    :open="showGlossaryCreateDialog"
+    resource-type="glossary"
+    :source-language="selectedFileLanguagePair?.source || ''"
+    :target-language="selectedFileLanguagePair?.target || ''"
+    @close="showGlossaryCreateDialog = false"
+    @created="handleGlossaryCreated"
+  />
 </template>
 
 <style scoped>
@@ -1645,6 +1727,13 @@ function stopPreTranslate() {
 
 .ptd-section.is-disabled {
   background: color-mix(in srgb, var(--surface-1) 97%, var(--ptd-accent) 3%);
+  opacity: 0.55;
+  filter: grayscale(25%);
+  transition: opacity 0.2s ease, filter 0.2s ease;
+}
+
+.ptd-section:not(.is-disabled) {
+  transition: opacity 0.2s ease, filter 0.2s ease;
 }
 
 .ptd-section__head {
@@ -1700,6 +1789,20 @@ function stopPreTranslate() {
   flex-shrink: 0;
 }
 
+.ptd-switch__control::before {
+  content: '✕';
+  position: absolute;
+  top: 50%;
+  right: 5px;
+  transform: translateY(-50%);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--text-muted);
+  opacity: 0.7;
+  transition: opacity 0.18s ease;
+}
+
 .ptd-switch__control::after {
   content: '';
   position: absolute;
@@ -1715,6 +1818,14 @@ function stopPreTranslate() {
 .ptd-switch input:checked + .ptd-switch__control {
   border-color: var(--ptd-accent-strong);
   background: color-mix(in srgb, var(--surface-panel) 76%, var(--ptd-accent) 24%);
+}
+
+.ptd-switch input:checked + .ptd-switch__control::before {
+  content: '✓';
+  right: auto;
+  left: 5px;
+  color: var(--ptd-accent-strong);
+  opacity: 1;
 }
 
 .ptd-switch input:checked + .ptd-switch__control::after {
@@ -1850,6 +1961,18 @@ function stopPreTranslate() {
   border-color: color-mix(in srgb, var(--state-danger) 28%, var(--line-strong));
   background: color-mix(in srgb, var(--surface-panel) 66%, var(--state-danger-bg) 34%);
   color: var(--state-danger);
+}
+
+.ptd-resource__button--create {
+  border-color: color-mix(in srgb, var(--state-success) 14%, var(--line-soft));
+  background: color-mix(in srgb, var(--surface-panel) 88%, var(--state-success-bg) 12%);
+  color: color-mix(in srgb, var(--state-success) 72%, var(--text-secondary));
+}
+
+.ptd-resource__button--create:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--state-success) 28%, var(--line-strong));
+  background: color-mix(in srgb, var(--surface-panel) 76%, var(--state-success-bg) 24%);
+  color: var(--state-success);
 }
 
 .ptd-resource__note {
