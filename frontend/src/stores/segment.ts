@@ -29,6 +29,7 @@ const DEFAULT_SEGMENT_PAGE_SIZE = 100
 const MAX_SEGMENT_PAGE_SIZE = 500
 const AUTO_SYNC_DELAY_MS = 1500
 const CHANGE_POLL_INTERVAL_MS = 10000
+const CHANGE_POLL_BURST_DELAYS_MS = [1200, 3000, 6000, 10000]
 const EXPORT_POLL_INTERVAL_MS = 1200
 
 interface FileExportTask {
@@ -178,6 +179,7 @@ export const useSegmentStore = defineStore('segment', () => {
   const segmentIndexMap = new Map<string, number>()
   let syncTimer: number | null = null
   let changePollTimer: number | null = null
+  let changePollBurstTimers: number[] = []
   let changeCursor: string | null = null
   let pollingChanges = false
   let loadMorePromise: Promise<boolean> | null = null
@@ -582,11 +584,29 @@ export const useSegmentStore = defineStore('segment', () => {
     }, CHANGE_POLL_INTERVAL_MS)
   }
 
+  function clearChangePollBurstTimers() {
+    for (const timer of changePollBurstTimers) {
+      window.clearTimeout(timer)
+    }
+    changePollBurstTimers = []
+  }
+
+  function scheduleChangePollBurst() {
+    clearChangePollBurstTimers()
+    if (!fileRecord.value) {
+      return
+    }
+    changePollBurstTimers = CHANGE_POLL_BURST_DELAYS_MS.map((delay) => window.setTimeout(() => {
+      void pollSegmentChanges()
+    }, delay))
+  }
+
   function stopChangePolling() {
     if (changePollTimer !== null) {
       window.clearInterval(changePollTimer)
       changePollTimer = null
     }
+    clearChangePollBurstTimers()
     pollingChanges = false
   }
 
@@ -1184,6 +1204,9 @@ export const useSegmentStore = defineStore('segment', () => {
         syncMessage.value = translate('stores.segment.syncedAt', {
           time: syncedAt.toLocaleString('zh-CN', { hour12: false }),
         })
+      }
+      if (syncedSentenceIds.length > 0 || (data.segments || []).length > 0) {
+        scheduleChangePollBurst()
       }
       return true
     } catch (error) {

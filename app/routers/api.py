@@ -11,7 +11,7 @@ from datetime import datetime
 from functools import partial
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, Iterable, List, Literal, Optional
 from urllib.parse import quote, unquote, urlparse
 from uuid import UUID, uuid4
 
@@ -51,6 +51,7 @@ from app.models import (
     ProjectAssignment,
     ProjectWorkflowStep,
     Segment,
+    SegmentQAIssue,
     SegmentRevision,
     TMCollection,
     TermQAReport,
@@ -166,7 +167,7 @@ from app.services.llm_service import (
     iter_batch_translate,
     validate_provider_choice,
 )
-from app.services.term_entry_service import build_term_entry_conflict_items
+from app.services.term_entry_service import build_term_entry_conflict_items, save_term_entries_batch
 from app.services.term_extraction_service import (
     TERM_EXTRACTION_MODEL,
     TERM_EXTRACTION_MODEL_OPTIONS,
@@ -183,6 +184,20 @@ from app.services.notification_service import (
     build_resource_import_notification,
     build_save_to_tm_notification,
     create_operation_notification,
+)
+from app.services.spelling_grammar_qa import (
+    QA_ISSUE_STATUS_IGNORED,
+    QA_ISSUE_STATUS_OPEN,
+    get_languagetool_language,
+    get_supported_quality_qa_languages,
+    is_languagetool_configured,
+    load_open_segment_qa_issues_by_segment_id,
+    load_quality_qa_settings,
+    normalize_quality_qa_settings,
+    run_spelling_grammar_qa_for_project,
+    schedule_spelling_grammar_qa,
+    serialize_segment_qa_issue,
+    store_quality_qa_settings,
 )
 from app.services.file_export_queue import (
     build_file_export_download_response,
@@ -1014,6 +1029,17 @@ class TermExtractionRequest(BaseModel):
     extraction_prompt: str = Field(default="", max_length=4000)
 
 
+class TermExtractionSaveEntry(BaseModel):
+    source_text: str
+    target_text: str
+    action: Literal["add", "replace", "skip"] = "add"
+
+
+class TermExtractionSaveRequest(BaseModel):
+    term_base_id: UUID
+    entries: list[TermExtractionSaveEntry]
+
+
 class GuidelineTemplateUpdateRequest(BaseModel):
     content: str
 
@@ -1086,6 +1112,21 @@ class TermQAReportItemIgnoreRequest(BaseModel):
 
 class TermQAReportItemsIgnoreRequest(BaseModel):
     item_ids: list[UUID] = Field(default_factory=list)
+    ignored: bool = True
+
+
+class SpellingGrammarQASettingsRequest(BaseModel):
+    enabled: bool = False
+    severity: Literal["low", "medium", "high"] = "medium"
+
+
+class QualityQASettingsRequest(BaseModel):
+    spelling_grammar: SpellingGrammarQASettingsRequest = Field(
+        default_factory=SpellingGrammarQASettingsRequest
+    )
+
+
+class SegmentQAIssueIgnoreRequest(BaseModel):
     ignored: bool = True
 
 
@@ -1859,7 +1900,10 @@ def _can_write_file_record(file_record: FileRecord, current_user: User | None, d
     if can_access_all_projects(current_user):
         return True
     session = db or _get_record_session(file_record)
-    return _has_active_file_assignment(session, file_record, current_user.id)
+    if session is not None:
+        return _has_active_file_assignment(session, file_record, current_user.id)
+    assignee_id = getattr(file_record, "assignee_id", None)
+    return assignee_id is None or assignee_id == current_user.id
 
 
 def _require_file_record_read_access(file_record: FileRecord, current_user: User) -> None:
@@ -4233,6 +4277,33 @@ def _serialize_term_qa_report(
     }
 
 
+def _serialize_quality_qa_settings_response(db: Session, project: Project) -> dict[str, Any]:
+    file_language_rows = (
+        db.query(FileRecord.target_language, func.count(FileRecord.id))
+        .filter(FileRecord.project_id == project.id)
+        .group_by(FileRecord.target_language)
+        .all()
+    )
+    target_languages = [
+        {
+            "language": row[0],
+            "file_count": int(row[1] or 0),
+            "supported": bool(get_languagetool_language(row[0])),
+            "languagetool_code": get_languagetool_language(row[0]),
+        }
+        for row in file_language_rows
+        if row[0]
+    ]
+    target_languages.sort(key=lambda item: item["language"])
+    return {
+        "project_id": str(project.id),
+        "settings": load_quality_qa_settings(project),
+        "languagetool_configured": is_languagetool_configured(),
+        "supported_languages": get_supported_quality_qa_languages(),
+        "target_languages": target_languages,
+    }
+
+
 def _create_term_qa_report(
     db: Session,
     *,
@@ -4462,10 +4533,10 @@ def _apply_term_qa_ignore_state(
 
 
 def _build_project_detail_payload(
-    db: Session,
-    project: Project,
-    files: list[FileRecord],
-    file_stats: dict[UUID, dict],
+    db: Session | Project,
+    project: Project | list[FileRecord],
+    files: list[FileRecord] | dict[UUID, dict],
+    file_stats: dict[UUID, dict] | None = None,
     issue_markers: list[IssueMarker] | None = None,
     project_issue_stats: dict[str, int] | None = None,
     file_issue_stats: dict[UUID, dict[str, int]] | None = None,
@@ -4473,14 +4544,23 @@ def _build_project_detail_payload(
     assigned_users: list[User] | None = None,
     file_assignees: dict[UUID, list[User]] | None = None,
 ) -> dict:
+    if file_stats is None:
+        project_obj = db
+        files_list = project
+        stats = files
+        db = None
+        project = project_obj
+        files = files_list
+        file_stats = stats
+
     total_segments = sum(file_stats.get(file.id, {"total": 0})["total"] for file in files)
     translated_segments = sum(file_stats.get(file.id, {"filled": 0})["filled"] for file in files)
     pretranslated_segments = sum(
         file_stats.get(file.id, {}).get("pretranslated", 0) for file in files
     )
-    workflow_steps = _load_project_workflow_steps(db, project.id)
-    workflow_progress = _get_project_workflow_progress(db, [project.id]).get(project.id, [])
-    file_workflow_progress = _get_file_workflow_progress(db, [file.id for file in files])
+    workflow_steps = _load_project_workflow_steps(db, project.id) if db is not None else []
+    workflow_progress = _get_project_workflow_progress(db, [project.id]).get(project.id, []) if db is not None else []
+    file_workflow_progress = _get_file_workflow_progress(db, [file.id for file in files]) if db is not None else {}
     file_issue_stats = file_issue_stats or {}
     payload = _build_project_summary_payload(
         project=project,
@@ -5387,6 +5467,110 @@ def update_project(
     }
 
 
+@router.get("/projects/{project_id}/quality-qa-settings")
+def get_project_quality_qa_settings(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    _require_project_read_access(project, current_user, db)
+    return _serialize_quality_qa_settings_response(db, project)
+
+
+@router.patch("/projects/{project_id}/quality-qa-settings")
+def update_project_quality_qa_settings(
+    project_id: UUID,
+    payload: QualityQASettingsRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    normalized = store_quality_qa_settings(project, payload.model_dump())
+    db.commit()
+    db.refresh(project)
+    if normalized["spelling_grammar"]["enabled"]:
+        background_tasks.add_task(run_spelling_grammar_qa_for_project, project.id)
+    return _serialize_quality_qa_settings_response(db, project)
+
+
+@router.post("/file-records/{file_record_id}/qa-checks/spelling-grammar")
+def refresh_file_record_spelling_grammar_qa(
+    file_record_id: UUID,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    _require_file_record_work_access(file_record, current_user)
+    project = file_record.project or (
+        db.query(Project).filter(Project.id == file_record.project_id).first()
+        if file_record.project_id
+        else None
+    )
+    if not project:
+        raise HTTPException(status_code=400, detail="当前文件未归属项目，无法使用项目 QA 设置")
+    quality_settings = load_quality_qa_settings(project)
+    if not quality_settings["spelling_grammar"]["enabled"]:
+        raise HTTPException(status_code=400, detail="项目尚未启用拼写/语法 QA")
+    if not is_languagetool_configured():
+        raise HTTPException(status_code=503, detail="LanguageTool 未配置，无法手动刷新")
+    if not get_languagetool_language(file_record.target_language):
+        raise HTTPException(status_code=400, detail="当前目标语言暂不支持拼写/语法 QA")
+
+    segments = (
+        db.query(Segment)
+        .filter(
+            Segment.file_record_id == file_record_id,
+            func.trim(func.coalesce(Segment.target_text, "")) != "",
+        )
+        .all()
+    )
+    _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, segments)
+    return {
+        "file_record_id": str(file_record_id),
+        "queued_count": len(segments),
+    }
+
+
+@router.patch("/segment-qa-issues/{issue_id}/ignore")
+def update_segment_qa_issue_ignore(
+    issue_id: UUID,
+    payload: SegmentQAIssueIgnoreRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    issue = db.query(SegmentQAIssue).filter(SegmentQAIssue.id == issue_id).first()
+    if not issue:
+        raise HTTPException(status_code=404, detail="QA 问题不存在")
+    file_record = issue.file_record or db.query(FileRecord).filter(FileRecord.id == issue.file_record_id).first()
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    _require_file_record_work_access(file_record, current_user)
+
+    if payload.ignored:
+        issue.status = QA_ISSUE_STATUS_IGNORED
+        issue.ignored_by_id = current_user.id
+        issue.ignored_at = datetime.utcnow()
+    else:
+        issue.status = QA_ISSUE_STATUS_OPEN
+        issue.ignored_by_id = None
+        issue.ignored_at = None
+    issue.updated_at = datetime.utcnow()
+    if issue.segment:
+        issue.segment.updated_at = issue.updated_at
+    db.commit()
+    db.refresh(issue)
+    return serialize_segment_qa_issue(issue)
+
+
 @router.get("/projects/{project_id}/issue-markers")
 def list_project_issue_markers(
     project_id: UUID,
@@ -5830,6 +6014,7 @@ def _serialize_workbench_segment(
     *,
     source_filename: str | None = None,
     target_automatic_numbering_by_sentence_id: dict[str, str] | None = None,
+    qa_issues_by_segment_id: dict[UUID, list[SegmentQAIssue]] | None = None,
     workflow_step_by_id: dict[UUID, ProjectWorkflowStep] | None = None,
     writable_workflow_step_ids: set[UUID] | None = None,
     can_manage: bool = False,
@@ -5888,11 +6073,38 @@ def _serialize_workbench_segment(
         "workflow_step_name": workflow_step.name if workflow_step else "翻译",
         "workflow_step_order": int(workflow_step.sort_order or 0) if workflow_step else 0,
         "can_write": can_write,
+        "qa_issues": [
+            serialize_segment_qa_issue(issue)
+            for issue in (qa_issues_by_segment_id or {}).get(seg.id, [])
+        ],
         "updated_at": seg.updated_at.isoformat() if seg.updated_at else None,
     }
     if display_index is not None:
         payload["display_index"] = display_index
     return payload
+
+
+def _load_workbench_segment_qa_issues(
+    db: Session,
+    segments: list[Segment],
+) -> dict[UUID, list[SegmentQAIssue]]:
+    return load_open_segment_qa_issues_by_segment_id(
+        db,
+        [segment.id for segment in segments],
+    )
+
+
+def _schedule_spelling_grammar_qa_for_segments(
+    background_tasks: BackgroundTasks | None,
+    file_record: FileRecord,
+    segments: Iterable[Segment],
+) -> None:
+    segment_ids = [
+        segment.id
+        for segment in segments
+        if normalize_text(getattr(segment, "target_text", "") or "")
+    ]
+    schedule_spelling_grammar_qa(background_tasks, file_record.id, segment_ids)
 
 
 def _serialize_segment_update_conflict(conflict) -> dict:
@@ -6012,6 +6224,12 @@ def _apply_segment_screening_filters(
             conditions.append(Segment.status == "confirmed")
         if "unconfirmed" in status_values:
             conditions.append(or_(Segment.status.is_(None), Segment.status != "confirmed"))
+        if "qa" in status_values:
+            conditions.append(
+                Segment.qa_issues.any(
+                    SegmentQAIssue.status == QA_ISSUE_STATUS_OPEN
+                )
+            )
         if conditions:
             query = query.filter(or_(*conditions))
 
@@ -6480,6 +6698,7 @@ def get_file_record(
     )
     workflow_progress = _get_file_workflow_progress(db, [file_record.id]).get(file_record.id, [])
     target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
+    qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, segments)
 
     return {
         "id": file_record.id,
@@ -6541,6 +6760,7 @@ def get_file_record(
                 display_index=result["skip"] + index,
                 source_filename=source_filename,
                 target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
+                qa_issues_by_segment_id=qa_issues_by_segment_id,
                 workflow_step_by_id=workflow_step_by_id,
                 writable_workflow_step_ids=writable_workflow_step_ids,
                 can_manage=can_manage,
@@ -6681,6 +6901,7 @@ def get_file_record_segments(
         current_user,
     )
     target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
+    qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, page_segments)
 
     return {
         "file_record_id": str(file_record_id),
@@ -6706,6 +6927,7 @@ def get_file_record_segments(
                 display_index=display_index_map.get(seg.id),
                 source_filename=get_file_record_source_filename(file_record),
                 target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
+                qa_issues_by_segment_id=qa_issues_by_segment_id,
                 workflow_step_by_id=workflow_step_by_id,
                 writable_workflow_step_ids=writable_workflow_step_ids,
                 can_manage=can_manage,
@@ -6750,6 +6972,7 @@ def get_file_record_segment_changes(
         current_user,
     )
     target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
+    qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, changed_segments)
     return {
         "file_record_id": str(file_record_id),
         "server_time": datetime.utcnow().isoformat(),
@@ -6758,6 +6981,7 @@ def get_file_record_segment_changes(
                 segment,
                 source_filename=get_file_record_source_filename(file_record),
                 target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
+                qa_issues_by_segment_id=qa_issues_by_segment_id,
                 workflow_step_by_id=workflow_step_by_id,
                 writable_workflow_step_ids=writable_workflow_step_ids,
                 can_manage=can_manage,
@@ -7484,7 +7708,7 @@ def export_file_record_with_type(
                 segments=segments,
                 document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
                 document_parse_options=_get_file_record_document_parse_options(file_record),
-                target_language=file_record.target_language,
+                target_language=getattr(file_record, "target_language", None),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -7509,7 +7733,7 @@ def export_file_record_with_type(
                 order=BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS[export_type],
                 document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
                 document_parse_options=_get_file_record_document_parse_options(file_record),
-                target_language=file_record.target_language,
+                target_language=getattr(file_record, "target_language", None),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -7618,6 +7842,7 @@ def update_segment(
                 current_user,
             )
             target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
+            qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, [current_segment])
             return {
                 "updated_count": 0,
                 "conflicts": [
@@ -7635,6 +7860,7 @@ def update_segment(
                         current_segment,
                         source_filename=get_file_record_source_filename(file_record),
                         target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
+                        qa_issues_by_segment_id=qa_issues_by_segment_id,
                         workflow_step_by_id=workflow_step_by_id,
                         writable_workflow_step_ids=writable_workflow_step_ids,
                         can_manage=can_manage,
@@ -7681,6 +7907,9 @@ def update_segment(
         current_user,
     )
     target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
+    response_segments = [segment, *project_sync_summary.current_file_segments]
+    qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, response_segments)
+    _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, response_segments)
 
     return {
         "id": segment.id,
@@ -7699,11 +7928,12 @@ def update_segment(
                 item,
                 source_filename=get_file_record_source_filename(file_record),
                 target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
+                qa_issues_by_segment_id=qa_issues_by_segment_id,
                 workflow_step_by_id=workflow_step_by_id,
                 writable_workflow_step_ids=writable_workflow_step_ids,
                 can_manage=can_manage,
             )
-            for item in [segment, *project_sync_summary.current_file_segments]
+            for item in response_segments
         ],
     }
 
@@ -8089,6 +8319,9 @@ def batch_update(
         current_user,
     )
     target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
+    response_segments = [*result.updated_segments, *project_sync_summary.current_file_segments]
+    qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, response_segments)
+    _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, response_segments)
     return {
         "updated_count": result.updated_count,
         "conflicts": [_serialize_segment_update_conflict(conflict) for conflict in result.conflicts],
@@ -8099,11 +8332,12 @@ def batch_update(
                 segment,
                 source_filename=get_file_record_source_filename(file_record),
                 target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
+                qa_issues_by_segment_id=qa_issues_by_segment_id,
                 workflow_step_by_id=workflow_step_by_id,
                 writable_workflow_step_ids=writable_workflow_step_ids,
                 can_manage=can_manage,
             )
-            for segment in [*result.updated_segments, *project_sync_summary.current_file_segments]
+            for segment in response_segments
         ],
     }
 
@@ -8191,6 +8425,7 @@ def batch_update_segment_confirmation(
 def replace_file_record_segment_targets(
     file_record_id: UUID,
     payload: SegmentReplaceRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
@@ -8251,6 +8486,17 @@ def replace_file_record_segment_targets(
         updates=updates,
         current_user=current_user,
     )
+    if updated_count:
+        updated_sentence_ids = [item["sentence_id"] for item in updates]
+        updated_segments = (
+            db.query(Segment)
+            .filter(
+                Segment.file_record_id == file_record_id,
+                Segment.sentence_id.in_(updated_sentence_ids),
+            )
+            .all()
+        )
+        _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, updated_segments)
     return {"updated_count": updated_count, "occurrence_count": occurrence_count}
 
 
@@ -8824,6 +9070,39 @@ async def extract_file_record_terms(
             for error in extraction_errors
         ],
     }
+
+
+@router.post("/file-records/{file_record_id}/term-extraction/save")
+def save_file_record_extracted_terms(
+    file_record_id: UUID,
+    payload: TermExtractionSaveRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+
+    _require_file_record_work_access(file_record, current_user)
+    ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
+    source_language, target_language = _resolve_file_record_language_pair(file_record)
+
+    term_base = db.query(TermBase).filter(TermBase.id == payload.term_base_id).first()
+    if not term_base:
+        raise HTTPException(status_code=404, detail="术语库不存在。")
+    _ensure_resource_language_pair_matches(term_base, source_language, target_language, "术语库")
+
+    writable_term_base_ids = set(_load_file_record_term_base_write_ids(file_record))
+    if term_base.id not in writable_term_base_ids:
+        raise HTTPException(status_code=403, detail="目标术语库未绑定为当前文件的可写术语库。")
+
+    return save_term_entries_batch(
+        db=db,
+        term_base=term_base,
+        entries=[entry.model_dump() for entry in payload.entries],
+        current_user=current_user,
+    )
 
 
 @router.post("/file-records/{file_record_id}/llm-translate")

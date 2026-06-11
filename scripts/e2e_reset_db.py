@@ -23,10 +23,12 @@ SQL_FILES = [
     "scripts/add_file_record_resource_binding.sql",
     "scripts/add_creator_to_entries.sql",
     "scripts/add_translation_guidelines.sql",
+    "scripts/add_quality_qa_settings.sql",
     "scripts/create_issue_markers.sql",
 ]
 
 E2E_TABLES = [
+    "segment_qa_issues",
     "segment_revisions",
     "segment_comments",
     "issue_markers",

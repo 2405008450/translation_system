@@ -11,6 +11,7 @@ import { isProgressComplete } from '../utils/progress'
 import type {
   TMCollection,
   GlossaryBase,
+  GlossaryImportPreview,
   GlossaryImportSummary,
   TMImportPreview,
   TMImportSummary,
@@ -89,9 +90,11 @@ const newGlossaryBaseDescription = ref('')
 const glossaryImportSourceLanguage = ref('')
 const glossaryImportTargetLanguage = ref('')
 const glossaryImporting = ref(false)
+const glossaryPreviewing = ref(false)
 const glossaryUploadPercent = ref(0)
 const glossaryImportMessage = ref('')
 const glossaryImportSummary = ref<GlossaryImportSummary | null>(null)
+const glossaryImportPreview = ref<GlossaryImportPreview | null>(null)
 const glossarySkipHeader = ref(false)
 
 const selectedTermFile = ref<File | null>(null)
@@ -140,6 +143,10 @@ const tmPreviewRowsHidden = computed(() => {
 })
 const termPreviewRowsHidden = computed(() => {
   const preview = termImportPreview.value
+  return preview ? Math.max(0, preview.total_rows - preview.rows.length) : 0
+})
+const glossaryPreviewRowsHidden = computed(() => {
+  const preview = glossaryImportPreview.value
   return preview ? Math.max(0, preview.total_rows - preview.rows.length) : 0
 })
 const fixedTMTargetLabel = computed(() => props.contextLabel || selectedTMCollection.value?.name || '当前记忆库')
@@ -625,6 +632,7 @@ function resetTMPreview() {
 }
 
 function resetGlossaryImport() {
+  glossaryImportPreview.value = null
   glossaryImportSummary.value = null
   glossaryImportMessage.value = ''
 }
@@ -648,17 +656,54 @@ function buildTMImportFormData(collectionId?: string, includeDuplicateDecisions 
   return formData
 }
 
-function buildGlossaryImportFormData(glossaryBaseId: string) {
+function buildGlossaryImportFormData(glossaryBaseId?: string) {
   if (!selectedGlossaryFile.value) {
     throw new Error('请先选择要导入的词汇表文件。')
   }
   const formData = new FormData()
   formData.append('file', selectedGlossaryFile.value)
-  formData.append('glossary_base_id', glossaryBaseId)
+  if (glossaryBaseId) {
+    formData.append('glossary_base_id', glossaryBaseId)
+  }
   formData.append('source_language', glossaryImportSourceLanguage.value)
   formData.append('target_language', glossaryImportTargetLanguage.value)
   formData.append('skip_header', glossarySkipHeader.value ? 'true' : 'false')
   return formData
+}
+
+async function previewGlossaryWorkbook() {
+  if (!selectedGlossaryFile.value) {
+    glossaryImportMessage.value = '请先选择要导入的词汇表文件。'
+    return
+  }
+
+  try {
+    ensureLanguagePair(glossaryImportSourceLanguage.value, glossaryImportTargetLanguage.value)
+  } catch (error) {
+    resetGlossaryImport()
+    glossaryImportMessage.value = error instanceof Error ? error.message : t('resourceImport.errors.selectLanguage')
+    return
+  }
+
+  glossaryPreviewing.value = true
+  glossaryImportMessage.value = ''
+  glossaryImportSummary.value = null
+
+  try {
+    const glossaryBaseId = selectedGlossaryBaseId.value || props.fixedGlossaryBaseId
+    const formData = buildGlossaryImportFormData(glossaryBaseId)
+    formData.append('preview_limit', '500')
+    const { data } = await http.post<GlossaryImportPreview>('/glossary-bases/import/preview', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    glossaryImportPreview.value = data
+    glossaryImportMessage.value = `预览完成：读到 ${data.valid_rows} 条有效词汇。`
+  } catch (error) {
+    glossaryImportPreview.value = null
+    glossaryImportMessage.value = getErrorMessage(error, '词汇表预览失败。')
+  } finally {
+    glossaryPreviewing.value = false
+  }
 }
 
 async function previewTMWorkbook() {
@@ -895,6 +940,7 @@ async function uploadGlossaryWorkbook() {
     })
 
     glossaryImportSummary.value = data
+    glossaryImportPreview.value = null
     glossaryImportMessage.value = `导入完成：${data.filename}`
     refreshGlobalNotifications()
     selectedGlossaryFile.value = null
@@ -1370,14 +1416,24 @@ onMounted(() => {
 
       <div class="resource-import-panel__actions">
         <button
+          class="button"
+          type="button"
+          :disabled="glossaryImporting || glossaryPreviewing"
+          @click="previewGlossaryWorkbook"
+        >
+          <Loader2 v-if="glossaryPreviewing" class="lucide-spin" />
+          <Eye v-else :size="14" />
+          {{ glossaryPreviewing ? '预览中...' : '预览数据' }}
+        </button>
+        <button
           class="button button--primary"
           type="button"
-          :disabled="glossaryImporting"
+          :disabled="glossaryImporting || glossaryPreviewing || !glossaryImportPreview"
           @click="uploadGlossaryWorkbook"
         >
           <Loader2 v-if="glossaryImporting" class="lucide-spin" />
           <CheckCircle2 v-else :size="14" />
-          {{ glossaryImporting ? t('resourceImport.glossary.importing', { percent: glossaryUploadPercent }) : t('resourceImport.glossary.importAction') }}
+          {{ glossaryImporting ? t('resourceImport.glossary.importing', { percent: glossaryUploadPercent }) : '确认导入' }}
         </button>
       </div>
 
@@ -1397,10 +1453,56 @@ onMounted(() => {
       <p
         v-if="glossaryImportMessage"
         class="form-message"
-        :class="{ 'is-error': !glossaryImportSummary }"
+        :class="{ 'is-error': !glossaryImportSummary && !glossaryImportPreview }"
       >
         {{ glossaryImportMessage }}
       </p>
+
+      <div v-if="glossaryImportPreview" class="resource-import-panel__preview">
+        <div class="resource-import-panel__preview-head">
+          <div>
+            <div class="section-title">导入预览</div>
+            <p class="hint-text">
+              {{ glossaryImportPreview.filename }}，将导入到 {{ glossaryImportPreview.glossary_base_name || (newGlossaryBaseName || '新词汇表') }}
+            </p>
+          </div>
+          <div class="resource-import-panel__preview-stats">
+            <span>有效 {{ glossaryImportPreview.valid_rows }}</span>
+            <span>新增 {{ glossaryImportPreview.create_rows }}</span>
+            <span>覆盖 {{ glossaryImportPreview.update_rows }}</span>
+            <span>重复 {{ glossaryImportPreview.duplicate_rows }}</span>
+            <span>跳过 {{ glossaryImportPreview.skipped_empty_rows + glossaryImportPreview.skipped_header_rows }}</span>
+          </div>
+        </div>
+
+        <div class="resource-import-panel__preview-table-wrap">
+          <table class="resource-import-panel__preview-table resource-import-panel__preview-table--glossary">
+            <thead>
+              <tr>
+                <th>行号</th>
+                <th>原文</th>
+                <th>译文</th>
+                <th>备注</th>
+                <th>结果</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in glossaryImportPreview.rows" :key="row.row_index" :class="`is-${row.status}`">
+                <td>{{ row.row_index }}</td>
+                <td>{{ row.source_text || '-' }}</td>
+                <td>{{ row.target_text || '-' }}</td>
+                <td>{{ row.note || '-' }}</td>
+                <td>
+                  <strong>{{ row.message }}</strong>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p v-if="glossaryPreviewRowsHidden > 0" class="hint-text">
+          仅显示前 {{ glossaryImportPreview.rows.length }} 行，还有 {{ glossaryPreviewRowsHidden }} 行未展示。
+        </p>
+      </div>
 
       <div v-if="glossaryImportSummary" class="resource-import-panel__summary">
         <div class="section-title">{{ t('resourceImport.glossary.summary.title') }}</div>
@@ -1736,6 +1838,11 @@ onMounted(() => {
 }
 
 .resource-import-panel__toggle {
+  --resource-toggle-off: color-mix(in srgb, var(--state-danger) 72%, var(--text-muted) 28%);
+  --resource-toggle-off-strong: color-mix(in srgb, var(--state-danger) 82%, var(--text-secondary) 18%);
+  --resource-toggle-on: var(--state-success);
+  --resource-toggle-on-soft: color-mix(in srgb, var(--state-success) 78%, var(--surface-panel) 22%);
+
   display: flex;
   align-items: center;
   gap: 10px;
@@ -1758,9 +1865,12 @@ onMounted(() => {
   width: 42px;
   height: 24px;
   flex-shrink: 0;
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--resource-toggle-off-strong);
   border-radius: 999px;
-  background: #dbe3ea;
+  background: linear-gradient(135deg, var(--resource-toggle-off-strong), var(--resource-toggle-off));
+  box-shadow:
+    inset 0 1px 2px rgba(17, 49, 42, 0.12),
+    0 0 0 2px color-mix(in srgb, var(--resource-toggle-off) 8%, transparent);
   transition: background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
 }
 
@@ -1778,13 +1888,18 @@ onMounted(() => {
 }
 
 .resource-import-panel__toggle input:checked + .resource-import-panel__toggle-control {
-  border-color: var(--brand-600);
-  background: linear-gradient(135deg, var(--brand-600), var(--brand-500));
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand-500) 18%, transparent);
+  border-color: var(--resource-toggle-on);
+  background: linear-gradient(135deg, var(--resource-toggle-on), var(--resource-toggle-on-soft));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--resource-toggle-on) 14%, transparent);
 }
 
 .resource-import-panel__toggle input:checked + .resource-import-panel__toggle-control::after {
   transform: translateX(18px);
+}
+
+.resource-import-panel__toggle input:focus-visible + .resource-import-panel__toggle-control {
+  outline: 2px solid color-mix(in srgb, var(--brand-700) 24%, transparent);
+  outline-offset: 2px;
 }
 
 .resource-import-panel__toggle strong,

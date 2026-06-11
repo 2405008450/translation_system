@@ -179,9 +179,33 @@ Copy-Item .env.example .env
 | `TM_VECTOR_*`                                 | pgvector 语义检索开关、维度、候选数和权重                                                                   |
 | `DEEPSEEK_*` / `OPENROUTER_*`                 | LLM Provider 配置，AI 修正至少需要一个 API Key                                                         |
 | `LLM_TIMEOUT_SECONDS` / `LLM_STALL_TIMEOUT_SECONDS` / `LLM_MAX_CONCURRENCY` | LLM 单次请求超时、无进展中止阈值与并发控制                                                                 |
+| `LANGUAGETOOL_BASE_URL` / `LANGUAGETOOL_TIMEOUT_SECONDS` / `LANGUAGETOOL_MAX_TEXT_LENGTH` | 拼写/语法 QA 使用的自托管 LanguageTool HTTP Server 配置；未配置时自动跳过 QA，不影响译文保存。 |
 
 
 `.env` 已在 `.gitignore` 中，密钥不要提交到仓库。
+
+
+### LanguageTool 拼写/语法 QA
+
+建议将 LanguageTool 作为内网服务部署，不暴露公网。应用侧通过 `LANGUAGETOOL_BASE_URL=http://languagetool:8010/v2` 访问：
+
+```yaml
+services:
+  app:
+    environment:
+      LANGUAGETOOL_BASE_URL: http://languagetool:8010/v2
+      LANGUAGETOOL_TIMEOUT_SECONDS: 10
+      LANGUAGETOOL_MAX_TEXT_LENGTH: 20000
+    depends_on:
+      - languagetool
+
+  languagetool:
+    image: silviof/docker-languagetool:latest
+    expose:
+      - "8010"
+```
+
+项目设置中启用“质量保证 -> 拼写/语法检查”后，译文保存会后台触发检查。LanguageTool 未配置、不可用或目标语言暂不支持时，系统只跳过 QA，不会阻塞保存、确认、预翻译等核心流程。
 
 ### 4. 启动后端
 

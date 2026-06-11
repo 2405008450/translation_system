@@ -6,7 +6,7 @@ import InteractiveDiffText from './InteractiveDiffText.vue'
 
 import { getLLMModelShortLabel } from '../constants/llm'
 import { getSegmentSourceMeta, getSegmentStatusMeta } from '../constants/status'
-import type { Segment, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
+import type { Segment, SegmentQAIssue, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
 import { computeDiff } from '../utils/textDiff'
 import type { TextFormat } from '../composables/useRichTextEditor'
 
@@ -20,6 +20,7 @@ const props = withDefaults(defineProps<{
   pendingRevision?: SegmentRevisionEntry | null
   revisionBusy?: boolean
   matchedTerms?: TermEntryRecord[]
+  qaIssues?: SegmentQAIssue[]
   sourceSearchQuery?: string
   targetSearchQuery?: string
   showVisibleChars?: boolean
@@ -31,6 +32,7 @@ const props = withDefaults(defineProps<{
   pendingRevision: null,
   revisionBusy: false,
   matchedTerms: () => [],
+  qaIssues: () => [],
   sourceSearchQuery: '',
   targetSearchQuery: '',
   showVisibleChars: false,
@@ -76,8 +78,8 @@ interface HistoryRecordOptions {
   data?: string | null
 }
 
-type HighlightKind = 'term' | 'search'
-type HighlightPart = { text: string; highlight: boolean; kind?: HighlightKind }
+type HighlightKind = 'term' | 'search' | 'qa'
+type HighlightPart = { text: string; highlight: boolean; kind?: HighlightKind; title?: string }
 type BasicFormatTag = 'b' | 'i' | 'u' | 's' | 'sub' | 'sup'
 
 const BASIC_FORMAT_TAGS = ['b', 'strong', 'i', 'em', 'u', 's', 'strike', 'del', 'sub', 'sup']
@@ -278,6 +280,63 @@ const highlightedTargetText = computed(() => {
   return highlightSearchText(text, props.targetSearchQuery) || highlightText(text, props.matchedTerms || [], 'target_text')
 })
 
+const activeQAIssues = computed(() => {
+  const textLength = (props.segment.target_text || '').length
+  return (props.qaIssues || props.segment.qa_issues || [])
+    .filter((issue) => issue.status === 'open' && issue.length > 0 && issue.offset < textLength)
+    .map((issue) => ({
+      ...issue,
+      offset: Math.max(0, issue.offset),
+      length: Math.min(issue.length, Math.max(0, textLength - Math.max(0, issue.offset))),
+    }))
+    .filter((issue) => issue.length > 0)
+    .sort((a, b) => a.offset - b.offset || b.length - a.length)
+})
+
+function highlightQAText(text: string, issues: SegmentQAIssue[]): HighlightPart[] | null {
+  if (!text || issues.length === 0) {
+    return null
+  }
+
+  const ranges: Array<{ start: number; end: number; title: string }> = []
+  for (const issue of issues) {
+    const start = Math.max(0, issue.offset)
+    const end = Math.min(text.length, start + Math.max(0, issue.length))
+    if (end <= start) continue
+    const overlaps = ranges.some((range) => !(end <= range.start || start >= range.end))
+    if (overlaps) continue
+    ranges.push({
+      start,
+      end,
+      title: issue.short_message || issue.message || '拼写/语法问题',
+    })
+  }
+
+  if (ranges.length === 0) {
+    return null
+  }
+  ranges.sort((a, b) => a.start - b.start)
+
+  const parts: HighlightPart[] = []
+  let lastEnd = 0
+  for (const range of ranges) {
+    if (range.start > lastEnd) {
+      parts.push({ text: text.slice(lastEnd, range.start), highlight: false })
+    }
+    parts.push({
+      text: text.slice(range.start, range.end),
+      highlight: true,
+      kind: 'qa',
+      title: range.title,
+    })
+    lastEnd = range.end
+  }
+  if (lastEnd < text.length) {
+    parts.push({ text: text.slice(lastEnd), highlight: false })
+  }
+  return parts
+}
+
 // 生成带高亮的 HTML
 const targetHtmlContent = computed(() => {
   // 如果有保存的格式化 HTML，优先使用
@@ -317,12 +376,18 @@ function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;')
 }
 
+function escapeAttribute(text: string): string {
+  return escapeHtml(text).replace(/'/g, '&#39;')
+}
+
 function renderHighlightPartsAsHtml(parts: HighlightPart[] | null, text: string): string {
   const sourceParts: HighlightPart[] = parts || [{ text, highlight: false }]
   return sourceParts
     .map((seg) =>
       seg.highlight
-        ? `<mark class="${seg.kind === 'search' ? 'segment-row__search-highlight' : 'segment-row__term-highlight'}">${textToVisibleChars(seg.text)}</mark>`
+        ? seg.kind === 'qa'
+          ? `<span class="segment-row__qa-highlight" title="${escapeAttribute(seg.title || '拼写/语法问题')}">${textToVisibleChars(seg.text)}</span>`
+          : `<mark class="${seg.kind === 'search' ? 'segment-row__search-highlight' : 'segment-row__term-highlight'}">${textToVisibleChars(seg.text)}</mark>`
         : textToVisibleChars(seg.text)
     )
     .join('')
@@ -343,20 +408,17 @@ function hasSourceHighlights(): boolean {
 function renderTargetTextWithHighlights(text: string): string {
   const parts = highlightSearchText(text, props.targetSearchQuery)
     || highlightText(text, props.matchedTerms || [], 'target_text')
+    || highlightQAText(text, activeQAIssues.value)
   if (!parts) {
     return textToVisibleChars(text)
   }
-  return parts
-    .map((seg) =>
-      seg.highlight
-        ? `<mark class="${seg.kind === 'search' ? 'segment-row__search-highlight' : 'segment-row__term-highlight'}">${textToVisibleChars(seg.text)}</mark>`
-        : textToVisibleChars(seg.text)
-    )
-    .join('')
+  return renderHighlightPartsAsHtml(parts, text)
 }
 
 function hasTargetHighlights(): boolean {
-  return Boolean(props.targetSearchQuery.trim()) || (props.matchedTerms || []).some((term) => Boolean(term.target_text))
+  return Boolean(props.targetSearchQuery.trim())
+    || (props.matchedTerms || []).some((term) => Boolean(term.target_text))
+    || activeQAIssues.value.length > 0
 }
 
 function renderSourceHtmlWithHighlights(sourceHtml: string): string {
@@ -390,6 +452,7 @@ function renderSourceHtmlWithHighlights(sourceHtml: string): string {
       || element.classList.contains('doc-math')
       || element.classList.contains('segment-row__term-highlight')
       || element.classList.contains('segment-row__search-highlight')
+      || element.classList.contains('segment-row__qa-highlight')
     ) {
       return
     }
@@ -430,6 +493,7 @@ function renderTargetHtmlWithHighlights(targetHtml: string): string {
       || element.classList.contains('doc-math')
       || element.classList.contains('segment-row__term-highlight')
       || element.classList.contains('segment-row__search-highlight')
+      || element.classList.contains('segment-row__qa-highlight')
     ) {
       return
     }
@@ -1857,6 +1921,15 @@ watch(
   font-weight: 600;
 }
 
+.segment-row__qa-highlight {
+  color: inherit;
+  text-decoration-line: underline;
+  text-decoration-style: wavy;
+  text-decoration-color: #d92d20;
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 3px;
+}
+
 /* 穿透 scoped 样式，让 innerHTML 插入的 mark 标签也能应用样式 */
 .segment-row__text :deep(.segment-row__term-highlight),
 .segment-row__source-editor :deep(.segment-row__term-highlight) {
@@ -1877,6 +1950,16 @@ watch(
   font-weight: 600;
 }
 
+.segment-row__text :deep(.segment-row__qa-highlight),
+.segment-row__source-editor :deep(.segment-row__qa-highlight) {
+  color: inherit;
+  text-decoration-line: underline;
+  text-decoration-style: wavy;
+  text-decoration-color: #d92d20;
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 3px;
+}
+
 .segment-row__editor :deep(.segment-row__term-highlight) {
   background: rgba(216, 183, 78, 0.28);
   color: inherit;
@@ -1892,6 +1975,15 @@ watch(
   border-radius: 3px;
   box-shadow: inset 0 0 0 1px rgba(138, 103, 0, 0.2);
   font-weight: 600;
+}
+
+.segment-row__editor :deep(.segment-row__qa-highlight) {
+  color: inherit;
+  text-decoration-line: underline;
+  text-decoration-style: wavy;
+  text-decoration-color: #d92d20;
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 3px;
 }
 
 .segment-row__editor {

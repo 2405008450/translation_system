@@ -68,6 +68,7 @@ REQUIRED_SCHEMA = {
         "deadline",
         "access_level",
         "translation_guidelines",
+        "quality_qa_settings",
         "created_at",
         "updated_at",
     },
@@ -172,6 +173,32 @@ REQUIRED_SCHEMA = {
         "ignored_by_id",
         "ignored_at",
         "created_at",
+    },
+    "segment_qa_issues": {
+        "id",
+        "project_id",
+        "file_record_id",
+        "segment_id",
+        "sentence_id",
+        "rule_key",
+        "provider",
+        "language",
+        "severity",
+        "message",
+        "short_message",
+        "rule_id",
+        "rule_category",
+        "issue_type",
+        "context_text",
+        "offset",
+        "length",
+        "replacements",
+        "target_text_hash",
+        "status",
+        "ignored_by_id",
+        "ignored_at",
+        "created_at",
+        "updated_at",
     },
     "project_assignments": {
         "id",
@@ -367,6 +394,15 @@ REQUIRED_INDEXES = {
     "project_workflow_steps": {
         "ix_project_workflow_steps_project_id",
         "ix_project_workflow_steps_project_order",
+    },
+    "segment_qa_issues": {
+        "ix_segment_qa_issues_project_id",
+        "ix_segment_qa_issues_file_record_id",
+        "ix_segment_qa_issues_segment_id",
+        "ix_segment_qa_issues_segment_rule_status",
+        "ix_segment_qa_issues_status",
+        "ix_segment_qa_issues_rule_key",
+        "ix_segment_qa_issues_target_hash",
     },
 }
 
@@ -847,6 +883,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 deadline TIMESTAMP,
                 access_level VARCHAR(20) NOT NULL DEFAULT 'team',
                 translation_guidelines TEXT NOT NULL DEFAULT '',
+                quality_qa_settings TEXT NOT NULL DEFAULT '{{}}',
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
@@ -878,6 +915,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS projects
             ADD COLUMN IF NOT EXISTS translation_guidelines TEXT NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS quality_qa_settings TEXT NOT NULL DEFAULT '{}'
             """,
             """
             ALTER TABLE IF EXISTS projects
@@ -1875,6 +1916,163 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_term_qa_report_items_ignored_at
             ON term_qa_report_items (ignored_at)
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS segment_qa_issues (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+                segment_id UUID NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+                sentence_id VARCHAR(40) NOT NULL DEFAULT '',
+                rule_key VARCHAR(40) NOT NULL DEFAULT 'spelling_grammar',
+                provider VARCHAR(40) NOT NULL DEFAULT 'languagetool',
+                language VARCHAR(20) NOT NULL DEFAULT '',
+                severity VARCHAR(20) NOT NULL DEFAULT 'medium',
+                message TEXT NOT NULL DEFAULT '',
+                short_message TEXT NOT NULL DEFAULT '',
+                rule_id VARCHAR(120) NOT NULL DEFAULT '',
+                rule_category VARCHAR(120) NOT NULL DEFAULT '',
+                issue_type VARCHAR(80) NOT NULL DEFAULT '',
+                context_text TEXT NOT NULL DEFAULT '',
+                "offset" INTEGER NOT NULL DEFAULT 0,
+                length INTEGER NOT NULL DEFAULT 0,
+                replacements TEXT NOT NULL DEFAULT '[]',
+                target_text_hash VARCHAR(64) NOT NULL DEFAULT '',
+                status VARCHAR(20) NOT NULL DEFAULT 'open',
+                ignored_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                ignored_at TIMESTAMP,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS file_record_id UUID REFERENCES file_records(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS segment_id UUID REFERENCES segments(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS sentence_id VARCHAR(40) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS rule_key VARCHAR(40) NOT NULL DEFAULT 'spelling_grammar'
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS provider VARCHAR(40) NOT NULL DEFAULT 'languagetool'
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS language VARCHAR(20) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS severity VARCHAR(20) NOT NULL DEFAULT 'medium'
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS message TEXT NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS short_message TEXT NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS rule_id VARCHAR(120) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS rule_category VARCHAR(120) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS issue_type VARCHAR(80) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS context_text TEXT NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS "offset" INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS length INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS replacements TEXT NOT NULL DEFAULT '[]'
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS target_text_hash VARCHAR(64) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'open'
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS ignored_by_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS ignored_at TIMESTAMP
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_project_id
+            ON segment_qa_issues (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_file_record_id
+            ON segment_qa_issues (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_segment_id
+            ON segment_qa_issues (segment_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_segment_rule_status
+            ON segment_qa_issues (segment_id, rule_key, status)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_status
+            ON segment_qa_issues (status)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_rule_key
+            ON segment_qa_issues (rule_key)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_target_hash
+            ON segment_qa_issues (target_text_hash)
+            """,
+            """
+            DROP TRIGGER IF EXISTS update_segment_qa_issues_updated_at ON segment_qa_issues
+            """,
+            """
+            CREATE TRIGGER update_segment_qa_issues_updated_at
+            BEFORE UPDATE ON segment_qa_issues
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column()
             """,
             """
             INSERT INTO projects (

@@ -50,6 +50,9 @@ class Project(Base):
     translation_guidelines: Mapped[str] = mapped_column(
         Text, nullable=False, default="", server_default=text("''")
     )
+    quality_qa_settings: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default=text("'{}'")
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -287,6 +290,11 @@ class FileRecord(Base):
     )
     revisions: Mapped[list["SegmentRevision"]] = relationship(
         "SegmentRevision",
+        back_populates="file_record",
+        cascade="all, delete-orphan",
+    )
+    qa_issues: Mapped[list["SegmentQAIssue"]] = relationship(
+        "SegmentQAIssue",
         back_populates="file_record",
         cascade="all, delete-orphan",
     )
@@ -765,6 +773,11 @@ class Segment(Base):
         back_populates="segment",
         cascade="all, delete-orphan",
     )
+    qa_issues: Mapped[list["SegmentQAIssue"]] = relationship(
+        "SegmentQAIssue",
+        back_populates="segment",
+        cascade="all, delete-orphan",
+    )
 
 
 class TermQAReport(Base):
@@ -887,6 +900,77 @@ class TermQAReportItem(Base):
     file_record: Mapped["FileRecord"] = relationship("FileRecord")
     segment: Mapped["Segment | None"] = relationship("Segment")
     term_base: Mapped["TermBase | None"] = relationship("TermBase")
+    ignored_by: Mapped["User | None"] = relationship("User", foreign_keys=[ignored_by_id])
+
+
+class SegmentQAIssue(Base):
+    __tablename__ = "segment_qa_issues"
+    __table_args__ = (
+        Index("ix_segment_qa_issues_project_id", "project_id"),
+        Index("ix_segment_qa_issues_file_record_id", "file_record_id"),
+        Index("ix_segment_qa_issues_segment_id", "segment_id"),
+        Index("ix_segment_qa_issues_segment_rule_status", "segment_id", "rule_key", "status"),
+        Index("ix_segment_qa_issues_status", "status"),
+        Index("ix_segment_qa_issues_rule_key", "rule_key"),
+        Index("ix_segment_qa_issues_target_hash", "target_text_hash"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    file_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    segment_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("segments.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sentence_id: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+    rule_key: Mapped[str] = mapped_column(String(40), nullable=False, default="spelling_grammar")
+    provider: Mapped[str] = mapped_column(String(40), nullable=False, default="languagetool")
+    language: Mapped[str] = mapped_column(String(20), nullable=False, default="")
+    severity: Mapped[str] = mapped_column(String(20), nullable=False, default="medium")
+    message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    short_message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    rule_id: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    rule_category: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    issue_type: Mapped[str] = mapped_column(String(80), nullable=False, default="")
+    context_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    offset: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    length: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    replacements: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default=text("'[]'"))
+    target_text_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open", server_default=text("'open'"))
+    ignored_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    ignored_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    project: Mapped["Project | None"] = relationship("Project")
+    file_record: Mapped["FileRecord"] = relationship("FileRecord", back_populates="qa_issues")
+    segment: Mapped["Segment"] = relationship("Segment", back_populates="qa_issues")
     ignored_by: Mapped["User | None"] = relationship("User", foreign_keys=[ignored_by_id])
 
 

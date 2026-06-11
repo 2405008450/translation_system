@@ -418,6 +418,7 @@ CREATE TABLE IF NOT EXISTS projects (
     deadline TIMESTAMP,
     access_level VARCHAR(20) NOT NULL DEFAULT 'team',
     translation_guidelines TEXT NOT NULL DEFAULT '',
+    quality_qa_settings TEXT NOT NULL DEFAULT '{}',
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -426,6 +427,8 @@ ALTER TABLE IF EXISTS projects
     ADD COLUMN IF NOT EXISTS document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full';
 ALTER TABLE IF EXISTS projects
     ADD COLUMN IF NOT EXISTS translation_guidelines TEXT NOT NULL DEFAULT '';
+ALTER TABLE IF EXISTS projects
+    ADD COLUMN IF NOT EXISTS quality_qa_settings TEXT NOT NULL DEFAULT '{}';
 
 CREATE INDEX IF NOT EXISTS ix_projects_creator_id
     ON projects (creator_id);
@@ -1034,6 +1037,64 @@ CREATE INDEX IF NOT EXISTS ix_issue_markers_reporter_id
 DROP TRIGGER IF EXISTS update_issue_markers_updated_at ON issue_markers;
 CREATE TRIGGER update_issue_markers_updated_at
     BEFORE UPDATE ON issue_markers
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- -----------------------------------------------------------------------------
+-- 8.1 Segment spelling / grammar QA issues
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS segment_qa_issues (
+    id UUID PRIMARY KEY DEFAULT (
+        lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
+        lpad(to_hex(floor(random() * 65536)::int), 4, '0') || '-' ||
+        '4' || substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        substr('89ab', floor(random() * 4)::int + 1, 1) ||
+        substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
+    )::uuid,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+    segment_id UUID NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+    sentence_id VARCHAR(40) NOT NULL DEFAULT '',
+    rule_key VARCHAR(40) NOT NULL DEFAULT 'spelling_grammar',
+    provider VARCHAR(40) NOT NULL DEFAULT 'languagetool',
+    language VARCHAR(20) NOT NULL DEFAULT '',
+    severity VARCHAR(20) NOT NULL DEFAULT 'medium',
+    message TEXT NOT NULL DEFAULT '',
+    short_message TEXT NOT NULL DEFAULT '',
+    rule_id VARCHAR(120) NOT NULL DEFAULT '',
+    rule_category VARCHAR(120) NOT NULL DEFAULT '',
+    issue_type VARCHAR(80) NOT NULL DEFAULT '',
+    context_text TEXT NOT NULL DEFAULT '',
+    "offset" INTEGER NOT NULL DEFAULT 0,
+    length INTEGER NOT NULL DEFAULT 0,
+    replacements TEXT NOT NULL DEFAULT '[]',
+    target_text_hash VARCHAR(64) NOT NULL DEFAULT '',
+    status VARCHAR(20) NOT NULL DEFAULT 'open',
+    ignored_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    ignored_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_project_id
+    ON segment_qa_issues (project_id);
+CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_file_record_id
+    ON segment_qa_issues (file_record_id);
+CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_segment_id
+    ON segment_qa_issues (segment_id);
+CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_segment_rule_status
+    ON segment_qa_issues (segment_id, rule_key, status);
+CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_status
+    ON segment_qa_issues (status);
+CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_rule_key
+    ON segment_qa_issues (rule_key);
+CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_target_hash
+    ON segment_qa_issues (target_text_hash);
+
+DROP TRIGGER IF EXISTS update_segment_qa_issues_updated_at ON segment_qa_issues;
+CREATE TRIGGER update_segment_qa_issues_updated_at
+    BEFORE UPDATE ON segment_qa_issues
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 

@@ -112,7 +112,7 @@ type ResourceSearchMode = 'exact' | 'fuzzy'
 type FileExportStatus = 'queued' | 'running' | 'completed' | 'failed'
 type WorkflowTransitionDirection = 'forward' | 'back'
 type WorkflowSourceStatus = 'none' | 'exact' | 'fuzzy' | 'confirmed'
-type SegmentScreeningGroup = 'status' | 'match' | 'source' | 'workflow'
+type SegmentScreeningGroup = 'status' | 'match' | 'source' | 'flag' | 'workflow'
 interface SegmentScreeningOption {
   value: string
   label: string
@@ -361,6 +361,7 @@ const segmentScreeningNumberInput = ref('1')
 const segmentScreeningStatusFilters = ref<string[]>([])
 const segmentScreeningMatchFilters = ref<string[]>([])
 const segmentScreeningSourceFilters = ref<string[]>([])
+const segmentScreeningFlagFilters = ref<string[]>([])
 const segmentScreeningWorkflowStepIds = ref<string[]>([])
 const searchLoadingAllSegments = ref(false)
 const segmentSearchReturnTarget = ref<{ sentenceId: string; displayIndex: number | null; page: number } | null>(null)
@@ -496,7 +497,7 @@ function getCommentWindowQuery(): CommentWindowQuery | null {
     sourceQuery: sourceSearchQuery.value,
     targetQuery: targetSearchQuery.value,
     searchFuzzy: searchFuzzyEnabled.value,
-    statusFilters: [...segmentScreeningStatusFilters.value],
+    statusFilters: [...segmentScreeningStatusFilters.value, ...segmentScreeningFlagFilters.value],
     matchFilters: [...segmentScreeningMatchFilters.value],
     sourceFilters: [...segmentScreeningSourceFilters.value],
     workflowStepIds: [...segmentScreeningWorkflowStepIds.value],
@@ -511,7 +512,7 @@ function getSegmentWindowQuery(page = segmentStore.currentPage, pageSize = segme
     sourceQuery: sourceSearchQuery.value,
     targetQuery: targetSearchQuery.value,
     searchFuzzy: searchFuzzyEnabled.value,
-    statusFilters: [...segmentScreeningStatusFilters.value],
+    statusFilters: [...segmentScreeningStatusFilters.value, ...segmentScreeningFlagFilters.value],
     matchFilters: [...segmentScreeningMatchFilters.value],
     sourceFilters: [...segmentScreeningSourceFilters.value],
     workflowStepIds: [...segmentScreeningWorkflowStepIds.value],
@@ -932,7 +933,7 @@ const segmentScreeningModifyOptions: SegmentScreeningOption[] = [
 ]
 const segmentScreeningFlagOptions: SegmentScreeningOption[] = [
   { value: 'note', label: '带备注', disabled: true },
-  { value: 'qa', label: '带QA提醒', disabled: true },
+  { value: 'qa', label: '带 QA 提醒' },
   { value: 'language_error', label: '带语言错误类型', disabled: true },
   { value: 'limited_repair', label: '带限修修订', disabled: true },
   { value: 'unadded_language_error', label: '未添加语言错误类型', disabled: true },
@@ -945,18 +946,21 @@ const segmentScreeningQueryKey = computed(() => JSON.stringify({
   status: segmentScreeningStatusFilters.value,
   match: segmentScreeningMatchFilters.value,
   source: segmentScreeningSourceFilters.value,
+  flag: segmentScreeningFlagFilters.value,
   workflow: segmentScreeningWorkflowStepIds.value,
 }))
 const hasSegmentScreeningFilters = computed(() => (
   segmentScreeningStatusFilters.value.length > 0
   || segmentScreeningMatchFilters.value.length > 0
   || segmentScreeningSourceFilters.value.length > 0
+  || segmentScreeningFlagFilters.value.length > 0
   || segmentScreeningWorkflowStepIds.value.length > 0
 ))
 const segmentScreeningActiveCount = computed(() => (
   segmentScreeningStatusFilters.value.length
   + segmentScreeningMatchFilters.value.length
   + segmentScreeningSourceFilters.value.length
+  + segmentScreeningFlagFilters.value.length
   + segmentScreeningWorkflowStepIds.value.length
 ))
 const workflowTargetSteps = computed(() => {
@@ -1805,6 +1809,7 @@ function resetSegmentScreeningFilters() {
   segmentScreeningStatusFilters.value = []
   segmentScreeningMatchFilters.value = []
   segmentScreeningSourceFilters.value = []
+  segmentScreeningFlagFilters.value = []
   segmentScreeningWorkflowStepIds.value = []
 }
 
@@ -1818,6 +1823,9 @@ function getSegmentScreeningGroupValues(group: SegmentScreeningGroup) {
   if (group === 'source') {
     return segmentScreeningSourceFilters.value
   }
+  if (group === 'flag') {
+    return segmentScreeningFlagFilters.value
+  }
   return segmentScreeningWorkflowStepIds.value
 }
 
@@ -1829,6 +1837,8 @@ function setSegmentScreeningGroupValues(group: SegmentScreeningGroup, values: st
     segmentScreeningMatchFilters.value = nextValues
   } else if (group === 'source') {
     segmentScreeningSourceFilters.value = nextValues
+  } else if (group === 'flag') {
+    segmentScreeningFlagFilters.value = nextValues
   } else {
     segmentScreeningWorkflowStepIds.value = nextValues
   }
@@ -2181,7 +2191,7 @@ async function replaceAllSearchMatches() {
         replace_text: replaceSearchText.value,
         search_fuzzy: searchFuzzyEnabled.value,
         replace_all: true,
-        status_filters: [...segmentScreeningStatusFilters.value],
+        status_filters: [...segmentScreeningStatusFilters.value, ...segmentScreeningFlagFilters.value],
         match_filters: [...segmentScreeningMatchFilters.value],
         source_filters: [...segmentScreeningSourceFilters.value],
         workflow_step_ids: [...segmentScreeningWorkflowStepIds.value],
@@ -5242,9 +5252,15 @@ onBeforeRouteLeave(async () => {
                 <label
                   v-for="option in segmentScreeningFlagOptions"
                   :key="option.value"
-                  class="segment-screening-panel__check is-disabled"
+                  class="segment-screening-panel__check"
+                  :class="{ 'is-disabled': option.disabled }"
                 >
-                  <input type="checkbox" disabled />
+                  <input
+                    type="checkbox"
+                    :disabled="option.disabled"
+                    :checked="isSegmentScreeningChecked('flag', option.value)"
+                    @change="toggleSegmentScreeningFilter('flag', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
                   <span>{{ option.label }}</span>
                 </label>
               </div>
@@ -5427,6 +5443,7 @@ onBeforeRouteLeave(async () => {
                     :pending-revision="revisionTraceVisible ? segmentStore.getRevisionTrace(item.sentence_id) : null"
                     :revision-busy="revisionActionLoading"
                     :matched-terms="segmentStore.activeSentenceId === item.sentence_id ? activeMatchedTerms : []"
+                    :qa-issues="item.qa_issues || []"
                     :source-search-query="sourceSearchQuery"
                     :target-search-query="targetSearchQuery"
                     :show-visible-chars="richTextEditor.visibleCharactersEnabled.value"
@@ -5977,9 +5994,15 @@ onBeforeRouteLeave(async () => {
                 <label
                   v-for="option in segmentScreeningFlagOptions"
                   :key="option.value"
-                  class="segment-screening-panel__check is-disabled"
+                  class="segment-screening-panel__check"
+                  :class="{ 'is-disabled': option.disabled }"
                 >
-                  <input type="checkbox" disabled />
+                  <input
+                    type="checkbox"
+                    :disabled="option.disabled"
+                    :checked="isSegmentScreeningChecked('flag', option.value)"
+                    @change="toggleSegmentScreeningFilter('flag', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
                   <span>{{ option.label }}</span>
                 </label>
               </div>

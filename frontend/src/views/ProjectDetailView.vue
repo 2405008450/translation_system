@@ -72,6 +72,8 @@ import type {
   IssueMarker,
   IssueStatus,
   ProjectAssignmentsResponse,
+  QualityQASettingsResponse,
+  SegmentQAIssueSeverity,
   ProjectTranslationMemorySettingCollection,
   ProjectTermBaseSettingGroup,
   ProjectTermBaseSettingRow,
@@ -92,7 +94,7 @@ const props = defineProps<{
 }>()
 
 type ProjectTab = 'files' | 'issues' | 'assignments' | 'settings' | 'stats' | 'summary' | 'quote'
-type ProjectSettingsSection = 'basic' | 'guidelines' | 'translation-memory' | 'terms' | 'term-qa'
+type ProjectSettingsSection = 'basic' | 'guidelines' | 'translation-memory' | 'terms' | 'quality-qa' | 'term-qa'
 type AccessLevel = 'team' | 'private' | 'public'
 type DocumentStatisticNumberKey =
   | 'pages'
@@ -314,6 +316,8 @@ function getProjectSettingsSectionFromHash(hash: string): ProjectSettingsSection
       return 'translation-memory'
     case '#project-settings-terms':
       return 'terms'
+    case '#project-settings-quality-qa':
+      return 'quality-qa'
     case '#project-settings-term-qa':
       return 'term-qa'
     case '#project-settings-basic':
@@ -404,6 +408,16 @@ const termImportDialogContext = ref<{
   termBaseName: '',
   sourceLanguage: null,
   targetLanguage: null,
+})
+const qualityQASettings = ref<QualityQASettingsResponse | null>(null)
+const loadingQualityQASettings = ref(false)
+const savingQualityQASettings = ref(false)
+const qualityQASettingsError = ref('')
+const qualityQADraft = reactive({
+  spelling_grammar: {
+    enabled: false,
+    severity: 'medium' as SegmentQAIssueSeverity,
+  },
 })
 const generatingTermQAReport = ref(false)
 const termQAReport = ref<TermQAReport | null>(null)
@@ -1635,12 +1649,14 @@ async function loadProject() {
       void loadAssignmentEvents()
       void loadProjectTranslationMemorySettings()
       void loadProjectTermBaseSettings()
+      void loadProjectQualityQASettings()
       if (activeTab.value === 'stats') {
         void loadDocumentStatisticsReports()
       }
     } else {
       translationMemorySettings.value = null
       termBaseSettings.value = null
+      qualityQASettings.value = null
     }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.load'))
@@ -1688,6 +1704,60 @@ async function loadProjectTranslationMemorySettings() {
     loadingTranslationMemorySettings.value = false
   }
 }
+
+async function loadProjectQualityQASettings() {
+  if (!project.value?.can_manage) {
+    qualityQASettings.value = null
+    return
+  }
+  loadingQualityQASettings.value = true
+  qualityQASettingsError.value = ''
+  try {
+    const { data } = await http.get<QualityQASettingsResponse>(
+      `/projects/${project.value.id}/quality-qa-settings`,
+    )
+    qualityQASettings.value = data
+    qualityQADraft.spelling_grammar.enabled = data.settings.spelling_grammar.enabled
+    qualityQADraft.spelling_grammar.severity = data.settings.spelling_grammar.severity
+  } catch (error) {
+    qualityQASettingsError.value = getErrorMessage(error, '质量保证设置加载失败。')
+  } finally {
+    loadingQualityQASettings.value = false
+  }
+}
+
+async function saveProjectQualityQASettings() {
+  if (!project.value?.can_manage || savingQualityQASettings.value) {
+    return
+  }
+  savingQualityQASettings.value = true
+  qualityQASettingsError.value = ''
+  try {
+    const { data } = await http.patch<QualityQASettingsResponse>(
+      `/projects/${project.value.id}/quality-qa-settings`,
+      {
+        spelling_grammar: {
+          enabled: qualityQADraft.spelling_grammar.enabled,
+          severity: qualityQADraft.spelling_grammar.severity,
+        },
+      },
+    )
+    qualityQASettings.value = data
+    qualityQADraft.spelling_grammar.enabled = data.settings.spelling_grammar.enabled
+    qualityQADraft.spelling_grammar.severity = data.settings.spelling_grammar.severity
+    toast.success('质量保证设置已保存')
+  } catch (error) {
+    qualityQASettingsError.value = getErrorMessage(error, '质量保证设置保存失败。')
+  } finally {
+    savingQualityQASettings.value = false
+  }
+}
+
+const qualityQASeverityOptions: Array<{ value: SegmentQAIssueSeverity; label: string }> = [
+  { value: 'low', label: '低' },
+  { value: 'medium', label: '一般' },
+  { value: 'high', label: '高' },
+]
 
 function translationMemorySettingGroupKey(group: ProjectTranslationMemorySettingGroup) {
   return `${group.source_language}->${group.target_language}`
@@ -3049,6 +3119,15 @@ onBeforeUnmount(() => {
             </button>
             <button
               class="pd-settings-rail__item"
+              :class="{ 'is-active': activeProjectSettingsSection === 'quality-qa' }"
+              type="button"
+              @click="switchProjectSettingsSection('quality-qa')"
+            >
+              <ShieldCheck :size="15" />
+              <span>质量保证</span>
+            </button>
+            <button
+              class="pd-settings-rail__item"
               :class="{ 'is-active': activeProjectSettingsSection === 'term-qa' }"
               type="button"
               @click="switchProjectSettingsSection('term-qa')"
@@ -3578,6 +3657,102 @@ onBeforeUnmount(() => {
               </div>
             </section>
 
+            <section v-show="activeProjectSettingsSection === 'quality-qa'" id="project-settings-quality-qa" class="pd-settings-section">
+              <header class="pd-settings-section-head">
+                <div class="pd-settings-section-head__copy">
+                  <span class="pd-settings-section-icon">
+                    <ShieldCheck :size="17" />
+                  </span>
+                  <div>
+                    <div class="section-title section-title--tight">质量保证</div>
+                    <p class="panel-subtitle">启用拼写/语法 QA 后，译文保存会后台检查，工作台会用红色波浪线提示问题。</p>
+                  </div>
+                </div>
+                <button
+                  class="button button--primary pd-settings-save"
+                  type="button"
+                  :disabled="savingQualityQASettings || loadingQualityQASettings"
+                  @click="saveProjectQualityQASettings"
+                >
+                  <Loader2 v-if="savingQualityQASettings" class="lucide-spin" :size="14" />
+                  <Settings2 v-else :size="14" />
+                  {{ savingQualityQASettings ? '保存中' : '保存质量设置' }}
+                </button>
+              </header>
+
+              <div class="pd-settings-section-body quality-qa-settings">
+                <StateView
+                  v-if="loadingQualityQASettings"
+                  kind="loading"
+                  title="正在加载质量保证设置"
+                  message="正在读取 LanguageTool 配置和项目语言支持情况。"
+                />
+                <p v-else-if="qualityQASettingsError" class="form-message is-error">{{ qualityQASettingsError }}</p>
+                <div v-else class="quality-qa-settings__content">
+                  <label class="quality-qa-settings__toggle-row">
+                    <span>
+                      <strong>拼写/语法检查</strong>
+                      <small>自托管 LanguageTool，后台最佳努力执行，不阻塞译文保存。</small>
+                    </span>
+                    <span class="term-settings__toggle">
+                      <input v-model="qualityQADraft.spelling_grammar.enabled" type="checkbox" />
+                      <span aria-hidden="true" />
+                    </span>
+                  </label>
+
+                  <label class="field quality-qa-settings__severity">
+                    <span class="field__label">严重级别</span>
+                    <select
+                      v-model="qualityQADraft.spelling_grammar.severity"
+                      class="field__control pd-settings-control"
+                      :disabled="!qualityQADraft.spelling_grammar.enabled"
+                    >
+                      <option v-for="option in qualityQASeverityOptions" :key="option.value" :value="option.value">
+                        {{ option.label }}
+                      </option>
+                    </select>
+                  </label>
+
+                  <div class="quality-qa-settings__status-grid">
+                    <div class="quality-qa-settings__status-item">
+                      <span>LanguageTool</span>
+                      <strong :class="qualityQASettings?.languagetool_configured ? 'is-ok' : 'is-warn'">
+                        {{ qualityQASettings?.languagetool_configured ? '已配置' : '未配置' }}
+                      </strong>
+                    </div>
+                    <div class="quality-qa-settings__status-item">
+                      <span>检查方式</span>
+                      <strong>后台自动检查</strong>
+                    </div>
+                  </div>
+
+                  <div class="quality-qa-settings__language-list">
+                    <div class="quality-qa-settings__language-head">
+                      <strong>项目目标语言</strong>
+                      <span>{{ qualityQASettings?.target_languages.length || 0 }} 种</span>
+                    </div>
+                    <div v-if="!qualityQASettings || qualityQASettings.target_languages.length === 0" class="empty-state">
+                      当前项目还没有可检查的目标语言文件。
+                    </div>
+                    <div v-else class="quality-qa-settings__language-grid">
+                      <span
+                        v-for="item in qualityQASettings.target_languages"
+                        :key="item.language"
+                        class="quality-qa-settings__language-chip"
+                        :class="{ 'is-supported': item.supported, 'is-unsupported': !item.supported }"
+                      >
+                        <strong>{{ getLanguageLabel(item.language) }}</strong>
+                        <small>{{ item.file_count }} 个文件 · {{ item.supported ? item.languagetool_code : '暂不支持' }}</small>
+                      </span>
+                    </div>
+                  </div>
+
+                  <p v-if="qualityQADraft.spelling_grammar.enabled && !qualityQASettings?.languagetool_configured" class="form-message is-error">
+                    已启用检查，但后端尚未配置 LANGUAGETOOL_BASE_URL，保存译文不会被阻塞，QA 检查会自动跳过。
+                  </p>
+                </div>
+              </div>
+            </section>
             <section v-show="activeProjectSettingsSection === 'term-qa'" id="project-settings-term-qa" class="pd-settings-section">
               <header class="pd-settings-section-head">
                 <div class="pd-settings-section-head__copy">
@@ -7009,6 +7184,81 @@ onBeforeUnmount(() => {
   background: color-mix(in srgb, var(--brand-700) 12%, transparent);
   font-size: 11px;
   cursor: help;
+}
+
+.quality-qa-settings__content {
+  display: grid;
+  gap: 16px;
+}
+
+.quality-qa-settings__toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px;
+  border: 1px solid var(--border-muted);
+  border-radius: 8px;
+  background: var(--surface-muted);
+}
+
+.quality-qa-settings__toggle-row > span:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.quality-qa-settings__toggle-row small,
+.quality-qa-settings__language-chip small,
+.quality-qa-settings__language-head span {
+  color: var(--text-muted);
+}
+
+.quality-qa-settings__severity {
+  max-width: 260px;
+}
+
+.quality-qa-settings__status-grid,
+.quality-qa-settings__language-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+}
+
+.quality-qa-settings__status-item,
+.quality-qa-settings__language-chip {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border: 1px solid var(--border-muted);
+  border-radius: 8px;
+  background: var(--surface-primary);
+}
+
+.quality-qa-settings__status-item span {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.quality-qa-settings__status-item .is-ok,
+.quality-qa-settings__language-chip.is-supported strong {
+  color: #227f58;
+}
+
+.quality-qa-settings__status-item .is-warn,
+.quality-qa-settings__language-chip.is-unsupported strong {
+  color: #b54708;
+}
+
+.quality-qa-settings__language-list {
+  display: grid;
+  gap: 10px;
+}
+
+.quality-qa-settings__language-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .term-qa-report__actions {

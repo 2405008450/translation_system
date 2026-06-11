@@ -393,6 +393,38 @@ export interface Segment {
   workflow_step_name?: string | null
   workflow_step_order?: number | null
   can_write?: boolean
+  qa_issues?: SegmentQAIssue[]
+  updated_at: string | null
+}
+
+export type SegmentQAIssueSeverity = 'low' | 'medium' | 'high'
+export type SegmentQAIssueStatus = 'open' | 'ignored' | 'resolved'
+
+export interface SegmentQAIssue {
+  id: string
+  project_id: string | null
+  file_record_id: string
+  segment_id: string
+  sentence_id: string
+  rule_key: string
+  provider: string
+  language: string
+  severity: SegmentQAIssueSeverity
+  message: string
+  short_message: string
+  rule_id: string
+  rule_category: string
+  issue_type: string
+  context_text: string
+  offset: number
+  length: number
+  replacements: string[]
+  target_text_hash: string
+  status: SegmentQAIssueStatus
+  ignored: boolean
+  ignored_at: string | null
+  ignored_by_id: string | null
+  created_at: string | null
   updated_at: string | null
 }
 
@@ -631,6 +663,29 @@ export interface ProjectTermBaseSettingGroup {
 export interface ProjectTermBaseSettingsResponse {
   project_id: string
   groups: ProjectTermBaseSettingGroup[]
+}
+
+export interface QualityQASettingsResponse {
+  project_id: string
+  settings: {
+    spelling_grammar: {
+      enabled: boolean
+      severity: SegmentQAIssueSeverity
+    }
+  }
+  languagetool_configured: boolean
+  supported_languages: Array<{
+    code: string
+    label: string
+    languagetool_code: string | null
+    supported: boolean
+  }>
+  target_languages: Array<{
+    language: string
+    file_count: number
+    supported: boolean
+    languagetool_code: string | null
+  }>
 }
 
 export interface ProjectTranslationMemorySettingCollection {
@@ -941,6 +996,32 @@ export interface GlossaryImportSummary {
   skipped_header_rows: number
   imported_rows: number
   glossary_base_id: string
+  glossary_base_name: string
+  source_language: string
+  target_language: string
+}
+
+export interface GlossaryImportPreviewRow {
+  row_index: number
+  source_text: string
+  target_text: string
+  note: string
+  status: ImportPreviewStatus
+  message: string
+}
+
+export interface GlossaryImportPreview {
+  filename: string
+  rows: GlossaryImportPreviewRow[]
+  total_rows: number
+  valid_rows: number
+  create_rows: number
+  update_rows: number
+  duplicate_rows: number
+  skipped_empty_rows: number
+  skipped_header_rows: number
+  preview_limit: number
+  glossary_base_id: string | null
   glossary_base_name: string
   source_language: string
   target_language: string

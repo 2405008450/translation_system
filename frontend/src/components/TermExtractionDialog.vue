@@ -167,13 +167,20 @@ const canExtract = computed(() => Boolean(
   && selectedModels.value.length <= 2
   && !extracting.value,
 ))
+const canCreateTermBaseForSave = computed(() => Boolean(
+  showCreateTermBaseFields.value
+  && sourceLanguage.value
+  && targetLanguage.value
+  && newBaseName.value.trim()
+))
 const canSave = computed(() => Boolean(
   props.file
-  && selectedTermBaseId.value
+  && (selectedTermBaseId.value || canCreateTermBaseForSave.value)
   && drafts.value.length > 0
   && saveableCount.value > 0
   && !saving.value
-  && !extracting.value,
+  && !extracting.value
+  && !creatingBase.value
 ))
 
 function getErrorMessage(error: unknown, fallback: string) {
@@ -455,15 +462,16 @@ async function refreshConflicts() {
   }
 }
 
-async function createTermBase() {
+async function createTermBaseForCurrentSelection(options: { showToast?: boolean } = {}) {
+  const showToast = options.showToast ?? true
   if (!sourceLanguage.value || !targetLanguage.value) {
     errorMessage.value = t('projectDetail.termExtraction.languageMissing')
-    return
+    return null
   }
   const name = newBaseName.value.trim()
   if (!name) {
     errorMessage.value = t('projectDetail.termExtraction.errors.baseNameRequired')
-    return
+    return null
   }
 
   creatingBase.value = true
@@ -485,16 +493,24 @@ async function createTermBase() {
     await loadTermBases()
     selectedTermBaseId.value = data.id
     await refreshConflicts()
-    pushToast({
-      tone: 'success',
-      title: t('projectDetail.termExtraction.toast.baseCreated'),
-      message: data.name,
-    })
+    if (showToast) {
+      pushToast({
+        tone: 'success',
+        title: t('projectDetail.termExtraction.toast.baseCreated'),
+        message: data.name,
+      })
+    }
+    return data.id
   } catch (error) {
     errorMessage.value = getErrorMessage(error, t('projectDetail.termExtraction.errors.createBase'))
+    return null
   } finally {
     creatingBase.value = false
   }
+}
+
+async function createTermBase() {
+  await createTermBaseForCurrentSelection()
 }
 
 function removeDraft(rowId: string) {
@@ -518,19 +534,31 @@ function addEmptyDraft() {
 }
 
 async function saveTerms() {
-  if (!props.file || !selectedTermBaseId.value || saving.value) {
+  if (!props.file || saving.value || extracting.value || saveableCount.value === 0) {
     return
   }
 
   saving.value = true
   errorMessage.value = ''
   saveResult.value = null
-  const targetTermBaseId = selectedTermBaseId.value
   try {
-    await ensureTermBaseWritable(targetTermBaseId)
+    let targetTermBaseId = selectedTermBaseId.value
+    if (!targetTermBaseId && showCreateTermBaseFields.value) {
+      targetTermBaseId = await createTermBaseForCurrentSelection({ showToast: false }) || ''
+    }
+    if (!targetTermBaseId) {
+      errorMessage.value = t('projectDetail.termExtraction.selectBase')
+      return
+    }
+    const writableReady = await ensureTermBaseWritable(targetTermBaseId)
+    if (!writableReady) {
+      errorMessage.value = '目标术语库绑定失败，请确认当前任务仍有写入权限。'
+      return
+    }
     const { data } = await http.post<TermBatchSaveResult>(
-      `/term-bases/${targetTermBaseId}/entries/batch`,
+      `/file-records/${props.file.id}/term-extraction/save`,
       {
+        term_base_id: targetTermBaseId,
         entries: drafts.value.map((draft) => ({
           source_text: draft.source_text,
           target_text: draft.target_text,

@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     llm_max_concurrency: int = 5
     llm_temperature: float = 0.2
     llm_retry_attempts_per_provider: int = 2
+    languagetool_base_url: str | None = None
+    languagetool_timeout_seconds: float = 10.0
+    languagetool_max_text_length: int = 20000
     redis_url: str | None = None
     import_queue_backend: str = "local"
     aspose_words_license_path: str | None = None

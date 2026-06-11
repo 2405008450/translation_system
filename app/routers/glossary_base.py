@@ -16,6 +16,7 @@ from app.models import FileRecord, GlossaryBase, GlossaryEntry, User
 from app.services.glossary_importer import (
     XLSX_EXTENSIONS,
     import_glossary_from_xlsx_upload,
+    preview_glossary_from_xlsx_upload,
 )
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import normalize_match_text, normalize_text
@@ -269,6 +270,84 @@ def delete_glossary_base(
     db.delete(glossary_base)
     db.commit()
     return {"message": "词汇表已删除。", "deleted_entries": entry_count}
+
+
+@router.post("/glossary-bases/import-xlsx/preview")
+@router.post("/glossary-bases/import/preview", include_in_schema=False)
+async def preview_glossary_base_xlsx(
+    file: UploadFile = File(...),
+    glossary_base_id: UUID | None = Form(default=None),
+    source_language: str = Form(...),
+    target_language: str = Form(...),
+    preview_limit: int = Form(default=100),
+    skip_header: bool = Form(default=False),
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
+    if extension not in XLSX_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="仅支持上传 .xlsx 文件。")
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="上传的 XLSX 文件为空。")
+
+    glossary_base = _get_glossary_base_or_404(db, glossary_base_id) if glossary_base_id else None
+    if glossary_base is not None and glossary_base.source_language and glossary_base.target_language:
+        resolved_source_language, resolved_target_language = _require_glossary_language_pair(
+            source_language,
+            target_language,
+        )
+        if (
+            resolved_source_language != glossary_base.source_language
+            or resolved_target_language != glossary_base.target_language
+        ):
+            raise HTTPException(status_code=400, detail="所选词汇表的语言对与本次导入不一致。")
+    else:
+        resolved_source_language, resolved_target_language = _require_glossary_language_pair(
+            source_language,
+            target_language,
+        )
+
+    try:
+        preview = preview_glossary_from_xlsx_upload(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=file.filename or "uploaded.xlsx",
+            glossary_base_id=glossary_base_id,
+            source_language=resolved_source_language,
+            target_language=resolved_target_language,
+            preview_limit=max(1, min(preview_limit, 500)),
+            skip_header=skip_header,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"词汇表预览失败：{exc}") from exc
+
+    return {
+        "filename": preview.filename,
+        "rows": [
+            {
+                "row_index": row.row_index,
+                "source_text": row.source_text,
+                "target_text": row.target_text,
+                "note": row.note,
+                "status": row.status,
+                "message": row.message,
+            }
+            for row in preview.rows
+        ],
+        "total_rows": preview.total_rows,
+        "valid_rows": preview.valid_rows,
+        "create_rows": preview.create_rows,
+        "update_rows": preview.update_rows,
+        "duplicate_rows": preview.duplicate_rows,
+        "skipped_empty_rows": preview.skipped_empty_rows,
+        "skipped_header_rows": preview.skipped_header_rows,
+        "preview_limit": preview.preview_limit,
+        "glossary_base_id": str(glossary_base.id) if glossary_base else None,
+        "glossary_base_name": glossary_base.name if glossary_base else "",
+        "source_language": resolved_source_language,
+        "target_language": resolved_target_language,
+    }
 
 
 @router.post("/glossary-bases/import-xlsx")
