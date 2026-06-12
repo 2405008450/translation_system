@@ -375,27 +375,6 @@ const overrides = {
     uiChinese: '中文',
     uiEnglish: 'English',
   },
-  resourceCreate: {
-    termBase: 'Termbase',
-    glossary: 'Glossary',
-    dialogTitle: 'Create {type}',
-    dialogDescription: 'Create a new {type} and optionally upload data file.',
-    languagePairHint: 'Language pair will match the selected files',
-    name: 'Name',
-    namePlaceholder: 'Enter {type} name',
-    description: 'Description',
-    descriptionPlaceholder: 'Optional, briefly describe the purpose or content',
-    importFile: 'Import data (optional)',
-    importFileHint: 'Supports .xlsx, .xls, .csv formats, auto-imported after creation',
-    selectFile: 'Select file',
-    create: 'Create',
-    errors: {
-      createFailed: 'Creation failed, please try again later.',
-      createFailedTitle: '{type} creation failed',
-      importFailed: 'Data import failed, but the resource was created successfully.',
-      importFailedTitle: 'Data import failed',
-    },
-  },
 } satisfies LocaleTree
 
 const phraseOverrides: Record<string, string> = {

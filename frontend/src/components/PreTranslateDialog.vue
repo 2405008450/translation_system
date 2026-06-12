@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { BookOpen, BookOpenCheck, Bot, Check, Database, Loader2, Plus, Search, Sparkles, Upload, X } from 'lucide-vue-next'
+import { BookOpen, BookOpenCheck, Bot, Check, Database, Loader2, Search, Sparkles, Upload, X } from 'lucide-vue-next'
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
@@ -12,7 +12,6 @@ import { consumeLLMStream } from '../utils/llmStream'
 import { isProgressComplete } from '../utils/progress'
 import ResourceImportDialog from './ResourceImportDialog.vue'
 import Modal from './base/Modal.vue'
-import ResourceCreateDialog from './ResourceCreateDialog.vue'
 
 interface ProjectFileItem {
   id: string
@@ -109,9 +108,6 @@ const activeResourceImportTab = ref<ResourceImportTab | null>(null)
 
 const progressByFileId = ref<Record<string, number>>({})
 const statusByFileId = ref<Record<string, string>>({})
-
-const showTermBaseCreateDialog = ref(false)
-const showGlossaryCreateDialog = ref(false)
 
 const llmProviderOptions = computed<Array<{ value: LLMProvider, label: string }>>(() => [
   { value: 'deepseek', label: t('projectDetail.preTranslate.llm.providers.deepseek') },
@@ -1086,47 +1082,6 @@ function stopPreTranslate() {
   currentAbortController.value?.abort()
 }
 
-function openTermBaseCreateDialog() {
-  showTermBaseCreateDialog.value = true
-}
-
-function openGlossaryCreateDialog() {
-  showGlossaryCreateDialog.value = true
-}
-
-async function handleTermBaseCreated(newTermBase: TermBase) {
-  showTermBaseCreateDialog.value = false
-  await loadResources()
-  if (resourceMatchesSelectedLanguagePair(newTermBase)) {
-    termBaseIds.value = normalizeResourceIds(
-      [...termBaseIds.value, newTermBase.id],
-      availableTermBases.value,
-    )
-    useTermBase.value = true
-  }
-  pushToast({
-    tone: 'success',
-    title: t('projectDetail.preTranslate.toast.termBaseCreatedTitle'),
-    message: t('projectDetail.preTranslate.toast.termBaseCreatedMessage', { name: newTermBase.name }),
-  })
-}
-
-async function handleGlossaryCreated(newGlossary: GlossaryBase) {
-  showGlossaryCreateDialog.value = false
-  await loadResources()
-  if (resourceMatchesSelectedLanguagePair(newGlossary)) {
-    glossaryBaseIds.value = normalizeResourceIds(
-      [...glossaryBaseIds.value, newGlossary.id],
-      availableGlossaryBases.value,
-    )
-    useGlossary.value = true
-  }
-  pushToast({
-    tone: 'success',
-    title: t('projectDetail.preTranslate.toast.glossaryCreatedTitle'),
-    message: t('projectDetail.preTranslate.toast.glossaryCreatedMessage', { name: newGlossary.name }),
-  })
-}
 </script>
 
 <template>
@@ -1322,27 +1277,18 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
                 :placeholder="t('projectDetail.preTranslate.glossary.searchPlaceholder')"
                 :disabled="running || loadingResources || !useGlossary"
               />
-              </label>
-              <div class="ptd-resource__buttons">
-                <button
-                  class="button button--ghost ptd-resource__button ptd-resource__button--import"
-                  type="button"
-                  :disabled="running || loadingResources || Boolean(languagePairIssue)"
-                  @click="openResourceImport('glossary')"
-                >
-                  <Upload :size="14" />
-                  {{ t('common.actions.import') }}
-                </button>
-                <button
-                  class="button button--ghost ptd-resource__button ptd-resource__button--create"
-                  type="button"
-                  :disabled="running || loadingResources || !useGlossary || !selectedFileLanguagePair"
-                @click="openGlossaryCreateDialog"
-                >
-                  <Plus :size="14" />
-                  {{ t('projectDetail.preTranslate.resources.create') }}
-                </button>
-                <button
+            </label>
+            <div class="ptd-resource__buttons">
+              <button
+                class="button button--ghost ptd-resource__button ptd-resource__button--import"
+                type="button"
+                :disabled="running || loadingResources || Boolean(languagePairIssue)"
+                @click="openResourceImport('glossary')"
+              >
+                <Upload :size="14" />
+                {{ t('common.actions.import') }}
+              </button>
+              <button
                 class="button button--ghost ptd-resource__button ptd-resource__button--select"
                 type="button"
                 :disabled="running || loadingResources || !useGlossary || availableGlossaryBases.length === 0"
@@ -1440,27 +1386,18 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
                 :placeholder="t('projectDetail.preTranslate.termBase.searchPlaceholder')"
                 :disabled="running || loadingResources || !useTermBase"
               />
-              </label>
-              <div class="ptd-resource__buttons">
-                <button
-                  class="button button--ghost ptd-resource__button ptd-resource__button--import"
-                  type="button"
-                  :disabled="running || loadingResources || Boolean(languagePairIssue)"
-                  @click="openResourceImport('term')"
-                >
-                  <Upload :size="14" />
-                  {{ t('common.actions.import') }}
-                </button>
-                <button
-                  class="button button--ghost ptd-resource__button ptd-resource__button--create"
-                  type="button"
-                  :disabled="running || loadingResources || !useTermBase || !selectedFileLanguagePair"
-                @click="openTermBaseCreateDialog"
-                >
-                  <Plus :size="14" />
-                  {{ t('projectDetail.preTranslate.resources.create') }}
-                </button>
-                <button
+            </label>
+            <div class="ptd-resource__buttons">
+              <button
+                class="button button--ghost ptd-resource__button ptd-resource__button--import"
+                type="button"
+                :disabled="running || loadingResources || Boolean(languagePairIssue)"
+                @click="openResourceImport('term')"
+              >
+                <Upload :size="14" />
+                {{ t('common.actions.import') }}
+              </button>
+              <button
                 class="button button--ghost ptd-resource__button ptd-resource__button--select"
                 type="button"
                 :disabled="running || loadingResources || !useTermBase || availableTermBases.length === 0"
@@ -1689,24 +1626,6 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
     :target-language="selectedFileLanguagePair?.target || props.targetLanguage"
     @close="closeResourceImport"
     @imported="handleResourceImported"
-  />
-
-  <ResourceCreateDialog
-    :open="showTermBaseCreateDialog"
-    resource-type="termBase"
-    :source-language="selectedFileLanguagePair?.source || ''"
-    :target-language="selectedFileLanguagePair?.target || ''"
-    @close="showTermBaseCreateDialog = false"
-    @created="handleTermBaseCreated"
-  />
-
-  <ResourceCreateDialog
-    :open="showGlossaryCreateDialog"
-    resource-type="glossary"
-    :source-language="selectedFileLanguagePair?.source || ''"
-    :target-language="selectedFileLanguagePair?.target || ''"
-    @close="showGlossaryCreateDialog = false"
-    @created="handleGlossaryCreated"
   />
 </template>
 
@@ -2087,18 +2006,6 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
   border-color: color-mix(in srgb, var(--state-danger) 18%, var(--line-strong));
   background: color-mix(in srgb, var(--surface-panel) 86%, var(--state-danger-bg) 14%);
   color: color-mix(in srgb, var(--state-danger) 68%, var(--text-primary));
-}
-
-.ptd-resource__button--create {
-  border-color: color-mix(in srgb, var(--state-success) 14%, var(--line-soft));
-  background: color-mix(in srgb, var(--surface-panel) 88%, var(--state-success-bg) 12%);
-  color: color-mix(in srgb, var(--state-success) 72%, var(--text-secondary));
-}
-
-.ptd-resource__button--create:not(:disabled):hover {
-  border-color: color-mix(in srgb, var(--state-success) 28%, var(--line-strong));
-  background: color-mix(in srgb, var(--surface-panel) 76%, var(--state-success-bg) 24%);
-  color: var(--state-success);
 }
 
 .ptd-resource__note {
