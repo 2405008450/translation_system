@@ -1184,6 +1184,8 @@ class TMCollection(Base):
     __table_args__ = (
         Index("uq_memory_bases_name", "name", unique=True),
         Index("ix_memory_bases_language_pair", "source_language", "target_language"),
+        Index("ix_memory_bases_project_id", "project_id"),
+        Index("ix_memory_bases_origin", "origin"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -1196,6 +1198,17 @@ class TMCollection(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
     target_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    origin: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="manual",
+        server_default=text("'manual'"),
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -1496,6 +1509,8 @@ class GlossaryBase(Base):
     __table_args__ = (
         Index("uq_glossary_bases_name", "name", unique=True),
         Index("ix_glossary_bases_language_pair", "source_language", "target_language"),
+        Index("ix_glossary_bases_project_id", "project_id"),
+        Index("ix_glossary_bases_origin", "origin"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -1508,6 +1523,17 @@ class GlossaryBase(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_language: Mapped[str] = mapped_column(String(20), nullable=False)
     target_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    origin: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="manual",
+        server_default=text("'manual'"),
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -1586,6 +1612,7 @@ class ReferenceProfile(Base):
     __tablename__ = "reference_profiles"
     __table_args__ = (
         Index("ix_reference_profiles_file_record_id", "file_record_id"),
+        Index("ix_reference_profiles_project_id", "project_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -1599,6 +1626,21 @@ class ReferenceProfile(Base):
         ForeignKey("file_records.id", ondelete="CASCADE"),
         nullable=True,
     )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    glossary_base_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("glossary_bases.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    memory_base_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("memory_bases.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     source_files: Mapped[str] = mapped_column(
         Text, nullable=False, default="[]", server_default=text("'[]'")
     )
@@ -1610,7 +1652,6 @@ class ReferenceProfile(Base):
     )
     style_guide: Mapped[str | None] = mapped_column(Text, nullable=True)
     analysis_report: Mapped[str | None] = mapped_column(Text, nullable=True)
-    match_result: Mapped[str | None] = mapped_column(Text, nullable=True)  # 匹配结果JSON
     overall_confidence: Mapped[float] = mapped_column(
         nullable=False, default=0.0, server_default=text("0.0")
     )

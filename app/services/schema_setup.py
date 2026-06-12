@@ -25,7 +25,7 @@ LEGACY_REQUIRED_EXISTING_TABLES = (
     "translation_memory_entries",
 )
 REQUIRED_SCHEMA = {
-    "memory_bases": {"source_language", "target_language"},
+    "memory_bases": {"source_language", "target_language", "project_id", "origin"},
     "memory_entries": {"source_language", "target_language"},
     "term_bases": {
         "id",
@@ -46,6 +46,8 @@ REQUIRED_SCHEMA = {
         "name",
         "source_language",
         "target_language",
+        "project_id",
+        "origin",
     },
     "glossary_entries": {
         "id",
@@ -322,6 +324,11 @@ REQUIRED_SCHEMA = {
         "error_message",
         "created_at",
         "updated_at",
+    },
+    "reference_profiles": {
+        "project_id",
+        "glossary_base_id",
+        "memory_base_id",
     },
 }
 
@@ -2116,6 +2123,58 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_auto_tm_rematch_queue_first_pending_at
             ON auto_tm_rematch_queue (first_pending_at)
+            """,
+            """
+            ALTER TABLE IF EXISTS memory_bases
+            ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS memory_bases
+            ADD COLUMN IF NOT EXISTS origin VARCHAR(20) NOT NULL DEFAULT 'manual'
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_memory_bases_project_id
+            ON memory_bases (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_memory_bases_origin
+            ON memory_bases (origin)
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_bases
+            ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_bases
+            ADD COLUMN IF NOT EXISTS origin VARCHAR(20) NOT NULL DEFAULT 'manual'
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_bases_project_id
+            ON glossary_bases (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_bases_origin
+            ON glossary_bases (origin)
+            """,
+            """
+            ALTER TABLE IF EXISTS reference_profiles
+            ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS reference_profiles
+            ADD COLUMN IF NOT EXISTS glossary_base_id UUID REFERENCES glossary_bases(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS reference_profiles
+            ADD COLUMN IF NOT EXISTS memory_base_id UUID REFERENCES memory_bases(id) ON DELETE SET NULL
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_reference_profiles_project_id
+            ON reference_profiles (project_id)
+            """,
+            """
+            ALTER TABLE IF EXISTS reference_profiles
+            DROP COLUMN IF EXISTS match_result
             """,
         ]
     )

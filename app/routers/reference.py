@@ -16,11 +16,10 @@ from sqlalchemy.orm import Session
 from app.auth import get_current_user
 from app.config import get_settings
 from app.database import get_db
-from app.models import FileRecord, ReferenceFile, ReferenceProfile, Segment, SegmentRevision, User
+from app.models import FileRecord, Project, ReferenceFile, ReferenceProfile, Segment, SegmentRevision, User
 from app.services.reference_analyzer.service import (
     analyze_reference_files,
     get_reference_llm_helper,
-    match_segments_with_reference,
     profile_to_dict,
 )
 from app.services.reference_analyzer.progress import (
@@ -35,6 +34,10 @@ from app.services.llm_service import (
     LLMTranslationTask,
     iter_batch_translate,
     validate_provider_choice,
+)
+from app.services.reference_sync_service import (
+    cleanup_reference_profile_resources,
+    sync_reference_profile_resources,
 )
 from app.services.file_operation_lock_service import (
     FILE_OPERATION_TOKEN_HEADER,
@@ -67,26 +70,6 @@ class AnalyzeResponse(BaseModel):
     style: Optional[dict]
     analysis_report: Optional[dict]
     overall_confidence: float
-
-
-class MatchResultResponse(BaseModel):
-    exact_matches: List[dict]
-    fuzzy_matches: List[dict]
-    term_matches: List[dict]
-    exact_count: int
-    fuzzy_count: int
-    term_count: int
-
-
-class ApplyMatchesRequest(BaseModel):
-    profile_id: str
-    apply_exact: bool = True
-    exact_match_ids: Optional[List[str]] = None
-
-
-class ApplyMatchesResponse(BaseModel):
-    applied_count: int
-    skipped_count: int
 
 
 @router.post("/file-records/{file_record_id}/upload", response_model=dict)
@@ -307,9 +290,57 @@ async def analyze_reference(
             "overall_confidence": 0.0
         }, ensure_ascii=False)
         profile.overall_confidence = 0.0
-    
-    db.commit()
-    
+
+    # 把术语和翻译记忆同步到项目级的词汇表/记忆库，让翻译流程通过原生通道命中。
+    # 文件不属于任何项目时，sync 会自动跳过；同步失败不阻塞分析结果保存。
+    file_record = (
+        db.execute(
+            select(FileRecord).where(FileRecord.id == uuid.UUID(file_record_id))
+        )
+        .scalar_one_or_none()
+    )
+    project = None
+    if file_record is not None and file_record.project_id is not None:
+        project = (
+            db.execute(select(Project).where(Project.id == file_record.project_id))
+            .scalar_one_or_none()
+        )
+
+    # 先把 profile 的修改 flush 进当前事务，再尝试同步；失败则回滚同步引发的脏状态。
+    db.flush()
+    sync_savepoint = db.begin_nested()
+    try:
+        sync_reference_profile_resources(
+            db,
+            profile,
+            project=project,
+            source_language=file_record.source_language if file_record else None,
+            target_language=file_record.target_language if file_record else None,
+            creator_id=getattr(current_user, "id", None),
+            terminology=[
+                {
+                    "source": t.source,
+                    "target": t.target,
+                    "context": t.context,
+                    "category": t.category,
+                }
+                for t in translation_profile.constraints.terminology
+            ],
+            translation_memory=[
+                {"source": p.source, "target": p.target}
+                for p in translation_profile.references.translation_memory
+            ],
+        )
+        sync_savepoint.commit()
+    except Exception as exc:  # 同步失败不阻塞分析结果保存，但要记录日志
+        sync_savepoint.rollback()
+        logger.warning(
+            "参考分析同步到词汇表/记忆库失败 profile_id=%s error=%s",
+            profile.id,
+            exc,
+        )
+
+    db.commit()    
     return AnalyzeResponse(
         profile_id=str(profile.id),
         source_files=translation_profile.source_files,
@@ -385,194 +416,6 @@ async def list_reference_files(
     ]
 
 
-@router.post("/file-records/{file_record_id}/match", response_model=MatchResultResponse)
-async def match_with_reference(
-    file_record_id: str,
-    exact_threshold: float = 1.0,
-    fuzzy_threshold: float = 0.6,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """将当前任务句段与参考进行匹配"""
-    profile_record = db.execute(
-        select(ReferenceProfile).where(
-            ReferenceProfile.file_record_id == uuid.UUID(file_record_id)
-        )
-    ).scalar_one_or_none()
-    
-    if not profile_record:
-        raise HTTPException(status_code=404, detail="未找到参考分析结果，请先上传并分析参考文件")
-    
-    # 加载句段
-    segments = db.execute(
-        select(Segment).where(Segment.file_record_id == uuid.UUID(file_record_id))
-    ).scalars().all()
-    
-    if not segments:
-        return MatchResultResponse(
-            exact_matches=[], fuzzy_matches=[], term_matches=[],
-            exact_count=0, fuzzy_count=0, term_count=0
-        )
-    
-    # 重建 TranslationProfile 对象
-    from app.services.reference_analyzer.schema import (
-        TranslationProfile, Constraints, References, TermEntry, SentencePair, StyleGuide
-    )
-    
-    terminology = []
-    if profile_record.terminology:
-        for t in json.loads(profile_record.terminology):
-            terminology.append(TermEntry(
-                source=t.get("source", ""),
-                target=t.get("target", ""),
-                context=t.get("context"),
-                category=t.get("category"),
-            ))
-    
-    tm = []
-    if profile_record.translation_memory:
-        for p in json.loads(profile_record.translation_memory):
-            tm.append(SentencePair(
-                source=p.get("source", ""),
-                target=p.get("target", ""),
-                similarity=p.get("similarity", 0.0),
-            ))
-    
-    style = None
-    if profile_record.style_guide:
-        style_data = json.loads(profile_record.style_guide)
-        style = StyleGuide(
-            tone=style_data.get("tone"),
-            person=style_data.get("person"),
-            preferences=style_data.get("preferences", []),
-            avoid=style_data.get("avoid", []),
-        )
-    
-    profile = TranslationProfile(
-        constraints=Constraints(terminology=terminology),
-        references=References(translation_memory=tm, style=style),
-        source_files=json.loads(profile_record.source_files) if profile_record.source_files else [],
-    )
-    
-    # 执行匹配
-    segments_data = [
-        {"sentence_id": str(seg.sentence_id), "source_text": seg.source_text}
-        for seg in segments
-    ]
-    
-    result = match_segments_with_reference(
-        segments_data, profile, exact_threshold, fuzzy_threshold
-    )
-    
-    # 保存匹配结果到数据库
-    match_result_data = {
-        "exact_matches": result["exact_matches"],
-        "fuzzy_matches": result["fuzzy_matches"],
-        "term_matches": result["term_matches"],
-        "exact_count": len(result["exact_matches"]),
-        "fuzzy_count": len(result["fuzzy_matches"]),
-        "term_count": len(result["term_matches"]),
-    }
-    profile_record.match_result = json.dumps(match_result_data, ensure_ascii=False)
-    db.commit()
-    
-    return MatchResultResponse(
-        exact_matches=result["exact_matches"],
-        fuzzy_matches=result["fuzzy_matches"],
-        term_matches=result["term_matches"],
-        exact_count=len(result["exact_matches"]),
-        fuzzy_count=len(result["fuzzy_matches"]),
-        term_count=len(result["term_matches"]),
-    )
-
-
-@router.get("/file-records/{file_record_id}/match-result", response_model=Optional[MatchResultResponse])
-async def get_match_result(
-    file_record_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """获取已保存的匹配结果"""
-    profile_record = db.execute(
-        select(ReferenceProfile).where(
-            ReferenceProfile.file_record_id == uuid.UUID(file_record_id)
-        )
-    ).scalar_one_or_none()
-    
-    if not profile_record or not profile_record.match_result:
-        return None
-    
-    try:
-        match_data = json.loads(profile_record.match_result)
-        return MatchResultResponse(
-            exact_matches=match_data.get("exact_matches", []),
-            fuzzy_matches=match_data.get("fuzzy_matches", []),
-            term_matches=match_data.get("term_matches", []),
-            exact_count=match_data.get("exact_count", 0),
-            fuzzy_count=match_data.get("fuzzy_count", 0),
-            term_count=match_data.get("term_count", 0),
-        )
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-
-@router.post("/file-records/{file_record_id}/apply", response_model=ApplyMatchesResponse)
-async def apply_reference_matches(
-    file_record_id: str,
-    request: ApplyMatchesRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """将精确匹配的参考译文应用到句段"""
-    profile_record = db.execute(
-        select(ReferenceProfile).where(ReferenceProfile.id == uuid.UUID(request.profile_id))
-    ).scalar_one_or_none()
-    
-    if not profile_record:
-        raise HTTPException(status_code=404, detail="参考分析结果不存在")
-    
-    if not request.apply_exact:
-        return ApplyMatchesResponse(applied_count=0, skipped_count=0)
-    
-    # 重建 TM 查找表
-    tm_lookup = {}
-    if profile_record.translation_memory:
-        for p in json.loads(profile_record.translation_memory):
-            normalized = p.get("source", "").strip().lower()
-            if normalized:
-                tm_lookup[normalized] = p.get("target", "")
-    
-    # 获取并更新句段
-    segments = db.execute(
-        select(Segment).where(Segment.file_record_id == uuid.UUID(file_record_id))
-    ).scalars().all()
-    
-    applied_count = 0
-    skipped_count = 0
-    
-    for seg in segments:
-        if not seg.source_text:
-            continue
-        
-        normalized_source = seg.source_text.strip().lower()
-        
-        if normalized_source in tm_lookup:
-            # 检查是否只应用特定 ID
-            if request.exact_match_ids and str(seg.sentence_id) not in request.exact_match_ids:
-                skipped_count += 1
-                continue
-            
-            # 更新译文
-            seg.target_text = tm_lookup[normalized_source]
-            applied_count += 1
-        else:
-            skipped_count += 1
-    
-    db.commit()
-    
-    return ApplyMatchesResponse(applied_count=applied_count, skipped_count=skipped_count)
-
-
 @router.get("/file-records/{file_record_id}/terminology", response_model=List[dict])
 async def get_reference_terminology(
     file_record_id: str,
@@ -634,6 +477,9 @@ async def delete_reference_profile(
     if os.path.exists(storage_dir):
         shutil.rmtree(storage_dir, ignore_errors=True)
     
+    # 清理同步出来的项目级词汇表/记忆库及文件层绑定
+    cleanup_reference_profile_resources(db, profile)
+
     # 删除数据库记录
     db.execute(
         ReferenceFile.__table__.delete().where(ReferenceFile.profile_id == profile.id)
@@ -820,40 +666,8 @@ def _build_reference_translation_guidelines(
         except (json.JSONDecodeError, TypeError):
             pass
     
-    # 3. 术语表
-    if profile_record.terminology:
-        try:
-            terms = json.loads(profile_record.terminology)
-            if terms:
-                # 按类别分组
-                categorized = {}
-                for t in terms:
-                    cat = t.get("category", "通用")
-                    if cat not in categorized:
-                        categorized[cat] = []
-                    categorized[cat].append(t)
-                
-                term_sections = []
-                for cat, cat_terms in categorized.items():
-                    term_lines = [f"    {t['source']} → {t['target']}" for t in cat_terms[:15]]
-                    term_sections.append(f"  [{cat}]\n" + "\n".join(term_lines))
-                
-                parts.append("【术语表】请严格按以下术语翻译：\n" + "\n".join(term_sections[:5]))
-        except (json.JSONDecodeError, TypeError):
-            pass
-    
-    # 4. 翻译记忆参考
-    if profile_record.translation_memory:
-        try:
-            tm = json.loads(profile_record.translation_memory)
-            if tm:
-                # 选取部分高质量的翻译记忆作为参考
-                sample_tm = tm[:10]
-                tm_lines = [f"  原文: {p['source'][:80]}{'...' if len(p['source']) > 80 else ''}\n  译文: {p['target'][:80]}{'...' if len(p['target']) > 80 else ''}" 
-                           for p in sample_tm]
-                parts.append("【翻译记忆参考】以下是参考文件中的译法示例，请参考其风格：\n" + "\n\n".join(tm_lines))
-        except (json.JSONDecodeError, TypeError):
-            pass
+    # 注：术语表和翻译记忆已经被同步到项目级 GlossaryBase / TMCollection，
+    # 翻译时通过原生通道（智能注入 / 模糊匹配改写）使用，这里不再重复注入到 prompt。
     
     # 5. 临时提示词
     if temporary_prompt.strip():

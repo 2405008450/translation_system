@@ -442,7 +442,6 @@ const addTermFormError = ref('')
 const termsMessage = ref(t('workbench.terms.defaultMessage'))
 
 // 参考文件匹配结果
-const referenceMatchResult = ref<import('../types/api').ReferenceMatchResult | null>(null)
 
 let searchLoadRequestId = 0
 let suppressSegmentFilterWatch = false
@@ -3199,9 +3198,6 @@ async function loadTask() {
 
     await loadTermBases()
     await loadLatestTermQAReport()
-    
-    // 加载参考文件匹配结果
-    await loadReferenceMatchResult()
 
     const boundTermBaseId = segmentStore.fileRecord?.term_base_id
     if (boundTermBaseId) {
@@ -3748,57 +3744,7 @@ function handleAppendText(text: string) {
 }
 
 // 加载参考文件匹配结果（工作台初始化时调用）
-async function loadReferenceMatchResult() {
-  const fileRecordId = segmentStore.fileRecord?.id
-  if (!fileRecordId) return
-  
-  try {
-    const res = await http.get<import('../types/api').ReferenceMatchResult | null>(
-      `/reference/file-records/${fileRecordId}/match-result`
-    )
-    if (res.data) {
-      referenceMatchResult.value = res.data
-    }
-  } catch {
-    // 没有匹配结果或加载失败，静默处理
-    referenceMatchResult.value = null
-  }
-}
-
-// 参考文件匹配处理
-function handleReferenceMatchesLoaded(matches: import('../types/api').ReferenceMatchResult) {
-  // 保存匹配结果供 WorkbenchMatchPanel 使用
-  referenceMatchResult.value = matches
-  
-  // 匹配结果加载后显示详细提示
-  const messages: string[] = []
-  
-  if (matches.exact_count > 0) {
-    messages.push(`精确匹配 ${matches.exact_count} 条`)
-  }
-  if (matches.fuzzy_count > 0) {
-    messages.push(`模糊匹配 ${matches.fuzzy_count} 条`)
-  }
-  if (matches.term_count > 0) {
-    messages.push(`术语匹配 ${matches.term_count} 条`)
-  }
-  
-  if (messages.length > 0) {
-    toast.info(`参考匹配完成: ${messages.join('，')}`)
-  } else {
-    toast.info('未找到匹配的参考内容')
-  }
-}
-
-async function handleReferenceApplyExactMatches() {
-  // 精确匹配应用后重新加载句段
-  toast.success('精确匹配已应用，正在刷新...')
-  await segmentStore.fetchSegments({ 
-    fileRecordId: props.id, 
-    skip: 0, 
-    limit: segmentStore.pageSize 
-  })
-}
+// 已废弃：参考资料分析后会自动同步到项目级 TM/术语库，匹配通过原生通道命中。
 
 async function handleReferenceAITranslateComplete(result: { updated_count: number; error_count: number }) {
   // AI翻译完成后重新加载句段
@@ -5440,7 +5386,6 @@ onBeforeRouteLeave(async () => {
             :term-entries="termEntries"
             :active-source-text="activeSegmentSourceText"
             :file-record-id="segmentStore.fileRecord?.id || null"
-            :reference-match-result="referenceMatchResult"
             @replace-text="handleReplaceText"
             @append-text="handleAppendText"
           />
@@ -5547,8 +5492,6 @@ onBeforeRouteLeave(async () => {
             v-else-if="activeSideTool === 'reference'"
             key="reference"
             :file-record-id="segmentStore.fileRecord?.id || null"
-            @matches-loaded="handleReferenceMatchesLoaded"
-            @apply-exact-matches="handleReferenceApplyExactMatches"
             @ai-translate-complete="handleReferenceAITranslateComplete"
           />
         </Transition>

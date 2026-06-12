@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
-import type { Segment, TermEntryRecord, TMMatchCandidate, ReferenceMatchResult, ReferenceExactMatch, ReferenceFuzzyMatch, ReferenceTermMatch } from '../types/api'
+import type { Segment, TermEntryRecord, TMMatchCandidate } from '../types/api'
 import { http } from '../api/http'
 import DiffText from './DiffText.vue'
 
@@ -15,7 +15,6 @@ const props = defineProps<{
   termEntries: TermEntryRecord[]
   activeSourceText: string
   fileRecordId: string | null
-  referenceMatchResult: ReferenceMatchResult | null
 }>()
 
 const emit = defineEmits<{
@@ -42,31 +41,6 @@ const matchedTerms = computed(() => {
     .filter((entry) => sourceText.includes(entry.source_text.toLowerCase()))
     .slice()
     .sort((left, right) => right.source_text.length - left.source_text.length)
-})
-
-// 当前句段的参考匹配结果
-const currentSegmentRefExactMatch = computed<ReferenceExactMatch | null>(() => {
-  if (!props.referenceMatchResult || !props.segment) return null
-  const sentenceId = props.segment.sentence_id
-  return props.referenceMatchResult.exact_matches.find(m => m.segment_id === sentenceId) || null
-})
-
-const currentSegmentRefFuzzyMatches = computed<ReferenceFuzzyMatch[]>(() => {
-  if (!props.referenceMatchResult || !props.segment) return []
-  const sentenceId = props.segment.sentence_id
-  return props.referenceMatchResult.fuzzy_matches.filter(m => m.segment_id === sentenceId)
-})
-
-const currentSegmentRefTermMatch = computed<ReferenceTermMatch | null>(() => {
-  if (!props.referenceMatchResult || !props.segment) return null
-  const sentenceId = props.segment.sentence_id
-  return props.referenceMatchResult.term_matches.find(m => m.segment_id === sentenceId) || null
-})
-
-const hasReferenceMatches = computed(() => {
-  return currentSegmentRefExactMatch.value !== null 
-    || currentSegmentRefFuzzyMatches.value.length > 0 
-    || currentSegmentRefTermMatch.value !== null
 })
 
 watch(
@@ -123,14 +97,6 @@ function handleTMApply(candidate: TMMatchCandidate) {
 
 function handleTermApply(term: TermEntryRecord) {
   emit('appendText', term.target_text)
-}
-
-function handleRefTMApply(target: string) {
-  emit('replaceText', target)
-}
-
-function handleRefTermApply(target: string) {
-  emit('appendText', target)
 }
 
 function getMatchScoreClass(score: number): string {
@@ -282,138 +248,6 @@ function getMatchScoreClass(score: number): string {
         </div>
       </section>
 
-      <!-- 参考文件匹配 -->
-      <section v-if="hasReferenceMatches" class="match-section">
-        <h4 class="match-section__title match-section__title--reference">参考文件匹配</h4>
-
-        <!-- 参考精确匹配 -->
-        <template v-if="currentSegmentRefExactMatch">
-          <div class="ref-match-subsection">
-            <div class="ref-match-subsection__label ref-match-subsection__label--exact">精确匹配 (100%)</div>
-            <div 
-              class="candidate-item candidate-item--ref-exact"
-              @dblclick="handleRefTMApply(currentSegmentRefExactMatch.target)"
-            >
-              <div class="candidate-item__header">
-                <div class="candidate-item__meta">
-                  <span class="candidate-item__meta-item">来源: {{ currentSegmentRefExactMatch.source_file || '参考文件' }}</span>
-                </div>
-                <button
-                  class="button candidate-item__action"
-                  type="button"
-                  @click.stop="handleRefTMApply(currentSegmentRefExactMatch.target)"
-                >
-                  应用
-                </button>
-              </div>
-              <div class="candidate-item__body">
-                <div class="candidate-item__panel candidate-item__panel--source">
-                  <div class="candidate-item__panel-label">原文</div>
-                  <div class="candidate-item__target-text">{{ currentSegmentRefExactMatch.source }}</div>
-                </div>
-                <div class="candidate-item__score-column">
-                  <span class="candidate-item__score exact">100%</span>
-                </div>
-                <div class="candidate-item__panel candidate-item__panel--target">
-                  <div class="candidate-item__panel-label">参考译文</div>
-                  <div class="candidate-item__target-text">{{ currentSegmentRefExactMatch.target }}</div>
-                </div>
-              </div>
-              <div class="candidate-item__hint">双击替换当前译文</div>
-            </div>
-          </div>
-        </template>
-
-        <!-- 参考模糊匹配 -->
-        <template v-if="currentSegmentRefFuzzyMatches.length > 0">
-          <div class="ref-match-subsection">
-            <div class="ref-match-subsection__label ref-match-subsection__label--fuzzy">模糊匹配 ({{ currentSegmentRefFuzzyMatches.length }})</div>
-            <div class="candidate-list">
-              <div 
-                v-for="(match, index) in currentSegmentRefFuzzyMatches"
-                :key="index"
-                class="candidate-item candidate-item--ref-fuzzy"
-                @dblclick="handleRefTMApply(match.target)"
-              >
-                <div class="candidate-item__header">
-                  <div class="candidate-item__meta">
-                    <span class="candidate-item__meta-item">来源: {{ match.source_file || '参考文件' }}</span>
-                  </div>
-                  <button
-                    class="button candidate-item__action"
-                    type="button"
-                    @click.stop="handleRefTMApply(match.target)"
-                  >
-                    应用
-                  </button>
-                </div>
-                <div class="candidate-item__body">
-                  <div class="candidate-item__panel candidate-item__panel--source">
-                    <div class="candidate-item__panel-label">差异对比</div>
-                    <div class="candidate-item__diff">
-                      <DiffText
-                        :old-text="match.matched_source"
-                        :new-text="activeSourceText || match.source"
-                      />
-                    </div>
-                  </div>
-                  <div class="candidate-item__score-column">
-                    <span class="candidate-item__score" :class="getMatchScoreClass(match.similarity)">
-                      {{ Math.round(match.similarity * 100) }}%
-                    </span>
-                  </div>
-                  <div class="candidate-item__panel candidate-item__panel--target">
-                    <div class="candidate-item__panel-label">参考译文</div>
-                    <div class="candidate-item__target-text">{{ match.target }}</div>
-                  </div>
-                </div>
-                <div class="candidate-item__hint">双击替换当前译文</div>
-              </div>
-            </div>
-          </div>
-        </template>
-
-        <!-- 参考术语匹配 -->
-        <template v-if="currentSegmentRefTermMatch">
-          <div class="ref-match-subsection">
-            <div class="ref-match-subsection__label ref-match-subsection__label--term">术语匹配 ({{ currentSegmentRefTermMatch.terms.length }})</div>
-            <div class="term-list">
-              <div 
-                v-for="(term, index) in currentSegmentRefTermMatch.terms"
-                :key="index"
-                class="term-item term-item--ref"
-                @dblclick="handleRefTermApply(term.target)"
-              >
-                <div class="term-item__header">
-                  <div class="term-item__meta">
-                    <span class="term-item__meta-item">来源: {{ term.source_file || '参考文件' }}</span>
-                    <span v-if="term.category" class="term-item__meta-item">分类: {{ term.category }}</span>
-                  </div>
-                  <button
-                    class="button term-item__action"
-                    type="button"
-                    @click.stop="handleRefTermApply(term.target)"
-                  >
-                    应用
-                  </button>
-                </div>
-                <div class="term-item__body">
-                  <div class="term-item__panel">
-                    <div class="term-item__panel-label">原文</div>
-                    <div class="term-item__source">{{ term.source }}</div>
-                  </div>
-                  <div class="term-item__token term-item__token--ref">参考</div>
-                  <div class="term-item__panel">
-                    <div class="term-item__panel-label">译文</div>
-                    <div class="term-item__target">{{ term.target }}</div>
-                  </div>
-                </div>
-                <div class="term-item__hint">双击追加到当前译文</div>
-              </div>
-            </div>
-          </div>
-        </template>
-      </section>
     </div>
   </div>
 </template>
@@ -747,77 +581,5 @@ function getMatchScoreClass(score: number): string {
   .term-item__action {
     width: 100%;
   }
-}
-
-/* 参考文件匹配样式 */
-.match-section__title--reference {
-  color: #7c3aed;
-}
-
-.ref-match-subsection {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-
-.ref-match-subsection__label {
-  font-size: 11px;
-  font-weight: 600;
-  padding: 4px 8px;
-  border-radius: 4px;
-  width: fit-content;
-}
-
-.ref-match-subsection__label--exact {
-  background: rgba(13, 122, 104, 0.12);
-  color: #0b6b5b;
-}
-
-.ref-match-subsection__label--fuzzy {
-  background: rgba(138, 92, 246, 0.12);
-  color: #7c3aed;
-}
-
-.ref-match-subsection__label--term {
-  background: rgba(234, 179, 8, 0.15);
-  color: #a16207;
-}
-
-.candidate-item--ref-exact {
-  background: linear-gradient(180deg, rgba(240, 253, 250, 0.96), rgba(255, 255, 255, 0.98));
-  border: 1px solid rgba(13, 122, 104, 0.18);
-}
-
-.candidate-item--ref-exact:hover {
-  border-color: rgba(13, 122, 104, 0.32);
-  box-shadow: 0 10px 24px rgba(13, 122, 104, 0.1);
-}
-
-.candidate-item--ref-fuzzy {
-  background: linear-gradient(180deg, rgba(245, 243, 255, 0.96), rgba(255, 255, 255, 0.98));
-  border: 1px solid rgba(138, 92, 246, 0.16);
-}
-
-.candidate-item--ref-fuzzy:hover {
-  border-color: rgba(138, 92, 246, 0.28);
-  box-shadow: 0 10px 24px rgba(138, 92, 246, 0.1);
-}
-
-.term-item--ref {
-  background: linear-gradient(180deg, rgba(255, 251, 235, 0.96), rgba(255, 255, 255, 0.98));
-  border: 1px solid rgba(234, 179, 8, 0.2);
-}
-
-.term-item--ref:hover {
-  border-color: rgba(234, 179, 8, 0.35);
-  box-shadow: 0 10px 24px rgba(234, 179, 8, 0.1);
-}
-
-.term-item__token--ref {
-  background: linear-gradient(180deg, rgba(138, 92, 246, 0.12), rgba(138, 92, 246, 0.06));
-  border: 1px solid rgba(138, 92, 246, 0.18);
-  color: #7c3aed;
-  font-size: 11px;
 }
 </style>

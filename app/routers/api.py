@@ -157,6 +157,7 @@ from app.services.guideline_repository import (
     update_guideline_template,
 )
 from app.services.glossary_matcher import build_glossary_matches_by_text
+from app.services.reference_sync_service import attach_project_reference_bases_to_file
 from app.services.llm_service import (
     LLMConfigurationError,
     LLMRequestError,
@@ -852,6 +853,8 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
             file_record.collection_ids_json = json.dumps([str(cid) for cid in selected_collection_ids])
         if term_base is not None:
             _store_file_record_term_base_ids(file_record, [term_base_id])
+        # 项目下已有参考分析时，自动把对应的词汇表/记忆库追加到当前文件
+        attach_project_reference_bases_to_file(db, file_record)
         db.flush()
         _assign_file_segments_to_first_workflow_step(db, file_record)
         sync_project_repeated_segments_from_file(
