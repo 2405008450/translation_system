@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     languagetool_base_url: str | None = None
     languagetool_timeout_seconds: float = 10.0
     languagetool_max_text_length: int = 20000
+    # LLM settings for reference analysis.
+    reference_llm_provider: str = "openrouter"
+    reference_llm_api_key: str | None = None
+    reference_llm_model: str = "google/gemini-3.5-flash"
+    reference_llm_base_url: str = "https://openrouter.ai/api/v1"
     redis_url: str | None = None
     import_queue_backend: str = "local"
     aspose_words_license_path: str | None = None

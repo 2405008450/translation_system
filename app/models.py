@@ -1661,3 +1661,96 @@ class GlossaryEntry(Base):
     creator: Mapped["User | None"] = relationship(
         "User", foreign_keys=[creator_id]
     )
+
+
+# ================ 参考分析相关模型 ================
+
+class ReferenceProfile(Base):
+    """参考文件分析结果"""
+    __tablename__ = "reference_profiles"
+    __table_args__ = (
+        Index("ix_reference_profiles_file_record_id", "file_record_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    file_record_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    source_files: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default=text("'[]'")
+    )
+    terminology: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default=text("'[]'")
+    )
+    translation_memory: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default=text("'[]'")
+    )
+    style_guide: Mapped[str | None] = mapped_column(Text, nullable=True)
+    analysis_report: Mapped[str | None] = mapped_column(Text, nullable=True)
+    match_result: Mapped[str | None] = mapped_column(Text, nullable=True)  # 匹配结果JSON
+    overall_confidence: Mapped[float] = mapped_column(
+        nullable=False, default=0.0, server_default=text("0.0")
+    )
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    file_record: Mapped["FileRecord | None"] = relationship("FileRecord")
+    reference_files: Mapped[list["ReferenceFile"]] = relationship(
+        "ReferenceFile",
+        back_populates="profile",
+        cascade="all, delete-orphan",
+    )
+
+
+class ReferenceFile(Base):
+    """上传的参考文件记录"""
+    __tablename__ = "reference_files"
+    __table_args__ = (
+        Index("ix_reference_files_profile_id", "profile_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("reference_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    filename: Mapped[str] = mapped_column(String(500), nullable=False)
+    file_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    file_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_bilingual_source: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    is_bilingual_target: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    bilingual_pair_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+
+    profile: Mapped["ReferenceProfile"] = relationship(
+        "ReferenceProfile", back_populates="reference_files"
+    )

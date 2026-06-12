@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { BookOpen, BookOpenCheck, Bot, Check, Database, Loader2, Search, Sparkles, Upload, X } from 'lucide-vue-next'
+import { BookOpen, BookOpenCheck, Bot, Check, Database, Loader2, Plus, Search, Sparkles, Upload, X } from 'lucide-vue-next'
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
@@ -12,6 +12,7 @@ import { consumeLLMStream } from '../utils/llmStream'
 import { isProgressComplete } from '../utils/progress'
 import ResourceImportDialog from './ResourceImportDialog.vue'
 import Modal from './base/Modal.vue'
+import ResourceCreateDialog from './ResourceCreateDialog.vue'
 
 interface ProjectFileItem {
   id: string
@@ -108,6 +109,9 @@ const activeResourceImportTab = ref<ResourceImportTab | null>(null)
 
 const progressByFileId = ref<Record<string, number>>({})
 const statusByFileId = ref<Record<string, string>>({})
+
+const showTermBaseCreateDialog = ref(false)
+const showGlossaryCreateDialog = ref(false)
 
 const llmProviderOptions = computed<Array<{ value: LLMProvider, label: string }>>(() => [
   { value: 'deepseek', label: t('projectDetail.preTranslate.llm.providers.deepseek') },
@@ -1081,6 +1085,48 @@ function stopPreTranslate() {
   stopRequested.value = true
   currentAbortController.value?.abort()
 }
+
+function openTermBaseCreateDialog() {
+  showTermBaseCreateDialog.value = true
+}
+
+function openGlossaryCreateDialog() {
+  showGlossaryCreateDialog.value = true
+}
+
+async function handleTermBaseCreated(newTermBase: TermBase) {
+  showTermBaseCreateDialog.value = false
+  await loadResources()
+  if (resourceMatchesSelectedLanguagePair(newTermBase)) {
+    termBaseIds.value = normalizeResourceIds(
+      [...termBaseIds.value, newTermBase.id],
+      availableTermBases.value,
+    )
+    useTermBase.value = true
+  }
+  pushToast({
+    tone: 'success',
+    title: t('projectDetail.preTranslate.toast.termBaseCreatedTitle'),
+    message: t('projectDetail.preTranslate.toast.termBaseCreatedMessage', { name: newTermBase.name }),
+  })
+}
+
+async function handleGlossaryCreated(newGlossary: GlossaryBase) {
+  showGlossaryCreateDialog.value = false
+  await loadResources()
+  if (resourceMatchesSelectedLanguagePair(newGlossary)) {
+    glossaryBaseIds.value = normalizeResourceIds(
+      [...glossaryBaseIds.value, newGlossary.id],
+      availableGlossaryBases.value,
+    )
+    useGlossary.value = true
+  }
+  pushToast({
+    tone: 'success',
+    title: t('projectDetail.preTranslate.toast.glossaryCreatedTitle'),
+    message: t('projectDetail.preTranslate.toast.glossaryCreatedMessage', { name: newGlossary.name }),
+  })
+}
 </script>
 
 <template>
@@ -1156,7 +1202,7 @@ function stopPreTranslate() {
                   @click="openResourceImport('tm')"
                 >
                   <Upload :size="14" />
-                  导入
+                  {{ t('common.actions.import') }}
                 </button>
                 <button
                   class="button button--ghost ptd-resource__button ptd-resource__button--select"
@@ -1276,18 +1322,27 @@ function stopPreTranslate() {
                 :placeholder="t('projectDetail.preTranslate.glossary.searchPlaceholder')"
                 :disabled="running || loadingResources || !useGlossary"
               />
-            </label>
-            <div class="ptd-resource__buttons">
-              <button
-                class="button button--ghost ptd-resource__button ptd-resource__button--import"
-                type="button"
-                :disabled="running || loadingResources || Boolean(languagePairIssue)"
-                @click="openResourceImport('glossary')"
-              >
-                <Upload :size="14" />
-                导入
-              </button>
-              <button
+              </label>
+              <div class="ptd-resource__buttons">
+                <button
+                  class="button button--ghost ptd-resource__button ptd-resource__button--import"
+                  type="button"
+                  :disabled="running || loadingResources || Boolean(languagePairIssue)"
+                  @click="openResourceImport('glossary')"
+                >
+                  <Upload :size="14" />
+                  {{ t('common.actions.import') }}
+                </button>
+                <button
+                  class="button button--ghost ptd-resource__button ptd-resource__button--create"
+                  type="button"
+                  :disabled="running || loadingResources || !useGlossary || !selectedFileLanguagePair"
+                @click="openGlossaryCreateDialog"
+                >
+                  <Plus :size="14" />
+                  {{ t('projectDetail.preTranslate.resources.create') }}
+                </button>
+                <button
                 class="button button--ghost ptd-resource__button ptd-resource__button--select"
                 type="button"
                 :disabled="running || loadingResources || !useGlossary || availableGlossaryBases.length === 0"
@@ -1385,18 +1440,27 @@ function stopPreTranslate() {
                 :placeholder="t('projectDetail.preTranslate.termBase.searchPlaceholder')"
                 :disabled="running || loadingResources || !useTermBase"
               />
-            </label>
-            <div class="ptd-resource__buttons">
-              <button
-                class="button button--ghost ptd-resource__button ptd-resource__button--import"
-                type="button"
-                :disabled="running || loadingResources || Boolean(languagePairIssue)"
-                @click="openResourceImport('term')"
-              >
-                <Upload :size="14" />
-                导入
-              </button>
-              <button
+              </label>
+              <div class="ptd-resource__buttons">
+                <button
+                  class="button button--ghost ptd-resource__button ptd-resource__button--import"
+                  type="button"
+                  :disabled="running || loadingResources || Boolean(languagePairIssue)"
+                  @click="openResourceImport('term')"
+                >
+                  <Upload :size="14" />
+                  {{ t('common.actions.import') }}
+                </button>
+                <button
+                  class="button button--ghost ptd-resource__button ptd-resource__button--create"
+                  type="button"
+                  :disabled="running || loadingResources || !useTermBase || !selectedFileLanguagePair"
+                @click="openTermBaseCreateDialog"
+                >
+                  <Plus :size="14" />
+                  {{ t('projectDetail.preTranslate.resources.create') }}
+                </button>
+                <button
                 class="button button--ghost ptd-resource__button ptd-resource__button--select"
                 type="button"
                 :disabled="running || loadingResources || !useTermBase || availableTermBases.length === 0"
@@ -1626,6 +1690,24 @@ function stopPreTranslate() {
     @close="closeResourceImport"
     @imported="handleResourceImported"
   />
+
+  <ResourceCreateDialog
+    :open="showTermBaseCreateDialog"
+    resource-type="termBase"
+    :source-language="selectedFileLanguagePair?.source || ''"
+    :target-language="selectedFileLanguagePair?.target || ''"
+    @close="showTermBaseCreateDialog = false"
+    @created="handleTermBaseCreated"
+  />
+
+  <ResourceCreateDialog
+    :open="showGlossaryCreateDialog"
+    resource-type="glossary"
+    :source-language="selectedFileLanguagePair?.source || ''"
+    :target-language="selectedFileLanguagePair?.target || ''"
+    @close="showGlossaryCreateDialog = false"
+    @created="handleGlossaryCreated"
+  />
 </template>
 
 <style scoped>
@@ -1707,7 +1789,7 @@ function stopPreTranslate() {
   border: 1px solid color-mix(in srgb, var(--ptd-accent) 6%, var(--line-soft));
   border-radius: 8px;
   background: color-mix(in srgb, var(--surface-panel) 99%, var(--ptd-accent) 1%);
-  transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease, opacity 0.2s ease, filter 0.2s ease;
 }
 
 .ptd-section--tm {
@@ -1727,13 +1809,15 @@ function stopPreTranslate() {
 }
 
 .ptd-section.is-disabled {
-  background: var(--surface-1);
-  opacity: 0.84;
+  background: color-mix(in srgb, var(--surface-1) 97%, var(--ptd-accent) 3%);
+  opacity: 0.72;
+  filter: grayscale(18%);
 }
 
 .ptd-section:not(.is-disabled) {
   border-color: color-mix(in srgb, var(--ptd-accent) 16%, var(--line-soft));
   box-shadow: 0 8px 18px color-mix(in srgb, var(--ptd-accent) 5%, transparent);
+  filter: none;
 }
 
 .ptd-section__head {
@@ -1811,6 +1895,20 @@ function stopPreTranslate() {
   transition: background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
 }
 
+.ptd-switch__control::before {
+  content: '\2715';
+  position: absolute;
+  top: 50%;
+  right: 5px;
+  transform: translateY(-50%);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+  color: rgba(255, 255, 255, 0.82);
+  opacity: 0.9;
+  transition: opacity 0.18s ease;
+}
+
 .ptd-switch__control::after {
   content: '';
   position: absolute;
@@ -1834,6 +1932,14 @@ function stopPreTranslate() {
   box-shadow:
     0 0 0 3px color-mix(in srgb, var(--ptd-switch-on) 12%, transparent),
     0 6px 14px color-mix(in srgb, var(--ptd-switch-on) 12%, transparent);
+}
+
+.ptd-switch input:checked + .ptd-switch__control::before {
+  content: '\2713';
+  right: auto;
+  left: 6px;
+  color: rgba(255, 255, 255, 0.94);
+  opacity: 1;
 }
 
 .ptd-switch input:checked + .ptd-switch__control::after {
@@ -1981,6 +2087,18 @@ function stopPreTranslate() {
   border-color: color-mix(in srgb, var(--state-danger) 18%, var(--line-strong));
   background: color-mix(in srgb, var(--surface-panel) 86%, var(--state-danger-bg) 14%);
   color: color-mix(in srgb, var(--state-danger) 68%, var(--text-primary));
+}
+
+.ptd-resource__button--create {
+  border-color: color-mix(in srgb, var(--state-success) 14%, var(--line-soft));
+  background: color-mix(in srgb, var(--surface-panel) 88%, var(--state-success-bg) 12%);
+  color: color-mix(in srgb, var(--state-success) 72%, var(--text-secondary));
+}
+
+.ptd-resource__button--create:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--state-success) 28%, var(--line-strong));
+  background: color-mix(in srgb, var(--surface-panel) 76%, var(--state-success-bg) 24%);
+  color: var(--state-success);
 }
 
 .ptd-resource__note {

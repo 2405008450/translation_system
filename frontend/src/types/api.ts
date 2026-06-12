@@ -1132,3 +1132,151 @@ export interface TermbaseImportSummary {
   collection_id: string | null
   collection_name: string | null
 }
+
+// ============ 参考文件分析 ============
+
+export interface ReferenceFile {
+  id: string
+  filename: string
+  file_size: number
+  is_bilingual_source: boolean
+  is_bilingual_target: boolean
+  bilingual_pair_id: string | null
+  created_at: string
+}
+
+export interface ReferenceProfile {
+  id: string
+  file_record_id: string | null
+  source_files: string[]
+  terminology_count: number
+  tm_count: number
+  style: ReferenceStyleGuide | null
+  analysis_report: ReferenceAnalysisReport | null
+  overall_confidence: number
+  created_at: string
+  updated_at: string
+}
+
+export interface ReferenceStyleGuide {
+  tone: string | null
+  person: string | null
+  preferences: string[]
+  avoid: string[]
+}
+
+export interface ReferenceAnalysisReport {
+  industry: string
+  industry_confidence: number
+  industry_signals: string[]
+  strategy: string
+  strategy_reasoning: string
+  preserve_structure: boolean
+  client_profile: string
+  formality_level: number
+  brand_terms: ReferenceTermEntry[]
+  abbreviations: ReferenceAbbreviation[]
+  term_conflicts: ReferenceTermConflict[]
+  risk_points: ReferenceRiskPoint[]
+  format_spec: ReferenceFormatSpec
+  fixed_patterns: ReferenceSentencePair[]
+  overall_confidence: number
+  analysis_notes: string[]
+}
+
+export interface ReferenceTermEntry {
+  source: string
+  target: string
+  context: string | null
+  category: string | null
+}
+
+export interface ReferenceAbbreviation {
+  abbr: string
+  full_form: string
+  translation: string | null
+}
+
+export interface ReferenceTermConflict {
+  source: string
+  translations: string[]
+  recommendation: string | null
+  note: string | null
+}
+
+export interface ReferenceRiskPoint {
+  category: string
+  description: string
+  examples: string[]
+  suggestion: string | null
+}
+
+export interface ReferenceFormatSpec {
+  number_format: string | null
+  date_format: string | null
+  currency_format: string | null
+  unit_format: string | null
+  heading_style: string | null
+  list_style: string | null
+  notes: string[]
+}
+
+export interface ReferenceSentencePair {
+  source: string
+  target: string
+  similarity: number
+}
+
+export interface ReferenceAnalyzeResponse {
+  profile_id: string
+  source_files: string[]
+  terminology_count: number
+  tm_count: number
+  style: ReferenceStyleGuide | null
+  analysis_report: ReferenceAnalysisReport | null
+  overall_confidence: number
+}
+
+export interface ReferenceMatchResult {
+  exact_matches: ReferenceExactMatch[]
+  fuzzy_matches: ReferenceFuzzyMatch[]
+  term_matches: ReferenceTermMatch[]
+  exact_count: number
+  fuzzy_count: number
+  term_count: number
+}
+
+export interface ReferenceExactMatch {
+  segment_id: string
+  source: string
+  target: string
+  match_type: 'reference-exact'
+  similarity: number
+  source_file: string
+}
+
+export interface ReferenceFuzzyMatch {
+  segment_id: string
+  source: string
+  matched_source: string
+  target: string
+  similarity: number
+  match_type: 'reference-fuzzy'
+  source_file: string
+}
+
+export interface ReferenceTermMatch {
+  segment_id: string
+  terms: Array<{
+    source: string
+    target: string
+    category: string | null
+    source_file: string
+  }>
+  source_file: string
+}
+
+export interface ReferenceApplyResult {
+  applied_count: number
+  skipped_count: number
+}
