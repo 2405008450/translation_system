@@ -27,7 +27,7 @@ export function useWorkbenchShortcuts(handlers: WorkbenchShortcutHandlers) {
     const ctrlOrMeta = event.ctrlKey || event.metaKey
     const editableTarget = isEditableTarget(event.target)
 
-    if (event.key === '?' && !ctrlOrMeta) {
+    if (event.key === '?' && !ctrlOrMeta && !editableTarget) {
       event.preventDefault()
       handlers.toggleHelp()
       return
