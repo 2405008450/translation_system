@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { BookOpen, BookOpenCheck, Bot, Check, Database, Loader2, Search, Sparkles, Upload, X } from 'lucide-vue-next'
+import { BookOpen, BookOpenCheck, Bot, Check, Database, Loader2, Pause, Search, Sparkles, Upload, X } from 'lucide-vue-next'
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
@@ -70,6 +70,7 @@ const loadingResources = ref(false)
 const running = ref(false)
 const stopRequested = ref(false)
 const currentAbortController = ref<AbortController | null>(null)
+const currentLLMReader = ref<ReadableStreamDefaultReader<Uint8Array> | null>(null)
 
 const tmCollections = ref<TMCollection[]>([])
 const termBases = ref<TermBase[]>([])
@@ -826,53 +827,59 @@ async function runLLMForFile(fileId: string, completedActions: number, actionCou
       throw new Error(message)
     }
 
-    await consumeLLMStream(response, ({ event, data }) => {
-      refreshIdleTimer()
-      if (stopRequested.value) {
-        return
-      }
+    await consumeLLMStream(
+      response,
+      ({ event, data }) => {
+        refreshIdleTimer()
+        if (stopRequested.value) {
+          return
+        }
 
-      if (event === 'start') {
-        plannedCount = Number(data.total || 0)
-        processedCount = 0
-        updateLLMProgress(
-          plannedCount > 0
-            ? t('projectDetail.preTranslate.progress.llmRunning', { processed: 0, total: plannedCount })
-            : t('projectDetail.preTranslate.progress.llmStarting'),
-          0,
-        )
-        return
-      }
+        if (event === 'start') {
+          plannedCount = Number(data.total || 0)
+          processedCount = 0
+          updateLLMProgress(
+            plannedCount > 0
+              ? t('projectDetail.preTranslate.progress.llmRunning', { processed: 0, total: plannedCount })
+              : t('projectDetail.preTranslate.progress.llmStarting'),
+            0,
+          )
+          return
+        }
 
-      if (event === 'segment' || event === 'error') {
-        processedCount += 1
-        const total = Math.max(plannedCount, processedCount)
-        const actionPercent = total > 0 ? (processedCount / total) * 100 : 0
-        updateLLMProgress(
-          t('projectDetail.preTranslate.progress.llmRunning', {
-            processed: processedCount,
-            total,
-          }),
-          actionPercent,
-        )
-        return
-      }
+        if (event === 'segment' || event === 'error') {
+          processedCount += 1
+          const total = Math.max(plannedCount, processedCount)
+          const actionPercent = total > 0 ? (processedCount / total) * 100 : 0
+          updateLLMProgress(
+            t('projectDetail.preTranslate.progress.llmRunning', {
+              processed: processedCount,
+              total,
+            }),
+            actionPercent,
+          )
+          return
+        }
 
-      if (event === 'complete') {
-        sawComplete = true
-        const total = Number(data.total || plannedCount || processedCount)
-        const updated = Number(data.updated_count || 0)
-        const error = Number(data.error_count || 0)
-        plannedCount = total
-        processedCount = Math.max(total, updated + error, processedCount)
-        updateLLMProgress(
-          total > 0
-            ? t('projectDetail.preTranslate.progress.llmDone', { updated, error })
-            : t('projectDetail.preTranslate.progress.llmSkipped'),
-          100,
-        )
-      }
-    })
+        if (event === 'complete') {
+          sawComplete = true
+          const total = Number(data.total || plannedCount || processedCount)
+          const updated = Number(data.updated_count || 0)
+          const error = Number(data.error_count || 0)
+          plannedCount = total
+          processedCount = Math.max(total, updated + error, processedCount)
+          updateLLMProgress(
+            total > 0
+              ? t('projectDetail.preTranslate.progress.llmDone', { updated, error })
+              : t('projectDetail.preTranslate.progress.llmSkipped'),
+            100,
+          )
+        }
+      },
+      (reader) => {
+        currentLLMReader.value = reader
+      },
+    )
 
     if (!sawComplete) {
       throw new Error(t('projectDetail.preTranslate.errors.llmStreamInterrupted'))
@@ -885,6 +892,7 @@ async function runLLMForFile(fileId: string, completedActions: number, actionCou
   } finally {
     clearIdleTimer()
     currentAbortController.value = null
+    currentLLMReader.value = null
   }
 }
 
@@ -1074,12 +1082,17 @@ async function startPreTranslate() {
   }
 }
 
-function stopPreTranslate() {
+async function stopPreTranslate() {
   if (!running.value) {
     return
   }
   stopRequested.value = true
   currentAbortController.value?.abort()
+  try {
+    await currentLLMReader.value?.cancel()
+  } catch {
+    // 忽略浏览器取消流时的竞态错误。
+  }
 }
 
 </script>
@@ -1595,11 +1608,13 @@ function stopPreTranslate() {
           </button>
           <button
             v-if="running"
-            class="button"
+            class="button button--danger"
             type="button"
+            :disabled="stopRequested"
             @click="stopPreTranslate"
           >
-            {{ t('common.actions.stop') }}
+            <Pause :size="14" />
+            {{ t('common.actions.pause') }}
           </button>
           <button
             class="button button--primary"

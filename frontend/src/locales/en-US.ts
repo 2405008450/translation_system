@@ -31,6 +31,7 @@ const overrides = {
       back: 'Back',
       details: 'View details',
       stop: 'Stop',
+      pause: 'Pause',
       reply: 'Reply',
     },
     roles: {
@@ -143,6 +144,14 @@ const overrides = {
     submitLoading: 'Submitting...',
     statusError: 'Unable to fetch initialization status. Please make sure the backend is running.',
     requestError: 'Request failed. Please try again later.',
+  },
+  workbench: {
+    search: {
+      advanced: 'Advanced',
+      sourceExcludeLabel: 'Source excludes',
+      targetExcludeLabel: 'Target excludes',
+      excludePlaceholder: 'Separate terms with spaces or commas',
+    },
   },
   pagination: {
     total: '{total} total',

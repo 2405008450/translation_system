@@ -995,6 +995,8 @@ class SegmentReplaceRequest(BaseModel):
     scope: str = "all"
     source_query: str = ""
     target_query: str
+    source_exclude: str = ""
+    target_exclude: str = ""
     replace_text: str = ""
     search_fuzzy: bool = False
     replace_all: bool = True
@@ -6202,6 +6204,8 @@ def _apply_segment_text_filters(
     query,
     source_query: str | None,
     target_query: str | None,
+    source_exclude: str | None = None,
+    target_exclude: str | None = None,
 ):
     source_keyword = (source_query or "").strip()
     target_keyword = (target_query or "").strip()
@@ -6215,7 +6219,27 @@ def _apply_segment_text_filters(
         )
     if target_keyword:
         query = query.filter(Segment.target_text.ilike(f"%{target_keyword}%"))
+    for keyword in _split_segment_exclude_keywords(source_exclude):
+        source_pattern = f"%{keyword}%"
+        query = query.filter(
+            and_(
+                or_(Segment.source_text.is_(None), ~Segment.source_text.ilike(source_pattern)),
+                or_(Segment.display_text.is_(None), ~Segment.display_text.ilike(source_pattern)),
+            )
+        )
+    for keyword in _split_segment_exclude_keywords(target_exclude):
+        target_pattern = f"%{keyword}%"
+        query = query.filter(
+            or_(Segment.target_text.is_(None), ~Segment.target_text.ilike(target_pattern))
+        )
     return query
+
+
+def _split_segment_exclude_keywords(value: str | None) -> list[str]:
+    if not value:
+        return []
+    keywords = [item.strip() for item in re.split(r"[\s,，]+", value) if item.strip()]
+    return list(dict.fromkeys(keywords))
 
 
 def _normalize_segment_filter_values(*values: Any) -> list[str]:
@@ -6413,6 +6437,8 @@ def _get_segment_page_sentence_ids(
     scope: str = "all",
     source_query: str | None = None,
     target_query: str | None = None,
+    source_exclude: str | None = None,
+    target_exclude: str | None = None,
     status_filters: list[str] | None = None,
     match_filters: list[str] | None = None,
     source_filters: list[str] | None = None,
@@ -6426,6 +6452,8 @@ def _get_segment_page_sentence_ids(
         query,
         source_query=source_query,
         target_query=target_query,
+        source_exclude=source_exclude,
+        target_exclude=target_exclude,
     )
     query = _apply_segment_screening_filters(
         query,
@@ -6873,6 +6901,8 @@ def get_file_record_segments(
     scope: str = "all",
     source_query: str | None = None,
     target_query: str | None = None,
+    source_exclude: str | None = None,
+    target_exclude: str | None = None,
     search_fuzzy: bool = False,
     status_filters: str | None = None,
     status_filters_bracket: list[str] | None = Query(default=None, alias="status_filters[]"),
@@ -6900,6 +6930,8 @@ def get_file_record_segments(
         filtered_query,
         source_query=source_query,
         target_query=target_query,
+        source_exclude=source_exclude,
+        target_exclude=target_exclude,
     )
     normalized_status_filters = _normalize_segment_filter_values(status_filters, status_filters_bracket)
     normalized_match_filters = _normalize_segment_filter_values(match_filters, match_filters_bracket)
@@ -6939,6 +6971,8 @@ def get_file_record_segments(
             "scope": scope,
             "source_query": source_query or "",
             "target_query": target_query or "",
+            "source_exclude": source_exclude or "",
+            "target_exclude": target_exclude or "",
             "search_fuzzy": search_fuzzy,
             "status_filters": normalized_status_filters,
             "match_filters": normalized_match_filters,
@@ -8568,6 +8602,8 @@ def replace_file_record_segment_targets(
         query,
         source_query=payload.source_query,
         target_query=target_query,
+        source_exclude=payload.source_exclude,
+        target_exclude=payload.target_exclude,
     )
     query = _apply_segment_screening_filters(
         query,
@@ -8804,6 +8840,8 @@ def get_file_record_revisions(
     scope: str = "all",
     source_query: str | None = None,
     target_query: str | None = None,
+    source_exclude: str | None = None,
+    target_exclude: str | None = None,
     search_fuzzy: bool = False,
     status_filters: str | None = None,
     status_filters_bracket: list[str] | None = Query(default=None, alias="status_filters[]"),
@@ -8842,6 +8880,8 @@ def get_file_record_revisions(
             scope=scope,
             source_query=source_query,
             target_query=target_query,
+            source_exclude=source_exclude,
+            target_exclude=target_exclude,
             status_filters=_normalize_segment_filter_values(status_filters, status_filters_bracket),
             match_filters=_normalize_segment_filter_values(match_filters, match_filters_bracket),
             source_filters=_normalize_segment_filter_values(source_filters, source_filters_bracket),
@@ -8928,6 +8968,8 @@ def get_file_record_comments(
     scope: str = "all",
     source_query: str | None = None,
     target_query: str | None = None,
+    source_exclude: str | None = None,
+    target_exclude: str | None = None,
     search_fuzzy: bool = False,
     status_filters: str | None = None,
     status_filters_bracket: list[str] | None = Query(default=None, alias="status_filters[]"),
@@ -8955,6 +8997,8 @@ def get_file_record_comments(
             scope=scope,
             source_query=source_query,
             target_query=target_query,
+            source_exclude=source_exclude,
+            target_exclude=target_exclude,
             status_filters=_normalize_segment_filter_values(status_filters, status_filters_bracket),
             match_filters=_normalize_segment_filter_values(match_filters, match_filters_bracket),
             source_filters=_normalize_segment_filter_values(source_filters, source_filters_bracket),
@@ -9333,7 +9377,8 @@ async def llm_translate_file_record(
             model_override=requested_model,
         ):
             if await request.is_disconnected():
-                break
+                db.rollback()
+                return
 
             if isinstance(result, LLMTranslationFailure):
                 error_count += 1

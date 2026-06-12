@@ -353,8 +353,11 @@ const guidelinesEditorRef = ref<HTMLTextAreaElement | null>(null)
 const segmentDisplayScope = ref<SegmentDisplayScope>('all')
 const sourceSearchQuery = ref('')
 const targetSearchQuery = ref('')
+const sourceExcludeQuery = ref('')
+const targetExcludeQuery = ref('')
 const replaceSearchText = ref('')
 const searchFuzzyEnabled = ref(false)
+const advancedSearchOpen = ref(false)
 const segmentScreeningDisplayRange = ref('my_tasks')
 const segmentScreeningNumberInput = ref('1')
 const segmentScreeningStatusFilters = ref<string[]>([])
@@ -499,6 +502,8 @@ function getCommentWindowQuery(): CommentWindowQuery | null {
     scope: segmentDisplayScope.value,
     sourceQuery: sourceSearchQuery.value,
     targetQuery: targetSearchQuery.value,
+    sourceExclude: sourceExcludeQuery.value,
+    targetExclude: targetExcludeQuery.value,
     searchFuzzy: searchFuzzyEnabled.value,
     statusFilters: [...segmentScreeningStatusFilters.value, ...segmentScreeningFlagFilters.value],
     matchFilters: [...segmentScreeningMatchFilters.value],
@@ -514,6 +519,8 @@ function getSegmentWindowQuery(page = segmentStore.currentPage, pageSize = segme
     scope: segmentDisplayScope.value,
     sourceQuery: sourceSearchQuery.value,
     targetQuery: targetSearchQuery.value,
+    sourceExclude: sourceExcludeQuery.value,
+    targetExclude: targetExcludeQuery.value,
     searchFuzzy: searchFuzzyEnabled.value,
     statusFilters: [...segmentScreeningStatusFilters.value, ...segmentScreeningFlagFilters.value],
     matchFilters: [...segmentScreeningMatchFilters.value],
@@ -1090,9 +1097,19 @@ function matchesSearchKeyword(value: string, keyword: string) {
 
 const normalizedSourceSearchQuery = computed(() => normalizeSearchText(sourceSearchQuery.value))
 const normalizedTargetSearchQuery = computed(() => normalizeSearchText(targetSearchQuery.value))
+const normalizedSourceExcludeQuery = computed(() => normalizeSearchText(sourceExcludeQuery.value))
+const normalizedTargetExcludeQuery = computed(() => normalizeSearchText(targetExcludeQuery.value))
+const hasAdvancedSegmentSearch = computed(() => Boolean(
+  normalizedSourceExcludeQuery.value || normalizedTargetExcludeQuery.value,
+))
 
 const hasSegmentSearch = computed(() => (
-  Boolean(normalizedSourceSearchQuery.value || normalizedTargetSearchQuery.value)
+  Boolean(
+    normalizedSourceSearchQuery.value
+    || normalizedTargetSearchQuery.value
+    || normalizedSourceExcludeQuery.value
+    || normalizedTargetExcludeQuery.value
+  )
 ))
 
 const hasSegmentDisplayScope = computed(() => segmentDisplayScope.value !== 'all')
@@ -1767,10 +1784,13 @@ async function toggleGuidelinesPanel() {
 function resetSegmentSearch() {
   searchLoadRequestId += 1
   segmentSearchOpen.value = false
+  advancedSearchOpen.value = false
   segmentScreeningPopoverOpen.value = false
   segmentDisplayScope.value = 'all'
   sourceSearchQuery.value = ''
   targetSearchQuery.value = ''
+  sourceExcludeQuery.value = ''
+  targetExcludeQuery.value = ''
   replaceSearchText.value = ''
   searchFuzzyEnabled.value = false
   resetSegmentScreeningFilters()
@@ -1800,8 +1820,11 @@ function captureSegmentSearchReturnTarget() {
 function clearSegmentSearchFilters() {
   searchLoadRequestId += 1
   segmentDisplayScope.value = 'all'
+  advancedSearchOpen.value = false
   sourceSearchQuery.value = ''
   targetSearchQuery.value = ''
+  sourceExcludeQuery.value = ''
+  targetExcludeQuery.value = ''
   searchFuzzyEnabled.value = false
   resetSegmentScreeningFilters()
   searchLoadingAllSegments.value = false
@@ -2157,6 +2180,8 @@ async function replaceAllSearchMatches() {
         scope: segmentDisplayScope.value,
         source_query: sourceSearchQuery.value,
         target_query: targetSearchQuery.value,
+        source_exclude: sourceExcludeQuery.value,
+        target_exclude: targetExcludeQuery.value,
         replace_text: replaceSearchText.value,
         search_fuzzy: searchFuzzyEnabled.value,
         replace_all: true,
@@ -4048,7 +4073,15 @@ watch(saveToTMScope, () => {
   }
 })
 
-watch([segmentDisplayScope, sourceSearchQuery, targetSearchQuery, searchFuzzyEnabled, segmentScreeningQueryKey], async () => {
+watch([
+  segmentDisplayScope,
+  sourceSearchQuery,
+  targetSearchQuery,
+  sourceExcludeQuery,
+  targetExcludeQuery,
+  searchFuzzyEnabled,
+  segmentScreeningQueryKey,
+], async () => {
   if (suppressSegmentFilterWatch) {
     return
   }
@@ -5324,6 +5357,18 @@ onBeforeRouteLeave(async () => {
                   <span>{{ t('workbench.search.fuzzy') }}</span>
                 </label>
 
+                <button
+                  class="button workbench-search-panel__advanced-toggle"
+                  :class="{ 'is-active': advancedSearchOpen, 'has-value': hasAdvancedSegmentSearch }"
+                  type="button"
+                  :aria-pressed="advancedSearchOpen"
+                  @click="advancedSearchOpen = !advancedSearchOpen"
+                >
+                  <Filter :size="12" />
+                  <span>{{ t('workbench.search.advanced') }}</span>
+                  <span v-if="hasAdvancedSegmentSearch" class="workbench-search-panel__advanced-dot" />
+                </button>
+
                 <div class="workbench-search-panel__actions">
                   <button
                     class="button workbench-action workbench-action--search workbench-search-panel__nav"
@@ -5387,9 +5432,61 @@ onBeforeRouteLeave(async () => {
                   <span>{{ t('workbench.search.collapseShort') }}</span>
                 </button>
               </div>
+
+              <div v-if="advancedSearchOpen" class="workbench-search-panel__line workbench-search-panel__line--advanced">
+                <label class="workbench-search-panel__field">
+                  <span>{{ t('workbench.search.sourceExcludeLabel') }}</span>
+                  <span class="workbench-search-panel__input-wrap">
+                    <input
+                      v-model="sourceExcludeQuery"
+                      class="field__control"
+                      :class="{ 'has-clear-action': sourceExcludeQuery }"
+                      type="text"
+                      :placeholder="t('workbench.search.excludePlaceholder')"
+                      @keydown.enter.prevent="void focusMatchedSegment(1)"
+                    />
+                    <button
+                      v-if="sourceExcludeQuery"
+                      class="workbench-search-panel__input-clear"
+                      type="button"
+                      :title="t('workbench.search.clear')"
+                      :aria-label="t('workbench.search.clear')"
+                      @mousedown.prevent
+                      @click="sourceExcludeQuery = ''"
+                    >
+                      <X :size="12" />
+                    </button>
+                  </span>
+                </label>
+
+                <label class="workbench-search-panel__field">
+                  <span>{{ t('workbench.search.targetExcludeLabel') }}</span>
+                  <span class="workbench-search-panel__input-wrap">
+                    <input
+                      v-model="targetExcludeQuery"
+                      class="field__control"
+                      :class="{ 'has-clear-action': targetExcludeQuery }"
+                      type="text"
+                      :placeholder="t('workbench.search.excludePlaceholder')"
+                      @keydown.enter.prevent="void focusMatchedSegment(1)"
+                    />
+                    <button
+                      v-if="targetExcludeQuery"
+                      class="workbench-search-panel__input-clear"
+                      type="button"
+                      :title="t('workbench.search.clear')"
+                      :aria-label="t('workbench.search.clear')"
+                      @mousedown.prevent
+                      @click="targetExcludeQuery = ''"
+                    >
+                      <X :size="12" />
+                    </button>
+                  </span>
+                </label>
+              </div>
             </div>
 
-            <div class="workbench-search-panel__meta">
+            <div v-if="hasEditorSegmentFilter || searchLoadingAllSegments" class="workbench-search-panel__meta">
               <span v-if="hasEditorSegmentFilter" class="hint-text">
                 {{
                   t('workbench.search.resultSummary', {
@@ -7647,8 +7744,8 @@ onBeforeRouteLeave(async () => {
 
 .workbench-search-panel {
   flex: 0 0 auto;
-  margin-bottom: 8px;
-  padding: 8px 10px;
+  margin-bottom: 4px;
+  padding: 4px 8px;
   border: 1px solid #d4dee5;
   border-radius: 2px;
   background: #f5f8fa;
@@ -7658,7 +7755,7 @@ onBeforeRouteLeave(async () => {
 
 .workbench-search-panel__form--compact {
   display: grid;
-  gap: 6px;
+  gap: 4px;
 }
 
 .workbench-search-panel__line {
@@ -7671,6 +7768,10 @@ onBeforeRouteLeave(async () => {
 
 .workbench-search-panel__line--replace {
   padding-left: 231px;
+}
+
+.workbench-search-panel__line--advanced {
+  padding-left: 0;
 }
 
 .workbench-search-panel__field {
@@ -7699,8 +7800,8 @@ onBeforeRouteLeave(async () => {
 
 .workbench-search-panel__field .field__control {
   width: 180px;
-  min-height: 28px;
-  padding: 4px 8px;
+  min-height: 24px;
+  padding: 2px 8px;
   border-color: #c7d2da;
   border-radius: 3px;
   background: #fff;
@@ -7745,7 +7846,7 @@ onBeforeRouteLeave(async () => {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  min-height: 28px;
+  min-height: 24px;
   margin: 0 4px 0 2px;
   color: #485861;
   font-size: 13px;
@@ -7757,6 +7858,38 @@ onBeforeRouteLeave(async () => {
   height: 14px;
   margin: 0;
   accent-color: #0d7a68;
+}
+
+.workbench-search-panel__advanced-toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 24px !important;
+  padding: 2px 8px !important;
+  border: 1px solid #c7d2da;
+  border-radius: 3px;
+  background: #fff;
+  color: #485861;
+  font-size: 13px !important;
+  box-shadow: none !important;
+}
+
+.workbench-search-panel__advanced-toggle.is-active {
+  border-color: #82b7ab;
+  background: #e9f5f2;
+  color: #0c6b5b;
+}
+
+.workbench-search-panel__advanced-toggle.has-value:not(.is-active) {
+  border-color: #e2a272;
+}
+
+.workbench-search-panel__advanced-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #d9480f;
 }
 
 .workbench-search-panel__actions {
@@ -7873,7 +8006,7 @@ onBeforeRouteLeave(async () => {
   align-items: center;
   gap: 10px;
   min-height: 20px;
-  margin-top: 4px;
+  margin-top: 2px;
 }
 
 .workbench-search-panel__actions .is-layout-placeholder {

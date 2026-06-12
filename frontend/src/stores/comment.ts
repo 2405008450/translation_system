@@ -20,6 +20,8 @@ export interface CommentWindowQuery {
   scope?: string
   sourceQuery?: string
   targetQuery?: string
+  sourceExclude?: string
+  targetExclude?: string
   searchFuzzy?: boolean
   statusFilters?: string[]
   matchFilters?: string[]
@@ -56,6 +58,8 @@ function buildCommentWindowParams(query?: CommentWindowQuery | null) {
     scope: query.scope ?? 'all',
     source_query: query.sourceQuery ?? '',
     target_query: query.targetQuery ?? '',
+    source_exclude: query.sourceExclude ?? '',
+    target_exclude: query.targetExclude ?? '',
     search_fuzzy: query.searchFuzzy ?? false,
     status_filters: serializeArray(query.statusFilters),
     match_filters: serializeArray(query.matchFilters),

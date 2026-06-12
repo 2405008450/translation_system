@@ -122,6 +122,8 @@ export interface SegmentPageQuery {
   scope?: string
   sourceQuery?: string
   targetQuery?: string
+  sourceExclude?: string
+  targetExclude?: string
   searchFuzzy?: boolean
   statusFilters?: string[]
   matchFilters?: string[]
@@ -172,6 +174,8 @@ export const useSegmentStore = defineStore('segment', () => {
     scope: 'all',
     sourceQuery: '',
     targetQuery: '',
+    sourceExclude: '',
+    targetExclude: '',
     searchFuzzy: false,
     statusFilters: [] as string[],
     matchFilters: [] as string[],
@@ -477,6 +481,8 @@ export const useSegmentStore = defineStore('segment', () => {
       scope: query.scope ?? segmentFilters.value.scope,
       sourceQuery: query.sourceQuery ?? segmentFilters.value.sourceQuery,
       targetQuery: query.targetQuery ?? segmentFilters.value.targetQuery,
+      sourceExclude: query.sourceExclude ?? segmentFilters.value.sourceExclude,
+      targetExclude: query.targetExclude ?? segmentFilters.value.targetExclude,
       searchFuzzy: query.searchFuzzy ?? segmentFilters.value.searchFuzzy,
       statusFilters: normalizeStringArray(query.statusFilters ?? segmentFilters.value.statusFilters),
       matchFilters: normalizeStringArray(query.matchFilters ?? segmentFilters.value.matchFilters),
@@ -493,6 +499,8 @@ export const useSegmentStore = defineStore('segment', () => {
       scope: resolved.scope,
       source_query: resolved.sourceQuery,
       target_query: resolved.targetQuery,
+      source_exclude: resolved.sourceExclude,
+      target_exclude: resolved.targetExclude,
       search_fuzzy: resolved.searchFuzzy,
       status_filters: serializeFilterArray(resolved.statusFilters),
       match_filters: serializeFilterArray(resolved.matchFilters),
@@ -508,6 +516,8 @@ export const useSegmentStore = defineStore('segment', () => {
       scope: segmentFilters.value.scope,
       sourceQuery: segmentFilters.value.sourceQuery,
       targetQuery: segmentFilters.value.targetQuery,
+      sourceExclude: segmentFilters.value.sourceExclude,
+      targetExclude: segmentFilters.value.targetExclude,
       searchFuzzy: segmentFilters.value.searchFuzzy,
       statusFilters: [...segmentFilters.value.statusFilters],
       matchFilters: [...segmentFilters.value.matchFilters],
@@ -553,6 +563,8 @@ export const useSegmentStore = defineStore('segment', () => {
       scope: string
       sourceQuery: string
       targetQuery: string
+      sourceExclude: string
+      targetExclude: string
       searchFuzzy: boolean
       statusFilters: string[]
       matchFilters: string[]
@@ -566,6 +578,8 @@ export const useSegmentStore = defineStore('segment', () => {
       scope: resolved.scope,
       sourceQuery: resolved.sourceQuery,
       targetQuery: resolved.targetQuery,
+      sourceExclude: resolved.sourceExclude,
+      targetExclude: resolved.targetExclude,
       searchFuzzy: resolved.searchFuzzy,
       statusFilters: [...resolved.statusFilters],
       matchFilters: [...resolved.matchFilters],
@@ -728,6 +742,8 @@ export const useSegmentStore = defineStore('segment', () => {
       scope: 'all',
       sourceQuery: '',
       targetQuery: '',
+      sourceExclude: '',
+      targetExclude: '',
       searchFuzzy: false,
       statusFilters: [],
       matchFilters: [],
@@ -774,6 +790,8 @@ export const useSegmentStore = defineStore('segment', () => {
         scope: query.scope ?? 'all',
         sourceQuery: query.sourceQuery ?? '',
         targetQuery: query.targetQuery ?? '',
+        sourceExclude: query.sourceExclude ?? '',
+        targetExclude: query.targetExclude ?? '',
         searchFuzzy: query.searchFuzzy ?? false,
         statusFilters: query.statusFilters ?? [],
         matchFilters: query.matchFilters ?? [],
@@ -786,6 +804,8 @@ export const useSegmentStore = defineStore('segment', () => {
         scope: resolved.scope,
         sourceQuery: resolved.sourceQuery,
         targetQuery: resolved.targetQuery,
+        sourceExclude: resolved.sourceExclude,
+        targetExclude: resolved.targetExclude,
         searchFuzzy: resolved.searchFuzzy,
         statusFilters: [...resolved.statusFilters],
         matchFilters: [...resolved.matchFilters],
@@ -805,6 +825,8 @@ export const useSegmentStore = defineStore('segment', () => {
         && resolved.scope === 'all'
         && !resolved.sourceQuery
         && !resolved.targetQuery
+        && !resolved.sourceExclude
+        && !resolved.targetExclude
         && resolved.statusFilters.length === 0
         && resolved.matchFilters.length === 0
         && resolved.sourceFilters.length === 0

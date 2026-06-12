@@ -501,6 +501,8 @@ export interface SegmentPageFilters {
   scope: string
   source_query: string
   target_query: string
+  source_exclude: string
+  target_exclude: string
   search_fuzzy: boolean
   status_filters?: string[]
   match_filters?: string[]

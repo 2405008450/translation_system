@@ -26,6 +26,7 @@ export default {
       back: '返回',
       details: '查看详情',
       stop: '停止',
+      pause: '暂停',
       reply: '回复',
     },
     roles: {
@@ -892,6 +893,10 @@ export default {
       replaceAll: '全部替换({count})',
       fuzzy: '模糊',
       fuzzyHint: '启用后按字符顺序做宽松匹配',
+      advanced: '高级',
+      sourceExcludeLabel: '原文不含',
+      targetExcludeLabel: '译文不含',
+      excludePlaceholder: '空格或逗号分隔多个词',
       scopes: {
         all: '全部句段',
         fuzzyOnly: '仅模糊匹配',
