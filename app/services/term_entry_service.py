@@ -197,6 +197,10 @@ def save_term_entries_batch(
             existing.source_normalized = source_normalized
             existing.source_language = term_base.source_language
             existing.target_language = term_base.target_language
+            if existing.creator_id is None and current_user is not None:
+                existing.creator_id = current_user.id
+            if current_user is not None:
+                existing.last_modified_by_id = current_user.id
             updated_count += 1
             result_item["status"] = "updated"
             result_item["conflict"] = serialize_term_entry_conflict(existing)
@@ -212,6 +216,7 @@ def save_term_entries_batch(
             source_language=term_base.source_language,
             target_language=term_base.target_language,
             creator_id=current_user.id if current_user else None,
+            last_modified_by_id=current_user.id if current_user else None,
         )
         db.add(new_entry)
         db.flush()

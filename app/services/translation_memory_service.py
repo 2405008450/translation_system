@@ -77,6 +77,7 @@ def _normalize_upsert_entries(entries: list[TMUpsertEntry]) -> list[dict]:
             "source_language": source_language,
             "target_language": target_language,
             "creator_id": entry.creator_id,
+            "last_modified_by_id": entry.creator_id,
             "key": key,
         }
     return list(rows_by_key.values())
@@ -125,6 +126,7 @@ def _batch_upsert_tm_entries_postgres(db: Session, rows: list[dict]) -> list[tup
             "source_language": row["source_language"],
             "target_language": row["target_language"],
             "creator_id": str(row["creator_id"]) if row["creator_id"] else None,
+            "last_modified_by_id": str(row["last_modified_by_id"]) if row["last_modified_by_id"] else None,
         }
         for row in rows
     ]
@@ -140,7 +142,8 @@ def _batch_upsert_tm_entries_postgres(db: Session, rows: list[dict]) -> list[tup
                 source_normalized,
                 source_language,
                 target_language,
-                creator_id
+                creator_id,
+                last_modified_by_id
             )
             VALUES (
                 CAST(:id AS uuid),
@@ -151,7 +154,8 @@ def _batch_upsert_tm_entries_postgres(db: Session, rows: list[dict]) -> list[tup
                 :source_normalized,
                 :source_language,
                 :target_language,
-                CAST(:creator_id AS uuid)
+                CAST(:creator_id AS uuid),
+                CAST(:last_modified_by_id AS uuid)
             )
             ON CONFLICT (collection_id, source_hash, source_language, target_language)
             DO UPDATE SET
@@ -161,7 +165,8 @@ def _batch_upsert_tm_entries_postgres(db: Session, rows: list[dict]) -> list[tup
                 source_normalized = EXCLUDED.source_normalized,
                 source_language = EXCLUDED.source_language,
                 target_language = EXCLUDED.target_language,
-                creator_id = COALESCE(EXCLUDED.creator_id, memory_entries.creator_id),
+                creator_id = COALESCE(memory_entries.creator_id, EXCLUDED.creator_id),
+                last_modified_by_id = COALESCE(EXCLUDED.last_modified_by_id, memory_entries.last_modified_by_id),
                 updated_at = NOW()
             """
         ),
@@ -231,8 +236,10 @@ def _batch_upsert_tm_entries_orm(db: Session, rows: list[dict]) -> list[tuple[UU
             existing.collection_id = row["collection_id"]
             existing.source_language = row["source_language"]
             existing.target_language = row["target_language"]
-            if row["creator_id"] is not None:
+            if existing.creator_id is None and row["creator_id"] is not None:
                 existing.creator_id = row["creator_id"]
+            if row["last_modified_by_id"] is not None:
+                existing.last_modified_by_id = row["last_modified_by_id"]
             touched_entries.append(existing)
             continue
 
@@ -245,6 +252,7 @@ def _batch_upsert_tm_entries_orm(db: Session, rows: list[dict]) -> list[tuple[UU
             source_language=row["source_language"],
             target_language=row["target_language"],
             creator_id=row["creator_id"],
+            last_modified_by_id=row["last_modified_by_id"],
         )
         db.add(memory_entry)
         touched_entries.append(memory_entry)

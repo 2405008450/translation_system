@@ -411,6 +411,39 @@ test.describe.serial('多用户并发回归', () => {
     expect(stats.maxConcurrent).toBeGreaterThanOrEqual(2)
   })
 
+  test('同文件重复原文的 LLM 预翻译保持一致', async () => {
+    await resetFakeLlmStats()
+
+    const marker = `DUP_${Date.now()}`
+    const repeatedSource = `重复 ${marker} 内容。`
+    const projectId = await createProject(users[0].context, `重复预翻译回归 ${marker}`)
+    const file = await uploadTextFile(
+      users[0].context,
+      projectId,
+      `duplicate-${marker}.txt`,
+      [
+        repeatedSource,
+        `上下文 ${marker} 内容。`,
+        repeatedSource,
+      ].join('\n\n'),
+    )
+
+    const events = await runLlm(users[0].context, file.id)
+    const start = events.find((item) => item.event === 'start')
+    const complete = events.find((item) => item.event === 'complete')
+    const segmentEvents = events.filter((item) => item.event === 'segment')
+
+    expect(Number(start?.data.total || 0)).toBeGreaterThan(Number(start?.data.unique_total || 0))
+    expect(Number(start?.data.deduplicated_count || 0)).toBeGreaterThanOrEqual(1)
+    expect(segmentEvents.length).toBe(Number(complete?.data.total || 0))
+    expect(Number(complete?.data.updated_count || 0)).toBe(Number(complete?.data.total || 0))
+
+    const segments = await getSegments(users[0].context, file.id)
+    const repeatedSegments = segments.filter((segment) => segment.source_text === repeatedSource)
+    expect(repeatedSegments.length).toBe(2)
+    expect(new Set(repeatedSegments.map((segment) => segment.target_text)).size).toBe(1)
+  })
+
   test('文件级预翻译锁会阻止无 token 写入，但不影响其他文件', async () => {
     await resetFakeLlmStats()
 

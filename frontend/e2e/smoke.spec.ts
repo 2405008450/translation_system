@@ -1,5 +1,5 @@
 import path from 'node:path'
-import type { Page } from '@playwright/test'
+import type { Locator, Page } from '@playwright/test'
 
 import { expect, test } from './test-fixtures'
 
@@ -75,6 +75,89 @@ async function saveWorkbenchNow(page: Page) {
   ))
   await page.getByTestId('workbench-save-button').click()
   await saveResponse
+}
+
+async function expectEditorText(editor: Locator, expected: string) {
+  await expect.poll(async () => (
+    (await editor.evaluate((element) => element.textContent || '')).replace(/\u00a0/g, ' ')
+  )).toBe(expected)
+}
+
+async function expectEditorHtml(editor: Locator, matcher: RegExp) {
+  await expect.poll(async () => editor.evaluate((element) => element.innerHTML)).toMatch(matcher)
+}
+
+async function expectEditorHtmlNot(editor: Locator, matcher: RegExp) {
+  await expect.poll(async () => editor.evaluate((element) => element.innerHTML)).not.toMatch(matcher)
+}
+
+async function selectEditorRange(editor: Locator, start: number, end: number) {
+  await editor.evaluate((element, rangeOffsets) => {
+    element.focus()
+    const selection = window.getSelection()
+    if (!selection) return
+
+    const range = document.createRange()
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT)
+    let offset = 0
+    let startSet = false
+    let endSet = false
+    let node = walker.nextNode()
+
+    while (node) {
+      const textLength = node.textContent?.length || 0
+      if (!startSet && offset + textLength >= rangeOffsets.start) {
+        range.setStart(node, Math.max(0, rangeOffsets.start - offset))
+        startSet = true
+      }
+      if (!endSet && offset + textLength >= rangeOffsets.end) {
+        range.setEnd(node, Math.max(0, rangeOffsets.end - offset))
+        endSet = true
+        break
+      }
+      offset += textLength
+      node = walker.nextNode()
+    }
+
+    if (!startSet) {
+      range.selectNodeContents(element)
+      range.collapse(false)
+    } else if (!endSet) {
+      range.setEnd(element, element.childNodes.length)
+    }
+
+    selection.removeAllRanges()
+    selection.addRange(range)
+  }, { start, end })
+}
+
+async function moveEditorCaretToEnd(editor: Locator) {
+  await editor.evaluate((element) => {
+    element.focus()
+    const selection = window.getSelection()
+    if (!selection) return
+    const range = document.createRange()
+    range.selectNodeContents(element)
+    range.collapse(false)
+    selection.removeAllRanges()
+    selection.addRange(range)
+  })
+}
+
+async function dispatchEditorPaste(editor: Locator, text: string, html = '') {
+  await editor.evaluate((element, payload) => {
+    const data = new DataTransfer()
+    data.setData('text/plain', payload.text)
+    if (payload.html) {
+      data.setData('text/html', payload.html)
+    }
+    const event = new ClipboardEvent('paste', {
+      clipboardData: data,
+      bubbles: true,
+      cancelable: true,
+    })
+    element.dispatchEvent(event)
+  }, { text, html })
 }
 
 async function acceptCurrentRevision(page: Page) {
@@ -199,6 +282,92 @@ test.describe.serial('核心 E2E 冒烟流程', () => {
     await focusPage.getByTestId('workbench-export-button').click()
     const focusDownload = await focusDownloadPromise
     expect(focusDownload.suggestedFilename()).toContain('smoke-source')
+    await focusPage.close()
+  })
+
+  test('目标译文编辑支持稳定撤销和恢复', async ({ page }) => {
+    await login(page)
+    const focusPage = await createProjectWithFixtureAndOpenFocusWorkbench(
+      page,
+      `E2E Undo ${Date.now()}`,
+    )
+
+    const editor = focusPage.getByTestId('segment-target-editor').first()
+    await expect(editor).toBeVisible()
+
+    await editor.fill('')
+    await editor.click()
+    await focusPage.keyboard.type('Alpha Beta')
+    await expectEditorText(editor, 'Alpha Beta')
+
+    await focusPage.keyboard.press('Control+Z')
+    await expectEditorText(editor, 'Alpha')
+    await focusPage.keyboard.press('Control+Y')
+    await expectEditorText(editor, 'Alpha Beta')
+
+    await saveWorkbenchNow(focusPage)
+    await expectEditorText(editor, 'Alpha Beta')
+    await focusPage.keyboard.press('Control+Z')
+    await expectEditorText(editor, 'Alpha')
+    await focusPage.keyboard.press('Control+Y')
+    await expectEditorText(editor, 'Alpha Beta')
+
+    await focusPage.getByTestId('workbench-clear-target-button').click()
+    await expectEditorText(editor, '')
+    await focusPage.keyboard.press('Control+Z')
+    await expectEditorText(editor, 'Alpha Beta')
+
+    await focusPage.getByTestId('workbench-copy-source-button').click()
+    await focusPage.keyboard.press('Control+Z')
+    await expectEditorText(editor, 'Alpha Beta')
+
+    await editor.fill('format me')
+    await selectEditorRange(editor, 0, 6)
+    await focusPage.getByTestId('workbench-format-bold').click()
+    await expectEditorHtml(editor, /<b>format<\/b>/i)
+    await focusPage.keyboard.press('Control+Z')
+    await expectEditorHtmlNot(editor, /<b>format<\/b>/i)
+
+    await selectEditorRange(editor, 0, 6)
+    await focusPage.getByTestId('workbench-format-bold').click()
+    await expectEditorHtml(editor, /<b>format<\/b>/i)
+    await selectEditorRange(editor, 0, 6)
+    await focusPage.getByTestId('workbench-clear-format-button').click()
+    await expectEditorHtmlNot(editor, /<b>format<\/b>/i)
+    await focusPage.keyboard.press('Control+Z')
+    await expectEditorHtml(editor, /<b>format<\/b>/i)
+
+    await editor.fill('case word')
+    await selectEditorRange(editor, 0, 4)
+    await focusPage.getByTestId('workbench-case-menu-button').click()
+    await focusPage.getByTestId('workbench-case-upper').click()
+    await expectEditorText(editor, 'CASE word')
+    await focusPage.keyboard.press('Control+Z')
+    await expectEditorText(editor, 'case word')
+
+    await editor.fill('symbol')
+    await moveEditorCaretToEnd(editor)
+    await focusPage.getByTestId('workbench-special-character-menu').click()
+    await focusPage.getByTestId('workbench-special-character-0-0').click()
+    await expectEditorText(editor, 'symbol&')
+    await focusPage.keyboard.press('Control+Z')
+    await expectEditorText(editor, 'symbol')
+
+    await editor.fill('paste')
+    await moveEditorCaretToEnd(editor)
+    await dispatchEditorPaste(editor, ' plain')
+    await expectEditorText(editor, 'paste plain')
+    await focusPage.keyboard.press('Control+Z')
+    await expectEditorText(editor, 'paste')
+
+    await moveEditorCaretToEnd(editor)
+    await dispatchEditorPaste(editor, ' rich', '<b> rich</b>')
+    await expectEditorText(editor, 'paste rich')
+    await expectEditorHtml(editor, /<b>\s*rich<\/b>/i)
+    await focusPage.keyboard.press('Control+Z')
+    await expectEditorText(editor, 'paste')
+    await expectEditorHtmlNot(editor, /<b>\s*rich<\/b>/i)
+
     await focusPage.close()
   })
 

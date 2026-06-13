@@ -26,7 +26,7 @@ LEGACY_REQUIRED_EXISTING_TABLES = (
 )
 REQUIRED_SCHEMA = {
     "memory_bases": {"source_language", "target_language"},
-    "memory_entries": {"source_language", "target_language"},
+    "memory_entries": {"source_language", "target_language", "creator_id", "last_modified_by_id"},
     "term_bases": {
         "id",
         "name",
@@ -40,6 +40,8 @@ REQUIRED_SCHEMA = {
         "target_text",
         "source_language",
         "target_language",
+        "creator_id",
+        "last_modified_by_id",
     },
     "glossary_bases": {
         "id",
@@ -55,6 +57,8 @@ REQUIRED_SCHEMA = {
         "note",
         "source_language",
         "target_language",
+        "creator_id",
+        "last_modified_by_id",
     },
     "users": {"nickname", "translator_type"},
     "projects": {
@@ -367,6 +371,16 @@ REQUIRED_INDEXES = {
     },
     "memory_entries": {
         "uq_memory_entries_collection_source_hash_language_pair",
+        "ix_memory_entries_creator_id",
+        "ix_memory_entries_last_modified_by_id",
+    },
+    "term_entries": {
+        "ix_term_entries_creator_id",
+        "ix_term_entries_last_modified_by_id",
+    },
+    "glossary_entries": {
+        "ix_glossary_entries_creator_id",
+        "ix_glossary_entries_last_modified_by_id",
     },
     "auto_tm_outbox": {
         "uq_auto_tm_outbox_file_segment_collection",
@@ -533,6 +547,28 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ADD COLUMN IF NOT EXISTS target_language VARCHAR(20)
             """,
             """
+            ALTER TABLE IF EXISTS memory_entries
+            ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS memory_entries
+            ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_memory_entries_creator_id
+            ON memory_entries (creator_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_memory_entries_last_modified_by_id
+            ON memory_entries (last_modified_by_id)
+            """,
+            """
+            UPDATE memory_entries
+            SET last_modified_by_id = creator_id
+            WHERE last_modified_by_id IS NULL
+              AND creator_id IS NOT NULL
+            """,
+            """
             CREATE INDEX IF NOT EXISTS ix_memory_entries_language_pair
             ON memory_entries (source_language, target_language)
             """,
@@ -649,6 +685,8 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 source_normalized TEXT,
                 source_language VARCHAR(20) NOT NULL,
                 target_language VARCHAR(20) NOT NULL,
+                creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
@@ -664,6 +702,14 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS term_entries
             ADD COLUMN IF NOT EXISTS target_language VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS term_entries
+            ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS term_entries
+            ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL
             """,
             """
             ALTER TABLE IF EXISTS term_entries
@@ -688,6 +734,20 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_term_entries_language_pair
             ON term_entries (source_language, target_language)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_entries_creator_id
+            ON term_entries (creator_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_entries_last_modified_by_id
+            ON term_entries (last_modified_by_id)
+            """,
+            """
+            UPDATE term_entries
+            SET last_modified_by_id = creator_id
+            WHERE last_modified_by_id IS NULL
+              AND creator_id IS NOT NULL
             """,
             """
             DROP TRIGGER IF EXISTS update_term_entries_updated_at ON term_entries
@@ -757,6 +817,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 source_language VARCHAR(20) NOT NULL,
                 target_language VARCHAR(20) NOT NULL,
                 creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
@@ -783,6 +844,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
             """
             ALTER TABLE IF EXISTS glossary_entries
+            ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_entries
             ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
             """,
             """
@@ -792,6 +857,16 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_glossary_entries_creator_id
             ON glossary_entries (creator_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_entries_last_modified_by_id
+            ON glossary_entries (last_modified_by_id)
+            """,
+            """
+            UPDATE glossary_entries
+            SET last_modified_by_id = creator_id
+            WHERE last_modified_by_id IS NULL
+              AND creator_id IS NOT NULL
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_glossary_entries_glossary_base_id

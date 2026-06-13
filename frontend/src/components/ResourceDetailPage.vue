@@ -85,6 +85,10 @@ const showExportMenu = ref(false)
 const showIndexColumn = ref(true)
 const showSourceColumn = ref(true)
 const showTargetColumn = ref(true)
+const showCreatorColumn = ref(true)
+const showCreatedAtColumn = ref(true)
+const showLastModifiedByColumn = ref(true)
+const showUpdatedAtColumn = ref(true)
 const exportProgress = ref(0)
 const newSourceText = ref('')
 const newTargetText = ref('')
@@ -166,6 +170,8 @@ const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
 const canManageResources = computed(() => authStore.isAdmin)
 const tableColumnCount = computed(() => (
   Number(showIndexColumn.value) + Number(showSourceColumn.value) + Number(showTargetColumn.value)
+  + Number(showCreatorColumn.value) + Number(showCreatedAtColumn.value)
+  + Number(showLastModifiedByColumn.value) + Number(showUpdatedAtColumn.value)
   + Number(canManageResources.value)
 ))
 const entryCount = computed(() => resource.value?.entry_count ?? totalEntries.value)
@@ -661,6 +667,22 @@ onUnmounted(() => {
                 <input v-model="showTargetColumn" type="checkbox" />
                 {{ targetLanguageLabel }}
               </label>
+              <label>
+                <input v-model="showCreatorColumn" type="checkbox" />
+                创建人
+              </label>
+              <label>
+                <input v-model="showCreatedAtColumn" type="checkbox" />
+                创建时间
+              </label>
+              <label>
+                <input v-model="showLastModifiedByColumn" type="checkbox" />
+                最后修改人
+              </label>
+              <label>
+                <input v-model="showUpdatedAtColumn" type="checkbox" />
+                最新修改时间
+              </label>
             </div>
           </div>
         </div>
@@ -680,6 +702,10 @@ onUnmounted(() => {
                 <th v-if="showIndexColumn" class="resource-detail-table__index">序号</th>
                 <th v-if="showSourceColumn">{{ sourceLanguageLabel }}</th>
                 <th v-if="showTargetColumn">{{ targetLanguageLabel }}</th>
+                <th v-if="showCreatorColumn" class="resource-detail-table__meta">创建人</th>
+                <th v-if="showCreatedAtColumn" class="resource-detail-table__datetime">创建时间</th>
+                <th v-if="showLastModifiedByColumn" class="resource-detail-table__meta">最后修改人</th>
+                <th v-if="showUpdatedAtColumn" class="resource-detail-table__datetime">最新修改时间</th>
                 <th v-if="canManageResources" class="resource-detail-table__actions">操作</th>
               </tr>
             </thead>
@@ -718,6 +744,18 @@ onUnmounted(() => {
                     :aria-label="`编辑${copy.targetLabel}`"
                   />
                   <span v-else>{{ entry.target_text }}</span>
+                </td>
+                <td v-if="showCreatorColumn" class="resource-detail-table__meta">
+                  {{ entry.creator_name || '-' }}
+                </td>
+                <td v-if="showCreatedAtColumn" class="resource-detail-table__datetime">
+                  {{ formatDate(entry.created_at) }}
+                </td>
+                <td v-if="showLastModifiedByColumn" class="resource-detail-table__meta">
+                  {{ entry.last_modified_by_name || '-' }}
+                </td>
+                <td v-if="showUpdatedAtColumn" class="resource-detail-table__datetime">
+                  {{ formatDate(entry.updated_at) }}
                 </td>
                 <td v-if="canManageResources" class="resource-detail-table__actions">
                   <div v-if="isEditingEntry(entry)" class="resource-detail-row-actions">
@@ -1137,7 +1175,7 @@ onUnmounted(() => {
 
 .resource-detail-table {
   width: 100%;
-  min-width: 720px;
+  min-width: 1120px;
   border-collapse: collapse;
   table-layout: fixed;
   font-size: 13px;
@@ -1173,6 +1211,14 @@ onUnmounted(() => {
 .resource-detail-table__index {
   width: 48px;
   text-align: center !important;
+}
+
+.resource-detail-table__meta {
+  width: 112px;
+}
+
+.resource-detail-table__datetime {
+  width: 152px;
 }
 
 .resource-detail-table__actions {

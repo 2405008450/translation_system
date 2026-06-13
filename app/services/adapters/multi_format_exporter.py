@@ -50,6 +50,10 @@ class MultiFormatExporter:
         extension = Path(filename).suffix.lower()
         base_name = Path(filename).stem or "translated"
 
+        if export_type == "source":
+            if original_bytes is None:
+                raise ValueError("Source export requires the original source file.")
+            return original_bytes, self._get_mime_type(extension), filename
         if export_type == "original":
             return self._export_original(
                 extension,

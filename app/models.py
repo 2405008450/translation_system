@@ -1323,6 +1323,8 @@ class TranslationMemory(Base):
             "source_language",
             "target_language",
         ),
+        Index("ix_memory_entries_creator_id", "creator_id"),
+        Index("ix_memory_entries_last_modified_by_id", "last_modified_by_id"),
         Index(
             "ix_memory_entries_source_text_trgm",
             "source_text",
@@ -1359,6 +1361,11 @@ class TranslationMemory(Base):
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
+    last_modified_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -1375,6 +1382,9 @@ class TranslationMemory(Base):
     )
     creator: Mapped["User | None"] = relationship(
         "User", foreign_keys=[creator_id]
+    )
+    last_modified_by: Mapped["User | None"] = relationship(
+        "User", foreign_keys=[last_modified_by_id]
     )
 
 
@@ -1533,6 +1543,8 @@ class TermEntry(Base):
             "source_normalized",
         ),
         Index("ix_term_entries_language_pair", "source_language", "target_language"),
+        Index("ix_term_entries_creator_id", "creator_id"),
+        Index("ix_term_entries_last_modified_by_id", "last_modified_by_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -1556,6 +1568,11 @@ class TermEntry(Base):
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
+    last_modified_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -1572,6 +1589,9 @@ class TermEntry(Base):
     )
     creator: Mapped["User | None"] = relationship(
         "User", foreign_keys=[creator_id]
+    )
+    last_modified_by: Mapped["User | None"] = relationship(
+        "User", foreign_keys=[last_modified_by_id]
     )
 
 
@@ -1620,6 +1640,8 @@ class GlossaryEntry(Base):
             "source_normalized",
         ),
         Index("ix_glossary_entries_language_pair", "source_language", "target_language"),
+        Index("ix_glossary_entries_creator_id", "creator_id"),
+        Index("ix_glossary_entries_last_modified_by_id", "last_modified_by_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -1644,6 +1666,11 @@ class GlossaryEntry(Base):
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
+    last_modified_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -1660,6 +1687,9 @@ class GlossaryEntry(Base):
     )
     creator: Mapped["User | None"] = relationship(
         "User", foreign_keys=[creator_id]
+    )
+    last_modified_by: Mapped["User | None"] = relationship(
+        "User", foreign_keys=[last_modified_by_id]
     )
 
 

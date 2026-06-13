@@ -6,6 +6,8 @@ interface WorkbenchShortcutHandlers {
   focusPrev: () => void
   focusNext: () => void
   confirmCurrent: () => void
+  undo: () => void
+  redo: () => void
   closePanel: () => void
   toggleHelp: () => void
 }
@@ -54,6 +56,24 @@ export function useWorkbenchShortcuts(handlers: WorkbenchShortcutHandlers) {
       event.preventDefault()
       handlers.confirmCurrent()
       return
+    }
+
+    if (ctrlOrMeta && !editableTarget && !event.altKey) {
+      const key = event.key.toLowerCase()
+      if (key === 'z') {
+        event.preventDefault()
+        if (event.shiftKey) {
+          handlers.redo()
+        } else {
+          handlers.undo()
+        }
+        return
+      }
+      if (key === 'y') {
+        event.preventDefault()
+        handlers.redo()
+        return
+      }
     }
 
     if (editableTarget && !event.altKey) {

@@ -425,6 +425,7 @@ def _build_glossary_row(
         "source_language": source_language,
         "target_language": target_language,
         "creator_id": creator_id,
+        "last_modified_by_id": creator_id,
     }
 
 
@@ -520,8 +521,10 @@ def _flush_glossary_batch(
         existing.source_normalized = row["source_normalized"]
         existing.source_language = row["source_language"]
         existing.target_language = row["target_language"]
-        if row.get("creator_id"):
+        if existing.creator_id is None and row.get("creator_id"):
             existing.creator_id = row["creator_id"]
+        if row.get("last_modified_by_id"):
+            existing.last_modified_by_id = row["last_modified_by_id"]
         updated_rows += 1
 
     db.commit()

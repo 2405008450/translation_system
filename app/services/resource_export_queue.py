@@ -15,7 +15,7 @@ from fastapi import HTTPException
 from fastapi.responses import FileResponse
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.config import get_settings
 from app.services.cache import get_json as cache_get_json
@@ -143,7 +143,7 @@ def export_tm_collection_now(
         _write_xlsx_file(
             output_path=output_path,
             sheet_title=collection.name,
-            headers=["原文", "译文", "源语言", "目标语言", "创建时间", "更新时间"],
+            headers=["原文", "译文", "源语言", "目标语言", "创建人", "创建时间", "最后修改人", "更新时间"],
             row_iter=_iter_tm_xlsx_rows(db, collection.id),
             total_entries=total_entries,
             progress_callback=progress,
@@ -196,7 +196,7 @@ def export_term_base_now(
         _write_xlsx_file(
             output_path=output_path,
             sheet_title=term_base.name,
-            headers=["术语原文", "术语译文", "源语言", "目标语言", "创建时间", "更新时间"],
+            headers=["术语原文", "术语译文", "源语言", "目标语言", "创建人", "创建时间", "最后修改人", "更新时间"],
             row_iter=_iter_term_xlsx_rows(db, term_base.id),
             total_entries=total_entries,
             progress_callback=progress,
@@ -249,7 +249,7 @@ def export_glossary_base_now(
         _write_xlsx_file(
             output_path=output_path,
             sheet_title=glossary_base.name,
-            headers=["原文", "译文", "备注", "源语言", "目标语言", "创建时间", "更新时间"],
+            headers=["原文", "译文", "备注", "源语言", "目标语言", "创建人", "创建时间", "最后修改人", "更新时间"],
             row_iter=_iter_glossary_xlsx_rows(db, glossary_base.id),
             total_entries=total_entries,
             progress_callback=progress,
@@ -437,7 +437,10 @@ def _write_tmx_file(
 
 
 def _iter_tm_xlsx_rows(db: Session, collection_id: UUID):
-    from app.models import TranslationMemory
+    from app.models import TranslationMemory, User
+
+    Creator = aliased(User)
+    Modifier = aliased(User)
 
     query = (
         db.query(
@@ -445,9 +448,15 @@ def _iter_tm_xlsx_rows(db: Session, collection_id: UUID):
             TranslationMemory.target_text,
             TranslationMemory.source_language,
             TranslationMemory.target_language,
+            Creator.nickname.label("creator_nickname"),
+            Creator.username.label("creator_username"),
             TranslationMemory.created_at,
+            Modifier.nickname.label("modifier_nickname"),
+            Modifier.username.label("modifier_username"),
             TranslationMemory.updated_at,
         )
+        .outerjoin(Creator, TranslationMemory.creator_id == Creator.id)
+        .outerjoin(Modifier, TranslationMemory.last_modified_by_id == Modifier.id)
         .filter(TranslationMemory.collection_id == collection_id)
         .order_by(TranslationMemory.updated_at.desc(), TranslationMemory.created_at.desc())
         .execution_options(stream_results=True)
@@ -458,13 +467,18 @@ def _iter_tm_xlsx_rows(db: Session, collection_id: UUID):
             row.target_text,
             row.source_language or "",
             row.target_language or "",
+            _format_user_name(row.creator_nickname, row.creator_username),
             _format_datetime(row.created_at),
+            _format_user_name(row.modifier_nickname, row.modifier_username),
             _format_datetime(row.updated_at),
         ]
 
 
 def _iter_term_xlsx_rows(db: Session, term_base_id: UUID):
-    from app.models import TermEntry
+    from app.models import TermEntry, User
+
+    Creator = aliased(User)
+    Modifier = aliased(User)
 
     query = (
         db.query(
@@ -472,9 +486,15 @@ def _iter_term_xlsx_rows(db: Session, term_base_id: UUID):
             TermEntry.target_text,
             TermEntry.source_language,
             TermEntry.target_language,
+            Creator.nickname.label("creator_nickname"),
+            Creator.username.label("creator_username"),
             TermEntry.created_at,
+            Modifier.nickname.label("modifier_nickname"),
+            Modifier.username.label("modifier_username"),
             TermEntry.updated_at,
         )
+        .outerjoin(Creator, TermEntry.creator_id == Creator.id)
+        .outerjoin(Modifier, TermEntry.last_modified_by_id == Modifier.id)
         .filter(TermEntry.term_base_id == term_base_id)
         .order_by(TermEntry.updated_at.desc(), TermEntry.created_at.desc())
         .execution_options(stream_results=True)
@@ -485,13 +505,18 @@ def _iter_term_xlsx_rows(db: Session, term_base_id: UUID):
             row.target_text,
             row.source_language or "",
             row.target_language or "",
+            _format_user_name(row.creator_nickname, row.creator_username),
             _format_datetime(row.created_at),
+            _format_user_name(row.modifier_nickname, row.modifier_username),
             _format_datetime(row.updated_at),
         ]
 
 
 def _iter_glossary_xlsx_rows(db: Session, glossary_base_id: UUID):
-    from app.models import GlossaryEntry
+    from app.models import GlossaryEntry, User
+
+    Creator = aliased(User)
+    Modifier = aliased(User)
 
     query = (
         db.query(
@@ -500,9 +525,15 @@ def _iter_glossary_xlsx_rows(db: Session, glossary_base_id: UUID):
             GlossaryEntry.note,
             GlossaryEntry.source_language,
             GlossaryEntry.target_language,
+            Creator.nickname.label("creator_nickname"),
+            Creator.username.label("creator_username"),
             GlossaryEntry.created_at,
+            Modifier.nickname.label("modifier_nickname"),
+            Modifier.username.label("modifier_username"),
             GlossaryEntry.updated_at,
         )
+        .outerjoin(Creator, GlossaryEntry.creator_id == Creator.id)
+        .outerjoin(Modifier, GlossaryEntry.last_modified_by_id == Modifier.id)
         .filter(GlossaryEntry.glossary_base_id == glossary_base_id)
         .order_by(GlossaryEntry.updated_at.desc(), GlossaryEntry.created_at.desc())
         .execution_options(stream_results=True)
@@ -514,7 +545,9 @@ def _iter_glossary_xlsx_rows(db: Session, glossary_base_id: UUID):
             row.note or "",
             row.source_language or "",
             row.target_language or "",
+            _format_user_name(row.creator_nickname, row.creator_username),
             _format_datetime(row.created_at),
+            _format_user_name(row.modifier_nickname, row.modifier_username),
             _format_datetime(row.updated_at),
         ]
 
@@ -668,6 +701,10 @@ def _format_datetime(value: datetime | None) -> str:
     if value is None:
         return ""
     return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_user_name(nickname: str | None, username: str | None) -> str:
+    return nickname or username or ""
 
 
 def _noop_progress_callback(progress: int, message: str) -> None:

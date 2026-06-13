@@ -165,6 +165,9 @@ def _serialize_term_entry(entry: TermEntry) -> dict:
     creator_name = None
     if entry.creator:
         creator_name = entry.creator.nickname or entry.creator.username
+    last_modified_by_name = None
+    if entry.last_modified_by:
+        last_modified_by_name = entry.last_modified_by.nickname or entry.last_modified_by.username
     return {
         "id": entry.id,
         "term_base_id": entry.term_base_id,
@@ -172,7 +175,10 @@ def _serialize_term_entry(entry: TermEntry) -> dict:
         "target_text": entry.target_text,
         "source_language": entry.source_language,
         "target_language": entry.target_language,
+        "creator_id": entry.creator_id,
         "creator_name": creator_name,
+        "last_modified_by_id": entry.last_modified_by_id,
+        "last_modified_by_name": last_modified_by_name,
         "created_at": entry.created_at.isoformat(),
         "updated_at": entry.updated_at.isoformat(),
     }
@@ -375,7 +381,9 @@ def merge_term_bases(
                 existing.source_normalized = source_normalized
                 existing.source_language = source_language
                 existing.target_language = target_language
-                existing.creator_id = entry.creator_id or current_user.id
+                if existing.creator_id is None:
+                    existing.creator_id = entry.creator_id or current_user.id
+                existing.last_modified_by_id = current_user.id
                 merged_by_source_normalized[source_normalized] = existing
                 merged_by_source_text[source_text] = existing
                 updated_rows += 1
@@ -389,6 +397,7 @@ def merge_term_bases(
                 source_language=source_language,
                 target_language=target_language,
                 creator_id=entry.creator_id or current_user.id,
+                last_modified_by_id=current_user.id,
             )
             db.add(merged_entry)
             merged_by_source_normalized[source_normalized] = merged_entry
@@ -618,6 +627,7 @@ async def import_term_base_xlsx(
             term_base_id=term_base_id,
             source_language=resolved_source_language,
             target_language=resolved_target_language,
+            creator_id=current_user.id,
             skip_duplicate_row_indexes=skipped_row_indexes,
             skip_header=skip_header,
         )
@@ -760,14 +770,16 @@ def export_term_base_entries_xlsx(
     )
     xlsx_bytes = build_tabular_xlsx(
         sheet_title=term_base.name,
-        headers=["术语原文", "术语译文", "源语言", "目标语言", "创建时间", "更新时间"],
+        headers=["术语原文", "术语译文", "源语言", "目标语言", "创建人", "创建时间", "最后修改人", "更新时间"],
         rows=[
             [
                 entry.source_text,
                 entry.target_text,
                 entry.source_language,
                 entry.target_language,
+                (entry.creator.nickname or entry.creator.username) if entry.creator else "",
                 entry.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                (entry.last_modified_by.nickname or entry.last_modified_by.username) if entry.last_modified_by else "",
                 entry.updated_at.strftime("%Y-%m-%d %H:%M:%S"),
             ]
             for entry in rows
@@ -841,6 +853,7 @@ def create_term_base_entry(
         source_language=term_base.source_language,
         target_language=term_base.target_language,
         creator_id=current_user.id,
+        last_modified_by_id=current_user.id,
     )
     db.add(entry)
     db.commit()
@@ -853,7 +866,7 @@ def update_term_entry(
     entry_id: UUID,
     payload: TermEntryUpdatePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     entry = db.query(TermEntry).filter(TermEntry.id == entry_id).first()
     if entry is None:
@@ -891,6 +904,9 @@ def update_term_entry(
     entry.source_normalized = source_normalized
     entry.source_language = source_language
     entry.target_language = target_language
+    if entry.creator_id is None:
+        entry.creator_id = current_user.id
+    entry.last_modified_by_id = current_user.id
     db.commit()
     db.refresh(entry)
     return _serialize_term_entry(entry)

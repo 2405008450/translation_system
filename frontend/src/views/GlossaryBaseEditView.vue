@@ -110,7 +110,7 @@ const languagePairLabel = computed(() => (
     : '-'
 ))
 const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
-const tableColumnCount = computed(() => 4 + Number(canManageResources.value))
+const tableColumnCount = computed(() => 8 + Number(canManageResources.value))
 const exportButtonText = computed(() => (
   exportingEntries.value ? `导出中 ${exportProgress.value}%` : '导出'
 ))
@@ -702,6 +702,10 @@ onUnmounted(() => {
                 <th>原文</th>
                 <th>译文</th>
                 <th>备注</th>
+                <th class="glossary-detail-table__meta">创建人</th>
+                <th class="glossary-detail-table__datetime">创建时间</th>
+                <th class="glossary-detail-table__meta">最后修改人</th>
+                <th class="glossary-detail-table__datetime">最新修改时间</th>
                 <th v-if="canManageResources" class="glossary-detail-table__actions">操作</th>
               </tr>
             </thead>
@@ -750,6 +754,18 @@ onUnmounted(() => {
                     aria-label="编辑备注"
                   />
                   <span v-else class="glossary-detail-note">{{ entry.note || '-' }}</span>
+                </td>
+                <td class="glossary-detail-table__meta">
+                  {{ entry.creator_name || '-' }}
+                </td>
+                <td class="glossary-detail-table__datetime">
+                  {{ formatDate(entry.created_at) }}
+                </td>
+                <td class="glossary-detail-table__meta">
+                  {{ entry.last_modified_by_name || '-' }}
+                </td>
+                <td class="glossary-detail-table__datetime">
+                  {{ formatDate(entry.updated_at) }}
                 </td>
                 <td v-if="canManageResources" class="glossary-detail-table__actions">
                   <div v-if="isEditingEntry(entry)" class="glossary-detail-row-actions">
@@ -1222,7 +1238,7 @@ onUnmounted(() => {
 
 .glossary-detail-table {
   width: 100%;
-  min-width: 860px;
+  min-width: 1240px;
   border-collapse: collapse;
   table-layout: fixed;
   font-size: 13px;
@@ -1258,6 +1274,14 @@ onUnmounted(() => {
 .glossary-detail-table__index {
   width: 56px;
   text-align: center !important;
+}
+
+.glossary-detail-table__meta {
+  width: 112px;
+}
+
+.glossary-detail-table__datetime {
+  width: 152px;
 }
 
 .glossary-detail-table__actions {

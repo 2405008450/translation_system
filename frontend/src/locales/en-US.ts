@@ -266,6 +266,11 @@ const overrides = {
         upload: 'Upload File',
         assign: 'Assign File',
         export: 'Export',
+        exportTarget: 'Export Target File',
+        exportSource: 'Export Source File',
+        exportSelectFirst: 'Select files to export first.',
+        exportLoading: 'Loading export options...',
+        exportNoOptions: 'No common export types are available.',
         delete: 'Delete',
         filter: 'Filter',
         columns: 'Columns',
@@ -284,6 +289,11 @@ const overrides = {
         crossFileRepeatedWords: 'Cross-file repeated words',
         crossFileRepeatedCharacters: 'Cross-file repeated characters',
       },
+    },
+    errors: {
+      export: 'Failed to export file.',
+      exportOptions: 'Failed to load export options.',
+      exportSource: 'Failed to export source files.',
     },
   },
   documentParsing: {

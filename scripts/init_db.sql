@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     source_language VARCHAR(20),
     target_language VARCHAR(20),
     creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
     source_embedding vector(128),
     source_embedding_version INTEGER,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -101,9 +102,13 @@ ALTER TABLE IF EXISTS memory_entries
     ADD COLUMN IF NOT EXISTS target_language VARCHAR(20);
 ALTER TABLE IF EXISTS memory_entries
     ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE IF EXISTS memory_entries
+    ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL;
 
 CREATE INDEX IF NOT EXISTS ix_memory_entries_creator_id
     ON memory_entries (creator_id);
+CREATE INDEX IF NOT EXISTS ix_memory_entries_last_modified_by_id
+    ON memory_entries (last_modified_by_id);
 
 CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_id
     ON memory_entries (collection_id);
@@ -232,6 +237,7 @@ CREATE TABLE IF NOT EXISTS term_entries (
     source_language VARCHAR(20) NOT NULL,
     target_language VARCHAR(20) NOT NULL,
     creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -245,12 +251,16 @@ ALTER TABLE IF EXISTS term_entries
 ALTER TABLE IF EXISTS term_entries
     ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL;
 ALTER TABLE IF EXISTS term_entries
+    ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE IF EXISTS term_entries
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
 ALTER TABLE IF EXISTS term_entries
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
 
 CREATE INDEX IF NOT EXISTS ix_term_entries_creator_id
     ON term_entries (creator_id);
+CREATE INDEX IF NOT EXISTS ix_term_entries_last_modified_by_id
+    ON term_entries (last_modified_by_id);
 
 CREATE INDEX IF NOT EXISTS ix_term_entries_term_base_id
     ON term_entries (term_base_id);
@@ -361,6 +371,7 @@ CREATE TABLE IF NOT EXISTS glossary_entries (
     source_language VARCHAR(20) NOT NULL,
     target_language VARCHAR(20) NOT NULL,
     creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -376,12 +387,16 @@ ALTER TABLE IF EXISTS glossary_entries
 ALTER TABLE IF EXISTS glossary_entries
     ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL;
 ALTER TABLE IF EXISTS glossary_entries
+    ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE IF EXISTS glossary_entries
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
 ALTER TABLE IF EXISTS glossary_entries
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
 
 CREATE INDEX IF NOT EXISTS ix_glossary_entries_creator_id
     ON glossary_entries (creator_id);
+CREATE INDEX IF NOT EXISTS ix_glossary_entries_last_modified_by_id
+    ON glossary_entries (last_modified_by_id);
 CREATE INDEX IF NOT EXISTS ix_glossary_entries_glossary_base_id
     ON glossary_entries (glossary_base_id);
 CREATE INDEX IF NOT EXISTS ix_glossary_entries_base_source_text

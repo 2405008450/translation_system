@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import mimetypes
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -384,8 +385,18 @@ def _run_file_export_task(task_id: UUID) -> None:
 
 def _build_exported_file(db: Session, file_record: FileRecord, export_type: str):
     raw_bytes = load_file_record_source(file_record)
-    segments = list_segments_for_file_record(db, file_record.id)
     source_filename = get_file_record_source_filename(file_record)
+
+    if export_type == "source":
+        if raw_bytes is None:
+            raise ValueError("The source file is unavailable.")
+        return _GenericExportedFile(
+            content=raw_bytes,
+            media_type=mimetypes.guess_type(source_filename)[0] or "application/octet-stream",
+            filename=source_filename,
+        )
+
+    segments = list_segments_for_file_record(db, file_record.id)
     document_parse_mode = getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL)
     document_parse_options = normalize_document_parse_options(
         getattr(file_record, "document_parse_options", None),

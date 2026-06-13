@@ -60,6 +60,7 @@ class LLMTranslationTask:
     tm_target_text: str | None = None
     glossary_matches: list[GlossaryMatch] = field(default_factory=list)
     should_translate: bool = True
+    project_sync_disabled: bool = False
 
 
 @dataclass(frozen=True)

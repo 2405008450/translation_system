@@ -238,18 +238,36 @@ CREATE INDEX IF NOT EXISTS ix_segments_file_source_hash
 -- -----------------------------------------------------------------------------
 ALTER TABLE IF EXISTS memory_entries
     ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE IF EXISTS memory_entries
+    ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL;
 
 CREATE INDEX IF NOT EXISTS ix_memory_entries_creator_id
     ON memory_entries (creator_id);
+CREATE INDEX IF NOT EXISTS ix_memory_entries_last_modified_by_id
+    ON memory_entries (last_modified_by_id);
+
+UPDATE memory_entries
+SET last_modified_by_id = creator_id
+WHERE last_modified_by_id IS NULL
+  AND creator_id IS NOT NULL;
 
 -- -----------------------------------------------------------------------------
 -- term_entries 表：缺少 creator_id（models.py 中有此字段）
 -- -----------------------------------------------------------------------------
 ALTER TABLE IF EXISTS term_entries
     ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE IF EXISTS term_entries
+    ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL;
 
 CREATE INDEX IF NOT EXISTS ix_term_entries_creator_id
     ON term_entries (creator_id);
+CREATE INDEX IF NOT EXISTS ix_term_entries_last_modified_by_id
+    ON term_entries (last_modified_by_id);
+
+UPDATE term_entries
+SET last_modified_by_id = creator_id
+WHERE last_modified_by_id IS NULL
+  AND creator_id IS NOT NULL;
 
 -- -----------------------------------------------------------------------------
 -- document statistics reports：每次点击统计生成一份可切换的字数检验报告
@@ -316,6 +334,7 @@ CREATE TABLE IF NOT EXISTS glossary_entries (
     source_language VARCHAR(20) NOT NULL,
     target_language VARCHAR(20) NOT NULL,
     creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -331,12 +350,21 @@ ALTER TABLE IF EXISTS glossary_entries
 ALTER TABLE IF EXISTS glossary_entries
     ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL;
 ALTER TABLE IF EXISTS glossary_entries
+    ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE IF EXISTS glossary_entries
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
 ALTER TABLE IF EXISTS glossary_entries
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
 
 CREATE INDEX IF NOT EXISTS ix_glossary_entries_creator_id
     ON glossary_entries (creator_id);
+CREATE INDEX IF NOT EXISTS ix_glossary_entries_last_modified_by_id
+    ON glossary_entries (last_modified_by_id);
+
+UPDATE glossary_entries
+SET last_modified_by_id = creator_id
+WHERE last_modified_by_id IS NULL
+  AND creator_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_glossary_entries_glossary_base_id
     ON glossary_entries (glossary_base_id);
 CREATE INDEX IF NOT EXISTS ix_glossary_entries_base_source_text

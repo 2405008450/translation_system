@@ -281,6 +281,12 @@ interface FileExportTask {
   message?: string
   error?: string | null
 }
+interface FileExportOption {
+  id: string
+  name: string
+  description: string
+  extension: string
+}
 
 const confirm = useConfirm()
 const authStore = useAuthStore()
@@ -536,8 +542,12 @@ const generatingTermQAReport = ref(false)
 const termQAReport = ref<TermQAReport | null>(null)
 const downloadingTermQAReport = ref(false)
 const exportingFileId = ref('')
+const exportingFileType = ref('')
 const exportFileProgress = ref(0)
 const exportFileMessage = ref('')
+const showProjectExportMenu = ref(false)
+const loadingProjectExportOptions = ref(false)
+const projectExportOptions = ref<FileExportOption[]>([])
 let exportPollTimer: number | null = null
 
 const tabs = computed(() => ([
@@ -721,6 +731,23 @@ const canOpenTermExtraction = computed(() => (
   && Boolean(selectedTermExtractionSourceLanguage.value)
   && Boolean(selectedTermExtractionTargetLanguage.value)
 ))
+const canOpenProjectExportMenu = computed(() => (
+  selectedProjectFiles.value.length > 0
+  && !exportingFileId.value
+  && !loadingProjectExportOptions.value
+))
+const projectExportButtonTitle = computed(() => {
+  if (selectedProjectFiles.value.length === 0) {
+    return t('projectDetail.files.actions.exportSelectFirst')
+  }
+  if (loadingProjectExportOptions.value) {
+    return t('projectDetail.files.actions.exportLoading')
+  }
+  if (exportingFileId.value) {
+    return exportFileMessage.value
+  }
+  return ''
+})
 
 const columns = computed<DataTableColumn[]>(() => ([
   { key: 'filename', label: t('projectDetail.files.columns.details'), width: '300px' },
@@ -1645,6 +1672,10 @@ function stopActionMenuEventBubble(ev: MouseEvent) {
 }
 
 function handleDocumentClick(ev: MouseEvent) {
+  const target = ev.target as HTMLElement
+  if (!target.closest('.pd-export-dropdown')) {
+    showProjectExportMenu.value = false
+  }
   if (isEventFromFloatingActionMenu(ev)) {
     return
   }
@@ -1652,6 +1683,7 @@ function handleDocumentClick(ev: MouseEvent) {
 }
 
 function handleDocumentScroll() {
+  showProjectExportMenu.value = false
   if (openActionMenuId.value) {
     closeActionMenu()
   }
@@ -2824,15 +2856,35 @@ function waitForExportPoll(ms: number) {
   })
 }
 
-function isProjectFileExporting(row: ProjectRow | null) {
-  return Boolean(row && exportingFileId.value === String(row.id))
+function isProjectFileExporting(row: ProjectRow | null, exportType = '') {
+  if (!row || exportingFileId.value !== String(row.id)) {
+    return false
+  }
+  return !exportType || exportingFileType.value === exportType
 }
 
-function getProjectFileExportLabel(row: ProjectRow | null) {
-  if (!isProjectFileExporting(row)) {
-    return t('projectDetail.files.actions.export')
+function getProjectFileExportLabel(row: ProjectRow | null, exportType = 'original') {
+  if (!isProjectFileExporting(row, exportType)) {
+    return exportType === 'source'
+      ? t('projectDetail.files.actions.exportSource')
+      : t('projectDetail.files.actions.exportTarget')
   }
   return `导出中 ${exportFileProgress.value}%`
+}
+
+function getProjectFileExportFallbackName(filename: string, exportType: string) {
+  return exportType === 'source' ? filename : buildTranslatedTaskFilename(filename)
+}
+
+function getProjectFileExportSuccessMessage(exportType: string, count: number) {
+  if (count > 1) {
+    return exportType === 'source'
+      ? `已开始下载 ${count} 个源文件。`
+      : `已开始下载 ${count} 个导出文件。`
+  }
+  return exportType === 'source'
+    ? '源文件已开始下载。'
+    : '导出完成，文件已开始下载。'
 }
 
 async function waitForFileExportTask(task: FileExportTask) {
@@ -2854,43 +2906,128 @@ async function waitForFileExportTask(task: FileExportTask) {
   }
 }
 
-async function exportProjectFile(row: ProjectRow) {
-  if (!row.has_source_document) {
+async function loadProjectExportOptionsForSelection() {
+  const rows = [...selectedProjectFiles.value]
+  projectExportOptions.value = []
+  if (rows.length === 0) {
     return
   }
+
+  loadingProjectExportOptions.value = true
+  try {
+    const responses = await Promise.all(
+      rows.map((row) => http.get<{ export_options: FileExportOption[] }>(`/file-records/${String(row.id)}/export-options`)),
+    )
+    const optionLists = responses.map((response) => response.data.export_options || [])
+    const firstOptions = optionLists[0] || []
+    const commonIds = new Set(firstOptions.map((option) => option.id))
+    for (const options of optionLists.slice(1)) {
+      const ids = new Set(options.map((option) => option.id))
+      for (const id of Array.from(commonIds)) {
+        if (!ids.has(id)) {
+          commonIds.delete(id)
+        }
+      }
+    }
+    projectExportOptions.value = firstOptions.filter((option) => commonIds.has(option.id))
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('projectDetail.errors.exportOptions'))
+    projectExportOptions.value = []
+  } finally {
+    loadingProjectExportOptions.value = false
+  }
+}
+
+async function toggleProjectExportMenu() {
+  if (!canOpenProjectExportMenu.value) {
+    return
+  }
+  if (showProjectExportMenu.value) {
+    showProjectExportMenu.value = false
+    return
+  }
+  await loadProjectExportOptionsForSelection()
+  showProjectExportMenu.value = true
+}
+
+async function downloadProjectFileExport(row: ProjectRow, exportType: string) {
+  const rowId = String(row.id)
+  const filename = String(row.filename || 'export')
+  const { data: task } = await http.post<FileExportTask>(
+    `/file-records/${rowId}/exports`,
+    null,
+    { params: { type: exportType } },
+  )
+  const completedTask = await waitForFileExportTask(task)
+  const response = await http.get(`/file-records/export-tasks/${completedTask.task_id}/download`, {
+    responseType: 'blob',
+  })
+  const downloadName = resolveDownloadFilename(
+    response.headers['content-disposition'],
+    getProjectFileExportFallbackName(filename, exportType),
+  )
+  downloadBlob(response.data, downloadName)
+}
+
+async function exportProjectFile(row: ProjectRow, exportType = 'original') {
   if (exportingFileId.value) {
     return
   }
 
   closeActionMenu()
+  showProjectExportMenu.value = false
   pageError.value = ''
-  const rowId = String(row.id)
-  const filename = String(row.filename || 'translated.txt')
-  exportingFileId.value = rowId
+  exportingFileId.value = String(row.id)
+  exportingFileType.value = exportType
   exportFileProgress.value = 0
   exportFileMessage.value = '导出任务提交中。'
 
   try {
-    const { data: task } = await http.post<FileExportTask>(
-      `/file-records/${rowId}/exports`,
-      null,
-      { params: { type: 'original' } },
-    )
-    const completedTask = await waitForFileExportTask(task)
-    const response = await http.get(`/file-records/export-tasks/${completedTask.task_id}/download`, {
-      responseType: 'blob',
-    })
-    const downloadName = resolveDownloadFilename(
-      response.headers['content-disposition'],
-      buildTranslatedTaskFilename(filename),
-    )
-    downloadBlob(response.data, downloadName)
-    toast.success('导出完成，文件已开始下载。')
+    await downloadProjectFileExport(row, exportType)
+    toast.success(getProjectFileExportSuccessMessage(exportType, 1))
   } catch (error) {
-    pageError.value = getErrorMessage(error, t('projectDetail.errors.export'))
+    pageError.value = getErrorMessage(
+      error,
+      exportType === 'source' ? t('projectDetail.errors.exportSource') : t('projectDetail.errors.export'),
+    )
   } finally {
     clearExportPollTimer()
     exportingFileId.value = ''
+    exportingFileType.value = ''
+    exportFileProgress.value = 0
+    exportFileMessage.value = ''
+  }
+}
+
+async function exportSelectedProjectFiles(exportType: string) {
+  if (selectedProjectFiles.value.length === 0 || exportingFileId.value) {
+    return
+  }
+
+  closeActionMenu()
+  showProjectExportMenu.value = false
+  pageError.value = ''
+  const rows = [...selectedProjectFiles.value]
+
+  try {
+    for (let index = 0; index < rows.length; index += 1) {
+      const current = rows[index]
+      exportingFileId.value = String(current.id)
+      exportingFileType.value = exportType
+      exportFileProgress.value = 0
+      exportFileMessage.value = `导出 ${index + 1}/${rows.length} 提交中。`
+      await downloadProjectFileExport(current, exportType)
+    }
+    toast.success(getProjectFileExportSuccessMessage(exportType, rows.length))
+  } catch (error) {
+    pageError.value = getErrorMessage(
+      error,
+      exportType === 'source' ? t('projectDetail.errors.exportSource') : t('projectDetail.errors.export'),
+    )
+  } finally {
+    clearExportPollTimer()
+    exportingFileId.value = ''
+    exportingFileType.value = ''
     exportFileProgress.value = 0
     exportFileMessage.value = ''
   }
@@ -4385,15 +4522,42 @@ onBeforeUnmount(() => {
               <Users :size="14" />
               {{ t('projectDetail.files.actions.assign') }}
             </button>
-            <button
-              class="button"
-              type="button"
-              disabled
-              :title="t('projectDetail.common.comingSoon')"
-            >
-              <Download :size="14" />
-              {{ t('projectDetail.files.actions.export') }}
-            </button>
+            <div class="pd-export-dropdown">
+              <button
+                class="button"
+                data-testid="project-file-export-selected"
+                type="button"
+                :disabled="!canOpenProjectExportMenu"
+                :title="projectExportButtonTitle || undefined"
+                @click.stop="toggleProjectExportMenu"
+              >
+                <Loader2 v-if="loadingProjectExportOptions || exportingFileId" class="lucide-spin" :size="14" />
+                <Download v-else :size="14" />
+                {{ exportingFileId ? `导出中 ${exportFileProgress}%` : t('projectDetail.files.actions.export') }}
+                <ChevronDown :size="13" />
+              </button>
+              <div v-if="showProjectExportMenu" class="pd-export-menu" role="menu" @click.stop>
+                <div v-if="loadingProjectExportOptions" class="pd-export-menu__loading">
+                  {{ t('projectDetail.files.actions.exportLoading') }}
+                </div>
+                <div v-else-if="projectExportOptions.length === 0" class="pd-export-menu__loading">
+                  {{ t('projectDetail.files.actions.exportNoOptions') }}
+                </div>
+                <template v-else>
+                  <button
+                    v-for="option in projectExportOptions"
+                    :key="option.id"
+                    class="pd-export-menu__item"
+                    type="button"
+                    :disabled="Boolean(exportingFileId)"
+                    @click="exportSelectedProjectFiles(option.id)"
+                  >
+                    <span class="pd-export-menu__item-name">{{ option.name }}</span>
+                    <span class="pd-export-menu__item-desc">{{ option.description }}</span>
+                  </button>
+                </template>
+              </div>
+            </div>
             <button v-if="canManageProject" class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
               <Clock3 :size="14" />
               {{ t('projectDetail.files.actions.modifyTaskType') }}
@@ -4796,10 +4960,18 @@ onBeforeUnmount(() => {
         <button
           type="button"
           :disabled="!actionMenuRow.has_source_document || Boolean(exportingFileId)"
-          :title="isProjectFileExporting(actionMenuRow) ? exportFileMessage : (!actionMenuRow.has_source_document ? t('projectDetail.common.uploadRequired') : undefined)"
-          @click="exportProjectFile(actionMenuRow)"
+          :title="isProjectFileExporting(actionMenuRow, 'original') ? exportFileMessage : (!actionMenuRow.has_source_document ? t('projectDetail.common.uploadRequired') : undefined)"
+          @click="exportProjectFile(actionMenuRow, 'original')"
         >
-          {{ getProjectFileExportLabel(actionMenuRow) }}
+          {{ getProjectFileExportLabel(actionMenuRow, 'original') }}
+        </button>
+        <button
+          type="button"
+          :disabled="!actionMenuRow.has_source_document || Boolean(exportingFileId)"
+          :title="isProjectFileExporting(actionMenuRow, 'source') ? exportFileMessage : (!actionMenuRow.has_source_document ? t('projectDetail.common.uploadRequired') : undefined)"
+          @click="exportProjectFile(actionMenuRow, 'source')"
+        >
+          {{ getProjectFileExportLabel(actionMenuRow, 'source') }}
         </button>
         <button
           type="button"
@@ -5650,6 +5822,70 @@ onBeforeUnmount(() => {
 .pd-toolbar__left,
 .pd-toolbar__right {
   flex-wrap: wrap;
+}
+
+.pd-export-dropdown {
+  position: relative;
+  display: inline-flex;
+}
+
+.pd-export-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 30;
+  min-width: 240px;
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-0);
+  box-shadow: var(--shadow-medium);
+}
+
+.pd-export-menu__loading,
+.pd-export-menu__item {
+  width: 100%;
+  padding: 9px 12px;
+  text-align: left;
+}
+
+.pd-export-menu__loading {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.pd-export-menu__item {
+  display: grid;
+  gap: 3px;
+  border: 0;
+  border-bottom: 1px solid var(--line-soft);
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.pd-export-menu__item:last-child {
+  border-bottom: 0;
+}
+
+.pd-export-menu__item:hover:not(:disabled) {
+  background: var(--surface-muted);
+}
+
+.pd-export-menu__item:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.pd-export-menu__item-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.pd-export-menu__item-desc {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .pd-file-table :deep(.data-table) {

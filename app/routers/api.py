@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import partial
 from io import BytesIO
@@ -2689,10 +2690,79 @@ def _build_llm_translation_tasks(
                 tm_target_text=tm_target_text,
                 glossary_matches=glossary_matches_by_source.get(segment.source_text, []),
                 should_translate=should_translate,
+                project_sync_disabled=bool(getattr(segment, "project_sync_disabled", False)),
             )
         )
 
     return tasks
+
+
+@dataclass(frozen=True)
+class LLMDeduplicationResult:
+    tasks: list[LLMTranslationTask]
+    result_sentence_ids_by_representative: dict[str, list[str]]
+    unique_total: int
+    deduplicated_count: int
+
+
+def _llm_task_has_tm_context(task: LLMTranslationTask) -> bool:
+    return task.status in {"exact", "fuzzy"} and bool(normalize_text(task.tm_target_text or ""))
+
+
+def _select_llm_representative(
+    grouped_tasks: list[tuple[int, LLMTranslationTask]],
+) -> LLMTranslationTask:
+    _, task = min(
+        grouped_tasks,
+        key=lambda item: (
+            0 if _llm_task_has_tm_context(item[1]) else 1,
+            item[0],
+        ),
+    )
+    return task
+
+
+def _deduplicate_llm_translation_tasks(
+    tasks: list[LLMTranslationTask],
+) -> LLMDeduplicationResult:
+    grouped_by_source_hash: dict[str, list[tuple[int, LLMTranslationTask]]] = {}
+    target_total = 0
+    for index, task in enumerate(tasks):
+        if not task.should_translate:
+            continue
+        target_total += 1
+        if task.project_sync_disabled:
+            continue
+        grouped_by_source_hash.setdefault(build_source_hash(task.source_text), []).append((index, task))
+
+    result_sentence_ids_by_representative: dict[str, list[str]] = {}
+    suppressed_sentence_ids: set[str] = set()
+    for grouped_tasks in grouped_by_source_hash.values():
+        representative = _select_llm_representative(grouped_tasks)
+        sentence_ids = [task.sentence_id for _, task in grouped_tasks]
+        result_sentence_ids_by_representative[representative.sentence_id] = sentence_ids
+        suppressed_sentence_ids.update(
+            sentence_id
+            for sentence_id in sentence_ids
+            if sentence_id != representative.sentence_id
+        )
+
+    deduplicated_tasks: list[LLMTranslationTask] = []
+    for task in tasks:
+        if task.should_translate and task.sentence_id in suppressed_sentence_ids:
+            deduplicated_tasks.append(replace(task, should_translate=False))
+            continue
+        deduplicated_tasks.append(task)
+        if task.should_translate:
+            result_sentence_ids_by_representative.setdefault(task.sentence_id, [task.sentence_id])
+
+    unique_total = sum(1 for task in deduplicated_tasks if task.should_translate)
+    return LLMDeduplicationResult(
+        tasks=deduplicated_tasks,
+        result_sentence_ids_by_representative=result_sentence_ids_by_representative,
+        unique_total=unique_total,
+        deduplicated_count=target_total - unique_total,
+    )
 
 
 @router.get("/guideline-templates")
@@ -7642,6 +7712,9 @@ def _queue_file_record_export_for_current_user(
     if export_type not in export_option_ids:
         raise HTTPException(status_code=400, detail="Current file format does not support this export type.")
 
+    if export_type == "source" and raw_bytes is None:
+        raise HTTPException(status_code=400, detail="The source file is unavailable.")
+
     if export_type == "original" and not can_export_task_file(
         get_file_record_source_filename(file_record),
         has_source_file=raw_bytes is not None,
@@ -7733,7 +7806,10 @@ def get_file_record_export_options(
         raise HTTPException(status_code=404, detail="文档不存在。")
 
     _require_file_record_read_access(file_record, current_user)
+    raw_bytes = load_file_record_source(file_record)
     options = get_export_options_for_file(file_record.filename)
+    if raw_bytes is None:
+        options = [option for option in options if option.get("id") != "source"]
 
     return {
         "file_record_id": str(file_record_id),
@@ -7783,6 +7859,17 @@ def export_file_record_with_type(
 
     _require_file_record_read_access(file_record, current_user)
     raw_bytes = load_file_record_source(file_record)
+
+    if export_type == "source":
+        if raw_bytes is None:
+            raise HTTPException(status_code=400, detail="The source file is unavailable.")
+        source_filename = get_file_record_source_filename(file_record)
+        return _build_binary_download_response(
+            filename=source_filename,
+            content=raw_bytes,
+            media_type="application/octet-stream",
+        )
+
     segments = list_segments_for_file_record(db, file_record_id)
 
     # 原格式导出需要按原文件重新写回，避免走通用导出器丢失格式。
@@ -9325,6 +9412,12 @@ async def llm_translate_file_record(
         sentence_id=body.sentence_id,
         source_filename=get_file_record_source_filename(file_record),
     )
+    deduplication = _deduplicate_llm_translation_tasks(translation_tasks)
+    target_task_by_sentence_id = {
+        task.sentence_id: task
+        for task in translation_tasks
+        if task.should_translate
+    }
 
     async def event_stream():
         updated_count = 0
@@ -9343,6 +9436,8 @@ async def llm_translate_file_record(
                 "target_language": target_language,
                 "glossary_base_ids": [str(glossary_base_id) for glossary_base_id in glossary_base_ids],
                 "total": total_count,
+                "unique_total": deduplication.unique_total,
+                "deduplicated_count": deduplication.deduplicated_count,
             },
         )
 
@@ -9370,7 +9465,7 @@ async def llm_translate_file_record(
         uncommitted_count = 0
 
         async for result in iter_batch_translate(
-            translation_tasks,
+            deduplication.tasks,
             provider=body.provider,
             translation_guidelines=guidelines,
             translation_unit=body.translation_unit,
@@ -9381,132 +9476,149 @@ async def llm_translate_file_record(
                 return
 
             if isinstance(result, LLMTranslationFailure):
-                error_count += 1
-                yield _sse_event(
-                    "error",
-                    {
-                        "sentence_id": result.sentence_id,
-                        "status": result.status,
-                        "message": result.error_message,
-                    },
+                sentence_ids = deduplication.result_sentence_ids_by_representative.get(
+                    result.sentence_id,
+                    [result.sentence_id],
                 )
+                for sentence_id in sentence_ids:
+                    target_task = target_task_by_sentence_id.get(sentence_id)
+                    error_count += 1
+                    yield _sse_event(
+                        "error",
+                        {
+                            "sentence_id": sentence_id,
+                            "status": target_task.status if target_task else result.status,
+                            "message": result.error_message,
+                        },
+                    )
                 continue
 
             try:
                 ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
             except Exception as exc:  # noqa: BLE001
                 db.rollback()
-                error_count += 1
-                yield _sse_event(
-                    "error",
-                    {
-                        "sentence_id": result.sentence_id,
-                        "status": result.status,
-                        "message": f"数据库更新失败：{exc}",
-                    },
+                sentence_ids = deduplication.result_sentence_ids_by_representative.get(
+                    result.sentence_id,
+                    [result.sentence_id],
                 )
-                continue
-
-            segment = seg_map.get(result.sentence_id)
-            if not segment:
-                error_count += 1
-                yield _sse_event(
-                    "error",
-                    {
-                        "sentence_id": result.sentence_id,
-                        "status": result.status,
-                        "message": "片段不存在，无法写回 LLM 译文。",
-                    },
-                )
-                continue
-
-            try:
-                _require_segment_work_access(db, file_record, segment, current_user)
-            except HTTPException as exc:
-                error_count += 1
-                yield _sse_event(
-                    "error",
-                    {
-                        "sentence_id": result.sentence_id,
-                        "status": result.status,
-                        "message": str(exc.detail),
-                    },
-                )
-                continue
-
-            try:
-                before_text = segment.target_text
-                translated_text = (
-                    strip_automatic_numbering_prefix(
-                        result.translated_text,
-                        source_text=segment.source_text,
-                        display_text=segment.display_text,
-                        reference_texts=[segment.matched_source_text],
+                for sentence_id in sentence_ids:
+                    target_task = target_task_by_sentence_id.get(sentence_id)
+                    error_count += 1
+                    yield _sse_event(
+                        "error",
+                        {
+                            "sentence_id": sentence_id,
+                            "status": target_task.status if target_task else result.status,
+                            "message": f"数据库更新失败：{exc}",
+                        },
                     )
-                    if is_word_document_filename(file_record.filename)
-                    else result.translated_text
-                )
-                segment.target_text = translated_text
-                segment.target_html = None
-                segment.source = "llm"
-                segment.version = int(segment.version or 1) + 1
-                segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
-                segment.llm_provider = result.provider
-                segment.llm_model = result.model
-                segment.status = _resolve_unconfirmed_segment_status(segment)
-
-                # Inline revision creation — skip pending query for LLM bulk writes
-                if (before_text or "") != (translated_text or ""):
-                    db.add(SegmentRevision(
-                        file_record_id=file_record_id,
-                        segment_id=segment.id,
-                        sentence_id=segment.sentence_id,
-                        before_text=before_text or "",
-                        after_text=translated_text or "",
-                        source="llm",
-                        status="pending",
-                        author_id=current_user.id if current_user else None,
-                    ))
-                record_translation_metric_event(
-                    db,
-                    segment=segment,
-                    before_text=before_text,
-                    after_text=translated_text,
-                    source="llm",
-                    current_user=current_user,
-                )
-
-                uncommitted_count += 1
-                if uncommitted_count >= COMMIT_INTERVAL:
-                    db.commit()
-                    uncommitted_count = 0
-
-            except Exception as exc:  # noqa: BLE001
-                db.rollback()
-                uncommitted_count = 0
-                error_count += 1
-                yield _sse_event(
-                    "error",
-                    {
-                        "sentence_id": result.sentence_id,
-                        "status": result.status,
-                        "message": f"数据库更新失败：{exc}",
-                    },
-                )
                 continue
 
-            updated_count += 1
-            yield _sse_event(
-                "segment",
-                {
-                    "sentence_id": segment.sentence_id,
-                    "target_text": segment.target_text,
-                    "status": segment.status,
-                    "source": segment.source,
-                    "provider": result.provider,
-                    "model": result.model,
-                },
+            sentence_ids = deduplication.result_sentence_ids_by_representative.get(
+                result.sentence_id,
+                [result.sentence_id],
             )
+            for sentence_id in sentence_ids:
+                target_task = target_task_by_sentence_id.get(sentence_id)
+                segment = seg_map.get(sentence_id)
+                if not segment:
+                    error_count += 1
+                    yield _sse_event(
+                        "error",
+                        {
+                            "sentence_id": sentence_id,
+                            "status": target_task.status if target_task else result.status,
+                            "message": "片段不存在，无法写回 LLM 译文。",
+                        },
+                    )
+                    continue
+
+                try:
+                    _require_segment_work_access(db, file_record, segment, current_user)
+                except HTTPException as exc:
+                    error_count += 1
+                    yield _sse_event(
+                        "error",
+                        {
+                            "sentence_id": sentence_id,
+                            "status": target_task.status if target_task else result.status,
+                            "message": str(exc.detail),
+                        },
+                    )
+                    continue
+
+                try:
+                    before_text = segment.target_text
+                    translated_text = (
+                        strip_automatic_numbering_prefix(
+                            result.translated_text,
+                            source_text=segment.source_text,
+                            display_text=segment.display_text,
+                            reference_texts=[segment.matched_source_text],
+                        )
+                        if is_word_document_filename(file_record.filename)
+                        else result.translated_text
+                    )
+                    segment.target_text = translated_text
+                    segment.target_html = None
+                    segment.source = "llm"
+                    segment.version = int(segment.version or 1) + 1
+                    segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
+                    segment.llm_provider = result.provider
+                    segment.llm_model = result.model
+                    segment.status = _resolve_unconfirmed_segment_status(segment)
+
+                    if (before_text or "") != (translated_text or ""):
+                        db.add(SegmentRevision(
+                            file_record_id=file_record_id,
+                            segment_id=segment.id,
+                            sentence_id=segment.sentence_id,
+                            before_text=before_text or "",
+                            after_text=translated_text or "",
+                            source="llm",
+                            status="pending",
+                            author_id=current_user.id if current_user else None,
+                        ))
+                    record_translation_metric_event(
+                        db,
+                        segment=segment,
+                        before_text=before_text,
+                        after_text=translated_text,
+                        source="llm",
+                        current_user=current_user,
+                    )
+
+                    uncommitted_count += 1
+                    if uncommitted_count >= COMMIT_INTERVAL:
+                        db.commit()
+                        uncommitted_count = 0
+
+                except Exception as exc:  # noqa: BLE001
+                    db.rollback()
+                    uncommitted_count = 0
+                    error_count += 1
+                    yield _sse_event(
+                        "error",
+                        {
+                            "sentence_id": sentence_id,
+                            "status": target_task.status if target_task else result.status,
+                            "message": f"数据库更新失败：{exc}",
+                        },
+                    )
+                    continue
+
+                updated_count += 1
+                yield _sse_event(
+                    "segment",
+                    {
+                        "sentence_id": segment.sentence_id,
+                        "target_text": segment.target_text,
+                        "status": segment.status,
+                        "source": segment.source,
+                        "provider": result.provider,
+                        "model": result.model,
+                    },
+                )
 
         # Final commit for remaining + sync status once
         try:
@@ -9576,7 +9688,15 @@ class TMEntryUpdatePayload(BaseModel):
     target_text: str
 
 
+def _entry_user_name(user: User | None) -> str | None:
+    if user is None:
+        return None
+    return user.nickname or user.username
+
+
 def _serialize_tm_entry(entry: TranslationMemory) -> dict:
+    creator_name = _entry_user_name(entry.creator)
+    last_modified_by_name = _entry_user_name(entry.last_modified_by)
     return {
         "id": entry.id,
         "collection_id": entry.collection_id,
@@ -9584,6 +9704,10 @@ def _serialize_tm_entry(entry: TranslationMemory) -> dict:
         "target_text": entry.target_text,
         "source_language": entry.source_language,
         "target_language": entry.target_language,
+        "creator_id": entry.creator_id,
+        "creator_name": creator_name,
+        "last_modified_by_id": entry.last_modified_by_id,
+        "last_modified_by_name": last_modified_by_name,
         "created_at": entry.created_at.isoformat(),
         "updated_at": entry.updated_at.isoformat(),
     }
@@ -9915,7 +10039,9 @@ def merge_tm_collections(
                 existing.source_normalized = source_normalized
                 existing.source_language = source_language
                 existing.target_language = target_language
-                existing.creator_id = entry.creator_id or current_user.id
+                if existing.creator_id is None:
+                    existing.creator_id = entry.creator_id or current_user.id
+                existing.last_modified_by_id = current_user.id
                 merged_by_hash[source_hash] = existing
                 merged_by_source_text[source_text] = existing
                 merged_entries.append(existing)
@@ -9931,6 +10057,7 @@ def merge_tm_collections(
                 source_language=source_language,
                 target_language=target_language,
                 creator_id=entry.creator_id or current_user.id,
+                last_modified_by_id=current_user.id,
             )
             db.add(merged_entry)
             merged_by_hash[source_hash] = merged_entry
@@ -10316,14 +10443,16 @@ def export_tm_collection_entries_xlsx(
             entry.target_text,
             entry.source_language or "",
             entry.target_language or "",
+            _entry_user_name(entry.creator) or "",
             entry.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            _entry_user_name(entry.last_modified_by) or "",
             entry.updated_at.strftime("%Y-%m-%d %H:%M:%S"),
         ]
         for entry in entries
     ]
     xlsx_bytes = build_tabular_xlsx(
         sheet_title=collection.name,
-        headers=["原文", "译文", "源语言", "目标语言", "创建时间", "更新时间"],
+        headers=["原文", "译文", "源语言", "目标语言", "创建人", "创建时间", "最后修改人", "更新时间"],
         rows=rows,
     )
     return build_xlsx_download_response(f"{collection.name}-tm.xlsx", xlsx_bytes)
@@ -10364,7 +10493,7 @@ def add_tm_collection_entry(
     collection_id: UUID,
     payload: TMEntryUpdatePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     collection = _get_collection_or_404(db, collection_id)
     if collection is None:
@@ -10379,6 +10508,7 @@ def add_tm_collection_entry(
             target_language=collection.target_language,
         ),
         db,
+        current_user,
     )
     entry = db.query(TranslationMemory).filter(TranslationMemory.id == result["id"]).first()
     if entry is None:
@@ -10391,7 +10521,7 @@ def add_tm_collection_entry(
 def add_tm_entry(
     entry: TMEntry,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     """添加单条 TM 记录（去重：相同原文不重复添加）"""
     source_text = normalize_text(entry.source_text)
@@ -10427,6 +10557,9 @@ def add_tm_entry(
         existing.source_normalized = normalize_match_text(source_text) or source_text
         existing.source_language = source_language
         existing.target_language = target_language
+        if existing.creator_id is None:
+            existing.creator_id = current_user.id
+        existing.last_modified_by_id = current_user.id
         db.commit()
         sync_tm_embeddings(db, [(existing.id, existing.source_text)])
         _notify_tm_collections_changed(db, [existing.collection_id] if existing.collection_id else [])
@@ -10441,6 +10574,8 @@ def add_tm_entry(
         source_normalized=normalize_match_text(source_text) or source_text,
         source_language=source_language,
         target_language=target_language,
+        creator_id=current_user.id,
+        last_modified_by_id=current_user.id,
     )
     db.add(tm)
     db.commit()
@@ -10457,7 +10592,7 @@ def update_tm_entry(
     entry_id: UUID,
     payload: TMEntryUpdatePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     entry = db.query(TranslationMemory).filter(TranslationMemory.id == entry_id).first()
     if entry is None:
@@ -10497,6 +10632,9 @@ def update_tm_entry(
     entry.source_normalized = normalize_match_text(source_text) or source_text
     entry.source_language = source_language
     entry.target_language = target_language
+    if entry.creator_id is None:
+        entry.creator_id = current_user.id
+    entry.last_modified_by_id = current_user.id
     db.commit()
     db.refresh(entry)
     sync_tm_embeddings(db, [(entry.id, entry.source_text)])

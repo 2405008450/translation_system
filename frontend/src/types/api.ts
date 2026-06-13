@@ -791,6 +791,10 @@ export interface TMEntryRecord {
   target_text: string
   source_language: string | null
   target_language: string | null
+  creator_id?: string | null
+  creator_name?: string | null
+  last_modified_by_id?: string | null
+  last_modified_by_name?: string | null
   created_at: string
   updated_at: string
 }
@@ -802,7 +806,10 @@ export interface TermEntryRecord {
   target_text: string
   source_language: string
   target_language: string
+  creator_id?: string | null
   creator_name: string | null
+  last_modified_by_id?: string | null
+  last_modified_by_name?: string | null
   created_at: string
   updated_at: string
 }
@@ -815,7 +822,10 @@ export interface GlossaryEntryRecord {
   note: string | null
   source_language: string
   target_language: string
+  creator_id?: string | null
   creator_name: string | null
+  last_modified_by_id?: string | null
+  last_modified_by_name?: string | null
   created_at: string
   updated_at: string
 }

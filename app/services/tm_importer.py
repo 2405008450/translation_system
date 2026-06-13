@@ -760,6 +760,7 @@ def _build_tm_row(
         "source_language": source_language,
         "target_language": target_language,
         "creator_id": creator_id,
+        "last_modified_by_id": creator_id,
     }
 
 
@@ -829,6 +830,8 @@ def _flush_tm_batch(
         existing.collection_id = row["collection_id"]
         existing.source_language = row["source_language"]
         existing.target_language = row["target_language"]
+        if row.get("last_modified_by_id"):
+            existing.last_modified_by_id = row["last_modified_by_id"]
         existing_by_hash[row["source_hash"]] = existing
         existing_by_source_text[row["source_text"]] = existing
         sync_candidates.append(existing)

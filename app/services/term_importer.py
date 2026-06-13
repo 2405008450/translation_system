@@ -77,6 +77,7 @@ def import_terms_from_xlsx_upload(
     target_language: str,
     batch_size: int = 5000,
     term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
 ) -> TermImportSummary:
@@ -90,6 +91,7 @@ def import_terms_from_xlsx_upload(
             target_language=target_language,
             batch_size=batch_size,
             term_base_id=term_base_id,
+            creator_id=creator_id,
             skip_duplicate_row_indexes=skip_duplicate_row_indexes,
             skip_header=skip_header,
         )
@@ -102,6 +104,7 @@ def import_terms_from_xlsx_upload(
             target_language=target_language,
             batch_size=batch_size,
             term_base_id=term_base_id,
+            creator_id=creator_id,
             skip_duplicate_row_indexes=skip_duplicate_row_indexes,
         )
     if extension in XLS_EXTENSIONS:
@@ -113,6 +116,7 @@ def import_terms_from_xlsx_upload(
             target_language=target_language,
             batch_size=batch_size,
             term_base_id=term_base_id,
+            creator_id=creator_id,
             skip_duplicate_row_indexes=skip_duplicate_row_indexes,
             skip_header=skip_header,
         )
@@ -124,6 +128,7 @@ def import_terms_from_xlsx_upload(
         filename=filename,
         batch_size=batch_size,
         term_base_id=term_base_id,
+        creator_id=creator_id,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
         skip_header=skip_header,
         source_language=source_language,
@@ -139,6 +144,7 @@ def import_terms_from_csv_upload(
     target_language: str,
     batch_size: int = 5000,
     term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
 ) -> TermImportSummary:
@@ -148,6 +154,7 @@ def import_terms_from_csv_upload(
         filename=filename,
         batch_size=batch_size,
         term_base_id=term_base_id,
+        creator_id=creator_id,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
         skip_header=skip_header,
         source_language=source_language,
@@ -163,6 +170,7 @@ def import_terms_from_tmx_upload(
     target_language: str,
     batch_size: int = 5000,
     term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
 ) -> TermImportSummary:
     normalized_source_language, normalized_target_language = require_language_pair(
@@ -179,6 +187,7 @@ def import_terms_from_tmx_upload(
         filename=filename,
         batch_size=batch_size,
         term_base_id=term_base_id,
+        creator_id=creator_id,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
         source_language=normalized_source_language,
         target_language=normalized_target_language,
@@ -193,6 +202,7 @@ def import_terms_from_xls_upload(
     target_language: str,
     batch_size: int = 5000,
     term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
 ) -> TermImportSummary:
@@ -202,6 +212,7 @@ def import_terms_from_xls_upload(
         filename=filename,
         batch_size=batch_size,
         term_base_id=term_base_id,
+        creator_id=creator_id,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
         skip_header=skip_header,
         source_language=source_language,
@@ -357,6 +368,7 @@ def import_terms_from_xlsx_path(
     target_language: str,
     batch_size: int = 5000,
     term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
 ) -> TermImportSummary:
@@ -367,6 +379,7 @@ def import_terms_from_xlsx_path(
         filename=Path(xlsx_path).name,
         batch_size=batch_size,
         term_base_id=term_base_id,
+        creator_id=creator_id,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
         skip_header=skip_header,
         source_language=source_language,
@@ -404,6 +417,7 @@ def _import_workbook(
     source_language: str,
     target_language: str,
     term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
 ) -> TermImportSummary:
@@ -415,6 +429,7 @@ def _import_workbook(
             filename=filename,
             batch_size=batch_size,
             term_base_id=term_base_id,
+            creator_id=creator_id,
             skip_duplicate_row_indexes=skip_duplicate_row_indexes,
             skip_header=skip_header,
             source_language=source_language,
@@ -432,6 +447,7 @@ def _import_text_rows(
     source_language: str,
     target_language: str,
     term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
 ) -> TermImportSummary:
@@ -624,6 +640,7 @@ def _build_term_row(
     source_language: str,
     target_language: str,
     term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
 ) -> dict:
     return {
         "term_base_id": term_base_id,
@@ -632,6 +649,8 @@ def _build_term_row(
         "source_normalized": normalize_match_text(source_text) or normalize_text(source_text),
         "source_language": source_language,
         "target_language": target_language,
+        "creator_id": creator_id,
+        "last_modified_by_id": creator_id,
     }
 
 
@@ -689,6 +708,10 @@ def _flush_term_batch(
         existing.source_normalized = row["source_normalized"]
         existing.source_language = row["source_language"]
         existing.target_language = row["target_language"]
+        if existing.creator_id is None and row.get("creator_id"):
+            existing.creator_id = row["creator_id"]
+        if row.get("last_modified_by_id"):
+            existing.last_modified_by_id = row["last_modified_by_id"]
         updated_rows += 1
 
     db.commit()

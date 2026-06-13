@@ -129,6 +129,16 @@ interface FileExportTask {
 type SegmentEditorRowPublic = ComponentPublicInstance & {
   undoEditorChange: () => boolean
   redoEditorChange: () => boolean
+  recordEditorUndoBoundary: (options?: {
+    inputType?: string
+    data?: string | null
+    preserveNextTargetSync?: boolean
+  }) => boolean
+}
+type UpdateSegmentTargetOptions = {
+  confirm?: boolean
+  recordUndo?: boolean
+  undoInputType?: string
 }
 type SaveToTMPayload = {
   collection_mode: SaveToTMTargetMode
@@ -1463,6 +1473,8 @@ useWorkbenchShortcuts({
   focusPrev: () => { void focusSentenceByOffset(-1) },
   focusNext: () => { void focusSentenceByOffset(1) },
   confirmCurrent: () => { confirmCurrentSentence() },
+  undo: () => { undoActiveSegmentEdit() },
+  redo: () => { redoActiveSegmentEdit() },
   closePanel: () => { void closeActiveWorkbenchPanel() },
   toggleHelp: () => { showShortcutHelp.value = !showShortcutHelp.value },
 })
@@ -2031,15 +2043,29 @@ function updateSegmentTarget(
   sentenceId: string,
   targetText: string,
   targetHtml?: string,
-  options: { confirm?: boolean } = {},
+  options: UpdateSegmentTargetOptions = {},
 ) {
   const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
   if (segment && !segment.can_write) {
     toast.warn('当前流程阶段无编辑权限')
     return
   }
+  const hasTargetContentChange = Boolean(
+    segment
+    && (
+      (segment.target_text || '') !== targetText
+      || (segment.target_html || null) !== (targetHtml || null)
+    ),
+  )
+  if (options.recordUndo && hasTargetContentChange) {
+    recordSegmentEditorUndoBoundary(
+      sentenceId,
+      options.undoInputType || 'programmaticEdit',
+      true,
+    )
+  }
   retainEmptyTargetSegmentDuringEdit(sentenceId, segment?.target_text)
-  segmentStore.updateTarget(sentenceId, targetText, targetHtml, options)
+  segmentStore.updateTarget(sentenceId, targetText, targetHtml, { confirm: options.confirm })
 }
 
 async function updateSegmentSource(sentenceId: string, sourceText: string) {
@@ -2150,7 +2176,12 @@ async function replaceCurrentSearchMatch() {
     return
   }
 
-  updateSegmentTarget(targetSegment.sentence_id, replaceTargetText(targetSegment.target_text || '', false))
+  updateSegmentTarget(
+    targetSegment.sentence_id,
+    replaceTargetText(targetSegment.target_text || '', false),
+    undefined,
+    { recordUndo: true, undoInputType: 'replaceCurrentSearchMatch' },
+  )
   const targetIndex = editorSegments.value.findIndex((segment) => segment.sentence_id === targetSegment.sentence_id)
   if (targetIndex >= 0) {
     await focusEditorSegmentAtIndex(targetIndex)
@@ -2727,6 +2758,24 @@ function getActiveSegmentEditorRow() {
   return sentenceId ? segmentEditorRowRefs.get(sentenceId) || null : null
 }
 
+function recordSegmentEditorUndoBoundary(
+  sentenceId: string,
+  inputType: string,
+  preserveNextTargetSync = false,
+) {
+  return segmentEditorRowRefs.get(sentenceId)?.recordEditorUndoBoundary({
+    inputType,
+    preserveNextTargetSync,
+  }) ?? false
+}
+
+function recordActiveSegmentEditorUndoBoundary(inputType: string, preserveNextTargetSync = false) {
+  const sentenceId = segmentStore.activeSentenceId
+  return sentenceId
+    ? recordSegmentEditorUndoBoundary(sentenceId, inputType, preserveNextTargetSync)
+    : false
+}
+
 function undoActiveSegmentEdit() {
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
@@ -2898,6 +2947,16 @@ function getActiveEditorElement(): HTMLElement | null {
   return document.querySelector(selector)
 }
 
+function hasSelectedEditorText(editor: HTMLElement) {
+  const selection = window.getSelection()
+  return Boolean(
+    selection
+    && selection.rangeCount > 0
+    && !selection.isCollapsed
+    && editor.contains(selection.anchorNode),
+  )
+}
+
 /**
  * 应用文本格式（粗体、斜体、下划线等）
  */
@@ -2919,6 +2978,9 @@ function applyTextFormat(format: TextFormat) {
     }
 
     // 应用格式（会同时切换 activeFormats 状态）
+    if (hasSelectedEditorText(editor)) {
+      recordActiveSegmentEditorUndoBoundary(`format:${format}`)
+    }
     richTextEditor.applyFormat(format, editor)
 
     // 触发 input 事件以同步数据
@@ -2949,12 +3011,14 @@ function clearSelectedFormat() {
 
   if (hasSelectedText) {
     // 有选中文本：清除选中文本的格式
+    recordActiveSegmentEditorUndoBoundary('format:clear-selection')
     if (richTextEditor.clearFormat(editor)) {
       editor.dispatchEvent(new Event('input', { bubbles: true }))
       toast.success(t('workbench.ribbon.messages.formatCleared'))
     }
   } else {
     // 没有选中文本：清除整个段落的所有格式
+    recordActiveSegmentEditorUndoBoundary('format:clear-all')
     const plainText = richTextEditor.clearAllFormatInElement(editor)
     if (activeSegment.value) {
       updateSegmentTarget(activeSegment.value.sentence_id, plainText)
@@ -2977,6 +3041,7 @@ function clearAllFormat() {
     return
   }
 
+  recordActiveSegmentEditorUndoBoundary('format:clear-all')
   const plainText = richTextEditor.clearAllFormatInElement(editor)
   if (activeSegment.value) {
     updateSegmentTarget(activeSegment.value.sentence_id, plainText)
@@ -2997,6 +3062,13 @@ function applyCase(caseType: CaseType) {
 
   editor.focus()
 
+  if (!hasSelectedEditorText(editor)) {
+    toast.warn(t('workbench.ribbon.messages.selectTextFirst'))
+    showCaseMenu.value = false
+    return
+  }
+
+  recordActiveSegmentEditorUndoBoundary(`case:${caseType}`)
   if (richTextEditor.changeCase(caseType, editor)) {
     editor.dispatchEvent(new Event('input', { bubbles: true }))
   } else {
@@ -3049,6 +3121,7 @@ function insertSpecialChar(char: string) {
     selection?.addRange(range)
   }
 
+  recordActiveSegmentEditorUndoBoundary('insertSpecialCharacter')
   document.execCommand('insertText', false, char)
   editor.dispatchEvent(new Event('input', { bubbles: true }))
 
@@ -3088,7 +3161,12 @@ function copySourceToTarget() {
   }
 
   const sourceText = getSegmentCopyableSourceText(activeSegment.value)
-  updateSegmentTarget(activeSegment.value.sentence_id, sourceText)
+  updateSegmentTarget(
+    activeSegment.value.sentence_id,
+    sourceText,
+    undefined,
+    { recordUndo: true, undoInputType: 'copySourceToTarget' },
+  )
   toast.success(t('workbench.ribbon.messages.sourceCopied'))
 }
 
@@ -3102,7 +3180,12 @@ function clearActiveTarget() {
     return
   }
 
-  updateSegmentTarget(activeSegment.value.sentence_id, '')
+  updateSegmentTarget(
+    activeSegment.value.sentence_id,
+    '',
+    undefined,
+    { recordUndo: true, undoInputType: 'clearTarget' },
+  )
   toast.success(t('workbench.ribbon.messages.targetCleared'))
 }
 
@@ -3325,7 +3408,12 @@ async function handleBatchRejectRevisions() {
 }
 
 function handleApplyTMTarget(sentenceId: string, targetText: string) {
-  updateSegmentTarget(sentenceId, targetText)
+  updateSegmentTarget(
+    sentenceId,
+    targetText,
+    undefined,
+    { recordUndo: true, undoInputType: 'applyMatchTarget' },
+  )
 }
 
 function getRouteQueryString(value: unknown) {
@@ -3953,7 +4041,12 @@ function handleReplaceText(text: string) {
     return
   }
 
-  updateSegmentTarget(activeSegment.value.sentence_id, text)
+  updateSegmentTarget(
+    activeSegment.value.sentence_id,
+    text,
+    undefined,
+    { recordUndo: true, undoInputType: 'replaceTargetFromMatchPanel' },
+  )
   toast.success(t('matchPanel.textInserted'))
 }
 
@@ -3963,7 +4056,12 @@ function handleAppendText(text: string) {
   }
 
   const nextText = appendToCurrentText(activeSegment.value.target_text || '', text)
-  updateSegmentTarget(activeSegment.value.sentence_id, nextText)
+  updateSegmentTarget(
+    activeSegment.value.sentence_id,
+    nextText,
+    undefined,
+    { recordUndo: true, undoInputType: 'appendTargetFromMatchPanel' },
+  )
   toast.success(t('matchPanel.textInserted'))
 }
 
@@ -4354,7 +4452,7 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group">
           <span class="tool-col">
-            <button class="tool-line tool-button" type="button" :disabled="!activeSegmentCanWrite" @click="undoActiveSegmentEdit">
+            <button class="tool-line tool-button" type="button" data-testid="workbench-undo-button" :disabled="!activeSegmentCanWrite" @click="undoActiveSegmentEdit">
               <span class="icon-text-area">
                 <span class="tool-item">
                   <Undo2 class="tool-label-icon" :size="16" />
@@ -4362,7 +4460,7 @@ onBeforeRouteLeave(async () => {
                 </span>
               </span>
             </button>
-            <button class="tool-line tool-button" type="button" :disabled="!activeSegmentCanWrite" @click="redoActiveSegmentEdit">
+            <button class="tool-line tool-button" type="button" data-testid="workbench-redo-button" :disabled="!activeSegmentCanWrite" @click="redoActiveSegmentEdit">
               <span class="icon-text-area">
                 <span class="tool-item">
                   <Redo2 class="tool-label-icon" :size="16" />
@@ -4375,7 +4473,7 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group">
           <span class="tool-col align-left">
-            <button class="tool-line tool-button" type="button" :disabled="!activeSegmentCanWrite" @click="copySourceToTarget">
+            <button class="tool-line tool-button" type="button" data-testid="workbench-copy-source-button" :disabled="!activeSegmentCanWrite" @click="copySourceToTarget">
               <span class="icon-text-area has_dropdown">
                 <span class="tool-item">
                   <Copy class="tool-label-icon" :size="16" />
@@ -4386,7 +4484,7 @@ onBeforeRouteLeave(async () => {
                 <ChevronDown :size="11" />
               </span>
             </button>
-            <button class="tool-line tool-button" type="button" :disabled="!activeSegmentCanWrite" @click="clearActiveTarget">
+            <button class="tool-line tool-button" type="button" data-testid="workbench-clear-target-button" :disabled="!activeSegmentCanWrite" @click="clearActiveTarget">
               <span class="icon-text-area">
                 <span class="tool-item">
                   <X class="tool-label-icon" :size="16" />
@@ -4399,42 +4497,42 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group custom-style">
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.bold }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.bold')" @mousedown.prevent @click="applyTextFormat('bold')">
+            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-bold" :class="{ 'is-active': richTextEditor.activeFormats.bold }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.bold')" @mousedown.prevent @click="applyTextFormat('bold')">
               <span class="icon-text-area"><span class="tool-item"><Bold class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.strikethrough }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.strike')" @mousedown.prevent @click="applyTextFormat('strikethrough')">
+            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-strikethrough" :class="{ 'is-active': richTextEditor.activeFormats.strikethrough }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.strike')" @mousedown.prevent @click="applyTextFormat('strikethrough')">
               <span class="icon-text-area"><span class="tool-item"><Strikethrough class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.italic }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.italic')" @mousedown.prevent @click="applyTextFormat('italic')">
+            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-italic" :class="{ 'is-active': richTextEditor.activeFormats.italic }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.italic')" @mousedown.prevent @click="applyTextFormat('italic')">
               <span class="icon-text-area"><span class="tool-item"><Italic class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.superscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.superscript')" @mousedown.prevent @click="applyTextFormat('superscript')">
+            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-superscript" :class="{ 'is-active': richTextEditor.activeFormats.superscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.superscript')" @mousedown.prevent @click="applyTextFormat('superscript')">
               <span class="icon-text-area"><span class="tool-item"><Superscript class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.underline }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.underline')" @mousedown.prevent @click="applyTextFormat('underline')">
+            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-underline" :class="{ 'is-active': richTextEditor.activeFormats.underline }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.underline')" @mousedown.prevent @click="applyTextFormat('underline')">
               <span class="icon-text-area"><span class="tool-item"><Underline class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.subscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.subscript')" @mousedown.prevent @click="applyTextFormat('subscript')">
+            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-subscript" :class="{ 'is-active': richTextEditor.activeFormats.subscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.subscript')" @mousedown.prevent @click="applyTextFormat('subscript')">
               <span class="icon-text-area"><span class="tool-item"><Subscript class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
             <div class="case-menu">
-              <button class="tool-line style-item tool-button" type="button" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.caseChange')" @mousedown.prevent @click.stop="showCaseMenu = !showCaseMenu">
+              <button class="tool-line style-item tool-button" type="button" data-testid="workbench-case-menu-button" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.caseChange')" @mousedown.prevent @click.stop="showCaseMenu = !showCaseMenu">
                 <span class="icon-text-area has_dropdown"><span class="tool-item"><Type class="tool-label-icon" :size="15" /></span></span>
                 <span class="dropdown-link" aria-hidden="true">
                   <ChevronDown :size="10" />
                 </span>
               </button>
               <div v-if="showCaseMenu" class="case-menu__dropdown">
-                <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('upper')">{{ t('workbench.ribbon.caseUpper') }}</button>
-                <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('lower')">{{ t('workbench.ribbon.caseLower') }}</button>
-                <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('capitalize')">{{ t('workbench.ribbon.caseCapitalize') }}</button>
-                <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('sentence')">{{ t('workbench.ribbon.caseSentence') }}</button>
+                <button type="button" class="case-menu__item" data-testid="workbench-case-upper" @mousedown.prevent @click="applyCase('upper')">{{ t('workbench.ribbon.caseUpper') }}</button>
+                <button type="button" class="case-menu__item" data-testid="workbench-case-lower" @mousedown.prevent @click="applyCase('lower')">{{ t('workbench.ribbon.caseLower') }}</button>
+                <button type="button" class="case-menu__item" data-testid="workbench-case-capitalize" @mousedown.prevent @click="applyCase('capitalize')">{{ t('workbench.ribbon.caseCapitalize') }}</button>
+                <button type="button" class="case-menu__item" data-testid="workbench-case-sentence" @mousedown.prevent @click="applyCase('sentence')">{{ t('workbench.ribbon.caseSentence') }}</button>
               </div>
             </div>
             <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
@@ -4448,6 +4546,7 @@ onBeforeRouteLeave(async () => {
             <button
               class="tool-col tool-col--big tool-button clear-format-menu__main"
               type="button"
+              data-testid="workbench-clear-format-button"
               :disabled="!activeSegmentCanWrite"
               @mousedown.prevent
               @click="clearSelectedFormat"
@@ -4468,8 +4567,8 @@ onBeforeRouteLeave(async () => {
               <ChevronDown :size="12" />
             </button>
             <div v-if="showClearFormatMenu" class="clear-format-menu__dropdown">
-              <button type="button" class="clear-format-menu__item" @mousedown.prevent @click="clearSelectedFormat">{{ t('workbench.ribbon.clearSelectedFormat') }}</button>
-              <button type="button" class="clear-format-menu__item" @mousedown.prevent @click="clearAllFormat">{{ t('workbench.ribbon.clearAllFormat') }}</button>
+              <button type="button" class="clear-format-menu__item" data-testid="workbench-clear-selected-format" @mousedown.prevent @click="clearSelectedFormat">{{ t('workbench.ribbon.clearSelectedFormat') }}</button>
+              <button type="button" class="clear-format-menu__item" data-testid="workbench-clear-all-format" @mousedown.prevent @click="clearAllFormat">{{ t('workbench.ribbon.clearAllFormat') }}</button>
             </div>
           </div>
         </div>
@@ -4628,7 +4727,7 @@ onBeforeRouteLeave(async () => {
         <div class="tool-group">
           <span class="tool-col align-left">
             <div class="special-char-menu">
-              <button class="tool-line tool-button" type="button" :disabled="!activeSegment" @mousedown.prevent @click.stop="showSpecialCharMenu = !showSpecialCharMenu">
+              <button class="tool-line tool-button" type="button" data-testid="workbench-special-character-menu" :disabled="!activeSegment" @mousedown.prevent @click.stop="showSpecialCharMenu = !showSpecialCharMenu">
                 <span class="icon-text-area">
                   <span class="tool-item">
                     <Sigma class="tool-label-icon" :size="16" />
@@ -4645,6 +4744,7 @@ onBeforeRouteLeave(async () => {
                       :key="`${rowIdx}-${colIdx}`"
                       type="button"
                       class="special-char-menu__char"
+                      :data-testid="`workbench-special-character-${rowIdx}-${colIdx}`"
                       :title="char"
                       @mousedown.prevent
                       @click="insertSpecialChar(char)"
@@ -4658,6 +4758,7 @@ onBeforeRouteLeave(async () => {
                       :key="idx"
                       type="button"
                       class="special-char-menu__char"
+                      :data-testid="`workbench-recent-special-character-${idx}`"
                       :title="char"
                       @mousedown.prevent
                       @click="insertSpecialChar(char)"

@@ -113,6 +113,9 @@ def _serialize_glossary_entry(entry: GlossaryEntry) -> dict:
     creator_name = None
     if entry.creator:
         creator_name = entry.creator.nickname or entry.creator.username
+    last_modified_by_name = None
+    if entry.last_modified_by:
+        last_modified_by_name = entry.last_modified_by.nickname or entry.last_modified_by.username
     return {
         "id": str(entry.id),
         "glossary_base_id": str(entry.glossary_base_id),
@@ -121,7 +124,10 @@ def _serialize_glossary_entry(entry: GlossaryEntry) -> dict:
         "note": entry.note or "",
         "source_language": entry.source_language,
         "target_language": entry.target_language,
+        "creator_id": str(entry.creator_id) if entry.creator_id else None,
         "creator_name": creator_name,
+        "last_modified_by_id": str(entry.last_modified_by_id) if entry.last_modified_by_id else None,
+        "last_modified_by_name": last_modified_by_name,
         "created_at": entry.created_at.isoformat(),
         "updated_at": entry.updated_at.isoformat(),
     }
@@ -501,6 +507,7 @@ def create_glossary_entry(
         source_language=glossary_base.source_language,
         target_language=glossary_base.target_language,
         creator_id=current_user.id,
+        last_modified_by_id=current_user.id,
     )
     db.add(entry)
     db.commit()
@@ -513,7 +520,7 @@ def update_glossary_entry(
     entry_id: UUID,
     payload: GlossaryEntryPayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     entry = db.query(GlossaryEntry).filter(GlossaryEntry.id == entry_id).first()
     if entry is None:
@@ -547,6 +554,9 @@ def update_glossary_entry(
     entry.source_normalized = source_normalized
     entry.source_language = glossary_base.source_language
     entry.target_language = glossary_base.target_language
+    if entry.creator_id is None:
+        entry.creator_id = current_user.id
+    entry.last_modified_by_id = current_user.id
     db.commit()
     db.refresh(entry)
     return _serialize_glossary_entry(entry)
@@ -580,7 +590,7 @@ def export_glossary_entries_xlsx(
     )
     xlsx_bytes = build_tabular_xlsx(
         sheet_title=glossary_base.name,
-        headers=["原文", "译文", "备注", "源语言", "目标语言", "创建时间", "更新时间"],
+        headers=["原文", "译文", "备注", "源语言", "目标语言", "创建人", "创建时间", "最后修改人", "更新时间"],
         rows=[
             [
                 entry.source_text,
@@ -588,7 +598,9 @@ def export_glossary_entries_xlsx(
                 entry.note or "",
                 entry.source_language,
                 entry.target_language,
+                (entry.creator.nickname or entry.creator.username) if entry.creator else "",
                 entry.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                (entry.last_modified_by.nickname or entry.last_modified_by.username) if entry.last_modified_by else "",
                 entry.updated_at.strftime("%Y-%m-%d %H:%M:%S"),
             ]
             for entry in rows

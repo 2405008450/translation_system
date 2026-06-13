@@ -78,6 +78,12 @@ interface HistoryRecordOptions {
   data?: string | null
 }
 
+interface EditorUndoBoundaryOptions {
+  inputType?: string
+  data?: string | null
+  preserveNextTargetSync?: boolean
+}
+
 type HighlightKind = 'term' | 'search' | 'qa'
 type HighlightPart = { text: string; highlight: boolean; kind?: HighlightKind; title?: string }
 type BasicFormatTag = 'b' | 'i' | 'u' | 's' | 'sub' | 'sup'
@@ -92,6 +98,7 @@ const isApplyingHistory = ref(false)
 const compositionSnapshotRecorded = ref(false)
 let lastHistorySnapshotAt = 0
 let lastHistoryInputKind = ''
+let preserveNextTargetSync = false
 const canUndoEditorChange = computed(() => undoStack.value.length > 0)
 const canRedoEditorChange = computed(() => redoStack.value.length > 0)
 
@@ -796,12 +803,13 @@ function getCurrentEditorSnapshot(): EditorHistorySnapshot {
 function pushHistorySnapshot(stack: EditorHistorySnapshot[], snapshot: EditorHistorySnapshot) {
   const lastSnapshot = stack[stack.length - 1]
   if (lastSnapshot?.text === snapshot.text && lastSnapshot.html === snapshot.html) {
-    return
+    return false
   }
   stack.push(snapshot)
   if (stack.length > MAX_EDITOR_HISTORY_SIZE) {
     stack.shift()
   }
+  return true
 }
 
 function clearEditorHistory() {
@@ -868,17 +876,44 @@ function shouldStartNewHistoryGroup(options: HistoryRecordOptions) {
 
 function recordUndoSnapshot(clearRedo = true, options: HistoryRecordOptions = {}) {
   if (props.disabled || !editorRef.value || isApplyingHistory.value || isComposing.value) {
-    return
+    return false
   }
   if (!shouldStartNewHistoryGroup(options)) {
-    return
+    return false
   }
-  pushHistorySnapshot(undoStack.value, getCurrentEditorSnapshot())
+  const recorded = pushHistorySnapshot(undoStack.value, getCurrentEditorSnapshot())
   lastHistorySnapshotAt = Date.now()
   lastHistoryInputKind = getHistoryInputKind(options.inputType)
   if (clearRedo) {
     redoStack.value = []
   }
+  return recorded
+}
+
+function recordEditorUndoBoundary(options: EditorUndoBoundaryOptions = {}) {
+  if (props.disabled || !editorRef.value || isApplyingHistory.value || isComposing.value) {
+    return false
+  }
+  const recorded = recordUndoSnapshot(true, {
+    inputType: options.inputType || 'programmaticEdit',
+    data: options.data,
+    force: true,
+  })
+  if (options.preserveNextTargetSync) {
+    preserveNextTargetSync = true
+  }
+  return recorded
+}
+
+function shouldPreserveHistoryForStateSync() {
+  if (preserveNextTargetSync || isFocused.value || isApplyingHistory.value) {
+    return true
+  }
+  if (!editorRef.value) {
+    return false
+  }
+  const stateText = props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
+  return serializeEditorContent(editorRef.value) === stateText
 }
 
 function applyHistorySnapshot(snapshot: EditorHistorySnapshot) {
@@ -1152,8 +1187,9 @@ function handlePaste(event: ClipboardEvent) {
   event.preventDefault()
   recordUndoSnapshot(true, { force: true, inputType: 'insertFromPaste' })
   // 优先获取 HTML 格式，保留格式标签
-  const html = event.clipboardData?.getData('text/html') || ''
-  const text = event.clipboardData?.getData('text/plain') || ''
+  const clipboardData = event.clipboardData
+  const html = clipboardData?.getData('text/html') || ''
+  const text = clipboardData?.getData('text/plain') || ''
 
   // 如果有待应用的格式且粘贴的是纯文本，应用格式
   if (!html && text && hasPendingFormats()) {
@@ -1409,7 +1445,9 @@ watch(
 watch(
   () => props.segment.target_text,
   () => {
-    if (!isFocused.value && !isApplyingHistory.value) {
+    const shouldPreserveHistory = shouldPreserveHistoryForStateSync()
+    preserveNextTargetSync = false
+    if (!shouldPreserveHistory) {
       clearEditorHistory()
     }
     if (!isFocused.value && editorRef.value) {
@@ -1421,7 +1459,9 @@ watch(
 watch(
   () => props.pendingRevision?.id ?? null,
   () => {
-    if (!isFocused.value && !isApplyingHistory.value) {
+    const shouldPreserveHistory = shouldPreserveHistoryForStateSync()
+    preserveNextTargetSync = false
+    if (!shouldPreserveHistory) {
       clearEditorHistory()
     }
   }
@@ -1442,6 +1482,7 @@ watch(
 defineExpose({
   undoEditorChange,
   redoEditorChange,
+  recordEditorUndoBoundary,
   canUndoEditorChange,
   canRedoEditorChange,
 })

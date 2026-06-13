@@ -2,6 +2,7 @@
 导出格式配置模块 - 定义各种文件格式支持的导出选项
 
 导出类型：
+- source: 上传源文件
 - original: 原格式导出
 - bilingual: 双语对照文件
 - tmx: TMX 翻译记忆库格式
@@ -25,6 +26,13 @@ class ExportOption:
 
 # 标准导出选项定义
 EXPORT_OPTIONS = {
+    "source": ExportOption(
+        id="source",
+        name="源文件",
+        description="下载上传时保留的原始源文件",
+        extension="",  # 使用原扩展名
+        mime_type="",  # 使用原 MIME 类型
+    ),
     "original": ExportOption(
         id="original",
         name="目标文件",
@@ -171,6 +179,7 @@ def get_supported_exports(extension: str) -> List[ExportOption]:
     """
     ext = extension.lower()
     option_ids = FORMAT_EXPORT_SUPPORT.get(ext, ["bilingual_txt", "tmx", "xliff"])
+    option_ids = ["source", *option_ids]
     return [EXPORT_OPTIONS[opt_id] for opt_id in option_ids if opt_id in EXPORT_OPTIONS]
 
 
