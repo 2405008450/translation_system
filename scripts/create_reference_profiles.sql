@@ -10,10 +10,14 @@ CREATE TABLE IF NOT EXISTS reference_profiles (
     translation_memory TEXT NOT NULL DEFAULT '[]',
     style_guide TEXT,
     analysis_report TEXT,
+    match_result TEXT,
     overall_confidence FLOAT DEFAULT 0.0,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE IF EXISTS reference_profiles
+    ADD COLUMN IF NOT EXISTS match_result TEXT;
 
 -- 索引
 CREATE INDEX IF NOT EXISTS ix_reference_profiles_file_record_id 
@@ -57,3 +61,4 @@ COMMENT ON TABLE reference_files IS '参考文件记录，存储上传的参考�
 COMMENT ON COLUMN reference_profiles.terminology IS '提取的术语列表 JSON';
 COMMENT ON COLUMN reference_profiles.translation_memory IS '提取的翻译记忆句对 JSON';
 COMMENT ON COLUMN reference_profiles.analysis_report IS 'AI 深度分析报告 JSON';
+COMMENT ON COLUMN reference_profiles.match_result IS '匹配结果JSON，包含exact_matches、fuzzy_matches、term_matches';

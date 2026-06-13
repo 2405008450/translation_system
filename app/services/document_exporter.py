@@ -39,6 +39,7 @@ from app.services.document_workspace import (
     _local_name,
     _normalize_segment_source_text,
     _qn,
+    _resolve_internal_reference_field_target,
     _resolve_paragraph_numbering_reference,
     _select_preferred_alternate_content_branch,
     normalize_document_parse_options,
@@ -168,12 +169,20 @@ class TextToken:
     apply_export_font: bool = False
     is_math: bool = False
     is_hyperlink: bool = False
+    hyperlink_element: object | None = None
 
 
 @dataclass(frozen=True)
 class CellParagraphTokens:
     paragraph: ET.Element
     tokens: list[TextToken]
+
+
+@dataclass
+class ExportTrackedField:
+    instruction_parts: list[str] = field(default_factory=list)
+    collecting_instruction: bool = True
+    hyperlink_key: object | None = None
 
 
 def export_bilingual_docx_with_layout(
@@ -926,9 +935,12 @@ def _collect_inline_tokens(
     parent_element: ET.Element | None = None,
     math_placeholder_counter: list[int] | None = None,
     inside_hyperlink: bool = False,
+    current_hyperlink: object | None = None,
+    field_stack: list[ExportTrackedField] | None = None,
     process_embedded_textboxes: bool = True,
 ) -> list[TextToken]:
     placeholder_counter = math_placeholder_counter if math_placeholder_counter is not None else [0]
+    active_field_stack = field_stack if field_stack is not None else []
     if node.tag in OMML_ATOMIC_TAGS:
         placeholder_counter[0] += 1
         placeholder = MATH_PLACEHOLDER_TEMPLATE.format(index=placeholder_counter[0])
@@ -961,15 +973,38 @@ def _collect_inline_tokens(
             parent_element=parent_element,
             math_placeholder_counter=placeholder_counter,
             inside_hyperlink=inside_hyperlink,
+            current_hyperlink=current_hyperlink,
+            field_stack=active_field_stack,
             process_embedded_textboxes=process_embedded_textboxes,
         )
 
+    if node.tag == _qn("w", "fldSimple") and story.parse_options.get("preserve_hyperlinks", True):
+        instruction = node.get(_qn("w", "instr"), "")
+        if _resolve_internal_reference_field_target(instruction):
+            inside_hyperlink = True
+            current_hyperlink = node
+
     if node.tag == _qn("w", "hyperlink") and story.parse_options.get("preserve_hyperlinks", True):
         inside_hyperlink = True
+        current_hyperlink = node
 
     if node.tag == _qn("w", "r"):
         current_run = node
         current_run_container = parent_element
+
+    if node.tag == _qn("w", "fldChar"):
+        _update_export_field_state(node, active_field_stack)
+        return []
+
+    if node_name == "instrText":
+        if active_field_stack and active_field_stack[-1].collecting_instruction:
+            active_field_stack[-1].instruction_parts.append(node.text or "")
+        return []
+
+    field_hyperlink = _current_export_field_hyperlink(active_field_stack)
+    if field_hyperlink is not None and story.parse_options.get("preserve_hyperlinks", True):
+        inside_hyperlink = True
+        current_hyperlink = field_hyperlink
 
     if node.tag == _qn("w", "t"):
         text_value = node.text or ""
@@ -983,6 +1018,7 @@ def _collect_inline_tokens(
                 container_element=current_run_container if current_run_container is not None else parent_element,
                 original_text=text_value,
                 is_hyperlink=inside_hyperlink,
+                hyperlink_element=current_hyperlink,
             )
         ]
 
@@ -1018,9 +1054,6 @@ def _collect_inline_tokens(
         )
         return []
 
-    if node_name == "instrText":
-        return []
-
     tokens: list[TextToken] = []
     for child in list(node):
         tokens.extend(
@@ -1035,11 +1068,43 @@ def _collect_inline_tokens(
                 parent_element=node,
                 math_placeholder_counter=placeholder_counter,
                 inside_hyperlink=inside_hyperlink,
+                current_hyperlink=current_hyperlink,
+                field_stack=active_field_stack,
                 process_embedded_textboxes=process_embedded_textboxes,
             )
         )
 
     return tokens
+
+
+def _update_export_field_state(
+    node: ET.Element,
+    field_stack: list[ExportTrackedField],
+) -> None:
+    field_type = node.get(_qn("w", "fldCharType"))
+    if field_type == "begin":
+        field_stack.append(ExportTrackedField())
+        return
+
+    if not field_stack:
+        return
+
+    current_field = field_stack[-1]
+    if field_type == "separate":
+        current_field.collecting_instruction = False
+        if _resolve_internal_reference_field_target("".join(current_field.instruction_parts)):
+            current_field.hyperlink_key = current_field
+        return
+
+    if field_type == "end":
+        field_stack.pop()
+
+
+def _current_export_field_hyperlink(field_stack: list[ExportTrackedField]) -> object | None:
+    for tracked_field in reversed(field_stack):
+        if not tracked_field.collecting_instruction and tracked_field.hyperlink_key is not None:
+            return tracked_field.hyperlink_key
+    return None
 
 
 def _export_bilingual_embedded_textboxes(
@@ -1674,6 +1739,9 @@ def _queue_sentence_replacement(
     span: SentenceSpan,
     replacement: str,
 ) -> None:
+    if _queue_sentence_replacement_preserving_hyperlink_scope(tokens, span, replacement):
+        return
+
     writable_overlaps: list[tuple[TextToken, int, int]] = []
     for token in tokens:
         if token.element is None:
@@ -1689,6 +1757,141 @@ def _queue_sentence_replacement(
         )
 
     _queue_text_range_edit(writable_overlaps, replacement)
+
+
+@dataclass(frozen=True)
+class _HyperlinkReplacementGroup:
+    start: int
+    end: int
+    text: str
+    first_token: TextToken
+    last_token: TextToken
+
+
+def _queue_sentence_replacement_preserving_hyperlink_scope(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+    replacement: str,
+) -> bool:
+    hyperlink_groups = _collect_sentence_hyperlink_groups(tokens, span)
+    if not hyperlink_groups:
+        return False
+
+    matches = _match_hyperlink_texts_in_replacement(hyperlink_groups, replacement)
+    if matches is None:
+        return False
+
+    source_cursor = span.start
+    replacement_cursor = 0
+    previous_token: TextToken | None = None
+
+    for group, (match_start, match_end) in zip(hyperlink_groups, matches, strict=False):
+        _queue_text_region_replacement(
+            tokens=tokens,
+            region_start=source_cursor,
+            region_end=group.start,
+            replacement_text=replacement[replacement_cursor:match_start],
+            before_token=previous_token,
+            after_token=group.first_token,
+        )
+        _queue_text_region_replacement(
+            tokens=tokens,
+            region_start=group.start,
+            region_end=group.end,
+            replacement_text=replacement[match_start:match_end],
+            before_token=None,
+            after_token=group.first_token,
+        )
+        source_cursor = group.end
+        replacement_cursor = match_end
+        previous_token = group.last_token
+
+    _queue_text_region_replacement(
+        tokens=tokens,
+        region_start=source_cursor,
+        region_end=span.end,
+        replacement_text=replacement[replacement_cursor:],
+        before_token=previous_token,
+        after_token=_find_first_token_starting_at_or_after(tokens, span.end),
+    )
+    return True
+
+
+def _collect_sentence_hyperlink_groups(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+) -> list[_HyperlinkReplacementGroup]:
+    groups: list[_HyperlinkReplacementGroup] = []
+    current_element: object | None = None
+    current_tokens: list[TextToken] = []
+    current_text_parts: list[str] = []
+    current_start = 0
+    current_end = 0
+
+    def flush_current_group() -> None:
+        nonlocal current_element, current_tokens, current_text_parts, current_start, current_end
+        if current_element is not None and current_tokens:
+            linked_text = "".join(current_text_parts)
+            if linked_text:
+                groups.append(
+                    _HyperlinkReplacementGroup(
+                        start=current_start,
+                        end=current_end,
+                        text=linked_text,
+                        first_token=current_tokens[0],
+                        last_token=current_tokens[-1],
+                    )
+                )
+        current_element = None
+        current_tokens = []
+        current_text_parts = []
+        current_start = 0
+        current_end = 0
+
+    for token in tokens:
+        overlap_start = max(span.start, token.start)
+        overlap_end = min(span.end, token.end)
+        if overlap_end <= overlap_start:
+            continue
+
+        hyperlink_element = token.hyperlink_element if token.is_hyperlink else None
+        if hyperlink_element is None:
+            flush_current_group()
+            continue
+
+        local_start = overlap_start - token.start
+        local_end = overlap_end - token.start
+        token_text = token.display_text[local_start:local_end]
+        if hyperlink_element is not current_element:
+            flush_current_group()
+            current_element = hyperlink_element
+            current_start = overlap_start
+
+        current_tokens.append(token)
+        current_text_parts.append(token_text)
+        current_end = overlap_end
+
+    flush_current_group()
+    return groups
+
+
+def _match_hyperlink_texts_in_replacement(
+    groups: list[_HyperlinkReplacementGroup],
+    replacement: str,
+) -> list[tuple[int, int]] | None:
+    matches: list[tuple[int, int]] = []
+    cursor = 0
+    for group in groups:
+        linked_text = group.text
+        if not linked_text:
+            return None
+        match_start = replacement.find(linked_text, cursor)
+        if match_start < 0:
+            return None
+        match_end = match_start + len(linked_text)
+        matches.append((match_start, match_end))
+        cursor = match_end
+    return matches
 
 
 def _apply_token_edits(tokens: list[TextToken]) -> None:

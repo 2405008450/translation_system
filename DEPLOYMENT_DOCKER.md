@@ -7,7 +7,7 @@
 ```bash
 sudo ss -tulpn | grep 19013 || true
 docker --version
-docker compose version
+docker compose version || docker-compose version
 ```
 
 在云服务器安全组和系统防火墙中放行 TCP `19013`。
@@ -30,10 +30,23 @@ nano .env.prod
 
 ## 3. 构建并启动
 
+如果服务器支持新版插件命令 `docker compose`，使用：
+
 ```bash
 docker compose --env-file .env.prod -f docker-compose.prod.yml build
 docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
 docker compose --env-file .env.prod -f docker-compose.prod.yml ps
+```
+
+如果服务器只有独立命令 `docker-compose`，先复制一份默认 `.env`，再使用：
+
+```bash
+cp .env.prod .env
+
+sudo docker-compose -f docker-compose.prod.yml config
+sudo docker-compose -f docker-compose.prod.yml build
+sudo docker-compose -f docker-compose.prod.yml up -d
+sudo docker-compose -f docker-compose.prod.yml ps
 ```
 
 首次创建数据库 volume 时会自动执行：
@@ -52,6 +65,13 @@ curl http://127.0.0.1:19013/api/health
 curl http://43.132.156.72:19013/
 docker compose --env-file .env.prod -f docker-compose.prod.yml logs --tail=100 app
 docker compose --env-file .env.prod -f docker-compose.prod.yml logs --tail=100 worker
+```
+
+如果使用的是 `docker-compose` 命令：
+
+```bash
+sudo docker-compose -f docker-compose.prod.yml logs --tail=100 app
+sudo docker-compose -f docker-compose.prod.yml logs --tail=100 worker
 ```
 
 打开：
@@ -73,3 +93,5 @@ http://43.132.156.72:19013/login
 5. 再启动服务并检查 `/api/health`。
 
 仓库中的 `migration_20260605_105050` 是旧迁移包，可作为后续恢复来源，但不要在首次空库上线时自动覆盖。
+
+数据库迁移和远程连接请看 [DATABASE_MIGRATION.md](DATABASE_MIGRATION.md)。默认推荐 SSH 隧道连接数据库，不建议把 PostgreSQL 裸露到公网。

@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     default_similarity_threshold: float = 0.80
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
-    deepseek_model: str = "deepseek-v4-flash*"
+    deepseek_model: str = "deepseek-chat"
     openrouter_api_key: str | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_model: str = "google/gemini-3.5-flash"

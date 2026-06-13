@@ -2135,18 +2135,28 @@ async function focusMatchedSegment(offset: number) {
   await ensureFilteredCorpusLoaded()
 
   const matches = editorSegments.value
-  if (!matches.length) {
+  const totalMatches = segmentStore.matchedSegmentCount
+  if (!matches.length || totalMatches <= 0) {
     return
   }
 
-  let targetIndex = activeEditorIndex.value
-  if (targetIndex === -1) {
-    targetIndex = offset > 0 ? 0 : matches.length - 1
+  const pageSize = Math.max(segmentStore.pageSize, 1)
+  const currentPageStartIndex = Math.max(segmentStore.currentPage - 1, 0) * pageSize
+  let targetGlobalIndex = 0
+  if (activeEditorIndex.value === -1) {
+    targetGlobalIndex = offset >= 0 ? 0 : totalMatches - 1
   } else {
-    targetIndex = (targetIndex + offset + matches.length) % matches.length
+    const currentGlobalIndex = currentPageStartIndex + activeEditorIndex.value
+    targetGlobalIndex = (currentGlobalIndex + offset + totalMatches) % totalMatches
   }
 
-  await focusEditorSegmentAtIndex(targetIndex)
+  const targetPage = Math.floor(targetGlobalIndex / pageSize) + 1
+  const targetPageIndex = targetGlobalIndex % pageSize
+  if (targetPage !== segmentStore.currentPage) {
+    await refreshSegmentPage(targetPage, pageSize)
+  }
+
+  await focusEditorSegmentAtIndex(Math.min(targetPageIndex, Math.max(editorSegments.value.length - 1, 0)))
 }
 
 function replaceTargetText(targetText: string, replaceAll = false) {

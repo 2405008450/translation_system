@@ -66,6 +66,7 @@ HIGHLIGHT_COLORS = {
     "yellow": "#ffff00",
 }
 PAGE_NUMBER_FIELD_NAMES = {"PAGE", "NUMPAGES", "SECTIONPAGES"}
+INTERNAL_REFERENCE_FIELD_NAMES = {"REF", "PAGEREF", "NOTEREF"}
 NUMBERING_PLACEHOLDER_RE = re.compile(r"%(\d+)")
 PAGE_NUMBER_WRAPPER_RE = re.compile(r"[\s\-\u2013\u2014\u2212\uff0d_./\\|:：()\[\]{}（）【】<>《》·•]+")
 CELL_SENTENCE_END_CHARS = frozenset("。？！?!.；;:：")
@@ -76,7 +77,7 @@ CELL_PARAGRAPH_BREAK_SENTINEL = "\uE000"
 PAGE_BREAK_SENTINEL = "\uE001"
 PAGE_BREAK_HTML = '<span class="doc-page-break" aria-hidden="true"></span>'
 DOCX_PARSE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
-DOCX_PARSE_CACHE_VERSION = "8"
+DOCX_PARSE_CACHE_VERSION = "9"
 DOCUMENT_PARSE_MODE_FULL = "full"
 DOCUMENT_PARSE_MODE_BODY_ONLY = "body_only"
 SUPPORTED_DOCUMENT_PARSE_MODES = {
@@ -172,6 +173,7 @@ class TrackedField:
     instruction_parts: list[str] = field(default_factory=list)
     collecting_instruction: bool = True
     suppress_result: bool = False
+    href: str | None = None
 
 
 @dataclass
@@ -1937,6 +1939,9 @@ def _collect_inline_content(
         if _should_suppress_page_number_field(instruction, story.kind):
             parse_state.suppressed_page_number_field = True
             return [], [], []
+        field_href = _resolve_internal_reference_field_target(instruction)
+        if field_href and story.parse_options.get("preserve_hyperlinks", True):
+            hyperlink = field_href
 
     if node.tag == _qn("w", "hyperlink") and story.parse_options.get("preserve_hyperlinks", True):
         hyperlink = _resolve_hyperlink_target(node, story.rels) or hyperlink
@@ -1977,6 +1982,11 @@ def _collect_inline_content(
             _qn("w", "pict"),
         }:
             return [], [], []
+
+    if story.parse_options.get("preserve_hyperlinks", True):
+        field_href = _current_field_result_hyperlink(parse_state.field_stack)
+        if field_href:
+            hyperlink = field_href
 
     if node.tag == _qn("w", "t"):
         text_value = node.text or ""
@@ -2360,11 +2370,13 @@ def _update_field_state(
 
     current_field = parse_state.field_stack[-1]
     if field_type == "separate":
+        instruction = "".join(current_field.instruction_parts)
         current_field.collecting_instruction = False
         current_field.suppress_result = _should_suppress_page_number_field(
-            "".join(current_field.instruction_parts),
+            instruction,
             story_kind,
         )
+        current_field.href = _resolve_internal_reference_field_target(instruction)
         if current_field.suppress_result:
             parse_state.suppressed_page_number_field = True
         return
@@ -2390,6 +2402,60 @@ def _should_suppress_page_number_field(instruction: str, story_kind: str) -> boo
 
 def _is_inside_suppressed_page_number_field(field_stack: list[TrackedField]) -> bool:
     return any(field.suppress_result and not field.collecting_instruction for field in field_stack)
+
+
+def _current_field_result_hyperlink(field_stack: list[TrackedField]) -> str | None:
+    for tracked_field in reversed(field_stack):
+        if not tracked_field.collecting_instruction and tracked_field.href:
+            return tracked_field.href
+    return None
+
+
+def _resolve_internal_reference_field_target(instruction: str) -> str | None:
+    normalized = " ".join((instruction or "").replace("\u0014", " ").split())
+    if not normalized:
+        return None
+
+    field_name_match = re.match(r"[A-Za-z]+", normalized)
+    if not field_name_match:
+        return None
+
+    field_name = field_name_match.group(0).upper()
+    if field_name in INTERNAL_REFERENCE_FIELD_NAMES and _field_instruction_has_switch(normalized, "h"):
+        target = _first_field_argument(normalized[field_name_match.end() :])
+        return f"#{target}" if target else None
+
+    if field_name == "HYPERLINK":
+        target = _field_switch_argument(normalized, "l")
+        return f"#{target}" if target else None
+
+    return None
+
+
+def _field_instruction_has_switch(instruction: str, switch_name: str) -> bool:
+    return re.search(rf"(^|\s)\\{re.escape(switch_name)}(?=\s|$)", instruction, re.IGNORECASE) is not None
+
+
+def _first_field_argument(instruction_tail: str) -> str | None:
+    for token in _iter_field_instruction_tokens(instruction_tail):
+        if token.startswith("\\"):
+            continue
+        return token
+    return None
+
+
+def _field_switch_argument(instruction: str, switch_name: str) -> str | None:
+    tokens = list(_iter_field_instruction_tokens(instruction))
+    for index, token in enumerate(tokens):
+        if token.lower() == f"\\{switch_name.lower()}" and index + 1 < len(tokens):
+            target = tokens[index + 1]
+            return None if target.startswith("\\") else target
+    return None
+
+
+def _iter_field_instruction_tokens(instruction: str):
+    for match in re.finditer(r'"([^"]+)"|(\S+)', instruction or ""):
+        yield match.group(1) if match.group(1) is not None else match.group(2)
 
 
 def _is_page_number_wrapper_only(text: str, block_type: str) -> bool:
