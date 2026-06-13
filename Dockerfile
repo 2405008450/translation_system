@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1.7
+
+FROM node:20-bookworm-slim AS frontend-builder
+
+WORKDIR /build/frontend
+
+COPY frontend/package*.json ./
+RUN npm ci
+
+COPY frontend/ ./
+RUN npm run build
+
+
+FROM python:3.11-slim-bookworm AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    LIBREOFFICE_SOFFICE_PATH=/usr/bin/libreoffice \
+    LIBREOFFICE_PYTHON_PATH=/usr/bin/python3
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        fontconfig \
+        fonts-noto-cjk \
+        libreoffice \
+        libreoffice-calc \
+        libreoffice-impress \
+        libreoffice-writer \
+        p7zip-full \
+        python3-uno \
+        unzip \
+        unrar-free \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN python -m pip install --upgrade pip \
+    && python -m pip install -r requirements.txt
+
+COPY app ./app
+COPY scripts ./scripts
+COPY prompt_templates ./prompt_templates
+COPY --from=frontend-builder /build/frontend/dist ./frontend/dist
+
+RUN mkdir -p /app/data/file_records /app/data/export_tasks /app/logs
+
+EXPOSE 19013
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:19013/api/health', timeout=3).read()"
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "19013", "--proxy-headers"]

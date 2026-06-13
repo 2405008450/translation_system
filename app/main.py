@@ -6,8 +6,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
 
 from app.config import get_settings, validate_runtime_settings
+from app.database import engine
 from app.logging import configure_logging
 from app.routers.api import router as api_router
 from app.routers.auth import router as auth_router
@@ -39,6 +41,16 @@ app.include_router(api_router, prefix="/api")
 app.include_router(term_base_router, prefix="/api")
 app.include_router(reference_router, prefix="/api")
 app.include_router(glossary_base_router, prefix="/api")
+
+
+@app.get("/api/health", include_in_schema=False)
+def health_check():
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="数据库连接不可用。") from exc
+    return {"status": "ok", "database": "ok"}
 
 
 if frontend_assets_dir.exists():

@@ -1,0 +1,101 @@
+name: ai-translation-system
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-translation-system:latest
+    container_name: ai-translation-app
+    env_file:
+      - ${APP_ENV_FILE:-.env.prod}
+    environment:
+      FILE_STORAGE_DIR: /app/data/file_records
+      EXPORT_TASK_DIR: /app/data/export_tasks
+      LIBREOFFICE_SOFFICE_PATH: /usr/bin/libreoffice
+      LIBREOFFICE_PYTHON_PATH: /usr/bin/python3
+    ports:
+      - "19013:19013"
+    volumes:
+      - app_file_storage:/app/data/file_records
+      - app_export_tasks:/app/data/export_tasks
+      - app_logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      languagetool:
+        condition: service_started
+    restart: unless-stopped
+
+  worker:
+    image: ai-translation-system:latest
+    container_name: ai-translation-worker
+    command: ["arq", "app.routers.api.WorkerSettings"]
+    healthcheck:
+      disable: true
+    env_file:
+      - ${APP_ENV_FILE:-.env.prod}
+    environment:
+      FILE_STORAGE_DIR: /app/data/file_records
+      EXPORT_TASK_DIR: /app/data/export_tasks
+      LIBREOFFICE_SOFFICE_PATH: /usr/bin/libreoffice
+      LIBREOFFICE_PYTHON_PATH: /usr/bin/python3
+    volumes:
+      - app_file_storage:/app/data/file_records
+      - app_export_tasks:/app/data/export_tasks
+      - app_logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: ai-translation-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?请在 .env.prod 中设置 POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?请在 .env.prod 中设置 POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env.prod 中设置 POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init/00-extensions.sql:/docker-entrypoint-initdb.d/00-extensions.sql:ro
+      - ./docker/postgres/init/05-users-prereq.sql:/docker-entrypoint-initdb.d/05-users-prereq.sql:ro
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/10-init_db.sql:ro
+      - ./scripts/create_reference_profiles.sql:/docker-entrypoint-initdb.d/20-create_reference_profiles.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: ai-translation-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  languagetool:
+    image: silviof/docker-languagetool:latest
+    container_name: ai-translation-languagetool
+    expose:
+      - "8010"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  app_file_storage:
+  app_export_tasks:
+  app_logs:

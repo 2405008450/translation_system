@@ -258,9 +258,9 @@ function startResize(event: MouseEvent) {
 }
 
 function resolveDefaultBottomDrawerHeight() {
-  const minHeight = props.standalone ? 380 : 360
-  const maxHeight = props.standalone ? 560 : 520
-  const preferredHeight = Math.round(viewportHeight.value * 0.5)
+  const minHeight = props.standalone ? 320 : 300
+  const maxHeight = props.standalone ? 500 : 460
+  const preferredHeight = Math.round(viewportHeight.value * 0.42)
   return clampBottomDrawerHeight(Math.min(Math.max(preferredHeight, minHeight), maxHeight))
 }
 
@@ -5603,7 +5603,7 @@ onBeforeRouteLeave(async () => {
           </div>
         </Transition>
 
-        <div class="segment-editor-shell">
+        <div class="segment-editor-shell" :class="{ 'has-bottom-drawer': activeBottomTool }">
           <div ref="segmentEditorResultsRef" class="segment-editor-results">
             <div class="segment-table-head" aria-hidden="true">
               <span>句段</span>
@@ -5760,7 +5760,7 @@ onBeforeRouteLeave(async () => {
               />
 
               <button
-                v-if="activeBottomTool === 'history'"
+                v-if="activeBottomTool === 'history' || activeBottomTool === 'qa-result'"
                 class="workbench-bottom-drawer__close"
                 type="button"
                 title="关闭"
@@ -5844,35 +5844,35 @@ onBeforeRouteLeave(async () => {
               />
 
               <div v-else class="workbench-bottom-drawer__qa">
-                <div class="workbench-bottom-drawer__header">
-                  <div>
+                <div class="workbench-bottom-drawer__header workbench-bottom-drawer__header--qa">
+                  <div class="workbench-bottom-drawer__header-lead">
                     <div class="section-title section-title--tight">术语 QA 报告</div>
                     <p class="panel-subtitle">{{ segmentStore.fileRecord?.filename || '' }}</p>
                   </div>
-                  <button
-                    class="button preview-panel__close"
-                    type="button"
-                    @click="closeBottomDrawer"
-                  >
-                    关闭
-                  </button>
-                </div>
 
-                <div v-if="loadingTermQAReport || (generatingTermQAReport && !termQAReport)" class="empty-state">
-                  <Loader2 class="lucide-spin" :size="28" />
-                  {{ generatingTermQAReport ? '正在生成术语 QA 报告' : '正在加载最近报告' }}
-                </div>
-
-                <template v-else-if="termQAReport">
-                  <div class="term-qa-dialog__summary">
-                    <span>检查句段：{{ termQAReport.checked_segments }}</span>
-                    <span>总问题数：{{ termQAReport.issue_count }}</span>
-                    <span>待处理：{{ termQAReport.active_issue_count }}</span>
-                    <span>已忽略：{{ termQAReport.ignored_count }}</span>
-                    <span>报告时间：{{ termQAReport.created_at || '' }}</span>
+                  <div v-if="termQAReport" class="term-qa-dialog__summary">
+                    <span class="term-qa-stat">
+                      <em class="term-qa-stat__value">{{ termQAReport.active_issue_count }}</em>
+                      <span class="term-qa-stat__label">待处理</span>
+                    </span>
+                    <span class="term-qa-stat is-muted">
+                      <em class="term-qa-stat__value">{{ termQAReport.ignored_count }}</em>
+                      <span class="term-qa-stat__label">已忽略</span>
+                    </span>
+                    <span class="term-qa-stat is-muted">
+                      <em class="term-qa-stat__value">{{ termQAReport.issue_count }}</em>
+                      <span class="term-qa-stat__label">总问题</span>
+                    </span>
+                    <span class="term-qa-stat is-muted">
+                      <em class="term-qa-stat__value">{{ termQAReport.checked_segments }}</em>
+                      <span class="term-qa-stat__label">检查句段</span>
+                    </span>
+                    <span v-if="termQAReport.created_at" class="term-qa-stat__time">
+                      {{ termQAReport.created_at }}
+                    </span>
                   </div>
 
-                  <div class="term-qa-dialog__actions">
+                  <div v-if="termQAReport" class="term-qa-dialog__actions">
                     <button
                       class="button button--ghost"
                       type="button"
@@ -5910,7 +5910,14 @@ onBeforeRouteLeave(async () => {
                       重新生成
                     </button>
                   </div>
+                </div>
 
+                <div v-if="loadingTermQAReport || (generatingTermQAReport && !termQAReport)" class="empty-state">
+                  <Loader2 class="lucide-spin" :size="28" />
+                  {{ generatingTermQAReport ? '正在生成术语 QA 报告' : '正在加载最近报告' }}
+                </div>
+
+                <template v-else-if="termQAReport">
                   <div v-if="termQAReport.items.length === 0" class="empty-state">
                     未发现术语不一致问题。
                   </div>
@@ -5918,7 +5925,16 @@ onBeforeRouteLeave(async () => {
                     <table class="term-qa-dialog__table">
                       <thead>
                         <tr>
-                          <th>选择</th>
+                          <th class="term-qa-dialog__col-select">
+                            <input
+                              type="checkbox"
+                              :checked="allActiveTermQAItemsSelected"
+                              :disabled="activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
+                              aria-label="全选未忽略报告项"
+                              title="全选未忽略"
+                              @change="toggleAllActiveTermQAItems(!allActiveTermQAItemsSelected)"
+                            >
+                          </th>
                           <th>句段</th>
                           <th>原文术语</th>
                           <th>期望译文</th>
@@ -5962,9 +5978,13 @@ onBeforeRouteLeave(async () => {
                               {{ item.sentence_id }}
                             </span>
                           </td>
-                          <td>{{ item.source_term }}</td>
-                          <td>{{ item.expected_target_term }}</td>
-                          <td>{{ item.target_text || '未填写' }}</td>
+                          <td class="term-qa-dialog__cell-text" :title="item.source_term">{{ item.source_term }}</td>
+                          <td class="term-qa-dialog__cell-text" :title="item.expected_target_term">{{ item.expected_target_term }}</td>
+                          <td
+                            class="term-qa-dialog__cell-text"
+                            :class="{ 'is-empty': !item.target_text }"
+                            :title="item.target_text || '未填写'"
+                          >{{ item.target_text || '未填写' }}</td>
                           <td>
                             <span class="term-qa-dialog__status" :class="{ 'is-ignored': item.ignored }">
                               {{ item.ignored ? '已忽略' : '待处理' }}
@@ -6640,7 +6660,7 @@ onBeforeRouteLeave(async () => {
 
 .workbench-page {
   --workbench-editor-stage-height: clamp(420px, calc(100vh - 410px), 660px);
-  --workbench-bottom-panel-height: clamp(360px, 50vh, 520px);
+  --workbench-bottom-panel-height: clamp(300px, 42vh, 460px);
   --workbench-visible-bottom-panel-height: min(var(--workbench-bottom-panel-height), calc(100dvh - 70px));
   --workbench-side-tools-width: 48px;
   --workbench-toolbar-left: calc(var(--sidebar-width) + 24px);
@@ -6654,7 +6674,7 @@ onBeforeRouteLeave(async () => {
 
 .workbench-page.is-standalone {
   --workbench-editor-stage-height: clamp(460px, calc(100vh - 300px), 860px);
-  --workbench-bottom-panel-height: clamp(380px, 50vh, 560px);
+  --workbench-bottom-panel-height: clamp(320px, 42vh, 500px);
   --workbench-visible-bottom-panel-height: min(var(--workbench-bottom-panel-height), calc(100dvh - 70px));
   --workbench-toolbar-left: 16px;
   --workbench-drawer-left: 16px;
@@ -7539,7 +7559,7 @@ onBeforeRouteLeave(async () => {
 .term-qa-dialog__actions {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   flex-wrap: wrap;
 }
 
@@ -7548,21 +7568,61 @@ onBeforeRouteLeave(async () => {
   font-size: 13px;
 }
 
+.term-qa-stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 3px 9px;
+  border: 1px solid #d7e7e3;
+  border-radius: 999px;
+  background: #f3faf8;
+  white-space: nowrap;
+}
+
+.term-qa-stat.is-muted {
+  border-color: var(--border-color, #dbe3ea);
+  background: var(--surface-muted, #f8fafc);
+}
+
+.term-qa-stat__value {
+  font-size: 14px;
+  font-weight: 700;
+  font-style: normal;
+  color: #b4530f;
+}
+
+.term-qa-stat.is-muted .term-qa-stat__value {
+  color: #2f4a53;
+}
+
+.term-qa-stat__label {
+  font-size: 12px;
+  color: var(--text-muted, #64748b);
+}
+
+.term-qa-stat__time {
+  margin-left: auto;
+  color: #8694a0;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .term-qa-dialog__actions {
   justify-content: flex-end;
 }
 
 .term-qa-dialog__table-wrap {
-  overflow-x: auto;
+  overflow: auto;
   border: 1px solid var(--border-color, #dbe3ea);
   border-radius: 8px;
 }
 
 .term-qa-dialog__table {
   width: 100%;
-  min-width: 920px;
+  min-width: 760px;
   border-collapse: collapse;
   font-size: 13px;
+  table-layout: fixed;
 }
 
 .term-qa-dialog__table th,
@@ -7574,9 +7634,41 @@ onBeforeRouteLeave(async () => {
 }
 
 .term-qa-dialog__table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
   color: var(--text-muted, #64748b);
   background: var(--surface-muted, #f8fafc);
   font-weight: 600;
+}
+
+.term-qa-dialog__col-select {
+  width: 40px;
+  text-align: center;
+}
+
+.term-qa-dialog__table th:nth-child(2) {
+  width: 88px;
+}
+
+.term-qa-dialog__table th:nth-child(6) {
+  width: 104px;
+}
+
+.term-qa-dialog__table th:nth-child(7) {
+  width: 78px;
+}
+
+.term-qa-dialog__cell-text {
+  max-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.term-qa-dialog__cell-text.is-empty {
+  color: #9aa7af;
+  font-style: italic;
 }
 
 .term-qa-dialog__table tr:last-child td {
@@ -8135,16 +8227,22 @@ onBeforeRouteLeave(async () => {
 }
 
 .segment-editor-shell {
+  position: relative;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   align-items: stretch;
   gap: 8px;
 }
 
+.segment-editor-shell.has-bottom-drawer {
+  gap: 0;
+}
+
 .segment-editor-results {
   --segment-editor-grid-template: 72px minmax(0, 1fr) minmax(0, 1fr) 76px 76px;
   --segment-editor-scrollbar-gutter: 10px;
   --virtual-list-inline-end-gap: 4px;
+  order: 1;
   display: grid;
   grid-template-rows: auto minmax(390px, var(--workbench-editor-stage-height));
   min-height: 0;
@@ -8187,14 +8285,23 @@ onBeforeRouteLeave(async () => {
 }
 
 .segment-editor-footer {
+  position: relative;
+  z-index: 2;
+  order: 3;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   min-height: 44px;
   min-width: 0;
-  padding: 6px 0 0;
-  background: transparent;
+  padding: 6px 8px;
+  border: 1px solid #cfd8df;
+  background: #f4f7f9;
+}
+
+.segment-editor-shell.has-bottom-drawer .segment-editor-footer {
+  border-top: 0;
+  background: #edf3f6;
 }
 
 .segment-editor-footer :deep(.pagination) {
@@ -8626,7 +8733,7 @@ onBeforeRouteLeave(async () => {
   display: flex;
   justify-content: flex-start;
   align-items: center;
-  gap: 6px;
+  gap: 0;
   min-height: 32px;
   min-width: 0;
   width: max-content;
@@ -8634,11 +8741,11 @@ onBeforeRouteLeave(async () => {
   overflow-x: auto;
   overflow-y: hidden;
   padding: 0;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  box-shadow: none;
-  pointer-events: none;
+  border: 1px solid #c6d4dc;
+  border-radius: 4px;
+  background: #ffffff;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.86);
+  pointer-events: auto;
   scrollbar-width: none;
 }
 
@@ -8656,44 +8763,46 @@ onBeforeRouteLeave(async () => {
   max-width: min(540px, 48vw);
   min-height: 31px;
   padding: 0;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  box-shadow: none;
+  border-color: #b8cbd5;
+  border-radius: 4px;
+  background: #ffffff;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.55);
 }
 
 .segment-editor-bottom-tool {
-  --bottom-tool-bg: linear-gradient(180deg, #f7fbff, #e6f0f7);
-  --bottom-tool-border: #afc1cc;
   position: relative;
   display: inline-flex;
   flex: 0 0 auto;
   align-items: center;
   justify-content: center;
   gap: 5px;
-  height: 32px;
-  min-width: 100px;
-  padding: 0 13px;
-  border: 1px solid var(--bottom-tool-border);
-  border-radius: 4px;
-  background: var(--bottom-tool-bg);
+  height: 30px;
+  min-width: 94px;
+  padding: 0 11px;
+  border: 0;
+  border-left: 1px solid #d7e2e8;
+  border-radius: 0;
+  background: transparent;
   color: #334852;
   font-size: 13px;
   font-weight: 500;
   line-height: 1;
   letter-spacing: 0;
   white-space: nowrap;
-  box-shadow: 0 8px 18px rgba(24, 48, 58, 0.12);
+  box-shadow: none;
   pointer-events: auto;
+  transition:
+    background-color 140ms ease,
+    color 140ms ease;
 }
 
 .segment-editor-bottom-tool:first-child {
-  border-left: 1px solid var(--bottom-tool-border);
-  border-radius: 4px;
+  border-left: 0;
+  border-radius: 0;
 }
 
 .segment-editor-bottom-tool:last-child {
-  border-radius: 4px;
+  border-radius: 0;
 }
 
 .segment-editor-bottom-tool svg {
@@ -8710,18 +8819,16 @@ onBeforeRouteLeave(async () => {
 .segment-editor-bottom-tool:hover:not(:disabled),
 .segment-editor-bottom-tool:focus-visible {
   z-index: 1;
-  border-color: #72acd7;
-  background: #ffffff;
+  background: #f6fbfd;
   color: #0070c0;
   outline: none;
 }
 
 .segment-editor-bottom-tool.is-active {
   z-index: 2;
-  border-color: #8abfe8;
   background: #ffffff;
   color: #0070c0;
-  box-shadow: 0 8px 18px rgba(24, 48, 58, 0.14), inset 0 -2px 0 #1e9bff;
+  box-shadow: inset 0 2px 0 #1e9bff, inset 0 -1px 0 #ffffff;
 }
 
 .segment-editor-bottom-tool.is-active svg {
@@ -8742,8 +8849,6 @@ onBeforeRouteLeave(async () => {
 }
 
 .segment-editor-bottom-tool--qa {
-  --bottom-tool-bg: linear-gradient(180deg, #eef9f3, #d7eadf);
-  --bottom-tool-border: #9bc7ad;
   padding-right: 26px;
 }
 
@@ -8751,36 +8856,16 @@ onBeforeRouteLeave(async () => {
   color: #23805f;
 }
 
-.segment-editor-bottom-tool--history {
-  --bottom-tool-bg: linear-gradient(180deg, #f5f1fb, #e6ddf2);
-  --bottom-tool-border: #b9abd0;
-}
-
 .segment-editor-bottom-tool--history svg {
-  color: #6e5c91;
-}
-
-.segment-editor-bottom-tool--paper {
-  --bottom-tool-bg: linear-gradient(180deg, #eef8fb, #dcecf1);
-  --bottom-tool-border: #a5c4ce;
+  color: #5d6f85;
 }
 
 .segment-editor-bottom-tool--paper svg {
   color: #376f7e;
 }
 
-.segment-editor-bottom-tool--success {
-  --bottom-tool-bg: linear-gradient(180deg, #effaf5, #d9efe5);
-  --bottom-tool-border: #9fcdb8;
-}
-
 .segment-editor-bottom-tool--success svg {
   color: #1d7b61;
-}
-
-.segment-editor-bottom-tool--layout {
-  --bottom-tool-bg: linear-gradient(180deg, #eef6ff, #dce9f7);
-  --bottom-tool-border: #a7bdd7;
 }
 
 .segment-editor-bottom-tool--layout svg {
@@ -8811,25 +8896,24 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-bottom-drawer {
-  position: fixed;
-  right: 16px;
-  bottom: 50px;
-  left: var(--workbench-drawer-left);
-  z-index: 1700;
-  width: auto;
+  position: relative;
+  z-index: 1;
+  order: 2;
+  width: 100%;
   height: var(--workbench-visible-bottom-panel-height);
   min-height: min(260px, var(--workbench-visible-bottom-panel-height));
   max-height: var(--workbench-visible-bottom-panel-height);
   overflow: hidden;
-  border: 1px solid #cbd8de;
-  border-radius: 6px;
+  border: 1px solid #cfd8df;
+  border-bottom: 0;
+  border-radius: 0;
   background: #ffffff;
-  box-shadow: 0 18px 40px rgba(24, 48, 58, 0.18);
+  box-shadow: none;
 }
 
 .workbench-bottom-drawer.is-resizable {
-  padding-top: 8px;
-  border-top-color: #9eb9c4;
+  padding-top: 12px;
+  border-top-color: #b6c9d2;
 }
 
 .workbench-bottom-drawer.is-resizing {
@@ -8845,7 +8929,8 @@ onBeforeRouteLeave(async () => {
   height: 12px;
   padding: 0;
   border: 0;
-  background: transparent;
+  border-bottom: 1px solid #dde7ec;
+  background: #edf3f6;
   cursor: ns-resize;
   touch-action: none;
 }
@@ -8853,13 +8938,13 @@ onBeforeRouteLeave(async () => {
 .workbench-bottom-drawer__resize-handle::before {
   content: "";
   position: absolute;
-  top: 3px;
+  top: 4px;
   left: 50%;
-  width: 74px;
-  height: 4px;
+  width: 58px;
+  height: 3px;
   transform: translateX(-50%);
   border-radius: 999px;
-  background: #a9bec7;
+  background: #8fa9b5;
   opacity: 0.85;
   transition:
     background-color 140ms ease,
@@ -8941,7 +9026,7 @@ onBeforeRouteLeave(async () => {
 
 .workbench-bottom-drawer__close {
   position: absolute;
-  top: 10px;
+  top: 18px;
   right: 10px;
   z-index: 3;
   display: inline-grid;
@@ -8951,7 +9036,7 @@ onBeforeRouteLeave(async () => {
   padding: 0;
   border: 1px solid #cdd9de;
   border-radius: 4px;
-  background: rgba(255, 255, 255, 0.92);
+  background: #ffffff;
   color: #40515a;
   box-shadow: none;
 }
@@ -8980,7 +9065,7 @@ onBeforeRouteLeave(async () => {
 
 .workbench-bottom-drawer__qa {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 10px;
   overflow: hidden;
   padding: 12px;
@@ -8998,6 +9083,26 @@ onBeforeRouteLeave(async () => {
   min-width: 0;
 }
 
+.workbench-bottom-drawer__header--qa {
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  padding-right: 40px;
+}
+
+.workbench-bottom-drawer__header-lead {
+  flex: 0 1 auto;
+}
+
+.workbench-bottom-drawer__header--qa .term-qa-dialog__summary {
+  flex: 1 1 auto;
+}
+
+.workbench-bottom-drawer__header--qa .term-qa-dialog__actions {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
 .workbench-bottom-drawer__header .panel-subtitle {
   max-width: min(760px, 70vw);
   overflow: hidden;
@@ -9006,7 +9111,12 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-bottom-drawer__qa > .empty-state {
-  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 100%;
 }
 
 .workbench-bottom-drawer__qa .term-qa-dialog__table-wrap {
@@ -9015,7 +9125,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-bottom-drawer__qa .term-qa-dialog__table {
-  min-width: 980px;
+  min-width: 760px;
 }
 
 .workbench-bottom-drawer :deep(.preview-panel),
@@ -9120,15 +9230,25 @@ onBeforeRouteLeave(async () => {
 
 .workbench-bottom-drawer-enter-active,
 .workbench-bottom-drawer-leave-active {
+  overflow: hidden;
   transition:
-    opacity 180ms ease,
-    transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+    max-height 220ms ease,
+    opacity 160ms ease,
+    transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 .workbench-bottom-drawer-enter-from,
 .workbench-bottom-drawer-leave-to {
+  max-height: 0;
   opacity: 0;
-  transform: translateY(-8px);
+  transform: translateY(6px);
+}
+
+.workbench-bottom-drawer-enter-to,
+.workbench-bottom-drawer-leave-from {
+  max-height: var(--workbench-visible-bottom-panel-height);
+  opacity: 1;
+  transform: translateY(0);
 }
 
 .segment-editor-list-stage {
@@ -9144,6 +9264,19 @@ onBeforeRouteLeave(async () => {
   overflow-y: scroll;
   scrollbar-width: thin;
   scrollbar-color: #52717a #e7f0ef;
+}
+
+.segment-editor-shell.has-bottom-drawer .segment-editor-results {
+  grid-template-rows: auto minmax(180px, 1fr);
+}
+
+.segment-editor-shell.has-bottom-drawer .segment-editor-list-stage {
+  height: clamp(
+    180px,
+    calc(var(--workbench-editor-stage-height) - var(--workbench-visible-bottom-panel-height) - 24px),
+    var(--workbench-editor-stage-height)
+  );
+  min-height: 180px;
 }
 
 .segment-editor-list-stage > .virtual-list::-webkit-scrollbar {
@@ -9540,8 +9673,19 @@ onBeforeRouteLeave(async () => {
 }
 
 @media (max-width: 1180px) {
+  .workbench-layout,
+  .workbench-layout.has-active-tool {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .panel--editor {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
   .segment-editor-side-tools {
     grid-column: 1;
+    grid-row: 1;
     order: -1;
     position: static;
     flex-direction: row;
@@ -9616,8 +9760,8 @@ onBeforeRouteLeave(async () => {
   }
 
   .workbench-bottom-drawer {
-    right: 12px;
-    left: var(--workbench-drawer-left);
+    right: auto;
+    left: auto;
   }
 }
 
