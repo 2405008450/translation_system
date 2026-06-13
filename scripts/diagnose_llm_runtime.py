@@ -19,6 +19,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from dataclasses import dataclass
 
 
@@ -96,10 +97,13 @@ def print_runtime_info() -> None:
 
 
 def provider_config(provider: Provider, model_override: str | None) -> dict[str, str | None]:
+    configured_model = os.getenv(provider.model_env) or provider.default_model
     return {
         "api_key": os.getenv(provider.key_env),
         "base_url": normalize_base_url(os.getenv(provider.base_url_env) or provider.default_base_url),
-        "model": model_override or os.getenv(provider.model_env) or provider.default_model,
+        "configured_model": configured_model,
+        "model": model_override or configured_model,
+        "model_source": "命令行覆盖" if model_override else ("环境变量" if os.getenv(provider.model_env) else "脚本默认值"),
     }
 
 
@@ -107,7 +111,9 @@ def print_provider_info(provider: Provider, config: dict[str, str | None]) -> No
     print(f"== Provider: {provider.name} ==")
     print(f"{provider.key_env}: {mask_secret(config['api_key'])}")
     print(f"{provider.base_url_env}: {config['base_url']}")
-    print(f"{provider.model_env}: {config['model']}")
+    print(f"{provider.model_env}: {config['configured_model']}")
+    if config["model"] != config["configured_model"]:
+        print(f"本次测试模型: {config['model']}（{config['model_source']}）")
 
 
 def parse_host_port(base_url: str) -> tuple[str, int]:
@@ -236,6 +242,81 @@ def check_chat_completion(
         return False
 
 
+def ensure_app_import_path() -> None:
+    candidates = [Path.cwd(), Path("/app")]
+    for item in candidates:
+        if (item / "app").is_dir() and str(item) not in sys.path:
+            sys.path.insert(0, str(item))
+
+
+async def run_app_translation_check(
+    provider_name: str,
+    model_override: str | None,
+    translation_unit: str,
+    source_text: str,
+    source_language: str,
+    target_language: str,
+) -> bool:
+    ensure_app_import_path()
+    try:
+        from app.config import get_settings
+        from app.services.llm_service import (
+            LLMTranslationFailure,
+            LLMTranslationTask,
+            iter_batch_translate,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print("== 应用翻译链路 ==")
+        print(f"无法导入应用代码：{type(exc).__name__}: {exc}")
+        print("提示：请在应用容器内执行，或确认 /app/app 目录存在。")
+        return False
+
+    settings = get_settings()
+    print("== 应用翻译链路 ==")
+    print(f"provider: {provider_name}")
+    print(f"model_override: {model_override or '未指定，使用应用配置'}")
+    print(f"translation_unit: {translation_unit}")
+    print(f"应用读取 DEEPSEEK_MODEL: {settings.deepseek_model}")
+    print(f"应用读取 OPENROUTER_MODEL: {settings.openrouter_model}")
+    print(f"应用读取 LLM_TIMEOUT_SECONDS: {settings.llm_timeout_seconds}")
+    print(f"应用读取 LLM_STALL_TIMEOUT_SECONDS: {settings.llm_stall_timeout_seconds}")
+
+    task = LLMTranslationTask(
+        sentence_id="diagnose-1",
+        status="none",
+        source_text=source_text,
+        source_language=source_language,
+        target_language=target_language,
+        block_type="paragraph",
+        block_index=1,
+    )
+
+    try:
+        async for item in iter_batch_translate(
+            [task],
+            provider=provider_name,  # type: ignore[arg-type]
+            translation_unit=translation_unit,  # type: ignore[arg-type]
+            model_override=model_override,
+        ):
+            if isinstance(item, LLMTranslationFailure):
+                print("应用翻译失败：")
+                print(f"sentence_id: {item.sentence_id}")
+                print(f"status: {item.status}")
+                print(f"error_message: {item.error_message}")
+                return False
+            print("应用翻译成功：")
+            print(f"provider: {item.provider}")
+            print(f"model: {item.model}")
+            print(f"translated_text: {item.translated_text}")
+            return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"应用翻译异常：{type(exc).__name__}: {exc}")
+        return False
+
+    print("应用翻译没有返回任何结果。")
+    return False
+
+
 def choose_providers(name: str) -> list[Provider]:
     if name == "auto":
         return [PROVIDERS["deepseek"], PROVIDERS["openrouter"]]
@@ -261,6 +342,32 @@ def main() -> int:
         "--prompt",
         default="请只回复 OK",
         help="用于测试的最小 prompt",
+    )
+    parser.add_argument(
+        "--app-translation-check",
+        action="store_true",
+        help="额外调用项目内 llm_service，复现 AI 修正使用的翻译链路",
+    )
+    parser.add_argument(
+        "--translation-unit",
+        choices=["paragraph", "sentence"],
+        default="paragraph",
+        help="应用翻译链路的模式；页面默认是 paragraph",
+    )
+    parser.add_argument(
+        "--source-text",
+        default="Hello world.",
+        help="应用翻译链路测试用原文",
+    )
+    parser.add_argument(
+        "--source-language",
+        default="en",
+        help="应用翻译链路测试用源语言",
+    )
+    parser.add_argument(
+        "--target-language",
+        default="zh-CN",
+        help="应用翻译链路测试用目标语言",
     )
     args = parser.parse_args()
 
@@ -291,12 +398,41 @@ def main() -> int:
             any_success = True
         print()
 
-    if any_success:
-        print("结论：至少一个 LLM provider 在当前运行环境中可用。")
+    app_success = True
+    if args.app_translation_check:
+        import asyncio
+
+        app_success = asyncio.run(
+            run_app_translation_check(
+                provider_name=args.provider,
+                model_override=args.model,
+                translation_unit=args.translation_unit,
+                source_text=args.source_text,
+                source_language=args.source_language,
+                target_language=args.target_language,
+            )
+        )
+        print()
+
+    if args.app_translation_check and app_success:
+        if any_success:
+            print("结论：基础 LLM 请求和应用翻译链路都可用。")
+        else:
+            print("结论：应用翻译链路可用；基础直连未成功，可能是环境变量与应用配置加载方式不同。")
+        return 0
+
+    if any_success and app_success:
+        if args.app_translation_check:
+            print("结论：基础 LLM 请求和应用翻译链路都可用。")
+        else:
+            print("结论：至少一个 LLM provider 在当前运行环境中可用。")
         return 0
     if not any_configured:
         print("结论：当前容器没有读到 DEEPSEEK_API_KEY 或 OPENROUTER_API_KEY。")
         return 2
+    if any_success and not app_success:
+        print("结论：基础 LLM 请求可用，但应用翻译链路失败。请看“应用翻译链路”的错误。")
+        return 3
     print("结论：容器读到了 API Key，但 LLM 请求没有成功。请优先查看上面的 HTTP/DNS/TCP 错误摘要。")
     return 1
 
