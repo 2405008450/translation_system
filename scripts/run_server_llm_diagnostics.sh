@@ -11,7 +11,6 @@ DEFAULT_CONTAINER="ai-translation-app"
 LOCAL_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${LOCAL_SCRIPT_DIR}/.." && pwd)"
 LOCAL_SCRIPT="${LOCAL_SCRIPT_DIR}/diagnose_llm_runtime.py"
-IN_IMAGE_SCRIPT="/app/scripts/diagnose_llm_runtime.py"
 TMP_SCRIPT="/tmp/diagnose_llm_runtime.py"
 DOCKER_EXEC_FLAGS=(-i)
 DOCKER_CMD=(docker)
@@ -132,16 +131,11 @@ fi
 
 echo "使用容器：${CONTAINER}"
 
-if "${DOCKER_CMD[@]}" exec "${CONTAINER}" test -f "${IN_IMAGE_SCRIPT}" >/dev/null 2>&1; then
-  "${DOCKER_CMD[@]}" exec "${DOCKER_EXEC_FLAGS[@]}" "${CONTAINER}" python "${IN_IMAGE_SCRIPT}" "$@"
-  exit $?
-fi
-
 if [ ! -f "${LOCAL_SCRIPT}" ]; then
   echo "错误：本地找不到 ${LOCAL_SCRIPT}，无法拷贝到容器。"
   exit 1
 fi
 
-echo "镜像内没有 ${IN_IMAGE_SCRIPT}，临时拷贝脚本到容器 ${TMP_SCRIPT} ..."
+echo "临时拷贝本地诊断脚本到容器 ${TMP_SCRIPT} ..."
 "${DOCKER_CMD[@]}" cp "${LOCAL_SCRIPT}" "${CONTAINER}:${TMP_SCRIPT}" || exit $?
 "${DOCKER_CMD[@]}" exec "${DOCKER_EXEC_FLAGS[@]}" "${CONTAINER}" python "${TMP_SCRIPT}" "$@"
