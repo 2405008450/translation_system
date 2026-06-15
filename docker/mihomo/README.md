@@ -10,6 +10,20 @@
 MIHOMO_SUBSCRIPTION_URL='你的 Clash 订阅链接' bash scripts/prepare_mihomo_config.sh
 ```
 
+如果订阅里的“自动选择”没有选到适合 OpenRouter 的节点，可以先在生成后的配置里找日本或美国节点名：
+
+```bash
+grep -nE 'name:.*(日本|东京|大阪|JP|Japan|美国|美國|US|USA|United States|洛杉矶|洛杉磯|硅谷|圣何塞)' docker/mihomo/config.yaml | head -50
+```
+
+然后用具体节点名或策略组名重新生成，并把 `openrouter.ai` 固定到该策略：
+
+```bash
+MIHOMO_OPENROUTER_POLICY='这里填日本或美国节点名' \
+MIHOMO_SUBSCRIPTION_URL='你的 Clash 订阅链接' \
+bash scripts/prepare_mihomo_config.sh
+```
+
 脚本会下载订阅并补齐本项目需要的入站配置：
 
 ```yaml

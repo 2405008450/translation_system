@@ -2,6 +2,7 @@
 # 下载 Clash/Mihomo 订阅配置，并规范成本项目 Docker 内网使用的入站端口。
 # 用法：
 #   MIHOMO_SUBSCRIPTION_URL='https://example.com/sub' bash scripts/prepare_mihomo_config.sh
+#   MIHOMO_OPENROUTER_POLICY='日本节点名或美国节点名' MIHOMO_SUBSCRIPTION_URL='https://example.com/sub' bash scripts/prepare_mihomo_config.sh
 #   bash scripts/prepare_mihomo_config.sh 'https://example.com/sub' docker/mihomo/config.yaml
 
 set -euo pipefail
@@ -9,6 +10,7 @@ set -euo pipefail
 SUBSCRIPTION_URL="${1:-${MIHOMO_SUBSCRIPTION_URL:-}}"
 OUTPUT_PATH="${2:-docker/mihomo/config.yaml}"
 SUBSCRIPTION_USER_AGENT="${MIHOMO_SUBSCRIPTION_USER_AGENT:-Clash.Meta}"
+OPENROUTER_POLICY="${MIHOMO_OPENROUTER_POLICY:-}"
 
 if [ -z "${SUBSCRIPTION_URL}" ]; then
   echo "错误：请通过第一个参数或 MIHOMO_SUBSCRIPTION_URL 提供 Clash 订阅链接。"
@@ -46,7 +48,7 @@ if [ ! -s "${TMP_FILE}" ]; then
   exit 1
 fi
 
-"${PYTHON_BIN}" - "${TMP_FILE}" "${OUTPUT_PATH}" <<'PY'
+"${PYTHON_BIN}" - "${TMP_FILE}" "${OUTPUT_PATH}" "${OPENROUTER_POLICY}" <<'PY'
 from __future__ import annotations
 
 import re
@@ -57,6 +59,7 @@ from pathlib import Path
 
 source_path = Path(sys.argv[1])
 output_path = Path(sys.argv[2])
+openrouter_policy = sys.argv[3].strip()
 
 raw_text = source_path.read_text(encoding="utf-8-sig")
 if "proxies:" not in raw_text and "proxy-providers:" not in raw_text:
@@ -89,6 +92,16 @@ filtered_lines = [
     if not top_level_override_re.match(line)
 ]
 
+if openrouter_policy:
+    openrouter_rule = f"  - DOMAIN-SUFFIX,openrouter.ai,{openrouter_policy}"
+    if openrouter_rule not in filtered_lines:
+        for index, line in enumerate(filtered_lines):
+            if line.strip() == "rules:":
+                filtered_lines.insert(index + 1, openrouter_rule)
+                break
+        else:
+            filtered_lines.extend(["", "rules:", openrouter_rule])
+
 prefix = [
     "# 由 scripts/prepare_mihomo_config.sh 生成。",
     "# 本文件可能包含订阅节点和凭据，不要提交到 Git。",
@@ -105,4 +118,7 @@ output_path.write_text("\n".join(prefix + filtered_lines).rstrip() + "\n", encod
 PY
 
 echo "已生成 ${OUTPUT_PATH}"
+if [ -n "${OPENROUTER_POLICY}" ]; then
+  echo "已将 openrouter.ai 固定到策略：${OPENROUTER_POLICY}"
+fi
 echo "下一步：docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml up -d"
