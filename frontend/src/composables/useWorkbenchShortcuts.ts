@@ -24,6 +24,14 @@ function isEditableTarget(target: EventTarget | null) {
   return ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)
 }
 
+function isTargetEditorTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) {
+    return false
+  }
+
+  return Boolean(target.closest('[data-segment-target="true"]'))
+}
+
 export function useWorkbenchShortcuts(handlers: WorkbenchShortcutHandlers) {
   function onKeydown(event: KeyboardEvent) {
     const ctrlOrMeta = event.ctrlKey || event.metaKey
@@ -52,7 +60,17 @@ export function useWorkbenchShortcuts(handlers: WorkbenchShortcutHandlers) {
       return
     }
 
-    if (ctrlOrMeta && event.key === 'Enter') {
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+      if (ctrlOrMeta) {
+        return
+      }
+
+      const targetEditor = isTargetEditorTarget(event.target)
+      const otherEditable = isEditableTarget(event.target) && !targetEditor
+      if (otherEditable) {
+        return
+      }
+
       event.preventDefault()
       handlers.confirmCurrent()
       return

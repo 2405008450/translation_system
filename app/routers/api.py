@@ -107,6 +107,14 @@ from app.services.document_statistics import (
     normalize_document_statistics,
     serialize_document_statistics,
 )
+from app.services.document_match_analysis import (
+    DocumentMatchSegment,
+    compute_document_match_analysis,
+    empty_document_match_analysis,
+    merge_document_match_analyses,
+    normalize_document_match_analysis,
+    reconcile_document_match_analysis_words,
+)
 from app.services.document_repetition_statistics import (
     compute_document_repetition_statistics,
     empty_repetition_statistics,
@@ -1278,14 +1286,17 @@ def _build_unavailable_document_statistics() -> dict[str, Any]:
         "engine_version": None,
         "license_status": None,
         "include_textboxes_footnotes_endnotes": None,
+        "match_analysis": None,
     }
     for key in STATISTIC_NUMBER_KEYS:
         statistics[key] = None
     return statistics
 
 
-def _create_empty_document_statistics_totals() -> dict[str, int | None]:
-    return {key: None for key in STATISTIC_NUMBER_KEYS}
+def _create_empty_document_statistics_totals() -> dict[str, Any]:
+    totals: dict[str, Any] = {key: None for key in STATISTIC_NUMBER_KEYS}
+    totals["match_analysis"] = None
+    return totals
 
 
 def _has_any_document_statistic(statistics: dict[str, Any] | None) -> bool:
@@ -1294,19 +1305,22 @@ def _has_any_document_statistic(statistics: dict[str, Any] | None) -> bool:
     return any(isinstance(statistics.get(key), int) for key in STATISTIC_NUMBER_KEYS)
 
 
-def _sum_document_statistics(statistics_list: list[dict[str, Any]]) -> dict[str, int | None]:
+def _sum_document_statistics(statistics_list: list[dict[str, Any]]) -> dict[str, Any]:
     totals = _create_empty_document_statistics_totals()
+    match_analyses: list[Any] = []
     for raw_statistics in statistics_list:
         statistics = normalize_document_statistics(raw_statistics)
+        match_analyses.append(statistics.get("match_analysis"))
         for key in STATISTIC_NUMBER_KEYS:
             value = statistics.get(key)
             if not isinstance(value, int):
                 continue
             totals[key] = (totals[key] or 0) + value
+    totals["match_analysis"] = merge_document_match_analyses(match_analyses)
     return totals
 
 
-def _load_document_statistics_totals(raw_value: str | None) -> dict[str, int | None]:
+def _load_document_statistics_totals(raw_value: str | None) -> dict[str, Any]:
     try:
         value = json.loads(raw_value or "{}")
     except (TypeError, ValueError):
@@ -1319,6 +1333,7 @@ def _load_document_statistics_totals(raw_value: str | None) -> dict[str, int | N
                 totals[key] = raw_number
             elif isinstance(raw_number, str) and raw_number.strip().isdigit():
                 totals[key] = int(raw_number)
+        totals["match_analysis"] = normalize_document_match_analysis(value.get("match_analysis"))
     return totals
 
 
@@ -1408,6 +1423,53 @@ def _load_document_repetition_statistics_for_files(
         file_segments.setdefault(file_record_id, []).append(source_text or "")
 
     return compute_document_repetition_statistics(file_segments)
+
+
+def _load_document_match_analysis_for_files(
+    db: Session,
+    files: list[FileRecord],
+) -> dict[UUID, dict[str, Any]]:
+    file_segments: dict[UUID, list[DocumentMatchSegment]] = {
+        file_record.id: [] for file_record in files
+    }
+    if not file_segments:
+        return {}
+
+    collection_ids_by_file_id = {
+        file_record.id: tuple(_load_file_record_collection_ids(file_record))
+        for file_record in files
+    }
+
+    segments = (
+        db.query(
+            Segment.file_record_id,
+            Segment.source_text,
+            Segment.display_text,
+            Segment.source_word_count,
+        )
+        .filter(Segment.file_record_id.in_(list(file_segments.keys())))
+        .order_by(
+            Segment.file_record_id.asc(),
+            Segment.block_index.asc(),
+            Segment.row_index.asc().nullsfirst(),
+            Segment.cell_index.asc().nullsfirst(),
+            Segment.sentence_id.asc(),
+            Segment.id.asc(),
+        )
+        .all()
+    )
+    for file_record_id, source_text, display_text, source_word_count in segments:
+        file_segments.setdefault(file_record_id, []).append(
+            DocumentMatchSegment(
+                file_id=file_record_id,
+                source_text=source_text or "",
+                display_text=display_text or "",
+                source_word_count=int(source_word_count or 0),
+                collection_ids=collection_ids_by_file_id.get(file_record_id, ()),
+            )
+        )
+
+    return compute_document_match_analysis(db, file_segments)
 
 
 def _can_manage_workflow(current_user: User | None) -> bool:
@@ -5391,6 +5453,7 @@ def compute_project_document_statistics(
         db,
         [file_record.id for file_record in files],
     )
+    match_analysis_by_file_id = _load_document_match_analysis_for_files(db, files)
     for file_record in files:
         source_bytes = load_file_record_source(file_record)
         source_filename = get_file_record_source_filename(file_record)
@@ -5402,6 +5465,11 @@ def compute_project_document_statistics(
         normalized_statistics.update(
             repetition_statistics_by_file_id.get(file_record.id, empty_repetition_statistics())
         )
+        match_analysis = match_analysis_by_file_id.get(file_record.id, empty_document_match_analysis())
+        normalized_statistics["match_analysis"] = reconcile_document_match_analysis_words(
+            match_analysis,
+            normalized_statistics.get("words") if isinstance(normalized_statistics.get("words"), int) else None,
+        ) or match_analysis
         serialized_statistics = serialize_document_statistics(normalized_statistics)
         file_record.document_statistics = serialized_statistics
         report_statistics.append(normalized_statistics)

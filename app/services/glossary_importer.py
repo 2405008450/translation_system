@@ -15,6 +15,7 @@ from app.services.normalizer import normalize_match_text, normalize_text
 
 
 XLSX_EXTENSIONS = {".xlsx"}
+GLOSSARY_STATUS_LOOKUP_CHUNK_SIZE = 10000
 SOURCE_HEADER_ALIASES = {"source", "source_text", "source_term", "term", "原文", "词汇", "词条", "术语"}
 TARGET_HEADER_ALIASES = {"target", "target_text", "target_term", "translation", "译文", "翻译"}
 NOTE_HEADER_ALIASES = {"note", "notes", "comment", "comments", "context", "remark", "remarks", "备注", "说明", "补充解释"}
@@ -449,25 +450,35 @@ def _load_existing_glossary_status(
     if glossary_base_id is None or (not source_normalized_values and not source_texts):
         return set()
 
-    existing_rows = (
-        db.query(GlossaryEntry.source_normalized, GlossaryEntry.source_text)
-        .filter(
-            GlossaryEntry.glossary_base_id == glossary_base_id,
-            GlossaryEntry.source_language == source_language,
-            GlossaryEntry.target_language == target_language,
-            or_(
-                GlossaryEntry.source_normalized.in_(source_normalized_values or [""]),
-                GlossaryEntry.source_text.in_(source_texts or [""]),
-            ),
-        )
-        .all()
-    )
     keys: set[str] = set()
-    for source_normalized, source_text in existing_rows:
-        if source_normalized:
-            keys.add(source_normalized)
-        if source_text:
-            keys.add(source_text)
+    source_normalized_values = list(dict.fromkeys(source_normalized_values))
+    source_texts = list(dict.fromkeys(source_texts))
+    max_lookup_count = max(len(source_normalized_values), len(source_texts))
+
+    for offset in range(0, max_lookup_count, GLOSSARY_STATUS_LOOKUP_CHUNK_SIZE):
+        normalized_chunk = source_normalized_values[offset : offset + GLOSSARY_STATUS_LOOKUP_CHUNK_SIZE]
+        source_text_chunk = source_texts[offset : offset + GLOSSARY_STATUS_LOOKUP_CHUNK_SIZE]
+        lookup_conditions = []
+        if normalized_chunk:
+            lookup_conditions.append(GlossaryEntry.source_normalized.in_(normalized_chunk))
+        if source_text_chunk:
+            lookup_conditions.append(GlossaryEntry.source_text.in_(source_text_chunk))
+
+        existing_rows = (
+            db.query(GlossaryEntry.source_normalized, GlossaryEntry.source_text)
+            .filter(
+                GlossaryEntry.glossary_base_id == glossary_base_id,
+                GlossaryEntry.source_language == source_language,
+                GlossaryEntry.target_language == target_language,
+                or_(*lookup_conditions),
+            )
+            .all()
+        )
+        for source_normalized, source_text in existing_rows:
+            if source_normalized:
+                keys.add(source_normalized)
+            if source_text:
+                keys.add(source_text)
     return keys
 
 

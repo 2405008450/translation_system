@@ -28,6 +28,18 @@ nano .env.prod
 
 如果数据库密码包含 `@`、`:`、`/`、`?`、`#` 等字符，`DATABASE_URL` 里的密码部分必须 URL 编码。
 
+### 可选：为 OpenRouter 启用项目内 Clash/Mihomo 代理
+
+如果云服务器无法直连 OpenRouter，可以只给本项目启用一个 Mihomo 容器。订阅链接和生成的 `docker/mihomo/config.yaml` 都属于敏感信息，不要提交到 Git。
+
+在服务器项目根目录执行：
+
+```bash
+MIHOMO_SUBSCRIPTION_URL='你的 Clash 订阅链接' bash scripts/prepare_mihomo_config.sh
+```
+
+该脚本会生成 `docker/mihomo/config.yaml`，并固定提供 Docker 内网代理端口 `7890`。Mihomo 不映射宿主机端口，因此默认不会影响服务器上的其它项目。
+
 ## 3. 构建并启动
 
 如果服务器支持新版插件命令 `docker compose`，使用：
@@ -36,6 +48,14 @@ nano .env.prod
 docker compose --env-file .env.prod -f docker-compose.prod.yml build
 docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
 docker compose --env-file .env.prod -f docker-compose.prod.yml ps
+```
+
+如果启用了上面的 Mihomo 代理，启动命令改为带上 `docker-compose.proxy.yml`：
+
+```bash
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml build
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml up -d
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml ps
 ```
 
 如果服务器只有独立命令 `docker-compose`，先复制一份默认 `.env`，再使用：
@@ -48,6 +68,8 @@ sudo docker-compose -f docker-compose.prod.yml build
 sudo docker-compose -f docker-compose.prod.yml up -d
 sudo docker-compose -f docker-compose.prod.yml ps
 ```
+
+启用 Mihomo 代理时，`docker-compose` 命令同样需要追加 `-f docker-compose.proxy.yml`。
 
 首次创建数据库 volume 时会自动执行：
 
@@ -65,6 +87,14 @@ curl http://127.0.0.1:19013/api/health
 curl http://43.132.156.72:19013/
 docker compose --env-file .env.prod -f docker-compose.prod.yml logs --tail=100 app
 docker compose --env-file .env.prod -f docker-compose.prod.yml logs --tail=100 worker
+```
+
+如果启用了 Mihomo 代理，可额外检查：
+
+```bash
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml logs --tail=100 mihomo
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml exec -T app \
+  python -c "import httpx; r=httpx.get('https://openrouter.ai/api/v1/models', timeout=30); print(r.status_code); print(r.text[:300])"
 ```
 
 如果使用的是 `docker-compose` 命令：

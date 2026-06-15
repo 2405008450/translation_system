@@ -63,6 +63,7 @@ import { getProgressStyle, isProgressComplete } from '../utils/progress'
 import type {
   DocumentParseMode,
   DocumentParseOptions,
+  DocumentMatchAnalysis,
   DocumentStatistics,
   DocumentStatisticsReport,
   DocumentStatisticsReportItem,
@@ -262,6 +263,37 @@ const DOCUMENT_STATISTIC_NUMBER_KEYS: DocumentStatisticNumberKey[] = [
   'cross_file_repeated_words',
   'cross_file_repeated_characters',
 ]
+
+const DOCUMENT_MATCH_ANALYSIS_ROW_KEYS = [
+  'new',
+  'tm_50_74',
+  'tm_75_84',
+  'tm_85_94',
+  'tm_95_99',
+  'tm_100',
+  'tm_101',
+  'tm_102',
+  'internal_repeat',
+  'cross_file_repeat',
+] as const
+
+type DocumentMatchAnalysisRowKey = typeof DOCUMENT_MATCH_ANALYSIS_ROW_KEYS[number]
+
+interface DocumentMatchAnalysisDisplayRow {
+  key: DocumentMatchAnalysisRowKey | 'total'
+  label: string
+  percent: number
+  segment_count: number
+  word_count: number
+  is_total?: boolean
+}
+
+interface DocumentFileMatchAnalysisBlock {
+  id: string
+  file_name: string
+  analysis: DocumentMatchAnalysis
+  rows: DocumentMatchAnalysisDisplayRow[]
+}
 
 interface LanguageDetectResponse {
   language: string | null
@@ -631,7 +663,12 @@ const statisticsTotals = computed<DocumentStatisticsTotals>(() => {
     return normalizeStatisticsTotals(activeStatisticsReport.value.totals)
   }
   const totals = createEmptyStatisticsTotals()
+  const matchAnalyses: DocumentMatchAnalysis[] = []
   for (const row of statisticsResultRows.value) {
+    const matchAnalysis = normalizeDocumentMatchAnalysis(row.statistics.match_analysis)
+    if (matchAnalysis) {
+      matchAnalyses.push(matchAnalysis)
+    }
     for (const key of DOCUMENT_STATISTIC_NUMBER_KEYS) {
       const value = getStatisticNumber(row.statistics, key)
       if (value == null) {
@@ -640,8 +677,34 @@ const statisticsTotals = computed<DocumentStatisticsTotals>(() => {
       totals[key] = (totals[key] ?? 0) + value
     }
   }
+  totals.match_analysis = mergeDocumentMatchAnalyses(matchAnalyses)
   return totals
 })
+const statisticsMatchAnalysis = computed(() => (
+  reconcileDocumentMatchAnalysisForDisplay(statisticsTotals.value.match_analysis, statisticsTotals.value.words)
+))
+const statisticsMatchAnalysisRows = computed<DocumentMatchAnalysisDisplayRow[]>(() => (
+  buildDocumentMatchAnalysisRows(statisticsMatchAnalysis.value)
+))
+const statisticsFileMatchAnalysisBlocks = computed<DocumentFileMatchAnalysisBlock[]>(() => (
+  statisticsResultRows.value
+    .map((row) => {
+      const analysis = reconcileDocumentMatchAnalysisForDisplay(
+        row.statistics.match_analysis,
+        getStatisticNumber(row.statistics, 'words'),
+      )
+      if (!analysis) {
+        return null
+      }
+      return {
+        id: row.file_record_id || row.id,
+        file_name: row.file_name,
+        analysis,
+        rows: buildDocumentMatchAnalysisRows(analysis),
+      }
+    })
+    .filter((row): row is DocumentFileMatchAnalysisBlock => Boolean(row && row.rows.length > 0))
+))
 const selectedTermExtractionFile = computed<ProjectFileItem | null>(() => (
   selectedProjectFiles.value.length === 1 ? selectedProjectFiles.value[0] : null
 ))
@@ -1029,6 +1092,7 @@ function createEmptyStatisticsTotals(): DocumentStatisticsTotals {
     internal_repeated_characters: null,
     cross_file_repeated_words: null,
     cross_file_repeated_characters: null,
+    match_analysis: null,
   }
 }
 
@@ -1041,7 +1105,195 @@ function normalizeStatisticsTotals(totals: DocumentStatisticsTotals | null | und
     const value = totals[key]
     normalized[key] = typeof value === 'number' && Number.isFinite(value) ? value : null
   }
+  normalized.match_analysis = normalizeDocumentMatchAnalysis(totals.match_analysis)
   return normalized
+}
+
+function normalizeDocumentMatchAnalysis(value: DocumentMatchAnalysis | null | undefined): DocumentMatchAnalysis | null {
+  if (!value || !Array.isArray(value.rows)) {
+    return null
+  }
+  const rows = DOCUMENT_MATCH_ANALYSIS_ROW_KEYS.map((key) => {
+    const source = value.rows.find((row) => row.key === key)
+    const segmentCount = normalizeStatisticNumber(source?.segment_count) ?? 0
+    const wordCount = normalizeStatisticNumber(source?.word_count) ?? 0
+    return {
+      key,
+      label: source?.label || getDocumentMatchAnalysisLabel(key),
+      segment_count: segmentCount,
+      word_count: wordCount,
+      percent: normalizeStatisticNumber(source?.percent) ?? 0,
+    }
+  })
+  const totalSegments = normalizeStatisticNumber(value.total_segments)
+    ?? rows.reduce((sum, row) => sum + row.segment_count, 0)
+  const totalWords = normalizeStatisticNumber(value.total_words)
+    ?? rows.reduce((sum, row) => sum + row.word_count, 0)
+  return {
+    threshold: normalizeStatisticNumber(value.threshold) ?? 0.5,
+    collection_ids: Array.isArray(value.collection_ids) ? value.collection_ids.filter(Boolean) : [],
+    total_segments: totalSegments,
+    total_words: totalWords,
+    rows,
+  }
+}
+
+function reconcileDocumentMatchAnalysisForDisplay(
+  value: DocumentMatchAnalysis | null | undefined,
+  authoritativeWords: number | null | undefined,
+): DocumentMatchAnalysis | null {
+  const normalized = normalizeDocumentMatchAnalysis(value)
+  const targetTotal = normalizeStatisticNumber(authoritativeWords)
+  if (!normalized || targetTotal == null || targetTotal === normalized.total_words) {
+    return normalized
+  }
+  const rows = normalized.rows.map((row) => ({ ...row }))
+  const currentTotal = rows.reduce((sum, row) => sum + Math.max(row.word_count, 0), 0)
+  if (targetTotal <= 0) {
+    rows.forEach((row) => {
+      row.word_count = 0
+    })
+  } else if (currentTotal <= 0 || targetTotal > currentTotal) {
+    const newRow = rows.find((row) => row.key === 'new')
+    if (newRow) {
+      newRow.word_count = Math.max(0, newRow.word_count + targetTotal - currentTotal)
+    }
+  } else {
+    scaleDocumentMatchRowsToWordTotal(rows, targetTotal, currentTotal)
+  }
+  return rebuildDocumentMatchAnalysisRows({
+    ...normalized,
+    total_words: targetTotal,
+    rows,
+  })
+}
+
+function scaleDocumentMatchRowsToWordTotal(
+  rows: DocumentMatchAnalysis['rows'],
+  targetTotal: number,
+  currentTotal: number,
+) {
+  const scaled = rows.map((row, index) => {
+    const rawValue = Math.max(row.word_count, 0) * targetTotal / currentTotal
+    const floorValue = Math.floor(rawValue)
+    return {
+      index,
+      floorValue,
+      remainder: rawValue - floorValue,
+    }
+  })
+  const floorTotal = scaled.reduce((sum, row) => sum + row.floorValue, 0)
+  let remaining = Math.max(targetTotal - floorTotal, 0)
+  const ranked = [...scaled].sort((left, right) => {
+    if (right.remainder !== left.remainder) {
+      return right.remainder - left.remainder
+    }
+    return left.index - right.index
+  })
+  const extraByIndex = new Map<number, number>()
+  for (const row of ranked) {
+    if (remaining <= 0) break
+    extraByIndex.set(row.index, (extraByIndex.get(row.index) ?? 0) + 1)
+    remaining -= 1
+  }
+  for (const row of scaled) {
+    rows[row.index].word_count = row.floorValue + (extraByIndex.get(row.index) ?? 0)
+  }
+}
+
+function mergeDocumentMatchAnalyses(analyses: DocumentMatchAnalysis[]): DocumentMatchAnalysis | null {
+  if (analyses.length === 0) {
+    return null
+  }
+  const counts = new Map<DocumentMatchAnalysisRowKey, { segment_count: number; word_count: number }>()
+  for (const key of DOCUMENT_MATCH_ANALYSIS_ROW_KEYS) {
+    counts.set(key, { segment_count: 0, word_count: 0 })
+  }
+  const collectionIds = new Set<string>()
+  let threshold = 0.5
+  for (const analysis of analyses) {
+    threshold = analysis.threshold
+    analysis.collection_ids.forEach((id) => collectionIds.add(id))
+    for (const row of analysis.rows) {
+      if (!DOCUMENT_MATCH_ANALYSIS_ROW_KEYS.includes(row.key as DocumentMatchAnalysisRowKey)) {
+        continue
+      }
+      const key = row.key as DocumentMatchAnalysisRowKey
+      const target = counts.get(key)
+      if (!target) continue
+      target.segment_count += row.segment_count
+      target.word_count += row.word_count
+    }
+  }
+  const totalSegments = [...counts.values()].reduce((sum, row) => sum + row.segment_count, 0)
+  const totalWords = [...counts.values()].reduce((sum, row) => sum + row.word_count, 0)
+  return {
+    threshold,
+    collection_ids: [...collectionIds],
+    total_segments: totalSegments,
+    total_words: totalWords,
+    rows: buildDocumentMatchRowsFromCounts(counts, totalWords),
+  }
+}
+
+function rebuildDocumentMatchAnalysisRows(analysis: DocumentMatchAnalysis): DocumentMatchAnalysis {
+  const counts = new Map<DocumentMatchAnalysisRowKey, { segment_count: number; word_count: number }>()
+  for (const key of DOCUMENT_MATCH_ANALYSIS_ROW_KEYS) {
+    const source = analysis.rows.find((row) => row.key === key)
+    counts.set(key, {
+      segment_count: normalizeStatisticNumber(source?.segment_count) ?? 0,
+      word_count: normalizeStatisticNumber(source?.word_count) ?? 0,
+    })
+  }
+  return {
+    ...analysis,
+    rows: buildDocumentMatchRowsFromCounts(counts, analysis.total_words),
+  }
+}
+
+function buildDocumentMatchRowsFromCounts(
+  counts: Map<DocumentMatchAnalysisRowKey, { segment_count: number; word_count: number }>,
+  totalWords: number,
+) {
+  return DOCUMENT_MATCH_ANALYSIS_ROW_KEYS.map((key) => {
+    const row = counts.get(key) ?? { segment_count: 0, word_count: 0 }
+    return {
+      key,
+      label: getDocumentMatchAnalysisLabel(key),
+      segment_count: row.segment_count,
+      word_count: row.word_count,
+      percent: totalWords > 0 ? Number(((row.word_count / totalWords) * 100).toFixed(2)) : 0,
+    }
+  })
+}
+
+function buildDocumentMatchAnalysisRows(
+  analysis: DocumentMatchAnalysis | null | undefined,
+): DocumentMatchAnalysisDisplayRow[] {
+  const normalized = normalizeDocumentMatchAnalysis(analysis)
+  if (!normalized) {
+    return []
+  }
+  const rows: DocumentMatchAnalysisDisplayRow[] = normalized.rows.map((row) => ({
+    key: row.key as DocumentMatchAnalysisRowKey,
+    label: getDocumentMatchAnalysisLabel(row.key as DocumentMatchAnalysisRowKey),
+    percent: row.percent,
+    segment_count: row.segment_count,
+    word_count: row.word_count,
+  }))
+  rows.push({
+    key: 'total',
+    label: t('projectDetail.stats.matchAnalysis.total'),
+    percent: normalized.total_words > 0 ? 100 : 0,
+    segment_count: normalized.total_segments,
+    word_count: normalized.total_words,
+    is_total: true,
+  })
+  return rows
+}
+
+function normalizeStatisticNumber(value: number | null | undefined) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
 
 function getStatisticNumber(
@@ -1061,6 +1313,18 @@ function formatStatisticNumber(value: number | null | undefined) {
     return getPlaceholder()
   }
   return new Intl.NumberFormat('zh-CN').format(value)
+}
+
+function formatStatisticPercent(value: number | null | undefined) {
+  if (value == null || Number.isNaN(value)) {
+    return getPlaceholder()
+  }
+  const formatted = Number.isInteger(value) ? value.toFixed(0) : value.toFixed(2)
+  return `${formatted}%`
+}
+
+function getDocumentMatchAnalysisLabel(key: DocumentMatchAnalysisRowKey) {
+  return t(`projectDetail.stats.matchAnalysis.rows.${key}`)
 }
 
 function getStatisticsSourceLabel(statistics: DocumentStatistics | null | undefined) {
@@ -4853,13 +5117,89 @@ onBeforeUnmount(() => {
               <span>{{ t('projectDetail.stats.columns.charactersWithSpaces') }}</span>
               <strong>{{ formatStatisticNumber(statisticsTotals.characters_with_spaces) }}</strong>
             </div>
-            <div class="pd-statistics-summary__item">
-              <span>{{ t('projectDetail.stats.columns.internalRepeatedWords') }}</span>
-              <strong>{{ formatStatisticNumber(statisticsTotals.internal_repeated_words) }}</strong>
+          </div>
+
+          <div v-if="statisticsMatchAnalysisRows.length > 0" class="pd-statistics-match-analysis">
+            <div class="pd-statistics-subhead">
+              <div class="section-title section-title--tight">{{ t('projectDetail.stats.matchAnalysis.summaryTitle') }}</div>
+              <span>
+                {{ t('projectDetail.stats.matchAnalysis.meta', {
+                  threshold: formatStatisticPercent((statisticsMatchAnalysis?.threshold ?? 0.5) * 100),
+                  count: statisticsMatchAnalysis?.collection_ids.length ?? 0,
+                }) }}
+              </span>
             </div>
-            <div class="pd-statistics-summary__item">
-              <span>{{ t('projectDetail.stats.columns.crossFileRepeatedWords') }}</span>
-              <strong>{{ formatStatisticNumber(statisticsTotals.cross_file_repeated_words) }}</strong>
+            <div class="pd-statistics-grid-wrap pd-statistics-grid-wrap--match">
+              <table class="pd-statistics-grid pd-statistics-match-grid">
+                <thead>
+                  <tr>
+                    <th>{{ t('projectDetail.stats.matchAnalysis.columns.category') }}</th>
+                    <th>{{ t('projectDetail.stats.matchAnalysis.columns.percent') }}</th>
+                    <th>{{ t('projectDetail.stats.matchAnalysis.columns.segments') }}</th>
+                    <th>{{ t('projectDetail.stats.matchAnalysis.columns.words') }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="row in statisticsMatchAnalysisRows"
+                    :key="row.key"
+                    :class="{ 'is-total': row.is_total }"
+                  >
+                    <td>{{ row.label }}</td>
+                    <td>{{ formatStatisticPercent(row.percent) }}</td>
+                    <td>{{ formatStatisticNumber(row.segment_count) }}</td>
+                    <td>{{ formatStatisticNumber(row.word_count) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div v-if="statisticsFileMatchAnalysisBlocks.length > 1" class="pd-statistics-match-analysis">
+            <div class="pd-statistics-subhead">
+              <div class="section-title section-title--tight">{{ t('projectDetail.stats.matchAnalysis.fileTitle') }}</div>
+              <span>{{ t('projectDetail.stats.matchAnalysis.fileHint') }}</span>
+            </div>
+            <div class="pd-statistics-file-match-list">
+              <section
+                v-for="block in statisticsFileMatchAnalysisBlocks"
+                :key="block.id"
+                class="pd-statistics-file-match-block"
+              >
+                <div class="pd-statistics-file-match-head">
+                  <strong :title="block.file_name">{{ block.file_name }}</strong>
+                  <span>
+                    {{ t('projectDetail.stats.matchAnalysis.fileMeta', {
+                      words: formatStatisticNumber(block.analysis.total_words),
+                      segments: formatStatisticNumber(block.analysis.total_segments),
+                    }) }}
+                  </span>
+                </div>
+                <div class="pd-statistics-grid-wrap pd-statistics-grid-wrap--match">
+                  <table class="pd-statistics-grid pd-statistics-match-grid">
+                    <thead>
+                      <tr>
+                        <th>{{ t('projectDetail.stats.matchAnalysis.columns.category') }}</th>
+                        <th>{{ t('projectDetail.stats.matchAnalysis.columns.percent') }}</th>
+                        <th>{{ t('projectDetail.stats.matchAnalysis.columns.segments') }}</th>
+                        <th>{{ t('projectDetail.stats.matchAnalysis.columns.words') }}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr
+                        v-for="row in block.rows"
+                        :key="`${block.id}-${row.key}`"
+                        :class="{ 'is-total': row.is_total }"
+                      >
+                        <td>{{ row.label }}</td>
+                        <td>{{ formatStatisticPercent(row.percent) }}</td>
+                        <td>{{ formatStatisticNumber(row.segment_count) }}</td>
+                        <td>{{ formatStatisticNumber(row.word_count) }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </section>
             </div>
           </div>
 
@@ -4877,10 +5217,6 @@ onBeforeUnmount(() => {
                   <th>{{ t('projectDetail.stats.columns.charactersWithSpaces') }}</th>
                   <th>{{ t('projectDetail.stats.columns.paragraphs') }}</th>
                   <th>{{ t('projectDetail.stats.columns.lines') }}</th>
-                  <th>{{ t('projectDetail.stats.columns.internalRepeatedWords') }}</th>
-                  <th>{{ t('projectDetail.stats.columns.internalRepeatedCharacters') }}</th>
-                  <th>{{ t('projectDetail.stats.columns.crossFileRepeatedWords') }}</th>
-                  <th>{{ t('projectDetail.stats.columns.crossFileRepeatedCharacters') }}</th>
                   <th>{{ t('projectDetail.stats.columns.license') }}</th>
                 </tr>
               </thead>
@@ -4898,10 +5234,6 @@ onBeforeUnmount(() => {
                   <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'characters_with_spaces')) }}</td>
                   <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'paragraphs')) }}</td>
                   <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'lines')) }}</td>
-                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'internal_repeated_words')) }}</td>
-                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'internal_repeated_characters')) }}</td>
-                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'cross_file_repeated_words')) }}</td>
-                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'cross_file_repeated_characters')) }}</td>
                   <td>{{ getStatisticsLicenseLabel(row.statistics) }}</td>
                 </tr>
               </tbody>
@@ -4917,10 +5249,6 @@ onBeforeUnmount(() => {
                   <td>{{ formatStatisticNumber(statisticsTotals.characters_with_spaces) }}</td>
                   <td>{{ formatStatisticNumber(statisticsTotals.paragraphs) }}</td>
                   <td>{{ formatStatisticNumber(statisticsTotals.lines) }}</td>
-                  <td>{{ formatStatisticNumber(statisticsTotals.internal_repeated_words) }}</td>
-                  <td>{{ formatStatisticNumber(statisticsTotals.internal_repeated_characters) }}</td>
-                  <td>{{ formatStatisticNumber(statisticsTotals.cross_file_repeated_words) }}</td>
-                  <td>{{ formatStatisticNumber(statisticsTotals.cross_file_repeated_characters) }}</td>
                   <td>{{ getPlaceholder() }}</td>
                 </tr>
               </tfoot>
@@ -5969,11 +6297,71 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
+.pd-statistics-match-analysis {
+  display: grid;
+  gap: 10px;
+}
+
+.pd-statistics-subhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.pd-statistics-subhead > span {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.pd-statistics-file-match-list {
+  display: grid;
+  gap: 14px;
+}
+
+.pd-statistics-file-match-block {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.pd-statistics-file-match-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-muted);
+}
+
+.pd-statistics-file-match-head strong {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-statistics-file-match-head span {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 .pd-statistics-grid-wrap {
   overflow-x: auto;
   border: 1px solid var(--line-soft);
   border-radius: 8px;
   background: var(--surface-panel);
+}
+
+.pd-statistics-grid-wrap--match {
+  max-width: 720px;
 }
 
 .pd-statistics-grid {
@@ -5982,6 +6370,10 @@ onBeforeUnmount(() => {
   border-collapse: collapse;
   table-layout: fixed;
   font-size: 13px;
+}
+
+.pd-statistics-match-grid {
+  min-width: 560px;
 }
 
 .pd-statistics-grid th,
@@ -6008,6 +6400,18 @@ onBeforeUnmount(() => {
   border-right: 0;
 }
 
+.pd-statistics-match-grid th:first-child,
+.pd-statistics-match-grid td:first-child {
+  text-align: left;
+}
+
+.pd-statistics-match-grid th:nth-child(n + 2),
+.pd-statistics-match-grid td:nth-child(n + 2),
+.pd-statistics-match-grid th:last-child,
+.pd-statistics-match-grid td:last-child {
+  text-align: right;
+}
+
 .pd-statistics-grid thead th,
 .pd-statistics-grid tfoot th,
 .pd-statistics-grid tfoot td {
@@ -6018,6 +6422,12 @@ onBeforeUnmount(() => {
 
 .pd-statistics-grid tbody tr:last-child td {
   border-bottom: 0;
+}
+
+.pd-statistics-match-grid tbody tr.is-total td {
+  background: var(--surface-muted);
+  color: var(--text-primary);
+  font-weight: 600;
 }
 
 .pd-statistics-grid tfoot th,

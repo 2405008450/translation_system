@@ -49,3 +49,9 @@ migration_20260605_105050.zip
 *.docx
 *.pptx
 *.pdf
+
+# Clash/Mihomo 订阅配置可能包含节点和凭据，不进入 Docker build context。
+docker/mihomo/*.yaml
+docker/mihomo/*.yml
+!docker/mihomo/*.example.yaml
+!docker/mihomo/*.example.yml

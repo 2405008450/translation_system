@@ -21,6 +21,7 @@ TMX_EXTENSIONS = {".tmx"}
 XLS_EXTENSIONS = {".xls"}
 XLSX_EXTENSIONS = {".xlsx"}
 TERM_IMPORT_EXTENSIONS = CSV_EXTENSIONS | TMX_EXTENSIONS | XLS_EXTENSIONS | XLSX_EXTENSIONS
+TERM_STATUS_LOOKUP_CHUNK_SIZE = 10000
 HEADER_ALIASES = {
     ("source", "target"),
     ("source_term", "target_term"),
@@ -541,25 +542,35 @@ def _load_existing_term_status(
     if term_base_id is None or (not source_normalized_values and not source_texts):
         return set()
 
-    existing_rows = (
-        db.query(TermEntry.source_normalized, TermEntry.source_text)
-        .filter(
-            TermEntry.term_base_id == term_base_id,
-            TermEntry.source_language == source_language,
-            TermEntry.target_language == target_language,
-            or_(
-                TermEntry.source_normalized.in_(source_normalized_values or [""]),
-                TermEntry.source_text.in_(source_texts or [""]),
-            ),
-        )
-        .all()
-    )
     keys: set[str] = set()
-    for source_normalized, source_text in existing_rows:
-        if source_normalized:
-            keys.add(source_normalized)
-        if source_text:
-            keys.add(source_text)
+    source_normalized_values = list(dict.fromkeys(source_normalized_values))
+    source_texts = list(dict.fromkeys(source_texts))
+    max_lookup_count = max(len(source_normalized_values), len(source_texts))
+
+    for offset in range(0, max_lookup_count, TERM_STATUS_LOOKUP_CHUNK_SIZE):
+        normalized_chunk = source_normalized_values[offset : offset + TERM_STATUS_LOOKUP_CHUNK_SIZE]
+        source_text_chunk = source_texts[offset : offset + TERM_STATUS_LOOKUP_CHUNK_SIZE]
+        lookup_conditions = []
+        if normalized_chunk:
+            lookup_conditions.append(TermEntry.source_normalized.in_(normalized_chunk))
+        if source_text_chunk:
+            lookup_conditions.append(TermEntry.source_text.in_(source_text_chunk))
+
+        existing_rows = (
+            db.query(TermEntry.source_normalized, TermEntry.source_text)
+            .filter(
+                TermEntry.term_base_id == term_base_id,
+                TermEntry.source_language == source_language,
+                TermEntry.target_language == target_language,
+                or_(*lookup_conditions),
+            )
+            .all()
+        )
+        for source_normalized, source_text in existing_rows:
+            if source_normalized:
+                keys.add(source_normalized)
+            if source_text:
+                keys.add(source_text)
     return keys
 
 

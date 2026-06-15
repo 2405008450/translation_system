@@ -28,6 +28,7 @@ XLSX_EXTENSIONS = {".xlsx"}
 SDLTM_EXTENSIONS = {".sdltm"}
 WORKBOOK_EXTENSIONS = XLSX_EXTENSIONS | XLS_EXTENSIONS
 TM_IMPORT_EXTENSIONS = CSV_EXTENSIONS | TMX_EXTENSIONS | WORKBOOK_EXTENSIONS | SDLTM_EXTENSIONS
+TM_STATUS_LOOKUP_CHUNK_SIZE = 10000
 HEADER_ALIASES = {
     ("zh-cn", "en-us"),
     ("source", "target"),
@@ -498,28 +499,38 @@ def _load_existing_tm_status(
     if not source_hashes and not source_texts:
         return set()
 
-    existing_query = (
-        db.query(MemoryEntry.source_hash, MemoryEntry.source_text)
-        .filter(
-            or_(
-                MemoryEntry.source_hash.in_(source_hashes or [""]),
-                MemoryEntry.source_text.in_(source_texts or [""]),
-            ),
-            MemoryEntry.source_language == source_language,
-            MemoryEntry.target_language == target_language,
-        )
-    )
-    if collection_id is None:
-        existing_query = existing_query.filter(MemoryEntry.collection_id.is_(None))
-    else:
-        existing_query = existing_query.filter(MemoryEntry.collection_id == collection_id)
-
     keys: set[str] = set()
-    for source_hash, source_text in existing_query.all():
-        if source_hash:
-            keys.add(source_hash)
-        if source_text:
-            keys.add(source_text)
+    source_hashes = list(dict.fromkeys(source_hashes))
+    source_texts = list(dict.fromkeys(source_texts))
+    max_lookup_count = max(len(source_hashes), len(source_texts))
+
+    for offset in range(0, max_lookup_count, TM_STATUS_LOOKUP_CHUNK_SIZE):
+        source_hash_chunk = source_hashes[offset : offset + TM_STATUS_LOOKUP_CHUNK_SIZE]
+        source_text_chunk = source_texts[offset : offset + TM_STATUS_LOOKUP_CHUNK_SIZE]
+        lookup_conditions = []
+        if source_hash_chunk:
+            lookup_conditions.append(MemoryEntry.source_hash.in_(source_hash_chunk))
+        if source_text_chunk:
+            lookup_conditions.append(MemoryEntry.source_text.in_(source_text_chunk))
+
+        existing_query = (
+            db.query(MemoryEntry.source_hash, MemoryEntry.source_text)
+            .filter(
+                or_(*lookup_conditions),
+                MemoryEntry.source_language == source_language,
+                MemoryEntry.target_language == target_language,
+            )
+        )
+        if collection_id is None:
+            existing_query = existing_query.filter(MemoryEntry.collection_id.is_(None))
+        else:
+            existing_query = existing_query.filter(MemoryEntry.collection_id == collection_id)
+
+        for source_hash, source_text in existing_query.all():
+            if source_hash:
+                keys.add(source_hash)
+            if source_text:
+                keys.add(source_text)
     return keys
 
 

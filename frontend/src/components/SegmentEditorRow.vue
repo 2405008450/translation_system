@@ -1069,9 +1069,40 @@ function handleBeforeInput(event: Event) {
   handleInput()
 }
 
+function insertEditorLineBreak() {
+  if (!editorRef.value || props.disabled || isApplyingHistory.value || isComposing.value) {
+    return
+  }
+
+  recordUndoSnapshot(true, { force: true, inputType: 'insertLineBreak' })
+  if (props.showVisibleChars) {
+    document.execCommand(
+      'insertHTML',
+      false,
+      '<span class="visible-char visible-char--newline" contenteditable="false">¶</span>\n',
+    )
+  } else {
+    document.execCommand('insertLineBreak')
+  }
+  handleInput()
+}
+
 function handleKeydown(event: KeyboardEvent) {
   if (props.disabled || isApplyingHistory.value || event.altKey) {
     return
+  }
+
+  if (event.key === 'Enter' && !event.isComposing) {
+    if (event.ctrlKey || event.metaKey) {
+      event.preventDefault()
+      insertEditorLineBreak()
+      return
+    }
+
+    if (!event.shiftKey) {
+      event.preventDefault()
+      return
+    }
   }
 
   const usesShortcutModifier = event.ctrlKey || event.metaKey

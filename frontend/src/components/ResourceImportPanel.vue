@@ -154,6 +154,9 @@ const fixedGlossaryTargetLabel = computed(() => props.contextLabel || selectedGl
 const fixedTermTargetLabel = computed(() => props.contextLabel || selectedTermBase.value?.name || '当前术语库')
 const tmKeptDuplicateRows = computed(() => countKeptDuplicateRows(tmImportPreview.value?.rows ?? [], tmKeepDuplicateRowIndexes.value))
 const termKeptDuplicateRows = computed(() => countKeptDuplicateRows(termImportPreview.value?.rows ?? [], termKeepDuplicateRowIndexes.value))
+const canUploadTMWorkbook = computed(() => Boolean(selectedTMFile.value) && !tmImporting.value && !tmPreviewing.value)
+const canUploadGlossaryWorkbook = computed(() => Boolean(selectedGlossaryFile.value) && !glossaryImporting.value && !glossaryPreviewing.value)
+const canUploadTermWorkbook = computed(() => Boolean(selectedTermFile.value) && !termImporting.value && !termPreviewing.value)
 
 watch(() => props.mode, (mode) => {
   if (mode !== 'all') {
@@ -876,7 +879,7 @@ async function uploadTMWorkbook() {
 
   try {
     const collectionId = await ensureImportCollection()
-    const formData = buildTMImportFormData(collectionId, true)
+    const formData = buildTMImportFormData(collectionId, Boolean(tmImportPreview.value))
 
     const { data } = await http.post<TMImportSummary>('/translation-memory/import', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
@@ -980,7 +983,7 @@ async function uploadTermWorkbook() {
 
   try {
     const termBaseId = await ensureImportTermBase()
-    const formData = buildTermImportFormData(termBaseId, true)
+    const formData = buildTermImportFormData(termBaseId, Boolean(termImportPreview.value))
 
     const { data } = await http.post<TermImportSummary>('/term-bases/import', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
@@ -1178,12 +1181,12 @@ onMounted(() => {
         <button
           class="button button--primary"
           type="button"
-          :disabled="tmImporting || tmPreviewing || !tmImportPreview"
+          :disabled="!canUploadTMWorkbook"
           @click="uploadTMWorkbook"
         >
           <Loader2 v-if="tmImporting" class="lucide-spin" />
           <CheckCircle2 v-else :size="14" />
-          {{ tmImporting ? t('resourceImport.tm.importing', { percent: tmUploadPercent }) : '确认导入' }}
+          {{ tmImporting ? t('resourceImport.tm.importing', { percent: tmUploadPercent }) : (tmImportPreview ? '确认导入' : '直接导入') }}
         </button>
       </div>
 
@@ -1428,12 +1431,12 @@ onMounted(() => {
         <button
           class="button button--primary"
           type="button"
-          :disabled="glossaryImporting || glossaryPreviewing || !glossaryImportPreview"
+          :disabled="!canUploadGlossaryWorkbook"
           @click="uploadGlossaryWorkbook"
         >
           <Loader2 v-if="glossaryImporting" class="lucide-spin" />
           <CheckCircle2 v-else :size="14" />
-          {{ glossaryImporting ? t('resourceImport.glossary.importing', { percent: glossaryUploadPercent }) : '确认导入' }}
+          {{ glossaryImporting ? t('resourceImport.glossary.importing', { percent: glossaryUploadPercent }) : (glossaryImportPreview ? '确认导入' : '直接导入') }}
         </button>
       </div>
 
@@ -1651,12 +1654,12 @@ onMounted(() => {
         <button
           class="button button--primary"
           type="button"
-          :disabled="termImporting || termPreviewing || !termImportPreview"
+          :disabled="!canUploadTermWorkbook"
           @click="uploadTermWorkbook"
         >
           <Loader2 v-if="termImporting" class="lucide-spin" />
           <CheckCircle2 v-else :size="14" />
-          {{ termImporting ? t('resourceImport.term.importing', { percent: termUploadPercent }) : '确认导入' }}
+          {{ termImporting ? t('resourceImport.term.importing', { percent: termUploadPercent }) : (termImportPreview ? '确认导入' : '直接导入') }}
         </button>
       </div>
 

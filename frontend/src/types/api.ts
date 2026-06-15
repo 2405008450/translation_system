@@ -246,6 +246,7 @@ export interface DocumentStatistics {
   engine_version: string | null
   license_status: string | null
   include_textboxes_footnotes_endnotes: boolean | null
+  match_analysis: DocumentMatchAnalysis | null
   pages: number | null
   words: number | null
   non_asian_words: number | null
@@ -258,6 +259,22 @@ export interface DocumentStatistics {
   internal_repeated_characters: number | null
   cross_file_repeated_words: number | null
   cross_file_repeated_characters: number | null
+}
+
+export interface DocumentMatchAnalysisRow {
+  key: string
+  label: string
+  segment_count: number
+  word_count: number
+  percent: number
+}
+
+export interface DocumentMatchAnalysis {
+  threshold: number
+  collection_ids: string[]
+  total_segments: number
+  total_words: number
+  rows: DocumentMatchAnalysisRow[]
 }
 
 export interface DocumentStatisticsTotals {
@@ -273,6 +290,7 @@ export interface DocumentStatisticsTotals {
   internal_repeated_characters: number | null
   cross_file_repeated_words: number | null
   cross_file_repeated_characters: number | null
+  match_analysis: DocumentMatchAnalysis | null
 }
 
 export interface DocumentStatisticsReportItem {
