@@ -8,6 +8,7 @@ set -euo pipefail
 
 SUBSCRIPTION_URL="${1:-${MIHOMO_SUBSCRIPTION_URL:-}}"
 OUTPUT_PATH="${2:-docker/mihomo/config.yaml}"
+SUBSCRIPTION_USER_AGENT="${MIHOMO_SUBSCRIPTION_USER_AGENT:-Clash.Meta}"
 
 if [ -z "${SUBSCRIPTION_URL}" ]; then
   echo "错误：请通过第一个参数或 MIHOMO_SUBSCRIPTION_URL 提供 Clash 订阅链接。"
@@ -34,7 +35,11 @@ TMP_FILE="$(mktemp)"
 trap 'rm -f "${TMP_FILE}"' EXIT
 
 echo "正在下载 Clash 订阅配置..."
-curl -fsSL "${SUBSCRIPTION_URL}" -o "${TMP_FILE}"
+curl -fsSL \
+  -A "${SUBSCRIPTION_USER_AGENT}" \
+  -H "Accept: text/yaml,application/yaml,text/plain,*/*" \
+  "${SUBSCRIPTION_URL}" \
+  -o "${TMP_FILE}"
 
 if [ ! -s "${TMP_FILE}" ]; then
   echo "错误：订阅下载结果为空。"
@@ -46,6 +51,8 @@ from __future__ import annotations
 
 import re
 import sys
+import base64
+import binascii
 from pathlib import Path
 
 source_path = Path(sys.argv[1])
@@ -53,7 +60,25 @@ output_path = Path(sys.argv[2])
 
 raw_text = source_path.read_text(encoding="utf-8-sig")
 if "proxies:" not in raw_text and "proxy-providers:" not in raw_text:
-    raise SystemExit("错误：下载内容不像 Clash YAML 配置，请确认订阅链接类型。")
+    sample = raw_text.strip()[:4096]
+    reason = "下载内容不像 Clash YAML 配置。"
+    if sample.startswith("<!DOCTYPE") or sample.startswith("<html") or "<html" in sample[:200].lower():
+        reason = "订阅地址返回了 HTML 页面，可能是链接失效、被防火墙拦截或需要登录。"
+    elif sample.startswith("{") or sample.startswith("["):
+        reason = "订阅地址返回了 JSON，而不是 Clash YAML。"
+    else:
+        compact = re.sub(r"\s+", "", sample)
+        if compact and re.fullmatch(r"[A-Za-z0-9+/=_-]+", compact):
+            try:
+                decoded = base64.b64decode(compact + "=" * (-len(compact) % 4), validate=False).decode(
+                    "utf-8",
+                    errors="ignore",
+                )
+            except (binascii.Error, UnicodeDecodeError):
+                decoded = ""
+            if any(marker in decoded for marker in ("vmess://", "vless://", "trojan://", "ss://", "ssr://")):
+                reason = "订阅地址返回了通用 base64 节点订阅，不是 Clash YAML。请在机场后台复制 Clash/Mihomo 专用订阅，或使用订阅转换后再运行。"
+    raise SystemExit(f"错误：{reason}")
 
 # 移除常见顶层入站字段，避免订阅自带端口与本项目的 mixed-port 冲突。
 top_level_override_re = re.compile(
