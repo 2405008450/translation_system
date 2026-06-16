@@ -152,6 +152,9 @@ const overrides = {
       targetExcludeLabel: 'Target excludes',
       excludePlaceholder: 'Separate terms with spaces or commas',
     },
+    shortcutItems: {
+      confirm: 'Confirm current segment and jump to the next unconfirmed segment',
+    },
   },
   pagination: {
     total: '{total} total',

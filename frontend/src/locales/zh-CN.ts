@@ -957,7 +957,7 @@ export default {
     shortcutItems: {
       save: '立即保存',
       runAi: '执行 AI 修正',
-      confirm: '将当前句段标记为人工确认',
+      confirm: '确认当前句段并跳到下一个未确认句段',
       newline: '在译文编辑框内插入换行',
       move: '定位上一句 / 下一句',
       closePanel: '收起右侧面板',

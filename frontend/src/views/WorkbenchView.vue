@@ -1472,7 +1472,7 @@ useWorkbenchShortcuts({
   runAI: () => { void runLLMTranslation() },
   focusPrev: () => { void focusSentenceByOffset(-1) },
   focusNext: () => { void focusSentenceByOffset(1) },
-  confirmCurrent: () => { confirmCurrentSentence() },
+  confirmSegment: () => { void confirmAndMoveToNextUnconfirmed() },
   undo: () => { undoActiveSegmentEdit() },
   redo: () => { redoActiveSegmentEdit() },
   closePanel: () => { void closeActiveWorkbenchPanel() },
@@ -2266,11 +2266,11 @@ function getEditorSegmentDisplayIndex(sentenceId: string, fallbackIndex: number)
 function confirmCurrentSentence() {
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
-    return
+    return false
   }
   if (!activeSegmentCanWrite.value) {
     toast.warn('当前流程阶段无编辑权限')
-    return
+    return false
   }
   updateSegmentTarget(
     activeSegment.value.sentence_id,
@@ -2279,6 +2279,7 @@ function confirmCurrentSentence() {
     { confirm: true },
   )
   toast.success(t('workbench.messages.confirmed'))
+  return true
 }
 
 function toggleConfirmMenu() {
@@ -2304,7 +2305,9 @@ async function confirmAndMoveToNextUnconfirmed() {
     return
   }
 
-  confirmCurrentSentence()
+  if (!confirmCurrentSentence()) {
+    return
+  }
   const currentIndex = activeEditorIndex.value
   const segments = editorSegments.value
   let nextUnconfirmedIndex = -1

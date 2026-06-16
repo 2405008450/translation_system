@@ -5,7 +5,7 @@ interface WorkbenchShortcutHandlers {
   runAI: () => void
   focusPrev: () => void
   focusNext: () => void
-  confirmCurrent: () => void
+  confirmSegment: () => void
   undo: () => void
   redo: () => void
   closePanel: () => void
@@ -72,7 +72,7 @@ export function useWorkbenchShortcuts(handlers: WorkbenchShortcutHandlers) {
       }
 
       event.preventDefault()
-      handlers.confirmCurrent()
+      handlers.confirmSegment()
       return
     }
 
