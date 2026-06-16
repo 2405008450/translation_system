@@ -151,6 +151,7 @@ FORMAT_EXPORT_SUPPORT: Dict[str, List[str]] = {
     
     # 工程/设计文件
     ".dxf": ["original", "bilingual_txt", "tmx", "xliff"],
+    ".dwg": ["original", "bilingual_txt", "tmx", "xliff"],
     ".idml": ["original", "bilingual_txt", "tmx", "xliff"],
     ".mif": ["original", "bilingual_txt", "tmx", "xliff"],
     

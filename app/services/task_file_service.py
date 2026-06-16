@@ -65,6 +65,7 @@ TASK_ADAPTER_EXTENSIONS = {
     ".sdlxliff",
     ".txml",
     ".dxf",
+    ".dwg",
     ".idml",
     ".mif",
     ".zip",
@@ -388,6 +389,23 @@ _UPLOAD_CAPABILITY_SPECS = (
         "label": "DXF",
         "category": "engineering",
         "features": ("提取图纸文本", "保留文本实体定位", "支持原格式导出"),
+        "settings": (
+            {
+                "id": "skip_non_translatable",
+                "label": "非译元素(数字和符号)",
+                "default": True,
+            },
+        ),
+    },
+    {
+        "extensions": (".dwg",),
+        "label": "DWG",
+        "category": "engineering",
+        "features": (
+            "依赖 ODA File Converter（需用户安装）",
+            "DWG -> DXF -> 文本提取",
+            "默认导出 DXF；启用后回写 DWG",
+        ),
         "settings": (
             {
                 "id": "skip_non_translatable",

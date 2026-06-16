@@ -52,6 +52,7 @@ MIME_TYPES = {
     ".sdlxliff": "application/xml; charset=utf-8",
     ".txml": "application/xml; charset=utf-8",
     ".dxf": "application/dxf",
+    ".dwg": "image/vnd.dwg",
     ".zip": "application/zip",
     ".idml": "application/vnd.adobe.indesign-idml-package",
     ".mif": "application/x-mif",
@@ -114,6 +115,17 @@ def export_translated_file(
         target = getattr(seg, 'target_text', None) or seg.get('target_text', '') if isinstance(seg, dict) else seg.target_text
         if source and target:
             translations[source] = target
+
+    # DWG 单独走专用通道，因为最终扩展名取决于 ODA 是否可用
+    if ext == ".dwg":
+        from app.services.adapters.dwg_exporter import DwgExporter
+
+        result = DwgExporter().export_with_extension(original_bytes, translations)
+        actual_ext = result.extension
+        mime_type = MIME_TYPES.get(actual_ext, mime_type)
+        base_name = Path(filename).stem
+        export_filename = f"{base_name}-translated{actual_ext}"
+        return result.content, mime_type, export_filename
 
     # 根据格式选择导出器
     exported_bytes = _export_by_format(ext, original_bytes, translations, segments)
@@ -203,6 +215,11 @@ def _export_by_format(
     # DXF
     if ext == ".dxf":
         return DxfExporter().export(original_bytes, translations)
+
+    # DWG（依赖 ODA File Converter）
+    if ext == ".dwg":
+        from app.services.adapters.dwg_exporter import DwgExporter
+        return DwgExporter().export(original_bytes, translations)
 
     # ZIP
     if ext == ".zip":

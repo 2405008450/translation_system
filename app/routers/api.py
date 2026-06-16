@@ -2703,7 +2703,7 @@ SUPPORTED_EXTENSIONS = {
     # 双语文件
     ".sdlxliff", ".txml",
     # 工程/设计
-    ".dxf", ".idml", ".mif",
+    ".dxf", ".dwg", ".idml", ".mif",
     # 压缩包
     ".zip", ".rar",
 }

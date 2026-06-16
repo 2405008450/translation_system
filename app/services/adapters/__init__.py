@@ -68,6 +68,7 @@ _DEFAULT_ADAPTER_SPECS = (
     _AdapterSpec("app.services.adapters.sdlxliff_adapter", "SdlxliffAdapter"),
     _AdapterSpec("app.services.adapters.txml_adapter", "TxmlAdapter"),
     _AdapterSpec("app.services.adapters.dxf_adapter", "DxfAdapter"),
+    _AdapterSpec("app.services.adapters.dwg_adapter", "DwgAdapter"),
     _AdapterSpec("app.services.adapters.zip_adapter", "ZipAdapter"),
     _AdapterSpec("app.services.adapters.idml_adapter", "IdmlAdapter"),
     _AdapterSpec("app.services.adapters.mif_adapter", "MifAdapter"),

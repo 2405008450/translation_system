@@ -174,6 +174,10 @@ class MultiFormatExporter:
         for key, values in candidates.items():
             if len(values) == 1:
                 result[key] = next(iter(values))
+            elif len(values) > 1:
+                # 有多个不同译文时，使用第一个（按字母顺序）
+                # 这比完全跳过更好，至少能保证有翻译输出
+                result[key] = sorted(values)[0]
         return result
 
     def _export_original(
@@ -269,6 +273,17 @@ class MultiFormatExporter:
             from app.services.adapters.dxf_exporter import DxfExporter
 
             content = DxfExporter().export(original_bytes, text_map)
+        elif extension == ".dwg":
+            from app.services.adapters.dwg_exporter import DwgExporter
+
+            result = DwgExporter().export_with_extension(original_bytes, text_map)
+            content = result.content
+            # 当 DWG 回写不可用时降级为 DXF，需要纠正下游 mime/扩展
+            if result.extension != ".dwg":
+                extension = result.extension
+                export_filename = self._build_translated_filename(
+                    filename, extension_override=result.extension
+                )
         elif extension == ".idml":
             from app.services.adapters.idml_exporter import IdmlExporter
 
@@ -701,6 +716,7 @@ class MultiFormatExporter:
         mime_map = {
             ".csv": "text/csv; charset=utf-8",
             ".dxf": "image/vnd.dxf",
+            ".dwg": "image/vnd.dwg",
             ".idml": "application/vnd.adobe.indesign-idml-package",
             ".json": "application/json; charset=utf-8",
             ".md": "text/markdown; charset=utf-8",
