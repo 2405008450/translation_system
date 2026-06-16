@@ -198,20 +198,6 @@ def queue_file_export(
     if file_record is None:
         raise HTTPException(status_code=404, detail="File record not found.")
 
-    existing_task = (
-        db.query(FileExportTask)
-        .filter(
-            FileExportTask.file_record_id == file_record_id,
-            FileExportTask.export_type == export_type,
-            FileExportTask.expires_at > now,
-            FileExportTask.status.in_(["queued", "running"]),
-        )
-        .order_by(FileExportTask.created_at.desc())
-        .first()
-    )
-    if existing_task is not None:
-        return serialize_file_export_task(existing_task)
-
     task = FileExportTask(
         file_record_id=file_record_id,
         export_type=export_type,
