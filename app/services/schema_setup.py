@@ -377,6 +377,7 @@ REQUIRED_INDEXES = {
     "term_entries": {
         "ix_term_entries_creator_id",
         "ix_term_entries_last_modified_by_id",
+        "ix_term_entries_term_base_updated_created",
     },
     "glossary_entries": {
         "ix_glossary_entries_creator_id",
@@ -730,6 +731,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_term_entries_term_base_source_normalized
             ON term_entries (term_base_id, source_normalized)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_entries_term_base_updated_created
+            ON term_entries (term_base_id, updated_at DESC, created_at DESC)
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_term_entries_language_pair

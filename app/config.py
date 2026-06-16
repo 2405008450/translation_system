@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     database_url: str = Field(
         default="postgresql+psycopg://postgres:postgres@localhost:5432/tm_demo" 
     )
+    database_pool_size: int = 10
+    database_max_overflow: int = 20
+    database_pool_timeout: int = 60
+    database_pool_recycle: int = 1800
     file_storage_dir: str = "data/file_records"
     export_task_dir: str = "data/export_tasks"
     upload_max_size_mb: int = 10

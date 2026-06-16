@@ -268,6 +268,8 @@ CREATE INDEX IF NOT EXISTS ix_term_entries_term_base_source_text
     ON term_entries (term_base_id, source_text);
 CREATE INDEX IF NOT EXISTS ix_term_entries_term_base_source_normalized
     ON term_entries (term_base_id, source_normalized);
+CREATE INDEX IF NOT EXISTS ix_term_entries_term_base_updated_created
+    ON term_entries (term_base_id, updated_at DESC, created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_term_entries_language_pair
     ON term_entries (source_language, target_language);
 
