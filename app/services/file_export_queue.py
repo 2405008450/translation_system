@@ -351,7 +351,7 @@ def _run_file_export_task(task_id: UUID) -> None:
                 raise ValueError("File record not found.")
 
             _set_file_export_task_status(db, task, "running", progress=20, message="正在读取文件和句段。")
-            exported_file = _build_exported_file(db, file_record, task.export_type)
+            exported_file = build_file_record_exported_file(db, file_record, task.export_type)
 
             output_dir = _ensure_export_dir()
             _cleanup_expired_export_files(output_dir)
@@ -373,7 +373,7 @@ def _run_file_export_task(task_id: UUID) -> None:
                 _set_file_export_task_status(db, task, "failed", progress=100, message="导出失败。")
 
 
-def _build_exported_file(db: Session, file_record: FileRecord, export_type: str):
+def build_file_record_exported_file(db: Session, file_record: FileRecord, export_type: str):
     raw_bytes = load_file_record_source(file_record)
     source_filename = get_file_record_source_filename(file_record)
 

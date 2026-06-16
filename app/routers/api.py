@@ -215,6 +215,11 @@ from app.services.file_export_queue import (
     serialize_file_export_task,
     wait_for_file_export_task,
 )
+from app.services.project_file_export_zip_queue import (
+    build_project_file_zip_export_download_response,
+    ensure_project_file_zip_export_task_status,
+    queue_project_file_zip_export,
+)
 from app.services.project_segment_sync import (
     ProjectSyncDisableSummary,
     disable_project_sync_for_segments,
@@ -1276,6 +1281,10 @@ class ProjectUpdatePayload(BaseModel):
 
 
 class ProjectDocumentStatisticsPayload(BaseModel):
+    file_ids: list[UUID] = Field(default_factory=list)
+
+
+class ProjectFileZipExportPayload(BaseModel):
     file_ids: list[UUID] = Field(default_factory=list)
 
 
@@ -7795,6 +7804,106 @@ def _queue_file_record_export_for_current_user(
         export_type=export_type,
         current_user=current_user,
     )
+
+
+def _load_project_file_zip_export_files(
+    *,
+    db: Session,
+    project: Project,
+    file_ids: list[UUID],
+    current_user: User,
+) -> list[FileRecord]:
+    normalized_file_ids = list(dict.fromkeys(file_ids))
+    if len(normalized_file_ids) < 2:
+        raise HTTPException(status_code=400, detail="请至少选择两个文件导出为压缩包。")
+
+    files = (
+        db.query(FileRecord)
+        .filter(
+            FileRecord.project_id == project.id,
+            FileRecord.id.in_(normalized_file_ids),
+        )
+        .all()
+    )
+    file_by_id = {file_record.id: file_record for file_record in files}
+    ordered_files: list[FileRecord] = []
+    for file_id in normalized_file_ids:
+        file_record = file_by_id.get(file_id)
+        if file_record is None:
+            raise HTTPException(status_code=404, detail="部分文件不存在或不属于当前项目。")
+        if not _can_read_file_record(file_record, current_user, db):
+            raise HTTPException(status_code=404, detail="部分文件不存在或未分配给当前用户。")
+        raw_bytes = load_file_record_source(file_record)
+        if not can_export_task_file(
+            get_file_record_source_filename(file_record),
+            has_source_file=raw_bytes is not None,
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"文件“{file_record.filename}”暂不支持目标文件导出，无法打包为压缩包。",
+            )
+        ordered_files.append(file_record)
+    return ordered_files
+
+
+def _require_project_file_zip_export_task_read_access(
+    task: dict[str, Any],
+    *,
+    db: Session,
+    current_user: User,
+) -> None:
+    try:
+        project_id = UUID(str(task.get("project_id") or ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="压缩包导出任务不存在。") from exc
+
+    project = _get_project_or_404(db, project_id)
+    _require_project_read_access(project, current_user, db)
+
+
+@router.post("/projects/{project_id}/file-export-zip-tasks")
+def create_project_file_export_zip_task(
+    project_id: UUID,
+    payload: ProjectFileZipExportPayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    project = _get_project_or_404(db, project_id)
+    _require_project_read_access(project, current_user, db)
+    files = _load_project_file_zip_export_files(
+        db=db,
+        project=project,
+        file_ids=payload.file_ids,
+        current_user=current_user,
+    )
+    task = queue_project_file_zip_export(
+        project_id=project.id,
+        project_name=getattr(project, "name", None) or getattr(project, "filename", None) or "项目",
+        file_ids=[file_record.id for file_record in files],
+    )
+    return JSONResponse(status_code=202, content=task)
+
+
+@router.get("/projects/file-export-zip-tasks/{task_id}")
+def get_project_file_export_zip_task(
+    task_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    task = ensure_project_file_zip_export_task_status(task_id)
+    _require_project_file_zip_export_task_read_access(task, db=db, current_user=current_user)
+    return task
+
+
+@router.get("/projects/file-export-zip-tasks/{task_id}/download")
+def download_project_file_export_zip_task(
+    task_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    task = ensure_project_file_zip_export_task_status(task_id)
+    _require_project_file_zip_export_task_read_access(task, db=db, current_user=current_user)
+    return build_project_file_zip_export_download_response(task_id)
 
 
 @router.post("/file-records/{file_record_id}/exports")

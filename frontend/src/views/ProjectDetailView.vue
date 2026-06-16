@@ -312,6 +312,8 @@ interface FileExportTask {
   progress: number
   message?: string
   error?: string | null
+  filename?: string | null
+  size_bytes?: number | null
 }
 interface FileExportOption {
   id: string
@@ -798,6 +800,10 @@ const canOpenProjectExportMenu = computed(() => (
   selectedProjectFiles.value.length > 0
   && !exportingFileId.value
   && !loadingProjectExportOptions.value
+))
+const canExportSelectedProjectFilesAsZip = computed(() => (
+  selectedProjectFiles.value.length > 1
+  && projectExportOptions.value.some((option) => option.id === 'original')
 ))
 const projectExportButtonTitle = computed(() => {
   if (selectedProjectFiles.value.length === 0) {
@@ -3170,6 +3176,25 @@ async function waitForFileExportTask(task: FileExportTask) {
   }
 }
 
+async function waitForProjectFileZipExportTask(task: FileExportTask) {
+  let currentTask = task
+  while (true) {
+    exportFileProgress.value = currentTask.progress
+    exportFileMessage.value = currentTask.message || `压缩包导出处理中：${currentTask.progress}%`
+
+    if (currentTask.status === 'completed') {
+      return currentTask
+    }
+    if (currentTask.status === 'failed') {
+      throw new Error(currentTask.error || currentTask.message || '压缩包导出失败。')
+    }
+
+    await waitForExportPoll(1200)
+    const { data } = await http.get<FileExportTask>(`/projects/file-export-zip-tasks/${currentTask.task_id}`)
+    currentTask = data
+  }
+}
+
 async function loadProjectExportOptionsForSelection() {
   const rows = [...selectedProjectFiles.value]
   projectExportOptions.value = []
@@ -3233,6 +3258,27 @@ async function downloadProjectFileExport(row: ProjectRow, exportType: string) {
   downloadBlob(response.data, downloadName)
 }
 
+function getProjectFileZipExportFallbackName() {
+  const projectName = String(project.value?.name || project.value?.filename || '项目')
+  return `${projectName}-目标文件.zip`
+}
+
+async function downloadProjectFileZipExport(rows: ProjectRow[]) {
+  const { data: task } = await http.post<FileExportTask>(
+    `/projects/${props.id}/file-export-zip-tasks`,
+    { file_ids: rows.map((row) => String(row.id)) },
+  )
+  const completedTask = await waitForProjectFileZipExportTask(task)
+  const response = await http.get(`/projects/file-export-zip-tasks/${completedTask.task_id}/download`, {
+    responseType: 'blob',
+  })
+  const downloadName = resolveDownloadFilename(
+    response.headers['content-disposition'],
+    getProjectFileZipExportFallbackName(),
+  )
+  downloadBlob(response.data, downloadName)
+}
+
 async function exportProjectFile(row: ProjectRow, exportType = 'original') {
   if (exportingFileId.value) {
     return
@@ -3254,6 +3300,34 @@ async function exportProjectFile(row: ProjectRow, exportType = 'original') {
       error,
       exportType === 'source' ? t('projectDetail.errors.exportSource') : t('projectDetail.errors.export'),
     )
+  } finally {
+    clearExportPollTimer()
+    exportingFileId.value = ''
+    exportingFileType.value = ''
+    exportFileProgress.value = 0
+    exportFileMessage.value = ''
+  }
+}
+
+async function exportSelectedProjectFilesAsZip() {
+  if (!canExportSelectedProjectFilesAsZip.value || exportingFileId.value) {
+    return
+  }
+
+  closeActionMenu()
+  showProjectExportMenu.value = false
+  pageError.value = ''
+  const rows = [...selectedProjectFiles.value]
+  exportingFileId.value = '__project_zip__'
+  exportingFileType.value = 'zip'
+  exportFileProgress.value = 0
+  exportFileMessage.value = '压缩包导出任务提交中。'
+
+  try {
+    await downloadProjectFileZipExport(rows)
+    toast.success(`已开始下载包含 ${rows.length} 个目标文件的压缩包。`)
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('projectDetail.errors.exportZip'))
   } finally {
     clearExportPollTimer()
     exportingFileId.value = ''
@@ -4818,6 +4892,16 @@ onBeforeUnmount(() => {
                   >
                     <span class="pd-export-menu__item-name">{{ option.name }}</span>
                     <span class="pd-export-menu__item-desc">{{ option.description }}</span>
+                  </button>
+                  <button
+                    v-if="canExportSelectedProjectFilesAsZip"
+                    class="pd-export-menu__item"
+                    type="button"
+                    :disabled="Boolean(exportingFileId)"
+                    @click="exportSelectedProjectFilesAsZip"
+                  >
+                    <span class="pd-export-menu__item-name">{{ t('projectDetail.files.actions.exportZip') }}</span>
+                    <span class="pd-export-menu__item-desc">{{ t('projectDetail.files.actions.exportZipDescription') }}</span>
                   </button>
                 </template>
               </div>
