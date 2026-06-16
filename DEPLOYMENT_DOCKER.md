@@ -40,6 +40,16 @@ MIHOMO_SUBSCRIPTION_URL='你的 Clash 订阅链接' bash scripts/prepare_mihomo_
 
 该脚本会生成 `docker/mihomo/config.yaml`，并固定提供 Docker 内网代理端口 `7890`。Mihomo 不映射宿主机端口，因此默认不会影响服务器上的其它项目。
 
+推荐给 OpenRouter 启用日本/美国节点故障转移：
+
+```bash
+MIHOMO_OPENROUTER_FALLBACK=true \
+MIHOMO_SUBSCRIPTION_URL='你的 Clash 订阅链接' \
+bash scripts/prepare_mihomo_config.sh
+```
+
+脚本会自动生成 `OpenRouter-Fallback` 策略组，并把 `openrouter.ai` 规则放到 `rules` 第一条。默认健康检查间隔为 `30` 秒，超时为 `2000` 毫秒；如果希望更快切换，可以额外设置 `MIHOMO_OPENROUTER_FALLBACK_INTERVAL=15` 和 `MIHOMO_OPENROUTER_FALLBACK_TIMEOUT=1500`。
+
 如果订阅里的“自动选择”没有选到适合 OpenRouter 的节点，可以先查找日本或美国节点名：
 
 ```bash

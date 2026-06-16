@@ -10,6 +10,26 @@
 MIHOMO_SUBSCRIPTION_URL='你的 Clash 订阅链接' bash scripts/prepare_mihomo_config.sh
 ```
 
+推荐给 OpenRouter 启用日本/美国节点故障转移：
+
+```bash
+MIHOMO_OPENROUTER_FALLBACK=true \
+MIHOMO_SUBSCRIPTION_URL='你的 Clash 订阅链接' \
+bash scripts/prepare_mihomo_config.sh
+```
+
+脚本会自动扫描订阅中的日本/美国节点，生成 `OpenRouter-Fallback` 策略组，并把 `openrouter.ai` 规则放到 `rules` 第一条。默认健康检查间隔为 `30` 秒，超时为 `2000` 毫秒。
+
+如需调得更激进：
+
+```bash
+MIHOMO_OPENROUTER_FALLBACK=true \
+MIHOMO_OPENROUTER_FALLBACK_INTERVAL=15 \
+MIHOMO_OPENROUTER_FALLBACK_TIMEOUT=1500 \
+MIHOMO_SUBSCRIPTION_URL='你的 Clash 订阅链接' \
+bash scripts/prepare_mihomo_config.sh
+```
+
 如果订阅里的“自动选择”没有选到适合 OpenRouter 的节点，可以先在生成后的配置里找日本或美国节点名：
 
 ```bash
