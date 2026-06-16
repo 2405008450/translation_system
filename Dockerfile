@@ -13,11 +13,14 @@ RUN npm run build
 
 FROM python:3.11-slim-bookworm AS runtime
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
+ENV TZ=Asia/Shanghai \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     LIBREOFFICE_SOFFICE_PATH=/usr/bin/libreoffice \
     LIBREOFFICE_PYTHON_PATH=/usr/bin/python3
+
+ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -31,8 +34,11 @@ RUN apt-get update \
         libreoffice-writer \
         p7zip-full \
         python3-uno \
+        tzdata \
         unzip \
         unrar-free \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo $TZ > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

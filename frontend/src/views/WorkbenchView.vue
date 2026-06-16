@@ -3880,6 +3880,11 @@ async function exportWithType(exportType: string) {
   showExportMenu.value = false
 
   try {
+    const synced = await segmentStore.syncToBackend()
+    if (!synced) {
+      return
+    }
+
     const { data: task } = await http.post<FileExportTask>(
       `/file-records/${segmentStore.fileRecord.id}/exports`,
       null,

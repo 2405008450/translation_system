@@ -4,7 +4,7 @@ import logging
 import mimetypes
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -169,8 +169,12 @@ _FILE_EXPORT_REQUIRED_INDEXES = {
 }
 
 
+def local_now() -> datetime:
+    return datetime.now()
+
+
 def utcnow() -> datetime:
-    return datetime.now(UTC).replace(tzinfo=None)
+    return local_now()
 
 
 def queue_file_export(
@@ -182,7 +186,7 @@ def queue_file_export(
 ) -> dict[str, Any]:
     ensure_file_export_tasks_schema()
     export_type = normalize_file_export_type(export_type)
-    now = utcnow()
+    now = local_now()
     expires_at = now + timedelta(seconds=FILE_EXPORT_TASK_TTL_SECONDS)
 
     file_record = (
@@ -200,7 +204,7 @@ def queue_file_export(
             FileExportTask.file_record_id == file_record_id,
             FileExportTask.export_type == export_type,
             FileExportTask.expires_at > now,
-            FileExportTask.status.in_(["queued", "running", "completed"]),
+            FileExportTask.status.in_(["queued", "running"]),
         )
         .order_by(FileExportTask.created_at.desc())
         .first()
@@ -469,7 +473,7 @@ def _set_file_export_task_status(
     task.status = status
     task.progress = max(0, min(100, int(progress)))
     task.message = message
-    task.updated_at = utcnow()
+    task.updated_at = local_now()
     db.commit()
     db.refresh(task)
 
@@ -481,7 +485,7 @@ def _ensure_export_dir() -> Path:
 
 
 def _cleanup_expired_file_exports(db: Session) -> None:
-    now = utcnow()
+    now = local_now()
     expired_tasks = db.query(FileExportTask).filter(FileExportTask.expires_at <= now).all()
     for task in expired_tasks:
         if task.result_path:

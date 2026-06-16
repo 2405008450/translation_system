@@ -229,7 +229,7 @@ def _resolve_revision(
 
     anchor_revision.status = normalized_status
     anchor_revision.resolved_by_id = current_user.id
-    anchor_revision.resolved_at = datetime.utcnow()
+    anchor_revision.resolved_at = datetime.now()
 
     # 同步更新 segment 的 target_text：
     # 接受 → 保留 after_text；拒绝 → 恢复 before_text
@@ -273,7 +273,7 @@ def _batch_resolve_revisions(
     if not pending_revisions:
         return 0
 
-    resolved_at = datetime.utcnow()
+    resolved_at = datetime.now()
     resolved_count = 0
     grouped_revisions: dict[UUID, list[SegmentRevision]] = {}
     for revision in pending_revisions:

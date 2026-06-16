@@ -8,6 +8,7 @@ DEFAULT_JWT_SECRET_KEY = "change-me-in-production"
 
 class Settings(BaseSettings):
     app_name: str = "Translation Memory Demo"
+    tz: str = "Asia/Shanghai"
     database_url: str = Field(
         default="postgresql+psycopg://postgres:postgres@localhost:5432/tm_demo" 
     )

@@ -185,7 +185,7 @@ def update_segment_comment(
         if status not in COMMENT_STATUS_VALUES:
             raise HTTPException(status_code=400, detail="不支持的批注状态。")
         comment.status = status
-        comment.resolved_at = datetime.utcnow() if status == "resolved" else None
+        comment.resolved_at = datetime.now() if status == "resolved" else None
         changed = True
 
     if not changed:

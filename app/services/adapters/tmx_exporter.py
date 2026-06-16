@@ -3,7 +3,7 @@ TMX 导出器模块 - 导出翻译记忆库交换格式
 
 TMX (Translation Memory eXchange) 是翻译记忆库的行业标准交换格式。
 """
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import List, Optional
 from xml.sax.saxutils import escape
 
@@ -42,7 +42,7 @@ class TmxExporter:
         Returns:
             bytes: TMX XML 文件字节
         """
-        creation_date = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        creation_date = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         
         # TMX 头部
         tmx_parts = [

@@ -394,7 +394,7 @@ def _apply_cleaned_issues(
     }
     next_fingerprints = {issue.fingerprint(text_hash) for issue in cleaned_issues}
     changed = False
-    now = datetime.utcnow()
+    now = datetime.now()
 
     for existing in existing_issues:
         if _existing_issue_fingerprint(existing) not in next_fingerprints and existing.status != QA_ISSUE_STATUS_RESOLVED:

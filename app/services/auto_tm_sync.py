@@ -74,7 +74,7 @@ def enqueue_confirmed_segments_for_auto_tm(
     if collection is None or not source_language or not target_language:
         return AutoTMEnqueueSummary(skipped_invalid_count=len(eligible_segments))
 
-    now = datetime.utcnow()
+    now = datetime.now()
     segment_ids = [segment.id for segment in eligible_segments]
     existing_rows = (
         db.query(AutoTMOutbox)
@@ -178,7 +178,7 @@ def process_auto_tm_outbox(db: Session, *, batch_size: int = AUTO_TM_BATCH_SIZE)
             for row in rows
         ]
         summary = batch_upsert_tm_entries(db, entries)
-        processed_at = datetime.utcnow()
+        processed_at = datetime.now()
         for row in rows:
             row.status = "completed"
             row.processed_at = processed_at
@@ -200,7 +200,7 @@ def process_auto_tm_outbox(db: Session, *, batch_size: int = AUTO_TM_BATCH_SIZE)
 
 
 def process_due_auto_tm_rematches(db: Session, *, force: bool = False) -> int:
-    now = datetime.utcnow()
+    now = datetime.now()
     cutoff = now - AUTO_TM_REMATCH_AGE
     candidates = (
         db.query(AutoTMRematchQueue)
@@ -234,7 +234,7 @@ def process_due_auto_tm_rematches(db: Session, *, force: bool = False) -> int:
             queue.pending_entry_count = 0
             queue.first_pending_at = None
             queue.last_pending_at = None
-            queue.last_processed_at = datetime.utcnow()
+            queue.last_processed_at = datetime.now()
             queue.status = "pending"
             queue.error_message = ""
             db.commit()
@@ -453,7 +453,7 @@ def _upsert_rematch_queue(
     collection_id: UUID,
     count: int,
 ) -> None:
-    now = datetime.utcnow()
+    now = datetime.now()
     queue = (
         db.query(AutoTMRematchQueue)
         .filter(AutoTMRematchQueue.file_record_id == file_record_id)

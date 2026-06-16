@@ -355,7 +355,7 @@ def _set_import_task_status(
         "message": message,
         "result": result,
         "error": error,
-        "updated_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.now().isoformat(),
     }
     cache_set_json(_import_task_cache_key(task_id), payload, ttl_seconds=IMPORT_TASK_TTL_SECONDS)
     return payload
@@ -2317,7 +2317,7 @@ def _update_project_assignments_by_workflow(
     current_user: User,
 ) -> dict[str, Any]:
     desired, desired_user_ids = _validate_assignment_payload(db, project, payload)
-    now = datetime.utcnow()
+    now = datetime.now()
     workflow_steps = _load_project_workflow_steps(db, project_id)
     first_step_id = workflow_steps[0].id if workflow_steps else None
 
@@ -2509,7 +2509,7 @@ def mark_all_notifications_read(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    now = datetime.utcnow()
+    now = datetime.now()
     (
         db.query(Notification)
         .filter(Notification.user_id == current_user.id, Notification.read_at.is_(None))
@@ -2533,7 +2533,7 @@ def mark_notification_read(
     if notification is None:
         raise HTTPException(status_code=404, detail="消息不存在。")
     if notification.read_at is None:
-        notification.read_at = datetime.utcnow()
+        notification.read_at = datetime.now()
         db.commit()
         db.refresh(notification)
     return _serialize_notification(notification)
@@ -4659,7 +4659,7 @@ def _apply_term_qa_ignore_state(
     current_user: User,
     ignored: bool,
 ) -> None:
-    now = datetime.utcnow()
+    now = datetime.now()
     for item in items:
         if ignored:
             item.ignored_at = item.ignored_at or now
@@ -4787,7 +4787,7 @@ def update_project_assignments(
         current_user=current_user,
     )
     desired = _validate_assignment_payload(db, project, payload)
-    now = datetime.utcnow()
+    now = datetime.now()
 
     current_project_assignments = {
         assignment.assignee_id: assignment
@@ -5723,12 +5723,12 @@ def update_segment_qa_issue_ignore(
     if payload.ignored:
         issue.status = QA_ISSUE_STATUS_IGNORED
         issue.ignored_by_id = current_user.id
-        issue.ignored_at = datetime.utcnow()
+        issue.ignored_at = datetime.now()
     else:
         issue.status = QA_ISSUE_STATUS_OPEN
         issue.ignored_by_id = None
         issue.ignored_at = None
-    issue.updated_at = datetime.utcnow()
+    issue.updated_at = datetime.now()
     if issue.segment:
         issue.segment.updated_at = issue.updated_at
     db.commit()
@@ -6931,7 +6931,7 @@ def get_file_record(
         "translation_guidelines": project_guidelines,
         "created_at": file_record.created_at.isoformat(),
         "updated_at": file_record.updated_at.isoformat(),
-        "server_time": datetime.utcnow().isoformat(),
+        "server_time": datetime.now().isoformat(),
         "total_segments": result["total_segments"],
         "skip": result["skip"],
         "limit": result["limit"],
@@ -7117,7 +7117,7 @@ def get_file_record_segments(
             "source_filters": normalized_source_filters,
             "workflow_step_ids": normalized_workflow_step_ids,
         },
-        "server_time": datetime.utcnow().isoformat(),
+        "server_time": datetime.now().isoformat(),
         "segments": [
             _serialize_workbench_segment(
                 seg,
@@ -7153,7 +7153,7 @@ def _parse_segment_change_cursor(cursor: str) -> tuple[datetime, UUID | None]:
 
 
 def _format_segment_change_cursor(segment: Segment) -> str:
-    updated_at = segment.updated_at or datetime.utcnow()
+    updated_at = segment.updated_at or datetime.now()
     return f"{updated_at.isoformat()}|{segment.id}"
 
 
@@ -7188,7 +7188,7 @@ def get_file_record_segment_changes(
         .limit(safe_limit)
         .all()
     )
-    server_time = datetime.utcnow().isoformat()
+    server_time = datetime.now().isoformat()
     has_more = len(changed_segments) >= safe_limit
     next_cursor = _format_segment_change_cursor(changed_segments[-1]) if has_more and changed_segments else server_time
     workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
@@ -7331,7 +7331,7 @@ def assign_file_record_task(
 
     file_record.assignee_id = assignee.id if assignee else None
     file_record.assigned_by_id = current_user.id if assignee else None
-    file_record.assigned_at = datetime.utcnow() if assignee else None
+    file_record.assigned_at = datetime.now() if assignee else None
     db.commit()
     db.refresh(file_record)
 

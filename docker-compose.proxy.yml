@@ -31,6 +31,8 @@ services:
     image: metacubex/mihomo:latest
     container_name: ai-translation-mihomo
     command: ["-f", "/root/.config/mihomo/config.yaml"]
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - ./docker/mihomo/config.yaml:/root/.config/mihomo/config.yaml:ro
     expose:

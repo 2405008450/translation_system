@@ -10,6 +10,7 @@ services:
     env_file:
       - ${APP_ENV_FILE:-.env.prod}
     environment:
+      TZ: ${TZ:-Asia/Shanghai}
       FILE_STORAGE_DIR: /app/data/file_records
       EXPORT_TASK_DIR: /app/data/export_tasks
       LIBREOFFICE_SOFFICE_PATH: /usr/bin/libreoffice
@@ -38,6 +39,7 @@ services:
     env_file:
       - ${APP_ENV_FILE:-.env.prod}
     environment:
+      TZ: ${TZ:-Asia/Shanghai}
       FILE_STORAGE_DIR: /app/data/file_records
       EXPORT_TASK_DIR: /app/data/export_tasks
       LIBREOFFICE_SOFFICE_PATH: /usr/bin/libreoffice
@@ -56,7 +58,10 @@ services:
   postgres:
     image: pgvector/pgvector:pg17
     container_name: ai-translation-postgres
+    command: ["postgres", "-c", "timezone=${TZ:-Asia/Shanghai}"]
     environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      PGTZ: ${TZ:-Asia/Shanghai}
       POSTGRES_DB: ${POSTGRES_DB:?请在 .env.prod 中设置 POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER:?请在 .env.prod 中设置 POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env.prod 中设置 POSTGRES_PASSWORD}
@@ -77,6 +82,8 @@ services:
     image: redis:7.4-alpine
     container_name: ai-translation-redis
     command: ["redis-server", "--appendonly", "yes"]
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - redis_data:/data
     healthcheck:
@@ -89,6 +96,8 @@ services:
   languagetool:
     image: silviof/docker-languagetool:latest
     container_name: ai-translation-languagetool
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
     expose:
       - "8010"
     restart: unless-stopped
