@@ -216,8 +216,10 @@ if [ "${DIRECT_OK}" -eq 0 ]; then
   echo "    -c \"ALTER USER ${POSTGRES_USER} WITH PASSWORD '${POSTGRES_PASSWORD}';\""
   echo "  然后：${COMPOSE_CMD[*]} up -d --force-recreate pgbouncer app worker"
 elif [ "${PGBOUNCER_OK}" -eq 0 ]; then
-  echo "• 直连成功但 PgBouncer 失败：多半是 PgBouncer 凭据未刷新。"
-  echo "  执行：${COMPOSE_CMD[*]} up -d --force-recreate pgbouncer"
+  echo "• 直连成功但 PgBouncer 失败：常见是 PgBouncer 客户端认证配置问题（如 SASL/scram userlist 不匹配）。"
+  echo "  1) 确认 docker-compose.prod.yml 中 pgbouncer 使用 AUTH_TYPE=plain（内网部署）"
+  echo "  2) 重建：${COMPOSE_CMD[*]} up -d --force-recreate pgbouncer"
+  echo "  3) 若仍失败，查看：${COMPOSE_CMD[*]} logs --tail=50 pgbouncer"
 elif [ "${APP_OK}" -eq 0 ]; then
   echo "• DB 层成功但 app 失败：检查 DATABASE_URL 密码/主机是否与 POSTGRES_PASSWORD 一致。"
 else

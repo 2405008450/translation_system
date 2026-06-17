@@ -98,7 +98,8 @@ services:
       MIN_POOL_SIZE: "5"
       RESERVE_POOL_SIZE: "10"
       RESERVE_POOL_TIMEOUT: "3"
-      AUTH_TYPE: scram-sha-256
+      # 内网专用：客户端用明文口令校验 userlist。PG17 后端仍走 SCRAM；勿对公网暴露 6432。
+      AUTH_TYPE: plain
       # psycopg/SQLAlchemy 可能发送这些启动参数，事务池化下需忽略以避免连接被拒。
       IGNORE_STARTUP_PARAMETERS: extra_float_digits,options
     depends_on:
