@@ -28,41 +28,26 @@ nano .env.prod
 
 如果数据库密码包含 `@`、`:`、`/`、`?`、`#` 等字符，`DATABASE_URL` 里的密码部分必须 URL 编码。
 
-### 可选：为 OpenRouter 启用项目内 Clash/Mihomo 代理
+### `.env.prod` 和 `.env` 分别干什么？
 
-如果云服务器无法直连 OpenRouter，可以只给本项目启用一个 Mihomo 容器。订阅链接和生成的 `docker/mihomo/config.yaml` 都属于敏感信息，不要提交到 Git。
+| 文件 | 谁读它 | 作用 |
+|------|--------|------|
+| **`.env.prod`** | `docker-compose.prod.yml`（经 `--env-file` 或 `env_file:`） | **生产环境唯一权威配置**。Compose 用它解析 `${POSTGRES_*}` 等变量，并注入 app/worker 容器。 |
+| **`.env`** | 独立版 `docker-compose` 默认自动读取；本地开发时 `app/config.py` 也会读 | 生产上通常是 `cp .env.prod .env` 的**副本**，只为兼容不带 `--env-file` 的旧命令。容器内**不依赖**磁盘上的 `.env` 文件。 |
 
-在服务器项目根目录执行：
-
-```bash
-MIHOMO_SUBSCRIPTION_URL='你的 Clash 订阅链接' bash scripts/prepare_mihomo_config.sh
-```
-
-该脚本会生成 `docker/mihomo/config.yaml`，并固定提供 Docker 内网代理端口 `7890`。Mihomo 不映射宿主机端口，因此默认不会影响服务器上的其它项目。
-
-推荐给 OpenRouter 启用日本/美国节点故障转移：
+推荐做法：
 
 ```bash
-MIHOMO_OPENROUTER_FALLBACK=true \
-MIHOMO_SUBSCRIPTION_URL='你的 Clash 订阅链接' \
-bash scripts/prepare_mihomo_config.sh
+# 1. 只维护 .env.prod（内容以 .env.prod.example 为模板）
+nano .env.prod
+
+# 2. 若使用 docker-compose 且不想每次写 --env-file，同步一份
+cp .env.prod .env
+
+# 3. 两个文件内容应完全一致；改配置时只改 .env.prod，再 cp 覆盖 .env
 ```
 
-脚本会自动生成 `OpenRouter-Fallback` 策略组，并把 `openrouter.ai` 规则放到 `rules` 第一条。默认健康检查间隔为 `30` 秒，超时为 `2000` 毫秒；如果希望更快切换，可以额外设置 `MIHOMO_OPENROUTER_FALLBACK_INTERVAL=15` 和 `MIHOMO_OPENROUTER_FALLBACK_TIMEOUT=1500`。
-
-如果订阅里的“自动选择”没有选到适合 OpenRouter 的节点，可以先查找日本或美国节点名：
-
-```bash
-grep -nE 'name:.*(日本|东京|大阪|JP|Japan|美国|美國|US|USA|United States|洛杉矶|洛杉磯|硅谷|圣何塞)' docker/mihomo/config.yaml | head -50
-```
-
-再用具体节点名或策略组名重新生成配置，让 `openrouter.ai` 固定走该节点：
-
-```bash
-MIHOMO_OPENROUTER_POLICY='这里填日本或美国节点名' \
-MIHOMO_SUBSCRIPTION_URL='你的 Clash 订阅链接' \
-bash scripts/prepare_mihomo_config.sh
-```
+注意：容器里的 Python 应用读的是**环境变量**（Compose 从 `.env.prod` 注入），不是容器内的 `.env` 文件。服务器项目目录里的 `.env` 主要是给 Compose 解析用的。
 
 ## 3. 构建并启动
 
@@ -72,14 +57,6 @@ bash scripts/prepare_mihomo_config.sh
 docker compose --env-file .env.prod -f docker-compose.prod.yml build
 docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
 docker compose --env-file .env.prod -f docker-compose.prod.yml ps
-```
-
-如果启用了上面的 Mihomo 代理，启动命令改为带上 `docker-compose.proxy.yml`：
-
-```bash
-docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml build
-docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml up -d
-docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml ps
 ```
 
 如果服务器只有独立命令 `docker-compose`，先复制一份默认 `.env`，再使用：
@@ -92,8 +69,6 @@ sudo docker-compose -f docker-compose.prod.yml build
 sudo docker-compose -f docker-compose.prod.yml up -d
 sudo docker-compose -f docker-compose.prod.yml ps
 ```
-
-启用 Mihomo 代理时，`docker-compose` 命令同样需要追加 `-f docker-compose.proxy.yml`。
 
 首次创建数据库 volume 时会自动执行：
 
@@ -111,14 +86,6 @@ curl http://127.0.0.1:19013/api/health
 curl http://43.132.156.72:19013/
 docker compose --env-file .env.prod -f docker-compose.prod.yml logs --tail=100 app
 docker compose --env-file .env.prod -f docker-compose.prod.yml logs --tail=100 worker
-```
-
-如果启用了 Mihomo 代理，可额外检查：
-
-```bash
-docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml logs --tail=100 mihomo
-docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml exec -T app \
-  python -c "import httpx; r=httpx.get('https://openrouter.ai/api/v1/models', timeout=30); print(r.status_code); print(r.text[:300])"
 ```
 
 如果使用的是 `docker-compose` 命令：
@@ -143,7 +110,7 @@ http://43.132.156.72:19013/login
 1. 先停应用和 worker。
 2. 备份当前 `postgres_data`、`app_file_storage`、`app_export_tasks` volume。
 3. 按你提供的 dump 或连接信息恢复 PostgreSQL。
-4. 同步 `data/file_records` 和 `data/export_tasks`。
+4. 同步 `data/file_records` 和 `data/export_tasks`。    
 5. 再启动服务并检查 `/api/health`。
 
 仓库中的 `migration_20260605_105050` 是旧迁移包，可作为后续恢复来源，但不要在首次空库上线时自动覆盖。
