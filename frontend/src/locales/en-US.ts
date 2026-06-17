@@ -137,7 +137,7 @@ const overrides = {
   auth: {
     login: 'Log in',
     initialize: 'Initialize super admin',
-    subtitleLogin: 'Enter your account and password to access the management platform',
+    subtitleLogin: 'Enter your account and password to access the Smart Operations Platform',
     subtitleInit: 'No users exist yet. Create a super admin account first.',
     username: 'Username',
     password: 'Password',
@@ -146,7 +146,7 @@ const overrides = {
     requestError: 'Request failed. Please try again later.',
   },
   login: {
-    kicker: 'Management Platform',
+    kicker: 'Smart Operations Platform',
   },
   workbench: {
     search: {
