@@ -28,6 +28,8 @@ services:
         condition: service_healthy
       languagetool:
         condition: service_started
+      db-migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   worker:
@@ -54,6 +56,8 @@ services:
         condition: service_started
       redis:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   postgres:
@@ -79,6 +83,26 @@ services:
       timeout: 5s
       retries: 10
     restart: unless-stopped
+
+  # 幂等数据库迁移：每次启动对已有库补齐索引等增量变更（CREATE INDEX IF NOT EXISTS），
+  # 执行完即退出。新库由 /docker-entrypoint-initdb.d 初始化，已有库靠本服务升级。
+  db-migrate:
+    image: pgvector/pgvector:pg17
+    container_name: ai-translation-db-migrate
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:?请在 .env.prod 中设置 POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?请在 .env.prod 中设置 POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB:?请在 .env.prod 中设置 POSTGRES_DB}
+    entrypoint: ["bash", "/app/scripts/run_migrations.sh"]
+    volumes:
+      - ./scripts:/app/scripts:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
   pgbouncer:
     image: edoburu/pgbouncer:1.22.1-p0

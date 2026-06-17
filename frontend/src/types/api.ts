@@ -530,9 +530,9 @@ export interface SegmentPageFilters {
 
 export interface SegmentPageResponse {
   file_record_id: string
-  total_segments: number
+  total_segments: number | null
   matched_segments: number
-  status_stats: SegmentStatusStats
+  status_stats: SegmentStatusStats | null
   skip: number
   limit: number
   filters: SegmentPageFilters

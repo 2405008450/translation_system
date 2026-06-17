@@ -967,6 +967,21 @@ CREATE INDEX IF NOT EXISTS ix_segments_file_record_order
     ON segments (file_record_id, block_index, row_index, cell_index, sentence_id);
 CREATE INDEX IF NOT EXISTS ix_segments_workflow_step_id
     ON segments (workflow_step_id);
+-- 检索/筛选加速：scope、status_filters、match_filters 频繁按这些列过滤。
+CREATE INDEX IF NOT EXISTS ix_segments_file_record_status
+    ON segments (file_record_id, status);
+CREATE INDEX IF NOT EXISTS ix_segments_file_record_source
+    ON segments (file_record_id, source);
+-- 增量游标端点 /segments/changes 按 updated_at 过滤并排序。
+CREATE INDEX IF NOT EXISTS ix_segments_updated_at
+    ON segments (updated_at);
+-- 文本检索：ilike('%kw%') 双向通配无法走 B-tree，改用 pg_trgm GIN 索引加速。
+CREATE INDEX IF NOT EXISTS ix_segments_source_text_trgm
+    ON segments USING GIN (source_text gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS ix_segments_display_text_trgm
+    ON segments USING GIN (display_text gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS ix_segments_target_text_trgm
+    ON segments USING GIN (target_text gin_trgm_ops);
 
 DROP TRIGGER IF EXISTS update_segments_updated_at ON segments;
 CREATE TRIGGER update_segments_updated_at

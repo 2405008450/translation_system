@@ -7144,6 +7144,7 @@ def get_file_record_segments(
     source_exclude: str | None = None,
     target_exclude: str | None = None,
     search_fuzzy: bool = False,
+    include_stats: bool = True,
     status_filters: str | None = None,
     status_filters_bracket: list[str] | None = Query(default=None, alias="status_filters[]"),
     match_filters: str | None = None,
@@ -7164,7 +7165,9 @@ def get_file_record_segments(
     safe_skip = max(skip, 0)
     safe_limit = _normalize_segment_page_limit(limit)
     base_query = db.query(Segment).filter(Segment.file_record_id == file_record_id)
-    total_segments = base_query.count()
+    # total_segments / status_stats 与页码、筛选无关（仅随编辑变化），
+    # 翻页时可让前端复用上次结果（include_stats=false），避免每页重复全表聚合。
+    total_segments = base_query.count() if include_stats else None
     filtered_query = _apply_segment_scope_filter(base_query, scope)
     filtered_query = _apply_segment_text_filters(
         filtered_query,
@@ -7204,7 +7207,7 @@ def get_file_record_segments(
         "file_record_id": str(file_record_id),
         "total_segments": total_segments,
         "matched_segments": matched_segments,
-        "status_stats": _get_segment_status_stats(db, file_record_id),
+        "status_stats": _get_segment_status_stats(db, file_record_id) if include_stats else None,
         "skip": safe_skip,
         "limit": safe_limit,
         "filters": {

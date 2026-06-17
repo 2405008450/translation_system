@@ -705,6 +705,27 @@ class Segment(Base):
             "cell_index",
             "sentence_id",
         ),
+        Index("ix_segments_file_record_status", "file_record_id", "status"),
+        Index("ix_segments_file_record_source", "file_record_id", "source"),
+        Index("ix_segments_updated_at", "updated_at"),
+        Index(
+            "ix_segments_source_text_trgm",
+            "source_text",
+            postgresql_using="gin",
+            postgresql_ops={"source_text": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_segments_display_text_trgm",
+            "display_text",
+            postgresql_using="gin",
+            postgresql_ops={"display_text": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_segments_target_text_trgm",
+            "target_text",
+            postgresql_using="gin",
+            postgresql_ops={"target_text": "gin_trgm_ops"},
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

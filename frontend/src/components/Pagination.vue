@@ -7,8 +7,10 @@ const props = withDefaults(defineProps<{
   page: number
   pageSize: number
   pageSizes?: number[]
+  loading?: boolean
 }>(), {
   pageSizes: () => [10, 20, 50],
+  loading: false,
 })
 
 const emit = defineEmits<{
@@ -87,13 +89,14 @@ function changePageSize(e: Event) {
 </script>
 
 <template>
-  <div class="pagination">
+  <div class="pagination" :class="{ 'is-loading': loading }">
     <span class="pagination__info">{{ t('pagination.total', { total }) }}</span>
     <span class="sr-only" aria-live="polite">{{ liveText }}</span>
 
     <select
       class="pagination__size-select"
       :value="pageSize"
+      :disabled="loading"
       @change="changePageSize"
     >
       <option v-for="size in pageSizes" :key="size" :value="size">{{ t('pagination.pageSize', { size }) }}</option>
@@ -101,7 +104,7 @@ function changePageSize(e: Event) {
 
     <button
       class="pagination__btn"
-      :disabled="page <= 1"
+      :disabled="page <= 1 || loading"
       @click="prev"
     >&lt;</button>
 
@@ -111,13 +114,14 @@ function changePageSize(e: Event) {
         v-else
         class="pagination__btn"
         :class="{ 'is-active': item === page }"
+        :disabled="loading"
         @click="goTo(item)"
       >{{ item }}</button>
     </template>
 
     <button
       class="pagination__btn"
-      :disabled="page >= totalPages"
+      :disabled="page >= totalPages || loading"
       @click="next"
     >&gt;</button>
 
@@ -129,6 +133,7 @@ function changePageSize(e: Event) {
         type="number"
         min="1"
         :max="totalPages"
+        :disabled="loading"
         :aria-label="t('pagination.jumpInput')"
         @keyup.enter="handleJump"
       />

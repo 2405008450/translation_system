@@ -4036,6 +4036,10 @@ body.modal-open {
   color: var(--ink-500);
 }
 
+.pagination.is-loading {
+  cursor: progress;
+}
+
 .pagination__info {
   margin-right: auto;
   font-size: 13px;

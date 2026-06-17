@@ -522,7 +522,7 @@ function getCommentWindowQuery(): CommentWindowQuery | null {
   }
 }
 
-function getSegmentWindowQuery(page = segmentStore.currentPage, pageSize = segmentStore.pageSize) {
+function getSegmentWindowQuery(page = segmentStore.currentPage, pageSize = segmentStore.pageSize, includeStats = true) {
   return {
     page,
     pageSize,
@@ -536,6 +536,7 @@ function getSegmentWindowQuery(page = segmentStore.currentPage, pageSize = segme
     matchFilters: [...segmentScreeningMatchFilters.value],
     sourceFilters: [...segmentScreeningSourceFilters.value],
     workflowStepIds: [...segmentScreeningWorkflowStepIds.value],
+    includeStats,
   }
 }
 
@@ -3535,19 +3536,31 @@ async function loadTask() {
   }
 }
 
-async function refreshSegmentPage(page = segmentStore.currentPage, size = segmentStore.pageSize) {
+async function refreshSegmentPage(
+  page = segmentStore.currentPage,
+  size = segmentStore.pageSize,
+  options: { includeStats?: boolean } = {},
+) {
   if (!segmentStore.fileRecord) {
     return
   }
+
+  // total_segments / status_stats 仅随句段编辑变化；纯翻页时复用缓存即可。
+  // 但若本次同步保存了脏数据，则必须重新统计，因此叠加 dirtyCount 判断。
+  const includeStats = options.includeStats ?? true
+  const hadPendingEdits = segmentStore.dirtyCount > 0
 
   pageError.value = ''
   try {
     const synced = await segmentStore.syncToBackend()
     if (!synced) {
+      const reason = segmentStore.syncMessage || t('workbench.errors.loadMore')
+      pageError.value = reason
+      toast.warn(reason)
       return
     }
     await segmentStore.loadSegmentPage({
-      ...getSegmentWindowQuery(page, size),
+      ...getSegmentWindowQuery(page, size, includeStats || hadPendingEdits),
     })
     if (revisionTraceVisible.value) {
       segmentStore.startRevisionTracking()
@@ -3580,11 +3593,11 @@ async function refreshSegmentPage(page = segmentStore.currentPage, size = segmen
 }
 
 async function handleSegmentPageChange(page: number) {
-  await refreshSegmentPage(page, segmentStore.pageSize)
+  await refreshSegmentPage(page, segmentStore.pageSize, { includeStats: false })
 }
 
 async function handleSegmentPageSizeChange(size: number) {
-  await refreshSegmentPage(1, size)
+  await refreshSegmentPage(1, size, { includeStats: false })
 }
 
 async function runLLMTranslation() {
@@ -5633,6 +5646,15 @@ onBeforeRouteLeave(async () => {
 
             <div class="segment-editor-list-stage">
               <div
+                v-if="segmentStore.loadingMoreSegments"
+                class="segment-editor-list-loading"
+                aria-live="polite"
+              >
+                <Loader2 class="lucide-spin" :size="28" />
+                <span>{{ t('table.loading') }}</span>
+              </div>
+
+              <div
                 v-if="hasEditorSegmentFilter && !searchLoadingAllSegments && editorSegments.length === 0"
                 class="empty-state workbench-search-empty"
               >
@@ -5688,6 +5710,7 @@ onBeforeRouteLeave(async () => {
             :page="segmentStore.currentPage"
             :page-size="segmentStore.pageSize"
             :page-sizes="segmentPageSizes"
+            :loading="segmentStore.loadingMoreSegments"
             @update:page="handleSegmentPageChange"
             @update:page-size="handleSegmentPageSizeChange"
           />
@@ -8239,6 +8262,23 @@ onBeforeRouteLeave(async () => {
 .segment-editor-list-stage {
   min-width: 0;
   overflow-anchor: none;
+  position: relative;
+}
+
+.segment-editor-list-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--ink-500);
+  font-size: 13px;
+  background: rgba(255, 255, 255, 0.62);
+  backdrop-filter: blur(1px);
+  pointer-events: all;
 }
 
 .panel--editor {

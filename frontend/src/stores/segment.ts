@@ -129,6 +129,7 @@ export interface SegmentPageQuery {
   matchFilters?: string[]
   sourceFilters?: string[]
   workflowStepIds?: string[]
+  includeStats?: boolean
 }
 
 interface SegmentChangeResponse {
@@ -195,6 +196,7 @@ export const useSegmentStore = defineStore('segment', () => {
   let changeCursor: string | null = null
   let pollingChanges = false
   let loadMorePromise: Promise<boolean> | null = null
+  let pendingSegmentPageQuery: SegmentPageQuery | null = null
   let previewPromise: Promise<void> | null = null
   let previewLoaded = false
   let previewCacheKey = ''
@@ -488,6 +490,7 @@ export const useSegmentStore = defineStore('segment', () => {
       matchFilters: normalizeStringArray(query.matchFilters ?? segmentFilters.value.matchFilters),
       sourceFilters: normalizeStringArray(query.sourceFilters ?? segmentFilters.value.sourceFilters),
       workflowStepIds: normalizeStringArray(query.workflowStepIds ?? segmentFilters.value.workflowStepIds),
+      includeStats: query.includeStats ?? true,
     }
   }
 
@@ -506,6 +509,7 @@ export const useSegmentStore = defineStore('segment', () => {
       match_filters: serializeFilterArray(resolved.matchFilters),
       source_filters: serializeFilterArray(resolved.sourceFilters),
       workflow_step_ids: serializeFilterArray(resolved.workflowStepIds),
+      include_stats: resolved.includeStats,
     }
   }
 
@@ -586,9 +590,11 @@ export const useSegmentStore = defineStore('segment', () => {
       sourceFilters: [...resolved.sourceFilters],
       workflowStepIds: [...resolved.workflowStepIds],
     }
-    totalSegmentCount.value = data.total_segments
+    totalSegmentCount.value = data.total_segments ?? totalSegmentCount.value
     matchedSegmentCount.value = data.matched_segments
-    setSegmentStatusStats(data.status_stats)
+    if (data.status_stats) {
+      setSegmentStatusStats(data.status_stats)
+    }
     resetSegments(data.segments)
     if (data.server_time) {
       changeCursor = data.server_time
@@ -775,6 +781,7 @@ export const useSegmentStore = defineStore('segment', () => {
     localRevisionBaselines.value = {}
     revisionTrackingEnabled.value = false
     loadMorePromise = null
+    pendingSegmentPageQuery = null
     llmAbortController = null
     llmReader = null
     llmAbortRequested = false
@@ -845,34 +852,47 @@ export const useSegmentStore = defineStore('segment', () => {
     }
   }
 
-  async function loadSegmentPage(query: SegmentPageQuery = {}) {
+  async function loadSegmentPage(query: SegmentPageQuery = {}): Promise<boolean> {
     if (!fileRecord.value) {
       return false
     }
 
+    // 已有进行中的加载：记录最新目标 query，由当前的加载循环在结束后继续处理（last-wins），
+    // 避免连续翻页时后点击的页码被静默丢弃而停在旧页。
     if (loadMorePromise) {
+      pendingSegmentPageQuery = query
       return loadMorePromise
     }
 
     loadingMoreSegments.value = true
     loadMorePromise = (async () => {
-      const { data, resolved } = await fetchSegmentPage(fileRecord.value!.id, query)
-      applySegmentPageData(data, resolved)
-      await loadRevisions(fileRecord.value!.id, resolved)
-      if (segments.value[0] && !segments.value.some((segment) => segment.sentence_id === activeSentenceId.value)) {
-        setActiveSentence(segments.value[0].sentence_id)
-      } else if (!segments.value.length) {
-        setActiveSentence(null)
+      let currentQuery: SegmentPageQuery | null = query
+      let hasMore = false
+      try {
+        while (currentQuery) {
+          const activeQuery = currentQuery
+          pendingSegmentPageQuery = null
+          const { data, resolved } = await fetchSegmentPage(fileRecord.value!.id, activeQuery)
+          applySegmentPageData(data, resolved)
+          await loadRevisions(fileRecord.value!.id, resolved)
+          if (segments.value[0] && !segments.value.some((segment) => segment.sentence_id === activeSentenceId.value)) {
+            setActiveSentence(segments.value[0].sentence_id)
+          } else if (!segments.value.length) {
+            setActiveSentence(null)
+          }
+          hasMore = data.segments.length > 0
+          // 加载期间若有更新的目标页码，循环加载最新的那一页。
+          currentQuery = pendingSegmentPageQuery
+        }
+        return hasMore
+      } finally {
+        pendingSegmentPageQuery = null
+        loadMorePromise = null
+        loadingMoreSegments.value = false
       }
-      return data.segments.length > 0
     })()
 
-    try {
-      return await loadMorePromise
-    } finally {
-      loadMorePromise = null
-      loadingMoreSegments.value = false
-    }
+    return loadMorePromise
   }
 
   async function loadMoreSegments() {
