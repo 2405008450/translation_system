@@ -204,7 +204,7 @@ from app.services.spelling_grammar_qa import (
     load_quality_qa_settings,
     normalize_quality_qa_settings,
     run_spelling_grammar_qa_for_project,
-    schedule_spelling_grammar_qa,
+    run_spelling_grammar_qa_for_segment_ids,
     serialize_segment_qa_issue,
     store_quality_qa_settings,
 )
@@ -429,6 +429,65 @@ async def _enqueue_arq_import_task(task_id: str, payload: dict[str, Any]) -> boo
     finally:
         if redis_pool is not None:
             await _close_arq_pool(redis_pool)
+
+
+async def _enqueue_arq_job(function_name: str, *args: Any) -> bool:
+    """通用 ARQ 任务入队：成功返回 True，未启用/失败返回 False 以便回退本地执行。"""
+    settings = get_settings()
+    if settings.import_queue_backend.lower() != "arq":
+        return False
+    if not settings.redis_url or arq_create_pool is None:
+        return False
+
+    redis_settings = _build_arq_redis_settings(settings.redis_url)
+    if redis_settings is None:
+        return False
+
+    redis_pool = None
+    try:
+        redis_pool = await arq_create_pool(redis_settings)
+        await redis_pool.enqueue_job(function_name, *args)
+        return True
+    except Exception:
+        logger.warning(
+            "enqueue ARQ job %s failed, fallback to local execution", function_name, exc_info=True
+        )
+        return False
+    finally:
+        if redis_pool is not None:
+            await _close_arq_pool(redis_pool)
+
+
+async def _dispatch_spelling_grammar_qa_segments(
+    file_record_id: UUID, segment_ids: list[UUID]
+) -> None:
+    """优先把拼写语法 QA 投递到 arq worker 执行，未启用 arq 时回退到本地线程池。
+
+    这样 LanguageTool 的网络请求与相关数据库写入都发生在独立 worker 进程，
+    不再占用 web 进程的数据库连接池。
+    """
+    if not segment_ids:
+        return
+    if await _enqueue_arq_job(
+        "spelling_grammar_qa_segments_job",
+        str(file_record_id),
+        [str(segment_id) for segment_id in segment_ids],
+    ):
+        return
+    await asyncio.to_thread(run_spelling_grammar_qa_for_segment_ids, file_record_id, segment_ids)
+
+
+async def _dispatch_spelling_grammar_qa_project(project_id: UUID) -> None:
+    if await _enqueue_arq_job("spelling_grammar_qa_project_job", str(project_id)):
+        return
+    await asyncio.to_thread(run_spelling_grammar_qa_for_project, project_id)
+
+
+async def _dispatch_auto_tm_background() -> None:
+    """优先把 auto-TM 处理投递到 arq worker，未启用 arq 时回退到本地线程池。"""
+    if await _enqueue_arq_job("auto_tm_background_job"):
+        return
+    await asyncio.to_thread(run_auto_tm_background_once)
 
 
 async def _queue_import_task(
@@ -958,8 +1017,31 @@ async def process_import_task_job(ctx, task_id: str, payload: dict[str, Any]) ->
     await asyncio.to_thread(_run_import_task, task_id, payload)
 
 
+async def spelling_grammar_qa_segments_job(
+    ctx, file_record_id: str, segment_ids: list[str]
+) -> None:
+    await asyncio.to_thread(
+        run_spelling_grammar_qa_for_segment_ids,
+        UUID(file_record_id),
+        [UUID(segment_id) for segment_id in segment_ids],
+    )
+
+
+async def spelling_grammar_qa_project_job(ctx, project_id: str) -> None:
+    await asyncio.to_thread(run_spelling_grammar_qa_for_project, UUID(project_id))
+
+
+async def auto_tm_background_job(ctx) -> None:
+    await asyncio.to_thread(run_auto_tm_background_once)
+
+
 class WorkerSettings:
-    functions = [process_import_task_job]
+    functions = [
+        process_import_task_job,
+        spelling_grammar_qa_segments_job,
+        spelling_grammar_qa_project_job,
+        auto_tm_background_job,
+    ]
     redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
 
 
@@ -3250,7 +3332,7 @@ def _require_same_tm_collection_language_pair(
 
 
 @router.post("/parser/slate")
-async def upload_for_slate(
+def upload_for_slate(
     file: UploadFile = File(...),
     threshold: float = Form(default=0.6),
     collection_ids: list[UUID] | None = Form(default=None),
@@ -3259,10 +3341,12 @@ async def upload_for_slate(
     """上传文件并解析为 Slate 编辑器格式
 
     目前仅支持 DOCX 格式。
+
+    定义为同步 def，由 FastAPI 调度到线程池执行，避免解析/数据库等阻塞操作卡住事件循环。
     """
     _validate_docx_upload(file)
 
-    raw_bytes = await file.read()
+    raw_bytes = file.file.read()
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="文件为空。")
 
@@ -3308,17 +3392,19 @@ async def upload_for_workspace(
 
 
 @router.post("/parser/parse")
-async def parse_document(
+def parse_document(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
     """通用文档解析接口
 
     使用适配器系统解析多种格式的文档。
+
+    定义为同步 def，由 FastAPI 调度到线程池执行，避免 CPU 密集的解析阻塞事件循环。
     """
     ext = _validate_file_upload(file)
 
-    raw_bytes = await file.read()
+    raw_bytes = file.file.read()
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="文件为空。")
 
@@ -5669,7 +5755,7 @@ def update_project_quality_qa_settings(
     db.commit()
     db.refresh(project)
     if normalized["spelling_grammar"]["enabled"]:
-        background_tasks.add_task(run_spelling_grammar_qa_for_project, project.id)
+        background_tasks.add_task(_dispatch_spelling_grammar_qa_project, project.id)
     return _serialize_quality_qa_settings_response(db, project)
 
 
@@ -5867,17 +5953,18 @@ def remove_issue_marker(
 
 
 @router.post("/projects/{project_id}/detect-source-language")
-async def detect_project_source_language(
+def detect_project_source_language(
     project_id: UUID,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
+    # 定义为同步 def，由 FastAPI 调度到线程池执行，避免语言识别的 CPU 操作阻塞事件循环。
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在。")
 
-    raw_bytes = await file.read()
+    raw_bytes = file.file.read()
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="文件为空，无法识别语言。")
 
@@ -6273,12 +6360,18 @@ def _schedule_spelling_grammar_qa_for_segments(
     file_record: FileRecord,
     segments: Iterable[Segment],
 ) -> None:
+    if background_tasks is None:
+        return
     segment_ids = [
         segment.id
         for segment in segments
         if normalize_text(getattr(segment, "target_text", "") or "")
     ]
-    schedule_spelling_grammar_qa(background_tasks, file_record.id, segment_ids)
+    if not segment_ids:
+        return
+    background_tasks.add_task(
+        _dispatch_spelling_grammar_qa_segments, file_record.id, segment_ids
+    )
 
 
 def _serialize_segment_update_conflict(conflict) -> dict:
@@ -6299,7 +6392,7 @@ def _schedule_auto_tm_processing(
     summary: AutoTMEnqueueSummary,
 ) -> None:
     if background_tasks is not None and summary.queued_count > 0:
-        background_tasks.add_task(run_auto_tm_background_once)
+        background_tasks.add_task(_dispatch_auto_tm_background)
 
 
 def _notify_tm_collections_changed(
@@ -9430,6 +9523,14 @@ async def extract_file_record_terms(
     if not segments:
         raise HTTPException(status_code=400, detail="当前文件没有可用于术语提取的已解析句段。")
 
+    # 捕获响应所需的纯数据，并在 LLM 调用前释放请求级连接：
+    # 术语提取需要多次调用 LLM（可能耗时数十秒），期间不应一直占用连接池连接。
+    file_record_id_value = file_record.id
+    file_record_filename = file_record.filename
+    file_record_term_base_id = file_record.term_base_id
+    total_segments = len(segments)
+    db.close()
+
     extractions = []
     extraction_errors: list[dict[str, str | int]] = []
     for model in selected_models:
@@ -9456,20 +9557,27 @@ async def extract_file_record_terms(
         detail = str(extraction_errors[0]["message"]) if extraction_errors else "术语提取失败。"
         raise HTTPException(status_code=status_code, detail=detail)
 
-    results = []
-    for extraction in extractions:
-        terms = _serialize_term_extraction_items(db, term_base, extraction.terms)
-        results.append({
-            "provider": extraction.provider,
-            "model": extraction.model,
-            "terms": terms,
-            "total": len(terms),
-        })
-    merged_terms = _serialize_term_extraction_items(
-        db,
-        term_base,
-        merge_extracted_terms(extractions, max_terms=body.max_terms),
-    )
+    # LLM 调用完成后，使用独立短事务连接进行术语库查重与序列化。
+    with SessionLocal() as serialize_db:
+        serialize_term_base = (
+            serialize_db.query(TermBase).filter(TermBase.id == target_term_base_id).first()
+            if target_term_base_id is not None
+            else None
+        )
+        results = []
+        for extraction in extractions:
+            terms = _serialize_term_extraction_items(serialize_db, serialize_term_base, extraction.terms)
+            results.append({
+                "provider": extraction.provider,
+                "model": extraction.model,
+                "terms": terms,
+                "total": len(terms),
+            })
+        merged_terms = _serialize_term_extraction_items(
+            serialize_db,
+            serialize_term_base,
+            merge_extracted_terms(extractions, max_terms=body.max_terms),
+        )
     default_terms = merged_terms if len(results) > 1 else (results[0]["terms"] if results else [])
     primary_result = results[0] if results else {
         "provider": "openrouter",
@@ -9480,12 +9588,12 @@ async def extract_file_record_terms(
 
     return {
         "file_record": {
-            "id": str(file_record.id),
-            "filename": file_record.filename,
-            "term_base_id": str(file_record.term_base_id) if file_record.term_base_id else None,
-            "total_segments": len(segments),
+            "id": str(file_record_id_value),
+            "filename": file_record_filename,
+            "term_base_id": str(file_record_term_base_id) if file_record_term_base_id else None,
+            "total_segments": total_segments,
         },
-        "term_base_id": str(term_base.id) if term_base else None,
+        "term_base_id": str(target_term_base_id) if target_term_base_id else None,
         "source_language": source_language,
         "target_language": target_language,
         "provider": primary_result["provider"],
@@ -9596,7 +9704,185 @@ async def llm_translate_file_record(
         if task.should_translate
     }
 
+    current_user_id = current_user.id if current_user else None
+
+    def _expand_sentence_ids(representative_sentence_id: str) -> list[str]:
+        return deduplication.result_sentence_ids_by_representative.get(
+            representative_sentence_id,
+            [representative_sentence_id],
+        )
+
+    def _persist_llm_results(batch: list) -> tuple[list[tuple[str, dict]], int]:
+        """在独立短事务中写回一批 LLM 翻译结果，返回 (待下发事件, 成功写回数量)。
+
+        每次调用使用全新的 SessionLocal，仅在写回期间短暂占用连接；LLM 调用过程中
+        不持有任何数据库连接，从而避免长时间流式翻译把连接池占满，也不会阻塞事件循环。
+        """
+        events: list[tuple[str, dict]] = []
+        updated = 0
+        with SessionLocal() as fdb:
+            fr = fdb.query(FileRecord).filter(FileRecord.id == file_record_id).first()
+            if fr is None:
+                for result in batch:
+                    for sentence_id in _expand_sentence_ids(result.sentence_id):
+                        target_task = target_task_by_sentence_id.get(sentence_id)
+                        events.append((
+                            "error",
+                            {
+                                "sentence_id": sentence_id,
+                                "status": target_task.status if target_task else result.status,
+                                "message": "片段所属文件不存在，无法写回 LLM 译文。",
+                            },
+                        ))
+                return events, 0
+
+            user = (
+                fdb.query(User).filter(User.id == current_user_id).first()
+                if current_user_id
+                else None
+            )
+            needed_sentence_ids = [
+                sentence_id
+                for result in batch
+                for sentence_id in _expand_sentence_ids(result.sentence_id)
+            ]
+            seg_map = {
+                segment.sentence_id: segment
+                for segment in (
+                    fdb.query(Segment)
+                    .filter(
+                        Segment.file_record_id == file_record_id,
+                        Segment.sentence_id.in_(needed_sentence_ids),
+                    )
+                    .all()
+                )
+            }
+            is_word_document = is_word_document_filename(fr.filename)
+
+            for result in batch:
+                try:
+                    ensure_file_record_write_allowed(fdb, fr, operation_token=operation_token)
+                except Exception as exc:  # noqa: BLE001
+                    fdb.rollback()
+                    for sentence_id in _expand_sentence_ids(result.sentence_id):
+                        target_task = target_task_by_sentence_id.get(sentence_id)
+                        events.append((
+                            "error",
+                            {
+                                "sentence_id": sentence_id,
+                                "status": target_task.status if target_task else result.status,
+                                "message": f"数据库更新失败：{exc}",
+                            },
+                        ))
+                    continue
+
+                for sentence_id in _expand_sentence_ids(result.sentence_id):
+                    target_task = target_task_by_sentence_id.get(sentence_id)
+                    segment = seg_map.get(sentence_id)
+                    if not segment:
+                        events.append((
+                            "error",
+                            {
+                                "sentence_id": sentence_id,
+                                "status": target_task.status if target_task else result.status,
+                                "message": "片段不存在，无法写回 LLM 译文。",
+                            },
+                        ))
+                        continue
+
+                    try:
+                        _require_segment_work_access(fdb, fr, segment, user)
+                    except HTTPException as exc:
+                        events.append((
+                            "error",
+                            {
+                                "sentence_id": sentence_id,
+                                "status": target_task.status if target_task else result.status,
+                                "message": str(exc.detail),
+                            },
+                        ))
+                        continue
+
+                    try:
+                        with fdb.begin_nested():
+                            before_text = segment.target_text
+                            translated_text = (
+                                strip_automatic_numbering_prefix(
+                                    result.translated_text,
+                                    source_text=segment.source_text,
+                                    display_text=segment.display_text,
+                                    reference_texts=[segment.matched_source_text],
+                                )
+                                if is_word_document
+                                else result.translated_text
+                            )
+                            segment.target_text = translated_text
+                            segment.target_html = None
+                            segment.source = "llm"
+                            segment.version = int(segment.version or 1) + 1
+                            segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
+                            segment.llm_provider = result.provider
+                            segment.llm_model = result.model
+                            segment.status = _resolve_unconfirmed_segment_status(segment)
+
+                            if (before_text or "") != (translated_text or ""):
+                                fdb.add(SegmentRevision(
+                                    file_record_id=file_record_id,
+                                    segment_id=segment.id,
+                                    sentence_id=segment.sentence_id,
+                                    before_text=before_text or "",
+                                    after_text=translated_text or "",
+                                    source="llm",
+                                    status="pending",
+                                    author_id=current_user_id,
+                                ))
+                            record_translation_metric_event(
+                                fdb,
+                                segment=segment,
+                                before_text=before_text,
+                                after_text=translated_text,
+                                source="llm",
+                                current_user=user,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        events.append((
+                            "error",
+                            {
+                                "sentence_id": sentence_id,
+                                "status": target_task.status if target_task else result.status,
+                                "message": f"数据库更新失败：{exc}",
+                            },
+                        ))
+                        continue
+
+                    updated += 1
+                    events.append((
+                        "segment",
+                        {
+                            "sentence_id": segment.sentence_id,
+                            "target_text": segment.target_text,
+                            "status": segment.status,
+                            "source": segment.source,
+                            "provider": result.provider,
+                            "model": result.model,
+                        },
+                    ))
+
+            fdb.commit()
+        return events, updated
+
+    def _finalize_file_record_status() -> None:
+        with SessionLocal() as fdb:
+            try:
+                sync_file_record_status(fdb, file_record_id)
+                fdb.commit()
+            except Exception:  # noqa: BLE001
+                fdb.rollback()
+
     async def event_stream():
+        # 准备阶段已取完所需数据，立即归还请求级连接；后续写回使用独立短事务连接，
+        # 避免在数分钟的流式翻译过程中一直占用连接池中的连接。
+        db.close()
         updated_count = 0
         error_count = 0
         total_count = sum(1 for task in translation_tasks if task.should_translate)
@@ -9630,16 +9916,21 @@ async def llm_translate_file_record(
             )
             return
 
-        # Pre-load all segments into memory to avoid per-item SELECT
-        all_segments = (
-            db.query(Segment)
-            .filter(Segment.file_record_id == file_record_id)
-            .all()
-        )
-        seg_map = {s.sentence_id: s for s in all_segments}
+        FLUSH_INTERVAL = 10
+        pending_results: list = []
 
-        COMMIT_INTERVAL = 50
-        uncommitted_count = 0
+        async def flush_pending():
+            nonlocal updated_count, error_count, pending_results
+            if not pending_results:
+                return
+            batch = pending_results
+            pending_results = []
+            events, updated = await asyncio.to_thread(_persist_llm_results, batch)
+            updated_count += updated
+            for event_name, event_data in events:
+                if event_name == "error":
+                    error_count += 1
+                yield _sse_event(event_name, event_data)
 
         async for result in iter_batch_translate(
             deduplication.tasks,
@@ -9649,15 +9940,12 @@ async def llm_translate_file_record(
             model_override=requested_model,
         ):
             if await request.is_disconnected():
-                db.rollback()
                 return
 
             if isinstance(result, LLMTranslationFailure):
-                sentence_ids = deduplication.result_sentence_ids_by_representative.get(
-                    result.sentence_id,
-                    [result.sentence_id],
-                )
-                for sentence_id in sentence_ids:
+                async for event in flush_pending():
+                    yield event
+                for sentence_id in _expand_sentence_ids(result.sentence_id):
                     target_task = target_task_by_sentence_id.get(sentence_id)
                     error_count += 1
                     yield _sse_event(
@@ -9670,142 +9958,16 @@ async def llm_translate_file_record(
                     )
                 continue
 
-            try:
-                ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
-            except Exception as exc:  # noqa: BLE001
-                db.rollback()
-                sentence_ids = deduplication.result_sentence_ids_by_representative.get(
-                    result.sentence_id,
-                    [result.sentence_id],
-                )
-                for sentence_id in sentence_ids:
-                    target_task = target_task_by_sentence_id.get(sentence_id)
-                    error_count += 1
-                    yield _sse_event(
-                        "error",
-                        {
-                            "sentence_id": sentence_id,
-                            "status": target_task.status if target_task else result.status,
-                            "message": f"数据库更新失败：{exc}",
-                        },
-                    )
-                continue
+            pending_results.append(result)
+            if len(pending_results) >= FLUSH_INTERVAL:
+                async for event in flush_pending():
+                    yield event
 
-            sentence_ids = deduplication.result_sentence_ids_by_representative.get(
-                result.sentence_id,
-                [result.sentence_id],
-            )
-            for sentence_id in sentence_ids:
-                target_task = target_task_by_sentence_id.get(sentence_id)
-                segment = seg_map.get(sentence_id)
-                if not segment:
-                    error_count += 1
-                    yield _sse_event(
-                        "error",
-                        {
-                            "sentence_id": sentence_id,
-                            "status": target_task.status if target_task else result.status,
-                            "message": "片段不存在，无法写回 LLM 译文。",
-                        },
-                    )
-                    continue
+        async for event in flush_pending():
+            yield event
 
-                try:
-                    _require_segment_work_access(db, file_record, segment, current_user)
-                except HTTPException as exc:
-                    error_count += 1
-                    yield _sse_event(
-                        "error",
-                        {
-                            "sentence_id": sentence_id,
-                            "status": target_task.status if target_task else result.status,
-                            "message": str(exc.detail),
-                        },
-                    )
-                    continue
-
-                try:
-                    before_text = segment.target_text
-                    translated_text = (
-                        strip_automatic_numbering_prefix(
-                            result.translated_text,
-                            source_text=segment.source_text,
-                            display_text=segment.display_text,
-                            reference_texts=[segment.matched_source_text],
-                        )
-                        if is_word_document_filename(file_record.filename)
-                        else result.translated_text
-                    )
-                    segment.target_text = translated_text
-                    segment.target_html = None
-                    segment.source = "llm"
-                    segment.version = int(segment.version or 1) + 1
-                    segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
-                    segment.llm_provider = result.provider
-                    segment.llm_model = result.model
-                    segment.status = _resolve_unconfirmed_segment_status(segment)
-
-                    if (before_text or "") != (translated_text or ""):
-                        db.add(SegmentRevision(
-                            file_record_id=file_record_id,
-                            segment_id=segment.id,
-                            sentence_id=segment.sentence_id,
-                            before_text=before_text or "",
-                            after_text=translated_text or "",
-                            source="llm",
-                            status="pending",
-                            author_id=current_user.id if current_user else None,
-                        ))
-                    record_translation_metric_event(
-                        db,
-                        segment=segment,
-                        before_text=before_text,
-                        after_text=translated_text,
-                        source="llm",
-                        current_user=current_user,
-                    )
-
-                    uncommitted_count += 1
-                    if uncommitted_count >= COMMIT_INTERVAL:
-                        db.commit()
-                        uncommitted_count = 0
-
-                except Exception as exc:  # noqa: BLE001
-                    db.rollback()
-                    uncommitted_count = 0
-                    error_count += 1
-                    yield _sse_event(
-                        "error",
-                        {
-                            "sentence_id": sentence_id,
-                            "status": target_task.status if target_task else result.status,
-                            "message": f"数据库更新失败：{exc}",
-                        },
-                    )
-                    continue
-
-                updated_count += 1
-                yield _sse_event(
-                    "segment",
-                    {
-                        "sentence_id": segment.sentence_id,
-                        "target_text": segment.target_text,
-                        "status": segment.status,
-                        "source": segment.source,
-                        "provider": result.provider,
-                        "model": result.model,
-                    },
-                )
-
-        # Final commit for remaining + sync status once
-        try:
-            if uncommitted_count > 0:
-                db.commit()
-            if updated_count > 0:
-                sync_file_record_status(db, file_record_id)
-                db.commit()
-        except Exception:  # noqa: BLE001
-            db.rollback()
+        if updated_count > 0:
+            await asyncio.to_thread(_finalize_file_record_status)
 
         if not await request.is_disconnected():
             yield _sse_event(
@@ -10450,7 +10612,7 @@ async def preview_tm_xlsx(
 @router.post("/tm/import-xlsx", include_in_schema=False)
 @router.post("/translation-memory/import", include_in_schema=False)
 @router.post("/tm/import", include_in_schema=False)
-async def import_tm_xlsx(
+def import_tm_xlsx(
     file: UploadFile = File(...),
     collection_id: UUID | None = Form(default=None),
     source_language: str = Form(...),
@@ -10461,9 +10623,10 @@ async def import_tm_xlsx(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
+    # 定义为同步 def，由 FastAPI 调度到线程池执行，避免大文件导入的解析/写库阻塞事件循环。
     extension = _validate_tm_import_upload(file)
 
-    raw_bytes = await file.read()
+    raw_bytes = file.file.read()
     _validate_tm_import_upload(file, raw_bytes)
 
     collection = _get_collection_or_404(db, collection_id)
@@ -11127,17 +11290,18 @@ def delete_term(
 
 @router.post("/termbase/import-xlsx")
 @router.post("/termbase/import", include_in_schema=False)
-async def import_termbase_xlsx(
+def import_termbase_xlsx(
     file: UploadFile = File(...),
     collection_id: UUID | None = Form(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
+    # 定义为同步 def，由 FastAPI 调度到线程池执行，避免术语库导入的解析/写库阻塞事件循环。
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
     if extension not in TERM_IMPORT_EXTENSIONS:
         raise HTTPException(status_code=400, detail="仅支持上传 .tmx、.xls、.xlsx 或 .csv 文件。")
 
-    raw_bytes = await file.read()
+    raw_bytes = file.file.read()
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="上传的术语文件为空。")
 

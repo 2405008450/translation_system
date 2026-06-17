@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user, require_admin
+from app.config import get_settings
 from app.database import get_db
 from app.models import FileRecord, TermBase, TermEntry, User
 from app.services.language_pairs import require_language_pair
@@ -560,6 +561,7 @@ async def preview_term_base_xlsx(
             target_language=resolved_target_language,
             preview_limit=max(1, min(preview_limit, 500)),
             skip_header=skip_header,
+            max_scan_rows=get_settings().term_import_preview_max_scan_rows,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"术语库预览失败：{exc}") from exc
@@ -584,6 +586,8 @@ async def preview_term_base_xlsx(
         "skipped_empty_rows": preview.skipped_empty_rows,
         "skipped_header_rows": preview.skipped_header_rows,
         "preview_limit": preview.preview_limit,
+        "scanned_rows": preview.scanned_rows,
+        "truncated": preview.truncated,
         "term_base_id": str(term_base.id) if term_base else None,
         "term_base_name": term_base.name if term_base else "",
         "source_language": resolved_source_language,

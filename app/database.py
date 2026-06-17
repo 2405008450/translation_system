@@ -8,8 +8,16 @@ from app.config import get_settings
 
 settings = get_settings()
 
-connect_args = {"connect_timeout": 5}
-if settings.tz:
+connect_args: dict[str, object] = {"connect_timeout": 5}
+if settings.database_application_name:
+    connect_args["application_name"] = settings.database_application_name
+
+if settings.database_pgbouncer_transaction_mode:
+    # 事务级连接池(PgBouncer transaction mode)下必须关闭服务端预备语句，否则会因
+    # 同一客户端被分配到不同后端连接而报 "prepared statement does not exist"。
+    connect_args["prepare_threshold"] = None
+    # 事务池化下会话级 SET 不可靠，时区改由 Postgres 服务端默认时区保证(部署时已设置)。
+elif settings.tz:
     connect_args["options"] = f"-c timezone={settings.tz}"
 
 engine_kwargs = {

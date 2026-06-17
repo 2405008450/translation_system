@@ -22,8 +22,8 @@ services:
       - app_export_tasks:/app/data/export_tasks
       - app_logs:/app/logs
     depends_on:
-      postgres:
-        condition: service_healthy
+      pgbouncer:
+        condition: service_started
       redis:
         condition: service_healthy
       languagetool:
@@ -44,13 +44,14 @@ services:
       EXPORT_TASK_DIR: /app/data/export_tasks
       LIBREOFFICE_SOFFICE_PATH: /usr/bin/libreoffice
       LIBREOFFICE_PYTHON_PATH: /usr/bin/python3
+      DATABASE_APPLICATION_NAME: ai-translation-worker
     volumes:
       - app_file_storage:/app/data/file_records
       - app_export_tasks:/app/data/export_tasks
       - app_logs:/app/logs
     depends_on:
-      postgres:
-        condition: service_healthy
+      pgbouncer:
+        condition: service_started
       redis:
         condition: service_healthy
     restart: unless-stopped
@@ -58,7 +59,8 @@ services:
   postgres:
     image: pgvector/pgvector:pg17
     container_name: ai-translation-postgres
-    command: ["postgres", "-c", "timezone=${TZ:-Asia/Shanghai}"]
+    # max_connections 需覆盖 PgBouncer 后端连接(DEFAULT_POOL_SIZE+RESERVE_POOL_SIZE 等)并留出余量。
+    command: ["postgres", "-c", "timezone=${TZ:-Asia/Shanghai}", "-c", "max_connections=200"]
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       PGTZ: ${TZ:-Asia/Shanghai}
@@ -76,6 +78,32 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
+
+  pgbouncer:
+    image: edoburu/pgbouncer:1.22.1
+    container_name: ai-translation-pgbouncer
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ${POSTGRES_USER:?请在 .env.prod 中设置 POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env.prod 中设置 POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB:?请在 .env.prod 中设置 POSTGRES_DB}
+      LISTEN_PORT: "6432"
+      # 事务级池化：连接只在事务期间占用真实 Postgres backend，应用侧 idle 连接不再占后端。
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: "1000"
+      DEFAULT_POOL_SIZE: "50"
+      MIN_POOL_SIZE: "5"
+      RESERVE_POOL_SIZE: "10"
+      RESERVE_POOL_TIMEOUT: "3"
+      AUTH_TYPE: scram-sha-256
+      # psycopg/SQLAlchemy 可能发送这些启动参数，事务池化下需忽略以避免连接被拒。
+      IGNORE_STARTUP_PARAMETERS: extra_float_digits,options
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
   redis:

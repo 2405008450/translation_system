@@ -18,7 +18,9 @@ ENV TZ=Asia/Shanghai \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     LIBREOFFICE_SOFFICE_PATH=/usr/bin/libreoffice \
-    LIBREOFFICE_PYTHON_PATH=/usr/bin/python3
+    LIBREOFFICE_PYTHON_PATH=/usr/bin/python3 \
+    WEB_CONCURRENCY=4 \
+    FORWARDED_ALLOW_IPS=*
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -50,6 +52,7 @@ RUN python -m pip install --upgrade pip \
 COPY app ./app
 COPY scripts ./scripts
 COPY prompt_templates ./prompt_templates
+COPY gunicorn.conf.py ./gunicorn.conf.py
 COPY --from=frontend-builder /build/frontend/dist ./frontend/dist
 
 RUN mkdir -p /app/data/file_records /app/data/export_tasks /app/logs
@@ -59,4 +62,5 @@ EXPOSE 19013
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:19013/api/health', timeout=3).read()"
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "19013", "--proxy-headers"]
+# 使用 gunicorn 管理多个 UvicornWorker 进程以支撑并发；详细参数见 gunicorn.conf.py。
+CMD ["gunicorn", "app.main:app", "-c", "gunicorn.conf.py"]

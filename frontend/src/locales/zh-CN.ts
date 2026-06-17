@@ -132,7 +132,7 @@ export default {
   auth: {
     login: '登录',
     initialize: '初始化超级管理员',
-    subtitleLogin: '输入账号密码进入翻译工作台',
+    subtitleLogin: '输入账号密码进入综合管理平台',
     subtitleInit: '系统当前还没有用户，请先创建超级管理员账号',
     username: '用户名',
     password: '密码',
@@ -209,7 +209,7 @@ export default {
     },
   },
   login: {
-    kicker: '翻译工作台',
+    kicker: '综合管理平台',
   },
   dashboard: {
     title: '系统数据看板',

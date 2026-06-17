@@ -22,6 +22,7 @@ XLS_EXTENSIONS = {".xls"}
 XLSX_EXTENSIONS = {".xlsx"}
 TERM_IMPORT_EXTENSIONS = CSV_EXTENSIONS | TMX_EXTENSIONS | XLS_EXTENSIONS | XLSX_EXTENSIONS
 TERM_STATUS_LOOKUP_CHUNK_SIZE = 10000
+TERM_PREVIEW_MAX_SCAN_ROWS = 5000
 HEADER_ALIASES = {
     ("source", "target"),
     ("source_term", "target_term"),
@@ -68,6 +69,8 @@ class TermImportPreview:
     skipped_empty_rows: int
     skipped_header_rows: int
     preview_limit: int
+    scanned_rows: int
+    truncated: bool
 
 
 def import_terms_from_xlsx_upload(
@@ -230,6 +233,7 @@ def preview_terms_from_upload(
     term_base_id: UUID | None,
     preview_limit: int = 100,
     skip_header: bool = False,
+    max_scan_rows: int = TERM_PREVIEW_MAX_SCAN_ROWS,
 ) -> TermImportPreview:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
@@ -249,8 +253,13 @@ def preview_terms_from_upload(
     skipped_header_rows = 0
     total_rows = 0
     duplicate_rows = 0
+    safe_max_scan_rows = max(1, int(max_scan_rows or TERM_PREVIEW_MAX_SCAN_ROWS))
+    truncated = False
 
     for row_index, row in enumerate(rows, start=1):
+        if row_index > safe_max_scan_rows:
+            truncated = True
+            break
         total_rows += 1
         source_text = normalize_text(_cell_to_text(row, 0))
         target_text = normalize_text(_cell_to_text(row, 1))
@@ -359,6 +368,8 @@ def preview_terms_from_upload(
         skipped_empty_rows=skipped_empty_rows,
         skipped_header_rows=skipped_header_rows,
         preview_limit=preview_limit,
+        scanned_rows=total_rows,
+        truncated=truncated,
     )
 
 

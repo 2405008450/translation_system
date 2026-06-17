@@ -1016,6 +1016,8 @@ export interface TermImportPreview {
   skipped_empty_rows: number
   skipped_header_rows: number
   preview_limit: number
+  scanned_rows: number
+  truncated: boolean
   term_base_id: string | null
   term_base_name: string
   source_language: string

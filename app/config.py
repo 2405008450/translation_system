@@ -16,6 +16,15 @@ class Settings(BaseSettings):
     database_max_overflow: int = 20
     database_pool_timeout: int = 60
     database_pool_recycle: int = 1800
+    # 当通过 PgBouncer 等事务级连接池中间件访问数据库时置为 True：
+    # 会关闭 psycopg 的服务端预备语句，并放弃会话级时区设置（改由服务端默认时区保证）。
+    database_pgbouncer_transaction_mode: bool = False
+    # 写入每个数据库连接的 application_name，便于在 pg_stat_activity 中区分来源。
+    database_application_name: str = "ai-translation"
+    # 同步接口/后台任务运行所用线程池大小（anyio 默认 40）。设置时应与每进程数据库
+    # 连接池容量(pool_size + max_overflow)及 PgBouncer 池大小协调，避免线程数远超可用连接。
+    server_threadpool_size: int | None = None
+    term_import_preview_max_scan_rows: int = 5000
     file_storage_dir: str = "data/file_records"
     export_task_dir: str = "data/export_tasks"
     upload_max_size_mb: int = 10

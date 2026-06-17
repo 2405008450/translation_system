@@ -137,13 +137,16 @@ const overrides = {
   auth: {
     login: 'Log in',
     initialize: 'Initialize super admin',
-    subtitleLogin: 'Enter your account and password to open the translation workbench',
+    subtitleLogin: 'Enter your account and password to access the management platform',
     subtitleInit: 'No users exist yet. Create a super admin account first.',
     username: 'Username',
     password: 'Password',
     submitLoading: 'Submitting...',
     statusError: 'Unable to fetch initialization status. Please make sure the backend is running.',
     requestError: 'Request failed. Please try again later.',
+  },
+  login: {
+    kicker: 'Management Platform',
   },
   workbench: {
     search: {

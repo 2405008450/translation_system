@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
+import anyio.to_thread
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -20,9 +22,28 @@ from app.services.schema_setup import ensure_runtime_schema
 
 
 configure_logging()
+logger = logging.getLogger(__name__)
 settings = get_settings()
 validate_runtime_settings(settings)
 ensure_runtime_schema()
+
+
+def _engine_pool_stats() -> dict[str, int | str]:
+    """返回 SQLAlchemy 连接池的实时使用情况，便于监控连接是否接近打满。"""
+    pool = engine.pool
+    stats: dict[str, int | str] = {}
+    for key, getter in (
+        ("size", getattr(pool, "size", None)),
+        ("checked_in", getattr(pool, "checkedin", None)),
+        ("checked_out", getattr(pool, "checkedout", None)),
+        ("overflow", getattr(pool, "overflow", None)),
+    ):
+        if callable(getter):
+            try:
+                stats[key] = getter()
+            except Exception:  # noqa: BLE001
+                continue
+    return stats
 frontend_dist_dir = Path("frontend/dist")
 frontend_assets_dir = frontend_dist_dir / "assets"
 
@@ -43,6 +64,23 @@ app.include_router(reference_router, prefix="/api")
 app.include_router(glossary_base_router, prefix="/api")
 
 
+@app.on_event("startup")
+async def _configure_runtime() -> None:
+    # 同步接口由 FastAPI 调度到 anyio 线程池执行，按需调大其容量以匹配并发与连接池规模。
+    if settings.server_threadpool_size and settings.server_threadpool_size > 0:
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        limiter.total_tokens = settings.server_threadpool_size
+        logger.info("anyio thread pool size set to %s", settings.server_threadpool_size)
+    logger.info(
+        "DB pool config: pool_size=%s max_overflow=%s pool_timeout=%s pgbouncer_mode=%s application_name=%s",
+        settings.database_pool_size,
+        settings.database_max_overflow,
+        settings.database_pool_timeout,
+        settings.database_pgbouncer_transaction_mode,
+        settings.database_application_name,
+    )
+
+
 @app.get("/api/health", include_in_schema=False)
 def health_check():
     try:
@@ -50,7 +88,7 @@ def health_check():
             connection.execute(text("SELECT 1"))
     except Exception as exc:
         raise HTTPException(status_code=503, detail="数据库连接不可用。") from exc
-    return {"status": "ok", "database": "ok"}
+    return {"status": "ok", "database": "ok", "db_pool": _engine_pool_stats()}
 
 
 if frontend_assets_dir.exists():
