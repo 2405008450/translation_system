@@ -320,7 +320,7 @@ export default {
       current: '当前状态',
       languagePair: '语言对',
       progress: '处理进度',
-      confirmedProgress: '确认进度',
+      confirmedProgress: '总进度',
       totalSegments: '句段总数',
       creator: '创建人',
       access: '访问权限',
@@ -431,7 +431,7 @@ export default {
       columns: {
         index: '序号',
         details: '文件详情',
-        progress: '确认进度',
+        progress: '总进度',
         pretranslationProgress: '预翻译进度',
         task: '任务管理',
         status: '状态',

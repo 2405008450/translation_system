@@ -1796,6 +1796,46 @@ def _build_workflow_progress_payload(
     return payload
 
 
+def _clamp_progress_value(value: Any) -> int:
+    try:
+        progress = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(100, progress))
+
+
+def _calculate_workflow_overall_progress(
+    workflow_progress: list[dict[str, Any]] | None,
+    fallback_progress: int,
+) -> int:
+    fallback = _clamp_progress_value(fallback_progress)
+    if not workflow_progress:
+        return fallback
+
+    completed_units = 0
+    total_units = 0
+    progress_values: list[int] = []
+    for item in workflow_progress:
+        if not isinstance(item, dict):
+            continue
+        progress_values.append(_clamp_progress_value(item.get("progress", 0)))
+        try:
+            total_segments = int(item.get("total_segments") or 0)
+            completed_segments = int(item.get("completed_segments") or 0)
+        except (TypeError, ValueError):
+            continue
+        if total_segments <= 0:
+            continue
+        total_units += total_segments
+        completed_units += max(0, min(completed_segments, total_segments))
+
+    if total_units > 0:
+        return calculate_file_record_progress(total_units, completed_units)
+    if progress_values:
+        return _clamp_progress_value(sum(progress_values) / len(progress_values))
+    return fallback
+
+
 def _get_file_workflow_progress(db: Session, file_record_ids: list[UUID]) -> dict[UUID, list[dict[str, Any]]]:
     if not file_record_ids:
         return {}
@@ -3932,7 +3972,7 @@ def _build_project_summary_payload(
 ) -> dict:
     progress = calculate_file_record_progress(total_segments, translated_segments)
     if workflow_progress:
-        progress = int(workflow_progress[-1].get("progress", progress))
+        progress = _calculate_workflow_overall_progress(workflow_progress, progress)
     pretranslation_progress = calculate_file_record_progress(total_segments, pretranslated_segments)
     effective_status = (
         resolve_file_record_status("in_progress", total_segments, translated_segments)
@@ -3993,7 +4033,7 @@ def _build_project_file_payload(
     )
     progress = calculate_file_record_progress(total_segments, translated_segments)
     if workflow_progress:
-        progress = int(workflow_progress[-1].get("progress", progress))
+        progress = _calculate_workflow_overall_progress(workflow_progress, progress)
     pretranslation_progress = calculate_file_record_progress(total_segments, pretranslated_segments)
     effective_status = resolve_file_record_status(
         file_record.status,
@@ -6181,13 +6221,12 @@ def get_file_records(
             "project_name": file_record.project.name if file_record.project else None,
             "filename": file_record.filename,
             "status": file_record.status,
-            "progress": (
-                int(file_workflow_progress.get(file_record.id, [{}])[-1].get("progress", 0))
-                if file_workflow_progress.get(file_record.id)
-                else calculate_file_record_progress(
+            "progress": _calculate_workflow_overall_progress(
+                file_workflow_progress.get(file_record.id, []),
+                calculate_file_record_progress(
                     file_stats.get(file_record.id, {"total": 0})["total"],
                     file_stats.get(file_record.id, {"filled": 0})["filled"],
-                )
+                ),
             ),
             "total_segments": file_stats.get(file_record.id, {"total": 0})["total"],
             "translated_segments": file_stats.get(file_record.id, {"filled": 0})["filled"],

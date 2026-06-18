@@ -234,7 +234,7 @@ const overrides = {
     createDialogTitle: 'New Project',
     createDialogDescription: 'After creating a project, upload documents from the project details page.',
     status: {
-      confirmedProgress: 'Confirmed progress',
+      confirmedProgress: 'Overall progress',
     },
   },
   projectDetail: {
@@ -265,7 +265,7 @@ const overrides = {
       openHint: 'Open the translation workbench',
       processingHint: 'The source document is uploaded and will be available after processing.',
       columns: {
-        progress: 'Confirmed progress',
+        progress: 'Overall progress',
         pretranslationProgress: 'Pre-translation progress',
       },
       actions: {
