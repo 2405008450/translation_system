@@ -7416,6 +7416,7 @@ def export_file_record_with_type(
             "target_text": seg.target_text,
             "status": seg.status,
             "matched_source_text": seg.matched_source_text,
+            "metadata": json.loads(seg.segment_metadata) if seg.segment_metadata else {},
         }
         for seg in segments
     ]
@@ -7821,12 +7822,22 @@ def merge_segment(
     if first_seg.workflow_step_id != second_seg.workflow_step_id:
         raise HTTPException(status_code=400, detail="只能合并处于同一流程阶段的句段。")
 
-    if (
-        first_seg.block_index != second_seg.block_index
-        or first_seg.row_index != second_seg.row_index
-        or first_seg.cell_index != second_seg.cell_index
-    ):
-        raise HTTPException(status_code=400, detail="只能合并同一区块内相邻的句段。")
+    # DWG/DXF 文件允许跨 block 合并（CAD 图纸中相邻实体可能是独立 block）
+    file_ext = (file_record.filename or "").lower().rsplit(".", 1)[-1] if file_record.filename else ""
+    is_cad_file = file_ext in ("dwg", "dxf")
+
+    if is_cad_file:
+        # CAD 文件：允许跨 block 合并，不强制检查相邻性
+        # 用户选择的句段即认为需要合并（CAD 图纸的实体位置关系复杂）
+        pass
+    else:
+        # 其他格式：保持原有严格校验（必须同一 block）
+        if (
+            first_seg.block_index != second_seg.block_index
+            or first_seg.row_index != second_seg.row_index
+            or first_seg.cell_index != second_seg.cell_index
+        ):
+            raise HTTPException(status_code=400, detail="只能合并同一区块内相邻的句段。")
 
     # 合并文本
     separator = "" if _is_cjk_text(first_seg.source_text) else " "
@@ -7834,6 +7845,96 @@ def merge_segment(
     merged_target = ""
     if (first_seg.target_text or "").strip() or (second_seg.target_text or "").strip():
         merged_target = (first_seg.target_text or "").rstrip() + separator + (second_seg.target_text or "").lstrip()
+
+    # 对于 CAD 文件，保存合并信息到 metadata（用于导出时清空被合并的实体）
+    if is_cad_file:
+        import json as _json
+        
+        # 解析两个句段的 metadata
+        first_metadata = {}
+        second_metadata = {}
+        try:
+            first_metadata = _json.loads(first_seg.segment_metadata or "{}")
+        except (TypeError, _json.JSONDecodeError):
+            pass
+        try:
+            second_metadata = _json.loads(second_seg.segment_metadata or "{}")
+        except (TypeError, _json.JSONDecodeError):
+            pass
+        
+        # 获取 handle 信息
+        first_handle = first_metadata.get("handle", "")
+        second_handle = second_metadata.get("handle", "")
+        
+        # 如果数据库中没有 handle（旧文件导入时未保存），尝试重新解析文件获取
+        if not first_handle or not second_handle:
+            try:
+                from app.services.adapters import get_registry
+                from app.services.document_storage import load_source_file
+                
+                source_filename = file_record.source_filename or file_record.filename
+                source_bytes = load_source_file(file_record.id, source_filename)
+                if source_bytes:
+                    registry = get_registry()
+                    adapter = registry.get_adapter(source_filename)
+                    parse_result = adapter.parse_with_validation(source_bytes, source_filename)
+                    
+                    # 按 source_text 匹配找到对应的 handle
+                    for seg in parse_result.segments:
+                        seg_metadata = getattr(seg, 'metadata', {}) or {}
+                        seg_handle = seg_metadata.get("handle", "")
+                        if seg_handle:
+                            if not first_handle and seg.source_text.strip() == first_seg.source_text.strip():
+                                first_handle = seg_handle
+                                first_metadata["handle"] = seg_handle
+                                first_metadata["x"] = seg_metadata.get("x", 0)
+                                first_metadata["y"] = seg_metadata.get("y", 0)
+                                first_metadata["height"] = seg_metadata.get("height", 2.5)
+                                first_metadata["layer"] = seg_metadata.get("layer", "0")
+                            elif not second_handle and seg.source_text.strip() == second_seg.source_text.strip():
+                                second_handle = seg_handle
+                                second_metadata["handle"] = seg_handle
+                                second_metadata["x"] = seg_metadata.get("x", 0)
+                                second_metadata["y"] = seg_metadata.get("y", 0)
+                                second_metadata["height"] = seg_metadata.get("height", 2.5)
+                                second_metadata["layer"] = seg_metadata.get("layer", "0")
+                        if first_handle and second_handle:
+                            break
+                    
+                    logger.info(
+                        "merge_segment: 从文件解析获取 handle first=%s second=%s",
+                        first_handle, second_handle
+                    )
+            except Exception as exc:
+                logger.warning("merge_segment: 获取 handle 失败: %s", exc)
+        
+        # 获取已有的合并 handles 列表（支持多次合并）
+        existing_merged_handles = first_metadata.get("merged_handles", [])
+        if not existing_merged_handles and first_handle:
+            existing_merged_handles = [first_handle]
+        
+        # 添加第二个句段的 handle
+        if second_handle and second_handle not in existing_merged_handles:
+            existing_merged_handles.append(second_handle)
+        
+        # 更新 metadata
+        first_metadata["is_merged"] = True
+        first_metadata["merged_handles"] = existing_merged_handles
+        first_metadata["primary_handle"] = first_handle or (existing_merged_handles[0] if existing_merged_handles else "")
+        
+        # 保存第二个实体的位置信息（用于清空时定位）
+        merged_entities = first_metadata.get("merged_entities", [])
+        if second_handle:
+            merged_entities.append({
+                "handle": second_handle,
+                "source_text": second_seg.source_text,
+                "x": second_metadata.get("x", 0),
+                "y": second_metadata.get("y", 0),
+                "height": second_metadata.get("height", 2.5),
+            })
+        first_metadata["merged_entities"] = merged_entities
+        
+        first_seg.segment_metadata = _json.dumps(first_metadata, ensure_ascii=False)
 
     # 更新第一个句段
     first_seg.source_text = merged_source.strip()

@@ -120,7 +120,14 @@ def export_translated_file(
     if ext == ".dwg":
         from app.services.adapters.dwg_exporter import DwgExporter
 
-        result = DwgExporter().export_with_extension(original_bytes, translations)
+        # 提取合并文本信息（用于 MTEXT 重建）
+        merged_text_info = _extract_merged_text_info(segments, translations)
+        
+        result = DwgExporter().export_with_extension(
+            original_bytes, 
+            translations,
+            merged_text_info=merged_text_info,
+        )
         actual_ext = result.extension
         mime_type = MIME_TYPES.get(actual_ext, mime_type)
         base_name = Path(filename).stem
@@ -219,7 +226,9 @@ def _export_by_format(
     # DWG（依赖 ODA File Converter）
     if ext == ".dwg":
         from app.services.adapters.dwg_exporter import DwgExporter
-        return DwgExporter().export(original_bytes, translations)
+        # 提取合并文本信息（用于 MTEXT 重建）
+        merged_text_info = _extract_merged_text_info(segments, translations)
+        return DwgExporter().export(original_bytes, translations, merged_text_info=merged_text_info)
 
     # ZIP
     if ext == ".zip":
@@ -342,3 +351,85 @@ def _get_segment_target(seg) -> str:
     if isinstance(seg, dict):
         return seg.get('target_text', '')
     return getattr(seg, 'target_text', '')
+
+
+def _extract_merged_text_info(segments: List, translations: Dict[str, str]) -> List[Dict]:
+    """从句段中提取合并文本信息
+    
+    用于 DWG/DXF 导出时的 MTEXT 重建。
+    
+    Args:
+        segments: 句段列表
+        translations: 源文本 -> 目标文本的映射
+        
+    Returns:
+        合并文本信息列表，每项包含:
+        - source_text: 原始合并后的源文本
+        - target_text: 翻译后的目标文本
+        - primary_handle: 主实体 handle
+        - merged_handles: 所有被合并的实体 handle 列表
+        - primary_x, primary_y, primary_height: 主实体位置和字高
+        - layer: 图层名
+    """
+    merged_info_list = []
+    
+    # 调试：统计有多少句段有 metadata
+    total_segments = len(segments)
+    segments_with_metadata = 0
+    segments_with_is_merged = 0
+    
+    for seg in segments:
+        # 获取 metadata
+        if isinstance(seg, dict):
+            metadata = seg.get('metadata', {})
+            source_text = seg.get('source_text', '')
+            target_text = seg.get('target_text', '')
+        else:
+            metadata = getattr(seg, 'metadata', {})
+            source_text = getattr(seg, 'source_text', '')
+            target_text = getattr(seg, 'target_text', '')
+        
+        if metadata:
+            segments_with_metadata += 1
+        
+        # 检查是否是合并的文本组
+        if not metadata:
+            continue
+            
+        is_merged = metadata.get('is_merged', False)
+        merged_handles = metadata.get('merged_handles', [])
+        
+        if is_merged:
+            segments_with_is_merged += 1
+        
+        if not is_merged or len(merged_handles) <= 1:
+            continue
+        
+        # 如果没有译文，尝试从 translations 中查找
+        if not target_text and source_text:
+            target_text = translations.get(source_text, '')
+        
+        if not target_text:
+            continue
+        
+        merged_info = {
+            'source_text': source_text,
+            'target_text': target_text,
+            'primary_handle': metadata.get('handle', merged_handles[0] if merged_handles else ''),
+            'merged_handles': merged_handles,
+            'primary_x': metadata.get('primary_x', 0),
+            'primary_y': metadata.get('primary_y', 0),
+            'primary_height': metadata.get('primary_height', 2.5),
+            'layer': metadata.get('layer', '0'),
+        }
+        merged_info_list.append(merged_info)
+    
+    # 调试日志
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(
+        "导出合并信息提取：总句段 %d，有 metadata %d，有 is_merged %d，最终合并组 %d",
+        total_segments, segments_with_metadata, segments_with_is_merged, len(merged_info_list)
+    )
+    
+    return merged_info_list

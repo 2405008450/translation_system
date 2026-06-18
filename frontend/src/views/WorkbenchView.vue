@@ -2535,6 +2535,13 @@ function redoActiveSegmentEdit() {
 const selectedSentenceIds = ref<Set<string>>(new Set())
 const lastSourceCaretOffset = ref<number | null>(null)
 
+// 判断当前文件是否为 CAD 文件（DWG/DXF）
+const isCadFile = computed(() => {
+  const filename = segmentStore.fileRecord?.filename || ''
+  const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase()
+  return ext === '.dwg' || ext === '.dxf'
+})
+
 // 切换激活句段时清除光标缓存
 watch(() => segmentStore.activeSentenceId, () => {
   lastSourceCaretOffset.value = null
@@ -2635,17 +2642,24 @@ async function handleMergeSegment() {
     return
   }
 
-  // 检查是否属于同一段落
+  // CAD 文件（DWG/DXF）：允许跨 block 合并，不检查相邻性
+  // 其他格式：必须同一 block
   const first = orderedSegments[0]
-  const notSameBlock = orderedSegments.some(
-    (s) =>
-      s.block_index !== first.block_index
-      || s.row_index !== first.row_index
-      || s.cell_index !== first.cell_index,
-  )
-  if (notSameBlock) {
-    toast.warn({ message: t('workbench.messages.mergeDifferentBlock') })
-    return
+  if (isCadFile.value) {
+    // CAD 文件：用户选择的句段即可合并，不强制检查相邻性
+    // CAD 图纸的实体位置关系复杂，由用户自行判断
+  } else {
+    // 其他格式：检查是否属于同一段落
+    const notSameBlock = orderedSegments.some(
+      (s) =>
+        s.block_index !== first.block_index
+        || s.row_index !== first.row_index
+        || s.cell_index !== first.cell_index,
+    )
+    if (notSameBlock) {
+      toast.warn({ message: t('workbench.messages.mergeDifferentBlock') })
+      return
+    }
   }
 
   try {

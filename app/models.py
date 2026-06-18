@@ -744,6 +744,12 @@ class Segment(Base):
     block_index: Mapped[int] = mapped_column(nullable=False, default=0)
     row_index: Mapped[int | None] = mapped_column(nullable=True)
     cell_index: Mapped[int | None] = mapped_column(nullable=True)
+    segment_metadata: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="{}",
+        server_default=text("'{}'"),
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )

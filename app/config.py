@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     dwg_fix_shx_font_for_unicode: bool = True
     # DWG 专用：替换 SHX 字体的 TrueType 字体名称
     dwg_unicode_font_name: str = "Arial"
+    # DWG 专用：启用空间聚类合并（将同一行的多个 TEXT 实体合并为语义完整的句子）
+    # 默认关闭，每个实体独立提取
+    dwg_enable_spatial_merge: bool = False
     tm_vector_enabled: bool = True
     tm_vector_dimensions: int = 128
     tm_vector_candidate_limit: int = 6

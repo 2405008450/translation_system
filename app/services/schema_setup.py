@@ -239,6 +239,7 @@ REQUIRED_SCHEMA = {
         "version",
         "source_html",
         "target_html",
+        "segment_metadata",
     },
     "translation_metric_events": {
         "id",
@@ -1423,6 +1424,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS segments
             ADD COLUMN IF NOT EXISTS target_html TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS segment_metadata TEXT NOT NULL DEFAULT '{}'
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_segments_file_record_order

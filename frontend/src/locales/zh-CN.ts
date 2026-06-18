@@ -1072,6 +1072,7 @@ export default {
       mergeFailed: '句段合并失败。',
       mergeDifferentBlock: '选中的句段属于不同段落，无法合并。',
       mergeSelectAtLeast: '请按住 Ctrl 点击选择至少两个句段。',
+      mergeNotAdjacent: '选中的句段位置不相邻，无法合并。',
     },
   },
   notes: {

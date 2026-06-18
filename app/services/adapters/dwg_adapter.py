@@ -56,6 +56,7 @@ class DwgAdapter(FormatAdapter):
                 filename=filename,
                 extract_extra_entities=settings.dwg_handle_extra_entities,
                 skip_dimension_like=settings.dwg_skip_dimension_like,
+                enable_spatial_merge=settings.dwg_enable_spatial_merge,
             )
         try:
             dxf_bytes = dwg_to_dxf(raw_bytes)
@@ -73,6 +74,7 @@ class DwgAdapter(FormatAdapter):
             filename=filename,
             extract_extra_entities=settings.dwg_handle_extra_entities,
             skip_dimension_like=settings.dwg_skip_dimension_like,
+            enable_spatial_merge=settings.dwg_enable_spatial_merge,
         )
         result.ast.source_format = ".dwg"
         result.metadata = {**result.metadata, "converted_from": ".dwg"}

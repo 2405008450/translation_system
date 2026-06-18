@@ -599,6 +599,10 @@ def build_task_workspace(
     segments: list[dict[str, Any]] = []
     for index, (segment, match_result) in enumerate(zip(parse_result.segments, match_results, strict=False)):
         context = _build_segment_context(parse_result.ast, segment.block_path, fallback_index=index)
+        
+        # 获取 segment metadata（包含 DXF/DWG 实体信息如 handle, layer 等）
+        seg_metadata = getattr(segment, 'metadata', {}) or {}
+        
         segments.append(
             {
                 "sentence_id": segment.segment_id,
@@ -612,6 +616,7 @@ def build_task_workspace(
                 "matched_creator_name": match_result.matched_creator_name,
                 "matched_created_at": match_result.matched_created_at,
                 "matched_updated_at": match_result.matched_updated_at,
+                "segment_metadata": seg_metadata,
                 **context,
             }
         )
@@ -809,6 +814,11 @@ def build_export_segments_from_source(
     segments: list[Any],
     document_parse_options: dict[str, object] | str | None = None,
 ) -> list[dict[str, Any]]:
+    import json as _json
+    import logging
+    
+    _logger = logging.getLogger(__name__)
+    
     if is_word_task(filename):
         return [_normalize_existing_segment(segment) for segment in segments]
 
@@ -816,15 +826,101 @@ def build_export_segments_from_source(
     adapter = registry.get_adapter(filename)
     document_parse_options = normalize_document_parse_options(document_parse_options)
     parse_result = adapter.parse_with_options(raw_bytes, filename=filename, options=document_parse_options)
+    
+    # 按 segment_id 建立数据库句段索引
     translated_segments = {
         str(_get_segment_value(segment, "sentence_id", _get_segment_value(segment, "segment_id", ""))): segment
         for segment in segments
     }
+    
+    # 对于 CAD 文件，额外按 handle 建立索引（因为合并后 segment_id 会变）
+    extension = (filename or "").lower().rsplit(".", 1)[-1] if filename else ""
+    is_cad_file = extension in ("dwg", "dxf")
+    
+    handle_to_db_segment: dict[str, Any] = {}
+    merged_handles_set: set[str] = set()  # 所有被合并的 handles（用于清空）
+    
+    if is_cad_file:
+        for segment in segments:
+            db_metadata_str = _get_segment_value(segment, "segment_metadata", "{}")
+            try:
+                db_metadata = _json.loads(db_metadata_str) if db_metadata_str else {}
+            except (TypeError, _json.JSONDecodeError):
+                db_metadata = {}
+            
+            handle = db_metadata.get("handle", "")
+            if handle:
+                handle_to_db_segment[handle] = segment
+            
+            # 收集所有被合并的 handles
+            if db_metadata.get("is_merged"):
+                merged_handles = db_metadata.get("merged_handles", [])
+                primary_handle = db_metadata.get("primary_handle", "")
+                for h in merged_handles:
+                    if h != primary_handle:
+                        merged_handles_set.add(h)
+        
+        _logger.info(
+            "build_export_segments_from_source: CAD 文件，handle 索引 %d 个，被合并实体 %d 个",
+            len(handle_to_db_segment), len(merged_handles_set)
+        )
+    
+    _logger.debug(
+        "build_export_segments_from_source: 解析得到 %d 个句段，数据库有 %d 个翻译句段",
+        len(parse_result.segments), len(translated_segments)
+    )
 
     export_segments: list[dict[str, Any]] = []
     for index, parsed_segment in enumerate(parse_result.segments):
+        # 首先尝试按 segment_id 匹配
         translated_segment = translated_segments.get(parsed_segment.segment_id)
+        
+        # 获取解析时的 metadata
+        segment_metadata = getattr(parsed_segment, 'metadata', {}) or {}
+        handle = segment_metadata.get('handle', '')
+        
+        # 对于 CAD 文件，如果 segment_id 匹配不到，尝试用 handle 匹配
+        if is_cad_file and translated_segment is None and handle:
+            translated_segment = handle_to_db_segment.get(handle)
+            if translated_segment:
+                _logger.info(
+                    "build_export_segments_from_source: segment_id 匹配失败，使用 handle=%s 匹配成功",
+                    handle
+                )
+        
         context = _build_segment_context(parse_result.ast, parsed_segment.block_path, fallback_index=index)
+        
+        # 优先使用数据库中的 segment_metadata（可能包含手动合并信息）
+        if translated_segment:
+            db_metadata_str = _get_segment_value(translated_segment, "segment_metadata", "{}")
+            try:
+                db_metadata = _json.loads(db_metadata_str) if db_metadata_str else {}
+            except (TypeError, _json.JSONDecodeError):
+                db_metadata = {}
+            
+            # 如果数据库中有合并信息，覆盖解析的 metadata
+            if db_metadata.get("is_merged"):
+                segment_metadata = {**segment_metadata, **db_metadata}
+                _logger.info(
+                    "build_export_segments_from_source: 句段 %s 是合并句段, metadata=%s",
+                    parsed_segment.segment_id, segment_metadata
+                )
+        else:
+            # 没有在数据库中找到对应的翻译句段
+            _logger.debug(
+                "build_export_segments_from_source: 句段 %s 在数据库中不存在 (handle=%s)",
+                parsed_segment.segment_id, handle
+            )
+            
+            # 对于 CAD 文件，检查这个实体是否是被合并的
+            if is_cad_file and handle and handle in merged_handles_set:
+                # 标记这个实体是被合并的一部分，需要被清空
+                segment_metadata['is_merged_secondary'] = True
+                _logger.info(
+                    "build_export_segments_from_source: 实体 handle=%s 是被合并的次级实体",
+                    handle
+                )
+        
         export_segments.append(
             {
                 "segment_id": parsed_segment.segment_id,
@@ -834,6 +930,7 @@ def build_export_segments_from_source(
                 "target_text": _get_segment_value(translated_segment, "target_text", ""),
                 "status": _get_segment_value(translated_segment, "status", "none"),
                 "matched_source_text": _get_segment_value(translated_segment, "matched_source_text", ""),
+                "metadata": segment_metadata,
                 **context,
             }
         )
