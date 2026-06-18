@@ -354,6 +354,15 @@ REQUIRED_SCHEMA = {
         "created_at",
         "updated_at",
     },
+    "project_merge_views": {
+        "id",
+        "project_id",
+        "name",
+        "file_ids",
+        "creator_id",
+        "created_at",
+        "updated_at",
+    },
 }
 
 REQUIRED_INDEXES = {
@@ -2394,6 +2403,34 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_auto_tm_rematch_queue_first_pending_at
             ON auto_tm_rematch_queue (first_pending_at)
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS project_merge_views (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                name VARCHAR(200) NOT NULL,
+                file_ids TEXT NOT NULL DEFAULT '[]',
+                creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_project_merge_views_project_id
+            ON project_merge_views (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_project_merge_views_creator_id
+            ON project_merge_views (creator_id)
+            """,
+            """
+            DROP TRIGGER IF EXISTS update_project_merge_views_updated_at ON project_merge_views
+            """,
+            """
+            CREATE TRIGGER update_project_merge_views_updated_at
+            BEFORE UPDATE ON project_merge_views
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column()
             """,
         ]
     )

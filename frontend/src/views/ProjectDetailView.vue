@@ -39,6 +39,12 @@ import {
   waitForImportTask,
   type ImportTaskAccepted,
 } from '../api/importTasks'
+import {
+  createProjectMergeView,
+  deleteMergeView,
+  listProjectMergeViews,
+  updateMergeView,
+} from '../api/mergeViews'
 import { http } from '../api/http'
 import DataTable from '../components/DataTable.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
@@ -54,7 +60,7 @@ import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
 import { useToast } from '../composables/useToast'
-import { formatLanguagePair, getLanguageLabel, languageOptions } from '../constants/languages'
+import { canonicalizeLanguagePair, formatLanguagePair, getLanguageLabel, languageOptions } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
 import { buildTranslatedTaskFilename, supportedTaskFileAccept } from '../constants/taskFiles'
 import { useAuthStore } from '../stores/auth'
@@ -73,6 +79,7 @@ import type {
   AssignmentEventsResponse,
   IssueMarker,
   IssueStatus,
+  MergeView,
   ProjectAssignmentsResponse,
   ProjectSyncDisableResult,
   QualityQASettingsResponse,
@@ -95,7 +102,7 @@ const props = defineProps<{
   id: string
 }>()
 
-type ProjectTab = 'files' | 'issues' | 'assignments' | 'settings' | 'stats' | 'summary' | 'quote'
+type ProjectTab = 'files' | 'views' | 'issues' | 'assignments' | 'settings' | 'stats' | 'summary' | 'quote'
 type ProjectSettingsSection = 'basic' | 'guidelines' | 'translation-memory' | 'terms' | 'automation' | 'quality-qa' | 'term-qa'
 type AccessLevel = 'team' | 'private' | 'public'
 type DocumentStatisticNumberKey =
@@ -220,6 +227,11 @@ interface ProjectDocumentStatisticsResponse {
 }
 
 type LanguageDetectTone = 'info' | 'success' | 'warning' | 'error'
+type LanguagePairSummary = {
+  source_language: string | null
+  target_language: string | null
+  file_count: number
+}
 
 const DEFAULT_DOCUMENT_PARSE_OPTIONS: DocumentParseOptions = {
   include_headers_footers: true,
@@ -378,6 +390,7 @@ const showPreTranslateDialog = ref(false)
 const showIssueDialog = ref(false)
 const showTermExtractionDialog = ref(false)
 const showAssignmentDialog = ref(false)
+const showMergeViewDialog = ref(false)
 const showTMImportDialog = ref(false)
 const showTermImportDialog = ref(false)
 const termExtractionNeedsReload = ref(false)
@@ -387,6 +400,14 @@ const actionMenuStyle = ref<Record<string, string>>({})
 const currentPage = ref(1)
 const pageSize = ref(10)
 const selectedFileIds = ref(new Set<string>())
+const mergeViews = ref<MergeView[]>([])
+const loadingMergeViews = ref(false)
+const savingMergeView = ref(false)
+const mergeViewActionId = ref('')
+const mergeViewDialogMode = ref<'create' | 'rename'>('create')
+const mergeViewDialogError = ref('')
+const mergeViewName = ref('')
+const activeMergeView = ref<MergeView | null>(null)
 const statisticsSelectedFileIds = ref(new Set<string>())
 const statisticsResultFileIds = ref(new Set<string>())
 const statisticsReports = ref<DocumentStatisticsReport[]>([])
@@ -586,6 +607,7 @@ let exportPollTimer: number | null = null
 
 const tabs = computed(() => ([
   { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
+  { key: 'views' as const, label: t('projectDetail.tabs.views'), disabled: !canManageProject.value },
   {
     key: 'issues' as const,
     label: `${t('projectDetail.tabs.issues')}${openIssueCount.value > 0 ? ` (${openIssueCount.value})` : ''}`,
@@ -628,6 +650,60 @@ const selectedProjectFiles = computed(() => (
 ))
 const hasSelectedLockedFile = computed(() => selectedProjectFiles.value.some((row) => row.is_edit_locked))
 const hasSelectedNonWritableFile = computed(() => selectedProjectFiles.value.some((row) => !row.can_write))
+const selectedMergeViewFiles = computed(() => (
+  selectedProjectFiles.value.filter((row) => canUseFileInMergeView(row))
+))
+const selectedMergeViewInvalidFiles = computed(() => (
+  selectedProjectFiles.value.filter((row) => !canUseFileInMergeView(row))
+))
+const selectedMergeViewLanguagePairs = computed<LanguagePairSummary[]>(() => {
+  const pairMap = new Map<string, LanguagePairSummary>()
+  let invalidCount = 0
+  for (const file of selectedMergeViewFiles.value) {
+    const pair = canonicalizeLanguagePair(
+      file.source_language || project.value?.source_language,
+      file.target_language || project.value?.target_language,
+    )
+    if (!pair) {
+      invalidCount += 1
+      continue
+    }
+    const key = `${pair.source}__${pair.target}`
+    const current = pairMap.get(key)
+    if (current) {
+      current.file_count += 1
+    } else {
+      pairMap.set(key, {
+        source_language: pair.source,
+        target_language: pair.target,
+        file_count: 1,
+      })
+    }
+  }
+  const pairs = Array.from(pairMap.values())
+  if (invalidCount > 0) {
+    pairs.push({ source_language: null, target_language: null, file_count: invalidCount })
+  }
+  return pairs
+})
+const selectedMergeViewHasMixedLanguagePairs = computed(() => selectedMergeViewLanguagePairs.value.length > 1)
+const canOpenMergeViewDialog = computed(() => (
+  canManageProject.value
+  && selectedMergeViewFiles.value.length >= 2
+  && !savingMergeView.value
+))
+const mergeOpenButtonTitle = computed(() => {
+  if (selectedProjectFiles.value.length === 0) {
+    return t('projectDetail.mergeViews.selectFileFirst')
+  }
+  if (selectedMergeViewFiles.value.length < 2) {
+    return t('projectDetail.mergeViews.selectAtLeastTwo')
+  }
+  if (selectedMergeViewInvalidFiles.value.length > 0) {
+    return t('projectDetail.mergeViews.someFilesIgnored', { count: selectedMergeViewInvalidFiles.value.length })
+  }
+  return ''
+})
 const canDeleteSelectedProjectFiles = computed(() => (
   canManageProject.value
   && selectedProjectFiles.value.length > 0
@@ -924,7 +1000,6 @@ const projectLanguagePairLabel = computed(() => (
       : formatLanguagePair(effectiveProjectSourceLanguage.value, effectiveProjectTargetLanguage.value)
 ))
 
-const uploadFilePreview = computed(() => selectedFiles.value.slice(0, 3).map((file) => file.name))
 const uploadSupportedSummary = computed(() => {
   if (uploadCapabilities.value.length === 0) {
     return uploadFileAccept.value
@@ -1416,6 +1491,43 @@ function canEnterWorkbench(row: ProjectRow) {
   return Boolean(row.can_write) && Number(row.total_segments ?? 0) > 0 && !row.is_edit_locked
 }
 
+function canUseFileInMergeView(row: ProjectRow) {
+  return canEnterWorkbench(row)
+}
+
+function getMergeViewFileNames(view: MergeView) {
+  const fileById = new Map(tableRows.value.map((file) => [file.id, file.filename]))
+  return view.file_ids.map((fileId) => fileById.get(fileId) || fileId)
+}
+
+function getMergeViewMetaText(view: MergeView) {
+  return [
+    t('projectDetail.mergeViews.fileCount', { count: view.file_count }),
+    view.available_file_count !== view.file_count
+      ? t('projectDetail.mergeViews.availableFileCount', { count: view.available_file_count })
+      : '',
+    view.creator_name ? t('projectDetail.mergeViews.creator', { name: view.creator_name }) : '',
+    formatDateText(view.updated_at || view.created_at),
+  ].filter(Boolean).join(' · ')
+}
+
+function formatLanguagePairSummary(pair: LanguagePairSummary) {
+  return `${formatLanguagePair(pair.source_language, pair.target_language)} · ${pair.file_count} 个文件`
+}
+
+function buildDefaultMergeViewName() {
+  const names = selectedMergeViewFiles.value
+    .slice(0, 2)
+    .map((file) => String(file.filename || '').trim())
+    .filter(Boolean)
+  const suffix = selectedMergeViewFiles.value.length > 2
+    ? ` +${selectedMergeViewFiles.value.length - 2}`
+    : ''
+  return names.length > 0
+    ? `${names.join(' + ')}${suffix}`
+    : t('projectDetail.mergeViews.defaultName')
+}
+
 function getFileDetailHint(row: ProjectRow) {
   if (row.is_edit_locked) {
     return row.active_operation_message || t('projectDetail.files.editLockedHint')
@@ -1459,14 +1571,22 @@ function onFileDrop(event: DragEvent) {
   updateSelectedFiles(Array.from(event.dataTransfer?.files ?? []))
 }
 
-function resetUploadForm() {
+function clearSelectedUploadFiles() {
+  if (uploading.value) {
+    return
+  }
+
   selectedFiles.value = []
   uploadMessage.value = ''
   clearLanguageDetectState()
+  uploadInputKey.value += 1
+}
+
+function resetUploadForm() {
+  clearSelectedUploadFiles()
   uploadPercent.value = 0
   documentParseMode.value = 'full'
   documentParseOptions.value = { ...DEFAULT_DOCUMENT_PARSE_OPTIONS }
-  uploadInputKey.value += 1
 }
 
 function openUploadDialog() {
@@ -1965,6 +2085,9 @@ function goBack() {
 
 function switchProjectTab(tab: ProjectTab) {
   activeTab.value = tab
+  if (tab === 'views' && canManageProject.value) {
+    void loadMergeViews()
+  }
   if (tab === 'stats' && statisticsSelectedFileIds.value.size === 0 && selectedFileIds.value.size > 0) {
     statisticsSelectedFileIds.value = new Set(selectedFileIds.value)
   }
@@ -2083,6 +2206,134 @@ function openWorkbench(row: ProjectRow) {
   window.open(resolved.href, '_blank', 'noopener,noreferrer')
 }
 
+async function loadMergeViews() {
+  if (!project.value || loadingMergeViews.value) {
+    return
+  }
+  loadingMergeViews.value = true
+  try {
+    const data = await listProjectMergeViews(project.value.id)
+    mergeViews.value = data.items
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('projectDetail.mergeViews.errors.load'))
+  } finally {
+    loadingMergeViews.value = false
+  }
+}
+
+function openMergeView(view: MergeView) {
+  const resolved = router.resolve({
+    name: 'merge-view-focus',
+    params: { viewId: view.id },
+    query: {
+      from: 'project',
+      pid: props.id,
+      ...(cameFromTasks.value ? { parent: 'tasks' } : {}),
+    },
+  })
+  window.open(resolved.href, '_blank', 'noopener,noreferrer')
+}
+
+function openCreateMergeViewDialog() {
+  if (!canOpenMergeViewDialog.value) {
+    toast.warn(mergeOpenButtonTitle.value || t('projectDetail.mergeViews.selectAtLeastTwo'))
+    return
+  }
+  mergeViewDialogMode.value = 'create'
+  activeMergeView.value = null
+  mergeViewName.value = buildDefaultMergeViewName()
+  mergeViewDialogError.value = ''
+  showMergeViewDialog.value = true
+}
+
+function openRenameMergeViewDialog(view: MergeView) {
+  mergeViewDialogMode.value = 'rename'
+  activeMergeView.value = view
+  mergeViewName.value = view.name
+  mergeViewDialogError.value = ''
+  showMergeViewDialog.value = true
+}
+
+function closeMergeViewDialog() {
+  if (savingMergeView.value) {
+    return
+  }
+  showMergeViewDialog.value = false
+  activeMergeView.value = null
+  mergeViewDialogError.value = ''
+}
+
+async function submitMergeViewDialog() {
+  if (!project.value) {
+    return
+  }
+  const name = mergeViewName.value.trim()
+  if (!name) {
+    mergeViewDialogError.value = t('projectDetail.mergeViews.errors.nameRequired')
+    return
+  }
+
+  savingMergeView.value = true
+  mergeViewDialogError.value = ''
+  try {
+    if (mergeViewDialogMode.value === 'create') {
+      const created = await createProjectMergeView(project.value.id, {
+        name,
+        file_ids: selectedMergeViewFiles.value.map((file) => file.id),
+      })
+      mergeViews.value = [created, ...mergeViews.value.filter((view) => view.id !== created.id)]
+      showMergeViewDialog.value = false
+      toast.success(t('projectDetail.mergeViews.messages.created'))
+      openMergeView(created)
+      return
+    }
+
+    if (!activeMergeView.value) {
+      return
+    }
+    const updated = await updateMergeView(activeMergeView.value.id, { name })
+    mergeViews.value = mergeViews.value.map((view) => (view.id === updated.id ? updated : view))
+    showMergeViewDialog.value = false
+    activeMergeView.value = null
+    toast.success(t('projectDetail.mergeViews.messages.renamed'))
+  } catch (error) {
+    mergeViewDialogError.value = getErrorMessage(
+      error,
+      mergeViewDialogMode.value === 'create'
+        ? t('projectDetail.mergeViews.errors.create')
+        : t('projectDetail.mergeViews.errors.rename'),
+    )
+  } finally {
+    savingMergeView.value = false
+  }
+}
+
+async function deleteSavedMergeView(view: MergeView) {
+  if (!canManageProject.value || mergeViewActionId.value) {
+    return
+  }
+  const confirmed = await confirm({
+    title: t('projectDetail.mergeViews.deleteTitle'),
+    message: t('projectDetail.mergeViews.deleteConfirm', { name: view.name }),
+    confirmText: t('common.actions.delete'),
+    danger: true,
+  })
+  if (!confirmed) {
+    return
+  }
+
+  mergeViewActionId.value = view.id
+  try {
+    await deleteMergeView(view.id)
+    mergeViews.value = mergeViews.value.filter((item) => item.id !== view.id)
+    toast.success(t('projectDetail.mergeViews.messages.deleted'))
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('projectDetail.mergeViews.errors.delete'))
+  } finally {
+    mergeViewActionId.value = ''
+  }
+}
+
 async function loadProject() {
   loading.value = true
   pageError.value = ''
@@ -2104,6 +2355,9 @@ async function loadProject() {
       void loadProjectTranslationMemorySettings()
       void loadProjectTermBaseSettings()
       void loadProjectQualityQASettings()
+      if (activeTab.value === 'views') {
+        void loadMergeViews()
+      }
       if (activeTab.value === 'stats') {
         void loadDocumentStatisticsReports()
       }
@@ -2111,6 +2365,7 @@ async function loadProject() {
       translationMemorySettings.value = null
       termBaseSettings.value = null
       qualityQASettings.value = null
+      mergeViews.value = []
     }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.load'))
@@ -3608,14 +3863,29 @@ onBeforeUnmount(() => {
             {{ languageDetectMessage }}
           </p>
 
-          <div v-if="selectedFiles.length" class="upload-file-list">
-            <div v-for="fileName in uploadFilePreview" :key="fileName" class="upload-file-list__item">
-              <FileText :size="15" />
-              <span>{{ fileName }}</span>
+          <div v-if="selectedFiles.length" class="upload-file-list-wrap">
+            <div class="upload-file-list__head">
+              <span class="upload-file-list__summary">已选 {{ selectedFiles.length }} 个文件</span>
+              <button
+                type="button"
+                class="upload-file-list__clear"
+                data-testid="project-upload-clear-files"
+                :disabled="uploading"
+                @click="clearSelectedUploadFiles"
+              >
+                <X :size="14" />
+                取消选中
+              </button>
             </div>
-            <div v-if="selectedFiles.length > uploadFilePreview.length" class="upload-file-list__item">
-              <FileText :size="15" />
-              <span>还有 {{ selectedFiles.length - uploadFilePreview.length }} 个文件</span>
+            <div class="upload-file-list">
+              <div
+                v-for="(file, index) in selectedFiles"
+                :key="`${file.name}-${file.size}-${file.lastModified}-${index}`"
+                class="upload-file-list__item"
+              >
+                <FileText :size="15" />
+                <span>{{ file.name }}</span>
+              </div>
             </div>
           </div>
 
@@ -4778,6 +5048,70 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
+      <section v-if="activeTab === 'views'" class="panel">
+        <div class="pd-panel-head">
+          <div class="pd-panel-head__copy">
+            <div class="section-title section-title--tight">{{ t('projectDetail.mergeViews.title') }}</div>
+            <p class="panel-subtitle">{{ t('projectDetail.mergeViews.description') }}</p>
+          </div>
+          <button class="button" type="button" :disabled="loadingMergeViews" @click="loadMergeViews">
+            <Loader2 v-if="loadingMergeViews" class="lucide-spin" :size="14" />
+            <RotateCcw v-else :size="14" />
+            {{ t('common.actions.refresh') }}
+          </button>
+        </div>
+
+        <div v-if="loadingMergeViews" class="empty-state issue-empty">
+          {{ t('projectDetail.mergeViews.loading') }}
+        </div>
+        <div v-else-if="mergeViews.length === 0" class="empty-state issue-empty">
+          {{ t('projectDetail.mergeViews.empty') }}
+        </div>
+        <div v-else class="pd-merge-view-list">
+          <article v-for="view in mergeViews" :key="view.id" class="pd-merge-view-item">
+            <div class="pd-merge-view-item__main">
+              <div class="pd-merge-view-item__head">
+                <strong>{{ view.name }}</strong>
+                <span>{{ getMergeViewMetaText(view) }}</span>
+              </div>
+              <div class="pd-merge-view-item__files">
+                <span
+                  v-for="fileName in getMergeViewFileNames(view)"
+                  :key="`${view.id}-${fileName}`"
+                  :title="fileName"
+                >
+                  {{ fileName }}
+                </span>
+              </div>
+            </div>
+            <div class="pd-merge-view-item__actions">
+              <button class="button" type="button" @click="openMergeView(view)">
+                <FolderOpen :size="14" />
+                {{ t('projectDetail.mergeViews.open') }}
+              </button>
+              <button
+                class="button"
+                type="button"
+                :disabled="mergeViewActionId === view.id"
+                @click="openRenameMergeViewDialog(view)"
+              >
+                {{ t('projectDetail.mergeViews.rename') }}
+              </button>
+              <button
+                class="button button--danger"
+                type="button"
+                :disabled="mergeViewActionId === view.id"
+                @click="deleteSavedMergeView(view)"
+              >
+                <Loader2 v-if="mergeViewActionId === view.id" class="lucide-spin" :size="14" />
+                <Trash2 v-else :size="14" />
+                {{ t('projectDetail.mergeViews.delete') }}
+              </button>
+            </div>
+          </article>
+        </div>
+      </section>
+
       <section v-if="activeTab === 'files'" class="panel">
         <div class="pd-panel-head">
           <div class="pd-panel-head__copy">
@@ -4910,7 +5244,14 @@ onBeforeUnmount(() => {
               <Clock3 :size="14" />
               {{ t('projectDetail.files.actions.modifyTaskType') }}
             </button>
-            <button v-if="canManageProject" class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
+            <button
+              v-if="canManageProject"
+              class="button"
+              type="button"
+              :disabled="!canOpenMergeViewDialog"
+              :title="mergeOpenButtonTitle || undefined"
+              @click="openCreateMergeViewDialog"
+            >
               <FolderOpen :size="14" />
               {{ t('projectDetail.files.actions.mergeOpen') }}
             </button>
@@ -5404,6 +5745,72 @@ onBeforeUnmount(() => {
     </Teleport>
 
     <Modal
+      :open="showMergeViewDialog"
+      :title="mergeViewDialogMode === 'create' ? t('projectDetail.mergeViews.dialogCreateTitle') : t('projectDetail.mergeViews.dialogRenameTitle')"
+      width="min(560px, calc(100vw - 32px))"
+      :close-on-overlay="!savingMergeView"
+      :close-on-esc="!savingMergeView"
+      @close="closeMergeViewDialog"
+    >
+      <div class="pd-merge-view-dialog">
+        <label class="field">
+          <span class="field__label">{{ t('projectDetail.mergeViews.nameLabel') }} <span class="field__required">*</span></span>
+          <input
+            v-model="mergeViewName"
+            class="field__control"
+            type="text"
+            maxlength="200"
+            :disabled="savingMergeView"
+            :placeholder="t('projectDetail.mergeViews.namePlaceholder')"
+            @keydown.enter.prevent="submitMergeViewDialog"
+          />
+        </label>
+
+        <div v-if="mergeViewDialogMode === 'create'" class="pd-merge-view-selected">
+          <span>{{ t('projectDetail.mergeViews.selectedFiles', { count: selectedMergeViewFiles.length }) }}</span>
+          <div>
+            <span v-for="file in selectedMergeViewFiles" :key="file.id" :title="file.filename">
+              {{ file.filename }}
+            </span>
+          </div>
+        </div>
+
+        <div
+          v-if="mergeViewDialogMode === 'create' && selectedMergeViewLanguagePairs.length > 0"
+          class="pd-merge-view-language"
+          :class="{ 'is-warning': selectedMergeViewHasMixedLanguagePairs }"
+        >
+          <strong>{{ selectedMergeViewHasMixedLanguagePairs ? '检测到混合语言对' : '语言对一致' }}</strong>
+          <div>
+            <span
+              v-for="pair in selectedMergeViewLanguagePairs"
+              :key="`${pair.source_language || 'unset'}-${pair.target_language || 'unset'}`"
+            >
+              {{ formatLanguagePairSummary(pair) }}
+            </span>
+          </div>
+          <p v-if="selectedMergeViewHasMixedLanguagePairs">
+            合并视图允许混合语言对一起审阅；后续 AI、TM、术语库等批处理会按当前文件或语言对隔离，避免资源串用。
+          </p>
+        </div>
+
+        <p v-if="mergeViewDialogError" class="form-message is-error">{{ mergeViewDialogError }}</p>
+      </div>
+
+      <template #footer>
+        <button class="button" type="button" :disabled="savingMergeView" @click="closeMergeViewDialog">
+          {{ t('common.actions.cancel') }}
+        </button>
+        <button class="button button--primary" type="button" :disabled="savingMergeView" @click="submitMergeViewDialog">
+          <Loader2 v-if="savingMergeView" class="lucide-spin" :size="14" />
+          <FolderOpen v-else-if="mergeViewDialogMode === 'create'" :size="14" />
+          <Check v-else :size="14" />
+          {{ savingMergeView ? t('common.actions.saving') : (mergeViewDialogMode === 'create' ? t('projectDetail.mergeViews.createAndOpen') : t('common.actions.save')) }}
+        </button>
+      </template>
+    </Modal>
+
+    <Modal
       :open="showAssignmentDialog"
       title="分配任务"
       width="min(980px, calc(100vw - 32px))"
@@ -5856,9 +6263,52 @@ onBeforeUnmount(() => {
   color: var(--danger, #dc2626);
 }
 
+.upload-file-list-wrap {
+  display: grid;
+  gap: 8px;
+}
+
+.upload-file-list__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.upload-file-list__summary {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.upload-file-list__clear {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--state-danger, #dc2626);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.upload-file-list__clear:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--state-danger, #dc2626) 30%, transparent);
+  background: var(--state-danger-bg, #fef2f2);
+}
+
+.upload-file-list__clear:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
 .upload-file-list {
   display: grid;
   gap: 8px;
+  max-height: min(280px, 40vh);
+  overflow-y: auto;
 }
 
 .upload-file-list__item {
@@ -6234,6 +6684,140 @@ onBeforeUnmount(() => {
 .pd-toolbar__left,
 .pd-toolbar__right {
   flex-wrap: wrap;
+}
+
+.pd-merge-view-list {
+  display: grid;
+  gap: 10px;
+}
+
+.pd-merge-view-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: center;
+  padding: 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+}
+
+.pd-merge-view-item__main {
+  min-width: 0;
+  display: grid;
+  gap: 9px;
+}
+
+.pd-merge-view-item__head {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.pd-merge-view-item__head strong,
+.pd-merge-view-item__head span,
+.pd-merge-view-item__files span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-merge-view-item__head strong {
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.pd-merge-view-item__head span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.pd-merge-view-item__files {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.pd-merge-view-item__files span,
+.pd-merge-view-selected span {
+  max-width: 220px;
+  padding: 3px 7px;
+  border: 1px solid color-mix(in srgb, var(--brand-700) 18%, var(--line-soft));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--brand-050) 48%, var(--surface-panel));
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.pd-merge-view-item__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pd-merge-view-dialog {
+  display: grid;
+  gap: 14px;
+}
+
+.pd-merge-view-selected {
+  display: grid;
+  gap: 8px;
+}
+
+.pd-merge-view-selected > span {
+  max-width: none;
+  width: fit-content;
+  background: var(--surface-muted);
+}
+
+.pd-merge-view-selected > div {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.pd-merge-view-language {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--brand-700) 16%, var(--line-soft));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--brand-050) 48%, var(--surface-panel));
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.pd-merge-view-language.is-warning {
+  border-color: rgba(194, 120, 3, 0.3);
+  background: var(--state-warning-bg);
+}
+
+.pd-merge-view-language strong {
+  color: var(--text-primary);
+}
+
+.pd-merge-view-language > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.pd-merge-view-language span {
+  max-width: 100%;
+  padding: 3px 7px;
+  border: 1px solid color-mix(in srgb, var(--brand-700) 14%, var(--line-soft));
+  border-radius: 6px;
+  background: var(--surface-panel);
+  overflow-wrap: anywhere;
+}
+
+.pd-merge-view-language p {
+  margin: 0;
 }
 
 .pd-export-dropdown {

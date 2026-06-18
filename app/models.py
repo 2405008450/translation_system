@@ -87,6 +87,62 @@ class Project(Base):
         cascade="all, delete-orphan",
         order_by="ProjectWorkflowStep.sort_order",
     )
+    merge_views: Mapped[list["ProjectMergeView"]] = relationship(
+        "ProjectMergeView",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="ProjectMergeView.created_at",
+    )
+
+
+class ProjectMergeView(Base):
+    """项目"合并视图"：记录同一项目中哪些 file_records 组成一个编辑视图。
+
+    仅持久化分组关系（name + 有序 file_ids），不为合并单独存储句段——
+    句段仍通过 file_record_id 归属各自文件，保存/导出复用按文件的现有接口。
+    """
+
+    __tablename__ = "project_merge_views"
+    __table_args__ = (
+        Index("ix_project_merge_views_project_id", "project_id"),
+        Index("ix_project_merge_views_creator_id", "creator_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    file_ids: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="[]",
+        server_default=text("'[]'"),
+    )
+    creator_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    project: Mapped["Project"] = relationship("Project", back_populates="merge_views")
+    creator: Mapped["User | None"] = relationship("User", foreign_keys=[creator_id])
 
 
 class ProjectWorkflowStep(Base):

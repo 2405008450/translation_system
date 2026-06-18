@@ -25,6 +25,8 @@ const props = withDefaults(defineProps<{
   targetSearchQuery?: string
   showVisibleChars?: boolean
   pendingFormats?: Record<TextFormat, boolean> & { _overrideActive?: boolean }
+  /** 句段对外标识：单文件模式即 sentence_id；合并模式为复合键 ${file_record_id}:${sentence_id} */
+  segmentKey?: string
 }>(), {
   disabled: false,
   sourceEditing: false,
@@ -45,6 +47,7 @@ const props = withDefaults(defineProps<{
     superscript: false,
     _overrideActive: false,
   }),
+  segmentKey: '',
 })
 
 const emit = defineEmits<{
@@ -62,6 +65,9 @@ const sourceEditorRef = ref<HTMLDivElement | null>(null)
 const isFocused = ref(false)
 const isSourceFocused = ref(false)
 const isComposing = ref(false)
+
+// 对外标识：合并视图使用复合键，单文件回退为 sentence_id
+const segmentKey = computed(() => props.segmentKey || props.segment.sentence_id)
 const MAX_EDITOR_HISTORY_SIZE = 100
 const EDITOR_HISTORY_GROUP_TIMEOUT_MS = 1200
 const EDITOR_HISTORY_WORD_BOUNDARY_REGEXP = /[\s.,!?;:\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A]/
@@ -918,7 +924,7 @@ function shouldPreserveHistoryForStateSync() {
 
 function applyHistorySnapshot(snapshot: EditorHistorySnapshot) {
   isApplyingHistory.value = true
-  emit('update', props.segment.sentence_id, snapshot.text, snapshot.html || undefined)
+  emit('update', segmentKey.value, snapshot.text, snapshot.html || undefined)
   void nextTick(() => {
     if (editorRef.value) {
       editorRef.value.innerHTML = editorHtmlContent.value
@@ -954,7 +960,7 @@ function redoEditorChange() {
 
 function handleFocus() {
   isFocused.value = true
-  emit('focus', props.segment.sentence_id)
+  emit('focus', segmentKey.value)
 }
 
 function handleBlur() {
@@ -966,17 +972,17 @@ function handleBlur() {
 function handleClick(event?: MouseEvent) {
   resetHistoryGroup()
   if (event && (event.ctrlKey || event.metaKey)) {
-    emit('ctrlClick', props.segment.sentence_id, event)
+    emit('ctrlClick', segmentKey.value, event)
     return
   }
-  emit('activateTarget', props.segment.sentence_id)
+  emit('activateTarget', segmentKey.value)
 }
 
 function handleProjectSyncToggle() {
   if (props.disabled) {
     return
   }
-  emit('toggleProjectSync', props.segment.sentence_id, !props.segment.project_sync_disabled)
+  emit('toggleProjectSync', segmentKey.value, !props.segment.project_sync_disabled)
 }
 
 function handleSourceFocus() {
@@ -995,7 +1001,7 @@ function handleSourceInput() {
     return
   }
   const text = sourceEditorRef.value.textContent || ''
-  emit('updateSource', props.segment.sentence_id, text)
+  emit('updateSource', segmentKey.value, text)
 }
 
 function handleSourceBeforeInput(event: Event) {
@@ -1152,12 +1158,12 @@ function handleInput() {
   // 如果有格式标签，同时传递 HTML
   if (hasFormatTags) {
     // 清理 HTML，只保留格式标签
-    emit('update', props.segment.sentence_id, text, cleanHtml)
+    emit('update', segmentKey.value, text, cleanHtml)
     return
   }
 
   // 没有格式标签，只传递纯文本
-  emit('update', props.segment.sentence_id, text)
+  emit('update', segmentKey.value, text)
 }
 
 /**
@@ -1581,9 +1587,9 @@ watch(
   <article
     class="segment-row"
     :class="[statusClass, parityClass, { 'is-active': active, 'is-selected': selected, 'has-pending-revision': hasPendingRevision, 'is-empty-target': isEmptyTarget }]"
-    :id="`segment-${segment.sentence_id}`"
+    :id="`segment-${segmentKey}`"
     data-testid="segment-row"
-    :data-sentence-id="segment.sentence_id"
+    :data-sentence-id="segmentKey"
     :data-has-pending-revision="hasPendingRevision ? 'true' : 'false'"
     role="group"
     :aria-label="`segment ${index + 1}`"
@@ -1631,7 +1637,7 @@ watch(
         v-if="false && pendingRevision"
         class="segment-row__revision-inline"
         data-testid="segment-revision-inline"
-        :data-sentence-id="segment.sentence_id"
+        :data-sentence-id="segmentKey"
         :aria-label="`translation revision for segment ${index + 1}`"
         @click="handleClick"
       >
@@ -1669,7 +1675,7 @@ watch(
           data-testid="segment-target-editor"
           :data-revision-visible="hasPendingRevision ? 'true' : 'false'"
           data-segment-target="true"
-          :data-sentence-id="segment.sentence_id"
+          :data-sentence-id="segmentKey"
           :aria-label="`translation for segment ${index + 1}`"
           spellcheck="false"
           @focus="handleFocus"

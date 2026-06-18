@@ -44,6 +44,11 @@ interface FileOperationLockResponse {
 }
 
 type ResourceImportTab = 'tm' | 'glossary' | 'term'
+type LanguagePairStat = {
+  source: string | null
+  target: string | null
+  fileCount: number
+}
 
 const props = defineProps<{
   open: boolean
@@ -146,6 +151,37 @@ const selectedFileLanguagePairs = computed(() => {
   return Array.from(pairMap.values())
 })
 
+const selectedFileLanguagePairStats = computed<LanguagePairStat[]>(() => {
+  const pairMap = new Map<string, LanguagePairStat>()
+  let invalidCount = 0
+  for (const file of props.files) {
+    const pair = canonicalizeLanguagePair(
+      file.source_language || props.sourceLanguage,
+      file.target_language || props.targetLanguage,
+    )
+    if (!pair) {
+      invalidCount += 1
+      continue
+    }
+    const key = `${pair.source}__${pair.target}`
+    const current = pairMap.get(key)
+    if (current) {
+      current.fileCount += 1
+    } else {
+      pairMap.set(key, {
+        source: pair.source,
+        target: pair.target,
+        fileCount: 1,
+      })
+    }
+  }
+  const stats = Array.from(pairMap.values())
+  if (invalidCount > 0) {
+    stats.push({ source: null, target: null, fileCount: invalidCount })
+  }
+  return stats
+})
+
 const filesWithInvalidLanguagePair = computed(() => (
   props.files.filter((file) => !canonicalizeLanguagePair(
     file.source_language || props.sourceLanguage,
@@ -160,15 +196,22 @@ const selectedFileLanguagePair = computed(() => (
 const selectedLanguagePairLabel = computed(() => (
   selectedFileLanguagePair.value
     ? formatLanguagePair(selectedFileLanguagePair.value.source, selectedFileLanguagePair.value.target)
-    : t('common.notSet')
+    : (selectedFileLanguagePairs.value.length > 1 ? '混合语言对' : t('common.notSet'))
 ))
 
-const languagePairIssue = computed(() => {
+const invalidLanguagePairIssue = computed(() => {
   if (props.files.length === 0) {
     return ''
   }
   if (filesWithInvalidLanguagePair.value.length > 0) {
     return t('projectDetail.preTranslate.errors.fileLanguagePairRequired')
+  }
+  return ''
+})
+
+const mixedLanguagePairIssue = computed(() => {
+  if (props.files.length === 0) {
+    return ''
   }
   if (selectedFileLanguagePairs.value.length > 1) {
     return t('projectDetail.preTranslate.errors.fileLanguagePairMixed', {
@@ -177,6 +220,21 @@ const languagePairIssue = computed(() => {
   }
   return ''
 })
+
+const languagePairIssue = computed(() => invalidLanguagePairIssue.value || mixedLanguagePairIssue.value)
+
+const usesLanguagePairResources = computed(() => useTm.value || useGlossary.value || useTermBase.value)
+
+const pureLlmMixedLanguagePairNotice = computed(() => {
+  if (!useLlm.value || usesLanguagePairResources.value || selectedFileLanguagePairs.value.length <= 1) {
+    return ''
+  }
+  return `已选择 ${selectedFileLanguagePairs.value.length} 个语言对；纯 LLM 会按每个文件自己的语言对逐个执行，不共用 TM、术语库或词汇表。`
+})
+
+function formatLanguagePairStat(stat: LanguagePairStat) {
+  return `${formatLanguagePair(stat.source, stat.target)} · ${stat.fileCount} 个文件`
+}
 
 function resourceMatchesSelectedLanguagePair(resource: TMCollection | TermBase | GlossaryBase) {
   const selectedPair = selectedFileLanguagePair.value
@@ -685,8 +743,12 @@ function validateBeforeStart() {
     errorMessage.value = t('projectDetail.preTranslate.errors.selectOneOption')
     return false
   }
-  if ((useTm.value || useGlossary.value || useTermBase.value) && languagePairIssue.value) {
-    errorMessage.value = languagePairIssue.value
+  if (invalidLanguagePairIssue.value) {
+    errorMessage.value = invalidLanguagePairIssue.value
+    return false
+  }
+  if (usesLanguagePairResources.value && mixedLanguagePairIssue.value) {
+    errorMessage.value = mixedLanguagePairIssue.value
     return false
   }
   if (useTm.value && selectedTmCollectionIds.value.length === 0) {
@@ -1131,6 +1193,21 @@ async function stopPreTranslate() {
       </aside>
 
       <div class="ptd-flow">
+        <div
+          v-if="selectedFileLanguagePairStats.length > 0"
+          class="ptd-language-notice"
+          :class="{ 'is-warning': Boolean(languagePairIssue), 'is-info': !languagePairIssue }"
+        >
+          <div class="ptd-language-notice__head">
+            <strong>{{ selectedFileLanguagePairs.length > 1 ? '已选择混合语言对' : '已选择语言对' }}</strong>
+            <span>{{ selectedFileLanguagePairStats.map(formatLanguagePairStat).join('；') }}</span>
+          </div>
+          <p v-if="invalidLanguagePairIssue">{{ invalidLanguagePairIssue }}</p>
+          <p v-else-if="mixedLanguagePairIssue">
+            混合语言对可以使用纯 LLM 逐文件预翻译；如启用 TM、词汇表或术语库，请按语言对分批执行。
+          </p>
+        </div>
+
         <div class="ptd-section ptd-section--tm" :class="{ 'is-disabled': !useTm }">
           <div class="ptd-section__head">
             <label class="ptd-switch">
@@ -1555,6 +1632,7 @@ async function stopPreTranslate() {
             :disabled="running || !useLlm"
           />
         </label>
+        <p v-if="pureLlmMixedLanguagePairNotice" class="hint-text is-warning">{{ pureLlmMixedLanguagePairNotice }}</p>
         <p class="hint-text">{{ t('projectDetail.preTranslate.llm.hint') }}</p>
       </div>
       </div>
@@ -1708,6 +1786,45 @@ async function stopPreTranslate() {
   gap: 12px;
   align-items: start;
   min-width: 0;
+}
+
+.ptd-language-notice {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.ptd-language-notice.is-warning {
+  border-color: rgba(194, 120, 3, 0.3);
+  background: var(--state-warning-bg);
+}
+
+.ptd-language-notice.is-info {
+  border-color: color-mix(in srgb, var(--brand-700) 16%, var(--line-soft));
+  background: color-mix(in srgb, var(--brand-050) 48%, var(--surface-panel));
+}
+
+.ptd-language-notice__head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.ptd-language-notice__head strong {
+  color: var(--text-primary);
+}
+
+.ptd-language-notice p {
+  margin: 0;
 }
 
 .ptd-section {
@@ -2227,6 +2344,12 @@ async function stopPreTranslate() {
   border: 1px solid color-mix(in srgb, var(--ptd-accent) 5%, var(--line-soft));
   border-radius: 8px;
   background: color-mix(in srgb, var(--surface-1) 99%, var(--ptd-accent) 1%);
+}
+
+.ptd-section .hint-text.is-warning {
+  border-color: rgba(194, 120, 3, 0.28);
+  background: var(--state-warning-bg);
+  color: var(--state-warning);
 }
 
 .ptd-progress {

@@ -35,6 +35,7 @@ RUN apt-get update \
         libreoffice-impress \
         libreoffice-writer \
         p7zip-full \
+        postgresql-client \
         python3-uno \
         tzdata \
         unzip \

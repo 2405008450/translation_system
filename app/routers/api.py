@@ -50,6 +50,7 @@ from app.models import (
     Notification,
     Project,
     ProjectAssignment,
+    ProjectMergeView,
     ProjectWorkflowStep,
     Segment,
     SegmentQAIssue,
@@ -219,6 +220,14 @@ from app.services.project_file_export_zip_queue import (
     build_project_file_zip_export_download_response,
     ensure_project_file_zip_export_task_status,
     queue_project_file_zip_export,
+)
+from app.services.merge_view_service import (
+    load_view_file_records,
+    normalize_file_ids,
+    parse_file_ids,
+    serialize_file_ids,
+    serialize_merge_view_detail,
+    serialize_merge_view_summary,
 )
 from app.services.project_segment_sync import (
     ProjectSyncDisableSummary,
@@ -8041,6 +8050,333 @@ def download_project_file_export_zip_task(
     return build_project_file_zip_export_download_response(task_id)
 
 
+# ---------------------------------------------------------------------------
+# 项目"合并视图"（merge-views）
+# 合并视图只持久化"哪些 file_records 组成一个编辑视图"。句段仍归属各自
+# file_record，保存/导出复用按文件的现有接口；此处仅提供视图 CRUD 与
+# 聚合读取（把多文件句段按"文件顺序 + 文件内顺序"展平，每段附 file_record_id）。
+# ---------------------------------------------------------------------------
+
+
+class MergeViewCreatePayload(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200, description="视图名称")
+    file_ids: list[UUID] = Field(..., min_length=2, description="组成视图的文件 id，至少 2 个")
+
+
+class MergeViewUpdatePayload(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    file_ids: list[UUID] | None = Field(default=None, min_length=2)
+
+
+def _require_merge_view_manage_access(
+    db: Session, view: ProjectMergeView, current_user: User
+) -> None:
+    """管理合并视图需对所属项目有管理权限（沿用 can_manage_workflow 口径）。"""
+    project = db.query(Project).filter(Project.id == view.project_id).first()
+    if project is None:
+        raise HTTPException(status_code=404, detail="视图不存在。")
+    _require_project_read_access(project, current_user, db)
+    if not _can_manage_workflow(current_user):
+        raise HTTPException(status_code=403, detail="仅项目管理员可操作合并视图。")
+
+
+def _get_merge_view_or_404(db: Session, view_id: UUID) -> ProjectMergeView:
+    view = db.query(ProjectMergeView).filter(ProjectMergeView.id == view_id).first()
+    if view is None:
+        raise HTTPException(status_code=404, detail="视图不存在。")
+    return view
+
+
+def _validate_and_order_view_file_ids(
+    db: Session, project: Project, file_ids: list[UUID], current_user: User
+) -> list[UUID]:
+    """校验文件归属该项目且当前用户可读，去重保序返回。"""
+    ordered = normalize_file_ids(file_ids)
+    if len(ordered) < 2:
+        raise HTTPException(status_code=400, detail="合并视图至少需要选择两个文件。")
+    files = (
+        db.query(FileRecord)
+        .filter(
+            FileRecord.project_id == project.id,
+            FileRecord.id.in_(ordered),
+        )
+        .all()
+    )
+    file_by_id = {f.id: f for f in files}
+    for fid in ordered:
+        file_record = file_by_id.get(fid)
+        if file_record is None:
+            raise HTTPException(status_code=400, detail="部分文件不存在或不属于当前项目。")
+        if not _can_read_file_record(file_record, current_user, db):
+            raise HTTPException(status_code=404, detail="部分文件不存在或未分配给当前用户。")
+    return ordered
+
+
+@router.get("/projects/{project_id}/merge-views")
+def list_project_merge_views(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """列出项目的合并视图（含文件数、creator、时间）。需项目读权限。"""
+    project = _get_project_or_404(db, project_id)
+    _require_project_read_access(project, current_user, db)
+    views = (
+        db.query(ProjectMergeView)
+        .filter(ProjectMergeView.project_id == project.id)
+        .order_by(ProjectMergeView.created_at.desc())
+        .all()
+    )
+    return {
+        "project_id": str(project.id),
+        "items": [serialize_merge_view_summary(db, view, current_user=current_user) for view in views],
+    }
+
+
+@router.post("/projects/{project_id}/merge-views")
+def create_project_merge_view(
+    project_id: UUID,
+    payload: MergeViewCreatePayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """创建合并视图。需项目管理权限；校验文件归属该项目、去重保序。"""
+    project = _get_project_or_404(db, project_id)
+    _require_project_read_access(project, current_user, db)
+    if not _can_manage_workflow(current_user):
+        raise HTTPException(status_code=403, detail="仅项目管理员可创建合并视图。")
+    ordered = _validate_and_order_view_file_ids(db, project, payload.file_ids, current_user)
+    view = ProjectMergeView(
+        project_id=project.id,
+        name=payload.name.strip(),
+        file_ids=serialize_file_ids(ordered),
+        creator_id=current_user.id,
+    )
+    db.add(view)
+    db.commit()
+    db.refresh(view)
+    return serialize_merge_view_summary(db, view, current_user=current_user)
+
+
+@router.get("/merge-views/{view_id}")
+def get_merge_view_detail(
+    view_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """视图详情：name + 按顺序的文件元数据（含 status_stats）+ 合计。需项目读权限。"""
+    view = _get_merge_view_or_404(db, view_id)
+    project = _get_project_or_404(db, view.project_id)
+    _require_project_read_access(project, current_user, db)
+    files = load_view_file_records(db, view)
+    payload = serialize_merge_view_detail(db, view, files)
+    for file_payload, file_record in zip(payload.get("files", []), files):
+        file_payload["can_write"] = _can_write_file_record(file_record, current_user, db)
+    return payload
+
+
+@router.patch("/merge-views/{view_id}")
+def update_merge_view(
+    view_id: UUID,
+    payload: MergeViewUpdatePayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """重命名或更新 file_ids。需项目管理权限。"""
+    view = _get_merge_view_or_404(db, view_id)
+    _require_merge_view_manage_access(db, view, current_user)
+    if payload.name is not None:
+        view.name = payload.name.strip()
+    if payload.file_ids is not None:
+        project = _get_project_or_404(db, view.project_id)
+        ordered = _validate_and_order_view_file_ids(db, project, payload.file_ids, current_user)
+        view.file_ids = serialize_file_ids(ordered)
+    db.commit()
+    db.refresh(view)
+    return serialize_merge_view_summary(db, view, current_user=current_user)
+
+
+@router.delete("/merge-views/{view_id}")
+def delete_merge_view(
+    view_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """删除视图记录（仅删视图，不动文件/句段）。需项目管理权限。"""
+    view = _get_merge_view_or_404(db, view_id)
+    _require_merge_view_manage_access(db, view, current_user)
+    db.delete(view)
+    db.commit()
+    return JSONResponse(status_code=200, content={"deleted": True, "id": str(view_id)})
+
+
+@router.get("/merge-views/{view_id}/segments")
+def get_merge_view_segments(
+    view_id: UUID,
+    skip: int = 0,
+    limit: int = 100,
+    scope: str = "all",
+    source_query: str | None = None,
+    target_query: str | None = None,
+    source_exclude: str | None = None,
+    target_exclude: str | None = None,
+    search_fuzzy: bool = False,
+    status_filters: str | None = None,
+    status_filters_bracket: list[str] | None = Query(default=None, alias="status_filters[]"),
+    match_filters: str | None = None,
+    match_filters_bracket: list[str] | None = Query(default=None, alias="match_filters[]"),
+    source_filters: str | None = None,
+    source_filters_bracket: list[str] | None = Query(default=None, alias="source_filters[]"),
+    workflow_step_ids: str | None = None,
+    workflow_step_ids_bracket: list[str] | None = Query(default=None, alias="workflow_step_ids[]"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """聚合读取：把视图下各文件句段按"文件顺序 + 文件内顺序"展平分页。
+
+    每个句段附带 file_record_id 与 filename；返回分组边界信息供前端渲染分组表头。
+    复用单文件句段的筛选/排序/序列化 helper，跨文件循环拼接。
+    """
+    view = _get_merge_view_or_404(db, view_id)
+    project = _get_project_or_404(db, view.project_id)
+    _require_project_read_access(project, current_user, db)
+    files = load_view_file_records(db, view)
+
+    safe_skip = max(skip, 0)
+    safe_limit = _normalize_segment_page_limit(limit)
+    normalized_status_filters = _normalize_segment_filter_values(status_filters, status_filters_bracket)
+    normalized_match_filters = _normalize_segment_filter_values(match_filters, match_filters_bracket)
+    normalized_source_filters = _normalize_segment_filter_values(source_filters, source_filters_bracket)
+    normalized_workflow_step_ids = _normalize_segment_filter_values(workflow_step_ids, workflow_step_ids_bracket)
+
+    # 先按文件累计匹配数，确定 skip/limit 落在哪些文件、各文件取多少。
+    # 为避免逐文件全量序列化，采用"两段式"：先统计每文件匹配数，再按窗口取所需页片段。
+    per_file_matched: list[int] = []
+    per_file_queries: list = []
+    for file_record in files:
+        base_query = db.query(Segment).filter(Segment.file_record_id == file_record.id)
+        filtered_query = _apply_segment_scope_filter(base_query, scope)
+        filtered_query = _apply_segment_text_filters(
+            filtered_query,
+            source_query=source_query,
+            target_query=target_query,
+            source_exclude=source_exclude,
+            target_exclude=target_exclude,
+        )
+        filtered_query = _apply_segment_screening_filters(
+            filtered_query,
+            status_filters=normalized_status_filters,
+            match_filters=normalized_match_filters,
+            source_filters=normalized_source_filters,
+            workflow_step_ids=normalized_workflow_step_ids,
+        )
+        per_file_matched.append(filtered_query.count())
+        per_file_queries.append(filtered_query)
+
+    total_matched = sum(per_file_matched)
+    # 计算每个文件的窗口起止（在展平序列中的绝对区间）
+    flat_segments: list[tuple[Segment, FileRecord]] = []
+    cumulative = 0
+    remaining_skip = safe_skip
+    remaining_limit = safe_limit
+    for file_record, filtered_query, matched in zip(files, per_file_queries, per_file_matched):
+        if remaining_limit <= 0:
+            break
+        file_start = cumulative
+        file_end = cumulative + matched  # 不含
+        # 该文件是否有落在 [skip, skip+limit) 窗口内的句段
+        window_start = max(safe_skip, file_start)
+        window_end = min(safe_skip + safe_limit, file_end)
+        cumulative = file_end
+        if window_start >= window_end:
+            continue
+        local_skip = window_start - file_start
+        local_limit = window_end - window_start
+        page_segments = (
+            _order_segment_query(filtered_query)
+            .offset(local_skip)
+            .limit(local_limit)
+            .all()
+        )
+        for seg in page_segments:
+            flat_segments.append((seg, file_record))
+        remaining_skip = 0
+        remaining_limit -= local_limit
+
+    # 分组边界：返回每个文件在该页内的段数，供前端定位分组表头
+    groups: list[dict] = []
+    seg_index = 0
+    for file_record, matched in zip(files, per_file_matched):
+        page_count = 0
+        while seg_index < len(flat_segments) and flat_segments[seg_index][1].id == file_record.id:
+            page_count += 1
+            seg_index += 1
+        if page_count > 0:
+            groups.append({
+                "file_record_id": str(file_record.id),
+                "filename": file_record.filename,
+                "matched_segments": matched,
+                "page_segment_count": page_count,
+            })
+
+    # 序列化：每个文件独立构建 workflow/QA/numbering 上下文
+    serialized: list[dict] = []
+    segments_by_file: dict[UUID, list[Segment]] = {}
+    for seg, file_record in flat_segments:
+        segments_by_file.setdefault(file_record.id, []).append(seg)
+    for file_record in files:
+        segs = segments_by_file.get(file_record.id, [])
+        if not segs:
+            continue
+        workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+            db, file_record, current_user,
+        )
+        target_numbering = _build_target_automatic_numbering_text_map(file_record)
+        qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, segs)
+        display_index_map = _get_segment_display_index_map(db, file_record.id, segs)
+        source_filename = get_file_record_source_filename(file_record)
+        for seg in segs:
+            payload = _serialize_workbench_segment(
+                seg,
+                display_index=display_index_map.get(seg.id),
+                source_filename=source_filename,
+                target_automatic_numbering_by_sentence_id=target_numbering,
+                qa_issues_by_segment_id=qa_issues_by_segment_id,
+                workflow_step_by_id=workflow_step_by_id,
+                writable_workflow_step_ids=writable_workflow_step_ids,
+                can_manage=can_manage,
+            )
+            payload["file_record_id"] = str(file_record.id)
+            payload["filename"] = file_record.filename
+            serialized.append(payload)
+
+    # 恢复"文件顺序 + 文件内顺序"的稳定排序（序列化时按文件分组，顺序已保持）
+    return {
+        "merge_view_id": str(view.id),
+        "project_id": str(view.project_id),
+        "name": view.name,
+        "total_segments": total_matched,
+        "matched_segments": total_matched,
+        "skip": safe_skip,
+        "limit": safe_limit,
+        "filters": {
+            "scope": scope,
+            "source_query": source_query or "",
+            "target_query": target_query or "",
+            "source_exclude": source_exclude or "",
+            "target_exclude": target_exclude or "",
+            "search_fuzzy": search_fuzzy,
+            "status_filters": normalized_status_filters,
+            "match_filters": normalized_match_filters,
+            "source_filters": normalized_source_filters,
+            "workflow_step_ids": normalized_workflow_step_ids,
+        },
+        "groups": groups,
+        "server_time": datetime.now().isoformat(),
+        "segments": serialized,
+    }
+
+
 @router.post("/file-records/{file_record_id}/exports")
 @router.post("/documents/{file_record_id}/exports", include_in_schema=False)
 def create_file_record_export_task(
@@ -10138,8 +10474,27 @@ def search_file_record_bound_resources(
     _require_file_record_read_access(file_record, current_user)
     query_text = normalize_text(q or "")
     safe_limit = min(max(limit, 1), 100)
+    source_language, target_language = _resolve_file_record_language_pair(file_record)
     collection_ids = _load_file_record_collection_ids(file_record)
     term_base_ids = _load_file_record_term_base_ids(file_record)
+
+    if collection_ids:
+        collections = (
+            db.query(MemoryBase)
+            .filter(MemoryBase.id.in_(collection_ids))
+            .all()
+        )
+        for collection in collections:
+            _ensure_resource_language_pair_matches(collection, source_language, target_language, "记忆库")
+
+    if term_base_ids:
+        term_bases = (
+            db.query(TermBase)
+            .filter(TermBase.id.in_(term_base_ids))
+            .all()
+        )
+        for term_base in term_bases:
+            _ensure_resource_language_pair_matches(term_base, source_language, target_language, "术语库")
 
     if not query_text:
         return {
@@ -10162,6 +10517,8 @@ def search_file_record_bound_resources(
             db.query(TranslationMemory, MemoryBase.name.label("collection_name"))
             .outerjoin(MemoryBase, TranslationMemory.collection_id == MemoryBase.id)
             .filter(TranslationMemory.collection_id.in_(collection_ids))
+            .filter(TranslationMemory.source_language == source_language)
+            .filter(TranslationMemory.target_language == target_language)
         )
         if mode == "exact":
             tm_query = tm_query.filter(TranslationMemory.source_text.ilike(like_pattern))
@@ -10187,6 +10544,8 @@ def search_file_record_bound_resources(
             db.query(TermEntry, TermBase.name.label("term_base_name"))
             .outerjoin(TermBase, TermEntry.term_base_id == TermBase.id)
             .filter(TermEntry.term_base_id.in_(term_base_ids))
+            .filter(TermEntry.source_language == source_language)
+            .filter(TermEntry.target_language == target_language)
         )
         if mode == "exact":
             term_query = term_query.filter(TermEntry.source_text.ilike(like_pattern))

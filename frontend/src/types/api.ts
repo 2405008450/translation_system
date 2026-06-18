@@ -413,6 +413,9 @@ export interface Segment {
   can_write?: boolean
   qa_issues?: SegmentQAIssue[]
   updated_at: string | null
+  /** 合并视图聚合读取时附带：句段所属文件 id 与文件名 */
+  file_record_id?: string
+  filename?: string
 }
 
 export type SegmentQAIssueSeverity = 'low' | 'medium' | 'high'
@@ -549,6 +552,79 @@ export interface SegmentPositionResponse {
   page: number
   page_size: number
   page_index: number
+}
+
+/** 合并视图摘要（列表项） */
+export interface MergeView {
+  id: string
+  project_id: string
+  name: string
+  file_ids: string[]
+  file_count: number
+  available_file_count: number
+  creator_id: string | null
+  creator_name: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+/** 合并视图中的文件元数据（详情用） */
+export interface MergeViewFile {
+  id: string
+  filename: string
+  status: string
+  total_segments: number
+  status_stats: SegmentStatusStats
+  source_language: string | null
+  target_language: string | null
+  progress: number
+  can_write?: boolean
+  is_edit_locked: boolean
+}
+
+export interface MergeViewLanguagePair {
+  source_language: string | null
+  target_language: string | null
+  file_count: number
+}
+
+/** 合并视图详情 */
+export interface MergeViewDetail {
+  id: string
+  project_id: string
+  name: string
+  file_ids: string[]
+  files: MergeViewFile[]
+  total_files: number
+  total_segments: number
+  is_mixed_language_pair: boolean
+  language_pairs: MergeViewLanguagePair[]
+  creator_id: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+/** 合并视图聚合分页中的分组边界信息 */
+export interface MergeViewSegmentGroup {
+  file_record_id: string
+  filename: string
+  matched_segments: number
+  page_segment_count: number
+}
+
+/** 合并视图聚合句段分页响应 */
+export interface MergeViewSegmentPageResponse {
+  merge_view_id: string
+  project_id: string
+  name: string
+  total_segments: number
+  matched_segments: number
+  skip: number
+  limit: number
+  filters: SegmentPageFilters
+  groups: MergeViewSegmentGroup[]
+  server_time?: string
+  segments: Segment[]
 }
 
 export interface FileRecordPreview {
@@ -1084,6 +1160,8 @@ export interface SegmentUpdatePayload {
   track_revision?: boolean
   base_version?: number | null
   confirm?: boolean
+  /** 合并视图模式：该 dirty 条目归属的文件 id（前端分组保存用，后端 PUT 忽略） */
+  file_record_id?: string
 }
 
 export interface SegmentRevisionEntry {

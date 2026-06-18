@@ -96,8 +96,10 @@ import { buildDocumentPreviewHtml } from '../utils/documentPreview'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 
 const props = defineProps<{
-  id: string
+  id?: string
   standalone?: boolean
+  /** 合并视图 id：非空时进入合并模式，在同一工作台按文件分区编辑多个文件 */
+  mergeViewId?: string
 }>()
 
 type BottomToolKey = 'qa-result' | 'history' | 'source-preview' | 'target-preview' | 'split-preview'
@@ -485,6 +487,19 @@ const llmModelSelectOptions = computed(() => [
   )),
 ])
 
+const workbenchLLMScopeOptions = computed(() => (
+  llmScopeOptions.map((option) => {
+    if (!segmentStore.mergeViewId || option.value === 'current_segment') {
+      return option
+    }
+    return {
+      ...option,
+      label: `${option.label}（当前文件）`,
+      description: `${option.description} 合并视图中此范围仅处理当前激活文件。`,
+    }
+  })
+))
+
 watch(llmModel, (modelId) => {
   const selectedModel = llmModelOptions.find((option) => option.id === modelId)
   if (selectedModel) {
@@ -855,6 +870,77 @@ const currentLanguagePair = computed(() => (
   )
 ))
 
+const activeMergeViewFile = computed(() => {
+  const activeFileId = segmentStore.activeFileRecordId
+  if (!activeFileId) {
+    return null
+  }
+  return segmentStore.mergeViewDetail?.files.find((file) => file.id === activeFileId) ?? null
+})
+
+const activeWorkbenchFileId = computed(() => {
+  if (segmentStore.mergeViewId || props.mergeViewId) {
+    return segmentStore.activeFileRecordId || null
+  }
+  return segmentStore.fileRecord?.id || props.id || null
+})
+
+const activeWorkbenchFileContext = computed(() => {
+  if (segmentStore.mergeViewId || props.mergeViewId) {
+    return activeMergeViewFile.value
+  }
+  return segmentStore.fileRecord
+})
+
+const activeWorkbenchProjectId = computed(() => (
+  segmentStore.fileRecord?.project_id
+  || segmentStore.mergeViewDetail?.project_id
+  || projectReturnId.value
+  || null
+))
+
+const activeWorkbenchLanguagePair = computed(() => {
+  if (activeMergeViewFile.value) {
+    return formatLanguagePair(
+      activeMergeViewFile.value.source_language,
+      activeMergeViewFile.value.target_language,
+    )
+  }
+  return currentLanguagePair.value
+})
+
+function formatMergeLanguagePairSummary(pair: { source_language: string | null; target_language: string | null; file_count: number }) {
+  return `${formatLanguagePair(pair.source_language, pair.target_language)} ${pair.file_count} 个文件`
+}
+
+const mergeLanguagePairText = computed(() => {
+  const detail = segmentStore.mergeViewDetail
+  const pairs = detail?.language_pairs || []
+  if (!pairs.length) {
+    return '未设置语言对'
+  }
+  const summary = pairs.map(formatMergeLanguagePairSummary).join('；')
+  return detail?.is_mixed_language_pair ? `混合语言对：${summary}` : summary
+})
+
+const activeMergeFileContextText = computed(() => {
+  if (!segmentStore.mergeViewId) {
+    return ''
+  }
+  const file = activeMergeViewFile.value
+  if (!file) {
+    return '请先选中一个句段以确定当前文件'
+  }
+  return `当前文件：${file.filename} · ${activeWorkbenchLanguagePair.value}`
+})
+
+const activeMergeFileContextTitle = computed(() => {
+  if (!segmentStore.mergeViewId) {
+    return ''
+  }
+  return `${activeMergeFileContextText.value}。合并视图中的 AI、TM 和术语资源操作都会按当前文件隔离执行。`
+})
+
 function formatWorkbenchStatusTime(value: string | null | undefined) {
   if (!value) {
     return ''
@@ -916,8 +1002,34 @@ const ribbonStatusTitle = computed(() => (
 ))
 
 const activeSegment = computed(() => (
-  segmentStore.segments.find((segment) => segment.sentence_id === segmentStore.activeSentenceId) ?? null
+  segmentStore.segments.find((segment) => segmentStore.segmentKeyOf(segment) === segmentStore.activeSentenceId) ?? null
 ))
+/** 句段对外标识：合并模式为复合键，单文件即 sentence_id */
+function segmentKeyOf(segment: { sentence_id: string; file_record_id?: string }) {
+  return segmentStore.segmentKeyOf(segment as any)
+}
+/** VirtualList item-key 解析器：合并模式按复合键，单文件按 sentence_id */
+function segmentItemKey(item: any) {
+  return segmentStore.segmentKeyOf(item)
+}
+function shouldShowMergeGroupHeader(segment: Segment, index: number) {
+  if (!isMergeWorkbench.value || !segment.file_record_id) {
+    return false
+  }
+  const previous = editorSegments.value[index - 1]
+  return !previous || previous.file_record_id !== segment.file_record_id
+}
+function getMergeGroupFile(segment: Segment) {
+  const fileId = segment.file_record_id || ''
+  return segmentStore.mergeViewDetail?.files.find((file) => file.id === fileId) ?? null
+}
+function getMergeGroupProgressText(segment: Segment) {
+  const file = getMergeGroupFile(segment)
+  if (!file) {
+    return ''
+  }
+  return `${formatLanguagePair(file.source_language, file.target_language)} · ${file.progress}% · ${file.total_segments} 句段`
+}
 const activeSegmentCanWrite = computed(() => Boolean(activeSegment.value?.can_write))
 const workflowSteps = computed(() => segmentStore.fileRecord?.workflow_steps || [])
 const workflowStepById = computed(() => new Map(workflowSteps.value.map((step) => [step.id, step])))
@@ -1189,7 +1301,7 @@ const activeEditorIndex = computed(() => {
   if (!segmentStore.activeSentenceId) {
     return -1
   }
-  return editorSegments.value.findIndex((segment) => segment.sentence_id === segmentStore.activeSentenceId)
+  return editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === segmentStore.activeSentenceId)
 })
 
 const segmentOrdinalMap = computed(() => {
@@ -1199,7 +1311,7 @@ const segmentOrdinalMap = computed(() => {
     const displayIndex = typeof segment.display_index === 'number' && Number.isFinite(segment.display_index)
       ? segment.display_index
       : startIndex + index
-    nextMap.set(segment.sentence_id, displayIndex)
+    nextMap.set(segmentKeyOf(segment), displayIndex)
   })
   return nextMap
 })
@@ -1283,9 +1395,24 @@ const saveToTMPreviewStats = computed(() => {
 })
 
 const taskTMCollectionId = computed(() => segmentStore.fileRecord?.collection_id || '')
-const canOpenIssueDialog = computed(() => Boolean(segmentStore.fileRecord?.project_id))
+const canOpenIssueDialog = computed(() => Boolean(activeWorkbenchProjectId.value && activeWorkbenchFileId.value))
+const canOpenSaveToTMDialog = computed(() => Boolean(segmentStore.fileRecord) && !isMergeWorkbench.value)
+const saveToTMButtonTitle = computed(() => (
+  isMergeWorkbench.value
+    ? '合并视图暂不支持保存到 TM；请切到单文件工作台，或后续按语言对分批执行。'
+    : t('workbench.saveToTM')
+))
+const canRunTermQAReport = computed(() => Boolean(segmentStore.fileRecord) && !isMergeWorkbench.value && !generatingTermQAReport.value)
+const termQAButtonTitle = computed(() => (
+  isMergeWorkbench.value
+    ? '合并视图暂不跨文件生成术语 QA；请切到单文件工作台执行，避免语言对资源混用。'
+    : t('workbench.ribbon.qaSettings')
+))
 
 const boundTermBaseIds = computed(() => {
+  if (segmentStore.mergeViewId) {
+    return []
+  }
   const fileRecord = segmentStore.fileRecord
   if (!fileRecord) {
     return []
@@ -1297,6 +1424,11 @@ const boundTermBaseIds = computed(() => {
 })
 
 const boundResourceSummary = computed(() => {
+  if (segmentStore.mergeViewId) {
+    return activeMergeViewFile.value
+      ? `${activeMergeFileContextText.value}；仅搜索该文件绑定的资源库`
+      : '请选择一个句段后再搜索当前文件绑定的资源库'
+  }
   const collectionCount = segmentStore.fileRecord?.collection_ids?.length || (segmentStore.fileRecord?.collection_id ? 1 : 0)
   const termBaseCount = boundTermBaseIds.value.length
   return `已绑定 ${collectionCount} 个记忆库、${termBaseCount} 个术语库`
@@ -1437,15 +1569,32 @@ const sideToolButtons = computed(() => ([
   { key: 'reference' as const, label: '参考文件', icon: FileText, tone: 'reference' },
 ]))
 
-usePageHeader(() => ({
-  title: segmentStore.fileRecord?.filename || t('workbench.titleFallback'),
-  description: segmentStore.fileRecord
+const isMergeWorkbench = computed(() => Boolean(segmentStore.mergeViewId || props.mergeViewId))
+const workbenchHeaderTitle = computed(() => (
+  isMergeWorkbench.value
+    ? (segmentStore.mergeViewDetail?.name || '合并视图')
+    : (segmentStore.fileRecord?.filename || t('workbench.titleFallback'))
+))
+const workbenchHeaderDescription = computed(() => {
+  if (isMergeWorkbench.value) {
+    const detail = segmentStore.mergeViewDetail
+    if (!detail) {
+      return '正在加载合并视图'
+    }
+    return `${detail.total_files} 个文件 · ${segmentStore.loadedSegmentCount}/${detail.total_segments} 个句段 · ${mergeLanguagePairText.value}`
+  }
+  return segmentStore.fileRecord
     ? t('workbench.overviewDescription', {
         pair: currentLanguagePair.value,
         loaded: segmentStore.loadedSegmentCount,
         total: segmentStore.totalSegmentCount,
       })
-    : t('workbench.description'),
+    : t('workbench.description')
+})
+
+usePageHeader(() => ({
+  title: workbenchHeaderTitle.value,
+  description: workbenchHeaderDescription.value,
   breadcrumbs: hasProjectReturnContext.value
     ? [
         {
@@ -1460,11 +1609,11 @@ usePageHeader(() => ({
             ...(projectReturnParent.value ? { query: { from: projectReturnParent.value } } : {}),
           },
         },
-        { label: segmentStore.fileRecord?.filename || t('workbench.titleFallback') },
+        { label: workbenchHeaderTitle.value },
       ]
     : [
         { label: t('shell.sections.tasks'), to: { name: 'tasks' } },
-        { label: segmentStore.fileRecord?.filename || t('workbench.titleFallback') },
+        { label: workbenchHeaderTitle.value },
       ],
 }))
 
@@ -1488,6 +1637,15 @@ async function loadTermBases() {
   loadingTermBases.value = true
   termsMessage.value = t('workbench.terms.loadingBases')
   try {
+    if (segmentStore.mergeViewId) {
+      termBases.value = []
+      termEntries.value = []
+      selectedTermBaseId.value = ''
+      termsMessage.value = activeMergeViewFile.value
+        ? '合并视图已按当前文件隔离资源上下文；术语库浏览暂不跨文件加载，请使用“资源库搜索”查看当前文件绑定资源。'
+        : '请先选中一个句段以确定当前文件上下文。'
+      return
+    }
     const { data } = await http.get<TermBase[]>('/term-bases')
     const filtered = data.filter((termBase) => (
       termBase.source_language === segmentStore.fileRecord?.source_language
@@ -1545,14 +1703,24 @@ function resetResourceSearchResults(message = '请输入关键词，搜索当前
 async function runResourceSearch() {
   const keyword = resourceSearchQuery.value.trim()
   if (!keyword) {
-    resetResourceSearchResults()
+    resetResourceSearchResults(
+      segmentStore.mergeViewId
+        ? '请输入关键词，搜索当前激活文件绑定的记忆库和术语库。'
+        : undefined,
+    )
     return
   }
 
-  const fileRecordId = segmentStore.fileRecord?.id || props.id
+  const fileRecordId = activeWorkbenchFileId.value
+  if (!fileRecordId) {
+    resetResourceSearchResults('请先选中一个句段后再搜索当前文件绑定的资源库。')
+    return
+  }
   const requestId = ++resourceSearchRequestId
   resourceSearchLoading.value = true
-  resourceSearchMessage.value = '正在搜索绑定的资源库...'
+  resourceSearchMessage.value = segmentStore.mergeViewId
+    ? '正在搜索当前文件绑定的资源库...'
+    : '正在搜索绑定的资源库...'
   try {
     const { data } = await http.get<ResourceSearchResponse>(`/file-records/${fileRecordId}/resource-search`, {
       params: {
@@ -1751,6 +1919,10 @@ async function handleEditorReachEnd() {
 }
 
 function openImportDialog(tab: ResourceImportTab = 'tm') {
+  if (isMergeWorkbench.value && !activeWorkbenchFileId.value) {
+    toast.warn('请先选中一个句段，以确定资源导入的当前文件语言对。')
+    return
+  }
   importDialogInitialTab.value = tab
   showImportDialog.value = true
 }
@@ -1819,7 +1991,7 @@ function captureSegmentSearchReturnTarget() {
     return
   }
 
-  const segment = editorSegments.value.find((item) => item.sentence_id === sentenceId)
+  const segment = editorSegments.value.find((item) => segmentKeyOf(item) === sentenceId)
   const displayIndex = typeof segment?.display_index === 'number' && Number.isFinite(segment.display_index)
     ? segment.display_index
     : (segmentOrdinalMap.value.get(sentenceId) ?? null)
@@ -1931,7 +2103,7 @@ async function goToSegmentScreeningNumber() {
 }
 
 async function focusEditorSegmentBySentenceId(sentenceId: string) {
-  const index = editorSegments.value.findIndex((segment) => segment.sentence_id === sentenceId)
+  const index = editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === sentenceId)
   if (index < 0) {
     return false
   }
@@ -1948,11 +2120,21 @@ function getReturnTargetPage(target: { displayIndex: number | null; page: number
 
 async function resolveSegmentReturnTargetPage(target: { sentenceId: string; displayIndex: number | null; page: number }) {
   const localPage = getReturnTargetPage(target)
+  if (segmentStore.mergeViewId) {
+    return localPage
+  }
   if (typeof target.displayIndex === 'number' && Number.isFinite(target.displayIndex) && target.displayIndex >= 0) {
     return localPage
   }
 
-  const fileRecordId = segmentStore.fileRecord?.id || props.id
+  const fileRecordId = segmentStore.activeFileRecordId || segmentStore.fileRecord?.id || props.id
+  if (!fileRecordId) {
+    resetResourceSearchResults('请选择一个句段后再搜索资源库。')
+    return
+  }
+  if (!fileRecordId) {
+    return localPage
+  }
   try {
     const { data } = await http.get<SegmentPositionResponse>(
       `/file-records/${fileRecordId}/segments/${encodeURIComponent(target.sentenceId)}/position`,
@@ -1994,7 +2176,7 @@ async function clearSourceSegmentSearchQuery() {
   await nextTick()
   suppressSegmentFilterWatch = false
 
-  if (segmentStore.fileRecord) {
+  if (segmentStore.fileRecord || segmentStore.mergeViewId) {
     await refreshSegmentPage(targetPage, segmentStore.pageSize)
   }
 
@@ -2046,7 +2228,8 @@ function updateSegmentTarget(
   targetHtml?: string,
   options: UpdateSegmentTargetOptions = {},
 ) {
-  const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
+  // sentenceId 在合并模式下是复合键；按 key 查找句段
+  const segment = segmentStore.segments.find((item) => segmentKeyOf(item) === sentenceId)
   if (segment && !segment.can_write) {
     toast.warn('当前流程阶段无编辑权限')
     return
@@ -2070,7 +2253,7 @@ function updateSegmentTarget(
 }
 
 async function updateSegmentSource(sentenceId: string, sourceText: string) {
-  const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
+  const segment = segmentStore.segments.find((item) => segmentKeyOf(item) === sentenceId)
   if (segment && !segment.can_write) {
     toast.warn('当前流程阶段无编辑权限')
     return
@@ -2083,7 +2266,7 @@ async function updateSegmentSource(sentenceId: string, sourceText: string) {
 }
 
 async function toggleProjectSegmentSync(sentenceId: string, disabled: boolean) {
-  const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
+  const segment = segmentStore.segments.find((item) => segmentKeyOf(item) === sentenceId)
   if (segment && !segment.can_write) {
     toast.warn('当前流程阶段无编辑权限')
     return
@@ -2188,12 +2371,12 @@ async function replaceCurrentSearchMatch() {
   }
 
   updateSegmentTarget(
-    targetSegment.sentence_id,
+    segmentKeyOf(targetSegment),
     replaceTargetText(targetSegment.target_text || '', false),
     undefined,
     { recordUndo: true, undoInputType: 'replaceCurrentSearchMatch' },
   )
-  const targetIndex = editorSegments.value.findIndex((segment) => segment.sentence_id === targetSegment.sentence_id)
+  const targetIndex = editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === segmentKeyOf(targetSegment))
   if (targetIndex >= 0) {
     await focusEditorSegmentAtIndex(targetIndex)
   }
@@ -2274,7 +2457,7 @@ function confirmCurrentSentence() {
     return false
   }
   updateSegmentTarget(
-    activeSegment.value.sentence_id,
+    segmentKeyOf(activeSegment.value),
     activeSegment.value.target_text || '',
     activeSegment.value.target_html ?? undefined,
     { confirm: true },
@@ -2512,7 +2695,7 @@ function setCurrentTermQAReport(report: TermQAReport | null) {
 }
 
 async function loadLatestTermQAReport() {
-  if (!segmentStore.fileRecord || loadingTermQAReport.value) {
+  if (isMergeWorkbench.value || !segmentStore.fileRecord || loadingTermQAReport.value) {
     return
   }
   loadingTermQAReport.value = true
@@ -2536,6 +2719,10 @@ async function loadLatestTermQAReport() {
 }
 
 async function generateCurrentFileTermQAReport() {
+  if (isMergeWorkbench.value) {
+    toast.warn('合并视图暂不跨文件生成术语 QA；请切到单文件工作台执行，避免语言对资源混用。')
+    return
+  }
   if (!segmentStore.fileRecord || generatingTermQAReport.value) {
     return
   }
@@ -2577,7 +2764,7 @@ async function openTermQAResult() {
   previewPanelRendering.value = false
   activeBottomTool.value = 'qa-result'
   await scrollBottomPanelIntoView()
-  if (termQAReport.value) {
+  if (isMergeWorkbench.value || termQAReport.value) {
     return
   }
   await generateCurrentFileTermQAReport()
@@ -2869,7 +3056,7 @@ const canSplitSegment = computed(() => {
 const canMergeSegment = computed(() => {
   if (selectedSentenceIds.value.size < 2) return false
   return Array.from(selectedSentenceIds.value).every((sentenceId) => {
-    const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
+    const segment = segmentStore.segments.find((item) => segmentKeyOf(item) === sentenceId)
     return Boolean(segment?.can_write)
   })
 })
@@ -2890,7 +3077,7 @@ async function handleSplitSegment() {
   }
 
   try {
-    await segmentStore.splitSegment(activeSegment.value.sentence_id, caretOffset)
+    await segmentStore.splitSegment(segmentKeyOf(activeSegment.value), caretOffset)
     lastSourceCaretOffset.value = null
     // 刷新预览（如果预览面板已打开）
     if (activeBottomTool.value === 'source-preview' || activeBottomTool.value === 'split-preview') {
@@ -2912,7 +3099,7 @@ async function handleMergeSegment() {
 
   // 按当前显示顺序排列选中的句段
   const selectedIds = selectedSentenceIds.value
-  const orderedSegments = editorSegments.value.filter((s) => selectedIds.has(s.sentence_id))
+  const orderedSegments = editorSegments.value.filter((s) => selectedIds.has(segmentKeyOf(s)))
 
   if (orderedSegments.length < 2) {
     toast.warn({ message: t('workbench.messages.mergeSelectAtLeast') })
@@ -2933,9 +3120,9 @@ async function handleMergeSegment() {
   }
 
   try {
-    const baseSentenceId = orderedSegments[0].sentence_id
+    const baseSentenceId = segmentKeyOf(orderedSegments[0])
     for (let i = 1; i < orderedSegments.length; i++) {
-      await segmentStore.mergeSegment(baseSentenceId, orderedSegments[i].sentence_id)
+      await segmentStore.mergeSegment(baseSentenceId, segmentKeyOf(orderedSegments[i]))
     }
     selectedSentenceIds.value = new Set()
     // 刷新预览（如果预览面板已打开）
@@ -3460,6 +3647,10 @@ async function replaceSegmentPageQueryIfNeeded() {
 }
 
 async function loadTask() {
+  if (!props.id) {
+    pageError.value = t('workbench.errors.taskLoad')
+    return
+  }
   pageError.value = ''
   activeSideTool.value = null
   closeBottomDrawer()
@@ -3476,7 +3667,8 @@ async function loadTask() {
   setCurrentTermQAReport(null)
 
   try {
-    await segmentStore.loadTask(props.id, {
+    const taskId = props.id
+    await segmentStore.loadTask(taskId, {
       ...getSegmentWindowQuery(
         Number(route.query.page || 1),
         Number(route.query.pageSize || segmentStore.pageSize || 100),
@@ -3506,11 +3698,11 @@ async function loadTask() {
     try {
       const commentQuery = getCommentWindowQuery()
       if (commentQuery) {
-        await commentStore.loadComments(props.id, commentQuery)
+        await commentStore.loadComments(taskId, commentQuery)
       } else {
         commentStore.resetState()
       }
-      commentStore.startPolling(props.id, getCommentWindowQuery)
+      commentStore.startPolling(taskId, getCommentWindowQuery)
     } catch (error) {
       commentStore.message = getErrorMessage(error, t('workbench.errors.commentsUnavailable'))
     }
@@ -3536,12 +3728,54 @@ async function loadTask() {
   }
 }
 
+async function loadMergeViewTask() {
+  if (!props.mergeViewId) {
+    return
+  }
+  pageError.value = ''
+  activeSideTool.value = null
+  closeBottomDrawer()
+  openRevisionMenu.value = null
+  suppressSegmentFilterWatch = true
+  resetSegmentSearch()
+  suppressSegmentFilterWatch = false
+  commentStore.stopPolling()
+  termEntries.value = []
+  termBases.value = []
+  selectedTermBaseId.value = ''
+  resourceSearchQuery.value = ''
+  resetResourceSearchResults()
+  setCurrentTermQAReport(null)
+
+  try {
+    await segmentStore.loadMergeView(props.mergeViewId, {
+      ...getSegmentWindowQuery(
+        Number(route.query.page || 1),
+        Number(route.query.pageSize || segmentStore.pageSize || 100),
+      ),
+    })
+    await replaceSegmentPageQueryIfNeeded()
+    // 合并模式：禁用批注/项目同步轮询等单文件特性（一期）
+    commentStore.resetState()
+    workbenchGuidelines.value = ''
+    await loadTermBases()
+    await loadLatestTermQAReport()
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('workbench.errors.taskLoad'))
+  } finally {
+    await nextTick()
+    observeSegmentEditorResults()
+    scheduleSegmentEditorScrollbarGutterUpdate()
+  }
+}
+
 async function refreshSegmentPage(
   page = segmentStore.currentPage,
   size = segmentStore.pageSize,
   options: { includeStats?: boolean } = {},
 ) {
-  if (!segmentStore.fileRecord) {
+  const isMergeMode = Boolean(segmentStore.mergeViewId || props.mergeViewId)
+  if (!isMergeMode && !segmentStore.fileRecord) {
     return
   }
 
@@ -3559,22 +3793,28 @@ async function refreshSegmentPage(
       toast.warn(reason)
       return
     }
-    await segmentStore.loadSegmentPage({
-      ...getSegmentWindowQuery(page, size, includeStats || hadPendingEdits),
-    })
-    if (revisionTraceVisible.value) {
-      segmentStore.startRevisionTracking()
-    }
-    const commentQuery = getCommentWindowQuery()
-    try {
-      if (commentQuery) {
-        await commentStore.loadComments(props.id, commentQuery)
-        commentStore.startPolling(props.id, getCommentWindowQuery)
-      } else {
-        commentStore.resetState()
+    const nextQuery = getSegmentWindowQuery(page, size, includeStats || hadPendingEdits)
+    if (isMergeMode) {
+      await segmentStore.refreshMergeViewPage(nextQuery)
+      commentStore.resetState()
+    } else {
+      await segmentStore.loadSegmentPage({
+        ...nextQuery,
+      })
+      if (revisionTraceVisible.value) {
+        segmentStore.startRevisionTracking()
       }
-    } catch (error) {
-      commentStore.message = getErrorMessage(error, t('workbench.errors.commentsUnavailable'))
+      const commentQuery = getCommentWindowQuery()
+      try {
+        if (commentQuery && props.id) {
+          await commentStore.loadComments(props.id, commentQuery)
+          commentStore.startPolling(props.id, getCommentWindowQuery)
+        } else {
+          commentStore.resetState()
+        }
+      } catch (error) {
+        commentStore.message = getErrorMessage(error, t('workbench.errors.commentsUnavailable'))
+      }
     }
     await nextTick()
     await virtualListRef.value?.scrollToIndex(0, 'start')
@@ -3603,6 +3843,10 @@ async function handleSegmentPageSizeChange(size: number) {
 async function runLLMTranslation() {
   pageError.value = ''
   const currentSentenceId = activeSegment.value?.sentence_id || ''
+  if (segmentStore.mergeViewId && !segmentStore.activeFileRecordId) {
+    toast.warn('请先选中一个句段，以确定本次 AI 处理的当前文件。')
+    return
+  }
   if (llmScope.value === 'current_segment' && currentSentenceId && !activeSegmentCanWrite.value) {
     toast.warn('当前流程阶段无编辑权限')
     return
@@ -3639,6 +3883,13 @@ async function loadTMCollections() {
 }
 
 async function openSaveToTMDialog() {
+  if (isMergeWorkbench.value) {
+    toast.warn('合并视图暂不支持保存到 TM；请切到单文件工作台，或后续按语言对分批执行。')
+    return
+  }
+  if (!segmentStore.fileRecord) {
+    return
+  }
   pageError.value = ''
   saveToTMScope.value = 'translated'
   saveToTMTargetMode.value = 'new'
@@ -3785,6 +4036,18 @@ async function goBack() {
 }
 
 function openFocusWorkbench() {
+  if (props.mergeViewId) {
+    const resolved = router.resolve({
+      name: 'merge-view-focus',
+      params: { viewId: props.mergeViewId },
+      query: { ...route.query },
+    })
+    window.open(resolved.href, '_blank', 'noopener,noreferrer')
+    return
+  }
+  if (!props.id) {
+    return
+  }
   const resolved = router.resolve({
     name: 'workbench-focus',
     params: { id: props.id },
@@ -3802,7 +4065,7 @@ async function handlePreviewFocus(sentenceId: string) {
 
   if (hasEditorSegmentFilter.value) {
     await ensureFilteredCorpusLoaded()
-    const filteredIndex = editorSegments.value.findIndex((segment) => segment.sentence_id === sentenceId)
+    const filteredIndex = editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === sentenceId)
     if (filteredIndex === -1) {
       return
     }
@@ -3812,7 +4075,9 @@ async function handlePreviewFocus(sentenceId: string) {
     return
   }
 
-  const index = await segmentStore.ensureSentenceLoaded(sentenceId)
+  const index = segmentStore.mergeViewId
+    ? editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === sentenceId)
+    : await segmentStore.ensureSentenceLoaded(sentenceId)
   if (index === -1) {
     return
   }
@@ -3886,8 +4151,9 @@ async function waitForFileExportTask(task: FileExportTask) {
   }
 }
 
-async function exportWithType(exportType: string) {
-  if (!segmentStore.fileRecord || exporting.value) return
+async function exportWithTypeForFile(exportType: string, fileRecordId?: string | null) {
+  const targetFileRecordId = fileRecordId || segmentStore.fileRecord?.id || ''
+  if (!targetFileRecordId || exporting.value) return
 
   pageError.value = ''
   exporting.value = true
@@ -3902,7 +4168,7 @@ async function exportWithType(exportType: string) {
     }
 
     const { data: task } = await http.post<FileExportTask>(
-      `/file-records/${segmentStore.fileRecord.id}/exports`,
+      `/file-records/${targetFileRecordId}/exports`,
       null,
       { params: { type: exportType } },
     )
@@ -3928,6 +4194,10 @@ async function exportWithType(exportType: string) {
     exportProgress.value = 0
     exportMessage.value = ''
   }
+}
+
+async function exportWithType(exportType: string) {
+  await exportWithTypeForFile(exportType, segmentStore.fileRecord?.id)
 }
 
 // 点击外部关闭导出菜单
@@ -4098,7 +4368,7 @@ function handleAppendText(text: string) {
 
 // 加载参考文件匹配结果（工作台初始化时调用）
 async function loadReferenceMatchResult() {
-  const fileRecordId = segmentStore.fileRecord?.id
+  const fileRecordId = activeWorkbenchFileId.value
   if (!fileRecordId) return
 
   try {
@@ -4179,7 +4449,40 @@ function handleSegmentTargetActivate(sentenceId: string) {
 }
 
 watch(() => props.id, () => {
-  void loadTask()
+  if (props.mergeViewId) {
+    void loadMergeViewTask()
+  } else {
+    void loadTask()
+  }
+})
+
+watch(() => props.mergeViewId, () => {
+  if (props.mergeViewId) {
+    void loadMergeViewTask()
+  } else if (props.id) {
+    void loadTask()
+  }
+})
+
+watch(() => segmentStore.activeFileRecordId, () => {
+  if (!segmentStore.mergeViewId) {
+    return
+  }
+  referenceMatchResult.value = null
+  resetResourceSearchResults(
+    activeWorkbenchFileId.value
+      ? '请输入关键词，搜索当前激活文件绑定的资源库。'
+      : '请先选中一个句段后再搜索当前文件绑定的资源库。',
+  )
+  if (activeSideTool.value === 'terms' && !loadingTermBases.value) {
+    void loadTermBases()
+  }
+  if (
+    activeWorkbenchFileId.value
+    && (activeSideTool.value === 'reference' || activeSideTool.value === 'match-info')
+  ) {
+    void loadReferenceMatchResult()
+  }
 })
 
 watch(selectedTermBaseId, () => {
@@ -4216,7 +4519,7 @@ watch([
   }
   searchLoadRequestId += 1
   searchLoadingAllSegments.value = false
-  if (segmentStore.fileRecord) {
+  if (segmentStore.fileRecord || segmentStore.mergeViewId) {
     await refreshSegmentPage(1, segmentStore.pageSize)
   }
 })
@@ -4258,7 +4561,7 @@ onMounted(() => {
     observeSegmentEditorResults()
     scheduleSegmentEditorScrollbarGutterUpdate()
   })
-  void loadTask()
+  void (props.mergeViewId ? loadMergeViewTask() : loadTask())
   void loadGuidelineTemplates()
 })
 
@@ -4293,8 +4596,8 @@ onBeforeRouteLeave(async () => {
           {{ t('workbench.ribbon.startTab') }}
         </button>
         <div class="workbench-ribbon__task">
-          <strong>{{ segmentStore.fileRecord?.filename || t('workbench.titleFallback') }}</strong>
-          <span>{{ currentLanguagePair }}</span>
+          <strong>{{ workbenchHeaderTitle }}</strong>
+          <span>{{ isMergeWorkbench ? workbenchHeaderDescription : currentLanguagePair }}</span>
         </div>
         <div class="workbench-ribbon__top-actions" aria-label="任务操作">
           <button
@@ -4308,7 +4611,13 @@ onBeforeRouteLeave(async () => {
             <Save v-else :size="15" />
             <span>{{ segmentStore.saving ? t('common.actions.saving') : t('workbench.saveNow') }}</span>
           </button>
-          <button class="workbench-ribbon__top-action" type="button" @click="void openSaveToTMDialog()">
+          <button
+            class="workbench-ribbon__top-action"
+            type="button"
+            :disabled="!canOpenSaveToTMDialog"
+            :title="saveToTMButtonTitle"
+            @click="void openSaveToTMDialog()"
+          >
             <FileCheck :size="15" />
             <span>{{ t('workbench.saveToTM') }}</span>
           </button>
@@ -4361,12 +4670,15 @@ onBeforeRouteLeave(async () => {
       <div class="workbench-ribbon__ai-strip" aria-label="AI">
         <label class="ai-strip__field">
           <span>{{ t('workbench.aiScopeShort') }}</span>
-          <select v-model="llmScope" class="field__control">
-            <option v-for="option in llmScopeOptions" :key="option.value" :value="option.value">
+          <select v-model="llmScope" class="field__control" :title="activeMergeFileContextTitle || t('workbench.aiScope')">
+            <option v-for="option in workbenchLLMScopeOptions" :key="option.value" :value="option.value">
               {{ option.label }}
             </option>
           </select>
         </label>
+        <span v-if="isMergeWorkbench" class="ai-strip__context" :title="activeMergeFileContextTitle">
+          {{ activeMergeFileContextText }}
+        </span>
         <label class="ai-strip__field">
           <span>{{ t('workbench.aiProviderShort') }}</span>
           <select v-model="llmProvider" class="field__control">
@@ -4801,7 +5113,8 @@ onBeforeRouteLeave(async () => {
             <button
               class="tool-line tool-button"
               type="button"
-              :disabled="generatingTermQAReport"
+              :disabled="!canRunTermQAReport"
+              :title="termQAButtonTitle"
               @click="generateCurrentFileTermQAReport"
             >
               <span class="icon-text-area has_dropdown">
@@ -4907,8 +5220,8 @@ onBeforeRouteLeave(async () => {
 
         <label class="field field--compact workbench-toolbar__field">
           <span class="field__label">{{ t('workbench.aiScopeShort') }}</span>
-          <select v-model="llmScope" class="field__control" :title="t('workbench.aiScope')">
-            <option v-for="option in llmScopeOptions" :key="option.value" :value="option.value">
+          <select v-model="llmScope" class="field__control" :title="activeMergeFileContextTitle || t('workbench.aiScope')">
+            <option v-for="option in workbenchLLMScopeOptions" :key="option.value" :value="option.value">
               {{ option.label }}
             </option>
           </select>
@@ -4994,6 +5307,8 @@ onBeforeRouteLeave(async () => {
           <button
             class="button workbench-action"
             type="button"
+            :disabled="!canOpenSaveToTMDialog"
+            :title="saveToTMButtonTitle"
             @click="void openSaveToTMDialog()"
           >
             <FileCheck :size="14" />
@@ -5667,7 +5982,7 @@ onBeforeRouteLeave(async () => {
                 ref="virtualListRef"
                 :items="editorSegments"
                 :item-height="itemHeight"
-                item-key="sentence_id"
+                :item-key="segmentItemKey"
                 :adaptive="!isStandaloneWorkbench"
                 :virtualized="!isStandaloneWorkbench"
                 :overscan="isStandaloneWorkbench ? 8 : 4"
@@ -5675,30 +5990,48 @@ onBeforeRouteLeave(async () => {
                 @reach-end="handleEditorReachEnd"
               >
                 <template #default="{ item, index }">
-                  <SegmentEditorRow
-                    :ref="(instance) => setSegmentEditorRowRef(item.sentence_id, instance)"
-                    :segment="item"
-                    :index="getEditorSegmentDisplayIndex(item.sentence_id, index)"
-                    :active="segmentStore.activeSentenceId === item.sentence_id"
-                    :disabled="!item.can_write"
-                    :source-editing="sourceEditing"
-                    :selected="selectedSentenceIds.has(item.sentence_id)"
-                    :pending-revision="revisionTraceVisible ? segmentStore.getRevisionTrace(item.sentence_id) : null"
-                    :revision-busy="revisionActionLoading"
-                    :matched-terms="segmentStore.activeSentenceId === item.sentence_id ? activeMatchedTerms : []"
-                    :qa-issues="item.qa_issues || []"
-                    :source-search-query="sourceSearchQuery"
-                    :target-search-query="targetSearchQuery"
-                    :show-visible-chars="richTextEditor.visibleCharactersEnabled.value"
-                    :pending-formats="pendingFormatsForEditor"
-                    @focus="segmentStore.setActiveSentence"
-                    @activate-target="handleSegmentTargetActivate"
-                    @update="updateSegmentTarget"
-                    @update-source="updateSegmentSource"
-                    @toggle-project-sync="toggleProjectSegmentSync"
-                    @apply-partial-revision="handleApplyPartialRevision"
-                    @ctrl-click="handleSegmentClick"
-                  />
+                  <div class="merge-segment-group">
+                    <div v-if="shouldShowMergeGroupHeader(item, index)" class="merge-segment-group__header">
+                      <div>
+                        <strong>{{ item.filename || getMergeGroupFile(item)?.filename || t('workbench.currentTask') }}</strong>
+                        <span>{{ getMergeGroupProgressText(item) }}</span>
+                      </div>
+                      <button
+                        class="button merge-segment-group__export"
+                        type="button"
+                        :disabled="exporting"
+                        @click="exportWithTypeForFile('original', item.file_record_id)"
+                      >
+                        <Download :size="13" />
+                        <span>{{ t('common.actions.export') }}</span>
+                      </button>
+                    </div>
+                    <SegmentEditorRow
+                      :ref="(instance) => setSegmentEditorRowRef(segmentKeyOf(item), instance)"
+                      :segment="item"
+                      :segment-key="segmentKeyOf(item)"
+                      :index="getEditorSegmentDisplayIndex(segmentKeyOf(item), index)"
+                      :active="segmentStore.activeSentenceId === segmentKeyOf(item)"
+                      :disabled="!item.can_write"
+                      :source-editing="sourceEditing"
+                      :selected="selectedSentenceIds.has(segmentKeyOf(item))"
+                      :pending-revision="revisionTraceVisible ? segmentStore.getRevisionTrace(segmentKeyOf(item)) : null"
+                      :revision-busy="revisionActionLoading"
+                      :matched-terms="segmentStore.activeSentenceId === segmentKeyOf(item) ? activeMatchedTerms : []"
+                      :qa-issues="item.qa_issues || []"
+                      :source-search-query="sourceSearchQuery"
+                      :target-search-query="targetSearchQuery"
+                      :show-visible-chars="richTextEditor.visibleCharactersEnabled.value"
+                      :pending-formats="pendingFormatsForEditor"
+                      @focus="segmentStore.setActiveSentence"
+                      @activate-target="handleSegmentTargetActivate"
+                      @update="updateSegmentTarget"
+                      @update-source="updateSegmentSource"
+                      @toggle-project-sync="toggleProjectSegmentSync"
+                      @apply-partial-revision="handleApplyPartialRevision"
+                      @ctrl-click="handleSegmentClick"
+                    />
+                  </div>
                 </template>
               </VirtualList>
             </div>
@@ -5725,7 +6058,7 @@ onBeforeRouteLeave(async () => {
               class="segment-editor-bottom-tool segment-editor-bottom-tool--qa"
               :class="{ 'is-active': activeBottomTool === 'qa-result' }"
               type="button"
-              :title="termQAReport ? `QA结果：${termQAReport.active_issue_count} 条待处理` : '生成 QA 报告'"
+              :title="isMergeWorkbench ? termQAButtonTitle : (termQAReport ? `QA结果：${termQAReport.active_issue_count} 条待处理` : '生成 QA 报告')"
               :aria-pressed="activeBottomTool === 'qa-result'"
               :disabled="loadingTermQAReport || generatingTermQAReport"
               @click="void openTermQAResult()"
@@ -5944,7 +6277,8 @@ onBeforeRouteLeave(async () => {
                     <button
                       class="button button--ghost"
                       type="button"
-                      :disabled="generatingTermQAReport"
+                      :disabled="!canRunTermQAReport"
+                      :title="termQAButtonTitle"
                       @click="void generateCurrentFileTermQAReport()"
                     >
                       <Loader2 v-if="generatingTermQAReport" class="lucide-spin" :size="14" />
@@ -6058,7 +6392,8 @@ onBeforeRouteLeave(async () => {
                   <button
                     class="button"
                     type="button"
-                    :disabled="generatingTermQAReport"
+                    :disabled="!canRunTermQAReport"
+                    :title="termQAButtonTitle"
                     @click="void generateCurrentFileTermQAReport()"
                   >
                     <Loader2 v-if="generatingTermQAReport" class="lucide-spin" :size="14" />
@@ -6282,7 +6617,7 @@ onBeforeRouteLeave(async () => {
             :term-base-name="selectedTermBaseName"
             :term-entries="termEntries"
             :active-source-text="activeSegmentSourceText"
-            :file-record-id="segmentStore.fileRecord?.id || null"
+            :file-record-id="activeWorkbenchFileId"
             :reference-match-result="referenceMatchResult"
             @replace-text="handleReplaceText"
             @append-text="handleAppendText"
@@ -6387,13 +6722,20 @@ onBeforeRouteLeave(async () => {
             @cancel-draft="commentStore.setDraftAnchor(null)"
           />
           <ReferencePanel
-            v-else-if="activeSideTool === 'reference'"
+            v-else-if="activeSideTool === 'reference' && activeWorkbenchFileId"
             key="reference"
-            :file-record-id="segmentStore.fileRecord?.id || null"
+            :file-record-id="activeWorkbenchFileId"
             @matches-loaded="handleReferenceMatchesLoaded"
             @apply-exact-matches="handleReferenceApplyExactMatches"
             @ai-translate-complete="handleReferenceAITranslateComplete"
           />
+          <section
+            v-else-if="activeSideTool === 'reference'"
+            key="reference-context-required"
+            class="empty-state"
+          >
+            请选择一个句段以确定当前文件上下文。
+          </section>
         </Transition>
         </div>
       </div>
@@ -6434,20 +6776,20 @@ onBeforeRouteLeave(async () => {
     <ResourceImportDialog
       :open="showImportDialog"
       :initial-tab="importDialogInitialTab"
-      :context-label="t('workbench.importContext', { name: segmentStore.fileRecord?.filename || t('workbench.currentTask') })"
-      :source-language="segmentStore.fileRecord?.source_language || null"
-      :target-language="segmentStore.fileRecord?.target_language || null"
-      :default-tm-collection-id="segmentStore.fileRecord?.collection_id || ''"
-      :default-term-base-id="segmentStore.fileRecord?.term_base_id || ''"
+      :context-label="t('workbench.importContext', { name: activeWorkbenchFileContext?.filename || t('workbench.currentTask') })"
+      :source-language="activeWorkbenchFileContext?.source_language || null"
+      :target-language="activeWorkbenchFileContext?.target_language || null"
+      :default-tm-collection-id="segmentStore.mergeViewId ? '' : (segmentStore.fileRecord?.collection_id || '')"
+      :default-term-base-id="segmentStore.mergeViewId ? '' : (segmentStore.fileRecord?.term_base_id || '')"
       @close="showImportDialog = false"
       @imported="handleResourceImported"
     />
 
     <IssueMarkerDialog
       :open="showIssueDialog"
-      :project-id="segmentStore.fileRecord?.project_id || projectReturnId || null"
-      :file-record-id="segmentStore.fileRecord?.id || props.id"
-      :context-label="segmentStore.fileRecord?.filename || t('workbench.currentTask')"
+      :project-id="activeWorkbenchProjectId"
+      :file-record-id="activeWorkbenchFileId"
+      :context-label="activeWorkbenchFileContext?.filename || t('workbench.currentTask')"
       @close="showIssueDialog = false"
       @saved="handleIssueSaved"
     />
@@ -7006,6 +7348,21 @@ onBeforeRouteLeave(async () => {
   background-color: #fff;
   color: #163f4d;
   font-size: 11px;
+}
+
+.ai-strip__context {
+  min-width: 0;
+  max-width: min(360px, 28vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 4px 8px;
+  border: 1px solid rgba(15, 125, 120, 0.22);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.58);
+  color: #245d5b;
+  font-size: 11px;
+  line-height: 1.2;
 }
 
 .ai-strip__button {
@@ -9323,6 +9680,52 @@ onBeforeRouteLeave(async () => {
   overflow-y: scroll;
   scrollbar-width: thin;
   scrollbar-color: #52717a #e7f0ef;
+}
+
+.merge-segment-group {
+  display: grid;
+}
+
+.merge-segment-group__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 38px;
+  padding: 8px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--brand-700) 18%, var(--line-soft));
+  background: color-mix(in srgb, var(--brand-050) 58%, var(--surface-panel));
+  color: var(--text-primary);
+}
+
+.merge-segment-group__header > div {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.merge-segment-group__header strong,
+.merge-segment-group__header span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.merge-segment-group__header strong {
+  font-size: 13px;
+}
+
+.merge-segment-group__header span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.merge-segment-group__export {
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 4px 8px;
+  font-size: 12px;
 }
 
 .segment-editor-shell.has-bottom-drawer .segment-editor-results {

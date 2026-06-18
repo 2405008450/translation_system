@@ -1164,6 +1164,39 @@ CREATE INDEX IF NOT EXISTS ix_segment_revisions_sentence_id
 CREATE INDEX IF NOT EXISTS ix_segment_revisions_status
     ON segment_revisions (status);
 
+-- -----------------------------------------------------------------------------
+-- 7. 项目"合并视图"：记录哪些 file_records 组成一个编辑视图（仅持久化分组）
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS project_merge_views (
+    id UUID PRIMARY KEY DEFAULT (
+        lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
+        lpad(to_hex(floor(random() * 65536)::int), 4, '0') || '-' ||
+        '4' || substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        substr('89ab', floor(random() * 4)::int + 1, 1) ||
+        substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
+    )::uuid,
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name VARCHAR(200) NOT NULL,
+    file_ids TEXT NOT NULL DEFAULT '[]',
+    creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS ix_project_merge_views_project_id
+    ON project_merge_views (project_id);
+
+CREATE INDEX IF NOT EXISTS ix_project_merge_views_creator_id
+    ON project_merge_views (creator_id);
+
+DROP TRIGGER IF EXISTS update_project_merge_views_updated_at ON project_merge_views;
+
+CREATE TRIGGER update_project_merge_views_updated_at
+    BEFORE UPDATE ON project_merge_views
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
 -- =============================================================================
 -- 完成。首次运行后请通过前端 "/login" 页面使用首次初始化接口创建管理员账号：
 --   POST /api/auth/init  { "username": "admin", "password": "..." }
