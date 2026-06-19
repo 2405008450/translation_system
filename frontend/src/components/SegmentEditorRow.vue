@@ -6,7 +6,7 @@ import InteractiveDiffText from './InteractiveDiffText.vue'
 
 import { getLLMModelShortLabel } from '../constants/llm'
 import { getSegmentSourceMeta, getSegmentStatusMeta } from '../constants/status'
-import type { Segment, SegmentQAIssue, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
+import type { RevisionDisplaySettings, Segment, SegmentQAIssue, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
 import { findTermTextRanges } from '../utils/termMatching'
 import { computeDiff } from '../utils/textDiff'
 import type { TextFormat } from '../composables/useRichTextEditor'
@@ -19,6 +19,7 @@ const props = withDefaults(defineProps<{
   sourceEditing?: boolean
   selected?: boolean
   pendingRevision?: SegmentRevisionEntry | null
+  revisionSettings?: RevisionDisplaySettings | null
   revisionBusy?: boolean
   matchedTerms?: TermEntryRecord[]
   qaIssues?: SegmentQAIssue[]
@@ -33,6 +34,7 @@ const props = withDefaults(defineProps<{
   sourceEditing: false,
   selected: false,
   pendingRevision: null,
+  revisionSettings: null,
   revisionBusy: false,
   matchedTerms: () => [],
   qaIssues: () => [],
@@ -89,6 +91,12 @@ interface EditorUndoBoundaryOptions {
   inputType?: string
   data?: string | null
   preserveNextTargetSync?: boolean
+}
+
+interface CommittedEditorContent {
+  sentenceId: string
+  text: string
+  html: string | null
 }
 
 type HighlightKind = 'term' | 'search' | 'qa'
@@ -161,6 +169,35 @@ const hasPendingRevision = computed(() => Boolean(props.pendingRevision))
 const revisionAuthorClass = computed(() => (
   revisionAuthorRole.value === 'user' ? 'is-revision-author-user' : 'is-revision-author-admin'
 ))
+const revisionInsertColor = computed(() => {
+  const settings = props.revisionSettings
+  const authorId = props.pendingRevision?.author?.id || ''
+  return settings?.author_colors?.[authorId]?.insert || settings?.default_insert_color || '#2563eb'
+})
+const revisionDeleteColor = computed(() => {
+  const settings = props.revisionSettings
+  const authorId = props.pendingRevision?.author?.id || ''
+  return settings?.author_colors?.[authorId]?.delete || settings?.default_delete_color || '#dc2626'
+})
+const revisionColorStyle = computed(() => (
+  hasPendingRevision.value
+    ? {
+      '--rev-insert-color': revisionInsertColor.value,
+      '--rev-delete-color': revisionDeleteColor.value,
+    }
+    : {}
+))
+const revisionTooltip = computed(() => {
+  if (!props.pendingRevision || props.revisionSettings?.show_author_time === false) {
+    return ''
+  }
+  const author = props.pendingRevision.author
+  const authorName = author?.nickname || author?.username || '未知用户'
+  const createdAt = props.pendingRevision.created_at
+    ? new Date(props.pendingRevision.created_at).toLocaleString('zh-CN', { hour12: false })
+    : ''
+  return createdAt ? `${authorName} · ${createdAt}` : authorName
+})
 const scorePercent = computed(() => {
   if (!props.segment.score || props.segment.score <= 0) return null
   return Math.round(props.segment.score * 100)
@@ -364,10 +401,12 @@ const editorHtmlContent = computed(() => {
   return computeDiff(revision.before_text || '', revision.after_text || '')
     .map((segment) => {
       const editableAttr = segment.type === 'delete' ? ' contenteditable="false"' : ''
+      const titleAttr = revisionTooltip.value ? ` title="${escapeHtml(revisionTooltip.value)}"` : ''
       return [
         `<span class="segment-row__revision-segment segment-row__revision-${segment.type}"`,
         ` data-revision-type="${segment.type}"`,
         ` data-testid="segment-revision-${segment.type}"`,
+        titleAttr,
         editableAttr,
         '>',
         renderTargetTextHtml(segment.text),
@@ -791,6 +830,27 @@ function getCurrentEditorHtml(): string | null {
   return /<(b|strong|i|em|u|s|strike|del|sub|sup)>/i.test(html) ? html : null
 }
 
+function commitEditorContent(): CommittedEditorContent | null {
+  if (!editorRef.value || isApplyingHistory.value || isComposing.value) {
+    return null
+  }
+
+  const text = serializeEditorContent(editorRef.value)
+  const html = getCurrentEditorHtml()
+  const currentText = props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
+  const currentHtml = props.segment.target_html || null
+
+  if (text !== currentText || html !== currentHtml) {
+    emit('update', segmentKey.value, text, html || undefined)
+  }
+
+  return {
+    sentenceId: segmentKey.value,
+    text,
+    html,
+  }
+}
+
 function getCurrentEditorSnapshot(): EditorHistorySnapshot {
   const text = getCurrentEditorText()
   return {
@@ -1091,6 +1151,11 @@ function insertEditorLineBreak() {
 
 function handleKeydown(event: KeyboardEvent) {
   if (props.disabled || isApplyingHistory.value || event.altKey) {
+    return
+  }
+
+  if (event.key === 'Enter' && (event.isComposing || isComposing.value)) {
+    event.stopPropagation()
     return
   }
 
@@ -1516,6 +1581,7 @@ defineExpose({
   undoEditorChange,
   redoEditorChange,
   recordEditorUndoBoundary,
+  commitEditorContent,
   canUndoEditorChange,
   canRedoEditorChange,
 })
@@ -1666,6 +1732,7 @@ watch(
             { 'is-focused': isFocused, 'has-revision': hasPendingRevision },
             revisionAuthorClass,
           ]"
+          :style="revisionColorStyle"
           :contenteditable="!disabled"
           tabindex="0"
           data-testid="segment-target-editor"
@@ -2101,29 +2168,19 @@ watch(
 }
 
 .segment-row__editor :deep(.segment-row__revision-insert) {
-  color: #0070c0;
+  color: var(--rev-insert-color, #2563eb);
   text-decoration: underline;
-  text-decoration-color: rgba(0, 122, 204, 0.9);
+  text-decoration-color: var(--rev-insert-color, #2563eb);
   text-decoration-thickness: 1px;
   text-underline-offset: 2px;
 }
 
 .segment-row__editor :deep(.segment-row__revision-delete) {
-  color: #d69a00;
+  color: var(--rev-delete-color, #dc2626);
   text-decoration: line-through;
-  text-decoration-color: rgba(214, 154, 0, 0.95);
+  text-decoration-color: var(--rev-delete-color, #dc2626);
   text-decoration-thickness: 1px;
   user-select: text;
-}
-
-.segment-row__editor.is-revision-author-user :deep(.segment-row__revision-insert) {
-  color: #2e7d32;
-  text-decoration-color: rgba(46, 125, 50, 0.9);
-}
-
-.segment-row__editor.is-revision-author-user :deep(.segment-row__revision-delete) {
-  color: #c62828;
-  text-decoration-color: rgba(198, 40, 40, 0.9);
 }
 
 .segment-row__editor[contenteditable="false"] {

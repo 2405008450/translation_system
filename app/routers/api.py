@@ -262,6 +262,12 @@ from app.services.revision_service import (
     reject_revision,
     serialize_segment_revision,
 )
+from app.services.revision_settings_service import (
+    DEFAULT_DELETE_COLOR,
+    DEFAULT_INSERT_COLOR,
+    get_revision_display_settings,
+    upsert_revision_display_settings,
+)
 from app.services.resource_export_queue import (
     ResourceExportFormat,
     build_resource_export_download_response,
@@ -1176,6 +1182,19 @@ class SegmentReplaceRequest(BaseModel):
 
 class RevisionResolvePayload(BaseModel):
     status: Literal["accepted", "rejected"]
+
+
+class RevisionAuthorColorPayload(BaseModel):
+    insert: str = Field(default=DEFAULT_INSERT_COLOR, max_length=20)
+    delete: str = Field(default=DEFAULT_DELETE_COLOR, max_length=20)
+
+
+class RevisionDisplaySettingsPayload(BaseModel):
+    show_author_time: bool = True
+    show_others_revisions: bool = True
+    default_insert_color: str = Field(default=DEFAULT_INSERT_COLOR, max_length=20)
+    default_delete_color: str = Field(default=DEFAULT_DELETE_COLOR, max_length=20)
+    author_colors: dict[str, RevisionAuthorColorPayload] = Field(default_factory=dict)
 
 
 class FileOperationLockRequest(BaseModel):
@@ -10459,6 +10478,36 @@ def get_file_record_revisions(
         file_record_id=file_record_id,
     )
     return [serialize_segment_revision(revision) for revision in revisions]
+
+
+@router.get("/file-records/{file_record_id}/revision-settings")
+def get_file_record_revision_settings(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File record not found.")
+
+    _require_file_record_read_access(file_record, current_user)
+    return get_revision_display_settings(db, file_record_id)
+
+
+@router.put("/file-records/{file_record_id}/revision-settings")
+def update_file_record_revision_settings(
+    file_record_id: UUID,
+    payload: RevisionDisplaySettingsPayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_file_record_write_access(db, file_record_id, current_user)
+    return upsert_revision_display_settings(
+        db,
+        file_record_id=file_record_id,
+        payload=payload.model_dump(mode="json"),
+        updated_by=current_user,
+    )
 
 
 @router.patch("/revisions/{revision_id}")

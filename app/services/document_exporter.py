@@ -736,8 +736,16 @@ def _group_table_cell_paragraphs(
     grouped_paragraphs: list[tuple[list[TextToken], int]] = []
     current_tokens: list[TextToken] = []
 
+    def flush_current_tokens() -> None:
+        nonlocal current_tokens
+        if not current_tokens:
+            return
+        grouped_paragraphs.append((current_tokens, _count_token_sentence_spans(current_tokens)))
+        current_tokens = []
+
     for paragraph in paragraphs:
         if not paragraph.tokens:
+            flush_current_tokens()
             continue
 
         paragraph_tokens = list(paragraph.tokens)
@@ -755,11 +763,10 @@ def _group_table_cell_paragraphs(
             current_tokens.extend(paragraph_tokens)
             continue
 
-        grouped_paragraphs.append((current_tokens, _count_token_sentence_spans(current_tokens)))
+        flush_current_tokens()
         current_tokens = paragraph_tokens
 
-    if current_tokens:
-        grouped_paragraphs.append((current_tokens, _count_token_sentence_spans(current_tokens)))
+    flush_current_tokens()
 
     return grouped_paragraphs
 
@@ -772,8 +779,17 @@ def _group_table_cell_paragraph_groups(
     current_paragraphs: list[CellParagraphTokens] = []
     current_tokens: list[TextToken] = []
 
+    def flush_current_paragraphs() -> None:
+        nonlocal current_paragraphs, current_tokens
+        if not current_paragraphs:
+            return
+        grouped_paragraphs.append((current_paragraphs, _count_token_sentence_spans(current_tokens)))
+        current_paragraphs = []
+        current_tokens = []
+
     for paragraph in paragraphs:
         if not paragraph.tokens:
+            flush_current_paragraphs()
             continue
 
         paragraph_tokens = list(paragraph.tokens)
@@ -793,12 +809,11 @@ def _group_table_cell_paragraph_groups(
             current_paragraphs.append(paragraph)
             continue
 
-        grouped_paragraphs.append((current_paragraphs, _count_token_sentence_spans(current_tokens)))
+        flush_current_paragraphs()
         current_paragraphs = [paragraph]
         current_tokens = paragraph_tokens
 
-    if current_paragraphs:
-        grouped_paragraphs.append((current_paragraphs, _count_token_sentence_spans(current_tokens)))
+    flush_current_paragraphs()
 
     return grouped_paragraphs
 

@@ -18,6 +18,7 @@ import type {
   MergeViewSegmentGroup,
   ProjectSegmentSyncSummary,
   ProjectSyncDisableResult,
+  RevisionDisplaySettings,
   Segment,
   SegmentPageResponse,
   SegmentRevisionEntry,
@@ -35,6 +36,9 @@ const AUTO_SYNC_DELAY_MS = 1500
 const CHANGE_POLL_INTERVAL_MS = 10000
 const CHANGE_POLL_BURST_DELAYS_MS = [1200, 3000, 6000, 10000]
 const EXPORT_POLL_INTERVAL_MS = 1200
+const REVISION_TRACKING_STORAGE_KEY = 'workbench.revisionTrackingEnabled'
+const DEFAULT_REVISION_INSERT_COLOR = '#2563eb'
+const DEFAULT_REVISION_DELETE_COLOR = '#dc2626'
 
 interface FileExportTask {
   task_id: string
@@ -120,6 +124,38 @@ function getEditLockedMessage(error: unknown) {
   return translate('stores.segment.syncLocked')
 }
 
+function getInitialRevisionTrackingEnabled() {
+  if (typeof window === 'undefined') {
+    return false
+  }
+  return window.localStorage.getItem(REVISION_TRACKING_STORAGE_KEY) === '1'
+}
+
+function persistRevisionTrackingEnabled(enabled: boolean) {
+  if (typeof window === 'undefined') {
+    return
+  }
+  try {
+    window.localStorage.setItem(REVISION_TRACKING_STORAGE_KEY, enabled ? '1' : '0')
+  } catch {
+    // 忽略浏览器隐私模式下的存储失败，当前会话仍可使用。
+  }
+}
+
+function createDefaultRevisionSettings(fileRecordId = ''): RevisionDisplaySettings {
+  return {
+    id: null,
+    file_record_id: fileRecordId,
+    show_author_time: true,
+    show_others_revisions: true,
+    default_insert_color: DEFAULT_REVISION_INSERT_COLOR,
+    default_delete_color: DEFAULT_REVISION_DELETE_COLOR,
+    author_colors: {},
+    updated_by: null,
+    updated_at: null,
+  }
+}
+
 export interface SegmentPageQuery {
   page?: number
   pageSize?: number
@@ -202,7 +238,8 @@ export const useSegmentStore = defineStore('segment', () => {
   const revisionHistory = ref<Record<string, SegmentRevisionEntry[]>>({})
   const localRevisionDrafts = ref<Record<string, SegmentRevisionEntry>>({})
   const localRevisionBaselines = ref<Record<string, string>>({})
-  const revisionTrackingEnabled = ref(false)
+  const revisionTrackingEnabled = ref(getInitialRevisionTrackingEnabled())
+  const revisionSettings = ref<RevisionDisplaySettings>(createDefaultRevisionSettings())
 
   // ---- 合并视图(merge-view)模式状态 ----
   // mergeViewId 非空即处于合并模式：segments 中每段带 file_record_id，
@@ -318,6 +355,7 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   const segmentIndexMap = new Map<string, number>()
+  const notifiedNoTMCollectionFileIds = new Set<string>()
   let syncTimer: number | null = null
   let syncPromise: Promise<boolean> | null = null
   let changePollTimer: number | null = null
@@ -357,7 +395,7 @@ export const useSegmentStore = defineStore('segment', () => {
     const sentenceIds = new Set<string>()
     for (const entries of Object.values(revisionHistory.value)) {
       for (const entry of entries) {
-        if (isPendingManualRevision(entry)) {
+        if (isVisiblePendingManualRevision(entry)) {
           sentenceIds.add(entry.sentence_id)
         }
       }
@@ -372,6 +410,19 @@ export const useSegmentStore = defineStore('segment', () => {
 
   function isPendingManualRevision(entry: SegmentRevisionEntry) {
     return entry.status === 'pending' && entry.source === 'manual'
+  }
+
+  function isVisibleRevision(entry: SegmentRevisionEntry) {
+    if (revisionSettings.value.show_others_revisions) {
+      return true
+    }
+    const userId = currentUserId()
+    const authorId = entry.author?.id || null
+    return !userId || !authorId || authorId === userId
+  }
+
+  function isVisiblePendingManualRevision(entry: SegmentRevisionEntry) {
+    return isPendingManualRevision(entry) && isVisibleRevision(entry)
   }
 
   function isLocalRevisionId(id: string) {
@@ -418,7 +469,27 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   function getPendingRevision(sentenceId: string) {
-    return revisionHistory.value[sentenceId]?.find(isPendingManualRevision) || null
+    return revisionHistory.value[sentenceId]?.find(isVisiblePendingManualRevision) || null
+  }
+
+  function listVisiblePendingRevisions() {
+    const revisions: SegmentRevisionEntry[] = []
+    const seenRevisionIds = new Set<string>()
+    for (const entries of Object.values(revisionHistory.value)) {
+      for (const entry of entries) {
+        if (isVisiblePendingManualRevision(entry) && !seenRevisionIds.has(entry.id)) {
+          revisions.push(entry)
+          seenRevisionIds.add(entry.id)
+        }
+      }
+    }
+    for (const entry of Object.values(localRevisionDrafts.value)) {
+      if (isPendingManualRevision(entry) && !seenRevisionIds.has(entry.id)) {
+        revisions.push(entry)
+        seenRevisionIds.add(entry.id)
+      }
+    }
+    return revisions.sort(compareRevisionEntries)
   }
 
   function getRevisionTrace(sentenceId: string) {
@@ -495,12 +566,14 @@ export const useSegmentStore = defineStore('segment', () => {
 
   function startRevisionTracking() {
     revisionTrackingEnabled.value = true
+    persistRevisionTrackingEnabled(true)
     ensureRevisionTrackingBaselines()
   }
 
   function stopRevisionTracking() {
     revisionTrackingEnabled.value = false
-    // 开关只控制修订痕迹是否显示；基准必须保留，避免再次开启时刷新快照。
+    persistRevisionTrackingEnabled(false)
+    // 停止记录时保留基准，避免再次开启后丢失当前会话里已有的待处理修订上下文。
   }
 
   function ensureRevisionTrackingBaselines() {
@@ -863,6 +936,43 @@ export const useSegmentStore = defineStore('segment', () => {
     return data
   }
 
+  async function fetchRevisionSettings(fileRecordId = fileRecord.value?.id || '') {
+    if (!fileRecordId) {
+      revisionSettings.value = createDefaultRevisionSettings()
+      return revisionSettings.value
+    }
+    const { data } = await http.get<RevisionDisplaySettings>(`/file-records/${fileRecordId}/revision-settings`)
+    revisionSettings.value = {
+      ...createDefaultRevisionSettings(fileRecordId),
+      ...data,
+      author_colors: data.author_colors || {},
+    }
+    return revisionSettings.value
+  }
+
+  async function saveRevisionSettings(payload: RevisionDisplaySettings) {
+    const fileRecordId = fileRecord.value?.id || payload.file_record_id
+    if (!fileRecordId) {
+      throw new Error('当前任务尚未加载，无法保存修订设置。')
+    }
+    const { data } = await http.put<RevisionDisplaySettings>(
+      `/file-records/${fileRecordId}/revision-settings`,
+      {
+        show_author_time: payload.show_author_time,
+        show_others_revisions: payload.show_others_revisions,
+        default_insert_color: payload.default_insert_color,
+        default_delete_color: payload.default_delete_color,
+        author_colors: payload.author_colors || {},
+      },
+    )
+    revisionSettings.value = {
+      ...createDefaultRevisionSettings(fileRecordId),
+      ...data,
+      author_colors: data.author_colors || {},
+    }
+    return revisionSettings.value
+  }
+
   function resetState() {
     if (syncTimer !== null) {
       window.clearTimeout(syncTimer)
@@ -906,6 +1016,7 @@ export const useSegmentStore = defineStore('segment', () => {
     lastModifiedAt.value = null
     dirtyEntries.value = {}
     conflictEntries.value = {}
+    notifiedNoTMCollectionFileIds.clear()
     changeCursor = null
     previewUpdateToken.value = 0
     lastPreviewUpdatedSentenceId.value = null
@@ -913,7 +1024,8 @@ export const useSegmentStore = defineStore('segment', () => {
     revisionHistory.value = {}
     localRevisionDrafts.value = {}
     localRevisionBaselines.value = {}
-    revisionTrackingEnabled.value = false
+    revisionTrackingEnabled.value = getInitialRevisionTrackingEnabled()
+    revisionSettings.value = createDefaultRevisionSettings()
     syncPromise = null
     loadMorePromise = null
     pendingSegmentPageQuery = null
@@ -1093,6 +1205,10 @@ export const useSegmentStore = defineStore('segment', () => {
         applySegmentPageData(page.data, page.resolved)
       }
       await loadRevisions(fileRecordId)
+      await fetchRevisionSettings(fileRecordId)
+      if (revisionTrackingEnabled.value) {
+        ensureRevisionTrackingBaselines()
+      }
       startChangePolling()
     } finally {
       loading.value = false
@@ -1603,7 +1719,7 @@ export const useSegmentStore = defineStore('segment', () => {
     if (sensitiveConflicts.length > 0) {
       applySyncConflicts(sensitiveConflicts, fileId)
     }
-    notifySyncSideEffects(data as { auto_tm?: { skipped_no_collection_count?: number }; project_sync: ProjectSegmentSyncSummary })
+    notifySyncSideEffects(fileId, data as { auto_tm?: { skipped_no_collection_count?: number }; project_sync: ProjectSegmentSyncSummary })
     return finishSyncState(hadConflict)
   }
 
@@ -1663,7 +1779,7 @@ export const useSegmentStore = defineStore('segment', () => {
       if (sensitiveConflicts.length > 0) {
         applySyncConflicts(sensitiveConflicts, result.fileId)
       }
-      notifySyncSideEffects(result.data as { auto_tm?: { skipped_no_collection_count?: number }; project_sync: ProjectSegmentSyncSummary })
+      notifySyncSideEffects(result.fileId, result.data as { auto_tm?: { skipped_no_collection_count?: number }; project_sync: ProjectSegmentSyncSummary })
     }
     dirtyEntries.value = nextDirtyEntries
     clearLocalRevisionDrafts(syncedSentenceIds)
@@ -1690,15 +1806,20 @@ export const useSegmentStore = defineStore('segment', () => {
     conflictEntries.value = nextConflicts
   }
 
-  function notifySyncSideEffects(data: {
+  function notifySyncSideEffects(fileId: string, data: {
     auto_tm?: { skipped_no_collection_count?: number }
     project_sync?: ProjectSegmentSyncSummary
   }) {
     if (data.auto_tm?.skipped_no_collection_count) {
+      if (notifiedNoTMCollectionFileIds.has(fileId)) {
+        return
+      }
+      notifiedNoTMCollectionFileIds.add(fileId)
       pushToast({
         tone: 'info',
         title: '未自动写入记忆库',
         message: '当前文件未绑定记忆库，确认译文已保存。',
+        duration: 2600,
       })
     }
   }
@@ -1784,6 +1905,18 @@ export const useSegmentStore = defineStore('segment', () => {
       return 0
     }
 
+    if (!revisionSettings.value.show_others_revisions) {
+      await loadRevisions(fileRecord.value.id)
+      const revisions = listVisiblePendingRevisions()
+      let updatedCount = 0
+      for (const revision of revisions) {
+        await acceptRevision(revision.id)
+        updatedCount += 1
+      }
+      await refreshCurrentSegmentPage()
+      return updatedCount
+    }
+
     const { data } = await http.post<{ updated_count: number }>(
       `/file-records/${fileRecord.value.id}/revisions/batch-accept`,
     )
@@ -1799,6 +1932,18 @@ export const useSegmentStore = defineStore('segment', () => {
     const synced = await syncToBackend()
     if (!synced) {
       return 0
+    }
+
+    if (!revisionSettings.value.show_others_revisions) {
+      await loadRevisions(fileRecord.value.id)
+      const revisions = listVisiblePendingRevisions()
+      let updatedCount = 0
+      for (const revision of revisions) {
+        await rejectRevision(revision.id)
+        updatedCount += 1
+      }
+      await refreshCurrentSegmentPage()
+      return updatedCount
     }
 
     const { data } = await http.post<{ updated_count: number }>(
@@ -2263,7 +2408,9 @@ export const useSegmentStore = defineStore('segment', () => {
     previewUpdateToken,
     lastPreviewUpdatedSentenceId,
     lastPreviewUpdatedText,
+    revisionTrackingEnabled,
     revisionHistory,
+    revisionSettings,
     conflictEntries,
     // 合并视图状态
     mergeViewId,
@@ -2275,6 +2422,8 @@ export const useSegmentStore = defineStore('segment', () => {
     startRevisionTracking,
     stopRevisionTracking,
     ensureRevisionTrackingBaselines,
+    fetchRevisionSettings,
+    saveRevisionSettings,
     loadTask,
     loadMergeView,
     refreshMergeViewPage,

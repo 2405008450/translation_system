@@ -397,6 +397,8 @@ test.describe.serial('核心 E2E 冒烟流程', () => {
 
     await focusPage.getByTestId('workbench-revision-toggle').click()
     await expect(focusPage.getByTestId('workbench-revision-toggle')).toHaveAttribute('aria-pressed', 'true')
+    await focusPage.getByTestId('workbench-revision-track-menu').click()
+    await focusPage.getByTestId('workbench-revision-show-trace').click()
 
     await editor.fill(acceptedText)
     await expect(firstRow.locator('[data-testid="segment-revision-insert"]')).toContainText(acceptedText)

@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, Uuid, func, text
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, Uuid, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -348,6 +348,12 @@ class FileRecord(Base):
         "SegmentRevision",
         back_populates="file_record",
         cascade="all, delete-orphan",
+    )
+    revision_display_setting: Mapped["RevisionDisplaySetting | None"] = relationship(
+        "RevisionDisplaySetting",
+        back_populates="file_record",
+        cascade="all, delete-orphan",
+        uselist=False,
     )
     qa_issues: Mapped[list["SegmentQAIssue"]] = relationship(
         "SegmentQAIssue",
@@ -1235,6 +1241,76 @@ class SegmentRevision(Base):
     resolved_by: Mapped["User | None"] = relationship(
         "User",
         foreign_keys=[resolved_by_id],
+    )
+
+
+class RevisionDisplaySetting(Base):
+    __tablename__ = "revision_display_settings"
+    __table_args__ = (
+        UniqueConstraint("file_record_id", name="uq_revision_display_settings_file_record_id"),
+        Index("ix_revision_display_settings_updated_by_id", "updated_by_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    file_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    show_author_time: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default=text("TRUE"),
+    )
+    show_others_revisions: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default=text("TRUE"),
+    )
+    default_insert_color: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="#2563eb",
+        server_default=text("'#2563eb'"),
+    )
+    default_delete_color: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="#dc2626",
+        server_default=text("'#dc2626'"),
+    )
+    author_colors: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'"),
+    )
+    updated_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    file_record: Mapped["FileRecord"] = relationship(
+        "FileRecord",
+        back_populates="revision_display_setting",
+    )
+    updated_by: Mapped["User | None"] = relationship(
+        "User",
+        foreign_keys=[updated_by_id],
     )
 
 

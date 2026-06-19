@@ -19,6 +19,7 @@ SQL_FILES = [
     "scripts/init_db.sql",
     "scripts/add_user_nickname.sql",
     "scripts/create_segment_revisions.sql",
+    "scripts/create_revision_display_settings.sql",
     "scripts/add_project_fields.sql",
     "scripts/add_file_record_resource_binding.sql",
     "scripts/add_creator_to_entries.sql",
@@ -29,6 +30,7 @@ SQL_FILES = [
 
 E2E_TABLES = [
     "segment_qa_issues",
+    "revision_display_settings",
     "segment_revisions",
     "segment_comments",
     "issue_markers",

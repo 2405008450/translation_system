@@ -173,6 +173,7 @@ git pull
 # 若希望显式配置，从 .env.prod.example 合并新增项即可
 
 docker compose --env-file .env.prod -f docker-compose.prod.yml build app
+docker compose --env-file .env.prod -f docker-compose.prod.yml up --force-recreate db-migrate
 docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --force-recreate app worker
 ```
 
@@ -182,6 +183,7 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --force-rec
 
 ```bash
 sudo docker-compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml build app
+sudo docker-compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml up --force-recreate db-migrate
 sudo docker-compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml up -d --force-recreate app worker
 ```
 

@@ -68,6 +68,7 @@ case "$cmd" in
     ;;
   restart)
     compose build app
+    compose up --force-recreate db-migrate
     if [[ "${USE_NGINX:-0}" == "1" ]]; then
       compose up -d --force-recreate --no-deps app worker nginx
     else

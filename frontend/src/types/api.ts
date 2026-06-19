@@ -1188,6 +1188,23 @@ export interface SegmentRevisionEntry {
   resolved_at: string | null
 }
 
+export interface RevisionAuthorColors {
+  insert: string
+  delete: string
+}
+
+export interface RevisionDisplaySettings {
+  id: string | null
+  file_record_id: string
+  show_author_time: boolean
+  show_others_revisions: boolean
+  default_insert_color: string
+  default_delete_color: string
+  author_colors: Record<string, RevisionAuthorColors>
+  updated_by: User | null
+  updated_at: string | null
+}
+
 export interface CommentCreatePayload extends CommentAnchorDraft {
   segment_id?: string | null
   body: string

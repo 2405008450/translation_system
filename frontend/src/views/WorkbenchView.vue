@@ -52,6 +52,7 @@ import NotesPanel from '../components/NotesPanel.vue'
 import Pagination from '../components/Pagination.vue'
 import PreviewPanel from '../components/PreviewPanel.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
+import RevisionSettingsDialog from '../components/RevisionSettingsDialog.vue'
 import SegmentEditorRow from '../components/SegmentEditorRow.vue'
 import SplitPreviewPanel from '../components/SplitPreviewPanel.vue'
 import TMMatchPanel from '../components/TMMatchPanel.vue'
@@ -83,6 +84,7 @@ import type {
   IssueMarker,
   LLMProvider,
   LLMTranslateScope,
+  RevisionDisplaySettings,
   SaveToTMResult,
   Segment,
   SegmentPositionResponse,
@@ -129,6 +131,16 @@ interface FileExportTask {
   message?: string
   error?: string | null
 }
+interface RevisionAuthorOption {
+  id: string
+  name: string
+  username?: string | null
+}
+interface CommittedSegmentEditorContent {
+  sentenceId: string
+  text: string
+  html: string | null
+}
 type SegmentEditorRowPublic = ComponentPublicInstance & {
   undoEditorChange: () => boolean
   redoEditorChange: () => boolean
@@ -137,6 +149,7 @@ type SegmentEditorRowPublic = ComponentPublicInstance & {
     data?: string | null
     preserveNextTargetSync?: boolean
   }) => boolean
+  commitEditorContent: () => CommittedSegmentEditorContent | null
 }
 type UpdateSegmentTargetOptions = {
   confirm?: boolean
@@ -358,6 +371,8 @@ const confirmationActionLoading = ref(false)
 const openRevisionMenu = ref<RevisionMenuKind | null>(null)
 const revisionTraceVisible = ref(getInitialRevisionTraceVisible())
 const revisionActionLoading = ref(false)
+const showRevisionSettingsDialog = ref(false)
+const revisionSettingsSaving = ref(false)
 const segmentSearchOpen = ref(false)
 const segmentScreeningPopoverOpen = ref(false)
 const sourceEditing = ref(false)
@@ -1150,11 +1165,57 @@ const activeSegmentHistory = computed(() => (
     : []
 ))
 
+const revisionSettingsAuthors = computed<RevisionAuthorOption[]>(() => {
+  const authors = new Map<string, RevisionAuthorOption>()
+  const addAuthor = (user: { id?: string; username?: string | null; nickname?: string | null } | null | undefined) => {
+    if (!user?.id || authors.has(user.id)) {
+      return
+    }
+    authors.set(user.id, {
+      id: user.id,
+      name: user.nickname || user.username || user.id,
+      username: user.username || null,
+    })
+  }
+
+  addAuthor(authStore.user)
+  Object.values(segmentStore.revisionHistory).forEach((entries) => {
+    entries.forEach((entry) => addAuthor(entry.author))
+  })
+  return Array.from(authors.values())
+})
+
 const activePendingRevision = computed(() => (
   revisionTraceVisible.value && segmentStore.activeSentenceId
     ? segmentStore.getRevisionTrace(segmentStore.activeSentenceId)
     : null
 ))
+
+function resolveRevisionNavigationTarget(direction: 'prev' | 'next') {
+  const revisionItems = editorSegments.value
+    .map((segment, index) => ({
+      key: segmentKeyOf(segment),
+      index,
+    }))
+    .filter((item) => Boolean(segmentStore.getRevisionTrace(item.key)))
+
+  if (!revisionItems.length) {
+    return null
+  }
+
+  const activeIndex = editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === segmentStore.activeSentenceId)
+  const anchorIndex = activeIndex === -1
+    ? (direction === 'next' ? -1 : editorSegments.value.length)
+    : activeIndex
+
+  if (direction === 'next') {
+    return revisionItems.find((item) => item.index > anchorIndex)?.key || null
+  }
+  return revisionItems.slice().reverse().find((item) => item.index < anchorIndex)?.key || null
+}
+
+const canGoPrevRevision = computed(() => Boolean(resolveRevisionNavigationTarget('prev')))
+const canGoNextRevision = computed(() => Boolean(resolveRevisionNavigationTarget('next')))
 
 const activeSegmentSourceText = computed(() => activeSegment.value?.source_text || '')
 
@@ -2252,6 +2313,25 @@ function updateSegmentTarget(
   segmentStore.updateTarget(sentenceId, targetText, targetHtml, { confirm: options.confirm })
 }
 
+function commitActiveSegmentEditorContent(): CommittedSegmentEditorContent | null {
+  const segment = activeSegment.value
+  if (!segment) {
+    return null
+  }
+
+  const sentenceId = segmentKeyOf(segment)
+  const committed = segmentEditorRowRefs.get(sentenceId)?.commitEditorContent()
+  if (committed?.sentenceId === sentenceId) {
+    return committed
+  }
+
+  return {
+    sentenceId,
+    text: segment.target_text || '',
+    html: segment.target_html || null,
+  }
+}
+
 async function updateSegmentSource(sentenceId: string, sourceText: string) {
   const segment = segmentStore.segments.find((item) => segmentKeyOf(item) === sentenceId)
   if (segment && !segment.can_write) {
@@ -2456,10 +2536,14 @@ function confirmCurrentSentence() {
     toast.warn('当前流程阶段无编辑权限')
     return false
   }
+  const targetContent = commitActiveSegmentEditorContent()
+  if (!targetContent) {
+    return false
+  }
   updateSegmentTarget(
-    segmentKeyOf(activeSegment.value),
-    activeSegment.value.target_text || '',
-    activeSegment.value.target_html ?? undefined,
+    targetContent.sentenceId,
+    targetContent.text,
+    targetContent.html || undefined,
     { confirm: true },
   )
   toast.success(t('workbench.messages.confirmed'))
@@ -3488,23 +3572,51 @@ function toggleRevisionMenu(kind: RevisionMenuKind) {
   openConfirmMenu.value = false
 }
 
+function toggleRevisionTracking() {
+  if (segmentStore.revisionTrackingEnabled) {
+    segmentStore.stopRevisionTracking()
+    toast.success(t('workbench.ribbon.messages.revisionTrackingStopped'))
+  } else {
+    segmentStore.startRevisionTracking()
+    toast.success(t('workbench.ribbon.messages.revisionTrackingStarted'))
+  }
+  openRevisionMenu.value = null
+}
+
 function setRevisionTraceVisible(visible: boolean) {
   revisionTraceVisible.value = visible
   try {
     window.localStorage.setItem(REVISION_TRACE_VISIBLE_STORAGE_KEY, visible ? '1' : '0')
   } catch {}
-  if (visible) {
-    segmentStore.startRevisionTracking()
-  } else {
-    segmentStore.stopRevisionTracking()
-  }
   openRevisionMenu.value = null
   toast.success(visible ? t('workbench.ribbon.messages.revisionTraceShown') : t('workbench.ribbon.messages.revisionTraceHidden'))
 }
 
 function openRevisionTraceSettings() {
   openRevisionMenu.value = null
-  toast.info(t('workbench.ribbon.messages.revisionTraceSettingsHint'))
+  showRevisionSettingsDialog.value = true
+}
+
+async function handleSaveRevisionSettings(payload: RevisionDisplaySettings) {
+  revisionSettingsSaving.value = true
+  pageError.value = ''
+  try {
+    await segmentStore.saveRevisionSettings(payload)
+    showRevisionSettingsDialog.value = false
+    toast.success(t('workbench.ribbon.messages.revisionTraceSettingsSaved'))
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('workbench.ribbon.messages.revisionTraceSettingsSaveFailed'))
+  } finally {
+    revisionSettingsSaving.value = false
+  }
+}
+
+async function goToPendingRevision(direction: 'prev' | 'next') {
+  const target = resolveRevisionNavigationTarget(direction)
+  if (!target) {
+    return
+  }
+  await handlePreviewFocus(target)
 }
 
 async function handleAcceptActiveRevision() {
@@ -3691,7 +3803,7 @@ async function loadTask() {
     if (segmentStore.segments[0] && !segmentStore.activeSentenceId) {
       segmentStore.setActiveSentence(segmentStore.segments[0].sentence_id)
     }
-    if (revisionTraceVisible.value) {
+    if (segmentStore.revisionTrackingEnabled) {
       segmentStore.startRevisionTracking()
     }
 
@@ -3801,7 +3913,7 @@ async function refreshSegmentPage(
       await segmentStore.loadSegmentPage({
         ...nextQuery,
       })
-      if (revisionTraceVisible.value) {
+      if (segmentStore.revisionTrackingEnabled) {
         segmentStore.startRevisionTracking()
       }
       const commentQuery = getCommentWindowQuery()
@@ -4960,21 +5072,84 @@ onBeforeRouteLeave(async () => {
         </div>
 
         <div class="tool-group tool-group--revision">
-          <button
-            class="tool-col tool-col--big tool-button workbench-revision-trigger"
-            data-testid="workbench-revision-toggle"
-            type="button"
-            :class="{ active: revisionTraceVisible }"
-            :aria-pressed="revisionTraceVisible"
-            @click.stop="setRevisionTraceVisible(!revisionTraceVisible)"
-          >
-            <span class="tool-line line1 with-big-icon" :class="{ active: revisionTraceVisible }">
-              <span class="icon-text-area">
-                <Type class="tool-single-icon" :size="27" />
+          <div class="workbench-revision-track">
+            <button
+              class="tool-col tool-col--big tool-button workbench-revision-trigger"
+              data-testid="workbench-revision-toggle"
+              type="button"
+              :class="{ active: segmentStore.revisionTrackingEnabled }"
+              :aria-pressed="segmentStore.revisionTrackingEnabled"
+              @click.stop="toggleRevisionTracking"
+            >
+              <span class="tool-line line1 with-big-icon" :class="{ active: segmentStore.revisionTrackingEnabled }">
+                <span class="icon-text-area">
+                  <Type class="tool-single-icon" :size="27" />
+                </span>
               </span>
-            </span>
-            <span class="tool-line" :class="{ active: revisionTraceVisible }"><span class="label">{{ t('workbench.ribbon.trackChanges') }}</span></span>
-          </button>
+              <span class="tool-line" :class="{ active: segmentStore.revisionTrackingEnabled }"><span class="label">{{ t('workbench.ribbon.trackChanges') }}</span></span>
+            </button>
+            <button
+              class="workbench-revision-track__menu workbench-revision-trigger"
+              data-testid="workbench-revision-track-menu"
+              type="button"
+              :aria-expanded="openRevisionMenu === 'track'"
+              :title="t('workbench.ribbon.revisionTraceSettings')"
+              @click.stop="toggleRevisionMenu('track')"
+            >
+              <ChevronDown :size="12" />
+            </button>
+            <div
+              v-if="openRevisionMenu === 'track'"
+              class="workbench-revision-menu__dropdown workbench-revision-menu__dropdown--track"
+              role="menu"
+            >
+              <button
+                data-testid="workbench-revision-show-trace"
+                type="button"
+                :class="{ 'is-selected': revisionTraceVisible }"
+                @click="setRevisionTraceVisible(true)"
+              >
+                <span>{{ t('workbench.ribbon.showRevisionTrace') }}</span>
+                <Check v-if="revisionTraceVisible" class="workbench-revision-menu__check" :size="13" />
+              </button>
+              <button
+                data-testid="workbench-revision-hide-trace"
+                type="button"
+                :class="{ 'is-selected': !revisionTraceVisible }"
+                @click="setRevisionTraceVisible(false)"
+              >
+                <span>{{ t('workbench.ribbon.hideRevisionTrace') }}</span>
+                <Check v-if="!revisionTraceVisible" class="workbench-revision-menu__check" :size="13" />
+              </button>
+              <button data-testid="workbench-revision-settings" type="button" @click="openRevisionTraceSettings">
+                <span>{{ t('workbench.ribbon.revisionTraceSettings') }}</span>
+              </button>
+            </div>
+          </div>
+          <span class="tool-col revision-nav-col">
+            <button
+              class="tool-line tool-button revision-nav-button"
+              data-testid="workbench-revision-prev"
+              type="button"
+              :disabled="revisionActionLoading || !revisionTraceVisible || !canGoPrevRevision"
+              :title="t('workbench.ribbon.prevRevision')"
+              :aria-label="t('workbench.ribbon.prevRevision')"
+              @click="void goToPendingRevision('prev')"
+            >
+              <ArrowLeft :size="15" />
+            </button>
+            <button
+              class="tool-line tool-button revision-nav-button"
+              data-testid="workbench-revision-next"
+              type="button"
+              :disabled="revisionActionLoading || !revisionTraceVisible || !canGoNextRevision"
+              :title="t('workbench.ribbon.nextRevision')"
+              :aria-label="t('workbench.ribbon.nextRevision')"
+              @click="void goToPendingRevision('next')"
+            >
+              <ArrowRight :size="15" />
+            </button>
+          </span>
           <span class="tool-col align-left revision-action-col">
             <div class="workbench-revision-menu workbench-revision-menu--ribbon">
               <button
@@ -6016,6 +6191,7 @@ onBeforeRouteLeave(async () => {
                       :source-editing="sourceEditing"
                       :selected="selectedSentenceIds.has(segmentKeyOf(item))"
                       :pending-revision="revisionTraceVisible ? segmentStore.getRevisionTrace(segmentKeyOf(item)) : null"
+                      :revision-settings="segmentStore.revisionSettings"
                       :revision-busy="revisionActionLoading"
                       :matched-terms="segmentStore.activeSentenceId === segmentKeyOf(item) ? activeMatchedTerms : []"
                       :qa-issues="item.qa_issues || []"
@@ -6794,6 +6970,15 @@ onBeforeRouteLeave(async () => {
       @saved="handleIssueSaved"
     />
 
+    <RevisionSettingsDialog
+      :open="showRevisionSettingsDialog"
+      :settings="segmentStore.revisionSettings"
+      :authors="revisionSettingsAuthors"
+      :saving="revisionSettingsSaving"
+      @close="showRevisionSettingsDialog = false"
+      @save="handleSaveRevisionSettings"
+    />
+
     <Modal
       :open="showWorkflowTransitionDialog"
       :title="workflowTransitionDirection === 'forward' ? '前进句段' : '退回句段'"
@@ -7445,8 +7630,78 @@ onBeforeRouteLeave(async () => {
 
 .tool-group--revision {
   position: relative;
-  gap: 4px;
+  gap: 3px;
+  align-items: center;
+  padding-inline: 5px;
   overflow: visible;
+}
+
+.workbench-revision-track {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 64px;
+  min-height: 58px;
+}
+
+.workbench-revision-track > .tool-button.tool-col--big {
+  width: 64px;
+  border-color: transparent;
+}
+
+.workbench-revision-track > .tool-button.tool-col--big:hover:not(:disabled),
+.workbench-revision-track > .tool-button.tool-col--big:focus-visible,
+.workbench-revision-track > .tool-button.tool-col--big.active {
+  border-color: #b8cbd4;
+  background: linear-gradient(180deg, #f8fbfc 0%, #edf5f7 100%);
+}
+
+.workbench-revision-track__menu {
+  position: absolute;
+  right: 3px;
+  bottom: 19px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  min-height: 0;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.72);
+  color: #6b7a82;
+  cursor: pointer;
+}
+
+.workbench-revision-track__menu:hover,
+.workbench-revision-track__menu:focus-visible {
+  border-color: #b8cbd4;
+  background: rgba(0, 112, 192, 0.08);
+  color: #0070c0;
+  outline: none;
+}
+
+.revision-nav-col {
+  width: 28px;
+  min-height: 58px;
+  grid-template-rows: 1fr 1fr;
+  align-content: center;
+  gap: 2px;
+}
+
+.revision-nav-button {
+  justify-content: center;
+  width: 26px;
+  min-width: 26px;
+  height: 28px;
+  padding: 0;
+  color: #68777f;
+}
+
+.revision-nav-button:hover:not(:disabled),
+.revision-nav-button:focus-visible {
+  color: #0f6f83;
 }
 
 .tool-group--confirm {
@@ -7518,7 +7773,11 @@ onBeforeRouteLeave(async () => {
 }
 
 .revision-action-col {
-  width: 108px;
+  width: 104px;
+  min-height: 58px;
+  grid-template-rows: 28px 28px;
+  align-content: center;
+  gap: 2px;
 }
 
 .tool-col--big {
@@ -7705,7 +7964,20 @@ onBeforeRouteLeave(async () => {
 
 .workbench-revision-menu--ribbon .tool-button {
   justify-content: space-between;
-  min-width: 104px;
+  min-width: 100%;
+  height: 28px;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+.workbench-revision-menu--ribbon .tool-button .tool-item {
+  gap: 4px;
+}
+
+.workbench-revision-menu--ribbon .tool-button .text {
+  max-width: 72px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .workbench-revision-menu--ribbon .workbench-revision-menu__dropdown {

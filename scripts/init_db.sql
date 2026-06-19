@@ -1165,6 +1165,34 @@ CREATE INDEX IF NOT EXISTS ix_segment_revisions_status
     ON segment_revisions (status);
 
 -- -----------------------------------------------------------------------------
+-- 10. Revision display settings
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS revision_display_settings (
+    id UUID PRIMARY KEY DEFAULT (
+        lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
+        lpad(to_hex(floor(random() * 65536)::int), 4, '0') || '-' ||
+        '4' || substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        substr('89ab', floor(random() * 4)::int + 1, 1) ||
+        substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
+    )::uuid,
+    file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+    show_author_time BOOLEAN NOT NULL DEFAULT TRUE,
+    show_others_revisions BOOLEAN NOT NULL DEFAULT TRUE,
+    default_insert_color VARCHAR(20) NOT NULL DEFAULT '#2563eb',
+    default_delete_color VARCHAR(20) NOT NULL DEFAULT '#dc2626',
+    author_colors JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_revision_display_settings_file_record_id UNIQUE (file_record_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_revision_display_settings_file_record_id
+    ON revision_display_settings (file_record_id);
+CREATE INDEX IF NOT EXISTS ix_revision_display_settings_updated_by_id
+    ON revision_display_settings (updated_by_id);
+
+-- -----------------------------------------------------------------------------
 -- 7. 项目"合并视图"：记录哪些 file_records 组成一个编辑视图（仅持久化分组）
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS project_merge_views (
