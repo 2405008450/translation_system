@@ -7,6 +7,7 @@ import InteractiveDiffText from './InteractiveDiffText.vue'
 import { getLLMModelShortLabel } from '../constants/llm'
 import { getSegmentSourceMeta, getSegmentStatusMeta } from '../constants/status'
 import type { Segment, SegmentQAIssue, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
+import { findTermTextRanges } from '../utils/termMatching'
 import { computeDiff } from '../utils/textDiff'
 import type { TextFormat } from '../composables/useRichTextEditor'
 
@@ -180,24 +181,19 @@ function highlightText(
     (a, b) => b[field].length - a[field].length
   )
 
-  // 找出所有匹配位置
   const matches: Array<{ start: number; end: number }> = []
-  const lowerText = text.toLowerCase()
 
   for (const term of sortedTerms) {
     const termText = term[field]
     if (!termText) continue
-    const lowerTerm = termText.toLowerCase()
-    let pos = 0
-    while ((pos = lowerText.indexOf(lowerTerm, pos)) !== -1) {
+    for (const range of findTermTextRanges(text, termText)) {
       // 检查是否与已有匹配重叠
       const overlaps = matches.some(
-        (m) => !(pos + lowerTerm.length <= m.start || pos >= m.end)
+        (m) => !(range.end <= m.start || range.start >= m.end)
       )
       if (!overlaps) {
-        matches.push({ start: pos, end: pos + lowerTerm.length })
+        matches.push(range)
       }
-      pos += 1
     }
   }
 

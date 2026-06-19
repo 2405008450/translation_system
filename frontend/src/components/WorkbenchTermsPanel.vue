@@ -5,6 +5,7 @@ import { useI18n } from 'vue-i18n'
 import StateView from './base/StateView.vue'
 
 import type { TermBase, TermEntryRecord } from '../types/api'
+import { hasTermTextMatch } from '../utils/termMatching'
 
 const props = withDefaults(defineProps<{
   termBases: TermBase[]
@@ -25,14 +26,14 @@ const emit = defineEmits<{
 }>()
 const { t } = useI18n()
 
-const normalizedSourceText = computed(() => props.activeSourceText.trim().toLowerCase())
+const normalizedSourceText = computed(() => props.activeSourceText.trim())
 
 const matchedEntries = computed(() => {
   if (!normalizedSourceText.value) {
     return []
   }
 
-  return props.entries.filter((entry) => normalizedSourceText.value.includes(entry.source_text.trim().toLowerCase()))
+  return props.entries.filter((entry) => hasTermTextMatch(normalizedSourceText.value, entry.source_text))
 })
 
 const fallbackEntries = computed(() => props.entries.slice(0, 10))

@@ -197,6 +197,7 @@ from app.services.term_extraction_service import (
     extract_terms_from_segments,
     merge_extracted_terms,
 )
+from app.services.term_matcher import find_term_text_matches, text_contains_term
 from app.services.language_detection import detect_upload_language
 from app.services.language_pairs import require_language_pair
 from app.services.matcher import get_tm_candidates_for_text, match_sentences_with_stats
@@ -5240,9 +5241,7 @@ def _validate_term_base_setting_ids(
 
 
 def _text_contains_case_insensitive(text: str | None, needle: str | None) -> bool:
-    clean_text = (text or "").casefold()
-    clean_needle = (needle or "").strip().casefold()
-    return bool(clean_needle and clean_needle in clean_text)
+    return text_contains_term(text, needle)
 
 
 def _term_qa_source_key(source_text: str | None) -> str:
@@ -12587,6 +12586,7 @@ def import_termbase_xlsx(
 def match_terms(
     text: str,
     collection_ids: list[UUID] | None = None,
+    case_sensitive: bool = False,
     db: Session = Depends(get_db),
 ):
     """匹配文本中的术语，返回匹配到的术语列表（长术语优先）"""
@@ -12604,17 +12604,11 @@ def match_terms(
 
     matches = []
     matched_positions = set()
-    text_lower = text.lower()
 
     for term in sorted_terms:
-        term_lower = term.source_text.lower()
-        start = 0
-        while True:
-            pos = text_lower.find(term_lower, start)
-            if pos == -1:
-                break
-
-            end_pos = pos + len(term.source_text)
+        for text_match in find_term_text_matches(text, term.source_text, case_sensitive=case_sensitive):
+            pos = text_match.start
+            end_pos = text_match.end
             # 检查是否与已匹配的位置重叠
             overlap = False
             for matched_start, matched_end in matched_positions:
@@ -12631,8 +12625,6 @@ def match_terms(
                     "start": pos,
                     "end": end_pos,
                 })
-
-            start = pos + 1
 
     # 按位置排序
     matches.sort(key=lambda m: m["start"])

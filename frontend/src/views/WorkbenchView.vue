@@ -71,6 +71,7 @@ import { getTaskExportFormatLabel } from '../constants/taskFiles'
 import { llmModelOptions, llmProviderOptions, llmScopeOptions } from '../constants/llm'
 import { formatLanguagePair } from '../constants/languages'
 import { isProgressComplete } from '../utils/progress'
+import { hasTermTextMatch } from '../utils/termMatching'
 import { useAuthStore } from '../stores/auth'
 import { useCommentStore, type CommentWindowQuery } from '../stores/comment'
 import { useSegmentStore } from '../stores/segment'
@@ -1160,9 +1161,8 @@ const activeSegmentSourceText = computed(() => activeSegment.value?.source_text 
 // 计算当前激活段落匹配的术语（用于原文高亮）
 const activeMatchedTerms = computed(() => {
   if (!activeSegmentSourceText.value || termEntries.value.length === 0) return []
-  const sourceText = activeSegmentSourceText.value.toLowerCase()
   return termEntries.value
-    .filter((entry) => sourceText.includes(entry.source_text.toLowerCase()))
+    .filter((entry) => hasTermTextMatch(activeSegmentSourceText.value, entry.source_text))
     .slice()
     .sort((left, right) => right.source_text.length - left.source_text.length)
 })

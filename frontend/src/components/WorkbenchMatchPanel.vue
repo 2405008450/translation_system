@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 
 import type { Segment, TermEntryRecord, TMMatchCandidate, ReferenceMatchResult, ReferenceExactMatch, ReferenceFuzzyMatch, ReferenceTermMatch } from '../types/api'
 import { http } from '../api/http'
+import { hasTermTextMatch } from '../utils/termMatching'
 import DiffText from './DiffText.vue'
 
 const props = defineProps<{
@@ -37,9 +38,8 @@ const matchPercent = computed(() => {
 
 const matchedTerms = computed(() => {
   if (!props.activeSourceText || props.termEntries.length === 0) return []
-  const sourceText = props.activeSourceText.toLowerCase()
   return props.termEntries
-    .filter((entry) => sourceText.includes(entry.source_text.toLowerCase()))
+    .filter((entry) => hasTermTextMatch(props.activeSourceText, entry.source_text))
     .slice()
     .sort((left, right) => right.source_text.length - left.source_text.length)
 })
