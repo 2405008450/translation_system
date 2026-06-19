@@ -354,10 +354,17 @@ export interface UploadCapability {
   features: string[]
 }
 
+export interface UploadBatchLimits {
+  max_files_per_batch: number
+  max_total_size_mb: number
+  max_expanded_files: number
+}
+
 export interface UploadCapabilitiesResponse {
   extensions: string[]
   accept: string
   formats: UploadCapability[]
+  limits?: UploadBatchLimits
 }
 
 export interface TMMatchCandidate {
@@ -403,6 +410,8 @@ export interface Segment {
   source: string
   llm_provider: string | null
   llm_model: string | null
+  last_modified_by_id?: string | null
+  last_modified_by?: User | null
   block_type: string
   block_index: number
   row_index?: number | null

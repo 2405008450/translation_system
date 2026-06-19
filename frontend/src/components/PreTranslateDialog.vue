@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { BookOpen, BookOpenCheck, Bot, Check, Database, Loader2, Pause, Search, Sparkles, Upload, X } from 'lucide-vue-next'
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import { http } from '../api/http'
@@ -43,6 +43,44 @@ interface FileOperationLockResponse {
   is_edit_locked: boolean
 }
 
+interface PretranslationTaskStatus {
+  id: string
+  run_id: string
+  file_record_id: string
+  filename?: string | null
+  status: string
+  stage: string
+  progress: number
+  message: string
+  provider?: string | null
+  model?: string | null
+  scope?: string | null
+  total_segments: number
+  unique_segments: number
+  deduplicated_segments: number
+  processed_segments: number
+  updated_segments: number
+  error_segments: number
+  current_action?: string | null
+  cancel_requested: boolean
+  error?: string | null
+  updated_at?: string | null
+  last_heartbeat_at?: string | null
+}
+
+interface PretranslationRunStatus {
+  id: string
+  project_id: string
+  status: string
+  progress: number
+  message: string
+  total_files: number
+  completed_files: number
+  failed_files: number
+  canceled_files: number
+  tasks: PretranslationTaskStatus[]
+}
+
 type ResourceImportTab = 'tm' | 'glossary' | 'term'
 type LanguagePairStat = {
   source: string | null
@@ -52,6 +90,7 @@ type LanguagePairStat = {
 
 const props = defineProps<{
   open: boolean
+  projectId: string | null
   files: ProjectFileItem[]
   sourceLanguage: string | null
   targetLanguage: string | null
@@ -68,6 +107,8 @@ const FILE_OPERATION_TOKEN_HEADER = 'X-File-Operation-Token'
 const LOCK_HEARTBEAT_INTERVAL_MS = 30_000
 const LLM_STREAM_IDLE_TIMEOUT_MS = 150_000
 const RELEASE_LOCK_RETRY_DELAYS_MS = [600, 1_500, 3_000]
+const PRETRANSLATION_POLL_INTERVAL_MS = 2_000
+const ACTIVE_PRETRANSLATION_STATUSES = new Set(['queued', 'running', 'canceling'])
 
 const { t } = useI18n()
 
@@ -114,6 +155,9 @@ const activeResourceImportTab = ref<ResourceImportTab | null>(null)
 
 const progressByFileId = ref<Record<string, number>>({})
 const statusByFileId = ref<Record<string, string>>({})
+const activeRunId = ref('')
+const activeTaskIdsByFileId = ref<Record<string, string>>({})
+const pretranslationPollTimer = ref<number | null>(null)
 
 const llmProviderOptions = computed<Array<{ value: LLMProvider, label: string }>>(() => [
   { value: 'deepseek', label: t('projectDetail.preTranslate.llm.providers.deepseek') },
@@ -415,6 +459,8 @@ function resetProgress() {
   runFiles.value = []
   progressByFileId.value = {}
   statusByFileId.value = {}
+  activeRunId.value = ''
+  activeTaskIdsByFileId.value = {}
 }
 
 function normalizeProgress(progress: number) {
@@ -449,6 +495,132 @@ function setFileProgress(fileId: string, progress: number, status: string) {
     status,
     running: running.value,
   })
+}
+
+function stopPretranslationPolling() {
+  if (pretranslationPollTimer.value !== null) {
+    window.clearInterval(pretranslationPollTimer.value)
+    pretranslationPollTimer.value = null
+  }
+}
+
+function buildTaskStatusText(task: PretranslationTaskStatus) {
+  const parts: string[] = []
+  if (task.message) {
+    parts.push(task.message)
+  } else if (task.status === 'queued') {
+    parts.push(t('projectDetail.preTranslate.progress.pending'))
+  } else if (task.status === 'running') {
+    parts.push(t('projectDetail.preTranslate.progress.running'))
+  }
+  if (task.provider || task.model) {
+    parts.push([task.provider, task.model].filter(Boolean).join(' / '))
+  }
+  if (task.total_segments > 0 || task.processed_segments > 0) {
+    const total = Math.max(task.total_segments, task.processed_segments)
+    parts.push(`${task.processed_segments}/${total}`)
+  }
+  if (task.unique_segments > 0 && task.deduplicated_segments > 0) {
+    parts.push(`唯一 ${task.unique_segments}，去重 ${task.deduplicated_segments}`)
+  }
+  if (task.updated_segments > 0 || task.error_segments > 0) {
+    parts.push(`成功 ${task.updated_segments}，失败 ${task.error_segments}`)
+  }
+  if (task.error && task.status === 'failed') {
+    parts.push(task.error)
+  }
+  return parts.filter(Boolean).join(' · ')
+}
+
+function applyPretranslationRun(run: PretranslationRunStatus) {
+  activeRunId.value = run.id
+  const nextTaskIdsByFileId = { ...activeTaskIdsByFileId.value }
+  let activeCount = 0
+  let terminalCount = 0
+
+  for (const task of run.tasks || []) {
+    nextTaskIdsByFileId[task.file_record_id] = task.id
+    const taskRunning = ACTIVE_PRETRANSLATION_STATUSES.has(task.status)
+    if (taskRunning) {
+      activeCount += 1
+    } else {
+      terminalCount += 1
+    }
+    setFileProgress(
+      task.file_record_id,
+      normalizeProgress(task.progress),
+      buildTaskStatusText(task),
+    )
+  }
+
+  activeTaskIdsByFileId.value = nextTaskIdsByFileId
+  finishedCount.value = terminalCount
+  running.value = activeCount > 0
+  if (!running.value && run.tasks.length > 0) {
+    stopPretranslationPolling()
+    emitCurrentProgress(false)
+  }
+}
+
+async function pollPretranslationRun() {
+  if (!activeRunId.value) {
+    return
+  }
+  try {
+    const { data } = await http.get<PretranslationRunStatus>(`/pretranslation-runs/${activeRunId.value}`)
+    applyPretranslationRun(data)
+    if (!ACTIVE_PRETRANSLATION_STATUSES.has(data.status)) {
+      await handlePretranslationRunFinished(data)
+    }
+  } catch (error) {
+    stopPretranslationPolling()
+    running.value = false
+    const message = error instanceof Error ? error.message : t('projectDetail.preTranslate.errors.unknown')
+    pushToast({
+      tone: 'error',
+      title: t('projectDetail.preTranslate.toast.loadFailedTitle'),
+      message,
+    })
+  }
+}
+
+function startPretranslationPolling() {
+  stopPretranslationPolling()
+  pretranslationPollTimer.value = window.setInterval(() => {
+    void pollPretranslationRun()
+  }, PRETRANSLATION_POLL_INTERVAL_MS)
+}
+
+async function handlePretranslationRunFinished(run: PretranslationRunStatus) {
+  stopPretranslationPolling()
+  running.value = false
+  emitCurrentProgress(false)
+  activeRunId.value = ''
+
+  if (run.status === 'canceled' || stopRequested.value) {
+    pushToast({
+      tone: 'info',
+      title: t('projectDetail.preTranslate.toast.stoppedTitle'),
+      message: t('projectDetail.preTranslate.toast.stoppedMessage'),
+    })
+  } else if (run.status === 'failed') {
+    pushToast({
+      tone: 'warn',
+      title: t('projectDetail.preTranslate.toast.fileFailedTitle', { name: t('projectDetail.preTranslate.dialogTitle') }),
+      message: run.message || t('projectDetail.preTranslate.errors.unknown'),
+    })
+  } else {
+    pushToast({
+      tone: 'success',
+      title: t('projectDetail.preTranslate.toast.doneTitle'),
+      message: t('projectDetail.preTranslate.toast.doneMessage', {
+        done: run.completed_files,
+        total: Math.max(run.total_files, run.tasks.length, selectedCount.value),
+      }),
+    })
+  }
+
+  emit('done')
 }
 
 function emitCurrentProgress(runningState = running.value) {
@@ -958,6 +1130,7 @@ async function runLLMForFile(fileId: string, completedActions: number, actionCou
   }
 }
 
+/*
 async function startPreTranslate() {
   if (running.value || !validateBeforeStart()) {
     return
@@ -1155,7 +1328,86 @@ async function stopPreTranslate() {
   } catch {
     // 忽略浏览器取消流时的竞态错误。
   }
+    // 忽略浏览器取消流时的竞态错误。
+  }
 }
+}
+
+*/
+async function startPreTranslateTaskRun() {
+  if (running.value || !validateBeforeStart()) {
+    return
+  }
+
+  if (!props.projectId) {
+    errorMessage.value = t('projectDetail.preTranslate.errors.unknown')
+    return
+  }
+
+  running.value = true
+  stopRequested.value = false
+  resetProgress()
+  runFiles.value = [...props.files]
+  for (const file of runFiles.value) {
+    setFileProgress(file.id, 0, t('projectDetail.preTranslate.progress.pending'))
+  }
+
+  try {
+    const { data } = await http.post<PretranslationRunStatus>(`/projects/${props.projectId}/pretranslation-runs`, {
+      file_ids: runFiles.value.map((file) => file.id),
+      use_tm: shouldRunTm.value,
+      tm_collection_ids: selectedTmCollectionIds.value,
+      tm_threshold: normalizeTMThreshold(tmThreshold.value),
+      tm_skip_confirmed: tmSkipConfirmed.value,
+      tm_overwrite_fuzzy: tmOverwriteFuzzy.value,
+      tm_auto_confirm_exact: tmAutoConfirmExact.value,
+      use_glossary: useGlossary.value,
+      glossary_base_ids: selectedGlossaryBaseIds.value,
+      use_term_base: useTermBase.value,
+      term_base_ids: selectedTermBaseIds.value,
+      use_llm: useLlm.value,
+      llm_scope: llmScope.value,
+      llm_provider: llmProvider.value,
+      llm_model: llmModel.value || null,
+      llm_translation_unit: 'paragraph',
+      guideline_template_id: selectedGuidelineTemplateId.value || null,
+      temporary_prompt: llmGuidelines.value,
+    })
+
+    applyPretranslationRun(data)
+    if (ACTIVE_PRETRANSLATION_STATUSES.has(data.status)) {
+      startPretranslationPolling()
+      return
+    }
+    await handlePretranslationRunFinished(data)
+  } catch (error) {
+    running.value = false
+    stopPretranslationPolling()
+    const message = error instanceof Error ? error.message : t('projectDetail.preTranslate.errors.unknown')
+    errorMessage.value = message
+    pushToast({
+      tone: 'error',
+      title: t('projectDetail.preTranslate.toast.fileFailedTitle', { name: t('projectDetail.preTranslate.dialogTitle') }),
+      message,
+    })
+  }
+}
+
+async function stopPreTranslateTaskRun() {
+  if (!running.value) {
+    return
+  }
+  stopRequested.value = true
+  const taskIds = Array.from(new Set(Object.values(activeTaskIdsByFileId.value)))
+  await Promise.allSettled(taskIds.map((taskId) => (
+    http.post(`/pretranslation-tasks/${taskId}/cancel`)
+  )))
+  await pollPretranslationRun()
+}
+
+onBeforeUnmount(() => {
+  stopPretranslationPolling()
+})
 
 </script>
 
@@ -1689,7 +1941,7 @@ async function stopPreTranslate() {
             class="button button--danger"
             type="button"
             :disabled="stopRequested"
-            @click="stopPreTranslate"
+            @click="stopPreTranslateTaskRun"
           >
             <Pause :size="14" />
             {{ t('common.actions.pause') }}
@@ -1698,7 +1950,7 @@ async function stopPreTranslate() {
             class="button button--primary"
             type="button"
             :disabled="running || selectedCount === 0"
-            @click="startPreTranslate"
+            @click="startPreTranslateTaskRun"
           >
             <Loader2 v-if="running" class="lucide-spin" :size="14" />
             <Sparkles v-else :size="14" />

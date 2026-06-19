@@ -27,7 +27,13 @@ class Settings(BaseSettings):
     term_import_preview_max_scan_rows: int = 5000
     file_storage_dir: str = "data/file_records"
     export_task_dir: str = "data/export_tasks"
-    upload_max_size_mb: int = 10
+    import_task_dir: str = "data/import_tasks"
+    import_task_staging_ttl_seconds: int = 86400
+    # 全局 fallback；实际单文件上限以各格式 adapter 的 FORMAT_SIZE_LIMITS 为准。
+    upload_max_size_mb: int = 100
+    upload_max_files_per_batch: int = 50
+    upload_max_total_size_mb: int = 500
+    upload_max_expanded_files: int = 100
     default_similarity_threshold: float = 0.80
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"

@@ -7,6 +7,7 @@ import { fetchMergeViewSegmentPage, getMergeViewDetail } from '../api/mergeViews
 import { pushToast } from '../composables/useToast'
 import { buildTranslatedTaskFilename } from '../constants/taskFiles'
 import { translate } from '../i18n'
+import { useAuthStore } from './auth'
 import type {
   FileRecordDetail,
   FileRecordPreview,
@@ -143,7 +144,18 @@ interface SegmentChangeResponse {
   segments: Segment[]
 }
 
+interface SegmentConflictResponse {
+  sentence_id: string
+  current_version: number
+  attempted_version: number | null
+  current_target_text: string
+  conflict_source?: string | null
+  conflict_last_modified_by_id?: string | null
+  resolution?: string | null
+}
+
 export const useSegmentStore = defineStore('segment', () => {
+  const authStore = useAuthStore()
   const fileRecord = ref<FileRecordDetail | null>(null)
   const segments = ref<Segment[]>([])
   const previewHtml = ref('')
@@ -237,6 +249,72 @@ export const useSegmentStore = defineStore('segment', () => {
   }
   function segmentKeyOf(segment: Segment) {
     return buildSegmentKey(fileRecordIdForSegment(segment), segment.sentence_id)
+  }
+
+  function isMachineSegmentSource(source: string | null | undefined) {
+    return source === 'llm' || source === 'tm' || source === 'project_sync' || source === 'none' || !source
+  }
+
+  function currentUserId() {
+    return authStore.user?.id ?? null
+  }
+
+  function isSensitiveRemoteConflict(
+    source: string | null | undefined,
+    lastModifiedById: string | null | undefined,
+    incomingSource = 'manual',
+  ) {
+    const userId = currentUserId()
+    if (userId && lastModifiedById && lastModifiedById === userId) {
+      return false
+    }
+    if (incomingSource === 'manual' && isMachineSegmentSource(source)) {
+      return false
+    }
+    return source === 'manual'
+  }
+
+  function isSameDirtyPayload(
+    dirtyEntry: SegmentUpdatePayload | undefined,
+    payload: SegmentUpdatePayload,
+  ) {
+    return Boolean(
+      dirtyEntry
+      && dirtyEntry.target_text === payload.target_text
+      && (dirtyEntry.target_html || null) === (payload.target_html || null)
+      && dirtyEntry.source === payload.source
+      && Boolean(dirtyEntry.confirm) === Boolean(payload.confirm),
+    )
+  }
+
+  function bumpDirtyBaseVersion(
+    nextDirtyEntries: Record<string, SegmentUpdatePayload>,
+    key: string,
+    version: number | null | undefined,
+  ) {
+    const currentEntry = nextDirtyEntries[key]
+    const nextVersion = Number(version || 0)
+    if (!currentEntry || !nextVersion) {
+      return
+    }
+    nextDirtyEntries[key] = {
+      ...currentEntry,
+      base_version: Math.max(Number(currentEntry.base_version || 0), nextVersion),
+    }
+  }
+
+  function applyServerSegmentMetadata(segmentKey: string, remoteSegment: Segment) {
+    const index = getSegmentIndex(segmentKey)
+    if (index === -1) {
+      return
+    }
+    segments.value[index] = {
+      ...segments.value[index],
+      version: remoteSegment.version,
+      updated_at: remoteSegment.updated_at,
+      last_modified_by_id: remoteSegment.last_modified_by_id,
+      last_modified_by: remoteSegment.last_modified_by,
+    }
   }
 
   const segmentIndexMap = new Map<string, number>()
@@ -697,6 +775,7 @@ export const useSegmentStore = defineStore('segment', () => {
     try {
       const currentFileRecordId = fileRecord.value.id
       const nextConflicts = { ...conflictEntries.value }
+      const nextDirtyEntries = { ...dirtyEntries.value }
       let conflictAdded = false
       let hasMore = true
       let pageGuard = 0
@@ -717,16 +796,19 @@ export const useSegmentStore = defineStore('segment', () => {
             const baseVersion = Number(dirtyEntry.base_version || 0)
             const remoteVersion = Number(remoteSegment.version || 1)
             if (remoteVersion > baseVersion) {
-              nextConflicts[remoteSegment.sentence_id] = remoteSegment.target_text || ''
-              conflictAdded = true
-              const index = getSegmentIndex(remoteSegment.sentence_id)
-              if (index !== -1) {
-                segments.value[index] = {
-                  ...segments.value[index],
-                  version: remoteVersion,
-                  updated_at: remoteSegment.updated_at,
-                }
+              if ((remoteSegment.target_text || '') === (dirtyEntry.target_text || '')) {
+                bumpDirtyBaseVersion(nextDirtyEntries, remoteSegment.sentence_id, remoteVersion)
+              } else if (isSensitiveRemoteConflict(
+                remoteSegment.source,
+                remoteSegment.last_modified_by_id,
+                dirtyEntry.source,
+              )) {
+                nextConflicts[remoteSegment.sentence_id] = remoteSegment.target_text || ''
+                conflictAdded = true
+              } else {
+                bumpDirtyBaseVersion(nextDirtyEntries, remoteSegment.sentence_id, remoteVersion)
               }
+              applyServerSegmentMetadata(remoteSegment.sentence_id, remoteSegment)
               continue
             }
           }
@@ -736,6 +818,7 @@ export const useSegmentStore = defineStore('segment', () => {
         hasMore = Boolean(data.has_more)
       }
 
+      dirtyEntries.value = nextDirtyEntries
       conflictEntries.value = nextConflicts
       if (conflictAdded) {
         syncMessage.value = '检测到其他用户已更新同一句段，请确认后再保存本地修改。'
@@ -1432,12 +1515,7 @@ export const useSegmentStore = defineStore('segment', () => {
     const updates = items.map((item) => item.payload)
     const { data } = await http.put<{
       updated_count: number
-      conflicts?: Array<{
-        sentence_id: string
-        current_version: number
-        attempted_version: number | null
-        current_target_text: string
-      }>
+      conflicts?: SegmentConflictResponse[]
       auto_tm?: {
         queued_count: number
         skipped_no_collection_count: number
@@ -1457,21 +1535,45 @@ export const useSegmentStore = defineStore('segment', () => {
   /** 单文件保存后：应用服务端段、清成功 dirty、处理冲突，返回是否成功。 */
   function reconcileSingleSync(fileId: string, result: ReturnType<typeof syncOneFile> extends Promise<infer R> ? R : never): boolean {
     const { data, items } = result
-    applyServerSegments(data.segments || [], false)
     void loadRevisions(fileId)
     const nextDirtyEntries = { ...dirtyEntries.value }
     const syncedSentenceIds: string[] = []
+    const payloadByKey = new Map(items.map((item) => [item.key, item.payload]))
+    for (const segment of data.segments || []) {
+      const segmentKey = segment.sentence_id
+      const payload = payloadByKey.get(segmentKey)
+      const currentEntry = nextDirtyEntries[segmentKey]
+      if (currentEntry && (!payload || !isSameDirtyPayload(currentEntry, payload))) {
+        bumpDirtyBaseVersion(nextDirtyEntries, segmentKey, segment.version)
+        applyServerSegmentMetadata(segmentKey, segment)
+        continue
+      }
+      applyServerSegment(segment, false)
+    }
     const updatedSentenceIds = new Set((data.segments || []).map((segment) => segment.sentence_id))
-    const conflictSentenceIds = new Set((data.conflicts || []).map((conflict) => conflict.sentence_id))
+    const sensitiveConflicts = (data.conflicts || []).filter((conflict) => {
+      const key = conflict.sentence_id
+      const incomingSource = nextDirtyEntries[key]?.source || payloadByKey.get(key)?.source || 'manual'
+      if ((conflict.current_target_text || '') === (nextDirtyEntries[key]?.target_text || '')) {
+        bumpDirtyBaseVersion(nextDirtyEntries, key, conflict.current_version)
+        return false
+      }
+      if (isSensitiveRemoteConflict(
+        conflict.conflict_source,
+        conflict.conflict_last_modified_by_id,
+        incomingSource,
+      )) {
+        return true
+      }
+      bumpDirtyBaseVersion(nextDirtyEntries, key, conflict.current_version)
+      return false
+    })
+    const conflictSentenceIds = new Set(sensitiveConflicts.map((conflict) => conflict.sentence_id))
     let hadConflict = false
     for (const { key, payload } of items) {
       const currentEntry = nextDirtyEntries[key]
       if (
-        currentEntry
-        && currentEntry.target_text === payload.target_text
-        && (currentEntry.target_html || null) === (payload.target_html || null)
-        && currentEntry.source === payload.source
-        && Boolean(currentEntry.confirm) === Boolean(payload.confirm)
+        isSameDirtyPayload(currentEntry, payload)
         && (updatedSentenceIds.size === 0 || updatedSentenceIds.has(payload.sentence_id))
         && !conflictSentenceIds.has(payload.sentence_id)
       ) {
@@ -1483,10 +1585,10 @@ export const useSegmentStore = defineStore('segment', () => {
     }
     dirtyEntries.value = nextDirtyEntries
     clearLocalRevisionDrafts(syncedSentenceIds)
-    if ((data.conflicts || []).length > 0) {
-      applySyncConflicts(data.conflicts || [], fileId)
+    if (sensitiveConflicts.length > 0) {
+      applySyncConflicts(sensitiveConflicts, fileId)
     }
-    notifySyncSideEffects(data)
+    notifySyncSideEffects(data as { auto_tm?: { skipped_no_collection_count?: number }; project_sync: ProjectSegmentSyncSummary })
     return finishSyncState(hadConflict)
   }
 
@@ -1498,18 +1600,42 @@ export const useSegmentStore = defineStore('segment', () => {
     const syncedSentenceIds: string[] = []
     let hadConflict = false
     for (const result of results) {
-      applyServerSegments(result.data.segments || [], false)
+      const payloadByKey = new Map(result.items.map((item) => [item.key, item.payload]))
+      for (const segment of result.data.segments || []) {
+        const segmentKey = segmentKeyOf(segment)
+        const payload = payloadByKey.get(segmentKey)
+        const currentEntry = nextDirtyEntries[segmentKey]
+        if (currentEntry && (!payload || !isSameDirtyPayload(currentEntry, payload))) {
+          bumpDirtyBaseVersion(nextDirtyEntries, segmentKey, segment.version)
+          applyServerSegmentMetadata(segmentKey, segment)
+          continue
+        }
+        applyServerSegment(segment, false)
+      }
       // 合并模式下按文件加载修订意义不大（多文件），跳过 loadRevisions
       const updatedSentenceIds = new Set((result.data.segments || []).map((segment) => segment.sentence_id))
-      const conflictSentenceIds = new Set((result.data.conflicts || []).map((conflict) => conflict.sentence_id))
+      const sensitiveConflicts = (result.data.conflicts || []).filter((conflict) => {
+        const key = buildSegmentKey(result.fileId, conflict.sentence_id)
+        const incomingSource = nextDirtyEntries[key]?.source || payloadByKey.get(key)?.source || 'manual'
+        if ((conflict.current_target_text || '') === (nextDirtyEntries[key]?.target_text || '')) {
+          bumpDirtyBaseVersion(nextDirtyEntries, key, conflict.current_version)
+          return false
+        }
+        if (isSensitiveRemoteConflict(
+          conflict.conflict_source,
+          conflict.conflict_last_modified_by_id,
+          incomingSource,
+        )) {
+          return true
+        }
+        bumpDirtyBaseVersion(nextDirtyEntries, key, conflict.current_version)
+        return false
+      })
+      const conflictSentenceIds = new Set(sensitiveConflicts.map((conflict) => conflict.sentence_id))
       for (const { key, payload } of result.items) {
         const currentEntry = nextDirtyEntries[key]
         if (
-          currentEntry
-          && currentEntry.target_text === payload.target_text
-          && (currentEntry.target_html || null) === (payload.target_html || null)
-          && currentEntry.source === payload.source
-          && Boolean(currentEntry.confirm) === Boolean(payload.confirm)
+          isSameDirtyPayload(currentEntry, payload)
           && (updatedSentenceIds.size === 0 || updatedSentenceIds.has(payload.sentence_id))
           && !conflictSentenceIds.has(payload.sentence_id)
         ) {
@@ -1519,10 +1645,10 @@ export const useSegmentStore = defineStore('segment', () => {
           hadConflict = true
         }
       }
-      if ((result.data.conflicts || []).length > 0) {
-        applySyncConflicts(result.data.conflicts || [], result.fileId)
+      if (sensitiveConflicts.length > 0) {
+        applySyncConflicts(sensitiveConflicts, result.fileId)
       }
-      notifySyncSideEffects(result.data)
+      notifySyncSideEffects(result.data as { auto_tm?: { skipped_no_collection_count?: number }; project_sync: ProjectSegmentSyncSummary })
     }
     dirtyEntries.value = nextDirtyEntries
     clearLocalRevisionDrafts(syncedSentenceIds)
@@ -1558,20 +1684,6 @@ export const useSegmentStore = defineStore('segment', () => {
         tone: 'info',
         title: '未自动写入记忆库',
         message: '当前文件未绑定记忆库，确认译文已保存。',
-      })
-    }
-    if (data.project_sync?.filled_count) {
-      pushToast({
-        tone: 'success',
-        title: '项目同步完成',
-        message: `已自动填充 ${data.project_sync.filled_count} 条相同原文句段。`,
-      })
-    }
-    if (data.project_sync?.updated_count) {
-      pushToast({
-        tone: 'success',
-        title: '项目同步已更新',
-        message: `已自动更新 ${data.project_sync.updated_count} 条重复句段译文。`,
       })
     }
   }

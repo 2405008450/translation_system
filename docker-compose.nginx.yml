@@ -1,0 +1,16 @@
+# 可选：nginx 反向代理（80 或自定义端口空闲时使用）
+# 用法：docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.nginx.yml up -d
+# 或：USE_NGINX=1 scripts/deploy_prod.sh up
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: ai-translation-nginx
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:80"
+    volumes:
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped

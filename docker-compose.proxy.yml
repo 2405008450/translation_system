@@ -7,8 +7,8 @@ services:
       http_proxy: http://mihomo:7890
       https_proxy: http://mihomo:7890
       all_proxy: http://mihomo:7890
-      NO_PROXY: localhost,127.0.0.1,::1,postgres,redis,languagetool,ai-translation-postgres,ai-translation-redis,ai-translation-languagetool
-      no_proxy: localhost,127.0.0.1,::1,postgres,redis,languagetool,ai-translation-postgres,ai-translation-redis,ai-translation-languagetool
+      NO_PROXY: localhost,127.0.0.1,::1,postgres,redis,languagetool,pgbouncer,mihomo,app,nginx,ai-translation-postgres,ai-translation-redis,ai-translation-languagetool,ai-translation-app,ai-translation-nginx
+      no_proxy: localhost,127.0.0.1,::1,postgres,redis,languagetool,pgbouncer,mihomo,app,nginx,ai-translation-postgres,ai-translation-redis,ai-translation-languagetool,ai-translation-app,ai-translation-nginx
     depends_on:
       mihomo:
         condition: service_started
@@ -21,8 +21,8 @@ services:
       http_proxy: http://mihomo:7890
       https_proxy: http://mihomo:7890
       all_proxy: http://mihomo:7890
-      NO_PROXY: localhost,127.0.0.1,::1,postgres,redis,languagetool,ai-translation-postgres,ai-translation-redis,ai-translation-languagetool
-      no_proxy: localhost,127.0.0.1,::1,postgres,redis,languagetool,ai-translation-postgres,ai-translation-redis,ai-translation-languagetool
+      NO_PROXY: localhost,127.0.0.1,::1,postgres,redis,languagetool,pgbouncer,mihomo,app,nginx,ai-translation-postgres,ai-translation-redis,ai-translation-languagetool,ai-translation-app,ai-translation-nginx
+      no_proxy: localhost,127.0.0.1,::1,postgres,redis,languagetool,pgbouncer,mihomo,app,nginx,ai-translation-postgres,ai-translation-redis,ai-translation-languagetool,ai-translation-app,ai-translation-nginx
     depends_on:
       mihomo:
         condition: service_started

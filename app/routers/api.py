@@ -51,6 +51,8 @@ from app.models import (
     Project,
     ProjectAssignment,
     ProjectMergeView,
+    PretranslationRun,
+    PretranslationTask,
     ProjectWorkflowStep,
     Segment,
     SegmentQAIssue,
@@ -129,7 +131,16 @@ from app.services.issue_marker_service import (
 )
 from app.services.cache import get_json as cache_get_json
 from app.services.cache import set_json as cache_set_json
+from app.services.import_task_storage import (
+    cleanup_expired_import_staging,
+    cleanup_import_task_staging,
+    read_import_file_bytes,
+    stage_import_file_payload,
+    stage_import_file_payloads,
+)
 from app.services.file_record_service import (
+    SegmentUpdateConflict,
+    _can_auto_merge_stale_segment,
     backfill_file_record_source_html,
     batch_update_segments,
     calculate_file_record_progress,
@@ -260,6 +271,7 @@ from app.services.slate_parser import parse_docx_for_slate
 from app.services.task_file_service import (
     BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS,
     DOCUMENT_PARSE_MODE_FULL,
+    UploadLimitError,
     build_task_preview_html,
     build_task_workspace,
     can_export_task_file,
@@ -271,6 +283,8 @@ from app.services.task_file_service import (
     normalize_document_parse_options,
     normalize_document_parse_mode,
     supports_task_file,
+    validate_expanded_upload_batch,
+    validate_upload_batch,
 )
 from app.services.document_workspace import build_docx_target_numbering_text_map
 from app.services.tm_importer import (
@@ -502,21 +516,42 @@ async def _dispatch_auto_tm_background() -> None:
 async def _queue_import_task(
     background_tasks: BackgroundTasks,
     payload: dict[str, Any],
+    *,
+    staging_files: list[tuple[str, bytes]] | None = None,
+    staging_file: tuple[str, bytes] | None = None,
 ) -> JSONResponse:
+    cleanup_expired_import_staging()
     task_id = str(uuid4())
-    _set_import_task_status(task_id, "queued", progress=0, message="任务已进入导入队列。")
-    if not await _enqueue_arq_import_task(task_id, payload):
-        background_tasks.add_task(_run_import_task, task_id, payload)
+    try:
+        if staging_files is not None:
+            payload = {
+                **payload,
+                "files": stage_import_file_payloads(task_id, staging_files),
+            }
+        elif staging_file is not None:
+            filename, raw_bytes = staging_file
+            payload = {
+                **payload,
+                "file": stage_import_file_payload(task_id, filename, raw_bytes),
+            }
+        payload["staging_task_id"] = task_id
 
-    return JSONResponse(
-        status_code=202,
-        content={
-            "task_id": task_id,
-            "status": "queued",
-            "progress": 0,
-            "message": "任务已进入导入队列。",
-        },
-    )
+        _set_import_task_status(task_id, "queued", progress=0, message="任务已进入导入队列。")
+        if not await _enqueue_arq_import_task(task_id, payload):
+            background_tasks.add_task(_run_import_task, task_id, payload)
+
+        return JSONResponse(
+            status_code=202,
+            content={
+                "task_id": task_id,
+                "status": "queued",
+                "progress": 0,
+                "message": "任务已进入导入队列。",
+            },
+        )
+    except Exception:
+        cleanup_import_task_staging(task_id)
+        raise
 
 
 def _uuid_list(values: list[str] | None) -> list[UUID]:
@@ -657,7 +692,7 @@ def _get_file_record_document_parse_options(file_record: FileRecord) -> dict[str
 
 def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
     file_payload = payload["file"]
-    raw_bytes = file_payload["content"]
+    raw_bytes = read_import_file_bytes(file_payload)
     filename = file_payload["filename"] or "untitled.txt"
     selected_collection_ids = _uuid_list(payload.get("collection_ids"))
     term_base_id = UUID(payload["term_base_id"]) if payload.get("term_base_id") else None
@@ -736,16 +771,17 @@ def _expand_archive_payloads(file_payloads: list[dict[str, Any]]) -> list[dict[s
     for file_payload in file_payloads:
         filename = file_payload.get("filename") or ""
         ext = Path(filename).suffix.lower()
+        raw_bytes = read_import_file_bytes(file_payload)
 
         if ext == ".zip":
-            extracted = _extract_zip_files(file_payload["content"], filename)
+            extracted = _extract_zip_files(raw_bytes, filename)
             if extracted:
                 expanded.extend(extracted)
             else:
                 # 如果解压后没有支持的文件，保留原始 zip 处理方式
                 expanded.append(file_payload)
         elif ext == ".rar":
-            extracted = _extract_rar_files(file_payload["content"], filename)
+            extracted = _extract_rar_files(raw_bytes, filename)
             if extracted:
                 expanded.extend(extracted)
             else:
@@ -912,10 +948,12 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
 
     # 展开压缩包：将 zip/rar 文件解压为独立文件
     expanded_payloads = _expand_archive_payloads(file_payloads)
+    validate_expanded_upload_batch(expanded_payloads)
 
     created_files: list[FileRecord] = []
     for index, file_payload in enumerate(expanded_payloads, start=1):
         filename = file_payload["filename"] or "source.txt"
+        raw_bytes = read_import_file_bytes(file_payload)
         _set_import_task_status(
             task_id,
             "running",
@@ -924,7 +962,7 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
         )
         workspace_data = build_task_workspace(
             db=db,
-            raw_bytes=file_payload["content"],
+            raw_bytes=raw_bytes,
             filename=filename,
             similarity_threshold=threshold,
             collection_ids=selected_collection_ids,
@@ -933,7 +971,7 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
         )
         file_record = create_file_record_with_segments(
             db=db,
-            raw_bytes=file_payload["content"],
+            raw_bytes=raw_bytes,
             filename=filename,
             similarity_threshold=threshold,
             workspace_data=workspace_data,
@@ -987,39 +1025,52 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
 
 
 def _run_import_task(task_id: str, payload: dict[str, Any]) -> None:
+    staging_task_id = str(payload.get("staging_task_id") or task_id)
     _set_import_task_status(task_id, "running", progress=5, message="导入任务开始处理。")
-    with SessionLocal() as db:
-        try:
-            if payload.get("kind") == "project_source_document":
-                result = _process_project_source_import(db, task_id, payload)
-            else:
-                result = _process_file_record_import(db, payload)
-            _set_import_task_status(
-                task_id,
-                "completed",
-                progress=100,
-                message="导入完成。",
-                result=result,
-            )
-        except HTTPException as exc:
-            db.rollback()
-            _set_import_task_status(
-                task_id,
-                "failed",
-                progress=100,
-                message="导入失败。",
-                error=str(exc.detail),
-            )
-        except Exception as exc:
-            db.rollback()
-            logger.exception("import task failed task_id=%s", task_id)
-            _set_import_task_status(
-                task_id,
-                "failed",
-                progress=100,
-                message="导入失败。",
-                error=str(exc),
-            )
+    try:
+        with SessionLocal() as db:
+            try:
+                if payload.get("kind") == "project_source_document":
+                    result = _process_project_source_import(db, task_id, payload)
+                else:
+                    result = _process_file_record_import(db, payload)
+                _set_import_task_status(
+                    task_id,
+                    "completed",
+                    progress=100,
+                    message="导入完成。",
+                    result=result,
+                )
+            except HTTPException as exc:
+                db.rollback()
+                _set_import_task_status(
+                    task_id,
+                    "failed",
+                    progress=100,
+                    message="导入失败。",
+                    error=str(exc.detail),
+                )
+            except UploadLimitError as exc:
+                db.rollback()
+                _set_import_task_status(
+                    task_id,
+                    "failed",
+                    progress=100,
+                    message="导入失败。",
+                    error=exc.detail,
+                )
+            except Exception as exc:
+                db.rollback()
+                logger.exception("import task failed task_id=%s", task_id)
+                _set_import_task_status(
+                    task_id,
+                    "failed",
+                    progress=100,
+                    message="导入失败。",
+                    error=str(exc),
+                )
+    finally:
+        cleanup_import_task_staging(staging_task_id)
 
 
 async def process_import_task_job(ctx, task_id: str, payload: dict[str, Any]) -> None:
@@ -1044,12 +1095,23 @@ async def auto_tm_background_job(ctx) -> None:
     await asyncio.to_thread(run_auto_tm_background_once)
 
 
+async def _dispatch_pretranslation_run(run_id: UUID) -> None:
+    if await _enqueue_arq_job("pretranslation_run_job", str(run_id)):
+        return
+    await asyncio.to_thread(_run_pretranslation_run, run_id)
+
+
+async def pretranslation_run_job(ctx, run_id: str) -> None:
+    await asyncio.to_thread(_run_pretranslation_run, UUID(run_id))
+
+
 class WorkerSettings:
     functions = [
         process_import_task_job,
         spelling_grammar_qa_segments_job,
         spelling_grammar_qa_project_job,
         auto_tm_background_job,
+        pretranslation_run_job,
     ]
     redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
 
@@ -1170,6 +1232,728 @@ class FileRecordBindingsRequest(BaseModel):
     collection_id: UUID | None = None
     collection_ids: list[UUID] | None = None
     tm_match_threshold: float | None = None
+
+
+class PretranslationRunRequest(BaseModel):
+    file_ids: list[UUID] = Field(default_factory=list)
+    use_tm: bool = True
+    tm_collection_ids: list[UUID] = Field(default_factory=list)
+    tm_threshold: float = 0.75
+    tm_skip_confirmed: bool = True
+    tm_overwrite_fuzzy: bool = True
+    tm_auto_confirm_exact: bool = True
+    use_glossary: bool = False
+    glossary_base_ids: list[UUID] = Field(default_factory=list)
+    use_term_base: bool = False
+    term_base_ids: list[UUID] = Field(default_factory=list)
+    use_llm: bool = False
+    llm_scope: Literal["fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"] = "all"
+    llm_provider: Literal["auto", "deepseek", "openrouter"] = "deepseek"
+    llm_model: str | None = Field(default=None, max_length=120)
+    llm_translation_unit: Literal["paragraph", "sentence"] = "paragraph"
+    guideline_template_id: str | None = None
+    temporary_prompt: str = Field(default="", max_length=8000)
+
+
+PRETRANSLATION_ACTIVE_STATUSES = {"queued", "running", "canceling"}
+PRETRANSLATION_TERMINAL_STATUSES = {"completed", "failed", "canceled"}
+
+
+class PretranslationCanceled(Exception):
+    pass
+
+
+class _BackgroundLLMRequest:
+    async def is_disconnected(self) -> bool:
+        return False
+
+
+def _pretranslation_now() -> datetime:
+    return datetime.now()
+
+
+def _load_pretranslation_options(run: PretranslationRun | None) -> dict[str, Any]:
+    if run is None:
+        return {}
+    try:
+        value = json.loads(run.options_json or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _serialize_pretranslation_task(task: PretranslationTask) -> dict[str, Any]:
+    file_record = task.file_record
+    return {
+        "id": str(task.id),
+        "run_id": str(task.run_id),
+        "file_record_id": str(task.file_record_id),
+        "project_id": str(file_record.project_id) if file_record and file_record.project_id else None,
+        "filename": file_record.filename if file_record else None,
+        "status": task.status,
+        "stage": task.stage,
+        "progress": int(task.progress or 0),
+        "message": task.message or "",
+        "provider": task.provider,
+        "model": task.model,
+        "scope": task.scope,
+        "total_segments": int(task.total_segments or 0),
+        "unique_segments": int(task.unique_segments or 0),
+        "deduplicated_segments": int(task.deduplicated_segments or 0),
+        "processed_segments": int(task.processed_segments or 0),
+        "updated_segments": int(task.updated_segments or 0),
+        "error_segments": int(task.error_segments or 0),
+        "current_action": task.current_action,
+        "cancel_requested": bool(task.cancel_requested),
+        "error": task.error,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "started_at": task.started_at.isoformat() if task.started_at else None,
+        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+        "last_heartbeat_at": task.last_heartbeat_at.isoformat() if task.last_heartbeat_at else None,
+    }
+
+
+def _refresh_pretranslation_run_status(db: Session, run: PretranslationRun) -> None:
+    tasks = (
+        db.query(PretranslationTask)
+        .filter(PretranslationTask.run_id == run.id)
+        .all()
+    )
+    total = len(tasks)
+    completed = sum(1 for task in tasks if task.status == "completed")
+    failed = sum(1 for task in tasks if task.status == "failed")
+    canceled = sum(1 for task in tasks if task.status == "canceled")
+    active = sum(1 for task in tasks if task.status in PRETRANSLATION_ACTIVE_STATUSES)
+    run.total_files = total
+    run.completed_files = completed
+    run.failed_files = failed
+    run.canceled_files = canceled
+    run.progress = int(sum(int(task.progress or 0) for task in tasks) / total) if total else 100
+    run.updated_at = _pretranslation_now()
+    if active:
+        run.status = "running"
+        if run.started_at is None:
+            run.started_at = _pretranslation_now()
+        run.completed_at = None
+        run.message = "预翻译正在后台执行"
+    else:
+        if failed:
+            run.status = "failed"
+            run.message = "预翻译完成，但存在失败文件"
+        elif canceled and canceled == total:
+            run.status = "canceled"
+            run.message = "预翻译已取消"
+        else:
+            run.status = "completed"
+            run.message = "预翻译已完成"
+        if run.started_at is None:
+            run.started_at = _pretranslation_now()
+        if run.completed_at is None:
+            run.completed_at = _pretranslation_now()
+
+
+def _serialize_pretranslation_run(
+    run: PretranslationRun,
+    *,
+    extra_tasks: list[PretranslationTask] | None = None,
+) -> dict[str, Any]:
+    tasks_by_id: dict[UUID, PretranslationTask] = {}
+    for task in list(run.tasks or []):
+        tasks_by_id[task.id] = task
+    for task in extra_tasks or []:
+        tasks_by_id[task.id] = task
+    tasks = sorted(tasks_by_id.values(), key=lambda item: (item.created_at or datetime.min, str(item.id)))
+    return {
+        "id": str(run.id),
+        "project_id": str(run.project_id),
+        "status": run.status,
+        "progress": int(run.progress or 0),
+        "message": run.message or "",
+        "total_files": int(run.total_files or 0),
+        "completed_files": int(run.completed_files or 0),
+        "failed_files": int(run.failed_files or 0),
+        "canceled_files": int(run.canceled_files or 0),
+        "created_by_id": str(run.created_by_id) if run.created_by_id else None,
+        "created_by": serialize_user(run.created_by) if run.created_by else None,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "updated_at": run.updated_at.isoformat() if run.updated_at else None,
+        "tasks": [_serialize_pretranslation_task(task) for task in tasks],
+    }
+
+
+def _update_pretranslation_task(task_id: UUID, **values: Any) -> None:
+    with SessionLocal() as db:
+        task = db.query(PretranslationTask).filter(PretranslationTask.id == task_id).first()
+        if task is None:
+            return
+        now = _pretranslation_now()
+        for key, value in values.items():
+            setattr(task, key, value)
+        task.updated_at = now
+        if task.status in {"running", "canceling"} and task.started_at is None:
+            task.started_at = now
+        if task.status in PRETRANSLATION_TERMINAL_STATUSES and task.completed_at is None:
+            task.completed_at = now
+            task.progress = 100
+        run = db.query(PretranslationRun).filter(PretranslationRun.id == task.run_id).first()
+        if run is not None:
+            _refresh_pretranslation_run_status(db, run)
+        db.commit()
+
+
+def _pretranslation_task_cancel_requested(task_id: UUID) -> bool:
+    with SessionLocal() as db:
+        task = db.query(PretranslationTask).filter(PretranslationTask.id == task_id).first()
+        return task is None or bool(task.cancel_requested) or task.status == "canceled"
+
+
+def _touch_pretranslation_task_heartbeat(task_id: UUID) -> None:
+    with SessionLocal() as db:
+        task = db.query(PretranslationTask).filter(PretranslationTask.id == task_id).first()
+        if task is None or task.file_record is None:
+            return
+        task.last_heartbeat_at = _pretranslation_now()
+        if task.operation_token:
+            heartbeat_file_operation_lock(
+                db,
+                task.file_record,
+                operation_token=task.operation_token,
+            )
+        else:
+            db.commit()
+
+
+def _release_pretranslation_task_lock(task_id: UUID) -> None:
+    with SessionLocal() as db:
+        task = db.query(PretranslationTask).filter(PretranslationTask.id == task_id).first()
+        if task is None or task.file_record is None or not task.operation_token:
+            return
+        try:
+            release_file_operation_lock(
+                db,
+                task.file_record,
+                operation_token=task.operation_token,
+            )
+        except HTTPException:
+            logger.warning("release pretranslation lock failed task_id=%s", task_id, exc_info=True)
+
+
+def _pretranslation_options_for_run(task_id: UUID) -> dict[str, Any]:
+    with SessionLocal() as db:
+        task = db.query(PretranslationTask).filter(PretranslationTask.id == task_id).first()
+        return _load_pretranslation_options(task.run if task else None)
+
+
+def _run_pretranslation_binding_stage(task_id: UUID, options: dict[str, Any]) -> None:
+    binding_payload: dict[str, Any] = {}
+    if options.get("use_tm") and options.get("tm_collection_ids"):
+        collection_ids = [UUID(str(item)) for item in options.get("tm_collection_ids") or []]
+        binding_payload["collection_ids"] = collection_ids
+        binding_payload["collection_id"] = collection_ids[0] if collection_ids else None
+        binding_payload["tm_match_threshold"] = options.get("tm_threshold", 0.75)
+    if options.get("use_glossary"):
+        binding_payload["glossary_base_ids"] = [
+            UUID(str(item)) for item in options.get("glossary_base_ids") or []
+        ]
+    if options.get("use_term_base"):
+        binding_payload["term_base_ids"] = [
+            UUID(str(item)) for item in options.get("term_base_ids") or []
+        ]
+    if not binding_payload:
+        return
+
+    _update_pretranslation_task(
+        task_id,
+        status="running",
+        stage="bindings",
+        progress=8,
+        message="正在绑定预翻译资源",
+        current_action="bindings",
+    )
+    _touch_pretranslation_task_heartbeat(task_id)
+    with SessionLocal() as db:
+        task = db.query(PretranslationTask).filter(PretranslationTask.id == task_id).first()
+        if task is None or task.file_record is None or task.run is None:
+            raise RuntimeError("预翻译任务不存在")
+        user = db.query(User).filter(User.id == task.run.created_by_id).first()
+        if user is None:
+            raise RuntimeError("预翻译发起用户不存在")
+        patch_file_record_bindings(
+            task.file_record_id,
+            FileRecordBindingsRequest(**binding_payload),
+            db,
+            user,
+            operation_token=task.operation_token,
+        )
+
+
+def _run_pretranslation_tm_stage(task_id: UUID, options: dict[str, Any]) -> None:
+    if not options.get("use_tm"):
+        return
+    collection_ids = [UUID(str(item)) for item in options.get("tm_collection_ids") or []]
+    if not collection_ids:
+        return
+
+    _update_pretranslation_task(
+        task_id,
+        status="running",
+        stage="tm",
+        progress=18,
+        message="正在执行 TM 预匹配",
+        current_action="tm",
+    )
+    _touch_pretranslation_task_heartbeat(task_id)
+    with SessionLocal() as db:
+        task = db.query(PretranslationTask).filter(PretranslationTask.id == task_id).first()
+        if task is None or task.file_record is None or task.run is None:
+            raise RuntimeError("预翻译任务不存在")
+        user = db.query(User).filter(User.id == task.run.created_by_id).first()
+        if user is None:
+            raise RuntimeError("预翻译发起用户不存在")
+        result = rematch_file_record(
+            task.file_record_id,
+            RematchRequest(
+                collection_ids=collection_ids,
+                threshold=float(options.get("tm_threshold") or 0.75),
+                skip_confirmed=bool(options.get("tm_skip_confirmed", True)),
+                overwrite_fuzzy=bool(options.get("tm_overwrite_fuzzy", True)),
+                auto_confirm_exact=bool(options.get("tm_auto_confirm_exact", True)),
+            ),
+            db,
+            user,
+            operation_token=task.operation_token,
+        )
+    _update_pretranslation_task(
+        task_id,
+        progress=35,
+        message=f"TM 预匹配完成，更新 {int(result.get('updated', 0))} 条",
+        current_action="tm_done",
+    )
+
+
+def _parse_sse_events(chunk: str | bytes) -> list[tuple[str, dict[str, Any]]]:
+    text = chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+    events: list[tuple[str, dict[str, Any]]] = []
+    for block in text.split("\n\n"):
+        event_name = ""
+        data_lines: list[str] = []
+        for line in block.splitlines():
+            if line.startswith("event:"):
+                event_name = line.split(":", 1)[1].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line.split(":", 1)[1].strip())
+        if not event_name or not data_lines:
+            continue
+        try:
+            payload = json.loads("\n".join(data_lines))
+        except ValueError:
+            payload = {}
+        events.append((event_name, payload if isinstance(payload, dict) else {}))
+    return events
+
+
+async def _run_pretranslation_llm_stage(task_id: UUID, options: dict[str, Any]) -> None:
+    if not options.get("use_llm"):
+        return
+
+    requested_model = normalize_text(options.get("llm_model") or "") or None
+    body = LLMTranslateRequest(
+        scope=options.get("llm_scope") or "all",
+        provider=options.get("llm_provider") or "deepseek",
+        model=requested_model,
+        translation_unit=options.get("llm_translation_unit") or "paragraph",
+        guideline_template_id=options.get("guideline_template_id") or None,
+        temporary_prompt=options.get("temporary_prompt") or "",
+        glossary_base_ids=[
+            UUID(str(item)) for item in options.get("glossary_base_ids") or []
+        ] if options.get("use_glossary") else None,
+    )
+
+    _update_pretranslation_task(
+        task_id,
+        status="running",
+        stage="llm",
+        progress=42,
+        message="正在等待模型返回结果",
+        current_action="waiting_model",
+        provider=body.provider,
+        model=requested_model,
+        scope=body.scope,
+    )
+    _touch_pretranslation_task_heartbeat(task_id)
+
+    stream_db = SessionLocal()
+    try:
+        task = stream_db.query(PretranslationTask).filter(PretranslationTask.id == task_id).first()
+        if task is None or task.file_record is None or task.run is None:
+            raise RuntimeError("预翻译任务不存在")
+        user = stream_db.query(User).filter(User.id == task.run.created_by_id).first()
+        if user is None:
+            raise RuntimeError("预翻译发起用户不存在")
+        response = await llm_translate_file_record(
+            task.file_record_id,
+            _BackgroundLLMRequest(),
+            body,
+            stream_db,
+            user,
+            operation_token=task.operation_token,
+        )
+        total = 0
+        processed = 0
+        updated = 0
+        errors = 0
+        last_heartbeat = datetime.min
+        async for chunk in response.body_iterator:
+            for event_name, payload in _parse_sse_events(chunk):
+                if event_name == "start":
+                    total = int(payload.get("total") or 0)
+                    _update_pretranslation_task(
+                        task_id,
+                        total_segments=total,
+                        unique_segments=int(payload.get("unique_total") or 0),
+                        deduplicated_segments=int(payload.get("deduplicated_count") or 0),
+                        progress=45 if total else 92,
+                        message=(
+                            f"LLM 预翻译进行中：0/{total}"
+                            if total
+                            else "LLM 没有需要处理的句段"
+                        ),
+                        current_action="waiting_model" if total else "llm_skipped",
+                    )
+                elif event_name == "segment":
+                    processed += 1
+                    updated += 1
+                    progress = 45 + int(min(processed, max(total, 1)) / max(total, 1) * 45)
+                    _update_pretranslation_task(
+                        task_id,
+                        processed_segments=processed,
+                        updated_segments=updated,
+                        error_segments=errors,
+                        progress=min(progress, 95),
+                        message=f"LLM 预翻译进行中：{processed}/{total or processed}",
+                        current_action="writing_result",
+                    )
+                elif event_name == "error":
+                    processed += 1
+                    errors += 1
+                    progress = 45 + int(min(processed, max(total, 1)) / max(total, 1) * 45)
+                    _update_pretranslation_task(
+                        task_id,
+                        processed_segments=processed,
+                        updated_segments=updated,
+                        error_segments=errors,
+                        progress=min(progress, 95),
+                        message=f"LLM 预翻译部分失败：{processed}/{total or processed}",
+                        current_action="writing_result",
+                        error=payload.get("message") or None,
+                    )
+                elif event_name == "complete":
+                    total = int(payload.get("total") or total)
+                    updated = int(payload.get("updated_count") or updated)
+                    errors = int(payload.get("error_count") or errors)
+                    processed = max(processed, updated + errors)
+                    _update_pretranslation_task(
+                        task_id,
+                        processed_segments=processed,
+                        updated_segments=updated,
+                        error_segments=errors,
+                        progress=95,
+                        message="LLM 预翻译写入完成",
+                        current_action="llm_done",
+                    )
+
+            if _pretranslation_task_cancel_requested(task_id):
+                raise PretranslationCanceled()
+            now = _pretranslation_now()
+            if (now - last_heartbeat).total_seconds() >= 15:
+                _touch_pretranslation_task_heartbeat(task_id)
+                last_heartbeat = now
+    finally:
+        stream_db.close()
+
+
+def _run_pretranslation_task(task_id: UUID) -> None:
+    options = _pretranslation_options_for_run(task_id)
+    try:
+        with SessionLocal() as db:
+            task = db.query(PretranslationTask).filter(PretranslationTask.id == task_id).first()
+            if task is None:
+                return
+            if task.cancel_requested or task.status == "canceled":
+                raise PretranslationCanceled()
+            segment_count = (
+                db.query(Segment)
+                .filter(Segment.file_record_id == task.file_record_id)
+                .count()
+            )
+        _update_pretranslation_task(
+            task_id,
+            status="running",
+            stage="starting",
+            progress=2,
+            total_segments=segment_count,
+            message="预翻译任务已开始",
+            current_action="starting",
+        )
+        _touch_pretranslation_task_heartbeat(task_id)
+
+        if _pretranslation_task_cancel_requested(task_id):
+            raise PretranslationCanceled()
+        _run_pretranslation_binding_stage(task_id, options)
+
+        if _pretranslation_task_cancel_requested(task_id):
+            raise PretranslationCanceled()
+        _run_pretranslation_tm_stage(task_id, options)
+
+        if _pretranslation_task_cancel_requested(task_id):
+            raise PretranslationCanceled()
+        asyncio.run(_run_pretranslation_llm_stage(task_id, options))
+
+        _update_pretranslation_task(
+            task_id,
+            status="completed",
+            stage="completed",
+            progress=100,
+            message="预翻译已完成",
+            current_action="completed",
+        )
+    except PretranslationCanceled:
+        _update_pretranslation_task(
+            task_id,
+            status="canceled",
+            stage="canceled",
+            progress=100,
+            message="预翻译已取消",
+            current_action="canceled",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("pretranslation task failed task_id=%s", task_id)
+        _update_pretranslation_task(
+            task_id,
+            status="failed",
+            stage="failed",
+            progress=100,
+            message="预翻译失败",
+            error=str(exc),
+            current_action="failed",
+        )
+    finally:
+        _release_pretranslation_task_lock(task_id)
+
+
+def _run_pretranslation_run(run_id: UUID) -> None:
+    with SessionLocal() as db:
+        run = db.query(PretranslationRun).filter(PretranslationRun.id == run_id).first()
+        if run is None:
+            return
+        run.status = "running"
+        run.started_at = run.started_at or _pretranslation_now()
+        run.message = "预翻译正在后台执行"
+        _refresh_pretranslation_run_status(db, run)
+        task_ids = [
+            task.id
+            for task in (
+                db.query(PretranslationTask)
+                .filter(PretranslationTask.run_id == run_id)
+                .order_by(PretranslationTask.created_at.asc(), PretranslationTask.id.asc())
+                .all()
+            )
+        ]
+        db.commit()
+
+    for task_id in task_ids:
+        _run_pretranslation_task(task_id)
+
+    with SessionLocal() as db:
+        run = db.query(PretranslationRun).filter(PretranslationRun.id == run_id).first()
+        if run is not None:
+            _refresh_pretranslation_run_status(db, run)
+            db.commit()
+
+
+@router.post("/projects/{project_id}/pretranslation-runs")
+async def create_pretranslation_run(
+    project_id: UUID,
+    payload: PretranslationRunRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    project = _get_project_or_404(db, project_id)
+    _require_project_read_access(project, current_user, db)
+    file_ids = list(dict.fromkeys(payload.file_ids))
+    if not file_ids:
+        raise HTTPException(status_code=400, detail="请至少选择一个文件进行预翻译。")
+    if not (payload.use_tm or payload.use_glossary or payload.use_term_base or payload.use_llm):
+        raise HTTPException(status_code=400, detail="请至少选择一种预翻译操作。")
+    if payload.use_tm and not payload.tm_collection_ids:
+        raise HTTPException(status_code=400, detail="请选择用于预匹配的记忆库。")
+    if payload.use_glossary and not payload.glossary_base_ids:
+        raise HTTPException(status_code=400, detail="请选择用于 LLM 的词汇表。")
+    if payload.use_term_base and not payload.term_base_ids:
+        raise HTTPException(status_code=400, detail="请选择需要绑定的术语库。")
+
+    files = (
+        db.query(FileRecord)
+        .filter(FileRecord.project_id == project_id, FileRecord.id.in_(file_ids))
+        .all()
+    )
+    files_by_id = {file_record.id: file_record for file_record in files}
+    missing_ids = [file_id for file_id in file_ids if file_id not in files_by_id]
+    if missing_ids:
+        raise HTTPException(status_code=404, detail="选择的文件不存在或不属于当前项目。")
+    ordered_files = [files_by_id[file_id] for file_id in file_ids]
+    for file_record in ordered_files:
+        _require_file_record_work_access(file_record, current_user)
+
+    active_tasks = (
+        db.query(PretranslationTask)
+        .filter(
+            PretranslationTask.file_record_id.in_(file_ids),
+            PretranslationTask.status.in_(PRETRANSLATION_ACTIVE_STATUSES),
+        )
+        .all()
+    )
+    active_file_ids = {task.file_record_id for task in active_tasks}
+    files_to_start = [file_record for file_record in ordered_files if file_record.id not in active_file_ids]
+    if not files_to_start and active_tasks:
+        active_run = active_tasks[0].run
+        return JSONResponse(
+            status_code=202,
+            content=_serialize_pretranslation_run(active_run, extra_tasks=active_tasks),
+        )
+
+    run = PretranslationRun(
+        project_id=project_id,
+        status="queued",
+        progress=0,
+        message="预翻译任务已创建",
+        total_files=len(files_to_start),
+        options_json=json.dumps(payload.model_dump(mode="json"), ensure_ascii=False),
+        created_by_id=current_user.id,
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+
+    created_tasks: list[PretranslationTask] = []
+    for file_record in files_to_start:
+        _, operation_token = acquire_file_operation_lock(
+            db,
+            file_record.id,
+            operation=PRE_TRANSLATE_OPERATION,
+            current_user=current_user,
+        )
+        task = PretranslationTask(
+            run_id=run.id,
+            file_record_id=file_record.id,
+            status="queued",
+            stage="queued",
+            progress=0,
+            message="等待后台执行",
+            provider=payload.llm_provider if payload.use_llm else None,
+            model=payload.llm_model if payload.use_llm else None,
+            scope=payload.llm_scope if payload.use_llm else None,
+            operation_token=operation_token,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        created_tasks.append(task)
+
+    _refresh_pretranslation_run_status(db, run)
+    db.commit()
+    db.refresh(run)
+    if created_tasks:
+        background_tasks.add_task(_dispatch_pretranslation_run, run.id)
+    return JSONResponse(
+        status_code=202,
+        content=_serialize_pretranslation_run(run, extra_tasks=active_tasks),
+    )
+
+
+@router.get("/pretranslation-runs/{run_id}")
+def get_pretranslation_run(
+    run_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    run = db.query(PretranslationRun).filter(PretranslationRun.id == run_id).first()
+    if run is None:
+        raise HTTPException(status_code=404, detail="预翻译任务不存在。")
+    project = db.query(Project).filter(Project.id == run.project_id).first()
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    _require_project_read_access(project, current_user, db)
+    _refresh_pretranslation_run_status(db, run)
+    db.commit()
+    db.refresh(run)
+    return _serialize_pretranslation_run(run)
+
+
+@router.get("/projects/{project_id}/pretranslation-tasks/active")
+def list_active_pretranslation_tasks(
+    project_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    project = _get_project_or_404(db, project_id)
+    _require_project_read_access(project, current_user, db)
+    tasks = (
+        db.query(PretranslationTask)
+        .join(FileRecord, PretranslationTask.file_record_id == FileRecord.id)
+        .filter(
+            FileRecord.project_id == project_id,
+            PretranslationTask.status.in_(PRETRANSLATION_ACTIVE_STATUSES),
+        )
+        .order_by(PretranslationTask.updated_at.desc(), PretranslationTask.created_at.desc())
+        .all()
+    )
+    visible_tasks: list[PretranslationTask] = []
+    for task in tasks:
+        try:
+            _require_file_record_read_access(task.file_record, current_user)
+        except HTTPException:
+            continue
+        visible_tasks.append(task)
+    return {"tasks": [_serialize_pretranslation_task(task) for task in visible_tasks]}
+
+
+@router.post("/pretranslation-tasks/{task_id}/cancel")
+def cancel_pretranslation_task(
+    task_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    task = db.query(PretranslationTask).filter(PretranslationTask.id == task_id).first()
+    if task is None or task.file_record is None:
+        raise HTTPException(status_code=404, detail="预翻译任务不存在。")
+    _require_file_record_work_access(task.file_record, current_user)
+    if task.status in PRETRANSLATION_TERMINAL_STATUSES:
+        return _serialize_pretranslation_task(task)
+
+    task.cancel_requested = True
+    task.message = "正在取消预翻译"
+    if task.status == "queued":
+        task.status = "canceled"
+        task.stage = "canceled"
+        task.progress = 100
+        task.completed_at = _pretranslation_now()
+        db.commit()
+        _release_pretranslation_task_lock(task.id)
+    else:
+        task.status = "canceling"
+        task.stage = "canceling"
+        db.commit()
+    db.refresh(task)
+    if task.run:
+        _refresh_pretranslation_run_status(db, task.run)
+        db.commit()
+        db.refresh(task)
+    return _serialize_pretranslation_task(task)
 
 
 class ProjectTranslationMemoryFileSettingPayload(BaseModel):
@@ -3085,6 +3869,10 @@ def _validate_task_upload(file: UploadFile) -> None:
     )
 
 
+def _raise_upload_limit_error(exc: UploadLimitError) -> None:
+    raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
 def _normalize_upload_document_parse_mode(document_parse_mode: str | None) -> str:
     try:
         return normalize_document_parse_mode(document_parse_mode)
@@ -3782,6 +4570,11 @@ async def create_file_record(
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="文件为空。")
 
+    try:
+        validate_upload_batch([(file.filename or "untitled.txt", raw_bytes)])
+    except UploadLimitError as exc:
+        _raise_upload_limit_error(exc)
+
     selected_collection_ids = _validate_collection_ids(db, collection_ids) or []
     primary_collection = _get_collection_or_404(
         db,
@@ -3808,10 +4601,6 @@ async def create_file_record(
 
     payload = {
         "kind": "file_record",
-        "file": {
-            "filename": file.filename or "untitled.txt",
-            "content": raw_bytes,
-        },
         "threshold": threshold,
         "collection_ids": [str(collection_id) for collection_id in selected_collection_ids],
         "term_base_id": str(term_base_id) if term_base_id is not None else None,
@@ -3821,7 +4610,11 @@ async def create_file_record(
         "document_parse_options": normalized_parse_options,
         "creator_id": str(current_user.id),
     }
-    return await _queue_import_task(background_tasks, payload)
+    return await _queue_import_task(
+        background_tasks,
+        payload,
+        staging_file=(file.filename or "untitled.txt", raw_bytes),
+    )
 
 
 @router.get("/workflow-templates")
@@ -6075,22 +6868,21 @@ async def upload_project_source_document(
             "术语库",
         )
 
-    queued_files = []
+    file_entries: list[tuple[str, bytes]] = []
     for upload_file in uploaded_files:
         raw_bytes = await upload_file.read()
         if not raw_bytes:
             raise HTTPException(status_code=400, detail=f"{upload_file.filename or '文件'} 为空。")
-        queued_files.append(
-            {
-                "filename": upload_file.filename or "source.txt",
-                "content": raw_bytes,
-            }
-        )
+        file_entries.append((upload_file.filename or "source.txt", raw_bytes))
+
+    try:
+        validate_upload_batch(file_entries)
+    except UploadLimitError as exc:
+        _raise_upload_limit_error(exc)
 
     payload = {
         "kind": "project_source_document",
         "project_id": str(project.id),
-        "files": queued_files,
         "threshold": threshold,
         "collection_ids": [str(collection_id) for collection_id in selected_collection_ids],
         "term_base_id": str(term_base_id) if term_base_id is not None else None,
@@ -6099,7 +6891,7 @@ async def upload_project_source_document(
         "document_parse_mode": document_parse_mode,
         "document_parse_options": normalized_parse_options,
     }
-    return await _queue_import_task(background_tasks, payload)
+    return await _queue_import_task(background_tasks, payload, staging_files=file_entries)
 
 
 @router.get("/projects")
@@ -6374,6 +7166,8 @@ def _serialize_workbench_segment(
         "source": seg.source,
         "llm_provider": seg.llm_provider,
         "llm_model": seg.llm_model,
+        "last_modified_by_id": str(seg.last_modified_by_id) if seg.last_modified_by_id else None,
+        "last_modified_by": serialize_user(seg.last_modified_by) if seg.last_modified_by else None,
         "block_type": seg.block_type,
         "block_index": seg.block_index,
         "row_index": seg.row_index,
@@ -6428,6 +7222,18 @@ def _serialize_segment_update_conflict(conflict) -> dict:
         "current_version": conflict.current_version,
         "attempted_version": conflict.attempted_version,
         "current_target_text": conflict.current_target_text,
+        "conflict_source": getattr(conflict, "current_source", None),
+        "conflict_updated_at": (
+            conflict.current_updated_at.isoformat()
+            if getattr(conflict, "current_updated_at", None)
+            else None
+        ),
+        "conflict_last_modified_by_id": (
+            str(conflict.current_last_modified_by_id)
+            if getattr(conflict, "current_last_modified_by_id", None)
+            else None
+        ),
+        "resolution": getattr(conflict, "resolution", "conflict"),
     }
 
 
@@ -6904,6 +7710,7 @@ def transition_file_record_workflow(
         if segment.workflow_step_id != target_step.id or segment.status != next_status:
             segment.workflow_step_id = target_step.id
             segment.status = next_status
+            segment.last_modified_by_id = current_user.id
             segment.version = int(segment.version or 1) + 1
             updated_count += 1
         if segment.status == "confirmed" and normalize_text(segment.target_text):
@@ -7728,7 +8535,7 @@ def rematch_file_record(
             exact_count += 1
         elif match.status == "fuzzy" and match.target_text is not None:
             can_overwrite = payload.overwrite_fuzzy or (
-                segment.status in {"none", "fuzzy"} and segment.source != "user"
+                segment.status in {"none", "fuzzy"} and segment.source != "manual"
             )
             if can_overwrite:
                 target_text = (
@@ -7761,6 +8568,7 @@ def rematch_file_record(
             segment.matched_updated_at,
         )
         if before != after:
+            segment.last_modified_by_id = current_user.id
             segment.version = int(segment.version or 1) + 1
             updated_count += 1
 
@@ -8659,7 +9467,12 @@ def update_segment(
         if not current_segment:
             raise HTTPException(status_code=404, detail="片段不存在。")
         current_version = int(current_segment.version or 1)
-        if current_version != update.base_version:
+        if current_version != update.base_version and not _can_auto_merge_stale_segment(
+            current_segment,
+            incoming_source=update.source,
+            current_user=current_user,
+            target_text=update.target_text,
+        ):
             workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
                 db,
                 file_record,
@@ -8667,16 +9480,18 @@ def update_segment(
             )
             target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
             qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, [current_segment])
+            conflict = SegmentUpdateConflict(
+                sentence_id=current_segment.sentence_id,
+                current_version=current_version,
+                attempted_version=update.base_version,
+                current_target_text=current_segment.target_text or "",
+                current_source=current_segment.source,
+                current_updated_at=current_segment.updated_at,
+                current_last_modified_by_id=current_segment.last_modified_by_id,
+            )
             return {
                 "updated_count": 0,
-                "conflicts": [
-                    {
-                        "sentence_id": current_segment.sentence_id,
-                        "current_version": current_version,
-                        "attempted_version": update.base_version,
-                        "current_target_text": current_segment.target_text or "",
-                    }
-                ],
+                "conflicts": [_serialize_segment_update_conflict(conflict)],
                 "auto_tm": _empty_auto_tm_summary().to_dict(),
                 "project_sync": empty_project_segment_sync_summary().to_dict(),
                 "segments": [
@@ -8787,6 +9602,7 @@ def update_segment_source(
         file_record_id=file_record_id,
         sentence_id=sentence_id,
         source_text=update.source_text,
+        current_user=current_user,
     )
     if not segment:
         raise HTTPException(status_code=404, detail="片段不存在。")
@@ -8821,11 +9637,12 @@ def update_segment_project_sync(
 
     _require_segment_work_access(db, file_record, segment, current_user)
     if payload.disabled:
-        summary = disable_project_sync_for_segments([segment])
+        summary = disable_project_sync_for_segments([segment], current_user=current_user)
         if summary.updated_count:
             sync_file_record_status(db, file_record_id)
     elif segment.project_sync_disabled:
         segment.project_sync_disabled = False
+        segment.last_modified_by_id = current_user.id
         segment.version = int(segment.version or 1) + 1
     db.commit()
     db.refresh(segment)
@@ -8860,7 +9677,7 @@ def disable_file_record_project_sync(
         .all()
     )
     writable_segments = _filter_writable_segments(db, file_record, current_user, segments)
-    summary = disable_project_sync_for_segments(writable_segments)
+    summary = disable_project_sync_for_segments(writable_segments, current_user=current_user)
     if summary.updated_count:
         sync_file_record_status(db, file_record_id)
     db.commit()
@@ -8881,6 +9698,7 @@ def _set_project_sync_disabled_for_project(
     db: Session,
     project_id: UUID,
     disabled: bool,
+    current_user: User | None = None,
 ) -> ProjectSyncDisableSummary:
     _get_project_or_404(db, project_id)
     file_records = (
@@ -8898,9 +9716,9 @@ def _set_project_sync_disabled_for_project(
             .all()
         )
         current_summary = (
-            disable_project_sync_for_segments(segments)
+            disable_project_sync_for_segments(segments, current_user=current_user)
             if disabled
-            else enable_project_sync_for_segments(segments)
+            else enable_project_sync_for_segments(segments, current_user=current_user)
         )
         _extend_project_sync_update_summary(summary, current_summary)
         if disabled and current_summary.updated_count:
@@ -8914,10 +9732,10 @@ def update_project_sync_for_project(
     project_id: UUID,
     payload: SegmentProjectSyncUpdate,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ) -> ProjectSyncDisableResponse:
     """开启或关闭项目下全部文件的项目同步。关闭时清空项目同步生成的译文。"""
-    summary = _set_project_sync_disabled_for_project(db, project_id, payload.disabled)
+    summary = _set_project_sync_disabled_for_project(db, project_id, payload.disabled, current_user)
     db.commit()
     return ProjectSyncDisableResponse(**summary.to_dict())
 
@@ -8926,10 +9744,10 @@ def update_project_sync_for_project(
 def disable_project_sync_for_project(
     project_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ) -> ProjectSyncDisableResponse:
     """一键关闭项目下全部文件的项目同步，并清空项目同步生成的译文。"""
-    disable_summary = _set_project_sync_disabled_for_project(db, project_id, True)
+    disable_summary = _set_project_sync_disabled_for_project(db, project_id, True, current_user)
     db.commit()
     return ProjectSyncDisableResponse(**disable_summary.to_dict())
 
@@ -8987,12 +9805,15 @@ def split_segment(
     segment.target_text = first_target
     segment.target_html = None
     segment.score = 0.0
+    segment.source = "manual"
+    segment.last_modified_by_id = current_user.id
     segment.matched_source_text = None
     segment.matched_collection_name = None
     segment.matched_creator_name = None
     segment.matched_created_at = None
     segment.matched_updated_at = None
     segment.status = _resolve_unconfirmed_segment_status(segment)
+    segment.version = int(segment.version or 1) + 1
 
     # 创建新句段
     new_segment = Segment(
@@ -9008,6 +9829,7 @@ def split_segment(
         status="none",
         score=0.0,
         source="manual",
+        last_modified_by_id=current_user.id,
         block_type=segment.block_type,
         block_index=segment.block_index,
         row_index=segment.row_index,
@@ -9106,12 +9928,14 @@ def merge_segment(
     first_seg.target_html = None
     first_seg.score = 0.0
     first_seg.source = "manual"
+    first_seg.last_modified_by_id = current_user.id
     first_seg.matched_source_text = None
     first_seg.matched_collection_name = None
     first_seg.matched_creator_name = None
     first_seg.matched_created_at = None
     first_seg.matched_updated_at = None
     first_seg.status = _resolve_unconfirmed_segment_status(first_seg)
+    first_seg.version = int(first_seg.version or 1) + 1
 
     # 迁移第二个句段的评论到第一个句段
     for comment in second_seg.comments:
@@ -9261,6 +10085,7 @@ def batch_update_segment_confirmation(
         for segment in segments:
             if segment.status != next_status:
                 segment.status = next_status
+                segment.last_modified_by_id = current_user.id
                 segment.version = int(segment.version or 1) + 1
                 updated_count += 1
     else:
@@ -9275,6 +10100,7 @@ def batch_update_segment_confirmation(
             next_status = _resolve_unconfirmed_segment_status(segment)
             if segment.status != next_status:
                 segment.status = next_status
+                segment.last_modified_by_id = current_user.id
                 segment.version = int(segment.version or 1) + 1
                 updated_count += 1
 
@@ -10197,6 +11023,7 @@ async def llm_translate_file_record(
                             segment.target_text = translated_text
                             segment.target_html = None
                             segment.source = "llm"
+                            segment.last_modified_by_id = current_user_id
                             segment.version = int(segment.version or 1) + 1
                             segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
                             segment.llm_provider = result.provider

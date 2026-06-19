@@ -362,6 +362,7 @@ def refresh_unconfirmed_segment_matches(
                 segment.matched_updated_at,
             )
             if before != after:
+                segment.last_modified_by_id = None
                 segment.version = int(segment.version or 1) + 1
                 updated_count += 1
 

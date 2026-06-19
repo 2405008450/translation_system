@@ -82,7 +82,11 @@ def empty_project_segment_sync_summary() -> ProjectSegmentSyncSummary:
     return ProjectSegmentSyncSummary()
 
 
-def disable_project_sync_for_segments(segments: list[Segment]) -> ProjectSyncDisableSummary:
+def disable_project_sync_for_segments(
+    segments: list[Segment],
+    *,
+    current_user=None,
+) -> ProjectSyncDisableSummary:
     """关闭句段项目同步；对已由项目同步填充的译文同步清空。"""
     summary = ProjectSyncDisableSummary()
 
@@ -101,6 +105,8 @@ def disable_project_sync_for_segments(segments: list[Segment]) -> ProjectSyncDis
                 changed = True
 
         if changed:
+            if current_user is not None:
+                segment.last_modified_by_id = current_user.id
             segment.version = int(segment.version or 1) + 1
             summary.updated_count += 1
             summary.updated_segments.append(segment)
@@ -108,7 +114,11 @@ def disable_project_sync_for_segments(segments: list[Segment]) -> ProjectSyncDis
     return summary
 
 
-def enable_project_sync_for_segments(segments: list[Segment]) -> ProjectSyncDisableSummary:
+def enable_project_sync_for_segments(
+    segments: list[Segment],
+    *,
+    current_user=None,
+) -> ProjectSyncDisableSummary:
     """恢复句段项目同步，不改动现有译文。"""
     summary = ProjectSyncDisableSummary()
 
@@ -117,6 +127,8 @@ def enable_project_sync_for_segments(segments: list[Segment]) -> ProjectSyncDisa
             continue
 
         segment.project_sync_disabled = False
+        if current_user is not None:
+            segment.last_modified_by_id = current_user.id
         segment.version = int(segment.version or 1) + 1
         summary.updated_count += 1
         summary.updated_segments.append(segment)
@@ -302,6 +314,7 @@ def _apply_candidate_to_targets(
         target.target_html = None
         target.status = "confirmed" if target.status == "confirmed" else PROJECT_SYNC_STATUS
         target.source = PROJECT_SYNC_SOURCE
+        target.last_modified_by_id = current_user.id if current_user is not None else None
         target.score = 1.0
         target.matched_source_text = candidate.segment.source_text
         target.version = int(target.version or 1) + 1

@@ -1,16 +1,34 @@
 # Docker 生产部署说明
 
-本项目推荐用独立 Compose 项目部署，避免影响服务器上已有的 `offline-deploy-*` 容器。当前方案只对公网发布 `19013`，PostgreSQL、Redis、LanguageTool 均留在本项目 Docker 内网。
+本项目使用独立 Compose 项目部署。**默认方案 A**：不启动 nginx，公网直连 **app:19013**（适合 80 端口已被其他项目占用的临时测试）。
+
+待换服务器或 80 空闲后，可用 `USE_NGINX=1` 启用 nginx 反代。
+
+```text
+公网 :19013 (app) ── gunicorn
+                 ├── worker (arq)
+                 ├── postgres / pgbouncer / redis / languagetool
+                 └── 共享卷：file_records / export_tasks / import_tasks
+
+可选 USE_NGINX=1：
+公网 :80 (nginx) ──► app:19013
+```
 
 ## 1. 服务器准备
 
 ```bash
-sudo ss -tulpn | grep 19013 || true
+sudo ss -tulpn | grep -E ':80|:19013' || true
 docker --version
 docker compose version || docker-compose version
+chmod +x scripts/deploy_prod.sh
 ```
 
-在云服务器安全组和系统防火墙中放行 TCP `19013`。
+安全组 / 防火墙放行：
+
+| 端口 | 用途 | 默认方案 A |
+|------|------|------------|
+| 19013 | 直连 app | **公网放行** |
+| 80 | nginx（`USE_NGINX=1` 时） | 不启用 |
 
 ## 2. 配置环境变量
 
@@ -19,39 +37,54 @@ cp .env.prod.example .env.prod
 nano .env.prod
 ```
 
-必须替换：
+**必须替换：**
 
 - `POSTGRES_PASSWORD`
 - `DATABASE_URL` 中的数据库密码
 - `JWT_SECRET_KEY`
 - 至少一个 LLM Key：`DEEPSEEK_API_KEY` 或 `OPENROUTER_API_KEY`
+- `CORS_ALLOW_ORIGINS` 中的公网 IP / 域名
 
-如果数据库密码包含 `@`、`:`、`/`、`?`、`#` 等字符，`DATABASE_URL` 里的密码部分必须 URL 编码。
+**上传相关（已有默认值，一般无需改）：**
 
-### `.env.prod` 和 `.env` 分别干什么？
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `UPLOAD_MAX_TOTAL_SIZE_MB` | 500 | 单次上传总大小 |
+| `UPLOAD_MAX_FILES_PER_BATCH` | 50 | 单次文件数 |
+| `UPLOAD_MAX_EXPANDED_FILES` | 100 | zip/rar 解压后文件数 |
+| `IMPORT_TASK_DIR` | `/app/data/import_tasks` | 导入暂存（app/worker 共享卷） |
+| `GUNICORN_TIMEOUT` | 600 | 大文件上传超时（秒） |
 
-| 文件 | 谁读它 | 作用 |
-|------|--------|------|
-| **`.env.prod`** | `docker-compose.prod.yml`（经 `--env-file` 或 `env_file:`） | **生产环境唯一权威配置**。Compose 用它解析 `${POSTGRES_*}` 等变量，并注入 app/worker 容器。 |
-| **`.env`** | 独立版 `docker-compose` 默认自动读取；本地开发时 `app/config.py` 也会读 | 生产上通常是 `cp .env.prod .env` 的**副本**，只为兼容不带 `--env-file` 的旧命令。容器内**不依赖**磁盘上的 `.env` 文件。 |
+nginx 的 `client_max_body_size` 在 `docker/nginx/default.conf`，默认 **500m**，需与 `UPLOAD_MAX_TOTAL_SIZE_MB` 保持一致。
 
-推荐做法：
+密码含 `@`、`:`、`/`、`?`、`#` 等字符时，`DATABASE_URL` 须 URL 编码。
+
+### `.env.prod` 和 `.env`
+
+| 文件 | 作用 |
+|------|------|
+| `.env.prod` | 生产权威配置，Compose 通过 `--env-file` 读取 |
+| `.env` | 可选副本：`cp .env.prod .env`，兼容不带 `--env-file` 的旧命令 |
+
+## 3. 构建并启动（推荐，方案 A）
 
 ```bash
-# 1. 只维护 .env.prod（内容以 .env.prod.example 为模板）
-nano .env.prod
+# 默认：不启 nginx，公网访问 http://<IP>:19013
+scripts/deploy_prod.sh up
 
-# 2. 若使用 docker-compose 且不想每次写 --env-file，同步一份
-cp .env.prod .env
-
-# 3. 两个文件内容应完全一致；改配置时只改 .env.prod，再 cp 覆盖 .env
+# 若需 Mihomo 代理访问 OpenRouter
+USE_PROXY=1 scripts/deploy_prod.sh up
 ```
 
-注意：容器里的 Python 应用读的是**环境变量**（Compose 从 `.env.prod` 注入），不是容器内的 `.env` 文件。服务器项目目录里的 `.env` 主要是给 Compose 解析用的。
+**换服务器后启用 nginx（80 或自定义端口空闲时）：**
 
-## 3. 构建并启动
+```bash
+USE_NGINX=1 scripts/deploy_prod.sh up
+# 或手动：
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.nginx.yml up -d
+```
 
-如果服务器支持新版插件命令 `docker compose`，使用：
+等价手动命令：
 
 ```bash
 docker compose --env-file .env.prod -f docker-compose.prod.yml build
@@ -59,60 +92,115 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
 docker compose --env-file .env.prod -f docker-compose.prod.yml ps
 ```
 
-如果服务器只有独立命令 `docker-compose`，先复制一份默认 `.env`，再使用：
+独立版 `docker-compose`：
 
 ```bash
 cp .env.prod .env
-
-sudo docker-compose -f docker-compose.prod.yml config
 sudo docker-compose -f docker-compose.prod.yml build
 sudo docker-compose -f docker-compose.prod.yml up -d
-sudo docker-compose -f docker-compose.prod.yml ps
 ```
 
-首次创建数据库 volume 时会自动执行：
+### 代码更新后重建
 
-- `docker/postgres/init/00-extensions.sql`
-- `docker/postgres/init/05-users-prereq.sql`
-- `scripts/init_db.sql`
-- `scripts/create_reference_profiles.sql`
-
-这些初始化脚本只在 PostgreSQL volume 第一次创建时运行。
+```bash
+git pull
+scripts/deploy_prod.sh restart
+# 或完整重建：
+scripts/deploy_prod.sh build
+docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --force-recreate app worker nginx
+```
 
 ## 4. 验证
 
 ```bash
+scripts/deploy_prod.sh health
+
 curl http://127.0.0.1:19013/api/health
-curl http://43.132.156.72:19013/
-docker compose --env-file .env.prod -f docker-compose.prod.yml logs --tail=100 app
-docker compose --env-file .env.prod -f docker-compose.prod.yml logs --tail=100 worker
+curl http://<公网IP>:19013/
+
+docker compose --env-file .env.prod -f docker-compose.prod.yml logs --tail=100 app worker
 ```
 
-如果使用的是 `docker-compose` 命令：
-
-```bash
-sudo docker-compose -f docker-compose.prod.yml logs --tail=100 app
-sudo docker-compose -f docker-compose.prod.yml logs --tail=100 worker
-```
-
-打开：
+浏览器访问（将 IP 换成你的服务器）：
 
 ```text
+http://43.132.156.72:19013/
 http://43.132.156.72:19013/login
 ```
 
 首次进入后初始化管理员账号。
 
-## 5. 数据恢复策略
+## 5. 数据卷说明
 
-本次先按空库上线。后续如果要恢复数据库和文件：
+| Volume | 路径 | 内容 |
+|--------|------|------|
+| `app_file_storage` | `/app/data/file_records` | 源文件持久化 |
+| `app_export_tasks` | `/app/data/export_tasks` | 导出临时文件 |
+| `app_import_tasks` | `/app/data/import_tasks` | 上传导入暂存（app/worker **必须共享**） |
+| `app_logs` | `/app/logs` | 应用日志 |
+| `postgres_data` | — | PostgreSQL 数据 |
+| `redis_data` | — | Redis AOF |
 
-1. 先停应用和 worker。
-2. 备份当前 `postgres_data`、`app_file_storage`、`app_export_tasks` volume。
-3. 按你提供的 dump 或连接信息恢复 PostgreSQL。
-4. 同步 `data/file_records` 和 `data/export_tasks`。    
-5. 再启动服务并检查 `/api/health`。
+启动时 app 会自动创建目录并清理过期 `import_tasks`（TTL 默认 86400s）。
 
-仓库中的 `migration_20260605_105050` 是旧迁移包，可作为后续恢复来源，但不要在首次空库上线时自动覆盖。
+## 6. nginx 说明
 
-数据库迁移和远程连接请看 [DATABASE_MIGRATION.md](DATABASE_MIGRATION.md)。默认推荐 SSH 隧道连接数据库，不建议把 PostgreSQL 裸露到公网。
+配置文件：`docker/nginx/default.conf`
+
+- 反向代理到 `app:19013`
+- `client_max_body_size 500m` — 与上传总大小限制对齐
+- `proxy_request_buffering off` — 大文件流式转发
+- 超时 600s — 与 `GUNICORN_TIMEOUT` 对齐
+
+HTTPS：当前仅 HTTP。接入 TLS 时可挂载证书到 nginx，或使用云厂商 LB 终结 SSL 后转发到 80。
+
+## 7. 数据恢复
+
+1. 停 app / worker / nginx
+2. 备份 `postgres_data`、`app_file_storage`、`app_export_tasks`、`app_import_tasks`
+3. 恢复 PostgreSQL dump 与文件卷
+4. 启动并检查 `/api/health`
+
+详见 [DATABASE_MIGRATION.md](DATABASE_MIGRATION.md)。
+
+## 9. 从旧版 Docker 栈升级（保留数据）
+
+本次上传改造**只新增** `app_import_tasks` 卷与环境变量，不改动 postgres / file_records / export_tasks 卷名。
+
+```bash
+git pull
+# .env.prod 可不改：compose 已为 IMPORT_TASK_DIR / 上传限制提供默认值
+# 若希望显式配置，从 .env.prod.example 合并新增项即可
+
+docker compose --env-file .env.prod -f docker-compose.prod.yml build app
+docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --force-recreate app worker
+```
+
+**必须重建 app + worker**，否则新卷 `app_import_tasks` 不会挂载，ARQ 导入会报「暂存文件不存在」。
+
+仍可使用原有命令（与改版前相同，仅去掉 nginx）：
+
+```bash
+sudo docker-compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml build app
+sudo docker-compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml up -d --force-recreate app worker
+```
+
+## 10. 常见问题
+
+**上传 413 / 502**
+
+- 检查 nginx `client_max_body_size` 与 `UPLOAD_MAX_TOTAL_SIZE_MB`
+- 检查 `GUNICORN_TIMEOUT` 是否足够
+
+**ARQ 导入失败「暂存文件不存在」**
+
+- 确认 worker 已挂载 `app_import_tasks` 卷（`docker-compose.prod.yml` 已配置）
+- 重建 worker：`scripts/deploy_prod.sh restart`
+
+**仅想直连 19013、不用 nginx（默认）**
+
+- 直接 `scripts/deploy_prod.sh up` 即可，nginx 不会启动。
+
+**日后启用 nginx**
+
+- `USE_NGINX=1 scripts/deploy_prod.sh up`，并设置 `NGINX_HTTP_PORT`。

@@ -169,6 +169,7 @@ export default {
     requestFailed: '请求失败',
     network: '网络异常，请稍后重试。',
     importFailed: '导入失败。',
+    importTaskTimeout: '导入任务超时，请稍后刷新页面查看处理结果。',
   },
   stores: {
     auth: {
@@ -820,6 +821,9 @@ export default {
       load: '项目详情加载失败。',
       collectionsLoad: '记忆库列表加载失败。',
       selectFile: '请先选择要上传的文件。',
+      tooManyFiles: '单次最多上传 {max} 个文件。',
+      fileTooLarge: '文件“{name}”超过大小限制（{max} MB）。',
+      totalTooLarge: '所选文件总大小超过限制（{max} MB）。',
       selectCollection: '请选择 TM 记忆库。',
       selectLanguagePair: '请先选择源语言和目标语言。',
       upload: '待翻译文档上传失败。',

@@ -13,13 +13,21 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
       FILE_STORAGE_DIR: /app/data/file_records
       EXPORT_TASK_DIR: /app/data/export_tasks
+      IMPORT_TASK_DIR: /app/data/import_tasks
+      IMPORT_TASK_STAGING_TTL_SECONDS: ${IMPORT_TASK_STAGING_TTL_SECONDS:-86400}
+      UPLOAD_MAX_SIZE_MB: ${UPLOAD_MAX_SIZE_MB:-100}
+      UPLOAD_MAX_FILES_PER_BATCH: ${UPLOAD_MAX_FILES_PER_BATCH:-50}
+      UPLOAD_MAX_TOTAL_SIZE_MB: ${UPLOAD_MAX_TOTAL_SIZE_MB:-500}
+      UPLOAD_MAX_EXPANDED_FILES: ${UPLOAD_MAX_EXPANDED_FILES:-100}
+      GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-600}
       LIBREOFFICE_SOFFICE_PATH: /usr/bin/libreoffice
       LIBREOFFICE_PYTHON_PATH: /usr/bin/python3
     ports:
-      - "19013:19013"
+      - "${APP_PUBLISH_PORT:-19013}:19013"
     volumes:
       - app_file_storage:/app/data/file_records
       - app_export_tasks:/app/data/export_tasks
+      - app_import_tasks:/app/data/import_tasks
       - app_logs:/app/logs
     depends_on:
       pgbouncer:
@@ -30,6 +38,12 @@ services:
         condition: service_started
       db-migrate:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:19013/api/health', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
     restart: unless-stopped
 
   worker:
@@ -44,12 +58,19 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
       FILE_STORAGE_DIR: /app/data/file_records
       EXPORT_TASK_DIR: /app/data/export_tasks
+      IMPORT_TASK_DIR: /app/data/import_tasks
+      IMPORT_TASK_STAGING_TTL_SECONDS: ${IMPORT_TASK_STAGING_TTL_SECONDS:-86400}
+      UPLOAD_MAX_SIZE_MB: ${UPLOAD_MAX_SIZE_MB:-100}
+      UPLOAD_MAX_FILES_PER_BATCH: ${UPLOAD_MAX_FILES_PER_BATCH:-50}
+      UPLOAD_MAX_TOTAL_SIZE_MB: ${UPLOAD_MAX_TOTAL_SIZE_MB:-500}
+      UPLOAD_MAX_EXPANDED_FILES: ${UPLOAD_MAX_EXPANDED_FILES:-100}
       LIBREOFFICE_SOFFICE_PATH: /usr/bin/libreoffice
       LIBREOFFICE_PYTHON_PATH: /usr/bin/python3
       DATABASE_APPLICATION_NAME: ai-translation-worker
     volumes:
       - app_file_storage:/app/data/file_records
       - app_export_tasks:/app/data/export_tasks
+      - app_import_tasks:/app/data/import_tasks
       - app_logs:/app/logs
     depends_on:
       pgbouncer:
@@ -158,4 +179,5 @@ volumes:
   redis_data:
   app_file_storage:
   app_export_tasks:
+  app_import_tasks:
   app_logs:

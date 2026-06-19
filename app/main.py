@@ -18,6 +18,7 @@ from app.routers.auth import router as auth_router
 from app.routers.glossary_base import router as glossary_base_router
 from app.routers.term_base import router as term_base_router
 from app.routers.reference import router as reference_router
+from app.services.import_task_storage import initialize_import_task_storage
 from app.services.schema_setup import ensure_runtime_schema
 
 
@@ -66,6 +67,8 @@ app.include_router(glossary_base_router, prefix="/api")
 
 @app.on_event("startup")
 async def _configure_runtime() -> None:
+    storage_state = initialize_import_task_storage()
+    logger.info("upload storage initialized: %s", storage_state)
     # 同步接口由 FastAPI 调度到 anyio 线程池执行，按需调大其容量以匹配并发与连接池规模。
     if settings.server_threadpool_size and settings.server_threadpool_size > 0:
         limiter = anyio.to_thread.current_default_thread_limiter()

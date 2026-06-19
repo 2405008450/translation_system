@@ -7,6 +7,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.services.adapters import ensure_default_adapters_registered
 from app.services.adapters.base import DEFAULT_MAX_FILE_SIZE, FORMAT_SIZE_LIMITS
 from app.services.adapters.export_formats import get_supported_exports
@@ -480,6 +481,67 @@ def can_export_task_file(filename: str, has_source_file: bool = True) -> bool:
     return any(option.id == "original" for option in get_supported_exports(extension))
 
 
+class UploadLimitError(Exception):
+    def __init__(self, detail: str, *, status_code: int = 400):
+        self.detail = detail
+        self.status_code = status_code
+        super().__init__(detail)
+
+
+def get_max_upload_size_bytes(filename: str) -> int:
+    extension = get_task_file_extension(filename)
+    registry = ensure_default_adapters_registered()
+    try:
+        adapter = registry.get_adapter(filename if extension else "file.txt")
+        return adapter.get_max_file_size()
+    except Exception:
+        return FORMAT_SIZE_LIMITS.get(extension, DEFAULT_MAX_FILE_SIZE)
+
+
+def validate_upload_batch(
+    files: list[tuple[str, bytes]],
+    *,
+    max_files: int | None = None,
+) -> None:
+    settings = get_settings()
+    limit_files = max_files if max_files is not None else settings.upload_max_files_per_batch
+    max_total_bytes = settings.upload_max_total_size_mb * 1024 * 1024
+
+    if len(files) > limit_files:
+        raise UploadLimitError(
+            f"文件数量超过限制，最多 {limit_files} 个。",
+            status_code=400,
+        )
+
+    total = 0
+    for filename, raw_bytes in files:
+        max_size = get_max_upload_size_bytes(filename)
+        size = len(raw_bytes)
+        if size > max_size:
+            max_mb = round(max_size / (1024 * 1024), 2)
+            raise UploadLimitError(
+                f"文件 {filename} 超过大小限制（{max_mb} MB）。",
+                status_code=413,
+            )
+        total += size
+
+    if total > max_total_bytes:
+        raise UploadLimitError(
+            f"上传总大小超过限制（{settings.upload_max_total_size_mb} MB）。",
+            status_code=413,
+        )
+
+
+def validate_expanded_upload_batch(file_payloads: list[dict[str, Any]]) -> None:
+    from app.services.import_task_storage import read_import_file_bytes
+
+    files = [
+        (payload.get("filename") or "source.txt", read_import_file_bytes(payload))
+        for payload in file_payloads
+    ]
+    validate_upload_batch(files, max_files=get_settings().upload_max_expanded_files)
+
+
 def get_upload_capabilities() -> dict[str, Any]:
     supported_extensions = get_supported_task_extensions()
     supported_set = set(supported_extensions)
@@ -506,21 +568,21 @@ def get_upload_capabilities() -> dict[str, Any]:
             }
         )
 
+    settings = get_settings()
     return {
         "extensions": list(supported_extensions),
         "accept": ",".join(supported_extensions),
         "formats": formats,
+        "limits": {
+            "max_files_per_batch": settings.upload_max_files_per_batch,
+            "max_total_size_mb": settings.upload_max_total_size_mb,
+            "max_expanded_files": settings.upload_max_expanded_files,
+        },
     }
 
 
 def _get_upload_max_size_mb(extension: str) -> float:
-    registry = ensure_default_adapters_registered()
-    try:
-        adapter = registry.get_adapter(f"file{extension}")
-        max_size = adapter.get_max_file_size()
-    except Exception:
-        max_size = FORMAT_SIZE_LIMITS.get(extension, DEFAULT_MAX_FILE_SIZE)
-    return round(max_size / (1024 * 1024), 2)
+    return round(get_max_upload_size_bytes(f"file{extension}") / (1024 * 1024), 2)
 
 
 def build_task_workspace(

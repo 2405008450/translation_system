@@ -93,6 +93,7 @@ import type {
   TermQAReport,
   UploadCapabilitiesResponse,
   UploadCapability,
+  UploadBatchLimits,
   User,
   WorkflowProgress,
   WorkflowStep,
@@ -219,6 +220,30 @@ interface PreTranslateProgressState {
 
 interface PreTranslateProgressPayload extends PreTranslateProgressState {
   fileId: string
+}
+
+interface ActivePretranslationTaskStatus {
+  id: string
+  file_record_id: string
+  filename?: string | null
+  status: string
+  stage: string
+  progress: number
+  message: string
+  provider?: string | null
+  model?: string | null
+  scope?: string | null
+  total_segments: number
+  unique_segments: number
+  deduplicated_segments: number
+  processed_segments: number
+  updated_segments: number
+  error_segments: number
+  error?: string | null
+}
+
+interface ActivePretranslationTasksResponse {
+  tasks: ActivePretranslationTaskStatus[]
 }
 
 interface ProjectDocumentStatisticsResponse {
@@ -360,6 +385,11 @@ const uploadTargetLanguage = ref('')
 const documentParseMode = ref<DocumentParseMode>('full')
 const documentParseOptions = ref<DocumentParseOptions>({ ...DEFAULT_DOCUMENT_PARSE_OPTIONS })
 const uploadCapabilities = ref<UploadCapability[]>([])
+const uploadLimits = ref<UploadBatchLimits>({
+  max_files_per_batch: 50,
+  max_total_size_mb: 500,
+  max_expanded_files: 100,
+})
 const uploadFileAccept = ref(supportedTaskFileAccept)
 const loadingUploadCapabilities = ref(false)
 const basicCollapsed = ref(false)
@@ -604,6 +634,9 @@ const showProjectExportMenu = ref(false)
 const loadingProjectExportOptions = ref(false)
 const projectExportOptions = ref<FileExportOption[]>([])
 let exportPollTimer: number | null = null
+let activePretranslationPollTimer: number | null = null
+const ACTIVE_PRETRANSLATION_STATUSES = new Set(['queued', 'running', 'canceling'])
+const ACTIVE_PRETRANSLATION_POLL_INTERVAL_MS = 2_500
 
 const tabs = computed(() => ([
   { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
@@ -1011,6 +1044,14 @@ const uploadSupportedSummary = computed(() => {
 })
 const canDetectSourceLanguage = computed(() => (
   selectedFiles.value.length > 0 && !uploading.value && !detectingLanguage.value
+))
+const uploadFileValidationError = computed(() => validateSelectedUploadFiles(selectedFiles.value))
+const canSubmitSourceUpload = computed(() => (
+  selectedFiles.value.length > 0
+  && !uploading.value
+  && !uploadFileValidationError.value
+  && Boolean(uploadSourceLanguage.value)
+  && Boolean(uploadTargetLanguage.value)
 ))
 const cameFromTasks = computed(() => route.query.from === 'tasks')
 const backRoute = computed(() => (
@@ -1558,9 +1599,55 @@ function clearLanguageDetectState() {
   languageDetectTone.value = 'info'
 }
 
+function getUploadFileExtension(filename: string): string {
+  const dotIndex = filename.lastIndexOf('.')
+  return dotIndex >= 0 ? filename.slice(dotIndex).toLowerCase() : ''
+}
+
+function getMaxUploadSizeMbForFile(filename: string): number {
+  const extension = getUploadFileExtension(filename)
+  for (const capability of uploadCapabilities.value) {
+    if (capability.extensions.includes(extension)) {
+      return capability.max_size_mb
+    }
+  }
+  return 50
+}
+
+function validateSelectedUploadFiles(files: File[]): string {
+  if (files.length === 0) {
+    return ''
+  }
+
+  const limits = uploadLimits.value
+  if (files.length > limits.max_files_per_batch) {
+    return t('projectDetail.errors.tooManyFiles', { max: limits.max_files_per_batch })
+  }
+
+  let totalBytes = 0
+  for (const file of files) {
+    const maxBytes = getMaxUploadSizeMbForFile(file.name) * 1024 * 1024
+    if (file.size > maxBytes) {
+      return t('projectDetail.errors.fileTooLarge', {
+        name: file.name,
+        max: getMaxUploadSizeMbForFile(file.name),
+      })
+    }
+    totalBytes += file.size
+  }
+
+  const maxTotalBytes = limits.max_total_size_mb * 1024 * 1024
+  if (totalBytes > maxTotalBytes) {
+    return t('projectDetail.errors.totalTooLarge', { max: limits.max_total_size_mb })
+  }
+
+  return ''
+}
+
 function updateSelectedFiles(files: File[]) {
   selectedFiles.value = files
   clearLanguageDetectState()
+  uploadMessage.value = validateSelectedUploadFiles(files)
 }
 
 function onFileChange(event: Event) {
@@ -1931,6 +2018,79 @@ function handlePreTranslateProgress(payload: PreTranslateProgressPayload) {
       status: payload.status,
       running: payload.running,
     },
+  }
+}
+
+function buildActivePretranslationStatus(task: ActivePretranslationTaskStatus) {
+  const parts: string[] = []
+  if (task.message) {
+    parts.push(task.message)
+  }
+  if (task.provider || task.model) {
+    parts.push([task.provider, task.model].filter(Boolean).join(' / '))
+  }
+  if (task.total_segments > 0 || task.processed_segments > 0) {
+    const total = Math.max(task.total_segments, task.processed_segments)
+    parts.push(`${task.processed_segments}/${total}`)
+  }
+  if (task.unique_segments > 0 && task.deduplicated_segments > 0) {
+    parts.push(`唯一 ${task.unique_segments}，去重 ${task.deduplicated_segments}`)
+  }
+  if (task.updated_segments > 0 || task.error_segments > 0) {
+    parts.push(`成功 ${task.updated_segments}，失败 ${task.error_segments}`)
+  }
+  if (task.error && task.status === 'failed') {
+    parts.push(task.error)
+  }
+  return parts.filter(Boolean).join(' · ') || t('projectDetail.preTranslate.progress.running')
+}
+
+function clearActivePretranslationPollTimer() {
+  if (activePretranslationPollTimer !== null) {
+    window.clearInterval(activePretranslationPollTimer)
+    activePretranslationPollTimer = null
+  }
+}
+
+function ensureActivePretranslationPolling() {
+  if (activePretranslationPollTimer !== null) {
+    return
+  }
+  activePretranslationPollTimer = window.setInterval(() => {
+    void loadActivePretranslationTasks()
+  }, ACTIVE_PRETRANSLATION_POLL_INTERVAL_MS)
+}
+
+async function loadActivePretranslationTasks() {
+  if (!project.value?.id) {
+    clearActivePretranslationPollTimer()
+    return
+  }
+  try {
+    const { data } = await http.get<ActivePretranslationTasksResponse>(
+      `/projects/${project.value.id}/pretranslation-tasks/active`,
+    )
+    const hasRunningProgress = Object.values(preTranslateProgressByFileId.value).some((state) => state.running)
+    if (!data.tasks.length) {
+      clearActivePretranslationPollTimer()
+      if (hasRunningProgress) {
+        preTranslateProgressByFileId.value = {}
+        await loadProject()
+      }
+      return
+    }
+
+    for (const task of data.tasks) {
+      handlePreTranslateProgress({
+        fileId: task.file_record_id,
+        progress: task.progress,
+        status: buildActivePretranslationStatus(task),
+        running: ACTIVE_PRETRANSLATION_STATUSES.has(task.status),
+      })
+    }
+    ensureActivePretranslationPolling()
+  } catch {
+    clearActivePretranslationPollTimer()
   }
 }
 
@@ -2367,6 +2527,7 @@ async function loadProject() {
       qualityQASettings.value = null
       mergeViews.value = []
     }
+    void loadActivePretranslationTasks()
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.load'))
   } finally {
@@ -3171,6 +3332,11 @@ async function loadUploadCapabilities() {
   try {
     const { data } = await http.get<UploadCapabilitiesResponse>('/file-records/upload-capabilities')
     uploadCapabilities.value = data.formats
+    uploadLimits.value = {
+      max_files_per_batch: data.limits?.max_files_per_batch ?? 50,
+      max_total_size_mb: data.limits?.max_total_size_mb ?? 500,
+      max_expanded_files: data.limits?.max_expanded_files ?? 100,
+    }
     uploadFileAccept.value = data.accept || supportedTaskFileAccept
   } catch (error) {
     console.error('Failed to load upload capabilities:', error)
@@ -3318,6 +3484,12 @@ async function uploadSourceDocument() {
 
   if (uploadSourceLanguage.value === uploadTargetLanguage.value) {
     uploadMessage.value = t('projectList.errors.sameLanguage')
+    return
+  }
+
+  const validationError = validateSelectedUploadFiles(selectedFiles.value)
+  if (validationError) {
+    uploadMessage.value = validationError
     return
   }
 
@@ -3761,6 +3933,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('scroll', handleDocumentScroll)
   window.removeEventListener('resize', handleDocumentScroll)
   clearExportPollTimer()
+  clearActivePretranslationPollTimer()
 })
 
 </script>
@@ -3912,7 +4085,7 @@ onBeforeUnmount(() => {
               class="button button--primary"
               data-testid="project-upload-submit"
               type="button"
-              :disabled="uploading || selectedFiles.length === 0 || !uploadSourceLanguage || !uploadTargetLanguage"
+              :disabled="!canSubmitSourceUpload"
               @click="uploadSourceDocument"
             >
               <Loader2 v-if="uploading" class="lucide-spin" :size="14" />
@@ -6056,6 +6229,7 @@ onBeforeUnmount(() => {
 
     <PreTranslateDialog
       :open="showPreTranslateDialog"
+      :project-id="project?.id ?? null"
       :files="selectedProjectFiles"
       :source-language="project?.source_language ?? null"
       :target-language="project?.target_language ?? null"

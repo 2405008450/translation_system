@@ -188,6 +188,7 @@ const overrides = {
     requestFailed: 'Request failed',
     network: 'Network error. Please try again later.',
     importFailed: 'Import failed.',
+    importTaskTimeout: 'Import timed out. Refresh the page later to check the result.',
   },
   appLayout: {
     brand: 'Workbench',
@@ -364,6 +365,9 @@ const overrides = {
       export: 'Failed to export file.',
       exportOptions: 'Failed to load export options.',
       exportSource: 'Failed to export source files.',
+      tooManyFiles: 'You can upload at most {max} files at once.',
+      fileTooLarge: 'File "{name}" exceeds the size limit ({max} MB).',
+      totalTooLarge: 'Total selected file size exceeds the limit ({max} MB).',
     },
   },
   documentParsing: {

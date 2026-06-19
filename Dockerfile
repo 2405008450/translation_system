@@ -56,7 +56,7 @@ COPY prompt_templates ./prompt_templates
 COPY gunicorn.conf.py ./gunicorn.conf.py
 COPY --from=frontend-builder /build/frontend/dist ./frontend/dist
 
-RUN mkdir -p /app/data/file_records /app/data/export_tasks /app/logs
+RUN mkdir -p /app/data/file_records /app/data/export_tasks /app/data/import_tasks /app/logs
 
 EXPOSE 19013
 
