@@ -208,12 +208,17 @@ def export_bilingual_docx_with_layout(
         document_parse_mode=document_parse_mode,
         document_parse_options=document_parse_options,
     )
+    source_segments = source_workspace["segments"]
     math_placeholders_by_sentence_id = {
         str(segment["sentence_id"]): dict(segment.get("math_placeholders") or {})
-        for segment in source_workspace["segments"]
+        for segment in source_segments
         if segment.get("sentence_id")
     }
-    segments_by_block = _group_segments_by_block(segments, math_placeholders_by_sentence_id)
+    segments_by_block = _group_segments_by_block(
+        segments,
+        math_placeholders_by_sentence_id,
+        source_segments=source_segments,
+    )
     block_counter = count(0)
 
     for story in stories:
@@ -264,12 +269,17 @@ def export_translated_docx(
         document_parse_mode=document_parse_mode,
         document_parse_options=document_parse_options,
     )
+    source_segments = source_workspace["segments"]
     math_placeholders_by_sentence_id = {
         str(segment["sentence_id"]): dict(segment.get("math_placeholders") or {})
-        for segment in source_workspace["segments"]
+        for segment in source_segments
         if segment.get("sentence_id")
     }
-    segments_by_block = _group_segments_by_block(segments, math_placeholders_by_sentence_id)
+    segments_by_block = _group_segments_by_block(
+        segments,
+        math_placeholders_by_sentence_id,
+        source_segments=source_segments,
+    )
     block_counter = count(0)
 
     for story in stories:
@@ -319,6 +329,7 @@ def _normalize_bilingual_layout_order(order: str) -> str:
 def _group_segments_by_block(
     segments: Iterable[Any],
     math_placeholders_by_sentence_id: Mapping[str, dict[str, str]] | None = None,
+    source_segments: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[BlockKey, list[ExportSegment]]:
     grouped: dict[BlockKey, list[ExportSegment]] = defaultdict(list)
     math_map = math_placeholders_by_sentence_id or {}
@@ -344,7 +355,119 @@ def _group_segments_by_block(
             )
         )
 
+    if source_segments is not None:
+        return _order_segment_groups_by_source(grouped, source_segments)
+
     return grouped
+
+
+def _order_segment_groups_by_source(
+    grouped: dict[BlockKey, list[ExportSegment]],
+    source_segments: Iterable[Mapping[str, Any]],
+) -> dict[BlockKey, list[ExportSegment]]:
+    source_by_block: dict[BlockKey, list[Mapping[str, Any]]] = defaultdict(list)
+    for segment in source_segments:
+        block_key = _source_segment_block_key(segment)
+        source_by_block[block_key].append(segment)
+
+    ordered: dict[BlockKey, list[ExportSegment]] = {}
+    for block_key, block_segments in grouped.items():
+        source_block_segments = source_by_block.get(block_key)
+        if not source_block_segments:
+            ordered[block_key] = block_segments
+            continue
+        ordered[block_key] = _order_export_segments_for_source_block(block_segments, source_block_segments)
+    return ordered
+
+
+def _source_segment_block_key(segment: Mapping[str, Any]) -> BlockKey:
+    block_type = str(segment.get("block_type") or "paragraph")
+    block_index = int(segment.get("block_index") or 0)
+    row_index = _to_optional_int(segment.get("row_index"))
+    cell_index = _to_optional_int(segment.get("cell_index"))
+    return (block_type, block_index, row_index, cell_index)
+
+
+def _order_export_segments_for_source_block(
+    block_segments: list[ExportSegment],
+    source_segments: list[Mapping[str, Any]],
+) -> list[ExportSegment]:
+    used_indexes: set[int] = set()
+    ordered: list[ExportSegment] = []
+
+    for source_segment in source_segments:
+        match_index = _find_export_segment_by_sentence_id(
+            block_segments,
+            source_segment,
+            used_indexes,
+        )
+        if match_index is None:
+            match_index = _find_export_segment_by_text(block_segments, source_segment, used_indexes)
+        if match_index is None:
+            continue
+        used_indexes.add(match_index)
+        ordered.append(block_segments[match_index])
+
+    ordered.extend(
+        segment
+        for index, segment in enumerate(block_segments)
+        if index not in used_indexes
+    )
+    return ordered
+
+
+def _find_export_segment_by_sentence_id(
+    block_segments: list[ExportSegment],
+    source_segment: Mapping[str, Any],
+    used_indexes: set[int],
+) -> int | None:
+    sentence_id = str(source_segment.get("sentence_id") or "")
+    if not sentence_id:
+        return None
+
+    for index, segment in enumerate(block_segments):
+        if index in used_indexes:
+            continue
+        if segment.sentence_id == sentence_id:
+            return index
+    return None
+
+
+def _find_export_segment_by_text(
+    block_segments: list[ExportSegment],
+    source_segment: Mapping[str, Any],
+    used_indexes: set[int],
+) -> int | None:
+    source_keys = _source_segment_text_keys(source_segment)
+    if not source_keys:
+        return None
+
+    for index, segment in enumerate(block_segments):
+        if index in used_indexes:
+            continue
+        if source_keys & _export_segment_text_keys(segment):
+            return index
+    return None
+
+
+def _source_segment_text_keys(segment: Mapping[str, Any]) -> set[str]:
+    return _segment_text_keys(
+        segment.get("source_text"),
+        segment.get("display_text"),
+    )
+
+
+def _export_segment_text_keys(segment: ExportSegment) -> set[str]:
+    return _segment_text_keys(segment.source_text, segment.display_text)
+
+
+def _segment_text_keys(*values: object) -> set[str]:
+    keys: set[str] = set()
+    for value in values:
+        text = _normalize_segment_source_text(str(value or ""))
+        if text:
+            keys.add(text)
+    return keys
 
 
 def _export_bilingual_block_sequence(

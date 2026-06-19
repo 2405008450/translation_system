@@ -7057,12 +7057,13 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-page.is-standalone {
-  --workbench-editor-stage-height: clamp(460px, calc(100vh - 300px), 860px);
+  --workbench-editor-stage-height: clamp(500px, calc(100vh - 252px), 900px);
   --workbench-bottom-panel-height: clamp(320px, 42vh, 500px);
   --workbench-visible-bottom-panel-height: min(var(--workbench-bottom-panel-height), calc(100dvh - 70px));
   --workbench-toolbar-left: 16px;
   --workbench-drawer-left: 16px;
   --workbench-fixed-max: calc(100vw - 32px);
+  --workbench-side-panel-top: 160px;
   height: 100dvh;
   min-height: 0;
   padding: 0 10px 8px;
@@ -7108,6 +7109,12 @@ onBeforeRouteLeave(async () => {
 
 .workbench-page.is-stable-grid .workbench-ribbon {
   box-shadow: 0 1px 0 #cfd8df;
+}
+
+.workbench-page.is-standalone .toolbar-panel.workbench-toolbar.workbench-ribbon {
+  min-height: 0;
+  padding: 0;
+  gap: 0;
 }
 
 .workbench-page.is-stable-grid .workbench-layout {
@@ -7191,7 +7198,7 @@ onBeforeRouteLeave(async () => {
 .workbench-ribbon__tabs {
   display: flex;
   align-items: center;
-  min-height: 40px;
+  min-height: 36px;
   border-bottom: 1px solid #d8e0e5;
   background: linear-gradient(180deg, #eef2f5, #e7edf1);
 }
@@ -7247,9 +7254,9 @@ onBeforeRouteLeave(async () => {
   align-items: center;
   justify-content: center;
   gap: 4px;
-  min-height: 28px;
+  min-height: 26px;
   min-width: max-content;
-  padding: 4px 8px;
+  padding: 3px 7px;
   border: 1px solid transparent;
   border-radius: 4px;
   background: transparent;
@@ -7285,8 +7292,8 @@ onBeforeRouteLeave(async () => {
 .workbench-ribbon__help {
   display: inline-grid;
   place-items: center;
-  width: 32px;
-  height: 32px;
+  width: 30px;
+  height: 30px;
   margin-right: 8px;
   border: 1px solid transparent;
   border-radius: 6px;
@@ -7308,7 +7315,7 @@ onBeforeRouteLeave(async () => {
   flex-wrap: wrap;
   align-items: stretch;
   gap: 0;
-  min-height: 68px;
+  min-height: 60px;
   overflow: visible;
   border-top: 1px solid #edf2f5;
   background: #fff;
@@ -7318,8 +7325,8 @@ onBeforeRouteLeave(async () => {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 36px;
-  padding: 4px 10px;
+  min-height: 32px;
+  padding: 3px 10px;
   border-top: 1px solid #cce3ec;
   border-bottom: 1px solid #c5dfe9;
   background: linear-gradient(180deg, #edf8fb 0%, #dff1f6 100%);
@@ -7422,8 +7429,8 @@ onBeforeRouteLeave(async () => {
   align-items: center;
   flex: 0 1 auto;
   min-width: 0;
-  min-height: 68px;
-  padding: 3px 4px 5px;
+  min-height: 60px;
+  padding: 2px 4px 3px;
   border-right: 1px solid #dde5ea;
   background: linear-gradient(180deg, #fff 0%, #fbfdfe 100%);
 }
@@ -7750,8 +7757,8 @@ onBeforeRouteLeave(async () => {
   display: flex;
   align-items: center;
   gap: 7px;
-  min-height: 24px;
-  padding: 3px 10px;
+  min-height: 22px;
+  padding: 2px 10px;
   border-top: 1px solid #e5ebef;
   background: #f9fbfc;
   color: var(--text-muted);
@@ -7780,22 +7787,22 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-page.is-standalone .workbench-sidecar {
-  top: 174px;
-  max-height: calc(100vh - 194px);
+  top: var(--workbench-side-panel-top);
+  max-height: calc(100vh - var(--workbench-side-panel-top) - 20px);
 }
 
 .workbench-page.is-standalone .workbench-sidecar__panel {
-  max-height: calc(100vh - 194px);
+  max-height: calc(100vh - var(--workbench-side-panel-top) - 20px);
 }
 
 .workbench-page.is-standalone .workbench-sidecar__panel > .preview-panel,
 .workbench-page.is-standalone .workbench-sidecar__panel > .split-preview {
-  height: calc(100vh - 194px);
+  height: calc(100vh - var(--workbench-side-panel-top) - 20px);
 }
 
 .workbench-page.is-standalone .segment-editor-side-tools {
-  top: 174px;
-  max-height: calc(100vh - 194px);
+  top: var(--workbench-side-panel-top);
+  max-height: calc(100vh - var(--workbench-side-panel-top) - 20px);
 }
 
 .workbench-toolbar {
@@ -8608,8 +8615,8 @@ onBeforeRouteLeave(async () => {
 
 .segment-editor-toolbar {
   align-items: center;
-  gap: 10px;
-  margin-bottom: 8px;
+  gap: 6px;
+  margin-bottom: 4px;
   flex-wrap: wrap;
 }
 
@@ -8707,10 +8714,10 @@ onBeforeRouteLeave(async () => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  min-height: 44px;
+  gap: 8px;
+  min-height: 36px;
   min-width: 0;
-  padding: 6px 8px;
+  padding: 3px 6px;
   border: 1px solid #cfd8df;
   background: #f4f7f9;
 }
@@ -8724,6 +8731,41 @@ onBeforeRouteLeave(async () => {
   flex: 1 1 auto;
   min-width: 0;
   padding: 0;
+  gap: 5px;
+  font-size: 12px;
+}
+
+.segment-editor-footer :deep(.pagination__info) {
+  font-size: 12px;
+}
+
+.segment-editor-footer :deep(.pagination__btn),
+.segment-editor-footer :deep(.pagination__ellipsis),
+.segment-editor-footer :deep(.pagination__jump-input),
+.segment-editor-footer :deep(.pagination__size-select) {
+  height: 28px;
+  min-height: 28px;
+  font-size: 12px;
+}
+
+.segment-editor-footer :deep(.pagination__btn),
+.segment-editor-footer :deep(.pagination__ellipsis) {
+  min-width: 28px;
+  padding: 0 6px;
+}
+
+.segment-editor-footer :deep(.pagination__jump) {
+  gap: 4px;
+  margin-left: 4px;
+}
+
+.segment-editor-footer :deep(.pagination__jump-input) {
+  width: 44px;
+  padding: 0 5px;
+}
+
+.segment-editor-footer :deep(.pagination__size-select) {
+  padding: 0 6px;
 }
 
 .segment-editor-side-tool {
@@ -9150,7 +9192,7 @@ onBeforeRouteLeave(async () => {
   justify-content: flex-start;
   align-items: center;
   gap: 0;
-  min-height: 32px;
+  min-height: 30px;
   min-width: 0;
   width: max-content;
   max-width: min(540px, 48vw);
@@ -9177,7 +9219,7 @@ onBeforeRouteLeave(async () => {
   z-index: 1710;
   width: max-content;
   max-width: min(540px, 48vw);
-  min-height: 31px;
+  min-height: 29px;
   padding: 0;
   border-color: #b8cbd5;
   border-radius: 4px;
@@ -9191,10 +9233,10 @@ onBeforeRouteLeave(async () => {
   flex: 0 0 auto;
   align-items: center;
   justify-content: center;
-  gap: 5px;
-  height: 30px;
-  min-width: 94px;
-  padding: 0 11px;
+  gap: 4px;
+  height: 28px;
+  min-width: 88px;
+  padding: 0 9px;
   border: 0;
   border-left: 1px solid #d7e2e8;
   border-radius: 0;
@@ -9265,7 +9307,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .segment-editor-bottom-tool--qa {
-  padding-right: 26px;
+  padding-right: 24px;
 }
 
 .segment-editor-bottom-tool--qa svg {
@@ -9777,49 +9819,53 @@ onBeforeRouteLeave(async () => {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
   flex-wrap: wrap;
 }
 
 .segment-editor-toolbar__overview {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   flex: 1 1 520px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   min-width: 0;
+  overflow: hidden;
 }
 
 .segment-editor-toolbar__overview .workbench-stat--compact {
-  min-height: 30px;
-  padding: 5px 9px;
-  gap: 6px;
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 4px 8px;
+  gap: 5px;
   border-radius: 999px;
   box-shadow: none;
 }
 
 .segment-editor-toolbar__overview .workbench-stat--compact span {
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1;
 }
 
 .segment-editor-toolbar__overview .workbench-stat--compact strong {
-  font-size: 14px;
+  font-size: 13px;
   line-height: 1;
 }
 
 .segment-editor-toolbar__tip,
 .segment-editor-toolbar__loaded {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--text-muted);
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1.2;
   white-space: nowrap;
 }
 
 .segment-editor-toolbar__tip {
-  max-width: 220px;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  max-width: 160px;
 }
 
 .segment-editor-toolbar__load {
@@ -9832,7 +9878,7 @@ onBeforeRouteLeave(async () => {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
+  gap: 6px;
   flex-wrap: wrap;
   min-width: 0;
   margin-left: auto;
@@ -9842,8 +9888,8 @@ onBeforeRouteLeave(async () => {
   flex: 0 1 auto;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  min-height: 34px;
+  gap: 4px;
+  min-height: 30px;
   min-width: 0;
   margin: 0;
 }
@@ -9852,24 +9898,28 @@ onBeforeRouteLeave(async () => {
   flex: 0 0 auto;
   margin: 0;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1;
   white-space: nowrap;
 }
 
 .segment-editor-toolbar__filter-select {
-  width: 148px;
-  min-width: 148px;
+  width: 136px;
+  min-width: 136px;
+  min-height: 30px;
+  height: 30px;
+  padding: 4px 8px;
   background-color: var(--surface-panel);
+  font-size: 12px;
   box-shadow: none;
 }
 
 .segment-editor-toolbar__screening {
   position: relative;
-  flex: 0 0 34px;
-  width: 34px;
-  min-width: 34px;
-  min-height: 34px;
+  flex: 0 0 30px;
+  width: 30px;
+  min-width: 30px;
+  min-height: 30px;
   padding: 0;
   justify-content: center;
   gap: 0;

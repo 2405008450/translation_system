@@ -44,3 +44,5 @@ frontend/.DS_Store
 .claude
 *.xlsx
 tests/
+记忆库下载/
+术语库下载/
