@@ -319,6 +319,7 @@ export const useSegmentStore = defineStore('segment', () => {
 
   const segmentIndexMap = new Map<string, number>()
   let syncTimer: number | null = null
+  let syncPromise: Promise<boolean> | null = null
   let changePollTimer: number | null = null
   let changePollBurstTimers: number[] = []
   let changeCursor: string | null = null
@@ -913,6 +914,7 @@ export const useSegmentStore = defineStore('segment', () => {
     localRevisionDrafts.value = {}
     localRevisionBaselines.value = {}
     revisionTrackingEnabled.value = false
+    syncPromise = null
     loadMorePromise = null
     pendingSegmentPageQuery = null
     llmAbortController = null
@@ -1433,25 +1435,7 @@ export const useSegmentStore = defineStore('segment', () => {
     }, AUTO_SYNC_DELAY_MS)
   }
 
-  async function syncToBackend() {
-    if (dirtyCount.value === 0) {
-      return true
-    }
-    // 单文件模式需要 fileRecord；合并模式按 dirty 条目自带 file_record_id 分组。
-    if (!mergeViewId.value && !fileRecord.value) {
-      return true
-    }
-
-    if (saving.value) {
-      scheduleSync()
-      return false
-    }
-
-    if (syncTimer !== null) {
-      window.clearTimeout(syncTimer)
-      syncTimer = null
-    }
-
+  async function runSyncToBackend(): Promise<boolean> {
     saving.value = true
     const allUpdates = Object.entries(dirtyEntries.value) // [segmentKey, payload]
     syncMessage.value = translate('stores.segment.syncing', { count: allUpdates.length })
@@ -1504,6 +1488,37 @@ export const useSegmentStore = defineStore('segment', () => {
       return false
     } finally {
       saving.value = false
+    }
+  }
+
+  async function syncToBackend(): Promise<boolean> {
+    if (dirtyCount.value === 0) {
+      return true
+    }
+    // 单文件模式需要 fileRecord；合并模式按 dirty 条目自带 file_record_id 分组。
+    if (!mergeViewId.value && !fileRecord.value) {
+      return true
+    }
+
+    if (syncPromise) {
+      const synced = await syncPromise
+      if (!synced) {
+        return false
+      }
+      // 当前保存过程中可能又产生了新编辑；翻页、切页等显式动作要等待这些修改落库。
+      return dirtyCount.value === 0 ? true : syncToBackend()
+    }
+
+    if (syncTimer !== null) {
+      window.clearTimeout(syncTimer)
+      syncTimer = null
+    }
+
+    syncPromise = runSyncToBackend()
+    try {
+      return await syncPromise
+    } finally {
+      syncPromise = null
     }
   }
 
