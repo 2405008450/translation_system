@@ -368,6 +368,7 @@ const showShortcutHelp = ref(false)
 const showSaveToTMDialog = ref(false)
 const openConfirmMenu = ref(false)
 const confirmationActionLoading = ref(false)
+const manualSaving = ref(false)
 const openRevisionMenu = ref<RevisionMenuKind | null>(null)
 const revisionTraceVisible = ref(getInitialRevisionTraceVisible())
 const revisionActionLoading = ref(false)
@@ -2332,6 +2333,12 @@ function commitActiveSegmentEditorContent(): CommittedSegmentEditorContent | nul
   }
 }
 
+async function syncPendingWorkbenchEdits(): Promise<boolean> {
+  commitActiveSegmentEditorContent()
+  await nextTick()
+  return segmentStore.syncToBackend()
+}
+
 async function updateSegmentSource(sentenceId: string, sourceText: string) {
   const segment = segmentStore.segments.find((item) => segmentKeyOf(item) === sentenceId)
   if (segment && !segment.can_write) {
@@ -2386,7 +2393,7 @@ async function focusEditorSegmentAtIndex(index: number) {
     return
   }
 
-  segmentStore.setActiveSentence(target.sentence_id)
+  segmentStore.setActiveSentence(segmentKeyOf(target))
   await nextTick()
   await virtualListRef.value?.focusIndex(index, '[data-segment-target="true"]', 'nearest')
 }
@@ -2475,7 +2482,7 @@ async function replaceAllSearchMatches() {
 
   pageError.value = ''
   try {
-    const synced = await segmentStore.syncToBackend()
+    const synced = await syncPendingWorkbenchEdits()
     if (!synced) {
       return
     }
@@ -2546,7 +2553,6 @@ function confirmCurrentSentence() {
     targetContent.html || undefined,
     { confirm: true },
   )
-  toast.success(t('workbench.messages.confirmed'))
   return true
 }
 
@@ -2727,7 +2733,7 @@ async function submitWorkflowTransition() {
   }
   workflowTransitionLoading.value = true
   try {
-    await segmentStore.syncToBackend()
+    await syncPendingWorkbenchEdits()
     const { data } = await http.post<{ updated_count: number }>(
       `/file-records/${segmentStore.fileRecord.id}/workflow/transition`,
       buildWorkflowTransitionPayload(),
@@ -2812,7 +2818,7 @@ async function generateCurrentFileTermQAReport() {
   }
   generatingTermQAReport.value = true
   try {
-    const synced = await segmentStore.syncToBackend()
+    const synced = await syncPendingWorkbenchEdits()
     if (!synced) {
       return
     }
@@ -2970,7 +2976,7 @@ async function focusTermQAReportItem(item: TermQAReportItem) {
       return
     }
 
-    const synced = await segmentStore.syncToBackend()
+    const synced = await syncPendingWorkbenchEdits()
     if (!synced) {
       return
     }
@@ -3898,7 +3904,7 @@ async function refreshSegmentPage(
 
   pageError.value = ''
   try {
-    const synced = await segmentStore.syncToBackend()
+    const synced = await syncPendingWorkbenchEdits()
     if (!synced) {
       const reason = segmentStore.syncMessage || t('workbench.errors.loadMore')
       pageError.value = reason
@@ -4040,7 +4046,7 @@ async function saveToTM() {
   pageError.value = ''
   savingToTM.value = true
   try {
-    const synced = await segmentStore.syncToBackend()
+    const synced = await syncPendingWorkbenchEdits()
     if (!synced) {
       return
     }
@@ -4114,15 +4120,21 @@ function handleIssueSaved(_marker: IssueMarker) {
 }
 
 async function saveNow() {
+  if (manualSaving.value) {
+    return
+  }
   pageError.value = ''
+  manualSaving.value = true
   try {
-    const synced = await segmentStore.syncToBackend()
+    const synced = await syncPendingWorkbenchEdits()
     if (!synced) {
       return
     }
     toast.success(t('workbench.messages.synced'))
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.save'))
+  } finally {
+    manualSaving.value = false
   }
 }
 
@@ -4274,7 +4286,7 @@ async function exportWithTypeForFile(exportType: string, fileRecordId?: string |
   showExportMenu.value = false
 
   try {
-    const synced = await segmentStore.syncToBackend()
+    const synced = await syncPendingWorkbenchEdits()
     if (!synced) {
       return
     }
@@ -4692,7 +4704,7 @@ onBeforeUnmount(() => {
 
 onBeforeRouteLeave(async () => {
   commentStore.stopPolling()
-  await segmentStore.syncToBackend()
+  await syncPendingWorkbenchEdits()
 })
 </script>
 
@@ -4716,12 +4728,12 @@ onBeforeRouteLeave(async () => {
             class="workbench-ribbon__top-action"
             data-testid="workbench-save-button"
             type="button"
-            :disabled="segmentStore.saving"
+            :disabled="manualSaving"
             @click="saveNow"
           >
-            <Loader2 v-if="segmentStore.saving" class="lucide-spin" :size="15" />
+            <Loader2 v-if="manualSaving" class="lucide-spin" :size="15" />
             <Save v-else :size="15" />
-            <span>{{ segmentStore.saving ? t('common.actions.saving') : t('workbench.saveNow') }}</span>
+            <span>{{ manualSaving ? t('common.actions.saving') : t('workbench.saveNow') }}</span>
           </button>
           <button
             class="workbench-ribbon__top-action"
@@ -5436,12 +5448,12 @@ onBeforeRouteLeave(async () => {
             class="button workbench-action workbench-action--save"
             data-testid="workbench-save-button"
             type="button"
-            :disabled="segmentStore.saving"
+            :disabled="manualSaving"
             @click="saveNow"
           >
-            <Loader2 v-if="segmentStore.saving" class="lucide-spin" :size="14" />
+            <Loader2 v-if="manualSaving" class="lucide-spin" :size="14" />
             <Save v-else :size="14" />
-            {{ segmentStore.saving ? t('common.actions.saving') : t('workbench.saveNow') }}
+            {{ manualSaving ? t('common.actions.saving') : t('workbench.saveNow') }}
           </button>
 
           <div class="export-dropdown export-dropdown--toolbar">

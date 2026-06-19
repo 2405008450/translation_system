@@ -1020,6 +1020,7 @@ function handleFocus() {
 }
 
 function handleBlur() {
+  commitEditorContent()
   isFocused.value = false
   resetHistoryGroup()
   void nextTick(() => syncEditorHtmlFromState(false))

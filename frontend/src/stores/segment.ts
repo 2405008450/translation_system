@@ -355,7 +355,6 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   const segmentIndexMap = new Map<string, number>()
-  const notifiedNoTMCollectionFileIds = new Set<string>()
   let syncTimer: number | null = null
   let syncPromise: Promise<boolean> | null = null
   let changePollTimer: number | null = null
@@ -1016,7 +1015,6 @@ export const useSegmentStore = defineStore('segment', () => {
     lastModifiedAt.value = null
     dirtyEntries.value = {}
     conflictEntries.value = {}
-    notifiedNoTMCollectionFileIds.clear()
     changeCursor = null
     previewUpdateToken.value = 0
     lastPreviewUpdatedSentenceId.value = null
@@ -1719,7 +1717,6 @@ export const useSegmentStore = defineStore('segment', () => {
     if (sensitiveConflicts.length > 0) {
       applySyncConflicts(sensitiveConflicts, fileId)
     }
-    notifySyncSideEffects(fileId, data as { auto_tm?: { skipped_no_collection_count?: number }; project_sync: ProjectSegmentSyncSummary })
     return finishSyncState(hadConflict)
   }
 
@@ -1779,7 +1776,6 @@ export const useSegmentStore = defineStore('segment', () => {
       if (sensitiveConflicts.length > 0) {
         applySyncConflicts(sensitiveConflicts, result.fileId)
       }
-      notifySyncSideEffects(result.fileId, result.data as { auto_tm?: { skipped_no_collection_count?: number }; project_sync: ProjectSegmentSyncSummary })
     }
     dirtyEntries.value = nextDirtyEntries
     clearLocalRevisionDrafts(syncedSentenceIds)
@@ -1804,24 +1800,6 @@ export const useSegmentStore = defineStore('segment', () => {
       }
     }
     conflictEntries.value = nextConflicts
-  }
-
-  function notifySyncSideEffects(fileId: string, data: {
-    auto_tm?: { skipped_no_collection_count?: number }
-    project_sync?: ProjectSegmentSyncSummary
-  }) {
-    if (data.auto_tm?.skipped_no_collection_count) {
-      if (notifiedNoTMCollectionFileIds.has(fileId)) {
-        return
-      }
-      notifiedNoTMCollectionFileIds.add(fileId)
-      pushToast({
-        tone: 'info',
-        title: '未自动写入记忆库',
-        message: '当前文件未绑定记忆库，确认译文已保存。',
-        duration: 2600,
-      })
-    }
   }
 
   function finishSyncState(hadConflict: boolean): boolean {
