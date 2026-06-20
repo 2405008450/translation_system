@@ -12018,6 +12018,8 @@ def import_tm_xlsx(
         source_language,
         target_language,
     )
+    collection_response_id = collection.id if collection is not None else None
+    collection_response_name = collection.name if collection is not None else None
     normalized_duplicate_policy = _normalize_duplicate_policy(duplicate_policy)
     skipped_row_indexes = _parse_import_row_indexes(skip_duplicate_row_indexes)
     try:
@@ -12069,12 +12071,12 @@ def import_tm_xlsx(
         cleanup_import_task_staging(task_id)
 
     refreshed_count = 0
-    if collection is not None and import_summary.imported_rows > 0:
-        refreshed_count = _notify_tm_collections_changed(db, [collection.id])
-    if collection is not None:
+    if collection_response_id is not None and import_summary.imported_rows > 0:
+        refreshed_count = _notify_tm_collections_changed(db, [collection_response_id])
+    if collection_response_id is not None:
         notification_title, notification_body = build_resource_import_notification(
             resource_label="记忆库",
-            resource_name=collection.name,
+            resource_name=collection_response_name or "",
             filename=import_summary.filename,
             imported_rows=import_summary.imported_rows,
             created_rows=import_summary.created_rows,
@@ -12102,8 +12104,8 @@ def import_tm_xlsx(
         "skipped_header_rows": import_summary.skipped_header_rows,
         "imported_rows": import_summary.imported_rows,
         "refreshed_segments": refreshed_count,
-        "collection_id": collection.id if collection else None,
-        "collection_name": collection.name if collection else None,
+        "collection_id": collection_response_id,
+        "collection_name": collection_response_name,
         "source_language": resolved_source_language,
         "target_language": resolved_target_language,
     }
@@ -12705,6 +12707,10 @@ def import_termbase_xlsx(
     task_id, staged_file = _stage_resource_upload_file(file)
 
     collection = _get_termbase_collection_or_404(db, collection_id)
+    collection_response_id = collection.id if collection is not None else None
+    collection_response_name = collection.name if collection is not None else None
+    collection_source_language = collection.source_language if collection is not None else "zh"
+    collection_target_language = collection.target_language if collection is not None else "en"
 
     try:
         if extension == ".xlsx":
@@ -12713,8 +12719,8 @@ def import_termbase_xlsx(
                 xlsx_path=staged_file["path"],
                 filename=file.filename or "uploaded.xlsx",
                 term_base_id=collection_id,
-                source_language=collection.source_language if collection else "zh",
-                target_language=collection.target_language if collection else "en",
+                source_language=collection_source_language,
+                target_language=collection_target_language,
                 batch_size=_resource_import_batch_size(),
             )
         else:
@@ -12723,8 +12729,8 @@ def import_termbase_xlsx(
                 raw_bytes=read_import_file_bytes(staged_file),
                 filename=file.filename or "uploaded.xlsx",
                 term_base_id=collection_id,
-                source_language=collection.source_language if collection else "zh",
-                target_language=collection.target_language if collection else "en",
+                source_language=collection_source_language,
+                target_language=collection_target_language,
                 batch_size=_resource_import_batch_size(),
             )
     except Exception as exc:
@@ -12733,18 +12739,18 @@ def import_termbase_xlsx(
     finally:
         cleanup_import_task_staging(task_id)
 
-    if collection is not None:
+    if collection_response_id is not None:
         notification_title, notification_body = build_resource_import_notification(
             resource_label="术语库",
-            resource_name=collection.name,
+            resource_name=collection_response_name or "",
             filename=import_summary.filename,
             imported_rows=import_summary.imported_rows,
             created_rows=import_summary.created_rows,
             updated_rows=import_summary.updated_rows,
             skipped_empty_rows=import_summary.skipped_empty_rows,
             skipped_header_rows=import_summary.skipped_header_rows,
-            source_language=collection.source_language if collection else "zh",
-            target_language=collection.target_language if collection else "en",
+            source_language=collection_source_language,
+            target_language=collection_target_language,
         )
         create_operation_notification(
             db,
@@ -12763,8 +12769,8 @@ def import_termbase_xlsx(
         "skipped_empty_rows": import_summary.skipped_empty_rows,
         "skipped_header_rows": import_summary.skipped_header_rows,
         "imported_rows": import_summary.imported_rows,
-        "collection_id": collection.id if collection else None,
-        "collection_name": collection.name if collection else None,
+        "collection_id": collection_response_id,
+        "collection_name": collection_response_name,
     }
 
 

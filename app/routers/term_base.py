@@ -678,6 +678,8 @@ async def import_term_base_xlsx(
         source_language,
         target_language,
     )
+    term_base_response_id = term_base.id
+    term_base_response_name = term_base.name
     skipped_row_indexes = _parse_import_row_indexes(skip_duplicate_row_indexes)
 
     try:
@@ -715,7 +717,7 @@ async def import_term_base_xlsx(
 
     notification_title, notification_body = build_resource_import_notification(
         resource_label="术语库",
-        resource_name=term_base.name,
+        resource_name=term_base_response_name,
         filename=import_summary.filename,
         imported_rows=import_summary.imported_rows,
         created_rows=import_summary.created_rows,
@@ -742,8 +744,8 @@ async def import_term_base_xlsx(
         "skipped_empty_rows": import_summary.skipped_empty_rows,
         "skipped_header_rows": import_summary.skipped_header_rows,
         "imported_rows": import_summary.imported_rows,
-        "term_base_id": term_base.id,
-        "term_base_name": term_base.name,
+        "term_base_id": term_base_response_id,
+        "term_base_name": term_base_response_name,
         "source_language": resolved_source_language,
         "target_language": resolved_target_language,
     }

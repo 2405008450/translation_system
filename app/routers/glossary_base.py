@@ -422,6 +422,8 @@ async def import_glossary_base_xlsx(
         source_language,
         target_language,
     )
+    glossary_base_response_id = glossary_base.id
+    glossary_base_response_name = glossary_base.name
     try:
         import_summary = import_glossary_from_xlsx_path(
             db=db,
@@ -442,7 +444,7 @@ async def import_glossary_base_xlsx(
 
     notification_title, notification_body = build_resource_import_notification(
         resource_label="词汇表",
-        resource_name=glossary_base.name,
+        resource_name=glossary_base_response_name,
         filename=import_summary.filename,
         imported_rows=import_summary.imported_rows,
         created_rows=import_summary.created_rows,
@@ -468,8 +470,8 @@ async def import_glossary_base_xlsx(
         "skipped_empty_rows": import_summary.skipped_empty_rows,
         "skipped_header_rows": import_summary.skipped_header_rows,
         "imported_rows": import_summary.imported_rows,
-        "glossary_base_id": str(glossary_base.id),
-        "glossary_base_name": glossary_base.name,
+        "glossary_base_id": str(glossary_base_response_id),
+        "glossary_base_name": glossary_base_response_name,
         "source_language": resolved_source_language,
         "target_language": resolved_target_language,
     }
