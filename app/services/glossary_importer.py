@@ -566,6 +566,9 @@ def _flush_glossary_batch(
             created_rows += 1
             continue
 
+        if _glossary_entry_matches_import_row(existing, row):
+            continue
+
         existing.source_text = row["source_text"]
         existing.target_text = row["target_text"]
         existing.note = row["note"]
@@ -579,7 +582,19 @@ def _flush_glossary_batch(
         updated_rows += 1
 
     db.commit()
+    db.expunge_all()
     return created_rows, updated_rows
+
+
+def _glossary_entry_matches_import_row(existing: GlossaryEntry, row: dict) -> bool:
+    return (
+        normalize_text(existing.source_text or "") == row["source_text"]
+        and normalize_text(existing.target_text or "") == row["target_text"]
+        and normalize_text(existing.note or "") == row["note"]
+        and existing.glossary_base_id == row["glossary_base_id"]
+        and (existing.source_language or "") == row["source_language"]
+        and (existing.target_language or "") == row["target_language"]
+    )
 
 
 def _cell_to_text(row: tuple, index: int) -> str:

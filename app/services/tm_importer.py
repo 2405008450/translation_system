@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import re
 import sqlite3
 import tempfile
@@ -11,7 +12,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Literal
 from xml.etree import ElementTree as ET
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from openpyxl import load_workbook
 from sqlalchemy import or_, text
@@ -1058,6 +1059,16 @@ def _flush_tm_batch_once(
     if not batch_rows:
         return 0, 0, 0
 
+    if db.get_bind().dialect.name == "postgresql" and collection_id is not None:
+        return _flush_tm_batch_postgres(
+            db=db,
+            batch_rows=batch_rows,
+            source_language=source_language,
+            target_language=target_language,
+            collection_id=collection_id,
+            duplicate_policy=duplicate_policy,
+        )
+
     _acquire_tm_import_transaction_lock(
         db=db,
         collection_id=collection_id,
@@ -1144,6 +1155,7 @@ def _flush_tm_batch_once(
     db.commit()
     if sync_rows:
         sync_tm_embeddings(db, sync_rows)
+    db.expunge_all()
     return created_rows, updated_rows, skipped_duplicate_rows
 
 
@@ -1152,11 +1164,174 @@ def _tm_entry_matches_import_row(existing: MemoryEntry, row: dict) -> bool:
         normalize_text(existing.source_text or "") == row["source_text"]
         and normalize_text(existing.target_text or "") == row["target_text"]
         and (existing.source_hash or "") == row["source_hash"]
-        and (existing.source_normalized or "") == row["source_normalized"]
         and existing.collection_id == row["collection_id"]
         and (existing.source_language or "") == row["source_language"]
         and (existing.target_language or "") == row["target_language"]
     )
+
+
+def _flush_tm_batch_postgres(
+    db: Session,
+    batch_rows: list[dict],
+    source_language: str,
+    target_language: str,
+    collection_id: UUID,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+) -> tuple[int, int, int]:
+    _acquire_tm_import_transaction_lock(
+        db=db,
+        collection_id=collection_id,
+        source_language=source_language,
+        target_language=target_language,
+    )
+
+    payload = [
+        {
+            "id": str(row.get("id") or uuid4()),
+            "collection_id": str(collection_id),
+            "source_text": row["source_text"],
+            "target_text": row["target_text"],
+            "source_hash": row["source_hash"],
+            "source_normalized": row["source_normalized"],
+            "source_language": row["source_language"],
+            "target_language": row["target_language"],
+            "creator_id": str(row["creator_id"]) if row.get("creator_id") else None,
+            "last_modified_by_id": str(row["last_modified_by_id"]) if row.get("last_modified_by_id") else None,
+        }
+        for row in batch_rows
+    ]
+    if duplicate_policy == "keep":
+        statement = text(
+            """
+            WITH incoming AS (
+                SELECT *
+                FROM jsonb_to_recordset(CAST(:payload AS jsonb)) AS item(
+                    id uuid,
+                    collection_id uuid,
+                    source_text text,
+                    target_text text,
+                    source_hash text,
+                    source_normalized text,
+                    source_language text,
+                    target_language text,
+                    creator_id uuid,
+                    last_modified_by_id uuid
+                )
+            )
+            INSERT INTO memory_entries (
+                id,
+                collection_id,
+                source_text,
+                target_text,
+                source_hash,
+                source_normalized,
+                source_language,
+                target_language,
+                creator_id,
+                last_modified_by_id
+            )
+            SELECT
+                id,
+                collection_id,
+                source_text,
+                target_text,
+                source_hash,
+                source_normalized,
+                source_language,
+                target_language,
+                creator_id,
+                last_modified_by_id
+            FROM incoming
+            ORDER BY source_hash, source_text
+            ON CONFLICT (collection_id, source_hash, source_language, target_language)
+            DO NOTHING
+            RETURNING id, source_text, TRUE AS inserted
+            """
+        )
+    else:
+        statement = text(
+            """
+            WITH incoming AS (
+                SELECT *
+                FROM jsonb_to_recordset(CAST(:payload AS jsonb)) AS item(
+                    id uuid,
+                    collection_id uuid,
+                    source_text text,
+                    target_text text,
+                    source_hash text,
+                    source_normalized text,
+                    source_language text,
+                    target_language text,
+                    creator_id uuid,
+                    last_modified_by_id uuid
+                )
+            )
+            INSERT INTO memory_entries (
+                id,
+                collection_id,
+                source_text,
+                target_text,
+                source_hash,
+                source_normalized,
+                source_language,
+                target_language,
+                creator_id,
+                last_modified_by_id
+            )
+            SELECT
+                id,
+                collection_id,
+                source_text,
+                target_text,
+                source_hash,
+                source_normalized,
+                source_language,
+                target_language,
+                creator_id,
+                last_modified_by_id
+            FROM incoming
+            ORDER BY source_hash, source_text
+            ON CONFLICT (collection_id, source_hash, source_language, target_language)
+            DO UPDATE SET
+                source_text = EXCLUDED.source_text,
+                target_text = EXCLUDED.target_text,
+                source_normalized = EXCLUDED.source_normalized,
+                creator_id = COALESCE(memory_entries.creator_id, EXCLUDED.creator_id),
+                last_modified_by_id = COALESCE(EXCLUDED.last_modified_by_id, memory_entries.last_modified_by_id),
+                updated_at = NOW()
+            WHERE
+                memory_entries.source_text IS DISTINCT FROM EXCLUDED.source_text
+                OR memory_entries.target_text IS DISTINCT FROM EXCLUDED.target_text
+            RETURNING id, source_text, (xmax = 0) AS inserted
+            """
+        )
+
+    returned_rows = list(db.execute(statement, {"payload": json.dumps(payload, ensure_ascii=False)}))
+    created_rows = 0
+    updated_rows = 0
+    sync_rows: list[tuple[UUID | str, str]] = []
+    for returned in returned_rows:
+        row_id, source_text, inserted = _read_tm_upsert_returned_row(returned)
+        if inserted:
+            created_rows += 1
+        else:
+            updated_rows += 1
+        if row_id is not None and source_text:
+            sync_rows.append((row_id, source_text))
+
+    db.commit()
+    if sync_rows:
+        sync_tm_embeddings(db, sorted(sync_rows, key=lambda item: str(item[0])))
+    db.expunge_all()
+    skipped_duplicate_rows = len(batch_rows) - created_rows - updated_rows
+    return created_rows, updated_rows, skipped_duplicate_rows
+
+
+def _read_tm_upsert_returned_row(row) -> tuple[UUID | str | None, str, bool]:
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        return mapping.get("id"), mapping.get("source_text") or "", bool(mapping.get("inserted"))
+    return getattr(row, "id", None), getattr(row, "source_text", "") or "", bool(getattr(row, "inserted", False))
 
 
 def _tm_import_row_sort_key(row: dict) -> tuple[str, str]:
