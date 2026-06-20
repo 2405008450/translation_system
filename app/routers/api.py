@@ -12071,29 +12071,34 @@ def import_tm_xlsx(
         cleanup_import_task_staging(task_id)
 
     refreshed_count = 0
-    if collection_response_id is not None and import_summary.imported_rows > 0:
-        refreshed_count = _notify_tm_collections_changed(db, [collection_response_id])
-    if collection_response_id is not None:
-        notification_title, notification_body = build_resource_import_notification(
-            resource_label="记忆库",
-            resource_name=collection_response_name or "",
-            filename=import_summary.filename,
-            imported_rows=import_summary.imported_rows,
-            created_rows=import_summary.created_rows,
-            updated_rows=import_summary.updated_rows,
-            skipped_empty_rows=import_summary.skipped_empty_rows,
-            skipped_header_rows=import_summary.skipped_header_rows,
-            source_language=resolved_source_language,
-            target_language=resolved_target_language,
-        )
-        create_operation_notification(
-            db,
-            user_id=current_user.id,
-            notification_type="resource_import",
-            title=notification_title,
-            body=notification_body,
-        )
-        db.commit()
+    try:
+        if collection_response_id is not None and import_summary.imported_rows > 0:
+            refreshed_count = _notify_tm_collections_changed(db, [collection_response_id])
+        if collection_response_id is not None:
+            notification_title, notification_body = build_resource_import_notification(
+                resource_label="记忆库",
+                resource_name=collection_response_name or "",
+                filename=import_summary.filename,
+                imported_rows=import_summary.imported_rows,
+                created_rows=import_summary.created_rows,
+                updated_rows=import_summary.updated_rows,
+                skipped_empty_rows=import_summary.skipped_empty_rows,
+                skipped_header_rows=import_summary.skipped_header_rows,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+            )
+            create_operation_notification(
+                db,
+                user_id=current_user.id,
+                notification_type="resource_import",
+                title=notification_title,
+                body=notification_body,
+            )
+            db.commit()
+    except Exception:
+        db.rollback()
+        refreshed_count = 0
+        logger.exception("TM import post-processing failed")
 
     return {
         "filename": import_summary.filename,
@@ -12739,27 +12744,31 @@ def import_termbase_xlsx(
     finally:
         cleanup_import_task_staging(task_id)
 
-    if collection_response_id is not None:
-        notification_title, notification_body = build_resource_import_notification(
-            resource_label="术语库",
-            resource_name=collection_response_name or "",
-            filename=import_summary.filename,
-            imported_rows=import_summary.imported_rows,
-            created_rows=import_summary.created_rows,
-            updated_rows=import_summary.updated_rows,
-            skipped_empty_rows=import_summary.skipped_empty_rows,
-            skipped_header_rows=import_summary.skipped_header_rows,
-            source_language=collection_source_language,
-            target_language=collection_target_language,
-        )
-        create_operation_notification(
-            db,
-            user_id=current_user.id,
-            notification_type="resource_import",
-            title=notification_title,
-            body=notification_body,
-        )
-        db.commit()
+    try:
+        if collection_response_id is not None:
+            notification_title, notification_body = build_resource_import_notification(
+                resource_label="术语库",
+                resource_name=collection_response_name or "",
+                filename=import_summary.filename,
+                imported_rows=import_summary.imported_rows,
+                created_rows=import_summary.created_rows,
+                updated_rows=import_summary.updated_rows,
+                skipped_empty_rows=import_summary.skipped_empty_rows,
+                skipped_header_rows=import_summary.skipped_header_rows,
+                source_language=collection_source_language,
+                target_language=collection_target_language,
+            )
+            create_operation_notification(
+                db,
+                user_id=current_user.id,
+                notification_type="resource_import",
+                title=notification_title,
+                body=notification_body,
+            )
+            db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Termbase import post-processing failed")
 
     return {
         "filename": import_summary.filename,

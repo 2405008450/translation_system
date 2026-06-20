@@ -1060,14 +1060,51 @@ def _flush_tm_batch_once(
         return 0, 0, 0
 
     if db.get_bind().dialect.name == "postgresql" and collection_id is not None:
-        return _flush_tm_batch_postgres(
-            db=db,
-            batch_rows=batch_rows,
-            source_language=source_language,
-            target_language=target_language,
-            collection_id=collection_id,
-            duplicate_policy=duplicate_policy,
-        )
+        try:
+            return _flush_tm_batch_postgres(
+                db=db,
+                batch_rows=batch_rows,
+                source_language=source_language,
+                target_language=target_language,
+                collection_id=collection_id,
+                duplicate_policy=duplicate_policy,
+            )
+        except DBAPIError as exc:
+            db.rollback()
+            if _is_retryable_tm_write_error(exc):
+                raise
+            return _flush_tm_batch_orm(
+                db=db,
+                batch_rows=batch_rows,
+                source_language=source_language,
+                target_language=target_language,
+                collection_id=collection_id,
+                creator_id=creator_id,
+                duplicate_policy=duplicate_policy,
+            )
+
+    return _flush_tm_batch_orm(
+        db=db,
+        batch_rows=batch_rows,
+        source_language=source_language,
+        target_language=target_language,
+        collection_id=collection_id,
+        creator_id=creator_id,
+        duplicate_policy=duplicate_policy,
+    )
+
+
+def _flush_tm_batch_orm(
+    db: Session,
+    batch_rows: list[dict],
+    source_language: str,
+    target_language: str,
+    collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+) -> tuple[int, int, int]:
+    if not batch_rows:
+        return 0, 0, 0
 
     _acquire_tm_import_transaction_lock(
         db=db,

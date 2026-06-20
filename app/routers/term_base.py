@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
@@ -50,6 +51,7 @@ from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_r
 
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
+logger = logging.getLogger(__name__)
 
 
 class TermBasePayload(BaseModel):
@@ -715,26 +717,30 @@ async def import_term_base_xlsx(
     finally:
         cleanup_import_task_staging(task_id)
 
-    notification_title, notification_body = build_resource_import_notification(
-        resource_label="术语库",
-        resource_name=term_base_response_name,
-        filename=import_summary.filename,
-        imported_rows=import_summary.imported_rows,
-        created_rows=import_summary.created_rows,
-        updated_rows=import_summary.updated_rows,
-        skipped_empty_rows=import_summary.skipped_empty_rows,
-        skipped_header_rows=import_summary.skipped_header_rows,
-        source_language=resolved_source_language,
-        target_language=resolved_target_language,
-    )
-    create_operation_notification(
-        db,
-        user_id=current_user.id,
-        notification_type="resource_import",
-        title=notification_title,
-        body=notification_body,
-    )
-    db.commit()
+    try:
+        notification_title, notification_body = build_resource_import_notification(
+            resource_label="术语库",
+            resource_name=term_base_response_name,
+            filename=import_summary.filename,
+            imported_rows=import_summary.imported_rows,
+            created_rows=import_summary.created_rows,
+            updated_rows=import_summary.updated_rows,
+            skipped_empty_rows=import_summary.skipped_empty_rows,
+            skipped_header_rows=import_summary.skipped_header_rows,
+            source_language=resolved_source_language,
+            target_language=resolved_target_language,
+        )
+        create_operation_notification(
+            db,
+            user_id=current_user.id,
+            notification_type="resource_import",
+            title=notification_title,
+            body=notification_body,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Term base import post-processing failed")
 
     return {
         "filename": import_summary.filename,
