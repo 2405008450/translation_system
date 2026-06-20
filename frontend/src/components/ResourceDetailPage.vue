@@ -40,7 +40,7 @@ interface ResourceExportTask {
   resource_type: ResourceMode
   resource_id: string
   format: ExportFormat
-  status: 'queued' | 'running' | 'completed' | 'failed'
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'canceling' | 'canceled'
   progress: number
   message: string
   result: {
@@ -90,6 +90,7 @@ const showCreatedAtColumn = ref(true)
 const showLastModifiedByColumn = ref(true)
 const showUpdatedAtColumn = ref(true)
 const exportProgress = ref(0)
+const currentExportTaskId = ref('')
 const newSourceText = ref('')
 const newTargetText = ref('')
 const editingEntryId = ref('')
@@ -125,6 +126,7 @@ const copy = computed(() => {
       createEndpoint: `/translation-memory/collections/${props.id}/entries`,
       createExportEndpoint: `/translation-memory/collections/${props.id}/exports`,
       exportTaskEndpoint: (taskId: string) => `/translation-memory/export-tasks/${taskId}`,
+      exportCancelEndpoint: (taskId: string) => `/translation-memory/export-tasks/${taskId}/cancel`,
       exportDownloadEndpoint: (taskId: string) => `/translation-memory/export-tasks/${taskId}/download`,
       updateEntryEndpoint: (entryId: string) => `/translation-memory/entries/${entryId}`,
       deleteEntryEndpoint: (entryId: string) => `/translation-memory/entries/${entryId}`,
@@ -155,6 +157,7 @@ const copy = computed(() => {
     createEndpoint: `/term-bases/${props.id}/entries`,
     createExportEndpoint: `/term-bases/${props.id}/exports`,
     exportTaskEndpoint: (taskId: string) => `/term-bases/export-tasks/${taskId}`,
+    exportCancelEndpoint: (taskId: string) => `/term-bases/export-tasks/${taskId}/cancel`,
     exportDownloadEndpoint: (taskId: string) => `/term-bases/export-tasks/${taskId}/download`,
     updateEntryEndpoint: (entryId: string) => `/term-entries/${entryId}`,
     deleteEntryEndpoint: (entryId: string) => `/term-entries/${entryId}`,
@@ -443,6 +446,7 @@ async function deleteEntry(entry: EntryRecord) {
 
 async function waitForExportTask(task: ResourceExportTask) {
   let currentTask = task
+  currentExportTaskId.value = task.task_id
   while (!disposed) {
     exportProgress.value = currentTask.progress
     entryMessage.value = currentTask.message || '导出任务处理中。'
@@ -453,12 +457,23 @@ async function waitForExportTask(task: ResourceExportTask) {
     if (currentTask.status === 'failed') {
       throw new Error(currentTask.error || currentTask.message || '导出失败。')
     }
+    if (currentTask.status === 'canceled') {
+      throw new DOMException(currentTask.message || '导出已取消。', 'AbortError')
+    }
 
     await waitForExportPoll(1200)
     const { data } = await http.get<ResourceExportTask>(copy.value.exportTaskEndpoint(currentTask.task_id))
     currentTask = data
   }
   throw new Error('导出任务已取消。')
+}
+
+async function cancelCurrentExport() {
+  if (!currentExportTaskId.value) {
+    return
+  }
+  entryMessage.value = '正在停止导出...'
+  await http.post(copy.value.exportCancelEndpoint(currentExportTaskId.value)).catch(() => undefined)
 }
 
 async function exportEntries(format: ExportFormat) {
@@ -487,11 +502,14 @@ async function exportEntries(format: ExportFormat) {
     downloadBlob(response.data, filename)
     entryMessage.value = `${copy.value.entryName}已导出为 ${formatLabel}。`
   } catch (error) {
-    entryMessage.value = getErrorMessage(error, `${copy.value.entryName}导出失败。`)
+    entryMessage.value = error instanceof DOMException && error.name === 'AbortError'
+      ? `${copy.value.entryName}导出已停止。`
+      : getErrorMessage(error, `${copy.value.entryName}导出失败。`)
   } finally {
     clearExportPollTimer()
     exportingEntries.value = false
     exportProgress.value = 0
+    currentExportTaskId.value = ''
   }
 }
 
@@ -592,6 +610,15 @@ onUnmounted(() => {
             </button>
           </div>
         </div>
+        <button
+          v-if="exportingEntries"
+          class="resource-detail-button resource-detail-button--danger"
+          type="button"
+          @click="cancelCurrentExport"
+        >
+          <X :size="14" />
+          停止导出
+        </button>
         <button class="resource-detail-icon-button" type="button" title="更多">
           <ChevronDown :size="16" />
         </button>
@@ -960,6 +987,12 @@ onUnmounted(() => {
   color: #ffffff;
 }
 
+.resource-detail-button--danger {
+  border-color: var(--state-danger);
+  background: color-mix(in srgb, var(--state-danger) 9%, var(--button-bg));
+  color: var(--state-danger);
+}
+
 .resource-detail-back:hover,
 .resource-detail-button:hover:not(:disabled),
 .resource-detail-icon-button:hover,
@@ -973,6 +1006,12 @@ onUnmounted(() => {
   border-color: #0b6b5b;
   background: #0b6b5b;
   color: #ffffff;
+}
+
+.resource-detail-button--danger:hover:not(:disabled) {
+  border-color: var(--state-danger);
+  background: color-mix(in srgb, var(--state-danger) 14%, var(--button-bg));
+  color: var(--state-danger);
 }
 
 .resource-detail-button:disabled {

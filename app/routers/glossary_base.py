@@ -6,7 +6,7 @@ import logging
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import func, or_
@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import get_current_user, require_admin
 from app.config import get_settings
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.models import FileRecord, GlossaryBase, GlossaryEntry, User
 from app.services.glossary_importer import (
     XLSX_EXTENSIONS,
@@ -26,6 +26,12 @@ from app.services.import_task_storage import (
     cleanup_import_task_staging,
     stage_import_file_streams,
 )
+from app.services.import_task_state import (
+    ImportTaskCanceled,
+    import_task_cancel_requested,
+    raise_if_import_task_canceled,
+    set_import_task_status,
+)
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import normalize_match_text, normalize_text
 from app.services.notification_service import (
@@ -35,6 +41,7 @@ from app.services.notification_service import (
 from app.services.resource_export_queue import (
     ResourceExportFormat,
     build_resource_export_download_response,
+    cancel_resource_export_task,
     ensure_export_task_status,
     queue_resource_export,
 )
@@ -401,8 +408,128 @@ async def preview_glossary_base_xlsx(
     }
 
 
+def _build_glossary_import_result_payload(
+    *,
+    import_summary,
+    glossary_base_response_id: UUID,
+    glossary_base_response_name: str,
+    resolved_source_language: str,
+    resolved_target_language: str,
+) -> dict[str, Any]:
+    return {
+        "filename": import_summary.filename,
+        "created_rows": import_summary.created_rows,
+        "updated_rows": import_summary.updated_rows,
+        "skipped_empty_rows": import_summary.skipped_empty_rows,
+        "skipped_header_rows": import_summary.skipped_header_rows,
+        "imported_rows": import_summary.imported_rows,
+        "glossary_base_id": str(glossary_base_response_id),
+        "glossary_base_name": glossary_base_response_name,
+        "source_language": resolved_source_language,
+        "target_language": resolved_target_language,
+    }
+
+
+def _run_glossary_resource_import_task(task_id: str, payload: dict[str, Any]) -> None:
+    staging_task_id = str(payload.get("staging_task_id") or task_id)
+    set_import_task_status(task_id, "running", progress=5, message="词汇表导入开始处理。")
+    try:
+        raise_if_import_task_canceled(task_id)
+        with SessionLocal() as db:
+            file_payload = payload["file"]
+            filename = file_payload.get("filename") or "uploaded.xlsx"
+            glossary_base_id = UUID(str(payload["glossary_base_id"]))
+            creator_id = UUID(str(payload["creator_id"]))
+
+            def cancel_check() -> bool:
+                return import_task_cancel_requested(task_id)
+
+            try:
+                set_import_task_status(task_id, "running", progress=20, message=f"正在导入 {filename}。")
+                import_summary = import_glossary_from_xlsx_path(
+                    db=db,
+                    xlsx_path=file_payload["path"],
+                    filename=filename,
+                    glossary_base_id=glossary_base_id,
+                    source_language=str(payload["source_language"]),
+                    target_language=str(payload["target_language"]),
+                    creator_id=creator_id,
+                    skip_header=bool(payload.get("skip_header")),
+                    batch_size=_resource_import_batch_size(),
+                    cancel_check=cancel_check,
+                )
+            except ImportTaskCanceled:
+                db.rollback()
+                raise
+            except Exception as exc:
+                db.rollback()
+                raise RuntimeError(f"词汇表导入失败：{exc}") from exc
+            raise_if_import_task_canceled(task_id)
+            db.commit()
+
+            try:
+                set_import_task_status(task_id, "running", progress=90, message="正在写入导入通知。")
+                raise_if_import_task_canceled(task_id)
+                notification_title, notification_body = build_resource_import_notification(
+                    resource_label="词汇表",
+                    resource_name=str(payload["glossary_base_name"]),
+                    filename=import_summary.filename,
+                    imported_rows=import_summary.imported_rows,
+                    created_rows=import_summary.created_rows,
+                    updated_rows=import_summary.updated_rows,
+                    skipped_empty_rows=import_summary.skipped_empty_rows,
+                    skipped_header_rows=import_summary.skipped_header_rows,
+                    source_language=str(payload["source_language"]),
+                    target_language=str(payload["target_language"]),
+                )
+                create_operation_notification(
+                    db,
+                    user_id=creator_id,
+                    notification_type="resource_import",
+                    title=notification_title,
+                    body=notification_body,
+                )
+                db.commit()
+            except ImportTaskCanceled:
+                db.rollback()
+                raise
+            except Exception:
+                db.rollback()
+                logger.exception("Glossary import post-processing failed")
+
+            raise_if_import_task_canceled(task_id)
+            result = _build_glossary_import_result_payload(
+                import_summary=import_summary,
+                glossary_base_response_id=glossary_base_id,
+                glossary_base_response_name=str(payload["glossary_base_name"]),
+                resolved_source_language=str(payload["source_language"]),
+                resolved_target_language=str(payload["target_language"]),
+            )
+            set_import_task_status(
+                task_id,
+                "completed",
+                progress=100,
+                message="词汇表导入完成。",
+                result=result,
+            )
+    except ImportTaskCanceled:
+        set_import_task_status(task_id, "canceled", progress=100, message="词汇表导入已取消。")
+    except Exception as exc:
+        logger.exception("glossary resource import task failed task_id=%s", task_id)
+        set_import_task_status(
+            task_id,
+            "failed",
+            progress=100,
+            message="词汇表导入失败。",
+            error=str(exc),
+        )
+    finally:
+        cleanup_import_task_staging(staging_task_id)
+
+
 @router.post("/glossary-bases/import-xlsx")
 async def import_glossary_base_xlsx(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     glossary_base_id: UUID | None = Form(default=None),
     source_language: str = Form(...),
@@ -417,70 +544,39 @@ async def import_glossary_base_xlsx(
     if extension not in XLSX_EXTENSIONS:
         raise HTTPException(status_code=400, detail="仅支持上传 .xlsx 文件。")
     task_id, staged_file = await asyncio.to_thread(_stage_resource_upload_file, file)
-
-    glossary_base = _get_glossary_base_or_404(db, glossary_base_id)
-    resolved_source_language, resolved_target_language = _resolve_glossary_base_language_pair(
-        glossary_base,
-        source_language,
-        target_language,
-    )
-    glossary_base_response_id = glossary_base.id
-    glossary_base_response_name = glossary_base.name
     try:
-        import_summary = import_glossary_from_xlsx_path(
-            db=db,
-            xlsx_path=staged_file["path"],
-            filename=file.filename or "uploaded.xlsx",
-            glossary_base_id=glossary_base_id,
-            source_language=resolved_source_language,
-            target_language=resolved_target_language,
-            creator_id=current_user.id,
-            skip_header=skip_header,
-            batch_size=_resource_import_batch_size(),
-        )
-    except Exception as exc:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"词汇表导入失败：{exc}") from exc
-    finally:
-        cleanup_import_task_staging(task_id)
-
-    try:
-        notification_title, notification_body = build_resource_import_notification(
-            resource_label="词汇表",
-            resource_name=glossary_base_response_name,
-            filename=import_summary.filename,
-            imported_rows=import_summary.imported_rows,
-            created_rows=import_summary.created_rows,
-            updated_rows=import_summary.updated_rows,
-            skipped_empty_rows=import_summary.skipped_empty_rows,
-            skipped_header_rows=import_summary.skipped_header_rows,
-            source_language=resolved_source_language,
-            target_language=resolved_target_language,
-        )
-        create_operation_notification(
-            db,
-            user_id=current_user.id,
-            notification_type="resource_import",
-            title=notification_title,
-            body=notification_body,
+        glossary_base = _get_glossary_base_or_404(db, glossary_base_id)
+        resolved_source_language, resolved_target_language = _resolve_glossary_base_language_pair(
+            glossary_base,
+            source_language,
+            target_language,
         )
         db.commit()
+        payload = {
+            "kind": "glossary_resource_import",
+            "staging_task_id": task_id,
+            "file": staged_file,
+            "glossary_base_id": str(glossary_base.id),
+            "glossary_base_name": glossary_base.name,
+            "source_language": resolved_source_language,
+            "target_language": resolved_target_language,
+            "skip_header": bool(skip_header),
+            "creator_id": str(current_user.id),
+        }
+        set_import_task_status(task_id, "queued", progress=0, message="词汇表导入任务已进入队列。")
+        background_tasks.add_task(_run_glossary_resource_import_task, task_id, payload)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "task_id": task_id,
+                "status": "queued",
+                "progress": 0,
+                "message": "词汇表导入任务已进入队列。",
+            },
+        )
     except Exception:
-        db.rollback()
-        logger.exception("Glossary import post-processing failed")
-
-    return {
-        "filename": import_summary.filename,
-        "created_rows": import_summary.created_rows,
-        "updated_rows": import_summary.updated_rows,
-        "skipped_empty_rows": import_summary.skipped_empty_rows,
-        "skipped_header_rows": import_summary.skipped_header_rows,
-        "imported_rows": import_summary.imported_rows,
-        "glossary_base_id": str(glossary_base_response_id),
-        "glossary_base_name": glossary_base_response_name,
-        "source_language": resolved_source_language,
-        "target_language": resolved_target_language,
-    }
+        cleanup_import_task_staging(task_id)
+        raise
 
 
 @router.get("/glossary-bases/{glossary_base_id}/entries")
@@ -681,6 +777,11 @@ def queue_glossary_base_export(
 @router.get("/glossary-bases/export-tasks/{task_id}")
 def get_glossary_base_export_task(task_id: str):
     return ensure_export_task_status(task_id, expected_resource_type="glossary")
+
+
+@router.post("/glossary-bases/export-tasks/{task_id}/cancel")
+def cancel_glossary_base_export_task(task_id: str):
+    return cancel_resource_export_task(task_id, expected_resource_type="glossary")
 
 
 @router.get("/glossary-bases/export-tasks/{task_id}/download")

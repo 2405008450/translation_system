@@ -452,6 +452,8 @@ const savingSettings = ref(false)
 const guidelinesText = ref('')
 const savingGuidelines = ref(false)
 const preTranslateProgressByFileId = ref<Record<string, PreTranslateProgressState>>({})
+const activePretranslationTaskIdByFileId = ref<Record<string, string>>({})
+const cancelingPretranslationTaskIds = ref(new Set<string>())
 const issueDialogTarget = ref<{
   fileRecordId: string | null
   label: string
@@ -2008,6 +2010,7 @@ async function handlePreTranslateDone() {
   selectedFileIds.value = new Set<string>()
   await loadProject()
   preTranslateProgressByFileId.value = {}
+  activePretranslationTaskIdByFileId.value = {}
 }
 
 function handlePreTranslateProgress(payload: PreTranslateProgressPayload) {
@@ -2064,6 +2067,7 @@ function ensureActivePretranslationPolling() {
 async function loadActivePretranslationTasks() {
   if (!project.value?.id) {
     clearActivePretranslationPollTimer()
+    activePretranslationTaskIdByFileId.value = {}
     return
   }
   try {
@@ -2073,6 +2077,7 @@ async function loadActivePretranslationTasks() {
     const hasRunningProgress = Object.values(preTranslateProgressByFileId.value).some((state) => state.running)
     if (!data.tasks.length) {
       clearActivePretranslationPollTimer()
+      activePretranslationTaskIdByFileId.value = {}
       if (hasRunningProgress) {
         preTranslateProgressByFileId.value = {}
         await loadProject()
@@ -2080,7 +2085,9 @@ async function loadActivePretranslationTasks() {
       return
     }
 
+    const nextTaskIdByFileId: Record<string, string> = {}
     for (const task of data.tasks) {
+      nextTaskIdByFileId[task.file_record_id] = task.id
       handlePreTranslateProgress({
         fileId: task.file_record_id,
         progress: task.progress,
@@ -2088,9 +2095,11 @@ async function loadActivePretranslationTasks() {
         running: ACTIVE_PRETRANSLATION_STATUSES.has(task.status),
       })
     }
+    activePretranslationTaskIdByFileId.value = nextTaskIdByFileId
     ensureActivePretranslationPolling()
   } catch {
     clearActivePretranslationPollTimer()
+    activePretranslationTaskIdByFileId.value = {}
   }
 }
 
@@ -2128,6 +2137,47 @@ function getFilePretranslationProgressMessage(row: ProjectRow) {
   return preTranslateProgressByFileId.value[String(row.id)]?.status
     || (row.active_operation === 'pre_translate' ? row.active_operation_message : '')
     || ''
+}
+
+function getActivePretranslationTaskId(row: ProjectRow) {
+  return activePretranslationTaskIdByFileId.value[String(row.id)] || ''
+}
+
+function setPretranslationTaskCanceling(taskId: string, canceling: boolean) {
+  const next = new Set(cancelingPretranslationTaskIds.value)
+  if (canceling) {
+    next.add(taskId)
+  } else {
+    next.delete(taskId)
+  }
+  cancelingPretranslationTaskIds.value = next
+}
+
+function isFilePretranslationCanceling(row: ProjectRow) {
+  const taskId = getActivePretranslationTaskId(row)
+  return taskId ? cancelingPretranslationTaskIds.value.has(taskId) : false
+}
+
+async function cancelFilePretranslation(row: ProjectRow) {
+  const taskId = getActivePretranslationTaskId(row)
+  if (!taskId) {
+    return
+  }
+  setPretranslationTaskCanceling(taskId, true)
+  handlePreTranslateProgress({
+    fileId: String(row.id),
+    progress: getFilePretranslationProgress(row),
+    status: '正在停止预翻译任务。',
+    running: true,
+  })
+  try {
+    await http.post(`/pretranslation-tasks/${taskId}/cancel`)
+    await loadActivePretranslationTasks()
+  } catch (error) {
+    toast.error(getErrorMessage(error, '预翻译停止失败。'))
+  } finally {
+    setPretranslationTaskCanceling(taskId, false)
+  }
 }
 
 function openProjectIssueDialog() {
@@ -5520,6 +5570,17 @@ onBeforeUnmount(() => {
               <span v-if="getFilePretranslationProgressMessage(row)" class="pd-file-progress__status">
                 {{ getFilePretranslationProgressMessage(row) }}
               </span>
+              <button
+                v-if="getActivePretranslationTaskId(row)"
+                class="pd-file-progress__cancel"
+                type="button"
+                :disabled="isFilePretranslationCanceling(row)"
+                @click.stop="cancelFilePretranslation(row)"
+              >
+                <Loader2 v-if="isFilePretranslationCanceling(row)" class="lucide-spin" :size="12" />
+                <X v-else :size="12" />
+                停止
+              </button>
             </div>
           </template>
 
@@ -7373,6 +7434,34 @@ onBeforeUnmount(() => {
   line-height: 1.3;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.pd-file-progress__cancel {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  justify-self: flex-start;
+  gap: 4px;
+  min-width: 52px;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--state-danger, #dc2626) 26%, transparent);
+  border-radius: 6px;
+  background: var(--state-danger-bg, #fef2f2);
+  color: var(--state-danger, #dc2626);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.pd-file-progress__cancel:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--state-danger, #dc2626) 42%, transparent);
+  background: color-mix(in srgb, var(--state-danger-bg, #fef2f2) 70%, #fff);
+}
+
+.pd-file-progress__cancel:disabled {
+  cursor: wait;
+  opacity: 0.75;
 }
 
 .pd-task-cell {

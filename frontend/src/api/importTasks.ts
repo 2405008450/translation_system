@@ -3,11 +3,12 @@ import { translate } from '../i18n'
 
 export interface ImportTaskStatus<T = unknown> {
   task_id: string
-  status: 'queued' | 'running' | 'completed' | 'failed'
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'canceling' | 'canceled'
   progress: number
   message: string
   result: T | null
   error: string | null
+  cancel_requested?: boolean
   updated_at?: string
 }
 
@@ -37,6 +38,7 @@ const DEFAULT_IMPORT_TASK_TIMEOUT_MS = 60 * 60 * 1000
 export interface WaitForImportTaskOptions {
   intervalMs?: number
   timeoutMs?: number
+  signal?: AbortSignal
 }
 
 export async function waitForImportTask<T>(
@@ -49,6 +51,10 @@ export async function waitForImportTask<T>(
   const startedAt = Date.now()
 
   for (;;) {
+    if (options?.signal?.aborted) {
+      throw new DOMException('导入已取消。', 'AbortError')
+    }
+
     if (Date.now() - startedAt > timeoutMs) {
       throw new Error(translate('errors.importTaskTimeout'))
     }
@@ -64,6 +70,15 @@ export async function waitForImportTask<T>(
       throw new Error(data.error || data.message || translate('errors.importFailed'))
     }
 
+    if (data.status === 'canceled') {
+      throw new DOMException(data.message || '导入已取消。', 'AbortError')
+    }
+
     await delay(intervalMs)
   }
+}
+
+export async function cancelImportTask(taskId: string) {
+  const { data } = await http.post<ImportTaskStatus>(`/import-tasks/${taskId}/cancel`)
+  return data
 }

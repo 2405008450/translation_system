@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 from xml.etree import ElementTree as ET
 from uuid import UUID, uuid4
 
@@ -20,6 +20,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from app.models import MemoryEntry
+from app.services.import_task_state import ImportTaskCanceled
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
 from app.services.tm_vector import sync_tm_embeddings
@@ -45,6 +46,13 @@ HEADER_ALIASES = {
     ("原文", "译文"),
     ("中文", "英文"),
 }
+
+CancelCheck = Callable[[], bool]
+
+
+def _raise_if_canceled(cancel_check: CancelCheck | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise ImportTaskCanceled("记忆库导入已取消。")
 
 
 @dataclass
@@ -159,6 +167,7 @@ def import_tm_from_upload(
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
+    cancel_check: CancelCheck | None = None,
 ) -> TMImportSummary:
     extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
     if extension in CSV_EXTENSIONS:
@@ -174,6 +183,7 @@ def import_tm_from_upload(
             duplicate_policy=duplicate_policy,
             skip_duplicate_row_indexes=skip_duplicate_row_indexes,
             skip_header=skip_header,
+            cancel_check=cancel_check,
         )
     if extension in TMX_EXTENSIONS:
         return import_tm_from_tmx_upload(
@@ -187,6 +197,7 @@ def import_tm_from_upload(
             creator_id=creator_id,
             duplicate_policy=duplicate_policy,
             skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+            cancel_check=cancel_check,
         )
     return import_tm_from_xlsx_upload(
         db=db,
@@ -200,6 +211,7 @@ def import_tm_from_upload(
         duplicate_policy=duplicate_policy,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
         skip_header=skip_header,
+        cancel_check=cancel_check,
     )
 
 
@@ -215,6 +227,7 @@ def import_tm_from_xlsx_upload(
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
+    cancel_check: CancelCheck | None = None,
 ) -> TMImportSummary:
     extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
     if extension in XLS_EXTENSIONS:
@@ -231,6 +244,7 @@ def import_tm_from_xlsx_upload(
             skip_header=skip_header,
             source_language=source_language,
             target_language=target_language,
+            cancel_check=cancel_check,
         )
 
     workbook = load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)
@@ -246,6 +260,7 @@ def import_tm_from_xlsx_upload(
         skip_header=skip_header,
         source_language=source_language,
         target_language=target_language,
+        cancel_check=cancel_check,
     )
 
 
@@ -261,6 +276,7 @@ def import_tm_from_xlsx_path(
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
+    cancel_check: CancelCheck | None = None,
 ) -> TMImportSummary:
     workbook = load_workbook(Path(xlsx_path), read_only=True, data_only=True)
     return _import_workbook(
@@ -275,6 +291,7 @@ def import_tm_from_xlsx_path(
         skip_header=skip_header,
         source_language=source_language,
         target_language=target_language,
+        cancel_check=cancel_check,
     )
 
 
@@ -290,6 +307,7 @@ def import_tm_from_csv_upload(
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
+    cancel_check: CancelCheck | None = None,
 ) -> TMImportSummary:
     rows = _iter_csv_rows(raw_bytes)
     return _import_text_rows(
@@ -304,6 +322,7 @@ def import_tm_from_csv_upload(
         skip_header=skip_header,
         source_language=source_language,
         target_language=target_language,
+        cancel_check=cancel_check,
     )
 
 
@@ -318,6 +337,7 @@ def import_tm_from_tmx_upload(
     creator_id: UUID | None = None,
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> TMImportSummary:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
@@ -335,6 +355,7 @@ def import_tm_from_tmx_upload(
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
         source_language=normalized_source_language,
         target_language=normalized_target_language,
+        cancel_check=cancel_check,
     )
 
 
@@ -876,6 +897,7 @@ def _import_workbook(
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
+    cancel_check: CancelCheck | None = None,
 ) -> TMImportSummary:
     worksheet = workbook.active
     try:
@@ -891,6 +913,7 @@ def _import_workbook(
             skip_header=skip_header,
             source_language=source_language,
             target_language=target_language,
+            cancel_check=cancel_check,
         )
     finally:
         workbook.close()
@@ -908,6 +931,7 @@ def _import_text_rows(
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
+    cancel_check: CancelCheck | None = None,
 ) -> TMImportSummary:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
@@ -922,6 +946,8 @@ def _import_text_rows(
     skipped_row_indexes = skip_duplicate_row_indexes or set()
 
     for row_index, row in enumerate(rows, start=1):
+        if row_index == 1 or row_index % batch_size == 0:
+            _raise_if_canceled(cancel_check)
         source_text = normalize_text(_cell_to_text(row, 0))
         target_text = normalize_text(_cell_to_text(row, 1))
 
@@ -964,8 +990,10 @@ def _import_text_rows(
             updated_rows += updated_in_batch
             skipped_duplicate_rows += skipped_duplicate_in_batch
             batch_rows.clear()
+            _raise_if_canceled(cancel_check)
 
     if batch_rows:
+        _raise_if_canceled(cancel_check)
         created_in_batch, updated_in_batch, skipped_duplicate_in_batch = _flush_tm_batch(
             db=db,
             batch_rows=list(batch_rows.values()),
@@ -1467,6 +1495,7 @@ def import_tm_from_sdltm_upload(
     creator_id: UUID | None = None,
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> TMImportSummary:
     """Import translation memory from an uploaded SDLTM file."""
     with tempfile.NamedTemporaryFile(suffix=".sdltm", delete=False) as tmp:
@@ -1485,6 +1514,7 @@ def import_tm_from_sdltm_upload(
             skip_duplicate_row_indexes=skip_duplicate_row_indexes,
             source_language=source_language,
             target_language=target_language,
+            cancel_check=cancel_check,
         )
     finally:
         Path(tmp_path).unlink(missing_ok=True)
@@ -1501,6 +1531,7 @@ def import_tm_from_sdltm_path(
     creator_id: UUID | None = None,
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> TMImportSummary:
     """Import translation memory from an SDLTM file path."""
     return _import_sdltm(
@@ -1514,6 +1545,7 @@ def import_tm_from_sdltm_path(
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
         source_language=source_language,
         target_language=target_language,
+        cancel_check=cancel_check,
     )
 
 
@@ -1528,6 +1560,7 @@ def _import_sdltm(
     creator_id: UUID | None = None,
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> TMImportSummary:
     """Core SDLTM import logic."""
     normalized_source_language, normalized_target_language = require_language_pair(
@@ -1559,6 +1592,8 @@ def _import_sdltm(
         cursor.execute(query)
 
         for row_index, row in enumerate(cursor, start=1):
+            if row_index == 1 or row_index % batch_size == 0:
+                _raise_if_canceled(cancel_check)
             _, raw_source, raw_target = row
 
             # Extract text from SDLTM XML format
@@ -1600,8 +1635,10 @@ def _import_sdltm(
                 updated_rows += updated_in_batch
                 skipped_duplicate_rows += skipped_duplicate_in_batch
                 batch_rows.clear()
+                _raise_if_canceled(cancel_check)
 
         if batch_rows:
+            _raise_if_canceled(cancel_check)
             created_in_batch, updated_in_batch, skipped_duplicate_in_batch = _flush_tm_batch(
                 db=db,
                 batch_rows=list(batch_rows.values()),

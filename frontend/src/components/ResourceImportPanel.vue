@@ -1,10 +1,16 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { BookOpen, BookOpenCheck, CheckCircle2, Database, Loader2 } from 'lucide-vue-next'
+import { BookOpen, BookOpenCheck, CheckCircle2, Database, Loader2, X } from 'lucide-vue-next'
 import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import { http } from '../api/http'
+import {
+  cancelImportTask,
+  isImportTaskAccepted,
+  waitForImportTask,
+  type ImportTaskAccepted,
+} from '../api/importTasks'
 import { formatLanguagePair, languageOptions } from '../constants/languages'
 import { refreshGlobalNotifications } from '../utils/notifications'
 import { isProgressComplete } from '../utils/progress'
@@ -84,6 +90,8 @@ const tmImportTargetLanguage = ref('')
 const tmImporting = ref(false)
 const tmPreviewing = ref(false)
 const tmUploadPercent = ref(0)
+const tmImportTaskId = ref('')
+const tmCanceling = ref(false)
 const tmImportMessage = ref('')
 const tmImportSummary = ref<TMImportSummary | null>(null)
 const tmImportPreview = ref<TMImportPreview | null>(null)
@@ -99,6 +107,8 @@ const glossaryImportTargetLanguage = ref('')
 const glossaryImporting = ref(false)
 const glossaryPreviewing = ref(false)
 const glossaryUploadPercent = ref(0)
+const glossaryImportTaskId = ref('')
+const glossaryCanceling = ref(false)
 const glossaryImportMessage = ref('')
 const glossaryImportSummary = ref<GlossaryImportSummary | null>(null)
 const glossaryImportPreview = ref<GlossaryImportPreview | null>(null)
@@ -113,11 +123,17 @@ const termImportTargetLanguage = ref('')
 const termImporting = ref(false)
 const termPreviewing = ref(false)
 const termUploadPercent = ref(0)
+const termImportTaskId = ref('')
+const termCanceling = ref(false)
 const termImportMessage = ref('')
 const termImportSummary = ref<TermImportSummary | null>(null)
 const termImportPreview = ref<TermImportPreview | null>(null)
 const termKeepDuplicateRowIndexes = ref<Set<number>>(new Set())
 const termSkipHeader = ref(false)
+
+let tmImportAbortController: AbortController | null = null
+let glossaryImportAbortController: AbortController | null = null
+let termImportAbortController: AbortController | null = null
 
 const selectedTMCollection = computed(() => (
   tmCollections.value.find((item) => item.id === selectedTMCollectionId.value) ?? null
@@ -298,6 +314,64 @@ function getErrorMessage(error: unknown, fallback: string) {
     return String(error.response?.data?.detail || fallback)
   }
   return error instanceof Error ? error.message : fallback
+}
+
+function isAbortError(error: unknown) {
+  return (
+    error instanceof DOMException && error.name === 'AbortError'
+  ) || (
+    axios.isCancel(error)
+  ) || (
+    axios.isAxiosError(error) && error.code === 'ERR_CANCELED'
+  )
+}
+
+function resetTMImportTaskState() {
+  tmImportTaskId.value = ''
+  tmCanceling.value = false
+  tmImportAbortController = null
+}
+
+function resetGlossaryImportTaskState() {
+  glossaryImportTaskId.value = ''
+  glossaryCanceling.value = false
+  glossaryImportAbortController = null
+}
+
+function resetTermImportTaskState() {
+  termImportTaskId.value = ''
+  termCanceling.value = false
+  termImportAbortController = null
+}
+
+async function cancelTMImport() {
+  if (!tmImporting.value) return
+  tmCanceling.value = true
+  tmImportMessage.value = '正在停止记忆库导入...'
+  if (tmImportTaskId.value) {
+    await cancelImportTask(tmImportTaskId.value).catch(() => undefined)
+  }
+  tmImportAbortController?.abort()
+}
+
+async function cancelGlossaryImport() {
+  if (!glossaryImporting.value) return
+  glossaryCanceling.value = true
+  glossaryImportMessage.value = '正在停止词汇表导入...'
+  if (glossaryImportTaskId.value) {
+    await cancelImportTask(glossaryImportTaskId.value).catch(() => undefined)
+  }
+  glossaryImportAbortController?.abort()
+}
+
+async function cancelTermImport() {
+  if (!termImporting.value) return
+  termCanceling.value = true
+  termImportMessage.value = '正在停止术语库导入...'
+  if (termImportTaskId.value) {
+    await cancelImportTask(termImportTaskId.value).catch(() => undefined)
+  }
+  termImportAbortController?.abort()
 }
 
 function fileBaseName(file: File) {
@@ -884,25 +958,43 @@ async function uploadTMWorkbook() {
 
   tmImporting.value = true
   tmUploadPercent.value = 0
+  tmImportTaskId.value = ''
+  tmCanceling.value = false
   tmImportMessage.value = ''
   tmImportSummary.value = null
+  tmImportAbortController = new AbortController()
 
   try {
     const collectionId = await ensureImportCollection()
     const formData = buildTMImportFormData(collectionId)
 
-    const { data } = await http.post<TMImportSummary>('/translation-memory/import', formData, {
+    const { data } = await http.post<TMImportSummary | ImportTaskAccepted>('/translation-memory/import', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      signal: tmImportAbortController.signal,
       onUploadProgress: (event) => {
         const total = event.total || 0
         const loaded = event.loaded || 0
         tmUploadPercent.value = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0
       },
     })
+    if (isImportTaskAccepted(data)) {
+      tmImportTaskId.value = data.task_id
+    }
+    const summary = isImportTaskAccepted(data)
+      ? await waitForImportTask<TMImportSummary>(
+        data.task_id,
+        (status) => {
+          tmImportTaskId.value = status.task_id
+          tmUploadPercent.value = status.progress
+          tmImportMessage.value = status.message || '记忆库导入处理中。'
+        },
+        { signal: tmImportAbortController.signal },
+      )
+      : data
 
-    tmImportSummary.value = data
+    tmImportSummary.value = summary
     tmImportPreview.value = null
-    tmImportMessage.value = t('resourceImport.tm.success.imported', { filename: data.filename })
+    tmImportMessage.value = t('resourceImport.tm.success.imported', { filename: summary.filename })
     refreshGlobalNotifications()
     selectedTMFile.value = null
     if (tmFileInput.value) {
@@ -910,13 +1002,16 @@ async function uploadTMWorkbook() {
     }
     newTMCollectionName.value = ''
     newTMCollectionDescription.value = ''
-    emit('imported', { tab: 'tm', resourceId: data.collection_id || collectionId })
+    emit('imported', { tab: 'tm', resourceId: summary.collection_id || collectionId })
     await loadTMCollections()
   } catch (error) {
-    tmImportMessage.value = getErrorMessage(error, t('resourceImport.tm.errors.importFailed'))
+    tmImportMessage.value = isAbortError(error)
+      ? '记忆库导入已停止。'
+      : getErrorMessage(error, t('resourceImport.tm.errors.importFailed'))
   } finally {
     tmImporting.value = false
     tmUploadPercent.value = 0
+    resetTMImportTaskState()
   }
 }
 
@@ -936,25 +1031,43 @@ async function uploadGlossaryWorkbook() {
 
   glossaryImporting.value = true
   glossaryUploadPercent.value = 0
+  glossaryImportTaskId.value = ''
+  glossaryCanceling.value = false
   glossaryImportMessage.value = ''
   glossaryImportSummary.value = null
+  glossaryImportAbortController = new AbortController()
 
   try {
     const glossaryBaseId = await ensureImportGlossaryBase()
     const formData = buildGlossaryImportFormData(glossaryBaseId)
 
-    const { data } = await http.post<GlossaryImportSummary>('/glossary-bases/import-xlsx', formData, {
+    const { data } = await http.post<GlossaryImportSummary | ImportTaskAccepted>('/glossary-bases/import-xlsx', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      signal: glossaryImportAbortController.signal,
       onUploadProgress: (event) => {
         const total = event.total || 0
         const loaded = event.loaded || 0
         glossaryUploadPercent.value = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0
       },
     })
+    if (isImportTaskAccepted(data)) {
+      glossaryImportTaskId.value = data.task_id
+    }
+    const summary = isImportTaskAccepted(data)
+      ? await waitForImportTask<GlossaryImportSummary>(
+        data.task_id,
+        (status) => {
+          glossaryImportTaskId.value = status.task_id
+          glossaryUploadPercent.value = status.progress
+          glossaryImportMessage.value = status.message || '词汇表导入处理中。'
+        },
+        { signal: glossaryImportAbortController.signal },
+      )
+      : data
 
-    glossaryImportSummary.value = data
+    glossaryImportSummary.value = summary
     glossaryImportPreview.value = null
-    glossaryImportMessage.value = `导入完成：${data.filename}`
+    glossaryImportMessage.value = `导入完成：${summary.filename}`
     refreshGlobalNotifications()
     selectedGlossaryFile.value = null
     if (glossaryFileInput.value) {
@@ -962,13 +1075,16 @@ async function uploadGlossaryWorkbook() {
     }
     newGlossaryBaseName.value = ''
     newGlossaryBaseDescription.value = ''
-    emit('imported', { tab: 'glossary', resourceId: data.glossary_base_id || glossaryBaseId })
+    emit('imported', { tab: 'glossary', resourceId: summary.glossary_base_id || glossaryBaseId })
     await loadGlossaryBases()
   } catch (error) {
-    glossaryImportMessage.value = getErrorMessage(error, '词汇表导入失败。')
+    glossaryImportMessage.value = isAbortError(error)
+      ? '词汇表导入已停止。'
+      : getErrorMessage(error, '词汇表导入失败。')
   } finally {
     glossaryImporting.value = false
     glossaryUploadPercent.value = 0
+    resetGlossaryImportTaskState()
   }
 }
 
@@ -988,25 +1104,43 @@ async function uploadTermWorkbook() {
 
   termImporting.value = true
   termUploadPercent.value = 0
+  termImportTaskId.value = ''
+  termCanceling.value = false
   termImportMessage.value = ''
   termImportSummary.value = null
+  termImportAbortController = new AbortController()
 
   try {
     const termBaseId = await ensureImportTermBase()
     const formData = buildTermImportFormData(termBaseId)
 
-    const { data } = await http.post<TermImportSummary>('/term-bases/import', formData, {
+    const { data } = await http.post<TermImportSummary | ImportTaskAccepted>('/term-bases/import', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      signal: termImportAbortController.signal,
       onUploadProgress: (event) => {
         const total = event.total || 0
         const loaded = event.loaded || 0
         termUploadPercent.value = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0
       },
     })
+    if (isImportTaskAccepted(data)) {
+      termImportTaskId.value = data.task_id
+    }
+    const summary = isImportTaskAccepted(data)
+      ? await waitForImportTask<TermImportSummary>(
+        data.task_id,
+        (status) => {
+          termImportTaskId.value = status.task_id
+          termUploadPercent.value = status.progress
+          termImportMessage.value = status.message || '术语库导入处理中。'
+        },
+        { signal: termImportAbortController.signal },
+      )
+      : data
 
-    termImportSummary.value = data
+    termImportSummary.value = summary
     termImportPreview.value = null
-    termImportMessage.value = t('resourceImport.term.success.imported', { filename: data.filename })
+    termImportMessage.value = t('resourceImport.term.success.imported', { filename: summary.filename })
     refreshGlobalNotifications()
     selectedTermFile.value = null
     if (termFileInput.value) {
@@ -1014,13 +1148,16 @@ async function uploadTermWorkbook() {
     }
     newTermBaseName.value = ''
     newTermBaseDescription.value = ''
-    emit('imported', { tab: 'term', resourceId: data.term_base_id || termBaseId })
+    emit('imported', { tab: 'term', resourceId: summary.term_base_id || termBaseId })
     await loadTermBases()
   } catch (error) {
-    termImportMessage.value = getErrorMessage(error, t('resourceImport.term.errors.importFailed'))
+    termImportMessage.value = isAbortError(error)
+      ? '术语库导入已停止。'
+      : getErrorMessage(error, t('resourceImport.term.errors.importFailed'))
   } finally {
     termImporting.value = false
     termUploadPercent.value = 0
+    resetTermImportTaskState()
   }
 }
 
@@ -1187,6 +1324,16 @@ onMounted(() => {
           <Loader2 v-if="tmImporting" class="lucide-spin" />
           <CheckCircle2 v-else :size="14" />
           {{ tmImporting ? t('resourceImport.tm.importing', { percent: tmUploadPercent }) : '直接导入' }}
+        </button>
+        <button
+          v-if="tmImporting"
+          class="button button--danger"
+          type="button"
+          :disabled="tmCanceling"
+          @click="cancelTMImport"
+        >
+          <X :size="14" />
+          {{ tmCanceling ? '停止中...' : '停止导入' }}
         </button>
       </div>
 
@@ -1428,6 +1575,16 @@ onMounted(() => {
           <CheckCircle2 v-else :size="14" />
           {{ glossaryImporting ? t('resourceImport.glossary.importing', { percent: glossaryUploadPercent }) : '直接导入' }}
         </button>
+        <button
+          v-if="glossaryImporting"
+          class="button button--danger"
+          type="button"
+          :disabled="glossaryCanceling"
+          @click="cancelGlossaryImport"
+        >
+          <X :size="14" />
+          {{ glossaryCanceling ? '停止中...' : '停止导入' }}
+        </button>
       </div>
 
       <div v-if="glossaryImporting" class="resource-import-panel__progress">
@@ -1640,6 +1797,16 @@ onMounted(() => {
           <Loader2 v-if="termImporting" class="lucide-spin" />
           <CheckCircle2 v-else :size="14" />
           {{ termImporting ? t('resourceImport.term.importing', { percent: termUploadPercent }) : '直接导入' }}
+        </button>
+        <button
+          v-if="termImporting"
+          class="button button--danger"
+          type="button"
+          :disabled="termCanceling"
+          @click="cancelTermImport"
+        >
+          <X :size="14" />
+          {{ termCanceling ? '停止中...' : '停止导入' }}
         </button>
       </div>
 

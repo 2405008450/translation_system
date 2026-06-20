@@ -2972,7 +2972,6 @@ async function focusTermQAReportItem(item: TermQAReportItem) {
     )
     if (currentPageIndex >= 0) {
       await focusEditorSegmentAtIndex(currentPageIndex)
-      closeBottomDrawer()
       return
     }
 
@@ -2999,7 +2998,6 @@ async function focusTermQAReportItem(item: TermQAReportItem) {
       return
     }
     await focusEditorSegmentAtIndex(targetIndex)
-    closeBottomDrawer()
   } catch (error) {
     toast.error({
       title: '跳转 QA 句段失败',

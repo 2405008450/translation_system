@@ -129,8 +129,6 @@ from app.services.issue_marker_service import (
     serialize_issue_marker,
     update_issue_marker,
 )
-from app.services.cache import get_json as cache_get_json
-from app.services.cache import set_json as cache_set_json
 from app.services.import_task_storage import (
     cleanup_expired_import_staging,
     cleanup_import_task_staging,
@@ -138,6 +136,15 @@ from app.services.import_task_storage import (
     stage_import_file_payload,
     stage_import_file_payloads,
     stage_import_file_streams,
+)
+from app.services.import_task_state import (
+    ImportTaskCanceled,
+    get_import_task_status as shared_get_import_task_status,
+    import_task_cache_key,
+    import_task_cancel_requested,
+    raise_if_import_task_canceled,
+    request_import_task_cancel,
+    set_import_task_status as shared_set_import_task_status,
 )
 from app.services.file_record_service import (
     SegmentUpdateConflict,
@@ -273,6 +280,7 @@ from app.services.revision_settings_service import (
 from app.services.resource_export_queue import (
     ResourceExportFormat,
     build_resource_export_download_response,
+    cancel_resource_export_task,
     ensure_export_task_status,
     queue_resource_export,
 )
@@ -373,38 +381,31 @@ def _begin_repeatable_read_snapshot(db: Session) -> None:
         db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
 
 
-IMPORT_TASK_TTL_SECONDS = 24 * 60 * 60
-
-
 def _import_task_cache_key(task_id: str) -> str:
-    return f"import-task:{task_id}"
+    return import_task_cache_key(task_id)
 
 
 def _set_import_task_status(
     task_id: str,
-    status: Literal["queued", "running", "completed", "failed"],
+    status: Literal["queued", "running", "completed", "failed", "canceling", "canceled"],
     *,
     progress: int = 0,
     message: str = "",
     result: dict[str, Any] | None = None,
     error: str | None = None,
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "task_id": task_id,
-        "status": status,
-        "progress": max(0, min(100, int(progress))),
-        "message": message,
-        "result": result,
-        "error": error,
-        "updated_at": datetime.now().isoformat(),
-    }
-    cache_set_json(_import_task_cache_key(task_id), payload, ttl_seconds=IMPORT_TASK_TTL_SECONDS)
-    return payload
+    return shared_set_import_task_status(
+        task_id,
+        status,
+        progress=progress,
+        message=message,
+        result=result,
+        error=error,
+    )
 
 
 def _get_import_task_status(task_id: str) -> dict[str, Any] | None:
-    payload = cache_get_json(_import_task_cache_key(task_id))
-    return payload if isinstance(payload, dict) else None
+    return shared_get_import_task_status(task_id)
 
 
 def _build_arq_redis_settings(redis_url: str):
@@ -978,6 +979,7 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
 
     created_files: list[FileRecord] = []
     for index, file_payload in enumerate(expanded_payloads, start=1):
+        raise_if_import_task_canceled(task_id)
         filename = file_payload["filename"] or "source.txt"
         raw_bytes = read_import_file_bytes(file_payload)
         _set_import_task_status(
@@ -1056,16 +1058,27 @@ def _run_import_task(task_id: str, payload: dict[str, Any]) -> None:
     try:
         with SessionLocal() as db:
             try:
+                raise_if_import_task_canceled(task_id)
                 if payload.get("kind") == "project_source_document":
                     result = _process_project_source_import(db, task_id, payload)
                 else:
                     result = _process_file_record_import(db, payload)
+                raise_if_import_task_canceled(task_id)
                 _set_import_task_status(
                     task_id,
                     "completed",
                     progress=100,
                     message="导入完成。",
                     result=result,
+                )
+            except ImportTaskCanceled:
+                db.rollback()
+                _set_import_task_status(
+                    task_id,
+                    "canceled",
+                    progress=100,
+                    message="导入已取消。",
+                    error=None,
                 )
             except HTTPException as exc:
                 db.rollback()
@@ -1303,8 +1316,14 @@ class PretranslationCanceled(Exception):
 
 
 class _BackgroundLLMRequest:
+    def __init__(self, task_id: UUID):
+        self.task_id = task_id
+
     async def is_disconnected(self) -> bool:
-        return False
+        return _pretranslation_task_cancel_requested(self.task_id)
+
+    def is_cancel_requested(self) -> bool:
+        return _pretranslation_task_cancel_requested(self.task_id)
 
 
 def _pretranslation_now() -> datetime:
@@ -1634,7 +1653,7 @@ async def _run_pretranslation_llm_stage(task_id: UUID, options: dict[str, Any]) 
             raise RuntimeError("预翻译发起用户不存在")
         response = await llm_translate_file_record(
             task.file_record_id,
-            _BackgroundLLMRequest(),
+            _BackgroundLLMRequest(task_id),
             body,
             stream_db,
             user,
@@ -1751,6 +1770,8 @@ def _run_pretranslation_task(task_id: UUID) -> None:
             raise PretranslationCanceled()
         asyncio.run(_run_pretranslation_llm_stage(task_id, options))
 
+        if _pretranslation_task_cancel_requested(task_id):
+            raise PretranslationCanceled()
         _update_pretranslation_task(
             task_id,
             status="completed",
@@ -4373,6 +4394,14 @@ async def get_supported_formats():
 @router.get("/import-tasks/{task_id}")
 def get_import_task(task_id: str):
     status = _get_import_task_status(task_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="导入任务不存在或已过期。")
+    return status
+
+
+@router.post("/import-tasks/{task_id}/cancel")
+def cancel_import_task(task_id: str):
+    status = request_import_task_cancel(task_id)
     if status is None:
         raise HTTPException(status_code=404, detail="导入任务不存在或已过期。")
     return status
@@ -11220,6 +11249,10 @@ async def llm_translate_file_record(
 
         FLUSH_INTERVAL = 10
         pending_results: list = []
+        request_cancel_check = getattr(request, "is_cancel_requested", None)
+
+        def cancel_requested() -> bool:
+            return bool(callable(request_cancel_check) and request_cancel_check())
 
         async def flush_pending():
             nonlocal updated_count, error_count, pending_results
@@ -11240,8 +11273,9 @@ async def llm_translate_file_record(
             translation_guidelines=guidelines,
             translation_unit=body.translation_unit,
             model_override=requested_model,
+            cancel_check=cancel_requested if callable(request_cancel_check) else None,
         ):
-            if await request.is_disconnected():
+            if cancel_requested() or await request.is_disconnected():
                 return
 
             if isinstance(result, LLMTranslationFailure):
@@ -11271,7 +11305,7 @@ async def llm_translate_file_record(
         if updated_count > 0:
             await asyncio.to_thread(_finalize_file_record_status)
 
-        if not await request.is_disconnected():
+        if not cancel_requested() and not await request.is_disconnected():
             yield _sse_event(
                 "complete",
                 {
@@ -11894,6 +11928,181 @@ def _parse_import_row_indexes(value: str | None) -> set[int]:
     return row_indexes
 
 
+def _build_tm_import_result_payload(
+    *,
+    import_summary,
+    collection_response_id: UUID | None,
+    collection_response_name: str | None,
+    resolved_source_language: str,
+    resolved_target_language: str,
+    refreshed_count: int,
+) -> dict[str, Any]:
+    return {
+        "filename": import_summary.filename,
+        "created_rows": import_summary.created_rows,
+        "updated_rows": import_summary.updated_rows,
+        "skipped_duplicate_rows": import_summary.skipped_duplicate_rows,
+        "skipped_empty_rows": import_summary.skipped_empty_rows,
+        "skipped_header_rows": import_summary.skipped_header_rows,
+        "imported_rows": import_summary.imported_rows,
+        "refreshed_segments": refreshed_count,
+        "collection_id": str(collection_response_id) if collection_response_id is not None else None,
+        "collection_name": collection_response_name,
+        "source_language": resolved_source_language,
+        "target_language": resolved_target_language,
+    }
+
+
+def _run_tm_resource_import_task(task_id: str, payload: dict[str, Any]) -> None:
+    staging_task_id = str(payload.get("staging_task_id") or task_id)
+    _set_import_task_status(task_id, "running", progress=5, message="记忆库导入开始处理。")
+    try:
+        raise_if_import_task_canceled(task_id)
+        with SessionLocal() as db:
+            file_payload = payload["file"]
+            filename = file_payload.get("filename") or "uploaded.xlsx"
+            extension = str(payload.get("extension") or "")
+            collection_id = UUID(payload["collection_id"]) if payload.get("collection_id") else None
+            creator_id = UUID(payload["creator_id"]) if payload.get("creator_id") else None
+            collection_response_id = (
+                UUID(payload["collection_response_id"])
+                if payload.get("collection_response_id")
+                else None
+            )
+            collection_response_name = payload.get("collection_response_name")
+            resolved_source_language = str(payload["source_language"])
+            resolved_target_language = str(payload["target_language"])
+            normalized_duplicate_policy = _normalize_duplicate_policy(payload.get("duplicate_policy"))
+            skipped_row_indexes = {
+                int(item)
+                for item in payload.get("skip_duplicate_row_indexes", [])
+                if int(item) > 0
+            }
+
+            def cancel_check() -> bool:
+                return import_task_cancel_requested(task_id)
+
+            try:
+                _set_import_task_status(task_id, "running", progress=20, message=f"正在导入 {filename}。")
+                if extension in SDLTM_EXTENSIONS:
+                    import_summary = import_tm_from_sdltm_path(
+                        db=db,
+                        sdltm_path=file_payload["path"],
+                        filename=filename,
+                        collection_id=collection_id,
+                        source_language=resolved_source_language,
+                        target_language=resolved_target_language,
+                        creator_id=creator_id,
+                        duplicate_policy=normalized_duplicate_policy,
+                        skip_duplicate_row_indexes=skipped_row_indexes,
+                        batch_size=_resource_import_batch_size(),
+                        cancel_check=cancel_check,
+                    )
+                elif extension in XLSX_EXTENSIONS:
+                    import_summary = import_tm_from_xlsx_path(
+                        db=db,
+                        xlsx_path=file_payload["path"],
+                        filename=filename,
+                        collection_id=collection_id,
+                        source_language=resolved_source_language,
+                        target_language=resolved_target_language,
+                        creator_id=creator_id,
+                        duplicate_policy=normalized_duplicate_policy,
+                        skip_duplicate_row_indexes=skipped_row_indexes,
+                        skip_header=bool(payload.get("skip_header")),
+                        batch_size=_resource_import_batch_size(),
+                        cancel_check=cancel_check,
+                    )
+                else:
+                    import_summary = import_tm_from_upload(
+                        db=db,
+                        raw_bytes=read_import_file_bytes(file_payload),
+                        filename=filename,
+                        collection_id=collection_id,
+                        source_language=resolved_source_language,
+                        target_language=resolved_target_language,
+                        creator_id=creator_id,
+                        duplicate_policy=normalized_duplicate_policy,
+                        skip_duplicate_row_indexes=skipped_row_indexes,
+                        skip_header=bool(payload.get("skip_header")),
+                        batch_size=_resource_import_batch_size(),
+                        cancel_check=cancel_check,
+                    )
+            except ImportTaskCanceled:
+                db.rollback()
+                raise
+            except Exception as exc:
+                db.rollback()
+                raise RuntimeError(f"TM 导入失败：{exc}") from exc
+            raise_if_import_task_canceled(task_id)
+            db.commit()
+
+            refreshed_count = 0
+            try:
+                _set_import_task_status(task_id, "running", progress=90, message="正在刷新相关匹配与通知。")
+                raise_if_import_task_canceled(task_id)
+                if collection_response_id is not None and import_summary.imported_rows > 0:
+                    refreshed_count = _notify_tm_collections_changed(db, [collection_response_id])
+                if collection_response_id is not None:
+                    notification_title, notification_body = build_resource_import_notification(
+                        resource_label="记忆库",
+                        resource_name=collection_response_name or "",
+                        filename=import_summary.filename,
+                        imported_rows=import_summary.imported_rows,
+                        created_rows=import_summary.created_rows,
+                        updated_rows=import_summary.updated_rows,
+                        skipped_empty_rows=import_summary.skipped_empty_rows,
+                        skipped_header_rows=import_summary.skipped_header_rows,
+                        source_language=resolved_source_language,
+                        target_language=resolved_target_language,
+                    )
+                    create_operation_notification(
+                        db,
+                        user_id=creator_id,
+                        notification_type="resource_import",
+                        title=notification_title,
+                        body=notification_body,
+                    )
+                    db.commit()
+            except ImportTaskCanceled:
+                db.rollback()
+                raise
+            except Exception:
+                db.rollback()
+                refreshed_count = 0
+                logger.exception("TM import post-processing failed")
+
+            raise_if_import_task_canceled(task_id)
+            result = _build_tm_import_result_payload(
+                import_summary=import_summary,
+                collection_response_id=collection_response_id,
+                collection_response_name=collection_response_name,
+                resolved_source_language=resolved_source_language,
+                resolved_target_language=resolved_target_language,
+                refreshed_count=refreshed_count,
+            )
+            _set_import_task_status(
+                task_id,
+                "completed",
+                progress=100,
+                message="记忆库导入完成。",
+                result=result,
+            )
+    except ImportTaskCanceled:
+        _set_import_task_status(task_id, "canceled", progress=100, message="记忆库导入已取消。")
+    except Exception as exc:
+        logger.exception("TM resource import task failed task_id=%s", task_id)
+        _set_import_task_status(
+            task_id,
+            "failed",
+            progress=100,
+            message="记忆库导入失败。",
+            error=str(exc),
+        )
+    finally:
+        cleanup_import_task_staging(staging_task_id)
+
+
 async def preview_tm_xlsx(
     file: UploadFile = File(...),
     collection_id: UUID | None = Form(default=None),
@@ -11998,6 +12207,7 @@ async def preview_tm_xlsx(
 @router.post("/translation-memory/import", include_in_schema=False)
 @router.post("/tm/import", include_in_schema=False)
 def import_tm_xlsx(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     collection_id: UUID | None = Form(default=None),
     source_language: str = Form(...),
@@ -12008,112 +12218,49 @@ def import_tm_xlsx(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    # 定义为同步 def，由 FastAPI 调度到线程池执行，避免大文件导入的解析/写库阻塞事件循环。
     extension = _validate_tm_import_upload(file)
     task_id, staged_file = _stage_resource_upload_file(file)
-
-    collection = _get_collection_or_404(db, collection_id)
-    resolved_source_language, resolved_target_language = _resolve_collection_language_pair(
-        collection,
-        source_language,
-        target_language,
-    )
-    collection_response_id = collection.id if collection is not None else None
-    collection_response_name = collection.name if collection is not None else None
-    normalized_duplicate_policy = _normalize_duplicate_policy(duplicate_policy)
-    skipped_row_indexes = _parse_import_row_indexes(skip_duplicate_row_indexes)
     try:
-        if extension in SDLTM_EXTENSIONS:
-            import_summary = import_tm_from_sdltm_path(
-                db=db,
-                sdltm_path=staged_file["path"],
-                filename=file.filename or "uploaded.sdltm",
-                collection_id=collection_id,
-                source_language=resolved_source_language,
-                target_language=resolved_target_language,
-                creator_id=current_user.id,
-                duplicate_policy=normalized_duplicate_policy,
-                skip_duplicate_row_indexes=skipped_row_indexes,
-                batch_size=_resource_import_batch_size(),
-            )
-        elif extension in XLSX_EXTENSIONS:
-            import_summary = import_tm_from_xlsx_path(
-                db=db,
-                xlsx_path=staged_file["path"],
-                filename=file.filename or "uploaded.xlsx",
-                collection_id=collection_id,
-                source_language=resolved_source_language,
-                target_language=resolved_target_language,
-                creator_id=current_user.id,
-                duplicate_policy=normalized_duplicate_policy,
-                skip_duplicate_row_indexes=skipped_row_indexes,
-                skip_header=skip_header,
-                batch_size=_resource_import_batch_size(),
-            )
-        else:
-            import_summary = import_tm_from_upload(
-                db=db,
-                raw_bytes=read_import_file_bytes(staged_file),
-                filename=file.filename or "uploaded.xlsx",
-                collection_id=collection_id,
-                source_language=resolved_source_language,
-                target_language=resolved_target_language,
-                creator_id=current_user.id,
-                duplicate_policy=normalized_duplicate_policy,
-                skip_duplicate_row_indexes=skipped_row_indexes,
-                skip_header=skip_header,
-                batch_size=_resource_import_batch_size(),
-            )
-    except Exception as exc:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"TM 导入失败：{exc}") from exc
-    finally:
-        cleanup_import_task_staging(task_id)
+        collection = _get_collection_or_404(db, collection_id)
+        resolved_source_language, resolved_target_language = _resolve_collection_language_pair(
+            collection,
+            source_language,
+            target_language,
+        )
+        db.commit()
+        collection_response_id = collection.id if collection is not None else None
+        collection_response_name = collection.name if collection is not None else None
+        skipped_row_indexes = _parse_import_row_indexes(skip_duplicate_row_indexes)
 
-    refreshed_count = 0
-    try:
-        if collection_response_id is not None and import_summary.imported_rows > 0:
-            refreshed_count = _notify_tm_collections_changed(db, [collection_response_id])
-        if collection_response_id is not None:
-            notification_title, notification_body = build_resource_import_notification(
-                resource_label="记忆库",
-                resource_name=collection_response_name or "",
-                filename=import_summary.filename,
-                imported_rows=import_summary.imported_rows,
-                created_rows=import_summary.created_rows,
-                updated_rows=import_summary.updated_rows,
-                skipped_empty_rows=import_summary.skipped_empty_rows,
-                skipped_header_rows=import_summary.skipped_header_rows,
-                source_language=resolved_source_language,
-                target_language=resolved_target_language,
-            )
-            create_operation_notification(
-                db,
-                user_id=current_user.id,
-                notification_type="resource_import",
-                title=notification_title,
-                body=notification_body,
-            )
-            db.commit()
+        payload = {
+            "kind": "tm_resource_import",
+            "staging_task_id": task_id,
+            "file": staged_file,
+            "extension": extension,
+            "collection_id": str(collection_id) if collection_id is not None else None,
+            "collection_response_id": str(collection_response_id) if collection_response_id is not None else None,
+            "collection_response_name": collection_response_name,
+            "source_language": resolved_source_language,
+            "target_language": resolved_target_language,
+            "duplicate_policy": _normalize_duplicate_policy(duplicate_policy),
+            "skip_duplicate_row_indexes": sorted(skipped_row_indexes),
+            "skip_header": bool(skip_header),
+            "creator_id": str(current_user.id),
+        }
+        _set_import_task_status(task_id, "queued", progress=0, message="记忆库导入任务已进入队列。")
+        background_tasks.add_task(_run_tm_resource_import_task, task_id, payload)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "task_id": task_id,
+                "status": "queued",
+                "progress": 0,
+                "message": "记忆库导入任务已进入队列。",
+            },
+        )
     except Exception:
-        db.rollback()
-        refreshed_count = 0
-        logger.exception("TM import post-processing failed")
-
-    return {
-        "filename": import_summary.filename,
-        "created_rows": import_summary.created_rows,
-        "updated_rows": import_summary.updated_rows,
-        "skipped_duplicate_rows": import_summary.skipped_duplicate_rows,
-        "skipped_empty_rows": import_summary.skipped_empty_rows,
-        "skipped_header_rows": import_summary.skipped_header_rows,
-        "imported_rows": import_summary.imported_rows,
-        "refreshed_segments": refreshed_count,
-        "collection_id": collection_response_id,
-        "collection_name": collection_response_name,
-        "source_language": resolved_source_language,
-        "target_language": resolved_target_language,
-    }
+        cleanup_import_task_staging(task_id)
+        raise
 
 
 @router.get("/translation-memory/collections/{collection_id}/entries")
@@ -12229,6 +12376,11 @@ def queue_tm_collection_export(
 @router.get("/translation-memory/export-tasks/{task_id}")
 def get_tm_export_task(task_id: str):
     return ensure_export_task_status(task_id, expected_resource_type="tm")
+
+
+@router.post("/translation-memory/export-tasks/{task_id}/cancel")
+def cancel_tm_export_task(task_id: str):
+    return cancel_resource_export_task(task_id, expected_resource_type="tm")
 
 
 @router.get("/translation-memory/export-tasks/{task_id}/download")

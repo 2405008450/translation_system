@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from typing import Callable
 from uuid import UUID
 
 from openpyxl import load_workbook
@@ -10,6 +11,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.models import GlossaryEntry
+from app.services.import_task_state import ImportTaskCanceled
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import normalize_match_text, normalize_text
 
@@ -20,6 +22,13 @@ GLOSSARY_PREVIEW_MAX_SCAN_ROWS = 1000
 SOURCE_HEADER_ALIASES = {"source", "source_text", "source_term", "term", "原文", "词汇", "词条", "术语"}
 TARGET_HEADER_ALIASES = {"target", "target_text", "target_term", "translation", "译文", "翻译"}
 NOTE_HEADER_ALIASES = {"note", "notes", "comment", "comments", "context", "remark", "remarks", "备注", "说明", "补充解释"}
+
+CancelCheck = Callable[[], bool]
+
+
+def _raise_if_canceled(cancel_check: CancelCheck | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise ImportTaskCanceled("词汇表导入已取消。")
 
 
 @dataclass
@@ -72,6 +81,7 @@ def import_glossary_from_xlsx_upload(
     creator_id: UUID | None = None,
     batch_size: int = 5000,
     skip_header: bool = False,
+    cancel_check: CancelCheck | None = None,
 ) -> GlossaryImportSummary:
     workbook = load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)
     return _import_workbook(
@@ -84,6 +94,7 @@ def import_glossary_from_xlsx_upload(
         target_language=target_language,
         creator_id=creator_id,
         skip_header=skip_header,
+        cancel_check=cancel_check,
     )
 
 
@@ -150,6 +161,7 @@ def import_glossary_from_xlsx_path(
     creator_id: UUID | None = None,
     batch_size: int = 5000,
     skip_header: bool = False,
+    cancel_check: CancelCheck | None = None,
 ) -> GlossaryImportSummary:
     workbook = load_workbook(Path(xlsx_path), read_only=True, data_only=True)
     return _import_workbook(
@@ -162,6 +174,7 @@ def import_glossary_from_xlsx_path(
         target_language=target_language,
         creator_id=creator_id,
         skip_header=skip_header,
+        cancel_check=cancel_check,
     )
 
 
@@ -342,6 +355,7 @@ def _import_workbook(
     target_language: str,
     creator_id: UUID | None = None,
     skip_header: bool = False,
+    cancel_check: CancelCheck | None = None,
 ) -> GlossaryImportSummary:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
@@ -356,6 +370,8 @@ def _import_workbook(
     column_indexes = (0, 1, 2)
 
     for row_index, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+        if row_index == 1 or row_index % batch_size == 0:
+            _raise_if_canceled(cancel_check)
         if row_index == 1:
             detected = _detect_header_indexes(row)
             if detected is not None:
@@ -397,8 +413,10 @@ def _import_workbook(
             created_rows += created_in_batch
             updated_rows += updated_in_batch
             batch_rows.clear()
+            _raise_if_canceled(cancel_check)
 
     if batch_rows:
+        _raise_if_canceled(cancel_check)
         created_in_batch, updated_in_batch = _flush_glossary_batch(
             db=db,
             batch_rows=list(batch_rows.values()),

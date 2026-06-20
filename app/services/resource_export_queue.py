@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -27,8 +27,9 @@ logger = logging.getLogger(__name__)
 
 ResourceExportKind = Literal["tm", "term", "glossary"]
 ResourceExportFormat = Literal["xlsx", "tmx"]
-ResourceExportStatus = Literal["queued", "running", "completed", "failed"]
+ResourceExportStatus = Literal["queued", "running", "completed", "failed", "canceling", "canceled"]
 ProgressCallback = Callable[[int, str], None]
+CancelCheck = Callable[[], bool]
 
 EXPORT_TASK_TTL_SECONDS = 24 * 60 * 60
 EXPORT_QUERY_BATCH_SIZE = 1000
@@ -39,6 +40,11 @@ EXPORT_MEDIA_TYPES: dict[ResourceExportFormat, str] = {
 
 # 本地模式下串行处理大文件导出，避免多个重任务同时占用数据库连接和文件句柄。
 _EXPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="resource-export")
+_EXPORT_FUTURES: dict[str, Future] = {}
+
+
+class ResourceExportCanceled(Exception):
+    """导出任务已被用户取消。"""
 
 
 def queue_resource_export(
@@ -62,6 +68,7 @@ def queue_resource_export(
         payload=payload,
     )
     future = _EXPORT_EXECUTOR.submit(_run_resource_export_task, task_id, payload)
+    _EXPORT_FUTURES[task_id] = future
     future.add_done_callback(_log_export_task_failure)
     status = get_resource_export_task_status(task_id)
     return status or payload
@@ -81,6 +88,50 @@ def ensure_export_task_status(
     if not status or status.get("resource_type") != expected_resource_type:
         raise HTTPException(status_code=404, detail="导出任务不存在。")
     return status
+
+
+def _export_task_cancel_requested(task_id: str) -> bool:
+    status = get_resource_export_task_status(task_id)
+    return bool(status and status.get("status") in {"canceling", "canceled"})
+
+
+def _raise_if_export_canceled(task_id: str) -> None:
+    if _export_task_cancel_requested(task_id):
+        raise ResourceExportCanceled("导出已取消。")
+
+
+def cancel_resource_export_task(
+    task_id: str,
+    *,
+    expected_resource_type: ResourceExportKind,
+) -> dict[str, Any]:
+    status = ensure_export_task_status(task_id, expected_resource_type=expected_resource_type)
+    current_status = str(status.get("status") or "")
+    if current_status in {"completed", "failed", "canceled"}:
+        return status
+
+    payload = {
+        "resource_type": status.get("resource_type"),
+        "resource_id": status.get("resource_id"),
+        "format": status.get("format"),
+    }
+    future = _EXPORT_FUTURES.get(task_id)
+    if current_status == "queued" and future is not None and future.cancel():
+        return _set_export_task_status(
+            task_id,
+            "canceled",
+            progress=100,
+            message="导出已取消。",
+            payload=payload,
+        )
+
+    return _set_export_task_status(
+        task_id,
+        "canceling",
+        progress=int(status.get("progress") or 0),
+        message="正在取消导出，请稍候。",
+        payload=payload,
+    )
 
 
 def build_resource_export_download_response(
@@ -280,16 +331,19 @@ def export_glossary_base_now(
 def _run_resource_export_task(task_id: str, payload: dict[str, Any]) -> None:
     resource_type = payload.get("resource_type")
     export_format = payload.get("format")
+    output_path: Path | None = None
     try:
         resource_id = UUID(str(payload["resource_id"]))
         if resource_type not in ("tm", "term", "glossary") or export_format not in ("xlsx", "tmx"):
             raise ValueError("导出任务参数不正确。")
+        _raise_if_export_canceled(task_id)
 
         output_dir = _ensure_export_dir()
         _cleanup_expired_export_files(output_dir)
         output_path = output_dir / f"{task_id}.{export_format}"
 
         def update_progress(progress: int, message: str) -> None:
+            _raise_if_export_canceled(task_id)
             _set_export_task_status(
                 task_id,
                 "running",
@@ -327,6 +381,7 @@ def _run_resource_export_task(task_id: str, payload: dict[str, Any]) -> None:
                     progress_callback=update_progress,
                 )
 
+        _raise_if_export_canceled(task_id)
         _set_export_task_status(
             task_id,
             "completed",
@@ -334,6 +389,19 @@ def _run_resource_export_task(task_id: str, payload: dict[str, Any]) -> None:
             message="导出完成。",
             payload=payload,
             result=result,
+        )
+    except ResourceExportCanceled:
+        if output_path is not None:
+            try:
+                output_path.unlink(missing_ok=True)
+            except OSError:
+                logger.debug("skip cleanup for canceled export path=%s", output_path, exc_info=True)
+        _set_export_task_status(
+            task_id,
+            "canceled",
+            progress=100,
+            message="导出已取消。",
+            payload=payload,
         )
     except Exception as exc:
         logger.exception("resource export task failed task_id=%s", task_id)
@@ -375,6 +443,7 @@ def _write_xlsx_file(
     if processed == 0:
         progress_callback(90, "正在写入空 Excel 文件。")
 
+    progress_callback(92, "正在保存 Excel 文件。")
     workbook.save(output_path)
     workbook.close()
 
@@ -432,6 +501,7 @@ def _write_tmx_file(
         if processed == 0:
             progress_callback(90, "正在写入空 TMX 文件。")
 
+        progress_callback(92, "正在保存 TMX 文件。")
         file.write("  </body>\n")
         file.write("</tmx>\n")
 
@@ -712,7 +782,13 @@ def _noop_progress_callback(progress: int, message: str) -> None:
 
 
 def _log_export_task_failure(future: Future) -> None:
+    for task_id, candidate in list(_EXPORT_FUTURES.items()):
+        if candidate is future:
+            _EXPORT_FUTURES.pop(task_id, None)
+            break
     try:
         future.result()
+    except CancelledError:
+        return
     except Exception:
         logger.exception("resource export worker crashed")

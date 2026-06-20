@@ -23,7 +23,7 @@ interface ResourceExportTask {
   resource_type: 'term'
   resource_id: string
   format: ExportFormat
-  status: 'queued' | 'running' | 'completed' | 'failed'
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'canceling' | 'canceled'
   progress: number
   message: string
   result: {
@@ -71,6 +71,7 @@ const mergeMessage = ref('')
 const mergeSubmitting = ref(false)
 const deletingBases = ref(false)
 const exportingKey = ref('')
+const currentExportTaskId = ref('')
 
 const selectedTermBaseId = ref('')
 let exportPollTimer: number | null = null
@@ -157,6 +158,7 @@ function waitForExportPoll(ms: number) {
 
 async function waitForExportTask(task: ResourceExportTask) {
   let currentTask = task
+  currentExportTaskId.value = task.task_id
   while (!disposed) {
     baseMessage.value = currentTask.message || `导出处理中：${currentTask.progress}%`
 
@@ -166,12 +168,23 @@ async function waitForExportTask(task: ResourceExportTask) {
     if (currentTask.status === 'failed') {
       throw new Error(currentTask.error || currentTask.message || '导出失败。')
     }
+    if (currentTask.status === 'canceled') {
+      throw new DOMException(currentTask.message || '导出已取消。', 'AbortError')
+    }
 
     await waitForExportPoll(1200)
     const { data } = await http.get<ResourceExportTask>(`/term-bases/export-tasks/${currentTask.task_id}`)
     currentTask = data
   }
   throw new Error('导出任务已取消。')
+}
+
+async function cancelCurrentExport() {
+  if (!currentExportTaskId.value) {
+    return
+  }
+  baseMessage.value = '正在停止导出...'
+  await http.post(`/term-bases/export-tasks/${currentExportTaskId.value}/cancel`).catch(() => undefined)
 }
 
 async function exportTermBase(termBase: TermBase | Record<string, any>, format: ExportFormat) {
@@ -200,10 +213,13 @@ async function exportTermBase(termBase: TermBase | Record<string, any>, format: 
     downloadBlob(response.data, filename)
     baseMessage.value = `${currentTermBase.name} 已导出为 ${formatLabel}。`
   } catch (error) {
-    baseMessage.value = getErrorMessage(error, `${currentTermBase.name} 导出失败。`)
+    baseMessage.value = error instanceof DOMException && error.name === 'AbortError'
+      ? `${currentTermBase.name} 导出已停止。`
+      : getErrorMessage(error, `${currentTermBase.name} 导出失败。`)
   } finally {
     clearExportPollTimer()
     exportingKey.value = ''
+    currentExportTaskId.value = ''
   }
 }
 
@@ -587,6 +603,15 @@ onUnmounted(() => {
           </button>
           <button class="button" type="button" :disabled="loadingBases" @click="loadTermBases">
             {{ loadingBases ? '刷新中...' : '刷新' }}
+          </button>
+          <button
+            v-if="exportingKey"
+            class="button button--danger"
+            type="button"
+            @click="cancelCurrentExport"
+          >
+            <X :size="14" />
+            停止导出
           </button>
           <span style="font-size: 13px; color: var(--ink-500);">
             已选择：{{ selectedIds.size }}　总数：{{ totalCount }}
