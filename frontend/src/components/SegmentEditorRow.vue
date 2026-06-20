@@ -1026,9 +1026,19 @@ function handleBlur() {
   void nextTick(() => syncEditorHtmlFromState(false))
 }
 
-function handleClick(event?: MouseEvent) {
+function isSegmentMultiSelectEvent(event?: MouseEvent) {
+  return Boolean(event && (event.ctrlKey || event.metaKey || event.shiftKey))
+}
+
+function handleSelectMouseDown(event: MouseEvent) {
+  if (isSegmentMultiSelectEvent(event)) {
+    event.preventDefault()
+  }
+}
+
+function handleClick(event: MouseEvent) {
   resetHistoryGroup()
-  if (event && (event.ctrlKey || event.metaKey)) {
+  if (isSegmentMultiSelectEvent(event)) {
     emit('ctrlClick', segmentKey.value, event)
     return
   }
@@ -1077,8 +1087,11 @@ function handleSourceKeydown(event: KeyboardEvent) {
   }
 }
 
-function handleEditorShellClick() {
-  handleClick()
+function handleEditorShellClick(event: MouseEvent) {
+  handleClick(event)
+  if (isSegmentMultiSelectEvent(event)) {
+    return
+  }
   void nextTick(() => {
     editorRef.value?.focus({ preventScroll: true })
   })
@@ -1661,7 +1674,7 @@ watch(
       <span class="segment-row__index">{{ index + 1 }}</span>
     </div>
 
-    <div class="segment-row__cell segment-row__cell--source" @click="handleClick">
+    <div class="segment-row__cell segment-row__cell--source" @mousedown="handleSelectMouseDown" @click="handleClick">
       <div class="segment-row__source-content">
         <span
           v-if="hasAutomaticNumbering"
@@ -1694,6 +1707,7 @@ watch(
       <div
         class="segment-row__editor-shell"
         :class="{ 'is-focused': isFocused, 'is-disabled': disabled, 'has-revision': hasPendingRevision }"
+        @mousedown="handleSelectMouseDown"
         @click="handleEditorShellClick"
       >
       <div
@@ -1744,7 +1758,8 @@ watch(
           spellcheck="false"
           @focus="handleFocus"
           @blur="handleBlur"
-          @click="handleClick"
+          @mousedown="handleSelectMouseDown"
+          @click.stop="handleClick"
           @keydown="handleKeydown"
           @compositionstart="handleCompositionStart"
           @compositionend="handleCompositionEnd"

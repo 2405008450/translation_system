@@ -3094,6 +3094,7 @@ function redoActiveSegmentEdit() {
 // ========== 拆分/合并句段 ==========
 
 const selectedSentenceIds = ref<Set<string>>(new Set())
+const segmentSelectionAnchorId = ref<string | null>(null)
 const lastSourceCaretOffset = ref<number | null>(null)
 
 // 切换激活句段时清除光标缓存
@@ -3101,9 +3102,36 @@ watch(() => segmentStore.activeSentenceId, () => {
   lastSourceCaretOffset.value = null
 })
 
+function selectSegmentRange(fromSentenceId: string, toSentenceId: string) {
+  const segments = editorSegments.value
+  const fromIndex = segments.findIndex((segment) => segmentKeyOf(segment) === fromSentenceId)
+  const toIndex = segments.findIndex((segment) => segmentKeyOf(segment) === toSentenceId)
+  if (fromIndex === -1 || toIndex === -1) {
+    selectedSentenceIds.value = new Set([toSentenceId])
+    return
+  }
+  const [start, end] = fromIndex <= toIndex ? [fromIndex, toIndex] : [toIndex, fromIndex]
+  const next = new Set<string>()
+  for (let index = start; index <= end; index += 1) {
+    next.add(segmentKeyOf(segments[index]))
+  }
+  selectedSentenceIds.value = next
+}
+
 function handleSegmentClick(sentenceId: string, event: MouseEvent) {
+  if (event.shiftKey) {
+    const anchorId = segmentSelectionAnchorId.value || segmentStore.activeSentenceId
+    if (!anchorId) {
+      selectedSentenceIds.value = new Set([sentenceId])
+    } else {
+      selectSegmentRange(anchorId, sentenceId)
+    }
+    segmentSelectionAnchorId.value = sentenceId
+    segmentStore.setActiveSentence(sentenceId)
+    return
+  }
+
   if (event.ctrlKey || event.metaKey) {
-    // Ctrl+Click 多选
     const next = new Set(selectedSentenceIds.value)
     if (next.has(sentenceId)) {
       next.delete(sentenceId)
@@ -3111,9 +3139,8 @@ function handleSegmentClick(sentenceId: string, event: MouseEvent) {
       next.add(sentenceId)
     }
     selectedSentenceIds.value = next
-  } else {
-    // 普通点击清除多选
-    selectedSentenceIds.value = new Set()
+    segmentSelectionAnchorId.value = sentenceId
+    segmentStore.setActiveSentence(sentenceId)
   }
 }
 
@@ -3143,12 +3170,51 @@ const canSplitSegment = computed(() => {
   return activeSegmentCanWrite.value && (activeSegment.value.source_text || '').length >= 2
 })
 
+const orderedSelectedMergeSegments = computed(() => {
+  const selectedIds = selectedSentenceIds.value
+  return editorSegments.value.filter((segment) => selectedIds.has(segmentKeyOf(segment)))
+})
+
+function isSameMergeBlock(left: Segment, right: Segment) {
+  return (
+    (left.file_record_id ?? null) === (right.file_record_id ?? null)
+    && left.block_index === right.block_index
+    && (left.row_index ?? null) === (right.row_index ?? null)
+    && (left.cell_index ?? null) === (right.cell_index ?? null)
+  )
+}
+
+const selectedMergeSegmentsCanWrite = computed(() => (
+  orderedSelectedMergeSegments.value.length === selectedSentenceIds.value.size
+  && orderedSelectedMergeSegments.value.every((segment) => Boolean(segment.can_write))
+))
+
+const selectedMergeSegmentsInSameBlock = computed(() => {
+  const orderedSegments = orderedSelectedMergeSegments.value
+  if (orderedSegments.length < 2) return false
+  const first = orderedSegments[0]
+  return orderedSegments.every((segment) => isSameMergeBlock(segment, first))
+})
+
 const canMergeSegment = computed(() => {
-  if (selectedSentenceIds.value.size < 2) return false
-  return Array.from(selectedSentenceIds.value).every((sentenceId) => {
-    const segment = segmentStore.segments.find((item) => segmentKeyOf(item) === sentenceId)
-    return Boolean(segment?.can_write)
-  })
+  return (
+    orderedSelectedMergeSegments.value.length >= 2
+    && selectedMergeSegmentsCanWrite.value
+    && selectedMergeSegmentsInSameBlock.value
+  )
+})
+
+const mergeSegmentButtonTitle = computed(() => {
+  if (orderedSelectedMergeSegments.value.length < 2) {
+    return t('workbench.messages.mergeSelectAtLeast')
+  }
+  if (!selectedMergeSegmentsCanWrite.value) {
+    return t('workbench.messages.mergeReadonly')
+  }
+  if (!selectedMergeSegmentsInSameBlock.value) {
+    return t('workbench.messages.mergeDifferentBlock')
+  }
+  return t('workbench.ribbon.mergeSegment')
 })
 
 async function handleSplitSegment() {
@@ -3188,8 +3254,7 @@ async function handleMergeSegment() {
   }
 
   // 按当前显示顺序排列选中的句段
-  const selectedIds = selectedSentenceIds.value
-  const orderedSegments = editorSegments.value.filter((s) => selectedIds.has(segmentKeyOf(s)))
+  const orderedSegments = orderedSelectedMergeSegments.value
 
   if (orderedSegments.length < 2) {
     toast.warn({ message: t('workbench.messages.mergeSelectAtLeast') })
@@ -3198,12 +3263,7 @@ async function handleMergeSegment() {
 
   // 检查是否属于同一段落
   const first = orderedSegments[0]
-  const notSameBlock = orderedSegments.some(
-    (s) =>
-      s.block_index !== first.block_index
-      || s.row_index !== first.row_index
-      || s.cell_index !== first.cell_index,
-  )
+  const notSameBlock = orderedSegments.some((segment) => !isSameMergeBlock(segment, first))
   if (notSameBlock) {
     toast.warn({ message: t('workbench.messages.mergeDifferentBlock') })
     return
@@ -4568,7 +4628,8 @@ async function ensureMatchInfoPanelOpen() {
 }
 
 function handleSegmentTargetActivate(sentenceId: string) {
-  selectedSentenceIds.value = new Set()
+  selectedSentenceIds.value = new Set([sentenceId])
+  segmentSelectionAnchorId.value = sentenceId
   segmentStore.setActiveSentence(sentenceId)
 }
 
@@ -5053,7 +5114,13 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group">
           <span class="tool-col align-left">
-            <button class="tool-line tool-button" type="button" :disabled="!canMergeSegment" @click="handleMergeSegment">
+            <button
+              class="tool-line tool-button"
+              type="button"
+              :disabled="!canMergeSegment"
+              :title="mergeSegmentButtonTitle"
+              @click="handleMergeSegment"
+            >
               <span class="icon-text-area">
                 <span class="tool-item" :class="{ disabled: !canMergeSegment }">
                   <Combine class="tool-label-icon" :size="16" />

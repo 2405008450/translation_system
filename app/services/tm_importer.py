@@ -1112,6 +1112,12 @@ def _flush_tm_batch_once(
             skipped_duplicate_rows += 1
             continue
 
+        if _tm_entry_matches_import_row(existing, row):
+            existing_by_hash[row["source_hash"]] = existing
+            existing_by_source_text[row["source_text"]] = existing
+            skipped_duplicate_rows += 1
+            continue
+
         existing.source_text = row["source_text"]
         existing.target_text = row["target_text"]
         existing.source_hash = row["source_hash"]
@@ -1136,8 +1142,21 @@ def _flush_tm_batch_once(
         key=lambda item: str(item[0]),
     )
     db.commit()
-    sync_tm_embeddings(db, sync_rows)
+    if sync_rows:
+        sync_tm_embeddings(db, sync_rows)
     return created_rows, updated_rows, skipped_duplicate_rows
+
+
+def _tm_entry_matches_import_row(existing: MemoryEntry, row: dict) -> bool:
+    return (
+        normalize_text(existing.source_text or "") == row["source_text"]
+        and normalize_text(existing.target_text or "") == row["target_text"]
+        and (existing.source_hash or "") == row["source_hash"]
+        and (existing.source_normalized or "") == row["source_normalized"]
+        and existing.collection_id == row["collection_id"]
+        and (existing.source_language or "") == row["source_language"]
+        and (existing.target_language or "") == row["target_language"]
+    )
 
 
 def _tm_import_row_sort_key(row: dict) -> tuple[str, str]:
