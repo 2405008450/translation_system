@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import re
 import csv
+import hashlib
+import re
 import sqlite3
 import tempfile
+import time
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -12,7 +14,8 @@ from xml.etree import ElementTree as ET
 from uuid import UUID
 
 from openpyxl import load_workbook
-from sqlalchemy import or_
+from sqlalchemy import or_, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from app.models import MemoryEntry
@@ -30,6 +33,9 @@ WORKBOOK_EXTENSIONS = XLSX_EXTENSIONS | XLS_EXTENSIONS
 TM_IMPORT_EXTENSIONS = CSV_EXTENSIONS | TMX_EXTENSIONS | WORKBOOK_EXTENSIONS | SDLTM_EXTENSIONS
 TM_STATUS_LOOKUP_CHUNK_SIZE = 10000
 TM_PREVIEW_MAX_SCAN_ROWS = 1000
+TM_IMPORT_WRITE_RETRY_ATTEMPTS = 5
+TM_IMPORT_WRITE_RETRY_BASE_DELAY_SECONDS = 0.2
+TM_IMPORT_RETRYABLE_SQLSTATES = {"40P01", "40001", "55P03"}
 HEADER_ALIASES = {
     ("zh-cn", "en-us"),
     ("source", "target"),
@@ -1014,6 +1020,50 @@ def _flush_tm_batch(
 ) -> tuple[int, int, int]:
     if not batch_rows:
         return 0, 0, 0
+    ordered_batch_rows = sorted(batch_rows, key=_tm_import_row_sort_key)
+    attempts = max(1, TM_IMPORT_WRITE_RETRY_ATTEMPTS)
+    for attempt_index in range(attempts):
+        try:
+            return _flush_tm_batch_once(
+                db=db,
+                batch_rows=ordered_batch_rows,
+                source_language=source_language,
+                target_language=target_language,
+                collection_id=collection_id,
+                creator_id=creator_id,
+                duplicate_policy=duplicate_policy,
+            )
+        except DBAPIError as exc:
+            db.rollback()
+            if not _is_retryable_tm_write_error(exc) or attempt_index + 1 >= attempts:
+                raise
+            delay_seconds = min(
+                TM_IMPORT_WRITE_RETRY_BASE_DELAY_SECONDS * (2 ** attempt_index),
+                2.0,
+            )
+            time.sleep(delay_seconds)
+
+    return 0, 0, 0
+
+
+def _flush_tm_batch_once(
+    db: Session,
+    batch_rows: list[dict],
+    source_language: str,
+    target_language: str,
+    collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+) -> tuple[int, int, int]:
+    if not batch_rows:
+        return 0, 0, 0
+
+    _acquire_tm_import_transaction_lock(
+        db=db,
+        collection_id=collection_id,
+        source_language=source_language,
+        target_language=target_language,
+    )
 
     source_hashes = [row["source_hash"] for row in batch_rows]
     source_texts = [row["source_text"] for row in batch_rows]
@@ -1032,7 +1082,7 @@ def _flush_tm_batch(
         existing_query = existing_query.filter(MemoryEntry.collection_id.is_(None))
     else:
         existing_query = existing_query.filter(MemoryEntry.collection_id == collection_id)
-    existing_rows = existing_query.all()
+    existing_rows = sorted(existing_query.all(), key=_memory_entry_sort_key)
 
     existing_by_hash: dict[str, MemoryEntry] = {}
     existing_by_source_text: dict[str, MemoryEntry] = {}
@@ -1077,16 +1127,62 @@ def _flush_tm_batch(
         updated_rows += 1
 
     db.flush()
-    sync_rows = list(
+    sync_rows = sorted(
         {
             row.id: row.source_text
             for row in sync_candidates
             if row.id is not None and row.source_text
-        }.items()
+        }.items(),
+        key=lambda item: str(item[0]),
     )
     db.commit()
     sync_tm_embeddings(db, sync_rows)
     return created_rows, updated_rows, skipped_duplicate_rows
+
+
+def _tm_import_row_sort_key(row: dict) -> tuple[str, str]:
+    return (str(row.get("source_hash") or ""), normalize_text(str(row.get("source_text") or "")))
+
+
+def _memory_entry_sort_key(entry: MemoryEntry) -> tuple[str, str, str]:
+    return (str(entry.id or ""), str(entry.source_hash or ""), normalize_text(entry.source_text or ""))
+
+
+def _is_retryable_tm_write_error(exc: DBAPIError) -> bool:
+    original = getattr(exc, "orig", None)
+    sqlstate = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+    if sqlstate in TM_IMPORT_RETRYABLE_SQLSTATES:
+        return True
+
+    message = str(exc).lower()
+    return (
+        "deadlock detected" in message
+        or "could not serialize access" in message
+        or "lock not available" in message
+    )
+
+
+def _acquire_tm_import_transaction_lock(
+    db: Session,
+    collection_id: UUID | None,
+    source_language: str,
+    target_language: str,
+) -> None:
+    if db.get_bind().dialect.name != "postgresql":
+        return
+
+    lock_key = _build_tm_import_lock_key(collection_id, source_language, target_language)
+    db.execute(text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": lock_key})
+
+
+def _build_tm_import_lock_key(
+    collection_id: UUID | None,
+    source_language: str,
+    target_language: str,
+) -> int:
+    lock_scope = f"tm-import:{collection_id or 'global'}:{source_language}:{target_language}"
+    digest = hashlib.blake2b(lock_scope.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="big", signed=True)
 
 
 def _cell_to_text(row: tuple, index: int) -> str:
