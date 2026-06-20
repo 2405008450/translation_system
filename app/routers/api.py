@@ -19,7 +19,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, case, func, or_
+from sqlalchemy import and_, case, func, literal, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, object_session
 
@@ -12943,22 +12943,37 @@ def match_terms(
     db: Session = Depends(get_db),
 ):
     """匹配文本中的术语，返回匹配到的术语列表（长术语优先）"""
-    if not text:
+    match_text = normalize_text(text or "")
+    if not match_text:
         return {"matches": []}
 
-    query = db.query(TermEntry)
-    if collection_ids:
-        query = query.filter(TermEntry.term_base_id.in_(collection_ids))
+    # 防止未绑定术语库时全表扫描 term_entries。
+    if not collection_ids:
+        return {"matches": []}
 
-    all_terms = query.all()
+    candidate_query = (
+        db.query(TermEntry.id, TermEntry.source_text, TermEntry.target_text)
+        .filter(
+            TermEntry.term_base_id.in_(collection_ids),
+            TermEntry.source_text != "",
+            func.length(TermEntry.source_text) <= len(match_text),
+        )
+        .order_by(func.length(TermEntry.source_text).desc(), TermEntry.updated_at.desc())
+        .limit(1000)
+    )
+    if case_sensitive:
+        candidate_query = candidate_query.filter(literal(match_text).contains(TermEntry.source_text))
+    else:
+        candidate_query = candidate_query.filter(
+            literal(match_text.lower()).contains(func.lower(TermEntry.source_text))
+        )
 
-    # 按原文长度降序排序（长术语优先）
-    sorted_terms = sorted(all_terms, key=lambda t: len(t.source_text), reverse=True)
+    candidate_terms = candidate_query.all()
 
     matches = []
     matched_positions = set()
 
-    for term in sorted_terms:
+    for term in candidate_terms:
         for text_match in find_term_text_matches(text, term.source_text, case_sensitive=case_sensitive):
             pos = text_match.start
             end_pos = text_match.end
