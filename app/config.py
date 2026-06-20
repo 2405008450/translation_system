@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     # 连接池容量(pool_size + max_overflow)及 PgBouncer 池大小协调，避免线程数远超可用连接。
     server_threadpool_size: int | None = None
     term_import_preview_max_scan_rows: int = 5000
+    # 资源库导入预览只扫描前 N 行，避免几十万行 Excel 在预览阶段占满内存。
+    resource_import_preview_max_scan_rows: int = 1000
+    # 资源库实际导入的写库批次大小，控制单批 ORM 对象和向量同步 payload 的内存峰值。
+    resource_import_batch_size: int = 1000
     file_storage_dir: str = "data/file_records"
     export_task_dir: str = "data/export_tasks"
     import_task_dir: str = "data/import_tasks"

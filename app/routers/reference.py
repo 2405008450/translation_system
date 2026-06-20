@@ -44,6 +44,7 @@ from app.services.analytics_service import count_source_words, record_translatio
 from app.services.normalizer import normalize_text
 
 router = APIRouter(prefix="/reference", tags=["reference"])
+REFERENCE_UPLOAD_COPY_CHUNK_SIZE = 1024 * 1024
 
 
 class ReferenceProfileResponse(BaseModel):
@@ -120,20 +121,41 @@ async def upload_reference_file(
     storage_dir = os.path.join(settings.file_storage_dir, "reference_files", str(profile.id))
     os.makedirs(storage_dir, exist_ok=True)
     
-    file_ext = os.path.splitext(file.filename)[1]
+    original_filename = file.filename or "reference"
+    file_ext = os.path.splitext(original_filename)[1]
     file_id = str(uuid.uuid4())[:8]
     saved_filename = f"{file_id}{file_ext}"
     file_path = os.path.join(storage_dir, saved_filename)
-    
-    content = await file.read()
-    with open(file_path, "wb") as f:
-        f.write(content)
+
+    file_size = 0
+    max_file_size = max(1, int(settings.upload_max_size_mb or 100)) * 1024 * 1024
+    try:
+        with open(file_path, "wb") as f:
+            while True:
+                chunk = await file.read(REFERENCE_UPLOAD_COPY_CHUNK_SIZE)
+                if not chunk:
+                    break
+                file_size += len(chunk)
+                if file_size > max_file_size:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"文件 {original_filename} 超过大小限制（{settings.upload_max_size_mb} MB）。",
+                    )
+                f.write(chunk)
+    except Exception:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise
+    if file_size <= 0:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise HTTPException(status_code=400, detail="上传的参考文件为空。")
     
     ref_file = ReferenceFile(
         profile_id=profile.id,
-        filename=file.filename,
+        filename=original_filename,
         file_path=file_path,
-        file_size=len(content),
+        file_size=file_size,
         is_bilingual_source=is_bilingual_source,
         is_bilingual_target=is_bilingual_target,
         bilingual_pair_id=uuid.UUID(bilingual_pair_id) if bilingual_pair_id else None,
@@ -143,8 +165,8 @@ async def upload_reference_file(
     
     return {
         "file_id": str(ref_file.id),
-        "filename": file.filename,
-        "file_size": len(content),
+        "filename": original_filename,
+        "file_size": file_size,
         "profile_id": str(profile.id),
     }
 

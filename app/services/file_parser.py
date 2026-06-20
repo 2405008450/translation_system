@@ -17,6 +17,10 @@ from app.services.libreoffice_service import (
     build_converted_docx_filename,
     convert_word_to_docx,
 )
+from app.services.task_file_service import get_max_upload_size_bytes
+
+
+UPLOAD_READ_CHUNK_SIZE = 1024 * 1024
 
 
 # 支持的文件扩展名
@@ -31,6 +35,23 @@ SUPPORTED_EXTENSIONS = {
     # V6 新增格式
     ".idml", ".mif", ".rar",
 }
+
+
+async def _read_upload_bytes_with_limit(upload_file: UploadFile) -> bytes:
+    filename = upload_file.filename or "uploaded"
+    max_bytes = get_max_upload_size_bytes(filename)
+    chunks: list[bytes] = []
+    total_size = 0
+    while True:
+        chunk = await upload_file.read(UPLOAD_READ_CHUNK_SIZE)
+        if not chunk:
+            break
+        total_size += len(chunk)
+        if total_size > max_bytes:
+            max_mb = round(max_bytes / (1024 * 1024), 2)
+            raise ValueError(f"文件 {filename} 超过大小限制（{max_mb} MB）。")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 async def parse_uploaded_file(upload_file: UploadFile) -> str:
@@ -52,7 +73,7 @@ async def parse_uploaded_file(upload_file: UploadFile) -> str:
         supported_list = ", ".join(sorted(SUPPORTED_EXTENSIONS))
         raise ValueError(f"不支持的文件格式 '{extension}'。支持的格式: {supported_list}")
 
-    raw_bytes = await upload_file.read()
+    raw_bytes = await _read_upload_bytes_with_limit(upload_file)
     if not raw_bytes:
         return ""
     if extension == ".doc":

@@ -16,6 +16,7 @@ from app.services.normalizer import normalize_match_text, normalize_text
 
 XLSX_EXTENSIONS = {".xlsx"}
 GLOSSARY_STATUS_LOOKUP_CHUNK_SIZE = 10000
+GLOSSARY_PREVIEW_MAX_SCAN_ROWS = 1000
 SOURCE_HEADER_ALIASES = {"source", "source_text", "source_term", "term", "原文", "词汇", "词条", "术语"}
 TARGET_HEADER_ALIASES = {"target", "target_text", "target_term", "translation", "译文", "翻译"}
 NOTE_HEADER_ALIASES = {"note", "notes", "comment", "comments", "context", "remark", "remarks", "备注", "说明", "补充解释"}
@@ -56,6 +57,8 @@ class GlossaryImportPreview:
     skipped_empty_rows: int
     skipped_header_rows: int
     preview_limit: int
+    scanned_rows: int = 0
+    truncated: bool = False
 
 
 def import_glossary_from_xlsx_upload(
@@ -94,6 +97,7 @@ def preview_glossary_from_xlsx_upload(
     glossary_base_id: UUID | None,
     preview_limit: int = 100,
     skip_header: bool = False,
+    max_scan_rows: int = GLOSSARY_PREVIEW_MAX_SCAN_ROWS,
 ) -> GlossaryImportPreview:
     workbook = load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)
     return _preview_workbook(
@@ -105,6 +109,33 @@ def preview_glossary_from_xlsx_upload(
         target_language=target_language,
         preview_limit=preview_limit,
         skip_header=skip_header,
+        max_scan_rows=max_scan_rows,
+    )
+
+
+def preview_glossary_from_xlsx_path(
+    db: Session,
+    xlsx_path: str | Path,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    *,
+    glossary_base_id: UUID | None,
+    preview_limit: int = 100,
+    skip_header: bool = False,
+    max_scan_rows: int = GLOSSARY_PREVIEW_MAX_SCAN_ROWS,
+) -> GlossaryImportPreview:
+    workbook = load_workbook(Path(xlsx_path), read_only=True, data_only=True)
+    return _preview_workbook(
+        db=db,
+        workbook=workbook,
+        filename=filename,
+        glossary_base_id=glossary_base_id,
+        source_language=source_language,
+        target_language=target_language,
+        preview_limit=preview_limit,
+        skip_header=skip_header,
+        max_scan_rows=max_scan_rows,
     )
 
 
@@ -114,6 +145,7 @@ def import_glossary_from_xlsx_path(
     source_language: str,
     target_language: str,
     *,
+    filename: str | None = None,
     glossary_base_id: UUID,
     creator_id: UUID | None = None,
     batch_size: int = 5000,
@@ -123,7 +155,7 @@ def import_glossary_from_xlsx_path(
     return _import_workbook(
         db=db,
         workbook=workbook,
-        filename=Path(xlsx_path).name,
+        filename=filename or Path(xlsx_path).name,
         batch_size=batch_size,
         glossary_base_id=glossary_base_id,
         source_language=source_language,
@@ -142,6 +174,7 @@ def _preview_workbook(
     target_language: str,
     preview_limit: int = 100,
     skip_header: bool = False,
+    max_scan_rows: int = GLOSSARY_PREVIEW_MAX_SCAN_ROWS,
 ) -> GlossaryImportPreview:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
@@ -157,9 +190,14 @@ def _preview_workbook(
     total_rows = 0
     duplicate_rows = 0
     column_indexes = (0, 1, 2)
+    safe_max_scan_rows = max(1, int(max_scan_rows or GLOSSARY_PREVIEW_MAX_SCAN_ROWS))
+    truncated = False
 
     try:
         for row_index, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+            if row_index > safe_max_scan_rows:
+                truncated = True
+                break
             total_rows += 1
 
             if row_index == 1:
@@ -289,6 +327,8 @@ def _preview_workbook(
         skipped_empty_rows=skipped_empty_rows,
         skipped_header_rows=skipped_header_rows,
         preview_limit=preview_limit,
+        scanned_rows=total_rows,
+        truncated=truncated,
     )
 
 

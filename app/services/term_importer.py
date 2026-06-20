@@ -373,11 +373,161 @@ def preview_terms_from_upload(
     )
 
 
+def preview_terms_from_xlsx_path(
+    db: Session,
+    xlsx_path: str | Path,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    term_base_id: UUID | None,
+    preview_limit: int = 100,
+    skip_header: bool = False,
+    max_scan_rows: int = TERM_PREVIEW_MAX_SCAN_ROWS,
+) -> TermImportPreview:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    workbook = load_workbook(Path(xlsx_path), read_only=True, data_only=True)
+    try:
+        return _preview_terms_from_rows(
+            db=db,
+            rows=workbook.active.iter_rows(values_only=True),
+            filename=filename,
+            term_base_id=term_base_id,
+            source_language=normalized_source_language,
+            target_language=normalized_target_language,
+            preview_limit=preview_limit,
+            skip_header=skip_header,
+            max_scan_rows=max_scan_rows,
+        )
+    finally:
+        workbook.close()
+
+
+def _preview_terms_from_rows(
+    db: Session,
+    rows,
+    filename: str,
+    term_base_id: UUID | None,
+    source_language: str,
+    target_language: str,
+    preview_limit: int = 100,
+    skip_header: bool = False,
+    max_scan_rows: int = TERM_PREVIEW_MAX_SCAN_ROWS,
+) -> TermImportPreview:
+    preview_rows: list[TermImportPreviewRow] = []
+    source_normalized_values: set[str] = set()
+    source_texts: set[str] = set()
+    final_candidates: dict[str, dict] = {}
+    skipped_empty_rows = 0
+    skipped_header_rows = 0
+    total_rows = 0
+    duplicate_rows = 0
+    safe_max_scan_rows = max(1, int(max_scan_rows or TERM_PREVIEW_MAX_SCAN_ROWS))
+    truncated = False
+
+    for row_index, row in enumerate(rows, start=1):
+        if row_index > safe_max_scan_rows:
+            truncated = True
+            break
+        total_rows += 1
+        source_text = normalize_text(_cell_to_text(row, 0))
+        target_text = normalize_text(_cell_to_text(row, 1))
+
+        if _should_skip_header_row(filename, row_index, source_text, target_text, skip_header):
+            skipped_header_rows += 1
+            _append_preview_row(
+                preview_rows,
+                preview_limit,
+                TermImportPreviewRow(row_index, source_text, target_text, "header", "表头行，导入时会跳过。"),
+            )
+            continue
+
+        if not source_text or not target_text:
+            skipped_empty_rows += 1
+            _append_preview_row(
+                preview_rows,
+                preview_limit,
+                TermImportPreviewRow(row_index, source_text, target_text, "empty", "源术语或目标术语为空，导入时会跳过。"),
+            )
+            continue
+
+        term_row = _build_term_row(
+            source_text=source_text,
+            target_text=target_text,
+            term_base_id=term_base_id,
+            source_language=source_language,
+            target_language=target_language,
+        )
+        source_normalized = term_row["source_normalized"]
+        status = "pending"
+        message = "待导入。"
+        if source_normalized in source_normalized_values or source_text in source_texts:
+            duplicate_rows += 1
+            status = "duplicate"
+            message = "文件内重复，实际导入时以后出现的这一条为准。"
+        source_normalized_values.add(source_normalized)
+        source_texts.add(source_text)
+        final_candidates[source_normalized] = term_row
+        _append_preview_row(
+            preview_rows,
+            preview_limit,
+            TermImportPreviewRow(row_index, source_text, target_text, status, message),
+        )
+
+    existing_status = _load_existing_term_status(
+        db=db,
+        term_base_id=term_base_id,
+        source_language=source_language,
+        target_language=target_language,
+        source_normalized_values=list(source_normalized_values),
+        source_texts=list(source_texts),
+    )
+
+    create_rows = 0
+    update_rows = 0
+    for candidate in final_candidates.values():
+        key = candidate["source_normalized"]
+        source_text = candidate["source_text"]
+        if key in existing_status or source_text in existing_status:
+            update_rows += 1
+        else:
+            create_rows += 1
+
+    for preview_row in preview_rows:
+        if preview_row.status != "pending":
+            continue
+        normalized = normalize_match_text(preview_row.source_text) or normalize_text(preview_row.source_text)
+        if normalized in existing_status or preview_row.source_text in existing_status:
+            preview_row.status = "update"
+            preview_row.message = "术语库中已有相同源术语，导入时会覆盖目标术语。"
+        else:
+            preview_row.status = "create"
+            preview_row.message = "导入时会新增。"
+
+    return TermImportPreview(
+        filename=filename,
+        rows=preview_rows,
+        total_rows=total_rows,
+        valid_rows=len(final_candidates),
+        create_rows=create_rows,
+        update_rows=update_rows,
+        duplicate_rows=duplicate_rows,
+        skipped_empty_rows=skipped_empty_rows,
+        skipped_header_rows=skipped_header_rows,
+        preview_limit=preview_limit,
+        scanned_rows=total_rows,
+        truncated=truncated,
+    )
+
+
 def import_terms_from_xlsx_path(
     db: Session,
     xlsx_path: str | Path,
     source_language: str,
     target_language: str,
+    filename: str | None = None,
     batch_size: int = 5000,
     term_base_id: UUID | None = None,
     creator_id: UUID | None = None,
@@ -388,7 +538,7 @@ def import_terms_from_xlsx_path(
     return _import_workbook(
         db=db,
         workbook=workbook,
-        filename=Path(xlsx_path).name,
+        filename=filename or Path(xlsx_path).name,
         batch_size=batch_size,
         term_base_id=term_base_id,
         creator_id=creator_id,

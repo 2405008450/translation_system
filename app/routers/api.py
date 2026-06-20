@@ -137,6 +137,7 @@ from app.services.import_task_storage import (
     read_import_file_bytes,
     stage_import_file_payload,
     stage_import_file_payloads,
+    stage_import_file_streams,
 )
 from app.services.file_record_service import (
     SegmentUpdateConflict,
@@ -251,6 +252,7 @@ from app.services.project_segment_sync import (
 )
 from app.services.term_importer import (
     TERM_IMPORT_EXTENSIONS,
+    import_terms_from_xlsx_path,
     import_terms_from_xlsx_upload,
 )
 from app.services.revision_service import (
@@ -284,6 +286,7 @@ from app.services.task_file_service import (
     can_export_task_file,
     export_bilingual_task_docx_with_layout,
     export_translated_task_file,
+    get_max_upload_size_bytes,
     get_upload_capabilities,
     get_supported_task_extensions,
     get_task_file_extension,
@@ -291,17 +294,19 @@ from app.services.task_file_service import (
     normalize_document_parse_mode,
     supports_task_file,
     validate_expanded_upload_batch,
-    validate_upload_batch,
 )
 from app.services.document_workspace import build_docx_target_numbering_text_map
 from app.services.tm_importer import (
     SDLTM_EXTENSIONS,
     TM_IMPORT_EXTENSIONS,
     XLSX_EXTENSIONS,
-    import_tm_from_sdltm_upload,
+    import_tm_from_sdltm_path,
+    import_tm_from_xlsx_path,
     import_tm_from_upload,
+    preview_tm_from_sdltm_path,
+    preview_tm_from_xlsx_path,
     preview_tm_from_upload,
-    preview_sdltm_metadata,
+    preview_sdltm_metadata_from_path,
 )
 from app.services.tm_vector import sync_tm_embeddings
 from app.services.translation_memory_service import TMUpsertEntry, batch_upsert_tm_entries
@@ -317,6 +322,7 @@ except ModuleNotFoundError:  # pragma: no cover - 本地未安装 ARQ 时使用 
 
 logger = logging.getLogger(__name__)
 router = APIRouter(dependencies=[Depends(get_current_user)])
+UPLOAD_READ_CHUNK_SIZE = 1024 * 1024
 
 
 def _build_task_workspace_with_new_session(
@@ -526,11 +532,21 @@ async def _queue_import_task(
     *,
     staging_files: list[tuple[str, bytes]] | None = None,
     staging_file: tuple[str, bytes] | None = None,
+    staging_upload_files: list[tuple[str, Any]] | None = None,
 ) -> JSONResponse:
     cleanup_expired_import_staging()
     task_id = str(uuid4())
     try:
-        if staging_files is not None:
+        if staging_upload_files is not None:
+            payload = {
+                **payload,
+                "files": await asyncio.to_thread(
+                    stage_import_file_streams,
+                    task_id,
+                    staging_upload_files,
+                ),
+            }
+        elif staging_files is not None:
             payload = {
                 **payload,
                 "files": stage_import_file_payloads(task_id, staging_files),
@@ -556,6 +572,9 @@ async def _queue_import_task(
                 "message": "任务已进入导入队列。",
             },
         )
+    except UploadLimitError as exc:
+        cleanup_import_task_staging(task_id)
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     except Exception:
         cleanup_import_task_staging(task_id)
         raise
@@ -3783,7 +3802,7 @@ def list_translation_guideline_templates():
 @router.post("/guideline-templates/import")
 async def import_translation_guideline_template(file: UploadFile = File(...)):
     """导入 .md/.txt 翻译细则，并统一保存为仓库内 UTF-8 Markdown。"""
-    raw_bytes = await file.read()
+    raw_bytes = await _read_upload_bytes_with_limit(file)
     try:
         template = save_guideline_template(file.filename or "", raw_bytes)
     except ValueError as exc:
@@ -3891,6 +3910,50 @@ def _validate_task_upload(file: UploadFile) -> None:
 
 def _raise_upload_limit_error(exc: UploadLimitError) -> None:
     raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+def _raise_upload_file_too_large(filename: str, max_bytes: int) -> None:
+    max_mb = round(max_bytes / (1024 * 1024), 2)
+    raise HTTPException(
+        status_code=413,
+        detail=f"文件 {filename or 'uploaded'} 超过大小限制（{max_mb} MB）。",
+    )
+
+
+def _read_upload_file_bytes_with_limit(file: UploadFile) -> bytes:
+    filename = file.filename or "uploaded"
+    max_bytes = get_max_upload_size_bytes(filename)
+    chunks: list[bytes] = []
+    total_size = 0
+    try:
+        file.file.seek(0)
+    except (AttributeError, OSError):
+        pass
+    while True:
+        chunk = file.file.read(UPLOAD_READ_CHUNK_SIZE)
+        if not chunk:
+            break
+        total_size += len(chunk)
+        if total_size > max_bytes:
+            _raise_upload_file_too_large(filename, max_bytes)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _read_upload_bytes_with_limit(file: UploadFile) -> bytes:
+    filename = file.filename or "uploaded"
+    max_bytes = get_max_upload_size_bytes(filename)
+    chunks: list[bytes] = []
+    total_size = 0
+    while True:
+        chunk = await file.read(UPLOAD_READ_CHUNK_SIZE)
+        if not chunk:
+            break
+        total_size += len(chunk)
+        if total_size > max_bytes:
+            _raise_upload_file_too_large(filename, max_bytes)
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _normalize_upload_document_parse_mode(document_parse_mode: str | None) -> str:
@@ -4203,7 +4266,7 @@ def upload_for_slate(
     """
     _validate_docx_upload(file)
 
-    raw_bytes = file.file.read()
+    raw_bytes = _read_upload_file_bytes_with_limit(file)
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="文件为空。")
 
@@ -4230,7 +4293,7 @@ async def upload_for_workspace(
 ):
     _validate_task_upload(file)
 
-    raw_bytes = await file.read()
+    raw_bytes = await _read_upload_bytes_with_limit(file)
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="文件为空。")
 
@@ -4261,7 +4324,7 @@ def parse_document(
     """
     ext = _validate_file_upload(file)
 
-    raw_bytes = file.file.read()
+    raw_bytes = _read_upload_file_bytes_with_limit(file)
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="文件为空。")
 
@@ -4553,7 +4616,7 @@ async def import_xliff(file: UploadFile = File(...)):
     """导入 XLIFF 文件"""
     if not file.filename or not file.filename.lower().endswith((".xlf", ".xliff")):
         raise HTTPException(status_code=400, detail="请上传 XLIFF 文件 (.xlf 或 .xliff)")
-    raw_bytes = await file.read()
+    raw_bytes = await _read_upload_bytes_with_limit(file)
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="文件为空")
     try:
@@ -4585,15 +4648,6 @@ async def create_file_record(
     _validate_task_upload(file)
     document_parse_mode = _normalize_upload_document_parse_mode(document_parse_mode)
     normalized_parse_options = _normalize_upload_document_parse_options(document_parse_options, document_parse_mode)
-
-    raw_bytes = await file.read()
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail="文件为空。")
-
-    try:
-        validate_upload_batch([(file.filename or "untitled.txt", raw_bytes)])
-    except UploadLimitError as exc:
-        _raise_upload_limit_error(exc)
 
     selected_collection_ids = _validate_collection_ids(db, collection_ids) or []
     primary_collection = _get_collection_or_404(
@@ -4633,7 +4687,7 @@ async def create_file_record(
     return await _queue_import_task(
         background_tasks,
         payload,
-        staging_file=(file.filename or "untitled.txt", raw_bytes),
+        staging_upload_files=[(file.filename or "untitled.txt", file.file)],
     )
 
 
@@ -6824,7 +6878,7 @@ def detect_project_source_language(
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在。")
 
-    raw_bytes = file.file.read()
+    raw_bytes = _read_upload_file_bytes_with_limit(file)
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="文件为空，无法识别语言。")
 
@@ -6886,18 +6940,6 @@ async def upload_project_source_document(
             "术语库",
         )
 
-    file_entries: list[tuple[str, bytes]] = []
-    for upload_file in uploaded_files:
-        raw_bytes = await upload_file.read()
-        if not raw_bytes:
-            raise HTTPException(status_code=400, detail=f"{upload_file.filename or '文件'} 为空。")
-        file_entries.append((upload_file.filename or "source.txt", raw_bytes))
-
-    try:
-        validate_upload_batch(file_entries)
-    except UploadLimitError as exc:
-        _raise_upload_limit_error(exc)
-
     payload = {
         "kind": "project_source_document",
         "project_id": str(project.id),
@@ -6909,7 +6951,14 @@ async def upload_project_source_document(
         "document_parse_mode": document_parse_mode,
         "document_parse_options": normalized_parse_options,
     }
-    return await _queue_import_task(background_tasks, payload, staging_files=file_entries)
+    return await _queue_import_task(
+        background_tasks,
+        payload,
+        staging_upload_files=[
+            (upload_file.filename or "source.txt", upload_file.file)
+            for upload_file in uploaded_files
+        ],
+    )
 
 
 @router.get("/projects")
@@ -11763,12 +11812,9 @@ async def preview_sdltm(
     if extension not in SDLTM_EXTENSIONS:
         raise HTTPException(status_code=400, detail="仅支持 .sdltm 文件。")
 
-    raw_bytes = await file.read()
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail="上传的文件为空。")
-
+    task_id, staged_file = await asyncio.to_thread(_stage_resource_upload_file, file)
     try:
-        metadata = preview_sdltm_metadata(raw_bytes)
+        metadata = preview_sdltm_metadata_from_path(staged_file["path"])
         return {
             "name": metadata.name,
             "source_language": metadata.source_language,
@@ -11777,6 +11823,8 @@ async def preview_sdltm(
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"读取 SDLTM 元数据失败：{exc}") from exc
+    finally:
+        cleanup_import_task_staging(task_id)
 
 
 def _validate_tm_import_upload(file: UploadFile, raw_bytes: bytes | None = None) -> str:
@@ -11786,6 +11834,39 @@ def _validate_tm_import_upload(file: UploadFile, raw_bytes: bytes | None = None)
     if raw_bytes is not None and not raw_bytes:
         raise HTTPException(status_code=400, detail="上传的文件为空。")
     return extension
+
+
+def _resource_import_preview_max_scan_rows() -> int:
+    value = int(get_settings().resource_import_preview_max_scan_rows or 1000)
+    return max(1, min(value, 10000))
+
+
+def _resource_import_batch_size() -> int:
+    value = int(get_settings().resource_import_batch_size or 1000)
+    return max(1, min(value, 5000))
+
+
+def _resource_import_max_file_bytes(_: str) -> int:
+    return max(1, int(get_settings().upload_max_size_mb or 100)) * 1024 * 1024
+
+
+def _stage_resource_upload_file(file: UploadFile) -> tuple[str, dict[str, Any]]:
+    task_id = str(uuid4())
+    try:
+        staged = stage_import_file_streams(
+            task_id,
+            [(file.filename or "uploaded", file.file)],
+            max_files=1,
+            max_size_resolver=_resource_import_max_file_bytes,
+            max_total_bytes=_resource_import_max_file_bytes(file.filename or "uploaded"),
+        )[0]
+        return task_id, staged
+    except UploadLimitError as exc:
+        cleanup_import_task_staging(task_id)
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except Exception:
+        cleanup_import_task_staging(task_id)
+        raise
 
 
 def _normalize_duplicate_policy(value: str | None) -> Literal["overwrite", "keep"]:
@@ -11828,9 +11909,8 @@ async def preview_tm_xlsx(
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
-    _validate_tm_import_upload(file)
-    raw_bytes = await file.read()
-    _validate_tm_import_upload(file, raw_bytes)
+    extension = _validate_tm_import_upload(file)
+    task_id, staged_file = await asyncio.to_thread(_stage_resource_upload_file, file)
 
     collection = _get_collection_or_404(db, collection_id)
     resolved_source_language, resolved_target_language = _resolve_collection_language_pair(
@@ -11841,19 +11921,49 @@ async def preview_tm_xlsx(
     normalized_duplicate_policy = _normalize_duplicate_policy(duplicate_policy)
 
     try:
-        preview = preview_tm_from_upload(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=file.filename or "uploaded.xlsx",
-            collection_id=collection_id,
-            source_language=resolved_source_language,
-            target_language=resolved_target_language,
-            duplicate_policy=normalized_duplicate_policy,
-            preview_limit=max(1, min(preview_limit, 500)),
-            skip_header=skip_header,
-        )
+        if extension in SDLTM_EXTENSIONS:
+            preview = preview_tm_from_sdltm_path(
+                db=db,
+                sdltm_path=staged_file["path"],
+                filename=file.filename or "uploaded.sdltm",
+                collection_id=collection_id,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                duplicate_policy=normalized_duplicate_policy,
+                preview_limit=max(1, min(preview_limit, 500)),
+                skip_header=skip_header,
+                max_scan_rows=_resource_import_preview_max_scan_rows(),
+            )
+        elif extension in XLSX_EXTENSIONS:
+            preview = preview_tm_from_xlsx_path(
+                db=db,
+                xlsx_path=staged_file["path"],
+                filename=file.filename or "uploaded.xlsx",
+                collection_id=collection_id,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                duplicate_policy=normalized_duplicate_policy,
+                preview_limit=max(1, min(preview_limit, 500)),
+                skip_header=skip_header,
+                max_scan_rows=_resource_import_preview_max_scan_rows(),
+            )
+        else:
+            preview = preview_tm_from_upload(
+                db=db,
+                raw_bytes=read_import_file_bytes(staged_file),
+                filename=file.filename or "uploaded.xlsx",
+                collection_id=collection_id,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                duplicate_policy=normalized_duplicate_policy,
+                preview_limit=max(1, min(preview_limit, 500)),
+                skip_header=skip_header,
+                max_scan_rows=_resource_import_preview_max_scan_rows(),
+            )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"TM 预览失败：{exc}") from exc
+    finally:
+        cleanup_import_task_staging(task_id)
 
     return {
         "filename": preview.filename,
@@ -11877,6 +11987,9 @@ async def preview_tm_xlsx(
         "skipped_header_rows": preview.skipped_header_rows,
         "preview_limit": preview.preview_limit,
         "duplicate_policy": preview.duplicate_policy,
+        "scanned_rows": preview.scanned_rows,
+        "truncated": preview.truncated,
+        "max_scan_rows": _resource_import_preview_max_scan_rows(),
         "collection_id": str(collection.id) if collection else None,
         "collection_name": collection.name if collection else "",
         "source_language": resolved_source_language,
@@ -11901,9 +12014,7 @@ def import_tm_xlsx(
 ):
     # 定义为同步 def，由 FastAPI 调度到线程池执行，避免大文件导入的解析/写库阻塞事件循环。
     extension = _validate_tm_import_upload(file)
-
-    raw_bytes = file.file.read()
-    _validate_tm_import_upload(file, raw_bytes)
+    task_id, staged_file = _stage_resource_upload_file(file)
 
     collection = _get_collection_or_404(db, collection_id)
     resolved_source_language, resolved_target_language = _resolve_collection_language_pair(
@@ -11915,9 +12026,9 @@ def import_tm_xlsx(
     skipped_row_indexes = _parse_import_row_indexes(skip_duplicate_row_indexes)
     try:
         if extension in SDLTM_EXTENSIONS:
-            import_summary = import_tm_from_sdltm_upload(
+            import_summary = import_tm_from_sdltm_path(
                 db=db,
-                raw_bytes=raw_bytes,
+                sdltm_path=staged_file["path"],
                 filename=file.filename or "uploaded.sdltm",
                 collection_id=collection_id,
                 source_language=resolved_source_language,
@@ -11925,11 +12036,12 @@ def import_tm_xlsx(
                 creator_id=current_user.id,
                 duplicate_policy=normalized_duplicate_policy,
                 skip_duplicate_row_indexes=skipped_row_indexes,
+                batch_size=_resource_import_batch_size(),
             )
-        else:
-            import_summary = import_tm_from_upload(
+        elif extension in XLSX_EXTENSIONS:
+            import_summary = import_tm_from_xlsx_path(
                 db=db,
-                raw_bytes=raw_bytes,
+                xlsx_path=staged_file["path"],
                 filename=file.filename or "uploaded.xlsx",
                 collection_id=collection_id,
                 source_language=resolved_source_language,
@@ -11938,10 +12050,27 @@ def import_tm_xlsx(
                 duplicate_policy=normalized_duplicate_policy,
                 skip_duplicate_row_indexes=skipped_row_indexes,
                 skip_header=skip_header,
+                batch_size=_resource_import_batch_size(),
+            )
+        else:
+            import_summary = import_tm_from_upload(
+                db=db,
+                raw_bytes=read_import_file_bytes(staged_file),
+                filename=file.filename or "uploaded.xlsx",
+                collection_id=collection_id,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                creator_id=current_user.id,
+                duplicate_policy=normalized_duplicate_policy,
+                skip_duplicate_row_indexes=skipped_row_indexes,
+                skip_header=skip_header,
+                batch_size=_resource_import_batch_size(),
             )
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"TM 导入失败：{exc}") from exc
+    finally:
+        cleanup_import_task_staging(task_id)
 
     refreshed_count = 0
     if collection is not None and import_summary.imported_rows > 0:
@@ -12577,24 +12706,36 @@ def import_termbase_xlsx(
     if extension not in TERM_IMPORT_EXTENSIONS:
         raise HTTPException(status_code=400, detail="仅支持上传 .tmx、.xls、.xlsx 或 .csv 文件。")
 
-    raw_bytes = file.file.read()
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail="上传的术语文件为空。")
+    task_id, staged_file = _stage_resource_upload_file(file)
 
     collection = _get_termbase_collection_or_404(db, collection_id)
 
     try:
-        import_summary = import_terms_from_xlsx_upload(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=file.filename or "uploaded.xlsx",
-            term_base_id=collection_id,
-            source_language=collection.source_language if collection else "zh",
-            target_language=collection.target_language if collection else "en",
-        )
+        if extension == ".xlsx":
+            import_summary = import_terms_from_xlsx_path(
+                db=db,
+                xlsx_path=staged_file["path"],
+                filename=file.filename or "uploaded.xlsx",
+                term_base_id=collection_id,
+                source_language=collection.source_language if collection else "zh",
+                target_language=collection.target_language if collection else "en",
+                batch_size=_resource_import_batch_size(),
+            )
+        else:
+            import_summary = import_terms_from_xlsx_upload(
+                db=db,
+                raw_bytes=read_import_file_bytes(staged_file),
+                filename=file.filename or "uploaded.xlsx",
+                term_base_id=collection_id,
+                source_language=collection.source_language if collection else "zh",
+                target_language=collection.target_language if collection else "en",
+                batch_size=_resource_import_batch_size(),
+            )
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"术语库导入失败：{exc}") from exc
+    finally:
+        cleanup_import_task_staging(task_id)
 
     if collection is not None:
         notification_title, notification_body = build_resource_import_notification(

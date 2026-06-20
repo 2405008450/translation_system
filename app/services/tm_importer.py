@@ -29,6 +29,7 @@ SDLTM_EXTENSIONS = {".sdltm"}
 WORKBOOK_EXTENSIONS = XLSX_EXTENSIONS | XLS_EXTENSIONS
 TM_IMPORT_EXTENSIONS = CSV_EXTENSIONS | TMX_EXTENSIONS | WORKBOOK_EXTENSIONS | SDLTM_EXTENSIONS
 TM_STATUS_LOOKUP_CHUNK_SIZE = 10000
+TM_PREVIEW_MAX_SCAN_ROWS = 1000
 HEADER_ALIASES = {
     ("zh-cn", "en-us"),
     ("source", "target"),
@@ -76,6 +77,8 @@ class TMImportPreview:
     skipped_header_rows: int
     preview_limit: int
     duplicate_policy: str
+    scanned_rows: int = 0
+    truncated: bool = False
 
 
 DuplicatePolicy = Literal["overwrite", "keep"]
@@ -97,7 +100,16 @@ def preview_sdltm_metadata(raw_bytes: bytes) -> SDLTMMetadata:
         tmp_path = tmp.name
 
     try:
-        conn = sqlite3.connect(tmp_path)
+        return preview_sdltm_metadata_from_path(tmp_path)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def preview_sdltm_metadata_from_path(sdltm_path: str | Path) -> SDLTMMetadata:
+    """Extract metadata from an SDLTM file path without importing."""
+    conn = None
+    try:
+        conn = sqlite3.connect(str(sdltm_path))
         cursor = conn.cursor()
 
         # Get TM metadata
@@ -117,8 +129,6 @@ def preview_sdltm_metadata(raw_bytes: bytes) -> SDLTMMetadata:
         cursor.execute("SELECT COUNT(*) FROM translation_units")
         entry_count = cursor.fetchone()[0]
 
-        conn.close()
-
         return SDLTMMetadata(
             name=name or "",
             source_language=source_lang or "",
@@ -126,7 +136,8 @@ def preview_sdltm_metadata(raw_bytes: bytes) -> SDLTMMetadata:
             entry_count=entry_count,
         )
     finally:
-        Path(tmp_path).unlink(missing_ok=True)
+        if conn is not None:
+            conn.close()
 
 
 def import_tm_from_upload(
@@ -236,6 +247,7 @@ def import_tm_from_xlsx_path(
     xlsx_path: str | Path,
     source_language: str,
     target_language: str,
+    filename: str | None = None,
     batch_size: int = 5000,
     collection_id: UUID | None = None,
     creator_id: UUID | None = None,
@@ -247,7 +259,7 @@ def import_tm_from_xlsx_path(
     return _import_workbook(
         db=db,
         workbook=workbook,
-        filename=Path(xlsx_path).name,
+        filename=filename or Path(xlsx_path).name,
         batch_size=batch_size,
         collection_id=collection_id,
         creator_id=creator_id,
@@ -329,6 +341,7 @@ def preview_tm_from_upload(
     duplicate_policy: DuplicatePolicy = "overwrite",
     preview_limit: int = 100,
     skip_header: bool = False,
+    max_scan_rows: int = TM_PREVIEW_MAX_SCAN_ROWS,
 ) -> TMImportPreview:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
@@ -348,8 +361,13 @@ def preview_tm_from_upload(
     skipped_header_rows = 0
     total_rows = 0
     duplicate_rows = 0
+    safe_max_scan_rows = max(1, int(max_scan_rows or TM_PREVIEW_MAX_SCAN_ROWS))
+    truncated = False
 
     for row_index, row in enumerate(rows, start=1):
+        if row_index > safe_max_scan_rows:
+            truncated = True
+            break
         total_rows += 1
         source_text = normalize_text(_cell_to_text(row, 0))
         target_text = normalize_text(_cell_to_text(row, 1))
@@ -452,6 +470,210 @@ def preview_tm_from_upload(
         skipped_header_rows=skipped_header_rows,
         preview_limit=preview_limit,
         duplicate_policy=duplicate_policy,
+        scanned_rows=total_rows,
+        truncated=truncated,
+    )
+
+
+def preview_tm_from_xlsx_path(
+    db: Session,
+    xlsx_path: str | Path,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    collection_id: UUID | None,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+    preview_limit: int = 100,
+    skip_header: bool = False,
+    max_scan_rows: int = TM_PREVIEW_MAX_SCAN_ROWS,
+) -> TMImportPreview:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    workbook = load_workbook(Path(xlsx_path), read_only=True, data_only=True)
+    try:
+        return _preview_tm_from_rows(
+            db=db,
+            rows=workbook.active.iter_rows(values_only=True),
+            filename=filename,
+            collection_id=collection_id,
+            source_language=normalized_source_language,
+            target_language=normalized_target_language,
+            duplicate_policy=duplicate_policy,
+            preview_limit=preview_limit,
+            skip_header=skip_header,
+            max_scan_rows=max_scan_rows,
+        )
+    finally:
+        workbook.close()
+
+
+def preview_tm_from_sdltm_path(
+    db: Session,
+    sdltm_path: str | Path,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    collection_id: UUID | None,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+    preview_limit: int = 100,
+    skip_header: bool = False,
+    max_scan_rows: int = TM_PREVIEW_MAX_SCAN_ROWS,
+) -> TMImportPreview:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    return _preview_tm_from_rows(
+        db=db,
+        rows=_iter_sdltm_path_rows(sdltm_path),
+        filename=filename,
+        collection_id=collection_id,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
+        duplicate_policy=duplicate_policy,
+        preview_limit=preview_limit,
+        skip_header=skip_header,
+        max_scan_rows=max_scan_rows,
+    )
+
+
+def _preview_tm_from_rows(
+    db: Session,
+    rows,
+    filename: str,
+    collection_id: UUID | None,
+    source_language: str,
+    target_language: str,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+    preview_limit: int = 100,
+    skip_header: bool = False,
+    max_scan_rows: int = TM_PREVIEW_MAX_SCAN_ROWS,
+) -> TMImportPreview:
+    preview_rows: list[TMImportPreviewRow] = []
+    source_hashes: set[str] = set()
+    source_texts: set[str] = set()
+    final_candidates: dict[str, dict] = {}
+    skipped_empty_rows = 0
+    skipped_header_rows = 0
+    total_rows = 0
+    duplicate_rows = 0
+    safe_max_scan_rows = max(1, int(max_scan_rows or TM_PREVIEW_MAX_SCAN_ROWS))
+    truncated = False
+
+    for row_index, row in enumerate(rows, start=1):
+        if row_index > safe_max_scan_rows:
+            truncated = True
+            break
+        total_rows += 1
+        source_text = normalize_text(_cell_to_text(row, 0))
+        target_text = normalize_text(_cell_to_text(row, 1))
+
+        if _should_skip_header_row(filename, row_index, source_text, target_text, skip_header):
+            skipped_header_rows += 1
+            _append_preview_row(
+                preview_rows,
+                preview_limit,
+                TMImportPreviewRow(row_index, source_text, target_text, "header", "表头行，导入时会跳过。"),
+            )
+            continue
+
+        if not source_text or not target_text:
+            skipped_empty_rows += 1
+            _append_preview_row(
+                preview_rows,
+                preview_limit,
+                TMImportPreviewRow(row_index, source_text, target_text, "empty", "源文或译文为空，导入时会跳过。"),
+            )
+            continue
+
+        tm_row = _build_tm_row(
+            source_text=source_text,
+            target_text=target_text,
+            source_language=source_language,
+            target_language=target_language,
+            collection_id=collection_id,
+        )
+        source_hash = tm_row["source_hash"]
+        status = "pending"
+        message = "待导入。"
+        if source_hash in source_hashes or source_text in source_texts:
+            duplicate_rows += 1
+            status = "duplicate"
+            message = (
+                "文件内重复，导入时会保留首次出现的数据。"
+                if duplicate_policy == "keep"
+                else "文件内重复，导入时以后出现的这一条为准。"
+            )
+            if duplicate_policy == "keep":
+                _append_preview_row(
+                    preview_rows,
+                    preview_limit,
+                    TMImportPreviewRow(row_index, source_text, target_text, status, message),
+                )
+                continue
+
+        source_hashes.add(source_hash)
+        source_texts.add(source_text)
+        final_candidates[source_hash] = tm_row
+        _append_preview_row(
+            preview_rows,
+            preview_limit,
+            TMImportPreviewRow(row_index, source_text, target_text, status, message),
+        )
+
+    existing_status = _load_existing_tm_status(
+        db=db,
+        collection_id=collection_id,
+        source_language=source_language,
+        target_language=target_language,
+        source_hashes=list(source_hashes),
+        source_texts=list(source_texts),
+    )
+
+    create_rows = 0
+    update_rows = 0
+    keep_rows = 0
+    for candidate in final_candidates.values():
+        exists = candidate["source_hash"] in existing_status or candidate["source_text"] in existing_status
+        if not exists:
+            create_rows += 1
+        elif duplicate_policy == "keep":
+            keep_rows += 1
+        else:
+            update_rows += 1
+
+    for preview_row in preview_rows:
+        if preview_row.status != "pending":
+            continue
+        source_hash = build_source_hash(preview_row.source_text)
+        exists = source_hash in existing_status or preview_row.source_text in existing_status
+        if not exists:
+            preview_row.status = "create"
+            preview_row.message = "导入时会新增。"
+        elif duplicate_policy == "keep":
+            preview_row.status = "keep"
+            preview_row.message = "记忆库中已有相同源文，导入时会保留旧数据并跳过这一条。"
+        else:
+            preview_row.status = "update"
+            preview_row.message = "记忆库中已有相同源文，导入时会用新译文覆盖。"
+
+    return TMImportPreview(
+        filename=filename,
+        rows=preview_rows,
+        total_rows=total_rows,
+        valid_rows=len(final_candidates),
+        create_rows=create_rows,
+        update_rows=update_rows,
+        keep_rows=keep_rows,
+        duplicate_rows=duplicate_rows,
+        skipped_empty_rows=skipped_empty_rows,
+        skipped_header_rows=skipped_header_rows,
+        preview_limit=preview_limit,
+        duplicate_policy=duplicate_policy,
+        scanned_rows=total_rows,
+        truncated=truncated,
     )
 
 
@@ -589,9 +811,16 @@ def _iter_sdltm_rows(raw_bytes: bytes):
         tmp.write(raw_bytes)
         tmp_path = tmp.name
 
+    try:
+        yield from _iter_sdltm_path_rows(tmp_path)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def _iter_sdltm_path_rows(sdltm_path: str | Path):
     conn = None
     try:
-        conn = sqlite3.connect(tmp_path)
+        conn = sqlite3.connect(str(sdltm_path))
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -600,12 +829,11 @@ def _iter_sdltm_rows(raw_bytes: bytes):
             WHERE source_segment IS NOT NULL AND target_segment IS NOT NULL
             """
         )
-        for raw_source, raw_target in cursor.fetchall():
+        for raw_source, raw_target in cursor:
             yield (_extract_sdltm_text(raw_source), _extract_sdltm_text(raw_target))
     finally:
         if conn is not None:
             conn.close()
-        Path(tmp_path).unlink(missing_ok=True)
 
 
 def _decode_csv_bytes(raw_bytes: bytes) -> str:
@@ -940,6 +1168,7 @@ def import_tm_from_sdltm_path(
     sdltm_path: str | Path,
     source_language: str,
     target_language: str,
+    filename: str | None = None,
     batch_size: int = 5000,
     collection_id: UUID | None = None,
     creator_id: UUID | None = None,
@@ -950,7 +1179,7 @@ def import_tm_from_sdltm_path(
     return _import_sdltm(
         db=db,
         sdltm_path=str(sdltm_path),
-        filename=Path(sdltm_path).name,
+        filename=filename or Path(sdltm_path).name,
         batch_size=batch_size,
         collection_id=collection_id,
         creator_id=creator_id,
@@ -1002,7 +1231,7 @@ def _import_sdltm(
 
         cursor.execute(query)
 
-        for row_index, row in enumerate(cursor.fetchall(), start=1):
+        for row_index, row in enumerate(cursor, start=1):
             _, raw_source, raw_target = row
 
             # Extract text from SDLTM XML format

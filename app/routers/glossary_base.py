@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from uuid import UUID
+from typing import Any
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
@@ -11,12 +13,17 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user, require_admin
+from app.config import get_settings
 from app.database import get_db
 from app.models import FileRecord, GlossaryBase, GlossaryEntry, User
 from app.services.glossary_importer import (
     XLSX_EXTENSIONS,
-    import_glossary_from_xlsx_upload,
-    preview_glossary_from_xlsx_upload,
+    import_glossary_from_xlsx_path,
+    preview_glossary_from_xlsx_path,
+)
+from app.services.import_task_storage import (
+    cleanup_import_task_staging,
+    stage_import_file_streams,
 )
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import normalize_match_text, normalize_text
@@ -31,9 +38,43 @@ from app.services.resource_export_queue import (
     queue_resource_export,
 )
 from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_response
+from app.services.task_file_service import UploadLimitError
 
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
+
+
+def _resource_import_preview_max_scan_rows() -> int:
+    value = int(get_settings().resource_import_preview_max_scan_rows or 1000)
+    return max(1, min(value, 10000))
+
+
+def _resource_import_batch_size() -> int:
+    value = int(get_settings().resource_import_batch_size or 1000)
+    return max(1, min(value, 5000))
+
+
+def _resource_import_max_file_bytes(_: str) -> int:
+    return max(1, int(get_settings().upload_max_size_mb or 100)) * 1024 * 1024
+
+
+def _stage_resource_upload_file(file: UploadFile) -> tuple[str, dict[str, Any]]:
+    task_id = str(uuid4())
+    try:
+        staged = stage_import_file_streams(
+            task_id,
+            [(file.filename or "uploaded.xlsx", file.file)],
+            max_files=1,
+            max_size_resolver=_resource_import_max_file_bytes,
+            max_total_bytes=_resource_import_max_file_bytes(file.filename or "uploaded.xlsx"),
+        )[0]
+        return task_id, staged
+    except UploadLimitError as exc:
+        cleanup_import_task_staging(task_id)
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except Exception:
+        cleanup_import_task_staging(task_id)
+        raise
 
 
 class GlossaryBasePayload(BaseModel):
@@ -293,9 +334,7 @@ async def preview_glossary_base_xlsx(
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
     if extension not in XLSX_EXTENSIONS:
         raise HTTPException(status_code=400, detail="仅支持上传 .xlsx 文件。")
-    raw_bytes = await file.read()
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail="上传的 XLSX 文件为空。")
+    task_id, staged_file = await asyncio.to_thread(_stage_resource_upload_file, file)
 
     glossary_base = _get_glossary_base_or_404(db, glossary_base_id) if glossary_base_id else None
     if glossary_base is not None and glossary_base.source_language and glossary_base.target_language:
@@ -315,18 +354,21 @@ async def preview_glossary_base_xlsx(
         )
 
     try:
-        preview = preview_glossary_from_xlsx_upload(
+        preview = preview_glossary_from_xlsx_path(
             db=db,
-            raw_bytes=raw_bytes,
+            xlsx_path=staged_file["path"],
             filename=file.filename or "uploaded.xlsx",
             glossary_base_id=glossary_base_id,
             source_language=resolved_source_language,
             target_language=resolved_target_language,
             preview_limit=max(1, min(preview_limit, 500)),
             skip_header=skip_header,
+            max_scan_rows=_resource_import_preview_max_scan_rows(),
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"词汇表预览失败：{exc}") from exc
+    finally:
+        cleanup_import_task_staging(task_id)
 
     return {
         "filename": preview.filename,
@@ -349,6 +391,9 @@ async def preview_glossary_base_xlsx(
         "skipped_empty_rows": preview.skipped_empty_rows,
         "skipped_header_rows": preview.skipped_header_rows,
         "preview_limit": preview.preview_limit,
+        "scanned_rows": preview.scanned_rows,
+        "truncated": preview.truncated,
+        "max_scan_rows": _resource_import_preview_max_scan_rows(),
         "glossary_base_id": str(glossary_base.id) if glossary_base else None,
         "glossary_base_name": glossary_base.name if glossary_base else "",
         "source_language": resolved_source_language,
@@ -371,9 +416,7 @@ async def import_glossary_base_xlsx(
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
     if extension not in XLSX_EXTENSIONS:
         raise HTTPException(status_code=400, detail="仅支持上传 .xlsx 文件。")
-    raw_bytes = await file.read()
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail="上传的 XLSX 文件为空。")
+    task_id, staged_file = await asyncio.to_thread(_stage_resource_upload_file, file)
 
     glossary_base = _get_glossary_base_or_404(db, glossary_base_id)
     resolved_source_language, resolved_target_language = _resolve_glossary_base_language_pair(
@@ -382,19 +425,22 @@ async def import_glossary_base_xlsx(
         target_language,
     )
     try:
-        import_summary = import_glossary_from_xlsx_upload(
+        import_summary = import_glossary_from_xlsx_path(
             db=db,
-            raw_bytes=raw_bytes,
+            xlsx_path=staged_file["path"],
             filename=file.filename or "uploaded.xlsx",
             glossary_base_id=glossary_base_id,
             source_language=resolved_source_language,
             target_language=resolved_target_language,
             creator_id=current_user.id,
             skip_header=skip_header,
+            batch_size=_resource_import_batch_size(),
         )
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"词汇表导入失败：{exc}") from exc
+    finally:
+        cleanup_import_task_staging(task_id)
 
     notification_title, notification_body = build_resource_import_notification(
         resource_label="词汇表",

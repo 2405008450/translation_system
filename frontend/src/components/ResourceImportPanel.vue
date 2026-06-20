@@ -23,6 +23,13 @@ import type {
 type ImportTab = 'tm' | 'glossary' | 'term'
 type ImportMode = 'all' | ImportTab
 type ImportPreviewRow = { row_index: number, status: string, message: string }
+type LimitedImportPreview = {
+  valid_rows: number
+  total_rows: number
+  scanned_rows?: number
+  truncated?: boolean
+  max_scan_rows?: number
+}
 
 const props = withDefaults(defineProps<{
   mode?: ImportMode
@@ -456,6 +463,15 @@ function getTermPreviewMessage(row: ImportPreviewRow) {
   return row.message
 }
 
+function buildPreviewCompleteMessage(resourceName: string, preview: LimitedImportPreview) {
+  const scannedRows = preview.scanned_rows ?? preview.total_rows
+  const limit = preview.max_scan_rows ?? scannedRows
+  const suffix = preview.truncated
+    ? `；已达到预览上限 ${limit} 行，导入时仍会分批处理完整文件。`
+    : ''
+  return `预览完成：已扫描 ${scannedRows} 行，识别 ${preview.valid_rows} 条有效${resourceName}${suffix}`
+}
+
 async function loadTMCollections() {
   loadingTMCollections.value = true
   try {
@@ -700,7 +716,7 @@ async function previewGlossaryWorkbook() {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
     glossaryImportPreview.value = data
-    glossaryImportMessage.value = `预览完成：读到 ${data.valid_rows} 条有效词汇。`
+    glossaryImportMessage.value = buildPreviewCompleteMessage('词汇', data)
   } catch (error) {
     glossaryImportPreview.value = null
     glossaryImportMessage.value = getErrorMessage(error, '词汇表预览失败。')
@@ -735,7 +751,7 @@ async function previewTMWorkbook() {
     })
     tmImportPreview.value = data
     tmKeepDuplicateRowIndexes.value = getInitialKeepDuplicateRowIndexes(data.rows)
-    tmImportMessage.value = `预览完成：读取 ${data.valid_rows} 条有效记忆。`
+    tmImportMessage.value = buildPreviewCompleteMessage('记忆', data)
   } catch (error) {
     tmImportPreview.value = null
     tmImportMessage.value = getErrorMessage(error, '记忆库预览失败。')
@@ -795,7 +811,7 @@ async function previewTermWorkbook() {
     })
     termImportPreview.value = data
     termKeepDuplicateRowIndexes.value = getInitialKeepDuplicateRowIndexes(data.rows)
-    termImportMessage.value = `预览完成：读取 ${data.valid_rows} 条有效术语。`
+    termImportMessage.value = buildPreviewCompleteMessage('术语', data)
   } catch (error) {
     termImportPreview.value = null
     termImportMessage.value = getErrorMessage(error, '术语库预览失败。')
@@ -1275,8 +1291,8 @@ onMounted(() => {
             </tbody>
           </table>
         </div>
-        <p v-if="tmPreviewRowsHidden > 0" class="hint-text">
-          仅显示前 {{ tmImportPreview.rows.length }} 行，还有 {{ tmPreviewRowsHidden }} 行未展示；未展示行不会参与逐行保留选择。
+        <p v-if="tmPreviewRowsHidden > 0 || tmImportPreview.truncated" class="hint-text">
+          仅显示前 {{ tmImportPreview.rows.length }} 行；预览最多扫描 {{ tmImportPreview.max_scan_rows || tmImportPreview.scanned_rows }} 行，完整文件会在导入时分批处理。
         </p>
       </div>
 
@@ -1502,8 +1518,8 @@ onMounted(() => {
             </tbody>
           </table>
         </div>
-        <p v-if="glossaryPreviewRowsHidden > 0" class="hint-text">
-          仅显示前 {{ glossaryImportPreview.rows.length }} 行，还有 {{ glossaryPreviewRowsHidden }} 行未展示。
+        <p v-if="glossaryPreviewRowsHidden > 0 || glossaryImportPreview.truncated" class="hint-text">
+          仅显示前 {{ glossaryImportPreview.rows.length }} 行；预览最多扫描 {{ glossaryImportPreview.max_scan_rows || glossaryImportPreview.scanned_rows }} 行，完整文件会在导入时分批处理。
         </p>
       </div>
 
@@ -1748,8 +1764,8 @@ onMounted(() => {
             </tbody>
           </table>
         </div>
-        <p v-if="termPreviewRowsHidden > 0" class="hint-text">
-          仅显示前 {{ termImportPreview.rows.length }} 行，还有 {{ termPreviewRowsHidden }} 行未展示；未展示行不会参与逐行保留选择。
+        <p v-if="termPreviewRowsHidden > 0 || termImportPreview.truncated" class="hint-text">
+          仅显示前 {{ termImportPreview.rows.length }} 行；预览最多扫描 {{ termImportPreview.max_scan_rows || termImportPreview.scanned_rows }} 行，完整文件会在导入时分批处理。
         </p>
       </div>
 

@@ -1052,6 +1052,9 @@ export interface TMImportPreview {
   skipped_header_rows: number
   preview_limit: number
   duplicate_policy: 'overwrite' | 'keep'
+  scanned_rows: number
+  truncated: boolean
+  max_scan_rows?: number
   collection_id: string | null
   collection_name: string
   source_language: string
@@ -1103,6 +1106,7 @@ export interface TermImportPreview {
   preview_limit: number
   scanned_rows: number
   truncated: boolean
+  max_scan_rows?: number
   term_base_id: string | null
   term_base_name: string
   source_language: string
@@ -1142,6 +1146,9 @@ export interface GlossaryImportPreview {
   skipped_empty_rows: number
   skipped_header_rows: number
   preview_limit: number
+  scanned_rows: number
+  truncated: boolean
+  max_scan_rows?: number
   glossary_base_id: string | null
   glossary_base_name: string
   source_language: string

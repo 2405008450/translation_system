@@ -5,11 +5,12 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, Callable
 
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+IMPORT_STAGING_COPY_CHUNK_SIZE = 1024 * 1024
 
 
 def get_import_task_root() -> Path:
@@ -56,6 +57,83 @@ def stage_import_file_payloads(
         file_path = task_dir / safe_name
         file_path.write_bytes(raw_bytes)
         staged.append({"filename": filename, "path": str(file_path.resolve())})
+    return staged
+
+
+def stage_import_file_streams(
+    task_id: str,
+    files: list[tuple[str, BinaryIO]],
+    *,
+    max_files: int | None = None,
+    max_size_resolver: Callable[[str], int] | None = None,
+    max_total_bytes: int | None = None,
+) -> list[dict[str, str | int]]:
+    from app.services.task_file_service import (
+        UploadLimitError,
+        get_max_upload_size_bytes,
+    )
+
+    settings = get_settings()
+    limit_files = max_files if max_files is not None else settings.upload_max_files_per_batch
+    if len(files) > limit_files:
+        raise UploadLimitError(
+            f"文件数量超过限制，最多 {limit_files} 个。",
+            status_code=400,
+        )
+
+    total_limit = max_total_bytes
+    if total_limit is None:
+        total_limit = settings.upload_max_total_size_mb * 1024 * 1024
+    resolve_max_size = max_size_resolver or get_max_upload_size_bytes
+
+    task_dir = get_import_task_staging_dir(task_id)
+    task_dir.mkdir(parents=True, exist_ok=True)
+    staged: list[dict[str, str | int]] = []
+    total_size = 0
+
+    for index, (filename, stream) in enumerate(files, start=1):
+        original_filename = filename or "source.txt"
+        safe_name = f"{index:04d}_{_sanitize_staging_basename(original_filename)}"
+        file_path = task_dir / safe_name
+        max_size = resolve_max_size(original_filename)
+        file_size = 0
+
+        try:
+            stream.seek(0)
+        except (AttributeError, OSError):
+            pass
+
+        with file_path.open("wb") as output:
+            while True:
+                chunk = stream.read(IMPORT_STAGING_COPY_CHUNK_SIZE)
+                if not chunk:
+                    break
+                file_size += len(chunk)
+                total_size += len(chunk)
+                if file_size > max_size:
+                    max_mb = round(max_size / (1024 * 1024), 2)
+                    raise UploadLimitError(
+                        f"文件 {original_filename} 超过大小限制（{max_mb} MB）。",
+                        status_code=413,
+                    )
+                if total_size > total_limit:
+                    max_total_mb = round(total_limit / (1024 * 1024), 2)
+                    raise UploadLimitError(
+                        f"上传总大小超过限制（{max_total_mb} MB）。",
+                        status_code=413,
+                    )
+                output.write(chunk)
+
+        if file_size <= 0:
+            raise UploadLimitError(f"文件 {original_filename} 为空。", status_code=400)
+        staged.append(
+            {
+                "filename": original_filename,
+                "path": str(file_path.resolve()),
+                "size": file_size,
+            }
+        )
+
     return staged
 
 

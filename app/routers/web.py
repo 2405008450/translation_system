@@ -35,6 +35,7 @@ from app.services.file_record_service import (
     load_file_record_source,
 )
 from app.services.file_parser import parse_uploaded_file
+from app.services.task_file_service import get_max_upload_size_bytes
 from app.services.matcher import match_sentences_with_stats
 from app.services.sentence_splitter import split_sentences
 from app.services.tm_importer import (
@@ -54,6 +55,27 @@ DEFAULT_TASKS_PAGE_SIZE = 24
 MAX_TASKS_PAGE_SIZE = 100
 DEFAULT_SEGMENTS_PAGE_SIZE = 100
 MAX_SEGMENTS_PAGE_SIZE = 500
+UPLOAD_READ_CHUNK_SIZE = 1024 * 1024
+
+
+async def _read_upload_bytes_with_limit(file: UploadFile) -> bytes:
+    filename = file.filename or "uploaded"
+    max_bytes = get_max_upload_size_bytes(filename)
+    chunks: list[bytes] = []
+    total_size = 0
+    while True:
+        chunk = await file.read(UPLOAD_READ_CHUNK_SIZE)
+        if not chunk:
+            break
+        total_size += len(chunk)
+        if total_size > max_bytes:
+            max_mb = round(max_bytes / (1024 * 1024), 2)
+            raise HTTPException(
+                status_code=413,
+                detail=f"文件 {filename} 超过大小限制（{max_mb} MB）。",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _build_docx_download_response(filename: str, docx_bytes: bytes) -> StreamingResponse:
@@ -362,7 +384,7 @@ async def upload_and_match(
 
     if is_docx_file:
         # DOCX: 创建文档记录并保存片段
-        raw_bytes = await file.read()
+        raw_bytes = await _read_upload_bytes_with_limit(file)
         if not raw_bytes:
             raise HTTPException(status_code=400, detail="文件为空。")
 
@@ -559,7 +581,7 @@ async def open_workspace(
             detail=f"不支持的文件格式 '{extension}'。支持的格式: {supported_list}"
         )
 
-    raw_bytes = await workspace_file.read()
+    raw_bytes = await _read_upload_bytes_with_limit(workspace_file)
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="上传的文件为空。")
 
@@ -606,7 +628,7 @@ async def import_xlsx(
     if extension not in TM_IMPORT_EXTENSIONS:
         return _render_index(request, error_message="仅支持上传 .tmx、.sdltm、.xls、.xlsx 或 .csv 文件。")
 
-    raw_bytes = await xlsx_file.read()
+    raw_bytes = await _read_upload_bytes_with_limit(xlsx_file)
     if not raw_bytes:
         return _render_index(request, error_message="上传的文件为空。")
 

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import Literal
-from uuid import UUID
+from typing import Any, Literal
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
@@ -33,9 +34,18 @@ from app.services.term_entry_service import (
 )
 from app.services.term_importer import (
     TERM_IMPORT_EXTENSIONS,
+    XLSX_EXTENSIONS,
+    import_terms_from_xlsx_path,
     import_terms_from_xlsx_upload,
+    preview_terms_from_xlsx_path,
     preview_terms_from_upload,
 )
+from app.services.import_task_storage import (
+    cleanup_import_task_staging,
+    read_import_file_bytes,
+    stage_import_file_streams,
+)
+from app.services.task_file_service import UploadLimitError
 from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_response
 
 
@@ -185,12 +195,48 @@ def _serialize_term_entry(entry: TermEntry) -> dict:
     }
 
 
-def _validate_term_import_upload(file: UploadFile, raw_bytes: bytes | None = None) -> None:
+def _validate_term_import_upload(file: UploadFile, raw_bytes: bytes | None = None) -> str:
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
     if extension not in TERM_IMPORT_EXTENSIONS:
         raise HTTPException(status_code=400, detail="仅支持上传 .tmx、.xls、.xlsx 或 .csv 文件。")
     if raw_bytes is not None and not raw_bytes:
         raise HTTPException(status_code=400, detail="上传的术语文件为空。")
+    return extension
+
+
+def _resource_import_preview_max_scan_rows() -> int:
+    settings = get_settings()
+    term_limit = int(settings.term_import_preview_max_scan_rows or 5000)
+    resource_limit = int(settings.resource_import_preview_max_scan_rows or 1000)
+    return max(1, min(term_limit, resource_limit, 10000))
+
+
+def _resource_import_batch_size() -> int:
+    value = int(get_settings().resource_import_batch_size or 1000)
+    return max(1, min(value, 5000))
+
+
+def _resource_import_max_file_bytes(_: str) -> int:
+    return max(1, int(get_settings().upload_max_size_mb or 100)) * 1024 * 1024
+
+
+def _stage_resource_upload_file(file: UploadFile) -> tuple[str, dict[str, Any]]:
+    task_id = str(uuid4())
+    try:
+        staged = stage_import_file_streams(
+            task_id,
+            [(file.filename or "uploaded", file.file)],
+            max_files=1,
+            max_size_resolver=_resource_import_max_file_bytes,
+            max_total_bytes=_resource_import_max_file_bytes(file.filename or "uploaded"),
+        )[0]
+        return task_id, staged
+    except UploadLimitError as exc:
+        cleanup_import_task_staging(task_id)
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except Exception:
+        cleanup_import_task_staging(task_id)
+        raise
 
 
 def _parse_import_row_indexes(value: str | None) -> set[int]:
@@ -534,9 +580,8 @@ async def preview_term_base_xlsx(
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
-    _validate_term_import_upload(file)
-    raw_bytes = await file.read()
-    _validate_term_import_upload(file, raw_bytes)
+    extension = _validate_term_import_upload(file)
+    task_id, staged_file = await asyncio.to_thread(_stage_resource_upload_file, file)
 
     term_base = _get_term_base_or_404(db, term_base_id) if term_base_id else None
     if term_base is not None:
@@ -552,19 +597,34 @@ async def preview_term_base_xlsx(
         )
 
     try:
-        preview = preview_terms_from_upload(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=file.filename or "uploaded.xlsx",
-            term_base_id=term_base_id,
-            source_language=resolved_source_language,
-            target_language=resolved_target_language,
-            preview_limit=max(1, min(preview_limit, 500)),
-            skip_header=skip_header,
-            max_scan_rows=get_settings().term_import_preview_max_scan_rows,
-        )
+        if extension in XLSX_EXTENSIONS:
+            preview = preview_terms_from_xlsx_path(
+                db=db,
+                xlsx_path=staged_file["path"],
+                filename=file.filename or "uploaded.xlsx",
+                term_base_id=term_base_id,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                preview_limit=max(1, min(preview_limit, 500)),
+                skip_header=skip_header,
+                max_scan_rows=_resource_import_preview_max_scan_rows(),
+            )
+        else:
+            preview = preview_terms_from_upload(
+                db=db,
+                raw_bytes=read_import_file_bytes(staged_file),
+                filename=file.filename or "uploaded.xlsx",
+                term_base_id=term_base_id,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                preview_limit=max(1, min(preview_limit, 500)),
+                skip_header=skip_header,
+                max_scan_rows=_resource_import_preview_max_scan_rows(),
+            )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"术语库预览失败：{exc}") from exc
+    finally:
+        cleanup_import_task_staging(task_id)
 
     return {
         "filename": preview.filename,
@@ -588,6 +648,7 @@ async def preview_term_base_xlsx(
         "preview_limit": preview.preview_limit,
         "scanned_rows": preview.scanned_rows,
         "truncated": preview.truncated,
+        "max_scan_rows": _resource_import_preview_max_scan_rows(),
         "term_base_id": str(term_base.id) if term_base else None,
         "term_base_name": term_base.name if term_base else "",
         "source_language": resolved_source_language,
@@ -610,10 +671,8 @@ async def import_term_base_xlsx(
     if term_base_id is None:
         raise HTTPException(status_code=400, detail="请先选择要导入的术语库。")
 
-    _validate_term_import_upload(file)
-
-    raw_bytes = await file.read()
-    _validate_term_import_upload(file, raw_bytes)
+    extension = _validate_term_import_upload(file)
+    task_id, staged_file = await asyncio.to_thread(_stage_resource_upload_file, file)
 
     term_base = _get_term_base_or_404(db, term_base_id)
     resolved_source_language, resolved_target_language = _resolve_term_base_language_pair(
@@ -624,20 +683,37 @@ async def import_term_base_xlsx(
     skipped_row_indexes = _parse_import_row_indexes(skip_duplicate_row_indexes)
 
     try:
-        import_summary = import_terms_from_xlsx_upload(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=file.filename or "uploaded.xlsx",
-            term_base_id=term_base_id,
-            source_language=resolved_source_language,
-            target_language=resolved_target_language,
-            creator_id=current_user.id,
-            skip_duplicate_row_indexes=skipped_row_indexes,
-            skip_header=skip_header,
-        )
+        if extension in XLSX_EXTENSIONS:
+            import_summary = import_terms_from_xlsx_path(
+                db=db,
+                xlsx_path=staged_file["path"],
+                filename=file.filename or "uploaded.xlsx",
+                term_base_id=term_base_id,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                creator_id=current_user.id,
+                skip_duplicate_row_indexes=skipped_row_indexes,
+                skip_header=skip_header,
+                batch_size=_resource_import_batch_size(),
+            )
+        else:
+            import_summary = import_terms_from_xlsx_upload(
+                db=db,
+                raw_bytes=read_import_file_bytes(staged_file),
+                filename=file.filename or "uploaded.xlsx",
+                term_base_id=term_base_id,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                creator_id=current_user.id,
+                skip_duplicate_row_indexes=skipped_row_indexes,
+                skip_header=skip_header,
+                batch_size=_resource_import_batch_size(),
+            )
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"术语库导入失败：{exc}") from exc
+    finally:
+        cleanup_import_task_staging(task_id)
 
     notification_title, notification_body = build_resource_import_notification(
         resource_label="术语库",
