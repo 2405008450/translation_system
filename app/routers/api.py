@@ -11894,16 +11894,12 @@ def _parse_import_row_indexes(value: str | None) -> set[int]:
     return row_indexes
 
 
-@router.post("/translation-memory/import-xlsx/preview")
-@router.post("/tm/import-xlsx/preview", include_in_schema=False)
-@router.post("/translation-memory/import/preview", include_in_schema=False)
-@router.post("/tm/import/preview", include_in_schema=False)
 async def preview_tm_xlsx(
     file: UploadFile = File(...),
     collection_id: UUID | None = Form(default=None),
     source_language: str = Form(...),
     target_language: str = Form(...),
-    duplicate_policy: str = Form(default="overwrite"),
+    duplicate_policy: str = Form(default="keep"),
     preview_limit: int = Form(default=100),
     skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
@@ -12006,7 +12002,7 @@ def import_tm_xlsx(
     collection_id: UUID | None = Form(default=None),
     source_language: str = Form(...),
     target_language: str = Form(...),
-    duplicate_policy: str = Form(default="overwrite"),
+    duplicate_policy: str = Form(default="keep"),
     skip_duplicate_row_indexes: str = Form(default="[]"),
     skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),

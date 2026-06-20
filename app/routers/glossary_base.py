@@ -319,8 +319,6 @@ def delete_glossary_base(
     return {"message": "词汇表已删除。", "deleted_entries": entry_count}
 
 
-@router.post("/glossary-bases/import-xlsx/preview")
-@router.post("/glossary-bases/import/preview", include_in_schema=False)
 async def preview_glossary_base_xlsx(
     file: UploadFile = File(...),
     glossary_base_id: UUID | None = Form(default=None),

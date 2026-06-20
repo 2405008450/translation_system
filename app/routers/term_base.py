@@ -568,8 +568,6 @@ def delete_term_base(
     return {"message": "术语库已删除。", "deleted_entries": entry_count}
 
 
-@router.post("/term-bases/import-xlsx/preview")
-@router.post("/term-bases/import/preview", include_in_schema=False)
 async def preview_term_base_xlsx(
     file: UploadFile = File(...),
     term_base_id: UUID | None = Form(default=None),

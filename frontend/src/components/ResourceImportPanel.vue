@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import axios from 'axios'
-import { BookOpen, BookOpenCheck, CheckCircle2, Database, Eye, Loader2 } from 'lucide-vue-next'
+import { BookOpen, BookOpenCheck, CheckCircle2, Database, Loader2 } from 'lucide-vue-next'
 import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
@@ -144,6 +144,9 @@ const contextLanguagePair = computed(() => (
 const showTMCreateFields = computed(() => !props.fixedTMCollectionId && !selectedTMCollectionId.value)
 const showGlossaryCreateFields = computed(() => !props.fixedGlossaryBaseId && !selectedGlossaryBaseId.value)
 const showTermCreateFields = computed(() => !props.fixedTermBaseId && !selectedTermBaseId.value)
+const fixedTMTargetLabel = computed(() => props.contextLabel || selectedTMCollection.value?.name || '当前记忆库')
+const fixedGlossaryTargetLabel = computed(() => props.contextLabel || selectedGlossaryBase.value?.name || '当前词汇表')
+const fixedTermTargetLabel = computed(() => props.contextLabel || selectedTermBase.value?.name || '当前术语库')
 const tmPreviewRowsHidden = computed(() => {
   const preview = tmImportPreview.value
   return preview ? Math.max(0, preview.total_rows - preview.rows.length) : 0
@@ -156,14 +159,11 @@ const glossaryPreviewRowsHidden = computed(() => {
   const preview = glossaryImportPreview.value
   return preview ? Math.max(0, preview.total_rows - preview.rows.length) : 0
 })
-const fixedTMTargetLabel = computed(() => props.contextLabel || selectedTMCollection.value?.name || '当前记忆库')
-const fixedGlossaryTargetLabel = computed(() => props.contextLabel || selectedGlossaryBase.value?.name || '当前词汇表')
-const fixedTermTargetLabel = computed(() => props.contextLabel || selectedTermBase.value?.name || '当前术语库')
 const tmKeptDuplicateRows = computed(() => countKeptDuplicateRows(tmImportPreview.value?.rows ?? [], tmKeepDuplicateRowIndexes.value))
 const termKeptDuplicateRows = computed(() => countKeptDuplicateRows(termImportPreview.value?.rows ?? [], termKeepDuplicateRowIndexes.value))
-const canUploadTMWorkbook = computed(() => Boolean(selectedTMFile.value) && !tmImporting.value && !tmPreviewing.value)
-const canUploadGlossaryWorkbook = computed(() => Boolean(selectedGlossaryFile.value) && !glossaryImporting.value && !glossaryPreviewing.value)
-const canUploadTermWorkbook = computed(() => Boolean(selectedTermFile.value) && !termImporting.value && !termPreviewing.value)
+const canUploadTMWorkbook = computed(() => Boolean(selectedTMFile.value) && !tmImporting.value)
+const canUploadGlossaryWorkbook = computed(() => Boolean(selectedGlossaryFile.value) && !glossaryImporting.value)
+const canUploadTermWorkbook = computed(() => Boolean(selectedTermFile.value) && !termImporting.value)
 
 watch(() => props.mode, (mode) => {
   if (mode !== 'all') {
@@ -313,84 +313,6 @@ function ensureLanguagePair(sourceLanguage: string, targetLanguage: string) {
   }
 }
 
-function findMatchingTMCollectionId() {
-  const sourceLanguage = tmImportSourceLanguage.value || props.sourceLanguage || ''
-  const targetLanguage = tmImportTargetLanguage.value || props.targetLanguage || ''
-  if (!sourceLanguage || !targetLanguage) {
-    return ''
-  }
-  return tmCollections.value.find((collection) => (
-    collection.source_language === sourceLanguage
-    && collection.target_language === targetLanguage
-  ))?.id || ''
-}
-
-function findMatchingGlossaryBaseId() {
-  const sourceLanguage = glossaryImportSourceLanguage.value || props.sourceLanguage || ''
-  const targetLanguage = glossaryImportTargetLanguage.value || props.targetLanguage || ''
-  if (!sourceLanguage || !targetLanguage) {
-    return ''
-  }
-  return glossaryBases.value.find((glossaryBase) => (
-    glossaryBase.source_language === sourceLanguage
-    && glossaryBase.target_language === targetLanguage
-  ))?.id || ''
-}
-
-function findMatchingTermBaseId() {
-  const sourceLanguage = termImportSourceLanguage.value || props.sourceLanguage || ''
-  const targetLanguage = termImportTargetLanguage.value || props.targetLanguage || ''
-  if (!sourceLanguage || !targetLanguage) {
-    return ''
-  }
-  return termBases.value.find((termBase) => (
-    termBase.source_language === sourceLanguage
-    && termBase.target_language === targetLanguage
-  ))?.id || ''
-}
-
-function ensureDefaultTMCollectionSelection() {
-  if (props.fixedTMCollectionId) {
-    selectedTMCollectionId.value = props.fixedTMCollectionId
-    return
-  }
-  if (selectedTMCollectionId.value) {
-    return
-  }
-  const defaultId = props.defaultTMCollectionId || findMatchingTMCollectionId()
-  if (defaultId && tmCollections.value.some((collection) => collection.id === defaultId)) {
-    selectedTMCollectionId.value = defaultId
-  }
-}
-
-function ensureDefaultGlossaryBaseSelection() {
-  if (props.fixedGlossaryBaseId) {
-    selectedGlossaryBaseId.value = props.fixedGlossaryBaseId
-    return
-  }
-  if (selectedGlossaryBaseId.value) {
-    return
-  }
-  const defaultId = props.defaultGlossaryBaseId || findMatchingGlossaryBaseId()
-  if (defaultId && glossaryBases.value.some((glossaryBase) => glossaryBase.id === defaultId)) {
-    selectedGlossaryBaseId.value = defaultId
-  }
-}
-
-function ensureDefaultTermBaseSelection() {
-  if (props.fixedTermBaseId) {
-    selectedTermBaseId.value = props.fixedTermBaseId
-    return
-  }
-  if (selectedTermBaseId.value) {
-    return
-  }
-  const defaultId = props.defaultTermBaseId || findMatchingTermBaseId()
-  if (defaultId && termBases.value.some((termBase) => termBase.id === defaultId)) {
-    selectedTermBaseId.value = defaultId
-  }
-}
-
 function isDuplicatePreviewRow(row: ImportPreviewRow) {
   return row.status === 'update' || row.status === 'keep' || row.status === 'duplicate'
 }
@@ -470,6 +392,84 @@ function buildPreviewCompleteMessage(resourceName: string, preview: LimitedImpor
     ? `；已达到预览上限 ${limit} 行，导入时仍会分批处理完整文件。`
     : ''
   return `预览完成：已扫描 ${scannedRows} 行，识别 ${preview.valid_rows} 条有效${resourceName}${suffix}`
+}
+
+function findMatchingTMCollectionId() {
+  const sourceLanguage = tmImportSourceLanguage.value || props.sourceLanguage || ''
+  const targetLanguage = tmImportTargetLanguage.value || props.targetLanguage || ''
+  if (!sourceLanguage || !targetLanguage) {
+    return ''
+  }
+  return tmCollections.value.find((collection) => (
+    collection.source_language === sourceLanguage
+    && collection.target_language === targetLanguage
+  ))?.id || ''
+}
+
+function findMatchingGlossaryBaseId() {
+  const sourceLanguage = glossaryImportSourceLanguage.value || props.sourceLanguage || ''
+  const targetLanguage = glossaryImportTargetLanguage.value || props.targetLanguage || ''
+  if (!sourceLanguage || !targetLanguage) {
+    return ''
+  }
+  return glossaryBases.value.find((glossaryBase) => (
+    glossaryBase.source_language === sourceLanguage
+    && glossaryBase.target_language === targetLanguage
+  ))?.id || ''
+}
+
+function findMatchingTermBaseId() {
+  const sourceLanguage = termImportSourceLanguage.value || props.sourceLanguage || ''
+  const targetLanguage = termImportTargetLanguage.value || props.targetLanguage || ''
+  if (!sourceLanguage || !targetLanguage) {
+    return ''
+  }
+  return termBases.value.find((termBase) => (
+    termBase.source_language === sourceLanguage
+    && termBase.target_language === targetLanguage
+  ))?.id || ''
+}
+
+function ensureDefaultTMCollectionSelection() {
+  if (props.fixedTMCollectionId) {
+    selectedTMCollectionId.value = props.fixedTMCollectionId
+    return
+  }
+  if (selectedTMCollectionId.value) {
+    return
+  }
+  const defaultId = props.defaultTMCollectionId || findMatchingTMCollectionId()
+  if (defaultId && tmCollections.value.some((collection) => collection.id === defaultId)) {
+    selectedTMCollectionId.value = defaultId
+  }
+}
+
+function ensureDefaultGlossaryBaseSelection() {
+  if (props.fixedGlossaryBaseId) {
+    selectedGlossaryBaseId.value = props.fixedGlossaryBaseId
+    return
+  }
+  if (selectedGlossaryBaseId.value) {
+    return
+  }
+  const defaultId = props.defaultGlossaryBaseId || findMatchingGlossaryBaseId()
+  if (defaultId && glossaryBases.value.some((glossaryBase) => glossaryBase.id === defaultId)) {
+    selectedGlossaryBaseId.value = defaultId
+  }
+}
+
+function ensureDefaultTermBaseSelection() {
+  if (props.fixedTermBaseId) {
+    selectedTermBaseId.value = props.fixedTermBaseId
+    return
+  }
+  if (selectedTermBaseId.value) {
+    return
+  }
+  const defaultId = props.defaultTermBaseId || findMatchingTermBaseId()
+  if (defaultId && termBases.value.some((termBase) => termBase.id === defaultId)) {
+    selectedTermBaseId.value = defaultId
+  }
 }
 
 async function loadTMCollections() {
@@ -644,19 +644,16 @@ function onTermFileChange(event: Event) {
 }
 
 function resetTMPreview() {
-  tmImportPreview.value = null
   tmImportSummary.value = null
   tmImportMessage.value = ''
-  tmKeepDuplicateRowIndexes.value = new Set()
 }
 
 function resetGlossaryImport() {
-  glossaryImportPreview.value = null
   glossaryImportSummary.value = null
   glossaryImportMessage.value = ''
 }
 
-function buildTMImportFormData(collectionId?: string, includeDuplicateDecisions = false) {
+function buildTMImportFormData(collectionId?: string) {
   if (!selectedTMFile.value) {
     throw new Error(t('resourceImport.tm.errors.selectFile'))
   }
@@ -667,11 +664,8 @@ function buildTMImportFormData(collectionId?: string, includeDuplicateDecisions 
   }
   formData.append('source_language', tmImportSourceLanguage.value)
   formData.append('target_language', tmImportTargetLanguage.value)
-  formData.append('duplicate_policy', 'overwrite')
+  formData.append('duplicate_policy', 'keep')
   formData.append('skip_header', tmSkipHeader.value ? 'true' : 'false')
-  if (includeDuplicateDecisions) {
-    appendSkippedDuplicateRows(formData, tmKeepDuplicateRowIndexes.value)
-  }
   return formData
 }
 
@@ -895,7 +889,7 @@ async function uploadTMWorkbook() {
 
   try {
     const collectionId = await ensureImportCollection()
-    const formData = buildTMImportFormData(collectionId, Boolean(tmImportPreview.value))
+    const formData = buildTMImportFormData(collectionId)
 
     const { data } = await http.post<TMImportSummary>('/translation-memory/import', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
@@ -999,7 +993,7 @@ async function uploadTermWorkbook() {
 
   try {
     const termBaseId = await ensureImportTermBase()
-    const formData = buildTermImportFormData(termBaseId, Boolean(termImportPreview.value))
+    const formData = buildTermImportFormData(termBaseId)
 
     const { data } = await http.post<TermImportSummary>('/term-bases/import', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
@@ -1185,16 +1179,6 @@ onMounted(() => {
 
       <div class="resource-import-panel__actions">
         <button
-          class="button"
-          type="button"
-          :disabled="tmImporting || tmPreviewing"
-          @click="previewTMWorkbook"
-        >
-          <Loader2 v-if="tmPreviewing" class="lucide-spin" />
-          <Eye v-else :size="14" />
-          {{ tmPreviewing ? '预览中...' : '预览数据' }}
-        </button>
-        <button
           class="button button--primary"
           type="button"
           :disabled="!canUploadTMWorkbook"
@@ -1202,7 +1186,7 @@ onMounted(() => {
         >
           <Loader2 v-if="tmImporting" class="lucide-spin" />
           <CheckCircle2 v-else :size="14" />
-          {{ tmImporting ? t('resourceImport.tm.importing', { percent: tmUploadPercent }) : (tmImportPreview ? '确认导入' : '直接导入') }}
+          {{ tmImporting ? t('resourceImport.tm.importing', { percent: tmUploadPercent }) : '直接导入' }}
         </button>
       </div>
 
@@ -1435,16 +1419,6 @@ onMounted(() => {
 
       <div class="resource-import-panel__actions">
         <button
-          class="button"
-          type="button"
-          :disabled="glossaryImporting || glossaryPreviewing"
-          @click="previewGlossaryWorkbook"
-        >
-          <Loader2 v-if="glossaryPreviewing" class="lucide-spin" />
-          <Eye v-else :size="14" />
-          {{ glossaryPreviewing ? '预览中...' : '预览数据' }}
-        </button>
-        <button
           class="button button--primary"
           type="button"
           :disabled="!canUploadGlossaryWorkbook"
@@ -1452,7 +1426,7 @@ onMounted(() => {
         >
           <Loader2 v-if="glossaryImporting" class="lucide-spin" />
           <CheckCircle2 v-else :size="14" />
-          {{ glossaryImporting ? t('resourceImport.glossary.importing', { percent: glossaryUploadPercent }) : (glossaryImportPreview ? '确认导入' : '直接导入') }}
+          {{ glossaryImporting ? t('resourceImport.glossary.importing', { percent: glossaryUploadPercent }) : '直接导入' }}
         </button>
       </div>
 
@@ -1658,16 +1632,6 @@ onMounted(() => {
 
       <div class="resource-import-panel__actions">
         <button
-          class="button"
-          type="button"
-          :disabled="termImporting || termPreviewing"
-          @click="previewTermWorkbook"
-        >
-          <Loader2 v-if="termPreviewing" class="lucide-spin" />
-          <Eye v-else :size="14" />
-          {{ termPreviewing ? '预览中...' : '预览数据' }}
-        </button>
-        <button
           class="button button--primary"
           type="button"
           :disabled="!canUploadTermWorkbook"
@@ -1675,7 +1639,7 @@ onMounted(() => {
         >
           <Loader2 v-if="termImporting" class="lucide-spin" />
           <CheckCircle2 v-else :size="14" />
-          {{ termImporting ? t('resourceImport.term.importing', { percent: termUploadPercent }) : (termImportPreview ? '确认导入' : '直接导入') }}
+          {{ termImporting ? t('resourceImport.term.importing', { percent: termUploadPercent }) : '直接导入' }}
         </button>
       </div>
 
