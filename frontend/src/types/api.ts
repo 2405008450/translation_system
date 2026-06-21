@@ -571,6 +571,8 @@ export interface MergeView {
   file_ids: string[]
   file_count: number
   available_file_count: number
+  can_manage?: boolean
+  can_open?: boolean
   creator_id: string | null
   creator_name: string | null
   created_at: string | null
@@ -608,6 +610,7 @@ export interface MergeViewDetail {
   total_segments: number
   is_mixed_language_pair: boolean
   language_pairs: MergeViewLanguagePair[]
+  can_manage?: boolean
   creator_id: string | null
   created_at: string | null
   updated_at: string | null

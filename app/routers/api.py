@@ -8975,13 +8975,57 @@ class MergeViewUpdatePayload(BaseModel):
 def _require_merge_view_manage_access(
     db: Session, view: ProjectMergeView, current_user: User
 ) -> None:
-    """管理合并视图需对所属项目有管理权限（沿用 can_manage_workflow 口径）。"""
+    """管理合并视图需具备项目读权限，且为管理员或视图创建者。"""
     project = db.query(Project).filter(Project.id == view.project_id).first()
     if project is None:
         raise HTTPException(status_code=404, detail="视图不存在。")
     _require_project_read_access(project, current_user, db)
-    if not _can_manage_workflow(current_user):
-        raise HTTPException(status_code=403, detail="仅项目管理员可操作合并视图。")
+    if not _can_manage_merge_view(view, current_user):
+        raise HTTPException(status_code=403, detail="仅管理员或视图创建者可操作合并视图。")
+
+
+def _can_manage_merge_view(view: ProjectMergeView, current_user: User | None) -> bool:
+    if current_user is None:
+        return False
+    if _can_manage_workflow(current_user):
+        return True
+    return view.creator_id is not None and getattr(current_user, "id", None) == view.creator_id
+
+
+def _get_visible_merge_view_files(
+    db: Session,
+    view: ProjectMergeView,
+    current_user: User,
+) -> list[FileRecord]:
+    files = load_view_file_records(db, view)
+    return _visible_project_files(files, current_user, db)
+
+
+def _serialize_merge_view_summary_for_user(
+    db: Session,
+    view: ProjectMergeView,
+    current_user: User,
+    *,
+    visible_files: list[FileRecord] | None = None,
+) -> dict:
+    payload = serialize_merge_view_summary(db, view, current_user=current_user)
+    if visible_files is None:
+        visible_files = _get_visible_merge_view_files(db, view, current_user)
+    if not can_access_all_projects(current_user):
+        visible_ids = [str(file_record.id) for file_record in visible_files]
+        payload["file_ids"] = visible_ids
+        payload["file_count"] = len(visible_ids)
+        payload["available_file_count"] = len(visible_ids)
+    payload["can_manage"] = _can_manage_merge_view(view, current_user)
+    payload["can_open"] = len(visible_files) >= 2
+    return payload
+
+
+def _require_merge_view_openable_files(files: list[FileRecord], current_user: User) -> None:
+    if not files:
+        raise HTTPException(status_code=404, detail="视图不存在或没有可访问文件。")
+    if not can_access_all_projects(current_user) and len(files) < 2:
+        raise HTTPException(status_code=404, detail="视图不存在或没有足够的可访问文件。")
 
 
 def _get_merge_view_or_404(db: Session, view_id: UUID) -> ProjectMergeView:
@@ -9031,9 +9075,22 @@ def list_project_merge_views(
         .order_by(ProjectMergeView.created_at.desc())
         .all()
     )
+    items = []
+    for view in views:
+        visible_files = _get_visible_merge_view_files(db, view, current_user)
+        if not can_access_all_projects(current_user) and len(visible_files) < 2:
+            continue
+        items.append(
+            _serialize_merge_view_summary_for_user(
+                db,
+                view,
+                current_user,
+                visible_files=visible_files,
+            )
+        )
     return {
         "project_id": str(project.id),
-        "items": [serialize_merge_view_summary(db, view, current_user=current_user) for view in views],
+        "items": items,
     }
 
 
@@ -9044,11 +9101,9 @@ def create_project_merge_view(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """创建合并视图。需项目管理权限；校验文件归属该项目、去重保序。"""
+    """创建合并视图。需项目读权限；校验文件归属该项目、去重保序且当前用户可读。"""
     project = _get_project_or_404(db, project_id)
     _require_project_read_access(project, current_user, db)
-    if not _can_manage_workflow(current_user):
-        raise HTTPException(status_code=403, detail="仅项目管理员可创建合并视图。")
     ordered = _validate_and_order_view_file_ids(db, project, payload.file_ids, current_user)
     view = ProjectMergeView(
         project_id=project.id,
@@ -9059,7 +9114,7 @@ def create_project_merge_view(
     db.add(view)
     db.commit()
     db.refresh(view)
-    return serialize_merge_view_summary(db, view, current_user=current_user)
+    return _serialize_merge_view_summary_for_user(db, view, current_user)
 
 
 @router.get("/merge-views/{view_id}")
@@ -9072,8 +9127,14 @@ def get_merge_view_detail(
     view = _get_merge_view_or_404(db, view_id)
     project = _get_project_or_404(db, view.project_id)
     _require_project_read_access(project, current_user, db)
-    files = load_view_file_records(db, view)
+    files = _get_visible_merge_view_files(db, view, current_user)
+    _require_merge_view_openable_files(files, current_user)
     payload = serialize_merge_view_detail(db, view, files)
+    if not can_access_all_projects(current_user):
+        visible_ids = [str(file_record.id) for file_record in files]
+        payload["file_ids"] = visible_ids
+        payload["total_files"] = len(files)
+    payload["can_manage"] = _can_manage_merge_view(view, current_user)
     for file_payload, file_record in zip(payload.get("files", []), files):
         file_payload["can_write"] = _can_write_file_record(file_record, current_user, db)
     return payload
@@ -9097,7 +9158,7 @@ def update_merge_view(
         view.file_ids = serialize_file_ids(ordered)
     db.commit()
     db.refresh(view)
-    return serialize_merge_view_summary(db, view, current_user=current_user)
+    return _serialize_merge_view_summary_for_user(db, view, current_user)
 
 
 @router.delete("/merge-views/{view_id}")
@@ -9144,7 +9205,8 @@ def get_merge_view_segments(
     view = _get_merge_view_or_404(db, view_id)
     project = _get_project_or_404(db, view.project_id)
     _require_project_read_access(project, current_user, db)
-    files = load_view_file_records(db, view)
+    files = _get_visible_merge_view_files(db, view, current_user)
+    _require_merge_view_openable_files(files, current_user)
 
     safe_skip = max(skip, 0)
     safe_limit = _normalize_segment_page_limit(limit)

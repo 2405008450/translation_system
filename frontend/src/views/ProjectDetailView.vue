@@ -642,7 +642,7 @@ const ACTIVE_PRETRANSLATION_POLL_INTERVAL_MS = 2_500
 
 const tabs = computed(() => ([
   { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
-  { key: 'views' as const, label: t('projectDetail.tabs.views'), disabled: !canManageProject.value },
+  { key: 'views' as const, label: t('projectDetail.tabs.views'), disabled: false },
   {
     key: 'issues' as const,
     label: `${t('projectDetail.tabs.issues')}${openIssueCount.value > 0 ? ` (${openIssueCount.value})` : ''}`,
@@ -723,7 +723,7 @@ const selectedMergeViewLanguagePairs = computed<LanguagePairSummary[]>(() => {
 })
 const selectedMergeViewHasMixedLanguagePairs = computed(() => selectedMergeViewLanguagePairs.value.length > 1)
 const canOpenMergeViewDialog = computed(() => (
-  canManageProject.value
+  Boolean(project.value)
   && selectedMergeViewFiles.value.length >= 2
   && !savingMergeView.value
 ))
@@ -1538,6 +1538,10 @@ function canUseFileInMergeView(row: ProjectRow) {
   return canEnterWorkbench(row)
 }
 
+function canManageMergeView(view: MergeView) {
+  return canManageProject.value || Boolean(view.can_manage)
+}
+
 function getMergeViewFileNames(view: MergeView) {
   const fileById = new Map(tableRows.value.map((file) => [file.id, file.filename]))
   return view.file_ids.map((fileId) => fileById.get(fileId) || fileId)
@@ -2295,7 +2299,7 @@ function goBack() {
 
 function switchProjectTab(tab: ProjectTab) {
   activeTab.value = tab
-  if (tab === 'views' && canManageProject.value) {
+  if (tab === 'views') {
     void loadMergeViews()
   }
   if (tab === 'stats' && statisticsSelectedFileIds.value.size === 0 && selectedFileIds.value.size > 0) {
@@ -2457,6 +2461,9 @@ function openCreateMergeViewDialog() {
 }
 
 function openRenameMergeViewDialog(view: MergeView) {
+  if (!canManageMergeView(view)) {
+    return
+  }
   mergeViewDialogMode.value = 'rename'
   activeMergeView.value = view
   mergeViewName.value = view.name
@@ -2519,7 +2526,7 @@ async function submitMergeViewDialog() {
 }
 
 async function deleteSavedMergeView(view: MergeView) {
-  if (!canManageProject.value || mergeViewActionId.value) {
+  if (!canManageMergeView(view) || mergeViewActionId.value) {
     return
   }
   const confirmed = await confirm({
@@ -2560,14 +2567,14 @@ async function loadProject() {
     statisticsResultFileIds.value = new Set<string>()
     statisticsReports.value = []
     activeStatisticsReportId.value = ''
+    if (activeTab.value === 'views') {
+      void loadMergeViews()
+    }
     if (data.can_manage) {
       void loadAssignmentEvents()
       void loadProjectTranslationMemorySettings()
       void loadProjectTermBaseSettings()
       void loadProjectQualityQASettings()
-      if (activeTab.value === 'views') {
-        void loadMergeViews()
-      }
       if (activeTab.value === 'stats') {
         void loadDocumentStatisticsReports()
       }
@@ -2575,7 +2582,6 @@ async function loadProject() {
       translationMemorySettings.value = null
       termBaseSettings.value = null
       qualityQASettings.value = null
-      mergeViews.value = []
     }
     void loadActivePretranslationTasks()
   } catch (error) {
@@ -5308,11 +5314,17 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <div class="pd-merge-view-item__actions">
-              <button class="button" type="button" @click="openMergeView(view)">
+              <button
+                class="button"
+                type="button"
+                :disabled="view.can_open === false"
+                @click="openMergeView(view)"
+              >
                 <FolderOpen :size="14" />
                 {{ t('projectDetail.mergeViews.open') }}
               </button>
               <button
+                v-if="canManageMergeView(view)"
                 class="button"
                 type="button"
                 :disabled="mergeViewActionId === view.id"
@@ -5321,6 +5333,7 @@ onBeforeUnmount(() => {
                 {{ t('projectDetail.mergeViews.rename') }}
               </button>
               <button
+                v-if="canManageMergeView(view)"
                 class="button button--danger"
                 type="button"
                 :disabled="mergeViewActionId === view.id"
@@ -5468,7 +5481,6 @@ onBeforeUnmount(() => {
               {{ t('projectDetail.files.actions.modifyTaskType') }}
             </button>
             <button
-              v-if="canManageProject"
               class="button"
               type="button"
               :disabled="!canOpenMergeViewDialog"
