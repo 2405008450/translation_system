@@ -7431,8 +7431,8 @@ def _apply_segment_text_filters(
     def text_contains(column, pattern: str):
         return column.like(pattern) if case_sensitive else column.ilike(pattern)
 
-    source_keyword = (source_query or "").strip()
-    target_keyword = (target_query or "").strip()
+    source_keyword = _normalize_segment_search_keyword(source_query)
+    target_keyword = _normalize_segment_search_keyword(target_query)
     if source_keyword:
         source_pattern = f"%{source_keyword}%"
         query = query.filter(
@@ -7459,9 +7459,19 @@ def _apply_segment_text_filters(
     return query
 
 
+def _normalize_segment_search_keyword(value: str | None) -> str:
+    if value is None:
+        return ""
+    normalized = re.sub(r"\s+", " ", value)
+    stripped = normalized.strip()
+    return stripped or (" " if normalized else "")
+
+
 def _split_segment_exclude_keywords(value: str | None) -> list[str]:
     if not value:
         return []
+    if not value.strip():
+        return [" "]
     keywords = [item.strip() for item in re.split(r"[\s,，]+", value) if item.strip()]
     return list(dict.fromkeys(keywords))
 
@@ -10542,7 +10552,7 @@ def replace_file_record_segment_targets(
         raise HTTPException(status_code=404, detail="文档不存在。")
 
     _require_file_record_write_access(db, file_record_id, current_user, operation_token)
-    target_query = (payload.target_query or "").strip()
+    target_query = _normalize_segment_search_keyword(payload.target_query)
     if not target_query:
         raise HTTPException(status_code=400, detail="请先输入译文关键词用于替换。")
 

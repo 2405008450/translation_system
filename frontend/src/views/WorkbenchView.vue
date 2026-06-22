@@ -89,6 +89,7 @@ import type {
   CommentStatus,
   GuidelineTemplateSummary,
   IssueMarker,
+  LLMMergeTarget,
   LLMProvider,
   LLMTranslateScope,
   RevisionDisplaySettings,
@@ -363,6 +364,7 @@ function handleBottomDrawerResizeKeydown(event: KeyboardEvent) {
 
 const pageError = ref('')
 const llmScope = ref<LLMTranslateScope>('current_segment')
+const llmMergeTarget = ref<LLMMergeTarget>('current_file')
 const llmProvider = ref<LLMProvider>('deepseek')
 const llmModel = ref('')
 const itemHeight = ref(resolveItemHeight())
@@ -516,6 +518,11 @@ const llmModelSelectOptions = computed(() => [
   )),
 ])
 
+const llmMergeTargetOptions = computed(() => [
+  { value: 'current_file' as const, label: '当前文件' },
+  { value: 'merge_view' as const, label: '整个视图' },
+])
+
 const workbenchLLMScopeOptions = computed(() => (
   llmScopeOptions.map((option) => {
     if (!segmentStore.mergeViewId || option.value === 'current_segment') {
@@ -523,11 +530,16 @@ const workbenchLLMScopeOptions = computed(() => (
     }
     return {
       ...option,
-      label: `${option.label}（当前文件）`,
-      description: `${option.description} 合并视图中此范围仅处理当前激活文件。`,
+      description: `${option.description} 合并视图中可选择处理当前文件或整个视图。`,
     }
   })
 ))
+
+watch(llmScope, (scope) => {
+  if (scope === 'current_segment') {
+    llmMergeTarget.value = 'current_file'
+  }
+})
 
 const confirmShortcutDescription = computed(() => (
   preferencesStore.confirmJumpMode === 'next_segment'
@@ -915,12 +927,6 @@ const statusSummary = computed(() => {
   ]
 })
 
-const confirmableSegmentCount = computed(() => Math.max(
-  0,
-  segmentStore.totalSegmentCount - segmentStore.segmentStatusStats.confirmed,
-))
-const confirmedSegmentCount = computed(() => segmentStore.segmentStatusStats.confirmed)
-
 const currentLanguagePair = computed(() => (
   formatLanguagePair(
     segmentStore.fileRecord?.source_language ?? null,
@@ -935,6 +941,48 @@ const activeMergeViewFile = computed(() => {
   }
   return segmentStore.mergeViewDetail?.files.find((file) => file.id === activeFileId) ?? null
 })
+
+const activeFileStatusStats = computed(() => {
+  if (!segmentStore.mergeViewId && !props.mergeViewId) {
+    return segmentStore.segmentStatusStats
+  }
+  return activeMergeViewFile.value?.status_stats ?? {
+    total: 0,
+    exact: 0,
+    fuzzy: 0,
+    none: 0,
+    confirmed: 0,
+    empty_target: 0,
+  }
+})
+
+const activeFileSegmentTotal = computed(() => (
+  (segmentStore.mergeViewId || props.mergeViewId)
+    ? (activeMergeViewFile.value?.total_segments ?? 0)
+    : segmentStore.totalSegmentCount
+))
+
+const confirmableSegmentCount = computed(() => Math.max(
+  0,
+  activeFileSegmentTotal.value - activeFileStatusStats.value.confirmed,
+))
+const confirmedSegmentCount = computed(() => activeFileStatusStats.value.confirmed)
+const mergeViewWritableFiles = computed(() => (
+  (segmentStore.mergeViewDetail?.files ?? []).filter((file) => file.can_write !== false)
+))
+const mergeViewConfirmableSegmentCount = computed(() => Math.max(
+  0,
+  mergeViewWritableFiles.value.reduce(
+    (sum, file) => sum + Math.max(0, file.total_segments - Number(file.status_stats?.confirmed || 0)),
+    0,
+  ),
+))
+const mergeViewConfirmedSegmentCount = computed(() => (
+  mergeViewWritableFiles.value.reduce(
+    (sum, file) => sum + Number(file.status_stats?.confirmed || 0),
+    0,
+  )
+))
 
 const activeWorkbenchFileId = computed(() => {
   if (segmentStore.mergeViewId || props.mergeViewId) {
@@ -1319,9 +1367,15 @@ const activeTermMatches = computed(() => {
   return segment ? segmentStore.getTermMatches(segmentKeyOf(segment)) : []
 })
 
+function resolveLiteralSearchKeyword(value: string) {
+  const normalized = value.replace(/\s+/g, ' ')
+  const trimmed = normalized.trim()
+  return trimmed || (normalized ? ' ' : '')
+}
+
 function normalizeSearchText(value: string, caseSensitive = searchCaseSensitive.value) {
-  const normalized = value.replace(/\s+/g, ' ').trim()
-  return caseSensitive ? normalized : normalized.toLocaleLowerCase()
+  const keyword = resolveLiteralSearchKeyword(value)
+  return caseSensitive ? keyword : keyword.toLocaleLowerCase()
 }
 
 function normalizeFuzzySearchText(value: string, caseSensitive = searchCaseSensitive.value) {
@@ -1347,7 +1401,7 @@ function isSubsequenceMatch(value: string, keyword: string) {
   const normalizedValue = normalizeFuzzySearchText(value)
   const normalizedKeyword = normalizeFuzzySearchText(keyword)
   if (!normalizedKeyword) {
-    return true
+    return !resolveLiteralSearchKeyword(keyword)
   }
 
   let cursor = 0
@@ -1400,7 +1454,7 @@ function escapeRegExp(value: string) {
 }
 
 function buildTargetReplaceRegExp(global = false) {
-  const keyword = targetSearchQuery.value.trim()
+  const keyword = resolveLiteralSearchKeyword(targetSearchQuery.value)
   if (!keyword) {
     return null
   }
@@ -2541,7 +2595,7 @@ function replaceTargetText(targetText: string, replaceAll = false) {
 }
 
 async function replaceCurrentSearchMatch() {
-  if (!targetSearchQuery.value.trim()) {
+  if (!resolveLiteralSearchKeyword(targetSearchQuery.value)) {
     toast.warn(t('workbench.search.targetRequiredForReplace'))
     return
   }
@@ -2573,7 +2627,7 @@ async function replaceCurrentSearchMatch() {
 }
 
 async function replaceAllSearchMatches() {
-  if (!targetSearchQuery.value.trim()) {
+  if (!resolveLiteralSearchKeyword(targetSearchQuery.value)) {
     toast.warn(t('workbench.search.targetRequiredForReplace'))
     return
   }
@@ -2719,9 +2773,12 @@ async function confirmAndMoveToNextUnconfirmed() {
   }
 }
 
-async function handleConfirmAllSegments() {
-  if (confirmableSegmentCount.value === 0) {
-    toast.info('当前文件全部句段都已确认。')
+async function handleConfirmAllSegments(target: LLMMergeTarget = 'current_file') {
+  const isViewTarget = target === 'merge_view'
+  const count = isViewTarget ? mergeViewConfirmableSegmentCount.value : confirmableSegmentCount.value
+  const scopeText = isViewTarget ? '当前视图' : '当前文件'
+  if (count === 0) {
+    toast.info(`${scopeText}全部句段都已确认。`)
     closeConfirmMenu()
     return
   }
@@ -2729,7 +2786,7 @@ async function handleConfirmAllSegments() {
   pageError.value = ''
   confirmationActionLoading.value = true
   try {
-    const updatedCount = await segmentStore.updateAllSegmentConfirmations('confirm')
+    const updatedCount = await segmentStore.updateAllSegmentConfirmations('confirm', target)
     toast.success(updatedCount > 0 ? `已确认 ${updatedCount} 个句段` : '没有需要确认的句段')
     closeConfirmMenu()
   } catch (error) {
@@ -2739,10 +2796,12 @@ async function handleConfirmAllSegments() {
   }
 }
 
-async function handleCancelAllSegmentConfirmations() {
-  const count = confirmedSegmentCount.value
+async function handleCancelAllSegmentConfirmations(target: LLMMergeTarget = 'current_file') {
+  const isViewTarget = target === 'merge_view'
+  const count = isViewTarget ? mergeViewConfirmedSegmentCount.value : confirmedSegmentCount.value
+  const scopeText = isViewTarget ? '当前视图' : '当前文件'
   if (count === 0) {
-    toast.info('当前文件没有已确认句段。')
+    toast.info(`${scopeText}没有已确认句段。`)
     closeConfirmMenu()
     return
   }
@@ -2750,7 +2809,7 @@ async function handleCancelAllSegmentConfirmations() {
   closeConfirmMenu()
   const accepted = await confirm({
     title: '确认全部取消',
-    message: `确定要取消当前文件全部 ${count} 个已确认句段的确认状态吗？译文内容会保留，但这些句段将不再显示为已确认。`,
+    message: `确定要取消${scopeText}全部 ${count} 个已确认句段的确认状态吗？译文内容会保留，但这些句段将不再显示为已确认。`,
     confirmText: '全部取消',
     cancelText: t('common.actions.cancel'),
     danger: true,
@@ -2762,7 +2821,7 @@ async function handleCancelAllSegmentConfirmations() {
   pageError.value = ''
   confirmationActionLoading.value = true
   try {
-    const updatedCount = await segmentStore.updateAllSegmentConfirmations('cancel')
+    const updatedCount = await segmentStore.updateAllSegmentConfirmations('cancel', target)
     toast.success(updatedCount > 0 ? `已取消确认 ${updatedCount} 个句段` : '没有需要取消确认的句段')
     closeConfirmMenu()
   } catch (error) {
@@ -4184,7 +4243,12 @@ async function handleSegmentPageSizeChange(size: number) {
 async function runLLMTranslation() {
   pageError.value = ''
   const currentSentenceId = activeSegment.value?.sentence_id || ''
-  if (segmentStore.mergeViewId && !segmentStore.activeFileRecordId) {
+  const isMergeViewBatch = Boolean(
+    segmentStore.mergeViewId
+    && llmMergeTarget.value === 'merge_view'
+    && llmScope.value !== 'current_segment',
+  )
+  if (segmentStore.mergeViewId && !isMergeViewBatch && !segmentStore.activeFileRecordId) {
     toast.warn('请先选中一个句段，以确定本次 AI 处理的当前文件。')
     return
   }
@@ -4202,6 +4266,7 @@ async function runLLMTranslation() {
       temporaryPrompt: workbenchGuidelines.value,
       model: llmModel.value || undefined,
       sentenceId: llmScope.value === 'current_segment' ? currentSentenceId : undefined,
+      mergeTarget: segmentStore.mergeViewId ? llmMergeTarget.value : undefined,
     })
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.llm'))
@@ -5025,6 +5090,14 @@ onBeforeRouteLeave(async () => {
             </option>
           </select>
         </label>
+        <label v-if="isMergeWorkbench && llmScope !== 'current_segment'" class="ai-strip__field">
+          <span>对象</span>
+          <select v-model="llmMergeTarget" class="field__control" title="选择 AI 修正处理当前文件或整个合并视图">
+            <option v-for="option in llmMergeTargetOptions" :key="option.value" :value="option.value">
+              {{ option.label }}
+            </option>
+          </select>
+        </label>
         <span v-if="isMergeWorkbench" class="ai-strip__context" :title="activeMergeFileContextTitle">
           {{ activeMergeFileContextText }}
         </span>
@@ -5124,20 +5197,41 @@ onBeforeRouteLeave(async () => {
               data-testid="workbench-confirm-all"
               type="button"
               role="menuitem"
-              :disabled="confirmationActionLoading || confirmableSegmentCount === 0"
+              :disabled="confirmationActionLoading || confirmableSegmentCount === 0 || (isMergeWorkbench && activeMergeViewFile?.can_write === false)"
               @click="void handleConfirmAllSegments()"
             >
-              全部确认
+              {{ isMergeWorkbench ? '当前文件全部确认' : '全部确认' }}
+            </button>
+            <button
+              v-if="isMergeWorkbench"
+              data-testid="workbench-confirm-merge-view-all"
+              type="button"
+              role="menuitem"
+              :disabled="confirmationActionLoading || mergeViewConfirmableSegmentCount === 0"
+              @click="void handleConfirmAllSegments('merge_view')"
+            >
+              确认视图全部句段
             </button>
             <button
               class="is-danger"
               data-testid="workbench-cancel-all-confirmations"
               type="button"
               role="menuitem"
-              :disabled="confirmationActionLoading || confirmedSegmentCount === 0"
+              :disabled="confirmationActionLoading || confirmedSegmentCount === 0 || (isMergeWorkbench && activeMergeViewFile?.can_write === false)"
               @click="void handleCancelAllSegmentConfirmations()"
             >
-              全部取消
+              {{ isMergeWorkbench ? '当前文件全部取消' : '全部取消' }}
+            </button>
+            <button
+              v-if="isMergeWorkbench"
+              class="is-danger"
+              data-testid="workbench-cancel-merge-view-confirmations"
+              type="button"
+              role="menuitem"
+              :disabled="confirmationActionLoading || mergeViewConfirmedSegmentCount === 0"
+              @click="void handleCancelAllSegmentConfirmations('merge_view')"
+            >
+              取消视图全部确认
             </button>
           </div>
         </div>
@@ -6277,7 +6371,7 @@ onBeforeRouteLeave(async () => {
                 <button
                   class="button workbench-search-panel__replace-button"
                   type="button"
-                  :disabled="!targetSearchQuery.trim()"
+                  :disabled="!resolveLiteralSearchKeyword(targetSearchQuery)"
                   @click="void replaceCurrentSearchMatch()"
                 >
                   {{ t('workbench.search.replace') }}
@@ -6285,7 +6379,7 @@ onBeforeRouteLeave(async () => {
                 <button
                   class="button workbench-search-panel__replace-button"
                   type="button"
-                  :disabled="!targetSearchQuery.trim()"
+                  :disabled="!resolveLiteralSearchKeyword(targetSearchQuery)"
                   @click="void replaceAllSearchMatches()"
                 >
                   {{ t('workbench.search.replaceAll', { count: segmentStore.matchedSegmentCount }) }}

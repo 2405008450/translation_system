@@ -12,6 +12,7 @@ import type {
   FileRecordDetail,
   FileRecordPreview,
   LLMGuidelineOptions,
+  LLMMergeTarget,
   LLMProvider,
   LLMTranslateScope,
   MergeViewDetail,
@@ -39,6 +40,7 @@ const EXPORT_POLL_INTERVAL_MS = 1200
 const REVISION_TRACKING_STORAGE_KEY = 'workbench.revisionTrackingEnabled'
 const DEFAULT_REVISION_INSERT_COLOR = '#2563eb'
 const DEFAULT_REVISION_DELETE_COLOR = '#dc2626'
+type SegmentBatchTarget = LLMMergeTarget
 
 interface FileExportTask {
   task_id: string
@@ -57,6 +59,20 @@ function createEmptySegmentStatusStats(): SegmentStatusStats {
     confirmed: 0,
     empty_target: 0,
   }
+}
+
+function buildMergeViewStatusStats(detail: MergeViewDetail | null): SegmentStatusStats {
+  const totals = createEmptySegmentStatusStats()
+  for (const file of detail?.files ?? []) {
+    const stats = { ...createEmptySegmentStatusStats(), ...(file.status_stats || {}) }
+    totals.total += Number(stats.total || file.total_segments || 0)
+    totals.exact += Number(stats.exact || 0)
+    totals.fuzzy += Number(stats.fuzzy || 0)
+    totals.none += Number(stats.none || 0)
+    totals.confirmed += Number(stats.confirmed || 0)
+    totals.empty_target += Number(stats.empty_target || 0)
+  }
+  return totals
 }
 
 function isCountedSegmentStatus(status: string): status is 'exact' | 'fuzzy' | 'none' | 'confirmed' {
@@ -650,6 +666,17 @@ export const useSegmentStore = defineStore('segment', () => {
     segmentStatusStats.value = stats ? { ...createEmptySegmentStatusStats(), ...stats } : createEmptySegmentStatusStats()
   }
 
+  async function refreshMergeViewDetail() {
+    if (!mergeViewId.value) {
+      return null
+    }
+    const detail = await getMergeViewDetail(mergeViewId.value)
+    mergeViewDetail.value = detail
+    totalSegmentCount.value = detail.total_segments
+    setSegmentStatusStats(buildMergeViewStatusStats(detail))
+    return detail
+  }
+
   function adjustSegmentStatusStats(previousSegment: Segment, nextSegment: Segment) {
     const nextStats = { ...segmentStatusStats.value }
     if (isCountedSegmentStatus(previousSegment.status)) {
@@ -1084,8 +1111,7 @@ export const useSegmentStore = defineStore('segment', () => {
       const detail = await getMergeViewDetail(viewId)
       mergeViewDetail.value = detail
       totalSegmentCount.value = detail.total_segments
-      // 合并模式无单文件 status_stats 概念，置空合计
-      setSegmentStatusStats()
+      setSegmentStatusStats(buildMergeViewStatusStats(detail))
 
       const page = await fetchMergeViewSegmentPage(viewId, resolved)
       matchedSegmentCount.value = page.matched_segments
@@ -1945,23 +1971,35 @@ export const useSegmentStore = defineStore('segment', () => {
     return data.updated_count
   }
 
-  async function updateAllSegmentConfirmations(action: 'confirm' | 'cancel') {
+  async function updateAllSegmentConfirmations(
+    action: 'confirm' | 'cancel',
+    target: SegmentBatchTarget = 'current_file',
+  ) {
     if (mergeViewId.value) {
-      // 合并模式：对当前激活句段所属文件执行确认/取消
-      const fileId = activeFileRecordId.value
-      if (!fileId) {
+      const targetFileIds = target === 'merge_view'
+        ? (mergeViewDetail.value?.files ?? [])
+            .filter((file) => file.can_write !== false)
+            .map((file) => file.id)
+        : [activeFileRecordId.value].filter(Boolean) as string[]
+      if (!targetFileIds.length) {
         return 0
       }
       const synced = await syncToBackend()
       if (!synced) {
         return 0
       }
-      const { data } = await http.post<{ updated_count: number }>(
-        `/file-records/${fileId}/segments/confirmation`,
-        { action },
+      const results = await Promise.all(
+        targetFileIds.map((fileId) =>
+          http.post<{ updated_count: number }>(
+            `/file-records/${fileId}/segments/confirmation`,
+            { action },
+          ),
+        ),
       )
+      const updatedCount = results.reduce((sum, result) => sum + Number(result.data.updated_count || 0), 0)
+      await refreshMergeViewDetail()
       await refreshMergeViewPage(resolveCurrentMergeQuery())
-      return data.updated_count
+      return updatedCount
     }
 
     if (!fileRecord.value) {
@@ -2000,10 +2038,11 @@ export const useSegmentStore = defineStore('segment', () => {
     source = 'llm',
     status?: string | null,
     llmInfo: { provider?: string | null, model?: string | null } = {},
+    fileRecordId?: string | null,
   ) {
-    // 合并模式：LLM 端点返回真实 sentence_id，需用复合键（当前激活文件）定位
+    // 合并模式：LLM 端点返回真实 sentence_id，需用文件 id 拼复合键定位。
     const segmentKey = mergeViewId.value
-      ? buildSegmentKey(activeFileRecordId.value, sentenceId)
+      ? buildSegmentKey(fileRecordId || activeFileRecordId.value, sentenceId)
       : sentenceId
     const index = getSegmentIndex(segmentKey)
     if (index === -1) {
@@ -2041,9 +2080,26 @@ export const useSegmentStore = defineStore('segment', () => {
       return
     }
 
-    // 合并模式：仅支持对当前激活句段所在文件做翻译；batch 范围限定在该文件内。
+    const isMergeViewBatch = Boolean(
+      mergeViewId.value
+      && guidelineOptions.mergeTarget === 'merge_view'
+      && scope !== 'current_segment',
+    )
+    const mergeViewTargetFileIds = isMergeViewBatch
+      ? (mergeViewDetail.value?.files ?? [])
+          .filter((file) => file.can_write !== false)
+          .map((file) => file.id)
+      : []
     const llmFileId = mergeViewId.value ? activeFileRecordId.value : (fileRecord.value?.id ?? null)
-    if (!llmFileId) {
+    if (isMergeViewBatch && !mergeViewTargetFileIds.length) {
+      pushToast({
+        tone: 'warn',
+        title: 'AI 修正未开始',
+        message: '当前合并视图中没有可执行 AI 修正的可写文件。',
+      })
+      return
+    }
+    if (!isMergeViewBatch && !llmFileId) {
       return
     }
 
@@ -2073,56 +2129,113 @@ export const useSegmentStore = defineStore('segment', () => {
     try {
       const token = window.localStorage.getItem('token')
       llmAbortController = new AbortController()
-      const response = await fetch(`/api/file-records/${llmFileId}/llm-translate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({
-          scope,
-          provider,
-          model: guidelineOptions.model || null,
-          sentence_id: realSentenceId,
-          guideline_template_id: guidelineOptions.guidelineTemplateId || null,
-          temporary_prompt: guidelineOptions.temporaryPrompt || '',
-        }),
-        signal: llmAbortController.signal,
-      })
 
-      if (!response.ok) {
-        let message = translate('stores.segment.llmRequestFailed')
-        try {
-          const payload = await response.json()
-          message = String(payload.detail || message)
-        } catch {
-          // ignore parsing error
+      const runFileLLMTranslation = async (
+        targetFileId: string,
+        eventHandler: (event: string, data: Record<string, unknown>) => void,
+      ) => {
+        const response = await fetch(`/api/file-records/${targetFileId}/llm-translate`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'text/event-stream',
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({
+            scope,
+            provider,
+            model: guidelineOptions.model || null,
+            sentence_id: realSentenceId,
+            guideline_template_id: guidelineOptions.guidelineTemplateId || null,
+            temporary_prompt: guidelineOptions.temporaryPrompt || '',
+          }),
+          signal: llmAbortController?.signal,
+        })
+
+        if (!response.ok) {
+          let message = translate('stores.segment.llmRequestFailed')
+          try {
+            const payload = await response.json()
+            message = String(payload.detail || message)
+          } catch {
+            // ignore parsing error
+          }
+          throw new Error(message)
         }
-        throw new Error(message)
+
+        try {
+          await consumeLLMStream(
+            response,
+            ({ event, data }) => {
+              if (llmAbortRequested) {
+                return
+              }
+              eventHandler(event, data)
+            },
+            (reader) => {
+              llmReader = reader
+            },
+          )
+        } catch (error) {
+          if (error instanceof Error && error.message === 'SSE 响应体为空。') {
+            throw new Error(translate('stores.segment.llmNoStream'))
+          }
+          throw error
+        }
       }
 
-      try {
-        await consumeLLMStream(
-          response,
-          ({ event, data }) => {
-            if (llmAbortRequested) {
+      if (isMergeViewBatch) {
+        let aggregateTotal = 0
+        let aggregateUpdatedCount = 0
+        let aggregateErrorCount = 0
+
+        for (const targetFileId of mergeViewTargetFileIds) {
+          if (llmAbortRequested) {
+            break
+          }
+          await runFileLLMTranslation(targetFileId, (event, data) => {
+            if (event === 'start') {
+              aggregateTotal += Number(data.total || 0)
+              llmPlannedCount.value = aggregateTotal
+              llmMessage.value = translate('stores.segment.llmStarted', { total: aggregateTotal })
               return
             }
-            handleLLMEvent(event, data)
-          },
-          (reader) => {
-            llmReader = reader
-          },
-        )
-      } catch (error) {
-        if (error instanceof Error && error.message === 'SSE 响应体为空。') {
-          throw new Error(translate('stores.segment.llmNoStream'))
+            if (event === 'complete') {
+              aggregateUpdatedCount += Number(data.updated_count || 0)
+              aggregateErrorCount += Number(data.error_count || 0)
+              return
+            }
+            handleLLMEvent(event, data, targetFileId)
+          })
         }
-        throw error
+
+        if (!llmAbortRequested) {
+          llmPlannedCount.value = aggregateTotal
+          llmProcessedCount.value = Math.max(aggregateTotal, aggregateUpdatedCount + aggregateErrorCount)
+          llmErrorCount.value = aggregateErrorCount
+          llmMessage.value = translate('stores.segment.llmCompleted', {
+            updated: aggregateUpdatedCount,
+            error: aggregateErrorCount,
+          })
+          pushToast({
+            tone: aggregateErrorCount > 0 ? 'warn' : 'success',
+            title: translate('stores.segment.llmCompletedToastTitle'),
+            message: translate('stores.segment.llmCompletedToastMessage', {
+              updated: aggregateUpdatedCount,
+              error: aggregateErrorCount,
+            }),
+          })
+        }
+      } else {
+        await runFileLLMTranslation(llmFileId!, (event, data) => {
+          handleLLMEvent(event, data, llmFileId)
+        })
       }
 
-      if (!llmAbortRequested && !mergeViewId.value && fileRecord.value) {
+      if (!llmAbortRequested && mergeViewId.value) {
+        await refreshMergeViewDetail()
+        await refreshMergeViewPage(resolveCurrentMergeQuery())
+      } else if (!llmAbortRequested && fileRecord.value) {
         await loadRevisions(fileRecord.value.id)
       }
     } catch (error) {
@@ -2143,7 +2256,7 @@ export const useSegmentStore = defineStore('segment', () => {
     }
   }
 
-  function handleLLMEvent(event: string, data: Record<string, unknown>) {
+  function handleLLMEvent(event: string, data: Record<string, unknown>, fileRecordId?: string | null) {
     if (event === 'start') {
       const total = Number(data.total || 0)
       llmPlannedCount.value = total
@@ -2155,6 +2268,9 @@ export const useSegmentStore = defineStore('segment', () => {
 
     if (event === 'segment') {
       llmProcessedCount.value += 1
+      const eventFileRecordId = typeof data.file_record_id === 'string'
+        ? data.file_record_id
+        : fileRecordId
       applyLLMUpdate(
         String(data.sentence_id || ''),
         String(data.target_text || ''),
@@ -2164,6 +2280,7 @@ export const useSegmentStore = defineStore('segment', () => {
           provider: typeof data.provider === 'string' ? data.provider : null,
           model: typeof data.model === 'string' ? data.model : null,
         },
+        eventFileRecordId,
       )
       llmMessage.value = translate('stores.segment.llmProgress', {
         processed: llmProcessedCount.value,
@@ -2419,6 +2536,7 @@ export const useSegmentStore = defineStore('segment', () => {
     loadTask,
     loadMergeView,
     refreshMergeViewPage,
+    refreshMergeViewDetail,
     loadSegmentPage,
     refreshCurrentSegmentPage,
     loadMoreSegments,

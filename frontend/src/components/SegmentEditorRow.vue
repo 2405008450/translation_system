@@ -267,8 +267,14 @@ function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
+function resolveSearchKeyword(value: string) {
+  const normalized = value.replace(/\s+/g, ' ')
+  const trimmed = normalized.trim()
+  return trimmed || (normalized ? ' ' : '')
+}
+
 function highlightSearchText(text: string, keyword: string, caseSensitive = false): HighlightPart[] | null {
-  const query = keyword.trim()
+  const query = resolveSearchKeyword(keyword)
   if (!text || !query) {
     return null
   }
@@ -452,7 +458,7 @@ function renderSourceTextWithHighlights(text: string): string {
 }
 
 function hasSourceHighlights(): boolean {
-  return Boolean(props.sourceSearchQuery.trim()) || (props.matchedTerms || []).some((term) => Boolean(term.source_text))
+  return Boolean(resolveSearchKeyword(props.sourceSearchQuery)) || (props.matchedTerms || []).some((term) => Boolean(term.source_text))
 }
 
 function renderTargetTextWithHighlights(text: string): string {
@@ -466,7 +472,7 @@ function renderTargetTextWithHighlights(text: string): string {
 }
 
 function hasTargetHighlights(): boolean {
-  return Boolean(props.targetSearchQuery.trim())
+  return Boolean(resolveSearchKeyword(props.targetSearchQuery))
     || (props.matchedTerms || []).some((term) => Boolean(term.target_text))
     || activeQAIssues.value.length > 0
 }
