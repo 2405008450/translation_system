@@ -430,6 +430,10 @@ const actionMenuStyle = ref<Record<string, string>>({})
 const currentPage = ref(1)
 const pageSize = ref(10)
 const selectedFileIds = ref(new Set<string>())
+const fileSearchQuery = ref('')
+const fileStatusFilter = ref('all')
+const fileLanguagePairFilter = ref('all')
+const fileAssigneeFilter = ref('all')
 const mergeViews = ref<MergeView[]>([])
 const loadingMergeViews = ref(false)
 const savingMergeView = ref(false)
@@ -480,6 +484,7 @@ const savingTranslationMemorySettings = ref(false)
 const creatingTranslationMemoryPair = ref('')
 const translationMemorySettingsError = ref('')
 const expandedTMCollectionKey = ref('')
+const tmSettingsSearchQuery = ref('')
 const tmImportDialogContext = ref<{
   collectionId: string
   collectionName: string
@@ -496,6 +501,7 @@ const loadingTermBaseSettings = ref(false)
 const savingTermBaseSettings = ref(false)
 const creatingTermBasePair = ref('')
 const termBaseSettingsError = ref('')
+const termBaseSettingsSearchQuery = ref('')
 const termImportDialogContext = ref<{
   termBaseId: string
   termBaseName: string
@@ -639,6 +645,7 @@ let exportPollTimer: number | null = null
 let activePretranslationPollTimer: number | null = null
 const ACTIVE_PRETRANSLATION_STATUSES = new Set(['queued', 'running', 'canceling'])
 const ACTIVE_PRETRANSLATION_POLL_INTERVAL_MS = 2_500
+const FILE_UNASSIGNED_FILTER = '__unassigned__'
 
 const tabs = computed(() => ([
   { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
@@ -655,6 +662,103 @@ const tabs = computed(() => ([
   { key: 'quote' as const, label: t('projectDetail.tabs.quote'), disabled: true },
 ]))
 const tableRows = computed<ProjectFileItem[]>(() => project.value?.files ?? [])
+const fileStatusFilterOptions = computed(() => {
+  const counts = new Map<string, number>()
+  for (const file of tableRows.value) {
+    const status = String(file.status || '')
+    if (!status) {
+      continue
+    }
+    counts.set(status, (counts.get(status) ?? 0) + 1)
+  }
+  return Array.from(counts.entries())
+    .map(([value, count]) => ({
+      value,
+      count,
+      label: formatStatus(value),
+    }))
+    .sort((left, right) => left.label.localeCompare(right.label, 'zh-CN'))
+})
+const fileLanguagePairFilterOptions = computed(() => {
+  const options = new Map<string, { value: string; label: string; count: number }>()
+  for (const file of tableRows.value) {
+    const value = getFileLanguagePairKey(file)
+    const label = getFileLanguagePairLabel(file)
+    const current = options.get(value)
+    if (current) {
+      current.count += 1
+    } else {
+      options.set(value, { value, label, count: 1 })
+    }
+  }
+  return Array.from(options.values())
+    .sort((left, right) => left.label.localeCompare(right.label, 'zh-CN'))
+})
+const fileAssigneeFilterOptions = computed(() => {
+  const options = new Map<string, { value: string; label: string; count: number }>()
+  let unassignedCount = 0
+  for (const file of tableRows.value) {
+    const assignees = getFileAssignees(file)
+    if (assignees.length === 0) {
+      unassignedCount += 1
+      continue
+    }
+    for (const user of assignees) {
+      const label = getAssigneeDisplayName(user)
+      if (!user.id || !label) {
+        continue
+      }
+      const current = options.get(user.id)
+      if (current) {
+        current.count += 1
+      } else {
+        options.set(user.id, { value: user.id, label, count: 1 })
+      }
+    }
+  }
+  const rows = Array.from(options.values())
+    .sort((left, right) => left.label.localeCompare(right.label, 'zh-CN'))
+  if (unassignedCount > 0) {
+    rows.unshift({ value: FILE_UNASSIGNED_FILTER, label: '未分配', count: unassignedCount })
+  }
+  return rows
+})
+const hasFileFilters = computed(() => (
+  Boolean(normalizeFileFilterKeyword(fileSearchQuery.value))
+  || fileStatusFilter.value !== 'all'
+  || fileLanguagePairFilter.value !== 'all'
+  || fileAssigneeFilter.value !== 'all'
+))
+const filteredTableRows = computed<ProjectFileItem[]>(() => {
+  const keywords = normalizeFileFilterKeyword(fileSearchQuery.value).split(/\s+/).filter(Boolean)
+  let rows = [...tableRows.value]
+
+  if (keywords.length > 0) {
+    rows = rows.filter((file) => {
+      const text = getFileSearchText(file)
+      return keywords.every((keyword) => text.includes(keyword))
+    })
+  }
+
+  if (fileStatusFilter.value !== 'all') {
+    rows = rows.filter((file) => file.status === fileStatusFilter.value)
+  }
+
+  if (fileLanguagePairFilter.value !== 'all') {
+    rows = rows.filter((file) => getFileLanguagePairKey(file) === fileLanguagePairFilter.value)
+  }
+
+  if (fileAssigneeFilter.value === FILE_UNASSIGNED_FILTER) {
+    rows = rows.filter((file) => getFileAssigneeIds(file).length === 0)
+  } else if (fileAssigneeFilter.value !== 'all') {
+    rows = rows.filter((file) => getFileAssigneeIds(file).includes(fileAssigneeFilter.value))
+  }
+
+  return rows
+})
+const fileTableEmptyText = computed(() => (
+  hasFileFilters.value ? '没有符合筛选条件的文件' : t('projectDetail.files.empty')
+))
 const projectWorkflowSteps = computed<WorkflowStep[]>(() => project.value?.workflow_steps ?? [])
 const projectWorkflowProgress = computed<WorkflowProgress[]>(() => project.value?.workflow_progress ?? [])
 const projectWorkflowLabel = computed(() => (
@@ -668,6 +772,9 @@ const activeAssignmentWorkflowStep = computed(() => (
 const activeAssignmentDrafts = computed(() => (
   assignmentDrafts.value.filter((draft) => draft.workflow_step_id === activeAssignmentWorkflowStepId.value)
 ))
+const assignmentMergeViews = computed(() => (
+  mergeViews.value.filter((view) => getAssignableMergeViewFileIds(view).length >= 2)
+))
 const issueMarkers = computed<IssueMarker[]>(() => project.value?.issue_markers ?? [])
 const openIssueCount = computed(() => issueMarkers.value.filter((marker) => marker.status === 'open').length)
 const actionMenuRow = computed<ProjectFileItem | null>(() => {
@@ -677,7 +784,7 @@ const actionMenuRow = computed<ProjectFileItem | null>(() => {
 })
 const pagedRows = computed(() => {
   const start = (currentPage.value - 1) * pageSize.value
-  return tableRows.value.slice(start, start + pageSize.value)
+  return filteredTableRows.value.slice(start, start + pageSize.value)
 })
 const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
 const selectedProjectFiles = computed(() => (
@@ -1143,6 +1250,70 @@ function getAssigneeTooltip(user: User) {
 
 function normalizeAssignmentKeyword(value: string | null | undefined) {
   return String(value || '').trim().toLowerCase()
+}
+
+function normalizeFileFilterKeyword(value: string | null | undefined) {
+  return String(value || '').trim().toLowerCase()
+}
+
+function getFileLanguagePairKey(row: ProjectRow) {
+  return `${String(row.source_language || '')}->${String(row.target_language || '')}`
+}
+
+function getFileLanguagePairLabel(row: ProjectRow) {
+  if (!row.source_language || !row.target_language) {
+    return '未设置语言对'
+  }
+  return formatLanguagePair(row.source_language, row.target_language)
+}
+
+function getFileAssignees(row: ProjectRow): User[] {
+  const candidates = [
+    ...(Array.isArray(row.assignees) ? row.assignees : []),
+    row.assignee,
+  ].filter((user): user is User => Boolean(user && typeof user === 'object'))
+  const seen = new Set<string>()
+  const users: User[] = []
+  for (const user of candidates) {
+    if (!user.id || seen.has(user.id)) {
+      continue
+    }
+    seen.add(user.id)
+    users.push(user)
+  }
+  return users
+}
+
+function getFileAssigneeIds(row: ProjectRow) {
+  const ids = new Set(getFileAssignees(row).map((user) => user.id).filter(Boolean))
+  if (typeof row.assignee_id === 'string' && row.assignee_id) {
+    ids.add(row.assignee_id)
+  }
+  return Array.from(ids)
+}
+
+function getFileSearchText(row: ProjectRow) {
+  return [
+    row.filename,
+    row.status,
+    row.status ? formatStatus(String(row.status)) : '',
+    getFileLanguagePairLabel(row),
+    row.source_language,
+    row.target_language,
+    getLanguageLabel(row.source_language),
+    getLanguageLabel(row.target_language),
+    getAssigneeLabel(row),
+    row.creator,
+    formatBytes(row.file_size_bytes),
+    formatDateText(row.created_at),
+  ].map(normalizeFileFilterKeyword).join(' ')
+}
+
+function resetFileFilters() {
+  fileSearchQuery.value = ''
+  fileStatusFilter.value = 'all'
+  fileLanguagePairFilter.value = 'all'
+  fileAssigneeFilter.value = 'all'
 }
 
 function getAssignmentUserSearchText(user: User) {
@@ -1859,6 +2030,62 @@ function getFilteredAssignmentFiles(draft: AssignmentDraft) {
   return files
 }
 
+function getAssignableMergeViewFileIds(view: MergeView) {
+  const projectFileIds = new Set(tableRows.value.map((file) => file.id))
+  return (view.file_ids || []).filter((fileId) => projectFileIds.has(fileId))
+}
+
+function isAssignmentMergeViewChecked(draft: AssignmentDraft, view: MergeView) {
+  const fileIds = getAssignableMergeViewFileIds(view)
+  return fileIds.length > 0 && fileIds.every((fileId) => draft.file_record_ids.has(fileId))
+}
+
+function isAssignmentMergeViewPartial(draft: AssignmentDraft, view: MergeView) {
+  const fileIds = getAssignableMergeViewFileIds(view)
+  if (fileIds.length === 0 || isAssignmentMergeViewChecked(draft, view)) {
+    return false
+  }
+  return fileIds.some((fileId) => draft.file_record_ids.has(fileId))
+}
+
+function toggleAssignmentMergeView(draft: AssignmentDraft, view: MergeView) {
+  const fileIds = getAssignableMergeViewFileIds(view)
+  if (fileIds.length === 0) {
+    return
+  }
+  const shouldRemove = isAssignmentMergeViewChecked(draft, view)
+  assignmentDrafts.value = assignmentDrafts.value.map((item) => {
+    if (item.assignee_id !== draft.assignee_id || item.workflow_step_id !== draft.workflow_step_id) {
+      return item
+    }
+    const nextFileIds = new Set(item.file_record_ids)
+    for (const fileId of fileIds) {
+      if (shouldRemove) {
+        nextFileIds.delete(fileId)
+      } else {
+        nextFileIds.add(fileId)
+      }
+    }
+    return {
+      ...item,
+      file_record_ids: nextFileIds,
+    }
+  })
+}
+
+function getAssignmentMergeViewMeta(view: MergeView) {
+  return [
+    `${getAssignableMergeViewFileIds(view).length} 个文件`,
+    view.creator_name ? `创建人 ${view.creator_name}` : '',
+  ].filter(Boolean).join(' · ')
+}
+
+function getCheckedAssignmentMergeViewIds(draft: AssignmentDraft) {
+  return assignmentMergeViews.value
+    .filter((view) => isAssignmentMergeViewChecked(draft, view))
+    .map((view) => view.id)
+}
+
 function updateFilteredAssignmentFiles(userId: string, checked: boolean) {
   const draft = getAssignmentDraft(userId)
   if (!draft) {
@@ -1954,7 +2181,7 @@ async function openAssignmentDialog(_row?: ProjectFileItem | null) {
   resetAssignmentFilters()
   ensureActiveAssignmentWorkflowStep()
   showAssignmentDialog.value = true
-  await Promise.all([loadAssignableUsers(), loadProjectAssignments()])
+  await Promise.all([loadAssignableUsers(), loadProjectAssignments(), loadMergeViews()])
 }
 
 function closeAssignmentDialog() {
@@ -1976,6 +2203,7 @@ async function saveAssignment() {
         assignee_id: draft.assignee_id,
         workflow_step_id: draft.workflow_step_id,
         file_record_ids: Array.from(draft.file_record_ids),
+        merge_view_ids: getCheckedAssignmentMergeViewIds(draft),
       })),
     })
     toast.success('项目指派已更新。')
@@ -2602,7 +2830,7 @@ async function loadProjectTermBaseSettings() {
     const { data } = await http.get<ProjectTermBaseSettingsResponse>(
       `/projects/${project.value.id}/term-base-settings`,
     )
-    sortTermBaseSettings(data)
+    preserveTermBaseSettingsDisplayOrder(data, termBaseSettings.value)
     termBaseSettings.value = data
   } catch (error) {
     termBaseSettingsError.value = getErrorMessage(error, '术语库设置加载失败。')
@@ -2622,7 +2850,7 @@ async function loadProjectTranslationMemorySettings() {
     const { data } = await http.get<ProjectTranslationMemorySettingsResponse>(
       `/projects/${project.value.id}/translation-memory-settings`,
     )
-    sortTranslationMemorySettings(data)
+    preserveTranslationMemorySettingsDisplayOrder(data, translationMemorySettings.value)
     translationMemorySettings.value = data
   } catch (error) {
     translationMemorySettingsError.value = getErrorMessage(error, '记忆库设置加载失败。')
@@ -2821,6 +3049,56 @@ function getTMCollectionBoundSummary(group: ProjectTranslationMemorySettingGroup
   return `${count}/${group.files.length} 个文件`
 }
 
+function normalizeResourceSettingsSearchText(value: unknown) {
+  return String(value ?? '').trim().toLowerCase()
+}
+
+function getResourceSettingsSearchKeywords(value: string) {
+  return normalizeResourceSettingsSearchText(value).split(/\s+/).filter(Boolean)
+}
+
+function getTMCollectionSearchText(
+  group: ProjectTranslationMemorySettingGroup,
+  collection: ProjectTranslationMemorySettingCollection,
+) {
+  return [
+    collection.name,
+    collection.description,
+    collection.entry_count,
+    formatLanguagePair(collection.source_language, collection.target_language),
+    getLanguageLabel(collection.source_language),
+    getLanguageLabel(collection.target_language),
+    isTMCollectionEnabled(group, collection.id) ? '已启用 enabled' : '未启用 disabled',
+    isTMCollectionWritable(group, collection.id) ? '写入 writable' : '',
+    getTMCollectionBoundSummary(group, collection.id),
+  ].map(normalizeResourceSettingsSearchText).join(' ')
+}
+
+function getFilteredTMCollections(group: ProjectTranslationMemorySettingGroup) {
+  const keywords = getResourceSettingsSearchKeywords(tmSettingsSearchQuery.value)
+  if (keywords.length === 0) {
+    return group.collections
+  }
+  return group.collections.filter((collection) => {
+    const searchText = getTMCollectionSearchText(group, collection)
+    return keywords.every((keyword) => searchText.includes(keyword))
+  })
+}
+
+function getFilteredTMSettingsCollectionCount() {
+  return translationMemorySettings.value?.groups.reduce(
+    (total, group) => total + getFilteredTMCollections(group).length,
+    0,
+  ) ?? 0
+}
+
+function getTMSettingsCollectionCount() {
+  return translationMemorySettings.value?.groups.reduce(
+    (total, group) => total + group.collections.length,
+    0,
+  ) ?? 0
+}
+
 function isTMCollectionEnabled(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
   return getTMCollectionBoundFiles(group, collectionId).length > 0
 }
@@ -2852,6 +3130,45 @@ function sortTranslationMemorySettings(settings: ProjectTranslationMemorySetting
   }
 }
 
+function preserveTranslationMemorySettingsDisplayOrder(
+  settings: ProjectTranslationMemorySettingsResponse,
+  previousSettings: ProjectTranslationMemorySettingsResponse | null,
+) {
+  if (!previousSettings) {
+    sortTranslationMemorySettings(settings)
+    return
+  }
+
+  const previousGroupByKey = new Map(
+    previousSettings.groups.map((group) => [translationMemorySettingGroupKey(group), group]),
+  )
+  for (const group of settings.groups) {
+    const previousGroup = previousGroupByKey.get(translationMemorySettingGroupKey(group))
+    if (!previousGroup) {
+      sortTMCollectionsByEnabled(group)
+      continue
+    }
+    const displayOrderById = new Map(previousGroup.collections.map((collection, index) => [collection.id, index]))
+    group.collections = group.collections
+      .map((collection, index) => ({ collection, index }))
+      .sort((left, right) => {
+        const leftOrder = displayOrderById.get(left.collection.id)
+        const rightOrder = displayOrderById.get(right.collection.id)
+        if (typeof leftOrder === 'number' && typeof rightOrder === 'number') {
+          return leftOrder - rightOrder
+        }
+        if (typeof leftOrder === 'number') {
+          return -1
+        }
+        if (typeof rightOrder === 'number') {
+          return 1
+        }
+        return left.index - right.index
+      })
+      .map(({ collection }) => collection)
+  }
+}
+
 function isTMCollectionWritable(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
   return group.files.some((file) => file.collection_id === collectionId)
 }
@@ -2873,7 +3190,6 @@ function toggleTMCollectionEnabled(
       }
     }
   }
-  sortTMCollectionsByEnabled(group, checked ? collectionId : '')
 }
 
 function toggleTMCollectionWritable(
@@ -2892,7 +3208,6 @@ function toggleTMCollectionWritable(
       file.collection_id = file.collection_ids.find((id) => id !== collectionId) || null
     }
   }
-  sortTMCollectionsByEnabled(group, checked ? collectionId : '')
 }
 
 function toggleTMCollectionDetails(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
@@ -2926,10 +3241,6 @@ function toggleFileTMCollection(
   if (checked && !file.collection_id) {
     file.collection_id = collectionId
   }
-  const group = translationMemorySettings.value?.groups.find((candidate) => candidate.files.some((item) => item.id === file.id))
-  if (group) {
-    sortTMCollectionsByEnabled(group, checked ? collectionId : '')
-  }
 }
 
 function setFilePrimaryTMCollection(file: ProjectTranslationMemorySettingFile, event: Event) {
@@ -2937,10 +3248,6 @@ function setFilePrimaryTMCollection(file: ProjectTranslationMemorySettingFile, e
   file.collection_id = collectionId
   if (collectionId && !file.collection_ids.includes(collectionId)) {
     file.collection_ids = [...file.collection_ids, collectionId]
-  }
-  const group = translationMemorySettings.value?.groups.find((candidate) => candidate.files.some((item) => item.id === file.id))
-  if (group) {
-    sortTMCollectionsByEnabled(group, collectionId || '')
   }
 }
 
@@ -2967,7 +3274,6 @@ function setTMCollectionBindingForAll(
       file.collection_id = collectionId
     }
   }
-  sortTMCollectionsByEnabled(group, enabled ? collectionId : '')
 }
 
 function toggleTMCollectionBindingForAll(
@@ -3008,7 +3314,6 @@ function setGroupPrimaryTMCollection(group: ProjectTranslationMemorySettingGroup
       file.collection_ids = [...file.collection_ids, collectionId]
     }
   }
-  sortTMCollectionsByEnabled(group, collectionId || '')
 }
 
 function buildTranslationMemorySettingsPayload() {
@@ -3037,7 +3342,7 @@ async function saveProjectTranslationMemorySettings() {
       `/projects/${project.value.id}/translation-memory-settings`,
       buildTranslationMemorySettingsPayload(),
     )
-    sortTranslationMemorySettings(data)
+    preserveTranslationMemorySettingsDisplayOrder(data, translationMemorySettings.value)
     translationMemorySettings.value = data
     toast.show({
       tone: 'success',
@@ -3135,6 +3440,48 @@ function getTermBaseSettingPairLabel(group: ProjectTermBaseSettingGroup) {
   return formatLanguagePair(group.source_language, group.target_language)
 }
 
+function getTermBaseSearchText(
+  group: ProjectTermBaseSettingGroup,
+  row: ProjectTermBaseSettingRow,
+) {
+  return [
+    row.name,
+    row.description,
+    row.entry_count,
+    getTermBaseSettingPairLabel(group),
+    getLanguageLabel(row.source_language),
+    getLanguageLabel(row.target_language),
+    row.enabled ? '已启用 enabled' : '未启用 disabled',
+    row.writable ? '写入 writable' : '',
+    row.qa ? 'qa 质量检查' : '',
+  ].map(normalizeResourceSettingsSearchText).join(' ')
+}
+
+function getFilteredTermBaseRows(group: ProjectTermBaseSettingGroup) {
+  const keywords = getResourceSettingsSearchKeywords(termBaseSettingsSearchQuery.value)
+  if (keywords.length === 0) {
+    return group.term_bases
+  }
+  return group.term_bases.filter((row) => {
+    const searchText = getTermBaseSearchText(group, row)
+    return keywords.every((keyword) => searchText.includes(keyword))
+  })
+}
+
+function getFilteredTermBaseSettingsRowCount() {
+  return termBaseSettings.value?.groups.reduce(
+    (total, group) => total + getFilteredTermBaseRows(group).length,
+    0,
+  ) ?? 0
+}
+
+function getTermBaseSettingsRowCount() {
+  return termBaseSettings.value?.groups.reduce(
+    (total, group) => total + group.term_bases.length,
+    0,
+  ) ?? 0
+}
+
 function sortTermBaseSettings(settings: ProjectTermBaseSettingsResponse) {
   for (const group of settings.groups) {
     sortTermBaseSettingGroup(group)
@@ -3157,15 +3504,71 @@ function sortTermBaseSettingGroup(group: ProjectTermBaseSettingGroup) {
   normalizeTermBaseQAPriority(group)
 }
 
+function getOrderedTermBaseQARows(group: ProjectTermBaseSettingGroup) {
+  const displayOrderById = new Map(group.term_bases.map((row, index) => [row.id, index]))
+  return group.term_bases
+    .filter((row) => row.qa)
+    .sort((left, right) => {
+      const leftPriority = typeof left.qa_priority === 'number' ? left.qa_priority : Number.MAX_SAFE_INTEGER
+      const rightPriority = typeof right.qa_priority === 'number' ? right.qa_priority : Number.MAX_SAFE_INTEGER
+      if (leftPriority !== rightPriority) {
+        return leftPriority - rightPriority
+      }
+      return (displayOrderById.get(left.id) ?? 0) - (displayOrderById.get(right.id) ?? 0)
+    })
+}
+
 function normalizeTermBaseQAPriority(group: ProjectTermBaseSettingGroup) {
-  let priority = 1
+  const orderedQARows = getOrderedTermBaseQARows(group)
   for (const row of group.term_bases) {
-    if (row.qa) {
-      row.qa_priority = priority
-      priority += 1
-    } else {
+    if (!row.qa) {
       row.qa_priority = null
     }
+  }
+  let priority = 1
+  for (const row of orderedQARows) {
+    row.qa_priority = priority
+    priority += 1
+  }
+}
+
+function preserveTermBaseSettingsDisplayOrder(
+  settings: ProjectTermBaseSettingsResponse,
+  previousSettings: ProjectTermBaseSettingsResponse | null,
+) {
+  if (!previousSettings) {
+    sortTermBaseSettings(settings)
+    return
+  }
+
+  const previousGroupByKey = new Map(
+    previousSettings.groups.map((group) => [termBaseSettingGroupKey(group), group]),
+  )
+  for (const group of settings.groups) {
+    const previousGroup = previousGroupByKey.get(termBaseSettingGroupKey(group))
+    if (!previousGroup) {
+      sortTermBaseSettingGroup(group)
+      continue
+    }
+    const displayOrderById = new Map(previousGroup.term_bases.map((row, index) => [row.id, index]))
+    group.term_bases = group.term_bases
+      .map((row, index) => ({ row, index }))
+      .sort((left, right) => {
+        const leftOrder = displayOrderById.get(left.row.id)
+        const rightOrder = displayOrderById.get(right.row.id)
+        if (typeof leftOrder === 'number' && typeof rightOrder === 'number') {
+          return leftOrder - rightOrder
+        }
+        if (typeof leftOrder === 'number') {
+          return -1
+        }
+        if (typeof rightOrder === 'number') {
+          return 1
+        }
+        return left.index - right.index
+      })
+      .map(({ row }) => row)
+    normalizeTermBaseQAPriority(group)
   }
 }
 
@@ -3188,7 +3591,6 @@ function toggleTermBaseSetting(
     row.enabled = true
   }
   normalizeTermBaseQAPriority(group)
-  sortTermBaseSettingGroup(group)
 }
 
 function moveTermBaseQAPriority(
@@ -3199,22 +3601,20 @@ function moveTermBaseQAPriority(
   if (!row.qa) {
     return
   }
-  const currentIndex = group.term_bases.findIndex((item) => item.id === row.id)
+  const orderedQARows = getOrderedTermBaseQARows(group)
+  const currentIndex = orderedQARows.findIndex((item) => item.id === row.id)
   if (currentIndex < 0) {
     return
   }
   const targetIndex = currentIndex + direction
-  if (
-    targetIndex < 0
-    || targetIndex >= group.term_bases.length
-    || !group.term_bases[targetIndex].qa
-  ) {
+  if (targetIndex < 0 || targetIndex >= orderedQARows.length) {
     return
   }
-  const nextRows = [...group.term_bases]
-  const [movedRow] = nextRows.splice(currentIndex, 1)
-  nextRows.splice(targetIndex, 0, movedRow)
-  group.term_bases = nextRows
+  const [movedRow] = orderedQARows.splice(currentIndex, 1)
+  orderedQARows.splice(targetIndex, 0, movedRow)
+  orderedQARows.forEach((item, index) => {
+    item.qa_priority = index + 1
+  })
   normalizeTermBaseQAPriority(group)
 }
 
@@ -3249,7 +3649,7 @@ function buildTermBaseSettingsPayload() {
       target_language: group.target_language,
       enabled_term_base_ids: group.term_bases.filter((row) => row.enabled).map((row) => row.id),
       writable_term_base_ids: group.term_bases.filter((row) => row.enabled && row.writable).map((row) => row.id),
-      qa_term_base_ids: group.term_bases.filter((row) => row.enabled && row.qa).map((row) => row.id),
+      qa_term_base_ids: getOrderedTermBaseQARows(group).filter((row) => row.enabled).map((row) => row.id),
     })),
   }
 }
@@ -3265,7 +3665,7 @@ async function saveProjectTermBaseSettings(showSuccessToast = true) {
       `/projects/${project.value.id}/term-base-settings`,
       buildTermBaseSettingsPayload(),
     )
-    sortTermBaseSettings(data)
+    preserveTermBaseSettingsDisplayOrder(data, termBaseSettings.value)
     termBaseSettings.value = data
     if (showSuccessToast) {
       toast.show({
@@ -3984,6 +4384,22 @@ watch(() => route.hash, () => {
   syncProjectSettingsHash()
 })
 
+watch([fileSearchQuery, fileStatusFilter, fileLanguagePairFilter, fileAssigneeFilter], () => {
+  currentPage.value = 1
+  if (selectedFileIds.value.size > 0) {
+    const visibleFileIds = new Set(filteredTableRows.value.map((file) => file.id))
+    selectedFileIds.value = new Set(Array.from(selectedFileIds.value).filter((id) => visibleFileIds.has(id)))
+  }
+  closeActionMenu()
+})
+
+watch([filteredTableRows, pageSize], () => {
+  const totalPages = Math.max(1, Math.ceil(filteredTableRows.value.length / pageSize.value))
+  if (currentPage.value > totalPages) {
+    currentPage.value = totalPages
+  }
+})
+
 onBeforeUnmount(() => {
   document.removeEventListener('click', handleDocumentClick)
   window.removeEventListener('scroll', handleDocumentScroll)
@@ -4515,6 +4931,28 @@ onBeforeUnmount(() => {
                   当前项目还没有可配置语言对的文件。
                 </div>
                 <div v-else class="tm-settings__groups">
+                  <div class="resource-settings-search">
+                    <label class="resource-settings-search__field">
+                      <Search :size="14" />
+                      <input
+                        v-model="tmSettingsSearchQuery"
+                        type="search"
+                        placeholder="搜索记忆库名称、说明、语言或条目数"
+                      >
+                    </label>
+                    <span class="resource-settings-search__summary">
+                      显示 {{ getFilteredTMSettingsCollectionCount() }} / {{ getTMSettingsCollectionCount() }} 个记忆库
+                    </span>
+                    <button
+                      v-if="tmSettingsSearchQuery"
+                      class="resource-settings-search__clear"
+                      type="button"
+                      title="清空搜索"
+                      @click="tmSettingsSearchQuery = ''"
+                    >
+                      <X :size="14" />
+                    </button>
+                  </div>
                   <section
                     v-for="group in translationMemorySettings.groups"
                     :key="translationMemorySettingGroupKey(group)"
@@ -4523,7 +4961,13 @@ onBeforeUnmount(() => {
                     <div class="tm-settings__panel-head">
                       <div>
                         <strong>{{ getTranslationMemorySettingPairLabel(group) }}</strong>
-                        <span>{{ group.file_count }} 个文件 · {{ group.collections.length }} 个记忆库</span>
+                        <span>
+                          {{ group.file_count }} 个文件 ·
+                          <template v-if="tmSettingsSearchQuery">
+                            显示 {{ getFilteredTMCollections(group).length }} / {{ group.collections.length }} 个记忆库
+                          </template>
+                          <template v-else>{{ group.collections.length }} 个记忆库</template>
+                        </span>
                       </div>
                       <div class="tm-settings__panel-actions">
                         <label class="tm-settings__threshold">
@@ -4590,7 +5034,10 @@ onBeforeUnmount(() => {
                           </tr>
                         </thead>
                         <tbody>
-                          <template v-for="(collection, collectionIndex) in group.collections" :key="collection.id">
+                          <tr v-if="getFilteredTMCollections(group).length === 0">
+                            <td colspan="10">没有匹配的记忆库。</td>
+                          </tr>
+                          <template v-for="(collection, collectionIndex) in getFilteredTMCollections(group)" :key="collection.id">
                             <tr>
                               <td>{{ collectionIndex + 1 }}</td>
                               <td>
@@ -4754,6 +5201,28 @@ onBeforeUnmount(() => {
                   当前项目还没有可配置语言对的文件。
                 </div>
                 <div v-else class="term-settings__groups">
+                  <div class="resource-settings-search">
+                    <label class="resource-settings-search__field">
+                      <Search :size="14" />
+                      <input
+                        v-model="termBaseSettingsSearchQuery"
+                        type="search"
+                        placeholder="搜索术语库名称、说明、语言、条目数或 QA"
+                      >
+                    </label>
+                    <span class="resource-settings-search__summary">
+                      显示 {{ getFilteredTermBaseSettingsRowCount() }} / {{ getTermBaseSettingsRowCount() }} 个术语库
+                    </span>
+                    <button
+                      v-if="termBaseSettingsSearchQuery"
+                      class="resource-settings-search__clear"
+                      type="button"
+                      title="清空搜索"
+                      @click="termBaseSettingsSearchQuery = ''"
+                    >
+                      <X :size="14" />
+                    </button>
+                  </div>
                   <section
                     v-for="group in termBaseSettings.groups"
                     :key="termBaseSettingGroupKey(group)"
@@ -4761,7 +5230,11 @@ onBeforeUnmount(() => {
                   >
                     <div class="term-settings__group-head">
                       <span class="term-settings__group-summary">
-                        {{ getTermBaseSettingPairLabel(group) }} · {{ group.file_count }} 个文件 · {{ group.term_bases.length }} 个术语库
+                        {{ getTermBaseSettingPairLabel(group) }} · {{ group.file_count }} 个文件 ·
+                        <template v-if="termBaseSettingsSearchQuery">
+                          显示 {{ getFilteredTermBaseRows(group).length }} / {{ group.term_bases.length }} 个术语库
+                        </template>
+                        <template v-else>{{ group.term_bases.length }} 个术语库</template>
                       </span>
                       <button
                         class="button term-settings__create"
@@ -4797,7 +5270,10 @@ onBeforeUnmount(() => {
                           <tr v-if="group.term_bases.length === 0">
                             <td colspan="6">当前语言对暂无术语库。</td>
                           </tr>
-                          <tr v-for="row in group.term_bases" :key="row.id">
+                          <tr v-else-if="getFilteredTermBaseRows(group).length === 0">
+                            <td colspan="6">没有匹配的术语库。</td>
+                          </tr>
+                          <tr v-for="row in getFilteredTermBaseRows(group)" :key="row.id">
                             <td>
                               <span class="term-settings__name">{{ row.name }}</span>
                               <span class="term-settings__meta">{{ row.entry_count }} 条术语</span>
@@ -5505,10 +5981,75 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="table-toolbar__right pd-toolbar__right">
-            <button class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
-              <Filter :size="14" />
-              {{ t('projectDetail.files.actions.filter') }}
-            </button>
+            <div class="pd-file-filters" role="search" aria-label="文件筛选">
+              <span class="pd-file-filters__lead" title="筛选文件" aria-hidden="true">
+                <Filter :size="14" />
+              </span>
+              <label class="pd-file-filter pd-file-filter--search">
+                <Search class="pd-file-filter__search-icon" :size="14" aria-hidden="true" />
+                <input
+                  v-model="fileSearchQuery"
+                  class="pd-file-filter__input"
+                  type="search"
+                  placeholder="搜索文件名、语言、负责人"
+                  aria-label="搜索文件"
+                  @keydown.esc="fileSearchQuery = ''"
+                />
+                <button
+                  v-if="fileSearchQuery"
+                  class="pd-file-filter__clear"
+                  type="button"
+                  title="清空搜索"
+                  aria-label="清空搜索"
+                  @click="fileSearchQuery = ''"
+                >
+                  <X :size="13" />
+                </button>
+              </label>
+              <select
+                v-model="fileStatusFilter"
+                class="pd-file-filter__select pd-file-filter__select--status"
+                aria-label="状态筛选"
+              >
+                <option value="all">全部状态</option>
+                <option v-for="option in fileStatusFilterOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}（{{ option.count }}）
+                </option>
+              </select>
+              <select
+                v-model="fileLanguagePairFilter"
+                class="pd-file-filter__select pd-file-filter__select--language"
+                aria-label="语言对筛选"
+              >
+                <option value="all">全部语言对</option>
+                <option v-for="option in fileLanguagePairFilterOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}（{{ option.count }}）
+                </option>
+              </select>
+              <select
+                v-model="fileAssigneeFilter"
+                class="pd-file-filter__select pd-file-filter__select--assignee"
+                aria-label="负责人筛选"
+              >
+                <option value="all">全部负责人</option>
+                <option v-for="option in fileAssigneeFilterOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}（{{ option.count }}）
+                </option>
+              </select>
+              <button
+                v-if="hasFileFilters"
+                class="button pd-file-filter__reset"
+                type="button"
+                @click="resetFileFilters"
+              >
+                <RotateCcw :size="14" />
+                清空
+              </button>
+              <span class="pd-file-filter__summary">
+                显示 {{ filteredTableRows.length }} / {{ tableRows.length }} 个文件
+                <template v-if="selectedFileIds.size > 0"> · 已选 {{ selectedFileIds.size }}</template>
+              </span>
+            </div>
             <button class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
               <Settings2 :size="14" />
               {{ t('projectDetail.files.actions.columns') }}
@@ -5527,7 +6068,7 @@ onBeforeUnmount(() => {
           :selected-ids="selectedFileIds"
           :show-index="true"
           :index-offset="indexOffset"
-          :empty-text="t('projectDetail.files.empty')"
+          :empty-text="fileTableEmptyText"
           @select="selectedFileIds = $event"
         >
           <template #filename="{ row }">
@@ -5650,10 +6191,10 @@ onBeforeUnmount(() => {
         </DataTable>
 
         <Pagination
-          :total="tableRows.length"
+          :total="filteredTableRows.length"
           :page="currentPage"
           :page-size="pageSize"
-          :page-sizes="[10]"
+          :page-sizes="[10, 20, 50, 100, 200]"
           @update:page="currentPage = $event"
           @update:page-size="pageSize = $event"
         />
@@ -6150,10 +6691,10 @@ onBeforeUnmount(() => {
         <section class="pd-assignment-panel pd-assignment-files">
           <div class="pd-assignment-panel__head pd-assignment-panel__head--files">
             <div>
-              <strong>文件授权</strong>
+              <strong>文件 / 视图授权</strong>
               <span>已选择 {{ assignmentDrafts.length }} 位译者</span>
             </div>
-            <span>{{ tableRows.length }} 个文件</span>
+            <span>{{ tableRows.length }} 个文件 · {{ assignmentMergeViews.length }} 个视图</span>
           </div>
 
           <div v-if="projectWorkflowSteps.length > 0" class="pd-assignment-workflow-tabs">
@@ -6241,6 +6782,30 @@ onBeforeUnmount(() => {
                     清空筛选结果
                   </button>
                 </div>
+              </div>
+
+              <div v-if="assignmentMergeViews.length > 0" class="pd-assignment-view-list">
+                <div class="pd-assignment-view-list__head">
+                  <strong>按视图授权</strong>
+                  <span>勾选后自动选择视图内文件</span>
+                </div>
+                <label
+                  v-for="view in assignmentMergeViews"
+                  :key="`${draft.assignee_id}-${draft.workflow_step_id}-${view.id}`"
+                  class="pd-assignment-view-option"
+                  :class="{ 'is-partial': isAssignmentMergeViewPartial(draft, view) }"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="isAssignmentMergeViewChecked(draft, view)"
+                    :disabled="savingAssignment"
+                    @change="toggleAssignmentMergeView(draft, view)"
+                  />
+                  <span>
+                    <strong>{{ view.name }}</strong>
+                    <small>{{ getAssignmentMergeViewMeta(view) }}</small>
+                  </span>
+                </label>
               </div>
 
               <p v-if="tableRows.length === 0" class="hint-text pd-assignment-mini-empty">
@@ -6931,6 +7496,134 @@ onBeforeUnmount(() => {
 .pd-toolbar__left,
 .pd-toolbar__right {
   flex-wrap: wrap;
+}
+
+.pd-file-filters {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  max-width: 100%;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.pd-file-filters__lead {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 32px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-muted);
+  color: var(--text-muted);
+}
+
+.pd-file-filter {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.pd-file-filter--search {
+  flex: 1 1 240px;
+  width: min(330px, 36vw);
+  max-width: 360px;
+}
+
+.pd-file-filter__input,
+.pd-file-filter__select {
+  min-height: 32px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--control-bg);
+  color: var(--text-primary);
+  font-size: 13px;
+  transition:
+    border-color var(--motion-base) var(--ease-standard),
+    background var(--motion-base) var(--ease-standard),
+    box-shadow var(--motion-base) var(--ease-standard);
+}
+
+.pd-file-filter__input {
+  width: 100%;
+  padding: 5px 32px 5px 32px;
+}
+
+.pd-file-filter__select {
+  height: 32px;
+  padding: 0 28px 0 10px;
+}
+
+.pd-file-filter__select--status {
+  width: 132px;
+}
+
+.pd-file-filter__select--language {
+  width: 178px;
+}
+
+.pd-file-filter__select--assignee {
+  width: 150px;
+}
+
+.pd-file-filter__input::placeholder {
+  color: var(--text-placeholder);
+}
+
+.pd-file-filter__input:hover,
+.pd-file-filter__select:hover {
+  border-color: color-mix(in srgb, var(--brand-700) 58%, var(--line-strong));
+  background: var(--surface-panel);
+}
+
+.pd-file-filter__input:focus,
+.pd-file-filter__select:focus {
+  outline: none;
+  border-color: var(--brand-700);
+  box-shadow: var(--focus-ring);
+}
+
+.pd-file-filter__search-icon {
+  position: absolute;
+  left: 10px;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+.pd-file-filter__clear {
+  position: absolute;
+  right: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  box-shadow: none;
+}
+
+.pd-file-filter__clear:hover {
+  background: var(--surface-muted);
+  color: var(--brand-700);
+}
+
+.pd-file-filter__reset {
+  min-height: 32px;
+  padding: 4px 10px;
+  font-size: 13px;
+}
+
+.pd-file-filter__summary {
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .pd-merge-view-list {
@@ -8061,6 +8754,75 @@ onBeforeUnmount(() => {
   box-shadow: none;
 }
 
+.pd-assignment-view-list {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-muted) 54%, var(--surface-panel));
+}
+
+.pd-assignment-view-list__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.pd-assignment-view-list__head strong {
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.pd-assignment-view-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-height: 38px;
+  padding: 7px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.pd-assignment-view-option:hover {
+  border-color: var(--line-soft);
+  background: var(--surface-panel);
+}
+
+.pd-assignment-view-option.is-partial {
+  border-color: color-mix(in srgb, var(--state-warning) 42%, var(--line-soft));
+  background: color-mix(in srgb, var(--state-warning-bg) 62%, var(--surface-panel));
+}
+
+.pd-assignment-view-option > span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.pd-assignment-view-option strong,
+.pd-assignment-view-option small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-assignment-view-option strong {
+  color: var(--text-primary);
+}
+
+.pd-assignment-view-option small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 .pd-assignment-file-list {
   display: grid;
   gap: 4px;
@@ -8553,6 +9315,75 @@ onBeforeUnmount(() => {
 .resource-settings-block__head span {
   color: var(--text-muted);
   font-size: 12px;
+}
+
+.resource-settings-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-muted) 46%, var(--surface-panel));
+}
+
+.resource-settings-search__field {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 1 1 280px;
+  min-width: min(100%, 240px);
+}
+
+.resource-settings-search__field svg {
+  position: absolute;
+  left: 10px;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+.resource-settings-search__field input {
+  width: 100%;
+  height: 34px;
+  padding: 0 10px 0 32px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface-panel);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+}
+
+.resource-settings-search__field input:focus {
+  border-color: var(--brand-700);
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.resource-settings-search__summary {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.resource-settings-search__clear {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-panel);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.resource-settings-search__clear:hover {
+  border-color: var(--line-strong);
+  color: var(--brand-700);
 }
 
 .tm-settings__bulk {
@@ -9435,6 +10266,21 @@ onBeforeUnmount(() => {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .pd-toolbar__right {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .pd-file-filters {
+    flex: 1 1 100%;
+    justify-content: flex-start;
+  }
+
+  .pd-file-filter--search {
+    width: auto;
+    max-width: none;
+  }
+
 }
 
 @media (max-width: 720px) {
@@ -9488,6 +10334,21 @@ onBeforeUnmount(() => {
   .pd-settings-actions .button {
     flex: 1 1 140px;
     justify-content: center;
+  }
+
+  .pd-file-filters__lead {
+    display: none;
+  }
+
+  .pd-file-filter--search,
+  .pd-file-filter__select,
+  .pd-file-filter__summary,
+  .pd-file-filter__reset {
+    width: 100%;
+  }
+
+  .pd-file-filter__summary {
+    white-space: normal;
   }
 
   .tm-settings__bulk {

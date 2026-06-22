@@ -11,7 +11,7 @@ import Modal from '../components/base/Modal.vue'
 import Pagination from '../components/Pagination.vue'
 import RowActionMenu from '../components/RowActionMenu.vue'
 import { useConfirm } from '../composables/useConfirm'
-import { canonicalizeLanguagePair, formatLanguagePair, languageOptions } from '../constants/languages'
+import { canonicalizeLanguagePair, formatLanguagePair, getLanguageLabel, languageOptions } from '../constants/languages'
 import { useAuthStore } from '../stores/auth'
 import type { TermBase } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
@@ -78,6 +78,29 @@ let exportPollTimer: number | null = null
 let disposed = false
 
 const canManageResources = computed(() => authStore.isAdmin)
+
+function normalizeResourceSearchText(value: unknown) {
+  return String(value ?? '').trim().toLowerCase()
+}
+
+function getResourceSearchKeywords() {
+  return normalizeResourceSearchText(searchQuery.value).split(/\s+/).filter(Boolean)
+}
+
+function getTermBaseSearchText(termBase: TermBase) {
+  return [
+    termBase.name,
+    termBase.description,
+    termBase.source_language,
+    termBase.target_language,
+    getLanguageLabel(termBase.source_language),
+    getLanguageLabel(termBase.target_language),
+    formatLanguagePair(termBase.source_language, termBase.target_language),
+    termBase.entry_count,
+    termBase.created_at,
+    termBase.updated_at,
+  ].map(normalizeResourceSearchText).join(' ')
+}
 
 const columns: DataTableColumn[] = [
   { key: 'name', label: '名称', sortable: true },
@@ -468,13 +491,12 @@ const filteredBases = computed(() => {
   if (filterTargetLanguage.value) {
     data = data.filter((item) => item.target_language === filterTargetLanguage.value)
   }
-  if (searchQuery.value.trim()) {
-    const q = searchQuery.value.trim().toLowerCase()
-    data = data.filter((item) => (
-      item.name.toLowerCase().includes(q)
-      || (item.description || '').toLowerCase().includes(q)
-      || formatLanguagePair(item.source_language, item.target_language).toLowerCase().includes(q)
-    ))
+  const keywords = getResourceSearchKeywords()
+  if (keywords.length > 0) {
+    data = data.filter((item) => {
+      const searchText = getTermBaseSearchText(item)
+      return keywords.every((keyword) => searchText.includes(keyword))
+    })
   }
   if (sortKey.value) {
     const dir = sortOrder.value === 'asc' ? 1 : -1

@@ -2,9 +2,8 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
-import type { Segment, TermEntryRecord, TMMatchCandidate, ReferenceMatchResult, ReferenceExactMatch, ReferenceFuzzyMatch, ReferenceTermMatch } from '../types/api'
+import type { Segment, TermEntryRecord, TermMatch, TMMatchCandidate, ReferenceMatchResult, ReferenceExactMatch, ReferenceFuzzyMatch, ReferenceTermMatch } from '../types/api'
 import { http } from '../api/http'
-import { hasTermTextMatch } from '../utils/termMatching'
 import DiffText from './DiffText.vue'
 
 const props = defineProps<{
@@ -14,6 +13,7 @@ const props = defineProps<{
   termBaseId: string | null
   termBaseName: string | null
   termEntries: TermEntryRecord[]
+  termMatches: TermMatch[]
   activeSourceText: string
   fileRecordId: string | null
   referenceMatchResult: ReferenceMatchResult | null
@@ -37,11 +37,14 @@ const matchPercent = computed(() => {
 })
 
 const matchedTerms = computed(() => {
-  if (!props.activeSourceText || props.termEntries.length === 0) return []
-  return props.termEntries
-    .filter((entry) => hasTermTextMatch(props.activeSourceText, entry.source_text))
-    .slice()
-    .sort((left, right) => right.source_text.length - left.source_text.length)
+  if (!props.activeSourceText || props.termMatches.length === 0) return []
+  return props.termMatches.map((match) => ({
+    id: match.term_id,
+    source_text: match.source_text,
+    target_text: match.target_text,
+    creator_name: null,
+    updated_at: null,
+  }))
 })
 
 // 当前句段的参考匹配结果
@@ -121,7 +124,7 @@ function handleTMApply(candidate: TMMatchCandidate) {
   emit('replaceText', candidate.target_text)
 }
 
-function handleTermApply(term: TermEntryRecord) {
+function handleTermApply(term: { target_text: string }) {
   emit('appendText', term.target_text)
 }
 

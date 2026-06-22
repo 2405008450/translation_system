@@ -205,7 +205,7 @@ from app.services.term_extraction_service import (
     extract_terms_from_segments,
     merge_extracted_terms,
 )
-from app.services.term_matcher import find_term_text_matches, text_contains_term
+from app.services.term_matcher import find_non_overlapping_term_text_matches, text_contains_term
 from app.services.language_detection import detect_upload_language
 from app.services.language_pairs import require_language_pair
 from app.services.matcher import get_tm_candidates_for_text, match_sentences_with_stats
@@ -1205,6 +1205,7 @@ class SegmentReplaceRequest(BaseModel):
     target_exclude: str = ""
     replace_text: str = ""
     search_fuzzy: bool = False
+    case_sensitive: bool = False
     replace_all: bool = True
     status_filters: list[str] = Field(default_factory=list)
     match_filters: list[str] = Field(default_factory=list)
@@ -2096,6 +2097,7 @@ class ProjectAssignmentEntryRequest(BaseModel):
     assignee_id: UUID
     workflow_step_id: UUID | None = None
     file_record_ids: list[UUID] = Field(default_factory=list)
+    merge_view_ids: list[UUID] = Field(default_factory=list)
 
 
 class ProjectAssignmentsRequest(BaseModel):
@@ -3184,6 +3186,21 @@ def _validate_assignment_payload(
         if workflow_step_id not in workflow_step_ids:
             raise HTTPException(status_code=400, detail="存在不属于当前项目的流程阶段授权。")
         file_ids = set(entry.file_record_ids or [])
+        merge_view_ids = set(entry.merge_view_ids or [])
+        if merge_view_ids:
+            merge_views = (
+                db.query(ProjectMergeView)
+                .filter(
+                    ProjectMergeView.project_id == project.id,
+                    ProjectMergeView.id.in_(merge_view_ids),
+                )
+                .all()
+            )
+            found_view_ids = {view.id for view in merge_views}
+            if found_view_ids != merge_view_ids:
+                raise HTTPException(status_code=400, detail="存在不属于当前项目的合并视图授权。")
+            for view in merge_views:
+                file_ids.update(parse_file_ids(view.file_ids))
         invalid_file_ids = file_ids - project_file_ids
         if invalid_file_ids:
             raise HTTPException(status_code=400, detail="存在不属于当前项目的文件授权。")
@@ -5346,41 +5363,18 @@ def _text_contains_case_insensitive(text: str | None, needle: str | None) -> boo
     return text_contains_term(text, needle)
 
 
-def _term_qa_source_key(source_text: str | None) -> str:
-    return normalize_match_text(source_text or "") or normalize_text(source_text or "").casefold()
-
-
-def _term_qa_terms_are_similar(left: str, right: str) -> bool:
-    left_key = _term_qa_source_key(left)
-    right_key = _term_qa_source_key(right)
-    if not left_key or not right_key:
-        return False
-    if left_key == right_key:
-        return True
-    return left_key in right_key or right_key in left_key
-
-
-def _deduplicate_term_qa_entries(
+def _sort_term_qa_entries_for_matching(
     entries: list[TermEntry],
     priority_by_term_base_id: dict[UUID, int],
 ) -> list[TermEntry]:
-    sorted_entries = sorted(
+    return sorted(
         entries,
         key=lambda entry: (
+            -len((entry.source_text or "").strip()),
             priority_by_term_base_id.get(entry.term_base_id, 9999),
-            -len(_term_qa_source_key(entry.source_text)),
             str(entry.id),
         ),
     )
-    selected_entries: list[TermEntry] = []
-    for entry in sorted_entries:
-        source_term = (entry.source_text or "").strip()
-        if not source_term:
-            continue
-        if any(_term_qa_terms_are_similar(source_term, selected.source_text or "") for selected in selected_entries):
-            continue
-        selected_entries.append(entry)
-    return selected_entries
 
 
 def _load_json_list(raw_value: str | None) -> list[Any]:
@@ -5485,7 +5479,7 @@ def _create_term_qa_report(
     project_id: UUID | None,
     files: list[FileRecord],
     current_user: User,
-    scope: Literal["project", "file"],
+    scope: Literal["project", "file", "merge_view"],
 ) -> TermQAReport:
     if not files:
         raise HTTPException(status_code=400, detail="请选择要检查的文件。")
@@ -5510,37 +5504,18 @@ def _create_term_qa_report(
         .all()
     )
     term_base_by_id = {term_base.id: term_base for term_base in term_bases}
-    entries = (
-        db.query(TermEntry)
-        .filter(TermEntry.term_base_id.in_(configured_term_base_ids))
-        .all()
-    )
-    entries_by_key: dict[tuple[str, str, UUID], list[TermEntry]] = {}
-    for entry in entries:
-        source_term = (entry.source_text or "").strip()
-        target_term = (entry.target_text or "").strip()
-        if not source_term or not target_term:
-            continue
-        entries_by_key.setdefault(
-            (entry.source_language, entry.target_language, entry.term_base_id),
-            [],
-        ).append(entry)
-
-    segments = (
-        db.query(Segment)
+    segment_count_rows = (
+        db.query(Segment.file_record_id, func.count(Segment.id))
         .filter(Segment.file_record_id.in_(file_ids))
-        .order_by(
-            Segment.file_record_id.asc(),
-            Segment.block_index.asc(),
-            Segment.row_index.asc().nullsfirst(),
-            Segment.cell_index.asc().nullsfirst(),
-            Segment.sentence_id.asc(),
-        )
+        .group_by(Segment.file_record_id)
         .all()
     )
-    segments_by_file_id: dict[UUID, list[Segment]] = {}
-    for segment in segments:
-        segments_by_file_id.setdefault(segment.file_record_id, []).append(segment)
+    segment_count_by_file_id = {
+        file_record_id: int(count or 0)
+        for file_record_id, count in segment_count_rows
+    }
+    total_segments = sum(segment_count_by_file_id.values())
+    entries_cache: dict[tuple[str, str, tuple[UUID, ...]], list[TermEntry]] = {}
 
     language_pairs: list[dict[str, str]] = []
     language_pair_keys: set[tuple[str, str]] = set()
@@ -5549,11 +5524,11 @@ def _create_term_qa_report(
         file_record_id=files[0].id if scope == "file" and len(files) == 1 else None,
         created_by_id=getattr(current_user, "id", None),
         scope=scope,
-        file_ids=json.dumps([str(file_id) for file_id in file_ids]),
+        file_ids=serialize_file_ids(file_ids),
         term_base_ids=json.dumps([str(term_base_id) for term_base_id in configured_term_base_ids]),
         language_pairs="[]",
         total_files=len(files),
-        total_segments=len(segments),
+        total_segments=total_segments,
         checked_segments=0,
         issue_count=0,
         status="completed",
@@ -5589,26 +5564,55 @@ def _create_term_qa_report(
             term_base_id: index
             for index, term_base_id in enumerate(qa_ids)
         }
-        applicable_entries = _deduplicate_term_qa_entries(
-            [
+        entries_cache_key = (source_language, target_language, tuple(qa_ids))
+        if entries_cache_key not in entries_cache:
+            entries_cache[entries_cache_key] = [
                 entry
-                for term_base_id in qa_ids
-                for entry in entries_by_key.get((source_language, target_language, term_base_id), [])
-            ],
+                for entry in (
+                    db.query(TermEntry)
+                    .filter(
+                        TermEntry.term_base_id.in_(qa_ids),
+                        TermEntry.source_language == source_language,
+                        TermEntry.target_language == target_language,
+                    )
+                    .all()
+                )
+                if (entry.source_text or "").strip() and (entry.target_text or "").strip()
+            ]
+        applicable_entries = _sort_term_qa_entries_for_matching(
+            entries_cache[entries_cache_key],
             qa_priority_by_id,
         )
         if not applicable_entries:
             continue
-        file_segments = segments_by_file_id.get(file_record.id, [])
+        file_segments = (
+            db.query(Segment)
+            .filter(Segment.file_record_id == file_record.id)
+            .order_by(
+                Segment.block_index.asc(),
+                Segment.row_index.asc().nullsfirst(),
+                Segment.cell_index.asc().nullsfirst(),
+                Segment.sentence_id.asc(),
+            )
+            .all()
+        )
         checked_segments += len(file_segments)
         for segment in file_segments:
             source_text = segment.source_text or ""
             target_text = segment.target_text or ""
-            for entry in applicable_entries:
+            source_matches = find_non_overlapping_term_text_matches(
+                source_text,
+                applicable_entries,
+                lambda entry: entry.source_text,
+            )
+            reported_entry_ids: set[UUID] = set()
+            for source_match in source_matches:
+                entry = source_match.item
+                if entry.id in reported_entry_ids:
+                    continue
+                reported_entry_ids.add(entry.id)
                 source_term = (entry.source_text or "").strip()
                 expected_target_term = (entry.target_text or "").strip()
-                if not _text_contains_case_insensitive(source_text, source_term):
-                    continue
                 if _text_contains_case_insensitive(target_text, expected_target_term):
                     continue
                 term_base = term_base_by_id.get(entry.term_base_id)
@@ -5630,6 +5634,8 @@ def _create_term_qa_report(
                     cell_index=segment.cell_index,
                 ))
                 issue_count += 1
+                if issue_count % 1000 == 0:
+                    db.flush()
 
     report.language_pairs = json.dumps(language_pairs)
     report.checked_segments = checked_segments
@@ -5678,6 +5684,30 @@ def _load_term_qa_report_items_for_response(db: Session, report_id: UUID) -> lis
         .filter(TermQAReportItem.report_id == report_id)
         .order_by(TermQAReportItem.file_name.asc(), TermQAReportItem.block_index.asc(), TermQAReportItem.sentence_id.asc())
         .all()
+    )
+
+
+def _load_term_qa_report_items_for_files(
+    db: Session,
+    report_id: UUID,
+    file_ids: list[UUID],
+) -> list[TermQAReportItem]:
+    """按给定文件顺序返回报告项，供合并视图保持视图内文件排序。"""
+    items = (
+        db.query(TermQAReportItem)
+        .filter(TermQAReportItem.report_id == report_id)
+        .all()
+    )
+    file_order = {file_id: index for index, file_id in enumerate(file_ids)}
+    return sorted(
+        items,
+        key=lambda item: (
+            file_order.get(item.file_record_id, len(file_order)),
+            int(item.block_index or 0),
+            item.row_index if item.row_index is not None else -1,
+            item.cell_index if item.cell_index is not None else -1,
+            item.sentence_id,
+        ),
     )
 
 
@@ -7396,31 +7426,35 @@ def _apply_segment_text_filters(
     target_query: str | None,
     source_exclude: str | None = None,
     target_exclude: str | None = None,
+    case_sensitive: bool = False,
 ):
+    def text_contains(column, pattern: str):
+        return column.like(pattern) if case_sensitive else column.ilike(pattern)
+
     source_keyword = (source_query or "").strip()
     target_keyword = (target_query or "").strip()
     if source_keyword:
         source_pattern = f"%{source_keyword}%"
         query = query.filter(
             or_(
-                Segment.source_text.ilike(source_pattern),
-                Segment.display_text.ilike(source_pattern),
+                text_contains(Segment.source_text, source_pattern),
+                text_contains(Segment.display_text, source_pattern),
             )
         )
     if target_keyword:
-        query = query.filter(Segment.target_text.ilike(f"%{target_keyword}%"))
+        query = query.filter(text_contains(Segment.target_text, f"%{target_keyword}%"))
     for keyword in _split_segment_exclude_keywords(source_exclude):
         source_pattern = f"%{keyword}%"
         query = query.filter(
             and_(
-                or_(Segment.source_text.is_(None), ~Segment.source_text.ilike(source_pattern)),
-                or_(Segment.display_text.is_(None), ~Segment.display_text.ilike(source_pattern)),
+                or_(Segment.source_text.is_(None), ~text_contains(Segment.source_text, source_pattern)),
+                or_(Segment.display_text.is_(None), ~text_contains(Segment.display_text, source_pattern)),
             )
         )
     for keyword in _split_segment_exclude_keywords(target_exclude):
         target_pattern = f"%{keyword}%"
         query = query.filter(
-            or_(Segment.target_text.is_(None), ~Segment.target_text.ilike(target_pattern))
+            or_(Segment.target_text.is_(None), ~text_contains(Segment.target_text, target_pattern))
         )
     return query
 
@@ -7629,6 +7663,7 @@ def _get_segment_page_sentence_ids(
     target_query: str | None = None,
     source_exclude: str | None = None,
     target_exclude: str | None = None,
+    case_sensitive: bool = False,
     status_filters: list[str] | None = None,
     match_filters: list[str] | None = None,
     source_filters: list[str] | None = None,
@@ -7644,6 +7679,7 @@ def _get_segment_page_sentence_ids(
         target_query=target_query,
         source_exclude=source_exclude,
         target_exclude=target_exclude,
+        case_sensitive=case_sensitive,
     )
     query = _apply_segment_screening_filters(
         query,
@@ -8095,6 +8131,7 @@ def get_file_record_segments(
     source_exclude: str | None = None,
     target_exclude: str | None = None,
     search_fuzzy: bool = False,
+    case_sensitive: bool = False,
     include_stats: bool = True,
     status_filters: str | None = None,
     status_filters_bracket: list[str] | None = Query(default=None, alias="status_filters[]"),
@@ -8126,6 +8163,7 @@ def get_file_record_segments(
         target_query=target_query,
         source_exclude=source_exclude,
         target_exclude=target_exclude,
+        case_sensitive=case_sensitive,
     )
     normalized_status_filters = _normalize_segment_filter_values(status_filters, status_filters_bracket)
     normalized_match_filters = _normalize_segment_filter_values(match_filters, match_filters_bracket)
@@ -8168,6 +8206,7 @@ def get_file_record_segments(
             "source_exclude": source_exclude or "",
             "target_exclude": target_exclude or "",
             "search_fuzzy": search_fuzzy,
+            "case_sensitive": case_sensitive,
             "status_filters": normalized_status_filters,
             "match_filters": normalized_match_filters,
             "source_filters": normalized_source_filters,
@@ -9035,6 +9074,20 @@ def _get_merge_view_or_404(db: Session, view_id: UUID) -> ProjectMergeView:
     return view
 
 
+def _get_merge_view_context(
+    db: Session,
+    view_id: UUID,
+    current_user: User,
+) -> tuple[ProjectMergeView, Project, list[FileRecord]]:
+    """加载合并视图及当前用户可见文件，并统一执行读权限校验。"""
+    view = _get_merge_view_or_404(db, view_id)
+    project = _get_project_or_404(db, view.project_id)
+    _require_project_read_access(project, current_user, db)
+    files = _get_visible_merge_view_files(db, view, current_user)
+    _require_merge_view_openable_files(files, current_user)
+    return view, project, files
+
+
 def _validate_and_order_view_file_ids(
     db: Session, project: Project, file_ids: list[UUID], current_user: User
 ) -> list[UUID]:
@@ -9117,6 +9170,52 @@ def create_project_merge_view(
     return _serialize_merge_view_summary_for_user(db, view, current_user)
 
 
+@router.get("/merge-views")
+def list_visible_merge_views(
+    project_id: UUID | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """列出当前用户可打开的合并视图；普通用户按已授权文件过滤。"""
+    query = (
+        db.query(ProjectMergeView, Project)
+        .join(Project, Project.id == ProjectMergeView.project_id)
+    )
+    if project_id is not None:
+        project = _get_project_or_404(db, project_id)
+        _require_project_read_access(project, current_user, db)
+        query = query.filter(ProjectMergeView.project_id == project.id)
+    elif not can_access_all_projects(current_user):
+        assigned_project_ids = (
+            db.query(ProjectAssignment.project_id)
+            .filter(
+                ProjectAssignment.assignee_id == current_user.id,
+                ProjectAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            )
+            .distinct()
+        )
+        query = query.filter(ProjectMergeView.project_id.in_(assigned_project_ids))
+
+    rows = (
+        query.order_by(ProjectMergeView.updated_at.desc(), ProjectMergeView.created_at.desc())
+        .all()
+    )
+    items: list[dict[str, Any]] = []
+    for view, project in rows:
+        visible_files = _get_visible_merge_view_files(db, view, current_user)
+        if not can_access_all_projects(current_user) and len(visible_files) < 2:
+            continue
+        payload = _serialize_merge_view_summary_for_user(
+            db,
+            view,
+            current_user,
+            visible_files=visible_files,
+        )
+        payload["project_name"] = project.name
+        items.append(payload)
+    return {"items": items}
+
+
 @router.get("/merge-views/{view_id}")
 def get_merge_view_detail(
     view_id: UUID,
@@ -9175,6 +9274,135 @@ def delete_merge_view(
     return JSONResponse(status_code=200, content={"deleted": True, "id": str(view_id)})
 
 
+@router.post("/merge-views/{view_id}/term-qa-reports")
+def create_merge_view_term_qa_report(
+    view_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """为当前合并视图文件组合生成一份术语 QA 汇总报告。"""
+    _view, project, files = _get_merge_view_context(db, view_id, current_user)
+    file_ids = [file_record.id for file_record in files]
+    report = _create_term_qa_report(
+        db,
+        project_id=project.id,
+        files=files,
+        current_user=current_user,
+        scope="merge_view",
+    )
+    items = _load_term_qa_report_items_for_files(db, report.id, file_ids)
+    return _serialize_term_qa_report(report, items)
+
+
+@router.get("/merge-views/{view_id}/term-qa-reports")
+def list_merge_view_term_qa_reports(
+    view_id: UUID,
+    limit: int = 5,
+    include_items: bool = True,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """列出当前合并视图文件组合最近生成的术语 QA 报告。"""
+    _view, project, files = _get_merge_view_context(db, view_id, current_user)
+    file_ids = [file_record.id for file_record in files]
+    file_ids_text = serialize_file_ids(file_ids)
+    safe_limit = min(max(int(limit), 1), 20)
+    reports = (
+        db.query(TermQAReport)
+        .filter(
+            TermQAReport.project_id == project.id,
+            TermQAReport.scope == "merge_view",
+            TermQAReport.file_ids == file_ids_text,
+        )
+        .order_by(TermQAReport.created_at.desc(), TermQAReport.id.desc())
+        .limit(safe_limit)
+        .all()
+    )
+
+    items_by_report_id: dict[UUID, list[TermQAReportItem]] = {report.id: [] for report in reports}
+    if include_items:
+        for report in reports:
+            items_by_report_id[report.id] = _load_term_qa_report_items_for_files(db, report.id, file_ids)
+
+    return {
+        "items": [
+            _serialize_term_qa_report(report, items_by_report_id.get(report.id, []))
+            for report in reports
+        ],
+    }
+
+
+@router.get("/merge-views/{view_id}/segments/{file_record_id}/{sentence_id}/position")
+def get_merge_view_segment_position(
+    view_id: UUID,
+    file_record_id: UUID,
+    sentence_id: str,
+    page_size: int = 100,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """返回句段在合并视图展平序列中的全局页码，用于跨文件 QA 定位。"""
+    _view, _project, files = _get_merge_view_context(db, view_id, current_user)
+    file_by_id = {file_record.id: file_record for file_record in files}
+    if file_record_id not in file_by_id:
+        raise HTTPException(status_code=404, detail="句段所属文件不在当前视图中。")
+
+    safe_page_size = _normalize_segment_page_limit(page_size)
+    previous_count = 0
+    for file_record in files:
+        if file_record.id == file_record_id:
+            break
+        previous_count += (
+            db.query(func.count(Segment.id))
+            .filter(Segment.file_record_id == file_record.id)
+            .scalar()
+            or 0
+        )
+
+    ordered_segments = (
+        db.query(
+            Segment.id.label("id"),
+            Segment.sentence_id.label("sentence_id"),
+            func.row_number()
+            .over(
+                order_by=(
+                    Segment.block_index.asc(),
+                    Segment.row_index.asc().nullsfirst(),
+                    Segment.cell_index.asc().nullsfirst(),
+                    Segment.sentence_id.asc(),
+                )
+            )
+            .label("position"),
+        )
+        .filter(Segment.file_record_id == file_record_id)
+        .subquery()
+    )
+    row = (
+        db.query(
+            ordered_segments.c.id,
+            ordered_segments.c.sentence_id,
+            ordered_segments.c.position,
+        )
+        .filter(ordered_segments.c.sentence_id == sentence_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="句段不存在。")
+
+    local_index = max(int(row.position) - 1, 0)
+    index = int(previous_count) + local_index
+    return {
+        "file_record_id": str(file_record_id),
+        "sentence_id": row.sentence_id,
+        "segment_id": str(row.id),
+        "index": index,
+        "display_index": int(row.position),
+        "page": (index // safe_page_size) + 1,
+        "page_size": safe_page_size,
+        "page_index": index % safe_page_size,
+    }
+
+
 @router.get("/merge-views/{view_id}/segments")
 def get_merge_view_segments(
     view_id: UUID,
@@ -9186,6 +9414,7 @@ def get_merge_view_segments(
     source_exclude: str | None = None,
     target_exclude: str | None = None,
     search_fuzzy: bool = False,
+    case_sensitive: bool = False,
     status_filters: str | None = None,
     status_filters_bracket: list[str] | None = Query(default=None, alias="status_filters[]"),
     match_filters: str | None = None,
@@ -9228,6 +9457,7 @@ def get_merge_view_segments(
             target_query=target_query,
             source_exclude=source_exclude,
             target_exclude=target_exclude,
+            case_sensitive=case_sensitive,
         )
         filtered_query = _apply_segment_screening_filters(
             filtered_query,
@@ -9332,6 +9562,7 @@ def get_merge_view_segments(
             "source_exclude": source_exclude or "",
             "target_exclude": target_exclude or "",
             "search_fuzzy": search_fuzzy,
+            "case_sensitive": case_sensitive,
             "status_filters": normalized_status_filters,
             "match_filters": normalized_match_filters,
             "source_filters": normalized_source_filters,
@@ -10323,6 +10554,7 @@ def replace_file_record_segment_targets(
         target_query=target_query,
         source_exclude=payload.source_exclude,
         target_exclude=payload.target_exclude,
+        case_sensitive=payload.case_sensitive,
     )
     query = _apply_segment_screening_filters(
         query,
@@ -10336,7 +10568,7 @@ def replace_file_record_segment_targets(
     if not segments:
         return {"updated_count": 0, "occurrence_count": 0}
 
-    flags = re.IGNORECASE
+    flags = 0 if payload.case_sensitive else re.IGNORECASE
     pattern = re.compile(re.escape(target_query), flags)
     occurrence_count = 0
     updates: list[dict[str, str]] = []
@@ -10562,6 +10794,7 @@ def get_file_record_revisions(
     source_exclude: str | None = None,
     target_exclude: str | None = None,
     search_fuzzy: bool = False,
+    case_sensitive: bool = False,
     status_filters: str | None = None,
     status_filters_bracket: list[str] | None = Query(default=None, alias="status_filters[]"),
     match_filters: str | None = None,
@@ -10601,6 +10834,7 @@ def get_file_record_revisions(
             target_query=target_query,
             source_exclude=source_exclude,
             target_exclude=target_exclude,
+            case_sensitive=case_sensitive,
             status_filters=_normalize_segment_filter_values(status_filters, status_filters_bracket),
             match_filters=_normalize_segment_filter_values(match_filters, match_filters_bracket),
             source_filters=_normalize_segment_filter_values(source_filters, source_filters_bracket),
@@ -10720,6 +10954,7 @@ def get_file_record_comments(
     source_exclude: str | None = None,
     target_exclude: str | None = None,
     search_fuzzy: bool = False,
+    case_sensitive: bool = False,
     status_filters: str | None = None,
     status_filters_bracket: list[str] | None = Query(default=None, alias="status_filters[]"),
     match_filters: str | None = None,
@@ -10748,6 +10983,7 @@ def get_file_record_comments(
             target_query=target_query,
             source_exclude=source_exclude,
             target_exclude=target_exclude,
+            case_sensitive=case_sensitive,
             status_filters=_normalize_segment_filter_values(status_filters, status_filters_bracket),
             match_filters=_normalize_segment_filter_values(match_filters, match_filters_bracket),
             source_filters=_normalize_segment_filter_values(source_filters, source_filters_bracket),
@@ -13031,32 +13267,21 @@ def match_terms(
         )
 
     candidate_terms = candidate_query.all()
-
-    matches = []
-    matched_positions = set()
-
-    for term in candidate_terms:
-        for text_match in find_term_text_matches(text, term.source_text, case_sensitive=case_sensitive):
-            pos = text_match.start
-            end_pos = text_match.end
-            # 检查是否与已匹配的位置重叠
-            overlap = False
-            for matched_start, matched_end in matched_positions:
-                if not (end_pos <= matched_start or pos >= matched_end):
-                    overlap = True
-                    break
-
-            if not overlap:
-                matched_positions.add((pos, end_pos))
-                matches.append({
-                    "term_id": str(term.id),
-                    "source_text": term.source_text,
-                    "target_text": term.target_text,
-                    "start": pos,
-                    "end": end_pos,
-                })
-
-    # 按位置排序
-    matches.sort(key=lambda m: m["start"])
-
-    return {"matches": matches}
+    term_matches = find_non_overlapping_term_text_matches(
+        text,
+        candidate_terms,
+        lambda term: term.source_text,
+        case_sensitive=case_sensitive,
+    )
+    return {
+        "matches": [
+            {
+                "term_id": str(term_match.item.id),
+                "source_text": term_match.item.source_text,
+                "target_text": term_match.item.target_text,
+                "start": term_match.start,
+                "end": term_match.end,
+            }
+            for term_match in term_matches
+        ],
+    }

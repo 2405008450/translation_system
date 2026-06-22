@@ -166,6 +166,7 @@ export interface ProjectAssignmentPayload {
     assignee_id: string
     workflow_step_id?: string
     file_record_ids: string[]
+    merge_view_ids?: string[]
   }>
 }
 
@@ -534,6 +535,7 @@ export interface SegmentPageFilters {
   source_exclude: string
   target_exclude: string
   search_fuzzy: boolean
+  case_sensitive: boolean
   status_filters?: string[]
   match_filters?: string[]
   source_filters?: string[]
@@ -567,6 +569,7 @@ export interface SegmentPositionResponse {
 export interface MergeView {
   id: string
   project_id: string
+  project_name?: string | null
   name: string
   file_ids: string[]
   file_count: number
@@ -860,7 +863,7 @@ export interface TermQAReport {
   project_id: string | null
   file_record_id: string | null
   created_by_id: string | null
-  scope: 'project' | 'file'
+  scope: 'project' | 'file' | 'merge_view'
   file_ids: string[]
   term_base_ids: string[]
   language_pairs: Array<{ source_language: string, target_language: string }>

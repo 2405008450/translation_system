@@ -165,6 +165,7 @@ export interface SegmentPageQuery {
   sourceExclude?: string
   targetExclude?: string
   searchFuzzy?: boolean
+  caseSensitive?: boolean
   statusFilters?: string[]
   matchFilters?: string[]
   sourceFilters?: string[]
@@ -229,6 +230,7 @@ export const useSegmentStore = defineStore('segment', () => {
     sourceExclude: '',
     targetExclude: '',
     searchFuzzy: false,
+    caseSensitive: false,
     statusFilters: [] as string[],
     matchFilters: [] as string[],
     sourceFilters: [] as string[],
@@ -687,6 +689,7 @@ export const useSegmentStore = defineStore('segment', () => {
       sourceExclude: query.sourceExclude ?? segmentFilters.value.sourceExclude,
       targetExclude: query.targetExclude ?? segmentFilters.value.targetExclude,
       searchFuzzy: query.searchFuzzy ?? segmentFilters.value.searchFuzzy,
+      caseSensitive: query.caseSensitive ?? segmentFilters.value.caseSensitive,
       statusFilters: normalizeStringArray(query.statusFilters ?? segmentFilters.value.statusFilters),
       matchFilters: normalizeStringArray(query.matchFilters ?? segmentFilters.value.matchFilters),
       sourceFilters: normalizeStringArray(query.sourceFilters ?? segmentFilters.value.sourceFilters),
@@ -706,6 +709,7 @@ export const useSegmentStore = defineStore('segment', () => {
       source_exclude: resolved.sourceExclude,
       target_exclude: resolved.targetExclude,
       search_fuzzy: resolved.searchFuzzy,
+      case_sensitive: resolved.caseSensitive,
       status_filters: serializeFilterArray(resolved.statusFilters),
       match_filters: serializeFilterArray(resolved.matchFilters),
       source_filters: serializeFilterArray(resolved.sourceFilters),
@@ -724,6 +728,7 @@ export const useSegmentStore = defineStore('segment', () => {
       sourceExclude: segmentFilters.value.sourceExclude,
       targetExclude: segmentFilters.value.targetExclude,
       searchFuzzy: segmentFilters.value.searchFuzzy,
+      caseSensitive: segmentFilters.value.caseSensitive,
       statusFilters: [...segmentFilters.value.statusFilters],
       matchFilters: [...segmentFilters.value.matchFilters],
       sourceFilters: [...segmentFilters.value.sourceFilters],
@@ -771,6 +776,7 @@ export const useSegmentStore = defineStore('segment', () => {
       sourceExclude: string
       targetExclude: string
       searchFuzzy: boolean
+      caseSensitive: boolean
       statusFilters: string[]
       matchFilters: string[]
       sourceFilters: string[]
@@ -786,6 +792,7 @@ export const useSegmentStore = defineStore('segment', () => {
       sourceExclude: resolved.sourceExclude,
       targetExclude: resolved.targetExclude,
       searchFuzzy: resolved.searchFuzzy,
+      caseSensitive: resolved.caseSensitive,
       statusFilters: [...resolved.statusFilters],
       matchFilters: [...resolved.matchFilters],
       sourceFilters: [...resolved.sourceFilters],
@@ -994,6 +1001,7 @@ export const useSegmentStore = defineStore('segment', () => {
       sourceExclude: '',
       targetExclude: '',
       searchFuzzy: false,
+      caseSensitive: false,
       statusFilters: [],
       matchFilters: [],
       sourceFilters: [],
@@ -1052,6 +1060,7 @@ export const useSegmentStore = defineStore('segment', () => {
         sourceExclude: query.sourceExclude ?? '',
         targetExclude: query.targetExclude ?? '',
         searchFuzzy: query.searchFuzzy ?? false,
+        caseSensitive: query.caseSensitive ?? false,
         statusFilters: query.statusFilters ?? [],
         matchFilters: query.matchFilters ?? [],
         sourceFilters: query.sourceFilters ?? [],
@@ -1066,6 +1075,7 @@ export const useSegmentStore = defineStore('segment', () => {
         sourceExclude: resolved.sourceExclude,
         targetExclude: resolved.targetExclude,
         searchFuzzy: resolved.searchFuzzy,
+        caseSensitive: resolved.caseSensitive,
         statusFilters: [...resolved.statusFilters],
         matchFilters: [...resolved.matchFilters],
         sourceFilters: [...resolved.sourceFilters],
@@ -1108,6 +1118,7 @@ export const useSegmentStore = defineStore('segment', () => {
         sourceExclude: resolved.sourceExclude,
         targetExclude: resolved.targetExclude,
         searchFuzzy: resolved.searchFuzzy,
+        caseSensitive: resolved.caseSensitive,
         statusFilters: [...resolved.statusFilters],
         matchFilters: [...resolved.matchFilters],
         sourceFilters: [...resolved.sourceFilters],
@@ -1137,6 +1148,7 @@ export const useSegmentStore = defineStore('segment', () => {
       sourceExclude: segmentFilters.value.sourceExclude,
       targetExclude: segmentFilters.value.targetExclude,
       searchFuzzy: segmentFilters.value.searchFuzzy,
+      caseSensitive: segmentFilters.value.caseSensitive,
       statusFilters: segmentFilters.value.statusFilters,
       matchFilters: segmentFilters.value.matchFilters,
       sourceFilters: segmentFilters.value.sourceFilters,
@@ -1157,6 +1169,7 @@ export const useSegmentStore = defineStore('segment', () => {
         sourceExclude: query.sourceExclude ?? '',
         targetExclude: query.targetExclude ?? '',
         searchFuzzy: query.searchFuzzy ?? false,
+        caseSensitive: query.caseSensitive ?? false,
         statusFilters: query.statusFilters ?? [],
         matchFilters: query.matchFilters ?? [],
         sourceFilters: query.sourceFilters ?? [],
@@ -1171,6 +1184,7 @@ export const useSegmentStore = defineStore('segment', () => {
         sourceExclude: resolved.sourceExclude,
         targetExclude: resolved.targetExclude,
         searchFuzzy: resolved.searchFuzzy,
+        caseSensitive: resolved.caseSensitive,
         statusFilters: [...resolved.statusFilters],
         matchFilters: [...resolved.matchFilters],
         sourceFilters: [...resolved.sourceFilters],

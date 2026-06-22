@@ -11,7 +11,7 @@ import Modal from '../components/base/Modal.vue'
 import Pagination from '../components/Pagination.vue'
 import RowActionMenu from '../components/RowActionMenu.vue'
 import { useConfirm } from '../composables/useConfirm'
-import { canonicalizeLanguagePair, formatLanguagePair, languageOptions } from '../constants/languages'
+import { canonicalizeLanguagePair, formatLanguagePair, getLanguageLabel, languageOptions } from '../constants/languages'
 import { useAuthStore } from '../stores/auth'
 import type { GlossaryBase } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
@@ -66,6 +66,29 @@ let disposed = false
 
 const canManageResources = computed(() => authStore.isAdmin)
 
+function normalizeResourceSearchText(value: unknown) {
+  return String(value ?? '').trim().toLowerCase()
+}
+
+function getResourceSearchKeywords() {
+  return normalizeResourceSearchText(searchQuery.value).split(/\s+/).filter(Boolean)
+}
+
+function getGlossaryBaseSearchText(glossaryBase: GlossaryBase) {
+  return [
+    glossaryBase.name,
+    glossaryBase.description,
+    glossaryBase.source_language,
+    glossaryBase.target_language,
+    getLanguageLabel(glossaryBase.source_language),
+    getLanguageLabel(glossaryBase.target_language),
+    formatLanguagePair(glossaryBase.source_language, glossaryBase.target_language),
+    glossaryBase.entry_count,
+    glossaryBase.created_at,
+    glossaryBase.updated_at,
+  ].map(normalizeResourceSearchText).join(' ')
+}
+
 const columns: DataTableColumn[] = [
   { key: 'name', label: '名称', sortable: true },
   { key: 'language_pair', label: '语言对', sortable: true },
@@ -95,13 +118,12 @@ const filteredBases = computed(() => {
   if (filterTargetLanguage.value) {
     data = data.filter((item) => item.target_language === filterTargetLanguage.value)
   }
-  if (searchQuery.value.trim()) {
-    const q = searchQuery.value.trim().toLowerCase()
-    data = data.filter((item) => (
-      item.name.toLowerCase().includes(q)
-      || (item.description || '').toLowerCase().includes(q)
-      || formatLanguagePair(item.source_language, item.target_language).toLowerCase().includes(q)
-    ))
+  const keywords = getResourceSearchKeywords()
+  if (keywords.length > 0) {
+    data = data.filter((item) => {
+      const searchText = getGlossaryBaseSearchText(item)
+      return keywords.every((keyword) => searchText.includes(keyword))
+    })
   }
   if (sortKey.value) {
     const dir = sortOrder.value === 'asc' ? 1 : -1

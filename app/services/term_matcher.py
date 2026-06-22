@@ -1,5 +1,6 @@
 import re
 from dataclasses import dataclass
+from typing import Callable, Generic, Iterable, TypeVar
 
 
 ASCII_WORD_CHAR_PATTERN = re.compile(r"[A-Za-z0-9_]")
@@ -10,6 +11,16 @@ ASCII_UPPER_PATTERN = re.compile(r"[A-Z]")
 
 @dataclass(frozen=True)
 class TermTextMatch:
+    start: int
+    end: int
+
+
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class SelectedTermTextMatch(Generic[T]):
+    item: T
     start: int
     end: int
 
@@ -72,3 +83,33 @@ def find_term_text_matches(text: str, term: str, *, case_sensitive: bool = False
 
 def text_contains_term(text: str | None, term: str | None, *, case_sensitive: bool = False) -> bool:
     return bool(find_term_text_matches(text or "", term or "", case_sensitive=case_sensitive))
+
+
+def find_non_overlapping_term_text_matches(
+    text: str,
+    items: Iterable[T],
+    get_term_text: Callable[[T], str | None],
+    *,
+    case_sensitive: bool = False,
+) -> list[SelectedTermTextMatch[T]]:
+    ordered_items = sorted(
+        list(items),
+        key=lambda item: -len((get_term_text(item) or "").strip()),
+    )
+    matches: list[SelectedTermTextMatch[T]] = []
+    matched_positions: set[tuple[int, int]] = set()
+
+    for item in ordered_items:
+        term_text = get_term_text(item) or ""
+        for text_match in find_term_text_matches(text, term_text, case_sensitive=case_sensitive):
+            overlaps = any(
+                not (text_match.end <= matched_start or text_match.start >= matched_end)
+                for matched_start, matched_end in matched_positions
+            )
+            if overlaps:
+                continue
+            matched_positions.add((text_match.start, text_match.end))
+            matches.append(SelectedTermTextMatch(item=item, start=text_match.start, end=text_match.end))
+
+    matches.sort(key=lambda match: match.start)
+    return matches

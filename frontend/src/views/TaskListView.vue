@@ -3,6 +3,7 @@ import axios from 'axios'
 import {
   ArrowRight,
   Download,
+  FolderOpen,
   MoreHorizontal,
   Search,
   Settings2,
@@ -13,6 +14,7 @@ import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 
 import { http } from '../api/http'
+import { listVisibleMergeViews } from '../api/mergeViews'
 import DataTable from '../components/DataTable.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
 import Pagination from '../components/Pagination.vue'
@@ -22,7 +24,7 @@ import { useConfirm } from '../composables/useConfirm'
 import { useToast } from '../composables/useToast'
 import { getFileStatusMeta } from '../constants/status'
 import { useAuthStore } from '../stores/auth'
-import type { WorkflowProgress } from '../types/api'
+import type { MergeView, WorkflowProgress } from '../types/api'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
 
 interface ProjectRow {
@@ -50,7 +52,7 @@ interface ProjectRow {
   updated_at: string
 }
 
-type MainTab = 'tasks' | 'performance'
+type MainTab = 'tasks' | 'views' | 'performance'
 type SubTab = 'all' | 'incomplete'
 type ResourceImportTab = 'tm' | 'term'
 
@@ -71,6 +73,9 @@ const sortOrder = ref<'asc' | 'desc'>('desc')
 const searchQuery = ref('')
 const projects = ref<ProjectRow[]>([])
 const projectsLoading = ref(false)
+const visibleMergeViews = ref<MergeView[]>([])
+const mergeViewsLoading = ref(false)
+const mergeViewError = ref('')
 let searchTimer: ReturnType<typeof setTimeout> | null = null
 const showImportDialog = ref(false)
 const importDialogInitialTab = ref<ResourceImportTab>('tm')
@@ -137,11 +142,37 @@ function getTaskMetaText(row: ProjectRow) {
   ].join(' · ')
 }
 
+function getMergeViewMetaText(view: MergeView) {
+  return [
+    view.project_name || '未命名项目',
+    `${Number(view.file_count || 0)} 个文件`,
+    view.creator_name ? `创建人 ${view.creator_name}` : '',
+  ].filter(Boolean).join(' · ')
+}
+
+function getMergeViewFileText(view: MergeView) {
+  const count = Number(view.file_count || view.file_ids?.length || 0)
+  return count > 0 ? `可打开 ${count} 个文件` : '暂无可访问文件'
+}
+
 function getErrorMessage(error: unknown, fallback: string) {
   if (axios.isAxiosError(error)) {
     return String(error.response?.data?.detail || fallback)
   }
   return error instanceof Error ? error.message : fallback
+}
+
+async function loadMergeViews() {
+  mergeViewError.value = ''
+  mergeViewsLoading.value = true
+  try {
+    const data = await listVisibleMergeViews()
+    visibleMergeViews.value = data.items
+  } catch (error) {
+    mergeViewError.value = getErrorMessage(error, '合并视图加载失败。')
+  } finally {
+    mergeViewsLoading.value = false
+  }
 }
 
 async function loadProjects() {
@@ -283,6 +314,17 @@ function openProjectDetail(row: ProjectRow) {
   })
 }
 
+function openMergeView(view: MergeView) {
+  void router.push({
+    name: 'merge-view-focus',
+    params: { viewId: view.id },
+    query: {
+      from: 'tasks',
+      ...(view.project_id ? { pid: view.project_id } : {}),
+    },
+  })
+}
+
 watch(searchQuery, () => {
   if (searchTimer) {
     clearTimeout(searchTimer)
@@ -295,6 +337,12 @@ watch(searchQuery, () => {
 
 watch(subTab, () => {
   currentPage.value = 1
+})
+
+watch(mainTab, (tab) => {
+  if (tab === 'views' && visibleMergeViews.value.length === 0 && !mergeViewsLoading.value) {
+    void loadMergeViews()
+  }
 })
 
 onMounted(() => {
@@ -322,6 +370,14 @@ onBeforeUnmount(() => {
             @click="mainTab = 'tasks'"
           >
             {{ t('taskList.mainTab') }}
+          </button>
+          <button
+            class="tab-item"
+            :class="{ 'is-active': mainTab === 'views' }"
+            type="button"
+            @click="mainTab = 'views'"
+          >
+            合并视图
           </button>
           <button
             class="tab-item"
@@ -530,6 +586,48 @@ onBeforeUnmount(() => {
         </div>
       </template>
 
+      <template v-else-if="mainTab === 'views'">
+        <div class="task-merge-views">
+          <div class="task-merge-views__head">
+            <div>
+              <strong>合并视图</strong>
+              <span>显示已授权且可重新打开的多文件工作台</span>
+            </div>
+            <button class="button" type="button" :disabled="mergeViewsLoading" @click="loadMergeViews">
+              <FolderOpen :size="14" />
+              刷新
+            </button>
+          </div>
+
+          <p v-if="mergeViewError" class="form-message is-error task-page__message">{{ mergeViewError }}</p>
+
+          <div v-if="mergeViewsLoading" class="empty-state task-merge-views__empty">
+            正在加载合并视图...
+          </div>
+          <div v-else-if="visibleMergeViews.length === 0" class="empty-state task-merge-views__empty">
+            暂无可打开的合并视图
+          </div>
+          <div v-else class="task-merge-view-list">
+            <article v-for="view in visibleMergeViews" :key="view.id" class="task-merge-view-card">
+              <div class="task-merge-view-card__main">
+                <strong>{{ view.name }}</strong>
+                <span>{{ getMergeViewMetaText(view) }}</span>
+                <small>{{ getMergeViewFileText(view) }}</small>
+              </div>
+              <button
+                class="button button--primary"
+                type="button"
+                :disabled="view.can_open === false"
+                @click="openMergeView(view)"
+              >
+                <ArrowRight :size="14" />
+                打开
+              </button>
+            </article>
+          </div>
+        </div>
+      </template>
+
       <template v-else>
         <div class="empty-state" style="padding: 60px 20px;">
           {{ t('taskList.performanceSoon') }}
@@ -559,6 +657,81 @@ onBeforeUnmount(() => {
 
 .task-page__message {
   margin: 0 20px 12px;
+}
+
+.task-merge-views {
+  display: grid;
+  gap: 12px;
+  padding: 16px 20px 20px;
+}
+
+.task-merge-views__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.task-merge-views__head > div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.task-merge-views__head strong {
+  color: var(--text-primary);
+  font-size: 15px;
+}
+
+.task-merge-views__head span {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.task-merge-views__empty {
+  min-height: 220px;
+}
+
+.task-merge-view-list {
+  display: grid;
+  gap: 10px;
+}
+
+.task-merge-view-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+}
+
+.task-merge-view-card__main {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.task-merge-view-card__main strong,
+.task-merge-view-card__main span,
+.task-merge-view-card__main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-merge-view-card__main strong {
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.task-merge-view-card__main span,
+.task-merge-view-card__main small {
+  color: var(--text-muted);
+  font-size: 12px;
 }
 
 .project-link {
@@ -685,6 +858,18 @@ onBeforeUnmount(() => {
 
 .task-action-menu__dropdown button.is-danger:hover {
   background: var(--state-danger-bg);
+}
+
+@media (max-width: 720px) {
+  .task-merge-view-card {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .task-merge-view-card .button {
+    width: 100%;
+    justify-content: center;
+  }
 }
 
 </style>

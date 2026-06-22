@@ -4,6 +4,9 @@ import type {
   MergeView,
   MergeViewDetail,
   MergeViewSegmentPageResponse,
+  SegmentPositionResponse,
+  TermQAReport,
+  TermQAReportListResponse,
 } from '../types/api'
 import type { SegmentPageQuery } from '../stores/segment'
 
@@ -21,6 +24,15 @@ export async function listProjectMergeViews(projectId: string) {
   const { data } = await http.get<{ project_id: string; items: MergeView[] }>(
     `/projects/${projectId}/merge-views`,
   )
+  return data
+}
+
+export async function listVisibleMergeViews(params: { projectId?: string } = {}) {
+  const { data } = await http.get<{ items: MergeView[] }>('/merge-views', {
+    params: {
+      project_id: params.projectId,
+    },
+  })
   return data
 }
 
@@ -43,6 +55,44 @@ export async function deleteMergeView(viewId: string) {
   await http.delete(`/merge-views/${viewId}`)
 }
 
+export async function createMergeViewTermQAReport(viewId: string) {
+  const { data } = await http.post<TermQAReport>(`/merge-views/${viewId}/term-qa-reports`)
+  return data
+}
+
+export async function listMergeViewTermQAReports(
+  viewId: string,
+  params: { limit?: number; includeItems?: boolean } = {},
+) {
+  const { data } = await http.get<TermQAReportListResponse>(
+    `/merge-views/${viewId}/term-qa-reports`,
+    {
+      params: {
+        limit: params.limit,
+        include_items: params.includeItems,
+      },
+    },
+  )
+  return data
+}
+
+export async function fetchMergeViewSegmentPosition(
+  viewId: string,
+  fileRecordId: string,
+  sentenceId: string,
+  params: { pageSize?: number } = {},
+) {
+  const { data } = await http.get<SegmentPositionResponse>(
+    `/merge-views/${viewId}/segments/${fileRecordId}/${encodeURIComponent(sentenceId)}/position`,
+    {
+      params: {
+        page_size: params.pageSize,
+      },
+    },
+  )
+  return data
+}
+
 /** 把 SegmentPageQuery 序列化为 merge-views 段聚合端点的查询参数 */
 function buildMergeViewSegmentParams(query: SegmentPageQuery) {
   const pageSize = query.pageSize ?? 100
@@ -56,6 +106,7 @@ function buildMergeViewSegmentParams(query: SegmentPageQuery) {
     source_exclude: query.sourceExclude || undefined,
     target_exclude: query.targetExclude || undefined,
     search_fuzzy: query.searchFuzzy || undefined,
+    case_sensitive: query.caseSensitive || undefined,
     'status_filters[]': query.statusFilters,
     'match_filters[]': query.matchFilters,
     'source_filters[]': query.sourceFilters,

@@ -29,6 +29,7 @@ import {
   Redo2,
   Save,
   Search,
+  Settings,
   ShieldCheck,
   Sigma,
   Split,
@@ -62,6 +63,11 @@ import WorkbenchMatchPanel from '../components/WorkbenchMatchPanel.vue'
 import WorkbenchTermsPanel from '../components/WorkbenchTermsPanel.vue'
 import ReferencePanel from '../components/ReferencePanel.vue'
 import { http } from '../api/http'
+import {
+  createMergeViewTermQAReport,
+  fetchMergeViewSegmentPosition,
+  listMergeViewTermQAReports,
+} from '../api/mergeViews'
 import { refreshGlobalNotifications } from '../utils/notifications'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
@@ -75,6 +81,7 @@ import { isProgressComplete } from '../utils/progress'
 import { hasTermTextMatch } from '../utils/termMatching'
 import { useAuthStore } from '../stores/auth'
 import { useCommentStore, type CommentWindowQuery } from '../stores/comment'
+import { usePreferencesStore, type WorkbenchConfirmJumpMode } from '../stores/preferences'
 import { useSegmentStore } from '../stores/segment'
 import type {
   CommentAnchorDraft,
@@ -118,6 +125,7 @@ type FileExportStatus = 'queued' | 'running' | 'completed' | 'failed'
 type WorkflowTransitionDirection = 'forward' | 'back'
 type WorkflowSourceStatus = 'none' | 'exact' | 'fuzzy' | 'confirmed'
 type SegmentScreeningGroup = 'status' | 'match' | 'source' | 'flag' | 'workflow'
+type WorkbenchSettingsTab = 'preferences' | 'shortcuts'
 interface SegmentScreeningOption {
   value: string
   label: string
@@ -201,6 +209,7 @@ const router = useRouter()
 const route = useRoute()
 const authStore = useAuthStore()
 const commentStore = useCommentStore()
+const preferencesStore = usePreferencesStore()
 const segmentStore = useSegmentStore()
 const toast = useToast()
 const confirm = useConfirm()
@@ -364,7 +373,8 @@ const previewPanelRendering = ref(false)
 const showImportDialog = ref(false)
 const showIssueDialog = ref(false)
 const importDialogInitialTab = ref<ResourceImportTab>('tm')
-const showShortcutHelp = ref(false)
+const showWorkbenchSettings = ref(false)
+const activeWorkbenchSettingsTab = ref<WorkbenchSettingsTab>('preferences')
 const showSaveToTMDialog = ref(false)
 const openConfirmMenu = ref(false)
 const confirmationActionLoading = ref(false)
@@ -386,6 +396,7 @@ const sourceExcludeQuery = ref('')
 const targetExcludeQuery = ref('')
 const replaceSearchText = ref('')
 const searchFuzzyEnabled = ref(false)
+const searchCaseSensitive = ref(false)
 const advancedSearchOpen = ref(false)
 const segmentScreeningDisplayRange = ref('my_tasks')
 const segmentScreeningNumberInput = ref('1')
@@ -494,6 +505,7 @@ const referenceMatchResult = ref<import('../types/api').ReferenceMatchResult | n
 
 let searchLoadRequestId = 0
 let suppressSegmentFilterWatch = false
+let ignoreNextPaginationPageReset = false
 
 const segmentPageSizes = [100, 200, 500]
 
@@ -516,6 +528,33 @@ const workbenchLLMScopeOptions = computed(() => (
     }
   })
 ))
+
+const confirmShortcutDescription = computed(() => (
+  preferencesStore.confirmJumpMode === 'next_segment'
+    ? t('workbench.shortcutItems.confirmNextSegment')
+    : t('workbench.shortcutItems.confirmNextUnconfirmed')
+))
+
+function openWorkbenchSettings(tab: WorkbenchSettingsTab = 'preferences') {
+  activeWorkbenchSettingsTab.value = tab
+  showWorkbenchSettings.value = true
+}
+
+function closeWorkbenchSettings() {
+  showWorkbenchSettings.value = false
+}
+
+function toggleWorkbenchSettings(tab: WorkbenchSettingsTab = 'preferences') {
+  if (showWorkbenchSettings.value && activeWorkbenchSettingsTab.value === tab) {
+    closeWorkbenchSettings()
+    return
+  }
+  openWorkbenchSettings(tab)
+}
+
+function setWorkbenchConfirmJumpMode(mode: WorkbenchConfirmJumpMode) {
+  preferencesStore.setConfirmJumpMode(mode)
+}
 
 watch(llmModel, (modelId) => {
   const selectedModel = llmModelOptions.find((option) => option.id === modelId)
@@ -547,6 +586,7 @@ function getCommentWindowQuery(): CommentWindowQuery | null {
     sourceExclude: sourceExcludeQuery.value,
     targetExclude: targetExcludeQuery.value,
     searchFuzzy: searchFuzzyEnabled.value,
+    caseSensitive: searchCaseSensitive.value,
     statusFilters: [...segmentScreeningStatusFilters.value, ...segmentScreeningFlagFilters.value],
     matchFilters: [...segmentScreeningMatchFilters.value],
     sourceFilters: [...segmentScreeningSourceFilters.value],
@@ -564,6 +604,7 @@ function getSegmentWindowQuery(page = segmentStore.currentPage, pageSize = segme
     sourceExclude: sourceExcludeQuery.value,
     targetExclude: targetExcludeQuery.value,
     searchFuzzy: searchFuzzyEnabled.value,
+    caseSensitive: searchCaseSensitive.value,
     statusFilters: [...segmentScreeningStatusFilters.value, ...segmentScreeningFlagFilters.value],
     matchFilters: [...segmentScreeningMatchFilters.value],
     sourceFilters: [...segmentScreeningSourceFilters.value],
@@ -1002,6 +1043,50 @@ const termQAReportCreatedAtText = computed(() => (
   formatWorkbenchStatusTime(termQAReport.value?.created_at)
 ))
 
+const termQAReportSubtitle = computed(() => {
+  if (isMergeWorkbench.value) {
+    const detail = segmentStore.mergeViewDetail
+    if (!detail) {
+      return '合并视图'
+    }
+    return `${detail.name} · ${detail.total_files} 个文件`
+  }
+  return segmentStore.fileRecord?.filename || ''
+})
+
+function getTermQAFileName(item: TermQAReportItem) {
+  return (
+    segmentStore.mergeViewDetail?.files.find((file) => file.id === item.file_record_id)?.filename
+    || item.file_name
+    || '未知文件'
+  )
+}
+
+function normalizeTermQAReportForCurrentWorkbench(report: TermQAReport | null) {
+  if (!report || !isMergeWorkbench.value) {
+    return report
+  }
+  const fileOrder = new Map(
+    (segmentStore.mergeViewDetail?.files ?? []).map((file, index) => [file.id, index]),
+  )
+  return {
+    ...report,
+    items: [...report.items].sort((left, right) => {
+      const leftFileOrder = fileOrder.get(left.file_record_id) ?? Number.MAX_SAFE_INTEGER
+      const rightFileOrder = fileOrder.get(right.file_record_id) ?? Number.MAX_SAFE_INTEGER
+      if (leftFileOrder !== rightFileOrder) return leftFileOrder - rightFileOrder
+      if (left.block_index !== right.block_index) return left.block_index - right.block_index
+      const leftRow = left.row_index ?? -1
+      const rightRow = right.row_index ?? -1
+      if (leftRow !== rightRow) return leftRow - rightRow
+      const leftCell = left.cell_index ?? -1
+      const rightCell = right.cell_index ?? -1
+      if (leftCell !== rightCell) return leftCell - rightCell
+      return left.sentence_id.localeCompare(right.sentence_id, undefined, { numeric: true })
+    }),
+  }
+}
+
 const lastModifiedStatusText = computed(() => {
   const modifiedAt = (
     segmentStore.lastModifiedAt
@@ -1229,12 +1314,18 @@ const activeMatchedTerms = computed(() => {
     .sort((left, right) => right.source_text.length - left.source_text.length)
 })
 
-function normalizeSearchText(value: string) {
-  return value.replace(/\s+/g, ' ').trim().toLocaleLowerCase()
+const activeTermMatches = computed(() => {
+  const segment = activeSegment.value
+  return segment ? segmentStore.getTermMatches(segmentKeyOf(segment)) : []
+})
+
+function normalizeSearchText(value: string, caseSensitive = searchCaseSensitive.value) {
+  const normalized = value.replace(/\s+/g, ' ').trim()
+  return caseSensitive ? normalized : normalized.toLocaleLowerCase()
 }
 
-function normalizeFuzzySearchText(value: string) {
-  return normalizeSearchText(value).replace(/[\s.,，。;；:：'"“”‘’!?！？()[\]{}<>《》、\\/|_-]+/g, '')
+function normalizeFuzzySearchText(value: string, caseSensitive = searchCaseSensitive.value) {
+  return normalizeSearchText(value, caseSensitive).replace(/[\s.,，。;；:：'"“”‘’!?！？()[\]{}<>《》、\\/|_-]+/g, '')
 }
 
 function buildSourceSearchableText(segment: Segment) {
@@ -1313,7 +1404,8 @@ function buildTargetReplaceRegExp(global = false) {
   if (!keyword) {
     return null
   }
-  return new RegExp(escapeRegExp(keyword), global ? 'gi' : 'i')
+  const flags = `${global ? 'g' : ''}${searchCaseSensitive.value ? '' : 'i'}`
+  return new RegExp(escapeRegExp(keyword), flags)
 }
 
 function countTargetReplaceOccurrences(segment: Segment) {
@@ -1464,10 +1556,18 @@ const saveToTMButtonTitle = computed(() => (
     ? '合并视图暂不支持保存到 TM；请切到单文件工作台，或后续按语言对分批执行。'
     : t('workbench.saveToTM')
 ))
-const canRunTermQAReport = computed(() => Boolean(segmentStore.fileRecord) && !isMergeWorkbench.value && !generatingTermQAReport.value)
+const canRunTermQAReport = computed(() => {
+  if (generatingTermQAReport.value) {
+    return false
+  }
+  if (isMergeWorkbench.value) {
+    return Boolean((segmentStore.mergeViewId || props.mergeViewId) && segmentStore.mergeViewDetail?.files.length)
+  }
+  return Boolean(segmentStore.fileRecord)
+})
 const termQAButtonTitle = computed(() => (
   isMergeWorkbench.value
-    ? '合并视图暂不跨文件生成术语 QA；请切到单文件工作台执行，避免语言对资源混用。'
+    ? '按当前合并视图文件组合生成术语 QA 报告。'
     : t('workbench.ribbon.qaSettings')
 ))
 
@@ -1688,7 +1788,7 @@ useWorkbenchShortcuts({
   undo: () => { undoActiveSegmentEdit() },
   redo: () => { redoActiveSegmentEdit() },
   closePanel: () => { void closeActiveWorkbenchPanel() },
-  toggleHelp: () => { showShortcutHelp.value = !showShortcutHelp.value },
+  toggleHelp: () => { toggleWorkbenchSettings('shortcuts') },
 })
 
 function getTermBaseStorageKey() {
@@ -2040,6 +2140,7 @@ function resetSegmentSearch() {
   targetExcludeQuery.value = ''
   replaceSearchText.value = ''
   searchFuzzyEnabled.value = false
+  searchCaseSensitive.value = false
   resetSegmentScreeningFilters()
   searchLoadingAllSegments.value = false
   segmentSearchReturnTarget.value = null
@@ -2073,6 +2174,7 @@ function clearSegmentSearchFilters() {
   sourceExcludeQuery.value = ''
   targetExcludeQuery.value = ''
   searchFuzzyEnabled.value = false
+  searchCaseSensitive.value = false
   resetSegmentScreeningFilters()
   searchLoadingAllSegments.value = false
   retainedEmptyTargetSentenceIds.value = new Set()
@@ -2496,6 +2598,7 @@ async function replaceAllSearchMatches() {
         target_exclude: targetExcludeQuery.value,
         replace_text: replaceSearchText.value,
         search_fuzzy: searchFuzzyEnabled.value,
+        case_sensitive: searchCaseSensitive.value,
         replace_all: true,
         status_filters: [...segmentScreeningStatusFilters.value, ...segmentScreeningFlagFilters.value],
         match_filters: [...segmentScreeningMatchFilters.value],
@@ -2579,11 +2682,20 @@ async function confirmAndMoveToNextUnconfirmed() {
     return
   }
 
+  const currentIndex = activeEditorIndex.value
   if (!confirmCurrentSentence()) {
     return
   }
-  const currentIndex = activeEditorIndex.value
   const segments = editorSegments.value
+
+  if (preferencesStore.confirmJumpMode === 'next_segment') {
+    const nextIndex = currentIndex >= 0 ? currentIndex + 1 : 0
+    if (nextIndex < segments.length) {
+      await focusEditorSegmentAtIndex(nextIndex)
+    }
+    return
+  }
+
   let nextUnconfirmedIndex = -1
 
   for (let i = currentIndex + 1; i < segments.length; i++) {
@@ -2777,29 +2889,45 @@ watch(
 )
 
 function setCurrentTermQAReport(report: TermQAReport | null) {
-  termQAReport.value = report
-  const validIds = new Set(report?.items.filter((item) => !item.ignored).map((item) => item.id) ?? [])
+  const normalizedReport = normalizeTermQAReportForCurrentWorkbench(report)
+  termQAReport.value = normalizedReport
+  const validIds = new Set(normalizedReport?.items.filter((item) => !item.ignored).map((item) => item.id) ?? [])
   selectedTermQAItemIds.value = new Set(
     [...selectedTermQAItemIds.value].filter((id) => validIds.has(id)),
   )
 }
 
 async function loadLatestTermQAReport() {
-  if (isMergeWorkbench.value || !segmentStore.fileRecord || loadingTermQAReport.value) {
+  if (loadingTermQAReport.value) {
+    return
+  }
+  const mergeViewId = segmentStore.mergeViewId || props.mergeViewId || ''
+  if (isMergeWorkbench.value && !mergeViewId) {
+    return
+  }
+  if (!isMergeWorkbench.value && !segmentStore.fileRecord) {
     return
   }
   loadingTermQAReport.value = true
   try {
-    const { data } = await http.get<TermQAReportListResponse>(
-      `/file-records/${segmentStore.fileRecord.id}/term-qa-reports`,
-      {
-        params: {
-          limit: 1,
-          include_items: true,
+    if (isMergeWorkbench.value) {
+      const data = await listMergeViewTermQAReports(mergeViewId, {
+        limit: 1,
+        includeItems: true,
+      })
+      setCurrentTermQAReport(data.items[0] || null)
+    } else if (segmentStore.fileRecord) {
+      const { data } = await http.get<TermQAReportListResponse>(
+        `/file-records/${segmentStore.fileRecord.id}/term-qa-reports`,
+        {
+          params: {
+            limit: 1,
+            include_items: true,
+          },
         },
-      },
-    )
-    setCurrentTermQAReport(data.items[0] || null)
+      )
+      setCurrentTermQAReport(data.items[0] || null)
+    }
   } catch (error) {
     console.error('Failed to load latest term QA report:', error)
     setCurrentTermQAReport(null)
@@ -2808,12 +2936,15 @@ async function loadLatestTermQAReport() {
   }
 }
 
-async function generateCurrentFileTermQAReport() {
-  if (isMergeWorkbench.value) {
-    toast.warn('合并视图暂不跨文件生成术语 QA；请切到单文件工作台执行，避免语言对资源混用。')
+async function generateCurrentTermQAReport() {
+  const mergeViewId = segmentStore.mergeViewId || props.mergeViewId || ''
+  if (isMergeWorkbench.value && !mergeViewId) {
     return
   }
-  if (!segmentStore.fileRecord || generatingTermQAReport.value) {
+  if (!isMergeWorkbench.value && !segmentStore.fileRecord) {
+    return
+  }
+  if (generatingTermQAReport.value) {
     return
   }
   generatingTermQAReport.value = true
@@ -2822,9 +2953,18 @@ async function generateCurrentFileTermQAReport() {
     if (!synced) {
       return
     }
-    const { data } = await http.post<TermQAReport>(
-      `/file-records/${segmentStore.fileRecord.id}/term-qa-reports`,
-    )
+    let data: TermQAReport
+    if (isMergeWorkbench.value) {
+      data = await createMergeViewTermQAReport(mergeViewId)
+    } else {
+      const fileRecord = segmentStore.fileRecord
+      if (!fileRecord) {
+        return
+      }
+      data = (await http.post<TermQAReport>(
+        `/file-records/${fileRecord.id}/term-qa-reports`,
+      )).data
+    }
     setCurrentTermQAReport(data)
     activeBottomTool.value = 'qa-result'
     await scrollBottomPanelIntoView()
@@ -2854,10 +2994,10 @@ async function openTermQAResult() {
   previewPanelRendering.value = false
   activeBottomTool.value = 'qa-result'
   await scrollBottomPanelIntoView()
-  if (isMergeWorkbench.value || termQAReport.value) {
+  if (termQAReport.value) {
     return
   }
-  await generateCurrentFileTermQAReport()
+  await generateCurrentTermQAReport()
 }
 
 async function clearSegmentFiltersForTermQANavigation() {
@@ -2956,20 +3096,23 @@ async function ignoreSelectedTermQAReportItems() {
 }
 
 async function focusTermQAReportItem(item: TermQAReportItem) {
-  const fileRecord = segmentStore.fileRecord
-  if (!fileRecord || locatingTermQAReportItemId.value) {
+  if (locatingTermQAReportItemId.value) {
     return
   }
-  if (item.file_record_id !== fileRecord.id) {
-    toast.warn('该报告项不属于当前文件。')
+  const mergeViewId = segmentStore.mergeViewId || props.mergeViewId || ''
+  const isMergeMode = Boolean(isMergeWorkbench.value && mergeViewId)
+  const fileRecord = segmentStore.fileRecord
+  if (!isMergeMode && !fileRecord) {
     return
   }
 
   locatingTermQAReportItemId.value = item.id
   try {
-    const currentPageIndex = editorSegments.value.findIndex(
-      (segment) => segment.sentence_id === item.sentence_id,
-    )
+    const currentPageIndex = editorSegments.value.findIndex((segment) => (
+      isMergeMode
+        ? segment.file_record_id === item.file_record_id && segment.sentence_id === item.sentence_id
+        : segment.sentence_id === item.sentence_id
+    ))
     if (currentPageIndex >= 0) {
       await focusEditorSegmentAtIndex(currentPageIndex)
       return
@@ -2980,19 +3123,31 @@ async function focusTermQAReportItem(item: TermQAReportItem) {
       return
     }
 
-    const { data } = await http.get<SegmentPositionResponse>(
-      `/file-records/${fileRecord.id}/segments/${encodeURIComponent(item.sentence_id)}/position`,
-      {
-        params: {
-          page_size: segmentStore.pageSize,
+    let data: SegmentPositionResponse
+    if (isMergeMode) {
+      data = await fetchMergeViewSegmentPosition(mergeViewId, item.file_record_id, item.sentence_id, {
+        pageSize: segmentStore.pageSize,
+      })
+    } else {
+      if (!fileRecord) {
+        return
+      }
+      data = (await http.get<SegmentPositionResponse>(
+        `/file-records/${fileRecord.id}/segments/${encodeURIComponent(item.sentence_id)}/position`,
+        {
+          params: {
+            page_size: segmentStore.pageSize,
+          },
         },
-      },
-    )
+      )).data
+    }
     await clearSegmentFiltersForTermQANavigation()
     await refreshSegmentPage(data.page, data.page_size)
-    const targetIndex = editorSegments.value.findIndex(
-      (segment) => segment.sentence_id === item.sentence_id,
-    )
+    const targetIndex = editorSegments.value.findIndex((segment) => (
+      isMergeMode
+        ? segment.file_record_id === item.file_record_id && segment.sentence_id === item.sentence_id
+        : segment.sentence_id === item.sentence_id
+    ))
     if (targetIndex === -1) {
       toast.warn('已切换到目标页，但未找到对应句段。')
       return
@@ -4009,11 +4164,21 @@ async function refreshSegmentPage(
 }
 
 async function handleSegmentPageChange(page: number) {
+  if (ignoreNextPaginationPageReset && page === 1) {
+    ignoreNextPaginationPageReset = false
+    return
+  }
+  ignoreNextPaginationPageReset = false
   await refreshSegmentPage(page, segmentStore.pageSize, { includeStats: false })
 }
 
 async function handleSegmentPageSizeChange(size: number) {
-  await refreshSegmentPage(1, size, { includeStats: false })
+  ignoreNextPaginationPageReset = true
+  try {
+    await refreshSegmentPage(1, size, { includeStats: false })
+  } finally {
+    ignoreNextPaginationPageReset = false
+  }
 }
 
 async function runLLMTranslation() {
@@ -4695,6 +4860,7 @@ watch([
   sourceExcludeQuery,
   targetExcludeQuery,
   searchFuzzyEnabled,
+  searchCaseSensitive,
   segmentScreeningQueryKey,
 ], async () => {
   if (suppressSegmentFilterWatch) {
@@ -4842,11 +5008,11 @@ onBeforeRouteLeave(async () => {
         <button
           class="workbench-ribbon__help"
           type="button"
-          :title="t('workbench.shortcuts')"
-          :aria-label="t('workbench.shortcuts')"
-          @click="showShortcutHelp = true"
+          :title="t('workbench.settings.title')"
+          :aria-label="t('workbench.settings.title')"
+          @click="openWorkbenchSettings()"
         >
-          <CircleHelp :size="16" />
+          <Settings :size="16" />
         </button>
       </div>
 
@@ -5367,7 +5533,7 @@ onBeforeRouteLeave(async () => {
               type="button"
               :disabled="!canRunTermQAReport"
               :title="termQAButtonTitle"
-              @click="generateCurrentFileTermQAReport"
+              @click="generateCurrentTermQAReport"
             >
               <span class="icon-text-area has_dropdown">
                 <span class="tool-item">
@@ -5599,13 +5765,13 @@ onBeforeRouteLeave(async () => {
           </button>
 
           <button
-            class="button workbench-action workbench-action--help workbench-toolbar__icon-btn"
+            class="button workbench-action workbench-action--settings workbench-toolbar__icon-btn"
             type="button"
-            :title="t('workbench.shortcuts')"
-            :aria-label="t('workbench.shortcuts')"
-            @click="showShortcutHelp = true"
+            :title="t('workbench.settings.title')"
+            :aria-label="t('workbench.settings.title')"
+            @click="openWorkbenchSettings()"
           >
-            <CircleHelp :size="16" />
+            <Settings :size="16" />
           </button>
         </div>
       </div>
@@ -6055,6 +6221,10 @@ onBeforeRouteLeave(async () => {
                   <input v-model="searchFuzzyEnabled" type="checkbox">
                   <span>{{ t('workbench.search.fuzzy') }}</span>
                 </label>
+                <label class="workbench-search-panel__toggle" :title="t('workbench.search.caseSensitiveHint')">
+                  <input v-model="searchCaseSensitive" type="checkbox">
+                  <span>{{ t('workbench.search.caseSensitive') }}</span>
+                </label>
 
                 <button
                   class="button workbench-search-panel__advanced-toggle"
@@ -6274,6 +6444,7 @@ onBeforeRouteLeave(async () => {
                       :qa-issues="item.qa_issues || []"
                       :source-search-query="sourceSearchQuery"
                       :target-search-query="targetSearchQuery"
+                      :search-case-sensitive="searchCaseSensitive"
                       :show-visible-chars="richTextEditor.visibleCharactersEnabled.value"
                       :pending-formats="pendingFormatsForEditor"
                       @focus="segmentStore.setActiveSentence"
@@ -6474,7 +6645,7 @@ onBeforeRouteLeave(async () => {
                 <div class="workbench-bottom-drawer__header workbench-bottom-drawer__header--qa">
                   <div class="workbench-bottom-drawer__header-lead">
                     <div class="section-title section-title--tight">术语 QA 报告</div>
-                    <p class="panel-subtitle">{{ segmentStore.fileRecord?.filename || '' }}</p>
+                    <p class="panel-subtitle">{{ termQAReportSubtitle }}</p>
                   </div>
 
                   <div v-if="termQAReport" class="term-qa-dialog__summary">
@@ -6494,8 +6665,8 @@ onBeforeRouteLeave(async () => {
                       <em class="term-qa-stat__value">{{ termQAReport.checked_segments }}</em>
                       <span class="term-qa-stat__label">检查句段</span>
                     </span>
-                    <span v-if="termQAReport.created_at" class="term-qa-stat__time">
-                      {{ termQAReport.created_at }}
+                    <span v-if="termQAReportCreatedAtText" class="term-qa-stat__time">
+                      {{ termQAReportCreatedAtText }}
                     </span>
                   </div>
 
@@ -6532,7 +6703,7 @@ onBeforeRouteLeave(async () => {
                       type="button"
                       :disabled="!canRunTermQAReport"
                       :title="termQAButtonTitle"
-                      @click="void generateCurrentFileTermQAReport()"
+                      @click="void generateCurrentTermQAReport()"
                     >
                       <Loader2 v-if="generatingTermQAReport" class="lucide-spin" :size="14" />
                       重新生成
@@ -6563,12 +6734,13 @@ onBeforeRouteLeave(async () => {
                               @change="toggleAllActiveTermQAItems(!allActiveTermQAItemsSelected)"
                             >
                           </th>
-                          <th>句段</th>
+                          <th class="term-qa-dialog__col-segment">句段</th>
+                          <th v-if="isMergeWorkbench" class="term-qa-dialog__col-file">文件</th>
                           <th>原文术语</th>
                           <th>期望译文</th>
                           <th>当前译文</th>
-                          <th>状态</th>
-                          <th>操作</th>
+                          <th class="term-qa-dialog__col-status">状态</th>
+                          <th class="term-qa-dialog__col-action">操作</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -6606,6 +6778,11 @@ onBeforeRouteLeave(async () => {
                               {{ item.sentence_id }}
                             </span>
                           </td>
+                          <td
+                            v-if="isMergeWorkbench"
+                            class="term-qa-dialog__cell-text"
+                            :title="getTermQAFileName(item)"
+                          >{{ getTermQAFileName(item) }}</td>
                           <td class="term-qa-dialog__cell-text" :title="item.source_term">{{ item.source_term }}</td>
                           <td class="term-qa-dialog__cell-text" :title="item.expected_target_term">{{ item.expected_target_term }}</td>
                           <td
@@ -6647,7 +6824,7 @@ onBeforeRouteLeave(async () => {
                     type="button"
                     :disabled="!canRunTermQAReport"
                     :title="termQAButtonTitle"
-                    @click="void generateCurrentFileTermQAReport()"
+                    @click="void generateCurrentTermQAReport()"
                   >
                     <Loader2 v-if="generatingTermQAReport" class="lucide-spin" :size="14" />
                     生成报告
@@ -6869,6 +7046,7 @@ onBeforeRouteLeave(async () => {
             :term-base-id="selectedTermBaseId || segmentStore.fileRecord?.term_base_id || null"
             :term-base-name="selectedTermBaseName"
             :term-entries="termEntries"
+            :term-matches="activeTermMatches"
             :active-source-text="activeSegmentSourceText"
             :file-record-id="activeWorkbenchFileId"
             :reference-match-result="referenceMatchResult"
@@ -7276,20 +7454,130 @@ onBeforeRouteLeave(async () => {
     </Modal>
 
     <Modal
-      :open="showShortcutHelp"
-      :title="t('workbench.shortcutDialogTitle')"
-      :description="t('workbench.shortcutDialogDescription')"
-      width="520px"
-      @close="showShortcutHelp = false"
+      :open="showWorkbenchSettings"
+      :title="t('workbench.settings.title')"
+      width="min(560px, calc(100vw - 32px))"
+      @close="closeWorkbenchSettings"
     >
-      <div class="shortcut-list">
-        <div class="shortcut-item"><strong>Ctrl + S</strong><span>{{ t('workbench.shortcutItems.save') }}</span></div>
-        <div class="shortcut-item"><strong>Ctrl + Shift + T</strong><span>{{ t('workbench.shortcutItems.runAi') }}</span></div>
-        <div class="shortcut-item"><strong>Enter</strong><span>{{ t('workbench.shortcutItems.confirm') }}</span></div>
-        <div class="shortcut-item"><strong>Ctrl + Enter</strong><span>{{ t('workbench.shortcutItems.newline') }}</span></div>
-        <div class="shortcut-item"><strong>Alt + ↑ / ↓</strong><span>{{ t('workbench.shortcutItems.move') }}</span></div>
-        <div class="shortcut-item"><strong>Esc</strong><span>{{ t('workbench.shortcutItems.closePanel') }}</span></div>
-        <div class="shortcut-item"><strong>?</strong><span>{{ t('workbench.shortcutItems.help') }}</span></div>
+      <div class="workbench-settings-dialog">
+        <div class="workbench-settings-tabs" role="tablist" :aria-label="t('workbench.settings.tabsLabel')">
+          <button
+            class="workbench-settings-tabs__item"
+            :class="{ 'is-active': activeWorkbenchSettingsTab === 'preferences' }"
+            type="button"
+            role="tab"
+            :aria-selected="activeWorkbenchSettingsTab === 'preferences'"
+            @click="activeWorkbenchSettingsTab = 'preferences'"
+          >
+            {{ t('workbench.settings.preferencesTab') }}
+          </button>
+          <button
+            class="workbench-settings-tabs__item"
+            :class="{ 'is-active': activeWorkbenchSettingsTab === 'shortcuts' }"
+            type="button"
+            role="tab"
+            :aria-selected="activeWorkbenchSettingsTab === 'shortcuts'"
+            @click="activeWorkbenchSettingsTab = 'shortcuts'"
+          >
+            {{ t('workbench.settings.shortcutsTab') }}
+          </button>
+        </div>
+
+        <div v-if="activeWorkbenchSettingsTab === 'preferences'" class="workbench-settings-panel" role="tabpanel">
+          <section class="workbench-settings-section">
+            <h4 class="workbench-settings-section__title">{{ t('workbench.settings.interface') }}</h4>
+            <div class="workbench-settings-row">
+              <span>{{ t('workbench.settings.language') }}</span>
+              <div class="workbench-settings-segmented" role="group" :aria-label="t('workbench.settings.language')">
+                <button
+                  type="button"
+                  :class="{ 'is-active': preferencesStore.locale === 'zh-CN' }"
+                  @click="preferencesStore.setLocale('zh-CN')"
+                >
+                  {{ t('language.uiChinese') }}
+                </button>
+                <button
+                  type="button"
+                  :class="{ 'is-active': preferencesStore.locale === 'en-US' }"
+                  @click="preferencesStore.setLocale('en-US')"
+                >
+                  {{ t('language.uiEnglish') }}
+                </button>
+              </div>
+            </div>
+            <div class="workbench-settings-row">
+              <span>{{ t('workbench.settings.theme') }}</span>
+              <div class="workbench-settings-segmented" role="group" :aria-label="t('workbench.settings.theme')">
+                <button
+                  type="button"
+                  :class="{ 'is-active': preferencesStore.theme === 'light' }"
+                  @click="preferencesStore.setTheme('light')"
+                >
+                  {{ t('workbench.settings.themeLight') }}
+                </button>
+                <button
+                  type="button"
+                  :class="{ 'is-active': preferencesStore.theme === 'dark' }"
+                  @click="preferencesStore.setTheme('dark')"
+                >
+                  {{ t('workbench.settings.themeDark') }}
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <section class="workbench-settings-section">
+            <h4 class="workbench-settings-section__title">{{ t('workbench.settings.autoFill') }}</h4>
+            <label class="workbench-settings-choice">
+              <input
+                type="checkbox"
+                :checked="preferencesStore.autoFillExactMatches"
+                @change="preferencesStore.setAutoFillExactMatches(($event.target as HTMLInputElement).checked)"
+              >
+              <span>{{ t('workbench.settings.autoFillExact') }}</span>
+            </label>
+            <label class="workbench-settings-choice">
+              <input
+                type="checkbox"
+                :checked="preferencesStore.autoFillFuzzyMatches"
+                @change="preferencesStore.setAutoFillFuzzyMatches(($event.target as HTMLInputElement).checked)"
+              >
+              <span>{{ t('workbench.settings.autoFillFuzzy') }}</span>
+            </label>
+          </section>
+
+          <section class="workbench-settings-section">
+            <h4 class="workbench-settings-section__title">{{ t('workbench.settings.confirmGroup') }}</h4>
+            <label class="workbench-settings-choice">
+              <input
+                type="radio"
+                name="workbench-confirm-jump"
+                :checked="preferencesStore.confirmJumpMode === 'next_segment'"
+                @change="setWorkbenchConfirmJumpMode('next_segment')"
+              >
+              <span>{{ t('workbench.settings.confirmNextSegment') }}</span>
+            </label>
+            <label class="workbench-settings-choice">
+              <input
+                type="radio"
+                name="workbench-confirm-jump"
+                :checked="preferencesStore.confirmJumpMode === 'next_unconfirmed'"
+                @change="setWorkbenchConfirmJumpMode('next_unconfirmed')"
+              >
+              <span>{{ t('workbench.settings.confirmNextUnconfirmed') }}</span>
+            </label>
+          </section>
+        </div>
+
+        <div v-else class="shortcut-list shortcut-list--settings" role="tabpanel">
+          <div class="shortcut-item"><strong>Ctrl + S</strong><span>{{ t('workbench.shortcutItems.save') }}</span></div>
+          <div class="shortcut-item"><strong>Ctrl + Shift + T</strong><span>{{ t('workbench.shortcutItems.runAi') }}</span></div>
+          <div class="shortcut-item"><strong>Enter</strong><span>{{ confirmShortcutDescription }}</span></div>
+          <div class="shortcut-item"><strong>Ctrl + Enter</strong><span>{{ t('workbench.shortcutItems.newline') }}</span></div>
+          <div class="shortcut-item"><strong>Alt + ↑ / ↓</strong><span>{{ t('workbench.shortcutItems.move') }}</span></div>
+          <div class="shortcut-item"><strong>Esc</strong><span>{{ t('workbench.shortcutItems.closePanel') }}</span></div>
+          <div class="shortcut-item"><strong>?</strong><span>{{ t('workbench.shortcutItems.help') }}</span></div>
+        </div>
       </div>
     </Modal>
   </div>
@@ -8374,7 +8662,7 @@ onBeforeRouteLeave(async () => {
 
 .term-qa-dialog__table {
   width: 100%;
-  min-width: 760px;
+  min-width: 920px;
   border-collapse: collapse;
   font-size: 13px;
   table-layout: fixed;
@@ -8402,15 +8690,19 @@ onBeforeRouteLeave(async () => {
   text-align: center;
 }
 
-.term-qa-dialog__table th:nth-child(2) {
+.term-qa-dialog__col-segment {
   width: 88px;
 }
 
-.term-qa-dialog__table th:nth-child(6) {
+.term-qa-dialog__col-file {
+  width: 160px;
+}
+
+.term-qa-dialog__col-status {
   width: 104px;
 }
 
-.term-qa-dialog__table th:nth-child(7) {
+.term-qa-dialog__col-action {
   width: 78px;
 }
 
@@ -8637,7 +8929,8 @@ onBeforeRouteLeave(async () => {
   --action-hover-shadow: rgba(184, 60, 65, 0.28);
 }
 
-.workbench-action--help {
+.workbench-action--help,
+.workbench-action--settings {
   --action-bg: linear-gradient(180deg, #eef1fb, #dde5f7);
   --action-border: #c8d4ee;
   --action-color: #33486f;
@@ -10509,6 +10802,129 @@ onBeforeRouteLeave(async () => {
   --rail-active-shadow: rgba(91, 67, 128, 0.16);
 }
 
+.workbench-settings-dialog {
+  display: grid;
+  gap: 16px;
+}
+
+.workbench-settings-tabs {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  padding: 2px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-muted);
+}
+
+.workbench-settings-tabs__item {
+  min-height: 30px;
+  padding: 5px 14px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.workbench-settings-tabs__item:hover,
+.workbench-settings-tabs__item:focus-visible {
+  color: var(--brand-700);
+  outline: none;
+}
+
+.workbench-settings-tabs__item.is-active {
+  border-color: color-mix(in srgb, var(--brand-700) 24%, var(--line-soft));
+  background: var(--surface-panel);
+  color: var(--brand-700);
+  box-shadow: 0 1px 4px rgba(17, 49, 42, 0.08);
+}
+
+.workbench-settings-panel {
+  display: grid;
+  gap: 18px;
+}
+
+.workbench-settings-section {
+  display: grid;
+  gap: 10px;
+  padding-top: 2px;
+}
+
+.workbench-settings-section + .workbench-settings-section {
+  padding-top: 16px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.workbench-settings-section__title {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.workbench-settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 34px;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.workbench-settings-segmented {
+  display: inline-flex;
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 2px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-muted);
+}
+
+.workbench-settings-segmented button {
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.workbench-settings-segmented button:hover,
+.workbench-settings-segmented button:focus-visible {
+  color: var(--brand-700);
+  outline: none;
+}
+
+.workbench-settings-segmented button.is-active {
+  border-color: color-mix(in srgb, var(--brand-700) 26%, var(--line-soft));
+  background: var(--surface-panel);
+  color: var(--brand-700);
+}
+
+.workbench-settings-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-height: 26px;
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.workbench-settings-choice input {
+  flex: 0 0 auto;
+  margin: 3px 0 0;
+  accent-color: var(--brand-700);
+}
+
 .shortcut-list {
   display: grid;
   gap: 10px;
@@ -10722,6 +11138,20 @@ onBeforeRouteLeave(async () => {
 
   .shortcut-item {
     flex-direction: column;
+  }
+
+  .workbench-settings-row {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .workbench-settings-segmented {
+    width: 100%;
+  }
+
+  .workbench-settings-segmented button {
+    flex: 1 1 0;
   }
 }
 

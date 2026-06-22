@@ -151,6 +151,8 @@ const overrides = {
   workbench: {
     search: {
       advanced: 'Advanced',
+      caseSensitive: 'Match case',
+      caseSensitiveHint: 'Only match text with the same letter casing',
       sourceExcludeLabel: 'Source excludes',
       targetExcludeLabel: 'Target excludes',
       excludePlaceholder: 'Separate terms with spaces or commas',
@@ -183,8 +185,28 @@ const overrides = {
       deleteColor: 'Delete color',
       noAuthors: 'No revision users yet.',
     },
+    settings: {
+      title: 'Settings',
+      tabsLabel: 'Settings sections',
+      preferencesTab: 'Preferences',
+      shortcutsTab: 'Shortcuts',
+      interface: 'Interface',
+      language: 'Language',
+      theme: 'Theme',
+      themeLight: 'Light',
+      themeDark: 'Dark',
+      autoFill: 'Auto fill',
+      autoFillExact: 'TM matches at 100% or higher',
+      autoFillFuzzy: 'TM matches above the minimum threshold',
+      confirmGroup: 'Segment confirmation',
+      confirmNextSegment: 'After confirming, move to the next segment',
+      confirmNextUnconfirmed: 'After confirming, move to the next unconfirmed segment',
+    },
     shortcutItems: {
       confirm: 'Confirm current segment and jump to the next unconfirmed segment',
+      confirmNextSegment: 'Confirm current segment and jump to the next segment',
+      confirmNextUnconfirmed: 'Confirm current segment and jump to the next unconfirmed segment',
+      help: 'Open the shortcuts tab',
     },
   },
   pagination: {

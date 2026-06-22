@@ -25,6 +25,7 @@ const props = withDefaults(defineProps<{
   qaIssues?: SegmentQAIssue[]
   sourceSearchQuery?: string
   targetSearchQuery?: string
+  searchCaseSensitive?: boolean
   showVisibleChars?: boolean
   pendingFormats?: Record<TextFormat, boolean> & { _overrideActive?: boolean }
   /** 句段对外标识：单文件模式即 sentence_id；合并模式为复合键 ${file_record_id}:${sentence_id} */
@@ -40,6 +41,7 @@ const props = withDefaults(defineProps<{
   qaIssues: () => [],
   sourceSearchQuery: '',
   targetSearchQuery: '',
+  searchCaseSensitive: false,
   showVisibleChars: false,
   pendingFormats: () => ({
     bold: false,
@@ -265,13 +267,13 @@ function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-function highlightSearchText(text: string, keyword: string): HighlightPart[] | null {
+function highlightSearchText(text: string, keyword: string, caseSensitive = false): HighlightPart[] | null {
   const query = keyword.trim()
   if (!text || !query) {
     return null
   }
 
-  const regexp = new RegExp(escapeRegExp(query), 'gi')
+  const regexp = new RegExp(escapeRegExp(query), caseSensitive ? 'g' : 'gi')
   const matches = Array.from(text.matchAll(regexp))
     .map((match) => ({
       start: match.index ?? 0,
@@ -317,13 +319,13 @@ const sourceTextContent = computed(() => {
 
 const highlightedSourceText = computed(() => {
   const text = sourceTextContent.value
-  return highlightSearchText(text, props.sourceSearchQuery) || highlightText(text, props.matchedTerms || [], 'source_text')
+  return highlightSearchText(text, props.sourceSearchQuery, props.searchCaseSensitive) || highlightText(text, props.matchedTerms || [], 'source_text')
 })
 
 // 高亮译文中匹配的术语
 const highlightedTargetText = computed(() => {
   const text = props.segment.target_text || ''
-  return highlightSearchText(text, props.targetSearchQuery) || highlightText(text, props.matchedTerms || [], 'target_text')
+  return highlightSearchText(text, props.targetSearchQuery, props.searchCaseSensitive) || highlightText(text, props.matchedTerms || [], 'target_text')
 })
 
 const activeQAIssues = computed(() => {
@@ -443,7 +445,7 @@ function renderHighlightPartsAsHtml(parts: HighlightPart[] | null, text: string)
 
 function renderSourceTextWithHighlights(text: string): string {
   return renderHighlightPartsAsHtml(
-    highlightSearchText(text, props.sourceSearchQuery)
+    highlightSearchText(text, props.sourceSearchQuery, props.searchCaseSensitive)
       || highlightText(text, props.matchedTerms || [], 'source_text'),
     text,
   )
@@ -454,7 +456,7 @@ function hasSourceHighlights(): boolean {
 }
 
 function renderTargetTextWithHighlights(text: string): string {
-  const parts = highlightSearchText(text, props.targetSearchQuery)
+  const parts = highlightSearchText(text, props.targetSearchQuery, props.searchCaseSensitive)
     || highlightText(text, props.matchedTerms || [], 'target_text')
     || highlightQAText(text, activeQAIssues.value)
   if (!parts) {
