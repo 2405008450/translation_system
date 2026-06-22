@@ -1547,6 +1547,10 @@ export const useSegmentStore = defineStore('segment', () => {
 
   async function loadTermMatches(sentenceId: string, sourceText: string) {
     if (!sourceText) {
+      termMatchesMap.value = {
+        ...termMatchesMap.value,
+        [sentenceId]: [],
+      }
       return
     }
     if (mergeViewId.value) {
@@ -1558,9 +1562,18 @@ export const useSegmentStore = defineStore('segment', () => {
     }
     try {
       const params = new URLSearchParams({ text: sourceText })
-      const boundTermBaseIds = fileRecord.value?.term_base_ids?.length
-        ? fileRecord.value.term_base_ids
-        : (fileRecord.value?.term_base_id ? [fileRecord.value.term_base_id] : [])
+      const boundTermBaseIds = Array.from(new Set([
+        ...(fileRecord.value?.term_base_ids || []),
+        ...(fileRecord.value?.term_base_id ? [fileRecord.value.term_base_id] : []),
+        ...(fileRecord.value?.qa_term_base_ids || []),
+      ].filter(Boolean)))
+      if (boundTermBaseIds.length === 0) {
+        termMatchesMap.value = {
+          ...termMatchesMap.value,
+          [sentenceId]: [],
+        }
+        return
+      }
       for (const termBaseId of boundTermBaseIds) {
         params.append('collection_ids', termBaseId)
       }
@@ -1574,6 +1587,13 @@ export const useSegmentStore = defineStore('segment', () => {
     } catch {
       // 静默失败
     }
+  }
+
+  function refreshActiveTermMatches() {
+    if (!activeSentenceId.value) {
+      return
+    }
+    void loadTermMatches(activeSentenceId.value, activeSourceText.value)
   }
 
   function getTermMatches(sentenceId: string): TermMatch[] {
@@ -2550,6 +2570,7 @@ export const useSegmentStore = defineStore('segment', () => {
     setProjectSyncDisabled,
     disableProjectSyncForCurrentFile,
     setActiveSentence,
+    refreshActiveTermMatches,
     getTermMatches,
     syncToBackend,
     acceptRevision,

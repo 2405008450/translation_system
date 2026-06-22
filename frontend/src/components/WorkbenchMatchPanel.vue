@@ -4,7 +4,16 @@ import { useI18n } from 'vue-i18n'
 
 import type { Segment, TermEntryRecord, TermMatch, TMMatchCandidate, ReferenceMatchResult, ReferenceExactMatch, ReferenceFuzzyMatch, ReferenceTermMatch } from '../types/api'
 import { http } from '../api/http'
+import { hasTermTextMatch } from '../utils/termMatching'
 import DiffText from './DiffText.vue'
+
+type MatchedTermDisplay = {
+  id: string
+  source_text: string
+  target_text: string
+  creator_name: string | null
+  updated_at: string | null
+}
 
 const props = defineProps<{
   segment: Segment | null
@@ -36,15 +45,28 @@ const matchPercent = computed(() => {
   return Math.round(bestScore * 100)
 })
 
-const matchedTerms = computed(() => {
-  if (!props.activeSourceText || props.termMatches.length === 0) return []
-  return props.termMatches.map((match) => ({
-    id: match.term_id,
-    source_text: match.source_text,
-    target_text: match.target_text,
-    creator_name: null,
-    updated_at: null,
-  }))
+const matchedTerms = computed<MatchedTermDisplay[]>(() => {
+  if (!props.activeSourceText) return []
+  if (props.termMatches.length > 0) {
+    return props.termMatches.map((match) => ({
+      id: match.term_id,
+      source_text: match.source_text,
+      target_text: match.target_text,
+      creator_name: null,
+      updated_at: null,
+    }))
+  }
+  return props.termEntries
+    .filter((entry) => hasTermTextMatch(props.activeSourceText, entry.source_text))
+    .slice()
+    .sort((left, right) => right.source_text.length - left.source_text.length)
+    .map((entry) => ({
+      id: entry.id,
+      source_text: entry.source_text,
+      target_text: entry.target_text,
+      creator_name: entry.creator_name,
+      updated_at: entry.updated_at,
+    }))
 })
 
 // 当前句段的参考匹配结果
@@ -230,7 +252,10 @@ function getMatchScoreClass(score: number): string {
       </section>
 
       <section class="match-section">
-        <h4 class="match-section__title">{{ t('matchPanel.termMatch') }}</h4>
+        <h4 class="match-section__title">
+          {{ t('matchPanel.termMatch') }}
+          <span v-if="matchedTerms.length > 0">({{ matchedTerms.length }})</span>
+        </h4>
 
         <template v-if="matchedTerms.length > 0">
           <div class="term-list">

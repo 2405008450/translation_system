@@ -390,6 +390,7 @@ const segmentSearchOpen = ref(false)
 const segmentScreeningPopoverOpen = ref(false)
 const sourceEditing = ref(false)
 const sourceSearchInputRef = ref<HTMLInputElement | null>(null)
+const targetSearchInputRef = ref<HTMLInputElement | null>(null)
 const guidelinesEditorRef = ref<HTMLTextAreaElement | null>(null)
 const segmentDisplayScope = ref<SegmentDisplayScope>('all')
 const sourceSearchQuery = ref('')
@@ -1157,6 +1158,47 @@ const activeSegment = computed(() => (
 /** 句段对外标识：合并模式为复合键，单文件即 sentence_id */
 function segmentKeyOf(segment: { sentence_id: string; file_record_id?: string }) {
   return segmentStore.segmentKeyOf(segment as any)
+}
+function resolveCommentSentenceKey(sentenceId: string | null | undefined, fileRecordId?: string | null) {
+  if (!sentenceId) {
+    return null
+  }
+  if (!segmentStore.mergeViewId) {
+    return sentenceId
+  }
+  const segment = segmentStore.segments.find((item) => (
+    item.sentence_id === sentenceId
+    && (!fileRecordId || item.file_record_id === fileRecordId)
+  ))
+  return segment ? segmentKeyOf(segment) : sentenceId
+}
+function buildActiveSegmentCommentDraft(): CommentAnchorDraft | null {
+  const segment = activeSegment.value
+  const sentenceId = segment?.sentence_id || segmentStore.activeSentenceId
+  if (!sentenceId) {
+    return null
+  }
+  const normalizedSentenceId = segment?.sentence_id
+    || (segmentStore.mergeViewId && sentenceId.includes(':')
+      ? sentenceId.slice(sentenceId.indexOf(':') + 1)
+      : sentenceId)
+  return {
+    sentence_id: normalizedSentenceId,
+    anchor_mode: 'sentence',
+    range_start_offset: null,
+    range_end_offset: null,
+    anchor_text: null,
+  }
+}
+function isSameCommentDraft(left: CommentAnchorDraft | null, right: CommentAnchorDraft) {
+  return Boolean(
+    left
+    && left.sentence_id === right.sentence_id
+    && left.anchor_mode === right.anchor_mode
+    && left.range_start_offset === right.range_start_offset
+    && left.range_end_offset === right.range_end_offset
+    && left.anchor_text === right.anchor_text,
+  )
 }
 /** VirtualList item-key 解析器：合并模式按复合键，单文件按 sentence_id */
 function segmentItemKey(item: any) {
@@ -2090,7 +2132,38 @@ async function openBottomTool(tool: BottomDrawerToolKey) {
   }
 }
 
+async function openActiveSegmentCommentDraft() {
+  const draft = buildActiveSegmentCommentDraft()
+  if (!draft) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+
+  if (!isSameCommentDraft(commentStore.draftAnchor, draft)) {
+    commentStore.setDraftAnchor(draft)
+  }
+  commentStore.setActiveComment(null)
+  activeSideTool.value = 'notes'
+
+  if (segmentStore.activeSentenceId) {
+    await handlePreviewFocus(segmentStore.activeSentenceId)
+  }
+
+  await nextTick()
+  document
+    .querySelector<HTMLTextAreaElement>('.notes-panel--drawer .notes-panel__composer .notes-panel__textarea')
+    ?.focus()
+}
+
 async function openSideTool(tool: SideToolKey) {
+  if (tool === 'notes') {
+    pageError.value = ''
+    sidecarWidth.value = null
+    activeSideTool.value = 'notes'
+    await openActiveSegmentCommentDraft()
+    return
+  }
+
   if (activeSideTool.value === tool) {
     activeSideTool.value = null
     sidecarWidth.value = null
@@ -2405,6 +2478,29 @@ async function clearSourceSegmentSearchQuery() {
 
   await nextTick()
   sourceSearchInputRef.value?.focus({ preventScroll: true })
+}
+
+async function clearTargetSegmentSearchQuery() {
+  const target = segmentSearchReturnTarget.value
+  const targetPage = target ? await resolveSegmentReturnTargetPage(target) : segmentStore.currentPage
+  searchLoadRequestId += 1
+  searchLoadingAllSegments.value = false
+  suppressSegmentFilterWatch = true
+  targetSearchQuery.value = ''
+  await nextTick()
+  suppressSegmentFilterWatch = false
+
+  if (segmentStore.fileRecord || segmentStore.mergeViewId) {
+    await refreshSegmentPage(targetPage, segmentStore.pageSize)
+  }
+
+  if (target) {
+    await focusEditorSegmentBySentenceId(target.sentenceId)
+    return
+  }
+
+  await nextTick()
+  targetSearchInputRef.value?.focus({ preventScroll: true })
 }
 
 async function closeSegmentSearchPanel() {
@@ -4653,8 +4749,10 @@ function handleClickOutside(event: MouseEvent) {
 async function handleCommentDraft(draft: CommentAnchorDraft) {
   commentStore.setDraftAnchor(draft)
   commentStore.setActiveComment(null)
-  segmentStore.setActiveSentence(draft.sentence_id)
-  await handlePreviewFocus(draft.sentence_id)
+  const sentenceKey = resolveCommentSentenceKey(draft.sentence_id, activeWorkbenchFileId.value)
+  if (sentenceKey) {
+    await handlePreviewFocus(sentenceKey)
+  }
   activeSideTool.value = 'notes'
 }
 
@@ -4663,23 +4761,28 @@ async function handleCommentFocus(commentId: string) {
   commentStore.setActiveComment(commentId)
   const comment = commentStore.comments.find((item) => item.id === commentId)
   if (comment?.sentence_id) {
-    segmentStore.setActiveSentence(comment.sentence_id)
-    await handlePreviewFocus(comment.sentence_id)
+    const sentenceKey = resolveCommentSentenceKey(comment.sentence_id, comment.file_record_id)
+    if (sentenceKey) {
+      await handlePreviewFocus(sentenceKey)
+    }
   }
   activeSideTool.value = 'notes'
 }
 
 async function handleCreateComment(payload: CommentCreatePayload) {
-  if (!segmentStore.fileRecord) {
+  const fileRecordId = activeWorkbenchFileId.value || segmentStore.fileRecord?.id || props.id
+  if (!fileRecordId) {
     return
   }
 
   pageError.value = ''
   try {
-    const comment = await commentStore.createComment(segmentStore.fileRecord.id, payload)
+    const comment = await commentStore.createComment(fileRecordId, payload)
     if (comment.sentence_id) {
-      segmentStore.setActiveSentence(comment.sentence_id)
-      await handlePreviewFocus(comment.sentence_id)
+      const sentenceKey = resolveCommentSentenceKey(comment.sentence_id, comment.file_record_id || fileRecordId)
+      if (sentenceKey) {
+        await handlePreviewFocus(sentenceKey)
+      }
     }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.commentSave'))
@@ -4691,8 +4794,10 @@ async function handleReplyComment(commentId: string, body: string) {
   try {
     const comment = await commentStore.replyToComment(commentId, { body })
     if (comment.sentence_id) {
-      segmentStore.setActiveSentence(comment.sentence_id)
-      await handlePreviewFocus(comment.sentence_id)
+      const sentenceKey = resolveCommentSentenceKey(comment.sentence_id, comment.file_record_id)
+      if (sentenceKey) {
+        await handlePreviewFocus(sentenceKey)
+      }
     }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.replySave'))
@@ -4704,7 +4809,10 @@ async function handleUpdateComment(commentId: string, payload: { body?: string; 
   try {
     const comment = await commentStore.updateComment(commentId, payload)
     if (comment.sentence_id) {
-      segmentStore.setActiveSentence(comment.sentence_id)
+      const sentenceKey = resolveCommentSentenceKey(comment.sentence_id, comment.file_record_id)
+      if (sentenceKey) {
+        segmentStore.setActiveSentence(sentenceKey)
+      }
     }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.commentUpdate'))
@@ -4850,6 +4958,7 @@ async function ensureMatchInfoPanelOpen() {
     if (selectedTermBaseId.value && termEntries.value.length === 0 && !loadingTermEntries.value) {
       await loadTermEntries()
     }
+    segmentStore.refreshActiveTermMatches()
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.sidePanel'))
   }
@@ -6302,13 +6411,28 @@ onBeforeRouteLeave(async () => {
 
                 <label class="workbench-search-panel__field">
                   <span>{{ t('workbench.search.targetShortLabel') }}</span>
-                  <input
-                    v-model="targetSearchQuery"
-                    class="field__control"
-                    type="text"
-                    :placeholder="t('workbench.search.targetPlaceholder')"
-                    @keydown.enter.prevent="void focusMatchedSegment(1)"
-                  />
+                  <span class="workbench-search-panel__input-wrap">
+                    <input
+                      ref="targetSearchInputRef"
+                      v-model="targetSearchQuery"
+                      class="field__control"
+                      :class="{ 'has-clear-action': targetSearchQuery }"
+                      type="text"
+                      :placeholder="t('workbench.search.targetPlaceholder')"
+                      @keydown.enter.prevent="void focusMatchedSegment(1)"
+                    />
+                    <button
+                      v-if="targetSearchQuery"
+                      class="workbench-search-panel__input-clear"
+                      type="button"
+                      :title="t('workbench.search.clear')"
+                      :aria-label="t('workbench.search.clear')"
+                      @mousedown.prevent
+                      @click="void clearTargetSegmentSearchQuery()"
+                    >
+                      <X :size="12" />
+                    </button>
+                  </span>
                 </label>
 
                 <label class="workbench-search-panel__toggle" :title="t('workbench.search.fuzzyHint')">
@@ -6359,13 +6483,27 @@ onBeforeRouteLeave(async () => {
               <div class="workbench-search-panel__line workbench-search-panel__line--replace">
                 <label class="workbench-search-panel__field workbench-search-panel__field--replace">
                   <span>{{ t('workbench.search.replaceLabel') }}</span>
-                  <input
-                    v-model="replaceSearchText"
-                    class="field__control"
-                    type="text"
-                    :placeholder="t('workbench.search.replacePlaceholder')"
-                    @keydown.enter.prevent="void replaceCurrentSearchMatch()"
-                  />
+                  <span class="workbench-search-panel__input-wrap">
+                    <input
+                      v-model="replaceSearchText"
+                      class="field__control"
+                      :class="{ 'has-clear-action': replaceSearchText }"
+                      type="text"
+                      :placeholder="t('workbench.search.replacePlaceholder')"
+                      @keydown.enter.prevent="void replaceCurrentSearchMatch()"
+                    />
+                    <button
+                      v-if="replaceSearchText"
+                      class="workbench-search-panel__input-clear"
+                      type="button"
+                      :title="t('workbench.search.clear')"
+                      :aria-label="t('workbench.search.clear')"
+                      @mousedown.prevent
+                      @click="replaceSearchText = ''"
+                    >
+                      <X :size="12" />
+                    </button>
+                  </span>
                 </label>
 
                 <button
@@ -11200,6 +11338,7 @@ onBeforeRouteLeave(async () => {
 
   .workbench-search-panel__field,
   .workbench-search-panel__field .field__control,
+  .workbench-search-panel__field .workbench-search-panel__input-wrap,
   .workbench-search-panel__field--replace .field__control {
     width: 100%;
   }
