@@ -165,6 +165,13 @@ export default {
   confirm: {
     title: '请确认',
   },
+  appUpdate: {
+    title: '发现新版本',
+    message: '系统已更新，刷新后可使用最新功能。当前编辑内容请先保存。',
+    hardRefreshHint: '如果刷新后仍异常，请按 Ctrl+F5；Mac 可按 Cmd+Shift+R。',
+    reload: '立即刷新',
+    versionChanged: '当前版本 {current}，最新版本 {latest}。',
+  },
   errors: {
     requestFailed: '请求失败',
     network: '网络异常，请稍后重试。',

@@ -43,7 +43,24 @@ const workflowItems = computed(() => (
     }))
 ))
 const hasWorkflowDetails = computed(() => workflowItems.value.length > 1)
-const progressAriaLabel = computed(() => `${props.label} ${normalizedProgress.value}%`)
+const translationWorkflowItem = computed(() => (
+  workflowItems.value.find((item) => (
+    item.step_key === 'translate' || item.step_type === 'translation'
+  )) ?? null
+))
+const displayProgress = computed(() => {
+  if (hasWorkflowDetails.value && translationWorkflowItem.value) {
+    return translationWorkflowItem.value.progress
+  }
+  return normalizedProgress.value
+})
+const displayProgressLabel = computed(() => {
+  if (hasWorkflowDetails.value && translationWorkflowItem.value) {
+    return translationWorkflowItem.value.name
+  }
+  return props.label
+})
+const progressAriaLabel = computed(() => `${displayProgressLabel.value} ${displayProgress.value}%`)
 
 function removePositionListeners() {
   window.removeEventListener('resize', updatePopoverPosition)
@@ -162,11 +179,11 @@ onBeforeUnmount(() => {
       <div class="progress-bar__track">
         <div
           class="progress-bar__fill"
-          :class="{ 'is-complete': isProgressComplete(normalizedProgress) }"
-          :style="getProgressStyle(normalizedProgress, status)"
+          :class="{ 'is-complete': isProgressComplete(displayProgress) }"
+          :style="getProgressStyle(displayProgress, status)"
         />
       </div>
-      <span class="progress-bar__text">{{ normalizedProgress }}%</span>
+      <span class="progress-bar__text">{{ displayProgress }}%</span>
     </div>
   </div>
 

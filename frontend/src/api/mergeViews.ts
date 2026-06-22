@@ -7,6 +7,7 @@ import type {
   SegmentPositionResponse,
   TermQAReport,
   TermQAReportListResponse,
+  WorkbenchQAResult,
 } from '../types/api'
 import type { SegmentPageQuery } from '../stores/segment'
 
@@ -73,6 +74,16 @@ export async function listMergeViewTermQAReports(
       },
     },
   )
+  return data
+}
+
+export async function fetchMergeViewQAResult(viewId: string) {
+  const { data } = await http.get<WorkbenchQAResult>(`/merge-views/${viewId}/qa-results`)
+  return data
+}
+
+export async function createMergeViewQAResult(viewId: string) {
+  const { data } = await http.post<WorkbenchQAResult>(`/merge-views/${viewId}/qa-results`)
   return data
 }
 

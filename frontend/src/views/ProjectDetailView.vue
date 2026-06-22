@@ -5475,13 +5475,19 @@ onBeforeUnmount(() => {
                         </tr>
                       </thead>
                       <tbody>
-                        <tr v-for="(rule, index) in qualityQARules" :key="rule.key">
+                        <tr
+                          v-for="(rule, index) in qualityQARules"
+                          :key="rule.key"
+                          :data-rule-key="rule.key"
+                          :data-testid="`quality-qa-rule-${rule.key}`"
+                        >
                           <td>{{ index + 1 }}</td>
                           <td class="quality-qa-settings__check-cell">
                             <label class="quality-qa-settings__rule-check">
                               <input
                                 v-model="qualityQADraft.rules[rule.key]"
                                 type="checkbox"
+                                :data-testid="`quality-qa-rule-toggle-${rule.key}`"
                                 :disabled="savingQualityQASettings || loadingQualityQASettings"
                                 :aria-label="`启用${rule.label}`"
                               />
@@ -5493,6 +5499,8 @@ onBeforeUnmount(() => {
                           v-for="(rule, index) in qualityQAPlaceholderRules"
                           :key="rule.key"
                           class="is-placeholder"
+                          :data-rule-key="rule.key"
+                          :data-testid="`quality-qa-rule-${rule.key}`"
                           title="占位展示，后端暂未接入。"
                         >
                           <td>{{ qualityQARules.length + index + 1 }}</td>
@@ -5501,6 +5509,7 @@ onBeforeUnmount(() => {
                               <input
                                 type="checkbox"
                                 disabled
+                                :data-testid="`quality-qa-rule-toggle-${rule.key}`"
                                 :aria-label="`占位${rule.label}`"
                               />
                             </label>

@@ -62,11 +62,12 @@ import WorkbenchHistoryPanel from '../components/WorkbenchHistoryPanel.vue'
 import WorkbenchMatchPanel from '../components/WorkbenchMatchPanel.vue'
 import WorkbenchTermsPanel from '../components/WorkbenchTermsPanel.vue'
 import ReferencePanel from '../components/ReferencePanel.vue'
+import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { http } from '../api/http'
 import {
-  createMergeViewTermQAReport,
+  createMergeViewQAResult,
   fetchMergeViewSegmentPosition,
-  listMergeViewTermQAReports,
+  fetchMergeViewQAResult,
 } from '../api/mergeViews'
 import { refreshGlobalNotifications } from '../utils/notifications'
 import { useConfirm } from '../composables/useConfirm'
@@ -77,7 +78,12 @@ import { useWorkbenchShortcuts } from '../composables/useWorkbenchShortcuts'
 import { getTaskExportFormatLabel } from '../constants/taskFiles'
 import { llmModelOptions, llmProviderOptions, llmScopeOptions } from '../constants/llm'
 import { formatLanguagePair } from '../constants/languages'
-import { isProgressComplete } from '../utils/progress'
+import {
+  calculateOverallWorkflowProgress,
+  calculateProgressPercent,
+  isProgressComplete,
+  patchTranslationWorkflowProgress,
+} from '../utils/progress'
 import { hasTermTextMatch } from '../utils/termMatching'
 import { useAuthStore } from '../stores/auth'
 import { useCommentStore, type CommentWindowQuery } from '../stores/comment'
@@ -99,9 +105,9 @@ import type {
   TMCollection,
   TermBase,
   TermEntryRecord,
-  TermQAReport,
-  TermQAReportItem,
-  TermQAReportListResponse,
+  WorkbenchQAResult,
+  WorkbenchQAResultItem,
+  WorkflowProgress,
 } from '../types/api'
 import { buildDocumentPreviewHtml } from '../utils/documentPreview'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
@@ -194,6 +200,7 @@ type ResourceSearchResponse = {
 }
 
 const REVISION_TRACE_VISIBLE_STORAGE_KEY = 'workbench.revisionTraceEnabled'
+const QA_RESULT_PAGE_SIZE = 50
 const BOTTOM_DRAWER_MIN_HEIGHT = 260
 const BOTTOM_DRAWER_TOP_GUTTER = 70
 const BOTTOM_DRAWER_KEYBOARD_STEP = 32
@@ -418,13 +425,14 @@ const saveToTMScope = ref<SaveToTMScope>('translated')
 const saveToTMTargetMode = ref<SaveToTMTargetMode>('new')
 const saveToTMCollectionId = ref('')
 const saveToTMNewCollectionName = ref('')
-const termQAReport = ref<TermQAReport | null>(null)
+const termQAReport = ref<WorkbenchQAResult | null>(null)
 const loadingTermQAReport = ref(false)
 const generatingTermQAReport = ref(false)
 const downloadingTermQAReport = ref(false)
 const locatingTermQAReportItemId = ref<string | null>(null)
 const updatingTermQAIgnore = ref(false)
 const selectedTermQAItemIds = ref<Set<string>>(new Set())
+const termQAReportPage = ref(1)
 const showWorkflowTransitionDialog = ref(false)
 const workflowTransitionDirection = ref<WorkflowTransitionDirection>('forward')
 const workflowTransitionLoading = ref(false)
@@ -999,6 +1007,48 @@ const activeWorkbenchFileContext = computed(() => {
   return segmentStore.fileRecord
 })
 
+const workbenchFooterProgressContext = computed(() => {
+  const total = activeFileSegmentTotal.value
+  const confirmed = activeFileStatusStats.value.confirmed
+  const liveProgress = calculateProgressPercent(confirmed, total)
+
+  if (isMergeWorkbench.value) {
+    const file = activeMergeViewFile.value
+    if (!file) {
+      return null
+    }
+    const workflowProgress = patchTranslationWorkflowProgress(
+      (file.workflow_progress || []) as WorkflowProgress[],
+      confirmed,
+      total,
+    )
+    return {
+      progress: workflowProgress.length
+        ? calculateOverallWorkflowProgress(workflowProgress, liveProgress)
+        : liveProgress,
+      status: file.status,
+      workflowProgress,
+    }
+  }
+
+  const record = segmentStore.fileRecord
+  if (!record) {
+    return null
+  }
+  const workflowProgress = patchTranslationWorkflowProgress(
+    record.workflow_progress || [],
+    confirmed,
+    total,
+  )
+  return {
+    progress: workflowProgress.length
+      ? calculateOverallWorkflowProgress(workflowProgress, liveProgress)
+      : liveProgress,
+    status: record.status,
+    workflowProgress,
+  }
+})
+
 const activeWorkbenchProjectId = computed(() => (
   segmentStore.fileRecord?.project_id
   || segmentStore.mergeViewDetail?.project_id
@@ -1088,6 +1138,25 @@ const allActiveTermQAItemsSelected = computed(() => (
   && activeTermQAReportItems.value.every((item) => selectedTermQAItemIds.value.has(item.id))
 ))
 
+const termQAReportPageSize = QA_RESULT_PAGE_SIZE
+const termQAReportTotalPages = computed(() => (
+  Math.max(1, Math.ceil((termQAReport.value?.items.length || 0) / termQAReportPageSize))
+))
+const visibleTermQAReportItems = computed(() => {
+  const items = termQAReport.value?.items || []
+  const startIndex = (termQAReportPage.value - 1) * termQAReportPageSize
+  return items.slice(startIndex, startIndex + termQAReportPageSize)
+})
+const termQAReportPageRangeText = computed(() => {
+  const total = termQAReport.value?.items.length || 0
+  if (total === 0) {
+    return '0 / 0'
+  }
+  const start = (termQAReportPage.value - 1) * termQAReportPageSize + 1
+  const end = Math.min(start + termQAReportPageSize - 1, total)
+  return `${start}-${end} / ${total}`
+})
+
 const termQAReportCreatedAtText = computed(() => (
   formatWorkbenchStatusTime(termQAReport.value?.created_at)
 ))
@@ -1103,7 +1172,7 @@ const termQAReportSubtitle = computed(() => {
   return segmentStore.fileRecord?.filename || ''
 })
 
-function getTermQAFileName(item: TermQAReportItem) {
+function getTermQAFileName(item: WorkbenchQAResultItem) {
   return (
     segmentStore.mergeViewDetail?.files.find((file) => file.id === item.file_record_id)?.filename
     || item.file_name
@@ -1111,7 +1180,7 @@ function getTermQAFileName(item: TermQAReportItem) {
   )
 }
 
-function normalizeTermQAReportForCurrentWorkbench(report: TermQAReport | null) {
+function normalizeTermQAReportForCurrentWorkbench(report: WorkbenchQAResult | null) {
   if (!report || !isMergeWorkbench.value) {
     return report
   }
@@ -1663,8 +1732,8 @@ const canRunTermQAReport = computed(() => {
 })
 const termQAButtonTitle = computed(() => (
   isMergeWorkbench.value
-    ? '按当前合并视图文件组合生成术语 QA 报告。'
-    : t('workbench.ribbon.qaSettings')
+    ? '按当前合并视图文件组合生成 QA 结果。'
+    : '按项目质量设置生成 QA 结果。'
 ))
 
 const boundTermBaseIds = computed(() => {
@@ -3043,13 +3112,28 @@ watch(
   },
 )
 
-function setCurrentTermQAReport(report: TermQAReport | null) {
+function setCurrentTermQAReport(report: WorkbenchQAResult | null) {
   const normalizedReport = normalizeTermQAReportForCurrentWorkbench(report)
   termQAReport.value = normalizedReport
+  setTermQAReportPage(termQAReportPage.value)
   const validIds = new Set(normalizedReport?.items.filter((item) => !item.ignored).map((item) => item.id) ?? [])
   selectedTermQAItemIds.value = new Set(
     [...selectedTermQAItemIds.value].filter((id) => validIds.has(id)),
   )
+}
+
+function setTermQAReportPage(page: number) {
+  const safePage = Number.isFinite(page) ? Math.trunc(page) : 1
+  termQAReportPage.value = Math.min(Math.max(safePage, 1), termQAReportTotalPages.value)
+}
+
+watch(
+  () => termQAReport.value?.items.length || 0,
+  () => setTermQAReportPage(termQAReportPage.value),
+)
+
+function shouldKeepLoadedQAResult(report: WorkbenchQAResult) {
+  return report.items.length > 0 || Boolean(report.term_report_id)
 }
 
 async function loadLatestTermQAReport() {
@@ -3066,25 +3150,16 @@ async function loadLatestTermQAReport() {
   loadingTermQAReport.value = true
   try {
     if (isMergeWorkbench.value) {
-      const data = await listMergeViewTermQAReports(mergeViewId, {
-        limit: 1,
-        includeItems: true,
-      })
-      setCurrentTermQAReport(data.items[0] || null)
+      const data = await fetchMergeViewQAResult(mergeViewId)
+      setCurrentTermQAReport(shouldKeepLoadedQAResult(data) ? data : null)
     } else if (segmentStore.fileRecord) {
-      const { data } = await http.get<TermQAReportListResponse>(
-        `/file-records/${segmentStore.fileRecord.id}/term-qa-reports`,
-        {
-          params: {
-            limit: 1,
-            include_items: true,
-          },
-        },
+      const { data } = await http.get<WorkbenchQAResult>(
+        `/file-records/${segmentStore.fileRecord.id}/qa-results`,
       )
-      setCurrentTermQAReport(data.items[0] || null)
+      setCurrentTermQAReport(shouldKeepLoadedQAResult(data) ? data : null)
     }
   } catch (error) {
-    console.error('Failed to load latest term QA report:', error)
+    console.error('Failed to load QA result:', error)
     setCurrentTermQAReport(null)
   } finally {
     loadingTermQAReport.value = false
@@ -3108,30 +3183,31 @@ async function generateCurrentTermQAReport() {
     if (!synced) {
       return
     }
-    let data: TermQAReport
+    let data: WorkbenchQAResult
     if (isMergeWorkbench.value) {
-      data = await createMergeViewTermQAReport(mergeViewId)
+      data = await createMergeViewQAResult(mergeViewId)
     } else {
       const fileRecord = segmentStore.fileRecord
       if (!fileRecord) {
         return
       }
-      data = (await http.post<TermQAReport>(
-        `/file-records/${fileRecord.id}/term-qa-reports`,
+      data = (await http.post<WorkbenchQAResult>(
+        `/file-records/${fileRecord.id}/qa-results`,
       )).data
     }
     setCurrentTermQAReport(data)
+    setTermQAReportPage(1)
     activeBottomTool.value = 'qa-result'
     await scrollBottomPanelIntoView()
     toast.show({
       tone: data.issue_count > 0 ? 'warn' : 'success',
-      title: '术语QA报告已生成',
-      message: `发现 ${data.issue_count} 条术语问题。`,
+      title: 'QA 结果已生成',
+      message: `发现 ${data.issue_count} 条待检查问题。`,
     })
   } catch (error) {
     toast.error({
-      title: '术语QA报告生成失败',
-      message: getErrorMessage(error, '术语QA报告生成失败。'),
+      title: 'QA 结果生成失败',
+      message: getErrorMessage(error, 'QA 结果生成失败。'),
     })
   } finally {
     generatingTermQAReport.value = false
@@ -3198,41 +3274,44 @@ async function setTermQAReportItemsIgnored(itemIds: string[], ignored: boolean) 
   }
   updatingTermQAIgnore.value = true
   try {
-    const { data } = await http.patch<TermQAReport>(
-      `/term-qa-reports/${termQAReport.value.id}/items/ignore`,
+    await http.patch(
+      '/qa-result-items/ignore',
       {
         item_ids: itemIds,
         ignored,
       },
     )
-    setCurrentTermQAReport(data)
-    toast.success(ignored ? '已忽略所选术语 QA 项。' : '已恢复所选术语 QA 项。')
+    await loadLatestTermQAReport()
+    toast.success(ignored ? '已忽略所选 QA 问题。' : '已恢复所选 QA 问题。')
   } catch (error) {
     toast.error({
       title: ignored ? '忽略失败' : '恢复失败',
-      message: getErrorMessage(error, ignored ? '忽略术语 QA 项失败。' : '恢复术语 QA 项失败。'),
+      message: getErrorMessage(error, ignored ? '忽略 QA 问题失败。' : '恢复 QA 问题失败。'),
     })
   } finally {
     updatingTermQAIgnore.value = false
   }
 }
 
-async function setSingleTermQAReportItemIgnored(item: TermQAReportItem, ignored: boolean) {
+async function setSingleTermQAReportItemIgnored(item: WorkbenchQAResultItem, ignored: boolean) {
   if (updatingTermQAIgnore.value) {
     return
   }
   updatingTermQAIgnore.value = true
   try {
-    const { data } = await http.patch<TermQAReport>(
-      `/term-qa-report-items/${item.id}/ignore`,
-      { ignored },
+    await http.patch(
+      '/qa-result-items/ignore',
+      {
+        item_ids: [item.id],
+        ignored,
+      },
     )
-    setCurrentTermQAReport(data)
-    toast.success(ignored ? '已忽略该术语 QA 项。' : '已恢复该术语 QA 项。')
+    await loadLatestTermQAReport()
+    toast.success(ignored ? '已忽略该 QA 问题。' : '已恢复该 QA 问题。')
   } catch (error) {
     toast.error({
       title: ignored ? '忽略失败' : '恢复失败',
-      message: getErrorMessage(error, ignored ? '忽略术语 QA 项失败。' : '恢复术语 QA 项失败。'),
+      message: getErrorMessage(error, ignored ? '忽略 QA 问题失败。' : '恢复 QA 问题失败。'),
     })
   } finally {
     updatingTermQAIgnore.value = false
@@ -3241,7 +3320,7 @@ async function setSingleTermQAReportItemIgnored(item: TermQAReportItem, ignored:
 
 async function ignoreSelectedTermQAReportItems() {
   if (selectedActiveTermQAReportItems.value.length === 0) {
-    toast.warn('请先选择未忽略的术语 QA 项。')
+    toast.warn('请先选择未忽略的 QA 问题。')
     return
   }
   await setTermQAReportItemsIgnored(
@@ -3250,7 +3329,7 @@ async function ignoreSelectedTermQAReportItems() {
   )
 }
 
-async function focusTermQAReportItem(item: TermQAReportItem) {
+async function focusTermQAReportItem(item: WorkbenchQAResultItem) {
   if (locatingTermQAReportItemId.value) {
     return
   }
@@ -3324,20 +3403,24 @@ async function downloadCurrentTermQAReport() {
   }
   downloadingTermQAReport.value = true
   try {
-    const response = await http.get(`/term-qa-reports/${termQAReport.value.id}/export-xlsx`, {
+    const mergeViewId = segmentStore.mergeViewId || props.mergeViewId || ''
+    const exportUrl = isMergeWorkbench.value
+      ? `/merge-views/${mergeViewId}/qa-results/export-xlsx`
+      : `/file-records/${segmentStore.fileRecord?.id}/qa-results/export-xlsx`
+    const response = await http.get(exportUrl, {
       responseType: 'blob',
     })
     downloadBlob(
       response.data,
       resolveDownloadFilename(
         response.headers['content-disposition'],
-        `term-qa-report-${termQAReport.value.id}.xlsx`,
+        `qa-result-${termQAReport.value.id}.xlsx`,
       ),
     )
   } catch (error) {
     toast.error({
-      title: '术语QA报告导出失败',
-      message: getErrorMessage(error, '术语QA报告导出失败。'),
+      title: 'QA 结果导出失败',
+      message: getErrorMessage(error, 'QA 结果导出失败。'),
     })
   } finally {
     downloadingTermQAReport.value = false
@@ -5742,7 +5825,7 @@ onBeforeRouteLeave(async () => {
                 <span class="tool-item">
                   <Loader2 v-if="generatingTermQAReport" class="tool-label-icon lucide-spin" :size="16" />
                   <ShieldCheck v-else class="tool-label-icon" :size="16" />
-                  <span class="text">{{ t('workbench.ribbon.qaSettings') }}</span>
+                  <span class="text">QA结果</span>
                 </span>
               </span>
               <span class="dropdown-link" aria-hidden="true">
@@ -6694,15 +6777,31 @@ onBeforeRouteLeave(async () => {
           </div>
 
           <div class="segment-editor-footer">
-          <Pagination
-            :total="segmentStore.matchedSegmentCount"
-            :page="segmentStore.currentPage"
-            :page-size="segmentStore.pageSize"
-            :page-sizes="segmentPageSizes"
-            :loading="segmentStore.loadingMoreSegments"
-            @update:page="handleSegmentPageChange"
-            @update:page-size="handleSegmentPageSizeChange"
-          />
+          <div class="segment-editor-footer__main">
+            <div
+              v-if="workbenchFooterProgressContext"
+              class="segment-editor-footer__progress"
+            >
+              <span class="segment-editor-footer__progress-label">{{ t('common.progress.total') }}</span>
+              <WorkflowProgressSummary
+                compact
+                :progress="workbenchFooterProgressContext.progress"
+                :status="workbenchFooterProgressContext.status"
+                :workflow-progress="workbenchFooterProgressContext.workflowProgress"
+                :label="t('common.progress.total')"
+                :detail-title="t('common.progress.workflowDetail')"
+              />
+            </div>
+            <Pagination
+              :total="segmentStore.matchedSegmentCount"
+              :page="segmentStore.currentPage"
+              :page-size="segmentStore.pageSize"
+              :page-sizes="segmentPageSizes"
+              :loading="segmentStore.loadingMoreSegments"
+              @update:page="handleSegmentPageChange"
+              @update:page-size="handleSegmentPageSizeChange"
+            />
+          </div>
 
           <div
             ref="bottomPanelRef"
@@ -6714,7 +6813,7 @@ onBeforeRouteLeave(async () => {
               class="segment-editor-bottom-tool segment-editor-bottom-tool--qa"
               :class="{ 'is-active': activeBottomTool === 'qa-result' }"
               type="button"
-              :title="isMergeWorkbench ? termQAButtonTitle : (termQAReport ? `QA结果：${termQAReport.active_issue_count} 条待处理` : '生成 QA 报告')"
+              :title="isMergeWorkbench ? termQAButtonTitle : (termQAReport ? `QA结果：${termQAReport.active_issue_count} 条待处理` : '生成 QA 结果')"
               :aria-pressed="activeBottomTool === 'qa-result'"
               :disabled="loadingTermQAReport || generatingTermQAReport"
               @click="void openTermQAResult()"
@@ -6876,7 +6975,7 @@ onBeforeRouteLeave(async () => {
               <div v-else class="workbench-bottom-drawer__qa">
                 <div class="workbench-bottom-drawer__header workbench-bottom-drawer__header--qa">
                   <div class="workbench-bottom-drawer__header-lead">
-                    <div class="section-title section-title--tight">术语 QA 报告</div>
+                    <div class="section-title section-title--tight">QA 结果</div>
                     <p class="panel-subtitle">{{ termQAReportSubtitle }}</p>
                   </div>
 
@@ -6943,14 +7042,20 @@ onBeforeRouteLeave(async () => {
                   </div>
                 </div>
 
+                <div v-if="termQAReport?.warnings.length" class="term-qa-dialog__warnings">
+                  <p v-for="warning in termQAReport.warnings" :key="warning" class="hint-text">
+                    {{ warning }}
+                  </p>
+                </div>
+
                 <div v-if="loadingTermQAReport || (generatingTermQAReport && !termQAReport)" class="empty-state">
                   <Loader2 class="lucide-spin" :size="28" />
-                  {{ generatingTermQAReport ? '正在生成术语 QA 报告' : '正在加载最近报告' }}
+                  {{ generatingTermQAReport ? '正在生成 QA 结果' : '正在加载 QA 结果' }}
                 </div>
 
                 <template v-else-if="termQAReport">
                   <div v-if="termQAReport.items.length === 0" class="empty-state">
-                    未发现术语不一致问题。
+                    未发现已开启规则的 QA 问题。
                   </div>
                   <div v-else class="term-qa-dialog__table-wrap">
                     <table class="term-qa-dialog__table">
@@ -6961,15 +7066,16 @@ onBeforeRouteLeave(async () => {
                               type="checkbox"
                               :checked="allActiveTermQAItemsSelected"
                               :disabled="activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
-                              aria-label="全选未忽略报告项"
+                              aria-label="全选未忽略 QA 问题"
                               title="全选未忽略"
                               @change="toggleAllActiveTermQAItems(!allActiveTermQAItemsSelected)"
                             >
                           </th>
                           <th class="term-qa-dialog__col-segment">句段</th>
                           <th v-if="isMergeWorkbench" class="term-qa-dialog__col-file">文件</th>
-                          <th>原文术语</th>
-                          <th>期望译文</th>
+                          <th>错误类型</th>
+                          <th>问题描述</th>
+                          <th>建议/期望译文</th>
                           <th>当前译文</th>
                           <th class="term-qa-dialog__col-status">状态</th>
                           <th class="term-qa-dialog__col-action">操作</th>
@@ -6977,7 +7083,7 @@ onBeforeRouteLeave(async () => {
                       </thead>
                       <tbody>
                         <tr
-                          v-for="item in termQAReport.items.slice(0, 50)"
+                          v-for="item in visibleTermQAReportItems"
                           :key="item.id"
                           class="term-qa-dialog__row"
                           :class="{
@@ -6995,7 +7101,7 @@ onBeforeRouteLeave(async () => {
                               type="checkbox"
                               :checked="selectedTermQAItemIds.has(item.id)"
                               :disabled="item.ignored"
-                              aria-label="选择报告项"
+                              aria-label="选择 QA 问题"
                               @click.stop
                               @change.stop="handleTermQAItemSelectionChange(item.id, $event)"
                             >
@@ -7015,8 +7121,13 @@ onBeforeRouteLeave(async () => {
                             class="term-qa-dialog__cell-text"
                             :title="getTermQAFileName(item)"
                           >{{ getTermQAFileName(item) }}</td>
-                          <td class="term-qa-dialog__cell-text" :title="item.source_term">{{ item.source_term }}</td>
-                          <td class="term-qa-dialog__cell-text" :title="item.expected_target_term">{{ item.expected_target_term }}</td>
+                          <td class="term-qa-dialog__cell-text" :title="item.rule_label">{{ item.rule_label }}</td>
+                          <td class="term-qa-dialog__cell-text" :title="item.detail || item.message">{{ item.message }}</td>
+                          <td
+                            class="term-qa-dialog__cell-text"
+                            :class="{ 'is-empty': !item.suggestion }"
+                            :title="item.suggestion || '暂无建议'"
+                          >{{ item.suggestion || '暂无建议' }}</td>
                           <td
                             class="term-qa-dialog__cell-text"
                             :class="{ 'is-empty': !item.target_text }"
@@ -7043,14 +7154,37 @@ onBeforeRouteLeave(async () => {
                         </tr>
                       </tbody>
                     </table>
-                    <p v-if="termQAReport.items.length > 50" class="hint-text">
-                      已显示前 50 条，完整报告请导出 XLSX。
-                    </p>
+                    <div v-if="termQAReport.items.length > termQAReportPageSize" class="term-qa-dialog__pager">
+                      <span class="term-qa-dialog__pager-range">{{ termQAReportPageRangeText }}</span>
+                      <span class="term-qa-dialog__pager-page">
+                        第 {{ termQAReportPage }} / {{ termQAReportTotalPages }} 页
+                      </span>
+                      <div class="term-qa-dialog__pager-actions">
+                        <button
+                          class="button button--ghost term-qa-dialog__pager-button"
+                          type="button"
+                          :disabled="termQAReportPage <= 1"
+                          @click="setTermQAReportPage(termQAReportPage - 1)"
+                        >
+                          <ArrowLeft :size="14" />
+                          上一页
+                        </button>
+                        <button
+                          class="button button--ghost term-qa-dialog__pager-button"
+                          type="button"
+                          :disabled="termQAReportPage >= termQAReportTotalPages"
+                          @click="setTermQAReportPage(termQAReportPage + 1)"
+                        >
+                          下一页
+                          <ArrowRight :size="14" />
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 </template>
 
                 <div v-else class="empty-state">
-                  暂无术语 QA 报告
+                  暂无 QA 结果
                   <button
                     class="button"
                     type="button"
@@ -7059,7 +7193,7 @@ onBeforeRouteLeave(async () => {
                     @click="void generateCurrentTermQAReport()"
                   >
                     <Loader2 v-if="generatingTermQAReport" class="lucide-spin" :size="14" />
-                    生成报告
+                    生成 QA 结果
                   </button>
                 </div>
               </div>
@@ -8886,15 +9020,51 @@ onBeforeRouteLeave(async () => {
   justify-content: flex-end;
 }
 
+.term-qa-dialog__warnings {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 8px;
+  color: #9a5b12;
+}
+
 .term-qa-dialog__table-wrap {
   overflow: auto;
   border: 1px solid var(--border-color, #dbe3ea);
   border-radius: 8px;
 }
 
+.term-qa-dialog__pager {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border-color, #dbe3ea);
+  background: var(--surface-muted, #f8fafc);
+  color: var(--text-muted, #64748b);
+  font-size: 12px;
+}
+
+.term-qa-dialog__pager-range,
+.term-qa-dialog__pager-page {
+  white-space: nowrap;
+}
+
+.term-qa-dialog__pager-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.term-qa-dialog__pager-button {
+  min-height: 30px;
+  padding: 4px 9px;
+  font-size: 12px;
+}
+
 .term-qa-dialog__table {
   width: 100%;
-  min-width: 920px;
+  min-width: 1080px;
   border-collapse: collapse;
   font-size: 13px;
   table-layout: fixed;
@@ -9594,6 +9764,31 @@ onBeforeRouteLeave(async () => {
   padding: 3px 6px;
   border: 1px solid #cfd8df;
   background: #f4f7f9;
+}
+
+.segment-editor-footer__main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.segment-editor-footer__progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  width: min(220px, 28vw);
+  min-width: 148px;
+}
+
+.segment-editor-footer__progress-label {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
 }
 
 .segment-editor-shell.has-bottom-drawer .segment-editor-footer {
@@ -11252,6 +11447,17 @@ onBeforeRouteLeave(async () => {
 
   .segment-editor-footer {
     flex-wrap: wrap;
+  }
+
+  .segment-editor-footer__main {
+    flex-basis: 100%;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .segment-editor-footer__progress {
+    width: 100%;
+    max-width: none;
   }
 
   .segment-editor-footer :deep(.pagination) {

@@ -3,6 +3,8 @@
 FROM node:20-bookworm-slim AS frontend-builder
 
 WORKDIR /build/frontend
+ARG APP_VERSION=
+ENV APP_VERSION=${APP_VERSION}
 
 COPY frontend/package*.json ./
 RUN npm ci
@@ -13,7 +15,9 @@ RUN npm run build
 
 FROM python:3.11-slim-bookworm AS runtime
 
+ARG APP_VERSION=
 ENV TZ=Asia/Shanghai \
+    APP_VERSION=${APP_VERSION} \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \

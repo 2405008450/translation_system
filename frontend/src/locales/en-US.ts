@@ -234,6 +234,13 @@ const overrides = {
   confirm: {
     title: 'Please confirm',
   },
+  appUpdate: {
+    title: 'New version available',
+    message: 'The system has been updated. Refresh to use the latest features. Save current edits first.',
+    hardRefreshHint: 'If refresh still looks wrong, press Ctrl+F5. On Mac, press Cmd+Shift+R.',
+    reload: 'Refresh now',
+    versionChanged: 'Current version {current}, latest version {latest}.',
+  },
   errors: {
     requestFailed: 'Request failed',
     network: 'Network error. Please try again later.',

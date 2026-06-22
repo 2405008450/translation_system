@@ -5,6 +5,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-}
     image: ai-translation-system:latest
     container_name: ai-translation-app
     env_file:

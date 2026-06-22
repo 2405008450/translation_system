@@ -459,6 +459,66 @@ export interface SegmentQAIssue {
   updated_at: string | null
 }
 
+export type WorkbenchQAResultItemSourceKind = 'segment_qa_issue' | 'term_qa_report_item'
+export type WorkbenchQAResultRuleKey = 'spelling_grammar' | 'term_inconsistency'
+
+export interface WorkbenchQAResultRule {
+  key: WorkbenchQAResultRuleKey
+  label: string
+  enabled: boolean
+  supported: boolean
+}
+
+export interface WorkbenchQAResultItem {
+  id: string
+  source_id: string
+  source_kind: WorkbenchQAResultItemSourceKind
+  rule_key: WorkbenchQAResultRuleKey
+  rule_label: string
+  project_id: string | null
+  file_record_id: string
+  file_name: string
+  segment_id: string | null
+  sentence_id: string
+  source_text: string
+  target_text: string
+  message: string
+  detail: string
+  suggestion: string
+  source_term: string
+  expected_target_term: string
+  term_base_name: string
+  severity: SegmentQAIssueSeverity
+  status: SegmentQAIssueStatus
+  ignored: boolean
+  ignored_at: string | null
+  ignored_by_id: string | null
+  ignored_by_name: string | null
+  block_index: number
+  row_index: number | null
+  cell_index: number | null
+  created_at: string | null
+}
+
+export interface WorkbenchQAResult {
+  id: string
+  project_id: string
+  file_record_id: string | null
+  scope: 'file' | 'merge_view'
+  file_ids: string[]
+  term_report_id: string | null
+  total_files: number
+  total_segments: number
+  checked_segments: number
+  issue_count: number
+  active_issue_count: number
+  ignored_count: number
+  created_at: string | null
+  rules: WorkbenchQAResultRule[]
+  warnings: string[]
+  items: WorkbenchQAResultItem[]
+}
+
 export interface ProjectSegmentSyncSummary {
   filled_count: number
   updated_count: number
@@ -592,6 +652,7 @@ export interface MergeViewFile {
   source_language: string | null
   target_language: string | null
   progress: number
+  workflow_progress?: WorkflowProgress[]
   can_write?: boolean
   is_edit_locked: boolean
 }

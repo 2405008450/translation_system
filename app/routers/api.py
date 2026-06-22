@@ -218,6 +218,9 @@ from app.services.notification_service import (
 from app.services.spelling_grammar_qa import (
     QA_ISSUE_STATUS_IGNORED,
     QA_ISSUE_STATUS_OPEN,
+    QA_RULE_SPELLING_GRAMMAR,
+    QA_RULE_TERM_INCONSISTENCY,
+    check_segments_with_languagetool,
     get_languagetool_language,
     get_supported_quality_qa_languages,
     is_languagetool_configured,
@@ -2066,6 +2069,11 @@ class TermQAReportItemIgnoreRequest(BaseModel):
 
 class TermQAReportItemsIgnoreRequest(BaseModel):
     item_ids: list[UUID] = Field(default_factory=list)
+    ignored: bool = True
+
+
+class WorkbenchQAResultItemsIgnoreRequest(BaseModel):
+    item_ids: list[str] = Field(default_factory=list)
     ignored: bool = True
 
 
@@ -5737,6 +5745,445 @@ def _apply_term_qa_ignore_state(
             item.ignored_by_id = None
 
 
+WORKBENCH_QA_ITEM_PREFIX_SEGMENT = "segment_qa_issue:"
+WORKBENCH_QA_ITEM_PREFIX_TERM = "term_qa_report_item:"
+WORKBENCH_QA_SUPPORTED_RULES = (QA_RULE_SPELLING_GRAMMAR, QA_RULE_TERM_INCONSISTENCY)
+WORKBENCH_QA_RULE_LABELS = {
+    QA_RULE_SPELLING_GRAMMAR: "拼写/语法",
+    QA_RULE_TERM_INCONSISTENCY: "术语不一致",
+}
+
+
+def _is_workbench_qa_rule_enabled(settings: dict[str, Any], rule_key: str) -> bool:
+    rule = (settings.get("rules") or {}).get(rule_key)
+    if isinstance(rule, dict):
+        return bool(rule.get("enabled"))
+    if rule_key == QA_RULE_SPELLING_GRAMMAR:
+        spelling_grammar = settings.get(QA_RULE_SPELLING_GRAMMAR)
+        if isinstance(spelling_grammar, dict):
+            return bool(spelling_grammar.get("enabled"))
+    return False
+
+
+def _get_file_record_project_or_400(db: Session, file_record: FileRecord) -> Project:
+    project = file_record.project or (
+        db.query(Project).filter(Project.id == file_record.project_id).first()
+        if file_record.project_id
+        else None
+    )
+    if not project:
+        raise HTTPException(status_code=400, detail="当前文件未归属项目，无法使用项目 QA 设置。")
+    return project
+
+
+def _load_latest_term_qa_report_for_file(db: Session, file_record_id: UUID) -> TermQAReport | None:
+    return (
+        db.query(TermQAReport)
+        .filter(TermQAReport.file_record_id == file_record_id)
+        .order_by(TermQAReport.created_at.desc(), TermQAReport.id.desc())
+        .first()
+    )
+
+
+def _load_latest_term_qa_report_for_merge_view(
+    db: Session,
+    project_id: UUID,
+    file_ids: list[UUID],
+) -> TermQAReport | None:
+    return (
+        db.query(TermQAReport)
+        .filter(
+            TermQAReport.project_id == project_id,
+            TermQAReport.scope == "merge_view",
+            TermQAReport.file_ids == serialize_file_ids(file_ids),
+        )
+        .order_by(TermQAReport.created_at.desc(), TermQAReport.id.desc())
+        .first()
+    )
+
+
+def _load_workbench_segment_qa_issue_items(
+    db: Session,
+    *,
+    files: list[FileRecord],
+    file_order: dict[UUID, int],
+) -> list[dict[str, Any]]:
+    file_ids = [file_record.id for file_record in files]
+    if not file_ids:
+        return []
+    file_by_id = {file_record.id: file_record for file_record in files}
+    issues = (
+        db.query(SegmentQAIssue)
+        .filter(
+            SegmentQAIssue.file_record_id.in_(file_ids),
+            SegmentQAIssue.rule_key == QA_RULE_SPELLING_GRAMMAR,
+            SegmentQAIssue.status.in_([QA_ISSUE_STATUS_OPEN, QA_ISSUE_STATUS_IGNORED]),
+        )
+        .all()
+    )
+    if not issues:
+        return []
+
+    segment_by_id = {
+        segment.id: segment
+        for segment in (
+            db.query(Segment)
+            .filter(Segment.id.in_([issue.segment_id for issue in issues]))
+            .all()
+        )
+    }
+    items: list[dict[str, Any]] = []
+    for issue in issues:
+        segment = segment_by_id.get(issue.segment_id)
+        file_record = file_by_id.get(issue.file_record_id)
+        serialized = serialize_segment_qa_issue(issue)
+        replacements = serialized.get("replacements") or []
+        suggestion = "；".join(str(value) for value in replacements[:5])
+        ignored_by_name = None
+        if issue.ignored_by_id:
+            ignored_by = getattr(issue, "ignored_by", None)
+            ignored_by_name = get_user_display_name(ignored_by) if ignored_by else None
+        items.append({
+            "id": f"{WORKBENCH_QA_ITEM_PREFIX_SEGMENT}{issue.id}",
+            "source_id": str(issue.id),
+            "source_kind": "segment_qa_issue",
+            "rule_key": QA_RULE_SPELLING_GRAMMAR,
+            "rule_label": WORKBENCH_QA_RULE_LABELS[QA_RULE_SPELLING_GRAMMAR],
+            "project_id": str(issue.project_id) if issue.project_id else None,
+            "file_record_id": str(issue.file_record_id),
+            "file_name": file_record.filename if file_record else "",
+            "segment_id": str(issue.segment_id),
+            "sentence_id": issue.sentence_id,
+            "source_text": segment.source_text if segment else "",
+            "target_text": segment.target_text if segment else "",
+            "message": issue.short_message or issue.message or "译文有拼写或语法错误",
+            "detail": issue.message,
+            "suggestion": suggestion,
+            "source_term": "",
+            "expected_target_term": "",
+            "term_base_name": "",
+            "severity": issue.severity,
+            "status": issue.status,
+            "ignored": issue.status == QA_ISSUE_STATUS_IGNORED,
+            "ignored_at": issue.ignored_at.isoformat() if issue.ignored_at else None,
+            "ignored_by_id": str(issue.ignored_by_id) if issue.ignored_by_id else None,
+            "ignored_by_name": ignored_by_name,
+            "block_index": int(segment.block_index or 0) if segment else 0,
+            "row_index": segment.row_index if segment else None,
+            "cell_index": segment.cell_index if segment else None,
+            "created_at": issue.created_at.isoformat() if issue.created_at else None,
+            "_sort": (
+                file_order.get(issue.file_record_id, len(file_order)),
+                int(segment.block_index or 0) if segment else 0,
+                segment.row_index if segment and segment.row_index is not None else -1,
+                segment.cell_index if segment and segment.cell_index is not None else -1,
+                issue.sentence_id,
+                0,
+            ),
+        })
+    return items
+
+
+def _serialize_workbench_term_qa_item(
+    item: TermQAReportItem,
+    *,
+    file_order: dict[UUID, int],
+) -> dict[str, Any]:
+    ignored_by_name = None
+    if item.ignored_by_id:
+        ignored_by = getattr(item, "ignored_by", None)
+        ignored_by_name = get_user_display_name(ignored_by) if ignored_by else None
+    message = f"术语“{item.source_term}”应译为“{item.expected_target_term}”。"
+    return {
+        "id": f"{WORKBENCH_QA_ITEM_PREFIX_TERM}{item.id}",
+        "source_id": str(item.id),
+        "source_kind": "term_qa_report_item",
+        "rule_key": QA_RULE_TERM_INCONSISTENCY,
+        "rule_label": WORKBENCH_QA_RULE_LABELS[QA_RULE_TERM_INCONSISTENCY],
+        "project_id": str(item.project_id) if item.project_id else None,
+        "file_record_id": str(item.file_record_id),
+        "file_name": item.file_name,
+        "segment_id": str(item.segment_id) if item.segment_id else None,
+        "sentence_id": item.sentence_id,
+        "source_text": item.source_text,
+        "target_text": item.target_text,
+        "message": message,
+        "detail": message,
+        "suggestion": item.expected_target_term,
+        "source_term": item.source_term,
+        "expected_target_term": item.expected_target_term,
+        "term_base_name": item.term_base_name,
+        "severity": "medium",
+        "status": "ignored" if item.ignored_at else "open",
+        "ignored": item.ignored_at is not None,
+        "ignored_at": item.ignored_at.isoformat() if item.ignored_at else None,
+        "ignored_by_id": str(item.ignored_by_id) if item.ignored_by_id else None,
+        "ignored_by_name": ignored_by_name,
+        "block_index": int(item.block_index or 0),
+        "row_index": item.row_index,
+        "cell_index": item.cell_index,
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+        "_sort": (
+            file_order.get(item.file_record_id, len(file_order)),
+            int(item.block_index or 0),
+            item.row_index if item.row_index is not None else -1,
+            item.cell_index if item.cell_index is not None else -1,
+            item.sentence_id,
+            1,
+        ),
+    }
+
+
+def _load_workbench_term_qa_items(
+    db: Session,
+    *,
+    report: TermQAReport | None,
+    files: list[FileRecord],
+    file_order: dict[UUID, int],
+) -> list[dict[str, Any]]:
+    if report is None:
+        return []
+    file_ids = [file_record.id for file_record in files]
+    if report.scope == "merge_view":
+        items = _load_term_qa_report_items_for_files(db, report.id, file_ids)
+    else:
+        items = _load_term_qa_report_items_for_response(db, report.id)
+    return [
+        _serialize_workbench_term_qa_item(item, file_order=file_order)
+        for item in items
+        if item.file_record_id in set(file_ids)
+    ]
+
+
+def _run_spelling_grammar_for_workbench_files(
+    db: Session,
+    *,
+    files: list[FileRecord],
+    warnings: list[str],
+) -> None:
+    if not is_languagetool_configured():
+        warnings.append("LanguageTool 未配置，已跳过拼写/语法 QA。")
+        return
+
+    for file_record in files:
+        if not get_languagetool_language(file_record.target_language):
+            warnings.append(f"{file_record.filename} 的目标语言暂不支持拼写/语法 QA。")
+            continue
+        segments = (
+            db.query(Segment)
+            .filter(
+                Segment.file_record_id == file_record.id,
+                func.trim(func.coalesce(Segment.target_text, "")) != "",
+            )
+            .all()
+        )
+        check_segments_with_languagetool(db, file_record=file_record, segments=segments)
+
+
+def _maybe_create_workbench_term_qa_report(
+    db: Session,
+    *,
+    project_id: UUID,
+    files: list[FileRecord],
+    current_user: User,
+    scope: Literal["file", "merge_view"],
+    warnings: list[str],
+) -> TermQAReport | None:
+    try:
+        return _create_term_qa_report(
+            db,
+            project_id=project_id,
+            files=files,
+            current_user=current_user,
+            scope=scope,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 400 and str(exc.detail) == "未配置用于 QA 的术语库。":
+            warnings.append("未配置用于 QA 的术语库，已跳过术语不一致检查。")
+            return None
+        raise
+
+
+def _build_workbench_qa_result(
+    db: Session,
+    *,
+    project: Project,
+    files: list[FileRecord],
+    current_user: User,
+    scope: Literal["file", "merge_view"],
+    generate: bool,
+) -> dict[str, Any]:
+    file_ids = [file_record.id for file_record in files]
+    file_order = {file_id: index for index, file_id in enumerate(file_ids)}
+    settings = load_quality_qa_settings(project)
+    enabled_rules = {
+        rule_key: _is_workbench_qa_rule_enabled(settings, rule_key)
+        for rule_key in WORKBENCH_QA_SUPPORTED_RULES
+    }
+    warnings: list[str] = []
+    term_report: TermQAReport | None = None
+
+    if not any(enabled_rules.values()):
+        warnings.append("当前项目未启用已支持的 QA 规则。")
+
+    if enabled_rules[QA_RULE_SPELLING_GRAMMAR] and generate:
+        _run_spelling_grammar_for_workbench_files(db, files=files, warnings=warnings)
+
+    if enabled_rules[QA_RULE_TERM_INCONSISTENCY]:
+        if generate:
+            term_report = _maybe_create_workbench_term_qa_report(
+                db,
+                project_id=project.id,
+                files=files,
+                current_user=current_user,
+                scope=scope,
+                warnings=warnings,
+            )
+        elif scope == "file" and len(files) == 1:
+            term_report = _load_latest_term_qa_report_for_file(db, files[0].id)
+        else:
+            term_report = _load_latest_term_qa_report_for_merge_view(db, project.id, file_ids)
+
+    total_segments = (
+        db.query(func.count(Segment.id))
+        .filter(Segment.file_record_id.in_(file_ids))
+        .scalar()
+        or 0
+    )
+    items: list[dict[str, Any]] = []
+    if enabled_rules[QA_RULE_SPELLING_GRAMMAR]:
+        items.extend(_load_workbench_segment_qa_issue_items(db, files=files, file_order=file_order))
+    if enabled_rules[QA_RULE_TERM_INCONSISTENCY]:
+        items.extend(_load_workbench_term_qa_items(db, report=term_report, files=files, file_order=file_order))
+
+    items.sort(key=lambda item: item.get("_sort", ()))
+    for item in items:
+        item.pop("_sort", None)
+
+    ignored_count = sum(1 for item in items if item.get("ignored"))
+    active_issue_count = len(items) - ignored_count
+    created_at = term_report.created_at.isoformat() if term_report and term_report.created_at else datetime.now().isoformat()
+    return {
+        "id": f"{scope}:{project.id}:{','.join(str(file_id) for file_id in file_ids)}",
+        "project_id": str(project.id),
+        "file_record_id": str(files[0].id) if scope == "file" and len(files) == 1 else None,
+        "scope": scope,
+        "file_ids": [str(file_id) for file_id in file_ids],
+        "term_report_id": str(term_report.id) if term_report else None,
+        "total_files": len(files),
+        "total_segments": int(total_segments),
+        "checked_segments": int(total_segments) if any(enabled_rules.values()) else 0,
+        "issue_count": len(items),
+        "active_issue_count": active_issue_count,
+        "ignored_count": ignored_count,
+        "created_at": created_at,
+        "rules": [
+            {
+                "key": rule_key,
+                "label": WORKBENCH_QA_RULE_LABELS[rule_key],
+                "enabled": enabled_rules[rule_key],
+                "supported": True,
+            }
+            for rule_key in WORKBENCH_QA_SUPPORTED_RULES
+        ],
+        "warnings": list(dict.fromkeys(warnings)),
+        "items": items,
+    }
+
+
+def _parse_workbench_qa_item_ids(item_ids: list[str]) -> tuple[list[UUID], list[UUID]]:
+    segment_issue_ids: list[UUID] = []
+    term_item_ids: list[UUID] = []
+    for raw_id in dict.fromkeys(item_ids):
+        value = str(raw_id or "").strip()
+        if value.startswith(WORKBENCH_QA_ITEM_PREFIX_SEGMENT):
+            try:
+                segment_issue_ids.append(UUID(value[len(WORKBENCH_QA_ITEM_PREFIX_SEGMENT):]))
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="QA 问题 ID 无效。") from exc
+            continue
+        if value.startswith(WORKBENCH_QA_ITEM_PREFIX_TERM):
+            try:
+                term_item_ids.append(UUID(value[len(WORKBENCH_QA_ITEM_PREFIX_TERM):]))
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="QA 问题 ID 无效。") from exc
+            continue
+        raise HTTPException(status_code=400, detail="QA 问题 ID 类型无效。")
+    return segment_issue_ids, term_item_ids
+
+
+def _require_segment_qa_issue_write_access(db: Session, issue: SegmentQAIssue, current_user: User) -> None:
+    file_record = issue.file_record or db.query(FileRecord).filter(FileRecord.id == issue.file_record_id).first()
+    if not file_record:
+        raise HTTPException(status_code=404, detail="QA 问题对应文件不存在。")
+    _require_file_record_work_access(file_record, current_user)
+
+
+def _apply_segment_qa_ignore_state(
+    issues: list[SegmentQAIssue],
+    current_user: User,
+    ignored: bool,
+) -> None:
+    now = datetime.now()
+    for issue in issues:
+        if ignored:
+            issue.status = QA_ISSUE_STATUS_IGNORED
+            issue.ignored_by_id = current_user.id
+            issue.ignored_at = issue.ignored_at or now
+        else:
+            issue.status = QA_ISSUE_STATUS_OPEN
+            issue.ignored_by_id = None
+            issue.ignored_at = None
+        issue.updated_at = now
+        if issue.segment:
+            issue.segment.updated_at = now
+
+
+def _build_workbench_qa_xlsx_response(result: dict[str, Any], filename: str):
+    rows = [
+        [
+            item.get("file_name") or "",
+            item.get("sentence_id") or "",
+            item.get("rule_label") or item.get("rule_key") or "",
+            item.get("message") or "",
+            item.get("suggestion") or "",
+            item.get("source_term") or "",
+            item.get("expected_target_term") or "",
+            item.get("source_text") or "",
+            item.get("target_text") or "",
+            "已忽略" if item.get("ignored") else "待处理",
+            item.get("ignored_at") or "",
+            item.get("ignored_by_name") or item.get("ignored_by_id") or "",
+            item.get("block_index") if item.get("block_index") is not None else "",
+            item.get("row_index") if item.get("row_index") is not None else "",
+            item.get("cell_index") if item.get("cell_index") is not None else "",
+        ]
+        for item in result.get("items", [])
+    ]
+    xlsx_bytes = build_tabular_xlsx(
+        sheet_title="QA结果",
+        headers=[
+            "文件名",
+            "句段ID",
+            "错误类型",
+            "问题描述",
+            "建议/期望译文",
+            "原文术语",
+            "期望术语译文",
+            "原文",
+            "译文",
+            "处理状态",
+            "忽略时间",
+            "忽略人",
+            "块序号",
+            "行序号",
+            "单元格序号",
+        ],
+        rows=rows,
+    )
+    return build_xlsx_download_response(filename, xlsx_bytes)
+
+
 def _get_project_sync_segment_stats(db: Session | None, project_id: UUID) -> tuple[int, int]:
     if db is None:
         return 0, 0
@@ -6408,6 +6855,118 @@ def export_term_qa_report_xlsx(
         f"term-qa-report-{report.id}",
         xlsx_bytes,
     )
+
+
+@router.get("/file-records/{file_record_id}/qa-results")
+def get_file_record_qa_result(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    project = _get_file_record_project_or_400(db, file_record)
+    return _build_workbench_qa_result(
+        db,
+        project=project,
+        files=[file_record],
+        current_user=current_user,
+        scope="file",
+        generate=False,
+    )
+
+
+@router.post("/file-records/{file_record_id}/qa-results")
+def create_file_record_qa_result(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    _require_file_record_work_access(file_record, current_user)
+    project = _get_file_record_project_or_400(db, file_record)
+    return _build_workbench_qa_result(
+        db,
+        project=project,
+        files=[file_record],
+        current_user=current_user,
+        scope="file",
+        generate=True,
+    )
+
+
+@router.get("/file-records/{file_record_id}/qa-results/export-xlsx")
+def export_file_record_qa_result_xlsx(
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    project = _get_file_record_project_or_400(db, file_record)
+    result = _build_workbench_qa_result(
+        db,
+        project=project,
+        files=[file_record],
+        current_user=current_user,
+        scope="file",
+        generate=False,
+    )
+    return _build_workbench_qa_xlsx_response(
+        result,
+        f"qa-result-{file_record.id}.xlsx",
+    )
+
+
+@router.patch("/qa-result-items/ignore")
+def set_workbench_qa_result_items_ignored(
+    payload: WorkbenchQAResultItemsIgnoreRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not payload.item_ids:
+        raise HTTPException(status_code=400, detail="请选择要忽略的 QA 问题。")
+
+    segment_issue_ids, term_item_ids = _parse_workbench_qa_item_ids(payload.item_ids)
+    updated_count = 0
+
+    if segment_issue_ids:
+        issues = (
+            db.query(SegmentQAIssue)
+            .filter(SegmentQAIssue.id.in_(segment_issue_ids))
+            .all()
+        )
+        if len(issues) != len(segment_issue_ids):
+            raise HTTPException(status_code=404, detail="部分 QA 问题不存在。")
+        for issue in issues:
+            _require_segment_qa_issue_write_access(db, issue, current_user)
+        _apply_segment_qa_ignore_state(issues, current_user, payload.ignored)
+        updated_count += len(issues)
+
+    if term_item_ids:
+        items = (
+            db.query(TermQAReportItem)
+            .filter(TermQAReportItem.id.in_(term_item_ids))
+            .all()
+        )
+        if len(items) != len(term_item_ids):
+            raise HTTPException(status_code=404, detail="部分术语 QA 报告项不存在。")
+        for item in items:
+            _require_term_qa_item_write_access(db, item, current_user)
+        _apply_term_qa_ignore_state(items, current_user, payload.ignored)
+        updated_count += len(items)
+
+    db.commit()
+    return {
+        "updated_count": updated_count,
+        "ignored": payload.ignored,
+    }
 
 
 @router.get("/projects/{project_id}")
@@ -9244,8 +9803,16 @@ def get_merge_view_detail(
         payload["file_ids"] = visible_ids
         payload["total_files"] = len(files)
     payload["can_manage"] = _can_manage_merge_view(view, current_user)
+    file_workflow_progress = _get_file_workflow_progress(db, [file_record.id for file_record in files])
     for file_payload, file_record in zip(payload.get("files", []), files):
         file_payload["can_write"] = _can_write_file_record(file_record, current_user, db)
+        workflow_progress = file_workflow_progress.get(file_record.id, [])
+        file_payload["workflow_progress"] = workflow_progress
+        if workflow_progress:
+            file_payload["progress"] = _calculate_workflow_overall_progress(
+                workflow_progress,
+                file_payload.get("progress", 0),
+            )
     return payload
 
 
@@ -9340,6 +9907,63 @@ def list_merge_view_term_qa_reports(
             for report in reports
         ],
     }
+
+
+@router.get("/merge-views/{view_id}/qa-results")
+def get_merge_view_qa_result(
+    view_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _view, project, files = _get_merge_view_context(db, view_id, current_user)
+    return _build_workbench_qa_result(
+        db,
+        project=project,
+        files=files,
+        current_user=current_user,
+        scope="merge_view",
+        generate=False,
+    )
+
+
+@router.post("/merge-views/{view_id}/qa-results")
+def create_merge_view_qa_result(
+    view_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _view, project, files = _get_merge_view_context(db, view_id, current_user)
+    for file_record in files:
+        _require_file_record_work_access(file_record, current_user)
+    return _build_workbench_qa_result(
+        db,
+        project=project,
+        files=files,
+        current_user=current_user,
+        scope="merge_view",
+        generate=True,
+    )
+
+
+@router.get("/merge-views/{view_id}/qa-results/export-xlsx")
+def export_merge_view_qa_result_xlsx(
+    view_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _view, project, files = _get_merge_view_context(db, view_id, current_user)
+    result = _build_workbench_qa_result(
+        db,
+        project=project,
+        files=files,
+        current_user=current_user,
+        scope="merge_view",
+        generate=False,
+    )
+    return _build_workbench_qa_xlsx_response(
+        result,
+        f"merge-view-qa-result-{view_id}.xlsx",
+    )
 
 
 @router.get("/merge-views/{view_id}/segments/{file_record_id}/{sentence_id}/position")

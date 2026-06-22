@@ -6,7 +6,7 @@ from pathlib import Path
 import anyio.to_thread
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
@@ -45,8 +45,47 @@ def _engine_pool_stats() -> dict[str, int | str]:
             except Exception:  # noqa: BLE001
                 continue
     return stats
+
+
 frontend_dist_dir = Path("frontend/dist")
 frontend_assets_dir = frontend_dist_dir / "assets"
+frontend_version_file = frontend_dist_dir / "app-version.txt"
+
+SPA_ENTRY_CACHE_HEADERS = {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+SPA_ASSET_CACHE_HEADERS = {
+    "Cache-Control": "public, max-age=31536000, immutable",
+}
+
+
+def _get_app_version() -> str:
+    try:
+        built_version = frontend_version_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        built_version = ""
+    if built_version:
+        return built_version
+
+    configured_version = (settings.app_version or "").strip()
+    return configured_version or "dev"
+
+
+class CacheControlStaticFiles(StaticFiles):
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers.update(SPA_ASSET_CACHE_HEADERS)
+        return response
+
+
+def _spa_entry_response(index_path: Path) -> FileResponse:
+    return FileResponse(index_path, headers=SPA_ENTRY_CACHE_HEADERS)
+
+
+def _spa_file_response(path: Path) -> FileResponse:
+    return FileResponse(path, headers=SPA_ENTRY_CACHE_HEADERS)
 
 app = FastAPI(title=settings.app_name)
 
@@ -94,8 +133,13 @@ def health_check():
     return {"status": "ok", "database": "ok", "db_pool": _engine_pool_stats()}
 
 
+@app.get("/api/app-version", include_in_schema=False)
+def app_version():
+    return JSONResponse({"version": _get_app_version()}, headers=SPA_ENTRY_CACHE_HEADERS)
+
+
 if frontend_assets_dir.exists():
-    app.mount("/assets", StaticFiles(directory=frontend_assets_dir), name="spa-assets")
+    app.mount("/assets", CacheControlStaticFiles(directory=frontend_assets_dir), name="spa-assets")
 
 
 def _resolve_spa_asset(full_path: str) -> Path | None:
@@ -116,7 +160,7 @@ def serve_spa_root():
     index_path = frontend_dist_dir / "index.html"
     if not index_path.exists():
         raise HTTPException(status_code=404, detail="前端构建产物不存在，请先运行 frontend 构建。")
-    return FileResponse(index_path)
+    return _spa_entry_response(index_path)
 
 
 @app.get("/{full_path:path}", include_in_schema=False)
@@ -126,9 +170,9 @@ def serve_spa(full_path: str):
 
     asset_path = _resolve_spa_asset(full_path)
     if asset_path is not None:
-        return FileResponse(asset_path)
+        return _spa_file_response(asset_path)
 
     index_path = frontend_dist_dir / "index.html"
     if not index_path.exists():
         raise HTTPException(status_code=404, detail="前端构建产物不存在，请先运行 frontend 构建。")
-    return FileResponse(index_path)
+    return _spa_entry_response(index_path)
