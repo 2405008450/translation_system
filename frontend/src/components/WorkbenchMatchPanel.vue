@@ -11,6 +11,7 @@ import type {
   TermEntryRecord,
   TermMatch,
   TMMatchCandidate,
+  WorkbenchQAResultItem,
 } from '../types/api'
 import { http } from '../api/http'
 import { hasTermTextMatch } from '../utils/termMatching'
@@ -18,6 +19,8 @@ import DiffText from './DiffText.vue'
 
 type MatchedTermDisplay = {
   id: string
+  term_base_id: string | null
+  term_base_name: string | null
   source_text: string
   target_text: string
   creator_name: string | null
@@ -57,6 +60,7 @@ const props = defineProps<{
   termBaseName: string | null
   termEntries: TermEntryRecord[]
   termMatches: TermMatch[]
+  qaTermItems: WorkbenchQAResultItem[]
   activeSourceText: string
   fileRecordId: string | null
   referenceMatchResult: ReferenceMatchResult | null
@@ -86,6 +90,8 @@ const matchedTerms = computed<MatchedTermDisplay[]>(() => {
       const entry = termEntryById.value.get(match.term_id)
       return {
         id: match.term_id,
+        term_base_id: match.term_base_id ?? entry?.term_base_id ?? null,
+        term_base_name: match.term_base_name ?? null,
         source_text: match.source_text,
         target_text: match.target_text,
         creator_name: entry?.creator_name ?? null,
@@ -102,6 +108,8 @@ const matchedTerms = computed<MatchedTermDisplay[]>(() => {
     .sort((left, right) => right.source_text.length - left.source_text.length)
     .map((entry) => ({
       id: entry.id,
+      term_base_id: entry.term_base_id,
+      term_base_name: props.termBaseId === entry.term_base_id ? props.termBaseName : null,
       source_text: entry.source_text,
       target_text: entry.target_text,
       creator_name: entry.creator_name,
@@ -166,8 +174,17 @@ const matchRows = computed<MatchDisplayRow[]>(() => {
     rows.push(buildTMRow(candidate, index))
   })
 
+  const termRowKeys = new Set<string>()
   matchedTerms.value.forEach((term, index) => {
+    termRowKeys.add(buildTermRowKey(term.source_text, term.target_text))
     rows.push(buildTermRow(term, index))
+  })
+
+  props.qaTermItems.forEach((item, index) => {
+    const rowKey = buildTermRowKey(item.source_term, item.expected_target_term)
+    if (!rowKey || termRowKeys.has(rowKey)) return
+    termRowKeys.add(rowKey)
+    rows.push(buildQATermRow(item, index))
   })
 
   return rows
@@ -296,7 +313,7 @@ function buildTMRow(candidate: TMMatchCandidate, index: number): MatchDisplayRow
 }
 
 function buildTermRow(term: MatchedTermDisplay, index: number): MatchDisplayRow {
-  const termBaseName = props.termBaseName || '术语库'
+  const termBaseName = term.term_base_name || props.termBaseName || '术语库'
   return {
     id: `term-${index}-${term.id}`,
     sourceLabel: termBaseName,
@@ -306,6 +323,7 @@ function buildTermRow(term: MatchedTermDisplay, index: number): MatchDisplayRow 
     compareText: null,
     targetText: term.target_text,
     detailItems: buildDetailItems([
+      ['匹配类型', '术语库命中'],
       ['术语库名称', termBaseName],
       ['创建人', term.creator_name],
       ['创建时间', formatDateTime(term.created_at)],
@@ -317,6 +335,38 @@ function buildTermRow(term: MatchedTermDisplay, index: number): MatchDisplayRow 
     applyText: term.target_text,
     applyMode: 'append',
   }
+}
+
+function buildQATermRow(item: WorkbenchQAResultItem, index: number): MatchDisplayRow {
+  const sourceTerm = item.source_term || item.source_text
+  const targetTerm = item.expected_target_term || item.suggestion || item.target_text
+  const termBaseName = item.term_base_name || props.termBaseName || '术语库'
+  return {
+    id: `qa-term-${index}-${item.id}`,
+    sourceLabel: termBaseName,
+    badge: 'TB',
+    tone: 'term',
+    sourceText: sourceTerm,
+    compareText: null,
+    targetText: targetTerm,
+    detailItems: buildDetailItems([
+      ['匹配类型', 'QA 术语命中'],
+      ['术语库名称', termBaseName],
+      ['句段编号', item.sentence_id],
+      ['状态', item.ignored ? '已忽略' : '待处理'],
+      ['创建时间', formatDateTime(item.created_at)],
+    ]),
+    sourceTitle: '术语原文',
+    targetTitle: '术语译文',
+    applyText: targetTerm,
+    applyMode: 'append',
+  }
+}
+
+function buildTermRowKey(sourceText: string | null | undefined, targetText: string | null | undefined) {
+  const source = `${sourceText ?? ''}`.trim().toLocaleLowerCase()
+  const target = `${targetText ?? ''}`.trim().toLocaleLowerCase()
+  return source && target ? `${source}\u0000${target}` : ''
 }
 
 function buildDetailItems(items: Array<[string, string | null | undefined]>): MatchDetailItem[] {
@@ -398,8 +448,8 @@ function applyMatchRow(row: MatchDisplayRow | null) {
               @keydown.space.prevent="selectMatchRow(row)"
             >
               <td class="match-summary-cell match-summary-cell--index">{{ index + 1 }}</td>
-              <td class="match-summary-cell match-summary-cell--source" :title="row.sourceLabel">
-                {{ row.sourceLabel }}
+              <td class="match-summary-cell match-summary-cell--source" :title="row.sourceText">
+                {{ row.sourceText }}
               </td>
               <td class="match-summary-cell match-summary-cell--score">
                 <span class="match-summary-badge" :class="`match-summary-badge--${row.tone}`">

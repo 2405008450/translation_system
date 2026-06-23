@@ -1329,6 +1329,8 @@ export interface Term {
 
 export interface TermMatch {
   term_id: string
+  term_base_id?: string | null
+  term_base_name?: string | null
   source_text: string
   target_text: string
   start: number

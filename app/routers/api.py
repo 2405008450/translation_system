@@ -1188,6 +1188,8 @@ class BatchSegmentUpdate(BaseModel):
 
 class SegmentConfirmationBatchUpdate(BaseModel):
     action: Literal["confirm", "cancel"]
+    range_start: int | None = Field(default=None, ge=1, description="可选：句段编号范围起始值")
+    range_end: int | None = Field(default=None, ge=1, description="可选：句段编号范围结束值")
 
 
 class SegmentSplitRequest(BaseModel):
@@ -8156,6 +8158,49 @@ def _get_segment_display_index_map(
     return {row.id: int(row.display_index) - 1 for row in rows}
 
 
+def _apply_segment_display_range_filter(
+    db: Session,
+    query,
+    file_record_id: UUID,
+    range_start: int | None,
+    range_end: int | None,
+):
+    if range_start is None and range_end is None:
+        return query
+
+    start = range_start if range_start is not None else range_end
+    end = range_end if range_end is not None else range_start
+    if start is None or end is None:
+        return query
+    if start > end:
+        raise HTTPException(status_code=400, detail="句段范围起始值不能大于结束值。")
+
+    ordered_segments = (
+        db.query(
+            Segment.id.label("id"),
+            func.row_number()
+            .over(
+                order_by=(
+                    Segment.block_index.asc(),
+                    Segment.row_index.asc().nullsfirst(),
+                    Segment.cell_index.asc().nullsfirst(),
+                    Segment.sentence_id.asc(),
+                )
+            )
+            .label("display_index"),
+        )
+        .filter(Segment.file_record_id == file_record_id)
+        .subquery()
+    )
+    return (
+        query.join(ordered_segments, ordered_segments.c.id == Segment.id)
+        .filter(
+            ordered_segments.c.display_index >= start,
+            ordered_segments.c.display_index <= end,
+        )
+    )
+
+
 def _generate_split_sentence_id(original_id: str, db: Session, file_record_id: UUID) -> str:
     """为拆分生成新的 sentence_id，使用子编号方式（如 "5" → "5.1"）。"""
     base = original_id
@@ -11094,14 +11139,21 @@ def batch_update_segment_confirmation(
     file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
 
     if payload.action == "confirm":
-        segments = (
+        query = (
             db.query(Segment)
             .filter(
                 Segment.file_record_id == file_record_id,
                 or_(Segment.status.is_(None), Segment.status != "confirmed"),
             )
-            .all()
         )
+        query = _apply_segment_display_range_filter(
+            db,
+            query,
+            file_record_id,
+            payload.range_start,
+            payload.range_end,
+        )
+        segments = query.all()
         segments = _filter_writable_segments(db, file_record, current_user, segments)
         next_status = "confirmed"
         updated_count = 0
@@ -11112,11 +11164,18 @@ def batch_update_segment_confirmation(
                 segment.version = int(segment.version or 1) + 1
                 updated_count += 1
     else:
-        segments = (
+        query = (
             db.query(Segment)
             .filter(Segment.file_record_id == file_record_id, Segment.status == "confirmed")
-            .all()
         )
+        query = _apply_segment_display_range_filter(
+            db,
+            query,
+            file_record_id,
+            payload.range_start,
+            payload.range_end,
+        )
+        segments = query.all()
         segments = _filter_writable_segments(db, file_record, current_user, segments)
         updated_count = 0
         for segment in segments:
@@ -13884,7 +13943,14 @@ def match_terms(
         return {"matches": []}
 
     candidate_query = (
-        db.query(TermEntry.id, TermEntry.source_text, TermEntry.target_text)
+        db.query(
+            TermEntry.id,
+            TermEntry.term_base_id,
+            TermEntry.source_text,
+            TermEntry.target_text,
+            TermBase.name.label("term_base_name"),
+        )
+        .outerjoin(TermBase, TermEntry.term_base_id == TermBase.id)
         .filter(
             TermEntry.term_base_id.in_(collection_ids),
             TermEntry.source_text != "",
@@ -13911,6 +13977,8 @@ def match_terms(
         "matches": [
             {
                 "term_id": str(term_match.item.id),
+                "term_base_id": str(term_match.item.term_base_id),
+                "term_base_name": term_match.item.term_base_name,
                 "source_text": term_match.item.source_text,
                 "target_text": term_match.item.target_text,
                 "start": term_match.start,

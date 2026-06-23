@@ -41,6 +41,10 @@ const REVISION_TRACKING_STORAGE_KEY = 'workbench.revisionTrackingEnabled'
 const DEFAULT_REVISION_INSERT_COLOR = '#2563eb'
 const DEFAULT_REVISION_DELETE_COLOR = '#dc2626'
 type SegmentBatchTarget = LLMMergeTarget
+interface SegmentConfirmationOptions {
+  rangeStart?: number | null
+  rangeEnd?: number | null
+}
 
 interface FileExportTask {
   task_id: string
@@ -1591,9 +1595,9 @@ export const useSegmentStore = defineStore('segment', () => {
 
   function refreshActiveTermMatches() {
     if (!activeSentenceId.value) {
-      return
+      return Promise.resolve()
     }
-    void loadTermMatches(activeSentenceId.value, activeSourceText.value)
+    return loadTermMatches(activeSentenceId.value, activeSourceText.value)
   }
 
   function getTermMatches(sentenceId: string): TermMatch[] {
@@ -1994,7 +1998,13 @@ export const useSegmentStore = defineStore('segment', () => {
   async function updateAllSegmentConfirmations(
     action: 'confirm' | 'cancel',
     target: SegmentBatchTarget = 'current_file',
+    options: SegmentConfirmationOptions = {},
   ) {
+    const payload = {
+      action,
+      range_start: options.rangeStart ?? undefined,
+      range_end: options.rangeEnd ?? undefined,
+    }
     if (mergeViewId.value) {
       const targetFileIds = target === 'merge_view'
         ? (mergeViewDetail.value?.files ?? [])
@@ -2012,7 +2022,7 @@ export const useSegmentStore = defineStore('segment', () => {
         targetFileIds.map((fileId) =>
           http.post<{ updated_count: number }>(
             `/file-records/${fileId}/segments/confirmation`,
-            { action },
+            target === 'merge_view' ? { action } : payload,
           ),
         ),
       )
@@ -2033,7 +2043,7 @@ export const useSegmentStore = defineStore('segment', () => {
 
     const { data } = await http.post<{ updated_count: number }>(
       `/file-records/${fileRecord.value.id}/segments/confirmation`,
-      { action },
+      payload,
     )
     await refreshCurrentSegmentPage()
     return data.updated_count

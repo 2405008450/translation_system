@@ -387,6 +387,8 @@ const activeWorkbenchSettingsTab = ref<WorkbenchSettingsTab>('preferences')
 const showSaveToTMDialog = ref(false)
 const openConfirmMenu = ref(false)
 const confirmationActionLoading = ref(false)
+const confirmationRangeStart = ref('')
+const confirmationRangeEnd = ref('')
 const manualSaving = ref(false)
 const openRevisionMenu = ref<RevisionMenuKind | null>(null)
 const revisionTraceVisible = ref(getInitialRevisionTraceVisible())
@@ -1464,18 +1466,84 @@ const canGoNextRevision = computed(() => Boolean(resolveRevisionNavigationTarget
 
 const activeSegmentSourceText = computed(() => activeSegment.value?.source_text || '')
 
-// 计算当前激活段落匹配的术语（用于原文高亮）
-const activeMatchedTerms = computed(() => {
-  if (!activeSegmentSourceText.value || termEntries.value.length === 0) return []
-  return termEntries.value
-    .filter((entry) => hasTermTextMatch(activeSegmentSourceText.value, entry.source_text))
-    .slice()
-    .sort((left, right) => right.source_text.length - left.source_text.length)
+const activeTermQAItemsForSegment = computed(() => {
+  const segment = activeSegment.value
+  if (!segment) return []
+
+  const fileRecordId = segment.file_record_id || activeWorkbenchFileId.value || segmentStore.fileRecord?.id || ''
+  return activeTermQAReportItems.value.filter((item) => (
+    item.source_kind === 'term_qa_report_item'
+    && item.rule_key === 'term_inconsistency'
+    && item.sentence_id === segment.sentence_id
+    && (!fileRecordId || item.file_record_id === fileRecordId)
+    && Boolean(item.source_term)
+    && Boolean(item.expected_target_term)
+  ))
 })
 
 const activeTermMatches = computed(() => {
   const segment = activeSegment.value
   return segment ? segmentStore.getTermMatches(segmentKeyOf(segment)) : []
+})
+
+// 计算当前激活段落匹配的术语（用于原文高亮）
+const activeMatchedTerms = computed(() => {
+  const terms: TermEntryRecord[] = []
+  const seen = new Set<string>()
+
+  for (const match of activeTermMatches.value) {
+    const sourceText = match.source_text.trim()
+    const targetText = match.target_text.trim()
+    if (!sourceText || !targetText) continue
+    const key = `${sourceText}\u0000${targetText}`.toLocaleLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    terms.push({
+      id: match.term_id,
+      term_base_id: match.term_base_id || '',
+      source_text: sourceText,
+      target_text: targetText,
+      source_language: segmentStore.fileRecord?.source_language || '',
+      target_language: segmentStore.fileRecord?.target_language || '',
+      creator_name: null,
+      created_at: '',
+      updated_at: '',
+    })
+  }
+
+  if (activeSegmentSourceText.value && termEntries.value.length > 0) {
+    for (const entry of termEntries.value) {
+      if (!hasTermTextMatch(activeSegmentSourceText.value, entry.source_text)) continue
+      const key = `${entry.source_text}\u0000${entry.target_text}`.toLocaleLowerCase()
+      if (seen.has(key)) continue
+      seen.add(key)
+      terms.push(entry)
+    }
+  }
+
+  for (const item of activeTermQAItemsForSegment.value) {
+    const sourceText = item.source_term.trim()
+    const targetText = item.expected_target_term.trim()
+    if (!sourceText || !targetText) continue
+    const key = `${sourceText}\u0000${targetText}`.toLocaleLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    terms.push({
+      id: item.id,
+      term_base_id: '',
+      source_text: sourceText,
+      target_text: targetText,
+      source_language: '',
+      target_language: '',
+      creator_name: null,
+      created_at: item.created_at || '',
+      updated_at: item.created_at || '',
+    })
+  }
+
+  return terms
+    .slice()
+    .sort((left, right) => right.source_text.length - left.source_text.length)
 })
 
 function resolveLiteralSearchKeyword(value: string) {
@@ -1744,10 +1812,11 @@ const boundTermBaseIds = computed(() => {
   if (!fileRecord) {
     return []
   }
-  if (fileRecord.term_base_ids?.length) {
-    return fileRecord.term_base_ids
-  }
-  return fileRecord.term_base_id ? [fileRecord.term_base_id] : []
+  return Array.from(new Set([
+    ...(fileRecord.term_base_ids || []),
+    ...(fileRecord.term_base_id ? [fileRecord.term_base_id] : []),
+    ...(fileRecord.qa_term_base_ids || []),
+  ].filter(Boolean)))
 })
 
 const boundResourceSummary = computed(() => {
@@ -2224,6 +2293,39 @@ async function openActiveSegmentCommentDraft() {
     ?.focus()
 }
 
+function syncActiveSegmentCommentDraft() {
+  if (
+    activeSideTool.value !== 'notes'
+    || commentStore.draftAnchor?.anchor_mode !== 'sentence'
+  ) {
+    return
+  }
+
+  const draft = buildActiveSegmentCommentDraft()
+  if (!draft || isSameCommentDraft(commentStore.draftAnchor, draft)) {
+    return
+  }
+
+  commentStore.setDraftAnchor(draft)
+  commentStore.setActiveComment(null)
+}
+
+async function ensureMatchInfoTermContext() {
+  if (termBases.value.length === 0 && !loadingTermBases.value) {
+    await loadTermBases()
+  }
+  if (!selectedTermBaseId.value && termBases.value.length > 0) {
+    selectedTermBaseId.value = termBases.value[0].id
+  }
+  if (selectedTermBaseId.value && termEntries.value.length === 0 && !loadingTermEntries.value) {
+    await loadTermEntries()
+  }
+  await segmentStore.refreshActiveTermMatches()
+  if (!termQAReport.value && !loadingTermQAReport.value && !generatingTermQAReport.value) {
+    await loadLatestTermQAReport()
+  }
+}
+
 async function openSideTool(tool: SideToolKey) {
   if (tool === 'notes') {
     pageError.value = ''
@@ -2256,16 +2358,7 @@ async function openSideTool(tool: SideToolKey) {
     }
 
     if (tool === 'match-info') {
-      // 确保术语库列表和条目已加载
-      if (termBases.value.length === 0 && !loadingTermBases.value) {
-        await loadTermBases()
-      }
-      if (!selectedTermBaseId.value && termBases.value.length > 0) {
-        selectedTermBaseId.value = termBases.value[0].id
-      }
-      if (selectedTermBaseId.value && termEntries.value.length === 0 && !loadingTermEntries.value) {
-        await loadTermEntries()
-      }
+      await ensureMatchInfoTermContext()
     }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.sidePanel'))
@@ -2895,6 +2988,46 @@ function handleConfirmCurrentFromMenu() {
   confirmCurrentSentence()
 }
 
+function parseConfirmationRangeValue(value: string) {
+  const normalized = value.trim()
+  if (!normalized) {
+    return null
+  }
+  const numericValue = Number(normalized)
+  if (!Number.isInteger(numericValue) || numericValue < 1) {
+    return Number.NaN
+  }
+  return numericValue
+}
+
+function resolveConfirmationRange() {
+  const startValue = parseConfirmationRangeValue(confirmationRangeStart.value)
+  const endValue = parseConfirmationRangeValue(confirmationRangeEnd.value)
+  if (Number.isNaN(startValue) || Number.isNaN(endValue)) {
+    toast.warn('请输入有效的句段编号范围。')
+    return null
+  }
+  const start = startValue ?? endValue
+  const end = endValue ?? startValue
+  if (!start || !end) {
+    toast.warn('请先输入要确认的句段编号范围。')
+    return null
+  }
+  if (start > end) {
+    toast.warn('句段范围起始值不能大于结束值。')
+    return null
+  }
+  if (activeFileSegmentTotal.value > 0 && start > activeFileSegmentTotal.value) {
+    toast.warn(`当前文件只有 ${activeFileSegmentTotal.value} 个句段。`)
+    return null
+  }
+  return { start, end }
+}
+
+function formatConfirmationRange(start: number, end: number) {
+  return start === end ? String(start) : `${start}~${end}`
+}
+
 async function confirmAndMoveToNextUnconfirmed() {
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
@@ -2935,6 +3068,41 @@ async function confirmAndMoveToNextUnconfirmed() {
 
   if (nextUnconfirmedIndex !== -1) {
     await focusEditorSegmentAtIndex(nextUnconfirmedIndex)
+  }
+}
+
+async function handleConfirmRangeSegments() {
+  if (isMergeWorkbench.value && !activeMergeViewFile.value) {
+    toast.warn('请先选中一个句段，以确定要确认范围的当前文件。')
+    return
+  }
+  if (isMergeWorkbench.value && activeMergeViewFile.value?.can_write === false) {
+    toast.warn('当前文件无可编辑权限。')
+    return
+  }
+  const range = resolveConfirmationRange()
+  if (!range) {
+    return
+  }
+
+  pageError.value = ''
+  confirmationActionLoading.value = true
+  try {
+    const updatedCount = await segmentStore.updateAllSegmentConfirmations('confirm', 'current_file', {
+      rangeStart: range.start,
+      rangeEnd: range.end,
+    })
+    const rangeText = formatConfirmationRange(range.start, range.end)
+    toast.success(
+      updatedCount > 0
+        ? `已确认编号 ${rangeText} 范围内 ${updatedCount} 个句段`
+        : `编号 ${rangeText} 范围内没有需要确认的句段`,
+    )
+    closeConfirmMenu()
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '范围确认失败')
+  } finally {
+    confirmationActionLoading.value = false
   }
 }
 
@@ -3491,6 +3659,7 @@ const lastSourceCaretOffset = ref<number | null>(null)
 // 切换激活句段时清除光标缓存
 watch(() => segmentStore.activeSentenceId, () => {
   lastSourceCaretOffset.value = null
+  syncActiveSegmentCommentDraft()
 })
 
 function selectSegmentRange(fromSentenceId: string, toSentenceId: string) {
@@ -5032,16 +5201,7 @@ async function ensureMatchInfoPanelOpen() {
   activeSideTool.value = 'match-info'
 
   try {
-    if (termBases.value.length === 0 && !loadingTermBases.value) {
-      await loadTermBases()
-    }
-    if (!selectedTermBaseId.value && termBases.value.length > 0) {
-      selectedTermBaseId.value = termBases.value[0].id
-    }
-    if (selectedTermBaseId.value && termEntries.value.length === 0 && !loadingTermEntries.value) {
-      await loadTermEntries()
-    }
-    segmentStore.refreshActiveTermMatches()
+    await ensureMatchInfoTermContext()
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.sidePanel'))
   }
@@ -5097,6 +5257,20 @@ watch(selectedTermBaseId, () => {
   }
   void loadTermEntries()
 })
+
+watch(
+  () => boundTermBaseIds.value.join('|'),
+  () => {
+    if (activeSideTool.value === 'match-info') {
+      void ensureMatchInfoTermContext()
+      return
+    }
+    void segmentStore.refreshActiveTermMatches()
+    if (activeSideTool.value === 'terms' && !loadingTermBases.value) {
+      void loadTermBases()
+    }
+  },
+)
 
 watch(resourceSearchMode, () => {
   if (activeSideTool.value === 'resource-search' && resourceSearchQuery.value.trim()) {
@@ -5385,6 +5559,43 @@ onBeforeRouteLeave(async () => {
             >
               确认并跳到下一个
             </button>
+            <div class="workbench-confirm-menu__range" role="group" aria-label="按句段编号范围确认">
+              <span class="workbench-confirm-menu__range-label">
+                {{ isMergeWorkbench ? '当前文件范围' : '编号范围' }}
+              </span>
+              <div class="workbench-confirm-menu__range-fields">
+                <input
+                  v-model="confirmationRangeStart"
+                  class="workbench-confirm-menu__range-input"
+                  type="number"
+                  min="1"
+                  inputmode="numeric"
+                  placeholder="起始"
+                  aria-label="确认范围起始编号"
+                  @keydown.enter.prevent="void handleConfirmRangeSegments()"
+                />
+                <span aria-hidden="true">~</span>
+                <input
+                  v-model="confirmationRangeEnd"
+                  class="workbench-confirm-menu__range-input"
+                  type="number"
+                  min="1"
+                  inputmode="numeric"
+                  placeholder="结束"
+                  aria-label="确认范围结束编号"
+                  @keydown.enter.prevent="void handleConfirmRangeSegments()"
+                />
+              </div>
+              <button
+                data-testid="workbench-confirm-range"
+                type="button"
+                role="menuitem"
+                :disabled="confirmationActionLoading || (isMergeWorkbench && (!activeMergeViewFile || activeMergeViewFile.can_write === false))"
+                @click="void handleConfirmRangeSegments()"
+              >
+                确认范围
+              </button>
+            </div>
             <button
               data-testid="workbench-confirm-all"
               type="button"
@@ -7413,6 +7624,7 @@ onBeforeRouteLeave(async () => {
             :term-base-name="selectedTermBaseName"
             :term-entries="termEntries"
             :term-matches="activeTermMatches"
+            :qa-term-items="activeTermQAItemsForSegment"
             :active-source-text="activeSegmentSourceText"
             :file-record-id="activeWorkbenchFileId"
             :reference-match-result="referenceMatchResult"
@@ -8446,7 +8658,7 @@ onBeforeRouteLeave(async () => {
   left: 4px;
   z-index: 1250;
   display: grid;
-  min-width: 136px;
+  min-width: 176px;
   padding: 4px;
   border: 1px solid var(--line-soft);
   border-radius: 4px;
@@ -8484,6 +8696,47 @@ onBeforeRouteLeave(async () => {
 
 .workbench-confirm-menu__dropdown button.is-danger:hover:not(:disabled) {
   background: rgba(194, 59, 63, 0.08);
+}
+
+.workbench-confirm-menu__range {
+  display: grid;
+  gap: 5px;
+  padding: 7px 6px;
+  border-top: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.workbench-confirm-menu__range-label {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.workbench-confirm-menu__range-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 4px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.workbench-confirm-menu__range-input {
+  width: 100%;
+  min-width: 0;
+  height: 26px;
+  padding: 3px 5px;
+  border: 1px solid var(--line-soft);
+  border-radius: 3px;
+  background: #fff;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.workbench-confirm-menu__range-input:focus {
+  border-color: color-mix(in srgb, var(--brand-700) 42%, var(--line-soft));
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(13, 122, 104, 0.12);
 }
 
 .tool-col {
@@ -9131,8 +9384,9 @@ onBeforeRouteLeave(async () => {
 .term-qa-dialog__row:hover,
 .term-qa-dialog__row:focus-visible,
 .term-qa-dialog__row.is-locating {
-  background: #f4faf9;
+  background: #e4f3ff;
   outline: none;
+  box-shadow: inset 3px 0 0 #2a7fb8;
 }
 
 .term-qa-dialog__row.is-ignored {

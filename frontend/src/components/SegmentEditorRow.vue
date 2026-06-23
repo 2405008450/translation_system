@@ -2070,11 +2070,12 @@ watch(
 }
 
 .segment-row__term-highlight {
-  background: rgba(216, 183, 78, 0.28);
+  background: rgba(247, 187, 42, 0.46);
   color: inherit;
   padding: 1px 2px;
   border-radius: 3px;
-  font-weight: 500;
+  box-shadow: inset 0 0 0 1px rgba(152, 103, 0, 0.32);
+  font-weight: 600;
 }
 
 .segment-row__search-highlight {
@@ -2098,11 +2099,12 @@ watch(
 /* 穿透 scoped 样式，让 innerHTML 插入的 mark 标签也能应用样式 */
 .segment-row__text :deep(.segment-row__term-highlight),
 .segment-row__source-editor :deep(.segment-row__term-highlight) {
-  background: rgba(216, 183, 78, 0.28);
+  background: rgba(247, 187, 42, 0.46);
   color: inherit;
   padding: 1px 2px;
   border-radius: 3px;
-  font-weight: 500;
+  box-shadow: inset 0 0 0 1px rgba(152, 103, 0, 0.32);
+  font-weight: 600;
 }
 
 .segment-row__text :deep(.segment-row__search-highlight),
@@ -2126,11 +2128,12 @@ watch(
 }
 
 .segment-row__editor :deep(.segment-row__term-highlight) {
-  background: rgba(216, 183, 78, 0.28);
+  background: rgba(247, 187, 42, 0.46);
   color: inherit;
   padding: 1px 2px;
   border-radius: 3px;
-  font-weight: 500;
+  box-shadow: inset 0 0 0 1px rgba(152, 103, 0, 0.32);
+  font-weight: 600;
 }
 
 .segment-row__editor :deep(.segment-row__search-highlight) {
