@@ -105,6 +105,7 @@ import type {
   TMCollection,
   TermBase,
   TermEntryRecord,
+  QualityQASettingsResponse,
   WorkbenchQAResult,
   WorkbenchQAResultItem,
   WorkflowProgress,
@@ -133,6 +134,11 @@ type WorkflowTransitionDirection = 'forward' | 'back'
 type WorkflowSourceStatus = 'none' | 'exact' | 'fuzzy' | 'confirmed'
 type SegmentScreeningGroup = 'status' | 'match' | 'source' | 'flag' | 'workflow'
 type WorkbenchSettingsTab = 'preferences' | 'shortcuts'
+type SegmentSearchReturnTarget = {
+  sentenceId: string | null
+  displayIndex: number | null
+  page: number
+}
 interface SegmentScreeningOption {
   value: string
   label: string
@@ -164,6 +170,7 @@ type SegmentEditorRowPublic = ComponentPublicInstance & {
     data?: string | null
     preserveNextTargetSync?: boolean
   }) => boolean
+  insertOrReplaceTargetText: (text: string) => boolean
   commitEditorContent: () => CommittedSegmentEditorContent | null
 }
 type UpdateSegmentTargetOptions = {
@@ -418,7 +425,7 @@ const segmentScreeningSourceFilters = ref<string[]>([])
 const segmentScreeningFlagFilters = ref<string[]>([])
 const segmentScreeningWorkflowStepIds = ref<string[]>([])
 const searchLoadingAllSegments = ref(false)
-const segmentSearchReturnTarget = ref<{ sentenceId: string; displayIndex: number | null; page: number } | null>(null)
+const segmentSearchReturnTarget = ref<SegmentSearchReturnTarget | null>(null)
 const retainedEmptyTargetSentenceIds = ref<Set<string>>(new Set())
 const tmCollections = ref<TMCollection[]>([])
 const loadingTMCollections = ref(false)
@@ -435,6 +442,11 @@ const locatingTermQAReportItemId = ref<string | null>(null)
 const updatingTermQAIgnore = ref(false)
 const selectedTermQAItemIds = ref<Set<string>>(new Set())
 const termQAReportPage = ref(1)
+const showQualityQAAdjustDialog = ref(false)
+const qualityQASettings = ref<QualityQASettingsResponse | null>(null)
+const loadingQualityQASettings = ref(false)
+const savingQualityQASettings = ref(false)
+const qualityQASettingsError = ref('')
 const showWorkflowTransitionDialog = ref(false)
 const workflowTransitionDirection = ref<WorkflowTransitionDirection>('forward')
 const workflowTransitionLoading = ref(false)
@@ -519,6 +531,7 @@ const referenceMatchResult = ref<import('../types/api').ReferenceMatchResult | n
 let searchLoadRequestId = 0
 let suppressSegmentFilterWatch = false
 let ignoreNextPaginationPageReset = false
+let pendingSegmentSearchReturnPage: number | null = null
 
 const segmentPageSizes = [100, 200, 500]
 
@@ -1163,6 +1176,18 @@ const termQAReportCreatedAtText = computed(() => (
   formatWorkbenchStatusTime(termQAReport.value?.created_at)
 ))
 
+const termQAReportMetaText = computed(() => {
+  const report = termQAReport.value
+  if (!report) {
+    return ''
+  }
+  return [
+    `共 ${report.issue_count} 条`,
+    `检查 ${report.checked_segments} 句段`,
+    termQAReportCreatedAtText.value,
+  ].filter(Boolean).join(' · ')
+})
+
 const termQAReportSubtitle = computed(() => {
   if (isMergeWorkbench.value) {
     const detail = segmentStore.mergeViewDetail
@@ -1180,6 +1205,93 @@ function getTermQAFileName(item: WorkbenchQAResultItem) {
     || item.file_name
     || '未知文件'
   )
+}
+
+function formatTermQASegmentNumber(sentenceId: string) {
+  const match = sentenceId.match(/\d+$/)
+  if (!match) {
+    return sentenceId
+  }
+  return String(Number.parseInt(match[0], 10))
+}
+
+const qualityQARules = [
+  { key: 'target_without_tag', label: '译文无标记', defaultEnabled: true },
+  { key: 'target_tag_missing', label: '译文标记丢失', defaultEnabled: true },
+  { key: 'unmatched_closing_tag', label: '结束标记无匹配的开始标记', defaultEnabled: true },
+  { key: 'unmatched_opening_tag', label: '开始标记无匹配的结束标记', defaultEnabled: true },
+  { key: 'target_placeholder_missing', label: '译文占位符标记丢失', defaultEnabled: true },
+  { key: 'spelling_grammar', label: '译文有拼写或语法错误（查看支持的语种）', defaultEnabled: true },
+  { key: 'term_inconsistency', label: '术语不一致', defaultEnabled: false },
+  { key: 'paired_punctuation_missing', label: '成对标点符号丢失', defaultEnabled: false },
+  { key: 'ending_punctuation_mismatch', label: '原文和译文的结束标点不同', defaultEnabled: false },
+  { key: 'repeated_punctuation', label: '重复标点', defaultEnabled: false },
+  { key: 'extra_space_after_punctuation', label: '标点符号后有多余空格', defaultEnabled: false },
+  { key: 'missing_space_after_punctuation', label: '标点符号后遗漏空格', defaultEnabled: false },
+] as const
+
+type QualityQARuleKey = typeof qualityQARules[number]['key']
+type QualityQARuleDraft = Record<QualityQARuleKey, boolean>
+
+function createQualityQARuleDraft(): QualityQARuleDraft {
+  return qualityQARules.reduce((draft, rule) => {
+    draft[rule.key] = rule.defaultEnabled
+    return draft
+  }, {} as QualityQARuleDraft)
+}
+
+const qualityQADraft = reactive({
+  rules: createQualityQARuleDraft(),
+})
+
+const enabledQualityQARuleCount = computed(() => (
+  qualityQARules.filter((rule) => qualityQADraft.rules[rule.key]).length
+))
+const qualityQARuleStatusText = computed(() => {
+  if (enabledQualityQARuleCount.value === 0) {
+    return '全部关闭'
+  }
+  if (enabledQualityQARuleCount.value === qualityQARules.length) {
+    return `全部启用（${enabledQualityQARuleCount.value}/${qualityQARules.length}）`
+  }
+  return `已启用 ${enabledQualityQARuleCount.value}/${qualityQARules.length}`
+})
+const qualityQARuleStatusClass = computed(() => (
+  enabledQualityQARuleCount.value > 0 ? 'is-ok' : 'is-warn'
+))
+const spellingGrammarQAEnabled = computed(() => qualityQADraft.rules.spelling_grammar)
+const canOpenQualityQAAdjustDialog = computed(() => Boolean(activeWorkbenchProjectId.value))
+
+function syncQualityQADraftFromSettings(data: QualityQASettingsResponse) {
+  for (const rule of qualityQARules) {
+    qualityQADraft.rules[rule.key] = getSavedQualityQARuleEnabledFrom(data, rule)
+  }
+}
+
+function getSavedQualityQARuleEnabledFrom(data: QualityQASettingsResponse, rule: typeof qualityQARules[number]) {
+  const ruleSetting = data.settings.rules?.[rule.key]
+  if (typeof ruleSetting?.enabled === 'boolean') {
+    return ruleSetting.enabled
+  }
+  if (rule.key === 'spelling_grammar') {
+    return Boolean(data.settings.spelling_grammar.enabled)
+  }
+  return rule.defaultEnabled
+}
+
+function buildQualityQARulesPayload() {
+  return qualityQARules.reduce((payload, rule) => {
+    payload[rule.key] = {
+      enabled: qualityQADraft.rules[rule.key],
+    }
+    return payload
+  }, {} as Record<QualityQARuleKey, { enabled: boolean }>)
+}
+
+function setAllQualityQARules(checked: boolean) {
+  for (const rule of qualityQARules) {
+    qualityQADraft.rules[rule.key] = checked
+  }
 }
 
 function normalizeTermQAReportForCurrentWorkbench(report: WorkbenchQAResult | null) {
@@ -2433,24 +2545,54 @@ function resetSegmentSearch() {
   resetSegmentScreeningFilters()
   searchLoadingAllSegments.value = false
   segmentSearchReturnTarget.value = null
+  pendingSegmentSearchReturnPage = null
   retainedEmptyTargetSentenceIds.value = new Set()
 }
 
-function captureSegmentSearchReturnTarget() {
+function buildSegmentSearchReturnTarget(): SegmentSearchReturnTarget | null {
   const sentenceId = segmentStore.activeSentenceId
   if (!sentenceId) {
-    segmentSearchReturnTarget.value = null
-    return
+    return null
   }
 
   const segment = editorSegments.value.find((item) => segmentKeyOf(item) === sentenceId)
   const displayIndex = typeof segment?.display_index === 'number' && Number.isFinite(segment.display_index)
     ? segment.display_index
     : (segmentOrdinalMap.value.get(sentenceId) ?? null)
-  segmentSearchReturnTarget.value = {
+  return {
     sentenceId,
     displayIndex,
     page: segmentStore.currentPage,
+  }
+}
+
+function captureSegmentSearchReturnTarget() {
+  if (pendingSegmentSearchReturnPage !== null) {
+    captureSegmentSearchReturnPage(pendingSegmentSearchReturnPage)
+    return
+  }
+
+  const target = buildSegmentSearchReturnTarget()
+  if (target || !segmentSearchReturnTarget.value) {
+    segmentSearchReturnTarget.value = target
+  }
+}
+
+function syncSegmentSearchReturnTarget() {
+  const target = buildSegmentSearchReturnTarget()
+  if (target) {
+    segmentSearchReturnTarget.value = target
+  }
+}
+
+function captureSegmentSearchReturnPage(page = segmentStore.currentPage) {
+  const safePage = Number.isFinite(page) && page > 0
+    ? Math.trunc(page)
+    : segmentStore.currentPage
+  segmentSearchReturnTarget.value = {
+    sentenceId: null,
+    displayIndex: null,
+    page: safePage,
   }
 }
 
@@ -2564,16 +2706,19 @@ async function focusEditorSegmentBySentenceId(sentenceId: string) {
   return true
 }
 
-function getReturnTargetPage(target: { displayIndex: number | null; page: number }) {
+function getReturnTargetPage(target: SegmentSearchReturnTarget) {
   if (typeof target.displayIndex === 'number' && Number.isFinite(target.displayIndex) && target.displayIndex >= 0) {
     return Math.floor(target.displayIndex / segmentStore.pageSize) + 1
   }
   return target.page
 }
 
-async function resolveSegmentReturnTargetPage(target: { sentenceId: string; displayIndex: number | null; page: number }) {
+async function resolveSegmentReturnTargetPage(target: SegmentSearchReturnTarget) {
   const localPage = getReturnTargetPage(target)
   if (segmentStore.mergeViewId) {
+    return localPage
+  }
+  if (!target.sentenceId) {
     return localPage
   }
   if (typeof target.displayIndex === 'number' && Number.isFinite(target.displayIndex) && target.displayIndex >= 0) {
@@ -2603,25 +2748,28 @@ async function resolveSegmentReturnTargetPage(target: { sentenceId: string; disp
 async function restoreSegmentSearchReturnTarget() {
   const target = segmentSearchReturnTarget.value
   segmentSearchReturnTarget.value = null
-  if (!target) {
+  if (!hasEditorSegmentFilter.value) {
+    if (target?.sentenceId) {
+      await focusEditorSegmentBySentenceId(target.sentenceId)
+    }
     return
   }
 
-  if (await focusEditorSegmentBySentenceId(target.sentenceId)) {
-    return
-  }
-
-  const targetPage = await resolveSegmentReturnTargetPage(target)
+  const targetPage = target ? await resolveSegmentReturnTargetPage(target) : segmentStore.currentPage
   suppressSegmentFilterWatch = true
   clearSegmentSearchFilters()
+  await nextTick()
   suppressSegmentFilterWatch = false
-  await refreshSegmentPage(targetPage, segmentStore.pageSize)
-  await focusEditorSegmentBySentenceId(target.sentenceId)
+  if (segmentStore.fileRecord || segmentStore.mergeViewId) {
+    await refreshSegmentPage(targetPage, segmentStore.pageSize)
+  }
+  if (target?.sentenceId) {
+    await focusEditorSegmentBySentenceId(target.sentenceId)
+  }
 }
 
 async function clearSourceSegmentSearchQuery() {
   const target = segmentSearchReturnTarget.value
-  const targetPage = target ? await resolveSegmentReturnTargetPage(target) : segmentStore.currentPage
   searchLoadRequestId += 1
   searchLoadingAllSegments.value = false
   suppressSegmentFilterWatch = true
@@ -2629,11 +2777,15 @@ async function clearSourceSegmentSearchQuery() {
   await nextTick()
   suppressSegmentFilterWatch = false
 
+  const shouldRestoreReturnTarget = !hasEditorSegmentFilter.value
+  const targetPage = shouldRestoreReturnTarget && target
+    ? await resolveSegmentReturnTargetPage(target)
+    : 1
   if (segmentStore.fileRecord || segmentStore.mergeViewId) {
     await refreshSegmentPage(targetPage, segmentStore.pageSize)
   }
 
-  if (target) {
+  if (shouldRestoreReturnTarget && target?.sentenceId) {
     await focusEditorSegmentBySentenceId(target.sentenceId)
     return
   }
@@ -2644,7 +2796,6 @@ async function clearSourceSegmentSearchQuery() {
 
 async function clearTargetSegmentSearchQuery() {
   const target = segmentSearchReturnTarget.value
-  const targetPage = target ? await resolveSegmentReturnTargetPage(target) : segmentStore.currentPage
   searchLoadRequestId += 1
   searchLoadingAllSegments.value = false
   suppressSegmentFilterWatch = true
@@ -2652,11 +2803,15 @@ async function clearTargetSegmentSearchQuery() {
   await nextTick()
   suppressSegmentFilterWatch = false
 
+  const shouldRestoreReturnTarget = !hasEditorSegmentFilter.value
+  const targetPage = shouldRestoreReturnTarget && target
+    ? await resolveSegmentReturnTargetPage(target)
+    : 1
   if (segmentStore.fileRecord || segmentStore.mergeViewId) {
     await refreshSegmentPage(targetPage, segmentStore.pageSize)
   }
 
-  if (target) {
+  if (shouldRestoreReturnTarget && target?.sentenceId) {
     await focusEditorSegmentBySentenceId(target.sentenceId)
     return
   }
@@ -2808,6 +2963,9 @@ async function focusEditorSegmentAtIndex(index: number) {
   }
 
   segmentStore.setActiveSentence(segmentKeyOf(target))
+  if (segmentSearchOpen.value && !hasEditorSegmentFilter.value) {
+    syncSegmentSearchReturnTarget()
+  }
   await nextTick()
   await virtualListRef.value?.focusIndex(index, '[data-segment-target="true"]', 'nearest')
 }
@@ -3300,6 +3458,17 @@ watch(
   () => setTermQAReportPage(termQAReportPage.value),
 )
 
+watch(
+  () => activeWorkbenchProjectId.value,
+  () => {
+    qualityQASettings.value = null
+    qualityQASettingsError.value = ''
+    if (showQualityQAAdjustDialog.value) {
+      void loadWorkbenchQualityQASettings()
+    }
+  },
+)
+
 function shouldKeepLoadedQAResult(report: WorkbenchQAResult) {
   return report.items.length > 0 || Boolean(report.term_report_id)
 }
@@ -3497,6 +3666,81 @@ async function ignoreSelectedTermQAReportItems() {
   )
 }
 
+async function loadWorkbenchQualityQASettings() {
+  const projectId = activeWorkbenchProjectId.value
+  if (!projectId) {
+    qualityQASettings.value = null
+    return
+  }
+  loadingQualityQASettings.value = true
+  qualityQASettingsError.value = ''
+  try {
+    const { data } = await http.get<QualityQASettingsResponse>(
+      `/projects/${projectId}/quality-qa-settings`,
+    )
+    qualityQASettings.value = data
+    syncQualityQADraftFromSettings(data)
+  } catch (error) {
+    qualityQASettingsError.value = getErrorMessage(error, '质量保证设置加载失败。')
+  } finally {
+    loadingQualityQASettings.value = false
+  }
+}
+
+async function openQualityQAAdjustDialog() {
+  if (!canOpenQualityQAAdjustDialog.value) {
+    toast.warn('当前工作台缺少项目信息，无法调整质量保证设置。')
+    return
+  }
+  showQualityQAAdjustDialog.value = true
+  if (!qualityQASettings.value && !loadingQualityQASettings.value) {
+    await loadWorkbenchQualityQASettings()
+  }
+}
+
+function closeQualityQAAdjustDialog() {
+  if (savingQualityQASettings.value) {
+    return
+  }
+  showQualityQAAdjustDialog.value = false
+}
+
+async function saveWorkbenchQualityQASettings() {
+  const projectId = activeWorkbenchProjectId.value
+  if (!projectId || savingQualityQASettings.value) {
+    return false
+  }
+  savingQualityQASettings.value = true
+  qualityQASettingsError.value = ''
+  try {
+    const { data } = await http.patch<QualityQASettingsResponse>(
+      `/projects/${projectId}/quality-qa-settings`,
+      {
+        rules: buildQualityQARulesPayload(),
+        spelling_grammar: {
+          enabled: qualityQADraft.rules.spelling_grammar,
+        },
+      },
+    )
+    qualityQASettings.value = data
+    syncQualityQADraftFromSettings(data)
+    toast.success('质量保证设置已保存，可重新生成 QA 结果。')
+    return true
+  } catch (error) {
+    qualityQASettingsError.value = getErrorMessage(error, '质量保证设置保存失败。')
+    return false
+  } finally {
+    savingQualityQASettings.value = false
+  }
+}
+
+async function submitQualityQAAdjustDialog() {
+  const saved = await saveWorkbenchQualityQASettings()
+  if (saved) {
+    showQualityQAAdjustDialog.value = false
+  }
+}
+
 async function focusTermQAReportItem(item: WorkbenchQAResultItem) {
   if (locatingTermQAReportItemId.value) {
     return
@@ -3660,6 +3904,9 @@ const lastSourceCaretOffset = ref<number | null>(null)
 watch(() => segmentStore.activeSentenceId, () => {
   lastSourceCaretOffset.value = null
   syncActiveSegmentCommentDraft()
+  if (segmentSearchOpen.value && !hasEditorSegmentFilter.value) {
+    syncSegmentSearchReturnTarget()
+  }
 })
 
 function selectSegmentRange(fromSentenceId: string, toSentenceId: string) {
@@ -4576,13 +4823,35 @@ async function handleSegmentPageChange(page: number) {
     return
   }
   ignoreNextPaginationPageReset = false
+  const shouldSyncReturnTarget = segmentSearchOpen.value && !hasEditorSegmentFilter.value
+  if (!hasEditorSegmentFilter.value) {
+    pendingSegmentSearchReturnPage = page
+    captureSegmentSearchReturnPage(page)
+  }
   await refreshSegmentPage(page, segmentStore.pageSize, { includeStats: false })
+  if (shouldSyncReturnTarget) {
+    syncSegmentSearchReturnTarget()
+  }
+  if (pendingSegmentSearchReturnPage === page) {
+    pendingSegmentSearchReturnPage = null
+  }
 }
 
 async function handleSegmentPageSizeChange(size: number) {
   ignoreNextPaginationPageReset = true
+  const shouldSyncReturnTarget = segmentSearchOpen.value && !hasEditorSegmentFilter.value
+  if (!hasEditorSegmentFilter.value) {
+    pendingSegmentSearchReturnPage = 1
+    captureSegmentSearchReturnPage(1)
+  }
   try {
     await refreshSegmentPage(1, size, { includeStats: false })
+    if (shouldSyncReturnTarget) {
+      syncSegmentSearchReturnTarget()
+    }
+    if (pendingSegmentSearchReturnPage === 1) {
+      pendingSegmentSearchReturnPage = null
+    }
   } finally {
     ignoreNextPaginationPageReset = false
   }
@@ -5114,8 +5383,9 @@ function handleReplaceText(text: string) {
     return
   }
 
+  const sentenceId = segmentKeyOf(activeSegment.value)
   updateSegmentTarget(
-    activeSegment.value.sentence_id,
+    sentenceId,
     text,
     undefined,
     { recordUndo: true, undoInputType: 'replaceTargetFromMatchPanel' },
@@ -5128,9 +5398,16 @@ function handleAppendText(text: string) {
     return
   }
 
+  const activeEditor = getActiveSegmentEditorRow()
+  if (activeEditor?.insertOrReplaceTargetText(text)) {
+    toast.success(t('matchPanel.textInserted'))
+    return
+  }
+
+  const sentenceId = segmentKeyOf(activeSegment.value)
   const nextText = appendToCurrentText(activeSegment.value.target_text || '', text)
   updateSegmentTarget(
-    activeSegment.value.sentence_id,
+    sentenceId,
     nextText,
     undefined,
     { recordUndo: true, undoInputType: 'appendTargetFromMatchPanel' },
@@ -7199,49 +7476,59 @@ onBeforeRouteLeave(async () => {
                       <em class="term-qa-stat__value">{{ termQAReport.ignored_count }}</em>
                       <span class="term-qa-stat__label">已忽略</span>
                     </span>
-                    <span class="term-qa-stat is-muted">
-                      <em class="term-qa-stat__value">{{ termQAReport.issue_count }}</em>
-                      <span class="term-qa-stat__label">总问题</span>
-                    </span>
-                    <span class="term-qa-stat is-muted">
-                      <em class="term-qa-stat__value">{{ termQAReport.checked_segments }}</em>
-                      <span class="term-qa-stat__label">检查句段</span>
-                    </span>
-                    <span v-if="termQAReportCreatedAtText" class="term-qa-stat__time">
-                      {{ termQAReportCreatedAtText }}
+                    <span class="term-qa-dialog__meta">
+                      {{ termQAReportMetaText }}
                     </span>
                   </div>
 
-                  <div v-if="termQAReport" class="term-qa-dialog__actions">
+                  <div class="term-qa-dialog__actions">
                     <button
-                      class="button button--ghost"
+                      v-if="termQAReport"
+                      class="button button--ghost term-qa-dialog__action-button"
                       type="button"
                       :disabled="activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
+                      title="全选未忽略"
                       @click="toggleAllActiveTermQAItems(!allActiveTermQAItemsSelected)"
                     >
-                      {{ allActiveTermQAItemsSelected ? '取消全选' : '全选未忽略' }}
+                      {{ allActiveTermQAItemsSelected ? '取消' : '全选' }}
                     </button>
                     <button
-                      class="button button--ghost"
+                      v-if="termQAReport"
+                      class="button button--ghost term-qa-dialog__action-button"
                       type="button"
                       :disabled="selectedActiveTermQAReportItems.length === 0 || updatingTermQAIgnore"
+                      title="忽略选中的 QA 问题"
                       @click="void ignoreSelectedTermQAReportItems()"
                     >
                       <Loader2 v-if="updatingTermQAIgnore" class="lucide-spin" :size="14" />
-                      忽略选中 {{ selectedActiveTermQAReportItems.length || '' }}
+                      忽略{{ selectedActiveTermQAReportItems.length ? ` ${selectedActiveTermQAReportItems.length}` : '' }}
                     </button>
                     <button
-                      class="button"
+                      v-if="termQAReport"
+                      class="button term-qa-dialog__action-button"
                       type="button"
                       :disabled="downloadingTermQAReport"
+                      title="导出 XLSX"
                       @click="downloadCurrentTermQAReport"
                     >
                       <Loader2 v-if="downloadingTermQAReport" class="lucide-spin" :size="14" />
                       <Download v-else :size="14" />
-                      导出 XLSX
+                      导出
                     </button>
                     <button
-                      class="button button--ghost"
+                      class="button button--ghost term-qa-dialog__action-button"
+                      type="button"
+                      :disabled="loadingQualityQASettings || savingQualityQASettings || !canOpenQualityQAAdjustDialog"
+                      title="调整质量保证规则"
+                      @click="void openQualityQAAdjustDialog()"
+                    >
+                      <Loader2 v-if="loadingQualityQASettings || savingQualityQASettings" class="lucide-spin" :size="14" />
+                      <Settings v-else :size="14" />
+                      调整
+                    </button>
+                    <button
+                      v-if="termQAReport"
+                      class="button button--ghost term-qa-dialog__action-button"
                       type="button"
                       :disabled="!canRunTermQAReport"
                       :title="termQAButtonTitle"
@@ -7284,11 +7571,9 @@ onBeforeRouteLeave(async () => {
                           </th>
                           <th class="term-qa-dialog__col-segment">句段</th>
                           <th v-if="isMergeWorkbench" class="term-qa-dialog__col-file">文件</th>
-                          <th>错误类型</th>
-                          <th>问题描述</th>
-                          <th>建议/期望译文</th>
-                          <th>当前译文</th>
-                          <th class="term-qa-dialog__col-status">状态</th>
+                          <th class="term-qa-dialog__col-type">类型</th>
+                          <th>问题 / 建议</th>
+                          <th class="term-qa-dialog__col-target">当前译文</th>
                           <th class="term-qa-dialog__col-action">操作</th>
                         </tr>
                       </thead>
@@ -7302,7 +7587,7 @@ onBeforeRouteLeave(async () => {
                             'is-ignored': item.ignored,
                           }"
                           tabindex="0"
-                          :aria-label="`跳转到句段 ${item.sentence_id}`"
+                          :aria-label="`跳转到句段 ${formatTermQASegmentNumber(item.sentence_id)}`"
                           @click="void focusTermQAReportItem(item)"
                           @keydown.enter.prevent="void focusTermQAReportItem(item)"
                           @keydown.space.prevent="void focusTermQAReportItem(item)"
@@ -7318,13 +7603,13 @@ onBeforeRouteLeave(async () => {
                             >
                           </td>
                           <td>
-                            <span class="term-qa-dialog__segment">
+                            <span class="term-qa-dialog__segment" :title="item.sentence_id">
                               <Loader2
                                 v-if="locatingTermQAReportItemId === item.id"
                                 class="lucide-spin"
                                 :size="13"
                               />
-                              {{ item.sentence_id }}
+                              {{ formatTermQASegmentNumber(item.sentence_id) }}
                             </span>
                           </td>
                           <td
@@ -7333,29 +7618,28 @@ onBeforeRouteLeave(async () => {
                             :title="getTermQAFileName(item)"
                           >{{ getTermQAFileName(item) }}</td>
                           <td class="term-qa-dialog__cell-text" :title="item.rule_label">{{ item.rule_label }}</td>
-                          <td class="term-qa-dialog__cell-text" :title="item.detail || item.message">{{ item.message }}</td>
-                          <td
-                            class="term-qa-dialog__cell-text"
-                            :class="{ 'is-empty': !item.suggestion }"
-                            :title="item.suggestion || '暂无建议'"
-                          >{{ item.suggestion || '暂无建议' }}</td>
+                          <td class="term-qa-dialog__issue-cell">
+                            <span class="term-qa-dialog__issue-title" :title="item.detail || item.message">
+                              {{ item.message }}
+                            </span>
+                            <span
+                              v-if="item.suggestion"
+                              class="term-qa-dialog__issue-suggestion"
+                              :title="item.suggestion"
+                            >
+                              建议：{{ item.suggestion }}
+                            </span>
+                          </td>
                           <td
                             class="term-qa-dialog__cell-text"
                             :class="{ 'is-empty': !item.target_text }"
                             :title="item.target_text || '未填写'"
                           >{{ item.target_text || '未填写' }}</td>
                           <td>
-                            <span class="term-qa-dialog__status" :class="{ 'is-ignored': item.ignored }">
-                              {{ item.ignored ? '已忽略' : '待处理' }}
-                            </span>
-                            <small v-if="item.ignored_at" class="term-qa-dialog__ignored-meta">
-                              {{ item.ignored_by_name || item.ignored_by_id || '' }}
-                            </small>
-                          </td>
-                          <td>
                             <button
                               class="button button--ghost term-qa-dialog__inline-action"
                               type="button"
+                              :title="item.ignored ? '恢复该 QA 问题' : '忽略该 QA 问题'"
                               :disabled="updatingTermQAIgnore"
                               @click.stop="void setSingleTermQAReportItemIgnored(item, !item.ignored)"
                             >
@@ -7367,27 +7651,29 @@ onBeforeRouteLeave(async () => {
                     </table>
                     <div v-if="termQAReport.items.length > termQAReportPageSize" class="term-qa-dialog__pager">
                       <span class="term-qa-dialog__pager-range">{{ termQAReportPageRangeText }}</span>
-                      <span class="term-qa-dialog__pager-page">
-                        第 {{ termQAReportPage }} / {{ termQAReportTotalPages }} 页
-                      </span>
                       <div class="term-qa-dialog__pager-actions">
                         <button
                           class="button button--ghost term-qa-dialog__pager-button"
                           type="button"
+                          aria-label="上一页"
+                          title="上一页"
                           :disabled="termQAReportPage <= 1"
                           @click="setTermQAReportPage(termQAReportPage - 1)"
                         >
-                          <ArrowLeft :size="14" />
-                          上一页
+                          <ArrowLeft :size="13" />
                         </button>
+                        <span class="term-qa-dialog__pager-page">
+                          {{ termQAReportPage }} / {{ termQAReportTotalPages }}
+                        </span>
                         <button
                           class="button button--ghost term-qa-dialog__pager-button"
                           type="button"
+                          aria-label="下一页"
+                          title="下一页"
                           :disabled="termQAReportPage >= termQAReportTotalPages"
                           @click="setTermQAReportPage(termQAReportPage + 1)"
                         >
-                          下一页
-                          <ArrowRight :size="14" />
+                          <ArrowRight :size="13" />
                         </button>
                       </div>
                     </div>
@@ -7811,6 +8097,73 @@ onBeforeRouteLeave(async () => {
       @close="showRevisionSettingsDialog = false"
       @save="handleSaveRevisionSettings"
     />
+
+    <Modal
+      :open="showQualityQAAdjustDialog"
+      title="质量保证调整"
+      width="min(560px, calc(100vw - 32px))"
+      :close-on-overlay="!savingQualityQASettings"
+      :close-on-esc="!savingQualityQASettings"
+      @close="closeQualityQAAdjustDialog"
+    >
+      <div class="quality-qa-adjust-dialog">
+        <div v-if="loadingQualityQASettings" class="empty-state quality-qa-adjust-dialog__loading">
+          <Loader2 class="lucide-spin" :size="24" />
+          正在加载质量保证设置
+        </div>
+        <template v-else>
+          <div class="quality-qa-adjust-dialog__summary">
+            <span>规则</span>
+            <strong :class="qualityQARuleStatusClass">{{ qualityQARuleStatusText }}</strong>
+          </div>
+
+          <div class="quality-qa-adjust-dialog__quick-actions">
+            <button class="button" type="button" :disabled="savingQualityQASettings" @click="setAllQualityQARules(true)">
+              全部启用
+            </button>
+            <button class="button" type="button" :disabled="savingQualityQASettings" @click="setAllQualityQARules(false)">
+              全部关闭
+            </button>
+          </div>
+
+          <div class="quality-qa-adjust-dialog__options">
+            <label
+              v-for="rule in qualityQARules"
+              :key="rule.key"
+              class="quality-qa-adjust-dialog__option"
+            >
+              <input
+                v-model="qualityQADraft.rules[rule.key]"
+                type="checkbox"
+                :disabled="savingQualityQASettings"
+              >
+              <span>{{ rule.label }}</span>
+            </label>
+          </div>
+
+          <p v-if="qualityQASettingsError" class="form-message is-error">{{ qualityQASettingsError }}</p>
+          <p v-else-if="spellingGrammarQAEnabled && !qualityQASettings?.languagetool_configured" class="form-message is-error">
+            已启用拼写/语法检查，但后端尚未配置 LanguageTool。
+          </p>
+        </template>
+      </div>
+
+      <template #footer>
+        <button class="button" type="button" :disabled="savingQualityQASettings" @click="closeQualityQAAdjustDialog">
+          {{ t('common.actions.cancel') }}
+        </button>
+        <button
+          class="button button--primary"
+          type="button"
+          :disabled="savingQualityQASettings || loadingQualityQASettings"
+          @click="void submitQualityQAAdjustDialog()"
+        >
+          <Loader2 v-if="savingQualityQASettings" class="lucide-spin" :size="14" />
+          <Check v-else :size="14" />
+          {{ savingQualityQASettings ? t('common.actions.saving') : t('common.actions.save') }}
+        </button>
+      </template>
+    </Modal>
 
     <Modal
       :open="showWorkflowTransitionDialog"
@@ -9227,16 +9580,17 @@ onBeforeRouteLeave(async () => {
 
 .term-qa-dialog__summary {
   color: var(--text-muted, #64748b);
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .term-qa-stat {
   display: inline-flex;
   align-items: baseline;
   gap: 5px;
-  padding: 3px 9px;
+  min-height: 26px;
+  padding: 2px 8px;
   border: 1px solid #d7e7e3;
-  border-radius: 999px;
+  border-radius: 6px;
   background: #f3faf8;
   white-space: nowrap;
 }
@@ -9247,7 +9601,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .term-qa-stat__value {
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 700;
   font-style: normal;
   color: #b4530f;
@@ -9258,19 +9612,30 @@ onBeforeRouteLeave(async () => {
 }
 
 .term-qa-stat__label {
-  font-size: 12px;
+  font-size: 11px;
   color: var(--text-muted, #64748b);
 }
 
-.term-qa-stat__time {
-  margin-left: auto;
+.term-qa-dialog__meta {
+  flex: 1 1 220px;
+  min-width: 0;
   color: #8694a0;
   font-size: 12px;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .term-qa-dialog__actions {
   justify-content: flex-end;
+}
+
+.term-qa-dialog__action-button {
+  min-height: 30px;
+  padding: 5px 9px;
+  gap: 4px;
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .term-qa-dialog__warnings {
@@ -9283,14 +9648,15 @@ onBeforeRouteLeave(async () => {
 .term-qa-dialog__table-wrap {
   overflow: auto;
   border: 1px solid var(--border-color, #dbe3ea);
-  border-radius: 8px;
+  border-radius: 6px;
 }
 
 .term-qa-dialog__pager {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 12px;
+  gap: 10px;
+  min-height: 40px;
+  padding: 6px 10px;
   border-top: 1px solid var(--border-color, #dbe3ea);
   background: var(--surface-muted, #f8fafc);
   color: var(--text-muted, #64748b);
@@ -9305,30 +9671,46 @@ onBeforeRouteLeave(async () => {
 .term-qa-dialog__pager-actions {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   margin-left: auto;
 }
 
 .term-qa-dialog__pager-button {
-  min-height: 30px;
-  padding: 4px 9px;
+  width: 28px;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
   font-size: 12px;
+}
+
+.term-qa-dialog__pager-page {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 54px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border-color, #dbe3ea);
+  border-radius: 6px;
+  background: #ffffff;
+  color: #40515a;
+  font-weight: 600;
 }
 
 .term-qa-dialog__table {
   width: 100%;
-  min-width: 1080px;
+  min-width: 820px;
   border-collapse: collapse;
-  font-size: 13px;
+  font-size: 12px;
   table-layout: fixed;
 }
 
 .term-qa-dialog__table th,
 .term-qa-dialog__table td {
-  padding: 9px 10px;
+  padding: 8px 10px;
   border-bottom: 1px solid var(--border-color, #dbe3ea);
   text-align: left;
-  vertical-align: top;
+  vertical-align: middle;
 }
 
 .term-qa-dialog__table th {
@@ -9353,12 +9735,21 @@ onBeforeRouteLeave(async () => {
   width: 160px;
 }
 
-.term-qa-dialog__col-status {
-  width: 104px;
+.term-qa-dialog__col-type {
+  width: 108px;
+}
+
+.term-qa-dialog__col-target {
+  width: 28%;
 }
 
 .term-qa-dialog__col-action {
-  width: 78px;
+  width: 62px;
+  text-align: center;
+}
+
+.term-qa-dialog__table td:last-child {
+  text-align: center;
 }
 
 .term-qa-dialog__cell-text {
@@ -9371,6 +9762,30 @@ onBeforeRouteLeave(async () => {
 .term-qa-dialog__cell-text.is-empty {
   color: #9aa7af;
   font-style: italic;
+}
+
+.term-qa-dialog__issue-cell {
+  min-width: 0;
+}
+
+.term-qa-dialog__issue-title,
+.term-qa-dialog__issue-suggestion {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.term-qa-dialog__issue-title {
+  color: #233941;
+  font-weight: 600;
+}
+
+.term-qa-dialog__issue-suggestion {
+  margin-top: 3px;
+  color: #637780;
+  font-size: 11px;
 }
 
 .term-qa-dialog__table tr:last-child td {
@@ -9402,35 +9817,94 @@ onBeforeRouteLeave(async () => {
   font-weight: 700;
 }
 
-.term-qa-dialog__status {
-  display: inline-flex;
-  align-items: center;
-  min-height: 22px;
-  padding: 2px 7px;
-  border-radius: 999px;
-  background: #fff4e5;
-  color: #8a4b10;
-  font-size: 12px;
-  font-weight: 700;
-  white-space: nowrap;
-}
-
-.term-qa-dialog__status.is-ignored {
-  background: #edf2f3;
-  color: #64747c;
-}
-
-.term-qa-dialog__ignored-meta {
-  display: block;
-  margin-top: 4px;
-  color: #7c8b92;
-  font-size: 11px;
-}
-
 .term-qa-dialog__inline-action {
-  min-height: 28px;
-  padding: 4px 8px;
+  min-height: 26px;
+  padding: 3px 8px;
   font-size: 12px;
+}
+
+.quality-qa-adjust-dialog {
+  display: grid;
+  gap: 14px;
+}
+
+.quality-qa-adjust-dialog__loading {
+  min-height: 180px;
+}
+
+.quality-qa-adjust-dialog__summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color, #dbe3ea);
+  border-radius: 8px;
+  background: var(--surface-muted, #f8fafc);
+}
+
+.quality-qa-adjust-dialog__summary span {
+  color: var(--text-muted, #64748b);
+  font-size: 13px;
+}
+
+.quality-qa-adjust-dialog__summary strong.is-ok {
+  color: #227f58;
+}
+
+.quality-qa-adjust-dialog__summary strong.is-warn {
+  color: #b54708;
+}
+
+.quality-qa-adjust-dialog__quick-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.quality-qa-adjust-dialog__quick-actions .button {
+  min-height: 30px;
+  padding: 5px 10px;
+  font-size: 12px;
+}
+
+.quality-qa-adjust-dialog__options {
+  display: grid;
+  gap: 8px;
+  max-height: min(360px, 48vh);
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.quality-qa-adjust-dialog__option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color, #dbe3ea);
+  border-radius: 8px;
+  background: #ffffff;
+  cursor: pointer;
+}
+
+.quality-qa-adjust-dialog__option:hover {
+  background: #f3faf8;
+}
+
+.quality-qa-adjust-dialog__option input {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: #0d7a68;
+}
+
+.quality-qa-adjust-dialog__option span {
+  min-width: 0;
+  color: var(--text-primary, #1f2f36);
+  font-size: 13px;
+  line-height: 1.35;
 }
 
 .workbench-toolbar__progress {

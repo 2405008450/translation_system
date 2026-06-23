@@ -722,11 +722,17 @@ CREATE TABLE IF NOT EXISTS file_assignments (
     assigned_at TIMESTAMP NOT NULL DEFAULT NOW(),
     revoked_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
     revoked_at TIMESTAMP,
-    status VARCHAR(20) NOT NULL DEFAULT 'active'
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    segment_range_start INTEGER,
+    segment_range_end INTEGER
 );
 
 ALTER TABLE IF EXISTS file_assignments
     ADD COLUMN IF NOT EXISTS workflow_step_id UUID REFERENCES project_workflow_steps(id) ON DELETE CASCADE;
+ALTER TABLE IF EXISTS file_assignments
+    ADD COLUMN IF NOT EXISTS segment_range_start INTEGER;
+ALTER TABLE IF EXISTS file_assignments
+    ADD COLUMN IF NOT EXISTS segment_range_end INTEGER;
 
 CREATE TABLE IF NOT EXISTS assignment_events (
     id UUID PRIMARY KEY DEFAULT (

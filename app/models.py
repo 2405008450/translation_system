@@ -754,6 +754,8 @@ class FileAssignment(Base):
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="active", server_default=text("'active'")
     )
+    segment_range_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    segment_range_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     file_record: Mapped["FileRecord"] = relationship("FileRecord", back_populates="file_assignments")
     project: Mapped["Project"] = relationship("Project")

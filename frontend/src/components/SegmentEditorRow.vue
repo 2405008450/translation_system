@@ -101,6 +101,11 @@ interface CommittedEditorContent {
   html: string | null
 }
 
+interface EditorTextRange {
+  start: number
+  end: number
+}
+
 type HighlightKind = 'term' | 'search' | 'qa'
 type HighlightPart = { text: string; highlight: boolean; kind?: HighlightKind; title?: string }
 type BasicFormatTag = 'b' | 'i' | 'u' | 's' | 'sub' | 'sup'
@@ -113,6 +118,7 @@ const undoStack = ref<EditorHistorySnapshot[]>([])
 const redoStack = ref<EditorHistorySnapshot[]>([])
 const isApplyingHistory = ref(false)
 const compositionSnapshotRecorded = ref(false)
+const lastTargetSelectionRange = ref<EditorTextRange | null>(null)
 let lastHistorySnapshotAt = 0
 let lastHistoryInputKind = ''
 let preserveNextTargetSync = false
@@ -731,15 +737,7 @@ function serializeEditorContentWithFormat(node: Node): string {
   return ''
 }
 
-function saveSerializableCaretPosition(el: HTMLElement): number {
-  const selection = window.getSelection()
-  if (!selection || selection.rangeCount === 0) return 0
-
-  const range = selection.getRangeAt(0)
-  if (!el.contains(range.startContainer)) {
-    return 0
-  }
-
+function getSerializableOffsetForPosition(el: HTMLElement, container: Node, positionOffset: number): number {
   let offset = 0
   let found = false
 
@@ -748,13 +746,13 @@ function saveSerializableCaretPosition(el: HTMLElement): number {
       return true
     }
 
-    if (node === range.startContainer) {
+    if (node === container) {
       if (node.nodeType === Node.TEXT_NODE) {
         offset += isRevisionDeleteNode(node)
           ? 0
-          : (node.textContent || '').slice(0, range.startOffset).length
+          : (node.textContent || '').slice(0, positionOffset).length
       } else {
-        const children = Array.from(node.childNodes).slice(0, range.startOffset)
+        const children = Array.from(node.childNodes).slice(0, positionOffset)
         offset += children.reduce((total, child) => total + getSerializableNodeLength(child), 0)
       }
       found = true
@@ -778,55 +776,125 @@ function saveSerializableCaretPosition(el: HTMLElement): number {
   return offset
 }
 
-function restoreSerializableCaretPosition(el: HTMLElement, offset: number) {
+function saveSerializableCaretPosition(el: HTMLElement): number {
   const selection = window.getSelection()
-  if (!selection) return
+  if (!selection || selection.rangeCount === 0) return 0
 
-  const range = document.createRange()
+  const range = selection.getRangeAt(0)
+  if (!el.contains(range.startContainer)) {
+    return 0
+  }
+
+  return getSerializableOffsetForPosition(el, range.startContainer, range.startOffset)
+}
+
+function getSerializableSelectionRange(el: HTMLElement): EditorTextRange | null {
+  const selection = window.getSelection()
+  if (!selection || selection.rangeCount === 0) return null
+
+  const range = selection.getRangeAt(0)
+  if (!el.contains(range.startContainer) || !el.contains(range.endContainer)) {
+    return null
+  }
+
+  const start = getSerializableOffsetForPosition(el, range.startContainer, range.startOffset)
+  const end = getSerializableOffsetForPosition(el, range.endContainer, range.endOffset)
+  return {
+    start: Math.min(start, end),
+    end: Math.max(start, end),
+  }
+}
+
+function getNodeIndex(node: Node): number {
+  return Array.from(node.parentNode?.childNodes || []).findIndex((child) => child === node)
+}
+
+function resolveSerializablePosition(el: HTMLElement, targetOffset: number): { node: Node; offset: number } {
+  const normalizedOffset = Math.max(0, targetOffset)
   let currentOffset = 0
-  let found = false
+  let fallback: { node: Node; offset: number } = { node: el, offset: el.childNodes.length }
+  let resolved: { node: Node; offset: number } | null = null
 
   function traverse(node: Node): boolean {
     if (isRevisionDeleteNode(node)) {
       return false
     }
+
     if (node.nodeType === Node.TEXT_NODE) {
       const textLength = node.textContent?.length || 0
-      if (currentOffset + textLength >= offset) {
-        range.setStart(node, offset - currentOffset)
-        range.collapse(true)
+      if (currentOffset + textLength >= normalizedOffset) {
+        resolved = {
+          node,
+          offset: Math.max(0, Math.min(textLength, normalizedOffset - currentOffset)),
+        }
         return true
       }
       currentOffset += textLength
-    } else if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR') {
-      if (currentOffset + 1 >= offset) {
-        range.setStartBefore(node)
-        range.collapse(true)
+      fallback = { node, offset: textLength }
+      return false
+    }
+
+    if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR') {
+      const parent = node.parentNode || el
+      const index = Math.max(0, getNodeIndex(node))
+      if (currentOffset + 1 >= normalizedOffset) {
+        resolved = { node: parent, offset: index }
         return true
       }
       currentOffset += 1
-    } else {
-      for (const child of Array.from(node.childNodes)) {
-        if (traverse(child)) return true
-      }
+      fallback = { node: parent, offset: index + 1 }
+      return false
     }
-    return false
+
+    return Array.from(node.childNodes).some((child) => {
+      if (traverse(child)) {
+        return true
+      }
+      return false
+    })
   }
 
-  found = traverse(el)
-  if (!found) {
-    range.selectNodeContents(el)
-    range.collapse(false)
-  }
+  traverse(el)
+  return resolved || fallback
+}
+
+function restoreSerializableCaretPosition(el: HTMLElement, offset: number) {
+  const selection = window.getSelection()
+  if (!selection) return
+
+  const range = document.createRange()
+  const position = resolveSerializablePosition(el, offset)
+  range.setStart(position.node, position.offset)
+  range.collapse(true)
 
   selection.removeAllRanges()
   selection.addRange(range)
+}
+
+function restoreSerializableSelectionRange(el: HTMLElement, textRange: EditorTextRange): boolean {
+  const selection = window.getSelection()
+  if (!selection) return false
+
+  const start = Math.max(0, Math.min(textRange.start, textRange.end))
+  const end = Math.max(start, textRange.end)
+  const startPosition = resolveSerializablePosition(el, start)
+  const endPosition = resolveSerializablePosition(el, end)
+  const range = document.createRange()
+  range.setStart(startPosition.node, startPosition.offset)
+  range.setEnd(endPosition.node, endPosition.offset)
+  selection.removeAllRanges()
+  selection.addRange(range)
+  return true
 }
 
 function getCurrentEditorText(): string {
   if (editorRef.value) {
     return serializeEditorContent(editorRef.value)
   }
+  return getTargetStateText()
+}
+
+function getTargetStateText(): string {
   return props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
 }
 
@@ -975,6 +1043,45 @@ function recordEditorUndoBoundary(options: EditorUndoBoundaryOptions = {}) {
   return recorded
 }
 
+function cacheTargetSelectionFromDom() {
+  const editor = editorRef.value
+  if (!editor) {
+    return
+  }
+  const textRange = getSerializableSelectionRange(editor)
+  if (textRange) {
+    lastTargetSelectionRange.value = textRange
+  }
+}
+
+function insertOrReplaceTargetText(text: string): boolean {
+  const editor = editorRef.value
+  if (!editor || props.disabled || isApplyingHistory.value || isComposing.value || !text) {
+    return false
+  }
+
+  const activeRange = getSerializableSelectionRange(editor)
+  const textRange = activeRange
+    || lastTargetSelectionRange.value
+    || {
+      start: getCurrentEditorText().length,
+      end: getCurrentEditorText().length,
+    }
+
+  recordEditorUndoBoundary({
+    inputType: 'insertTargetTextFromMatchPanel',
+    data: text,
+    preserveNextTargetSync: true,
+  })
+  editor.focus({ preventScroll: true })
+  restoreSerializableSelectionRange(editor, textRange)
+  document.execCommand('insertText', false, text)
+  const caretOffset = Math.min(textRange.start, textRange.end) + text.length
+  lastTargetSelectionRange.value = { start: caretOffset, end: caretOffset }
+  handleInput()
+  return true
+}
+
 function shouldPreserveHistoryForStateSync() {
   if (preserveNextTargetSync || isFocused.value || isApplyingHistory.value) {
     return true
@@ -1025,9 +1132,11 @@ function redoEditorChange() {
 function handleFocus() {
   isFocused.value = true
   emit('focus', segmentKey.value)
+  cacheTargetSelectionFromDom()
 }
 
 function handleBlur() {
+  cacheTargetSelectionFromDom()
   commitEditorContent()
   isFocused.value = false
   resetHistoryGroup()
@@ -1050,6 +1159,7 @@ function handleClick(event: MouseEvent) {
     emit('ctrlClick', segmentKey.value, event)
     return
   }
+  cacheTargetSelectionFromDom()
   emit('activateTarget', segmentKey.value)
 }
 
@@ -1230,6 +1340,7 @@ function handleInput() {
   if (!editorRef.value) return
   if (isApplyingHistory.value) return
   if (isComposing.value) return
+  cacheTargetSelectionFromDom()
 
   // 检查是否有格式标签
   const cleanHtml = serializeEditorContentWithFormat(editorRef.value)
@@ -1526,6 +1637,17 @@ function syncEditorHtmlFromState(preserveCaret: boolean) {
   }
 }
 
+function syncFocusedTargetHighlightsFromState() {
+  const editor = editorRef.value
+  if (!editor || isApplyingHistory.value || isComposing.value) {
+    return
+  }
+  if (isFocused.value && serializeEditorContent(editor) !== getTargetStateText()) {
+    return
+  }
+  syncEditorHtmlFromState(isFocused.value)
+}
+
 function syncSourceEditorFromState(preserveCaret: boolean) {
   const editor = sourceEditorRef.value
   if (!editor) {
@@ -1558,6 +1680,7 @@ onMounted(() => {
 watch(
   () => props.segment.sentence_id,
   () => {
+    lastTargetSelectionRange.value = null
     clearEditorHistory()
   }
 )
@@ -1599,10 +1722,21 @@ watch(
   { flush: 'post' },
 )
 
+watch(
+  () => (props.matchedTerms || [])
+    .map((term) => `${term.id}\u0000${term.source_text}\u0000${term.target_text}`)
+    .join('\u0001'),
+  () => {
+    syncFocusedTargetHighlightsFromState()
+  },
+  { flush: 'post' },
+)
+
 defineExpose({
   undoEditorChange,
   redoEditorChange,
   recordEditorUndoBoundary,
+  insertOrReplaceTargetText,
   commitEditorContent,
   canUndoEditorChange,
   canRedoEditorChange,
@@ -1767,8 +1901,10 @@ watch(
           @focus="handleFocus"
           @blur="handleBlur"
           @mousedown="handleSelectMouseDown"
+          @mouseup="cacheTargetSelectionFromDom"
           @click.stop="handleClick"
           @keydown="handleKeydown"
+          @keyup="cacheTargetSelectionFromDom"
           @compositionstart="handleCompositionStart"
           @compositionend="handleCompositionEnd"
           @beforeinput="handleBeforeInput"

@@ -206,7 +206,15 @@ interface AssignmentDraft {
   assignee_id: string
   workflow_step_id: string
   file_record_ids: Set<string>
+  file_ranges: Map<string, AssignmentFileRangeDraft>
 }
+
+interface AssignmentFileRangeDraft {
+  range_start: number | null
+  range_end: number | null
+}
+
+type AssignmentFileRangeField = 'range_start' | 'range_end'
 
 type AssignmentUserTypeFilter = 'all' | 'internal' | 'external'
 type AssignmentUserStateFilter = 'all' | 'selected' | 'unselected'
@@ -662,6 +670,7 @@ const tabs = computed(() => ([
   { key: 'quote' as const, label: t('projectDetail.tabs.quote'), disabled: true },
 ]))
 const tableRows = computed<ProjectFileItem[]>(() => project.value?.files ?? [])
+const projectFileById = computed(() => new Map(tableRows.value.map((file) => [file.id, file])))
 const fileStatusFilterOptions = computed(() => {
   const counts = new Map<string, number>()
   for (const file of tableRows.value) {
@@ -1918,11 +1927,25 @@ async function loadProjectAssignments() {
     if (!activeAssignmentWorkflowStepId.value) {
       activeAssignmentWorkflowStepId.value = data.workflow_steps?.[0]?.id || projectWorkflowSteps.value[0]?.id || ''
     }
-    assignmentDrafts.value = data.assignments.map((assignment) => ({
-      assignee_id: assignment.assignee_id,
-      workflow_step_id: assignment.workflow_step_id || activeAssignmentWorkflowStepId.value,
-      file_record_ids: new Set(assignment.file_record_ids),
-    }))
+    assignmentDrafts.value = data.assignments.map((assignment) => {
+      const fileRanges = new Map<string, AssignmentFileRangeDraft>()
+      const fileIds = new Set(assignment.file_record_ids)
+      for (const range of assignment.file_ranges || []) {
+        fileIds.add(range.file_record_id)
+        if (range.range_start !== null || range.range_end !== null) {
+          fileRanges.set(range.file_record_id, {
+            range_start: range.range_start,
+            range_end: range.range_end,
+          })
+        }
+      }
+      return {
+        assignee_id: assignment.assignee_id,
+        workflow_step_id: assignment.workflow_step_id || activeAssignmentWorkflowStepId.value,
+        file_record_ids: fileIds,
+        file_ranges: fileRanges,
+      }
+    })
   } catch (error) {
     toast.error(getErrorMessage(error, '项目指派加载失败。'))
   } finally {
@@ -1985,6 +2008,7 @@ function toggleAssignmentUser(user: User) {
       assignee_id: user.id,
       workflow_step_id: workflowStepId,
       file_record_ids: new Set<string>(),
+      file_ranges: new Map<string, AssignmentFileRangeDraft>(),
     },
   ]
 }
@@ -2000,14 +2024,17 @@ function toggleAssignmentFile(userId: string, fileRecordId: string) {
       return draft
     }
     const nextFileIds = new Set(draft.file_record_ids)
+    const nextFileRanges = new Map(draft.file_ranges)
     if (nextFileIds.has(fileRecordId)) {
       nextFileIds.delete(fileRecordId)
+      nextFileRanges.delete(fileRecordId)
     } else {
       nextFileIds.add(fileRecordId)
     }
     return {
       ...draft,
       file_record_ids: nextFileIds,
+      file_ranges: nextFileRanges,
     }
   })
 }
@@ -2059,9 +2086,11 @@ function toggleAssignmentMergeView(draft: AssignmentDraft, view: MergeView) {
       return item
     }
     const nextFileIds = new Set(item.file_record_ids)
+    const nextFileRanges = new Map(item.file_ranges)
     for (const fileId of fileIds) {
       if (shouldRemove) {
         nextFileIds.delete(fileId)
+        nextFileRanges.delete(fileId)
       } else {
         nextFileIds.add(fileId)
       }
@@ -2069,6 +2098,7 @@ function toggleAssignmentMergeView(draft: AssignmentDraft, view: MergeView) {
     return {
       ...item,
       file_record_ids: nextFileIds,
+      file_ranges: nextFileRanges,
     }
   })
 }
@@ -2101,16 +2131,19 @@ function updateFilteredAssignmentFiles(userId: string, checked: boolean) {
       return item
     }
     const nextFileIds = new Set(item.file_record_ids)
+    const nextFileRanges = new Map(item.file_ranges)
     for (const fileId of filteredFileIds) {
       if (checked) {
         nextFileIds.add(fileId)
       } else {
         nextFileIds.delete(fileId)
+        nextFileRanges.delete(fileId)
       }
     }
     return {
       ...item,
       file_record_ids: nextFileIds,
+      file_ranges: nextFileRanges,
     }
   })
 }
@@ -2121,6 +2154,121 @@ function selectFilteredAssignmentFiles(userId: string) {
 
 function clearFilteredAssignmentFiles(userId: string) {
   updateFilteredAssignmentFiles(userId, false)
+}
+
+function getAssignmentRangeInputValue(
+  draft: AssignmentDraft,
+  fileRecordId: string,
+  field: AssignmentFileRangeField,
+) {
+  const value = draft.file_ranges.get(fileRecordId)?.[field]
+  return value ?? ''
+}
+
+function getAssignmentInputValue(event: Event) {
+  return event.target instanceof HTMLInputElement ? event.target.value : ''
+}
+
+function parseAssignmentRangeInput(value: string) {
+  const trimmed = value.trim()
+  if (!trimmed) {
+    return null
+  }
+  const numericValue = Number(trimmed)
+  return Number.isFinite(numericValue) ? numericValue : null
+}
+
+function updateAssignmentFileRange(
+  userId: string,
+  fileRecordId: string,
+  field: AssignmentFileRangeField,
+  value: string,
+) {
+  const workflowStepId = activeAssignmentWorkflowStepId.value
+  assignmentDrafts.value = assignmentDrafts.value.map((draft) => {
+    if (draft.assignee_id !== userId || draft.workflow_step_id !== workflowStepId) {
+      return draft
+    }
+    const nextFileIds = new Set(draft.file_record_ids)
+    const nextFileRanges = new Map(draft.file_ranges)
+    const currentRange = nextFileRanges.get(fileRecordId) ?? { range_start: null, range_end: null }
+    const nextRange = {
+      ...currentRange,
+      [field]: parseAssignmentRangeInput(value),
+    }
+    nextFileIds.add(fileRecordId)
+    if (nextRange.range_start === null && nextRange.range_end === null) {
+      nextFileRanges.delete(fileRecordId)
+    } else {
+      nextFileRanges.set(fileRecordId, nextRange)
+    }
+    return {
+      ...draft,
+      file_record_ids: nextFileIds,
+      file_ranges: nextFileRanges,
+    }
+  })
+}
+
+function getAssignmentFileSegmentCount(fileRecordId: string) {
+  return Number(projectFileById.value.get(fileRecordId)?.total_segments || 0)
+}
+
+function getAssignmentFileLabel(fileRecordId: string) {
+  return projectFileById.value.get(fileRecordId)?.filename || fileRecordId
+}
+
+function validateAssignmentRanges() {
+  for (const draft of assignmentDrafts.value) {
+    for (const fileRecordId of draft.file_record_ids) {
+      const range = draft.file_ranges.get(fileRecordId)
+      if (!range || (range.range_start === null && range.range_end === null)) {
+        continue
+      }
+      const fileLabel = getAssignmentFileLabel(fileRecordId)
+      if (range.range_start === null || range.range_end === null) {
+        toast.error(`${fileLabel} 的句段范围需要同时填写起始段和结束段。`)
+        return false
+      }
+      if (
+        !Number.isInteger(range.range_start)
+        || !Number.isInteger(range.range_end)
+        || range.range_start < 1
+        || range.range_end < 1
+      ) {
+        toast.error(`${fileLabel} 的句段范围必须是大于 0 的整数。`)
+        return false
+      }
+      if (range.range_start > range.range_end) {
+        toast.error(`${fileLabel} 的起始段不能大于结束段。`)
+        return false
+      }
+      const segmentCount = getAssignmentFileSegmentCount(fileRecordId)
+      if (segmentCount > 0 && range.range_end > segmentCount) {
+        toast.error(`${fileLabel} 的结束段不能超过 ${segmentCount}。`)
+        return false
+      }
+    }
+  }
+  return true
+}
+
+function buildAssignmentFilePayload(draft: AssignmentDraft) {
+  const file_record_ids: string[] = []
+  const file_ranges: Array<{ file_record_id: string; range_start: number; range_end: number }> = []
+  for (const fileRecordId of draft.file_record_ids) {
+    const range = draft.file_ranges.get(fileRecordId)
+    if (range && range.range_start !== null && range.range_end !== null) {
+      file_ranges.push({
+        file_record_id: fileRecordId,
+        range_start: range.range_start,
+        range_end: range.range_end,
+      })
+    } else {
+      file_record_ids.push(fileRecordId)
+    }
+  }
+  return { file_record_ids, file_ranges }
 }
 
 function getAssignmentEventActionLabel(action: string) {
@@ -2196,15 +2344,22 @@ async function saveAssignment() {
   if (!project.value) {
     return
   }
+  if (!validateAssignmentRanges()) {
+    return
+  }
   savingAssignment.value = true
   try {
     await http.patch(`/projects/${project.value.id}/assignments`, {
-      assignments: assignmentDrafts.value.map((draft) => ({
-        assignee_id: draft.assignee_id,
-        workflow_step_id: draft.workflow_step_id,
-        file_record_ids: Array.from(draft.file_record_ids),
-        merge_view_ids: getCheckedAssignmentMergeViewIds(draft),
-      })),
+      assignments: assignmentDrafts.value.map((draft) => {
+        const filePayload = buildAssignmentFilePayload(draft)
+        return {
+          assignee_id: draft.assignee_id,
+          workflow_step_id: draft.workflow_step_id,
+          file_record_ids: filePayload.file_record_ids,
+          file_ranges: filePayload.file_ranges,
+          merge_view_ids: getCheckedAssignmentMergeViewIds(draft),
+        }
+      }),
     })
     toast.success('项目指派已更新。')
     showAssignmentDialog.value = false
@@ -6824,25 +6979,49 @@ onBeforeUnmount(() => {
                 没有符合条件的文件
               </p>
               <div v-else class="pd-assignment-file-list">
-                <label
+                <div
                   v-for="file in getFilteredAssignmentFiles(draft)"
                   :key="`${draft.assignee_id}-${file.id}`"
                   class="pd-assignment-file-option"
                 >
-                  <input
-                    type="checkbox"
-                    :checked="isFileCheckedForUser(draft.assignee_id, file.id)"
-                  :disabled="savingAssignment"
-                  @change="toggleAssignmentFile(draft.assignee_id, file.id)"
-                />
-                  <span
-                    @mouseenter="showAssignmentTooltip($event, file.filename)"
-                    @mousemove="updateAssignmentTooltipPosition"
-                    @mouseleave="hideAssignmentTooltip"
-                  >
-                    {{ file.filename }}
-                  </span>
-                </label>
+                  <label class="pd-assignment-file-check">
+                    <input
+                      type="checkbox"
+                      :checked="isFileCheckedForUser(draft.assignee_id, file.id)"
+                      :disabled="savingAssignment"
+                      @change="toggleAssignmentFile(draft.assignee_id, file.id)"
+                    />
+                    <span
+                      @mouseenter="showAssignmentTooltip($event, file.filename)"
+                      @mousemove="updateAssignmentTooltipPosition"
+                      @mouseleave="hideAssignmentTooltip"
+                    >
+                      {{ file.filename }}
+                    </span>
+                  </label>
+                  <div class="pd-assignment-range-controls">
+                    <small>{{ getAssignmentFileSegmentCount(file.id) }} 段</small>
+                    <input
+                      type="number"
+                      min="1"
+                      inputmode="numeric"
+                      placeholder="起始"
+                      :value="getAssignmentRangeInputValue(draft, file.id, 'range_start')"
+                      :disabled="savingAssignment || !isFileCheckedForUser(draft.assignee_id, file.id)"
+                      @input="updateAssignmentFileRange(draft.assignee_id, file.id, 'range_start', getAssignmentInputValue($event))"
+                    />
+                    <span>-</span>
+                    <input
+                      type="number"
+                      min="1"
+                      inputmode="numeric"
+                      placeholder="结束"
+                      :value="getAssignmentRangeInputValue(draft, file.id, 'range_end')"
+                      :disabled="savingAssignment || !isFileCheckedForUser(draft.assignee_id, file.id)"
+                      @input="updateAssignmentFileRange(draft.assignee_id, file.id, 'range_end', getAssignmentInputValue($event))"
+                    />
+                  </div>
+                </div>
               </div>
             </section>
           </div>
@@ -8841,8 +9020,9 @@ onBeforeUnmount(() => {
 }
 
 .pd-assignment-file-option {
-  display: flex;
-  align-items: flex-start;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
   gap: 8px;
   min-height: 30px;
   padding: 6px 8px;
@@ -8856,10 +9036,49 @@ onBeforeUnmount(() => {
   background: var(--surface-muted);
 }
 
-.pd-assignment-file-option span {
+.pd-assignment-file-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
   min-width: 0;
+}
+
+.pd-assignment-file-check span {
+  min-width: 0;
+  flex: 1;
   overflow-wrap: anywhere;
   white-space: normal;
+}
+
+.pd-assignment-range-controls {
+  display: grid;
+  grid-template-columns: auto 68px auto 68px;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.pd-assignment-range-controls input {
+  width: 68px;
+  min-width: 0;
+  padding: 4px 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-panel);
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.pd-assignment-range-controls input:focus {
+  border-color: var(--brand-500);
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--brand-500) 18%, transparent);
+}
+
+.pd-assignment-range-controls input:disabled {
+  background: var(--surface-muted);
+  color: var(--text-muted);
 }
 
 .pd-assignment-mini-empty {
@@ -10443,6 +10662,19 @@ onBeforeUnmount(() => {
 
   .pd-assignment-file-action {
     flex: 1 1 140px;
+  }
+
+  .pd-assignment-file-option {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .pd-assignment-range-controls {
+    grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr);
+  }
+
+  .pd-assignment-range-controls input {
+    width: 100%;
   }
 
   .pd-settings-control,

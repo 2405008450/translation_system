@@ -1118,6 +1118,8 @@ export const useSegmentStore = defineStore('segment', () => {
       setSegmentStatusStats(buildMergeViewStatusStats(detail))
 
       const page = await fetchMergeViewSegmentPage(viewId, resolved)
+      currentPage.value = Math.floor((page.skip || 0) / Math.max(page.limit || resolved.pageSize, 1)) + 1
+      pageSize.value = page.limit || resolved.pageSize
       matchedSegmentCount.value = page.matched_segments
       mergeViewGroups.value = page.groups
       changeCursor = page.server_time || new Date().toISOString()
@@ -1155,6 +1157,8 @@ export const useSegmentStore = defineStore('segment', () => {
         workflowStepIds: [...resolved.workflowStepIds],
       }
       const page = await fetchMergeViewSegmentPage(mergeViewId.value, resolved)
+      currentPage.value = Math.floor((page.skip || 0) / Math.max(page.limit || resolved.pageSize, 1)) + 1
+      pageSize.value = page.limit || resolved.pageSize
       matchedSegmentCount.value = page.matched_segments
       mergeViewGroups.value = page.groups
       changeCursor = page.server_time || changeCursor

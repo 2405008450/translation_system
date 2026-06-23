@@ -2103,10 +2103,17 @@ class FileRecordAssignmentRequest(BaseModel):
     assignee_id: UUID | None = None
 
 
+class ProjectAssignmentFileRangeRequest(BaseModel):
+    file_record_id: UUID
+    range_start: int | None = Field(default=None, ge=1)
+    range_end: int | None = Field(default=None, ge=1)
+
+
 class ProjectAssignmentEntryRequest(BaseModel):
     assignee_id: UUID
     workflow_step_id: UUID | None = None
     file_record_ids: list[UUID] = Field(default_factory=list)
+    file_ranges: list[ProjectAssignmentFileRangeRequest] = Field(default_factory=list)
     merge_view_ids: list[UUID] = Field(default_factory=list)
 
 
@@ -2781,6 +2788,16 @@ ASSIGNMENT_EVENT_FILE_GRANTED = "file_permission_granted"
 ASSIGNMENT_EVENT_FILE_REVOKED = "file_permission_revoked"
 
 
+AssignmentTarget = tuple[UUID, int | None, int | None]
+
+
+@dataclass(frozen=True)
+class SegmentWritableAssignment:
+    workflow_step_id: UUID
+    range_start: int | None = None
+    range_end: int | None = None
+
+
 def _get_record_session(record: Any) -> Session | None:
     try:
         return object_session(record)
@@ -2840,6 +2857,125 @@ def _get_active_file_assignment_step_ids(
         .all()
     )
     return {row.workflow_step_id for row in rows if row.workflow_step_id is not None}
+
+
+def _get_user_writable_assignments(
+    db: Session | None,
+    file_record: FileRecord,
+    user_id: UUID | None,
+) -> list[SegmentWritableAssignment]:
+    if db is None or user_id is None:
+        return []
+    if not _has_active_project_assignment(db, file_record.project_id, user_id):
+        return []
+    rows = (
+        db.query(
+            FileAssignment.workflow_step_id,
+            FileAssignment.segment_range_start,
+            FileAssignment.segment_range_end,
+        )
+        .filter(
+            FileAssignment.file_record_id == file_record.id,
+            FileAssignment.assignee_id == user_id,
+            FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+        )
+        .all()
+    )
+    first_step_id = _get_first_workflow_step_id(db, file_record.project_id)
+    assignments: list[SegmentWritableAssignment] = []
+    for row in rows:
+        workflow_step_id = row.workflow_step_id or first_step_id
+        if workflow_step_id is None:
+            continue
+        assignments.append(
+            SegmentWritableAssignment(
+                workflow_step_id=workflow_step_id,
+                range_start=row.segment_range_start,
+                range_end=row.segment_range_end,
+            )
+        )
+    return assignments
+
+
+def _display_index_in_assignment_range(
+    zero_based_display_index: int | None,
+    range_start: int | None,
+    range_end: int | None,
+) -> bool:
+    if range_start is None and range_end is None:
+        return True
+    if zero_based_display_index is None or range_start is None or range_end is None:
+        return False
+    one_based_display_index = zero_based_display_index + 1
+    return range_start <= one_based_display_index <= range_end
+
+
+def _can_write_segment_with_assignments(
+    workflow_step_id: UUID | None,
+    zero_based_display_index: int | None,
+    writable_assignments: Iterable[SegmentWritableAssignment],
+) -> bool:
+    if workflow_step_id is None:
+        return False
+    return any(
+        assignment.workflow_step_id == workflow_step_id
+        and _display_index_in_assignment_range(
+            zero_based_display_index,
+            assignment.range_start,
+            assignment.range_end,
+        )
+        for assignment in writable_assignments
+    )
+
+
+def _apply_segment_assignment_visibility_filter(
+    db: Session,
+    query,
+    file_record: FileRecord,
+    current_user: User,
+):
+    if can_access_all_projects(current_user):
+        return query
+    visible_assignments = _get_user_writable_assignments(db, file_record, current_user.id)
+    if not visible_assignments:
+        return query.filter(literal(False))
+
+    ordered_segments = (
+        db.query(
+            Segment.id.label("id"),
+            Segment.workflow_step_id.label("workflow_step_id"),
+            func.row_number()
+            .over(
+                order_by=(
+                    Segment.block_index.asc(),
+                    Segment.row_index.asc().nullsfirst(),
+                    Segment.cell_index.asc().nullsfirst(),
+                    Segment.sentence_id.asc(),
+                )
+            )
+            .label("display_index"),
+        )
+        .filter(Segment.file_record_id == file_record.id)
+        .subquery()
+    )
+
+    visibility_conditions = []
+    for assignment in visible_assignments:
+        condition = ordered_segments.c.workflow_step_id == assignment.workflow_step_id
+        if assignment.range_start is not None and assignment.range_end is not None:
+            condition = and_(
+                condition,
+                ordered_segments.c.display_index >= assignment.range_start,
+                ordered_segments.c.display_index <= assignment.range_end,
+            )
+        elif assignment.range_start is not None or assignment.range_end is not None:
+            continue
+        visibility_conditions.append(condition)
+
+    if not visibility_conditions:
+        return query.filter(literal(False))
+    visible_segment_ids = db.query(ordered_segments.c.id).filter(or_(*visibility_conditions))
+    return query.filter(Segment.id.in_(visible_segment_ids))
 
 
 def _has_active_file_assignment_for_step(
@@ -2907,7 +3043,15 @@ def _require_segment_work_access(
     current_user: User,
 ) -> None:
     workflow_step_id = _ensure_segment_workflow_step(db, file_record, segment)
-    if not _can_write_workflow_step(db, file_record, current_user, workflow_step_id):
+    if can_access_all_projects(current_user):
+        return
+    display_index_map = _get_segment_display_index_map(db, file_record.id, [segment])
+    writable_assignments = _get_user_writable_assignments(db, file_record, current_user.id)
+    if not _can_write_segment_with_assignments(
+        workflow_step_id,
+        display_index_map.get(segment.id),
+        writable_assignments,
+    ):
         raise HTTPException(status_code=403, detail="当前账号没有编辑该流程阶段句段的权限。")
 
 
@@ -2921,11 +3065,16 @@ def _filter_writable_segments(
         for segment in segments:
             _ensure_segment_workflow_step(db, file_record, segment)
         return segments
-    writable_step_ids = _get_file_record_writable_workflow_step_ids(db, file_record, current_user)
+    writable_assignments = _get_user_writable_assignments(db, file_record, current_user.id)
+    display_index_map = _get_segment_display_index_map(db, file_record.id, segments)
     result: list[Segment] = []
     for segment in segments:
         workflow_step_id = _ensure_segment_workflow_step(db, file_record, segment)
-        if workflow_step_id in writable_step_ids:
+        if _can_write_segment_with_assignments(
+            workflow_step_id,
+            display_index_map.get(segment.id),
+            writable_assignments,
+        ):
             result.append(segment)
     return result
 
@@ -3166,11 +3315,40 @@ def _get_project_or_404(db: Session, project_id: UUID) -> Project:
     return project
 
 
+def _assignment_target_sort_key(target: AssignmentTarget) -> tuple[str, int, int]:
+    file_record_id, range_start, range_end = target
+    return (str(file_record_id), range_start or 0, range_end or 0)
+
+
+def _serialize_assignment_target_payload(target: AssignmentTarget) -> dict[str, Any]:
+    file_record_id, range_start, range_end = target
+    return {
+        "file_record_id": str(file_record_id),
+        "range_start": range_start,
+        "range_end": range_end,
+    }
+
+
+def _assignment_ranges_overlap(
+    left_start: int | None,
+    left_end: int | None,
+    right_start: int | None,
+    right_end: int | None,
+) -> bool:
+    if left_start is None and left_end is None:
+        return True
+    if right_start is None and right_end is None:
+        return True
+    if left_start is None or left_end is None or right_start is None or right_end is None:
+        return True
+    return max(left_start, right_start) <= min(left_end, right_end)
+
+
 def _validate_assignment_payload(
     db: Session,
     project: Project,
     payload: ProjectAssignmentsRequest,
-) -> tuple[dict[tuple[UUID, UUID], set[UUID]], set[UUID]]:
+) -> tuple[dict[tuple[UUID, UUID], set[AssignmentTarget]], set[UUID]]:
     project_file_ids = {
         row.id
         for row in db.query(FileRecord.id).filter(FileRecord.project_id == project.id).all()
@@ -3186,7 +3364,26 @@ def _validate_assignment_payload(
     workflow_step_ids = {step.id for step in workflow_steps}
     first_step_id = workflow_steps[0].id
 
-    desired: dict[tuple[UUID, UUID], set[UUID]] = {}
+    ranged_file_ids = {
+        item.file_record_id
+        for entry in payload.assignments
+        for item in (entry.file_ranges or [])
+        if item.range_start is not None or item.range_end is not None
+    }
+    segment_counts_by_file_id: dict[UUID, int] = {}
+    if ranged_file_ids:
+        segment_count_rows = (
+            db.query(Segment.file_record_id, func.count(Segment.id).label("segment_count"))
+            .filter(Segment.file_record_id.in_(ranged_file_ids))
+            .group_by(Segment.file_record_id)
+            .all()
+        )
+        segment_counts_by_file_id = {
+            row.file_record_id: int(row.segment_count or 0)
+            for row in segment_count_rows
+        }
+
+    desired: dict[tuple[UUID, UUID], set[AssignmentTarget]] = {}
     desired_user_ids: set[UUID] = set()
     for entry in payload.assignments:
         assignee = get_user_by_id(db, entry.assignee_id)
@@ -3214,8 +3411,48 @@ def _validate_assignment_payload(
         invalid_file_ids = file_ids - project_file_ids
         if invalid_file_ids:
             raise HTTPException(status_code=400, detail="存在不属于当前项目的文件授权。")
+        file_range_targets: set[AssignmentTarget] = set()
+        for file_range in entry.file_ranges or []:
+            if file_range.file_record_id not in project_file_ids:
+                raise HTTPException(status_code=400, detail="存在不属于当前项目的文件范围授权。")
+            range_start = file_range.range_start
+            range_end = file_range.range_end
+            if (range_start is None) != (range_end is None):
+                raise HTTPException(status_code=400, detail="句段范围必须同时填写起始段和结束段。")
+            if range_start is not None and range_end is not None:
+                if range_start > range_end:
+                    raise HTTPException(status_code=400, detail="句段范围起始段不能大于结束段。")
+                segment_count = segment_counts_by_file_id.get(file_range.file_record_id, 0)
+                if segment_count <= 0:
+                    raise HTTPException(status_code=400, detail="设置句段范围前，文件必须已有句段。")
+                if range_end > segment_count:
+                    raise HTTPException(status_code=400, detail="句段范围不能超过文件句段总数。")
+            file_range_targets.add((file_range.file_record_id, range_start, range_end))
         desired_user_ids.add(assignee.id)
-        desired.setdefault((assignee.id, workflow_step_id), set()).update(file_ids)
+        targets = desired.setdefault((assignee.id, workflow_step_id), set())
+        targets.update((file_record_id, None, None) for file_record_id in file_ids)
+        targets.update(file_range_targets)
+
+    ranges_by_file_step: dict[tuple[UUID, UUID], list[tuple[UUID, int | None, int | None]]] = {}
+    for (assignee_id, workflow_step_id), targets in desired.items():
+        for file_record_id, range_start, range_end in targets:
+            ranges_by_file_step.setdefault((workflow_step_id, file_record_id), []).append(
+                (assignee_id, range_start, range_end)
+            )
+    for range_items in ranges_by_file_step.values():
+        sorted_items = sorted(range_items, key=lambda item: (str(item[0]), item[1] or 0, item[2] or 0))
+        for index, current in enumerate(sorted_items):
+            for other in sorted_items[index + 1:]:
+                if current[0] == other[0]:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="同一译者在同一文件同一流程阶段只能设置一个句段范围。",
+                    )
+                if _assignment_ranges_overlap(current[1], current[2], other[1], other[2]):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="同一文件同一流程阶段的句段范围不能重叠。",
+                    )
     return desired, desired_user_ids
 
 
@@ -3265,6 +3502,7 @@ def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, A
         .all()
     )
     files_by_user_step: dict[tuple[UUID, UUID], list[str]] = {}
+    file_ranges_by_user_step: dict[tuple[UUID, UUID], list[dict[str, Any]]] = {}
     first_file_assignment_by_user_step: dict[tuple[UUID, UUID], FileAssignment] = {}
     for file_assignment in file_rows:
         workflow_step_id = file_assignment.workflow_step_id or first_step_id
@@ -3272,6 +3510,11 @@ def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, A
             continue
         key = (file_assignment.assignee_id, workflow_step_id)
         files_by_user_step.setdefault(key, []).append(str(file_assignment.file_record_id))
+        file_ranges_by_user_step.setdefault(key, []).append({
+            "file_record_id": str(file_assignment.file_record_id),
+            "range_start": file_assignment.segment_range_start,
+            "range_end": file_assignment.segment_range_end,
+        })
         first_file_assignment_by_user_step.setdefault(key, file_assignment)
 
     assignment_items: list[dict[str, Any]] = []
@@ -3309,6 +3552,7 @@ def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, A
                 "workflow_step_id": str(workflow_step_id),
                 "workflow_step": _serialize_workflow_step(workflow_step) if workflow_step is not None else None,
                 "file_record_ids": files_by_user_step.get((assignment.assignee_id, workflow_step_id), []),
+                "file_ranges": file_ranges_by_user_step.get((assignment.assignee_id, workflow_step_id), []),
                 "assigned_by_id": str(assigned_by_id) if assigned_by_id else None,
                 "assigned_at": assigned_at.isoformat(),
             })
@@ -3344,7 +3588,7 @@ def _update_project_assignments_by_workflow(
         )
     }
 
-    current_file_assignments: dict[tuple[UUID, UUID], dict[UUID, FileAssignment]] = {}
+    current_file_assignments: dict[tuple[UUID, UUID], dict[AssignmentTarget, FileAssignment]] = {}
     for assignment in (
         db.query(FileAssignment)
         .filter(
@@ -3359,7 +3603,13 @@ def _update_project_assignments_by_workflow(
         current_file_assignments.setdefault(
             (assignment.assignee_id, workflow_step_id),
             {},
-        )[assignment.file_record_id] = assignment
+        )[
+            (
+                assignment.file_record_id,
+                assignment.segment_range_start,
+                assignment.segment_range_end,
+            )
+        ] = assignment
 
     for assignee_id, assignment in list(current_project_assignments.items()):
         if assignee_id in desired_user_ids:
@@ -3400,15 +3650,17 @@ def _update_project_assignments_by_workflow(
             after_payload={"project_id": str(project_id), "status": ASSIGNMENT_STATUS_ACTIVE},
         )
 
-    for key, active_by_file_id in current_file_assignments.items():
+    for key, active_by_target in current_file_assignments.items():
         assignee_id, workflow_step_id = key
-        desired_file_ids = desired.get(key, set())
-        for file_record_id, file_assignment in active_by_file_id.items():
-            if assignee_id in desired_user_ids and file_record_id in desired_file_ids:
+        desired_targets = desired.get(key, set())
+        for target, file_assignment in active_by_target.items():
+            file_record_id, range_start, range_end = target
+            if assignee_id in desired_user_ids and target in desired_targets:
                 continue
             file_assignment.status = ASSIGNMENT_STATUS_REVOKED
             file_assignment.revoked_by_id = current_user.id
             file_assignment.revoked_at = now
+            range_payload = _serialize_assignment_target_payload(target)
             _record_assignment_event(
                 db,
                 project_id=project_id,
@@ -3419,19 +3671,28 @@ def _update_project_assignments_by_workflow(
                 before_payload={
                     "file_record_id": str(file_record_id),
                     "workflow_step_id": str(workflow_step_id),
+                    "range_start": range_start,
+                    "range_end": range_end,
+                    "range": range_payload,
                     "status": ASSIGNMENT_STATUS_ACTIVE,
                 },
                 after_payload={
                     "file_record_id": str(file_record_id),
                     "workflow_step_id": str(workflow_step_id),
+                    "range_start": range_start,
+                    "range_end": range_end,
+                    "range": range_payload,
                     "status": ASSIGNMENT_STATUS_REVOKED,
                 },
             )
 
-    for (assignee_id, workflow_step_id), desired_file_ids in desired.items():
+    db.flush()
+
+    for (assignee_id, workflow_step_id), desired_targets in desired.items():
         active_file_assignments = current_file_assignments.get((assignee_id, workflow_step_id), {})
-        active_file_ids = set(active_file_assignments)
-        for file_record_id in sorted(desired_file_ids - active_file_ids, key=str):
+        active_targets = set(active_file_assignments)
+        for target in sorted(desired_targets - active_targets, key=_assignment_target_sort_key):
+            file_record_id, range_start, range_end = target
             file_assignment = FileAssignment(
                 project_id=project_id,
                 file_record_id=file_record_id,
@@ -3440,8 +3701,11 @@ def _update_project_assignments_by_workflow(
                 assigned_by_id=current_user.id,
                 assigned_at=now,
                 status=ASSIGNMENT_STATUS_ACTIVE,
+                segment_range_start=range_start,
+                segment_range_end=range_end,
             )
             db.add(file_assignment)
+            range_payload = _serialize_assignment_target_payload(target)
             _record_assignment_event(
                 db,
                 project_id=project_id,
@@ -3452,11 +3716,17 @@ def _update_project_assignments_by_workflow(
                 before_payload={
                     "file_record_id": str(file_record_id),
                     "workflow_step_id": str(workflow_step_id),
+                    "range_start": range_start,
+                    "range_end": range_end,
+                    "range": range_payload,
                     "status": None,
                 },
                 after_payload={
                     "file_record_id": str(file_record_id),
                     "workflow_step_id": str(workflow_step_id),
+                    "range_start": range_start,
+                    "range_end": range_end,
+                    "range": range_payload,
                     "status": ASSIGNMENT_STATUS_ACTIVE,
                 },
             )
@@ -7760,14 +8030,20 @@ def _build_segment_workflow_context(
     db: Session,
     file_record: FileRecord,
     current_user: User | None,
-) -> tuple[dict[UUID, ProjectWorkflowStep], set[UUID] | None, bool]:
+) -> tuple[dict[UUID, ProjectWorkflowStep], list[SegmentWritableAssignment] | None, bool]:
     _assign_file_segments_to_first_workflow_step(db, file_record)
     workflow_steps = _load_project_workflow_steps(db, file_record.project_id)
     can_manage = _can_manage_workflow(current_user)
-    writable_step_ids: set[UUID] | None = None
+    writable_assignments: list[SegmentWritableAssignment] | None = None
     if current_user is not None:
-        writable_step_ids = _get_file_record_writable_workflow_step_ids(db, file_record, current_user)
-    return {step.id: step for step in workflow_steps}, writable_step_ids, can_manage
+        if can_access_all_projects(current_user):
+            writable_assignments = [
+                SegmentWritableAssignment(workflow_step_id=step.id)
+                for step in workflow_steps
+            ]
+        else:
+            writable_assignments = _get_user_writable_assignments(db, file_record, current_user.id)
+    return {step.id: step for step in workflow_steps}, writable_assignments, can_manage
 
 
 def _build_target_automatic_numbering_text_map(
@@ -7804,7 +8080,7 @@ def _serialize_workbench_segment(
     target_automatic_numbering_by_sentence_id: dict[str, str] | None = None,
     qa_issues_by_segment_id: dict[UUID, list[SegmentQAIssue]] | None = None,
     workflow_step_by_id: dict[UUID, ProjectWorkflowStep] | None = None,
-    writable_workflow_step_ids: set[UUID] | None = None,
+    writable_workflow_assignments: list[SegmentWritableAssignment] | None = None,
     can_manage: bool = False,
 ) -> dict:
     resolved_source_filename = source_filename
@@ -7828,8 +8104,15 @@ def _serialize_workbench_segment(
         resolved_workflow_step_id = next(iter(workflow_step_by_id.keys()), None)
     workflow_step = workflow_step_by_id.get(resolved_workflow_step_id) if workflow_step_by_id else None
     can_write = True
-    if writable_workflow_step_ids is not None:
-        can_write = bool(can_manage or (resolved_workflow_step_id in writable_workflow_step_ids))
+    if writable_workflow_assignments is not None:
+        can_write = bool(
+            can_manage
+            or _can_write_segment_with_assignments(
+                resolved_workflow_step_id,
+                display_index,
+                writable_workflow_assignments,
+            )
+        )
     payload = {
         "id": str(seg.id),
         "sentence_id": seg.sentence_id,
@@ -8243,9 +8526,15 @@ def _build_preview_render_segments(
 
 
 def _get_segment_status_stats(db: Session, file_record_id: UUID) -> dict[str, int]:
+    return _get_segment_status_stats_for_query(
+        db.query(Segment).filter(Segment.file_record_id == file_record_id)
+    )
+
+
+def _get_segment_status_stats_for_query(query) -> dict[str, int]:
     empty_target_expr = func.trim(func.coalesce(Segment.target_text, "")) == ""
     row = (
-        db.query(
+        query.with_entities(
             func.count(Segment.id).label("total"),
             func.coalesce(func.sum(case((Segment.status == "exact", 1), else_=0)), 0).label("exact"),
             func.coalesce(func.sum(case((Segment.status == "fuzzy", 1), else_=0)), 0).label("fuzzy"),
@@ -8253,7 +8542,6 @@ def _get_segment_status_stats(db: Session, file_record_id: UUID) -> dict[str, in
             func.coalesce(func.sum(case((Segment.status == "confirmed", 1), else_=0)), 0).label("confirmed"),
             func.coalesce(func.sum(case((empty_target_expr, 1), else_=0)), 0).label("empty_target"),
         )
-        .filter(Segment.file_record_id == file_record_id)
         .one()
     )
     return {
@@ -8526,7 +8814,21 @@ def get_file_record(
         if not result:
             raise HTTPException(status_code=404, detail="\u4efb\u52a1\u4e0d\u5b58\u5728")
         file_record = result["file_record"]
-    segments = result["segments"]
+    _assign_file_segments_to_first_workflow_step(db, file_record)
+    visible_base_query = _apply_segment_assignment_visibility_filter(
+        db,
+        db.query(Segment).filter(Segment.file_record_id == file_record_id),
+        file_record,
+        current_user,
+    )
+    total_segments = visible_base_query.count()
+    segments = (
+        _order_segment_query(visible_base_query)
+        .offset(safe_skip)
+        .limit(safe_limit)
+        .all()
+    )
+    display_index_map = _get_segment_display_index_map(db, file_record_id, segments)
     source_bytes = load_file_record_source(file_record)
     source_filename = get_file_record_source_filename(file_record)
 
@@ -8585,7 +8887,7 @@ def get_file_record(
     )
     file_assignees = _get_active_file_assignees(db, [file_record.id]).get(file_record.id, [])
     workflow_steps = _load_project_workflow_steps(db, file_record.project_id)
-    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+    workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
         db,
         file_record,
         current_user,
@@ -8635,9 +8937,9 @@ def get_file_record(
         "created_at": file_record.created_at.isoformat(),
         "updated_at": file_record.updated_at.isoformat(),
         "server_time": datetime.now().isoformat(),
-        "total_segments": result["total_segments"],
-        "skip": result["skip"],
-        "limit": result["limit"],
+        "total_segments": total_segments,
+        "skip": safe_skip,
+        "limit": safe_limit,
         "source_extension": get_task_file_extension(source_filename),
         "has_source_document": source_bytes is not None,
         "can_export": can_export_task_file(source_filename, has_source_file=source_bytes is not None),
@@ -8647,19 +8949,19 @@ def get_file_record(
         "workflow_progress": workflow_progress,
         "issue_count": issue_stats["issue_count"],
         "open_issue_count": issue_stats["open_issue_count"],
-        "status_stats": _get_segment_status_stats(db, file_record_id),
+        "status_stats": _get_segment_status_stats_for_query(visible_base_query),
         "segments": [
             _serialize_workbench_segment(
                 seg,
-                display_index=result["skip"] + index,
+                display_index=display_index_map.get(seg.id),
                 source_filename=source_filename,
                 target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
                 qa_issues_by_segment_id=qa_issues_by_segment_id,
                 workflow_step_by_id=workflow_step_by_id,
-                writable_workflow_step_ids=writable_workflow_step_ids,
+                writable_workflow_assignments=writable_workflow_assignments,
                 can_manage=can_manage,
             )
-            for index, seg in enumerate(segments)
+            for seg in segments
         ],
     }
 
@@ -8764,9 +9066,15 @@ def get_file_record_segments(
         raise HTTPException(status_code=404, detail="文档不存在。")
 
     _require_file_record_read_access(file_record, current_user)
+    _assign_file_segments_to_first_workflow_step(db, file_record)
     safe_skip = max(skip, 0)
     safe_limit = _normalize_segment_page_limit(limit)
-    base_query = db.query(Segment).filter(Segment.file_record_id == file_record_id)
+    base_query = _apply_segment_assignment_visibility_filter(
+        db,
+        db.query(Segment).filter(Segment.file_record_id == file_record_id),
+        file_record,
+        current_user,
+    )
     # total_segments / status_stats 与页码、筛选无关（仅随编辑变化），
     # 翻页时可让前端复用上次结果（include_stats=false），避免每页重复全表聚合。
     total_segments = base_query.count() if include_stats else None
@@ -8798,7 +9106,7 @@ def get_file_record_segments(
         .all()
     )
     display_index_map = _get_segment_display_index_map(db, file_record_id, page_segments)
-    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+    workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
         db,
         file_record,
         current_user,
@@ -8810,7 +9118,7 @@ def get_file_record_segments(
         "file_record_id": str(file_record_id),
         "total_segments": total_segments,
         "matched_segments": matched_segments,
-        "status_stats": _get_segment_status_stats(db, file_record_id) if include_stats else None,
+        "status_stats": _get_segment_status_stats_for_query(base_query) if include_stats else None,
         "skip": safe_skip,
         "limit": safe_limit,
         "filters": {
@@ -8835,7 +9143,7 @@ def get_file_record_segments(
                 target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
                 qa_issues_by_segment_id=qa_issues_by_segment_id,
                 workflow_step_by_id=workflow_step_by_id,
-                writable_workflow_step_ids=writable_workflow_step_ids,
+                writable_workflow_assignments=writable_workflow_assignments,
                 can_manage=can_manage,
             )
             for seg in page_segments
@@ -8879,6 +9187,7 @@ def get_file_record_segment_changes(
         raise HTTPException(status_code=404, detail="文件不存在。")
 
     _require_file_record_read_access(file_record, current_user)
+    _assign_file_segments_to_first_workflow_step(db, file_record)
     since_dt, since_id = _parse_segment_change_cursor(since)
     safe_limit = _normalize_segment_page_limit(limit)
     cursor_condition = Segment.updated_at > since_dt
@@ -8887,12 +9196,17 @@ def get_file_record_segment_changes(
             Segment.updated_at > since_dt,
             and_(Segment.updated_at == since_dt, Segment.id > since_id),
         )
-    changed_segments = (
-        db.query(Segment)
-        .filter(
+    changed_query = _apply_segment_assignment_visibility_filter(
+        db,
+        db.query(Segment).filter(
             Segment.file_record_id == file_record_id,
             cursor_condition,
-        )
+        ),
+        file_record,
+        current_user,
+    )
+    changed_segments = (
+        changed_query
         .order_by(Segment.updated_at.asc(), Segment.id.asc())
         .limit(safe_limit)
         .all()
@@ -8900,13 +9214,14 @@ def get_file_record_segment_changes(
     server_time = datetime.now().isoformat()
     has_more = len(changed_segments) >= safe_limit
     next_cursor = _format_segment_change_cursor(changed_segments[-1]) if has_more and changed_segments else server_time
-    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+    workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
         db,
         file_record,
         current_user,
     )
     target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
     qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, changed_segments)
+    display_index_map = _get_segment_display_index_map(db, file_record_id, changed_segments)
     return {
         "file_record_id": str(file_record_id),
         "server_time": server_time,
@@ -8915,11 +9230,12 @@ def get_file_record_segment_changes(
         "segments": [
             _serialize_workbench_segment(
                 segment,
+                display_index=display_index_map.get(segment.id),
                 source_filename=get_file_record_source_filename(file_record),
                 target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
                 qa_issues_by_segment_id=qa_issues_by_segment_id,
                 workflow_step_by_id=workflow_step_by_id,
-                writable_workflow_step_ids=writable_workflow_step_ids,
+                writable_workflow_assignments=writable_workflow_assignments,
                 can_manage=can_manage,
             )
             for segment in changed_segments
@@ -8940,9 +9256,16 @@ def get_file_record_segment_position(
         raise HTTPException(status_code=404, detail="文件不存在。")
 
     _require_file_record_read_access(file_record, current_user)
+    _assign_file_segments_to_first_workflow_step(db, file_record)
     safe_page_size = _normalize_segment_page_limit(page_size)
+    visible_base_query = _apply_segment_assignment_visibility_filter(
+        db,
+        db.query(Segment).filter(Segment.file_record_id == file_record_id),
+        file_record,
+        current_user,
+    )
     ordered_segments = (
-        db.query(
+        visible_base_query.with_entities(
             Segment.id.label("id"),
             Segment.sentence_id.label("sentence_id"),
             func.row_number()
@@ -8956,7 +9279,6 @@ def get_file_record_segment_position(
             )
             .label("position"),
         )
-        .filter(Segment.file_record_id == file_record_id)
         .subquery()
     )
     row = (
@@ -9074,13 +9396,18 @@ def get_file_record_preview(
         raise HTTPException(status_code=404, detail="文档不存在。")
 
     _require_file_record_read_access(file_record, current_user)
+    _assign_file_segments_to_first_workflow_step(db, file_record)
     source_filename = get_file_record_source_filename(file_record)
     safe_skip = max(skip, 0)
     safe_limit = _normalize_segment_page_limit(limit)
+    visible_query = _apply_segment_assignment_visibility_filter(
+        db,
+        db.query(Segment).filter(Segment.file_record_id == file_record_id),
+        file_record,
+        current_user,
+    )
     page_segments = (
-        _order_segment_query(
-            db.query(Segment).filter(Segment.file_record_id == file_record_id)
-        )
+        _order_segment_query(visible_query)
         .offset(safe_skip)
         .limit(safe_limit)
         .all()
@@ -10128,7 +10455,13 @@ def get_merge_view_segments(
     per_file_matched: list[int] = []
     per_file_queries: list = []
     for file_record in files:
-        base_query = db.query(Segment).filter(Segment.file_record_id == file_record.id)
+        _assign_file_segments_to_first_workflow_step(db, file_record)
+        base_query = _apply_segment_assignment_visibility_filter(
+            db,
+            db.query(Segment).filter(Segment.file_record_id == file_record.id),
+            file_record,
+            current_user,
+        )
         filtered_query = _apply_segment_scope_filter(base_query, scope)
         filtered_query = _apply_segment_text_filters(
             filtered_query,
@@ -10203,7 +10536,7 @@ def get_merge_view_segments(
         segs = segments_by_file.get(file_record.id, [])
         if not segs:
             continue
-        workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+        workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
             db, file_record, current_user,
         )
         target_numbering = _build_target_automatic_numbering_text_map(file_record)
@@ -10218,7 +10551,7 @@ def get_merge_view_segments(
                 target_automatic_numbering_by_sentence_id=target_numbering,
                 qa_issues_by_segment_id=qa_issues_by_segment_id,
                 workflow_step_by_id=workflow_step_by_id,
-                writable_workflow_step_ids=writable_workflow_step_ids,
+                writable_workflow_assignments=writable_workflow_assignments,
                 can_manage=can_manage,
             )
             payload["file_record_id"] = str(file_record.id)
@@ -10541,13 +10874,14 @@ def update_segment(
             current_user=current_user,
             target_text=update.target_text,
         ):
-            workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+            workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
                 db,
                 file_record,
                 current_user,
             )
             target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
             qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, [current_segment])
+            display_index_map = _get_segment_display_index_map(db, file_record_id, [current_segment])
             conflict = SegmentUpdateConflict(
                 sentence_id=current_segment.sentence_id,
                 current_version=current_version,
@@ -10565,11 +10899,12 @@ def update_segment(
                 "segments": [
                     _serialize_workbench_segment(
                         current_segment,
+                        display_index=display_index_map.get(current_segment.id),
                         source_filename=get_file_record_source_filename(file_record),
                         target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
                         qa_issues_by_segment_id=qa_issues_by_segment_id,
                         workflow_step_by_id=workflow_step_by_id,
-                        writable_workflow_step_ids=writable_workflow_step_ids,
+                        writable_workflow_assignments=writable_workflow_assignments,
                         can_manage=can_manage,
                     )
                 ],
@@ -10608,7 +10943,7 @@ def update_segment(
     if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0 or project_sync_summary.updated_count > 0:
         db.commit()
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
-    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+    workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
         db,
         file_record,
         current_user,
@@ -10616,6 +10951,7 @@ def update_segment(
     target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
     response_segments = [segment, *project_sync_summary.current_file_segments]
     qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, response_segments)
+    display_index_map = _get_segment_display_index_map(db, file_record_id, response_segments)
     _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, response_segments)
 
     return {
@@ -10633,11 +10969,12 @@ def update_segment(
         "segments": [
             _serialize_workbench_segment(
                 item,
+                display_index=display_index_map.get(item.id),
                 source_filename=get_file_record_source_filename(file_record),
                 target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
                 qa_issues_by_segment_id=qa_issues_by_segment_id,
                 workflow_step_by_id=workflow_step_by_id,
-                writable_workflow_step_ids=writable_workflow_step_ids,
+                writable_workflow_assignments=writable_workflow_assignments,
                 can_manage=can_manage,
             )
             for item in response_segments
@@ -10714,18 +11051,20 @@ def update_segment_project_sync(
         segment.version = int(segment.version or 1) + 1
     db.commit()
     db.refresh(segment)
-    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+    workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
         db,
         file_record,
         current_user,
     )
     target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
+    display_index_map = _get_segment_display_index_map(db, file_record_id, [segment])
     return _serialize_workbench_segment(
         segment,
+        display_index=display_index_map.get(segment.id),
         source_filename=get_file_record_source_filename(file_record),
         target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
         workflow_step_by_id=workflow_step_by_id,
-        writable_workflow_step_ids=writable_workflow_step_ids,
+        writable_workflow_assignments=writable_workflow_assignments,
         can_manage=can_manage,
     )
 
@@ -10910,28 +11249,31 @@ def split_segment(
     db.commit()
     db.refresh(segment)
     db.refresh(new_segment)
-    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+    workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
         db,
         file_record,
         current_user,
     )
     target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
+    display_index_map = _get_segment_display_index_map(db, file_record_id, [segment, new_segment])
 
     return {
         "first": _serialize_workbench_segment(
             segment,
+            display_index=display_index_map.get(segment.id),
             source_filename=get_file_record_source_filename(file_record),
             target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
             workflow_step_by_id=workflow_step_by_id,
-            writable_workflow_step_ids=writable_workflow_step_ids,
+            writable_workflow_assignments=writable_workflow_assignments,
             can_manage=can_manage,
         ),
         "second": _serialize_workbench_segment(
             new_segment,
+            display_index=display_index_map.get(new_segment.id),
             source_filename=get_file_record_source_filename(file_record),
             target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
             workflow_step_by_id=workflow_step_by_id,
-            writable_workflow_step_ids=writable_workflow_step_ids,
+            writable_workflow_assignments=writable_workflow_assignments,
             can_manage=can_manage,
         ),
     }
@@ -11018,20 +11360,22 @@ def merge_segment(
     sync_file_record_status(db, file_record_id)
     db.commit()
     db.refresh(first_seg)
-    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+    workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
         db,
         file_record,
         current_user,
     )
     target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
+    display_index_map = _get_segment_display_index_map(db, file_record_id, [first_seg])
 
     return {
         "merged": _serialize_workbench_segment(
             first_seg,
+            display_index=display_index_map.get(first_seg.id),
             source_filename=get_file_record_source_filename(file_record),
             target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
             workflow_step_by_id=workflow_step_by_id,
-            writable_workflow_step_ids=writable_workflow_step_ids,
+            writable_workflow_assignments=writable_workflow_assignments,
             can_manage=can_manage,
         ),
         "deleted_sentence_id": payload.target_sentence_id,
@@ -11096,7 +11440,7 @@ def batch_update(
     if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0 or project_sync_summary.updated_count > 0:
         db.commit()
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
-    workflow_step_by_id, writable_workflow_step_ids, can_manage = _build_segment_workflow_context(
+    workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
         db,
         file_record,
         current_user,
@@ -11104,6 +11448,7 @@ def batch_update(
     target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
     response_segments = [*result.updated_segments, *project_sync_summary.current_file_segments]
     qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, response_segments)
+    display_index_map = _get_segment_display_index_map(db, file_record_id, response_segments)
     _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, response_segments)
     return {
         "updated_count": result.updated_count,
@@ -11113,11 +11458,12 @@ def batch_update(
         "segments": [
             _serialize_workbench_segment(
                 segment,
+                display_index=display_index_map.get(segment.id),
                 source_filename=get_file_record_source_filename(file_record),
                 target_automatic_numbering_by_sentence_id=target_automatic_numbering_by_sentence_id,
                 qa_issues_by_segment_id=qa_issues_by_segment_id,
                 workflow_step_by_id=workflow_step_by_id,
-                writable_workflow_step_ids=writable_workflow_step_ids,
+                writable_workflow_assignments=writable_workflow_assignments,
                 can_manage=can_manage,
             )
             for segment in response_segments

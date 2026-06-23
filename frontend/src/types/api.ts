@@ -151,8 +151,15 @@ export interface ProjectAssignmentItem {
   workflow_step_id?: string
   workflow_step?: WorkflowStep | null
   file_record_ids: string[]
+  file_ranges?: ProjectAssignmentFileRange[]
   assigned_by_id: string | null
   assigned_at: string
+}
+
+export interface ProjectAssignmentFileRange {
+  file_record_id: string
+  range_start: number | null
+  range_end: number | null
 }
 
 export interface ProjectAssignmentsResponse {
@@ -166,6 +173,7 @@ export interface ProjectAssignmentPayload {
     assignee_id: string
     workflow_step_id?: string
     file_record_ids: string[]
+    file_ranges?: ProjectAssignmentFileRange[]
     merge_view_ids?: string[]
   }>
 }

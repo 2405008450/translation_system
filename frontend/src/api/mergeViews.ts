@@ -129,9 +129,20 @@ export async function fetchMergeViewSegmentPage(
   viewId: string,
   query: SegmentPageQuery,
 ) {
-  const { data } = await http.get<MergeViewSegmentPageResponse>(
-    `/merge-views/${viewId}/segments`,
-    { params: buildMergeViewSegmentParams(query) },
-  )
+  const pageSize = query.pageSize ?? 100
+  const requestPage = async (page: number) => {
+    const { data } = await http.get<MergeViewSegmentPageResponse>(
+      `/merge-views/${viewId}/segments`,
+      { params: buildMergeViewSegmentParams({ ...query, page, pageSize }) },
+    )
+    return data
+  }
+
+  const requestedPage = Math.max(1, Math.floor(query.page ?? 1))
+  let data = await requestPage(requestedPage)
+  const maxPage = Math.max(1, Math.ceil(data.matched_segments / pageSize))
+  if (requestedPage > maxPage) {
+    data = await requestPage(maxPage)
+  }
   return data
 }
