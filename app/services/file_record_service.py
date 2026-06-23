@@ -45,10 +45,10 @@ _WORKSPACE_SOURCE_FILENAME_KEY = "_source_filename"
 
 
 SEGMENT_ORDERING = (
+    Segment.sentence_id.asc(),
     Segment.block_index.asc(),
     Segment.row_index.asc().nullsfirst(),
     Segment.cell_index.asc().nullsfirst(),
-    Segment.sentence_id.asc(),
 )
 
 _PENDING_SOURCE_FILES_KEY = "pending_source_files"
@@ -785,7 +785,7 @@ def list_segments_for_llm_translation(
             db.query(Segment)
             .filter(
                 Segment.file_record_id == file_record_id,
-                func.trim(Segment.target_text) == "",
+                func.coalesce(Segment.target_text, "") == "",
             )
             .order_by(*SEGMENT_ORDERING)
             .all()
@@ -836,7 +836,14 @@ def _clean_segment_target_for_automatic_numbering(
     *,
     clean_numbering: bool | None = None,
 ) -> tuple[str, str | None]:
-    original_target_text = target_text or ""
+    original_target_text, target_html = _normalize_segment_target_for_save(
+        segment,
+        target_text,
+        target_html,
+    )
+    if original_target_text and not original_target_text.strip():
+        return original_target_text, None
+
     should_clean = clean_numbering
     if should_clean is None:
         should_clean = is_word_document_filename(
@@ -852,6 +859,16 @@ def _clean_segment_target_for_automatic_numbering(
     )
     cleaned_target_html = None if cleaned_target_text != original_target_text else target_html
     return cleaned_target_text, cleaned_target_html
+
+
+def _normalize_segment_target_for_save(
+    segment: Segment,
+    target_text: str | None,
+    target_html: str | None,
+) -> tuple[str, str | None]:
+    if target_text is None or target_text == "":
+        return segment.source_text or segment.display_text or "", None
+    return target_text, target_html
 
 
 MACHINE_SEGMENT_SOURCES = {"llm", "tm", "project_sync", "none", ""}

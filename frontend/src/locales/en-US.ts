@@ -158,6 +158,8 @@ const overrides = {
       excludePlaceholder: 'Separate terms with spaces or commas',
     },
     ribbon: {
+      spacePlaceholder: 'Space placeholder',
+      spacePlaceholderHint: 'Save one space to mark this segment as not needing translation; leaving it empty fills in the source text.',
       prevRevision: 'Previous revision',
       nextRevision: 'Next revision',
       showRevisionTrace: 'Show revision marks',
@@ -170,6 +172,7 @@ const overrides = {
         revisionTrackingStopped: 'Revision tracking stopped.',
         revisionTraceSettingsSaved: 'Revision mark settings saved.',
         revisionTraceSettingsSaveFailed: 'Failed to save revision mark settings.',
+        spacePlaceholderSet: 'Space placeholder set.',
       },
     },
     revisionSettings: {

@@ -40,6 +40,7 @@ from app.services.file_operation_lock_service import (
     FILE_OPERATION_TOKEN_HEADER,
     ensure_file_record_write_allowed,
 )
+from app.services.file_record_service import SEGMENT_ORDERING
 from app.services.analytics_service import count_source_words, record_translation_metric_event
 from app.services.normalizer import normalize_text
 
@@ -901,7 +902,7 @@ def _build_reference_translation_tasks(
     }
     
     segments = db.execute(
-        select(Segment).where(Segment.file_record_id == file_record_id).order_by(Segment.block_index)
+        select(Segment).where(Segment.file_record_id == file_record_id).order_by(*SEGMENT_ORDERING)
     ).scalars().all()
     
     tasks: list[LLMTranslationTask] = []
@@ -911,7 +912,7 @@ def _build_reference_translation_tasks(
         
         if scope == "empty_target_only":
             # 只翻译没有译文的句段
-            if normalize_text(segment.target_text):
+            if (segment.target_text or "") != "":
                 should_translate = False
         else:
             target_statuses = statuses_by_scope.get(scope, {"fuzzy", "none"})

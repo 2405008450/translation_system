@@ -33,6 +33,7 @@ import {
   ShieldCheck,
   Sigma,
   Split,
+  Space,
   SquarePen,
   Strikethrough,
   Subscript,
@@ -768,6 +769,10 @@ function getErrorMessage(error: unknown, fallback: string) {
 
 function normalizeTextForSaveToTM(value: string | null | undefined) {
   return (value || '').trim()
+}
+
+function isEmptyTargetForWorkbench(value: string | null | undefined) {
+  return value === null || value === undefined || value === ''
 }
 
 function buildDefaultSaveToTMCollectionName() {
@@ -1784,7 +1789,7 @@ function matchesSegmentDisplayScope(segment: Segment) {
     return segment.status === 'confirmed'
   }
   if (segmentDisplayScope.value === 'empty_target') {
-    return !normalizeTextForSaveToTM(segment.target_text)
+    return isEmptyTargetForWorkbench(segment.target_text)
       || retainedEmptyTargetSentenceIds.value.has(segment.sentence_id)
   }
   return true
@@ -1945,10 +1950,7 @@ const boundResourceSummary = computed(() => {
 const addTermTargetTermBases = computed(() => {
   const boundIds = new Set(boundTermBaseIds.value)
   const writableIds = segmentStore.fileRecord?.term_base_write_ids || []
-  const targetIds = writableIds.length > 0
-    ? writableIds.filter((id) => boundIds.has(id))
-    : boundTermBaseIds.value
-  const allowedIds = new Set(targetIds)
+  const allowedIds = new Set(writableIds.filter((id) => boundIds.has(id)))
   return termBases.value.filter((termBase) => allowedIds.has(termBase.id))
 })
 
@@ -2843,7 +2845,7 @@ function toggleSegmentSummaryScope(scope: SegmentDisplayScope) {
 }
 
 function retainEmptyTargetSegmentDuringEdit(sentenceId: string, previousTargetText: string | null | undefined) {
-  if (segmentDisplayScope.value !== 'empty_target' || normalizeTextForSaveToTM(previousTargetText)) {
+  if (segmentDisplayScope.value !== 'empty_target' || !isEmptyTargetForWorkbench(previousTargetText)) {
     return
   }
 
@@ -3002,6 +3004,32 @@ async function focusMatchedSegment(offset: number) {
   await focusEditorSegmentAtIndex(Math.min(targetPageIndex, Math.max(editorSegments.value.length - 1, 0)))
 }
 
+async function focusSegmentByGlobalIndex(globalIndex: number) {
+  const total = segmentStore.matchedSegmentCount
+  if (total <= 0) {
+    return false
+  }
+
+  const pageSize = Math.max(segmentStore.pageSize, 1)
+  const boundedIndex = Math.min(Math.max(globalIndex, 0), total - 1)
+  const targetPage = Math.floor(boundedIndex / pageSize) + 1
+  const targetPageIndex = boundedIndex % pageSize
+
+  if (targetPage !== segmentStore.currentPage) {
+    await refreshSegmentPage(targetPage, pageSize, { includeStats: false })
+    if (segmentStore.currentPage !== targetPage) {
+      return false
+    }
+  }
+
+  const targetIndex = Math.min(targetPageIndex, Math.max(editorSegments.value.length - 1, 0))
+  if (targetIndex < 0) {
+    return false
+  }
+  await focusEditorSegmentAtIndex(targetIndex)
+  return true
+}
+
 function replaceTargetText(targetText: string, replaceAll = false) {
   const regexp = buildTargetReplaceRegExp(replaceAll)
   if (!regexp) {
@@ -3096,11 +3124,14 @@ async function focusSentenceByOffset(offset: number) {
     return
   }
 
-  let targetIndex = getCurrentSegmentIndex() + offset
-  targetIndex = Math.max(0, targetIndex)
+  if (!editorSegments.value.length || segmentStore.matchedSegmentCount <= 0) {
+    return
+  }
 
-  targetIndex = Math.min(targetIndex, Math.max(editorSegments.value.length - 1, 0))
-  await focusEditorSegmentAtIndex(targetIndex)
+  const pageSize = Math.max(segmentStore.pageSize, 1)
+  const currentPageStartIndex = Math.max(segmentStore.currentPage - 1, 0) * pageSize
+  const targetGlobalIndex = currentPageStartIndex + getCurrentSegmentIndex() + offset
+  await focusSegmentByGlobalIndex(targetGlobalIndex)
 }
 
 function getEditorSegmentDisplayIndex(sentenceId: string, fallbackIndex: number) {
@@ -3127,6 +3158,66 @@ function confirmCurrentSentence() {
     { confirm: true },
   )
   return true
+}
+
+function findUnconfirmedSegmentIndex(startIndex = 0, endIndex = editorSegments.value.length) {
+  const start = Math.max(0, startIndex)
+  const end = Math.min(Math.max(endIndex, 0), editorSegments.value.length)
+  for (let index = start; index < end; index += 1) {
+    if (editorSegments.value[index]?.status !== 'confirmed') {
+      return index
+    }
+  }
+  return -1
+}
+
+async function focusNextUnconfirmedSegment(currentIndex: number) {
+  const initialPage = segmentStore.currentPage
+  const pageSize = Math.max(segmentStore.pageSize, 1)
+  const initialMatchedCount = segmentStore.matchedSegmentCount
+
+  let nextIndex = findUnconfirmedSegmentIndex(currentIndex + 1)
+  if (nextIndex !== -1) {
+    await focusEditorSegmentAtIndex(nextIndex)
+    return true
+  }
+
+  if (hasEditorSegmentFilter.value) {
+    await refreshSegmentPage(initialPage, pageSize, { includeStats: false })
+    const refreshedStartIndex = Math.min(Math.max(currentIndex, 0), editorSegments.value.length)
+    nextIndex = findUnconfirmedSegmentIndex(refreshedStartIndex)
+    if (nextIndex !== -1) {
+      await focusEditorSegmentAtIndex(nextIndex)
+      return true
+    }
+  }
+
+  const total = Math.max(segmentStore.matchedSegmentCount, initialMatchedCount)
+  const lastPage = Math.max(1, Math.ceil(total / pageSize))
+  for (let page = initialPage + 1; page <= lastPage; page += 1) {
+    const previousPage = segmentStore.currentPage
+    await refreshSegmentPage(page, pageSize, { includeStats: false })
+    if (segmentStore.currentPage === previousPage && page !== previousPage) {
+      return false
+    }
+    nextIndex = findUnconfirmedSegmentIndex(0)
+    if (nextIndex !== -1) {
+      await focusEditorSegmentAtIndex(nextIndex)
+      return true
+    }
+  }
+
+  if (segmentStore.currentPage !== initialPage) {
+    await refreshSegmentPage(initialPage, pageSize, { includeStats: false })
+  }
+
+  nextIndex = findUnconfirmedSegmentIndex(0, currentIndex)
+  if (nextIndex !== -1) {
+    await focusEditorSegmentAtIndex(nextIndex)
+    return true
+  }
+
+  return false
 }
 
 function toggleConfirmMenu() {
@@ -3196,37 +3287,13 @@ async function confirmAndMoveToNextUnconfirmed() {
   if (!confirmCurrentSentence()) {
     return
   }
-  const segments = editorSegments.value
 
   if (preferencesStore.confirmJumpMode === 'next_segment') {
-    const nextIndex = currentIndex >= 0 ? currentIndex + 1 : 0
-    if (nextIndex < segments.length) {
-      await focusEditorSegmentAtIndex(nextIndex)
-    }
+    await focusSentenceByOffset(1)
     return
   }
 
-  let nextUnconfirmedIndex = -1
-
-  for (let i = currentIndex + 1; i < segments.length; i++) {
-    if (segments[i].status !== 'confirmed') {
-      nextUnconfirmedIndex = i
-      break
-    }
-  }
-
-  if (nextUnconfirmedIndex === -1) {
-    for (let i = 0; i < currentIndex; i++) {
-      if (segments[i].status !== 'confirmed') {
-        nextUnconfirmedIndex = i
-        break
-      }
-    }
-  }
-
-  if (nextUnconfirmedIndex !== -1) {
-    await focusEditorSegmentAtIndex(nextUnconfirmedIndex)
-  }
+  await focusNextUnconfirmedSegment(currentIndex)
 }
 
 async function handleConfirmRangeSegments() {
@@ -4320,7 +4387,7 @@ function copySourceToTarget() {
 
   const sourceText = getSegmentCopyableSourceText(activeSegment.value)
   updateSegmentTarget(
-    activeSegment.value.sentence_id,
+    segmentKeyOf(activeSegment.value),
     sourceText,
     undefined,
     { recordUndo: true, undoInputType: 'copySourceToTarget' },
@@ -4339,12 +4406,31 @@ function clearActiveTarget() {
   }
 
   updateSegmentTarget(
-    activeSegment.value.sentence_id,
+    segmentKeyOf(activeSegment.value),
     '',
     undefined,
     { recordUndo: true, undoInputType: 'clearTarget' },
   )
   toast.success(t('workbench.ribbon.messages.targetCleared'))
+}
+
+function setActiveTargetSpacePlaceholder() {
+  if (!activeSegment.value) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+  if (!activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
+
+  updateSegmentTarget(
+    segmentKeyOf(activeSegment.value),
+    ' ',
+    undefined,
+    { recordUndo: true, undoInputType: 'spacePlaceholder' },
+  )
+  toast.success(t('workbench.ribbon.messages.spacePlaceholderSet'))
 }
 
 function resolveAddTermTargetBaseId() {
@@ -4414,6 +4500,7 @@ async function submitAddTermForm() {
     await http.post(`/term-bases/${targetBaseId}/entries`, {
       source_text: sourceText,
       target_text: targetText,
+      file_record_id: activeWorkbenchFileId.value,
     })
     selectedTermBaseId.value = targetBaseId
     await loadTermEntries()
@@ -5959,6 +6046,16 @@ onBeforeRouteLeave(async () => {
               </span>
             </button>
           </span>
+          <span class="tool-col align-left">
+            <button class="tool-line tool-button" type="button" data-testid="workbench-space-placeholder-button" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.spacePlaceholderHint')" @click="setActiveTargetSpacePlaceholder">
+              <span class="icon-text-area">
+                <span class="tool-item">
+                  <Space class="tool-label-icon" :size="16" />
+                  <span class="text">{{ t('workbench.ribbon.spacePlaceholder') }}</span>
+                </span>
+              </span>
+            </button>
+          </span>
         </div>
 
         <div class="tool-group custom-style">
@@ -6370,7 +6467,7 @@ onBeforeRouteLeave(async () => {
       </div>
 
       <div class="workbench-ribbon__status" role="status" :title="ribbonStatusTitle">
-        <span>{{ lastModifiedStatusText }}</span>
+        <span class="workbench-ribbon__modified-time">{{ lastModifiedStatusText }}</span>
         <span aria-hidden="true">·</span>
         <span>{{ segmentStore.syncMessage }}</span>
         <span aria-hidden="true">·</span>
@@ -9381,10 +9478,11 @@ onBeforeRouteLeave(async () => {
   white-space: nowrap;
 }
 
-.workbench-ribbon__status span:first-child {
+.workbench-ribbon__status span.workbench-ribbon__modified-time {
   flex: 0 0 auto;
   max-width: min(360px, 44vw);
-  color: #40515a;
+  color: #c2410c;
+  font-weight: 700;
 }
 
 .workbench-ribbon__status span:last-child {

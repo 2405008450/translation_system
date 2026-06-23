@@ -147,6 +147,7 @@ from app.services.import_task_state import (
     set_import_task_status as shared_set_import_task_status,
 )
 from app.services.file_record_service import (
+    SEGMENT_ORDERING,
     SegmentUpdateConflict,
     _can_auto_merge_stale_segment,
     backfill_file_record_source_html,
@@ -2374,10 +2375,7 @@ def _load_document_repetition_statistics_for_files(
         .filter(Segment.file_record_id.in_(file_ids))
         .order_by(
             Segment.file_record_id.asc(),
-            Segment.block_index.asc(),
-            Segment.row_index.asc().nullsfirst(),
-            Segment.cell_index.asc().nullsfirst(),
-            Segment.sentence_id.asc(),
+            *SEGMENT_ORDERING,
             Segment.id.asc(),
         )
         .all()
@@ -2413,10 +2411,7 @@ def _load_document_match_analysis_for_files(
         .filter(Segment.file_record_id.in_(list(file_segments.keys())))
         .order_by(
             Segment.file_record_id.asc(),
-            Segment.block_index.asc(),
-            Segment.row_index.asc().nullsfirst(),
-            Segment.cell_index.asc().nullsfirst(),
-            Segment.sentence_id.asc(),
+            *SEGMENT_ORDERING,
             Segment.id.asc(),
         )
         .all()
@@ -2946,12 +2941,7 @@ def _apply_segment_assignment_visibility_filter(
             Segment.workflow_step_id.label("workflow_step_id"),
             func.row_number()
             .over(
-                order_by=(
-                    Segment.block_index.asc(),
-                    Segment.row_index.asc().nullsfirst(),
-                    Segment.cell_index.asc().nullsfirst(),
-                    Segment.sentence_id.asc(),
-                )
+                order_by=SEGMENT_ORDERING
             )
             .label("display_index"),
         )
@@ -3991,7 +3981,7 @@ def _build_llm_translation_tasks(
         if scope == "current_segment":
             should_translate = segment.sentence_id == current_sentence_id
         elif scope == "empty_target_only":
-            if normalize_text(segment.target_text):
+            if (segment.target_text or "") != "":
                 should_translate = False
         elif target_statuses is None or segment.status not in target_statuses:
             should_translate = False
@@ -5868,12 +5858,7 @@ def _create_term_qa_report(
         file_segments = (
             db.query(Segment)
             .filter(Segment.file_record_id == file_record.id)
-            .order_by(
-                Segment.block_index.asc(),
-                Segment.row_index.asc().nullsfirst(),
-                Segment.cell_index.asc().nullsfirst(),
-                Segment.sentence_id.asc(),
-            )
+            .order_by(*SEGMENT_ORDERING)
             .all()
         )
         checked_segments += len(file_segments)
@@ -8260,7 +8245,7 @@ def _apply_segment_scope_filter(query, scope: str):
     if normalized_scope == "confirmed_only":
         return query.filter(Segment.status == "confirmed")
     if normalized_scope == "empty_target":
-        return query.filter(func.trim(Segment.target_text) == "")
+        return query.filter(func.coalesce(Segment.target_text, "") == "")
     return query
 
 
@@ -8346,7 +8331,7 @@ def _apply_segment_screening_filters(
     if status_values:
         conditions = []
         if "empty_target" in status_values:
-            conditions.append(func.trim(func.coalesce(Segment.target_text, "")) == "")
+            conditions.append(func.coalesce(Segment.target_text, "") == "")
         if "confirmed" in status_values:
             conditions.append(Segment.status == "confirmed")
         if "unconfirmed" in status_values:
@@ -8399,12 +8384,7 @@ def _apply_segment_screening_filters(
 
 
 def _order_segment_query(query):
-    return query.order_by(
-        Segment.block_index.asc(),
-        Segment.row_index.asc().nullsfirst(),
-        Segment.cell_index.asc().nullsfirst(),
-        Segment.sentence_id.asc(),
-    )
+    return query.order_by(*SEGMENT_ORDERING)
 
 
 def _get_segment_display_index_map(
@@ -8421,12 +8401,7 @@ def _get_segment_display_index_map(
             Segment.id.label("id"),
             func.row_number()
             .over(
-                order_by=(
-                    Segment.block_index.asc(),
-                    Segment.row_index.asc().nullsfirst(),
-                    Segment.cell_index.asc().nullsfirst(),
-                    Segment.sentence_id.asc(),
-                )
+                order_by=SEGMENT_ORDERING
             )
             .label("display_index"),
         )
@@ -8463,12 +8438,7 @@ def _apply_segment_display_range_filter(
             Segment.id.label("id"),
             func.row_number()
             .over(
-                order_by=(
-                    Segment.block_index.asc(),
-                    Segment.row_index.asc().nullsfirst(),
-                    Segment.cell_index.asc().nullsfirst(),
-                    Segment.sentence_id.asc(),
-                )
+                order_by=SEGMENT_ORDERING
             )
             .label("display_index"),
         )
@@ -8532,7 +8502,7 @@ def _get_segment_status_stats(db: Session, file_record_id: UUID) -> dict[str, in
 
 
 def _get_segment_status_stats_for_query(query) -> dict[str, int]:
-    empty_target_expr = func.trim(func.coalesce(Segment.target_text, "")) == ""
+    empty_target_expr = func.coalesce(Segment.target_text, "") == ""
     row = (
         query.with_entities(
             func.count(Segment.id).label("total"),
@@ -8647,12 +8617,7 @@ def _apply_workflow_transition_filters(
                 Segment.id.label("id"),
                 func.row_number()
                 .over(
-                    order_by=(
-                        Segment.block_index.asc(),
-                        Segment.row_index.asc().nullsfirst(),
-                        Segment.cell_index.asc().nullsfirst(),
-                        Segment.sentence_id.asc(),
-                    )
+                    order_by=SEGMENT_ORDERING
                 )
                 .label("display_index"),
             )
@@ -9270,12 +9235,7 @@ def get_file_record_segment_position(
             Segment.sentence_id.label("sentence_id"),
             func.row_number()
             .over(
-                order_by=(
-                    Segment.block_index.asc(),
-                    Segment.row_index.asc().nullsfirst(),
-                    Segment.cell_index.asc().nullsfirst(),
-                    Segment.sentence_id.asc(),
-                )
+                order_by=SEGMENT_ORDERING
             )
             .label("position"),
         )
@@ -10371,12 +10331,7 @@ def get_merge_view_segment_position(
             Segment.sentence_id.label("sentence_id"),
             func.row_number()
             .over(
-                order_by=(
-                    Segment.block_index.asc(),
-                    Segment.row_index.asc().nullsfirst(),
-                    Segment.cell_index.asc().nullsfirst(),
-                    Segment.sentence_id.asc(),
-                )
+                order_by=SEGMENT_ORDERING
             )
             .label("position"),
         )

@@ -186,7 +186,7 @@ def _file_status_stats(db: Session, file_record_id: UUID) -> dict[str, int]:
         func.count(case((Segment.status == "none", 1), else_=None)).label("none"),
         func.count(case((Segment.status == "confirmed", 1), else_=None)).label("confirmed"),
         func.count(
-            case((func.trim(func.coalesce(Segment.target_text, "")) == "", 1), else_=None)
+            case((func.coalesce(Segment.target_text, "") == "", 1), else_=None)
         ).label("empty_target"),
     ).filter(Segment.file_record_id == file_record_id).one()
     return {

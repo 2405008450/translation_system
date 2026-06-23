@@ -13,10 +13,10 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.auth import get_current_user, require_admin
+from app.auth import can_access_all_projects, get_current_user, is_admin_role, require_admin
 from app.config import get_settings
 from app.database import SessionLocal, get_db
-from app.models import FileRecord, TermBase, TermEntry, User
+from app.models import FileAssignment, FileRecord, ProjectAssignment, TermBase, TermEntry, User
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import normalize_match_text, normalize_text
 from app.services.notification_service import (
@@ -77,6 +77,7 @@ class TermBaseMergePayload(BaseModel):
 class TermEntryUpdatePayload(BaseModel):
     source_text: str
     target_text: str
+    file_record_id: UUID | None = None
 
 
 class TermEntryDraftPayload(BaseModel):
@@ -285,6 +286,73 @@ def _load_bound_ids(file_record: FileRecord, field_name: str) -> list[str]:
 
 def _load_bound_term_base_ids(file_record: FileRecord) -> list[str]:
     return _load_bound_ids(file_record, "term_base_ids")
+
+
+def _file_record_allows_term_base_write(file_record: FileRecord, term_base_id: UUID) -> bool:
+    term_base_id_text = str(term_base_id)
+    enabled_ids = set(_load_bound_term_base_ids(file_record))
+    writable_ids = set(_load_bound_ids(file_record, "term_base_write_ids"))
+    return term_base_id_text in enabled_ids and term_base_id_text in writable_ids
+
+
+def _can_use_file_record_term_write_context(
+    db: Session,
+    file_record: FileRecord,
+    current_user: User,
+) -> bool:
+    if can_access_all_projects(current_user):
+        return True
+
+    user_id = getattr(current_user, "id", None)
+    if user_id is None or file_record.project_id is None:
+        return False
+
+    has_project_assignment = (
+        db.query(ProjectAssignment.id)
+        .filter(
+            ProjectAssignment.project_id == file_record.project_id,
+            ProjectAssignment.assignee_id == user_id,
+            ProjectAssignment.status == "active",
+        )
+        .first()
+        is not None
+    )
+    if not has_project_assignment:
+        return False
+
+    return (
+        db.query(FileAssignment.id)
+        .filter(
+            FileAssignment.file_record_id == file_record.id,
+            FileAssignment.assignee_id == user_id,
+            FileAssignment.status == "active",
+        )
+        .first()
+        is not None
+    )
+
+
+def _require_term_entry_create_access(
+    db: Session,
+    term_base_id: UUID,
+    file_record_id: UUID | None,
+    current_user: User,
+) -> None:
+    if is_admin_role(getattr(current_user, "role", None)):
+        return
+
+    if file_record_id is None:
+        raise HTTPException(status_code=403, detail="请从已开启写入权限的项目文件中添加术语。")
+
+    file_record = db.query(FileRecord).filter(FileRecord.id == file_record_id).first()
+    if file_record is None:
+        raise HTTPException(status_code=404, detail="文件不存在。")
+
+    if not _can_use_file_record_term_write_context(db, file_record, current_user):
+        raise HTTPException(status_code=403, detail="当前账号没有处理该文件的权限。")
+
+    if not _file_record_allows_term_base_write(file_record, term_base_id):
+        raise HTTPException(status_code=403, detail="目标术语库未在当前项目设置中开启写入权限。")
 
 
 def _store_bound_term_base_ids(file_record: FileRecord, term_base_ids: list[str]) -> None:
@@ -1015,9 +1083,15 @@ def create_term_base_entry(
     term_base_id: UUID,
     payload: TermEntryUpdatePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(get_current_user),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
+    _require_term_entry_create_access(
+        db,
+        term_base.id,
+        payload.file_record_id,
+        current_user,
+    )
     source_text = normalize_text(payload.source_text)
     target_text = normalize_text(payload.target_text)
     if not source_text or not target_text:

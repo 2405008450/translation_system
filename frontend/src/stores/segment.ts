@@ -84,7 +84,7 @@ function isCountedSegmentStatus(status: string): status is 'exact' | 'fuzzy' | '
 }
 
 function hasEmptyTarget(value: string | null | undefined) {
-  return !(value || '').trim()
+  return value === null || value === undefined || value === ''
 }
 
 function normalizeMatchText(value: string | null | undefined) {

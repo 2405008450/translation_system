@@ -1388,12 +1388,16 @@ def _replace_block_tokens(
 
         segment = segments[segment_index]
         segment_index += 1
-        replacement = strip_automatic_numbering_prefix(
-            segment.target_text,
-            source_text=segment.source_text,
-            display_text=segment.display_text,
-            numbering_text=segment.numbering_text,
-            reference_texts=[segment.matched_source_text],
+        replacement = (
+            segment.target_text
+            if _is_target_placeholder(segment.target_text)
+            else strip_automatic_numbering_prefix(
+                segment.target_text,
+                source_text=segment.source_text,
+                display_text=segment.display_text,
+                numbering_text=segment.numbering_text,
+                reference_texts=[segment.matched_source_text],
+            )
         )
         if previous_span is not None:
             boundary_text = display_text[previous_span.end:span.start]
@@ -1403,9 +1407,13 @@ def _replace_block_tokens(
                 boundary_text=boundary_text,
             )
         if not normalize_text(replacement):
-            if not keep_source_when_empty:
-                _queue_sentence_replacement(tokens, span, "")
-            previous_replacement = ""
+            if _is_target_placeholder(segment.target_text) or not keep_source_when_empty:
+                _queue_sentence_replacement(
+                    tokens,
+                    span,
+                    replacement if _is_target_placeholder(segment.target_text) else "",
+                )
+            previous_replacement = replacement if _is_target_placeholder(segment.target_text) else ""
             previous_span = span
             continue
 
@@ -1431,6 +1439,10 @@ def _replace_block_tokens(
         previous_span = span
 
     _apply_token_edits(tokens)
+
+
+def _is_target_placeholder(text: str | None) -> bool:
+    return bool(text) and not normalize_text(text or "")
 
 
 def _collect_cell_group_tokens(

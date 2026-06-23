@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Link2, Link2Off } from 'lucide-vue-next'
-import { computed, onMounted, ref, watch, nextTick } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch, nextTick } from 'vue'
 
 import InteractiveDiffText from './InteractiveDiffText.vue'
 
@@ -75,6 +75,7 @@ const isComposing = ref(false)
 const segmentKey = computed(() => props.segmentKey || props.segment.sentence_id)
 const MAX_EDITOR_HISTORY_SIZE = 100
 const EDITOR_HISTORY_GROUP_TIMEOUT_MS = 1200
+const REVISION_RERENDER_DEBOUNCE_MS = 150
 const EDITOR_HISTORY_WORD_BOUNDARY_REGEXP = /[\s.,!?;:\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A]/
 
 interface EditorHistorySnapshot {
@@ -122,6 +123,7 @@ const lastTargetSelectionRange = ref<EditorTextRange | null>(null)
 let lastHistorySnapshotAt = 0
 let lastHistoryInputKind = ''
 let preserveNextTargetSync = false
+let revisionRerenderTimer: ReturnType<typeof setTimeout> | null = null
 const canUndoEditorChange = computed(() => undoStack.value.length > 0)
 const canRedoEditorChange = computed(() => redoStack.value.length > 0)
 
@@ -130,7 +132,7 @@ const parityClass = computed(() => (props.index % 2 === 0 ? 'segment-row--odd' :
 const sourceClass = computed(() => `segment-row__tag--source-${props.segment.source || 'none'}`)
 const isEmptyTarget = computed(() => {
   const targetText = props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
-  return targetText.trim().length === 0
+  return targetText.length === 0
 })
 const statusMeta = computed(() => getSegmentStatusMeta(props.segment.status))
 const sourceMeta = computed(() => getSegmentSourceMeta(props.segment.source))
@@ -1136,6 +1138,7 @@ function handleFocus() {
 }
 
 function handleBlur() {
+  clearRevisionRerenderTimer()
   cacheTargetSelectionFromDom()
   commitEditorContent()
   isFocused.value = false
@@ -1360,6 +1363,69 @@ function handleInput() {
   emit('update', segmentKey.value, text)
 }
 
+function getEditorSelectionRange(): Range | null {
+  const editor = editorRef.value
+  const selection = window.getSelection()
+  if (!editor || !selection || selection.rangeCount === 0 || selection.isCollapsed) {
+    return null
+  }
+
+  const range = selection.getRangeAt(0)
+  if (!editor.contains(range.startContainer) || !editor.contains(range.endContainer)) {
+    return null
+  }
+
+  return range
+}
+
+function writeCleanRevisionSelectionToClipboard(event: ClipboardEvent, range: Range): boolean {
+  const clipboardData = event.clipboardData
+  if (!clipboardData) {
+    return false
+  }
+
+  const fragment = range.cloneContents()
+  const text = serializeEditorContent(fragment)
+  const html = serializeEditorContentWithFormat(fragment)
+  event.preventDefault()
+  clipboardData.clearData()
+  clipboardData.setData('text/plain', text)
+  clipboardData.setData('text/html', html)
+  return true
+}
+
+function handleCopy(event: ClipboardEvent) {
+  if (!hasPendingRevision.value) {
+    return
+  }
+
+  const range = getEditorSelectionRange()
+  if (!range) {
+    return
+  }
+
+  writeCleanRevisionSelectionToClipboard(event, range)
+}
+
+function handleCut(event: ClipboardEvent) {
+  if (!hasPendingRevision.value) {
+    return
+  }
+
+  const range = getEditorSelectionRange()
+  if (!range || !writeCleanRevisionSelectionToClipboard(event, range)) {
+    return
+  }
+
+  if (props.disabled || isApplyingHistory.value || isComposing.value) {
+    return
+  }
+
+  recordUndoSnapshot(true, { force: true, inputType: 'deleteByCut' })
+  document.execCommand('delete')
+  handleInput()
+}
+
 /**
  * 检查是否有待应用的格式
  */
@@ -1411,6 +1477,7 @@ function handleCompositionStart() {
 function handleCompositionEnd() {
   isComposing.value = false
   handleInput()
+  scheduleRevisionRerender()
   compositionSnapshotRecorded.value = false
 }
 
@@ -1619,6 +1686,29 @@ function normalizeTagName(tag: string): string {
   return map[tag] || tag
 }
 
+function clearRevisionRerenderTimer() {
+  if (revisionRerenderTimer === null) {
+    return
+  }
+  clearTimeout(revisionRerenderTimer)
+  revisionRerenderTimer = null
+}
+
+function scheduleRevisionRerender() {
+  clearRevisionRerenderTimer()
+  if (!isFocused.value || isApplyingHistory.value || isComposing.value) {
+    return
+  }
+
+  revisionRerenderTimer = setTimeout(() => {
+    revisionRerenderTimer = null
+    if (!isFocused.value || isApplyingHistory.value || isComposing.value) {
+      return
+    }
+    syncEditorHtmlFromState(true)
+  }, REVISION_RERENDER_DEBOUNCE_MS)
+}
+
 function syncEditorHtmlFromState(preserveCaret: boolean) {
   const editor = editorRef.value
   if (!editor || isApplyingHistory.value || isComposing.value) {
@@ -1677,6 +1767,10 @@ onMounted(() => {
   }
 })
 
+onBeforeUnmount(() => {
+  clearRevisionRerenderTimer()
+})
+
 watch(
   () => props.segment.sentence_id,
   () => {
@@ -1715,8 +1809,10 @@ watch(
   editorHtmlContent,
   () => {
     if (isFocused.value && !isApplyingHistory.value) {
+      scheduleRevisionRerender()
       return
     }
+    clearRevisionRerenderTimer()
     syncEditorHtmlFromState(isFocused.value)
   },
   { flush: 'post' },
@@ -1910,6 +2006,8 @@ watch(
           @beforeinput="handleBeforeInput"
           @input="handleInput"
           @paste="handlePaste"
+          @copy="handleCopy"
+          @cut="handleCut"
         />
       </div>
       </div>
@@ -2343,7 +2441,7 @@ watch(
   text-decoration: line-through;
   text-decoration-color: var(--rev-delete-color, #dc2626);
   text-decoration-thickness: 1px;
-  user-select: text;
+  user-select: none;
 }
 
 .segment-row__editor[contenteditable="false"] {

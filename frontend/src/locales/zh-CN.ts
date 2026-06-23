@@ -1106,6 +1106,8 @@ export default {
       redo: '恢复',
       copySource: '复制原文',
       clearTarget: '清除译文',
+      spacePlaceholder: '空格占位',
+      spacePlaceholderHint: '保存一个空格，占位表示此句段不需要翻译；留空则会自动回填原文。',
       bold: '加粗',
       italic: '斜体',
       underline: '下划线',
@@ -1161,6 +1163,7 @@ export default {
       messages: {
         sourceCopied: '已将原文复制到译文。',
         targetCleared: '已清空当前译文。',
+        spacePlaceholderSet: '已设置空格占位。',
         selectTermBaseFirst: '请先选择术语库。',
         termTextRequired: '当前句段需要同时有原文和译文才能添加术语。',
         termAdded: '术语已添加。',
