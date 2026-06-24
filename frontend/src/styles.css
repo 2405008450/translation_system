@@ -2654,16 +2654,18 @@ body.modal-open {
 .workbench-sidecar {
   display: flex;
   flex-direction: row;
-  gap: 12px;
-  align-items: start;
+  gap: 0;
+  align-items: stretch;
   position: sticky;
   top: 24px;
+  min-width: min(360px, calc(100vw - 96px));
+  height: calc(100vh - 140px);
   max-height: calc(100vh - 140px);
   transition: width 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 .workbench-sidecar.is-preview-open {
-  width: min(calc(36vw + 80px), 580px);
+  width: clamp(380px, calc(32vw + 64px), 540px);
 }
 
 .workbench-sidecar.is-split-open {
@@ -2671,13 +2673,17 @@ body.modal-open {
 }
 
 .workbench-sidecar__panel {
+  display: flex;
+  flex-direction: column;
   flex: 1 1 0;
   min-width: 0;
+  height: 100%;
   max-height: calc(100vh - 140px);
-  overflow-y: auto;
-  overflow-x: hidden;
-  scrollbar-width: thin;
-  scrollbar-color: var(--line-soft) transparent;
+  overflow: hidden;
+  border: 1px solid #d5e2e6;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 10px 24px rgba(32, 61, 70, 0.08);
 }
 
 .workbench-resizer {
@@ -2711,10 +2717,20 @@ body.modal-open {
 }
 
 /* 预览面板撑满高度，与左侧对齐 */
+.workbench-sidecar__panel > .panel,
 .workbench-sidecar__panel > .preview-panel,
-.workbench-sidecar__panel > .split-preview {
-  height: calc(100vh - 140px);
+.workbench-sidecar__panel > .split-preview,
+.workbench-sidecar__panel > .match-panel,
+.workbench-sidecar__panel > .resource-search-panel,
+.workbench-sidecar__panel > .reference-panel,
+.workbench-sidecar__panel > .notes-panel,
+.workbench-sidecar__panel > .empty-state {
+  width: 100%;
+  height: 100%;
   min-height: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
 }
 
 .workbench-rail {
@@ -3277,10 +3293,39 @@ body.modal-open {
 }
 
 .workbench-tool-panel {
-  width: min(100%, 500px);
-  min-height: 360px;
+  width: 100%;
+  min-height: 0;
+  height: 100%;
+  padding: 18px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: #9fb8bd transparent;
   background:
-    linear-gradient(180deg, rgba(250, 252, 251, 0.98), rgba(240, 247, 244, 0.95));
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(247, 251, 251, 0.96));
+}
+
+.workbench-tool-panel::-webkit-scrollbar,
+.notes-panel::-webkit-scrollbar {
+  width: 8px;
+}
+
+.workbench-tool-panel::-webkit-scrollbar-track,
+.notes-panel::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.workbench-tool-panel::-webkit-scrollbar-thumb,
+.notes-panel::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-color: #9fb8bd;
+  background-clip: content-box;
+}
+
+.workbench-tool-panel::-webkit-scrollbar-thumb:hover,
+.notes-panel::-webkit-scrollbar-thumb:hover {
+  background-color: #6f9299;
 }
 
 .workbench-tool-panel .empty-state {
@@ -3636,10 +3681,16 @@ body.modal-open {
 }
 
 .notes-panel {
-  width: min(100%, 500px);
-  min-height: 360px;
+  width: 100%;
+  min-height: 0;
+  height: 100%;
   display: grid;
   gap: 14px;
+  padding: 18px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: #9fb8bd transparent;
 }
 
 .notes-panel__header {
@@ -3690,7 +3741,9 @@ body.modal-open {
 
 .notes-panel__threads {
   display: grid;
+  align-content: start;
   gap: 12px;
+  min-height: 0;
 }
 
 .notes-thread {
@@ -4520,6 +4573,7 @@ body.modal-open {
   .workbench-sidecar {
     position: static;
     width: auto !important;
+    height: auto;
     max-height: none;
     justify-content: end;
   }
@@ -4534,6 +4588,7 @@ body.modal-open {
   }
 
   .workbench-sidecar__panel {
+    height: auto;
     max-height: none;
     overflow-y: visible;
     flex: 1 1 280px;

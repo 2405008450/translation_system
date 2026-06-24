@@ -60,7 +60,7 @@ export function useWorkbenchShortcuts(handlers: WorkbenchShortcutHandlers) {
       return
     }
 
-    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && !event.repeat) {
       if (ctrlOrMeta) {
         return
       }

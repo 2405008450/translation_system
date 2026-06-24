@@ -3334,15 +3334,89 @@ def _assignment_ranges_overlap(
     return max(left_start, right_start) <= min(left_end, right_end)
 
 
+def _segment_merge_block_key(segment: Any) -> tuple[int, int | None, int | None]:
+    return (
+        int(getattr(segment, "block_index", 0) or 0),
+        getattr(segment, "row_index", None),
+        getattr(segment, "cell_index", None),
+    )
+
+
+def _segments_in_same_merge_block(left: Any, right: Any) -> bool:
+    return _segment_merge_block_key(left) == _segment_merge_block_key(right)
+
+
+def _validate_assignment_range_merge_block_boundary(
+    db: Session,
+    *,
+    file_record_id: UUID,
+    file_label: str,
+    range_start: int,
+    range_end: int,
+) -> None:
+    boundary_positions = {range_start, range_end}
+    if range_start > 1:
+        boundary_positions.add(range_start - 1)
+    boundary_positions.add(range_end + 1)
+
+    ordered_segments = (
+        db.query(
+            Segment.id.label("id"),
+            Segment.block_index.label("block_index"),
+            Segment.row_index.label("row_index"),
+            Segment.cell_index.label("cell_index"),
+            func.row_number()
+            .over(
+                order_by=SEGMENT_ORDERING
+            )
+            .label("display_index"),
+        )
+        .filter(Segment.file_record_id == file_record_id)
+        .subquery()
+    )
+    rows = (
+        db.query(
+            ordered_segments.c.display_index,
+            ordered_segments.c.block_index,
+            ordered_segments.c.row_index,
+            ordered_segments.c.cell_index,
+        )
+        .filter(ordered_segments.c.display_index.in_(boundary_positions))
+        .all()
+    )
+    row_by_position = {int(row.display_index): row for row in rows}
+    start_segment = row_by_position.get(range_start)
+    end_segment = row_by_position.get(range_end)
+    if start_segment is None or end_segment is None:
+        raise HTTPException(status_code=400, detail=f"{file_label} 的句段范围不存在。")
+
+    previous_segment = row_by_position.get(range_start - 1)
+    if previous_segment is not None and _segments_in_same_merge_block(previous_segment, start_segment):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{file_label} 的句段范围不能从同一段落中间开始，请将起始段调整到段落边界。",
+        )
+
+    next_segment = row_by_position.get(range_end + 1)
+    if next_segment is not None and _segments_in_same_merge_block(end_segment, next_segment):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{file_label} 的句段范围不能在同一段落中间结束，请将结束段调整到段落边界。",
+        )
+
+
 def _validate_assignment_payload(
     db: Session,
     project: Project,
     payload: ProjectAssignmentsRequest,
 ) -> tuple[dict[tuple[UUID, UUID], set[AssignmentTarget]], set[UUID]]:
-    project_file_ids = {
-        row.id
-        for row in db.query(FileRecord.id).filter(FileRecord.project_id == project.id).all()
-    }
+    project_file_rows = (
+        db.query(FileRecord.id, FileRecord.filename)
+        .filter(FileRecord.project_id == project.id)
+        .all()
+    )
+    project_file_ids = {row.id for row in project_file_rows}
+    project_file_labels = {row.id: row.filename or str(row.id) for row in project_file_rows}
     workflow_steps = _load_project_workflow_steps(db, project.id)
     if not workflow_steps:
         workflow_steps = _create_project_workflow_steps(
@@ -3375,6 +3449,7 @@ def _validate_assignment_payload(
 
     desired: dict[tuple[UUID, UUID], set[AssignmentTarget]] = {}
     desired_user_ids: set[UUID] = set()
+    validated_boundary_ranges: set[tuple[UUID, int, int]] = set()
     for entry in payload.assignments:
         assignee = get_user_by_id(db, entry.assignee_id)
         if assignee is None or not assignee.is_active or assignee.role != USER_ROLE:
@@ -3417,6 +3492,19 @@ def _validate_assignment_payload(
                     raise HTTPException(status_code=400, detail="设置句段范围前，文件必须已有句段。")
                 if range_end > segment_count:
                     raise HTTPException(status_code=400, detail="句段范围不能超过文件句段总数。")
+                range_key = (file_range.file_record_id, range_start, range_end)
+                if range_key not in validated_boundary_ranges:
+                    _validate_assignment_range_merge_block_boundary(
+                        db,
+                        file_record_id=file_range.file_record_id,
+                        file_label=project_file_labels.get(
+                            file_range.file_record_id,
+                            str(file_range.file_record_id),
+                        ),
+                        range_start=range_start,
+                        range_end=range_end,
+                    )
+                    validated_boundary_ranges.add(range_key)
             file_range_targets.add((file_range.file_record_id, range_start, range_end))
         desired_user_ids.add(assignee.id)
         targets = desired.setdefault((assignee.id, workflow_step_id), set())
@@ -3905,7 +3993,7 @@ def _resolve_llm_guidelines(
 
     if body.guideline_template_id:
         try:
-            template = read_guideline_template(body.guideline_template_id)
+            template = read_guideline_template(db, body.guideline_template_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="选择的翻译细则模板不存在。") from exc
         parts.append(f"【可复用细则：{template.name}】\n{template.content.strip()}")
@@ -4099,29 +4187,33 @@ def _deduplicate_llm_translation_tasks(
 
 
 @router.get("/guideline-templates")
-def list_translation_guideline_templates():
+def list_translation_guideline_templates(db: Session = Depends(get_db)):
     """列出仓库中可复用的 Markdown 翻译细则模板。"""
     return [
         _serialize_guideline_template(template)
-        for template in list_guideline_templates()
+        for template in list_guideline_templates(db)
     ]
 
 
 @router.post("/guideline-templates/import")
-async def import_translation_guideline_template(file: UploadFile = File(...)):
+async def import_translation_guideline_template(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """导入 .md/.txt 翻译细则，并统一保存为仓库内 UTF-8 Markdown。"""
     raw_bytes = await _read_upload_bytes_with_limit(file)
     try:
-        template = save_guideline_template(file.filename or "", raw_bytes)
+        template = save_guideline_template(db, file.filename or "", raw_bytes, user_id=current_user.id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _serialize_guideline_template(template, include_content=True)
 
 
 @router.get("/guideline-templates/{template_id}")
-def get_translation_guideline_template(template_id: str):
+def get_translation_guideline_template(template_id: str, db: Session = Depends(get_db)):
     try:
-        template = read_guideline_template(template_id)
+        template = read_guideline_template(db, template_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="翻译细则模板不存在。") from exc
     return _serialize_guideline_template(template, include_content=True)
@@ -4131,9 +4223,11 @@ def get_translation_guideline_template(template_id: str):
 def update_translation_guideline_template(
     template_id: str,
     payload: GuidelineTemplateUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     try:
-        template = update_guideline_template(template_id, payload.content)
+        template = update_guideline_template(db, template_id, payload.content, user_id=current_user.id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="翻译细则模板不存在。") from exc
     except ValueError as exc:
@@ -4142,9 +4236,9 @@ def update_translation_guideline_template(
 
 
 @router.delete("/guideline-templates/{template_id}", status_code=204)
-def delete_translation_guideline_template(template_id: str):
+def delete_translation_guideline_template(template_id: str, db: Session = Depends(get_db)):
     try:
-        delete_guideline_template(template_id)
+        delete_guideline_template(db, template_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="翻译细则模板不存在。") from exc
     return Response(status_code=204)
@@ -9208,6 +9302,119 @@ def get_file_record_segment_changes(
     }
 
 
+@router.get("/file-records/{file_record_id}/segments/next-unconfirmed-position")
+def get_file_record_next_unconfirmed_segment_position(
+    file_record_id: UUID,
+    after_sentence_id: str | None = None,
+    page_size: int = 100,
+    wrap: bool = True,
+    scope: str = "all",
+    source_query: str | None = None,
+    target_query: str | None = None,
+    source_exclude: str | None = None,
+    target_exclude: str | None = None,
+    search_fuzzy: bool = False,
+    case_sensitive: bool = False,
+    status_filters: str | None = None,
+    status_filters_bracket: list[str] | None = Query(default=None, alias="status_filters[]"),
+    match_filters: str | None = None,
+    match_filters_bracket: list[str] | None = Query(default=None, alias="match_filters[]"),
+    source_filters: str | None = None,
+    source_filters_bracket: list[str] | None = Query(default=None, alias="source_filters[]"),
+    workflow_step_ids: str | None = None,
+    workflow_step_ids_bracket: list[str] | None = Query(default=None, alias="workflow_step_ids[]"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文件不存在。")
+
+    _require_file_record_read_access(file_record, current_user)
+    _assign_file_segments_to_first_workflow_step(db, file_record)
+    safe_page_size = _normalize_segment_page_limit(page_size)
+    visible_base_query = _apply_segment_assignment_visibility_filter(
+        db,
+        db.query(Segment).filter(Segment.file_record_id == file_record_id),
+        file_record,
+        current_user,
+    )
+
+    after_position = 0
+    if after_sentence_id:
+        after_segment = visible_base_query.filter(Segment.sentence_id == after_sentence_id).first()
+        if not after_segment:
+            raise HTTPException(status_code=404, detail="句段不存在。")
+        after_position = _get_segment_display_index_map(db, file_record_id, [after_segment]).get(after_segment.id, 0) + 1
+
+    filtered_query = _apply_segment_scope_filter(visible_base_query, scope)
+    filtered_query = _apply_segment_text_filters(
+        filtered_query,
+        source_query=source_query,
+        target_query=target_query,
+        source_exclude=source_exclude,
+        target_exclude=target_exclude,
+        case_sensitive=case_sensitive,
+    )
+    filtered_query = _apply_segment_screening_filters(
+        filtered_query,
+        status_filters=_normalize_segment_filter_values(status_filters, status_filters_bracket),
+        match_filters=_normalize_segment_filter_values(match_filters, match_filters_bracket),
+        source_filters=_normalize_segment_filter_values(source_filters, source_filters_bracket),
+        workflow_step_ids=_normalize_segment_filter_values(workflow_step_ids, workflow_step_ids_bracket),
+    )
+
+    filtered_segments = _order_segment_query(
+        filtered_query.with_entities(
+            Segment.id,
+            Segment.sentence_id,
+            Segment.status,
+        )
+    ).all()
+    display_index_map = _get_segment_display_index_map(db, file_record_id, filtered_segments)
+
+    def is_target_unconfirmed(item: Any) -> bool:
+        return getattr(item, "status", None) != "confirmed"
+
+    def get_display_position(item: Any, fallback_index: int) -> int:
+        return display_index_map.get(item.id, fallback_index) + 1
+
+    row: Any | None = None
+    filtered_index = -1
+    for index, item in enumerate(filtered_segments):
+        if is_target_unconfirmed(item) and get_display_position(item, index) > after_position:
+            row = item
+            filtered_index = index
+            break
+    wrapped = False
+    if not row and wrap:
+        for index, item in enumerate(filtered_segments):
+            if is_target_unconfirmed(item) and get_display_position(item, index) <= after_position:
+                row = item
+                filtered_index = index
+                wrapped = True
+                break
+
+    if not row:
+        return {"target": None, "wrapped": False}
+
+    filtered_index = max(filtered_index, 0)
+    display_position = get_display_position(row, filtered_index)
+    return {
+        "target": {
+            "file_record_id": str(file_record_id),
+            "sentence_id": row.sentence_id,
+            "segment_id": str(row.id),
+            "index": filtered_index,
+            "display_index": display_position,
+            "page": (filtered_index // safe_page_size) + 1,
+            "page_size": safe_page_size,
+            "page_index": filtered_index % safe_page_size,
+        },
+        "wrapped": wrapped,
+    }
+
+
 @router.get("/file-records/{file_record_id}/segments/{sentence_id}/position")
 def get_file_record_segment_position(
     file_record_id: UUID,
@@ -11270,11 +11477,7 @@ def merge_segment(
     if first_seg.workflow_step_id != second_seg.workflow_step_id:
         raise HTTPException(status_code=400, detail="只能合并处于同一流程阶段的句段。")
 
-    if (
-        first_seg.block_index != second_seg.block_index
-        or first_seg.row_index != second_seg.row_index
-        or first_seg.cell_index != second_seg.cell_index
-    ):
+    if not _segments_in_same_merge_block(first_seg, second_seg):
         raise HTTPException(status_code=400, detail="只能合并同一区块内相邻的句段。")
 
     # 合并文本
@@ -12759,6 +12962,23 @@ def search_file_record_bound_resources(
         }
 
     like_pattern = f"%{query_text}%"
+    fuzzy_keywords = [keyword for keyword in re.split(r"\s+", query_text) if keyword]
+
+    def apply_resource_text_filter(query, source_column, target_column):
+        if mode == "fuzzy" and len(fuzzy_keywords) > 1:
+            return query.filter(and_(*[
+                or_(
+                    source_column.ilike(f"%{keyword}%"),
+                    target_column.ilike(f"%{keyword}%"),
+                )
+                for keyword in fuzzy_keywords
+            ]))
+        return query.filter(
+            or_(
+                source_column.ilike(like_pattern),
+                target_column.ilike(like_pattern),
+            )
+        )
 
     tm_rows: list[tuple[TranslationMemory, str | None]] = []
     tm_total = 0
@@ -12770,15 +12990,11 @@ def search_file_record_bound_resources(
             .filter(TranslationMemory.source_language == source_language)
             .filter(TranslationMemory.target_language == target_language)
         )
-        if mode == "exact":
-            tm_query = tm_query.filter(TranslationMemory.source_text.ilike(like_pattern))
-        else:
-            tm_query = tm_query.filter(
-                or_(
-                    TranslationMemory.source_text.ilike(like_pattern),
-                    TranslationMemory.target_text.ilike(like_pattern),
-                )
-            )
+        tm_query = apply_resource_text_filter(
+            tm_query,
+            TranslationMemory.source_text,
+            TranslationMemory.target_text,
+        )
         tm_total = tm_query.count()
         tm_rows = (
             tm_query
@@ -12797,15 +13013,11 @@ def search_file_record_bound_resources(
             .filter(TermEntry.source_language == source_language)
             .filter(TermEntry.target_language == target_language)
         )
-        if mode == "exact":
-            term_query = term_query.filter(TermEntry.source_text.ilike(like_pattern))
-        else:
-            term_query = term_query.filter(
-                or_(
-                    TermEntry.source_text.ilike(like_pattern),
-                    TermEntry.target_text.ilike(like_pattern),
-                )
-            )
+        term_query = apply_resource_text_filter(
+            term_query,
+            TermEntry.source_text,
+            TermEntry.target_text,
+        )
         term_total = term_query.count()
         term_rows = (
             term_query
@@ -12817,7 +13029,9 @@ def search_file_record_bound_resources(
     items = [
         *[_serialize_resource_search_tm_row(entry, collection_name) for entry, collection_name in tm_rows],
         *[_serialize_resource_search_term_row(entry, term_base_name) for entry, term_base_name in term_rows],
-    ][:safe_limit]
+    ]
+    items.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
+    items = items[:safe_limit]
 
     return {
         "items": items,

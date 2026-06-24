@@ -46,3 +46,13 @@ frontend/.DS_Store
 tests/
 记忆库下载/
 术语库下载/
+tools/yicat_cookies.json
+TMX下载/
+/tools/
+/.playwright-mcp/
+
+# Local translation export/probe artifacts
+/tm_*.json
+/tm_*.jsonl
+/term_*.json
+/term_*.jsonl

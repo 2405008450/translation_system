@@ -121,7 +121,7 @@ const fallbackEntries = computed(() => props.entries.slice(0, 10))
 .workbench-terms-panel__list,
 .workbench-terms-panel__group {
   display: grid;
-  gap: 12px;
+  gap: 10px;
 }
 
 .workbench-terms-panel__summary {
@@ -132,21 +132,22 @@ const fallbackEntries = computed(() => props.entries.slice(0, 10))
   color: var(--text-muted);
   font-size: 12px;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
 }
 
 .workbench-terms-panel__item {
   display: grid;
   gap: 6px;
   padding: 12px 14px;
-  border: 1px solid var(--line-soft);
-  border-radius: 10px;
-  background: var(--surface-panel);
+  border: 1px solid #d7e4e5;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 4px 12px rgba(29, 59, 67, 0.04);
 }
 
 .workbench-terms-panel__item.is-hit {
-  border-color: rgba(13, 122, 104, 0.22);
-  background: var(--brand-050);
+  border-color: rgba(13, 122, 104, 0.28);
+  background: linear-gradient(180deg, #f2fbf7, #ffffff);
 }
 
 .workbench-terms-panel__item strong {

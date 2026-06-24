@@ -519,9 +519,9 @@ function applyMatchRow(row: MatchDisplayRow | null) {
   display: flex;
   flex-direction: column;
   height: 100%;
-  min-height: min(620px, calc(100vh - 140px));
-  border: 1px solid #cfd8df;
-  background: #ffffff;
+  min-height: 0;
+  border: 0;
+  background: linear-gradient(180deg, #ffffff 0%, #f7fbfb 100%);
   color: #1f2933;
 }
 
@@ -530,10 +530,10 @@ function applyMatchRow(row: MatchDisplayRow | null) {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  min-height: 34px;
-  padding: 6px 10px;
-  border-bottom: 1px solid #cfd8df;
-  background: #f4f7f9;
+  min-height: 44px;
+  padding: 10px 14px;
+  border-bottom: 1px solid #d8e4e7;
+  background: rgba(247, 251, 251, 0.92);
 }
 
 .match-panel__title {
@@ -573,6 +573,31 @@ function applyMatchRow(row: MatchDisplayRow | null) {
   min-height: 180px;
   overflow: auto;
   background: #ffffff;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: #9fb8bd transparent;
+}
+
+.match-summary::-webkit-scrollbar,
+.match-detail::-webkit-scrollbar,
+.match-detail__text::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.match-summary::-webkit-scrollbar-track,
+.match-detail::-webkit-scrollbar-track,
+.match-detail__text::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.match-summary::-webkit-scrollbar-thumb,
+.match-detail::-webkit-scrollbar-thumb,
+.match-detail__text::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-color: #9fb8bd;
+  background-clip: content-box;
 }
 
 .match-summary-table {
@@ -694,8 +719,8 @@ function applyMatchRow(row: MatchDisplayRow | null) {
 .match-detail {
   flex: 0 0 auto;
   max-height: 46%;
-  padding: 8px 10px 10px;
-  border-top: 1px solid #cfd8df;
+  padding: 10px 14px 14px;
+  border-top: 1px solid #d8e4e7;
   background: #ffffff;
   overflow: auto;
   font-size: 12px;

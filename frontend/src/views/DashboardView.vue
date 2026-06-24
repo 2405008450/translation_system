@@ -2,6 +2,9 @@
 import axios from 'axios'
 import {
   Activity,
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   BarChart3,
   Briefcase,
   FileText,
@@ -43,6 +46,8 @@ const granularity = ref<AnalyticsGranularity>('day')
 const dashboard = ref<AnalyticsDashboardResponse | null>(null)
 const loading = ref(false)
 const pageError = ref('')
+const userStatsSortKey = ref<'last_seen_at' | ''>('')
+const userStatsSortOrder = ref<'asc' | 'desc'>('desc')
 
 const chartWidth = 720
 const chartHeight = 240
@@ -56,7 +61,13 @@ const chartPadding = {
 const summary = computed(() => dashboard.value?.summary)
 const series = computed(() => dashboard.value?.series ?? [])
 const topLanguagePairs = computed(() => (dashboard.value?.language_pairs ?? []).slice(0, 8))
-const userStats = computed(() => [...(dashboard.value?.user_stats ?? [])].sort(compareUserStats))
+const userStats = computed(() => {
+  const stats = [...(dashboard.value?.user_stats ?? [])]
+  if (userStatsSortKey.value === 'last_seen_at') {
+    return stats.sort(compareUserStatsByLastSeen)
+  }
+  return stats.sort(compareUserStats)
+})
 const hasSeriesData = computed(() => series.value.some((item) => (
   item.project_created_count
   || item.translated_source_word_count
@@ -204,6 +215,55 @@ function compareUserStats(left: AnalyticsUserStat, right: AnalyticsUserStat) {
     || Number(right.request_count || 0) - Number(left.request_count || 0)
     || left.display_name.localeCompare(right.display_name, 'zh-CN')
   )
+}
+
+function compareUserStatsByLastSeen(left: AnalyticsUserStat, right: AnalyticsUserStat) {
+  const leftTime = parseUserLastSeenTime(left)
+  const rightTime = parseUserLastSeenTime(right)
+  if (leftTime === null && rightTime === null) {
+    return compareUserStats(left, right)
+  }
+  if (leftTime === null) {
+    return 1
+  }
+  if (rightTime === null) {
+    return -1
+  }
+  const result = userStatsSortOrder.value === 'asc'
+    ? leftTime - rightTime
+    : rightTime - leftTime
+  return result || compareUserStats(left, right)
+}
+
+function parseUserLastSeenTime(user: AnalyticsUserStat) {
+  if (!user.last_seen_at) {
+    return null
+  }
+  const timestamp = new Date(user.last_seen_at).getTime()
+  return Number.isNaN(timestamp) ? null : timestamp
+}
+
+function toggleUserStatsLastSeenSort() {
+  if (userStatsSortKey.value !== 'last_seen_at') {
+    userStatsSortKey.value = 'last_seen_at'
+    userStatsSortOrder.value = 'desc'
+    return
+  }
+  userStatsSortOrder.value = userStatsSortOrder.value === 'desc' ? 'asc' : 'desc'
+}
+
+function getUserStatsLastSeenSortIcon() {
+  if (userStatsSortKey.value !== 'last_seen_at') {
+    return ArrowUpDown
+  }
+  return userStatsSortOrder.value === 'desc' ? ArrowDown : ArrowUp
+}
+
+function getUserStatsLastSeenAriaSort() {
+  if (userStatsSortKey.value !== 'last_seen_at') {
+    return 'none'
+  }
+  return userStatsSortOrder.value === 'desc' ? 'descending' : 'ascending'
 }
 
 function getUserRoleLabel(user: AnalyticsUserStat) {
@@ -487,7 +547,17 @@ onMounted(() => {
                   <th>{{ t('dashboard.userStats.newWords') }}</th>
                   <th>{{ t('dashboard.userStats.modifiedWords') }}</th>
                   <th>{{ t('dashboard.userStats.totalWords') }}</th>
-                  <th>{{ t('dashboard.userStats.lastSeen') }}</th>
+                  <th class="user-stats-table__sortable" :aria-sort="getUserStatsLastSeenAriaSort()">
+                    <button
+                      type="button"
+                      class="user-stats-sort-button"
+                      :title="t('dashboard.userStats.lastSeen')"
+                      @click="toggleUserStatsLastSeenSort"
+                    >
+                      <span>{{ t('dashboard.userStats.lastSeen') }}</span>
+                      <component :is="getUserStatsLastSeenSortIcon()" :size="14" aria-hidden="true" />
+                    </button>
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -903,6 +973,38 @@ onMounted(() => {
   font-size: 12px;
   font-weight: 600;
   background: var(--surface-muted);
+}
+
+.user-stats-table__sortable {
+  user-select: none;
+}
+
+.user-stats-sort-button {
+  display: inline-flex;
+  width: 100%;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.user-stats-sort-button:hover,
+.user-stats-sort-button:focus-visible {
+  color: #2563eb;
+}
+
+.user-stats-sort-button:focus-visible {
+  outline: 2px solid rgba(37, 99, 235, 0.35);
+  outline-offset: 3px;
+}
+
+.user-stats-sort-button svg {
+  flex: 0 0 auto;
 }
 
 .user-stats-table th:first-child,

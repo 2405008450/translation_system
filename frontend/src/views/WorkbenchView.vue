@@ -102,6 +102,7 @@ import type {
   RevisionDisplaySettings,
   SaveToTMResult,
   Segment,
+  SegmentNextUnconfirmedPositionResponse,
   SegmentPositionResponse,
   TMCollection,
   TermBase,
@@ -395,6 +396,7 @@ const activeWorkbenchSettingsTab = ref<WorkbenchSettingsTab>('preferences')
 const showSaveToTMDialog = ref(false)
 const openConfirmMenu = ref(false)
 const confirmationActionLoading = ref(false)
+const confirmJumpActionLoading = ref(false)
 const confirmationRangeStart = ref('')
 const confirmationRangeEnd = ref('')
 const manualSaving = ref(false)
@@ -519,7 +521,7 @@ const resourceSearchTMTotal = ref(0)
 const resourceSearchTermTotal = ref(0)
 let resourceSearchRequestId = 0
 const addingTerm = ref(false)
-const showAddTermDialog = ref(false)
+const showAddTermPanel = ref(false)
 const addTermSourceText = ref('')
 const addTermTargetText = ref('')
 const addTermTargetBaseId = ref('')
@@ -1954,6 +1956,10 @@ const addTermTargetTermBases = computed(() => {
   return termBases.value.filter((termBase) => allowedIds.has(termBase.id))
 })
 
+const singleAddTermTargetBase = computed(() => (
+  addTermTargetTermBases.value.length === 1 ? addTermTargetTermBases.value[0] : null
+))
+
 const addTermCanSubmit = computed(() => Boolean(
   addTermSourceText.value.trim()
   && addTermTargetText.value.trim()
@@ -2210,8 +2216,56 @@ function resetResourceSearchResults(message = '请输入关键词，搜索当前
   resourceSearchMessage.value = message
 }
 
+function normalizeResourceSearchKeyword(value: string) {
+  return value.replace(/\s+/g, ' ').trim()
+}
+
+function escapeResourceSearchHtml(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+function getResourceSearchHighlightKeywords() {
+  const keyword = normalizeResourceSearchKeyword(resourceSearchQuery.value)
+  if (!keyword) {
+    return []
+  }
+  const values = resourceSearchMode.value === 'fuzzy'
+    ? keyword.split(/\s+/).filter(Boolean)
+    : [keyword]
+  return Array.from(new Set(values.map((item) => item.toLocaleLowerCase())))
+    .sort((left, right) => right.length - left.length)
+}
+
+function renderResourceSearchResultText(value: string | null | undefined) {
+  const text = value || ''
+  const keywords = getResourceSearchHighlightKeywords()
+  if (!text || keywords.length === 0) {
+    return escapeResourceSearchHtml(text)
+  }
+
+  const regexp = new RegExp(keywords.map(escapeRegExp).join('|'), 'gi')
+  let cursor = 0
+  let rendered = ''
+  for (const match of text.matchAll(regexp)) {
+    const start = match.index ?? 0
+    const matchedText = match[0]
+    if (!matchedText) {
+      continue
+    }
+    rendered += escapeResourceSearchHtml(text.slice(cursor, start))
+    rendered += `<mark class="resource-search-panel__highlight">${escapeResourceSearchHtml(matchedText)}</mark>`
+    cursor = start + matchedText.length
+  }
+  rendered += escapeResourceSearchHtml(text.slice(cursor))
+  return rendered
+}
+
 async function runResourceSearch() {
-  const keyword = resourceSearchQuery.value.trim()
+  const keyword = normalizeResourceSearchKeyword(resourceSearchQuery.value)
   if (!keyword) {
     resetResourceSearchResults(
       segmentStore.mergeViewId
@@ -2261,7 +2315,7 @@ async function runResourceSearch() {
 }
 
 function prepareResourceSearchQuery() {
-  if (!resourceSearchQuery.value.trim() && activeSegmentSourceText.value.trim()) {
+  if (!normalizeResourceSearchKeyword(resourceSearchQuery.value) && activeSegmentSourceText.value.trim()) {
     resourceSearchQuery.value = activeSegmentSourceText.value.trim()
   }
 }
@@ -2452,12 +2506,16 @@ async function openSideTool(tool: SideToolKey) {
   if (activeSideTool.value === tool) {
     activeSideTool.value = null
     sidecarWidth.value = null
+    showAddTermPanel.value = false
     return
   }
 
   pageError.value = ''
   activeSideTool.value = tool
   sidecarWidth.value = null
+  if (tool !== 'terms') {
+    showAddTermPanel.value = false
+  }
 
   try {
     if (tool === 'terms' && termBases.value.length === 0 && !loadingTermBases.value) {
@@ -2466,7 +2524,7 @@ async function openSideTool(tool: SideToolKey) {
 
     if (tool === 'resource-search') {
       prepareResourceSearchQuery()
-      if (resourceSearchQuery.value.trim() && resourceSearchItems.value.length === 0) {
+      if (normalizeResourceSearchKeyword(resourceSearchQuery.value) && resourceSearchItems.value.length === 0) {
         await runResourceSearch()
       }
     }
@@ -3171,7 +3229,79 @@ function findUnconfirmedSegmentIndex(startIndex = 0, endIndex = editorSegments.v
   return -1
 }
 
-async function focusNextUnconfirmedSegment(currentIndex: number) {
+function buildNextUnconfirmedPositionParams(currentSegment: Segment, pageSize: number) {
+  const query = getSegmentWindowQuery(segmentStore.currentPage, pageSize, false)
+  return {
+    after_sentence_id: currentSegment.sentence_id,
+    page_size: pageSize,
+    wrap: true,
+    scope: query.scope,
+    source_query: query.sourceQuery,
+    target_query: query.targetQuery,
+    source_exclude: query.sourceExclude,
+    target_exclude: query.targetExclude,
+    search_fuzzy: query.searchFuzzy,
+    case_sensitive: query.caseSensitive,
+    status_filters: query.statusFilters,
+    match_filters: query.matchFilters,
+    source_filters: query.sourceFilters,
+    workflow_step_ids: query.workflowStepIds,
+  }
+}
+
+async function focusSegmentPosition(target: SegmentPositionResponse) {
+  const pageSize = Math.max(target.page_size || segmentStore.pageSize, 1)
+  if (target.page !== segmentStore.currentPage || pageSize !== segmentStore.pageSize) {
+    await refreshSegmentPage(target.page, pageSize, { includeStats: false })
+  }
+  const targetIndex = editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === target.sentence_id)
+  const fallbackIndex = Math.min(target.page_index, Math.max(editorSegments.value.length - 1, 0))
+  const resolvedIndex = targetIndex >= 0 ? targetIndex : fallbackIndex
+  if (resolvedIndex < 0) {
+    return false
+  }
+  await focusEditorSegmentAtIndex(resolvedIndex)
+  return true
+}
+
+async function focusNextUnconfirmedSegmentByPosition(currentSegment: Segment) {
+  if (isMergeWorkbench.value) {
+    return null
+  }
+  const fileRecordId = segmentStore.fileRecord?.id || props.id
+  if (!fileRecordId) {
+    return null
+  }
+
+  const pageSize = Math.max(segmentStore.pageSize, 1)
+  try {
+    const synced = await syncPendingWorkbenchEdits()
+    if (!synced) {
+      return false
+    }
+    const { data } = await http.get<SegmentNextUnconfirmedPositionResponse>(
+      `/file-records/${fileRecordId}/segments/next-unconfirmed-position`,
+      { params: buildNextUnconfirmedPositionParams(currentSegment, pageSize) },
+    )
+    if (!data.target) {
+      toast.info('没有下一个未确认句段。')
+      return false
+    }
+    return focusSegmentPosition(data.target)
+  } catch (error) {
+    console.warn('Failed to locate next unconfirmed segment:', error)
+    return null
+  }
+}
+
+async function focusNextUnconfirmedSegment(currentIndex: number, currentSegment: Segment | null) {
+  if (currentSegment) {
+    const positioned = await focusNextUnconfirmedSegmentByPosition(currentSegment)
+    if (positioned !== null) {
+      return positioned
+    }
+  }
+
   const initialPage = segmentStore.currentPage
   const pageSize = Math.max(segmentStore.pageSize, 1)
   const initialMatchedCount = segmentStore.matchedSegmentCount
@@ -3221,7 +3351,7 @@ async function focusNextUnconfirmedSegment(currentIndex: number) {
 }
 
 function toggleConfirmMenu() {
-  if (confirmationActionLoading.value || segmentStore.totalSegmentCount === 0) {
+  if (confirmationActionLoading.value || confirmJumpActionLoading.value || segmentStore.totalSegmentCount === 0) {
     return
   }
   openConfirmMenu.value = !openConfirmMenu.value
@@ -3278,22 +3408,36 @@ function formatConfirmationRange(start: number, end: number) {
 }
 
 async function confirmAndMoveToNextUnconfirmed() {
+  if (confirmJumpActionLoading.value) {
+    return
+  }
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
     return
   }
 
+  const currentSegment = activeSegment.value
   const currentIndex = activeEditorIndex.value
-  if (!confirmCurrentSentence()) {
-    return
-  }
+  confirmJumpActionLoading.value = true
+  try {
+    if (!confirmCurrentSentence()) {
+      return
+    }
 
-  if (preferencesStore.confirmJumpMode === 'next_segment') {
-    await focusSentenceByOffset(1)
-    return
-  }
+    if (preferencesStore.confirmJumpMode === 'next_segment') {
+      await focusSentenceByOffset(1)
+      return
+    }
 
-  await focusNextUnconfirmedSegment(currentIndex)
+    if (confirmableSegmentCount.value <= 0) {
+      toast.info('当前文件全部句段都已确认。')
+      return
+    }
+
+    await focusNextUnconfirmedSegment(currentIndex, currentSegment)
+  } finally {
+    confirmJumpActionLoading.value = false
+  }
 }
 
 async function handleConfirmRangeSegments() {
@@ -4448,7 +4592,7 @@ function resolveAddTermTargetBaseId() {
   return candidates[0]?.id || ''
 }
 
-async function openAddTermDialog() {
+async function openAddTermPanel() {
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
     return
@@ -4461,6 +4605,7 @@ async function openAddTermDialog() {
   if (addTermTargetTermBases.value.length === 0) {
     toast.warn('当前文件没有可写入的已启用术语库。')
     activeSideTool.value = 'terms'
+    showAddTermPanel.value = false
     return
   }
 
@@ -4468,14 +4613,15 @@ async function openAddTermDialog() {
   addTermTargetText.value = ''
   addTermTargetBaseId.value = resolveAddTermTargetBaseId()
   addTermFormError.value = ''
-  showAddTermDialog.value = true
+  activeSideTool.value = 'terms'
+  showAddTermPanel.value = true
 }
 
-function closeAddTermDialog() {
+function closeAddTermPanel() {
   if (addingTerm.value) {
     return
   }
-  showAddTermDialog.value = false
+  showAddTermPanel.value = false
   addTermFormError.value = ''
 }
 
@@ -4505,7 +4651,7 @@ async function submitAddTermForm() {
     selectedTermBaseId.value = targetBaseId
     await loadTermEntries()
     activeSideTool.value = 'terms'
-    showAddTermDialog.value = false
+    showAddTermPanel.value = false
     toast.success(t('workbench.ribbon.messages.termAdded'))
   } catch (error) {
     addTermFormError.value = getErrorMessage(error, t('workbench.ribbon.messages.termAddFailed'))
@@ -5637,7 +5783,7 @@ watch(
 )
 
 watch(resourceSearchMode, () => {
-  if (activeSideTool.value === 'resource-search' && resourceSearchQuery.value.trim()) {
+  if (activeSideTool.value === 'resource-search' && normalizeResourceSearchKeyword(resourceSearchQuery.value)) {
     void runResourceSearch()
   }
 })
@@ -5888,14 +6034,14 @@ onBeforeRouteLeave(async () => {
             data-testid="workbench-confirm-menu"
             type="button"
             :class="{ active: openConfirmMenu }"
-            :disabled="confirmationActionLoading || segmentStore.totalSegmentCount === 0"
+            :disabled="confirmationActionLoading || confirmJumpActionLoading || segmentStore.totalSegmentCount === 0"
             :aria-expanded="openConfirmMenu"
             aria-haspopup="menu"
             @click.stop="toggleConfirmMenu"
           >
             <span class="tool-line line1 with-big-icon">
               <span class="icon-text-area has_dropdown">
-                <Loader2 v-if="confirmationActionLoading" class="lucide-spin tool-single-icon" :size="28" />
+                <Loader2 v-if="confirmationActionLoading || confirmJumpActionLoading" class="lucide-spin tool-single-icon" :size="28" />
                 <Check v-else class="tool-single-icon tool-single-icon--confirm" :size="28" />
               </span>
               <span class="dropdown-link" aria-hidden="true">
@@ -5918,7 +6064,7 @@ onBeforeRouteLeave(async () => {
               data-testid="workbench-confirm-next"
               type="button"
               role="menuitem"
-              :disabled="confirmationActionLoading || !activeSegmentCanWrite"
+              :disabled="confirmationActionLoading || confirmJumpActionLoading || !activeSegmentCanWrite"
               @click="openConfirmMenu = false; void confirmAndMoveToNextUnconfirmed()"
             >
               确认并跳到下一个
@@ -6345,7 +6491,7 @@ onBeforeRouteLeave(async () => {
         </div>
 
         <div class="tool-group">
-          <button class="tool-col tool-col--big tool-button" type="button" :disabled="addingTerm" @click="void openAddTermDialog()">
+          <button class="tool-col tool-col--big tool-button" type="button" :disabled="addingTerm" @click="void openAddTermPanel()">
             <span class="tool-line line1 with-big-icon">
               <span class="icon-text-area">
                 <Loader2 v-if="addingTerm" class="lucide-spin tool-single-icon" :size="27" />
@@ -8014,6 +8160,81 @@ onBeforeRouteLeave(async () => {
             @replace-text="handleReplaceText"
             @append-text="handleAppendText"
           />
+          <section
+            v-else-if="activeSideTool === 'terms' && showAddTermPanel"
+            key="add-term"
+            class="panel workbench-tool-panel add-term-side-panel"
+          >
+            <div class="panel-header panel-header--compact add-term-side-panel__header">
+              <div>
+                <div class="section-title section-title--tight">添加术语</div>
+              </div>
+              <button
+                class="button button--icon"
+                type="button"
+                :disabled="addingTerm"
+                title="收起"
+                aria-label="收起添加术语表单"
+                @click="closeAddTermPanel"
+              >
+                <X :size="14" />
+              </button>
+            </div>
+
+            <form class="add-term-panel" @submit.prevent="void submitAddTermForm()">
+              <label class="field">
+                <span class="field__label">原文</span>
+                <textarea
+                  v-model="addTermSourceText"
+                  class="field__control add-term-panel__textarea"
+                  rows="3"
+                  :disabled="addingTerm"
+                  placeholder="输入原文术语"
+                />
+              </label>
+
+              <label class="field">
+                <span class="field__label">译文</span>
+                <textarea
+                  v-model="addTermTargetText"
+                  class="field__control add-term-panel__textarea"
+                  rows="3"
+                  :disabled="addingTerm"
+                  placeholder="输入对应译文"
+                />
+              </label>
+
+              <div v-if="singleAddTermTargetBase" class="add-term-panel__base">
+                <span>写入</span>
+                <strong>{{ singleAddTermTargetBase.name }}</strong>
+              </div>
+              <label v-else class="field">
+                <span class="field__label">术语库</span>
+                <select
+                  v-model="addTermTargetBaseId"
+                  class="field__control"
+                  :disabled="addingTerm || loadingTermBases"
+                >
+                  <option value="">请选择术语库</option>
+                  <option v-for="termBase in addTermTargetTermBases" :key="termBase.id" :value="termBase.id">
+                    {{ termBase.name }}（{{ termBase.entry_count }} 条）
+                  </option>
+                </select>
+              </label>
+
+              <p v-if="addTermFormError" class="form-message is-error">{{ addTermFormError }}</p>
+
+              <div class="add-term-panel__actions">
+                <button class="button button--ghost" type="button" :disabled="addingTerm" @click="closeAddTermPanel">
+                  取消
+                </button>
+                <button class="button" type="submit" :disabled="!addTermCanSubmit">
+                  <Loader2 v-if="addingTerm" class="lucide-spin" :size="14" />
+                  <span>{{ addingTerm ? t('common.actions.saving') : '添加' }}</span>
+                </button>
+              </div>
+            </form>
+          </section>
           <WorkbenchTermsPanel
             v-else-if="activeSideTool === 'terms'"
             key="terms"
@@ -8082,8 +8303,16 @@ onBeforeRouteLeave(async () => {
                         {{ item.type === 'tm' ? 'TM' : 'TB' }}
                       </span>
                     </td>
-                    <td>{{ item.source_text }}</td>
-                    <td>{{ item.target_text }}</td>
+                    <td
+                      class="resource-search-panel__text"
+                      :title="item.source_text"
+                      v-html="renderResourceSearchResultText(item.source_text)"
+                    ></td>
+                    <td
+                      class="resource-search-panel__text"
+                      :title="item.target_text"
+                      v-html="renderResourceSearchResultText(item.target_text)"
+                    ></td>
                   </tr>
                 </tbody>
               </table>
@@ -8344,67 +8573,6 @@ onBeforeRouteLeave(async () => {
           {{ workflowTransitionDirection === 'forward' ? '前进句段' : '退回句段' }}
         </button>
       </template>
-    </Modal>
-
-    <Modal
-      :open="showAddTermDialog"
-      title="添加术语"
-      :description="segmentStore.fileRecord?.filename || ''"
-      width="min(680px, calc(100vw - 32px))"
-      :close-on-overlay="!addingTerm"
-      :close-on-esc="!addingTerm"
-      @close="closeAddTermDialog"
-    >
-      <form class="add-term-dialog" @submit.prevent="void submitAddTermForm()">
-        <label class="field">
-          <span class="field__label">原文内容</span>
-          <textarea
-            v-model="addTermSourceText"
-            class="field__control add-term-dialog__textarea"
-            rows="3"
-            :disabled="addingTerm"
-            placeholder="请输入原文术语"
-          />
-        </label>
-
-        <label class="field">
-          <span class="field__label">译文内容</span>
-          <textarea
-            v-model="addTermTargetText"
-            class="field__control add-term-dialog__textarea"
-            rows="3"
-            :disabled="addingTerm"
-            placeholder="请输入对应译文"
-          />
-        </label>
-
-        <label class="field">
-          <span class="field__label">目标术语库</span>
-          <select
-            v-model="addTermTargetBaseId"
-            class="field__control"
-            :disabled="addingTerm || loadingTermBases"
-          >
-            <option value="">请选择目标术语库</option>
-            <option v-for="termBase in addTermTargetTermBases" :key="termBase.id" :value="termBase.id">
-              {{ termBase.name }}（{{ termBase.entry_count }} 条）
-            </option>
-          </select>
-        </label>
-
-        <p class="hint-text">仅显示当前文件已启用且允许写入的术语库。</p>
-        <p v-if="addTermFormError" class="form-message is-error">{{ addTermFormError }}</p>
-
-        <div class="add-term-dialog__actions">
-          <button class="button button--ghost" type="button" :disabled="addingTerm" @click="closeAddTermDialog">
-            {{ t('common.actions.cancel') }}
-          </button>
-          <button class="button" type="submit" :disabled="!addTermCanSubmit">
-            <Loader2 v-if="addingTerm" class="lucide-spin" :size="14" />
-            <span>{{ addingTerm ? t('common.actions.saving') : '添加术语' }}</span>
-          </button>
-        </div>
-      </form>
     </Modal>
 
     <Modal
@@ -9495,10 +9663,12 @@ onBeforeRouteLeave(async () => {
 
 .workbench-page.is-standalone .workbench-sidecar {
   top: var(--workbench-side-panel-top);
+  height: calc(100vh - var(--workbench-side-panel-top) - 20px);
   max-height: calc(100vh - var(--workbench-side-panel-top) - 20px);
 }
 
 .workbench-page.is-standalone .workbench-sidecar__panel {
+  height: calc(100vh - var(--workbench-side-panel-top) - 20px);
   max-height: calc(100vh - var(--workbench-side-panel-top) - 20px);
 }
 
@@ -9617,18 +9787,44 @@ onBeforeRouteLeave(async () => {
   white-space: nowrap;
 }
 
-.add-term-dialog,
+.add-term-panel,
 .save-to-tm-dialog {
   display: grid;
   gap: 12px;
 }
 
-.add-term-dialog__textarea {
-  min-height: 96px;
+.add-term-side-panel__header {
+  align-items: center;
+}
+
+.add-term-panel {
+  gap: 10px;
+}
+
+.add-term-panel__textarea {
+  min-height: 72px;
   resize: vertical;
 }
 
-.add-term-dialog__actions {
+.add-term-panel__base {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 6px 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.add-term-panel__base strong {
+  min-width: 0;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.add-term-panel__actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
@@ -10946,8 +11142,9 @@ onBeforeRouteLeave(async () => {
   gap: 12px;
   min-height: 0;
   height: 100%;
-  padding: 14px;
-  background: #f8fbfb;
+  padding: 18px;
+  overflow: hidden;
+  background: linear-gradient(180deg, #ffffff 0%, #f7fbfb 100%);
 }
 
 .resource-search-panel__header {
@@ -10963,7 +11160,7 @@ onBeforeRouteLeave(async () => {
   align-items: center;
   overflow: hidden;
   border: 1px solid #c9d7dd;
-  border-radius: 4px;
+  border-radius: 6px;
   background: #fff;
 }
 
@@ -11013,10 +11210,31 @@ onBeforeRouteLeave(async () => {
 }
 
 .resource-search-panel__table-wrap {
+  flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
   border: 1px solid #d6e1e5;
+  border-radius: 6px;
   background: #fff;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: #9fb8bd transparent;
+}
+
+.resource-search-panel__table-wrap::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.resource-search-panel__table-wrap::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.resource-search-panel__table-wrap::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-color: #9fb8bd;
+  background-clip: content-box;
 }
 
 .resource-search-panel__table {
@@ -11051,7 +11269,21 @@ onBeforeRouteLeave(async () => {
 }
 
 .resource-search-panel__table tbody tr:nth-child(even) {
-  background: #edf6ff;
+  background: #f5fafc;
+}
+
+.resource-search-panel__text {
+  word-break: break-word;
+}
+
+.resource-search-panel__table :deep(.resource-search-panel__highlight) {
+  display: inline;
+  padding: 1px 2px;
+  border-radius: 3px;
+  background: #fff176;
+  color: inherit;
+  box-shadow: inset 0 0 0 1px rgba(138, 103, 0, 0.2);
+  font-weight: 700;
 }
 
 .resource-search-panel__badge {

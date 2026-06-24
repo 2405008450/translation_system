@@ -633,6 +633,11 @@ export interface SegmentPositionResponse {
   page_index: number
 }
 
+export interface SegmentNextUnconfirmedPositionResponse {
+  target: SegmentPositionResponse | null
+  wrapped: boolean
+}
+
 /** 合并视图摘要（列表项） */
 export interface MergeView {
   id: string

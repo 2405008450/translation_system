@@ -650,6 +650,45 @@ class User(Base):
     )
 
 
+class GuidelineTemplate(Base):
+    __tablename__ = "guideline_templates"
+    __table_args__ = (
+        Index("ix_guideline_templates_updated_at", "updated_at"),
+        Index("ix_guideline_templates_created_by_id", "created_by_id"),
+        Index("ix_guideline_templates_last_modified_by_id", "last_modified_by_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(120), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default=text("''"))
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    source_path: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    last_modified_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    creator: Mapped["User | None"] = relationship("User", foreign_keys=[created_by_id])
+    last_modified_by: Mapped["User | None"] = relationship("User", foreign_keys=[last_modified_by_id])
+
+
 class ProjectAssignment(Base):
     __tablename__ = "project_assignments"
     __table_args__ = (
