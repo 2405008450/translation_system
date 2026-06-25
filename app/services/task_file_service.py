@@ -643,13 +643,14 @@ def build_task_workspace(
     segments: list[dict[str, Any]] = []
     for index, (segment, match_result) in enumerate(zip(parse_result.segments, match_results, strict=False)):
         context = _build_segment_context(parse_result.ast, segment.block_path, fallback_index=index)
+        existing_target_text = str(context.get("target") or "").strip()
         segments.append(
             {
                 "sentence_id": segment.segment_id,
                 "source_text": segment.source_text,
                 "display_text": segment.display_text,
-                "target_text": match_result.target_text or "",
-                "status": match_result.status,
+                "target_text": existing_target_text or match_result.target_text or "",
+                "status": "confirmed" if existing_target_text else match_result.status,
                 "score": match_result.score,
                 "matched_source_text": match_result.matched_source_text or "",
                 "matched_collection_name": match_result.matched_collection_name,
@@ -864,10 +865,17 @@ def build_export_segments_from_source(
         str(_get_segment_value(segment, "sentence_id", _get_segment_value(segment, "segment_id", ""))): segment
         for segment in segments
     }
+    ordered_translated_segments = list(segments)
 
     export_segments: list[dict[str, Any]] = []
     for index, parsed_segment in enumerate(parse_result.segments):
         translated_segment = translated_segments.get(parsed_segment.segment_id)
+        if translated_segment is None and index < len(ordered_translated_segments):
+            candidate_segment = ordered_translated_segments[index]
+            if _normalize_export_source_text(
+                _get_segment_value(candidate_segment, "source_text", "")
+            ) == _normalize_export_source_text(parsed_segment.source_text):
+                translated_segment = candidate_segment
         context = _build_segment_context(parse_result.ast, parsed_segment.block_path, fallback_index=index)
         export_segments.append(
             {
@@ -950,7 +958,7 @@ def _build_segment_context(
         context["index"] = subtitle_index
         context["subtitle_index"] = subtitle_index
 
-    for field in ("id", "tu_id", "start", "end", "zip_path", "rar_path", "file_type"):
+    for field in ("id", "tu_id", "mid", "target", "start", "end", "zip_path", "rar_path", "file_type"):
         value = metadata.get(field)
         if value is not None and not isinstance(value, (dict, list, set, tuple)):
             context[field] = value
@@ -996,6 +1004,10 @@ def _get_segment_value(segment: Any, field_name: str, default: Any = None) -> An
     if isinstance(segment, dict):
         return segment.get(field_name, default)
     return getattr(segment, field_name, default)
+
+
+def _normalize_export_source_text(value: Any) -> str:
+    return " ".join(str(value or "").split())
 
 
 def _to_optional_int(value: Any) -> int | None:

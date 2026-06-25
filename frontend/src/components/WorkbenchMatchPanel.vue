@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import type {
@@ -77,6 +77,14 @@ const tmCandidates = ref<TMMatchCandidate[]>([])
 const loadingCandidates = ref(false)
 const selectedRowId = ref('')
 let candidateRequestId = 0
+const CANDIDATE_DEBOUNCE_MS = 250
+const CANDIDATE_CACHE_TTL_MS = 30_000
+type CandidateCacheEntry = {
+  candidates: TMMatchCandidate[]
+  expiresAt: number
+}
+const tmCandidateCache = new Map<string, CandidateCacheEntry>()
+let candidateLoadTimer: number | null = null
 
 const termEntryById = computed(() => {
   return new Map(props.termEntries.map((entry) => [entry.id, entry]))
@@ -194,41 +202,94 @@ const selectedMatchRow = computed(() => {
   return matchRows.value.find((row) => row.id === selectedRowId.value) ?? matchRows.value[0] ?? null
 })
 
-watch(
-  () => [props.segment?.id ?? '', props.fileRecordId ?? ''],
-  async ([segmentId, fileRecordId]) => {
-    const requestId = ++candidateRequestId
+function buildTMCandidateCacheKey(segmentId: string, fileRecordId: string, sourceText: string) {
+  return [fileRecordId, segmentId, sourceText].join(':')
+}
 
+function clearCandidateLoadTimer() {
+  if (candidateLoadTimer !== null) {
+    window.clearTimeout(candidateLoadTimer)
+    candidateLoadTimer = null
+  }
+}
+
+function scheduleTMCandidatesLoad(segmentId: string, fileRecordId: string, sourceText: string) {
+  const requestId = ++candidateRequestId
+  clearCandidateLoadTimer()
+  candidateLoadTimer = window.setTimeout(() => {
+    candidateLoadTimer = null
+    void loadTMCandidates(segmentId, fileRecordId, sourceText, requestId)
+  }, CANDIDATE_DEBOUNCE_MS)
+}
+
+async function loadTMCandidates(
+  segmentId: string,
+  fileRecordId: string,
+  sourceText: string,
+  requestId: number,
+) {
+  if (!segmentId || !fileRecordId) {
+    tmCandidates.value = []
+    loadingCandidates.value = false
+    return
+  }
+
+  const cacheKey = buildTMCandidateCacheKey(segmentId, fileRecordId, sourceText)
+  const cached = tmCandidateCache.get(cacheKey)
+  if (cached && cached.expiresAt > Date.now()) {
+    if (requestId !== candidateRequestId) return
+    tmCandidates.value = cached.candidates
+    loadingCandidates.value = false
+    return
+  }
+
+  loadingCandidates.value = true
+  try {
+    const { data } = await http.get<{
+      segment_id: string
+      source_text: string
+      candidates: TMMatchCandidate[]
+    }>(`/file-records/${fileRecordId}/segments/${segmentId}/tm-candidates`)
+
+    if (requestId === candidateRequestId) {
+      const candidates = data.candidates || []
+      tmCandidates.value = candidates
+      tmCandidateCache.set(cacheKey, {
+        candidates,
+        expiresAt: Date.now() + CANDIDATE_CACHE_TTL_MS,
+      })
+    }
+  } catch (error) {
+    console.error('Failed to load TM candidates:', error)
+    if (requestId === candidateRequestId) {
+      tmCandidates.value = []
+    }
+  } finally {
+    if (requestId === candidateRequestId) {
+      loadingCandidates.value = false
+    }
+  }
+}
+
+watch(
+  () => [props.segment?.id ?? '', props.fileRecordId ?? '', props.segment?.source_text ?? ''],
+  ([segmentId, fileRecordId, sourceText]) => {
     if (!segmentId || !fileRecordId) {
+      candidateRequestId += 1
+      clearCandidateLoadTimer()
       tmCandidates.value = []
       loadingCandidates.value = false
       return
     }
-
-    loadingCandidates.value = true
-    try {
-      const { data } = await http.get<{
-        segment_id: string
-        source_text: string
-        candidates: TMMatchCandidate[]
-      }>(`/file-records/${fileRecordId}/segments/${segmentId}/tm-candidates`)
-
-      if (requestId === candidateRequestId) {
-        tmCandidates.value = data.candidates || []
-      }
-    } catch (error) {
-      console.error('Failed to load TM candidates:', error)
-      if (requestId === candidateRequestId) {
-        tmCandidates.value = []
-      }
-    } finally {
-      if (requestId === candidateRequestId) {
-        loadingCandidates.value = false
-      }
-    }
+    scheduleTMCandidatesLoad(segmentId, fileRecordId, sourceText)
   },
   { immediate: true },
 )
+
+onBeforeUnmount(() => {
+  candidateRequestId += 1
+  clearCandidateLoadTimer()
+})
 
 watch(
   matchRows,

@@ -26,7 +26,7 @@ from app.services.tm_vector import (
 
 
 EXACT_MATCH_BATCH_SIZE = 1000
-FUZZY_MATCH_BATCH_SIZE = 200
+DEFAULT_FUZZY_MATCH_BATCH_SIZE = 50
 FUZZY_CANDIDATE_LIMIT = 3
 TM_CANDIDATES_LIMIT = 5
 T = TypeVar("T")
@@ -518,7 +518,7 @@ def _find_fuzzy_matches(
 
     matches: list[ResolvedMatch | None] = []
     total_candidates = 0
-    for chunk in _chunked(prepared_sentences, FUZZY_MATCH_BATCH_SIZE):
+    for chunk in _chunked(prepared_sentences, _get_fuzzy_match_batch_size()):
         chunk_matches, chunk_candidates = _find_fuzzy_matches_chunk(
             db=db,
             prepared_sentences=chunk,
@@ -611,6 +611,7 @@ FROM memory_entries AS tm
         ),
         {"trigram_limit": trigram_prefilter_threshold},
     )
+    _apply_match_statement_timeout(db)
     rows = db.execute(stmt, params).mappings().all()
 
     grouped_candidates: dict[int, dict[tuple[str, str], dict]] = {}
@@ -646,7 +647,7 @@ FROM memory_entries AS tm
                 float(candidate_entry["source_trigram_score"]),
             )
 
-    if is_tm_vector_ready(db):
+    if _get_tm_vector_weight() > 0 and is_tm_vector_ready(db):
         _merge_vector_candidates(
             db=db,
             prepared_sentences=prepared_sentences,
@@ -793,6 +794,7 @@ FROM memory_entries AS tm
     )
 
     try:
+        _apply_match_statement_timeout(db)
         rows = db.execute(stmt, params).mappings().all()
     except SQLAlchemyError as exc:
         mark_tm_vector_unavailable(db)
@@ -901,6 +903,32 @@ def _pick_best_fuzzy_candidate(
 
 def _get_trigram_prefilter_threshold(similarity_threshold: float) -> float:
     return min(max(similarity_threshold, 0.01), 0.3)
+
+
+def _get_fuzzy_match_batch_size() -> int:
+    settings = get_settings()
+    configured = getattr(
+        settings,
+        "tm_fuzzy_match_batch_size",
+        DEFAULT_FUZZY_MATCH_BATCH_SIZE,
+    )
+    return min(max(int(configured), 1), EXACT_MATCH_BATCH_SIZE)
+
+
+def _get_match_statement_timeout_ms() -> int:
+    settings = get_settings()
+    configured = getattr(settings, "tm_match_statement_timeout_ms", 0)
+    return max(int(configured or 0), 0)
+
+
+def _apply_match_statement_timeout(db: Session) -> None:
+    timeout_ms = _get_match_statement_timeout_ms()
+    if timeout_ms <= 0:
+        return
+    db.execute(
+        text("SELECT set_config('statement_timeout', :timeout_value, true)"),
+        {"timeout_value": f"{timeout_ms}ms"},
+    )
 
 
 def _blend_match_score(lexical_score: float, vector_score: float) -> float:

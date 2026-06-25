@@ -3,7 +3,6 @@ DITA 适配器模块 - 解析 DITA XML 文件
 
 Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6
 """
-import hashlib
 from io import BytesIO
 from typing import List, Optional
 
@@ -273,9 +272,8 @@ class DitaAdapter(FormatAdapter):
             if node.text_content and node.text_content.strip():
                 display_text = node.text_content.strip()
                 source_text = " ".join(display_text.split())
-                content_hash = hashlib.md5(source_text.encode()).hexdigest()[:8]
                 segments.append(Segment(
-                    segment_id=Segment.generate_id(path, position, content_hash),
+                    segment_id=f"seg-{position + 1:06d}",
                     source_text=source_text,
                     display_text=display_text,
                     block_path=path,

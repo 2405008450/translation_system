@@ -261,10 +261,7 @@ class MultiFormatExporter:
         elif extension == ".sdlxliff":
             from app.services.adapters.sdlxliff_exporter import SdlxliffExporter
 
-            content = SdlxliffExporter().export(
-                original_bytes,
-                {**text_map, **translation_maps["segment_id"]},
-            )
+            content = SdlxliffExporter().export_by_segments(original_bytes, segments)
         elif extension == ".txml":
             from app.services.adapters.txml_exporter import TxmlExporter
 

@@ -92,6 +92,27 @@ def is_tm_vector_ready(db: Session) -> bool:
                               AND table_name = 'memory_entries'
                               AND column_name = 'source_embedding_version'
                         )
+                        AND EXISTS (
+                            SELECT 1
+                            FROM pg_index AS idx
+                            JOIN pg_class AS index_class
+                              ON index_class.oid = idx.indexrelid
+                            JOIN pg_class AS table_class
+                              ON table_class.oid = idx.indrelid
+                            JOIN pg_namespace AS table_schema
+                              ON table_schema.oid = table_class.relnamespace
+                            JOIN pg_am AS access_method
+                              ON access_method.oid = index_class.relam
+                            JOIN pg_attribute AS indexed_attribute
+                              ON indexed_attribute.attrelid = table_class.oid
+                             AND indexed_attribute.attnum = ANY(idx.indkey)
+                            WHERE table_schema.nspname = current_schema()
+                              AND table_class.relname = 'memory_entries'
+                              AND indexed_attribute.attname = 'source_embedding'
+                              AND idx.indisvalid
+                              AND idx.indisready
+                              AND access_method.amname IN ('ivfflat', 'hnsw')
+                        )
                     """
                 )
             ).scalar()

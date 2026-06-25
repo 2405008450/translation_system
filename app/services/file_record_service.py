@@ -45,10 +45,10 @@ _WORKSPACE_SOURCE_FILENAME_KEY = "_source_filename"
 
 
 SEGMENT_ORDERING = (
-    Segment.sentence_id.asc(),
     Segment.block_index.asc(),
     Segment.row_index.asc().nullsfirst(),
     Segment.cell_index.asc().nullsfirst(),
+    Segment.sentence_id.asc(),
 )
 
 _PENDING_SOURCE_FILES_KEY = "pending_source_files"

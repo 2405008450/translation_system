@@ -11,7 +11,7 @@ from typing import Any
 
 import yaml
 
-from app.services.language_pairs import LANGUAGE_LABELS
+from app.services.language_pairs import LANGUAGE_LABELS, normalize_language_code
 from app.services.libreoffice_service import LibreOfficeError, convert_word_to_docx
 
 
@@ -29,6 +29,7 @@ SUPPORTED_TEXT_EXTENSIONS = {
     ".po",
     ".pot",
     ".properties",
+    ".sdlxliff",
     ".srt",
     ".txt",
     ".yaml",
@@ -80,6 +81,17 @@ def detect_upload_language(filename: str, raw_bytes: bytes) -> LanguageDetection
     extension = Path(filename or "").suffix.lower()
     if extension not in SUPPORTED_EXTENSIONS:
         return _empty_result(supported=False, message=UNSUPPORTED_MESSAGE)
+
+    declared_language = _extract_declared_source_language(extension, raw_bytes)
+    if declared_language:
+        return LanguageDetectionResult(
+            language=declared_language,
+            label=LANGUAGE_LABELS.get(declared_language),
+            confidence=0.99,
+            supported=True,
+            sample_length=0,
+            message=SUCCESS_MESSAGE,
+        )
 
     sample = _extract_sample_text(extension, raw_bytes)
     sample_length = len(re.sub(r"\s+", "", sample))
@@ -137,6 +149,8 @@ def _extract_sample_text(extension: str, raw_bytes: bytes) -> str:
         return _extract_pptx_text(raw_bytes)
     if extension == ".xlsx":
         return _extract_xlsx_text(raw_bytes)
+    if extension == ".sdlxliff":
+        return _extract_sdlxliff_text(raw_bytes)
 
     text = _decode_text(raw_bytes[:MAX_TEXT_BYTES])
     if not text:
@@ -167,6 +181,38 @@ def _decode_text(raw_bytes: bytes) -> str:
         except UnicodeDecodeError:
             continue
     return ""
+
+
+def _extract_declared_source_language(extension: str, raw_bytes: bytes) -> str | None:
+    if extension != ".sdlxliff":
+        return None
+
+    try:
+        from lxml import etree
+
+        root = etree.fromstring(
+            raw_bytes[:MAX_TEXT_BYTES],
+            parser=etree.XMLParser(recover=True),
+        )
+    except Exception:
+        return None
+
+    language = None
+    for file_node in root.xpath('.//*[local-name()="file"]'):
+        language = (
+            file_node.get("source-language")
+            or file_node.get("srcLang")
+            or file_node.get("{http://www.w3.org/XML/1998/namespace}lang")
+        )
+        if language:
+            break
+
+    if not language:
+        return None
+    try:
+        return normalize_language_code(language, field_label="源语言")
+    except ValueError:
+        return None
 
 
 def _extract_docx_text(raw_bytes: bytes) -> str:
@@ -236,6 +282,27 @@ def _extract_xlsx_text(raw_bytes: bytes) -> str:
                         return _normalize_sample(" ".join(parts))
     finally:
         workbook.close()
+    return _normalize_sample(" ".join(parts))
+
+
+def _extract_sdlxliff_text(raw_bytes: bytes) -> str:
+    try:
+        from lxml import etree
+
+        root = etree.fromstring(
+            raw_bytes[:MAX_TEXT_BYTES],
+            parser=etree.XMLParser(recover=True),
+        )
+    except Exception:
+        return ""
+
+    parts: list[str] = []
+    marks = root.xpath('.//*[local-name()="seg-source"]//*[local-name()="mrk" and @mtype="seg"]')
+    candidates = marks or root.xpath('.//*[local-name()="source"]')
+    for element in candidates:
+        _append_text_part(parts, "".join(element.itertext()))
+        if _joined_length(parts) >= MAX_SAMPLE_CHARS:
+            break
     return _normalize_sample(" ".join(parts))
 
 

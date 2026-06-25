@@ -1189,6 +1189,7 @@ async def pretranslation_run_job(ctx, run_id: str) -> None:
 
 
 class WorkerSettings:
+    max_jobs = max(int(get_settings().arq_max_jobs), 1)
     functions = [
         process_import_task_job,
         tm_resource_import_job,
@@ -9725,6 +9726,24 @@ def get_segment_tm_candidates(
     }
 
 
+def _filter_tm_rematch_segments(
+    segments: list[Segment],
+    *,
+    skip_confirmed: bool,
+) -> tuple[list[Segment], int]:
+    if not skip_confirmed:
+        return segments, 0
+
+    matchable_segments: list[Segment] = []
+    skipped_count = 0
+    for segment in segments:
+        if segment.status == "confirmed":
+            skipped_count += 1
+            continue
+        matchable_segments.append(segment)
+    return matchable_segments, skipped_count
+
+
 @router.post("/file-records/{file_record_id}/rematch")
 def rematch_file_record(
     file_record_id: UUID,
@@ -9761,23 +9780,29 @@ def rematch_file_record(
     if not segments:
         return {"exact": 0, "fuzzy": 0, "skipped": 0, "updated": 0}
 
-    source_sentences = [segment.source_text for segment in segments]
-    auxiliary_sentences = [segment.display_text for segment in segments]
-    matches, _ = match_sentences_with_stats(
-        db=db,
-        sentences=source_sentences,
-        auxiliary_sentences=auxiliary_sentences,
-        similarity_threshold=threshold,
-        collection_ids=selected_collection_ids,
+    matchable_segments, skipped_count = _filter_tm_rematch_segments(
+        segments,
+        skip_confirmed=payload.skip_confirmed,
     )
+    if matchable_segments:
+        source_sentences = [segment.source_text for segment in matchable_segments]
+        auxiliary_sentences = [segment.display_text for segment in matchable_segments]
+        matches, _ = match_sentences_with_stats(
+            db=db,
+            sentences=source_sentences,
+            auxiliary_sentences=auxiliary_sentences,
+            similarity_threshold=threshold,
+            collection_ids=selected_collection_ids,
+        )
+    else:
+        matches = []
 
     exact_count = 0
     fuzzy_count = 0
-    skipped_count = 0
     updated_count = 0
     clean_numbering = is_word_document_filename(file_record.filename)
 
-    for segment, match in zip(segments, matches, strict=False):
+    for segment, match in zip(matchable_segments, matches, strict=False):
         before = (
             segment.target_text,
             segment.status,
@@ -9789,9 +9814,6 @@ def rematch_file_record(
             segment.matched_created_at,
             segment.matched_updated_at,
         )
-        if payload.skip_confirmed and segment.status == "confirmed":
-            skipped_count += 1
-            continue
 
         segment.score = float(match.score or 0)
         segment.matched_source_text = match.matched_source_text

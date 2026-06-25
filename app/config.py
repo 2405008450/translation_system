@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     reference_llm_base_url: str = "https://openrouter.ai/api/v1"
     redis_url: str | None = None
     import_queue_backend: str = "local"
+    arq_max_jobs: int = 1
     aspose_words_license_path: str | None = None
     libreoffice_soffice_path: str | None = None
     libreoffice_python_path: str | None = None
@@ -71,6 +72,8 @@ class Settings(BaseSettings):
     tm_vector_candidate_limit: int = 6
     tm_vector_similarity_floor: float = 0.45
     tm_vector_weight: float = 0.35
+    tm_fuzzy_match_batch_size: int = 50
+    tm_match_statement_timeout_ms: int = 45000
     jwt_secret_key: str = DEFAULT_JWT_SECRET_KEY
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 1440
