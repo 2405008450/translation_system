@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
@@ -36,12 +37,16 @@ from app.services.term_entry_service import (
 )
 from app.services.term_importer import (
     TERM_IMPORT_EXTENSIONS,
+    TMX_EXTENSIONS,
     XLSX_EXTENSIONS,
+    import_terms_from_tmx_path,
     import_terms_from_xlsx_path,
     import_terms_from_xlsx_upload,
+    preview_terms_from_tmx_path,
     preview_terms_from_xlsx_path,
     preview_terms_from_upload,
 )
+from app.services.resource_import_batch import create_resource_import_batch
 from app.services.import_task_storage import (
     cleanup_import_task_staging,
     read_import_file_bytes,
@@ -59,6 +64,7 @@ from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_r
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 logger = logging.getLogger(__name__)
+_TERM_RESOURCE_IMPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="term-resource-import")
 
 
 class TermBasePayload(BaseModel):
@@ -227,7 +233,7 @@ def _resource_import_batch_size() -> int:
 
 
 def _resource_import_max_file_bytes(_: str) -> int:
-    return max(1, int(get_settings().upload_max_size_mb or 100)) * 1024 * 1024
+    return max(1, int(get_settings().resource_import_max_size_mb or 1024)) * 1024 * 1024
 
 
 def _stage_resource_upload_file(file: UploadFile) -> tuple[str, dict[str, Any]]:
@@ -247,6 +253,31 @@ def _stage_resource_upload_file(file: UploadFile) -> tuple[str, dict[str, Any]]:
     except Exception:
         cleanup_import_task_staging(task_id)
         raise
+
+
+async def _queue_term_resource_import_task(task_id: str, payload: dict[str, Any]) -> None:
+    from app.routers.api import _enqueue_arq_job
+
+    if await _enqueue_arq_job("term_resource_import_job", task_id, payload):
+        return
+    future = _TERM_RESOURCE_IMPORT_EXECUTOR.submit(_run_term_resource_import_task, task_id, payload)
+    future.add_done_callback(_log_local_term_resource_import_failure(task_id))
+
+
+def _log_local_term_resource_import_failure(task_id: str):
+    def _callback(done: Any) -> None:
+        try:
+            exc = done.exception()
+        except CancelledError:
+            return
+        if exc is not None:
+            logger.error(
+                "local term resource import task failed task_id=%s",
+                task_id,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+    return _callback
 
 
 def _parse_import_row_indexes(value: str | None) -> set[int]:
@@ -645,6 +676,7 @@ def delete_term_base(
     return {"message": "术语库已删除。", "deleted_entries": entry_count}
 
 
+@router.post("/term-bases/import/preview")
 async def preview_term_base_xlsx(
     file: UploadFile = File(...),
     term_base_id: UUID | None = Form(default=None),
@@ -672,7 +704,19 @@ async def preview_term_base_xlsx(
         )
 
     try:
-        if extension in XLSX_EXTENSIONS:
+        if extension in TMX_EXTENSIONS:
+            preview = preview_terms_from_tmx_path(
+                db=db,
+                tmx_path=staged_file["path"],
+                filename=file.filename or "uploaded.tmx",
+                term_base_id=term_base_id,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                preview_limit=max(1, min(preview_limit, 500)),
+                skip_header=skip_header,
+                max_scan_rows=_resource_import_preview_max_scan_rows(),
+            )
+        elif extension in XLSX_EXTENSIONS:
             preview = preview_terms_from_xlsx_path(
                 db=db,
                 xlsx_path=staged_file["path"],
@@ -770,13 +814,39 @@ def _run_term_resource_import_task(task_id: str, payload: dict[str, Any]) -> Non
                 for item in payload.get("skip_duplicate_row_indexes", [])
                 if int(item) > 0
             }
+            import_batch = create_resource_import_batch(
+                db,
+                resource_type="term",
+                resource_id=term_base_id,
+                filename=filename,
+                file_path=file_payload["path"],
+                file_format=extension,
+                source_language=str(payload["source_language"]),
+                target_language=str(payload["target_language"]),
+                created_by_id=creator_id,
+            )
+            db.commit()
 
             def cancel_check() -> bool:
                 return import_task_cancel_requested(task_id)
 
             try:
                 set_import_task_status(task_id, "running", progress=20, message=f"正在导入 {filename}。")
-                if extension in XLSX_EXTENSIONS:
+                if extension in TMX_EXTENSIONS:
+                    import_summary = import_terms_from_tmx_path(
+                        db=db,
+                        tmx_path=file_payload["path"],
+                        filename=filename,
+                        term_base_id=term_base_id,
+                        source_language=str(payload["source_language"]),
+                        target_language=str(payload["target_language"]),
+                        creator_id=creator_id,
+                        skip_duplicate_row_indexes=skipped_row_indexes,
+                        batch_size=_resource_import_batch_size(),
+                        cancel_check=cancel_check,
+                        import_batch_id=import_batch.id,
+                    )
+                elif extension in XLSX_EXTENSIONS:
                     import_summary = import_terms_from_xlsx_path(
                         db=db,
                         xlsx_path=file_payload["path"],
@@ -789,6 +859,7 @@ def _run_term_resource_import_task(task_id: str, payload: dict[str, Any]) -> Non
                         skip_header=bool(payload.get("skip_header")),
                         batch_size=_resource_import_batch_size(),
                         cancel_check=cancel_check,
+                        import_batch_id=import_batch.id,
                     )
                 else:
                     import_summary = import_terms_from_xlsx_upload(
@@ -803,6 +874,7 @@ def _run_term_resource_import_task(task_id: str, payload: dict[str, Any]) -> Non
                         skip_header=bool(payload.get("skip_header")),
                         batch_size=_resource_import_batch_size(),
                         cancel_check=cancel_check,
+                        import_batch_id=import_batch.id,
                     )
             except ImportTaskCanceled:
                 db.rollback()
@@ -914,7 +986,7 @@ async def import_term_base_xlsx(
             "creator_id": str(current_user.id),
         }
         set_import_task_status(task_id, "queued", progress=0, message="术语库导入任务已进入队列。")
-        background_tasks.add_task(_run_term_resource_import_task, task_id, payload)
+        await _queue_term_resource_import_task(task_id, payload)
         return JSONResponse(
             status_code=202,
             content={

@@ -10,8 +10,7 @@ import time
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Callable, Literal
-from xml.etree import ElementTree as ET
+from typing import Any, Callable, Literal
 from uuid import UUID, uuid4
 
 from openpyxl import load_workbook
@@ -23,6 +22,7 @@ from app.models import MemoryEntry
 from app.services.import_task_state import ImportTaskCanceled
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
+from app.services.tmx_stream import TMXRow, iter_tmx_rows as iter_stream_tmx_rows
 from app.services.tm_vector import sync_tm_embeddings
 
 
@@ -168,6 +168,7 @@ def import_tm_from_upload(
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
     cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
 ) -> TMImportSummary:
     extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
     if extension in CSV_EXTENSIONS:
@@ -184,6 +185,7 @@ def import_tm_from_upload(
             skip_duplicate_row_indexes=skip_duplicate_row_indexes,
             skip_header=skip_header,
             cancel_check=cancel_check,
+            import_batch_id=import_batch_id,
         )
     if extension in TMX_EXTENSIONS:
         return import_tm_from_tmx_upload(
@@ -198,6 +200,7 @@ def import_tm_from_upload(
             duplicate_policy=duplicate_policy,
             skip_duplicate_row_indexes=skip_duplicate_row_indexes,
             cancel_check=cancel_check,
+            import_batch_id=import_batch_id,
         )
     return import_tm_from_xlsx_upload(
         db=db,
@@ -212,6 +215,7 @@ def import_tm_from_upload(
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
         skip_header=skip_header,
         cancel_check=cancel_check,
+        import_batch_id=import_batch_id,
     )
 
 
@@ -228,6 +232,7 @@ def import_tm_from_xlsx_upload(
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
     cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
 ) -> TMImportSummary:
     extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
     if extension in XLS_EXTENSIONS:
@@ -245,6 +250,7 @@ def import_tm_from_xlsx_upload(
             source_language=source_language,
             target_language=target_language,
             cancel_check=cancel_check,
+            import_batch_id=import_batch_id,
         )
 
     workbook = load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)
@@ -261,6 +267,7 @@ def import_tm_from_xlsx_upload(
         source_language=source_language,
         target_language=target_language,
         cancel_check=cancel_check,
+        import_batch_id=import_batch_id,
     )
 
 
@@ -277,6 +284,7 @@ def import_tm_from_xlsx_path(
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
     cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
 ) -> TMImportSummary:
     workbook = load_workbook(Path(xlsx_path), read_only=True, data_only=True)
     return _import_workbook(
@@ -292,6 +300,7 @@ def import_tm_from_xlsx_path(
         source_language=source_language,
         target_language=target_language,
         cancel_check=cancel_check,
+        import_batch_id=import_batch_id,
     )
 
 
@@ -308,6 +317,7 @@ def import_tm_from_csv_upload(
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
     cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
 ) -> TMImportSummary:
     rows = _iter_csv_rows(raw_bytes)
     return _import_text_rows(
@@ -323,6 +333,7 @@ def import_tm_from_csv_upload(
         source_language=source_language,
         target_language=target_language,
         cancel_check=cancel_check,
+        import_batch_id=import_batch_id,
     )
 
 
@@ -338,6 +349,7 @@ def import_tm_from_tmx_upload(
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
     cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
 ) -> TMImportSummary:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
@@ -356,6 +368,45 @@ def import_tm_from_tmx_upload(
         source_language=normalized_source_language,
         target_language=normalized_target_language,
         cancel_check=cancel_check,
+        import_batch_id=import_batch_id,
+    )
+
+
+def import_tm_from_tmx_path(
+    db: Session,
+    tmx_path: str | Path,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    collection_id: UUID | None = None,
+    creator_id: UUID | None = None,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+    skip_duplicate_row_indexes: set[int] | None = None,
+    cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
+) -> TMImportSummary:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    return _import_text_rows(
+        db=db,
+        rows=_iter_tmx_path_rows(
+            tmx_path,
+            normalized_source_language,
+            normalized_target_language,
+        ),
+        filename=filename,
+        batch_size=batch_size,
+        collection_id=collection_id,
+        creator_id=creator_id,
+        duplicate_policy=duplicate_policy,
+        skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
+        cancel_check=cancel_check,
+        import_batch_id=import_batch_id,
     )
 
 
@@ -567,6 +618,40 @@ def preview_tm_from_sdltm_path(
     )
 
 
+def preview_tm_from_tmx_path(
+    db: Session,
+    tmx_path: str | Path,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    collection_id: UUID | None,
+    duplicate_policy: DuplicatePolicy = "overwrite",
+    preview_limit: int = 100,
+    skip_header: bool = False,
+    max_scan_rows: int = TM_PREVIEW_MAX_SCAN_ROWS,
+) -> TMImportPreview:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    return _preview_tm_from_rows(
+        db=db,
+        rows=_iter_tmx_path_rows(
+            tmx_path,
+            normalized_source_language,
+            normalized_target_language,
+        ),
+        filename=filename,
+        collection_id=collection_id,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
+        duplicate_policy=duplicate_policy,
+        preview_limit=preview_limit,
+        skip_header=skip_header,
+        max_scan_rows=max_scan_rows,
+    )
+
+
 def _preview_tm_from_rows(
     db: Session,
     rows,
@@ -738,6 +823,17 @@ def _append_preview_row(
         rows.append(row)
 
 
+def _row_to_metadata(row: Any) -> dict[str, Any]:
+    if isinstance(row, TMXRow):
+        return row.metadata
+    if isinstance(row, dict):
+        metadata = row.get("metadata")
+        return metadata if isinstance(metadata, dict) else {}
+    if isinstance(row, (tuple, list)) and len(row) >= 3 and isinstance(row[2], dict):
+        return row[2]
+    return {}
+
+
 def _load_existing_tm_status(
     db: Session,
     collection_id: UUID | None,
@@ -809,29 +905,16 @@ def _iter_xls_rows(raw_bytes: bytes):
 
 
 def _iter_tmx_rows(raw_bytes: bytes, source_language: str, target_language: str):
-    root = ET.fromstring(raw_bytes)
-    for translation_unit in root.findall(".//{*}tu"):
-        language_segments: list[tuple[str, str]] = []
-        for tuv in translation_unit.findall("{*}tuv"):
-            language = (
-                tuv.attrib.get("{http://www.w3.org/XML/1998/namespace}lang")
-                or tuv.attrib.get("lang")
-                or tuv.attrib.get("xml:lang")
-                or ""
-            )
-            segment = tuv.find("{*}seg")
-            if segment is None:
-                continue
-            text = normalize_text("".join(segment.itertext()))
-            if text:
-                language_segments.append((language, text))
+    yield from _iter_tmx_source_rows(raw_bytes, source_language, target_language)
 
-        source_text = _find_tmx_language_text(language_segments, source_language)
-        target_text = _find_tmx_language_text(language_segments, target_language)
-        if (not source_text or not target_text) and len(language_segments) >= 2:
-            source_text = source_text or language_segments[0][1]
-            target_text = target_text or language_segments[1][1]
-        yield (source_text, target_text)
+
+def _iter_tmx_path_rows(tmx_path: str | Path, source_language: str, target_language: str):
+    yield from _iter_tmx_source_rows(Path(tmx_path), source_language, target_language)
+
+
+def _iter_tmx_source_rows(source: Any, source_language: str, target_language: str):
+    for row in iter_stream_tmx_rows(source, source_language, target_language):
+        yield (row.source_text, row.target_text, row.metadata)
 
 
 def _iter_sdltm_rows(raw_bytes: bytes):
@@ -898,6 +981,7 @@ def _import_workbook(
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
     cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
 ) -> TMImportSummary:
     worksheet = workbook.active
     try:
@@ -914,6 +998,7 @@ def _import_workbook(
             source_language=source_language,
             target_language=target_language,
             cancel_check=cancel_check,
+            import_batch_id=import_batch_id,
         )
     finally:
         workbook.close()
@@ -932,6 +1017,7 @@ def _import_text_rows(
     skip_duplicate_row_indexes: set[int] | None = None,
     skip_header: bool = False,
     cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
 ) -> TMImportSummary:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
@@ -948,6 +1034,7 @@ def _import_text_rows(
     for row_index, row in enumerate(rows, start=1):
         if row_index == 1 or row_index % batch_size == 0:
             _raise_if_canceled(cancel_check)
+        row_metadata = _row_to_metadata(row)
         source_text = normalize_text(_cell_to_text(row, 0))
         target_text = normalize_text(_cell_to_text(row, 1))
 
@@ -970,6 +1057,9 @@ def _import_text_rows(
             target_language=normalized_target_language,
             collection_id=collection_id,
             creator_id=creator_id,
+            external_tuid=str(row_metadata.get("tuid") or "") or None,
+            tmx_metadata=row_metadata,
+            import_batch_id=import_batch_id,
         )
         if duplicate_policy == "keep" and tm_row["source_hash"] in batch_rows:
             skipped_duplicate_rows += 1
@@ -1024,6 +1114,9 @@ def _build_tm_row(
     target_language: str,
     collection_id: UUID | None = None,
     creator_id: UUID | None = None,
+    external_tuid: str | None = None,
+    tmx_metadata: dict[str, Any] | None = None,
+    import_batch_id: UUID | None = None,
 ) -> dict:
     return {
         "collection_id": collection_id,
@@ -1035,6 +1128,9 @@ def _build_tm_row(
         "target_language": target_language,
         "creator_id": creator_id,
         "last_modified_by_id": creator_id,
+        "external_tuid": external_tuid,
+        "tmx_metadata": tmx_metadata or None,
+        "import_batch_id": import_batch_id,
     }
 
 
@@ -1201,6 +1297,9 @@ def _flush_tm_batch_orm(
         existing.collection_id = row["collection_id"]
         existing.source_language = row["source_language"]
         existing.target_language = row["target_language"]
+        existing.external_tuid = row.get("external_tuid")
+        existing.tmx_metadata = row.get("tmx_metadata")
+        existing.import_batch_id = row.get("import_batch_id")
         if row.get("last_modified_by_id"):
             existing.last_modified_by_id = row["last_modified_by_id"]
         existing_by_hash[row["source_hash"]] = existing
@@ -1232,6 +1331,9 @@ def _tm_entry_matches_import_row(existing: MemoryEntry, row: dict) -> bool:
         and existing.collection_id == row["collection_id"]
         and (existing.source_language or "") == row["source_language"]
         and (existing.target_language or "") == row["target_language"]
+        and (getattr(existing, "external_tuid", None) or None) == row.get("external_tuid")
+        and (getattr(existing, "tmx_metadata", None) or None) == row.get("tmx_metadata")
+        and getattr(existing, "import_batch_id", None) == row.get("import_batch_id")
     )
 
 
@@ -1262,6 +1364,9 @@ def _flush_tm_batch_postgres(
             "target_language": row["target_language"],
             "creator_id": str(row["creator_id"]) if row.get("creator_id") else None,
             "last_modified_by_id": str(row["last_modified_by_id"]) if row.get("last_modified_by_id") else None,
+            "external_tuid": row.get("external_tuid"),
+            "tmx_metadata": row.get("tmx_metadata"),
+            "import_batch_id": str(row["import_batch_id"]) if row.get("import_batch_id") else None,
         }
         for row in batch_rows
     ]
@@ -1280,7 +1385,10 @@ def _flush_tm_batch_postgres(
                     source_language text,
                     target_language text,
                     creator_id uuid,
-                    last_modified_by_id uuid
+                    last_modified_by_id uuid,
+                    external_tuid text,
+                    tmx_metadata jsonb,
+                    import_batch_id uuid
                 )
             )
             INSERT INTO memory_entries (
@@ -1293,7 +1401,10 @@ def _flush_tm_batch_postgres(
                 source_language,
                 target_language,
                 creator_id,
-                last_modified_by_id
+                last_modified_by_id,
+                external_tuid,
+                tmx_metadata,
+                import_batch_id
             )
             SELECT
                 id,
@@ -1305,7 +1416,10 @@ def _flush_tm_batch_postgres(
                 source_language,
                 target_language,
                 creator_id,
-                last_modified_by_id
+                last_modified_by_id,
+                external_tuid,
+                tmx_metadata,
+                import_batch_id
             FROM incoming
             ORDER BY source_hash, source_text
             ON CONFLICT (collection_id, source_hash, source_language, target_language)
@@ -1328,7 +1442,10 @@ def _flush_tm_batch_postgres(
                     source_language text,
                     target_language text,
                     creator_id uuid,
-                    last_modified_by_id uuid
+                    last_modified_by_id uuid,
+                    external_tuid text,
+                    tmx_metadata jsonb,
+                    import_batch_id uuid
                 )
             )
             INSERT INTO memory_entries (
@@ -1341,7 +1458,10 @@ def _flush_tm_batch_postgres(
                 source_language,
                 target_language,
                 creator_id,
-                last_modified_by_id
+                last_modified_by_id,
+                external_tuid,
+                tmx_metadata,
+                import_batch_id
             )
             SELECT
                 id,
@@ -1353,7 +1473,10 @@ def _flush_tm_batch_postgres(
                 source_language,
                 target_language,
                 creator_id,
-                last_modified_by_id
+                last_modified_by_id,
+                external_tuid,
+                tmx_metadata,
+                import_batch_id
             FROM incoming
             ORDER BY source_hash, source_text
             ON CONFLICT (collection_id, source_hash, source_language, target_language)
@@ -1363,10 +1486,16 @@ def _flush_tm_batch_postgres(
                 source_normalized = EXCLUDED.source_normalized,
                 creator_id = COALESCE(memory_entries.creator_id, EXCLUDED.creator_id),
                 last_modified_by_id = COALESCE(EXCLUDED.last_modified_by_id, memory_entries.last_modified_by_id),
+                external_tuid = EXCLUDED.external_tuid,
+                tmx_metadata = EXCLUDED.tmx_metadata,
+                import_batch_id = EXCLUDED.import_batch_id,
                 updated_at = NOW()
             WHERE
                 memory_entries.source_text IS DISTINCT FROM EXCLUDED.source_text
                 OR memory_entries.target_text IS DISTINCT FROM EXCLUDED.target_text
+                OR memory_entries.external_tuid IS DISTINCT FROM EXCLUDED.external_tuid
+                OR memory_entries.tmx_metadata IS DISTINCT FROM EXCLUDED.tmx_metadata
+                OR memory_entries.import_batch_id IS DISTINCT FROM EXCLUDED.import_batch_id
             RETURNING id, source_text, (xmax = 0) AS inserted
             """
         )
@@ -1496,6 +1625,7 @@ def import_tm_from_sdltm_upload(
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
     cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
 ) -> TMImportSummary:
     """Import translation memory from an uploaded SDLTM file."""
     with tempfile.NamedTemporaryFile(suffix=".sdltm", delete=False) as tmp:
@@ -1515,6 +1645,7 @@ def import_tm_from_sdltm_upload(
             source_language=source_language,
             target_language=target_language,
             cancel_check=cancel_check,
+            import_batch_id=import_batch_id,
         )
     finally:
         Path(tmp_path).unlink(missing_ok=True)
@@ -1532,6 +1663,7 @@ def import_tm_from_sdltm_path(
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
     cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
 ) -> TMImportSummary:
     """Import translation memory from an SDLTM file path."""
     return _import_sdltm(
@@ -1546,6 +1678,7 @@ def import_tm_from_sdltm_path(
         source_language=source_language,
         target_language=target_language,
         cancel_check=cancel_check,
+        import_batch_id=import_batch_id,
     )
 
 
@@ -1561,6 +1694,7 @@ def _import_sdltm(
     duplicate_policy: DuplicatePolicy = "overwrite",
     skip_duplicate_row_indexes: set[int] | None = None,
     cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
 ) -> TMImportSummary:
     """Core SDLTM import logic."""
     normalized_source_language, normalized_target_language = require_language_pair(
@@ -1615,6 +1749,7 @@ def _import_sdltm(
                 target_language=normalized_target_language,
                 collection_id=collection_id,
                 creator_id=creator_id,
+                import_batch_id=import_batch_id,
             )
             if duplicate_policy == "keep" and tm_row["source_hash"] in batch_rows:
                 skipped_duplicate_rows += 1

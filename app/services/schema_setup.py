@@ -26,7 +26,28 @@ LEGACY_REQUIRED_EXISTING_TABLES = (
 )
 REQUIRED_SCHEMA = {
     "memory_bases": {"source_language", "target_language"},
-    "memory_entries": {"source_language", "target_language", "creator_id", "last_modified_by_id"},
+    "resource_import_batches": {
+        "id",
+        "resource_type",
+        "resource_id",
+        "filename",
+        "file_size_bytes",
+        "file_format",
+        "source_language",
+        "target_language",
+        "tmx_header_metadata",
+        "created_by_id",
+        "created_at",
+    },
+    "memory_entries": {
+        "source_language",
+        "target_language",
+        "creator_id",
+        "last_modified_by_id",
+        "external_tuid",
+        "tmx_metadata",
+        "import_batch_id",
+    },
     "term_bases": {
         "id",
         "name",
@@ -42,6 +63,9 @@ REQUIRED_SCHEMA = {
         "target_language",
         "creator_id",
         "last_modified_by_id",
+        "external_tuid",
+        "tmx_metadata",
+        "import_batch_id",
     },
     "glossary_bases": {
         "id",
@@ -453,11 +477,19 @@ REQUIRED_INDEXES = {
         "uq_memory_entries_collection_source_hash_language_pair",
         "ix_memory_entries_creator_id",
         "ix_memory_entries_last_modified_by_id",
+        "ix_memory_entries_external_tuid",
+        "ix_memory_entries_import_batch_id",
     },
     "term_entries": {
         "ix_term_entries_creator_id",
         "ix_term_entries_last_modified_by_id",
         "ix_term_entries_term_base_updated_created",
+        "ix_term_entries_external_tuid",
+        "ix_term_entries_import_batch_id",
+    },
+    "resource_import_batches": {
+        "ix_resource_import_batches_resource",
+        "ix_resource_import_batches_created_at",
     },
     "glossary_entries": {
         "ix_glossary_entries_creator_id",
@@ -629,6 +661,29 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
 
     statements.extend(
         [
+            f"""
+            CREATE TABLE IF NOT EXISTS resource_import_batches (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                resource_type VARCHAR(20) NOT NULL,
+                resource_id UUID,
+                filename TEXT NOT NULL,
+                file_size_bytes INTEGER NOT NULL DEFAULT 0,
+                file_format VARCHAR(20) NOT NULL DEFAULT '',
+                source_language VARCHAR(20),
+                target_language VARCHAR(20),
+                tmx_header_metadata JSONB,
+                created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_resource_import_batches_resource
+            ON resource_import_batches (resource_type, resource_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_resource_import_batches_created_at
+            ON resource_import_batches (created_at)
+            """,
             """
             ALTER TABLE IF EXISTS memory_bases
             ADD COLUMN IF NOT EXISTS source_language VARCHAR(20)
@@ -658,12 +713,32 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL
             """,
             """
+            ALTER TABLE IF EXISTS memory_entries
+            ADD COLUMN IF NOT EXISTS external_tuid TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS memory_entries
+            ADD COLUMN IF NOT EXISTS tmx_metadata JSONB
+            """,
+            """
+            ALTER TABLE IF EXISTS memory_entries
+            ADD COLUMN IF NOT EXISTS import_batch_id UUID REFERENCES resource_import_batches(id) ON DELETE SET NULL
+            """,
+            """
             CREATE INDEX IF NOT EXISTS ix_memory_entries_creator_id
             ON memory_entries (creator_id)
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_memory_entries_last_modified_by_id
             ON memory_entries (last_modified_by_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_memory_entries_external_tuid
+            ON memory_entries (external_tuid)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_memory_entries_import_batch_id
+            ON memory_entries (import_batch_id)
             """,
             """
             UPDATE memory_entries
@@ -790,6 +865,9 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 target_language VARCHAR(20) NOT NULL,
                 creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
                 last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                external_tuid TEXT,
+                tmx_metadata JSONB,
+                import_batch_id UUID REFERENCES resource_import_batches(id) ON DELETE SET NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
@@ -813,6 +891,18 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS term_entries
             ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS term_entries
+            ADD COLUMN IF NOT EXISTS external_tuid TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS term_entries
+            ADD COLUMN IF NOT EXISTS tmx_metadata JSONB
+            """,
+            """
+            ALTER TABLE IF EXISTS term_entries
+            ADD COLUMN IF NOT EXISTS import_batch_id UUID REFERENCES resource_import_batches(id) ON DELETE SET NULL
             """,
             """
             ALTER TABLE IF EXISTS term_entries
@@ -849,6 +939,14 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_term_entries_last_modified_by_id
             ON term_entries (last_modified_by_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_entries_external_tuid
+            ON term_entries (external_tuid)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_entries_import_batch_id
+            ON term_entries (import_batch_id)
             """,
             """
             UPDATE term_entries

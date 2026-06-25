@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import re
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import partial
@@ -263,6 +264,7 @@ from app.services.project_segment_sync import (
 )
 from app.services.term_importer import (
     TERM_IMPORT_EXTENSIONS,
+    import_terms_from_tmx_path,
     import_terms_from_xlsx_path,
     import_terms_from_xlsx_upload,
 )
@@ -311,15 +313,19 @@ from app.services.document_workspace import build_docx_target_numbering_text_map
 from app.services.tm_importer import (
     SDLTM_EXTENSIONS,
     TM_IMPORT_EXTENSIONS,
+    TMX_EXTENSIONS,
     XLSX_EXTENSIONS,
     import_tm_from_sdltm_path,
+    import_tm_from_tmx_path,
     import_tm_from_xlsx_path,
     import_tm_from_upload,
     preview_tm_from_sdltm_path,
+    preview_tm_from_tmx_path,
     preview_tm_from_xlsx_path,
     preview_tm_from_upload,
     preview_sdltm_metadata_from_path,
 )
+from app.services.resource_import_batch import create_resource_import_batch
 from app.services.tm_vector import sync_tm_embeddings
 from app.services.translation_memory_service import TMUpsertEntry, batch_upsert_tm_entries
 from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_response
@@ -333,6 +339,7 @@ except ModuleNotFoundError:  # pragma: no cover - 本地未安装 ARQ 时使用 
 
 
 logger = logging.getLogger(__name__)
+_RESOURCE_IMPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="resource-import")
 router = APIRouter(dependencies=[Depends(get_current_user)])
 UPLOAD_READ_CHUNK_SIZE = 1024 * 1024
 
@@ -583,6 +590,29 @@ async def _queue_import_task(
     except Exception:
         cleanup_import_task_staging(task_id)
         raise
+
+
+async def _queue_tm_resource_import_task(task_id: str, payload: dict[str, Any]) -> None:
+    if await _enqueue_arq_job("tm_resource_import_job", task_id, payload):
+        return
+    future = _RESOURCE_IMPORT_EXECUTOR.submit(_run_tm_resource_import_task, task_id, payload)
+    future.add_done_callback(_log_local_tm_resource_import_failure(task_id))
+
+
+def _log_local_tm_resource_import_failure(task_id: str):
+    def _callback(done: Any) -> None:
+        try:
+            exc = done.exception()
+        except CancelledError:
+            return
+        if exc is not None:
+            logger.error(
+                "local TM resource import task failed task_id=%s",
+                task_id,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+    return _callback
 
 
 def _uuid_list(values: list[str] | None) -> list[UUID]:
@@ -1120,6 +1150,16 @@ async def process_import_task_job(ctx, task_id: str, payload: dict[str, Any]) ->
     await asyncio.to_thread(_run_import_task, task_id, payload)
 
 
+async def tm_resource_import_job(ctx, task_id: str, payload: dict[str, Any]) -> None:
+    await asyncio.to_thread(_run_tm_resource_import_task, task_id, payload)
+
+
+async def term_resource_import_job(ctx, task_id: str, payload: dict[str, Any]) -> None:
+    from app.routers.term_base import _run_term_resource_import_task
+
+    await asyncio.to_thread(_run_term_resource_import_task, task_id, payload)
+
+
 async def spelling_grammar_qa_segments_job(
     ctx, file_record_id: str, segment_ids: list[str]
 ) -> None:
@@ -1151,6 +1191,8 @@ async def pretranslation_run_job(ctx, run_id: str) -> None:
 class WorkerSettings:
     functions = [
         process_import_task_job,
+        tm_resource_import_job,
+        term_resource_import_job,
         spelling_grammar_qa_segments_job,
         spelling_grammar_qa_project_job,
         auto_tm_background_job,
@@ -13387,7 +13429,7 @@ def _resource_import_batch_size() -> int:
 
 
 def _resource_import_max_file_bytes(_: str) -> int:
-    return max(1, int(get_settings().upload_max_size_mb or 100)) * 1024 * 1024
+    return max(1, int(get_settings().resource_import_max_size_mb or 1024)) * 1024 * 1024
 
 
 def _stage_resource_upload_file(file: UploadFile) -> tuple[str, dict[str, Any]]:
@@ -13484,6 +13526,18 @@ def _run_tm_resource_import_task(task_id: str, payload: dict[str, Any]) -> None:
                 for item in payload.get("skip_duplicate_row_indexes", [])
                 if int(item) > 0
             }
+            import_batch = create_resource_import_batch(
+                db,
+                resource_type="tm",
+                resource_id=collection_id,
+                filename=filename,
+                file_path=file_payload["path"],
+                file_format=extension,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                created_by_id=creator_id,
+            )
+            db.commit()
 
             def cancel_check() -> bool:
                 return import_task_cancel_requested(task_id)
@@ -13503,6 +13557,22 @@ def _run_tm_resource_import_task(task_id: str, payload: dict[str, Any]) -> None:
                         skip_duplicate_row_indexes=skipped_row_indexes,
                         batch_size=_resource_import_batch_size(),
                         cancel_check=cancel_check,
+                        import_batch_id=import_batch.id,
+                    )
+                elif extension in TMX_EXTENSIONS:
+                    import_summary = import_tm_from_tmx_path(
+                        db=db,
+                        tmx_path=file_payload["path"],
+                        filename=filename,
+                        collection_id=collection_id,
+                        source_language=resolved_source_language,
+                        target_language=resolved_target_language,
+                        creator_id=creator_id,
+                        duplicate_policy=normalized_duplicate_policy,
+                        skip_duplicate_row_indexes=skipped_row_indexes,
+                        batch_size=_resource_import_batch_size(),
+                        cancel_check=cancel_check,
+                        import_batch_id=import_batch.id,
                     )
                 elif extension in XLSX_EXTENSIONS:
                     import_summary = import_tm_from_xlsx_path(
@@ -13518,6 +13588,7 @@ def _run_tm_resource_import_task(task_id: str, payload: dict[str, Any]) -> None:
                         skip_header=bool(payload.get("skip_header")),
                         batch_size=_resource_import_batch_size(),
                         cancel_check=cancel_check,
+                        import_batch_id=import_batch.id,
                     )
                 else:
                     import_summary = import_tm_from_upload(
@@ -13533,6 +13604,7 @@ def _run_tm_resource_import_task(task_id: str, payload: dict[str, Any]) -> None:
                         skip_header=bool(payload.get("skip_header")),
                         batch_size=_resource_import_batch_size(),
                         cancel_check=cancel_check,
+                        import_batch_id=import_batch.id,
                     )
             except ImportTaskCanceled:
                 db.rollback()
@@ -13609,6 +13681,8 @@ def _run_tm_resource_import_task(task_id: str, payload: dict[str, Any]) -> None:
         cleanup_import_task_staging(staging_task_id)
 
 
+@router.post("/translation-memory/import/preview")
+@router.post("/tm/import/preview", include_in_schema=False)
 async def preview_tm_xlsx(
     file: UploadFile = File(...),
     collection_id: UUID | None = Form(default=None),
@@ -13637,6 +13711,19 @@ async def preview_tm_xlsx(
                 db=db,
                 sdltm_path=staged_file["path"],
                 filename=file.filename or "uploaded.sdltm",
+                collection_id=collection_id,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                duplicate_policy=normalized_duplicate_policy,
+                preview_limit=max(1, min(preview_limit, 500)),
+                skip_header=skip_header,
+                max_scan_rows=_resource_import_preview_max_scan_rows(),
+            )
+        elif extension in TMX_EXTENSIONS:
+            preview = preview_tm_from_tmx_path(
+                db=db,
+                tmx_path=staged_file["path"],
+                filename=file.filename or "uploaded.tmx",
                 collection_id=collection_id,
                 source_language=resolved_source_language,
                 target_language=resolved_target_language,
@@ -13712,7 +13799,7 @@ async def preview_tm_xlsx(
 @router.post("/tm/import-xlsx", include_in_schema=False)
 @router.post("/translation-memory/import", include_in_schema=False)
 @router.post("/tm/import", include_in_schema=False)
-def import_tm_xlsx(
+async def import_tm_xlsx(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     collection_id: UUID | None = Form(default=None),
@@ -13725,7 +13812,7 @@ def import_tm_xlsx(
     current_user: User = Depends(require_admin),
 ):
     extension = _validate_tm_import_upload(file)
-    task_id, staged_file = _stage_resource_upload_file(file)
+    task_id, staged_file = await asyncio.to_thread(_stage_resource_upload_file, file)
     try:
         collection = _get_collection_or_404(db, collection_id)
         resolved_source_language, resolved_target_language = _resolve_collection_language_pair(
@@ -13754,7 +13841,7 @@ def import_tm_xlsx(
             "creator_id": str(current_user.id),
         }
         _set_import_task_status(task_id, "queued", progress=0, message="记忆库导入任务已进入队列。")
-        background_tasks.add_task(_run_tm_resource_import_task, task_id, payload)
+        await _queue_tm_resource_import_task(task_id, payload)
         return JSONResponse(
             status_code=202,
             content={
@@ -14376,7 +14463,17 @@ def import_termbase_xlsx(
     collection_target_language = collection.target_language if collection is not None else "en"
 
     try:
-        if extension == ".xlsx":
+        if extension in TMX_EXTENSIONS:
+            import_summary = import_terms_from_tmx_path(
+                db=db,
+                tmx_path=staged_file["path"],
+                filename=file.filename or "uploaded.tmx",
+                term_base_id=collection_id,
+                source_language=collection_source_language,
+                target_language=collection_target_language,
+                batch_size=_resource_import_batch_size(),
+            )
+        elif extension == ".xlsx":
             import_summary = import_terms_from_xlsx_path(
                 db=db,
                 xlsx_path=staged_file["path"],

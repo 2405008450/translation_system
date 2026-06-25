@@ -1578,6 +1578,39 @@ class IssueMarker(Base):
     )
 
 
+class ResourceImportBatch(Base):
+    __tablename__ = "resource_import_batches"
+    __table_args__ = (
+        Index("ix_resource_import_batches_resource", "resource_type", "resource_id"),
+        Index("ix_resource_import_batches_created_at", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    resource_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    resource_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    filename: Mapped[str] = mapped_column(Text, nullable=False)
+    file_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    file_format: Mapped[str] = mapped_column(String(20), nullable=False, default="", server_default=text("''"))
+    source_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    target_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    tmx_header_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+
+    created_by: Mapped["User | None"] = relationship("User", foreign_keys=[created_by_id])
+
+
 class TMCollection(Base):
     __tablename__ = "memory_bases"
     __table_args__ = (
@@ -1640,6 +1673,8 @@ class TranslationMemory(Base):
         ),
         Index("ix_memory_entries_creator_id", "creator_id"),
         Index("ix_memory_entries_last_modified_by_id", "last_modified_by_id"),
+        Index("ix_memory_entries_external_tuid", "external_tuid"),
+        Index("ix_memory_entries_import_batch_id", "import_batch_id"),
         Index(
             "ix_memory_entries_source_text_trgm",
             "source_text",
@@ -1681,6 +1716,13 @@ class TranslationMemory(Base):
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
+    external_tuid: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tmx_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    import_batch_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("resource_import_batches.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -1700,6 +1742,10 @@ class TranslationMemory(Base):
     )
     last_modified_by: Mapped["User | None"] = relationship(
         "User", foreign_keys=[last_modified_by_id]
+    )
+    import_batch: Mapped["ResourceImportBatch | None"] = relationship(
+        "ResourceImportBatch",
+        foreign_keys=[import_batch_id],
     )
 
 
@@ -1860,6 +1906,8 @@ class TermEntry(Base):
         Index("ix_term_entries_language_pair", "source_language", "target_language"),
         Index("ix_term_entries_creator_id", "creator_id"),
         Index("ix_term_entries_last_modified_by_id", "last_modified_by_id"),
+        Index("ix_term_entries_external_tuid", "external_tuid"),
+        Index("ix_term_entries_import_batch_id", "import_batch_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -1888,6 +1936,13 @@ class TermEntry(Base):
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
+    external_tuid: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tmx_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    import_batch_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("resource_import_batches.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -1907,6 +1962,10 @@ class TermEntry(Base):
     )
     last_modified_by: Mapped["User | None"] = relationship(
         "User", foreign_keys=[last_modified_by_id]
+    )
+    import_batch: Mapped["ResourceImportBatch | None"] = relationship(
+        "ResourceImportBatch",
+        foreign_keys=[import_batch_id],
     )
 
 

@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     resource_import_preview_max_scan_rows: int = 1000
     # 资源库实际导入的写库批次大小，控制单批 ORM 对象和向量同步 payload 的内存峰值。
     resource_import_batch_size: int = 1000
+    resource_import_max_size_mb: int = 1024
     file_storage_dir: str = "data/file_records"
     export_task_dir: str = "data/export_tasks"
     import_task_dir: str = "data/import_tasks"

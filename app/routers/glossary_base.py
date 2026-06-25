@@ -64,7 +64,7 @@ def _resource_import_batch_size() -> int:
 
 
 def _resource_import_max_file_bytes(_: str) -> int:
-    return max(1, int(get_settings().upload_max_size_mb or 100)) * 1024 * 1024
+    return max(1, int(get_settings().resource_import_max_size_mb or 1024)) * 1024 * 1024
 
 
 def _stage_resource_upload_file(file: UploadFile) -> tuple[str, dict[str, Any]]:
@@ -328,6 +328,7 @@ def delete_glossary_base(
     return {"message": "词汇表已删除。", "deleted_entries": entry_count}
 
 
+@router.post("/glossary-bases/import/preview")
 async def preview_glossary_base_xlsx(
     file: UploadFile = File(...),
     glossary_base_id: UUID | None = Form(default=None),

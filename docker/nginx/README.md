@@ -15,7 +15,7 @@ Compose 文件为独立的 `docker-compose.nginx.yml`（叠加启用），默认
 修改 `UPLOAD_MAX_TOTAL_SIZE_MB` 时，请同步修改本目录 `default.conf` 中的：
 
 ```nginx
-client_max_body_size 500m;
+client_max_body_size 1024m;
 ```
 
 建议：`client_max_body_size` ≥ `UPLOAD_MAX_TOTAL_SIZE_MB`。

@@ -339,7 +339,7 @@ const highlightedSourceText = computed(() => {
 // 高亮译文中匹配的术语
 const highlightedTargetText = computed(() => {
   const text = props.segment.target_text || ''
-  return highlightSearchText(text, props.targetSearchQuery, props.searchCaseSensitive) || highlightText(text, props.matchedTerms || [], 'target_text')
+  return getTargetHighlightParts(text)
 })
 
 const activeQAIssues = computed(() => {
@@ -470,19 +470,49 @@ function hasSourceHighlights(): boolean {
 }
 
 function renderTargetTextWithHighlights(text: string): string {
-  const parts = highlightSearchText(text, props.targetSearchQuery, props.searchCaseSensitive)
-    || highlightText(text, props.matchedTerms || [], 'target_text')
-    || highlightQAText(text, activeQAIssues.value)
+  const parts = getTargetHighlightParts(text)
   if (!parts) {
     return textToVisibleChars(text)
   }
   return renderHighlightPartsAsHtml(parts, text)
 }
 
-function hasTargetHighlights(): boolean {
+function shouldRenderTargetHighlights(): boolean {
+  return !isFocused.value
+}
+
+function getTargetHighlightParts(text: string): HighlightPart[] | null {
+  if (!shouldRenderTargetHighlights()) {
+    return null
+  }
+  return highlightSearchText(text, props.targetSearchQuery, props.searchCaseSensitive)
+    || highlightText(text, props.matchedTerms || [], 'target_text')
+    || highlightQAText(text, activeQAIssues.value)
+}
+
+function hasTargetHighlightSources(): boolean {
   return Boolean(resolveSearchKeyword(props.targetSearchQuery))
     || (props.matchedTerms || []).some((term) => Boolean(term.target_text))
     || activeQAIssues.value.length > 0
+}
+
+function hasRenderedTargetHighlights(): boolean {
+  return shouldRenderTargetHighlights() && hasTargetHighlightSources()
+}
+
+function hasRenderedEditorDecorations(): boolean {
+  return Boolean(props.pendingRevision) || props.showVisibleChars || hasRenderedTargetHighlights()
+}
+
+function editorHasDecorationNodes(editor: HTMLElement): boolean {
+  return Boolean(editor.querySelector([
+    '[data-revision-type]',
+    '.segment-row__revision-segment',
+    '.segment-row__term-highlight',
+    '.segment-row__search-highlight',
+    '.segment-row__qa-highlight',
+    '.visible-char',
+  ].join(',')))
 }
 
 function renderSourceHtmlWithHighlights(sourceHtml: string): string {
@@ -529,7 +559,7 @@ function renderSourceHtmlWithHighlights(sourceHtml: string): string {
 }
 
 function renderTargetHtmlWithHighlights(targetHtml: string): string {
-  if (!hasTargetHighlights() || typeof document === 'undefined') {
+  if (!hasRenderedTargetHighlights() || typeof document === 'undefined') {
     return targetHtml
   }
 
@@ -1694,15 +1724,30 @@ function clearRevisionRerenderTimer() {
   revisionRerenderTimer = null
 }
 
+function canSkipFocusedEditorStateSync(editor: HTMLElement): boolean {
+  if (!isFocused.value || hasRenderedEditorDecorations() || editorHasDecorationNodes(editor)) {
+    return false
+  }
+  return serializeEditorContent(editor) === getTargetStateText()
+}
+
 function scheduleRevisionRerender() {
   clearRevisionRerenderTimer()
   if (!isFocused.value || isApplyingHistory.value || isComposing.value) {
+    return
+  }
+  const editor = editorRef.value
+  if (editor && canSkipFocusedEditorStateSync(editor)) {
     return
   }
 
   revisionRerenderTimer = setTimeout(() => {
     revisionRerenderTimer = null
     if (!isFocused.value || isApplyingHistory.value || isComposing.value) {
+      return
+    }
+    const currentEditor = editorRef.value
+    if (currentEditor && canSkipFocusedEditorStateSync(currentEditor)) {
       return
     }
     syncEditorHtmlFromState(true)
@@ -1712,6 +1757,10 @@ function scheduleRevisionRerender() {
 function syncEditorHtmlFromState(preserveCaret: boolean) {
   const editor = editorRef.value
   if (!editor || isApplyingHistory.value || isComposing.value) {
+    return
+  }
+
+  if (canSkipFocusedEditorStateSync(editor)) {
     return
   }
 
@@ -1809,6 +1858,21 @@ watch(
   editorHtmlContent,
   () => {
     if (isFocused.value && !isApplyingHistory.value) {
+      const editor = editorRef.value
+      if (editor && canSkipFocusedEditorStateSync(editor)) {
+        clearRevisionRerenderTimer()
+        return
+      }
+      if (
+        editor
+        && !hasRenderedEditorDecorations()
+        && editorHasDecorationNodes(editor)
+        && serializeEditorContent(editor) === getTargetStateText()
+      ) {
+        clearRevisionRerenderTimer()
+        syncEditorHtmlFromState(true)
+        return
+      }
       scheduleRevisionRerender()
       return
     }

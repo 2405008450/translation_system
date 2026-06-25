@@ -478,17 +478,36 @@ def _write_tmx_file(
 
         processed = 0
         for processed, row in enumerate(rows, start=1):
-            row_id, source_text, target_text = row
+            row_id, source_text, target_text, external_tuid, metadata = _normalize_tmx_export_row(row)
             if not source_text:
                 continue
 
-            tuid = f"{tuid_prefix}_{row_id}"
-            file.write(f"    <tu tuid={quoteattr(tuid)}>\n")
-            file.write(f"      <tuv xml:lang={quoteattr(source_language)}>\n")
-            file.write(f"        <seg>{escape(str(source_text))}</seg>\n")
+            tuid = _resolve_tmx_tuid(
+                row_id=row_id,
+                tuid_prefix=tuid_prefix,
+                external_tuid=external_tuid,
+                metadata=metadata,
+            )
+            tu_attrs = _resolve_tmx_attributes(metadata.get("tu_attributes"), skip_keys={"tuid"})
+            tu_attr_text = _format_tmx_attributes({"tuid": tuid, **tu_attrs})
+            file.write(f"    <tu{tu_attr_text}>\n")
+            _write_tmx_props(file, metadata.get("tu_props"), indent="      ")
+            _write_tmx_notes(file, metadata.get("tu_notes"), indent="      ")
+
+            source_tuv = _resolve_tuv_metadata(metadata.get("source_tuv"))
+            source_attrs = _resolve_tmx_attributes(source_tuv.get("attributes"), skip_keys={"xml:lang", "lang", "language"})
+            file.write(f"      <tuv{_format_tmx_attributes({'xml:lang': source_language, **source_attrs})}>\n")
+            _write_tmx_props(file, source_tuv.get("props"), indent="        ")
+            _write_tmx_notes(file, source_tuv.get("notes"), indent="        ")
+            file.write(f"        <seg>{escape(_sanitize_xml_text(source_text))}</seg>\n")
             file.write("      </tuv>\n")
-            file.write(f"      <tuv xml:lang={quoteattr(target_language)}>\n")
-            file.write(f"        <seg>{escape(str(target_text or ''))}</seg>\n")
+
+            target_tuv = _resolve_tuv_metadata(metadata.get("target_tuv"))
+            target_attrs = _resolve_tmx_attributes(target_tuv.get("attributes"), skip_keys={"xml:lang", "lang", "language"})
+            file.write(f"      <tuv{_format_tmx_attributes({'xml:lang': target_language, **target_attrs})}>\n")
+            _write_tmx_props(file, target_tuv.get("props"), indent="        ")
+            _write_tmx_notes(file, target_tuv.get("notes"), indent="        ")
+            file.write(f"        <seg>{escape(_sanitize_xml_text(target_text or ''))}</seg>\n")
             file.write("      </tuv>\n")
             file.write("    </tu>\n")
             _report_export_progress(
@@ -504,6 +523,88 @@ def _write_tmx_file(
         progress_callback(92, "正在保存 TMX 文件。")
         file.write("  </body>\n")
         file.write("</tmx>\n")
+
+
+def _normalize_tmx_export_row(row: Any) -> tuple[Any, str, str, str | None, dict[str, Any]]:
+    try:
+        row_id = row[0]
+        source_text = row[1] or ""
+        target_text = row[2] or ""
+        external_tuid = row[3] if len(row) > 3 else None
+        raw_metadata = row[4] if len(row) > 4 else None
+    except (TypeError, KeyError, IndexError):
+        row_id = getattr(row, "id", "")
+        source_text = getattr(row, "source_text", "") or ""
+        target_text = getattr(row, "target_text", "") or ""
+        external_tuid = getattr(row, "external_tuid", None)
+        raw_metadata = getattr(row, "tmx_metadata", None)
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+    return row_id, str(source_text), str(target_text), str(external_tuid) if external_tuid else None, metadata
+
+
+def _resolve_tmx_tuid(
+    *,
+    row_id: Any,
+    tuid_prefix: str,
+    external_tuid: str | None,
+    metadata: dict[str, Any],
+) -> str:
+    return str(metadata.get("tuid") or external_tuid or f"{tuid_prefix}_{row_id}")
+
+
+def _resolve_tuv_metadata(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _resolve_tmx_attributes(value: Any, *, skip_keys: set[str] | None = None) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    normalized_skip = {(key or "").lower() for key in (skip_keys or set())}
+    attributes: dict[str, str] = {}
+    for key, item in value.items():
+        clean_key = str(key)
+        if clean_key.lower() in normalized_skip:
+            continue
+        if item is None:
+            continue
+        attributes[clean_key] = str(item)
+    return attributes
+
+
+def _format_tmx_attributes(attributes: dict[str, str]) -> str:
+    parts = []
+    for key, value in attributes.items():
+        if not key:
+            continue
+        parts.append(f"{key}={quoteattr(_sanitize_xml_text(value))}")
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def _write_tmx_props(file, props: Any, *, indent: str) -> None:
+    if not isinstance(props, list):
+        return
+    for prop in props:
+        if not isinstance(prop, dict):
+            continue
+        prop_type = _sanitize_xml_text(str(prop.get("type") or ""))
+        value = _sanitize_xml_text(str(prop.get("value") or ""))
+        if not prop_type and not value:
+            continue
+        file.write(f"{indent}<prop type={quoteattr(prop_type)}>{escape(value)}</prop>\n")
+
+
+def _write_tmx_notes(file, notes: Any, *, indent: str) -> None:
+    if not isinstance(notes, list):
+        return
+    for note in notes:
+        value = _sanitize_xml_text(str(note or ""))
+        if value:
+            file.write(f"{indent}<note>{escape(value)}</note>\n")
+
+
+def _sanitize_xml_text(value: Any) -> str:
+    text_value = str(value or "")
+    return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", text_value)
 
 
 def _iter_tm_xlsx_rows(db: Session, collection_id: UUID):
@@ -630,13 +731,15 @@ def _iter_tm_tmx_rows(db: Session, collection_id: UUID):
             TranslationMemory.id,
             TranslationMemory.source_text,
             TranslationMemory.target_text,
+            TranslationMemory.external_tuid,
+            TranslationMemory.tmx_metadata,
         )
         .filter(TranslationMemory.collection_id == collection_id)
         .order_by(TranslationMemory.updated_at.desc(), TranslationMemory.created_at.desc())
         .execution_options(stream_results=True)
     )
     for row in query.yield_per(EXPORT_QUERY_BATCH_SIZE):
-        yield row.id, row.source_text, row.target_text
+        yield row.id, row.source_text, row.target_text, row.external_tuid, row.tmx_metadata
 
 
 def _iter_term_tmx_rows(db: Session, term_base_id: UUID):
@@ -647,13 +750,15 @@ def _iter_term_tmx_rows(db: Session, term_base_id: UUID):
             TermEntry.id,
             TermEntry.source_text,
             TermEntry.target_text,
+            TermEntry.external_tuid,
+            TermEntry.tmx_metadata,
         )
         .filter(TermEntry.term_base_id == term_base_id)
         .order_by(TermEntry.updated_at.desc(), TermEntry.created_at.desc())
         .execution_options(stream_results=True)
     )
     for row in query.yield_per(EXPORT_QUERY_BATCH_SIZE):
-        yield row.id, row.source_text, row.target_text
+        yield row.id, row.source_text, row.target_text, row.external_tuid, row.tmx_metadata
 
 
 def _iter_glossary_tmx_rows(db: Session, glossary_base_id: UUID):
