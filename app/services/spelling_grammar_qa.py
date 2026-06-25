@@ -74,6 +74,7 @@ LANGUAGETOOL_LANGUAGE_MAP: dict[str, str] = {
     "fr-FR": "fr",
     "de-DE": "de-DE",
     "es-ES": "es",
+    "es-419": "es",
     "pt-BR": "pt-BR",
     "it-IT": "it",
     "ru-RU": "ru-RU",

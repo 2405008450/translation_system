@@ -460,6 +460,25 @@ def _script_confidence(count: int, total_letters: int) -> float:
     return round(min(0.98, 0.66 + ratio * 0.3), 2)
 
 
+SPANISH_COMMON_STOPWORDS = {
+    "como",
+    "con",
+    "de",
+    "del",
+    "el",
+    "en",
+    "es",
+    "la",
+    "las",
+    "los",
+    "para",
+    "por",
+    "que",
+    "un",
+    "una",
+    "y",
+}
+
 LATIN_STOPWORDS: dict[str, set[str]] = {
     "en-US": {
         "a",
@@ -524,24 +543,8 @@ LATIN_STOPWORDS: dict[str, set[str]] = {
         "von",
         "zu",
     },
-    "es-ES": {
-        "como",
-        "con",
-        "de",
-        "del",
-        "el",
-        "en",
-        "es",
-        "la",
-        "las",
-        "los",
-        "para",
-        "por",
-        "que",
-        "un",
-        "una",
-        "y",
-    },
+    "es-ES": SPANISH_COMMON_STOPWORDS | {"coche", "conducir", "móvil", "ordenador", "vosotros", "vuestro"},
+    "es-419": SPANISH_COMMON_STOPWORDS | {"carro", "celular", "computadora", "manejar", "ustedes"},
     "pt-BR": {
         "a",
         "as",
@@ -600,6 +603,7 @@ DIACRITIC_HINTS: tuple[tuple[str, str], ...] = (
     ("vi-VN", r"[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]"),
     ("fr-FR", r"[àâæçéèêëîïôœùûüÿ]"),
     ("es-ES", r"[áéíóúñü¿¡]"),
+    ("es-419", r"[áéíóúñü¿¡]"),
     ("pt-BR", r"[ãõáâàéêíóôúç]"),
     ("de-DE", r"[äöüß]"),
     ("it-IT", r"[àèéìíîòóùú]"),

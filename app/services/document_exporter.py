@@ -176,6 +176,7 @@ class TextToken:
 class CellParagraphTokens:
     paragraph: ET.Element
     tokens: list[TextToken]
+    parent: ET.Element | None = None
 
 
 @dataclass
@@ -631,6 +632,29 @@ def _export_block(
         )
 
 
+def _iter_block_nodes_with_parent(container: ET.Element):
+    for child in list(container):
+        child_name = _local_name(child.tag)
+        if child_name in {"p", "tbl"}:
+            yield container, child
+            continue
+
+        if child_name == "sdt":
+            content = child.find("w:sdtContent", NS)
+            if content is not None:
+                yield from _iter_block_nodes_with_parent(content)
+            continue
+
+        if child_name in {"customXml", "ins", "moveFrom", "moveTo", "smartTag"}:
+            yield from _iter_block_nodes_with_parent(child)
+            continue
+
+        if child_name == "AlternateContent":
+            preferred_branch = _select_preferred_alternate_content_branch(child)
+            if preferred_branch is not None:
+                yield from _iter_block_nodes_with_parent(preferred_branch)
+
+
 def _export_bilingual_table(
     table: ET.Element,
     story: StoryPart,
@@ -863,16 +887,16 @@ def _export_bilingual_table_cell(
                 segments=group_segments,
                 keep_source_when_empty=False,
             )
-            _insert_cloned_blocks(
-                parent=cell,
-                anchors=[item.paragraph for item in paragraph_group],
-                clones=target_paragraphs,
+            _insert_cloned_table_cell_paragraphs(
+                cell=cell,
+                paragraph_group=paragraph_group,
+                target_paragraphs=target_paragraphs,
                 order=order,
             )
 
         paragraph_buffer = []
 
-    for block in list(cell):
+    for parent, block in _iter_block_nodes_with_parent(cell):
         block_name = _local_name(block.tag)
         if block_name == "p":
             paragraph_buffer.append(
@@ -887,6 +911,7 @@ def _export_bilingual_table_cell(
                         math_placeholder_counter=[0],
                         process_embedded_textboxes=False,
                     ),
+                    parent=parent,
                 )
             )
             _export_bilingual_embedded_textboxes(
@@ -911,6 +936,38 @@ def _export_bilingual_table_cell(
             )
 
     flush_paragraphs()
+
+
+def _insert_cloned_table_cell_paragraphs(
+    cell: ET.Element,
+    paragraph_group: list[CellParagraphTokens],
+    target_paragraphs: list[ET.Element],
+    order: str,
+) -> None:
+    if not paragraph_group or not target_paragraphs:
+        return
+
+    parents = [
+        item.parent if item.parent is not None else cell
+        for item in paragraph_group
+    ]
+    first_parent = parents[0]
+    if all(parent is first_parent for parent in parents):
+        _insert_cloned_blocks(
+            parent=first_parent,
+            anchors=[item.paragraph for item in paragraph_group],
+            clones=target_paragraphs,
+            order=order,
+        )
+        return
+
+    for item, clone, parent in zip(paragraph_group, target_paragraphs, parents, strict=False):
+        _insert_cloned_blocks(
+            parent=parent,
+            anchors=[item.paragraph],
+            clones=[clone],
+            order=order,
+        )
 
 
 def _export_table_cell(
