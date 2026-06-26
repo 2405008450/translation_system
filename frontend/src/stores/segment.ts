@@ -416,7 +416,7 @@ export const useSegmentStore = defineStore('segment', () => {
     const sentenceIds = new Set<string>()
     for (const entries of Object.values(revisionHistory.value)) {
       for (const entry of entries) {
-        if (isVisiblePendingManualRevision(entry)) {
+        if (isCurrentVisiblePendingManualRevision(entry)) {
           sentenceIds.add(entry.sentence_id)
         }
       }
@@ -444,6 +444,21 @@ export const useSegmentStore = defineStore('segment', () => {
 
   function isVisiblePendingManualRevision(entry: SegmentRevisionEntry) {
     return isPendingManualRevision(entry) && isVisibleRevision(entry)
+  }
+
+  function isRevisionCurrentForSegment(entry: SegmentRevisionEntry) {
+    const segmentKey = mergeViewId.value
+      ? buildSegmentKey(entry.file_record_id, entry.sentence_id)
+      : entry.sentence_id
+    const index = getSegmentIndex(segmentKey)
+    if (index === -1) {
+      return true
+    }
+    return (segments.value[index].target_text || '') === (entry.after_text || '')
+  }
+
+  function isCurrentVisiblePendingManualRevision(entry: SegmentRevisionEntry) {
+    return isVisiblePendingManualRevision(entry) && isRevisionCurrentForSegment(entry)
   }
 
   function isLocalRevisionId(id: string) {
@@ -490,7 +505,7 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   function getPendingRevision(sentenceId: string) {
-    return revisionHistory.value[sentenceId]?.find(isVisiblePendingManualRevision) || null
+    return revisionHistory.value[sentenceId]?.find(isCurrentVisiblePendingManualRevision) || null
   }
 
   function listVisiblePendingRevisions() {
@@ -498,7 +513,7 @@ export const useSegmentStore = defineStore('segment', () => {
     const seenRevisionIds = new Set<string>()
     for (const entries of Object.values(revisionHistory.value)) {
       for (const entry of entries) {
-        if (isVisiblePendingManualRevision(entry) && !seenRevisionIds.has(entry.id)) {
+        if (isCurrentVisiblePendingManualRevision(entry) && !seenRevisionIds.has(entry.id)) {
           revisions.push(entry)
           seenRevisionIds.add(entry.id)
         }
@@ -2105,6 +2120,36 @@ export const useSegmentStore = defineStore('segment', () => {
     clearLocalRevisionDrafts([segmentKey])
   }
 
+  function finishLLMCompletion(updatedCount: number, errorCount: number, total: number) {
+    const hasNoSegments = total === 0 && updatedCount === 0 && errorCount === 0
+    llmPlannedCount.value = total
+    llmProcessedCount.value = Math.max(total, updatedCount + errorCount)
+    llmErrorCount.value = errorCount
+
+    if (hasNoSegments) {
+      llmMessage.value = translate('stores.segment.llmNoSegments')
+      pushToast({
+        tone: 'info',
+        title: translate('stores.segment.llmNoSegmentsToastTitle'),
+        message: translate('stores.segment.llmNoSegmentsToastMessage'),
+      })
+      return
+    }
+
+    llmMessage.value = translate('stores.segment.llmCompleted', {
+      updated: updatedCount,
+      error: errorCount,
+    })
+    pushToast({
+      tone: errorCount > 0 ? 'warn' : 'success',
+      title: translate('stores.segment.llmCompletedToastTitle'),
+      message: translate('stores.segment.llmCompletedToastMessage', {
+        updated: updatedCount,
+        error: errorCount,
+      }),
+    })
+  }
+
   async function startLLMTranslation(
     scope: LLMTranslateScope,
     provider: LLMProvider,
@@ -2244,21 +2289,7 @@ export const useSegmentStore = defineStore('segment', () => {
         }
 
         if (!llmAbortRequested) {
-          llmPlannedCount.value = aggregateTotal
-          llmProcessedCount.value = Math.max(aggregateTotal, aggregateUpdatedCount + aggregateErrorCount)
-          llmErrorCount.value = aggregateErrorCount
-          llmMessage.value = translate('stores.segment.llmCompleted', {
-            updated: aggregateUpdatedCount,
-            error: aggregateErrorCount,
-          })
-          pushToast({
-            tone: aggregateErrorCount > 0 ? 'warn' : 'success',
-            title: translate('stores.segment.llmCompletedToastTitle'),
-            message: translate('stores.segment.llmCompletedToastMessage', {
-              updated: aggregateUpdatedCount,
-              error: aggregateErrorCount,
-            }),
-          })
+          finishLLMCompletion(aggregateUpdatedCount, aggregateErrorCount, aggregateTotal)
         }
       } else {
         await runFileLLMTranslation(llmFileId!, (event, data) => {
@@ -2336,21 +2367,7 @@ export const useSegmentStore = defineStore('segment', () => {
       const updatedCount = Number(data.updated_count || 0)
       const errorCount = Number(data.error_count || 0)
       const total = Number(data.total || llmPlannedCount.value || updatedCount + errorCount)
-      llmPlannedCount.value = total
-      llmProcessedCount.value = Math.max(total, updatedCount + errorCount)
-      llmErrorCount.value = errorCount
-      llmMessage.value = translate('stores.segment.llmCompleted', {
-        updated: updatedCount,
-        error: errorCount,
-      })
-      pushToast({
-        tone: errorCount > 0 ? 'warn' : 'success',
-        title: translate('stores.segment.llmCompletedToastTitle'),
-        message: translate('stores.segment.llmCompletedToastMessage', {
-          updated: updatedCount,
-          error: errorCount,
-        }),
-      })
+      finishLLMCompletion(updatedCount, errorCount, total)
     }
   }
 

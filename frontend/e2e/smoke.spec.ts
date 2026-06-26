@@ -77,10 +77,34 @@ async function saveWorkbenchNow(page: Page) {
   await saveResponse
 }
 
+async function runCurrentSegmentAi(page: Page, options: { waitForSave?: boolean } = {}) {
+  const saveResponse = options.waitForSave
+    ? page.waitForResponse((response) => (
+      response.url().includes('/segments')
+      && response.request().method() === 'PUT'
+      && response.status() < 400
+    ))
+    : Promise.resolve(null)
+  const llmResponse = page.waitForResponse((response) => (
+    response.url().includes('/llm-translate')
+    && response.request().method() === 'POST'
+    && response.status() < 400
+  ))
+
+  await page.locator('.workbench-ribbon__ai-strip .ai-strip__button--primary').click()
+  await Promise.all([saveResponse, llmResponse])
+}
+
 async function expectEditorText(editor: Locator, expected: string) {
   await expect.poll(async () => (
     (await editor.evaluate((element) => element.textContent || '')).replace(/\u00a0/g, ' ')
   )).toBe(expected)
+}
+
+async function expectEditorTextContains(editor: Locator, expected: string) {
+  await expect.poll(async () => (
+    (await editor.evaluate((element) => element.textContent || '')).replace(/\u00a0/g, ' ')
+  )).toContain(expected)
 }
 
 async function expectEditorHtml(editor: Locator, matcher: RegExp) {
@@ -282,6 +306,87 @@ test.describe.serial('核心 E2E 冒烟流程', () => {
     await focusPage.getByTestId('workbench-export-button').click()
     const focusDownload = await focusDownloadPromise
     expect(focusDownload.suggestedFilename()).toContain('smoke-source')
+    await focusPage.close()
+  })
+
+  test('AI 修正会回填手动清空的当前译文', async ({ page }) => {
+    const originalText = `AI original ${Date.now()}`
+
+    await login(page)
+    const focusPage = await createProjectWithFixtureAndOpenFocusWorkbench(
+      page,
+      `E2E AI Clear ${Date.now()}`,
+    )
+
+    const firstRow = focusPage.getByTestId('segment-row').first()
+    const editor = focusPage.getByTestId('segment-target-editor').first()
+    await expect(editor).toBeVisible()
+
+    await editor.fill(originalText)
+    await saveWorkbenchNow(focusPage)
+    await editor.fill('')
+    await runCurrentSegmentAi(focusPage, { waitForSave: true })
+
+    await expectEditorTextContains(editor, 'MOCK_LLM_TRANSLATION sent-00001')
+    await expect(firstRow.locator('[data-revision-type]')).toHaveCount(0)
+
+    await focusPage.close()
+  })
+
+  test('AI 修正会在清空当前句段后移除过期待审修订', async ({ page }) => {
+    const originalText = `AI revision original ${Date.now()}`
+    const pendingText = `AI stale pending ${Date.now()}`
+
+    await login(page)
+    const focusPage = await createProjectWithFixtureAndOpenFocusWorkbench(
+      page,
+      `E2E AI Revision ${Date.now()}`,
+    )
+
+    const firstRow = focusPage.getByTestId('segment-row').first()
+    const editor = focusPage.getByTestId('segment-target-editor').first()
+    await expect(editor).toBeVisible()
+
+    await editor.fill(originalText)
+    await saveWorkbenchNow(focusPage)
+    await focusPage.getByTestId('workbench-revision-toggle').click()
+    await focusPage.getByTestId('workbench-revision-track-menu').click()
+    await focusPage.getByTestId('workbench-revision-show-trace').click()
+
+    await editor.fill(pendingText)
+    await saveWorkbenchNow(focusPage)
+    await expect(firstRow.locator('[data-testid="segment-revision-insert"]')).toContainText(pendingText)
+
+    await editor.fill('')
+    await runCurrentSegmentAi(focusPage, { waitForSave: true })
+
+    await expectEditorTextContains(editor, 'MOCK_LLM_TRANSLATION sent-00001')
+    await expect(editor).not.toContainText(pendingText)
+    await expect(firstRow.locator('[data-revision-type]')).toHaveCount(0)
+
+    await focusPage.close()
+  })
+
+  test('AI 修正无可处理句段时不显示成功语义', async ({ page }) => {
+    await login(page)
+    const focusPage = await createProjectWithFixtureAndOpenFocusWorkbench(
+      page,
+      `E2E AI Empty Scope ${Date.now()}`,
+    )
+
+    const editors = focusPage.getByTestId('segment-target-editor')
+    await expect(editors.first()).toBeVisible()
+    await expect(editors.nth(1)).toBeVisible()
+    await editors.nth(0).fill(`Filled target 1 ${Date.now()}`)
+    await editors.nth(1).fill(`Filled target 2 ${Date.now()}`)
+    await saveWorkbenchNow(focusPage)
+
+    await focusPage.locator('.workbench-ribbon__ai-strip select').first().selectOption('empty_target_only')
+    await runCurrentSegmentAi(focusPage)
+
+    await expect(focusPage.getByText('AI 未处理句段').last()).toBeVisible()
+    await expect(focusPage.getByText('AI 修正完成')).toHaveCount(0)
+
     await focusPage.close()
   })
 

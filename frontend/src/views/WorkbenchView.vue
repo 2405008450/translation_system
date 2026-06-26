@@ -5275,6 +5275,14 @@ async function runLLMTranslation() {
     return
   }
   try {
+    commitActiveSegmentEditorContent()
+    const synced = await syncPendingWorkbenchEdits()
+    if (!synced) {
+      const reason = segmentStore.syncMessage || t('workbench.errors.save')
+      pageError.value = reason
+      toast.warn(reason)
+      return
+    }
     await segmentStore.startLLMTranslation(llmScope.value, llmProvider.value, {
       guidelineTemplateId: selectedGuidelineTemplateId.value || undefined,
       temporaryPrompt: workbenchGuidelines.value,

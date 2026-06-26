@@ -133,6 +133,32 @@ def create_revision(
     return revision
 
 
+def reject_stale_manual_revisions_for_segment(
+    db: Session,
+    *,
+    segment_id: UUID,
+    after_text: str,
+    current_user: User | None = None,
+) -> int:
+    normalized_after_text = after_text or ""
+    stale_revisions = (
+        db.query(SegmentRevision)
+        .filter(
+            SegmentRevision.segment_id == segment_id,
+            SegmentRevision.source == "manual",
+            SegmentRevision.status == "pending",
+            SegmentRevision.after_text != normalized_after_text,
+        )
+        .all()
+    )
+    resolved_at = datetime.now()
+    for revision in stale_revisions:
+        revision.status = "rejected"
+        revision.resolved_at = resolved_at
+        revision.resolved_by_id = current_user.id if current_user else None
+    return len(stale_revisions)
+
+
 def accept_revision(
     db: Session,
     *,

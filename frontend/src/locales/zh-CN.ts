@@ -214,6 +214,9 @@ export default {
       llmCompleted: 'AI 修正完成，成功 {updated} 条，失败 {error} 条。',
       llmCompletedToastTitle: 'AI 修正完成',
       llmCompletedToastMessage: '成功 {updated} 条，失败 {error} 条。',
+      llmNoSegments: 'AI 修正未处理任何句段。',
+      llmNoSegmentsToastTitle: 'AI 未处理句段',
+      llmNoSegmentsToastMessage: '当前范围内没有需要 AI 修正的句段。',
     },
   },
   login: {

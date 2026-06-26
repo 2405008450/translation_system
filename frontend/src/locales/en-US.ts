@@ -502,6 +502,13 @@ const overrides = {
     admin: 'Admin',
     user: 'User',
   },
+  stores: {
+    segment: {
+      llmNoSegments: 'AI revision did not process any segments.',
+      llmNoSegmentsToastTitle: 'No segments processed',
+      llmNoSegmentsToastMessage: 'There are no segments in the current scope that need AI revision.',
+    },
+  },
   status: {
     unknownStatus: 'Unknown status',
     unknownSource: 'Unknown source',

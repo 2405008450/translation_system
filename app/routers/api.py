@@ -280,6 +280,7 @@ from app.services.revision_service import (
     get_revision_or_404,
     list_revisions,
     reject_revision,
+    reject_stale_manual_revisions_for_segment,
     serialize_segment_revision,
 )
 from app.services.revision_settings_service import (
@@ -12746,6 +12747,12 @@ async def llm_translate_file_record(
                             segment.llm_provider = result.provider
                             segment.llm_model = result.model
                             segment.status = _resolve_unconfirmed_segment_status(segment)
+                            reject_stale_manual_revisions_for_segment(
+                                fdb,
+                                segment_id=segment.id,
+                                after_text=translated_text,
+                                current_user=user,
+                            )
 
                             if (before_text or "") != (translated_text or ""):
                                 fdb.add(SegmentRevision(
