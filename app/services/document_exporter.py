@@ -1376,6 +1376,25 @@ def _export_bilingual_embedded_textboxes(
     segments_by_block: dict[BlockKey, list[ExportSegment]],
     order: str,
 ) -> None:
+    for embedded_node in _iter_embedded_object_nodes_for_export(node):
+        _export_bilingual_embedded_textbox_object(
+            node=embedded_node,
+            story=story,
+            block_counter=block_counter,
+            numbering_schema=numbering_schema,
+            segments_by_block=segments_by_block,
+            order=order,
+        )
+
+
+def _export_bilingual_embedded_textbox_object(
+    node: ET.Element,
+    story: StoryPart,
+    block_counter,
+    numbering_schema: NumberingSchema,
+    segments_by_block: dict[BlockKey, list[ExportSegment]],
+    order: str,
+) -> None:
     textbox_contents = node.findall(".//w:txbxContent", NS)
     if textbox_contents:
         for textbox_content in textbox_contents:
@@ -1435,6 +1454,23 @@ def _export_embedded_textboxes(
     numbering_schema: NumberingSchema,
     segments_by_block: dict[BlockKey, list[ExportSegment]],
 ) -> None:
+    for embedded_node in _iter_embedded_object_nodes_for_export(node):
+        _export_embedded_textbox_object(
+            node=embedded_node,
+            story=story,
+            block_counter=block_counter,
+            numbering_schema=numbering_schema,
+            segments_by_block=segments_by_block,
+        )
+
+
+def _export_embedded_textbox_object(
+    node: ET.Element,
+    story: StoryPart,
+    block_counter,
+    numbering_schema: NumberingSchema,
+    segments_by_block: dict[BlockKey, list[ExportSegment]],
+) -> None:
     textbox_contents = node.findall(".//w:txbxContent", NS)
     if textbox_contents:
         for textbox_content in textbox_contents:
@@ -1479,6 +1515,25 @@ def _export_embedded_textboxes(
             [],
         ),
     )
+
+
+def _iter_embedded_object_nodes_for_export(node: ET.Element):
+    node_name = _local_name(node.tag)
+    if node_name in {"pPr", "rPr", "tblPr", "tblGrid", "trPr", "tcPr", "sectPr"}:
+        return
+
+    if node_name == "AlternateContent":
+        preferred_branch = _select_preferred_alternate_content_branch(node)
+        if preferred_branch is not None:
+            yield from _iter_embedded_object_nodes_for_export(preferred_branch)
+        return
+
+    if node.tag in {_qn("w", "drawing"), _qn("w", "pict")}:
+        yield node
+        return
+
+    for child in list(node):
+        yield from _iter_embedded_object_nodes_for_export(child)
 
 
 def _replace_block_tokens(
