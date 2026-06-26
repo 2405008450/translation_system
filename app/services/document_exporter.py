@@ -334,6 +334,9 @@ def _group_segments_by_block(
 ) -> dict[BlockKey, list[ExportSegment]]:
     grouped: dict[BlockKey, list[ExportSegment]] = defaultdict(list)
     math_map = math_placeholders_by_sentence_id or {}
+    source_segment_list = list(source_segments or [])
+    source_segment_by_sentence_id = _build_source_segment_lookup_by_sentence_id(source_segment_list)
+    source_segment_by_text_key = _build_unique_source_segment_lookup_by_text(source_segment_list)
 
     for segment in segments:
         block_type = str(_get_segment_value(segment, "block_type", "paragraph") or "paragraph")
@@ -342,8 +345,14 @@ def _group_segments_by_block(
         cell_index = _to_optional_int(_get_segment_value(segment, "cell_index"))
         sentence_id = str(_get_segment_value(segment, "sentence_id", "") or "")
         target_html = _get_segment_value(segment, "target_html")
+        block_key = _resolve_export_segment_block_key(
+            segment=segment,
+            fallback=(block_type, block_index, row_index, cell_index),
+            source_segment_by_sentence_id=source_segment_by_sentence_id,
+            source_segment_by_text_key=source_segment_by_text_key,
+        )
 
-        grouped[(block_type, block_index, row_index, cell_index)].append(
+        grouped[block_key].append(
             ExportSegment(
                 sentence_id=sentence_id,
                 source_text=str(_get_segment_value(segment, "source_text", "") or ""),
@@ -356,10 +365,67 @@ def _group_segments_by_block(
             )
         )
 
-    if source_segments is not None:
-        return _order_segment_groups_by_source(grouped, source_segments)
+    if source_segment_list:
+        return _order_segment_groups_by_source(grouped, source_segment_list)
 
     return grouped
+
+
+def _build_source_segment_lookup_by_sentence_id(
+    source_segments: Iterable[Mapping[str, Any]] | None,
+) -> dict[str, Mapping[str, Any]]:
+    if source_segments is None:
+        return {}
+    return {
+        str(segment.get("sentence_id") or ""): segment
+        for segment in source_segments
+        if segment.get("sentence_id")
+    }
+
+
+def _build_unique_source_segment_lookup_by_text(
+    source_segments: Iterable[Mapping[str, Any]] | None,
+) -> dict[str, Mapping[str, Any]]:
+    if source_segments is None:
+        return {}
+
+    source_by_key: dict[str, Mapping[str, Any] | None] = {}
+    for segment in source_segments:
+        for text_key in _source_segment_text_keys(segment):
+            if text_key not in source_by_key:
+                source_by_key[text_key] = segment
+            elif source_by_key[text_key] is not segment:
+                source_by_key[text_key] = None
+
+    return {
+        text_key: segment
+        for text_key, segment in source_by_key.items()
+        if segment is not None
+    }
+
+
+def _resolve_export_segment_block_key(
+    *,
+    segment: Any,
+    fallback: BlockKey,
+    source_segment_by_sentence_id: Mapping[str, Mapping[str, Any]],
+    source_segment_by_text_key: Mapping[str, Mapping[str, Any]],
+) -> BlockKey:
+    sentence_id = str(_get_segment_value(segment, "sentence_id", "") or "")
+    source_segment = source_segment_by_sentence_id.get(sentence_id)
+    if source_segment is None:
+        for text_key in _segment_text_keys(
+            _get_segment_value(segment, "source_text", ""),
+            _get_segment_value(segment, "display_text", ""),
+        ):
+            source_segment = source_segment_by_text_key.get(text_key)
+            if source_segment is not None:
+                break
+
+    if source_segment is None:
+        return fallback
+
+    return _source_segment_block_key(source_segment)
 
 
 def _order_segment_groups_by_source(

@@ -170,7 +170,7 @@ def _is_sentence_ending_dot(text: str, dot_index: int) -> bool:
     if dot_index + 1 < text_length:
         next_char = text[dot_index + 1]
         # 如果句号后直接跟着字母或数字，不是句子结束（如文件名 file.txt）
-        if next_char.isalnum():
+        if next_char.isascii() and next_char.isalnum():
             return False
         # 如果句号后面是空格，再检查空格后的字符
         if next_char.isspace():
