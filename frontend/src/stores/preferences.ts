@@ -29,7 +29,7 @@ function getStoredBoolean(key: string, fallback: boolean) {
 }
 
 function normalizeConfirmJumpMode(value: string | null | undefined): WorkbenchConfirmJumpMode {
-  return value === 'next_unconfirmed' ? 'next_unconfirmed' : 'next_segment'
+  return value === 'next_segment' ? 'next_segment' : 'next_unconfirmed'
 }
 
 export const usePreferencesStore = defineStore('preferences', () => {
@@ -37,7 +37,7 @@ export const usePreferencesStore = defineStore('preferences', () => {
   const theme = ref<ThemeMode>('light')
   const autoFillExactMatches = ref(true)
   const autoFillFuzzyMatches = ref(true)
-  const confirmJumpMode = ref<WorkbenchConfirmJumpMode>('next_segment')
+  const confirmJumpMode = ref<WorkbenchConfirmJumpMode>('next_unconfirmed')
 
   const isDark = computed(() => theme.value === 'dark')
 

@@ -276,9 +276,7 @@ function escapeRegExp(value: string) {
 }
 
 function resolveSearchKeyword(value: string) {
-  const normalized = value.replace(/\s+/g, ' ')
-  const trimmed = normalized.trim()
-  return trimmed || (normalized ? ' ' : '')
+  return value
 }
 
 function highlightSearchText(text: string, keyword: string, caseSensitive = false): HighlightPart[] | null {

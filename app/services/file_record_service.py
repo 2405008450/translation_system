@@ -51,6 +51,13 @@ SEGMENT_ORDERING = (
     Segment.sentence_id.asc(),
 )
 
+PPTX_SEGMENT_ORDERING = (
+    Segment.sentence_id.asc(),
+    Segment.block_index.asc(),
+    Segment.row_index.asc().nullsfirst(),
+    Segment.cell_index.asc().nullsfirst(),
+)
+
 _PENDING_SOURCE_FILES_KEY = "pending_source_files"
 
 
@@ -177,6 +184,12 @@ def _count_filled_targets(items: list[dict]) -> int:
 
 def _count_confirmed_segments(items: list[dict]) -> int:
     return sum(1 for item in items if item.get("status") == "confirmed")
+
+
+def get_segment_ordering_for_file_record(file_record: FileRecord | None):
+    if file_record is not None and Path(file_record.filename or "").suffix.lower() == ".pptx":
+        return PPTX_SEGMENT_ORDERING
+    return SEGMENT_ORDERING
 
 
 def _record_initial_translation_events(db: Session, segments: list[Segment]) -> None:
@@ -728,7 +741,7 @@ def get_file_record_with_segments(
     base_query = db.query(Segment).filter(Segment.file_record_id == file_record_id)
     total_segments = base_query.count()
 
-    segments_query = base_query.order_by(*SEGMENT_ORDERING)
+    segments_query = base_query.order_by(*get_segment_ordering_for_file_record(file_record))
     if safe_skip:
         segments_query = segments_query.offset(safe_skip)
     if limit is not None:
@@ -761,10 +774,11 @@ def list_segments_for_file_record(
     db: Session,
     file_record_id: UUID,
 ) -> list[Segment]:
+    file_record = get_file_record(db, file_record_id)
     return (
         db.query(Segment)
         .filter(Segment.file_record_id == file_record_id)
-        .order_by(*SEGMENT_ORDERING)
+        .order_by(*get_segment_ordering_for_file_record(file_record))
         .all()
     )
 
@@ -774,6 +788,7 @@ def list_segments_for_llm_translation(
     file_record_id: UUID,
     scope: str = "all",
 ) -> list[Segment]:
+    file_record = get_file_record(db, file_record_id)
     statuses_by_scope = {
         "fuzzy_only": ["fuzzy"],
         "none_only": ["none"],
@@ -787,7 +802,7 @@ def list_segments_for_llm_translation(
                 Segment.file_record_id == file_record_id,
                 func.coalesce(Segment.target_text, "") == "",
             )
-            .order_by(*SEGMENT_ORDERING)
+            .order_by(*get_segment_ordering_for_file_record(file_record))
             .all()
         )
 
@@ -801,7 +816,7 @@ def list_segments_for_llm_translation(
             Segment.file_record_id == file_record_id,
             Segment.status.in_(statuses),
         )
-        .order_by(*SEGMENT_ORDERING)
+        .order_by(*get_segment_ordering_for_file_record(file_record))
         .all()
     )
 

@@ -161,6 +161,7 @@ from app.services.file_record_service import (
     get_file_record_document_statistics,
     get_file_record_source_filename,
     get_file_record_with_segments,
+    get_segment_ordering_for_file_record,
     get_tm_target_text_map,
     list_file_records,
     list_segments_for_file_record,
@@ -2986,7 +2987,7 @@ def _apply_segment_assignment_visibility_filter(
             Segment.workflow_step_id.label("workflow_step_id"),
             func.row_number()
             .over(
-                order_by=SEGMENT_ORDERING
+                order_by=get_segment_ordering_for_file_record(file_record)
             )
             .label("display_index"),
         )
@@ -3399,6 +3400,7 @@ def _validate_assignment_range_merge_block_boundary(
     range_start: int,
     range_end: int,
 ) -> None:
+    file_record = get_file_record_model(db, file_record_id)
     boundary_positions = {range_start, range_end}
     if range_start > 1:
         boundary_positions.add(range_start - 1)
@@ -3412,7 +3414,7 @@ def _validate_assignment_range_merge_block_boundary(
             Segment.cell_index.label("cell_index"),
             func.row_number()
             .over(
-                order_by=SEGMENT_ORDERING
+                order_by=get_segment_ordering_for_file_record(file_record)
             )
             .label("display_index"),
         )
@@ -5997,7 +5999,7 @@ def _create_term_qa_report(
         file_segments = (
             db.query(Segment)
             .filter(Segment.file_record_id == file_record.id)
-            .order_by(*SEGMENT_ORDERING)
+            .order_by(*get_segment_ordering_for_file_record(file_record))
             .all()
         )
         checked_segments += len(file_segments)
@@ -8430,9 +8432,7 @@ def _apply_segment_text_filters(
 def _normalize_segment_search_keyword(value: str | None) -> str:
     if value is None:
         return ""
-    normalized = re.sub(r"\s+", " ", value)
-    stripped = normalized.strip()
-    return stripped or (" " if normalized else "")
+    return value
 
 
 def _split_segment_exclude_keywords(value: str | None) -> list[str]:
@@ -8522,8 +8522,8 @@ def _apply_segment_screening_filters(
     return query
 
 
-def _order_segment_query(query):
-    return query.order_by(*SEGMENT_ORDERING)
+def _order_segment_query(query, file_record: FileRecord | None = None):
+    return query.order_by(*get_segment_ordering_for_file_record(file_record))
 
 
 def _get_segment_display_index_map(
@@ -8535,12 +8535,13 @@ def _get_segment_display_index_map(
     if not segment_ids:
         return {}
 
+    file_record = get_file_record_model(db, file_record_id)
     ordered_segments = (
         db.query(
             Segment.id.label("id"),
             func.row_number()
             .over(
-                order_by=SEGMENT_ORDERING
+                order_by=get_segment_ordering_for_file_record(file_record)
             )
             .label("display_index"),
         )
@@ -8572,12 +8573,13 @@ def _apply_segment_display_range_filter(
     if start > end:
         raise HTTPException(status_code=400, detail="句段范围起始值不能大于结束值。")
 
+    file_record = get_file_record_model(db, file_record_id)
     ordered_segments = (
         db.query(
             Segment.id.label("id"),
             func.row_number()
             .over(
-                order_by=SEGMENT_ORDERING
+                order_by=get_segment_ordering_for_file_record(file_record)
             )
             .label("display_index"),
         )
@@ -8682,6 +8684,7 @@ def _get_segment_page_sentence_ids(
 ) -> list[str]:
     safe_skip = max(skip, 0)
     safe_limit = _normalize_segment_page_limit(limit)
+    file_record = get_file_record_model(db, file_record_id)
     query = db.query(Segment.sentence_id).filter(Segment.file_record_id == file_record_id)
     query = _apply_segment_scope_filter(query, scope)
     query = _apply_segment_text_filters(
@@ -8702,7 +8705,7 @@ def _get_segment_page_sentence_ids(
     return [
         sentence_id
         for (sentence_id,) in (
-            _order_segment_query(query)
+            _order_segment_query(query, file_record)
             .offset(safe_skip)
             .limit(safe_limit)
             .all()
@@ -8735,6 +8738,7 @@ def _apply_workflow_transition_filters(
     file_record_id: UUID,
     payload: WorkflowTransitionPreviewRequest,
 ):
+    file_record = get_file_record_model(db, file_record_id)
     query = query.filter(
         Segment.file_record_id == file_record_id,
         Segment.workflow_step_id == payload.from_step_id,
@@ -8756,7 +8760,7 @@ def _apply_workflow_transition_filters(
                 Segment.id.label("id"),
                 func.row_number()
                 .over(
-                    order_by=SEGMENT_ORDERING
+                    order_by=get_segment_ordering_for_file_record(file_record)
                 )
                 .label("display_index"),
             )
@@ -8838,7 +8842,8 @@ def transition_file_record_workflow(
             db.query(Segment),
             file_record_id,
             payload,
-        )
+        ),
+        file_record,
     ).all()
     matched_count = len(segments)
     updated_count = 0
@@ -8927,7 +8932,7 @@ def get_file_record(
     )
     total_segments = visible_base_query.count()
     segments = (
-        _order_segment_query(visible_base_query)
+        _order_segment_query(visible_base_query, file_record)
         .offset(safe_skip)
         .limit(safe_limit)
         .all()
@@ -9204,7 +9209,7 @@ def get_file_record_segments(
     )
     matched_segments = filtered_query.count()
     page_segments = (
-        _order_segment_query(filtered_query)
+        _order_segment_query(filtered_query, file_record)
         .offset(safe_skip)
         .limit(safe_limit)
         .all()
@@ -9414,7 +9419,8 @@ def get_file_record_next_unconfirmed_segment_position(
             Segment.id,
             Segment.sentence_id,
             Segment.status,
-        )
+        ),
+        file_record,
     ).all()
     display_index_map = _get_segment_display_index_map(db, file_record_id, filtered_segments)
 
@@ -9487,7 +9493,7 @@ def get_file_record_segment_position(
             Segment.sentence_id.label("sentence_id"),
             func.row_number()
             .over(
-                order_by=SEGMENT_ORDERING
+                order_by=get_segment_ordering_for_file_record(file_record)
             )
             .label("position"),
         )
@@ -9619,7 +9625,7 @@ def get_file_record_preview(
         current_user,
     )
     page_segments = (
-        _order_segment_query(visible_query)
+        _order_segment_query(visible_query, file_record)
         .offset(safe_skip)
         .limit(safe_limit)
         .all()
@@ -10587,6 +10593,7 @@ def get_merge_view_segment_position(
         raise HTTPException(status_code=404, detail="句段所属文件不在当前视图中。")
 
     safe_page_size = _normalize_segment_page_limit(page_size)
+    target_file_record = file_by_id[file_record_id]
     previous_count = 0
     for file_record in files:
         if file_record.id == file_record_id:
@@ -10604,7 +10611,7 @@ def get_merge_view_segment_position(
             Segment.sentence_id.label("sentence_id"),
             func.row_number()
             .over(
-                order_by=SEGMENT_ORDERING
+                order_by=get_segment_ordering_for_file_record(target_file_record)
             )
             .label("position"),
         )
@@ -10729,7 +10736,7 @@ def get_merge_view_segments(
         local_skip = window_start - file_start
         local_limit = window_end - window_start
         page_segments = (
-            _order_segment_query(filtered_query)
+            _order_segment_query(filtered_query, file_record)
             .offset(local_skip)
             .limit(local_limit)
             .all()
@@ -11826,7 +11833,7 @@ def replace_file_record_segment_targets(
         source_filters=payload.source_filters,
         workflow_step_ids=payload.workflow_step_ids,
     )
-    segments = _order_segment_query(query).all()
+    segments = _order_segment_query(query, file_record).all()
     segments = _filter_writable_segments(db, file_record, current_user, segments)
     if not segments:
         return {"updated_count": 0, "occurrence_count": 0}

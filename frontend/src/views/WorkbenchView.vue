@@ -1666,9 +1666,7 @@ const activeMatchedTerms = computed(() => {
 })
 
 function resolveLiteralSearchKeyword(value: string) {
-  const normalized = value.replace(/\s+/g, ' ')
-  const trimmed = normalized.trim()
-  return trimmed || (normalized ? ' ' : '')
+  return value
 }
 
 function normalizeSearchText(value: string, caseSensitive = searchCaseSensitive.value) {

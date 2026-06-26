@@ -9,13 +9,13 @@ from zipfile import ZipFile
 from xml.etree import ElementTree as ET
 
 from app.services.adapters.models import BlockNode, DocumentAST
-from app.services.adapters.pptx_adapter import A_NS, CORE_NS, DC_NS, DCTERMS_NS, EXTENDED_PROPS_NS, NS, P_NS, R_NS, PptxAdapter
+from app.services.adapters.pptx_adapter import A_NS, C_NS, CORE_NS, DC_NS, DCTERMS_NS, EXTENDED_PROPS_NS, NS, P_NS, R_NS, PptxAdapter
 
 
 PPTX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 XML_SPACE_ATTR = "{http://www.w3.org/XML/1998/namespace}space"
-PPTX_AUTOFIT_MIN_SCALE = 0.78
-PPTX_AUTOFIT_MIN_FONT_SIZE = 800
+PPTX_AUTOFIT_MIN_SCALE = 0.35
+PPTX_AUTOFIT_MIN_FONT_SIZE = 600
 PPTX_AUTOFIT_OVERFLOW_TOLERANCE = 1.08
 PPTX_AUTOFIT_LINE_SPACE_REDUCTION = 10000
 PPTX_PERCENT_DENOMINATOR = 100000
@@ -131,6 +131,13 @@ class PptxExporter:
                 str(metadata.get("part_name", "")),
                 int(metadata.get("property_index", 0)),
             )
+        if item_type == "chart_text":
+            return (
+                "chart_text",
+                str(metadata.get("part_name", "")),
+                str(metadata.get("chart_text_kind", "")),
+                int(metadata.get("chart_text_index", 0)),
+            )
         return None
 
     def _build_modified_xml(
@@ -198,6 +205,15 @@ class PptxExporter:
                     if property_index < len(children):
                         children[property_index].text = replacement.text
 
+                for (_, _, chart_text_kind, chart_text_index), replacement in (
+                    (key, value)
+                    for key, value in part_replacements.items()
+                    if key[0] == "chart_text"
+                ):
+                    chart_text_elements = _chart_text_elements(root, chart_text_kind)
+                    if chart_text_index < len(chart_text_elements):
+                        _replace_single_text_element(chart_text_elements[chart_text_index], replacement.text)
+
                 modified[part_name] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
         return modified
@@ -206,13 +222,17 @@ class PptxExporter:
 def _replace_text_elements(elements: list[ET.Element], text: str) -> None:
     if not elements:
         return
-    elements[0].text = text
-    if text[:1].isspace() or text[-1:].isspace():
-        elements[0].set(XML_SPACE_ATTR, "preserve")
-    else:
-        elements[0].attrib.pop(XML_SPACE_ATTR, None)
+    _replace_single_text_element(elements[0], text)
     for element in elements[1:]:
         element.text = ""
+
+
+def _replace_single_text_element(element: ET.Element, text: str) -> None:
+    element.text = text
+    if text[:1].isspace() or text[-1:].isspace():
+        element.set(XML_SPACE_ATTR, "preserve")
+    else:
+        element.attrib.pop(XML_SPACE_ATTR, None)
 
 
 def _apply_autofit(
@@ -229,6 +249,8 @@ def _apply_autofit(
         font_size=font_size,
         box=box,
     )
+    if body_pr is not None:
+        _set_body_text_constraints(body_pr)
     if scale >= 1:
         return
 
@@ -245,15 +267,22 @@ def _calculate_autofit_scale(
     font_size: int,
     box: TextBoxEstimate | None,
 ) -> float:
-    estimated_scale = _estimate_scale_for_box(target_text, font_size, box)
-    if estimated_scale is not None:
-        return estimated_scale
-
+    scale_candidates: list[float] = []
+    box_scale = _estimate_scale_for_box(target_text, font_size, box)
+    if box_scale is not None:
+        scale_candidates.append(box_scale)
     source_units = _visual_text_units(source_text)
     target_units = _visual_text_units(target_text)
-    if source_units <= 0 or target_units <= source_units * PPTX_AUTOFIT_OVERFLOW_TOLERANCE:
+    if source_units > 0 and target_units > source_units * PPTX_AUTOFIT_OVERFLOW_TOLERANCE:
+        scale_candidates.append(
+            max(
+                PPTX_AUTOFIT_MIN_SCALE,
+                min(1.0, ((source_units * PPTX_AUTOFIT_OVERFLOW_TOLERANCE) / target_units) ** 0.35),
+            )
+        )
+    if not scale_candidates:
         return 1
-    return max(PPTX_AUTOFIT_MIN_SCALE, min(1.0, (source_units / target_units) ** 0.35))
+    return min(scale_candidates)
 
 
 def _estimate_scale_for_box(
@@ -449,6 +478,7 @@ def _parse_non_negative_int(value: str | None) -> int:
 
 
 def _set_normal_autofit(body_pr: ET.Element, scale: float) -> None:
+    _set_body_text_constraints(body_pr)
     for child in list(body_pr):
         if _local_name(child.tag) in {"noAutofit", "normAutofit", "spAutoFit"}:
             body_pr.remove(child)
@@ -457,6 +487,12 @@ def _set_normal_autofit(body_pr: ET.Element, scale: float) -> None:
     normal_autofit.set("fontScale", str(int(round(scale * PPTX_PERCENT_DENOMINATOR))))
     normal_autofit.set("lnSpcReduction", str(PPTX_AUTOFIT_LINE_SPACE_REDUCTION))
     body_pr.insert(_autofit_insert_index(body_pr), normal_autofit)
+
+
+def _set_body_text_constraints(body_pr: ET.Element) -> None:
+    body_pr.set("wrap", "square")
+    body_pr.set("horzOverflow", "clip")
+    body_pr.set("vertOverflow", "clip")
 
 
 def _autofit_insert_index(body_pr: ET.Element) -> int:
@@ -611,6 +647,14 @@ def _comment_text_elements(comment: ET.Element) -> list[ET.Element]:
     ]
 
 
+def _chart_text_elements(root: ET.Element, chart_text_kind: str) -> list[ET.Element]:
+    if chart_text_kind == "a_t":
+        return root.findall(".//a:t", NS)
+    if chart_text_kind == "c_v":
+        return root.findall(".//c:v", NS)
+    return []
+
+
 def _local_name(tag: str) -> str:
     if tag.startswith("{") and "}" in tag:
         return tag.split("}", 1)[1]
@@ -626,6 +670,7 @@ def _register_namespaces() -> None:
     ET.register_namespace("a", A_NS)
     ET.register_namespace("p", P_NS)
     ET.register_namespace("r", R_NS)
+    ET.register_namespace("c", C_NS)
     ET.register_namespace("cp", CORE_NS)
     ET.register_namespace("dc", DC_NS)
     ET.register_namespace("dcterms", DCTERMS_NS)

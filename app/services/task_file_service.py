@@ -865,17 +865,36 @@ def build_export_segments_from_source(
         str(_get_segment_value(segment, "sentence_id", _get_segment_value(segment, "segment_id", ""))): segment
         for segment in segments
     }
+    translated_segments_by_source: dict[str, list[Any]] = {}
+    for segment in segments:
+        source_key = _normalize_export_source_text(_get_segment_value(segment, "source_text", ""))
+        if source_key:
+            translated_segments_by_source.setdefault(source_key, []).append(segment)
     ordered_translated_segments = list(segments)
+    used_translated_segment_ids: set[int] = set()
 
     export_segments: list[dict[str, Any]] = []
     for index, parsed_segment in enumerate(parse_result.segments):
         translated_segment = translated_segments.get(parsed_segment.segment_id)
+        parsed_source = _normalize_export_source_text(parsed_segment.source_text)
+        if translated_segment is not None and _normalize_export_source_text(
+            _get_segment_value(translated_segment, "source_text", "")
+        ) != parsed_source:
+            translated_segment = None
         if translated_segment is None and index < len(ordered_translated_segments):
             candidate_segment = ordered_translated_segments[index]
-            if _normalize_export_source_text(
+            if id(candidate_segment) not in used_translated_segment_ids and _normalize_export_source_text(
                 _get_segment_value(candidate_segment, "source_text", "")
-            ) == _normalize_export_source_text(parsed_segment.source_text):
+            ) == parsed_source:
                 translated_segment = candidate_segment
+        if translated_segment is None and parsed_source:
+            candidates = translated_segments_by_source.get(parsed_source, [])
+            while candidates and id(candidates[0]) in used_translated_segment_ids:
+                candidates.pop(0)
+            if candidates:
+                translated_segment = candidates.pop(0)
+        if translated_segment is not None:
+            used_translated_segment_ids.add(id(translated_segment))
         context = _build_segment_context(parse_result.ast, parsed_segment.block_path, fallback_index=index)
         export_segments.append(
             {
@@ -936,7 +955,12 @@ def _build_segment_context(
 
     block_index = root_index
     if block_type == "table_cell":
-        if ".children." not in block_path and ("row" in metadata or "col" in metadata):
+        explicit_block_index = _to_optional_int(metadata.get("block_index"))
+        if explicit_block_index is not None:
+            block_index = explicit_block_index
+        elif ".children." in block_path:
+            block_index = root_index
+        elif "row" in metadata or "col" in metadata:
             block_index = _to_int(metadata.get("table_index"), default=0)
         else:
             block_index = _to_int(metadata.get("table_index"), default=root_index)
