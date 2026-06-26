@@ -53,6 +53,9 @@ class Project(Base):
     quality_qa_settings: Mapped[str] = mapped_column(
         Text, nullable=False, default="{}", server_default=text("'{}'")
     )
+    auto_tm_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )

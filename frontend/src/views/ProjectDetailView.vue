@@ -3473,6 +3473,7 @@ function setGroupPrimaryTMCollection(group: ProjectTranslationMemorySettingGroup
 
 function buildTranslationMemorySettingsPayload() {
   return {
+    auto_tm_enabled: translationMemorySettings.value?.auto_tm_enabled ?? true,
     settings: (translationMemorySettings.value?.groups || []).map((group) => ({
       source_language: group.source_language,
       target_language: group.target_language,
@@ -3502,7 +3503,9 @@ async function saveProjectTranslationMemorySettings() {
     toast.show({
       tone: 'success',
       title: '记忆库设置已保存',
-      message: data.initial_match_updated_count
+      message: data.initial_match_queued_count
+        ? `已将 ${data.initial_match_queued_count} 个文件加入后台匹配队列。`
+        : data.initial_match_updated_count
         ? `已同步更新 ${data.initial_match_updated_count} 个句段。`
         : '',
     })
@@ -5086,6 +5089,20 @@ onBeforeUnmount(() => {
                   当前项目还没有可配置语言对的文件。
                 </div>
                 <div v-else class="tm-settings__groups">
+                  <div class="tm-settings__auto-sync">
+                    <label class="term-settings__toggle tm-settings__auto-sync-switch">
+                      <input
+                        v-model="translationMemorySettings.auto_tm_enabled"
+                        type="checkbox"
+                        aria-label="自动写入确认句段到主写入记忆库"
+                      >
+                      <span aria-hidden="true" />
+                    </label>
+                    <div class="tm-settings__auto-sync-copy">
+                      <strong>自动写入确认句段到主写入记忆库</strong>
+                      <span>开启后，已确认且有译文的句段会进入后台队列，写入当前文件的主写入记忆库。</span>
+                    </div>
+                  </div>
                   <div class="resource-settings-search">
                     <label class="resource-settings-search__field">
                       <Search :size="14" />
@@ -9659,6 +9676,37 @@ onBeforeUnmount(() => {
 .tm-settings__groups {
   display: grid;
   gap: 12px;
+}
+
+.tm-settings__auto-sync {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-1);
+}
+
+.tm-settings__auto-sync-switch {
+  flex: 0 0 auto;
+}
+
+.tm-settings__auto-sync-copy {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.tm-settings__auto-sync-copy strong {
+  color: var(--text-primary);
+  font-size: 0.93rem;
+}
+
+.tm-settings__auto-sync-copy span {
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  line-height: 1.45;
 }
 
 .tm-settings__panel {

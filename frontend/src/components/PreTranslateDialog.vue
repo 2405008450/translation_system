@@ -1848,6 +1848,7 @@ onBeforeUnmount(() => {
                 {{ option.label }}
               </option>
             </select>
+            <span class="field__note">{{ t('projectDetail.preTranslate.llm.scopeHint') }}</span>
           </label>
         </div>
         <label class="field field--full">
@@ -2650,6 +2651,12 @@ onBeforeUnmount(() => {
   background: color-mix(in srgb, var(--surface-panel) 97%, var(--ptd-accent) 3%);
   color: color-mix(in srgb, var(--ptd-accent-strong) 36%, var(--text-secondary));
   font-weight: 600;
+}
+
+.ptd-section .field__note {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  line-height: 1.45;
 }
 
 .ptd-section .hint-text {

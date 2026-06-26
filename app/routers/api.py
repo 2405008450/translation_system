@@ -90,8 +90,10 @@ from app.services.auto_tm_sync import (
     enqueue_confirmed_segments_for_auto_tm,
     process_due_auto_tm_rematches,
     refresh_unconfirmed_segment_matches,
+    register_file_rematch_work,
     register_project_collections_rematch_work,
     run_auto_tm_background_once,
+    run_auto_tm_rematch_background_once,
 )
 from app.services.adapters.dita_exporter import DitaExporter
 from app.services.adapters.svg_exporter import SvgExporter
@@ -539,6 +541,13 @@ async def _dispatch_auto_tm_background() -> None:
     if await _enqueue_arq_job("auto_tm_background_job"):
         return
     await asyncio.to_thread(run_auto_tm_background_once)
+
+
+async def _dispatch_auto_tm_rematch_background() -> None:
+    """强制处理已入队的 TM 重匹配任务，用于项目绑定后的初始刷新。"""
+    if await _enqueue_arq_job("auto_tm_rematch_background_job"):
+        return
+    await asyncio.to_thread(run_auto_tm_rematch_background_once)
 
 
 async def _queue_import_task(
@@ -1181,6 +1190,10 @@ async def auto_tm_background_job(ctx) -> None:
     await asyncio.to_thread(run_auto_tm_background_once)
 
 
+async def auto_tm_rematch_background_job(ctx) -> None:
+    await asyncio.to_thread(run_auto_tm_rematch_background_once)
+
+
 async def _dispatch_pretranslation_run(run_id: UUID) -> None:
     if await _enqueue_arq_job("pretranslation_run_job", str(run_id)):
         return
@@ -1200,6 +1213,7 @@ class WorkerSettings:
         spelling_grammar_qa_segments_job,
         spelling_grammar_qa_project_job,
         auto_tm_background_job,
+        auto_tm_rematch_background_job,
         pretranslation_run_job,
     ]
     redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
@@ -2086,6 +2100,7 @@ class ProjectTranslationMemorySettingPayload(BaseModel):
 
 
 class ProjectTranslationMemorySettingsRequest(BaseModel):
+    auto_tm_enabled: bool | None = None
     settings: list[ProjectTranslationMemorySettingPayload] = Field(default_factory=list)
 
 
@@ -4116,7 +4131,7 @@ def _build_llm_translation_tasks(
         if scope == "current_segment":
             should_translate = segment.sentence_id == current_sentence_id
         elif scope == "empty_target_only":
-            if (segment.target_text or "") != "":
+            if normalize_text(segment.target_text or ""):
                 should_translate = False
         elif target_statuses is None or segment.status not in target_statuses:
             should_translate = False
@@ -5722,6 +5737,7 @@ def _serialize_project_translation_memory_settings(
 
     return {
         "project_id": str(project.id),
+        "auto_tm_enabled": getattr(project, "auto_tm_enabled", True) is not False,
         "groups": groups,
     }
 
@@ -6946,10 +6962,14 @@ def get_project_translation_memory_settings(
 def update_project_translation_memory_settings(
     project_id: UUID,
     payload: ProjectTranslationMemorySettingsRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
     project = _get_project_or_404(db, project_id)
+    if "auto_tm_enabled" in payload.model_fields_set and payload.auto_tm_enabled is not None:
+        project.auto_tm_enabled = bool(payload.auto_tm_enabled)
+
     files = (
         db.query(FileRecord)
         .filter(FileRecord.project_id == project_id)
@@ -7018,15 +7038,17 @@ def update_project_translation_memory_settings(
                 changed_files.append(file_record)
 
     db.flush()
-    initial_match_updated_count = 0
+    initial_match_queued_count = 0
     for file_record in list(dict.fromkeys(changed_files)):
-        initial_match_updated_count += refresh_unconfirmed_segment_matches(
+        initial_match_queued_count += register_file_rematch_work(
             db,
             file_record_id=file_record.id,
             collection_ids=_load_file_record_collection_ids(file_record),
         )
 
     db.commit()
+    if initial_match_queued_count > 0:
+        background_tasks.add_task(_dispatch_auto_tm_rematch_background)
     files = (
         db.query(FileRecord)
         .filter(FileRecord.project_id == project_id)
@@ -7034,7 +7056,8 @@ def update_project_translation_memory_settings(
         .all()
     )
     response = _serialize_project_translation_memory_settings(db, project, files)
-    response["initial_match_updated_count"] = initial_match_updated_count
+    response["initial_match_updated_count"] = 0
+    response["initial_match_queued_count"] = initial_match_queued_count
     return response
 
 

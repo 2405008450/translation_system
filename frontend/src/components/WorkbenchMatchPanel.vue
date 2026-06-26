@@ -474,6 +474,21 @@ function applyMatchRow(row: MatchDisplayRow | null) {
 
   emit('appendText', row.applyText)
 }
+
+function applyMatchAtIndex(index: number) {
+  const row = matchRows.value[index] ?? null
+  if (!row?.applyText) {
+    return false
+  }
+
+  selectedRowId.value = row.id
+  applyMatchRow(row)
+  return true
+}
+
+defineExpose({
+  applyMatchAtIndex,
+})
 </script>
 
 <template>

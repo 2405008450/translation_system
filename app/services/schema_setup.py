@@ -110,6 +110,7 @@ REQUIRED_SCHEMA = {
         "access_level",
         "translation_guidelines",
         "quality_qa_settings",
+        "auto_tm_enabled",
         "created_at",
         "updated_at",
     },
@@ -2706,6 +2707,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS revision_display_settings
             ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS auto_tm_enabled BOOLEAN NOT NULL DEFAULT TRUE
             """,
             """
             CREATE UNIQUE INDEX IF NOT EXISTS uq_revision_display_settings_file_record_id

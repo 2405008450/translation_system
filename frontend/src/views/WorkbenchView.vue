@@ -104,6 +104,7 @@ import type {
   Segment,
   SegmentNextUnconfirmedPositionResponse,
   SegmentPositionResponse,
+  TMMatchCandidate,
   TMCollection,
   TermBase,
   TermEntryRecord,
@@ -175,6 +176,13 @@ type SegmentEditorRowPublic = ComponentPublicInstance & {
   insertOrReplaceTargetText: (text: string) => boolean
   commitEditorContent: () => CommittedSegmentEditorContent | null
 }
+type WorkbenchMatchPanelPublic = ComponentPublicInstance & {
+  applyMatchAtIndex: (index: number) => boolean
+}
+type WorkbenchShortcutItem = {
+  keys: string
+  label: string
+}
 type UpdateSegmentTargetOptions = {
   confirm?: boolean
   recordUndo?: boolean
@@ -238,6 +246,7 @@ const virtualListRef = ref<{
 } | null>(null)
 const segmentEditorResultsRef = ref<HTMLElement | null>(null)
 const segmentEditorRowRefs = new Map<string, SegmentEditorRowPublic>()
+const matchPanelRef = ref<WorkbenchMatchPanelPublic | null>(null)
 
 const bottomPanelRef = ref<HTMLElement | null>(null)
 const bottomDrawerRef = ref<HTMLElement | null>(null)
@@ -573,6 +582,39 @@ const confirmShortcutDescription = computed(() => (
     ? t('workbench.shortcutItems.confirmNextSegment')
     : t('workbench.shortcutItems.confirmNextUnconfirmed')
 ))
+
+const workbenchShortcutItems = computed<WorkbenchShortcutItem[]>(() => [
+  { keys: 'Ctrl / Cmd + X', label: t('workbench.shortcutItems.cut') },
+  { keys: 'Ctrl / Cmd + C', label: t('workbench.shortcutItems.copy') },
+  { keys: 'Ctrl / Cmd + V', label: t('workbench.shortcutItems.paste') },
+  { keys: 'Ctrl / Cmd + Z', label: t('workbench.shortcutItems.undo') },
+  { keys: 'Ctrl / Cmd + Y', label: t('workbench.shortcutItems.redo') },
+  { keys: 'Ctrl / Cmd + S', label: t('workbench.shortcutItems.save') },
+  { keys: 'Enter', label: confirmShortcutDescription.value },
+  { keys: 'Ctrl / Cmd + Enter', label: t('workbench.shortcutItems.newline') },
+  { keys: 'Ctrl / Cmd + ↑ / ↓', label: t('workbench.shortcutItems.move') },
+  { keys: 'Tab', label: t('workbench.shortcutItems.toggleSourceTarget') },
+  { keys: 'Alt + F', label: t('workbench.shortcutItems.findReplace') },
+  { keys: 'Alt + ↑ / ↓', label: t('workbench.shortcutItems.searchResult') },
+  { keys: 'Alt + P / Ctrl + Shift + T', label: t('workbench.shortcutItems.runAi') },
+  { keys: 'Alt + G', label: t('workbench.shortcutItems.guidelines') },
+  { keys: 'Alt + K', label: t('workbench.shortcutItems.resourceSearch') },
+  { keys: 'Alt + T', label: t('workbench.shortcutItems.addTerm') },
+  { keys: 'Alt + N', label: t('workbench.shortcutItems.addComment') },
+  { keys: 'Alt + C', label: t('workbench.shortcutItems.copySource') },
+  { keys: 'Alt + Delete', label: t('workbench.shortcutItems.clearTarget') },
+  { keys: 'Alt + M', label: t('workbench.shortcutItems.mergeSegment') },
+  { keys: 'Alt + S', label: t('workbench.shortcutItems.splitSegment') },
+  { keys: 'Alt + E', label: t('workbench.shortcutItems.acceptRevision') },
+  { keys: 'Alt + R', label: t('workbench.shortcutItems.rejectRevision') },
+  { keys: 'Alt + Shift + T', label: t('workbench.shortcutItems.autoTagging') },
+  { keys: 'Alt + Shift + S', label: t('workbench.shortcutItems.webSearch') },
+  { keys: 'Alt + Shift + Z', label: t('workbench.shortcutItems.cancelConfirmation') },
+  { keys: 'Alt + Shift + D', label: t('workbench.shortcutItems.addToDictionary') },
+  { keys: 'Ctrl / Cmd + 1...5', label: t('workbench.shortcutItems.applyMatchResult') },
+  { keys: 'Esc', label: t('workbench.shortcutItems.closePanel') },
+  { keys: '?', label: t('workbench.shortcutItems.help') },
+])
 
 function openWorkbenchSettings(tab: WorkbenchSettingsTab = 'preferences') {
   activeWorkbenchSettingsTab.value = tab
@@ -2136,11 +2178,30 @@ useWorkbenchShortcuts({
   runAI: () => { void runLLMTranslation() },
   focusPrev: () => { void focusSentenceByOffset(-1) },
   focusNext: () => { void focusSentenceByOffset(1) },
+  focusPrevSearchResult: () => { void focusSearchResultByOffset(-1) },
+  focusNextSearchResult: () => { void focusSearchResultByOffset(1) },
   confirmSegment: () => { void confirmAndMoveToNextUnconfirmed() },
   undo: () => { undoActiveSegmentEdit() },
   redo: () => { redoActiveSegmentEdit() },
   closePanel: () => { void closeActiveWorkbenchPanel() },
   toggleHelp: () => { toggleWorkbenchSettings('shortcuts') },
+  toggleSearch: () => { void toggleSegmentSearchPanel() },
+  openGuidelines: () => { void toggleGuidelinesPanel() },
+  openResourceSearch: () => { void openSideTool('resource-search') },
+  openAddTerm: () => { void openAddTermPanel() },
+  openComment: () => { void openActiveSegmentCommentDraft() },
+  copySourceToTarget: () => { copySourceToTarget() },
+  clearTarget: () => { clearActiveTarget() },
+  mergeSegment: () => { void handleMergeSegment() },
+  splitSegment: () => { void handleSplitSegment() },
+  acceptRevision: () => { void handleAcceptActiveRevision() },
+  rejectRevision: () => { void handleRejectActiveRevision() },
+  cancelSegmentConfirmation: () => { cancelActiveSegmentConfirmation() },
+  autoTagging: () => { showRibbonPlaceholder(t('workbench.ribbon.autoTagging')) },
+  webSearch: () => { showRibbonPlaceholder(t('workbench.shortcutItems.webSearch')) },
+  addToDictionary: () => { showRibbonPlaceholder(t('workbench.shortcutItems.addToDictionary')) },
+  applyMatchResult: (index) => { void applyMatchResultByIndex(index) },
+  toggleSourceTarget: () => { void toggleActiveSourceTargetEditor() },
 })
 
 function getTermBaseStorageKey() {
@@ -2577,6 +2638,111 @@ async function closeActiveWorkbenchPanel() {
 
 function closeGuidelinesPanel() {
   showGuidelinesPanel.value = false
+}
+
+async function focusSearchResultByOffset(offset: number) {
+  if (!hasEditorSegmentFilter.value) {
+    if (!segmentSearchOpen.value) {
+      await toggleSegmentSearchPanel()
+      return
+    }
+    toast.info(t('workbench.search.idle'))
+    return
+  }
+
+  await focusMatchedSegment(offset)
+}
+
+function cancelActiveSegmentConfirmation() {
+  if (!activeSegment.value) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+  if (!activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
+  if (activeSegment.value.status !== 'confirmed') {
+    toast.info(t('workbench.messages.segmentNotConfirmed'))
+    return
+  }
+
+  const targetContent = commitActiveSegmentEditorContent()
+  if (!targetContent) {
+    return
+  }
+  updateSegmentTarget(
+    targetContent.sentenceId,
+    targetContent.text,
+    targetContent.html || undefined,
+  )
+  toast.success(t('workbench.messages.confirmationCancelled'))
+}
+
+async function applyMatchResultByIndex(index: number) {
+  if (!activeSegment.value) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+  if (!activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
+
+  if (matchPanelRef.value?.applyMatchAtIndex(index)) {
+    return
+  }
+
+  const fileRecordId = activeWorkbenchFileId.value
+  const segmentId = activeSegment.value.id
+  if (!fileRecordId || !segmentId) {
+    toast.warn(t('workbench.messages.noMatchResultAtIndex', { index: index + 1 }))
+    return
+  }
+
+  pageError.value = ''
+  try {
+    const { data } = await http.get<{
+      candidates: TMMatchCandidate[]
+    }>(`/file-records/${fileRecordId}/segments/${segmentId}/tm-candidates`)
+    const candidate = data.candidates?.[index] ?? null
+    if (!candidate?.target_text) {
+      toast.warn(t('workbench.messages.noMatchResultAtIndex', { index: index + 1 }))
+      return
+    }
+    handleReplaceText(candidate.target_text)
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('workbench.errors.sidePanel'))
+  }
+}
+
+async function toggleActiveSourceTargetEditor() {
+  if (!segmentStore.activeSentenceId) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+
+  await nextTick()
+  const sentenceId = segmentStore.activeSentenceId
+  const activeElement = document.activeElement
+  const targetEditor = document.querySelector<HTMLElement>(
+    `[data-segment-target="true"][data-sentence-id="${sentenceId}"]`,
+  )
+  const sourceEditor = document.querySelector<HTMLElement>(
+    `.segment-row[data-sentence-id="${sentenceId}"] .segment-row__source-editor`,
+  )
+
+  if (sourceEditor && activeElement instanceof Node && sourceEditor.contains(activeElement)) {
+    targetEditor?.focus({ preventScroll: true })
+    return
+  }
+
+  if (targetEditor && activeElement instanceof Node && targetEditor.contains(activeElement)) {
+    sourceEditor?.focus({ preventScroll: true })
+    return
+  }
+
+  targetEditor?.focus({ preventScroll: true })
 }
 
 async function toggleGuidelinesPanel() {
@@ -8143,6 +8309,7 @@ onBeforeRouteLeave(async () => {
           </section>
           <WorkbenchMatchPanel
             v-else-if="activeSideTool === 'match-info'"
+            ref="matchPanelRef"
             key="match-info"
             :segment="activeSegment"
             :collection-id="segmentStore.fileRecord?.collection_id || null"
@@ -8764,13 +8931,14 @@ onBeforeRouteLeave(async () => {
         </div>
 
         <div v-else class="shortcut-list shortcut-list--settings" role="tabpanel">
-          <div class="shortcut-item"><strong>Ctrl + S</strong><span>{{ t('workbench.shortcutItems.save') }}</span></div>
-          <div class="shortcut-item"><strong>Ctrl + Shift + T</strong><span>{{ t('workbench.shortcutItems.runAi') }}</span></div>
-          <div class="shortcut-item"><strong>Enter</strong><span>{{ confirmShortcutDescription }}</span></div>
-          <div class="shortcut-item"><strong>Ctrl + Enter</strong><span>{{ t('workbench.shortcutItems.newline') }}</span></div>
-          <div class="shortcut-item"><strong>Alt + ↑ / ↓</strong><span>{{ t('workbench.shortcutItems.move') }}</span></div>
-          <div class="shortcut-item"><strong>Esc</strong><span>{{ t('workbench.shortcutItems.closePanel') }}</span></div>
-          <div class="shortcut-item"><strong>?</strong><span>{{ t('workbench.shortcutItems.help') }}</span></div>
+          <div
+            v-for="item in workbenchShortcutItems"
+            :key="item.keys"
+            class="shortcut-item"
+          >
+            <strong>{{ item.keys }}</strong>
+            <span>{{ item.label }}</span>
+          </div>
         </div>
       </div>
     </Modal>
@@ -12413,21 +12581,29 @@ onBeforeRouteLeave(async () => {
   gap: 10px;
 }
 
+.shortcut-list--settings {
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
 .shortcut-item {
   display: flex;
   justify-content: space-between;
   gap: 16px;
+  min-width: 0;
   padding: 12px 14px;
   border: 1px solid var(--line-soft);
-  border-radius: 10px;
+  border-radius: 8px;
   background: var(--surface-panel);
 }
 
 .shortcut-item strong {
+  flex: 0 0 auto;
   color: var(--text-primary);
+  white-space: nowrap;
 }
 
 .shortcut-item span {
+  min-width: 0;
   color: var(--text-secondary);
   text-align: right;
 }
@@ -12633,6 +12809,11 @@ onBeforeRouteLeave(async () => {
 
   .shortcut-item {
     flex-direction: column;
+    gap: 4px;
+  }
+
+  .shortcut-item span {
+    text-align: left;
   }
 
   .workbench-settings-row {

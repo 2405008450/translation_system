@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.database import SessionLocal
-from app.models import AutoTMOutbox, AutoTMRematchQueue, FileRecord, MemoryBase, Segment, User
+from app.models import AutoTMOutbox, AutoTMRematchQueue, FileRecord, MemoryBase, Project, Segment, User
 from app.services.automatic_numbering import (
     is_word_document_filename,
     strip_automatic_numbering_prefix,
@@ -51,6 +51,9 @@ def enqueue_confirmed_segments_for_auto_tm(
     segments: list[Segment],
     current_user: User | None = None,
 ) -> AutoTMEnqueueSummary:
+    if not _project_allows_auto_tm(db, file_record):
+        return AutoTMEnqueueSummary()
+
     eligible_segments = [
         segment
         for segment in segments
@@ -143,6 +146,14 @@ def run_auto_tm_background_once() -> None:
             process_due_auto_tm_rematches(db, force=processed_count > 0)
         except Exception:
             logger.exception("auto TM background task failed")
+
+
+def run_auto_tm_rematch_background_once() -> None:
+    with SessionLocal() as db:
+        try:
+            process_due_auto_tm_rematches(db, force=True)
+        except Exception:
+            logger.exception("auto TM rematch background task failed")
 
 
 def process_auto_tm_outbox(db: Session, *, batch_size: int = AUTO_TM_BATCH_SIZE) -> int:
@@ -447,6 +458,25 @@ def register_project_collections_rematch_work(
     return queued_count
 
 
+def register_file_rematch_work(
+    db: Session,
+    *,
+    file_record_id: UUID,
+    collection_ids: list[UUID],
+    count: int = 1,
+) -> int:
+    selected_ids = list(dict.fromkeys(collection_ids))
+    if not selected_ids:
+        return 0
+    _upsert_rematch_queue(
+        db,
+        file_record_id=file_record_id,
+        collection_id=selected_ids[0],
+        count=count,
+    )
+    return 1
+
+
 def _upsert_rematch_queue(
     db: Session,
     *,
@@ -478,6 +508,21 @@ def _upsert_rematch_queue(
     if queue.first_pending_at is None:
         queue.first_pending_at = now
     queue.last_pending_at = now
+
+
+def _project_allows_auto_tm(db: Session, file_record: FileRecord) -> bool:
+    if not file_record.project_id:
+        return True
+    project = getattr(file_record, "project", None)
+    if project is not None:
+        return getattr(project, "auto_tm_enabled", True) is not False
+
+    enabled = (
+        db.query(Project.auto_tm_enabled)
+        .filter(Project.id == file_record.project_id)
+        .scalar()
+    )
+    return True if enabled is None else bool(enabled)
 
 
 def _resolve_refresh_collection_ids(

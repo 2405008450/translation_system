@@ -904,8 +904,10 @@ export interface ProjectTranslationMemorySettingGroup {
 
 export interface ProjectTranslationMemorySettingsResponse {
   project_id: string
+  auto_tm_enabled: boolean
   groups: ProjectTranslationMemorySettingGroup[]
   initial_match_updated_count?: number
+  initial_match_queued_count?: number
 }
 
 export interface TermQAReportItem {

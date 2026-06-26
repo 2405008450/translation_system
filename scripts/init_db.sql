@@ -488,6 +488,7 @@ CREATE TABLE IF NOT EXISTS projects (
     access_level VARCHAR(20) NOT NULL DEFAULT 'team',
     translation_guidelines TEXT NOT NULL DEFAULT '',
     quality_qa_settings TEXT NOT NULL DEFAULT '{}',
+    auto_tm_enabled BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -498,6 +499,8 @@ ALTER TABLE IF EXISTS projects
     ADD COLUMN IF NOT EXISTS translation_guidelines TEXT NOT NULL DEFAULT '';
 ALTER TABLE IF EXISTS projects
     ADD COLUMN IF NOT EXISTS quality_qa_settings TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE IF EXISTS projects
+    ADD COLUMN IF NOT EXISTS auto_tm_enabled BOOLEAN NOT NULL DEFAULT TRUE;
 
 CREATE INDEX IF NOT EXISTS ix_projects_creator_id
     ON projects (creator_id);
