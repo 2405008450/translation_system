@@ -264,6 +264,8 @@ from app.services.project_segment_sync import (
 )
 from app.services.term_importer import (
     TERM_IMPORT_EXTENSIONS,
+    TBX_EXTENSIONS,
+    import_terms_from_tbx_path,
     import_terms_from_tmx_path,
     import_terms_from_xlsx_path,
     import_terms_from_xlsx_upload,
@@ -1285,7 +1287,7 @@ class FileOperationLockRequest(BaseModel):
 
 class LLMTranslateRequest(BaseModel):
     scope: Literal["current_segment", "fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"] = "all"
-    provider: Literal["auto", "deepseek", "openrouter"] = "deepseek"
+    provider: Literal["auto", "deepseek", "openrouter"] = "openrouter"
     model: str | None = Field(default=None, max_length=120)
     sentence_id: str | None = None
     translation_unit: Literal["paragraph", "sentence"] = "paragraph"
@@ -1350,7 +1352,7 @@ class PretranslationRunRequest(BaseModel):
     term_base_ids: list[UUID] = Field(default_factory=list)
     use_llm: bool = False
     llm_scope: Literal["fuzzy_only", "none_only", "empty_target_only", "all", "all_with_exact"] = "all"
-    llm_provider: Literal["auto", "deepseek", "openrouter"] = "deepseek"
+    llm_provider: Literal["auto", "deepseek", "openrouter"] = "openrouter"
     llm_model: str | None = Field(default=None, max_length=120)
     llm_translation_unit: Literal["paragraph", "sentence"] = "paragraph"
     guideline_template_id: str | None = None
@@ -1670,7 +1672,7 @@ async def _run_pretranslation_llm_stage(task_id: UUID, options: dict[str, Any]) 
     requested_model = normalize_text(options.get("llm_model") or "") or None
     body = LLMTranslateRequest(
         scope=options.get("llm_scope") or "all",
-        provider=options.get("llm_provider") or "deepseek",
+        provider=options.get("llm_provider") or "openrouter",
         model=requested_model,
         translation_unit=options.get("llm_translation_unit") or "paragraph",
         guideline_template_id=options.get("guideline_template_id") or None,
@@ -14485,7 +14487,17 @@ def import_termbase_xlsx(
     collection_target_language = collection.target_language if collection is not None else "en"
 
     try:
-        if extension in TMX_EXTENSIONS:
+        if extension in TBX_EXTENSIONS:
+            import_summary = import_terms_from_tbx_path(
+                db=db,
+                tbx_path=staged_file["path"],
+                filename=file.filename or "uploaded.tbx",
+                term_base_id=collection_id,
+                source_language=collection_source_language,
+                target_language=collection_target_language,
+                batch_size=_resource_import_batch_size(),
+            )
+        elif extension in TMX_EXTENSIONS:
             import_summary = import_terms_from_tmx_path(
                 db=db,
                 tmx_path=staged_file["path"],

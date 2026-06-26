@@ -31,7 +31,7 @@ import type { PaginatedResponse, TermBase, TermEntryRecord, TMCollection, TMEntr
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 
 type ResourceMode = 'tm' | 'term'
-type ExportFormat = 'xlsx' | 'tmx'
+type ExportFormat = 'xlsx' | 'tmx' | 'tbx'
 type ResourceRecord = TMCollection | TermBase
 type EntryRecord = TMEntryRecord | TermEntryRecord
 
@@ -242,7 +242,7 @@ function getErrorMessage(error: unknown, fallback: string) {
 }
 
 function getExportFormatLabel(format: ExportFormat) {
-  return format === 'xlsx' ? 'Excel' : 'TMX'
+  return format === 'xlsx' ? 'Excel' : (format === 'tmx' ? 'TMX' : 'TBX')
 }
 
 function getExportFilename(format: ExportFormat) {
@@ -607,6 +607,10 @@ onUnmounted(() => {
             <button type="button" @click="exportEntries('tmx')">
               <FileCode2 :size="14" />
               TMX
+            </button>
+            <button v-if="props.mode === 'term'" type="button" @click="exportEntries('tbx')">
+              <FileCode2 :size="14" />
+              TBX
             </button>
           </div>
         </div>

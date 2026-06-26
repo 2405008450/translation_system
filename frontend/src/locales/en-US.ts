@@ -421,6 +421,12 @@ const overrides = {
         },
       },
     },
+    preTranslate: {
+      llm: {
+        modelTipTitle: 'Model selection tip',
+        modelTipBody: 'For normal pre-translation, use a fast model such as Gemini 3 Flash Preview or GPT-5.4 Mini. If the rule set is large or terminology/style requirements are strict, use Gemini 3.1 Pro Preview or GPT-5.5. These models are called through OpenRouter.',
+      },
+    },
     errors: {
       export: 'Failed to export file.',
       exportOptions: 'Failed to load export options.',

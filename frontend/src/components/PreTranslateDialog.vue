@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { BookOpen, BookOpenCheck, Bot, Check, Database, Loader2, Pause, Search, Sparkles, Upload, X } from 'lucide-vue-next'
+import { AlertTriangle, BookOpen, BookOpenCheck, Bot, Check, Database, Loader2, Pause, Search, Sparkles, Upload, X } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import { http } from '../api/http'
 import { canonicalizeLanguagePair, formatLanguagePair } from '../constants/languages'
-import { llmModelOptions as baseLLMModelOptions } from '../constants/llm'
+import { defaultLLMModelId, llmModelOptions as baseLLMModelOptions } from '../constants/llm'
 import { pushToast } from '../composables/useToast'
 import type { GlossaryBase, GuidelineTemplateSummary, LLMProvider, LLMTranslateScope, TermBase, TMCollection } from '../types/api'
 import { consumeLLMStream } from '../utils/llmStream'
@@ -133,8 +133,8 @@ const tmAutoConfirmExact = ref(true)
 
 const useLlm = ref(false)
 const llmScope = ref<LLMTranslateScope>('all')
-const llmProvider = ref<LLMProvider>('deepseek')
-const llmModel = ref('')
+const llmProvider = ref<LLMProvider>('openrouter')
+const llmModel = ref(defaultLLMModelId)
 const llmGuidelines = ref('')
 const selectedGuidelineTemplateId = ref('')
 const importingGuidelineTemplate = ref(false)
@@ -160,8 +160,8 @@ const activeTaskIdsByFileId = ref<Record<string, string>>({})
 const pretranslationPollTimer = ref<number | null>(null)
 
 const llmProviderOptions = computed<Array<{ value: LLMProvider, label: string }>>(() => [
-  { value: 'deepseek', label: t('projectDetail.preTranslate.llm.providers.deepseek') },
   { value: 'openrouter', label: t('projectDetail.preTranslate.llm.providers.openrouter') },
+  { value: 'deepseek', label: t('projectDetail.preTranslate.llm.providers.deepseek') },
   { value: 'auto', label: t('projectDetail.preTranslate.llm.providers.auto') },
 ])
 
@@ -1817,6 +1817,13 @@ onBeforeUnmount(() => {
             <span>{{ t('projectDetail.preTranslate.sections.llm') }}</span>
           </label>
         </div>
+        <div class="ptd-llm-tip" role="note">
+          <AlertTriangle :size="18" />
+          <div class="ptd-llm-tip__content">
+            <strong>{{ t('projectDetail.preTranslate.llm.modelTipTitle') }}</strong>
+            <p>{{ t('projectDetail.preTranslate.llm.modelTipBody') }}</p>
+          </div>
+        </div>
         <div class="ptd-grid ptd-grid--llm">
           <label class="field">
             <span class="field__label">{{ t('projectDetail.preTranslate.llm.provider') }}</span>
@@ -2158,6 +2165,60 @@ onBeforeUnmount(() => {
 .ptd-section__meta {
   color: var(--text-muted);
   font-size: 13px;
+}
+
+.ptd-section--llm.is-disabled {
+  opacity: 1;
+  filter: none;
+}
+
+.ptd-section--llm.is-disabled .ptd-grid--llm,
+.ptd-section--llm.is-disabled .field--full,
+.ptd-section--llm.is-disabled > .hint-text {
+  opacity: 0.72;
+  filter: grayscale(18%);
+}
+
+.ptd-llm-tip {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 1px solid rgba(194, 120, 3, 0.34);
+  border-left: 4px solid var(--state-warning);
+  border-radius: 8px;
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--state-warning-bg) 78%, var(--surface-panel) 22%),
+      color-mix(in srgb, var(--surface-panel) 96%, var(--state-warning) 4%)
+    ),
+    var(--state-warning-bg);
+  box-shadow: 0 8px 18px rgba(194, 120, 3, 0.12);
+}
+
+.ptd-llm-tip svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--state-warning);
+}
+
+.ptd-llm-tip__content {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.ptd-llm-tip strong {
+  color: color-mix(in srgb, var(--state-warning) 72%, var(--text-primary));
+  font-size: 14px;
+}
+
+.ptd-llm-tip p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .ptd-switch {

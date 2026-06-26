@@ -26,7 +26,7 @@ from app.services.xlsx_exporter import XLSX_MEDIA_TYPE
 logger = logging.getLogger(__name__)
 
 ResourceExportKind = Literal["tm", "term", "glossary"]
-ResourceExportFormat = Literal["xlsx", "tmx"]
+ResourceExportFormat = Literal["xlsx", "tmx", "tbx"]
 ResourceExportStatus = Literal["queued", "running", "completed", "failed", "canceling", "canceled"]
 ProgressCallback = Callable[[int, str], None]
 CancelCheck = Callable[[], bool]
@@ -36,6 +36,7 @@ EXPORT_QUERY_BATCH_SIZE = 1000
 EXPORT_MEDIA_TYPES: dict[ResourceExportFormat, str] = {
     "xlsx": XLSX_MEDIA_TYPE,
     "tmx": "application/x-tmx+xml",
+    "tbx": "application/x-tbx+xml",
 }
 
 # 本地模式下串行处理大文件导出，避免多个重任务同时占用数据库连接和文件句柄。
@@ -53,6 +54,8 @@ def queue_resource_export(
     resource_id: UUID,
     export_format: ResourceExportFormat,
 ) -> dict[str, Any]:
+    if export_format == "tbx" and resource_type != "term":
+        raise HTTPException(status_code=400, detail="TBX 仅支持术语库导出。")
     task_id = str(uuid4())
     payload = {
         "task_id": task_id,
@@ -263,6 +266,16 @@ def export_term_base_now(
             filename=term_base.name,
             tuid_prefix="term",
         )
+    elif export_format == "tbx":
+        _write_tbx_file(
+            output_path=output_path,
+            source_language=term_base.source_language or "und",
+            target_language=term_base.target_language or "und",
+            rows=_iter_term_tmx_rows(db, term_base.id),
+            total_entries=total_entries,
+            progress_callback=progress,
+            entry_id_prefix="term",
+        )
     else:
         raise ValueError("不支持的导出格式。")
 
@@ -334,7 +347,11 @@ def _run_resource_export_task(task_id: str, payload: dict[str, Any]) -> None:
     output_path: Path | None = None
     try:
         resource_id = UUID(str(payload["resource_id"]))
-        if resource_type not in ("tm", "term", "glossary") or export_format not in ("xlsx", "tmx"):
+        if (
+            resource_type not in ("tm", "term", "glossary")
+            or export_format not in ("xlsx", "tmx", "tbx")
+            or (export_format == "tbx" and resource_type != "term")
+        ):
             raise ValueError("导出任务参数不正确。")
         _raise_if_export_canceled(task_id)
 
@@ -525,6 +542,68 @@ def _write_tmx_file(
         file.write("</tmx>\n")
 
 
+def _write_tbx_file(
+    *,
+    output_path: Path,
+    source_language: str,
+    target_language: str,
+    rows: Any,
+    total_entries: int,
+    progress_callback: ProgressCallback,
+    entry_id_prefix: str,
+) -> None:
+    with output_path.open("w", encoding="utf-8", newline="\n") as file:
+        file.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+        file.write(f"<martif{_format_tmx_attributes({'xml:lang': source_language, 'type': 'TBX'})}>\n")
+        file.write("  <text>\n")
+        file.write("    <body>\n")
+
+        processed = 0
+        for processed, row in enumerate(rows, start=1):
+            row_id, source_text, target_text, external_tuid, metadata = _normalize_tmx_export_row(row)
+            if not source_text:
+                continue
+
+            entry_id = _resolve_tbx_entry_id(
+                row_id=row_id,
+                entry_id_prefix=entry_id_prefix,
+                external_tuid=external_tuid,
+                metadata=metadata,
+            )
+            entry_attrs = _resolve_tmx_attributes(
+                metadata.get("tbx_entry_attributes"),
+                skip_keys={"id"},
+            )
+            file.write(f"      <termEntry{_format_tmx_attributes({'id': entry_id, **entry_attrs})}>\n")
+            _write_tbx_lang_set(
+                file,
+                language=source_language,
+                term_text=source_text,
+                term_metadata=_resolve_tbx_term_metadata(metadata.get("source_tbx_term")),
+            )
+            _write_tbx_lang_set(
+                file,
+                language=target_language,
+                term_text=target_text or "",
+                term_metadata=_resolve_tbx_term_metadata(metadata.get("target_tbx_term")),
+            )
+            file.write("      </termEntry>\n")
+            _report_export_progress(
+                processed=processed,
+                total_entries=total_entries,
+                progress_callback=progress_callback,
+                message="正在写入 TBX 文件。",
+            )
+
+        if processed == 0:
+            progress_callback(90, "正在写入空 TBX 文件。")
+
+        progress_callback(92, "正在保存 TBX 文件。")
+        file.write("    </body>\n")
+        file.write("  </text>\n")
+        file.write("</martif>\n")
+
+
 def _normalize_tmx_export_row(row: Any) -> tuple[Any, str, str, str | None, dict[str, Any]]:
     try:
         row_id = row[0]
@@ -552,7 +631,21 @@ def _resolve_tmx_tuid(
     return str(metadata.get("tuid") or external_tuid or f"{tuid_prefix}_{row_id}")
 
 
+def _resolve_tbx_entry_id(
+    *,
+    row_id: Any,
+    entry_id_prefix: str,
+    external_tuid: str | None,
+    metadata: dict[str, Any],
+) -> str:
+    return str(metadata.get("tbx_entry_id") or external_tuid or f"{entry_id_prefix}_{row_id}")
+
+
 def _resolve_tuv_metadata(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _resolve_tbx_term_metadata(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
@@ -594,6 +687,45 @@ def _write_tmx_props(file, props: Any, *, indent: str) -> None:
 
 
 def _write_tmx_notes(file, notes: Any, *, indent: str) -> None:
+    if not isinstance(notes, list):
+        return
+    for note in notes:
+        value = _sanitize_xml_text(str(note or ""))
+        if value:
+            file.write(f"{indent}<note>{escape(value)}</note>\n")
+
+
+def _write_tbx_lang_set(file, *, language: str, term_text: str, term_metadata: dict[str, Any]) -> None:
+    lang_attrs = _resolve_tmx_attributes(
+        term_metadata.get("lang_set_attributes"),
+        skip_keys={"xml:lang", "lang", "language"},
+    )
+    tig_attrs = _resolve_tmx_attributes(term_metadata.get("tig_attributes"))
+    file.write(f"        <langSet{_format_tmx_attributes({'xml:lang': language, **lang_attrs})}>\n")
+    file.write(f"          <tig{_format_tmx_attributes(tig_attrs)}>\n")
+    file.write(f"            <term>{escape(_sanitize_xml_text(term_text))}</term>\n")
+    _write_tbx_typed_children(file, "termNote", term_metadata.get("term_notes"), indent="            ")
+    _write_tbx_typed_children(file, "descrip", term_metadata.get("descrips"), indent="            ")
+    _write_tbx_notes(file, term_metadata.get("notes"), indent="            ")
+    file.write("          </tig>\n")
+    file.write("        </langSet>\n")
+
+
+def _write_tbx_typed_children(file, tag_name: str, items: Any, *, indent: str) -> None:
+    if not isinstance(items, list):
+        return
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_type = _sanitize_xml_text(str(item.get("type") or ""))
+        value = _sanitize_xml_text(str(item.get("value") or ""))
+        if not item_type and not value:
+            continue
+        attr_text = f" type={quoteattr(item_type)}" if item_type else ""
+        file.write(f"{indent}<{tag_name}{attr_text}>{escape(value)}</{tag_name}>\n")
+
+
+def _write_tbx_notes(file, notes: Any, *, indent: str) -> None:
     if not isinstance(notes, list):
         return
     for note in notes:

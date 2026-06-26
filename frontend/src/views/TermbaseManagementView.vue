@@ -227,7 +227,7 @@ onMounted(() => {
       <div class="section-title">导入术语库</div>
       <div class="upload-form">
         <p class="hint-text">
-          支持 TMX、Excel 和 CSV 文件。表格文件约定第一列原文术语，第二列译文，首行可以保留表头。重复原文会按现有记录更新。
+          支持 TMX、TBX、Excel 和 CSV 文件。表格文件约定第一列原文术语，第二列译文，首行可以保留表头。重复原文会按现有记录更新。
         </p>
 
         <label class="field">
@@ -250,7 +250,7 @@ onMounted(() => {
             id="termbase-upload-file"
             class="field__control"
             type="file"
-            accept=".tmx,.xls,.xlsx,.csv"
+            accept=".tmx,.tbx,.xls,.xlsx,.csv"
             @change="onFileChange"
           />
         </label>

@@ -16,7 +16,7 @@ import { useAuthStore } from '../stores/auth'
 import type { TermBase } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 
-type ExportFormat = 'xlsx' | 'tmx'
+type ExportFormat = 'xlsx' | 'tmx' | 'tbx'
 
 interface ResourceExportTask {
   task_id: string
@@ -215,7 +215,7 @@ async function exportTermBase(termBase: TermBase | Record<string, any>, format: 
     return
   }
   const currentTermBase = termBase as TermBase
-  const formatLabel = format === 'xlsx' ? 'Excel' : 'TMX'
+  const formatLabel = format === 'xlsx' ? 'Excel' : (format === 'tmx' ? 'TMX' : 'TBX')
   exportingKey.value = getExportKey(currentTermBase.id, format)
   baseMessage.value = ''
   try {
@@ -725,6 +725,17 @@ onUnmounted(() => {
                       <Loader2 v-if="isExporting(row.id, 'tmx')" class="lucide-spin" :size="13" />
                       <FileCode2 v-else :size="13" />
                       导出 TMX
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      title="导出 TBX"
+                      :disabled="Boolean(exportingKey)"
+                      @click="close(); exportTermBase(row, 'tbx')"
+                    >
+                      <Loader2 v-if="isExporting(row.id, 'tbx')" class="lucide-spin" :size="13" />
+                      <FileCode2 v-else :size="13" />
+                      导出 TBX
                     </button>
                     <button
                       v-if="canManageResources"

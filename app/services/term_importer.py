@@ -15,14 +15,16 @@ from app.models import TermEntry
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import normalize_match_text, normalize_text
 from app.services.import_task_state import ImportTaskCanceled
+from app.services.tbx_stream import iter_tbx_rows as iter_stream_tbx_rows
 from app.services.tmx_stream import TMXRow, iter_tmx_rows as iter_stream_tmx_rows
 
 
 CSV_EXTENSIONS = {".csv"}
 TMX_EXTENSIONS = {".tmx"}
+TBX_EXTENSIONS = {".tbx"}
 XLS_EXTENSIONS = {".xls"}
 XLSX_EXTENSIONS = {".xlsx"}
-TERM_IMPORT_EXTENSIONS = CSV_EXTENSIONS | TMX_EXTENSIONS | XLS_EXTENSIONS | XLSX_EXTENSIONS
+TERM_IMPORT_EXTENSIONS = CSV_EXTENSIONS | TMX_EXTENSIONS | TBX_EXTENSIONS | XLS_EXTENSIONS | XLSX_EXTENSIONS
 TERM_STATUS_LOOKUP_CHUNK_SIZE = 10000
 TERM_PREVIEW_MAX_SCAN_ROWS = 5000
 HEADER_ALIASES = {
@@ -114,6 +116,20 @@ def import_terms_from_xlsx_upload(
         )
     if extension in TMX_EXTENSIONS:
         return import_terms_from_tmx_upload(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            source_language=source_language,
+            target_language=target_language,
+            batch_size=batch_size,
+            term_base_id=term_base_id,
+            creator_id=creator_id,
+            skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+            cancel_check=cancel_check,
+            import_batch_id=import_batch_id,
+        )
+    if extension in TBX_EXTENSIONS:
+        return import_terms_from_tbx_upload(
             db=db,
             raw_bytes=raw_bytes,
             filename=filename,
@@ -225,6 +241,42 @@ def import_terms_from_tmx_upload(
     )
 
 
+def import_terms_from_tbx_upload(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
+    skip_duplicate_row_indexes: set[int] | None = None,
+    cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
+) -> TermImportSummary:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    return _import_text_rows(
+        db=db,
+        rows=_iter_tbx_rows(
+            raw_bytes,
+            normalized_source_language,
+            normalized_target_language,
+        ),
+        filename=filename,
+        batch_size=batch_size,
+        term_base_id=term_base_id,
+        creator_id=creator_id,
+        skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
+        cancel_check=cancel_check,
+        import_batch_id=import_batch_id,
+    )
+
+
 def import_terms_from_tmx_path(
     db: Session,
     tmx_path: str | Path,
@@ -246,6 +298,42 @@ def import_terms_from_tmx_path(
         db=db,
         rows=_iter_tmx_path_rows(
             tmx_path,
+            normalized_source_language,
+            normalized_target_language,
+        ),
+        filename=filename,
+        batch_size=batch_size,
+        term_base_id=term_base_id,
+        creator_id=creator_id,
+        skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
+        cancel_check=cancel_check,
+        import_batch_id=import_batch_id,
+    )
+
+
+def import_terms_from_tbx_path(
+    db: Session,
+    tbx_path: str | Path,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
+    skip_duplicate_row_indexes: set[int] | None = None,
+    cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
+) -> TermImportSummary:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    return _import_text_rows(
+        db=db,
+        rows=_iter_tbx_path_rows(
+            tbx_path,
             normalized_source_language,
             normalized_target_language,
         ),
@@ -504,6 +592,38 @@ def preview_terms_from_tmx_path(
     )
 
 
+def preview_terms_from_tbx_path(
+    db: Session,
+    tbx_path: str | Path,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    term_base_id: UUID | None,
+    preview_limit: int = 100,
+    skip_header: bool = False,
+    max_scan_rows: int = TERM_PREVIEW_MAX_SCAN_ROWS,
+) -> TermImportPreview:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    return _preview_terms_from_rows(
+        db=db,
+        rows=_iter_tbx_path_rows(
+            tbx_path,
+            normalized_source_language,
+            normalized_target_language,
+        ),
+        filename=filename,
+        term_base_id=term_base_id,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
+        preview_limit=preview_limit,
+        skip_header=skip_header,
+        max_scan_rows=max_scan_rows,
+    )
+
+
 def _preview_terms_from_rows(
     db: Session,
     rows,
@@ -658,6 +778,8 @@ def _iter_upload_rows(raw_bytes: bytes, filename: str, source_language: str, tar
         return _iter_csv_rows(raw_bytes)
     if extension in TMX_EXTENSIONS:
         return _iter_tmx_rows(raw_bytes, source_language, target_language)
+    if extension in TBX_EXTENSIONS:
+        return _iter_tbx_rows(raw_bytes, source_language, target_language)
     if extension in XLS_EXTENSIONS:
         return _iter_xls_rows(raw_bytes)
     if extension not in XLSX_EXTENSIONS:
@@ -760,7 +882,7 @@ def _import_text_rows(
             source_language=normalized_source_language,
             target_language=normalized_target_language,
             creator_id=creator_id,
-            external_tuid=str(row_metadata.get("tuid") or "") or None,
+            external_tuid=str(row_metadata.get("tuid") or row_metadata.get("tbx_entry_id") or "") or None,
             tmx_metadata=row_metadata,
             import_batch_id=import_batch_id,
         )
@@ -898,6 +1020,19 @@ def _iter_tmx_path_rows(tmx_path: str | Path, source_language: str, target_langu
 
 def _iter_tmx_source_rows(source: Any, source_language: str, target_language: str):
     for row in iter_stream_tmx_rows(source, source_language, target_language):
+        yield (row.source_text, row.target_text, row.metadata)
+
+
+def _iter_tbx_rows(raw_bytes: bytes, source_language: str, target_language: str):
+    yield from _iter_tbx_source_rows(raw_bytes, source_language, target_language)
+
+
+def _iter_tbx_path_rows(tbx_path: str | Path, source_language: str, target_language: str):
+    yield from _iter_tbx_source_rows(Path(tbx_path), source_language, target_language)
+
+
+def _iter_tbx_source_rows(source: Any, source_language: str, target_language: str):
+    for row in iter_stream_tbx_rows(source, source_language, target_language):
         yield (row.source_text, row.target_text, row.metadata)
 
 

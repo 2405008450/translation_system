@@ -14,7 +14,7 @@ export interface LLMModelOption {
   provider: 'openrouter' | 'deepseek'
 }
 
-export const defaultLLMModelId = 'google/gemini-3.5-flash'
+export const defaultLLMModelId = 'google/gemini-3-flash-preview'
 
 export const llmModelShortLabelMap: Record<string, string> = {
   'google/gemini-3.5-flash': 'Gemini 3.5',
@@ -32,25 +32,19 @@ export const llmModelShortLabelMap: Record<string, string> = {
 export const llmModelOptions: LLMModelOption[] = [
   {
     id: defaultLLMModelId,
-    name: 'Gemini 3.5 Flash',
+    name: 'Gemini 3 Flash Preview',
     family: 'gemini',
+    provider: 'openrouter',
+  },
+  {
+    id: 'openai/gpt-5.4-mini',
+    name: 'GPT-5.4 Mini',
+    family: 'gpt',
     provider: 'openrouter',
   },
   {
     id: 'google/gemini-3.1-pro-preview',
     name: 'Gemini 3.1 Pro Preview',
-    family: 'gemini',
-    provider: 'openrouter',
-  },
-  {
-    id: 'google/gemini-3.1-flash-lite',
-    name: 'Gemini 3.1 Flash Lite',
-    family: 'gemini',
-    provider: 'openrouter',
-  },
-  {
-    id: 'google/gemini-3-flash-preview',
-    name: 'Gemini 3 Flash Preview',
     family: 'gemini',
     provider: 'openrouter',
   },
@@ -61,14 +55,20 @@ export const llmModelOptions: LLMModelOption[] = [
     provider: 'openrouter',
   },
   {
-    id: 'openai/gpt-5.4',
-    name: 'GPT-5.4',
-    family: 'gpt',
+    id: 'google/gemini-3.5-flash',
+    name: 'Gemini 3.5 Flash',
+    family: 'gemini',
     provider: 'openrouter',
   },
   {
-    id: 'openai/gpt-5.4-mini',
-    name: 'GPT-5.4 Mini',
+    id: 'google/gemini-3.1-flash-lite',
+    name: 'Gemini 3.1 Flash Lite',
+    family: 'gemini',
+    provider: 'openrouter',
+  },
+  {
+    id: 'openai/gpt-5.4',
+    name: 'GPT-5.4',
     family: 'gpt',
     provider: 'openrouter',
   },

@@ -7,7 +7,7 @@
 - **项目与任务管理**：创建翻译项目，维护源语言、目标语言、截止时间、访问级别、创建人、处理进度；项目详情页上传源文档，任务页进入工作台。
 - **多格式任务解析**：支持 DOCX 以及文本、本地化、网页、字幕、技术写作、双语交换和部分工程/设计文件的句段抽取与原格式导出。
 - **翻译记忆库（TM）**：按记忆库分组管理双语句对，支持 TMX/SDLTM/XLS/XLSX/CSV 导入、条目维护、XLSX/TMX 导出、精确匹配、trigram 模糊匹配和 pgvector 语义候选。
-- **术语库**：独立术语库与术语条目管理，支持 TMX/XLS/XLSX/CSV 导入与 XLSX/TMX 导出，并在工作台按当前语言对和句段内容推荐术语。
+- **术语库**：独立术语库与术语条目管理，支持 TMX/TBX/XLS/XLSX/CSV 导入与 XLSX/TMX/TBX 导出，并在工作台按当前语言对和句段内容推荐术语。
 - **翻译工作台**：句段分页/懒加载、原文/译文/分屏预览、自动保存、TM 候选、术语面板、修改快照、批注与嵌套回复。
 - **AI 修正**：对 exact / fuzzy / none 不同范围触发 LLM 修正，支持 DeepSeek、OpenRouter 和自动选择，SSE 流式返回进度并写回句段。
 - **用户与权限**：首次初始化管理员、JWT 登录、管理员创建用户、用户昵称、基础角色区分。
@@ -400,7 +400,7 @@ Authorization: Bearer <token>
 | 术语  | GET/PUT/DELETE | `/api/term-bases/{id}`                                       | 术语库详情 / 更新 / 删除   |
 | 术语  | GET/POST       | `/api/term-bases/{id}/entries`                               | 术语条目列表 / 新增       |
 | 术语  | PUT/DELETE     | `/api/term-entries/{id}`                                     | 更新 / 删除术语条目       |
-| 术语  | POST           | `/api/term-bases/import`                                     | TMX/表格导入术语       |
+| 术语  | POST           | `/api/term-bases/import`                                     | TMX/TBX/表格导入术语   |
 | 术语  | GET            | `/api/term-bases/{id}/export-xlsx`                           | XLSX 导出术语         |
 | 解析  | POST           | `/api/parser/workspace`                                      | 仅解析文件并返回工作台结构，不落库 |
 

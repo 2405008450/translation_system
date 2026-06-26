@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     deepseek_model: str = "deepseek-chat"
     openrouter_api_key: str | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    openrouter_model: str = "google/gemini-3.5-flash"
+    openrouter_model: str = "google/gemini-3-flash-preview"
     llm_timeout_seconds: float = 60.0
     llm_stall_timeout_seconds: float = 120.0
     llm_max_concurrency: int = 5

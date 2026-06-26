@@ -665,6 +665,8 @@ export default {
         guidelineTemplateNone: '不使用模板',
         temporaryPrompt: '本次临时提示词',
         modelDefault: '使用后端默认',
+        modelTipTitle: '模型选择建议',
+        modelTipBody: '一般预翻译建议使用快速版 Gemini 3 Flash Preview 或 GPT-5.4 Mini；如果翻译规则较多、术语或风格要求较高，推荐 Gemini 3.1 Pro Preview 或 GPT-5.5。以上模型均通过 OpenRouter 调用。',
         guidelinesPlaceholder: '输入翻译要求，如术语规范、语气风格等...',
         hint: '项目固定细则会自动带入；可导入 Markdown/TXT 细则作为仓库模板复用，手动输入只在本次预翻译中生效。',
         providers: {
@@ -1367,10 +1369,10 @@ export default {
       },
     },
     term: {
-      intro: '支持 TMX、Excel（.xls/.xlsx）和 CSV 格式。表格文件约定第一列为源术语，第二列为目标术语；导入时会校验语言对。',
+      intro: '支持 TMX、TBX、Excel（.xls/.xlsx）和 CSV 格式。表格文件约定第一列为源术语，第二列为目标术语；导入时会校验语言对。',
       target: '目标术语库',
       createNew: '新建术语库',
-      file: 'TMX / 表格文件',
+      file: 'TMX / TBX / 表格文件',
       newName: '新术语库名称',
       newNamePlaceholder: '例如：医疗器械中英术语库',
       description: '说明',

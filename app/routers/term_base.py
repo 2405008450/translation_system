@@ -37,11 +37,14 @@ from app.services.term_entry_service import (
 )
 from app.services.term_importer import (
     TERM_IMPORT_EXTENSIONS,
+    TBX_EXTENSIONS,
     TMX_EXTENSIONS,
     XLSX_EXTENSIONS,
+    import_terms_from_tbx_path,
     import_terms_from_tmx_path,
     import_terms_from_xlsx_path,
     import_terms_from_xlsx_upload,
+    preview_terms_from_tbx_path,
     preview_terms_from_tmx_path,
     preview_terms_from_xlsx_path,
     preview_terms_from_upload,
@@ -704,7 +707,19 @@ async def preview_term_base_xlsx(
         )
 
     try:
-        if extension in TMX_EXTENSIONS:
+        if extension in TBX_EXTENSIONS:
+            preview = preview_terms_from_tbx_path(
+                db=db,
+                tbx_path=staged_file["path"],
+                filename=file.filename or "uploaded.tbx",
+                term_base_id=term_base_id,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                preview_limit=max(1, min(preview_limit, 500)),
+                skip_header=skip_header,
+                max_scan_rows=_resource_import_preview_max_scan_rows(),
+            )
+        elif extension in TMX_EXTENSIONS:
             preview = preview_terms_from_tmx_path(
                 db=db,
                 tmx_path=staged_file["path"],
@@ -832,7 +847,21 @@ def _run_term_resource_import_task(task_id: str, payload: dict[str, Any]) -> Non
 
             try:
                 set_import_task_status(task_id, "running", progress=20, message=f"正在导入 {filename}。")
-                if extension in TMX_EXTENSIONS:
+                if extension in TBX_EXTENSIONS:
+                    import_summary = import_terms_from_tbx_path(
+                        db=db,
+                        tbx_path=file_payload["path"],
+                        filename=filename,
+                        term_base_id=term_base_id,
+                        source_language=str(payload["source_language"]),
+                        target_language=str(payload["target_language"]),
+                        creator_id=creator_id,
+                        skip_duplicate_row_indexes=skipped_row_indexes,
+                        batch_size=_resource_import_batch_size(),
+                        cancel_check=cancel_check,
+                        import_batch_id=import_batch.id,
+                    )
+                elif extension in TMX_EXTENSIONS:
                     import_summary = import_terms_from_tmx_path(
                         db=db,
                         tmx_path=file_payload["path"],

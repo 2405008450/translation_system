@@ -1724,7 +1724,7 @@ onMounted(() => {
             ref="termFileInput"
             class="field__control"
             type="file"
-            accept=".tmx,.xls,.xlsx,.csv"
+            accept=".tmx,.tbx,.xls,.xlsx,.csv"
             @change="onTermFileChange"
           />
         </label>
