@@ -18,11 +18,7 @@ from app.services.automatic_numbering import (
     strip_automatic_numbering_prefix,
 )
 from app.services.document_workspace import (
-    CELL_GROUP_MAX_CHARS,
-    CELL_NEXT_PARAGRAPH_MAX_CHARS,
     CELL_PARAGRAPH_BREAK_SENTINEL,
-    CELL_SENTENCE_END_CHARS,
-    CELL_SHORT_PARAGRAPH_MAX_CHARS,
     DOCUMENT_PARSE_MODE_FULL,
     DocxPackage,
     MATH_PLACEHOLDER_TEMPLATE,
@@ -44,6 +40,7 @@ from app.services.document_workspace import (
     _select_preferred_alternate_content_branch,
     normalize_document_parse_options,
     normalize_document_parse_mode,
+    should_merge_table_cell_paragraph_texts,
 )
 from app.services.normalizer import normalize_text
 from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
@@ -769,17 +766,6 @@ def _export_table(
             )
 
 
-def _table_cell_text_length(tokens: list[TextToken]) -> int:
-    return len(normalize_text("".join(token.display_text for token in tokens)))
-
-
-def _table_cell_tokens_look_incomplete(tokens: list[TextToken]) -> bool:
-    text = "".join(token.display_text for token in tokens).rstrip()
-    if not text:
-        return False
-    return text[-1] not in CELL_SENTENCE_END_CHARS
-
-
 def _should_merge_table_cell_paragraphs(
     current_tokens: list[TextToken],
     next_paragraph: CellParagraphTokens,
@@ -787,18 +773,15 @@ def _should_merge_table_cell_paragraphs(
 ) -> bool:
     if not current_tokens or not next_paragraph.tokens:
         return False
-    if _resolve_paragraph_numbering_reference(next_paragraph.paragraph, numbering_schema) is not None:
-        return False
-    if not _table_cell_tokens_look_incomplete(current_tokens):
-        return False
-
-    next_length = _table_cell_text_length(next_paragraph.tokens)
-    if next_length == 0 or next_length > CELL_NEXT_PARAGRAPH_MAX_CHARS:
-        return False
-    if next_length <= CELL_SHORT_PARAGRAPH_MAX_CHARS:
-        return True
-
-    return _table_cell_text_length(current_tokens) + next_length <= CELL_GROUP_MAX_CHARS
+    return should_merge_table_cell_paragraph_texts(
+        "".join(token.display_text for token in current_tokens),
+        "".join(token.display_text for token in next_paragraph.tokens),
+        next_has_numbering=_resolve_paragraph_numbering_reference(
+            next_paragraph.paragraph,
+            numbering_schema,
+        )
+        is not None,
+    )
 
 
 def _count_token_sentence_spans(tokens: list[TextToken]) -> int:
