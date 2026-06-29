@@ -136,6 +136,8 @@ REQUIRED_SCHEMA = {
         "term_base_write_ids",
         "qa_term_base_ids",
         "glossary_base_ids",
+        "tm_match_signature",
+        "tm_last_matched_at",
         "deadline",
         "access_level",
     },
@@ -1418,6 +1420,14 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS file_records
             ADD COLUMN IF NOT EXISTS tm_match_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.8
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS tm_match_signature VARCHAR(64)
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS tm_last_matched_at TIMESTAMP
             """,
             """
             UPDATE file_records

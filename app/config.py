@@ -63,6 +63,9 @@ class Settings(BaseSettings):
     redis_url: str | None = None
     import_queue_backend: str = "local"
     arq_max_jobs: int = 1
+    arq_maintenance_max_jobs: int = 1
+    arq_pretranslation_max_jobs: int = 1
+    auto_tm_rematch_max_files_per_run: int = 10
     aspose_words_license_path: str | None = None
     libreoffice_soffice_path: str | None = None
     libreoffice_python_path: str | None = None
