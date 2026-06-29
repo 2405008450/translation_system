@@ -114,6 +114,7 @@ type BasicFormatTag = 'b' | 'i' | 'u' | 's' | 'sub' | 'sup'
 const BASIC_FORMAT_TAGS = ['b', 'strong', 'i', 'em', 'u', 's', 'strike', 'del', 'sub', 'sup']
 const BASIC_FORMAT_RENDER_ORDER: BasicFormatTag[] = ['b', 'i', 'u', 's', 'sub', 'sup']
 const DROPPED_HTML_TAGS = new Set(['script', 'style', 'noscript', 'iframe', 'object', 'embed', 'link', 'meta'])
+const EXPLICIT_PLAIN_FORMAT_DATA_KEY = 'explicitPlainFormat'
 
 const undoStack = ref<EditorHistorySnapshot[]>([])
 const redoStack = ref<EditorHistorySnapshot[]>([])
@@ -400,8 +401,8 @@ function highlightQAText(text: string, issues: SegmentQAIssue[]): HighlightPart[
 // 生成带高亮的 HTML
 const targetHtmlContent = computed(() => {
   // 如果有保存的格式化 HTML，优先使用
-  if (props.segment.target_html && !hasAutomaticNumbering.value) {
-    return renderTargetHtmlWithHighlights(sanitizeHtml(props.segment.target_html))
+  if (hasExplicitTargetHtmlOverride() && !hasAutomaticNumbering.value) {
+    return renderTargetHtmlWithHighlights(sanitizeHtml(props.segment.target_html ?? ''))
   }
 
   return renderTargetWithSourceFormats(props.segment.target_text || '')
@@ -933,7 +934,7 @@ function getCurrentEditorHtml(): string | null {
     return props.segment.target_html || null
   }
   const html = serializeEditorContentWithFormat(editorRef.value)
-  return /<(b|strong|i|em|u|s|strike|del|sub|sup)>/i.test(html) ? html : null
+  return shouldPersistEditorHtml(html) ? html : null
 }
 
 function commitEditorContent(): CommittedEditorContent | null {
@@ -1375,20 +1376,21 @@ function handleInput() {
 
   // 检查是否有格式标签
   const cleanHtml = serializeEditorContentWithFormat(editorRef.value)
-  const hasFormatTags = /<(b|strong|i|em|u|s|strike|del|sub|sup)>/i.test(cleanHtml)
+  const shouldPersistHtml = shouldPersistEditorHtml(cleanHtml)
 
   // 获取纯文本内容用于保存
   const text = serializeEditorContent(editorRef.value)
 
-  // 如果有格式标签，同时传递 HTML
-  if (hasFormatTags) {
-    // 清理 HTML，只保留格式标签
+  // Persist HTML when it carries formats or an explicit plain-format override.
+  if (shouldPersistHtml) {
     emit('update', segmentKey.value, text, cleanHtml)
+    clearExplicitPlainFormatRequest()
     return
   }
 
   // 没有格式标签，只传递纯文本
   emit('update', segmentKey.value, text)
+  clearExplicitPlainFormatRequest()
 }
 
 function getEditorSelectionRange(): Range | null {
@@ -1541,6 +1543,24 @@ function handlePaste(event: ClipboardEvent) {
 
 function hasSerializableFormatTags(html: string): boolean {
   return /<(b|i|u|s|sub|sup)>/i.test(html)
+}
+
+function hasExplicitTargetHtmlOverride(): boolean {
+  return props.segment.target_html !== null && props.segment.target_html !== undefined
+}
+
+function hasExplicitPlainFormatRequest(): boolean {
+  return editorRef.value?.dataset[EXPLICIT_PLAIN_FORMAT_DATA_KEY] === 'true'
+}
+
+function clearExplicitPlainFormatRequest() {
+  const editor = editorRef.value
+  if (!editor) return
+  delete editor.dataset[EXPLICIT_PLAIN_FORMAT_DATA_KEY]
+}
+
+function shouldPersistEditorHtml(html: string): boolean {
+  return hasSerializableFormatTags(html) || hasExplicitTargetHtmlOverride() || hasExplicitPlainFormatRequest()
 }
 
 /**

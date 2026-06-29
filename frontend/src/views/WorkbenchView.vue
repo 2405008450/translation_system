@@ -4490,6 +4490,10 @@ function hasSelectedEditorText(editor: HTMLElement) {
   )
 }
 
+function markExplicitPlainFormat(editor: HTMLElement) {
+  editor.dataset.explicitPlainFormat = 'true'
+}
+
 /**
  * 应用文本格式（粗体、斜体、下划线等）
  */
@@ -4546,16 +4550,16 @@ function clearSelectedFormat() {
     // 有选中文本：清除选中文本的格式
     recordActiveSegmentEditorUndoBoundary('format:clear-selection')
     if (richTextEditor.clearFormat(editor)) {
+      markExplicitPlainFormat(editor)
       editor.dispatchEvent(new Event('input', { bubbles: true }))
       toast.success(t('workbench.ribbon.messages.formatCleared'))
     }
   } else {
     // 没有选中文本：清除整个段落的所有格式
     recordActiveSegmentEditorUndoBoundary('format:clear-all')
-    const plainText = richTextEditor.clearAllFormatInElement(editor)
-    if (activeSegment.value) {
-      updateSegmentTarget(activeSegment.value.sentence_id, plainText)
-    }
+    richTextEditor.clearAllFormatInElement(editor)
+    markExplicitPlainFormat(editor)
+    editor.dispatchEvent(new Event('input', { bubbles: true }))
     toast.success(t('workbench.ribbon.messages.allFormatCleared'))
   }
 
@@ -4575,10 +4579,9 @@ function clearAllFormat() {
   }
 
   recordActiveSegmentEditorUndoBoundary('format:clear-all')
-  const plainText = richTextEditor.clearAllFormatInElement(editor)
-  if (activeSegment.value) {
-    updateSegmentTarget(activeSegment.value.sentence_id, plainText)
-  }
+  richTextEditor.clearAllFormatInElement(editor)
+  markExplicitPlainFormat(editor)
+  editor.dispatchEvent(new Event('input', { bubbles: true }))
   toast.success(t('workbench.ribbon.messages.allFormatCleared'))
   showClearFormatMenu.value = false
 }

@@ -60,6 +60,16 @@ ENGLISH_BOUNDARY_TRAILING_RE = re.compile(r"[,;:.!?][\"')\]\}]*$")
 ENGLISH_WORD_LEADING_RE = re.compile(r"^[\"'“‘(\[]*[A-Za-z0-9]")
 # 支持的格式标签
 FORMAT_TAG_RE = re.compile(r"<(/?)(b|strong|i|em|u|s|strike|del|sub|sup)>", re.IGNORECASE)
+EXPLICIT_FORMAT_RUN_PROPERTIES = {
+    "b",
+    "bCs",
+    "i",
+    "iCs",
+    "u",
+    "strike",
+    "dstrike",
+    "vertAlign",
+}
 
 
 @dataclass(frozen=True)
@@ -1675,8 +1685,7 @@ def _replace_block_tokens(
 
         expected_math_placeholders = _extract_math_placeholders_from_tokens(tokens, span)
 
-        # 检查是否有自定义格式（target_html 包含格式标签）
-        has_custom_format = _has_format_tags(segment.target_html)
+        has_custom_target_html = segment.target_html is not None
 
         if expected_math_placeholders:
             _queue_math_sentence_replacement(
@@ -1685,8 +1694,7 @@ def _replace_block_tokens(
                 replacement=replacement,
                 expected_math_placeholders=expected_math_placeholders,
             )
-        elif has_custom_format:
-            # 使用带格式的替换
+        elif has_custom_target_html:
             _queue_formatted_sentence_replacement(tokens, span, segment.target_html)
         else:
             _queue_sentence_replacement(tokens, span, replacement)
@@ -2052,7 +2060,7 @@ def _queue_formatted_sentence_replacement(
     # 在第一个 token 位置插入格式化的 runs
     if first_token.run_element is not None and first_token.container_element is not None:
         parent = first_token.container_element
-        anchor = first_token.anchor_element or first_token.run_element
+        anchor = first_token.anchor_element if first_token.anchor_element is not None else first_token.run_element
         insert_index = list(parent).index(anchor)
 
         # 为每个格式化片段创建一个 run
@@ -2084,6 +2092,8 @@ def _build_formatted_word_run(
         run_properties = ET.Element(_qn("w", "rPr"))
         run_element.insert(0, run_properties)
 
+    _clear_explicit_format_run_properties(run_properties)
+
     # 应用格式
     if fragment.bold:
         _set_run_property(run_properties, "b")
@@ -2110,6 +2120,12 @@ def _build_formatted_word_run(
     _apply_export_font(run_element)
 
     return run_element
+
+
+def _clear_explicit_format_run_properties(run_properties: ET.Element) -> None:
+    for child in list(run_properties):
+        if _namespace_uri(child.tag) == NS["w"] and _local_name(child.tag) in EXPLICIT_FORMAT_RUN_PROPERTIES:
+            run_properties.remove(child)
 
 
 def _set_run_property(run_properties: ET.Element, prop_name: str) -> None:
