@@ -216,6 +216,55 @@ REQUIRED_SCHEMA = {
         "ignored_at",
         "created_at",
     },
+    "number_check_reports": {
+        "id",
+        "project_id",
+        "file_record_id",
+        "created_by_id",
+        "scope",
+        "file_ids",
+        "total_files",
+        "total_segments",
+        "checked_segments",
+        "program_issue_count",
+        "ai_issue_count",
+        "source_issue_count",
+        "ai_checked",
+        "status",
+        "created_at",
+    },
+    "number_check_report_items": {
+        "id",
+        "report_id",
+        "project_id",
+        "file_record_id",
+        "segment_id",
+        "sentence_id",
+        "file_name",
+        "source_text",
+        "target_text",
+        "source_numbers",
+        "target_numbers",
+        "error_reason",
+        "ai_checked",
+        "ai_is_correct",
+        "ai_errors",
+        "ai_source_issues",
+        "replace_anchor",
+        "suggested_value",
+        "is_source_consistent",
+        "ai_error_status",
+        "original_target_text",
+        "applied",
+        "applied_at",
+        "status",
+        "ignored_by_id",
+        "ignored_at",
+        "block_index",
+        "row_index",
+        "cell_index",
+        "created_at",
+    },
     "segment_qa_issues": {
         "id",
         "project_id",
@@ -2375,6 +2424,95 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_term_qa_report_items_ignored_at
             ON term_qa_report_items (ignored_at)
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS number_check_reports (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID REFERENCES file_records(id) ON DELETE CASCADE,
+                created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                scope VARCHAR(20) NOT NULL DEFAULT 'file',
+                file_ids TEXT NOT NULL DEFAULT '[]',
+                total_files INTEGER NOT NULL DEFAULT 0,
+                total_segments INTEGER NOT NULL DEFAULT 0,
+                checked_segments INTEGER NOT NULL DEFAULT 0,
+                program_issue_count INTEGER NOT NULL DEFAULT 0,
+                ai_issue_count INTEGER NOT NULL DEFAULT 0,
+                source_issue_count INTEGER NOT NULL DEFAULT 0,
+                ai_checked BOOLEAN NOT NULL DEFAULT FALSE,
+                status VARCHAR(20) NOT NULL DEFAULT 'completed',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS number_check_report_items (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                report_id UUID NOT NULL REFERENCES number_check_reports(id) ON DELETE CASCADE,
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+                segment_id UUID REFERENCES segments(id) ON DELETE SET NULL,
+                sentence_id VARCHAR(40) NOT NULL DEFAULT '',
+                file_name VARCHAR(255) NOT NULL DEFAULT '',
+                source_text TEXT NOT NULL DEFAULT '',
+                target_text TEXT NOT NULL DEFAULT '',
+                source_numbers TEXT NOT NULL DEFAULT '[]',
+                target_numbers TEXT NOT NULL DEFAULT '[]',
+                error_reason TEXT NOT NULL DEFAULT '',
+                ai_checked BOOLEAN NOT NULL DEFAULT FALSE,
+                ai_is_correct BOOLEAN NOT NULL DEFAULT TRUE,
+                ai_errors TEXT NOT NULL DEFAULT '[]',
+                ai_source_issues TEXT NOT NULL DEFAULT '[]',
+                replace_anchor TEXT NOT NULL DEFAULT '',
+                suggested_value TEXT NOT NULL DEFAULT '',
+                is_source_consistent BOOLEAN NOT NULL DEFAULT FALSE,
+                ai_error_status VARCHAR(40) NOT NULL DEFAULT '',
+                original_target_text TEXT NOT NULL DEFAULT '',
+                applied BOOLEAN NOT NULL DEFAULT FALSE,
+                applied_at TIMESTAMP,
+                status VARCHAR(20) NOT NULL DEFAULT 'open',
+                ignored_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                ignored_at TIMESTAMP,
+                block_index INTEGER NOT NULL DEFAULT 0,
+                row_index INTEGER,
+                cell_index INTEGER,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_reports_project_id
+            ON number_check_reports (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_reports_file_record_id
+            ON number_check_reports (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_reports_created_by_id
+            ON number_check_reports (created_by_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_reports_created_at
+            ON number_check_reports (created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_report_items_report_id
+            ON number_check_report_items (report_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_report_items_project_id
+            ON number_check_report_items (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_report_items_file_record_id
+            ON number_check_report_items (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_report_items_segment_id
+            ON number_check_report_items (segment_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_report_items_status
+            ON number_check_report_items (status)
             """,
             f"""
             CREATE TABLE IF NOT EXISTS segment_qa_issues (

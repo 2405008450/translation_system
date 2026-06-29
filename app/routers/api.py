@@ -49,6 +49,8 @@ from app.models import (
     MemoryBase,
     MemoryEntry,
     Notification,
+    NumberCheckReport,
+    NumberCheckReportItem,
     Project,
     ProjectAssignment,
     ProjectMergeView,
@@ -332,6 +334,19 @@ from app.services.tm_importer import (
     preview_sdltm_metadata_from_path,
 )
 from app.services.resource_import_batch import create_resource_import_batch
+from app.services.number_check_service import (
+    apply_number_check_item,
+    apply_number_check_items_bulk,
+    aiter_number_check_generation,
+    create_number_check_report,
+    ignore_number_check_items_bulk,
+    load_number_check_items,
+    restore_number_check_item,
+    run_ai_number_check_all_segments,
+    run_ai_number_check_for_report,
+    serialize_number_check_report,
+    set_number_check_item_ignored,
+)
 from app.services.tm_vector import sync_tm_embeddings
 from app.services.translation_memory_service import TMUpsertEntry, batch_upsert_tm_entries
 from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_response
@@ -7391,6 +7406,341 @@ def set_workbench_qa_result_items_ignored(
     }
 
 
+class NumberCheckRecheckRequest(BaseModel):
+    item_ids: list[UUID] = Field(default_factory=list)
+
+
+def _get_number_check_report_or_404(db: Session, report_id: UUID) -> NumberCheckReport:
+    report = (
+        db.query(NumberCheckReport)
+        .filter(NumberCheckReport.id == report_id)
+        .first()
+    )
+    if not report:
+        raise HTTPException(status_code=404, detail="数字专检报告不存在。")
+    return report
+
+
+def _get_number_check_item_or_404(db: Session, item_id: UUID) -> NumberCheckReportItem:
+    item = (
+        db.query(NumberCheckReportItem)
+        .filter(NumberCheckReportItem.id == item_id)
+        .first()
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="数字专检报告项不存在。")
+    return item
+
+
+def _require_number_check_report_read_access(
+    report: NumberCheckReport,
+    current_user: User,
+    db: Session,
+) -> None:
+    if report.file_record_id:
+        file_record = get_file_record_model(db, report.file_record_id)
+        if file_record:
+            _require_file_record_read_access(file_record, current_user)
+            return
+    if report.project_id:
+        project = db.query(Project).filter(Project.id == report.project_id).first()
+        if project:
+            _require_project_read_access(project, current_user, db)
+            return
+    if not can_access_all_projects(current_user):
+        raise HTTPException(status_code=403, detail="无权访问该数字专检报告。")
+
+
+def _resolve_file_record_project(db: Session, file_record: FileRecord) -> Project | None:
+    if not file_record.project_id:
+        return None
+    return file_record.project or db.query(Project).filter(Project.id == file_record.project_id).first()
+
+
+@router.post("/file-records/{file_record_id}/number-check-reports")
+async def create_file_record_number_check_report(
+    file_record_id: UUID,
+    run_ai: bool = Query(default=True),
+    ai_scope: str = Query(default="program_only"),
+    provider: str = Query(default="auto"),
+    model: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    project = _resolve_file_record_project(db, file_record)
+    report = create_number_check_report(
+        db,
+        project=project,
+        files=[file_record],
+        current_user=current_user,
+        scope="file",
+    )
+    if run_ai:
+        if ai_scope == "all":
+            await run_ai_number_check_all_segments(
+                db, report, [file_record], provider=provider, model=model
+            )
+        elif report.program_issue_count > 0:
+            await run_ai_number_check_for_report(db, report, provider=provider, model=model)
+    return serialize_number_check_report(report, load_number_check_items(db, report.id))
+
+
+def _build_number_check_stream(
+    db: Session,
+    request: Request,
+    *,
+    project: Project | None,
+    files: list[FileRecord],
+    current_user: User,
+    scope: str,
+    run_ai: bool,
+    ai_scope: str,
+    provider: str,
+    model: str | None,
+):
+    async def event_stream():
+        report_id: str | None = None
+        try:
+            async for event in aiter_number_check_generation(
+                db,
+                project=project,
+                files=files,
+                current_user=current_user,
+                scope=scope,
+                run_ai=run_ai,
+                ai_scope=ai_scope,
+                provider=provider,
+                model=model,
+            ):
+                if await request.is_disconnected():
+                    break
+                stage = event.get("stage")
+                if stage == "complete":
+                    report_id = event.get("report_id")
+                    break
+                yield _sse_event(stage, event)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("number-check stream failed")
+            yield _sse_event("error", {"message": str(exc)})
+            return
+
+        if report_id is not None and not await request.is_disconnected():
+            report = _get_number_check_report_or_404(db, UUID(report_id))
+            yield _sse_event(
+                "complete",
+                {"report": serialize_number_check_report(report, load_number_check_items(db, report.id))},
+            )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/file-records/{file_record_id}/number-check-reports/stream")
+async def stream_file_record_number_check_report(
+    file_record_id: UUID,
+    request: Request,
+    run_ai: bool = Query(default=True),
+    ai_scope: str = Query(default="program_only"),
+    provider: str = Query(default="auto"),
+    model: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    project = _resolve_file_record_project(db, file_record)
+    return _build_number_check_stream(
+        db,
+        request,
+        project=project,
+        files=[file_record],
+        current_user=current_user,
+        scope="file",
+        run_ai=run_ai,
+        ai_scope=ai_scope,
+        provider=provider,
+        model=model,
+    )
+
+
+@router.get("/file-records/{file_record_id}/number-check-reports")
+def list_file_record_number_check_reports(
+    file_record_id: UUID,
+    limit: int = 1,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文档不存在。")
+    _require_file_record_read_access(file_record, current_user)
+    safe_limit = min(max(int(limit), 1), 20)
+    reports = (
+        db.query(NumberCheckReport)
+        .filter(NumberCheckReport.file_record_id == file_record_id)
+        .order_by(NumberCheckReport.created_at.desc(), NumberCheckReport.id.desc())
+        .limit(safe_limit)
+        .all()
+    )
+    return {
+        "items": [
+            serialize_number_check_report(report, load_number_check_items(db, report.id))
+            for report in reports
+        ]
+    }
+
+
+@router.get("/number-check-reports/{report_id}")
+def get_number_check_report(
+    report_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_number_check_report_or_404(db, report_id)
+    _require_number_check_report_read_access(report, current_user, db)
+    return serialize_number_check_report(report, load_number_check_items(db, report.id))
+
+
+@router.post("/number-check-reports/{report_id}/ai-recheck")
+async def recheck_number_check_report(
+    report_id: UUID,
+    payload: NumberCheckRecheckRequest | None = None,
+    provider: str = Query(default="auto"),
+    model: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_number_check_report_or_404(db, report_id)
+    _require_number_check_report_read_access(report, current_user, db)
+    item_ids = list(dict.fromkeys((payload.item_ids if payload else []) or [])) or None
+    await run_ai_number_check_for_report(
+        db,
+        report,
+        item_ids=item_ids,
+        provider=provider,
+        model=model,
+    )
+    return serialize_number_check_report(report, load_number_check_items(db, report.id))
+
+
+@router.patch("/number-check-report-items/{item_id}/apply")
+def apply_number_check_report_item(
+    item_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_number_check_item_or_404(db, item_id)
+    file_record = get_file_record_model(db, item.file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="对应文件不存在。")
+    _require_file_record_work_access(file_record, current_user)
+    apply_number_check_item(db, item, current_user)
+    report = _get_number_check_report_or_404(db, item.report_id)
+    return serialize_number_check_report(report, load_number_check_items(db, report.id))
+
+
+@router.patch("/number-check-report-items/{item_id}/restore")
+def restore_number_check_report_item(
+    item_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_number_check_item_or_404(db, item_id)
+    file_record = get_file_record_model(db, item.file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="对应文件不存在。")
+    _require_file_record_work_access(file_record, current_user)
+    restore_number_check_item(db, item, current_user)
+    report = _get_number_check_report_or_404(db, item.report_id)
+    return serialize_number_check_report(report, load_number_check_items(db, report.id))
+
+
+@router.patch("/number-check-report-items/{item_id}/ignore")
+def set_number_check_report_item_ignored(
+    item_id: UUID,
+    payload: TermQAReportItemIgnoreRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    item = _get_number_check_item_or_404(db, item_id)
+    file_record = get_file_record_model(db, item.file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="对应文件不存在。")
+    _require_file_record_work_access(file_record, current_user)
+    set_number_check_item_ignored(db, item, current_user, payload.ignored)
+    report = _get_number_check_report_or_404(db, item.report_id)
+    return serialize_number_check_report(report, load_number_check_items(db, report.id))
+
+
+def _require_number_check_report_write_access(
+    db: Session,
+    report: NumberCheckReport,
+    current_user: User,
+) -> None:
+    file_ids = {
+        row.file_record_id
+        for row in db.query(NumberCheckReportItem.file_record_id)
+        .filter(NumberCheckReportItem.report_id == report.id)
+        .distinct()
+        .all()
+    }
+    for file_record_id in file_ids:
+        file_record = get_file_record_model(db, file_record_id)
+        if file_record is None:
+            continue
+        _require_file_record_work_access(file_record, current_user)
+
+
+@router.post("/number-check-reports/{report_id}/apply-all")
+def apply_all_number_check_report_items(
+    report_id: UUID,
+    payload: NumberCheckRecheckRequest | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_number_check_report_or_404(db, report_id)
+    _require_number_check_report_write_access(db, report, current_user)
+    item_ids = list(dict.fromkeys((payload.item_ids if payload else []) or [])) or None
+    applied_count = apply_number_check_items_bulk(db, report, current_user, item_ids=item_ids)
+    db.refresh(report)
+    result = serialize_number_check_report(report, load_number_check_items(db, report.id))
+    result["applied_count"] = applied_count
+    return result
+
+
+@router.post("/number-check-reports/{report_id}/ignore-all")
+def ignore_all_number_check_report_items(
+    report_id: UUID,
+    payload: NumberCheckRecheckRequest | None = None,
+    ignored: bool = Query(default=True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    report = _get_number_check_report_or_404(db, report_id)
+    _require_number_check_report_write_access(db, report, current_user)
+    item_ids = list(dict.fromkeys((payload.item_ids if payload else []) or [])) or None
+    updated_count = ignore_number_check_items_bulk(
+        db, report, current_user, item_ids=item_ids, ignored=ignored
+    )
+    db.refresh(report)
+    result = serialize_number_check_report(report, load_number_check_items(db, report.id))
+    result["updated_count"] = updated_count
+    return result
+
+
 @router.get("/projects/{project_id}")
 def get_project_detail(
     project_id: UUID,
@@ -10599,6 +10949,89 @@ def export_merge_view_qa_result_xlsx(
         result,
         f"merge-view-qa-result-{view_id}.xlsx",
     )
+
+
+@router.post("/merge-views/{view_id}/number-check-reports")
+async def create_merge_view_number_check_report(
+    view_id: UUID,
+    run_ai: bool = Query(default=True),
+    ai_scope: str = Query(default="program_only"),
+    provider: str = Query(default="auto"),
+    model: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _view, project, files = _get_merge_view_context(db, view_id, current_user)
+    report = create_number_check_report(
+        db,
+        project=project,
+        files=files,
+        current_user=current_user,
+        scope="merge_view",
+    )
+    if run_ai:
+        if ai_scope == "all":
+            await run_ai_number_check_all_segments(
+                db, report, files, provider=provider, model=model
+            )
+        elif report.program_issue_count > 0:
+            await run_ai_number_check_for_report(db, report, provider=provider, model=model)
+    return serialize_number_check_report(report, load_number_check_items(db, report.id))
+
+
+@router.post("/merge-views/{view_id}/number-check-reports/stream")
+async def stream_merge_view_number_check_report(
+    view_id: UUID,
+    request: Request,
+    run_ai: bool = Query(default=True),
+    ai_scope: str = Query(default="program_only"),
+    provider: str = Query(default="auto"),
+    model: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _view, project, files = _get_merge_view_context(db, view_id, current_user)
+    return _build_number_check_stream(
+        db,
+        request,
+        project=project,
+        files=files,
+        current_user=current_user,
+        scope="merge_view",
+        run_ai=run_ai,
+        ai_scope=ai_scope,
+        provider=provider,
+        model=model,
+    )
+
+
+@router.get("/merge-views/{view_id}/number-check-reports")
+def list_merge_view_number_check_reports(
+    view_id: UUID,
+    limit: int = 1,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _view, _project, files = _get_merge_view_context(db, view_id, current_user)
+    file_ids = [str(file_record.id) for file_record in files]
+    file_ids_text = json.dumps(file_ids)
+    safe_limit = min(max(int(limit), 1), 20)
+    reports = (
+        db.query(NumberCheckReport)
+        .filter(
+            NumberCheckReport.scope == "merge_view",
+            NumberCheckReport.file_ids == file_ids_text,
+        )
+        .order_by(NumberCheckReport.created_at.desc(), NumberCheckReport.id.desc())
+        .limit(safe_limit)
+        .all()
+    )
+    return {
+        "items": [
+            serialize_number_check_report(report, load_number_check_items(db, report.id))
+            for report in reports
+        ]
+    }
 
 
 @router.get("/merge-views/{view_id}/segments/{file_record_id}/{sentence_id}/position")

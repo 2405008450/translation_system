@@ -527,6 +527,60 @@ export interface WorkbenchQAResult {
   items: WorkbenchQAResultItem[]
 }
 
+export interface NumberCheckReportItem {
+  id: string
+  report_id: string
+  project_id: string | null
+  file_record_id: string
+  segment_id: string | null
+  sentence_id: string
+  file_name: string
+  source_text: string
+  target_text: string
+  source_numbers: string[]
+  target_numbers: string[]
+  error_reason: string
+  program_flagged: boolean
+  ai_checked: boolean
+  ai_is_correct: boolean
+  ai_errors: Record<string, unknown>[]
+  ai_source_issues: Record<string, unknown>[]
+  replace_anchor: string
+  suggested_value: string
+  is_source_consistent: boolean
+  ai_error_status: string
+  original_target_text: string
+  applied: boolean
+  applied_at: string | null
+  status: 'open' | 'ignored' | 'modified'
+  ignored: boolean
+  can_apply: boolean
+  block_index: number
+  row_index: number | null
+  cell_index: number | null
+  created_at: string | null
+}
+
+export interface NumberCheckReport {
+  id: string
+  project_id: string | null
+  file_record_id: string | null
+  scope: 'file' | 'merge_view'
+  file_ids: string[]
+  total_files: number
+  total_segments: number
+  checked_segments: number
+  program_issue_count: number
+  ai_issue_count: number
+  source_issue_count: number
+  ai_checked: boolean
+  active_issue_count: number
+  ignored_count: number
+  status: string
+  created_at: string | null
+  items: NumberCheckReportItem[]
+}
+
 export interface ProjectSegmentSyncSummary {
   filled_count: number
   updated_count: number

@@ -70,6 +70,16 @@ import {
   fetchMergeViewSegmentPosition,
   fetchMergeViewQAResult,
 } from '../api/mergeViews'
+import {
+  applyNumberCheckItem,
+  applyAllNumberCheckItems,
+  fetchFileNumberCheckReport,
+  fetchMergeViewNumberCheckReport,
+  ignoreAllNumberCheckItems,
+  recheckNumberCheckReport,
+  restoreNumberCheckItem,
+  setNumberCheckItemIgnored,
+} from '../api/numberCheck'
 import { refreshGlobalNotifications } from '../utils/notifications'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
@@ -86,6 +96,7 @@ import {
   patchTranslationWorkflowProgress,
 } from '../utils/progress'
 import { hasTermTextMatch } from '../utils/termMatching'
+import { consumeLLMStream } from '../utils/llmStream'
 import { useAuthStore } from '../stores/auth'
 import { useCommentStore, type CommentWindowQuery } from '../stores/comment'
 import { usePreferencesStore, type WorkbenchConfirmJumpMode } from '../stores/preferences'
@@ -111,6 +122,8 @@ import type {
   QualityQASettingsResponse,
   WorkbenchQAResult,
   WorkbenchQAResultItem,
+  NumberCheckReport,
+  NumberCheckReportItem,
   WorkflowProgress,
 } from '../types/api'
 import { buildDocumentPreviewHtml } from '../utils/documentPreview'
@@ -123,8 +136,8 @@ const props = defineProps<{
   mergeViewId?: string
 }>()
 
-type BottomToolKey = 'qa-result' | 'history' | 'source-preview' | 'target-preview' | 'split-preview'
-type BottomDrawerToolKey = Exclude<BottomToolKey, 'qa-result'>
+type BottomToolKey = 'qa-result' | 'number-check' | 'history' | 'source-preview' | 'target-preview' | 'split-preview'
+type BottomDrawerToolKey = Exclude<BottomToolKey, 'qa-result' | 'number-check'>
 type SideToolKey = 'match-info' | 'terms' | 'resource-search' | 'notes' | 'reference'
 type ResourceImportTab = 'tm' | 'glossary' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
@@ -454,6 +467,33 @@ const locatingTermQAReportItemId = ref<string | null>(null)
 const updatingTermQAIgnore = ref(false)
 const selectedTermQAItemIds = ref<Set<string>>(new Set())
 const termQAReportPage = ref(1)
+
+type NumberCheckFilter = 'all' | 'program' | 'ai' | 'source' | 'modified' | 'ignored'
+const numberCheckReport = ref<NumberCheckReport | null>(null)
+const loadingNumberCheck = ref(false)
+const generatingNumberCheck = ref(false)
+const recheckingNumberCheck = ref(false)
+const numberCheckAiEnabled = ref(true)
+const numberCheckFilter = ref<NumberCheckFilter>('all')
+const numberCheckVisibleLimit = ref(100)
+const numberCheckAiScope = ref<'program_only' | 'all'>('program_only')
+const numberCheckModel = ref<string>('')
+const showNumberCheckSettings = ref(false)
+const selectedNumberCheckItemIds = ref<Set<string>>(new Set())
+const numberCheckItemBusyId = ref<string | null>(null)
+const numberCheckBulkBusy = ref(false)
+const locatingNumberCheckItemId = ref<string | null>(null)
+
+interface NumberCheckProgress {
+  stage: 'program' | 'ai' | 'done'
+  programCurrent: number
+  programTotal: number
+  programDone: boolean
+  programIssueCount: number
+  aiCurrent: number
+  aiTotal: number
+}
+const numberCheckProgress = ref<NumberCheckProgress | null>(null)
 const showQualityQAAdjustDialog = ref(false)
 const qualityQASettings = ref<QualityQASettingsResponse | null>(null)
 const loadingQualityQASettings = ref(false)
@@ -4184,6 +4224,583 @@ async function focusTermQAReportItem(item: WorkbenchQAResultItem) {
   }
 }
 
+const NUMBER_CHECK_RENDER_STEP = 100
+
+const numberCheckFilteredItems = computed(() => {
+  const items = numberCheckReport.value?.items ?? []
+  switch (numberCheckFilter.value) {
+    case 'program':
+      return items.filter((item) => item.status !== 'ignored')
+    case 'ai':
+      return items.filter((item) => item.ai_checked && !item.ai_is_correct && item.status !== 'ignored')
+    case 'source':
+      return items.filter((item) => item.ai_source_issues.length > 0 && item.status !== 'ignored')
+    case 'modified':
+      return items.filter((item) => item.applied)
+    case 'ignored':
+      return items.filter((item) => item.status === 'ignored')
+    default:
+      return items
+  }
+})
+
+const visibleNumberCheckItems = computed(() => (
+  numberCheckFilteredItems.value.slice(0, numberCheckVisibleLimit.value)
+))
+
+const numberCheckHasMore = computed(() => (
+  numberCheckVisibleLimit.value < numberCheckFilteredItems.value.length
+))
+
+const numberCheckCountText = computed(() => {
+  const total = numberCheckFilteredItems.value.length
+  const shown = Math.min(numberCheckVisibleLimit.value, total)
+  return `${shown} / ${total}`
+})
+
+interface NumberCheckPreviewPart {
+  text: string
+  mark: boolean
+}
+
+function numberCheckPreviewParts(item: NumberCheckReportItem): NumberCheckPreviewPart[] {
+  const target = item.target_text || ''
+  const anchor = item.replace_anchor || ''
+  const suggested = item.suggested_value || ''
+
+  if (item.applied) {
+    if (suggested && target.includes(suggested)) {
+      const idx = target.indexOf(suggested)
+      return [
+        { text: target.slice(0, idx), mark: false },
+        { text: suggested, mark: true },
+        { text: target.slice(idx + suggested.length), mark: false },
+      ].filter((part) => part.text.length > 0)
+    }
+    return [{ text: target || '未填写', mark: false }]
+  }
+
+  if (anchor && suggested && target.includes(anchor)) {
+    const idx = target.indexOf(anchor)
+    return [
+      { text: target.slice(0, idx), mark: false },
+      { text: suggested, mark: true },
+      { text: target.slice(idx + anchor.length), mark: false },
+    ].filter((part) => part.text.length > 0)
+  }
+
+  return [{ text: target || '未填写', mark: false }]
+}
+
+function onNumberCheckScroll(event: Event) {
+  const el = event.target as HTMLElement | null
+  if (!el) {
+    return
+  }
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 200 && numberCheckHasMore.value) {
+    numberCheckVisibleLimit.value += NUMBER_CHECK_RENDER_STEP
+  }
+}
+
+const numberCheckSelectableItems = computed(() => (
+  numberCheckFilteredItems.value.filter((item) => item.status !== 'ignored')
+))
+
+const selectedNumberCheckItems = computed(() => (
+  (numberCheckReport.value?.items ?? []).filter((item) => selectedNumberCheckItemIds.value.has(item.id))
+))
+
+const allNumberCheckItemsSelected = computed(() => (
+  numberCheckSelectableItems.value.length > 0
+  && numberCheckSelectableItems.value.every((item) => selectedNumberCheckItemIds.value.has(item.id))
+))
+
+const numberCheckMetaText = computed(() => {
+  const report = numberCheckReport.value
+  if (!report) {
+    return ''
+  }
+  return [
+    `程序 ${report.program_issue_count} 处`,
+    report.ai_checked ? `AI ${report.ai_issue_count} 处` : 'AI 未复核',
+    `检查 ${report.checked_segments} 句段`,
+    formatWorkbenchStatusTime(report.created_at),
+  ].filter(Boolean).join(' · ')
+})
+
+const canRunNumberCheck = computed(() => {
+  if (generatingNumberCheck.value) {
+    return false
+  }
+  if (isMergeWorkbench.value) {
+    return Boolean(segmentStore.mergeViewId || props.mergeViewId)
+  }
+  return Boolean(segmentStore.fileRecord)
+})
+
+const numberCheckButtonTitle = computed(() => (
+  numberCheckReport.value
+    ? `数字专检：${numberCheckReport.value.active_issue_count} 处待处理`
+    : '生成数字专检'
+))
+
+function getNumberCheckFileName(item: NumberCheckReportItem) {
+  if (item.file_name) {
+    return item.file_name
+  }
+  return (
+    segmentStore.mergeViewDetail?.files.find((file) => file.id === item.file_record_id)?.filename
+    || ''
+  )
+}
+
+function numberCheckHasCorrection(item: NumberCheckReportItem) {
+  if (item.applied) {
+    return true
+  }
+  return Boolean(
+    item.replace_anchor
+    && item.suggested_value
+    && (item.target_text || '').includes(item.replace_anchor),
+  )
+}
+
+interface NumberCheckStatusTag {
+  text: string
+  tone: 'ok' | 'warn' | 'muted' | 'done'
+}
+
+function numberCheckProgramTag(item: NumberCheckReportItem): NumberCheckStatusTag {
+  return item.program_flagged
+    ? { text: '程序·疑误', tone: 'warn' }
+    : { text: '程序·通过', tone: 'ok' }
+}
+
+function numberCheckAiTag(item: NumberCheckReportItem): NumberCheckStatusTag {
+  if (!item.ai_checked) {
+    return { text: 'AI·未复核', tone: 'muted' }
+  }
+  if (item.ai_error_status) {
+    return { text: 'AI·失败', tone: 'warn' }
+  }
+  if (!item.ai_is_correct) {
+    return { text: 'AI·有误', tone: 'warn' }
+  }
+  if (item.is_source_consistent) {
+    return { text: 'AI·原文问题', tone: 'warn' }
+  }
+  return { text: 'AI·正确', tone: 'ok' }
+}
+
+function numberCheckManualTag(item: NumberCheckReportItem): NumberCheckStatusTag {
+  if (item.status === 'ignored') {
+    return { text: '人工·已忽略', tone: 'done' }
+  }
+  if (item.applied) {
+    return { text: '人工·已修改', tone: 'done' }
+  }
+  return { text: '人工·待处理', tone: 'muted' }
+}
+
+function numberCheckStatusTags(item: NumberCheckReportItem): NumberCheckStatusTag[] {
+  return [
+    numberCheckProgramTag(item),
+    numberCheckAiTag(item),
+    numberCheckManualTag(item),
+  ]
+}
+
+function setCurrentNumberCheckReport(
+  report: NumberCheckReport | null,
+  options: { keepPage?: boolean; keepSelection?: boolean } = {},
+) {
+  numberCheckReport.value = report
+  if (!options.keepPage) {
+    numberCheckVisibleLimit.value = NUMBER_CHECK_RENDER_STEP
+  }
+  if (!options.keepSelection) {
+    selectedNumberCheckItemIds.value = new Set()
+  }
+}
+
+function setNumberCheckFilter(filter: NumberCheckFilter) {
+  numberCheckFilter.value = filter
+  numberCheckVisibleLimit.value = NUMBER_CHECK_RENDER_STEP
+}
+
+function toggleNumberCheckItemSelection(itemId: string, event: Event) {
+  const checked = (event.target as HTMLInputElement | null)?.checked ?? false
+  const next = new Set(selectedNumberCheckItemIds.value)
+  if (checked) {
+    next.add(itemId)
+  } else {
+    next.delete(itemId)
+  }
+  selectedNumberCheckItemIds.value = next
+}
+
+function toggleAllNumberCheckItems(selected: boolean) {
+  const next = new Set(selectedNumberCheckItemIds.value)
+  for (const item of numberCheckSelectableItems.value) {
+    if (selected) {
+      next.add(item.id)
+    } else {
+      next.delete(item.id)
+    }
+  }
+  selectedNumberCheckItemIds.value = next
+}
+
+async function loadNumberCheckReport() {
+  const mergeViewId = segmentStore.mergeViewId || props.mergeViewId || ''
+  if (isMergeWorkbench.value ? !mergeViewId : !segmentStore.fileRecord) {
+    return
+  }
+  loadingNumberCheck.value = true
+  try {
+    const report = isMergeWorkbench.value
+      ? await fetchMergeViewNumberCheckReport(mergeViewId)
+      : await fetchFileNumberCheckReport(segmentStore.fileRecord!.id)
+    setCurrentNumberCheckReport(report)
+  } catch (error) {
+    // 尚无报告时忽略错误
+  } finally {
+    loadingNumberCheck.value = false
+  }
+}
+
+async function openNumberCheck() {
+  if (loadingNumberCheck.value || generatingNumberCheck.value) {
+    return
+  }
+  if (activeBottomTool.value === 'number-check') {
+    closeBottomDrawer()
+    return
+  }
+  previewPanelRendering.value = false
+  activeBottomTool.value = 'number-check'
+  await scrollBottomPanelIntoView()
+  if (!numberCheckReport.value) {
+    await loadNumberCheckReport()
+  }
+}
+
+function resolveNumberCheckGenerateOptions() {
+  const model = numberCheckModel.value.trim()
+  const provider = model
+    ? (llmModelOptions.find((option) => option.id === model)?.provider || 'auto')
+    : 'auto'
+  return {
+    runAi: numberCheckAiEnabled.value,
+    aiScope: numberCheckAiScope.value,
+    provider,
+    model: model || undefined,
+  }
+}
+
+const numberCheckProgressText = computed(() => {
+  const progress = numberCheckProgress.value
+  if (!progress) {
+    return ''
+  }
+  if (progress.stage === 'program') {
+    return `程序检查 ${progress.programCurrent}/${progress.programTotal}`
+  }
+  if (progress.stage === 'ai') {
+    const head = progress.programDone ? '程序检查已完成 · ' : ''
+    return `${head}AI 正在复核 ${progress.aiCurrent}/${progress.aiTotal}`
+  }
+  return '已完成'
+})
+
+const numberCheckProgressPercent = computed(() => {
+  const progress = numberCheckProgress.value
+  if (!progress) {
+    return 0
+  }
+  const programPct = progress.programTotal ? progress.programCurrent / progress.programTotal : 1
+  if (!numberCheckAiEnabled.value) {
+    return Math.min(100, Math.round(programPct * 100))
+  }
+  if (!progress.programDone) {
+    return Math.min(50, Math.round(programPct * 50))
+  }
+  const aiPct = progress.aiTotal ? progress.aiCurrent / progress.aiTotal : (progress.stage === 'done' ? 1 : 0)
+  return Math.min(100, Math.round(50 + aiPct * 50))
+})
+
+async function generateNumberCheckReport() {
+  if (generatingNumberCheck.value || !canRunNumberCheck.value) {
+    return
+  }
+  const mergeViewId = segmentStore.mergeViewId || props.mergeViewId || ''
+  showNumberCheckSettings.value = false
+  generatingNumberCheck.value = true
+  numberCheckProgress.value = {
+    stage: 'program',
+    programCurrent: 0,
+    programTotal: 0,
+    programDone: false,
+    programIssueCount: 0,
+    aiCurrent: 0,
+    aiTotal: 0,
+  }
+  activeBottomTool.value = 'number-check'
+  await scrollBottomPanelIntoView()
+  try {
+    const options = resolveNumberCheckGenerateOptions()
+    const params = new URLSearchParams()
+    params.set('run_ai', String(options.runAi))
+    params.set('ai_scope', options.aiScope)
+    params.set('provider', options.provider)
+    if (options.model) {
+      params.set('model', options.model)
+    }
+    const base = isMergeWorkbench.value
+      ? `/api/merge-views/${mergeViewId}/number-check-reports/stream`
+      : `/api/file-records/${segmentStore.fileRecord!.id}/number-check-reports/stream`
+    const token = authStore.token
+    const response = await fetch(`${base}?${params.toString()}`, {
+      method: 'POST',
+      headers: {
+        Accept: 'text/event-stream',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    })
+    if (!response.ok) {
+      throw new Error(`请求失败 (${response.status})`)
+    }
+    await consumeLLMStream(response, async (event) => {
+      const data = event.data as Record<string, unknown>
+      const progress = numberCheckProgress.value
+      if (!progress) {
+        return
+      }
+      if (event.event === 'program') {
+        progress.stage = 'program'
+        progress.programCurrent = Number(data.current || 0)
+        progress.programTotal = Number(data.total || 0)
+      } else if (event.event === 'program_done') {
+        progress.programDone = true
+        progress.programIssueCount = Number(data.program_issue_count || 0)
+        if (options.runAi) {
+          progress.stage = 'ai'
+        }
+      } else if (event.event === 'ai') {
+        progress.stage = 'ai'
+        progress.aiCurrent = Number(data.current || 0)
+        progress.aiTotal = Number(data.total || 0)
+      } else if (event.event === 'complete') {
+        setCurrentNumberCheckReport(data.report as NumberCheckReport)
+        progress.stage = 'done'
+      } else if (event.event === 'error') {
+        throw new Error(String(data.message || '数字专检失败'))
+      }
+    })
+    toast.show({
+      title: '数字专检完成',
+      message: numberCheckReport.value
+        ? `共 ${numberCheckReport.value.program_issue_count} 处疑似数值问题`
+        : '检查完成',
+    })
+  } catch (error) {
+    toast.error({
+      title: '数字专检失败',
+      message: getErrorMessage(error, '无法生成数字专检结果。'),
+    })
+  } finally {
+    generatingNumberCheck.value = false
+    numberCheckProgress.value = null
+  }
+}
+
+async function runNumberCheckRecheck(itemIds: string[]) {
+  if (!numberCheckReport.value || recheckingNumberCheck.value) {
+    return
+  }
+  recheckingNumberCheck.value = true
+  try {
+    const report = await recheckNumberCheckReport(numberCheckReport.value.id, itemIds)
+    setCurrentNumberCheckReport(report, { keepPage: true, keepSelection: true })
+    toast.show({ title: 'AI 复核完成', message: `已复核 ${itemIds.length} 项` })
+  } catch (error) {
+    toast.error({
+      title: 'AI 复核失败',
+      message: getErrorMessage(error, '无法完成 AI 复核。'),
+    })
+  } finally {
+    recheckingNumberCheck.value = false
+  }
+}
+
+async function recheckSelectedNumberCheck() {
+  const ids = selectedNumberCheckItems.value.map((item) => item.id)
+  if (ids.length === 0) {
+    return
+  }
+  await runNumberCheckRecheck(ids)
+}
+
+async function refreshAfterNumberCheckChange() {
+  try {
+    await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize)
+  } catch (error) {
+    // 编辑器刷新失败不影响报告操作
+  }
+}
+
+async function applyNumberCheckReportItem(item: NumberCheckReportItem) {
+  if (numberCheckItemBusyId.value) {
+    return
+  }
+  numberCheckItemBusyId.value = item.id
+  try {
+    const report = await applyNumberCheckItem(item.id)
+    setCurrentNumberCheckReport(report, { keepPage: true, keepSelection: true })
+    await refreshAfterNumberCheckChange()
+    toast.show({ title: '已按建议修改译文', message: '锚点替换已应用到当前译文。' })
+  } catch (error) {
+    toast.error({
+      title: '修改失败',
+      message: getErrorMessage(error, '无法应用修改建议。'),
+    })
+  } finally {
+    numberCheckItemBusyId.value = null
+  }
+}
+
+async function restoreNumberCheckReportItem(item: NumberCheckReportItem) {
+  if (numberCheckItemBusyId.value) {
+    return
+  }
+  numberCheckItemBusyId.value = item.id
+  try {
+    const report = await restoreNumberCheckItem(item.id)
+    setCurrentNumberCheckReport(report, { keepPage: true, keepSelection: true })
+    await refreshAfterNumberCheckChange()
+    toast.show({ title: '已恢复原译文', message: '译文已还原到修改前的内容。' })
+  } catch (error) {
+    toast.error({
+      title: '恢复失败',
+      message: getErrorMessage(error, '无法恢复译文。'),
+    })
+  } finally {
+    numberCheckItemBusyId.value = null
+  }
+}
+
+async function ignoreNumberCheckReportItem(item: NumberCheckReportItem, ignored: boolean) {
+  if (numberCheckItemBusyId.value) {
+    return
+  }
+  numberCheckItemBusyId.value = item.id
+  try {
+    const report = await setNumberCheckItemIgnored(item.id, ignored)
+    setCurrentNumberCheckReport(report, { keepPage: true, keepSelection: true })
+  } catch (error) {
+    toast.error({
+      title: ignored ? '忽略失败' : '恢复失败',
+      message: getErrorMessage(error, '无法更新报告项状态。'),
+    })
+  } finally {
+    numberCheckItemBusyId.value = null
+  }
+}
+
+const numberCheckApplicableCount = computed(() => (
+  (numberCheckReport.value?.items ?? []).filter(
+    (item) => item.can_apply && item.status !== 'ignored',
+  ).length
+))
+
+async function applyAllNumberCheck() {
+  if (!numberCheckReport.value || numberCheckBulkBusy.value) {
+    return
+  }
+  const ids = selectedNumberCheckItems.value.map((item) => item.id)
+  numberCheckBulkBusy.value = true
+  try {
+    const report = await applyAllNumberCheckItems(numberCheckReport.value.id, ids)
+    setCurrentNumberCheckReport(report, { keepPage: true })
+    await refreshAfterNumberCheckChange()
+    toast.show({
+      title: '一键修改完成',
+      message: `已应用 ${report.applied_count} 处修改`,
+    })
+  } catch (error) {
+    toast.error({
+      title: '一键修改失败',
+      message: getErrorMessage(error, '无法批量应用修改。'),
+    })
+  } finally {
+    numberCheckBulkBusy.value = false
+  }
+}
+
+async function focusNumberCheckReportItem(item: NumberCheckReportItem) {
+  if (locatingNumberCheckItemId.value) {
+    return
+  }
+  const mergeViewId = segmentStore.mergeViewId || props.mergeViewId || ''
+  const isMergeMode = Boolean(isMergeWorkbench.value && mergeViewId)
+  const fileRecord = segmentStore.fileRecord
+  if (!isMergeMode && !fileRecord) {
+    return
+  }
+
+  locatingNumberCheckItemId.value = item.id
+  try {
+    const currentPageIndex = editorSegments.value.findIndex((segment) => (
+      isMergeMode
+        ? segment.file_record_id === item.file_record_id && segment.sentence_id === item.sentence_id
+        : segment.sentence_id === item.sentence_id
+    ))
+    if (currentPageIndex >= 0) {
+      await focusEditorSegmentAtIndex(currentPageIndex)
+      return
+    }
+
+    const synced = await syncPendingWorkbenchEdits()
+    if (!synced) {
+      return
+    }
+
+    let data: SegmentPositionResponse
+    if (isMergeMode) {
+      data = await fetchMergeViewSegmentPosition(mergeViewId, item.file_record_id, item.sentence_id, {
+        pageSize: segmentStore.pageSize,
+      })
+    } else {
+      if (!fileRecord) {
+        return
+      }
+      data = (await http.get<SegmentPositionResponse>(
+        `/file-records/${fileRecord.id}/segments/${encodeURIComponent(item.sentence_id)}/position`,
+        { params: { page_size: segmentStore.pageSize } },
+      )).data
+    }
+    await clearSegmentFiltersForTermQANavigation()
+    await refreshSegmentPage(data.page, data.page_size)
+    const targetIndex = editorSegments.value.findIndex((segment) => (
+      isMergeMode
+        ? segment.file_record_id === item.file_record_id && segment.sentence_id === item.sentence_id
+        : segment.sentence_id === item.sentence_id
+    ))
+    if (targetIndex === -1) {
+      toast.warn('已切换到目标页，但未找到对应句段。')
+      return
+    }
+    await focusEditorSegmentAtIndex(targetIndex)
+  } catch (error) {
+    toast.error({
+      title: '跳转句段失败',
+      message: getErrorMessage(error, '无法定位报告中的句段。'),
+    })
+  } finally {
+    locatingNumberCheckItemId.value = null
+  }
+}
+
 async function downloadCurrentTermQAReport() {
   if (!termQAReport.value || downloadingTermQAReport.value) {
     return
@@ -7733,6 +8350,26 @@ onBeforeRouteLeave(async () => {
               </span>
             </button>
             <button
+              class="segment-editor-bottom-tool segment-editor-bottom-tool--qa"
+              :class="{ 'is-active': activeBottomTool === 'number-check' }"
+              type="button"
+              :title="numberCheckButtonTitle"
+              :aria-pressed="activeBottomTool === 'number-check'"
+              :disabled="loadingNumberCheck || generatingNumberCheck"
+              @click="void openNumberCheck()"
+            >
+              <Loader2 v-if="loadingNumberCheck || generatingNumberCheck" class="lucide-spin" :size="14" />
+              <Sigma v-else :size="14" />
+              <span>数字专检</span>
+              <span
+                v-if="numberCheckReport"
+                class="segment-editor-bottom-tool__badge"
+                :class="{ 'is-clean': numberCheckReport.active_issue_count === 0 }"
+              >
+                {{ numberCheckReport.active_issue_count }}
+              </span>
+            </button>
+            <button
               v-for="tool in bottomToolButtons"
               :key="tool.key"
               class="segment-editor-bottom-tool"
@@ -7766,7 +8403,7 @@ onBeforeRouteLeave(async () => {
               :class="[
                 `workbench-bottom-drawer--${activeBottomTool}`,
                 {
-                  'is-wide': activeBottomTool === 'split-preview' || activeBottomTool === 'qa-result',
+                  'is-wide': activeBottomTool === 'split-preview' || activeBottomTool === 'qa-result' || activeBottomTool === 'number-check',
                   'is-loading': bottomDrawerPreviewBusy,
                   'is-resizable': isBottomDrawerResizable,
                   'is-resizing': isBottomDrawerResizing,
@@ -7792,7 +8429,7 @@ onBeforeRouteLeave(async () => {
               />
 
               <button
-                v-if="activeBottomTool === 'history' || activeBottomTool === 'qa-result'"
+                v-if="activeBottomTool === 'history' || activeBottomTool === 'qa-result' || activeBottomTool === 'number-check'"
                 class="workbench-bottom-drawer__close"
                 type="button"
                 title="关闭"
@@ -7875,7 +8512,7 @@ onBeforeRouteLeave(async () => {
                 :history="activeSegmentHistory"
               />
 
-              <div v-else class="workbench-bottom-drawer__qa">
+              <div v-else-if="activeBottomTool === 'qa-result'" class="workbench-bottom-drawer__qa">
                 <div class="workbench-bottom-drawer__header workbench-bottom-drawer__header--qa">
                   <div class="workbench-bottom-drawer__header-lead">
                     <div class="section-title section-title--tight">QA 结果</div>
@@ -8106,6 +8743,259 @@ onBeforeRouteLeave(async () => {
                   >
                     <Loader2 v-if="generatingTermQAReport" class="lucide-spin" :size="14" />
                     生成 QA 结果
+                  </button>
+                </div>
+              </div>
+
+              <div v-else-if="activeBottomTool === 'number-check'" class="workbench-bottom-drawer__qa">
+                <div class="workbench-bottom-drawer__header workbench-bottom-drawer__header--qa">
+                  <div class="workbench-bottom-drawer__header-lead">
+                    <div class="section-title section-title--tight">数字专检</div>
+                    <p class="panel-subtitle">程序检查数值一致性，AI 复核可疑结果，按锚点替换修改译文。</p>
+                  </div>
+
+                  <div v-if="numberCheckReport" class="term-qa-dialog__summary">
+                    <span class="term-qa-stat">
+                      <em class="term-qa-stat__value">{{ numberCheckReport.active_issue_count }}</em>
+                      <span class="term-qa-stat__label">待处理</span>
+                    </span>
+                    <span class="term-qa-stat is-muted">
+                      <em class="term-qa-stat__value">{{ numberCheckReport.ignored_count }}</em>
+                      <span class="term-qa-stat__label">已忽略</span>
+                    </span>
+                    <span class="term-qa-dialog__meta">{{ numberCheckMetaText }}</span>
+                  </div>
+
+                  <div class="term-qa-dialog__actions">
+                    <div class="number-check__settings">
+                      <button
+                        class="button button--ghost term-qa-dialog__action-button"
+                        type="button"
+                        title="数字专检设置"
+                        @click="showNumberCheckSettings = true"
+                      >
+                        <Settings :size="14" />
+                        设置
+                      </button>
+                    </div>
+                    <select
+                      v-if="numberCheckReport"
+                      class="term-qa-dialog__filter-select"
+                      :value="numberCheckFilter"
+                      title="筛选报告项"
+                      @change="setNumberCheckFilter(($event.target as HTMLSelectElement).value as NumberCheckFilter)"
+                    >
+                      <option value="all">全部</option>
+                      <option value="program">程序疑误</option>
+                      <option value="ai">AI 判误</option>
+                      <option value="source">原文问题</option>
+                      <option value="modified">已修改</option>
+                      <option value="ignored">已忽略</option>
+                    </select>
+                    <label class="term-qa-dialog__toggle" title="生成时默认对程序筛选结果进行 AI 复核">
+                      <input type="checkbox" v-model="numberCheckAiEnabled">
+                      AI 复核
+                    </label>
+                    <button
+                      v-if="numberCheckReport"
+                      class="button button--ghost term-qa-dialog__action-button"
+                      type="button"
+                      :disabled="numberCheckApplicableCount === 0 || numberCheckBulkBusy"
+                      :title="selectedNumberCheckItems.length ? '对所选项按建议一键修改' : '对全部可修改项按建议一键修改'"
+                      @click="void applyAllNumberCheck()"
+                    >
+                      <Loader2 v-if="numberCheckBulkBusy" class="lucide-spin" :size="14" />
+                      一键修改{{ selectedNumberCheckItems.length ? ` ${selectedNumberCheckItems.length}` : '' }}
+                    </button>
+                    <button
+                      v-if="numberCheckReport"
+                      class="button button--ghost term-qa-dialog__action-button"
+                      type="button"
+                      :disabled="selectedNumberCheckItems.length === 0 || recheckingNumberCheck"
+                      title="对所选项运行 AI 复核"
+                      @click="void recheckSelectedNumberCheck()"
+                    >
+                      <Loader2 v-if="recheckingNumberCheck" class="lucide-spin" :size="14" />
+                      复核选中{{ selectedNumberCheckItems.length ? ` ${selectedNumberCheckItems.length}` : '' }}
+                    </button>
+                    <button
+                      class="button button--ghost term-qa-dialog__action-button"
+                      type="button"
+                      :disabled="!canRunNumberCheck"
+                      :title="numberCheckButtonTitle"
+                      @click="void generateNumberCheckReport()"
+                    >
+                      <Loader2 v-if="generatingNumberCheck" class="lucide-spin" :size="14" />
+                      {{ numberCheckReport ? '重新检查' : '开始检查' }}
+                    </button>
+                  </div>
+                </div>
+
+                <div v-if="generatingNumberCheck && numberCheckProgress" class="number-check__progress">
+                  <div class="number-check__progress-head">
+                    <span class="number-check__progress-text">{{ numberCheckProgressText }}</span>
+                    <span class="number-check__progress-pct">{{ numberCheckProgressPercent }}%</span>
+                  </div>
+                  <div class="number-check__progress-track">
+                    <div
+                      class="number-check__progress-fill"
+                      :style="{ width: numberCheckProgressPercent + '%' }"
+                    ></div>
+                  </div>
+                </div>
+
+                <div v-if="loadingNumberCheck && !generatingNumberCheck" class="empty-state">
+                  <Loader2 class="lucide-spin" :size="28" />
+                  正在加载数字专检结果
+                </div>
+
+                <template v-else-if="numberCheckReport">
+                  <div v-if="numberCheckFilteredItems.length === 0" class="empty-state">
+                    未发现数值问题。
+                  </div>
+                  <div v-else class="term-qa-dialog__table-wrap" @scroll="onNumberCheckScroll">
+                    <table class="term-qa-dialog__table number-check__table">
+                      <thead>
+                        <tr>
+                          <th class="term-qa-dialog__col-select">
+                            <input
+                              type="checkbox"
+                              :checked="allNumberCheckItemsSelected"
+                              :disabled="numberCheckSelectableItems.length === 0"
+                              aria-label="全选"
+                              @change="toggleAllNumberCheckItems(!allNumberCheckItemsSelected)"
+                            >
+                          </th>
+                          <th class="term-qa-dialog__col-segment">序号</th>
+                          <th v-if="isMergeWorkbench" class="term-qa-dialog__col-file">文件</th>
+                          <th class="number-check__col-reason">程序检查（错误原因）</th>
+                          <th class="number-check__col-target">修正后译文</th>
+                          <th class="number-check__col-status">状态</th>
+                          <th class="number-check__col-action">操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr
+                          v-for="item in visibleNumberCheckItems"
+                          :key="item.id"
+                          class="term-qa-dialog__row"
+                          :class="{
+                            'is-locating': locatingNumberCheckItemId === item.id,
+                            'is-ignored': item.ignored,
+                          }"
+                          tabindex="0"
+                          @click="void focusNumberCheckReportItem(item)"
+                          @keydown.enter.prevent="void focusNumberCheckReportItem(item)"
+                          @keydown.space.prevent="void focusNumberCheckReportItem(item)"
+                        >
+                          <td>
+                            <input
+                              type="checkbox"
+                              :checked="selectedNumberCheckItemIds.has(item.id)"
+                              :disabled="item.ignored"
+                              aria-label="选择报告项"
+                              @click.stop
+                              @change.stop="toggleNumberCheckItemSelection(item.id, $event)"
+                            >
+                          </td>
+                          <td>
+                            <span class="term-qa-dialog__segment" :title="item.sentence_id">
+                              <Loader2
+                                v-if="locatingNumberCheckItemId === item.id"
+                                class="lucide-spin"
+                                :size="13"
+                              />
+                              {{ formatTermQASegmentNumber(item.sentence_id) }}
+                            </span>
+                          </td>
+                          <td
+                            v-if="isMergeWorkbench"
+                            class="number-check__cell"
+                            :title="getNumberCheckFileName(item)"
+                          >{{ getNumberCheckFileName(item) }}</td>
+                          <td class="number-check__cell">
+                            <div class="number-check__reason">{{ item.error_reason }}</div>
+                            <div class="number-check__nums">
+                              原文 [{{ item.source_numbers.join(', ') }}] · 译文 [{{ item.target_numbers.join(', ') }}]
+                            </div>
+                          </td>
+                          <td class="number-check__cell">
+                            <div class="number-check__fix">
+                              <template v-if="numberCheckHasCorrection(item)">
+                                <template v-for="(part, partIndex) in numberCheckPreviewParts(item)" :key="partIndex">
+                                  <mark v-if="part.mark" class="number-check__diff">{{ part.text }}</mark>
+                                  <span v-else>{{ part.text }}</span>
+                                </template>
+                              </template>
+                              <span v-else class="number-check__no-fix">—</span>
+                            </div>
+                          </td>
+                          <td class="number-check__cell">
+                            <div class="number-check__status">
+                              <span
+                                v-for="(tag, tagIndex) in numberCheckStatusTags(item)"
+                                :key="tagIndex"
+                                class="number-check__status-tag"
+                                :class="`number-check__status-tag--${tag.tone}`"
+                              >{{ tag.text }}</span>
+                            </div>
+                          </td>
+                          <td>
+                            <div class="term-qa-dialog__inline-actions number-check__actions">
+                              <button
+                                v-if="!item.applied"
+                                class="button button--ghost term-qa-dialog__inline-action number-check__action"
+                                type="button"
+                                title="按锚点替换应用 AI 建议"
+                                :disabled="!item.can_apply || numberCheckItemBusyId === item.id"
+                                @click.stop="void applyNumberCheckReportItem(item)"
+                              >
+                                <Loader2 v-if="numberCheckItemBusyId === item.id" class="lucide-spin" :size="14" />
+                                修改
+                              </button>
+                              <button
+                                v-else
+                                class="button button--ghost term-qa-dialog__inline-action number-check__action"
+                                type="button"
+                                title="恢复修改前的译文"
+                                :disabled="numberCheckItemBusyId === item.id"
+                                @click.stop="void restoreNumberCheckReportItem(item)"
+                              >
+                                <Loader2 v-if="numberCheckItemBusyId === item.id" class="lucide-spin" :size="14" />
+                                恢复
+                              </button>
+                              <button
+                                class="button button--ghost term-qa-dialog__inline-action number-check__action"
+                                type="button"
+                                :title="item.ignored ? '取消忽略' : '忽略该项'"
+                                :disabled="numberCheckItemBusyId === item.id"
+                                @click.stop="void ignoreNumberCheckReportItem(item, !item.ignored)"
+                              >
+                                {{ item.ignored ? '取消忽略' : '忽略' }}
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                    <div v-if="numberCheckFilteredItems.length > 0" class="number-check__count">
+                      已显示 {{ numberCheckCountText }}
+                      <span v-if="numberCheckHasMore" class="number-check__count-hint">（向下滚动加载更多）</span>
+                    </div>
+                  </div>
+                </template>
+
+                <div v-else-if="!generatingNumberCheck" class="empty-state">
+                  暂无数字专检结果
+                  <button
+                    class="button"
+                    type="button"
+                    :disabled="!canRunNumberCheck"
+                    :title="numberCheckButtonTitle"
+                    @click="void generateNumberCheckReport()"
+                  >
+                    <Loader2 v-if="generatingNumberCheck" class="lucide-spin" :size="14" />
+                    开始检查
                   </button>
                 </div>
               </div>
@@ -8660,6 +9550,45 @@ onBeforeRouteLeave(async () => {
           <Loader2 v-if="savingQualityQASettings" class="lucide-spin" :size="14" />
           <Check v-else :size="14" />
           {{ savingQualityQASettings ? t('common.actions.saving') : t('common.actions.save') }}
+        </button>
+      </template>
+    </Modal>
+
+    <Modal
+      :open="showNumberCheckSettings"
+      title="数字专检设置"
+      width="min(420px, calc(100vw - 32px))"
+      @close="showNumberCheckSettings = false"
+    >
+      <div class="number-check__settings-dialog">
+        <div class="number-check__settings-group">
+          <div class="number-check__settings-label">AI 检查范围</div>
+          <label class="number-check__settings-option">
+            <input type="radio" value="program_only" v-model="numberCheckAiScope">
+            只检查程序判错的（推荐，速度快）
+          </label>
+          <label class="number-check__settings-option">
+            <input type="radio" value="all" v-model="numberCheckAiScope">
+            全部检查（含程序未判错句段，较慢、消耗更多）
+          </label>
+        </div>
+        <div class="number-check__settings-group">
+          <div class="number-check__settings-label">AI 模型</div>
+          <select class="term-qa-dialog__filter-select" v-model="numberCheckModel">
+            <option value="">使用配置默认模型</option>
+            <option
+              v-for="modelOption in llmModelOptions"
+              :key="modelOption.id"
+              :value="modelOption.id"
+            >{{ modelOption.name }}</option>
+          </select>
+        </div>
+        <p class="hint-text">设置在下次“开始检查 / 重新检查”时生效。</p>
+      </div>
+
+      <template #footer>
+        <button class="button button--primary" type="button" @click="showNumberCheckSettings = false">
+          完成
         </button>
       </template>
     </Modal>
@@ -10289,6 +11218,254 @@ onBeforeRouteLeave(async () => {
   min-height: 26px;
   padding: 3px 8px;
   font-size: 12px;
+}
+
+.term-qa-dialog__inline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.term-qa-dialog__filter-select {
+  min-height: 28px;
+  padding: 3px 8px;
+  font-size: 12px;
+  border: 1px solid #c5d6de;
+  border-radius: 6px;
+  background: #fff;
+  color: #2b3a40;
+  cursor: pointer;
+}
+
+.term-qa-dialog__filter-select:focus-visible {
+  outline: 2px solid rgba(0, 112, 192, 0.28);
+  outline-offset: -1px;
+  border-color: #0070c0;
+}
+
+.term-qa-dialog__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: #5a737b;
+  cursor: pointer;
+  user-select: none;
+}
+
+.number-check__col-reason {
+  width: 34%;
+}
+
+.number-check__col-target {
+  width: 34%;
+}
+
+.number-check__col-status {
+  width: 104px;
+}
+
+.number-check__col-action {
+  width: 124px;
+}
+
+.number-check__table {
+  border-collapse: collapse;
+  width: 100%;
+  table-layout: fixed;
+}
+
+.number-check__table thead th,
+.number-check__table tbody td {
+  border: 1px solid #dce5ea !important;
+  padding: 8px 10px;
+}
+
+.number-check__table thead th {
+  background: #f3f7f9;
+}
+
+.number-check__table .term-qa-dialog__col-select {
+  width: 40px;
+}
+
+.number-check__table .term-qa-dialog__col-segment {
+  width: 64px;
+}
+
+.number-check__table .term-qa-dialog__col-file {
+  width: 140px;
+}
+
+.number-check__cell {
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+  max-width: none;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.number-check__reason {
+  font-weight: 500;
+  line-height: 1.5;
+}
+
+.number-check__nums {
+  margin-top: 3px;
+  color: #5a737b;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.number-check__fix {
+  line-height: 1.5;
+}
+
+.number-check__actions {
+  gap: 6px;
+  flex-wrap: nowrap;
+}
+
+.number-check__action {
+  min-height: 32px;
+  padding: 6px 14px;
+  font-size: 13px;
+}
+
+.number-check__no-fix {
+  color: #9aaab1;
+}
+
+.number-check__progress {
+  display: grid;
+  gap: 8px;
+  padding: 16px 4px;
+}
+
+.number-check__progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  color: #2b3a40;
+}
+
+.number-check__progress-pct {
+  font-weight: 600;
+  color: #0070c0;
+}
+
+.number-check__progress-track {
+  height: 8px;
+  border-radius: 999px;
+  background: #e6eef2;
+  overflow: hidden;
+}
+
+.number-check__progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2e8be6, #0070c0);
+  transition: width 0.25s ease;
+}
+
+.number-check__status {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+}
+
+.number-check__status-tag {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+.number-check__status-tag--ok {
+  background: #e6f4ea;
+  color: #2e7d4f;
+}
+
+.number-check__status-tag--warn {
+  background: #fdecec;
+  color: #c0392b;
+}
+
+.number-check__status-tag--done {
+  background: #e8f0fe;
+  color: #1a5fb4;
+}
+
+.number-check__status-tag--muted {
+  background: #eef2f4;
+  color: #6b7a82;
+}
+
+.number-check__settings {
+  position: relative;
+}
+
+.number-check__settings-dialog {
+  display: grid;
+  gap: 16px;
+}
+
+.number-check__settings-group {
+  display: grid;
+  gap: 6px;
+}
+
+.number-check__settings-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #2b3a40;
+}
+
+.number-check__settings-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #40515a;
+  cursor: pointer;
+}
+
+.number-check__table .term-qa-dialog__issue-title,
+.number-check__table .term-qa-dialog__issue-suggestion,
+.number-check__table .term-qa-dialog__cell-text {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  word-break: break-word;
+  display: block;
+}
+
+.number-check__table td {
+  vertical-align: top;
+}
+
+.number-check__diff {
+  background: #fff3cd;
+  color: #8a6d00;
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+.number-check__count {
+  padding: 8px 4px;
+  font-size: 12px;
+  color: #5a737b;
+  text-align: center;
+}
+
+.number-check__count-hint {
+  color: #9aaab1;
 }
 
 .quality-qa-adjust-dialog {

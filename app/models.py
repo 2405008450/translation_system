@@ -1151,6 +1151,135 @@ class TermQAReportItem(Base):
     ignored_by: Mapped["User | None"] = relationship("User", foreign_keys=[ignored_by_id])
 
 
+class NumberCheckReport(Base):
+    __tablename__ = "number_check_reports"
+    __table_args__ = (
+        Index("ix_number_check_reports_project_id", "project_id"),
+        Index("ix_number_check_reports_file_record_id", "file_record_id"),
+        Index("ix_number_check_reports_created_by_id", "created_by_id"),
+        Index("ix_number_check_reports_created_at", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    file_record_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    scope: Mapped[str] = mapped_column(String(20), nullable=False, default="file")
+    file_ids: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default=text("'[]'"))
+    total_files: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    total_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    checked_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    program_issue_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    ai_issue_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    source_issue_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    ai_checked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="completed", server_default=text("'completed'"))
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+
+    project: Mapped["Project | None"] = relationship("Project")
+    file_record: Mapped["FileRecord | None"] = relationship("FileRecord")
+    created_by: Mapped["User | None"] = relationship("User", foreign_keys=[created_by_id])
+    items: Mapped[list["NumberCheckReportItem"]] = relationship(
+        "NumberCheckReportItem",
+        back_populates="report",
+        cascade="all, delete-orphan",
+    )
+
+
+class NumberCheckReportItem(Base):
+    __tablename__ = "number_check_report_items"
+    __table_args__ = (
+        Index("ix_number_check_report_items_report_id", "report_id"),
+        Index("ix_number_check_report_items_project_id", "project_id"),
+        Index("ix_number_check_report_items_file_record_id", "file_record_id"),
+        Index("ix_number_check_report_items_segment_id", "segment_id"),
+        Index("ix_number_check_report_items_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    report_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("number_check_reports.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    file_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    segment_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("segments.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    sentence_id: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    source_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    target_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    source_numbers: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default=text("'[]'"))
+    target_numbers: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default=text("'[]'"))
+    error_reason: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    ai_checked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    ai_is_correct: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=text("true"))
+    ai_errors: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default=text("'[]'"))
+    ai_source_issues: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default=text("'[]'"))
+    replace_anchor: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    suggested_value: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    is_source_consistent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    ai_error_status: Mapped[str] = mapped_column(String(40), nullable=False, default="", server_default=text("''"))
+    original_target_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    applied_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open", server_default=text("'open'"))
+    ignored_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    ignored_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    block_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    row_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cell_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+
+    report: Mapped["NumberCheckReport"] = relationship("NumberCheckReport", back_populates="items")
+    project: Mapped["Project | None"] = relationship("Project")
+    file_record: Mapped["FileRecord"] = relationship("FileRecord")
+    segment: Mapped["Segment | None"] = relationship("Segment")
+    ignored_by: Mapped["User | None"] = relationship("User", foreign_keys=[ignored_by_id])
+
+
 class SegmentQAIssue(Base):
     __tablename__ = "segment_qa_issues"
     __table_args__ = (

@@ -74,6 +74,8 @@ class MultiFormatExporter:
             return self._export_bilingual_docx(normalized_segments, base_name)
         if export_type == "bilingual_txt":
             return self._export_bilingual_txt(normalized_segments, base_name)
+        if export_type == "bilingual_excel":
+            return self._export_bilingual_excel(normalized_segments, base_name)
         if export_type == "tmx":
             return self._export_tmx(normalized_segments, base_name)
         if export_type in {"xliff", "xliff2"}:
@@ -523,6 +525,51 @@ class MultiFormatExporter:
             "\n".join(lines).encode("utf-8"),
             "text/plain; charset=utf-8",
             f"{base_name}-bilingual.txt",
+        )
+
+    def _export_bilingual_excel(
+        self,
+        segments: list[dict[str, Any]],
+        base_name: str,
+    ) -> tuple[bytes, str, str]:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "双语对照"
+
+        # 表头样式
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(fill_type="solid", fgColor="4472C4")
+        header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        ws.column_dimensions["A"].width = 50
+        ws.column_dimensions["B"].width = 50
+
+        ws.append(["原文", "译文"])
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_alignment
+
+        cell_alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        for segment in segments:
+            source_text = str(segment.get("source_text") or "")
+            if not source_text:
+                continue
+            target_text = str(segment.get("target_text") or "")
+            row_idx = ws.max_row + 1
+            ws.append([source_text, target_text])
+            for cell in ws[row_idx]:
+                cell.alignment = cell_alignment
+
+        buffer = BytesIO()
+        wb.save(buffer)
+        return (
+            buffer.getvalue(),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            f"{base_name}-bilingual.xlsx",
         )
 
     def _export_tmx(
