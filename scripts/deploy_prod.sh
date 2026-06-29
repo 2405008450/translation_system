@@ -70,9 +70,9 @@ case "$cmd" in
     compose build app
     compose up --force-recreate db-migrate
     if [[ "${USE_NGINX:-0}" == "1" ]]; then
-      compose up -d --force-recreate --no-deps app worker nginx
+      compose up -d --force-recreate --no-deps app worker pretranslation-worker nginx
     else
-      compose up -d --force-recreate --no-deps app worker
+      compose up -d --force-recreate --no-deps app worker pretranslation-worker
     fi
     compose ps
     ;;
@@ -81,9 +81,9 @@ case "$cmd" in
     ;;
   logs)
     if [[ "${USE_NGINX:-0}" == "1" ]]; then
-      compose logs -f --tail=200 app worker nginx "$@"
+      compose logs -f --tail=200 app worker pretranslation-worker nginx "$@"
     else
-      compose logs -f --tail=200 app worker "$@"
+      compose logs -f --tail=200 app worker pretranslation-worker "$@"
     fi
     ;;
   health)

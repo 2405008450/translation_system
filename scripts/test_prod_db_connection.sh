@@ -214,7 +214,7 @@ if [ "${DIRECT_OK}" -eq 0 ]; then
   echo "  修复示例（把密码换成 .env.prod 里要用的值）："
   echo "  ${COMPOSE_CMD[*]} exec postgres psql -U ${POSTGRES_USER} -d ${POSTGRES_DB} \\"
   echo "    -c \"ALTER USER ${POSTGRES_USER} WITH PASSWORD '${POSTGRES_PASSWORD}';\""
-  echo "  然后：${COMPOSE_CMD[*]} up -d --force-recreate pgbouncer app worker"
+  echo "  然后：${COMPOSE_CMD[*]} up -d --force-recreate pgbouncer app worker pretranslation-worker"
 elif [ "${PGBOUNCER_OK}" -eq 0 ]; then
   echo "• 直连成功但 PgBouncer 失败：常见是 PgBouncer 客户端认证配置问题（如 SASL/scram userlist 不匹配）。"
   echo "  1) 确认 docker-compose.prod.yml 中 pgbouncer 使用 AUTH_TYPE=plain（内网部署）"

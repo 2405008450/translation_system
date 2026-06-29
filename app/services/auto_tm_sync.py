@@ -210,12 +210,16 @@ def process_auto_tm_outbox(db: Session, *, batch_size: int = AUTO_TM_BATCH_SIZE)
         return 0
 
 
-def process_due_auto_tm_rematches(db: Session, *, force: bool = False) -> int:
+def process_due_auto_tm_rematches(db: Session, *, force: bool = False, max_files: int | None = None) -> int:
+    settings = get_settings()
+    if max_files is None:
+        max_files = int(getattr(settings, "auto_tm_rematch_max_files_per_run", 10) or 0)
     now = datetime.now()
     cutoff = now - AUTO_TM_REMATCH_AGE
     candidates = (
         db.query(AutoTMRematchQueue)
         .filter(AutoTMRematchQueue.status == "pending")
+        .order_by(AutoTMRematchQueue.first_pending_at.asc().nullsfirst(), AutoTMRematchQueue.id.asc())
         .all()
     )
     due_queues = [
@@ -232,6 +236,8 @@ def process_due_auto_tm_rematches(db: Session, *, force: bool = False) -> int:
         or queue.pending_entry_count >= AUTO_TM_REMATCH_COUNT_THRESHOLD
         or (queue.first_pending_at is not None and queue.first_pending_at <= cutoff)
     ]
+    if max_files and max_files > 0:
+        due_queues = due_queues[:max_files]
     refreshed_count = 0
     for queue in due_queues:
         queue.status = "running"

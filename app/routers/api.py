@@ -215,6 +215,11 @@ from app.services.language_detection import detect_upload_language
 from app.services.language_pairs import require_language_pair
 from app.services.matcher import get_tm_candidates_for_text, match_sentences_with_stats
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
+from app.services.tm_match_state import (
+    build_tm_match_signature,
+    is_tm_match_signature_current,
+    mark_tm_match_signature_current,
+)
 from app.services.notification_service import (
     build_resource_import_notification,
     build_save_to_tm_notification,
@@ -346,6 +351,8 @@ except ModuleNotFoundError:  # pragma: no cover - 本地未安装 ARQ 时使用 
 
 logger = logging.getLogger(__name__)
 _RESOURCE_IMPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="resource-import")
+ARQ_MAINTENANCE_QUEUE_NAME = "arq:maintenance"
+ARQ_PRETRANSLATION_QUEUE_NAME = "arq:pretranslation"
 router = APIRouter(dependencies=[Depends(get_current_user)])
 UPLOAD_READ_CHUNK_SIZE = 1024 * 1024
 
@@ -475,7 +482,12 @@ async def _enqueue_arq_import_task(task_id: str, payload: dict[str, Any]) -> boo
     redis_pool = None
     try:
         redis_pool = await arq_create_pool(redis_settings)
-        await redis_pool.enqueue_job("process_import_task_job", task_id, payload)
+        await redis_pool.enqueue_job(
+            "process_import_task_job",
+            task_id,
+            payload,
+            _queue_name=ARQ_MAINTENANCE_QUEUE_NAME,
+        )
         return True
     except Exception:
         logger.warning("enqueue ARQ import task failed, fallback to local background task", exc_info=True)
@@ -485,7 +497,11 @@ async def _enqueue_arq_import_task(task_id: str, payload: dict[str, Any]) -> boo
             await _close_arq_pool(redis_pool)
 
 
-async def _enqueue_arq_job(function_name: str, *args: Any) -> bool:
+async def _enqueue_arq_job(
+    function_name: str,
+    *args: Any,
+    queue_name: str = ARQ_MAINTENANCE_QUEUE_NAME,
+) -> bool:
     """通用 ARQ 任务入队：成功返回 True，未启用/失败返回 False 以便回退本地执行。"""
     settings = get_settings()
     if settings.import_queue_backend.lower() != "arq":
@@ -500,7 +516,7 @@ async def _enqueue_arq_job(function_name: str, *args: Any) -> bool:
     redis_pool = None
     try:
         redis_pool = await arq_create_pool(redis_settings)
-        await redis_pool.enqueue_job(function_name, *args)
+        await redis_pool.enqueue_job(function_name, *args, _queue_name=queue_name)
         return True
     except Exception:
         logger.warning(
@@ -1196,7 +1212,11 @@ async def auto_tm_rematch_background_job(ctx) -> None:
 
 
 async def _dispatch_pretranslation_run(run_id: UUID) -> None:
-    if await _enqueue_arq_job("pretranslation_run_job", str(run_id)):
+    if await _enqueue_arq_job(
+        "pretranslation_run_job",
+        str(run_id),
+        queue_name=ARQ_PRETRANSLATION_QUEUE_NAME,
+    ):
         return
     await asyncio.to_thread(_run_pretranslation_run, run_id)
 
@@ -1205,8 +1225,12 @@ async def pretranslation_run_job(ctx, run_id: str) -> None:
     await asyncio.to_thread(_run_pretranslation_run, UUID(run_id))
 
 
-class WorkerSettings:
-    max_jobs = max(int(get_settings().arq_max_jobs), 1)
+class MaintenanceWorkerSettings:
+    queue_name = ARQ_MAINTENANCE_QUEUE_NAME
+    max_jobs = max(
+        int(getattr(get_settings(), "arq_maintenance_max_jobs", None) or get_settings().arq_max_jobs),
+        1,
+    )
     functions = [
         process_import_task_job,
         tm_resource_import_job,
@@ -1215,9 +1239,21 @@ class WorkerSettings:
         spelling_grammar_qa_project_job,
         auto_tm_background_job,
         auto_tm_rematch_background_job,
+    ]
+    redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
+
+
+class PretranslationWorkerSettings:
+    queue_name = ARQ_PRETRANSLATION_QUEUE_NAME
+    max_jobs = max(int(get_settings().arq_pretranslation_max_jobs), 1)
+    functions = [
         pretranslation_run_job,
     ]
     redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
+
+
+class WorkerSettings(MaintenanceWorkerSettings):
+    pass
 
 
 class SegmentUpdate(BaseModel):
@@ -1613,6 +1649,7 @@ def _run_pretranslation_binding_stage(task_id: UUID, options: dict[str, Any]) ->
             db,
             user,
             operation_token=task.operation_token,
+            refresh_tm_matches=False,
         )
 
 
@@ -1639,6 +1676,23 @@ def _run_pretranslation_tm_stage(task_id: UUID, options: dict[str, Any]) -> None
         user = db.query(User).filter(User.id == task.run.created_by_id).first()
         if user is None:
             raise RuntimeError("预翻译发起用户不存在")
+        signature = build_tm_match_signature(
+            db,
+            file_record_id=task.file_record_id,
+            collection_ids=collection_ids,
+            threshold=float(options.get("tm_threshold") or 0.75),
+            skip_confirmed=bool(options.get("tm_skip_confirmed", True)),
+            overwrite_fuzzy=bool(options.get("tm_overwrite_fuzzy", True)),
+            auto_confirm_exact=bool(options.get("tm_auto_confirm_exact", True)),
+        )
+        if is_tm_match_signature_current(task.file_record, signature):
+            _update_pretranslation_task(
+                task_id,
+                progress=35,
+                message="TM 已是最新，跳过重复匹配",
+                current_action="tm_skipped",
+            )
+            return
         result = rematch_file_record(
             task.file_record_id,
             RematchRequest(
@@ -1652,6 +1706,9 @@ def _run_pretranslation_tm_stage(task_id: UUID, options: dict[str, Any]) -> None
             user,
             operation_token=task.operation_token,
         )
+        db.refresh(task.file_record)
+        mark_tm_match_signature_current(task.file_record, signature)
+        db.commit()
     _update_pretranslation_task(
         task_id,
         progress=35,
@@ -9806,6 +9863,15 @@ def rematch_file_record(
     if threshold < 0.5 or threshold > 1:
         raise HTTPException(status_code=400, detail="TM 匹配阈值必须在 0.50 到 1.00 之间。")
     threshold = round(threshold, 2)
+    tm_match_signature = build_tm_match_signature(
+        db,
+        file_record_id=file_record_id,
+        collection_ids=selected_collection_ids,
+        threshold=threshold,
+        skip_confirmed=payload.skip_confirmed,
+        overwrite_fuzzy=payload.overwrite_fuzzy,
+        auto_confirm_exact=payload.auto_confirm_exact,
+    )
 
     segments = list_segments_for_file_record(db, file_record_id)
     segments = _filter_writable_segments(db, file_record, current_user, segments)
@@ -9916,6 +9982,7 @@ def rematch_file_record(
         file_record.collection_id = selected_collection_ids[0]
         file_record.collection_ids_json = json.dumps([str(cid) for cid in selected_collection_ids])
     file_record.tm_match_threshold = threshold
+    mark_tm_match_signature_current(file_record, tm_match_signature)
 
     db.commit()
     return {
@@ -9933,6 +10000,7 @@ def patch_file_record_bindings(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
+    refresh_tm_matches: bool = Query(default=True, include_in_schema=False),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
@@ -10024,7 +10092,7 @@ def patch_file_record_bindings(
         file_record.collection_id,
         _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
     )
-    if before_collection_binding != after_collection_binding:
+    if refresh_tm_matches and before_collection_binding != after_collection_binding:
         db.flush()
         refresh_unconfirmed_segment_matches(
             db,

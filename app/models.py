@@ -266,6 +266,8 @@ class FileRecord(Base):
         default=0.8,
         server_default=text("0.8"),
     )
+    tm_match_signature: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tm_last_matched_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
     term_base_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("term_bases.id", ondelete="SET NULL"),

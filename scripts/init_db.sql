@@ -587,6 +587,8 @@ CREATE TABLE IF NOT EXISTS file_records (
     collection_id UUID REFERENCES memory_bases(id) ON DELETE SET NULL,
     collection_ids_json TEXT NOT NULL DEFAULT '[]',
     tm_match_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.8,
+    tm_match_signature VARCHAR(64),
+    tm_last_matched_at TIMESTAMP,
     term_base_id UUID REFERENCES term_bases(id) ON DELETE SET NULL,
     glossary_base_ids TEXT NOT NULL DEFAULT '[]',
     deadline TIMESTAMP,
@@ -629,6 +631,10 @@ ALTER TABLE IF EXISTS file_records
     ADD COLUMN IF NOT EXISTS collection_ids_json TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE IF EXISTS file_records
     ADD COLUMN IF NOT EXISTS tm_match_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.8;
+ALTER TABLE IF EXISTS file_records
+    ADD COLUMN IF NOT EXISTS tm_match_signature VARCHAR(64);
+ALTER TABLE IF EXISTS file_records
+    ADD COLUMN IF NOT EXISTS tm_last_matched_at TIMESTAMP;
 ALTER TABLE IF EXISTS file_records
     ADD COLUMN IF NOT EXISTS term_base_id UUID REFERENCES term_bases(id) ON DELETE SET NULL;
 ALTER TABLE IF EXISTS file_records
