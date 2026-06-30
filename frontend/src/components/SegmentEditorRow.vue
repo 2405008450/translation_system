@@ -222,7 +222,11 @@ const revisionTooltip = computed(() => {
 })
 const scorePercent = computed(() => {
   if (!props.segment.score || props.segment.score <= 0) return null
-  return Math.round(props.segment.score * 100)
+  const percent = Math.round(props.segment.score * 100)
+  if (props.segment.status !== 'exact' && props.segment.status !== 'confirmed') {
+    return Math.min(percent, 99)
+  }
+  return percent
 })
 
 // 通用的文本高亮函数

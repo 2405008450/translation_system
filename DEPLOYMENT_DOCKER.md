@@ -57,6 +57,14 @@ nano .env.prod
 
 nginx 的 `client_max_body_size` 在 `docker/nginx/default.conf`，默认 **500m**，需与 `UPLOAD_MAX_TOTAL_SIZE_MB` 保持一致。
 
+**队列并发（资源充足时可调）：**
+
+| 变量 | 推荐起点 | 说明 |
+|------|----------|------|
+| `ARQ_MAINTENANCE_MAX_JOBS` | 3 | 上传导入、资源导入、QA、自动 TM 重匹配等维护队列并发 |
+| `ARQ_PRETRANSLATION_MAX_JOBS` | 2 | 项目预翻译队列并发；每个任务内部仍受 `LLM_MAX_CONCURRENCY` 限制 |
+| `ARQ_MAX_JOBS` | 5 | 维护队列未单独设置时的全局兜底值 |
+
 密码含 `@`、`:`、`/`、`?`、`#` 等字符时，`DATABASE_URL` 须 URL 编码。
 
 ### `.env.prod` 和 `.env`

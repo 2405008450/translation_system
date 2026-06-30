@@ -29,6 +29,7 @@ EXACT_MATCH_BATCH_SIZE = 1000
 DEFAULT_FUZZY_MATCH_BATCH_SIZE = 50
 FUZZY_CANDIDATE_LIMIT = 3
 TM_CANDIDATES_LIMIT = 5
+FUZZY_MISMATCH_SCORE_CEILING = 0.99
 T = TypeVar("T")
 logger = logging.getLogger(__name__)
 
@@ -180,6 +181,7 @@ def get_tm_candidates(
         compare_text = normalize_match_text(row["source_normalized"]) or row["source_normalized"]
         sequence_score = SequenceMatcher(None, match_text, compare_text).ratio()
         final_score = max(float(row["trigram_score"]), sequence_score)
+        final_score = _cap_fuzzy_mismatch_score(final_score, match_text, compare_text)
 
         if final_score >= similarity_threshold:
             seen_sources.add(row["source_text"])
@@ -241,6 +243,15 @@ def _escape_html(text: str) -> str:
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
+
+
+def _cap_fuzzy_mismatch_score(score: float, query_match_text: str, compare_text: str) -> float:
+    safe_score = min(max(float(score or 0.0), 0.0), 1.0)
+    normalized_query = normalize_match_text(query_match_text) or query_match_text
+    normalized_compare = normalize_match_text(compare_text) or compare_text
+    if normalized_query and normalized_query == normalized_compare:
+        return safe_score
+    return min(safe_score, FUZZY_MISMATCH_SCORE_CEILING)
 
 
 def match_sentences_with_stats(
@@ -871,6 +882,7 @@ def _pick_best_fuzzy_candidates(
         final_score = base_score
         if auxiliary_score > source_score:
             final_score += min(auxiliary_score - source_score, 0.05)
+        final_score = _cap_fuzzy_mismatch_score(final_score, sentence.match_text, compare_text)
 
         if final_score >= similarity_threshold:
             scored_candidates.append({

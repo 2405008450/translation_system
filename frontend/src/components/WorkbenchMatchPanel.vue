@@ -79,6 +79,7 @@ const selectedRowId = ref('')
 let candidateRequestId = 0
 const CANDIDATE_DEBOUNCE_MS = 250
 const CANDIDATE_CACHE_TTL_MS = 30_000
+const FUZZY_DISPLAY_SCORE_CEILING = 0.99
 type CandidateCacheEntry = {
   candidates: TMMatchCandidate[]
   expiresAt: number
@@ -312,7 +313,7 @@ function buildReferenceExactRow(match: ReferenceExactMatch): MatchDisplayRow {
     id: `ref-exact-${match.segment_id}`,
     sourceLabel: '参阅材料',
     badge: formatScore(score),
-    tone: getMatchScoreTone(score),
+    tone: getMatchScoreTone(score, true),
     sourceText: match.source,
     compareText: null,
     targetText: match.target,
@@ -351,17 +352,19 @@ function buildReferenceFuzzyRow(match: ReferenceFuzzyMatch, index: number): Matc
 
 function buildTMRow(candidate: TMMatchCandidate, index: number): MatchDisplayRow {
   const collectionName = candidate.collection_name || props.collectionName || '记忆库'
+  const exactTextMatch = isExactTextMatch(props.activeSourceText, candidate.source_text)
+  const displayScore = normalizeDisplayScore(candidate.score, exactTextMatch)
   return {
     id: `tm-${index}`,
     sourceLabel: collectionName,
-    badge: formatScore(candidate.score),
-    tone: getMatchScoreTone(candidate.score),
+    badge: formatScore(displayScore),
+    tone: getMatchScoreTone(displayScore ?? 0, exactTextMatch),
     sourceText: candidate.source_text,
     compareText: props.activeSourceText || candidate.source_text,
     targetText: candidate.target_text,
     detailItems: buildDetailItems([
       ['记忆库名称', collectionName],
-      ['匹配率', formatScore(candidate.score)],
+      ['匹配率', formatScore(displayScore)],
       ['创建人', candidate.creator_name],
       ['创建时间', formatDateTime(candidate.created_at)],
       ['最近更新时间', formatDateTime(candidate.updated_at)],
@@ -448,13 +451,29 @@ function formatDateTime(isoString: string | null | undefined): string {
   ].join(' ')
 }
 
+function normalizeMatchText(value: string | null | undefined): string {
+  return (value || '').trim().replace(/\s+/g, ' ').replace(/[。！？!?.]+$/u, '').toLowerCase()
+}
+
+function isExactTextMatch(sourceText: string | null | undefined, matchedSourceText: string | null | undefined): boolean {
+  const normalizedSource = normalizeMatchText(sourceText)
+  const normalizedMatchedSource = normalizeMatchText(matchedSourceText)
+  return Boolean(normalizedSource && normalizedSource === normalizedMatchedSource)
+}
+
+function normalizeDisplayScore(score: number | null | undefined, exactTextMatch = false): number | null {
+  if (score === null || score === undefined || !Number.isFinite(score)) return null
+  const safeScore = Math.min(Math.max(score, 0), 1)
+  return exactTextMatch ? safeScore : Math.min(safeScore, FUZZY_DISPLAY_SCORE_CEILING)
+}
+
 function formatScore(score: number | null | undefined): string {
   if (score === null || score === undefined || !Number.isFinite(score)) return ''
   return `${Math.round(score * 100)}%`
 }
 
-function getMatchScoreTone(score: number): MatchRowTone {
-  if (score >= 1.0) return 'exact'
+function getMatchScoreTone(score: number, exactTextMatch = false): MatchRowTone {
+  if (exactTextMatch && score >= 1.0) return 'exact'
   if (score >= 0.8) return 'high'
   if (score >= 0.6) return 'medium'
   return 'low'

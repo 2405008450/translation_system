@@ -1244,11 +1244,17 @@ async def pretranslation_run_job(ctx, run_id: str) -> None:
     await asyncio.to_thread(_run_pretranslation_run, UUID(run_id))
 
 
+def _resolve_arq_worker_max_jobs(configured: int | None, fallback: int = 1) -> int:
+    if configured is None or configured <= 0:
+        configured = fallback
+    return max(int(configured), 1)
+
+
 class MaintenanceWorkerSettings:
     queue_name = ARQ_MAINTENANCE_QUEUE_NAME
-    max_jobs = max(
-        int(getattr(get_settings(), "arq_maintenance_max_jobs", None) or get_settings().arq_max_jobs),
-        1,
+    max_jobs = _resolve_arq_worker_max_jobs(
+        get_settings().arq_maintenance_max_jobs,
+        get_settings().arq_max_jobs,
     )
     functions = [
         process_import_task_job,
@@ -1264,7 +1270,10 @@ class MaintenanceWorkerSettings:
 
 class PretranslationWorkerSettings:
     queue_name = ARQ_PRETRANSLATION_QUEUE_NAME
-    max_jobs = max(int(get_settings().arq_pretranslation_max_jobs), 1)
+    max_jobs = _resolve_arq_worker_max_jobs(
+        get_settings().arq_pretranslation_max_jobs,
+        1,
+    )
     functions = [
         pretranslation_run_job,
     ]

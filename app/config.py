@@ -63,8 +63,9 @@ class Settings(BaseSettings):
     redis_url: str | None = None
     import_queue_backend: str = "local"
     arq_max_jobs: int = 1
-    arq_maintenance_max_jobs: int = 1
-    arq_pretranslation_max_jobs: int = 1
+    # 为空或 0 时继承 ARQ_MAX_JOBS；生产环境可单独设置维护队列/预翻译队列并发。
+    arq_maintenance_max_jobs: int | None = None
+    arq_pretranslation_max_jobs: int | None = None
     auto_tm_rematch_max_files_per_run: int = 10
     aspose_words_license_path: str | None = None
     libreoffice_soffice_path: str | None = None
