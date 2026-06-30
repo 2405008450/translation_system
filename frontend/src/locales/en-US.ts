@@ -454,6 +454,8 @@ const overrides = {
         modelTipTitle: 'Model selection tip',
         modelTipBody: 'For normal pre-translation, use a fast model such as Gemini 3 Flash Preview or GPT-5.4 Mini. If the rule set is large or terminology/style requirements are strict, use Gemini 3.1 Pro Preview or GPT-5.5. These models are called through OpenRouter.',
         scopeHint: 'The default flow matches TM first, then sends only fuzzy and unmatched segments to the LLM. 100% TM matches usually do not need model rewriting.',
+        contextMode: 'Paragraph context',
+        contextModeTitle: 'Off: stable sentence mode. On: strict paragraph context mode with structured JSON output.',
         scopes: {
           all: 'Fuzzy matches + no matches (recommended)',
           fuzzyOnly: 'Only fuzzy matches',
