@@ -460,7 +460,7 @@ const overrides = {
           all: 'Fuzzy matches + no matches (recommended)',
           fuzzyOnly: 'Only fuzzy matches',
           noneOnly: 'Only no matches',
-          emptyTargetOnly: 'Only empty targets',
+          emptyTargetOnly: 'Only empty targets (ignore match status)',
           allWithExact: 'Include 100% TM matches (risky)',
         },
       },

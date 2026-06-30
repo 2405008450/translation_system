@@ -2354,6 +2354,15 @@ export const useSegmentStore = defineStore('segment', () => {
       return
     }
 
+    if (event === 'skipped') {
+      llmProcessedCount.value += 1
+      llmMessage.value = translate('stores.segment.llmProgress', {
+        processed: llmProcessedCount.value,
+        planned: Math.max(llmPlannedCount.value, llmProcessedCount.value),
+      })
+      return
+    }
+
     if (event === 'error') {
       llmProcessedCount.value += 1
       llmErrorCount.value += 1

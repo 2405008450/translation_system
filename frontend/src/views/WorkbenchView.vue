@@ -1509,7 +1509,7 @@ const segmentScreeningStatusOptions: SegmentScreeningOption[] = [
 const segmentScreeningMatchOptions: SegmentScreeningOption[] = [
   { value: 'context_102', label: '102%匹配', disabled: true, hint: '暂无上下文匹配字段，先占位。' },
   { value: 'context_101', label: '101%匹配', disabled: true, hint: '暂无上下文匹配字段，先占位。' },
-  { value: 'exact', label: '100%匹配' },
+  { value: 'exact', label: '精确匹配' },
   { value: 'fuzzy', label: '模糊匹配' },
   { value: 'none', label: '无匹配' },
   { value: 'machine_translation', label: '机器翻译' },

@@ -6,6 +6,7 @@ import InteractiveDiffText from './InteractiveDiffText.vue'
 
 import { getLLMModelShortLabel } from '../constants/llm'
 import { getSegmentSourceMeta, getSegmentStatusMeta } from '../constants/status'
+import { useAuthStore } from '../stores/auth'
 import type { RevisionDisplaySettings, Segment, SegmentQAIssue, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
 import { findTermTextRanges } from '../utils/termMatching'
 import { computeDiff } from '../utils/textDiff'
@@ -67,6 +68,7 @@ const emit = defineEmits<{
 
 const editorRef = ref<HTMLDivElement | null>(null)
 const sourceEditorRef = ref<HTMLDivElement | null>(null)
+const authStore = useAuthStore()
 const isFocused = ref(false)
 const isSourceFocused = ref(false)
 const isComposing = ref(false)
@@ -137,8 +139,12 @@ const isEmptyTarget = computed(() => {
 })
 const statusMeta = computed(() => getSegmentStatusMeta(props.segment.status))
 const sourceMeta = computed(() => getSegmentSourceMeta(props.segment.source))
+const shouldHideLLMModel = computed(() => authStore.isExternalTranslator)
 const sourceLabel = computed(() => {
   if (props.segment.source === 'llm') {
+    if (shouldHideLLMModel.value) {
+      return '机器翻译'
+    }
     const modelId = props.segment.llm_model?.trim()
     return modelId ? getLLMModelShortLabel(modelId) : sourceMeta.value.label
   }
@@ -167,10 +173,15 @@ const projectSyncToggleLabel = computed(() => (
   props.segment.project_sync_disabled ? '开启同步' : '关闭同步'
 ))
 const sourceTitle = computed(() => {
-  if (props.segment.source === 'llm' && props.segment.llm_model?.trim()) {
-    return props.segment.llm_provider
-      ? `${props.segment.llm_model} (${props.segment.llm_provider})`
-      : props.segment.llm_model
+  if (props.segment.source === 'llm') {
+    if (shouldHideLLMModel.value) {
+      return '机器翻译'
+    }
+    if (props.segment.llm_model?.trim()) {
+      return props.segment.llm_provider
+        ? `${props.segment.llm_model} (${props.segment.llm_provider})`
+        : props.segment.llm_model
+    }
   }
   return sourceMeta.value.label
 })
@@ -2101,8 +2112,8 @@ watch(
         class="segment-row__confirm-mark"
         aria-label="已确认"
       >√</span>
-      <span v-if="scorePercent !== null" class="segment-row__match-rate">
-        {{ scorePercent }}%
+      <span v-if="scorePercent !== null" class="segment-row__match-rate" :title="statusMeta.label">
+        {{ segment.status === 'exact' ? `${statusMeta.label} · ${scorePercent}%` : `${scorePercent}%` }}
       </span>
       <span
         v-if="showStatusTag && segment.status !== 'confirmed' && scorePercent === null"
@@ -2248,6 +2259,7 @@ watch(
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  max-width: 100%;
   min-height: 18px;
   padding: 0 4px;
   border-radius: 2px;
@@ -2256,6 +2268,9 @@ watch(
   font-size: 11px;
   font-weight: 700;
   line-height: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .segment-row__compact-tag {

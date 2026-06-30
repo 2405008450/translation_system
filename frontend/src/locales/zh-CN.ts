@@ -684,7 +684,7 @@ export default {
           all: '模糊匹配 + 无匹配（推荐）',
           fuzzyOnly: '只处理模糊匹配',
           noneOnly: '只处理无匹配',
-          emptyTargetOnly: '只处理空译文',
+          emptyTargetOnly: '只处理空译文（不看匹配状态）',
           allWithExact: '包含 100% 记忆匹配（风险选项）',
         },
       },

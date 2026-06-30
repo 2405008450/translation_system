@@ -217,6 +217,10 @@ from app.services.language_detection import detect_upload_language
 from app.services.language_pairs import require_language_pair
 from app.services.matcher import get_tm_candidates_for_text, match_sentences_with_stats
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
+from app.services.segment_status import (
+    is_llm_protected_reuse_segment,
+    resolve_unconfirmed_segment_status,
+)
 from app.services.tm_match_state import (
     build_tm_match_signature,
     is_tm_match_signature_current,
@@ -1803,6 +1807,7 @@ async def _run_pretranslation_llm_stage(task_id: UUID, options: dict[str, Any]) 
         processed = 0
         updated = 0
         errors = 0
+        skipped = 0
         last_heartbeat = datetime.min
         async for chunk in response.body_iterator:
             for event_name, payload in _parse_sse_events(chunk):
@@ -1848,11 +1853,25 @@ async def _run_pretranslation_llm_stage(task_id: UUID, options: dict[str, Any]) 
                         current_action="writing_result",
                         error=payload.get("message") or None,
                     )
+                elif event_name == "skipped":
+                    processed += 1
+                    skipped += 1
+                    progress = 45 + int(min(processed, max(total, 1)) / max(total, 1) * 45)
+                    _update_pretranslation_task(
+                        task_id,
+                        processed_segments=processed,
+                        updated_segments=updated,
+                        error_segments=errors,
+                        progress=min(progress, 95),
+                        message=f"LLM pretranslation running: {processed}/{total or processed}",
+                        current_action="writing_result",
+                    )
                 elif event_name == "complete":
                     total = int(payload.get("total") or total)
                     updated = int(payload.get("updated_count") or updated)
                     errors = int(payload.get("error_count") or errors)
-                    processed = max(processed, updated + errors)
+                    skipped = int(payload.get("skipped_count") or skipped)
+                    processed = max(processed, updated + errors + skipped)
                     _update_pretranslation_task(
                         task_id,
                         processed_segments=processed,
@@ -4154,6 +4173,71 @@ def _parse_optional_datetime(value: str | None) -> datetime | None:
         return None
 
 
+LLM_STATUSES_BY_SCOPE = {
+    "fuzzy_only": {"fuzzy"},
+    "none_only": {"none"},
+    "all": {"fuzzy", "none"},
+    "all_with_exact": {"exact", "fuzzy", "none"},
+}
+LLM_PROTECTED_REUSE_ALLOWED_SCOPES = {"current_segment", "all_with_exact"}
+
+
+def _llm_scope_allows_protected_reuse(scope: str) -> bool:
+    return (scope or "").strip().lower() in LLM_PROTECTED_REUSE_ALLOWED_SCOPES
+
+
+def _llm_scope_allows_segment(
+    segment: Any,
+    scope: str,
+    *,
+    sentence_id: str | None = None,
+) -> bool:
+    normalized_scope = (scope or "all").strip().lower()
+    if normalized_scope == "current_segment":
+        return getattr(segment, "sentence_id", None) == normalize_text(sentence_id or "")
+    if normalized_scope == "empty_target_only":
+        return not normalize_text(getattr(segment, "target_text", "") or "")
+    statuses = LLM_STATUSES_BY_SCOPE.get(normalized_scope)
+    return bool(statuses is not None and getattr(segment, "status", None) in statuses)
+
+
+def _llm_segment_should_translate(
+    segment: Any,
+    scope: str,
+    *,
+    sentence_id: str | None = None,
+) -> bool:
+    if not _llm_scope_allows_segment(segment, scope, sentence_id=sentence_id):
+        return False
+    if _llm_scope_allows_protected_reuse(scope):
+        return True
+    return not is_llm_protected_reuse_segment(segment)
+
+
+def _get_llm_write_skip_reason(segment: Segment, task: LLMTranslationTask, scope: str) -> str | None:
+    base_version = int(getattr(task, "base_version", 0) or 0)
+    current_version = int(getattr(segment, "version", 0) or 0)
+    version_changed = bool(base_version and current_version != base_version)
+
+    if (segment.source_text or "") != (task.source_text or ""):
+        return "句段原文已变化，已跳过 LLM 写回。"
+    if (
+        version_changed
+        and not _llm_scope_allows_protected_reuse(scope)
+        and is_llm_protected_reuse_segment(segment)
+    ):
+        return "句段已被 TM 或项目同步更新为 100% 复用结果，已跳过 LLM 写回。"
+    if version_changed and not _llm_scope_allows_segment(
+        segment,
+        scope,
+        sentence_id=task.sentence_id,
+    ):
+        return "句段状态已变化，不再属于本次 LLM 处理范围，已跳过写回。"
+    if version_changed and (segment.target_text or "") != (task.base_target_text or ""):
+        return "句段译文已在 LLM 返回前被更新，已跳过写回。"
+    return None
+
+
 def _build_llm_translation_tasks(
     db: Session,
     file_record_id: UUID,
@@ -4166,12 +4250,7 @@ def _build_llm_translation_tasks(
     sentence_id: str | None = None,
     source_filename: str | None = None,
 ) -> list[LLMTranslationTask]:
-    statuses_by_scope = {
-        "fuzzy_only": {"fuzzy"},
-        "none_only": {"none"},
-        "all": {"fuzzy", "none"},
-        "all_with_exact": {"exact", "fuzzy", "none"},
-    }
+    statuses_by_scope = LLM_STATUSES_BY_SCOPE
     target_statuses: set[str] | None = None
     current_sentence_id = normalize_text(sentence_id or "")
     if scope == "current_segment":
@@ -4207,6 +4286,12 @@ def _build_llm_translation_tasks(
             if normalize_text(segment.target_text or ""):
                 should_translate = False
         elif target_statuses is None or segment.status not in target_statuses:
+            should_translate = False
+        if should_translate and not _llm_segment_should_translate(
+            segment,
+            scope,
+            sentence_id=current_sentence_id,
+        ):
             should_translate = False
 
         if not should_translate and not include_context:
@@ -4247,6 +4332,10 @@ def _build_llm_translation_tasks(
                 glossary_matches=glossary_matches_by_source.get(segment.source_text, []),
                 should_translate=should_translate,
                 project_sync_disabled=bool(getattr(segment, "project_sync_disabled", False)),
+                base_version=int(getattr(segment, "version", 0) or 0) or None,
+                base_status=getattr(segment, "status", None),
+                base_source=getattr(segment, "source", None),
+                base_target_text=getattr(segment, "target_text", "") or "",
             )
         )
 
@@ -8793,17 +8882,7 @@ def _notify_tm_collections_changed(
 
 
 def _resolve_unconfirmed_segment_status(segment: Segment) -> str:
-    if not normalize_text(segment.target_text):
-        return "none"
-
-    score = float(segment.score or 0)
-    source_text = normalize_match_text(segment.source_text or "")
-    matched_source_text = normalize_match_text(segment.matched_source_text or "")
-    if score >= 0.999 or (matched_source_text and matched_source_text == source_text):
-        return "exact"
-    if score > 0 or matched_source_text:
-        return "fuzzy"
-    return "none"
+    return resolve_unconfirmed_segment_status(segment)
 
 
 def _apply_segment_scope_filter(query, scope: str):
@@ -13226,6 +13305,19 @@ async def llm_translate_file_record(
                         ))
                         continue
 
+                    if target_task is not None:
+                        skip_reason = _get_llm_write_skip_reason(segment, target_task, body.scope)
+                        if skip_reason:
+                            events.append((
+                                "skipped",
+                                {
+                                    "sentence_id": sentence_id,
+                                    "status": segment.status,
+                                    "message": skip_reason,
+                                },
+                            ))
+                            continue
+
                     try:
                         with fdb.begin_nested():
                             before_text = segment.target_text
@@ -13315,6 +13407,7 @@ async def llm_translate_file_record(
         db.close()
         updated_count = 0
         error_count = 0
+        skipped_count = 0
         total_count = sum(1 for task in translation_tasks if task.should_translate)
 
         yield _sse_event(
@@ -13354,7 +13447,7 @@ async def llm_translate_file_record(
             return bool(callable(request_cancel_check) and request_cancel_check())
 
         async def flush_pending():
-            nonlocal updated_count, error_count, pending_results
+            nonlocal updated_count, error_count, skipped_count, pending_results
             if not pending_results:
                 return
             batch = pending_results
@@ -13364,6 +13457,8 @@ async def llm_translate_file_record(
             for event_name, event_data in events:
                 if event_name == "error":
                     error_count += 1
+                elif event_name == "skipped":
+                    skipped_count += 1
                 yield _sse_event(event_name, event_data)
 
         async for result in iter_batch_translate(
@@ -13411,6 +13506,7 @@ async def llm_translate_file_record(
                     "file_record_id": str(file_record_id),
                     "updated_count": updated_count,
                     "error_count": error_count,
+                    "skipped_count": skipped_count,
                     "total": total_count,
                 },
             )
