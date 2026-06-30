@@ -526,7 +526,7 @@ function buildTaskStatusText(task: PretranslationTaskStatus) {
   if (task.updated_segments > 0 || task.error_segments > 0) {
     parts.push(`成功 ${task.updated_segments}，失败 ${task.error_segments}`)
   }
-  if (task.error && task.status === 'failed') {
+  if (task.error && (task.status === 'failed' || task.error_segments > 0)) {
     parts.push(task.error)
   }
   return parts.filter(Boolean).join(' · ')
@@ -1369,7 +1369,7 @@ async function startPreTranslateTaskRun() {
       llm_scope: llmScope.value,
       llm_provider: llmProvider.value,
       llm_model: llmModel.value || null,
-      llm_translation_unit: 'paragraph',
+      llm_translation_unit: 'sentence',
       guideline_template_id: selectedGuidelineTemplateId.value || null,
       temporary_prompt: llmGuidelines.value,
     })
