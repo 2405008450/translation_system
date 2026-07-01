@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import axios from 'axios'
+import { Pencil, Save, Trash2, X } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
@@ -10,12 +12,18 @@ import type {
   Segment,
   TermEntryRecord,
   TermMatch,
+  TMEntryRecord,
   TMMatchCandidate,
   WorkbenchQAResultItem,
 } from '../types/api'
 import { http } from '../api/http'
+import { useConfirm } from '../composables/useConfirm'
+import { pushToast } from '../composables/useToast'
+import { useAuthStore } from '../stores/auth'
 import { hasTermTextMatch } from '../utils/termMatching'
 import DiffText from './DiffText.vue'
+
+type EditableMatchKind = 'tm' | 'term'
 
 type MatchedTermDisplay = {
   id: string
@@ -23,7 +31,9 @@ type MatchedTermDisplay = {
   term_base_name: string | null
   source_text: string
   target_text: string
+  creator_id: string | null
   creator_name: string | null
+  last_modified_by_id: string | null
   last_modified_by_name: string | null
   created_at: string | null
   updated_at: string | null
@@ -50,6 +60,10 @@ type MatchDisplayRow = {
   targetTitle: string
   applyText: string
   applyMode: MatchApplyMode
+  editableKind: EditableMatchKind | null
+  entryId: string | null
+  creatorId: string | null
+  canEdit: boolean
 }
 
 const props = defineProps<{
@@ -69,13 +83,24 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'replaceText', text: string): void
   (e: 'appendText', text: string): void
+  (e: 'resourceEntryChanged', kind: EditableMatchKind): void
 }>()
 
 const { t } = useI18n()
+const authStore = useAuthStore()
+const confirm = useConfirm()
 
 const tmCandidates = ref<TMMatchCandidate[]>([])
 const loadingCandidates = ref(false)
 const selectedRowId = ref('')
+const editingRowId = ref('')
+const editSourceText = ref('')
+const editTargetText = ref('')
+const editMessage = ref('')
+const savingEntry = ref(false)
+const deletingEntry = ref(false)
+const hiddenTermEntryIds = ref<Set<string>>(new Set())
+const termEntryOverrides = ref<Record<string, TermEntryRecord>>({})
 let candidateRequestId = 0
 const CANDIDATE_DEBOUNCE_MS = 250
 const CANDIDATE_CACHE_TTL_MS = 30_000
@@ -91,41 +116,58 @@ const termEntryById = computed(() => {
   return new Map(props.termEntries.map((entry) => [entry.id, entry]))
 })
 
+const currentUserId = computed(() => authStore.user?.id || '')
+
 const matchedTerms = computed<MatchedTermDisplay[]>(() => {
   if (!props.activeSourceText) return []
+  const hiddenIds = hiddenTermEntryIds.value
+  const overrides = termEntryOverrides.value
 
   if (props.termMatches.length > 0) {
-    return props.termMatches.map((match) => {
+    return props.termMatches.map((match): MatchedTermDisplay | null => {
+      if (hiddenIds.has(match.term_id)) return null
       const entry = termEntryById.value.get(match.term_id)
+      const override = overrides[match.term_id]
+      const sourceText = override?.source_text ?? entry?.source_text ?? match.source_text
+      const targetText = override?.target_text ?? entry?.target_text ?? match.target_text
+      if (!hasTermTextMatch(props.activeSourceText, sourceText)) return null
       return {
         id: match.term_id,
-        term_base_id: match.term_base_id ?? entry?.term_base_id ?? null,
+        term_base_id: override?.term_base_id ?? match.term_base_id ?? entry?.term_base_id ?? null,
         term_base_name: match.term_base_name ?? null,
-        source_text: match.source_text,
-        target_text: match.target_text,
-        creator_name: entry?.creator_name ?? null,
-        last_modified_by_name: entry?.last_modified_by_name ?? null,
-        created_at: entry?.created_at ?? null,
-        updated_at: entry?.updated_at ?? null,
+        source_text: sourceText,
+        target_text: targetText,
+        creator_id: override?.creator_id ?? entry?.creator_id ?? match.creator_id ?? null,
+        creator_name: override?.creator_name ?? entry?.creator_name ?? match.creator_name ?? null,
+        last_modified_by_id: override?.last_modified_by_id ?? entry?.last_modified_by_id ?? match.last_modified_by_id ?? null,
+        last_modified_by_name: override?.last_modified_by_name ?? entry?.last_modified_by_name ?? match.last_modified_by_name ?? null,
+        created_at: override?.created_at ?? entry?.created_at ?? match.created_at ?? null,
+        updated_at: override?.updated_at ?? entry?.updated_at ?? match.updated_at ?? null,
       }
-    })
+    }).filter((term): term is MatchedTermDisplay => term !== null)
   }
 
   return props.termEntries
-    .filter((entry) => hasTermTextMatch(props.activeSourceText, entry.source_text))
+    .filter((entry) => !hiddenIds.has(entry.id))
     .slice()
+    .map((entry) => termEntryOverrides.value[entry.id] || entry)
+    .filter((entry) => hasTermTextMatch(props.activeSourceText, entry.source_text))
     .sort((left, right) => right.source_text.length - left.source_text.length)
-    .map((entry) => ({
-      id: entry.id,
-      term_base_id: entry.term_base_id,
-      term_base_name: props.termBaseId === entry.term_base_id ? props.termBaseName : null,
-      source_text: entry.source_text,
-      target_text: entry.target_text,
-      creator_name: entry.creator_name,
-      last_modified_by_name: entry.last_modified_by_name ?? null,
-      created_at: entry.created_at,
-      updated_at: entry.updated_at,
-    }))
+    .map((entry) => {
+      return {
+        id: entry.id,
+        term_base_id: entry.term_base_id,
+        term_base_name: props.termBaseId === entry.term_base_id ? props.termBaseName : null,
+        source_text: entry.source_text,
+        target_text: entry.target_text,
+        creator_id: entry.creator_id ?? null,
+        creator_name: entry.creator_name,
+        last_modified_by_id: entry.last_modified_by_id ?? null,
+        last_modified_by_name: entry.last_modified_by_name ?? null,
+        created_at: entry.created_at,
+        updated_at: entry.updated_at,
+      }
+    })
 })
 
 const currentSegmentRefExactMatch = computed<ReferenceExactMatch | null>(() => {
@@ -161,6 +203,7 @@ const matchRows = computed<MatchDisplayRow[]>(() => {
   currentSegmentRefTermMatch.value?.terms.forEach((term, index) => {
     rows.push({
       id: `ref-term-${index}-${term.source}`,
+      ...buildReadonlyRowMeta(),
       sourceLabel: '参阅材料',
       badge: 'TB',
       tone: 'term',
@@ -307,10 +350,39 @@ watch(
   { immediate: true },
 )
 
+watch(selectedRowId, () => {
+  resetEntryEdit()
+})
+
+function buildReadonlyRowMeta() {
+  return {
+    editableKind: null,
+    entryId: null,
+    creatorId: null,
+    canEdit: false,
+  }
+}
+
+function buildEditableRowMeta(
+  kind: EditableMatchKind,
+  entryId: string | null | undefined,
+  creatorId: string | null | undefined,
+) {
+  const normalizedEntryId = entryId || null
+  const normalizedCreatorId = creatorId || null
+  return {
+    editableKind: normalizedEntryId ? kind : null,
+    entryId: normalizedEntryId,
+    creatorId: normalizedCreatorId,
+    canEdit: Boolean(normalizedEntryId && normalizedCreatorId && normalizedCreatorId === currentUserId.value),
+  }
+}
+
 function buildReferenceExactRow(match: ReferenceExactMatch): MatchDisplayRow {
   const score = Number.isFinite(match.similarity) ? match.similarity : 1
   return {
     id: `ref-exact-${match.segment_id}`,
+    ...buildReadonlyRowMeta(),
     sourceLabel: '参阅材料',
     badge: formatScore(score),
     tone: getMatchScoreTone(score, true),
@@ -332,6 +404,7 @@ function buildReferenceExactRow(match: ReferenceExactMatch): MatchDisplayRow {
 function buildReferenceFuzzyRow(match: ReferenceFuzzyMatch, index: number): MatchDisplayRow {
   return {
     id: `ref-fuzzy-${index}-${match.segment_id}`,
+    ...buildReadonlyRowMeta(),
     sourceLabel: '参阅材料',
     badge: formatScore(match.similarity),
     tone: getMatchScoreTone(match.similarity),
@@ -360,7 +433,8 @@ function buildTMRow(candidate: TMMatchCandidate, index: number): MatchDisplayRow
     candidate.source_text,
   )
   return {
-    id: `tm-${index}`,
+    id: `tm-${candidate.entry_id || index}`,
+    ...buildEditableRowMeta('tm', candidate.entry_id ?? null, candidate.creator_id ?? null),
     sourceLabel: collectionName,
     badge: formatScore(displayScore),
     tone: getMatchScoreTone(displayScore ?? 0, exactTextMatch),
@@ -385,6 +459,7 @@ function buildTermRow(term: MatchedTermDisplay, index: number): MatchDisplayRow 
   const termBaseName = term.term_base_name || props.termBaseName || '术语库'
   return {
     id: `term-${index}-${term.id}`,
+    ...buildEditableRowMeta('term', term.id, term.creator_id),
     sourceLabel: termBaseName,
     badge: 'TB',
     tone: 'term',
@@ -412,6 +487,7 @@ function buildQATermRow(item: WorkbenchQAResultItem, index: number): MatchDispla
   const termBaseName = item.term_base_name || props.termBaseName || '术语库'
   return {
     id: `qa-term-${index}-${item.id}`,
+    ...buildReadonlyRowMeta(),
     sourceLabel: termBaseName,
     badge: 'TB',
     tone: 'term',
@@ -540,6 +616,120 @@ function selectMatchRow(row: MatchDisplayRow) {
   selectedRowId.value = row.id
 }
 
+function getErrorMessage(error: unknown, fallback: string) {
+  if (axios.isAxiosError(error)) {
+    return String(error.response?.data?.detail || fallback)
+  }
+  return error instanceof Error ? error.message : fallback
+}
+
+function resetEntryEdit() {
+  editingRowId.value = ''
+  editSourceText.value = ''
+  editTargetText.value = ''
+  editMessage.value = ''
+}
+
+function startEditEntry(row: MatchDisplayRow) {
+  if (!row.canEdit || !row.entryId || !row.editableKind) return
+  editingRowId.value = row.id
+  editSourceText.value = row.sourceText
+  editTargetText.value = row.targetText
+  editMessage.value = ''
+}
+
+function setHiddenTermEntry(entryId: string) {
+  hiddenTermEntryIds.value = new Set([...hiddenTermEntryIds.value, entryId])
+}
+
+function setTermEntryOverride(entry: TermEntryRecord) {
+  termEntryOverrides.value = {
+    ...termEntryOverrides.value,
+    [entry.id]: entry,
+  }
+}
+
+function removeTMCandidate(entryId: string) {
+  tmCandidates.value = tmCandidates.value.filter((candidate) => candidate.entry_id !== entryId)
+  tmCandidateCache.clear()
+}
+
+async function refreshCurrentTMCandidates() {
+  const segmentId = props.segment?.id || ''
+  const fileRecordId = props.fileRecordId || ''
+  const sourceText = props.segment?.source_text || ''
+  if (!segmentId || !fileRecordId) return
+  tmCandidateCache.clear()
+  const requestId = ++candidateRequestId
+  await loadTMCandidates(segmentId, fileRecordId, sourceText, requestId)
+}
+
+async function saveEntryEdit(row: MatchDisplayRow) {
+  if (!row.entryId || !row.editableKind || !row.canEdit || savingEntry.value) return
+  const sourceText = editSourceText.value.trim()
+  const targetText = editTargetText.value.trim()
+  if (!sourceText || !targetText) {
+    editMessage.value = '原文和译文不能为空。'
+    return
+  }
+
+  savingEntry.value = true
+  editMessage.value = ''
+  try {
+    if (row.editableKind === 'tm') {
+      await http.put<TMEntryRecord>(`/translation-memory/entries/${row.entryId}`, {
+        source_text: sourceText,
+        target_text: targetText,
+      })
+      await refreshCurrentTMCandidates()
+    } else {
+      const { data } = await http.put<TermEntryRecord>(`/term-entries/${row.entryId}`, {
+        source_text: sourceText,
+        target_text: targetText,
+      })
+      setTermEntryOverride(data)
+      emit('resourceEntryChanged', 'term')
+    }
+    resetEntryEdit()
+    pushToast({ tone: 'success', message: '条目已更新。' })
+  } catch (error) {
+    editMessage.value = getErrorMessage(error, '条目更新失败。')
+  } finally {
+    savingEntry.value = false
+  }
+}
+
+async function deleteEntry(row: MatchDisplayRow) {
+  if (!row.entryId || !row.editableKind || !row.canEdit || deletingEntry.value) return
+  const label = row.editableKind === 'tm' ? 'TM 条目' : '术语条目'
+  const confirmed = await confirm({
+    title: `删除${label}`,
+    message: `确定删除这条${label}吗？此操作无法撤销。`,
+    confirmText: '删除',
+    danger: true,
+  })
+  if (!confirmed) return
+
+  deletingEntry.value = true
+  editMessage.value = ''
+  try {
+    if (row.editableKind === 'tm') {
+      await http.delete(`/translation-memory/entries/${row.entryId}`)
+      removeTMCandidate(row.entryId)
+    } else {
+      await http.delete(`/term-entries/${row.entryId}`)
+      setHiddenTermEntry(row.entryId)
+      emit('resourceEntryChanged', 'term')
+    }
+    resetEntryEdit()
+    pushToast({ tone: 'success', message: '条目已删除。' })
+  } catch (error) {
+    editMessage.value = getErrorMessage(error, '条目删除失败。')
+  } finally {
+    deletingEntry.value = false
+  }
+}
+
 function applyMatchRow(row: MatchDisplayRow | null) {
   if (!row || !row.applyText) return
 
@@ -632,7 +822,29 @@ defineExpose({
           </div>
         </div>
 
-        <div class="match-detail__texts">
+        <div v-if="editingRowId === selectedMatchRow.id" class="match-detail__edit-form">
+          <label class="match-detail__edit-field">
+            <span>原文</span>
+            <textarea
+              v-model="editSourceText"
+              class="match-detail__edit-control"
+              rows="3"
+              :disabled="savingEntry || deletingEntry"
+            />
+          </label>
+          <label class="match-detail__edit-field">
+            <span>译文</span>
+            <textarea
+              v-model="editTargetText"
+              class="match-detail__edit-control"
+              rows="3"
+              :disabled="savingEntry || deletingEntry"
+            />
+          </label>
+          <p v-if="editMessage" class="match-detail__message">{{ editMessage }}</p>
+        </div>
+
+        <div v-else class="match-detail__texts">
           <div class="match-detail__text-block">
             <div class="match-detail__text-label">{{ selectedMatchRow.sourceTitle }}</div>
             <div class="match-detail__text">
@@ -652,6 +864,51 @@ defineExpose({
         </div>
 
         <div class="match-detail__actions">
+          <template v-if="editingRowId === selectedMatchRow.id">
+            <button
+              class="button match-detail__action"
+              type="button"
+              :disabled="savingEntry || deletingEntry"
+              title="保存"
+              @click="saveEntryEdit(selectedMatchRow)"
+            >
+              <Save :size="14" />
+              保存
+            </button>
+            <button
+              class="button match-detail__action"
+              type="button"
+              :disabled="savingEntry || deletingEntry"
+              title="取消"
+              @click="resetEntryEdit"
+            >
+              <X :size="14" />
+              取消
+            </button>
+          </template>
+          <template v-else>
+            <button
+              v-if="selectedMatchRow.canEdit"
+              class="button match-detail__action"
+              type="button"
+              :disabled="savingEntry || deletingEntry"
+              title="编辑条目"
+              @click="startEditEntry(selectedMatchRow)"
+            >
+              <Pencil :size="14" />
+              编辑
+            </button>
+            <button
+              v-if="selectedMatchRow.canEdit"
+              class="button match-detail__action match-detail__action--danger"
+              type="button"
+              :disabled="savingEntry || deletingEntry"
+              title="删除条目"
+              @click="deleteEntry(selectedMatchRow)"
+            >
+              <Trash2 :size="14" />
+              删除
+            </button>
           <button
             class="button match-detail__apply"
             type="button"
@@ -660,6 +917,7 @@ defineExpose({
           >
             应用
           </button>
+          </template>
         </div>
       </div>
     </div>
@@ -913,6 +1171,49 @@ defineExpose({
   border-top: 1px solid #e2e8ee;
 }
 
+.match-detail__edit-form {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #e2e8ee;
+}
+
+.match-detail__edit-field {
+  display: grid;
+  gap: 4px;
+  color: #223843;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.match-detail__edit-control {
+  width: 100%;
+  min-height: 66px;
+  resize: vertical;
+  padding: 6px 8px;
+  border: 1px solid #b8cfd3;
+  border-radius: 4px;
+  background: #ffffff;
+  color: #23343f;
+  font: inherit;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+.match-detail__edit-control:focus {
+  border-color: #40a391;
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(64, 163, 145, 0.16);
+}
+
+.match-detail__message {
+  margin: 0;
+  color: #a43a3d;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .match-detail__text-block {
   min-width: 0;
 }
@@ -936,8 +1237,43 @@ defineExpose({
 
 .match-detail__actions {
   display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
   justify-content: flex-end;
   padding-top: 8px;
+}
+
+.match-detail__action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 28px;
+  padding: 4px 9px;
+  border-color: #a9c7c9;
+  border-radius: 4px;
+  background: #ffffff;
+  color: #255661;
+  font-size: 12px;
+  font-weight: 700;
+  box-shadow: none;
+}
+
+.match-detail__action:hover:not(:disabled),
+.match-detail__action:focus-visible {
+  border-color: #40a391;
+  color: #0b6658;
+  outline: none;
+}
+
+.match-detail__action--danger {
+  border-color: #e1b7ba;
+  color: #a43a3d;
+}
+
+.match-detail__action--danger:hover:not(:disabled),
+.match-detail__action--danger:focus-visible {
+  border-color: #c95c62;
+  color: #8e2f32;
 }
 
 .match-detail__apply {

@@ -377,21 +377,32 @@ export interface UploadCapabilitiesResponse {
 }
 
 export interface TMMatchCandidate {
+  entry_id?: string | null
+  collection_id?: string | null
   source_text: string
   target_text: string
   score: number
   diff_html?: string | null
   collection_name: string | null
+  creator_id?: string | null
   creator_name: string | null
+  last_modified_by_id?: string | null
+  last_modified_by_name?: string | null
   created_at: string | null
   updated_at: string | null
 }
 
 export interface TermMatchCandidate {
+  entry_id?: string | null
+  term_base_id?: string | null
   source_text: string
   target_text: string
   term_base_name: string | null
+  creator_id?: string | null
   creator_name: string | null
+  last_modified_by_id?: string | null
+  last_modified_by_name?: string | null
+  created_at?: string | null
   updated_at: string | null
 }
 
@@ -1403,6 +1414,12 @@ export interface TermMatch {
   term_base_name?: string | null
   source_text: string
   target_text: string
+  creator_id?: string | null
+  creator_name?: string | null
+  last_modified_by_id?: string | null
+  last_modified_by_name?: string | null
+  created_at?: string | null
+  updated_at?: string | null
   start: number
   end: number
 }

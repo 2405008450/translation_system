@@ -214,6 +214,14 @@ def _serialize_term_entry(entry: TermEntry) -> dict:
     }
 
 
+def _require_term_entry_owner_or_admin(entry: TermEntry, current_user: User) -> None:
+    if is_admin_role(getattr(current_user, "role", None)):
+        return
+    if entry.creator_id is not None and entry.creator_id == current_user.id:
+        return
+    raise HTTPException(status_code=403, detail="只能编辑或删除自己添加的术语条目。")
+
+
 def _validate_term_import_upload(file: UploadFile, raw_bytes: bytes | None = None) -> str:
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
     if extension not in TERM_IMPORT_EXTENSIONS:
@@ -1236,11 +1244,13 @@ def update_term_entry(
     entry_id: UUID,
     payload: TermEntryUpdatePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(get_current_user),
 ):
     entry = db.query(TermEntry).filter(TermEntry.id == entry_id).first()
     if entry is None:
         raise HTTPException(status_code=404, detail="术语条目不存在。")
+
+    _require_term_entry_owner_or_admin(entry, current_user)
 
     source_text = normalize_text(payload.source_text)
     target_text = normalize_text(payload.target_text)
@@ -1286,11 +1296,13 @@ def update_term_entry(
 def delete_term_entry(
     entry_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(get_current_user),
 ):
     entry = db.query(TermEntry).filter(TermEntry.id == entry_id).first()
     if entry is None:
         raise HTTPException(status_code=404, detail="术语条目不存在。")
+
+    _require_term_entry_owner_or_admin(entry, current_user)
 
     db.delete(entry)
     db.commit()

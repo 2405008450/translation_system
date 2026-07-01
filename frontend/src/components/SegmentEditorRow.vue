@@ -110,6 +110,12 @@ interface EditorTextRange {
   end: number
 }
 
+interface LocalEditorEcho {
+  sentenceId: string
+  text: string
+  html: string | null
+}
+
 type HighlightKind = 'term' | 'search' | 'qa'
 type HighlightPart = { text: string; highlight: boolean; kind?: HighlightKind; title?: string }
 type BasicFormatTag = 'b' | 'i' | 'u' | 's' | 'sub' | 'sup'
@@ -124,6 +130,7 @@ const redoStack = ref<EditorHistorySnapshot[]>([])
 const isApplyingHistory = ref(false)
 const compositionSnapshotRecorded = ref(false)
 const lastTargetSelectionRange = ref<EditorTextRange | null>(null)
+const localEditorEcho = ref<LocalEditorEcho | null>(null)
 let lastHistorySnapshotAt = 0
 let lastHistoryInputKind = ''
 let preserveNextTargetSync = false
@@ -524,10 +531,10 @@ function highlightQAText(text: string, issues: SegmentQAIssue[]): HighlightPart[
 const targetHtmlContent = computed(() => {
   // 如果有保存的格式化 HTML，优先使用
   if (hasExplicitTargetHtmlOverride() && !hasAutomaticNumbering.value) {
-    return renderTargetHtmlWithHighlights(sanitizeHtml(props.segment.target_html ?? ''))
+    return renderTargetHtmlWithHighlights(sanitizeHtml(getTargetStateHtml() ?? ''))
   }
 
-  return renderTargetWithSourceFormats(props.segment.target_text || '')
+  return renderTargetWithSourceFormats(getTargetStateText())
 })
 
 const editorHtmlContent = computed(() => {
@@ -1047,13 +1054,53 @@ function getCurrentEditorText(): string {
   return getTargetStateText()
 }
 
-function getTargetStateText(): string {
+function getPropTargetStateText(): string {
   return props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
+}
+
+function getPropTargetStateHtml(): string | null {
+  return props.segment.target_html || null
+}
+
+function getActiveLocalEditorEcho(): LocalEditorEcho | null {
+  const echo = localEditorEcho.value
+  return echo?.sentenceId === segmentKey.value ? echo : null
+}
+
+function setLocalEditorEcho(text: string, html: string | null) {
+  localEditorEcho.value = {
+    sentenceId: segmentKey.value,
+    text,
+    html: html || null,
+  }
+}
+
+function clearLocalEditorEchoIfSynced() {
+  const echo = getActiveLocalEditorEcho()
+  if (!echo) {
+    return
+  }
+  if (echo.text === getPropTargetStateText() && echo.html === getPropTargetStateHtml()) {
+    localEditorEcho.value = null
+  }
+}
+
+function clearLocalEditorEcho() {
+  localEditorEcho.value = null
+}
+
+function getTargetStateText(): string {
+  return getActiveLocalEditorEcho()?.text ?? getPropTargetStateText()
+}
+
+function getTargetStateHtml(): string | null {
+  const echo = getActiveLocalEditorEcho()
+  return echo ? echo.html : getPropTargetStateHtml()
 }
 
 function getCurrentEditorHtml(): string | null {
   if (!editorRef.value) {
-    return props.segment.target_html || null
+    return getTargetStateHtml()
   }
   const html = serializeEditorContentWithFormat(editorRef.value)
   return shouldPersistEditorHtml(html) ? html : null
@@ -1066,10 +1113,11 @@ function commitEditorContent(): CommittedEditorContent | null {
 
   const text = serializeEditorContent(editorRef.value)
   const html = getCurrentEditorHtml()
-  const currentText = props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
-  const currentHtml = props.segment.target_html || null
+  const currentText = getTargetStateText()
+  const currentHtml = getTargetStateHtml()
 
   if (text !== currentText || (editorDirtySinceFocus.value && html !== currentHtml)) {
+    setLocalEditorEcho(text, html)
     emit('update', segmentKey.value, text, html || undefined)
   }
 
@@ -1242,8 +1290,7 @@ function shouldPreserveHistoryForStateSync() {
   if (!editorRef.value) {
     return false
   }
-  const stateText = props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
-  return serializeEditorContent(editorRef.value) === stateText
+  return serializeEditorContent(editorRef.value) === getTargetStateText()
 }
 
 function applyHistorySnapshot(snapshot: EditorHistorySnapshot) {
@@ -1376,6 +1423,9 @@ function handleBeforeInput(event: Event) {
   if (props.disabled || isApplyingHistory.value) {
     return
   }
+  if (inputEvent.inputType.startsWith('delete')) {
+    clearRevisionRerenderTimer()
+  }
 
   if (inputEvent.inputType === 'historyUndo') {
     inputEvent.preventDefault()
@@ -1496,6 +1546,7 @@ function handleInput() {
   if (!editorRef.value) return
   if (isApplyingHistory.value) return
   if (isComposing.value) return
+  clearRevisionRerenderTimer()
   editorDirtySinceFocus.value = true
   cacheTargetSelectionFromDom()
 
@@ -1508,12 +1559,14 @@ function handleInput() {
 
   // Persist HTML when it carries formats or an explicit plain-format override.
   if (shouldPersistHtml) {
+    setLocalEditorEcho(text, cleanHtml)
     emit('update', segmentKey.value, text, cleanHtml)
     clearExplicitPlainFormatRequest()
     return
   }
 
   // 没有格式标签，只传递纯文本
+  setLocalEditorEcho(text, null)
   emit('update', segmentKey.value, text)
   clearExplicitPlainFormatRequest()
 }
@@ -1671,7 +1724,7 @@ function hasSerializableFormatTags(html: string): boolean {
 }
 
 function hasExplicitTargetHtmlOverride(): boolean {
-  return props.segment.target_html !== null && props.segment.target_html !== undefined
+  return getTargetStateHtml() !== null && getTargetStateHtml() !== undefined
 }
 
 function hasExplicitPlainFormatRequest(): boolean {
@@ -1968,13 +2021,15 @@ watch(
   () => {
     lastTargetSelectionRange.value = null
     editorDirtySinceFocus.value = false
+    clearLocalEditorEcho()
     clearEditorHistory()
   }
 )
 
 watch(
-  () => props.segment.target_text,
+  () => [props.segment.target_text, props.segment.target_html, props.pendingRevision?.after_text] as const,
   () => {
+    clearLocalEditorEchoIfSynced()
     const shouldPreserveHistory = shouldPreserveHistoryForStateSync()
     preserveNextTargetSync = false
     if (!shouldPreserveHistory) {
@@ -1989,6 +2044,7 @@ watch(
 watch(
   () => props.pendingRevision?.id ?? null,
   () => {
+    clearLocalEditorEchoIfSynced()
     const shouldPreserveHistory = shouldPreserveHistoryForStateSync()
     preserveNextTargetSync = false
     if (!shouldPreserveHistory) {

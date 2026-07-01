@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, case, func, literal, or_
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, object_session
+from sqlalchemy.orm import Session, aliased, object_session
 
 from app.auth import (
     USER_ROLE,
@@ -10469,12 +10469,17 @@ def get_segment_tm_candidates(
         "source_text": segment.source_text,
         "candidates": [
             {
+                "entry_id": c.entry_id,
+                "collection_id": c.collection_id,
                 "source_text": c.source_text,
                 "target_text": c.target_text,
                 "score": c.score,
                 "diff_html": c.diff_html,
                 "collection_name": c.collection_name,
+                "creator_id": c.creator_id,
                 "creator_name": c.creator_name,
+                "last_modified_by_id": c.last_modified_by_id,
+                "last_modified_by_name": c.last_modified_by_name,
                 "created_at": c.created_at,
                 "updated_at": c.updated_at,
             }
@@ -13857,6 +13862,14 @@ def _serialize_tm_entry(entry: TranslationMemory) -> dict:
     }
 
 
+def _require_tm_entry_owner_or_admin(entry: TranslationMemory, current_user: User) -> None:
+    if is_admin_role(getattr(current_user, "role", None)):
+        return
+    if entry.creator_id is not None and entry.creator_id == current_user.id:
+        return
+    raise HTTPException(status_code=403, detail="只能编辑或删除自己添加的 TM 条目。")
+
+
 def _serialize_resource_search_tm_row(entry: TranslationMemory, collection_name: str | None) -> dict:
     return {
         "id": str(entry.id),
@@ -15017,11 +15030,13 @@ def update_tm_entry(
     entry_id: UUID,
     payload: TMEntryUpdatePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(get_current_user),
 ):
     entry = db.query(TranslationMemory).filter(TranslationMemory.id == entry_id).first()
     if entry is None:
         raise HTTPException(status_code=404, detail="TM 条目不存在。")
+
+    _require_tm_entry_owner_or_admin(entry, current_user)
 
     source_text = normalize_text(payload.source_text)
     target_text = normalize_text(payload.target_text)
@@ -15072,11 +15087,13 @@ def update_tm_entry(
 def delete_tm_entry(
     entry_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(get_current_user),
 ):
     entry = db.query(TranslationMemory).filter(TranslationMemory.id == entry_id).first()
     if entry is None:
         raise HTTPException(status_code=404, detail="TM 条目不存在。")
+
+    _require_tm_entry_owner_or_admin(entry, current_user)
 
     db.delete(entry)
     db.commit()
@@ -15496,15 +15513,25 @@ def match_terms(
     if not collection_ids:
         return {"matches": []}
 
+    creator_user = aliased(User)
+    last_modified_user = aliased(User)
     candidate_query = (
         db.query(
             TermEntry.id,
             TermEntry.term_base_id,
             TermEntry.source_text,
             TermEntry.target_text,
+            TermEntry.creator_id,
+            TermEntry.last_modified_by_id,
+            TermEntry.created_at,
+            TermEntry.updated_at,
             TermBase.name.label("term_base_name"),
+            func.coalesce(creator_user.nickname, creator_user.username).label("creator_name"),
+            func.coalesce(last_modified_user.nickname, last_modified_user.username).label("last_modified_by_name"),
         )
         .outerjoin(TermBase, TermEntry.term_base_id == TermBase.id)
+        .outerjoin(creator_user, TermEntry.creator_id == creator_user.id)
+        .outerjoin(last_modified_user, TermEntry.last_modified_by_id == last_modified_user.id)
         .filter(
             TermEntry.term_base_id.in_(collection_ids),
             TermEntry.source_text != "",
@@ -15535,6 +15562,16 @@ def match_terms(
                 "term_base_name": term_match.item.term_base_name,
                 "source_text": term_match.item.source_text,
                 "target_text": term_match.item.target_text,
+                "creator_id": str(term_match.item.creator_id) if term_match.item.creator_id else None,
+                "creator_name": term_match.item.creator_name,
+                "last_modified_by_id": (
+                    str(term_match.item.last_modified_by_id)
+                    if term_match.item.last_modified_by_id
+                    else None
+                ),
+                "last_modified_by_name": term_match.item.last_modified_by_name,
+                "created_at": term_match.item.created_at.isoformat() if term_match.item.created_at else None,
+                "updated_at": term_match.item.updated_at.isoformat() if term_match.item.updated_at else None,
                 "start": term_match.start,
                 "end": term_match.end,
             }

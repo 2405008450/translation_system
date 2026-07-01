@@ -6513,6 +6513,14 @@ function handleAppendText(text: string) {
 }
 
 // 加载参考文件匹配结果（工作台初始化时调用）
+async function handleMatchPanelResourceEntryChanged(kind: 'tm' | 'term') {
+  if (kind !== 'term') return
+  await Promise.all([
+    loadTermEntries(),
+    segmentStore.refreshActiveTermMatches(),
+  ])
+}
+
 async function loadReferenceMatchResult() {
   const fileRecordId = activeWorkbenchFileId.value
   if (!fileRecordId) return
@@ -9311,6 +9319,7 @@ onBeforeRouteLeave(async () => {
             :reference-match-result="referenceMatchResult"
             @replace-text="handleReplaceText"
             @append-text="handleAppendText"
+            @resource-entry-changed="handleMatchPanelResourceEntryChanged"
           />
           <section
             v-else-if="activeSideTool === 'terms' && showAddTermPanel"
