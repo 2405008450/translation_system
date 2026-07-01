@@ -6829,7 +6829,7 @@ onBeforeRouteLeave(async () => {
         </button>
       </div>
 
-      <div class="workbench-ribbon__ai-strip" aria-label="AI">
+      <div v-if="!authStore.isExternalTranslator" class="workbench-ribbon__ai-strip" aria-label="AI">
         <label class="ai-strip__field">
           <span>{{ t('workbench.aiScopeShort') }}</span>
           <select v-model="llmScope" class="field__control" :title="activeMergeFileContextTitle || t('workbench.aiScope')">
