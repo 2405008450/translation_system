@@ -115,6 +115,7 @@ import type {
   Segment,
   SegmentNextUnconfirmedPositionResponse,
   SegmentPositionResponse,
+  SegmentStatusStats,
   TMMatchCandidate,
   TMCollection,
   TermBase,
@@ -446,7 +447,7 @@ const segmentScreeningDisplayRange = ref('my_tasks')
 const segmentScreeningNumberInput = ref('1')
 const segmentScreeningStatusFilters = ref<string[]>([])
 const segmentScreeningMatchFilters = ref<string[]>([])
-const segmentScreeningSourceFilters = ref<string[]>([])
+const segmentScreeningSourceContentFilters = ref<string[]>([])
 const segmentScreeningFlagFilters = ref<string[]>([])
 const segmentScreeningWorkflowStepIds = ref<string[]>([])
 const searchLoadingAllSegments = ref(false)
@@ -710,7 +711,7 @@ function getCommentWindowQuery(): CommentWindowQuery | null {
     caseSensitive: searchCaseSensitive.value,
     statusFilters: [...segmentScreeningStatusFilters.value, ...segmentScreeningFlagFilters.value],
     matchFilters: [...segmentScreeningMatchFilters.value],
-    sourceFilters: [...segmentScreeningSourceFilters.value],
+    sourceContentFilters: [...segmentScreeningSourceContentFilters.value],
     workflowStepIds: [...segmentScreeningWorkflowStepIds.value],
   }
 }
@@ -728,7 +729,7 @@ function getSegmentWindowQuery(page = segmentStore.currentPage, pageSize = segme
     caseSensitive: searchCaseSensitive.value,
     statusFilters: [...segmentScreeningStatusFilters.value, ...segmentScreeningFlagFilters.value],
     matchFilters: [...segmentScreeningMatchFilters.value],
-    sourceFilters: [...segmentScreeningSourceFilters.value],
+    sourceContentFilters: [...segmentScreeningSourceContentFilters.value],
     workflowStepIds: [...segmentScreeningWorkflowStepIds.value],
     includeStats,
   }
@@ -993,8 +994,41 @@ const projectReturnParent = computed(() => (
   route.query.parent === 'tasks' ? 'tasks' : ''
 ))
 
+function createWorkbenchStatusStats(): SegmentStatusStats {
+  return {
+    total: 0,
+    exact: 0,
+    fuzzy: 0,
+    none: 0,
+    confirmed: 0,
+    empty_target: 0,
+  }
+}
+
+const loadedSegmentStatusStats = computed<SegmentStatusStats>(() => {
+  const stats = createWorkbenchStatusStats()
+  stats.total = segmentStore.segments.length
+  for (const segment of segmentStore.segments) {
+    const status = resolveWorkbenchEffectiveStatus(segment)
+    stats[status] += 1
+    if (
+      isEmptyTargetForWorkbench(segment.target_text)
+      || retainedEmptyTargetSentenceIds.value.has(segment.sentence_id)
+    ) {
+      stats.empty_target += 1
+    }
+  }
+  return stats
+})
+
+const statusSummaryCounters = computed(() => (
+  segmentStore.loadedSegmentCount >= segmentStore.matchedSegmentCount
+    ? loadedSegmentStatusStats.value
+    : segmentStore.segmentStatusStats
+))
+
 const statusSummary = computed(() => {
-  const counters = segmentStore.segmentStatusStats
+  const counters = statusSummaryCounters.value
 
   return [
     {
@@ -1518,11 +1552,11 @@ const segmentScreeningMatchOptions: SegmentScreeningOption[] = [
   { value: 'tm_replace', label: '自动替换（记忆库）', disabled: true, hint: '暂无自动替换来源字段，先占位。' },
 ]
 const segmentScreeningSourceContentOptions: SegmentScreeningOption[] = [
-  { value: 'repeat_first', label: '重复首句', disabled: true },
-  { value: 'internal_repeat', label: '内部重复', disabled: true },
-  { value: 'cross_file_repeat', label: '跨文件重复', disabled: true },
-  { value: 'not_repeat', label: '不重复', disabled: true },
-  { value: 'term_not_sync', label: '标记为不同步', disabled: true },
+  { value: 'repeat_first', label: '重复首句' },
+  { value: 'internal_repeat', label: '内部重复' },
+  { value: 'cross_file_repeat', label: '跨文件重复' },
+  { value: 'not_repeat', label: '不重复' },
+  { value: 'project_sync_disabled', label: '标记为不同步' },
 ]
 const segmentScreeningModifyOptions: SegmentScreeningOption[] = [
   { value: 'modified', label: '已修改', disabled: true },
@@ -1542,21 +1576,21 @@ const segmentScreeningWorkflowOptions = computed(() => (
 const segmentScreeningQueryKey = computed(() => JSON.stringify({
   status: segmentScreeningStatusFilters.value,
   match: segmentScreeningMatchFilters.value,
-  source: segmentScreeningSourceFilters.value,
+  sourceContent: segmentScreeningSourceContentFilters.value,
   flag: segmentScreeningFlagFilters.value,
   workflow: segmentScreeningWorkflowStepIds.value,
 }))
 const hasSegmentScreeningFilters = computed(() => (
   segmentScreeningStatusFilters.value.length > 0
   || segmentScreeningMatchFilters.value.length > 0
-  || segmentScreeningSourceFilters.value.length > 0
+  || segmentScreeningSourceContentFilters.value.length > 0
   || segmentScreeningFlagFilters.value.length > 0
   || segmentScreeningWorkflowStepIds.value.length > 0
 ))
 const segmentScreeningActiveCount = computed(() => (
   segmentScreeningStatusFilters.value.length
   + segmentScreeningMatchFilters.value.length
-  + segmentScreeningSourceFilters.value.length
+  + segmentScreeningSourceContentFilters.value.length
   + segmentScreeningFlagFilters.value.length
   + segmentScreeningWorkflowStepIds.value.length
 ))
@@ -1857,18 +1891,56 @@ const segmentDisplayScopeOptions = computed<Array<{ value: SegmentDisplayScope; 
   { value: 'empty_target', label: '空译文' },
 ])
 
+function normalizeWorkbenchMatchText(value: string | null | undefined) {
+  return (value || '').trim().replace(/\s+/g, ' ').replace(/[\u3002\uff01\uff1f!?.]+$/u, '')
+}
+
+function compactWorkbenchMatchCore(value: string | null | undefined) {
+  return normalizeWorkbenchMatchText(value).replace(/[^\w\u4e00-\u9fff]+/gu, '')
+}
+
+function isShortWorkbenchStructuralFragment(value: string | null | undefined) {
+  const core = compactWorkbenchMatchCore(value)
+  return Boolean(core && core.length <= 4 && /^(?:\d+[A-Za-z]?|[A-Za-z]|[ivxlcdmIVXLCDM]{1,4})$/.test(core))
+}
+
+function resolveWorkbenchEffectiveStatus(segment: Segment) {
+  if (segment.status === 'confirmed') {
+    return 'confirmed'
+  }
+  const sourceText = normalizeWorkbenchMatchText(segment.source_text)
+  const displayText = normalizeWorkbenchMatchText(segment.display_text)
+  const matchedSourceText = normalizeWorkbenchMatchText(segment.matched_source_text)
+  if (sourceText && matchedSourceText && matchedSourceText === sourceText) {
+    return 'exact'
+  }
+  if (
+    displayText
+    && matchedSourceText
+    && matchedSourceText === displayText
+    && !isShortWorkbenchStructuralFragment(segment.source_text)
+  ) {
+    return 'exact'
+  }
+  if (Number(segment.score || 0) > 0 || matchedSourceText || segment.status === 'fuzzy') {
+    return 'fuzzy'
+  }
+  return 'none'
+}
+
 function matchesSegmentDisplayScope(segment: Segment) {
+  const effectiveStatus = resolveWorkbenchEffectiveStatus(segment)
   if (segmentDisplayScope.value === 'exact_only') {
-    return segment.status === 'exact'
+    return effectiveStatus === 'exact'
   }
   if (segmentDisplayScope.value === 'fuzzy_only') {
-    return segment.status === 'fuzzy'
+    return effectiveStatus === 'fuzzy'
   }
   if (segmentDisplayScope.value === 'none_only') {
-    return segment.status === 'none'
+    return effectiveStatus === 'none'
   }
   if (segmentDisplayScope.value === 'confirmed_only') {
-    return segment.status === 'confirmed'
+    return effectiveStatus === 'confirmed'
   }
   if (segmentDisplayScope.value === 'empty_target') {
     return isEmptyTargetForWorkbench(segment.target_text)
@@ -2879,7 +2951,7 @@ function resetSegmentScreeningFilters() {
   segmentScreeningDisplayRange.value = 'my_tasks'
   segmentScreeningStatusFilters.value = []
   segmentScreeningMatchFilters.value = []
-  segmentScreeningSourceFilters.value = []
+  segmentScreeningSourceContentFilters.value = []
   segmentScreeningFlagFilters.value = []
   segmentScreeningWorkflowStepIds.value = []
 }
@@ -2892,7 +2964,7 @@ function getSegmentScreeningGroupValues(group: SegmentScreeningGroup) {
     return segmentScreeningMatchFilters.value
   }
   if (group === 'source') {
-    return segmentScreeningSourceFilters.value
+    return segmentScreeningSourceContentFilters.value
   }
   if (group === 'flag') {
     return segmentScreeningFlagFilters.value
@@ -2907,7 +2979,7 @@ function setSegmentScreeningGroupValues(group: SegmentScreeningGroup, values: st
   } else if (group === 'match') {
     segmentScreeningMatchFilters.value = nextValues
   } else if (group === 'source') {
-    segmentScreeningSourceFilters.value = nextValues
+    segmentScreeningSourceContentFilters.value = nextValues
   } else if (group === 'flag') {
     segmentScreeningFlagFilters.value = nextValues
   } else {
@@ -3362,7 +3434,7 @@ async function replaceAllSearchMatches() {
         replace_all: true,
         status_filters: [...segmentScreeningStatusFilters.value, ...segmentScreeningFlagFilters.value],
         match_filters: [...segmentScreeningMatchFilters.value],
-        source_filters: [...segmentScreeningSourceFilters.value],
+        source_content_filters: [...segmentScreeningSourceContentFilters.value],
         workflow_step_ids: [...segmentScreeningWorkflowStepIds.value],
       },
     )
@@ -3448,7 +3520,7 @@ function buildNextUnconfirmedPositionParams(currentSegment: Segment, pageSize: n
     case_sensitive: query.caseSensitive,
     status_filters: query.statusFilters,
     match_filters: query.matchFilters,
-    source_filters: query.sourceFilters,
+    source_content_filters: query.sourceContentFilters,
     workflow_step_ids: query.workflowStepIds,
   }
 }
@@ -7947,9 +8019,16 @@ onBeforeRouteLeave(async () => {
                 <label
                   v-for="option in segmentScreeningSourceContentOptions"
                   :key="option.value"
-                  class="segment-screening-panel__check is-disabled"
+                  class="segment-screening-panel__check"
+                  :class="{ 'is-disabled': option.disabled }"
+                  :title="option.hint || ''"
                 >
-                  <input type="checkbox" disabled />
+                  <input
+                    type="checkbox"
+                    :disabled="option.disabled"
+                    :checked="isSegmentScreeningChecked('source', option.value)"
+                    @change="toggleSegmentScreeningFilter('source', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
                   <span>{{ option.label }}</span>
                 </label>
               </div>
@@ -9177,9 +9256,16 @@ onBeforeRouteLeave(async () => {
                 <label
                   v-for="option in segmentScreeningSourceContentOptions"
                   :key="option.value"
-                  class="segment-screening-panel__check is-disabled"
+                  class="segment-screening-panel__check"
+                  :class="{ 'is-disabled': option.disabled }"
+                  :title="option.hint || ''"
                 >
-                  <input type="checkbox" disabled />
+                  <input
+                    type="checkbox"
+                    :disabled="option.disabled"
+                    :checked="isSegmentScreeningChecked('source', option.value)"
+                    @change="toggleSegmentScreeningFilter('source', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
                   <span>{{ option.label }}</span>
                 </label>
               </div>

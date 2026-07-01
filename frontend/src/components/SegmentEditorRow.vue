@@ -72,6 +72,7 @@ const authStore = useAuthStore()
 const isFocused = ref(false)
 const isSourceFocused = ref(false)
 const isComposing = ref(false)
+const editorDirtySinceFocus = ref(false)
 
 // 对外标识：合并视图使用复合键，单文件回退为 sentence_id
 const segmentKey = computed(() => props.segmentKey || props.segment.sentence_id)
@@ -130,14 +131,104 @@ let revisionRerenderTimer: ReturnType<typeof setTimeout> | null = null
 const canUndoEditorChange = computed(() => undoStack.value.length > 0)
 const canRedoEditorChange = computed(() => redoStack.value.length > 0)
 
-const statusClass = computed(() => `segment-row--${props.segment.status || 'none'}`)
+function normalizeMatchText(value: string | null | undefined) {
+  return (value || '').trim().replace(/\s+/g, ' ').replace(/[\u3002\uff01\uff1f!?.]+$/u, '')
+}
+
+function compactMatchCore(value: string | null | undefined) {
+  return normalizeMatchText(value).replace(/[^\w\u4e00-\u9fff]+/gu, '')
+}
+
+function isShortStructuralFragment(value: string | null | undefined) {
+  const core = compactMatchCore(value)
+  return Boolean(core && core.length <= 4 && /^(?:\d+[A-Za-z]?|[A-Za-z]|[ivxlcdmIVXLCDM]{1,4})$/.test(core))
+}
+
+function normalizedSequenceRatio(left: string, right: string): number {
+  if (left === right) return 1
+  const rows = left.length + 1
+  const cols = right.length + 1
+  const lengths = Array.from({ length: rows }, () => Array<number>(cols).fill(0))
+  for (let row = 1; row < rows; row += 1) {
+    for (let col = 1; col < cols; col += 1) {
+      lengths[row][col] = left[row - 1] === right[col - 1]
+        ? lengths[row - 1][col - 1] + 1
+        : Math.max(lengths[row - 1][col], lengths[row][col - 1])
+    }
+  }
+  return (2 * lengths[left.length][right.length]) / Math.max(left.length + right.length, 1)
+}
+
+function capShortStructuralDisplayScore(
+  score: number,
+  sourceText: string | null | undefined,
+  matchedSourceText: string | null | undefined,
+) {
+  const normalizedSource = normalizeMatchText(sourceText)
+  const normalizedMatchedSource = normalizeMatchText(matchedSourceText)
+  if (!normalizedSource || !normalizedMatchedSource || normalizedSource === normalizedMatchedSource) {
+    return score
+  }
+  const sourceCore = compactMatchCore(normalizedSource)
+  const matchedCore = compactMatchCore(normalizedMatchedSource)
+  if (
+    sourceCore
+    && sourceCore === matchedCore
+    && (isShortStructuralFragment(normalizedSource) || isShortStructuralFragment(normalizedMatchedSource))
+  ) {
+    return Math.min(score, normalizedSequenceRatio(normalizedSource, normalizedMatchedSource), 0.79)
+  }
+  return score
+}
+
+function normalizeDisplayScore(
+  score: number | null | undefined,
+  exactTextMatch = false,
+  sourceText?: string | null,
+  matchedSourceText?: string | null,
+): number | null {
+  if (score === null || score === undefined || !Number.isFinite(score) || score <= 0) return null
+  const safeScore = Math.min(Math.max(score, 0), 1)
+  const cappedScore = capShortStructuralDisplayScore(safeScore, sourceText, matchedSourceText)
+  return exactTextMatch ? cappedScore : Math.min(cappedScore, 0.99)
+}
+
+const hasExactTextMatch = computed(() => {
+  const sourceText = normalizeMatchText(props.segment.source_text)
+  const displayText = normalizeMatchText(props.segment.display_text)
+  const matchedSourceText = normalizeMatchText(props.segment.matched_source_text)
+  return Boolean(
+    (sourceText && matchedSourceText && matchedSourceText === sourceText)
+    || (
+      displayText
+      && matchedSourceText
+      && matchedSourceText === displayText
+      && !isShortStructuralFragment(props.segment.source_text)
+    )
+  )
+})
+const effectiveSegmentStatus = computed(() => {
+  if (props.segment.status === 'confirmed') {
+    return 'confirmed'
+  }
+  if (hasExactTextMatch.value) {
+    return 'exact'
+  }
+  const matchedSourceText = normalizeMatchText(props.segment.matched_source_text)
+  const score = Number(props.segment.score || 0)
+  if (score > 0 || matchedSourceText || props.segment.status === 'fuzzy') {
+    return 'fuzzy'
+  }
+  return 'none'
+})
+const statusClass = computed(() => `segment-row--${effectiveSegmentStatus.value}`)
 const parityClass = computed(() => (props.index % 2 === 0 ? 'segment-row--odd' : 'segment-row--even'))
 const sourceClass = computed(() => `segment-row__tag--source-${props.segment.source || 'none'}`)
 const isEmptyTarget = computed(() => {
   const targetText = props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
   return targetText.length === 0
 })
-const statusMeta = computed(() => getSegmentStatusMeta(props.segment.status))
+const statusMeta = computed(() => getSegmentStatusMeta(effectiveSegmentStatus.value))
 const sourceMeta = computed(() => getSegmentSourceMeta(props.segment.source))
 const shouldHideLLMModel = computed(() => authStore.isExternalTranslator)
 const sourceLabel = computed(() => {
@@ -155,7 +246,7 @@ const compactSourceLabel = computed(() => (
 ))
 const workflowLabel = computed(() => props.segment.workflow_step_name || '翻译')
 const showStatusTag = computed(() => {
-  const status = props.segment.status || 'none'
+  const status = effectiveSegmentStatus.value
   return status !== 'none' && status !== 'fuzzy'
 })
 const showSourceTag = computed(() => {
@@ -166,7 +257,7 @@ const showSourceTag = computed(() => {
   if (source === 'llm') {
     return !isEmptyTarget.value
   }
-  return props.segment.status !== 'none' && props.segment.status !== 'fuzzy'
+  return effectiveSegmentStatus.value !== 'none' && effectiveSegmentStatus.value !== 'fuzzy'
 })
 const showProjectSyncToggle = computed(() => true)
 const projectSyncToggleLabel = computed(() => (
@@ -220,13 +311,29 @@ const revisionTooltip = computed(() => {
     : ''
   return createdAt ? `${authorName} · ${createdAt}` : authorName
 })
-const scorePercent = computed(() => {
-  if (!props.segment.score || props.segment.score <= 0) return null
-  const percent = Math.round(props.segment.score * 100)
-  if (props.segment.status !== 'exact' && props.segment.status !== 'confirmed') {
-    return Math.min(percent, 99)
+const displayScore = computed(() => (
+  normalizeDisplayScore(
+    props.segment.score,
+    effectiveSegmentStatus.value === 'exact' || effectiveSegmentStatus.value === 'confirmed',
+    props.segment.source_text,
+    props.segment.matched_source_text,
+  )
+))
+const scorePercent = computed(() => (
+  displayScore.value === null ? null : Math.round(displayScore.value * 100)
+))
+const matchRateTone = computed(() => {
+  const score = displayScore.value ?? 0
+  if (effectiveSegmentStatus.value === 'exact' && score >= 1) return 'exact'
+  if (score >= 0.8) return 'high'
+  if (score >= 0.6) return 'medium'
+  return 'low'
+})
+const matchRateLabel = computed(() => {
+  if (scorePercent.value === null) {
+    return ''
   }
-  return percent
+  return `${scorePercent.value}%`
 })
 
 // 通用的文本高亮函数
@@ -962,7 +1069,7 @@ function commitEditorContent(): CommittedEditorContent | null {
   const currentText = props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
   const currentHtml = props.segment.target_html || null
 
-  if (text !== currentText || html !== currentHtml) {
+  if (text !== currentText || (editorDirtySinceFocus.value && html !== currentHtml)) {
     emit('update', segmentKey.value, text, html || undefined)
   }
 
@@ -1177,6 +1284,7 @@ function redoEditorChange() {
 
 function handleFocus() {
   isFocused.value = true
+  editorDirtySinceFocus.value = false
   emit('focus', segmentKey.value)
   cacheTargetSelectionFromDom()
 }
@@ -1186,6 +1294,7 @@ function handleBlur() {
   cacheTargetSelectionFromDom()
   commitEditorContent()
   isFocused.value = false
+  editorDirtySinceFocus.value = false
   resetHistoryGroup()
   void nextTick(() => syncEditorHtmlFromState(false))
 }
@@ -1387,6 +1496,7 @@ function handleInput() {
   if (!editorRef.value) return
   if (isApplyingHistory.value) return
   if (isComposing.value) return
+  editorDirtySinceFocus.value = true
   cacheTargetSelectionFromDom()
 
   // 检查是否有格式标签
@@ -1857,6 +1967,7 @@ watch(
   () => props.segment.sentence_id,
   () => {
     lastTargetSelectionRange.value = null
+    editorDirtySinceFocus.value = false
     clearEditorHistory()
   }
 )
@@ -2116,8 +2227,13 @@ watch(
         class="segment-row__confirm-mark"
         aria-label="已确认"
       >√</span>
-      <span v-if="scorePercent !== null" class="segment-row__match-rate" :title="statusMeta.label">
-        {{ segment.status === 'exact' ? `${statusMeta.label} · ${scorePercent}%` : `${scorePercent}%` }}
+      <span
+        v-if="scorePercent !== null"
+        class="segment-row__match-rate"
+        :class="`segment-row__match-rate--${matchRateTone}`"
+        :title="statusMeta.label"
+      >
+        {{ matchRateLabel }}
       </span>
       <span
         v-if="showStatusTag && segment.status !== 'confirmed' && scorePercent === null"
@@ -2275,6 +2391,19 @@ watch(
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.segment-row__match-rate--exact,
+.segment-row__match-rate--high {
+  background: #4fa873;
+}
+
+.segment-row__match-rate--medium {
+  background: #d8b74e;
+}
+
+.segment-row__match-rate--low {
+  background: #c95c62;
 }
 
 .segment-row__compact-tag {

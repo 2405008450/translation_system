@@ -909,6 +909,14 @@ def _can_auto_merge_stale_segment(
     return False
 
 
+def _resolve_status_after_target_update(segment: Segment, before_text: str | None, target_text: str, confirm: bool) -> str:
+    if confirm:
+        return "confirmed"
+    if segment.status == "confirmed" and (before_text or "") == (target_text or ""):
+        return "confirmed"
+    return resolve_unconfirmed_segment_status(segment)
+
+
 def update_segment_target(
     db: Session,
     segment_id: UUID,
@@ -943,10 +951,7 @@ def update_segment_target(
     else:
         segment.llm_provider = None
         segment.llm_model = None
-    if confirm:
-        segment.status = "confirmed"
-    else:
-        segment.status = resolve_unconfirmed_segment_status(segment)
+    segment.status = _resolve_status_after_target_update(segment, before_text, target_text, confirm)
     if track_revision:
         create_revision(
             db,
@@ -1011,10 +1016,7 @@ def update_segment_by_sentence_id(
     else:
         segment.llm_provider = None
         segment.llm_model = None
-    if confirm:
-        segment.status = "confirmed"
-    else:
-        segment.status = resolve_unconfirmed_segment_status(segment)
+    segment.status = _resolve_status_after_target_update(segment, before_text, target_text, confirm)
     if track_revision:
         create_revision(
             db,
@@ -1171,10 +1173,7 @@ def batch_update_segments(
         else:
             segment.llm_provider = None
             segment.llm_model = None
-        if confirm:
-            segment.status = "confirmed"
-        else:
-            segment.status = resolve_unconfirmed_segment_status(segment)
+        segment.status = _resolve_status_after_target_update(segment, before_text, target_text, confirm)
         if track_revision:
             create_revision(
                 db,

@@ -121,6 +121,7 @@ function buildMergeViewSegmentParams(query: SegmentPageQuery) {
     'status_filters[]': query.statusFilters,
     'match_filters[]': query.matchFilters,
     'source_filters[]': query.sourceFilters,
+    'source_content_filters[]': query.sourceContentFilters,
     'workflow_step_ids[]': query.workflowStepIds,
   }
 }

@@ -353,7 +353,12 @@ function buildReferenceFuzzyRow(match: ReferenceFuzzyMatch, index: number): Matc
 function buildTMRow(candidate: TMMatchCandidate, index: number): MatchDisplayRow {
   const collectionName = candidate.collection_name || props.collectionName || '记忆库'
   const exactTextMatch = isExactTextMatch(props.activeSourceText, candidate.source_text)
-  const displayScore = normalizeDisplayScore(candidate.score, exactTextMatch)
+  const displayScore = normalizeDisplayScore(
+    candidate.score,
+    exactTextMatch,
+    props.activeSourceText,
+    candidate.source_text,
+  )
   return {
     id: `tm-${index}`,
     sourceLabel: collectionName,
@@ -452,7 +457,16 @@ function formatDateTime(isoString: string | null | undefined): string {
 }
 
 function normalizeMatchText(value: string | null | undefined): string {
-  return (value || '').trim().replace(/\s+/g, ' ').replace(/[。！？!?.]+$/u, '').toLowerCase()
+  return (value || '').trim().replace(/\s+/g, ' ').replace(/[\u3002\uff01\uff1f!?.]+$/u, '')
+}
+
+function compactMatchCore(value: string | null | undefined): string {
+  return normalizeMatchText(value).replace(/[^\w\u4e00-\u9fff]+/gu, '')
+}
+
+function isShortStructuralFragment(value: string | null | undefined): boolean {
+  const core = compactMatchCore(value)
+  return Boolean(core && core.length <= 4 && /^(?:\d+[A-Za-z]?|[A-Za-z]|[ivxlcdmIVXLCDM]{1,4})$/.test(core))
 }
 
 function isExactTextMatch(sourceText: string | null | undefined, matchedSourceText: string | null | undefined): boolean {
@@ -461,10 +475,53 @@ function isExactTextMatch(sourceText: string | null | undefined, matchedSourceTe
   return Boolean(normalizedSource && normalizedSource === normalizedMatchedSource)
 }
 
-function normalizeDisplayScore(score: number | null | undefined, exactTextMatch = false): number | null {
+function normalizedSequenceRatio(left: string, right: string): number {
+  if (left === right) return 1
+  const rows = left.length + 1
+  const cols = right.length + 1
+  const lengths = Array.from({ length: rows }, () => Array<number>(cols).fill(0))
+  for (let row = 1; row < rows; row += 1) {
+    for (let col = 1; col < cols; col += 1) {
+      lengths[row][col] = left[row - 1] === right[col - 1]
+        ? lengths[row - 1][col - 1] + 1
+        : Math.max(lengths[row - 1][col], lengths[row][col - 1])
+    }
+  }
+  return (2 * lengths[left.length][right.length]) / Math.max(left.length + right.length, 1)
+}
+
+function capShortStructuralDisplayScore(
+  score: number,
+  sourceText: string | null | undefined,
+  matchedSourceText: string | null | undefined,
+) {
+  const normalizedSource = normalizeMatchText(sourceText)
+  const normalizedMatchedSource = normalizeMatchText(matchedSourceText)
+  if (!normalizedSource || !normalizedMatchedSource || normalizedSource === normalizedMatchedSource) {
+    return score
+  }
+  const sourceCore = compactMatchCore(normalizedSource)
+  const matchedCore = compactMatchCore(normalizedMatchedSource)
+  if (
+    sourceCore
+    && sourceCore === matchedCore
+    && (isShortStructuralFragment(normalizedSource) || isShortStructuralFragment(normalizedMatchedSource))
+  ) {
+    return Math.min(score, normalizedSequenceRatio(normalizedSource, normalizedMatchedSource), 0.79)
+  }
+  return score
+}
+
+function normalizeDisplayScore(
+  score: number | null | undefined,
+  exactTextMatch = false,
+  sourceText?: string | null,
+  matchedSourceText?: string | null,
+): number | null {
   if (score === null || score === undefined || !Number.isFinite(score)) return null
   const safeScore = Math.min(Math.max(score, 0), 1)
-  return exactTextMatch ? safeScore : Math.min(safeScore, FUZZY_DISPLAY_SCORE_CEILING)
+  const cappedScore = capShortStructuralDisplayScore(safeScore, sourceText, matchedSourceText)
+  return exactTextMatch ? cappedScore : Math.min(cappedScore, FUZZY_DISPLAY_SCORE_CEILING)
 }
 
 function formatScore(score: number | null | undefined): string {

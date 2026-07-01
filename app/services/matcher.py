@@ -15,7 +15,13 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models import MemoryEntry
 from app.schemas import MatchResult, TMMatchCandidate
-from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
+from app.services.normalizer import (
+    build_source_hash,
+    compact_match_core,
+    is_short_structural_fragment,
+    normalize_match_text,
+    normalize_text,
+)
 from app.services.tm_vector import (
     TM_EMBEDDING_VERSION,
     build_tm_embedding_literal,
@@ -30,6 +36,7 @@ DEFAULT_FUZZY_MATCH_BATCH_SIZE = 50
 FUZZY_CANDIDATE_LIMIT = 3
 TM_CANDIDATES_LIMIT = 5
 FUZZY_MISMATCH_SCORE_CEILING = 0.99
+SHORT_STRUCTURAL_MISMATCH_SCORE_CEILING = 0.79
 T = TypeVar("T")
 logger = logging.getLogger(__name__)
 
@@ -251,7 +258,18 @@ def _cap_fuzzy_mismatch_score(score: float, query_match_text: str, compare_text:
     normalized_compare = normalize_match_text(compare_text) or compare_text
     if normalized_query and normalized_query == normalized_compare:
         return safe_score
+    if _is_short_structural_core_match(normalized_query, normalized_compare):
+        sequence_score = SequenceMatcher(None, normalized_query, normalized_compare).ratio()
+        return min(safe_score, sequence_score, SHORT_STRUCTURAL_MISMATCH_SCORE_CEILING)
     return min(safe_score, FUZZY_MISMATCH_SCORE_CEILING)
+
+
+def _is_short_structural_core_match(query_text: str, compare_text: str) -> bool:
+    query_core = compact_match_core(query_text)
+    compare_core = compact_match_core(compare_text)
+    if not query_core or query_core != compare_core:
+        return False
+    return is_short_structural_fragment(query_text) or is_short_structural_fragment(compare_text)
 
 
 def match_sentences_with_stats(
@@ -411,8 +429,10 @@ def _resolve_matches(
             none_hits += 1
             continue
 
-        # 精确匹配只使用 source_hash，确保文本完全相同
-        exact_match = exact_matches_by_hash.get(sentence.auxiliary_hash)
+        # 带编号的辅助文本可优先匹配标题正文，但短编号片段不能因此被提升为精确匹配。
+        exact_match = None
+        if _allow_auxiliary_exact_match(sentence):
+            exact_match = exact_matches_by_hash.get(sentence.auxiliary_hash)
         if exact_match is None:
             exact_match = exact_matches_by_hash.get(sentence.source_hash)
 
@@ -516,6 +536,12 @@ def _find_exact_matches(
             matches_by_hash.setdefault(match.source_hash, match)
 
     return matches_by_hash
+
+
+def _allow_auxiliary_exact_match(sentence: PreparedSentence) -> bool:
+    if not sentence.auxiliary_hash or sentence.auxiliary_hash == sentence.source_hash:
+        return False
+    return not is_short_structural_fragment(sentence.source_sentence)
 
 
 def _find_fuzzy_matches(
@@ -853,14 +879,20 @@ def _pick_best_fuzzy_candidates(
 ) -> list[dict]:
     """返回Top N个最佳模糊匹配候选"""
     scored_candidates = []
+    allow_vector_boost = not is_short_structural_fragment(sentence.match_text)
 
     for candidate in candidates:
         compare_text_raw = candidate.get("compare_text") or candidate["source_text"]
         compare_text = normalize_match_text(compare_text_raw) or compare_text_raw
+        auxiliary_exact_signal = (
+            bool(sentence.auxiliary_match_text)
+            and not is_short_structural_fragment(sentence.match_text)
+            and compare_text == (normalize_match_text(sentence.auxiliary_match_text) or sentence.auxiliary_match_text)
+        )
         source_sequence_score = SequenceMatcher(None, sentence.match_text, compare_text).ratio()
         source_score = _blend_match_score(
             lexical_score=max(float(candidate["source_trigram_score"]), source_sequence_score),
-            vector_score=float(candidate.get("source_vector_score") or 0.0),
+            vector_score=float(candidate.get("source_vector_score") or 0.0) if allow_vector_boost else 0.0,
         )
 
         auxiliary_score = 0.0
@@ -875,14 +907,17 @@ def _pick_best_fuzzy_candidates(
                     float(candidate["auxiliary_trigram_score"]),
                     auxiliary_sequence_score,
                 ),
-                vector_score=float(candidate.get("auxiliary_vector_score") or 0.0),
+                vector_score=float(candidate.get("auxiliary_vector_score") or 0.0) if allow_vector_boost else 0.0,
             )
 
         base_score = max(source_score, auxiliary_score)
         final_score = base_score
         if auxiliary_score > source_score:
             final_score += min(auxiliary_score - source_score, 0.05)
-        final_score = _cap_fuzzy_mismatch_score(final_score, sentence.match_text, compare_text)
+        if auxiliary_exact_signal:
+            final_score = min(max(final_score, auxiliary_score), 1.0)
+        else:
+            final_score = _cap_fuzzy_mismatch_score(final_score, sentence.match_text, compare_text)
 
         if final_score >= similarity_threshold:
             scored_candidates.append({
@@ -894,10 +929,11 @@ def _pick_best_fuzzy_candidates(
                 "updated_at": candidate.get("updated_at"),
                 "score": final_score,
                 "base_score": base_score,
+                "auxiliary_exact": 1 if auxiliary_exact_signal else 0,
             })
 
     # 按分数排序，取Top N
-    scored_candidates.sort(key=lambda x: (x["score"], x["base_score"]), reverse=True)
+    scored_candidates.sort(key=lambda x: (x["auxiliary_exact"], x["score"], x["base_score"]), reverse=True)
     return scored_candidates[:top_n]
 
 

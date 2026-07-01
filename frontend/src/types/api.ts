@@ -661,6 +661,7 @@ export interface SegmentPageFilters {
   status_filters?: string[]
   match_filters?: string[]
   source_filters?: string[]
+  source_content_filters?: string[]
   workflow_step_ids?: string[]
 }
 
