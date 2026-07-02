@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import UUID
@@ -7,7 +8,8 @@ from uuid import UUID
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from app.models import FileRecord, Segment
+from app.database import SessionLocal
+from app.models import FileRecord, Segment, User
 from app.services.analytics_service import count_source_words, record_translation_metric_event
 from app.services.automatic_numbering import (
     is_word_document_filename,
@@ -18,6 +20,7 @@ from app.services.normalizer import build_source_hash, normalize_text
 
 PROJECT_SYNC_SOURCE = "project_sync"
 PROJECT_SYNC_STATUS = "exact"
+logger = logging.getLogger(__name__)
 
 _SOURCE_PRIORITY = {
     "manual": 30,
@@ -205,6 +208,8 @@ def sync_project_repeated_segments_from_segments(
                 Segment.id != resolved.segment.id,
                 _segment_project_sync_enabled(),
             )
+            .order_by(Segment.id.asc())
+            .with_for_update(skip_locked=True)
             .all()
         )
         _apply_candidate_to_targets(
@@ -219,6 +224,65 @@ def sync_project_repeated_segments_from_segments(
     if summary.filled_count or summary.updated_count:
         db.flush()
     return summary
+
+
+def run_project_sync_for_segment_ids(
+    file_record_id: UUID,
+    segment_ids: list[UUID],
+    current_user_id: UUID | None = None,
+) -> ProjectSegmentSyncSummary:
+    """在独立 DB session 中执行项目重复句段同步，供后台 worker 调用。"""
+    unique_segment_ids = list(dict.fromkeys(segment_ids))
+    if not unique_segment_ids:
+        return ProjectSegmentSyncSummary()
+
+    with SessionLocal() as db:
+        file_record = db.query(FileRecord).filter(FileRecord.id == file_record_id).first()
+        if not file_record:
+            return ProjectSegmentSyncSummary()
+        current_user = (
+            db.query(User).filter(User.id == current_user_id).first()
+            if current_user_id is not None
+            else None
+        )
+        segments = (
+            db.query(Segment)
+            .filter(
+                Segment.file_record_id == file_record_id,
+                Segment.id.in_(unique_segment_ids),
+            )
+            .all()
+        )
+        if not segments:
+            return ProjectSegmentSyncSummary()
+
+        try:
+            summary = sync_project_repeated_segments_from_segments(
+                db,
+                file_record=file_record,
+                source_segments=segments,
+                current_user=current_user,
+            )
+            db.commit()
+            if summary.filled_count or summary.updated_count or summary.conflict_count:
+                logger.info(
+                    "project sync completed file_record_id=%s segments=%s filled=%s updated=%s conflicts=%s affected_files=%s",
+                    file_record_id,
+                    len(unique_segment_ids),
+                    summary.filled_count,
+                    summary.updated_count,
+                    summary.conflict_count,
+                    summary.affected_file_count,
+                )
+            return summary
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "project sync failed file_record_id=%s segments=%s",
+                file_record_id,
+                len(unique_segment_ids),
+            )
+            raise
 
 
 def backfill_segment_source_hashes(db: Session, *, batch_size: int = 500) -> int:
@@ -259,6 +323,8 @@ def _fill_targets_from_project_candidates(
             _segment_project_sync_enabled(),
             func.trim(func.coalesce(Segment.target_text, "")) != "",
         )
+        .order_by(Segment.id.asc())
+        .with_for_update(skip_locked=True)
         .all()
     )
     candidates = [candidate for candidate in (_build_candidate(row) for row in candidate_rows) if candidate is not None]

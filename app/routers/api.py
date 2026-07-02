@@ -274,8 +274,8 @@ from app.services.project_segment_sync import (
     disable_project_sync_for_segments,
     empty_project_segment_sync_summary,
     enable_project_sync_for_segments,
+    run_project_sync_for_segment_ids,
     sync_project_repeated_segments_from_file,
-    sync_project_repeated_segments_from_segments,
 )
 from app.services.term_importer import (
     TERM_IMPORT_EXTENSIONS,
@@ -585,6 +585,29 @@ async def _dispatch_auto_tm_rematch_background() -> None:
     if await _enqueue_arq_job("auto_tm_rematch_background_job"):
         return
     await asyncio.to_thread(run_auto_tm_rematch_background_once)
+
+
+async def _dispatch_project_segment_sync(
+    file_record_id: UUID,
+    segment_ids: list[UUID],
+    current_user_id: UUID | None,
+) -> None:
+    """优先把项目重复句段同步投递到 arq worker，失败时后台线程兜底。"""
+    if not segment_ids:
+        return
+    if await _enqueue_arq_job(
+        "project_segment_sync_job",
+        str(file_record_id),
+        [str(segment_id) for segment_id in segment_ids],
+        str(current_user_id) if current_user_id else None,
+    ):
+        return
+    await asyncio.to_thread(
+        run_project_sync_for_segment_ids,
+        file_record_id,
+        segment_ids,
+        current_user_id,
+    )
 
 
 async def _queue_import_task(
@@ -1231,6 +1254,20 @@ async def auto_tm_rematch_background_job(ctx) -> None:
     await asyncio.to_thread(run_auto_tm_rematch_background_once)
 
 
+async def project_segment_sync_job(
+    ctx,
+    file_record_id: str,
+    segment_ids: list[str],
+    current_user_id: str | None = None,
+) -> None:
+    await asyncio.to_thread(
+        run_project_sync_for_segment_ids,
+        UUID(file_record_id),
+        [UUID(segment_id) for segment_id in segment_ids],
+        UUID(current_user_id) if current_user_id else None,
+    )
+
+
 async def _dispatch_pretranslation_run(run_id: UUID) -> None:
     if await _enqueue_arq_job(
         "pretranslation_run_job",
@@ -1265,6 +1302,7 @@ class MaintenanceWorkerSettings:
         spelling_grammar_qa_project_job,
         auto_tm_background_job,
         auto_tm_rematch_background_job,
+        project_segment_sync_job,
     ]
     redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
 
@@ -8928,6 +8966,30 @@ def _schedule_auto_tm_processing(
         background_tasks.add_task(_dispatch_auto_tm_background)
 
 
+def _schedule_project_segment_sync_for_segments(
+    background_tasks: BackgroundTasks | None,
+    file_record: FileRecord,
+    segments: Iterable[Segment],
+    current_user: User | None,
+) -> None:
+    if background_tasks is None:
+        return
+    segment_ids = [
+        segment.id
+        for segment in segments
+        if normalize_text(getattr(segment, "target_text", "") or "")
+        and not getattr(segment, "project_sync_disabled", False)
+    ]
+    if not segment_ids:
+        return
+    background_tasks.add_task(
+        _dispatch_project_segment_sync,
+        file_record.id,
+        list(dict.fromkeys(segment_ids)),
+        current_user.id if current_user else None,
+    )
+
+
 def _notify_tm_collections_changed(
     db: Session,
     collection_ids: list[UUID],
@@ -12074,13 +12136,7 @@ def update_segment(
         raise HTTPException(status_code=404, detail="片段不存在。")
 
     project_sync_summary = empty_project_segment_sync_summary()
-    if normalize_text(segment.target_text) and not segment.project_sync_disabled:
-        project_sync_summary = sync_project_repeated_segments_from_segments(
-            db,
-            file_record=file_record,
-            source_segments=[segment],
-            current_user=current_user,
-        )
+    segments_for_project_sync = [segment]
 
     auto_tm_summary = _empty_auto_tm_summary()
     if segment.status == "confirmed":
@@ -12093,13 +12149,19 @@ def update_segment(
     if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0 or project_sync_summary.updated_count > 0:
         db.commit()
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+    _schedule_project_segment_sync_for_segments(
+        background_tasks,
+        file_record,
+        segments_for_project_sync,
+        current_user,
+    )
     workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
         db,
         file_record,
         current_user,
     )
     target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
-    response_segments = [segment, *project_sync_summary.current_file_segments]
+    response_segments = [segment]
     qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, response_segments)
     display_index_map = _get_segment_display_index_map(db, file_record_id, response_segments)
     _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, response_segments)
@@ -12574,13 +12636,6 @@ def batch_update(
         if normalize_text(segment.target_text) and not segment.project_sync_disabled
     ]
     project_sync_summary = empty_project_segment_sync_summary()
-    if segments_for_project_sync:
-        project_sync_summary = sync_project_repeated_segments_from_segments(
-            db,
-            file_record=file_record,
-            source_segments=segments_for_project_sync,
-            current_user=current_user,
-        )
     auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(
         db,
         file_record=file_record,
@@ -12590,13 +12645,19 @@ def batch_update(
     if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0 or project_sync_summary.updated_count > 0:
         db.commit()
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+    _schedule_project_segment_sync_for_segments(
+        background_tasks,
+        file_record,
+        segments_for_project_sync,
+        current_user,
+    )
     workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
         db,
         file_record,
         current_user,
     )
     target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
-    response_segments = [*result.updated_segments, *project_sync_summary.current_file_segments]
+    response_segments = [*result.updated_segments]
     qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, response_segments)
     display_index_map = _get_segment_display_index_map(db, file_record_id, response_segments)
     _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, response_segments)
@@ -12685,19 +12746,13 @@ def batch_update_segment_confirmation(
 
     auto_tm_summary = _empty_auto_tm_summary()
     project_sync_summary = empty_project_segment_sync_summary()
+    confirmed_segments_for_sync: list[Segment] = []
     if payload.action == "confirm" and updated_count:
         confirmed_segments_for_sync = [
             segment
             for segment in segments
             if segment.status == "confirmed" and normalize_text(segment.target_text)
         ]
-        if confirmed_segments_for_sync:
-            project_sync_summary = sync_project_repeated_segments_from_segments(
-                db,
-                file_record=file_record,
-                source_segments=confirmed_segments_for_sync,
-                current_user=current_user,
-            )
         auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(
             db,
             file_record=file_record,
@@ -12709,6 +12764,12 @@ def batch_update_segment_confirmation(
         sync_file_record_status(db, file_record_id)
         db.commit()
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+        _schedule_project_segment_sync_for_segments(
+            background_tasks,
+            file_record,
+            confirmed_segments_for_sync,
+            current_user,
+        )
 
     return {
         "updated_count": updated_count,

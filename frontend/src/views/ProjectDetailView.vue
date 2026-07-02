@@ -668,6 +668,96 @@ let activePretranslationPollTimer: number | null = null
 const ACTIVE_PRETRANSLATION_STATUSES = new Set(['queued', 'running', 'canceling'])
 const ACTIVE_PRETRANSLATION_POLL_INTERVAL_MS = 2_500
 const FILE_UNASSIGNED_FILTER = '__unassigned__'
+const FILE_PAGE_QUERY_KEY = 'filePage'
+const FILE_PAGE_SIZE_QUERY_KEY = 'filePageSize'
+const FILE_PAGE_SIZES = [10, 20, 50, 100, 200]
+const DEFAULT_FILE_PAGE_SIZE = FILE_PAGE_SIZES[0]
+
+function getFirstQueryValue(value: unknown) {
+  return Array.isArray(value) ? value[0] : value
+}
+
+function readPositiveQueryNumber(value: unknown, fallback: number) {
+  const raw = getFirstQueryValue(value)
+  const parsed = Number.parseInt(String(raw ?? ''), 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
+function readFilePageFromQuery() {
+  return readPositiveQueryNumber(route.query[FILE_PAGE_QUERY_KEY], 1)
+}
+
+function readFilePageSizeFromQuery() {
+  const size = readPositiveQueryNumber(route.query[FILE_PAGE_SIZE_QUERY_KEY], DEFAULT_FILE_PAGE_SIZE)
+  return FILE_PAGE_SIZES.includes(size) ? size : DEFAULT_FILE_PAGE_SIZE
+}
+
+function getExpectedFilePaginationQueryValue(key: string) {
+  if (key === FILE_PAGE_QUERY_KEY) {
+    return currentPage.value > 1 ? String(currentPage.value) : undefined
+  }
+  if (key === FILE_PAGE_SIZE_QUERY_KEY) {
+    return pageSize.value !== DEFAULT_FILE_PAGE_SIZE ? String(pageSize.value) : undefined
+  }
+  return undefined
+}
+
+function isFilePaginationQuerySynced() {
+  const currentPageQuery = getFirstQueryValue(route.query[FILE_PAGE_QUERY_KEY])
+  const currentPageSizeQuery = getFirstQueryValue(route.query[FILE_PAGE_SIZE_QUERY_KEY])
+  return (
+    currentPageQuery === getExpectedFilePaginationQueryValue(FILE_PAGE_QUERY_KEY)
+    && currentPageSizeQuery === getExpectedFilePaginationQueryValue(FILE_PAGE_SIZE_QUERY_KEY)
+  )
+}
+
+function syncFilePaginationToRouteQuery() {
+  if (isFilePaginationQuerySynced()) {
+    return
+  }
+
+  const query = { ...route.query }
+  const pageQueryValue = getExpectedFilePaginationQueryValue(FILE_PAGE_QUERY_KEY)
+  const pageSizeQueryValue = getExpectedFilePaginationQueryValue(FILE_PAGE_SIZE_QUERY_KEY)
+
+  if (pageQueryValue) {
+    query[FILE_PAGE_QUERY_KEY] = pageQueryValue
+  } else {
+    delete query[FILE_PAGE_QUERY_KEY]
+  }
+  if (pageSizeQueryValue) {
+    query[FILE_PAGE_SIZE_QUERY_KEY] = pageSizeQueryValue
+  } else {
+    delete query[FILE_PAGE_SIZE_QUERY_KEY]
+  }
+
+  void router.replace({
+    path: route.path,
+    query,
+    hash: route.hash,
+  })
+}
+
+function applyFilePaginationFromRouteQuery() {
+  const nextPageSize = readFilePageSizeFromQuery()
+  const nextPage = readFilePageFromQuery()
+  if (pageSize.value !== nextPageSize) {
+    pageSize.value = nextPageSize
+  }
+  if (currentPage.value !== nextPage) {
+    currentPage.value = nextPage
+  }
+  syncFilePaginationToRouteQuery()
+}
+
+function setFilePage(page: number) {
+  currentPage.value = Math.max(1, Math.floor(page))
+}
+
+function setFilePageSize(size: number) {
+  pageSize.value = FILE_PAGE_SIZES.includes(size) ? size : DEFAULT_FILE_PAGE_SIZE
+  currentPage.value = 1
+}
 
 const tabs = computed(() => ([
   { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
@@ -2953,7 +3043,7 @@ async function deleteSavedMergeView(view: MergeView) {
   }
 }
 
-async function loadProject() {
+async function loadProject(options: { preserveFilePagination?: boolean } = {}) {
   loading.value = true
   pageError.value = ''
 
@@ -2963,7 +3053,11 @@ async function loadProject() {
     ensureActiveAssignmentWorkflowStep()
     syncSettingsForm(data)
     guidelinesText.value = data.translation_guidelines || ''
-    currentPage.value = 1
+    if (options.preserveFilePagination) {
+      applyFilePaginationFromRouteQuery()
+    } else {
+      currentPage.value = 1
+    }
     selectedFileIds.value = new Set<string>()
     statisticsSelectedFileIds.value = new Set<string>()
     statisticsResultFileIds.value = new Set<string>()
@@ -4548,7 +4642,7 @@ onMounted(() => {
   window.addEventListener('resize', handleDocumentScroll)
   syncProjectSettingsHash()
   void (async () => {
-    await loadProject()
+    await loadProject({ preserveFilePagination: true })
     syncProjectSettingsHash()
     if (route.query.assign === '1' && canManageProject.value) {
       await openAssignmentDialog()
@@ -4559,6 +4653,10 @@ onMounted(() => {
 
 watch(() => route.hash, () => {
   syncProjectSettingsHash()
+})
+
+watch(() => [route.query[FILE_PAGE_QUERY_KEY], route.query[FILE_PAGE_SIZE_QUERY_KEY]], () => {
+  applyFilePaginationFromRouteQuery()
 })
 
 watch([fileSearchQuery, fileStatusFilter, fileLanguagePairFilter, fileAssigneeFilter], () => {
@@ -4575,6 +4673,10 @@ watch([filteredTableRows, pageSize], () => {
   if (currentPage.value > totalPages) {
     currentPage.value = totalPages
   }
+})
+
+watch([currentPage, pageSize], () => {
+  syncFilePaginationToRouteQuery()
 })
 
 onBeforeUnmount(() => {
@@ -6459,9 +6561,9 @@ onBeforeUnmount(() => {
           :total="filteredTableRows.length"
           :page="currentPage"
           :page-size="pageSize"
-          :page-sizes="[10, 20, 50, 100, 200]"
-          @update:page="currentPage = $event"
-          @update:page-size="pageSize = $event"
+          :page-sizes="FILE_PAGE_SIZES"
+          @update:page="setFilePage"
+          @update:page-size="setFilePageSize"
         />
       </section>
 

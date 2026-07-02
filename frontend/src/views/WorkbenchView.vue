@@ -231,6 +231,7 @@ type ResourceSearchResponse = {
 }
 
 const REVISION_TRACE_VISIBLE_STORAGE_KEY = 'workbench.revisionTraceEnabled'
+const WORKBENCH_RIBBON_COLLAPSED_STORAGE_KEY = 'workbench.ribbonCollapsed'
 const QA_RESULT_PAGE_SIZE = 50
 const BOTTOM_DRAWER_MIN_HEIGHT = 260
 const BOTTOM_DRAWER_TOP_GUTTER = 70
@@ -242,6 +243,13 @@ function getInitialRevisionTraceVisible() {
     return false
   }
   return window.localStorage.getItem(REVISION_TRACE_VISIBLE_STORAGE_KEY) === '1'
+}
+
+function getInitialWorkbenchRibbonCollapsed() {
+  if (typeof window === 'undefined') {
+    return false
+  }
+  return window.localStorage.getItem(WORKBENCH_RIBBON_COLLAPSED_STORAGE_KEY) === '1'
 }
 
 const router = useRouter()
@@ -417,6 +425,7 @@ const importDialogInitialTab = ref<ResourceImportTab>('tm')
 const showWorkbenchSettings = ref(false)
 const activeWorkbenchSettingsTab = ref<WorkbenchSettingsTab>('preferences')
 const showSaveToTMDialog = ref(false)
+const workbenchRibbonCollapsed = ref(getInitialWorkbenchRibbonCollapsed())
 const openConfirmMenu = ref(false)
 const confirmationActionLoading = ref(false)
 const confirmJumpActionLoading = ref(false)
@@ -1456,6 +1465,10 @@ const lastModifiedStatusText = computed(() => {
 
 const ribbonStatusTitle = computed(() => (
   `${lastModifiedStatusText.value} · ${segmentStore.syncMessage} · ${segmentStore.llmMessage}`
+))
+
+const workbenchRibbonCollapseTitle = computed(() => (
+  workbenchRibbonCollapsed.value ? '展开工具栏' : '收起工具栏'
 ))
 
 const activeSegment = computed(() => (
@@ -5323,6 +5336,26 @@ function closeAllMenus() {
   showSpecialCharMenu.value = false
 }
 
+function closeRibbonMenus() {
+  closeAllMenus()
+  showExportMenu.value = false
+  openConfirmMenu.value = false
+  openRevisionMenu.value = null
+}
+
+function toggleWorkbenchRibbonCollapsed() {
+  workbenchRibbonCollapsed.value = !workbenchRibbonCollapsed.value
+  if (workbenchRibbonCollapsed.value) {
+    closeRibbonMenus()
+  }
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem(
+      WORKBENCH_RIBBON_COLLAPSED_STORAGE_KEY,
+      workbenchRibbonCollapsed.value ? '1' : '0',
+    )
+  }
+}
+
 /**
  * 插入特殊字符到当前活动编辑器
  */
@@ -6749,10 +6782,19 @@ onBeforeRouteLeave(async () => {
 <template>
   <div
     class="content-stack content-stack--workbench workbench-page"
-    :class="{ 'is-standalone': isStandaloneWorkbench, 'is-stable-grid': isStandaloneWorkbench }"
+    :class="{
+      'is-standalone': isStandaloneWorkbench,
+      'is-stable-grid': isStandaloneWorkbench,
+      'is-ribbon-collapsed': isStandaloneWorkbench && workbenchRibbonCollapsed,
+    }"
     data-testid="workbench-page"
   >
-    <section v-if="isStandaloneWorkbench" class="toolbar-panel workbench-toolbar workbench-ribbon" data-testid="workbench-ribbon">
+    <section
+      v-if="isStandaloneWorkbench"
+      class="toolbar-panel workbench-toolbar workbench-ribbon"
+      :class="{ 'is-collapsed': workbenchRibbonCollapsed }"
+      data-testid="workbench-ribbon"
+    >
       <div class="workbench-ribbon__tabs">
         <button class="workbench-ribbon__tab is-active" type="button">
           {{ t('workbench.ribbon.startTab') }}
@@ -6819,6 +6861,19 @@ onBeforeRouteLeave(async () => {
           </div>
         </div>
         <button
+          class="workbench-ribbon__collapse"
+          data-testid="workbench-ribbon-collapse"
+          type="button"
+          :class="{ 'is-active': workbenchRibbonCollapsed }"
+          :title="workbenchRibbonCollapseTitle"
+          :aria-label="workbenchRibbonCollapseTitle"
+          :aria-expanded="!workbenchRibbonCollapsed"
+          @click="toggleWorkbenchRibbonCollapsed"
+        >
+          <ChevronDown v-if="workbenchRibbonCollapsed" :size="16" />
+          <ChevronUp v-else :size="16" />
+        </button>
+        <button
           class="workbench-ribbon__help"
           type="button"
           :title="t('workbench.settings.title')"
@@ -6829,7 +6884,7 @@ onBeforeRouteLeave(async () => {
         </button>
       </div>
 
-      <div v-if="!authStore.isExternalTranslator" class="workbench-ribbon__ai-strip" aria-label="AI">
+      <div v-if="!authStore.isExternalTranslator && !workbenchRibbonCollapsed" class="workbench-ribbon__ai-strip" aria-label="AI">
         <label class="ai-strip__field">
           <span>{{ t('workbench.aiScopeShort') }}</span>
           <select v-model="llmScope" class="field__control" :title="activeMergeFileContextTitle || t('workbench.aiScope')">
@@ -6899,7 +6954,7 @@ onBeforeRouteLeave(async () => {
         </button>
       </div>
 
-      <div class="workbench-ribbon__container container">
+      <div v-if="!workbenchRibbonCollapsed" class="workbench-ribbon__container container">
         <div class="tool-group tool-group--confirm workbench-confirm-menu">
           <button
             class="tool-col tool-col--big tool-button"
@@ -7484,7 +7539,7 @@ onBeforeRouteLeave(async () => {
         </div>
       </div>
 
-      <div class="workbench-ribbon__status" role="status" :title="ribbonStatusTitle">
+      <div v-if="!workbenchRibbonCollapsed" class="workbench-ribbon__status" role="status" :title="ribbonStatusTitle">
         <span class="workbench-ribbon__modified-time">{{ lastModifiedStatusText }}</span>
         <span aria-hidden="true">·</span>
         <span>{{ segmentStore.syncMessage }}</span>
@@ -10018,6 +10073,10 @@ onBeforeRouteLeave(async () => {
   box-shadow: none;
 }
 
+.workbench-page.is-standalone.is-ribbon-collapsed {
+  --workbench-side-panel-top: 54px;
+}
+
 .workbench-page.is-standalone {
   grid-template-rows: auto minmax(0, 1fr);
 }
@@ -10150,6 +10209,10 @@ onBeforeRouteLeave(async () => {
   background: linear-gradient(180deg, #eef2f5, #e7edf1);
 }
 
+.workbench-ribbon.is-collapsed .workbench-ribbon__tabs {
+  border-bottom: 0;
+}
+
 .workbench-ribbon__tab {
   align-self: stretch;
   min-width: 90px;
@@ -10236,12 +10299,13 @@ onBeforeRouteLeave(async () => {
   opacity: 0.48;
 }
 
-.workbench-ribbon__help {
+.workbench-ribbon__help,
+.workbench-ribbon__collapse {
   display: inline-grid;
   place-items: center;
   width: 30px;
   height: 30px;
-  margin-right: 8px;
+  margin-right: 4px;
   border: 1px solid transparent;
   border-radius: 6px;
   background: transparent;
@@ -10249,10 +10313,23 @@ onBeforeRouteLeave(async () => {
   box-shadow: none;
 }
 
-.workbench-ribbon__help:hover {
+.workbench-ribbon__help {
+  margin-right: 8px;
+}
+
+.workbench-ribbon__help:hover,
+.workbench-ribbon__collapse:hover,
+.workbench-ribbon__collapse:focus-visible {
   border-color: var(--line-soft);
   background: #fff;
   color: var(--brand-700);
+  outline: none;
+}
+
+.workbench-ribbon__collapse.is-active {
+  border-color: #b9d3df;
+  background: #fff;
+  color: #0f6f83;
 }
 
 .workbench-ribbon__container {
