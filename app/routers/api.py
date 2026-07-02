@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 import re
-from concurrent.futures import CancelledError, ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import partial
@@ -1288,6 +1288,11 @@ def _resolve_arq_worker_max_jobs(configured: int | None, fallback: int = 1) -> i
     return max(int(configured), 1)
 
 
+def _resolve_pretranslation_run_file_concurrency() -> int:
+    configured = get_settings().pretranslation_run_file_concurrency
+    return max(int(configured or 1), 1)
+
+
 class MaintenanceWorkerSettings:
     queue_name = ARQ_MAINTENANCE_QUEUE_NAME
     max_jobs = _resolve_arq_worker_max_jobs(
@@ -2012,6 +2017,50 @@ def _run_pretranslation_task(task_id: UUID) -> None:
         _release_pretranslation_task_lock(task_id)
 
 
+def _run_pretranslation_tasks_for_run(run_id: UUID, task_ids: list[UUID]) -> None:
+    if not task_ids:
+        return
+    max_workers = min(_resolve_pretranslation_run_file_concurrency(), len(task_ids))
+    if max_workers <= 1:
+        for task_id in task_ids:
+            _run_pretranslation_task(task_id)
+        return
+
+    logger.info(
+        "pretranslation run processing files concurrently run_id=%s task_count=%s file_concurrency=%s",
+        run_id,
+        len(task_ids),
+        max_workers,
+    )
+    with ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="pretranslation-file",
+    ) as executor:
+        futures = {
+            executor.submit(_run_pretranslation_task, task_id): task_id
+            for task_id in task_ids
+        }
+        for future in as_completed(futures):
+            task_id = futures[future]
+            try:
+                future.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "pretranslation task crashed outside task handler run_id=%s task_id=%s",
+                    run_id,
+                    task_id,
+                )
+                _update_pretranslation_task(
+                    task_id,
+                    status="failed",
+                    stage="failed",
+                    progress=100,
+                    message="预翻译失败",
+                    error=str(exc),
+                    current_action="failed",
+                )
+
+
 def _run_pretranslation_run(run_id: UUID) -> None:
     with SessionLocal() as db:
         run = db.query(PretranslationRun).filter(PretranslationRun.id == run_id).first()
@@ -2032,8 +2081,7 @@ def _run_pretranslation_run(run_id: UUID) -> None:
         ]
         db.commit()
 
-    for task_id in task_ids:
-        _run_pretranslation_task(task_id)
+    _run_pretranslation_tasks_for_run(run_id, task_ids)
 
     with SessionLocal() as db:
         run = db.query(PretranslationRun).filter(PretranslationRun.id == run_id).first()

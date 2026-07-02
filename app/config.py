@@ -66,6 +66,8 @@ class Settings(BaseSettings):
     # 为空或 0 时继承 ARQ_MAX_JOBS；生产环境可单独设置维护队列/预翻译队列并发。
     arq_maintenance_max_jobs: int | None = None
     arq_pretranslation_max_jobs: int | None = None
+    # 单个项目预翻译批次内，同时处理的文件任务数。仍会叠加 LLM_MAX_CONCURRENCY 的限制。
+    pretranslation_run_file_concurrency: int = 2
     auto_tm_rematch_max_files_per_run: int = 10
     aspose_words_license_path: str | None = None
     libreoffice_soffice_path: str | None = None

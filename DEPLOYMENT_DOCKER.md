@@ -61,9 +61,13 @@ nginx 的 `client_max_body_size` 在 `docker/nginx/default.conf`，默认 **500m
 
 | 变量 | 推荐起点 | 说明 |
 |------|----------|------|
-| `ARQ_MAINTENANCE_MAX_JOBS` | 3 | 上传导入、资源导入、QA、自动 TM 重匹配等维护队列并发 |
-| `ARQ_PRETRANSLATION_MAX_JOBS` | 2 | 项目预翻译队列并发；每个任务内部仍受 `LLM_MAX_CONCURRENCY` 限制 |
+| `ARQ_MAINTENANCE_MAX_JOBS` | 4 | 上传导入、资源导入、QA、自动 TM 重匹配、项目重复句段同步等维护队列并发 |
+| `ARQ_PRETRANSLATION_MAX_JOBS` | 2 | 项目预翻译 run 队列并发 |
+| `PRETRANSLATION_RUN_FILE_CONCURRENCY` | 2 | 单个预翻译 run 内同时处理的文件数 |
+| `LLM_MAX_CONCURRENCY` | 3 | 单个文件 LLM 阶段的模型请求并发 |
 | `ARQ_MAX_JOBS` | 5 | 维护队列未单独设置时的全局兜底值 |
+
+LLM 预翻译的理论请求上限约为 `ARQ_PRETRANSLATION_MAX_JOBS × PRETRANSLATION_RUN_FILE_CONCURRENCY × LLM_MAX_CONCURRENCY`。若模型服务出现 429、超时或错误率升高，优先下调 `LLM_MAX_CONCURRENCY` 或 `PRETRANSLATION_RUN_FILE_CONCURRENCY`。
 
 密码含 `@`、`:`、`/`、`?`、`#` 等字符时，`DATABASE_URL` 须 URL 编码。
 

@@ -179,6 +179,7 @@ Copy-Item .env.example .env
 | `TM_VECTOR_*`                                 | pgvector 语义检索开关、维度、候选数和权重                                                                   |
 | `DEEPSEEK_*` / `OPENROUTER_*`                 | LLM Provider 配置，AI 修正至少需要一个 API Key                                                         |
 | `LLM_TIMEOUT_SECONDS` / `LLM_STALL_TIMEOUT_SECONDS` / `LLM_MAX_CONCURRENCY` | LLM 单次请求超时、无进展中止阈值与并发控制                                                                 |
+| `ARQ_MAINTENANCE_MAX_JOBS` / `ARQ_PRETRANSLATION_MAX_JOBS` / `PRETRANSLATION_RUN_FILE_CONCURRENCY` | 后台维护队列、预翻译 run 队列和单个预翻译批次内文件并发控制 |
 | `LANGUAGETOOL_BASE_URL` / `LANGUAGETOOL_TIMEOUT_SECONDS` / `LANGUAGETOOL_MAX_TEXT_LENGTH` | 拼写/语法 QA 使用的自托管 LanguageTool HTTP Server 配置；未配置时自动跳过 QA，不影响译文保存。 |
 
 
