@@ -353,6 +353,8 @@ REQUIRED_SCHEMA = {
         "workflow_step_id",
         "source_hash",
         "project_sync_disabled",
+        "project_sync_source_segment_id",
+        "project_sync_source_file_record_id",
         "source_word_count",
         "llm_provider",
         "llm_model",
@@ -518,6 +520,8 @@ REQUIRED_INDEXES = {
         "ix_segments_source_word_count",
         "ix_segments_source_hash",
         "ix_segments_file_source_hash",
+        "ix_segments_project_sync_source_segment_id",
+        "ix_segments_project_sync_source_file_record_id",
         "ix_segments_translated_source_word_count",
         "ix_segments_source_word_backfill",
         "ix_segments_translated_backfill",
@@ -851,12 +855,28 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ADD COLUMN IF NOT EXISTS project_sync_disabled BOOLEAN NOT NULL DEFAULT FALSE
             """,
             """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS project_sync_source_segment_id UUID REFERENCES segments(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS project_sync_source_file_record_id UUID REFERENCES file_records(id) ON DELETE SET NULL
+            """,
+            """
             CREATE INDEX IF NOT EXISTS ix_segments_source_hash
             ON segments (source_hash)
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_segments_file_source_hash
             ON segments (file_record_id, source_hash)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_project_sync_source_segment_id
+            ON segments (project_sync_source_segment_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_project_sync_source_file_record_id
+            ON segments (project_sync_source_file_record_id)
             """,
             f"""
             CREATE TABLE IF NOT EXISTS term_bases (
@@ -1973,6 +1993,14 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ADD COLUMN IF NOT EXISTS target_html TEXT
             """,
             """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS project_sync_source_segment_id UUID REFERENCES segments(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS project_sync_source_file_record_id UUID REFERENCES file_records(id) ON DELETE SET NULL
+            """,
+            """
             CREATE INDEX IF NOT EXISTS ix_segments_file_record_order
             ON segments (file_record_id, block_index, row_index, cell_index, sentence_id)
             """,
@@ -1987,6 +2015,14 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_segments_last_modified_by_id
             ON segments (last_modified_by_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_project_sync_source_segment_id
+            ON segments (project_sync_source_segment_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_project_sync_source_file_record_id
+            ON segments (project_sync_source_file_record_id)
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_segments_translated_source_word_count

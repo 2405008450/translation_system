@@ -5,6 +5,7 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import type {
+  ProjectSyncOrigin,
   ReferenceExactMatch,
   ReferenceFuzzyMatch,
   ReferenceMatchResult,
@@ -39,7 +40,7 @@ type MatchedTermDisplay = {
   updated_at: string | null
 }
 
-type MatchRowTone = 'exact' | 'high' | 'medium' | 'low' | 'term'
+type MatchRowTone = 'exact' | 'high' | 'medium' | 'low' | 'term' | 'sync'
 type MatchApplyMode = 'replace' | 'append'
 
 type MatchDetailItem = {
@@ -93,6 +94,7 @@ const confirm = useConfirm()
 const tmCandidates = ref<TMMatchCandidate[]>([])
 const loadingCandidates = ref(false)
 const selectedRowId = ref('')
+const selectedRowPinned = ref(false)
 const editingRowId = ref('')
 const editSourceText = ref('')
 const editTargetText = ref('')
@@ -117,6 +119,7 @@ const termEntryById = computed(() => {
 })
 
 const currentUserId = computed(() => authStore.user?.id || '')
+const canManageResourceEntries = computed(() => authStore.isAdmin || authStore.isInternalTranslator)
 
 const matchedTerms = computed<MatchedTermDisplay[]>(() => {
   if (!props.activeSourceText) return []
@@ -190,6 +193,10 @@ const currentSegmentRefTermMatch = computed<ReferenceTermMatch | null>(() => {
 
 const matchRows = computed<MatchDisplayRow[]>(() => {
   const rows: MatchDisplayRow[] = []
+
+  if (props.segment?.source === 'project_sync') {
+    rows.push(buildProjectSyncRow(props.segment.project_sync_origin ?? null))
+  }
 
   const exactMatch = currentSegmentRefExactMatch.value
   if (exactMatch) {
@@ -318,13 +325,26 @@ async function loadTMCandidates(
 watch(
   () => [props.segment?.id ?? '', props.fileRecordId ?? '', props.segment?.source_text ?? ''],
   ([segmentId, fileRecordId, sourceText]) => {
+    candidateRequestId += 1
+    clearCandidateLoadTimer()
+    selectedRowId.value = ''
+    selectedRowPinned.value = false
+    tmCandidates.value = []
+
     if (!segmentId || !fileRecordId) {
-      candidateRequestId += 1
-      clearCandidateLoadTimer()
-      tmCandidates.value = []
       loadingCandidates.value = false
       return
     }
+
+    const cacheKey = buildTMCandidateCacheKey(segmentId, fileRecordId, sourceText)
+    const cached = tmCandidateCache.get(cacheKey)
+    if (cached && cached.expiresAt > Date.now()) {
+      tmCandidates.value = cached.candidates
+      loadingCandidates.value = false
+      return
+    }
+
+    loadingCandidates.value = true
     scheduleTMCandidatesLoad(segmentId, fileRecordId, sourceText)
   },
   { immediate: true },
@@ -340,10 +360,18 @@ watch(
   (rows) => {
     if (rows.length === 0) {
       selectedRowId.value = ''
+      selectedRowPinned.value = false
       return
     }
 
-    if (!rows.some((row) => row.id === selectedRowId.value)) {
+    const hasSelectedRow = rows.some((row) => row.id === selectedRowId.value)
+    if (!hasSelectedRow) {
+      selectedRowPinned.value = false
+      selectedRowId.value = rows[0].id
+      return
+    }
+
+    if (!selectedRowPinned.value && selectedRowId.value !== rows[0].id) {
       selectedRowId.value = rows[0].id
     }
   },
@@ -374,7 +402,43 @@ function buildEditableRowMeta(
     editableKind: normalizedEntryId ? kind : null,
     entryId: normalizedEntryId,
     creatorId: normalizedCreatorId,
-    canEdit: Boolean(normalizedEntryId && normalizedCreatorId && normalizedCreatorId === currentUserId.value),
+    canEdit: Boolean(
+      normalizedEntryId
+      && (canManageResourceEntries.value || (normalizedCreatorId && normalizedCreatorId === currentUserId.value)),
+    ),
+  }
+}
+
+function buildProjectSyncRow(origin: ProjectSyncOrigin | null): MatchDisplayRow {
+  const sourceText = origin?.source_text || props.segment?.matched_source_text || props.segment?.source_text || ''
+  const targetText = origin?.target_text || props.segment?.target_text || ''
+  const detailItems = origin
+    ? buildDetailItems([
+      ['同步来源', origin.filename || '当前项目'],
+      ['来源句段', origin.sentence_id ? `句段 ${origin.sentence_id}` : '来源句段已删除'],
+      ['来源状态', formatOriginStatusLabel(origin.status)],
+      ['来源类型', formatOriginSourceLabel(origin.source)],
+      ['修改人', formatOriginUserName(origin)],
+      ['更新时间', formatDateTime(origin.updated_at)],
+    ])
+    : buildDetailItems([
+      ['同步来源', '旧数据未记录来源句段'],
+    ])
+
+  return {
+    id: origin?.segment_id ? `project-sync-${origin.segment_id}` : 'project-sync-untracked',
+    ...buildReadonlyRowMeta(),
+    sourceLabel: '项目同步',
+    badge: '同步',
+    tone: 'sync',
+    sourceText,
+    compareText: null,
+    targetText,
+    detailItems,
+    sourceTitle: '同步来源原文',
+    targetTitle: '同步来源译文',
+    applyText: targetText,
+    applyMode: 'replace',
   }
 }
 
@@ -520,6 +584,31 @@ function buildDetailItems(items: Array<[string, string | null | undefined]>): Ma
     .filter((item) => item.value.length > 0)
 }
 
+function formatOriginStatusLabel(status: string | null | undefined): string {
+  const labels: Record<string, string> = {
+    confirmed: '已确认',
+    exact: '精确匹配',
+    fuzzy: '模糊匹配',
+    none: '无匹配',
+  }
+  return status ? labels[status] || status : ''
+}
+
+function formatOriginSourceLabel(source: string | null | undefined): string {
+  const labels: Record<string, string> = {
+    manual: '人工',
+    llm: 'LLM',
+    tm: '记忆库',
+    project_sync: '项目同步',
+    none: '无',
+  }
+  return source ? labels[source] || source : ''
+}
+
+function formatOriginUserName(origin: ProjectSyncOrigin): string {
+  return origin.last_modified_by?.nickname || origin.last_modified_by?.username || ''
+}
+
 function formatDateTime(isoString: string | null | undefined): string {
   if (!isoString) return ''
   const date = new Date(isoString)
@@ -613,6 +702,7 @@ function getMatchScoreTone(score: number, exactTextMatch = false): MatchRowTone 
 }
 
 function selectMatchRow(row: MatchDisplayRow) {
+  selectedRowPinned.value = true
   selectedRowId.value = row.id
 }
 
@@ -747,6 +837,7 @@ function applyMatchAtIndex(index: number) {
     return false
   }
 
+  selectedRowPinned.value = true
   selectedRowId.value = row.id
   applyMatchRow(row)
   return true
@@ -1045,16 +1136,17 @@ defineExpose({
 }
 
 .match-summary-cell {
-  height: 25px;
-  min-height: 25px;
-  padding: 0 8px;
+  min-height: 34px;
+  padding: 6px 8px;
   border-right: 1px solid #cfd8df;
   border-bottom: 1px solid #cfd8df;
   background: #fbfcfd;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  vertical-align: middle;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  vertical-align: top;
 }
 
 .match-summary-row:nth-child(even) .match-summary-cell {
@@ -1067,7 +1159,7 @@ defineExpose({
 }
 
 .match-summary-cell--index {
-  padding: 0;
+  padding: 7px 0 6px;
   background: #f4f8fb;
   color: #315366;
   text-align: center;
@@ -1080,6 +1172,7 @@ defineExpose({
 .match-summary-cell--score {
   padding: 0;
   text-align: center;
+  vertical-align: stretch;
 }
 
 .match-summary-badge {
@@ -1087,7 +1180,9 @@ defineExpose({
   align-items: center;
   justify-content: center;
   width: 100%;
-  height: 25px;
+  min-height: 34px;
+  height: 100%;
+  padding: 0 4px;
   color: #ffffff;
   font-size: 12px;
   font-weight: 800;
@@ -1109,6 +1204,10 @@ defineExpose({
 
 .match-summary-badge--term {
   background: #9b7ad8;
+}
+
+.match-summary-badge--sync {
+  background: #26867d;
 }
 
 .match-summary-cell--target {
@@ -1143,7 +1242,7 @@ defineExpose({
 
 .match-detail__field {
   display: flex;
-  align-items: baseline;
+  align-items: flex-start;
   min-width: 0;
   min-height: 18px;
   line-height: 1.45;
@@ -1156,11 +1255,14 @@ defineExpose({
 }
 
 .match-detail__value {
+  flex: 1 1 auto;
   min-width: 0;
   color: #2d3b45;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .match-detail__texts {

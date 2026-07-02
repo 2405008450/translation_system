@@ -406,6 +406,19 @@ export interface TermMatchCandidate {
   updated_at: string | null
 }
 
+export interface ProjectSyncOrigin {
+  segment_id: string
+  sentence_id: string | null
+  file_record_id: string | null
+  filename: string | null
+  source_text: string | null
+  target_text: string | null
+  status: string | null
+  source: string | null
+  updated_at: string | null
+  last_modified_by?: User | null
+}
+
 export interface Segment {
   id: string
   sentence_id: string
@@ -420,6 +433,7 @@ export interface Segment {
   target_html?: string | null
   status: string
   project_sync_disabled?: boolean
+  project_sync_origin?: ProjectSyncOrigin | null
   version: number
   score: number
   matched_source_text: string | null
@@ -636,6 +650,7 @@ export interface FileRecordDetail {
   created_at: string
   updated_at: string
   server_time?: string
+  change_cursor?: string
   total_segments: number
   skip: number
   limit: number
@@ -685,6 +700,7 @@ export interface SegmentPageResponse {
   limit: number
   filters: SegmentPageFilters
   server_time?: string
+  change_cursor?: string
   segments: Segment[]
 }
 
@@ -779,6 +795,7 @@ export interface MergeViewSegmentPageResponse {
   filters: SegmentPageFilters
   groups: MergeViewSegmentGroup[]
   server_time?: string
+  change_cursor?: string
   segments: Segment[]
 }
 

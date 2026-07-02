@@ -1,14 +1,14 @@
-# Nginx 反向代理（可选）
+# Nginx 反向代理
 
-默认部署**不启动** nginx（方案 A，直连 `app:19013`）。启用方式：
+默认生产部署会启动 nginx，并对外发布 HTTP 80；`app:19013` 只作为 Docker 内网 upstream。
 
 ```bash
-USE_NGINX=1 scripts/deploy_prod.sh up
+scripts/deploy_prod.sh up
 # 80 被占用时换端口：
-USE_NGINX=1 NGINX_HTTP_PORT=19080 scripts/deploy_prod.sh up
+NGINX_HTTP_PORT=19080 scripts/deploy_prod.sh up
 ```
 
-Compose 文件为独立的 `docker-compose.nginx.yml`（叠加启用），默认 prod 栈不含 nginx，与改版前一致。
+Compose 文件为独立的 `docker-compose.nginx.yml`，由 `scripts/deploy_prod.sh` 默认叠加。若临时不启 nginx，使用 `USE_NGINX=0 scripts/deploy_prod.sh up`，脚本会改为叠加 `docker-compose.app-port.yml` 直连 app。
 
 ## 与上传限制对齐
 

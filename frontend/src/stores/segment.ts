@@ -887,8 +887,8 @@ export const useSegmentStore = defineStore('segment', () => {
       setSegmentStatusStats(data.status_stats)
     }
     resetSegments(data.segments)
-    if (data.server_time) {
-      changeCursor = data.server_time
+    if (data.change_cursor || data.server_time) {
+      changeCursor = data.change_cursor || data.server_time || null
     }
     resetPreviewState()
   }
@@ -1180,7 +1180,7 @@ export const useSegmentStore = defineStore('segment', () => {
       pageSize.value = page.limit || resolved.pageSize
       matchedSegmentCount.value = page.matched_segments
       mergeViewGroups.value = page.groups
-      changeCursor = page.server_time || new Date().toISOString()
+      changeCursor = page.change_cursor || page.server_time || new Date().toISOString()
       resetSegments(page.segments)
       // 自动激活首个句段
       if (segments.value[0]) {
@@ -1220,7 +1220,7 @@ export const useSegmentStore = defineStore('segment', () => {
       pageSize.value = page.limit || resolved.pageSize
       matchedSegmentCount.value = page.matched_segments
       mergeViewGroups.value = page.groups
-      changeCursor = page.server_time || changeCursor
+      changeCursor = page.change_cursor || page.server_time || changeCursor
       resetSegments(page.segments)
       if (segments.value[0] && !activeSentenceId.value) {
         setActiveSentence(segmentKeyOf(segments.value[0]))
@@ -1291,7 +1291,7 @@ export const useSegmentStore = defineStore('segment', () => {
         ...detail,
         segments: [],
       }
-      changeCursor = detail.server_time || new Date().toISOString()
+      changeCursor = detail.change_cursor || detail.server_time || new Date().toISOString()
       totalSegmentCount.value = detail.total_segments
       setSegmentStatusStats(detail.status_stats)
       if (

@@ -264,7 +264,7 @@ npm run build
 - `/assets/*`：静态资源
 - `/` 与 `/*`：回退到 `frontend/dist/index.html`，支持 Vue Router history 模式
 
-生产访问后端端口即可，例如 `http://127.0.0.1:19013/`。
+Docker 生产默认由 nginx 对外发布 HTTP 80，例如 `http://127.0.0.1/`；容器内 app 仍监听 `19013`。
 
 ## 常用开发命令
 

@@ -8737,6 +8737,49 @@ def _build_target_automatic_numbering_text_map(
         return {}
 
 
+def _serialize_project_sync_origin(seg: Segment) -> dict | None:
+    if (getattr(seg, "source", None) or "") != "project_sync":
+        return None
+
+    origin_segment_id = getattr(seg, "project_sync_source_segment_id", None)
+    origin_file_record_id = getattr(seg, "project_sync_source_file_record_id", None)
+    if not origin_segment_id:
+        return None
+
+    session = object_session(seg)
+    origin_segment = session.get(Segment, origin_segment_id) if session is not None else None
+    if origin_segment is None:
+        return {
+            "segment_id": str(origin_segment_id),
+            "sentence_id": None,
+            "file_record_id": str(origin_file_record_id) if origin_file_record_id else None,
+            "filename": None,
+            "source_text": None,
+            "target_text": None,
+            "status": None,
+            "source": None,
+            "updated_at": None,
+            "last_modified_by": None,
+        }
+
+    origin_file = getattr(origin_segment, "file_record", None)
+    if origin_file is None and session is not None and origin_segment.file_record_id:
+        origin_file = session.get(FileRecord, origin_segment.file_record_id)
+
+    return {
+        "segment_id": str(origin_segment.id),
+        "sentence_id": origin_segment.sentence_id,
+        "file_record_id": str(origin_segment.file_record_id) if origin_segment.file_record_id else None,
+        "filename": origin_file.filename if origin_file else None,
+        "source_text": origin_segment.source_text,
+        "target_text": origin_segment.target_text,
+        "status": origin_segment.status,
+        "source": origin_segment.source,
+        "updated_at": origin_segment.updated_at.isoformat() if origin_segment.updated_at else None,
+        "last_modified_by": serialize_user(origin_segment.last_modified_by) if origin_segment.last_modified_by else None,
+    }
+
+
 def _serialize_workbench_segment(
     seg: Segment,
     display_index: int | None = None,
@@ -8791,6 +8834,7 @@ def _serialize_workbench_segment(
         "target_html": seg.target_html,
         "status": seg.status,
         "project_sync_disabled": bool(getattr(seg, "project_sync_disabled", False)),
+        "project_sync_origin": _serialize_project_sync_origin(seg),
         "version": int(seg.version or 1),
         "score": seg.score,
         "matched_source_text": seg.matched_source_text,
@@ -9763,6 +9807,7 @@ def get_file_record(
         "created_at": file_record.created_at.isoformat(),
         "updated_at": file_record.updated_at.isoformat(),
         "server_time": datetime.now().isoformat(),
+        "change_cursor": _get_latest_segment_change_cursor(visible_base_query),
         "total_segments": total_segments,
         "skip": safe_skip,
         "limit": safe_limit,
@@ -9974,6 +10019,7 @@ def get_file_record_segments(
             "workflow_step_ids": normalized_workflow_step_ids,
         },
         "server_time": datetime.now().isoformat(),
+        "change_cursor": _get_latest_segment_change_cursor(base_query),
         "segments": [
             _serialize_workbench_segment(
                 seg,
@@ -10011,6 +10057,13 @@ def _parse_segment_change_cursor(cursor: str) -> tuple[datetime, UUID | None]:
 def _format_segment_change_cursor(segment: Segment) -> str:
     updated_at = segment.updated_at or datetime.now()
     return f"{updated_at.isoformat()}|{segment.id}"
+
+
+def _get_latest_segment_change_cursor(query) -> str:
+    segment = query.order_by(None).order_by(Segment.updated_at.desc(), Segment.id.desc()).first()
+    if segment is None:
+        return datetime.min.isoformat()
+    return _format_segment_change_cursor(segment)
 
 
 @router.get("/file-records/{file_record_id}/segments/changes")
@@ -10058,7 +10111,7 @@ def get_file_record_segment_changes(
     )
     server_time = datetime.now().isoformat()
     has_more = len(changed_segments) >= safe_limit
-    next_cursor = _format_segment_change_cursor(changed_segments[-1]) if has_more and changed_segments else server_time
+    next_cursor = _format_segment_change_cursor(changed_segments[-1]) if changed_segments else since
     workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
         db,
         file_record,
@@ -12316,6 +12369,8 @@ def split_segment(
     segment.matched_creator_name = None
     segment.matched_created_at = None
     segment.matched_updated_at = None
+    segment.project_sync_source_segment_id = None
+    segment.project_sync_source_file_record_id = None
     segment.status = _resolve_unconfirmed_segment_status(segment)
     segment.version = int(segment.version or 1) + 1
 
@@ -12437,6 +12492,8 @@ def merge_segment(
     first_seg.matched_creator_name = None
     first_seg.matched_created_at = None
     first_seg.matched_updated_at = None
+    first_seg.project_sync_source_segment_id = None
+    first_seg.project_sync_source_file_record_id = None
     first_seg.status = _resolve_unconfirmed_segment_status(first_seg)
     first_seg.version = int(first_seg.version or 1) + 1
 
@@ -13863,7 +13920,7 @@ def _serialize_tm_entry(entry: TranslationMemory) -> dict:
 
 
 def _require_tm_entry_owner_or_admin(entry: TranslationMemory, current_user: User) -> None:
-    if is_admin_role(getattr(current_user, "role", None)):
+    if can_access_all_projects(current_user):
         return
     if entry.creator_id is not None and entry.creator_id == current_user.id:
         return

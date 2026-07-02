@@ -337,6 +337,7 @@ class FileRecord(Base):
     segments: Mapped[list["Segment"]] = relationship(
         "Segment",
         back_populates="file_record",
+        foreign_keys="Segment.file_record_id",
         cascade="all, delete-orphan",
     )
     comments: Mapped[list["SegmentComment"]] = relationship(
@@ -930,6 +931,8 @@ class Segment(Base):
         Index("ix_segments_file_record_status", "file_record_id", "status"),
         Index("ix_segments_file_record_source", "file_record_id", "source"),
         Index("ix_segments_last_modified_by_id", "last_modified_by_id"),
+        Index("ix_segments_project_sync_source_segment_id", "project_sync_source_segment_id"),
+        Index("ix_segments_project_sync_source_file_record_id", "project_sync_source_file_record_id"),
         Index("ix_segments_updated_at", "updated_at"),
         Index(
             "ix_segments_source_text_trgm",
@@ -981,6 +984,16 @@ class Segment(Base):
         default=False,
         server_default=text("false"),
     )
+    project_sync_source_segment_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("segments.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    project_sync_source_file_record_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
     score: Mapped[float] = mapped_column(nullable=False, default=0.0)
     matched_source_text: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -1011,7 +1024,11 @@ class Segment(Base):
         nullable=False,
     )
 
-    file_record: Mapped["FileRecord"] = relationship("FileRecord", back_populates="segments")
+    file_record: Mapped["FileRecord"] = relationship(
+        "FileRecord",
+        back_populates="segments",
+        foreign_keys=[file_record_id],
+    )
     last_modified_by: Mapped["User | None"] = relationship("User", foreign_keys=[last_modified_by_id])
     workflow_step: Mapped["ProjectWorkflowStep | None"] = relationship(
         "ProjectWorkflowStep",

@@ -1,23 +1,23 @@
 # Docker 生产部署说明
 
-本项目使用独立 Compose 项目部署。**默认方案 A**：不启动 nginx，公网直连 **app:19013**（适合 80 端口已被其他项目占用的临时测试）。
+本项目使用独立 Compose 项目部署。现在默认启用 nginx，对外发布 **HTTP 80**；`app` 只在 Docker 内网监听 `19013`，不再把宿主机公网端口绑定到 `19013`。
 
-待换服务器或 80 空闲后，可用 `USE_NGINX=1` 启用 nginx 反代。
+如需临时绕过 nginx，可设置 `USE_NGINX=0`，脚本会叠加 `docker-compose.app-port.yml`，默认把宿主机 `80` 直连到 `app:19013`。
 
 ```text
-公网 :19013 (app) ── gunicorn
-                 ├── worker (arq maintenance) / pretranslation-worker
-                 ├── postgres / pgbouncer / redis / languagetool
-                 └── 共享卷：file_records / export_tasks / import_tasks
-
-可选 USE_NGINX=1：
 公网 :80 (nginx) ──► app:19013
+                    ├── worker (arq maintenance) / pretranslation-worker
+                    ├── postgres / pgbouncer / redis / languagetool
+                    └── 共享卷：file_records / export_tasks / import_tasks
+
+可选 USE_NGINX=0：
+公网 :80 (app 直连) ──► app:19013
 ```
 
 ## 1. 服务器准备
 
 ```bash
-sudo ss -tulpn | grep -E ':80|:19013' || true
+sudo ss -tulpn | grep -E ':80' || true
 docker --version
 docker compose version || docker-compose version
 chmod +x scripts/deploy_prod.sh
@@ -25,10 +25,10 @@ chmod +x scripts/deploy_prod.sh
 
 安全组 / 防火墙放行：
 
-| 端口 | 用途 | 默认方案 A |
+| 端口 | 用途 | 默认方案 |
 |------|------|------------|
-| 19013 | 直连 app | **公网放行** |
-| 80 | nginx（`USE_NGINX=1` 时） | 不启用 |
+| 80 | nginx HTTP 入口 | **公网放行** |
+| 19013 | app 容器内端口 | 不对公网放行 |
 
 ## 2. 配置环境变量
 
@@ -74,38 +74,44 @@ nginx 的 `client_max_body_size` 在 `docker/nginx/default.conf`，默认 **500m
 | `.env.prod` | 生产权威配置，Compose 通过 `--env-file` 读取 |
 | `.env` | 可选副本：`cp .env.prod .env`，兼容不带 `--env-file` 的旧命令 |
 
-## 3. 构建并启动（推荐，方案 A）
+## 3. 构建并启动（推荐：nginx 80）
 
 ```bash
-# 默认：不启 nginx，公网访问 http://<IP>:19013
+# 默认：启用 nginx，公网访问 http://<IP>/
 scripts/deploy_prod.sh up
 
 # 若需 Mihomo 代理访问 OpenRouter
 USE_PROXY=1 scripts/deploy_prod.sh up
 ```
 
-**换服务器后启用 nginx（80 或自定义端口空闲时）：**
+**80 被其他服务占用时，临时改 nginx 对外端口：**
 
 ```bash
-USE_NGINX=1 scripts/deploy_prod.sh up
-# 或手动：
-docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.nginx.yml up -d
+NGINX_HTTP_PORT=19080 scripts/deploy_prod.sh up
+```
+
+**临时不用 nginx，直连 app：**
+
+```bash
+USE_NGINX=0 scripts/deploy_prod.sh up
+# 如确实需要旧的 19013：
+USE_NGINX=0 APP_PUBLISH_PORT=19013 scripts/deploy_prod.sh up
 ```
 
 等价手动命令：
 
 ```bash
 docker compose --env-file .env.prod -f docker-compose.prod.yml build
-docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
-docker compose --env-file .env.prod -f docker-compose.prod.yml ps
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.nginx.yml up -d
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.nginx.yml ps
 ```
 
 独立版 `docker-compose`：
 
 ```bash
 cp .env.prod .env
-sudo docker-compose -f docker-compose.prod.yml build
-sudo docker-compose -f docker-compose.prod.yml up -d
+sudo docker-compose -f docker-compose.prod.yml -f docker-compose.nginx.yml build
+sudo docker-compose -f docker-compose.prod.yml -f docker-compose.nginx.yml up -d
 ```
 
 ### 代码更新后重建
@@ -115,7 +121,7 @@ git pull
 scripts/deploy_prod.sh restart
 # 或完整重建：
 scripts/deploy_prod.sh build
-docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --force-recreate app worker pretranslation-worker nginx
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.nginx.yml up -d --force-recreate app worker pretranslation-worker nginx
 ```
 
 ## 4. 验证
@@ -123,17 +129,17 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --force-rec
 ```bash
 scripts/deploy_prod.sh health
 
-curl http://127.0.0.1:19013/api/health
-curl http://<公网IP>:19013/
+curl http://127.0.0.1/api/health
+curl http://<公网IP>/
 
-docker compose --env-file .env.prod -f docker-compose.prod.yml logs --tail=100 app worker pretranslation-worker
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.nginx.yml logs --tail=100 app worker pretranslation-worker nginx
 ```
 
 浏览器访问（将 IP 换成你的服务器）：
 
 ```text
-http://43.132.156.72:19013/
-http://43.132.156.72:19013/login
+http://43.132.156.72/
+http://43.132.156.72/login
 ```
 
 首次进入后初始化管理员账号。
@@ -182,17 +188,17 @@ git pull
 
 docker compose --env-file .env.prod -f docker-compose.prod.yml build app
 docker compose --env-file .env.prod -f docker-compose.prod.yml up --force-recreate db-migrate
-docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --force-recreate app worker pretranslation-worker
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.nginx.yml up -d --force-recreate app worker pretranslation-worker nginx
 ```
 
 **必须重建 app + worker + pretranslation-worker**，否则新卷 `app_import_tasks` 不会挂载，ARQ 导入会报「暂存文件不存在」。
 
-仍可使用原有命令（与改版前相同，仅去掉 nginx）：
+如同时叠加 Mihomo 代理，可使用完整 Compose 文件组合：
 
 ```bash
-sudo docker-compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml build app
-sudo docker-compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml up --force-recreate db-migrate
-sudo docker-compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml up -d --force-recreate app worker pretranslation-worker
+sudo docker-compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml -f docker-compose.nginx.yml build app
+sudo docker-compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml -f docker-compose.nginx.yml up --force-recreate db-migrate
+sudo docker-compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.proxy.yml -f docker-compose.nginx.yml up -d --force-recreate app worker pretranslation-worker nginx
 ```
 
 ## 10. 常见问题
@@ -207,10 +213,11 @@ sudo docker-compose --env-file .env.prod -f docker-compose.prod.yml -f docker-co
 - 确认 worker 和 pretranslation-worker 已挂载 `app_import_tasks` 卷（`docker-compose.prod.yml` 已配置）
 - 重建 worker 和 pretranslation-worker：`scripts/deploy_prod.sh restart`
 
-**仅想直连 19013、不用 nginx（默认）**
+**临时绕过 nginx，直连 app**
 
-- 直接 `scripts/deploy_prod.sh up` 即可，nginx 不会启动。
+- `USE_NGINX=0 scripts/deploy_prod.sh up` 会叠加 `docker-compose.app-port.yml`，默认发布到宿主机 80。
+- 如确实需要旧端口，再显式执行 `USE_NGINX=0 APP_PUBLISH_PORT=19013 scripts/deploy_prod.sh up`。
 
-**日后启用 nginx**
+**nginx 改端口**
 
-- `USE_NGINX=1 scripts/deploy_prod.sh up`，并设置 `NGINX_HTTP_PORT`。
+- 设置 `NGINX_HTTP_PORT`，例如 `NGINX_HTTP_PORT=19080 scripts/deploy_prod.sh up`。

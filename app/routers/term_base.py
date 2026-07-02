@@ -215,7 +215,7 @@ def _serialize_term_entry(entry: TermEntry) -> dict:
 
 
 def _require_term_entry_owner_or_admin(entry: TermEntry, current_user: User) -> None:
-    if is_admin_role(getattr(current_user, "role", None)):
+    if can_access_all_projects(current_user):
         return
     if entry.creator_id is not None and entry.creator_id == current_user.id:
         return

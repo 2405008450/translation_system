@@ -308,12 +308,20 @@ def _apply_candidate_to_targets(
         before_text = target.target_text or ""
         before_text_is_empty = not normalize_text(before_text)
         if before_text == candidate.target_text:
+            if _set_project_sync_origin(target, candidate):
+                target.version = int(target.version or 1) + 1
+                summary.updated_count += 1
+                summary.affected_file_ids.add(target.file_record_id)
+                if target.file_record_id == current_file_id:
+                    summary.current_file_segments.append(target)
             continue
 
         target.target_text = candidate.target_text
         target.target_html = None
         target.status = "confirmed" if target.status == "confirmed" else PROJECT_SYNC_STATUS
         target.source = PROJECT_SYNC_SOURCE
+        target.project_sync_source_segment_id = candidate.segment.id
+        target.project_sync_source_file_record_id = candidate.segment.file_record_id
         target.last_modified_by_id = current_user.id if current_user is not None else None
         target.score = 1.0
         target.matched_source_text = candidate.segment.source_text
@@ -367,6 +375,19 @@ def _build_candidate(segment: Segment) -> _SyncCandidate | None:
     )
 
 
+def _set_project_sync_origin(segment: Segment, candidate: _SyncCandidate) -> bool:
+    if (segment.source or "") != PROJECT_SYNC_SOURCE:
+        return False
+    changed = False
+    if segment.project_sync_source_segment_id != candidate.segment.id:
+        segment.project_sync_source_segment_id = candidate.segment.id
+        changed = True
+    if segment.project_sync_source_file_record_id != candidate.segment.file_record_id:
+        segment.project_sync_source_file_record_id = candidate.segment.file_record_id
+        changed = True
+    return changed
+
+
 def _clear_project_synced_segment_fields(segment: Segment) -> bool:
     changed = False
     fields = {
@@ -382,6 +403,8 @@ def _clear_project_synced_segment_fields(segment: Segment) -> bool:
         "matched_updated_at": None,
         "llm_provider": None,
         "llm_model": None,
+        "project_sync_source_segment_id": None,
+        "project_sync_source_file_record_id": None,
     }
     for field_name, next_value in fields.items():
         if getattr(segment, field_name) != next_value:

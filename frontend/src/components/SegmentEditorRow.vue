@@ -238,6 +238,7 @@ const isEmptyTarget = computed(() => {
 const statusMeta = computed(() => getSegmentStatusMeta(effectiveSegmentStatus.value))
 const sourceMeta = computed(() => getSegmentSourceMeta(props.segment.source))
 const shouldHideLLMModel = computed(() => authStore.isExternalTranslator)
+const isProjectSynced = computed(() => props.segment.source === 'project_sync')
 const sourceLabel = computed(() => {
   if (props.segment.source === 'llm') {
     if (shouldHideLLMModel.value) {
@@ -249,15 +250,21 @@ const sourceLabel = computed(() => {
   return sourceMeta.value.label
 })
 const compactSourceLabel = computed(() => (
-  props.segment.source === 'project_sync' ? '同步' : sourceLabel.value
+  isProjectSynced.value ? '同步' : sourceLabel.value
 ))
 const workflowLabel = computed(() => props.segment.workflow_step_name || '翻译')
 const showStatusTag = computed(() => {
+  if (isProjectSynced.value) {
+    return false
+  }
   const status = effectiveSegmentStatus.value
   return status !== 'none' && status !== 'fuzzy'
 })
 const showSourceTag = computed(() => {
   const source = props.segment.source || 'none'
+  if (isProjectSynced.value) {
+    return true
+  }
   if (source === 'none' || source === 'fuzzy') {
     return false
   }
@@ -329,6 +336,7 @@ const displayScore = computed(() => (
 const scorePercent = computed(() => (
   displayScore.value === null ? null : Math.round(displayScore.value * 100)
 ))
+const showMatchRate = computed(() => !isProjectSynced.value && scorePercent.value !== null)
 const matchRateTone = computed(() => {
   const score = displayScore.value ?? 0
   if (effectiveSegmentStatus.value === 'exact' && score >= 1) return 'exact'
@@ -342,6 +350,9 @@ const matchRateLabel = computed(() => {
   }
   return `${scorePercent.value}%`
 })
+const stateCellTitle = computed(() => (
+  isProjectSynced.value ? sourceTitle.value : statusMeta.value.label
+))
 
 // 通用的文本高亮函数
 function highlightText(
@@ -2277,14 +2288,14 @@ watch(
       </div>
     </div>
 
-    <div class="segment-row__cell segment-row__cell--state" :title="statusMeta.label">
+    <div class="segment-row__cell segment-row__cell--state" :title="stateCellTitle">
       <span
-        v-if="segment.status === 'confirmed'"
+        v-if="segment.status === 'confirmed' && !isProjectSynced"
         class="segment-row__confirm-mark"
         aria-label="已确认"
       >√</span>
       <span
-        v-if="scorePercent !== null"
+        v-if="showMatchRate"
         class="segment-row__match-rate"
         :class="`segment-row__match-rate--${matchRateTone}`"
         :title="statusMeta.label"
@@ -2292,7 +2303,7 @@ watch(
         {{ matchRateLabel }}
       </span>
       <span
-        v-if="showStatusTag && segment.status !== 'confirmed' && scorePercent === null"
+        v-if="showStatusTag && segment.status !== 'confirmed' && !showMatchRate"
         class="segment-row__compact-tag segment-row__compact-tag--status"
       >
         {{ statusMeta.label }}
