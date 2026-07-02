@@ -8,6 +8,8 @@ from html.parser import HTMLParser
 from io import BytesIO
 from itertools import count
 from pathlib import Path
+import logging
+import os
 import re
 from typing import Any
 from zipfile import ZipFile
@@ -47,6 +49,96 @@ from app.services.document_workspace import (
 from app.services.normalizer import normalize_text
 from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
 
+
+# ── 临时诊断：译文回填位置排查（默认关闭，设置环境变量 EXPORT_POSITION_DEBUG=1 开启）──
+logger = logging.getLogger(__name__)
+_EXPORT_POSITION_DEBUG = os.environ.get("EXPORT_POSITION_DEBUG", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+
+def _pos_debug(message: str) -> None:
+    if _EXPORT_POSITION_DEBUG:
+        logger.warning("[EXPORT-POS] %s", message)
+
+
+def _pos_window_bound(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+# 只打印 block_index 落在 [EXPORT_POS_MIN, EXPORT_POS_MAX] 区间内的日志（不设则全部打印），
+# 用于把解析侧(SOURCE)与导出侧(WRITE)的同一段区间对齐排查。
+_POS_MIN = _pos_window_bound("EXPORT_POS_MIN")
+_POS_MAX = _pos_window_bound("EXPORT_POS_MAX")
+
+
+def _pos_in_window(block_index: int | None) -> bool:
+    if block_index is None:
+        return _POS_MIN is None and _POS_MAX is None
+    if _POS_MIN is not None and block_index < _POS_MIN:
+        return False
+    if _POS_MAX is not None and block_index > _POS_MAX:
+        return False
+    return True
+
+
+def _text_preview(text: Any, limit: int = 24) -> str:
+    collapsed = " ".join(str(text or "").split())
+    return collapsed[:limit] + ("…" if len(collapsed) > limit else "")
+
+
+def _sort_block_keys(keys: Iterable[BlockKey]) -> list[BlockKey]:
+    def _norm(value: int | None) -> int:
+        return value if value is not None else -1
+
+    return sorted(keys, key=lambda k: (str(k[0]), int(k[1]), _norm(k[2]), _norm(k[3])))
+
+
+def _dump_source_and_target_blocks(
+    label: str,
+    source_segments: Iterable[Mapping[str, Any]],
+    segments_by_block: dict[BlockKey, list[ExportSegment]],
+) -> None:
+    if not _EXPORT_POSITION_DEBUG:
+        return
+    source_list = list(source_segments or [])
+    _pos_debug(
+        f"===== {label}: {len(source_list)} 个源句段 / {len(segments_by_block)} 个译文块分组 ====="
+    )
+    for seg in source_list:
+        key = _source_segment_block_key(seg)
+        if not _pos_in_window(key[1]):
+            continue
+        _pos_debug(
+            "SOURCE key=%s sid=%s text=%r"
+            % (
+                key,
+                seg.get("sentence_id"),
+                _text_preview(seg.get("source_text") or seg.get("display_text")),
+            )
+        )
+    for key in _sort_block_keys(segments_by_block.keys()):
+        if not _pos_in_window(key[1]):
+            continue
+        group = segments_by_block[key]
+        _pos_debug(
+            "TARGET key=%s n=%d src0=%r tgt0=%r"
+            % (
+                key,
+                len(group),
+                _text_preview(group[0].source_text if group else ""),
+                _text_preview(group[0].target_text if group else ""),
+            )
+        )
 
 DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 XML_SPACE_ATTR = "{http://www.w3.org/XML/1998/namespace}space"
@@ -292,6 +384,7 @@ def export_translated_docx(
         math_placeholders_by_sentence_id,
         source_segments=source_segments,
     )
+    _dump_source_and_target_blocks("译文导出(translated)", source_segments, segments_by_block)
     block_counter = count(0)
 
     for story in stories:
@@ -1063,6 +1156,19 @@ def _export_table_cell(
         (_resolve_segment_block_type(story.kind, "table_cell"), block_index, row_index, cell_index),
         [],
     )
+    if _EXPORT_POSITION_DEBUG and cell_segments and _pos_in_window(block_index):
+        first = cell_segments[0]
+        _pos_debug(
+            "WRITE-CELL story=%s key=%s hit=%d seg_src=%r seg_tgt=%r sid=%s"
+            % (
+                story.kind,
+                (_resolve_segment_block_type(story.kind, "table_cell"), block_index, row_index, cell_index),
+                len(cell_segments),
+                _text_preview(first.source_text),
+                _text_preview(first.target_text),
+                first.sentence_id,
+            )
+        )
     segment_cursor = 0
     paragraph_buffer: list[CellParagraphTokens] = []
 
@@ -1133,12 +1239,37 @@ def _export_paragraph(
         math_placeholder_counter=[0],
     )
 
+    lookup_key = (
+        _resolve_segment_block_type(story.kind, block_type),
+        block_index,
+        row_index,
+        cell_index,
+    )
+    matched_segments = segments_by_block.get(lookup_key, [])
+    if _EXPORT_POSITION_DEBUG and _pos_in_window(block_index):
+        token_text = "".join(token.display_text for token in tokens)
+        first = matched_segments[0] if matched_segments else None
+        mismatch = bool(first) and (
+            _normalize_segment_source_text(token_text)
+            != _normalize_segment_source_text(first.source_text)
+        )
+        _pos_debug(
+            "WRITE-P%s story=%s key=%s hit=%d para_src=%r seg_src=%r seg_tgt=%r sid=%s"
+            % (
+                " !!MISMATCH" if mismatch else "",
+                story.kind,
+                lookup_key,
+                len(matched_segments),
+                _text_preview(token_text),
+                _text_preview(first.source_text if first else ""),
+                _text_preview(first.target_text if first else ""),
+                first.sentence_id if first else "",
+            )
+        )
+
     _replace_block_tokens(
         tokens=tokens,
-        segments=segments_by_block.get(
-            (_resolve_segment_block_type(story.kind, block_type), block_index, row_index, cell_index),
-            [],
-        ),
+        segments=matched_segments,
     )
 
 
@@ -2441,31 +2572,6 @@ def _build_localized_numbering_definition(
         target_language=target_language,
         strategy=strategy,
     )
-
-    for chinese_marker, english_label in (
-        ("章", "Chapter"),
-        ("节", "Section"),
-        ("条", "Article"),
-        ("款", "Clause"),
-    ):
-        if chinese_marker in lvl_text_value and "%1" in lvl_text_value:
-            return "decimal", f"{english_label} %1", "space"
-
-    normalized_text = _normalize_numbering_pattern(lvl_text_value)
-    if normalized_text != lvl_text_value or num_fmt_value in {
-        "chineseCounting",
-        "chineseLegalSimplified",
-        "ideographDigital",
-        "chineseCountingThousand",
-    }:
-        if _has_only_placeholders_and_ascii_punctuation(normalized_text):
-            normalized_text = normalized_text or "%1."
-            return "decimal", normalized_text, "space"
-
-    if any(token in lvl_text_value for token in ("、", "（", "）", "．", "。")) and _has_only_placeholders_and_ascii_punctuation(normalized_text):
-        return "decimal", normalized_text or "%1.", "space"
-
-    return None
 
 
 def _normalize_numbering_pattern(lvl_text: str) -> str:

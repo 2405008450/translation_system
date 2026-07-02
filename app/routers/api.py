@@ -17,7 +17,7 @@ from typing import Any, Dict, Iterable, List, Literal, Optional
 from urllib.parse import quote, unquote, urlparse
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, case, func, literal, or_
@@ -2375,6 +2375,11 @@ class ProjectDocumentStatisticsPayload(BaseModel):
 
 class ProjectFileZipExportPayload(BaseModel):
     file_ids: list[UUID] = Field(default_factory=list)
+
+
+class FileRecordExportPayload(BaseModel):
+    """文件记录导出请求体，可选携带 DOCX 导出样式设置。"""
+    style_settings: dict[str, Any] | None = None
 
 
 def _build_unavailable_document_statistics() -> dict[str, Any]:
@@ -10485,6 +10490,7 @@ def _queue_file_record_export_for_current_user(
     export_type: str,
     db: Session,
     current_user: User,
+    style_settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
@@ -10512,6 +10518,7 @@ def _queue_file_record_export_for_current_user(
         file_record_id=file_record_id,
         export_type=export_type,
         current_user=current_user,
+        style_settings=style_settings,
     )
 
 
@@ -11351,6 +11358,7 @@ def get_merge_view_segments(
 def create_file_record_export_task(
     file_record_id: UUID,
     type: str = Query(default="original"),
+    payload: FileRecordExportPayload | None = Body(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -11361,6 +11369,7 @@ def create_file_record_export_task(
             export_type=type,
             db=db,
             current_user=current_user,
+            style_settings=payload.style_settings if payload else None,
         ),
     )
 

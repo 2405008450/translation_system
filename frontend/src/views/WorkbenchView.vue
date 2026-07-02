@@ -55,6 +55,7 @@ import Pagination from '../components/Pagination.vue'
 import PreviewPanel from '../components/PreviewPanel.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
 import RevisionSettingsDialog from '../components/RevisionSettingsDialog.vue'
+import ExportStyleSettingsDialog, { type ExportStyleSettings } from '../components/ExportStyleSettingsDialog.vue'
 import SegmentEditorRow from '../components/SegmentEditorRow.vue'
 import SplitPreviewPanel from '../components/SplitPreviewPanel.vue'
 import TMMatchPanel from '../components/TMMatchPanel.vue'
@@ -750,6 +751,50 @@ const exporting = ref(false)
 const exportProgress = ref(0)
 const exportMessage = ref('')
 let exportPollTimer: number | null = null
+
+// 导出样式设置（仅对 DOCX 生效）
+const EXPORT_STYLE_SETTINGS_STORAGE_KEY = 'workbench.exportStyleSettings'
+const showExportStyleDialog = ref(false)
+
+function createEmptyExportStyleSettings(): ExportStyleSettings {
+  return { enabled: false, defaults: {}, styles: {}, hyphenation: {} }
+}
+
+function loadExportStyleSettings(): ExportStyleSettings {
+  try {
+    const raw = localStorage.getItem(EXPORT_STYLE_SETTINGS_STORAGE_KEY)
+    if (!raw) {
+      return createEmptyExportStyleSettings()
+    }
+    const parsed = JSON.parse(raw)
+    return {
+      enabled: Boolean(parsed?.enabled),
+      defaults: parsed?.defaults && typeof parsed.defaults === 'object' ? parsed.defaults : {},
+      styles: parsed?.styles && typeof parsed.styles === 'object' ? parsed.styles : {},
+      hyphenation: parsed?.hyphenation && typeof parsed.hyphenation === 'object' ? parsed.hyphenation : {},
+    }
+  } catch {
+    return createEmptyExportStyleSettings()
+  }
+}
+
+const exportStyleSettings = ref<ExportStyleSettings>(loadExportStyleSettings())
+
+function openExportStyleSettings() {
+  showExportMenu.value = false
+  showExportStyleDialog.value = true
+}
+
+function saveExportStyleSettings(payload: ExportStyleSettings) {
+  exportStyleSettings.value = payload
+  try {
+    localStorage.setItem(EXPORT_STYLE_SETTINGS_STORAGE_KEY, JSON.stringify(payload))
+  } catch {
+    // 忽略本地存储写入失败（如隐私模式），仅在本次会话内生效
+  }
+  showExportStyleDialog.value = false
+  toast.success(t('workbench.exportStyleSettings.saved'))
+}
 
 // 导出格式映射（用于原格式导出按钮显示）
 const exportFormatMap: Record<string, { format: string; label: string; note?: string }> = {
@@ -6221,9 +6266,10 @@ async function exportWithTypeForFile(exportType: string, fileRecordId?: string |
       return
     }
 
+    const stylePayload = exportStyleSettings.value.enabled ? exportStyleSettings.value : null
     const { data: task } = await http.post<FileExportTask>(
       `/file-records/${targetFileRecordId}/exports`,
-      null,
+      stylePayload ? { style_settings: stylePayload } : null,
       { params: { type: exportType } },
     )
     const completedTask = await waitForFileExportTask(task)
@@ -6746,6 +6792,15 @@ onBeforeRouteLeave(async () => {
           @click="openWorkbenchSettings()"
         >
           <Settings :size="16" />
+        </button>
+        <button
+          class="workbench-ribbon__top-action export-style-trigger"
+          type="button"
+          :title="t('workbench.exportStyleSettings.buttonTitle')"
+          @click="openExportStyleSettings"
+        >
+          <Settings :size="15" />
+          <span>{{ t('workbench.exportStyleSettings.button') }}</span>
         </button>
       </div>
 
@@ -7509,6 +7564,15 @@ onBeforeRouteLeave(async () => {
               <Download v-else :size="14" />
               {{ exportButtonLabel }}
               <ChevronDown :size="12" />
+            </button>
+            <button
+              class="button workbench-action export-dropdown__settings"
+              type="button"
+              :title="t('workbench.exportStyleSettings.buttonTitle')"
+              @click="openExportStyleSettings"
+            >
+              <Settings :size="14" />
+              {{ t('workbench.exportStyleSettings.button') }}
             </button>
             <div v-if="showExportMenu" class="export-dropdown__menu">
               <div v-if="loadingExportOptions" class="export-dropdown__loading">
@@ -9488,6 +9552,13 @@ onBeforeRouteLeave(async () => {
       :saving="revisionSettingsSaving"
       @close="showRevisionSettingsDialog = false"
       @save="handleSaveRevisionSettings"
+    />
+
+    <ExportStyleSettingsDialog
+      :open="showExportStyleDialog"
+      :model-value="exportStyleSettings"
+      @close="showExportStyleDialog = false"
+      @save="saveExportStyleSettings"
     />
 
     <Modal
