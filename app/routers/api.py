@@ -7,8 +7,8 @@ import asyncio
 import json
 import logging
 import re
-from concurrent.futures import CancelledError, ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import partial
 from io import BytesIO
@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, case, func, literal, or_
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, object_session
+from sqlalchemy.orm import Session, aliased, object_session
 
 from app.auth import (
     USER_ROLE,
@@ -217,6 +217,11 @@ from app.services.language_detection import detect_upload_language
 from app.services.language_pairs import require_language_pair
 from app.services.matcher import get_tm_candidates_for_text, match_sentences_with_stats
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
+from app.services.segment_status import (
+    is_llm_protected_reuse_segment,
+    resolve_unconfirmed_segment_status,
+    segment_effective_status_conditions,
+)
 from app.services.tm_match_state import (
     build_tm_match_signature,
     is_tm_match_signature_current,
@@ -269,8 +274,8 @@ from app.services.project_segment_sync import (
     disable_project_sync_for_segments,
     empty_project_segment_sync_summary,
     enable_project_sync_for_segments,
+    run_project_sync_for_segment_ids,
     sync_project_repeated_segments_from_file,
-    sync_project_repeated_segments_from_segments,
 )
 from app.services.term_importer import (
     TERM_IMPORT_EXTENSIONS,
@@ -580,6 +585,29 @@ async def _dispatch_auto_tm_rematch_background() -> None:
     if await _enqueue_arq_job("auto_tm_rematch_background_job"):
         return
     await asyncio.to_thread(run_auto_tm_rematch_background_once)
+
+
+async def _dispatch_project_segment_sync(
+    file_record_id: UUID,
+    segment_ids: list[UUID],
+    current_user_id: UUID | None,
+) -> None:
+    """优先把项目重复句段同步投递到 arq worker，失败时后台线程兜底。"""
+    if not segment_ids:
+        return
+    if await _enqueue_arq_job(
+        "project_segment_sync_job",
+        str(file_record_id),
+        [str(segment_id) for segment_id in segment_ids],
+        str(current_user_id) if current_user_id else None,
+    ):
+        return
+    await asyncio.to_thread(
+        run_project_sync_for_segment_ids,
+        file_record_id,
+        segment_ids,
+        current_user_id,
+    )
 
 
 async def _queue_import_task(
@@ -1226,6 +1254,20 @@ async def auto_tm_rematch_background_job(ctx) -> None:
     await asyncio.to_thread(run_auto_tm_rematch_background_once)
 
 
+async def project_segment_sync_job(
+    ctx,
+    file_record_id: str,
+    segment_ids: list[str],
+    current_user_id: str | None = None,
+) -> None:
+    await asyncio.to_thread(
+        run_project_sync_for_segment_ids,
+        UUID(file_record_id),
+        [UUID(segment_id) for segment_id in segment_ids],
+        UUID(current_user_id) if current_user_id else None,
+    )
+
+
 async def _dispatch_pretranslation_run(run_id: UUID) -> None:
     if await _enqueue_arq_job(
         "pretranslation_run_job",
@@ -1240,11 +1282,22 @@ async def pretranslation_run_job(ctx, run_id: str) -> None:
     await asyncio.to_thread(_run_pretranslation_run, UUID(run_id))
 
 
+def _resolve_arq_worker_max_jobs(configured: int | None, fallback: int = 1) -> int:
+    if configured is None or configured <= 0:
+        configured = fallback
+    return max(int(configured), 1)
+
+
+def _resolve_pretranslation_run_file_concurrency() -> int:
+    configured = get_settings().pretranslation_run_file_concurrency
+    return max(int(configured or 1), 1)
+
+
 class MaintenanceWorkerSettings:
     queue_name = ARQ_MAINTENANCE_QUEUE_NAME
-    max_jobs = max(
-        int(getattr(get_settings(), "arq_maintenance_max_jobs", None) or get_settings().arq_max_jobs),
-        1,
+    max_jobs = _resolve_arq_worker_max_jobs(
+        get_settings().arq_maintenance_max_jobs,
+        get_settings().arq_max_jobs,
     )
     functions = [
         process_import_task_job,
@@ -1254,13 +1307,17 @@ class MaintenanceWorkerSettings:
         spelling_grammar_qa_project_job,
         auto_tm_background_job,
         auto_tm_rematch_background_job,
+        project_segment_sync_job,
     ]
     redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
 
 
 class PretranslationWorkerSettings:
     queue_name = ARQ_PRETRANSLATION_QUEUE_NAME
-    max_jobs = max(int(get_settings().arq_pretranslation_max_jobs), 1)
+    max_jobs = _resolve_arq_worker_max_jobs(
+        get_settings().arq_pretranslation_max_jobs,
+        1,
+    )
     functions = [
         pretranslation_run_job,
     ]
@@ -1328,6 +1385,7 @@ class SegmentReplaceRequest(BaseModel):
     status_filters: list[str] = Field(default_factory=list)
     match_filters: list[str] = Field(default_factory=list)
     source_filters: list[str] = Field(default_factory=list)
+    source_content_filters: list[str] = Field(default_factory=list)
     workflow_step_ids: list[str] = Field(default_factory=list)
 
 
@@ -1803,6 +1861,7 @@ async def _run_pretranslation_llm_stage(task_id: UUID, options: dict[str, Any]) 
         processed = 0
         updated = 0
         errors = 0
+        skipped = 0
         last_heartbeat = datetime.min
         async for chunk in response.body_iterator:
             for event_name, payload in _parse_sse_events(chunk):
@@ -1848,11 +1907,25 @@ async def _run_pretranslation_llm_stage(task_id: UUID, options: dict[str, Any]) 
                         current_action="writing_result",
                         error=payload.get("message") or None,
                     )
+                elif event_name == "skipped":
+                    processed += 1
+                    skipped += 1
+                    progress = 45 + int(min(processed, max(total, 1)) / max(total, 1) * 45)
+                    _update_pretranslation_task(
+                        task_id,
+                        processed_segments=processed,
+                        updated_segments=updated,
+                        error_segments=errors,
+                        progress=min(progress, 95),
+                        message=f"LLM pretranslation running: {processed}/{total or processed}",
+                        current_action="writing_result",
+                    )
                 elif event_name == "complete":
                     total = int(payload.get("total") or total)
                     updated = int(payload.get("updated_count") or updated)
                     errors = int(payload.get("error_count") or errors)
-                    processed = max(processed, updated + errors)
+                    skipped = int(payload.get("skipped_count") or skipped)
+                    processed = max(processed, updated + errors + skipped)
                     _update_pretranslation_task(
                         task_id,
                         processed_segments=processed,
@@ -1944,6 +2017,50 @@ def _run_pretranslation_task(task_id: UUID) -> None:
         _release_pretranslation_task_lock(task_id)
 
 
+def _run_pretranslation_tasks_for_run(run_id: UUID, task_ids: list[UUID]) -> None:
+    if not task_ids:
+        return
+    max_workers = min(_resolve_pretranslation_run_file_concurrency(), len(task_ids))
+    if max_workers <= 1:
+        for task_id in task_ids:
+            _run_pretranslation_task(task_id)
+        return
+
+    logger.info(
+        "pretranslation run processing files concurrently run_id=%s task_count=%s file_concurrency=%s",
+        run_id,
+        len(task_ids),
+        max_workers,
+    )
+    with ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="pretranslation-file",
+    ) as executor:
+        futures = {
+            executor.submit(_run_pretranslation_task, task_id): task_id
+            for task_id in task_ids
+        }
+        for future in as_completed(futures):
+            task_id = futures[future]
+            try:
+                future.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "pretranslation task crashed outside task handler run_id=%s task_id=%s",
+                    run_id,
+                    task_id,
+                )
+                _update_pretranslation_task(
+                    task_id,
+                    status="failed",
+                    stage="failed",
+                    progress=100,
+                    message="预翻译失败",
+                    error=str(exc),
+                    current_action="failed",
+                )
+
+
 def _run_pretranslation_run(run_id: UUID) -> None:
     with SessionLocal() as db:
         run = db.query(PretranslationRun).filter(PretranslationRun.id == run_id).first()
@@ -1964,8 +2081,7 @@ def _run_pretranslation_run(run_id: UUID) -> None:
         ]
         db.commit()
 
-    for task_id in task_ids:
-        _run_pretranslation_task(task_id)
+    _run_pretranslation_tasks_for_run(run_id, task_ids)
 
     with SessionLocal() as db:
         run = db.query(PretranslationRun).filter(PretranslationRun.id == run_id).first()
@@ -4159,6 +4275,78 @@ def _parse_optional_datetime(value: str | None) -> datetime | None:
         return None
 
 
+LLM_STATUSES_BY_SCOPE = {
+    "fuzzy_only": {"fuzzy"},
+    "none_only": {"none"},
+    "all": {"fuzzy", "none"},
+    "all_with_exact": {"exact", "fuzzy", "none"},
+}
+LLM_PROTECTED_REUSE_ALLOWED_SCOPES = {"current_segment", "all_with_exact"}
+
+
+def _llm_scope_allows_protected_reuse(scope: str) -> bool:
+    return (scope or "").strip().lower() in LLM_PROTECTED_REUSE_ALLOWED_SCOPES
+
+
+def _llm_effective_segment_status(segment: Any) -> str:
+    status = str(getattr(segment, "status", "") or "")
+    if status == "confirmed":
+        return "confirmed"
+    return resolve_unconfirmed_segment_status(segment)
+
+
+def _llm_scope_allows_segment(
+    segment: Any,
+    scope: str,
+    *,
+    sentence_id: str | None = None,
+) -> bool:
+    normalized_scope = (scope or "all").strip().lower()
+    if normalized_scope == "current_segment":
+        return getattr(segment, "sentence_id", None) == normalize_text(sentence_id or "")
+    if normalized_scope == "empty_target_only":
+        return not normalize_text(getattr(segment, "target_text", "") or "")
+    statuses = LLM_STATUSES_BY_SCOPE.get(normalized_scope)
+    return bool(statuses is not None and _llm_effective_segment_status(segment) in statuses)
+
+
+def _llm_segment_should_translate(
+    segment: Any,
+    scope: str,
+    *,
+    sentence_id: str | None = None,
+) -> bool:
+    if not _llm_scope_allows_segment(segment, scope, sentence_id=sentence_id):
+        return False
+    if _llm_scope_allows_protected_reuse(scope):
+        return True
+    return not is_llm_protected_reuse_segment(segment)
+
+
+def _get_llm_write_skip_reason(segment: Segment, task: LLMTranslationTask, scope: str) -> str | None:
+    base_version = int(getattr(task, "base_version", 0) or 0)
+    current_version = int(getattr(segment, "version", 0) or 0)
+    version_changed = bool(base_version and current_version != base_version)
+
+    if (segment.source_text or "") != (task.source_text or ""):
+        return "句段原文已变化，已跳过 LLM 写回。"
+    if (
+        version_changed
+        and not _llm_scope_allows_protected_reuse(scope)
+        and is_llm_protected_reuse_segment(segment)
+    ):
+        return "句段已被 TM 或项目同步更新为 100% 复用结果，已跳过 LLM 写回。"
+    if version_changed and not _llm_scope_allows_segment(
+        segment,
+        scope,
+        sentence_id=task.sentence_id,
+    ):
+        return "句段状态已变化，不再属于本次 LLM 处理范围，已跳过写回。"
+    if version_changed and (segment.target_text or "") != (task.base_target_text or ""):
+        return "句段译文已在 LLM 返回前被更新，已跳过写回。"
+    return None
+
+
 def _build_llm_translation_tasks(
     db: Session,
     file_record_id: UUID,
@@ -4171,12 +4359,7 @@ def _build_llm_translation_tasks(
     sentence_id: str | None = None,
     source_filename: str | None = None,
 ) -> list[LLMTranslationTask]:
-    statuses_by_scope = {
-        "fuzzy_only": {"fuzzy"},
-        "none_only": {"none"},
-        "all": {"fuzzy", "none"},
-        "all_with_exact": {"exact", "fuzzy", "none"},
-    }
+    statuses_by_scope = LLM_STATUSES_BY_SCOPE
     target_statuses: set[str] | None = None
     current_sentence_id = normalize_text(sentence_id or "")
     if scope == "current_segment":
@@ -4205,13 +4388,20 @@ def _build_llm_translation_tasks(
     clean_numbering = is_word_document_filename(source_filename)
     tasks: list[LLMTranslationTask] = []
     for segment in segments:
+        effective_status = _llm_effective_segment_status(segment)
         should_translate = True
         if scope == "current_segment":
             should_translate = segment.sentence_id == current_sentence_id
         elif scope == "empty_target_only":
             if normalize_text(segment.target_text or ""):
                 should_translate = False
-        elif target_statuses is None or segment.status not in target_statuses:
+        elif target_statuses is None or effective_status not in target_statuses:
+            should_translate = False
+        if should_translate and not _llm_segment_should_translate(
+            segment,
+            scope,
+            sentence_id=current_sentence_id,
+        ):
             should_translate = False
 
         if not should_translate and not include_context:
@@ -4239,7 +4429,7 @@ def _build_llm_translation_tasks(
         tasks.append(
             LLMTranslationTask(
                 sentence_id=segment.sentence_id,
-                status=segment.status,
+                status=effective_status,
                 source_text=segment.source_text,
                 source_language=source_language,
                 target_language=target_language,
@@ -4252,6 +4442,10 @@ def _build_llm_translation_tasks(
                 glossary_matches=glossary_matches_by_source.get(segment.source_text, []),
                 should_translate=should_translate,
                 project_sync_disabled=bool(getattr(segment, "project_sync_disabled", False)),
+                base_version=int(getattr(segment, "version", 0) or 0) or None,
+                base_status=getattr(segment, "status", None),
+                base_source=getattr(segment, "source", None),
+                base_target_text=getattr(segment, "target_text", "") or "",
             )
         )
 
@@ -8110,18 +8304,15 @@ def get_project_quality_qa_settings(
 def update_project_quality_qa_settings(
     project_id: UUID,
     payload: QualityQASettingsRequest,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
-    normalized = store_quality_qa_settings(project, payload.model_dump())
+    store_quality_qa_settings(project, payload.model_dump())
     db.commit()
     db.refresh(project)
-    if normalized["spelling_grammar"]["enabled"]:
-        background_tasks.add_task(_dispatch_spelling_grammar_qa_project, project.id)
     return _serialize_quality_qa_settings_response(db, project)
 
 
@@ -8159,7 +8350,7 @@ def refresh_file_record_spelling_grammar_qa(
         )
         .all()
     )
-    _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, segments)
+    _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, segments, force=True)
     return {
         "file_record_id": str(file_record_id),
         "queued_count": len(segments),
@@ -8634,6 +8825,49 @@ def _build_target_automatic_numbering_text_map(
         return {}
 
 
+def _serialize_project_sync_origin(seg: Segment) -> dict | None:
+    if (getattr(seg, "source", None) or "") != "project_sync":
+        return None
+
+    origin_segment_id = getattr(seg, "project_sync_source_segment_id", None)
+    origin_file_record_id = getattr(seg, "project_sync_source_file_record_id", None)
+    if not origin_segment_id:
+        return None
+
+    session = object_session(seg)
+    origin_segment = session.get(Segment, origin_segment_id) if session is not None else None
+    if origin_segment is None:
+        return {
+            "segment_id": str(origin_segment_id),
+            "sentence_id": None,
+            "file_record_id": str(origin_file_record_id) if origin_file_record_id else None,
+            "filename": None,
+            "source_text": None,
+            "target_text": None,
+            "status": None,
+            "source": None,
+            "updated_at": None,
+            "last_modified_by": None,
+        }
+
+    origin_file = getattr(origin_segment, "file_record", None)
+    if origin_file is None and session is not None and origin_segment.file_record_id:
+        origin_file = session.get(FileRecord, origin_segment.file_record_id)
+
+    return {
+        "segment_id": str(origin_segment.id),
+        "sentence_id": origin_segment.sentence_id,
+        "file_record_id": str(origin_segment.file_record_id) if origin_segment.file_record_id else None,
+        "filename": origin_file.filename if origin_file else None,
+        "source_text": origin_segment.source_text,
+        "target_text": origin_segment.target_text,
+        "status": origin_segment.status,
+        "source": origin_segment.source,
+        "updated_at": origin_segment.updated_at.isoformat() if origin_segment.updated_at else None,
+        "last_modified_by": serialize_user(origin_segment.last_modified_by) if origin_segment.last_modified_by else None,
+    }
+
+
 def _serialize_workbench_segment(
     seg: Segment,
     display_index: int | None = None,
@@ -8688,6 +8922,7 @@ def _serialize_workbench_segment(
         "target_html": seg.target_html,
         "status": seg.status,
         "project_sync_disabled": bool(getattr(seg, "project_sync_disabled", False)),
+        "project_sync_origin": _serialize_project_sync_origin(seg),
         "version": int(seg.version or 1),
         "score": seg.score,
         "matched_source_text": seg.matched_source_text,
@@ -8733,8 +8968,12 @@ def _schedule_spelling_grammar_qa_for_segments(
     background_tasks: BackgroundTasks | None,
     file_record: FileRecord,
     segments: Iterable[Segment],
+    *,
+    force: bool = False,
 ) -> None:
     if background_tasks is None:
+        return
+    if not force and not get_settings().spelling_grammar_qa_auto_schedule:
         return
     segment_ids = [
         segment.id
@@ -8781,6 +9020,30 @@ def _schedule_auto_tm_processing(
         background_tasks.add_task(_dispatch_auto_tm_background)
 
 
+def _schedule_project_segment_sync_for_segments(
+    background_tasks: BackgroundTasks | None,
+    file_record: FileRecord,
+    segments: Iterable[Segment],
+    current_user: User | None,
+) -> None:
+    if background_tasks is None:
+        return
+    segment_ids = [
+        segment.id
+        for segment in segments
+        if normalize_text(getattr(segment, "target_text", "") or "")
+        and not getattr(segment, "project_sync_disabled", False)
+    ]
+    if not segment_ids:
+        return
+    background_tasks.add_task(
+        _dispatch_project_segment_sync,
+        file_record.id,
+        list(dict.fromkeys(segment_ids)),
+        current_user.id if current_user else None,
+    )
+
+
 def _notify_tm_collections_changed(
     db: Session,
     collection_ids: list[UUID],
@@ -8798,29 +9061,20 @@ def _notify_tm_collections_changed(
 
 
 def _resolve_unconfirmed_segment_status(segment: Segment) -> str:
-    if not normalize_text(segment.target_text):
-        return "none"
-
-    score = float(segment.score or 0)
-    source_text = normalize_match_text(segment.source_text or "")
-    matched_source_text = normalize_match_text(segment.matched_source_text or "")
-    if score >= 0.999 or (matched_source_text and matched_source_text == source_text):
-        return "exact"
-    if score > 0 or matched_source_text:
-        return "fuzzy"
-    return "none"
+    return resolve_unconfirmed_segment_status(segment)
 
 
 def _apply_segment_scope_filter(query, scope: str):
     normalized_scope = (scope or "all").strip().lower()
+    status_conditions = segment_effective_status_conditions(Segment)
     if normalized_scope == "exact_only":
-        return query.filter(Segment.status == "exact")
+        return query.filter(status_conditions["exact"])
     if normalized_scope == "fuzzy_only":
-        return query.filter(Segment.status == "fuzzy")
+        return query.filter(status_conditions["fuzzy"])
     if normalized_scope == "none_only":
-        return query.filter(Segment.status == "none")
+        return query.filter(status_conditions["none"])
     if normalized_scope == "confirmed_only":
-        return query.filter(Segment.status == "confirmed")
+        return query.filter(status_conditions["confirmed"])
     if normalized_scope == "empty_target":
         return query.filter(func.coalesce(Segment.target_text, "") == "")
     return query
@@ -8894,12 +9148,165 @@ def _normalize_segment_filter_values(*values: Any) -> list[str]:
     return list(dict.fromkeys(normalized))
 
 
+SEGMENT_SOURCE_CONTENT_FILTER_VALUES = {
+    "repeat_first",
+    "internal_repeat",
+    "cross_file_repeat",
+    "not_repeat",
+    "project_sync_disabled",
+}
+
+
+@dataclass
+class SegmentSourceContentFilterContext:
+    db: Session
+    file_records: list[FileRecord]
+    current_user: User
+    matching_ids_cache: dict[tuple[str, ...], set[UUID]] = field(default_factory=dict)
+
+
+def _normalize_segment_source_content_filter_values(*values: Any) -> list[str]:
+    return [
+        value
+        for value in _normalize_segment_filter_values(*values)
+        if value in SEGMENT_SOURCE_CONTENT_FILTER_VALUES
+    ]
+
+
+def _build_source_content_filter_context_for_file_record(
+    db: Session,
+    file_record: FileRecord,
+    current_user: User,
+) -> SegmentSourceContentFilterContext:
+    if file_record.project_id is None:
+        return SegmentSourceContentFilterContext(
+            db=db,
+            file_records=[file_record],
+            current_user=current_user,
+        )
+
+    files = (
+        db.query(FileRecord)
+        .filter(
+            FileRecord.project_id == file_record.project_id,
+            FileRecord.source_language == file_record.source_language,
+            FileRecord.target_language == file_record.target_language,
+        )
+        .order_by(FileRecord.created_at.asc(), FileRecord.id.asc())
+        .all()
+    )
+    visible_files = _visible_project_files(files, current_user, db)
+    if file_record.id not in {item.id for item in visible_files}:
+        visible_files.append(file_record)
+        visible_files.sort(key=lambda item: (item.created_at or datetime.min, str(item.id)))
+    return SegmentSourceContentFilterContext(
+        db=db,
+        file_records=visible_files,
+        current_user=current_user,
+    )
+
+
+def _build_source_content_filter_context_for_files(
+    db: Session,
+    files: list[FileRecord],
+    current_user: User,
+) -> SegmentSourceContentFilterContext:
+    return SegmentSourceContentFilterContext(
+        db=db,
+        file_records=files,
+        current_user=current_user,
+    )
+
+
+def _source_content_hash_for_segment(source_hash: str | None, source_text: str | None) -> str:
+    if source_hash:
+        return source_hash
+    if not normalize_text(source_text or ""):
+        return ""
+    return build_source_hash(source_text or "")
+
+
+def _load_source_content_matching_segment_ids(
+    context: SegmentSourceContentFilterContext,
+    filter_values: list[str],
+) -> set[UUID]:
+    selected_values = set(_normalize_segment_source_content_filter_values(filter_values))
+    cache_key = tuple(sorted(selected_values))
+    if cache_key in context.matching_ids_cache:
+        return context.matching_ids_cache[cache_key]
+
+    matching_ids: set[UUID] = set()
+    if not selected_values:
+        context.matching_ids_cache[cache_key] = matching_ids
+        return matching_ids
+
+    grouped_occurrences: list[tuple[tuple[str | None, str | None, str], list[UUID]]] = []
+
+    for file_record in context.file_records:
+        visible_query = _apply_segment_assignment_visibility_filter(
+            context.db,
+            context.db.query(Segment).filter(Segment.file_record_id == file_record.id),
+            file_record,
+            context.current_user,
+        )
+        rows = (
+            _order_segment_query(
+                visible_query.with_entities(
+                    Segment.id,
+                    Segment.file_record_id,
+                    Segment.source_hash,
+                    Segment.source_text,
+                    Segment.project_sync_disabled,
+                ),
+                file_record,
+            )
+            .all()
+        )
+        language_key = (file_record.source_language, file_record.target_language)
+        file_groups: dict[tuple[str | None, str | None, str], list[UUID]] = {}
+        for row in rows:
+            if "project_sync_disabled" in selected_values and row.project_sync_disabled:
+                matching_ids.add(row.id)
+            source_hash = _source_content_hash_for_segment(row.source_hash, row.source_text)
+            if not source_hash:
+                continue
+            key = (language_key[0], language_key[1], source_hash)
+            file_groups.setdefault(key, []).append(row.id)
+        grouped_occurrences.extend(file_groups.items())
+
+    repeated_values = selected_values & {
+        "repeat_first",
+        "internal_repeat",
+        "cross_file_repeat",
+        "not_repeat",
+    }
+    if repeated_values:
+        seen_keys_in_previous_files: set[tuple[str | None, str | None, str]] = set()
+        for key, segment_ids in grouped_occurrences:
+            if len(segment_ids) == 1:
+                if "not_repeat" in selected_values:
+                    matching_ids.add(segment_ids[0])
+            else:
+                if "repeat_first" in selected_values:
+                    matching_ids.add(segment_ids[0])
+                if "internal_repeat" in selected_values:
+                    matching_ids.update(segment_ids[1:])
+            if key in seen_keys_in_previous_files and "cross_file_repeat" in selected_values:
+                matching_ids.add(segment_ids[0])
+            seen_keys_in_previous_files.add(key)
+
+    context.matching_ids_cache[cache_key] = matching_ids
+    return matching_ids
+
+
 def _apply_segment_screening_filters(
     query,
     *,
     status_filters: list[str] | None = None,
     match_filters: list[str] | None = None,
     source_filters: list[str] | None = None,
+    source_content_filters: list[str] | None = None,
+    source_content_context: SegmentSourceContentFilterContext | None = None,
     workflow_step_ids: list[str] | None = None,
 ):
     status_values = set(_normalize_segment_filter_values(status_filters))
@@ -8922,13 +9329,14 @@ def _apply_segment_screening_filters(
 
     match_values = set(_normalize_segment_filter_values(match_filters))
     if match_values:
+        status_conditions = segment_effective_status_conditions(Segment)
         conditions = []
         if "exact" in match_values:
-            conditions.append(Segment.status == "exact")
+            conditions.append(status_conditions["exact"])
         if "fuzzy" in match_values:
-            conditions.append(Segment.status == "fuzzy")
+            conditions.append(status_conditions["fuzzy"])
         if "none" in match_values:
-            conditions.append(Segment.status == "none")
+            conditions.append(status_conditions["none"])
         if "machine_translation" in match_values:
             conditions.append(Segment.source == "llm")
         if "tm" in match_values:
@@ -8945,6 +9353,23 @@ def _apply_segment_screening_filters(
     ]
     if source_values:
         query = query.filter(Segment.source.in_(source_values))
+
+    source_content_values = _normalize_segment_source_content_filter_values(source_content_filters)
+    if source_content_values:
+        if source_content_context is None:
+            if "project_sync_disabled" in source_content_values:
+                query = query.filter(Segment.project_sync_disabled.is_(True))
+            else:
+                query = query.filter(literal(False))
+        else:
+            matching_ids = _load_source_content_matching_segment_ids(
+                source_content_context,
+                source_content_values,
+            )
+            if matching_ids:
+                query = query.filter(Segment.id.in_(matching_ids))
+            else:
+                query = query.filter(literal(False))
 
     workflow_step_values: list[UUID] = []
     for value in _normalize_segment_filter_values(workflow_step_ids):
@@ -9080,13 +9505,14 @@ def _get_segment_status_stats(db: Session, file_record_id: UUID) -> dict[str, in
 
 def _get_segment_status_stats_for_query(query) -> dict[str, int]:
     empty_target_expr = func.coalesce(Segment.target_text, "") == ""
+    status_conditions = segment_effective_status_conditions(Segment)
     row = (
         query.with_entities(
             func.count(Segment.id).label("total"),
-            func.coalesce(func.sum(case((Segment.status == "exact", 1), else_=0)), 0).label("exact"),
-            func.coalesce(func.sum(case((Segment.status == "fuzzy", 1), else_=0)), 0).label("fuzzy"),
-            func.coalesce(func.sum(case((Segment.status == "none", 1), else_=0)), 0).label("none"),
-            func.coalesce(func.sum(case((Segment.status == "confirmed", 1), else_=0)), 0).label("confirmed"),
+            func.coalesce(func.sum(case((status_conditions["exact"], 1), else_=0)), 0).label("exact"),
+            func.coalesce(func.sum(case((status_conditions["fuzzy"], 1), else_=0)), 0).label("fuzzy"),
+            func.coalesce(func.sum(case((status_conditions["none"], 1), else_=0)), 0).label("none"),
+            func.coalesce(func.sum(case((status_conditions["confirmed"], 1), else_=0)), 0).label("confirmed"),
             func.coalesce(func.sum(case((empty_target_expr, 1), else_=0)), 0).label("empty_target"),
         )
         .one()
@@ -9116,12 +9542,21 @@ def _get_segment_page_sentence_ids(
     status_filters: list[str] | None = None,
     match_filters: list[str] | None = None,
     source_filters: list[str] | None = None,
+    source_content_filters: list[str] | None = None,
     workflow_step_ids: list[str] | None = None,
+    current_user: User | None = None,
 ) -> list[str]:
     safe_skip = max(skip, 0)
     safe_limit = _normalize_segment_page_limit(limit)
     file_record = get_file_record_model(db, file_record_id)
     query = db.query(Segment.sentence_id).filter(Segment.file_record_id == file_record_id)
+    if file_record is not None and current_user is not None:
+        query = _apply_segment_assignment_visibility_filter(
+            db,
+            query,
+            file_record,
+            current_user,
+        )
     query = _apply_segment_scope_filter(query, scope)
     query = _apply_segment_text_filters(
         query,
@@ -9136,6 +9571,12 @@ def _get_segment_page_sentence_ids(
         status_filters=status_filters,
         match_filters=match_filters,
         source_filters=source_filters,
+        source_content_filters=source_content_filters,
+        source_content_context=(
+            _build_source_content_filter_context_for_file_record(db, file_record, current_user)
+            if file_record is not None and current_user is not None and source_content_filters
+            else None
+        ),
         workflow_step_ids=workflow_step_ids,
     )
     return [
@@ -9482,6 +9923,7 @@ def get_file_record(
         "created_at": file_record.created_at.isoformat(),
         "updated_at": file_record.updated_at.isoformat(),
         "server_time": datetime.now().isoformat(),
+        "change_cursor": _get_latest_segment_change_cursor(visible_base_query),
         "total_segments": total_segments,
         "skip": safe_skip,
         "limit": safe_limit,
@@ -9600,6 +10042,8 @@ def get_file_record_segments(
     match_filters_bracket: list[str] | None = Query(default=None, alias="match_filters[]"),
     source_filters: str | None = None,
     source_filters_bracket: list[str] | None = Query(default=None, alias="source_filters[]"),
+    source_content_filters: str | None = None,
+    source_content_filters_bracket: list[str] | None = Query(default=None, alias="source_content_filters[]"),
     workflow_step_ids: str | None = None,
     workflow_step_ids_bracket: list[str] | None = Query(default=None, alias="workflow_step_ids[]"),
     db: Session = Depends(get_db),
@@ -9635,12 +10079,22 @@ def get_file_record_segments(
     normalized_status_filters = _normalize_segment_filter_values(status_filters, status_filters_bracket)
     normalized_match_filters = _normalize_segment_filter_values(match_filters, match_filters_bracket)
     normalized_source_filters = _normalize_segment_filter_values(source_filters, source_filters_bracket)
+    normalized_source_content_filters = _normalize_segment_source_content_filter_values(
+        source_content_filters,
+        source_content_filters_bracket,
+    )
     normalized_workflow_step_ids = _normalize_segment_filter_values(workflow_step_ids, workflow_step_ids_bracket)
     filtered_query = _apply_segment_screening_filters(
         filtered_query,
         status_filters=normalized_status_filters,
         match_filters=normalized_match_filters,
         source_filters=normalized_source_filters,
+        source_content_filters=normalized_source_content_filters,
+        source_content_context=(
+            _build_source_content_filter_context_for_file_record(db, file_record, current_user)
+            if normalized_source_content_filters
+            else None
+        ),
         workflow_step_ids=normalized_workflow_step_ids,
     )
     matched_segments = filtered_query.count()
@@ -9677,9 +10131,11 @@ def get_file_record_segments(
             "status_filters": normalized_status_filters,
             "match_filters": normalized_match_filters,
             "source_filters": normalized_source_filters,
+            "source_content_filters": normalized_source_content_filters,
             "workflow_step_ids": normalized_workflow_step_ids,
         },
         "server_time": datetime.now().isoformat(),
+        "change_cursor": _get_latest_segment_change_cursor(base_query),
         "segments": [
             _serialize_workbench_segment(
                 seg,
@@ -9719,6 +10175,13 @@ def _format_segment_change_cursor(segment: Segment) -> str:
     return f"{updated_at.isoformat()}|{segment.id}"
 
 
+def _get_latest_segment_change_cursor(query) -> str:
+    segment = query.order_by(None).order_by(Segment.updated_at.desc(), Segment.id.desc()).first()
+    if segment is None:
+        return datetime.min.isoformat()
+    return _format_segment_change_cursor(segment)
+
+
 @router.get("/file-records/{file_record_id}/segments/changes")
 def get_file_record_segment_changes(
     file_record_id: UUID,
@@ -9741,6 +10204,12 @@ def get_file_record_segment_changes(
             Segment.updated_at > since_dt,
             and_(Segment.updated_at == since_dt, Segment.id > since_id),
         )
+    visible_base_query = _apply_segment_assignment_visibility_filter(
+        db,
+        db.query(Segment).filter(Segment.file_record_id == file_record_id),
+        file_record,
+        current_user,
+    )
     changed_query = _apply_segment_assignment_visibility_filter(
         db,
         db.query(Segment).filter(
@@ -9758,7 +10227,7 @@ def get_file_record_segment_changes(
     )
     server_time = datetime.now().isoformat()
     has_more = len(changed_segments) >= safe_limit
-    next_cursor = _format_segment_change_cursor(changed_segments[-1]) if has_more and changed_segments else server_time
+    next_cursor = _format_segment_change_cursor(changed_segments[-1]) if changed_segments else since
     workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
         db,
         file_record,
@@ -9772,6 +10241,7 @@ def get_file_record_segment_changes(
         "server_time": server_time,
         "next_cursor": next_cursor,
         "has_more": has_more,
+        "status_stats": _get_segment_status_stats_for_query(visible_base_query),
         "segments": [
             _serialize_workbench_segment(
                 segment,
@@ -9807,6 +10277,8 @@ def get_file_record_next_unconfirmed_segment_position(
     match_filters_bracket: list[str] | None = Query(default=None, alias="match_filters[]"),
     source_filters: str | None = None,
     source_filters_bracket: list[str] | None = Query(default=None, alias="source_filters[]"),
+    source_content_filters: str | None = None,
+    source_content_filters_bracket: list[str] | None = Query(default=None, alias="source_content_filters[]"),
     workflow_step_ids: str | None = None,
     workflow_step_ids_bracket: list[str] | None = Query(default=None, alias="workflow_step_ids[]"),
     db: Session = Depends(get_db),
@@ -9842,11 +10314,21 @@ def get_file_record_next_unconfirmed_segment_position(
         target_exclude=target_exclude,
         case_sensitive=case_sensitive,
     )
+    normalized_source_content_filters = _normalize_segment_source_content_filter_values(
+        source_content_filters,
+        source_content_filters_bracket,
+    )
     filtered_query = _apply_segment_screening_filters(
         filtered_query,
         status_filters=_normalize_segment_filter_values(status_filters, status_filters_bracket),
         match_filters=_normalize_segment_filter_values(match_filters, match_filters_bracket),
         source_filters=_normalize_segment_filter_values(source_filters, source_filters_bracket),
+        source_content_filters=normalized_source_content_filters,
+        source_content_context=(
+            _build_source_content_filter_context_for_file_record(db, file_record, current_user)
+            if normalized_source_content_filters
+            else None
+        ),
         workflow_step_ids=_normalize_segment_filter_values(workflow_step_ids, workflow_step_ids_bracket),
     )
 
@@ -10156,12 +10638,17 @@ def get_segment_tm_candidates(
         "source_text": segment.source_text,
         "candidates": [
             {
+                "entry_id": c.entry_id,
+                "collection_id": c.collection_id,
                 "source_text": c.source_text,
                 "target_text": c.target_text,
                 "score": c.score,
                 "diff_html": c.diff_html,
                 "collection_name": c.collection_name,
+                "creator_id": c.creator_id,
                 "creator_name": c.creator_name,
+                "last_modified_by_id": c.last_modified_by_id,
+                "last_modified_by_name": c.last_modified_by_name,
                 "created_at": c.created_at,
                 "updated_at": c.updated_at,
             }
@@ -11194,6 +11681,8 @@ def get_merge_view_segments(
     match_filters_bracket: list[str] | None = Query(default=None, alias="match_filters[]"),
     source_filters: str | None = None,
     source_filters_bracket: list[str] | None = Query(default=None, alias="source_filters[]"),
+    source_content_filters: str | None = None,
+    source_content_filters_bracket: list[str] | None = Query(default=None, alias="source_content_filters[]"),
     workflow_step_ids: str | None = None,
     workflow_step_ids_bracket: list[str] | None = Query(default=None, alias="workflow_step_ids[]"),
     db: Session = Depends(get_db),
@@ -11215,7 +11704,16 @@ def get_merge_view_segments(
     normalized_status_filters = _normalize_segment_filter_values(status_filters, status_filters_bracket)
     normalized_match_filters = _normalize_segment_filter_values(match_filters, match_filters_bracket)
     normalized_source_filters = _normalize_segment_filter_values(source_filters, source_filters_bracket)
+    normalized_source_content_filters = _normalize_segment_source_content_filter_values(
+        source_content_filters,
+        source_content_filters_bracket,
+    )
     normalized_workflow_step_ids = _normalize_segment_filter_values(workflow_step_ids, workflow_step_ids_bracket)
+    source_content_context = (
+        _build_source_content_filter_context_for_files(db, files, current_user)
+        if normalized_source_content_filters
+        else None
+    )
 
     # 先按文件累计匹配数，确定 skip/limit 落在哪些文件、各文件取多少。
     # 为避免逐文件全量序列化，采用"两段式"：先统计每文件匹配数，再按窗口取所需页片段。
@@ -11243,6 +11741,8 @@ def get_merge_view_segments(
             status_filters=normalized_status_filters,
             match_filters=normalized_match_filters,
             source_filters=normalized_source_filters,
+            source_content_filters=normalized_source_content_filters,
+            source_content_context=source_content_context,
             workflow_step_ids=normalized_workflow_step_ids,
         )
         per_file_matched.append(filtered_query.count())
@@ -11345,6 +11845,7 @@ def get_merge_view_segments(
             "status_filters": normalized_status_filters,
             "match_filters": normalized_match_filters,
             "source_filters": normalized_source_filters,
+            "source_content_filters": normalized_source_content_filters,
             "workflow_step_ids": normalized_workflow_step_ids,
         },
         "groups": groups,
@@ -11693,13 +12194,7 @@ def update_segment(
         raise HTTPException(status_code=404, detail="片段不存在。")
 
     project_sync_summary = empty_project_segment_sync_summary()
-    if normalize_text(segment.target_text) and not segment.project_sync_disabled:
-        project_sync_summary = sync_project_repeated_segments_from_segments(
-            db,
-            file_record=file_record,
-            source_segments=[segment],
-            current_user=current_user,
-        )
+    segments_for_project_sync = [segment]
 
     auto_tm_summary = _empty_auto_tm_summary()
     if segment.status == "confirmed":
@@ -11712,13 +12207,19 @@ def update_segment(
     if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0 or project_sync_summary.updated_count > 0:
         db.commit()
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+    _schedule_project_segment_sync_for_segments(
+        background_tasks,
+        file_record,
+        segments_for_project_sync,
+        current_user,
+    )
     workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
         db,
         file_record,
         current_user,
     )
     target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
-    response_segments = [segment, *project_sync_summary.current_file_segments]
+    response_segments = [segment]
     qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, response_segments)
     display_index_map = _get_segment_display_index_map(db, file_record_id, response_segments)
     _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, response_segments)
@@ -11988,6 +12489,8 @@ def split_segment(
     segment.matched_creator_name = None
     segment.matched_created_at = None
     segment.matched_updated_at = None
+    segment.project_sync_source_segment_id = None
+    segment.project_sync_source_file_record_id = None
     segment.status = _resolve_unconfirmed_segment_status(segment)
     segment.version = int(segment.version or 1) + 1
 
@@ -12109,6 +12612,8 @@ def merge_segment(
     first_seg.matched_creator_name = None
     first_seg.matched_created_at = None
     first_seg.matched_updated_at = None
+    first_seg.project_sync_source_segment_id = None
+    first_seg.project_sync_source_file_record_id = None
     first_seg.status = _resolve_unconfirmed_segment_status(first_seg)
     first_seg.version = int(first_seg.version or 1) + 1
 
@@ -12189,13 +12694,6 @@ def batch_update(
         if normalize_text(segment.target_text) and not segment.project_sync_disabled
     ]
     project_sync_summary = empty_project_segment_sync_summary()
-    if segments_for_project_sync:
-        project_sync_summary = sync_project_repeated_segments_from_segments(
-            db,
-            file_record=file_record,
-            source_segments=segments_for_project_sync,
-            current_user=current_user,
-        )
     auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(
         db,
         file_record=file_record,
@@ -12205,13 +12703,19 @@ def batch_update(
     if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0 or project_sync_summary.updated_count > 0:
         db.commit()
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+    _schedule_project_segment_sync_for_segments(
+        background_tasks,
+        file_record,
+        segments_for_project_sync,
+        current_user,
+    )
     workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
         db,
         file_record,
         current_user,
     )
     target_automatic_numbering_by_sentence_id = _build_target_automatic_numbering_text_map(file_record)
-    response_segments = [*result.updated_segments, *project_sync_summary.current_file_segments]
+    response_segments = [*result.updated_segments]
     qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, response_segments)
     display_index_map = _get_segment_display_index_map(db, file_record_id, response_segments)
     _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, response_segments)
@@ -12220,6 +12724,7 @@ def batch_update(
         "conflicts": [_serialize_segment_update_conflict(conflict) for conflict in result.conflicts],
         "auto_tm": auto_tm_summary.to_dict(),
         "project_sync": project_sync_summary.to_dict(),
+        "status_stats": _get_segment_status_stats(db, file_record_id),
         "segments": [
             _serialize_workbench_segment(
                 segment,
@@ -12299,19 +12804,13 @@ def batch_update_segment_confirmation(
 
     auto_tm_summary = _empty_auto_tm_summary()
     project_sync_summary = empty_project_segment_sync_summary()
+    confirmed_segments_for_sync: list[Segment] = []
     if payload.action == "confirm" and updated_count:
         confirmed_segments_for_sync = [
             segment
             for segment in segments
             if segment.status == "confirmed" and normalize_text(segment.target_text)
         ]
-        if confirmed_segments_for_sync:
-            project_sync_summary = sync_project_repeated_segments_from_segments(
-                db,
-                file_record=file_record,
-                source_segments=confirmed_segments_for_sync,
-                current_user=current_user,
-            )
         auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(
             db,
             file_record=file_record,
@@ -12323,6 +12822,12 @@ def batch_update_segment_confirmation(
         sync_file_record_status(db, file_record_id)
         db.commit()
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+        _schedule_project_segment_sync_for_segments(
+            background_tasks,
+            file_record,
+            confirmed_segments_for_sync,
+            current_user,
+        )
 
     return {
         "updated_count": updated_count,
@@ -12365,6 +12870,12 @@ def replace_file_record_segment_targets(
         status_filters=payload.status_filters,
         match_filters=payload.match_filters,
         source_filters=payload.source_filters,
+        source_content_filters=payload.source_content_filters,
+        source_content_context=(
+            _build_source_content_filter_context_for_file_record(db, file_record, current_user)
+            if payload.source_content_filters
+            else None
+        ),
         workflow_step_ids=payload.workflow_step_ids,
     )
     segments = _order_segment_query(query, file_record).all()
@@ -12605,6 +13116,8 @@ def get_file_record_revisions(
     match_filters_bracket: list[str] | None = Query(default=None, alias="match_filters[]"),
     source_filters: str | None = None,
     source_filters_bracket: list[str] | None = Query(default=None, alias="source_filters[]"),
+    source_content_filters: str | None = None,
+    source_content_filters_bracket: list[str] | None = Query(default=None, alias="source_content_filters[]"),
     workflow_step_ids: str | None = None,
     workflow_step_ids_bracket: list[str] | None = Query(default=None, alias="workflow_step_ids[]"),
     db: Session = Depends(get_db),
@@ -12642,7 +13155,12 @@ def get_file_record_revisions(
             status_filters=_normalize_segment_filter_values(status_filters, status_filters_bracket),
             match_filters=_normalize_segment_filter_values(match_filters, match_filters_bracket),
             source_filters=_normalize_segment_filter_values(source_filters, source_filters_bracket),
+            source_content_filters=_normalize_segment_source_content_filter_values(
+                source_content_filters,
+                source_content_filters_bracket,
+            ),
             workflow_step_ids=_normalize_segment_filter_values(workflow_step_ids, workflow_step_ids_bracket),
+            current_user=current_user,
         )
         revisions = list_revisions(
             db,
@@ -12765,6 +13283,8 @@ def get_file_record_comments(
     match_filters_bracket: list[str] | None = Query(default=None, alias="match_filters[]"),
     source_filters: str | None = None,
     source_filters_bracket: list[str] | None = Query(default=None, alias="source_filters[]"),
+    source_content_filters: str | None = None,
+    source_content_filters_bracket: list[str] | None = Query(default=None, alias="source_content_filters[]"),
     workflow_step_ids: str | None = None,
     workflow_step_ids_bracket: list[str] | None = Query(default=None, alias="workflow_step_ids[]"),
     db: Session = Depends(get_db),
@@ -12791,7 +13311,12 @@ def get_file_record_comments(
             status_filters=_normalize_segment_filter_values(status_filters, status_filters_bracket),
             match_filters=_normalize_segment_filter_values(match_filters, match_filters_bracket),
             source_filters=_normalize_segment_filter_values(source_filters, source_filters_bracket),
+            source_content_filters=_normalize_segment_source_content_filter_values(
+                source_content_filters,
+                source_content_filters_bracket,
+            ),
             workflow_step_ids=_normalize_segment_filter_values(workflow_step_ids, workflow_step_ids_bracket),
+            current_user=current_user,
         )
 
     comments = list_segment_comments_for_file_record(
@@ -13235,6 +13760,19 @@ async def llm_translate_file_record(
                         ))
                         continue
 
+                    if target_task is not None:
+                        skip_reason = _get_llm_write_skip_reason(segment, target_task, body.scope)
+                        if skip_reason:
+                            events.append((
+                                "skipped",
+                                {
+                                    "sentence_id": sentence_id,
+                                    "status": segment.status,
+                                    "message": skip_reason,
+                                },
+                            ))
+                            continue
+
                     try:
                         with fdb.begin_nested():
                             before_text = segment.target_text
@@ -13324,6 +13862,7 @@ async def llm_translate_file_record(
         db.close()
         updated_count = 0
         error_count = 0
+        skipped_count = 0
         total_count = sum(1 for task in translation_tasks if task.should_translate)
 
         yield _sse_event(
@@ -13363,7 +13902,7 @@ async def llm_translate_file_record(
             return bool(callable(request_cancel_check) and request_cancel_check())
 
         async def flush_pending():
-            nonlocal updated_count, error_count, pending_results
+            nonlocal updated_count, error_count, skipped_count, pending_results
             if not pending_results:
                 return
             batch = pending_results
@@ -13373,6 +13912,8 @@ async def llm_translate_file_record(
             for event_name, event_data in events:
                 if event_name == "error":
                     error_count += 1
+                elif event_name == "skipped":
+                    skipped_count += 1
                 yield _sse_event(event_name, event_data)
 
         async for result in iter_batch_translate(
@@ -13420,6 +13961,7 @@ async def llm_translate_file_record(
                     "file_record_id": str(file_record_id),
                     "updated_count": updated_count,
                     "error_count": error_count,
+                    "skipped_count": skipped_count,
                     "total": total_count,
                 },
             )
@@ -13494,6 +14036,14 @@ def _serialize_tm_entry(entry: TranslationMemory) -> dict:
         "created_at": entry.created_at.isoformat(),
         "updated_at": entry.updated_at.isoformat(),
     }
+
+
+def _require_tm_entry_owner_or_admin(entry: TranslationMemory, current_user: User) -> None:
+    if can_access_all_projects(current_user):
+        return
+    if entry.creator_id is not None and entry.creator_id == current_user.id:
+        return
+    raise HTTPException(status_code=403, detail="只能编辑或删除自己添加的 TM 条目。")
 
 
 def _serialize_resource_search_tm_row(entry: TranslationMemory, collection_name: str | None) -> dict:
@@ -14656,11 +15206,13 @@ def update_tm_entry(
     entry_id: UUID,
     payload: TMEntryUpdatePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(get_current_user),
 ):
     entry = db.query(TranslationMemory).filter(TranslationMemory.id == entry_id).first()
     if entry is None:
         raise HTTPException(status_code=404, detail="TM 条目不存在。")
+
+    _require_tm_entry_owner_or_admin(entry, current_user)
 
     source_text = normalize_text(payload.source_text)
     target_text = normalize_text(payload.target_text)
@@ -14711,11 +15263,13 @@ def update_tm_entry(
 def delete_tm_entry(
     entry_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(get_current_user),
 ):
     entry = db.query(TranslationMemory).filter(TranslationMemory.id == entry_id).first()
     if entry is None:
         raise HTTPException(status_code=404, detail="TM 条目不存在。")
+
+    _require_tm_entry_owner_or_admin(entry, current_user)
 
     db.delete(entry)
     db.commit()
@@ -15135,15 +15689,25 @@ def match_terms(
     if not collection_ids:
         return {"matches": []}
 
+    creator_user = aliased(User)
+    last_modified_user = aliased(User)
     candidate_query = (
         db.query(
             TermEntry.id,
             TermEntry.term_base_id,
             TermEntry.source_text,
             TermEntry.target_text,
+            TermEntry.creator_id,
+            TermEntry.last_modified_by_id,
+            TermEntry.created_at,
+            TermEntry.updated_at,
             TermBase.name.label("term_base_name"),
+            func.coalesce(creator_user.nickname, creator_user.username).label("creator_name"),
+            func.coalesce(last_modified_user.nickname, last_modified_user.username).label("last_modified_by_name"),
         )
         .outerjoin(TermBase, TermEntry.term_base_id == TermBase.id)
+        .outerjoin(creator_user, TermEntry.creator_id == creator_user.id)
+        .outerjoin(last_modified_user, TermEntry.last_modified_by_id == last_modified_user.id)
         .filter(
             TermEntry.term_base_id.in_(collection_ids),
             TermEntry.source_text != "",
@@ -15174,6 +15738,16 @@ def match_terms(
                 "term_base_name": term_match.item.term_base_name,
                 "source_text": term_match.item.source_text,
                 "target_text": term_match.item.target_text,
+                "creator_id": str(term_match.item.creator_id) if term_match.item.creator_id else None,
+                "creator_name": term_match.item.creator_name,
+                "last_modified_by_id": (
+                    str(term_match.item.last_modified_by_id)
+                    if term_match.item.last_modified_by_id
+                    else None
+                ),
+                "last_modified_by_name": term_match.item.last_modified_by_name,
+                "created_at": term_match.item.created_at.isoformat() if term_match.item.created_at else None,
+                "updated_at": term_match.item.updated_at.isoformat() if term_match.item.updated_at else None,
                 "start": term_match.start,
                 "end": term_match.end,
             }

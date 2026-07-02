@@ -377,22 +377,46 @@ export interface UploadCapabilitiesResponse {
 }
 
 export interface TMMatchCandidate {
+  entry_id?: string | null
+  collection_id?: string | null
   source_text: string
   target_text: string
   score: number
   diff_html?: string | null
   collection_name: string | null
+  creator_id?: string | null
   creator_name: string | null
+  last_modified_by_id?: string | null
+  last_modified_by_name?: string | null
   created_at: string | null
   updated_at: string | null
 }
 
 export interface TermMatchCandidate {
+  entry_id?: string | null
+  term_base_id?: string | null
   source_text: string
   target_text: string
   term_base_name: string | null
+  creator_id?: string | null
   creator_name: string | null
+  last_modified_by_id?: string | null
+  last_modified_by_name?: string | null
+  created_at?: string | null
   updated_at: string | null
+}
+
+export interface ProjectSyncOrigin {
+  segment_id: string
+  sentence_id: string | null
+  file_record_id: string | null
+  filename: string | null
+  source_text: string | null
+  target_text: string | null
+  status: string | null
+  source: string | null
+  updated_at: string | null
+  last_modified_by?: User | null
 }
 
 export interface Segment {
@@ -409,6 +433,7 @@ export interface Segment {
   target_html?: string | null
   status: string
   project_sync_disabled?: boolean
+  project_sync_origin?: ProjectSyncOrigin | null
   version: number
   score: number
   matched_source_text: string | null
@@ -625,6 +650,7 @@ export interface FileRecordDetail {
   created_at: string
   updated_at: string
   server_time?: string
+  change_cursor?: string
   total_segments: number
   skip: number
   limit: number
@@ -661,6 +687,7 @@ export interface SegmentPageFilters {
   status_filters?: string[]
   match_filters?: string[]
   source_filters?: string[]
+  source_content_filters?: string[]
   workflow_step_ids?: string[]
 }
 
@@ -673,6 +700,7 @@ export interface SegmentPageResponse {
   limit: number
   filters: SegmentPageFilters
   server_time?: string
+  change_cursor?: string
   segments: Segment[]
 }
 
@@ -767,6 +795,7 @@ export interface MergeViewSegmentPageResponse {
   filters: SegmentPageFilters
   groups: MergeViewSegmentGroup[]
   server_time?: string
+  change_cursor?: string
   segments: Segment[]
 }
 
@@ -1402,6 +1431,12 @@ export interface TermMatch {
   term_base_name?: string | null
   source_text: string
   target_text: string
+  creator_id?: string | null
+  creator_name?: string | null
+  last_modified_by_id?: string | null
+  last_modified_by_name?: string | null
+  created_at?: string | null
+  updated_at?: string | null
   start: number
   end: number
 }

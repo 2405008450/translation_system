@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     languagetool_base_url: str | None = None
     languagetool_timeout_seconds: float = 10.0
     languagetool_max_text_length: int = 20000
+    # 默认关闭保存/确认后的自动拼写语法 QA，避免低优先级检查挤占上传导入队列。
+    spelling_grammar_qa_auto_schedule: bool = False
     # LLM settings for reference analysis.
     reference_llm_provider: str = "openrouter"
     reference_llm_api_key: str | None = None
@@ -63,8 +65,11 @@ class Settings(BaseSettings):
     redis_url: str | None = None
     import_queue_backend: str = "local"
     arq_max_jobs: int = 1
-    arq_maintenance_max_jobs: int = 1
-    arq_pretranslation_max_jobs: int = 1
+    # 为空或 0 时继承 ARQ_MAX_JOBS；生产环境可单独设置维护队列/预翻译队列并发。
+    arq_maintenance_max_jobs: int | None = None
+    arq_pretranslation_max_jobs: int | None = None
+    # 单个项目预翻译批次内，同时处理的文件任务数。仍会叠加 LLM_MAX_CONCURRENCY 的限制。
+    pretranslation_run_file_concurrency: int = 2
     auto_tm_rematch_max_files_per_run: int = 10
     aspose_words_license_path: str | None = None
     libreoffice_soffice_path: str | None = None

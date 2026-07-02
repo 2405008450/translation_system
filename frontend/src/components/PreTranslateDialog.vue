@@ -82,6 +82,7 @@ interface PretranslationRunStatus {
 }
 
 type ResourceImportTab = 'tm' | 'glossary' | 'term'
+type LLMTranslationUnit = 'sentence' | 'paragraph'
 type LanguagePairStat = {
   source: string | null
   target: string | null
@@ -135,6 +136,7 @@ const useLlm = ref(false)
 const llmScope = ref<LLMTranslateScope>('all')
 const llmProvider = ref<LLMProvider>('openrouter')
 const llmModel = ref(defaultLLMModelId)
+const llmTranslationUnit = ref<LLMTranslationUnit>('sentence')
 const llmGuidelines = ref('')
 const selectedGuidelineTemplateId = ref('')
 const importingGuidelineTemplate = ref(false)
@@ -526,7 +528,7 @@ function buildTaskStatusText(task: PretranslationTaskStatus) {
   if (task.updated_segments > 0 || task.error_segments > 0) {
     parts.push(`成功 ${task.updated_segments}，失败 ${task.error_segments}`)
   }
-  if (task.error && task.status === 'failed') {
+  if (task.error && (task.status === 'failed' || task.error_segments > 0)) {
     parts.push(task.error)
   }
   return parts.filter(Boolean).join(' · ')
@@ -1369,7 +1371,7 @@ async function startPreTranslateTaskRun() {
       llm_scope: llmScope.value,
       llm_provider: llmProvider.value,
       llm_model: llmModel.value || null,
-      llm_translation_unit: 'paragraph',
+      llm_translation_unit: llmTranslationUnit.value,
       guideline_template_id: selectedGuidelineTemplateId.value || null,
       temporary_prompt: llmGuidelines.value,
     })
@@ -1815,6 +1817,17 @@ onBeforeUnmount(() => {
             <span class="ptd-switch__control" aria-hidden="true" />
             <span class="ptd-section__icon"><Bot :size="17" /></span>
             <span>{{ t('projectDetail.preTranslate.sections.llm') }}</span>
+          </label>
+          <label class="ptd-mini-toggle" :title="t('projectDetail.preTranslate.llm.contextModeTitle')">
+            <input
+              v-model="llmTranslationUnit"
+              type="checkbox"
+              true-value="paragraph"
+              false-value="sentence"
+              :disabled="running || !useLlm"
+            />
+            <span class="ptd-mini-toggle__track" aria-hidden="true" />
+            <span>{{ t('projectDetail.preTranslate.llm.contextMode') }}</span>
           </label>
         </div>
         <div class="ptd-llm-tip" role="note">
@@ -2313,6 +2326,69 @@ onBeforeUnmount(() => {
 }
 
 .ptd-switch input:focus-visible + .ptd-switch__control {
+  outline: 2px solid color-mix(in srgb, var(--brand-700) 24%, transparent);
+  outline-offset: 2px;
+}
+
+.ptd-mini-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.ptd-mini-toggle input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.ptd-mini-toggle__track {
+  position: relative;
+  width: 32px;
+  height: 18px;
+  flex: 0 0 auto;
+  border: 1px solid color-mix(in srgb, var(--text-muted) 42%, var(--line-soft));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface-panel) 82%, var(--text-muted) 18%);
+  transition: background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.ptd-mini-toggle__track::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.22);
+  transition: transform 0.18s ease;
+}
+
+.ptd-mini-toggle input:checked + .ptd-mini-toggle__track {
+  border-color: color-mix(in srgb, var(--brand-700) 70%, var(--line-soft));
+  background: color-mix(in srgb, var(--brand-500) 82%, #ffffff 18%);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--brand-500) 10%, transparent);
+}
+
+.ptd-mini-toggle input:checked + .ptd-mini-toggle__track::after {
+  transform: translateX(14px);
+}
+
+.ptd-mini-toggle input:disabled + .ptd-mini-toggle__track,
+.ptd-mini-toggle input:disabled ~ span {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.ptd-mini-toggle input:focus-visible + .ptd-mini-toggle__track {
   outline: 2px solid color-mix(in srgb, var(--brand-700) 24%, transparent);
   outline-offset: 2px;
 }

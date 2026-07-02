@@ -176,15 +176,17 @@ def _file_status_stats(db: Session, file_record_id: UUID) -> dict[str, int]:
     from sqlalchemy import case, func
 
     from app.models import Segment
+    from app.services.segment_status import segment_effective_status_conditions
 
     total = db.query(func.count(Segment.id)).filter(Segment.file_record_id == file_record_id).scalar() or 0
     if total == 0:
         return {"total": 0, "exact": 0, "fuzzy": 0, "none": 0, "confirmed": 0, "empty_target": 0}
+    status_conditions = segment_effective_status_conditions(Segment)
     rows = db.query(
-        func.count(case((Segment.status == "exact", 1), else_=None)).label("exact"),
-        func.count(case((Segment.status == "fuzzy", 1), else_=None)).label("fuzzy"),
-        func.count(case((Segment.status == "none", 1), else_=None)).label("none"),
-        func.count(case((Segment.status == "confirmed", 1), else_=None)).label("confirmed"),
+        func.count(case((status_conditions["exact"], 1), else_=None)).label("exact"),
+        func.count(case((status_conditions["fuzzy"], 1), else_=None)).label("fuzzy"),
+        func.count(case((status_conditions["none"], 1), else_=None)).label("none"),
+        func.count(case((status_conditions["confirmed"], 1), else_=None)).label("confirmed"),
         func.count(
             case((func.coalesce(Segment.target_text, "") == "", 1), else_=None)
         ).label("empty_target"),

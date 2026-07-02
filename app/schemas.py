@@ -10,22 +10,33 @@ PasswordStr = Annotated[str, StringConstraints(min_length=6, max_length=128)]
 
 class TMMatchCandidate(BaseModel):
     """单个TM匹配候选"""
+    entry_id: str | None = None
+    collection_id: str | None = None
     source_text: str
     target_text: str
     score: float
     diff_html: str | None = None
     collection_name: str | None = None
+    creator_id: str | None = None
     creator_name: str | None = None
+    last_modified_by_id: str | None = None
+    last_modified_by_name: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
 
 
 class TermMatchCandidate(BaseModel):
     """单个术语匹配候选"""
+    entry_id: str | None = None
+    term_base_id: str | None = None
     source_text: str
     target_text: str
     term_base_name: str | None = None
+    creator_id: str | None = None
     creator_name: str | None = None
+    last_modified_by_id: str | None = None
+    last_modified_by_name: str | None = None
+    created_at: str | None = None
     updated_at: str | None = None
 
 

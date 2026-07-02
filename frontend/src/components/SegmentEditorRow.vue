@@ -6,6 +6,7 @@ import InteractiveDiffText from './InteractiveDiffText.vue'
 
 import { getLLMModelShortLabel } from '../constants/llm'
 import { getSegmentSourceMeta, getSegmentStatusMeta } from '../constants/status'
+import { useAuthStore } from '../stores/auth'
 import type { RevisionDisplaySettings, Segment, SegmentQAIssue, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
 import { findTermTextRanges } from '../utils/termMatching'
 import { computeDiff } from '../utils/textDiff'
@@ -67,9 +68,11 @@ const emit = defineEmits<{
 
 const editorRef = ref<HTMLDivElement | null>(null)
 const sourceEditorRef = ref<HTMLDivElement | null>(null)
+const authStore = useAuthStore()
 const isFocused = ref(false)
 const isSourceFocused = ref(false)
 const isComposing = ref(false)
+const editorDirtySinceFocus = ref(false)
 
 // 对外标识：合并视图使用复合键，单文件回退为 sentence_id
 const segmentKey = computed(() => props.segmentKey || props.segment.sentence_id)
@@ -107,6 +110,12 @@ interface EditorTextRange {
   end: number
 }
 
+interface LocalEditorEcho {
+  sentenceId: string
+  text: string
+  html: string | null
+}
+
 type HighlightKind = 'term' | 'search' | 'qa'
 type HighlightPart = { text: string; highlight: boolean; kind?: HighlightKind; title?: string }
 type BasicFormatTag = 'b' | 'i' | 'u' | 's' | 'sub' | 'sup'
@@ -121,6 +130,7 @@ const redoStack = ref<EditorHistorySnapshot[]>([])
 const isApplyingHistory = ref(false)
 const compositionSnapshotRecorded = ref(false)
 const lastTargetSelectionRange = ref<EditorTextRange | null>(null)
+const localEditorEcho = ref<LocalEditorEcho | null>(null)
 let lastHistorySnapshotAt = 0
 let lastHistoryInputKind = ''
 let preserveNextTargetSync = false
@@ -128,49 +138,155 @@ let revisionRerenderTimer: ReturnType<typeof setTimeout> | null = null
 const canUndoEditorChange = computed(() => undoStack.value.length > 0)
 const canRedoEditorChange = computed(() => redoStack.value.length > 0)
 
-const statusClass = computed(() => `segment-row--${props.segment.status || 'none'}`)
+function normalizeMatchText(value: string | null | undefined) {
+  return (value || '').trim().replace(/\s+/g, ' ').replace(/[\u3002\uff01\uff1f!?.]+$/u, '')
+}
+
+function compactMatchCore(value: string | null | undefined) {
+  return normalizeMatchText(value).replace(/[^\w\u4e00-\u9fff]+/gu, '')
+}
+
+function isShortStructuralFragment(value: string | null | undefined) {
+  const core = compactMatchCore(value)
+  return Boolean(core && core.length <= 4 && /^(?:\d+[A-Za-z]?|[A-Za-z]|[ivxlcdmIVXLCDM]{1,4})$/.test(core))
+}
+
+function normalizedSequenceRatio(left: string, right: string): number {
+  if (left === right) return 1
+  const rows = left.length + 1
+  const cols = right.length + 1
+  const lengths = Array.from({ length: rows }, () => Array<number>(cols).fill(0))
+  for (let row = 1; row < rows; row += 1) {
+    for (let col = 1; col < cols; col += 1) {
+      lengths[row][col] = left[row - 1] === right[col - 1]
+        ? lengths[row - 1][col - 1] + 1
+        : Math.max(lengths[row - 1][col], lengths[row][col - 1])
+    }
+  }
+  return (2 * lengths[left.length][right.length]) / Math.max(left.length + right.length, 1)
+}
+
+function capShortStructuralDisplayScore(
+  score: number,
+  sourceText: string | null | undefined,
+  matchedSourceText: string | null | undefined,
+) {
+  const normalizedSource = normalizeMatchText(sourceText)
+  const normalizedMatchedSource = normalizeMatchText(matchedSourceText)
+  if (!normalizedSource || !normalizedMatchedSource || normalizedSource === normalizedMatchedSource) {
+    return score
+  }
+  const sourceCore = compactMatchCore(normalizedSource)
+  const matchedCore = compactMatchCore(normalizedMatchedSource)
+  if (
+    sourceCore
+    && sourceCore === matchedCore
+    && (isShortStructuralFragment(normalizedSource) || isShortStructuralFragment(normalizedMatchedSource))
+  ) {
+    return Math.min(score, normalizedSequenceRatio(normalizedSource, normalizedMatchedSource), 0.79)
+  }
+  return score
+}
+
+function normalizeDisplayScore(
+  score: number | null | undefined,
+  exactTextMatch = false,
+  sourceText?: string | null,
+  matchedSourceText?: string | null,
+): number | null {
+  if (score === null || score === undefined || !Number.isFinite(score) || score <= 0) return null
+  const safeScore = Math.min(Math.max(score, 0), 1)
+  const cappedScore = capShortStructuralDisplayScore(safeScore, sourceText, matchedSourceText)
+  return exactTextMatch ? cappedScore : Math.min(cappedScore, 0.99)
+}
+
+const hasExactTextMatch = computed(() => {
+  const sourceText = normalizeMatchText(props.segment.source_text)
+  const displayText = normalizeMatchText(props.segment.display_text)
+  const matchedSourceText = normalizeMatchText(props.segment.matched_source_text)
+  return Boolean(
+    (sourceText && matchedSourceText && matchedSourceText === sourceText)
+    || (
+      displayText
+      && matchedSourceText
+      && matchedSourceText === displayText
+      && !isShortStructuralFragment(props.segment.source_text)
+    )
+  )
+})
+const effectiveSegmentStatus = computed(() => {
+  if (props.segment.status === 'confirmed') {
+    return 'confirmed'
+  }
+  if (hasExactTextMatch.value) {
+    return 'exact'
+  }
+  const matchedSourceText = normalizeMatchText(props.segment.matched_source_text)
+  const score = Number(props.segment.score || 0)
+  if (score > 0 || matchedSourceText || props.segment.status === 'fuzzy') {
+    return 'fuzzy'
+  }
+  return 'none'
+})
+const statusClass = computed(() => `segment-row--${effectiveSegmentStatus.value}`)
 const parityClass = computed(() => (props.index % 2 === 0 ? 'segment-row--odd' : 'segment-row--even'))
 const sourceClass = computed(() => `segment-row__tag--source-${props.segment.source || 'none'}`)
 const isEmptyTarget = computed(() => {
   const targetText = props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
   return targetText.length === 0
 })
-const statusMeta = computed(() => getSegmentStatusMeta(props.segment.status))
+const statusMeta = computed(() => getSegmentStatusMeta(effectiveSegmentStatus.value))
 const sourceMeta = computed(() => getSegmentSourceMeta(props.segment.source))
+const shouldHideLLMModel = computed(() => authStore.isExternalTranslator)
+const isProjectSynced = computed(() => props.segment.source === 'project_sync')
 const sourceLabel = computed(() => {
   if (props.segment.source === 'llm') {
+    if (shouldHideLLMModel.value) {
+      return '机器翻译'
+    }
     const modelId = props.segment.llm_model?.trim()
     return modelId ? getLLMModelShortLabel(modelId) : sourceMeta.value.label
   }
   return sourceMeta.value.label
 })
 const compactSourceLabel = computed(() => (
-  props.segment.source === 'project_sync' ? '同步' : sourceLabel.value
+  isProjectSynced.value ? '同步' : sourceLabel.value
 ))
 const workflowLabel = computed(() => props.segment.workflow_step_name || '翻译')
 const showStatusTag = computed(() => {
-  const status = props.segment.status || 'none'
+  if (isProjectSynced.value) {
+    return false
+  }
+  const status = effectiveSegmentStatus.value
   return status !== 'none' && status !== 'fuzzy'
 })
 const showSourceTag = computed(() => {
   const source = props.segment.source || 'none'
+  if (isProjectSynced.value) {
+    return true
+  }
   if (source === 'none' || source === 'fuzzy') {
     return false
   }
   if (source === 'llm') {
     return !isEmptyTarget.value
   }
-  return props.segment.status !== 'none' && props.segment.status !== 'fuzzy'
+  return effectiveSegmentStatus.value !== 'none' && effectiveSegmentStatus.value !== 'fuzzy'
 })
 const showProjectSyncToggle = computed(() => true)
 const projectSyncToggleLabel = computed(() => (
   props.segment.project_sync_disabled ? '开启同步' : '关闭同步'
 ))
 const sourceTitle = computed(() => {
-  if (props.segment.source === 'llm' && props.segment.llm_model?.trim()) {
-    return props.segment.llm_provider
-      ? `${props.segment.llm_model} (${props.segment.llm_provider})`
-      : props.segment.llm_model
+  if (props.segment.source === 'llm') {
+    if (shouldHideLLMModel.value) {
+      return '机器翻译'
+    }
+    if (props.segment.llm_model?.trim()) {
+      return props.segment.llm_provider
+        ? `${props.segment.llm_model} (${props.segment.llm_provider})`
+        : props.segment.llm_model
+    }
   }
   return sourceMeta.value.label
 })
@@ -209,10 +325,34 @@ const revisionTooltip = computed(() => {
     : ''
   return createdAt ? `${authorName} · ${createdAt}` : authorName
 })
-const scorePercent = computed(() => {
-  if (!props.segment.score || props.segment.score <= 0) return null
-  return Math.round(props.segment.score * 100)
+const displayScore = computed(() => (
+  normalizeDisplayScore(
+    props.segment.score,
+    effectiveSegmentStatus.value === 'exact' || effectiveSegmentStatus.value === 'confirmed',
+    props.segment.source_text,
+    props.segment.matched_source_text,
+  )
+))
+const scorePercent = computed(() => (
+  displayScore.value === null ? null : Math.round(displayScore.value * 100)
+))
+const showMatchRate = computed(() => !isProjectSynced.value && scorePercent.value !== null)
+const matchRateTone = computed(() => {
+  const score = displayScore.value ?? 0
+  if (effectiveSegmentStatus.value === 'exact' && score >= 1) return 'exact'
+  if (score >= 0.8) return 'high'
+  if (score >= 0.6) return 'medium'
+  return 'low'
 })
+const matchRateLabel = computed(() => {
+  if (scorePercent.value === null) {
+    return ''
+  }
+  return `${scorePercent.value}%`
+})
+const stateCellTitle = computed(() => (
+  isProjectSynced.value ? sourceTitle.value : statusMeta.value.label
+))
 
 // 通用的文本高亮函数
 function highlightText(
@@ -402,10 +542,10 @@ function highlightQAText(text: string, issues: SegmentQAIssue[]): HighlightPart[
 const targetHtmlContent = computed(() => {
   // 如果有保存的格式化 HTML，优先使用
   if (hasExplicitTargetHtmlOverride() && !hasAutomaticNumbering.value) {
-    return renderTargetHtmlWithHighlights(sanitizeHtml(props.segment.target_html ?? ''))
+    return renderTargetHtmlWithHighlights(sanitizeHtml(getTargetStateHtml() ?? ''))
   }
 
-  return renderTargetWithSourceFormats(props.segment.target_text || '')
+  return renderTargetWithSourceFormats(getTargetStateText())
 })
 
 const editorHtmlContent = computed(() => {
@@ -925,13 +1065,53 @@ function getCurrentEditorText(): string {
   return getTargetStateText()
 }
 
-function getTargetStateText(): string {
+function getPropTargetStateText(): string {
   return props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
+}
+
+function getPropTargetStateHtml(): string | null {
+  return props.segment.target_html || null
+}
+
+function getActiveLocalEditorEcho(): LocalEditorEcho | null {
+  const echo = localEditorEcho.value
+  return echo?.sentenceId === segmentKey.value ? echo : null
+}
+
+function setLocalEditorEcho(text: string, html: string | null) {
+  localEditorEcho.value = {
+    sentenceId: segmentKey.value,
+    text,
+    html: html || null,
+  }
+}
+
+function clearLocalEditorEchoIfSynced() {
+  const echo = getActiveLocalEditorEcho()
+  if (!echo) {
+    return
+  }
+  if (echo.text === getPropTargetStateText() && echo.html === getPropTargetStateHtml()) {
+    localEditorEcho.value = null
+  }
+}
+
+function clearLocalEditorEcho() {
+  localEditorEcho.value = null
+}
+
+function getTargetStateText(): string {
+  return getActiveLocalEditorEcho()?.text ?? getPropTargetStateText()
+}
+
+function getTargetStateHtml(): string | null {
+  const echo = getActiveLocalEditorEcho()
+  return echo ? echo.html : getPropTargetStateHtml()
 }
 
 function getCurrentEditorHtml(): string | null {
   if (!editorRef.value) {
-    return props.segment.target_html || null
+    return getTargetStateHtml()
   }
   const html = serializeEditorContentWithFormat(editorRef.value)
   return shouldPersistEditorHtml(html) ? html : null
@@ -944,10 +1124,11 @@ function commitEditorContent(): CommittedEditorContent | null {
 
   const text = serializeEditorContent(editorRef.value)
   const html = getCurrentEditorHtml()
-  const currentText = props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
-  const currentHtml = props.segment.target_html || null
+  const currentText = getTargetStateText()
+  const currentHtml = getTargetStateHtml()
 
-  if (text !== currentText || html !== currentHtml) {
+  if (text !== currentText || (editorDirtySinceFocus.value && html !== currentHtml)) {
+    setLocalEditorEcho(text, html)
     emit('update', segmentKey.value, text, html || undefined)
   }
 
@@ -1120,8 +1301,7 @@ function shouldPreserveHistoryForStateSync() {
   if (!editorRef.value) {
     return false
   }
-  const stateText = props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
-  return serializeEditorContent(editorRef.value) === stateText
+  return serializeEditorContent(editorRef.value) === getTargetStateText()
 }
 
 function applyHistorySnapshot(snapshot: EditorHistorySnapshot) {
@@ -1162,6 +1342,7 @@ function redoEditorChange() {
 
 function handleFocus() {
   isFocused.value = true
+  editorDirtySinceFocus.value = false
   emit('focus', segmentKey.value)
   cacheTargetSelectionFromDom()
 }
@@ -1171,6 +1352,7 @@ function handleBlur() {
   cacheTargetSelectionFromDom()
   commitEditorContent()
   isFocused.value = false
+  editorDirtySinceFocus.value = false
   resetHistoryGroup()
   void nextTick(() => syncEditorHtmlFromState(false))
 }
@@ -1251,6 +1433,9 @@ function handleBeforeInput(event: Event) {
   const inputEvent = event as InputEvent
   if (props.disabled || isApplyingHistory.value) {
     return
+  }
+  if (inputEvent.inputType.startsWith('delete')) {
+    clearRevisionRerenderTimer()
   }
 
   if (inputEvent.inputType === 'historyUndo') {
@@ -1372,6 +1557,8 @@ function handleInput() {
   if (!editorRef.value) return
   if (isApplyingHistory.value) return
   if (isComposing.value) return
+  clearRevisionRerenderTimer()
+  editorDirtySinceFocus.value = true
   cacheTargetSelectionFromDom()
 
   // 检查是否有格式标签
@@ -1383,12 +1570,14 @@ function handleInput() {
 
   // Persist HTML when it carries formats or an explicit plain-format override.
   if (shouldPersistHtml) {
+    setLocalEditorEcho(text, cleanHtml)
     emit('update', segmentKey.value, text, cleanHtml)
     clearExplicitPlainFormatRequest()
     return
   }
 
   // 没有格式标签，只传递纯文本
+  setLocalEditorEcho(text, null)
   emit('update', segmentKey.value, text)
   clearExplicitPlainFormatRequest()
 }
@@ -1546,7 +1735,7 @@ function hasSerializableFormatTags(html: string): boolean {
 }
 
 function hasExplicitTargetHtmlOverride(): boolean {
-  return props.segment.target_html !== null && props.segment.target_html !== undefined
+  return getTargetStateHtml() !== null && getTargetStateHtml() !== undefined
 }
 
 function hasExplicitPlainFormatRequest(): boolean {
@@ -1842,13 +2031,16 @@ watch(
   () => props.segment.sentence_id,
   () => {
     lastTargetSelectionRange.value = null
+    editorDirtySinceFocus.value = false
+    clearLocalEditorEcho()
     clearEditorHistory()
   }
 )
 
 watch(
-  () => props.segment.target_text,
+  () => [props.segment.target_text, props.segment.target_html, props.pendingRevision?.after_text] as const,
   () => {
+    clearLocalEditorEchoIfSynced()
     const shouldPreserveHistory = shouldPreserveHistoryForStateSync()
     preserveNextTargetSync = false
     if (!shouldPreserveHistory) {
@@ -1863,6 +2055,7 @@ watch(
 watch(
   () => props.pendingRevision?.id ?? null,
   () => {
+    clearLocalEditorEchoIfSynced()
     const shouldPreserveHistory = shouldPreserveHistoryForStateSync()
     preserveNextTargetSync = false
     if (!shouldPreserveHistory) {
@@ -2095,17 +2288,22 @@ watch(
       </div>
     </div>
 
-    <div class="segment-row__cell segment-row__cell--state" :title="statusMeta.label">
+    <div class="segment-row__cell segment-row__cell--state" :title="stateCellTitle">
       <span
-        v-if="segment.status === 'confirmed'"
+        v-if="segment.status === 'confirmed' && !isProjectSynced"
         class="segment-row__confirm-mark"
         aria-label="已确认"
       >√</span>
-      <span v-if="scorePercent !== null" class="segment-row__match-rate">
-        {{ scorePercent }}%
+      <span
+        v-if="showMatchRate"
+        class="segment-row__match-rate"
+        :class="`segment-row__match-rate--${matchRateTone}`"
+        :title="statusMeta.label"
+      >
+        {{ matchRateLabel }}
       </span>
       <span
-        v-if="showStatusTag && segment.status !== 'confirmed' && scorePercent === null"
+        v-if="showStatusTag && segment.status !== 'confirmed' && !showMatchRate"
         class="segment-row__compact-tag segment-row__compact-tag--status"
       >
         {{ statusMeta.label }}
@@ -2248,6 +2446,7 @@ watch(
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  max-width: 100%;
   min-height: 18px;
   padding: 0 4px;
   border-radius: 2px;
@@ -2256,6 +2455,22 @@ watch(
   font-size: 11px;
   font-weight: 700;
   line-height: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.segment-row__match-rate--exact,
+.segment-row__match-rate--high {
+  background: #4fa873;
+}
+
+.segment-row__match-rate--medium {
+  background: #d8b74e;
+}
+
+.segment-row__match-rate--low {
+  background: #c95c62;
 }
 
 .segment-row__compact-tag {

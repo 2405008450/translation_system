@@ -179,7 +179,8 @@ Copy-Item .env.example .env
 | `TM_VECTOR_*`                                 | pgvector 语义检索开关、维度、候选数和权重                                                                   |
 | `DEEPSEEK_*` / `OPENROUTER_*`                 | LLM Provider 配置，AI 修正至少需要一个 API Key                                                         |
 | `LLM_TIMEOUT_SECONDS` / `LLM_STALL_TIMEOUT_SECONDS` / `LLM_MAX_CONCURRENCY` | LLM 单次请求超时、无进展中止阈值与并发控制                                                                 |
-| `LANGUAGETOOL_BASE_URL` / `LANGUAGETOOL_TIMEOUT_SECONDS` / `LANGUAGETOOL_MAX_TEXT_LENGTH` | 拼写/语法 QA 使用的自托管 LanguageTool HTTP Server 配置；未配置时自动跳过 QA，不影响译文保存。 |
+| `ARQ_MAINTENANCE_MAX_JOBS` / `ARQ_PRETRANSLATION_MAX_JOBS` / `PRETRANSLATION_RUN_FILE_CONCURRENCY` | 后台维护队列、预翻译 run 队列和单个预翻译批次内文件并发控制 |
+| `LANGUAGETOOL_BASE_URL` / `LANGUAGETOOL_TIMEOUT_SECONDS` / `LANGUAGETOOL_MAX_TEXT_LENGTH` / `SPELLING_GRAMMAR_QA_AUTO_SCHEDULE` | 拼写/语法 QA 使用的自托管 LanguageTool HTTP Server 配置；默认手动生成，不影响译文保存。 |
 
 
 `.env` 已在 `.gitignore` 中，密钥不要提交到仓库。
@@ -205,7 +206,7 @@ services:
       - "8010"
 ```
 
-项目设置中启用“质量保证 -> 拼写/语法检查”后，译文保存会后台触发检查。LanguageTool 未配置、不可用或目标语言暂不支持时，系统只跳过 QA，不会阻塞保存、确认、预翻译等核心流程。
+项目设置中启用“质量保证 -> 拼写/语法检查”后，默认仅在用户点击“生成 QA 结果/重新生成”时执行检查；如需恢复保存/确认句段后的自动后台检查，可显式设置 `SPELLING_GRAMMAR_QA_AUTO_SCHEDULE=true`。LanguageTool 未配置、不可用或目标语言暂不支持时，系统只跳过 QA，不会阻塞保存、确认、预翻译等核心流程。
 
 ### 4. 启动后端
 
@@ -264,7 +265,7 @@ npm run build
 - `/assets/*`：静态资源
 - `/` 与 `/*`：回退到 `frontend/dist/index.html`，支持 Vue Router history 模式
 
-生产访问后端端口即可，例如 `http://127.0.0.1:19013/`。
+Docker 生产默认由 nginx 对外发布 HTTP 80，例如 `http://127.0.0.1/`；容器内 app 仍监听 `19013`。
 
 ## 常用开发命令
 

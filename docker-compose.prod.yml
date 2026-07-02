@@ -25,8 +25,9 @@ services:
       GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-600}
       LIBREOFFICE_SOFFICE_PATH: /usr/bin/libreoffice
       LIBREOFFICE_PYTHON_PATH: /usr/bin/python3
-    ports:
-      - "${APP_PUBLISH_PORT:-19013}:19013"
+    # 仅在 Docker 内网暴露；公网入口由 docker-compose.nginx.yml 发布到 80。
+    expose:
+      - "19013"
     volumes:
       - app_file_storage:/app/data/file_records
       - app_export_tasks:/app/data/export_tasks

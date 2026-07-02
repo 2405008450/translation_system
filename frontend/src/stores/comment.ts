@@ -27,6 +27,7 @@ export interface CommentWindowQuery {
   statusFilters?: string[]
   matchFilters?: string[]
   sourceFilters?: string[]
+  sourceContentFilters?: string[]
   workflowStepIds?: string[]
 }
 
@@ -66,6 +67,7 @@ function buildCommentWindowParams(query?: CommentWindowQuery | null) {
     status_filters: serializeArray(query.statusFilters),
     match_filters: serializeArray(query.matchFilters),
     source_filters: serializeArray(query.sourceFilters),
+    source_content_filters: serializeArray(query.sourceContentFilters),
     workflow_step_ids: serializeArray(query.workflowStepIds),
   }
 }

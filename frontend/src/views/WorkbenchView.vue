@@ -116,6 +116,7 @@ import type {
   Segment,
   SegmentNextUnconfirmedPositionResponse,
   SegmentPositionResponse,
+  SegmentStatusStats,
   TMMatchCandidate,
   TMCollection,
   TermBase,
@@ -231,6 +232,7 @@ type ResourceSearchResponse = {
 }
 
 const REVISION_TRACE_VISIBLE_STORAGE_KEY = 'workbench.revisionTraceEnabled'
+const WORKBENCH_RIBBON_COLLAPSED_STORAGE_KEY = 'workbench.ribbonCollapsed'
 const QA_RESULT_PAGE_SIZE = 50
 const BOTTOM_DRAWER_MIN_HEIGHT = 260
 const BOTTOM_DRAWER_TOP_GUTTER = 70
@@ -242,6 +244,13 @@ function getInitialRevisionTraceVisible() {
     return false
   }
   return window.localStorage.getItem(REVISION_TRACE_VISIBLE_STORAGE_KEY) === '1'
+}
+
+function getInitialWorkbenchRibbonCollapsed() {
+  if (typeof window === 'undefined') {
+    return false
+  }
+  return window.localStorage.getItem(WORKBENCH_RIBBON_COLLAPSED_STORAGE_KEY) === '1'
 }
 
 const router = useRouter()
@@ -417,6 +426,7 @@ const importDialogInitialTab = ref<ResourceImportTab>('tm')
 const showWorkbenchSettings = ref(false)
 const activeWorkbenchSettingsTab = ref<WorkbenchSettingsTab>('preferences')
 const showSaveToTMDialog = ref(false)
+const workbenchRibbonCollapsed = ref(getInitialWorkbenchRibbonCollapsed())
 const openConfirmMenu = ref(false)
 const confirmationActionLoading = ref(false)
 const confirmJumpActionLoading = ref(false)
@@ -447,7 +457,7 @@ const segmentScreeningDisplayRange = ref('my_tasks')
 const segmentScreeningNumberInput = ref('1')
 const segmentScreeningStatusFilters = ref<string[]>([])
 const segmentScreeningMatchFilters = ref<string[]>([])
-const segmentScreeningSourceFilters = ref<string[]>([])
+const segmentScreeningSourceContentFilters = ref<string[]>([])
 const segmentScreeningFlagFilters = ref<string[]>([])
 const segmentScreeningWorkflowStepIds = ref<string[]>([])
 const searchLoadingAllSegments = ref(false)
@@ -711,7 +721,7 @@ function getCommentWindowQuery(): CommentWindowQuery | null {
     caseSensitive: searchCaseSensitive.value,
     statusFilters: [...segmentScreeningStatusFilters.value, ...segmentScreeningFlagFilters.value],
     matchFilters: [...segmentScreeningMatchFilters.value],
-    sourceFilters: [...segmentScreeningSourceFilters.value],
+    sourceContentFilters: [...segmentScreeningSourceContentFilters.value],
     workflowStepIds: [...segmentScreeningWorkflowStepIds.value],
   }
 }
@@ -729,7 +739,7 @@ function getSegmentWindowQuery(page = segmentStore.currentPage, pageSize = segme
     caseSensitive: searchCaseSensitive.value,
     statusFilters: [...segmentScreeningStatusFilters.value, ...segmentScreeningFlagFilters.value],
     matchFilters: [...segmentScreeningMatchFilters.value],
-    sourceFilters: [...segmentScreeningSourceFilters.value],
+    sourceContentFilters: [...segmentScreeningSourceContentFilters.value],
     workflowStepIds: [...segmentScreeningWorkflowStepIds.value],
     includeStats,
   }
@@ -1038,8 +1048,41 @@ const projectReturnParent = computed(() => (
   route.query.parent === 'tasks' ? 'tasks' : ''
 ))
 
+function createWorkbenchStatusStats(): SegmentStatusStats {
+  return {
+    total: 0,
+    exact: 0,
+    fuzzy: 0,
+    none: 0,
+    confirmed: 0,
+    empty_target: 0,
+  }
+}
+
+const loadedSegmentStatusStats = computed<SegmentStatusStats>(() => {
+  const stats = createWorkbenchStatusStats()
+  stats.total = segmentStore.segments.length
+  for (const segment of segmentStore.segments) {
+    const status = resolveWorkbenchEffectiveStatus(segment)
+    stats[status] += 1
+    if (
+      isEmptyTargetForWorkbench(segment.target_text)
+      || retainedEmptyTargetSentenceIds.value.has(segment.sentence_id)
+    ) {
+      stats.empty_target += 1
+    }
+  }
+  return stats
+})
+
+const statusSummaryCounters = computed(() => (
+  segmentStore.loadedSegmentCount >= segmentStore.matchedSegmentCount
+    ? loadedSegmentStatusStats.value
+    : segmentStore.segmentStatusStats
+))
+
 const statusSummary = computed(() => {
-  const counters = segmentStore.segmentStatusStats
+  const counters = statusSummaryCounters.value
 
   return [
     {
@@ -1469,6 +1512,10 @@ const ribbonStatusTitle = computed(() => (
   `${lastModifiedStatusText.value} · ${segmentStore.syncMessage} · ${segmentStore.llmMessage}`
 ))
 
+const workbenchRibbonCollapseTitle = computed(() => (
+  workbenchRibbonCollapsed.value ? '展开工具栏' : '收起工具栏'
+))
+
 const activeSegment = computed(() => (
   segmentStore.segments.find((segment) => segmentStore.segmentKeyOf(segment) === segmentStore.activeSentenceId) ?? null
 ))
@@ -1554,7 +1601,7 @@ const segmentScreeningStatusOptions: SegmentScreeningOption[] = [
 const segmentScreeningMatchOptions: SegmentScreeningOption[] = [
   { value: 'context_102', label: '102%匹配', disabled: true, hint: '暂无上下文匹配字段，先占位。' },
   { value: 'context_101', label: '101%匹配', disabled: true, hint: '暂无上下文匹配字段，先占位。' },
-  { value: 'exact', label: '100%匹配' },
+  { value: 'exact', label: '精确匹配' },
   { value: 'fuzzy', label: '模糊匹配' },
   { value: 'none', label: '无匹配' },
   { value: 'machine_translation', label: '机器翻译' },
@@ -1563,11 +1610,11 @@ const segmentScreeningMatchOptions: SegmentScreeningOption[] = [
   { value: 'tm_replace', label: '自动替换（记忆库）', disabled: true, hint: '暂无自动替换来源字段，先占位。' },
 ]
 const segmentScreeningSourceContentOptions: SegmentScreeningOption[] = [
-  { value: 'repeat_first', label: '重复首句', disabled: true },
-  { value: 'internal_repeat', label: '内部重复', disabled: true },
-  { value: 'cross_file_repeat', label: '跨文件重复', disabled: true },
-  { value: 'not_repeat', label: '不重复', disabled: true },
-  { value: 'term_not_sync', label: '标记为不同步', disabled: true },
+  { value: 'repeat_first', label: '重复首句' },
+  { value: 'internal_repeat', label: '内部重复' },
+  { value: 'cross_file_repeat', label: '跨文件重复' },
+  { value: 'not_repeat', label: '不重复' },
+  { value: 'project_sync_disabled', label: '标记为不同步' },
 ]
 const segmentScreeningModifyOptions: SegmentScreeningOption[] = [
   { value: 'modified', label: '已修改', disabled: true },
@@ -1587,21 +1634,21 @@ const segmentScreeningWorkflowOptions = computed(() => (
 const segmentScreeningQueryKey = computed(() => JSON.stringify({
   status: segmentScreeningStatusFilters.value,
   match: segmentScreeningMatchFilters.value,
-  source: segmentScreeningSourceFilters.value,
+  sourceContent: segmentScreeningSourceContentFilters.value,
   flag: segmentScreeningFlagFilters.value,
   workflow: segmentScreeningWorkflowStepIds.value,
 }))
 const hasSegmentScreeningFilters = computed(() => (
   segmentScreeningStatusFilters.value.length > 0
   || segmentScreeningMatchFilters.value.length > 0
-  || segmentScreeningSourceFilters.value.length > 0
+  || segmentScreeningSourceContentFilters.value.length > 0
   || segmentScreeningFlagFilters.value.length > 0
   || segmentScreeningWorkflowStepIds.value.length > 0
 ))
 const segmentScreeningActiveCount = computed(() => (
   segmentScreeningStatusFilters.value.length
   + segmentScreeningMatchFilters.value.length
-  + segmentScreeningSourceFilters.value.length
+  + segmentScreeningSourceContentFilters.value.length
   + segmentScreeningFlagFilters.value.length
   + segmentScreeningWorkflowStepIds.value.length
 ))
@@ -1902,18 +1949,56 @@ const segmentDisplayScopeOptions = computed<Array<{ value: SegmentDisplayScope; 
   { value: 'empty_target', label: '空译文' },
 ])
 
+function normalizeWorkbenchMatchText(value: string | null | undefined) {
+  return (value || '').trim().replace(/\s+/g, ' ').replace(/[\u3002\uff01\uff1f!?.]+$/u, '')
+}
+
+function compactWorkbenchMatchCore(value: string | null | undefined) {
+  return normalizeWorkbenchMatchText(value).replace(/[^\w\u4e00-\u9fff]+/gu, '')
+}
+
+function isShortWorkbenchStructuralFragment(value: string | null | undefined) {
+  const core = compactWorkbenchMatchCore(value)
+  return Boolean(core && core.length <= 4 && /^(?:\d+[A-Za-z]?|[A-Za-z]|[ivxlcdmIVXLCDM]{1,4})$/.test(core))
+}
+
+function resolveWorkbenchEffectiveStatus(segment: Segment) {
+  if (segment.status === 'confirmed') {
+    return 'confirmed'
+  }
+  const sourceText = normalizeWorkbenchMatchText(segment.source_text)
+  const displayText = normalizeWorkbenchMatchText(segment.display_text)
+  const matchedSourceText = normalizeWorkbenchMatchText(segment.matched_source_text)
+  if (sourceText && matchedSourceText && matchedSourceText === sourceText) {
+    return 'exact'
+  }
+  if (
+    displayText
+    && matchedSourceText
+    && matchedSourceText === displayText
+    && !isShortWorkbenchStructuralFragment(segment.source_text)
+  ) {
+    return 'exact'
+  }
+  if (Number(segment.score || 0) > 0 || matchedSourceText || segment.status === 'fuzzy') {
+    return 'fuzzy'
+  }
+  return 'none'
+}
+
 function matchesSegmentDisplayScope(segment: Segment) {
+  const effectiveStatus = resolveWorkbenchEffectiveStatus(segment)
   if (segmentDisplayScope.value === 'exact_only') {
-    return segment.status === 'exact'
+    return effectiveStatus === 'exact'
   }
   if (segmentDisplayScope.value === 'fuzzy_only') {
-    return segment.status === 'fuzzy'
+    return effectiveStatus === 'fuzzy'
   }
   if (segmentDisplayScope.value === 'none_only') {
-    return segment.status === 'none'
+    return effectiveStatus === 'none'
   }
   if (segmentDisplayScope.value === 'confirmed_only') {
-    return segment.status === 'confirmed'
+    return effectiveStatus === 'confirmed'
   }
   if (segmentDisplayScope.value === 'empty_target') {
     return isEmptyTargetForWorkbench(segment.target_text)
@@ -2924,7 +3009,7 @@ function resetSegmentScreeningFilters() {
   segmentScreeningDisplayRange.value = 'my_tasks'
   segmentScreeningStatusFilters.value = []
   segmentScreeningMatchFilters.value = []
-  segmentScreeningSourceFilters.value = []
+  segmentScreeningSourceContentFilters.value = []
   segmentScreeningFlagFilters.value = []
   segmentScreeningWorkflowStepIds.value = []
 }
@@ -2937,7 +3022,7 @@ function getSegmentScreeningGroupValues(group: SegmentScreeningGroup) {
     return segmentScreeningMatchFilters.value
   }
   if (group === 'source') {
-    return segmentScreeningSourceFilters.value
+    return segmentScreeningSourceContentFilters.value
   }
   if (group === 'flag') {
     return segmentScreeningFlagFilters.value
@@ -2952,7 +3037,7 @@ function setSegmentScreeningGroupValues(group: SegmentScreeningGroup, values: st
   } else if (group === 'match') {
     segmentScreeningMatchFilters.value = nextValues
   } else if (group === 'source') {
-    segmentScreeningSourceFilters.value = nextValues
+    segmentScreeningSourceContentFilters.value = nextValues
   } else if (group === 'flag') {
     segmentScreeningFlagFilters.value = nextValues
   } else {
@@ -3407,7 +3492,7 @@ async function replaceAllSearchMatches() {
         replace_all: true,
         status_filters: [...segmentScreeningStatusFilters.value, ...segmentScreeningFlagFilters.value],
         match_filters: [...segmentScreeningMatchFilters.value],
-        source_filters: [...segmentScreeningSourceFilters.value],
+        source_content_filters: [...segmentScreeningSourceContentFilters.value],
         workflow_step_ids: [...segmentScreeningWorkflowStepIds.value],
       },
     )
@@ -3493,7 +3578,7 @@ function buildNextUnconfirmedPositionParams(currentSegment: Segment, pageSize: n
     case_sensitive: query.caseSensitive,
     status_filters: query.statusFilters,
     match_filters: query.matchFilters,
-    source_filters: query.sourceFilters,
+    source_content_filters: query.sourceContentFilters,
     workflow_step_ids: query.workflowStepIds,
   }
 }
@@ -5296,6 +5381,26 @@ function closeAllMenus() {
   showSpecialCharMenu.value = false
 }
 
+function closeRibbonMenus() {
+  closeAllMenus()
+  showExportMenu.value = false
+  openConfirmMenu.value = false
+  openRevisionMenu.value = null
+}
+
+function toggleWorkbenchRibbonCollapsed() {
+  workbenchRibbonCollapsed.value = !workbenchRibbonCollapsed.value
+  if (workbenchRibbonCollapsed.value) {
+    closeRibbonMenus()
+  }
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem(
+      WORKBENCH_RIBBON_COLLAPSED_STORAGE_KEY,
+      workbenchRibbonCollapsed.value ? '1' : '0',
+    )
+  }
+}
+
 /**
  * 插入特殊字符到当前活动编辑器
  */
@@ -6487,6 +6592,14 @@ function handleAppendText(text: string) {
 }
 
 // 加载参考文件匹配结果（工作台初始化时调用）
+async function handleMatchPanelResourceEntryChanged(kind: 'tm' | 'term') {
+  if (kind !== 'term') return
+  await Promise.all([
+    loadTermEntries(),
+    segmentStore.refreshActiveTermMatches(),
+  ])
+}
+
 async function loadReferenceMatchResult() {
   const fileRecordId = activeWorkbenchFileId.value
   if (!fileRecordId) return
@@ -6715,10 +6828,19 @@ onBeforeRouteLeave(async () => {
 <template>
   <div
     class="content-stack content-stack--workbench workbench-page"
-    :class="{ 'is-standalone': isStandaloneWorkbench, 'is-stable-grid': isStandaloneWorkbench }"
+    :class="{
+      'is-standalone': isStandaloneWorkbench,
+      'is-stable-grid': isStandaloneWorkbench,
+      'is-ribbon-collapsed': isStandaloneWorkbench && workbenchRibbonCollapsed,
+    }"
     data-testid="workbench-page"
   >
-    <section v-if="isStandaloneWorkbench" class="toolbar-panel workbench-toolbar workbench-ribbon" data-testid="workbench-ribbon">
+    <section
+      v-if="isStandaloneWorkbench"
+      class="toolbar-panel workbench-toolbar workbench-ribbon"
+      :class="{ 'is-collapsed': workbenchRibbonCollapsed }"
+      data-testid="workbench-ribbon"
+    >
       <div class="workbench-ribbon__tabs">
         <button class="workbench-ribbon__tab is-active" type="button">
           {{ t('workbench.ribbon.startTab') }}
@@ -6785,6 +6907,19 @@ onBeforeRouteLeave(async () => {
           </div>
         </div>
         <button
+          class="workbench-ribbon__collapse"
+          data-testid="workbench-ribbon-collapse"
+          type="button"
+          :class="{ 'is-active': workbenchRibbonCollapsed }"
+          :title="workbenchRibbonCollapseTitle"
+          :aria-label="workbenchRibbonCollapseTitle"
+          :aria-expanded="!workbenchRibbonCollapsed"
+          @click="toggleWorkbenchRibbonCollapsed"
+        >
+          <ChevronDown v-if="workbenchRibbonCollapsed" :size="16" />
+          <ChevronUp v-else :size="16" />
+        </button>
+        <button
           class="workbench-ribbon__help"
           type="button"
           :title="t('workbench.settings.title')"
@@ -6804,7 +6939,7 @@ onBeforeRouteLeave(async () => {
         </button>
       </div>
 
-      <div class="workbench-ribbon__ai-strip" aria-label="AI">
+      <div v-if="!authStore.isExternalTranslator && !workbenchRibbonCollapsed" class="workbench-ribbon__ai-strip" aria-label="AI">
         <label class="ai-strip__field">
           <span>{{ t('workbench.aiScopeShort') }}</span>
           <select v-model="llmScope" class="field__control" :title="activeMergeFileContextTitle || t('workbench.aiScope')">
@@ -6874,7 +7009,7 @@ onBeforeRouteLeave(async () => {
         </button>
       </div>
 
-      <div class="workbench-ribbon__container container">
+      <div v-if="!workbenchRibbonCollapsed" class="workbench-ribbon__container container">
         <div class="tool-group tool-group--confirm workbench-confirm-menu">
           <button
             class="tool-col tool-col--big tool-button"
@@ -7459,7 +7594,7 @@ onBeforeRouteLeave(async () => {
         </div>
       </div>
 
-      <div class="workbench-ribbon__status" role="status" :title="ribbonStatusTitle">
+      <div v-if="!workbenchRibbonCollapsed" class="workbench-ribbon__status" role="status" :title="ribbonStatusTitle">
         <span class="workbench-ribbon__modified-time">{{ lastModifiedStatusText }}</span>
         <span aria-hidden="true">·</span>
         <span>{{ segmentStore.syncMessage }}</span>
@@ -8011,9 +8146,16 @@ onBeforeRouteLeave(async () => {
                 <label
                   v-for="option in segmentScreeningSourceContentOptions"
                   :key="option.value"
-                  class="segment-screening-panel__check is-disabled"
+                  class="segment-screening-panel__check"
+                  :class="{ 'is-disabled': option.disabled }"
+                  :title="option.hint || ''"
                 >
-                  <input type="checkbox" disabled />
+                  <input
+                    type="checkbox"
+                    :disabled="option.disabled"
+                    :checked="isSegmentScreeningChecked('source', option.value)"
+                    @change="toggleSegmentScreeningFilter('source', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
                   <span>{{ option.label }}</span>
                 </label>
               </div>
@@ -9241,9 +9383,16 @@ onBeforeRouteLeave(async () => {
                 <label
                   v-for="option in segmentScreeningSourceContentOptions"
                   :key="option.value"
-                  class="segment-screening-panel__check is-disabled"
+                  class="segment-screening-panel__check"
+                  :class="{ 'is-disabled': option.disabled }"
+                  :title="option.hint || ''"
                 >
-                  <input type="checkbox" disabled />
+                  <input
+                    type="checkbox"
+                    :disabled="option.disabled"
+                    :checked="isSegmentScreeningChecked('source', option.value)"
+                    @change="toggleSegmentScreeningFilter('source', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
                   <span>{{ option.label }}</span>
                 </label>
               </div>
@@ -9289,6 +9438,7 @@ onBeforeRouteLeave(async () => {
             :reference-match-result="referenceMatchResult"
             @replace-text="handleReplaceText"
             @append-text="handleAppendText"
+            @resource-entry-changed="handleMatchPanelResourceEntryChanged"
           />
           <section
             v-else-if="activeSideTool === 'terms' && showAddTermPanel"
@@ -9994,6 +10144,10 @@ onBeforeRouteLeave(async () => {
   box-shadow: none;
 }
 
+.workbench-page.is-standalone.is-ribbon-collapsed {
+  --workbench-side-panel-top: 54px;
+}
+
 .workbench-page.is-standalone {
   grid-template-rows: auto minmax(0, 1fr);
 }
@@ -10126,6 +10280,10 @@ onBeforeRouteLeave(async () => {
   background: linear-gradient(180deg, #eef2f5, #e7edf1);
 }
 
+.workbench-ribbon.is-collapsed .workbench-ribbon__tabs {
+  border-bottom: 0;
+}
+
 .workbench-ribbon__tab {
   align-self: stretch;
   min-width: 90px;
@@ -10212,12 +10370,13 @@ onBeforeRouteLeave(async () => {
   opacity: 0.48;
 }
 
-.workbench-ribbon__help {
+.workbench-ribbon__help,
+.workbench-ribbon__collapse {
   display: inline-grid;
   place-items: center;
   width: 30px;
   height: 30px;
-  margin-right: 8px;
+  margin-right: 4px;
   border: 1px solid transparent;
   border-radius: 6px;
   background: transparent;
@@ -10225,10 +10384,23 @@ onBeforeRouteLeave(async () => {
   box-shadow: none;
 }
 
-.workbench-ribbon__help:hover {
+.workbench-ribbon__help {
+  margin-right: 8px;
+}
+
+.workbench-ribbon__help:hover,
+.workbench-ribbon__collapse:hover,
+.workbench-ribbon__collapse:focus-visible {
   border-color: var(--line-soft);
   background: #fff;
   color: var(--brand-700);
+  outline: none;
+}
+
+.workbench-ribbon__collapse.is-active {
+  border-color: #b9d3df;
+  background: #fff;
+  color: #0f6f83;
 }
 
 .workbench-ribbon__container {
