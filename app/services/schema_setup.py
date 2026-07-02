@@ -1,9 +1,17 @@
 ﻿from __future__ import annotations
 
+import logging
+import time
+
 from sqlalchemy import inspect, text
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from app.database import engine
+
+logger = logging.getLogger(__name__)
+
+RUNTIME_SCHEMA_MAX_ATTEMPTS = 5
+TRANSIENT_SCHEMA_SQLSTATES = {"40P01", "55P03", "57014"}
 
 
 UUID_SQL_DEFAULT = """
@@ -613,6 +621,25 @@ REQUIRED_INDEXES = {
 
 
 def ensure_runtime_schema() -> None:
+    for attempt in range(1, RUNTIME_SCHEMA_MAX_ATTEMPTS + 1):
+        try:
+            _ensure_runtime_schema_once()
+            return
+        except OperationalError as exc:
+            if attempt >= RUNTIME_SCHEMA_MAX_ATTEMPTS or not _is_transient_schema_lock_error(exc):
+                raise
+            delay_seconds = min(2 ** (attempt - 1), 8)
+            logger.warning(
+                "runtime schema setup hit a transient database lock/deadlock; retrying in %ss "
+                "(attempt %s/%s)",
+                delay_seconds,
+                attempt + 1,
+                RUNTIME_SCHEMA_MAX_ATTEMPTS,
+            )
+            time.sleep(delay_seconds)
+
+
+def _ensure_runtime_schema_once() -> None:
     with engine.connect() as connection:
         inspector = inspect(connection)
         missing_existing_tables = [
@@ -658,6 +685,14 @@ def ensure_runtime_schema() -> None:
             "或 scripts/rename_translation_memory_tables.sql 后再启动服务。"
             f" 当前缺失项: {missing_text}"
         ) from exc
+
+
+def _is_transient_schema_lock_error(exc: OperationalError) -> bool:
+    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    if sqlstate in TRANSIENT_SCHEMA_SQLSTATES:
+        return True
+    message = str(exc).lower()
+    return "deadlock detected" in message or "lock timeout" in message
 
 
 def _collect_missing_schema(inspector) -> list[str]:

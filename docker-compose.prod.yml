@@ -78,6 +78,8 @@ services:
       - app_import_tasks:/app/data/import_tasks
       - app_logs:/app/logs
     depends_on:
+      app:
+        condition: service_healthy
       pgbouncer:
         condition: service_started
       redis:
@@ -114,6 +116,8 @@ services:
       - app_import_tasks:/app/data/import_tasks
       - app_logs:/app/logs
     depends_on:
+      app:
+        condition: service_healthy
       pgbouncer:
         condition: service_started
       redis:
@@ -150,6 +154,8 @@ services:
       - app_import_tasks:/app/data/import_tasks
       - app_logs:/app/logs
     depends_on:
+      app:
+        condition: service_healthy
       pgbouncer:
         condition: service_started
       redis:
