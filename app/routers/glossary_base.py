@@ -528,6 +528,23 @@ def _run_glossary_resource_import_task(task_id: str, payload: dict[str, Any]) ->
         cleanup_import_task_staging(staging_task_id)
 
 
+async def _queue_glossary_resource_import_task(
+    background_tasks: BackgroundTasks,
+    task_id: str,
+    payload: dict[str, Any],
+) -> None:
+    from app.routers.api import ARQ_IMPORT_QUEUE_NAME, _enqueue_arq_job
+
+    if await _enqueue_arq_job(
+        "glossary_resource_import_job",
+        task_id,
+        payload,
+        queue_name=ARQ_IMPORT_QUEUE_NAME,
+    ):
+        return
+    background_tasks.add_task(_run_glossary_resource_import_task, task_id, payload)
+
+
 @router.post("/glossary-bases/import-xlsx")
 async def import_glossary_base_xlsx(
     background_tasks: BackgroundTasks,
@@ -565,7 +582,7 @@ async def import_glossary_base_xlsx(
             "creator_id": str(current_user.id),
         }
         set_import_task_status(task_id, "queued", progress=0, message="词汇表导入任务已进入队列。")
-        background_tasks.add_task(_run_glossary_resource_import_task, task_id, payload)
+        await _queue_glossary_resource_import_task(background_tasks, task_id, payload)
         return JSONResponse(
             status_code=202,
             content={

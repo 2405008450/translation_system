@@ -666,7 +666,12 @@ async def _queue_import_task(
 
 
 async def _queue_tm_resource_import_task(task_id: str, payload: dict[str, Any]) -> None:
-    if await _enqueue_arq_job("tm_resource_import_job", task_id, payload):
+    if await _enqueue_arq_job(
+        "tm_resource_import_job",
+        task_id,
+        payload,
+        queue_name=ARQ_IMPORT_QUEUE_NAME,
+    ):
         return
     future = _RESOURCE_IMPORT_EXECUTOR.submit(_run_tm_resource_import_task, task_id, payload)
     future.add_done_callback(_log_local_tm_resource_import_failure(task_id))
@@ -1233,6 +1238,12 @@ async def term_resource_import_job(ctx, task_id: str, payload: dict[str, Any]) -
     await asyncio.to_thread(_run_term_resource_import_task, task_id, payload)
 
 
+async def glossary_resource_import_job(ctx, task_id: str, payload: dict[str, Any]) -> None:
+    from app.routers.glossary_base import _run_glossary_resource_import_task
+
+    await asyncio.to_thread(_run_glossary_resource_import_task, task_id, payload)
+
+
 async def spelling_grammar_qa_segments_job(
     ctx, file_record_id: str, segment_ids: list[str]
 ) -> None:
@@ -1304,6 +1315,7 @@ class MaintenanceWorkerSettings:
         process_import_task_job,
         tm_resource_import_job,
         term_resource_import_job,
+        glossary_resource_import_job,
         spelling_grammar_qa_segments_job,
         spelling_grammar_qa_project_job,
         auto_tm_background_job,
@@ -1321,6 +1333,9 @@ class ImportWorkerSettings:
     )
     functions = [
         process_import_task_job,
+        tm_resource_import_job,
+        term_resource_import_job,
+        glossary_resource_import_job,
     ]
     redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
 

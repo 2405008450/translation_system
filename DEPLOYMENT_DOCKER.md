@@ -61,8 +61,8 @@ nginx 的 `client_max_body_size` 在 `docker/nginx/default.conf`，默认 **500m
 
 | 变量 | 推荐起点 | 说明 |
 |------|----------|------|
-| `ARQ_IMPORT_MAX_JOBS` | 2 | 上传导入队列并发，独立于 QA、自动 TM 等低优先级维护任务 |
-| `ARQ_MAINTENANCE_MAX_JOBS` | 4 | 资源导入、QA、自动 TM 重匹配、项目重复句段同步等维护队列并发 |
+| `ARQ_IMPORT_MAX_JOBS` | 2 | 上传文件、记忆库、术语库、词汇表等导入队列并发，独立于 QA、自动 TM 等维护任务 |
+| `ARQ_MAINTENANCE_MAX_JOBS` | 4 | QA、自动 TM 重匹配、项目重复句段同步等维护队列并发 |
 | `ARQ_PRETRANSLATION_MAX_JOBS` | 2 | 项目预翻译 run 队列并发 |
 | `PRETRANSLATION_RUN_FILE_CONCURRENCY` | 2 | 单个预翻译 run 内同时处理的文件数 |
 | `LLM_MAX_CONCURRENCY` | 3 | 单个文件 LLM 阶段的模型请求并发 |
@@ -70,7 +70,7 @@ nginx 的 `client_max_body_size` 在 `docker/nginx/default.conf`，默认 **500m
 
 LLM 预翻译的理论请求上限约为 `ARQ_PRETRANSLATION_MAX_JOBS × PRETRANSLATION_RUN_FILE_CONCURRENCY × LLM_MAX_CONCURRENCY`。若模型服务出现 429、超时或错误率升高，优先下调 `LLM_MAX_CONCURRENCY` 或 `PRETRANSLATION_RUN_FILE_CONCURRENCY`。
 
-拼写/语法 QA 默认手动生成：`SPELLING_GRAMMAR_QA_AUTO_SCHEDULE=false`。不要轻易开启自动调度，否则保存/确认句段会持续产生 QA 任务并挤占上传导入队列。
+拼写/语法 QA 默认手动生成：`SPELLING_GRAMMAR_QA_AUTO_SCHEDULE=false`。不要轻易开启自动调度，否则保存/确认句段会持续产生 QA 任务并增加维护队列与数据库压力。
 
 密码含 `@`、`:`、`/`、`?`、`#` 等字符时，`DATABASE_URL` 须 URL 编码。
 
@@ -157,7 +157,7 @@ http://43.132.156.72/login
 |--------|------|------|
 | `app_file_storage` | `/app/data/file_records` | 源文件持久化 |
 | `app_export_tasks` | `/app/data/export_tasks` | 导出临时文件 |
-| `app_import_tasks` | `/app/data/import_tasks` | 上传导入暂存（app/import-worker/worker/pretranslation-worker **必须共享**） |
+| `app_import_tasks` | `/app/data/import_tasks` | 上传与资源导入暂存（app/import-worker/worker/pretranslation-worker **必须共享**） |
 | `app_logs` | `/app/logs` | 应用日志 |
 | `postgres_data` | — | PostgreSQL 数据 |
 | `redis_data` | — | Redis AOF |

@@ -267,9 +267,14 @@ def _stage_resource_upload_file(file: UploadFile) -> tuple[str, dict[str, Any]]:
 
 
 async def _queue_term_resource_import_task(task_id: str, payload: dict[str, Any]) -> None:
-    from app.routers.api import _enqueue_arq_job
+    from app.routers.api import ARQ_IMPORT_QUEUE_NAME, _enqueue_arq_job
 
-    if await _enqueue_arq_job("term_resource_import_job", task_id, payload):
+    if await _enqueue_arq_job(
+        "term_resource_import_job",
+        task_id,
+        payload,
+        queue_name=ARQ_IMPORT_QUEUE_NAME,
+    ):
         return
     future = _TERM_RESOURCE_IMPORT_EXECUTOR.submit(_run_term_resource_import_task, task_id, payload)
     future.add_done_callback(_log_local_term_resource_import_failure(task_id))

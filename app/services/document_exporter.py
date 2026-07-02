@@ -56,6 +56,7 @@ BILINGUAL_LAYOUT_SOURCE_FIRST = "source_first"
 BILINGUAL_LAYOUT_TARGET_FIRST = "target_first"
 BlockKey = tuple[str, int, int | None, int | None]
 MATH_PLACEHOLDER_RE = re.compile(r"⟦MATH_\d+⟧|\[\[MATH_\d+\]\]")
+MATH_PLACEHOLDER_TOKEN_RE = re.compile(r"^(?:⟦|\[\[)(MATH_\d+)(?:⟧|\]\])$")
 ENGLISH_BOUNDARY_TRAILING_RE = re.compile(r"[,;:.!?][\"')\]\}]*$")
 ENGLISH_WORD_LEADING_RE = re.compile(r"^[\"'“‘(\[]*[A-Za-z0-9]")
 # 支持的格式标签
@@ -1846,13 +1847,15 @@ def _queue_math_sentence_replacement(
 ) -> None:
     text_parts = _split_replacement_around_math_placeholders(replacement, expected_math_placeholders)
     if text_parts is None:
+        if (
+            not MATH_PLACEHOLDER_RE.search(replacement)
+            and _span_contains_only_math_placeholders(tokens, span, expected_math_placeholders)
+        ):
+            _replace_math_only_span_with_plain_text(tokens, span, replacement)
+            return
         raise ValueError("导出失败：译文中的数学公式占位符顺序或数量与原文不一致。")
 
-    sentence_tokens = [
-        token
-        for token in tokens
-        if token.start < span.end and token.end > span.start
-    ]
+    sentence_tokens = _collect_tokens_overlapping_span(tokens, span)
     math_tokens = [token for token in sentence_tokens if token.is_math]
     if len(math_tokens) != len(expected_math_placeholders):
         raise ValueError("导出失败：段落中的数学公式结构与句段映射不一致。")
@@ -1877,7 +1880,7 @@ def _split_replacement_around_math_placeholders(
     expected_math_placeholders: list[str],
 ) -> list[str] | None:
     matches = list(MATH_PLACEHOLDER_RE.finditer(replacement))
-    actual_placeholders = [match.group(0) for match in matches]
+    actual_placeholders = [_canonical_math_placeholder(match.group(0)) for match in matches]
     if actual_placeholders != expected_math_placeholders:
         return None
 
@@ -1888,6 +1891,85 @@ def _split_replacement_around_math_placeholders(
         cursor = match.end()
     text_parts.append(replacement[cursor:])
     return text_parts
+
+
+def _canonical_math_placeholder(placeholder: str) -> str:
+    match = MATH_PLACEHOLDER_TOKEN_RE.match(placeholder)
+    if not match:
+        return placeholder
+    return f"⟦{match.group(1)}⟧"
+
+
+def _collect_tokens_overlapping_span(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+) -> list[TextToken]:
+    return [
+        token
+        for token in tokens
+        if token.start < span.end and token.end > span.start
+    ]
+
+
+def _span_contains_only_math_placeholders(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+    expected_math_placeholders: list[str],
+) -> bool:
+    span_tokens = _collect_tokens_overlapping_span(tokens, span)
+    math_placeholders = [token.source_text for token in span_tokens if token.is_math]
+    if math_placeholders != expected_math_placeholders:
+        return False
+
+    for token in span_tokens:
+        if token.is_math:
+            continue
+        overlap_start = max(span.start, token.start)
+        overlap_end = min(span.end, token.end)
+        if overlap_end <= overlap_start:
+            continue
+        local_start = overlap_start - token.start
+        local_end = overlap_end - token.start
+        if normalize_text(token.display_text[local_start:local_end]):
+            return False
+    return bool(math_placeholders)
+
+
+def _replace_math_only_span_with_plain_text(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+    replacement: str,
+) -> None:
+    math_tokens = [
+        token
+        for token in _collect_tokens_overlapping_span(tokens, span)
+        if token.is_math and token.anchor_element is not None and token.container_element is not None
+    ]
+    if not math_tokens:
+        return
+
+    first_token = math_tokens[0]
+    parent = first_token.container_element
+    anchor = first_token.anchor_element
+    if parent is None or anchor is None:
+        return
+
+    try:
+        insert_index = list(parent).index(anchor)
+    except ValueError:
+        return
+    for token in math_tokens:
+        token_parent = token.container_element
+        token_anchor = token.anchor_element
+        if token_parent is None or token_anchor is None:
+            continue
+        try:
+            token_parent.remove(token_anchor)
+        except ValueError:
+            continue
+
+    if replacement:
+        parent.insert(insert_index, _build_inserted_word_run(replacement, None))
 
 
 def _queue_text_region_replacement(
