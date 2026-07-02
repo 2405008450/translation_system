@@ -294,6 +294,8 @@ const DEFAULT_DOCUMENT_PARSE_OPTIONS: DocumentParseOptions = {
   xlsx_skip_fill_colors: [],
 }
 
+const DEFAULT_UPLOAD_MAX_SIZE_MB = 100
+
 const DOCUMENT_STATISTIC_NUMBER_KEYS: DocumentStatisticNumberKey[] = [
   'pages',
   'words',
@@ -1901,7 +1903,7 @@ function getMaxUploadSizeMbForFile(filename: string): number {
       return capability.max_size_mb
     }
   }
-  return 50
+  return DEFAULT_UPLOAD_MAX_SIZE_MB
 }
 
 function validateSelectedUploadFiles(files: File[]): string {

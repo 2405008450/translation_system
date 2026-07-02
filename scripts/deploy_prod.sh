@@ -39,9 +39,9 @@ usage() {
 命令:
   build     构建 app 镜像（含前端）
   up        构建并后台启动（默认启用 nginx，对外发布 80）
-  restart   强制重建 app/worker（代码热更新常用）
+  restart   强制重建 app/import-worker/worker（代码热更新常用）
   ps        查看服务状态
-  logs      跟踪 app/worker 日志
+  logs      跟踪 app/import-worker/worker 日志
   health    本机健康检查（默认检查 nginx:80；USE_NGINX=0 时检查直连端口）
 
 环境变量:
@@ -76,9 +76,9 @@ case "$cmd" in
     compose build app
     compose up --force-recreate db-migrate
     if [[ "$USE_NGINX" == "1" ]]; then
-      compose up -d --force-recreate --no-deps app worker pretranslation-worker nginx
+      compose up -d --force-recreate --no-deps app import-worker worker pretranslation-worker nginx
     else
-      compose up -d --force-recreate --no-deps app worker pretranslation-worker
+      compose up -d --force-recreate --no-deps app import-worker worker pretranslation-worker
     fi
     compose ps
     ;;
@@ -87,9 +87,9 @@ case "$cmd" in
     ;;
   logs)
     if [[ "$USE_NGINX" == "1" ]]; then
-      compose logs -f --tail=200 app worker pretranslation-worker nginx "$@"
+      compose logs -f --tail=200 app import-worker worker pretranslation-worker nginx "$@"
     else
-      compose logs -f --tail=200 app worker pretranslation-worker "$@"
+      compose logs -f --tail=200 app import-worker worker pretranslation-worker "$@"
     fi
     ;;
   health)

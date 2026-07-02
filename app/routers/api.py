@@ -371,6 +371,7 @@ except ModuleNotFoundError:  # pragma: no cover - 本地未安装 ARQ 时使用 
 
 logger = logging.getLogger(__name__)
 _RESOURCE_IMPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="resource-import")
+ARQ_IMPORT_QUEUE_NAME = "arq:import"
 ARQ_MAINTENANCE_QUEUE_NAME = "arq:maintenance"
 ARQ_PRETRANSLATION_QUEUE_NAME = "arq:pretranslation"
 router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -506,7 +507,7 @@ async def _enqueue_arq_import_task(task_id: str, payload: dict[str, Any]) -> boo
             "process_import_task_job",
             task_id,
             payload,
-            _queue_name=ARQ_MAINTENANCE_QUEUE_NAME,
+            _queue_name=ARQ_IMPORT_QUEUE_NAME,
         )
         return True
     except Exception:
@@ -1308,6 +1309,18 @@ class MaintenanceWorkerSettings:
         auto_tm_background_job,
         auto_tm_rematch_background_job,
         project_segment_sync_job,
+    ]
+    redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
+
+
+class ImportWorkerSettings:
+    queue_name = ARQ_IMPORT_QUEUE_NAME
+    max_jobs = _resolve_arq_worker_max_jobs(
+        get_settings().arq_import_max_jobs,
+        get_settings().arq_max_jobs,
+    )
+    functions = [
+        process_import_task_job,
     ]
     redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
 
@@ -8867,6 +8880,7 @@ def _serialize_workbench_segment(
     seg: Segment,
     display_index: int | None = None,
     *,
+    permission_display_index: int | None = None,
     source_filename: str | None = None,
     target_automatic_numbering_by_sentence_id: dict[str, str] | None = None,
     qa_issues_by_segment_id: dict[UUID, list[SegmentQAIssue]] | None = None,
@@ -8896,11 +8910,16 @@ def _serialize_workbench_segment(
     workflow_step = workflow_step_by_id.get(resolved_workflow_step_id) if workflow_step_by_id else None
     can_write = True
     if writable_workflow_assignments is not None:
+        writable_display_index = (
+            permission_display_index
+            if permission_display_index is not None
+            else display_index
+        )
         can_write = bool(
             can_manage
             or _can_write_segment_with_assignments(
                 resolved_workflow_step_id,
-                display_index,
+                writable_display_index,
                 writable_workflow_assignments,
             )
         )
@@ -11649,7 +11668,7 @@ def get_merge_view_segment_position(
         "sentence_id": row.sentence_id,
         "segment_id": str(row.id),
         "index": index,
-        "display_index": int(row.position),
+        "display_index": index + 1,
         "page": (index // safe_page_size) + 1,
         "page_size": safe_page_size,
         "page_index": index % safe_page_size,
@@ -11712,7 +11731,16 @@ def get_merge_view_segments(
     # 为避免逐文件全量序列化，采用"两段式"：先统计每文件匹配数，再按窗口取所需页片段。
     per_file_matched: list[int] = []
     per_file_queries: list = []
+    display_index_offsets: dict[UUID, int] = {}
+    display_index_offset = 0
     for file_record in files:
+        display_index_offsets[file_record.id] = display_index_offset
+        display_index_offset += (
+            db.query(func.count(Segment.id))
+            .filter(Segment.file_record_id == file_record.id)
+            .scalar()
+            or 0
+        )
         _assign_file_segments_to_first_workflow_step(db, file_record)
         base_query = _apply_segment_assignment_visibility_filter(
             db,
@@ -11802,11 +11830,19 @@ def get_merge_view_segments(
         target_numbering = _build_target_automatic_numbering_text_map(file_record)
         qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, segs)
         display_index_map = _get_segment_display_index_map(db, file_record.id, segs)
+        display_index_offset = display_index_offsets.get(file_record.id, 0)
         source_filename = get_file_record_source_filename(file_record)
         for seg in segs:
+            local_display_index = display_index_map.get(seg.id)
+            global_display_index = (
+                display_index_offset + local_display_index
+                if local_display_index is not None
+                else None
+            )
             payload = _serialize_workbench_segment(
                 seg,
-                display_index=display_index_map.get(seg.id),
+                display_index=global_display_index,
+                permission_display_index=local_display_index,
                 source_filename=source_filename,
                 target_automatic_numbering_by_sentence_id=target_numbering,
                 qa_issues_by_segment_id=qa_issues_by_segment_id,

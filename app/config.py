@@ -65,7 +65,8 @@ class Settings(BaseSettings):
     redis_url: str | None = None
     import_queue_backend: str = "local"
     arq_max_jobs: int = 1
-    # 为空或 0 时继承 ARQ_MAX_JOBS；生产环境可单独设置维护队列/预翻译队列并发。
+    # 为空或 0 时继承 ARQ_MAX_JOBS；生产环境可单独设置导入/维护队列/预翻译队列并发。
+    arq_import_max_jobs: int | None = None
     arq_maintenance_max_jobs: int | None = None
     arq_pretranslation_max_jobs: int | None = None
     # 单个项目预翻译批次内，同时处理的文件任务数。仍会叠加 LLM_MAX_CONCURRENCY 的限制。
