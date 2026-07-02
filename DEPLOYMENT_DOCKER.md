@@ -69,6 +69,8 @@ nginx 的 `client_max_body_size` 在 `docker/nginx/default.conf`，默认 **500m
 
 LLM 预翻译的理论请求上限约为 `ARQ_PRETRANSLATION_MAX_JOBS × PRETRANSLATION_RUN_FILE_CONCURRENCY × LLM_MAX_CONCURRENCY`。若模型服务出现 429、超时或错误率升高，优先下调 `LLM_MAX_CONCURRENCY` 或 `PRETRANSLATION_RUN_FILE_CONCURRENCY`。
 
+拼写/语法 QA 默认手动生成：`SPELLING_GRAMMAR_QA_AUTO_SCHEDULE=false`。不要轻易开启自动调度，否则保存/确认句段会持续产生 QA 任务并挤占上传导入队列。
+
 密码含 `@`、`:`、`/`、`?`、`#` 等字符时，`DATABASE_URL` 须 URL 编码。
 
 ### `.env.prod` 和 `.env`

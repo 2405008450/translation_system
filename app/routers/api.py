@@ -8299,18 +8299,15 @@ def get_project_quality_qa_settings(
 def update_project_quality_qa_settings(
     project_id: UUID,
     payload: QualityQASettingsRequest,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
-    normalized = store_quality_qa_settings(project, payload.model_dump())
+    store_quality_qa_settings(project, payload.model_dump())
     db.commit()
     db.refresh(project)
-    if normalized["spelling_grammar"]["enabled"]:
-        background_tasks.add_task(_dispatch_spelling_grammar_qa_project, project.id)
     return _serialize_quality_qa_settings_response(db, project)
 
 
@@ -8348,7 +8345,7 @@ def refresh_file_record_spelling_grammar_qa(
         )
         .all()
     )
-    _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, segments)
+    _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, segments, force=True)
     return {
         "file_record_id": str(file_record_id),
         "queued_count": len(segments),
@@ -8966,8 +8963,12 @@ def _schedule_spelling_grammar_qa_for_segments(
     background_tasks: BackgroundTasks | None,
     file_record: FileRecord,
     segments: Iterable[Segment],
+    *,
+    force: bool = False,
 ) -> None:
     if background_tasks is None:
+        return
+    if not force and not get_settings().spelling_grammar_qa_auto_schedule:
         return
     segment_ids = [
         segment.id
