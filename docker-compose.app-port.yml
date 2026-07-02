@@ -1,0 +1,7 @@
+# 可选：不启 nginx 时，直接把 app 容器端口发布到宿主机。
+# 默认发布到宿主机 80；如需旧端口，可显式设置 APP_PUBLISH_PORT=19013。
+
+services:
+  app:
+    ports:
+      - "${APP_PUBLISH_PORT:-80}:19013"
