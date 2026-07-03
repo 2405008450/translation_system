@@ -65,6 +65,7 @@ let exportPollTimer: number | null = null
 let disposed = false
 
 const canManageResources = computed(() => authStore.isAdmin)
+const canCreateResources = computed(() => authStore.isAdmin || authStore.isInternalTranslator)
 
 function normalizeResourceSearchText(value: unknown) {
   return String(value ?? '').trim().toLowerCase()
@@ -256,7 +257,7 @@ async function loadGlossaryBases() {
 }
 
 async function createGlossaryBase() {
-  if (!canManageResources.value) {
+  if (!canCreateResources.value) {
     baseMessage.value = '当前账号只能查看和导出词汇表。'
     return
   }
@@ -291,7 +292,7 @@ async function createGlossaryBase() {
 }
 
 function openCreateDialog() {
-  if (!canManageResources.value) {
+  if (!canCreateResources.value) {
     baseMessage.value = '当前账号只能查看和导出词汇表。'
     return
   }
@@ -477,7 +478,7 @@ onUnmounted(() => {
               <X :size="14" />
             </button>
           </div>
-          <button v-if="canManageResources" class="button button--primary" type="button" @click="openCreateDialog">
+          <button v-if="canCreateResources" class="button button--primary" type="button" @click="openCreateDialog">
             <Plus :size="14" /> 创建
           </button>
           <button

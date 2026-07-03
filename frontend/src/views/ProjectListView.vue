@@ -300,8 +300,12 @@ const projectFilterTags = computed(() => {
   }
   return tags
 })
+const canManageProjects = computed(() => authStore.isAdmin)
+const canCreateProjects = computed(() => authStore.isAdmin || authStore.isInternalTranslator)
+const canAssignProjects = computed(() => authStore.isAdmin || authStore.isInternalTranslator)
 const canSubmitCreate = computed(() => (
-  !creating.value
+  canCreateProjects.value
+  && !creating.value
   && Boolean(form.name.trim())
   && Boolean(form.workflow_template_id)
   && form.workflow_steps.length > 0
@@ -317,7 +321,6 @@ const columns = computed<DataTableColumn[]>(() => ([
 ]))
 
 const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
-const canManageProjects = computed(() => authStore.isAdmin)
 const selectedProjects = computed(() => (
   projects.value.filter((project) => selectedProjectIds.value.has(project.id))
 ))
@@ -331,7 +334,7 @@ const duplicateButtonTitle = computed(() => {
   return t('projectList.duplicate.selectHint')
 })
 const canOpenDuplicateDialog = computed(() => (
-  canManageProjects.value
+  canCreateProjects.value
   && selectedProjectIds.value.size <= 1
   && !loadingDuplicateDialog.value
   && !duplicatingProject.value
@@ -704,12 +707,18 @@ function resetForm() {
 }
 
 function openCreateDialog() {
+  if (!canCreateProjects.value) {
+    return
+  }
   resetForm()
   showCreateDialog.value = true
   void loadWorkflowTemplates()
 }
 
 async function createProject() {
+  if (!canCreateProjects.value) {
+    return
+  }
   if (!form.name.trim()) {
     formError.value = t('projectList.errors.requiredName')
     return
@@ -1110,7 +1119,7 @@ onBeforeUnmount(() => {
       </div>
       <div class="table-toolbar__right">
         <button
-          v-if="canManageProjects"
+          v-if="canCreateProjects"
           class="button button--primary"
           data-testid="project-create-button"
           type="button"
@@ -1130,7 +1139,7 @@ onBeforeUnmount(() => {
           {{ t('projectList.importAssets') }}
         </button>
         <button
-          v-if="canManageProjects"
+          v-if="canCreateProjects"
           class="button"
           type="button"
           :title="duplicateButtonTitle"
@@ -1407,7 +1416,7 @@ onBeforeUnmount(() => {
                   查看详情
                 </button>
                 <button
-                  v-if="canManageProjects"
+                  v-if="canAssignProjects"
                   type="button"
                   role="menuitem"
                   @click="openProjectAssignment(row as ProjectItem); close()"

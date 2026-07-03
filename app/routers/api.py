@@ -33,6 +33,9 @@ from app.auth import (
     is_admin_role,
     is_external_translator,
     require_admin,
+    require_project_assignment_manager,
+    require_project_creator,
+    require_resource_creator,
     serialize_user,
 )
 from app.config import get_settings
@@ -4210,7 +4213,7 @@ def list_project_assignment_events(
     project_id: UUID,
     limit: int = 100,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_project_assignment_manager),
 ):
     _get_project_or_404(db, project_id)
     return list_assignment_events(project_id=project_id, limit=limit, db=db)
@@ -5472,7 +5475,7 @@ def list_workflow_templates(_: User = Depends(get_current_user)):
 def create_project(
     payload: ProjectCreatePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_project_creator),
 ):
     """仅填写基础信息创建项目，文档导入在项目详情页完成"""
     from datetime import datetime as _dt
@@ -5535,7 +5538,7 @@ def duplicate_project(
     project_id: UUID,
     payload: ProjectDuplicatePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_project_creator),
 ):
     source_project = (
         db.query(Project)
@@ -6989,7 +6992,7 @@ def _build_project_detail_payload(
 def get_project_assignments(
     project_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_project_assignment_manager),
 ):
     _get_project_or_404(db, project_id)
     return _serialize_project_assignments(db, project_id)
@@ -7000,7 +7003,7 @@ def update_project_assignments(
     project_id: UUID,
     payload: ProjectAssignmentsRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_project_assignment_manager),
 ):
     project = _get_project_or_404(db, project_id)
     return _update_project_assignments_by_workflow(
@@ -8537,7 +8540,7 @@ def detect_project_source_language(
     project_id: UUID,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_project_creator),
 ):
     # 定义为同步 def，由 FastAPI 调度到线程池执行，避免语言识别的 CPU 操作阻塞事件循环。
     project = db.query(Project).filter(Project.id == project_id).first()
@@ -8566,7 +8569,7 @@ async def upload_project_source_document(
     document_parse_mode: str = Form(default=DOCUMENT_PARSE_MODE_FULL),
     document_parse_options: str | None = Form(default=None),
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_project_creator),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
@@ -14291,7 +14294,7 @@ def get_tm_collection(
 def create_tm_collection(
     payload: MemoryBasePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_resource_creator),
 ):
     name = _normalize_collection_name(payload.name)
     source_language, target_language = _require_tm_language_pair(

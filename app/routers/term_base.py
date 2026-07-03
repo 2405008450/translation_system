@@ -14,7 +14,13 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.auth import can_access_all_projects, get_current_user, is_admin_role, require_admin
+from app.auth import (
+    can_access_all_projects,
+    get_current_user,
+    is_admin_role,
+    require_admin,
+    require_resource_creator,
+)
 from app.config import get_settings
 from app.database import SessionLocal, get_db
 from app.models import FileAssignment, FileRecord, ProjectAssignment, TermBase, TermEntry, User
@@ -446,7 +452,7 @@ def get_term_base(
 def create_term_base(
     payload: TermBasePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_resource_creator),
 ):
     name = _normalize_term_base_name(payload.name)
     if not name:

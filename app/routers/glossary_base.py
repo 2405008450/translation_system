@@ -13,7 +13,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.auth import get_current_user, require_admin
+from app.auth import get_current_user, require_admin, require_resource_creator
 from app.config import get_settings
 from app.database import SessionLocal, get_db
 from app.models import FileRecord, GlossaryBase, GlossaryEntry, User
@@ -217,7 +217,7 @@ def list_glossary_bases(db: Session = Depends(get_db)):
 def create_glossary_base(
     payload: GlossaryBasePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_resource_creator),
 ):
     name = _normalize_glossary_base_name(payload.name)
     if not name:

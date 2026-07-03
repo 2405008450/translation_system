@@ -769,7 +769,7 @@ const tabs = computed(() => ([
     label: `${t('projectDetail.tabs.issues')}${openIssueCount.value > 0 ? ` (${openIssueCount.value})` : ''}`,
     disabled: false,
   },
-  { key: 'assignments' as const, label: '指派记录', disabled: !canManageProject.value },
+  { key: 'assignments' as const, label: '指派记录', disabled: !canAssignProject.value },
   { key: 'settings' as const, label: t('projectDetail.tabs.settings'), disabled: !canManageProject.value },
   { key: 'stats' as const, label: t('projectDetail.tabs.stats'), disabled: !canManageProject.value },
   { key: 'summary' as const, label: t('projectDetail.tabs.summary'), disabled: true },
@@ -1064,7 +1064,7 @@ const preTranslateButtonTitle = computed(() => (
         : ''
 ))
 const canAssignSelectedFile = computed(() => (
-  canManageProject.value
+  canAssignProject.value
   && Boolean(project.value)
 ))
 const filteredAssignableUsers = computed<User[]>(() => {
@@ -1169,10 +1169,15 @@ const statisticsFileColumns = computed<DataTableColumn[]>(() => ([
 ]))
 
 const canManageProject = computed(() => Boolean(project.value?.can_manage))
-const canOpenUploadModal = computed(() => Boolean(project.value) && canManageProject.value)
+const canAssignProject = computed(() => Boolean(project.value) && (canManageProject.value || authStore.isInternalTranslator))
+const canCreateProjects = computed(() => authStore.isAdmin || authStore.isInternalTranslator)
+const canUploadProjectFiles = computed(() => Boolean(project.value) && canCreateProjects.value)
+const canOpenUploadModal = computed(() => canUploadProjectFiles.value)
 const canOpenProjectIssueDialog = computed(() => Boolean(project.value) && !authStore.isExternalTranslator)
 
-const uploadButtonTitle = computed(() => (canManageProject.value ? '' : '只有管理员可以上传项目文件'))
+const uploadButtonTitle = computed(() => (
+  canUploadProjectFiles.value ? '' : '只有管理员或内部译者可以上传项目文件'
+))
 const projectSyncSegmentCount = computed(() => Number(project.value?.project_sync_segment_count || 0))
 const projectSyncDisabledCount = computed(() => {
   const total = projectSyncSegmentCount.value
@@ -2013,7 +2018,7 @@ async function loadAssignableUsers() {
   }
   loadingAssignableUsers.value = true
   try {
-    const { data } = await http.get<User[]>('/auth/users')
+    const { data } = await http.get<User[]>('/auth/assignable-users')
     assignableUsers.value = data.filter((user) => user.role === 'user' && user.is_active)
   } catch (error) {
     toast.error(getErrorMessage(error, '译者列表加载失败。'))
@@ -2060,7 +2065,7 @@ async function loadProjectAssignments() {
 }
 
 async function loadAssignmentEvents() {
-  if (!project.value || !canManageProject.value) {
+  if (!project.value || !canAssignProject.value) {
     assignmentEvents.value = []
     return
   }
@@ -2428,7 +2433,7 @@ function hideAssignmentTooltip() {
 }
 
 async function openAssignmentDialog(_row?: ProjectFileItem | null) {
-  if (!canManageProject.value) {
+  if (!canAssignProject.value) {
     return
   }
   closeActionMenu()
@@ -2447,7 +2452,7 @@ function closeAssignmentDialog() {
 }
 
 async function saveAssignment() {
-  if (!project.value) {
+  if (!project.value || !canAssignProject.value) {
     return
   }
   if (!validateAssignmentRanges()) {
@@ -3068,8 +3073,12 @@ async function loadProject(options: { preserveFilePagination?: boolean } = {}) {
     if (activeTab.value === 'views') {
       void loadMergeViews()
     }
-    if (data.can_manage) {
+    if (canAssignProject.value) {
       void loadAssignmentEvents()
+    } else {
+      assignmentEvents.value = []
+    }
+    if (data.can_manage) {
       void loadProjectTranslationMemorySettings()
       void loadProjectTermBaseSettings()
       void loadProjectQualityQASettings()
@@ -4149,7 +4158,7 @@ async function saveGuidelines() {
 }
 
 async function detectSourceLanguage() {
-  if (!canManageProject.value) {
+  if (!canUploadProjectFiles.value) {
     return
   }
 
@@ -4197,7 +4206,7 @@ async function detectSourceLanguage() {
 }
 
 async function uploadSourceDocument() {
-  if (!canManageProject.value) {
+  if (!canUploadProjectFiles.value) {
     return
   }
 
@@ -4646,7 +4655,7 @@ onMounted(() => {
   void (async () => {
     await loadProject({ preserveFilePagination: true })
     syncProjectSettingsHash()
-    if (route.query.assign === '1' && canManageProject.value) {
+    if (route.query.assign === '1' && canAssignProject.value) {
       await openAssignmentDialog()
     }
   })()
@@ -6179,7 +6188,7 @@ onBeforeUnmount(() => {
         <div class="table-toolbar pd-toolbar">
           <div class="table-toolbar__left pd-toolbar__left">
             <button
-              v-if="canManageProject"
+              v-if="canUploadProjectFiles"
               class="button button--primary pd-toolbar-primary"
               data-testid="project-upload-open"
               type="button"
@@ -6255,7 +6264,7 @@ onBeforeUnmount(() => {
                 <BookOpen :size="15" />
               </button>
               <button
-                v-if="canManageProject"
+                v-if="canAssignProject"
                 class="button pd-toolbar-icon-button"
                 type="button"
                 :disabled="!canAssignSelectedFile"
@@ -6511,7 +6520,7 @@ onBeforeUnmount(() => {
               <span class="pd-assignee" :class="{ 'is-empty': !(row.assignees?.length || row.assignee) }">
                 {{ getAssigneeLabel(row) }}
               </span>
-              <div v-if="canManageProject" class="pd-task-links">
+              <div v-if="canAssignProject" class="pd-task-links">
                 <button
                   class="pd-inline-link"
                   type="button"
@@ -6860,7 +6869,7 @@ onBeforeUnmount(() => {
           {{ t('projectDetail.enterWorkbench') }}
         </button>
         <button
-          v-if="canManageProject"
+          v-if="canAssignProject"
           type="button"
           @click="openAssignmentDialog(actionMenuRow)"
         >
