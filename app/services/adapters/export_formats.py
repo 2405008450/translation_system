@@ -103,6 +103,13 @@ EXPORT_OPTIONS = {
         extension=".xlsx",
         mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ),
+    "bilingual_excel_original": ExportOption(
+        id="bilingual_excel_original",
+        name="Excel 原格式双语",
+        description="保留原 Excel 工作簿元素，在原单元格内按原文、译文换行导出",
+        extension=".xlsx",
+        mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ),
 }
 
 
@@ -132,7 +139,7 @@ FORMAT_EXPORT_SUPPORT: Dict[str, List[str]] = {
     ],
     ".pdf": ["bilingual_docx", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],  # PDF 无法原格式导出
     ".pptx": ["original", "bilingual_docx", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
-    ".xlsx": ["original", "bilingual_docx", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".xlsx": ["original", "bilingual_excel_original", "bilingual_docx", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
 
     # 纯文本
     ".txt": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],

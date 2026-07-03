@@ -74,6 +74,13 @@ class MultiFormatExporter:
             return self._export_bilingual_docx(normalized_segments, base_name)
         if export_type == "bilingual_txt":
             return self._export_bilingual_txt(normalized_segments, base_name)
+        if export_type == "bilingual_excel_original":
+            return self._export_bilingual_excel_original(
+                extension,
+                normalized_segments,
+                base_name,
+                original_bytes,
+            )
         if export_type == "bilingual_excel":
             return self._export_bilingual_excel(normalized_segments, base_name)
         if export_type == "tmx":
@@ -570,6 +577,26 @@ class MultiFormatExporter:
             buffer.getvalue(),
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             f"{base_name}-bilingual.xlsx",
+        )
+
+    def _export_bilingual_excel_original(
+        self,
+        extension: str,
+        segments: list[dict[str, Any]],
+        base_name: str,
+        original_bytes: bytes | None,
+    ) -> tuple[bytes, str, str]:
+        if extension != ".xlsx":
+            raise ValueError("Original-format bilingual Excel export requires an XLSX source file.")
+        if original_bytes is None:
+            raise ValueError("Original-format bilingual Excel export requires the original source file.")
+
+        from app.services.adapters.xlsx_exporter import XlsxExporter
+
+        return (
+            XlsxExporter().export(original_bytes, segments, bilingual=True),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            f"{base_name}_bilingual.xlsx",
         )
 
     def _export_tmx(

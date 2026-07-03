@@ -142,7 +142,15 @@ def enqueue_confirmed_segments_for_auto_tm(
 def run_auto_tm_background_once() -> None:
     with SessionLocal() as db:
         try:
-            processed_count = process_auto_tm_outbox(db)
+            settings = get_settings()
+            max_batches = int(getattr(settings, "auto_tm_outbox_max_batches_per_run", 5) or 1)
+            max_batches = max(max_batches, 1)
+            processed_count = 0
+            for _ in range(max_batches):
+                batch_count = process_auto_tm_outbox(db)
+                processed_count += batch_count
+                if batch_count < AUTO_TM_BATCH_SIZE:
+                    break
             process_due_auto_tm_rematches(db, force=processed_count > 0)
         except Exception:
             logger.exception("auto TM background task failed")

@@ -65,6 +65,11 @@ import { getFileStatusMeta } from '../constants/status'
 import { buildTranslatedTaskFilename, supportedTaskFileAccept } from '../constants/taskFiles'
 import { useAuthStore } from '../stores/auth'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
+import {
+  getExportOptionExtensionLabel,
+  groupExportOptions,
+  type FileExportOption,
+} from '../utils/exportOptions'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
 import type {
   DocumentParseMode,
@@ -362,13 +367,6 @@ interface FileExportTask {
   filename?: string | null
   size_bytes?: number | null
 }
-interface FileExportOption {
-  id: string
-  name: string
-  description: string
-  extension: string
-}
-
 const confirm = useConfirm()
 const authStore = useAuthStore()
 const route = useRoute()
@@ -665,6 +663,7 @@ const exportFileMessage = ref('')
 const showProjectExportMenu = ref(false)
 const loadingProjectExportOptions = ref(false)
 const projectExportOptions = ref<FileExportOption[]>([])
+const groupedProjectExportOptions = computed(() => groupExportOptions(projectExportOptions.value))
 let exportPollTimer: number | null = null
 let activePretranslationPollTimer: number | null = null
 const ACTIVE_PRETRANSLATION_STATUSES = new Set(['queued', 'running', 'canceling'])
@@ -1254,12 +1253,24 @@ const effectiveProjectTargetLanguage = computed(() => {
   return targets.size === 1 ? Array.from(targets)[0] : null
 })
 
+const projectBoundLanguagePair = computed(() => (
+  canonicalizeLanguagePair(project.value?.source_language, project.value?.target_language)
+))
 const projectLanguagePairLabel = computed(() => (
-  project.value?.source_language && project.value?.target_language
-    ? formatLanguagePair(project.value.source_language, project.value.target_language)
+  projectBoundLanguagePair.value
+    ? formatLanguagePair(projectBoundLanguagePair.value.source, projectBoundLanguagePair.value.target)
     : projectFileLanguagePairs.value.length > 1
       ? t('projectDetail.settings.multipleLanguagePairs', { count: projectFileLanguagePairs.value.length })
       : formatLanguagePair(effectiveProjectSourceLanguage.value, effectiveProjectTargetLanguage.value)
+))
+const isProjectLanguagePairBound = computed(() => Boolean(projectBoundLanguagePair.value))
+const uploadLanguageDescription = computed(() => (
+  isProjectLanguagePairBound.value
+    ? t('projectDetail.uploadLanguage.boundHint')
+    : t('projectDetail.uploadLanguage.unboundHint')
+))
+const uploadLanguageBoundMessage = computed(() => (
+  t('projectDetail.uploadLanguage.boundMessage', { pair: projectLanguagePairLabel.value })
 ))
 
 const uploadSupportedSummary = computed(() => {
@@ -1272,7 +1283,10 @@ const uploadSupportedSummary = computed(() => {
     .join('、')
 })
 const canDetectSourceLanguage = computed(() => (
-  selectedFiles.value.length > 0 && !uploading.value && !detectingLanguage.value
+  selectedFiles.value.length > 0
+  && !uploading.value
+  && !detectingLanguage.value
+  && !isProjectLanguagePairBound.value
 ))
 const uploadFileValidationError = computed(() => validateSelectedUploadFiles(selectedFiles.value))
 const canSubmitSourceUpload = computed(() => (
@@ -1979,8 +1993,8 @@ function openUploadDialog() {
   }
 
   resetUploadForm()
-  uploadSourceLanguage.value = project.value?.source_language || ''
-  uploadTargetLanguage.value = project.value?.target_language || ''
+  uploadSourceLanguage.value = projectBoundLanguagePair.value?.source || ''
+  uploadTargetLanguage.value = projectBoundLanguagePair.value?.target || ''
   showUploadModal.value = true
 }
 
@@ -4162,6 +4176,12 @@ async function detectSourceLanguage() {
     return
   }
 
+  if (isProjectLanguagePairBound.value) {
+    languageDetectTone.value = 'info'
+    languageDetectMessage.value = uploadLanguageBoundMessage.value
+    return
+  }
+
   if (selectedFiles.value.length === 0) {
     languageDetectTone.value = 'warning'
     languageDetectMessage.value = '请先选择要识别的文件。'
@@ -4215,12 +4235,19 @@ async function uploadSourceDocument() {
     return
   }
 
-  if (!uploadSourceLanguage.value || !uploadTargetLanguage.value) {
+  const resolvedSourceLanguage = projectBoundLanguagePair.value?.source || uploadSourceLanguage.value
+  const resolvedTargetLanguage = projectBoundLanguagePair.value?.target || uploadTargetLanguage.value
+  if (isProjectLanguagePairBound.value) {
+    uploadSourceLanguage.value = resolvedSourceLanguage
+    uploadTargetLanguage.value = resolvedTargetLanguage
+  }
+
+  if (!resolvedSourceLanguage || !resolvedTargetLanguage) {
     uploadMessage.value = t('projectDetail.errors.selectLanguagePair')
     return
   }
 
-  if (uploadSourceLanguage.value === uploadTargetLanguage.value) {
+  if (resolvedSourceLanguage === resolvedTargetLanguage) {
     uploadMessage.value = t('projectList.errors.sameLanguage')
     return
   }
@@ -4242,8 +4269,8 @@ async function uploadSourceDocument() {
       formData.append('files', file)
     })
     formData.append('threshold', '0.6')
-    formData.append('source_language', uploadSourceLanguage.value)
-    formData.append('target_language', uploadTargetLanguage.value)
+    formData.append('source_language', resolvedSourceLanguage)
+    formData.append('target_language', resolvedTargetLanguage)
     formData.append('document_parse_mode', documentParseMode.value)
     formData.append('document_parse_options', JSON.stringify(documentParseOptions.value))
 
@@ -4744,9 +4771,10 @@ onBeforeUnmount(() => {
           <div class="upload-language-panel__head">
             <div>
               <div class="section-title section-title--tight">语言设置</div>
-              <p class="panel-subtitle">可先识别第一个文件的源语言，再手动调整源语言和目标语言。</p>
+              <p class="panel-subtitle">{{ uploadLanguageDescription }}</p>
             </div>
             <button
+              v-if="!isProjectLanguagePairBound"
               class="button upload-detect-button"
               type="button"
               :disabled="!canDetectSourceLanguage"
@@ -4761,7 +4789,12 @@ onBeforeUnmount(() => {
           <div class="upload-language-grid">
             <label class="field">
               <span class="field__label">{{ t('projectList.form.sourceLanguage') }} <span class="field__required">*</span></span>
-              <select v-model="uploadSourceLanguage" class="field__control" data-testid="project-upload-source-language">
+              <select
+                v-model="uploadSourceLanguage"
+                class="field__control"
+                data-testid="project-upload-source-language"
+                :disabled="isProjectLanguagePairBound || uploading"
+              >
                 <option value="" disabled>{{ t('projectList.form.sourcePlaceholder') }}</option>
                 <option
                   v-for="lang in languageOptions"
@@ -4776,7 +4809,12 @@ onBeforeUnmount(() => {
 
             <label class="field">
               <span class="field__label">{{ t('projectList.form.targetLanguage') }} <span class="field__required">*</span></span>
-              <select v-model="uploadTargetLanguage" class="field__control" data-testid="project-upload-target-language">
+              <select
+                v-model="uploadTargetLanguage"
+                class="field__control"
+                data-testid="project-upload-target-language"
+                :disabled="isProjectLanguagePairBound || uploading"
+              >
                 <option value="" disabled>{{ t('projectList.form.targetPlaceholder') }}</option>
                 <option
                   v-for="lang in languageOptions"
@@ -4789,6 +4827,10 @@ onBeforeUnmount(() => {
               </select>
             </label>
           </div>
+
+          <p v-if="isProjectLanguagePairBound" class="upload-bound-language">
+            {{ uploadLanguageBoundMessage }}
+          </p>
 
           <p
             v-if="languageDetectMessage"
@@ -6298,17 +6340,32 @@ onBeforeUnmount(() => {
                     {{ t('projectDetail.files.actions.exportNoOptions') }}
                   </div>
                   <template v-else>
-                    <button
-                      v-for="option in projectExportOptions"
-                      :key="option.id"
-                      class="pd-export-menu__item"
-                      type="button"
-                      :disabled="Boolean(exportingFileId)"
-                      @click="exportSelectedProjectFiles(option.id)"
+                    <div
+                      v-for="group in groupedProjectExportOptions"
+                      :key="group.id"
+                      class="pd-export-menu__group"
                     >
-                      <span class="pd-export-menu__item-name">{{ option.name }}</span>
-                      <span class="pd-export-menu__item-desc">{{ option.description }}</span>
-                    </button>
+                      <div class="pd-export-menu__group-title">{{ group.label }}</div>
+                      <button
+                        v-for="option in group.options"
+                        :key="option.id"
+                        class="pd-export-menu__item"
+                        type="button"
+                        :disabled="Boolean(exportingFileId)"
+                        @click="exportSelectedProjectFiles(option.id)"
+                      >
+                        <span class="pd-export-menu__item-head">
+                          <span class="pd-export-menu__item-name">{{ option.name }}</span>
+                          <span
+                            v-if="getExportOptionExtensionLabel(option)"
+                            class="pd-export-menu__item-ext"
+                          >
+                            {{ getExportOptionExtensionLabel(option) }}
+                          </span>
+                        </span>
+                        <span class="pd-export-menu__item-desc">{{ option.description }}</span>
+                      </button>
+                    </div>
                     <button
                       v-if="canExportSelectedProjectFilesAsZip"
                       class="pd-export-menu__item"
@@ -6316,7 +6373,10 @@ onBeforeUnmount(() => {
                       :disabled="Boolean(exportingFileId)"
                       @click="exportSelectedProjectFilesAsZip"
                     >
-                      <span class="pd-export-menu__item-name">{{ t('projectDetail.files.actions.exportZip') }}</span>
+                      <span class="pd-export-menu__item-head">
+                        <span class="pd-export-menu__item-name">{{ t('projectDetail.files.actions.exportZip') }}</span>
+                        <span class="pd-export-menu__item-ext">ZIP</span>
+                      </span>
                       <span class="pd-export-menu__item-desc">{{ t('projectDetail.files.actions.exportZipDescription') }}</span>
                     </button>
                   </template>
@@ -7455,6 +7515,17 @@ onBeforeUnmount(() => {
   gap: 14px;
 }
 
+.upload-bound-language {
+  margin: -2px 0 0;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--state-info) 28%, transparent);
+  border-radius: 6px;
+  background: var(--state-info-bg);
+  color: var(--state-info);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .upload-detect-message {
   margin: -2px 0 0;
   font-size: 13px;
@@ -8419,8 +8490,11 @@ onBeforeUnmount(() => {
   top: calc(100% + 6px);
   left: 0;
   z-index: 30;
-  min-width: 240px;
-  overflow: hidden;
+  min-width: 300px;
+  max-width: min(360px, calc(100vw - 24px));
+  max-height: min(520px, calc(100vh - 120px));
+  padding: 8px;
+  overflow-y: auto;
   border: 1px solid var(--line-soft);
   border-radius: 8px;
   background: var(--surface-0);
@@ -8439,18 +8513,28 @@ onBeforeUnmount(() => {
   font-size: 13px;
 }
 
+.pd-export-menu__group + .pd-export-menu__group,
+.pd-export-menu__group + .pd-export-menu__item {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.pd-export-menu__group-title {
+  padding: 2px 0 6px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+}
+
 .pd-export-menu__item {
   display: grid;
-  gap: 3px;
+  gap: 4px;
   border: 0;
-  border-bottom: 1px solid var(--line-soft);
+  border-radius: 6px;
   background: transparent;
   color: var(--text-primary);
   cursor: pointer;
-}
-
-.pd-export-menu__item:last-child {
-  border-bottom: 0;
 }
 
 .pd-export-menu__item:hover:not(:disabled) {
@@ -8462,9 +8546,30 @@ onBeforeUnmount(() => {
   cursor: not-allowed;
 }
 
+.pd-export-menu__item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
 .pd-export-menu__item-name {
+  min-width: 0;
   font-size: 13px;
   font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.pd-export-menu__item-ext {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  background: var(--surface-muted);
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 700;
 }
 
 .pd-export-menu__item-desc {

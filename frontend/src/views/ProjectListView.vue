@@ -29,7 +29,7 @@ import RowActionMenu from '../components/RowActionMenu.vue'
 import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { useToast } from '../composables/useToast'
-import { formatLanguagePair } from '../constants/languages'
+import { formatLanguagePair, languageOptions } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
 import type { IssueMarker, User, WorkflowProgress, WorkflowStep, WorkflowTemplate } from '../types/api'
 import { useAuthStore } from '../stores/auth'
@@ -175,6 +175,8 @@ const filterProjectPoolSearch = ref<string | null>(null)
 
 const defaultForm = () => ({
   name: '',
+  source_language: '',
+  target_language: '',
   deadline: '',
   access_level: 'team' as 'team' | 'private' | 'public',
   workflow_template_id: '',
@@ -303,6 +305,14 @@ const projectFilterTags = computed(() => {
 const canManageProjects = computed(() => authStore.isAdmin)
 const canCreateProjects = computed(() => authStore.isAdmin || authStore.isInternalTranslator)
 const canAssignProjects = computed(() => authStore.isAdmin || authStore.isInternalTranslator)
+const isCreateLanguagePairPartiallySelected = computed(() => (
+  Boolean(form.source_language) !== Boolean(form.target_language)
+))
+const isCreateLanguagePairDuplicated = computed(() => (
+  Boolean(form.source_language)
+  && Boolean(form.target_language)
+  && form.source_language === form.target_language
+))
 const canSubmitCreate = computed(() => (
   canCreateProjects.value
   && !creating.value
@@ -310,6 +320,8 @@ const canSubmitCreate = computed(() => (
   && Boolean(form.workflow_template_id)
   && form.workflow_steps.length > 0
   && form.workflow_steps.every((step) => step.name.trim())
+  && !isCreateLanguagePairPartiallySelected.value
+  && !isCreateLanguagePairDuplicated.value
 ))
 
 const columns = computed<DataTableColumn[]>(() => ([
@@ -727,6 +739,16 @@ async function createProject() {
     formError.value = '请选择工作流模板'
     return
   }
+  if (isCreateLanguagePairPartiallySelected.value) {
+    formError.value = form.source_language
+      ? t('projectList.errors.requiredTarget')
+      : t('projectList.errors.requiredSource')
+    return
+  }
+  if (isCreateLanguagePairDuplicated.value) {
+    formError.value = t('projectList.errors.sameLanguage')
+    return
+  }
   const workflowSteps = form.workflow_steps.map((step, index) => ({
     step_key: index === 0 ? 'translate' : normalizeWorkflowStepKey(step.step_key, index),
     name: index === 0 ? '翻译' : step.name.trim(),
@@ -738,6 +760,8 @@ async function createProject() {
   try {
     const { data } = await http.post<ProjectCreateResponse>('/projects', {
       name: form.name.trim(),
+      source_language: form.source_language || null,
+      target_language: form.target_language || null,
       deadline: form.deadline || null,
       access_level: form.access_level,
       workflow_template_id: form.workflow_template_id,
@@ -1497,6 +1521,52 @@ onBeforeUnmount(() => {
           </select>
         </label>
 
+        <div class="field field--full project-language-binding">
+          <span class="field__label">{{ t('projectList.form.languagePairBinding') }}</span>
+          <p class="project-language-binding__hint">
+            {{ t('projectList.form.languagePairBindingHint') }}
+          </p>
+          <div class="project-language-binding__grid">
+            <label class="field">
+              <span class="field__label">{{ t('projectList.form.sourceLanguage') }}</span>
+              <select
+                v-model="form.source_language"
+                class="field__control"
+                data-testid="project-create-source-language"
+              >
+                <option value="">{{ t('projectList.form.noLanguagePairBinding') }}</option>
+                <option
+                  v-for="lang in languageOptions"
+                  :key="lang.code"
+                  :value="lang.code"
+                  :disabled="lang.code === form.target_language"
+                >
+                  {{ lang.label }}
+                </option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span class="field__label">{{ t('projectList.form.targetLanguage') }}</span>
+              <select
+                v-model="form.target_language"
+                class="field__control"
+                data-testid="project-create-target-language"
+              >
+                <option value="">{{ t('projectList.form.noLanguagePairBinding') }}</option>
+                <option
+                  v-for="lang in languageOptions"
+                  :key="lang.code"
+                  :value="lang.code"
+                  :disabled="lang.code === form.source_language"
+                >
+                  {{ lang.label }}
+                </option>
+              </select>
+            </label>
+          </div>
+        </div>
+
         <label class="field field--full">
           <span class="field__label">工作流模板 <span class="field__required">*</span></span>
           <select
@@ -2074,6 +2144,24 @@ onBeforeUnmount(() => {
   font-size: 13px;
 }
 
+.project-language-binding {
+  display: grid;
+  gap: 8px;
+}
+
+.project-language-binding__hint {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.project-language-binding__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
 .workflow-editor {
   display: grid;
   gap: 8px;
@@ -2170,6 +2258,10 @@ onBeforeUnmount(() => {
   }
 
   .project-filter-dialog__grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .project-language-binding__grid {
     grid-template-columns: minmax(0, 1fr);
   }
 

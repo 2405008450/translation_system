@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Link2, Link2Off } from 'lucide-vue-next'
+import { Copy, Link2, Link2Off } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, ref, watch, nextTick } from 'vue'
 
 import InteractiveDiffText from './InteractiveDiffText.vue'
@@ -61,6 +61,7 @@ const emit = defineEmits<{
   updateSource: [sentenceId: string, value: string]
   focus: [sentenceId: string]
   activateTarget: [sentenceId: string]
+  copySourceToTarget: [sentenceId: string]
   applyPartialRevision: [revisionId: string, newText: string]
   ctrlClick: [sentenceId: string, event: MouseEvent]
   toggleProjectSync: [sentenceId: string, disabled: boolean]
@@ -1384,6 +1385,14 @@ function handleProjectSyncToggle() {
   emit('toggleProjectSync', segmentKey.value, !props.segment.project_sync_disabled)
 }
 
+function handleCopySourceToTargetClick() {
+  if (props.disabled) {
+    return
+  }
+  resetHistoryGroup()
+  emit('copySourceToTarget', segmentKey.value)
+}
+
 function handleSourceFocus() {
   isSourceFocused.value = true
 }
@@ -2244,6 +2253,18 @@ watch(
         />
       </div>
       <div class="segment-row__target-content">
+        <button
+          class="segment-row__copy-source-button"
+          type="button"
+          data-testid="segment-copy-source-to-target"
+          title="用原文填充译文"
+          aria-label="用原文填充译文"
+          :disabled="disabled"
+          @mousedown.stop
+          @click.stop="handleCopySourceToTargetClick"
+        >
+          <Copy :size="13" aria-hidden="true" />
+        </button>
         <span
           v-if="hasTargetAutomaticNumbering"
           class="segment-row__automatic-numbering-badge segment-row__automatic-numbering-badge--target"
@@ -2376,6 +2397,11 @@ watch(
   min-width: 0;
 }
 
+.segment-row__text {
+  font-size: var(--segment-editor-source-font-size, 13px);
+  line-height: var(--segment-editor-source-line-height, 1.45);
+}
+
 .segment-row__automatic-numbering-badge {
   flex: 0 0 auto;
   max-width: 72px;
@@ -2396,6 +2422,38 @@ watch(
 
 .segment-row__automatic-numbering-badge--target {
   margin-top: 9px;
+}
+
+.segment-row__copy-source-button {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  margin-top: 8px;
+  padding: 0;
+  border: 1px solid rgba(34, 127, 88, 0.28);
+  border-radius: 4px;
+  background: rgba(34, 127, 88, 0.08);
+  color: #146c49;
+  line-height: 1;
+  box-shadow: none;
+}
+
+.segment-row__copy-source-button:hover:not(:disabled),
+.segment-row__copy-source-button:focus-visible {
+  border-color: rgba(13, 122, 104, 0.46);
+  background: rgba(13, 122, 104, 0.14);
+  color: #0b6658;
+  outline: none;
+}
+
+.segment-row__copy-source-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
 }
 
 .segment-row__cell--state,
@@ -2543,8 +2601,8 @@ watch(
     ),
     transparent;
   color: var(--text-primary);
-  font-size: 15px;
-  line-height: 1.58;
+  font-size: var(--segment-editor-target-font-size, 15px);
+  line-height: var(--segment-editor-target-line-height, 1.58);
   outline: none;
   overflow: auto;
   white-space: pre-wrap;
@@ -2699,8 +2757,8 @@ watch(
       var(--segment-editor-stripe, transparent),
       var(--segment-editor-stripe, transparent)
     );
-  font-size: 15px;
-  line-height: 1.58;
+  font-size: var(--segment-editor-target-font-size, 15px);
+  line-height: var(--segment-editor-target-line-height, 1.58);
   color: var(--text-primary);
   outline: none;
   white-space: pre-wrap;
@@ -2760,8 +2818,8 @@ watch(
   border: 1px solid var(--brand-700, #0d7a68);
   border-radius: 5px;
   background: var(--surface-panel, #fff);
-  font-size: 13px;
-  line-height: 1.45;
+  font-size: var(--segment-editor-source-font-size, 13px);
+  line-height: var(--segment-editor-source-line-height, 1.45);
   color: var(--text-primary);
   outline: none;
   white-space: pre-wrap;

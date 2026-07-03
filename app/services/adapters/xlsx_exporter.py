@@ -28,11 +28,18 @@ class Replacement:
     source_text: str
     parts: list[str] = field(default_factory=list)
     has_target: bool = False
+    bilingual: bool = False
 
     @property
     def text(self) -> str:
         separator = "\n" if "\n" in self.source_text else " "
-        return separator.join(part for part in self.parts if part).strip()
+        target_text = separator.join(part for part in self.parts if part).strip()
+        if not self.bilingual:
+            return target_text
+        source_text = self.source_text.strip()
+        if source_text and target_text:
+            return f"{source_text}\n{target_text}"
+        return source_text or target_text
 
 
 class XlsxExporter:
@@ -41,10 +48,11 @@ class XlsxExporter:
         original_bytes: bytes,
         segments: Iterable[Any],
         document_parse_options: Mapping[str, object] | str | None = None,
+        bilingual: bool = False,
     ) -> bytes:
         parse_options = normalize_document_parse_options(document_parse_options)
         parsed = XlsxAdapter().parse_with_options(original_bytes, options=parse_options)
-        replacements = self._build_replacements(parsed.ast, parsed.segments, segments)
+        replacements = self._build_replacements(parsed.ast, parsed.segments, segments, bilingual=bilingual)
         if not replacements:
             return original_bytes
 
@@ -67,6 +75,7 @@ class XlsxExporter:
         ast: DocumentAST,
         parsed_segments: Iterable[Any],
         translated_segments: Iterable[Any],
+        bilingual: bool = False,
     ) -> dict[tuple[Any, ...], Replacement]:
         targets = {
             str(_get_segment_value(segment, "sentence_id", _get_segment_value(segment, "segment_id", ""))): str(
@@ -86,7 +95,11 @@ class XlsxExporter:
 
             replacement = replacements.setdefault(
                 key,
-                Replacement(metadata=dict(node.metadata), source_text=node.text_content or ""),
+                Replacement(
+                    metadata=dict(node.metadata),
+                    source_text=node.text_content or "",
+                    bilingual=bilingual,
+                ),
             )
             target_text = targets.get(parsed_segment.segment_id, "")
             if target_text.strip():

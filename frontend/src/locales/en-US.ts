@@ -322,6 +322,11 @@ const overrides = {
     empty: 'No projects',
     createDialogTitle: 'New Project',
     createDialogDescription: 'After creating a project, upload documents from the project details page.',
+    form: {
+      languagePairBinding: 'Project language pair (optional)',
+      languagePairBindingHint: 'Bind a language pair when every file in this project will use the same direction. Leave it unbound to choose per upload.',
+      noLanguagePairBinding: 'Do not bind',
+    },
     status: {
       confirmedProgress: 'Overall progress',
     },
@@ -350,7 +355,7 @@ const overrides = {
     },
     files: {
       title: 'Files',
-      description: 'A project can contain multiple files. Select the language pair when uploading.',
+      description: 'A project can contain multiple files. Bound projects reuse the project language pair for every upload.',
       empty: 'No files to display.',
       openHint: 'Open the translation workbench',
       processingHint: 'The source document is uploaded and will be available after processing.',
@@ -371,6 +376,14 @@ const overrides = {
         filter: 'Filter',
         columns: 'Columns',
       },
+    },
+    uploadLanguage: {
+      boundHint: 'This project has a bound language pair. All uploaded files will use it.',
+      unboundHint: 'You can detect the first file source language, then adjust source and target manually.',
+      boundMessage: 'Project language pair: {pair}',
+    },
+    settings: {
+      languageLockedHint: 'A project language pair can be bound during creation. After creation it is read-only; unbound projects still set language per file.',
     },
     mergeViews: {
       title: 'Views',

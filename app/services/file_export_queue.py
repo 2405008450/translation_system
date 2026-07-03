@@ -26,6 +26,7 @@ from app.services.task_file_service import (
     DOCUMENT_PARSE_MODE_FULL,
     can_export_task_file,
     export_bilingual_task_docx_with_layout,
+    export_bilingual_xlsx_task_file,
     export_translated_task_file,
     get_task_file_extension,
     normalize_document_parse_options,
@@ -416,6 +417,16 @@ def build_file_record_exported_file(db: Session, file_record: FileRecord, export
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
             target_language=getattr(file_record, "target_language", None),
+        )
+
+    if export_type == "bilingual_excel_original":
+        if get_task_file_extension(source_filename) != ".xlsx":
+            raise ValueError("Only XLSX source files support original-format bilingual Excel export.")
+        return export_bilingual_xlsx_task_file(
+            raw_bytes=raw_bytes,
+            filename=source_filename,
+            segments=segments,
+            document_parse_options=document_parse_options,
         )
 
     segment_dicts = [

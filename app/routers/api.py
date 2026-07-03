@@ -320,6 +320,7 @@ from app.services.task_file_service import (
     build_task_workspace,
     can_export_task_file,
     export_bilingual_task_docx_with_layout,
+    export_bilingual_xlsx_task_file,
     export_translated_task_file,
     get_max_upload_size_bytes,
     get_upload_capabilities,
@@ -376,7 +377,11 @@ logger = logging.getLogger(__name__)
 _RESOURCE_IMPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="resource-import")
 ARQ_IMPORT_QUEUE_NAME = "arq:import"
 ARQ_MAINTENANCE_QUEUE_NAME = "arq:maintenance"
+ARQ_AUTO_TM_QUEUE_NAME = "arq:auto-tm"
+ARQ_SEGMENT_SYNC_QUEUE_NAME = "arq:segment-sync"
 ARQ_PRETRANSLATION_QUEUE_NAME = "arq:pretranslation"
+ARQ_AUTO_TM_BACKGROUND_JOB_ID = "auto-tm-background"
+ARQ_AUTO_TM_REMATCH_BACKGROUND_JOB_ID = "auto-tm-rematch-background"
 router = APIRouter(dependencies=[Depends(get_current_user)])
 UPLOAD_READ_CHUNK_SIZE = 1024 * 1024
 
@@ -525,6 +530,7 @@ async def _enqueue_arq_job(
     function_name: str,
     *args: Any,
     queue_name: str = ARQ_MAINTENANCE_QUEUE_NAME,
+    job_id: str | None = None,
 ) -> bool:
     """通用 ARQ 任务入队：成功返回 True，未启用/失败返回 False 以便回退本地执行。"""
     settings = get_settings()
@@ -540,7 +546,16 @@ async def _enqueue_arq_job(
     redis_pool = None
     try:
         redis_pool = await arq_create_pool(redis_settings)
-        await redis_pool.enqueue_job(function_name, *args, _queue_name=queue_name)
+        enqueue_kwargs: dict[str, Any] = {"_queue_name": queue_name}
+        if job_id:
+            enqueue_kwargs["_job_id"] = job_id
+        try:
+            await redis_pool.enqueue_job(function_name, *args, **enqueue_kwargs)
+        except TypeError:
+            if not job_id:
+                raise
+            enqueue_kwargs.pop("_job_id", None)
+            await redis_pool.enqueue_job(function_name, *args, **enqueue_kwargs)
         return True
     except Exception:
         logger.warning(
@@ -579,14 +594,22 @@ async def _dispatch_spelling_grammar_qa_project(project_id: UUID) -> None:
 
 async def _dispatch_auto_tm_background() -> None:
     """优先把 auto-TM 处理投递到 arq worker，未启用 arq 时回退到本地线程池。"""
-    if await _enqueue_arq_job("auto_tm_background_job"):
+    if await _enqueue_arq_job(
+        "auto_tm_background_job",
+        queue_name=ARQ_AUTO_TM_QUEUE_NAME,
+        job_id=ARQ_AUTO_TM_BACKGROUND_JOB_ID,
+    ):
         return
     await asyncio.to_thread(run_auto_tm_background_once)
 
 
 async def _dispatch_auto_tm_rematch_background() -> None:
     """强制处理已入队的 TM 重匹配任务，用于项目绑定后的初始刷新。"""
-    if await _enqueue_arq_job("auto_tm_rematch_background_job"):
+    if await _enqueue_arq_job(
+        "auto_tm_rematch_background_job",
+        queue_name=ARQ_AUTO_TM_QUEUE_NAME,
+        job_id=ARQ_AUTO_TM_REMATCH_BACKGROUND_JOB_ID,
+    ):
         return
     await asyncio.to_thread(run_auto_tm_rematch_background_once)
 
@@ -604,6 +627,7 @@ async def _dispatch_project_segment_sync(
         str(file_record_id),
         [str(segment_id) for segment_id in segment_ids],
         str(current_user_id) if current_user_id else None,
+        queue_name=ARQ_SEGMENT_SYNC_QUEUE_NAME,
     ):
         return
     await asyncio.to_thread(
@@ -1072,6 +1096,7 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
         payload.get("source_language"),
         payload.get("target_language"),
         primary_collection,
+        project,
     )
 
     term_base = None
@@ -1310,6 +1335,7 @@ def _resolve_pretranslation_run_file_concurrency() -> int:
 
 class MaintenanceWorkerSettings:
     queue_name = ARQ_MAINTENANCE_QUEUE_NAME
+    keep_result = 0
     max_jobs = _resolve_arq_worker_max_jobs(
         get_settings().arq_maintenance_max_jobs,
         get_settings().arq_max_jobs,
@@ -1328,8 +1354,36 @@ class MaintenanceWorkerSettings:
     redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
 
 
+class AutoTMWorkerSettings:
+    queue_name = ARQ_AUTO_TM_QUEUE_NAME
+    keep_result = 0
+    max_jobs = _resolve_arq_worker_max_jobs(
+        get_settings().arq_auto_tm_max_jobs,
+        1,
+    )
+    functions = [
+        auto_tm_background_job,
+        auto_tm_rematch_background_job,
+    ]
+    redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
+
+
+class SegmentSyncWorkerSettings:
+    queue_name = ARQ_SEGMENT_SYNC_QUEUE_NAME
+    keep_result = 0
+    max_jobs = _resolve_arq_worker_max_jobs(
+        get_settings().arq_segment_sync_max_jobs,
+        1,
+    )
+    functions = [
+        project_segment_sync_job,
+    ]
+    redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
+
+
 class ImportWorkerSettings:
     queue_name = ARQ_IMPORT_QUEUE_NAME
+    keep_result = 0
     max_jobs = _resolve_arq_worker_max_jobs(
         get_settings().arq_import_max_jobs,
         get_settings().arq_max_jobs,
@@ -1345,6 +1399,7 @@ class ImportWorkerSettings:
 
 class PretranslationWorkerSettings:
     queue_name = ARQ_PRETRANSLATION_QUEUE_NAME
+    keep_result = 0
     max_jobs = _resolve_arq_worker_max_jobs(
         get_settings().arq_pretranslation_max_jobs,
         1,
@@ -4925,7 +4980,34 @@ def _resolve_upload_language_pair(
     source_language: str | None,
     target_language: str | None,
     primary_collection: TMCollection | None = None,
+    project: Project | None = None,
 ) -> tuple[str, str]:
+    if project and (project.source_language or project.target_language):
+        resolved_source_language, resolved_target_language = _require_tm_language_pair(
+            project.source_language,
+            project.target_language,
+        )
+        if source_language or target_language:
+            submitted_source_language, submitted_target_language = _require_tm_language_pair(
+                source_language,
+                target_language,
+            )
+            if (
+                submitted_source_language != resolved_source_language
+                or submitted_target_language != resolved_target_language
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="当前项目已绑定语言对，上传文件必须使用项目语言对。",
+                )
+        _ensure_resource_language_pair_matches(
+            primary_collection,
+            resolved_source_language,
+            resolved_target_language,
+            "记忆库",
+        )
+        return resolved_source_language, resolved_target_language
+
     if source_language or target_language:
         resolved_source_language, resolved_target_language = _require_tm_language_pair(
             source_language,
@@ -8595,6 +8677,7 @@ async def upload_project_source_document(
         source_language,
         target_language,
         primary_collection,
+        project,
     )
 
     term_base = None
@@ -12020,7 +12103,8 @@ def export_file_record_with_type(
 
     Args:
         file_record_id: 文件记录 ID
-        export_type: 导出类型 (original, bilingual, bilingual_txt, tmx, xliff, xliff2)
+        export_type: 导出类型 (source, original, bilingual, bilingual_docx,
+            bilingual_excel_original, bilingual_excel, bilingual_txt, tmx, xliff, xliff2)
     """
     from app.services.adapters import export_file
 
@@ -12082,6 +12166,28 @@ def export_file_record_with_type(
                 document_parse_mode=getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL),
                 document_parse_options=_get_file_record_document_parse_options(file_record),
                 target_language=getattr(file_record, "target_language", None),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"导出失败: {str(exc)}") from exc
+
+        return _build_binary_download_response(
+            filename=exported_file.filename,
+            content=exported_file.content,
+            media_type=exported_file.media_type,
+        )
+
+    if export_type == "bilingual_excel_original":
+        source_filename = get_file_record_source_filename(file_record)
+        if get_task_file_extension(source_filename) != ".xlsx":
+            raise HTTPException(status_code=400, detail="Only XLSX source files support original-format bilingual Excel export.")
+        try:
+            exported_file = export_bilingual_xlsx_task_file(
+                raw_bytes=raw_bytes,
+                filename=source_filename,
+                segments=segments,
+                document_parse_options=_get_file_record_document_parse_options(file_record),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
