@@ -890,6 +890,8 @@ export interface TermBase {
   description: string | null
   source_language: string
   target_language: string
+  creator_id?: string | null
+  creator_name?: string | null
   created_at: string
   updated_at: string
   entry_count: number
@@ -901,6 +903,8 @@ export interface GlossaryBase {
   description: string | null
   source_language: string
   target_language: string
+  creator_id?: string | null
+  creator_name?: string | null
   created_at: string
   updated_at: string
   entry_count: number
@@ -1047,6 +1051,8 @@ export interface TMCollection {
   description: string | null
   source_language: string | null
   target_language: string | null
+  creator_id?: string | null
+  creator_name?: string | null
   created_at: string
   updated_at: string
   entry_count: number

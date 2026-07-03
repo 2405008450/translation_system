@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.auth import (
     can_access_all_projects,
     get_current_user,
+    get_user_display_name,
     is_admin_role,
     require_admin,
     require_resource_creator,
@@ -163,6 +164,8 @@ def _serialize_term_base(term_base: TermBase, entry_count: int = 0) -> dict:
         "description": term_base.description,
         "source_language": term_base.source_language,
         "target_language": term_base.target_language,
+        "creator_id": str(term_base.creator_id) if term_base.creator_id else None,
+        "creator_name": get_user_display_name(term_base.creator),
         "created_at": term_base.created_at.isoformat(),
         "updated_at": term_base.updated_at.isoformat(),
         "entry_count": entry_count,
@@ -452,7 +455,7 @@ def get_term_base(
 def create_term_base(
     payload: TermBasePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_resource_creator),
+    current_user: User = Depends(require_resource_creator),
 ):
     name = _normalize_term_base_name(payload.name)
     if not name:
@@ -467,6 +470,7 @@ def create_term_base(
         description=normalize_text(payload.description or "") or None,
         source_language=source_language,
         target_language=target_language,
+        creator_id=current_user.id,
     )
     db.add(term_base)
     try:
@@ -519,6 +523,7 @@ def merge_term_bases(
         description=normalize_text(payload.description or "") or None,
         source_language=source_language,
         target_language=target_language,
+        creator_id=current_user.id,
     )
     db.add(target_term_base)
     try:

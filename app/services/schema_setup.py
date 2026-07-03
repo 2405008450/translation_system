@@ -33,7 +33,7 @@ LEGACY_REQUIRED_EXISTING_TABLES = (
     "translation_memory_entries",
 )
 REQUIRED_SCHEMA = {
-    "memory_bases": {"source_language", "target_language"},
+    "memory_bases": {"source_language", "target_language", "creator_id"},
     "resource_import_batches": {
         "id",
         "resource_type",
@@ -61,6 +61,7 @@ REQUIRED_SCHEMA = {
         "name",
         "source_language",
         "target_language",
+        "creator_id",
     },
     "term_entries": {
         "id",
@@ -80,6 +81,7 @@ REQUIRED_SCHEMA = {
         "name",
         "source_language",
         "target_language",
+        "creator_id",
     },
     "glossary_entries": {
         "id",
@@ -784,8 +786,16 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ADD COLUMN IF NOT EXISTS target_language VARCHAR(20)
             """,
             """
+            ALTER TABLE IF EXISTS memory_bases
+            ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
             CREATE INDEX IF NOT EXISTS ix_memory_bases_language_pair
             ON memory_bases (source_language, target_language)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_memory_bases_creator_id
+            ON memory_bases (creator_id)
             """,
             """
             ALTER TABLE IF EXISTS memory_entries
@@ -920,6 +930,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 description TEXT,
                 source_language VARCHAR(20) NOT NULL,
                 target_language VARCHAR(20) NOT NULL,
+                creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
@@ -938,6 +949,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
             """
             ALTER TABLE IF EXISTS term_bases
+            ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS term_bases
             ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
             """,
             """
@@ -951,6 +966,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_term_bases_language_pair
             ON term_bases (source_language, target_language)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_bases_creator_id
+            ON term_bases (creator_id)
             """,
             """
             DROP TRIGGER IF EXISTS update_term_bases_updated_at ON term_bases
@@ -1077,6 +1096,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 description TEXT,
                 source_language VARCHAR(20) NOT NULL,
                 target_language VARCHAR(20) NOT NULL,
+                creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
@@ -1095,6 +1115,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
             """
             ALTER TABLE IF EXISTS glossary_bases
+            ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_bases
             ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
             """,
             """
@@ -1108,6 +1132,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_glossary_bases_language_pair
             ON glossary_bases (source_language, target_language)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_bases_creator_id
+            ON glossary_bases (creator_id)
             """,
             """
             DROP TRIGGER IF EXISTS update_glossary_bases_updated_at ON glossary_bases

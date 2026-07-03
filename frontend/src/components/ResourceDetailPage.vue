@@ -180,6 +180,12 @@ const tableColumnCount = computed(() => (
 const entryCount = computed(() => resource.value?.entry_count ?? totalEntries.value)
 const entryCountText = computed(() => `${entryCount.value}`)
 const lastImportTime = computed(() => entries.value[0]?.updated_at ? formatDate(entries.value[0].updated_at) : '-')
+const currentUserDisplayName = computed(() => (
+  authStore.user?.nickname || authStore.user?.username || '-'
+))
+const resourceCreatorName = computed(() => (
+  resource.value?.creator_name || currentUserDisplayName.value
+))
 const exportButtonText = computed(() => (
   exportingEntries.value ? `导出中 ${exportProgress.value}%` : '导出'
 ))
@@ -187,7 +193,7 @@ const exportButtonText = computed(() => (
 const metaColumns = computed(() => [
   [
     { label: '源语言', value: sourceLanguageLabel.value },
-    { label: '创建人', value: '项目专员-' },
+    { label: '创建人', value: resourceCreatorName.value },
     { label: '关联项目', value: '-' },
   ],
   [

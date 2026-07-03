@@ -535,6 +535,8 @@ const locatingTermQAReportItemId = ref<string | null>(null)
 const updatingTermQAIgnore = ref(false)
 const selectedTermQAItemIds = ref<Set<string>>(new Set())
 const termQAReportPage = ref(1)
+type TermQAReportFilter = 'active' | 'ignored' | 'all'
+const termQAReportFilter = ref<TermQAReportFilter>('active')
 
 type NumberCheckFilter = 'all' | 'program' | 'ai' | 'source' | 'modified' | 'ignored'
 const numberCheckReport = ref<NumberCheckReport | null>(null)
@@ -1381,22 +1383,45 @@ const allActiveTermQAItemsSelected = computed(() => (
 ))
 
 const termQAReportPageSize = QA_RESULT_PAGE_SIZE
+const filteredTermQAReportItems = computed(() => {
+  const items = termQAReport.value?.items || []
+  switch (termQAReportFilter.value) {
+    case 'ignored':
+      return items.filter((item) => item.ignored)
+    case 'all':
+      return items
+    default:
+      return items.filter((item) => !item.ignored)
+  }
+})
 const termQAReportTotalPages = computed(() => (
-  Math.max(1, Math.ceil((termQAReport.value?.items.length || 0) / termQAReportPageSize))
+  Math.max(1, Math.ceil(filteredTermQAReportItems.value.length / termQAReportPageSize))
 ))
 const visibleTermQAReportItems = computed(() => {
-  const items = termQAReport.value?.items || []
   const startIndex = (termQAReportPage.value - 1) * termQAReportPageSize
-  return items.slice(startIndex, startIndex + termQAReportPageSize)
+  return filteredTermQAReportItems.value.slice(startIndex, startIndex + termQAReportPageSize)
 })
 const termQAReportPageRangeText = computed(() => {
-  const total = termQAReport.value?.items.length || 0
+  const total = filteredTermQAReportItems.value.length
   if (total === 0) {
     return '0 / 0'
   }
   const start = (termQAReportPage.value - 1) * termQAReportPageSize + 1
   const end = Math.min(start + termQAReportPageSize - 1, total)
   return `${start}-${end} / ${total}`
+})
+
+const termQAReportEmptyText = computed(() => {
+  if (!termQAReport.value || termQAReport.value.items.length === 0) {
+    return '未发现已开启规则的 QA 问题。'
+  }
+  if (termQAReportFilter.value === 'ignored') {
+    return '暂无已忽略的 QA 问题。'
+  }
+  if (termQAReportFilter.value === 'all') {
+    return '暂无 QA 问题。'
+  }
+  return '当前没有待处理的 QA 问题。'
 })
 
 const termQAReportCreatedAtText = computed(() => (
@@ -4060,9 +4085,86 @@ function setTermQAReportPage(page: number) {
   termQAReportPage.value = Math.min(Math.max(safePage, 1), termQAReportTotalPages.value)
 }
 
+function setTermQAReportPageForItem(itemId: string) {
+  const itemIndex = filteredTermQAReportItems.value.findIndex((item) => item.id === itemId)
+  if (itemIndex === -1) {
+    return
+  }
+  setTermQAReportPage(Math.floor(itemIndex / termQAReportPageSize) + 1)
+}
+
+function findNextActiveTermQAReportItemAfter(itemIds: string[]) {
+  const items = termQAReport.value?.items || []
+  if (items.length === 0) {
+    return null
+  }
+  const ignoredIdSet = new Set(itemIds)
+  const ignoredIndexes = items
+    .map((item, index) => (ignoredIdSet.has(item.id) ? index : -1))
+    .filter((index) => index >= 0)
+  const startIndex = ignoredIndexes.length > 0
+    ? Math.max(...ignoredIndexes) + 1
+    : 0
+
+  for (let offset = 0; offset < items.length; offset += 1) {
+    const index = (startIndex + offset) % items.length
+    const candidate = items[index]
+    if (candidate && !candidate.ignored && !ignoredIdSet.has(candidate.id)) {
+      return candidate
+    }
+  }
+  return null
+}
+
+function updateCurrentTermQAReportItemsIgnored(itemIds: string[], ignored: boolean) {
+  const report = termQAReport.value
+  if (!report || itemIds.length === 0) {
+    return
+  }
+
+  const itemIdSet = new Set(itemIds)
+  const ignoredAt = new Date().toISOString()
+  let changed = false
+  const items = report.items.map((item) => {
+    if (!itemIdSet.has(item.id) || item.ignored === ignored) {
+      return item
+    }
+    changed = true
+    return {
+      ...item,
+      ignored,
+      status: ignored ? 'ignored' : 'open',
+      ignored_at: ignored ? (item.ignored_at || ignoredAt) : null,
+      ignored_by_id: ignored ? item.ignored_by_id : null,
+      ignored_by_name: ignored ? item.ignored_by_name : null,
+    } satisfies WorkbenchQAResultItem
+  })
+  if (!changed) {
+    return
+  }
+
+  const ignoredCount = items.filter((item) => item.ignored).length
+  termQAReport.value = {
+    ...report,
+    items,
+    active_issue_count: Math.max(items.length - ignoredCount, 0),
+    ignored_count: ignoredCount,
+  }
+  const activeIds = new Set(items.filter((item) => !item.ignored).map((item) => item.id))
+  selectedTermQAItemIds.value = new Set(
+    [...selectedTermQAItemIds.value].filter((id) => activeIds.has(id)),
+  )
+  setTermQAReportPage(termQAReportPage.value)
+}
+
 watch(
-  () => termQAReport.value?.items.length || 0,
+  () => filteredTermQAReportItems.value.length,
   () => setTermQAReportPage(termQAReportPage.value),
+)
+
+watch(
+  () => termQAReportFilter.value,
+  () => setTermQAReportPage(1),
 )
 
 watch(
@@ -4216,6 +4318,7 @@ async function setTermQAReportItemsIgnored(itemIds: string[], ignored: boolean) 
   if (!termQAReport.value || updatingTermQAIgnore.value || itemIds.length === 0) {
     return
   }
+  const nextItem = ignored ? findNextActiveTermQAReportItemAfter(itemIds) : null
   updatingTermQAIgnore.value = true
   try {
     await http.patch(
@@ -4225,7 +4328,11 @@ async function setTermQAReportItemsIgnored(itemIds: string[], ignored: boolean) 
         ignored,
       },
     )
-    await loadLatestTermQAReport()
+    updateCurrentTermQAReportItemsIgnored(itemIds, ignored)
+    if (nextItem) {
+      setTermQAReportPageForItem(nextItem.id)
+      await focusTermQAReportItem(nextItem)
+    }
     toast.success(ignored ? '已忽略所选 QA 问题。' : '已恢复所选 QA 问题。')
   } catch (error) {
     toast.error({
@@ -4241,6 +4348,7 @@ async function setSingleTermQAReportItemIgnored(item: WorkbenchQAResultItem, ign
   if (updatingTermQAIgnore.value) {
     return
   }
+  const nextItem = ignored ? findNextActiveTermQAReportItemAfter([item.id]) : null
   updatingTermQAIgnore.value = true
   try {
     await http.patch(
@@ -4250,7 +4358,11 @@ async function setSingleTermQAReportItemIgnored(item: WorkbenchQAResultItem, ign
         ignored,
       },
     )
-    await loadLatestTermQAReport()
+    updateCurrentTermQAReportItemsIgnored([item.id], ignored)
+    if (nextItem) {
+      setTermQAReportPageForItem(nextItem.id)
+      await focusTermQAReportItem(nextItem)
+    }
     toast.success(ignored ? '已忽略该 QA 问题。' : '已恢复该 QA 问题。')
   } catch (error) {
     toast.error({
@@ -8931,11 +9043,21 @@ onBeforeRouteLeave(async () => {
                   </div>
 
                   <div class="term-qa-dialog__actions">
+                    <select
+                      v-if="termQAReport && termQAReport.items.length > 0"
+                      v-model="termQAReportFilter"
+                      class="term-qa-dialog__filter-select"
+                      title="切换 QA 问题显示范围"
+                    >
+                      <option value="active">待处理</option>
+                      <option value="ignored">已忽略</option>
+                      <option value="all">全部</option>
+                    </select>
                     <button
                       v-if="termQAReport"
                       class="button button--ghost term-qa-dialog__action-button"
                       type="button"
-                      :disabled="activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
+                      :disabled="termQAReportFilter === 'ignored' || activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
                       title="全选未忽略"
                       @click="toggleAllActiveTermQAItems(!allActiveTermQAItemsSelected)"
                     >
@@ -8945,7 +9067,7 @@ onBeforeRouteLeave(async () => {
                       v-if="termQAReport"
                       class="button button--ghost term-qa-dialog__action-button"
                       type="button"
-                      :disabled="selectedActiveTermQAReportItems.length === 0 || updatingTermQAIgnore"
+                      :disabled="termQAReportFilter === 'ignored' || selectedActiveTermQAReportItems.length === 0 || updatingTermQAIgnore"
                       title="忽略选中的 QA 问题"
                       @click="void ignoreSelectedTermQAReportItems()"
                     >
@@ -9001,8 +9123,8 @@ onBeforeRouteLeave(async () => {
                 </div>
 
                 <template v-else-if="termQAReport">
-                  <div v-if="termQAReport.items.length === 0" class="empty-state">
-                    未发现已开启规则的 QA 问题。
+                  <div v-if="filteredTermQAReportItems.length === 0" class="empty-state">
+                    {{ termQAReportEmptyText }}
                   </div>
                   <div v-else class="term-qa-dialog__table-wrap">
                     <table class="term-qa-dialog__table">
@@ -9012,7 +9134,7 @@ onBeforeRouteLeave(async () => {
                             <input
                               type="checkbox"
                               :checked="allActiveTermQAItemsSelected"
-                              :disabled="activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
+                              :disabled="termQAReportFilter === 'ignored' || activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
                               aria-label="全选未忽略 QA 问题"
                               title="全选未忽略"
                               @change="toggleAllActiveTermQAItems(!allActiveTermQAItemsSelected)"
@@ -9098,7 +9220,7 @@ onBeforeRouteLeave(async () => {
                         </tr>
                       </tbody>
                     </table>
-                    <div v-if="termQAReport.items.length > termQAReportPageSize" class="term-qa-dialog__pager">
+                    <div v-if="filteredTermQAReportItems.length > termQAReportPageSize" class="term-qa-dialog__pager">
                       <span class="term-qa-dialog__pager-range">{{ termQAReportPageRangeText }}</span>
                       <div class="term-qa-dialog__pager-actions">
                         <button

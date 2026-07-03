@@ -1767,6 +1767,7 @@ class TMCollection(Base):
     __table_args__ = (
         Index("uq_memory_bases_name", "name", unique=True),
         Index("ix_memory_bases_language_pair", "source_language", "target_language"),
+        Index("ix_memory_bases_creator_id", "creator_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -1779,6 +1780,11 @@ class TMCollection(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
     target_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    creator_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -1793,6 +1799,7 @@ class TMCollection(Base):
         "TranslationMemory",
         back_populates="collection",
     )
+    creator: Mapped["User | None"] = relationship("User", foreign_keys=[creator_id])
 
 
 class TranslationMemory(Base):
@@ -2015,6 +2022,7 @@ class TermBase(Base):
     __table_args__ = (
         Index("uq_term_bases_name", "name", unique=True),
         Index("ix_term_bases_language_pair", "source_language", "target_language"),
+        Index("ix_term_bases_creator_id", "creator_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -2027,6 +2035,11 @@ class TermBase(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_language: Mapped[str] = mapped_column(String(20), nullable=False)
     target_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    creator_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -2042,6 +2055,7 @@ class TermBase(Base):
         back_populates="term_base",
         cascade="all, delete-orphan",
     )
+    creator: Mapped["User | None"] = relationship("User", foreign_keys=[creator_id])
 
 
 class TermEntry(Base):
@@ -2125,6 +2139,7 @@ class GlossaryBase(Base):
     __table_args__ = (
         Index("uq_glossary_bases_name", "name", unique=True),
         Index("ix_glossary_bases_language_pair", "source_language", "target_language"),
+        Index("ix_glossary_bases_creator_id", "creator_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -2137,6 +2152,11 @@ class GlossaryBase(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_language: Mapped[str] = mapped_column(String(20), nullable=False)
     target_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    creator_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -2152,6 +2172,7 @@ class GlossaryBase(Base):
         back_populates="glossary_base",
         cascade="all, delete-orphan",
     )
+    creator: Mapped["User | None"] = relationship("User", foreign_keys=[creator_id])
 
 
 class GlossaryEntry(Base):

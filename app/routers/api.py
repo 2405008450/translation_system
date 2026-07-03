@@ -5061,6 +5061,8 @@ def _serialize_tm_collection(collection: MemoryBase, entry_count: int = 0) -> di
         "description": collection.description,
         "source_language": collection.source_language,
         "target_language": collection.target_language,
+        "creator_id": str(collection.creator_id) if collection.creator_id else None,
+        "creator_name": _entry_user_name(collection.creator),
         "created_at": collection.created_at.isoformat(),
         "updated_at": collection.updated_at.isoformat(),
         "entry_count": entry_count,
@@ -12213,12 +12215,18 @@ def export_file_record_with_type(
     ]
 
     try:
-        exported_bytes, mime_type, export_filename = export_file(
-            export_type=export_type,
-            segments=segment_dicts,
-            filename=file_record.filename,
-            original_bytes=raw_bytes,
-        )
+        export_kwargs = {
+            "export_type": export_type,
+            "segments": segment_dicts,
+            "filename": file_record.filename,
+            "original_bytes": raw_bytes,
+        }
+        if export_type in {"tmx", "xliff", "xliff2"}:
+            source_language, target_language = _resolve_file_record_language_pair(file_record)
+            export_kwargs["source_lang"] = source_language
+            export_kwargs["target_lang"] = target_language
+
+        exported_bytes, mime_type, export_filename = export_file(**export_kwargs)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -13177,6 +13185,7 @@ def save_file_record_segments_to_tm(
             description=f"由任务「{file_record.filename}」保存生成",
             source_language=source_language,
             target_language=target_language,
+            creator_id=current_user.id,
         )
         db.add(collection)
         db.flush()
@@ -14400,7 +14409,7 @@ def get_tm_collection(
 def create_tm_collection(
     payload: MemoryBasePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_resource_creator),
+    current_user: User = Depends(require_resource_creator),
 ):
     name = _normalize_collection_name(payload.name)
     source_language, target_language = _require_tm_language_pair(
@@ -14415,6 +14424,7 @@ def create_tm_collection(
         description=normalize_text(payload.description or "") or None,
         source_language=source_language,
         target_language=target_language,
+        creator_id=current_user.id,
     )
     db.add(collection)
     try:
@@ -14518,6 +14528,7 @@ def merge_tm_collections(
         description=normalize_text(payload.description or "") or None,
         source_language=source_language,
         target_language=target_language,
+        creator_id=current_user.id,
     )
     db.add(target_collection)
     try:
@@ -15543,6 +15554,8 @@ def _serialize_termbase_collection(collection: TermBase, entry_count: int = 0) -
         "description": collection.description,
         "source_language": collection.source_language,
         "target_language": collection.target_language,
+        "creator_id": str(collection.creator_id) if collection.creator_id else None,
+        "creator_name": get_user_display_name(collection.creator),
         "created_at": collection.created_at.isoformat(),
         "updated_at": collection.updated_at.isoformat(),
         "entry_count": entry_count,
@@ -15580,7 +15593,7 @@ def list_termbase_collections(
 def create_termbase_collection(
     payload: TermBasePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     name = _normalize_collection_name(payload.name)
     if not name:
@@ -15591,6 +15604,7 @@ def create_termbase_collection(
         description=normalize_text(payload.description or "") or None,
         source_language=payload.source_language,
         target_language=payload.target_language,
+        creator_id=current_user.id,
     )
     db.add(collection)
     try:
