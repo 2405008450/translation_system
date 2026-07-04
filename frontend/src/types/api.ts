@@ -255,6 +255,9 @@ export interface DocumentStatistics {
   engine_version: string | null
   license_status: string | null
   include_textboxes_footnotes_endnotes: boolean | null
+  statistics_profile: string | null
+  content_scope: string | null
+  statistics_warnings: string[]
   match_analysis: DocumentMatchAnalysis | null
   pages: number | null
   words: number | null
@@ -268,6 +271,13 @@ export interface DocumentStatistics {
   internal_repeated_characters: number | null
   cross_file_repeated_words: number | null
   cross_file_repeated_characters: number | null
+  image_count: number | null
+  unique_image_count: number | null
+  inline_image_count: number | null
+  floating_image_count: number | null
+  linked_image_count: number | null
+  chart_count: number | null
+  smartart_count: number | null
 }
 
 export interface DocumentMatchAnalysisRow {
@@ -286,6 +296,18 @@ export interface DocumentMatchAnalysis {
   rows: DocumentMatchAnalysisRow[]
 }
 
+export interface PretranslationMatchAnalysisPreviewResponse {
+  analysis: DocumentMatchAnalysis
+  remaining_new_segments: number
+  remaining_new_words: number
+  tm_applied_segments: number
+  tm_applied_words: number
+  repeat_segments: number
+  repeat_words: number
+  skipped_confirmed_segments: number
+  skipped_confirmed_words: number
+}
+
 export interface DocumentStatisticsTotals {
   pages: number | null
   words: number | null
@@ -299,6 +321,13 @@ export interface DocumentStatisticsTotals {
   internal_repeated_characters: number | null
   cross_file_repeated_words: number | null
   cross_file_repeated_characters: number | null
+  image_count: number | null
+  unique_image_count: number | null
+  inline_image_count: number | null
+  floating_image_count: number | null
+  linked_image_count: number | null
+  chart_count: number | null
+  smartart_count: number | null
   match_analysis: DocumentMatchAnalysis | null
 }
 

@@ -124,6 +124,13 @@ type DocumentStatisticNumberKey =
   | 'internal_repeated_characters'
   | 'cross_file_repeated_words'
   | 'cross_file_repeated_characters'
+  | 'image_count'
+  | 'unique_image_count'
+  | 'inline_image_count'
+  | 'floating_image_count'
+  | 'linked_image_count'
+  | 'chart_count'
+  | 'smartart_count'
 
 interface ProjectDetail {
   id: string
@@ -315,6 +322,13 @@ const DOCUMENT_STATISTIC_NUMBER_KEYS: DocumentStatisticNumberKey[] = [
   'internal_repeated_characters',
   'cross_file_repeated_words',
   'cross_file_repeated_characters',
+  'image_count',
+  'unique_image_count',
+  'inline_image_count',
+  'floating_image_count',
+  'linked_image_count',
+  'chart_count',
+  'smartart_count',
 ]
 
 const DOCUMENT_MATCH_ANALYSIS_ROW_KEYS = [
@@ -1585,6 +1599,13 @@ function createEmptyStatisticsTotals(): DocumentStatisticsTotals {
     internal_repeated_characters: null,
     cross_file_repeated_words: null,
     cross_file_repeated_characters: null,
+    image_count: null,
+    unique_image_count: null,
+    inline_image_count: null,
+    floating_image_count: null,
+    linked_image_count: null,
+    chart_count: null,
+    smartart_count: null,
     match_analysis: null,
   }
 }
@@ -1849,7 +1870,7 @@ function getStatisticsStatusClass(statistics: DocumentStatistics | null | undefi
   if (statistics.source === 'aspose' || statistics.source === 'libreoffice') {
     return 'project-status--success'
   }
-  if (statistics.source === 'openxml_computed') {
+  if (statistics.source === 'openxml_computed' || statistics.source === 'openxml_word_like') {
     return 'project-status--info'
   }
   if (statistics.source === 'docprops_cached') {
@@ -7101,16 +7122,19 @@ onBeforeUnmount(() => {
               <span>{{ t('projectDetail.stats.columns.charactersWithSpaces') }}</span>
               <strong>{{ formatStatisticNumber(statisticsTotals.characters_with_spaces) }}</strong>
             </div>
+            <div class="pd-statistics-summary__item">
+              <span>图片数</span>
+              <strong>{{ formatStatisticNumber(statisticsTotals.image_count) }}</strong>
+            </div>
           </div>
 
           <div v-if="statisticsMatchAnalysisRows.length > 0" class="pd-statistics-match-analysis">
             <div class="pd-statistics-subhead">
               <div class="section-title section-title--tight">{{ t('projectDetail.stats.matchAnalysis.summaryTitle') }}</div>
               <span>
-                {{ t('projectDetail.stats.matchAnalysis.meta', {
-                  threshold: formatStatisticPercent((statisticsMatchAnalysis?.threshold ?? 0.5) * 100),
-                  count: statisticsMatchAnalysis?.collection_ids.length ?? 0,
-                }) }}
+                统计阈值 {{ formatStatisticPercent((statisticsMatchAnalysis?.threshold ?? 0.5) * 100) }}
+                · 已选记忆库 {{ statisticsMatchAnalysis?.collection_ids.length ?? 0 }} 个
+                · 字数按 Word-like OpenXML 口径统计
               </span>
             </div>
             <div class="pd-statistics-grid-wrap pd-statistics-grid-wrap--match">
@@ -7201,6 +7225,10 @@ onBeforeUnmount(() => {
                   <th>{{ t('projectDetail.stats.columns.charactersWithSpaces') }}</th>
                   <th>{{ t('projectDetail.stats.columns.paragraphs') }}</th>
                   <th>{{ t('projectDetail.stats.columns.lines') }}</th>
+                  <th>图片数</th>
+                  <th>去重图片数</th>
+                  <th>图表数</th>
+                  <th>SmartArt 数</th>
                   <th>{{ t('projectDetail.stats.columns.license') }}</th>
                 </tr>
               </thead>
@@ -7218,6 +7246,10 @@ onBeforeUnmount(() => {
                   <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'characters_with_spaces')) }}</td>
                   <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'paragraphs')) }}</td>
                   <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'lines')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'image_count')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'unique_image_count')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'chart_count')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'smartart_count')) }}</td>
                   <td>{{ getStatisticsLicenseLabel(row.statistics) }}</td>
                 </tr>
               </tbody>
@@ -7233,6 +7265,10 @@ onBeforeUnmount(() => {
                   <td>{{ formatStatisticNumber(statisticsTotals.characters_with_spaces) }}</td>
                   <td>{{ formatStatisticNumber(statisticsTotals.paragraphs) }}</td>
                   <td>{{ formatStatisticNumber(statisticsTotals.lines) }}</td>
+                  <td>{{ formatStatisticNumber(statisticsTotals.image_count) }}</td>
+                  <td>{{ formatStatisticNumber(statisticsTotals.unique_image_count) }}</td>
+                  <td>{{ formatStatisticNumber(statisticsTotals.chart_count) }}</td>
+                  <td>{{ formatStatisticNumber(statisticsTotals.smartart_count) }}</td>
                   <td>{{ getPlaceholder() }}</td>
                 </tr>
               </tfoot>

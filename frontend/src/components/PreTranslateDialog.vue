@@ -7,7 +7,16 @@ import { http } from '../api/http'
 import { canonicalizeLanguagePair, formatLanguagePair } from '../constants/languages'
 import { defaultLLMModelId, llmModelOptions as baseLLMModelOptions } from '../constants/llm'
 import { pushToast } from '../composables/useToast'
-import type { GlossaryBase, GuidelineTemplateSummary, LLMProvider, LLMTranslateScope, TermBase, TMCollection } from '../types/api'
+import type {
+  DocumentMatchAnalysisRow,
+  GlossaryBase,
+  GuidelineTemplateSummary,
+  LLMProvider,
+  LLMTranslateScope,
+  PretranslationMatchAnalysisPreviewResponse,
+  TermBase,
+  TMCollection,
+} from '../types/api'
 import { consumeLLMStream } from '../utils/llmStream'
 import { isProgressComplete } from '../utils/progress'
 import ResourceImportDialog from './ResourceImportDialog.vue'
@@ -88,6 +97,7 @@ type LanguagePairStat = {
   target: string | null
   fileCount: number
 }
+type WorkloadPreviewDisplayRow = DocumentMatchAnalysisRow & { isTotal?: boolean }
 
 const props = defineProps<{
   open: boolean
@@ -109,6 +119,7 @@ const LOCK_HEARTBEAT_INTERVAL_MS = 30_000
 const LLM_STREAM_IDLE_TIMEOUT_MS = 150_000
 const RELEASE_LOCK_RETRY_DELAYS_MS = [600, 1_500, 3_000]
 const PRETRANSLATION_POLL_INTERVAL_MS = 2_000
+const PRETRANSLATION_WORKLOAD_PREVIEW_DEBOUNCE_MS = 500
 const ACTIVE_PRETRANSLATION_STATUSES = new Set(['queued', 'running', 'canceling'])
 
 const { t } = useI18n()
@@ -131,6 +142,11 @@ const tmThreshold = ref(0.75)
 const tmSkipConfirmed = ref(true)
 const tmOverwriteFuzzy = ref(true)
 const tmAutoConfirmExact = ref(true)
+const workloadPreview = ref<PretranslationMatchAnalysisPreviewResponse | null>(null)
+const workloadPreviewLoading = ref(false)
+const workloadPreviewError = ref('')
+const workloadPreviewTimer = ref<number | null>(null)
+let workloadPreviewRequestSeq = 0
 
 const useLlm = ref(false)
 const llmScope = ref<LLMTranslateScope>('all')
@@ -301,6 +317,15 @@ const selectedTmCollectionIds = computed(() => (
 
 const shouldRunTm = computed(() => useTm.value && selectedTmCollectionIds.value.length > 0)
 
+const canLoadWorkloadPreview = computed(() => (
+  props.open
+  && Boolean(props.projectId)
+  && useTm.value
+  && selectedTmCollectionIds.value.length > 0
+  && props.files.length > 0
+  && !languagePairIssue.value
+))
+
 const availableTermBases = computed(() => {
   return termBases.value.filter((termBase) => resourceMatchesSelectedLanguagePair(termBase))
 })
@@ -367,6 +392,22 @@ const configuredActionCount = computed(() => (
 const progressFiles = computed(() => (
   runFiles.value.length > 0 ? runFiles.value : props.files
 ))
+const workloadPreviewRows = computed<WorkloadPreviewDisplayRow[]>(() => {
+  const analysis = workloadPreview.value?.analysis
+  if (!analysis) {
+    return []
+  }
+  const rows: WorkloadPreviewDisplayRow[] = analysis.rows.map((row) => ({ ...row }))
+  rows.push({
+    key: 'total',
+    label: '总计',
+    segment_count: analysis.total_segments,
+    word_count: analysis.total_words,
+    percent: analysis.total_words > 0 ? 100 : 0,
+    isTotal: true,
+  })
+  return rows
+})
 
 const resourceImportDialogTab = computed<ResourceImportTab>(() => activeResourceImportTab.value || 'tm')
 
@@ -397,6 +438,85 @@ function normalizeTMThreshold(value: unknown) {
     return 0.75
   }
   return Math.min(1, Math.max(0.5, Math.round(numericValue * 100) / 100))
+}
+
+function formatWorkloadNumber(value: number | null | undefined) {
+  const numericValue = Number(value || 0)
+  return new Intl.NumberFormat('zh-CN').format(Math.max(0, Math.round(numericValue)))
+}
+
+function formatWorkloadPercent(value: number | null | undefined) {
+  const numericValue = Number(value || 0)
+  const safeValue = Number.isFinite(numericValue) ? numericValue : 0
+  return `${safeValue.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}%`
+}
+
+function workloadPreviewThresholdLabel() {
+  return `${Math.round(normalizeTMThreshold(tmThreshold.value) * 100)}%`
+}
+
+function clearWorkloadPreviewTimer() {
+  if (workloadPreviewTimer.value !== null) {
+    window.clearTimeout(workloadPreviewTimer.value)
+    workloadPreviewTimer.value = null
+  }
+}
+
+function resetWorkloadPreview() {
+  clearWorkloadPreviewTimer()
+  workloadPreview.value = null
+  workloadPreviewError.value = ''
+  workloadPreviewLoading.value = false
+}
+
+function scheduleWorkloadPreview() {
+  clearWorkloadPreviewTimer()
+  if (!canLoadWorkloadPreview.value) {
+    resetWorkloadPreview()
+    return
+  }
+  workloadPreviewTimer.value = window.setTimeout(() => {
+    void loadWorkloadPreview()
+  }, PRETRANSLATION_WORKLOAD_PREVIEW_DEBOUNCE_MS)
+}
+
+async function loadWorkloadPreview() {
+  if (!canLoadWorkloadPreview.value || !props.projectId) {
+    resetWorkloadPreview()
+    return
+  }
+
+  const requestSeq = ++workloadPreviewRequestSeq
+  workloadPreviewLoading.value = true
+  workloadPreviewError.value = ''
+  try {
+    const { data } = await http.post<PretranslationMatchAnalysisPreviewResponse>(
+      `/projects/${props.projectId}/pretranslation-match-analysis-preview`,
+      {
+        file_ids: props.files.map((file) => file.id),
+        tm_collection_ids: selectedTmCollectionIds.value,
+        tm_threshold: normalizeTMThreshold(tmThreshold.value),
+        tm_skip_confirmed: tmSkipConfirmed.value,
+      },
+    )
+    if (requestSeq !== workloadPreviewRequestSeq) {
+      return
+    }
+    workloadPreview.value = data
+  } catch (error) {
+    if (requestSeq !== workloadPreviewRequestSeq) {
+      return
+    }
+    const responseDetail = (error as { response?: { data?: { detail?: unknown } } }).response?.data?.detail
+    workloadPreview.value = null
+    workloadPreviewError.value = typeof responseDetail === 'string'
+      ? responseDetail
+      : '工作量预估失败，请稍后重试。'
+  } finally {
+    if (requestSeq === workloadPreviewRequestSeq) {
+      workloadPreviewLoading.value = false
+    }
+  }
 }
 
 function applyTMThresholdDefaultFromFiles() {
@@ -455,6 +575,21 @@ watch(llmProvider, (provider) => {
     llmModel.value = ''
   }
 })
+
+watch(
+  () => [
+    props.open ? '1' : '0',
+    props.projectId || '',
+    props.files.map((file) => file.id).join('|'),
+    useTm.value ? '1' : '0',
+    selectedTmCollectionIds.value.join('|'),
+    normalizeTMThreshold(tmThreshold.value).toFixed(2),
+    tmSkipConfirmed.value ? '1' : '0',
+    languagePairIssue.value,
+  ],
+  () => scheduleWorkloadPreview(),
+  { immediate: true },
+)
 
 function resetProgress() {
   finishedCount.value = 0
@@ -1408,6 +1543,8 @@ async function stopPreTranslateTaskRun() {
 }
 
 onBeforeUnmount(() => {
+  clearWorkloadPreviewTimer()
+  workloadPreviewRequestSeq += 1
   stopPretranslationPolling()
 })
 
@@ -1589,6 +1726,74 @@ onBeforeUnmount(() => {
             <label><input v-model="tmSkipConfirmed" type="checkbox" :disabled="running || !useTm" />{{ t('projectDetail.preTranslate.tm.skipConfirmed') }}</label>
             <label><input v-model="tmOverwriteFuzzy" type="checkbox" :disabled="running || !useTm" />{{ t('projectDetail.preTranslate.tm.overwriteFuzzy') }}</label>
             <label><input v-model="tmAutoConfirmExact" type="checkbox" :disabled="running || !useTm" />{{ t('projectDetail.preTranslate.tm.autoConfirmExact') }}</label>
+          </div>
+
+          <div
+            v-if="useTm && selectedTmCollectionIds.length > 0"
+            class="ptd-workload-preview"
+          >
+            <div class="ptd-workload-preview__head">
+              <div>
+                <strong>TM 工作量预估</strong>
+                <span>按 {{ workloadPreviewThresholdLabel() }} 阈值，只统计每个句段的最佳命中</span>
+              </div>
+              <Loader2 v-if="workloadPreviewLoading" class="lucide-spin" :size="15" />
+            </div>
+            <div v-if="workloadPreviewError" class="ptd-workload-preview__empty is-error">
+              {{ workloadPreviewError }}
+            </div>
+            <div v-else-if="workloadPreview" class="ptd-workload-preview__body">
+              <div class="ptd-workload-preview__summary">
+                <div>
+                  <span>待处理新字</span>
+                  <strong>{{ formatWorkloadNumber(workloadPreview.remaining_new_words) }}</strong>
+                  <small>{{ formatWorkloadNumber(workloadPreview.remaining_new_segments) }} 句段</small>
+                </div>
+                <div>
+                  <span>TM 可预翻译</span>
+                  <strong>{{ formatWorkloadNumber(workloadPreview.tm_applied_words) }}</strong>
+                  <small>{{ formatWorkloadNumber(workloadPreview.tm_applied_segments) }} 句段</small>
+                </div>
+                <div>
+                  <span>重复可复用</span>
+                  <strong>{{ formatWorkloadNumber(workloadPreview.repeat_words) }}</strong>
+                  <small>{{ formatWorkloadNumber(workloadPreview.repeat_segments) }} 句段</small>
+                </div>
+              </div>
+              <div class="ptd-workload-preview__table-wrap">
+                <table class="ptd-workload-preview__table">
+                  <thead>
+                    <tr>
+                      <th>类别</th>
+                      <th>%</th>
+                      <th>句段</th>
+                      <th>字数</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr
+                      v-for="row in workloadPreviewRows"
+                      :key="row.key"
+                      :class="{ 'is-total': row.isTotal }"
+                    >
+                      <td>{{ row.label }}</td>
+                      <td>{{ formatWorkloadPercent(row.percent) }}</td>
+                      <td>{{ formatWorkloadNumber(row.segment_count) }}</td>
+                      <td>{{ formatWorkloadNumber(row.word_count) }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <p
+                v-if="workloadPreview.skipped_confirmed_segments > 0"
+                class="ptd-workload-preview__note"
+              >
+                已按“跳过已确认”排除 {{ formatWorkloadNumber(workloadPreview.skipped_confirmed_segments) }} 句段，{{ formatWorkloadNumber(workloadPreview.skipped_confirmed_words) }} 字。
+              </p>
+            </div>
+            <div v-else class="ptd-workload-preview__empty">
+              正在准备工作量预估
+            </div>
           </div>
         </div>
 
@@ -2711,6 +2916,154 @@ onBeforeUnmount(() => {
   accent-color: var(--ptd-accent-strong);
 }
 
+.ptd-workload-preview {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 7%, var(--line-soft));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-1) 98%, var(--ptd-accent) 2%);
+}
+
+.ptd-workload-preview__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ptd-workload-preview__head > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.ptd-workload-preview__head strong {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.ptd-workload-preview__head span,
+.ptd-workload-preview__note {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.ptd-workload-preview__body {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ptd-workload-preview__summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.ptd-workload-preview__summary > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 6%, var(--line-soft));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-panel) 98%, var(--ptd-accent) 2%);
+}
+
+.ptd-workload-preview__summary span,
+.ptd-workload-preview__summary small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.ptd-workload-preview__summary strong {
+  overflow-wrap: anywhere;
+  color: var(--text-primary);
+  font-size: 20px;
+  font-weight: 750;
+  line-height: 1.1;
+}
+
+.ptd-workload-preview__table-wrap {
+  min-width: 0;
+  overflow-x: auto;
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 5%, var(--line-soft));
+  border-radius: 8px;
+  background: var(--surface-panel);
+}
+
+.ptd-workload-preview__table {
+  width: 100%;
+  min-width: 420px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.ptd-workload-preview__table th,
+.ptd-workload-preview__table td {
+  padding: 7px 9px;
+  border-bottom: 1px solid color-mix(in srgb, var(--ptd-accent) 4%, var(--line-soft));
+  text-align: right;
+  white-space: nowrap;
+}
+
+.ptd-workload-preview__table th:first-child,
+.ptd-workload-preview__table td:first-child {
+  text-align: left;
+}
+
+.ptd-workload-preview__table th {
+  color: var(--text-muted);
+  font-weight: 650;
+  background: color-mix(in srgb, var(--surface-muted) 98%, var(--ptd-accent) 2%);
+}
+
+.ptd-workload-preview__table td {
+  color: var(--text-secondary);
+}
+
+.ptd-workload-preview__table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.ptd-workload-preview__table tr.is-total td {
+  color: var(--text-primary);
+  font-weight: 700;
+  background: color-mix(in srgb, var(--surface-muted) 96%, var(--ptd-accent) 4%);
+}
+
+.ptd-workload-preview__note {
+  margin: 0;
+}
+
+.ptd-workload-preview__empty {
+  display: grid;
+  place-items: center;
+  min-height: 46px;
+  padding: 10px;
+  border: 1px dashed var(--line-soft);
+  border-radius: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: center;
+  background: var(--surface-1);
+}
+
+.ptd-workload-preview__empty.is-error {
+  border-color: color-mix(in srgb, var(--state-danger) 28%, var(--line-soft));
+  color: var(--state-danger);
+  background: var(--state-danger-bg);
+}
+
 .ptd-section .field {
   min-width: 0;
   padding: 10px;
@@ -2874,6 +3227,7 @@ onBeforeUnmount(() => {
   .ptd-flow,
   .ptd-grid--threshold,
   .ptd-grid--llm,
+  .ptd-workload-preview__summary,
   .ptd-guideline-tools,
   .ptd-section--llm .ptd-grid--llm,
   .ptd-section--llm .ptd-guideline-tools {

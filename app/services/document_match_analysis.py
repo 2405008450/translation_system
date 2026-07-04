@@ -51,7 +51,7 @@ class DocumentMatchSegment:
 
 
 Matcher = Callable[
-    [Session | None, list[str], list[str], list[UUID]],
+    [Session | None, list[str], list[str], list[UUID], float],
     Sequence[MatchResult],
 ]
 
@@ -65,10 +65,18 @@ def compute_document_match_analysis(
     file_segments: Mapping[UUID, Iterable[DocumentMatchSegment]],
     *,
     matcher: Matcher | None = None,
+    match_threshold: float = MATCH_ANALYSIS_THRESHOLD,
+    applied_threshold: float | None = None,
+    include_workload: bool = False,
 ) -> dict[UUID, dict[str, Any]]:
     """按互斥报价口径统计句段级重复和 TM 匹配区间。"""
     matcher = matcher or _match_segments_with_tm
+    analysis_threshold = _normalize_threshold(match_threshold)
+    workload_threshold = _normalize_threshold(
+        applied_threshold if applied_threshold is not None else analysis_threshold
+    )
     counts_by_file = {file_id: _empty_counts() for file_id in file_segments}
+    workload_by_file = {file_id: _empty_workload_counts() for file_id in file_segments}
     collection_ids_by_file: dict[UUID, list[UUID]] = {
         file_id: [] for file_id in file_segments
     }
@@ -89,12 +97,15 @@ def compute_document_match_analysis(
 
             if not source_hash:
                 _add_to_counts(counts_by_file[file_id], "new", word_count)
+                _add_to_workload(workload_by_file[file_id], "remaining_new", word_count)
                 continue
 
             if source_hash in seen_hashes_by_file[file_id]:
                 _add_to_counts(counts_by_file[file_id], "internal_repeat", word_count)
+                _add_to_workload(workload_by_file[file_id], "repeat", word_count)
             elif any(seen_file_id != file_id for seen_file_id in seen_files_by_hash[source_hash]):
                 _add_to_counts(counts_by_file[file_id], "cross_file_repeat", word_count)
+                _add_to_workload(workload_by_file[file_id], "repeat", word_count)
             else:
                 pending_tm_segments.append(segment)
 
@@ -104,27 +115,45 @@ def compute_document_match_analysis(
     for collection_ids, grouped_segments in _group_segments_for_tm(pending_tm_segments).items():
         if not collection_ids:
             for segment in grouped_segments:
-                _add_to_counts(counts_by_file[segment.file_id], "new", _segment_word_count(segment))
+                word_count = _segment_word_count(segment)
+                _add_to_counts(counts_by_file[segment.file_id], "new", word_count)
+                _add_to_workload(workload_by_file[segment.file_id], "remaining_new", word_count)
             continue
 
         source_sentences = [segment.source_text for segment in grouped_segments]
         auxiliary_sentences = [segment.display_text or segment.source_text for segment in grouped_segments]
-        matches = matcher(db, source_sentences, auxiliary_sentences, list(collection_ids))
+        matches = matcher(db, source_sentences, auxiliary_sentences, list(collection_ids), analysis_threshold)
         for segment, match in zip(grouped_segments, matches, strict=False):
-            bucket = _bucket_for_tm_match(match)
-            _add_to_counts(counts_by_file[segment.file_id], bucket, _segment_word_count(segment))
+            bucket = _bucket_for_tm_match(match, match_threshold=analysis_threshold)
+            word_count = _segment_word_count(segment)
+            _add_to_counts(counts_by_file[segment.file_id], bucket, word_count)
+            if _tm_match_applies_at_threshold(match, workload_threshold):
+                _add_to_workload(workload_by_file[segment.file_id], "tm_applied", word_count)
+            else:
+                _add_to_workload(workload_by_file[segment.file_id], "remaining_new", word_count)
 
         if len(matches) < len(grouped_segments):
             for segment in grouped_segments[len(matches) :]:
-                _add_to_counts(counts_by_file[segment.file_id], "new", _segment_word_count(segment))
+                word_count = _segment_word_count(segment)
+                _add_to_counts(counts_by_file[segment.file_id], "new", word_count)
+                _add_to_workload(workload_by_file[segment.file_id], "remaining_new", word_count)
 
-    return {
-        file_id: _build_match_analysis(
+    result: dict[UUID, dict[str, Any]] = {}
+    for file_id in file_segments:
+        analysis = _build_match_analysis(
             counts_by_file[file_id],
             collection_ids=collection_ids_by_file.get(file_id, []),
+            threshold=analysis_threshold,
         )
-        for file_id in file_segments
-    }
+        if include_workload:
+            analysis.update(
+                _build_workload_summary(
+                    workload_by_file[file_id],
+                    applied_threshold=workload_threshold,
+                )
+            )
+        result[file_id] = analysis
+    return result
 
 
 def merge_document_match_analyses(analyses: Iterable[Any]) -> dict[str, Any]:
@@ -222,6 +251,7 @@ def _match_segments_with_tm(
     source_sentences: list[str],
     auxiliary_sentences: list[str],
     collection_ids: list[UUID],
+    match_threshold: float,
 ) -> Sequence[MatchResult]:
     if db is None:
         return []
@@ -229,13 +259,17 @@ def _match_segments_with_tm(
         db=db,
         sentences=source_sentences,
         auxiliary_sentences=auxiliary_sentences,
-        similarity_threshold=MATCH_ANALYSIS_THRESHOLD,
+        similarity_threshold=match_threshold,
         collection_ids=collection_ids,
     )
     return matches
 
 
-def _bucket_for_tm_match(match: MatchResult | Any) -> str:
+def _bucket_for_tm_match(
+    match: MatchResult | Any,
+    *,
+    match_threshold: float = MATCH_ANALYSIS_THRESHOLD,
+) -> str:
     status = str(getattr(match, "status", "") or "")
     try:
         score = float(getattr(match, "score", 0) or 0)
@@ -244,7 +278,7 @@ def _bucket_for_tm_match(match: MatchResult | Any) -> str:
 
     if status == "exact" or score >= 0.999:
         return "tm_100"
-    if status != "fuzzy" and score < MATCH_ANALYSIS_THRESHOLD:
+    if status != "fuzzy" and score < match_threshold:
         return "new"
     if score >= 0.95:
         return "tm_95_99"
@@ -252,9 +286,21 @@ def _bucket_for_tm_match(match: MatchResult | Any) -> str:
         return "tm_85_94"
     if score >= 0.75:
         return "tm_75_84"
-    if score >= MATCH_ANALYSIS_THRESHOLD:
+    if score >= match_threshold:
         return "tm_50_74"
     return "new"
+
+
+def _tm_match_applies_at_threshold(match: MatchResult | Any, threshold: float) -> bool:
+    status = str(getattr(match, "status", "") or "")
+    try:
+        score = float(getattr(match, "score", 0) or 0)
+    except (TypeError, ValueError):
+        score = 0.0
+
+    if status == "exact" or score >= 0.999:
+        return True
+    return status == "fuzzy" and score >= threshold
 
 
 def _group_segments_for_tm(
@@ -270,6 +316,14 @@ def _empty_counts() -> dict[str, dict[str, int]]:
     return {
         key: {"segment_count": 0, "word_count": 0}
         for key in MATCH_ANALYSIS_ROW_ORDER
+    }
+
+
+def _empty_workload_counts() -> dict[str, dict[str, int]]:
+    return {
+        "remaining_new": {"segment_count": 0, "word_count": 0},
+        "tm_applied": {"segment_count": 0, "word_count": 0},
+        "repeat": {"segment_count": 0, "word_count": 0},
     }
 
 
@@ -325,6 +379,31 @@ def _add_to_counts(counts: dict[str, dict[str, int]], key: str, word_count: int)
     bucket["word_count"] += max(int(word_count or 0), 0)
 
 
+def _add_to_workload(counts: dict[str, dict[str, int]], key: str, word_count: int) -> None:
+    bucket = counts.setdefault(key, {"segment_count": 0, "word_count": 0})
+    bucket["segment_count"] += 1
+    bucket["word_count"] += max(int(word_count or 0), 0)
+
+
+def _build_workload_summary(
+    counts: dict[str, dict[str, int]],
+    *,
+    applied_threshold: float,
+) -> dict[str, Any]:
+    remaining_new = counts.get("remaining_new", {})
+    tm_applied = counts.get("tm_applied", {})
+    repeats = counts.get("repeat", {})
+    return {
+        "applied_threshold": float(applied_threshold),
+        "remaining_new_segments": _to_int(remaining_new.get("segment_count")),
+        "remaining_new_words": _to_int(remaining_new.get("word_count")),
+        "tm_applied_segments": _to_int(tm_applied.get("segment_count")),
+        "tm_applied_words": _to_int(tm_applied.get("word_count")),
+        "repeat_segments": _to_int(repeats.get("segment_count")),
+        "repeat_words": _to_int(repeats.get("word_count")),
+    }
+
+
 def _build_match_analysis(
     counts: dict[str, dict[str, int]],
     *,
@@ -378,3 +457,15 @@ def _to_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _normalize_threshold(value: float | int | str | None) -> float:
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        numeric_value = MATCH_ANALYSIS_THRESHOLD
+    if numeric_value < MATCH_ANALYSIS_THRESHOLD:
+        return MATCH_ANALYSIS_THRESHOLD
+    if numeric_value > 1:
+        return 1.0
+    return round(numeric_value, 2)

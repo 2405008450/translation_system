@@ -1570,6 +1570,13 @@ class PretranslationRunRequest(BaseModel):
     temporary_prompt: str = Field(default="", max_length=8000)
 
 
+class PretranslationMatchAnalysisPreviewRequest(BaseModel):
+    file_ids: list[UUID] = Field(default_factory=list)
+    tm_collection_ids: list[UUID] = Field(default_factory=list)
+    tm_threshold: float = Field(default=0.75, ge=0.5, le=1.0)
+    tm_skip_confirmed: bool = True
+
+
 PRETRANSLATION_ACTIVE_STATUSES = {"queued", "running", "canceling"}
 PRETRANSLATION_TERMINAL_STATUSES = {"completed", "failed", "canceled"}
 
@@ -2176,6 +2183,77 @@ def _run_pretranslation_run(run_id: UUID) -> None:
             db.commit()
 
 
+@router.post("/projects/{project_id}/pretranslation-match-analysis-preview")
+def preview_pretranslation_match_analysis(
+    project_id: UUID,
+    payload: PretranslationMatchAnalysisPreviewRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    project = _get_project_or_404(db, project_id)
+    _require_project_read_access(project, current_user, db)
+
+    file_ids = list(dict.fromkeys(payload.file_ids))
+    if not file_ids:
+        raise HTTPException(status_code=400, detail="请至少选择一个文件进行预估。")
+
+    selected_collection_ids = _require_selected_collection_ids(
+        _validate_collection_ids(db, payload.tm_collection_ids)
+    )
+    threshold = round(float(payload.tm_threshold), 2)
+    if threshold < 0.5 or threshold > 1:
+        raise HTTPException(status_code=400, detail="TM 匹配阈值必须在 0.50 到 1.00 之间。")
+
+    files = (
+        db.query(FileRecord)
+        .filter(FileRecord.project_id == project_id, FileRecord.id.in_(file_ids))
+        .all()
+    )
+    files_by_id = {file_record.id: file_record for file_record in files}
+    missing_ids = [file_id for file_id in file_ids if file_id not in files_by_id]
+    if missing_ids:
+        raise HTTPException(status_code=404, detail="选择的文件不存在或不属于当前项目。")
+
+    ordered_files = [files_by_id[file_id] for file_id in file_ids]
+    collections = (
+        db.query(MemoryBase)
+        .filter(MemoryBase.id.in_(selected_collection_ids))
+        .all()
+    )
+    for file_record in ordered_files:
+        _require_file_record_work_access(file_record, current_user)
+        source_language, target_language = _resolve_file_record_language_pair(file_record)
+        for collection in collections:
+            _ensure_resource_language_pair_matches(collection, source_language, target_language, "记忆库")
+
+    file_segments, skipped_confirmed = _load_pretranslation_match_analysis_segments_for_files(
+        db,
+        ordered_files,
+        collection_ids=selected_collection_ids,
+        skip_confirmed=payload.tm_skip_confirmed,
+    )
+    analysis_by_file_id = compute_document_match_analysis(
+        db,
+        file_segments,
+        applied_threshold=threshold,
+        include_workload=True,
+    )
+    analysis = merge_document_match_analyses(analysis_by_file_id.values())
+    workload = _sum_pretranslation_match_workload(analysis_by_file_id.values())
+
+    return {
+        "analysis": analysis,
+        "remaining_new_segments": workload["remaining_new_segments"],
+        "remaining_new_words": workload["remaining_new_words"],
+        "tm_applied_segments": workload["tm_applied_segments"],
+        "tm_applied_words": workload["tm_applied_words"],
+        "repeat_segments": workload["repeat_segments"],
+        "repeat_words": workload["repeat_words"],
+        "skipped_confirmed_segments": skipped_confirmed["segment_count"],
+        "skipped_confirmed_words": skipped_confirmed["word_count"],
+    }
+
+
 @router.post("/projects/{project_id}/pretranslation-runs")
 async def create_pretranslation_run(
     project_id: UUID,
@@ -2764,6 +2842,88 @@ def _load_document_match_analysis_for_files(
         )
 
     return compute_document_match_analysis(db, file_segments)
+
+
+def _load_pretranslation_match_analysis_segments_for_files(
+    db: Session,
+    files: list[FileRecord],
+    *,
+    collection_ids: list[UUID],
+    skip_confirmed: bool,
+) -> tuple[dict[UUID, list[DocumentMatchSegment]], dict[str, int]]:
+    file_segments: dict[UUID, list[DocumentMatchSegment]] = {
+        file_record.id: [] for file_record in files
+    }
+    skipped_confirmed = {"segment_count": 0, "word_count": 0}
+    if not file_segments:
+        return file_segments, skipped_confirmed
+
+    selected_collection_ids = tuple(dict.fromkeys(collection_ids))
+    segments = (
+        db.query(
+            Segment.file_record_id,
+            Segment.source_text,
+            Segment.display_text,
+            Segment.source_word_count,
+            Segment.status,
+        )
+        .filter(Segment.file_record_id.in_(list(file_segments.keys())))
+        .order_by(
+            Segment.file_record_id.asc(),
+            *SEGMENT_ORDERING,
+            Segment.id.asc(),
+        )
+        .all()
+    )
+    for file_record_id, source_text, display_text, source_word_count, status in segments:
+        word_count = _segment_preview_word_count(source_text, source_word_count)
+        if skip_confirmed and status == "confirmed":
+            skipped_confirmed["segment_count"] += 1
+            skipped_confirmed["word_count"] += word_count
+            continue
+        file_segments.setdefault(file_record_id, []).append(
+            DocumentMatchSegment(
+                file_id=file_record_id,
+                source_text=source_text or "",
+                display_text=display_text or "",
+                source_word_count=word_count,
+                collection_ids=selected_collection_ids,
+            )
+        )
+
+    return file_segments, skipped_confirmed
+
+
+def _sum_pretranslation_match_workload(analyses: Iterable[dict[str, Any]]) -> dict[str, int]:
+    summary = {
+        "remaining_new_segments": 0,
+        "remaining_new_words": 0,
+        "tm_applied_segments": 0,
+        "tm_applied_words": 0,
+        "repeat_segments": 0,
+        "repeat_words": 0,
+    }
+    for analysis in analyses:
+        for key in summary:
+            summary[key] += _safe_int(analysis.get(key))
+    return summary
+
+
+def _segment_preview_word_count(source_text: str | None, source_word_count: int | None) -> int:
+    try:
+        word_count = int(source_word_count or 0)
+    except (TypeError, ValueError):
+        word_count = 0
+    if word_count > 0:
+        return word_count
+    return count_source_words(source_text or "")
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _can_manage_workflow(current_user: User | None) -> bool:
