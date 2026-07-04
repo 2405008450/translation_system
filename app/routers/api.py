@@ -11482,6 +11482,16 @@ def get_merge_view_detail(
     payload["can_manage"] = _can_manage_merge_view(view, current_user)
     file_workflow_progress = _get_file_workflow_progress(db, [file_record.id for file_record in files])
     for file_payload, file_record in zip(payload.get("files", []), files):
+        collection_ids = _load_file_record_collection_ids(file_record)
+        term_base_ids = _load_file_record_term_base_ids(file_record)
+        term_base_write_ids = _load_file_record_term_base_write_ids(file_record)
+        qa_term_base_ids = _load_file_record_qa_term_base_ids(file_record)
+        file_payload["collection_id"] = str(file_record.collection_id) if file_record.collection_id else None
+        file_payload["collection_ids"] = [str(collection_id) for collection_id in collection_ids]
+        file_payload["term_base_id"] = str(file_record.term_base_id) if file_record.term_base_id else None
+        file_payload["term_base_ids"] = [str(term_base_id) for term_base_id in term_base_ids]
+        file_payload["term_base_write_ids"] = [str(term_base_id) for term_base_id in term_base_write_ids]
+        file_payload["qa_term_base_ids"] = [str(term_base_id) for term_base_id in qa_term_base_ids]
         file_payload["can_write"] = _can_write_file_record(file_record, current_user, db)
         workflow_progress = file_workflow_progress.get(file_record.id, [])
         file_payload["workflow_progress"] = workflow_progress

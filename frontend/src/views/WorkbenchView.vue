@@ -2221,17 +2221,14 @@ const termQAButtonTitle = computed(() => (
 ))
 
 const boundTermBaseIds = computed(() => {
-  if (segmentStore.mergeViewId) {
-    return []
-  }
-  const fileRecord = segmentStore.fileRecord
-  if (!fileRecord) {
+  const context = activeWorkbenchFileContext.value
+  if (!context) {
     return []
   }
   return Array.from(new Set([
-    ...(fileRecord.term_base_ids || []),
-    ...(fileRecord.term_base_id ? [fileRecord.term_base_id] : []),
-    ...(fileRecord.qa_term_base_ids || []),
+    ...(context.term_base_ids || []),
+    ...(context.term_base_id ? [context.term_base_id] : []),
+    ...(context.qa_term_base_ids || []),
   ].filter(Boolean)))
 })
 
@@ -2248,7 +2245,7 @@ const boundResourceSummary = computed(() => {
 
 const addTermTargetTermBases = computed(() => {
   const boundIds = new Set(boundTermBaseIds.value)
-  const writableIds = segmentStore.fileRecord?.term_base_write_ids || []
+  const writableIds = activeWorkbenchFileContext.value?.term_base_write_ids || []
   const allowedIds = new Set(writableIds.filter((id) => boundIds.has(id)))
   return termBases.value.filter((termBase) => allowedIds.has(termBase.id))
 })
@@ -2267,7 +2264,7 @@ const addTermCanSubmit = computed(() => Boolean(
 
 const selectedTermBaseName = computed(() => (
   termBases.value.find((termBase) => termBase.id === selectedTermBaseId.value)?.name
-  || segmentStore.fileRecord?.term_base_name
+  || (!segmentStore.mergeViewId ? segmentStore.fileRecord?.term_base_name : null)
   || null
 ))
 
@@ -2462,26 +2459,28 @@ useWorkbenchShortcuts({
 })
 
 function getTermBaseStorageKey() {
-  return `workbench-term-base:${segmentStore.fileRecord?.source_language || 'na'}:${segmentStore.fileRecord?.target_language || 'na'}`
+  const context = activeWorkbenchFileContext.value
+  return `workbench-term-base:${context?.source_language || 'na'}:${context?.target_language || 'na'}`
 }
 
 async function loadTermBases() {
   loadingTermBases.value = true
   termsMessage.value = t('workbench.terms.loadingBases')
   try {
-    if (segmentStore.mergeViewId) {
+    const context = activeWorkbenchFileContext.value
+    if (!context) {
       termBases.value = []
       termEntries.value = []
       selectedTermBaseId.value = ''
       termsMessage.value = activeMergeViewFile.value
-        ? '合并视图已按当前文件隔离资源上下文；术语库浏览暂不跨文件加载，请使用“资源库搜索”查看当前文件绑定资源。'
+        ? t('workbench.terms.noBase')
         : '请先选中一个句段以确定当前文件上下文。'
       return
     }
     const { data } = await http.get<TermBase[]>('/term-bases')
     const filtered = data.filter((termBase) => (
-      termBase.source_language === segmentStore.fileRecord?.source_language
-      && termBase.target_language === segmentStore.fileRecord?.target_language
+      termBase.source_language === context.source_language
+      && termBase.target_language === context.target_language
       && boundTermBaseIds.value.includes(termBase.id)
     ))
 
@@ -5740,7 +5739,7 @@ function resolveAddTermTargetBaseId() {
   if (candidates.some((termBase) => termBase.id === selectedTermBaseId.value)) {
     return selectedTermBaseId.value
   }
-  const legacyBoundId = segmentStore.fileRecord?.term_base_id || ''
+  const legacyBoundId = activeWorkbenchFileContext.value?.term_base_id || ''
   if (legacyBoundId && candidates.some((termBase) => termBase.id === legacyBoundId)) {
     return legacyBoundId
   }
@@ -9990,8 +9989,8 @@ onBeforeRouteLeave(async () => {
       :context-label="t('workbench.importContext', { name: activeWorkbenchFileContext?.filename || t('workbench.currentTask') })"
       :source-language="activeWorkbenchFileContext?.source_language || null"
       :target-language="activeWorkbenchFileContext?.target_language || null"
-      :default-tm-collection-id="segmentStore.mergeViewId ? '' : (segmentStore.fileRecord?.collection_id || '')"
-      :default-term-base-id="segmentStore.mergeViewId ? '' : (segmentStore.fileRecord?.term_base_id || '')"
+      :default-tm-collection-id="activeWorkbenchFileContext?.collection_id || ''"
+      :default-term-base-id="activeWorkbenchFileContext?.term_base_id || ''"
       @close="showImportDialog = false"
       @imported="handleResourceImported"
     />

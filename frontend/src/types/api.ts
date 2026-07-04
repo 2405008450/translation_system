@@ -751,6 +751,12 @@ export interface MergeViewFile {
   workflow_progress?: WorkflowProgress[]
   can_write?: boolean
   is_edit_locked: boolean
+  collection_id?: string | null
+  collection_ids?: string[]
+  term_base_id?: string | null
+  term_base_ids?: string[]
+  term_base_write_ids?: string[]
+  qa_term_base_ids?: string[]
 }
 
 export interface MergeViewLanguagePair {
