@@ -426,6 +426,7 @@ export interface Segment {
   source_text: string
   display_text: string
   source_body_text?: string
+  source_layout_text?: string | null
   automatic_numbering_text?: string | null
   target_automatic_numbering_text?: string | null
   source_html?: string | null

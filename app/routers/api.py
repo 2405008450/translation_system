@@ -4490,10 +4490,20 @@ def _build_llm_translation_tasks(
 
         segment_source = getattr(segment, "source", "none")
         matched_source_text = getattr(segment, "matched_source_text", None)
+        source_layout_text = (
+            getattr(segment, "source_layout_text", "")
+            or getattr(segment, "display_text", "")
+            or ""
+        )
         segment_tm_target_text = segment.target_text if segment_source == "tm" and normalize_text(segment.target_text) else ""
         tm_target_text = segment_tm_target_text or tm_target_text_map.get(matched_source_text or "", "")
         if clean_numbering:
             raw_matched_source_text = matched_source_text
+            source_layout_text = strip_automatic_numbering_prefix(
+                source_layout_text,
+                source_text=segment.source_text,
+                display_text=getattr(segment, "display_text", "") or "",
+            )
             matched_source_text = strip_automatic_numbering_prefix(
                 matched_source_text or "",
                 source_text=segment.source_text,
@@ -4518,6 +4528,7 @@ def _build_llm_translation_tasks(
                 block_index=int(getattr(segment, "block_index", 0) or 0),
                 row_index=getattr(segment, "row_index", None),
                 cell_index=getattr(segment, "cell_index", None),
+                source_layout_text=source_layout_text,
                 matched_source_text=matched_source_text,
                 tm_target_text=tm_target_text,
                 glossary_matches=glossary_matches_by_source.get(segment.source_text, []),
@@ -9007,6 +9018,9 @@ def _serialize_workbench_segment(
         target_automatic_numbering_text = (
             target_automatic_numbering_by_sentence_id.get(str(seg.sentence_id), "") or ""
         ).strip()
+    source_layout_text = getattr(seg, "source_layout_text", "") or ""
+    if not source_layout_text and "\n" in (seg.display_text or ""):
+        source_layout_text = seg.display_text or ""
     resolved_workflow_step_id = seg.workflow_step_id
     if resolved_workflow_step_id is None and workflow_step_by_id:
         resolved_workflow_step_id = next(iter(workflow_step_by_id.keys()), None)
@@ -9032,6 +9046,7 @@ def _serialize_workbench_segment(
         "source_text": seg.source_text,
         "display_text": seg.display_text,
         "source_body_text": seg.source_text,
+        "source_layout_text": source_layout_text or None,
         "automatic_numbering_text": automatic_numbering_text or None,
         "target_automatic_numbering_text": target_automatic_numbering_text or None,
         "source_html": seg.source_html,

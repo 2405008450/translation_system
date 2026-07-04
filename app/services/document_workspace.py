@@ -27,7 +27,7 @@ from app.services.automatic_numbering import (
 )
 from app.services.document_statistics import compute_docx_statistics
 from app.services.matcher import MatchStats, match_sentences_with_stats
-from app.services.normalizer import normalize_text
+from app.services.normalizer import normalize_text, normalize_text_preserve_lines
 from app.services.omml_to_mathml import convert as convert_omml_to_mathml
 from app.services.omml_to_mathml import serialize_omml_xml
 from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
@@ -1273,6 +1273,14 @@ def _normalize_segment_source_text(text: str) -> str:
     )
 
 
+def _normalize_segment_source_layout_text(text: str) -> str:
+    if not text:
+        return ""
+    return normalize_text_preserve_lines(
+        text.replace(CELL_PARAGRAPH_BREAK_SENTINEL, "\n").replace(PAGE_BREAK_SENTINEL, "\n")
+    )
+
+
 def _build_paragraph_classes(story_kind: str, block_type: str) -> list[str]:
     paragraph_classes = ["doc-paragraph"]
     if block_type == "table_cell":
@@ -1722,7 +1730,9 @@ def _render_paragraph_fragment_group(
     numbering_available = bool(numbering_text)
     for span in spans:
         sentence_display = _collect_span_text(fragments, span, use_source=False)
-        sentence_source = _normalize_segment_source_text(_collect_span_text(fragments, span, use_source=True))
+        raw_sentence_source = _collect_span_text(fragments, span, use_source=True)
+        sentence_source = _normalize_segment_source_text(raw_sentence_source)
+        sentence_layout_source = _normalize_segment_source_layout_text(raw_sentence_source)
         math_placeholders = _collect_span_math_placeholders(fragments, span)
         source_html = _collect_span_html(
             fragments,
@@ -1740,6 +1750,7 @@ def _render_paragraph_fragment_group(
                     "sentence_id": sentence_id,
                     "source_text": sentence_source,
                     "display_text": sentence_display,
+                    "source_layout_text": sentence_layout_source,
                     "source_html": source_html,
                     "numbering_text": segment_numbering_text,
                     "status": "none",

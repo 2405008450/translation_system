@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Copy, Link2, Link2Off } from 'lucide-vue-next'
+import { Copy, CornerDownLeft, Link2, Link2Off } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, ref, watch, nextTick } from 'vue'
 
 import InteractiveDiffText from './InteractiveDiffText.vue'
@@ -1518,16 +1518,14 @@ function handleKeydown(event: KeyboardEvent) {
   }
 
   if (event.key === 'Enter' && !event.isComposing) {
-    if (event.ctrlKey || event.metaKey) {
+    if (event.ctrlKey || event.metaKey || event.shiftKey) {
       event.preventDefault()
       insertEditorLineBreak()
       return
     }
 
-    if (!event.shiftKey) {
-      event.preventDefault()
-      return
-    }
+    event.preventDefault()
+    return
   }
 
   const usesShortcutModifier = event.ctrlKey || event.metaKey
@@ -2265,6 +2263,17 @@ watch(
         >
           <Copy :size="13" aria-hidden="true" />
         </button>
+        <button
+          class="segment-row__line-break-button"
+          type="button"
+          title="插入换行"
+          aria-label="插入换行"
+          :disabled="disabled"
+          @mousedown.prevent.stop
+          @click.stop="insertEditorLineBreak"
+        >
+          <CornerDownLeft :size="13" aria-hidden="true" />
+        </button>
         <span
           v-if="hasTargetAutomaticNumbering"
           class="segment-row__automatic-numbering-badge segment-row__automatic-numbering-badge--target"
@@ -2424,7 +2433,8 @@ watch(
   margin-top: 9px;
 }
 
-.segment-row__copy-source-button {
+.segment-row__copy-source-button,
+.segment-row__line-break-button {
   flex: 0 0 auto;
   align-self: flex-start;
   display: inline-flex;
@@ -2444,14 +2454,23 @@ watch(
 }
 
 .segment-row__copy-source-button:hover:not(:disabled),
-.segment-row__copy-source-button:focus-visible {
+.segment-row__copy-source-button:focus-visible,
+.segment-row__line-break-button:hover:not(:disabled),
+.segment-row__line-break-button:focus-visible {
   border-color: rgba(13, 122, 104, 0.46);
   background: rgba(13, 122, 104, 0.14);
   color: #0b6658;
   outline: none;
 }
 
-.segment-row__copy-source-button:disabled {
+.segment-row__line-break-button {
+  border-color: rgba(91, 115, 132, 0.28);
+  background: rgba(91, 115, 132, 0.08);
+  color: #526574;
+}
+
+.segment-row__copy-source-button:disabled,
+.segment-row__line-break-button:disabled {
   cursor: not-allowed;
   opacity: 0.42;
 }
