@@ -2,12 +2,13 @@
 import axios from 'axios'
 import {
   ArrowRight,
+  ChevronDown,
   Download,
   FolderOpen,
+  Loader2,
   MoreHorizontal,
   Search,
   Settings2,
-  Upload,
 } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -22,9 +23,16 @@ import ResourceImportDialog from '../components/ResourceImportDialog.vue'
 import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { useToast } from '../composables/useToast'
+import { buildTranslatedTaskFilename } from '../constants/taskFiles'
 import { getFileStatusMeta } from '../constants/status'
 import { useAuthStore } from '../stores/auth'
 import type { MergeView, WorkflowProgress } from '../types/api'
+import { downloadBlob, resolveDownloadFilename } from '../utils/download'
+import {
+  getExportOptionExtensionLabel,
+  groupExportOptions,
+  type FileExportOption,
+} from '../utils/exportOptions'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
 
 interface ProjectRow {
@@ -55,6 +63,15 @@ interface ProjectRow {
 type MainTab = 'tasks' | 'views' | 'performance'
 type SubTab = 'all' | 'incomplete'
 type ResourceImportTab = 'tm' | 'term'
+type FileExportStatus = 'queued' | 'running' | 'completed' | 'failed'
+
+interface FileExportTask {
+  task_id: string
+  status: FileExportStatus
+  progress: number
+  message?: string | null
+  error?: string | null
+}
 
 const confirm = useConfirm()
 const toast = useToast()
@@ -80,6 +97,14 @@ let searchTimer: ReturnType<typeof setTimeout> | null = null
 const showImportDialog = ref(false)
 const importDialogInitialTab = ref<ResourceImportTab>('tm')
 const openActionMenuId = ref<string | null>(null)
+const showTaskExportMenu = ref(false)
+const loadingTaskExportOptions = ref(false)
+const taskExportOptions = ref<FileExportOption[]>([])
+const exportingTaskId = ref('')
+const exportingTaskType = ref('')
+const taskExportProgress = ref(0)
+const taskExportMessage = ref('')
+let taskExportPollTimer: number | null = null
 const importDialogContext = ref<{
   label: string
   sourceLanguage: string | null
@@ -276,6 +301,27 @@ const pagedProjects = computed(() => {
   return filteredProjects.value.slice(start, start + pageSize.value)
 })
 const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
+const selectedTaskRows = computed(() => (
+  projects.value.filter((row) => selectedIds.value.has(row.id))
+))
+const groupedTaskExportOptions = computed(() => groupExportOptions(taskExportOptions.value))
+const canOpenTaskExportMenu = computed(() => (
+  selectedTaskRows.value.length > 0
+  && !loadingTaskExportOptions.value
+  && !exportingTaskId.value
+))
+const taskExportButtonTitle = computed(() => {
+  if (selectedTaskRows.value.length === 0) {
+    return '请先勾选要导出的任务'
+  }
+  if (loadingTaskExportOptions.value) {
+    return '正在加载导出格式'
+  }
+  if (exportingTaskId.value) {
+    return taskExportMessage.value || `导出中 ${taskExportProgress.value}%`
+  }
+  return '导出选中的任务文件'
+})
 
 function handleSort(key: string, order: 'asc' | 'desc') {
   sortKey.value = key
@@ -284,6 +330,155 @@ function handleSort(key: string, order: 'asc' | 'desc') {
 
 function handleSelect(ids: Set<string>) {
   selectedIds.value = ids
+}
+
+function clearTaskExportPollTimer() {
+  if (taskExportPollTimer !== null) {
+    window.clearTimeout(taskExportPollTimer)
+    taskExportPollTimer = null
+  }
+}
+
+function waitForTaskExportPoll(ms: number) {
+  clearTaskExportPollTimer()
+  return new Promise<void>((resolve) => {
+    taskExportPollTimer = window.setTimeout(() => {
+      taskExportPollTimer = null
+      resolve()
+    }, ms)
+  })
+}
+
+function getTaskExportFallbackName(filename: string, exportType: string) {
+  return exportType === 'source' ? filename : buildTranslatedTaskFilename(filename)
+}
+
+function getTaskExportSuccessMessage(exportType: string, count: number) {
+  if (count > 1) {
+    return exportType === 'source'
+      ? `已开始下载 ${count} 个源文件。`
+      : `已开始下载 ${count} 个导出文件。`
+  }
+  return exportType === 'source'
+    ? '源文件已开始下载。'
+    : '导出完成，文件已开始下载。'
+}
+
+async function waitForTaskFileExportTask(task: FileExportTask) {
+  let currentTask = task
+  while (true) {
+    taskExportProgress.value = currentTask.progress
+    taskExportMessage.value = currentTask.message || `导出处理中：${currentTask.progress}%`
+
+    if (currentTask.status === 'completed') {
+      return currentTask
+    }
+    if (currentTask.status === 'failed') {
+      throw new Error(currentTask.error || currentTask.message || '导出失败。')
+    }
+
+    await waitForTaskExportPoll(1200)
+    const { data } = await http.get<FileExportTask>(`/file-records/export-tasks/${currentTask.task_id}`)
+    currentTask = data
+  }
+}
+
+async function loadTaskExportOptionsForSelection() {
+  const rows = [...selectedTaskRows.value]
+  taskExportOptions.value = []
+  if (rows.length === 0) {
+    return
+  }
+
+  loadingTaskExportOptions.value = true
+  pageError.value = ''
+  try {
+    const responses = await Promise.all(
+      rows.map((row) => http.get<{ export_options: FileExportOption[] }>(`/file-records/${String(row.id)}/export-options`)),
+    )
+    const optionLists = responses.map((response) => response.data.export_options || [])
+    const firstOptions = optionLists[0] || []
+    const commonIds = new Set(firstOptions.map((option) => option.id))
+    for (const options of optionLists.slice(1)) {
+      const ids = new Set(options.map((option) => option.id))
+      for (const id of Array.from(commonIds)) {
+        if (!ids.has(id)) {
+          commonIds.delete(id)
+        }
+      }
+    }
+    taskExportOptions.value = firstOptions.filter((option) => commonIds.has(option.id))
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '导出格式加载失败。')
+    taskExportOptions.value = []
+  } finally {
+    loadingTaskExportOptions.value = false
+  }
+}
+
+async function toggleTaskExportMenu() {
+  if (!canOpenTaskExportMenu.value) {
+    return
+  }
+  if (showTaskExportMenu.value) {
+    showTaskExportMenu.value = false
+    return
+  }
+  closeActionMenu()
+  await loadTaskExportOptionsForSelection()
+  showTaskExportMenu.value = true
+}
+
+async function downloadTaskFileExport(row: ProjectRow, exportType: string) {
+  const filename = String(row.filename || 'export')
+  const { data: task } = await http.post<FileExportTask>(
+    `/file-records/${String(row.id)}/exports`,
+    null,
+    { params: { type: exportType } },
+  )
+  const completedTask = await waitForTaskFileExportTask(task)
+  const response = await http.get(`/file-records/export-tasks/${completedTask.task_id}/download`, {
+    responseType: 'blob',
+  })
+  const downloadName = resolveDownloadFilename(
+    response.headers['content-disposition'],
+    getTaskExportFallbackName(filename, exportType),
+  )
+  downloadBlob(response.data, downloadName)
+}
+
+async function exportSelectedTasks(exportType: string) {
+  const rows = [...selectedTaskRows.value]
+  if (rows.length === 0 || exportingTaskId.value) {
+    return
+  }
+
+  closeActionMenu()
+  showTaskExportMenu.value = false
+  pageError.value = ''
+
+  try {
+    for (let index = 0; index < rows.length; index += 1) {
+      const current = rows[index]
+      exportingTaskId.value = String(current.id)
+      exportingTaskType.value = exportType
+      taskExportProgress.value = 0
+      taskExportMessage.value = `导出 ${index + 1}/${rows.length} 提交中。`
+      await downloadTaskFileExport(current, exportType)
+    }
+    toast.success(getTaskExportSuccessMessage(exportType, rows.length))
+  } catch (error) {
+    pageError.value = getErrorMessage(
+      error,
+      exportType === 'source' ? '源文件导出失败。' : '导出失败。',
+    )
+  } finally {
+    clearTaskExportPollTimer()
+    exportingTaskId.value = ''
+    exportingTaskType.value = ''
+    taskExportProgress.value = 0
+    taskExportMessage.value = ''
+  }
 }
 
 function toggleActionMenu(id: string) {
@@ -295,11 +490,8 @@ function closeActionMenu() {
 }
 
 function handleDocumentClick() {
+  showTaskExportMenu.value = false
   closeActionMenu()
-}
-
-function goToAssets() {
-  void router.push({ name: 'tm' })
 }
 
 function openProjectDetail(row: ProjectRow) {
@@ -355,6 +547,7 @@ onBeforeUnmount(() => {
   if (searchTimer) {
     clearTimeout(searchTimer)
   }
+  clearTaskExportPollTimer()
 })
 </script>
 
@@ -430,19 +623,58 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <div class="table-toolbar__right">
-            <button
-              v-if="authStore.isAdmin"
-              class="button"
-              type="button"
-              @click="goToAssets"
-            >
-              <Upload :size="14" />
-              {{ t('taskList.toolbar.importAssets') }}
-            </button>
-            <button class="button" type="button" disabled :title="t('common.comingSoon')">
-              <Download :size="14" />
-              {{ t('taskList.toolbar.export') }}
-            </button>
+            <div class="task-export-dropdown" @click.stop>
+              <button
+                class="button"
+                type="button"
+                :disabled="!canOpenTaskExportMenu"
+                :title="taskExportButtonTitle"
+                aria-haspopup="menu"
+                :aria-expanded="showTaskExportMenu"
+                @click="toggleTaskExportMenu"
+              >
+                <Loader2 v-if="loadingTaskExportOptions || exportingTaskId" class="lucide-spin" :size="14" />
+                <Download v-else :size="14" />
+                {{ exportingTaskId ? `导出中 ${taskExportProgress}%` : t('taskList.toolbar.export') }}
+                <ChevronDown :size="12" />
+              </button>
+              <div v-if="showTaskExportMenu" class="task-export-dropdown__menu" role="menu">
+                <div v-if="loadingTaskExportOptions" class="task-export-dropdown__loading">
+                  正在加载导出格式...
+                </div>
+                <div v-else-if="taskExportOptions.length === 0" class="task-export-dropdown__loading">
+                  暂无可用导出格式
+                </div>
+                <template v-else>
+                  <div
+                    v-for="group in groupedTaskExportOptions"
+                    :key="group.id"
+                    class="task-export-dropdown__group"
+                  >
+                    <div class="task-export-dropdown__group-title">{{ group.label }}</div>
+                    <button
+                      v-for="option in group.options"
+                      :key="option.id"
+                      class="task-export-dropdown__item"
+                      type="button"
+                      :disabled="Boolean(exportingTaskId)"
+                      @click="exportSelectedTasks(option.id)"
+                    >
+                      <span class="task-export-dropdown__item-head">
+                        <span class="task-export-dropdown__item-name">{{ option.name }}</span>
+                        <span
+                          v-if="getExportOptionExtensionLabel(option)"
+                          class="task-export-dropdown__item-ext"
+                        >
+                          {{ getExportOptionExtensionLabel(option) }}
+                        </span>
+                      </span>
+                      <span class="task-export-dropdown__item-desc">{{ option.description }}</span>
+                    </button>
+                  </div>
+                </template>
+              </div>
+            </div>
             <button class="button" type="button" disabled :title="t('common.comingSoon')">
               <Settings2 :size="14" />
               {{ t('taskList.toolbar.columns') }}
@@ -653,6 +885,103 @@ onBeforeUnmount(() => {
 
 .task-table-toolbar {
   padding: 8px 20px;
+}
+
+.task-export-dropdown {
+  position: relative;
+  display: inline-flex;
+}
+
+.task-export-dropdown > .button {
+  gap: 5px;
+}
+
+.task-export-dropdown__menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  width: min(320px, calc(100vw - 32px));
+  max-height: min(440px, calc(100vh - 180px));
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-popover);
+}
+
+.task-export-dropdown__loading,
+.task-export-dropdown__item {
+  width: 100%;
+  padding: 9px 12px;
+  text-align: left;
+}
+
+.task-export-dropdown__loading {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.task-export-dropdown__group + .task-export-dropdown__group {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.task-export-dropdown__group-title {
+  padding: 2px 0 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.task-export-dropdown__item {
+  display: grid;
+  gap: 4px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.task-export-dropdown__item:hover:not(:disabled) {
+  background: var(--surface-muted);
+}
+
+.task-export-dropdown__item:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.task-export-dropdown__item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.task-export-dropdown__item-name {
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.task-export-dropdown__item-ext {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--brand-700) 10%, transparent);
+  color: var(--brand-700);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.task-export-dropdown__item-desc {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .task-page__message {
