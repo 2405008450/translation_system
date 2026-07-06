@@ -933,6 +933,19 @@ def _can_auto_merge_stale_segment(
     return False
 
 
+def _resolve_status_after_target_update(segment: Segment, before_text: str | None, target_text: str, confirm: bool) -> str:
+    if confirm:
+        return "confirmed"
+    if segment.status == "confirmed" and (before_text or "") == (target_text or ""):
+        return "confirmed"
+    return resolve_unconfirmed_segment_status(segment)
+
+
+def _clear_project_sync_origin(segment: Segment) -> None:
+    segment.project_sync_source_segment_id = None
+    segment.project_sync_source_file_record_id = None
+
+
 def update_segment_target(
     db: Session,
     segment_id: UUID,
@@ -958,6 +971,8 @@ def update_segment_target(
     segment.target_text = target_text
     segment.target_html = target_html if target_html else None
     segment.source = source
+    if source != "project_sync":
+        _clear_project_sync_origin(segment)
     _mark_segment_modified_by(segment, current_user)
     segment.version = int(segment.version or 1) + 1
     segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
@@ -967,10 +982,7 @@ def update_segment_target(
     else:
         segment.llm_provider = None
         segment.llm_model = None
-    if confirm:
-        segment.status = "confirmed"
-    else:
-        segment.status = resolve_unconfirmed_segment_status(segment)
+    segment.status = _resolve_status_after_target_update(segment, before_text, target_text, confirm)
     if track_revision:
         create_revision(
             db,
@@ -1026,6 +1038,8 @@ def update_segment_by_sentence_id(
     segment.target_text = target_text
     segment.target_html = target_html if target_html else None
     segment.source = source
+    if source != "project_sync":
+        _clear_project_sync_origin(segment)
     _mark_segment_modified_by(segment, current_user)
     segment.version = int(segment.version or 1) + 1
     segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
@@ -1035,10 +1049,7 @@ def update_segment_by_sentence_id(
     else:
         segment.llm_provider = None
         segment.llm_model = None
-    if confirm:
-        segment.status = "confirmed"
-    else:
-        segment.status = resolve_unconfirmed_segment_status(segment)
+    segment.status = _resolve_status_after_target_update(segment, before_text, target_text, confirm)
     if track_revision:
         create_revision(
             db,
@@ -1084,6 +1095,7 @@ def update_segment_source_text(
     segment.source_hash = build_source_hash(source_text)
     segment.display_text = source_text
     segment.source_html = None
+    _clear_project_sync_origin(segment)
     _mark_segment_modified_by(segment, current_user)
     segment.version = int(segment.version or 1) + 1
     db.commit()
@@ -1186,6 +1198,8 @@ def batch_update_segments(
         segment.target_text = target_text
         segment.target_html = target_html if target_html else None
         segment.source = source
+        if source != "project_sync":
+            _clear_project_sync_origin(segment)
         _mark_segment_modified_by(segment, current_user)
         segment.version = current_version + 1
         segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
@@ -1195,10 +1209,7 @@ def batch_update_segments(
         else:
             segment.llm_provider = None
             segment.llm_model = None
-        if confirm:
-            segment.status = "confirmed"
-        else:
-            segment.status = resolve_unconfirmed_segment_status(segment)
+        segment.status = _resolve_status_after_target_update(segment, before_text, target_text, confirm)
         if track_revision:
             create_revision(
                 db,

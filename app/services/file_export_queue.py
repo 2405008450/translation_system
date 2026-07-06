@@ -26,6 +26,7 @@ from app.services.task_file_service import (
     DOCUMENT_PARSE_MODE_FULL,
     can_export_task_file,
     export_bilingual_task_docx_with_layout,
+    export_bilingual_xlsx_task_file,
     export_translated_task_file,
     get_task_file_extension,
     normalize_document_parse_options,
@@ -36,6 +37,7 @@ from app.services.file_record_service import (
     list_segments_for_file_record,
     load_file_record_source,
 )
+from app.services.language_pairs import require_language_pair
 
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,7 @@ logger = logging.getLogger(__name__)
 FILE_EXPORT_TASK_TTL_SECONDS = 24 * 60 * 60
 FILE_EXPORT_POLL_INTERVAL_SECONDS = 0.3
 FILE_EXPORT_WAIT_TIMEOUT_SECONDS = 30 * 60
+LANGUAGE_TAGGED_EXPORT_TYPES = {"tmx", "xliff", "xliff2"}
 
 _FILE_EXPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="file-export")
 _SCHEMA_READY = False
@@ -340,6 +343,18 @@ def normalize_file_export_type(export_type: str | None) -> str:
     return value or "original"
 
 
+def _resolve_file_record_export_language_pair(file_record: FileRecord) -> tuple[str, str]:
+    source_language = getattr(file_record, "source_language", None)
+    target_language = getattr(file_record, "target_language", None)
+    collection = getattr(file_record, "collection", None)
+
+    if (not source_language or not target_language) and collection is not None:
+        source_language = source_language or getattr(collection, "source_language", None)
+        target_language = target_language or getattr(collection, "target_language", None)
+
+    return require_language_pair(source_language, target_language)
+
+
 def _run_file_export_task(task_id: UUID) -> None:
     try:
         with SessionLocal() as db:
@@ -418,6 +433,16 @@ def build_file_record_exported_file(db: Session, file_record: FileRecord, export
             target_language=getattr(file_record, "target_language", None),
         )
 
+    if export_type == "bilingual_excel_original":
+        if get_task_file_extension(source_filename) != ".xlsx":
+            raise ValueError("Only XLSX source files support original-format bilingual Excel export.")
+        return export_bilingual_xlsx_task_file(
+            raw_bytes=raw_bytes,
+            filename=source_filename,
+            segments=segments,
+            document_parse_options=document_parse_options,
+        )
+
     segment_dicts = [
         {
             "segment_id": seg.sentence_id,
@@ -428,12 +453,18 @@ def build_file_record_exported_file(db: Session, file_record: FileRecord, export
         }
         for seg in segments
     ]
-    exported_bytes, media_type, export_filename = export_file(
-        export_type=export_type,
-        segments=segment_dicts,
-        filename=file_record.filename,
-        original_bytes=raw_bytes,
-    )
+    export_kwargs = {
+        "export_type": export_type,
+        "segments": segment_dicts,
+        "filename": file_record.filename,
+        "original_bytes": raw_bytes,
+    }
+    if export_type in LANGUAGE_TAGGED_EXPORT_TYPES:
+        source_language, target_language = _resolve_file_record_export_language_pair(file_record)
+        export_kwargs["source_lang"] = source_language
+        export_kwargs["target_lang"] = target_language
+
+    exported_bytes, media_type, export_filename = export_file(**export_kwargs)
     return _GenericExportedFile(
         content=exported_bytes,
         media_type=media_type,

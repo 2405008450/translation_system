@@ -61,6 +61,18 @@ def can_access_all_projects(user: User | None) -> bool:
     )
 
 
+def can_create_projects(user: User | None) -> bool:
+    return can_access_all_projects(user)
+
+
+def can_assign_projects(user: User | None) -> bool:
+    return can_access_all_projects(user)
+
+
+def can_create_resources(user: User | None) -> bool:
+    return can_access_all_projects(user)
+
+
 def normalize_translator_type(translator_type: str | None, role: str | None) -> str:
     if role != USER_ROLE:
         return INTERNAL_TRANSLATOR_TYPE
@@ -324,6 +336,24 @@ def get_current_user(
         raise HTTPException(status_code=403, detail="当前用户已被禁用。")
     record_user_activity_safely(user.id)
     return user
+
+
+def require_project_creator(current_user: User = Depends(get_current_user)) -> User:
+    if not can_create_projects(current_user):
+        raise HTTPException(status_code=403, detail="\u5f53\u524d\u8d26\u53f7\u6ca1\u6709\u521b\u5efa\u9879\u76ee\u7684\u6743\u9650\u3002")
+    return current_user
+
+
+def require_project_assignment_manager(current_user: User = Depends(get_current_user)) -> User:
+    if not can_assign_projects(current_user):
+        raise HTTPException(status_code=403, detail="\u5f53\u524d\u8d26\u53f7\u6ca1\u6709\u9879\u76ee\u5206\u914d\u7684\u6743\u9650\u3002")
+    return current_user
+
+
+def require_resource_creator(current_user: User = Depends(get_current_user)) -> User:
+    if not can_create_resources(current_user):
+        raise HTTPException(status_code=403, detail="\u5f53\u524d\u8d26\u53f7\u6ca1\u6709\u65b0\u5efa\u8d44\u6e90\u5e93\u7684\u6743\u9650\u3002")
+    return current_user
 
 
 def require_admin(current_user: User = Depends(get_current_user)) -> User:

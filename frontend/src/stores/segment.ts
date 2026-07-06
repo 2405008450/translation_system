@@ -79,33 +79,60 @@ function buildMergeViewStatusStats(detail: MergeViewDetail | null): SegmentStatu
   return totals
 }
 
-function isCountedSegmentStatus(status: string): status is 'exact' | 'fuzzy' | 'none' | 'confirmed' {
-  return status === 'exact' || status === 'fuzzy' || status === 'none' || status === 'confirmed'
-}
-
 function hasEmptyTarget(value: string | null | undefined) {
   return value === null || value === undefined || value === ''
 }
 
 function normalizeMatchText(value: string | null | undefined) {
-  return (value || '').trim().replace(/\s+/g, ' ').toLowerCase()
+  return (value || '').trim().replace(/\s+/g, ' ').replace(/[\u3002\uff01\uff1f!?.]+$/u, '')
 }
 
-function resolveUnconfirmedSegmentStatus(segment: Segment, targetText = segment.target_text) {
-  if (hasEmptyTarget(targetText)) {
-    return 'none'
-  }
+function compactMatchCore(value: string | null | undefined) {
+  return normalizeMatchText(value).replace(/[^\w\u4e00-\u9fff]+/gu, '')
+}
 
+function isShortStructuralFragment(value: string | null | undefined) {
+  const core = compactMatchCore(value)
+  return Boolean(core && core.length <= 4 && /^(?:\d+[A-Za-z]?|[A-Za-z]|[ivxlcdmIVXLCDM]{1,4})$/.test(core))
+}
+
+function resolveUnconfirmedSegmentStatus(segment: Segment, _targetText = segment.target_text) {
   const sourceText = normalizeMatchText(segment.source_text)
+  const displayText = normalizeMatchText(segment.display_text)
   const matchedSourceText = normalizeMatchText(segment.matched_source_text)
   const score = Number(segment.score || 0)
-  if (score >= 0.999 || (matchedSourceText && matchedSourceText === sourceText)) {
+  if (sourceText && matchedSourceText && matchedSourceText === sourceText) {
+    return 'exact'
+  }
+  if (
+    displayText
+    && matchedSourceText
+    && matchedSourceText === displayText
+    && !isShortStructuralFragment(segment.source_text)
+  ) {
     return 'exact'
   }
   if (score > 0 || matchedSourceText) {
     return 'fuzzy'
   }
   return 'none'
+}
+
+function resolveSegmentStatusForStats(segment: Segment) {
+  if (segment.status === 'confirmed') {
+    return 'confirmed'
+  }
+  return resolveUnconfirmedSegmentStatus(segment)
+}
+
+function resolveSegmentStatusAfterTargetUpdate(segment: Segment, targetText: string, confirm: boolean) {
+  if (confirm) {
+    return 'confirmed'
+  }
+  if (segment.status === 'confirmed' && (segment.target_text || '') === (targetText || '')) {
+    return 'confirmed'
+  }
+  return resolveUnconfirmedSegmentStatus(segment, targetText)
 }
 
 function normalizePositiveInt(value: unknown, fallback: number) {
@@ -189,6 +216,7 @@ export interface SegmentPageQuery {
   statusFilters?: string[]
   matchFilters?: string[]
   sourceFilters?: string[]
+  sourceContentFilters?: string[]
   workflowStepIds?: string[]
   includeStats?: boolean
 }
@@ -198,6 +226,7 @@ interface SegmentChangeResponse {
   server_time: string
   next_cursor?: string
   has_more?: boolean
+  status_stats?: SegmentStatusStats | null
   segments: Segment[]
 }
 
@@ -254,6 +283,7 @@ export const useSegmentStore = defineStore('segment', () => {
     statusFilters: [] as string[],
     matchFilters: [] as string[],
     sourceFilters: [] as string[],
+    sourceContentFilters: [] as string[],
     workflowStepIds: [] as string[],
   })
   const saveToTMStats = ref<SaveToTMStats | null>(null)
@@ -698,11 +728,11 @@ export const useSegmentStore = defineStore('segment', () => {
 
   function adjustSegmentStatusStats(previousSegment: Segment, nextSegment: Segment) {
     const nextStats = { ...segmentStatusStats.value }
-    if (isCountedSegmentStatus(previousSegment.status)) {
-      nextStats[previousSegment.status] = Math.max(0, nextStats[previousSegment.status] - 1)
-    }
-    if (isCountedSegmentStatus(nextSegment.status)) {
-      nextStats[nextSegment.status] += 1
+    const previousStatus = resolveSegmentStatusForStats(previousSegment)
+    const nextStatus = resolveSegmentStatusForStats(nextSegment)
+    if (previousStatus !== nextStatus) {
+      nextStats[previousStatus] = Math.max(0, nextStats[previousStatus] - 1)
+      nextStats[nextStatus] += 1
     }
 
     const wasEmptyTarget = hasEmptyTarget(previousSegment.target_text)
@@ -739,6 +769,9 @@ export const useSegmentStore = defineStore('segment', () => {
       statusFilters: normalizeStringArray(query.statusFilters ?? segmentFilters.value.statusFilters),
       matchFilters: normalizeStringArray(query.matchFilters ?? segmentFilters.value.matchFilters),
       sourceFilters: normalizeStringArray(query.sourceFilters ?? segmentFilters.value.sourceFilters),
+      sourceContentFilters: normalizeStringArray(
+        query.sourceContentFilters ?? segmentFilters.value.sourceContentFilters,
+      ),
       workflowStepIds: normalizeStringArray(query.workflowStepIds ?? segmentFilters.value.workflowStepIds),
       includeStats: query.includeStats ?? true,
     }
@@ -759,6 +792,7 @@ export const useSegmentStore = defineStore('segment', () => {
       status_filters: serializeFilterArray(resolved.statusFilters),
       match_filters: serializeFilterArray(resolved.matchFilters),
       source_filters: serializeFilterArray(resolved.sourceFilters),
+      source_content_filters: serializeFilterArray(resolved.sourceContentFilters),
       workflow_step_ids: serializeFilterArray(resolved.workflowStepIds),
       include_stats: resolved.includeStats,
     }
@@ -778,6 +812,7 @@ export const useSegmentStore = defineStore('segment', () => {
       statusFilters: [...segmentFilters.value.statusFilters],
       matchFilters: [...segmentFilters.value.matchFilters],
       sourceFilters: [...segmentFilters.value.sourceFilters],
+      sourceContentFilters: [...segmentFilters.value.sourceContentFilters],
       workflowStepIds: [...segmentFilters.value.workflowStepIds],
     }
   }
@@ -826,6 +861,7 @@ export const useSegmentStore = defineStore('segment', () => {
       statusFilters: string[]
       matchFilters: string[]
       sourceFilters: string[]
+      sourceContentFilters: string[]
       workflowStepIds: string[]
     },
   ) {
@@ -842,6 +878,7 @@ export const useSegmentStore = defineStore('segment', () => {
       statusFilters: [...resolved.statusFilters],
       matchFilters: [...resolved.matchFilters],
       sourceFilters: [...resolved.sourceFilters],
+      sourceContentFilters: [...resolved.sourceContentFilters],
       workflowStepIds: [...resolved.workflowStepIds],
     }
     totalSegmentCount.value = data.total_segments ?? totalSegmentCount.value
@@ -850,8 +887,8 @@ export const useSegmentStore = defineStore('segment', () => {
       setSegmentStatusStats(data.status_stats)
     }
     resetSegments(data.segments)
-    if (data.server_time) {
-      changeCursor = data.server_time
+    if (data.change_cursor || data.server_time) {
+      changeCursor = data.change_cursor || data.server_time || null
     }
     resetPreviewState()
   }
@@ -939,6 +976,9 @@ export const useSegmentStore = defineStore('segment', () => {
             }
           }
           applyServerSegment(remoteSegment)
+        }
+        if (data.status_stats) {
+          setSegmentStatusStats(data.status_stats)
         }
         changeCursor = data.next_cursor || data.server_time || new Date().toISOString()
         hasMore = Boolean(data.has_more)
@@ -1051,6 +1091,7 @@ export const useSegmentStore = defineStore('segment', () => {
       statusFilters: [],
       matchFilters: [],
       sourceFilters: [],
+      sourceContentFilters: [],
       workflowStepIds: [],
     }
     saveToTMStats.value = null
@@ -1110,6 +1151,7 @@ export const useSegmentStore = defineStore('segment', () => {
         statusFilters: query.statusFilters ?? [],
         matchFilters: query.matchFilters ?? [],
         sourceFilters: query.sourceFilters ?? [],
+        sourceContentFilters: query.sourceContentFilters ?? [],
         workflowStepIds: query.workflowStepIds ?? [],
       })
       pageSize.value = resolved.pageSize
@@ -1125,6 +1167,7 @@ export const useSegmentStore = defineStore('segment', () => {
         statusFilters: [...resolved.statusFilters],
         matchFilters: [...resolved.matchFilters],
         sourceFilters: [...resolved.sourceFilters],
+        sourceContentFilters: [...resolved.sourceContentFilters],
         workflowStepIds: [...resolved.workflowStepIds],
       }
       const detail = await getMergeViewDetail(viewId)
@@ -1137,7 +1180,7 @@ export const useSegmentStore = defineStore('segment', () => {
       pageSize.value = page.limit || resolved.pageSize
       matchedSegmentCount.value = page.matched_segments
       mergeViewGroups.value = page.groups
-      changeCursor = page.server_time || new Date().toISOString()
+      changeCursor = page.change_cursor || page.server_time || new Date().toISOString()
       resetSegments(page.segments)
       // 自动激活首个句段
       if (segments.value[0]) {
@@ -1169,6 +1212,7 @@ export const useSegmentStore = defineStore('segment', () => {
         statusFilters: [...resolved.statusFilters],
         matchFilters: [...resolved.matchFilters],
         sourceFilters: [...resolved.sourceFilters],
+        sourceContentFilters: [...resolved.sourceContentFilters],
         workflowStepIds: [...resolved.workflowStepIds],
       }
       const page = await fetchMergeViewSegmentPage(mergeViewId.value, resolved)
@@ -1176,7 +1220,7 @@ export const useSegmentStore = defineStore('segment', () => {
       pageSize.value = page.limit || resolved.pageSize
       matchedSegmentCount.value = page.matched_segments
       mergeViewGroups.value = page.groups
-      changeCursor = page.server_time || changeCursor
+      changeCursor = page.change_cursor || page.server_time || changeCursor
       resetSegments(page.segments)
       if (segments.value[0] && !activeSentenceId.value) {
         setActiveSentence(segmentKeyOf(segments.value[0]))
@@ -1201,6 +1245,7 @@ export const useSegmentStore = defineStore('segment', () => {
       statusFilters: segmentFilters.value.statusFilters,
       matchFilters: segmentFilters.value.matchFilters,
       sourceFilters: segmentFilters.value.sourceFilters,
+      sourceContentFilters: segmentFilters.value.sourceContentFilters,
       workflowStepIds: segmentFilters.value.workflowStepIds,
     }
   }
@@ -1222,6 +1267,7 @@ export const useSegmentStore = defineStore('segment', () => {
         statusFilters: query.statusFilters ?? [],
         matchFilters: query.matchFilters ?? [],
         sourceFilters: query.sourceFilters ?? [],
+        sourceContentFilters: query.sourceContentFilters ?? [],
         workflowStepIds: query.workflowStepIds ?? [],
       })
       pageSize.value = resolved.pageSize
@@ -1237,6 +1283,7 @@ export const useSegmentStore = defineStore('segment', () => {
         statusFilters: [...resolved.statusFilters],
         matchFilters: [...resolved.matchFilters],
         sourceFilters: [...resolved.sourceFilters],
+        sourceContentFilters: [...resolved.sourceContentFilters],
         workflowStepIds: [...resolved.workflowStepIds],
       }
       const detail = await fetchFileRecordDetail(fileRecordId, resolved.pageSize)
@@ -1244,7 +1291,7 @@ export const useSegmentStore = defineStore('segment', () => {
         ...detail,
         segments: [],
       }
-      changeCursor = detail.server_time || new Date().toISOString()
+      changeCursor = detail.change_cursor || detail.server_time || new Date().toISOString()
       totalSegmentCount.value = detail.total_segments
       setSegmentStatusStats(detail.status_stats)
       if (
@@ -1257,6 +1304,7 @@ export const useSegmentStore = defineStore('segment', () => {
         && resolved.statusFilters.length === 0
         && resolved.matchFilters.length === 0
         && resolved.sourceFilters.length === 0
+        && resolved.sourceContentFilters.length === 0
         && resolved.workflowStepIds.length === 0
       ) {
         matchedSegmentCount.value = detail.total_segments
@@ -1410,15 +1458,25 @@ export const useSegmentStore = defineStore('segment', () => {
 
     const segment = segments.value[index]
     const confirm = options.confirm === true
+    const nextTargetHtml = targetHtml || null
+    const currentTargetText = segment.target_text || ''
+    const currentTargetHtml = segment.target_html || null
+    if (
+      currentTargetText === (targetText || '')
+      && currentTargetHtml === nextTargetHtml
+      && (!confirm || segment.status === 'confirmed')
+    ) {
+      return
+    }
     if (revisionTrackingEnabled.value) {
       upsertLocalRevisionDraft(segment, targetText)
     }
     const nextSegment = {
       ...segment,
       target_text: targetText,
-      target_html: targetHtml || null,
+      target_html: nextTargetHtml,
       source: 'manual',
-      status: confirm ? 'confirmed' : resolveUnconfirmedSegmentStatus(segment, targetText),
+      status: resolveSegmentStatusAfterTargetUpdate(segment, targetText, confirm),
       llm_provider: null,
       llm_model: null,
     }
@@ -1431,7 +1489,7 @@ export const useSegmentStore = defineStore('segment', () => {
       [segmentKey]: {
         sentence_id: segment.sentence_id,
         target_text: targetText,
-        target_html: targetHtml || null,
+        target_html: nextTargetHtml,
         source: 'manual',
         track_revision: revisionTrackingEnabled.value,
         base_version: segment.version ?? 1,
@@ -1576,19 +1634,17 @@ export const useSegmentStore = defineStore('segment', () => {
       }
       return
     }
-    if (mergeViewId.value) {
-      termMatchesMap.value = {
-        ...termMatchesMap.value,
-        [sentenceId]: [],
-      }
-      return
-    }
     try {
       const params = new URLSearchParams({ text: sourceText })
+      const termContext = mergeViewId.value
+        ? mergeViewDetail.value?.files.find((file) => (
+            file.id === (fileRecordIdFromKey(sentenceId) || activeFileRecordId.value)
+          ))
+        : fileRecord.value
       const boundTermBaseIds = Array.from(new Set([
-        ...(fileRecord.value?.term_base_ids || []),
-        ...(fileRecord.value?.term_base_id ? [fileRecord.value.term_base_id] : []),
-        ...(fileRecord.value?.qa_term_base_ids || []),
+        ...(termContext?.term_base_ids || []),
+        ...(termContext?.term_base_id ? [termContext.term_base_id] : []),
+        ...(termContext?.qa_term_base_ids || []),
       ].filter(Boolean)))
       if (boundTermBaseIds.length === 0) {
         termMatchesMap.value = {
@@ -1734,6 +1790,7 @@ export const useSegmentStore = defineStore('segment', () => {
         skipped_invalid_count?: number
       }
       project_sync?: ProjectSegmentSyncSummary
+      status_stats?: SegmentStatusStats | null
       segments?: Segment[]
     }>(`/file-records/${fileId}/segments`, {
       updates,
@@ -1800,6 +1857,9 @@ export const useSegmentStore = defineStore('segment', () => {
     if (sensitiveConflicts.length > 0) {
       applySyncConflicts(sensitiveConflicts, fileId)
     }
+    if (data.status_stats) {
+      setSegmentStatusStats(data.status_stats)
+    }
     return finishSyncState(hadConflict)
   }
 
@@ -1859,6 +1919,22 @@ export const useSegmentStore = defineStore('segment', () => {
       if (sensitiveConflicts.length > 0) {
         applySyncConflicts(sensitiveConflicts, result.fileId)
       }
+    }
+    const statusStatsByFileId = new Map(
+      results
+        .filter((result) => result.data.status_stats)
+        .map((result) => [result.fileId, result.data.status_stats as SegmentStatusStats]),
+    )
+    if (statusStatsByFileId.size > 0 && mergeViewDetail.value) {
+      mergeViewDetail.value = {
+        ...mergeViewDetail.value,
+        files: mergeViewDetail.value.files.map((file) => (
+          statusStatsByFileId.has(file.id)
+            ? { ...file, status_stats: statusStatsByFileId.get(file.id)! }
+            : file
+        )),
+      }
+      setSegmentStatusStats(buildMergeViewStatusStats(mergeViewDetail.value))
     }
     dirtyEntries.value = nextDirtyEntries
     clearLocalRevisionDrafts(syncedSentenceIds)
@@ -2347,6 +2423,15 @@ export const useSegmentStore = defineStore('segment', () => {
         },
         eventFileRecordId,
       )
+      llmMessage.value = translate('stores.segment.llmProgress', {
+        processed: llmProcessedCount.value,
+        planned: Math.max(llmPlannedCount.value, llmProcessedCount.value),
+      })
+      return
+    }
+
+    if (event === 'skipped') {
+      llmProcessedCount.value += 1
       llmMessage.value = translate('stores.segment.llmProgress', {
         processed: llmProcessedCount.value,
         planned: Math.max(llmPlannedCount.value, llmProcessedCount.value),

@@ -25,8 +25,9 @@ services:
       GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-600}
       LIBREOFFICE_SOFFICE_PATH: /usr/bin/libreoffice
       LIBREOFFICE_PYTHON_PATH: /usr/bin/python3
-    ports:
-      - "${APP_PUBLISH_PORT:-19013}:19013"
+    # 仅在 Docker 内网暴露；公网入口由 docker-compose.nginx.yml 发布到 80。
+    expose:
+      - "19013"
     volumes:
       - app_file_storage:/app/data/file_records
       - app_export_tasks:/app/data/export_tasks
@@ -52,7 +53,7 @@ services:
   worker:
     image: ai-translation-system:latest
     container_name: ai-translation-worker
-    command: ["arq", "app.routers.api.WorkerSettings"]
+    command: ["arq", "app.routers.api.MaintenanceWorkerSettings"]
     healthcheck:
       disable: true
     env_file:
@@ -77,6 +78,160 @@ services:
       - app_import_tasks:/app/data/import_tasks
       - app_logs:/app/logs
     depends_on:
+      app:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  auto-tm-worker:
+    image: ai-translation-system:latest
+    container_name: ai-translation-auto-tm-worker
+    command: ["arq", "app.routers.api.AutoTMWorkerSettings"]
+    healthcheck:
+      disable: true
+    env_file:
+      - ${APP_ENV_FILE:-.env.prod}
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      FILE_STORAGE_DIR: /app/data/file_records
+      EXPORT_TASK_DIR: /app/data/export_tasks
+      IMPORT_TASK_DIR: /app/data/import_tasks
+      IMPORT_TASK_STAGING_TTL_SECONDS: ${IMPORT_TASK_STAGING_TTL_SECONDS:-86400}
+      RESOURCE_IMPORT_MAX_SIZE_MB: ${RESOURCE_IMPORT_MAX_SIZE_MB:-1024}
+      UPLOAD_MAX_SIZE_MB: ${UPLOAD_MAX_SIZE_MB:-100}
+      UPLOAD_MAX_FILES_PER_BATCH: ${UPLOAD_MAX_FILES_PER_BATCH:-50}
+      UPLOAD_MAX_TOTAL_SIZE_MB: ${UPLOAD_MAX_TOTAL_SIZE_MB:-1024}
+      UPLOAD_MAX_EXPANDED_FILES: ${UPLOAD_MAX_EXPANDED_FILES:-100}
+      LIBREOFFICE_SOFFICE_PATH: /usr/bin/libreoffice
+      LIBREOFFICE_PYTHON_PATH: /usr/bin/python3
+      DATABASE_APPLICATION_NAME: ai-translation-auto-tm-worker
+    volumes:
+      - app_file_storage:/app/data/file_records
+      - app_export_tasks:/app/data/export_tasks
+      - app_import_tasks:/app/data/import_tasks
+      - app_logs:/app/logs
+    depends_on:
+      app:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  segment-sync-worker:
+    image: ai-translation-system:latest
+    container_name: ai-translation-segment-sync-worker
+    command: ["arq", "app.routers.api.SegmentSyncWorkerSettings"]
+    healthcheck:
+      disable: true
+    env_file:
+      - ${APP_ENV_FILE:-.env.prod}
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      FILE_STORAGE_DIR: /app/data/file_records
+      EXPORT_TASK_DIR: /app/data/export_tasks
+      IMPORT_TASK_DIR: /app/data/import_tasks
+      IMPORT_TASK_STAGING_TTL_SECONDS: ${IMPORT_TASK_STAGING_TTL_SECONDS:-86400}
+      RESOURCE_IMPORT_MAX_SIZE_MB: ${RESOURCE_IMPORT_MAX_SIZE_MB:-1024}
+      UPLOAD_MAX_SIZE_MB: ${UPLOAD_MAX_SIZE_MB:-100}
+      UPLOAD_MAX_FILES_PER_BATCH: ${UPLOAD_MAX_FILES_PER_BATCH:-50}
+      UPLOAD_MAX_TOTAL_SIZE_MB: ${UPLOAD_MAX_TOTAL_SIZE_MB:-1024}
+      UPLOAD_MAX_EXPANDED_FILES: ${UPLOAD_MAX_EXPANDED_FILES:-100}
+      LIBREOFFICE_SOFFICE_PATH: /usr/bin/libreoffice
+      LIBREOFFICE_PYTHON_PATH: /usr/bin/python3
+      DATABASE_APPLICATION_NAME: ai-translation-segment-sync-worker
+    volumes:
+      - app_file_storage:/app/data/file_records
+      - app_export_tasks:/app/data/export_tasks
+      - app_import_tasks:/app/data/import_tasks
+      - app_logs:/app/logs
+    depends_on:
+      app:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  import-worker:
+    image: ai-translation-system:latest
+    container_name: ai-translation-import-worker
+    command: ["arq", "app.routers.api.ImportWorkerSettings"]
+    healthcheck:
+      disable: true
+    env_file:
+      - ${APP_ENV_FILE:-.env.prod}
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      FILE_STORAGE_DIR: /app/data/file_records
+      EXPORT_TASK_DIR: /app/data/export_tasks
+      IMPORT_TASK_DIR: /app/data/import_tasks
+      IMPORT_TASK_STAGING_TTL_SECONDS: ${IMPORT_TASK_STAGING_TTL_SECONDS:-86400}
+      RESOURCE_IMPORT_MAX_SIZE_MB: ${RESOURCE_IMPORT_MAX_SIZE_MB:-1024}
+      UPLOAD_MAX_SIZE_MB: ${UPLOAD_MAX_SIZE_MB:-100}
+      UPLOAD_MAX_FILES_PER_BATCH: ${UPLOAD_MAX_FILES_PER_BATCH:-50}
+      UPLOAD_MAX_TOTAL_SIZE_MB: ${UPLOAD_MAX_TOTAL_SIZE_MB:-1024}
+      UPLOAD_MAX_EXPANDED_FILES: ${UPLOAD_MAX_EXPANDED_FILES:-100}
+      LIBREOFFICE_SOFFICE_PATH: /usr/bin/libreoffice
+      LIBREOFFICE_PYTHON_PATH: /usr/bin/python3
+      DATABASE_APPLICATION_NAME: ai-translation-import-worker
+    volumes:
+      - app_file_storage:/app/data/file_records
+      - app_export_tasks:/app/data/export_tasks
+      - app_import_tasks:/app/data/import_tasks
+      - app_logs:/app/logs
+    depends_on:
+      app:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  pretranslation-worker:
+    image: ai-translation-system:latest
+    container_name: ai-translation-pretranslation-worker
+    command: ["arq", "app.routers.api.PretranslationWorkerSettings"]
+    healthcheck:
+      disable: true
+    env_file:
+      - ${APP_ENV_FILE:-.env.prod}
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      FILE_STORAGE_DIR: /app/data/file_records
+      EXPORT_TASK_DIR: /app/data/export_tasks
+      IMPORT_TASK_DIR: /app/data/import_tasks
+      IMPORT_TASK_STAGING_TTL_SECONDS: ${IMPORT_TASK_STAGING_TTL_SECONDS:-86400}
+      RESOURCE_IMPORT_MAX_SIZE_MB: ${RESOURCE_IMPORT_MAX_SIZE_MB:-1024}
+      UPLOAD_MAX_SIZE_MB: ${UPLOAD_MAX_SIZE_MB:-100}
+      UPLOAD_MAX_FILES_PER_BATCH: ${UPLOAD_MAX_FILES_PER_BATCH:-50}
+      UPLOAD_MAX_TOTAL_SIZE_MB: ${UPLOAD_MAX_TOTAL_SIZE_MB:-1024}
+      UPLOAD_MAX_EXPANDED_FILES: ${UPLOAD_MAX_EXPANDED_FILES:-100}
+      LIBREOFFICE_SOFFICE_PATH: /usr/bin/libreoffice
+      LIBREOFFICE_PYTHON_PATH: /usr/bin/python3
+      DATABASE_APPLICATION_NAME: ai-translation-pretranslation-worker
+    volumes:
+      - app_file_storage:/app/data/file_records
+      - app_export_tasks:/app/data/export_tasks
+      - app_import_tasks:/app/data/import_tasks
+      - app_logs:/app/logs
+    depends_on:
+      app:
+        condition: service_healthy
       pgbouncer:
         condition: service_started
       redis:

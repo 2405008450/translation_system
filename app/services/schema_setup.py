@@ -1,9 +1,17 @@
 ﻿from __future__ import annotations
 
+import logging
+import time
+
 from sqlalchemy import inspect, text
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from app.database import engine
+
+logger = logging.getLogger(__name__)
+
+RUNTIME_SCHEMA_MAX_ATTEMPTS = 5
+TRANSIENT_SCHEMA_SQLSTATES = {"40P01", "55P03", "57014"}
 
 
 UUID_SQL_DEFAULT = """
@@ -25,7 +33,7 @@ LEGACY_REQUIRED_EXISTING_TABLES = (
     "translation_memory_entries",
 )
 REQUIRED_SCHEMA = {
-    "memory_bases": {"source_language", "target_language"},
+    "memory_bases": {"source_language", "target_language", "creator_id"},
     "resource_import_batches": {
         "id",
         "resource_type",
@@ -53,6 +61,7 @@ REQUIRED_SCHEMA = {
         "name",
         "source_language",
         "target_language",
+        "creator_id",
     },
     "term_entries": {
         "id",
@@ -72,6 +81,7 @@ REQUIRED_SCHEMA = {
         "name",
         "source_language",
         "target_language",
+        "creator_id",
     },
     "glossary_entries": {
         "id",
@@ -136,6 +146,8 @@ REQUIRED_SCHEMA = {
         "term_base_write_ids",
         "qa_term_base_ids",
         "glossary_base_ids",
+        "tm_match_signature",
+        "tm_last_matched_at",
         "deadline",
         "access_level",
     },
@@ -214,6 +226,55 @@ REQUIRED_SCHEMA = {
         "cell_index",
         "ignored_by_id",
         "ignored_at",
+        "created_at",
+    },
+    "number_check_reports": {
+        "id",
+        "project_id",
+        "file_record_id",
+        "created_by_id",
+        "scope",
+        "file_ids",
+        "total_files",
+        "total_segments",
+        "checked_segments",
+        "program_issue_count",
+        "ai_issue_count",
+        "source_issue_count",
+        "ai_checked",
+        "status",
+        "created_at",
+    },
+    "number_check_report_items": {
+        "id",
+        "report_id",
+        "project_id",
+        "file_record_id",
+        "segment_id",
+        "sentence_id",
+        "file_name",
+        "source_text",
+        "target_text",
+        "source_numbers",
+        "target_numbers",
+        "error_reason",
+        "ai_checked",
+        "ai_is_correct",
+        "ai_errors",
+        "ai_source_issues",
+        "replace_anchor",
+        "suggested_value",
+        "is_source_consistent",
+        "ai_error_status",
+        "original_target_text",
+        "applied",
+        "applied_at",
+        "status",
+        "ignored_by_id",
+        "ignored_at",
+        "block_index",
+        "row_index",
+        "cell_index",
         "created_at",
     },
     "segment_qa_issues": {
@@ -302,6 +363,8 @@ REQUIRED_SCHEMA = {
         "workflow_step_id",
         "source_hash",
         "project_sync_disabled",
+        "project_sync_source_segment_id",
+        "project_sync_source_file_record_id",
         "source_word_count",
         "llm_provider",
         "llm_model",
@@ -467,6 +530,8 @@ REQUIRED_INDEXES = {
         "ix_segments_source_word_count",
         "ix_segments_source_hash",
         "ix_segments_file_source_hash",
+        "ix_segments_project_sync_source_segment_id",
+        "ix_segments_project_sync_source_file_record_id",
         "ix_segments_translated_source_word_count",
         "ix_segments_source_word_backfill",
         "ix_segments_translated_backfill",
@@ -558,6 +623,25 @@ REQUIRED_INDEXES = {
 
 
 def ensure_runtime_schema() -> None:
+    for attempt in range(1, RUNTIME_SCHEMA_MAX_ATTEMPTS + 1):
+        try:
+            _ensure_runtime_schema_once()
+            return
+        except OperationalError as exc:
+            if attempt >= RUNTIME_SCHEMA_MAX_ATTEMPTS or not _is_transient_schema_lock_error(exc):
+                raise
+            delay_seconds = min(2 ** (attempt - 1), 8)
+            logger.warning(
+                "runtime schema setup hit a transient database lock/deadlock; retrying in %ss "
+                "(attempt %s/%s)",
+                delay_seconds,
+                attempt + 1,
+                RUNTIME_SCHEMA_MAX_ATTEMPTS,
+            )
+            time.sleep(delay_seconds)
+
+
+def _ensure_runtime_schema_once() -> None:
     with engine.connect() as connection:
         inspector = inspect(connection)
         missing_existing_tables = [
@@ -603,6 +687,14 @@ def ensure_runtime_schema() -> None:
             "或 scripts/rename_translation_memory_tables.sql 后再启动服务。"
             f" 当前缺失项: {missing_text}"
         ) from exc
+
+
+def _is_transient_schema_lock_error(exc: OperationalError) -> bool:
+    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    if sqlstate in TRANSIENT_SCHEMA_SQLSTATES:
+        return True
+    message = str(exc).lower()
+    return "deadlock detected" in message or "lock timeout" in message
 
 
 def _collect_missing_schema(inspector) -> list[str]:
@@ -694,8 +786,16 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ADD COLUMN IF NOT EXISTS target_language VARCHAR(20)
             """,
             """
+            ALTER TABLE IF EXISTS memory_bases
+            ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
             CREATE INDEX IF NOT EXISTS ix_memory_bases_language_pair
             ON memory_bases (source_language, target_language)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_memory_bases_creator_id
+            ON memory_bases (creator_id)
             """,
             """
             ALTER TABLE IF EXISTS memory_entries
@@ -800,12 +900,28 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ADD COLUMN IF NOT EXISTS project_sync_disabled BOOLEAN NOT NULL DEFAULT FALSE
             """,
             """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS project_sync_source_segment_id UUID REFERENCES segments(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS project_sync_source_file_record_id UUID REFERENCES file_records(id) ON DELETE SET NULL
+            """,
+            """
             CREATE INDEX IF NOT EXISTS ix_segments_source_hash
             ON segments (source_hash)
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_segments_file_source_hash
             ON segments (file_record_id, source_hash)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_project_sync_source_segment_id
+            ON segments (project_sync_source_segment_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_project_sync_source_file_record_id
+            ON segments (project_sync_source_file_record_id)
             """,
             f"""
             CREATE TABLE IF NOT EXISTS term_bases (
@@ -814,6 +930,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 description TEXT,
                 source_language VARCHAR(20) NOT NULL,
                 target_language VARCHAR(20) NOT NULL,
+                creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
@@ -832,6 +949,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
             """
             ALTER TABLE IF EXISTS term_bases
+            ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS term_bases
             ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
             """,
             """
@@ -845,6 +966,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_term_bases_language_pair
             ON term_bases (source_language, target_language)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_bases_creator_id
+            ON term_bases (creator_id)
             """,
             """
             DROP TRIGGER IF EXISTS update_term_bases_updated_at ON term_bases
@@ -971,6 +1096,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 description TEXT,
                 source_language VARCHAR(20) NOT NULL,
                 target_language VARCHAR(20) NOT NULL,
+                creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
@@ -989,6 +1115,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
             """
             ALTER TABLE IF EXISTS glossary_bases
+            ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_bases
             ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
             """,
             """
@@ -1002,6 +1132,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_glossary_bases_language_pair
             ON glossary_bases (source_language, target_language)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_bases_creator_id
+            ON glossary_bases (creator_id)
             """,
             """
             DROP TRIGGER IF EXISTS update_glossary_bases_updated_at ON glossary_bases
@@ -1369,6 +1503,14 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS file_records
             ADD COLUMN IF NOT EXISTS tm_match_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.8
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS tm_match_signature VARCHAR(64)
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS tm_last_matched_at TIMESTAMP
             """,
             """
             UPDATE file_records
@@ -1914,6 +2056,14 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ADD COLUMN IF NOT EXISTS target_html TEXT
             """,
             """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS project_sync_source_segment_id UUID REFERENCES segments(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS project_sync_source_file_record_id UUID REFERENCES file_records(id) ON DELETE SET NULL
+            """,
+            """
             CREATE INDEX IF NOT EXISTS ix_segments_file_record_order
             ON segments (file_record_id, block_index, row_index, cell_index, sentence_id)
             """,
@@ -1928,6 +2078,14 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_segments_last_modified_by_id
             ON segments (last_modified_by_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_project_sync_source_segment_id
+            ON segments (project_sync_source_segment_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_project_sync_source_file_record_id
+            ON segments (project_sync_source_file_record_id)
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_segments_translated_source_word_count
@@ -2375,6 +2533,95 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_term_qa_report_items_ignored_at
             ON term_qa_report_items (ignored_at)
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS number_check_reports (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID REFERENCES file_records(id) ON DELETE CASCADE,
+                created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                scope VARCHAR(20) NOT NULL DEFAULT 'file',
+                file_ids TEXT NOT NULL DEFAULT '[]',
+                total_files INTEGER NOT NULL DEFAULT 0,
+                total_segments INTEGER NOT NULL DEFAULT 0,
+                checked_segments INTEGER NOT NULL DEFAULT 0,
+                program_issue_count INTEGER NOT NULL DEFAULT 0,
+                ai_issue_count INTEGER NOT NULL DEFAULT 0,
+                source_issue_count INTEGER NOT NULL DEFAULT 0,
+                ai_checked BOOLEAN NOT NULL DEFAULT FALSE,
+                status VARCHAR(20) NOT NULL DEFAULT 'completed',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS number_check_report_items (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                report_id UUID NOT NULL REFERENCES number_check_reports(id) ON DELETE CASCADE,
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+                segment_id UUID REFERENCES segments(id) ON DELETE SET NULL,
+                sentence_id VARCHAR(40) NOT NULL DEFAULT '',
+                file_name VARCHAR(255) NOT NULL DEFAULT '',
+                source_text TEXT NOT NULL DEFAULT '',
+                target_text TEXT NOT NULL DEFAULT '',
+                source_numbers TEXT NOT NULL DEFAULT '[]',
+                target_numbers TEXT NOT NULL DEFAULT '[]',
+                error_reason TEXT NOT NULL DEFAULT '',
+                ai_checked BOOLEAN NOT NULL DEFAULT FALSE,
+                ai_is_correct BOOLEAN NOT NULL DEFAULT TRUE,
+                ai_errors TEXT NOT NULL DEFAULT '[]',
+                ai_source_issues TEXT NOT NULL DEFAULT '[]',
+                replace_anchor TEXT NOT NULL DEFAULT '',
+                suggested_value TEXT NOT NULL DEFAULT '',
+                is_source_consistent BOOLEAN NOT NULL DEFAULT FALSE,
+                ai_error_status VARCHAR(40) NOT NULL DEFAULT '',
+                original_target_text TEXT NOT NULL DEFAULT '',
+                applied BOOLEAN NOT NULL DEFAULT FALSE,
+                applied_at TIMESTAMP,
+                status VARCHAR(20) NOT NULL DEFAULT 'open',
+                ignored_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                ignored_at TIMESTAMP,
+                block_index INTEGER NOT NULL DEFAULT 0,
+                row_index INTEGER,
+                cell_index INTEGER,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_reports_project_id
+            ON number_check_reports (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_reports_file_record_id
+            ON number_check_reports (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_reports_created_by_id
+            ON number_check_reports (created_by_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_reports_created_at
+            ON number_check_reports (created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_report_items_report_id
+            ON number_check_report_items (report_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_report_items_project_id
+            ON number_check_report_items (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_report_items_file_record_id
+            ON number_check_report_items (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_report_items_segment_id
+            ON number_check_report_items (segment_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_number_check_report_items_status
+            ON number_check_report_items (status)
             """,
             f"""
             CREATE TABLE IF NOT EXISTS segment_qa_issues (

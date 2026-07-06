@@ -255,6 +255,9 @@ export interface DocumentStatistics {
   engine_version: string | null
   license_status: string | null
   include_textboxes_footnotes_endnotes: boolean | null
+  statistics_profile: string | null
+  content_scope: string | null
+  statistics_warnings: string[]
   match_analysis: DocumentMatchAnalysis | null
   pages: number | null
   words: number | null
@@ -268,6 +271,13 @@ export interface DocumentStatistics {
   internal_repeated_characters: number | null
   cross_file_repeated_words: number | null
   cross_file_repeated_characters: number | null
+  image_count: number | null
+  unique_image_count: number | null
+  inline_image_count: number | null
+  floating_image_count: number | null
+  linked_image_count: number | null
+  chart_count: number | null
+  smartart_count: number | null
 }
 
 export interface DocumentMatchAnalysisRow {
@@ -286,6 +296,18 @@ export interface DocumentMatchAnalysis {
   rows: DocumentMatchAnalysisRow[]
 }
 
+export interface PretranslationMatchAnalysisPreviewResponse {
+  analysis: DocumentMatchAnalysis
+  remaining_new_segments: number
+  remaining_new_words: number
+  tm_applied_segments: number
+  tm_applied_words: number
+  repeat_segments: number
+  repeat_words: number
+  skipped_confirmed_segments: number
+  skipped_confirmed_words: number
+}
+
 export interface DocumentStatisticsTotals {
   pages: number | null
   words: number | null
@@ -299,6 +321,13 @@ export interface DocumentStatisticsTotals {
   internal_repeated_characters: number | null
   cross_file_repeated_words: number | null
   cross_file_repeated_characters: number | null
+  image_count: number | null
+  unique_image_count: number | null
+  inline_image_count: number | null
+  floating_image_count: number | null
+  linked_image_count: number | null
+  chart_count: number | null
+  smartart_count: number | null
   match_analysis: DocumentMatchAnalysis | null
 }
 
@@ -377,22 +406,46 @@ export interface UploadCapabilitiesResponse {
 }
 
 export interface TMMatchCandidate {
+  entry_id?: string | null
+  collection_id?: string | null
   source_text: string
   target_text: string
   score: number
   diff_html?: string | null
   collection_name: string | null
+  creator_id?: string | null
   creator_name: string | null
+  last_modified_by_id?: string | null
+  last_modified_by_name?: string | null
   created_at: string | null
   updated_at: string | null
 }
 
 export interface TermMatchCandidate {
+  entry_id?: string | null
+  term_base_id?: string | null
   source_text: string
   target_text: string
   term_base_name: string | null
+  creator_id?: string | null
   creator_name: string | null
+  last_modified_by_id?: string | null
+  last_modified_by_name?: string | null
+  created_at?: string | null
   updated_at: string | null
+}
+
+export interface ProjectSyncOrigin {
+  segment_id: string
+  sentence_id: string | null
+  file_record_id: string | null
+  filename: string | null
+  source_text: string | null
+  target_text: string | null
+  status: string | null
+  source: string | null
+  updated_at: string | null
+  last_modified_by?: User | null
 }
 
 export interface Segment {
@@ -402,6 +455,7 @@ export interface Segment {
   source_text: string
   display_text: string
   source_body_text?: string
+  source_layout_text?: string | null
   automatic_numbering_text?: string | null
   target_automatic_numbering_text?: string | null
   source_html?: string | null
@@ -409,6 +463,7 @@ export interface Segment {
   target_html?: string | null
   status: string
   project_sync_disabled?: boolean
+  project_sync_origin?: ProjectSyncOrigin | null
   version: number
   score: number
   matched_source_text: string | null
@@ -527,6 +582,60 @@ export interface WorkbenchQAResult {
   items: WorkbenchQAResultItem[]
 }
 
+export interface NumberCheckReportItem {
+  id: string
+  report_id: string
+  project_id: string | null
+  file_record_id: string
+  segment_id: string | null
+  sentence_id: string
+  file_name: string
+  source_text: string
+  target_text: string
+  source_numbers: string[]
+  target_numbers: string[]
+  error_reason: string
+  program_flagged: boolean
+  ai_checked: boolean
+  ai_is_correct: boolean
+  ai_errors: Record<string, unknown>[]
+  ai_source_issues: Record<string, unknown>[]
+  replace_anchor: string
+  suggested_value: string
+  is_source_consistent: boolean
+  ai_error_status: string
+  original_target_text: string
+  applied: boolean
+  applied_at: string | null
+  status: 'open' | 'ignored' | 'modified'
+  ignored: boolean
+  can_apply: boolean
+  block_index: number
+  row_index: number | null
+  cell_index: number | null
+  created_at: string | null
+}
+
+export interface NumberCheckReport {
+  id: string
+  project_id: string | null
+  file_record_id: string | null
+  scope: 'file' | 'merge_view'
+  file_ids: string[]
+  total_files: number
+  total_segments: number
+  checked_segments: number
+  program_issue_count: number
+  ai_issue_count: number
+  source_issue_count: number
+  ai_checked: boolean
+  active_issue_count: number
+  ignored_count: number
+  status: string
+  created_at: string | null
+  items: NumberCheckReportItem[]
+}
+
 export interface ProjectSegmentSyncSummary {
   filled_count: number
   updated_count: number
@@ -571,6 +680,7 @@ export interface FileRecordDetail {
   created_at: string
   updated_at: string
   server_time?: string
+  change_cursor?: string
   total_segments: number
   skip: number
   limit: number
@@ -607,6 +717,7 @@ export interface SegmentPageFilters {
   status_filters?: string[]
   match_filters?: string[]
   source_filters?: string[]
+  source_content_filters?: string[]
   workflow_step_ids?: string[]
 }
 
@@ -619,6 +730,7 @@ export interface SegmentPageResponse {
   limit: number
   filters: SegmentPageFilters
   server_time?: string
+  change_cursor?: string
   segments: Segment[]
 }
 
@@ -668,6 +780,12 @@ export interface MergeViewFile {
   workflow_progress?: WorkflowProgress[]
   can_write?: boolean
   is_edit_locked: boolean
+  collection_id?: string | null
+  collection_ids?: string[]
+  term_base_id?: string | null
+  term_base_ids?: string[]
+  term_base_write_ids?: string[]
+  qa_term_base_ids?: string[]
 }
 
 export interface MergeViewLanguagePair {
@@ -713,6 +831,7 @@ export interface MergeViewSegmentPageResponse {
   filters: SegmentPageFilters
   groups: MergeViewSegmentGroup[]
   server_time?: string
+  change_cursor?: string
   segments: Segment[]
 }
 
@@ -807,6 +926,8 @@ export interface TermBase {
   description: string | null
   source_language: string
   target_language: string
+  creator_id?: string | null
+  creator_name?: string | null
   created_at: string
   updated_at: string
   entry_count: number
@@ -818,6 +939,8 @@ export interface GlossaryBase {
   description: string | null
   source_language: string
   target_language: string
+  creator_id?: string | null
+  creator_name?: string | null
   created_at: string
   updated_at: string
   entry_count: number
@@ -964,6 +1087,8 @@ export interface TMCollection {
   description: string | null
   source_language: string | null
   target_language: string | null
+  creator_id?: string | null
+  creator_name?: string | null
   created_at: string
   updated_at: string
   entry_count: number
@@ -1348,6 +1473,12 @@ export interface TermMatch {
   term_base_name?: string | null
   source_text: string
   target_text: string
+  creator_id?: string | null
+  creator_name?: string | null
+  last_modified_by_id?: string | null
+  last_modified_by_name?: string | null
+  created_at?: string | null
+  updated_at?: string | null
   start: number
   end: number
 }

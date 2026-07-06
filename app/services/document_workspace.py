@@ -27,7 +27,7 @@ from app.services.automatic_numbering import (
 )
 from app.services.document_statistics import compute_docx_statistics
 from app.services.matcher import MatchStats, match_sentences_with_stats
-from app.services.normalizer import normalize_text
+from app.services.normalizer import normalize_text, normalize_text_preserve_lines
 from app.services.omml_to_mathml import convert as convert_omml_to_mathml
 from app.services.omml_to_mathml import serialize_omml_xml
 from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
@@ -35,6 +35,8 @@ from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
 
 NS = {
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
+    "c15": "http://schemas.microsoft.com/office/drawing/2012/chart",
     "m": "http://schemas.openxmlformats.org/officeDocument/2006/math",
     "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
     "rels": "http://schemas.openxmlformats.org/package/2006/relationships",
@@ -75,7 +77,7 @@ CELL_PARAGRAPH_BREAK_SENTINEL = "\uE000"
 PAGE_BREAK_SENTINEL = "\uE001"
 PAGE_BREAK_HTML = '<span class="doc-page-break" aria-hidden="true"></span>'
 DOCX_PARSE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
-DOCX_PARSE_CACHE_VERSION = "10"
+DOCX_PARSE_CACHE_VERSION = "11"
 DOCUMENT_PARSE_MODE_FULL = "full"
 DOCUMENT_PARSE_MODE_BODY_ONLY = "body_only"
 SUPPORTED_DOCUMENT_PARSE_MODES = {
@@ -1271,12 +1273,22 @@ def _normalize_segment_source_text(text: str) -> str:
     )
 
 
+def _normalize_segment_source_layout_text(text: str) -> str:
+    if not text:
+        return ""
+    return normalize_text_preserve_lines(
+        text.replace(CELL_PARAGRAPH_BREAK_SENTINEL, "\n").replace(PAGE_BREAK_SENTINEL, "\n")
+    )
+
+
 def _build_paragraph_classes(story_kind: str, block_type: str) -> list[str]:
     paragraph_classes = ["doc-paragraph"]
     if block_type == "table_cell":
         paragraph_classes.append("doc-table-paragraph")
     if block_type == "textbox":
         paragraph_classes.append("doc-textbox-paragraph")
+    if block_type == "chart_text":
+        paragraph_classes.append("doc-chart-paragraph")
     if story_kind != "body":
         paragraph_classes.append(f"doc-{story_kind}-paragraph")
     return paragraph_classes
@@ -1718,7 +1730,9 @@ def _render_paragraph_fragment_group(
     numbering_available = bool(numbering_text)
     for span in spans:
         sentence_display = _collect_span_text(fragments, span, use_source=False)
-        sentence_source = _normalize_segment_source_text(_collect_span_text(fragments, span, use_source=True))
+        raw_sentence_source = _collect_span_text(fragments, span, use_source=True)
+        sentence_source = _normalize_segment_source_text(raw_sentence_source)
+        sentence_layout_source = _normalize_segment_source_layout_text(raw_sentence_source)
         math_placeholders = _collect_span_math_placeholders(fragments, span)
         source_html = _collect_span_html(
             fragments,
@@ -1736,6 +1750,7 @@ def _render_paragraph_fragment_group(
                     "sentence_id": sentence_id,
                     "source_text": sentence_source,
                     "display_text": sentence_display,
+                    "source_layout_text": sentence_layout_source,
                     "source_html": source_html,
                     "numbering_text": segment_numbering_text,
                     "status": "none",
@@ -2214,7 +2229,14 @@ def _render_embedded_objects(
         numbering_state=numbering_state,
     )
     embedded_html_parts.extend(textbox_html_parts)
-    return embedded_html_parts, textbox_segments
+    chart_html_parts, chart_segments = _render_embedded_charts(
+        node=node,
+        story=story,
+        sentence_counter=sentence_counter,
+        block_counter=block_counter,
+    )
+    embedded_html_parts.extend(chart_html_parts)
+    return embedded_html_parts, textbox_segments + chart_segments
 
 
 def _render_embedded_images(
@@ -2281,6 +2303,96 @@ def _render_embedded_textboxes(
         return [], []
 
     return [f'<div class="doc-textbox">{paragraph_html}</div>'], paragraph_segments
+
+
+def _render_embedded_charts(
+    node: ET.Element,
+    story: StoryPart,
+    sentence_counter,
+    block_counter,
+) -> tuple[list[str], list[dict]]:
+    chart_html_parts: list[str] = []
+    chart_segments: list[dict] = []
+
+    for _, chart_root in _iter_related_chart_parts(node, story):
+        for text_element in _iter_chart_text_elements(chart_root):
+            text_value = text_element.text or ""
+            paragraph_html, paragraph_segments = _render_paragraph_from_fragments(
+                fragments=[InlineFragment(display_text=text_value, source_text=text_value)],
+                sentence_counter=sentence_counter,
+                block_index=next(block_counter),
+                block_type=_resolve_segment_block_type(story.kind, "chart_text"),
+                paragraph_classes=_build_paragraph_classes(story.kind, "chart_text"),
+            )
+            if not paragraph_html:
+                continue
+
+            chart_html_parts.append(f'<div class="doc-chart-text">{paragraph_html}</div>')
+            chart_segments.extend(paragraph_segments)
+
+    return chart_html_parts, chart_segments
+
+
+def _iter_related_chart_parts(node: ET.Element, story: StoryPart):
+    seen_parts: set[str] = set()
+    for chart in node.findall(".//c:chart", NS):
+        rel_id = chart.get(_qn("r", "id"))
+        if not rel_id:
+            continue
+
+        part_name = story.rels.get(rel_id)
+        if not part_name or part_name in seen_parts:
+            continue
+
+        chart_root = story.package.read_xml(part_name)
+        if chart_root is None:
+            continue
+
+        seen_parts.add(part_name)
+        yield part_name, chart_root
+
+
+def _iter_chart_text_elements(chart_root: ET.Element):
+    for text_element in chart_root.findall(".//a:r/a:t", NS):
+        if _is_translatable_chart_text(text_element.text or ""):
+            yield text_element
+
+    for text_element in chart_root.findall(".//c:v", NS):
+        if _is_translatable_chart_text(text_element.text or ""):
+            yield text_element
+
+
+def _is_translatable_chart_text(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.upper() == "[CELLRANGE]":
+        return False
+    if _is_number_like(stripped):
+        return False
+    return any(char.isalpha() or _is_cjk(char) for char in stripped)
+
+
+def _is_number_like(text: str) -> bool:
+    normalized = text.replace(",", "").replace("%", "").strip()
+    if not normalized:
+        return False
+    try:
+        float(normalized)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_cjk(char: str) -> bool:
+    codepoint = ord(char)
+    return (
+        0x2E80 <= codepoint <= 0xA4CF
+        or 0xAC00 <= codepoint <= 0xD7AF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0xFF00 <= codepoint <= 0xFFEF
+        or 0x20000 <= codepoint <= 0x2FA1F
+    )
 
 
 def _extract_embedded_images(
@@ -2957,7 +3069,7 @@ def _build_cell_span_attrs(cell: ET.Element) -> str:
 
 
 def _resolve_segment_block_type(story_kind: str, block_type: str) -> str:
-    if block_type in {"table_cell", "textbox"}:
+    if block_type in {"table_cell", "textbox", "chart_text"}:
         return block_type
     if story_kind in {"header", "footer", "footnote", "endnote", "comment"}:
         return story_kind

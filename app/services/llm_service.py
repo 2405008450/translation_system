@@ -56,11 +56,16 @@ class LLMTranslationTask:
     block_index: int = 0
     row_index: int | None = None
     cell_index: int | None = None
+    source_layout_text: str = ""
     matched_source_text: str | None = None
     tm_target_text: str | None = None
     glossary_matches: list[GlossaryMatch] = field(default_factory=list)
     should_translate: bool = True
     project_sync_disabled: bool = False
+    base_version: int | None = None
+    base_status: str | None = None
+    base_source: str | None = None
+    base_target_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -163,7 +168,9 @@ def _failures_for_tasks(tasks: list[LLMTranslationTask], message: str) -> list[L
 
 NUMERIC_LIKE_FRAGMENT_RE = re.compile(r"^[0-9\s,.\-+/%()（）$€¥￥£:：]+$")
 MATH_PLACEHOLDER_RE = re.compile(r"⟦MATH_\d+⟧")
+LINE_BREAK_PLACEHOLDER_RE = re.compile(r"⟦LB_\d+⟧")
 SYMBOL_VALIDATION_ERROR_MESSAGE = "复选框或特殊符号未按原文原样保留。"
+LINE_BREAK_VALIDATION_ERROR_MESSAGE = "版式换行未按原文保留。"
 STRICT_PRESERVE_SYMBOLS = frozenset(
     {
         "□",
@@ -199,6 +206,68 @@ STRICT_PRESERVE_SYMBOLS = frozenset(
 STRICT_PRESERVE_SYMBOL_CLASS = "".join(re.escape(char) for char in sorted(STRICT_PRESERVE_SYMBOLS))
 LINE_PREFIX_SYMBOL_RE = re.compile(rf"^(\s*(?:[{STRICT_PRESERVE_SYMBOL_CLASS}]\s*)+)(.*)$")
 UNSAFE_LOCALIZED_LIST_PREFIX_SYMBOLS = frozenset({"-", "–", "—", "*", "・", "∙", "⁃", "‣", "◾", "◽"})
+
+
+def _normalize_line_breaks(text: str) -> str:
+    return (text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _line_break_count(text: str) -> int:
+    return _normalize_line_breaks(text).count("\n")
+
+
+def _task_layout_source_text(task: LLMTranslationTask) -> str:
+    layout_text = _normalize_line_breaks(task.source_layout_text or "")
+    return layout_text or _normalize_line_breaks(task.source_text)
+
+
+def _task_preservation_source_text(task: LLMTranslationTask) -> str:
+    layout_text = _task_layout_source_text(task)
+    return layout_text if "\n" in layout_text else task.source_text
+
+
+def _encode_line_break_placeholders(text: str) -> str:
+    normalized = _normalize_line_breaks(text)
+    parts: list[str] = []
+    line_break_index = 1
+    for char in normalized:
+        if char == "\n":
+            parts.append(f"⟦LB_{line_break_index}⟧")
+            line_break_index += 1
+        else:
+            parts.append(char)
+    return "".join(parts)
+
+
+def _decode_line_break_placeholders(text: str) -> str:
+    return LINE_BREAK_PLACEHOLDER_RE.sub("\n", _normalize_line_breaks(text))
+
+
+def _format_source_for_prompt(task: LLMTranslationTask) -> str:
+    layout_text = _task_layout_source_text(task)
+    if "\n" not in layout_text:
+        return task.source_text
+    return _encode_line_break_placeholders(layout_text)
+
+
+def _format_batch_source_for_prompt(task: LLMTranslationTask) -> str:
+    source = _format_source_for_prompt(task)
+    line_break_instruction = _line_break_instruction(task)
+    if line_break_instruction:
+        return f"{source}\n    {line_break_instruction}"
+    return source
+
+
+def _line_break_instruction(task: LLMTranslationTask) -> str:
+    layout_text = _task_layout_source_text(task)
+    line_break_count = _line_break_count(layout_text)
+    if line_break_count <= 0:
+        return ""
+    placeholders = ", ".join(f"⟦LB_{index}⟧" for index in range(1, line_break_count + 1))
+    return (
+        f"原文版式包含 {line_break_count} 个换行，提示中用 {placeholders} 标记。"
+        "这些标记不可翻译、不可删除；译文必须保留同数量换行标记，系统会在写回前还原为真实换行。"
+    )
 
 
 def validate_provider_choice(
@@ -684,6 +753,11 @@ def _build_messages(
     source_label = _format_language_for_prompt(task.source_language, "源语言")
     target_label = _format_language_for_prompt(task.target_language, "目标语言")
     language_pair = f"{source_label} -> {target_label}"
+    prompt_source = _format_source_for_prompt(task)
+    line_break_instruction = _line_break_instruction(task)
+    line_break_prompt_block = f"{line_break_instruction}\n" if line_break_instruction else ""
+    fuzzy_line_break_requirement = f"5. {line_break_instruction}\n" if line_break_instruction else ""
+    fuzzy_final_requirement_index = 6 if line_break_instruction else 5
     system_prompt = (
         f"你是专业的文档翻译专家，当前任务语言对为：{language_pair}。"
         f"请将内容从{source_label}翻译为{target_label}。"
@@ -720,7 +794,7 @@ def _build_messages(
                 "content": (
                     f"请基于翻译记忆库参考译文，修正当前句子的{target_label}翻译。\n"
                     "这不是从零重译，而是以翻译记忆库译文为底稿进行定向修改。\n\n"
-                    f"当前原文：{task.source_text}\n"
+                    f"当前原文：{prompt_source}\n"
                     f"翻译记忆库匹配到的原文：{task.matched_source_text or '无'}\n"
                     f"翻译记忆库的译文：{task.tm_target_text or '无'}\n"
                     f"两个原文之间的差异：{_describe_diff(task.source_text, task.matched_source_text or '')}\n\n"
@@ -730,7 +804,8 @@ def _build_messages(
                     "2. 重点根据两个原文之间的差异，对基础译文做对应修改，而不是忽略基础译文直接整句重译。\n"
                     "3. 必须让结果完整表达“当前原文”的全部含义；如果当前原文比记忆库原文多了信息，就补全；如果少了信息，就删去不再适用的内容；如果有替换，就准确改写对应部分。\n"
                     "4. 保留数字、单位、标点风格、专有名词、复选框/勾选框/项目符号/箭头/特殊符号和已存在的专业术语一致性，不得擅自增删或替换符号。\n"
-                    f"5. 输出必须是最终可直接使用的完整{target_label}译文，只输出译文本身。\n\n"
+                    f"{fuzzy_line_break_requirement}"
+                    f"{fuzzy_final_requirement_index}. 输出必须是最终可直接使用的完整{target_label}译文，只输出译文本身。\n\n"
                     f"请输出基于记忆库译文修订后的最终{target_label}译文。{retry_instruction}"
                 ),
             },
@@ -746,7 +821,8 @@ def _build_messages(
                     f"如果内容只是数字、金额、百分比、日期、编号或符号，并且在{target_label}中通常可直接沿用，请原样输出。\n"
                     "如果内容中包含可翻译文字，只翻译文字部分，并尽量保留数字和原有排版格式。\n"
                     "除非原文明确体现需要按目标语言转换的数字单位或本地格式，否则不要擅自改动千分位、小数点、货币符号、编号格式或特殊符号。\n\n"
-                    f"原文：{task.source_text}\n\n"
+                    f"原文：{prompt_source}\n"
+                    f"{line_break_prompt_block}\n"
                     f"{_optional_glossary_prompt_block(task)}"
                     f"只输出最终结果。{retry_instruction}"
                 ),
@@ -761,7 +837,8 @@ def _build_messages(
                 f"请将以下内容作为独立片段从{source_label}翻译为{target_label}。"
                 "不要补充未提供的上下文，也不要参考前后句。"
                 "\n"
-                f"原文：{task.source_text}\n\n"
+                f"原文：{prompt_source}\n"
+                f"{line_break_prompt_block}\n"
                 f"{_optional_glossary_prompt_block(task)}"
                 f"请严格保留原文中的数字、复选框、勾选框、项目符号、箭头和特殊符号，不得擅自新增、替换或改变其状态。\n\n只输出{target_label}译文。{retry_instruction}"
             ),
@@ -826,6 +903,7 @@ def _extract_math_placeholder_sequence(text: str) -> list[str]:
 
 
 def _validate_or_repair_translation_output(task: LLMTranslationTask, translated_text: str) -> str:
+    translated_text = _decode_line_break_placeholders(translated_text)
     try:
         _validate_translation_output(task, translated_text)
         return translated_text
@@ -833,7 +911,7 @@ def _validate_or_repair_translation_output(task: LLMTranslationTask, translated_
         if str(exc) != SYMBOL_VALIDATION_ERROR_MESSAGE:
             raise
 
-        repaired_text = _repair_preserved_symbols(task.source_text, translated_text)
+        repaired_text = _repair_preserved_symbols(_task_preservation_source_text(task), translated_text)
         if repaired_text is None or repaired_text == translated_text:
             raise
 
@@ -843,6 +921,7 @@ def _validate_or_repair_translation_output(task: LLMTranslationTask, translated_
 
 
 def _validate_translation_output(task: LLMTranslationTask, translated_text: str) -> None:
+    translated_text = _decode_line_break_placeholders(translated_text)
     normalized_output = normalize_text(translated_text)
     if not normalized_output:
         raise LLMResponseValidationError("LLM 返回空译文。")
@@ -851,17 +930,21 @@ def _validate_translation_output(task: LLMTranslationTask, translated_text: str)
         if normalized_output != normalize_text(task.source_text):
             raise LLMResponseValidationError("数字或符号片段未按原文保留。")
 
-    source_symbols = _extract_preserved_symbol_sequence(task.source_text)
+    source_symbols = _extract_preserved_symbol_sequence(_task_preservation_source_text(task))
     if source_symbols:
         output_symbols = _extract_preserved_symbol_sequence(translated_text)
         if output_symbols != source_symbols:
             raise LLMResponseValidationError(SYMBOL_VALIDATION_ERROR_MESSAGE)
 
-    source_math_placeholders = _extract_math_placeholder_sequence(task.source_text)
+    source_math_placeholders = _extract_math_placeholder_sequence(_task_preservation_source_text(task))
     if source_math_placeholders:
         output_math_placeholders = _extract_math_placeholder_sequence(translated_text)
         if output_math_placeholders != source_math_placeholders:
             raise LLMResponseValidationError("数学公式占位符未按原文原样保留。")
+
+    source_line_breaks = _line_break_count(_task_layout_source_text(task))
+    if source_line_breaks and _line_break_count(translated_text) != source_line_breaks:
+        raise LLMResponseValidationError(LINE_BREAK_VALIDATION_ERROR_MESSAGE)
 
 
 def _repair_preserved_symbols(source_text: str, translated_text: str) -> str | None:
@@ -1153,6 +1236,10 @@ def _build_paragraph_messages(
             "status": task.status,
             "source_text": task.source_text,
         }
+        layout_source = _task_layout_source_text(task)
+        if "\n" in layout_source:
+            item["source_layout_text"] = _encode_line_break_placeholders(layout_source)
+            item["layout_note"] = _line_break_instruction(task)
         if task.should_translate:
             required_sentence_ids.append(task.sentence_id)
         if task.status == "fuzzy":
@@ -1179,6 +1266,7 @@ def _build_paragraph_messages(
 
     user_content = (
         "请翻译 JSON 中 translate=true 的句子。translate=false 的句子只用于理解上下文，不要返回它们的译文。\n"
+        "如果某条句子包含 source_layout_text，请优先翻译 source_layout_text；其中的 ⟦LB_n⟧ 是原文换行标记，必须在 target_text 中按数量保留，不能翻译、删除或重排为普通文字。\n"
         "返回 JSON 的 translations 键集合必须与 required_sentence_ids 完全一致；不要依赖顺序。\n"
         "每个 source_hash 必须原样带回，target_text 只写最终译文。\n\n"
         "输入：\n"
@@ -1290,7 +1378,7 @@ def _build_batch_messages(
         for idx, task in enumerate(group.tasks, 1):
             diff = _describe_diff(task.source_text, task.matched_source_text or "")
             lines.append(
-                f"[{idx}] 当前原文：{task.source_text}\n"
+                f"[{idx}] 当前原文：{_format_batch_source_for_prompt(task)}\n"
                 f"    记忆库原文：{task.matched_source_text or '无'}\n"
                 f"    记忆库译文：{task.tm_target_text or '无'}\n"
                 f"    差异：{diff}"
@@ -1306,7 +1394,7 @@ def _build_batch_messages(
         )
     elif group.group_type == "numeric":
         lines = [
-            f"[{idx}] {task.source_text}"
+            f"[{idx}] {_format_batch_source_for_prompt(task)}"
             + (f"\n    词汇表命中：{_format_glossary_matches_for_prompt(task)}" if task.glossary_matches else "")
             for idx, task in enumerate(group.tasks, 1)
         ]
@@ -1321,7 +1409,7 @@ def _build_batch_messages(
         )
     else:
         lines = [
-            f"[{idx}] {task.source_text}"
+            f"[{idx}] {_format_batch_source_for_prompt(task)}"
             + (f"\n    词汇表命中：{_format_glossary_matches_for_prompt(task)}" if task.glossary_matches else "")
             for idx, task in enumerate(group.tasks, 1)
         ]

@@ -55,7 +55,7 @@ sudo docker-compose -f docker-compose.prod.yml exec postgres \
   psql -U postgres -d tm_demo \
   -c "ALTER USER tm_user WITH PASSWORD '替换成你的新强密码';"
 
-sudo docker-compose -f docker-compose.prod.yml up -d app worker
+sudo docker-compose -f docker-compose.prod.yml up -d app worker pretranslation-worker
 ```
 
 ## 3. 从局域网数据库导出
@@ -91,7 +91,7 @@ scp file_storage.tar.gz ubuntu@43.132.156.72:~/opt/translation_system/
 ```bash
 cd ~/opt/translation_system
 
-sudo docker-compose -f docker-compose.prod.yml stop app worker
+sudo docker-compose -f docker-compose.prod.yml stop app worker pretranslation-worker
 ```
 
 重建空数据库并恢复 dump：
@@ -132,8 +132,8 @@ sudo docker cp data/export_tasks/. ai-translation-app:/app/data/export_tasks/ ||
 最后启动并验证：
 
 ```bash
-sudo docker-compose -f docker-compose.prod.yml up -d app worker
-curl http://127.0.0.1:19013/api/health
+sudo docker-compose -f docker-compose.prod.yml -f docker-compose.nginx.yml up -d app worker pretranslation-worker nginx
+curl http://127.0.0.1/api/health
 ```
 
 ## 6. 不建议裸露公网数据库

@@ -31,7 +31,9 @@ from app.services.document_workspace import (
     _build_story_parts,
     _build_trimmed_span,
     _decode_symbol,
+    _iter_chart_text_elements,
     _iter_block_nodes,
+    _iter_related_chart_parts,
     _local_name,
     _normalize_segment_source_text,
     _qn,
@@ -54,10 +56,21 @@ BILINGUAL_LAYOUT_SOURCE_FIRST = "source_first"
 BILINGUAL_LAYOUT_TARGET_FIRST = "target_first"
 BlockKey = tuple[str, int, int | None, int | None]
 MATH_PLACEHOLDER_RE = re.compile(r"⟦MATH_\d+⟧|\[\[MATH_\d+\]\]")
+MATH_PLACEHOLDER_TOKEN_RE = re.compile(r"^(?:⟦|\[\[)(MATH_\d+)(?:⟧|\]\])$")
 ENGLISH_BOUNDARY_TRAILING_RE = re.compile(r"[,;:.!?][\"')\]\}]*$")
 ENGLISH_WORD_LEADING_RE = re.compile(r"^[\"'“‘(\[]*[A-Za-z0-9]")
 # 支持的格式标签
 FORMAT_TAG_RE = re.compile(r"<(/?)(b|strong|i|em|u|s|strike|del|sub|sup)>", re.IGNORECASE)
+EXPLICIT_FORMAT_RUN_PROPERTIES = {
+    "b",
+    "bCs",
+    "i",
+    "iCs",
+    "u",
+    "strike",
+    "dstrike",
+    "vertAlign",
+}
 
 
 @dataclass(frozen=True)
@@ -242,7 +255,9 @@ def export_bilingual_docx_with_layout(
     return _build_modified_docx(
         raw_bytes=raw_bytes,
         package=package,
-        part_names={story.part_name for story in stories} | {"word/numbering.xml"},
+        part_names={story.part_name for story in stories}
+        | _collect_related_chart_part_names(stories)
+        | {"word/numbering.xml"},
     )
 
 
@@ -302,7 +317,9 @@ def export_translated_docx(
     return _build_modified_docx(
         raw_bytes=raw_bytes,
         package=package,
-        part_names={story.part_name for story in stories} | {"word/numbering.xml"},
+        part_names={story.part_name for story in stories}
+        | _collect_related_chart_part_names(stories)
+        | {"word/numbering.xml"},
     )
 
 
@@ -568,6 +585,13 @@ def _export_bilingual_block_sequence(
                 story=story,
                 block_counter=block_counter,
                 numbering_schema=numbering_schema,
+                segments_by_block=segments_by_block,
+                order=order,
+            )
+            _export_bilingual_embedded_charts(
+                node=child,
+                story=story,
+                block_counter=block_counter,
                 segments_by_block=segments_by_block,
                 order=order,
             )
@@ -891,6 +915,96 @@ def _group_table_cell_paragraph_groups(
     return grouped_paragraphs
 
 
+def _cell_paragraph_group_tokens(paragraph_group: list[CellParagraphTokens]) -> list[TextToken]:
+    tokens: list[TextToken] = []
+    for index, item in enumerate(paragraph_group):
+        if index > 0:
+            tokens.append(
+                TextToken(
+                    display_text="\n",
+                    source_text=CELL_PARAGRAPH_BREAK_SENTINEL,
+                )
+            )
+        tokens.extend(item.tokens)
+    return tokens
+
+
+def _try_distribute_table_cell_paragraph_lines(
+    cell: ET.Element,
+    paragraph_group: list[CellParagraphTokens],
+    group_segments: list[ExportSegment],
+    story: StoryPart,
+    block_counter,
+    numbering_schema: NumberingSchema,
+    segments_by_block: dict[BlockKey, list[ExportSegment]],
+) -> bool:
+    if len(paragraph_group) < 2 or len(group_segments) != 1:
+        return False
+
+    segment = group_segments[0]
+    if segment.target_html is not None or segment.math_placeholders:
+        return False
+
+    replacement = _resolve_segment_replacement_text(segment)
+    replacement = replacement.replace("\r\n", "\n").replace("\r", "\n")
+    if "\n" not in replacement or not normalize_text(replacement):
+        return False
+
+    lines = replacement.split("\n")
+    if len(lines) < 2:
+        return False
+
+    extra_paragraph_template = deepcopy(paragraph_group[-1].paragraph)
+    for index, item in enumerate(paragraph_group):
+        line = lines[index] if index < len(lines) else ""
+        _replace_entire_paragraph_tokens_with_text(item.tokens, line)
+
+    if len(lines) <= len(paragraph_group):
+        return True
+
+    parent = paragraph_group[-1].parent or cell
+    anchor = paragraph_group[-1].paragraph
+    try:
+        insert_index = list(parent).index(anchor) + 1
+    except ValueError:
+        parent = cell
+        insert_index = list(parent).index(anchor) + 1 if anchor in list(parent) else len(parent)
+
+    for line in lines[len(paragraph_group):]:
+        clone = _clone_bilingual_paragraph(extra_paragraph_template)
+        parent.insert(insert_index, clone)
+        insert_index += 1
+        clone_tokens = _collect_inline_tokens(
+            node=clone,
+            story=story,
+            block_counter=block_counter,
+            numbering_schema=numbering_schema,
+            segments_by_block=segments_by_block,
+            math_placeholder_counter=[0],
+            process_embedded_textboxes=False,
+        )
+        _replace_entire_paragraph_tokens_with_text(clone_tokens, line)
+
+    return True
+
+
+def _replace_entire_paragraph_tokens_with_text(tokens: list[TextToken], text: str) -> None:
+    if not tokens:
+        return
+
+    _assign_token_offsets(tokens)
+    display_text = "".join(token.display_text for token in tokens)
+    if not display_text:
+        return
+
+    _queue_sentence_replacement(
+        tokens,
+        SentenceSpan(start=0, end=len(display_text)),
+        text,
+    )
+    _apply_token_edits(tokens)
+
+
 def _export_bilingual_table_cell(
     cell: ET.Element,
     story: StoryPart,
@@ -971,6 +1085,13 @@ def _export_bilingual_table_cell(
                 segments_by_block=segments_by_block,
                 order=order,
             )
+            _export_bilingual_embedded_charts(
+                node=block,
+                story=story,
+                block_counter=block_counter,
+                segments_by_block=segments_by_block,
+                order=order,
+            )
             continue
 
         if block_name == "tbl":
@@ -1041,18 +1162,31 @@ def _export_table_cell(
         if not paragraph_buffer:
             return
 
-        for token_group, sentence_count in _group_table_cell_paragraphs(paragraph_buffer, numbering_schema):
+        for paragraph_group, sentence_count in _group_table_cell_paragraph_groups(paragraph_buffer, numbering_schema):
             if sentence_count == 0:
                 continue
+            group_segments = cell_segments[segment_cursor : segment_cursor + sentence_count]
+            if _try_distribute_table_cell_paragraph_lines(
+                cell=cell,
+                paragraph_group=paragraph_group,
+                group_segments=group_segments,
+                story=story,
+                block_counter=block_counter,
+                numbering_schema=numbering_schema,
+                segments_by_block=segments_by_block,
+            ):
+                segment_cursor += sentence_count
+                continue
+            token_group = _cell_paragraph_group_tokens(paragraph_group)
             _replace_block_tokens(
                 tokens=token_group,
-                segments=cell_segments[segment_cursor : segment_cursor + sentence_count],
+                segments=group_segments,
             )
             segment_cursor += sentence_count
 
         paragraph_buffer = []
 
-    for block in _iter_block_nodes(cell):
+    for parent, block in _iter_block_nodes_with_parent(cell):
         block_name = _local_name(block.tag)
         if block_name == "p":
             paragraph_buffer.append(
@@ -1066,6 +1200,7 @@ def _export_table_cell(
                         segments_by_block=segments_by_block,
                         math_placeholder_counter=[0],
                     ),
+                    parent=parent,
                 )
             )
             continue
@@ -1270,7 +1405,17 @@ def _collect_inline_tokens(
         return [TextToken(display_text="\t", source_text="\t")]
 
     if node.tag in {_qn("w", "br"), _qn("w", "cr")}:
-        return [TextToken(display_text="\n", source_text="\n")]
+        return [
+            TextToken(
+                display_text="\n",
+                source_text="\n",
+                element=node,
+                run_element=current_run,
+                anchor_element=current_run if current_run is not None else node,
+                container_element=current_run_container if current_run_container is not None else parent_element,
+                original_text="",
+            )
+        ]
 
     if node.tag == _qn("w", "noBreakHyphen"):
         return [TextToken(display_text="-", source_text="-")]
@@ -1294,6 +1439,12 @@ def _collect_inline_tokens(
             story=story,
             block_counter=block_counter,
             numbering_schema=numbering_schema,
+            segments_by_block=segments_by_block,
+        )
+        _export_embedded_charts(
+            node=node,
+            story=story,
+            block_counter=block_counter,
             segments_by_block=segments_by_block,
         )
         return []
@@ -1365,6 +1516,23 @@ def _export_bilingual_embedded_textboxes(
             story=story,
             block_counter=block_counter,
             numbering_schema=numbering_schema,
+            segments_by_block=segments_by_block,
+            order=order,
+        )
+
+
+def _export_bilingual_embedded_charts(
+    node: ET.Element,
+    story: StoryPart,
+    block_counter,
+    segments_by_block: dict[BlockKey, list[ExportSegment]],
+    order: str,
+) -> None:
+    for embedded_node in _iter_embedded_object_nodes_for_export(node):
+        _export_embedded_chart_object(
+            node=embedded_node,
+            story=story,
+            block_counter=block_counter,
             segments_by_block=segments_by_block,
             order=order,
         )
@@ -1445,6 +1613,58 @@ def _export_embedded_textboxes(
             numbering_schema=numbering_schema,
             segments_by_block=segments_by_block,
         )
+
+
+def _export_embedded_charts(
+    node: ET.Element,
+    story: StoryPart,
+    block_counter,
+    segments_by_block: dict[BlockKey, list[ExportSegment]],
+) -> None:
+    for embedded_node in _iter_embedded_object_nodes_for_export(node):
+        _export_embedded_chart_object(
+            node=embedded_node,
+            story=story,
+            block_counter=block_counter,
+            segments_by_block=segments_by_block,
+        )
+
+
+def _export_embedded_chart_object(
+    node: ET.Element,
+    story: StoryPart,
+    block_counter,
+    segments_by_block: dict[BlockKey, list[ExportSegment]],
+    order: str | None = None,
+) -> None:
+    for _, chart_root in _iter_related_chart_parts(node, story):
+        for text_element in _iter_chart_text_elements(chart_root):
+            text_value = text_element.text or ""
+            block_segments = segments_by_block.get(
+                (_resolve_segment_block_type(story.kind, "chart_text"), next(block_counter), None, None),
+                [],
+            )
+            if not block_segments:
+                continue
+
+            tokens = [
+                TextToken(
+                    display_text=text_value,
+                    source_text=text_value,
+                    element=text_element,
+                    original_text=text_value,
+                )
+            ]
+            replacement_segments = (
+                _build_inline_bilingual_segments(block_segments, order)
+                if order is not None
+                else block_segments
+            )
+            _replace_block_tokens(
+                tokens=tokens,
+                segments=replacement_segments,
+                keep_source_when_empty=order is None,
+            )
 
 
 def _export_embedded_textbox_object(
@@ -1549,17 +1769,7 @@ def _replace_block_tokens(
 
         segment = segments[segment_index]
         segment_index += 1
-        replacement = (
-            segment.target_text
-            if _is_target_placeholder(segment.target_text)
-            else strip_automatic_numbering_prefix(
-                segment.target_text,
-                source_text=segment.source_text,
-                display_text=segment.display_text,
-                numbering_text=segment.numbering_text,
-                reference_texts=[segment.matched_source_text],
-            )
-        )
+        replacement = _resolve_segment_replacement_text(segment)
         if previous_span is not None:
             boundary_text = display_text[previous_span.end:span.start]
             replacement = _normalize_adjacent_english_target_boundary(
@@ -1580,8 +1790,7 @@ def _replace_block_tokens(
 
         expected_math_placeholders = _extract_math_placeholders_from_tokens(tokens, span)
 
-        # 检查是否有自定义格式（target_html 包含格式标签）
-        has_custom_format = _has_format_tags(segment.target_html)
+        has_custom_target_html = segment.target_html is not None
 
         if expected_math_placeholders:
             _queue_math_sentence_replacement(
@@ -1590,8 +1799,7 @@ def _replace_block_tokens(
                 replacement=replacement,
                 expected_math_placeholders=expected_math_placeholders,
             )
-        elif has_custom_format:
-            # 使用带格式的替换
+        elif has_custom_target_html:
             _queue_formatted_sentence_replacement(tokens, span, segment.target_html)
         else:
             _queue_sentence_replacement(tokens, span, replacement)
@@ -1604,6 +1812,18 @@ def _replace_block_tokens(
 
 def _is_target_placeholder(text: str | None) -> bool:
     return bool(text) and not normalize_text(text or "")
+
+
+def _resolve_segment_replacement_text(segment: ExportSegment) -> str:
+    if _is_target_placeholder(segment.target_text):
+        return segment.target_text
+    return strip_automatic_numbering_prefix(
+        segment.target_text,
+        source_text=segment.source_text,
+        display_text=segment.display_text,
+        numbering_text=segment.numbering_text,
+        reference_texts=[segment.matched_source_text],
+    )
 
 
 def _collect_cell_group_tokens(
@@ -1743,13 +1963,15 @@ def _queue_math_sentence_replacement(
 ) -> None:
     text_parts = _split_replacement_around_math_placeholders(replacement, expected_math_placeholders)
     if text_parts is None:
+        if (
+            not MATH_PLACEHOLDER_RE.search(replacement)
+            and _span_contains_only_math_placeholders(tokens, span, expected_math_placeholders)
+        ):
+            _replace_math_only_span_with_plain_text(tokens, span, replacement)
+            return
         raise ValueError("导出失败：译文中的数学公式占位符顺序或数量与原文不一致。")
 
-    sentence_tokens = [
-        token
-        for token in tokens
-        if token.start < span.end and token.end > span.start
-    ]
+    sentence_tokens = _collect_tokens_overlapping_span(tokens, span)
     math_tokens = [token for token in sentence_tokens if token.is_math]
     if len(math_tokens) != len(expected_math_placeholders):
         raise ValueError("导出失败：段落中的数学公式结构与句段映射不一致。")
@@ -1774,7 +1996,7 @@ def _split_replacement_around_math_placeholders(
     expected_math_placeholders: list[str],
 ) -> list[str] | None:
     matches = list(MATH_PLACEHOLDER_RE.finditer(replacement))
-    actual_placeholders = [match.group(0) for match in matches]
+    actual_placeholders = [_canonical_math_placeholder(match.group(0)) for match in matches]
     if actual_placeholders != expected_math_placeholders:
         return None
 
@@ -1787,6 +2009,87 @@ def _split_replacement_around_math_placeholders(
     return text_parts
 
 
+def _canonical_math_placeholder(placeholder: str) -> str:
+    match = MATH_PLACEHOLDER_TOKEN_RE.match(placeholder)
+    if not match:
+        return placeholder
+    return f"⟦{match.group(1)}⟧"
+
+
+def _collect_tokens_overlapping_span(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+) -> list[TextToken]:
+    return [
+        token
+        for token in tokens
+        if token.start < span.end and token.end > span.start
+    ]
+
+
+def _span_contains_only_math_placeholders(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+    expected_math_placeholders: list[str],
+) -> bool:
+    span_tokens = _collect_tokens_overlapping_span(tokens, span)
+    math_placeholders = [token.source_text for token in span_tokens if token.is_math]
+    if math_placeholders != expected_math_placeholders:
+        return False
+
+    for token in span_tokens:
+        if token.is_math:
+            continue
+        overlap_start = max(span.start, token.start)
+        overlap_end = min(span.end, token.end)
+        if overlap_end <= overlap_start:
+            continue
+        local_start = overlap_start - token.start
+        local_end = overlap_end - token.start
+        if normalize_text(token.display_text[local_start:local_end]):
+            return False
+    return bool(math_placeholders)
+
+
+def _replace_math_only_span_with_plain_text(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+    replacement: str,
+) -> None:
+    math_tokens = [
+        token
+        for token in _collect_tokens_overlapping_span(tokens, span)
+        if token.is_math and token.anchor_element is not None and token.container_element is not None
+    ]
+    if not math_tokens:
+        return
+
+    first_token = math_tokens[0]
+    parent = first_token.container_element
+    anchor = first_token.anchor_element
+    if parent is None or anchor is None:
+        return
+
+    try:
+        insert_index = list(parent).index(anchor)
+    except ValueError:
+        return
+    for token in math_tokens:
+        token_parent = token.container_element
+        token_anchor = token.anchor_element
+        if token_parent is None or token_anchor is None:
+            continue
+        try:
+            token_parent.remove(token_anchor)
+        except ValueError:
+            continue
+
+    if replacement:
+        for run in _build_inserted_word_runs(replacement, None):
+            parent.insert(insert_index, run)
+            insert_index += 1
+
+
 def _queue_text_region_replacement(
     tokens: list[TextToken],
     region_start: int,
@@ -1796,6 +2099,7 @@ def _queue_text_region_replacement(
     after_token: TextToken | None,
 ) -> None:
     writable_overlaps: list[tuple[TextToken, int, int]] = []
+    structural_line_break_tokens: list[TextToken] = []
     for token in tokens:
         if token.element is None:
             continue
@@ -1803,10 +2107,17 @@ def _queue_text_region_replacement(
         overlap_end = min(region_end, token.end)
         if overlap_end <= overlap_start:
             continue
+        if _is_word_structural_line_break_token(token):
+            structural_line_break_tokens.append(token)
+            continue
         writable_overlaps.append((token, overlap_start - token.start, overlap_end - token.start))
 
     if writable_overlaps:
-        _queue_text_range_edit(writable_overlaps, replacement_text)
+        _queue_text_range_edit(
+            writable_overlaps,
+            replacement_text,
+            structural_line_break_tokens=structural_line_break_tokens,
+        )
         return
 
     if not replacement_text:
@@ -1815,11 +2126,32 @@ def _queue_text_region_replacement(
     _insert_text_run_between_tokens(replacement_text, before_token=before_token, after_token=after_token)
 
 
+def _is_word_structural_line_break_token(token: TextToken) -> bool:
+    return (
+        token.display_text == "\n"
+        and token.source_text == "\n"
+        and token.element is not None
+        and _local_name(token.element.tag) in {"br", "cr"}
+        and _namespace_uri(token.element.tag) == NS["w"]
+        and token.anchor_element is not None
+        and token.container_element is not None
+    )
+
+
 def _queue_text_range_edit(
     writable_overlaps: list[tuple[TextToken, int, int]],
     replacement_text: str,
+    structural_line_break_tokens: list[TextToken] | None = None,
 ) -> None:
     if not writable_overlaps:
+        return
+    structural_line_break_tokens = structural_line_break_tokens or []
+
+    if ("\n" in replacement_text or structural_line_break_tokens) and _queue_structural_word_text_range_edit(
+        writable_overlaps,
+        replacement_text,
+        structural_line_break_tokens,
+    ):
         return
 
     replacement_index = 0
@@ -1836,6 +2168,63 @@ def _queue_text_range_edit(
             token.edits.append((local_start, local_end, ""))
 
 
+def _queue_structural_word_text_range_edit(
+    writable_overlaps: list[tuple[TextToken, int, int]],
+    replacement_text: str,
+    structural_line_break_tokens: list[TextToken],
+) -> bool:
+    replacement_token: TextToken | None = None
+    for token, _, _ in writable_overlaps:
+        if (
+            token.run_element is not None
+            and token.container_element is not None
+            and token.anchor_element is not None
+            and _namespace_uri(token.run_element.tag) == NS["w"]
+        ):
+            replacement_token = token
+            break
+    if replacement_token is None:
+        return False
+
+    parent = replacement_token.container_element
+    anchor = replacement_token.anchor_element
+    if parent is None or anchor is None:
+        return False
+
+    try:
+        insert_index = list(parent).index(anchor)
+    except ValueError:
+        return False
+
+    for run in _build_inserted_word_runs(replacement_text, replacement_token.run_element):
+        parent.insert(insert_index, run)
+        insert_index += 1
+
+    for token, local_start, local_end in writable_overlaps:
+        token.edits.append((local_start, local_end, ""))
+        token.apply_export_font = False
+
+    _remove_structural_line_break_tokens(structural_line_break_tokens)
+    return True
+
+
+def _remove_structural_line_break_tokens(tokens: list[TextToken]) -> None:
+    removed: set[tuple[int, int]] = set()
+    for token in tokens:
+        parent = token.container_element
+        anchor = token.anchor_element
+        if parent is None or anchor is None:
+            continue
+        key = (id(parent), id(anchor))
+        if key in removed:
+            continue
+        try:
+            parent.remove(anchor)
+        except ValueError:
+            continue
+        removed.add(key)
+
+
 def _insert_text_run_between_tokens(
     text: str,
     before_token: TextToken | None,
@@ -1848,14 +2237,18 @@ def _insert_text_run_between_tokens(
         parent = after_token.container_element
         index = list(parent).index(after_token.anchor_element)
         reference_run = _pick_reference_run(before_token, after_token)
-        parent.insert(index, _build_inserted_word_run(text, reference_run))
+        for run in _build_inserted_word_runs(text, reference_run):
+            parent.insert(index, run)
+            index += 1
         return
 
     if before_token is not None and before_token.container_element is not None and before_token.anchor_element is not None:
         parent = before_token.container_element
         index = list(parent).index(before_token.anchor_element) + 1
         reference_run = _pick_reference_run(before_token, after_token)
-        parent.insert(index, _build_inserted_word_run(text, reference_run))
+        for run in _build_inserted_word_runs(text, reference_run):
+            parent.insert(index, run)
+            index += 1
 
 
 def _pick_reference_run(
@@ -1868,8 +2261,22 @@ def _pick_reference_run(
     return None
 
 
-def _build_inserted_word_run(text: str, reference_run: ET.Element | None) -> ET.Element:
-    text = _sanitize_xml_text(text)
+def _build_inserted_word_runs(text: str, reference_run: ET.Element | None) -> list[ET.Element]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if "\n" not in normalized:
+        return [_build_inserted_word_run(normalized, reference_run)] if normalized else []
+
+    runs: list[ET.Element] = []
+    lines = normalized.split("\n")
+    for index, line in enumerate(lines):
+        if line:
+            runs.append(_build_inserted_word_run(line, reference_run))
+        if index < len(lines) - 1:
+            runs.append(_build_inserted_word_break_run(reference_run))
+    return runs
+
+
+def _build_word_run_shell(reference_run: ET.Element | None) -> ET.Element:
     if reference_run is not None and _namespace_uri(reference_run.tag) == NS["w"]:
         run_element = deepcopy(reference_run)
         for child in list(run_element):
@@ -1877,12 +2284,25 @@ def _build_inserted_word_run(text: str, reference_run: ET.Element | None) -> ET.
                 run_element.remove(child)
     else:
         run_element = ET.Element(_qn("w", "r"))
+    return run_element
+
+
+def _build_inserted_word_run(text: str, reference_run: ET.Element | None) -> ET.Element:
+    text = _sanitize_xml_text(text)
+    run_element = _build_word_run_shell(reference_run)
 
     text_element = ET.Element(_qn("w", "t"))
     text_element.text = text
     if _needs_space_preserve(text):
         text_element.set(XML_SPACE_ATTR, "preserve")
     run_element.append(text_element)
+    _apply_export_font(run_element)
+    return run_element
+
+
+def _build_inserted_word_break_run(reference_run: ET.Element | None) -> ET.Element:
+    run_element = _build_word_run_shell(reference_run)
+    run_element.append(ET.Element(_qn("w", "br")))
     _apply_export_font(run_element)
     return run_element
 
@@ -1957,7 +2377,7 @@ def _queue_formatted_sentence_replacement(
     # 在第一个 token 位置插入格式化的 runs
     if first_token.run_element is not None and first_token.container_element is not None:
         parent = first_token.container_element
-        anchor = first_token.anchor_element or first_token.run_element
+        anchor = first_token.anchor_element if first_token.anchor_element is not None else first_token.run_element
         insert_index = list(parent).index(anchor)
 
         # 为每个格式化片段创建一个 run
@@ -1989,6 +2409,8 @@ def _build_formatted_word_run(
         run_properties = ET.Element(_qn("w", "rPr"))
         run_element.insert(0, run_properties)
 
+    _clear_explicit_format_run_properties(run_properties)
+
     # 应用格式
     if fragment.bold:
         _set_run_property(run_properties, "b")
@@ -2015,6 +2437,12 @@ def _build_formatted_word_run(
     _apply_export_font(run_element)
 
     return run_element
+
+
+def _clear_explicit_format_run_properties(run_properties: ET.Element) -> None:
+    for child in list(run_properties):
+        if _namespace_uri(child.tag) == NS["w"] and _local_name(child.tag) in EXPLICIT_FORMAT_RUN_PROPERTIES:
+            run_properties.remove(child)
 
 
 def _set_run_property(run_properties: ET.Element, prop_name: str) -> None:
@@ -2054,6 +2482,7 @@ def _queue_sentence_replacement(
         return
 
     writable_overlaps: list[tuple[TextToken, int, int]] = []
+    structural_line_break_tokens: list[TextToken] = []
     for token in tokens:
         if token.element is None:
             continue
@@ -2062,12 +2491,19 @@ def _queue_sentence_replacement(
         overlap_end = min(span.end, token.end)
         if overlap_end <= overlap_start:
             continue
+        if _is_word_structural_line_break_token(token):
+            structural_line_break_tokens.append(token)
+            continue
 
         writable_overlaps.append(
             (token, overlap_start - token.start, overlap_end - token.start)
         )
 
-    _queue_text_range_edit(writable_overlaps, replacement)
+    _queue_text_range_edit(
+        writable_overlaps,
+        replacement,
+        structural_line_break_tokens=structural_line_break_tokens,
+    )
 
 
 @dataclass(frozen=True)
@@ -2440,6 +2876,14 @@ def _build_modified_docx(
     return output.getvalue()
 
 
+def _collect_related_chart_part_names(stories: Iterable[StoryPart]) -> set[str]:
+    part_names: set[str] = set()
+    for story in stories:
+        for part_name, _ in _iter_related_chart_parts(story.root, story):
+            part_names.add(part_name)
+    return part_names
+
+
 FORMATTING_ELEMENT_NAMES = {
     "pPr",
     "rPr",
@@ -2558,7 +3002,7 @@ def _sanitize_xml_text(text: str) -> str:
 
 
 def _resolve_segment_block_type(story_kind: str, block_type: str) -> str:
-    if block_type in {"table_cell", "textbox"}:
+    if block_type in {"table_cell", "textbox", "chart_text"}:
         return block_type
     if story_kind in {"header", "footer", "footnote", "endnote", "comment"}:
         return story_kind

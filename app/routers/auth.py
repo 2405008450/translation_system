@@ -20,6 +20,7 @@ from app.auth import (
     is_super_admin_role,
     list_users,
     require_admin,
+    require_project_assignment_manager,
     require_users_table,
     serialize_user,
     update_user_profile,
@@ -161,6 +162,18 @@ def get_users(
     return [
         UserRead.model_validate(serialize_user(user))
         for user in list_users(db)
+    ]
+
+
+@router.get("/assignable-users", response_model=list[UserRead])
+def get_assignable_users(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_project_assignment_manager),
+) -> list[UserRead]:
+    return [
+        UserRead.model_validate(serialize_user(user))
+        for user in list_users(db)
+        if user.role == USER_ROLE and user.is_active
     ]
 
 

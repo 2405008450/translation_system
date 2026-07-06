@@ -96,6 +96,20 @@ EXPORT_OPTIONS = {
         extension=".xlf",
         mime_type="application/xliff+xml",
     ),
+    "bilingual_excel": ExportOption(
+        id="bilingual_excel",
+        name="双语 Excel",
+        description="导出为 Excel 双语对照表格（原文/译文两列）",
+        extension=".xlsx",
+        mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ),
+    "bilingual_excel_original": ExportOption(
+        id="bilingual_excel_original",
+        name="Excel 原格式双语",
+        description="保留原 Excel 工作簿元素，在原单元格内按原文、译文换行导出",
+        extension=".xlsx",
+        mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ),
 }
 
 
@@ -108,6 +122,7 @@ FORMAT_EXPORT_SUPPORT: Dict[str, List[str]] = {
         "bilingual_docx_layout_source_first",
         "bilingual_docx_layout_target_first",
         "bilingual_docx",
+        "bilingual_excel",
         "bilingual_txt",
         "tmx",
         "xliff",
@@ -117,55 +132,56 @@ FORMAT_EXPORT_SUPPORT: Dict[str, List[str]] = {
         "bilingual_docx_layout_source_first",
         "bilingual_docx_layout_target_first",
         "bilingual_docx",
+        "bilingual_excel",
         "bilingual_txt",
         "tmx",
         "xliff",
     ],
-    ".pdf": ["bilingual_docx", "bilingual_txt", "tmx", "xliff"],  # PDF 无法原格式导出
-    ".pptx": ["original", "bilingual_docx", "bilingual_txt", "tmx", "xliff"],
-    ".xlsx": ["original", "bilingual_docx", "bilingual_txt", "tmx", "xliff"],
-    
+    ".pdf": ["bilingual_docx", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],  # PDF 无法原格式导出
+    ".pptx": ["original", "bilingual_docx", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".xlsx": ["original", "bilingual_excel_original", "bilingual_docx", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+
     # 纯文本
-    ".txt": ["original", "bilingual_txt", "tmx", "xliff"],
-    ".dat": ["original", "bilingual_txt", "tmx", "xliff"],
-    
+    ".txt": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".dat": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+
     # 本地化文件 - 支持所有导出选项
-    ".properties": ["original", "bilingual", "bilingual_txt", "tmx", "xliff"],
-    ".po": ["original", "bilingual", "bilingual_txt", "tmx", "xliff"],
-    ".pot": ["original", "bilingual", "bilingual_txt", "tmx", "xliff"],
-    ".strings": ["original", "bilingual", "bilingual_txt", "tmx", "xliff"],
-    ".yaml": ["original", "bilingual_txt", "tmx", "xliff"],
-    ".yml": ["original", "bilingual_txt", "tmx", "xliff"],
-    ".json": ["original", "bilingual_txt", "tmx", "xliff"],
-    ".php": ["original", "bilingual_txt", "tmx", "xliff"],
-    
+    ".properties": ["original", "bilingual", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".po": ["original", "bilingual", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".pot": ["original", "bilingual", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".strings": ["original", "bilingual", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".yaml": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".yml": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".json": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".php": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+
     # 网页/排版文件
-    ".html": ["original", "bilingual", "bilingual_txt", "tmx", "xliff"],
-    ".htm": ["original", "bilingual", "bilingual_txt", "tmx", "xliff"],
-    ".md": ["original", "bilingual_txt", "tmx", "xliff"],
-    ".markdown": ["original", "bilingual_txt", "tmx", "xliff"],
-    ".csv": ["original", "bilingual_txt", "tmx", "xliff"],
-    ".srt": ["original", "bilingual_txt", "tmx", "xliff"],
-    
+    ".html": ["original", "bilingual", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".htm": ["original", "bilingual", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".md": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".markdown": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".csv": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".srt": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+
     # 技术写作文件
-    ".dita": ["original", "bilingual_txt", "tmx", "xliff"],
-    ".ditamap": ["original", "bilingual_txt", "tmx", "xliff"],
-    ".xml": ["original", "bilingual_txt", "tmx", "xliff"],
-    ".svg": ["original", "bilingual_txt", "tmx", "xliff"],
-    
+    ".dita": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".ditamap": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".xml": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".svg": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+
     # 双语文件 - 本身就是双语格式
-    ".sdlxliff": ["original", "tmx"],
-    ".txml": ["original", "tmx"],
-    
+    ".sdlxliff": ["original", "bilingual_excel", "tmx"],
+    ".txml": ["original", "bilingual_excel", "tmx"],
+
     # 工程/设计文件
-    ".dxf": ["original", "bilingual_txt", "tmx", "xliff"],
-    ".dwg": ["original", "bilingual_txt", "tmx", "xliff"],
-    ".idml": ["original", "bilingual_txt", "tmx", "xliff"],
-    ".mif": ["original", "bilingual_txt", "tmx", "xliff"],
-    
+    ".dxf": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".dwg": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".idml": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".mif": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+
     # 压缩包
-    ".zip": ["original", "tmx", "xliff"],
-    ".rar": ["original", "tmx", "xliff"],  # 导出为 ZIP
+    ".zip": ["original", "bilingual_excel", "tmx", "xliff"],
+    ".rar": ["original", "bilingual_excel", "tmx", "xliff"],  # 导出为 ZIP
 }
 
 

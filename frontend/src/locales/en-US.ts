@@ -322,6 +322,11 @@ const overrides = {
     empty: 'No projects',
     createDialogTitle: 'New Project',
     createDialogDescription: 'After creating a project, upload documents from the project details page.',
+    form: {
+      languagePairBinding: 'Project language pair (optional)',
+      languagePairBindingHint: 'Bind a language pair when every file in this project will use the same direction. Leave it unbound to choose per upload.',
+      noLanguagePairBinding: 'Do not bind',
+    },
     status: {
       confirmedProgress: 'Overall progress',
     },
@@ -350,7 +355,7 @@ const overrides = {
     },
     files: {
       title: 'Files',
-      description: 'A project can contain multiple files. Select the language pair when uploading.',
+      description: 'A project can contain multiple files. Bound projects reuse the project language pair for every upload.',
       empty: 'No files to display.',
       openHint: 'Open the translation workbench',
       processingHint: 'The source document is uploaded and will be available after processing.',
@@ -371,6 +376,14 @@ const overrides = {
         filter: 'Filter',
         columns: 'Columns',
       },
+    },
+    uploadLanguage: {
+      boundHint: 'This project has a bound language pair. All uploaded files will use it.',
+      unboundHint: 'You can detect the first file source language, then adjust source and target manually.',
+      boundMessage: 'Project language pair: {pair}',
+    },
+    settings: {
+      languageLockedHint: 'A project language pair can be bound during creation. After creation it is read-only; unbound projects still set language per file.',
     },
     mergeViews: {
       title: 'Views',
@@ -453,12 +466,14 @@ const overrides = {
       llm: {
         modelTipTitle: 'Model selection tip',
         modelTipBody: 'For normal pre-translation, use a fast model such as Gemini 3 Flash Preview or GPT-5.4 Mini. If the rule set is large or terminology/style requirements are strict, use Gemini 3.1 Pro Preview or GPT-5.5. These models are called through OpenRouter.',
-        scopeHint: 'The default flow matches TM first, then sends only fuzzy and unmatched segments to the LLM. 100% TM matches usually do not need model rewriting.',
+        scopeHint: 'The default flow matches TM first, then sends only fuzzy and unmatched segments to the LLM. 100% TM matches usually do not need model rewriting. "Exact match" and "100% match rate" refer to the same state here.',
+        contextMode: 'Paragraph context',
+        contextModeTitle: 'Off: stable sentence mode. On: strict paragraph context mode with structured JSON output.',
         scopes: {
           all: 'Fuzzy matches + no matches (recommended)',
           fuzzyOnly: 'Only fuzzy matches',
           noneOnly: 'Only no matches',
-          emptyTargetOnly: 'Only empty targets',
+          emptyTargetOnly: 'Only empty targets (ignore match status)',
           allWithExact: 'Include 100% TM matches (risky)',
         },
       },
@@ -545,7 +560,7 @@ const overrides = {
       },
       allWithExact: {
         label: 'All segments',
-        description: 'Rerun exact-match segments as well.',
+        description: 'Rerun exact-match segments as well; exact match means a 100% match rate.',
       },
       emptyTargetOnly: {
         label: 'Empty targets only',

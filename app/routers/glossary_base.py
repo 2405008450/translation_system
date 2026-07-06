@@ -13,7 +13,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.auth import get_current_user, require_admin
+from app.auth import get_current_user, get_user_display_name, require_admin, require_resource_creator
 from app.config import get_settings
 from app.database import SessionLocal, get_db
 from app.models import FileRecord, GlossaryBase, GlossaryEntry, User
@@ -153,6 +153,8 @@ def _serialize_glossary_base(glossary_base: GlossaryBase, entry_count: int = 0) 
         "description": glossary_base.description,
         "source_language": glossary_base.source_language,
         "target_language": glossary_base.target_language,
+        "creator_id": str(glossary_base.creator_id) if glossary_base.creator_id else None,
+        "creator_name": get_user_display_name(glossary_base.creator),
         "created_at": glossary_base.created_at.isoformat(),
         "updated_at": glossary_base.updated_at.isoformat(),
         "entry_count": entry_count,
@@ -217,7 +219,7 @@ def list_glossary_bases(db: Session = Depends(get_db)):
 def create_glossary_base(
     payload: GlossaryBasePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_resource_creator),
 ):
     name = _normalize_glossary_base_name(payload.name)
     if not name:
@@ -231,6 +233,7 @@ def create_glossary_base(
         description=normalize_text(payload.description or "") or None,
         source_language=source_language,
         target_language=target_language,
+        creator_id=current_user.id,
     )
     db.add(glossary_base)
     try:
@@ -528,6 +531,23 @@ def _run_glossary_resource_import_task(task_id: str, payload: dict[str, Any]) ->
         cleanup_import_task_staging(staging_task_id)
 
 
+async def _queue_glossary_resource_import_task(
+    background_tasks: BackgroundTasks,
+    task_id: str,
+    payload: dict[str, Any],
+) -> None:
+    from app.routers.api import ARQ_IMPORT_QUEUE_NAME, _enqueue_arq_job
+
+    if await _enqueue_arq_job(
+        "glossary_resource_import_job",
+        task_id,
+        payload,
+        queue_name=ARQ_IMPORT_QUEUE_NAME,
+    ):
+        return
+    background_tasks.add_task(_run_glossary_resource_import_task, task_id, payload)
+
+
 @router.post("/glossary-bases/import-xlsx")
 async def import_glossary_base_xlsx(
     background_tasks: BackgroundTasks,
@@ -565,7 +585,7 @@ async def import_glossary_base_xlsx(
             "creator_id": str(current_user.id),
         }
         set_import_task_status(task_id, "queued", progress=0, message="词汇表导入任务已进入队列。")
-        background_tasks.add_task(_run_glossary_resource_import_task, task_id, payload)
+        await _queue_glossary_resource_import_task(background_tasks, task_id, payload)
         return JSONResponse(
             status_code=202,
             content={

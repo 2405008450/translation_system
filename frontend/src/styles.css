@@ -1945,7 +1945,7 @@ body.modal-open {
   border-radius: 0;
   background: transparent;
   box-shadow: none;
-  font-size: 16.5px;
+  font-size: calc(16.5px * var(--segment-editor-font-scale, 1));
   line-height: 1.55;
   overflow: visible;
 }

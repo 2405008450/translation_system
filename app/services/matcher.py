@@ -15,7 +15,13 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models import MemoryEntry
 from app.schemas import MatchResult, TMMatchCandidate
-from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
+from app.services.normalizer import (
+    build_source_hash,
+    compact_match_core,
+    is_short_structural_fragment,
+    normalize_match_text,
+    normalize_text,
+)
 from app.services.tm_vector import (
     TM_EMBEDDING_VERSION,
     build_tm_embedding_literal,
@@ -29,6 +35,8 @@ EXACT_MATCH_BATCH_SIZE = 1000
 DEFAULT_FUZZY_MATCH_BATCH_SIZE = 50
 FUZZY_CANDIDATE_LIMIT = 3
 TM_CANDIDATES_LIMIT = 5
+FUZZY_MISMATCH_SCORE_CEILING = 0.99
+SHORT_STRUCTURAL_MISMATCH_SCORE_CEILING = 0.79
 T = TypeVar("T")
 logger = logging.getLogger(__name__)
 
@@ -180,6 +188,7 @@ def get_tm_candidates(
         compare_text = normalize_match_text(row["source_normalized"]) or row["source_normalized"]
         sequence_score = SequenceMatcher(None, match_text, compare_text).ratio()
         final_score = max(float(row["trigram_score"]), sequence_score)
+        final_score = _cap_fuzzy_mismatch_score(final_score, match_text, compare_text)
 
         if final_score >= similarity_threshold:
             seen_sources.add(row["source_text"])
@@ -241,6 +250,26 @@ def _escape_html(text: str) -> str:
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
+
+
+def _cap_fuzzy_mismatch_score(score: float, query_match_text: str, compare_text: str) -> float:
+    safe_score = min(max(float(score or 0.0), 0.0), 1.0)
+    normalized_query = normalize_match_text(query_match_text) or query_match_text
+    normalized_compare = normalize_match_text(compare_text) or compare_text
+    if normalized_query and normalized_query == normalized_compare:
+        return safe_score
+    if _is_short_structural_core_match(normalized_query, normalized_compare):
+        sequence_score = SequenceMatcher(None, normalized_query, normalized_compare).ratio()
+        return min(safe_score, sequence_score, SHORT_STRUCTURAL_MISMATCH_SCORE_CEILING)
+    return min(safe_score, FUZZY_MISMATCH_SCORE_CEILING)
+
+
+def _is_short_structural_core_match(query_text: str, compare_text: str) -> bool:
+    query_core = compact_match_core(query_text)
+    compare_core = compact_match_core(compare_text)
+    if not query_core or query_core != compare_core:
+        return False
+    return is_short_structural_fragment(query_text) or is_short_structural_fragment(compare_text)
 
 
 def match_sentences_with_stats(
@@ -400,8 +429,10 @@ def _resolve_matches(
             none_hits += 1
             continue
 
-        # 精确匹配只使用 source_hash，确保文本完全相同
-        exact_match = exact_matches_by_hash.get(sentence.auxiliary_hash)
+        # 带编号的辅助文本可优先匹配标题正文，但短编号片段不能因此被提升为精确匹配。
+        exact_match = None
+        if _allow_auxiliary_exact_match(sentence):
+            exact_match = exact_matches_by_hash.get(sentence.auxiliary_hash)
         if exact_match is None:
             exact_match = exact_matches_by_hash.get(sentence.source_hash)
 
@@ -414,12 +445,25 @@ def _resolve_matches(
                 creator_name = exact_match.creator.nickname or exact_match.creator.username
             # 构建单个精确匹配候选
             exact_candidate = TMMatchCandidate(
+                entry_id=str(exact_match.id),
+                collection_id=str(exact_match.collection_id) if exact_match.collection_id else None,
                 source_text=exact_match.source_text,
                 target_text=exact_match.target_text,
                 score=1.0,
                 diff_html=_build_diff_html(sentence.source_sentence, exact_match.source_text),
                 collection_name=collection_name,
+                creator_id=str(exact_match.creator_id) if exact_match.creator_id else None,
                 creator_name=creator_name,
+                last_modified_by_id=(
+                    str(exact_match.last_modified_by_id)
+                    if exact_match.last_modified_by_id
+                    else None
+                ),
+                last_modified_by_name=(
+                    exact_match.last_modified_by.nickname or exact_match.last_modified_by.username
+                    if exact_match.last_modified_by
+                    else None
+                ),
                 created_at=exact_match.created_at.isoformat() if exact_match.created_at else None,
                 updated_at=exact_match.updated_at.isoformat() if exact_match.updated_at else None,
             )
@@ -507,6 +551,12 @@ def _find_exact_matches(
     return matches_by_hash
 
 
+def _allow_auxiliary_exact_match(sentence: PreparedSentence) -> bool:
+    if not sentence.auxiliary_hash or sentence.auxiliary_hash == sentence.source_hash:
+        return False
+    return not is_short_structural_fragment(sentence.source_sentence)
+
+
 def _find_fuzzy_matches(
     db: Session,
     prepared_sentences: list[PreparedSentence],
@@ -573,28 +623,39 @@ def _find_fuzzy_matches_chunk(
             input.query_index,
             input.query_kind,
             input.query_text,
+            matched.entry_id,
+            matched.collection_id,
+            matched.creator_id,
+            matched.last_modified_by_id,
             matched.compare_text,
             matched.source_text,
             matched.target_text,
             matched.collection_name,
             matched.creator_name,
+            matched.last_modified_by_name,
             matched.created_at,
             matched.updated_at,
             matched.trigram_score
         FROM input
         LEFT JOIN LATERAL (
             SELECT
+                tm.id AS entry_id,
+                tm.collection_id,
+                tm.creator_id,
+                tm.last_modified_by_id,
                 tm.source_normalized AS compare_text,
                 tm.source_text,
                 tm.target_text,
                 mb.name AS collection_name,
                 COALESCE(u.nickname, u.username) AS creator_name,
+                COALESCE(lu.nickname, lu.username) AS last_modified_by_name,
                 tm.created_at,
                 tm.updated_at,
                 similarity(tm.source_normalized, input.query_text) AS trigram_score
 FROM memory_entries AS tm
             LEFT JOIN memory_bases AS mb ON mb.id = tm.collection_id
             LEFT JOIN users AS u ON u.id = tm.creator_id
+            LEFT JOIN users AS lu ON lu.id = tm.last_modified_by_id
             WHERE tm.source_normalized IS NOT NULL
               AND tm.source_normalized % input.query_text
               {collection_filter_sql}
@@ -619,15 +680,22 @@ FROM memory_entries AS tm
         if row["source_text"] is None or row["target_text"] is None:
             continue
         query_index = int(row["query_index"])
-        candidate_key = (row["source_text"], row["target_text"])
+        candidate_key = (row["entry_id"], row["source_text"], row["target_text"])
         candidate_entry = grouped_candidates.setdefault(query_index, {}).setdefault(
             candidate_key,
             {
+                "entry_id": str(row["entry_id"]) if row["entry_id"] else None,
+                "collection_id": str(row["collection_id"]) if row["collection_id"] else None,
+                "creator_id": str(row["creator_id"]) if row["creator_id"] else None,
+                "last_modified_by_id": (
+                    str(row["last_modified_by_id"]) if row["last_modified_by_id"] else None
+                ),
                 "compare_text": row["compare_text"],
                 "source_text": row["source_text"],
                 "target_text": row["target_text"],
                 "collection_name": row["collection_name"],
                 "creator_name": row["creator_name"],
+                "last_modified_by_name": row["last_modified_by_name"],
                 "created_at": row["created_at"].isoformat() if row["created_at"] else None,
                 "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
                 "source_trigram_score": 0.0,
@@ -671,12 +739,17 @@ FROM memory_entries AS tm
         # 构建所有候选列表
         tm_candidates = [
             TMMatchCandidate(
+                entry_id=c.get("entry_id"),
+                collection_id=c.get("collection_id"),
                 source_text=c["source_text"],
                 target_text=c["target_text"],
                 score=round(float(c["score"]), 4),
                 diff_html=_build_diff_html(sentence.source_sentence, c["source_text"]),
                 collection_name=c.get("collection_name"),
+                creator_id=c.get("creator_id"),
                 creator_name=c.get("creator_name"),
+                last_modified_by_id=c.get("last_modified_by_id"),
+                last_modified_by_name=c.get("last_modified_by_name"),
                 created_at=c.get("created_at"),
                 updated_at=c.get("updated_at"),
             )
@@ -760,28 +833,39 @@ def _merge_vector_candidates(
         SELECT
             input.query_index,
             input.query_kind,
+            matched.entry_id,
+            matched.collection_id,
+            matched.creator_id,
+            matched.last_modified_by_id,
             matched.compare_text,
             matched.source_text,
             matched.target_text,
             matched.collection_name,
             matched.creator_name,
+            matched.last_modified_by_name,
             matched.created_at,
             matched.updated_at,
             matched.vector_score
         FROM input
         LEFT JOIN LATERAL (
             SELECT
+                tm.id AS entry_id,
+                tm.collection_id,
+                tm.creator_id,
+                tm.last_modified_by_id,
                 COALESCE(tm.source_normalized, tm.source_text) AS compare_text,
                 tm.source_text,
                 tm.target_text,
                 mb.name AS collection_name,
                 COALESCE(u.nickname, u.username) AS creator_name,
+                COALESCE(lu.nickname, lu.username) AS last_modified_by_name,
                 tm.created_at,
                 tm.updated_at,
                 1 - (tm.source_embedding <=> input.query_vector) AS vector_score
 FROM memory_entries AS tm
             LEFT JOIN memory_bases AS mb ON mb.id = tm.collection_id
             LEFT JOIN users AS u ON u.id = tm.creator_id
+            LEFT JOIN users AS lu ON lu.id = tm.last_modified_by_id
             WHERE tm.source_embedding IS NOT NULL
               AND tm.source_embedding_version = :embedding_version
               AND 1 - (tm.source_embedding <=> input.query_vector) >= :vector_similarity_floor
@@ -805,15 +889,22 @@ FROM memory_entries AS tm
         if row["source_text"] is None or row["target_text"] is None:
             continue
         query_index = int(row["query_index"])
-        candidate_key = (row["source_text"], row["target_text"])
+        candidate_key = (row["entry_id"], row["source_text"], row["target_text"])
         candidate_entry = grouped_candidates.setdefault(query_index, {}).setdefault(
             candidate_key,
             {
+                "entry_id": str(row["entry_id"]) if row["entry_id"] else None,
+                "collection_id": str(row["collection_id"]) if row["collection_id"] else None,
+                "creator_id": str(row["creator_id"]) if row["creator_id"] else None,
+                "last_modified_by_id": (
+                    str(row["last_modified_by_id"]) if row["last_modified_by_id"] else None
+                ),
                 "compare_text": row["compare_text"] or row["source_text"],
                 "source_text": row["source_text"],
                 "target_text": row["target_text"],
                 "collection_name": row["collection_name"],
                 "creator_name": row["creator_name"],
+                "last_modified_by_name": row["last_modified_by_name"],
                 "created_at": row["created_at"].isoformat() if row["created_at"] else None,
                 "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
                 "source_trigram_score": 0.0,
@@ -842,14 +933,20 @@ def _pick_best_fuzzy_candidates(
 ) -> list[dict]:
     """返回Top N个最佳模糊匹配候选"""
     scored_candidates = []
+    allow_vector_boost = not is_short_structural_fragment(sentence.match_text)
 
     for candidate in candidates:
         compare_text_raw = candidate.get("compare_text") or candidate["source_text"]
         compare_text = normalize_match_text(compare_text_raw) or compare_text_raw
+        auxiliary_exact_signal = (
+            bool(sentence.auxiliary_match_text)
+            and not is_short_structural_fragment(sentence.match_text)
+            and compare_text == (normalize_match_text(sentence.auxiliary_match_text) or sentence.auxiliary_match_text)
+        )
         source_sequence_score = SequenceMatcher(None, sentence.match_text, compare_text).ratio()
         source_score = _blend_match_score(
             lexical_score=max(float(candidate["source_trigram_score"]), source_sequence_score),
-            vector_score=float(candidate.get("source_vector_score") or 0.0),
+            vector_score=float(candidate.get("source_vector_score") or 0.0) if allow_vector_boost else 0.0,
         )
 
         auxiliary_score = 0.0
@@ -864,28 +961,38 @@ def _pick_best_fuzzy_candidates(
                     float(candidate["auxiliary_trigram_score"]),
                     auxiliary_sequence_score,
                 ),
-                vector_score=float(candidate.get("auxiliary_vector_score") or 0.0),
+                vector_score=float(candidate.get("auxiliary_vector_score") or 0.0) if allow_vector_boost else 0.0,
             )
 
         base_score = max(source_score, auxiliary_score)
         final_score = base_score
         if auxiliary_score > source_score:
             final_score += min(auxiliary_score - source_score, 0.05)
+        if auxiliary_exact_signal:
+            final_score = min(max(final_score, auxiliary_score), 1.0)
+        else:
+            final_score = _cap_fuzzy_mismatch_score(final_score, sentence.match_text, compare_text)
 
         if final_score >= similarity_threshold:
             scored_candidates.append({
+                "entry_id": candidate.get("entry_id"),
+                "collection_id": candidate.get("collection_id"),
+                "creator_id": candidate.get("creator_id"),
+                "last_modified_by_id": candidate.get("last_modified_by_id"),
                 "source_text": candidate["source_text"],
                 "target_text": candidate["target_text"],
                 "collection_name": candidate.get("collection_name"),
                 "creator_name": candidate.get("creator_name"),
+                "last_modified_by_name": candidate.get("last_modified_by_name"),
                 "created_at": candidate.get("created_at"),
                 "updated_at": candidate.get("updated_at"),
                 "score": final_score,
                 "base_score": base_score,
+                "auxiliary_exact": 1 if auxiliary_exact_signal else 0,
             })
 
     # 按分数排序，取Top N
-    scored_candidates.sort(key=lambda x: (x["score"], x["base_score"]), reverse=True)
+    scored_candidates.sort(key=lambda x: (x["auxiliary_exact"], x["score"], x["base_score"]), reverse=True)
     return scored_candidates[:top_n]
 
 
@@ -1005,12 +1112,25 @@ def get_tm_candidates_for_text(
         if exact_match.creator:
             creator_name = exact_match.creator.nickname or exact_match.creator.username
         candidates.append(TMMatchCandidate(
+            entry_id=str(exact_match.id),
+            collection_id=str(exact_match.collection_id) if exact_match.collection_id else None,
             source_text=exact_match.source_text,
             target_text=exact_match.target_text,
             score=1.0,
             diff_html=_build_diff_html(source_text, exact_match.source_text),
             collection_name=collection_name,
+            creator_id=str(exact_match.creator_id) if exact_match.creator_id else None,
             creator_name=creator_name,
+            last_modified_by_id=(
+                str(exact_match.last_modified_by_id)
+                if exact_match.last_modified_by_id
+                else None
+            ),
+            last_modified_by_name=(
+                exact_match.last_modified_by.nickname or exact_match.last_modified_by.username
+                if exact_match.last_modified_by
+                else None
+            ),
             created_at=exact_match.created_at.isoformat() if exact_match.created_at else None,
             updated_at=exact_match.updated_at.isoformat() if exact_match.updated_at else None,
         ))

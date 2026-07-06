@@ -807,6 +807,37 @@ def export_translated_task_file(
     return ExportedTaskFile(content=content, media_type=media_type, filename=export_filename)
 
 
+def export_bilingual_xlsx_task_file(
+    raw_bytes: bytes | None,
+    filename: str,
+    segments: list[Any],
+    document_parse_options: dict[str, object] | str | None = None,
+) -> ExportedTaskFile:
+    if get_task_file_extension(filename) != ".xlsx":
+        raise ValueError("仅 Excel 源文件支持原格式双语 Excel 导出。")
+    if raw_bytes is None:
+        raise ValueError("Excel 源文件缺失，暂时无法导出原格式双语 Excel。")
+
+    from app.services.adapters.xlsx_exporter import XLSX_MEDIA_TYPE, XlsxExporter
+
+    export_segments = build_export_segments_from_source(
+        raw_bytes,
+        filename,
+        segments,
+        document_parse_options=document_parse_options,
+    )
+    return ExportedTaskFile(
+        content=XlsxExporter().export(
+            raw_bytes,
+            export_segments,
+            document_parse_options=document_parse_options,
+            bilingual=True,
+        ),
+        media_type=XLSX_MEDIA_TYPE,
+        filename=_build_bilingual_xlsx_filename(filename),
+    )
+
+
 def export_bilingual_task_docx_with_layout(
     raw_bytes: bytes | None,
     filename: str,
@@ -1172,3 +1203,9 @@ def _build_translated_filename(filename: str) -> str:
     extension = path.suffix or ".html"
     stem = path.stem or "translated"
     return f"{stem}_translated{extension}"
+
+
+def _build_bilingual_xlsx_filename(filename: str) -> str:
+    path = Path(filename or "bilingual.xlsx")
+    stem = path.stem or "bilingual"
+    return f"{stem}_bilingual.xlsx"
