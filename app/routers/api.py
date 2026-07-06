@@ -21,7 +21,7 @@ from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, Heade
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, case, func, literal, or_
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, aliased, object_session
 
 from app.auth import (
@@ -33,6 +33,9 @@ from app.auth import (
     is_admin_role,
     is_external_translator,
     require_admin,
+    require_project_assignment_manager,
+    require_project_creator,
+    require_resource_creator,
     serialize_user,
 )
 from app.config import get_settings
@@ -317,6 +320,7 @@ from app.services.task_file_service import (
     build_task_workspace,
     can_export_task_file,
     export_bilingual_task_docx_with_layout,
+    export_bilingual_xlsx_task_file,
     export_translated_task_file,
     get_max_upload_size_bytes,
     get_upload_capabilities,
@@ -371,8 +375,13 @@ except ModuleNotFoundError:  # pragma: no cover - 本地未安装 ARQ 时使用 
 
 logger = logging.getLogger(__name__)
 _RESOURCE_IMPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="resource-import")
+ARQ_IMPORT_QUEUE_NAME = "arq:import"
 ARQ_MAINTENANCE_QUEUE_NAME = "arq:maintenance"
+ARQ_AUTO_TM_QUEUE_NAME = "arq:auto-tm"
+ARQ_SEGMENT_SYNC_QUEUE_NAME = "arq:segment-sync"
 ARQ_PRETRANSLATION_QUEUE_NAME = "arq:pretranslation"
+ARQ_AUTO_TM_BACKGROUND_JOB_ID = "auto-tm-background"
+ARQ_AUTO_TM_REMATCH_BACKGROUND_JOB_ID = "auto-tm-rematch-background"
 router = APIRouter(dependencies=[Depends(get_current_user)])
 UPLOAD_READ_CHUNK_SIZE = 1024 * 1024
 
@@ -506,7 +515,7 @@ async def _enqueue_arq_import_task(task_id: str, payload: dict[str, Any]) -> boo
             "process_import_task_job",
             task_id,
             payload,
-            _queue_name=ARQ_MAINTENANCE_QUEUE_NAME,
+            _queue_name=ARQ_IMPORT_QUEUE_NAME,
         )
         return True
     except Exception:
@@ -521,6 +530,7 @@ async def _enqueue_arq_job(
     function_name: str,
     *args: Any,
     queue_name: str = ARQ_MAINTENANCE_QUEUE_NAME,
+    job_id: str | None = None,
 ) -> bool:
     """通用 ARQ 任务入队：成功返回 True，未启用/失败返回 False 以便回退本地执行。"""
     settings = get_settings()
@@ -536,7 +546,16 @@ async def _enqueue_arq_job(
     redis_pool = None
     try:
         redis_pool = await arq_create_pool(redis_settings)
-        await redis_pool.enqueue_job(function_name, *args, _queue_name=queue_name)
+        enqueue_kwargs: dict[str, Any] = {"_queue_name": queue_name}
+        if job_id:
+            enqueue_kwargs["_job_id"] = job_id
+        try:
+            await redis_pool.enqueue_job(function_name, *args, **enqueue_kwargs)
+        except TypeError:
+            if not job_id:
+                raise
+            enqueue_kwargs.pop("_job_id", None)
+            await redis_pool.enqueue_job(function_name, *args, **enqueue_kwargs)
         return True
     except Exception:
         logger.warning(
@@ -575,14 +594,22 @@ async def _dispatch_spelling_grammar_qa_project(project_id: UUID) -> None:
 
 async def _dispatch_auto_tm_background() -> None:
     """优先把 auto-TM 处理投递到 arq worker，未启用 arq 时回退到本地线程池。"""
-    if await _enqueue_arq_job("auto_tm_background_job"):
+    if await _enqueue_arq_job(
+        "auto_tm_background_job",
+        queue_name=ARQ_AUTO_TM_QUEUE_NAME,
+        job_id=ARQ_AUTO_TM_BACKGROUND_JOB_ID,
+    ):
         return
     await asyncio.to_thread(run_auto_tm_background_once)
 
 
 async def _dispatch_auto_tm_rematch_background() -> None:
     """强制处理已入队的 TM 重匹配任务，用于项目绑定后的初始刷新。"""
-    if await _enqueue_arq_job("auto_tm_rematch_background_job"):
+    if await _enqueue_arq_job(
+        "auto_tm_rematch_background_job",
+        queue_name=ARQ_AUTO_TM_QUEUE_NAME,
+        job_id=ARQ_AUTO_TM_REMATCH_BACKGROUND_JOB_ID,
+    ):
         return
     await asyncio.to_thread(run_auto_tm_rematch_background_once)
 
@@ -600,6 +627,7 @@ async def _dispatch_project_segment_sync(
         str(file_record_id),
         [str(segment_id) for segment_id in segment_ids],
         str(current_user_id) if current_user_id else None,
+        queue_name=ARQ_SEGMENT_SYNC_QUEUE_NAME,
     ):
         return
     await asyncio.to_thread(
@@ -665,7 +693,12 @@ async def _queue_import_task(
 
 
 async def _queue_tm_resource_import_task(task_id: str, payload: dict[str, Any]) -> None:
-    if await _enqueue_arq_job("tm_resource_import_job", task_id, payload):
+    if await _enqueue_arq_job(
+        "tm_resource_import_job",
+        task_id,
+        payload,
+        queue_name=ARQ_IMPORT_QUEUE_NAME,
+    ):
         return
     future = _RESOURCE_IMPORT_EXECUTOR.submit(_run_tm_resource_import_task, task_id, payload)
     future.add_done_callback(_log_local_tm_resource_import_failure(task_id))
@@ -1063,6 +1096,7 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
         payload.get("source_language"),
         payload.get("target_language"),
         primary_collection,
+        project,
     )
 
     term_base = None
@@ -1232,6 +1266,12 @@ async def term_resource_import_job(ctx, task_id: str, payload: dict[str, Any]) -
     await asyncio.to_thread(_run_term_resource_import_task, task_id, payload)
 
 
+async def glossary_resource_import_job(ctx, task_id: str, payload: dict[str, Any]) -> None:
+    from app.routers.glossary_base import _run_glossary_resource_import_task
+
+    await asyncio.to_thread(_run_glossary_resource_import_task, task_id, payload)
+
+
 async def spelling_grammar_qa_segments_job(
     ctx, file_record_id: str, segment_ids: list[str]
 ) -> None:
@@ -1295,6 +1335,7 @@ def _resolve_pretranslation_run_file_concurrency() -> int:
 
 class MaintenanceWorkerSettings:
     queue_name = ARQ_MAINTENANCE_QUEUE_NAME
+    keep_result = 0
     max_jobs = _resolve_arq_worker_max_jobs(
         get_settings().arq_maintenance_max_jobs,
         get_settings().arq_max_jobs,
@@ -1303,6 +1344,7 @@ class MaintenanceWorkerSettings:
         process_import_task_job,
         tm_resource_import_job,
         term_resource_import_job,
+        glossary_resource_import_job,
         spelling_grammar_qa_segments_job,
         spelling_grammar_qa_project_job,
         auto_tm_background_job,
@@ -1312,8 +1354,52 @@ class MaintenanceWorkerSettings:
     redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
 
 
+class AutoTMWorkerSettings:
+    queue_name = ARQ_AUTO_TM_QUEUE_NAME
+    keep_result = 0
+    max_jobs = _resolve_arq_worker_max_jobs(
+        get_settings().arq_auto_tm_max_jobs,
+        1,
+    )
+    functions = [
+        auto_tm_background_job,
+        auto_tm_rematch_background_job,
+    ]
+    redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
+
+
+class SegmentSyncWorkerSettings:
+    queue_name = ARQ_SEGMENT_SYNC_QUEUE_NAME
+    keep_result = 0
+    max_jobs = _resolve_arq_worker_max_jobs(
+        get_settings().arq_segment_sync_max_jobs,
+        1,
+    )
+    functions = [
+        project_segment_sync_job,
+    ]
+    redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
+
+
+class ImportWorkerSettings:
+    queue_name = ARQ_IMPORT_QUEUE_NAME
+    keep_result = 0
+    max_jobs = _resolve_arq_worker_max_jobs(
+        get_settings().arq_import_max_jobs,
+        get_settings().arq_max_jobs,
+    )
+    functions = [
+        process_import_task_job,
+        tm_resource_import_job,
+        term_resource_import_job,
+        glossary_resource_import_job,
+    ]
+    redis_settings = _build_arq_redis_settings(get_settings().redis_url or "redis://localhost:6379/0")
+
+
 class PretranslationWorkerSettings:
     queue_name = ARQ_PRETRANSLATION_QUEUE_NAME
+    keep_result = 0
     max_jobs = _resolve_arq_worker_max_jobs(
         get_settings().arq_pretranslation_max_jobs,
         1,
@@ -1482,6 +1568,13 @@ class PretranslationRunRequest(BaseModel):
     llm_translation_unit: Literal["paragraph", "sentence"] = "paragraph"
     guideline_template_id: str | None = None
     temporary_prompt: str = Field(default="", max_length=8000)
+
+
+class PretranslationMatchAnalysisPreviewRequest(BaseModel):
+    file_ids: list[UUID] = Field(default_factory=list)
+    tm_collection_ids: list[UUID] = Field(default_factory=list)
+    tm_threshold: float = Field(default=0.75, ge=0.5, le=1.0)
+    tm_skip_confirmed: bool = True
 
 
 PRETRANSLATION_ACTIVE_STATUSES = {"queued", "running", "canceling"}
@@ -2090,6 +2183,77 @@ def _run_pretranslation_run(run_id: UUID) -> None:
             db.commit()
 
 
+@router.post("/projects/{project_id}/pretranslation-match-analysis-preview")
+def preview_pretranslation_match_analysis(
+    project_id: UUID,
+    payload: PretranslationMatchAnalysisPreviewRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    project = _get_project_or_404(db, project_id)
+    _require_project_read_access(project, current_user, db)
+
+    file_ids = list(dict.fromkeys(payload.file_ids))
+    if not file_ids:
+        raise HTTPException(status_code=400, detail="请至少选择一个文件进行预估。")
+
+    selected_collection_ids = _require_selected_collection_ids(
+        _validate_collection_ids(db, payload.tm_collection_ids)
+    )
+    threshold = round(float(payload.tm_threshold), 2)
+    if threshold < 0.5 or threshold > 1:
+        raise HTTPException(status_code=400, detail="TM 匹配阈值必须在 0.50 到 1.00 之间。")
+
+    files = (
+        db.query(FileRecord)
+        .filter(FileRecord.project_id == project_id, FileRecord.id.in_(file_ids))
+        .all()
+    )
+    files_by_id = {file_record.id: file_record for file_record in files}
+    missing_ids = [file_id for file_id in file_ids if file_id not in files_by_id]
+    if missing_ids:
+        raise HTTPException(status_code=404, detail="选择的文件不存在或不属于当前项目。")
+
+    ordered_files = [files_by_id[file_id] for file_id in file_ids]
+    collections = (
+        db.query(MemoryBase)
+        .filter(MemoryBase.id.in_(selected_collection_ids))
+        .all()
+    )
+    for file_record in ordered_files:
+        _require_file_record_work_access(file_record, current_user)
+        source_language, target_language = _resolve_file_record_language_pair(file_record)
+        for collection in collections:
+            _ensure_resource_language_pair_matches(collection, source_language, target_language, "记忆库")
+
+    file_segments, skipped_confirmed = _load_pretranslation_match_analysis_segments_for_files(
+        db,
+        ordered_files,
+        collection_ids=selected_collection_ids,
+        skip_confirmed=payload.tm_skip_confirmed,
+    )
+    analysis_by_file_id = compute_document_match_analysis(
+        db,
+        file_segments,
+        applied_threshold=threshold,
+        include_workload=True,
+    )
+    analysis = merge_document_match_analyses(analysis_by_file_id.values())
+    workload = _sum_pretranslation_match_workload(analysis_by_file_id.values())
+
+    return {
+        "analysis": analysis,
+        "remaining_new_segments": workload["remaining_new_segments"],
+        "remaining_new_words": workload["remaining_new_words"],
+        "tm_applied_segments": workload["tm_applied_segments"],
+        "tm_applied_words": workload["tm_applied_words"],
+        "repeat_segments": workload["repeat_segments"],
+        "repeat_words": workload["repeat_words"],
+        "skipped_confirmed_segments": skipped_confirmed["segment_count"],
+        "skipped_confirmed_words": skipped_confirmed["word_count"],
+    }
+
+
 @router.post("/projects/{project_id}/pretranslation-runs")
 async def create_pretranslation_run(
     project_id: UUID,
@@ -2683,6 +2847,88 @@ def _load_document_match_analysis_for_files(
         )
 
     return compute_document_match_analysis(db, file_segments)
+
+
+def _load_pretranslation_match_analysis_segments_for_files(
+    db: Session,
+    files: list[FileRecord],
+    *,
+    collection_ids: list[UUID],
+    skip_confirmed: bool,
+) -> tuple[dict[UUID, list[DocumentMatchSegment]], dict[str, int]]:
+    file_segments: dict[UUID, list[DocumentMatchSegment]] = {
+        file_record.id: [] for file_record in files
+    }
+    skipped_confirmed = {"segment_count": 0, "word_count": 0}
+    if not file_segments:
+        return file_segments, skipped_confirmed
+
+    selected_collection_ids = tuple(dict.fromkeys(collection_ids))
+    segments = (
+        db.query(
+            Segment.file_record_id,
+            Segment.source_text,
+            Segment.display_text,
+            Segment.source_word_count,
+            Segment.status,
+        )
+        .filter(Segment.file_record_id.in_(list(file_segments.keys())))
+        .order_by(
+            Segment.file_record_id.asc(),
+            *SEGMENT_ORDERING,
+            Segment.id.asc(),
+        )
+        .all()
+    )
+    for file_record_id, source_text, display_text, source_word_count, status in segments:
+        word_count = _segment_preview_word_count(source_text, source_word_count)
+        if skip_confirmed and status == "confirmed":
+            skipped_confirmed["segment_count"] += 1
+            skipped_confirmed["word_count"] += word_count
+            continue
+        file_segments.setdefault(file_record_id, []).append(
+            DocumentMatchSegment(
+                file_id=file_record_id,
+                source_text=source_text or "",
+                display_text=display_text or "",
+                source_word_count=word_count,
+                collection_ids=selected_collection_ids,
+            )
+        )
+
+    return file_segments, skipped_confirmed
+
+
+def _sum_pretranslation_match_workload(analyses: Iterable[dict[str, Any]]) -> dict[str, int]:
+    summary = {
+        "remaining_new_segments": 0,
+        "remaining_new_words": 0,
+        "tm_applied_segments": 0,
+        "tm_applied_words": 0,
+        "repeat_segments": 0,
+        "repeat_words": 0,
+    }
+    for analysis in analyses:
+        for key in summary:
+            summary[key] += _safe_int(analysis.get(key))
+    return summary
+
+
+def _segment_preview_word_count(source_text: str | None, source_word_count: int | None) -> int:
+    try:
+        word_count = int(source_word_count or 0)
+    except (TypeError, ValueError):
+        word_count = 0
+    if word_count > 0:
+        return word_count
+    return count_source_words(source_text or "")
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _can_manage_workflow(current_user: User | None) -> bool:
@@ -4187,7 +4433,7 @@ def list_project_assignment_events(
     project_id: UUID,
     limit: int = 100,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_project_assignment_manager),
 ):
     _get_project_or_404(db, project_id)
     return list_assignment_events(project_id=project_id, limit=limit, db=db)
@@ -4409,10 +4655,20 @@ def _build_llm_translation_tasks(
 
         segment_source = getattr(segment, "source", "none")
         matched_source_text = getattr(segment, "matched_source_text", None)
+        source_layout_text = (
+            getattr(segment, "source_layout_text", "")
+            or getattr(segment, "display_text", "")
+            or ""
+        )
         segment_tm_target_text = segment.target_text if segment_source == "tm" and normalize_text(segment.target_text) else ""
         tm_target_text = segment_tm_target_text or tm_target_text_map.get(matched_source_text or "", "")
         if clean_numbering:
             raw_matched_source_text = matched_source_text
+            source_layout_text = strip_automatic_numbering_prefix(
+                source_layout_text,
+                source_text=segment.source_text,
+                display_text=getattr(segment, "display_text", "") or "",
+            )
             matched_source_text = strip_automatic_numbering_prefix(
                 matched_source_text or "",
                 source_text=segment.source_text,
@@ -4437,6 +4693,7 @@ def _build_llm_translation_tasks(
                 block_index=int(getattr(segment, "block_index", 0) or 0),
                 row_index=getattr(segment, "row_index", None),
                 cell_index=getattr(segment, "cell_index", None),
+                source_layout_text=source_layout_text,
                 matched_source_text=matched_source_text,
                 tm_target_text=tm_target_text,
                 glossary_matches=glossary_matches_by_source.get(segment.source_text, []),
@@ -4899,7 +5156,34 @@ def _resolve_upload_language_pair(
     source_language: str | None,
     target_language: str | None,
     primary_collection: TMCollection | None = None,
+    project: Project | None = None,
 ) -> tuple[str, str]:
+    if project and (project.source_language or project.target_language):
+        resolved_source_language, resolved_target_language = _require_tm_language_pair(
+            project.source_language,
+            project.target_language,
+        )
+        if source_language or target_language:
+            submitted_source_language, submitted_target_language = _require_tm_language_pair(
+                source_language,
+                target_language,
+            )
+            if (
+                submitted_source_language != resolved_source_language
+                or submitted_target_language != resolved_target_language
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="当前项目已绑定语言对，上传文件必须使用项目语言对。",
+                )
+        _ensure_resource_language_pair_matches(
+            primary_collection,
+            resolved_source_language,
+            resolved_target_language,
+            "记忆库",
+        )
+        return resolved_source_language, resolved_target_language
+
     if source_language or target_language:
         resolved_source_language, resolved_target_language = _require_tm_language_pair(
             source_language,
@@ -4953,6 +5237,8 @@ def _serialize_tm_collection(collection: MemoryBase, entry_count: int = 0) -> di
         "description": collection.description,
         "source_language": collection.source_language,
         "target_language": collection.target_language,
+        "creator_id": str(collection.creator_id) if collection.creator_id else None,
+        "creator_name": _entry_user_name(collection.creator),
         "created_at": collection.created_at.isoformat(),
         "updated_at": collection.updated_at.isoformat(),
         "entry_count": entry_count,
@@ -5449,7 +5735,7 @@ def list_workflow_templates(_: User = Depends(get_current_user)):
 def create_project(
     payload: ProjectCreatePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_project_creator),
 ):
     """仅填写基础信息创建项目，文档导入在项目详情页完成"""
     from datetime import datetime as _dt
@@ -5512,7 +5798,7 @@ def duplicate_project(
     project_id: UUID,
     payload: ProjectDuplicatePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_project_creator),
 ):
     source_project = (
         db.query(Project)
@@ -6966,7 +7252,7 @@ def _build_project_detail_payload(
 def get_project_assignments(
     project_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_project_assignment_manager),
 ):
     _get_project_or_404(db, project_id)
     return _serialize_project_assignments(db, project_id)
@@ -6977,7 +7263,7 @@ def update_project_assignments(
     project_id: UUID,
     payload: ProjectAssignmentsRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_project_assignment_manager),
 ):
     project = _get_project_or_404(db, project_id)
     return _update_project_assignments_by_workflow(
@@ -8514,7 +8800,7 @@ def detect_project_source_language(
     project_id: UUID,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_project_creator),
 ):
     # 定义为同步 def，由 FastAPI 调度到线程池执行，避免语言识别的 CPU 操作阻塞事件循环。
     project = db.query(Project).filter(Project.id == project_id).first()
@@ -8543,7 +8829,7 @@ async def upload_project_source_document(
     document_parse_mode: str = Form(default=DOCUMENT_PARSE_MODE_FULL),
     document_parse_options: str | None = Form(default=None),
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_project_creator),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
@@ -8569,6 +8855,7 @@ async def upload_project_source_document(
         source_language,
         target_language,
         primary_collection,
+        project,
     )
 
     term_base = None
@@ -8872,6 +9159,7 @@ def _serialize_workbench_segment(
     seg: Segment,
     display_index: int | None = None,
     *,
+    permission_display_index: int | None = None,
     source_filename: str | None = None,
     target_automatic_numbering_by_sentence_id: dict[str, str] | None = None,
     qa_issues_by_segment_id: dict[UUID, list[SegmentQAIssue]] | None = None,
@@ -8895,17 +9183,25 @@ def _serialize_workbench_segment(
         target_automatic_numbering_text = (
             target_automatic_numbering_by_sentence_id.get(str(seg.sentence_id), "") or ""
         ).strip()
+    source_layout_text = getattr(seg, "source_layout_text", "") or ""
+    if not source_layout_text and "\n" in (seg.display_text or ""):
+        source_layout_text = seg.display_text or ""
     resolved_workflow_step_id = seg.workflow_step_id
     if resolved_workflow_step_id is None and workflow_step_by_id:
         resolved_workflow_step_id = next(iter(workflow_step_by_id.keys()), None)
     workflow_step = workflow_step_by_id.get(resolved_workflow_step_id) if workflow_step_by_id else None
     can_write = True
     if writable_workflow_assignments is not None:
+        writable_display_index = (
+            permission_display_index
+            if permission_display_index is not None
+            else display_index
+        )
         can_write = bool(
             can_manage
             or _can_write_segment_with_assignments(
                 resolved_workflow_step_id,
-                display_index,
+                writable_display_index,
                 writable_workflow_assignments,
             )
         )
@@ -8915,6 +9211,7 @@ def _serialize_workbench_segment(
         "source_text": seg.source_text,
         "display_text": seg.display_text,
         "source_body_text": seg.source_text,
+        "source_layout_text": source_layout_text or None,
         "automatic_numbering_text": automatic_numbering_text or None,
         "target_automatic_numbering_text": target_automatic_numbering_text or None,
         "source_html": seg.source_html,
@@ -10575,6 +10872,15 @@ def get_file_record_preview(
     }
 
 
+def _is_statement_timeout_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return (
+        "statement timeout" in message
+        or "canceling statement due to statement timeout" in message
+        or exc.__class__.__name__ == "QueryCanceled"
+    )
+
+
 @router.get("/file-records/{file_record_id}/segments/{segment_ref}/tm-candidates")
 def get_segment_tm_candidates(
     file_record_id: UUID,
@@ -10622,20 +10928,36 @@ def get_segment_tm_candidates(
     if not collection_ids and file_record.collection_id:
         collection_ids = [file_record.collection_id]
 
-    candidates = get_tm_candidates_for_text(
-        db=db,
-        source_text=segment.source_text,
-        similarity_threshold=_normalize_tm_match_threshold(
-            threshold if threshold is not None else getattr(file_record, "tm_match_threshold", None),
-        ),
-        collection_ids=collection_ids,
-        top_n=max_candidates,
-    )
+    timed_out = False
+    try:
+        candidates = get_tm_candidates_for_text(
+            db=db,
+            source_text=segment.source_text,
+            similarity_threshold=_normalize_tm_match_threshold(
+                threshold if threshold is not None else getattr(file_record, "tm_match_threshold", None),
+            ),
+            collection_ids=collection_ids,
+            top_n=max_candidates,
+        )
+    except OperationalError as exc:
+        if not _is_statement_timeout_error(exc):
+            raise
+        db.rollback()
+        timed_out = True
+        candidates = []
+        logger.warning(
+            "TM candidate lookup timed out file_record_id=%s segment_ref=%s collection_count=%s",
+            file_record_id,
+            segment_ref,
+            len(collection_ids),
+        )
 
     return {
         "segment_id": str(segment.id),
         "sentence_id": segment.sentence_id,
         "source_text": segment.source_text,
+        "timed_out": timed_out,
+        "degraded_reason": "statement_timeout" if timed_out else None,
         "candidates": [
             {
                 "entry_id": c.entry_id,
@@ -11352,6 +11674,16 @@ def get_merge_view_detail(
     payload["can_manage"] = _can_manage_merge_view(view, current_user)
     file_workflow_progress = _get_file_workflow_progress(db, [file_record.id for file_record in files])
     for file_payload, file_record in zip(payload.get("files", []), files):
+        collection_ids = _load_file_record_collection_ids(file_record)
+        term_base_ids = _load_file_record_term_base_ids(file_record)
+        term_base_write_ids = _load_file_record_term_base_write_ids(file_record)
+        qa_term_base_ids = _load_file_record_qa_term_base_ids(file_record)
+        file_payload["collection_id"] = str(file_record.collection_id) if file_record.collection_id else None
+        file_payload["collection_ids"] = [str(collection_id) for collection_id in collection_ids]
+        file_payload["term_base_id"] = str(file_record.term_base_id) if file_record.term_base_id else None
+        file_payload["term_base_ids"] = [str(term_base_id) for term_base_id in term_base_ids]
+        file_payload["term_base_write_ids"] = [str(term_base_id) for term_base_id in term_base_write_ids]
+        file_payload["qa_term_base_ids"] = [str(term_base_id) for term_base_id in qa_term_base_ids]
         file_payload["can_write"] = _can_write_file_record(file_record, current_user, db)
         workflow_progress = file_workflow_progress.get(file_record.id, [])
         file_payload["workflow_progress"] = workflow_progress
@@ -11656,7 +11988,7 @@ def get_merge_view_segment_position(
         "sentence_id": row.sentence_id,
         "segment_id": str(row.id),
         "index": index,
-        "display_index": int(row.position),
+        "display_index": index + 1,
         "page": (index // safe_page_size) + 1,
         "page_size": safe_page_size,
         "page_index": index % safe_page_size,
@@ -11719,7 +12051,16 @@ def get_merge_view_segments(
     # 为避免逐文件全量序列化，采用"两段式"：先统计每文件匹配数，再按窗口取所需页片段。
     per_file_matched: list[int] = []
     per_file_queries: list = []
+    display_index_offsets: dict[UUID, int] = {}
+    display_index_offset = 0
     for file_record in files:
+        display_index_offsets[file_record.id] = display_index_offset
+        display_index_offset += (
+            db.query(func.count(Segment.id))
+            .filter(Segment.file_record_id == file_record.id)
+            .scalar()
+            or 0
+        )
         _assign_file_segments_to_first_workflow_step(db, file_record)
         base_query = _apply_segment_assignment_visibility_filter(
             db,
@@ -11809,11 +12150,19 @@ def get_merge_view_segments(
         target_numbering = _build_target_automatic_numbering_text_map(file_record)
         qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, segs)
         display_index_map = _get_segment_display_index_map(db, file_record.id, segs)
+        display_index_offset = display_index_offsets.get(file_record.id, 0)
         source_filename = get_file_record_source_filename(file_record)
         for seg in segs:
+            local_display_index = display_index_map.get(seg.id)
+            global_display_index = (
+                display_index_offset + local_display_index
+                if local_display_index is not None
+                else None
+            )
             payload = _serialize_workbench_segment(
                 seg,
-                display_index=display_index_map.get(seg.id),
+                display_index=global_display_index,
+                permission_display_index=local_display_index,
                 source_filename=source_filename,
                 target_automatic_numbering_by_sentence_id=target_numbering,
                 qa_issues_by_segment_id=qa_issues_by_segment_id,
@@ -11975,7 +12324,8 @@ def export_file_record_with_type(
 
     Args:
         file_record_id: 文件记录 ID
-        export_type: 导出类型 (original, bilingual, bilingual_txt, tmx, xliff, xliff2)
+        export_type: 导出类型 (source, original, bilingual, bilingual_docx,
+            bilingual_excel_original, bilingual_excel, bilingual_txt, tmx, xliff, xliff2)
     """
     from app.services.adapters import export_file
 
@@ -12049,6 +12399,28 @@ def export_file_record_with_type(
             media_type=exported_file.media_type,
         )
 
+    if export_type == "bilingual_excel_original":
+        source_filename = get_file_record_source_filename(file_record)
+        if get_task_file_extension(source_filename) != ".xlsx":
+            raise HTTPException(status_code=400, detail="Only XLSX source files support original-format bilingual Excel export.")
+        try:
+            exported_file = export_bilingual_xlsx_task_file(
+                raw_bytes=raw_bytes,
+                filename=source_filename,
+                segments=segments,
+                document_parse_options=_get_file_record_document_parse_options(file_record),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"导出失败: {str(exc)}") from exc
+
+        return _build_binary_download_response(
+            filename=exported_file.filename,
+            content=exported_file.content,
+            media_type=exported_file.media_type,
+        )
+
     # 其他导出格式使用通用句段列表。
     segment_dicts = [
         {
@@ -12062,12 +12434,18 @@ def export_file_record_with_type(
     ]
 
     try:
-        exported_bytes, mime_type, export_filename = export_file(
-            export_type=export_type,
-            segments=segment_dicts,
-            filename=file_record.filename,
-            original_bytes=raw_bytes,
-        )
+        export_kwargs = {
+            "export_type": export_type,
+            "segments": segment_dicts,
+            "filename": file_record.filename,
+            "original_bytes": raw_bytes,
+        }
+        if export_type in {"tmx", "xliff", "xliff2"}:
+            source_language, target_language = _resolve_file_record_language_pair(file_record)
+            export_kwargs["source_lang"] = source_language
+            export_kwargs["target_lang"] = target_language
+
+        exported_bytes, mime_type, export_filename = export_file(**export_kwargs)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -13026,6 +13404,7 @@ def save_file_record_segments_to_tm(
             description=f"由任务「{file_record.filename}」保存生成",
             source_language=source_language,
             target_language=target_language,
+            creator_id=current_user.id,
         )
         db.add(collection)
         db.flush()
@@ -14249,7 +14628,7 @@ def get_tm_collection(
 def create_tm_collection(
     payload: MemoryBasePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_resource_creator),
 ):
     name = _normalize_collection_name(payload.name)
     source_language, target_language = _require_tm_language_pair(
@@ -14264,6 +14643,7 @@ def create_tm_collection(
         description=normalize_text(payload.description or "") or None,
         source_language=source_language,
         target_language=target_language,
+        creator_id=current_user.id,
     )
     db.add(collection)
     try:
@@ -14367,6 +14747,7 @@ def merge_tm_collections(
         description=normalize_text(payload.description or "") or None,
         source_language=source_language,
         target_language=target_language,
+        creator_id=current_user.id,
     )
     db.add(target_collection)
     try:
@@ -15392,6 +15773,8 @@ def _serialize_termbase_collection(collection: TermBase, entry_count: int = 0) -
         "description": collection.description,
         "source_language": collection.source_language,
         "target_language": collection.target_language,
+        "creator_id": str(collection.creator_id) if collection.creator_id else None,
+        "creator_name": get_user_display_name(collection.creator),
         "created_at": collection.created_at.isoformat(),
         "updated_at": collection.updated_at.isoformat(),
         "entry_count": entry_count,
@@ -15429,7 +15812,7 @@ def list_termbase_collections(
 def create_termbase_collection(
     payload: TermBasePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     name = _normalize_collection_name(payload.name)
     if not name:
@@ -15440,6 +15823,7 @@ def create_termbase_collection(
         description=normalize_text(payload.description or "") or None,
         source_language=payload.source_language,
         target_language=payload.target_language,
+        creator_id=current_user.id,
     )
     db.add(collection)
     try:

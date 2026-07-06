@@ -315,6 +315,9 @@ export default {
     duplicateDialogDescription: '选择一个已有项目作为模板，只带入基础信息，不复制文件、句段或译文。',
     form: {
       name: '项目名称',
+      languagePairBinding: '项目语言对（可选）',
+      languagePairBindingHint: '如果本项目后续上传的文件语言方向一致，可提前绑定；不绑定时仍在上传文件时单独选择。',
+      noLanguagePairBinding: '不绑定',
       sourceLanguage: '源语言',
       targetLanguage: '目标语言',
       deadline: '截止期限',
@@ -322,7 +325,7 @@ export default {
       namePlaceholder: '例如：TP260420012_年度报告翻译',
       sourcePlaceholder: '请选择源语言',
       targetPlaceholder: '请选择目标语言',
-      hint: '项目创建后，可在项目详情页上传一个或多个待翻译文件；语言方向在上传时选择。',
+      hint: '项目创建后，可在项目详情页上传一个或多个待翻译文件；已绑定语言对的项目会自动沿用项目语言对。',
       team: '团队内可见',
       private: '仅自己可见',
       public: '公开',
@@ -435,7 +438,7 @@ export default {
     },
     files: {
       title: '文件列表',
-      description: '一个项目可包含多个待处理文件，上传文件时再指定语言方向。',
+      description: '一个项目可包含多个待处理文件；若项目已绑定语言对，上传文件会自动沿用该语言方向。',
       empty: '当前没有可展示的文件。',
       openHint: '点击进入翻译工作台',
       editLockedHint: '文件正在预翻译中，请完成后再进入工作台编辑。',
@@ -481,6 +484,11 @@ export default {
         assign: '分配任务',
         detail: '任务详情',
       },
+    },
+    uploadLanguage: {
+      boundHint: '当前项目已绑定语言对，上传的所有文件都会沿用项目语言方向。',
+      unboundHint: '可先识别第一个文件的源语言，再手动调整源语言和目标语言。',
+      boundMessage: '项目已绑定语言对：{pair}',
     },
     mergeViews: {
       title: '视图',
@@ -608,7 +616,7 @@ export default {
       namePlaceholder: '请输入项目名称',
       deadlineLabel: '截止时间',
       accessLevelLabel: '访问级别',
-      languageLockedHint: '语言对由项目文件和语言资产决定，项目设置中不可修改。',
+      languageLockedHint: '项目语言对可在创建时选择绑定；创建后保持只读，未绑定项目仍按文件分别设置。',
       multipleLanguagePairs: '{count} 个语言方向',
       saveBasic: '保存基础信息',
       basicSaved: '项目基础信息已保存',

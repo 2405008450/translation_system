@@ -24,9 +24,12 @@ import {
   Italic,
   Languages,
   Loader2,
+  Maximize2,
   MessageSquare,
+  Minimize2,
   Pilcrow,
   Redo2,
+  RotateCcw,
   Save,
   Search,
   Settings,
@@ -43,6 +46,8 @@ import {
   Undo2,
   Upload,
   X,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-vue-next'
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch, type ComponentPublicInstance } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -130,6 +135,11 @@ import type {
 } from '../types/api'
 import { buildDocumentPreviewHtml } from '../utils/documentPreview'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
+import {
+  getExportOptionExtensionLabel,
+  groupExportOptions,
+  type FileExportOption,
+} from '../utils/exportOptions'
 
 const props = defineProps<{
   id?: string
@@ -233,17 +243,37 @@ type ResourceSearchResponse = {
 
 const REVISION_TRACE_VISIBLE_STORAGE_KEY = 'workbench.revisionTraceEnabled'
 const WORKBENCH_RIBBON_COLLAPSED_STORAGE_KEY = 'workbench.ribbonCollapsed'
+const SEGMENT_EDITOR_FONT_SCALE_STORAGE_KEY = 'workbench.segmentEditorFontScale'
 const QA_RESULT_PAGE_SIZE = 50
-const BOTTOM_DRAWER_MIN_HEIGHT = 260
+const BOTTOM_DRAWER_MIN_HEIGHT = 168
 const BOTTOM_DRAWER_TOP_GUTTER = 70
 const BOTTOM_DRAWER_KEYBOARD_STEP = 32
 const BOTTOM_DRAWER_KEYBOARD_LARGE_STEP = 80
+const SEGMENT_EDITOR_FONT_SCALE_MIN = 0.8
+const SEGMENT_EDITOR_FONT_SCALE_MAX = 1.6
+const SEGMENT_EDITOR_FONT_SCALE_STEP = 0.1
+const SEGMENT_EDITOR_FONT_SCALE_DEFAULT = 1
 
 function getInitialRevisionTraceVisible() {
   if (typeof window === 'undefined') {
     return false
   }
   return window.localStorage.getItem(REVISION_TRACE_VISIBLE_STORAGE_KEY) === '1'
+}
+
+function clampSegmentEditorFontScale(value: number) {
+  const rounded = Math.round(value * 10) / 10
+  return Math.min(SEGMENT_EDITOR_FONT_SCALE_MAX, Math.max(SEGMENT_EDITOR_FONT_SCALE_MIN, rounded))
+}
+
+function getInitialSegmentEditorFontScale() {
+  if (typeof window === 'undefined') {
+    return SEGMENT_EDITOR_FONT_SCALE_DEFAULT
+  }
+  const saved = Number(window.localStorage.getItem(SEGMENT_EDITOR_FONT_SCALE_STORAGE_KEY))
+  return Number.isFinite(saved)
+    ? clampSegmentEditorFontScale(saved)
+    : SEGMENT_EDITOR_FONT_SCALE_DEFAULT
 }
 
 function getInitialWorkbenchRibbonCollapsed() {
@@ -267,6 +297,7 @@ const virtualListRef = ref<{
   scrollToIndex: (index: number, align?: ScrollLogicalPosition) => Promise<boolean>
   focusIndex: (index: number, selector?: string, align?: ScrollLogicalPosition) => Promise<boolean>
 } | null>(null)
+const workbenchPageRef = ref<HTMLElement | null>(null)
 const segmentEditorResultsRef = ref<HTMLElement | null>(null)
 const segmentEditorRowRefs = new Map<string, SegmentEditorRowPublic>()
 const matchPanelRef = ref<WorkbenchMatchPanelPublic | null>(null)
@@ -332,9 +363,24 @@ function startResize(event: MouseEvent) {
 }
 
 function resolveDefaultBottomDrawerHeight() {
-  const minHeight = props.standalone ? 320 : 300
-  const maxHeight = props.standalone ? 500 : 460
-  const preferredHeight = Math.round(viewportHeight.value * 0.42)
+  const compactTool = (
+    activeBottomTool.value === 'qa-result'
+    || activeBottomTool.value === 'number-check'
+    || activeBottomTool.value === 'history'
+  )
+  const splitPreviewTool = activeBottomTool.value === 'split-preview'
+  const minHeight = compactTool
+    ? (props.standalone ? 180 : 170)
+    : splitPreviewTool
+      ? (props.standalone ? 300 : 280)
+      : (props.standalone ? 260 : 240)
+  const maxHeight = compactTool
+    ? (props.standalone ? 340 : 320)
+    : splitPreviewTool
+      ? (props.standalone ? 520 : 480)
+      : (props.standalone ? 460 : 420)
+  const preferredRatio = compactTool ? 0.26 : splitPreviewTool ? 0.38 : 0.34
+  const preferredHeight = Math.round(viewportHeight.value * preferredRatio)
   return clampBottomDrawerHeight(Math.min(Math.max(preferredHeight, minHeight), maxHeight))
 }
 
@@ -416,10 +462,21 @@ const llmMergeTarget = ref<LLMMergeTarget>('current_file')
 const llmProvider = ref<LLMProvider>('deepseek')
 const llmModel = ref('')
 const itemHeight = ref(resolveItemHeight())
+const segmentEditorFontScale = ref(getInitialSegmentEditorFontScale())
 const activeSideTool = ref<SideToolKey | null>(null)
 const activeBottomTool = ref<BottomToolKey | null>(null)
 const openingBottomTool = ref<BottomDrawerToolKey | null>(null)
 const previewPanelRendering = ref(false)
+const bottomDrawerPanelHeightStyle = computed(() => {
+  if (!activeBottomTool.value) {
+    return {}
+  }
+  const height = `${bottomDrawerResizeValue.value}px`
+  return {
+    '--workbench-bottom-panel-height': height,
+    '--workbench-visible-bottom-panel-height': height,
+  }
+})
 const showImportDialog = ref(false)
 const showIssueDialog = ref(false)
 const importDialogInitialTab = ref<ResourceImportTab>('tm')
@@ -427,6 +484,7 @@ const showWorkbenchSettings = ref(false)
 const activeWorkbenchSettingsTab = ref<WorkbenchSettingsTab>('preferences')
 const showSaveToTMDialog = ref(false)
 const workbenchRibbonCollapsed = ref(getInitialWorkbenchRibbonCollapsed())
+const isWorkbenchFullscreen = ref(false)
 const openConfirmMenu = ref(false)
 const confirmationActionLoading = ref(false)
 const confirmJumpActionLoading = ref(false)
@@ -478,6 +536,8 @@ const locatingTermQAReportItemId = ref<string | null>(null)
 const updatingTermQAIgnore = ref(false)
 const selectedTermQAItemIds = ref<Set<string>>(new Set())
 const termQAReportPage = ref(1)
+type TermQAReportFilter = 'active' | 'ignored' | 'all'
+const termQAReportFilter = ref<TermQAReportFilter>('active')
 
 type NumberCheckFilter = 'all' | 'program' | 'ai' | 'source' | 'modified' | 'ignored'
 const numberCheckReport = ref<NumberCheckReport | null>(null)
@@ -634,6 +694,18 @@ const confirmShortcutDescription = computed(() => (
     : t('workbench.shortcutItems.confirmNextUnconfirmed')
 ))
 
+const segmentEditorFontPercent = computed(() => Math.round(segmentEditorFontScale.value * 100))
+const canDecreaseSegmentEditorFont = computed(() => segmentEditorFontScale.value > SEGMENT_EDITOR_FONT_SCALE_MIN)
+const canIncreaseSegmentEditorFont = computed(() => segmentEditorFontScale.value < SEGMENT_EDITOR_FONT_SCALE_MAX)
+const segmentEditorItemHeight = computed(() => Math.round(itemHeight.value * segmentEditorFontScale.value))
+const segmentEditorFontStyle = computed(() => ({
+  '--segment-editor-font-scale': String(segmentEditorFontScale.value),
+  '--segment-editor-source-font-size': `${Math.round(13 * segmentEditorFontScale.value * 10) / 10}px`,
+  '--segment-editor-target-font-size': `${Math.round(15 * segmentEditorFontScale.value * 10) / 10}px`,
+  '--segment-editor-source-line-height': segmentEditorFontScale.value >= 1.25 ? '1.5' : '1.45',
+  '--segment-editor-target-line-height': segmentEditorFontScale.value >= 1.25 ? '1.5' : '1.58',
+}))
+
 const workbenchShortcutItems = computed<WorkbenchShortcutItem[]>(() => [
   { keys: 'Ctrl / Cmd + X', label: t('workbench.shortcutItems.cut') },
   { keys: 'Ctrl / Cmd + C', label: t('workbench.shortcutItems.copy') },
@@ -686,6 +758,30 @@ function toggleWorkbenchSettings(tab: WorkbenchSettingsTab = 'preferences') {
 
 function setWorkbenchConfirmJumpMode(mode: WorkbenchConfirmJumpMode) {
   preferencesStore.setConfirmJumpMode(mode)
+}
+
+function setSegmentEditorFontScale(value: number) {
+  const nextScale = clampSegmentEditorFontScale(value)
+  segmentEditorFontScale.value = nextScale
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem(SEGMENT_EDITOR_FONT_SCALE_STORAGE_KEY, String(nextScale))
+  }
+  void nextTick(() => {
+    observeSegmentEditorResults()
+    scheduleSegmentEditorScrollbarGutterUpdate()
+  })
+}
+
+function decreaseSegmentEditorFontScale() {
+  setSegmentEditorFontScale(segmentEditorFontScale.value - SEGMENT_EDITOR_FONT_SCALE_STEP)
+}
+
+function increaseSegmentEditorFontScale() {
+  setSegmentEditorFontScale(segmentEditorFontScale.value + SEGMENT_EDITOR_FONT_SCALE_STEP)
+}
+
+function resetSegmentEditorFontScale() {
+  setSegmentEditorFontScale(SEGMENT_EDITOR_FONT_SCALE_DEFAULT)
 }
 
 watch(llmModel, (modelId) => {
@@ -755,12 +851,13 @@ const importingGuidelineTemplate = ref(false)
 const guidelineTemplateInputRef = ref<HTMLInputElement | null>(null)
 
 const showExportMenu = ref(false)
-const exportOptions = ref<Array<{ id: string; name: string; description: string; extension: string }>>([])
+const exportOptions = ref<FileExportOption[]>([])
 const loadingExportOptions = ref(false)
 const exporting = ref(false)
 const exportProgress = ref(0)
 const exportMessage = ref('')
 let exportPollTimer: number | null = null
+const groupedExportOptions = computed(() => groupExportOptions(exportOptions.value))
 
 // 导出样式设置（仅对 DOCX 生效）
 const EXPORT_STYLE_SETTINGS_STORAGE_KEY = 'workbench.exportStyleSettings'
@@ -1331,22 +1428,45 @@ const allActiveTermQAItemsSelected = computed(() => (
 ))
 
 const termQAReportPageSize = QA_RESULT_PAGE_SIZE
+const filteredTermQAReportItems = computed(() => {
+  const items = termQAReport.value?.items || []
+  switch (termQAReportFilter.value) {
+    case 'ignored':
+      return items.filter((item) => item.ignored)
+    case 'all':
+      return items
+    default:
+      return items.filter((item) => !item.ignored)
+  }
+})
 const termQAReportTotalPages = computed(() => (
-  Math.max(1, Math.ceil((termQAReport.value?.items.length || 0) / termQAReportPageSize))
+  Math.max(1, Math.ceil(filteredTermQAReportItems.value.length / termQAReportPageSize))
 ))
 const visibleTermQAReportItems = computed(() => {
-  const items = termQAReport.value?.items || []
   const startIndex = (termQAReportPage.value - 1) * termQAReportPageSize
-  return items.slice(startIndex, startIndex + termQAReportPageSize)
+  return filteredTermQAReportItems.value.slice(startIndex, startIndex + termQAReportPageSize)
 })
 const termQAReportPageRangeText = computed(() => {
-  const total = termQAReport.value?.items.length || 0
+  const total = filteredTermQAReportItems.value.length
   if (total === 0) {
     return '0 / 0'
   }
   const start = (termQAReportPage.value - 1) * termQAReportPageSize + 1
   const end = Math.min(start + termQAReportPageSize - 1, total)
   return `${start}-${end} / ${total}`
+})
+
+const termQAReportEmptyText = computed(() => {
+  if (!termQAReport.value || termQAReport.value.items.length === 0) {
+    return '未发现已开启规则的 QA 问题。'
+  }
+  if (termQAReportFilter.value === 'ignored') {
+    return '暂无已忽略的 QA 问题。'
+  }
+  if (termQAReportFilter.value === 'all') {
+    return '暂无 QA 问题。'
+  }
+  return '当前没有待处理的 QA 问题。'
 })
 
 const termQAReportCreatedAtText = computed(() => (
@@ -1512,8 +1632,20 @@ const ribbonStatusTitle = computed(() => (
   `${lastModifiedStatusText.value} · ${segmentStore.syncMessage} · ${segmentStore.llmMessage}`
 ))
 
+const workbenchRibbonCollapseLabel = computed(() => (
+  workbenchRibbonCollapsed.value ? '展开' : '收起'
+))
+
 const workbenchRibbonCollapseTitle = computed(() => (
-  workbenchRibbonCollapsed.value ? '展开工具栏' : '收起工具栏'
+  `${workbenchRibbonCollapseLabel.value}工具栏`
+))
+
+const workbenchFullscreenLabel = computed(() => (
+  isWorkbenchFullscreen.value ? '退出全屏' : '全屏'
+))
+
+const workbenchFullscreenTitle = computed(() => (
+  isWorkbenchFullscreen.value ? '退出工作台全屏' : '全屏显示工作台，效果类似浏览器 F11'
 ))
 
 const activeSegment = computed(() => (
@@ -2134,17 +2266,14 @@ const termQAButtonTitle = computed(() => (
 ))
 
 const boundTermBaseIds = computed(() => {
-  if (segmentStore.mergeViewId) {
-    return []
-  }
-  const fileRecord = segmentStore.fileRecord
-  if (!fileRecord) {
+  const context = activeWorkbenchFileContext.value
+  if (!context) {
     return []
   }
   return Array.from(new Set([
-    ...(fileRecord.term_base_ids || []),
-    ...(fileRecord.term_base_id ? [fileRecord.term_base_id] : []),
-    ...(fileRecord.qa_term_base_ids || []),
+    ...(context.term_base_ids || []),
+    ...(context.term_base_id ? [context.term_base_id] : []),
+    ...(context.qa_term_base_ids || []),
   ].filter(Boolean)))
 })
 
@@ -2161,7 +2290,7 @@ const boundResourceSummary = computed(() => {
 
 const addTermTargetTermBases = computed(() => {
   const boundIds = new Set(boundTermBaseIds.value)
-  const writableIds = segmentStore.fileRecord?.term_base_write_ids || []
+  const writableIds = activeWorkbenchFileContext.value?.term_base_write_ids || []
   const allowedIds = new Set(writableIds.filter((id) => boundIds.has(id)))
   return termBases.value.filter((termBase) => allowedIds.has(termBase.id))
 })
@@ -2180,7 +2309,7 @@ const addTermCanSubmit = computed(() => Boolean(
 
 const selectedTermBaseName = computed(() => (
   termBases.value.find((termBase) => termBase.id === selectedTermBaseId.value)?.name
-  || segmentStore.fileRecord?.term_base_name
+  || (!segmentStore.mergeViewId ? segmentStore.fileRecord?.term_base_name : null)
   || null
 ))
 
@@ -2375,26 +2504,28 @@ useWorkbenchShortcuts({
 })
 
 function getTermBaseStorageKey() {
-  return `workbench-term-base:${segmentStore.fileRecord?.source_language || 'na'}:${segmentStore.fileRecord?.target_language || 'na'}`
+  const context = activeWorkbenchFileContext.value
+  return `workbench-term-base:${context?.source_language || 'na'}:${context?.target_language || 'na'}`
 }
 
 async function loadTermBases() {
   loadingTermBases.value = true
   termsMessage.value = t('workbench.terms.loadingBases')
   try {
-    if (segmentStore.mergeViewId) {
+    const context = activeWorkbenchFileContext.value
+    if (!context) {
       termBases.value = []
       termEntries.value = []
       selectedTermBaseId.value = ''
       termsMessage.value = activeMergeViewFile.value
-        ? '合并视图已按当前文件隔离资源上下文；术语库浏览暂不跨文件加载，请使用“资源库搜索”查看当前文件绑定资源。'
+        ? t('workbench.terms.noBase')
         : '请先选中一个句段以确定当前文件上下文。'
       return
     }
     const { data } = await http.get<TermBase[]>('/term-bases')
     const filtered = data.filter((termBase) => (
-      termBase.source_language === segmentStore.fileRecord?.source_language
-      && termBase.target_language === segmentStore.fileRecord?.target_language
+      termBase.source_language === context.source_language
+      && termBase.target_language === context.target_language
       && boundTermBaseIds.value.includes(termBase.id)
     ))
 
@@ -3998,9 +4129,86 @@ function setTermQAReportPage(page: number) {
   termQAReportPage.value = Math.min(Math.max(safePage, 1), termQAReportTotalPages.value)
 }
 
+function setTermQAReportPageForItem(itemId: string) {
+  const itemIndex = filteredTermQAReportItems.value.findIndex((item) => item.id === itemId)
+  if (itemIndex === -1) {
+    return
+  }
+  setTermQAReportPage(Math.floor(itemIndex / termQAReportPageSize) + 1)
+}
+
+function findNextActiveTermQAReportItemAfter(itemIds: string[]) {
+  const items = termQAReport.value?.items || []
+  if (items.length === 0) {
+    return null
+  }
+  const ignoredIdSet = new Set(itemIds)
+  const ignoredIndexes = items
+    .map((item, index) => (ignoredIdSet.has(item.id) ? index : -1))
+    .filter((index) => index >= 0)
+  const startIndex = ignoredIndexes.length > 0
+    ? Math.max(...ignoredIndexes) + 1
+    : 0
+
+  for (let offset = 0; offset < items.length; offset += 1) {
+    const index = (startIndex + offset) % items.length
+    const candidate = items[index]
+    if (candidate && !candidate.ignored && !ignoredIdSet.has(candidate.id)) {
+      return candidate
+    }
+  }
+  return null
+}
+
+function updateCurrentTermQAReportItemsIgnored(itemIds: string[], ignored: boolean) {
+  const report = termQAReport.value
+  if (!report || itemIds.length === 0) {
+    return
+  }
+
+  const itemIdSet = new Set(itemIds)
+  const ignoredAt = new Date().toISOString()
+  let changed = false
+  const items = report.items.map((item) => {
+    if (!itemIdSet.has(item.id) || item.ignored === ignored) {
+      return item
+    }
+    changed = true
+    return {
+      ...item,
+      ignored,
+      status: ignored ? 'ignored' : 'open',
+      ignored_at: ignored ? (item.ignored_at || ignoredAt) : null,
+      ignored_by_id: ignored ? item.ignored_by_id : null,
+      ignored_by_name: ignored ? item.ignored_by_name : null,
+    } satisfies WorkbenchQAResultItem
+  })
+  if (!changed) {
+    return
+  }
+
+  const ignoredCount = items.filter((item) => item.ignored).length
+  termQAReport.value = {
+    ...report,
+    items,
+    active_issue_count: Math.max(items.length - ignoredCount, 0),
+    ignored_count: ignoredCount,
+  }
+  const activeIds = new Set(items.filter((item) => !item.ignored).map((item) => item.id))
+  selectedTermQAItemIds.value = new Set(
+    [...selectedTermQAItemIds.value].filter((id) => activeIds.has(id)),
+  )
+  setTermQAReportPage(termQAReportPage.value)
+}
+
 watch(
-  () => termQAReport.value?.items.length || 0,
+  () => filteredTermQAReportItems.value.length,
   () => setTermQAReportPage(termQAReportPage.value),
+)
+
+watch(
+  () => termQAReportFilter.value,
+  () => setTermQAReportPage(1),
 )
 
 watch(
@@ -4154,6 +4362,7 @@ async function setTermQAReportItemsIgnored(itemIds: string[], ignored: boolean) 
   if (!termQAReport.value || updatingTermQAIgnore.value || itemIds.length === 0) {
     return
   }
+  const nextItem = ignored ? findNextActiveTermQAReportItemAfter(itemIds) : null
   updatingTermQAIgnore.value = true
   try {
     await http.patch(
@@ -4163,7 +4372,11 @@ async function setTermQAReportItemsIgnored(itemIds: string[], ignored: boolean) 
         ignored,
       },
     )
-    await loadLatestTermQAReport()
+    updateCurrentTermQAReportItemsIgnored(itemIds, ignored)
+    if (nextItem) {
+      setTermQAReportPageForItem(nextItem.id)
+      await focusTermQAReportItem(nextItem)
+    }
     toast.success(ignored ? '已忽略所选 QA 问题。' : '已恢复所选 QA 问题。')
   } catch (error) {
     toast.error({
@@ -4179,6 +4392,7 @@ async function setSingleTermQAReportItemIgnored(item: WorkbenchQAResultItem, ign
   if (updatingTermQAIgnore.value) {
     return
   }
+  const nextItem = ignored ? findNextActiveTermQAReportItemAfter([item.id]) : null
   updatingTermQAIgnore.value = true
   try {
     await http.patch(
@@ -4188,7 +4402,11 @@ async function setSingleTermQAReportItemIgnored(item: WorkbenchQAResultItem, ign
         ignored,
       },
     )
-    await loadLatestTermQAReport()
+    updateCurrentTermQAReportItemsIgnored([item.id], ignored)
+    if (nextItem) {
+      setTermQAReportPageForItem(nextItem.id)
+      await focusTermQAReportItem(nextItem)
+    }
     toast.success(ignored ? '已忽略该 QA 问题。' : '已恢复该 QA 问题。')
   } catch (error) {
     toast.error({
@@ -5401,6 +5619,42 @@ function toggleWorkbenchRibbonCollapsed() {
   }
 }
 
+function syncWorkbenchFullscreenState() {
+  if (typeof document === 'undefined') {
+    isWorkbenchFullscreen.value = false
+    return
+  }
+  isWorkbenchFullscreen.value = document.fullscreenElement === workbenchPageRef.value
+}
+
+async function toggleWorkbenchFullscreen() {
+  const target = workbenchPageRef.value
+  if (!target) {
+    return
+  }
+
+  if (!document.fullscreenEnabled) {
+    toast.warn('当前浏览器不支持页面全屏，或全屏权限已被禁用。')
+    return
+  }
+
+  try {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen()
+      return
+    }
+
+    await target.requestFullscreen()
+    closeRibbonMenus()
+  } catch (error) {
+    toast.warn(getErrorMessage(error, '全屏切换失败，请检查浏览器权限。'))
+  } finally {
+    syncWorkbenchFullscreenState()
+    await nextTick()
+    handleResize()
+  }
+}
+
 /**
  * 插入特殊字符到当前活动编辑器
  */
@@ -5458,14 +5712,25 @@ function copySourceToTarget() {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
     return
   }
-  if (!activeSegmentCanWrite.value) {
+
+  copySourceToTargetForSegment(segmentKeyOf(activeSegment.value))
+}
+
+function copySourceToTargetForSegment(sentenceId: string) {
+  const segment = segmentStore.segments.find((item) => segmentKeyOf(item) === sentenceId)
+  if (!segment) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+  if (!segment.can_write) {
     toast.warn('当前流程阶段无编辑权限')
     return
   }
 
-  const sourceText = getSegmentCopyableSourceText(activeSegment.value)
+  handleSegmentTargetActivate(sentenceId)
+  const sourceText = getSegmentCopyableSourceText(segment)
   updateSegmentTarget(
-    segmentKeyOf(activeSegment.value),
+    sentenceId,
     sourceText,
     undefined,
     { recordUndo: true, undoInputType: 'copySourceToTarget' },
@@ -5519,7 +5784,7 @@ function resolveAddTermTargetBaseId() {
   if (candidates.some((termBase) => termBase.id === selectedTermBaseId.value)) {
     return selectedTermBaseId.value
   }
-  const legacyBoundId = segmentStore.fileRecord?.term_base_id || ''
+  const legacyBoundId = activeWorkbenchFileContext.value?.term_base_id || ''
   if (legacyBoundId && candidates.some((termBase) => termBase.id === legacyBoundId)) {
     return legacyBoundId
   }
@@ -6794,10 +7059,16 @@ function handleSelectionChange() {
   trackSourceCaretPosition()
 }
 
+function handleWorkbenchFullscreenChange() {
+  syncWorkbenchFullscreenState()
+  handleResize()
+}
+
 onMounted(() => {
   window.addEventListener('resize', handleResize)
   document.addEventListener('click', handleClickOutside)
   document.addEventListener('selectionchange', handleSelectionChange)
+  document.addEventListener('fullscreenchange', handleWorkbenchFullscreenChange)
   void nextTick(() => {
     observeSegmentEditorResults()
     scheduleSegmentEditorScrollbarGutterUpdate()
@@ -6815,6 +7086,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
   document.removeEventListener('click', handleClickOutside)
   document.removeEventListener('selectionchange', handleSelectionChange)
+  document.removeEventListener('fullscreenchange', handleWorkbenchFullscreenChange)
   clearExportPollTimer()
   commentStore.stopPolling()
 })
@@ -6827,11 +7099,13 @@ onBeforeRouteLeave(async () => {
 
 <template>
   <div
+    ref="workbenchPageRef"
     class="content-stack content-stack--workbench workbench-page"
     :class="{
       'is-standalone': isStandaloneWorkbench,
       'is-stable-grid': isStandaloneWorkbench,
       'is-ribbon-collapsed': isStandaloneWorkbench && workbenchRibbonCollapsed,
+      'is-fullscreen': isWorkbenchFullscreen,
     }"
     data-testid="workbench-page"
   >
@@ -6891,17 +7165,32 @@ onBeforeRouteLeave(async () => {
                 <span>{{ t('common.loading') }}</span>
               </div>
               <template v-else>
-                <button
-                  v-for="option in exportOptions"
-                  :key="option.id"
-                  type="button"
-                  class="export-dropdown__item"
-                  :disabled="exporting"
-                  @click="exportWithType(option.id)"
+                <div
+                  v-for="group in groupedExportOptions"
+                  :key="group.id"
+                  class="export-dropdown__group"
                 >
-                  <span class="export-dropdown__item-name">{{ option.name }}</span>
-                  <span class="export-dropdown__item-desc">{{ option.description }}</span>
-                </button>
+                  <div class="export-dropdown__group-title">{{ group.label }}</div>
+                  <button
+                    v-for="option in group.options"
+                    :key="option.id"
+                    type="button"
+                    class="export-dropdown__item"
+                    :disabled="exporting"
+                    @click="exportWithType(option.id)"
+                  >
+                    <span class="export-dropdown__item-head">
+                      <span class="export-dropdown__item-name">{{ option.name }}</span>
+                      <span
+                        v-if="getExportOptionExtensionLabel(option)"
+                        class="export-dropdown__item-ext"
+                      >
+                        {{ getExportOptionExtensionLabel(option) }}
+                      </span>
+                    </span>
+                    <span class="export-dropdown__item-desc">{{ option.description }}</span>
+                  </button>
+                </div>
               </template>
             </div>
           </div>
@@ -6918,6 +7207,21 @@ onBeforeRouteLeave(async () => {
         >
           <ChevronDown v-if="workbenchRibbonCollapsed" :size="16" />
           <ChevronUp v-else :size="16" />
+          <span>{{ workbenchRibbonCollapseLabel }}</span>
+        </button>
+        <button
+          class="workbench-ribbon__fullscreen"
+          data-testid="workbench-ribbon-fullscreen"
+          type="button"
+          :class="{ 'is-active': isWorkbenchFullscreen }"
+          :title="workbenchFullscreenTitle"
+          :aria-label="workbenchFullscreenTitle"
+          :aria-pressed="isWorkbenchFullscreen"
+          @click="void toggleWorkbenchFullscreen()"
+        >
+          <Minimize2 v-if="isWorkbenchFullscreen" :size="16" />
+          <Maximize2 v-else :size="16" />
+          <span>{{ workbenchFullscreenLabel }}</span>
         </button>
         <button
           class="workbench-ribbon__help"
@@ -7715,17 +8019,32 @@ onBeforeRouteLeave(async () => {
                 <span>{{ t('common.loading') }}</span>
               </div>
               <template v-else>
-                <button
-                  v-for="option in exportOptions"
-                  :key="option.id"
-                  type="button"
-                  class="export-dropdown__item"
-                  :disabled="exporting"
-                  @click="exportWithType(option.id)"
+                <div
+                  v-for="group in groupedExportOptions"
+                  :key="group.id"
+                  class="export-dropdown__group"
                 >
-                  <span class="export-dropdown__item-name">{{ option.name }}</span>
-                  <span class="export-dropdown__item-desc">{{ option.description }}</span>
-                </button>
+                  <div class="export-dropdown__group-title">{{ group.label }}</div>
+                  <button
+                    v-for="option in group.options"
+                    :key="option.id"
+                    type="button"
+                    class="export-dropdown__item"
+                    :disabled="exporting"
+                    @click="exportWithType(option.id)"
+                  >
+                    <span class="export-dropdown__item-head">
+                      <span class="export-dropdown__item-name">{{ option.name }}</span>
+                      <span
+                        v-if="getExportOptionExtensionLabel(option)"
+                        class="export-dropdown__item-ext"
+                      >
+                        {{ getExportOptionExtensionLabel(option) }}
+                      </span>
+                    </span>
+                    <span class="export-dropdown__item-desc">{{ option.description }}</span>
+                  </button>
+                </div>
               </template>
             </div>
           </div>
@@ -7918,7 +8237,11 @@ onBeforeRouteLeave(async () => {
     </section>
 
     <section v-else class="workbench-layout" :class="{ 'has-active-tool': activeSideTool }">
-      <section class="panel panel--stretch panel--editor" :class="{ 'has-search-open': segmentSearchOpen }">
+      <section
+        class="panel panel--stretch panel--editor"
+        :class="{ 'has-search-open': segmentSearchOpen }"
+        :style="segmentEditorFontStyle"
+      >
         <div class="panel-header panel-header--compact segment-editor-toolbar">
           <div class="segment-editor-toolbar__title">
             <div class="section-title section-title--tight">{{ t('workbench.editorTitle') }}</div>
@@ -7948,6 +8271,41 @@ onBeforeRouteLeave(async () => {
             </span>
           </div>
           <div class="segment-editor-toolbar__actions">
+            <div class="segment-editor-toolbar__font-zoom" role="group" aria-label="句段编辑字体缩放">
+              <button
+                class="segment-editor-toolbar__font-button"
+                type="button"
+                title="缩小句段字体"
+                aria-label="缩小句段字体"
+                :disabled="!canDecreaseSegmentEditorFont"
+                @click="decreaseSegmentEditorFontScale"
+              >
+                <ZoomOut :size="14" />
+              </button>
+              <span class="segment-editor-toolbar__font-value" aria-live="polite">
+                {{ segmentEditorFontPercent }}%
+              </span>
+              <button
+                class="segment-editor-toolbar__font-button"
+                type="button"
+                title="放大句段字体"
+                aria-label="放大句段字体"
+                :disabled="!canIncreaseSegmentEditorFont"
+                @click="increaseSegmentEditorFontScale"
+              >
+                <ZoomIn :size="14" />
+              </button>
+              <button
+                class="segment-editor-toolbar__font-button"
+                type="button"
+                title="恢复默认字体大小"
+                aria-label="恢复默认字体大小"
+                :disabled="segmentEditorFontScale === SEGMENT_EDITOR_FONT_SCALE_DEFAULT"
+                @click="resetSegmentEditorFontScale"
+              >
+                <RotateCcw :size="13" />
+              </button>
+            </div>
             <label class="segment-editor-toolbar__filter">
               <span class="segment-editor-toolbar__filter-label">{{ t('workbench.search.scopeLabel') }}</span>
               <select
@@ -8415,7 +8773,11 @@ onBeforeRouteLeave(async () => {
           </div>
         </Transition>
 
-        <div class="segment-editor-shell" :class="{ 'has-bottom-drawer': activeBottomTool }">
+          <div
+            class="segment-editor-shell"
+            :class="{ 'has-bottom-drawer': activeBottomTool }"
+            :style="bottomDrawerPanelHeightStyle"
+          >
           <div ref="segmentEditorResultsRef" class="segment-editor-results">
             <div class="segment-table-head" aria-hidden="true">
               <span>句段</span>
@@ -8447,7 +8809,7 @@ onBeforeRouteLeave(async () => {
                 v-else
                 ref="virtualListRef"
                 :items="editorSegments"
-                :item-height="itemHeight"
+                :item-height="segmentEditorItemHeight"
                 :item-key="segmentItemKey"
                 :adaptive="!isStandaloneWorkbench"
                 :virtualized="!isStandaloneWorkbench"
@@ -8456,7 +8818,7 @@ onBeforeRouteLeave(async () => {
                 @reach-end="handleEditorReachEnd"
               >
                 <template #default="{ item, index }">
-                  <div class="merge-segment-group">
+                  <div class="merge-segment-group" :style="segmentEditorFontStyle">
                     <div v-if="shouldShowMergeGroupHeader(item, index)" class="merge-segment-group__header">
                       <div>
                         <strong>{{ item.filename || getMergeGroupFile(item)?.filename || t('workbench.currentTask') }}</strong>
@@ -8493,6 +8855,7 @@ onBeforeRouteLeave(async () => {
                       :pending-formats="pendingFormatsForEditor"
                       @focus="segmentStore.setActiveSentence"
                       @activate-target="handleSegmentTargetActivate"
+                      @copy-source-to-target="copySourceToTargetForSegment"
                       @update="updateSegmentTarget"
                       @update-source="updateSegmentSource"
                       @toggle-project-sync="toggleProjectSegmentSync"
@@ -8743,11 +9106,21 @@ onBeforeRouteLeave(async () => {
                   </div>
 
                   <div class="term-qa-dialog__actions">
+                    <select
+                      v-if="termQAReport && termQAReport.items.length > 0"
+                      v-model="termQAReportFilter"
+                      class="term-qa-dialog__filter-select"
+                      title="切换 QA 问题显示范围"
+                    >
+                      <option value="active">待处理</option>
+                      <option value="ignored">已忽略</option>
+                      <option value="all">全部</option>
+                    </select>
                     <button
                       v-if="termQAReport"
                       class="button button--ghost term-qa-dialog__action-button"
                       type="button"
-                      :disabled="activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
+                      :disabled="termQAReportFilter === 'ignored' || activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
                       title="全选未忽略"
                       @click="toggleAllActiveTermQAItems(!allActiveTermQAItemsSelected)"
                     >
@@ -8757,7 +9130,7 @@ onBeforeRouteLeave(async () => {
                       v-if="termQAReport"
                       class="button button--ghost term-qa-dialog__action-button"
                       type="button"
-                      :disabled="selectedActiveTermQAReportItems.length === 0 || updatingTermQAIgnore"
+                      :disabled="termQAReportFilter === 'ignored' || selectedActiveTermQAReportItems.length === 0 || updatingTermQAIgnore"
                       title="忽略选中的 QA 问题"
                       @click="void ignoreSelectedTermQAReportItems()"
                     >
@@ -8813,8 +9186,8 @@ onBeforeRouteLeave(async () => {
                 </div>
 
                 <template v-else-if="termQAReport">
-                  <div v-if="termQAReport.items.length === 0" class="empty-state">
-                    未发现已开启规则的 QA 问题。
+                  <div v-if="filteredTermQAReportItems.length === 0" class="empty-state">
+                    {{ termQAReportEmptyText }}
                   </div>
                   <div v-else class="term-qa-dialog__table-wrap">
                     <table class="term-qa-dialog__table">
@@ -8824,7 +9197,7 @@ onBeforeRouteLeave(async () => {
                             <input
                               type="checkbox"
                               :checked="allActiveTermQAItemsSelected"
-                              :disabled="activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
+                              :disabled="termQAReportFilter === 'ignored' || activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
                               aria-label="全选未忽略 QA 问题"
                               title="全选未忽略"
                               @change="toggleAllActiveTermQAItems(!allActiveTermQAItemsSelected)"
@@ -8910,7 +9283,7 @@ onBeforeRouteLeave(async () => {
                         </tr>
                       </tbody>
                     </table>
-                    <div v-if="termQAReport.items.length > termQAReportPageSize" class="term-qa-dialog__pager">
+                    <div v-if="filteredTermQAReportItems.length > termQAReportPageSize" class="term-qa-dialog__pager">
                       <span class="term-qa-dialog__pager-range">{{ termQAReportPageRangeText }}</span>
                       <div class="term-qa-dialog__pager-actions">
                         <button
@@ -9680,8 +10053,8 @@ onBeforeRouteLeave(async () => {
       :context-label="t('workbench.importContext', { name: activeWorkbenchFileContext?.filename || t('workbench.currentTask') })"
       :source-language="activeWorkbenchFileContext?.source_language || null"
       :target-language="activeWorkbenchFileContext?.target_language || null"
-      :default-tm-collection-id="segmentStore.mergeViewId ? '' : (segmentStore.fileRecord?.collection_id || '')"
-      :default-term-base-id="segmentStore.mergeViewId ? '' : (segmentStore.fileRecord?.term_base_id || '')"
+      :default-tm-collection-id="activeWorkbenchFileContext?.collection_id || ''"
+      :default-term-base-id="activeWorkbenchFileContext?.term_base_id || ''"
       @close="showImportDialog = false"
       @imported="handleResourceImported"
     />
@@ -10117,7 +10490,7 @@ onBeforeRouteLeave(async () => {
 
 .workbench-page {
   --workbench-editor-stage-height: clamp(420px, calc(100vh - 410px), 660px);
-  --workbench-bottom-panel-height: clamp(300px, 42vh, 460px);
+  --workbench-bottom-panel-height: clamp(220px, 30vh, 340px);
   --workbench-visible-bottom-panel-height: min(var(--workbench-bottom-panel-height), calc(100dvh - 70px));
   --workbench-side-tools-width: 48px;
   --workbench-toolbar-left: calc(var(--sidebar-width) + 24px);
@@ -10131,7 +10504,7 @@ onBeforeRouteLeave(async () => {
 
 .workbench-page.is-standalone {
   --workbench-editor-stage-height: clamp(500px, calc(100vh - 252px), 900px);
-  --workbench-bottom-panel-height: clamp(320px, 42vh, 500px);
+  --workbench-bottom-panel-height: clamp(220px, 30vh, 360px);
   --workbench-visible-bottom-panel-height: min(var(--workbench-bottom-panel-height), calc(100dvh - 70px));
   --workbench-toolbar-left: 16px;
   --workbench-drawer-left: 16px;
@@ -10146,6 +10519,14 @@ onBeforeRouteLeave(async () => {
 
 .workbench-page.is-standalone.is-ribbon-collapsed {
   --workbench-side-panel-top: 54px;
+}
+
+.workbench-page.is-fullscreen {
+  width: 100vw;
+  height: 100vh;
+  padding: 0 10px 8px;
+  overflow: auto;
+  background: #f3f6f8;
 }
 
 .workbench-page.is-standalone {
@@ -10371,10 +10752,10 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-ribbon__help,
-.workbench-ribbon__collapse {
+.workbench-ribbon__collapse,
+.workbench-ribbon__fullscreen {
   display: inline-grid;
   place-items: center;
-  width: 30px;
   height: 30px;
   margin-right: 4px;
   border: 1px solid transparent;
@@ -10385,19 +10766,45 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-ribbon__help {
+  width: 30px;
+}
+
+.workbench-ribbon__collapse,
+.workbench-ribbon__fullscreen {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 60px;
+  padding: 0 8px;
+  color: #30434c;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.workbench-ribbon__collapse svg,
+.workbench-ribbon__fullscreen svg {
+  flex: 0 0 auto;
+}
+
+.workbench-ribbon__help {
   margin-right: 8px;
 }
 
 .workbench-ribbon__help:hover,
 .workbench-ribbon__collapse:hover,
-.workbench-ribbon__collapse:focus-visible {
+.workbench-ribbon__collapse:focus-visible,
+.workbench-ribbon__fullscreen:hover,
+.workbench-ribbon__fullscreen:focus-visible {
   border-color: var(--line-soft);
   background: #fff;
   color: var(--brand-700);
   outline: none;
 }
 
-.workbench-ribbon__collapse.is-active {
+.workbench-ribbon__collapse.is-active,
+.workbench-ribbon__fullscreen.is-active {
   border-color: #b9d3df;
   background: #fff;
   color: #0f6f83;
@@ -13083,7 +13490,7 @@ onBeforeRouteLeave(async () => {
   order: 2;
   width: 100%;
   height: var(--workbench-visible-bottom-panel-height);
-  min-height: min(260px, var(--workbench-visible-bottom-panel-height));
+  min-height: min(168px, var(--workbench-visible-bottom-panel-height));
   max-height: var(--workbench-visible-bottom-panel-height);
   overflow: hidden;
   border: 1px solid #cfd8df;
@@ -13094,7 +13501,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-bottom-drawer.is-resizable {
-  padding-top: 12px;
+  padding-top: 8px;
   border-top-color: #b6c9d2;
 }
 
@@ -13108,7 +13515,7 @@ onBeforeRouteLeave(async () => {
   right: 0;
   left: 0;
   z-index: 10;
-  height: 12px;
+  height: 8px;
   padding: 0;
   border: 0;
   border-bottom: 1px solid #dde7ec;
@@ -13120,9 +13527,9 @@ onBeforeRouteLeave(async () => {
 .workbench-bottom-drawer__resize-handle::before {
   content: "";
   position: absolute;
-  top: 4px;
+  top: 2px;
   left: 50%;
-  width: 58px;
+  width: 46px;
   height: 3px;
   transform: translateX(-50%);
   border-radius: 999px;
@@ -13208,13 +13615,13 @@ onBeforeRouteLeave(async () => {
 
 .workbench-bottom-drawer__close {
   position: absolute;
-  top: 18px;
-  right: 10px;
+  top: 12px;
+  right: 8px;
   z-index: 3;
   display: inline-grid;
   place-items: center;
-  width: 30px;
-  height: 30px;
+  width: 28px;
+  height: 28px;
   padding: 0;
   border: 1px solid #cdd9de;
   border-radius: 4px;
@@ -13248,9 +13655,9 @@ onBeforeRouteLeave(async () => {
 .workbench-bottom-drawer__qa {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  gap: 10px;
+  gap: 6px;
   overflow: hidden;
-  padding: 12px;
+  padding: 8px 10px;
 }
 
 .workbench-bottom-drawer__header {
@@ -13268,8 +13675,8 @@ onBeforeRouteLeave(async () => {
 .workbench-bottom-drawer__header--qa {
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px 14px;
-  padding-right: 40px;
+  gap: 5px 10px;
+  padding-right: 34px;
 }
 
 .workbench-bottom-drawer__header-lead {
@@ -13287,6 +13694,9 @@ onBeforeRouteLeave(async () => {
 
 .workbench-bottom-drawer__header .panel-subtitle {
   max-width: min(760px, 70vw);
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.25;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -13297,17 +13707,126 @@ onBeforeRouteLeave(async () => {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 10px;
-  min-height: 100%;
+  align-self: start;
+  gap: 8px;
+  width: 100%;
+  min-height: 88px;
+  padding: 14px 12px;
+  border: 1px dashed #d5e3e8;
+  border-radius: 5px;
+  background: #f9fcfc;
 }
 
 .workbench-bottom-drawer__qa .term-qa-dialog__table-wrap {
   min-height: 0;
   overflow: auto;
+  border-radius: 4px;
 }
 
 .workbench-bottom-drawer__qa .term-qa-dialog__table {
   min-width: 760px;
+}
+
+.workbench-bottom-drawer__qa .term-qa-dialog__summary {
+  gap: 5px;
+}
+
+.workbench-bottom-drawer__qa .term-qa-stat {
+  min-height: 22px;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.workbench-bottom-drawer__qa .term-qa-dialog__actions {
+  gap: 5px;
+}
+
+.workbench-bottom-drawer__qa .term-qa-dialog__action-button {
+  min-height: 26px;
+  padding: 3px 7px;
+}
+
+.workbench-bottom-drawer__qa .term-qa-dialog__filter-select {
+  min-height: 26px;
+  padding: 2px 7px;
+}
+
+.workbench-bottom-drawer__qa .term-qa-dialog__toggle {
+  min-height: 26px;
+}
+
+.workbench-bottom-drawer__qa .term-qa-dialog__warnings {
+  margin: 0;
+  padding: 4px 6px;
+}
+
+.workbench-bottom-drawer__qa .term-qa-dialog__table th,
+.workbench-bottom-drawer__qa .term-qa-dialog__table td {
+  padding: 5px 7px;
+  line-height: 1.35;
+}
+
+.workbench-bottom-drawer__qa .term-qa-dialog__issue-suggestion {
+  margin-top: 1px;
+}
+
+.workbench-bottom-drawer__qa .term-qa-dialog__inline-action {
+  min-height: 24px;
+  padding: 2px 7px;
+}
+
+.workbench-bottom-drawer__qa .term-qa-dialog__pager {
+  min-height: 32px;
+  padding: 4px 8px;
+}
+
+.workbench-bottom-drawer__qa .term-qa-dialog__pager-button {
+  width: 24px;
+  min-width: 24px;
+  min-height: 24px;
+}
+
+.workbench-bottom-drawer__qa .term-qa-dialog__pager-page {
+  height: 24px;
+  min-width: 48px;
+}
+
+.workbench-bottom-drawer__qa .number-check__table thead th,
+.workbench-bottom-drawer__qa .number-check__table tbody td {
+  padding: 5px 7px;
+}
+
+.workbench-bottom-drawer__qa .number-check__reason,
+.workbench-bottom-drawer__qa .number-check__fix {
+  line-height: 1.35;
+}
+
+.workbench-bottom-drawer__qa .number-check__nums {
+  margin-top: 1px;
+  line-height: 1.25;
+}
+
+.workbench-bottom-drawer__qa .number-check__actions {
+  gap: 4px;
+}
+
+.workbench-bottom-drawer__qa .number-check__action {
+  min-height: 26px;
+  padding: 3px 8px;
+  font-size: 12px;
+}
+
+.workbench-bottom-drawer__qa .number-check__progress {
+  gap: 5px;
+  padding: 6px 2px;
+}
+
+.workbench-bottom-drawer__qa .number-check__progress-track {
+  height: 6px;
+}
+
+.workbench-bottom-drawer__qa .number-check__count {
+  padding: 5px 4px;
 }
 
 .workbench-bottom-drawer :deep(.preview-panel),
@@ -13495,16 +14014,12 @@ onBeforeRouteLeave(async () => {
 }
 
 .segment-editor-shell.has-bottom-drawer .segment-editor-results {
-  grid-template-rows: auto minmax(180px, 1fr);
+  grid-template-rows: auto minmax(140px, 1fr);
 }
 
 .segment-editor-shell.has-bottom-drawer .segment-editor-list-stage {
-  height: clamp(
-    180px,
-    calc(var(--workbench-editor-stage-height) - var(--workbench-visible-bottom-panel-height) - 24px),
-    var(--workbench-editor-stage-height)
-  );
-  min-height: 180px;
+  height: 100%;
+  min-height: 0;
 }
 
 .segment-editor-list-stage > .virtual-list::-webkit-scrollbar {
@@ -13606,6 +14121,56 @@ onBeforeRouteLeave(async () => {
   flex-wrap: wrap;
   min-width: 0;
   margin-left: auto;
+}
+
+.segment-editor-toolbar__font-zoom {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 30px;
+  padding: 2px;
+  border: 1px solid #cbd9df;
+  border-radius: 4px;
+  background: #fff;
+  box-shadow: none;
+}
+
+.segment-editor-toolbar__font-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 24px;
+  min-width: 26px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: #2d4651;
+  box-shadow: none;
+}
+
+.segment-editor-toolbar__font-button:hover:not(:disabled),
+.segment-editor-toolbar__font-button:focus-visible {
+  border-color: #c6d8e2;
+  background: #edf7f4;
+  color: #0b6658;
+  outline: none;
+}
+
+.segment-editor-toolbar__font-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.segment-editor-toolbar__font-value {
+  min-width: 42px;
+  color: #2d4651;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  text-align: center;
+  white-space: nowrap;
 }
 
 .segment-editor-toolbar__filter {
@@ -14580,10 +15145,13 @@ onBeforeRouteLeave(async () => {
   top: calc(100% + 4px);
   right: 0;
   z-index: 100;
-  min-width: 240px;
-  padding: 4px;
+  min-width: 300px;
+  max-width: min(360px, calc(100vw - 24px));
+  max-height: min(520px, calc(100vh - 120px));
+  padding: 8px;
+  overflow-y: auto;
   border: 1px solid #e0e4e7;
-  border-radius: 6px;
+  border-radius: 8px;
   background: #fff;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
 }
@@ -14598,10 +15166,24 @@ onBeforeRouteLeave(async () => {
   font-size: 13px;
 }
 
+.export-dropdown__group + .export-dropdown__group {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #edf0f2;
+}
+
+.export-dropdown__group-title {
+  padding: 2px 8px 6px;
+  color: #6b7c85;
+  font-size: 11px;
+  font-weight: 700;
+}
+
 .export-dropdown__item {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
+  gap: 4px;
   width: 100%;
   padding: 8px 10px;
   border: none;
@@ -14621,16 +15203,38 @@ onBeforeRouteLeave(async () => {
   cursor: not-allowed;
 }
 
+.export-dropdown__item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+}
+
 .export-dropdown__item-name {
+  min-width: 0;
   font-size: 13px;
   font-weight: 500;
   color: #2c3e50;
+  overflow-wrap: anywhere;
+}
+
+.export-dropdown__item-ext {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid #d7dde2;
+  border-radius: 4px;
+  background: #f6f8f9;
+  color: #4d5c65;
+  font-size: 10px;
+  font-weight: 700;
 }
 
 .export-dropdown__item-desc {
   font-size: 11px;
   color: #6b7c85;
-  margin-top: 2px;
+  line-height: 1.35;
 }
 
 .export-dropdown--toolbar {

@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS memory_bases (
     description TEXT,
     source_language VARCHAR(20),
     target_language VARCHAR(20),
+    creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -57,11 +58,15 @@ ALTER TABLE IF EXISTS memory_bases
     ADD COLUMN IF NOT EXISTS source_language VARCHAR(20);
 ALTER TABLE IF EXISTS memory_bases
     ADD COLUMN IF NOT EXISTS target_language VARCHAR(20);
+ALTER TABLE IF EXISTS memory_bases
+    ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_bases_name
     ON memory_bases (name);
 CREATE INDEX IF NOT EXISTS ix_memory_bases_language_pair
     ON memory_bases (source_language, target_language);
+CREATE INDEX IF NOT EXISTS ix_memory_bases_creator_id
+    ON memory_bases (creator_id);
 
 DROP TRIGGER IF EXISTS update_memory_bases_updated_at ON memory_bases;
 CREATE TRIGGER update_memory_bases_updated_at
@@ -234,6 +239,7 @@ CREATE TABLE IF NOT EXISTS term_bases (
     description TEXT,
     source_language VARCHAR(20) NOT NULL,
     target_language VARCHAR(20) NOT NULL,
+    creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -245,6 +251,8 @@ ALTER TABLE IF EXISTS term_bases
 ALTER TABLE IF EXISTS term_bases
     ADD COLUMN IF NOT EXISTS target_language VARCHAR(20);
 ALTER TABLE IF EXISTS term_bases
+    ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE IF EXISTS term_bases
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
 ALTER TABLE IF EXISTS term_bases
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
@@ -253,6 +261,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_term_bases_name
     ON term_bases (name);
 CREATE INDEX IF NOT EXISTS ix_term_bases_language_pair
     ON term_bases (source_language, target_language);
+CREATE INDEX IF NOT EXISTS ix_term_bases_creator_id
+    ON term_bases (creator_id);
 
 DROP TRIGGER IF EXISTS update_term_bases_updated_at ON term_bases;
 CREATE TRIGGER update_term_bases_updated_at
@@ -382,6 +392,7 @@ CREATE TABLE IF NOT EXISTS glossary_bases (
     description TEXT,
     source_language VARCHAR(20) NOT NULL,
     target_language VARCHAR(20) NOT NULL,
+    creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -393,6 +404,8 @@ ALTER TABLE IF EXISTS glossary_bases
 ALTER TABLE IF EXISTS glossary_bases
     ADD COLUMN IF NOT EXISTS target_language VARCHAR(20);
 ALTER TABLE IF EXISTS glossary_bases
+    ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE IF EXISTS glossary_bases
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
 ALTER TABLE IF EXISTS glossary_bases
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
@@ -401,6 +414,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_glossary_bases_name
     ON glossary_bases (name);
 CREATE INDEX IF NOT EXISTS ix_glossary_bases_language_pair
     ON glossary_bases (source_language, target_language);
+CREATE INDEX IF NOT EXISTS ix_glossary_bases_creator_id
+    ON glossary_bases (creator_id);
 
 DROP TRIGGER IF EXISTS update_glossary_bases_updated_at ON glossary_bases;
 CREATE TRIGGER update_glossary_bases_updated_at

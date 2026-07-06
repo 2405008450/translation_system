@@ -1634,19 +1634,17 @@ export const useSegmentStore = defineStore('segment', () => {
       }
       return
     }
-    if (mergeViewId.value) {
-      termMatchesMap.value = {
-        ...termMatchesMap.value,
-        [sentenceId]: [],
-      }
-      return
-    }
     try {
       const params = new URLSearchParams({ text: sourceText })
+      const termContext = mergeViewId.value
+        ? mergeViewDetail.value?.files.find((file) => (
+            file.id === (fileRecordIdFromKey(sentenceId) || activeFileRecordId.value)
+          ))
+        : fileRecord.value
       const boundTermBaseIds = Array.from(new Set([
-        ...(fileRecord.value?.term_base_ids || []),
-        ...(fileRecord.value?.term_base_id ? [fileRecord.value.term_base_id] : []),
-        ...(fileRecord.value?.qa_term_base_ids || []),
+        ...(termContext?.term_base_ids || []),
+        ...(termContext?.term_base_id ? [termContext.term_base_id] : []),
+        ...(termContext?.qa_term_base_ids || []),
       ].filter(Boolean)))
       if (boundTermBaseIds.length === 0) {
         termMatchesMap.value = {

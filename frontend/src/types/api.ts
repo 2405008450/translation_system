@@ -255,6 +255,9 @@ export interface DocumentStatistics {
   engine_version: string | null
   license_status: string | null
   include_textboxes_footnotes_endnotes: boolean | null
+  statistics_profile: string | null
+  content_scope: string | null
+  statistics_warnings: string[]
   match_analysis: DocumentMatchAnalysis | null
   pages: number | null
   words: number | null
@@ -268,6 +271,13 @@ export interface DocumentStatistics {
   internal_repeated_characters: number | null
   cross_file_repeated_words: number | null
   cross_file_repeated_characters: number | null
+  image_count: number | null
+  unique_image_count: number | null
+  inline_image_count: number | null
+  floating_image_count: number | null
+  linked_image_count: number | null
+  chart_count: number | null
+  smartart_count: number | null
 }
 
 export interface DocumentMatchAnalysisRow {
@@ -286,6 +296,18 @@ export interface DocumentMatchAnalysis {
   rows: DocumentMatchAnalysisRow[]
 }
 
+export interface PretranslationMatchAnalysisPreviewResponse {
+  analysis: DocumentMatchAnalysis
+  remaining_new_segments: number
+  remaining_new_words: number
+  tm_applied_segments: number
+  tm_applied_words: number
+  repeat_segments: number
+  repeat_words: number
+  skipped_confirmed_segments: number
+  skipped_confirmed_words: number
+}
+
 export interface DocumentStatisticsTotals {
   pages: number | null
   words: number | null
@@ -299,6 +321,13 @@ export interface DocumentStatisticsTotals {
   internal_repeated_characters: number | null
   cross_file_repeated_words: number | null
   cross_file_repeated_characters: number | null
+  image_count: number | null
+  unique_image_count: number | null
+  inline_image_count: number | null
+  floating_image_count: number | null
+  linked_image_count: number | null
+  chart_count: number | null
+  smartart_count: number | null
   match_analysis: DocumentMatchAnalysis | null
 }
 
@@ -426,6 +455,7 @@ export interface Segment {
   source_text: string
   display_text: string
   source_body_text?: string
+  source_layout_text?: string | null
   automatic_numbering_text?: string | null
   target_automatic_numbering_text?: string | null
   source_html?: string | null
@@ -750,6 +780,12 @@ export interface MergeViewFile {
   workflow_progress?: WorkflowProgress[]
   can_write?: boolean
   is_edit_locked: boolean
+  collection_id?: string | null
+  collection_ids?: string[]
+  term_base_id?: string | null
+  term_base_ids?: string[]
+  term_base_write_ids?: string[]
+  qa_term_base_ids?: string[]
 }
 
 export interface MergeViewLanguagePair {
@@ -890,6 +926,8 @@ export interface TermBase {
   description: string | null
   source_language: string
   target_language: string
+  creator_id?: string | null
+  creator_name?: string | null
   created_at: string
   updated_at: string
   entry_count: number
@@ -901,6 +939,8 @@ export interface GlossaryBase {
   description: string | null
   source_language: string
   target_language: string
+  creator_id?: string | null
+  creator_name?: string | null
   created_at: string
   updated_at: string
   entry_count: number
@@ -1047,6 +1087,8 @@ export interface TMCollection {
   description: string | null
   source_language: string | null
   target_language: string | null
+  creator_id?: string | null
+  creator_name?: string | null
   created_at: string
   updated_at: string
   entry_count: number

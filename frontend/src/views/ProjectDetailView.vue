@@ -65,6 +65,11 @@ import { getFileStatusMeta } from '../constants/status'
 import { buildTranslatedTaskFilename, supportedTaskFileAccept } from '../constants/taskFiles'
 import { useAuthStore } from '../stores/auth'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
+import {
+  getExportOptionExtensionLabel,
+  groupExportOptions,
+  type FileExportOption,
+} from '../utils/exportOptions'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
 import type {
   DocumentParseMode,
@@ -119,6 +124,13 @@ type DocumentStatisticNumberKey =
   | 'internal_repeated_characters'
   | 'cross_file_repeated_words'
   | 'cross_file_repeated_characters'
+  | 'image_count'
+  | 'unique_image_count'
+  | 'inline_image_count'
+  | 'floating_image_count'
+  | 'linked_image_count'
+  | 'chart_count'
+  | 'smartart_count'
 
 interface ProjectDetail {
   id: string
@@ -219,6 +231,7 @@ type AssignmentFileRangeField = 'range_start' | 'range_end'
 type AssignmentUserTypeFilter = 'all' | 'internal' | 'external'
 type AssignmentUserStateFilter = 'all' | 'selected' | 'unselected'
 type AssignmentFileStateFilter = 'all' | 'checked' | 'unchecked'
+type ProjectResourceCreateKind = 'tm' | 'term'
 
 interface PreTranslateProgressState {
   progress: number
@@ -294,6 +307,8 @@ const DEFAULT_DOCUMENT_PARSE_OPTIONS: DocumentParseOptions = {
   xlsx_skip_fill_colors: [],
 }
 
+const DEFAULT_UPLOAD_MAX_SIZE_MB = 100
+
 const DOCUMENT_STATISTIC_NUMBER_KEYS: DocumentStatisticNumberKey[] = [
   'pages',
   'words',
@@ -307,6 +322,13 @@ const DOCUMENT_STATISTIC_NUMBER_KEYS: DocumentStatisticNumberKey[] = [
   'internal_repeated_characters',
   'cross_file_repeated_words',
   'cross_file_repeated_characters',
+  'image_count',
+  'unique_image_count',
+  'inline_image_count',
+  'floating_image_count',
+  'linked_image_count',
+  'chart_count',
+  'smartart_count',
 ]
 
 const DOCUMENT_MATCH_ANALYSIS_ROW_KEYS = [
@@ -360,13 +382,6 @@ interface FileExportTask {
   filename?: string | null
   size_bytes?: number | null
 }
-interface FileExportOption {
-  id: string
-  name: string
-  description: string
-  extension: string
-}
-
 const confirm = useConfirm()
 const authStore = useAuthStore()
 const route = useRoute()
@@ -452,6 +467,10 @@ const actionMenuStyle = ref<Record<string, string>>({})
 const currentPage = ref(1)
 const pageSize = ref(10)
 const selectedFileIds = ref(new Set<string>())
+const showFileSelectionMenu = ref(false)
+const fileSelectionRangeStart = ref('1')
+const fileSelectionRangeEnd = ref('1')
+const fileSelectionRangeError = ref('')
 const fileSearchQuery = ref('')
 const fileStatusFilter = ref('all')
 const fileLanguagePairFilter = ref('all')
@@ -507,6 +526,39 @@ const creatingTranslationMemoryPair = ref('')
 const translationMemorySettingsError = ref('')
 const expandedTMCollectionKey = ref('')
 const tmSettingsSearchQuery = ref('')
+const showProjectResourceCreateDialog = ref(false)
+const projectResourceCreateKind = ref<ProjectResourceCreateKind>('tm')
+const projectResourceCreateGroupKey = ref('')
+const projectResourceCreateForm = reactive({
+  name: '',
+  description: '',
+  sourceLanguage: '',
+  targetLanguage: '',
+})
+const projectResourceCreateError = ref('')
+const projectResourceCreateSubmitting = ref(false)
+const projectResourceCreateTitle = computed(() => (
+  projectResourceCreateKind.value === 'tm' ? '创建记忆库' : '创建术语库'
+))
+const projectResourceCreateDescription = computed(() => (
+  projectResourceCreateKind.value === 'tm'
+    ? '填写名称和说明后，为当前语言对创建新的翻译记忆库。'
+    : '填写名称和说明后，为当前语言对创建新的术语库。'
+))
+const projectResourceCreateNameLabel = computed(() => (
+  projectResourceCreateKind.value === 'tm' ? '记忆库名称' : '术语库名称'
+))
+const projectResourceCreateNamePlaceholder = computed(() => (
+  projectResourceCreateKind.value === 'tm'
+    ? '例如：技术文档中英记忆库'
+    : '例如：医疗器械中英术语库'
+))
+const projectResourceCreateSubmitText = computed(() => {
+  if (projectResourceCreateSubmitting.value) {
+    return '创建中...'
+  }
+  return projectResourceCreateKind.value === 'tm' ? '创建记忆库' : '创建术语库'
+})
 const tmImportDialogContext = ref<{
   collectionId: string
   collectionName: string
@@ -663,6 +715,7 @@ const exportFileMessage = ref('')
 const showProjectExportMenu = ref(false)
 const loadingProjectExportOptions = ref(false)
 const projectExportOptions = ref<FileExportOption[]>([])
+const groupedProjectExportOptions = computed(() => groupExportOptions(projectExportOptions.value))
 let exportPollTimer: number | null = null
 let activePretranslationPollTimer: number | null = null
 const ACTIVE_PRETRANSLATION_STATUSES = new Set(['queued', 'running', 'canceling'])
@@ -767,7 +820,7 @@ const tabs = computed(() => ([
     label: `${t('projectDetail.tabs.issues')}${openIssueCount.value > 0 ? ` (${openIssueCount.value})` : ''}`,
     disabled: false,
   },
-  { key: 'assignments' as const, label: '指派记录', disabled: !canManageProject.value },
+  { key: 'assignments' as const, label: '指派记录', disabled: !canAssignProject.value },
   { key: 'settings' as const, label: t('projectDetail.tabs.settings'), disabled: !canManageProject.value },
   { key: 'stats' as const, label: t('projectDetail.tabs.stats'), disabled: !canManageProject.value },
   { key: 'summary' as const, label: t('projectDetail.tabs.summary'), disabled: true },
@@ -900,6 +953,32 @@ const pagedRows = computed(() => {
   return filteredTableRows.value.slice(start, start + pageSize.value)
 })
 const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
+const currentPageFileRangeStart = computed(() => (
+  pagedRows.value.length > 0 ? indexOffset.value + 1 : 0
+))
+const currentPageFileRangeEnd = computed(() => (
+  pagedRows.value.length > 0 ? indexOffset.value + pagedRows.value.length : 0
+))
+const selectedFilteredFileCount = computed(() => (
+  filteredTableRows.value.filter((row) => selectedFileIds.value.has(row.id)).length
+))
+const selectedCurrentPageFileCount = computed(() => (
+  pagedRows.value.filter((row) => selectedFileIds.value.has(row.id)).length
+))
+const allFilteredFilesSelected = computed(() => (
+  filteredTableRows.value.length > 0
+  && filteredTableRows.value.every((row) => selectedFileIds.value.has(row.id))
+))
+const fileSelectionAllLabel = computed(() => (
+  hasFileFilters.value
+    ? `全选筛选结果（${filteredTableRows.value.length}）`
+    : `全选全部文件（${filteredTableRows.value.length}）`
+))
+const fileSelectionRangeHint = computed(() => (
+  filteredTableRows.value.length > 0
+    ? `按当前筛选后的序号选择，范围 1-${filteredTableRows.value.length}`
+    : '当前没有可选择的文件'
+))
 const selectedProjectFiles = computed(() => (
   tableRows.value.filter((row) => selectedFileIds.value.has(row.id))
 ))
@@ -1062,7 +1141,7 @@ const preTranslateButtonTitle = computed(() => (
         : ''
 ))
 const canAssignSelectedFile = computed(() => (
-  canManageProject.value
+  canAssignProject.value
   && Boolean(project.value)
 ))
 const filteredAssignableUsers = computed<User[]>(() => {
@@ -1167,10 +1246,15 @@ const statisticsFileColumns = computed<DataTableColumn[]>(() => ([
 ]))
 
 const canManageProject = computed(() => Boolean(project.value?.can_manage))
-const canOpenUploadModal = computed(() => Boolean(project.value) && canManageProject.value)
+const canAssignProject = computed(() => Boolean(project.value) && (canManageProject.value || authStore.isInternalTranslator))
+const canCreateProjects = computed(() => authStore.isAdmin || authStore.isInternalTranslator)
+const canUploadProjectFiles = computed(() => Boolean(project.value) && canCreateProjects.value)
+const canOpenUploadModal = computed(() => canUploadProjectFiles.value)
 const canOpenProjectIssueDialog = computed(() => Boolean(project.value) && !authStore.isExternalTranslator)
 
-const uploadButtonTitle = computed(() => (canManageProject.value ? '' : '只有管理员可以上传项目文件'))
+const uploadButtonTitle = computed(() => (
+  canUploadProjectFiles.value ? '' : '只有管理员或内部译者可以上传项目文件'
+))
 const projectSyncSegmentCount = computed(() => Number(project.value?.project_sync_segment_count || 0))
 const projectSyncDisabledCount = computed(() => {
   const total = projectSyncSegmentCount.value
@@ -1247,12 +1331,24 @@ const effectiveProjectTargetLanguage = computed(() => {
   return targets.size === 1 ? Array.from(targets)[0] : null
 })
 
+const projectBoundLanguagePair = computed(() => (
+  canonicalizeLanguagePair(project.value?.source_language, project.value?.target_language)
+))
 const projectLanguagePairLabel = computed(() => (
-  project.value?.source_language && project.value?.target_language
-    ? formatLanguagePair(project.value.source_language, project.value.target_language)
+  projectBoundLanguagePair.value
+    ? formatLanguagePair(projectBoundLanguagePair.value.source, projectBoundLanguagePair.value.target)
     : projectFileLanguagePairs.value.length > 1
       ? t('projectDetail.settings.multipleLanguagePairs', { count: projectFileLanguagePairs.value.length })
       : formatLanguagePair(effectiveProjectSourceLanguage.value, effectiveProjectTargetLanguage.value)
+))
+const isProjectLanguagePairBound = computed(() => Boolean(projectBoundLanguagePair.value))
+const uploadLanguageDescription = computed(() => (
+  isProjectLanguagePairBound.value
+    ? t('projectDetail.uploadLanguage.boundHint')
+    : t('projectDetail.uploadLanguage.unboundHint')
+))
+const uploadLanguageBoundMessage = computed(() => (
+  t('projectDetail.uploadLanguage.boundMessage', { pair: projectLanguagePairLabel.value })
 ))
 
 const uploadSupportedSummary = computed(() => {
@@ -1265,7 +1361,10 @@ const uploadSupportedSummary = computed(() => {
     .join('、')
 })
 const canDetectSourceLanguage = computed(() => (
-  selectedFiles.value.length > 0 && !uploading.value && !detectingLanguage.value
+  selectedFiles.value.length > 0
+  && !uploading.value
+  && !detectingLanguage.value
+  && !isProjectLanguagePairBound.value
 ))
 const uploadFileValidationError = computed(() => validateSelectedUploadFiles(selectedFiles.value))
 const canSubmitSourceUpload = computed(() => (
@@ -1500,6 +1599,13 @@ function createEmptyStatisticsTotals(): DocumentStatisticsTotals {
     internal_repeated_characters: null,
     cross_file_repeated_words: null,
     cross_file_repeated_characters: null,
+    image_count: null,
+    unique_image_count: null,
+    inline_image_count: null,
+    floating_image_count: null,
+    linked_image_count: null,
+    chart_count: null,
+    smartart_count: null,
     match_analysis: null,
   }
 }
@@ -1764,7 +1870,7 @@ function getStatisticsStatusClass(statistics: DocumentStatistics | null | undefi
   if (statistics.source === 'aspose' || statistics.source === 'libreoffice') {
     return 'project-status--success'
   }
-  if (statistics.source === 'openxml_computed') {
+  if (statistics.source === 'openxml_computed' || statistics.source === 'openxml_word_like') {
     return 'project-status--info'
   }
   if (statistics.source === 'docprops_cached') {
@@ -1901,7 +2007,7 @@ function getMaxUploadSizeMbForFile(filename: string): number {
       return capability.max_size_mb
     }
   }
-  return 50
+  return DEFAULT_UPLOAD_MAX_SIZE_MB
 }
 
 function validateSelectedUploadFiles(files: File[]): string {
@@ -1972,8 +2078,8 @@ function openUploadDialog() {
   }
 
   resetUploadForm()
-  uploadSourceLanguage.value = project.value?.source_language || ''
-  uploadTargetLanguage.value = project.value?.target_language || ''
+  uploadSourceLanguage.value = projectBoundLanguagePair.value?.source || ''
+  uploadTargetLanguage.value = projectBoundLanguagePair.value?.target || ''
   showUploadModal.value = true
 }
 
@@ -2011,7 +2117,7 @@ async function loadAssignableUsers() {
   }
   loadingAssignableUsers.value = true
   try {
-    const { data } = await http.get<User[]>('/auth/users')
+    const { data } = await http.get<User[]>('/auth/assignable-users')
     assignableUsers.value = data.filter((user) => user.role === 'user' && user.is_active)
   } catch (error) {
     toast.error(getErrorMessage(error, '译者列表加载失败。'))
@@ -2058,7 +2164,7 @@ async function loadProjectAssignments() {
 }
 
 async function loadAssignmentEvents() {
-  if (!project.value || !canManageProject.value) {
+  if (!project.value || !canAssignProject.value) {
     assignmentEvents.value = []
     return
   }
@@ -2426,7 +2532,7 @@ function hideAssignmentTooltip() {
 }
 
 async function openAssignmentDialog(_row?: ProjectFileItem | null) {
-  if (!canManageProject.value) {
+  if (!canAssignProject.value) {
     return
   }
   closeActionMenu()
@@ -2445,7 +2551,7 @@ function closeAssignmentDialog() {
 }
 
 async function saveAssignment() {
-  if (!project.value) {
+  if (!project.value || !canAssignProject.value) {
     return
   }
   if (!validateAssignmentRanges()) {
@@ -2730,6 +2836,75 @@ async function setIssueStatus(marker: IssueMarker, status: IssueStatus) {
   }
 }
 
+function resetFileSelectionRangeDefaults() {
+  const fallbackEnd = Math.max(filteredTableRows.value.length, 1)
+  const start = currentPageFileRangeStart.value || 1
+  const end = currentPageFileRangeEnd.value || fallbackEnd
+  fileSelectionRangeStart.value = String(start)
+  fileSelectionRangeEnd.value = String(end)
+  fileSelectionRangeError.value = ''
+}
+
+function closeFileSelectionMenu() {
+  showFileSelectionMenu.value = false
+  fileSelectionRangeError.value = ''
+}
+
+function toggleFileSelectionMenu() {
+  if (filteredTableRows.value.length === 0) {
+    return
+  }
+  if (showFileSelectionMenu.value) {
+    closeFileSelectionMenu()
+    return
+  }
+  closeActionMenu()
+  showProjectExportMenu.value = false
+  resetFileSelectionRangeDefaults()
+  showFileSelectionMenu.value = true
+}
+
+function selectCurrentFilePageFromMenu() {
+  const nextIds = new Set(selectedFileIds.value)
+  for (const row of pagedRows.value) {
+    nextIds.add(row.id)
+  }
+  selectedFileIds.value = nextIds
+  closeFileSelectionMenu()
+}
+
+function selectAllFilteredFiles() {
+  selectedFileIds.value = new Set(filteredTableRows.value.map((row) => row.id))
+  closeFileSelectionMenu()
+}
+
+function clearSelectedProjectFiles() {
+  selectedFileIds.value = new Set<string>()
+  closeFileSelectionMenu()
+}
+
+function selectFileRangeFromMenu() {
+  const total = filteredTableRows.value.length
+  if (total === 0) {
+    fileSelectionRangeError.value = '当前没有可选择的文件。'
+    return
+  }
+
+  const rawStart = Number.parseInt(fileSelectionRangeStart.value, 10)
+  const rawEnd = Number.parseInt(fileSelectionRangeEnd.value, 10)
+  if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd)) {
+    fileSelectionRangeError.value = '请输入有效的起止序号。'
+    return
+  }
+
+  const start = Math.min(Math.max(Math.min(rawStart, rawEnd), 1), total)
+  const end = Math.min(Math.max(Math.max(rawStart, rawEnd), 1), total)
+  fileSelectionRangeStart.value = String(start)
+  fileSelectionRangeEnd.value = String(end)
+  selectedFileIds.value = new Set(filteredTableRows.value.slice(start - 1, end).map((row) => row.id))
+  closeFileSelectionMenu()
+}
+
 function closeActionMenu() {
   openActionMenuId.value = null
   actionMenuStyle.value = {}
@@ -2767,6 +2942,9 @@ function handleDocumentClick(ev: MouseEvent) {
   if (!target.closest('.pd-export-dropdown')) {
     showProjectExportMenu.value = false
   }
+  if (!target.closest('.pd-file-selection')) {
+    closeFileSelectionMenu()
+  }
   if (isEventFromFloatingActionMenu(ev)) {
     return
   }
@@ -2775,6 +2953,7 @@ function handleDocumentClick(ev: MouseEvent) {
 
 function handleDocumentScroll() {
   showProjectExportMenu.value = false
+  closeFileSelectionMenu()
   if (openActionMenuId.value) {
     closeActionMenu()
   }
@@ -3066,8 +3245,12 @@ async function loadProject(options: { preserveFilePagination?: boolean } = {}) {
     if (activeTab.value === 'views') {
       void loadMergeViews()
     }
-    if (data.can_manage) {
+    if (canAssignProject.value) {
       void loadAssignmentEvents()
+    } else {
+      assignmentEvents.value = []
+    }
+    if (data.can_manage) {
       void loadProjectTranslationMemorySettings()
       void loadProjectTermBaseSettings()
       void loadProjectQualityQASettings()
@@ -3600,7 +3783,7 @@ function buildTranslationMemorySettingsPayload() {
   }
 }
 
-async function saveProjectTranslationMemorySettings() {
+async function saveProjectTranslationMemorySettings(showSuccessToast = true) {
   if (!project.value || savingTranslationMemorySettings.value || !canManageProject.value) {
     return
   }
@@ -3613,15 +3796,17 @@ async function saveProjectTranslationMemorySettings() {
     )
     preserveTranslationMemorySettingsDisplayOrder(data, translationMemorySettings.value)
     translationMemorySettings.value = data
-    toast.show({
-      tone: 'success',
-      title: '记忆库设置已保存',
-      message: data.initial_match_queued_count
-        ? `已将 ${data.initial_match_queued_count} 个文件加入后台匹配队列。`
-        : data.initial_match_updated_count
-        ? `已同步更新 ${data.initial_match_updated_count} 个句段。`
-        : '',
-    })
+    if (showSuccessToast) {
+      toast.show({
+        tone: 'success',
+        title: '记忆库设置已保存',
+        message: data.initial_match_queued_count
+          ? `已将 ${data.initial_match_queued_count} 个文件加入后台匹配队列。`
+          : data.initial_match_updated_count
+          ? `已同步更新 ${data.initial_match_updated_count} 个句段。`
+          : '',
+      })
+    }
     await loadProject()
   } catch (error) {
     translationMemorySettingsError.value = getErrorMessage(error, '记忆库设置保存失败。')
@@ -3630,52 +3815,159 @@ async function saveProjectTranslationMemorySettings() {
       title: '记忆库设置保存失败',
       message: translationMemorySettingsError.value,
     })
+    if (!showSuccessToast) {
+      throw error
+    }
   } finally {
     savingTranslationMemorySettings.value = false
   }
 }
 
-async function createTranslationMemoryForGroup(group: ProjectTranslationMemorySettingGroup) {
-  if (!project.value || creatingTranslationMemoryPair.value) {
+function moveTMCollectionToTop(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
+  const index = group.collections.findIndex((collection) => collection.id === collectionId)
+  if (index <= 0) {
     return
   }
-  const pairLabel = getTranslationMemorySettingPairLabel(group)
-  const defaultName = `${project.value.name || project.value.filename || '项目'} ${pairLabel} 记忆库`
-  const name = window.prompt('请输入记忆库名称', defaultName)
-  if (!name?.trim()) {
+  const [collection] = group.collections.splice(index, 1)
+  group.collections.unshift(collection)
+}
+
+function moveTermBaseRowToTop(group: ProjectTermBaseSettingGroup, termBaseId: string) {
+  const index = group.term_bases.findIndex((row) => row.id === termBaseId)
+  if (index <= 0) {
     return
   }
-  creatingTranslationMemoryPair.value = translationMemorySettingGroupKey(group)
+  const [row] = group.term_bases.splice(index, 1)
+  group.term_bases.unshift(row)
+  normalizeTermBaseQAPriority(group)
+}
+
+function findProjectResourceCreateTMGroup() {
+  return translationMemorySettings.value?.groups.find((group) => (
+    translationMemorySettingGroupKey(group) === projectResourceCreateGroupKey.value
+  )) ?? null
+}
+
+function findProjectResourceCreateTermGroup() {
+  return termBaseSettings.value?.groups.find((group) => (
+    termBaseSettingGroupKey(group) === projectResourceCreateGroupKey.value
+  )) ?? null
+}
+
+function openProjectResourceCreateDialog(
+  kind: ProjectResourceCreateKind,
+  group: ProjectTranslationMemorySettingGroup | ProjectTermBaseSettingGroup,
+) {
+  if (!project.value || projectResourceCreateSubmitting.value) {
+    return
+  }
+  const pairLabel = formatLanguagePair(group.source_language, group.target_language)
+  const resourceLabel = kind === 'tm' ? '记忆库' : '术语库'
+  projectResourceCreateKind.value = kind
+  projectResourceCreateGroupKey.value = kind === 'tm'
+    ? translationMemorySettingGroupKey(group as ProjectTranslationMemorySettingGroup)
+    : termBaseSettingGroupKey(group as ProjectTermBaseSettingGroup)
+  projectResourceCreateForm.name = `${project.value.name || project.value.filename || '项目'} ${pairLabel} ${resourceLabel}`
+  projectResourceCreateForm.description = ''
+  projectResourceCreateForm.sourceLanguage = group.source_language
+  projectResourceCreateForm.targetLanguage = group.target_language
+  projectResourceCreateError.value = ''
+  showProjectResourceCreateDialog.value = true
+}
+
+function closeProjectResourceCreateDialog() {
+  if (projectResourceCreateSubmitting.value) {
+    return
+  }
+  showProjectResourceCreateDialog.value = false
+  projectResourceCreateError.value = ''
+}
+
+function createTranslationMemoryForGroup(group: ProjectTranslationMemorySettingGroup) {
+  openProjectResourceCreateDialog('tm', group)
+}
+
+async function submitProjectResourceCreateDialog() {
+  const name = projectResourceCreateForm.name.trim()
+  if (!name) {
+    projectResourceCreateError.value = `${projectResourceCreateNameLabel.value}不能为空。`
+    return
+  }
+
+  const sourceLanguage = projectResourceCreateForm.sourceLanguage
+  const targetLanguage = projectResourceCreateForm.targetLanguage
+  if (!sourceLanguage || !targetLanguage) {
+    projectResourceCreateError.value = '缺少当前语言对，无法创建资源库。'
+    return
+  }
+
+  projectResourceCreateSubmitting.value = true
+  projectResourceCreateError.value = ''
+  if (projectResourceCreateKind.value === 'tm') {
+    creatingTranslationMemoryPair.value = projectResourceCreateGroupKey.value
+  } else {
+    creatingTermBasePair.value = projectResourceCreateGroupKey.value
+  }
+
   try {
-    const { data } = await http.post<{ id: string }>('/translation-memory/collections', {
-      name: name.trim(),
-      description: '',
-      source_language: group.source_language,
-      target_language: group.target_language,
-    })
-    await loadProjectTranslationMemorySettings()
-    const nextGroup = translationMemorySettings.value?.groups.find((item) => (
-      item.source_language === group.source_language && item.target_language === group.target_language
-    ))
-    if (nextGroup?.collections.some((collection) => collection.id === data.id)) {
-      for (const file of nextGroup.files) {
-        if (!file.collection_ids.includes(data.id)) {
-          file.collection_ids = [...file.collection_ids, data.id]
+    if (projectResourceCreateKind.value === 'tm') {
+      const { data } = await http.post<{ id: string; name?: string }>('/translation-memory/collections', {
+        name,
+        description: projectResourceCreateForm.description.trim() || null,
+        source_language: sourceLanguage,
+        target_language: targetLanguage,
+      })
+      await loadProjectTranslationMemorySettings()
+      const nextGroup = findProjectResourceCreateTMGroup()
+      if (nextGroup?.collections.some((collection) => collection.id === data.id)) {
+        for (const file of nextGroup.files) {
+          if (!file.collection_ids.includes(data.id)) {
+            file.collection_ids = [...file.collection_ids, data.id]
+          }
+          if (!file.collection_id) {
+            file.collection_id = data.id
+          }
         }
-        if (!file.collection_id) {
-          file.collection_id = data.id
-        }
+        moveTMCollectionToTop(nextGroup, data.id)
+        tmSettingsSearchQuery.value = ''
+        await saveProjectTranslationMemorySettings(false)
       }
-      await saveProjectTranslationMemorySettings()
+      toast.success(`已创建并启用记忆库：${data.name || name}`)
+    } else {
+      const { data } = await http.post<{ id: string; name?: string }>('/term-bases', {
+        name,
+        description: projectResourceCreateForm.description.trim() || null,
+        source_language: sourceLanguage,
+        target_language: targetLanguage,
+      })
+      await loadProjectTermBaseSettings()
+      const nextGroup = findProjectResourceCreateTermGroup()
+      const createdRow = nextGroup?.term_bases.find((row) => row.id === data.id)
+      if (nextGroup && createdRow) {
+        createdRow.enabled = true
+        createdRow.writable = true
+        createdRow.qa = false
+        moveTermBaseRowToTop(nextGroup, data.id)
+        termBaseSettingsSearchQuery.value = ''
+        await saveProjectTermBaseSettings(false)
+      }
+      toast.success(`已创建并启用术语库：${data.name || name}`)
     }
+    showProjectResourceCreateDialog.value = false
   } catch (error) {
+    projectResourceCreateError.value = getErrorMessage(
+      error,
+      projectResourceCreateKind.value === 'tm' ? '记忆库创建失败。' : '术语库创建失败。',
+    )
     toast.show({
       tone: 'error',
-      title: '记忆库创建失败',
-      message: getErrorMessage(error, '记忆库创建失败。'),
+      title: projectResourceCreateKind.value === 'tm' ? '记忆库创建失败' : '术语库创建失败',
+      message: projectResourceCreateError.value,
     })
   } finally {
+    projectResourceCreateSubmitting.value = false
     creatingTranslationMemoryPair.value = ''
+    creatingTermBasePair.value = ''
   }
 }
 
@@ -3961,44 +4253,8 @@ async function saveProjectTermBaseSettings(showSuccessToast = true) {
   }
 }
 
-async function createTermBaseForGroup(group: ProjectTermBaseSettingGroup) {
-  if (!project.value || creatingTermBasePair.value) {
-    return
-  }
-  const pairLabel = getTermBaseSettingPairLabel(group)
-  const defaultName = `${project.value.name || project.value.filename || '项目'} ${pairLabel} 术语库`
-  const name = window.prompt('请输入术语库名称', defaultName)
-  if (!name?.trim()) {
-    return
-  }
-  creatingTermBasePair.value = termBaseSettingGroupKey(group)
-  try {
-    const { data } = await http.post<{ id: string }>('/term-bases', {
-      name: name.trim(),
-      description: '',
-      source_language: group.source_language,
-      target_language: group.target_language,
-    })
-    await loadProjectTermBaseSettings()
-    const nextGroup = termBaseSettings.value?.groups.find((item) => (
-      item.source_language === group.source_language && item.target_language === group.target_language
-    ))
-    const createdRow = nextGroup?.term_bases.find((row) => row.id === data.id)
-    if (createdRow) {
-      createdRow.enabled = true
-      createdRow.writable = true
-      createdRow.qa = false
-      await saveProjectTermBaseSettings()
-    }
-  } catch (error) {
-    toast.show({
-      tone: 'error',
-      title: '术语库创建失败',
-      message: getErrorMessage(error, '术语库创建失败。'),
-    })
-  } finally {
-    creatingTermBasePair.value = ''
-  }
+function createTermBaseForGroup(group: ProjectTermBaseSettingGroup) {
+  openProjectResourceCreateDialog('term', group)
 }
 
 async function generateProjectTermQAReport() {
@@ -4147,7 +4403,13 @@ async function saveGuidelines() {
 }
 
 async function detectSourceLanguage() {
-  if (!canManageProject.value) {
+  if (!canUploadProjectFiles.value) {
+    return
+  }
+
+  if (isProjectLanguagePairBound.value) {
+    languageDetectTone.value = 'info'
+    languageDetectMessage.value = uploadLanguageBoundMessage.value
     return
   }
 
@@ -4195,7 +4457,7 @@ async function detectSourceLanguage() {
 }
 
 async function uploadSourceDocument() {
-  if (!canManageProject.value) {
+  if (!canUploadProjectFiles.value) {
     return
   }
 
@@ -4204,12 +4466,19 @@ async function uploadSourceDocument() {
     return
   }
 
-  if (!uploadSourceLanguage.value || !uploadTargetLanguage.value) {
+  const resolvedSourceLanguage = projectBoundLanguagePair.value?.source || uploadSourceLanguage.value
+  const resolvedTargetLanguage = projectBoundLanguagePair.value?.target || uploadTargetLanguage.value
+  if (isProjectLanguagePairBound.value) {
+    uploadSourceLanguage.value = resolvedSourceLanguage
+    uploadTargetLanguage.value = resolvedTargetLanguage
+  }
+
+  if (!resolvedSourceLanguage || !resolvedTargetLanguage) {
     uploadMessage.value = t('projectDetail.errors.selectLanguagePair')
     return
   }
 
-  if (uploadSourceLanguage.value === uploadTargetLanguage.value) {
+  if (resolvedSourceLanguage === resolvedTargetLanguage) {
     uploadMessage.value = t('projectList.errors.sameLanguage')
     return
   }
@@ -4231,8 +4500,8 @@ async function uploadSourceDocument() {
       formData.append('files', file)
     })
     formData.append('threshold', '0.6')
-    formData.append('source_language', uploadSourceLanguage.value)
-    formData.append('target_language', uploadTargetLanguage.value)
+    formData.append('source_language', resolvedSourceLanguage)
+    formData.append('target_language', resolvedTargetLanguage)
     formData.append('document_parse_mode', documentParseMode.value)
     formData.append('document_parse_options', JSON.stringify(documentParseOptions.value))
 
@@ -4644,7 +4913,7 @@ onMounted(() => {
   void (async () => {
     await loadProject({ preserveFilePagination: true })
     syncProjectSettingsHash()
-    if (route.query.assign === '1' && canManageProject.value) {
+    if (route.query.assign === '1' && canAssignProject.value) {
       await openAssignmentDialog()
     }
   })()
@@ -4665,6 +4934,7 @@ watch([fileSearchQuery, fileStatusFilter, fileLanguagePairFilter, fileAssigneeFi
     const visibleFileIds = new Set(filteredTableRows.value.map((file) => file.id))
     selectedFileIds.value = new Set(Array.from(selectedFileIds.value).filter((id) => visibleFileIds.has(id)))
   }
+  closeFileSelectionMenu()
   closeActionMenu()
 })
 
@@ -4672,6 +4942,9 @@ watch([filteredTableRows, pageSize], () => {
   const totalPages = Math.max(1, Math.ceil(filteredTableRows.value.length / pageSize.value))
   if (currentPage.value > totalPages) {
     currentPage.value = totalPages
+  }
+  if (showFileSelectionMenu.value) {
+    resetFileSelectionRangeDefaults()
   }
 })
 
@@ -4733,9 +5006,10 @@ onBeforeUnmount(() => {
           <div class="upload-language-panel__head">
             <div>
               <div class="section-title section-title--tight">语言设置</div>
-              <p class="panel-subtitle">可先识别第一个文件的源语言，再手动调整源语言和目标语言。</p>
+              <p class="panel-subtitle">{{ uploadLanguageDescription }}</p>
             </div>
             <button
+              v-if="!isProjectLanguagePairBound"
               class="button upload-detect-button"
               type="button"
               :disabled="!canDetectSourceLanguage"
@@ -4750,7 +5024,12 @@ onBeforeUnmount(() => {
           <div class="upload-language-grid">
             <label class="field">
               <span class="field__label">{{ t('projectList.form.sourceLanguage') }} <span class="field__required">*</span></span>
-              <select v-model="uploadSourceLanguage" class="field__control" data-testid="project-upload-source-language">
+              <select
+                v-model="uploadSourceLanguage"
+                class="field__control"
+                data-testid="project-upload-source-language"
+                :disabled="isProjectLanguagePairBound || uploading"
+              >
                 <option value="" disabled>{{ t('projectList.form.sourcePlaceholder') }}</option>
                 <option
                   v-for="lang in languageOptions"
@@ -4765,7 +5044,12 @@ onBeforeUnmount(() => {
 
             <label class="field">
               <span class="field__label">{{ t('projectList.form.targetLanguage') }} <span class="field__required">*</span></span>
-              <select v-model="uploadTargetLanguage" class="field__control" data-testid="project-upload-target-language">
+              <select
+                v-model="uploadTargetLanguage"
+                class="field__control"
+                data-testid="project-upload-target-language"
+                :disabled="isProjectLanguagePairBound || uploading"
+              >
                 <option value="" disabled>{{ t('projectList.form.targetPlaceholder') }}</option>
                 <option
                   v-for="lang in languageOptions"
@@ -4778,6 +5062,10 @@ onBeforeUnmount(() => {
               </select>
             </label>
           </div>
+
+          <p v-if="isProjectLanguagePairBound" class="upload-bound-language">
+            {{ uploadLanguageBoundMessage }}
+          </p>
 
           <p
             v-if="languageDetectMessage"
@@ -5211,7 +5499,7 @@ onBeforeUnmount(() => {
                   :disabled="savingTranslationMemorySettings || loadingTranslationMemorySettings"
                   :title="savingTranslationMemorySettings ? '保存中' : '保存记忆库设置'"
                   :aria-label="savingTranslationMemorySettings ? '保存中' : '保存记忆库设置'"
-                  @click="saveProjectTranslationMemorySettings"
+                  @click="saveProjectTranslationMemorySettings()"
                 >
                   <Loader2 v-if="savingTranslationMemorySettings" class="lucide-spin" :size="14" />
                   <Settings2 v-else :size="14" />
@@ -6177,7 +6465,7 @@ onBeforeUnmount(() => {
         <div class="table-toolbar pd-toolbar">
           <div class="table-toolbar__left pd-toolbar__left">
             <button
-              v-if="canManageProject"
+              v-if="canUploadProjectFiles"
               class="button button--primary pd-toolbar-primary"
               data-testid="project-upload-open"
               type="button"
@@ -6189,169 +6477,307 @@ onBeforeUnmount(() => {
               <Upload :size="14" />
               {{ t('projectDetail.files.actions.upload') }}
             </button>
-            <div class="pd-toolbar-action-strip" aria-label="文件批量操作">
+            <div class="pd-file-selection" @click.stop>
               <button
-                class="button pd-toolbar-icon-button"
+                class="button pd-file-selection__trigger"
                 type="button"
-                :disabled="!canOpenPreTranslate"
-                :title="preTranslateButtonTitle || t('projectDetail.preTranslate.button')"
-                :aria-label="t('projectDetail.preTranslate.button')"
-                @click="openPreTranslateDialog"
+                :disabled="filteredTableRows.length === 0"
+                :title="filteredTableRows.length === 0 ? '当前没有可选择的文件' : '选择文件范围或全部文件'"
+                aria-haspopup="menu"
+                :aria-expanded="showFileSelectionMenu"
+                @click="toggleFileSelectionMenu"
               >
-                <Sparkles :size="15" />
+                <Check :size="14" />
+                <span>选择</span>
+                <strong v-if="selectedFileIds.size > 0">{{ selectedFileIds.size }}</strong>
+                <ChevronDown :size="12" />
               </button>
-              <button
-                class="button pd-toolbar-icon-button"
-                type="button"
-                :disabled="!canOpenTermExtraction"
-                :title="termExtractionButtonTitle || t('projectDetail.termExtraction.button')"
-                :aria-label="t('projectDetail.termExtraction.button')"
-                @click="openTermExtractionDialog"
-              >
-                <BookOpen :size="15" />
-              </button>
-              <button
-                v-if="canManageProject"
-                class="button pd-toolbar-icon-button"
-                type="button"
-                :disabled="!canDuplicateTemplate"
-                :title="duplicateTemplateButtonTitle || t('projectDetail.files.actions.duplicateTemplate')"
-                :aria-label="t('projectDetail.files.actions.duplicateTemplate')"
-                @click="duplicateSelectedTemplate"
-              >
-                <Loader2 v-if="duplicating" class="lucide-spin" :size="15" />
-                <Copy v-else :size="15" />
-              </button>
-              <button
-                class="button pd-toolbar-icon-button"
-                type="button"
-                :disabled="!canOpenProjectIssueDialog"
-                :title="t('issueMarker.actions.open')"
-                :aria-label="t('issueMarker.actions.open')"
-                @click="openProjectIssueDialog"
-              >
-                <Flag :size="15" />
-              </button>
-              <button
-                v-if="canManageProject"
-                class="button pd-toolbar-icon-button"
-                type="button"
-                disabled
-                :title="`${t('projectDetail.files.actions.link')}：${t('projectDetail.common.comingSoon')}`"
-                :aria-label="t('projectDetail.files.actions.link')"
-              >
-                <Link :size="15" />
-              </button>
-              <button
-                v-if="canManageProject"
-                class="button pd-toolbar-icon-button"
-                type="button"
-                disabled
-                :title="`${t('projectDetail.files.actions.glossary')}：${t('projectDetail.common.comingSoon')}`"
-                :aria-label="t('projectDetail.files.actions.glossary')"
-              >
-                <BookOpen :size="15" />
-              </button>
-              <button
-                v-if="canManageProject"
-                class="button pd-toolbar-icon-button"
-                type="button"
-                :disabled="!canAssignSelectedFile"
-                :title="t('projectDetail.files.actions.assign')"
-                :aria-label="t('projectDetail.files.actions.assign')"
-                @click="openAssignmentDialog()"
-              >
-                <Users :size="15" />
-              </button>
-              <div class="pd-export-dropdown">
-                <button
-                  class="button pd-toolbar-icon-button pd-toolbar-export-button"
-                  data-testid="project-file-export-selected"
-                  type="button"
-                  :disabled="!canOpenProjectExportMenu"
-                  :title="projectExportButtonTitle || (exportingFileId ? `导出中 ${exportFileProgress}%` : t('projectDetail.files.actions.export'))"
-                  :aria-label="t('projectDetail.files.actions.export')"
-                  aria-haspopup="menu"
-                  :aria-expanded="showProjectExportMenu"
-                  @click.stop="toggleProjectExportMenu"
-                >
-                  <Loader2 v-if="loadingProjectExportOptions || exportingFileId" class="lucide-spin" :size="15" />
-                  <Download v-else :size="15" />
-                  <ChevronDown :size="12" />
-                </button>
-                <div v-if="showProjectExportMenu" class="pd-export-menu" role="menu" @click.stop>
-                  <div v-if="loadingProjectExportOptions" class="pd-export-menu__loading">
-                    {{ t('projectDetail.files.actions.exportLoading') }}
-                  </div>
-                  <div v-else-if="projectExportOptions.length === 0" class="pd-export-menu__loading">
-                    {{ t('projectDetail.files.actions.exportNoOptions') }}
-                  </div>
-                  <template v-else>
-                    <button
-                      v-for="option in projectExportOptions"
-                      :key="option.id"
-                      class="pd-export-menu__item"
-                      type="button"
-                      :disabled="Boolean(exportingFileId)"
-                      @click="exportSelectedProjectFiles(option.id)"
-                    >
-                      <span class="pd-export-menu__item-name">{{ option.name }}</span>
-                      <span class="pd-export-menu__item-desc">{{ option.description }}</span>
-                    </button>
-                    <button
-                      v-if="canExportSelectedProjectFilesAsZip"
-                      class="pd-export-menu__item"
-                      type="button"
-                      :disabled="Boolean(exportingFileId)"
-                      @click="exportSelectedProjectFilesAsZip"
-                    >
-                      <span class="pd-export-menu__item-name">{{ t('projectDetail.files.actions.exportZip') }}</span>
-                      <span class="pd-export-menu__item-desc">{{ t('projectDetail.files.actions.exportZipDescription') }}</span>
-                    </button>
-                  </template>
+
+              <div v-if="showFileSelectionMenu" class="pd-file-selection__menu" role="menu">
+                <div class="pd-file-selection__head">
+                  <strong>批量选择</strong>
+                  <span>已选 {{ selectedFileIds.size }} 个</span>
                 </div>
+
+                <button
+                  class="pd-file-selection__item"
+                  type="button"
+                  role="menuitem"
+                  :disabled="pagedRows.length === 0"
+                  @click="selectCurrentFilePageFromMenu"
+                >
+                  <span>选中当前页</span>
+                  <small>
+                    第 {{ currentPageFileRangeStart || 0 }}-{{ currentPageFileRangeEnd || 0 }} 项 ·
+                    已选 {{ selectedCurrentPageFileCount }} / {{ pagedRows.length }}
+                  </small>
+                </button>
+
+                <button
+                  class="pd-file-selection__item"
+                  type="button"
+                  role="menuitem"
+                  :class="{ 'is-active': allFilteredFilesSelected }"
+                  :disabled="filteredTableRows.length === 0"
+                  @click="selectAllFilteredFiles"
+                >
+                  <span>{{ fileSelectionAllLabel }}</span>
+                  <small>
+                    跨分页生效 · 已选 {{ selectedFilteredFileCount }} / {{ filteredTableRows.length }}
+                  </small>
+                </button>
+
+                <div class="pd-file-selection__range" role="group" aria-label="按序号范围选择">
+                  <div class="pd-file-selection__range-head">
+                    <strong>选中范围</strong>
+                    <span>{{ fileSelectionRangeHint }}</span>
+                  </div>
+                  <div class="pd-file-selection__range-controls">
+                    <label>
+                      <span>从</span>
+                      <input
+                        v-model="fileSelectionRangeStart"
+                        type="number"
+                        min="1"
+                        :max="Math.max(filteredTableRows.length, 1)"
+                        inputmode="numeric"
+                        @keydown.enter.prevent="selectFileRangeFromMenu"
+                      >
+                    </label>
+                    <label>
+                      <span>到</span>
+                      <input
+                        v-model="fileSelectionRangeEnd"
+                        type="number"
+                        min="1"
+                        :max="Math.max(filteredTableRows.length, 1)"
+                        inputmode="numeric"
+                        @keydown.enter.prevent="selectFileRangeFromMenu"
+                      >
+                    </label>
+                    <button
+                      class="button pd-file-selection__range-submit"
+                      type="button"
+                      :disabled="filteredTableRows.length === 0"
+                      @click="selectFileRangeFromMenu"
+                    >
+                      选中
+                    </button>
+                  </div>
+                  <p v-if="fileSelectionRangeError" class="pd-file-selection__error">
+                    {{ fileSelectionRangeError }}
+                  </p>
+                </div>
+
+                <button
+                  v-if="selectedFileIds.size > 0"
+                  class="pd-file-selection__clear"
+                  type="button"
+                  role="menuitem"
+                  @click="clearSelectedProjectFiles"
+                >
+                  清空选择
+                </button>
               </div>
-              <button
-                v-if="canManageProject"
-                class="button pd-toolbar-icon-button"
-                type="button"
-                disabled
-                :title="`${t('projectDetail.files.actions.modifyTaskType')}：${t('projectDetail.common.comingSoon')}`"
-                :aria-label="t('projectDetail.files.actions.modifyTaskType')"
-              >
-                <Clock3 :size="15" />
-              </button>
-              <button
-                class="button pd-toolbar-icon-button"
-                type="button"
-                :disabled="!canOpenMergeViewDialog"
-                :title="mergeOpenButtonTitle || t('projectDetail.files.actions.mergeOpen')"
-                :aria-label="t('projectDetail.files.actions.mergeOpen')"
-                @click="openCreateMergeViewDialog"
-              >
-                <FolderOpen :size="15" />
-              </button>
-              <button
-                v-if="canManageProject"
-                class="button pd-toolbar-icon-button pd-toolbar-icon-button--danger"
-                data-testid="project-file-delete-selected"
-                type="button"
-                :disabled="!canDeleteSelectedProjectFiles"
-                :title="deleteSelectedFilesButtonTitle || t('projectDetail.files.actions.deleteSelected')"
-                :aria-label="t('projectDetail.files.actions.deleteSelected')"
-                @click="deleteSelectedProjectFiles"
-              >
-                <Trash2 :size="15" />
-              </button>
-              <button
-                class="button pd-toolbar-icon-button"
-                type="button"
-                disabled
-                :title="`${t('projectDetail.files.actions.columns')}：${t('projectDetail.common.comingSoon')}`"
-                :aria-label="t('projectDetail.files.actions.columns')"
-              >
-                <Settings2 :size="14" />
-              </button>
+            </div>
+            <div class="pd-toolbar-action-strip" aria-label="文件批量操作">
+              <div class="pd-toolbar-action-group pd-toolbar-action-group--featured" aria-label="智能处理">
+                <button
+                  class="button pd-toolbar-action-button pd-toolbar-action-button--labeled pd-toolbar-action-button--accent"
+                  type="button"
+                  :disabled="!canOpenPreTranslate"
+                  :title="preTranslateButtonTitle || t('projectDetail.preTranslate.button')"
+                  :aria-label="t('projectDetail.preTranslate.button')"
+                  @click="openPreTranslateDialog"
+                >
+                  <Sparkles :size="15" />
+                  <span>{{ t('projectDetail.preTranslate.button') }}</span>
+                </button>
+                <button
+                  class="button pd-toolbar-action-button pd-toolbar-action-button--labeled"
+                  type="button"
+                  :disabled="!canOpenTermExtraction"
+                  :title="termExtractionButtonTitle || t('projectDetail.termExtraction.button')"
+                  :aria-label="t('projectDetail.termExtraction.button')"
+                  @click="openTermExtractionDialog"
+                >
+                  <BookOpen :size="15" />
+                  <span>{{ t('projectDetail.termExtraction.button') }}</span>
+                </button>
+              </div>
+
+              <div class="pd-toolbar-action-group" aria-label="文件操作">
+                <button
+                  v-if="canManageProject"
+                  class="button pd-toolbar-action-button"
+                  type="button"
+                  :disabled="!canDuplicateTemplate"
+                  :title="duplicateTemplateButtonTitle || t('projectDetail.files.actions.duplicateTemplate')"
+                  :aria-label="t('projectDetail.files.actions.duplicateTemplate')"
+                  @click="duplicateSelectedTemplate"
+                >
+                  <Loader2 v-if="duplicating" class="lucide-spin" :size="15" />
+                  <Copy v-else :size="15" />
+                </button>
+                <button
+                  class="button pd-toolbar-action-button pd-toolbar-action-button--labeled"
+                  type="button"
+                  :disabled="!canOpenProjectIssueDialog"
+                  :title="t('issueMarker.actions.open')"
+                  :aria-label="t('issueMarker.actions.open')"
+                  @click="openProjectIssueDialog"
+                >
+                  <Flag :size="15" />
+                  <span>{{ t('issueMarker.actions.open') }}</span>
+                </button>
+                <button
+                  v-if="canAssignProject"
+                  class="button pd-toolbar-action-button pd-toolbar-action-button--labeled"
+                  type="button"
+                  :disabled="!canAssignSelectedFile"
+                  :title="t('projectDetail.files.actions.assign')"
+                  :aria-label="t('projectDetail.files.actions.assign')"
+                  @click="openAssignmentDialog()"
+                >
+                  <Users :size="15" />
+                  <span>{{ t('projectDetail.files.actions.assign') }}</span>
+                </button>
+                <div class="pd-export-dropdown">
+                  <button
+                    class="button pd-toolbar-action-button pd-toolbar-action-button--labeled pd-toolbar-export-button"
+                    data-testid="project-file-export-selected"
+                    type="button"
+                    :disabled="!canOpenProjectExportMenu"
+                    :title="projectExportButtonTitle || (exportingFileId ? `导出中 ${exportFileProgress}%` : t('projectDetail.files.actions.export'))"
+                    :aria-label="t('projectDetail.files.actions.export')"
+                    aria-haspopup="menu"
+                    :aria-expanded="showProjectExportMenu"
+                    @click.stop="toggleProjectExportMenu"
+                  >
+                    <Loader2 v-if="loadingProjectExportOptions || exportingFileId" class="lucide-spin" :size="15" />
+                    <Download v-else :size="15" />
+                    <span>{{ t('projectDetail.files.actions.export') }}</span>
+                    <ChevronDown :size="12" />
+                  </button>
+                  <div v-if="showProjectExportMenu" class="pd-export-menu" role="menu" @click.stop>
+                    <div v-if="loadingProjectExportOptions" class="pd-export-menu__loading">
+                      {{ t('projectDetail.files.actions.exportLoading') }}
+                    </div>
+                    <div v-else-if="projectExportOptions.length === 0" class="pd-export-menu__loading">
+                      {{ t('projectDetail.files.actions.exportNoOptions') }}
+                    </div>
+                    <template v-else>
+                      <div
+                        v-for="group in groupedProjectExportOptions"
+                        :key="group.id"
+                        class="pd-export-menu__group"
+                      >
+                        <div class="pd-export-menu__group-title">{{ group.label }}</div>
+                        <button
+                          v-for="option in group.options"
+                          :key="option.id"
+                          class="pd-export-menu__item"
+                          type="button"
+                          :disabled="Boolean(exportingFileId)"
+                          @click="exportSelectedProjectFiles(option.id)"
+                        >
+                          <span class="pd-export-menu__item-head">
+                            <span class="pd-export-menu__item-name">{{ option.name }}</span>
+                            <span
+                              v-if="getExportOptionExtensionLabel(option)"
+                              class="pd-export-menu__item-ext"
+                            >
+                              {{ getExportOptionExtensionLabel(option) }}
+                            </span>
+                          </span>
+                          <span class="pd-export-menu__item-desc">{{ option.description }}</span>
+                        </button>
+                      </div>
+                      <button
+                        v-if="canExportSelectedProjectFilesAsZip"
+                        class="pd-export-menu__item"
+                        type="button"
+                        :disabled="Boolean(exportingFileId)"
+                        @click="exportSelectedProjectFilesAsZip"
+                      >
+                        <span class="pd-export-menu__item-head">
+                          <span class="pd-export-menu__item-name">{{ t('projectDetail.files.actions.exportZip') }}</span>
+                          <span class="pd-export-menu__item-ext">ZIP</span>
+                        </span>
+                        <span class="pd-export-menu__item-desc">{{ t('projectDetail.files.actions.exportZipDescription') }}</span>
+                      </button>
+                    </template>
+                  </div>
+                </div>
+                <button
+                  class="button pd-toolbar-action-button pd-toolbar-action-button--labeled"
+                  type="button"
+                  :disabled="!canOpenMergeViewDialog"
+                  :title="mergeOpenButtonTitle || t('projectDetail.files.actions.mergeOpen')"
+                  :aria-label="t('projectDetail.files.actions.mergeOpen')"
+                  @click="openCreateMergeViewDialog"
+                >
+                  <FolderOpen :size="15" />
+                  <span>{{ t('projectDetail.files.actions.mergeOpen') }}</span>
+                </button>
+              </div>
+
+              <div v-if="canManageProject" class="pd-toolbar-action-group pd-toolbar-action-group--reserved" aria-label="待开放操作">
+                <button
+                  class="button pd-toolbar-action-button"
+                  type="button"
+                  disabled
+                  :title="`${t('projectDetail.files.actions.link')}：${t('projectDetail.common.comingSoon')}`"
+                  :aria-label="t('projectDetail.files.actions.link')"
+                >
+                  <Link :size="15" />
+                </button>
+                <button
+                  class="button pd-toolbar-action-button"
+                  type="button"
+                  disabled
+                  :title="`${t('projectDetail.files.actions.glossary')}：${t('projectDetail.common.comingSoon')}`"
+                  :aria-label="t('projectDetail.files.actions.glossary')"
+                >
+                  <BookOpen :size="15" />
+                </button>
+                <button
+                  class="button pd-toolbar-action-button"
+                  type="button"
+                  disabled
+                  :title="`${t('projectDetail.files.actions.modifyTaskType')}：${t('projectDetail.common.comingSoon')}`"
+                  :aria-label="t('projectDetail.files.actions.modifyTaskType')"
+                >
+                  <Clock3 :size="15" />
+                </button>
+              </div>
+
+              <div class="pd-toolbar-action-group pd-toolbar-action-group--utility" aria-label="视图设置">
+                <button
+                  class="button pd-toolbar-action-button"
+                  type="button"
+                  disabled
+                  :title="`${t('projectDetail.files.actions.columns')}：${t('projectDetail.common.comingSoon')}`"
+                  :aria-label="t('projectDetail.files.actions.columns')"
+                >
+                  <Settings2 :size="14" />
+                </button>
+              </div>
+
+              <div v-if="canManageProject" class="pd-toolbar-action-group pd-toolbar-action-group--danger" aria-label="危险操作">
+                <button
+                  class="button pd-toolbar-action-button pd-toolbar-action-button--labeled pd-toolbar-action-button--danger"
+                  data-testid="project-file-delete-selected"
+                  type="button"
+                  :disabled="!canDeleteSelectedProjectFiles"
+                  :title="deleteSelectedFilesButtonTitle || t('projectDetail.files.actions.deleteSelected')"
+                  :aria-label="t('projectDetail.files.actions.deleteSelected')"
+                  @click="deleteSelectedProjectFiles"
+                >
+                  <Trash2 :size="15" />
+                  <span>{{ t('projectDetail.files.actions.delete') }}</span>
+                </button>
+              </div>
             </div>
           </div>
 
@@ -6509,7 +6935,7 @@ onBeforeUnmount(() => {
               <span class="pd-assignee" :class="{ 'is-empty': !(row.assignees?.length || row.assignee) }">
                 {{ getAssigneeLabel(row) }}
               </span>
-              <div v-if="canManageProject" class="pd-task-links">
+              <div v-if="canAssignProject" class="pd-task-links">
                 <button
                   class="pd-inline-link"
                   type="button"
@@ -6696,16 +7122,19 @@ onBeforeUnmount(() => {
               <span>{{ t('projectDetail.stats.columns.charactersWithSpaces') }}</span>
               <strong>{{ formatStatisticNumber(statisticsTotals.characters_with_spaces) }}</strong>
             </div>
+            <div class="pd-statistics-summary__item">
+              <span>图片数</span>
+              <strong>{{ formatStatisticNumber(statisticsTotals.image_count) }}</strong>
+            </div>
           </div>
 
           <div v-if="statisticsMatchAnalysisRows.length > 0" class="pd-statistics-match-analysis">
             <div class="pd-statistics-subhead">
               <div class="section-title section-title--tight">{{ t('projectDetail.stats.matchAnalysis.summaryTitle') }}</div>
               <span>
-                {{ t('projectDetail.stats.matchAnalysis.meta', {
-                  threshold: formatStatisticPercent((statisticsMatchAnalysis?.threshold ?? 0.5) * 100),
-                  count: statisticsMatchAnalysis?.collection_ids.length ?? 0,
-                }) }}
+                统计阈值 {{ formatStatisticPercent((statisticsMatchAnalysis?.threshold ?? 0.5) * 100) }}
+                · 已选记忆库 {{ statisticsMatchAnalysis?.collection_ids.length ?? 0 }} 个
+                · 字数按 Word-like OpenXML 口径统计
               </span>
             </div>
             <div class="pd-statistics-grid-wrap pd-statistics-grid-wrap--match">
@@ -6796,6 +7225,10 @@ onBeforeUnmount(() => {
                   <th>{{ t('projectDetail.stats.columns.charactersWithSpaces') }}</th>
                   <th>{{ t('projectDetail.stats.columns.paragraphs') }}</th>
                   <th>{{ t('projectDetail.stats.columns.lines') }}</th>
+                  <th>图片数</th>
+                  <th>去重图片数</th>
+                  <th>图表数</th>
+                  <th>SmartArt 数</th>
                   <th>{{ t('projectDetail.stats.columns.license') }}</th>
                 </tr>
               </thead>
@@ -6813,6 +7246,10 @@ onBeforeUnmount(() => {
                   <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'characters_with_spaces')) }}</td>
                   <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'paragraphs')) }}</td>
                   <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'lines')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'image_count')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'unique_image_count')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'chart_count')) }}</td>
+                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'smartart_count')) }}</td>
                   <td>{{ getStatisticsLicenseLabel(row.statistics) }}</td>
                 </tr>
               </tbody>
@@ -6828,6 +7265,10 @@ onBeforeUnmount(() => {
                   <td>{{ formatStatisticNumber(statisticsTotals.characters_with_spaces) }}</td>
                   <td>{{ formatStatisticNumber(statisticsTotals.paragraphs) }}</td>
                   <td>{{ formatStatisticNumber(statisticsTotals.lines) }}</td>
+                  <td>{{ formatStatisticNumber(statisticsTotals.image_count) }}</td>
+                  <td>{{ formatStatisticNumber(statisticsTotals.unique_image_count) }}</td>
+                  <td>{{ formatStatisticNumber(statisticsTotals.chart_count) }}</td>
+                  <td>{{ formatStatisticNumber(statisticsTotals.smartart_count) }}</td>
                   <td>{{ getPlaceholder() }}</td>
                 </tr>
               </tfoot>
@@ -6858,7 +7299,7 @@ onBeforeUnmount(() => {
           {{ t('projectDetail.enterWorkbench') }}
         </button>
         <button
-          v-if="canManageProject"
+          v-if="canAssignProject"
           type="button"
           @click="openAssignmentDialog(actionMenuRow)"
         >
@@ -6960,6 +7401,86 @@ onBeforeUnmount(() => {
           <FolderOpen v-else-if="mergeViewDialogMode === 'create'" :size="14" />
           <Check v-else :size="14" />
           {{ savingMergeView ? t('common.actions.saving') : (mergeViewDialogMode === 'create' ? t('projectDetail.mergeViews.createAndOpen') : t('common.actions.save')) }}
+        </button>
+      </template>
+    </Modal>
+
+    <Modal
+      :open="showProjectResourceCreateDialog"
+      :title="projectResourceCreateTitle"
+      :description="projectResourceCreateDescription"
+      width="min(620px, calc(100vw - 32px))"
+      :close-on-overlay="!projectResourceCreateSubmitting"
+      :close-on-esc="!projectResourceCreateSubmitting"
+      @close="closeProjectResourceCreateDialog"
+    >
+      <div class="upload-form form-grid-2 pd-resource-create-dialog">
+        <label class="field">
+          <span class="field__label">{{ projectResourceCreateNameLabel }}</span>
+          <input
+            v-model="projectResourceCreateForm.name"
+            class="field__control"
+            type="text"
+            :placeholder="projectResourceCreateNamePlaceholder"
+            :disabled="projectResourceCreateSubmitting"
+            @keydown.enter.prevent="submitProjectResourceCreateDialog"
+          />
+        </label>
+
+        <label class="field">
+          <span class="field__label">说明</span>
+          <input
+            v-model="projectResourceCreateForm.description"
+            class="field__control"
+            type="text"
+            placeholder="可选"
+            :disabled="projectResourceCreateSubmitting"
+            @keydown.enter.prevent="submitProjectResourceCreateDialog"
+          />
+        </label>
+
+        <label class="field">
+          <span class="field__label">源语言</span>
+          <select v-model="projectResourceCreateForm.sourceLanguage" class="field__control" disabled>
+            <option v-for="option in languageOptions" :key="option.code" :value="option.code">
+              {{ option.label }}
+            </option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span class="field__label">目标语言</span>
+          <select v-model="projectResourceCreateForm.targetLanguage" class="field__control" disabled>
+            <option v-for="option in languageOptions" :key="option.code" :value="option.code">
+              {{ option.label }}
+            </option>
+          </select>
+        </label>
+      </div>
+
+      <p class="hint-text pd-resource-create-dialog__hint">
+        语言对来自当前项目设置分组。创建成功后会自动启用，并排到当前列表顶部。
+      </p>
+      <p v-if="projectResourceCreateError" class="form-message is-error">{{ projectResourceCreateError }}</p>
+
+      <template #footer>
+        <button
+          class="button"
+          type="button"
+          :disabled="projectResourceCreateSubmitting"
+          @click="closeProjectResourceCreateDialog"
+        >
+          取消
+        </button>
+        <button
+          class="button button--primary"
+          type="button"
+          :disabled="projectResourceCreateSubmitting || !projectResourceCreateForm.name.trim()"
+          @click="submitProjectResourceCreateDialog"
+        >
+          <Loader2 v-if="projectResourceCreateSubmitting" class="lucide-spin" :size="14" />
+          <Plus v-else :size="14" />
+          {{ projectResourceCreateSubmitText }}
         </button>
       </template>
     </Modal>
@@ -7442,6 +7963,17 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
+}
+
+.upload-bound-language {
+  margin: -2px 0 0;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--state-info) 28%, transparent);
+  border-radius: 6px;
+  background: var(--state-info-bg);
+  color: var(--state-info);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .upload-detect-message {
@@ -7946,8 +8478,9 @@ onBeforeUnmount(() => {
 }
 
 .pd-files-panel .pd-toolbar {
-  gap: 5px 8px;
-  padding: 2px 0 6px;
+  gap: 6px 8px;
+  padding: 2px 0 8px;
+  justify-content: space-between;
 }
 
 .pd-files-panel .pd-toolbar__right {
@@ -7961,7 +8494,7 @@ onBeforeUnmount(() => {
   justify-content: flex-start;
 }
 
-@media (min-width: 1200px) {
+@media (min-width: 1540px) {
   .pd-files-panel .pd-toolbar {
     align-items: center;
     flex-wrap: nowrap;
@@ -7982,16 +8515,20 @@ onBeforeUnmount(() => {
   }
 
   .pd-files-panel .pd-file-filter--search {
-    flex: 0 1 280px;
-    width: 280px;
+    flex: 0 1 250px;
+    width: 250px;
+  }
+
+  .pd-files-panel .pd-file-filter__select--status {
+    width: 122px;
   }
 
   .pd-files-panel .pd-file-filter__select--language {
-    width: 158px;
+    width: 148px;
   }
 
   .pd-files-panel .pd-file-filter__select--assignee {
-    width: 142px;
+    width: 132px;
   }
 }
 
@@ -8068,10 +8605,195 @@ onBeforeUnmount(() => {
 }
 
 .pd-toolbar-primary {
-  min-height: 34px;
-  padding: 6px 12px;
+  min-height: 32px;
+  padding: 5px 12px;
+  border-radius: 7px;
   font-weight: 700;
   white-space: nowrap;
+}
+
+.pd-file-selection {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.pd-file-selection__trigger {
+  min-height: 32px;
+  padding: 5px 9px;
+  gap: 4px;
+  border-radius: 7px;
+  border-color: color-mix(in srgb, var(--brand-700) 22%, var(--line-soft));
+  background: var(--surface-panel);
+  color: var(--brand-700);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.pd-file-selection__trigger strong {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 19px;
+  height: 19px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--brand-700);
+  color: #fff;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.pd-file-selection__trigger .lucide:last-child {
+  width: 12px;
+  height: 12px;
+  opacity: 0.75;
+}
+
+.pd-file-selection__menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 3200;
+  display: grid;
+  gap: 7px;
+  width: min(328px, calc(100vw - 32px));
+  padding: 9px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-popover);
+}
+
+.pd-file-selection__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 2px 4px;
+}
+
+.pd-file-selection__head strong,
+.pd-file-selection__range-head strong {
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.pd-file-selection__head span,
+.pd-file-selection__range-head span,
+.pd-file-selection__item small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.pd-file-selection__item,
+.pd-file-selection__clear {
+  width: 100%;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.pd-file-selection__item {
+  display: grid;
+  gap: 3px;
+  padding: 8px 9px;
+}
+
+.pd-file-selection__item span {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.pd-file-selection__item:hover:not(:disabled),
+.pd-file-selection__item.is-active {
+  background: color-mix(in srgb, var(--brand-050) 72%, var(--surface-muted));
+}
+
+.pd-file-selection__item:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.pd-file-selection__range {
+  display: grid;
+  gap: 8px;
+  padding: 9px;
+  border: 1px solid color-mix(in srgb, var(--line-soft) 86%, var(--brand-100));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-muted) 54%, var(--surface-panel));
+}
+
+.pd-file-selection__range-head {
+  display: grid;
+  gap: 2px;
+}
+
+.pd-file-selection__range-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 7px;
+}
+
+.pd-file-selection__range-controls label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.pd-file-selection__range-controls label span {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.pd-file-selection__range-controls input {
+  width: 100%;
+  height: 30px;
+  min-width: 0;
+  padding: 0 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--control-bg);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.pd-file-selection__range-controls input:focus {
+  outline: none;
+  border-color: var(--brand-700);
+  box-shadow: var(--focus-ring);
+}
+
+.pd-file-selection__range-submit {
+  height: 30px;
+  min-height: 30px;
+  padding: 0 10px;
+}
+
+.pd-file-selection__error {
+  margin: -2px 0 0;
+  color: var(--state-danger);
+  font-size: 12px;
+}
+
+.pd-file-selection__clear {
+  padding: 7px 9px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.pd-file-selection__clear:hover {
+  background: var(--surface-muted);
+  color: var(--state-danger);
 }
 
 .pd-toolbar-action-strip {
@@ -8079,44 +8801,113 @@ onBeforeUnmount(() => {
   align-items: center;
   flex: 0 1 auto;
   flex-wrap: wrap;
-  gap: 3px;
+  gap: 1px;
   max-width: 100%;
   min-width: 0;
-  padding: 3px;
+  padding: 1px;
   border: 1px solid color-mix(in srgb, var(--line-soft) 84%, var(--brand-100));
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--surface-panel) 82%, var(--surface-muted));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--surface-panel) 90%, var(--surface-muted));
 }
 
-.pd-toolbar-icon-button {
+.pd-toolbar-action-group {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 1px;
+  min-width: 0;
+  padding: 1px 2px;
+}
+
+.pd-toolbar-action-group + .pd-toolbar-action-group {
+  margin-left: 1px;
+  padding-left: 5px;
+  border-left: 1px solid color-mix(in srgb, var(--line-soft) 72%, transparent);
+}
+
+.pd-toolbar-action-group--featured {
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--brand-050) 36%, transparent);
+}
+
+.pd-toolbar-action-group--reserved {
+  opacity: 0.7;
+}
+
+.pd-toolbar-action-group--reserved .pd-toolbar-action-button,
+.pd-toolbar-action-group--utility .pd-toolbar-action-button {
+  width: 30px;
+  min-width: 30px;
+  height: 27px;
+  min-height: 27px;
+}
+
+.pd-toolbar-action-button {
   width: 32px;
   min-width: 32px;
-  height: 32px;
-  min-height: 32px;
+  height: 28px;
+  min-height: 28px;
   padding: 0;
   border-color: transparent;
-  border-radius: 6px;
+  border-radius: 5px;
   background: transparent;
   color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1;
   box-shadow: none;
+  white-space: nowrap;
 }
 
-.pd-toolbar-icon-button:not(:disabled):hover {
+.pd-toolbar-action-button:not(.pd-toolbar-action-button--labeled) {
+  width: 32px;
+  min-width: 32px;
+  padding: 0;
+}
+
+.pd-toolbar-action-button--labeled {
+  max-width: 32px;
+}
+
+.pd-toolbar-action-button--labeled span {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.pd-toolbar-action-button .lucide {
+  flex: 0 0 auto;
+  color: currentColor;
+}
+
+.pd-toolbar-action-button--accent {
+  background: color-mix(in srgb, var(--brand-100) 52%, var(--surface-panel));
+  color: var(--brand-700);
+}
+
+.pd-toolbar-action-button:not(:disabled):hover {
   border-color: color-mix(in srgb, var(--brand-700) 28%, var(--line-soft));
   background: var(--surface-panel);
   color: var(--brand-700);
   box-shadow: 0 4px 10px rgba(17, 49, 42, 0.08);
 }
 
-.pd-toolbar-icon-button:disabled {
-  opacity: 0.46;
+.pd-toolbar-action-button:disabled {
+  opacity: 0.42;
 }
 
-.pd-toolbar-icon-button--danger {
+.pd-toolbar-action-group--reserved .pd-toolbar-action-button:disabled {
+  opacity: 0.36;
+}
+
+.pd-toolbar-action-button--danger {
   color: var(--state-danger);
 }
 
-.pd-toolbar-icon-button--danger:not(:disabled):hover {
+.pd-toolbar-action-button--danger:not(:disabled):hover {
   border-color: color-mix(in srgb, var(--state-danger) 34%, var(--line-soft));
   background: var(--state-danger-bg);
   color: var(--state-danger);
@@ -8124,23 +8915,62 @@ onBeforeUnmount(() => {
 }
 
 .pd-toolbar-export-button {
-  width: 40px;
-  min-width: 40px;
-  gap: 0;
+  width: 38px;
+  min-width: 38px;
+  max-width: 38px;
+  gap: 2px;
+  padding: 0 3px;
 }
 
 .pd-toolbar-export-button .lucide:last-child {
   width: 12px;
   height: 12px;
-  margin-left: -3px;
   opacity: 0.72;
+}
+
+@media (max-width: 1680px) {
+  .pd-toolbar-action-group--reserved,
+  .pd-toolbar-action-group--utility {
+    display: none;
+  }
+
+  .pd-toolbar-action-group:not(.pd-toolbar-action-group--featured) .pd-toolbar-action-button--labeled {
+    width: 32px;
+    min-width: 32px;
+    max-width: 32px;
+    padding: 0;
+  }
+
+  .pd-toolbar-action-group:not(.pd-toolbar-action-group--featured) .pd-toolbar-export-button {
+    width: 38px;
+    min-width: 38px;
+    max-width: 38px;
+    padding: 0 3px;
+  }
+
+}
+
+@media (max-width: 1280px) {
+  .pd-toolbar-action-button--labeled {
+    width: 32px;
+    min-width: 32px;
+    max-width: 32px;
+    padding: 0;
+  }
+
+  .pd-toolbar-export-button {
+    width: 38px;
+    min-width: 38px;
+    max-width: 38px;
+    padding: 0 3px;
+  }
 }
 
 .pd-file-filters {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
+  gap: 6px;
   max-width: 100%;
   min-width: 0;
   flex-wrap: wrap;
@@ -8151,7 +8981,7 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: center;
   width: 30px;
-  height: 32px;
+  height: 30px;
   border: 1px solid var(--line-soft);
   border-radius: 6px;
   background: var(--surface-muted);
@@ -8166,9 +8996,9 @@ onBeforeUnmount(() => {
 }
 
 .pd-file-filter--search {
-  flex: 1 1 240px;
-  width: min(330px, 36vw);
-  max-width: 360px;
+  flex: 1 1 220px;
+  width: min(300px, 32vw);
+  max-width: 320px;
 }
 
 .pd-file-filter__input,
@@ -8196,15 +9026,38 @@ onBeforeUnmount(() => {
 }
 
 .pd-file-filter__select--status {
-  width: 132px;
+  width: 122px;
 }
 
 .pd-file-filter__select--language {
-  width: 178px;
+  width: 154px;
 }
 
 .pd-file-filter__select--assignee {
-  width: 150px;
+  width: 136px;
+}
+
+@media (max-width: 1480px) {
+  .pd-files-panel .pd-file-filters__lead {
+    display: none;
+  }
+
+  .pd-files-panel .pd-file-filter--search {
+    flex-basis: 220px;
+    width: 220px;
+  }
+
+  .pd-files-panel .pd-file-filter__select--status {
+    width: 116px;
+  }
+
+  .pd-files-panel .pd-file-filter__select--language {
+    width: 142px;
+  }
+
+  .pd-files-panel .pd-file-filter__select--assignee {
+    width: 126px;
+  }
 }
 
 .pd-file-filter__input::placeholder {
@@ -8408,8 +9261,11 @@ onBeforeUnmount(() => {
   top: calc(100% + 6px);
   left: 0;
   z-index: 30;
-  min-width: 240px;
-  overflow: hidden;
+  min-width: 300px;
+  max-width: min(360px, calc(100vw - 24px));
+  max-height: min(520px, calc(100vh - 120px));
+  padding: 8px;
+  overflow-y: auto;
   border: 1px solid var(--line-soft);
   border-radius: 8px;
   background: var(--surface-0);
@@ -8428,18 +9284,28 @@ onBeforeUnmount(() => {
   font-size: 13px;
 }
 
+.pd-export-menu__group + .pd-export-menu__group,
+.pd-export-menu__group + .pd-export-menu__item {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.pd-export-menu__group-title {
+  padding: 2px 0 6px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+}
+
 .pd-export-menu__item {
   display: grid;
-  gap: 3px;
+  gap: 4px;
   border: 0;
-  border-bottom: 1px solid var(--line-soft);
+  border-radius: 6px;
   background: transparent;
   color: var(--text-primary);
   cursor: pointer;
-}
-
-.pd-export-menu__item:last-child {
-  border-bottom: 0;
 }
 
 .pd-export-menu__item:hover:not(:disabled) {
@@ -8451,9 +9317,30 @@ onBeforeUnmount(() => {
   cursor: not-allowed;
 }
 
+.pd-export-menu__item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
 .pd-export-menu__item-name {
+  min-width: 0;
   font-size: 13px;
   font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.pd-export-menu__item-ext {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  background: var(--surface-muted);
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 700;
 }
 
 .pd-export-menu__item-desc {
@@ -10510,6 +11397,10 @@ onBeforeUnmount(() => {
   font-weight: 600;
 }
 
+.pd-resource-create-dialog__hint {
+  margin: 10px 0 0;
+}
+
 .term-settings__group {
   display: grid;
   overflow: hidden;
@@ -11109,8 +12000,19 @@ onBeforeUnmount(() => {
     max-width: calc(100vw - 72px);
   }
 
+  .pd-file-selection,
   .pd-toolbar-action-strip,
   .pd-file-filters {
+    width: calc(100vw - 72px);
+    max-width: calc(100vw - 72px);
+  }
+
+  .pd-file-selection__trigger {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .pd-file-selection__menu {
     width: calc(100vw - 72px);
     max-width: calc(100vw - 72px);
   }

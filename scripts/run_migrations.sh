@@ -10,6 +10,8 @@ set -euo pipefail
 : "${PGPASSWORD:?需要 PGPASSWORD}"
 : "${PGDATABASE:?需要 PGDATABASE}"
 
+export PGOPTIONS="${PGOPTIONS:--c statement_timeout=0 -c lock_timeout=0}"
+
 MIGRATIONS_DIR="$(dirname "$0")/migrations"
 
 echo "[migrate] 等待 PostgreSQL ${PGHOST}:${PGPORT} 就绪..."

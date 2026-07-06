@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import posixpath
 import re
 import unicodedata
 from collections.abc import Iterable
@@ -12,15 +14,25 @@ from zipfile import BadZipFile, ZipFile
 from xml.etree import ElementTree as ET
 
 from app.config import get_settings
+from app.services.document_match_analysis import normalize_document_match_analysis
 from app.services.libreoffice_service import (
     LibreOfficeError,
     compute_libreoffice_document_statistics,
+    convert_word_to_docx,
 )
-from app.services.document_match_analysis import normalize_document_match_analysis
 
 
 APP_PROPERTIES_NS = "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
+RELATIONSHIPS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+C_NS = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+VML_NS = "urn:schemas-microsoft-com:vml"
+MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+DGM_GRAPHIC_URI = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
+
 STATISTIC_FIELDS = {
     "Pages": "pages",
     "Words": "words",
@@ -42,6 +54,13 @@ STATISTIC_NUMBER_KEYS = (
     "internal_repeated_characters",
     "cross_file_repeated_words",
     "cross_file_repeated_characters",
+    "image_count",
+    "unique_image_count",
+    "inline_image_count",
+    "floating_image_count",
+    "linked_image_count",
+    "chart_count",
+    "smartart_count",
 )
 NON_ASIAN_WORD_PATTERN = re.compile(
     r"[A-Za-z0-9]+(?:[.,:/_-][A-Za-z0-9]+)*%?|[^\W_\d\s]+(?:[-'][^\W_\d\s]+)*",
@@ -53,43 +72,61 @@ _LICENSE_STATUS: str | None = None
 
 
 def compute_docx_statistics(raw_bytes: bytes) -> dict[str, Any]:
-    """计算 DOCX 文档级统计，保留旧调用入口。"""
+    """Compute DOCX statistics with the default OpenXML word-like profile."""
     return compute_word_document_statistics(raw_bytes, "source.docx")
 
 
 def compute_word_document_statistics(raw_bytes: bytes, filename: str) -> dict[str, Any]:
-    """计算 Word 文档级统计，优先使用 LibreOffice。"""
-    libreoffice_statistics = _compute_with_libreoffice(raw_bytes, filename)
-    if libreoffice_statistics is not None:
-        return libreoffice_statistics
+    """Compute Word statistics without starting LibreOffice for DOCX files."""
+    suffix = Path(filename or "").suffix.lower()
+    if suffix == ".docx":
+        return _compute_docx_statistics_without_libreoffice(raw_bytes)
 
-    if Path(filename or "").suffix.lower() != ".docx":
-        return _build_statistics_payload(
-            source="unavailable",
-            engine=None,
-            include_textboxes_footnotes_endnotes=True,
-            license_status=None,
-        )
+    if suffix == ".doc":
+        converted_docx = _convert_doc_to_docx(raw_bytes, filename)
+        if converted_docx is not None:
+            return _compute_docx_statistics_without_libreoffice(converted_docx)
 
-    return _compute_docx_statistics_without_libreoffice(raw_bytes)
+        libreoffice_statistics = _compute_with_libreoffice(raw_bytes, filename)
+        if libreoffice_statistics is not None:
+            return libreoffice_statistics
+
+    return _build_statistics_payload(
+        source="unavailable",
+        engine=None,
+        include_textboxes_footnotes_endnotes=False,
+        license_status=None,
+        statistics_profile="unavailable",
+        content_scope="unavailable",
+    )
 
 
-def _compute_with_libreoffice(raw_bytes: bytes, filename: str) -> dict[str, Any] | None:
+def _convert_doc_to_docx(raw_bytes: bytes, filename: str) -> bytes | None:
     try:
-        return compute_libreoffice_document_statistics(raw_bytes, filename)
+        return convert_word_to_docx(raw_bytes, filename)
     except LibreOfficeError:
         return None
 
 
-def _compute_docx_statistics_without_libreoffice(raw_bytes: bytes) -> dict[str, Any]:
-    """计算 DOCX 文档级统计，优先使用 Aspose，失败时用 OpenXML 直接重算文本统计。"""
-    aspose_statistics = _compute_with_aspose(raw_bytes)
-    if aspose_statistics is not None:
-        return aspose_statistics
+def _compute_with_libreoffice(raw_bytes: bytes, filename: str) -> dict[str, Any] | None:
+    try:
+        statistics = compute_libreoffice_document_statistics(raw_bytes, filename)
+    except LibreOfficeError:
+        return None
+    statistics.setdefault("statistics_profile", "libreoffice")
+    statistics.setdefault("content_scope", "libreoffice_default")
+    statistics.setdefault("statistics_warnings", [])
+    return statistics
 
+
+def _compute_docx_statistics_without_libreoffice(raw_bytes: bytes) -> dict[str, Any]:
     openxml_statistics = _compute_with_openxml(raw_bytes)
     if openxml_statistics is not None:
         return openxml_statistics
+
+    aspose_statistics = _compute_with_aspose(raw_bytes)
+    if aspose_statistics is not None:
+        return aspose_statistics
 
     cached_statistics = _read_cached_docprops_statistics(raw_bytes)
     if cached_statistics is not None:
@@ -98,8 +135,10 @@ def _compute_docx_statistics_without_libreoffice(raw_bytes: bytes) -> dict[str, 
     return _build_statistics_payload(
         source="unavailable",
         engine=None,
-        include_textboxes_footnotes_endnotes=True,
+        include_textboxes_footnotes_endnotes=False,
         license_status=None,
+        statistics_profile="unavailable",
+        content_scope="unavailable",
     )
 
 
@@ -110,8 +149,6 @@ def normalize_document_statistics(value: Any) -> dict[str, Any]:
         return _coerce_statistics_payload(value)
     if isinstance(value, str) and value.strip():
         try:
-            import json
-
             decoded = json.loads(value)
         except (TypeError, ValueError):
             return {}
@@ -123,8 +160,6 @@ def normalize_document_statistics(value: Any) -> dict[str, Any]:
 
 
 def serialize_document_statistics(value: Any) -> str:
-    import json
-
     statistics = normalize_document_statistics(value)
     return json.dumps(statistics, ensure_ascii=False, sort_keys=True)
 
@@ -150,6 +185,8 @@ def _compute_with_aspose(raw_bytes: bytes) -> dict[str, Any] | None:
                 engine="aspose-words",
                 include_textboxes_footnotes_endnotes=False,
                 license_status=license_status,
+                statistics_profile="aspose_word",
+                content_scope="aspose_document",
             )
             payload.update(
                 {
@@ -176,6 +213,7 @@ def _compute_with_openxml(raw_bytes: bytes) -> dict[str, Any] | None:
         with ZipFile(BytesIO(raw_bytes)) as archive:
             document_xml = archive.read("word/document.xml")
             cached_statistics = _read_cached_docprops_statistics_from_archive(archive)
+            relationships = _read_part_relationships(archive, "word/document.xml")
     except (BadZipFile, KeyError):
         return None
 
@@ -184,35 +222,31 @@ def _compute_with_openxml(raw_bytes: bytes) -> dict[str, Any] | None:
     except ET.ParseError:
         return None
 
-    paragraphs = [
-        text
-        for text in _iter_visible_paragraph_texts(root, include_textboxes=False)
-        if text.strip()
-    ]
-    if not paragraphs:
-        return _build_statistics_payload(
-            source="openxml_computed",
-            engine="openxml-text",
-            include_textboxes_footnotes_endnotes=False,
-            license_status=None,
-        )
-
+    paragraphs = [text for text in _iter_word_like_paragraph_texts(root) if text.strip()]
+    object_statistics = _compute_openxml_object_statistics(root, relationships)
     payload = _build_statistics_payload(
-        source="openxml_computed",
-        engine="openxml-text",
+        source="openxml_word_like",
+        engine="openxml-word-like",
         include_textboxes_footnotes_endnotes=False,
         license_status=None,
+        statistics_profile="word_web_approx",
+        content_scope="main_document_body",
     )
     payload.update(
         {
             "pages": _to_optional_int((cached_statistics or {}).get("pages")),
             "words": _count_word_words(paragraphs),
+            "non_asian_words": _count_non_asian_words(paragraphs),
+            "asian_characters": _count_asian_characters(paragraphs),
             "characters": _count_characters(paragraphs, include_spaces=False),
             "characters_with_spaces": _count_characters(paragraphs, include_spaces=True),
             "paragraphs": len(paragraphs),
             "lines": _trusted_cached_line_count(cached_statistics, paragraph_count=len(paragraphs)),
+            **object_statistics,
         }
     )
+    if payload["pages"] is not None or payload["lines"] is not None:
+        payload["statistics_warnings"].append("pages_lines_from_cached_docprops")
     return payload
 
 
@@ -266,6 +300,8 @@ def _read_cached_docprops_statistics_from_archive(archive: ZipFile) -> dict[str,
         engine="openxml-docprops",
         include_textboxes_footnotes_endnotes=None,
         license_status=None,
+        statistics_profile="docprops_cached",
+        content_scope="cached_docprops",
     )
     for element_name, key in STATISTIC_FIELDS.items():
         element = root.find(f"{{{APP_PROPERTIES_NS}}}{element_name}")
@@ -273,60 +309,229 @@ def _read_cached_docprops_statistics_from_archive(archive: ZipFile) -> dict[str,
     return payload
 
 
-def _iter_visible_paragraph_texts(root: ET.Element, *, include_textboxes: bool) -> Iterable[str]:
-    def walk(node: ET.Element, *, in_textbox: bool = False) -> Iterable[str]:
-        next_in_textbox = in_textbox or node.tag == _w_tag("txbxContent")
-        if next_in_textbox and not include_textboxes:
+def _read_part_relationships(
+    archive: ZipFile,
+    part_name: str,
+) -> dict[str, dict[str, str | bool]]:
+    normalized_name = part_name.lstrip("/")
+    directory = posixpath.dirname(normalized_name)
+    basename = posixpath.basename(normalized_name)
+    rels_name = posixpath.join(directory, "_rels", f"{basename}.rels")
+    try:
+        root = ET.fromstring(archive.read(rels_name))
+    except (KeyError, ET.ParseError):
+        return {}
+
+    relationships: dict[str, dict[str, str | bool]] = {}
+    for relationship in root.findall(f"{{{RELATIONSHIPS_NS}}}Relationship"):
+        rel_id = relationship.get("Id")
+        target = relationship.get("Target")
+        if not rel_id or not target:
+            continue
+        target_mode = relationship.get("TargetMode")
+        is_external = target_mode == "External"
+        if is_external:
+            resolved_target = target
+        else:
+            resolved_target = posixpath.normpath(posixpath.join(directory, target))
+        relationships[rel_id] = {
+            "target": resolved_target,
+            "type": relationship.get("Type") or "",
+            "is_external": is_external,
+        }
+    return relationships
+
+
+def _iter_word_like_paragraph_texts(root: ET.Element) -> Iterable[str]:
+    body = root.find(f".//{_w_tag('body')}")
+    container = body if body is not None else root
+
+    def walk(node: ET.Element) -> Iterable[str]:
+        if _local_name(node.tag) == "AlternateContent":
+            preferred_branch = _select_preferred_alternate_content_branch(node)
+            if preferred_branch is not None:
+                yield from walk(preferred_branch)
+            return
+        if node.tag == _w_tag("txbxContent"):
             return
         if node.tag == _w_tag("p"):
-            yield _extract_paragraph_text(node, include_textboxes=include_textboxes)
-            if include_textboxes:
-                for child in node:
-                    if child.tag == _w_tag("txbxContent"):
-                        yield from walk(child, in_textbox=True)
-                    else:
-                        for textbox in child.findall(f".//{_w_tag('txbxContent')}"):
-                            yield from walk(textbox, in_textbox=True)
+            yield _extract_word_like_paragraph_text(node)
             return
         for child in node:
-            yield from walk(child, in_textbox=next_in_textbox)
+            yield from walk(child)
 
-    yield from walk(root)
+    yield from walk(container)
 
 
-def _extract_paragraph_text(paragraph: ET.Element, *, include_textboxes: bool) -> str:
+def _extract_word_like_paragraph_text(paragraph: ET.Element) -> str:
     parts: list[str] = []
 
-    def walk(node: ET.Element, *, deleted: bool = False) -> None:
-        if node.tag == _w_tag("txbxContent") and not include_textboxes:
+    def walk(node: ET.Element, *, deleted: bool = False, hidden: bool = False) -> None:
+        if _local_name(node.tag) == "AlternateContent":
+            preferred_branch = _select_preferred_alternate_content_branch(node)
+            if preferred_branch is not None:
+                walk(preferred_branch, deleted=deleted, hidden=hidden)
             return
-        next_deleted = deleted or node.tag == _w_tag("del")
-        if not next_deleted:
-            if node.tag == _w_tag("t"):
-                parts.append(node.text or "")
-                return
-            if node.tag == _w_tag("tab"):
-                parts.append("\t")
-                return
-            if node.tag == _w_tag("br"):
-                parts.append("\n")
-                return
+        if node.tag in {_w_tag("txbxContent"), _w_tag("moveFrom")}:
+            return
+        next_deleted = deleted or node.tag in {_w_tag("del"), _w_tag("delText")}
+        next_hidden = hidden or _is_hidden_run(node)
+        if next_deleted or next_hidden:
+            return
+        if node.tag == _w_tag("t"):
+            parts.append(node.text or "")
+            return
+        if node.tag == _w_tag("tab"):
+            parts.append("\t")
+            return
+        if node.tag in {_w_tag("br"), _w_tag("cr")}:
+            parts.append("\n")
+            return
+        if node.tag == _w_tag("noBreakHyphen"):
+            parts.append("-")
+            return
+        if node.tag == _w_tag("sym"):
+            symbol_text = _decode_symbol(node)
+            if symbol_text:
+                parts.append(symbol_text)
+            return
+        if node.tag == _w_tag("instrText"):
+            return
         for child in node:
-            walk(child, deleted=next_deleted)
+            walk(child, deleted=next_deleted, hidden=next_hidden)
 
     walk(paragraph)
     return "".join(parts)
 
 
+def _compute_openxml_object_statistics(
+    root: ET.Element,
+    relationships: dict[str, dict[str, str | bool]],
+) -> dict[str, int]:
+    image_targets: list[str] = []
+    inline_image_count = 0
+    floating_image_count = 0
+    linked_image_count = 0
+    chart_count = 0
+    smartart_count = 0
+
+    def resolve_relationship(rel_id: str) -> tuple[str, bool]:
+        relationship = relationships.get(rel_id)
+        if not relationship:
+            return rel_id, False
+        return str(relationship.get("target") or rel_id), bool(relationship.get("is_external"))
+
+    def add_image(rel_id: str, *, linked: bool, floating: bool) -> None:
+        nonlocal inline_image_count, floating_image_count, linked_image_count
+        target, is_external = resolve_relationship(rel_id)
+        image_targets.append(target)
+        if floating:
+            floating_image_count += 1
+        else:
+            inline_image_count += 1
+        if linked or is_external:
+            linked_image_count += 1
+
+    def walk(node: ET.Element, *, in_inline: bool = False, in_anchor: bool = False) -> None:
+        nonlocal chart_count, smartart_count
+        if _local_name(node.tag) == "AlternateContent":
+            preferred_branch = _select_preferred_alternate_content_branch(node)
+            if preferred_branch is not None:
+                walk(preferred_branch, in_inline=in_inline, in_anchor=in_anchor)
+            return
+
+        next_inline = in_inline or node.tag == _wp_tag("inline")
+        next_anchor = in_anchor or node.tag == _wp_tag("anchor")
+        if node.tag == _a_tag("blip"):
+            rel_id = node.get(_r_tag("embed"))
+            linked_rel_id = node.get(_r_tag("link"))
+            if rel_id:
+                add_image(rel_id, linked=False, floating=next_anchor and not next_inline)
+            elif linked_rel_id:
+                add_image(linked_rel_id, linked=True, floating=next_anchor and not next_inline)
+        elif node.tag == _v_tag("imagedata"):
+            rel_id = node.get(_r_tag("id")) or node.get(_r_tag("href"))
+            if rel_id:
+                add_image(rel_id, linked=bool(node.get(_r_tag("href"))), floating=next_anchor and not next_inline)
+        elif node.tag == _c_tag("chart") and node.get(_r_tag("id")):
+            chart_count += 1
+        elif node.tag == _a_tag("graphicData") and node.get("uri") == DGM_GRAPHIC_URI:
+            smartart_count += 1
+
+        for child in node:
+            walk(child, in_inline=next_inline, in_anchor=next_anchor)
+
+    walk(root)
+    return {
+        "image_count": len(image_targets),
+        "unique_image_count": len(set(image_targets)),
+        "inline_image_count": inline_image_count,
+        "floating_image_count": floating_image_count,
+        "linked_image_count": linked_image_count,
+        "chart_count": chart_count,
+        "smartart_count": smartart_count,
+    }
+
+
+def _select_preferred_alternate_content_branch(node: ET.Element) -> ET.Element | None:
+    for child in list(node):
+        if child.tag == f"{{{MC_NS}}}Choice" and len(child):
+            return child
+    for child in list(node):
+        if child.tag == f"{{{MC_NS}}}Fallback" and len(child):
+            return child
+    return None
+
+
+def _is_hidden_run(node: ET.Element) -> bool:
+    if node.tag != _w_tag("r"):
+        return False
+    run_properties = node.find(_w_tag("rPr"))
+    if run_properties is None:
+        return False
+    for tag_name in ("vanish", "webHidden"):
+        hidden_property = run_properties.find(_w_tag(tag_name))
+        if hidden_property is not None and not _is_false_property(hidden_property.get(_w_tag("val"))):
+            return True
+    return False
+
+
+def _is_false_property(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"0", "false", "off"}
+
+
+def _decode_symbol(node: ET.Element) -> str:
+    raw_value = node.get(_w_tag("char"))
+    if not raw_value:
+        return ""
+    try:
+        return chr(int(raw_value, 16))
+    except (TypeError, ValueError):
+        return ""
+
+
 def _count_word_words(paragraphs: Iterable[str]) -> int:
+    text_parts = list(paragraphs)
+    return _count_asian_characters(text_parts) + _count_non_asian_words(text_parts)
+
+
+def _count_asian_characters(paragraphs: Iterable[str]) -> int:
+    return sum(
+        1
+        for text in paragraphs
+        for char in text
+        if _is_east_asian_word_count_char(char)
+    )
+
+
+def _count_non_asian_words(paragraphs: Iterable[str]) -> int:
     word_count = 0
     for text in paragraphs:
-        east_asian_chars = sum(1 for char in text if _is_east_asian_word_count_char(char))
         non_asian_text = "".join(
             " " if _is_east_asian_word_count_char(char) else char
             for char in text
         )
-        word_count += east_asian_chars + len(NON_ASIAN_WORD_PATTERN.findall(non_asian_text))
+        word_count += len(NON_ASIAN_WORD_PATTERN.findall(non_asian_text))
     return word_count
 
 
@@ -359,8 +564,34 @@ def _is_east_asian_word_count_char(char: str) -> bool:
     return unicodedata.east_asian_width(char) in {"W", "F"}
 
 
+def _local_name(tag: str) -> str:
+    if "}" not in tag:
+        return tag
+    return tag.rsplit("}", 1)[1]
+
+
 def _w_tag(local_name: str) -> str:
     return f"{{{WORD_NS}}}{local_name}"
+
+
+def _r_tag(local_name: str) -> str:
+    return f"{{{REL_NS}}}{local_name}"
+
+
+def _a_tag(local_name: str) -> str:
+    return f"{{{A_NS}}}{local_name}"
+
+
+def _c_tag(local_name: str) -> str:
+    return f"{{{C_NS}}}{local_name}"
+
+
+def _wp_tag(local_name: str) -> str:
+    return f"{{{WP_NS}}}{local_name}"
+
+
+def _v_tag(local_name: str) -> str:
+    return f"{{{VML_NS}}}{local_name}"
 
 
 def _build_statistics_payload(
@@ -370,6 +601,9 @@ def _build_statistics_payload(
     include_textboxes_footnotes_endnotes: bool | None,
     license_status: str | None,
     engine_version: str | None = None,
+    statistics_profile: str | None = None,
+    content_scope: str | None = None,
+    statistics_warnings: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "source": source,
@@ -377,6 +611,9 @@ def _build_statistics_payload(
         "engine_version": engine_version,
         "license_status": license_status,
         "include_textboxes_footnotes_endnotes": include_textboxes_footnotes_endnotes,
+        "statistics_profile": statistics_profile or _default_statistics_profile(source),
+        "content_scope": content_scope or _default_content_scope(source),
+        "statistics_warnings": list(statistics_warnings or []),
         "match_analysis": None,
     }
     for key in STATISTIC_NUMBER_KEYS:
@@ -385,8 +622,9 @@ def _build_statistics_payload(
 
 
 def _coerce_statistics_payload(value: dict[str, Any]) -> dict[str, Any]:
+    source = str(value.get("source") or "")
     payload = _build_statistics_payload(
-        source=str(value.get("source") or ""),
+        source=source,
         engine=value.get("engine") if value.get("engine") is None else str(value.get("engine")),
         engine_version=(
             value.get("engine_version")
@@ -401,11 +639,46 @@ def _coerce_statistics_payload(value: dict[str, Any]) -> dict[str, Any]:
             if value.get("license_status") is None
             else str(value.get("license_status"))
         ),
+        statistics_profile=(
+            value.get("statistics_profile")
+            if value.get("statistics_profile") is None
+            else str(value.get("statistics_profile"))
+        ),
+        content_scope=(
+            value.get("content_scope")
+            if value.get("content_scope") is None
+            else str(value.get("content_scope"))
+        ),
+        statistics_warnings=_to_string_list(value.get("statistics_warnings")),
     )
     for key in STATISTIC_NUMBER_KEYS:
         payload[key] = _to_optional_int(value.get(key))
     payload["match_analysis"] = normalize_document_match_analysis(value.get("match_analysis"))
     return payload
+
+
+def _default_statistics_profile(source: str) -> str:
+    if source in {"openxml_word_like", "openxml_computed"}:
+        return "word_web_approx"
+    if source == "aspose":
+        return "aspose_word"
+    if source == "libreoffice":
+        return "libreoffice"
+    if source == "docprops_cached":
+        return "docprops_cached"
+    return source or "unknown"
+
+
+def _default_content_scope(source: str) -> str:
+    if source in {"openxml_word_like", "openxml_computed"}:
+        return "main_document_body"
+    if source == "aspose":
+        return "aspose_document"
+    if source == "libreoffice":
+        return "libreoffice_default"
+    if source == "docprops_cached":
+        return "cached_docprops"
+    return "unknown"
 
 
 def _configured_license_status_hint() -> str:
@@ -444,3 +717,11 @@ def _to_optional_bool(value: Any) -> bool | None:
         if normalized in {"0", "false", "no", "off"}:
             return False
     return bool(value)
+
+
+def _to_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if item is not None]
+    if isinstance(value, str) and value.strip():
+        return [value]
+    return []
