@@ -21,7 +21,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Header, HTT
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, case, func, literal, or_
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, aliased, object_session
 
 from app.auth import (
@@ -10867,6 +10867,15 @@ def get_file_record_preview(
     }
 
 
+def _is_statement_timeout_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return (
+        "statement timeout" in message
+        or "canceling statement due to statement timeout" in message
+        or exc.__class__.__name__ == "QueryCanceled"
+    )
+
+
 @router.get("/file-records/{file_record_id}/segments/{segment_ref}/tm-candidates")
 def get_segment_tm_candidates(
     file_record_id: UUID,
@@ -10914,20 +10923,36 @@ def get_segment_tm_candidates(
     if not collection_ids and file_record.collection_id:
         collection_ids = [file_record.collection_id]
 
-    candidates = get_tm_candidates_for_text(
-        db=db,
-        source_text=segment.source_text,
-        similarity_threshold=_normalize_tm_match_threshold(
-            threshold if threshold is not None else getattr(file_record, "tm_match_threshold", None),
-        ),
-        collection_ids=collection_ids,
-        top_n=max_candidates,
-    )
+    timed_out = False
+    try:
+        candidates = get_tm_candidates_for_text(
+            db=db,
+            source_text=segment.source_text,
+            similarity_threshold=_normalize_tm_match_threshold(
+                threshold if threshold is not None else getattr(file_record, "tm_match_threshold", None),
+            ),
+            collection_ids=collection_ids,
+            top_n=max_candidates,
+        )
+    except OperationalError as exc:
+        if not _is_statement_timeout_error(exc):
+            raise
+        db.rollback()
+        timed_out = True
+        candidates = []
+        logger.warning(
+            "TM candidate lookup timed out file_record_id=%s segment_ref=%s collection_count=%s",
+            file_record_id,
+            segment_ref,
+            len(collection_ids),
+        )
 
     return {
         "segment_id": str(segment.id),
         "sentence_id": segment.sentence_id,
         "source_text": segment.source_text,
+        "timed_out": timed_out,
+        "degraded_reason": "statement_timeout" if timed_out else None,
         "candidates": [
             {
                 "entry_id": c.entry_id,
