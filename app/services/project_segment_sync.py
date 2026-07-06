@@ -30,6 +30,7 @@ _SOURCE_PRIORITY = {
 @dataclass
 class ProjectSegmentSyncSummary:
     filled_count: int = 0
+    updated_count: int = 0
     conflict_count: int = 0
     affected_file_ids: set[UUID] = field(default_factory=set)
     current_file_segments: list[Segment] = field(default_factory=list)
@@ -40,6 +41,7 @@ class ProjectSegmentSyncSummary:
 
     def extend(self, other: "ProjectSegmentSyncSummary") -> None:
         self.filled_count += other.filled_count
+        self.updated_count += other.updated_count
         self.conflict_count += other.conflict_count
         self.affected_file_ids.update(other.affected_file_ids)
         self.current_file_segments.extend(other.current_file_segments)
@@ -47,8 +49,24 @@ class ProjectSegmentSyncSummary:
     def to_dict(self) -> dict[str, int]:
         return {
             "filled_count": self.filled_count,
+            "updated_count": self.updated_count,
             "conflict_count": self.conflict_count,
             "affected_file_count": self.affected_file_count,
+        }
+
+
+@dataclass
+class ProjectSyncDisableSummary:
+    updated_count: int = 0
+    disabled_count: int = 0
+    cleared_count: int = 0
+    updated_segments: list[Segment] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "updated_count": self.updated_count,
+            "disabled_count": self.disabled_count,
+            "cleared_count": self.cleared_count,
         }
 
 
@@ -62,6 +80,60 @@ class _SyncCandidate:
 
 def empty_project_segment_sync_summary() -> ProjectSegmentSyncSummary:
     return ProjectSegmentSyncSummary()
+
+
+def disable_project_sync_for_segments(
+    segments: list[Segment],
+    *,
+    current_user=None,
+) -> ProjectSyncDisableSummary:
+    """关闭句段项目同步；对已由项目同步填充的译文同步清空。"""
+    summary = ProjectSyncDisableSummary()
+
+    for segment in segments:
+        changed = False
+
+        if not segment.project_sync_disabled:
+            segment.project_sync_disabled = True
+            summary.disabled_count += 1
+            changed = True
+
+        if (segment.source or "") == PROJECT_SYNC_SOURCE:
+            if normalize_text(segment.target_text):
+                summary.cleared_count += 1
+            if _clear_project_synced_segment_fields(segment):
+                changed = True
+
+        if changed:
+            if current_user is not None:
+                segment.last_modified_by_id = current_user.id
+            segment.version = int(segment.version or 1) + 1
+            summary.updated_count += 1
+            summary.updated_segments.append(segment)
+
+    return summary
+
+
+def enable_project_sync_for_segments(
+    segments: list[Segment],
+    *,
+    current_user=None,
+) -> ProjectSyncDisableSummary:
+    """恢复句段项目同步，不改动现有译文。"""
+    summary = ProjectSyncDisableSummary()
+
+    for segment in segments:
+        if not segment.project_sync_disabled:
+            continue
+
+        segment.project_sync_disabled = False
+        if current_user is not None:
+            segment.last_modified_by_id = current_user.id
+        segment.version = int(segment.version or 1) + 1
+        summary.updated_count += 1
+        summary.updated_segments.append(segment)
+
+    return summary
 
 
 def sync_project_repeated_segments_from_file(
@@ -78,7 +150,6 @@ def sync_project_repeated_segments_from_file(
         db.query(Segment)
         .filter(
             Segment.file_record_id == file_record.id,
-            _segment_has_empty_target(),
             _segment_is_not_confirmed(),
             _segment_project_sync_enabled(),
         )
@@ -132,8 +203,6 @@ def sync_project_repeated_segments_from_segments(
                 FileRecord.target_language == file_record.target_language,
                 Segment.source_hash == source_hash,
                 Segment.id != resolved.segment.id,
-                _segment_has_empty_target(),
-                _segment_is_not_confirmed(),
                 _segment_project_sync_enabled(),
             )
             .all()
@@ -147,7 +216,7 @@ def sync_project_repeated_segments_from_segments(
             current_user=current_user,
         )
 
-    if summary.filled_count:
+    if summary.filled_count or summary.updated_count:
         db.flush()
     return summary
 
@@ -216,7 +285,7 @@ def _fill_targets_from_project_candidates(
             current_user=current_user,
         )
 
-    if summary.filled_count:
+    if summary.filled_count or summary.updated_count:
         db.flush()
     return summary
 
@@ -233,14 +302,19 @@ def _apply_candidate_to_targets(
     for target in targets:
         if target.id == candidate.segment.id:
             continue
-        if target.project_sync_disabled or target.status == "confirmed" or normalize_text(target.target_text):
+        if target.project_sync_disabled:
             continue
 
         before_text = target.target_text or ""
+        before_text_is_empty = not normalize_text(before_text)
+        if before_text == candidate.target_text:
+            continue
+
         target.target_text = candidate.target_text
         target.target_html = None
-        target.status = PROJECT_SYNC_STATUS
+        target.status = "confirmed" if target.status == "confirmed" else PROJECT_SYNC_STATUS
         target.source = PROJECT_SYNC_SOURCE
+        target.last_modified_by_id = current_user.id if current_user is not None else None
         target.score = 1.0
         target.matched_source_text = candidate.segment.source_text
         target.version = int(target.version or 1) + 1
@@ -253,7 +327,10 @@ def _apply_candidate_to_targets(
             source=PROJECT_SYNC_SOURCE,
             current_user=current_user,
         )
-        summary.filled_count += 1
+        if before_text_is_empty:
+            summary.filled_count += 1
+        else:
+            summary.updated_count += 1
         summary.affected_file_ids.add(target.file_record_id)
         if target.file_record_id == current_file_id:
             summary.current_file_segments.append(target)
@@ -262,7 +339,7 @@ def _apply_candidate_to_targets(
 def _build_candidate(segment: Segment) -> _SyncCandidate | None:
     if not normalize_text(segment.target_text):
         return None
-    if segment.project_sync_disabled and segment.source == PROJECT_SYNC_SOURCE:
+    if segment.project_sync_disabled:
         return None
     source_hash = segment.source_hash or build_source_hash(segment.source_text)
     if not source_hash:
@@ -288,6 +365,29 @@ def _build_candidate(segment: Segment) -> _SyncCandidate | None:
         target_text=target_text,
         rank=(confirmed_priority, source_priority, updated_at),
     )
+
+
+def _clear_project_synced_segment_fields(segment: Segment) -> bool:
+    changed = False
+    fields = {
+        "target_text": "",
+        "target_html": None,
+        "status": "none",
+        "source": "none",
+        "score": 0.0,
+        "matched_source_text": None,
+        "matched_collection_name": None,
+        "matched_creator_name": None,
+        "matched_created_at": None,
+        "matched_updated_at": None,
+        "llm_provider": None,
+        "llm_model": None,
+    }
+    for field_name, next_value in fields.items():
+        if getattr(segment, field_name) != next_value:
+            setattr(segment, field_name, next_value)
+            changed = True
+    return changed
 
 
 def _resolve_candidate(candidates: list[_SyncCandidate]) -> _SyncCandidate | None:
@@ -334,10 +434,6 @@ def _backfill_project_segment_hashes(db: Session, *, file_record: FileRecord) ->
         segment.source_hash = build_source_hash(segment.source_text)
     if rows:
         db.flush()
-
-
-def _segment_has_empty_target():
-    return func.trim(func.coalesce(Segment.target_text, "")) == ""
 
 
 def _segment_is_not_confirmed():

@@ -1,0 +1,40 @@
+services:
+  app:
+    environment:
+      HTTP_PROXY: http://mihomo:7890
+      HTTPS_PROXY: http://mihomo:7890
+      ALL_PROXY: http://mihomo:7890
+      http_proxy: http://mihomo:7890
+      https_proxy: http://mihomo:7890
+      all_proxy: http://mihomo:7890
+      NO_PROXY: localhost,127.0.0.1,::1,postgres,redis,languagetool,pgbouncer,mihomo,app,nginx,ai-translation-postgres,ai-translation-redis,ai-translation-languagetool,ai-translation-app,ai-translation-nginx
+      no_proxy: localhost,127.0.0.1,::1,postgres,redis,languagetool,pgbouncer,mihomo,app,nginx,ai-translation-postgres,ai-translation-redis,ai-translation-languagetool,ai-translation-app,ai-translation-nginx
+    depends_on:
+      mihomo:
+        condition: service_started
+
+  worker:
+    environment:
+      HTTP_PROXY: http://mihomo:7890
+      HTTPS_PROXY: http://mihomo:7890
+      ALL_PROXY: http://mihomo:7890
+      http_proxy: http://mihomo:7890
+      https_proxy: http://mihomo:7890
+      all_proxy: http://mihomo:7890
+      NO_PROXY: localhost,127.0.0.1,::1,postgres,redis,languagetool,pgbouncer,mihomo,app,nginx,ai-translation-postgres,ai-translation-redis,ai-translation-languagetool,ai-translation-app,ai-translation-nginx
+      no_proxy: localhost,127.0.0.1,::1,postgres,redis,languagetool,pgbouncer,mihomo,app,nginx,ai-translation-postgres,ai-translation-redis,ai-translation-languagetool,ai-translation-app,ai-translation-nginx
+    depends_on:
+      mihomo:
+        condition: service_started
+
+  mihomo:
+    image: metacubex/mihomo:latest
+    container_name: ai-translation-mihomo
+    command: ["-f", "/root/.config/mihomo/config.yaml"]
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - ./docker/mihomo/config.yaml:/root/.config/mihomo/config.yaml:ro
+    expose:
+      - "7890"
+    restart: unless-stopped

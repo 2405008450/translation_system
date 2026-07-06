@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { Loader2 } from 'lucide-vue-next'
 
+import AppUpdatePrompt from './components/AppUpdatePrompt.vue'
 import ConfirmDialog from './components/base/ConfirmDialog.vue'
 import Toast from './components/base/Toast.vue'
 import { routeLoading } from './router'
@@ -19,6 +20,7 @@ const { t } = useI18n()
       </div>
     </div>
   </Transition>
+  <AppUpdatePrompt />
   <Toast />
   <ConfirmDialog />
 </template>

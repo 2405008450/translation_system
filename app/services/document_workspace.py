@@ -66,17 +66,16 @@ HIGHLIGHT_COLORS = {
     "yellow": "#ffff00",
 }
 PAGE_NUMBER_FIELD_NAMES = {"PAGE", "NUMPAGES", "SECTIONPAGES"}
+INTERNAL_REFERENCE_FIELD_NAMES = {"REF", "PAGEREF", "NOTEREF"}
 NUMBERING_PLACEHOLDER_RE = re.compile(r"%(\d+)")
 PAGE_NUMBER_WRAPPER_RE = re.compile(r"[\s\-\u2013\u2014\u2212\uff0d_./\\|:：()\[\]{}（）【】<>《》·•]+")
 CELL_SENTENCE_END_CHARS = frozenset("。？！?!.；;:：")
-CELL_SHORT_PARAGRAPH_MAX_CHARS = 20
-CELL_NEXT_PARAGRAPH_MAX_CHARS = 50
 CELL_GROUP_MAX_CHARS = 200
 CELL_PARAGRAPH_BREAK_SENTINEL = "\uE000"
 PAGE_BREAK_SENTINEL = "\uE001"
 PAGE_BREAK_HTML = '<span class="doc-page-break" aria-hidden="true"></span>'
 DOCX_PARSE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
-DOCX_PARSE_CACHE_VERSION = "8"
+DOCX_PARSE_CACHE_VERSION = "10"
 DOCUMENT_PARSE_MODE_FULL = "full"
 DOCUMENT_PARSE_MODE_BODY_ONLY = "body_only"
 SUPPORTED_DOCUMENT_PARSE_MODES = {
@@ -135,6 +134,85 @@ SUPPORTED_BROWSER_IMAGE_MIME_TYPES = {
     "image/webp",
     "image/x-icon",
 }
+CELL_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+CELL_SHORT_CJK_FRAGMENT_RE = re.compile(r"^[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{1,2}$")
+CELL_DIGIT_RE = re.compile(r"\d")
+CELL_PHONE_RE = re.compile(
+    r"(?:电话|手机|传真|联系|tel|phone|mobile|fax)?\s*[:：]?\s*\+?\d[\d\s\-()（）]{5,}\d",
+    re.IGNORECASE,
+)
+CELL_DATE_RE = re.compile(
+    r"(?:日期|时间|date|time|年|月|日|\d{4}\s*[-/.年]\s*\d{1,2})",
+    re.IGNORECASE,
+)
+CELL_IDENTIFIER_RE = re.compile(
+    r"(?:编号|号码|证号|单号|案号|合同号|文件号|fileno|file\s*no|no\.?|id)\s*[:：]?\s*[A-Za-z0-9]",
+    re.IGNORECASE,
+)
+CELL_BRACKETED_STAMP_RE = re.compile(r"^[（(].*(?:章|盖章|印章|seal|stamp).*[）)]$", re.IGNORECASE)
+CELL_FORM_LABELS = {
+    "姓名",
+    "性别",
+    "年龄",
+    "电话",
+    "手机",
+    "传真",
+    "邮箱",
+    "地址",
+    "日期",
+    "时间",
+    "单位",
+    "公司",
+    "部门",
+    "职位",
+    "职务",
+    "经办人",
+    "联系人",
+    "盖章",
+    "单位盖章",
+    "备注",
+    "说明",
+    "编号",
+    "号码",
+    "证号",
+    "案号",
+    "合同号",
+    "文件号",
+    "fileno",
+    "file no",
+    "date",
+    "tel",
+    "phone",
+    "fax",
+    "mobile",
+    "email",
+    "name",
+    "address",
+}
+CELL_KNOWN_BROKEN_WORDS = {
+    "姓名",
+    "性别",
+    "年龄",
+    "电话",
+    "手机",
+    "传真",
+    "邮箱",
+    "地址",
+    "日期",
+    "时间",
+    "单位",
+    "部门",
+    "职位",
+    "职务",
+    "经办人",
+    "联系人",
+    "盖章",
+    "单位盖章",
+    "身份证",
+    "编号",
+    "号码",
+    "证号",
+}
 
 
 @dataclass(frozen=True)
@@ -172,6 +250,7 @@ class TrackedField:
     instruction_parts: list[str] = field(default_factory=list)
     collecting_instruction: bool = True
     suppress_result: bool = False
+    href: str | None = None
 
 
 @dataclass
@@ -1271,15 +1350,80 @@ def _cell_paragraph_text(fragments: list[InlineFragment]) -> str:
     return normalize_text("".join(fragment.display_text for fragment in fragments))
 
 
-def _cell_paragraph_text_length(fragments: list[InlineFragment]) -> int:
-    return len(_cell_paragraph_text(fragments))
+def _compact_cell_line_text(text: str) -> str:
+    return "".join(normalize_text(text).split())
 
 
-def _cell_paragraph_looks_incomplete(fragments: list[InlineFragment]) -> bool:
-    text = "".join(fragment.display_text for fragment in fragments).rstrip()
+def _cell_line_ends_sentence(text: str) -> bool:
+    text = normalize_text(text).rstrip()
     if not text:
+        return True
+    return text[-1] in CELL_SENTENCE_END_CHARS
+
+
+def _cell_line_ends_with_cjk(text: str) -> bool:
+    text = normalize_text(text).rstrip()
+    return bool(text and CELL_CJK_RE.fullmatch(text[-1]))
+
+
+def _cell_line_is_short_cjk_fragment(text: str) -> bool:
+    return bool(CELL_SHORT_CJK_FRAGMENT_RE.fullmatch(_compact_cell_line_text(text)))
+
+
+def _cell_line_is_known_broken_word_join(current_text: str, next_text: str) -> bool:
+    combined = (_compact_cell_line_text(current_text) + _compact_cell_line_text(next_text)).lower()
+    return combined in CELL_KNOWN_BROKEN_WORDS
+
+
+def _cell_line_has_form_signal(text: str) -> bool:
+    normalized = normalize_text(text)
+    compact = _compact_cell_line_text(normalized)
+    compact_lower = compact.lower()
+    loose_lower = " ".join(normalized.lower().split())
+    if not compact:
         return False
-    return text[-1] not in CELL_SENTENCE_END_CHARS
+    if ":" in normalized or "：" in normalized:
+        return True
+    if compact_lower in CELL_FORM_LABELS or loose_lower in CELL_FORM_LABELS:
+        return True
+    if CELL_BRACKETED_STAMP_RE.search(normalized):
+        return True
+    if CELL_PHONE_RE.search(normalized):
+        return True
+    if CELL_IDENTIFIER_RE.search(normalized):
+        return True
+    if CELL_DATE_RE.search(normalized) and CELL_DIGIT_RE.search(normalized):
+        return True
+    return False
+
+
+def should_merge_table_cell_paragraph_texts(
+    current_text: str,
+    next_text: str,
+    *,
+    next_has_numbering: bool = False,
+    current_has_embedded_content: bool = False,
+    next_has_embedded_content: bool = False,
+) -> bool:
+    current = normalize_text(current_text)
+    next_value = normalize_text(next_text)
+    if not current or not next_value:
+        return False
+    if next_has_numbering or current_has_embedded_content or next_has_embedded_content:
+        return False
+    if _cell_line_is_known_broken_word_join(current, next_value):
+        return True
+    if _cell_line_ends_sentence(current):
+        return False
+    if _cell_line_has_form_signal(current) or _cell_line_has_form_signal(next_value):
+        return False
+    if _cell_paragraph_text_length_from_text(current) + len(next_value) > CELL_GROUP_MAX_CHARS:
+        return False
+    return _cell_line_ends_with_cjk(current) and _cell_line_is_short_cjk_fragment(next_value)
+
+
+def _cell_paragraph_text_length_from_text(text: str) -> int:
+    return len(normalize_text(text))
 
 
 def _should_merge_cell_paragraphs(
@@ -1292,18 +1436,13 @@ def _should_merge_cell_paragraphs(
         return False
     if next_paragraph.embedded_html_parts or next_paragraph.embedded_segments:
         return False
-    if next_paragraph.numbering_text:
-        return False
-    if not _cell_paragraph_looks_incomplete(current.fragments):
-        return False
-
-    next_length = _cell_paragraph_text_length(next_paragraph.fragments)
-    if next_length == 0 or next_length > CELL_NEXT_PARAGRAPH_MAX_CHARS:
-        return False
-    if next_length <= CELL_SHORT_PARAGRAPH_MAX_CHARS:
-        return True
-
-    return _cell_paragraph_text_length(current.fragments) + next_length <= CELL_GROUP_MAX_CHARS
+    return should_merge_table_cell_paragraph_texts(
+        _cell_paragraph_text(current.fragments),
+        _cell_paragraph_text(next_paragraph.fragments),
+        next_has_numbering=bool(next_paragraph.numbering_text),
+        current_has_embedded_content=bool(current.embedded_html_parts or current.embedded_segments),
+        next_has_embedded_content=bool(next_paragraph.embedded_html_parts or next_paragraph.embedded_segments),
+    )
 
 
 def _group_cell_paragraphs(
@@ -1937,6 +2076,9 @@ def _collect_inline_content(
         if _should_suppress_page_number_field(instruction, story.kind):
             parse_state.suppressed_page_number_field = True
             return [], [], []
+        field_href = _resolve_internal_reference_field_target(instruction)
+        if field_href and story.parse_options.get("preserve_hyperlinks", True):
+            hyperlink = field_href
 
     if node.tag == _qn("w", "hyperlink") and story.parse_options.get("preserve_hyperlinks", True):
         hyperlink = _resolve_hyperlink_target(node, story.rels) or hyperlink
@@ -1977,6 +2119,11 @@ def _collect_inline_content(
             _qn("w", "pict"),
         }:
             return [], [], []
+
+    if story.parse_options.get("preserve_hyperlinks", True):
+        field_href = _current_field_result_hyperlink(parse_state.field_stack)
+        if field_href:
+            hyperlink = field_href
 
     if node.tag == _qn("w", "t"):
         text_value = node.text or ""
@@ -2360,11 +2507,13 @@ def _update_field_state(
 
     current_field = parse_state.field_stack[-1]
     if field_type == "separate":
+        instruction = "".join(current_field.instruction_parts)
         current_field.collecting_instruction = False
         current_field.suppress_result = _should_suppress_page_number_field(
-            "".join(current_field.instruction_parts),
+            instruction,
             story_kind,
         )
+        current_field.href = _resolve_internal_reference_field_target(instruction)
         if current_field.suppress_result:
             parse_state.suppressed_page_number_field = True
         return
@@ -2390,6 +2539,60 @@ def _should_suppress_page_number_field(instruction: str, story_kind: str) -> boo
 
 def _is_inside_suppressed_page_number_field(field_stack: list[TrackedField]) -> bool:
     return any(field.suppress_result and not field.collecting_instruction for field in field_stack)
+
+
+def _current_field_result_hyperlink(field_stack: list[TrackedField]) -> str | None:
+    for tracked_field in reversed(field_stack):
+        if not tracked_field.collecting_instruction and tracked_field.href:
+            return tracked_field.href
+    return None
+
+
+def _resolve_internal_reference_field_target(instruction: str) -> str | None:
+    normalized = " ".join((instruction or "").replace("\u0014", " ").split())
+    if not normalized:
+        return None
+
+    field_name_match = re.match(r"[A-Za-z]+", normalized)
+    if not field_name_match:
+        return None
+
+    field_name = field_name_match.group(0).upper()
+    if field_name in INTERNAL_REFERENCE_FIELD_NAMES and _field_instruction_has_switch(normalized, "h"):
+        target = _first_field_argument(normalized[field_name_match.end() :])
+        return f"#{target}" if target else None
+
+    if field_name == "HYPERLINK":
+        target = _field_switch_argument(normalized, "l")
+        return f"#{target}" if target else None
+
+    return None
+
+
+def _field_instruction_has_switch(instruction: str, switch_name: str) -> bool:
+    return re.search(rf"(^|\s)\\{re.escape(switch_name)}(?=\s|$)", instruction, re.IGNORECASE) is not None
+
+
+def _first_field_argument(instruction_tail: str) -> str | None:
+    for token in _iter_field_instruction_tokens(instruction_tail):
+        if token.startswith("\\"):
+            continue
+        return token
+    return None
+
+
+def _field_switch_argument(instruction: str, switch_name: str) -> str | None:
+    tokens = list(_iter_field_instruction_tokens(instruction))
+    for index, token in enumerate(tokens):
+        if token.lower() == f"\\{switch_name.lower()}" and index + 1 < len(tokens):
+            target = tokens[index + 1]
+            return None if target.startswith("\\") else target
+    return None
+
+
+def _iter_field_instruction_tokens(instruction: str):
+    for match in re.finditer(r'"([^"]+)"|(\S+)', instruction or ""):
+        yield match.group(1) if match.group(1) is not None else match.group(2)
 
 
 def _is_page_number_wrapper_only(text: str, block_type: str) -> bool:

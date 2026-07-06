@@ -18,6 +18,7 @@ import {
   FileCheck,
   FileText,
   Flag,
+  Filter,
   History,
   Info,
   Italic,
@@ -28,9 +29,11 @@ import {
   Redo2,
   Save,
   Search,
+  Settings,
   ShieldCheck,
   Sigma,
   Split,
+  Space,
   SquarePen,
   Strikethrough,
   Subscript,
@@ -51,6 +54,7 @@ import NotesPanel from '../components/NotesPanel.vue'
 import Pagination from '../components/Pagination.vue'
 import PreviewPanel from '../components/PreviewPanel.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
+import RevisionSettingsDialog from '../components/RevisionSettingsDialog.vue'
 import SegmentEditorRow from '../components/SegmentEditorRow.vue'
 import SplitPreviewPanel from '../components/SplitPreviewPanel.vue'
 import TMMatchPanel from '../components/TMMatchPanel.vue'
@@ -59,7 +63,13 @@ import WorkbenchHistoryPanel from '../components/WorkbenchHistoryPanel.vue'
 import WorkbenchMatchPanel from '../components/WorkbenchMatchPanel.vue'
 import WorkbenchTermsPanel from '../components/WorkbenchTermsPanel.vue'
 import ReferencePanel from '../components/ReferencePanel.vue'
+import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { http } from '../api/http'
+import {
+  createMergeViewQAResult,
+  fetchMergeViewSegmentPosition,
+  fetchMergeViewQAResult,
+} from '../api/mergeViews'
 import { refreshGlobalNotifications } from '../utils/notifications'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
@@ -69,9 +79,16 @@ import { useWorkbenchShortcuts } from '../composables/useWorkbenchShortcuts'
 import { getTaskExportFormatLabel } from '../constants/taskFiles'
 import { llmModelOptions, llmProviderOptions, llmScopeOptions } from '../constants/llm'
 import { formatLanguagePair } from '../constants/languages'
-import { isProgressComplete } from '../utils/progress'
+import {
+  calculateOverallWorkflowProgress,
+  calculateProgressPercent,
+  isProgressComplete,
+  patchTranslationWorkflowProgress,
+} from '../utils/progress'
+import { hasTermTextMatch } from '../utils/termMatching'
 import { useAuthStore } from '../stores/auth'
 import { useCommentStore, type CommentWindowQuery } from '../stores/comment'
+import { usePreferencesStore, type WorkbenchConfirmJumpMode } from '../stores/preferences'
 import { useSegmentStore } from '../stores/segment'
 import type {
   CommentAnchorDraft,
@@ -79,30 +96,37 @@ import type {
   CommentStatus,
   GuidelineTemplateSummary,
   IssueMarker,
+  LLMMergeTarget,
   LLMProvider,
   LLMTranslateScope,
+  RevisionDisplaySettings,
   SaveToTMResult,
   Segment,
+  SegmentNextUnconfirmedPositionResponse,
   SegmentPositionResponse,
+  TMMatchCandidate,
   TMCollection,
   TermBase,
   TermEntryRecord,
-  TermQAReport,
-  TermQAReportItem,
-  TermQAReportListResponse,
+  QualityQASettingsResponse,
+  WorkbenchQAResult,
+  WorkbenchQAResultItem,
+  WorkflowProgress,
 } from '../types/api'
 import { buildDocumentPreviewHtml } from '../utils/documentPreview'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 
 const props = defineProps<{
-  id: string
+  id?: string
   standalone?: boolean
+  /** 合并视图 id：非空时进入合并模式，在同一工作台按文件分区编辑多个文件 */
+  mergeViewId?: string
 }>()
 
 type BottomToolKey = 'qa-result' | 'history' | 'source-preview' | 'target-preview' | 'split-preview'
 type BottomDrawerToolKey = Exclude<BottomToolKey, 'qa-result'>
 type SideToolKey = 'match-info' | 'terms' | 'resource-search' | 'notes' | 'reference'
-type ResourceImportTab = 'tm' | 'term'
+type ResourceImportTab = 'tm' | 'glossary' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
 type SaveToTMTargetMode = 'new' | 'existing'
 type SegmentDisplayScope = 'all' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'confirmed_only' | 'empty_target'
@@ -111,6 +135,19 @@ type ResourceSearchMode = 'exact' | 'fuzzy'
 type FileExportStatus = 'queued' | 'running' | 'completed' | 'failed'
 type WorkflowTransitionDirection = 'forward' | 'back'
 type WorkflowSourceStatus = 'none' | 'exact' | 'fuzzy' | 'confirmed'
+type SegmentScreeningGroup = 'status' | 'match' | 'source' | 'flag' | 'workflow'
+type WorkbenchSettingsTab = 'preferences' | 'shortcuts'
+type SegmentSearchReturnTarget = {
+  sentenceId: string | null
+  displayIndex: number | null
+  page: number
+}
+interface SegmentScreeningOption {
+  value: string
+  label: string
+  disabled?: boolean
+  hint?: string
+}
 interface FileExportTask {
   task_id: string
   status: FileExportStatus
@@ -118,9 +155,38 @@ interface FileExportTask {
   message?: string
   error?: string | null
 }
+interface RevisionAuthorOption {
+  id: string
+  name: string
+  username?: string | null
+}
+interface CommittedSegmentEditorContent {
+  sentenceId: string
+  text: string
+  html: string | null
+}
 type SegmentEditorRowPublic = ComponentPublicInstance & {
   undoEditorChange: () => boolean
   redoEditorChange: () => boolean
+  recordEditorUndoBoundary: (options?: {
+    inputType?: string
+    data?: string | null
+    preserveNextTargetSync?: boolean
+  }) => boolean
+  insertOrReplaceTargetText: (text: string) => boolean
+  commitEditorContent: () => CommittedSegmentEditorContent | null
+}
+type WorkbenchMatchPanelPublic = ComponentPublicInstance & {
+  applyMatchAtIndex: (index: number) => boolean
+}
+type WorkbenchShortcutItem = {
+  keys: string
+  label: string
+}
+type UpdateSegmentTargetOptions = {
+  confirm?: boolean
+  recordUndo?: boolean
+  undoInputType?: string
 }
 type SaveToTMPayload = {
   collection_mode: SaveToTMTargetMode
@@ -151,6 +217,7 @@ type ResourceSearchResponse = {
 }
 
 const REVISION_TRACE_VISIBLE_STORAGE_KEY = 'workbench.revisionTraceEnabled'
+const QA_RESULT_PAGE_SIZE = 50
 const BOTTOM_DRAWER_MIN_HEIGHT = 260
 const BOTTOM_DRAWER_TOP_GUTTER = 70
 const BOTTOM_DRAWER_KEYBOARD_STEP = 32
@@ -167,6 +234,7 @@ const router = useRouter()
 const route = useRoute()
 const authStore = useAuthStore()
 const commentStore = useCommentStore()
+const preferencesStore = usePreferencesStore()
 const segmentStore = useSegmentStore()
 const toast = useToast()
 const confirm = useConfirm()
@@ -178,6 +246,7 @@ const virtualListRef = ref<{
 } | null>(null)
 const segmentEditorResultsRef = ref<HTMLElement | null>(null)
 const segmentEditorRowRefs = new Map<string, SegmentEditorRowPublic>()
+const matchPanelRef = ref<WorkbenchMatchPanelPublic | null>(null)
 
 const bottomPanelRef = ref<HTMLElement | null>(null)
 const bottomDrawerRef = ref<HTMLElement | null>(null)
@@ -240,9 +309,9 @@ function startResize(event: MouseEvent) {
 }
 
 function resolveDefaultBottomDrawerHeight() {
-  const minHeight = props.standalone ? 380 : 360
-  const maxHeight = props.standalone ? 560 : 520
-  const preferredHeight = Math.round(viewportHeight.value * 0.5)
+  const minHeight = props.standalone ? 320 : 300
+  const maxHeight = props.standalone ? 500 : 460
+  const preferredHeight = Math.round(viewportHeight.value * 0.42)
   return clampBottomDrawerHeight(Math.min(Math.max(preferredHeight, minHeight), maxHeight))
 }
 
@@ -255,7 +324,7 @@ function setBottomDrawerHeight(height: number) {
 }
 
 function startBottomDrawerResize(event: PointerEvent) {
-  if (!isPreviewDrawerResizable.value) {
+  if (!isBottomDrawerResizable.value) {
     return
   }
 
@@ -320,6 +389,7 @@ function handleBottomDrawerResizeKeydown(event: KeyboardEvent) {
 
 const pageError = ref('')
 const llmScope = ref<LLMTranslateScope>('current_segment')
+const llmMergeTarget = ref<LLMMergeTarget>('current_file')
 const llmProvider = ref<LLMProvider>('deepseek')
 const llmModel = ref('')
 const itemHeight = ref(resolveItemHeight())
@@ -330,24 +400,44 @@ const previewPanelRendering = ref(false)
 const showImportDialog = ref(false)
 const showIssueDialog = ref(false)
 const importDialogInitialTab = ref<ResourceImportTab>('tm')
-const showShortcutHelp = ref(false)
+const showWorkbenchSettings = ref(false)
+const activeWorkbenchSettingsTab = ref<WorkbenchSettingsTab>('preferences')
 const showSaveToTMDialog = ref(false)
 const openConfirmMenu = ref(false)
 const confirmationActionLoading = ref(false)
+const confirmJumpActionLoading = ref(false)
+const confirmationRangeStart = ref('')
+const confirmationRangeEnd = ref('')
+const manualSaving = ref(false)
 const openRevisionMenu = ref<RevisionMenuKind | null>(null)
 const revisionTraceVisible = ref(getInitialRevisionTraceVisible())
 const revisionActionLoading = ref(false)
+const showRevisionSettingsDialog = ref(false)
+const revisionSettingsSaving = ref(false)
 const segmentSearchOpen = ref(false)
+const segmentScreeningPopoverOpen = ref(false)
 const sourceEditing = ref(false)
 const sourceSearchInputRef = ref<HTMLInputElement | null>(null)
+const targetSearchInputRef = ref<HTMLInputElement | null>(null)
 const guidelinesEditorRef = ref<HTMLTextAreaElement | null>(null)
 const segmentDisplayScope = ref<SegmentDisplayScope>('all')
 const sourceSearchQuery = ref('')
 const targetSearchQuery = ref('')
+const sourceExcludeQuery = ref('')
+const targetExcludeQuery = ref('')
 const replaceSearchText = ref('')
 const searchFuzzyEnabled = ref(false)
+const searchCaseSensitive = ref(false)
+const advancedSearchOpen = ref(false)
+const segmentScreeningDisplayRange = ref('my_tasks')
+const segmentScreeningNumberInput = ref('1')
+const segmentScreeningStatusFilters = ref<string[]>([])
+const segmentScreeningMatchFilters = ref<string[]>([])
+const segmentScreeningSourceFilters = ref<string[]>([])
+const segmentScreeningFlagFilters = ref<string[]>([])
+const segmentScreeningWorkflowStepIds = ref<string[]>([])
 const searchLoadingAllSegments = ref(false)
-const segmentSearchReturnTarget = ref<{ sentenceId: string; displayIndex: number | null; page: number } | null>(null)
+const segmentSearchReturnTarget = ref<SegmentSearchReturnTarget | null>(null)
 const retainedEmptyTargetSentenceIds = ref<Set<string>>(new Set())
 const tmCollections = ref<TMCollection[]>([])
 const loadingTMCollections = ref(false)
@@ -356,13 +446,19 @@ const saveToTMScope = ref<SaveToTMScope>('translated')
 const saveToTMTargetMode = ref<SaveToTMTargetMode>('new')
 const saveToTMCollectionId = ref('')
 const saveToTMNewCollectionName = ref('')
-const termQAReport = ref<TermQAReport | null>(null)
+const termQAReport = ref<WorkbenchQAResult | null>(null)
 const loadingTermQAReport = ref(false)
 const generatingTermQAReport = ref(false)
 const downloadingTermQAReport = ref(false)
 const locatingTermQAReportItemId = ref<string | null>(null)
 const updatingTermQAIgnore = ref(false)
 const selectedTermQAItemIds = ref<Set<string>>(new Set())
+const termQAReportPage = ref(1)
+const showQualityQAAdjustDialog = ref(false)
+const qualityQASettings = ref<QualityQASettingsResponse | null>(null)
+const loadingQualityQASettings = ref(false)
+const savingQualityQASettings = ref(false)
+const qualityQASettingsError = ref('')
 const showWorkflowTransitionDialog = ref(false)
 const workflowTransitionDirection = ref<WorkflowTransitionDirection>('forward')
 const workflowTransitionLoading = ref(false)
@@ -434,7 +530,7 @@ const resourceSearchTMTotal = ref(0)
 const resourceSearchTermTotal = ref(0)
 let resourceSearchRequestId = 0
 const addingTerm = ref(false)
-const showAddTermDialog = ref(false)
+const showAddTermPanel = ref(false)
 const addTermSourceText = ref('')
 const addTermTargetText = ref('')
 const addTermTargetBaseId = ref('')
@@ -445,6 +541,8 @@ const termsMessage = ref(t('workbench.terms.defaultMessage'))
 
 let searchLoadRequestId = 0
 let suppressSegmentFilterWatch = false
+let ignoreNextPaginationPageReset = false
+let pendingSegmentSearchReturnPage: number | null = null
 
 const segmentPageSizes = [100, 200, 500]
 
@@ -454,6 +552,89 @@ const llmModelSelectOptions = computed(() => [
     llmProvider.value === 'auto' || option.provider === llmProvider.value
   )),
 ])
+
+const llmMergeTargetOptions = computed(() => [
+  { value: 'current_file' as const, label: '当前文件' },
+  { value: 'merge_view' as const, label: '整个视图' },
+])
+
+const workbenchLLMScopeOptions = computed(() => (
+  llmScopeOptions.map((option) => {
+    if (!segmentStore.mergeViewId || option.value === 'current_segment') {
+      return option
+    }
+    return {
+      ...option,
+      description: `${option.description} 合并视图中可选择处理当前文件或整个视图。`,
+    }
+  })
+))
+
+watch(llmScope, (scope) => {
+  if (scope === 'current_segment') {
+    llmMergeTarget.value = 'current_file'
+  }
+})
+
+const confirmShortcutDescription = computed(() => (
+  preferencesStore.confirmJumpMode === 'next_segment'
+    ? t('workbench.shortcutItems.confirmNextSegment')
+    : t('workbench.shortcutItems.confirmNextUnconfirmed')
+))
+
+const workbenchShortcutItems = computed<WorkbenchShortcutItem[]>(() => [
+  { keys: 'Ctrl / Cmd + X', label: t('workbench.shortcutItems.cut') },
+  { keys: 'Ctrl / Cmd + C', label: t('workbench.shortcutItems.copy') },
+  { keys: 'Ctrl / Cmd + V', label: t('workbench.shortcutItems.paste') },
+  { keys: 'Ctrl / Cmd + Z', label: t('workbench.shortcutItems.undo') },
+  { keys: 'Ctrl / Cmd + Y', label: t('workbench.shortcutItems.redo') },
+  { keys: 'Ctrl / Cmd + S', label: t('workbench.shortcutItems.save') },
+  { keys: 'Enter', label: confirmShortcutDescription.value },
+  { keys: 'Ctrl / Cmd + Enter', label: t('workbench.shortcutItems.newline') },
+  { keys: 'Ctrl / Cmd + ↑ / ↓', label: t('workbench.shortcutItems.move') },
+  { keys: 'Tab', label: t('workbench.shortcutItems.toggleSourceTarget') },
+  { keys: 'Alt + F', label: t('workbench.shortcutItems.findReplace') },
+  { keys: 'Alt + ↑ / ↓', label: t('workbench.shortcutItems.searchResult') },
+  { keys: 'Alt + P / Ctrl + Shift + T', label: t('workbench.shortcutItems.runAi') },
+  { keys: 'Alt + G', label: t('workbench.shortcutItems.guidelines') },
+  { keys: 'Alt + K', label: t('workbench.shortcutItems.resourceSearch') },
+  { keys: 'Alt + T', label: t('workbench.shortcutItems.addTerm') },
+  { keys: 'Alt + N', label: t('workbench.shortcutItems.addComment') },
+  { keys: 'Alt + C', label: t('workbench.shortcutItems.copySource') },
+  { keys: 'Alt + Delete', label: t('workbench.shortcutItems.clearTarget') },
+  { keys: 'Alt + M', label: t('workbench.shortcutItems.mergeSegment') },
+  { keys: 'Alt + S', label: t('workbench.shortcutItems.splitSegment') },
+  { keys: 'Alt + E', label: t('workbench.shortcutItems.acceptRevision') },
+  { keys: 'Alt + R', label: t('workbench.shortcutItems.rejectRevision') },
+  { keys: 'Alt + Shift + T', label: t('workbench.shortcutItems.autoTagging') },
+  { keys: 'Alt + Shift + S', label: t('workbench.shortcutItems.webSearch') },
+  { keys: 'Alt + Shift + Z', label: t('workbench.shortcutItems.cancelConfirmation') },
+  { keys: 'Alt + Shift + D', label: t('workbench.shortcutItems.addToDictionary') },
+  { keys: 'Ctrl / Cmd + 1...5', label: t('workbench.shortcutItems.applyMatchResult') },
+  { keys: 'Esc', label: t('workbench.shortcutItems.closePanel') },
+  { keys: '?', label: t('workbench.shortcutItems.help') },
+])
+
+function openWorkbenchSettings(tab: WorkbenchSettingsTab = 'preferences') {
+  activeWorkbenchSettingsTab.value = tab
+  showWorkbenchSettings.value = true
+}
+
+function closeWorkbenchSettings() {
+  showWorkbenchSettings.value = false
+}
+
+function toggleWorkbenchSettings(tab: WorkbenchSettingsTab = 'preferences') {
+  if (showWorkbenchSettings.value && activeWorkbenchSettingsTab.value === tab) {
+    closeWorkbenchSettings()
+    return
+  }
+  openWorkbenchSettings(tab)
+}
+
+function setWorkbenchConfirmJumpMode(mode: WorkbenchConfirmJumpMode) {
+  preferencesStore.setConfirmJumpMode(mode)
+}
 
 watch(llmModel, (modelId) => {
   const selectedModel = llmModelOptions.find((option) => option.id === modelId)
@@ -482,7 +663,33 @@ function getCommentWindowQuery(): CommentWindowQuery | null {
     scope: segmentDisplayScope.value,
     sourceQuery: sourceSearchQuery.value,
     targetQuery: targetSearchQuery.value,
+    sourceExclude: sourceExcludeQuery.value,
+    targetExclude: targetExcludeQuery.value,
     searchFuzzy: searchFuzzyEnabled.value,
+    caseSensitive: searchCaseSensitive.value,
+    statusFilters: [...segmentScreeningStatusFilters.value, ...segmentScreeningFlagFilters.value],
+    matchFilters: [...segmentScreeningMatchFilters.value],
+    sourceFilters: [...segmentScreeningSourceFilters.value],
+    workflowStepIds: [...segmentScreeningWorkflowStepIds.value],
+  }
+}
+
+function getSegmentWindowQuery(page = segmentStore.currentPage, pageSize = segmentStore.pageSize, includeStats = true) {
+  return {
+    page,
+    pageSize,
+    scope: segmentDisplayScope.value,
+    sourceQuery: sourceSearchQuery.value,
+    targetQuery: targetSearchQuery.value,
+    sourceExclude: sourceExcludeQuery.value,
+    targetExclude: targetExcludeQuery.value,
+    searchFuzzy: searchFuzzyEnabled.value,
+    caseSensitive: searchCaseSensitive.value,
+    statusFilters: [...segmentScreeningStatusFilters.value, ...segmentScreeningFlagFilters.value],
+    matchFilters: [...segmentScreeningMatchFilters.value],
+    sourceFilters: [...segmentScreeningSourceFilters.value],
+    workflowStepIds: [...segmentScreeningWorkflowStepIds.value],
+    includeStats,
   }
 }
 
@@ -605,6 +812,10 @@ function getErrorMessage(error: unknown, fallback: string) {
 
 function normalizeTextForSaveToTM(value: string | null | undefined) {
   return (value || '').trim()
+}
+
+function isEmptyTargetForWorkbench(value: string | null | undefined) {
+  return value === null || value === undefined || value === ''
 }
 
 function buildDefaultSaveToTMCollectionName() {
@@ -788,18 +999,167 @@ const statusSummary = computed(() => {
   ]
 })
 
-const confirmableSegmentCount = computed(() => Math.max(
-  0,
-  segmentStore.totalSegmentCount - segmentStore.segmentStatusStats.confirmed,
-))
-const confirmedSegmentCount = computed(() => segmentStore.segmentStatusStats.confirmed)
-
 const currentLanguagePair = computed(() => (
   formatLanguagePair(
     segmentStore.fileRecord?.source_language ?? null,
     segmentStore.fileRecord?.target_language ?? null,
   )
 ))
+
+const activeMergeViewFile = computed(() => {
+  const activeFileId = segmentStore.activeFileRecordId
+  if (!activeFileId) {
+    return null
+  }
+  return segmentStore.mergeViewDetail?.files.find((file) => file.id === activeFileId) ?? null
+})
+
+const activeFileStatusStats = computed(() => {
+  if (!segmentStore.mergeViewId && !props.mergeViewId) {
+    return segmentStore.segmentStatusStats
+  }
+  return activeMergeViewFile.value?.status_stats ?? {
+    total: 0,
+    exact: 0,
+    fuzzy: 0,
+    none: 0,
+    confirmed: 0,
+    empty_target: 0,
+  }
+})
+
+const activeFileSegmentTotal = computed(() => (
+  (segmentStore.mergeViewId || props.mergeViewId)
+    ? (activeMergeViewFile.value?.total_segments ?? 0)
+    : segmentStore.totalSegmentCount
+))
+
+const confirmableSegmentCount = computed(() => Math.max(
+  0,
+  activeFileSegmentTotal.value - activeFileStatusStats.value.confirmed,
+))
+const confirmedSegmentCount = computed(() => activeFileStatusStats.value.confirmed)
+const mergeViewWritableFiles = computed(() => (
+  (segmentStore.mergeViewDetail?.files ?? []).filter((file) => file.can_write !== false)
+))
+const mergeViewConfirmableSegmentCount = computed(() => Math.max(
+  0,
+  mergeViewWritableFiles.value.reduce(
+    (sum, file) => sum + Math.max(0, file.total_segments - Number(file.status_stats?.confirmed || 0)),
+    0,
+  ),
+))
+const mergeViewConfirmedSegmentCount = computed(() => (
+  mergeViewWritableFiles.value.reduce(
+    (sum, file) => sum + Number(file.status_stats?.confirmed || 0),
+    0,
+  )
+))
+
+const activeWorkbenchFileId = computed(() => {
+  if (segmentStore.mergeViewId || props.mergeViewId) {
+    return segmentStore.activeFileRecordId || null
+  }
+  return segmentStore.fileRecord?.id || props.id || null
+})
+
+const activeWorkbenchFileContext = computed(() => {
+  if (segmentStore.mergeViewId || props.mergeViewId) {
+    return activeMergeViewFile.value
+  }
+  return segmentStore.fileRecord
+})
+
+const workbenchFooterProgressContext = computed(() => {
+  const total = activeFileSegmentTotal.value
+  const confirmed = activeFileStatusStats.value.confirmed
+  const liveProgress = calculateProgressPercent(confirmed, total)
+
+  if (isMergeWorkbench.value) {
+    const file = activeMergeViewFile.value
+    if (!file) {
+      return null
+    }
+    const workflowProgress = patchTranslationWorkflowProgress(
+      (file.workflow_progress || []) as WorkflowProgress[],
+      confirmed,
+      total,
+    )
+    return {
+      progress: workflowProgress.length
+        ? calculateOverallWorkflowProgress(workflowProgress, liveProgress)
+        : liveProgress,
+      status: file.status,
+      workflowProgress,
+    }
+  }
+
+  const record = segmentStore.fileRecord
+  if (!record) {
+    return null
+  }
+  const workflowProgress = patchTranslationWorkflowProgress(
+    record.workflow_progress || [],
+    confirmed,
+    total,
+  )
+  return {
+    progress: workflowProgress.length
+      ? calculateOverallWorkflowProgress(workflowProgress, liveProgress)
+      : liveProgress,
+    status: record.status,
+    workflowProgress,
+  }
+})
+
+const activeWorkbenchProjectId = computed(() => (
+  segmentStore.fileRecord?.project_id
+  || segmentStore.mergeViewDetail?.project_id
+  || projectReturnId.value
+  || null
+))
+
+const activeWorkbenchLanguagePair = computed(() => {
+  if (activeMergeViewFile.value) {
+    return formatLanguagePair(
+      activeMergeViewFile.value.source_language,
+      activeMergeViewFile.value.target_language,
+    )
+  }
+  return currentLanguagePair.value
+})
+
+function formatMergeLanguagePairSummary(pair: { source_language: string | null; target_language: string | null; file_count: number }) {
+  return `${formatLanguagePair(pair.source_language, pair.target_language)} ${pair.file_count} 个文件`
+}
+
+const mergeLanguagePairText = computed(() => {
+  const detail = segmentStore.mergeViewDetail
+  const pairs = detail?.language_pairs || []
+  if (!pairs.length) {
+    return '未设置语言对'
+  }
+  const summary = pairs.map(formatMergeLanguagePairSummary).join('；')
+  return detail?.is_mixed_language_pair ? `混合语言对：${summary}` : summary
+})
+
+const activeMergeFileContextText = computed(() => {
+  if (!segmentStore.mergeViewId) {
+    return ''
+  }
+  const file = activeMergeViewFile.value
+  if (!file) {
+    return '请先选中一个句段以确定当前文件'
+  }
+  return `当前文件：${file.filename} · ${activeWorkbenchLanguagePair.value}`
+})
+
+const activeMergeFileContextTitle = computed(() => {
+  if (!segmentStore.mergeViewId) {
+    return ''
+  }
+  return `${activeMergeFileContextText.value}。合并视图中的 AI、TM 和术语资源操作都会按当前文件隔离执行。`
+})
 
 function formatWorkbenchStatusTime(value: string | null | undefined) {
   if (!value) {
@@ -841,9 +1201,171 @@ const allActiveTermQAItemsSelected = computed(() => (
   && activeTermQAReportItems.value.every((item) => selectedTermQAItemIds.value.has(item.id))
 ))
 
+const termQAReportPageSize = QA_RESULT_PAGE_SIZE
+const termQAReportTotalPages = computed(() => (
+  Math.max(1, Math.ceil((termQAReport.value?.items.length || 0) / termQAReportPageSize))
+))
+const visibleTermQAReportItems = computed(() => {
+  const items = termQAReport.value?.items || []
+  const startIndex = (termQAReportPage.value - 1) * termQAReportPageSize
+  return items.slice(startIndex, startIndex + termQAReportPageSize)
+})
+const termQAReportPageRangeText = computed(() => {
+  const total = termQAReport.value?.items.length || 0
+  if (total === 0) {
+    return '0 / 0'
+  }
+  const start = (termQAReportPage.value - 1) * termQAReportPageSize + 1
+  const end = Math.min(start + termQAReportPageSize - 1, total)
+  return `${start}-${end} / ${total}`
+})
+
 const termQAReportCreatedAtText = computed(() => (
   formatWorkbenchStatusTime(termQAReport.value?.created_at)
 ))
+
+const termQAReportMetaText = computed(() => {
+  const report = termQAReport.value
+  if (!report) {
+    return ''
+  }
+  return [
+    `共 ${report.issue_count} 条`,
+    `检查 ${report.checked_segments} 句段`,
+    termQAReportCreatedAtText.value,
+  ].filter(Boolean).join(' · ')
+})
+
+const termQAReportSubtitle = computed(() => {
+  if (isMergeWorkbench.value) {
+    const detail = segmentStore.mergeViewDetail
+    if (!detail) {
+      return '合并视图'
+    }
+    return `${detail.name} · ${detail.total_files} 个文件`
+  }
+  return segmentStore.fileRecord?.filename || ''
+})
+
+function getTermQAFileName(item: WorkbenchQAResultItem) {
+  return (
+    segmentStore.mergeViewDetail?.files.find((file) => file.id === item.file_record_id)?.filename
+    || item.file_name
+    || '未知文件'
+  )
+}
+
+function formatTermQASegmentNumber(sentenceId: string) {
+  const match = sentenceId.match(/\d+$/)
+  if (!match) {
+    return sentenceId
+  }
+  return String(Number.parseInt(match[0], 10))
+}
+
+const qualityQARules = [
+  { key: 'target_without_tag', label: '译文无标记', defaultEnabled: true },
+  { key: 'target_tag_missing', label: '译文标记丢失', defaultEnabled: true },
+  { key: 'unmatched_closing_tag', label: '结束标记无匹配的开始标记', defaultEnabled: true },
+  { key: 'unmatched_opening_tag', label: '开始标记无匹配的结束标记', defaultEnabled: true },
+  { key: 'target_placeholder_missing', label: '译文占位符标记丢失', defaultEnabled: true },
+  { key: 'spelling_grammar', label: '译文有拼写或语法错误（查看支持的语种）', defaultEnabled: true },
+  { key: 'term_inconsistency', label: '术语不一致', defaultEnabled: false },
+  { key: 'paired_punctuation_missing', label: '成对标点符号丢失', defaultEnabled: false },
+  { key: 'ending_punctuation_mismatch', label: '原文和译文的结束标点不同', defaultEnabled: false },
+  { key: 'repeated_punctuation', label: '重复标点', defaultEnabled: false },
+  { key: 'extra_space_after_punctuation', label: '标点符号后有多余空格', defaultEnabled: false },
+  { key: 'missing_space_after_punctuation', label: '标点符号后遗漏空格', defaultEnabled: false },
+] as const
+
+type QualityQARuleKey = typeof qualityQARules[number]['key']
+type QualityQARuleDraft = Record<QualityQARuleKey, boolean>
+
+function createQualityQARuleDraft(): QualityQARuleDraft {
+  return qualityQARules.reduce((draft, rule) => {
+    draft[rule.key] = rule.defaultEnabled
+    return draft
+  }, {} as QualityQARuleDraft)
+}
+
+const qualityQADraft = reactive({
+  rules: createQualityQARuleDraft(),
+})
+
+const enabledQualityQARuleCount = computed(() => (
+  qualityQARules.filter((rule) => qualityQADraft.rules[rule.key]).length
+))
+const qualityQARuleStatusText = computed(() => {
+  if (enabledQualityQARuleCount.value === 0) {
+    return '全部关闭'
+  }
+  if (enabledQualityQARuleCount.value === qualityQARules.length) {
+    return `全部启用（${enabledQualityQARuleCount.value}/${qualityQARules.length}）`
+  }
+  return `已启用 ${enabledQualityQARuleCount.value}/${qualityQARules.length}`
+})
+const qualityQARuleStatusClass = computed(() => (
+  enabledQualityQARuleCount.value > 0 ? 'is-ok' : 'is-warn'
+))
+const spellingGrammarQAEnabled = computed(() => qualityQADraft.rules.spelling_grammar)
+const canOpenQualityQAAdjustDialog = computed(() => Boolean(activeWorkbenchProjectId.value))
+
+function syncQualityQADraftFromSettings(data: QualityQASettingsResponse) {
+  for (const rule of qualityQARules) {
+    qualityQADraft.rules[rule.key] = getSavedQualityQARuleEnabledFrom(data, rule)
+  }
+}
+
+function getSavedQualityQARuleEnabledFrom(data: QualityQASettingsResponse, rule: typeof qualityQARules[number]) {
+  const ruleSetting = data.settings.rules?.[rule.key]
+  if (typeof ruleSetting?.enabled === 'boolean') {
+    return ruleSetting.enabled
+  }
+  if (rule.key === 'spelling_grammar') {
+    return Boolean(data.settings.spelling_grammar.enabled)
+  }
+  return rule.defaultEnabled
+}
+
+function buildQualityQARulesPayload() {
+  return qualityQARules.reduce((payload, rule) => {
+    payload[rule.key] = {
+      enabled: qualityQADraft.rules[rule.key],
+    }
+    return payload
+  }, {} as Record<QualityQARuleKey, { enabled: boolean }>)
+}
+
+function setAllQualityQARules(checked: boolean) {
+  for (const rule of qualityQARules) {
+    qualityQADraft.rules[rule.key] = checked
+  }
+}
+
+function normalizeTermQAReportForCurrentWorkbench(report: WorkbenchQAResult | null) {
+  if (!report || !isMergeWorkbench.value) {
+    return report
+  }
+  const fileOrder = new Map(
+    (segmentStore.mergeViewDetail?.files ?? []).map((file, index) => [file.id, index]),
+  )
+  return {
+    ...report,
+    items: [...report.items].sort((left, right) => {
+      const leftFileOrder = fileOrder.get(left.file_record_id) ?? Number.MAX_SAFE_INTEGER
+      const rightFileOrder = fileOrder.get(right.file_record_id) ?? Number.MAX_SAFE_INTEGER
+      if (leftFileOrder !== rightFileOrder) return leftFileOrder - rightFileOrder
+      if (left.block_index !== right.block_index) return left.block_index - right.block_index
+      const leftRow = left.row_index ?? -1
+      const rightRow = right.row_index ?? -1
+      if (leftRow !== rightRow) return leftRow - rightRow
+      const leftCell = left.cell_index ?? -1
+      const rightCell = right.cell_index ?? -1
+      if (leftCell !== rightCell) return leftCell - rightCell
+      return left.sentence_id.localeCompare(right.sentence_id, undefined, { numeric: true })
+    }),
+  }
+}
 
 const lastModifiedStatusText = computed(() => {
   const modifiedAt = (
@@ -862,11 +1384,141 @@ const ribbonStatusTitle = computed(() => (
 ))
 
 const activeSegment = computed(() => (
-  segmentStore.segments.find((segment) => segment.sentence_id === segmentStore.activeSentenceId) ?? null
+  segmentStore.segments.find((segment) => segmentStore.segmentKeyOf(segment) === segmentStore.activeSentenceId) ?? null
 ))
+/** 句段对外标识：合并模式为复合键，单文件即 sentence_id */
+function segmentKeyOf(segment: { sentence_id: string; file_record_id?: string }) {
+  return segmentStore.segmentKeyOf(segment as any)
+}
+function resolveCommentSentenceKey(sentenceId: string | null | undefined, fileRecordId?: string | null) {
+  if (!sentenceId) {
+    return null
+  }
+  if (!segmentStore.mergeViewId) {
+    return sentenceId
+  }
+  const segment = segmentStore.segments.find((item) => (
+    item.sentence_id === sentenceId
+    && (!fileRecordId || item.file_record_id === fileRecordId)
+  ))
+  return segment ? segmentKeyOf(segment) : sentenceId
+}
+function buildActiveSegmentCommentDraft(): CommentAnchorDraft | null {
+  const segment = activeSegment.value
+  const sentenceId = segment?.sentence_id || segmentStore.activeSentenceId
+  if (!sentenceId) {
+    return null
+  }
+  const normalizedSentenceId = segment?.sentence_id
+    || (segmentStore.mergeViewId && sentenceId.includes(':')
+      ? sentenceId.slice(sentenceId.indexOf(':') + 1)
+      : sentenceId)
+  return {
+    sentence_id: normalizedSentenceId,
+    anchor_mode: 'sentence',
+    range_start_offset: null,
+    range_end_offset: null,
+    anchor_text: null,
+  }
+}
+function isSameCommentDraft(left: CommentAnchorDraft | null, right: CommentAnchorDraft) {
+  return Boolean(
+    left
+    && left.sentence_id === right.sentence_id
+    && left.anchor_mode === right.anchor_mode
+    && left.range_start_offset === right.range_start_offset
+    && left.range_end_offset === right.range_end_offset
+    && left.anchor_text === right.anchor_text,
+  )
+}
+/** VirtualList item-key 解析器：合并模式按复合键，单文件按 sentence_id */
+function segmentItemKey(item: any) {
+  return segmentStore.segmentKeyOf(item)
+}
+function shouldShowMergeGroupHeader(segment: Segment, index: number) {
+  if (!isMergeWorkbench.value || !segment.file_record_id) {
+    return false
+  }
+  const previous = editorSegments.value[index - 1]
+  return !previous || previous.file_record_id !== segment.file_record_id
+}
+function getMergeGroupFile(segment: Segment) {
+  const fileId = segment.file_record_id || ''
+  return segmentStore.mergeViewDetail?.files.find((file) => file.id === fileId) ?? null
+}
+function getMergeGroupProgressText(segment: Segment) {
+  const file = getMergeGroupFile(segment)
+  if (!file) {
+    return ''
+  }
+  return `${formatLanguagePair(file.source_language, file.target_language)} · ${file.progress}% · ${file.total_segments} 句段`
+}
 const activeSegmentCanWrite = computed(() => Boolean(activeSegment.value?.can_write))
 const workflowSteps = computed(() => segmentStore.fileRecord?.workflow_steps || [])
 const workflowStepById = computed(() => new Map(workflowSteps.value.map((step) => [step.id, step])))
+const segmentScreeningDisplayRangeOptions: SegmentScreeningOption[] = [
+  { value: 'my_tasks', label: '我的任务' },
+]
+const segmentScreeningStatusOptions: SegmentScreeningOption[] = [
+  { value: 'empty_target', label: '空译文' },
+  { value: 'confirmed', label: '已确认' },
+  { value: 'unconfirmed', label: '未确认' },
+  { value: 'delivered', label: '已交付', disabled: true, hint: '暂无已交付字段，后续接入。' },
+]
+const segmentScreeningMatchOptions: SegmentScreeningOption[] = [
+  { value: 'context_102', label: '102%匹配', disabled: true, hint: '暂无上下文匹配字段，先占位。' },
+  { value: 'context_101', label: '101%匹配', disabled: true, hint: '暂无上下文匹配字段，先占位。' },
+  { value: 'exact', label: '100%匹配' },
+  { value: 'fuzzy', label: '模糊匹配' },
+  { value: 'none', label: '无匹配' },
+  { value: 'machine_translation', label: '机器翻译' },
+  { value: 'post_edit', label: '自动译后编辑', disabled: true, hint: '暂无自动译后编辑状态字段，先占位。' },
+  { value: 'non_translatable', label: '自动填充的非译元素', disabled: true, hint: '暂无非译元素字段，先占位。' },
+  { value: 'tm_replace', label: '自动替换（记忆库）', disabled: true, hint: '暂无自动替换来源字段，先占位。' },
+]
+const segmentScreeningSourceContentOptions: SegmentScreeningOption[] = [
+  { value: 'repeat_first', label: '重复首句', disabled: true },
+  { value: 'internal_repeat', label: '内部重复', disabled: true },
+  { value: 'cross_file_repeat', label: '跨文件重复', disabled: true },
+  { value: 'not_repeat', label: '不重复', disabled: true },
+  { value: 'term_not_sync', label: '标记为不同步', disabled: true },
+]
+const segmentScreeningModifyOptions: SegmentScreeningOption[] = [
+  { value: 'modified', label: '已修改', disabled: true },
+  { value: 'unmodified', label: '未修改', disabled: true },
+]
+const segmentScreeningFlagOptions: SegmentScreeningOption[] = [
+  { value: 'note', label: '带备注', disabled: true },
+  { value: 'qa', label: '带 QA 提醒' },
+  { value: 'language_error', label: '带语言错误类型', disabled: true },
+  { value: 'limited_repair', label: '带限修修订', disabled: true },
+  { value: 'unadded_language_error', label: '未添加语言错误类型', disabled: true },
+  { value: 'marked', label: '带标记', disabled: true },
+]
+const segmentScreeningWorkflowOptions = computed(() => (
+  workflowSteps.value.map((step) => ({ value: step.id, label: step.name }))
+))
+const segmentScreeningQueryKey = computed(() => JSON.stringify({
+  status: segmentScreeningStatusFilters.value,
+  match: segmentScreeningMatchFilters.value,
+  source: segmentScreeningSourceFilters.value,
+  flag: segmentScreeningFlagFilters.value,
+  workflow: segmentScreeningWorkflowStepIds.value,
+}))
+const hasSegmentScreeningFilters = computed(() => (
+  segmentScreeningStatusFilters.value.length > 0
+  || segmentScreeningMatchFilters.value.length > 0
+  || segmentScreeningSourceFilters.value.length > 0
+  || segmentScreeningFlagFilters.value.length > 0
+  || segmentScreeningWorkflowStepIds.value.length > 0
+))
+const segmentScreeningActiveCount = computed(() => (
+  segmentScreeningStatusFilters.value.length
+  + segmentScreeningMatchFilters.value.length
+  + segmentScreeningSourceFilters.value.length
+  + segmentScreeningFlagFilters.value.length
+  + segmentScreeningWorkflowStepIds.value.length
+))
 const workflowTargetSteps = computed(() => {
   const sourceStep = workflowStepById.value.get(workflowTransitionForm.from_step_id)
   if (!sourceStep) return []
@@ -920,30 +1572,151 @@ const activeSegmentHistory = computed(() => (
     : []
 ))
 
+const revisionSettingsAuthors = computed<RevisionAuthorOption[]>(() => {
+  const authors = new Map<string, RevisionAuthorOption>()
+  const addAuthor = (user: { id?: string; username?: string | null; nickname?: string | null } | null | undefined) => {
+    if (!user?.id || authors.has(user.id)) {
+      return
+    }
+    authors.set(user.id, {
+      id: user.id,
+      name: user.nickname || user.username || user.id,
+      username: user.username || null,
+    })
+  }
+
+  addAuthor(authStore.user)
+  Object.values(segmentStore.revisionHistory).forEach((entries) => {
+    entries.forEach((entry) => addAuthor(entry.author))
+  })
+  return Array.from(authors.values())
+})
+
 const activePendingRevision = computed(() => (
   revisionTraceVisible.value && segmentStore.activeSentenceId
     ? segmentStore.getRevisionTrace(segmentStore.activeSentenceId)
     : null
 ))
 
+function resolveRevisionNavigationTarget(direction: 'prev' | 'next') {
+  const revisionItems = editorSegments.value
+    .map((segment, index) => ({
+      key: segmentKeyOf(segment),
+      index,
+    }))
+    .filter((item) => Boolean(segmentStore.getRevisionTrace(item.key)))
+
+  if (!revisionItems.length) {
+    return null
+  }
+
+  const activeIndex = editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === segmentStore.activeSentenceId)
+  const anchorIndex = activeIndex === -1
+    ? (direction === 'next' ? -1 : editorSegments.value.length)
+    : activeIndex
+
+  if (direction === 'next') {
+    return revisionItems.find((item) => item.index > anchorIndex)?.key || null
+  }
+  return revisionItems.slice().reverse().find((item) => item.index < anchorIndex)?.key || null
+}
+
+const canGoPrevRevision = computed(() => Boolean(resolveRevisionNavigationTarget('prev')))
+const canGoNextRevision = computed(() => Boolean(resolveRevisionNavigationTarget('next')))
+
 const activeSegmentSourceText = computed(() => activeSegment.value?.source_text || '')
+
+const activeTermQAItemsForSegment = computed(() => {
+  const segment = activeSegment.value
+  if (!segment) return []
+
+  const fileRecordId = segment.file_record_id || activeWorkbenchFileId.value || segmentStore.fileRecord?.id || ''
+  return activeTermQAReportItems.value.filter((item) => (
+    item.source_kind === 'term_qa_report_item'
+    && item.rule_key === 'term_inconsistency'
+    && item.sentence_id === segment.sentence_id
+    && (!fileRecordId || item.file_record_id === fileRecordId)
+    && Boolean(item.source_term)
+    && Boolean(item.expected_target_term)
+  ))
+})
+
+const activeTermMatches = computed(() => {
+  const segment = activeSegment.value
+  return segment ? segmentStore.getTermMatches(segmentKeyOf(segment)) : []
+})
 
 // 计算当前激活段落匹配的术语（用于原文高亮）
 const activeMatchedTerms = computed(() => {
-  if (!activeSegmentSourceText.value || termEntries.value.length === 0) return []
-  const sourceText = activeSegmentSourceText.value.toLowerCase()
-  return termEntries.value
-    .filter((entry) => sourceText.includes(entry.source_text.toLowerCase()))
+  const terms: TermEntryRecord[] = []
+  const seen = new Set<string>()
+
+  for (const match of activeTermMatches.value) {
+    const sourceText = match.source_text.trim()
+    const targetText = match.target_text.trim()
+    if (!sourceText || !targetText) continue
+    const key = `${sourceText}\u0000${targetText}`.toLocaleLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    terms.push({
+      id: match.term_id,
+      term_base_id: match.term_base_id || '',
+      source_text: sourceText,
+      target_text: targetText,
+      source_language: segmentStore.fileRecord?.source_language || '',
+      target_language: segmentStore.fileRecord?.target_language || '',
+      creator_name: null,
+      created_at: '',
+      updated_at: '',
+    })
+  }
+
+  if (activeSegmentSourceText.value && termEntries.value.length > 0) {
+    for (const entry of termEntries.value) {
+      if (!hasTermTextMatch(activeSegmentSourceText.value, entry.source_text)) continue
+      const key = `${entry.source_text}\u0000${entry.target_text}`.toLocaleLowerCase()
+      if (seen.has(key)) continue
+      seen.add(key)
+      terms.push(entry)
+    }
+  }
+
+  for (const item of activeTermQAItemsForSegment.value) {
+    const sourceText = item.source_term.trim()
+    const targetText = item.expected_target_term.trim()
+    if (!sourceText || !targetText) continue
+    const key = `${sourceText}\u0000${targetText}`.toLocaleLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    terms.push({
+      id: item.id,
+      term_base_id: '',
+      source_text: sourceText,
+      target_text: targetText,
+      source_language: '',
+      target_language: '',
+      creator_name: null,
+      created_at: item.created_at || '',
+      updated_at: item.created_at || '',
+    })
+  }
+
+  return terms
     .slice()
     .sort((left, right) => right.source_text.length - left.source_text.length)
 })
 
-function normalizeSearchText(value: string) {
-  return value.replace(/\s+/g, ' ').trim().toLocaleLowerCase()
+function resolveLiteralSearchKeyword(value: string) {
+  return value
 }
 
-function normalizeFuzzySearchText(value: string) {
-  return normalizeSearchText(value).replace(/[\s.,，。;；:：'"“”‘’!?！？()[\]{}<>《》、\\/|_-]+/g, '')
+function normalizeSearchText(value: string, caseSensitive = searchCaseSensitive.value) {
+  const keyword = resolveLiteralSearchKeyword(value)
+  return caseSensitive ? keyword : keyword.toLocaleLowerCase()
+}
+
+function normalizeFuzzySearchText(value: string, caseSensitive = searchCaseSensitive.value) {
+  return normalizeSearchText(value, caseSensitive).replace(/[\s.,，。;；:：'"“”‘’!?！？()[\]{}<>《》、\\/|_-]+/g, '')
 }
 
 function buildSourceSearchableText(segment: Segment) {
@@ -965,7 +1738,7 @@ function isSubsequenceMatch(value: string, keyword: string) {
   const normalizedValue = normalizeFuzzySearchText(value)
   const normalizedKeyword = normalizeFuzzySearchText(keyword)
   if (!normalizedKeyword) {
-    return true
+    return !resolveLiteralSearchKeyword(keyword)
   }
 
   let cursor = 0
@@ -991,24 +1764,39 @@ function matchesSearchKeyword(value: string, keyword: string) {
 
 const normalizedSourceSearchQuery = computed(() => normalizeSearchText(sourceSearchQuery.value))
 const normalizedTargetSearchQuery = computed(() => normalizeSearchText(targetSearchQuery.value))
+const normalizedSourceExcludeQuery = computed(() => normalizeSearchText(sourceExcludeQuery.value))
+const normalizedTargetExcludeQuery = computed(() => normalizeSearchText(targetExcludeQuery.value))
+const hasAdvancedSegmentSearch = computed(() => Boolean(
+  normalizedSourceExcludeQuery.value || normalizedTargetExcludeQuery.value,
+))
 
 const hasSegmentSearch = computed(() => (
-  Boolean(normalizedSourceSearchQuery.value || normalizedTargetSearchQuery.value)
+  Boolean(
+    normalizedSourceSearchQuery.value
+    || normalizedTargetSearchQuery.value
+    || normalizedSourceExcludeQuery.value
+    || normalizedTargetExcludeQuery.value
+  )
 ))
 
 const hasSegmentDisplayScope = computed(() => segmentDisplayScope.value !== 'all')
-const hasEditorSegmentFilter = computed(() => hasSegmentSearch.value || hasSegmentDisplayScope.value)
+const hasEditorSegmentFilter = computed(() => (
+  hasSegmentSearch.value
+  || hasSegmentDisplayScope.value
+  || hasSegmentScreeningFilters.value
+))
 
 function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function buildTargetReplaceRegExp(global = false) {
-  const keyword = targetSearchQuery.value.trim()
+  const keyword = resolveLiteralSearchKeyword(targetSearchQuery.value)
   if (!keyword) {
     return null
   }
-  return new RegExp(escapeRegExp(keyword), global ? 'gi' : 'i')
+  const flags = `${global ? 'g' : ''}${searchCaseSensitive.value ? '' : 'i'}`
+  return new RegExp(escapeRegExp(keyword), flags)
 }
 
 function countTargetReplaceOccurrences(segment: Segment) {
@@ -1042,7 +1830,7 @@ function matchesSegmentDisplayScope(segment: Segment) {
     return segment.status === 'confirmed'
   }
   if (segmentDisplayScope.value === 'empty_target') {
-    return !normalizeTextForSaveToTM(segment.target_text)
+    return isEmptyTargetForWorkbench(segment.target_text)
       || retainedEmptyTargetSentenceIds.value.has(segment.sentence_id)
   }
   return true
@@ -1058,7 +1846,7 @@ const activeEditorIndex = computed(() => {
   if (!segmentStore.activeSentenceId) {
     return -1
   }
-  return editorSegments.value.findIndex((segment) => segment.sentence_id === segmentStore.activeSentenceId)
+  return editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === segmentStore.activeSentenceId)
 })
 
 const segmentOrdinalMap = computed(() => {
@@ -1068,7 +1856,7 @@ const segmentOrdinalMap = computed(() => {
     const displayIndex = typeof segment.display_index === 'number' && Number.isFinite(segment.display_index)
       ? segment.display_index
       : startIndex + index
-    nextMap.set(segment.sentence_id, displayIndex)
+    nextMap.set(segmentKeyOf(segment), displayIndex)
   })
   return nextMap
 })
@@ -1152,20 +1940,49 @@ const saveToTMPreviewStats = computed(() => {
 })
 
 const taskTMCollectionId = computed(() => segmentStore.fileRecord?.collection_id || '')
-const canOpenIssueDialog = computed(() => Boolean(segmentStore.fileRecord?.project_id))
+const canOpenIssueDialog = computed(() => Boolean(activeWorkbenchProjectId.value && activeWorkbenchFileId.value))
+const canOpenSaveToTMDialog = computed(() => Boolean(segmentStore.fileRecord) && !isMergeWorkbench.value)
+const saveToTMButtonTitle = computed(() => (
+  isMergeWorkbench.value
+    ? '合并视图暂不支持保存到 TM；请切到单文件工作台，或后续按语言对分批执行。'
+    : t('workbench.saveToTM')
+))
+const canRunTermQAReport = computed(() => {
+  if (generatingTermQAReport.value) {
+    return false
+  }
+  if (isMergeWorkbench.value) {
+    return Boolean((segmentStore.mergeViewId || props.mergeViewId) && segmentStore.mergeViewDetail?.files.length)
+  }
+  return Boolean(segmentStore.fileRecord)
+})
+const termQAButtonTitle = computed(() => (
+  isMergeWorkbench.value
+    ? '按当前合并视图文件组合生成 QA 结果。'
+    : '按项目质量设置生成 QA 结果。'
+))
 
 const boundTermBaseIds = computed(() => {
+  if (segmentStore.mergeViewId) {
+    return []
+  }
   const fileRecord = segmentStore.fileRecord
   if (!fileRecord) {
     return []
   }
-  if (fileRecord.term_base_ids?.length) {
-    return fileRecord.term_base_ids
-  }
-  return fileRecord.term_base_id ? [fileRecord.term_base_id] : []
+  return Array.from(new Set([
+    ...(fileRecord.term_base_ids || []),
+    ...(fileRecord.term_base_id ? [fileRecord.term_base_id] : []),
+    ...(fileRecord.qa_term_base_ids || []),
+  ].filter(Boolean)))
 })
 
 const boundResourceSummary = computed(() => {
+  if (segmentStore.mergeViewId) {
+    return activeMergeViewFile.value
+      ? `${activeMergeFileContextText.value}；仅搜索该文件绑定的资源库`
+      : '请选择一个句段后再搜索当前文件绑定的资源库'
+  }
   const collectionCount = segmentStore.fileRecord?.collection_ids?.length || (segmentStore.fileRecord?.collection_id ? 1 : 0)
   const termBaseCount = boundTermBaseIds.value.length
   return `已绑定 ${collectionCount} 个记忆库、${termBaseCount} 个术语库`
@@ -1174,12 +1991,13 @@ const boundResourceSummary = computed(() => {
 const addTermTargetTermBases = computed(() => {
   const boundIds = new Set(boundTermBaseIds.value)
   const writableIds = segmentStore.fileRecord?.term_base_write_ids || []
-  const targetIds = writableIds.length > 0
-    ? writableIds.filter((id) => boundIds.has(id))
-    : boundTermBaseIds.value
-  const allowedIds = new Set(targetIds)
+  const allowedIds = new Set(writableIds.filter((id) => boundIds.has(id)))
   return termBases.value.filter((termBase) => allowedIds.has(termBase.id))
 })
+
+const singleAddTermTargetBase = computed(() => (
+  addTermTargetTermBases.value.length === 1 ? addTermTargetTermBases.value[0] : null
+))
 
 const addTermCanSubmit = computed(() => Boolean(
   addTermSourceText.value.trim()
@@ -1243,11 +2061,7 @@ function isPreviewBottomTool(tool: BottomDrawerToolKey) {
   return tool === 'source-preview' || tool === 'target-preview' || tool === 'split-preview'
 }
 
-const isPreviewDrawerResizable = computed(() =>
-  activeBottomTool.value === 'source-preview'
-  || activeBottomTool.value === 'target-preview'
-  || activeBottomTool.value === 'split-preview',
-)
+const isBottomDrawerResizable = computed(() => activeBottomTool.value !== null)
 
 function isBottomToolLoading(tool: BottomDrawerToolKey) {
   if (tool === 'source-preview') {
@@ -1310,15 +2124,32 @@ const sideToolButtons = computed(() => ([
   { key: 'reference' as const, label: '参考文件', icon: FileText, tone: 'reference' },
 ]))
 
-usePageHeader(() => ({
-  title: segmentStore.fileRecord?.filename || t('workbench.titleFallback'),
-  description: segmentStore.fileRecord
+const isMergeWorkbench = computed(() => Boolean(segmentStore.mergeViewId || props.mergeViewId))
+const workbenchHeaderTitle = computed(() => (
+  isMergeWorkbench.value
+    ? (segmentStore.mergeViewDetail?.name || '合并视图')
+    : (segmentStore.fileRecord?.filename || t('workbench.titleFallback'))
+))
+const workbenchHeaderDescription = computed(() => {
+  if (isMergeWorkbench.value) {
+    const detail = segmentStore.mergeViewDetail
+    if (!detail) {
+      return '正在加载合并视图'
+    }
+    return `${detail.total_files} 个文件 · ${segmentStore.loadedSegmentCount}/${detail.total_segments} 个句段 · ${mergeLanguagePairText.value}`
+  }
+  return segmentStore.fileRecord
     ? t('workbench.overviewDescription', {
         pair: currentLanguagePair.value,
         loaded: segmentStore.loadedSegmentCount,
         total: segmentStore.totalSegmentCount,
       })
-    : t('workbench.description'),
+    : t('workbench.description')
+})
+
+usePageHeader(() => ({
+  title: workbenchHeaderTitle.value,
+  description: workbenchHeaderDescription.value,
   breadcrumbs: hasProjectReturnContext.value
     ? [
         {
@@ -1333,11 +2164,11 @@ usePageHeader(() => ({
             ...(projectReturnParent.value ? { query: { from: projectReturnParent.value } } : {}),
           },
         },
-        { label: segmentStore.fileRecord?.filename || t('workbench.titleFallback') },
+        { label: workbenchHeaderTitle.value },
       ]
     : [
         { label: t('shell.sections.tasks'), to: { name: 'tasks' } },
-        { label: segmentStore.fileRecord?.filename || t('workbench.titleFallback') },
+        { label: workbenchHeaderTitle.value },
       ],
 }))
 
@@ -1346,9 +2177,30 @@ useWorkbenchShortcuts({
   runAI: () => { void runLLMTranslation() },
   focusPrev: () => { void focusSentenceByOffset(-1) },
   focusNext: () => { void focusSentenceByOffset(1) },
-  confirmCurrent: () => { confirmCurrentSentence() },
+  focusPrevSearchResult: () => { void focusSearchResultByOffset(-1) },
+  focusNextSearchResult: () => { void focusSearchResultByOffset(1) },
+  confirmSegment: () => { void confirmAndMoveToNextUnconfirmed() },
+  undo: () => { undoActiveSegmentEdit() },
+  redo: () => { redoActiveSegmentEdit() },
   closePanel: () => { void closeActiveWorkbenchPanel() },
-  toggleHelp: () => { showShortcutHelp.value = !showShortcutHelp.value },
+  toggleHelp: () => { toggleWorkbenchSettings('shortcuts') },
+  toggleSearch: () => { void toggleSegmentSearchPanel() },
+  openGuidelines: () => { void toggleGuidelinesPanel() },
+  openResourceSearch: () => { void openSideTool('resource-search') },
+  openAddTerm: () => { void openAddTermPanel() },
+  openComment: () => { void openActiveSegmentCommentDraft() },
+  copySourceToTarget: () => { copySourceToTarget() },
+  clearTarget: () => { clearActiveTarget() },
+  mergeSegment: () => { void handleMergeSegment() },
+  splitSegment: () => { void handleSplitSegment() },
+  acceptRevision: () => { void handleAcceptActiveRevision() },
+  rejectRevision: () => { void handleRejectActiveRevision() },
+  cancelSegmentConfirmation: () => { cancelActiveSegmentConfirmation() },
+  autoTagging: () => { showRibbonPlaceholder(t('workbench.ribbon.autoTagging')) },
+  webSearch: () => { showRibbonPlaceholder(t('workbench.shortcutItems.webSearch')) },
+  addToDictionary: () => { showRibbonPlaceholder(t('workbench.shortcutItems.addToDictionary')) },
+  applyMatchResult: (index) => { void applyMatchResultByIndex(index) },
+  toggleSourceTarget: () => { void toggleActiveSourceTargetEditor() },
 })
 
 function getTermBaseStorageKey() {
@@ -1359,6 +2211,15 @@ async function loadTermBases() {
   loadingTermBases.value = true
   termsMessage.value = t('workbench.terms.loadingBases')
   try {
+    if (segmentStore.mergeViewId) {
+      termBases.value = []
+      termEntries.value = []
+      selectedTermBaseId.value = ''
+      termsMessage.value = activeMergeViewFile.value
+        ? '合并视图已按当前文件隔离资源上下文；术语库浏览暂不跨文件加载，请使用“资源库搜索”查看当前文件绑定资源。'
+        : '请先选中一个句段以确定当前文件上下文。'
+      return
+    }
     const { data } = await http.get<TermBase[]>('/term-bases')
     const filtered = data.filter((termBase) => (
       termBase.source_language === segmentStore.fileRecord?.source_language
@@ -1413,17 +2274,75 @@ function resetResourceSearchResults(message = '请输入关键词，搜索当前
   resourceSearchMessage.value = message
 }
 
-async function runResourceSearch() {
-  const keyword = resourceSearchQuery.value.trim()
+function normalizeResourceSearchKeyword(value: string) {
+  return value.replace(/\s+/g, ' ').trim()
+}
+
+function escapeResourceSearchHtml(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+function getResourceSearchHighlightKeywords() {
+  const keyword = normalizeResourceSearchKeyword(resourceSearchQuery.value)
   if (!keyword) {
-    resetResourceSearchResults()
+    return []
+  }
+  const values = resourceSearchMode.value === 'fuzzy'
+    ? keyword.split(/\s+/).filter(Boolean)
+    : [keyword]
+  return Array.from(new Set(values.map((item) => item.toLocaleLowerCase())))
+    .sort((left, right) => right.length - left.length)
+}
+
+function renderResourceSearchResultText(value: string | null | undefined) {
+  const text = value || ''
+  const keywords = getResourceSearchHighlightKeywords()
+  if (!text || keywords.length === 0) {
+    return escapeResourceSearchHtml(text)
+  }
+
+  const regexp = new RegExp(keywords.map(escapeRegExp).join('|'), 'gi')
+  let cursor = 0
+  let rendered = ''
+  for (const match of text.matchAll(regexp)) {
+    const start = match.index ?? 0
+    const matchedText = match[0]
+    if (!matchedText) {
+      continue
+    }
+    rendered += escapeResourceSearchHtml(text.slice(cursor, start))
+    rendered += `<mark class="resource-search-panel__highlight">${escapeResourceSearchHtml(matchedText)}</mark>`
+    cursor = start + matchedText.length
+  }
+  rendered += escapeResourceSearchHtml(text.slice(cursor))
+  return rendered
+}
+
+async function runResourceSearch() {
+  const keyword = normalizeResourceSearchKeyword(resourceSearchQuery.value)
+  if (!keyword) {
+    resetResourceSearchResults(
+      segmentStore.mergeViewId
+        ? '请输入关键词，搜索当前激活文件绑定的记忆库和术语库。'
+        : undefined,
+    )
     return
   }
 
-  const fileRecordId = segmentStore.fileRecord?.id || props.id
+  const fileRecordId = activeWorkbenchFileId.value
+  if (!fileRecordId) {
+    resetResourceSearchResults('请先选中一个句段后再搜索当前文件绑定的资源库。')
+    return
+  }
   const requestId = ++resourceSearchRequestId
   resourceSearchLoading.value = true
-  resourceSearchMessage.value = '正在搜索绑定的资源库...'
+  resourceSearchMessage.value = segmentStore.mergeViewId
+    ? '正在搜索当前文件绑定的资源库...'
+    : '正在搜索绑定的资源库...'
   try {
     const { data } = await http.get<ResourceSearchResponse>(`/file-records/${fileRecordId}/resource-search`, {
       params: {
@@ -1454,7 +2373,7 @@ async function runResourceSearch() {
 }
 
 function prepareResourceSearchQuery() {
-  if (!resourceSearchQuery.value.trim() && activeSegmentSourceText.value.trim()) {
+  if (!normalizeResourceSearchKeyword(resourceSearchQuery.value) && activeSegmentSourceText.value.trim()) {
     resourceSearchQuery.value = activeSegmentSourceText.value.trim()
   }
 }
@@ -1577,16 +2496,84 @@ async function openBottomTool(tool: BottomDrawerToolKey) {
   }
 }
 
+async function openActiveSegmentCommentDraft() {
+  const draft = buildActiveSegmentCommentDraft()
+  if (!draft) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+
+  if (!isSameCommentDraft(commentStore.draftAnchor, draft)) {
+    commentStore.setDraftAnchor(draft)
+  }
+  commentStore.setActiveComment(null)
+  activeSideTool.value = 'notes'
+
+  if (segmentStore.activeSentenceId) {
+    await handlePreviewFocus(segmentStore.activeSentenceId)
+  }
+
+  await nextTick()
+  document
+    .querySelector<HTMLTextAreaElement>('.notes-panel--drawer .notes-panel__composer .notes-panel__textarea')
+    ?.focus()
+}
+
+function syncActiveSegmentCommentDraft() {
+  if (
+    activeSideTool.value !== 'notes'
+    || commentStore.draftAnchor?.anchor_mode !== 'sentence'
+  ) {
+    return
+  }
+
+  const draft = buildActiveSegmentCommentDraft()
+  if (!draft || isSameCommentDraft(commentStore.draftAnchor, draft)) {
+    return
+  }
+
+  commentStore.setDraftAnchor(draft)
+  commentStore.setActiveComment(null)
+}
+
+async function ensureMatchInfoTermContext() {
+  if (termBases.value.length === 0 && !loadingTermBases.value) {
+    await loadTermBases()
+  }
+  if (!selectedTermBaseId.value && termBases.value.length > 0) {
+    selectedTermBaseId.value = termBases.value[0].id
+  }
+  if (selectedTermBaseId.value && termEntries.value.length === 0 && !loadingTermEntries.value) {
+    await loadTermEntries()
+  }
+  await segmentStore.refreshActiveTermMatches()
+  if (!termQAReport.value && !loadingTermQAReport.value && !generatingTermQAReport.value) {
+    await loadLatestTermQAReport()
+  }
+}
+
 async function openSideTool(tool: SideToolKey) {
+  if (tool === 'notes') {
+    pageError.value = ''
+    sidecarWidth.value = null
+    activeSideTool.value = 'notes'
+    await openActiveSegmentCommentDraft()
+    return
+  }
+
   if (activeSideTool.value === tool) {
     activeSideTool.value = null
     sidecarWidth.value = null
+    showAddTermPanel.value = false
     return
   }
 
   pageError.value = ''
   activeSideTool.value = tool
   sidecarWidth.value = null
+  if (tool !== 'terms') {
+    showAddTermPanel.value = false
+  }
 
   try {
     if (tool === 'terms' && termBases.value.length === 0 && !loadingTermBases.value) {
@@ -1595,22 +2582,13 @@ async function openSideTool(tool: SideToolKey) {
 
     if (tool === 'resource-search') {
       prepareResourceSearchQuery()
-      if (resourceSearchQuery.value.trim() && resourceSearchItems.value.length === 0) {
+      if (normalizeResourceSearchKeyword(resourceSearchQuery.value) && resourceSearchItems.value.length === 0) {
         await runResourceSearch()
       }
     }
 
     if (tool === 'match-info') {
-      // 确保术语库列表和条目已加载
-      if (termBases.value.length === 0 && !loadingTermBases.value) {
-        await loadTermBases()
-      }
-      if (!selectedTermBaseId.value && termBases.value.length > 0) {
-        selectedTermBaseId.value = termBases.value[0].id
-      }
-      if (selectedTermBaseId.value && termEntries.value.length === 0 && !loadingTermEntries.value) {
-        await loadTermEntries()
-      }
+      await ensureMatchInfoTermContext()
     }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.sidePanel'))
@@ -1622,6 +2600,10 @@ async function handleEditorReachEnd() {
 }
 
 function openImportDialog(tab: ResourceImportTab = 'tm') {
+  if (isMergeWorkbench.value && !activeWorkbenchFileId.value) {
+    toast.warn('请先选中一个句段，以确定资源导入的当前文件语言对。')
+    return
+  }
   importDialogInitialTab.value = tab
   showImportDialog.value = true
 }
@@ -1634,6 +2616,10 @@ async function handleResourceImported(payload: { tab: ResourceImportTab }) {
 }
 
 async function closeActiveWorkbenchPanel() {
+  if (segmentScreeningPopoverOpen.value) {
+    segmentScreeningPopoverOpen.value = false
+    return
+  }
   if (segmentSearchOpen.value) {
     await closeSegmentSearchPanel()
     return
@@ -1653,6 +2639,111 @@ function closeGuidelinesPanel() {
   showGuidelinesPanel.value = false
 }
 
+async function focusSearchResultByOffset(offset: number) {
+  if (!hasEditorSegmentFilter.value) {
+    if (!segmentSearchOpen.value) {
+      await toggleSegmentSearchPanel()
+      return
+    }
+    toast.info(t('workbench.search.idle'))
+    return
+  }
+
+  await focusMatchedSegment(offset)
+}
+
+function cancelActiveSegmentConfirmation() {
+  if (!activeSegment.value) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+  if (!activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
+  if (activeSegment.value.status !== 'confirmed') {
+    toast.info(t('workbench.messages.segmentNotConfirmed'))
+    return
+  }
+
+  const targetContent = commitActiveSegmentEditorContent()
+  if (!targetContent) {
+    return
+  }
+  updateSegmentTarget(
+    targetContent.sentenceId,
+    targetContent.text,
+    targetContent.html || undefined,
+  )
+  toast.success(t('workbench.messages.confirmationCancelled'))
+}
+
+async function applyMatchResultByIndex(index: number) {
+  if (!activeSegment.value) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+  if (!activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
+
+  if (matchPanelRef.value?.applyMatchAtIndex(index)) {
+    return
+  }
+
+  const fileRecordId = activeWorkbenchFileId.value
+  const segmentId = activeSegment.value.id
+  if (!fileRecordId || !segmentId) {
+    toast.warn(t('workbench.messages.noMatchResultAtIndex', { index: index + 1 }))
+    return
+  }
+
+  pageError.value = ''
+  try {
+    const { data } = await http.get<{
+      candidates: TMMatchCandidate[]
+    }>(`/file-records/${fileRecordId}/segments/${segmentId}/tm-candidates`)
+    const candidate = data.candidates?.[index] ?? null
+    if (!candidate?.target_text) {
+      toast.warn(t('workbench.messages.noMatchResultAtIndex', { index: index + 1 }))
+      return
+    }
+    handleReplaceText(candidate.target_text)
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('workbench.errors.sidePanel'))
+  }
+}
+
+async function toggleActiveSourceTargetEditor() {
+  if (!segmentStore.activeSentenceId) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+
+  await nextTick()
+  const sentenceId = segmentStore.activeSentenceId
+  const activeElement = document.activeElement
+  const targetEditor = document.querySelector<HTMLElement>(
+    `[data-segment-target="true"][data-sentence-id="${sentenceId}"]`,
+  )
+  const sourceEditor = document.querySelector<HTMLElement>(
+    `.segment-row[data-sentence-id="${sentenceId}"] .segment-row__source-editor`,
+  )
+
+  if (sourceEditor && activeElement instanceof Node && sourceEditor.contains(activeElement)) {
+    targetEditor?.focus({ preventScroll: true })
+    return
+  }
+
+  if (targetEditor && activeElement instanceof Node && targetEditor.contains(activeElement)) {
+    sourceEditor?.focus({ preventScroll: true })
+    return
+  }
+
+  targetEditor?.focus({ preventScroll: true })
+}
+
 async function toggleGuidelinesPanel() {
   showGuidelinesPanel.value = !showGuidelinesPanel.value
   if (showGuidelinesPanel.value) {
@@ -1664,46 +2755,173 @@ async function toggleGuidelinesPanel() {
 function resetSegmentSearch() {
   searchLoadRequestId += 1
   segmentSearchOpen.value = false
+  advancedSearchOpen.value = false
+  segmentScreeningPopoverOpen.value = false
   segmentDisplayScope.value = 'all'
   sourceSearchQuery.value = ''
   targetSearchQuery.value = ''
+  sourceExcludeQuery.value = ''
+  targetExcludeQuery.value = ''
   replaceSearchText.value = ''
   searchFuzzyEnabled.value = false
+  searchCaseSensitive.value = false
+  resetSegmentScreeningFilters()
   searchLoadingAllSegments.value = false
   segmentSearchReturnTarget.value = null
+  pendingSegmentSearchReturnPage = null
   retainedEmptyTargetSentenceIds.value = new Set()
 }
 
-function captureSegmentSearchReturnTarget() {
+function buildSegmentSearchReturnTarget(): SegmentSearchReturnTarget | null {
   const sentenceId = segmentStore.activeSentenceId
   if (!sentenceId) {
-    segmentSearchReturnTarget.value = null
-    return
+    return null
   }
 
-  const segment = editorSegments.value.find((item) => item.sentence_id === sentenceId)
+  const segment = editorSegments.value.find((item) => segmentKeyOf(item) === sentenceId)
   const displayIndex = typeof segment?.display_index === 'number' && Number.isFinite(segment.display_index)
     ? segment.display_index
     : (segmentOrdinalMap.value.get(sentenceId) ?? null)
-  segmentSearchReturnTarget.value = {
+  return {
     sentenceId,
     displayIndex,
     page: segmentStore.currentPage,
   }
 }
 
+function captureSegmentSearchReturnTarget() {
+  if (pendingSegmentSearchReturnPage !== null) {
+    captureSegmentSearchReturnPage(pendingSegmentSearchReturnPage)
+    return
+  }
+
+  const target = buildSegmentSearchReturnTarget()
+  if (target || !segmentSearchReturnTarget.value) {
+    segmentSearchReturnTarget.value = target
+  }
+}
+
+function syncSegmentSearchReturnTarget() {
+  const target = buildSegmentSearchReturnTarget()
+  if (target) {
+    segmentSearchReturnTarget.value = target
+  }
+}
+
+function captureSegmentSearchReturnPage(page = segmentStore.currentPage) {
+  const safePage = Number.isFinite(page) && page > 0
+    ? Math.trunc(page)
+    : segmentStore.currentPage
+  segmentSearchReturnTarget.value = {
+    sentenceId: null,
+    displayIndex: null,
+    page: safePage,
+  }
+}
+
 function clearSegmentSearchFilters() {
   searchLoadRequestId += 1
   segmentDisplayScope.value = 'all'
+  advancedSearchOpen.value = false
   sourceSearchQuery.value = ''
   targetSearchQuery.value = ''
+  sourceExcludeQuery.value = ''
+  targetExcludeQuery.value = ''
   searchFuzzyEnabled.value = false
+  searchCaseSensitive.value = false
+  resetSegmentScreeningFilters()
   searchLoadingAllSegments.value = false
   retainedEmptyTargetSentenceIds.value = new Set()
 }
 
+function resetSegmentScreeningFilters() {
+  segmentScreeningDisplayRange.value = 'my_tasks'
+  segmentScreeningStatusFilters.value = []
+  segmentScreeningMatchFilters.value = []
+  segmentScreeningSourceFilters.value = []
+  segmentScreeningFlagFilters.value = []
+  segmentScreeningWorkflowStepIds.value = []
+}
+
+function getSegmentScreeningGroupValues(group: SegmentScreeningGroup) {
+  if (group === 'status') {
+    return segmentScreeningStatusFilters.value
+  }
+  if (group === 'match') {
+    return segmentScreeningMatchFilters.value
+  }
+  if (group === 'source') {
+    return segmentScreeningSourceFilters.value
+  }
+  if (group === 'flag') {
+    return segmentScreeningFlagFilters.value
+  }
+  return segmentScreeningWorkflowStepIds.value
+}
+
+function setSegmentScreeningGroupValues(group: SegmentScreeningGroup, values: string[]) {
+  const nextValues = Array.from(new Set(values.filter(Boolean)))
+  if (group === 'status') {
+    segmentScreeningStatusFilters.value = nextValues
+  } else if (group === 'match') {
+    segmentScreeningMatchFilters.value = nextValues
+  } else if (group === 'source') {
+    segmentScreeningSourceFilters.value = nextValues
+  } else if (group === 'flag') {
+    segmentScreeningFlagFilters.value = nextValues
+  } else {
+    segmentScreeningWorkflowStepIds.value = nextValues
+  }
+}
+
+function isSegmentScreeningChecked(group: SegmentScreeningGroup, value: string) {
+  return getSegmentScreeningGroupValues(group).includes(value)
+}
+
+function toggleSegmentScreeningFilter(group: SegmentScreeningGroup, value: string, checked: boolean) {
+  const currentValues = getSegmentScreeningGroupValues(group)
+  if (checked) {
+    setSegmentScreeningGroupValues(group, [...currentValues, value])
+    return
+  }
+  setSegmentScreeningGroupValues(group, currentValues.filter((item) => item !== value))
+}
+
+function clearSegmentScreeningFilters() {
+  searchLoadRequestId += 1
+  resetSegmentScreeningFilters()
+  searchLoadingAllSegments.value = false
+}
+
+function toggleSegmentScreeningPopover() {
+  const nextOpen = !segmentScreeningPopoverOpen.value
+  segmentScreeningPopoverOpen.value = nextOpen
+  if (nextOpen) {
+    segmentSearchOpen.value = false
+  }
+}
+
+async function goToSegmentScreeningNumber() {
+  const targetNumber = Number(segmentScreeningNumberInput.value)
+  if (!Number.isInteger(targetNumber) || targetNumber <= 0) {
+    toast.warn('请输入有效的句段编号。')
+    return
+  }
+  if (segmentStore.matchedSegmentCount > 0 && targetNumber > segmentStore.matchedSegmentCount) {
+    toast.warn(`当前筛查范围只有 ${segmentStore.matchedSegmentCount} 个句段。`)
+    return
+  }
+  const targetPage = Math.floor((targetNumber - 1) / segmentStore.pageSize) + 1
+  const pageIndex = (targetNumber - 1) % segmentStore.pageSize
+  await refreshSegmentPage(targetPage, segmentStore.pageSize)
+  const index = Math.min(pageIndex, Math.max(editorSegments.value.length - 1, 0))
+  if (index >= 0) {
+    await focusEditorSegmentAtIndex(index)
+  }
+}
+
 async function focusEditorSegmentBySentenceId(sentenceId: string) {
-  const index = editorSegments.value.findIndex((segment) => segment.sentence_id === sentenceId)
+  const index = editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === sentenceId)
   if (index < 0) {
     return false
   }
@@ -1711,20 +2929,33 @@ async function focusEditorSegmentBySentenceId(sentenceId: string) {
   return true
 }
 
-function getReturnTargetPage(target: { displayIndex: number | null; page: number }) {
+function getReturnTargetPage(target: SegmentSearchReturnTarget) {
   if (typeof target.displayIndex === 'number' && Number.isFinite(target.displayIndex) && target.displayIndex >= 0) {
     return Math.floor(target.displayIndex / segmentStore.pageSize) + 1
   }
   return target.page
 }
 
-async function resolveSegmentReturnTargetPage(target: { sentenceId: string; displayIndex: number | null; page: number }) {
+async function resolveSegmentReturnTargetPage(target: SegmentSearchReturnTarget) {
   const localPage = getReturnTargetPage(target)
+  if (segmentStore.mergeViewId) {
+    return localPage
+  }
+  if (!target.sentenceId) {
+    return localPage
+  }
   if (typeof target.displayIndex === 'number' && Number.isFinite(target.displayIndex) && target.displayIndex >= 0) {
     return localPage
   }
 
-  const fileRecordId = segmentStore.fileRecord?.id || props.id
+  const fileRecordId = segmentStore.activeFileRecordId || segmentStore.fileRecord?.id || props.id
+  if (!fileRecordId) {
+    resetResourceSearchResults('请选择一个句段后再搜索资源库。')
+    return
+  }
+  if (!fileRecordId) {
+    return localPage
+  }
   try {
     const { data } = await http.get<SegmentPositionResponse>(
       `/file-records/${fileRecordId}/segments/${encodeURIComponent(target.sentenceId)}/position`,
@@ -1740,25 +2971,28 @@ async function resolveSegmentReturnTargetPage(target: { sentenceId: string; disp
 async function restoreSegmentSearchReturnTarget() {
   const target = segmentSearchReturnTarget.value
   segmentSearchReturnTarget.value = null
-  if (!target) {
+  if (!hasEditorSegmentFilter.value) {
+    if (target?.sentenceId) {
+      await focusEditorSegmentBySentenceId(target.sentenceId)
+    }
     return
   }
 
-  if (await focusEditorSegmentBySentenceId(target.sentenceId)) {
-    return
-  }
-
-  const targetPage = await resolveSegmentReturnTargetPage(target)
+  const targetPage = target ? await resolveSegmentReturnTargetPage(target) : segmentStore.currentPage
   suppressSegmentFilterWatch = true
   clearSegmentSearchFilters()
+  await nextTick()
   suppressSegmentFilterWatch = false
-  await refreshSegmentPage(targetPage, segmentStore.pageSize)
-  await focusEditorSegmentBySentenceId(target.sentenceId)
+  if (segmentStore.fileRecord || segmentStore.mergeViewId) {
+    await refreshSegmentPage(targetPage, segmentStore.pageSize)
+  }
+  if (target?.sentenceId) {
+    await focusEditorSegmentBySentenceId(target.sentenceId)
+  }
 }
 
 async function clearSourceSegmentSearchQuery() {
   const target = segmentSearchReturnTarget.value
-  const targetPage = target ? await resolveSegmentReturnTargetPage(target) : segmentStore.currentPage
   searchLoadRequestId += 1
   searchLoadingAllSegments.value = false
   suppressSegmentFilterWatch = true
@@ -1766,17 +3000,47 @@ async function clearSourceSegmentSearchQuery() {
   await nextTick()
   suppressSegmentFilterWatch = false
 
-  if (segmentStore.fileRecord) {
+  const shouldRestoreReturnTarget = !hasEditorSegmentFilter.value
+  const targetPage = shouldRestoreReturnTarget && target
+    ? await resolveSegmentReturnTargetPage(target)
+    : 1
+  if (segmentStore.fileRecord || segmentStore.mergeViewId) {
     await refreshSegmentPage(targetPage, segmentStore.pageSize)
   }
 
-  if (target) {
+  if (shouldRestoreReturnTarget && target?.sentenceId) {
     await focusEditorSegmentBySentenceId(target.sentenceId)
     return
   }
 
   await nextTick()
   sourceSearchInputRef.value?.focus({ preventScroll: true })
+}
+
+async function clearTargetSegmentSearchQuery() {
+  const target = segmentSearchReturnTarget.value
+  searchLoadRequestId += 1
+  searchLoadingAllSegments.value = false
+  suppressSegmentFilterWatch = true
+  targetSearchQuery.value = ''
+  await nextTick()
+  suppressSegmentFilterWatch = false
+
+  const shouldRestoreReturnTarget = !hasEditorSegmentFilter.value
+  const targetPage = shouldRestoreReturnTarget && target
+    ? await resolveSegmentReturnTargetPage(target)
+    : 1
+  if (segmentStore.fileRecord || segmentStore.mergeViewId) {
+    await refreshSegmentPage(targetPage, segmentStore.pageSize)
+  }
+
+  if (shouldRestoreReturnTarget && target?.sentenceId) {
+    await focusEditorSegmentBySentenceId(target.sentenceId)
+    return
+  }
+
+  await nextTick()
+  targetSearchInputRef.value?.focus({ preventScroll: true })
 }
 
 async function closeSegmentSearchPanel() {
@@ -1802,7 +3066,7 @@ function toggleSegmentSummaryScope(scope: SegmentDisplayScope) {
 }
 
 function retainEmptyTargetSegmentDuringEdit(sentenceId: string, previousTargetText: string | null | undefined) {
-  if (segmentDisplayScope.value !== 'empty_target' || normalizeTextForSaveToTM(previousTargetText)) {
+  if (segmentDisplayScope.value !== 'empty_target' || !isEmptyTargetForWorkbench(previousTargetText)) {
     return
   }
 
@@ -1816,19 +3080,59 @@ function updateSegmentTarget(
   sentenceId: string,
   targetText: string,
   targetHtml?: string,
-  options: { confirm?: boolean } = {},
+  options: UpdateSegmentTargetOptions = {},
 ) {
-  const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
+  // sentenceId 在合并模式下是复合键；按 key 查找句段
+  const segment = segmentStore.segments.find((item) => segmentKeyOf(item) === sentenceId)
   if (segment && !segment.can_write) {
     toast.warn('当前流程阶段无编辑权限')
     return
   }
+  const hasTargetContentChange = Boolean(
+    segment
+    && (
+      (segment.target_text || '') !== targetText
+      || (segment.target_html || null) !== (targetHtml || null)
+    ),
+  )
+  if (options.recordUndo && hasTargetContentChange) {
+    recordSegmentEditorUndoBoundary(
+      sentenceId,
+      options.undoInputType || 'programmaticEdit',
+      true,
+    )
+  }
   retainEmptyTargetSegmentDuringEdit(sentenceId, segment?.target_text)
-  segmentStore.updateTarget(sentenceId, targetText, targetHtml, options)
+  segmentStore.updateTarget(sentenceId, targetText, targetHtml, { confirm: options.confirm })
+}
+
+function commitActiveSegmentEditorContent(): CommittedSegmentEditorContent | null {
+  const segment = activeSegment.value
+  if (!segment) {
+    return null
+  }
+
+  const sentenceId = segmentKeyOf(segment)
+  const committed = segmentEditorRowRefs.get(sentenceId)?.commitEditorContent()
+  if (committed?.sentenceId === sentenceId) {
+    return committed
+  }
+
+  return {
+    sentenceId,
+    text: segment.target_text || '',
+    html: segment.target_html || null,
+  }
+}
+
+async function syncPendingWorkbenchEdits(): Promise<boolean> {
+  commitActiveSegmentEditorContent()
+  await nextTick()
+  return segmentStore.syncToBackend()
 }
 
 async function updateSegmentSource(sentenceId: string, sourceText: string) {
-  const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
+  const segment = segmentStore.segments.find((item) => segmentKeyOf(item) === sentenceId)
   if (segment && !segment.can_write) {
     toast.warn('当前流程阶段无编辑权限')
     return
@@ -1841,7 +3145,7 @@ async function updateSegmentSource(sentenceId: string, sourceText: string) {
 }
 
 async function toggleProjectSegmentSync(sentenceId: string, disabled: boolean) {
-  const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
+  const segment = segmentStore.segments.find((item) => segmentKeyOf(item) === sentenceId)
   if (segment && !segment.can_write) {
     toast.warn('当前流程阶段无编辑权限')
     return
@@ -1881,7 +3185,10 @@ async function focusEditorSegmentAtIndex(index: number) {
     return
   }
 
-  segmentStore.setActiveSentence(target.sentence_id)
+  segmentStore.setActiveSentence(segmentKeyOf(target))
+  if (segmentSearchOpen.value && !hasEditorSegmentFilter.value) {
+    syncSegmentSearchReturnTarget()
+  }
   await nextTick()
   await virtualListRef.value?.focusIndex(index, '[data-segment-target="true"]', 'nearest')
 }
@@ -1894,18 +3201,54 @@ async function focusMatchedSegment(offset: number) {
   await ensureFilteredCorpusLoaded()
 
   const matches = editorSegments.value
-  if (!matches.length) {
+  const totalMatches = segmentStore.matchedSegmentCount
+  if (!matches.length || totalMatches <= 0) {
     return
   }
 
-  let targetIndex = activeEditorIndex.value
-  if (targetIndex === -1) {
-    targetIndex = offset > 0 ? 0 : matches.length - 1
+  const pageSize = Math.max(segmentStore.pageSize, 1)
+  const currentPageStartIndex = Math.max(segmentStore.currentPage - 1, 0) * pageSize
+  let targetGlobalIndex = 0
+  if (activeEditorIndex.value === -1) {
+    targetGlobalIndex = offset >= 0 ? 0 : totalMatches - 1
   } else {
-    targetIndex = (targetIndex + offset + matches.length) % matches.length
+    const currentGlobalIndex = currentPageStartIndex + activeEditorIndex.value
+    targetGlobalIndex = (currentGlobalIndex + offset + totalMatches) % totalMatches
   }
 
+  const targetPage = Math.floor(targetGlobalIndex / pageSize) + 1
+  const targetPageIndex = targetGlobalIndex % pageSize
+  if (targetPage !== segmentStore.currentPage) {
+    await refreshSegmentPage(targetPage, pageSize)
+  }
+
+  await focusEditorSegmentAtIndex(Math.min(targetPageIndex, Math.max(editorSegments.value.length - 1, 0)))
+}
+
+async function focusSegmentByGlobalIndex(globalIndex: number) {
+  const total = segmentStore.matchedSegmentCount
+  if (total <= 0) {
+    return false
+  }
+
+  const pageSize = Math.max(segmentStore.pageSize, 1)
+  const boundedIndex = Math.min(Math.max(globalIndex, 0), total - 1)
+  const targetPage = Math.floor(boundedIndex / pageSize) + 1
+  const targetPageIndex = boundedIndex % pageSize
+
+  if (targetPage !== segmentStore.currentPage) {
+    await refreshSegmentPage(targetPage, pageSize, { includeStats: false })
+    if (segmentStore.currentPage !== targetPage) {
+      return false
+    }
+  }
+
+  const targetIndex = Math.min(targetPageIndex, Math.max(editorSegments.value.length - 1, 0))
+  if (targetIndex < 0) {
+    return false
+  }
   await focusEditorSegmentAtIndex(targetIndex)
+  return true
 }
 
 function replaceTargetText(targetText: string, replaceAll = false) {
@@ -1917,7 +3260,7 @@ function replaceTargetText(targetText: string, replaceAll = false) {
 }
 
 async function replaceCurrentSearchMatch() {
-  if (!targetSearchQuery.value.trim()) {
+  if (!resolveLiteralSearchKeyword(targetSearchQuery.value)) {
     toast.warn(t('workbench.search.targetRequiredForReplace'))
     return
   }
@@ -1935,8 +3278,13 @@ async function replaceCurrentSearchMatch() {
     return
   }
 
-  updateSegmentTarget(targetSegment.sentence_id, replaceTargetText(targetSegment.target_text || '', false))
-  const targetIndex = editorSegments.value.findIndex((segment) => segment.sentence_id === targetSegment.sentence_id)
+  updateSegmentTarget(
+    segmentKeyOf(targetSegment),
+    replaceTargetText(targetSegment.target_text || '', false),
+    undefined,
+    { recordUndo: true, undoInputType: 'replaceCurrentSearchMatch' },
+  )
+  const targetIndex = editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === segmentKeyOf(targetSegment))
   if (targetIndex >= 0) {
     await focusEditorSegmentAtIndex(targetIndex)
   }
@@ -1944,7 +3292,7 @@ async function replaceCurrentSearchMatch() {
 }
 
 async function replaceAllSearchMatches() {
-  if (!targetSearchQuery.value.trim()) {
+  if (!resolveLiteralSearchKeyword(targetSearchQuery.value)) {
     toast.warn(t('workbench.search.targetRequiredForReplace'))
     return
   }
@@ -1955,7 +3303,7 @@ async function replaceAllSearchMatches() {
 
   pageError.value = ''
   try {
-    const synced = await segmentStore.syncToBackend()
+    const synced = await syncPendingWorkbenchEdits()
     if (!synced) {
       return
     }
@@ -1965,9 +3313,16 @@ async function replaceAllSearchMatches() {
         scope: segmentDisplayScope.value,
         source_query: sourceSearchQuery.value,
         target_query: targetSearchQuery.value,
+        source_exclude: sourceExcludeQuery.value,
+        target_exclude: targetExcludeQuery.value,
         replace_text: replaceSearchText.value,
         search_fuzzy: searchFuzzyEnabled.value,
+        case_sensitive: searchCaseSensitive.value,
         replace_all: true,
+        status_filters: [...segmentScreeningStatusFilters.value, ...segmentScreeningFlagFilters.value],
+        match_filters: [...segmentScreeningMatchFilters.value],
+        source_filters: [...segmentScreeningSourceFilters.value],
+        workflow_step_ids: [...segmentScreeningWorkflowStepIds.value],
       },
     )
     if (data.updated_count === 0) {
@@ -1990,11 +3345,14 @@ async function focusSentenceByOffset(offset: number) {
     return
   }
 
-  let targetIndex = getCurrentSegmentIndex() + offset
-  targetIndex = Math.max(0, targetIndex)
+  if (!editorSegments.value.length || segmentStore.matchedSegmentCount <= 0) {
+    return
+  }
 
-  targetIndex = Math.min(targetIndex, Math.max(editorSegments.value.length - 1, 0))
-  await focusEditorSegmentAtIndex(targetIndex)
+  const pageSize = Math.max(segmentStore.pageSize, 1)
+  const currentPageStartIndex = Math.max(segmentStore.currentPage - 1, 0) * pageSize
+  const targetGlobalIndex = currentPageStartIndex + getCurrentSegmentIndex() + offset
+  await focusSegmentByGlobalIndex(targetGlobalIndex)
 }
 
 function getEditorSegmentDisplayIndex(sentenceId: string, fallbackIndex: number) {
@@ -2004,23 +3362,159 @@ function getEditorSegmentDisplayIndex(sentenceId: string, fallbackIndex: number)
 function confirmCurrentSentence() {
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
-    return
+    return false
   }
   if (!activeSegmentCanWrite.value) {
     toast.warn('当前流程阶段无编辑权限')
-    return
+    return false
+  }
+  const targetContent = commitActiveSegmentEditorContent()
+  if (!targetContent) {
+    return false
   }
   updateSegmentTarget(
-    activeSegment.value.sentence_id,
-    activeSegment.value.target_text || '',
-    activeSegment.value.target_html ?? undefined,
+    targetContent.sentenceId,
+    targetContent.text,
+    targetContent.html || undefined,
     { confirm: true },
   )
-  toast.success(t('workbench.messages.confirmed'))
+  return true
+}
+
+function findUnconfirmedSegmentIndex(startIndex = 0, endIndex = editorSegments.value.length) {
+  const start = Math.max(0, startIndex)
+  const end = Math.min(Math.max(endIndex, 0), editorSegments.value.length)
+  for (let index = start; index < end; index += 1) {
+    if (editorSegments.value[index]?.status !== 'confirmed') {
+      return index
+    }
+  }
+  return -1
+}
+
+function buildNextUnconfirmedPositionParams(currentSegment: Segment, pageSize: number) {
+  const query = getSegmentWindowQuery(segmentStore.currentPage, pageSize, false)
+  return {
+    after_sentence_id: currentSegment.sentence_id,
+    page_size: pageSize,
+    wrap: true,
+    scope: query.scope,
+    source_query: query.sourceQuery,
+    target_query: query.targetQuery,
+    source_exclude: query.sourceExclude,
+    target_exclude: query.targetExclude,
+    search_fuzzy: query.searchFuzzy,
+    case_sensitive: query.caseSensitive,
+    status_filters: query.statusFilters,
+    match_filters: query.matchFilters,
+    source_filters: query.sourceFilters,
+    workflow_step_ids: query.workflowStepIds,
+  }
+}
+
+async function focusSegmentPosition(target: SegmentPositionResponse) {
+  const pageSize = Math.max(target.page_size || segmentStore.pageSize, 1)
+  if (target.page !== segmentStore.currentPage || pageSize !== segmentStore.pageSize) {
+    await refreshSegmentPage(target.page, pageSize, { includeStats: false })
+  }
+  const targetIndex = editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === target.sentence_id)
+  const fallbackIndex = Math.min(target.page_index, Math.max(editorSegments.value.length - 1, 0))
+  const resolvedIndex = targetIndex >= 0 ? targetIndex : fallbackIndex
+  if (resolvedIndex < 0) {
+    return false
+  }
+  await focusEditorSegmentAtIndex(resolvedIndex)
+  return true
+}
+
+async function focusNextUnconfirmedSegmentByPosition(currentSegment: Segment) {
+  if (isMergeWorkbench.value) {
+    return null
+  }
+  const fileRecordId = segmentStore.fileRecord?.id || props.id
+  if (!fileRecordId) {
+    return null
+  }
+
+  const pageSize = Math.max(segmentStore.pageSize, 1)
+  try {
+    const synced = await syncPendingWorkbenchEdits()
+    if (!synced) {
+      return false
+    }
+    const { data } = await http.get<SegmentNextUnconfirmedPositionResponse>(
+      `/file-records/${fileRecordId}/segments/next-unconfirmed-position`,
+      { params: buildNextUnconfirmedPositionParams(currentSegment, pageSize) },
+    )
+    if (!data.target) {
+      toast.info('没有下一个未确认句段。')
+      return false
+    }
+    return focusSegmentPosition(data.target)
+  } catch (error) {
+    console.warn('Failed to locate next unconfirmed segment:', error)
+    return null
+  }
+}
+
+async function focusNextUnconfirmedSegment(currentIndex: number, currentSegment: Segment | null) {
+  if (currentSegment) {
+    const positioned = await focusNextUnconfirmedSegmentByPosition(currentSegment)
+    if (positioned !== null) {
+      return positioned
+    }
+  }
+
+  const initialPage = segmentStore.currentPage
+  const pageSize = Math.max(segmentStore.pageSize, 1)
+  const initialMatchedCount = segmentStore.matchedSegmentCount
+
+  let nextIndex = findUnconfirmedSegmentIndex(currentIndex + 1)
+  if (nextIndex !== -1) {
+    await focusEditorSegmentAtIndex(nextIndex)
+    return true
+  }
+
+  if (hasEditorSegmentFilter.value) {
+    await refreshSegmentPage(initialPage, pageSize, { includeStats: false })
+    const refreshedStartIndex = Math.min(Math.max(currentIndex, 0), editorSegments.value.length)
+    nextIndex = findUnconfirmedSegmentIndex(refreshedStartIndex)
+    if (nextIndex !== -1) {
+      await focusEditorSegmentAtIndex(nextIndex)
+      return true
+    }
+  }
+
+  const total = Math.max(segmentStore.matchedSegmentCount, initialMatchedCount)
+  const lastPage = Math.max(1, Math.ceil(total / pageSize))
+  for (let page = initialPage + 1; page <= lastPage; page += 1) {
+    const previousPage = segmentStore.currentPage
+    await refreshSegmentPage(page, pageSize, { includeStats: false })
+    if (segmentStore.currentPage === previousPage && page !== previousPage) {
+      return false
+    }
+    nextIndex = findUnconfirmedSegmentIndex(0)
+    if (nextIndex !== -1) {
+      await focusEditorSegmentAtIndex(nextIndex)
+      return true
+    }
+  }
+
+  if (segmentStore.currentPage !== initialPage) {
+    await refreshSegmentPage(initialPage, pageSize, { includeStats: false })
+  }
+
+  nextIndex = findUnconfirmedSegmentIndex(0, currentIndex)
+  if (nextIndex !== -1) {
+    await focusEditorSegmentAtIndex(nextIndex)
+    return true
+  }
+
+  return false
 }
 
 function toggleConfirmMenu() {
-  if (confirmationActionLoading.value || segmentStore.totalSegmentCount === 0) {
+  if (confirmationActionLoading.value || confirmJumpActionLoading.value || segmentStore.totalSegmentCount === 0) {
     return
   }
   openConfirmMenu.value = !openConfirmMenu.value
@@ -2036,41 +3530,120 @@ function handleConfirmCurrentFromMenu() {
   confirmCurrentSentence()
 }
 
+function parseConfirmationRangeValue(value: string) {
+  const normalized = value.trim()
+  if (!normalized) {
+    return null
+  }
+  const numericValue = Number(normalized)
+  if (!Number.isInteger(numericValue) || numericValue < 1) {
+    return Number.NaN
+  }
+  return numericValue
+}
+
+function resolveConfirmationRange() {
+  const startValue = parseConfirmationRangeValue(confirmationRangeStart.value)
+  const endValue = parseConfirmationRangeValue(confirmationRangeEnd.value)
+  if (Number.isNaN(startValue) || Number.isNaN(endValue)) {
+    toast.warn('请输入有效的句段编号范围。')
+    return null
+  }
+  const start = startValue ?? endValue
+  const end = endValue ?? startValue
+  if (!start || !end) {
+    toast.warn('请先输入要确认的句段编号范围。')
+    return null
+  }
+  if (start > end) {
+    toast.warn('句段范围起始值不能大于结束值。')
+    return null
+  }
+  if (activeFileSegmentTotal.value > 0 && start > activeFileSegmentTotal.value) {
+    toast.warn(`当前文件只有 ${activeFileSegmentTotal.value} 个句段。`)
+    return null
+  }
+  return { start, end }
+}
+
+function formatConfirmationRange(start: number, end: number) {
+  return start === end ? String(start) : `${start}~${end}`
+}
+
 async function confirmAndMoveToNextUnconfirmed() {
+  if (confirmJumpActionLoading.value) {
+    return
+  }
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
     return
   }
 
-  confirmCurrentSentence()
+  const currentSegment = activeSegment.value
   const currentIndex = activeEditorIndex.value
-  const segments = editorSegments.value
-  let nextUnconfirmedIndex = -1
-
-  for (let i = currentIndex + 1; i < segments.length; i++) {
-    if (segments[i].status !== 'confirmed') {
-      nextUnconfirmedIndex = i
-      break
+  confirmJumpActionLoading.value = true
+  try {
+    if (!confirmCurrentSentence()) {
+      return
     }
-  }
 
-  if (nextUnconfirmedIndex === -1) {
-    for (let i = 0; i < currentIndex; i++) {
-      if (segments[i].status !== 'confirmed') {
-        nextUnconfirmedIndex = i
-        break
-      }
+    if (preferencesStore.confirmJumpMode === 'next_segment') {
+      await focusSentenceByOffset(1)
+      return
     }
-  }
 
-  if (nextUnconfirmedIndex !== -1) {
-    await focusEditorSegmentAtIndex(nextUnconfirmedIndex)
+    if (confirmableSegmentCount.value <= 0) {
+      toast.info('当前文件全部句段都已确认。')
+      return
+    }
+
+    await focusNextUnconfirmedSegment(currentIndex, currentSegment)
+  } finally {
+    confirmJumpActionLoading.value = false
   }
 }
 
-async function handleConfirmAllSegments() {
-  if (confirmableSegmentCount.value === 0) {
-    toast.info('当前文件全部句段都已确认。')
+async function handleConfirmRangeSegments() {
+  if (isMergeWorkbench.value && !activeMergeViewFile.value) {
+    toast.warn('请先选中一个句段，以确定要确认范围的当前文件。')
+    return
+  }
+  if (isMergeWorkbench.value && activeMergeViewFile.value?.can_write === false) {
+    toast.warn('当前文件无可编辑权限。')
+    return
+  }
+  const range = resolveConfirmationRange()
+  if (!range) {
+    return
+  }
+
+  pageError.value = ''
+  confirmationActionLoading.value = true
+  try {
+    const updatedCount = await segmentStore.updateAllSegmentConfirmations('confirm', 'current_file', {
+      rangeStart: range.start,
+      rangeEnd: range.end,
+    })
+    const rangeText = formatConfirmationRange(range.start, range.end)
+    toast.success(
+      updatedCount > 0
+        ? `已确认编号 ${rangeText} 范围内 ${updatedCount} 个句段`
+        : `编号 ${rangeText} 范围内没有需要确认的句段`,
+    )
+    closeConfirmMenu()
+  } catch (error) {
+    pageError.value = getErrorMessage(error, '范围确认失败')
+  } finally {
+    confirmationActionLoading.value = false
+  }
+}
+
+async function handleConfirmAllSegments(target: LLMMergeTarget = 'current_file') {
+  const isViewTarget = target === 'merge_view'
+  const count = isViewTarget ? mergeViewConfirmableSegmentCount.value : confirmableSegmentCount.value
+  const scopeText = isViewTarget ? '当前视图' : '当前文件'
+  if (count === 0) {
+    toast.info(`${scopeText}全部句段都已确认。`)
     closeConfirmMenu()
     return
   }
@@ -2078,7 +3651,7 @@ async function handleConfirmAllSegments() {
   pageError.value = ''
   confirmationActionLoading.value = true
   try {
-    const updatedCount = await segmentStore.updateAllSegmentConfirmations('confirm')
+    const updatedCount = await segmentStore.updateAllSegmentConfirmations('confirm', target)
     toast.success(updatedCount > 0 ? `已确认 ${updatedCount} 个句段` : '没有需要确认的句段')
     closeConfirmMenu()
   } catch (error) {
@@ -2088,10 +3661,12 @@ async function handleConfirmAllSegments() {
   }
 }
 
-async function handleCancelAllSegmentConfirmations() {
-  const count = confirmedSegmentCount.value
+async function handleCancelAllSegmentConfirmations(target: LLMMergeTarget = 'current_file') {
+  const isViewTarget = target === 'merge_view'
+  const count = isViewTarget ? mergeViewConfirmedSegmentCount.value : confirmedSegmentCount.value
+  const scopeText = isViewTarget ? '当前视图' : '当前文件'
   if (count === 0) {
-    toast.info('当前文件没有已确认句段。')
+    toast.info(`${scopeText}没有已确认句段。`)
     closeConfirmMenu()
     return
   }
@@ -2099,7 +3674,7 @@ async function handleCancelAllSegmentConfirmations() {
   closeConfirmMenu()
   const accepted = await confirm({
     title: '确认全部取消',
-    message: `确定要取消当前文件全部 ${count} 个已确认句段的确认状态吗？译文内容会保留，但这些句段将不再显示为已确认。`,
+    message: `确定要取消${scopeText}全部 ${count} 个已确认句段的确认状态吗？译文内容会保留，但这些句段将不再显示为已确认。`,
     confirmText: '全部取消',
     cancelText: t('common.actions.cancel'),
     danger: true,
@@ -2111,7 +3686,7 @@ async function handleCancelAllSegmentConfirmations() {
   pageError.value = ''
   confirmationActionLoading.value = true
   try {
-    const updatedCount = await segmentStore.updateAllSegmentConfirmations('cancel')
+    const updatedCount = await segmentStore.updateAllSegmentConfirmations('cancel', target)
     toast.success(updatedCount > 0 ? `已取消确认 ${updatedCount} 个句段` : '没有需要取消确认的句段')
     closeConfirmMenu()
   } catch (error) {
@@ -2194,7 +3769,7 @@ async function submitWorkflowTransition() {
   }
   workflowTransitionLoading.value = true
   try {
-    await segmentStore.syncToBackend()
+    await syncPendingWorkbenchEdits()
     const { data } = await http.post<{ updated_count: number }>(
       `/file-records/${segmentStore.fileRecord.id}/workflow/transition`,
       buildWorkflowTransitionPayload(),
@@ -2237,63 +3812,113 @@ watch(
   },
 )
 
-function setCurrentTermQAReport(report: TermQAReport | null) {
-  termQAReport.value = report
-  const validIds = new Set(report?.items.filter((item) => !item.ignored).map((item) => item.id) ?? [])
+function setCurrentTermQAReport(report: WorkbenchQAResult | null) {
+  const normalizedReport = normalizeTermQAReportForCurrentWorkbench(report)
+  termQAReport.value = normalizedReport
+  setTermQAReportPage(termQAReportPage.value)
+  const validIds = new Set(normalizedReport?.items.filter((item) => !item.ignored).map((item) => item.id) ?? [])
   selectedTermQAItemIds.value = new Set(
     [...selectedTermQAItemIds.value].filter((id) => validIds.has(id)),
   )
 }
 
+function setTermQAReportPage(page: number) {
+  const safePage = Number.isFinite(page) ? Math.trunc(page) : 1
+  termQAReportPage.value = Math.min(Math.max(safePage, 1), termQAReportTotalPages.value)
+}
+
+watch(
+  () => termQAReport.value?.items.length || 0,
+  () => setTermQAReportPage(termQAReportPage.value),
+)
+
+watch(
+  () => activeWorkbenchProjectId.value,
+  () => {
+    qualityQASettings.value = null
+    qualityQASettingsError.value = ''
+    if (showQualityQAAdjustDialog.value) {
+      void loadWorkbenchQualityQASettings()
+    }
+  },
+)
+
+function shouldKeepLoadedQAResult(report: WorkbenchQAResult) {
+  return report.items.length > 0 || Boolean(report.term_report_id)
+}
+
 async function loadLatestTermQAReport() {
-  if (!segmentStore.fileRecord || loadingTermQAReport.value) {
+  if (loadingTermQAReport.value) {
+    return
+  }
+  const mergeViewId = segmentStore.mergeViewId || props.mergeViewId || ''
+  if (isMergeWorkbench.value && !mergeViewId) {
+    return
+  }
+  if (!isMergeWorkbench.value && !segmentStore.fileRecord) {
     return
   }
   loadingTermQAReport.value = true
   try {
-    const { data } = await http.get<TermQAReportListResponse>(
-      `/file-records/${segmentStore.fileRecord.id}/term-qa-reports`,
-      {
-        params: {
-          limit: 1,
-          include_items: true,
-        },
-      },
-    )
-    setCurrentTermQAReport(data.items[0] || null)
+    if (isMergeWorkbench.value) {
+      const data = await fetchMergeViewQAResult(mergeViewId)
+      setCurrentTermQAReport(shouldKeepLoadedQAResult(data) ? data : null)
+    } else if (segmentStore.fileRecord) {
+      const { data } = await http.get<WorkbenchQAResult>(
+        `/file-records/${segmentStore.fileRecord.id}/qa-results`,
+      )
+      setCurrentTermQAReport(shouldKeepLoadedQAResult(data) ? data : null)
+    }
   } catch (error) {
-    console.error('Failed to load latest term QA report:', error)
+    console.error('Failed to load QA result:', error)
     setCurrentTermQAReport(null)
   } finally {
     loadingTermQAReport.value = false
   }
 }
 
-async function generateCurrentFileTermQAReport() {
-  if (!segmentStore.fileRecord || generatingTermQAReport.value) {
+async function generateCurrentTermQAReport() {
+  const mergeViewId = segmentStore.mergeViewId || props.mergeViewId || ''
+  if (isMergeWorkbench.value && !mergeViewId) {
+    return
+  }
+  if (!isMergeWorkbench.value && !segmentStore.fileRecord) {
+    return
+  }
+  if (generatingTermQAReport.value) {
     return
   }
   generatingTermQAReport.value = true
   try {
-    const synced = await segmentStore.syncToBackend()
+    const synced = await syncPendingWorkbenchEdits()
     if (!synced) {
       return
     }
-    const { data } = await http.post<TermQAReport>(
-      `/file-records/${segmentStore.fileRecord.id}/term-qa-reports`,
-    )
+    let data: WorkbenchQAResult
+    if (isMergeWorkbench.value) {
+      data = await createMergeViewQAResult(mergeViewId)
+    } else {
+      const fileRecord = segmentStore.fileRecord
+      if (!fileRecord) {
+        return
+      }
+      data = (await http.post<WorkbenchQAResult>(
+        `/file-records/${fileRecord.id}/qa-results`,
+      )).data
+    }
     setCurrentTermQAReport(data)
+    setTermQAReportPage(1)
     activeBottomTool.value = 'qa-result'
     await scrollBottomPanelIntoView()
     toast.show({
       tone: data.issue_count > 0 ? 'warn' : 'success',
-      title: '术语QA报告已生成',
-      message: `发现 ${data.issue_count} 条术语问题。`,
+      title: 'QA 结果已生成',
+      message: `发现 ${data.issue_count} 条待检查问题。`,
     })
   } catch (error) {
     toast.error({
-      title: '术语QA报告生成失败',
-      message: getErrorMessage(error, '术语QA报告生成失败。'),
+      title: 'QA 结果生成失败',
+      message: getErrorMessage(error, 'QA 结果生成失败。'),
     })
   } finally {
     generatingTermQAReport.value = false
@@ -2314,7 +3939,7 @@ async function openTermQAResult() {
   if (termQAReport.value) {
     return
   }
-  await generateCurrentFileTermQAReport()
+  await generateCurrentTermQAReport()
 }
 
 async function clearSegmentFiltersForTermQANavigation() {
@@ -2360,41 +3985,44 @@ async function setTermQAReportItemsIgnored(itemIds: string[], ignored: boolean) 
   }
   updatingTermQAIgnore.value = true
   try {
-    const { data } = await http.patch<TermQAReport>(
-      `/term-qa-reports/${termQAReport.value.id}/items/ignore`,
+    await http.patch(
+      '/qa-result-items/ignore',
       {
         item_ids: itemIds,
         ignored,
       },
     )
-    setCurrentTermQAReport(data)
-    toast.success(ignored ? '已忽略所选术语 QA 项。' : '已恢复所选术语 QA 项。')
+    await loadLatestTermQAReport()
+    toast.success(ignored ? '已忽略所选 QA 问题。' : '已恢复所选 QA 问题。')
   } catch (error) {
     toast.error({
       title: ignored ? '忽略失败' : '恢复失败',
-      message: getErrorMessage(error, ignored ? '忽略术语 QA 项失败。' : '恢复术语 QA 项失败。'),
+      message: getErrorMessage(error, ignored ? '忽略 QA 问题失败。' : '恢复 QA 问题失败。'),
     })
   } finally {
     updatingTermQAIgnore.value = false
   }
 }
 
-async function setSingleTermQAReportItemIgnored(item: TermQAReportItem, ignored: boolean) {
+async function setSingleTermQAReportItemIgnored(item: WorkbenchQAResultItem, ignored: boolean) {
   if (updatingTermQAIgnore.value) {
     return
   }
   updatingTermQAIgnore.value = true
   try {
-    const { data } = await http.patch<TermQAReport>(
-      `/term-qa-report-items/${item.id}/ignore`,
-      { ignored },
+    await http.patch(
+      '/qa-result-items/ignore',
+      {
+        item_ids: [item.id],
+        ignored,
+      },
     )
-    setCurrentTermQAReport(data)
-    toast.success(ignored ? '已忽略该术语 QA 项。' : '已恢复该术语 QA 项。')
+    await loadLatestTermQAReport()
+    toast.success(ignored ? '已忽略该 QA 问题。' : '已恢复该 QA 问题。')
   } catch (error) {
     toast.error({
       title: ignored ? '忽略失败' : '恢复失败',
-      message: getErrorMessage(error, ignored ? '忽略术语 QA 项失败。' : '恢复术语 QA 项失败。'),
+      message: getErrorMessage(error, ignored ? '忽略 QA 问题失败。' : '恢复 QA 问题失败。'),
     })
   } finally {
     updatingTermQAIgnore.value = false
@@ -2403,7 +4031,7 @@ async function setSingleTermQAReportItemIgnored(item: TermQAReportItem, ignored:
 
 async function ignoreSelectedTermQAReportItems() {
   if (selectedActiveTermQAReportItems.value.length === 0) {
-    toast.warn('请先选择未忽略的术语 QA 项。')
+    toast.warn('请先选择未忽略的 QA 问题。')
     return
   }
   await setTermQAReportItemsIgnored(
@@ -2412,51 +4040,139 @@ async function ignoreSelectedTermQAReportItems() {
   )
 }
 
-async function focusTermQAReportItem(item: TermQAReportItem) {
-  const fileRecord = segmentStore.fileRecord
-  if (!fileRecord || locatingTermQAReportItemId.value) {
+async function loadWorkbenchQualityQASettings() {
+  const projectId = activeWorkbenchProjectId.value
+  if (!projectId) {
+    qualityQASettings.value = null
     return
   }
-  if (item.file_record_id !== fileRecord.id) {
-    toast.warn('该报告项不属于当前文件。')
+  loadingQualityQASettings.value = true
+  qualityQASettingsError.value = ''
+  try {
+    const { data } = await http.get<QualityQASettingsResponse>(
+      `/projects/${projectId}/quality-qa-settings`,
+    )
+    qualityQASettings.value = data
+    syncQualityQADraftFromSettings(data)
+  } catch (error) {
+    qualityQASettingsError.value = getErrorMessage(error, '质量保证设置加载失败。')
+  } finally {
+    loadingQualityQASettings.value = false
+  }
+}
+
+async function openQualityQAAdjustDialog() {
+  if (!canOpenQualityQAAdjustDialog.value) {
+    toast.warn('当前工作台缺少项目信息，无法调整质量保证设置。')
+    return
+  }
+  showQualityQAAdjustDialog.value = true
+  if (!qualityQASettings.value && !loadingQualityQASettings.value) {
+    await loadWorkbenchQualityQASettings()
+  }
+}
+
+function closeQualityQAAdjustDialog() {
+  if (savingQualityQASettings.value) {
+    return
+  }
+  showQualityQAAdjustDialog.value = false
+}
+
+async function saveWorkbenchQualityQASettings() {
+  const projectId = activeWorkbenchProjectId.value
+  if (!projectId || savingQualityQASettings.value) {
+    return false
+  }
+  savingQualityQASettings.value = true
+  qualityQASettingsError.value = ''
+  try {
+    const { data } = await http.patch<QualityQASettingsResponse>(
+      `/projects/${projectId}/quality-qa-settings`,
+      {
+        rules: buildQualityQARulesPayload(),
+        spelling_grammar: {
+          enabled: qualityQADraft.rules.spelling_grammar,
+        },
+      },
+    )
+    qualityQASettings.value = data
+    syncQualityQADraftFromSettings(data)
+    toast.success('质量保证设置已保存，可重新生成 QA 结果。')
+    return true
+  } catch (error) {
+    qualityQASettingsError.value = getErrorMessage(error, '质量保证设置保存失败。')
+    return false
+  } finally {
+    savingQualityQASettings.value = false
+  }
+}
+
+async function submitQualityQAAdjustDialog() {
+  const saved = await saveWorkbenchQualityQASettings()
+  if (saved) {
+    showQualityQAAdjustDialog.value = false
+  }
+}
+
+async function focusTermQAReportItem(item: WorkbenchQAResultItem) {
+  if (locatingTermQAReportItemId.value) {
+    return
+  }
+  const mergeViewId = segmentStore.mergeViewId || props.mergeViewId || ''
+  const isMergeMode = Boolean(isMergeWorkbench.value && mergeViewId)
+  const fileRecord = segmentStore.fileRecord
+  if (!isMergeMode && !fileRecord) {
     return
   }
 
   locatingTermQAReportItemId.value = item.id
   try {
-    const currentPageIndex = editorSegments.value.findIndex(
-      (segment) => segment.sentence_id === item.sentence_id,
-    )
+    const currentPageIndex = editorSegments.value.findIndex((segment) => (
+      isMergeMode
+        ? segment.file_record_id === item.file_record_id && segment.sentence_id === item.sentence_id
+        : segment.sentence_id === item.sentence_id
+    ))
     if (currentPageIndex >= 0) {
       await focusEditorSegmentAtIndex(currentPageIndex)
-      closeBottomDrawer()
       return
     }
 
-    const synced = await segmentStore.syncToBackend()
+    const synced = await syncPendingWorkbenchEdits()
     if (!synced) {
       return
     }
 
-    const { data } = await http.get<SegmentPositionResponse>(
-      `/file-records/${fileRecord.id}/segments/${encodeURIComponent(item.sentence_id)}/position`,
-      {
-        params: {
-          page_size: segmentStore.pageSize,
+    let data: SegmentPositionResponse
+    if (isMergeMode) {
+      data = await fetchMergeViewSegmentPosition(mergeViewId, item.file_record_id, item.sentence_id, {
+        pageSize: segmentStore.pageSize,
+      })
+    } else {
+      if (!fileRecord) {
+        return
+      }
+      data = (await http.get<SegmentPositionResponse>(
+        `/file-records/${fileRecord.id}/segments/${encodeURIComponent(item.sentence_id)}/position`,
+        {
+          params: {
+            page_size: segmentStore.pageSize,
+          },
         },
-      },
-    )
+      )).data
+    }
     await clearSegmentFiltersForTermQANavigation()
     await refreshSegmentPage(data.page, data.page_size)
-    const targetIndex = editorSegments.value.findIndex(
-      (segment) => segment.sentence_id === item.sentence_id,
-    )
+    const targetIndex = editorSegments.value.findIndex((segment) => (
+      isMergeMode
+        ? segment.file_record_id === item.file_record_id && segment.sentence_id === item.sentence_id
+        : segment.sentence_id === item.sentence_id
+    ))
     if (targetIndex === -1) {
       toast.warn('已切换到目标页，但未找到对应句段。')
       return
     }
     await focusEditorSegmentAtIndex(targetIndex)
-    closeBottomDrawer()
   } catch (error) {
     toast.error({
       title: '跳转 QA 句段失败',
@@ -2473,20 +4189,24 @@ async function downloadCurrentTermQAReport() {
   }
   downloadingTermQAReport.value = true
   try {
-    const response = await http.get(`/term-qa-reports/${termQAReport.value.id}/export-xlsx`, {
+    const mergeViewId = segmentStore.mergeViewId || props.mergeViewId || ''
+    const exportUrl = isMergeWorkbench.value
+      ? `/merge-views/${mergeViewId}/qa-results/export-xlsx`
+      : `/file-records/${segmentStore.fileRecord?.id}/qa-results/export-xlsx`
+    const response = await http.get(exportUrl, {
       responseType: 'blob',
     })
     downloadBlob(
       response.data,
       resolveDownloadFilename(
         response.headers['content-disposition'],
-        `term-qa-report-${termQAReport.value.id}.xlsx`,
+        `qa-result-${termQAReport.value.id}.xlsx`,
       ),
     )
   } catch (error) {
     toast.error({
-      title: '术语QA报告导出失败',
-      message: getErrorMessage(error, '术语QA报告导出失败。'),
+      title: 'QA 结果导出失败',
+      message: getErrorMessage(error, 'QA 结果导出失败。'),
     })
   } finally {
     downloadingTermQAReport.value = false
@@ -2504,6 +4224,24 @@ function setSegmentEditorRowRef(sentenceId: string, instance: Element | Componen
 function getActiveSegmentEditorRow() {
   const sentenceId = segmentStore.activeSentenceId
   return sentenceId ? segmentEditorRowRefs.get(sentenceId) || null : null
+}
+
+function recordSegmentEditorUndoBoundary(
+  sentenceId: string,
+  inputType: string,
+  preserveNextTargetSync = false,
+) {
+  return segmentEditorRowRefs.get(sentenceId)?.recordEditorUndoBoundary({
+    inputType,
+    preserveNextTargetSync,
+  }) ?? false
+}
+
+function recordActiveSegmentEditorUndoBoundary(inputType: string, preserveNextTargetSync = false) {
+  const sentenceId = segmentStore.activeSentenceId
+  return sentenceId
+    ? recordSegmentEditorUndoBoundary(sentenceId, inputType, preserveNextTargetSync)
+    : false
 }
 
 function undoActiveSegmentEdit() {
@@ -2533,6 +4271,7 @@ function redoActiveSegmentEdit() {
 // ========== 拆分/合并句段 ==========
 
 const selectedSentenceIds = ref<Set<string>>(new Set())
+const segmentSelectionAnchorId = ref<string | null>(null)
 const lastSourceCaretOffset = ref<number | null>(null)
 
 // 判断当前文件是否为 CAD 文件（DWG/DXF）
@@ -2545,11 +4284,42 @@ const isCadFile = computed(() => {
 // 切换激活句段时清除光标缓存
 watch(() => segmentStore.activeSentenceId, () => {
   lastSourceCaretOffset.value = null
+  syncActiveSegmentCommentDraft()
+  if (segmentSearchOpen.value && !hasEditorSegmentFilter.value) {
+    syncSegmentSearchReturnTarget()
+  }
 })
 
+function selectSegmentRange(fromSentenceId: string, toSentenceId: string) {
+  const segments = editorSegments.value
+  const fromIndex = segments.findIndex((segment) => segmentKeyOf(segment) === fromSentenceId)
+  const toIndex = segments.findIndex((segment) => segmentKeyOf(segment) === toSentenceId)
+  if (fromIndex === -1 || toIndex === -1) {
+    selectedSentenceIds.value = new Set([toSentenceId])
+    return
+  }
+  const [start, end] = fromIndex <= toIndex ? [fromIndex, toIndex] : [toIndex, fromIndex]
+  const next = new Set<string>()
+  for (let index = start; index <= end; index += 1) {
+    next.add(segmentKeyOf(segments[index]))
+  }
+  selectedSentenceIds.value = next
+}
+
 function handleSegmentClick(sentenceId: string, event: MouseEvent) {
+  if (event.shiftKey) {
+    const anchorId = segmentSelectionAnchorId.value || segmentStore.activeSentenceId
+    if (!anchorId) {
+      selectedSentenceIds.value = new Set([sentenceId])
+    } else {
+      selectSegmentRange(anchorId, sentenceId)
+    }
+    segmentSelectionAnchorId.value = sentenceId
+    segmentStore.setActiveSentence(sentenceId)
+    return
+  }
+
   if (event.ctrlKey || event.metaKey) {
-    // Ctrl+Click 多选
     const next = new Set(selectedSentenceIds.value)
     if (next.has(sentenceId)) {
       next.delete(sentenceId)
@@ -2557,9 +4327,8 @@ function handleSegmentClick(sentenceId: string, event: MouseEvent) {
       next.add(sentenceId)
     }
     selectedSentenceIds.value = next
-  } else {
-    // 普通点击清除多选
-    selectedSentenceIds.value = new Set()
+    segmentSelectionAnchorId.value = sentenceId
+    segmentStore.setActiveSentence(sentenceId)
   }
 }
 
@@ -2589,12 +4358,51 @@ const canSplitSegment = computed(() => {
   return activeSegmentCanWrite.value && (activeSegment.value.source_text || '').length >= 2
 })
 
+const orderedSelectedMergeSegments = computed(() => {
+  const selectedIds = selectedSentenceIds.value
+  return editorSegments.value.filter((segment) => selectedIds.has(segmentKeyOf(segment)))
+})
+
+function isSameMergeBlock(left: Segment, right: Segment) {
+  return (
+    (left.file_record_id ?? null) === (right.file_record_id ?? null)
+    && left.block_index === right.block_index
+    && (left.row_index ?? null) === (right.row_index ?? null)
+    && (left.cell_index ?? null) === (right.cell_index ?? null)
+  )
+}
+
+const selectedMergeSegmentsCanWrite = computed(() => (
+  orderedSelectedMergeSegments.value.length === selectedSentenceIds.value.size
+  && orderedSelectedMergeSegments.value.every((segment) => Boolean(segment.can_write))
+))
+
+const selectedMergeSegmentsInSameBlock = computed(() => {
+  const orderedSegments = orderedSelectedMergeSegments.value
+  if (orderedSegments.length < 2) return false
+  const first = orderedSegments[0]
+  return orderedSegments.every((segment) => isSameMergeBlock(segment, first))
+})
+
 const canMergeSegment = computed(() => {
-  if (selectedSentenceIds.value.size < 2) return false
-  return Array.from(selectedSentenceIds.value).every((sentenceId) => {
-    const segment = segmentStore.segments.find((item) => item.sentence_id === sentenceId)
-    return Boolean(segment?.can_write)
-  })
+  return (
+    orderedSelectedMergeSegments.value.length >= 2
+    && selectedMergeSegmentsCanWrite.value
+    && selectedMergeSegmentsInSameBlock.value
+  )
+})
+
+const mergeSegmentButtonTitle = computed(() => {
+  if (orderedSelectedMergeSegments.value.length < 2) {
+    return t('workbench.messages.mergeSelectAtLeast')
+  }
+  if (!selectedMergeSegmentsCanWrite.value) {
+    return t('workbench.messages.mergeReadonly')
+  }
+  if (!selectedMergeSegmentsInSameBlock.value) {
+    return t('workbench.messages.mergeDifferentBlock')
+  }
+  return t('workbench.ribbon.mergeSegment')
 })
 
 async function handleSplitSegment() {
@@ -2613,7 +4421,7 @@ async function handleSplitSegment() {
   }
 
   try {
-    await segmentStore.splitSegment(activeSegment.value.sentence_id, caretOffset)
+    await segmentStore.splitSegment(segmentKeyOf(activeSegment.value), caretOffset)
     lastSourceCaretOffset.value = null
     // 刷新预览（如果预览面板已打开）
     if (activeBottomTool.value === 'source-preview' || activeBottomTool.value === 'split-preview') {
@@ -2634,8 +4442,7 @@ async function handleMergeSegment() {
   }
 
   // 按当前显示顺序排列选中的句段
-  const selectedIds = selectedSentenceIds.value
-  const orderedSegments = editorSegments.value.filter((s) => selectedIds.has(s.sentence_id))
+  const orderedSegments = orderedSelectedMergeSegments.value
 
   if (orderedSegments.length < 2) {
     toast.warn({ message: t('workbench.messages.mergeSelectAtLeast') })
@@ -2645,17 +4452,8 @@ async function handleMergeSegment() {
   // CAD 文件（DWG/DXF）：允许跨 block 合并，不检查相邻性
   // 其他格式：必须同一 block
   const first = orderedSegments[0]
-  if (isCadFile.value) {
-    // CAD 文件：用户选择的句段即可合并，不强制检查相邻性
-    // CAD 图纸的实体位置关系复杂，由用户自行判断
-  } else {
-    // 其他格式：检查是否属于同一段落
-    const notSameBlock = orderedSegments.some(
-      (s) =>
-        s.block_index !== first.block_index
-        || s.row_index !== first.row_index
-        || s.cell_index !== first.cell_index,
-    )
+  if (!isCadFile.value) {
+    const notSameBlock = orderedSegments.some((segment) => !isSameMergeBlock(segment, first))
     if (notSameBlock) {
       toast.warn({ message: t('workbench.messages.mergeDifferentBlock') })
       return
@@ -2663,9 +4461,9 @@ async function handleMergeSegment() {
   }
 
   try {
-    const baseSentenceId = orderedSegments[0].sentence_id
+    const baseSentenceId = segmentKeyOf(orderedSegments[0])
     for (let i = 1; i < orderedSegments.length; i++) {
-      await segmentStore.mergeSegment(baseSentenceId, orderedSegments[i].sentence_id)
+      await segmentStore.mergeSegment(baseSentenceId, segmentKeyOf(orderedSegments[i]))
     }
     selectedSentenceIds.value = new Set()
     // 刷新预览（如果预览面板已打开）
@@ -2691,6 +4489,16 @@ function getActiveEditorElement(): HTMLElement | null {
   return document.querySelector(selector)
 }
 
+function hasSelectedEditorText(editor: HTMLElement) {
+  const selection = window.getSelection()
+  return Boolean(
+    selection
+    && selection.rangeCount > 0
+    && !selection.isCollapsed
+    && editor.contains(selection.anchorNode),
+  )
+}
+
 /**
  * 应用文本格式（粗体、斜体、下划线等）
  */
@@ -2712,6 +4520,9 @@ function applyTextFormat(format: TextFormat) {
     }
 
     // 应用格式（会同时切换 activeFormats 状态）
+    if (hasSelectedEditorText(editor)) {
+      recordActiveSegmentEditorUndoBoundary(`format:${format}`)
+    }
     richTextEditor.applyFormat(format, editor)
 
     // 触发 input 事件以同步数据
@@ -2742,12 +4553,14 @@ function clearSelectedFormat() {
 
   if (hasSelectedText) {
     // 有选中文本：清除选中文本的格式
+    recordActiveSegmentEditorUndoBoundary('format:clear-selection')
     if (richTextEditor.clearFormat(editor)) {
       editor.dispatchEvent(new Event('input', { bubbles: true }))
       toast.success(t('workbench.ribbon.messages.formatCleared'))
     }
   } else {
     // 没有选中文本：清除整个段落的所有格式
+    recordActiveSegmentEditorUndoBoundary('format:clear-all')
     const plainText = richTextEditor.clearAllFormatInElement(editor)
     if (activeSegment.value) {
       updateSegmentTarget(activeSegment.value.sentence_id, plainText)
@@ -2770,6 +4583,7 @@ function clearAllFormat() {
     return
   }
 
+  recordActiveSegmentEditorUndoBoundary('format:clear-all')
   const plainText = richTextEditor.clearAllFormatInElement(editor)
   if (activeSegment.value) {
     updateSegmentTarget(activeSegment.value.sentence_id, plainText)
@@ -2790,6 +4604,13 @@ function applyCase(caseType: CaseType) {
 
   editor.focus()
 
+  if (!hasSelectedEditorText(editor)) {
+    toast.warn(t('workbench.ribbon.messages.selectTextFirst'))
+    showCaseMenu.value = false
+    return
+  }
+
+  recordActiveSegmentEditorUndoBoundary(`case:${caseType}`)
   if (richTextEditor.changeCase(caseType, editor)) {
     editor.dispatchEvent(new Event('input', { bubbles: true }))
   } else {
@@ -2842,6 +4663,7 @@ function insertSpecialChar(char: string) {
     selection?.addRange(range)
   }
 
+  recordActiveSegmentEditorUndoBoundary('insertSpecialCharacter')
   document.execCommand('insertText', false, char)
   editor.dispatchEvent(new Event('input', { bubbles: true }))
 
@@ -2881,7 +4703,12 @@ function copySourceToTarget() {
   }
 
   const sourceText = getSegmentCopyableSourceText(activeSegment.value)
-  updateSegmentTarget(activeSegment.value.sentence_id, sourceText)
+  updateSegmentTarget(
+    segmentKeyOf(activeSegment.value),
+    sourceText,
+    undefined,
+    { recordUndo: true, undoInputType: 'copySourceToTarget' },
+  )
   toast.success(t('workbench.ribbon.messages.sourceCopied'))
 }
 
@@ -2895,8 +4722,32 @@ function clearActiveTarget() {
     return
   }
 
-  updateSegmentTarget(activeSegment.value.sentence_id, '')
+  updateSegmentTarget(
+    segmentKeyOf(activeSegment.value),
+    '',
+    undefined,
+    { recordUndo: true, undoInputType: 'clearTarget' },
+  )
   toast.success(t('workbench.ribbon.messages.targetCleared'))
+}
+
+function setActiveTargetSpacePlaceholder() {
+  if (!activeSegment.value) {
+    toast.warn(t('workbench.ribbon.noActiveSegment'))
+    return
+  }
+  if (!activeSegmentCanWrite.value) {
+    toast.warn('当前流程阶段无编辑权限')
+    return
+  }
+
+  updateSegmentTarget(
+    segmentKeyOf(activeSegment.value),
+    ' ',
+    undefined,
+    { recordUndo: true, undoInputType: 'spacePlaceholder' },
+  )
+  toast.success(t('workbench.ribbon.messages.spacePlaceholderSet'))
 }
 
 function resolveAddTermTargetBaseId() {
@@ -2914,7 +4765,7 @@ function resolveAddTermTargetBaseId() {
   return candidates[0]?.id || ''
 }
 
-async function openAddTermDialog() {
+async function openAddTermPanel() {
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
     return
@@ -2927,6 +4778,7 @@ async function openAddTermDialog() {
   if (addTermTargetTermBases.value.length === 0) {
     toast.warn('当前文件没有可写入的已启用术语库。')
     activeSideTool.value = 'terms'
+    showAddTermPanel.value = false
     return
   }
 
@@ -2934,14 +4786,15 @@ async function openAddTermDialog() {
   addTermTargetText.value = ''
   addTermTargetBaseId.value = resolveAddTermTargetBaseId()
   addTermFormError.value = ''
-  showAddTermDialog.value = true
+  activeSideTool.value = 'terms'
+  showAddTermPanel.value = true
 }
 
-function closeAddTermDialog() {
+function closeAddTermPanel() {
   if (addingTerm.value) {
     return
   }
-  showAddTermDialog.value = false
+  showAddTermPanel.value = false
   addTermFormError.value = ''
 }
 
@@ -2966,11 +4819,12 @@ async function submitAddTermForm() {
     await http.post(`/term-bases/${targetBaseId}/entries`, {
       source_text: sourceText,
       target_text: targetText,
+      file_record_id: activeWorkbenchFileId.value,
     })
     selectedTermBaseId.value = targetBaseId
     await loadTermEntries()
     activeSideTool.value = 'terms'
-    showAddTermDialog.value = false
+    showAddTermPanel.value = false
     toast.success(t('workbench.ribbon.messages.termAdded'))
   } catch (error) {
     addTermFormError.value = getErrorMessage(error, t('workbench.ribbon.messages.termAddFailed'))
@@ -2997,23 +4851,51 @@ function toggleRevisionMenu(kind: RevisionMenuKind) {
   openConfirmMenu.value = false
 }
 
+function toggleRevisionTracking() {
+  if (segmentStore.revisionTrackingEnabled) {
+    segmentStore.stopRevisionTracking()
+    toast.success(t('workbench.ribbon.messages.revisionTrackingStopped'))
+  } else {
+    segmentStore.startRevisionTracking()
+    toast.success(t('workbench.ribbon.messages.revisionTrackingStarted'))
+  }
+  openRevisionMenu.value = null
+}
+
 function setRevisionTraceVisible(visible: boolean) {
   revisionTraceVisible.value = visible
   try {
     window.localStorage.setItem(REVISION_TRACE_VISIBLE_STORAGE_KEY, visible ? '1' : '0')
   } catch {}
-  if (visible) {
-    segmentStore.startRevisionTracking()
-  } else {
-    segmentStore.stopRevisionTracking()
-  }
   openRevisionMenu.value = null
   toast.success(visible ? t('workbench.ribbon.messages.revisionTraceShown') : t('workbench.ribbon.messages.revisionTraceHidden'))
 }
 
 function openRevisionTraceSettings() {
   openRevisionMenu.value = null
-  toast.info(t('workbench.ribbon.messages.revisionTraceSettingsHint'))
+  showRevisionSettingsDialog.value = true
+}
+
+async function handleSaveRevisionSettings(payload: RevisionDisplaySettings) {
+  revisionSettingsSaving.value = true
+  pageError.value = ''
+  try {
+    await segmentStore.saveRevisionSettings(payload)
+    showRevisionSettingsDialog.value = false
+    toast.success(t('workbench.ribbon.messages.revisionTraceSettingsSaved'))
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('workbench.ribbon.messages.revisionTraceSettingsSaveFailed'))
+  } finally {
+    revisionSettingsSaving.value = false
+  }
+}
+
+async function goToPendingRevision(direction: 'prev' | 'next') {
+  const target = resolveRevisionNavigationTarget(direction)
+  if (!target) {
+    return
+  }
+  await handlePreviewFocus(target)
 }
 
 async function handleAcceptActiveRevision() {
@@ -3118,7 +5000,12 @@ async function handleBatchRejectRevisions() {
 }
 
 function handleApplyTMTarget(sentenceId: string, targetText: string) {
-  updateSegmentTarget(sentenceId, targetText)
+  updateSegmentTarget(
+    sentenceId,
+    targetText,
+    undefined,
+    { recordUndo: true, undoInputType: 'applyMatchTarget' },
+  )
 }
 
 function getRouteQueryString(value: unknown) {
@@ -3151,6 +5038,10 @@ async function replaceSegmentPageQueryIfNeeded() {
 }
 
 async function loadTask() {
+  if (!props.id) {
+    pageError.value = t('workbench.errors.taskLoad')
+    return
+  }
   pageError.value = ''
   activeSideTool.value = null
   closeBottomDrawer()
@@ -3167,13 +5058,12 @@ async function loadTask() {
   setCurrentTermQAReport(null)
 
   try {
-    await segmentStore.loadTask(props.id, {
-      page: Number(route.query.page || 1),
-      pageSize: Number(route.query.pageSize || segmentStore.pageSize || 100),
-      scope: segmentDisplayScope.value,
-      sourceQuery: sourceSearchQuery.value,
-      targetQuery: targetSearchQuery.value,
-      searchFuzzy: searchFuzzyEnabled.value,
+    const taskId = props.id
+    await segmentStore.loadTask(taskId, {
+      ...getSegmentWindowQuery(
+        Number(route.query.page || 1),
+        Number(route.query.pageSize || segmentStore.pageSize || 100),
+      ),
     })
     await replaceSegmentPageQueryIfNeeded()
     if (segmentStore.fileRecord?.is_edit_locked) {
@@ -3192,18 +5082,18 @@ async function loadTask() {
     if (segmentStore.segments[0] && !segmentStore.activeSentenceId) {
       segmentStore.setActiveSentence(segmentStore.segments[0].sentence_id)
     }
-    if (revisionTraceVisible.value) {
+    if (segmentStore.revisionTrackingEnabled) {
       segmentStore.startRevisionTracking()
     }
 
     try {
       const commentQuery = getCommentWindowQuery()
       if (commentQuery) {
-        await commentStore.loadComments(props.id, commentQuery)
+        await commentStore.loadComments(taskId, commentQuery)
       } else {
         commentStore.resetState()
       }
-      commentStore.startPolling(props.id, getCommentWindowQuery)
+      commentStore.startPolling(taskId, getCommentWindowQuery)
     } catch (error) {
       commentStore.message = getErrorMessage(error, t('workbench.errors.commentsUnavailable'))
     }
@@ -3212,6 +5102,9 @@ async function loadTask() {
 
     await loadTermBases()
     await loadLatestTermQAReport()
+
+    // 加载参考文件匹配结果
+    await loadReferenceMatchResult()
 
     const boundTermBaseId = segmentStore.fileRecord?.term_base_id
     if (boundTermBaseId) {
@@ -3226,38 +5119,93 @@ async function loadTask() {
   }
 }
 
-async function refreshSegmentPage(page = segmentStore.currentPage, size = segmentStore.pageSize) {
-  if (!segmentStore.fileRecord) {
+async function loadMergeViewTask() {
+  if (!props.mergeViewId) {
+    return
+  }
+  pageError.value = ''
+  activeSideTool.value = null
+  closeBottomDrawer()
+  openRevisionMenu.value = null
+  suppressSegmentFilterWatch = true
+  resetSegmentSearch()
+  suppressSegmentFilterWatch = false
+  commentStore.stopPolling()
+  termEntries.value = []
+  termBases.value = []
+  selectedTermBaseId.value = ''
+  resourceSearchQuery.value = ''
+  resetResourceSearchResults()
+  setCurrentTermQAReport(null)
+
+  try {
+    await segmentStore.loadMergeView(props.mergeViewId, {
+      ...getSegmentWindowQuery(
+        Number(route.query.page || 1),
+        Number(route.query.pageSize || segmentStore.pageSize || 100),
+      ),
+    })
+    await replaceSegmentPageQueryIfNeeded()
+    // 合并模式：禁用批注/项目同步轮询等单文件特性（一期）
+    commentStore.resetState()
+    workbenchGuidelines.value = ''
+    await loadTermBases()
+    await loadLatestTermQAReport()
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('workbench.errors.taskLoad'))
+  } finally {
+    await nextTick()
+    observeSegmentEditorResults()
+    scheduleSegmentEditorScrollbarGutterUpdate()
+  }
+}
+
+async function refreshSegmentPage(
+  page = segmentStore.currentPage,
+  size = segmentStore.pageSize,
+  options: { includeStats?: boolean } = {},
+) {
+  const isMergeMode = Boolean(segmentStore.mergeViewId || props.mergeViewId)
+  if (!isMergeMode && !segmentStore.fileRecord) {
     return
   }
 
+  // total_segments / status_stats 仅随句段编辑变化；纯翻页时复用缓存即可。
+  // 但若本次同步保存了脏数据，则必须重新统计，因此叠加 dirtyCount 判断。
+  const includeStats = options.includeStats ?? true
+  const hadPendingEdits = segmentStore.dirtyCount > 0
+
   pageError.value = ''
   try {
-    const synced = await segmentStore.syncToBackend()
+    const synced = await syncPendingWorkbenchEdits()
     if (!synced) {
+      const reason = segmentStore.syncMessage || t('workbench.errors.loadMore')
+      pageError.value = reason
+      toast.warn(reason)
       return
     }
-    await segmentStore.loadSegmentPage({
-      page,
-      pageSize: size,
-      scope: segmentDisplayScope.value,
-      sourceQuery: sourceSearchQuery.value,
-      targetQuery: targetSearchQuery.value,
-      searchFuzzy: searchFuzzyEnabled.value,
-    })
-    if (revisionTraceVisible.value) {
-      segmentStore.startRevisionTracking()
-    }
-    const commentQuery = getCommentWindowQuery()
-    try {
-      if (commentQuery) {
-        await commentStore.loadComments(props.id, commentQuery)
-        commentStore.startPolling(props.id, getCommentWindowQuery)
-      } else {
-        commentStore.resetState()
+    const nextQuery = getSegmentWindowQuery(page, size, includeStats || hadPendingEdits)
+    if (isMergeMode) {
+      await segmentStore.refreshMergeViewPage(nextQuery)
+      commentStore.resetState()
+    } else {
+      await segmentStore.loadSegmentPage({
+        ...nextQuery,
+      })
+      if (segmentStore.revisionTrackingEnabled) {
+        segmentStore.startRevisionTracking()
       }
-    } catch (error) {
-      commentStore.message = getErrorMessage(error, t('workbench.errors.commentsUnavailable'))
+      const commentQuery = getCommentWindowQuery()
+      try {
+        if (commentQuery && props.id) {
+          await commentStore.loadComments(props.id, commentQuery)
+          commentStore.startPolling(props.id, getCommentWindowQuery)
+        } else {
+          commentStore.resetState()
+        }
+      } catch (error) {
+        commentStore.message = getErrorMessage(error, t('workbench.errors.commentsUnavailable'))
+      }
     }
     await nextTick()
     await virtualListRef.value?.scrollToIndex(0, 'start')
@@ -3276,16 +5224,57 @@ async function refreshSegmentPage(page = segmentStore.currentPage, size = segmen
 }
 
 async function handleSegmentPageChange(page: number) {
-  await refreshSegmentPage(page, segmentStore.pageSize)
+  if (ignoreNextPaginationPageReset && page === 1) {
+    ignoreNextPaginationPageReset = false
+    return
+  }
+  ignoreNextPaginationPageReset = false
+  const shouldSyncReturnTarget = segmentSearchOpen.value && !hasEditorSegmentFilter.value
+  if (!hasEditorSegmentFilter.value) {
+    pendingSegmentSearchReturnPage = page
+    captureSegmentSearchReturnPage(page)
+  }
+  await refreshSegmentPage(page, segmentStore.pageSize, { includeStats: false })
+  if (shouldSyncReturnTarget) {
+    syncSegmentSearchReturnTarget()
+  }
+  if (pendingSegmentSearchReturnPage === page) {
+    pendingSegmentSearchReturnPage = null
+  }
 }
 
 async function handleSegmentPageSizeChange(size: number) {
-  await refreshSegmentPage(1, size)
+  ignoreNextPaginationPageReset = true
+  const shouldSyncReturnTarget = segmentSearchOpen.value && !hasEditorSegmentFilter.value
+  if (!hasEditorSegmentFilter.value) {
+    pendingSegmentSearchReturnPage = 1
+    captureSegmentSearchReturnPage(1)
+  }
+  try {
+    await refreshSegmentPage(1, size, { includeStats: false })
+    if (shouldSyncReturnTarget) {
+      syncSegmentSearchReturnTarget()
+    }
+    if (pendingSegmentSearchReturnPage === 1) {
+      pendingSegmentSearchReturnPage = null
+    }
+  } finally {
+    ignoreNextPaginationPageReset = false
+  }
 }
 
 async function runLLMTranslation() {
   pageError.value = ''
   const currentSentenceId = activeSegment.value?.sentence_id || ''
+  const isMergeViewBatch = Boolean(
+    segmentStore.mergeViewId
+    && llmMergeTarget.value === 'merge_view'
+    && llmScope.value !== 'current_segment',
+  )
+  if (segmentStore.mergeViewId && !isMergeViewBatch && !segmentStore.activeFileRecordId) {
+    toast.warn('请先选中一个句段，以确定本次 AI 处理的当前文件。')
+    return
+  }
   if (llmScope.value === 'current_segment' && currentSentenceId && !activeSegmentCanWrite.value) {
     toast.warn('当前流程阶段无编辑权限')
     return
@@ -3295,11 +5284,20 @@ async function runLLMTranslation() {
     return
   }
   try {
+    commitActiveSegmentEditorContent()
+    const synced = await syncPendingWorkbenchEdits()
+    if (!synced) {
+      const reason = segmentStore.syncMessage || t('workbench.errors.save')
+      pageError.value = reason
+      toast.warn(reason)
+      return
+    }
     await segmentStore.startLLMTranslation(llmScope.value, llmProvider.value, {
       guidelineTemplateId: selectedGuidelineTemplateId.value || undefined,
       temporaryPrompt: workbenchGuidelines.value,
       model: llmModel.value || undefined,
       sentenceId: llmScope.value === 'current_segment' ? currentSentenceId : undefined,
+      mergeTarget: segmentStore.mergeViewId ? llmMergeTarget.value : undefined,
     })
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.llm'))
@@ -3322,6 +5320,13 @@ async function loadTMCollections() {
 }
 
 async function openSaveToTMDialog() {
+  if (isMergeWorkbench.value) {
+    toast.warn('合并视图暂不支持保存到 TM；请切到单文件工作台，或后续按语言对分批执行。')
+    return
+  }
+  if (!segmentStore.fileRecord) {
+    return
+  }
   pageError.value = ''
   saveToTMScope.value = 'translated'
   saveToTMTargetMode.value = 'new'
@@ -3360,7 +5365,7 @@ async function saveToTM() {
   pageError.value = ''
   savingToTM.value = true
   try {
-    const synced = await segmentStore.syncToBackend()
+    const synced = await syncPendingWorkbenchEdits()
     if (!synced) {
       return
     }
@@ -3434,15 +5439,21 @@ function handleIssueSaved(_marker: IssueMarker) {
 }
 
 async function saveNow() {
+  if (manualSaving.value) {
+    return
+  }
   pageError.value = ''
+  manualSaving.value = true
   try {
-    const synced = await segmentStore.syncToBackend()
+    const synced = await syncPendingWorkbenchEdits()
     if (!synced) {
       return
     }
     toast.success(t('workbench.messages.synced'))
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.save'))
+  } finally {
+    manualSaving.value = false
   }
 }
 
@@ -3468,6 +5479,18 @@ async function goBack() {
 }
 
 function openFocusWorkbench() {
+  if (props.mergeViewId) {
+    const resolved = router.resolve({
+      name: 'merge-view-focus',
+      params: { viewId: props.mergeViewId },
+      query: { ...route.query },
+    })
+    window.open(resolved.href, '_blank', 'noopener,noreferrer')
+    return
+  }
+  if (!props.id) {
+    return
+  }
   const resolved = router.resolve({
     name: 'workbench-focus',
     params: { id: props.id },
@@ -3485,7 +5508,7 @@ async function handlePreviewFocus(sentenceId: string) {
 
   if (hasEditorSegmentFilter.value) {
     await ensureFilteredCorpusLoaded()
-    const filteredIndex = editorSegments.value.findIndex((segment) => segment.sentence_id === sentenceId)
+    const filteredIndex = editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === sentenceId)
     if (filteredIndex === -1) {
       return
     }
@@ -3495,7 +5518,9 @@ async function handlePreviewFocus(sentenceId: string) {
     return
   }
 
-  const index = await segmentStore.ensureSentenceLoaded(sentenceId)
+  const index = segmentStore.mergeViewId
+    ? editorSegments.value.findIndex((segment) => segmentKeyOf(segment) === sentenceId)
+    : await segmentStore.ensureSentenceLoaded(sentenceId)
   if (index === -1) {
     return
   }
@@ -3569,8 +5594,9 @@ async function waitForFileExportTask(task: FileExportTask) {
   }
 }
 
-async function exportWithType(exportType: string) {
-  if (!segmentStore.fileRecord || exporting.value) return
+async function exportWithTypeForFile(exportType: string, fileRecordId?: string | null) {
+  const targetFileRecordId = fileRecordId || segmentStore.fileRecord?.id || ''
+  if (!targetFileRecordId || exporting.value) return
 
   pageError.value = ''
   exporting.value = true
@@ -3579,8 +5605,13 @@ async function exportWithType(exportType: string) {
   showExportMenu.value = false
 
   try {
+    const synced = await syncPendingWorkbenchEdits()
+    if (!synced) {
+      return
+    }
+
     const { data: task } = await http.post<FileExportTask>(
-      `/file-records/${segmentStore.fileRecord.id}/exports`,
+      `/file-records/${targetFileRecordId}/exports`,
       null,
       { params: { type: exportType } },
     )
@@ -3608,6 +5639,10 @@ async function exportWithType(exportType: string) {
   }
 }
 
+async function exportWithType(exportType: string) {
+  await exportWithTypeForFile(exportType, segmentStore.fileRecord?.id)
+}
+
 // 点击外部关闭导出菜单
 function handleClickOutside(event: MouseEvent) {
   const target = event.target as HTMLElement
@@ -3633,6 +5668,13 @@ function handleClickOutside(event: MouseEvent) {
   ) {
     openConfirmMenu.value = false
   }
+  if (
+    segmentScreeningPopoverOpen.value
+    && !target.closest('.segment-screening-popover')
+    && !target.closest('.segment-editor-toolbar__screening')
+  ) {
+    segmentScreeningPopoverOpen.value = false
+  }
   // 关闭格式化相关的下拉菜单
   if (!target.closest('.case-menu') && !target.closest('.clear-format-menu') && !target.closest('.special-char-menu')) {
     closeAllMenus()
@@ -3642,8 +5684,10 @@ function handleClickOutside(event: MouseEvent) {
 async function handleCommentDraft(draft: CommentAnchorDraft) {
   commentStore.setDraftAnchor(draft)
   commentStore.setActiveComment(null)
-  segmentStore.setActiveSentence(draft.sentence_id)
-  await handlePreviewFocus(draft.sentence_id)
+  const sentenceKey = resolveCommentSentenceKey(draft.sentence_id, activeWorkbenchFileId.value)
+  if (sentenceKey) {
+    await handlePreviewFocus(sentenceKey)
+  }
   activeSideTool.value = 'notes'
 }
 
@@ -3652,23 +5696,28 @@ async function handleCommentFocus(commentId: string) {
   commentStore.setActiveComment(commentId)
   const comment = commentStore.comments.find((item) => item.id === commentId)
   if (comment?.sentence_id) {
-    segmentStore.setActiveSentence(comment.sentence_id)
-    await handlePreviewFocus(comment.sentence_id)
+    const sentenceKey = resolveCommentSentenceKey(comment.sentence_id, comment.file_record_id)
+    if (sentenceKey) {
+      await handlePreviewFocus(sentenceKey)
+    }
   }
   activeSideTool.value = 'notes'
 }
 
 async function handleCreateComment(payload: CommentCreatePayload) {
-  if (!segmentStore.fileRecord) {
+  const fileRecordId = activeWorkbenchFileId.value || segmentStore.fileRecord?.id || props.id
+  if (!fileRecordId) {
     return
   }
 
   pageError.value = ''
   try {
-    const comment = await commentStore.createComment(segmentStore.fileRecord.id, payload)
+    const comment = await commentStore.createComment(fileRecordId, payload)
     if (comment.sentence_id) {
-      segmentStore.setActiveSentence(comment.sentence_id)
-      await handlePreviewFocus(comment.sentence_id)
+      const sentenceKey = resolveCommentSentenceKey(comment.sentence_id, comment.file_record_id || fileRecordId)
+      if (sentenceKey) {
+        await handlePreviewFocus(sentenceKey)
+      }
     }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.commentSave'))
@@ -3680,8 +5729,10 @@ async function handleReplyComment(commentId: string, body: string) {
   try {
     const comment = await commentStore.replyToComment(commentId, { body })
     if (comment.sentence_id) {
-      segmentStore.setActiveSentence(comment.sentence_id)
-      await handlePreviewFocus(comment.sentence_id)
+      const sentenceKey = resolveCommentSentenceKey(comment.sentence_id, comment.file_record_id)
+      if (sentenceKey) {
+        await handlePreviewFocus(sentenceKey)
+      }
     }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.replySave'))
@@ -3693,7 +5744,10 @@ async function handleUpdateComment(commentId: string, payload: { body?: string; 
   try {
     const comment = await commentStore.updateComment(commentId, payload)
     if (comment.sentence_id) {
-      segmentStore.setActiveSentence(comment.sentence_id)
+      const sentenceKey = resolveCommentSentenceKey(comment.sentence_id, comment.file_record_id)
+      if (sentenceKey) {
+        segmentStore.setActiveSentence(sentenceKey)
+      }
     }
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.commentUpdate'))
@@ -3743,7 +5797,13 @@ function handleReplaceText(text: string) {
     return
   }
 
-  updateSegmentTarget(activeSegment.value.sentence_id, text)
+  const sentenceId = segmentKeyOf(activeSegment.value)
+  updateSegmentTarget(
+    sentenceId,
+    text,
+    undefined,
+    { recordUndo: true, undoInputType: 'replaceTargetFromMatchPanel' },
+  )
   toast.success(t('matchPanel.textInserted'))
 }
 
@@ -3752,25 +5812,79 @@ function handleAppendText(text: string) {
     return
   }
 
+  const activeEditor = getActiveSegmentEditorRow()
+  if (activeEditor?.insertOrReplaceTargetText(text)) {
+    toast.success(t('matchPanel.textInserted'))
+    return
+  }
+
+  const sentenceId = segmentKeyOf(activeSegment.value)
   const nextText = appendToCurrentText(activeSegment.value.target_text || '', text)
-  updateSegmentTarget(activeSegment.value.sentence_id, nextText)
+  updateSegmentTarget(
+    sentenceId,
+    nextText,
+    undefined,
+    { recordUndo: true, undoInputType: 'appendTargetFromMatchPanel' },
+  )
   toast.success(t('matchPanel.textInserted'))
 }
 
 // 加载参考文件匹配结果（工作台初始化时调用）
-// 已废弃：参考资料分析后会自动同步到项目级 TM/术语库，匹配通过原生通道命中。
+async function loadReferenceMatchResult() {
+  const fileRecordId = activeWorkbenchFileId.value
+  if (!fileRecordId) return
+
+  try {
+    const res = await http.get<import('../types/api').ReferenceMatchResult | null>(
+      `/reference/file-records/${fileRecordId}/match-result`
+    )
+    if (res.data) {
+      referenceMatchResult.value = res.data
+    }
+  } catch {
+    // 没有匹配结果或加载失败，静默处理
+    referenceMatchResult.value = null
+  }
+}
+
+// 参考文件匹配处理
+function handleReferenceMatchesLoaded(matches: import('../types/api').ReferenceMatchResult) {
+  // 保存匹配结果供 WorkbenchMatchPanel 使用
+  referenceMatchResult.value = matches
+
+  // 匹配结果加载后显示详细提示
+  const messages: string[] = []
+
+  if (matches.exact_count > 0) {
+    messages.push(`精确匹配 ${matches.exact_count} 条`)
+  }
+  if (matches.fuzzy_count > 0) {
+    messages.push(`模糊匹配 ${matches.fuzzy_count} 条`)
+  }
+  if (matches.term_count > 0) {
+    messages.push(`术语匹配 ${matches.term_count} 条`)
+  }
+
+  if (messages.length > 0) {
+    toast.info(`参考匹配完成: ${messages.join('，')}`)
+  } else {
+    toast.info('未找到匹配的参考内容')
+  }
+}
+
+async function handleReferenceApplyExactMatches() {
+  // 精确匹配应用后重新加载句段
+  toast.success('精确匹配已应用，正在刷新...')
+  await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize)
+}
 
 async function handleReferenceAITranslateComplete(result: { updated_count: number; error_count: number }) {
   // AI翻译完成后重新加载句段
-  const message = result.error_count > 0 
+  const message = result.error_count > 0
     ? `AI翻译完成: 成功 ${result.updated_count} 条，失败 ${result.error_count} 条`
     : `AI翻译完成: 成功翻译 ${result.updated_count} 条`
   toast.success(message)
-  await segmentStore.fetchSegments({ 
-    fileRecordId: props.id, 
-    skip: 0, 
-    limit: segmentStore.pageSize 
-  })
+  await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize)
 }
 
 async function ensureMatchInfoPanelOpen() {
@@ -3778,27 +5892,53 @@ async function ensureMatchInfoPanelOpen() {
   activeSideTool.value = 'match-info'
 
   try {
-    if (termBases.value.length === 0 && !loadingTermBases.value) {
-      await loadTermBases()
-    }
-    if (!selectedTermBaseId.value && termBases.value.length > 0) {
-      selectedTermBaseId.value = termBases.value[0].id
-    }
-    if (selectedTermBaseId.value && termEntries.value.length === 0 && !loadingTermEntries.value) {
-      await loadTermEntries()
-    }
+    await ensureMatchInfoTermContext()
   } catch (error) {
     pageError.value = getErrorMessage(error, t('workbench.errors.sidePanel'))
   }
 }
 
 function handleSegmentTargetActivate(sentenceId: string) {
-  selectedSentenceIds.value = new Set()
+  selectedSentenceIds.value = new Set([sentenceId])
+  segmentSelectionAnchorId.value = sentenceId
   segmentStore.setActiveSentence(sentenceId)
 }
 
 watch(() => props.id, () => {
-  void loadTask()
+  if (props.mergeViewId) {
+    void loadMergeViewTask()
+  } else {
+    void loadTask()
+  }
+})
+
+watch(() => props.mergeViewId, () => {
+  if (props.mergeViewId) {
+    void loadMergeViewTask()
+  } else if (props.id) {
+    void loadTask()
+  }
+})
+
+watch(() => segmentStore.activeFileRecordId, () => {
+  if (!segmentStore.mergeViewId) {
+    return
+  }
+  referenceMatchResult.value = null
+  resetResourceSearchResults(
+    activeWorkbenchFileId.value
+      ? '请输入关键词，搜索当前激活文件绑定的资源库。'
+      : '请先选中一个句段后再搜索当前文件绑定的资源库。',
+  )
+  if (activeSideTool.value === 'terms' && !loadingTermBases.value) {
+    void loadTermBases()
+  }
+  if (
+    activeWorkbenchFileId.value
+    && (activeSideTool.value === 'reference' || activeSideTool.value === 'match-info')
+  ) {
+    void loadReferenceMatchResult()
+  }
 })
 
 watch(selectedTermBaseId, () => {
@@ -3809,8 +5949,22 @@ watch(selectedTermBaseId, () => {
   void loadTermEntries()
 })
 
+watch(
+  () => boundTermBaseIds.value.join('|'),
+  () => {
+    if (activeSideTool.value === 'match-info') {
+      void ensureMatchInfoTermContext()
+      return
+    }
+    void segmentStore.refreshActiveTermMatches()
+    if (activeSideTool.value === 'terms' && !loadingTermBases.value) {
+      void loadTermBases()
+    }
+  },
+)
+
 watch(resourceSearchMode, () => {
-  if (activeSideTool.value === 'resource-search' && resourceSearchQuery.value.trim()) {
+  if (activeSideTool.value === 'resource-search' && normalizeResourceSearchKeyword(resourceSearchQuery.value)) {
     void runResourceSearch()
   }
 })
@@ -3821,13 +5975,22 @@ watch(saveToTMScope, () => {
   }
 })
 
-watch([segmentDisplayScope, sourceSearchQuery, targetSearchQuery, searchFuzzyEnabled], async () => {
+watch([
+  segmentDisplayScope,
+  sourceSearchQuery,
+  targetSearchQuery,
+  sourceExcludeQuery,
+  targetExcludeQuery,
+  searchFuzzyEnabled,
+  searchCaseSensitive,
+  segmentScreeningQueryKey,
+], async () => {
   if (suppressSegmentFilterWatch) {
     return
   }
   searchLoadRequestId += 1
   searchLoadingAllSegments.value = false
-  if (segmentStore.fileRecord) {
+  if (segmentStore.fileRecord || segmentStore.mergeViewId) {
     await refreshSegmentPage(1, segmentStore.pageSize)
   }
 })
@@ -3869,7 +6032,7 @@ onMounted(() => {
     observeSegmentEditorResults()
     scheduleSegmentEditorScrollbarGutterUpdate()
   })
-  void loadTask()
+  void (props.mergeViewId ? loadMergeViewTask() : loadTask())
   void loadGuidelineTemplates()
 })
 
@@ -3888,7 +6051,7 @@ onBeforeUnmount(() => {
 
 onBeforeRouteLeave(async () => {
   commentStore.stopPolling()
-  await segmentStore.syncToBackend()
+  await syncPendingWorkbenchEdits()
 })
 </script>
 
@@ -3904,22 +6067,28 @@ onBeforeRouteLeave(async () => {
           {{ t('workbench.ribbon.startTab') }}
         </button>
         <div class="workbench-ribbon__task">
-          <strong>{{ segmentStore.fileRecord?.filename || t('workbench.titleFallback') }}</strong>
-          <span>{{ currentLanguagePair }}</span>
+          <strong>{{ workbenchHeaderTitle }}</strong>
+          <span>{{ isMergeWorkbench ? workbenchHeaderDescription : currentLanguagePair }}</span>
         </div>
         <div class="workbench-ribbon__top-actions" aria-label="任务操作">
           <button
             class="workbench-ribbon__top-action"
             data-testid="workbench-save-button"
             type="button"
-            :disabled="segmentStore.saving"
+            :disabled="manualSaving"
             @click="saveNow"
           >
-            <Loader2 v-if="segmentStore.saving" class="lucide-spin" :size="15" />
+            <Loader2 v-if="manualSaving" class="lucide-spin" :size="15" />
             <Save v-else :size="15" />
-            <span>{{ segmentStore.saving ? t('common.actions.saving') : t('workbench.saveNow') }}</span>
+            <span>{{ manualSaving ? t('common.actions.saving') : t('workbench.saveNow') }}</span>
           </button>
-          <button class="workbench-ribbon__top-action" type="button" @click="void openSaveToTMDialog()">
+          <button
+            class="workbench-ribbon__top-action"
+            type="button"
+            :disabled="!canOpenSaveToTMDialog"
+            :title="saveToTMButtonTitle"
+            @click="void openSaveToTMDialog()"
+          >
             <FileCheck :size="15" />
             <span>{{ t('workbench.saveToTM') }}</span>
           </button>
@@ -3961,23 +6130,34 @@ onBeforeRouteLeave(async () => {
         <button
           class="workbench-ribbon__help"
           type="button"
-          :title="t('workbench.shortcuts')"
-          :aria-label="t('workbench.shortcuts')"
-          @click="showShortcutHelp = true"
+          :title="t('workbench.settings.title')"
+          :aria-label="t('workbench.settings.title')"
+          @click="openWorkbenchSettings()"
         >
-          <CircleHelp :size="16" />
+          <Settings :size="16" />
         </button>
       </div>
 
       <div class="workbench-ribbon__ai-strip" aria-label="AI">
         <label class="ai-strip__field">
           <span>{{ t('workbench.aiScopeShort') }}</span>
-          <select v-model="llmScope" class="field__control">
-            <option v-for="option in llmScopeOptions" :key="option.value" :value="option.value">
+          <select v-model="llmScope" class="field__control" :title="activeMergeFileContextTitle || t('workbench.aiScope')">
+            <option v-for="option in workbenchLLMScopeOptions" :key="option.value" :value="option.value">
               {{ option.label }}
             </option>
           </select>
         </label>
+        <label v-if="isMergeWorkbench && llmScope !== 'current_segment'" class="ai-strip__field">
+          <span>对象</span>
+          <select v-model="llmMergeTarget" class="field__control" title="选择 AI 修正处理当前文件或整个合并视图">
+            <option v-for="option in llmMergeTargetOptions" :key="option.value" :value="option.value">
+              {{ option.label }}
+            </option>
+          </select>
+        </label>
+        <span v-if="isMergeWorkbench" class="ai-strip__context" :title="activeMergeFileContextTitle">
+          {{ activeMergeFileContextText }}
+        </span>
         <label class="ai-strip__field">
           <span>{{ t('workbench.aiProviderShort') }}</span>
           <select v-model="llmProvider" class="field__control">
@@ -4035,14 +6215,14 @@ onBeforeRouteLeave(async () => {
             data-testid="workbench-confirm-menu"
             type="button"
             :class="{ active: openConfirmMenu }"
-            :disabled="confirmationActionLoading || segmentStore.totalSegmentCount === 0"
+            :disabled="confirmationActionLoading || confirmJumpActionLoading || segmentStore.totalSegmentCount === 0"
             :aria-expanded="openConfirmMenu"
             aria-haspopup="menu"
             @click.stop="toggleConfirmMenu"
           >
             <span class="tool-line line1 with-big-icon">
               <span class="icon-text-area has_dropdown">
-                <Loader2 v-if="confirmationActionLoading" class="lucide-spin tool-single-icon" :size="28" />
+                <Loader2 v-if="confirmationActionLoading || confirmJumpActionLoading" class="lucide-spin tool-single-icon" :size="28" />
                 <Check v-else class="tool-single-icon tool-single-icon--confirm" :size="28" />
               </span>
               <span class="dropdown-link" aria-hidden="true">
@@ -4065,36 +6245,94 @@ onBeforeRouteLeave(async () => {
               data-testid="workbench-confirm-next"
               type="button"
               role="menuitem"
-              :disabled="confirmationActionLoading || !activeSegmentCanWrite"
+              :disabled="confirmationActionLoading || confirmJumpActionLoading || !activeSegmentCanWrite"
               @click="openConfirmMenu = false; void confirmAndMoveToNextUnconfirmed()"
             >
               确认并跳到下一个
             </button>
+            <div class="workbench-confirm-menu__range" role="group" aria-label="按句段编号范围确认">
+              <span class="workbench-confirm-menu__range-label">
+                {{ isMergeWorkbench ? '当前文件范围' : '编号范围' }}
+              </span>
+              <div class="workbench-confirm-menu__range-fields">
+                <input
+                  v-model="confirmationRangeStart"
+                  class="workbench-confirm-menu__range-input"
+                  type="number"
+                  min="1"
+                  inputmode="numeric"
+                  placeholder="起始"
+                  aria-label="确认范围起始编号"
+                  @keydown.enter.prevent="void handleConfirmRangeSegments()"
+                />
+                <span aria-hidden="true">~</span>
+                <input
+                  v-model="confirmationRangeEnd"
+                  class="workbench-confirm-menu__range-input"
+                  type="number"
+                  min="1"
+                  inputmode="numeric"
+                  placeholder="结束"
+                  aria-label="确认范围结束编号"
+                  @keydown.enter.prevent="void handleConfirmRangeSegments()"
+                />
+              </div>
+              <button
+                data-testid="workbench-confirm-range"
+                type="button"
+                role="menuitem"
+                :disabled="confirmationActionLoading || (isMergeWorkbench && (!activeMergeViewFile || activeMergeViewFile.can_write === false))"
+                @click="void handleConfirmRangeSegments()"
+              >
+                确认范围
+              </button>
+            </div>
             <button
               data-testid="workbench-confirm-all"
               type="button"
               role="menuitem"
-              :disabled="confirmationActionLoading || confirmableSegmentCount === 0"
+              :disabled="confirmationActionLoading || confirmableSegmentCount === 0 || (isMergeWorkbench && activeMergeViewFile?.can_write === false)"
               @click="void handleConfirmAllSegments()"
             >
-              全部确认
+              {{ isMergeWorkbench ? '当前文件全部确认' : '全部确认' }}
+            </button>
+            <button
+              v-if="isMergeWorkbench"
+              data-testid="workbench-confirm-merge-view-all"
+              type="button"
+              role="menuitem"
+              :disabled="confirmationActionLoading || mergeViewConfirmableSegmentCount === 0"
+              @click="void handleConfirmAllSegments('merge_view')"
+            >
+              确认视图全部句段
             </button>
             <button
               class="is-danger"
               data-testid="workbench-cancel-all-confirmations"
               type="button"
               role="menuitem"
-              :disabled="confirmationActionLoading || confirmedSegmentCount === 0"
+              :disabled="confirmationActionLoading || confirmedSegmentCount === 0 || (isMergeWorkbench && activeMergeViewFile?.can_write === false)"
               @click="void handleCancelAllSegmentConfirmations()"
             >
-              全部取消
+              {{ isMergeWorkbench ? '当前文件全部取消' : '全部取消' }}
+            </button>
+            <button
+              v-if="isMergeWorkbench"
+              class="is-danger"
+              data-testid="workbench-cancel-merge-view-confirmations"
+              type="button"
+              role="menuitem"
+              :disabled="confirmationActionLoading || mergeViewConfirmedSegmentCount === 0"
+              @click="void handleCancelAllSegmentConfirmations('merge_view')"
+            >
+              取消视图全部确认
             </button>
           </div>
         </div>
 
         <div class="tool-group">
           <span class="tool-col">
-            <button class="tool-line tool-button" type="button" :disabled="!activeSegmentCanWrite" @click="undoActiveSegmentEdit">
+            <button class="tool-line tool-button" type="button" data-testid="workbench-undo-button" :disabled="!activeSegmentCanWrite" @click="undoActiveSegmentEdit">
               <span class="icon-text-area">
                 <span class="tool-item">
                   <Undo2 class="tool-label-icon" :size="16" />
@@ -4102,7 +6340,7 @@ onBeforeRouteLeave(async () => {
                 </span>
               </span>
             </button>
-            <button class="tool-line tool-button" type="button" :disabled="!activeSegmentCanWrite" @click="redoActiveSegmentEdit">
+            <button class="tool-line tool-button" type="button" data-testid="workbench-redo-button" :disabled="!activeSegmentCanWrite" @click="redoActiveSegmentEdit">
               <span class="icon-text-area">
                 <span class="tool-item">
                   <Redo2 class="tool-label-icon" :size="16" />
@@ -4115,7 +6353,7 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group">
           <span class="tool-col align-left">
-            <button class="tool-line tool-button" type="button" :disabled="!activeSegmentCanWrite" @click="copySourceToTarget">
+            <button class="tool-line tool-button" type="button" data-testid="workbench-copy-source-button" :disabled="!activeSegmentCanWrite" @click="copySourceToTarget">
               <span class="icon-text-area has_dropdown">
                 <span class="tool-item">
                   <Copy class="tool-label-icon" :size="16" />
@@ -4126,7 +6364,7 @@ onBeforeRouteLeave(async () => {
                 <ChevronDown :size="11" />
               </span>
             </button>
-            <button class="tool-line tool-button" type="button" :disabled="!activeSegmentCanWrite" @click="clearActiveTarget">
+            <button class="tool-line tool-button" type="button" data-testid="workbench-clear-target-button" :disabled="!activeSegmentCanWrite" @click="clearActiveTarget">
               <span class="icon-text-area">
                 <span class="tool-item">
                   <X class="tool-label-icon" :size="16" />
@@ -4135,46 +6373,56 @@ onBeforeRouteLeave(async () => {
               </span>
             </button>
           </span>
+          <span class="tool-col align-left">
+            <button class="tool-line tool-button" type="button" data-testid="workbench-space-placeholder-button" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.spacePlaceholderHint')" @click="setActiveTargetSpacePlaceholder">
+              <span class="icon-text-area">
+                <span class="tool-item">
+                  <Space class="tool-label-icon" :size="16" />
+                  <span class="text">{{ t('workbench.ribbon.spacePlaceholder') }}</span>
+                </span>
+              </span>
+            </button>
+          </span>
         </div>
 
         <div class="tool-group custom-style">
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.bold }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.bold')" @mousedown.prevent @click="applyTextFormat('bold')">
+            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-bold" :class="{ 'is-active': richTextEditor.activeFormats.bold }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.bold')" @mousedown.prevent @click="applyTextFormat('bold')">
               <span class="icon-text-area"><span class="tool-item"><Bold class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.strikethrough }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.strike')" @mousedown.prevent @click="applyTextFormat('strikethrough')">
+            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-strikethrough" :class="{ 'is-active': richTextEditor.activeFormats.strikethrough }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.strike')" @mousedown.prevent @click="applyTextFormat('strikethrough')">
               <span class="icon-text-area"><span class="tool-item"><Strikethrough class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.italic }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.italic')" @mousedown.prevent @click="applyTextFormat('italic')">
+            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-italic" :class="{ 'is-active': richTextEditor.activeFormats.italic }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.italic')" @mousedown.prevent @click="applyTextFormat('italic')">
               <span class="icon-text-area"><span class="tool-item"><Italic class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.superscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.superscript')" @mousedown.prevent @click="applyTextFormat('superscript')">
+            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-superscript" :class="{ 'is-active': richTextEditor.activeFormats.superscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.superscript')" @mousedown.prevent @click="applyTextFormat('superscript')">
               <span class="icon-text-area"><span class="tool-item"><Superscript class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.underline }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.underline')" @mousedown.prevent @click="applyTextFormat('underline')">
+            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-underline" :class="{ 'is-active': richTextEditor.activeFormats.underline }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.underline')" @mousedown.prevent @click="applyTextFormat('underline')">
               <span class="icon-text-area"><span class="tool-item"><Underline class="tool-label-icon" :size="15" /></span></span>
             </button>
-            <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.activeFormats.subscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.subscript')" @mousedown.prevent @click="applyTextFormat('subscript')">
+            <button class="tool-line style-item tool-button" type="button" data-testid="workbench-format-subscript" :class="{ 'is-active': richTextEditor.activeFormats.subscript }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.subscript')" @mousedown.prevent @click="applyTextFormat('subscript')">
               <span class="icon-text-area"><span class="tool-item"><Subscript class="tool-label-icon" :size="15" /></span></span>
             </button>
           </span>
           <span class="tool-col align-left">
             <div class="case-menu">
-              <button class="tool-line style-item tool-button" type="button" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.caseChange')" @mousedown.prevent @click.stop="showCaseMenu = !showCaseMenu">
+              <button class="tool-line style-item tool-button" type="button" data-testid="workbench-case-menu-button" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.caseChange')" @mousedown.prevent @click.stop="showCaseMenu = !showCaseMenu">
                 <span class="icon-text-area has_dropdown"><span class="tool-item"><Type class="tool-label-icon" :size="15" /></span></span>
                 <span class="dropdown-link" aria-hidden="true">
                   <ChevronDown :size="10" />
                 </span>
               </button>
               <div v-if="showCaseMenu" class="case-menu__dropdown">
-                <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('upper')">{{ t('workbench.ribbon.caseUpper') }}</button>
-                <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('lower')">{{ t('workbench.ribbon.caseLower') }}</button>
-                <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('capitalize')">{{ t('workbench.ribbon.caseCapitalize') }}</button>
-                <button type="button" class="case-menu__item" @mousedown.prevent @click="applyCase('sentence')">{{ t('workbench.ribbon.caseSentence') }}</button>
+                <button type="button" class="case-menu__item" data-testid="workbench-case-upper" @mousedown.prevent @click="applyCase('upper')">{{ t('workbench.ribbon.caseUpper') }}</button>
+                <button type="button" class="case-menu__item" data-testid="workbench-case-lower" @mousedown.prevent @click="applyCase('lower')">{{ t('workbench.ribbon.caseLower') }}</button>
+                <button type="button" class="case-menu__item" data-testid="workbench-case-capitalize" @mousedown.prevent @click="applyCase('capitalize')">{{ t('workbench.ribbon.caseCapitalize') }}</button>
+                <button type="button" class="case-menu__item" data-testid="workbench-case-sentence" @mousedown.prevent @click="applyCase('sentence')">{{ t('workbench.ribbon.caseSentence') }}</button>
               </div>
             </div>
             <button class="tool-line style-item tool-button" type="button" :class="{ 'is-active': richTextEditor.visibleCharactersEnabled.value }" :disabled="!activeSegmentCanWrite" :title="t('workbench.ribbon.visibleCharacters')" @click="toggleVisibleCharacters">
@@ -4188,6 +6436,7 @@ onBeforeRouteLeave(async () => {
             <button
               class="tool-col tool-col--big tool-button clear-format-menu__main"
               type="button"
+              data-testid="workbench-clear-format-button"
               :disabled="!activeSegmentCanWrite"
               @mousedown.prevent
               @click="clearSelectedFormat"
@@ -4208,8 +6457,8 @@ onBeforeRouteLeave(async () => {
               <ChevronDown :size="12" />
             </button>
             <div v-if="showClearFormatMenu" class="clear-format-menu__dropdown">
-              <button type="button" class="clear-format-menu__item" @mousedown.prevent @click="clearSelectedFormat">{{ t('workbench.ribbon.clearSelectedFormat') }}</button>
-              <button type="button" class="clear-format-menu__item" @mousedown.prevent @click="clearAllFormat">{{ t('workbench.ribbon.clearAllFormat') }}</button>
+              <button type="button" class="clear-format-menu__item" data-testid="workbench-clear-selected-format" @mousedown.prevent @click="clearSelectedFormat">{{ t('workbench.ribbon.clearSelectedFormat') }}</button>
+              <button type="button" class="clear-format-menu__item" data-testid="workbench-clear-all-format" @mousedown.prevent @click="clearAllFormat">{{ t('workbench.ribbon.clearAllFormat') }}</button>
             </div>
           </div>
         </div>
@@ -4227,7 +6476,13 @@ onBeforeRouteLeave(async () => {
 
         <div class="tool-group">
           <span class="tool-col align-left">
-            <button class="tool-line tool-button" type="button" :disabled="!canMergeSegment" @click="handleMergeSegment">
+            <button
+              class="tool-line tool-button"
+              type="button"
+              :disabled="!canMergeSegment"
+              :title="mergeSegmentButtonTitle"
+              @click="handleMergeSegment"
+            >
               <span class="icon-text-area">
                 <span class="tool-item" :class="{ disabled: !canMergeSegment }">
                   <Combine class="tool-label-icon" :size="16" />
@@ -4258,21 +6513,84 @@ onBeforeRouteLeave(async () => {
         </div>
 
         <div class="tool-group tool-group--revision">
-          <button
-            class="tool-col tool-col--big tool-button workbench-revision-trigger"
-            data-testid="workbench-revision-toggle"
-            type="button"
-            :class="{ active: revisionTraceVisible }"
-            :aria-pressed="revisionTraceVisible"
-            @click.stop="setRevisionTraceVisible(!revisionTraceVisible)"
-          >
-            <span class="tool-line line1 with-big-icon" :class="{ active: revisionTraceVisible }">
-              <span class="icon-text-area">
-                <Type class="tool-single-icon" :size="27" />
+          <div class="workbench-revision-track">
+            <button
+              class="tool-col tool-col--big tool-button workbench-revision-trigger"
+              data-testid="workbench-revision-toggle"
+              type="button"
+              :class="{ active: segmentStore.revisionTrackingEnabled }"
+              :aria-pressed="segmentStore.revisionTrackingEnabled"
+              @click.stop="toggleRevisionTracking"
+            >
+              <span class="tool-line line1 with-big-icon" :class="{ active: segmentStore.revisionTrackingEnabled }">
+                <span class="icon-text-area">
+                  <Type class="tool-single-icon" :size="27" />
+                </span>
               </span>
-            </span>
-            <span class="tool-line" :class="{ active: revisionTraceVisible }"><span class="label">{{ t('workbench.ribbon.trackChanges') }}</span></span>
-          </button>
+              <span class="tool-line" :class="{ active: segmentStore.revisionTrackingEnabled }"><span class="label">{{ t('workbench.ribbon.trackChanges') }}</span></span>
+            </button>
+            <button
+              class="workbench-revision-track__menu workbench-revision-trigger"
+              data-testid="workbench-revision-track-menu"
+              type="button"
+              :aria-expanded="openRevisionMenu === 'track'"
+              :title="t('workbench.ribbon.revisionTraceSettings')"
+              @click.stop="toggleRevisionMenu('track')"
+            >
+              <ChevronDown :size="12" />
+            </button>
+            <div
+              v-if="openRevisionMenu === 'track'"
+              class="workbench-revision-menu__dropdown workbench-revision-menu__dropdown--track"
+              role="menu"
+            >
+              <button
+                data-testid="workbench-revision-show-trace"
+                type="button"
+                :class="{ 'is-selected': revisionTraceVisible }"
+                @click="setRevisionTraceVisible(true)"
+              >
+                <span>{{ t('workbench.ribbon.showRevisionTrace') }}</span>
+                <Check v-if="revisionTraceVisible" class="workbench-revision-menu__check" :size="13" />
+              </button>
+              <button
+                data-testid="workbench-revision-hide-trace"
+                type="button"
+                :class="{ 'is-selected': !revisionTraceVisible }"
+                @click="setRevisionTraceVisible(false)"
+              >
+                <span>{{ t('workbench.ribbon.hideRevisionTrace') }}</span>
+                <Check v-if="!revisionTraceVisible" class="workbench-revision-menu__check" :size="13" />
+              </button>
+              <button data-testid="workbench-revision-settings" type="button" @click="openRevisionTraceSettings">
+                <span>{{ t('workbench.ribbon.revisionTraceSettings') }}</span>
+              </button>
+            </div>
+          </div>
+          <span class="tool-col revision-nav-col">
+            <button
+              class="tool-line tool-button revision-nav-button"
+              data-testid="workbench-revision-prev"
+              type="button"
+              :disabled="revisionActionLoading || !revisionTraceVisible || !canGoPrevRevision"
+              :title="t('workbench.ribbon.prevRevision')"
+              :aria-label="t('workbench.ribbon.prevRevision')"
+              @click="void goToPendingRevision('prev')"
+            >
+              <ArrowLeft :size="15" />
+            </button>
+            <button
+              class="tool-line tool-button revision-nav-button"
+              data-testid="workbench-revision-next"
+              type="button"
+              :disabled="revisionActionLoading || !revisionTraceVisible || !canGoNextRevision"
+              :title="t('workbench.ribbon.nextRevision')"
+              :aria-label="t('workbench.ribbon.nextRevision')"
+              @click="void goToPendingRevision('next')"
+            >
+              <ArrowRight :size="15" />
+            </button>
+          </span>
           <span class="tool-col align-left revision-action-col">
             <div class="workbench-revision-menu workbench-revision-menu--ribbon">
               <button
@@ -4354,7 +6672,7 @@ onBeforeRouteLeave(async () => {
         </div>
 
         <div class="tool-group">
-          <button class="tool-col tool-col--big tool-button" type="button" :disabled="addingTerm" @click="void openAddTermDialog()">
+          <button class="tool-col tool-col--big tool-button" type="button" :disabled="addingTerm" @click="void openAddTermPanel()">
             <span class="tool-line line1 with-big-icon">
               <span class="icon-text-area">
                 <Loader2 v-if="addingTerm" class="lucide-spin tool-single-icon" :size="27" />
@@ -4368,7 +6686,7 @@ onBeforeRouteLeave(async () => {
         <div class="tool-group">
           <span class="tool-col align-left">
             <div class="special-char-menu">
-              <button class="tool-line tool-button" type="button" :disabled="!activeSegment" @mousedown.prevent @click.stop="showSpecialCharMenu = !showSpecialCharMenu">
+              <button class="tool-line tool-button" type="button" data-testid="workbench-special-character-menu" :disabled="!activeSegment" @mousedown.prevent @click.stop="showSpecialCharMenu = !showSpecialCharMenu">
                 <span class="icon-text-area">
                   <span class="tool-item">
                     <Sigma class="tool-label-icon" :size="16" />
@@ -4385,6 +6703,7 @@ onBeforeRouteLeave(async () => {
                       :key="`${rowIdx}-${colIdx}`"
                       type="button"
                       class="special-char-menu__char"
+                      :data-testid="`workbench-special-character-${rowIdx}-${colIdx}`"
                       :title="char"
                       @mousedown.prevent
                       @click="insertSpecialChar(char)"
@@ -4398,6 +6717,7 @@ onBeforeRouteLeave(async () => {
                       :key="idx"
                       type="button"
                       class="special-char-menu__char"
+                      :data-testid="`workbench-recent-special-character-${idx}`"
                       :title="char"
                       @mousedown.prevent
                       @click="insertSpecialChar(char)"
@@ -4409,14 +6729,15 @@ onBeforeRouteLeave(async () => {
             <button
               class="tool-line tool-button"
               type="button"
-              :disabled="generatingTermQAReport"
-              @click="generateCurrentFileTermQAReport"
+              :disabled="!canRunTermQAReport"
+              :title="termQAButtonTitle"
+              @click="generateCurrentTermQAReport"
             >
               <span class="icon-text-area has_dropdown">
                 <span class="tool-item">
                   <Loader2 v-if="generatingTermQAReport" class="tool-label-icon lucide-spin" :size="16" />
                   <ShieldCheck v-else class="tool-label-icon" :size="16" />
-                  <span class="text">{{ t('workbench.ribbon.qaSettings') }}</span>
+                  <span class="text">QA结果</span>
                 </span>
               </span>
               <span class="dropdown-link" aria-hidden="true">
@@ -4473,7 +6794,7 @@ onBeforeRouteLeave(async () => {
       </div>
 
       <div class="workbench-ribbon__status" role="status" :title="ribbonStatusTitle">
-        <span>{{ lastModifiedStatusText }}</span>
+        <span class="workbench-ribbon__modified-time">{{ lastModifiedStatusText }}</span>
         <span aria-hidden="true">·</span>
         <span>{{ segmentStore.syncMessage }}</span>
         <span aria-hidden="true">·</span>
@@ -4515,8 +6836,8 @@ onBeforeRouteLeave(async () => {
 
         <label class="field field--compact workbench-toolbar__field">
           <span class="field__label">{{ t('workbench.aiScopeShort') }}</span>
-          <select v-model="llmScope" class="field__control" :title="t('workbench.aiScope')">
-            <option v-for="option in llmScopeOptions" :key="option.value" :value="option.value">
+          <select v-model="llmScope" class="field__control" :title="activeMergeFileContextTitle || t('workbench.aiScope')">
+            <option v-for="option in workbenchLLMScopeOptions" :key="option.value" :value="option.value">
               {{ option.label }}
             </option>
           </select>
@@ -4556,12 +6877,12 @@ onBeforeRouteLeave(async () => {
             class="button workbench-action workbench-action--save"
             data-testid="workbench-save-button"
             type="button"
-            :disabled="segmentStore.saving"
+            :disabled="manualSaving"
             @click="saveNow"
           >
-            <Loader2 v-if="segmentStore.saving" class="lucide-spin" :size="14" />
+            <Loader2 v-if="manualSaving" class="lucide-spin" :size="14" />
             <Save v-else :size="14" />
-            {{ segmentStore.saving ? t('common.actions.saving') : t('workbench.saveNow') }}
+            {{ manualSaving ? t('common.actions.saving') : t('workbench.saveNow') }}
           </button>
 
           <div class="export-dropdown export-dropdown--toolbar">
@@ -4602,6 +6923,8 @@ onBeforeRouteLeave(async () => {
           <button
             class="button workbench-action"
             type="button"
+            :disabled="!canOpenSaveToTMDialog"
+            :title="saveToTMButtonTitle"
             @click="void openSaveToTMDialog()"
           >
             <FileCheck :size="14" />
@@ -4640,13 +6963,13 @@ onBeforeRouteLeave(async () => {
           </button>
 
           <button
-            class="button workbench-action workbench-action--help workbench-toolbar__icon-btn"
+            class="button workbench-action workbench-action--settings workbench-toolbar__icon-btn"
             type="button"
-            :title="t('workbench.shortcuts')"
-            :aria-label="t('workbench.shortcuts')"
-            @click="showShortcutHelp = true"
+            :title="t('workbench.settings.title')"
+            :aria-label="t('workbench.settings.title')"
+            @click="openWorkbenchSettings()"
           >
-            <CircleHelp :size="16" />
+            <Settings :size="16" />
           </button>
         </div>
       </div>
@@ -4831,8 +7154,220 @@ onBeforeRouteLeave(async () => {
                 </option>
               </select>
             </label>
+            <button
+              class="button segment-editor-toolbar__screening"
+              :class="{ 'is-active': segmentScreeningPopoverOpen || hasSegmentScreeningFilters }"
+              type="button"
+              title="句段筛查"
+              aria-label="句段筛查"
+              :aria-pressed="segmentScreeningPopoverOpen"
+              @click.stop="toggleSegmentScreeningPopover"
+            >
+              <Filter :size="16" />
+              <span v-if="segmentScreeningActiveCount > 0" class="segment-editor-toolbar__screening-count">
+                {{ segmentScreeningActiveCount }}
+              </span>
+            </button>
           </div>
         </div>
+
+        <Transition name="segment-screening-popover">
+          <section
+            v-if="segmentScreeningPopoverOpen"
+            class="segment-screening-panel segment-screening-popover"
+            @keydown.esc.stop="segmentScreeningPopoverOpen = false"
+          >
+            <div class="segment-screening-panel__header">
+              <div class="segment-screening-panel__title">
+                <span class="section-title section-title--tight">句段筛查</span>
+                <span v-if="segmentScreeningActiveCount > 0" class="segment-screening-panel__count">
+                  {{ segmentScreeningActiveCount }}
+                </span>
+              </div>
+              <div class="segment-screening-panel__header-actions">
+                <button
+                  class="segment-screening-panel__clear"
+                  type="button"
+                  :disabled="!hasSegmentScreeningFilters"
+                  @click="clearSegmentScreeningFilters"
+                >
+                  清空
+                </button>
+                <button
+                  class="segment-screening-panel__close"
+                  type="button"
+                  title="关闭"
+                  aria-label="关闭句段筛查"
+                  @click="segmentScreeningPopoverOpen = false"
+                >
+                  <X :size="14" />
+                </button>
+              </div>
+            </div>
+
+            <div class="segment-screening-panel__range">
+              <label class="segment-screening-panel__field">
+                <span>显示范围：</span>
+                <select v-model="segmentScreeningDisplayRange" class="field__control">
+                  <option
+                    v-for="option in segmentScreeningDisplayRangeOptions"
+                    :key="option.value"
+                    :value="option.value"
+                  >
+                    {{ option.label }}
+                  </option>
+                </select>
+              </label>
+
+              <form class="segment-screening-panel__goto" @submit.prevent="void goToSegmentScreeningNumber()">
+                <label class="segment-screening-panel__field">
+                  <span>句段编号：</span>
+                  <input
+                    v-model="segmentScreeningNumberInput"
+                    class="field__control"
+                    type="number"
+                    min="1"
+                    inputmode="numeric"
+                  />
+                </label>
+                <button class="button" type="submit" :disabled="segmentStore.loadingMoreSegments">
+                  前往
+                </button>
+              </form>
+            </div>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段状态：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningStatusOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check"
+                  :class="{ 'is-disabled': option.disabled }"
+                  :title="option.hint || ''"
+                >
+                  <input
+                    type="checkbox"
+                    :disabled="option.disabled"
+                    :checked="isSegmentScreeningChecked('status', option.value)"
+                    @change="toggleSegmentScreeningFilter('status', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段流程：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningWorkflowOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="isSegmentScreeningChecked('workflow', option.value)"
+                    @change="toggleSegmentScreeningFilter('workflow', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span>{{ option.label }}</span>
+                </label>
+                <label v-if="segmentScreeningWorkflowOptions.length === 0" class="segment-screening-panel__check is-disabled">
+                  <input type="checkbox" disabled />
+                  <span>暂无流程阶段</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段匹配类型：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningMatchOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check"
+                  :class="{ 'is-disabled': option.disabled }"
+                  :title="option.hint || ''"
+                >
+                  <input
+                    type="checkbox"
+                    :disabled="option.disabled"
+                    :checked="isSegmentScreeningChecked('match', option.value)"
+                    @change="toggleSegmentScreeningFilter('match', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段修改状态：</span>
+                <CircleHelp :size="12" />
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningModifyOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check is-disabled"
+                >
+                  <input type="checkbox" disabled />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>原文内容：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningSourceContentOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check is-disabled"
+                >
+                  <input type="checkbox" disabled />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段标识：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningFlagOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check"
+                  :class="{ 'is-disabled': option.disabled }"
+                >
+                  <input
+                    type="checkbox"
+                    :disabled="option.disabled"
+                    :checked="isSegmentScreeningChecked('flag', option.value)"
+                    @change="toggleSegmentScreeningFilter('flag', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+          </section>
+        </Transition>
 
         <Transition name="workbench-panel-pop">
           <div
@@ -4871,19 +7406,50 @@ onBeforeRouteLeave(async () => {
 
                 <label class="workbench-search-panel__field">
                   <span>{{ t('workbench.search.targetShortLabel') }}</span>
-                  <input
-                    v-model="targetSearchQuery"
-                    class="field__control"
-                    type="text"
-                    :placeholder="t('workbench.search.targetPlaceholder')"
-                    @keydown.enter.prevent="void focusMatchedSegment(1)"
-                  />
+                  <span class="workbench-search-panel__input-wrap">
+                    <input
+                      ref="targetSearchInputRef"
+                      v-model="targetSearchQuery"
+                      class="field__control"
+                      :class="{ 'has-clear-action': targetSearchQuery }"
+                      type="text"
+                      :placeholder="t('workbench.search.targetPlaceholder')"
+                      @keydown.enter.prevent="void focusMatchedSegment(1)"
+                    />
+                    <button
+                      v-if="targetSearchQuery"
+                      class="workbench-search-panel__input-clear"
+                      type="button"
+                      :title="t('workbench.search.clear')"
+                      :aria-label="t('workbench.search.clear')"
+                      @mousedown.prevent
+                      @click="void clearTargetSegmentSearchQuery()"
+                    >
+                      <X :size="12" />
+                    </button>
+                  </span>
                 </label>
 
                 <label class="workbench-search-panel__toggle" :title="t('workbench.search.fuzzyHint')">
                   <input v-model="searchFuzzyEnabled" type="checkbox">
                   <span>{{ t('workbench.search.fuzzy') }}</span>
                 </label>
+                <label class="workbench-search-panel__toggle" :title="t('workbench.search.caseSensitiveHint')">
+                  <input v-model="searchCaseSensitive" type="checkbox">
+                  <span>{{ t('workbench.search.caseSensitive') }}</span>
+                </label>
+
+                <button
+                  class="button workbench-search-panel__advanced-toggle"
+                  :class="{ 'is-active': advancedSearchOpen, 'has-value': hasAdvancedSegmentSearch }"
+                  type="button"
+                  :aria-pressed="advancedSearchOpen"
+                  @click="advancedSearchOpen = !advancedSearchOpen"
+                >
+                  <Filter :size="12" />
+                  <span>{{ t('workbench.search.advanced') }}</span>
+                  <span v-if="hasAdvancedSegmentSearch" class="workbench-search-panel__advanced-dot" />
+                </button>
 
                 <div class="workbench-search-panel__actions">
                   <button
@@ -4912,19 +7478,33 @@ onBeforeRouteLeave(async () => {
               <div class="workbench-search-panel__line workbench-search-panel__line--replace">
                 <label class="workbench-search-panel__field workbench-search-panel__field--replace">
                   <span>{{ t('workbench.search.replaceLabel') }}</span>
-                  <input
-                    v-model="replaceSearchText"
-                    class="field__control"
-                    type="text"
-                    :placeholder="t('workbench.search.replacePlaceholder')"
-                    @keydown.enter.prevent="void replaceCurrentSearchMatch()"
-                  />
+                  <span class="workbench-search-panel__input-wrap">
+                    <input
+                      v-model="replaceSearchText"
+                      class="field__control"
+                      :class="{ 'has-clear-action': replaceSearchText }"
+                      type="text"
+                      :placeholder="t('workbench.search.replacePlaceholder')"
+                      @keydown.enter.prevent="void replaceCurrentSearchMatch()"
+                    />
+                    <button
+                      v-if="replaceSearchText"
+                      class="workbench-search-panel__input-clear"
+                      type="button"
+                      :title="t('workbench.search.clear')"
+                      :aria-label="t('workbench.search.clear')"
+                      @mousedown.prevent
+                      @click="replaceSearchText = ''"
+                    >
+                      <X :size="12" />
+                    </button>
+                  </span>
                 </label>
 
                 <button
                   class="button workbench-search-panel__replace-button"
                   type="button"
-                  :disabled="!targetSearchQuery.trim()"
+                  :disabled="!resolveLiteralSearchKeyword(targetSearchQuery)"
                   @click="void replaceCurrentSearchMatch()"
                 >
                   {{ t('workbench.search.replace') }}
@@ -4932,7 +7512,7 @@ onBeforeRouteLeave(async () => {
                 <button
                   class="button workbench-search-panel__replace-button"
                   type="button"
-                  :disabled="!targetSearchQuery.trim()"
+                  :disabled="!resolveLiteralSearchKeyword(targetSearchQuery)"
                   @click="void replaceAllSearchMatches()"
                 >
                   {{ t('workbench.search.replaceAll', { count: segmentStore.matchedSegmentCount }) }}
@@ -4948,9 +7528,61 @@ onBeforeRouteLeave(async () => {
                   <span>{{ t('workbench.search.collapseShort') }}</span>
                 </button>
               </div>
+
+              <div v-if="advancedSearchOpen" class="workbench-search-panel__line workbench-search-panel__line--advanced">
+                <label class="workbench-search-panel__field">
+                  <span>{{ t('workbench.search.sourceExcludeLabel') }}</span>
+                  <span class="workbench-search-panel__input-wrap">
+                    <input
+                      v-model="sourceExcludeQuery"
+                      class="field__control"
+                      :class="{ 'has-clear-action': sourceExcludeQuery }"
+                      type="text"
+                      :placeholder="t('workbench.search.excludePlaceholder')"
+                      @keydown.enter.prevent="void focusMatchedSegment(1)"
+                    />
+                    <button
+                      v-if="sourceExcludeQuery"
+                      class="workbench-search-panel__input-clear"
+                      type="button"
+                      :title="t('workbench.search.clear')"
+                      :aria-label="t('workbench.search.clear')"
+                      @mousedown.prevent
+                      @click="sourceExcludeQuery = ''"
+                    >
+                      <X :size="12" />
+                    </button>
+                  </span>
+                </label>
+
+                <label class="workbench-search-panel__field">
+                  <span>{{ t('workbench.search.targetExcludeLabel') }}</span>
+                  <span class="workbench-search-panel__input-wrap">
+                    <input
+                      v-model="targetExcludeQuery"
+                      class="field__control"
+                      :class="{ 'has-clear-action': targetExcludeQuery }"
+                      type="text"
+                      :placeholder="t('workbench.search.excludePlaceholder')"
+                      @keydown.enter.prevent="void focusMatchedSegment(1)"
+                    />
+                    <button
+                      v-if="targetExcludeQuery"
+                      class="workbench-search-panel__input-clear"
+                      type="button"
+                      :title="t('workbench.search.clear')"
+                      :aria-label="t('workbench.search.clear')"
+                      @mousedown.prevent
+                      @click="targetExcludeQuery = ''"
+                    >
+                      <X :size="12" />
+                    </button>
+                  </span>
+                </label>
+              </div>
             </div>
 
-            <div class="workbench-search-panel__meta">
+            <div v-if="hasEditorSegmentFilter || searchLoadingAllSegments" class="workbench-search-panel__meta">
               <span v-if="hasEditorSegmentFilter" class="hint-text">
                 {{
                   t('workbench.search.resultSummary', {
@@ -4966,7 +7598,7 @@ onBeforeRouteLeave(async () => {
           </div>
         </Transition>
 
-        <div class="segment-editor-shell">
+        <div class="segment-editor-shell" :class="{ 'has-bottom-drawer': activeBottomTool }">
           <div ref="segmentEditorResultsRef" class="segment-editor-results">
             <div class="segment-table-head" aria-hidden="true">
               <span>句段</span>
@@ -4977,6 +7609,15 @@ onBeforeRouteLeave(async () => {
             </div>
 
             <div class="segment-editor-list-stage">
+              <div
+                v-if="segmentStore.loadingMoreSegments"
+                class="segment-editor-list-loading"
+                aria-live="polite"
+              >
+                <Loader2 class="lucide-spin" :size="28" />
+                <span>{{ t('table.loading') }}</span>
+              </div>
+
               <div
                 v-if="hasEditorSegmentFilter && !searchLoadingAllSegments && editorSegments.length === 0"
                 class="empty-state workbench-search-empty"
@@ -4990,7 +7631,7 @@ onBeforeRouteLeave(async () => {
                 ref="virtualListRef"
                 :items="editorSegments"
                 :item-height="itemHeight"
-                item-key="sentence_id"
+                :item-key="segmentItemKey"
                 :adaptive="!isStandaloneWorkbench"
                 :virtualized="!isStandaloneWorkbench"
                 :overscan="isStandaloneWorkbench ? 8 : 4"
@@ -4998,43 +7639,81 @@ onBeforeRouteLeave(async () => {
                 @reach-end="handleEditorReachEnd"
               >
                 <template #default="{ item, index }">
-                  <SegmentEditorRow
-                    :ref="(instance) => setSegmentEditorRowRef(item.sentence_id, instance)"
-                    :segment="item"
-                    :index="getEditorSegmentDisplayIndex(item.sentence_id, index)"
-                    :active="segmentStore.activeSentenceId === item.sentence_id"
-                    :disabled="!item.can_write"
-                    :source-editing="sourceEditing"
-                    :selected="selectedSentenceIds.has(item.sentence_id)"
-                    :pending-revision="revisionTraceVisible ? segmentStore.getRevisionTrace(item.sentence_id) : null"
-                    :revision-busy="revisionActionLoading"
-                    :matched-terms="segmentStore.activeSentenceId === item.sentence_id ? activeMatchedTerms : []"
-                    :source-search-query="sourceSearchQuery"
-                    :target-search-query="targetSearchQuery"
-                    :show-visible-chars="richTextEditor.visibleCharactersEnabled.value"
-                    :pending-formats="pendingFormatsForEditor"
-                    @focus="segmentStore.setActiveSentence"
-                    @activate-target="handleSegmentTargetActivate"
-                    @update="updateSegmentTarget"
-                    @update-source="updateSegmentSource"
-                    @toggle-project-sync="toggleProjectSegmentSync"
-                    @apply-partial-revision="handleApplyPartialRevision"
-                    @ctrl-click="handleSegmentClick"
-                  />
+                  <div class="merge-segment-group">
+                    <div v-if="shouldShowMergeGroupHeader(item, index)" class="merge-segment-group__header">
+                      <div>
+                        <strong>{{ item.filename || getMergeGroupFile(item)?.filename || t('workbench.currentTask') }}</strong>
+                        <span>{{ getMergeGroupProgressText(item) }}</span>
+                      </div>
+                      <button
+                        class="button merge-segment-group__export"
+                        type="button"
+                        :disabled="exporting"
+                        @click="exportWithTypeForFile('original', item.file_record_id)"
+                      >
+                        <Download :size="13" />
+                        <span>{{ t('common.actions.export') }}</span>
+                      </button>
+                    </div>
+                    <SegmentEditorRow
+                      :ref="(instance) => setSegmentEditorRowRef(segmentKeyOf(item), instance)"
+                      :segment="item"
+                      :segment-key="segmentKeyOf(item)"
+                      :index="getEditorSegmentDisplayIndex(segmentKeyOf(item), index)"
+                      :active="segmentStore.activeSentenceId === segmentKeyOf(item)"
+                      :disabled="!item.can_write"
+                      :source-editing="sourceEditing"
+                      :selected="selectedSentenceIds.has(segmentKeyOf(item))"
+                      :pending-revision="revisionTraceVisible ? segmentStore.getRevisionTrace(segmentKeyOf(item)) : null"
+                      :revision-settings="segmentStore.revisionSettings"
+                      :revision-busy="revisionActionLoading"
+                      :matched-terms="segmentStore.activeSentenceId === segmentKeyOf(item) ? activeMatchedTerms : []"
+                      :qa-issues="item.qa_issues || []"
+                      :source-search-query="sourceSearchQuery"
+                      :target-search-query="targetSearchQuery"
+                      :search-case-sensitive="searchCaseSensitive"
+                      :show-visible-chars="richTextEditor.visibleCharactersEnabled.value"
+                      :pending-formats="pendingFormatsForEditor"
+                      @focus="segmentStore.setActiveSentence"
+                      @activate-target="handleSegmentTargetActivate"
+                      @update="updateSegmentTarget"
+                      @update-source="updateSegmentSource"
+                      @toggle-project-sync="toggleProjectSegmentSync"
+                      @apply-partial-revision="handleApplyPartialRevision"
+                      @ctrl-click="handleSegmentClick"
+                    />
+                  </div>
                 </template>
               </VirtualList>
             </div>
           </div>
 
           <div class="segment-editor-footer">
-          <Pagination
-            :total="segmentStore.matchedSegmentCount"
-            :page="segmentStore.currentPage"
-            :page-size="segmentStore.pageSize"
-            :page-sizes="segmentPageSizes"
-            @update:page="handleSegmentPageChange"
-            @update:page-size="handleSegmentPageSizeChange"
-          />
+          <div class="segment-editor-footer__main">
+            <div
+              v-if="workbenchFooterProgressContext"
+              class="segment-editor-footer__progress"
+            >
+              <span class="segment-editor-footer__progress-label">{{ t('common.progress.total') }}</span>
+              <WorkflowProgressSummary
+                compact
+                :progress="workbenchFooterProgressContext.progress"
+                :status="workbenchFooterProgressContext.status"
+                :workflow-progress="workbenchFooterProgressContext.workflowProgress"
+                :label="t('common.progress.total')"
+                :detail-title="t('common.progress.workflowDetail')"
+              />
+            </div>
+            <Pagination
+              :total="segmentStore.matchedSegmentCount"
+              :page="segmentStore.currentPage"
+              :page-size="segmentStore.pageSize"
+              :page-sizes="segmentPageSizes"
+              :loading="segmentStore.loadingMoreSegments"
+              @update:page="handleSegmentPageChange"
+              @update:page-size="handleSegmentPageSizeChange"
+            />
+          </div>
 
           <div
             ref="bottomPanelRef"
@@ -5046,7 +7725,7 @@ onBeforeRouteLeave(async () => {
               class="segment-editor-bottom-tool segment-editor-bottom-tool--qa"
               :class="{ 'is-active': activeBottomTool === 'qa-result' }"
               type="button"
-              :title="termQAReport ? `QA结果：${termQAReport.active_issue_count} 条待处理` : '生成 QA 报告'"
+              :title="isMergeWorkbench ? termQAButtonTitle : (termQAReport ? `QA结果：${termQAReport.active_issue_count} 条待处理` : '生成 QA 结果')"
               :aria-pressed="activeBottomTool === 'qa-result'"
               :disabled="loadingTermQAReport || generatingTermQAReport"
               @click="void openTermQAResult()"
@@ -5098,21 +7777,21 @@ onBeforeRouteLeave(async () => {
                 {
                   'is-wide': activeBottomTool === 'split-preview' || activeBottomTool === 'qa-result',
                   'is-loading': bottomDrawerPreviewBusy,
-                  'is-resizable': isPreviewDrawerResizable,
+                  'is-resizable': isBottomDrawerResizable,
                   'is-resizing': isBottomDrawerResizing,
                 },
               ]"
-              :style="isPreviewDrawerResizable ? bottomDrawerHeightStyle : undefined"
+              :style="isBottomDrawerResizable ? bottomDrawerHeightStyle : undefined"
               :aria-busy="bottomDrawerPreviewBusy"
               @keydown.esc.stop="closeBottomDrawer"
             >
               <div
-                v-if="isPreviewDrawerResizable"
+                v-if="isBottomDrawerResizable"
                 class="workbench-bottom-drawer__resize-handle"
                 role="separator"
                 tabindex="0"
-                title="拖动调整预览高度"
-                aria-label="拖动调整预览高度"
+                title="拖动调整窗口高度"
+                aria-label="拖动调整窗口高度"
                 aria-orientation="horizontal"
                 :aria-valuemin="BOTTOM_DRAWER_MIN_HEIGHT"
                 :aria-valuemax="bottomDrawerMaxHeight"
@@ -5122,7 +7801,7 @@ onBeforeRouteLeave(async () => {
               />
 
               <button
-                v-if="activeBottomTool === 'history'"
+                v-if="activeBottomTool === 'history' || activeBottomTool === 'qa-result'"
                 class="workbench-bottom-drawer__close"
                 type="button"
                 title="关闭"
@@ -5206,92 +7885,125 @@ onBeforeRouteLeave(async () => {
               />
 
               <div v-else class="workbench-bottom-drawer__qa">
-                <div class="workbench-bottom-drawer__header">
-                  <div>
-                    <div class="section-title section-title--tight">术语 QA 报告</div>
-                    <p class="panel-subtitle">{{ segmentStore.fileRecord?.filename || '' }}</p>
+                <div class="workbench-bottom-drawer__header workbench-bottom-drawer__header--qa">
+                  <div class="workbench-bottom-drawer__header-lead">
+                    <div class="section-title section-title--tight">QA 结果</div>
+                    <p class="panel-subtitle">{{ termQAReportSubtitle }}</p>
                   </div>
-                  <button
-                    class="button preview-panel__close"
-                    type="button"
-                    @click="closeBottomDrawer"
-                  >
-                    关闭
-                  </button>
-                </div>
 
-                <div v-if="loadingTermQAReport || (generatingTermQAReport && !termQAReport)" class="empty-state">
-                  <Loader2 class="lucide-spin" :size="28" />
-                  {{ generatingTermQAReport ? '正在生成术语 QA 报告' : '正在加载最近报告' }}
-                </div>
-
-                <template v-else-if="termQAReport">
-                  <div class="term-qa-dialog__summary">
-                    <span>检查句段：{{ termQAReport.checked_segments }}</span>
-                    <span>总问题数：{{ termQAReport.issue_count }}</span>
-                    <span>待处理：{{ termQAReport.active_issue_count }}</span>
-                    <span>已忽略：{{ termQAReport.ignored_count }}</span>
-                    <span>报告时间：{{ termQAReport.created_at || '' }}</span>
+                  <div v-if="termQAReport" class="term-qa-dialog__summary">
+                    <span class="term-qa-stat">
+                      <em class="term-qa-stat__value">{{ termQAReport.active_issue_count }}</em>
+                      <span class="term-qa-stat__label">待处理</span>
+                    </span>
+                    <span class="term-qa-stat is-muted">
+                      <em class="term-qa-stat__value">{{ termQAReport.ignored_count }}</em>
+                      <span class="term-qa-stat__label">已忽略</span>
+                    </span>
+                    <span class="term-qa-dialog__meta">
+                      {{ termQAReportMetaText }}
+                    </span>
                   </div>
 
                   <div class="term-qa-dialog__actions">
                     <button
-                      class="button button--ghost"
+                      v-if="termQAReport"
+                      class="button button--ghost term-qa-dialog__action-button"
                       type="button"
                       :disabled="activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
+                      title="全选未忽略"
                       @click="toggleAllActiveTermQAItems(!allActiveTermQAItemsSelected)"
                     >
-                      {{ allActiveTermQAItemsSelected ? '取消全选' : '全选未忽略' }}
+                      {{ allActiveTermQAItemsSelected ? '取消' : '全选' }}
                     </button>
                     <button
-                      class="button button--ghost"
+                      v-if="termQAReport"
+                      class="button button--ghost term-qa-dialog__action-button"
                       type="button"
                       :disabled="selectedActiveTermQAReportItems.length === 0 || updatingTermQAIgnore"
+                      title="忽略选中的 QA 问题"
                       @click="void ignoreSelectedTermQAReportItems()"
                     >
                       <Loader2 v-if="updatingTermQAIgnore" class="lucide-spin" :size="14" />
-                      忽略选中 {{ selectedActiveTermQAReportItems.length || '' }}
+                      忽略{{ selectedActiveTermQAReportItems.length ? ` ${selectedActiveTermQAReportItems.length}` : '' }}
                     </button>
                     <button
-                      class="button"
+                      v-if="termQAReport"
+                      class="button term-qa-dialog__action-button"
                       type="button"
                       :disabled="downloadingTermQAReport"
+                      title="导出 XLSX"
                       @click="downloadCurrentTermQAReport"
                     >
                       <Loader2 v-if="downloadingTermQAReport" class="lucide-spin" :size="14" />
                       <Download v-else :size="14" />
-                      导出 XLSX
+                      导出
                     </button>
                     <button
-                      class="button button--ghost"
+                      class="button button--ghost term-qa-dialog__action-button"
                       type="button"
-                      :disabled="generatingTermQAReport"
-                      @click="void generateCurrentFileTermQAReport()"
+                      :disabled="loadingQualityQASettings || savingQualityQASettings || !canOpenQualityQAAdjustDialog"
+                      title="调整质量保证规则"
+                      @click="void openQualityQAAdjustDialog()"
+                    >
+                      <Loader2 v-if="loadingQualityQASettings || savingQualityQASettings" class="lucide-spin" :size="14" />
+                      <Settings v-else :size="14" />
+                      调整
+                    </button>
+                    <button
+                      v-if="termQAReport"
+                      class="button button--ghost term-qa-dialog__action-button"
+                      type="button"
+                      :disabled="!canRunTermQAReport"
+                      :title="termQAButtonTitle"
+                      @click="void generateCurrentTermQAReport()"
                     >
                       <Loader2 v-if="generatingTermQAReport" class="lucide-spin" :size="14" />
                       重新生成
                     </button>
                   </div>
+                </div>
 
+                <div v-if="termQAReport?.warnings.length" class="term-qa-dialog__warnings">
+                  <p v-for="warning in termQAReport.warnings" :key="warning" class="hint-text">
+                    {{ warning }}
+                  </p>
+                </div>
+
+                <div v-if="loadingTermQAReport || (generatingTermQAReport && !termQAReport)" class="empty-state">
+                  <Loader2 class="lucide-spin" :size="28" />
+                  {{ generatingTermQAReport ? '正在生成 QA 结果' : '正在加载 QA 结果' }}
+                </div>
+
+                <template v-else-if="termQAReport">
                   <div v-if="termQAReport.items.length === 0" class="empty-state">
-                    未发现术语不一致问题。
+                    未发现已开启规则的 QA 问题。
                   </div>
                   <div v-else class="term-qa-dialog__table-wrap">
                     <table class="term-qa-dialog__table">
                       <thead>
                         <tr>
-                          <th>选择</th>
-                          <th>句段</th>
-                          <th>原文术语</th>
-                          <th>期望译文</th>
-                          <th>当前译文</th>
-                          <th>状态</th>
-                          <th>操作</th>
+                          <th class="term-qa-dialog__col-select">
+                            <input
+                              type="checkbox"
+                              :checked="allActiveTermQAItemsSelected"
+                              :disabled="activeTermQAReportItems.length === 0 || updatingTermQAIgnore"
+                              aria-label="全选未忽略 QA 问题"
+                              title="全选未忽略"
+                              @change="toggleAllActiveTermQAItems(!allActiveTermQAItemsSelected)"
+                            >
+                          </th>
+                          <th class="term-qa-dialog__col-segment">句段</th>
+                          <th v-if="isMergeWorkbench" class="term-qa-dialog__col-file">文件</th>
+                          <th class="term-qa-dialog__col-type">类型</th>
+                          <th>问题 / 建议</th>
+                          <th class="term-qa-dialog__col-target">当前译文</th>
+                          <th class="term-qa-dialog__col-action">操作</th>
                         </tr>
                       </thead>
                       <tbody>
                         <tr
-                          v-for="item in termQAReport.items.slice(0, 50)"
+                          v-for="item in visibleTermQAReportItems"
                           :key="item.id"
                           class="term-qa-dialog__row"
                           :class="{
@@ -5299,7 +8011,7 @@ onBeforeRouteLeave(async () => {
                             'is-ignored': item.ignored,
                           }"
                           tabindex="0"
-                          :aria-label="`跳转到句段 ${item.sentence_id}`"
+                          :aria-label="`跳转到句段 ${formatTermQASegmentNumber(item.sentence_id)}`"
                           @click="void focusTermQAReportItem(item)"
                           @keydown.enter.prevent="void focusTermQAReportItem(item)"
                           @keydown.space.prevent="void focusTermQAReportItem(item)"
@@ -5309,36 +8021,49 @@ onBeforeRouteLeave(async () => {
                               type="checkbox"
                               :checked="selectedTermQAItemIds.has(item.id)"
                               :disabled="item.ignored"
-                              aria-label="选择报告项"
+                              aria-label="选择 QA 问题"
                               @click.stop
                               @change.stop="handleTermQAItemSelectionChange(item.id, $event)"
                             >
                           </td>
                           <td>
-                            <span class="term-qa-dialog__segment">
+                            <span class="term-qa-dialog__segment" :title="item.sentence_id">
                               <Loader2
                                 v-if="locatingTermQAReportItemId === item.id"
                                 class="lucide-spin"
                                 :size="13"
                               />
-                              {{ item.sentence_id }}
+                              {{ formatTermQASegmentNumber(item.sentence_id) }}
                             </span>
                           </td>
-                          <td>{{ item.source_term }}</td>
-                          <td>{{ item.expected_target_term }}</td>
-                          <td>{{ item.target_text || '未填写' }}</td>
-                          <td>
-                            <span class="term-qa-dialog__status" :class="{ 'is-ignored': item.ignored }">
-                              {{ item.ignored ? '已忽略' : '待处理' }}
+                          <td
+                            v-if="isMergeWorkbench"
+                            class="term-qa-dialog__cell-text"
+                            :title="getTermQAFileName(item)"
+                          >{{ getTermQAFileName(item) }}</td>
+                          <td class="term-qa-dialog__cell-text" :title="item.rule_label">{{ item.rule_label }}</td>
+                          <td class="term-qa-dialog__issue-cell">
+                            <span class="term-qa-dialog__issue-title" :title="item.detail || item.message">
+                              {{ item.message }}
                             </span>
-                            <small v-if="item.ignored_at" class="term-qa-dialog__ignored-meta">
-                              {{ item.ignored_by_name || item.ignored_by_id || '' }}
-                            </small>
+                            <span
+                              v-if="item.suggestion"
+                              class="term-qa-dialog__issue-suggestion"
+                              :title="item.suggestion"
+                            >
+                              建议：{{ item.suggestion }}
+                            </span>
                           </td>
+                          <td
+                            class="term-qa-dialog__cell-text"
+                            :class="{ 'is-empty': !item.target_text }"
+                            :title="item.target_text || '未填写'"
+                          >{{ item.target_text || '未填写' }}</td>
                           <td>
                             <button
                               class="button button--ghost term-qa-dialog__inline-action"
                               type="button"
+                              :title="item.ignored ? '恢复该 QA 问题' : '忽略该 QA 问题'"
                               :disabled="updatingTermQAIgnore"
                               @click.stop="void setSingleTermQAReportItemIgnored(item, !item.ignored)"
                             >
@@ -5348,22 +8073,48 @@ onBeforeRouteLeave(async () => {
                         </tr>
                       </tbody>
                     </table>
-                    <p v-if="termQAReport.items.length > 50" class="hint-text">
-                      已显示前 50 条，完整报告请导出 XLSX。
-                    </p>
+                    <div v-if="termQAReport.items.length > termQAReportPageSize" class="term-qa-dialog__pager">
+                      <span class="term-qa-dialog__pager-range">{{ termQAReportPageRangeText }}</span>
+                      <div class="term-qa-dialog__pager-actions">
+                        <button
+                          class="button button--ghost term-qa-dialog__pager-button"
+                          type="button"
+                          aria-label="上一页"
+                          title="上一页"
+                          :disabled="termQAReportPage <= 1"
+                          @click="setTermQAReportPage(termQAReportPage - 1)"
+                        >
+                          <ArrowLeft :size="13" />
+                        </button>
+                        <span class="term-qa-dialog__pager-page">
+                          {{ termQAReportPage }} / {{ termQAReportTotalPages }}
+                        </span>
+                        <button
+                          class="button button--ghost term-qa-dialog__pager-button"
+                          type="button"
+                          aria-label="下一页"
+                          title="下一页"
+                          :disabled="termQAReportPage >= termQAReportTotalPages"
+                          @click="setTermQAReportPage(termQAReportPage + 1)"
+                        >
+                          <ArrowRight :size="13" />
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 </template>
 
                 <div v-else class="empty-state">
-                  暂无术语 QA 报告
+                  暂无 QA 结果
                   <button
                     class="button"
                     type="button"
-                    :disabled="generatingTermQAReport"
-                    @click="void generateCurrentFileTermQAReport()"
+                    :disabled="!canRunTermQAReport"
+                    :title="termQAButtonTitle"
+                    @click="void generateCurrentTermQAReport()"
                   >
                     <Loader2 v-if="generatingTermQAReport" class="lucide-spin" :size="14" />
-                    生成报告
+                    生成 QA 结果
                   </button>
                 </div>
               </div>
@@ -5389,8 +8140,193 @@ onBeforeRouteLeave(async () => {
       >
         <div class="workbench-sidecar__panel">
         <Transition name="preview-drawer" mode="out-in">
+          <section
+            v-if="false"
+            key="segment-screening"
+            class="segment-screening-panel"
+          >
+            <div class="segment-screening-panel__header">
+              <div class="segment-screening-panel__title">
+                <span class="section-title section-title--tight">句段筛查</span>
+                <span v-if="segmentScreeningActiveCount > 0" class="segment-screening-panel__count">
+                  {{ segmentScreeningActiveCount }}
+                </span>
+              </div>
+              <button
+                class="segment-screening-panel__clear"
+                type="button"
+                :disabled="!hasSegmentScreeningFilters"
+                @click="clearSegmentScreeningFilters"
+              >
+                清空
+              </button>
+            </div>
+
+            <div class="segment-screening-panel__range">
+              <label class="segment-screening-panel__field">
+                <span>显示范围：</span>
+                <select v-model="segmentScreeningDisplayRange" class="field__control">
+                  <option
+                    v-for="option in segmentScreeningDisplayRangeOptions"
+                    :key="option.value"
+                    :value="option.value"
+                  >
+                    {{ option.label }}
+                  </option>
+                </select>
+              </label>
+
+              <form class="segment-screening-panel__goto" @submit.prevent="void goToSegmentScreeningNumber()">
+                <label class="segment-screening-panel__field">
+                  <span>句段编号：</span>
+                  <input
+                    v-model="segmentScreeningNumberInput"
+                    class="field__control"
+                    type="number"
+                    min="1"
+                    inputmode="numeric"
+                  />
+                </label>
+                <button class="button" type="submit" :disabled="segmentStore.loadingMoreSegments">
+                  前往
+                </button>
+              </form>
+            </div>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段状态：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningStatusOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check"
+                  :class="{ 'is-disabled': option.disabled }"
+                  :title="option.hint || ''"
+                >
+                  <input
+                    type="checkbox"
+                    :disabled="option.disabled"
+                    :checked="isSegmentScreeningChecked('status', option.value)"
+                    @change="toggleSegmentScreeningFilter('status', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段流程：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningWorkflowOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="isSegmentScreeningChecked('workflow', option.value)"
+                    @change="toggleSegmentScreeningFilter('workflow', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span>{{ option.label }}</span>
+                </label>
+                <label v-if="segmentScreeningWorkflowOptions.length === 0" class="segment-screening-panel__check is-disabled">
+                  <input type="checkbox" disabled />
+                  <span>暂无流程阶段</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段匹配类型：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningMatchOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check"
+                  :class="{ 'is-disabled': option.disabled }"
+                  :title="option.hint || ''"
+                >
+                  <input
+                    type="checkbox"
+                    :disabled="option.disabled"
+                    :checked="isSegmentScreeningChecked('match', option.value)"
+                    @change="toggleSegmentScreeningFilter('match', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段修改状态：</span>
+                <CircleHelp :size="12" />
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningModifyOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check is-disabled"
+                >
+                  <input type="checkbox" disabled />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>原文内容：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningSourceContentOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check is-disabled"
+                >
+                  <input type="checkbox" disabled />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="segment-screening-panel__group">
+              <button class="segment-screening-panel__group-title" type="button">
+                <span>句段标识：</span>
+                <ChevronUp :size="13" />
+              </button>
+              <div class="segment-screening-panel__checks">
+                <label
+                  v-for="option in segmentScreeningFlagOptions"
+                  :key="option.value"
+                  class="segment-screening-panel__check"
+                  :class="{ 'is-disabled': option.disabled }"
+                >
+                  <input
+                    type="checkbox"
+                    :disabled="option.disabled"
+                    :checked="isSegmentScreeningChecked('flag', option.value)"
+                    @change="toggleSegmentScreeningFilter('flag', option.value, ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span>{{ option.label }}</span>
+                </label>
+              </div>
+            </section>
+          </section>
           <WorkbenchMatchPanel
-            v-if="activeSideTool === 'match-info'"
+            v-else-if="activeSideTool === 'match-info'"
+            ref="matchPanelRef"
             key="match-info"
             :segment="activeSegment"
             :collection-id="segmentStore.fileRecord?.collection_id || null"
@@ -5398,11 +8334,89 @@ onBeforeRouteLeave(async () => {
             :term-base-id="selectedTermBaseId || segmentStore.fileRecord?.term_base_id || null"
             :term-base-name="selectedTermBaseName"
             :term-entries="termEntries"
+            :term-matches="activeTermMatches"
+            :qa-term-items="activeTermQAItemsForSegment"
             :active-source-text="activeSegmentSourceText"
-            :file-record-id="segmentStore.fileRecord?.id || null"
+            :file-record-id="activeWorkbenchFileId"
+            :reference-match-result="referenceMatchResult"
             @replace-text="handleReplaceText"
             @append-text="handleAppendText"
           />
+          <section
+            v-else-if="activeSideTool === 'terms' && showAddTermPanel"
+            key="add-term"
+            class="panel workbench-tool-panel add-term-side-panel"
+          >
+            <div class="panel-header panel-header--compact add-term-side-panel__header">
+              <div>
+                <div class="section-title section-title--tight">添加术语</div>
+              </div>
+              <button
+                class="button button--icon"
+                type="button"
+                :disabled="addingTerm"
+                title="收起"
+                aria-label="收起添加术语表单"
+                @click="closeAddTermPanel"
+              >
+                <X :size="14" />
+              </button>
+            </div>
+
+            <form class="add-term-panel" @submit.prevent="void submitAddTermForm()">
+              <label class="field">
+                <span class="field__label">原文</span>
+                <textarea
+                  v-model="addTermSourceText"
+                  class="field__control add-term-panel__textarea"
+                  rows="3"
+                  :disabled="addingTerm"
+                  placeholder="输入原文术语"
+                />
+              </label>
+
+              <label class="field">
+                <span class="field__label">译文</span>
+                <textarea
+                  v-model="addTermTargetText"
+                  class="field__control add-term-panel__textarea"
+                  rows="3"
+                  :disabled="addingTerm"
+                  placeholder="输入对应译文"
+                />
+              </label>
+
+              <div v-if="singleAddTermTargetBase" class="add-term-panel__base">
+                <span>写入</span>
+                <strong>{{ singleAddTermTargetBase.name }}</strong>
+              </div>
+              <label v-else class="field">
+                <span class="field__label">术语库</span>
+                <select
+                  v-model="addTermTargetBaseId"
+                  class="field__control"
+                  :disabled="addingTerm || loadingTermBases"
+                >
+                  <option value="">请选择术语库</option>
+                  <option v-for="termBase in addTermTargetTermBases" :key="termBase.id" :value="termBase.id">
+                    {{ termBase.name }}（{{ termBase.entry_count }} 条）
+                  </option>
+                </select>
+              </label>
+
+              <p v-if="addTermFormError" class="form-message is-error">{{ addTermFormError }}</p>
+
+              <div class="add-term-panel__actions">
+                <button class="button button--ghost" type="button" :disabled="addingTerm" @click="closeAddTermPanel">
+                  取消
+                </button>
+                <button class="button" type="submit" :disabled="!addTermCanSubmit">
+                  <Loader2 v-if="addingTerm" class="lucide-spin" :size="14" />
+                  <span>{{ addingTerm ? t('common.actions.saving') : '添加' }}</span>
+                </button>
+              </div>
+            </form>
+          </section>
           <WorkbenchTermsPanel
             v-else-if="activeSideTool === 'terms'"
             key="terms"
@@ -5471,8 +8485,16 @@ onBeforeRouteLeave(async () => {
                         {{ item.type === 'tm' ? 'TM' : 'TB' }}
                       </span>
                     </td>
-                    <td>{{ item.source_text }}</td>
-                    <td>{{ item.target_text }}</td>
+                    <td
+                      class="resource-search-panel__text"
+                      :title="item.source_text"
+                      v-html="renderResourceSearchResultText(item.source_text)"
+                    ></td>
+                    <td
+                      class="resource-search-panel__text"
+                      :title="item.target_text"
+                      v-html="renderResourceSearchResultText(item.target_text)"
+                    ></td>
                   </tr>
                 </tbody>
               </table>
@@ -5503,11 +8525,20 @@ onBeforeRouteLeave(async () => {
             @cancel-draft="commentStore.setDraftAnchor(null)"
           />
           <ReferencePanel
-            v-else-if="activeSideTool === 'reference'"
+            v-else-if="activeSideTool === 'reference' && activeWorkbenchFileId"
             key="reference"
-            :file-record-id="segmentStore.fileRecord?.id || null"
+            :file-record-id="activeWorkbenchFileId"
+            @matches-loaded="handleReferenceMatchesLoaded"
+            @apply-exact-matches="handleReferenceApplyExactMatches"
             @ai-translate-complete="handleReferenceAITranslateComplete"
           />
+          <section
+            v-else-if="activeSideTool === 'reference'"
+            key="reference-context-required"
+            class="empty-state"
+          >
+            请选择一个句段以确定当前文件上下文。
+          </section>
         </Transition>
         </div>
       </div>
@@ -5548,23 +8579,99 @@ onBeforeRouteLeave(async () => {
     <ResourceImportDialog
       :open="showImportDialog"
       :initial-tab="importDialogInitialTab"
-      :context-label="t('workbench.importContext', { name: segmentStore.fileRecord?.filename || t('workbench.currentTask') })"
-      :source-language="segmentStore.fileRecord?.source_language || null"
-      :target-language="segmentStore.fileRecord?.target_language || null"
-      :default-tm-collection-id="segmentStore.fileRecord?.collection_id || ''"
-      :default-term-base-id="segmentStore.fileRecord?.term_base_id || ''"
+      :context-label="t('workbench.importContext', { name: activeWorkbenchFileContext?.filename || t('workbench.currentTask') })"
+      :source-language="activeWorkbenchFileContext?.source_language || null"
+      :target-language="activeWorkbenchFileContext?.target_language || null"
+      :default-tm-collection-id="segmentStore.mergeViewId ? '' : (segmentStore.fileRecord?.collection_id || '')"
+      :default-term-base-id="segmentStore.mergeViewId ? '' : (segmentStore.fileRecord?.term_base_id || '')"
       @close="showImportDialog = false"
       @imported="handleResourceImported"
     />
 
     <IssueMarkerDialog
       :open="showIssueDialog"
-      :project-id="segmentStore.fileRecord?.project_id || projectReturnId || null"
-      :file-record-id="segmentStore.fileRecord?.id || props.id"
-      :context-label="segmentStore.fileRecord?.filename || t('workbench.currentTask')"
+      :project-id="activeWorkbenchProjectId"
+      :file-record-id="activeWorkbenchFileId"
+      :context-label="activeWorkbenchFileContext?.filename || t('workbench.currentTask')"
       @close="showIssueDialog = false"
       @saved="handleIssueSaved"
     />
+
+    <RevisionSettingsDialog
+      :open="showRevisionSettingsDialog"
+      :settings="segmentStore.revisionSettings"
+      :authors="revisionSettingsAuthors"
+      :saving="revisionSettingsSaving"
+      @close="showRevisionSettingsDialog = false"
+      @save="handleSaveRevisionSettings"
+    />
+
+    <Modal
+      :open="showQualityQAAdjustDialog"
+      title="质量保证调整"
+      width="min(560px, calc(100vw - 32px))"
+      :close-on-overlay="!savingQualityQASettings"
+      :close-on-esc="!savingQualityQASettings"
+      @close="closeQualityQAAdjustDialog"
+    >
+      <div class="quality-qa-adjust-dialog">
+        <div v-if="loadingQualityQASettings" class="empty-state quality-qa-adjust-dialog__loading">
+          <Loader2 class="lucide-spin" :size="24" />
+          正在加载质量保证设置
+        </div>
+        <template v-else>
+          <div class="quality-qa-adjust-dialog__summary">
+            <span>规则</span>
+            <strong :class="qualityQARuleStatusClass">{{ qualityQARuleStatusText }}</strong>
+          </div>
+
+          <div class="quality-qa-adjust-dialog__quick-actions">
+            <button class="button" type="button" :disabled="savingQualityQASettings" @click="setAllQualityQARules(true)">
+              全部启用
+            </button>
+            <button class="button" type="button" :disabled="savingQualityQASettings" @click="setAllQualityQARules(false)">
+              全部关闭
+            </button>
+          </div>
+
+          <div class="quality-qa-adjust-dialog__options">
+            <label
+              v-for="rule in qualityQARules"
+              :key="rule.key"
+              class="quality-qa-adjust-dialog__option"
+            >
+              <input
+                v-model="qualityQADraft.rules[rule.key]"
+                type="checkbox"
+                :disabled="savingQualityQASettings"
+              >
+              <span>{{ rule.label }}</span>
+            </label>
+          </div>
+
+          <p v-if="qualityQASettingsError" class="form-message is-error">{{ qualityQASettingsError }}</p>
+          <p v-else-if="spellingGrammarQAEnabled && !qualityQASettings?.languagetool_configured" class="form-message is-error">
+            已启用拼写/语法检查，但后端尚未配置 LanguageTool。
+          </p>
+        </template>
+      </div>
+
+      <template #footer>
+        <button class="button" type="button" :disabled="savingQualityQASettings" @click="closeQualityQAAdjustDialog">
+          {{ t('common.actions.cancel') }}
+        </button>
+        <button
+          class="button button--primary"
+          type="button"
+          :disabled="savingQualityQASettings || loadingQualityQASettings"
+          @click="void submitQualityQAAdjustDialog()"
+        >
+          <Loader2 v-if="savingQualityQASettings" class="lucide-spin" :size="14" />
+          <Check v-else :size="14" />
+          {{ savingQualityQASettings ? t('common.actions.saving') : t('common.actions.save') }}
+        </button>
+      </template>
+    </Modal>
 
     <Modal
       :open="showWorkflowTransitionDialog"
@@ -5651,67 +8758,6 @@ onBeforeRouteLeave(async () => {
     </Modal>
 
     <Modal
-      :open="showAddTermDialog"
-      title="添加术语"
-      :description="segmentStore.fileRecord?.filename || ''"
-      width="min(680px, calc(100vw - 32px))"
-      :close-on-overlay="!addingTerm"
-      :close-on-esc="!addingTerm"
-      @close="closeAddTermDialog"
-    >
-      <form class="add-term-dialog" @submit.prevent="void submitAddTermForm()">
-        <label class="field">
-          <span class="field__label">原文内容</span>
-          <textarea
-            v-model="addTermSourceText"
-            class="field__control add-term-dialog__textarea"
-            rows="3"
-            :disabled="addingTerm"
-            placeholder="请输入原文术语"
-          />
-        </label>
-
-        <label class="field">
-          <span class="field__label">译文内容</span>
-          <textarea
-            v-model="addTermTargetText"
-            class="field__control add-term-dialog__textarea"
-            rows="3"
-            :disabled="addingTerm"
-            placeholder="请输入对应译文"
-          />
-        </label>
-
-        <label class="field">
-          <span class="field__label">目标术语库</span>
-          <select
-            v-model="addTermTargetBaseId"
-            class="field__control"
-            :disabled="addingTerm || loadingTermBases"
-          >
-            <option value="">请选择目标术语库</option>
-            <option v-for="termBase in addTermTargetTermBases" :key="termBase.id" :value="termBase.id">
-              {{ termBase.name }}（{{ termBase.entry_count }} 条）
-            </option>
-          </select>
-        </label>
-
-        <p class="hint-text">仅显示当前文件已启用且允许写入的术语库。</p>
-        <p v-if="addTermFormError" class="form-message is-error">{{ addTermFormError }}</p>
-
-        <div class="add-term-dialog__actions">
-          <button class="button button--ghost" type="button" :disabled="addingTerm" @click="closeAddTermDialog">
-            {{ t('common.actions.cancel') }}
-          </button>
-          <button class="button" type="submit" :disabled="!addTermCanSubmit">
-            <Loader2 v-if="addingTerm" class="lucide-spin" :size="14" />
-            <span>{{ addingTerm ? t('common.actions.saving') : '添加术语' }}</span>
-          </button>
-        </div>
-      </form>
-    </Modal>
-
-    <Modal
       :open="showSaveToTMDialog"
       :title="t('workbench.saveToTMTitle')"
       :description="t('workbench.saveToTMDescription')"
@@ -5786,19 +8832,131 @@ onBeforeRouteLeave(async () => {
     </Modal>
 
     <Modal
-      :open="showShortcutHelp"
-      :title="t('workbench.shortcutDialogTitle')"
-      :description="t('workbench.shortcutDialogDescription')"
-      width="520px"
-      @close="showShortcutHelp = false"
+      :open="showWorkbenchSettings"
+      :title="t('workbench.settings.title')"
+      width="min(560px, calc(100vw - 32px))"
+      @close="closeWorkbenchSettings"
     >
-      <div class="shortcut-list">
-        <div class="shortcut-item"><strong>Ctrl + S</strong><span>{{ t('workbench.shortcutItems.save') }}</span></div>
-        <div class="shortcut-item"><strong>Ctrl + Shift + T</strong><span>{{ t('workbench.shortcutItems.runAi') }}</span></div>
-        <div class="shortcut-item"><strong>Ctrl + Enter</strong><span>{{ t('workbench.shortcutItems.confirm') }}</span></div>
-        <div class="shortcut-item"><strong>Alt + ↑ / ↓</strong><span>{{ t('workbench.shortcutItems.move') }}</span></div>
-        <div class="shortcut-item"><strong>Esc</strong><span>{{ t('workbench.shortcutItems.closePanel') }}</span></div>
-        <div class="shortcut-item"><strong>?</strong><span>{{ t('workbench.shortcutItems.help') }}</span></div>
+      <div class="workbench-settings-dialog">
+        <div class="workbench-settings-tabs" role="tablist" :aria-label="t('workbench.settings.tabsLabel')">
+          <button
+            class="workbench-settings-tabs__item"
+            :class="{ 'is-active': activeWorkbenchSettingsTab === 'preferences' }"
+            type="button"
+            role="tab"
+            :aria-selected="activeWorkbenchSettingsTab === 'preferences'"
+            @click="activeWorkbenchSettingsTab = 'preferences'"
+          >
+            {{ t('workbench.settings.preferencesTab') }}
+          </button>
+          <button
+            class="workbench-settings-tabs__item"
+            :class="{ 'is-active': activeWorkbenchSettingsTab === 'shortcuts' }"
+            type="button"
+            role="tab"
+            :aria-selected="activeWorkbenchSettingsTab === 'shortcuts'"
+            @click="activeWorkbenchSettingsTab = 'shortcuts'"
+          >
+            {{ t('workbench.settings.shortcutsTab') }}
+          </button>
+        </div>
+
+        <div v-if="activeWorkbenchSettingsTab === 'preferences'" class="workbench-settings-panel" role="tabpanel">
+          <section class="workbench-settings-section">
+            <h4 class="workbench-settings-section__title">{{ t('workbench.settings.interface') }}</h4>
+            <div class="workbench-settings-row">
+              <span>{{ t('workbench.settings.language') }}</span>
+              <div class="workbench-settings-segmented" role="group" :aria-label="t('workbench.settings.language')">
+                <button
+                  type="button"
+                  :class="{ 'is-active': preferencesStore.locale === 'zh-CN' }"
+                  @click="preferencesStore.setLocale('zh-CN')"
+                >
+                  {{ t('language.uiChinese') }}
+                </button>
+                <button
+                  type="button"
+                  :class="{ 'is-active': preferencesStore.locale === 'en-US' }"
+                  @click="preferencesStore.setLocale('en-US')"
+                >
+                  {{ t('language.uiEnglish') }}
+                </button>
+              </div>
+            </div>
+            <div class="workbench-settings-row">
+              <span>{{ t('workbench.settings.theme') }}</span>
+              <div class="workbench-settings-segmented" role="group" :aria-label="t('workbench.settings.theme')">
+                <button
+                  type="button"
+                  :class="{ 'is-active': preferencesStore.theme === 'light' }"
+                  @click="preferencesStore.setTheme('light')"
+                >
+                  {{ t('workbench.settings.themeLight') }}
+                </button>
+                <button
+                  type="button"
+                  :class="{ 'is-active': preferencesStore.theme === 'dark' }"
+                  @click="preferencesStore.setTheme('dark')"
+                >
+                  {{ t('workbench.settings.themeDark') }}
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <section class="workbench-settings-section">
+            <h4 class="workbench-settings-section__title">{{ t('workbench.settings.autoFill') }}</h4>
+            <label class="workbench-settings-choice">
+              <input
+                type="checkbox"
+                :checked="preferencesStore.autoFillExactMatches"
+                @change="preferencesStore.setAutoFillExactMatches(($event.target as HTMLInputElement).checked)"
+              >
+              <span>{{ t('workbench.settings.autoFillExact') }}</span>
+            </label>
+            <label class="workbench-settings-choice">
+              <input
+                type="checkbox"
+                :checked="preferencesStore.autoFillFuzzyMatches"
+                @change="preferencesStore.setAutoFillFuzzyMatches(($event.target as HTMLInputElement).checked)"
+              >
+              <span>{{ t('workbench.settings.autoFillFuzzy') }}</span>
+            </label>
+          </section>
+
+          <section class="workbench-settings-section">
+            <h4 class="workbench-settings-section__title">{{ t('workbench.settings.confirmGroup') }}</h4>
+            <label class="workbench-settings-choice">
+              <input
+                type="radio"
+                name="workbench-confirm-jump"
+                :checked="preferencesStore.confirmJumpMode === 'next_segment'"
+                @change="setWorkbenchConfirmJumpMode('next_segment')"
+              >
+              <span>{{ t('workbench.settings.confirmNextSegment') }}</span>
+            </label>
+            <label class="workbench-settings-choice">
+              <input
+                type="radio"
+                name="workbench-confirm-jump"
+                :checked="preferencesStore.confirmJumpMode === 'next_unconfirmed'"
+                @change="setWorkbenchConfirmJumpMode('next_unconfirmed')"
+              >
+              <span>{{ t('workbench.settings.confirmNextUnconfirmed') }}</span>
+            </label>
+          </section>
+        </div>
+
+        <div v-else class="shortcut-list shortcut-list--settings" role="tabpanel">
+          <div
+            v-for="item in workbenchShortcutItems"
+            :key="item.keys"
+            class="shortcut-item"
+          >
+            <strong>{{ item.keys }}</strong>
+            <span>{{ item.label }}</span>
+          </div>
+        </div>
       </div>
     </Modal>
   </div>
@@ -5815,7 +8973,7 @@ onBeforeRouteLeave(async () => {
 
 .workbench-page {
   --workbench-editor-stage-height: clamp(420px, calc(100vh - 410px), 660px);
-  --workbench-bottom-panel-height: clamp(360px, 50vh, 520px);
+  --workbench-bottom-panel-height: clamp(300px, 42vh, 460px);
   --workbench-visible-bottom-panel-height: min(var(--workbench-bottom-panel-height), calc(100dvh - 70px));
   --workbench-side-tools-width: 48px;
   --workbench-toolbar-left: calc(var(--sidebar-width) + 24px);
@@ -5828,12 +8986,13 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-page.is-standalone {
-  --workbench-editor-stage-height: clamp(460px, calc(100vh - 300px), 860px);
-  --workbench-bottom-panel-height: clamp(380px, 50vh, 560px);
+  --workbench-editor-stage-height: clamp(500px, calc(100vh - 252px), 900px);
+  --workbench-bottom-panel-height: clamp(320px, 42vh, 500px);
   --workbench-visible-bottom-panel-height: min(var(--workbench-bottom-panel-height), calc(100dvh - 70px));
   --workbench-toolbar-left: 16px;
   --workbench-drawer-left: 16px;
   --workbench-fixed-max: calc(100vw - 32px);
+  --workbench-side-panel-top: 160px;
   height: 100dvh;
   min-height: 0;
   padding: 0 10px 8px;
@@ -5879,6 +9038,12 @@ onBeforeRouteLeave(async () => {
 
 .workbench-page.is-stable-grid .workbench-ribbon {
   box-shadow: 0 1px 0 #cfd8df;
+}
+
+.workbench-page.is-standalone .toolbar-panel.workbench-toolbar.workbench-ribbon {
+  min-height: 0;
+  padding: 0;
+  gap: 0;
 }
 
 .workbench-page.is-stable-grid .workbench-layout {
@@ -5962,7 +9127,7 @@ onBeforeRouteLeave(async () => {
 .workbench-ribbon__tabs {
   display: flex;
   align-items: center;
-  min-height: 40px;
+  min-height: 36px;
   border-bottom: 1px solid #d8e0e5;
   background: linear-gradient(180deg, #eef2f5, #e7edf1);
 }
@@ -6018,9 +9183,9 @@ onBeforeRouteLeave(async () => {
   align-items: center;
   justify-content: center;
   gap: 4px;
-  min-height: 28px;
+  min-height: 26px;
   min-width: max-content;
-  padding: 4px 8px;
+  padding: 3px 7px;
   border: 1px solid transparent;
   border-radius: 4px;
   background: transparent;
@@ -6056,8 +9221,8 @@ onBeforeRouteLeave(async () => {
 .workbench-ribbon__help {
   display: inline-grid;
   place-items: center;
-  width: 32px;
-  height: 32px;
+  width: 30px;
+  height: 30px;
   margin-right: 8px;
   border: 1px solid transparent;
   border-radius: 6px;
@@ -6079,7 +9244,7 @@ onBeforeRouteLeave(async () => {
   flex-wrap: wrap;
   align-items: stretch;
   gap: 0;
-  min-height: 68px;
+  min-height: 60px;
   overflow: visible;
   border-top: 1px solid #edf2f5;
   background: #fff;
@@ -6089,8 +9254,8 @@ onBeforeRouteLeave(async () => {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 36px;
-  padding: 4px 10px;
+  min-height: 32px;
+  padding: 3px 10px;
   border-top: 1px solid #cce3ec;
   border-bottom: 1px solid #c5dfe9;
   background: linear-gradient(180deg, #edf8fb 0%, #dff1f6 100%);
@@ -6119,6 +9284,21 @@ onBeforeRouteLeave(async () => {
   background-color: #fff;
   color: #163f4d;
   font-size: 11px;
+}
+
+.ai-strip__context {
+  min-width: 0;
+  max-width: min(360px, 28vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 4px 8px;
+  border: 1px solid rgba(15, 125, 120, 0.22);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.58);
+  color: #245d5b;
+  font-size: 11px;
+  line-height: 1.2;
 }
 
 .ai-strip__button {
@@ -6178,8 +9358,8 @@ onBeforeRouteLeave(async () => {
   align-items: center;
   flex: 0 1 auto;
   min-width: 0;
-  min-height: 68px;
-  padding: 3px 4px 5px;
+  min-height: 60px;
+  padding: 2px 4px 3px;
   border-right: 1px solid #dde5ea;
   background: linear-gradient(180deg, #fff 0%, #fbfdfe 100%);
 }
@@ -6194,8 +9374,78 @@ onBeforeRouteLeave(async () => {
 
 .tool-group--revision {
   position: relative;
-  gap: 4px;
+  gap: 3px;
+  align-items: center;
+  padding-inline: 5px;
   overflow: visible;
+}
+
+.workbench-revision-track {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 64px;
+  min-height: 58px;
+}
+
+.workbench-revision-track > .tool-button.tool-col--big {
+  width: 64px;
+  border-color: transparent;
+}
+
+.workbench-revision-track > .tool-button.tool-col--big:hover:not(:disabled),
+.workbench-revision-track > .tool-button.tool-col--big:focus-visible,
+.workbench-revision-track > .tool-button.tool-col--big.active {
+  border-color: #b8cbd4;
+  background: linear-gradient(180deg, #f8fbfc 0%, #edf5f7 100%);
+}
+
+.workbench-revision-track__menu {
+  position: absolute;
+  right: 3px;
+  bottom: 19px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  min-height: 0;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.72);
+  color: #6b7a82;
+  cursor: pointer;
+}
+
+.workbench-revision-track__menu:hover,
+.workbench-revision-track__menu:focus-visible {
+  border-color: #b8cbd4;
+  background: rgba(0, 112, 192, 0.08);
+  color: #0070c0;
+  outline: none;
+}
+
+.revision-nav-col {
+  width: 28px;
+  min-height: 58px;
+  grid-template-rows: 1fr 1fr;
+  align-content: center;
+  gap: 2px;
+}
+
+.revision-nav-button {
+  justify-content: center;
+  width: 26px;
+  min-width: 26px;
+  height: 28px;
+  padding: 0;
+  color: #68777f;
+}
+
+.revision-nav-button:hover:not(:disabled),
+.revision-nav-button:focus-visible {
+  color: #0f6f83;
 }
 
 .tool-group--confirm {
@@ -6209,7 +9459,7 @@ onBeforeRouteLeave(async () => {
   left: 4px;
   z-index: 1250;
   display: grid;
-  min-width: 136px;
+  min-width: 176px;
   padding: 4px;
   border: 1px solid var(--line-soft);
   border-radius: 4px;
@@ -6249,6 +9499,47 @@ onBeforeRouteLeave(async () => {
   background: rgba(194, 59, 63, 0.08);
 }
 
+.workbench-confirm-menu__range {
+  display: grid;
+  gap: 5px;
+  padding: 7px 6px;
+  border-top: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.workbench-confirm-menu__range-label {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.workbench-confirm-menu__range-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 4px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.workbench-confirm-menu__range-input {
+  width: 100%;
+  min-width: 0;
+  height: 26px;
+  padding: 3px 5px;
+  border: 1px solid var(--line-soft);
+  border-radius: 3px;
+  background: #fff;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.workbench-confirm-menu__range-input:focus {
+  border-color: color-mix(in srgb, var(--brand-700) 42%, var(--line-soft));
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(13, 122, 104, 0.12);
+}
+
 .tool-col {
   display: inline-grid;
   grid-template-rows: 24px 24px;
@@ -6267,7 +9558,11 @@ onBeforeRouteLeave(async () => {
 }
 
 .revision-action-col {
-  width: 108px;
+  width: 104px;
+  min-height: 58px;
+  grid-template-rows: 28px 28px;
+  align-content: center;
+  gap: 2px;
 }
 
 .tool-col--big {
@@ -6454,7 +9749,20 @@ onBeforeRouteLeave(async () => {
 
 .workbench-revision-menu--ribbon .tool-button {
   justify-content: space-between;
-  min-width: 104px;
+  min-width: 100%;
+  height: 28px;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+.workbench-revision-menu--ribbon .tool-button .tool-item {
+  gap: 4px;
+}
+
+.workbench-revision-menu--ribbon .tool-button .text {
+  max-width: 72px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .workbench-revision-menu--ribbon .workbench-revision-menu__dropdown {
@@ -6506,8 +9814,8 @@ onBeforeRouteLeave(async () => {
   display: flex;
   align-items: center;
   gap: 7px;
-  min-height: 24px;
-  padding: 3px 10px;
+  min-height: 22px;
+  padding: 2px 10px;
   border-top: 1px solid #e5ebef;
   background: #f9fbfc;
   color: var(--text-muted);
@@ -6521,10 +9829,11 @@ onBeforeRouteLeave(async () => {
   white-space: nowrap;
 }
 
-.workbench-ribbon__status span:first-child {
+.workbench-ribbon__status span.workbench-ribbon__modified-time {
   flex: 0 0 auto;
   max-width: min(360px, 44vw);
-  color: #40515a;
+  color: #c2410c;
+  font-weight: 700;
 }
 
 .workbench-ribbon__status span:last-child {
@@ -6536,22 +9845,24 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-page.is-standalone .workbench-sidecar {
-  top: 174px;
-  max-height: calc(100vh - 194px);
+  top: var(--workbench-side-panel-top);
+  height: calc(100vh - var(--workbench-side-panel-top) - 20px);
+  max-height: calc(100vh - var(--workbench-side-panel-top) - 20px);
 }
 
 .workbench-page.is-standalone .workbench-sidecar__panel {
-  max-height: calc(100vh - 194px);
+  height: calc(100vh - var(--workbench-side-panel-top) - 20px);
+  max-height: calc(100vh - var(--workbench-side-panel-top) - 20px);
 }
 
 .workbench-page.is-standalone .workbench-sidecar__panel > .preview-panel,
 .workbench-page.is-standalone .workbench-sidecar__panel > .split-preview {
-  height: calc(100vh - 194px);
+  height: calc(100vh - var(--workbench-side-panel-top) - 20px);
 }
 
 .workbench-page.is-standalone .segment-editor-side-tools {
-  top: 174px;
-  max-height: calc(100vh - 194px);
+  top: var(--workbench-side-panel-top);
+  max-height: calc(100vh - var(--workbench-side-panel-top) - 20px);
 }
 
 .workbench-toolbar {
@@ -6659,18 +9970,44 @@ onBeforeRouteLeave(async () => {
   white-space: nowrap;
 }
 
-.add-term-dialog,
+.add-term-panel,
 .save-to-tm-dialog {
   display: grid;
   gap: 12px;
 }
 
-.add-term-dialog__textarea {
-  min-height: 96px;
+.add-term-side-panel__header {
+  align-items: center;
+}
+
+.add-term-panel {
+  gap: 10px;
+}
+
+.add-term-panel__textarea {
+  min-height: 72px;
   resize: vertical;
 }
 
-.add-term-dialog__actions {
+.add-term-panel__base {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 6px 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.add-term-panel__base strong {
+  min-width: 0;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.add-term-panel__actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
@@ -6714,44 +10051,218 @@ onBeforeRouteLeave(async () => {
 .term-qa-dialog__actions {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   flex-wrap: wrap;
 }
 
 .term-qa-dialog__summary {
   color: var(--text-muted, #64748b);
+  font-size: 12px;
+}
+
+.term-qa-stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  min-height: 26px;
+  padding: 2px 8px;
+  border: 1px solid #d7e7e3;
+  border-radius: 6px;
+  background: #f3faf8;
+  white-space: nowrap;
+}
+
+.term-qa-stat.is-muted {
+  border-color: var(--border-color, #dbe3ea);
+  background: var(--surface-muted, #f8fafc);
+}
+
+.term-qa-stat__value {
   font-size: 13px;
+  font-weight: 700;
+  font-style: normal;
+  color: #b4530f;
+}
+
+.term-qa-stat.is-muted .term-qa-stat__value {
+  color: #2f4a53;
+}
+
+.term-qa-stat__label {
+  font-size: 11px;
+  color: var(--text-muted, #64748b);
+}
+
+.term-qa-dialog__meta {
+  flex: 1 1 220px;
+  min-width: 0;
+  color: #8694a0;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .term-qa-dialog__actions {
   justify-content: flex-end;
 }
 
+.term-qa-dialog__action-button {
+  min-height: 30px;
+  padding: 5px 9px;
+  gap: 4px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.term-qa-dialog__warnings {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 8px;
+  color: #9a5b12;
+}
+
 .term-qa-dialog__table-wrap {
-  overflow-x: auto;
+  overflow: auto;
   border: 1px solid var(--border-color, #dbe3ea);
-  border-radius: 8px;
+  border-radius: 6px;
+}
+
+.term-qa-dialog__pager {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  padding: 6px 10px;
+  border-top: 1px solid var(--border-color, #dbe3ea);
+  background: var(--surface-muted, #f8fafc);
+  color: var(--text-muted, #64748b);
+  font-size: 12px;
+}
+
+.term-qa-dialog__pager-range,
+.term-qa-dialog__pager-page {
+  white-space: nowrap;
+}
+
+.term-qa-dialog__pager-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.term-qa-dialog__pager-button {
+  width: 28px;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+  font-size: 12px;
+}
+
+.term-qa-dialog__pager-page {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 54px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border-color, #dbe3ea);
+  border-radius: 6px;
+  background: #ffffff;
+  color: #40515a;
+  font-weight: 600;
 }
 
 .term-qa-dialog__table {
   width: 100%;
-  min-width: 920px;
+  min-width: 820px;
   border-collapse: collapse;
-  font-size: 13px;
+  font-size: 12px;
+  table-layout: fixed;
 }
 
 .term-qa-dialog__table th,
 .term-qa-dialog__table td {
-  padding: 9px 10px;
+  padding: 8px 10px;
   border-bottom: 1px solid var(--border-color, #dbe3ea);
   text-align: left;
-  vertical-align: top;
+  vertical-align: middle;
 }
 
 .term-qa-dialog__table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
   color: var(--text-muted, #64748b);
   background: var(--surface-muted, #f8fafc);
   font-weight: 600;
+}
+
+.term-qa-dialog__col-select {
+  width: 40px;
+  text-align: center;
+}
+
+.term-qa-dialog__col-segment {
+  width: 88px;
+}
+
+.term-qa-dialog__col-file {
+  width: 160px;
+}
+
+.term-qa-dialog__col-type {
+  width: 108px;
+}
+
+.term-qa-dialog__col-target {
+  width: 28%;
+}
+
+.term-qa-dialog__col-action {
+  width: 62px;
+  text-align: center;
+}
+
+.term-qa-dialog__table td:last-child {
+  text-align: center;
+}
+
+.term-qa-dialog__cell-text {
+  max-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.term-qa-dialog__cell-text.is-empty {
+  color: #9aa7af;
+  font-style: italic;
+}
+
+.term-qa-dialog__issue-cell {
+  min-width: 0;
+}
+
+.term-qa-dialog__issue-title,
+.term-qa-dialog__issue-suggestion {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.term-qa-dialog__issue-title {
+  color: #233941;
+  font-weight: 600;
+}
+
+.term-qa-dialog__issue-suggestion {
+  margin-top: 3px;
+  color: #637780;
+  font-size: 11px;
 }
 
 .term-qa-dialog__table tr:last-child td {
@@ -6765,8 +10276,9 @@ onBeforeRouteLeave(async () => {
 .term-qa-dialog__row:hover,
 .term-qa-dialog__row:focus-visible,
 .term-qa-dialog__row.is-locating {
-  background: #f4faf9;
+  background: #e4f3ff;
   outline: none;
+  box-shadow: inset 3px 0 0 #2a7fb8;
 }
 
 .term-qa-dialog__row.is-ignored {
@@ -6782,35 +10294,94 @@ onBeforeRouteLeave(async () => {
   font-weight: 700;
 }
 
-.term-qa-dialog__status {
-  display: inline-flex;
-  align-items: center;
-  min-height: 22px;
-  padding: 2px 7px;
-  border-radius: 999px;
-  background: #fff4e5;
-  color: #8a4b10;
-  font-size: 12px;
-  font-weight: 700;
-  white-space: nowrap;
-}
-
-.term-qa-dialog__status.is-ignored {
-  background: #edf2f3;
-  color: #64747c;
-}
-
-.term-qa-dialog__ignored-meta {
-  display: block;
-  margin-top: 4px;
-  color: #7c8b92;
-  font-size: 11px;
-}
-
 .term-qa-dialog__inline-action {
-  min-height: 28px;
-  padding: 4px 8px;
+  min-height: 26px;
+  padding: 3px 8px;
   font-size: 12px;
+}
+
+.quality-qa-adjust-dialog {
+  display: grid;
+  gap: 14px;
+}
+
+.quality-qa-adjust-dialog__loading {
+  min-height: 180px;
+}
+
+.quality-qa-adjust-dialog__summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color, #dbe3ea);
+  border-radius: 8px;
+  background: var(--surface-muted, #f8fafc);
+}
+
+.quality-qa-adjust-dialog__summary span {
+  color: var(--text-muted, #64748b);
+  font-size: 13px;
+}
+
+.quality-qa-adjust-dialog__summary strong.is-ok {
+  color: #227f58;
+}
+
+.quality-qa-adjust-dialog__summary strong.is-warn {
+  color: #b54708;
+}
+
+.quality-qa-adjust-dialog__quick-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.quality-qa-adjust-dialog__quick-actions .button {
+  min-height: 30px;
+  padding: 5px 10px;
+  font-size: 12px;
+}
+
+.quality-qa-adjust-dialog__options {
+  display: grid;
+  gap: 8px;
+  max-height: min(360px, 48vh);
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.quality-qa-adjust-dialog__option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color, #dbe3ea);
+  border-radius: 8px;
+  background: #ffffff;
+  cursor: pointer;
+}
+
+.quality-qa-adjust-dialog__option:hover {
+  background: #f3faf8;
+}
+
+.quality-qa-adjust-dialog__option input {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: #0d7a68;
+}
+
+.quality-qa-adjust-dialog__option span {
+  min-width: 0;
+  color: var(--text-primary, #1f2f36);
+  font-size: 13px;
+  line-height: 1.35;
 }
 
 .workbench-toolbar__progress {
@@ -6965,7 +10536,8 @@ onBeforeRouteLeave(async () => {
   --action-hover-shadow: rgba(184, 60, 65, 0.28);
 }
 
-.workbench-action--help {
+.workbench-action--help,
+.workbench-action--settings {
   --action-bg: linear-gradient(180deg, #eef1fb, #dde5f7);
   --action-border: #c8d4ee;
   --action-color: #33486f;
@@ -7020,8 +10592,8 @@ onBeforeRouteLeave(async () => {
 
 .workbench-search-panel {
   flex: 0 0 auto;
-  margin-bottom: 8px;
-  padding: 8px 10px;
+  margin-bottom: 4px;
+  padding: 4px 8px;
   border: 1px solid #d4dee5;
   border-radius: 2px;
   background: #f5f8fa;
@@ -7031,7 +10603,7 @@ onBeforeRouteLeave(async () => {
 
 .workbench-search-panel__form--compact {
   display: grid;
-  gap: 6px;
+  gap: 4px;
 }
 
 .workbench-search-panel__line {
@@ -7044,6 +10616,10 @@ onBeforeRouteLeave(async () => {
 
 .workbench-search-panel__line--replace {
   padding-left: 231px;
+}
+
+.workbench-search-panel__line--advanced {
+  padding-left: 0;
 }
 
 .workbench-search-panel__field {
@@ -7072,8 +10648,8 @@ onBeforeRouteLeave(async () => {
 
 .workbench-search-panel__field .field__control {
   width: 180px;
-  min-height: 28px;
-  padding: 4px 8px;
+  min-height: 24px;
+  padding: 2px 8px;
   border-color: #c7d2da;
   border-radius: 3px;
   background: #fff;
@@ -7118,7 +10694,7 @@ onBeforeRouteLeave(async () => {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  min-height: 28px;
+  min-height: 24px;
   margin: 0 4px 0 2px;
   color: #485861;
   font-size: 13px;
@@ -7130,6 +10706,38 @@ onBeforeRouteLeave(async () => {
   height: 14px;
   margin: 0;
   accent-color: #0d7a68;
+}
+
+.workbench-search-panel__advanced-toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 24px !important;
+  padding: 2px 8px !important;
+  border: 1px solid #c7d2da;
+  border-radius: 3px;
+  background: #fff;
+  color: #485861;
+  font-size: 13px !important;
+  box-shadow: none !important;
+}
+
+.workbench-search-panel__advanced-toggle.is-active {
+  border-color: #82b7ab;
+  background: #e9f5f2;
+  color: #0c6b5b;
+}
+
+.workbench-search-panel__advanced-toggle.has-value:not(.is-active) {
+  border-color: #e2a272;
+}
+
+.workbench-search-panel__advanced-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #d9480f;
 }
 
 .workbench-search-panel__actions {
@@ -7246,7 +10854,7 @@ onBeforeRouteLeave(async () => {
   align-items: center;
   gap: 10px;
   min-height: 20px;
-  margin-top: 4px;
+  margin-top: 2px;
 }
 
 .workbench-search-panel__actions .is-layout-placeholder {
@@ -7256,8 +10864,8 @@ onBeforeRouteLeave(async () => {
 
 .segment-editor-toolbar {
   align-items: center;
-  gap: 10px;
-  margin-bottom: 8px;
+  gap: 6px;
+  margin-bottom: 4px;
   flex-wrap: wrap;
 }
 
@@ -7267,19 +10875,46 @@ onBeforeRouteLeave(async () => {
 .segment-editor-list-stage {
   min-width: 0;
   overflow-anchor: none;
+  position: relative;
+}
+
+.segment-editor-list-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--ink-500);
+  font-size: 13px;
+  background: rgba(255, 255, 255, 0.62);
+  backdrop-filter: blur(1px);
+  pointer-events: all;
+}
+
+.panel--editor {
+  position: relative;
 }
 
 .segment-editor-shell {
+  position: relative;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   align-items: stretch;
   gap: 8px;
 }
 
+.segment-editor-shell.has-bottom-drawer {
+  gap: 0;
+}
+
 .segment-editor-results {
   --segment-editor-grid-template: 72px minmax(0, 1fr) minmax(0, 1fr) 76px 76px;
   --segment-editor-scrollbar-gutter: 10px;
   --virtual-list-inline-end-gap: 4px;
+  order: 1;
   display: grid;
   grid-template-rows: auto minmax(390px, var(--workbench-editor-stage-height));
   min-height: 0;
@@ -7322,20 +10957,89 @@ onBeforeRouteLeave(async () => {
 }
 
 .segment-editor-footer {
+  position: relative;
+  z-index: 2;
+  order: 3;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  min-height: 44px;
+  gap: 8px;
+  min-height: 36px;
   min-width: 0;
-  padding: 6px 0 0;
-  background: transparent;
+  padding: 3px 6px;
+  border: 1px solid #cfd8df;
+  background: #f4f7f9;
+}
+
+.segment-editor-footer__main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.segment-editor-footer__progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  width: min(220px, 28vw);
+  min-width: 148px;
+}
+
+.segment-editor-footer__progress-label {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.segment-editor-shell.has-bottom-drawer .segment-editor-footer {
+  border-top: 0;
+  background: #edf3f6;
 }
 
 .segment-editor-footer :deep(.pagination) {
   flex: 1 1 auto;
   min-width: 0;
   padding: 0;
+  gap: 5px;
+  font-size: 12px;
+}
+
+.segment-editor-footer :deep(.pagination__info) {
+  font-size: 12px;
+}
+
+.segment-editor-footer :deep(.pagination__btn),
+.segment-editor-footer :deep(.pagination__ellipsis),
+.segment-editor-footer :deep(.pagination__jump-input),
+.segment-editor-footer :deep(.pagination__size-select) {
+  height: 28px;
+  min-height: 28px;
+  font-size: 12px;
+}
+
+.segment-editor-footer :deep(.pagination__btn),
+.segment-editor-footer :deep(.pagination__ellipsis) {
+  min-width: 28px;
+  padding: 0 6px;
+}
+
+.segment-editor-footer :deep(.pagination__jump) {
+  gap: 4px;
+  margin-left: 4px;
+}
+
+.segment-editor-footer :deep(.pagination__jump-input) {
+  width: 44px;
+  padding: 0 5px;
+}
+
+.segment-editor-footer :deep(.pagination__size-select) {
+  padding: 0 6px;
 }
 
 .segment-editor-side-tool {
@@ -7398,14 +11102,232 @@ onBeforeRouteLeave(async () => {
   color: #0d7bdc;
 }
 
+.segment-editor-side-tool--filter svg {
+  color: #7a55b8;
+}
+
+.segment-screening-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  height: 100%;
+  padding: 12px 14px 14px;
+  overflow-y: auto;
+  background: #fbfcfd;
+  color: #233943;
+}
+
+.segment-screening-popover {
+  position: absolute;
+  top: 46px;
+  right: 12px;
+  z-index: 1800;
+  width: min(378px, calc(100vw - 32px));
+  max-height: min(640px, calc(100vh - 160px));
+  height: auto;
+  border: 1px solid #d7e1e7;
+  border-radius: 8px;
+  box-shadow: 0 18px 42px rgba(20, 45, 55, 0.18);
+}
+
+.segment-screening-popover-enter-active,
+.segment-screening-popover-leave-active {
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+
+.segment-screening-popover-enter-from,
+.segment-screening-popover-leave-to {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+
+.segment-screening-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 32px;
+}
+
+.segment-screening-panel__title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.segment-screening-panel__count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #e6f2ef;
+  color: #0b6658;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.segment-screening-panel__header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.segment-screening-panel__clear {
+  border: 0;
+  background: transparent;
+  color: #0070c9;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.segment-screening-panel__clear:disabled {
+  color: #98a6ad;
+  cursor: not-allowed;
+}
+
+.segment-screening-panel__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid #d2dee4;
+  border-radius: 4px;
+  background: #fff;
+  color: #4a626d;
+  cursor: pointer;
+}
+
+.segment-screening-panel__close:hover {
+  border-color: #b8cbd4;
+  background: #f4f8fa;
+  color: #1f333c;
+}
+
+.segment-screening-panel__range {
+  display: grid;
+  gap: 6px;
+}
+
+.segment-screening-panel__field,
+.segment-screening-panel__goto {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.segment-screening-panel__field {
+  flex: 1 1 auto;
+}
+
+.segment-screening-panel__field > span {
+  flex: 0 0 66px;
+  color: #445a64;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.segment-screening-panel__field .field__control {
+  min-width: 0;
+  height: 29px;
+  padding: 4px 8px;
+  border-color: #c7d3da;
+  border-radius: 4px;
+  background-color: #fff;
+  font-size: 13px;
+  box-shadow: none;
+}
+
+.segment-screening-panel__goto .button {
+  flex: 0 0 auto;
+  min-height: 29px;
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+  box-shadow: none;
+}
+
+.segment-screening-panel__group {
+  display: grid;
+  gap: 5px;
+  padding-top: 3px;
+  border-top: 1px solid #eef2f4;
+}
+
+.segment-screening-panel__group-title {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  min-height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #384f59;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.segment-screening-panel__group-title span {
+  flex: 1 1 auto;
+}
+
+.segment-screening-panel__checks {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 12px;
+}
+
+.segment-screening-panel__check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  min-height: 19px;
+  color: #2e4650;
+  font-size: 13px;
+  line-height: 1.2;
+}
+
+.segment-screening-panel__check input {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: #0d7a68;
+}
+
+.segment-screening-panel__check span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.segment-screening-panel__check.is-disabled {
+  color: #8a98a1;
+}
+
+.segment-screening-panel__check.is-disabled input {
+  accent-color: #c7d0d5;
+}
+
 .resource-search-panel {
   display: flex;
   flex-direction: column;
   gap: 12px;
   min-height: 0;
   height: 100%;
-  padding: 14px;
-  background: #f8fbfb;
+  padding: 18px;
+  overflow: hidden;
+  background: linear-gradient(180deg, #ffffff 0%, #f7fbfb 100%);
 }
 
 .resource-search-panel__header {
@@ -7421,7 +11343,7 @@ onBeforeRouteLeave(async () => {
   align-items: center;
   overflow: hidden;
   border: 1px solid #c9d7dd;
-  border-radius: 4px;
+  border-radius: 6px;
   background: #fff;
 }
 
@@ -7471,10 +11393,31 @@ onBeforeRouteLeave(async () => {
 }
 
 .resource-search-panel__table-wrap {
+  flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
   border: 1px solid #d6e1e5;
+  border-radius: 6px;
   background: #fff;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: #9fb8bd transparent;
+}
+
+.resource-search-panel__table-wrap::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.resource-search-panel__table-wrap::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.resource-search-panel__table-wrap::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-color: #9fb8bd;
+  background-clip: content-box;
 }
 
 .resource-search-panel__table {
@@ -7509,7 +11452,21 @@ onBeforeRouteLeave(async () => {
 }
 
 .resource-search-panel__table tbody tr:nth-child(even) {
-  background: #edf6ff;
+  background: #f5fafc;
+}
+
+.resource-search-panel__text {
+  word-break: break-word;
+}
+
+.resource-search-panel__table :deep(.resource-search-panel__highlight) {
+  display: inline;
+  padding: 1px 2px;
+  border-radius: 3px;
+  background: #fff176;
+  color: inherit;
+  box-shadow: inset 0 0 0 1px rgba(138, 103, 0, 0.2);
+  font-weight: 700;
 }
 
 .resource-search-panel__badge {
@@ -7544,19 +11501,19 @@ onBeforeRouteLeave(async () => {
   display: flex;
   justify-content: flex-start;
   align-items: center;
-  gap: 6px;
-  min-height: 32px;
+  gap: 0;
+  min-height: 30px;
   min-width: 0;
   width: max-content;
   max-width: min(540px, 48vw);
   overflow-x: auto;
   overflow-y: hidden;
   padding: 0;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  box-shadow: none;
-  pointer-events: none;
+  border: 1px solid #c6d4dc;
+  border-radius: 4px;
+  background: #ffffff;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.86);
+  pointer-events: auto;
   scrollbar-width: none;
 }
 
@@ -7572,46 +11529,48 @@ onBeforeRouteLeave(async () => {
   z-index: 1710;
   width: max-content;
   max-width: min(540px, 48vw);
-  min-height: 31px;
+  min-height: 29px;
   padding: 0;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  box-shadow: none;
+  border-color: #b8cbd5;
+  border-radius: 4px;
+  background: #ffffff;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.55);
 }
 
 .segment-editor-bottom-tool {
-  --bottom-tool-bg: linear-gradient(180deg, #f7fbff, #e6f0f7);
-  --bottom-tool-border: #afc1cc;
   position: relative;
   display: inline-flex;
   flex: 0 0 auto;
   align-items: center;
   justify-content: center;
-  gap: 5px;
-  height: 32px;
-  min-width: 100px;
-  padding: 0 13px;
-  border: 1px solid var(--bottom-tool-border);
-  border-radius: 4px;
-  background: var(--bottom-tool-bg);
+  gap: 4px;
+  height: 28px;
+  min-width: 88px;
+  padding: 0 9px;
+  border: 0;
+  border-left: 1px solid #d7e2e8;
+  border-radius: 0;
+  background: transparent;
   color: #334852;
   font-size: 13px;
   font-weight: 500;
   line-height: 1;
   letter-spacing: 0;
   white-space: nowrap;
-  box-shadow: 0 8px 18px rgba(24, 48, 58, 0.12);
+  box-shadow: none;
   pointer-events: auto;
+  transition:
+    background-color 140ms ease,
+    color 140ms ease;
 }
 
 .segment-editor-bottom-tool:first-child {
-  border-left: 1px solid var(--bottom-tool-border);
-  border-radius: 4px;
+  border-left: 0;
+  border-radius: 0;
 }
 
 .segment-editor-bottom-tool:last-child {
-  border-radius: 4px;
+  border-radius: 0;
 }
 
 .segment-editor-bottom-tool svg {
@@ -7628,18 +11587,16 @@ onBeforeRouteLeave(async () => {
 .segment-editor-bottom-tool:hover:not(:disabled),
 .segment-editor-bottom-tool:focus-visible {
   z-index: 1;
-  border-color: #72acd7;
-  background: #ffffff;
+  background: #f6fbfd;
   color: #0070c0;
   outline: none;
 }
 
 .segment-editor-bottom-tool.is-active {
   z-index: 2;
-  border-color: #8abfe8;
   background: #ffffff;
   color: #0070c0;
-  box-shadow: 0 8px 18px rgba(24, 48, 58, 0.14), inset 0 -2px 0 #1e9bff;
+  box-shadow: inset 0 2px 0 #1e9bff, inset 0 -1px 0 #ffffff;
 }
 
 .segment-editor-bottom-tool.is-active svg {
@@ -7660,45 +11617,23 @@ onBeforeRouteLeave(async () => {
 }
 
 .segment-editor-bottom-tool--qa {
-  --bottom-tool-bg: linear-gradient(180deg, #eef9f3, #d7eadf);
-  --bottom-tool-border: #9bc7ad;
-  padding-right: 26px;
+  padding-right: 24px;
 }
 
 .segment-editor-bottom-tool--qa svg {
   color: #23805f;
 }
 
-.segment-editor-bottom-tool--history {
-  --bottom-tool-bg: linear-gradient(180deg, #f5f1fb, #e6ddf2);
-  --bottom-tool-border: #b9abd0;
-}
-
 .segment-editor-bottom-tool--history svg {
-  color: #6e5c91;
-}
-
-.segment-editor-bottom-tool--paper {
-  --bottom-tool-bg: linear-gradient(180deg, #eef8fb, #dcecf1);
-  --bottom-tool-border: #a5c4ce;
+  color: #5d6f85;
 }
 
 .segment-editor-bottom-tool--paper svg {
   color: #376f7e;
 }
 
-.segment-editor-bottom-tool--success {
-  --bottom-tool-bg: linear-gradient(180deg, #effaf5, #d9efe5);
-  --bottom-tool-border: #9fcdb8;
-}
-
 .segment-editor-bottom-tool--success svg {
   color: #1d7b61;
-}
-
-.segment-editor-bottom-tool--layout {
-  --bottom-tool-bg: linear-gradient(180deg, #eef6ff, #dce9f7);
-  --bottom-tool-border: #a7bdd7;
 }
 
 .segment-editor-bottom-tool--layout svg {
@@ -7729,25 +11664,24 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-bottom-drawer {
-  position: fixed;
-  right: 16px;
-  bottom: 50px;
-  left: var(--workbench-drawer-left);
-  z-index: 1700;
-  width: auto;
+  position: relative;
+  z-index: 1;
+  order: 2;
+  width: 100%;
   height: var(--workbench-visible-bottom-panel-height);
   min-height: min(260px, var(--workbench-visible-bottom-panel-height));
   max-height: var(--workbench-visible-bottom-panel-height);
   overflow: hidden;
-  border: 1px solid #cbd8de;
-  border-radius: 6px;
+  border: 1px solid #cfd8df;
+  border-bottom: 0;
+  border-radius: 0;
   background: #ffffff;
-  box-shadow: 0 18px 40px rgba(24, 48, 58, 0.18);
+  box-shadow: none;
 }
 
 .workbench-bottom-drawer.is-resizable {
-  padding-top: 8px;
-  border-top-color: #9eb9c4;
+  padding-top: 12px;
+  border-top-color: #b6c9d2;
 }
 
 .workbench-bottom-drawer.is-resizing {
@@ -7763,7 +11697,8 @@ onBeforeRouteLeave(async () => {
   height: 12px;
   padding: 0;
   border: 0;
-  background: transparent;
+  border-bottom: 1px solid #dde7ec;
+  background: #edf3f6;
   cursor: ns-resize;
   touch-action: none;
 }
@@ -7771,13 +11706,13 @@ onBeforeRouteLeave(async () => {
 .workbench-bottom-drawer__resize-handle::before {
   content: "";
   position: absolute;
-  top: 3px;
+  top: 4px;
   left: 50%;
-  width: 74px;
-  height: 4px;
+  width: 58px;
+  height: 3px;
   transform: translateX(-50%);
   border-radius: 999px;
-  background: #a9bec7;
+  background: #8fa9b5;
   opacity: 0.85;
   transition:
     background-color 140ms ease,
@@ -7859,7 +11794,7 @@ onBeforeRouteLeave(async () => {
 
 .workbench-bottom-drawer__close {
   position: absolute;
-  top: 10px;
+  top: 18px;
   right: 10px;
   z-index: 3;
   display: inline-grid;
@@ -7869,7 +11804,7 @@ onBeforeRouteLeave(async () => {
   padding: 0;
   border: 1px solid #cdd9de;
   border-radius: 4px;
-  background: rgba(255, 255, 255, 0.92);
+  background: #ffffff;
   color: #40515a;
   box-shadow: none;
 }
@@ -7898,7 +11833,7 @@ onBeforeRouteLeave(async () => {
 
 .workbench-bottom-drawer__qa {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 10px;
   overflow: hidden;
   padding: 12px;
@@ -7916,6 +11851,26 @@ onBeforeRouteLeave(async () => {
   min-width: 0;
 }
 
+.workbench-bottom-drawer__header--qa {
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  padding-right: 40px;
+}
+
+.workbench-bottom-drawer__header-lead {
+  flex: 0 1 auto;
+}
+
+.workbench-bottom-drawer__header--qa .term-qa-dialog__summary {
+  flex: 1 1 auto;
+}
+
+.workbench-bottom-drawer__header--qa .term-qa-dialog__actions {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
 .workbench-bottom-drawer__header .panel-subtitle {
   max-width: min(760px, 70vw);
   overflow: hidden;
@@ -7924,7 +11879,12 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-bottom-drawer__qa > .empty-state {
-  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 100%;
 }
 
 .workbench-bottom-drawer__qa .term-qa-dialog__table-wrap {
@@ -7933,7 +11893,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-bottom-drawer__qa .term-qa-dialog__table {
-  min-width: 980px;
+  min-width: 760px;
 }
 
 .workbench-bottom-drawer :deep(.preview-panel),
@@ -8038,15 +11998,25 @@ onBeforeRouteLeave(async () => {
 
 .workbench-bottom-drawer-enter-active,
 .workbench-bottom-drawer-leave-active {
+  overflow: hidden;
   transition:
-    opacity 180ms ease,
-    transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+    max-height 220ms ease,
+    opacity 160ms ease,
+    transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 .workbench-bottom-drawer-enter-from,
 .workbench-bottom-drawer-leave-to {
+  max-height: 0;
   opacity: 0;
-  transform: translateY(-8px);
+  transform: translateY(6px);
+}
+
+.workbench-bottom-drawer-enter-to,
+.workbench-bottom-drawer-leave-from {
+  max-height: var(--workbench-visible-bottom-panel-height);
+  opacity: 1;
+  transform: translateY(0);
 }
 
 .segment-editor-list-stage {
@@ -8062,6 +12032,65 @@ onBeforeRouteLeave(async () => {
   overflow-y: scroll;
   scrollbar-width: thin;
   scrollbar-color: #52717a #e7f0ef;
+}
+
+.merge-segment-group {
+  display: grid;
+}
+
+.merge-segment-group__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 38px;
+  padding: 8px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--brand-700) 18%, var(--line-soft));
+  background: color-mix(in srgb, var(--brand-050) 58%, var(--surface-panel));
+  color: var(--text-primary);
+}
+
+.merge-segment-group__header > div {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.merge-segment-group__header strong,
+.merge-segment-group__header span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.merge-segment-group__header strong {
+  font-size: 13px;
+}
+
+.merge-segment-group__header span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.merge-segment-group__export {
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.segment-editor-shell.has-bottom-drawer .segment-editor-results {
+  grid-template-rows: auto minmax(180px, 1fr);
+}
+
+.segment-editor-shell.has-bottom-drawer .segment-editor-list-stage {
+  height: clamp(
+    180px,
+    calc(var(--workbench-editor-stage-height) - var(--workbench-visible-bottom-panel-height) - 24px),
+    var(--workbench-editor-stage-height)
+  );
+  min-height: 180px;
 }
 
 .segment-editor-list-stage > .virtual-list::-webkit-scrollbar {
@@ -8100,49 +12129,53 @@ onBeforeRouteLeave(async () => {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
   flex-wrap: wrap;
 }
 
 .segment-editor-toolbar__overview {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   flex: 1 1 520px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   min-width: 0;
+  overflow: hidden;
 }
 
 .segment-editor-toolbar__overview .workbench-stat--compact {
-  min-height: 30px;
-  padding: 5px 9px;
-  gap: 6px;
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 4px 8px;
+  gap: 5px;
   border-radius: 999px;
   box-shadow: none;
 }
 
 .segment-editor-toolbar__overview .workbench-stat--compact span {
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1;
 }
 
 .segment-editor-toolbar__overview .workbench-stat--compact strong {
-  font-size: 14px;
+  font-size: 13px;
   line-height: 1;
 }
 
 .segment-editor-toolbar__tip,
 .segment-editor-toolbar__loaded {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--text-muted);
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1.2;
   white-space: nowrap;
 }
 
 .segment-editor-toolbar__tip {
-  max-width: 220px;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  max-width: 160px;
 }
 
 .segment-editor-toolbar__load {
@@ -8155,7 +12188,7 @@ onBeforeRouteLeave(async () => {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
+  gap: 6px;
   flex-wrap: wrap;
   min-width: 0;
   margin-left: auto;
@@ -8165,8 +12198,8 @@ onBeforeRouteLeave(async () => {
   flex: 0 1 auto;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  min-height: 34px;
+  gap: 4px;
+  min-height: 30px;
   min-width: 0;
   margin: 0;
 }
@@ -8175,16 +12208,60 @@ onBeforeRouteLeave(async () => {
   flex: 0 0 auto;
   margin: 0;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1;
   white-space: nowrap;
 }
 
 .segment-editor-toolbar__filter-select {
-  width: 148px;
-  min-width: 148px;
+  width: 136px;
+  min-width: 136px;
+  min-height: 30px;
+  height: 30px;
+  padding: 4px 8px;
   background-color: var(--surface-panel);
+  font-size: 12px;
   box-shadow: none;
+}
+
+.segment-editor-toolbar__screening {
+  position: relative;
+  flex: 0 0 30px;
+  width: 30px;
+  min-width: 30px;
+  min-height: 30px;
+  padding: 0;
+  justify-content: center;
+  gap: 0;
+  border-color: #cbd9df;
+  border-radius: 4px;
+  background: #fff;
+  color: #2d4651;
+  box-shadow: none;
+}
+
+.segment-editor-toolbar__screening:hover,
+.segment-editor-toolbar__screening.is-active {
+  border-color: #8db9c4;
+  background: #edf8f6;
+  color: #0b6658;
+}
+
+.segment-editor-toolbar__screening-count {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: rgba(13, 122, 104, 0.14);
+  color: #0b6658;
+  font-size: 11px;
+  line-height: 1;
 }
 
 .workbench-search-empty {
@@ -8393,33 +12470,175 @@ onBeforeRouteLeave(async () => {
   --rail-active-shadow: rgba(91, 67, 128, 0.16);
 }
 
+.workbench-settings-dialog {
+  display: grid;
+  gap: 16px;
+}
+
+.workbench-settings-tabs {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  padding: 2px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-muted);
+}
+
+.workbench-settings-tabs__item {
+  min-height: 30px;
+  padding: 5px 14px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.workbench-settings-tabs__item:hover,
+.workbench-settings-tabs__item:focus-visible {
+  color: var(--brand-700);
+  outline: none;
+}
+
+.workbench-settings-tabs__item.is-active {
+  border-color: color-mix(in srgb, var(--brand-700) 24%, var(--line-soft));
+  background: var(--surface-panel);
+  color: var(--brand-700);
+  box-shadow: 0 1px 4px rgba(17, 49, 42, 0.08);
+}
+
+.workbench-settings-panel {
+  display: grid;
+  gap: 18px;
+}
+
+.workbench-settings-section {
+  display: grid;
+  gap: 10px;
+  padding-top: 2px;
+}
+
+.workbench-settings-section + .workbench-settings-section {
+  padding-top: 16px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.workbench-settings-section__title {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.workbench-settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 34px;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.workbench-settings-segmented {
+  display: inline-flex;
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 2px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-muted);
+}
+
+.workbench-settings-segmented button {
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.workbench-settings-segmented button:hover,
+.workbench-settings-segmented button:focus-visible {
+  color: var(--brand-700);
+  outline: none;
+}
+
+.workbench-settings-segmented button.is-active {
+  border-color: color-mix(in srgb, var(--brand-700) 26%, var(--line-soft));
+  background: var(--surface-panel);
+  color: var(--brand-700);
+}
+
+.workbench-settings-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-height: 26px;
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.workbench-settings-choice input {
+  flex: 0 0 auto;
+  margin: 3px 0 0;
+  accent-color: var(--brand-700);
+}
+
 .shortcut-list {
   display: grid;
   gap: 10px;
+}
+
+.shortcut-list--settings {
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
 }
 
 .shortcut-item {
   display: flex;
   justify-content: space-between;
   gap: 16px;
+  min-width: 0;
   padding: 12px 14px;
   border: 1px solid var(--line-soft);
-  border-radius: 10px;
+  border-radius: 8px;
   background: var(--surface-panel);
 }
 
 .shortcut-item strong {
+  flex: 0 0 auto;
   color: var(--text-primary);
+  white-space: nowrap;
 }
 
 .shortcut-item span {
+  min-width: 0;
   color: var(--text-secondary);
   text-align: right;
 }
 
 @media (max-width: 1180px) {
+  .workbench-layout,
+  .workbench-layout.has-active-tool {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .panel--editor {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
   .segment-editor-side-tools {
     grid-column: 1;
+    grid-row: 1;
     order: -1;
     position: static;
     flex-direction: row;
@@ -8462,6 +12681,10 @@ onBeforeRouteLeave(async () => {
     height: 420px;
     min-height: 0;
   }
+
+  .segment-screening-panel__checks {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 @media (max-width: 980px) {
@@ -8473,6 +12696,17 @@ onBeforeRouteLeave(async () => {
 
   .segment-editor-footer {
     flex-wrap: wrap;
+  }
+
+  .segment-editor-footer__main {
+    flex-basis: 100%;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .segment-editor-footer__progress {
+    width: 100%;
+    max-width: none;
   }
 
   .segment-editor-footer :deep(.pagination) {
@@ -8490,8 +12724,8 @@ onBeforeRouteLeave(async () => {
   }
 
   .workbench-bottom-drawer {
-    right: 12px;
-    left: var(--workbench-drawer-left);
+    right: auto;
+    left: auto;
   }
 }
 
@@ -8526,6 +12760,10 @@ onBeforeRouteLeave(async () => {
     flex: 1 1 100%;
   }
 
+  .segment-editor-toolbar__screening {
+    flex: 0 0 34px;
+  }
+
   .segment-editor-toolbar__filter {
     align-items: stretch;
     flex-wrap: wrap;
@@ -8555,6 +12793,7 @@ onBeforeRouteLeave(async () => {
 
   .workbench-search-panel__field,
   .workbench-search-panel__field .field__control,
+  .workbench-search-panel__field .workbench-search-panel__input-wrap,
   .workbench-search-panel__field--replace .field__control {
     width: 100%;
   }
@@ -8587,6 +12826,25 @@ onBeforeRouteLeave(async () => {
 
   .shortcut-item {
     flex-direction: column;
+    gap: 4px;
+  }
+
+  .shortcut-item span {
+    text-align: left;
+  }
+
+  .workbench-settings-row {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .workbench-settings-segmented {
+    width: 100%;
+  }
+
+  .workbench-settings-segmented button {
+    flex: 1 1 0;
   }
 }
 

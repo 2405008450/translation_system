@@ -16,6 +16,7 @@ from app.services.libreoffice_service import (
     LibreOfficeError,
     compute_libreoffice_document_statistics,
 )
+from app.services.document_match_analysis import normalize_document_match_analysis
 
 
 APP_PROPERTIES_NS = "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
@@ -376,6 +377,7 @@ def _build_statistics_payload(
         "engine_version": engine_version,
         "license_status": license_status,
         "include_textboxes_footnotes_endnotes": include_textboxes_footnotes_endnotes,
+        "match_analysis": None,
     }
     for key in STATISTIC_NUMBER_KEYS:
         payload[key] = None
@@ -402,6 +404,7 @@ def _coerce_statistics_payload(value: dict[str, Any]) -> dict[str, Any]:
     )
     for key in STATISTIC_NUMBER_KEYS:
         payload[key] = _to_optional_int(value.get(key))
+    payload["match_analysis"] = normalize_document_match_analysis(value.get("match_analysis"))
     return payload
 
 

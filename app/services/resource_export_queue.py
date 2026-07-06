@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -15,7 +15,7 @@ from fastapi import HTTPException
 from fastapi.responses import FileResponse
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.config import get_settings
 from app.services.cache import get_json as cache_get_json
@@ -26,19 +26,26 @@ from app.services.xlsx_exporter import XLSX_MEDIA_TYPE
 logger = logging.getLogger(__name__)
 
 ResourceExportKind = Literal["tm", "term", "glossary"]
-ResourceExportFormat = Literal["xlsx", "tmx"]
-ResourceExportStatus = Literal["queued", "running", "completed", "failed"]
+ResourceExportFormat = Literal["xlsx", "tmx", "tbx"]
+ResourceExportStatus = Literal["queued", "running", "completed", "failed", "canceling", "canceled"]
 ProgressCallback = Callable[[int, str], None]
+CancelCheck = Callable[[], bool]
 
 EXPORT_TASK_TTL_SECONDS = 24 * 60 * 60
 EXPORT_QUERY_BATCH_SIZE = 1000
 EXPORT_MEDIA_TYPES: dict[ResourceExportFormat, str] = {
     "xlsx": XLSX_MEDIA_TYPE,
     "tmx": "application/x-tmx+xml",
+    "tbx": "application/x-tbx+xml",
 }
 
 # 本地模式下串行处理大文件导出，避免多个重任务同时占用数据库连接和文件句柄。
 _EXPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="resource-export")
+_EXPORT_FUTURES: dict[str, Future] = {}
+
+
+class ResourceExportCanceled(Exception):
+    """导出任务已被用户取消。"""
 
 
 def queue_resource_export(
@@ -47,6 +54,8 @@ def queue_resource_export(
     resource_id: UUID,
     export_format: ResourceExportFormat,
 ) -> dict[str, Any]:
+    if export_format == "tbx" and resource_type != "term":
+        raise HTTPException(status_code=400, detail="TBX 仅支持术语库导出。")
     task_id = str(uuid4())
     payload = {
         "task_id": task_id,
@@ -62,6 +71,7 @@ def queue_resource_export(
         payload=payload,
     )
     future = _EXPORT_EXECUTOR.submit(_run_resource_export_task, task_id, payload)
+    _EXPORT_FUTURES[task_id] = future
     future.add_done_callback(_log_export_task_failure)
     status = get_resource_export_task_status(task_id)
     return status or payload
@@ -81,6 +91,50 @@ def ensure_export_task_status(
     if not status or status.get("resource_type") != expected_resource_type:
         raise HTTPException(status_code=404, detail="导出任务不存在。")
     return status
+
+
+def _export_task_cancel_requested(task_id: str) -> bool:
+    status = get_resource_export_task_status(task_id)
+    return bool(status and status.get("status") in {"canceling", "canceled"})
+
+
+def _raise_if_export_canceled(task_id: str) -> None:
+    if _export_task_cancel_requested(task_id):
+        raise ResourceExportCanceled("导出已取消。")
+
+
+def cancel_resource_export_task(
+    task_id: str,
+    *,
+    expected_resource_type: ResourceExportKind,
+) -> dict[str, Any]:
+    status = ensure_export_task_status(task_id, expected_resource_type=expected_resource_type)
+    current_status = str(status.get("status") or "")
+    if current_status in {"completed", "failed", "canceled"}:
+        return status
+
+    payload = {
+        "resource_type": status.get("resource_type"),
+        "resource_id": status.get("resource_id"),
+        "format": status.get("format"),
+    }
+    future = _EXPORT_FUTURES.get(task_id)
+    if current_status == "queued" and future is not None and future.cancel():
+        return _set_export_task_status(
+            task_id,
+            "canceled",
+            progress=100,
+            message="导出已取消。",
+            payload=payload,
+        )
+
+    return _set_export_task_status(
+        task_id,
+        "canceling",
+        progress=int(status.get("progress") or 0),
+        message="正在取消导出，请稍候。",
+        payload=payload,
+    )
 
 
 def build_resource_export_download_response(
@@ -143,7 +197,7 @@ def export_tm_collection_now(
         _write_xlsx_file(
             output_path=output_path,
             sheet_title=collection.name,
-            headers=["原文", "译文", "源语言", "目标语言", "创建时间", "更新时间"],
+            headers=["原文", "译文", "源语言", "目标语言", "创建人", "创建时间", "最后修改人", "更新时间"],
             row_iter=_iter_tm_xlsx_rows(db, collection.id),
             total_entries=total_entries,
             progress_callback=progress,
@@ -196,7 +250,7 @@ def export_term_base_now(
         _write_xlsx_file(
             output_path=output_path,
             sheet_title=term_base.name,
-            headers=["术语原文", "术语译文", "源语言", "目标语言", "创建时间", "更新时间"],
+            headers=["术语原文", "术语译文", "源语言", "目标语言", "创建人", "创建时间", "最后修改人", "更新时间"],
             row_iter=_iter_term_xlsx_rows(db, term_base.id),
             total_entries=total_entries,
             progress_callback=progress,
@@ -211,6 +265,16 @@ def export_term_base_now(
             progress_callback=progress,
             filename=term_base.name,
             tuid_prefix="term",
+        )
+    elif export_format == "tbx":
+        _write_tbx_file(
+            output_path=output_path,
+            source_language=term_base.source_language or "und",
+            target_language=term_base.target_language or "und",
+            rows=_iter_term_tmx_rows(db, term_base.id),
+            total_entries=total_entries,
+            progress_callback=progress,
+            entry_id_prefix="term",
         )
     else:
         raise ValueError("不支持的导出格式。")
@@ -249,7 +313,7 @@ def export_glossary_base_now(
         _write_xlsx_file(
             output_path=output_path,
             sheet_title=glossary_base.name,
-            headers=["原文", "译文", "备注", "源语言", "目标语言", "创建时间", "更新时间"],
+            headers=["原文", "译文", "备注", "源语言", "目标语言", "创建人", "创建时间", "最后修改人", "更新时间"],
             row_iter=_iter_glossary_xlsx_rows(db, glossary_base.id),
             total_entries=total_entries,
             progress_callback=progress,
@@ -280,16 +344,23 @@ def export_glossary_base_now(
 def _run_resource_export_task(task_id: str, payload: dict[str, Any]) -> None:
     resource_type = payload.get("resource_type")
     export_format = payload.get("format")
+    output_path: Path | None = None
     try:
         resource_id = UUID(str(payload["resource_id"]))
-        if resource_type not in ("tm", "term", "glossary") or export_format not in ("xlsx", "tmx"):
+        if (
+            resource_type not in ("tm", "term", "glossary")
+            or export_format not in ("xlsx", "tmx", "tbx")
+            or (export_format == "tbx" and resource_type != "term")
+        ):
             raise ValueError("导出任务参数不正确。")
+        _raise_if_export_canceled(task_id)
 
         output_dir = _ensure_export_dir()
         _cleanup_expired_export_files(output_dir)
         output_path = output_dir / f"{task_id}.{export_format}"
 
         def update_progress(progress: int, message: str) -> None:
+            _raise_if_export_canceled(task_id)
             _set_export_task_status(
                 task_id,
                 "running",
@@ -327,6 +398,7 @@ def _run_resource_export_task(task_id: str, payload: dict[str, Any]) -> None:
                     progress_callback=update_progress,
                 )
 
+        _raise_if_export_canceled(task_id)
         _set_export_task_status(
             task_id,
             "completed",
@@ -334,6 +406,19 @@ def _run_resource_export_task(task_id: str, payload: dict[str, Any]) -> None:
             message="导出完成。",
             payload=payload,
             result=result,
+        )
+    except ResourceExportCanceled:
+        if output_path is not None:
+            try:
+                output_path.unlink(missing_ok=True)
+            except OSError:
+                logger.debug("skip cleanup for canceled export path=%s", output_path, exc_info=True)
+        _set_export_task_status(
+            task_id,
+            "canceled",
+            progress=100,
+            message="导出已取消。",
+            payload=payload,
         )
     except Exception as exc:
         logger.exception("resource export task failed task_id=%s", task_id)
@@ -375,6 +460,7 @@ def _write_xlsx_file(
     if processed == 0:
         progress_callback(90, "正在写入空 Excel 文件。")
 
+    progress_callback(92, "正在保存 Excel 文件。")
     workbook.save(output_path)
     workbook.close()
 
@@ -409,17 +495,36 @@ def _write_tmx_file(
 
         processed = 0
         for processed, row in enumerate(rows, start=1):
-            row_id, source_text, target_text = row
+            row_id, source_text, target_text, external_tuid, metadata = _normalize_tmx_export_row(row)
             if not source_text:
                 continue
 
-            tuid = f"{tuid_prefix}_{row_id}"
-            file.write(f"    <tu tuid={quoteattr(tuid)}>\n")
-            file.write(f"      <tuv xml:lang={quoteattr(source_language)}>\n")
-            file.write(f"        <seg>{escape(str(source_text))}</seg>\n")
+            tuid = _resolve_tmx_tuid(
+                row_id=row_id,
+                tuid_prefix=tuid_prefix,
+                external_tuid=external_tuid,
+                metadata=metadata,
+            )
+            tu_attrs = _resolve_tmx_attributes(metadata.get("tu_attributes"), skip_keys={"tuid"})
+            tu_attr_text = _format_tmx_attributes({"tuid": tuid, **tu_attrs})
+            file.write(f"    <tu{tu_attr_text}>\n")
+            _write_tmx_props(file, metadata.get("tu_props"), indent="      ")
+            _write_tmx_notes(file, metadata.get("tu_notes"), indent="      ")
+
+            source_tuv = _resolve_tuv_metadata(metadata.get("source_tuv"))
+            source_attrs = _resolve_tmx_attributes(source_tuv.get("attributes"), skip_keys={"xml:lang", "lang", "language"})
+            file.write(f"      <tuv{_format_tmx_attributes({'xml:lang': source_language, **source_attrs})}>\n")
+            _write_tmx_props(file, source_tuv.get("props"), indent="        ")
+            _write_tmx_notes(file, source_tuv.get("notes"), indent="        ")
+            file.write(f"        <seg>{escape(_sanitize_xml_text(source_text))}</seg>\n")
             file.write("      </tuv>\n")
-            file.write(f"      <tuv xml:lang={quoteattr(target_language)}>\n")
-            file.write(f"        <seg>{escape(str(target_text or ''))}</seg>\n")
+
+            target_tuv = _resolve_tuv_metadata(metadata.get("target_tuv"))
+            target_attrs = _resolve_tmx_attributes(target_tuv.get("attributes"), skip_keys={"xml:lang", "lang", "language"})
+            file.write(f"      <tuv{_format_tmx_attributes({'xml:lang': target_language, **target_attrs})}>\n")
+            _write_tmx_props(file, target_tuv.get("props"), indent="        ")
+            _write_tmx_notes(file, target_tuv.get("notes"), indent="        ")
+            file.write(f"        <seg>{escape(_sanitize_xml_text(target_text or ''))}</seg>\n")
             file.write("      </tuv>\n")
             file.write("    </tu>\n")
             _report_export_progress(
@@ -432,12 +537,213 @@ def _write_tmx_file(
         if processed == 0:
             progress_callback(90, "正在写入空 TMX 文件。")
 
+        progress_callback(92, "正在保存 TMX 文件。")
         file.write("  </body>\n")
         file.write("</tmx>\n")
 
 
+def _write_tbx_file(
+    *,
+    output_path: Path,
+    source_language: str,
+    target_language: str,
+    rows: Any,
+    total_entries: int,
+    progress_callback: ProgressCallback,
+    entry_id_prefix: str,
+) -> None:
+    with output_path.open("w", encoding="utf-8", newline="\n") as file:
+        file.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+        file.write(f"<martif{_format_tmx_attributes({'xml:lang': source_language, 'type': 'TBX'})}>\n")
+        file.write("  <text>\n")
+        file.write("    <body>\n")
+
+        processed = 0
+        for processed, row in enumerate(rows, start=1):
+            row_id, source_text, target_text, external_tuid, metadata = _normalize_tmx_export_row(row)
+            if not source_text:
+                continue
+
+            entry_id = _resolve_tbx_entry_id(
+                row_id=row_id,
+                entry_id_prefix=entry_id_prefix,
+                external_tuid=external_tuid,
+                metadata=metadata,
+            )
+            entry_attrs = _resolve_tmx_attributes(
+                metadata.get("tbx_entry_attributes"),
+                skip_keys={"id"},
+            )
+            file.write(f"      <termEntry{_format_tmx_attributes({'id': entry_id, **entry_attrs})}>\n")
+            _write_tbx_lang_set(
+                file,
+                language=source_language,
+                term_text=source_text,
+                term_metadata=_resolve_tbx_term_metadata(metadata.get("source_tbx_term")),
+            )
+            _write_tbx_lang_set(
+                file,
+                language=target_language,
+                term_text=target_text or "",
+                term_metadata=_resolve_tbx_term_metadata(metadata.get("target_tbx_term")),
+            )
+            file.write("      </termEntry>\n")
+            _report_export_progress(
+                processed=processed,
+                total_entries=total_entries,
+                progress_callback=progress_callback,
+                message="正在写入 TBX 文件。",
+            )
+
+        if processed == 0:
+            progress_callback(90, "正在写入空 TBX 文件。")
+
+        progress_callback(92, "正在保存 TBX 文件。")
+        file.write("    </body>\n")
+        file.write("  </text>\n")
+        file.write("</martif>\n")
+
+
+def _normalize_tmx_export_row(row: Any) -> tuple[Any, str, str, str | None, dict[str, Any]]:
+    try:
+        row_id = row[0]
+        source_text = row[1] or ""
+        target_text = row[2] or ""
+        external_tuid = row[3] if len(row) > 3 else None
+        raw_metadata = row[4] if len(row) > 4 else None
+    except (TypeError, KeyError, IndexError):
+        row_id = getattr(row, "id", "")
+        source_text = getattr(row, "source_text", "") or ""
+        target_text = getattr(row, "target_text", "") or ""
+        external_tuid = getattr(row, "external_tuid", None)
+        raw_metadata = getattr(row, "tmx_metadata", None)
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+    return row_id, str(source_text), str(target_text), str(external_tuid) if external_tuid else None, metadata
+
+
+def _resolve_tmx_tuid(
+    *,
+    row_id: Any,
+    tuid_prefix: str,
+    external_tuid: str | None,
+    metadata: dict[str, Any],
+) -> str:
+    return str(metadata.get("tuid") or external_tuid or f"{tuid_prefix}_{row_id}")
+
+
+def _resolve_tbx_entry_id(
+    *,
+    row_id: Any,
+    entry_id_prefix: str,
+    external_tuid: str | None,
+    metadata: dict[str, Any],
+) -> str:
+    return str(metadata.get("tbx_entry_id") or external_tuid or f"{entry_id_prefix}_{row_id}")
+
+
+def _resolve_tuv_metadata(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _resolve_tbx_term_metadata(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _resolve_tmx_attributes(value: Any, *, skip_keys: set[str] | None = None) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    normalized_skip = {(key or "").lower() for key in (skip_keys or set())}
+    attributes: dict[str, str] = {}
+    for key, item in value.items():
+        clean_key = str(key)
+        if clean_key.lower() in normalized_skip:
+            continue
+        if item is None:
+            continue
+        attributes[clean_key] = str(item)
+    return attributes
+
+
+def _format_tmx_attributes(attributes: dict[str, str]) -> str:
+    parts = []
+    for key, value in attributes.items():
+        if not key:
+            continue
+        parts.append(f"{key}={quoteattr(_sanitize_xml_text(value))}")
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def _write_tmx_props(file, props: Any, *, indent: str) -> None:
+    if not isinstance(props, list):
+        return
+    for prop in props:
+        if not isinstance(prop, dict):
+            continue
+        prop_type = _sanitize_xml_text(str(prop.get("type") or ""))
+        value = _sanitize_xml_text(str(prop.get("value") or ""))
+        if not prop_type and not value:
+            continue
+        file.write(f"{indent}<prop type={quoteattr(prop_type)}>{escape(value)}</prop>\n")
+
+
+def _write_tmx_notes(file, notes: Any, *, indent: str) -> None:
+    if not isinstance(notes, list):
+        return
+    for note in notes:
+        value = _sanitize_xml_text(str(note or ""))
+        if value:
+            file.write(f"{indent}<note>{escape(value)}</note>\n")
+
+
+def _write_tbx_lang_set(file, *, language: str, term_text: str, term_metadata: dict[str, Any]) -> None:
+    lang_attrs = _resolve_tmx_attributes(
+        term_metadata.get("lang_set_attributes"),
+        skip_keys={"xml:lang", "lang", "language"},
+    )
+    tig_attrs = _resolve_tmx_attributes(term_metadata.get("tig_attributes"))
+    file.write(f"        <langSet{_format_tmx_attributes({'xml:lang': language, **lang_attrs})}>\n")
+    file.write(f"          <tig{_format_tmx_attributes(tig_attrs)}>\n")
+    file.write(f"            <term>{escape(_sanitize_xml_text(term_text))}</term>\n")
+    _write_tbx_typed_children(file, "termNote", term_metadata.get("term_notes"), indent="            ")
+    _write_tbx_typed_children(file, "descrip", term_metadata.get("descrips"), indent="            ")
+    _write_tbx_notes(file, term_metadata.get("notes"), indent="            ")
+    file.write("          </tig>\n")
+    file.write("        </langSet>\n")
+
+
+def _write_tbx_typed_children(file, tag_name: str, items: Any, *, indent: str) -> None:
+    if not isinstance(items, list):
+        return
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_type = _sanitize_xml_text(str(item.get("type") or ""))
+        value = _sanitize_xml_text(str(item.get("value") or ""))
+        if not item_type and not value:
+            continue
+        attr_text = f" type={quoteattr(item_type)}" if item_type else ""
+        file.write(f"{indent}<{tag_name}{attr_text}>{escape(value)}</{tag_name}>\n")
+
+
+def _write_tbx_notes(file, notes: Any, *, indent: str) -> None:
+    if not isinstance(notes, list):
+        return
+    for note in notes:
+        value = _sanitize_xml_text(str(note or ""))
+        if value:
+            file.write(f"{indent}<note>{escape(value)}</note>\n")
+
+
+def _sanitize_xml_text(value: Any) -> str:
+    text_value = str(value or "")
+    return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", text_value)
+
+
 def _iter_tm_xlsx_rows(db: Session, collection_id: UUID):
-    from app.models import TranslationMemory
+    from app.models import TranslationMemory, User
+
+    Creator = aliased(User)
+    Modifier = aliased(User)
 
     query = (
         db.query(
@@ -445,9 +751,15 @@ def _iter_tm_xlsx_rows(db: Session, collection_id: UUID):
             TranslationMemory.target_text,
             TranslationMemory.source_language,
             TranslationMemory.target_language,
+            Creator.nickname.label("creator_nickname"),
+            Creator.username.label("creator_username"),
             TranslationMemory.created_at,
+            Modifier.nickname.label("modifier_nickname"),
+            Modifier.username.label("modifier_username"),
             TranslationMemory.updated_at,
         )
+        .outerjoin(Creator, TranslationMemory.creator_id == Creator.id)
+        .outerjoin(Modifier, TranslationMemory.last_modified_by_id == Modifier.id)
         .filter(TranslationMemory.collection_id == collection_id)
         .order_by(TranslationMemory.updated_at.desc(), TranslationMemory.created_at.desc())
         .execution_options(stream_results=True)
@@ -458,13 +770,18 @@ def _iter_tm_xlsx_rows(db: Session, collection_id: UUID):
             row.target_text,
             row.source_language or "",
             row.target_language or "",
+            _format_user_name(row.creator_nickname, row.creator_username),
             _format_datetime(row.created_at),
+            _format_user_name(row.modifier_nickname, row.modifier_username),
             _format_datetime(row.updated_at),
         ]
 
 
 def _iter_term_xlsx_rows(db: Session, term_base_id: UUID):
-    from app.models import TermEntry
+    from app.models import TermEntry, User
+
+    Creator = aliased(User)
+    Modifier = aliased(User)
 
     query = (
         db.query(
@@ -472,9 +789,15 @@ def _iter_term_xlsx_rows(db: Session, term_base_id: UUID):
             TermEntry.target_text,
             TermEntry.source_language,
             TermEntry.target_language,
+            Creator.nickname.label("creator_nickname"),
+            Creator.username.label("creator_username"),
             TermEntry.created_at,
+            Modifier.nickname.label("modifier_nickname"),
+            Modifier.username.label("modifier_username"),
             TermEntry.updated_at,
         )
+        .outerjoin(Creator, TermEntry.creator_id == Creator.id)
+        .outerjoin(Modifier, TermEntry.last_modified_by_id == Modifier.id)
         .filter(TermEntry.term_base_id == term_base_id)
         .order_by(TermEntry.updated_at.desc(), TermEntry.created_at.desc())
         .execution_options(stream_results=True)
@@ -485,13 +808,18 @@ def _iter_term_xlsx_rows(db: Session, term_base_id: UUID):
             row.target_text,
             row.source_language or "",
             row.target_language or "",
+            _format_user_name(row.creator_nickname, row.creator_username),
             _format_datetime(row.created_at),
+            _format_user_name(row.modifier_nickname, row.modifier_username),
             _format_datetime(row.updated_at),
         ]
 
 
 def _iter_glossary_xlsx_rows(db: Session, glossary_base_id: UUID):
-    from app.models import GlossaryEntry
+    from app.models import GlossaryEntry, User
+
+    Creator = aliased(User)
+    Modifier = aliased(User)
 
     query = (
         db.query(
@@ -500,9 +828,15 @@ def _iter_glossary_xlsx_rows(db: Session, glossary_base_id: UUID):
             GlossaryEntry.note,
             GlossaryEntry.source_language,
             GlossaryEntry.target_language,
+            Creator.nickname.label("creator_nickname"),
+            Creator.username.label("creator_username"),
             GlossaryEntry.created_at,
+            Modifier.nickname.label("modifier_nickname"),
+            Modifier.username.label("modifier_username"),
             GlossaryEntry.updated_at,
         )
+        .outerjoin(Creator, GlossaryEntry.creator_id == Creator.id)
+        .outerjoin(Modifier, GlossaryEntry.last_modified_by_id == Modifier.id)
         .filter(GlossaryEntry.glossary_base_id == glossary_base_id)
         .order_by(GlossaryEntry.updated_at.desc(), GlossaryEntry.created_at.desc())
         .execution_options(stream_results=True)
@@ -514,7 +848,9 @@ def _iter_glossary_xlsx_rows(db: Session, glossary_base_id: UUID):
             row.note or "",
             row.source_language or "",
             row.target_language or "",
+            _format_user_name(row.creator_nickname, row.creator_username),
             _format_datetime(row.created_at),
+            _format_user_name(row.modifier_nickname, row.modifier_username),
             _format_datetime(row.updated_at),
         ]
 
@@ -527,13 +863,15 @@ def _iter_tm_tmx_rows(db: Session, collection_id: UUID):
             TranslationMemory.id,
             TranslationMemory.source_text,
             TranslationMemory.target_text,
+            TranslationMemory.external_tuid,
+            TranslationMemory.tmx_metadata,
         )
         .filter(TranslationMemory.collection_id == collection_id)
         .order_by(TranslationMemory.updated_at.desc(), TranslationMemory.created_at.desc())
         .execution_options(stream_results=True)
     )
     for row in query.yield_per(EXPORT_QUERY_BATCH_SIZE):
-        yield row.id, row.source_text, row.target_text
+        yield row.id, row.source_text, row.target_text, row.external_tuid, row.tmx_metadata
 
 
 def _iter_term_tmx_rows(db: Session, term_base_id: UUID):
@@ -544,13 +882,15 @@ def _iter_term_tmx_rows(db: Session, term_base_id: UUID):
             TermEntry.id,
             TermEntry.source_text,
             TermEntry.target_text,
+            TermEntry.external_tuid,
+            TermEntry.tmx_metadata,
         )
         .filter(TermEntry.term_base_id == term_base_id)
         .order_by(TermEntry.updated_at.desc(), TermEntry.created_at.desc())
         .execution_options(stream_results=True)
     )
     for row in query.yield_per(EXPORT_QUERY_BATCH_SIZE):
-        yield row.id, row.source_text, row.target_text
+        yield row.id, row.source_text, row.target_text, row.external_tuid, row.tmx_metadata
 
 
 def _iter_glossary_tmx_rows(db: Session, glossary_base_id: UUID):
@@ -670,12 +1010,22 @@ def _format_datetime(value: datetime | None) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _format_user_name(nickname: str | None, username: str | None) -> str:
+    return nickname or username or ""
+
+
 def _noop_progress_callback(progress: int, message: str) -> None:
     return None
 
 
 def _log_export_task_failure(future: Future) -> None:
+    for task_id, candidate in list(_EXPORT_FUTURES.items()):
+        if candidate is future:
+            _EXPORT_FUTURES.pop(task_id, None)
+            break
     try:
         future.result()
+    except CancelledError:
+        return
     except Exception:
         logger.exception("resource export worker crashed")

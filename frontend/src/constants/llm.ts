@@ -14,27 +14,17 @@ export interface LLMModelOption {
   provider: 'openrouter' | 'deepseek'
 }
 
-export const defaultLLMModelId = 'google/gemini-3.5-flash'
+export const defaultLLMModelId = 'google/gemini-3-flash-preview'
 
 export const llmModelShortLabelMap: Record<string, string> = {
   'google/gemini-3.5-flash': 'Gemini 3.5',
   'google/gemini-3.1-pro-preview': 'Gemini 3.1 Pro',
   'google/gemini-3.1-flash-lite': 'Gemini 3.1 Lite',
   'google/gemini-3-flash-preview': 'Gemini 3 Flash',
-  'google/gemini-2.5-pro': 'Gemini 2.5 Pro',
-  'google/gemini-2.5-flash': 'Gemini 2.5 Flash',
-  'google/gemini-2.5-flash-lite': 'Gemini 2.5 Lite',
-  'openai/gpt-chat-latest': 'GPT Chat',
+  'openai/gpt-5.5': 'GPT-5.5',
   'openai/gpt-5.4': 'GPT-5.4',
   'openai/gpt-5.4-mini': 'GPT-5.4 Mini',
   'openai/gpt-5.4-nano': 'GPT-5.4 Nano',
-  'openai/gpt-5.3-chat': 'GPT-5.3 Chat',
-  'openai/gpt-5.2': 'GPT-5.2',
-  'openai/gpt-5.2-chat': 'GPT-5.2 Chat',
-  'openai/gpt-5.1': 'GPT-5.1',
-  'openai/gpt-5.1-chat': 'GPT-5.1 Chat',
-  'openai/gpt-5-mini': 'GPT-5 Mini',
-  'openai/gpt-5-nano': 'GPT-5 Nano',
   'deepseek/deepseek-chat': 'DeepSeek Chat',
   'deepseek-chat': 'DeepSeek Chat',
 }
@@ -42,13 +32,31 @@ export const llmModelShortLabelMap: Record<string, string> = {
 export const llmModelOptions: LLMModelOption[] = [
   {
     id: defaultLLMModelId,
-    name: 'Gemini 3.5 Flash',
+    name: 'Gemini 3 Flash Preview',
     family: 'gemini',
+    provider: 'openrouter',
+  },
+  {
+    id: 'openai/gpt-5.4-mini',
+    name: 'GPT-5.4 Mini',
+    family: 'gpt',
     provider: 'openrouter',
   },
   {
     id: 'google/gemini-3.1-pro-preview',
     name: 'Gemini 3.1 Pro Preview',
+    family: 'gemini',
+    provider: 'openrouter',
+  },
+  {
+    id: 'openai/gpt-5.5',
+    name: 'GPT-5.5',
+    family: 'gpt',
+    provider: 'openrouter',
+  },
+  {
+    id: 'google/gemini-3.5-flash',
+    name: 'Gemini 3.5 Flash',
     family: 'gemini',
     provider: 'openrouter',
   },
@@ -59,92 +67,14 @@ export const llmModelOptions: LLMModelOption[] = [
     provider: 'openrouter',
   },
   {
-    id: 'google/gemini-3-flash-preview',
-    name: 'Gemini 3 Flash Preview',
-    family: 'gemini',
-    provider: 'openrouter',
-  },
-  {
-    id: 'google/gemini-2.5-pro',
-    name: 'Gemini 2.5 Pro',
-    family: 'gemini',
-    provider: 'openrouter',
-  },
-  {
-    id: 'google/gemini-2.5-flash',
-    name: 'Gemini 2.5 Flash',
-    family: 'gemini',
-    provider: 'openrouter',
-  },
-  {
-    id: 'google/gemini-2.5-flash-lite',
-    name: 'Gemini 2.5 Flash Lite',
-    family: 'gemini',
-    provider: 'openrouter',
-  },
-  {
-    id: 'openai/gpt-chat-latest',
-    name: 'GPT Chat Latest',
-    family: 'gpt',
-    provider: 'openrouter',
-  },
-  {
     id: 'openai/gpt-5.4',
     name: 'GPT-5.4',
     family: 'gpt',
     provider: 'openrouter',
   },
   {
-    id: 'openai/gpt-5.4-mini',
-    name: 'GPT-5.4 Mini',
-    family: 'gpt',
-    provider: 'openrouter',
-  },
-  {
     id: 'openai/gpt-5.4-nano',
     name: 'GPT-5.4 Nano',
-    family: 'gpt',
-    provider: 'openrouter',
-  },
-  {
-    id: 'openai/gpt-5.3-chat',
-    name: 'GPT-5.3 Chat',
-    family: 'gpt',
-    provider: 'openrouter',
-  },
-  {
-    id: 'openai/gpt-5.2',
-    name: 'GPT-5.2',
-    family: 'gpt',
-    provider: 'openrouter',
-  },
-  {
-    id: 'openai/gpt-5.2-chat',
-    name: 'GPT-5.2 Chat',
-    family: 'gpt',
-    provider: 'openrouter',
-  },
-  {
-    id: 'openai/gpt-5.1',
-    name: 'GPT-5.1',
-    family: 'gpt',
-    provider: 'openrouter',
-  },
-  {
-    id: 'openai/gpt-5.1-chat',
-    name: 'GPT-5.1 Chat',
-    family: 'gpt',
-    provider: 'openrouter',
-  },
-  {
-    id: 'openai/gpt-5-mini',
-    name: 'GPT-5 Mini',
-    family: 'gpt',
-    provider: 'openrouter',
-  },
-  {
-    id: 'openai/gpt-5-nano',
-    name: 'GPT-5 Nano',
     family: 'gpt',
     provider: 'openrouter',
   },

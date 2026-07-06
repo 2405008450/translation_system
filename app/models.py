@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, Uuid, func, text
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, Uuid, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -50,6 +50,12 @@ class Project(Base):
     translation_guidelines: Mapped[str] = mapped_column(
         Text, nullable=False, default="", server_default=text("''")
     )
+    quality_qa_settings: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default=text("'{}'")
+    )
+    auto_tm_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -84,6 +90,62 @@ class Project(Base):
         cascade="all, delete-orphan",
         order_by="ProjectWorkflowStep.sort_order",
     )
+    merge_views: Mapped[list["ProjectMergeView"]] = relationship(
+        "ProjectMergeView",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="ProjectMergeView.created_at",
+    )
+
+
+class ProjectMergeView(Base):
+    """项目"合并视图"：记录同一项目中哪些 file_records 组成一个编辑视图。
+
+    仅持久化分组关系（name + 有序 file_ids），不为合并单独存储句段——
+    句段仍通过 file_record_id 归属各自文件，保存/导出复用按文件的现有接口。
+    """
+
+    __tablename__ = "project_merge_views"
+    __table_args__ = (
+        Index("ix_project_merge_views_project_id", "project_id"),
+        Index("ix_project_merge_views_creator_id", "creator_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    file_ids: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="[]",
+        server_default=text("'[]'"),
+    )
+    creator_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    project: Mapped["Project"] = relationship("Project", back_populates="merge_views")
+    creator: Mapped["User | None"] = relationship("User", foreign_keys=[creator_id])
 
 
 class ProjectWorkflowStep(Base):
@@ -290,6 +352,17 @@ class FileRecord(Base):
         back_populates="file_record",
         cascade="all, delete-orphan",
     )
+    revision_display_setting: Mapped["RevisionDisplaySetting | None"] = relationship(
+        "RevisionDisplaySetting",
+        back_populates="file_record",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+    qa_issues: Mapped[list["SegmentQAIssue"]] = relationship(
+        "SegmentQAIssue",
+        back_populates="file_record",
+        cascade="all, delete-orphan",
+    )
     file_assignments: Mapped[list["FileAssignment"]] = relationship(
         "FileAssignment",
         back_populates="file_record",
@@ -343,6 +416,120 @@ class FileExportTask(Base):
 
     file_record: Mapped["FileRecord"] = relationship("FileRecord")
     created_by: Mapped["User | None"] = relationship("User", foreign_keys=[created_by_id])
+
+
+class PretranslationRun(Base):
+    __tablename__ = "pretranslation_runs"
+    __table_args__ = (
+        Index("ix_pretranslation_runs_project_id", "project_id"),
+        Index("ix_pretranslation_runs_status", "status"),
+        Index("ix_pretranslation_runs_created_by_id", "created_by_id"),
+        Index("ix_pretranslation_runs_created_at", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="queued", server_default=text("'queued'"))
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    total_files: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    completed_files: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    failed_files: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    canceled_files: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    options_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}", server_default=text("'{}'"))
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    started_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    completed_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    project: Mapped["Project"] = relationship("Project")
+    created_by: Mapped["User | None"] = relationship("User", foreign_keys=[created_by_id])
+    tasks: Mapped[list["PretranslationTask"]] = relationship(
+        "PretranslationTask",
+        back_populates="run",
+        cascade="all, delete-orphan",
+    )
+
+
+class PretranslationTask(Base):
+    __tablename__ = "pretranslation_tasks"
+    __table_args__ = (
+        Index("ix_pretranslation_tasks_run_id", "run_id"),
+        Index("ix_pretranslation_tasks_file_record_id", "file_record_id"),
+        Index("ix_pretranslation_tasks_file_status", "file_record_id", "status"),
+        Index("ix_pretranslation_tasks_status", "status"),
+        Index("ix_pretranslation_tasks_updated_at", "updated_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("pretranslation_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    file_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="queued", server_default=text("'queued'"))
+    stage: Mapped[str] = mapped_column(String(40), nullable=False, default="queued", server_default=text("'queued'"))
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    provider: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    scope: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    total_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    unique_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    deduplicated_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    processed_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    updated_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    error_segments: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    current_action: Mapped[str | None] = mapped_column(Text, nullable=True)
+    operation_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    completed_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    last_heartbeat_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    run: Mapped["PretranslationRun"] = relationship("PretranslationRun", back_populates="tasks")
+    file_record: Mapped["FileRecord"] = relationship("FileRecord")
 
 
 class DocumentStatisticsReport(Base):
@@ -466,6 +653,45 @@ class User(Base):
     )
 
 
+class GuidelineTemplate(Base):
+    __tablename__ = "guideline_templates"
+    __table_args__ = (
+        Index("ix_guideline_templates_updated_at", "updated_at"),
+        Index("ix_guideline_templates_created_by_id", "created_by_id"),
+        Index("ix_guideline_templates_last_modified_by_id", "last_modified_by_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(120), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default=text("''"))
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    source_path: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    last_modified_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    creator: Mapped["User | None"] = relationship("User", foreign_keys=[created_by_id])
+    last_modified_by: Mapped["User | None"] = relationship("User", foreign_keys=[last_modified_by_id])
+
+
 class ProjectAssignment(Base):
     __tablename__ = "project_assignments"
     __table_args__ = (
@@ -570,6 +796,8 @@ class FileAssignment(Base):
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="active", server_default=text("'active'")
     )
+    segment_range_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    segment_range_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     file_record: Mapped["FileRecord"] = relationship("FileRecord", back_populates="file_assignments")
     project: Mapped["Project"] = relationship("Project")
@@ -697,6 +925,28 @@ class Segment(Base):
             "cell_index",
             "sentence_id",
         ),
+        Index("ix_segments_file_record_status", "file_record_id", "status"),
+        Index("ix_segments_file_record_source", "file_record_id", "source"),
+        Index("ix_segments_last_modified_by_id", "last_modified_by_id"),
+        Index("ix_segments_updated_at", "updated_at"),
+        Index(
+            "ix_segments_source_text_trgm",
+            "source_text",
+            postgresql_using="gin",
+            postgresql_ops={"source_text": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_segments_display_text_trgm",
+            "display_text",
+            postgresql_using="gin",
+            postgresql_ops={"display_text": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_segments_target_text_trgm",
+            "target_text",
+            postgresql_using="gin",
+            postgresql_ops={"target_text": "gin_trgm_ops"},
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -740,6 +990,11 @@ class Segment(Base):
     source_word_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     llm_provider: Mapped[str | None] = mapped_column(String(40), nullable=True)
     llm_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    last_modified_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     block_type: Mapped[str] = mapped_column(String(20), nullable=False, default="paragraph")
     block_index: Mapped[int] = mapped_column(nullable=False, default=0)
     row_index: Mapped[int | None] = mapped_column(nullable=True)
@@ -761,6 +1016,7 @@ class Segment(Base):
     )
 
     file_record: Mapped["FileRecord"] = relationship("FileRecord", back_populates="segments")
+    last_modified_by: Mapped["User | None"] = relationship("User", foreign_keys=[last_modified_by_id])
     workflow_step: Mapped["ProjectWorkflowStep | None"] = relationship(
         "ProjectWorkflowStep",
         back_populates="segments",
@@ -768,6 +1024,11 @@ class Segment(Base):
     comments: Mapped[list["SegmentComment"]] = relationship("SegmentComment", back_populates="segment")
     revisions: Mapped[list["SegmentRevision"]] = relationship(
         "SegmentRevision",
+        back_populates="segment",
+        cascade="all, delete-orphan",
+    )
+    qa_issues: Mapped[list["SegmentQAIssue"]] = relationship(
+        "SegmentQAIssue",
         back_populates="segment",
         cascade="all, delete-orphan",
     )
@@ -896,6 +1157,77 @@ class TermQAReportItem(Base):
     ignored_by: Mapped["User | None"] = relationship("User", foreign_keys=[ignored_by_id])
 
 
+class SegmentQAIssue(Base):
+    __tablename__ = "segment_qa_issues"
+    __table_args__ = (
+        Index("ix_segment_qa_issues_project_id", "project_id"),
+        Index("ix_segment_qa_issues_file_record_id", "file_record_id"),
+        Index("ix_segment_qa_issues_segment_id", "segment_id"),
+        Index("ix_segment_qa_issues_segment_rule_status", "segment_id", "rule_key", "status"),
+        Index("ix_segment_qa_issues_status", "status"),
+        Index("ix_segment_qa_issues_rule_key", "rule_key"),
+        Index("ix_segment_qa_issues_target_hash", "target_text_hash"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    file_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    segment_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("segments.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sentence_id: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+    rule_key: Mapped[str] = mapped_column(String(40), nullable=False, default="spelling_grammar")
+    provider: Mapped[str] = mapped_column(String(40), nullable=False, default="languagetool")
+    language: Mapped[str] = mapped_column(String(20), nullable=False, default="")
+    severity: Mapped[str] = mapped_column(String(20), nullable=False, default="medium")
+    message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    short_message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    rule_id: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    rule_category: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    issue_type: Mapped[str] = mapped_column(String(80), nullable=False, default="")
+    context_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    offset: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    length: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    replacements: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default=text("'[]'"))
+    target_text_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open", server_default=text("'open'"))
+    ignored_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    ignored_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    project: Mapped["Project | None"] = relationship("Project")
+    file_record: Mapped["FileRecord"] = relationship("FileRecord", back_populates="qa_issues")
+    segment: Mapped["Segment"] = relationship("Segment", back_populates="qa_issues")
+    ignored_by: Mapped["User | None"] = relationship("User", foreign_keys=[ignored_by_id])
+
+
 class SegmentRevision(Base):
     __tablename__ = "segment_revisions"
     __table_args__ = (
@@ -959,6 +1291,76 @@ class SegmentRevision(Base):
     resolved_by: Mapped["User | None"] = relationship(
         "User",
         foreign_keys=[resolved_by_id],
+    )
+
+
+class RevisionDisplaySetting(Base):
+    __tablename__ = "revision_display_settings"
+    __table_args__ = (
+        UniqueConstraint("file_record_id", name="uq_revision_display_settings_file_record_id"),
+        Index("ix_revision_display_settings_updated_by_id", "updated_by_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    file_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    show_author_time: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default=text("TRUE"),
+    )
+    show_others_revisions: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default=text("TRUE"),
+    )
+    default_insert_color: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="#2563eb",
+        server_default=text("'#2563eb'"),
+    )
+    default_delete_color: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="#dc2626",
+        server_default=text("'#dc2626'"),
+    )
+    author_colors: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'"),
+    )
+    updated_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    file_record: Mapped["FileRecord"] = relationship(
+        "FileRecord",
+        back_populates="revision_display_setting",
+    )
+    updated_by: Mapped["User | None"] = relationship(
+        "User",
+        foreign_keys=[updated_by_id],
     )
 
 
@@ -1185,6 +1587,39 @@ class IssueMarker(Base):
     )
 
 
+class ResourceImportBatch(Base):
+    __tablename__ = "resource_import_batches"
+    __table_args__ = (
+        Index("ix_resource_import_batches_resource", "resource_type", "resource_id"),
+        Index("ix_resource_import_batches_created_at", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    resource_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    resource_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    filename: Mapped[str] = mapped_column(Text, nullable=False)
+    file_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    file_format: Mapped[str] = mapped_column(String(20), nullable=False, default="", server_default=text("''"))
+    source_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    target_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    tmx_header_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+
+    created_by: Mapped["User | None"] = relationship("User", foreign_keys=[created_by_id])
+
+
 class TMCollection(Base):
     __tablename__ = "memory_bases"
     __table_args__ = (
@@ -1258,6 +1693,10 @@ class TranslationMemory(Base):
             "source_language",
             "target_language",
         ),
+        Index("ix_memory_entries_creator_id", "creator_id"),
+        Index("ix_memory_entries_last_modified_by_id", "last_modified_by_id"),
+        Index("ix_memory_entries_external_tuid", "external_tuid"),
+        Index("ix_memory_entries_import_batch_id", "import_batch_id"),
         Index(
             "ix_memory_entries_source_text_trgm",
             "source_text",
@@ -1294,6 +1733,18 @@ class TranslationMemory(Base):
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
+    last_modified_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    external_tuid: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tmx_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    import_batch_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("resource_import_batches.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -1310,6 +1761,13 @@ class TranslationMemory(Base):
     )
     creator: Mapped["User | None"] = relationship(
         "User", foreign_keys=[creator_id]
+    )
+    last_modified_by: Mapped["User | None"] = relationship(
+        "User", foreign_keys=[last_modified_by_id]
+    )
+    import_batch: Mapped["ResourceImportBatch | None"] = relationship(
+        "ResourceImportBatch",
+        foreign_keys=[import_batch_id],
     )
 
 
@@ -1468,6 +1926,10 @@ class TermEntry(Base):
             "source_normalized",
         ),
         Index("ix_term_entries_language_pair", "source_language", "target_language"),
+        Index("ix_term_entries_creator_id", "creator_id"),
+        Index("ix_term_entries_last_modified_by_id", "last_modified_by_id"),
+        Index("ix_term_entries_external_tuid", "external_tuid"),
+        Index("ix_term_entries_import_batch_id", "import_batch_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -1491,6 +1953,18 @@ class TermEntry(Base):
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
+    last_modified_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    external_tuid: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tmx_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    import_batch_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("resource_import_batches.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -1507,6 +1981,13 @@ class TermEntry(Base):
     )
     creator: Mapped["User | None"] = relationship(
         "User", foreign_keys=[creator_id]
+    )
+    last_modified_by: Mapped["User | None"] = relationship(
+        "User", foreign_keys=[last_modified_by_id]
+    )
+    import_batch: Mapped["ResourceImportBatch | None"] = relationship(
+        "ResourceImportBatch",
+        foreign_keys=[import_batch_id],
     )
 
 
@@ -1568,6 +2049,8 @@ class GlossaryEntry(Base):
             "source_normalized",
         ),
         Index("ix_glossary_entries_language_pair", "source_language", "target_language"),
+        Index("ix_glossary_entries_creator_id", "creator_id"),
+        Index("ix_glossary_entries_last_modified_by_id", "last_modified_by_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -1592,6 +2075,11 @@ class GlossaryEntry(Base):
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
+    last_modified_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -1608,6 +2096,9 @@ class GlossaryEntry(Base):
     )
     creator: Mapped["User | None"] = relationship(
         "User", foreign_keys=[creator_id]
+    )
+    last_modified_by: Mapped["User | None"] = relationship(
+        "User", foreign_keys=[last_modified_by_id]
     )
 
 

@@ -4,6 +4,7 @@ import csv
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from typing import Any, Callable
 from uuid import UUID
 
 from openpyxl import load_workbook
@@ -13,12 +14,19 @@ from sqlalchemy.orm import Session
 from app.models import TermEntry
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import normalize_match_text, normalize_text
+from app.services.import_task_state import ImportTaskCanceled
+from app.services.tbx_stream import iter_tbx_rows as iter_stream_tbx_rows
+from app.services.tmx_stream import TMXRow, iter_tmx_rows as iter_stream_tmx_rows
 
 
 CSV_EXTENSIONS = {".csv"}
+TMX_EXTENSIONS = {".tmx"}
+TBX_EXTENSIONS = {".tbx"}
 XLS_EXTENSIONS = {".xls"}
 XLSX_EXTENSIONS = {".xlsx"}
-TERM_IMPORT_EXTENSIONS = CSV_EXTENSIONS | XLS_EXTENSIONS | XLSX_EXTENSIONS
+TERM_IMPORT_EXTENSIONS = CSV_EXTENSIONS | TMX_EXTENSIONS | TBX_EXTENSIONS | XLS_EXTENSIONS | XLSX_EXTENSIONS
+TERM_STATUS_LOOKUP_CHUNK_SIZE = 10000
+TERM_PREVIEW_MAX_SCAN_ROWS = 5000
 HEADER_ALIASES = {
     ("source", "target"),
     ("source_term", "target_term"),
@@ -28,6 +36,13 @@ HEADER_ALIASES = {
     ("原文", "译文"),
     ("中文", "英文"),
 }
+
+CancelCheck = Callable[[], bool]
+
+
+def _raise_if_canceled(cancel_check: CancelCheck | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise ImportTaskCanceled("术语库导入已取消。")
 
 
 @dataclass
@@ -65,6 +80,8 @@ class TermImportPreview:
     skipped_empty_rows: int
     skipped_header_rows: int
     preview_limit: int
+    scanned_rows: int
+    truncated: bool
 
 
 def import_terms_from_xlsx_upload(
@@ -75,7 +92,11 @@ def import_terms_from_xlsx_upload(
     target_language: str,
     batch_size: int = 5000,
     term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
+    cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
 ) -> TermImportSummary:
     extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
     if extension in CSV_EXTENSIONS:
@@ -87,7 +108,39 @@ def import_terms_from_xlsx_upload(
             target_language=target_language,
             batch_size=batch_size,
             term_base_id=term_base_id,
+            creator_id=creator_id,
             skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+            skip_header=skip_header,
+            cancel_check=cancel_check,
+            import_batch_id=import_batch_id,
+        )
+    if extension in TMX_EXTENSIONS:
+        return import_terms_from_tmx_upload(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            source_language=source_language,
+            target_language=target_language,
+            batch_size=batch_size,
+            term_base_id=term_base_id,
+            creator_id=creator_id,
+            skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+            cancel_check=cancel_check,
+            import_batch_id=import_batch_id,
+        )
+    if extension in TBX_EXTENSIONS:
+        return import_terms_from_tbx_upload(
+            db=db,
+            raw_bytes=raw_bytes,
+            filename=filename,
+            source_language=source_language,
+            target_language=target_language,
+            batch_size=batch_size,
+            term_base_id=term_base_id,
+            creator_id=creator_id,
+            skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+            cancel_check=cancel_check,
+            import_batch_id=import_batch_id,
         )
     if extension in XLS_EXTENSIONS:
         return import_terms_from_xls_upload(
@@ -98,7 +151,11 @@ def import_terms_from_xlsx_upload(
             target_language=target_language,
             batch_size=batch_size,
             term_base_id=term_base_id,
+            creator_id=creator_id,
             skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+            skip_header=skip_header,
+            cancel_check=cancel_check,
+            import_batch_id=import_batch_id,
         )
 
     workbook = load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)
@@ -108,9 +165,13 @@ def import_terms_from_xlsx_upload(
         filename=filename,
         batch_size=batch_size,
         term_base_id=term_base_id,
+        creator_id=creator_id,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        skip_header=skip_header,
         source_language=source_language,
         target_language=target_language,
+        cancel_check=cancel_check,
+        import_batch_id=import_batch_id,
     )
 
 
@@ -122,7 +183,11 @@ def import_terms_from_csv_upload(
     target_language: str,
     batch_size: int = 5000,
     term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
+    cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
 ) -> TermImportSummary:
     return _import_text_rows(
         db=db,
@@ -130,9 +195,157 @@ def import_terms_from_csv_upload(
         filename=filename,
         batch_size=batch_size,
         term_base_id=term_base_id,
+        creator_id=creator_id,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        skip_header=skip_header,
         source_language=source_language,
         target_language=target_language,
+        cancel_check=cancel_check,
+        import_batch_id=import_batch_id,
+    )
+
+
+def import_terms_from_tmx_upload(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
+    skip_duplicate_row_indexes: set[int] | None = None,
+    cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
+) -> TermImportSummary:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    return _import_text_rows(
+        db=db,
+        rows=_iter_tmx_rows(
+            raw_bytes,
+            normalized_source_language,
+            normalized_target_language,
+        ),
+        filename=filename,
+        batch_size=batch_size,
+        term_base_id=term_base_id,
+        creator_id=creator_id,
+        skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
+        cancel_check=cancel_check,
+        import_batch_id=import_batch_id,
+    )
+
+
+def import_terms_from_tbx_upload(
+    db: Session,
+    raw_bytes: bytes,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
+    skip_duplicate_row_indexes: set[int] | None = None,
+    cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
+) -> TermImportSummary:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    return _import_text_rows(
+        db=db,
+        rows=_iter_tbx_rows(
+            raw_bytes,
+            normalized_source_language,
+            normalized_target_language,
+        ),
+        filename=filename,
+        batch_size=batch_size,
+        term_base_id=term_base_id,
+        creator_id=creator_id,
+        skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
+        cancel_check=cancel_check,
+        import_batch_id=import_batch_id,
+    )
+
+
+def import_terms_from_tmx_path(
+    db: Session,
+    tmx_path: str | Path,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
+    skip_duplicate_row_indexes: set[int] | None = None,
+    cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
+) -> TermImportSummary:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    return _import_text_rows(
+        db=db,
+        rows=_iter_tmx_path_rows(
+            tmx_path,
+            normalized_source_language,
+            normalized_target_language,
+        ),
+        filename=filename,
+        batch_size=batch_size,
+        term_base_id=term_base_id,
+        creator_id=creator_id,
+        skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
+        cancel_check=cancel_check,
+        import_batch_id=import_batch_id,
+    )
+
+
+def import_terms_from_tbx_path(
+    db: Session,
+    tbx_path: str | Path,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    batch_size: int = 5000,
+    term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
+    skip_duplicate_row_indexes: set[int] | None = None,
+    cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
+) -> TermImportSummary:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    return _import_text_rows(
+        db=db,
+        rows=_iter_tbx_path_rows(
+            tbx_path,
+            normalized_source_language,
+            normalized_target_language,
+        ),
+        filename=filename,
+        batch_size=batch_size,
+        term_base_id=term_base_id,
+        creator_id=creator_id,
+        skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
+        cancel_check=cancel_check,
+        import_batch_id=import_batch_id,
     )
 
 
@@ -144,7 +357,11 @@ def import_terms_from_xls_upload(
     target_language: str,
     batch_size: int = 5000,
     term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
+    cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
 ) -> TermImportSummary:
     return _import_text_rows(
         db=db,
@@ -152,9 +369,13 @@ def import_terms_from_xls_upload(
         filename=filename,
         batch_size=batch_size,
         term_base_id=term_base_id,
+        creator_id=creator_id,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        skip_header=skip_header,
         source_language=source_language,
         target_language=target_language,
+        cancel_check=cancel_check,
+        import_batch_id=import_batch_id,
     )
 
 
@@ -166,12 +387,19 @@ def preview_terms_from_upload(
     target_language: str,
     term_base_id: UUID | None,
     preview_limit: int = 100,
+    skip_header: bool = False,
+    max_scan_rows: int = TERM_PREVIEW_MAX_SCAN_ROWS,
 ) -> TermImportPreview:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
         target_language,
     )
-    rows = _iter_upload_rows(raw_bytes, filename)
+    rows = _iter_upload_rows(
+        raw_bytes,
+        filename,
+        normalized_source_language,
+        normalized_target_language,
+    )
     preview_rows: list[TermImportPreviewRow] = []
     source_normalized_values: set[str] = set()
     source_texts: set[str] = set()
@@ -180,13 +408,18 @@ def preview_terms_from_upload(
     skipped_header_rows = 0
     total_rows = 0
     duplicate_rows = 0
+    safe_max_scan_rows = max(1, int(max_scan_rows or TERM_PREVIEW_MAX_SCAN_ROWS))
+    truncated = False
 
     for row_index, row in enumerate(rows, start=1):
+        if row_index > safe_max_scan_rows:
+            truncated = True
+            break
         total_rows += 1
         source_text = normalize_text(_cell_to_text(row, 0))
         target_text = normalize_text(_cell_to_text(row, 1))
 
-        if row_index == 1 and _looks_like_header(source_text, target_text):
+        if _should_skip_header_row(filename, row_index, source_text, target_text, skip_header):
             skipped_header_rows += 1
             _append_preview_row(
                 preview_rows,
@@ -196,7 +429,7 @@ def preview_terms_from_upload(
                     source_text=source_text,
                     target_text=target_text,
                     status="header",
-                    message="识别为表头，导入时会跳过。",
+                    message="表头行，导入时会跳过。",
                 ),
             )
             continue
@@ -290,6 +523,221 @@ def preview_terms_from_upload(
         skipped_empty_rows=skipped_empty_rows,
         skipped_header_rows=skipped_header_rows,
         preview_limit=preview_limit,
+        scanned_rows=total_rows,
+        truncated=truncated,
+    )
+
+
+def preview_terms_from_xlsx_path(
+    db: Session,
+    xlsx_path: str | Path,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    term_base_id: UUID | None,
+    preview_limit: int = 100,
+    skip_header: bool = False,
+    max_scan_rows: int = TERM_PREVIEW_MAX_SCAN_ROWS,
+) -> TermImportPreview:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    workbook = load_workbook(Path(xlsx_path), read_only=True, data_only=True)
+    try:
+        return _preview_terms_from_rows(
+            db=db,
+            rows=workbook.active.iter_rows(values_only=True),
+            filename=filename,
+            term_base_id=term_base_id,
+            source_language=normalized_source_language,
+            target_language=normalized_target_language,
+            preview_limit=preview_limit,
+            skip_header=skip_header,
+            max_scan_rows=max_scan_rows,
+        )
+    finally:
+        workbook.close()
+
+
+def preview_terms_from_tmx_path(
+    db: Session,
+    tmx_path: str | Path,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    term_base_id: UUID | None,
+    preview_limit: int = 100,
+    skip_header: bool = False,
+    max_scan_rows: int = TERM_PREVIEW_MAX_SCAN_ROWS,
+) -> TermImportPreview:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    return _preview_terms_from_rows(
+        db=db,
+        rows=_iter_tmx_path_rows(
+            tmx_path,
+            normalized_source_language,
+            normalized_target_language,
+        ),
+        filename=filename,
+        term_base_id=term_base_id,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
+        preview_limit=preview_limit,
+        skip_header=skip_header,
+        max_scan_rows=max_scan_rows,
+    )
+
+
+def preview_terms_from_tbx_path(
+    db: Session,
+    tbx_path: str | Path,
+    filename: str,
+    source_language: str,
+    target_language: str,
+    term_base_id: UUID | None,
+    preview_limit: int = 100,
+    skip_header: bool = False,
+    max_scan_rows: int = TERM_PREVIEW_MAX_SCAN_ROWS,
+) -> TermImportPreview:
+    normalized_source_language, normalized_target_language = require_language_pair(
+        source_language,
+        target_language,
+    )
+    return _preview_terms_from_rows(
+        db=db,
+        rows=_iter_tbx_path_rows(
+            tbx_path,
+            normalized_source_language,
+            normalized_target_language,
+        ),
+        filename=filename,
+        term_base_id=term_base_id,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
+        preview_limit=preview_limit,
+        skip_header=skip_header,
+        max_scan_rows=max_scan_rows,
+    )
+
+
+def _preview_terms_from_rows(
+    db: Session,
+    rows,
+    filename: str,
+    term_base_id: UUID | None,
+    source_language: str,
+    target_language: str,
+    preview_limit: int = 100,
+    skip_header: bool = False,
+    max_scan_rows: int = TERM_PREVIEW_MAX_SCAN_ROWS,
+) -> TermImportPreview:
+    preview_rows: list[TermImportPreviewRow] = []
+    source_normalized_values: set[str] = set()
+    source_texts: set[str] = set()
+    final_candidates: dict[str, dict] = {}
+    skipped_empty_rows = 0
+    skipped_header_rows = 0
+    total_rows = 0
+    duplicate_rows = 0
+    safe_max_scan_rows = max(1, int(max_scan_rows or TERM_PREVIEW_MAX_SCAN_ROWS))
+    truncated = False
+
+    for row_index, row in enumerate(rows, start=1):
+        if row_index > safe_max_scan_rows:
+            truncated = True
+            break
+        total_rows += 1
+        source_text = normalize_text(_cell_to_text(row, 0))
+        target_text = normalize_text(_cell_to_text(row, 1))
+
+        if _should_skip_header_row(filename, row_index, source_text, target_text, skip_header):
+            skipped_header_rows += 1
+            _append_preview_row(
+                preview_rows,
+                preview_limit,
+                TermImportPreviewRow(row_index, source_text, target_text, "header", "表头行，导入时会跳过。"),
+            )
+            continue
+
+        if not source_text or not target_text:
+            skipped_empty_rows += 1
+            _append_preview_row(
+                preview_rows,
+                preview_limit,
+                TermImportPreviewRow(row_index, source_text, target_text, "empty", "源术语或目标术语为空，导入时会跳过。"),
+            )
+            continue
+
+        term_row = _build_term_row(
+            source_text=source_text,
+            target_text=target_text,
+            term_base_id=term_base_id,
+            source_language=source_language,
+            target_language=target_language,
+        )
+        source_normalized = term_row["source_normalized"]
+        status = "pending"
+        message = "待导入。"
+        if source_normalized in source_normalized_values or source_text in source_texts:
+            duplicate_rows += 1
+            status = "duplicate"
+            message = "文件内重复，实际导入时以后出现的这一条为准。"
+        source_normalized_values.add(source_normalized)
+        source_texts.add(source_text)
+        final_candidates[source_normalized] = term_row
+        _append_preview_row(
+            preview_rows,
+            preview_limit,
+            TermImportPreviewRow(row_index, source_text, target_text, status, message),
+        )
+
+    existing_status = _load_existing_term_status(
+        db=db,
+        term_base_id=term_base_id,
+        source_language=source_language,
+        target_language=target_language,
+        source_normalized_values=list(source_normalized_values),
+        source_texts=list(source_texts),
+    )
+
+    create_rows = 0
+    update_rows = 0
+    for candidate in final_candidates.values():
+        key = candidate["source_normalized"]
+        source_text = candidate["source_text"]
+        if key in existing_status or source_text in existing_status:
+            update_rows += 1
+        else:
+            create_rows += 1
+
+    for preview_row in preview_rows:
+        if preview_row.status != "pending":
+            continue
+        normalized = normalize_match_text(preview_row.source_text) or normalize_text(preview_row.source_text)
+        if normalized in existing_status or preview_row.source_text in existing_status:
+            preview_row.status = "update"
+            preview_row.message = "术语库中已有相同源术语，导入时会覆盖目标术语。"
+        else:
+            preview_row.status = "create"
+            preview_row.message = "导入时会新增。"
+
+    return TermImportPreview(
+        filename=filename,
+        rows=preview_rows,
+        total_rows=total_rows,
+        valid_rows=len(final_candidates),
+        create_rows=create_rows,
+        update_rows=update_rows,
+        duplicate_rows=duplicate_rows,
+        skipped_empty_rows=skipped_empty_rows,
+        skipped_header_rows=skipped_header_rows,
+        preview_limit=preview_limit,
+        scanned_rows=total_rows,
+        truncated=truncated,
     )
 
 
@@ -298,31 +746,44 @@ def import_terms_from_xlsx_path(
     xlsx_path: str | Path,
     source_language: str,
     target_language: str,
+    filename: str | None = None,
     batch_size: int = 5000,
     term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
+    cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
 ) -> TermImportSummary:
     workbook = load_workbook(Path(xlsx_path), read_only=True, data_only=True)
     return _import_workbook(
         db=db,
         workbook=workbook,
-        filename=Path(xlsx_path).name,
+        filename=filename or Path(xlsx_path).name,
         batch_size=batch_size,
         term_base_id=term_base_id,
+        creator_id=creator_id,
         skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+        skip_header=skip_header,
         source_language=source_language,
         target_language=target_language,
+        cancel_check=cancel_check,
+        import_batch_id=import_batch_id,
     )
 
 
-def _iter_upload_rows(raw_bytes: bytes, filename: str):
+def _iter_upload_rows(raw_bytes: bytes, filename: str, source_language: str, target_language: str):
     extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
     if extension in CSV_EXTENSIONS:
         return _iter_csv_rows(raw_bytes)
+    if extension in TMX_EXTENSIONS:
+        return _iter_tmx_rows(raw_bytes, source_language, target_language)
+    if extension in TBX_EXTENSIONS:
+        return _iter_tbx_rows(raw_bytes, source_language, target_language)
     if extension in XLS_EXTENSIONS:
         return _iter_xls_rows(raw_bytes)
     if extension not in XLSX_EXTENSIONS:
-        raise RuntimeError("仅支持上传 .xls、.xlsx 或 .csv 文件。")
+        raise RuntimeError("仅支持上传 .tmx、.xls、.xlsx 或 .csv 文件。")
 
     workbook = load_workbook(BytesIO(raw_bytes), read_only=True, data_only=True)
 
@@ -343,7 +804,11 @@ def _import_workbook(
     source_language: str,
     target_language: str,
     term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
+    cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
 ) -> TermImportSummary:
     worksheet = workbook.active
     try:
@@ -353,9 +818,13 @@ def _import_workbook(
             filename=filename,
             batch_size=batch_size,
             term_base_id=term_base_id,
+            creator_id=creator_id,
             skip_duplicate_row_indexes=skip_duplicate_row_indexes,
+            skip_header=skip_header,
             source_language=source_language,
             target_language=target_language,
+            cancel_check=cancel_check,
+            import_batch_id=import_batch_id,
         )
     finally:
         workbook.close()
@@ -369,7 +838,11 @@ def _import_text_rows(
     source_language: str,
     target_language: str,
     term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
     skip_duplicate_row_indexes: set[int] | None = None,
+    skip_header: bool = False,
+    cancel_check: CancelCheck | None = None,
+    import_batch_id: UUID | None = None,
 ) -> TermImportSummary:
     normalized_source_language, normalized_target_language = require_language_pair(
         source_language,
@@ -384,10 +857,13 @@ def _import_text_rows(
     skipped_row_indexes = skip_duplicate_row_indexes or set()
 
     for row_index, row in enumerate(rows, start=1):
+        if row_index == 1 or row_index % batch_size == 0:
+            _raise_if_canceled(cancel_check)
+        row_metadata = _row_to_metadata(row)
         source_text = normalize_text(_cell_to_text(row, 0))
         target_text = normalize_text(_cell_to_text(row, 1))
 
-        if row_index == 1 and _looks_like_header(source_text, target_text):
+        if _should_skip_header_row(filename, row_index, source_text, target_text, skip_header):
             skipped_header_rows += 1
             continue
 
@@ -405,6 +881,10 @@ def _import_text_rows(
             term_base_id=term_base_id,
             source_language=normalized_source_language,
             target_language=normalized_target_language,
+            creator_id=creator_id,
+            external_tuid=str(row_metadata.get("tuid") or row_metadata.get("tbx_entry_id") or "") or None,
+            tmx_metadata=row_metadata,
+            import_batch_id=import_batch_id,
         )
         batch_rows[term_row["source_normalized"]] = term_row
 
@@ -419,8 +899,10 @@ def _import_text_rows(
             created_rows += created_in_batch
             updated_rows += updated_in_batch
             batch_rows.clear()
+            _raise_if_canceled(cancel_check)
 
     if batch_rows:
+        _raise_if_canceled(cancel_check)
         created_in_batch, updated_in_batch = _flush_term_batch(
             db=db,
             batch_rows=list(batch_rows.values()),
@@ -450,6 +932,17 @@ def _append_preview_row(
         rows.append(row)
 
 
+def _row_to_metadata(row: Any) -> dict[str, Any]:
+    if isinstance(row, TMXRow):
+        return row.metadata
+    if isinstance(row, dict):
+        metadata = row.get("metadata")
+        return metadata if isinstance(metadata, dict) else {}
+    if isinstance(row, (tuple, list)) and len(row) >= 3 and isinstance(row[2], dict):
+        return row[2]
+    return {}
+
+
 def _load_existing_term_status(
     db: Session,
     term_base_id: UUID | None,
@@ -461,25 +954,35 @@ def _load_existing_term_status(
     if term_base_id is None or (not source_normalized_values and not source_texts):
         return set()
 
-    existing_rows = (
-        db.query(TermEntry.source_normalized, TermEntry.source_text)
-        .filter(
-            TermEntry.term_base_id == term_base_id,
-            TermEntry.source_language == source_language,
-            TermEntry.target_language == target_language,
-            or_(
-                TermEntry.source_normalized.in_(source_normalized_values or [""]),
-                TermEntry.source_text.in_(source_texts or [""]),
-            ),
-        )
-        .all()
-    )
     keys: set[str] = set()
-    for source_normalized, source_text in existing_rows:
-        if source_normalized:
-            keys.add(source_normalized)
-        if source_text:
-            keys.add(source_text)
+    source_normalized_values = list(dict.fromkeys(source_normalized_values))
+    source_texts = list(dict.fromkeys(source_texts))
+    max_lookup_count = max(len(source_normalized_values), len(source_texts))
+
+    for offset in range(0, max_lookup_count, TERM_STATUS_LOOKUP_CHUNK_SIZE):
+        normalized_chunk = source_normalized_values[offset : offset + TERM_STATUS_LOOKUP_CHUNK_SIZE]
+        source_text_chunk = source_texts[offset : offset + TERM_STATUS_LOOKUP_CHUNK_SIZE]
+        lookup_conditions = []
+        if normalized_chunk:
+            lookup_conditions.append(TermEntry.source_normalized.in_(normalized_chunk))
+        if source_text_chunk:
+            lookup_conditions.append(TermEntry.source_text.in_(source_text_chunk))
+
+        existing_rows = (
+            db.query(TermEntry.source_normalized, TermEntry.source_text)
+            .filter(
+                TermEntry.term_base_id == term_base_id,
+                TermEntry.source_language == source_language,
+                TermEntry.target_language == target_language,
+                or_(*lookup_conditions),
+            )
+            .all()
+        )
+        for source_normalized, source_text in existing_rows:
+            if source_normalized:
+                keys.add(source_normalized)
+            if source_text:
+                keys.add(source_text)
     return keys
 
 
@@ -507,6 +1010,32 @@ def _iter_xls_rows(raw_bytes: bytes):
         yield tuple(sheet.cell_value(row_index, column_index) for column_index in range(sheet.ncols))
 
 
+def _iter_tmx_rows(raw_bytes: bytes, source_language: str, target_language: str):
+    yield from _iter_tmx_source_rows(raw_bytes, source_language, target_language)
+
+
+def _iter_tmx_path_rows(tmx_path: str | Path, source_language: str, target_language: str):
+    yield from _iter_tmx_source_rows(Path(tmx_path), source_language, target_language)
+
+
+def _iter_tmx_source_rows(source: Any, source_language: str, target_language: str):
+    for row in iter_stream_tmx_rows(source, source_language, target_language):
+        yield (row.source_text, row.target_text, row.metadata)
+
+
+def _iter_tbx_rows(raw_bytes: bytes, source_language: str, target_language: str):
+    yield from _iter_tbx_source_rows(raw_bytes, source_language, target_language)
+
+
+def _iter_tbx_path_rows(tbx_path: str | Path, source_language: str, target_language: str):
+    yield from _iter_tbx_source_rows(Path(tbx_path), source_language, target_language)
+
+
+def _iter_tbx_source_rows(source: Any, source_language: str, target_language: str):
+    for row in iter_stream_tbx_rows(source, source_language, target_language):
+        yield (row.source_text, row.target_text, row.metadata)
+
+
 def _decode_csv_bytes(raw_bytes: bytes) -> str:
     for encoding in ("utf-8-sig", "utf-8", "gb18030"):
         try:
@@ -516,12 +1045,28 @@ def _decode_csv_bytes(raw_bytes: bytes) -> str:
     return raw_bytes.decode("utf-8", errors="replace")
 
 
+def _find_tmx_language_text(language_segments: list[tuple[str, str]], language: str) -> str:
+    normalized_language = _normalize_language_tag(language)
+    for candidate_language, text in language_segments:
+        if _normalize_language_tag(candidate_language) == normalized_language:
+            return text
+    primary_language = normalized_language.split("-", 1)[0]
+    for candidate_language, text in language_segments:
+        if _normalize_language_tag(candidate_language).split("-", 1)[0] == primary_language:
+            return text
+    return ""
+
+
 def _build_term_row(
     source_text: str,
     target_text: str,
     source_language: str,
     target_language: str,
     term_base_id: UUID | None = None,
+    creator_id: UUID | None = None,
+    external_tuid: str | None = None,
+    tmx_metadata: dict[str, Any] | None = None,
+    import_batch_id: UUID | None = None,
 ) -> dict:
     return {
         "term_base_id": term_base_id,
@@ -530,7 +1075,16 @@ def _build_term_row(
         "source_normalized": normalize_match_text(source_text) or normalize_text(source_text),
         "source_language": source_language,
         "target_language": target_language,
+        "creator_id": creator_id,
+        "last_modified_by_id": creator_id,
+        "external_tuid": external_tuid,
+        "tmx_metadata": tmx_metadata or None,
+        "import_batch_id": import_batch_id,
     }
+
+
+def _normalize_language_tag(language: str) -> str:
+    return (language or "").strip().lower().replace("_", "-")
 
 
 def _flush_term_batch(
@@ -578,15 +1132,39 @@ def _flush_term_batch(
             created_rows += 1
             continue
 
+        if _term_entry_matches_import_row(existing, row):
+            continue
+
         existing.source_text = row["source_text"]
         existing.target_text = row["target_text"]
         existing.source_normalized = row["source_normalized"]
         existing.source_language = row["source_language"]
         existing.target_language = row["target_language"]
+        existing.external_tuid = row.get("external_tuid")
+        existing.tmx_metadata = row.get("tmx_metadata")
+        existing.import_batch_id = row.get("import_batch_id")
+        if existing.creator_id is None and row.get("creator_id"):
+            existing.creator_id = row["creator_id"]
+        if row.get("last_modified_by_id"):
+            existing.last_modified_by_id = row["last_modified_by_id"]
         updated_rows += 1
 
     db.commit()
+    db.expunge_all()
     return created_rows, updated_rows
+
+
+def _term_entry_matches_import_row(existing: TermEntry, row: dict) -> bool:
+    return (
+        normalize_text(existing.source_text or "") == row["source_text"]
+        and normalize_text(existing.target_text or "") == row["target_text"]
+        and existing.term_base_id == row["term_base_id"]
+        and (existing.source_language or "") == row["source_language"]
+        and (existing.target_language or "") == row["target_language"]
+        and (getattr(existing, "external_tuid", None) or None) == row.get("external_tuid")
+        and (getattr(existing, "tmx_metadata", None) or None) == row.get("tmx_metadata")
+        and getattr(existing, "import_batch_id", None) == row.get("import_batch_id")
+    )
 
 
 def _cell_to_text(row: tuple, index: int) -> str:
@@ -602,3 +1180,20 @@ def _looks_like_header(source_text: str, target_text: str) -> bool:
 
     header_key = (source_text.lower(), target_text.lower())
     return header_key in HEADER_ALIASES
+
+
+def _is_table_import(filename: str) -> bool:
+    extension = f".{filename.rsplit('.', 1)[-1].lower()}" if "." in filename else ""
+    return extension in CSV_EXTENSIONS or extension in XLS_EXTENSIONS or extension in XLSX_EXTENSIONS
+
+
+def _should_skip_header_row(
+    filename: str,
+    row_index: int,
+    source_text: str,
+    target_text: str,
+    skip_header: bool,
+) -> bool:
+    if row_index != 1:
+        return False
+    return _looks_like_header(source_text, target_text) or (skip_header and _is_table_import(filename))

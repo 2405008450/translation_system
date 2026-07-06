@@ -54,6 +54,10 @@ class MultiFormatExporter:
         extension = Path(filename).suffix.lower()
         base_name = Path(filename).stem or "translated"
 
+        if export_type == "source":
+            if original_bytes is None:
+                raise ValueError("Source export requires the original source file.")
+            return original_bytes, self._get_mime_type(extension), filename
         if export_type == "original":
             return self._export_original(
                 extension,
@@ -265,10 +269,7 @@ class MultiFormatExporter:
         elif extension == ".sdlxliff":
             from app.services.adapters.sdlxliff_exporter import SdlxliffExporter
 
-            content = SdlxliffExporter().export(
-                original_bytes,
-                {**text_map, **translation_maps["segment_id"]},
-            )
+            content = SdlxliffExporter().export_by_segments(original_bytes, segments)
         elif extension == ".txml":
             from app.services.adapters.txml_exporter import TxmlExporter
 

@@ -18,11 +18,7 @@ from app.services.automatic_numbering import (
     strip_automatic_numbering_prefix,
 )
 from app.services.document_workspace import (
-    CELL_GROUP_MAX_CHARS,
-    CELL_NEXT_PARAGRAPH_MAX_CHARS,
     CELL_PARAGRAPH_BREAK_SENTINEL,
-    CELL_SENTENCE_END_CHARS,
-    CELL_SHORT_PARAGRAPH_MAX_CHARS,
     DOCUMENT_PARSE_MODE_FULL,
     DocxPackage,
     MATH_PLACEHOLDER_TEMPLATE,
@@ -39,10 +35,12 @@ from app.services.document_workspace import (
     _local_name,
     _normalize_segment_source_text,
     _qn,
+    _resolve_internal_reference_field_target,
     _resolve_paragraph_numbering_reference,
     _select_preferred_alternate_content_branch,
     normalize_document_parse_options,
     normalize_document_parse_mode,
+    should_merge_table_cell_paragraph_texts,
 )
 from app.services.normalizer import normalize_text
 from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
@@ -168,12 +166,21 @@ class TextToken:
     apply_export_font: bool = False
     is_math: bool = False
     is_hyperlink: bool = False
+    hyperlink_element: object | None = None
 
 
 @dataclass(frozen=True)
 class CellParagraphTokens:
     paragraph: ET.Element
     tokens: list[TextToken]
+    parent: ET.Element | None = None
+
+
+@dataclass
+class ExportTrackedField:
+    instruction_parts: list[str] = field(default_factory=list)
+    collecting_instruction: bool = True
+    hyperlink_key: object | None = None
 
 
 def export_bilingual_docx_with_layout(
@@ -199,12 +206,17 @@ def export_bilingual_docx_with_layout(
         document_parse_mode=document_parse_mode,
         document_parse_options=document_parse_options,
     )
+    source_segments = source_workspace["segments"]
     math_placeholders_by_sentence_id = {
         str(segment["sentence_id"]): dict(segment.get("math_placeholders") or {})
-        for segment in source_workspace["segments"]
+        for segment in source_segments
         if segment.get("sentence_id")
     }
-    segments_by_block = _group_segments_by_block(segments, math_placeholders_by_sentence_id)
+    segments_by_block = _group_segments_by_block(
+        segments,
+        math_placeholders_by_sentence_id,
+        source_segments=source_segments,
+    )
     block_counter = count(0)
 
     for story in stories:
@@ -255,12 +267,17 @@ def export_translated_docx(
         document_parse_mode=document_parse_mode,
         document_parse_options=document_parse_options,
     )
+    source_segments = source_workspace["segments"]
     math_placeholders_by_sentence_id = {
         str(segment["sentence_id"]): dict(segment.get("math_placeholders") or {})
-        for segment in source_workspace["segments"]
+        for segment in source_segments
         if segment.get("sentence_id")
     }
-    segments_by_block = _group_segments_by_block(segments, math_placeholders_by_sentence_id)
+    segments_by_block = _group_segments_by_block(
+        segments,
+        math_placeholders_by_sentence_id,
+        source_segments=source_segments,
+    )
     block_counter = count(0)
 
     for story in stories:
@@ -310,9 +327,13 @@ def _normalize_bilingual_layout_order(order: str) -> str:
 def _group_segments_by_block(
     segments: Iterable[Any],
     math_placeholders_by_sentence_id: Mapping[str, dict[str, str]] | None = None,
+    source_segments: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[BlockKey, list[ExportSegment]]:
     grouped: dict[BlockKey, list[ExportSegment]] = defaultdict(list)
     math_map = math_placeholders_by_sentence_id or {}
+    source_segment_list = list(source_segments or [])
+    source_segment_by_sentence_id = _build_source_segment_lookup_by_sentence_id(source_segment_list)
+    source_segment_by_text_key = _build_unique_source_segment_lookup_by_text(source_segment_list)
 
     for segment in segments:
         block_type = str(_get_segment_value(segment, "block_type", "paragraph") or "paragraph")
@@ -321,8 +342,14 @@ def _group_segments_by_block(
         cell_index = _to_optional_int(_get_segment_value(segment, "cell_index"))
         sentence_id = str(_get_segment_value(segment, "sentence_id", "") or "")
         target_html = _get_segment_value(segment, "target_html")
+        block_key = _resolve_export_segment_block_key(
+            segment=segment,
+            fallback=(block_type, block_index, row_index, cell_index),
+            source_segment_by_sentence_id=source_segment_by_sentence_id,
+            source_segment_by_text_key=source_segment_by_text_key,
+        )
 
-        grouped[(block_type, block_index, row_index, cell_index)].append(
+        grouped[block_key].append(
             ExportSegment(
                 sentence_id=sentence_id,
                 source_text=str(_get_segment_value(segment, "source_text", "") or ""),
@@ -335,7 +362,176 @@ def _group_segments_by_block(
             )
         )
 
+    if source_segment_list:
+        return _order_segment_groups_by_source(grouped, source_segment_list)
+
     return grouped
+
+
+def _build_source_segment_lookup_by_sentence_id(
+    source_segments: Iterable[Mapping[str, Any]] | None,
+) -> dict[str, Mapping[str, Any]]:
+    if source_segments is None:
+        return {}
+    return {
+        str(segment.get("sentence_id") or ""): segment
+        for segment in source_segments
+        if segment.get("sentence_id")
+    }
+
+
+def _build_unique_source_segment_lookup_by_text(
+    source_segments: Iterable[Mapping[str, Any]] | None,
+) -> dict[str, Mapping[str, Any]]:
+    if source_segments is None:
+        return {}
+
+    source_by_key: dict[str, Mapping[str, Any] | None] = {}
+    for segment in source_segments:
+        for text_key in _source_segment_text_keys(segment):
+            if text_key not in source_by_key:
+                source_by_key[text_key] = segment
+            elif source_by_key[text_key] is not segment:
+                source_by_key[text_key] = None
+
+    return {
+        text_key: segment
+        for text_key, segment in source_by_key.items()
+        if segment is not None
+    }
+
+
+def _resolve_export_segment_block_key(
+    *,
+    segment: Any,
+    fallback: BlockKey,
+    source_segment_by_sentence_id: Mapping[str, Mapping[str, Any]],
+    source_segment_by_text_key: Mapping[str, Mapping[str, Any]],
+) -> BlockKey:
+    sentence_id = str(_get_segment_value(segment, "sentence_id", "") or "")
+    source_segment = source_segment_by_sentence_id.get(sentence_id)
+    if source_segment is None:
+        for text_key in _segment_text_keys(
+            _get_segment_value(segment, "source_text", ""),
+            _get_segment_value(segment, "display_text", ""),
+        ):
+            source_segment = source_segment_by_text_key.get(text_key)
+            if source_segment is not None:
+                break
+
+    if source_segment is None:
+        return fallback
+
+    return _source_segment_block_key(source_segment)
+
+
+def _order_segment_groups_by_source(
+    grouped: dict[BlockKey, list[ExportSegment]],
+    source_segments: Iterable[Mapping[str, Any]],
+) -> dict[BlockKey, list[ExportSegment]]:
+    source_by_block: dict[BlockKey, list[Mapping[str, Any]]] = defaultdict(list)
+    for segment in source_segments:
+        block_key = _source_segment_block_key(segment)
+        source_by_block[block_key].append(segment)
+
+    ordered: dict[BlockKey, list[ExportSegment]] = {}
+    for block_key, block_segments in grouped.items():
+        source_block_segments = source_by_block.get(block_key)
+        if not source_block_segments:
+            ordered[block_key] = block_segments
+            continue
+        ordered[block_key] = _order_export_segments_for_source_block(block_segments, source_block_segments)
+    return ordered
+
+
+def _source_segment_block_key(segment: Mapping[str, Any]) -> BlockKey:
+    block_type = str(segment.get("block_type") or "paragraph")
+    block_index = int(segment.get("block_index") or 0)
+    row_index = _to_optional_int(segment.get("row_index"))
+    cell_index = _to_optional_int(segment.get("cell_index"))
+    return (block_type, block_index, row_index, cell_index)
+
+
+def _order_export_segments_for_source_block(
+    block_segments: list[ExportSegment],
+    source_segments: list[Mapping[str, Any]],
+) -> list[ExportSegment]:
+    used_indexes: set[int] = set()
+    ordered: list[ExportSegment] = []
+
+    for source_segment in source_segments:
+        match_index = _find_export_segment_by_sentence_id(
+            block_segments,
+            source_segment,
+            used_indexes,
+        )
+        if match_index is None:
+            match_index = _find_export_segment_by_text(block_segments, source_segment, used_indexes)
+        if match_index is None:
+            continue
+        used_indexes.add(match_index)
+        ordered.append(block_segments[match_index])
+
+    ordered.extend(
+        segment
+        for index, segment in enumerate(block_segments)
+        if index not in used_indexes
+    )
+    return ordered
+
+
+def _find_export_segment_by_sentence_id(
+    block_segments: list[ExportSegment],
+    source_segment: Mapping[str, Any],
+    used_indexes: set[int],
+) -> int | None:
+    sentence_id = str(source_segment.get("sentence_id") or "")
+    if not sentence_id:
+        return None
+
+    for index, segment in enumerate(block_segments):
+        if index in used_indexes:
+            continue
+        if segment.sentence_id == sentence_id:
+            return index
+    return None
+
+
+def _find_export_segment_by_text(
+    block_segments: list[ExportSegment],
+    source_segment: Mapping[str, Any],
+    used_indexes: set[int],
+) -> int | None:
+    source_keys = _source_segment_text_keys(source_segment)
+    if not source_keys:
+        return None
+
+    for index, segment in enumerate(block_segments):
+        if index in used_indexes:
+            continue
+        if source_keys & _export_segment_text_keys(segment):
+            return index
+    return None
+
+
+def _source_segment_text_keys(segment: Mapping[str, Any]) -> set[str]:
+    return _segment_text_keys(
+        segment.get("source_text"),
+        segment.get("display_text"),
+    )
+
+
+def _export_segment_text_keys(segment: ExportSegment) -> set[str]:
+    return _segment_text_keys(segment.source_text, segment.display_text)
+
+
+def _segment_text_keys(*values: object) -> set[str]:
+    keys: set[str] = set()
+    for value in values:
+        text = _normalize_segment_source_text(str(value or ""))
+        if text:
+            keys.add(text)
+    return keys
 
 
 def _export_bilingual_block_sequence(
@@ -499,6 +695,29 @@ def _export_block(
         )
 
 
+def _iter_block_nodes_with_parent(container: ET.Element):
+    for child in list(container):
+        child_name = _local_name(child.tag)
+        if child_name in {"p", "tbl"}:
+            yield container, child
+            continue
+
+        if child_name == "sdt":
+            content = child.find("w:sdtContent", NS)
+            if content is not None:
+                yield from _iter_block_nodes_with_parent(content)
+            continue
+
+        if child_name in {"customXml", "ins", "moveFrom", "moveTo", "smartTag"}:
+            yield from _iter_block_nodes_with_parent(child)
+            continue
+
+        if child_name == "AlternateContent":
+            preferred_branch = _select_preferred_alternate_content_branch(child)
+            if preferred_branch is not None:
+                yield from _iter_block_nodes_with_parent(preferred_branch)
+
+
 def _export_bilingual_table(
     table: ET.Element,
     story: StoryPart,
@@ -547,17 +766,6 @@ def _export_table(
             )
 
 
-def _table_cell_text_length(tokens: list[TextToken]) -> int:
-    return len(normalize_text("".join(token.display_text for token in tokens)))
-
-
-def _table_cell_tokens_look_incomplete(tokens: list[TextToken]) -> bool:
-    text = "".join(token.display_text for token in tokens).rstrip()
-    if not text:
-        return False
-    return text[-1] not in CELL_SENTENCE_END_CHARS
-
-
 def _should_merge_table_cell_paragraphs(
     current_tokens: list[TextToken],
     next_paragraph: CellParagraphTokens,
@@ -565,18 +773,15 @@ def _should_merge_table_cell_paragraphs(
 ) -> bool:
     if not current_tokens or not next_paragraph.tokens:
         return False
-    if _resolve_paragraph_numbering_reference(next_paragraph.paragraph, numbering_schema) is not None:
-        return False
-    if not _table_cell_tokens_look_incomplete(current_tokens):
-        return False
-
-    next_length = _table_cell_text_length(next_paragraph.tokens)
-    if next_length == 0 or next_length > CELL_NEXT_PARAGRAPH_MAX_CHARS:
-        return False
-    if next_length <= CELL_SHORT_PARAGRAPH_MAX_CHARS:
-        return True
-
-    return _table_cell_text_length(current_tokens) + next_length <= CELL_GROUP_MAX_CHARS
+    return should_merge_table_cell_paragraph_texts(
+        "".join(token.display_text for token in current_tokens),
+        "".join(token.display_text for token in next_paragraph.tokens),
+        next_has_numbering=_resolve_paragraph_numbering_reference(
+            next_paragraph.paragraph,
+            numbering_schema,
+        )
+        is not None,
+    )
 
 
 def _count_token_sentence_spans(tokens: list[TextToken]) -> int:
@@ -604,8 +809,16 @@ def _group_table_cell_paragraphs(
     grouped_paragraphs: list[tuple[list[TextToken], int]] = []
     current_tokens: list[TextToken] = []
 
+    def flush_current_tokens() -> None:
+        nonlocal current_tokens
+        if not current_tokens:
+            return
+        grouped_paragraphs.append((current_tokens, _count_token_sentence_spans(current_tokens)))
+        current_tokens = []
+
     for paragraph in paragraphs:
         if not paragraph.tokens:
+            flush_current_tokens()
             continue
 
         paragraph_tokens = list(paragraph.tokens)
@@ -623,11 +836,10 @@ def _group_table_cell_paragraphs(
             current_tokens.extend(paragraph_tokens)
             continue
 
-        grouped_paragraphs.append((current_tokens, _count_token_sentence_spans(current_tokens)))
+        flush_current_tokens()
         current_tokens = paragraph_tokens
 
-    if current_tokens:
-        grouped_paragraphs.append((current_tokens, _count_token_sentence_spans(current_tokens)))
+    flush_current_tokens()
 
     return grouped_paragraphs
 
@@ -640,8 +852,17 @@ def _group_table_cell_paragraph_groups(
     current_paragraphs: list[CellParagraphTokens] = []
     current_tokens: list[TextToken] = []
 
+    def flush_current_paragraphs() -> None:
+        nonlocal current_paragraphs, current_tokens
+        if not current_paragraphs:
+            return
+        grouped_paragraphs.append((current_paragraphs, _count_token_sentence_spans(current_tokens)))
+        current_paragraphs = []
+        current_tokens = []
+
     for paragraph in paragraphs:
         if not paragraph.tokens:
+            flush_current_paragraphs()
             continue
 
         paragraph_tokens = list(paragraph.tokens)
@@ -661,12 +882,11 @@ def _group_table_cell_paragraph_groups(
             current_paragraphs.append(paragraph)
             continue
 
-        grouped_paragraphs.append((current_paragraphs, _count_token_sentence_spans(current_tokens)))
+        flush_current_paragraphs()
         current_paragraphs = [paragraph]
         current_tokens = paragraph_tokens
 
-    if current_paragraphs:
-        grouped_paragraphs.append((current_paragraphs, _count_token_sentence_spans(current_tokens)))
+    flush_current_paragraphs()
 
     return grouped_paragraphs
 
@@ -716,16 +936,16 @@ def _export_bilingual_table_cell(
                 segments=group_segments,
                 keep_source_when_empty=False,
             )
-            _insert_cloned_blocks(
-                parent=cell,
-                anchors=[item.paragraph for item in paragraph_group],
-                clones=target_paragraphs,
+            _insert_cloned_table_cell_paragraphs(
+                cell=cell,
+                paragraph_group=paragraph_group,
+                target_paragraphs=target_paragraphs,
                 order=order,
             )
 
         paragraph_buffer = []
 
-    for block in list(cell):
+    for parent, block in _iter_block_nodes_with_parent(cell):
         block_name = _local_name(block.tag)
         if block_name == "p":
             paragraph_buffer.append(
@@ -740,6 +960,7 @@ def _export_bilingual_table_cell(
                         math_placeholder_counter=[0],
                         process_embedded_textboxes=False,
                     ),
+                    parent=parent,
                 )
             )
             _export_bilingual_embedded_textboxes(
@@ -764,6 +985,38 @@ def _export_bilingual_table_cell(
             )
 
     flush_paragraphs()
+
+
+def _insert_cloned_table_cell_paragraphs(
+    cell: ET.Element,
+    paragraph_group: list[CellParagraphTokens],
+    target_paragraphs: list[ET.Element],
+    order: str,
+) -> None:
+    if not paragraph_group or not target_paragraphs:
+        return
+
+    parents = [
+        item.parent if item.parent is not None else cell
+        for item in paragraph_group
+    ]
+    first_parent = parents[0]
+    if all(parent is first_parent for parent in parents):
+        _insert_cloned_blocks(
+            parent=first_parent,
+            anchors=[item.paragraph for item in paragraph_group],
+            clones=target_paragraphs,
+            order=order,
+        )
+        return
+
+    for item, clone, parent in zip(paragraph_group, target_paragraphs, parents, strict=False):
+        _insert_cloned_blocks(
+            parent=parent,
+            anchors=[item.paragraph],
+            clones=[clone],
+            order=order,
+        )
 
 
 def _export_table_cell(
@@ -926,9 +1179,12 @@ def _collect_inline_tokens(
     parent_element: ET.Element | None = None,
     math_placeholder_counter: list[int] | None = None,
     inside_hyperlink: bool = False,
+    current_hyperlink: object | None = None,
+    field_stack: list[ExportTrackedField] | None = None,
     process_embedded_textboxes: bool = True,
 ) -> list[TextToken]:
     placeholder_counter = math_placeholder_counter if math_placeholder_counter is not None else [0]
+    active_field_stack = field_stack if field_stack is not None else []
     if node.tag in OMML_ATOMIC_TAGS:
         placeholder_counter[0] += 1
         placeholder = MATH_PLACEHOLDER_TEMPLATE.format(index=placeholder_counter[0])
@@ -961,15 +1217,38 @@ def _collect_inline_tokens(
             parent_element=parent_element,
             math_placeholder_counter=placeholder_counter,
             inside_hyperlink=inside_hyperlink,
+            current_hyperlink=current_hyperlink,
+            field_stack=active_field_stack,
             process_embedded_textboxes=process_embedded_textboxes,
         )
 
+    if node.tag == _qn("w", "fldSimple") and story.parse_options.get("preserve_hyperlinks", True):
+        instruction = node.get(_qn("w", "instr"), "")
+        if _resolve_internal_reference_field_target(instruction):
+            inside_hyperlink = True
+            current_hyperlink = node
+
     if node.tag == _qn("w", "hyperlink") and story.parse_options.get("preserve_hyperlinks", True):
         inside_hyperlink = True
+        current_hyperlink = node
 
     if node.tag == _qn("w", "r"):
         current_run = node
         current_run_container = parent_element
+
+    if node.tag == _qn("w", "fldChar"):
+        _update_export_field_state(node, active_field_stack)
+        return []
+
+    if node_name == "instrText":
+        if active_field_stack and active_field_stack[-1].collecting_instruction:
+            active_field_stack[-1].instruction_parts.append(node.text or "")
+        return []
+
+    field_hyperlink = _current_export_field_hyperlink(active_field_stack)
+    if field_hyperlink is not None and story.parse_options.get("preserve_hyperlinks", True):
+        inside_hyperlink = True
+        current_hyperlink = field_hyperlink
 
     if node.tag == _qn("w", "t"):
         text_value = node.text or ""
@@ -983,6 +1262,7 @@ def _collect_inline_tokens(
                 container_element=current_run_container if current_run_container is not None else parent_element,
                 original_text=text_value,
                 is_hyperlink=inside_hyperlink,
+                hyperlink_element=current_hyperlink,
             )
         ]
 
@@ -1018,9 +1298,6 @@ def _collect_inline_tokens(
         )
         return []
 
-    if node_name == "instrText":
-        return []
-
     tokens: list[TextToken] = []
     for child in list(node):
         tokens.extend(
@@ -1035,6 +1312,8 @@ def _collect_inline_tokens(
                 parent_element=node,
                 math_placeholder_counter=placeholder_counter,
                 inside_hyperlink=inside_hyperlink,
+                current_hyperlink=current_hyperlink,
+                field_stack=active_field_stack,
                 process_embedded_textboxes=process_embedded_textboxes,
             )
         )
@@ -1042,7 +1321,56 @@ def _collect_inline_tokens(
     return tokens
 
 
+def _update_export_field_state(
+    node: ET.Element,
+    field_stack: list[ExportTrackedField],
+) -> None:
+    field_type = node.get(_qn("w", "fldCharType"))
+    if field_type == "begin":
+        field_stack.append(ExportTrackedField())
+        return
+
+    if not field_stack:
+        return
+
+    current_field = field_stack[-1]
+    if field_type == "separate":
+        current_field.collecting_instruction = False
+        if _resolve_internal_reference_field_target("".join(current_field.instruction_parts)):
+            current_field.hyperlink_key = current_field
+        return
+
+    if field_type == "end":
+        field_stack.pop()
+
+
+def _current_export_field_hyperlink(field_stack: list[ExportTrackedField]) -> object | None:
+    for tracked_field in reversed(field_stack):
+        if not tracked_field.collecting_instruction and tracked_field.hyperlink_key is not None:
+            return tracked_field.hyperlink_key
+    return None
+
+
 def _export_bilingual_embedded_textboxes(
+    node: ET.Element,
+    story: StoryPart,
+    block_counter,
+    numbering_schema: NumberingSchema,
+    segments_by_block: dict[BlockKey, list[ExportSegment]],
+    order: str,
+) -> None:
+    for embedded_node in _iter_embedded_object_nodes_for_export(node):
+        _export_bilingual_embedded_textbox_object(
+            node=embedded_node,
+            story=story,
+            block_counter=block_counter,
+            numbering_schema=numbering_schema,
+            segments_by_block=segments_by_block,
+            order=order,
+        )
+
+
+def _export_bilingual_embedded_textbox_object(
     node: ET.Element,
     story: StoryPart,
     block_counter,
@@ -1109,6 +1437,23 @@ def _export_embedded_textboxes(
     numbering_schema: NumberingSchema,
     segments_by_block: dict[BlockKey, list[ExportSegment]],
 ) -> None:
+    for embedded_node in _iter_embedded_object_nodes_for_export(node):
+        _export_embedded_textbox_object(
+            node=embedded_node,
+            story=story,
+            block_counter=block_counter,
+            numbering_schema=numbering_schema,
+            segments_by_block=segments_by_block,
+        )
+
+
+def _export_embedded_textbox_object(
+    node: ET.Element,
+    story: StoryPart,
+    block_counter,
+    numbering_schema: NumberingSchema,
+    segments_by_block: dict[BlockKey, list[ExportSegment]],
+) -> None:
     textbox_contents = node.findall(".//w:txbxContent", NS)
     if textbox_contents:
         for textbox_content in textbox_contents:
@@ -1155,6 +1500,25 @@ def _export_embedded_textboxes(
     )
 
 
+def _iter_embedded_object_nodes_for_export(node: ET.Element):
+    node_name = _local_name(node.tag)
+    if node_name in {"pPr", "rPr", "tblPr", "tblGrid", "trPr", "tcPr", "sectPr"}:
+        return
+
+    if node_name == "AlternateContent":
+        preferred_branch = _select_preferred_alternate_content_branch(node)
+        if preferred_branch is not None:
+            yield from _iter_embedded_object_nodes_for_export(preferred_branch)
+        return
+
+    if node.tag in {_qn("w", "drawing"), _qn("w", "pict")}:
+        yield node
+        return
+
+    for child in list(node):
+        yield from _iter_embedded_object_nodes_for_export(child)
+
+
 def _replace_block_tokens(
     tokens: list[TextToken],
     segments: list[ExportSegment],
@@ -1185,12 +1549,16 @@ def _replace_block_tokens(
 
         segment = segments[segment_index]
         segment_index += 1
-        replacement = strip_automatic_numbering_prefix(
-            segment.target_text,
-            source_text=segment.source_text,
-            display_text=segment.display_text,
-            numbering_text=segment.numbering_text,
-            reference_texts=[segment.matched_source_text],
+        replacement = (
+            segment.target_text
+            if _is_target_placeholder(segment.target_text)
+            else strip_automatic_numbering_prefix(
+                segment.target_text,
+                source_text=segment.source_text,
+                display_text=segment.display_text,
+                numbering_text=segment.numbering_text,
+                reference_texts=[segment.matched_source_text],
+            )
         )
         if previous_span is not None:
             boundary_text = display_text[previous_span.end:span.start]
@@ -1200,9 +1568,13 @@ def _replace_block_tokens(
                 boundary_text=boundary_text,
             )
         if not normalize_text(replacement):
-            if not keep_source_when_empty:
-                _queue_sentence_replacement(tokens, span, "")
-            previous_replacement = ""
+            if _is_target_placeholder(segment.target_text) or not keep_source_when_empty:
+                _queue_sentence_replacement(
+                    tokens,
+                    span,
+                    replacement if _is_target_placeholder(segment.target_text) else "",
+                )
+            previous_replacement = replacement if _is_target_placeholder(segment.target_text) else ""
             previous_span = span
             continue
 
@@ -1228,6 +1600,10 @@ def _replace_block_tokens(
         previous_span = span
 
     _apply_token_edits(tokens)
+
+
+def _is_target_placeholder(text: str | None) -> bool:
+    return bool(text) and not normalize_text(text or "")
 
 
 def _collect_cell_group_tokens(
@@ -1674,6 +2050,9 @@ def _queue_sentence_replacement(
     span: SentenceSpan,
     replacement: str,
 ) -> None:
+    if _queue_sentence_replacement_preserving_hyperlink_scope(tokens, span, replacement):
+        return
+
     writable_overlaps: list[tuple[TextToken, int, int]] = []
     for token in tokens:
         if token.element is None:
@@ -1689,6 +2068,141 @@ def _queue_sentence_replacement(
         )
 
     _queue_text_range_edit(writable_overlaps, replacement)
+
+
+@dataclass(frozen=True)
+class _HyperlinkReplacementGroup:
+    start: int
+    end: int
+    text: str
+    first_token: TextToken
+    last_token: TextToken
+
+
+def _queue_sentence_replacement_preserving_hyperlink_scope(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+    replacement: str,
+) -> bool:
+    hyperlink_groups = _collect_sentence_hyperlink_groups(tokens, span)
+    if not hyperlink_groups:
+        return False
+
+    matches = _match_hyperlink_texts_in_replacement(hyperlink_groups, replacement)
+    if matches is None:
+        return False
+
+    source_cursor = span.start
+    replacement_cursor = 0
+    previous_token: TextToken | None = None
+
+    for group, (match_start, match_end) in zip(hyperlink_groups, matches, strict=False):
+        _queue_text_region_replacement(
+            tokens=tokens,
+            region_start=source_cursor,
+            region_end=group.start,
+            replacement_text=replacement[replacement_cursor:match_start],
+            before_token=previous_token,
+            after_token=group.first_token,
+        )
+        _queue_text_region_replacement(
+            tokens=tokens,
+            region_start=group.start,
+            region_end=group.end,
+            replacement_text=replacement[match_start:match_end],
+            before_token=None,
+            after_token=group.first_token,
+        )
+        source_cursor = group.end
+        replacement_cursor = match_end
+        previous_token = group.last_token
+
+    _queue_text_region_replacement(
+        tokens=tokens,
+        region_start=source_cursor,
+        region_end=span.end,
+        replacement_text=replacement[replacement_cursor:],
+        before_token=previous_token,
+        after_token=_find_first_token_starting_at_or_after(tokens, span.end),
+    )
+    return True
+
+
+def _collect_sentence_hyperlink_groups(
+    tokens: list[TextToken],
+    span: SentenceSpan,
+) -> list[_HyperlinkReplacementGroup]:
+    groups: list[_HyperlinkReplacementGroup] = []
+    current_element: object | None = None
+    current_tokens: list[TextToken] = []
+    current_text_parts: list[str] = []
+    current_start = 0
+    current_end = 0
+
+    def flush_current_group() -> None:
+        nonlocal current_element, current_tokens, current_text_parts, current_start, current_end
+        if current_element is not None and current_tokens:
+            linked_text = "".join(current_text_parts)
+            if linked_text:
+                groups.append(
+                    _HyperlinkReplacementGroup(
+                        start=current_start,
+                        end=current_end,
+                        text=linked_text,
+                        first_token=current_tokens[0],
+                        last_token=current_tokens[-1],
+                    )
+                )
+        current_element = None
+        current_tokens = []
+        current_text_parts = []
+        current_start = 0
+        current_end = 0
+
+    for token in tokens:
+        overlap_start = max(span.start, token.start)
+        overlap_end = min(span.end, token.end)
+        if overlap_end <= overlap_start:
+            continue
+
+        hyperlink_element = token.hyperlink_element if token.is_hyperlink else None
+        if hyperlink_element is None:
+            flush_current_group()
+            continue
+
+        local_start = overlap_start - token.start
+        local_end = overlap_end - token.start
+        token_text = token.display_text[local_start:local_end]
+        if hyperlink_element is not current_element:
+            flush_current_group()
+            current_element = hyperlink_element
+            current_start = overlap_start
+
+        current_tokens.append(token)
+        current_text_parts.append(token_text)
+        current_end = overlap_end
+
+    flush_current_group()
+    return groups
+
+
+def _match_hyperlink_texts_in_replacement(
+    groups: list[_HyperlinkReplacementGroup],
+    replacement: str,
+) -> list[tuple[int, int]] | None:
+    matches: list[tuple[int, int]] = []
+    cursor = 0
+    for group in groups:
+        linked_text = group.text
+        if not linked_text:
+            return None
+        match_start = replacement.find(linked_text, cursor)
+        if match_start < 0:
+            return None
+        match_end = match_start + len(linked_text)
+        matches.append((match_start, match_end))
+        cursor = match_end
+    return matches
 
 
 def _apply_token_edits(tokens: list[TextToken]) -> None:

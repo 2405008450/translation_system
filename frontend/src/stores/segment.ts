@@ -3,16 +3,23 @@ import { defineStore } from 'pinia'
 import axios from 'axios'
 
 import { http } from '../api/http'
+import { fetchMergeViewSegmentPage, getMergeViewDetail } from '../api/mergeViews'
 import { pushToast } from '../composables/useToast'
 import { buildTranslatedTaskFilename } from '../constants/taskFiles'
 import { translate } from '../i18n'
+import { useAuthStore } from './auth'
 import type {
   FileRecordDetail,
   FileRecordPreview,
   LLMGuidelineOptions,
+  LLMMergeTarget,
   LLMProvider,
   LLMTranslateScope,
+  MergeViewDetail,
+  MergeViewSegmentGroup,
   ProjectSegmentSyncSummary,
+  ProjectSyncDisableResult,
+  RevisionDisplaySettings,
   Segment,
   SegmentPageResponse,
   SegmentRevisionEntry,
@@ -28,7 +35,16 @@ const DEFAULT_SEGMENT_PAGE_SIZE = 100
 const MAX_SEGMENT_PAGE_SIZE = 500
 const AUTO_SYNC_DELAY_MS = 1500
 const CHANGE_POLL_INTERVAL_MS = 10000
+const CHANGE_POLL_BURST_DELAYS_MS = [1200, 3000, 6000, 10000]
 const EXPORT_POLL_INTERVAL_MS = 1200
+const REVISION_TRACKING_STORAGE_KEY = 'workbench.revisionTrackingEnabled'
+const DEFAULT_REVISION_INSERT_COLOR = '#2563eb'
+const DEFAULT_REVISION_DELETE_COLOR = '#dc2626'
+type SegmentBatchTarget = LLMMergeTarget
+interface SegmentConfirmationOptions {
+  rangeStart?: number | null
+  rangeEnd?: number | null
+}
 
 interface FileExportTask {
   task_id: string
@@ -49,12 +65,26 @@ function createEmptySegmentStatusStats(): SegmentStatusStats {
   }
 }
 
+function buildMergeViewStatusStats(detail: MergeViewDetail | null): SegmentStatusStats {
+  const totals = createEmptySegmentStatusStats()
+  for (const file of detail?.files ?? []) {
+    const stats = { ...createEmptySegmentStatusStats(), ...(file.status_stats || {}) }
+    totals.total += Number(stats.total || file.total_segments || 0)
+    totals.exact += Number(stats.exact || 0)
+    totals.fuzzy += Number(stats.fuzzy || 0)
+    totals.none += Number(stats.none || 0)
+    totals.confirmed += Number(stats.confirmed || 0)
+    totals.empty_target += Number(stats.empty_target || 0)
+  }
+  return totals
+}
+
 function isCountedSegmentStatus(status: string): status is 'exact' | 'fuzzy' | 'none' | 'confirmed' {
   return status === 'exact' || status === 'fuzzy' || status === 'none' || status === 'confirmed'
 }
 
 function hasEmptyTarget(value: string | null | undefined) {
-  return !(value || '').trim()
+  return value === null || value === undefined || value === ''
 }
 
 function normalizeMatchText(value: string | null | undefined) {
@@ -90,6 +120,19 @@ function normalizePageSize(value: unknown, fallback = DEFAULT_SEGMENT_PAGE_SIZE)
   return Math.min(MAX_SEGMENT_PAGE_SIZE, normalizePositiveInt(value, fallback))
 }
 
+function normalizeStringArray(value: unknown) {
+  if (!Array.isArray(value)) {
+    return []
+  }
+  return value
+    .map((item) => String(item).trim())
+    .filter(Boolean)
+}
+
+function serializeFilterArray(value: string[]) {
+  return value.length > 0 ? value.join(',') : undefined
+}
+
 function isEditLockedError(error: unknown) {
   return axios.isAxiosError(error) && error.response?.status === 409
 }
@@ -101,16 +144,75 @@ function getEditLockedMessage(error: unknown) {
   return translate('stores.segment.syncLocked')
 }
 
+function getInitialRevisionTrackingEnabled() {
+  if (typeof window === 'undefined') {
+    return false
+  }
+  return window.localStorage.getItem(REVISION_TRACKING_STORAGE_KEY) === '1'
+}
+
+function persistRevisionTrackingEnabled(enabled: boolean) {
+  if (typeof window === 'undefined') {
+    return
+  }
+  try {
+    window.localStorage.setItem(REVISION_TRACKING_STORAGE_KEY, enabled ? '1' : '0')
+  } catch {
+    // 忽略浏览器隐私模式下的存储失败，当前会话仍可使用。
+  }
+}
+
+function createDefaultRevisionSettings(fileRecordId = ''): RevisionDisplaySettings {
+  return {
+    id: null,
+    file_record_id: fileRecordId,
+    show_author_time: true,
+    show_others_revisions: true,
+    default_insert_color: DEFAULT_REVISION_INSERT_COLOR,
+    default_delete_color: DEFAULT_REVISION_DELETE_COLOR,
+    author_colors: {},
+    updated_by: null,
+    updated_at: null,
+  }
+}
+
 export interface SegmentPageQuery {
   page?: number
   pageSize?: number
   scope?: string
   sourceQuery?: string
   targetQuery?: string
+  sourceExclude?: string
+  targetExclude?: string
   searchFuzzy?: boolean
+  caseSensitive?: boolean
+  statusFilters?: string[]
+  matchFilters?: string[]
+  sourceFilters?: string[]
+  workflowStepIds?: string[]
+  includeStats?: boolean
+}
+
+interface SegmentChangeResponse {
+  file_record_id: string
+  server_time: string
+  next_cursor?: string
+  has_more?: boolean
+  segments: Segment[]
+}
+
+interface SegmentConflictResponse {
+  sentence_id: string
+  current_version: number
+  attempted_version: number | null
+  current_target_text: string
+  conflict_source?: string | null
+  conflict_last_modified_by_id?: string | null
+  resolution?: string | null
 }
 
 export const useSegmentStore = defineStore('segment', () => {
+  const authStore = useAuthStore()
   const fileRecord = ref<FileRecordDetail | null>(null)
   const segments = ref<Segment[]>([])
   const previewHtml = ref('')
@@ -145,20 +247,144 @@ export const useSegmentStore = defineStore('segment', () => {
     scope: 'all',
     sourceQuery: '',
     targetQuery: '',
+    sourceExclude: '',
+    targetExclude: '',
     searchFuzzy: false,
+    caseSensitive: false,
+    statusFilters: [] as string[],
+    matchFilters: [] as string[],
+    sourceFilters: [] as string[],
+    workflowStepIds: [] as string[],
   })
   const saveToTMStats = ref<SaveToTMStats | null>(null)
   const revisionHistory = ref<Record<string, SegmentRevisionEntry[]>>({})
   const localRevisionDrafts = ref<Record<string, SegmentRevisionEntry>>({})
   const localRevisionBaselines = ref<Record<string, string>>({})
-  const revisionTrackingEnabled = ref(false)
+  const revisionTrackingEnabled = ref(getInitialRevisionTrackingEnabled())
+  const revisionSettings = ref<RevisionDisplaySettings>(createDefaultRevisionSettings())
+
+  // ---- 合并视图(merge-view)模式状态 ----
+  // mergeViewId 非空即处于合并模式：segments 中每段带 file_record_id，
+  // 句段对外 key 改用复合键 `${file_record_id}:${sentence_id}`，避免多文件
+  // sentence_id 冲突。mergeViewId 为空时走单文件旧逻辑，回归风险为零。
+  const mergeViewId = ref<string | null>(null)
+  const mergeViewDetail = ref<MergeViewDetail | null>(null)
+  const mergeViewGroups = ref<MergeViewSegmentGroup[]>([])
+  /** 当前激活句段所属文件 id（侧栏/LLM/导出按此取上下文） */
+  const activeFileRecordId = ref<string | null>(null)
+
+  /** 复合键：合并模式下 `${file_record_id}:${sentence_id}`，单文件模式即 sentence_id */
+  function buildSegmentKey(fileRecordId: string | null | undefined, sentenceId: string) {
+    return mergeViewId.value && fileRecordId ? `${fileRecordId}:${sentenceId}` : sentenceId
+  }
+  /** 从复合键还原 sentence_id（去掉前缀） */
+  function sentenceIdFromKey(key: string) {
+    const idx = key.indexOf(':')
+    return idx === -1 ? key : key.slice(idx + 1)
+  }
+  /** 从复合键还原 file_record_id */
+  function fileRecordIdFromKey(key: string): string | null {
+    const idx = key.indexOf(':')
+    return idx === -1 ? null : key.slice(0, idx)
+  }
+  function fileRecordIdForSegment(segment: Segment): string | null {
+    return segment.file_record_id ?? fileRecord.value?.id ?? null
+  }
+  function fileNameForFileId(fileId: string | null) {
+    if (!fileId) {
+      return null
+    }
+    return mergeViewDetail.value?.files.find((file) => file.id === fileId)?.filename ?? null
+  }
+  function withSegmentFileContext(segment: Segment, fileId: string | null): Segment {
+    if (!mergeViewId.value || !fileId) {
+      return segment
+    }
+    return {
+      ...segment,
+      file_record_id: segment.file_record_id ?? fileId,
+      filename: segment.filename ?? fileNameForFileId(fileId) ?? undefined,
+    }
+  }
+  function segmentKeyOf(segment: Segment) {
+    return buildSegmentKey(fileRecordIdForSegment(segment), segment.sentence_id)
+  }
+
+  function isMachineSegmentSource(source: string | null | undefined) {
+    return source === 'llm' || source === 'tm' || source === 'project_sync' || source === 'none' || !source
+  }
+
+  function currentUserId() {
+    return authStore.user?.id ?? null
+  }
+
+  function isSensitiveRemoteConflict(
+    source: string | null | undefined,
+    lastModifiedById: string | null | undefined,
+    incomingSource = 'manual',
+  ) {
+    const userId = currentUserId()
+    if (userId && lastModifiedById && lastModifiedById === userId) {
+      return false
+    }
+    if (incomingSource === 'manual' && isMachineSegmentSource(source)) {
+      return false
+    }
+    return source === 'manual'
+  }
+
+  function isSameDirtyPayload(
+    dirtyEntry: SegmentUpdatePayload | undefined,
+    payload: SegmentUpdatePayload,
+  ) {
+    return Boolean(
+      dirtyEntry
+      && dirtyEntry.target_text === payload.target_text
+      && (dirtyEntry.target_html || null) === (payload.target_html || null)
+      && dirtyEntry.source === payload.source
+      && Boolean(dirtyEntry.confirm) === Boolean(payload.confirm),
+    )
+  }
+
+  function bumpDirtyBaseVersion(
+    nextDirtyEntries: Record<string, SegmentUpdatePayload>,
+    key: string,
+    version: number | null | undefined,
+  ) {
+    const currentEntry = nextDirtyEntries[key]
+    const nextVersion = Number(version || 0)
+    if (!currentEntry || !nextVersion) {
+      return
+    }
+    nextDirtyEntries[key] = {
+      ...currentEntry,
+      base_version: Math.max(Number(currentEntry.base_version || 0), nextVersion),
+    }
+  }
+
+  function applyServerSegmentMetadata(segmentKey: string, remoteSegment: Segment) {
+    const index = getSegmentIndex(segmentKey)
+    if (index === -1) {
+      return
+    }
+    segments.value[index] = {
+      ...segments.value[index],
+      version: remoteSegment.version,
+      updated_at: remoteSegment.updated_at,
+      last_modified_by_id: remoteSegment.last_modified_by_id,
+      last_modified_by: remoteSegment.last_modified_by,
+    }
+  }
 
   const segmentIndexMap = new Map<string, number>()
   let syncTimer: number | null = null
+  let syncPromise: Promise<boolean> | null = null
   let changePollTimer: number | null = null
+  let changePollBurstTimers: number[] = []
   let changeCursor: string | null = null
   let pollingChanges = false
   let loadMorePromise: Promise<boolean> | null = null
+  let pendingSegmentPageQuery: SegmentPageQuery | null = null
   let previewPromise: Promise<void> | null = null
   let previewLoaded = false
   let previewCacheKey = ''
@@ -190,7 +416,7 @@ export const useSegmentStore = defineStore('segment', () => {
     const sentenceIds = new Set<string>()
     for (const entries of Object.values(revisionHistory.value)) {
       for (const entry of entries) {
-        if (isPendingManualRevision(entry)) {
+        if (isCurrentVisiblePendingManualRevision(entry)) {
           sentenceIds.add(entry.sentence_id)
         }
       }
@@ -205,6 +431,34 @@ export const useSegmentStore = defineStore('segment', () => {
 
   function isPendingManualRevision(entry: SegmentRevisionEntry) {
     return entry.status === 'pending' && entry.source === 'manual'
+  }
+
+  function isVisibleRevision(entry: SegmentRevisionEntry) {
+    if (revisionSettings.value.show_others_revisions) {
+      return true
+    }
+    const userId = currentUserId()
+    const authorId = entry.author?.id || null
+    return !userId || !authorId || authorId === userId
+  }
+
+  function isVisiblePendingManualRevision(entry: SegmentRevisionEntry) {
+    return isPendingManualRevision(entry) && isVisibleRevision(entry)
+  }
+
+  function isRevisionCurrentForSegment(entry: SegmentRevisionEntry) {
+    const segmentKey = mergeViewId.value
+      ? buildSegmentKey(entry.file_record_id, entry.sentence_id)
+      : entry.sentence_id
+    const index = getSegmentIndex(segmentKey)
+    if (index === -1) {
+      return true
+    }
+    return (segments.value[index].target_text || '') === (entry.after_text || '')
+  }
+
+  function isCurrentVisiblePendingManualRevision(entry: SegmentRevisionEntry) {
+    return isVisiblePendingManualRevision(entry) && isRevisionCurrentForSegment(entry)
   }
 
   function isLocalRevisionId(id: string) {
@@ -251,7 +505,27 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   function getPendingRevision(sentenceId: string) {
-    return revisionHistory.value[sentenceId]?.find(isPendingManualRevision) || null
+    return revisionHistory.value[sentenceId]?.find(isCurrentVisiblePendingManualRevision) || null
+  }
+
+  function listVisiblePendingRevisions() {
+    const revisions: SegmentRevisionEntry[] = []
+    const seenRevisionIds = new Set<string>()
+    for (const entries of Object.values(revisionHistory.value)) {
+      for (const entry of entries) {
+        if (isCurrentVisiblePendingManualRevision(entry) && !seenRevisionIds.has(entry.id)) {
+          revisions.push(entry)
+          seenRevisionIds.add(entry.id)
+        }
+      }
+    }
+    for (const entry of Object.values(localRevisionDrafts.value)) {
+      if (isPendingManualRevision(entry) && !seenRevisionIds.has(entry.id)) {
+        revisions.push(entry)
+        seenRevisionIds.add(entry.id)
+      }
+    }
+    return revisions.sort(compareRevisionEntries)
   }
 
   function getRevisionTrace(sentenceId: string) {
@@ -328,12 +602,14 @@ export const useSegmentStore = defineStore('segment', () => {
 
   function startRevisionTracking() {
     revisionTrackingEnabled.value = true
+    persistRevisionTrackingEnabled(true)
     ensureRevisionTrackingBaselines()
   }
 
   function stopRevisionTracking() {
     revisionTrackingEnabled.value = false
-    // 开关只控制修订痕迹是否显示；基准必须保留，避免再次开启时刷新快照。
+    persistRevisionTrackingEnabled(false)
+    // 停止记录时保留基准，避免再次开启后丢失当前会话里已有的待处理修订上下文。
   }
 
   function ensureRevisionTrackingBaselines() {
@@ -377,13 +653,13 @@ export const useSegmentStore = defineStore('segment', () => {
   function resetSegments(nextSegments: Segment[] = []) {
     segmentIndexMap.clear()
     nextSegments.forEach((segment, index) => {
-      segmentIndexMap.set(segment.sentence_id, index)
+      segmentIndexMap.set(segmentKeyOf(segment), index)
     })
     segments.value = nextSegments
   }
 
   function applyServerSegment(nextSegment: Segment, markPreview = true) {
-    const index = getSegmentIndex(nextSegment.sentence_id)
+    const index = getSegmentIndex(segmentKeyOf(nextSegment))
     if (index === -1) {
       return
     }
@@ -391,11 +667,11 @@ export const useSegmentStore = defineStore('segment', () => {
     const previousSegment = segments.value[index]
     segments.value[index] = nextSegment
     adjustSegmentStatusStats(previousSegment, nextSegment)
-    if (activeSentenceId.value === nextSegment.sentence_id) {
+    if (activeSentenceId.value === segmentKeyOf(nextSegment)) {
       activeSourceText.value = nextSegment.source_text || ''
     }
     if (markPreview && previousSegment.target_text !== nextSegment.target_text) {
-      markPreviewUpdate(nextSegment.sentence_id, nextSegment.target_text || '')
+      markPreviewUpdate(segmentKeyOf(nextSegment), nextSegment.target_text || '')
     }
   }
 
@@ -407,6 +683,17 @@ export const useSegmentStore = defineStore('segment', () => {
 
   function setSegmentStatusStats(stats?: SegmentStatusStats | null) {
     segmentStatusStats.value = stats ? { ...createEmptySegmentStatusStats(), ...stats } : createEmptySegmentStatusStats()
+  }
+
+  async function refreshMergeViewDetail() {
+    if (!mergeViewId.value) {
+      return null
+    }
+    const detail = await getMergeViewDetail(mergeViewId.value)
+    mergeViewDetail.value = detail
+    totalSegmentCount.value = detail.total_segments
+    setSegmentStatusStats(buildMergeViewStatusStats(detail))
+    return detail
   }
 
   function adjustSegmentStatusStats(previousSegment: Segment, nextSegment: Segment) {
@@ -445,7 +732,15 @@ export const useSegmentStore = defineStore('segment', () => {
       scope: query.scope ?? segmentFilters.value.scope,
       sourceQuery: query.sourceQuery ?? segmentFilters.value.sourceQuery,
       targetQuery: query.targetQuery ?? segmentFilters.value.targetQuery,
+      sourceExclude: query.sourceExclude ?? segmentFilters.value.sourceExclude,
+      targetExclude: query.targetExclude ?? segmentFilters.value.targetExclude,
       searchFuzzy: query.searchFuzzy ?? segmentFilters.value.searchFuzzy,
+      caseSensitive: query.caseSensitive ?? segmentFilters.value.caseSensitive,
+      statusFilters: normalizeStringArray(query.statusFilters ?? segmentFilters.value.statusFilters),
+      matchFilters: normalizeStringArray(query.matchFilters ?? segmentFilters.value.matchFilters),
+      sourceFilters: normalizeStringArray(query.sourceFilters ?? segmentFilters.value.sourceFilters),
+      workflowStepIds: normalizeStringArray(query.workflowStepIds ?? segmentFilters.value.workflowStepIds),
+      includeStats: query.includeStats ?? true,
     }
   }
 
@@ -457,7 +752,15 @@ export const useSegmentStore = defineStore('segment', () => {
       scope: resolved.scope,
       source_query: resolved.sourceQuery,
       target_query: resolved.targetQuery,
+      source_exclude: resolved.sourceExclude,
+      target_exclude: resolved.targetExclude,
       search_fuzzy: resolved.searchFuzzy,
+      case_sensitive: resolved.caseSensitive,
+      status_filters: serializeFilterArray(resolved.statusFilters),
+      match_filters: serializeFilterArray(resolved.matchFilters),
+      source_filters: serializeFilterArray(resolved.sourceFilters),
+      workflow_step_ids: serializeFilterArray(resolved.workflowStepIds),
+      include_stats: resolved.includeStats,
     }
   }
 
@@ -468,7 +771,14 @@ export const useSegmentStore = defineStore('segment', () => {
       scope: segmentFilters.value.scope,
       sourceQuery: segmentFilters.value.sourceQuery,
       targetQuery: segmentFilters.value.targetQuery,
+      sourceExclude: segmentFilters.value.sourceExclude,
+      targetExclude: segmentFilters.value.targetExclude,
       searchFuzzy: segmentFilters.value.searchFuzzy,
+      caseSensitive: segmentFilters.value.caseSensitive,
+      statusFilters: [...segmentFilters.value.statusFilters],
+      matchFilters: [...segmentFilters.value.matchFilters],
+      sourceFilters: [...segmentFilters.value.sourceFilters],
+      workflowStepIds: [...segmentFilters.value.workflowStepIds],
     }
   }
 
@@ -509,7 +819,14 @@ export const useSegmentStore = defineStore('segment', () => {
       scope: string
       sourceQuery: string
       targetQuery: string
+      sourceExclude: string
+      targetExclude: string
       searchFuzzy: boolean
+      caseSensitive: boolean
+      statusFilters: string[]
+      matchFilters: string[]
+      sourceFilters: string[]
+      workflowStepIds: string[]
     },
   ) {
     currentPage.value = resolved.page
@@ -518,11 +835,20 @@ export const useSegmentStore = defineStore('segment', () => {
       scope: resolved.scope,
       sourceQuery: resolved.sourceQuery,
       targetQuery: resolved.targetQuery,
+      sourceExclude: resolved.sourceExclude,
+      targetExclude: resolved.targetExclude,
       searchFuzzy: resolved.searchFuzzy,
+      caseSensitive: resolved.caseSensitive,
+      statusFilters: [...resolved.statusFilters],
+      matchFilters: [...resolved.matchFilters],
+      sourceFilters: [...resolved.sourceFilters],
+      workflowStepIds: [...resolved.workflowStepIds],
     }
-    totalSegmentCount.value = data.total_segments
+    totalSegmentCount.value = data.total_segments ?? totalSegmentCount.value
     matchedSegmentCount.value = data.matched_segments
-    setSegmentStatusStats(data.status_stats)
+    if (data.status_stats) {
+      setSegmentStatusStats(data.status_stats)
+    }
     resetSegments(data.segments)
     if (data.server_time) {
       changeCursor = data.server_time
@@ -540,11 +866,29 @@ export const useSegmentStore = defineStore('segment', () => {
     }, CHANGE_POLL_INTERVAL_MS)
   }
 
+  function clearChangePollBurstTimers() {
+    for (const timer of changePollBurstTimers) {
+      window.clearTimeout(timer)
+    }
+    changePollBurstTimers = []
+  }
+
+  function scheduleChangePollBurst() {
+    clearChangePollBurstTimers()
+    if (!fileRecord.value) {
+      return
+    }
+    changePollBurstTimers = CHANGE_POLL_BURST_DELAYS_MS.map((delay) => window.setTimeout(() => {
+      void pollSegmentChanges()
+    }, delay))
+  }
+
   function stopChangePolling() {
     if (changePollTimer !== null) {
       window.clearInterval(changePollTimer)
       changePollTimer = null
     }
+    clearChangePollBurstTimers()
     pollingChanges = false
   }
 
@@ -555,41 +899,52 @@ export const useSegmentStore = defineStore('segment', () => {
 
     pollingChanges = true
     try {
-      const { data } = await http.get<{
-        file_record_id: string
-        server_time: string
-        segments: Segment[]
-      }>(`/file-records/${fileRecord.value.id}/segments/changes`, {
-        params: {
-          since: changeCursor,
-          limit: MAX_SEGMENT_PAGE_SIZE,
-        },
-      })
-
+      const currentFileRecordId = fileRecord.value.id
       const nextConflicts = { ...conflictEntries.value }
+      const nextDirtyEntries = { ...dirtyEntries.value }
       let conflictAdded = false
-      for (const remoteSegment of data.segments || []) {
-        const dirtyEntry = dirtyEntries.value[remoteSegment.sentence_id]
-        if (dirtyEntry) {
-          const baseVersion = Number(dirtyEntry.base_version || 0)
-          const remoteVersion = Number(remoteSegment.version || 1)
-          if (remoteVersion > baseVersion) {
-            nextConflicts[remoteSegment.sentence_id] = remoteSegment.target_text || ''
-            conflictAdded = true
-            const index = getSegmentIndex(remoteSegment.sentence_id)
-            if (index !== -1) {
-              segments.value[index] = {
-                ...segments.value[index],
-                version: remoteVersion,
-                updated_at: remoteSegment.updated_at,
+      let hasMore = true
+      let pageGuard = 0
+
+      while (fileRecord.value && changeCursor && hasMore && pageGuard < 20) {
+        pageGuard += 1
+        const response: { data: SegmentChangeResponse } = await http.get<SegmentChangeResponse>(`/file-records/${currentFileRecordId}/segments/changes`, {
+          params: {
+            since: changeCursor,
+            limit: MAX_SEGMENT_PAGE_SIZE,
+          },
+        })
+        const data: SegmentChangeResponse = response.data
+
+        for (const remoteSegment of data.segments || []) {
+          const dirtyEntry = dirtyEntries.value[remoteSegment.sentence_id]
+          if (dirtyEntry) {
+            const baseVersion = Number(dirtyEntry.base_version || 0)
+            const remoteVersion = Number(remoteSegment.version || 1)
+            if (remoteVersion > baseVersion) {
+              if ((remoteSegment.target_text || '') === (dirtyEntry.target_text || '')) {
+                bumpDirtyBaseVersion(nextDirtyEntries, remoteSegment.sentence_id, remoteVersion)
+              } else if (isSensitiveRemoteConflict(
+                remoteSegment.source,
+                remoteSegment.last_modified_by_id,
+                dirtyEntry.source,
+              )) {
+                nextConflicts[remoteSegment.sentence_id] = remoteSegment.target_text || ''
+                conflictAdded = true
+              } else {
+                bumpDirtyBaseVersion(nextDirtyEntries, remoteSegment.sentence_id, remoteVersion)
               }
+              applyServerSegmentMetadata(remoteSegment.sentence_id, remoteSegment)
+              continue
             }
-            continue
           }
+          applyServerSegment(remoteSegment)
         }
-        applyServerSegment(remoteSegment)
+        changeCursor = data.next_cursor || data.server_time || new Date().toISOString()
+        hasMore = Boolean(data.has_more)
       }
 
+      dirtyEntries.value = nextDirtyEntries
       conflictEntries.value = nextConflicts
       if (conflictAdded) {
         syncMessage.value = '检测到其他用户已更新同一句段，请确认后再保存本地修改。'
@@ -599,7 +954,6 @@ export const useSegmentStore = defineStore('segment', () => {
           message: '有句段已被其他用户更新，本地修改已保留。',
         })
       }
-      changeCursor = data.server_time || new Date().toISOString()
     } catch {
       // 增量同步失败不打断当前编辑，下一轮继续尝试。
     } finally {
@@ -634,6 +988,43 @@ export const useSegmentStore = defineStore('segment', () => {
     return data
   }
 
+  async function fetchRevisionSettings(fileRecordId = fileRecord.value?.id || '') {
+    if (!fileRecordId) {
+      revisionSettings.value = createDefaultRevisionSettings()
+      return revisionSettings.value
+    }
+    const { data } = await http.get<RevisionDisplaySettings>(`/file-records/${fileRecordId}/revision-settings`)
+    revisionSettings.value = {
+      ...createDefaultRevisionSettings(fileRecordId),
+      ...data,
+      author_colors: data.author_colors || {},
+    }
+    return revisionSettings.value
+  }
+
+  async function saveRevisionSettings(payload: RevisionDisplaySettings) {
+    const fileRecordId = fileRecord.value?.id || payload.file_record_id
+    if (!fileRecordId) {
+      throw new Error('当前任务尚未加载，无法保存修订设置。')
+    }
+    const { data } = await http.put<RevisionDisplaySettings>(
+      `/file-records/${fileRecordId}/revision-settings`,
+      {
+        show_author_time: payload.show_author_time,
+        show_others_revisions: payload.show_others_revisions,
+        default_insert_color: payload.default_insert_color,
+        default_delete_color: payload.default_delete_color,
+        author_colors: payload.author_colors || {},
+      },
+    )
+    revisionSettings.value = {
+      ...createDefaultRevisionSettings(fileRecordId),
+      ...data,
+      author_colors: data.author_colors || {},
+    }
+    return revisionSettings.value
+  }
+
   function resetState() {
     if (syncTimer !== null) {
       window.clearTimeout(syncTimer)
@@ -653,7 +1044,14 @@ export const useSegmentStore = defineStore('segment', () => {
       scope: 'all',
       sourceQuery: '',
       targetQuery: '',
+      sourceExclude: '',
+      targetExclude: '',
       searchFuzzy: false,
+      caseSensitive: false,
+      statusFilters: [],
+      matchFilters: [],
+      sourceFilters: [],
+      workflowStepIds: [],
     }
     saveToTMStats.value = null
     activeSentenceId.value = null
@@ -678,11 +1076,133 @@ export const useSegmentStore = defineStore('segment', () => {
     revisionHistory.value = {}
     localRevisionDrafts.value = {}
     localRevisionBaselines.value = {}
-    revisionTrackingEnabled.value = false
+    revisionTrackingEnabled.value = getInitialRevisionTrackingEnabled()
+    revisionSettings.value = createDefaultRevisionSettings()
+    syncPromise = null
     loadMorePromise = null
+    pendingSegmentPageQuery = null
     llmAbortController = null
     llmReader = null
     llmAbortRequested = false
+    // 合并视图状态也一并清空
+    mergeViewId.value = null
+    mergeViewDetail.value = null
+    mergeViewGroups.value = []
+    activeFileRecordId.value = null
+  }
+
+  /** 合并视图模式：加载视图聚合段（每段带 file_record_id），填充 segments。 */
+  async function loadMergeView(viewId: string, query: SegmentPageQuery = {}) {
+    resetState()
+    mergeViewId.value = viewId
+    loading.value = true
+    try {
+      const resolved = resolvePageQuery({
+        page: query.page ?? 1,
+        pageSize: query.pageSize ?? DEFAULT_SEGMENT_PAGE_SIZE,
+        scope: query.scope ?? 'all',
+        sourceQuery: query.sourceQuery ?? '',
+        targetQuery: query.targetQuery ?? '',
+        sourceExclude: query.sourceExclude ?? '',
+        targetExclude: query.targetExclude ?? '',
+        searchFuzzy: query.searchFuzzy ?? false,
+        caseSensitive: query.caseSensitive ?? false,
+        statusFilters: query.statusFilters ?? [],
+        matchFilters: query.matchFilters ?? [],
+        sourceFilters: query.sourceFilters ?? [],
+        workflowStepIds: query.workflowStepIds ?? [],
+      })
+      pageSize.value = resolved.pageSize
+      currentPage.value = resolved.page
+      segmentFilters.value = {
+        scope: resolved.scope,
+        sourceQuery: resolved.sourceQuery,
+        targetQuery: resolved.targetQuery,
+        sourceExclude: resolved.sourceExclude,
+        targetExclude: resolved.targetExclude,
+        searchFuzzy: resolved.searchFuzzy,
+        caseSensitive: resolved.caseSensitive,
+        statusFilters: [...resolved.statusFilters],
+        matchFilters: [...resolved.matchFilters],
+        sourceFilters: [...resolved.sourceFilters],
+        workflowStepIds: [...resolved.workflowStepIds],
+      }
+      const detail = await getMergeViewDetail(viewId)
+      mergeViewDetail.value = detail
+      totalSegmentCount.value = detail.total_segments
+      setSegmentStatusStats(buildMergeViewStatusStats(detail))
+
+      const page = await fetchMergeViewSegmentPage(viewId, resolved)
+      currentPage.value = Math.floor((page.skip || 0) / Math.max(page.limit || resolved.pageSize, 1)) + 1
+      pageSize.value = page.limit || resolved.pageSize
+      matchedSegmentCount.value = page.matched_segments
+      mergeViewGroups.value = page.groups
+      changeCursor = page.server_time || new Date().toISOString()
+      resetSegments(page.segments)
+      // 自动激活首个句段
+      if (segments.value[0]) {
+        setActiveSentence(segmentKeyOf(segments.value[0]))
+      }
+    } finally {
+      loading.value = false
+    }
+  }
+
+  /** 合并模式刷新当前页（筛选/分页变化后）。 */
+  async function refreshMergeViewPage(query: SegmentPageQuery) {
+    if (!mergeViewId.value) {
+      return
+    }
+    loading.value = true
+    try {
+      const resolved = resolvePageQuery(query)
+      currentPage.value = resolved.page
+      pageSize.value = resolved.pageSize
+      segmentFilters.value = {
+        scope: resolved.scope,
+        sourceQuery: resolved.sourceQuery,
+        targetQuery: resolved.targetQuery,
+        sourceExclude: resolved.sourceExclude,
+        targetExclude: resolved.targetExclude,
+        searchFuzzy: resolved.searchFuzzy,
+        caseSensitive: resolved.caseSensitive,
+        statusFilters: [...resolved.statusFilters],
+        matchFilters: [...resolved.matchFilters],
+        sourceFilters: [...resolved.sourceFilters],
+        workflowStepIds: [...resolved.workflowStepIds],
+      }
+      const page = await fetchMergeViewSegmentPage(mergeViewId.value, resolved)
+      currentPage.value = Math.floor((page.skip || 0) / Math.max(page.limit || resolved.pageSize, 1)) + 1
+      pageSize.value = page.limit || resolved.pageSize
+      matchedSegmentCount.value = page.matched_segments
+      mergeViewGroups.value = page.groups
+      changeCursor = page.server_time || changeCursor
+      resetSegments(page.segments)
+      if (segments.value[0] && !activeSentenceId.value) {
+        setActiveSentence(segmentKeyOf(segments.value[0]))
+      }
+    } finally {
+      loading.value = false
+    }
+  }
+
+  /** 由当前页/筛选状态构造合并视图查询参数。 */
+  function resolveCurrentMergeQuery(): SegmentPageQuery {
+    return {
+      page: currentPage.value,
+      pageSize: pageSize.value,
+      scope: segmentFilters.value.scope,
+      sourceQuery: segmentFilters.value.sourceQuery,
+      targetQuery: segmentFilters.value.targetQuery,
+      sourceExclude: segmentFilters.value.sourceExclude,
+      targetExclude: segmentFilters.value.targetExclude,
+      searchFuzzy: segmentFilters.value.searchFuzzy,
+      caseSensitive: segmentFilters.value.caseSensitive,
+      statusFilters: segmentFilters.value.statusFilters,
+      matchFilters: segmentFilters.value.matchFilters,
+      sourceFilters: segmentFilters.value.sourceFilters,
+      workflowStepIds: segmentFilters.value.workflowStepIds,
+    }
   }
 
   async function loadTask(fileRecordId: string, query: SegmentPageQuery = {}) {
@@ -695,7 +1215,14 @@ export const useSegmentStore = defineStore('segment', () => {
         scope: query.scope ?? 'all',
         sourceQuery: query.sourceQuery ?? '',
         targetQuery: query.targetQuery ?? '',
+        sourceExclude: query.sourceExclude ?? '',
+        targetExclude: query.targetExclude ?? '',
         searchFuzzy: query.searchFuzzy ?? false,
+        caseSensitive: query.caseSensitive ?? false,
+        statusFilters: query.statusFilters ?? [],
+        matchFilters: query.matchFilters ?? [],
+        sourceFilters: query.sourceFilters ?? [],
+        workflowStepIds: query.workflowStepIds ?? [],
       })
       pageSize.value = resolved.pageSize
       currentPage.value = resolved.page
@@ -703,7 +1230,14 @@ export const useSegmentStore = defineStore('segment', () => {
         scope: resolved.scope,
         sourceQuery: resolved.sourceQuery,
         targetQuery: resolved.targetQuery,
+        sourceExclude: resolved.sourceExclude,
+        targetExclude: resolved.targetExclude,
         searchFuzzy: resolved.searchFuzzy,
+        caseSensitive: resolved.caseSensitive,
+        statusFilters: [...resolved.statusFilters],
+        matchFilters: [...resolved.matchFilters],
+        sourceFilters: [...resolved.sourceFilters],
+        workflowStepIds: [...resolved.workflowStepIds],
       }
       const detail = await fetchFileRecordDetail(fileRecordId, resolved.pageSize)
       fileRecord.value = {
@@ -718,6 +1252,12 @@ export const useSegmentStore = defineStore('segment', () => {
         && resolved.scope === 'all'
         && !resolved.sourceQuery
         && !resolved.targetQuery
+        && !resolved.sourceExclude
+        && !resolved.targetExclude
+        && resolved.statusFilters.length === 0
+        && resolved.matchFilters.length === 0
+        && resolved.sourceFilters.length === 0
+        && resolved.workflowStepIds.length === 0
       ) {
         matchedSegmentCount.value = detail.total_segments
         resetSegments(detail.segments)
@@ -726,40 +1266,57 @@ export const useSegmentStore = defineStore('segment', () => {
         applySegmentPageData(page.data, page.resolved)
       }
       await loadRevisions(fileRecordId)
+      await fetchRevisionSettings(fileRecordId)
+      if (revisionTrackingEnabled.value) {
+        ensureRevisionTrackingBaselines()
+      }
       startChangePolling()
     } finally {
       loading.value = false
     }
   }
 
-  async function loadSegmentPage(query: SegmentPageQuery = {}) {
+  async function loadSegmentPage(query: SegmentPageQuery = {}): Promise<boolean> {
     if (!fileRecord.value) {
       return false
     }
 
+    // 已有进行中的加载：记录最新目标 query，由当前的加载循环在结束后继续处理（last-wins），
+    // 避免连续翻页时后点击的页码被静默丢弃而停在旧页。
     if (loadMorePromise) {
+      pendingSegmentPageQuery = query
       return loadMorePromise
     }
 
     loadingMoreSegments.value = true
     loadMorePromise = (async () => {
-      const { data, resolved } = await fetchSegmentPage(fileRecord.value!.id, query)
-      applySegmentPageData(data, resolved)
-      await loadRevisions(fileRecord.value!.id, resolved)
-      if (segments.value[0] && !segments.value.some((segment) => segment.sentence_id === activeSentenceId.value)) {
-        setActiveSentence(segments.value[0].sentence_id)
-      } else if (!segments.value.length) {
-        setActiveSentence(null)
+      let currentQuery: SegmentPageQuery | null = query
+      let hasMore = false
+      try {
+        while (currentQuery) {
+          const activeQuery = currentQuery
+          pendingSegmentPageQuery = null
+          const { data, resolved } = await fetchSegmentPage(fileRecord.value!.id, activeQuery)
+          applySegmentPageData(data, resolved)
+          await loadRevisions(fileRecord.value!.id, resolved)
+          if (segments.value[0] && !segments.value.some((segment) => segment.sentence_id === activeSentenceId.value)) {
+            setActiveSentence(segments.value[0].sentence_id)
+          } else if (!segments.value.length) {
+            setActiveSentence(null)
+          }
+          hasMore = data.segments.length > 0
+          // 加载期间若有更新的目标页码，循环加载最新的那一页。
+          currentQuery = pendingSegmentPageQuery
+        }
+        return hasMore
+      } finally {
+        pendingSegmentPageQuery = null
+        loadMorePromise = null
+        loadingMoreSegments.value = false
       }
-      return data.segments.length > 0
     })()
 
-    try {
-      return await loadMorePromise
-    } finally {
-      loadMorePromise = null
-      loadingMoreSegments.value = false
-    }
+    return loadMorePromise
   }
 
   async function loadMoreSegments() {
@@ -823,7 +1380,7 @@ export const useSegmentStore = defineStore('segment', () => {
   function rebuildSegmentIndexMap() {
     segmentIndexMap.clear()
     segments.value.forEach((segment, index) => {
-      segmentIndexMap.set(segment.sentence_id, index)
+      segmentIndexMap.set(segmentKeyOf(segment), index)
     })
   }
 
@@ -844,7 +1401,9 @@ export const useSegmentStore = defineStore('segment', () => {
     targetHtml?: string,
     options: { confirm?: boolean } = {},
   ) {
-    const index = getSegmentIndex(sentenceId)
+    // sentenceId 在合并模式下是复合键；还原真实 sentence_id 用于后端匹配与回写。
+    const segmentKey = sentenceId
+    const index = getSegmentIndex(segmentKey)
     if (index === -1) {
       return
     }
@@ -865,29 +1424,32 @@ export const useSegmentStore = defineStore('segment', () => {
     }
     segments.value[index] = nextSegment
     adjustSegmentStatusStats(segment, nextSegment)
-    markPreviewUpdate(sentenceId, targetText)
+    markPreviewUpdate(segmentKey, targetText)
 
     dirtyEntries.value = {
       ...dirtyEntries.value,
-      [sentenceId]: {
-        sentence_id: sentenceId,
+      [segmentKey]: {
+        sentence_id: segment.sentence_id,
         target_text: targetText,
         target_html: targetHtml || null,
         source: 'manual',
         track_revision: revisionTrackingEnabled.value,
         base_version: segment.version ?? 1,
         confirm,
+        // 合并模式保存分组用：记录该 dirty 条目归属的文件
+        file_record_id: fileRecordIdForSegment(segment) ?? undefined,
       },
     }
     const nextConflicts = { ...conflictEntries.value }
-    delete nextConflicts[sentenceId]
+    delete nextConflicts[segmentKey]
     conflictEntries.value = nextConflicts
     syncMessage.value = translate('stores.segment.syncPending', { count: dirtyCount.value })
     scheduleSync()
   }
 
   async function updateSource(sentenceId: string, sourceText: string) {
-    const index = getSegmentIndex(sentenceId)
+    const segmentKey = sentenceId
+    const index = getSegmentIndex(segmentKey)
     if (index === -1) {
       return
     }
@@ -904,9 +1466,16 @@ export const useSegmentStore = defineStore('segment', () => {
     }
     segments.value[index] = nextSegment
 
+    // 合并模式按激活句段所属文件路由；单文件走 fileRecord.id
+    const fileId = mergeViewId.value
+      ? (fileRecordIdForSegment(segment) ?? null)
+      : (fileRecord.value?.id ?? null)
+    if (!fileId) {
+      return
+    }
     // 直接同步到后端
     try {
-      await http.put(`/file-records/${fileRecord.value?.id}/segments/${sentenceId}/source`, {
+      await http.put(`/file-records/${fileId}/segments/${segment.sentence_id}/source`, {
         source_text: sourceText,
       })
     } catch (error) {
@@ -917,20 +1486,38 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   async function setProjectSyncDisabled(sentenceId: string, disabled: boolean) {
-    if (!fileRecord.value) {
+    const segmentKey = sentenceId
+    const index = getSegmentIndex(segmentKey)
+    if (index === -1) {
       return
     }
+    const segment = segments.value[index]
+    // 合并模式按该句段所属文件路由；单文件走 fileRecord.id
+    const fileId = mergeViewId.value
+      ? (fileRecordIdForSegment(segment) ?? null)
+      : (fileRecord.value?.id ?? null)
+    if (!fileId) {
+      return
+    }
+    const previousSegment = segment
+    const willClearProjectSyncedTarget = Boolean(
+      disabled
+      && previousSegment?.source === 'project_sync'
+      && (previousSegment.target_text || '').trim(),
+    )
     try {
       const { data } = await http.patch<Segment>(
-        `/file-records/${fileRecord.value.id}/segments/${sentenceId}/project-sync`,
+        `/file-records/${fileId}/segments/${segment.sentence_id}/project-sync`,
         { disabled },
       )
-      applyServerSegments([data], false)
+      applyServerSegments([data])
       pushToast({
         tone: 'success',
         title: disabled ? '已关闭项目同步' : '已开启项目同步',
         message: disabled
-          ? '该句段会保留当前译文，后续不再被相同原文自动同步覆盖。'
+          ? (willClearProjectSyncedTarget
+              ? '已清空该句段由项目同步生成的译文，后续不再被相同原文自动同步覆盖。'
+              : '该句段后续不再被相同原文自动同步覆盖。')
           : '该句段已恢复项目内相同原文自动同步。',
       })
     } catch (error) {
@@ -943,26 +1530,73 @@ export const useSegmentStore = defineStore('segment', () => {
     }
   }
 
+  async function disableProjectSyncForCurrentFile(): Promise<ProjectSyncDisableResult> {
+    if (!fileRecord.value) {
+      return { updated_count: 0, disabled_count: 0, cleared_count: 0 }
+    }
+
+    const synced = await syncToBackend()
+    if (!synced) {
+      return { updated_count: 0, disabled_count: 0, cleared_count: 0 }
+    }
+
+    const { data } = await http.post<ProjectSyncDisableResult>(
+      `/file-records/${fileRecord.value.id}/segments/project-sync/disable`,
+    )
+    await refreshCurrentSegmentPage()
+    const syncedAt = new Date()
+    lastSyncedAt.value = syncedAt.toISOString()
+    syncMessage.value = translate('stores.segment.syncedAt', {
+      time: syncedAt.toLocaleString('zh-CN', { hour12: false }),
+    })
+    return data
+  }
+
   function setActiveSentence(sentenceId: string | null) {
+    // sentenceId 在合并模式下是复合键（${file_record_id}:${sentence_id}）
     activeSentenceId.value = sentenceId
     if (sentenceId) {
-      const segment = segments.value.find((s) => s.sentence_id === sentenceId)
+      const segment = mergeViewId.value
+        ? segments.value.find((s) => segmentKeyOf(s) === sentenceId)
+        : segments.value.find((s) => s.sentence_id === sentenceId)
       activeSourceText.value = segment?.source_text || ''
+      activeFileRecordId.value = segment ? fileRecordIdForSegment(segment) : null
       void loadTermMatches(sentenceId, activeSourceText.value)
     } else {
       activeSourceText.value = ''
+      activeFileRecordId.value = null
     }
   }
 
   async function loadTermMatches(sentenceId: string, sourceText: string) {
     if (!sourceText) {
+      termMatchesMap.value = {
+        ...termMatchesMap.value,
+        [sentenceId]: [],
+      }
+      return
+    }
+    if (mergeViewId.value) {
+      termMatchesMap.value = {
+        ...termMatchesMap.value,
+        [sentenceId]: [],
+      }
       return
     }
     try {
       const params = new URLSearchParams({ text: sourceText })
-      const boundTermBaseIds = fileRecord.value?.term_base_ids?.length
-        ? fileRecord.value.term_base_ids
-        : (fileRecord.value?.term_base_id ? [fileRecord.value.term_base_id] : [])
+      const boundTermBaseIds = Array.from(new Set([
+        ...(fileRecord.value?.term_base_ids || []),
+        ...(fileRecord.value?.term_base_id ? [fileRecord.value.term_base_id] : []),
+        ...(fileRecord.value?.qa_term_base_ids || []),
+      ].filter(Boolean)))
+      if (boundTermBaseIds.length === 0) {
+        termMatchesMap.value = {
+          ...termMatchesMap.value,
+          [sentenceId]: [],
+        }
+        return
+      }
       for (const termBaseId of boundTermBaseIds) {
         params.append('collection_ids', termBaseId)
       }
@@ -978,6 +1612,13 @@ export const useSegmentStore = defineStore('segment', () => {
     }
   }
 
+  function refreshActiveTermMatches() {
+    if (!activeSentenceId.value) {
+      return Promise.resolve()
+    }
+    return loadTermMatches(activeSentenceId.value, activeSourceText.value)
+  }
+
   function getTermMatches(sentenceId: string): TermMatch[] {
     return termMatchesMap.value[sentenceId] || []
   }
@@ -991,112 +1632,35 @@ export const useSegmentStore = defineStore('segment', () => {
     }, AUTO_SYNC_DELAY_MS)
   }
 
-  async function syncToBackend() {
-    if (!fileRecord.value || dirtyCount.value === 0) {
-      return true
-    }
-
-    if (saving.value) {
-      scheduleSync()
-      return false
-    }
-
-    if (syncTimer !== null) {
-      window.clearTimeout(syncTimer)
-      syncTimer = null
-    }
-
-    const updates = Object.values(dirtyEntries.value)
+  async function runSyncToBackend(): Promise<boolean> {
     saving.value = true
-    syncMessage.value = translate('stores.segment.syncing', { count: updates.length })
+    const allUpdates = Object.entries(dirtyEntries.value) // [segmentKey, payload]
+    syncMessage.value = translate('stores.segment.syncing', { count: allUpdates.length })
     try {
-      const { data } = await http.put<{
-        updated_count: number
-        conflicts?: Array<{
-          sentence_id: string
-          current_version: number
-          attempted_version: number | null
-          current_target_text: string
-        }>
-        auto_tm?: {
-          queued_count: number
-          skipped_no_collection_count: number
-          skipped_invalid_count?: number
-        }
-        project_sync?: ProjectSegmentSyncSummary
-        segments?: Segment[]
-      }>(`/file-records/${fileRecord.value.id}/segments`, {
-        updates,
-      })
-      applyServerSegments(data.segments || [], false)
-      await loadRevisions(fileRecord.value.id)
-      const nextDirtyEntries = { ...dirtyEntries.value }
-      const syncedSentenceIds: string[] = []
-      const updatedSentenceIds = new Set((data.segments || []).map((segment) => segment.sentence_id))
-      const conflictSentenceIds = new Set((data.conflicts || []).map((conflict) => conflict.sentence_id))
-      for (const update of updates) {
-        const currentEntry = nextDirtyEntries[update.sentence_id]
-        if (
-          currentEntry
-          && currentEntry.target_text === update.target_text
-          && (currentEntry.target_html || null) === (update.target_html || null)
-          && currentEntry.source === update.source
-          && Boolean(currentEntry.confirm) === Boolean(update.confirm)
-          && (updatedSentenceIds.size === 0 || updatedSentenceIds.has(update.sentence_id))
-          && !conflictSentenceIds.has(update.sentence_id)
-        ) {
-          delete nextDirtyEntries[update.sentence_id]
-          syncedSentenceIds.push(update.sentence_id)
-        }
-      }
-      dirtyEntries.value = nextDirtyEntries
-      clearLocalRevisionDrafts(syncedSentenceIds)
-      if ((data.conflicts || []).length > 0) {
-        const nextConflicts = { ...conflictEntries.value }
-        for (const conflict of data.conflicts || []) {
-          nextConflicts[conflict.sentence_id] = conflict.current_target_text
-          const index = getSegmentIndex(conflict.sentence_id)
-          if (index !== -1) {
-            segments.value[index] = {
-              ...segments.value[index],
-              version: conflict.current_version,
-            }
+      if (mergeViewId.value) {
+        // 合并模式：按 file_record_id 分组，对每个文件并行 PUT
+        const grouped = new Map<string, Array<{ key: string; payload: SegmentUpdatePayload }>>()
+        for (const [key, payload] of allUpdates) {
+          const fileId = payload.file_record_id
+          if (!fileId) {
+            continue
           }
+          const list = grouped.get(fileId) || []
+          list.push({ key, payload })
+          grouped.set(fileId, list)
         }
-        conflictEntries.value = nextConflicts
-        syncMessage.value = '检测到协同冲突，本地修改已保留。'
-        pushToast({
-          tone: 'warn',
-          title: '保存遇到协同冲突',
-          message: '其他用户已更新同一句段，请确认后再保存。',
-        })
-        return false
+        const results = await Promise.all(
+          Array.from(grouped.entries()).map(([fileId, items]) =>
+            syncOneFile(fileId, items).then((res) => ({ fileId, items, data: res.data })),
+          ),
+        )
+        return reconcileMergeSync(results)
       }
-      if (data.auto_tm?.skipped_no_collection_count) {
-        pushToast({
-          tone: 'info',
-          title: '未自动写入记忆库',
-          message: '当前文件未绑定记忆库，确认译文已保存。',
-        })
-      }
-      if (data.project_sync?.filled_count) {
-        pushToast({
-          tone: 'success',
-          title: '项目同步完成',
-          message: `已自动填充 ${data.project_sync.filled_count} 条相同原文句段。`,
-        })
-      }
-      const syncedAt = new Date()
-      lastSyncedAt.value = syncedAt.toISOString()
-      if (dirtyCount.value > 0) {
-        syncMessage.value = translate('stores.segment.syncPending', { count: dirtyCount.value })
-        scheduleSync()
-      } else {
-        syncMessage.value = translate('stores.segment.syncedAt', {
-          time: syncedAt.toLocaleString('zh-CN', { hour12: false }),
-        })
-      }
-      return true
+
+      // 单文件模式
+      const result = await syncOneFile(fileRecord.value!.id, allUpdates.map(([key, payload]) => ({ key, payload })))
+      const ok = reconcileSingleSync(fileRecord.value!.id, result)
+      return ok
     } catch (error) {
       if (isEditLockedError(error)) {
         const message = getEditLockedMessage(error)
@@ -1122,6 +1686,230 @@ export const useSegmentStore = defineStore('segment', () => {
     } finally {
       saving.value = false
     }
+  }
+
+  async function syncToBackend(): Promise<boolean> {
+    if (dirtyCount.value === 0) {
+      return true
+    }
+    // 单文件模式需要 fileRecord；合并模式按 dirty 条目自带 file_record_id 分组。
+    if (!mergeViewId.value && !fileRecord.value) {
+      return true
+    }
+
+    if (syncPromise) {
+      const synced = await syncPromise
+      if (!synced) {
+        return false
+      }
+      // 当前保存过程中可能又产生了新编辑；翻页、切页等显式动作要等待这些修改落库。
+      return dirtyCount.value === 0 ? true : syncToBackend()
+    }
+
+    if (syncTimer !== null) {
+      window.clearTimeout(syncTimer)
+      syncTimer = null
+    }
+
+    syncPromise = runSyncToBackend()
+    try {
+      return await syncPromise
+    } finally {
+      syncPromise = null
+    }
+  }
+
+  /** 对单个文件执行批量 PUT；返回该文件的服务端响应（segments/conflicts/auto_tm/project_sync）。 */
+  async function syncOneFile(
+    fileId: string,
+    items: Array<{ key: string; payload: SegmentUpdatePayload }>,
+  ) {
+    const updates = items.map((item) => item.payload)
+    const { data } = await http.put<{
+      updated_count: number
+      conflicts?: SegmentConflictResponse[]
+      auto_tm?: {
+        queued_count: number
+        skipped_no_collection_count: number
+        skipped_invalid_count?: number
+      }
+      project_sync?: ProjectSegmentSyncSummary
+      segments?: Segment[]
+    }>(`/file-records/${fileId}/segments`, {
+      updates,
+    })
+    if (mergeViewId.value) {
+      data.segments = (data.segments || []).map((segment) => withSegmentFileContext(segment, fileId))
+    }
+    return { data, items }
+  }
+
+  /** 单文件保存后：应用服务端段、清成功 dirty、处理冲突，返回是否成功。 */
+  function reconcileSingleSync(fileId: string, result: ReturnType<typeof syncOneFile> extends Promise<infer R> ? R : never): boolean {
+    const { data, items } = result
+    void loadRevisions(fileId)
+    const nextDirtyEntries = { ...dirtyEntries.value }
+    const syncedSentenceIds: string[] = []
+    const payloadByKey = new Map(items.map((item) => [item.key, item.payload]))
+    for (const segment of data.segments || []) {
+      const segmentKey = segment.sentence_id
+      const payload = payloadByKey.get(segmentKey)
+      const currentEntry = nextDirtyEntries[segmentKey]
+      if (currentEntry && (!payload || !isSameDirtyPayload(currentEntry, payload))) {
+        bumpDirtyBaseVersion(nextDirtyEntries, segmentKey, segment.version)
+        applyServerSegmentMetadata(segmentKey, segment)
+        continue
+      }
+      applyServerSegment(segment, false)
+    }
+    const updatedSentenceIds = new Set((data.segments || []).map((segment) => segment.sentence_id))
+    const sensitiveConflicts = (data.conflicts || []).filter((conflict) => {
+      const key = conflict.sentence_id
+      const incomingSource = nextDirtyEntries[key]?.source || payloadByKey.get(key)?.source || 'manual'
+      if ((conflict.current_target_text || '') === (nextDirtyEntries[key]?.target_text || '')) {
+        bumpDirtyBaseVersion(nextDirtyEntries, key, conflict.current_version)
+        return false
+      }
+      if (isSensitiveRemoteConflict(
+        conflict.conflict_source,
+        conflict.conflict_last_modified_by_id,
+        incomingSource,
+      )) {
+        return true
+      }
+      bumpDirtyBaseVersion(nextDirtyEntries, key, conflict.current_version)
+      return false
+    })
+    const conflictSentenceIds = new Set(sensitiveConflicts.map((conflict) => conflict.sentence_id))
+    let hadConflict = false
+    for (const { key, payload } of items) {
+      const currentEntry = nextDirtyEntries[key]
+      if (
+        isSameDirtyPayload(currentEntry, payload)
+        && (updatedSentenceIds.size === 0 || updatedSentenceIds.has(payload.sentence_id))
+        && !conflictSentenceIds.has(payload.sentence_id)
+      ) {
+        delete nextDirtyEntries[key]
+        syncedSentenceIds.push(key)
+      } else if (conflictSentenceIds.has(payload.sentence_id)) {
+        hadConflict = true
+      }
+    }
+    dirtyEntries.value = nextDirtyEntries
+    clearLocalRevisionDrafts(syncedSentenceIds)
+    if (sensitiveConflicts.length > 0) {
+      applySyncConflicts(sensitiveConflicts, fileId)
+    }
+    return finishSyncState(hadConflict)
+  }
+
+  /** 合并模式保存后：汇总各文件结果，统一应用。 */
+  function reconcileMergeSync(
+    results: Array<{ fileId: string; items: Array<{ key: string; payload: SegmentUpdatePayload }>; data: Awaited<ReturnType<typeof syncOneFile>>['data'] }>,
+  ): boolean {
+    const nextDirtyEntries = { ...dirtyEntries.value }
+    const syncedSentenceIds: string[] = []
+    let hadConflict = false
+    for (const result of results) {
+      const payloadByKey = new Map(result.items.map((item) => [item.key, item.payload]))
+      for (const segment of result.data.segments || []) {
+        const segmentKey = segmentKeyOf(segment)
+        const payload = payloadByKey.get(segmentKey)
+        const currentEntry = nextDirtyEntries[segmentKey]
+        if (currentEntry && (!payload || !isSameDirtyPayload(currentEntry, payload))) {
+          bumpDirtyBaseVersion(nextDirtyEntries, segmentKey, segment.version)
+          applyServerSegmentMetadata(segmentKey, segment)
+          continue
+        }
+        applyServerSegment(segment, false)
+      }
+      // 合并模式下按文件加载修订意义不大（多文件），跳过 loadRevisions
+      const updatedSentenceIds = new Set((result.data.segments || []).map((segment) => segment.sentence_id))
+      const sensitiveConflicts = (result.data.conflicts || []).filter((conflict) => {
+        const key = buildSegmentKey(result.fileId, conflict.sentence_id)
+        const incomingSource = nextDirtyEntries[key]?.source || payloadByKey.get(key)?.source || 'manual'
+        if ((conflict.current_target_text || '') === (nextDirtyEntries[key]?.target_text || '')) {
+          bumpDirtyBaseVersion(nextDirtyEntries, key, conflict.current_version)
+          return false
+        }
+        if (isSensitiveRemoteConflict(
+          conflict.conflict_source,
+          conflict.conflict_last_modified_by_id,
+          incomingSource,
+        )) {
+          return true
+        }
+        bumpDirtyBaseVersion(nextDirtyEntries, key, conflict.current_version)
+        return false
+      })
+      const conflictSentenceIds = new Set(sensitiveConflicts.map((conflict) => conflict.sentence_id))
+      for (const { key, payload } of result.items) {
+        const currentEntry = nextDirtyEntries[key]
+        if (
+          isSameDirtyPayload(currentEntry, payload)
+          && (updatedSentenceIds.size === 0 || updatedSentenceIds.has(payload.sentence_id))
+          && !conflictSentenceIds.has(payload.sentence_id)
+        ) {
+          delete nextDirtyEntries[key]
+          syncedSentenceIds.push(key)
+        } else if (conflictSentenceIds.has(payload.sentence_id)) {
+          hadConflict = true
+        }
+      }
+      if (sensitiveConflicts.length > 0) {
+        applySyncConflicts(sensitiveConflicts, result.fileId)
+      }
+    }
+    dirtyEntries.value = nextDirtyEntries
+    clearLocalRevisionDrafts(syncedSentenceIds)
+    return finishSyncState(hadConflict)
+  }
+
+  function applySyncConflicts(
+    conflicts: Array<{ sentence_id: string; current_version: number; current_target_text: string }>,
+    fileId: string,
+  ) {
+    const nextConflicts = { ...conflictEntries.value }
+    for (const conflict of conflicts) {
+      // 合并模式：冲突 key 用复合键（按文件定位）；单文件：即 sentence_id
+      const conflictKey = mergeViewId.value ? `${fileId}:${conflict.sentence_id}` : conflict.sentence_id
+      nextConflicts[conflictKey] = conflict.current_target_text
+      const index = getSegmentIndex(conflictKey)
+      if (index !== -1) {
+        segments.value[index] = {
+          ...segments.value[index],
+          version: conflict.current_version,
+        }
+      }
+    }
+    conflictEntries.value = nextConflicts
+  }
+
+  function finishSyncState(hadConflict: boolean): boolean {
+    if (hadConflict) {
+      syncMessage.value = '检测到协同冲突，本地修改已保留。'
+      pushToast({
+        tone: 'warn',
+        title: '保存遇到协同冲突',
+        message: '其他用户已更新同一句段，请确认后再保存。',
+      })
+      if (dirtyCount.value > 0) {
+        scheduleSync()
+      }
+      return false
+    }
+    const syncedAt = new Date()
+    lastSyncedAt.value = syncedAt.toISOString()
+    if (dirtyCount.value > 0) {
+      syncMessage.value = translate('stores.segment.syncPending', { count: dirtyCount.value })
+      scheduleSync()
+    } else {
+      syncMessage.value = translate('stores.segment.syncedAt', {
+        time: syncedAt.toLocaleString('zh-CN', { hour12: false }),
+      })
+    }
+    scheduleChangePollBurst()
+    return true
   }
 
   async function resolvePersistedRevisionId(revisionId: string) {
@@ -1178,6 +1966,18 @@ export const useSegmentStore = defineStore('segment', () => {
       return 0
     }
 
+    if (!revisionSettings.value.show_others_revisions) {
+      await loadRevisions(fileRecord.value.id)
+      const revisions = listVisiblePendingRevisions()
+      let updatedCount = 0
+      for (const revision of revisions) {
+        await acceptRevision(revision.id)
+        updatedCount += 1
+      }
+      await refreshCurrentSegmentPage()
+      return updatedCount
+    }
+
     const { data } = await http.post<{ updated_count: number }>(
       `/file-records/${fileRecord.value.id}/revisions/batch-accept`,
     )
@@ -1195,6 +1995,18 @@ export const useSegmentStore = defineStore('segment', () => {
       return 0
     }
 
+    if (!revisionSettings.value.show_others_revisions) {
+      await loadRevisions(fileRecord.value.id)
+      const revisions = listVisiblePendingRevisions()
+      let updatedCount = 0
+      for (const revision of revisions) {
+        await rejectRevision(revision.id)
+        updatedCount += 1
+      }
+      await refreshCurrentSegmentPage()
+      return updatedCount
+    }
+
     const { data } = await http.post<{ updated_count: number }>(
       `/file-records/${fileRecord.value.id}/revisions/batch-reject`,
     )
@@ -1202,7 +2014,43 @@ export const useSegmentStore = defineStore('segment', () => {
     return data.updated_count
   }
 
-  async function updateAllSegmentConfirmations(action: 'confirm' | 'cancel') {
+  async function updateAllSegmentConfirmations(
+    action: 'confirm' | 'cancel',
+    target: SegmentBatchTarget = 'current_file',
+    options: SegmentConfirmationOptions = {},
+  ) {
+    const payload = {
+      action,
+      range_start: options.rangeStart ?? undefined,
+      range_end: options.rangeEnd ?? undefined,
+    }
+    if (mergeViewId.value) {
+      const targetFileIds = target === 'merge_view'
+        ? (mergeViewDetail.value?.files ?? [])
+            .filter((file) => file.can_write !== false)
+            .map((file) => file.id)
+        : [activeFileRecordId.value].filter(Boolean) as string[]
+      if (!targetFileIds.length) {
+        return 0
+      }
+      const synced = await syncToBackend()
+      if (!synced) {
+        return 0
+      }
+      const results = await Promise.all(
+        targetFileIds.map((fileId) =>
+          http.post<{ updated_count: number }>(
+            `/file-records/${fileId}/segments/confirmation`,
+            target === 'merge_view' ? { action } : payload,
+          ),
+        ),
+      )
+      const updatedCount = results.reduce((sum, result) => sum + Number(result.data.updated_count || 0), 0)
+      await refreshMergeViewDetail()
+      await refreshMergeViewPage(resolveCurrentMergeQuery())
+      return updatedCount
+    }
+
     if (!fileRecord.value) {
       return 0
     }
@@ -1214,7 +2062,7 @@ export const useSegmentStore = defineStore('segment', () => {
 
     const { data } = await http.post<{ updated_count: number }>(
       `/file-records/${fileRecord.value.id}/segments/confirmation`,
-      { action },
+      payload,
     )
     await refreshCurrentSegmentPage()
     return data.updated_count
@@ -1239,8 +2087,13 @@ export const useSegmentStore = defineStore('segment', () => {
     source = 'llm',
     status?: string | null,
     llmInfo: { provider?: string | null, model?: string | null } = {},
+    fileRecordId?: string | null,
   ) {
-    const index = getSegmentIndex(sentenceId)
+    // 合并模式：LLM 端点返回真实 sentence_id，需用文件 id 拼复合键定位。
+    const segmentKey = mergeViewId.value
+      ? buildSegmentKey(fileRecordId || activeFileRecordId.value, sentenceId)
+      : sentenceId
+    const index = getSegmentIndex(segmentKey)
     if (index === -1) {
       return
     }
@@ -1258,13 +2111,43 @@ export const useSegmentStore = defineStore('segment', () => {
     }
     segments.value[index] = nextSegment
     adjustSegmentStatusStats(currentSegment, nextSegment)
-    markPreviewUpdate(sentenceId, targetText)
-    updateRevisionBaselineAfterPrefill(sentenceId, targetText)
+    markPreviewUpdate(segmentKey, targetText)
+    updateRevisionBaselineAfterPrefill(segmentKey, targetText)
 
     const nextDirtyEntries = { ...dirtyEntries.value }
-    delete nextDirtyEntries[sentenceId]
+    delete nextDirtyEntries[segmentKey]
     dirtyEntries.value = nextDirtyEntries
-    clearLocalRevisionDrafts([sentenceId])
+    clearLocalRevisionDrafts([segmentKey])
+  }
+
+  function finishLLMCompletion(updatedCount: number, errorCount: number, total: number) {
+    const hasNoSegments = total === 0 && updatedCount === 0 && errorCount === 0
+    llmPlannedCount.value = total
+    llmProcessedCount.value = Math.max(total, updatedCount + errorCount)
+    llmErrorCount.value = errorCount
+
+    if (hasNoSegments) {
+      llmMessage.value = translate('stores.segment.llmNoSegments')
+      pushToast({
+        tone: 'info',
+        title: translate('stores.segment.llmNoSegmentsToastTitle'),
+        message: translate('stores.segment.llmNoSegmentsToastMessage'),
+      })
+      return
+    }
+
+    llmMessage.value = translate('stores.segment.llmCompleted', {
+      updated: updatedCount,
+      error: errorCount,
+    })
+    pushToast({
+      tone: errorCount > 0 ? 'warn' : 'success',
+      title: translate('stores.segment.llmCompletedToastTitle'),
+      message: translate('stores.segment.llmCompletedToastMessage', {
+        updated: updatedCount,
+        error: errorCount,
+      }),
+    })
   }
 
   async function startLLMTranslation(
@@ -1272,9 +2155,37 @@ export const useSegmentStore = defineStore('segment', () => {
     provider: LLMProvider,
     guidelineOptions: LLMGuidelineOptions = {},
   ) {
-    if (!fileRecord.value || llmRunning.value) {
+    if (llmRunning.value) {
       return
     }
+
+    const isMergeViewBatch = Boolean(
+      mergeViewId.value
+      && guidelineOptions.mergeTarget === 'merge_view'
+      && scope !== 'current_segment',
+    )
+    const mergeViewTargetFileIds = isMergeViewBatch
+      ? (mergeViewDetail.value?.files ?? [])
+          .filter((file) => file.can_write !== false)
+          .map((file) => file.id)
+      : []
+    const llmFileId = mergeViewId.value ? activeFileRecordId.value : (fileRecord.value?.id ?? null)
+    if (isMergeViewBatch && !mergeViewTargetFileIds.length) {
+      pushToast({
+        tone: 'warn',
+        title: 'AI 修正未开始',
+        message: '当前合并视图中没有可执行 AI 修正的可写文件。',
+      })
+      return
+    }
+    if (!isMergeViewBatch && !llmFileId) {
+      return
+    }
+
+    // 合并模式下还原真实 sentence_id（前端持有的是复合键）
+    const realSentenceId = mergeViewId.value && guidelineOptions.sentenceId
+      ? sentenceIdFromKey(guidelineOptions.sentenceId)
+      : (guidelineOptions.sentenceId || null)
 
     if (syncTimer !== null) {
       window.clearTimeout(syncTimer)
@@ -1297,56 +2208,99 @@ export const useSegmentStore = defineStore('segment', () => {
     try {
       const token = window.localStorage.getItem('token')
       llmAbortController = new AbortController()
-      const response = await fetch(`/api/file-records/${fileRecord.value.id}/llm-translate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({
-          scope,
-          provider,
-          model: guidelineOptions.model || null,
-          sentence_id: guidelineOptions.sentenceId || null,
-          guideline_template_id: guidelineOptions.guidelineTemplateId || null,
-          temporary_prompt: guidelineOptions.temporaryPrompt || '',
-        }),
-        signal: llmAbortController.signal,
-      })
 
-      if (!response.ok) {
-        let message = translate('stores.segment.llmRequestFailed')
-        try {
-          const payload = await response.json()
-          message = String(payload.detail || message)
-        } catch {
-          // ignore parsing error
+      const runFileLLMTranslation = async (
+        targetFileId: string,
+        eventHandler: (event: string, data: Record<string, unknown>) => void,
+      ) => {
+        const response = await fetch(`/api/file-records/${targetFileId}/llm-translate`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'text/event-stream',
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({
+            scope,
+            provider,
+            model: guidelineOptions.model || null,
+            sentence_id: realSentenceId,
+            guideline_template_id: guidelineOptions.guidelineTemplateId || null,
+            temporary_prompt: guidelineOptions.temporaryPrompt || '',
+          }),
+          signal: llmAbortController?.signal,
+        })
+
+        if (!response.ok) {
+          let message = translate('stores.segment.llmRequestFailed')
+          try {
+            const payload = await response.json()
+            message = String(payload.detail || message)
+          } catch {
+            // ignore parsing error
+          }
+          throw new Error(message)
         }
-        throw new Error(message)
+
+        try {
+          await consumeLLMStream(
+            response,
+            ({ event, data }) => {
+              if (llmAbortRequested) {
+                return
+              }
+              eventHandler(event, data)
+            },
+            (reader) => {
+              llmReader = reader
+            },
+          )
+        } catch (error) {
+          if (error instanceof Error && error.message === 'SSE 响应体为空。') {
+            throw new Error(translate('stores.segment.llmNoStream'))
+          }
+          throw error
+        }
       }
 
-      try {
-        await consumeLLMStream(
-          response,
-          ({ event, data }) => {
-            if (llmAbortRequested) {
+      if (isMergeViewBatch) {
+        let aggregateTotal = 0
+        let aggregateUpdatedCount = 0
+        let aggregateErrorCount = 0
+
+        for (const targetFileId of mergeViewTargetFileIds) {
+          if (llmAbortRequested) {
+            break
+          }
+          await runFileLLMTranslation(targetFileId, (event, data) => {
+            if (event === 'start') {
+              aggregateTotal += Number(data.total || 0)
+              llmPlannedCount.value = aggregateTotal
+              llmMessage.value = translate('stores.segment.llmStarted', { total: aggregateTotal })
               return
             }
-            handleLLMEvent(event, data)
-          },
-          (reader) => {
-            llmReader = reader
-          },
-        )
-      } catch (error) {
-        if (error instanceof Error && error.message === 'SSE 响应体为空。') {
-          throw new Error(translate('stores.segment.llmNoStream'))
+            if (event === 'complete') {
+              aggregateUpdatedCount += Number(data.updated_count || 0)
+              aggregateErrorCount += Number(data.error_count || 0)
+              return
+            }
+            handleLLMEvent(event, data, targetFileId)
+          })
         }
-        throw error
+
+        if (!llmAbortRequested) {
+          finishLLMCompletion(aggregateUpdatedCount, aggregateErrorCount, aggregateTotal)
+        }
+      } else {
+        await runFileLLMTranslation(llmFileId!, (event, data) => {
+          handleLLMEvent(event, data, llmFileId)
+        })
       }
 
-      if (!llmAbortRequested && fileRecord.value) {
+      if (!llmAbortRequested && mergeViewId.value) {
+        await refreshMergeViewDetail()
+        await refreshMergeViewPage(resolveCurrentMergeQuery())
+      } else if (!llmAbortRequested && fileRecord.value) {
         await loadRevisions(fileRecord.value.id)
       }
     } catch (error) {
@@ -1367,7 +2321,7 @@ export const useSegmentStore = defineStore('segment', () => {
     }
   }
 
-  function handleLLMEvent(event: string, data: Record<string, unknown>) {
+  function handleLLMEvent(event: string, data: Record<string, unknown>, fileRecordId?: string | null) {
     if (event === 'start') {
       const total = Number(data.total || 0)
       llmPlannedCount.value = total
@@ -1379,6 +2333,9 @@ export const useSegmentStore = defineStore('segment', () => {
 
     if (event === 'segment') {
       llmProcessedCount.value += 1
+      const eventFileRecordId = typeof data.file_record_id === 'string'
+        ? data.file_record_id
+        : fileRecordId
       applyLLMUpdate(
         String(data.sentence_id || ''),
         String(data.target_text || ''),
@@ -1388,6 +2345,7 @@ export const useSegmentStore = defineStore('segment', () => {
           provider: typeof data.provider === 'string' ? data.provider : null,
           model: typeof data.model === 'string' ? data.model : null,
         },
+        eventFileRecordId,
       )
       llmMessage.value = translate('stores.segment.llmProgress', {
         processed: llmProcessedCount.value,
@@ -1409,21 +2367,7 @@ export const useSegmentStore = defineStore('segment', () => {
       const updatedCount = Number(data.updated_count || 0)
       const errorCount = Number(data.error_count || 0)
       const total = Number(data.total || llmPlannedCount.value || updatedCount + errorCount)
-      llmPlannedCount.value = total
-      llmProcessedCount.value = Math.max(total, updatedCount + errorCount)
-      llmErrorCount.value = errorCount
-      llmMessage.value = translate('stores.segment.llmCompleted', {
-        updated: updatedCount,
-        error: errorCount,
-      })
-      pushToast({
-        tone: errorCount > 0 ? 'warn' : 'success',
-        title: translate('stores.segment.llmCompletedToastTitle'),
-        message: translate('stores.segment.llmCompletedToastMessage', {
-          updated: updatedCount,
-          error: errorCount,
-        }),
-      })
+      finishLLMCompletion(updatedCount, errorCount, total)
     }
   }
 
@@ -1500,19 +2444,31 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   async function splitSegment(sentenceId: string, splitOffset: number) {
-    if (!fileRecord.value) return null
+    const segmentKey = sentenceId
+    const index = getSegmentIndex(segmentKey)
+    if (index === -1) {
+      return null
+    }
+    const segment = segments.value[index]
+    const fileId = mergeViewId.value
+      ? (fileRecordIdForSegment(segment) ?? null)
+      : (fileRecord.value?.id ?? null)
+    if (!fileId) {
+      return null
+    }
     // 先同步未保存的修改
     if (dirtyCount.value > 0) {
       await syncToBackend()
     }
     const { data } = await http.post<{ first: Segment; second: Segment }>(
-      `/file-records/${fileRecord.value.id}/segments/${sentenceId}/split`,
+      `/file-records/${fileId}/segments/${segment.sentence_id}/split`,
       { split_offset: splitOffset },
     )
+    const firstSegment = withSegmentFileContext(data.first, fileId)
+    const secondSegment = withSegmentFileContext(data.second, fileId)
     // 更新本地 segments 列表
-    const index = getSegmentIndex(sentenceId)
     if (index !== -1) {
-      segments.value.splice(index, 1, data.first, data.second)
+      segments.value.splice(index, 1, firstSegment, secondSegment)
       rebuildSegmentIndexMap()
       totalSegmentCount.value += 1
       matchedSegmentCount.value += 1
@@ -1523,20 +2479,36 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   async function mergeSegment(sentenceId: string, targetSentenceId: string) {
-    if (!fileRecord.value) return null
+    const baseKey = sentenceId
+    const otherKey = targetSentenceId
+    const baseIndex = getSegmentIndex(baseKey)
+    if (baseIndex === -1) {
+      return null
+    }
+    const segment = segments.value[baseIndex]
+    const fileId = mergeViewId.value
+      ? (fileRecordIdForSegment(segment) ?? null)
+      : (fileRecord.value?.id ?? null)
+    if (!fileId) {
+      return null
+    }
+    // 合并模式下还原真实 sentence_id
+    const realBaseId = mergeViewId.value ? sentenceIdFromKey(baseKey) : baseKey
+    const realOtherId = mergeViewId.value ? sentenceIdFromKey(otherKey) : otherKey
     // 先同步未保存的修改
     if (dirtyCount.value > 0) {
       await syncToBackend()
     }
     const { data } = await http.post<{ merged: Segment; deleted_sentence_id: string }>(
-      `/file-records/${fileRecord.value.id}/segments/${sentenceId}/merge`,
-      { target_sentence_id: targetSentenceId },
+      `/file-records/${fileId}/segments/${realBaseId}/merge`,
+      { target_sentence_id: realOtherId },
     )
+    const mergedSegment = withSegmentFileContext(data.merged, fileId)
     // 更新本地 segments 列表
-    const firstIndex = getSegmentIndex(sentenceId)
-    const secondIndex = getSegmentIndex(targetSentenceId)
+    const firstIndex = getSegmentIndex(baseKey)
+    const secondIndex = getSegmentIndex(otherKey)
     if (firstIndex !== -1) {
-      segments.value[firstIndex] = data.merged
+      segments.value[firstIndex] = mergedSegment
     }
     if (secondIndex !== -1) {
       segments.value.splice(secondIndex, 1)
@@ -1561,6 +2533,7 @@ export const useSegmentStore = defineStore('segment', () => {
     previewSupported,
     activeSentenceId,
     activeSourceText,
+    activeFileRecordId,
     termMatchesMap,
     loading,
     loadingMoreSegments,
@@ -1595,14 +2568,26 @@ export const useSegmentStore = defineStore('segment', () => {
     previewUpdateToken,
     lastPreviewUpdatedSentenceId,
     lastPreviewUpdatedText,
+    revisionTrackingEnabled,
     revisionHistory,
+    revisionSettings,
     conflictEntries,
+    // 合并视图状态
+    mergeViewId,
+    mergeViewDetail,
+    mergeViewGroups,
+    segmentKeyOf,
     getPendingRevision,
     getRevisionTrace,
     startRevisionTracking,
     stopRevisionTracking,
     ensureRevisionTrackingBaselines,
+    fetchRevisionSettings,
+    saveRevisionSettings,
     loadTask,
+    loadMergeView,
+    refreshMergeViewPage,
+    refreshMergeViewDetail,
     loadSegmentPage,
     refreshCurrentSegmentPage,
     loadMoreSegments,
@@ -1614,7 +2599,9 @@ export const useSegmentStore = defineStore('segment', () => {
     updateTarget,
     updateSource,
     setProjectSyncDisabled,
+    disableProjectSyncForCurrentFile,
     setActiveSentence,
+    refreshActiveTermMatches,
     getTermMatches,
     syncToBackend,
     acceptRevision,

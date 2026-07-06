@@ -51,6 +51,13 @@ SEGMENT_ORDERING = (
     Segment.sentence_id.asc(),
 )
 
+PPTX_SEGMENT_ORDERING = (
+    Segment.sentence_id.asc(),
+    Segment.block_index.asc(),
+    Segment.row_index.asc().nullsfirst(),
+    Segment.cell_index.asc().nullsfirst(),
+)
+
 _PENDING_SOURCE_FILES_KEY = "pending_source_files"
 
 
@@ -60,6 +67,10 @@ class SegmentUpdateConflict:
     current_version: int
     attempted_version: int | None
     current_target_text: str
+    current_source: str | None = None
+    current_updated_at: datetime | None = None
+    current_last_modified_by_id: UUID | None = None
+    resolution: str = "conflict"
 
 
 @dataclass
@@ -173,6 +184,12 @@ def _count_filled_targets(items: list[dict]) -> int:
 
 def _count_confirmed_segments(items: list[dict]) -> int:
     return sum(1 for item in items if item.get("status") == "confirmed")
+
+
+def get_segment_ordering_for_file_record(file_record: FileRecord | None):
+    if file_record is not None and Path(file_record.filename or "").suffix.lower() == ".pptx":
+        return PPTX_SEGMENT_ORDERING
+    return SEGMENT_ORDERING
 
 
 def _record_initial_translation_events(db: Session, segments: list[Segment]) -> None:
@@ -748,7 +765,7 @@ def get_file_record_with_segments(
     base_query = db.query(Segment).filter(Segment.file_record_id == file_record_id)
     total_segments = base_query.count()
 
-    segments_query = base_query.order_by(*SEGMENT_ORDERING)
+    segments_query = base_query.order_by(*get_segment_ordering_for_file_record(file_record))
     if safe_skip:
         segments_query = segments_query.offset(safe_skip)
     if limit is not None:
@@ -781,10 +798,11 @@ def list_segments_for_file_record(
     db: Session,
     file_record_id: UUID,
 ) -> list[Segment]:
+    file_record = get_file_record(db, file_record_id)
     return (
         db.query(Segment)
         .filter(Segment.file_record_id == file_record_id)
-        .order_by(*SEGMENT_ORDERING)
+        .order_by(*get_segment_ordering_for_file_record(file_record))
         .all()
     )
 
@@ -794,6 +812,7 @@ def list_segments_for_llm_translation(
     file_record_id: UUID,
     scope: str = "all",
 ) -> list[Segment]:
+    file_record = get_file_record(db, file_record_id)
     statuses_by_scope = {
         "fuzzy_only": ["fuzzy"],
         "none_only": ["none"],
@@ -805,9 +824,9 @@ def list_segments_for_llm_translation(
             db.query(Segment)
             .filter(
                 Segment.file_record_id == file_record_id,
-                func.trim(Segment.target_text) == "",
+                func.coalesce(Segment.target_text, "") == "",
             )
-            .order_by(*SEGMENT_ORDERING)
+            .order_by(*get_segment_ordering_for_file_record(file_record))
             .all()
         )
 
@@ -821,7 +840,7 @@ def list_segments_for_llm_translation(
             Segment.file_record_id == file_record_id,
             Segment.status.in_(statuses),
         )
-        .order_by(*SEGMENT_ORDERING)
+        .order_by(*get_segment_ordering_for_file_record(file_record))
         .all()
     )
 
@@ -856,7 +875,14 @@ def _clean_segment_target_for_automatic_numbering(
     *,
     clean_numbering: bool | None = None,
 ) -> tuple[str, str | None]:
-    original_target_text = target_text or ""
+    original_target_text, target_html = _normalize_segment_target_for_save(
+        segment,
+        target_text,
+        target_html,
+    )
+    if original_target_text and not original_target_text.strip():
+        return original_target_text, None
+
     should_clean = clean_numbering
     if should_clean is None:
         should_clean = is_word_document_filename(
@@ -872,6 +898,39 @@ def _clean_segment_target_for_automatic_numbering(
     )
     cleaned_target_html = None if cleaned_target_text != original_target_text else target_html
     return cleaned_target_text, cleaned_target_html
+
+
+def _normalize_segment_target_for_save(
+    segment: Segment,
+    target_text: str | None,
+    target_html: str | None,
+) -> tuple[str, str | None]:
+    if target_text is None or target_text == "":
+        return segment.source_text or segment.display_text or "", None
+    return target_text, target_html
+
+
+MACHINE_SEGMENT_SOURCES = {"llm", "tm", "project_sync", "none", ""}
+
+
+def _mark_segment_modified_by(segment: Segment, current_user: User | None) -> None:
+    segment.last_modified_by_id = current_user.id if current_user else None
+
+
+def _can_auto_merge_stale_segment(
+    segment: Segment,
+    *,
+    incoming_source: str,
+    current_user: User | None,
+    target_text: str,
+) -> bool:
+    if (segment.target_text or "") == (target_text or ""):
+        return True
+    if current_user is not None and segment.last_modified_by_id == current_user.id:
+        return True
+    if incoming_source == "manual" and (segment.source or "") in MACHINE_SEGMENT_SOURCES:
+        return True
+    return False
 
 
 def update_segment_target(
@@ -899,6 +958,7 @@ def update_segment_target(
     segment.target_text = target_text
     segment.target_html = target_html if target_html else None
     segment.source = source
+    _mark_segment_modified_by(segment, current_user)
     segment.version = int(segment.version or 1) + 1
     segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
     if source == "llm":
@@ -966,6 +1026,7 @@ def update_segment_by_sentence_id(
     segment.target_text = target_text
     segment.target_html = target_html if target_html else None
     segment.source = source
+    _mark_segment_modified_by(segment, current_user)
     segment.version = int(segment.version or 1) + 1
     segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
     if source == "llm":
@@ -1008,6 +1069,7 @@ def update_segment_source_text(
     file_record_id: UUID,
     sentence_id: str,
     source_text: str,
+    current_user: User | None = None,
 ) -> Segment | None:
     """更新片段的原文"""
     segment = (
@@ -1022,6 +1084,8 @@ def update_segment_source_text(
     segment.source_hash = build_source_hash(source_text)
     segment.display_text = source_text
     segment.source_html = None
+    _mark_segment_modified_by(segment, current_user)
+    segment.version = int(segment.version or 1) + 1
     db.commit()
     db.refresh(segment)
     return segment
@@ -1087,32 +1151,42 @@ def batch_update_segments(
         base_version = item.get("base_version")
         attempted_version = int(base_version) if base_version is not None else None
         current_version = int(segment.version or 1)
-        if attempted_version is not None and attempted_version != current_version:
-            conflicts.append(
-                SegmentUpdateConflict(
-                    sentence_id=segment.sentence_id,
-                    current_version=current_version,
-                    attempted_version=attempted_version,
-                    current_target_text=segment.target_text or "",
-                )
-            )
-            continue
-
-        before_text = segment.target_text
         target_text = item.get("target_text", "")
         target_html = item.get("target_html")
+        source = item.get("source", "manual")
+        if attempted_version is not None and attempted_version != current_version:
+            if not _can_auto_merge_stale_segment(
+                segment,
+                incoming_source=source,
+                current_user=current_user,
+                target_text=target_text,
+            ):
+                conflicts.append(
+                    SegmentUpdateConflict(
+                        sentence_id=segment.sentence_id,
+                        current_version=current_version,
+                        attempted_version=attempted_version,
+                        current_target_text=segment.target_text or "",
+                        current_source=segment.source,
+                        current_updated_at=segment.updated_at,
+                        current_last_modified_by_id=segment.last_modified_by_id,
+                    )
+                )
+                continue
+
+        before_text = segment.target_text
         target_text, target_html = _clean_segment_target_for_automatic_numbering(
             segment,
             target_text,
             target_html,
             clean_numbering=clean_numbering,
         )
-        source = item.get("source", "manual")
         track_revision = bool(item.get("track_revision", True))
         confirm = bool(item.get("confirm", False))
         segment.target_text = target_text
         segment.target_html = target_html if target_html else None
         segment.source = source
+        _mark_segment_modified_by(segment, current_user)
         segment.version = current_version + 1
         segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
         if source == "llm":

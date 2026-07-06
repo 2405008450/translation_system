@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS projects (
     creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
     deadline TIMESTAMP,
     access_level VARCHAR(20) NOT NULL DEFAULT 'team',
+    auto_tm_enabled BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -31,6 +32,7 @@ ALTER TABLE file_records ADD COLUMN IF NOT EXISTS collection_id UUID REFERENCES 
 ALTER TABLE file_records ADD COLUMN IF NOT EXISTS term_base_id UUID REFERENCES term_bases(id) ON DELETE SET NULL;
 ALTER TABLE file_records ADD COLUMN IF NOT EXISTS deadline TIMESTAMP;
 ALTER TABLE file_records ADD COLUMN IF NOT EXISTS access_level VARCHAR(20) NOT NULL DEFAULT 'team';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS auto_tm_enabled BOOLEAN NOT NULL DEFAULT TRUE;
 
 CREATE INDEX IF NOT EXISTS ix_projects_creator_id ON projects(creator_id);
 CREATE INDEX IF NOT EXISTS ix_projects_status ON projects(status);

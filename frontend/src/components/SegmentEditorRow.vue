@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { Link2, Link2Off } from 'lucide-vue-next'
-import { computed, onMounted, ref, watch, nextTick } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch, nextTick } from 'vue'
 
 import InteractiveDiffText from './InteractiveDiffText.vue'
 
 import { getLLMModelShortLabel } from '../constants/llm'
 import { getSegmentSourceMeta, getSegmentStatusMeta } from '../constants/status'
-import type { Segment, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
+import type { RevisionDisplaySettings, Segment, SegmentQAIssue, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
+import { findTermTextRanges } from '../utils/termMatching'
 import { computeDiff } from '../utils/textDiff'
 import type { TextFormat } from '../composables/useRichTextEditor'
 
@@ -18,21 +19,29 @@ const props = withDefaults(defineProps<{
   sourceEditing?: boolean
   selected?: boolean
   pendingRevision?: SegmentRevisionEntry | null
+  revisionSettings?: RevisionDisplaySettings | null
   revisionBusy?: boolean
   matchedTerms?: TermEntryRecord[]
+  qaIssues?: SegmentQAIssue[]
   sourceSearchQuery?: string
   targetSearchQuery?: string
+  searchCaseSensitive?: boolean
   showVisibleChars?: boolean
   pendingFormats?: Record<TextFormat, boolean> & { _overrideActive?: boolean }
+  /** 句段对外标识：单文件模式即 sentence_id；合并模式为复合键 ${file_record_id}:${sentence_id} */
+  segmentKey?: string
 }>(), {
   disabled: false,
   sourceEditing: false,
   selected: false,
   pendingRevision: null,
+  revisionSettings: null,
   revisionBusy: false,
   matchedTerms: () => [],
+  qaIssues: () => [],
   sourceSearchQuery: '',
   targetSearchQuery: '',
+  searchCaseSensitive: false,
   showVisibleChars: false,
   pendingFormats: () => ({
     bold: false,
@@ -43,6 +52,7 @@ const props = withDefaults(defineProps<{
     superscript: false,
     _overrideActive: false,
   }),
+  segmentKey: '',
 })
 
 const emit = defineEmits<{
@@ -60,8 +70,12 @@ const sourceEditorRef = ref<HTMLDivElement | null>(null)
 const isFocused = ref(false)
 const isSourceFocused = ref(false)
 const isComposing = ref(false)
+
+// 对外标识：合并视图使用复合键，单文件回退为 sentence_id
+const segmentKey = computed(() => props.segmentKey || props.segment.sentence_id)
 const MAX_EDITOR_HISTORY_SIZE = 100
 const EDITOR_HISTORY_GROUP_TIMEOUT_MS = 1200
+const REVISION_RERENDER_DEBOUNCE_MS = 150
 const EDITOR_HISTORY_WORD_BOUNDARY_REGEXP = /[\s.,!?;:\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A]/
 
 interface EditorHistorySnapshot {
@@ -76,8 +90,25 @@ interface HistoryRecordOptions {
   data?: string | null
 }
 
-type HighlightKind = 'term' | 'search'
-type HighlightPart = { text: string; highlight: boolean; kind?: HighlightKind }
+interface EditorUndoBoundaryOptions {
+  inputType?: string
+  data?: string | null
+  preserveNextTargetSync?: boolean
+}
+
+interface CommittedEditorContent {
+  sentenceId: string
+  text: string
+  html: string | null
+}
+
+interface EditorTextRange {
+  start: number
+  end: number
+}
+
+type HighlightKind = 'term' | 'search' | 'qa'
+type HighlightPart = { text: string; highlight: boolean; kind?: HighlightKind; title?: string }
 type BasicFormatTag = 'b' | 'i' | 'u' | 's' | 'sub' | 'sup'
 
 const BASIC_FORMAT_TAGS = ['b', 'strong', 'i', 'em', 'u', 's', 'strike', 'del', 'sub', 'sup']
@@ -88,8 +119,11 @@ const undoStack = ref<EditorHistorySnapshot[]>([])
 const redoStack = ref<EditorHistorySnapshot[]>([])
 const isApplyingHistory = ref(false)
 const compositionSnapshotRecorded = ref(false)
+const lastTargetSelectionRange = ref<EditorTextRange | null>(null)
 let lastHistorySnapshotAt = 0
 let lastHistoryInputKind = ''
+let preserveNextTargetSync = false
+let revisionRerenderTimer: ReturnType<typeof setTimeout> | null = null
 const canUndoEditorChange = computed(() => undoStack.value.length > 0)
 const canRedoEditorChange = computed(() => redoStack.value.length > 0)
 
@@ -98,7 +132,7 @@ const parityClass = computed(() => (props.index % 2 === 0 ? 'segment-row--odd' :
 const sourceClass = computed(() => `segment-row__tag--source-${props.segment.source || 'none'}`)
 const isEmptyTarget = computed(() => {
   const targetText = props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
-  return targetText.trim().length === 0
+  return targetText.length === 0
 })
 const statusMeta = computed(() => getSegmentStatusMeta(props.segment.status))
 const sourceMeta = computed(() => getSegmentSourceMeta(props.segment.source))
@@ -127,7 +161,7 @@ const showSourceTag = computed(() => {
   }
   return props.segment.status !== 'none' && props.segment.status !== 'fuzzy'
 })
-const showProjectSyncToggle = computed(() => props.segment.source === 'project_sync' || Boolean(props.segment.project_sync_disabled))
+const showProjectSyncToggle = computed(() => true)
 const projectSyncToggleLabel = computed(() => (
   props.segment.project_sync_disabled ? '开启同步' : '关闭同步'
 ))
@@ -145,6 +179,35 @@ const hasPendingRevision = computed(() => Boolean(props.pendingRevision))
 const revisionAuthorClass = computed(() => (
   revisionAuthorRole.value === 'user' ? 'is-revision-author-user' : 'is-revision-author-admin'
 ))
+const revisionInsertColor = computed(() => {
+  const settings = props.revisionSettings
+  const authorId = props.pendingRevision?.author?.id || ''
+  return settings?.author_colors?.[authorId]?.insert || settings?.default_insert_color || '#2563eb'
+})
+const revisionDeleteColor = computed(() => {
+  const settings = props.revisionSettings
+  const authorId = props.pendingRevision?.author?.id || ''
+  return settings?.author_colors?.[authorId]?.delete || settings?.default_delete_color || '#dc2626'
+})
+const revisionColorStyle = computed(() => (
+  hasPendingRevision.value
+    ? {
+      '--rev-insert-color': revisionInsertColor.value,
+      '--rev-delete-color': revisionDeleteColor.value,
+    }
+    : {}
+))
+const revisionTooltip = computed(() => {
+  if (!props.pendingRevision || props.revisionSettings?.show_author_time === false) {
+    return ''
+  }
+  const author = props.pendingRevision.author
+  const authorName = author?.nickname || author?.username || '未知用户'
+  const createdAt = props.pendingRevision.created_at
+    ? new Date(props.pendingRevision.created_at).toLocaleString('zh-CN', { hour12: false })
+    : ''
+  return createdAt ? `${authorName} · ${createdAt}` : authorName
+})
 const scorePercent = computed(() => {
   if (!props.segment.score || props.segment.score <= 0) return null
   return Math.round(props.segment.score * 100)
@@ -165,24 +228,19 @@ function highlightText(
     (a, b) => b[field].length - a[field].length
   )
 
-  // 找出所有匹配位置
   const matches: Array<{ start: number; end: number }> = []
-  const lowerText = text.toLowerCase()
 
   for (const term of sortedTerms) {
     const termText = term[field]
     if (!termText) continue
-    const lowerTerm = termText.toLowerCase()
-    let pos = 0
-    while ((pos = lowerText.indexOf(lowerTerm, pos)) !== -1) {
+    for (const range of findTermTextRanges(text, termText)) {
       // 检查是否与已有匹配重叠
       const overlaps = matches.some(
-        (m) => !(pos + lowerTerm.length <= m.start || pos >= m.end)
+        (m) => !(range.end <= m.start || range.start >= m.end)
       )
       if (!overlaps) {
-        matches.push({ start: pos, end: pos + lowerTerm.length })
+        matches.push(range)
       }
-      pos += 1
     }
   }
 
@@ -217,13 +275,17 @@ function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-function highlightSearchText(text: string, keyword: string): HighlightPart[] | null {
-  const query = keyword.trim()
+function resolveSearchKeyword(value: string) {
+  return value
+}
+
+function highlightSearchText(text: string, keyword: string, caseSensitive = false): HighlightPart[] | null {
+  const query = resolveSearchKeyword(keyword)
   if (!text || !query) {
     return null
   }
 
-  const regexp = new RegExp(escapeRegExp(query), 'gi')
+  const regexp = new RegExp(escapeRegExp(query), caseSensitive ? 'g' : 'gi')
   const matches = Array.from(text.matchAll(regexp))
     .map((match) => ({
       start: match.index ?? 0,
@@ -269,14 +331,71 @@ const sourceTextContent = computed(() => {
 
 const highlightedSourceText = computed(() => {
   const text = sourceTextContent.value
-  return highlightSearchText(text, props.sourceSearchQuery) || highlightText(text, props.matchedTerms || [], 'source_text')
+  return highlightSearchText(text, props.sourceSearchQuery, props.searchCaseSensitive) || highlightText(text, props.matchedTerms || [], 'source_text')
 })
 
 // 高亮译文中匹配的术语
 const highlightedTargetText = computed(() => {
   const text = props.segment.target_text || ''
-  return highlightSearchText(text, props.targetSearchQuery) || highlightText(text, props.matchedTerms || [], 'target_text')
+  return getTargetHighlightParts(text)
 })
+
+const activeQAIssues = computed(() => {
+  const textLength = (props.segment.target_text || '').length
+  return (props.qaIssues || props.segment.qa_issues || [])
+    .filter((issue) => issue.status === 'open' && issue.length > 0 && issue.offset < textLength)
+    .map((issue) => ({
+      ...issue,
+      offset: Math.max(0, issue.offset),
+      length: Math.min(issue.length, Math.max(0, textLength - Math.max(0, issue.offset))),
+    }))
+    .filter((issue) => issue.length > 0)
+    .sort((a, b) => a.offset - b.offset || b.length - a.length)
+})
+
+function highlightQAText(text: string, issues: SegmentQAIssue[]): HighlightPart[] | null {
+  if (!text || issues.length === 0) {
+    return null
+  }
+
+  const ranges: Array<{ start: number; end: number; title: string }> = []
+  for (const issue of issues) {
+    const start = Math.max(0, issue.offset)
+    const end = Math.min(text.length, start + Math.max(0, issue.length))
+    if (end <= start) continue
+    const overlaps = ranges.some((range) => !(end <= range.start || start >= range.end))
+    if (overlaps) continue
+    ranges.push({
+      start,
+      end,
+      title: issue.short_message || issue.message || '拼写/语法问题',
+    })
+  }
+
+  if (ranges.length === 0) {
+    return null
+  }
+  ranges.sort((a, b) => a.start - b.start)
+
+  const parts: HighlightPart[] = []
+  let lastEnd = 0
+  for (const range of ranges) {
+    if (range.start > lastEnd) {
+      parts.push({ text: text.slice(lastEnd, range.start), highlight: false })
+    }
+    parts.push({
+      text: text.slice(range.start, range.end),
+      highlight: true,
+      kind: 'qa',
+      title: range.title,
+    })
+    lastEnd = range.end
+  }
+  if (lastEnd < text.length) {
+    parts.push({ text: text.slice(lastEnd), highlight: false })
+  }
+  return parts
+}
 
 // 生成带高亮的 HTML
 const targetHtmlContent = computed(() => {
@@ -296,10 +415,12 @@ const editorHtmlContent = computed(() => {
   return computeDiff(revision.before_text || '', revision.after_text || '')
     .map((segment) => {
       const editableAttr = segment.type === 'delete' ? ' contenteditable="false"' : ''
+      const titleAttr = revisionTooltip.value ? ` title="${escapeHtml(revisionTooltip.value)}"` : ''
       return [
         `<span class="segment-row__revision-segment segment-row__revision-${segment.type}"`,
         ` data-revision-type="${segment.type}"`,
         ` data-testid="segment-revision-${segment.type}"`,
+        titleAttr,
         editableAttr,
         '>',
         renderTargetTextHtml(segment.text),
@@ -317,12 +438,18 @@ function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;')
 }
 
+function escapeAttribute(text: string): string {
+  return escapeHtml(text).replace(/'/g, '&#39;')
+}
+
 function renderHighlightPartsAsHtml(parts: HighlightPart[] | null, text: string): string {
   const sourceParts: HighlightPart[] = parts || [{ text, highlight: false }]
   return sourceParts
     .map((seg) =>
       seg.highlight
-        ? `<mark class="${seg.kind === 'search' ? 'segment-row__search-highlight' : 'segment-row__term-highlight'}">${textToVisibleChars(seg.text)}</mark>`
+        ? seg.kind === 'qa'
+          ? `<span class="segment-row__qa-highlight" title="${escapeAttribute(seg.title || '拼写/语法问题')}">${textToVisibleChars(seg.text)}</span>`
+          : `<mark class="${seg.kind === 'search' ? 'segment-row__search-highlight' : 'segment-row__term-highlight'}">${textToVisibleChars(seg.text)}</mark>`
         : textToVisibleChars(seg.text)
     )
     .join('')
@@ -330,33 +457,60 @@ function renderHighlightPartsAsHtml(parts: HighlightPart[] | null, text: string)
 
 function renderSourceTextWithHighlights(text: string): string {
   return renderHighlightPartsAsHtml(
-    highlightSearchText(text, props.sourceSearchQuery)
+    highlightSearchText(text, props.sourceSearchQuery, props.searchCaseSensitive)
       || highlightText(text, props.matchedTerms || [], 'source_text'),
     text,
   )
 }
 
 function hasSourceHighlights(): boolean {
-  return Boolean(props.sourceSearchQuery.trim()) || (props.matchedTerms || []).some((term) => Boolean(term.source_text))
+  return Boolean(resolveSearchKeyword(props.sourceSearchQuery)) || (props.matchedTerms || []).some((term) => Boolean(term.source_text))
 }
 
 function renderTargetTextWithHighlights(text: string): string {
-  const parts = highlightSearchText(text, props.targetSearchQuery)
-    || highlightText(text, props.matchedTerms || [], 'target_text')
+  const parts = getTargetHighlightParts(text)
   if (!parts) {
     return textToVisibleChars(text)
   }
-  return parts
-    .map((seg) =>
-      seg.highlight
-        ? `<mark class="${seg.kind === 'search' ? 'segment-row__search-highlight' : 'segment-row__term-highlight'}">${textToVisibleChars(seg.text)}</mark>`
-        : textToVisibleChars(seg.text)
-    )
-    .join('')
+  return renderHighlightPartsAsHtml(parts, text)
 }
 
-function hasTargetHighlights(): boolean {
-  return Boolean(props.targetSearchQuery.trim()) || (props.matchedTerms || []).some((term) => Boolean(term.target_text))
+function shouldRenderTargetHighlights(): boolean {
+  return !isFocused.value
+}
+
+function getTargetHighlightParts(text: string): HighlightPart[] | null {
+  if (!shouldRenderTargetHighlights()) {
+    return null
+  }
+  return highlightSearchText(text, props.targetSearchQuery, props.searchCaseSensitive)
+    || highlightText(text, props.matchedTerms || [], 'target_text')
+    || highlightQAText(text, activeQAIssues.value)
+}
+
+function hasTargetHighlightSources(): boolean {
+  return Boolean(resolveSearchKeyword(props.targetSearchQuery))
+    || (props.matchedTerms || []).some((term) => Boolean(term.target_text))
+    || activeQAIssues.value.length > 0
+}
+
+function hasRenderedTargetHighlights(): boolean {
+  return shouldRenderTargetHighlights() && hasTargetHighlightSources()
+}
+
+function hasRenderedEditorDecorations(): boolean {
+  return Boolean(props.pendingRevision) || props.showVisibleChars || hasRenderedTargetHighlights()
+}
+
+function editorHasDecorationNodes(editor: HTMLElement): boolean {
+  return Boolean(editor.querySelector([
+    '[data-revision-type]',
+    '.segment-row__revision-segment',
+    '.segment-row__term-highlight',
+    '.segment-row__search-highlight',
+    '.segment-row__qa-highlight',
+    '.visible-char',
+  ].join(',')))
 }
 
 function renderSourceHtmlWithHighlights(sourceHtml: string): string {
@@ -390,6 +544,7 @@ function renderSourceHtmlWithHighlights(sourceHtml: string): string {
       || element.classList.contains('doc-math')
       || element.classList.contains('segment-row__term-highlight')
       || element.classList.contains('segment-row__search-highlight')
+      || element.classList.contains('segment-row__qa-highlight')
     ) {
       return
     }
@@ -402,7 +557,7 @@ function renderSourceHtmlWithHighlights(sourceHtml: string): string {
 }
 
 function renderTargetHtmlWithHighlights(targetHtml: string): string {
-  if (!hasTargetHighlights() || typeof document === 'undefined') {
+  if (!hasRenderedTargetHighlights() || typeof document === 'undefined') {
     return targetHtml
   }
 
@@ -430,6 +585,7 @@ function renderTargetHtmlWithHighlights(targetHtml: string): string {
       || element.classList.contains('doc-math')
       || element.classList.contains('segment-row__term-highlight')
       || element.classList.contains('segment-row__search-highlight')
+      || element.classList.contains('segment-row__qa-highlight')
     ) {
       return
     }
@@ -611,15 +767,7 @@ function serializeEditorContentWithFormat(node: Node): string {
   return ''
 }
 
-function saveSerializableCaretPosition(el: HTMLElement): number {
-  const selection = window.getSelection()
-  if (!selection || selection.rangeCount === 0) return 0
-
-  const range = selection.getRangeAt(0)
-  if (!el.contains(range.startContainer)) {
-    return 0
-  }
-
+function getSerializableOffsetForPosition(el: HTMLElement, container: Node, positionOffset: number): number {
   let offset = 0
   let found = false
 
@@ -628,13 +776,13 @@ function saveSerializableCaretPosition(el: HTMLElement): number {
       return true
     }
 
-    if (node === range.startContainer) {
+    if (node === container) {
       if (node.nodeType === Node.TEXT_NODE) {
         offset += isRevisionDeleteNode(node)
           ? 0
-          : (node.textContent || '').slice(0, range.startOffset).length
+          : (node.textContent || '').slice(0, positionOffset).length
       } else {
-        const children = Array.from(node.childNodes).slice(0, range.startOffset)
+        const children = Array.from(node.childNodes).slice(0, positionOffset)
         offset += children.reduce((total, child) => total + getSerializableNodeLength(child), 0)
       }
       found = true
@@ -658,55 +806,125 @@ function saveSerializableCaretPosition(el: HTMLElement): number {
   return offset
 }
 
-function restoreSerializableCaretPosition(el: HTMLElement, offset: number) {
+function saveSerializableCaretPosition(el: HTMLElement): number {
   const selection = window.getSelection()
-  if (!selection) return
+  if (!selection || selection.rangeCount === 0) return 0
 
-  const range = document.createRange()
+  const range = selection.getRangeAt(0)
+  if (!el.contains(range.startContainer)) {
+    return 0
+  }
+
+  return getSerializableOffsetForPosition(el, range.startContainer, range.startOffset)
+}
+
+function getSerializableSelectionRange(el: HTMLElement): EditorTextRange | null {
+  const selection = window.getSelection()
+  if (!selection || selection.rangeCount === 0) return null
+
+  const range = selection.getRangeAt(0)
+  if (!el.contains(range.startContainer) || !el.contains(range.endContainer)) {
+    return null
+  }
+
+  const start = getSerializableOffsetForPosition(el, range.startContainer, range.startOffset)
+  const end = getSerializableOffsetForPosition(el, range.endContainer, range.endOffset)
+  return {
+    start: Math.min(start, end),
+    end: Math.max(start, end),
+  }
+}
+
+function getNodeIndex(node: Node): number {
+  return Array.from(node.parentNode?.childNodes || []).findIndex((child) => child === node)
+}
+
+function resolveSerializablePosition(el: HTMLElement, targetOffset: number): { node: Node; offset: number } {
+  const normalizedOffset = Math.max(0, targetOffset)
   let currentOffset = 0
-  let found = false
+  let fallback: { node: Node; offset: number } = { node: el, offset: el.childNodes.length }
+  let resolved: { node: Node; offset: number } | null = null
 
   function traverse(node: Node): boolean {
     if (isRevisionDeleteNode(node)) {
       return false
     }
+
     if (node.nodeType === Node.TEXT_NODE) {
       const textLength = node.textContent?.length || 0
-      if (currentOffset + textLength >= offset) {
-        range.setStart(node, offset - currentOffset)
-        range.collapse(true)
+      if (currentOffset + textLength >= normalizedOffset) {
+        resolved = {
+          node,
+          offset: Math.max(0, Math.min(textLength, normalizedOffset - currentOffset)),
+        }
         return true
       }
       currentOffset += textLength
-    } else if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR') {
-      if (currentOffset + 1 >= offset) {
-        range.setStartBefore(node)
-        range.collapse(true)
+      fallback = { node, offset: textLength }
+      return false
+    }
+
+    if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR') {
+      const parent = node.parentNode || el
+      const index = Math.max(0, getNodeIndex(node))
+      if (currentOffset + 1 >= normalizedOffset) {
+        resolved = { node: parent, offset: index }
         return true
       }
       currentOffset += 1
-    } else {
-      for (const child of Array.from(node.childNodes)) {
-        if (traverse(child)) return true
-      }
+      fallback = { node: parent, offset: index + 1 }
+      return false
     }
-    return false
+
+    return Array.from(node.childNodes).some((child) => {
+      if (traverse(child)) {
+        return true
+      }
+      return false
+    })
   }
 
-  found = traverse(el)
-  if (!found) {
-    range.selectNodeContents(el)
-    range.collapse(false)
-  }
+  traverse(el)
+  return resolved || fallback
+}
+
+function restoreSerializableCaretPosition(el: HTMLElement, offset: number) {
+  const selection = window.getSelection()
+  if (!selection) return
+
+  const range = document.createRange()
+  const position = resolveSerializablePosition(el, offset)
+  range.setStart(position.node, position.offset)
+  range.collapse(true)
 
   selection.removeAllRanges()
   selection.addRange(range)
+}
+
+function restoreSerializableSelectionRange(el: HTMLElement, textRange: EditorTextRange): boolean {
+  const selection = window.getSelection()
+  if (!selection) return false
+
+  const start = Math.max(0, Math.min(textRange.start, textRange.end))
+  const end = Math.max(start, textRange.end)
+  const startPosition = resolveSerializablePosition(el, start)
+  const endPosition = resolveSerializablePosition(el, end)
+  const range = document.createRange()
+  range.setStart(startPosition.node, startPosition.offset)
+  range.setEnd(endPosition.node, endPosition.offset)
+  selection.removeAllRanges()
+  selection.addRange(range)
+  return true
 }
 
 function getCurrentEditorText(): string {
   if (editorRef.value) {
     return serializeEditorContent(editorRef.value)
   }
+  return getTargetStateText()
+}
+
+function getTargetStateText(): string {
   return props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
 }
 
@@ -716,6 +934,27 @@ function getCurrentEditorHtml(): string | null {
   }
   const html = serializeEditorContentWithFormat(editorRef.value)
   return /<(b|strong|i|em|u|s|strike|del|sub|sup)>/i.test(html) ? html : null
+}
+
+function commitEditorContent(): CommittedEditorContent | null {
+  if (!editorRef.value || isApplyingHistory.value || isComposing.value) {
+    return null
+  }
+
+  const text = serializeEditorContent(editorRef.value)
+  const html = getCurrentEditorHtml()
+  const currentText = props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
+  const currentHtml = props.segment.target_html || null
+
+  if (text !== currentText || html !== currentHtml) {
+    emit('update', segmentKey.value, text, html || undefined)
+  }
+
+  return {
+    sentenceId: segmentKey.value,
+    text,
+    html,
+  }
 }
 
 function getCurrentEditorSnapshot(): EditorHistorySnapshot {
@@ -732,12 +971,13 @@ function getCurrentEditorSnapshot(): EditorHistorySnapshot {
 function pushHistorySnapshot(stack: EditorHistorySnapshot[], snapshot: EditorHistorySnapshot) {
   const lastSnapshot = stack[stack.length - 1]
   if (lastSnapshot?.text === snapshot.text && lastSnapshot.html === snapshot.html) {
-    return
+    return false
   }
   stack.push(snapshot)
   if (stack.length > MAX_EDITOR_HISTORY_SIZE) {
     stack.shift()
   }
+  return true
 }
 
 function clearEditorHistory() {
@@ -804,22 +1044,88 @@ function shouldStartNewHistoryGroup(options: HistoryRecordOptions) {
 
 function recordUndoSnapshot(clearRedo = true, options: HistoryRecordOptions = {}) {
   if (props.disabled || !editorRef.value || isApplyingHistory.value || isComposing.value) {
-    return
+    return false
   }
   if (!shouldStartNewHistoryGroup(options)) {
-    return
+    return false
   }
-  pushHistorySnapshot(undoStack.value, getCurrentEditorSnapshot())
+  const recorded = pushHistorySnapshot(undoStack.value, getCurrentEditorSnapshot())
   lastHistorySnapshotAt = Date.now()
   lastHistoryInputKind = getHistoryInputKind(options.inputType)
   if (clearRedo) {
     redoStack.value = []
   }
+  return recorded
+}
+
+function recordEditorUndoBoundary(options: EditorUndoBoundaryOptions = {}) {
+  if (props.disabled || !editorRef.value || isApplyingHistory.value || isComposing.value) {
+    return false
+  }
+  const recorded = recordUndoSnapshot(true, {
+    inputType: options.inputType || 'programmaticEdit',
+    data: options.data,
+    force: true,
+  })
+  if (options.preserveNextTargetSync) {
+    preserveNextTargetSync = true
+  }
+  return recorded
+}
+
+function cacheTargetSelectionFromDom() {
+  const editor = editorRef.value
+  if (!editor) {
+    return
+  }
+  const textRange = getSerializableSelectionRange(editor)
+  if (textRange) {
+    lastTargetSelectionRange.value = textRange
+  }
+}
+
+function insertOrReplaceTargetText(text: string): boolean {
+  const editor = editorRef.value
+  if (!editor || props.disabled || isApplyingHistory.value || isComposing.value || !text) {
+    return false
+  }
+
+  const activeRange = getSerializableSelectionRange(editor)
+  const textRange = activeRange
+    || lastTargetSelectionRange.value
+    || {
+      start: getCurrentEditorText().length,
+      end: getCurrentEditorText().length,
+    }
+
+  recordEditorUndoBoundary({
+    inputType: 'insertTargetTextFromMatchPanel',
+    data: text,
+    preserveNextTargetSync: true,
+  })
+  editor.focus({ preventScroll: true })
+  restoreSerializableSelectionRange(editor, textRange)
+  document.execCommand('insertText', false, text)
+  const caretOffset = Math.min(textRange.start, textRange.end) + text.length
+  lastTargetSelectionRange.value = { start: caretOffset, end: caretOffset }
+  handleInput()
+  return true
+}
+
+function shouldPreserveHistoryForStateSync() {
+  if (preserveNextTargetSync || isFocused.value || isApplyingHistory.value) {
+    return true
+  }
+  if (!editorRef.value) {
+    return false
+  }
+  const stateText = props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
+  return serializeEditorContent(editorRef.value) === stateText
 }
 
 function applyHistorySnapshot(snapshot: EditorHistorySnapshot) {
   isApplyingHistory.value = true
-  emit('update', props.segment.sentence_id, snapshot.text, snapshot.html || undefined)
+  emit('update', segmentKey.value, snapshot.text, snapshot.html || undefined)
   void nextTick(() => {
     if (editorRef.value) {
       editorRef.value.innerHTML = editorHtmlContent.value
@@ -855,29 +1161,44 @@ function redoEditorChange() {
 
 function handleFocus() {
   isFocused.value = true
-  emit('focus', props.segment.sentence_id)
+  emit('focus', segmentKey.value)
+  cacheTargetSelectionFromDom()
 }
 
 function handleBlur() {
+  clearRevisionRerenderTimer()
+  cacheTargetSelectionFromDom()
+  commitEditorContent()
   isFocused.value = false
   resetHistoryGroup()
   void nextTick(() => syncEditorHtmlFromState(false))
 }
 
-function handleClick(event?: MouseEvent) {
+function isSegmentMultiSelectEvent(event?: MouseEvent) {
+  return Boolean(event && (event.ctrlKey || event.metaKey || event.shiftKey))
+}
+
+function handleSelectMouseDown(event: MouseEvent) {
+  if (isSegmentMultiSelectEvent(event)) {
+    event.preventDefault()
+  }
+}
+
+function handleClick(event: MouseEvent) {
   resetHistoryGroup()
-  if (event && (event.ctrlKey || event.metaKey)) {
-    emit('ctrlClick', props.segment.sentence_id, event)
+  if (isSegmentMultiSelectEvent(event)) {
+    emit('ctrlClick', segmentKey.value, event)
     return
   }
-  emit('activateTarget', props.segment.sentence_id)
+  cacheTargetSelectionFromDom()
+  emit('activateTarget', segmentKey.value)
 }
 
 function handleProjectSyncToggle() {
   if (props.disabled) {
     return
   }
-  emit('toggleProjectSync', props.segment.sentence_id, !props.segment.project_sync_disabled)
+  emit('toggleProjectSync', segmentKey.value, !props.segment.project_sync_disabled)
 }
 
 function handleSourceFocus() {
@@ -896,7 +1217,7 @@ function handleSourceInput() {
     return
   }
   const text = sourceEditorRef.value.textContent || ''
-  emit('updateSource', props.segment.sentence_id, text)
+  emit('updateSource', segmentKey.value, text)
 }
 
 function handleSourceBeforeInput(event: Event) {
@@ -915,8 +1236,11 @@ function handleSourceKeydown(event: KeyboardEvent) {
   }
 }
 
-function handleEditorShellClick() {
-  handleClick()
+function handleEditorShellClick(event: MouseEvent) {
+  handleClick(event)
+  if (isSegmentMultiSelectEvent(event)) {
+    return
+  }
   void nextTick(() => {
     editorRef.value?.focus({ preventScroll: true })
   })
@@ -970,9 +1294,45 @@ function handleBeforeInput(event: Event) {
   handleInput()
 }
 
+function insertEditorLineBreak() {
+  if (!editorRef.value || props.disabled || isApplyingHistory.value || isComposing.value) {
+    return
+  }
+
+  recordUndoSnapshot(true, { force: true, inputType: 'insertLineBreak' })
+  if (props.showVisibleChars) {
+    document.execCommand(
+      'insertHTML',
+      false,
+      '<span class="visible-char visible-char--newline" contenteditable="false">¶</span>\n',
+    )
+  } else {
+    document.execCommand('insertLineBreak')
+  }
+  handleInput()
+}
+
 function handleKeydown(event: KeyboardEvent) {
   if (props.disabled || isApplyingHistory.value || event.altKey) {
     return
+  }
+
+  if (event.key === 'Enter' && (event.isComposing || isComposing.value)) {
+    event.stopPropagation()
+    return
+  }
+
+  if (event.key === 'Enter' && !event.isComposing) {
+    if (event.ctrlKey || event.metaKey) {
+      event.preventDefault()
+      insertEditorLineBreak()
+      return
+    }
+
+    if (!event.shiftKey) {
+      event.preventDefault()
+      return
+    }
   }
 
   const usesShortcutModifier = event.ctrlKey || event.metaKey
@@ -1011,6 +1371,7 @@ function handleInput() {
   if (!editorRef.value) return
   if (isApplyingHistory.value) return
   if (isComposing.value) return
+  cacheTargetSelectionFromDom()
 
   // 检查是否有格式标签
   const cleanHtml = serializeEditorContentWithFormat(editorRef.value)
@@ -1022,12 +1383,75 @@ function handleInput() {
   // 如果有格式标签，同时传递 HTML
   if (hasFormatTags) {
     // 清理 HTML，只保留格式标签
-    emit('update', props.segment.sentence_id, text, cleanHtml)
+    emit('update', segmentKey.value, text, cleanHtml)
     return
   }
 
   // 没有格式标签，只传递纯文本
-  emit('update', props.segment.sentence_id, text)
+  emit('update', segmentKey.value, text)
+}
+
+function getEditorSelectionRange(): Range | null {
+  const editor = editorRef.value
+  const selection = window.getSelection()
+  if (!editor || !selection || selection.rangeCount === 0 || selection.isCollapsed) {
+    return null
+  }
+
+  const range = selection.getRangeAt(0)
+  if (!editor.contains(range.startContainer) || !editor.contains(range.endContainer)) {
+    return null
+  }
+
+  return range
+}
+
+function writeCleanRevisionSelectionToClipboard(event: ClipboardEvent, range: Range): boolean {
+  const clipboardData = event.clipboardData
+  if (!clipboardData) {
+    return false
+  }
+
+  const fragment = range.cloneContents()
+  const text = serializeEditorContent(fragment)
+  const html = serializeEditorContentWithFormat(fragment)
+  event.preventDefault()
+  clipboardData.clearData()
+  clipboardData.setData('text/plain', text)
+  clipboardData.setData('text/html', html)
+  return true
+}
+
+function handleCopy(event: ClipboardEvent) {
+  if (!hasPendingRevision.value) {
+    return
+  }
+
+  const range = getEditorSelectionRange()
+  if (!range) {
+    return
+  }
+
+  writeCleanRevisionSelectionToClipboard(event, range)
+}
+
+function handleCut(event: ClipboardEvent) {
+  if (!hasPendingRevision.value) {
+    return
+  }
+
+  const range = getEditorSelectionRange()
+  if (!range || !writeCleanRevisionSelectionToClipboard(event, range)) {
+    return
+  }
+
+  if (props.disabled || isApplyingHistory.value || isComposing.value) {
+    return
+  }
+
+  recordUndoSnapshot(true, { force: true, inputType: 'deleteByCut' })
+  document.execCommand('delete')
+  handleInput()
 }
 
 /**
@@ -1081,6 +1505,7 @@ function handleCompositionStart() {
 function handleCompositionEnd() {
   isComposing.value = false
   handleInput()
+  scheduleRevisionRerender()
   compositionSnapshotRecorded.value = false
 }
 
@@ -1088,8 +1513,9 @@ function handlePaste(event: ClipboardEvent) {
   event.preventDefault()
   recordUndoSnapshot(true, { force: true, inputType: 'insertFromPaste' })
   // 优先获取 HTML 格式，保留格式标签
-  const html = event.clipboardData?.getData('text/html') || ''
-  const text = event.clipboardData?.getData('text/plain') || ''
+  const clipboardData = event.clipboardData
+  const html = clipboardData?.getData('text/html') || ''
+  const text = clipboardData?.getData('text/plain') || ''
 
   // 如果有待应用的格式且粘贴的是纯文本，应用格式
   if (!html && text && hasPendingFormats()) {
@@ -1288,9 +1714,51 @@ function normalizeTagName(tag: string): string {
   return map[tag] || tag
 }
 
+function clearRevisionRerenderTimer() {
+  if (revisionRerenderTimer === null) {
+    return
+  }
+  clearTimeout(revisionRerenderTimer)
+  revisionRerenderTimer = null
+}
+
+function canSkipFocusedEditorStateSync(editor: HTMLElement): boolean {
+  if (!isFocused.value || hasRenderedEditorDecorations() || editorHasDecorationNodes(editor)) {
+    return false
+  }
+  return serializeEditorContent(editor) === getTargetStateText()
+}
+
+function scheduleRevisionRerender() {
+  clearRevisionRerenderTimer()
+  if (!isFocused.value || isApplyingHistory.value || isComposing.value) {
+    return
+  }
+  const editor = editorRef.value
+  if (editor && canSkipFocusedEditorStateSync(editor)) {
+    return
+  }
+
+  revisionRerenderTimer = setTimeout(() => {
+    revisionRerenderTimer = null
+    if (!isFocused.value || isApplyingHistory.value || isComposing.value) {
+      return
+    }
+    const currentEditor = editorRef.value
+    if (currentEditor && canSkipFocusedEditorStateSync(currentEditor)) {
+      return
+    }
+    syncEditorHtmlFromState(true)
+  }, REVISION_RERENDER_DEBOUNCE_MS)
+}
+
 function syncEditorHtmlFromState(preserveCaret: boolean) {
   const editor = editorRef.value
   if (!editor || isApplyingHistory.value || isComposing.value) {
+    return
+  }
+
+  if (canSkipFocusedEditorStateSync(editor)) {
     return
   }
 
@@ -1304,6 +1772,17 @@ function syncEditorHtmlFromState(preserveCaret: boolean) {
   if (preserveCaret && isFocused.value) {
     restoreSerializableCaretPosition(editor, caretPos)
   }
+}
+
+function syncFocusedTargetHighlightsFromState() {
+  const editor = editorRef.value
+  if (!editor || isApplyingHistory.value || isComposing.value) {
+    return
+  }
+  if (isFocused.value && serializeEditorContent(editor) !== getTargetStateText()) {
+    return
+  }
+  syncEditorHtmlFromState(isFocused.value)
 }
 
 function syncSourceEditorFromState(preserveCaret: boolean) {
@@ -1335,9 +1814,14 @@ onMounted(() => {
   }
 })
 
+onBeforeUnmount(() => {
+  clearRevisionRerenderTimer()
+})
+
 watch(
   () => props.segment.sentence_id,
   () => {
+    lastTargetSelectionRange.value = null
     clearEditorHistory()
   }
 )
@@ -1345,7 +1829,9 @@ watch(
 watch(
   () => props.segment.target_text,
   () => {
-    if (!isFocused.value && !isApplyingHistory.value) {
+    const shouldPreserveHistory = shouldPreserveHistoryForStateSync()
+    preserveNextTargetSync = false
+    if (!shouldPreserveHistory) {
       clearEditorHistory()
     }
     if (!isFocused.value && editorRef.value) {
@@ -1357,7 +1843,9 @@ watch(
 watch(
   () => props.pendingRevision?.id ?? null,
   () => {
-    if (!isFocused.value && !isApplyingHistory.value) {
+    const shouldPreserveHistory = shouldPreserveHistoryForStateSync()
+    preserveNextTargetSync = false
+    if (!shouldPreserveHistory) {
       clearEditorHistory()
     }
   }
@@ -1368,9 +1856,36 @@ watch(
   editorHtmlContent,
   () => {
     if (isFocused.value && !isApplyingHistory.value) {
+      const editor = editorRef.value
+      if (editor && canSkipFocusedEditorStateSync(editor)) {
+        clearRevisionRerenderTimer()
+        return
+      }
+      if (
+        editor
+        && !hasRenderedEditorDecorations()
+        && editorHasDecorationNodes(editor)
+        && serializeEditorContent(editor) === getTargetStateText()
+      ) {
+        clearRevisionRerenderTimer()
+        syncEditorHtmlFromState(true)
+        return
+      }
+      scheduleRevisionRerender()
       return
     }
+    clearRevisionRerenderTimer()
     syncEditorHtmlFromState(isFocused.value)
+  },
+  { flush: 'post' },
+)
+
+watch(
+  () => (props.matchedTerms || [])
+    .map((term) => `${term.id}\u0000${term.source_text}\u0000${term.target_text}`)
+    .join('\u0001'),
+  () => {
+    syncFocusedTargetHighlightsFromState()
   },
   { flush: 'post' },
 )
@@ -1378,6 +1893,9 @@ watch(
 defineExpose({
   undoEditorChange,
   redoEditorChange,
+  recordEditorUndoBoundary,
+  insertOrReplaceTargetText,
+  commitEditorContent,
   canUndoEditorChange,
   canRedoEditorChange,
 })
@@ -1445,9 +1963,9 @@ watch(
   <article
     class="segment-row"
     :class="[statusClass, parityClass, { 'is-active': active, 'is-selected': selected, 'has-pending-revision': hasPendingRevision, 'is-empty-target': isEmptyTarget }]"
-    :id="`segment-${segment.sentence_id}`"
+    :id="`segment-${segmentKey}`"
     data-testid="segment-row"
-    :data-sentence-id="segment.sentence_id"
+    :data-sentence-id="segmentKey"
     :data-has-pending-revision="hasPendingRevision ? 'true' : 'false'"
     role="group"
     :aria-label="`segment ${index + 1}`"
@@ -1456,7 +1974,7 @@ watch(
       <span class="segment-row__index">{{ index + 1 }}</span>
     </div>
 
-    <div class="segment-row__cell segment-row__cell--source" @click="handleClick">
+    <div class="segment-row__cell segment-row__cell--source" @mousedown="handleSelectMouseDown" @click="handleClick">
       <div class="segment-row__source-content">
         <span
           v-if="hasAutomaticNumbering"
@@ -1489,13 +2007,14 @@ watch(
       <div
         class="segment-row__editor-shell"
         :class="{ 'is-focused': isFocused, 'is-disabled': disabled, 'has-revision': hasPendingRevision }"
+        @mousedown="handleSelectMouseDown"
         @click="handleEditorShellClick"
       >
       <div
         v-if="false && pendingRevision"
         class="segment-row__revision-inline"
         data-testid="segment-revision-inline"
-        :data-sentence-id="segment.sentence_id"
+        :data-sentence-id="segmentKey"
         :aria-label="`translation revision for segment ${index + 1}`"
         @click="handleClick"
       >
@@ -1528,23 +2047,29 @@ watch(
             { 'is-focused': isFocused, 'has-revision': hasPendingRevision },
             revisionAuthorClass,
           ]"
+          :style="revisionColorStyle"
           :contenteditable="!disabled"
           tabindex="0"
           data-testid="segment-target-editor"
           :data-revision-visible="hasPendingRevision ? 'true' : 'false'"
           data-segment-target="true"
-          :data-sentence-id="segment.sentence_id"
+          :data-sentence-id="segmentKey"
           :aria-label="`translation for segment ${index + 1}`"
           spellcheck="false"
           @focus="handleFocus"
           @blur="handleBlur"
-          @click="handleClick"
+          @mousedown="handleSelectMouseDown"
+          @mouseup="cacheTargetSelectionFromDom"
+          @click.stop="handleClick"
           @keydown="handleKeydown"
+          @keyup="cacheTargetSelectionFromDom"
           @compositionstart="handleCompositionStart"
           @compositionend="handleCompositionEnd"
           @beforeinput="handleBeforeInput"
           @input="handleInput"
           @paste="handlePaste"
+          @copy="handleCopy"
+          @cut="handleCut"
         />
       </div>
       </div>
@@ -1841,11 +2366,12 @@ watch(
 }
 
 .segment-row__term-highlight {
-  background: rgba(216, 183, 78, 0.28);
+  background: rgba(247, 187, 42, 0.46);
   color: inherit;
   padding: 1px 2px;
   border-radius: 3px;
-  font-weight: 500;
+  box-shadow: inset 0 0 0 1px rgba(152, 103, 0, 0.32);
+  font-weight: 600;
 }
 
 .segment-row__search-highlight {
@@ -1857,14 +2383,24 @@ watch(
   font-weight: 600;
 }
 
+.segment-row__qa-highlight {
+  color: inherit;
+  text-decoration-line: underline;
+  text-decoration-style: wavy;
+  text-decoration-color: #d92d20;
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 3px;
+}
+
 /* 穿透 scoped 样式，让 innerHTML 插入的 mark 标签也能应用样式 */
 .segment-row__text :deep(.segment-row__term-highlight),
 .segment-row__source-editor :deep(.segment-row__term-highlight) {
-  background: rgba(216, 183, 78, 0.28);
+  background: rgba(247, 187, 42, 0.46);
   color: inherit;
   padding: 1px 2px;
   border-radius: 3px;
-  font-weight: 500;
+  box-shadow: inset 0 0 0 1px rgba(152, 103, 0, 0.32);
+  font-weight: 600;
 }
 
 .segment-row__text :deep(.segment-row__search-highlight),
@@ -1877,12 +2413,23 @@ watch(
   font-weight: 600;
 }
 
+.segment-row__text :deep(.segment-row__qa-highlight),
+.segment-row__source-editor :deep(.segment-row__qa-highlight) {
+  color: inherit;
+  text-decoration-line: underline;
+  text-decoration-style: wavy;
+  text-decoration-color: #d92d20;
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 3px;
+}
+
 .segment-row__editor :deep(.segment-row__term-highlight) {
-  background: rgba(216, 183, 78, 0.28);
+  background: rgba(247, 187, 42, 0.46);
   color: inherit;
   padding: 1px 2px;
   border-radius: 3px;
-  font-weight: 500;
+  box-shadow: inset 0 0 0 1px rgba(152, 103, 0, 0.32);
+  font-weight: 600;
 }
 
 .segment-row__editor :deep(.segment-row__search-highlight) {
@@ -1892,6 +2439,15 @@ watch(
   border-radius: 3px;
   box-shadow: inset 0 0 0 1px rgba(138, 103, 0, 0.2);
   font-weight: 600;
+}
+
+.segment-row__editor :deep(.segment-row__qa-highlight) {
+  color: inherit;
+  text-decoration-line: underline;
+  text-decoration-style: wavy;
+  text-decoration-color: #d92d20;
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 3px;
 }
 
 .segment-row__editor {
@@ -1935,29 +2491,19 @@ watch(
 }
 
 .segment-row__editor :deep(.segment-row__revision-insert) {
-  color: #0070c0;
+  color: var(--rev-insert-color, #2563eb);
   text-decoration: underline;
-  text-decoration-color: rgba(0, 122, 204, 0.9);
+  text-decoration-color: var(--rev-insert-color, #2563eb);
   text-decoration-thickness: 1px;
   text-underline-offset: 2px;
 }
 
 .segment-row__editor :deep(.segment-row__revision-delete) {
-  color: #d69a00;
+  color: var(--rev-delete-color, #dc2626);
   text-decoration: line-through;
-  text-decoration-color: rgba(214, 154, 0, 0.95);
+  text-decoration-color: var(--rev-delete-color, #dc2626);
   text-decoration-thickness: 1px;
-  user-select: text;
-}
-
-.segment-row__editor.is-revision-author-user :deep(.segment-row__revision-insert) {
-  color: #2e7d32;
-  text-decoration-color: rgba(46, 125, 50, 0.9);
-}
-
-.segment-row__editor.is-revision-author-user :deep(.segment-row__revision-delete) {
-  color: #c62828;
-  text-decoration-color: rgba(198, 40, 40, 0.9);
+  user-select: none;
 }
 
 .segment-row__editor[contenteditable="false"] {

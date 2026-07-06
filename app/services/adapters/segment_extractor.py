@@ -3,7 +3,6 @@ Segment 提取模块 - 从 Document AST 中提取翻译片段
 
 Requirements: 4.1, 4.2, 4.3, 4.4, 4.5
 """
-import hashlib
 import re
 from typing import List, Tuple
 
@@ -240,11 +239,8 @@ class SegmentExtractor:
         position = self._position_counter
         self._position_counter += 1
         
-        # 生成内容哈希
-        content_hash = hashlib.md5(source_text.encode()).hexdigest()[:8]
-        
-        # 生成稳定 ID
-        segment_id = Segment.generate_id(block_path, position, content_hash)
+        # 使用补零顺序 ID，保证同一块内多句段按字符串排序时仍保持解析顺序。
+        segment_id = f"seg-{position + 1:06d}"
         
         return Segment(
             segment_id=segment_id,

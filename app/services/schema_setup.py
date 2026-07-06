@@ -25,8 +25,29 @@ LEGACY_REQUIRED_EXISTING_TABLES = (
     "translation_memory_entries",
 )
 REQUIRED_SCHEMA = {
-    "memory_bases": {"source_language", "target_language", "project_id", "origin"},
-    "memory_entries": {"source_language", "target_language"},
+    "memory_bases": {"source_language", "target_language"},
+    "resource_import_batches": {
+        "id",
+        "resource_type",
+        "resource_id",
+        "filename",
+        "file_size_bytes",
+        "file_format",
+        "source_language",
+        "target_language",
+        "tmx_header_metadata",
+        "created_by_id",
+        "created_at",
+    },
+    "memory_entries": {
+        "source_language",
+        "target_language",
+        "creator_id",
+        "last_modified_by_id",
+        "external_tuid",
+        "tmx_metadata",
+        "import_batch_id",
+    },
     "term_bases": {
         "id",
         "name",
@@ -40,14 +61,17 @@ REQUIRED_SCHEMA = {
         "target_text",
         "source_language",
         "target_language",
+        "creator_id",
+        "last_modified_by_id",
+        "external_tuid",
+        "tmx_metadata",
+        "import_batch_id",
     },
     "glossary_bases": {
         "id",
         "name",
         "source_language",
         "target_language",
-        "project_id",
-        "origin",
     },
     "glossary_entries": {
         "id",
@@ -57,8 +81,23 @@ REQUIRED_SCHEMA = {
         "note",
         "source_language",
         "target_language",
+        "creator_id",
+        "last_modified_by_id",
     },
     "users": {"nickname", "translator_type"},
+    "guideline_templates": {
+        "id",
+        "name",
+        "filename",
+        "content",
+        "content_hash",
+        "size_bytes",
+        "source_path",
+        "created_by_id",
+        "last_modified_by_id",
+        "created_at",
+        "updated_at",
+    },
     "projects": {
         "id",
         "name",
@@ -70,6 +109,8 @@ REQUIRED_SCHEMA = {
         "deadline",
         "access_level",
         "translation_guidelines",
+        "quality_qa_settings",
+        "auto_tm_enabled",
         "created_at",
         "updated_at",
     },
@@ -175,6 +216,32 @@ REQUIRED_SCHEMA = {
         "ignored_at",
         "created_at",
     },
+    "segment_qa_issues": {
+        "id",
+        "project_id",
+        "file_record_id",
+        "segment_id",
+        "sentence_id",
+        "rule_key",
+        "provider",
+        "language",
+        "severity",
+        "message",
+        "short_message",
+        "rule_id",
+        "rule_category",
+        "issue_type",
+        "context_text",
+        "offset",
+        "length",
+        "replacements",
+        "target_text_hash",
+        "status",
+        "ignored_by_id",
+        "ignored_at",
+        "created_at",
+        "updated_at",
+    },
     "project_assignments": {
         "id",
         "project_id",
@@ -184,6 +251,8 @@ REQUIRED_SCHEMA = {
         "revoked_by_id",
         "revoked_at",
         "status",
+        "segment_range_start",
+        "segment_range_end",
     },
     "project_workflow_steps": {
         "id",
@@ -236,10 +305,54 @@ REQUIRED_SCHEMA = {
         "source_word_count",
         "llm_provider",
         "llm_model",
+        "last_modified_by_id",
         "version",
         "source_html",
         "target_html",
-        "segment_metadata",
+    },
+    "pretranslation_runs": {
+        "id",
+        "project_id",
+        "status",
+        "progress",
+        "message",
+        "total_files",
+        "completed_files",
+        "failed_files",
+        "canceled_files",
+        "options_json",
+        "created_by_id",
+        "started_at",
+        "completed_at",
+        "created_at",
+        "updated_at",
+    },
+    "pretranslation_tasks": {
+        "id",
+        "run_id",
+        "file_record_id",
+        "status",
+        "stage",
+        "progress",
+        "message",
+        "provider",
+        "model",
+        "scope",
+        "total_segments",
+        "unique_segments",
+        "deduplicated_segments",
+        "processed_segments",
+        "updated_segments",
+        "error_segments",
+        "current_action",
+        "operation_token",
+        "cancel_requested",
+        "error",
+        "started_at",
+        "completed_at",
+        "last_heartbeat_at",
+        "created_at",
+        "updated_at",
     },
     "translation_metric_events": {
         "id",
@@ -276,6 +389,17 @@ REQUIRED_SCHEMA = {
         "resolved_by_id",
         "created_at",
         "resolved_at",
+    },
+    "revision_display_settings": {
+        "id",
+        "file_record_id",
+        "show_author_time",
+        "show_others_revisions",
+        "default_insert_color",
+        "default_delete_color",
+        "author_colors",
+        "updated_by_id",
+        "updated_at",
     },
     "issue_markers": {
         "id",
@@ -326,10 +450,14 @@ REQUIRED_SCHEMA = {
         "created_at",
         "updated_at",
     },
-    "reference_profiles": {
+    "project_merge_views": {
+        "id",
         "project_id",
-        "glossary_base_id",
-        "memory_base_id",
+        "name",
+        "file_ids",
+        "creator_id",
+        "created_at",
+        "updated_at",
     },
 }
 
@@ -348,6 +476,25 @@ REQUIRED_INDEXES = {
     },
     "memory_entries": {
         "uq_memory_entries_collection_source_hash_language_pair",
+        "ix_memory_entries_creator_id",
+        "ix_memory_entries_last_modified_by_id",
+        "ix_memory_entries_external_tuid",
+        "ix_memory_entries_import_batch_id",
+    },
+    "term_entries": {
+        "ix_term_entries_creator_id",
+        "ix_term_entries_last_modified_by_id",
+        "ix_term_entries_term_base_updated_created",
+        "ix_term_entries_external_tuid",
+        "ix_term_entries_import_batch_id",
+    },
+    "resource_import_batches": {
+        "ix_resource_import_batches_resource",
+        "ix_resource_import_batches_created_at",
+    },
+    "glossary_entries": {
+        "ix_glossary_entries_creator_id",
+        "ix_glossary_entries_last_modified_by_id",
     },
     "auto_tm_outbox": {
         "uq_auto_tm_outbox_file_segment_collection",
@@ -372,9 +519,40 @@ REQUIRED_INDEXES = {
         "ix_file_export_tasks_status",
         "ix_file_export_tasks_expires_at",
     },
+    "pretranslation_runs": {
+        "ix_pretranslation_runs_project_id",
+        "ix_pretranslation_runs_status",
+        "ix_pretranslation_runs_created_by_id",
+        "ix_pretranslation_runs_created_at",
+    },
+    "pretranslation_tasks": {
+        "ix_pretranslation_tasks_run_id",
+        "ix_pretranslation_tasks_file_record_id",
+        "ix_pretranslation_tasks_file_status",
+        "ix_pretranslation_tasks_status",
+        "ix_pretranslation_tasks_updated_at",
+    },
     "project_workflow_steps": {
         "ix_project_workflow_steps_project_id",
         "ix_project_workflow_steps_project_order",
+    },
+    "segment_qa_issues": {
+        "ix_segment_qa_issues_project_id",
+        "ix_segment_qa_issues_file_record_id",
+        "ix_segment_qa_issues_segment_id",
+        "ix_segment_qa_issues_segment_rule_status",
+        "ix_segment_qa_issues_status",
+        "ix_segment_qa_issues_rule_key",
+        "ix_segment_qa_issues_target_hash",
+    },
+    "revision_display_settings": {
+        "uq_revision_display_settings_file_record_id",
+        "ix_revision_display_settings_updated_by_id",
+    },
+    "guideline_templates": {
+        "ix_guideline_templates_updated_at",
+        "ix_guideline_templates_created_by_id",
+        "ix_guideline_templates_last_modified_by_id",
     },
 }
 
@@ -484,6 +662,29 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
 
     statements.extend(
         [
+            f"""
+            CREATE TABLE IF NOT EXISTS resource_import_batches (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                resource_type VARCHAR(20) NOT NULL,
+                resource_id UUID,
+                filename TEXT NOT NULL,
+                file_size_bytes INTEGER NOT NULL DEFAULT 0,
+                file_format VARCHAR(20) NOT NULL DEFAULT '',
+                source_language VARCHAR(20),
+                target_language VARCHAR(20),
+                tmx_header_metadata JSONB,
+                created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_resource_import_batches_resource
+            ON resource_import_batches (resource_type, resource_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_resource_import_batches_created_at
+            ON resource_import_batches (created_at)
+            """,
             """
             ALTER TABLE IF EXISTS memory_bases
             ADD COLUMN IF NOT EXISTS source_language VARCHAR(20)
@@ -503,6 +704,48 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS memory_entries
             ADD COLUMN IF NOT EXISTS target_language VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS memory_entries
+            ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS memory_entries
+            ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS memory_entries
+            ADD COLUMN IF NOT EXISTS external_tuid TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS memory_entries
+            ADD COLUMN IF NOT EXISTS tmx_metadata JSONB
+            """,
+            """
+            ALTER TABLE IF EXISTS memory_entries
+            ADD COLUMN IF NOT EXISTS import_batch_id UUID REFERENCES resource_import_batches(id) ON DELETE SET NULL
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_memory_entries_creator_id
+            ON memory_entries (creator_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_memory_entries_last_modified_by_id
+            ON memory_entries (last_modified_by_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_memory_entries_external_tuid
+            ON memory_entries (external_tuid)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_memory_entries_import_batch_id
+            ON memory_entries (import_batch_id)
+            """,
+            """
+            UPDATE memory_entries
+            SET last_modified_by_id = creator_id
+            WHERE last_modified_by_id IS NULL
+              AND creator_id IS NOT NULL
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_memory_entries_language_pair
@@ -621,6 +864,11 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 source_normalized TEXT,
                 source_language VARCHAR(20) NOT NULL,
                 target_language VARCHAR(20) NOT NULL,
+                creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                external_tuid TEXT,
+                tmx_metadata JSONB,
+                import_batch_id UUID REFERENCES resource_import_batches(id) ON DELETE SET NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
@@ -636,6 +884,26 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS term_entries
             ADD COLUMN IF NOT EXISTS target_language VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS term_entries
+            ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS term_entries
+            ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS term_entries
+            ADD COLUMN IF NOT EXISTS external_tuid TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS term_entries
+            ADD COLUMN IF NOT EXISTS tmx_metadata JSONB
+            """,
+            """
+            ALTER TABLE IF EXISTS term_entries
+            ADD COLUMN IF NOT EXISTS import_batch_id UUID REFERENCES resource_import_batches(id) ON DELETE SET NULL
             """,
             """
             ALTER TABLE IF EXISTS term_entries
@@ -658,8 +926,34 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ON term_entries (term_base_id, source_normalized)
             """,
             """
+            CREATE INDEX IF NOT EXISTS ix_term_entries_term_base_updated_created
+            ON term_entries (term_base_id, updated_at DESC, created_at DESC)
+            """,
+            """
             CREATE INDEX IF NOT EXISTS ix_term_entries_language_pair
             ON term_entries (source_language, target_language)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_entries_creator_id
+            ON term_entries (creator_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_entries_last_modified_by_id
+            ON term_entries (last_modified_by_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_entries_external_tuid
+            ON term_entries (external_tuid)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_term_entries_import_batch_id
+            ON term_entries (import_batch_id)
+            """,
+            """
+            UPDATE term_entries
+            SET last_modified_by_id = creator_id
+            WHERE last_modified_by_id IS NULL
+              AND creator_id IS NOT NULL
             """,
             """
             DROP TRIGGER IF EXISTS update_term_entries_updated_at ON term_entries
@@ -729,6 +1023,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 source_language VARCHAR(20) NOT NULL,
                 target_language VARCHAR(20) NOT NULL,
                 creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
@@ -755,6 +1050,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
             """
             ALTER TABLE IF EXISTS glossary_entries
+            ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_entries
             ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
             """,
             """
@@ -764,6 +1063,16 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_glossary_entries_creator_id
             ON glossary_entries (creator_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_entries_last_modified_by_id
+            ON glossary_entries (last_modified_by_id)
+            """,
+            """
+            UPDATE glossary_entries
+            SET last_modified_by_id = creator_id
+            WHERE last_modified_by_id IS NULL
+              AND creator_id IS NOT NULL
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_glossary_entries_glossary_base_id
@@ -855,6 +1164,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 deadline TIMESTAMP,
                 access_level VARCHAR(20) NOT NULL DEFAULT 'team',
                 translation_guidelines TEXT NOT NULL DEFAULT '',
+                quality_qa_settings TEXT NOT NULL DEFAULT '{{}}',
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
@@ -889,6 +1199,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
             """
             ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS quality_qa_settings TEXT NOT NULL DEFAULT '{}'
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
             ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
             """,
             """
@@ -909,6 +1223,82 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE TRIGGER update_projects_updated_at
             BEFORE UPDATE ON projects
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column()
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS guideline_templates (
+                id VARCHAR(120) PRIMARY KEY,
+                name VARCHAR(120) NOT NULL,
+                filename VARCHAR(255) NOT NULL,
+                content TEXT NOT NULL,
+                content_hash VARCHAR(64) NOT NULL DEFAULT '',
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                source_path VARCHAR(255),
+                created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS guideline_templates
+            ADD COLUMN IF NOT EXISTS name VARCHAR(120) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS guideline_templates
+            ADD COLUMN IF NOT EXISTS filename VARCHAR(255) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS guideline_templates
+            ADD COLUMN IF NOT EXISTS content TEXT NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS guideline_templates
+            ADD COLUMN IF NOT EXISTS content_hash VARCHAR(64) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS guideline_templates
+            ADD COLUMN IF NOT EXISTS size_bytes INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS guideline_templates
+            ADD COLUMN IF NOT EXISTS source_path VARCHAR(255)
+            """,
+            """
+            ALTER TABLE IF EXISTS guideline_templates
+            ADD COLUMN IF NOT EXISTS created_by_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS guideline_templates
+            ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS guideline_templates
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            """,
+            """
+            ALTER TABLE IF EXISTS guideline_templates
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_guideline_templates_updated_at
+            ON guideline_templates (updated_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_guideline_templates_created_by_id
+            ON guideline_templates (created_by_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_guideline_templates_last_modified_by_id
+            ON guideline_templates (last_modified_by_id)
+            """,
+            """
+            DROP TRIGGER IF EXISTS update_guideline_templates_updated_at ON guideline_templates
+            """,
+            """
+            CREATE TRIGGER update_guideline_templates_updated_at
+            BEFORE UPDATE ON guideline_templates
             FOR EACH ROW
             EXECUTE FUNCTION update_updated_at_column()
             """,
@@ -1061,6 +1451,90 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             CREATE INDEX IF NOT EXISTS ix_file_export_tasks_expires_at
             ON file_export_tasks (expires_at)
             """,
+            f"""
+            CREATE TABLE IF NOT EXISTS pretranslation_runs (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                status VARCHAR(20) NOT NULL DEFAULT 'queued',
+                progress INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL DEFAULT '',
+                total_files INTEGER NOT NULL DEFAULT 0,
+                completed_files INTEGER NOT NULL DEFAULT 0,
+                failed_files INTEGER NOT NULL DEFAULT 0,
+                canceled_files INTEGER NOT NULL DEFAULT 0,
+                options_json TEXT NOT NULL DEFAULT '{{}}',
+                created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS pretranslation_tasks (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                run_id UUID NOT NULL REFERENCES pretranslation_runs(id) ON DELETE CASCADE,
+                file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+                status VARCHAR(20) NOT NULL DEFAULT 'queued',
+                stage VARCHAR(40) NOT NULL DEFAULT 'queued',
+                progress INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL DEFAULT '',
+                provider VARCHAR(40),
+                model VARCHAR(200),
+                scope VARCHAR(40),
+                total_segments INTEGER NOT NULL DEFAULT 0,
+                unique_segments INTEGER NOT NULL DEFAULT 0,
+                deduplicated_segments INTEGER NOT NULL DEFAULT 0,
+                processed_segments INTEGER NOT NULL DEFAULT 0,
+                updated_segments INTEGER NOT NULL DEFAULT 0,
+                error_segments INTEGER NOT NULL DEFAULT 0,
+                current_action TEXT,
+                operation_token VARCHAR(64),
+                cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                error TEXT,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                last_heartbeat_at TIMESTAMP,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_pretranslation_runs_project_id
+            ON pretranslation_runs (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_pretranslation_runs_status
+            ON pretranslation_runs (status)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_pretranslation_runs_created_by_id
+            ON pretranslation_runs (created_by_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_pretranslation_runs_created_at
+            ON pretranslation_runs (created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_pretranslation_tasks_run_id
+            ON pretranslation_tasks (run_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_pretranslation_tasks_file_record_id
+            ON pretranslation_tasks (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_pretranslation_tasks_file_status
+            ON pretranslation_tasks (file_record_id, status)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_pretranslation_tasks_status
+            ON pretranslation_tasks (status)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_pretranslation_tasks_updated_at
+            ON pretranslation_tasks (updated_at)
+            """,
             """
             CREATE INDEX IF NOT EXISTS ix_file_records_assignee_id
             ON file_records (assignee_id)
@@ -1199,12 +1673,22 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 assigned_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 revoked_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
                 revoked_at TIMESTAMP,
-                status VARCHAR(20) NOT NULL DEFAULT 'active'
+                status VARCHAR(20) NOT NULL DEFAULT 'active',
+                segment_range_start INTEGER,
+                segment_range_end INTEGER
             )
             """,
             """
             ALTER TABLE IF EXISTS file_assignments
             ADD COLUMN IF NOT EXISTS workflow_step_id UUID REFERENCES project_workflow_steps(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS file_assignments
+            ADD COLUMN IF NOT EXISTS segment_range_start INTEGER
+            """,
+            """
+            ALTER TABLE IF EXISTS file_assignments
+            ADD COLUMN IF NOT EXISTS segment_range_end INTEGER
             """,
             f"""
             CREATE TABLE IF NOT EXISTS assignment_events (
@@ -1419,15 +1903,15 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
             """
             ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
             ADD COLUMN IF NOT EXISTS source_html TEXT
             """,
             """
             ALTER TABLE IF EXISTS segments
             ADD COLUMN IF NOT EXISTS target_html TEXT
-            """,
-            """
-            ALTER TABLE IF EXISTS segments
-            ADD COLUMN IF NOT EXISTS segment_metadata TEXT NOT NULL DEFAULT '{}'
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_segments_file_record_order
@@ -1440,6 +1924,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_segments_source_word_count
             ON segments (source_word_count)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_last_modified_by_id
+            ON segments (last_modified_by_id)
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_segments_translated_source_word_count
@@ -1888,6 +2376,163 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             CREATE INDEX IF NOT EXISTS ix_term_qa_report_items_ignored_at
             ON term_qa_report_items (ignored_at)
             """,
+            f"""
+            CREATE TABLE IF NOT EXISTS segment_qa_issues (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+                segment_id UUID NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+                sentence_id VARCHAR(40) NOT NULL DEFAULT '',
+                rule_key VARCHAR(40) NOT NULL DEFAULT 'spelling_grammar',
+                provider VARCHAR(40) NOT NULL DEFAULT 'languagetool',
+                language VARCHAR(20) NOT NULL DEFAULT '',
+                severity VARCHAR(20) NOT NULL DEFAULT 'medium',
+                message TEXT NOT NULL DEFAULT '',
+                short_message TEXT NOT NULL DEFAULT '',
+                rule_id VARCHAR(120) NOT NULL DEFAULT '',
+                rule_category VARCHAR(120) NOT NULL DEFAULT '',
+                issue_type VARCHAR(80) NOT NULL DEFAULT '',
+                context_text TEXT NOT NULL DEFAULT '',
+                "offset" INTEGER NOT NULL DEFAULT 0,
+                length INTEGER NOT NULL DEFAULT 0,
+                replacements TEXT NOT NULL DEFAULT '[]',
+                target_text_hash VARCHAR(64) NOT NULL DEFAULT '',
+                status VARCHAR(20) NOT NULL DEFAULT 'open',
+                ignored_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                ignored_at TIMESTAMP,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS file_record_id UUID REFERENCES file_records(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS segment_id UUID REFERENCES segments(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS sentence_id VARCHAR(40) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS rule_key VARCHAR(40) NOT NULL DEFAULT 'spelling_grammar'
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS provider VARCHAR(40) NOT NULL DEFAULT 'languagetool'
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS language VARCHAR(20) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS severity VARCHAR(20) NOT NULL DEFAULT 'medium'
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS message TEXT NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS short_message TEXT NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS rule_id VARCHAR(120) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS rule_category VARCHAR(120) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS issue_type VARCHAR(80) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS context_text TEXT NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS "offset" INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS length INTEGER NOT NULL DEFAULT 0
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS replacements TEXT NOT NULL DEFAULT '[]'
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS target_text_hash VARCHAR(64) NOT NULL DEFAULT ''
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'open'
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS ignored_by_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS ignored_at TIMESTAMP
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            """,
+            """
+            ALTER TABLE IF EXISTS segment_qa_issues
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_project_id
+            ON segment_qa_issues (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_file_record_id
+            ON segment_qa_issues (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_segment_id
+            ON segment_qa_issues (segment_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_segment_rule_status
+            ON segment_qa_issues (segment_id, rule_key, status)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_status
+            ON segment_qa_issues (status)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_rule_key
+            ON segment_qa_issues (rule_key)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_target_hash
+            ON segment_qa_issues (target_text_hash)
+            """,
+            """
+            DROP TRIGGER IF EXISTS update_segment_qa_issues_updated_at ON segment_qa_issues
+            """,
+            """
+            CREATE TRIGGER update_segment_qa_issues_updated_at
+            BEFORE UPDATE ON segment_qa_issues
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column()
+            """,
             """
             INSERT INTO projects (
                 id,
@@ -2022,6 +2667,99 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             $$;
             """,
             f"""
+            CREATE TABLE IF NOT EXISTS revision_display_settings (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+                show_author_time BOOLEAN NOT NULL DEFAULT TRUE,
+                show_others_revisions BOOLEAN NOT NULL DEFAULT TRUE,
+                default_insert_color VARCHAR(20) NOT NULL DEFAULT '#2563eb',
+                default_delete_color VARCHAR(20) NOT NULL DEFAULT '#dc2626',
+                author_colors JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                updated_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_revision_display_settings_file_record_id UNIQUE (file_record_id)
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS revision_display_settings
+            ADD COLUMN IF NOT EXISTS show_author_time BOOLEAN
+            """,
+            """
+            ALTER TABLE IF EXISTS revision_display_settings
+            ADD COLUMN IF NOT EXISTS show_others_revisions BOOLEAN
+            """,
+            """
+            ALTER TABLE IF EXISTS revision_display_settings
+            ADD COLUMN IF NOT EXISTS default_insert_color VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS revision_display_settings
+            ADD COLUMN IF NOT EXISTS default_delete_color VARCHAR(20)
+            """,
+            """
+            ALTER TABLE IF EXISTS revision_display_settings
+            ADD COLUMN IF NOT EXISTS author_colors JSONB
+            """,
+            """
+            ALTER TABLE IF EXISTS revision_display_settings
+            ADD COLUMN IF NOT EXISTS updated_by_id UUID
+            """,
+            """
+            ALTER TABLE IF EXISTS revision_display_settings
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()
+            """,
+            """
+            ALTER TABLE IF EXISTS projects
+            ADD COLUMN IF NOT EXISTS auto_tm_enabled BOOLEAN NOT NULL DEFAULT TRUE
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_revision_display_settings_file_record_id
+            ON revision_display_settings (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_revision_display_settings_updated_by_id
+            ON revision_display_settings (updated_by_id)
+            """,
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'revision_display_settings'
+                ) THEN
+                    ALTER TABLE revision_display_settings
+                        ALTER COLUMN show_author_time SET DEFAULT TRUE;
+                    ALTER TABLE revision_display_settings
+                        ALTER COLUMN show_others_revisions SET DEFAULT TRUE;
+                    ALTER TABLE revision_display_settings
+                        ALTER COLUMN default_insert_color SET DEFAULT '#2563eb';
+                    ALTER TABLE revision_display_settings
+                        ALTER COLUMN default_delete_color SET DEFAULT '#dc2626';
+                    ALTER TABLE revision_display_settings
+                        ALTER COLUMN author_colors SET DEFAULT '{}'::jsonb;
+                    ALTER TABLE revision_display_settings
+                        ALTER COLUMN updated_at SET DEFAULT NOW();
+                    UPDATE revision_display_settings
+                    SET show_author_time = COALESCE(show_author_time, TRUE),
+                        show_others_revisions = COALESCE(show_others_revisions, TRUE),
+                        default_insert_color = COALESCE(NULLIF(default_insert_color, ''), '#2563eb'),
+                        default_delete_color = COALESCE(NULLIF(default_delete_color, ''), '#dc2626'),
+                        author_colors = COALESCE(author_colors, '{}'::jsonb),
+                        updated_at = COALESCE(updated_at, NOW())
+                    WHERE show_author_time IS NULL
+                       OR show_others_revisions IS NULL
+                       OR default_insert_color IS NULL
+                       OR btrim(default_insert_color) = ''
+                       OR default_delete_color IS NULL
+                       OR btrim(default_delete_color) = ''
+                       OR author_colors IS NULL
+                       OR updated_at IS NULL;
+                END IF;
+            END
+            $$;
+            """,
+            f"""
             CREATE TABLE IF NOT EXISTS auto_tm_outbox (
                 id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
                 file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
@@ -2129,60 +2867,34 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             CREATE INDEX IF NOT EXISTS ix_auto_tm_rematch_queue_first_pending_at
             ON auto_tm_rematch_queue (first_pending_at)
             """,
-            """
-            ALTER TABLE IF EXISTS memory_bases
-            ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE
+            f"""
+            CREATE TABLE IF NOT EXISTS project_merge_views (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                name VARCHAR(200) NOT NULL,
+                file_ids TEXT NOT NULL DEFAULT '[]',
+                creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
             """,
             """
-            ALTER TABLE IF EXISTS memory_bases
-            ADD COLUMN IF NOT EXISTS origin VARCHAR(20) NOT NULL DEFAULT 'manual'
+            CREATE INDEX IF NOT EXISTS ix_project_merge_views_project_id
+            ON project_merge_views (project_id)
             """,
             """
-            CREATE INDEX IF NOT EXISTS ix_memory_bases_project_id
-            ON memory_bases (project_id)
+            CREATE INDEX IF NOT EXISTS ix_project_merge_views_creator_id
+            ON project_merge_views (creator_id)
             """,
             """
-            CREATE INDEX IF NOT EXISTS ix_memory_bases_origin
-            ON memory_bases (origin)
+            DROP TRIGGER IF EXISTS update_project_merge_views_updated_at ON project_merge_views
             """,
             """
-            ALTER TABLE IF EXISTS glossary_bases
-            ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE
-            """,
-            """
-            ALTER TABLE IF EXISTS glossary_bases
-            ADD COLUMN IF NOT EXISTS origin VARCHAR(20) NOT NULL DEFAULT 'manual'
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS ix_glossary_bases_project_id
-            ON glossary_bases (project_id)
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS ix_glossary_bases_origin
-            ON glossary_bases (origin)
-            """,
-            """
-            ALTER TABLE IF EXISTS reference_profiles
-            ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE
-            """,
-            """
-            ALTER TABLE IF EXISTS reference_profiles
-            ADD COLUMN IF NOT EXISTS glossary_base_id UUID REFERENCES glossary_bases(id) ON DELETE SET NULL
-            """,
-            """
-            ALTER TABLE IF EXISTS reference_profiles
-            ADD COLUMN IF NOT EXISTS memory_base_id UUID REFERENCES memory_bases(id) ON DELETE SET NULL
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS ix_reference_profiles_project_id
-            ON reference_profiles (project_id)
-            """,
-            """
-            ALTER TABLE IF EXISTS reference_profiles
-            DROP COLUMN IF EXISTS match_result
+            CREATE TRIGGER update_project_merge_views_updated_at
+            BEFORE UPDATE ON project_merge_views
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column()
             """,
         ]
     )
     return statements
-
-

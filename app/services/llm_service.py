@@ -7,7 +7,7 @@ import re
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
-from typing import AsyncIterator, Literal
+from typing import AsyncIterator, Callable, Literal
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -60,6 +60,7 @@ class LLMTranslationTask:
     tm_target_text: str | None = None
     glossary_matches: list[GlossaryMatch] = field(default_factory=list)
     should_translate: bool = True
+    project_sync_disabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -289,6 +290,7 @@ async def iter_batch_translate(
     settings: Settings | None = None,
     translation_unit: LLMTranslationUnit = "paragraph",
     model_override: str | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> AsyncIterator[LLMTranslationResult | LLMTranslationFailure]:
     config = settings or get_settings()
     providers = validate_provider_choice(provider=provider, settings=config, model_override=model_override)
@@ -305,9 +307,14 @@ async def iter_batch_translate(
     use_batch = bool(translation_guidelines)
     stall_timeout = _llm_stall_timeout_seconds(config)
 
+    def _is_canceled() -> bool:
+        return bool(cancel_check is not None and cancel_check())
+
     async def _run_single_mode(clients: dict[str, "httpx.AsyncClient" | None]):
         async def run_single(task: LLMTranslationTask):
             async with semaphore:
+                if _is_canceled():
+                    raise asyncio.CancelledError()
                 try:
                     return await asyncio.wait_for(
                         _translate_single_task(
@@ -343,7 +350,15 @@ async def iter_batch_translate(
         futures = [asyncio.create_task(run_single(task)) for task in target_tasks]
         try:
             for future in asyncio.as_completed(futures):
-                yield await future
+                if _is_canceled():
+                    break
+                try:
+                    item = await future
+                except asyncio.CancelledError:
+                    continue
+                if _is_canceled():
+                    break
+                yield item
         finally:
             for future in futures:
                 if not future.done():
@@ -360,6 +375,8 @@ async def iter_batch_translate(
 
         async def run_group(group: TaskGroup):
             async with semaphore:
+                if _is_canceled():
+                    raise asyncio.CancelledError()
                 try:
                     return await asyncio.wait_for(
                         _translate_batch_group(
@@ -385,7 +402,14 @@ async def iter_batch_translate(
         futures = [asyncio.create_task(run_group(group)) for group in groups]
         try:
             for future in asyncio.as_completed(futures):
-                group_results = await future
+                if _is_canceled():
+                    break
+                try:
+                    group_results = await future
+                except asyncio.CancelledError:
+                    continue
+                if _is_canceled():
+                    break
                 for item in group_results:
                     yield item
         finally:
@@ -404,6 +428,8 @@ async def iter_batch_translate(
 
         async def run_group(group: ParagraphTaskGroup):
             async with semaphore:
+                if _is_canceled():
+                    raise asyncio.CancelledError()
                 try:
                     return await asyncio.wait_for(
                         _translate_paragraph_group(
@@ -429,7 +455,14 @@ async def iter_batch_translate(
         futures = [asyncio.create_task(run_group(group)) for group in groups]
         try:
             for future in asyncio.as_completed(futures):
-                group_results = await future
+                if _is_canceled():
+                    break
+                try:
+                    group_results = await future
+                except asyncio.CancelledError:
+                    continue
+                if _is_canceled():
+                    break
                 for item in group_results:
                     yield item
         finally:

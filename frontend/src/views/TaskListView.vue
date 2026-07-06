@@ -3,7 +3,7 @@ import axios from 'axios'
 import {
   ArrowRight,
   Download,
-  Flag,
+  FolderOpen,
   MoreHorizontal,
   Search,
   Settings2,
@@ -14,16 +14,17 @@ import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 
 import { http } from '../api/http'
+import { listVisibleMergeViews } from '../api/mergeViews'
 import DataTable from '../components/DataTable.vue'
-import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
 import Pagination from '../components/Pagination.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
+import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { useToast } from '../composables/useToast'
 import { getFileStatusMeta } from '../constants/status'
 import { useAuthStore } from '../stores/auth'
-import type { IssueMarker } from '../types/api'
+import type { MergeView, WorkflowProgress } from '../types/api'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
 
 interface ProjectRow {
@@ -36,8 +37,10 @@ interface ProjectRow {
   file_count?: number
   total_segments: number
   translated_segments: number
-  issue_count: number
-  open_issue_count: number
+  confirmed_segments?: number
+  pretranslated_segments?: number
+  pretranslation_progress?: number
+  workflow_progress?: WorkflowProgress[]
   source_language: string | null
   target_language: string | null
   creator: string | null
@@ -49,7 +52,7 @@ interface ProjectRow {
   updated_at: string
 }
 
-type MainTab = 'tasks' | 'performance'
+type MainTab = 'tasks' | 'views' | 'performance'
 type SubTab = 'all' | 'incomplete'
 type ResourceImportTab = 'tm' | 'term'
 
@@ -70,12 +73,13 @@ const sortOrder = ref<'asc' | 'desc'>('desc')
 const searchQuery = ref('')
 const projects = ref<ProjectRow[]>([])
 const projectsLoading = ref(false)
+const visibleMergeViews = ref<MergeView[]>([])
+const mergeViewsLoading = ref(false)
+const mergeViewError = ref('')
 let searchTimer: ReturnType<typeof setTimeout> | null = null
 const showImportDialog = ref(false)
-const showIssueDialog = ref(false)
 const importDialogInitialTab = ref<ResourceImportTab>('tm')
 const openActionMenuId = ref<string | null>(null)
-const issueTarget = ref<ProjectRow | null>(null)
 const importDialogContext = ref<{
   label: string
   sourceLanguage: string | null
@@ -87,13 +91,10 @@ const importDialogContext = ref<{
 })
 
 const columns = computed<DataTableColumn[]>(() => ([
-  { key: 'project_name', label: t('taskList.columns.projectName'), width: '150px', sortable: true },
-  { key: 'filename', label: t('taskList.columns.filename'), width: '260px', sortable: true },
-  { key: 'status', label: t('taskList.columns.status'), width: '96px' },
-  { key: 'progress', label: t('projectList.status.progress'), width: '150px' },
-  { key: 'total_segments', label: '句段数', width: '110px', align: 'right' },
-  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '96px' },
-  { key: 'created_at', label: t('taskList.columns.createdAt'), width: '132px', sortable: true },
+  { key: 'filename', label: t('taskList.columns.filename'), width: '330px', sortable: true },
+  { key: 'status', label: t('taskList.columns.status'), width: '88px' },
+  { key: 'progress', label: t('projectDetail.files.columns.progress'), width: '150px' },
+  { key: 'pretranslation_progress', label: t('projectDetail.files.columns.pretranslationProgress'), width: '150px' },
   { key: 'updated_at', label: t('taskList.columns.updatedAt'), width: '132px', sortable: true },
 ]))
 
@@ -134,11 +135,44 @@ function formatDate(value: string) {
   }
 }
 
+function getTaskMetaText(row: ProjectRow) {
+  return [
+    row.project_name || t('common.notSet'),
+    `${t('projectList.status.totalSegments')} ${Number(row.total_segments || 0)}`,
+  ].join(' · ')
+}
+
+function getMergeViewMetaText(view: MergeView) {
+  return [
+    view.project_name || '未命名项目',
+    `${Number(view.file_count || 0)} 个文件`,
+    view.creator_name ? `创建人 ${view.creator_name}` : '',
+  ].filter(Boolean).join(' · ')
+}
+
+function getMergeViewFileText(view: MergeView) {
+  const count = Number(view.file_count || view.file_ids?.length || 0)
+  return count > 0 ? `可打开 ${count} 个文件` : '暂无可访问文件'
+}
+
 function getErrorMessage(error: unknown, fallback: string) {
   if (axios.isAxiosError(error)) {
     return String(error.response?.data?.detail || fallback)
   }
   return error instanceof Error ? error.message : fallback
+}
+
+async function loadMergeViews() {
+  mergeViewError.value = ''
+  mergeViewsLoading.value = true
+  try {
+    const data = await listVisibleMergeViews()
+    visibleMergeViews.value = data.items
+  } catch (error) {
+    mergeViewError.value = getErrorMessage(error, '合并视图加载失败。')
+  } finally {
+    mergeViewsLoading.value = false
+  }
 }
 
 async function loadProjects() {
@@ -193,6 +227,26 @@ function getStatusClass(status: string) {
   return `project-status--${meta.tone}`
 }
 
+function getFileDisplayProgress(row: ProjectRow) {
+  return Number(row.progress || 0)
+}
+
+function getFileDisplayProgressStatus(row: ProjectRow) {
+  return String(row.status || '')
+}
+
+function getFileWorkflowProgress(row: ProjectRow) {
+  return row.workflow_progress || []
+}
+
+function getFilePretranslationProgress(row: ProjectRow) {
+  return Number(row.pretranslation_progress || 0)
+}
+
+function getFilePretranslationProgressStatus(row: ProjectRow) {
+  return String(row.status || '')
+}
+
 const filteredProjects = computed(() => {
   let rows = [...projects.value]
 
@@ -206,7 +260,7 @@ const filteredProjects = computed(() => {
     rows.sort((left, right) => {
       const leftVal = left[key]
       const rightVal = right[key]
-      if (key === 'progress' || key === 'file_count' || key === 'total_segments') {
+      if (key === 'progress' || key === 'pretranslation_progress' || key === 'file_count' || key === 'total_segments') {
         return ((Number(leftVal) || 0) - (Number(rightVal) || 0)) * direction
       }
       return String(leftVal ?? '').localeCompare(String(rightVal ?? '')) * direction
@@ -260,21 +314,15 @@ function openProjectDetail(row: ProjectRow) {
   })
 }
 
-function openIssueDialog(row: ProjectRow) {
-  closeActionMenu()
-  if (!row.project_id) {
-    toast.warn(t('issueMarker.errors.missingProject'))
-    return
-  }
-  issueTarget.value = row
-  showIssueDialog.value = true
-}
-
-async function handleIssueSaved(_marker: IssueMarker) {
-  showIssueDialog.value = false
-  issueTarget.value = null
-  toast.success(t('issueMarker.messages.saved'))
-  await loadProjects()
+function openMergeView(view: MergeView) {
+  void router.push({
+    name: 'merge-view-focus',
+    params: { viewId: view.id },
+    query: {
+      from: 'tasks',
+      ...(view.project_id ? { pid: view.project_id } : {}),
+    },
+  })
 }
 
 watch(searchQuery, () => {
@@ -289,6 +337,12 @@ watch(searchQuery, () => {
 
 watch(subTab, () => {
   currentPage.value = 1
+})
+
+watch(mainTab, (tab) => {
+  if (tab === 'views' && visibleMergeViews.value.length === 0 && !mergeViewsLoading.value) {
+    void loadMergeViews()
+  }
 })
 
 onMounted(() => {
@@ -316,6 +370,14 @@ onBeforeUnmount(() => {
             @click="mainTab = 'tasks'"
           >
             {{ t('taskList.mainTab') }}
+          </button>
+          <button
+            class="tab-item"
+            :class="{ 'is-active': mainTab === 'views' }"
+            type="button"
+            @click="mainTab = 'views'"
+          >
+            合并视图
           </button>
           <button
             class="tab-item"
@@ -411,21 +473,20 @@ onBeforeUnmount(() => {
             @sort="handleSort"
             @select="handleSelect"
           >
-            <template #project_name="{ row }">
-              <span class="task-name-cell" :title="row.project_name || t('common.notSet')">
-                {{ row.project_name || t('common.notSet') }}
-              </span>
-            </template>
-
             <template #filename="{ row }">
-              <button
-                class="text-link project-link"
-                type="button"
-                :title="row.filename"
-                @click="openProjectDetail(row as ProjectRow)"
-              >
-                {{ compactFilename(row.filename) }}
-              </button>
+              <div class="task-main-cell">
+                <button
+                  class="text-link project-link"
+                  type="button"
+                  :title="row.filename"
+                  @click="openProjectDetail(row as ProjectRow)"
+                >
+                  {{ compactFilename(row.filename) }}
+                </button>
+                <span class="task-main-cell__meta" :title="getTaskMetaText(row as ProjectRow)">
+                  {{ getTaskMetaText(row as ProjectRow) }}
+                </span>
+              </div>
             </template>
 
             <template #status="{ row }">
@@ -435,38 +496,30 @@ onBeforeUnmount(() => {
             </template>
 
             <template #progress="{ row }">
-              <div class="progress-bar">
-                <div class="progress-bar__track">
-                  <div
-                    class="progress-bar__fill"
-                    :class="{ 'is-complete': isProgressComplete(row.progress) }"
-                    :style="getProgressStyle(row.progress, row.status)"
-                  />
-                </div>
-                <span class="progress-bar__text">{{ row.progress }}%</span>
+              <div class="task-file-progress">
+                <WorkflowProgressSummary
+                  compact
+                  :progress="getFileDisplayProgress(row as ProjectRow)"
+                  :status="getFileDisplayProgressStatus(row as ProjectRow)"
+                  :workflow-progress="getFileWorkflowProgress(row as ProjectRow)"
+                  :label="t('common.progress.total')"
+                  :detail-title="t('common.progress.workflowDetail')"
+                />
               </div>
             </template>
 
-            <template #total_segments="{ row }">
-              <span>{{ row.total_segments }}</span>
-            </template>
-
-            <template #open_issue_count="{ row }">
-              <button
-                class="issue-badge"
-                :class="{ 'is-active': Number(row.open_issue_count || 0) > 0 }"
-                type="button"
-                :title="t('issueMarker.actions.open')"
-                @click="openIssueDialog(row as ProjectRow)"
-              >
-                <Flag :size="13" />
-                {{ Number(row.open_issue_count || 0) > 0 ? row.open_issue_count : t('common.none') }}
-              </button>
-            </template>
-
-            <template #created_at="{ row }">
-              <div class="date-cell">
-                {{ formatDate(row.created_at).date }}<br>{{ formatDate(row.created_at).time }}
+            <template #pretranslation_progress="{ row }">
+              <div class="task-file-progress">
+                <div class="progress-bar">
+                  <div class="progress-bar__track">
+                    <div
+                      class="progress-bar__fill"
+                      :class="{ 'is-complete': isProgressComplete(getFilePretranslationProgress(row as ProjectRow)) }"
+                      :style="getProgressStyle(getFilePretranslationProgress(row as ProjectRow), getFilePretranslationProgressStatus(row as ProjectRow))"
+                    />
+                  </div>
+                  <span class="progress-bar__text">{{ getFilePretranslationProgress(row as ProjectRow) }}%</span>
+                </div>
               </div>
             </template>
 
@@ -486,15 +539,6 @@ onBeforeUnmount(() => {
                   @click="openProjectDetail(row as ProjectRow)"
                 >
                   <ArrowRight :size="16" />
-                </button>
-                <button
-                  class="data-table__actions-btn"
-                  type="button"
-                  :title="t('issueMarker.actions.open')"
-                  :aria-label="t('issueMarker.actions.open')"
-                  @click="openIssueDialog(row as ProjectRow)"
-                >
-                  <Flag :size="14" />
                 </button>
                 <div class="task-action-menu">
                   <button
@@ -516,9 +560,6 @@ onBeforeUnmount(() => {
                       @click="openImportDialog(row); closeActionMenu()"
                     >
                       {{ t('taskList.actions.importResources') }}
-                    </button>
-                    <button type="button" @click="openIssueDialog(row as ProjectRow)">
-                      {{ t('issueMarker.actions.open') }}
                     </button>
                     <button
                       v-if="row.can_manage"
@@ -545,6 +586,48 @@ onBeforeUnmount(() => {
         </div>
       </template>
 
+      <template v-else-if="mainTab === 'views'">
+        <div class="task-merge-views">
+          <div class="task-merge-views__head">
+            <div>
+              <strong>合并视图</strong>
+              <span>显示已授权且可重新打开的多文件工作台</span>
+            </div>
+            <button class="button" type="button" :disabled="mergeViewsLoading" @click="loadMergeViews">
+              <FolderOpen :size="14" />
+              刷新
+            </button>
+          </div>
+
+          <p v-if="mergeViewError" class="form-message is-error task-page__message">{{ mergeViewError }}</p>
+
+          <div v-if="mergeViewsLoading" class="empty-state task-merge-views__empty">
+            正在加载合并视图...
+          </div>
+          <div v-else-if="visibleMergeViews.length === 0" class="empty-state task-merge-views__empty">
+            暂无可打开的合并视图
+          </div>
+          <div v-else class="task-merge-view-list">
+            <article v-for="view in visibleMergeViews" :key="view.id" class="task-merge-view-card">
+              <div class="task-merge-view-card__main">
+                <strong>{{ view.name }}</strong>
+                <span>{{ getMergeViewMetaText(view) }}</span>
+                <small>{{ getMergeViewFileText(view) }}</small>
+              </div>
+              <button
+                class="button button--primary"
+                type="button"
+                :disabled="view.can_open === false"
+                @click="openMergeView(view)"
+              >
+                <ArrowRight :size="14" />
+                打开
+              </button>
+            </article>
+          </div>
+        </div>
+      </template>
+
       <template v-else>
         <div class="empty-state" style="padding: 60px 20px;">
           {{ t('taskList.performanceSoon') }}
@@ -559,14 +642,6 @@ onBeforeUnmount(() => {
       :source-language="importDialogContext.sourceLanguage"
       :target-language="importDialogContext.targetLanguage"
       @close="showImportDialog = false"
-    />
-    <IssueMarkerDialog
-      :open="showIssueDialog"
-      :project-id="issueTarget?.project_id ?? null"
-      :file-record-id="issueTarget?.id ?? null"
-      :context-label="issueTarget?.filename ?? ''"
-      @close="showIssueDialog = false"
-      @saved="handleIssueSaved"
     />
   </div>
 </template>
@@ -584,6 +659,81 @@ onBeforeUnmount(() => {
   margin: 0 20px 12px;
 }
 
+.task-merge-views {
+  display: grid;
+  gap: 12px;
+  padding: 16px 20px 20px;
+}
+
+.task-merge-views__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.task-merge-views__head > div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.task-merge-views__head strong {
+  color: var(--text-primary);
+  font-size: 15px;
+}
+
+.task-merge-views__head span {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.task-merge-views__empty {
+  min-height: 220px;
+}
+
+.task-merge-view-list {
+  display: grid;
+  gap: 10px;
+}
+
+.task-merge-view-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+}
+
+.task-merge-view-card__main {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.task-merge-view-card__main strong,
+.task-merge-view-card__main span,
+.task-merge-view-card__main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-merge-view-card__main strong {
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.task-merge-view-card__main span,
+.task-merge-view-card__main small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 .project-link {
   display: inline-block;
   max-width: 100%;
@@ -598,18 +748,26 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.task-name-cell {
-  display: inline-block;
-  max-width: 100%;
+.task-main-cell,
+.task-file-progress {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.task-main-cell__meta {
+  display: block;
   overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.3;
   text-overflow: ellipsis;
-  vertical-align: middle;
   white-space: nowrap;
 }
 
 .table-page__body :deep(.data-table) {
   table-layout: fixed;
-  min-width: 1180px;
+  min-width: 960px;
 }
 
 .table-page__body :deep(.data-table th),
@@ -659,26 +817,6 @@ onBeforeUnmount(() => {
   position: relative;
 }
 
-.issue-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  min-height: 24px;
-  padding: 3px 8px;
-  border: 1px solid var(--line-soft);
-  border-radius: 999px;
-  background: var(--surface-muted);
-  color: var(--text-muted);
-  font-size: 12px;
-  box-shadow: none;
-}
-
-.issue-badge.is-active {
-  border-color: color-mix(in srgb, var(--state-warning) 45%, var(--line-soft));
-  background: var(--state-warning-bg);
-  color: var(--state-warning);
-}
-
 .task-action-menu {
   position: relative;
 }
@@ -720,6 +858,18 @@ onBeforeUnmount(() => {
 
 .task-action-menu__dropdown button.is-danger:hover {
   background: var(--state-danger-bg);
+}
+
+@media (max-width: 720px) {
+  .task-merge-view-card {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .task-merge-view-card .button {
+    width: 100%;
+    justify-content: center;
+  }
 }
 
 </style>

@@ -69,6 +69,32 @@ CREATE TRIGGER update_memory_bases_updated_at
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
+CREATE TABLE IF NOT EXISTS resource_import_batches (
+    id UUID PRIMARY KEY DEFAULT (
+        lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
+        lpad(to_hex(floor(random() * 65536)::int), 4, '0') || '-' ||
+        '4' || substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        substr('89ab', floor(random() * 4)::int + 1, 1) ||
+        substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
+    )::uuid,
+    resource_type VARCHAR(20) NOT NULL,
+    resource_id UUID,
+    filename TEXT NOT NULL,
+    file_size_bytes INTEGER NOT NULL DEFAULT 0,
+    file_format VARCHAR(20) NOT NULL DEFAULT '',
+    source_language VARCHAR(20),
+    target_language VARCHAR(20),
+    tmx_header_metadata JSONB,
+    created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS ix_resource_import_batches_resource
+    ON resource_import_batches (resource_type, resource_id);
+CREATE INDEX IF NOT EXISTS ix_resource_import_batches_created_at
+    ON resource_import_batches (created_at);
+
 -- -----------------------------------------------------------------------------
 -- 2. 翻译记忆条目（支持 trigram + pgvector 混合检索）
 -- -----------------------------------------------------------------------------
@@ -89,6 +115,10 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     source_language VARCHAR(20),
     target_language VARCHAR(20),
     creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    external_tuid TEXT,
+    tmx_metadata JSONB,
+    import_batch_id UUID REFERENCES resource_import_batches(id) ON DELETE SET NULL,
     source_embedding vector(128),
     source_embedding_version INTEGER,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -101,9 +131,23 @@ ALTER TABLE IF EXISTS memory_entries
     ADD COLUMN IF NOT EXISTS target_language VARCHAR(20);
 ALTER TABLE IF EXISTS memory_entries
     ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE IF EXISTS memory_entries
+    ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE IF EXISTS memory_entries
+    ADD COLUMN IF NOT EXISTS external_tuid TEXT;
+ALTER TABLE IF EXISTS memory_entries
+    ADD COLUMN IF NOT EXISTS tmx_metadata JSONB;
+ALTER TABLE IF EXISTS memory_entries
+    ADD COLUMN IF NOT EXISTS import_batch_id UUID REFERENCES resource_import_batches(id) ON DELETE SET NULL;
 
 CREATE INDEX IF NOT EXISTS ix_memory_entries_creator_id
     ON memory_entries (creator_id);
+CREATE INDEX IF NOT EXISTS ix_memory_entries_last_modified_by_id
+    ON memory_entries (last_modified_by_id);
+CREATE INDEX IF NOT EXISTS ix_memory_entries_external_tuid
+    ON memory_entries (external_tuid);
+CREATE INDEX IF NOT EXISTS ix_memory_entries_import_batch_id
+    ON memory_entries (import_batch_id);
 
 CREATE INDEX IF NOT EXISTS ix_memory_entries_collection_id
     ON memory_entries (collection_id);
@@ -232,6 +276,10 @@ CREATE TABLE IF NOT EXISTS term_entries (
     source_language VARCHAR(20) NOT NULL,
     target_language VARCHAR(20) NOT NULL,
     creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    external_tuid TEXT,
+    tmx_metadata JSONB,
+    import_batch_id UUID REFERENCES resource_import_batches(id) ON DELETE SET NULL,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -245,12 +293,26 @@ ALTER TABLE IF EXISTS term_entries
 ALTER TABLE IF EXISTS term_entries
     ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL;
 ALTER TABLE IF EXISTS term_entries
+    ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE IF EXISTS term_entries
+    ADD COLUMN IF NOT EXISTS external_tuid TEXT;
+ALTER TABLE IF EXISTS term_entries
+    ADD COLUMN IF NOT EXISTS tmx_metadata JSONB;
+ALTER TABLE IF EXISTS term_entries
+    ADD COLUMN IF NOT EXISTS import_batch_id UUID REFERENCES resource_import_batches(id) ON DELETE SET NULL;
+ALTER TABLE IF EXISTS term_entries
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
 ALTER TABLE IF EXISTS term_entries
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
 
 CREATE INDEX IF NOT EXISTS ix_term_entries_creator_id
     ON term_entries (creator_id);
+CREATE INDEX IF NOT EXISTS ix_term_entries_last_modified_by_id
+    ON term_entries (last_modified_by_id);
+CREATE INDEX IF NOT EXISTS ix_term_entries_external_tuid
+    ON term_entries (external_tuid);
+CREATE INDEX IF NOT EXISTS ix_term_entries_import_batch_id
+    ON term_entries (import_batch_id);
 
 CREATE INDEX IF NOT EXISTS ix_term_entries_term_base_id
     ON term_entries (term_base_id);
@@ -258,6 +320,8 @@ CREATE INDEX IF NOT EXISTS ix_term_entries_term_base_source_text
     ON term_entries (term_base_id, source_text);
 CREATE INDEX IF NOT EXISTS ix_term_entries_term_base_source_normalized
     ON term_entries (term_base_id, source_normalized);
+CREATE INDEX IF NOT EXISTS ix_term_entries_term_base_updated_created
+    ON term_entries (term_base_id, updated_at DESC, created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_term_entries_language_pair
     ON term_entries (source_language, target_language);
 
@@ -361,6 +425,7 @@ CREATE TABLE IF NOT EXISTS glossary_entries (
     source_language VARCHAR(20) NOT NULL,
     target_language VARCHAR(20) NOT NULL,
     creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -376,12 +441,16 @@ ALTER TABLE IF EXISTS glossary_entries
 ALTER TABLE IF EXISTS glossary_entries
     ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL;
 ALTER TABLE IF EXISTS glossary_entries
+    ADD COLUMN IF NOT EXISTS last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE IF EXISTS glossary_entries
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
 ALTER TABLE IF EXISTS glossary_entries
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
 
 CREATE INDEX IF NOT EXISTS ix_glossary_entries_creator_id
     ON glossary_entries (creator_id);
+CREATE INDEX IF NOT EXISTS ix_glossary_entries_last_modified_by_id
+    ON glossary_entries (last_modified_by_id);
 CREATE INDEX IF NOT EXISTS ix_glossary_entries_glossary_base_id
     ON glossary_entries (glossary_base_id);
 CREATE INDEX IF NOT EXISTS ix_glossary_entries_base_source_text
@@ -418,6 +487,8 @@ CREATE TABLE IF NOT EXISTS projects (
     deadline TIMESTAMP,
     access_level VARCHAR(20) NOT NULL DEFAULT 'team',
     translation_guidelines TEXT NOT NULL DEFAULT '',
+    quality_qa_settings TEXT NOT NULL DEFAULT '{}',
+    auto_tm_enabled BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -426,6 +497,10 @@ ALTER TABLE IF EXISTS projects
     ADD COLUMN IF NOT EXISTS document_parse_mode VARCHAR(20) NOT NULL DEFAULT 'full';
 ALTER TABLE IF EXISTS projects
     ADD COLUMN IF NOT EXISTS translation_guidelines TEXT NOT NULL DEFAULT '';
+ALTER TABLE IF EXISTS projects
+    ADD COLUMN IF NOT EXISTS quality_qa_settings TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE IF EXISTS projects
+    ADD COLUMN IF NOT EXISTS auto_tm_enabled BOOLEAN NOT NULL DEFAULT TRUE;
 
 CREATE INDEX IF NOT EXISTS ix_projects_creator_id
     ON projects (creator_id);
@@ -702,11 +777,17 @@ CREATE TABLE IF NOT EXISTS file_assignments (
     assigned_at TIMESTAMP NOT NULL DEFAULT NOW(),
     revoked_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
     revoked_at TIMESTAMP,
-    status VARCHAR(20) NOT NULL DEFAULT 'active'
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    segment_range_start INTEGER,
+    segment_range_end INTEGER
 );
 
 ALTER TABLE IF EXISTS file_assignments
     ADD COLUMN IF NOT EXISTS workflow_step_id UUID REFERENCES project_workflow_steps(id) ON DELETE CASCADE;
+ALTER TABLE IF EXISTS file_assignments
+    ADD COLUMN IF NOT EXISTS segment_range_start INTEGER;
+ALTER TABLE IF EXISTS file_assignments
+    ADD COLUMN IF NOT EXISTS segment_range_end INTEGER;
 
 CREATE TABLE IF NOT EXISTS assignment_events (
     id UUID PRIMARY KEY DEFAULT (
@@ -947,6 +1028,21 @@ CREATE INDEX IF NOT EXISTS ix_segments_file_record_order
     ON segments (file_record_id, block_index, row_index, cell_index, sentence_id);
 CREATE INDEX IF NOT EXISTS ix_segments_workflow_step_id
     ON segments (workflow_step_id);
+-- 检索/筛选加速：scope、status_filters、match_filters 频繁按这些列过滤。
+CREATE INDEX IF NOT EXISTS ix_segments_file_record_status
+    ON segments (file_record_id, status);
+CREATE INDEX IF NOT EXISTS ix_segments_file_record_source
+    ON segments (file_record_id, source);
+-- 增量游标端点 /segments/changes 按 updated_at 过滤并排序。
+CREATE INDEX IF NOT EXISTS ix_segments_updated_at
+    ON segments (updated_at);
+-- 文本检索：ilike('%kw%') 双向通配无法走 B-tree，改用 pg_trgm GIN 索引加速。
+CREATE INDEX IF NOT EXISTS ix_segments_source_text_trgm
+    ON segments USING GIN (source_text gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS ix_segments_display_text_trgm
+    ON segments USING GIN (display_text gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS ix_segments_target_text_trgm
+    ON segments USING GIN (target_text gin_trgm_ops);
 
 DROP TRIGGER IF EXISTS update_segments_updated_at ON segments;
 CREATE TRIGGER update_segments_updated_at
@@ -1038,6 +1134,64 @@ CREATE TRIGGER update_issue_markers_updated_at
     EXECUTE FUNCTION update_updated_at_column();
 
 -- -----------------------------------------------------------------------------
+-- 8.1 Segment spelling / grammar QA issues
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS segment_qa_issues (
+    id UUID PRIMARY KEY DEFAULT (
+        lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
+        lpad(to_hex(floor(random() * 65536)::int), 4, '0') || '-' ||
+        '4' || substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        substr('89ab', floor(random() * 4)::int + 1, 1) ||
+        substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
+    )::uuid,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+    segment_id UUID NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+    sentence_id VARCHAR(40) NOT NULL DEFAULT '',
+    rule_key VARCHAR(40) NOT NULL DEFAULT 'spelling_grammar',
+    provider VARCHAR(40) NOT NULL DEFAULT 'languagetool',
+    language VARCHAR(20) NOT NULL DEFAULT '',
+    severity VARCHAR(20) NOT NULL DEFAULT 'medium',
+    message TEXT NOT NULL DEFAULT '',
+    short_message TEXT NOT NULL DEFAULT '',
+    rule_id VARCHAR(120) NOT NULL DEFAULT '',
+    rule_category VARCHAR(120) NOT NULL DEFAULT '',
+    issue_type VARCHAR(80) NOT NULL DEFAULT '',
+    context_text TEXT NOT NULL DEFAULT '',
+    "offset" INTEGER NOT NULL DEFAULT 0,
+    length INTEGER NOT NULL DEFAULT 0,
+    replacements TEXT NOT NULL DEFAULT '[]',
+    target_text_hash VARCHAR(64) NOT NULL DEFAULT '',
+    status VARCHAR(20) NOT NULL DEFAULT 'open',
+    ignored_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    ignored_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_project_id
+    ON segment_qa_issues (project_id);
+CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_file_record_id
+    ON segment_qa_issues (file_record_id);
+CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_segment_id
+    ON segment_qa_issues (segment_id);
+CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_segment_rule_status
+    ON segment_qa_issues (segment_id, rule_key, status);
+CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_status
+    ON segment_qa_issues (status);
+CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_rule_key
+    ON segment_qa_issues (rule_key);
+CREATE INDEX IF NOT EXISTS ix_segment_qa_issues_target_hash
+    ON segment_qa_issues (target_text_hash);
+
+DROP TRIGGER IF EXISTS update_segment_qa_issues_updated_at ON segment_qa_issues;
+CREATE TRIGGER update_segment_qa_issues_updated_at
+    BEFORE UPDATE ON segment_qa_issues
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- -----------------------------------------------------------------------------
 -- 9. Segment revisions
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS segment_revisions (
@@ -1070,6 +1224,97 @@ CREATE INDEX IF NOT EXISTS ix_segment_revisions_sentence_id
     ON segment_revisions (sentence_id);
 CREATE INDEX IF NOT EXISTS ix_segment_revisions_status
     ON segment_revisions (status);
+
+-- -----------------------------------------------------------------------------
+-- 10. Revision display settings
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS revision_display_settings (
+    id UUID PRIMARY KEY DEFAULT (
+        lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
+        lpad(to_hex(floor(random() * 65536)::int), 4, '0') || '-' ||
+        '4' || substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        substr('89ab', floor(random() * 4)::int + 1, 1) ||
+        substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
+    )::uuid,
+    file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
+    show_author_time BOOLEAN NOT NULL DEFAULT TRUE,
+    show_others_revisions BOOLEAN NOT NULL DEFAULT TRUE,
+    default_insert_color VARCHAR(20) NOT NULL DEFAULT '#2563eb',
+    default_delete_color VARCHAR(20) NOT NULL DEFAULT '#dc2626',
+    author_colors JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_revision_display_settings_file_record_id UNIQUE (file_record_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_revision_display_settings_file_record_id
+    ON revision_display_settings (file_record_id);
+CREATE INDEX IF NOT EXISTS ix_revision_display_settings_updated_by_id
+    ON revision_display_settings (updated_by_id);
+
+-- -----------------------------------------------------------------------------
+-- 7. 项目"合并视图"：记录哪些 file_records 组成一个编辑视图（仅持久化分组）
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS project_merge_views (
+    id UUID PRIMARY KEY DEFAULT (
+        lpad(to_hex(floor(random() * 4294967296)::bigint), 8, '0') || '-' ||
+        lpad(to_hex(floor(random() * 65536)::int), 4, '0') || '-' ||
+        '4' || substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        substr('89ab', floor(random() * 4)::int + 1, 1) ||
+        substr(lpad(to_hex(floor(random() * 4096)::int), 3, '0'), 1, 3) || '-' ||
+        lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
+    )::uuid,
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name VARCHAR(200) NOT NULL,
+    file_ids TEXT NOT NULL DEFAULT '[]',
+    creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS ix_project_merge_views_project_id
+    ON project_merge_views (project_id);
+
+CREATE INDEX IF NOT EXISTS ix_project_merge_views_creator_id
+    ON project_merge_views (creator_id);
+
+DROP TRIGGER IF EXISTS update_project_merge_views_updated_at ON project_merge_views;
+
+CREATE TRIGGER update_project_merge_views_updated_at
+    BEFORE UPDATE ON project_merge_views
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- -----------------------------------------------------------------------------
+-- 11. Translation guideline templates
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS guideline_templates (
+    id VARCHAR(120) PRIMARY KEY,
+    name VARCHAR(120) NOT NULL,
+    filename VARCHAR(255) NOT NULL,
+    content TEXT NOT NULL,
+    content_hash VARCHAR(64) NOT NULL DEFAULT '',
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    source_path VARCHAR(255),
+    created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    last_modified_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS ix_guideline_templates_updated_at
+    ON guideline_templates (updated_at);
+CREATE INDEX IF NOT EXISTS ix_guideline_templates_created_by_id
+    ON guideline_templates (created_by_id);
+CREATE INDEX IF NOT EXISTS ix_guideline_templates_last_modified_by_id
+    ON guideline_templates (last_modified_by_id);
+
+DROP TRIGGER IF EXISTS update_guideline_templates_updated_at ON guideline_templates;
+CREATE TRIGGER update_guideline_templates_updated_at
+    BEFORE UPDATE ON guideline_templates
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
 
 -- =============================================================================
 -- 完成。首次运行后请通过前端 "/login" 页面使用首次初始化接口创建管理员账号：

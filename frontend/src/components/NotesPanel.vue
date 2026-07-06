@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import type {
@@ -40,6 +40,7 @@ const emit = defineEmits<{
 }>()
 
 const draftBody = ref('')
+const draftTextareaRef = ref<HTMLTextAreaElement | null>(null)
 const editingCommentId = ref<string | null>(null)
 const editingBody = ref('')
 const replyingToCommentId = ref<string | null>(null)
@@ -149,11 +150,13 @@ function toggleStatus(comment: SegmentComment) {
   })
 }
 
-watch(() => props.draftAnchor, (draftAnchor) => {
+watch(() => props.draftAnchor, async (draftAnchor) => {
   if (draftAnchor) {
     draftBody.value = ''
+    await nextTick()
+    draftTextareaRef.value?.focus()
   }
-})
+}, { immediate: true })
 </script>
 
 <template>
@@ -179,6 +182,7 @@ watch(() => props.draftAnchor, (draftAnchor) => {
       </div>
       <div class="notes-panel__anchor">{{ draftSummary }}</div>
       <textarea
+        ref="draftTextareaRef"
         v-model="draftBody"
         class="notes-panel__textarea"
         rows="4"

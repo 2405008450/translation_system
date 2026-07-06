@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import Literal
-from uuid import UUID
+import logging
+from concurrent.futures import CancelledError, ThreadPoolExecutor
+from typing import Any, Literal
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.auth import get_current_user, require_admin
-from app.database import get_db
-from app.models import FileRecord, TermBase, TermEntry, User
+from app.auth import can_access_all_projects, get_current_user, is_admin_role, require_admin
+from app.config import get_settings
+from app.database import SessionLocal, get_db
+from app.models import FileAssignment, FileRecord, ProjectAssignment, TermBase, TermEntry, User
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import normalize_match_text, normalize_text
 from app.services.notification_service import (
@@ -23,6 +27,7 @@ from app.services.notification_service import (
 from app.services.resource_export_queue import (
     ResourceExportFormat,
     build_resource_export_download_response,
+    cancel_resource_export_task,
     ensure_export_task_status,
     queue_resource_export,
 )
@@ -32,13 +37,37 @@ from app.services.term_entry_service import (
 )
 from app.services.term_importer import (
     TERM_IMPORT_EXTENSIONS,
+    TBX_EXTENSIONS,
+    TMX_EXTENSIONS,
+    XLSX_EXTENSIONS,
+    import_terms_from_tbx_path,
+    import_terms_from_tmx_path,
+    import_terms_from_xlsx_path,
     import_terms_from_xlsx_upload,
+    preview_terms_from_tbx_path,
+    preview_terms_from_tmx_path,
+    preview_terms_from_xlsx_path,
     preview_terms_from_upload,
 )
+from app.services.resource_import_batch import create_resource_import_batch
+from app.services.import_task_storage import (
+    cleanup_import_task_staging,
+    read_import_file_bytes,
+    stage_import_file_streams,
+)
+from app.services.import_task_state import (
+    ImportTaskCanceled,
+    import_task_cancel_requested,
+    raise_if_import_task_canceled,
+    set_import_task_status,
+)
+from app.services.task_file_service import UploadLimitError
 from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_response
 
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
+logger = logging.getLogger(__name__)
+_TERM_RESOURCE_IMPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="term-resource-import")
 
 
 class TermBasePayload(BaseModel):
@@ -57,6 +86,7 @@ class TermBaseMergePayload(BaseModel):
 class TermEntryUpdatePayload(BaseModel):
     source_text: str
     target_text: str
+    file_record_id: UUID | None = None
 
 
 class TermEntryDraftPayload(BaseModel):
@@ -165,6 +195,9 @@ def _serialize_term_entry(entry: TermEntry) -> dict:
     creator_name = None
     if entry.creator:
         creator_name = entry.creator.nickname or entry.creator.username
+    last_modified_by_name = None
+    if entry.last_modified_by:
+        last_modified_by_name = entry.last_modified_by.nickname or entry.last_modified_by.username
     return {
         "id": entry.id,
         "term_base_id": entry.term_base_id,
@@ -172,18 +205,82 @@ def _serialize_term_entry(entry: TermEntry) -> dict:
         "target_text": entry.target_text,
         "source_language": entry.source_language,
         "target_language": entry.target_language,
+        "creator_id": entry.creator_id,
         "creator_name": creator_name,
+        "last_modified_by_id": entry.last_modified_by_id,
+        "last_modified_by_name": last_modified_by_name,
         "created_at": entry.created_at.isoformat(),
         "updated_at": entry.updated_at.isoformat(),
     }
 
 
-def _validate_term_import_upload(file: UploadFile, raw_bytes: bytes | None = None) -> None:
+def _validate_term_import_upload(file: UploadFile, raw_bytes: bytes | None = None) -> str:
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
     if extension not in TERM_IMPORT_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="仅支持上传 .xls、.xlsx 或 .csv 文件。")
+        raise HTTPException(status_code=400, detail="仅支持上传 .tmx、.xls、.xlsx 或 .csv 文件。")
     if raw_bytes is not None and not raw_bytes:
         raise HTTPException(status_code=400, detail="上传的术语文件为空。")
+    return extension
+
+
+def _resource_import_preview_max_scan_rows() -> int:
+    settings = get_settings()
+    term_limit = int(settings.term_import_preview_max_scan_rows or 5000)
+    resource_limit = int(settings.resource_import_preview_max_scan_rows or 1000)
+    return max(1, min(term_limit, resource_limit, 10000))
+
+
+def _resource_import_batch_size() -> int:
+    value = int(get_settings().resource_import_batch_size or 1000)
+    return max(1, min(value, 5000))
+
+
+def _resource_import_max_file_bytes(_: str) -> int:
+    return max(1, int(get_settings().resource_import_max_size_mb or 1024)) * 1024 * 1024
+
+
+def _stage_resource_upload_file(file: UploadFile) -> tuple[str, dict[str, Any]]:
+    task_id = str(uuid4())
+    try:
+        staged = stage_import_file_streams(
+            task_id,
+            [(file.filename or "uploaded", file.file)],
+            max_files=1,
+            max_size_resolver=_resource_import_max_file_bytes,
+            max_total_bytes=_resource_import_max_file_bytes(file.filename or "uploaded"),
+        )[0]
+        return task_id, staged
+    except UploadLimitError as exc:
+        cleanup_import_task_staging(task_id)
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except Exception:
+        cleanup_import_task_staging(task_id)
+        raise
+
+
+async def _queue_term_resource_import_task(task_id: str, payload: dict[str, Any]) -> None:
+    from app.routers.api import _enqueue_arq_job
+
+    if await _enqueue_arq_job("term_resource_import_job", task_id, payload):
+        return
+    future = _TERM_RESOURCE_IMPORT_EXECUTOR.submit(_run_term_resource_import_task, task_id, payload)
+    future.add_done_callback(_log_local_term_resource_import_failure(task_id))
+
+
+def _log_local_term_resource_import_failure(task_id: str):
+    def _callback(done: Any) -> None:
+        try:
+            exc = done.exception()
+        except CancelledError:
+            return
+        if exc is not None:
+            logger.error(
+                "local term resource import task failed task_id=%s",
+                task_id,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+    return _callback
 
 
 def _parse_import_row_indexes(value: str | None) -> set[int]:
@@ -223,6 +320,73 @@ def _load_bound_ids(file_record: FileRecord, field_name: str) -> list[str]:
 
 def _load_bound_term_base_ids(file_record: FileRecord) -> list[str]:
     return _load_bound_ids(file_record, "term_base_ids")
+
+
+def _file_record_allows_term_base_write(file_record: FileRecord, term_base_id: UUID) -> bool:
+    term_base_id_text = str(term_base_id)
+    enabled_ids = set(_load_bound_term_base_ids(file_record))
+    writable_ids = set(_load_bound_ids(file_record, "term_base_write_ids"))
+    return term_base_id_text in enabled_ids and term_base_id_text in writable_ids
+
+
+def _can_use_file_record_term_write_context(
+    db: Session,
+    file_record: FileRecord,
+    current_user: User,
+) -> bool:
+    if can_access_all_projects(current_user):
+        return True
+
+    user_id = getattr(current_user, "id", None)
+    if user_id is None or file_record.project_id is None:
+        return False
+
+    has_project_assignment = (
+        db.query(ProjectAssignment.id)
+        .filter(
+            ProjectAssignment.project_id == file_record.project_id,
+            ProjectAssignment.assignee_id == user_id,
+            ProjectAssignment.status == "active",
+        )
+        .first()
+        is not None
+    )
+    if not has_project_assignment:
+        return False
+
+    return (
+        db.query(FileAssignment.id)
+        .filter(
+            FileAssignment.file_record_id == file_record.id,
+            FileAssignment.assignee_id == user_id,
+            FileAssignment.status == "active",
+        )
+        .first()
+        is not None
+    )
+
+
+def _require_term_entry_create_access(
+    db: Session,
+    term_base_id: UUID,
+    file_record_id: UUID | None,
+    current_user: User,
+) -> None:
+    if is_admin_role(getattr(current_user, "role", None)):
+        return
+
+    if file_record_id is None:
+        raise HTTPException(status_code=403, detail="请从已开启写入权限的项目文件中添加术语。")
+
+    file_record = db.query(FileRecord).filter(FileRecord.id == file_record_id).first()
+    if file_record is None:
+        raise HTTPException(status_code=404, detail="文件不存在。")
+
+    if not _can_use_file_record_term_write_context(db, file_record, current_user):
+        raise HTTPException(status_code=403, detail="当前账号没有处理该文件的权限。")
+
+    if not _file_record_allows_term_base_write(file_record, term_base_id):
+        raise HTTPException(status_code=403, detail="目标术语库未在当前项目设置中开启写入权限。")
 
 
 def _store_bound_term_base_ids(file_record: FileRecord, term_base_ids: list[str]) -> None:
@@ -375,7 +539,9 @@ def merge_term_bases(
                 existing.source_normalized = source_normalized
                 existing.source_language = source_language
                 existing.target_language = target_language
-                existing.creator_id = entry.creator_id or current_user.id
+                if existing.creator_id is None:
+                    existing.creator_id = entry.creator_id or current_user.id
+                existing.last_modified_by_id = current_user.id
                 merged_by_source_normalized[source_normalized] = existing
                 merged_by_source_text[source_text] = existing
                 updated_rows += 1
@@ -389,6 +555,7 @@ def merge_term_bases(
                 source_language=source_language,
                 target_language=target_language,
                 creator_id=entry.creator_id or current_user.id,
+                last_modified_by_id=current_user.id,
             )
             db.add(merged_entry)
             merged_by_source_normalized[source_normalized] = merged_entry
@@ -512,19 +679,19 @@ def delete_term_base(
     return {"message": "术语库已删除。", "deleted_entries": entry_count}
 
 
-@router.post("/term-bases/import-xlsx/preview")
+@router.post("/term-bases/import/preview")
 async def preview_term_base_xlsx(
     file: UploadFile = File(...),
     term_base_id: UUID | None = Form(default=None),
     source_language: str = Form(...),
     target_language: str = Form(...),
     preview_limit: int = Form(default=100),
+    skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
-    _validate_term_import_upload(file)
-    raw_bytes = await file.read()
-    _validate_term_import_upload(file, raw_bytes)
+    extension = _validate_term_import_upload(file)
+    task_id, staged_file = await asyncio.to_thread(_stage_resource_upload_file, file)
 
     term_base = _get_term_base_or_404(db, term_base_id) if term_base_id else None
     if term_base is not None:
@@ -540,17 +707,58 @@ async def preview_term_base_xlsx(
         )
 
     try:
-        preview = preview_terms_from_upload(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=file.filename or "uploaded.xlsx",
-            term_base_id=term_base_id,
-            source_language=resolved_source_language,
-            target_language=resolved_target_language,
-            preview_limit=max(1, min(preview_limit, 500)),
-        )
+        if extension in TBX_EXTENSIONS:
+            preview = preview_terms_from_tbx_path(
+                db=db,
+                tbx_path=staged_file["path"],
+                filename=file.filename or "uploaded.tbx",
+                term_base_id=term_base_id,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                preview_limit=max(1, min(preview_limit, 500)),
+                skip_header=skip_header,
+                max_scan_rows=_resource_import_preview_max_scan_rows(),
+            )
+        elif extension in TMX_EXTENSIONS:
+            preview = preview_terms_from_tmx_path(
+                db=db,
+                tmx_path=staged_file["path"],
+                filename=file.filename or "uploaded.tmx",
+                term_base_id=term_base_id,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                preview_limit=max(1, min(preview_limit, 500)),
+                skip_header=skip_header,
+                max_scan_rows=_resource_import_preview_max_scan_rows(),
+            )
+        elif extension in XLSX_EXTENSIONS:
+            preview = preview_terms_from_xlsx_path(
+                db=db,
+                xlsx_path=staged_file["path"],
+                filename=file.filename or "uploaded.xlsx",
+                term_base_id=term_base_id,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                preview_limit=max(1, min(preview_limit, 500)),
+                skip_header=skip_header,
+                max_scan_rows=_resource_import_preview_max_scan_rows(),
+            )
+        else:
+            preview = preview_terms_from_upload(
+                db=db,
+                raw_bytes=read_import_file_bytes(staged_file),
+                filename=file.filename or "uploaded.xlsx",
+                term_base_id=term_base_id,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                preview_limit=max(1, min(preview_limit, 500)),
+                skip_header=skip_header,
+                max_scan_rows=_resource_import_preview_max_scan_rows(),
+            )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"术语库预览失败：{exc}") from exc
+    finally:
+        cleanup_import_task_staging(task_id)
 
     return {
         "filename": preview.filename,
@@ -572,6 +780,9 @@ async def preview_term_base_xlsx(
         "skipped_empty_rows": preview.skipped_empty_rows,
         "skipped_header_rows": preview.skipped_header_rows,
         "preview_limit": preview.preview_limit,
+        "scanned_rows": preview.scanned_rows,
+        "truncated": preview.truncated,
+        "max_scan_rows": _resource_import_preview_max_scan_rows(),
         "term_base_id": str(term_base.id) if term_base else None,
         "term_base_name": term_base.name if term_base else "",
         "source_language": resolved_source_language,
@@ -579,67 +790,14 @@ async def preview_term_base_xlsx(
     }
 
 
-@router.post("/term-bases/import-xlsx")
-async def import_term_base_xlsx(
-    file: UploadFile = File(...),
-    term_base_id: UUID | None = Form(default=None),
-    source_language: str = Form(...),
-    target_language: str = Form(...),
-    skip_duplicate_row_indexes: str = Form(default="[]"),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
-):
-    if term_base_id is None:
-        raise HTTPException(status_code=400, detail="请先选择要导入的术语库。")
-
-    _validate_term_import_upload(file)
-
-    raw_bytes = await file.read()
-    _validate_term_import_upload(file, raw_bytes)
-
-    term_base = _get_term_base_or_404(db, term_base_id)
-    resolved_source_language, resolved_target_language = _resolve_term_base_language_pair(
-        term_base,
-        source_language,
-        target_language,
-    )
-    skipped_row_indexes = _parse_import_row_indexes(skip_duplicate_row_indexes)
-
-    try:
-        import_summary = import_terms_from_xlsx_upload(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=file.filename or "uploaded.xlsx",
-            term_base_id=term_base_id,
-            source_language=resolved_source_language,
-            target_language=resolved_target_language,
-            skip_duplicate_row_indexes=skipped_row_indexes,
-        )
-    except Exception as exc:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"术语库导入失败：{exc}") from exc
-
-    notification_title, notification_body = build_resource_import_notification(
-        resource_label="术语库",
-        resource_name=term_base.name,
-        filename=import_summary.filename,
-        imported_rows=import_summary.imported_rows,
-        created_rows=import_summary.created_rows,
-        updated_rows=import_summary.updated_rows,
-        skipped_empty_rows=import_summary.skipped_empty_rows,
-        skipped_header_rows=import_summary.skipped_header_rows,
-        source_language=resolved_source_language,
-        target_language=resolved_target_language,
-    )
-    create_operation_notification(
-        db,
-        user_id=current_user.id,
-        notification_type="resource_import",
-        title=notification_title,
-        body=notification_body,
-    )
-    db.commit()
-
+def _build_term_import_result_payload(
+    *,
+    import_summary,
+    term_base_response_id: UUID,
+    term_base_response_name: str,
+    resolved_source_language: str,
+    resolved_target_language: str,
+) -> dict[str, Any]:
     return {
         "filename": import_summary.filename,
         "created_rows": import_summary.created_rows,
@@ -648,11 +806,228 @@ async def import_term_base_xlsx(
         "skipped_empty_rows": import_summary.skipped_empty_rows,
         "skipped_header_rows": import_summary.skipped_header_rows,
         "imported_rows": import_summary.imported_rows,
-        "term_base_id": term_base.id,
-        "term_base_name": term_base.name,
+        "term_base_id": str(term_base_response_id),
+        "term_base_name": term_base_response_name,
         "source_language": resolved_source_language,
         "target_language": resolved_target_language,
     }
+
+
+def _run_term_resource_import_task(task_id: str, payload: dict[str, Any]) -> None:
+    staging_task_id = str(payload.get("staging_task_id") or task_id)
+    set_import_task_status(task_id, "running", progress=5, message="术语库导入开始处理。")
+    try:
+        raise_if_import_task_canceled(task_id)
+        with SessionLocal() as db:
+            file_payload = payload["file"]
+            filename = file_payload.get("filename") or "uploaded.xlsx"
+            extension = str(payload.get("extension") or "")
+            term_base_id = UUID(str(payload["term_base_id"]))
+            creator_id = UUID(str(payload["creator_id"]))
+            skipped_row_indexes = {
+                int(item)
+                for item in payload.get("skip_duplicate_row_indexes", [])
+                if int(item) > 0
+            }
+            import_batch = create_resource_import_batch(
+                db,
+                resource_type="term",
+                resource_id=term_base_id,
+                filename=filename,
+                file_path=file_payload["path"],
+                file_format=extension,
+                source_language=str(payload["source_language"]),
+                target_language=str(payload["target_language"]),
+                created_by_id=creator_id,
+            )
+            db.commit()
+
+            def cancel_check() -> bool:
+                return import_task_cancel_requested(task_id)
+
+            try:
+                set_import_task_status(task_id, "running", progress=20, message=f"正在导入 {filename}。")
+                if extension in TBX_EXTENSIONS:
+                    import_summary = import_terms_from_tbx_path(
+                        db=db,
+                        tbx_path=file_payload["path"],
+                        filename=filename,
+                        term_base_id=term_base_id,
+                        source_language=str(payload["source_language"]),
+                        target_language=str(payload["target_language"]),
+                        creator_id=creator_id,
+                        skip_duplicate_row_indexes=skipped_row_indexes,
+                        batch_size=_resource_import_batch_size(),
+                        cancel_check=cancel_check,
+                        import_batch_id=import_batch.id,
+                    )
+                elif extension in TMX_EXTENSIONS:
+                    import_summary = import_terms_from_tmx_path(
+                        db=db,
+                        tmx_path=file_payload["path"],
+                        filename=filename,
+                        term_base_id=term_base_id,
+                        source_language=str(payload["source_language"]),
+                        target_language=str(payload["target_language"]),
+                        creator_id=creator_id,
+                        skip_duplicate_row_indexes=skipped_row_indexes,
+                        batch_size=_resource_import_batch_size(),
+                        cancel_check=cancel_check,
+                        import_batch_id=import_batch.id,
+                    )
+                elif extension in XLSX_EXTENSIONS:
+                    import_summary = import_terms_from_xlsx_path(
+                        db=db,
+                        xlsx_path=file_payload["path"],
+                        filename=filename,
+                        term_base_id=term_base_id,
+                        source_language=str(payload["source_language"]),
+                        target_language=str(payload["target_language"]),
+                        creator_id=creator_id,
+                        skip_duplicate_row_indexes=skipped_row_indexes,
+                        skip_header=bool(payload.get("skip_header")),
+                        batch_size=_resource_import_batch_size(),
+                        cancel_check=cancel_check,
+                        import_batch_id=import_batch.id,
+                    )
+                else:
+                    import_summary = import_terms_from_xlsx_upload(
+                        db=db,
+                        raw_bytes=read_import_file_bytes(file_payload),
+                        filename=filename,
+                        term_base_id=term_base_id,
+                        source_language=str(payload["source_language"]),
+                        target_language=str(payload["target_language"]),
+                        creator_id=creator_id,
+                        skip_duplicate_row_indexes=skipped_row_indexes,
+                        skip_header=bool(payload.get("skip_header")),
+                        batch_size=_resource_import_batch_size(),
+                        cancel_check=cancel_check,
+                        import_batch_id=import_batch.id,
+                    )
+            except ImportTaskCanceled:
+                db.rollback()
+                raise
+            except Exception as exc:
+                db.rollback()
+                raise RuntimeError(f"术语库导入失败：{exc}") from exc
+            raise_if_import_task_canceled(task_id)
+            db.commit()
+
+            try:
+                set_import_task_status(task_id, "running", progress=90, message="正在写入导入通知。")
+                raise_if_import_task_canceled(task_id)
+                notification_title, notification_body = build_resource_import_notification(
+                    resource_label="术语库",
+                    resource_name=str(payload["term_base_name"]),
+                    filename=import_summary.filename,
+                    imported_rows=import_summary.imported_rows,
+                    created_rows=import_summary.created_rows,
+                    updated_rows=import_summary.updated_rows,
+                    skipped_empty_rows=import_summary.skipped_empty_rows,
+                    skipped_header_rows=import_summary.skipped_header_rows,
+                    source_language=str(payload["source_language"]),
+                    target_language=str(payload["target_language"]),
+                )
+                create_operation_notification(
+                    db,
+                    user_id=creator_id,
+                    notification_type="resource_import",
+                    title=notification_title,
+                    body=notification_body,
+                )
+                db.commit()
+            except ImportTaskCanceled:
+                db.rollback()
+                raise
+            except Exception:
+                db.rollback()
+                logger.exception("Term base import post-processing failed")
+
+            raise_if_import_task_canceled(task_id)
+            result = _build_term_import_result_payload(
+                import_summary=import_summary,
+                term_base_response_id=term_base_id,
+                term_base_response_name=str(payload["term_base_name"]),
+                resolved_source_language=str(payload["source_language"]),
+                resolved_target_language=str(payload["target_language"]),
+            )
+            set_import_task_status(
+                task_id,
+                "completed",
+                progress=100,
+                message="术语库导入完成。",
+                result=result,
+            )
+    except ImportTaskCanceled:
+        set_import_task_status(task_id, "canceled", progress=100, message="术语库导入已取消。")
+    except Exception as exc:
+        logger.exception("term resource import task failed task_id=%s", task_id)
+        set_import_task_status(
+            task_id,
+            "failed",
+            progress=100,
+            message="术语库导入失败。",
+            error=str(exc),
+        )
+    finally:
+        cleanup_import_task_staging(staging_task_id)
+
+
+@router.post("/term-bases/import-xlsx")
+@router.post("/term-bases/import", include_in_schema=False)
+async def import_term_base_xlsx(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    term_base_id: UUID | None = Form(default=None),
+    source_language: str = Form(...),
+    target_language: str = Form(...),
+    skip_duplicate_row_indexes: str = Form(default="[]"),
+    skip_header: bool = Form(default=False),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    if term_base_id is None:
+        raise HTTPException(status_code=400, detail="请先选择要导入的术语库。")
+
+    extension = _validate_term_import_upload(file)
+    task_id, staged_file = await asyncio.to_thread(_stage_resource_upload_file, file)
+    try:
+        term_base = _get_term_base_or_404(db, term_base_id)
+        resolved_source_language, resolved_target_language = _resolve_term_base_language_pair(
+            term_base,
+            source_language,
+            target_language,
+        )
+        db.commit()
+        skipped_row_indexes = _parse_import_row_indexes(skip_duplicate_row_indexes)
+        payload = {
+            "kind": "term_resource_import",
+            "staging_task_id": task_id,
+            "file": staged_file,
+            "extension": extension,
+            "term_base_id": str(term_base.id),
+            "term_base_name": term_base.name,
+            "source_language": resolved_source_language,
+            "target_language": resolved_target_language,
+            "skip_duplicate_row_indexes": sorted(skipped_row_indexes),
+            "skip_header": bool(skip_header),
+            "creator_id": str(current_user.id),
+        }
+        set_import_task_status(task_id, "queued", progress=0, message="术语库导入任务已进入队列。")
+        await _queue_term_resource_import_task(task_id, payload)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "task_id": task_id,
+                "status": "queued",
+                "progress": 0,
+                "message": "术语库导入任务已进入队列。",
+            },
+        )
+    except Exception:
+        cleanup_import_task_staging(task_id)
+        raise
 
 
 @router.post("/term-bases/{term_base_id}/entries/conflicts")
@@ -754,14 +1129,16 @@ def export_term_base_entries_xlsx(
     )
     xlsx_bytes = build_tabular_xlsx(
         sheet_title=term_base.name,
-        headers=["术语原文", "术语译文", "源语言", "目标语言", "创建时间", "更新时间"],
+        headers=["术语原文", "术语译文", "源语言", "目标语言", "创建人", "创建时间", "最后修改人", "更新时间"],
         rows=[
             [
                 entry.source_text,
                 entry.target_text,
                 entry.source_language,
                 entry.target_language,
+                (entry.creator.nickname or entry.creator.username) if entry.creator else "",
                 entry.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                (entry.last_modified_by.nickname or entry.last_modified_by.username) if entry.last_modified_by else "",
                 entry.updated_at.strftime("%Y-%m-%d %H:%M:%S"),
             ]
             for entry in rows
@@ -792,6 +1169,11 @@ def get_term_base_export_task(task_id: str):
     return ensure_export_task_status(task_id, expected_resource_type="term")
 
 
+@router.post("/term-bases/export-tasks/{task_id}/cancel")
+def cancel_term_base_export_task(task_id: str):
+    return cancel_resource_export_task(task_id, expected_resource_type="term")
+
+
 @router.get("/term-bases/export-tasks/{task_id}/download")
 def download_term_base_export_task(task_id: str):
     return build_resource_export_download_response(task_id, expected_resource_type="term")
@@ -802,9 +1184,15 @@ def create_term_base_entry(
     term_base_id: UUID,
     payload: TermEntryUpdatePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(get_current_user),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
+    _require_term_entry_create_access(
+        db,
+        term_base.id,
+        payload.file_record_id,
+        current_user,
+    )
     source_text = normalize_text(payload.source_text)
     target_text = normalize_text(payload.target_text)
     if not source_text or not target_text:
@@ -835,6 +1223,7 @@ def create_term_base_entry(
         source_language=term_base.source_language,
         target_language=term_base.target_language,
         creator_id=current_user.id,
+        last_modified_by_id=current_user.id,
     )
     db.add(entry)
     db.commit()
@@ -847,7 +1236,7 @@ def update_term_entry(
     entry_id: UUID,
     payload: TermEntryUpdatePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     entry = db.query(TermEntry).filter(TermEntry.id == entry_id).first()
     if entry is None:
@@ -885,6 +1274,9 @@ def update_term_entry(
     entry.source_normalized = source_normalized
     entry.source_language = source_language
     entry.target_language = target_language
+    if entry.creator_id is None:
+        entry.creator_id = current_user.id
+    entry.last_modified_by_id = current_user.id
     db.commit()
     db.refresh(entry)
     return _serialize_term_entry(entry)

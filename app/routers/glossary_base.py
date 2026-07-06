@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from uuid import UUID
+import logging
+from typing import Any
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import func, or_
@@ -11,11 +14,23 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user, require_admin
-from app.database import get_db
+from app.config import get_settings
+from app.database import SessionLocal, get_db
 from app.models import FileRecord, GlossaryBase, GlossaryEntry, User
 from app.services.glossary_importer import (
     XLSX_EXTENSIONS,
-    import_glossary_from_xlsx_upload,
+    import_glossary_from_xlsx_path,
+    preview_glossary_from_xlsx_path,
+)
+from app.services.import_task_storage import (
+    cleanup_import_task_staging,
+    stage_import_file_streams,
+)
+from app.services.import_task_state import (
+    ImportTaskCanceled,
+    import_task_cancel_requested,
+    raise_if_import_task_canceled,
+    set_import_task_status,
 )
 from app.services.language_pairs import require_language_pair
 from app.services.normalizer import normalize_match_text, normalize_text
@@ -26,13 +41,49 @@ from app.services.notification_service import (
 from app.services.resource_export_queue import (
     ResourceExportFormat,
     build_resource_export_download_response,
+    cancel_resource_export_task,
     ensure_export_task_status,
     queue_resource_export,
 )
 from app.services.xlsx_exporter import build_tabular_xlsx, build_xlsx_download_response
+from app.services.task_file_service import UploadLimitError
 
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
+logger = logging.getLogger(__name__)
+
+
+def _resource_import_preview_max_scan_rows() -> int:
+    value = int(get_settings().resource_import_preview_max_scan_rows or 1000)
+    return max(1, min(value, 10000))
+
+
+def _resource_import_batch_size() -> int:
+    value = int(get_settings().resource_import_batch_size or 1000)
+    return max(1, min(value, 5000))
+
+
+def _resource_import_max_file_bytes(_: str) -> int:
+    return max(1, int(get_settings().resource_import_max_size_mb or 1024)) * 1024 * 1024
+
+
+def _stage_resource_upload_file(file: UploadFile) -> tuple[str, dict[str, Any]]:
+    task_id = str(uuid4())
+    try:
+        staged = stage_import_file_streams(
+            task_id,
+            [(file.filename or "uploaded.xlsx", file.file)],
+            max_files=1,
+            max_size_resolver=_resource_import_max_file_bytes,
+            max_total_bytes=_resource_import_max_file_bytes(file.filename or "uploaded.xlsx"),
+        )[0]
+        return task_id, staged
+    except UploadLimitError as exc:
+        cleanup_import_task_staging(task_id)
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except Exception:
+        cleanup_import_task_staging(task_id)
+        raise
 
 
 class GlossaryBasePayload(BaseModel):
@@ -112,6 +163,9 @@ def _serialize_glossary_entry(entry: GlossaryEntry) -> dict:
     creator_name = None
     if entry.creator:
         creator_name = entry.creator.nickname or entry.creator.username
+    last_modified_by_name = None
+    if entry.last_modified_by:
+        last_modified_by_name = entry.last_modified_by.nickname or entry.last_modified_by.username
     return {
         "id": str(entry.id),
         "glossary_base_id": str(entry.glossary_base_id),
@@ -120,7 +174,10 @@ def _serialize_glossary_entry(entry: GlossaryEntry) -> dict:
         "note": entry.note or "",
         "source_language": entry.source_language,
         "target_language": entry.target_language,
+        "creator_id": str(entry.creator_id) if entry.creator_id else None,
         "creator_name": creator_name,
+        "last_modified_by_id": str(entry.last_modified_by_id) if entry.last_modified_by_id else None,
+        "last_modified_by_name": last_modified_by_name,
         "created_at": entry.created_at.isoformat(),
         "updated_at": entry.updated_at.isoformat(),
     }
@@ -271,12 +328,214 @@ def delete_glossary_base(
     return {"message": "词汇表已删除。", "deleted_entries": entry_count}
 
 
-@router.post("/glossary-bases/import-xlsx")
-async def import_glossary_base_xlsx(
+@router.post("/glossary-bases/import/preview")
+async def preview_glossary_base_xlsx(
     file: UploadFile = File(...),
     glossary_base_id: UUID | None = Form(default=None),
     source_language: str = Form(...),
     target_language: str = Form(...),
+    preview_limit: int = Form(default=100),
+    skip_header: bool = Form(default=False),
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
+    if extension not in XLSX_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="仅支持上传 .xlsx 文件。")
+    task_id, staged_file = await asyncio.to_thread(_stage_resource_upload_file, file)
+
+    glossary_base = _get_glossary_base_or_404(db, glossary_base_id) if glossary_base_id else None
+    if glossary_base is not None and glossary_base.source_language and glossary_base.target_language:
+        resolved_source_language, resolved_target_language = _require_glossary_language_pair(
+            source_language,
+            target_language,
+        )
+        if (
+            resolved_source_language != glossary_base.source_language
+            or resolved_target_language != glossary_base.target_language
+        ):
+            raise HTTPException(status_code=400, detail="所选词汇表的语言对与本次导入不一致。")
+    else:
+        resolved_source_language, resolved_target_language = _require_glossary_language_pair(
+            source_language,
+            target_language,
+        )
+
+    try:
+        preview = preview_glossary_from_xlsx_path(
+            db=db,
+            xlsx_path=staged_file["path"],
+            filename=file.filename or "uploaded.xlsx",
+            glossary_base_id=glossary_base_id,
+            source_language=resolved_source_language,
+            target_language=resolved_target_language,
+            preview_limit=max(1, min(preview_limit, 500)),
+            skip_header=skip_header,
+            max_scan_rows=_resource_import_preview_max_scan_rows(),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"词汇表预览失败：{exc}") from exc
+    finally:
+        cleanup_import_task_staging(task_id)
+
+    return {
+        "filename": preview.filename,
+        "rows": [
+            {
+                "row_index": row.row_index,
+                "source_text": row.source_text,
+                "target_text": row.target_text,
+                "note": row.note,
+                "status": row.status,
+                "message": row.message,
+            }
+            for row in preview.rows
+        ],
+        "total_rows": preview.total_rows,
+        "valid_rows": preview.valid_rows,
+        "create_rows": preview.create_rows,
+        "update_rows": preview.update_rows,
+        "duplicate_rows": preview.duplicate_rows,
+        "skipped_empty_rows": preview.skipped_empty_rows,
+        "skipped_header_rows": preview.skipped_header_rows,
+        "preview_limit": preview.preview_limit,
+        "scanned_rows": preview.scanned_rows,
+        "truncated": preview.truncated,
+        "max_scan_rows": _resource_import_preview_max_scan_rows(),
+        "glossary_base_id": str(glossary_base.id) if glossary_base else None,
+        "glossary_base_name": glossary_base.name if glossary_base else "",
+        "source_language": resolved_source_language,
+        "target_language": resolved_target_language,
+    }
+
+
+def _build_glossary_import_result_payload(
+    *,
+    import_summary,
+    glossary_base_response_id: UUID,
+    glossary_base_response_name: str,
+    resolved_source_language: str,
+    resolved_target_language: str,
+) -> dict[str, Any]:
+    return {
+        "filename": import_summary.filename,
+        "created_rows": import_summary.created_rows,
+        "updated_rows": import_summary.updated_rows,
+        "skipped_empty_rows": import_summary.skipped_empty_rows,
+        "skipped_header_rows": import_summary.skipped_header_rows,
+        "imported_rows": import_summary.imported_rows,
+        "glossary_base_id": str(glossary_base_response_id),
+        "glossary_base_name": glossary_base_response_name,
+        "source_language": resolved_source_language,
+        "target_language": resolved_target_language,
+    }
+
+
+def _run_glossary_resource_import_task(task_id: str, payload: dict[str, Any]) -> None:
+    staging_task_id = str(payload.get("staging_task_id") or task_id)
+    set_import_task_status(task_id, "running", progress=5, message="词汇表导入开始处理。")
+    try:
+        raise_if_import_task_canceled(task_id)
+        with SessionLocal() as db:
+            file_payload = payload["file"]
+            filename = file_payload.get("filename") or "uploaded.xlsx"
+            glossary_base_id = UUID(str(payload["glossary_base_id"]))
+            creator_id = UUID(str(payload["creator_id"]))
+
+            def cancel_check() -> bool:
+                return import_task_cancel_requested(task_id)
+
+            try:
+                set_import_task_status(task_id, "running", progress=20, message=f"正在导入 {filename}。")
+                import_summary = import_glossary_from_xlsx_path(
+                    db=db,
+                    xlsx_path=file_payload["path"],
+                    filename=filename,
+                    glossary_base_id=glossary_base_id,
+                    source_language=str(payload["source_language"]),
+                    target_language=str(payload["target_language"]),
+                    creator_id=creator_id,
+                    skip_header=bool(payload.get("skip_header")),
+                    batch_size=_resource_import_batch_size(),
+                    cancel_check=cancel_check,
+                )
+            except ImportTaskCanceled:
+                db.rollback()
+                raise
+            except Exception as exc:
+                db.rollback()
+                raise RuntimeError(f"词汇表导入失败：{exc}") from exc
+            raise_if_import_task_canceled(task_id)
+            db.commit()
+
+            try:
+                set_import_task_status(task_id, "running", progress=90, message="正在写入导入通知。")
+                raise_if_import_task_canceled(task_id)
+                notification_title, notification_body = build_resource_import_notification(
+                    resource_label="词汇表",
+                    resource_name=str(payload["glossary_base_name"]),
+                    filename=import_summary.filename,
+                    imported_rows=import_summary.imported_rows,
+                    created_rows=import_summary.created_rows,
+                    updated_rows=import_summary.updated_rows,
+                    skipped_empty_rows=import_summary.skipped_empty_rows,
+                    skipped_header_rows=import_summary.skipped_header_rows,
+                    source_language=str(payload["source_language"]),
+                    target_language=str(payload["target_language"]),
+                )
+                create_operation_notification(
+                    db,
+                    user_id=creator_id,
+                    notification_type="resource_import",
+                    title=notification_title,
+                    body=notification_body,
+                )
+                db.commit()
+            except ImportTaskCanceled:
+                db.rollback()
+                raise
+            except Exception:
+                db.rollback()
+                logger.exception("Glossary import post-processing failed")
+
+            raise_if_import_task_canceled(task_id)
+            result = _build_glossary_import_result_payload(
+                import_summary=import_summary,
+                glossary_base_response_id=glossary_base_id,
+                glossary_base_response_name=str(payload["glossary_base_name"]),
+                resolved_source_language=str(payload["source_language"]),
+                resolved_target_language=str(payload["target_language"]),
+            )
+            set_import_task_status(
+                task_id,
+                "completed",
+                progress=100,
+                message="词汇表导入完成。",
+                result=result,
+            )
+    except ImportTaskCanceled:
+        set_import_task_status(task_id, "canceled", progress=100, message="词汇表导入已取消。")
+    except Exception as exc:
+        logger.exception("glossary resource import task failed task_id=%s", task_id)
+        set_import_task_status(
+            task_id,
+            "failed",
+            progress=100,
+            message="词汇表导入失败。",
+            error=str(exc),
+        )
+    finally:
+        cleanup_import_task_staging(staging_task_id)
+
+
+@router.post("/glossary-bases/import-xlsx")
+async def import_glossary_base_xlsx(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    glossary_base_id: UUID | None = Form(default=None),
+    source_language: str = Form(...),
+    target_language: str = Form(...),
+    skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
@@ -285,63 +544,40 @@ async def import_glossary_base_xlsx(
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
     if extension not in XLSX_EXTENSIONS:
         raise HTTPException(status_code=400, detail="仅支持上传 .xlsx 文件。")
-    raw_bytes = await file.read()
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail="上传的 XLSX 文件为空。")
-
-    glossary_base = _get_glossary_base_or_404(db, glossary_base_id)
-    resolved_source_language, resolved_target_language = _resolve_glossary_base_language_pair(
-        glossary_base,
-        source_language,
-        target_language,
-    )
+    task_id, staged_file = await asyncio.to_thread(_stage_resource_upload_file, file)
     try:
-        import_summary = import_glossary_from_xlsx_upload(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=file.filename or "uploaded.xlsx",
-            glossary_base_id=glossary_base_id,
-            source_language=resolved_source_language,
-            target_language=resolved_target_language,
-            creator_id=current_user.id,
+        glossary_base = _get_glossary_base_or_404(db, glossary_base_id)
+        resolved_source_language, resolved_target_language = _resolve_glossary_base_language_pair(
+            glossary_base,
+            source_language,
+            target_language,
         )
-    except Exception as exc:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"词汇表导入失败：{exc}") from exc
-
-    notification_title, notification_body = build_resource_import_notification(
-        resource_label="词汇表",
-        resource_name=glossary_base.name,
-        filename=import_summary.filename,
-        imported_rows=import_summary.imported_rows,
-        created_rows=import_summary.created_rows,
-        updated_rows=import_summary.updated_rows,
-        skipped_empty_rows=import_summary.skipped_empty_rows,
-        skipped_header_rows=import_summary.skipped_header_rows,
-        source_language=resolved_source_language,
-        target_language=resolved_target_language,
-    )
-    create_operation_notification(
-        db,
-        user_id=current_user.id,
-        notification_type="resource_import",
-        title=notification_title,
-        body=notification_body,
-    )
-    db.commit()
-
-    return {
-        "filename": import_summary.filename,
-        "created_rows": import_summary.created_rows,
-        "updated_rows": import_summary.updated_rows,
-        "skipped_empty_rows": import_summary.skipped_empty_rows,
-        "skipped_header_rows": import_summary.skipped_header_rows,
-        "imported_rows": import_summary.imported_rows,
-        "glossary_base_id": str(glossary_base.id),
-        "glossary_base_name": glossary_base.name,
-        "source_language": resolved_source_language,
-        "target_language": resolved_target_language,
-    }
+        db.commit()
+        payload = {
+            "kind": "glossary_resource_import",
+            "staging_task_id": task_id,
+            "file": staged_file,
+            "glossary_base_id": str(glossary_base.id),
+            "glossary_base_name": glossary_base.name,
+            "source_language": resolved_source_language,
+            "target_language": resolved_target_language,
+            "skip_header": bool(skip_header),
+            "creator_id": str(current_user.id),
+        }
+        set_import_task_status(task_id, "queued", progress=0, message="词汇表导入任务已进入队列。")
+        background_tasks.add_task(_run_glossary_resource_import_task, task_id, payload)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "task_id": task_id,
+                "status": "queued",
+                "progress": 0,
+                "message": "词汇表导入任务已进入队列。",
+            },
+        )
+    except Exception:
+        cleanup_import_task_staging(task_id)
+        raise
 
 
 @router.get("/glossary-bases/{glossary_base_id}/entries")
@@ -420,6 +656,7 @@ def create_glossary_entry(
         source_language=glossary_base.source_language,
         target_language=glossary_base.target_language,
         creator_id=current_user.id,
+        last_modified_by_id=current_user.id,
     )
     db.add(entry)
     db.commit()
@@ -432,7 +669,7 @@ def update_glossary_entry(
     entry_id: UUID,
     payload: GlossaryEntryPayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     entry = db.query(GlossaryEntry).filter(GlossaryEntry.id == entry_id).first()
     if entry is None:
@@ -466,6 +703,9 @@ def update_glossary_entry(
     entry.source_normalized = source_normalized
     entry.source_language = glossary_base.source_language
     entry.target_language = glossary_base.target_language
+    if entry.creator_id is None:
+        entry.creator_id = current_user.id
+    entry.last_modified_by_id = current_user.id
     db.commit()
     db.refresh(entry)
     return _serialize_glossary_entry(entry)
@@ -499,7 +739,7 @@ def export_glossary_entries_xlsx(
     )
     xlsx_bytes = build_tabular_xlsx(
         sheet_title=glossary_base.name,
-        headers=["原文", "译文", "备注", "源语言", "目标语言", "创建时间", "更新时间"],
+        headers=["原文", "译文", "备注", "源语言", "目标语言", "创建人", "创建时间", "最后修改人", "更新时间"],
         rows=[
             [
                 entry.source_text,
@@ -507,7 +747,9 @@ def export_glossary_entries_xlsx(
                 entry.note or "",
                 entry.source_language,
                 entry.target_language,
+                (entry.creator.nickname or entry.creator.username) if entry.creator else "",
                 entry.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                (entry.last_modified_by.nickname or entry.last_modified_by.username) if entry.last_modified_by else "",
                 entry.updated_at.strftime("%Y-%m-%d %H:%M:%S"),
             ]
             for entry in rows
@@ -536,6 +778,11 @@ def queue_glossary_base_export(
 @router.get("/glossary-bases/export-tasks/{task_id}")
 def get_glossary_base_export_task(task_id: str):
     return ensure_export_task_status(task_id, expected_resource_type="glossary")
+
+
+@router.post("/glossary-bases/export-tasks/{task_id}/cancel")
+def cancel_glossary_base_export_task(task_id: str):
+    return cancel_resource_export_task(task_id, expected_resource_type="glossary")
 
 
 @router.get("/glossary-bases/export-tasks/{task_id}/download")

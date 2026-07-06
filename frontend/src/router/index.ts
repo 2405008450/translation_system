@@ -78,6 +78,23 @@ const router = createRouter({
       },
     },
     {
+      path: '/merge/:viewId/focus',
+      name: 'merge-view-focus',
+      component: WorkbenchView,
+      props: (route) => ({
+        mergeViewId: String(route.params.viewId),
+        standalone: true,
+      }),
+      meta: {
+        requiresAuth: true,
+        navSection: 'tasks',
+        pageTitle: '合并视图',
+        pageDescription: '在同一工作台按文件分区编辑多个文件',
+        pageTitleKey: 'pages.workbench.title',
+        pageDescriptionKey: 'pages.workbench.description',
+      },
+    },
+    {
       path: '/',
       component: AppLayout,
       meta: { requiresAuth: true },

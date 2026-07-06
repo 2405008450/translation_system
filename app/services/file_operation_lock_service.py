@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -14,8 +14,8 @@ FILE_OPERATION_LOCK_TIMEOUT_SECONDS = 10 * 60
 FILE_OPERATION_TOKEN_HEADER = "X-File-Operation-Token"
 
 
-def utcnow() -> datetime:
-    return datetime.now(UTC).replace(tzinfo=None)
+def local_now() -> datetime:
+    return datetime.now()
 
 
 def get_file_operation_message(operation: str | None) -> str:
@@ -32,7 +32,7 @@ def is_file_operation_stale(file_record: FileRecord, now: datetime | None = None
     if file_record.active_operation_updated_at is None:
         return True
 
-    current_time = now or utcnow()
+    current_time = now or local_now()
     return current_time - file_record.active_operation_updated_at > timedelta(
         seconds=FILE_OPERATION_LOCK_TIMEOUT_SECONDS,
     )
@@ -93,7 +93,7 @@ def acquire_file_operation_lock(
     token = uuid4().hex
     file_record.active_operation = operation
     file_record.active_operation_token = token
-    file_record.active_operation_updated_at = utcnow()
+    file_record.active_operation_updated_at = local_now()
     file_record.active_operation_user_id = current_user.id if current_user else None
     db.commit()
     db.refresh(file_record)
@@ -116,7 +116,7 @@ def ensure_file_record_write_allowed(
 
     if operation_token and operation_token == file_record.active_operation_token:
         if touch_token:
-            file_record.active_operation_updated_at = utcnow()
+            file_record.active_operation_updated_at = local_now()
             db.flush()
         return
 

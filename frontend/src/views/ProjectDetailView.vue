@@ -8,6 +8,7 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  CircleHelp,
   Clock3,
   Copy,
   Download,
@@ -38,6 +39,12 @@ import {
   waitForImportTask,
   type ImportTaskAccepted,
 } from '../api/importTasks'
+import {
+  createProjectMergeView,
+  deleteMergeView,
+  listProjectMergeViews,
+  updateMergeView,
+} from '../api/mergeViews'
 import { http } from '../api/http'
 import DataTable from '../components/DataTable.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
@@ -53,7 +60,7 @@ import WorkflowProgressSummary from '../components/WorkflowProgressSummary.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
 import { useToast } from '../composables/useToast'
-import { formatLanguagePair, getLanguageLabel, languageOptions } from '../constants/languages'
+import { canonicalizeLanguagePair, formatLanguagePair, getLanguageLabel, languageOptions } from '../constants/languages'
 import { getFileStatusMeta } from '../constants/status'
 import { buildTranslatedTaskFilename, supportedTaskFileAccept } from '../constants/taskFiles'
 import { useAuthStore } from '../stores/auth'
@@ -62,6 +69,7 @@ import { getProgressStyle, isProgressComplete } from '../utils/progress'
 import type {
   DocumentParseMode,
   DocumentParseOptions,
+  DocumentMatchAnalysis,
   DocumentStatistics,
   DocumentStatisticsReport,
   DocumentStatisticsReportItem,
@@ -71,7 +79,10 @@ import type {
   AssignmentEventsResponse,
   IssueMarker,
   IssueStatus,
+  MergeView,
   ProjectAssignmentsResponse,
+  ProjectSyncDisableResult,
+  QualityQASettingsResponse,
   ProjectTranslationMemorySettingCollection,
   ProjectTermBaseSettingGroup,
   ProjectTermBaseSettingRow,
@@ -82,6 +93,7 @@ import type {
   TermQAReport,
   UploadCapabilitiesResponse,
   UploadCapability,
+  UploadBatchLimits,
   User,
   WorkflowProgress,
   WorkflowStep,
@@ -91,8 +103,8 @@ const props = defineProps<{
   id: string
 }>()
 
-type ProjectTab = 'files' | 'issues' | 'assignments' | 'settings' | 'stats' | 'summary' | 'quote'
-type ProjectSettingsSection = 'basic' | 'guidelines' | 'translation-memory' | 'terms' | 'term-qa'
+type ProjectTab = 'files' | 'views' | 'issues' | 'assignments' | 'settings' | 'stats' | 'summary' | 'quote'
+type ProjectSettingsSection = 'basic' | 'guidelines' | 'translation-memory' | 'terms' | 'automation' | 'quality-qa' | 'term-qa'
 type AccessLevel = 'team' | 'private' | 'public'
 type DocumentStatisticNumberKey =
   | 'pages'
@@ -120,6 +132,8 @@ interface ProjectDetail {
   confirmed_segments: number
   pretranslated_segments: number
   pretranslation_progress: number
+  project_sync_segment_count: number
+  project_sync_disabled_count: number
   workflow_steps?: WorkflowStep[]
   workflow_progress?: WorkflowProgress[]
   source_language: string | null
@@ -192,7 +206,15 @@ interface AssignmentDraft {
   assignee_id: string
   workflow_step_id: string
   file_record_ids: Set<string>
+  file_ranges: Map<string, AssignmentFileRangeDraft>
 }
+
+interface AssignmentFileRangeDraft {
+  range_start: number | null
+  range_end: number | null
+}
+
+type AssignmentFileRangeField = 'range_start' | 'range_end'
 
 type AssignmentUserTypeFilter = 'all' | 'internal' | 'external'
 type AssignmentUserStateFilter = 'all' | 'selected' | 'unselected'
@@ -208,12 +230,41 @@ interface PreTranslateProgressPayload extends PreTranslateProgressState {
   fileId: string
 }
 
+interface ActivePretranslationTaskStatus {
+  id: string
+  file_record_id: string
+  filename?: string | null
+  status: string
+  stage: string
+  progress: number
+  message: string
+  provider?: string | null
+  model?: string | null
+  scope?: string | null
+  total_segments: number
+  unique_segments: number
+  deduplicated_segments: number
+  processed_segments: number
+  updated_segments: number
+  error_segments: number
+  error?: string | null
+}
+
+interface ActivePretranslationTasksResponse {
+  tasks: ActivePretranslationTaskStatus[]
+}
+
 interface ProjectDocumentStatisticsResponse {
   files: ProjectFileItem[]
   report: DocumentStatisticsReport
 }
 
 type LanguageDetectTone = 'info' | 'success' | 'warning' | 'error'
+type LanguagePairSummary = {
+  source_language: string | null
+  target_language: string | null
+  file_count: number
+}
 
 const DEFAULT_DOCUMENT_PARSE_OPTIONS: DocumentParseOptions = {
   include_headers_footers: true,
@@ -258,6 +309,37 @@ const DOCUMENT_STATISTIC_NUMBER_KEYS: DocumentStatisticNumberKey[] = [
   'cross_file_repeated_characters',
 ]
 
+const DOCUMENT_MATCH_ANALYSIS_ROW_KEYS = [
+  'new',
+  'tm_50_74',
+  'tm_75_84',
+  'tm_85_94',
+  'tm_95_99',
+  'tm_100',
+  'tm_101',
+  'tm_102',
+  'internal_repeat',
+  'cross_file_repeat',
+] as const
+
+type DocumentMatchAnalysisRowKey = typeof DOCUMENT_MATCH_ANALYSIS_ROW_KEYS[number]
+
+interface DocumentMatchAnalysisDisplayRow {
+  key: DocumentMatchAnalysisRowKey | 'total'
+  label: string
+  percent: number
+  segment_count: number
+  word_count: number
+  is_total?: boolean
+}
+
+interface DocumentFileMatchAnalysisBlock {
+  id: string
+  file_name: string
+  analysis: DocumentMatchAnalysis
+  rows: DocumentMatchAnalysisDisplayRow[]
+}
+
 interface LanguageDetectResponse {
   language: string | null
   label: string | null
@@ -275,6 +357,14 @@ interface FileExportTask {
   progress: number
   message?: string
   error?: string | null
+  filename?: string | null
+  size_bytes?: number | null
+}
+interface FileExportOption {
+  id: string
+  name: string
+  description: string
+  extension: string
 }
 
 const confirm = useConfirm()
@@ -303,6 +393,11 @@ const uploadTargetLanguage = ref('')
 const documentParseMode = ref<DocumentParseMode>('full')
 const documentParseOptions = ref<DocumentParseOptions>({ ...DEFAULT_DOCUMENT_PARSE_OPTIONS })
 const uploadCapabilities = ref<UploadCapability[]>([])
+const uploadLimits = ref<UploadBatchLimits>({
+  max_files_per_batch: 50,
+  max_total_size_mb: 500,
+  max_expanded_files: 100,
+})
 const uploadFileAccept = ref(supportedTaskFileAccept)
 const loadingUploadCapabilities = ref(false)
 const basicCollapsed = ref(false)
@@ -314,6 +409,10 @@ function getProjectSettingsSectionFromHash(hash: string): ProjectSettingsSection
       return 'translation-memory'
     case '#project-settings-terms':
       return 'terms'
+    case '#project-settings-automation':
+      return 'automation'
+    case '#project-settings-quality-qa':
+      return 'quality-qa'
     case '#project-settings-term-qa':
       return 'term-qa'
     case '#project-settings-basic':
@@ -329,6 +428,7 @@ const showPreTranslateDialog = ref(false)
 const showIssueDialog = ref(false)
 const showTermExtractionDialog = ref(false)
 const showAssignmentDialog = ref(false)
+const showMergeViewDialog = ref(false)
 const showTMImportDialog = ref(false)
 const showTermImportDialog = ref(false)
 const termExtractionNeedsReload = ref(false)
@@ -338,6 +438,18 @@ const actionMenuStyle = ref<Record<string, string>>({})
 const currentPage = ref(1)
 const pageSize = ref(10)
 const selectedFileIds = ref(new Set<string>())
+const fileSearchQuery = ref('')
+const fileStatusFilter = ref('all')
+const fileLanguagePairFilter = ref('all')
+const fileAssigneeFilter = ref('all')
+const mergeViews = ref<MergeView[]>([])
+const loadingMergeViews = ref(false)
+const savingMergeView = ref(false)
+const mergeViewActionId = ref('')
+const mergeViewDialogMode = ref<'create' | 'rename'>('create')
+const mergeViewDialogError = ref('')
+const mergeViewName = ref('')
+const activeMergeView = ref<MergeView | null>(null)
 const statisticsSelectedFileIds = ref(new Set<string>())
 const statisticsResultFileIds = ref(new Set<string>())
 const statisticsReports = ref<DocumentStatisticsReport[]>([])
@@ -352,6 +464,8 @@ const savingSettings = ref(false)
 const guidelinesText = ref('')
 const savingGuidelines = ref(false)
 const preTranslateProgressByFileId = ref<Record<string, PreTranslateProgressState>>({})
+const activePretranslationTaskIdByFileId = ref<Record<string, string>>({})
+const cancelingPretranslationTaskIds = ref(new Set<string>())
 const issueDialogTarget = ref<{
   fileRecordId: string | null
   label: string
@@ -378,6 +492,7 @@ const savingTranslationMemorySettings = ref(false)
 const creatingTranslationMemoryPair = ref('')
 const translationMemorySettingsError = ref('')
 const expandedTMCollectionKey = ref('')
+const tmSettingsSearchQuery = ref('')
 const tmImportDialogContext = ref<{
   collectionId: string
   collectionName: string
@@ -394,6 +509,7 @@ const loadingTermBaseSettings = ref(false)
 const savingTermBaseSettings = ref(false)
 const creatingTermBasePair = ref('')
 const termBaseSettingsError = ref('')
+const termBaseSettingsSearchQuery = ref('')
 const termImportDialogContext = ref<{
   termBaseId: string
   termBaseName: string
@@ -405,16 +521,143 @@ const termImportDialogContext = ref<{
   sourceLanguage: null,
   targetLanguage: null,
 })
+const qualityQASettings = ref<QualityQASettingsResponse | null>(null)
+const loadingQualityQASettings = ref(false)
+const savingQualityQASettings = ref(false)
+const qualityQASettingsError = ref('')
+const projectSyncToggleLoading = ref(false)
+
+const qualityQARules = [
+  { key: 'target_without_tag', label: '译文无标记', defaultEnabled: true },
+  { key: 'target_tag_missing', label: '译文标记丢失', defaultEnabled: true },
+  { key: 'unmatched_closing_tag', label: '结束标记无匹配的开始标记', defaultEnabled: true },
+  { key: 'unmatched_opening_tag', label: '开始标记无匹配的结束标记', defaultEnabled: true },
+  { key: 'target_placeholder_missing', label: '译文占位符标记丢失', defaultEnabled: true },
+  { key: 'spelling_grammar', label: '译文有拼写或语法错误（查看支持的语种）', defaultEnabled: true },
+  { key: 'term_inconsistency', label: '术语不一致', defaultEnabled: false },
+  { key: 'paired_punctuation_missing', label: '成对标点符号丢失', defaultEnabled: false },
+  { key: 'ending_punctuation_mismatch', label: '原文和译文的结束标点不同', defaultEnabled: false },
+  { key: 'repeated_punctuation', label: '重复标点', defaultEnabled: false },
+  { key: 'extra_space_after_punctuation', label: '标点符号后有多余空格', defaultEnabled: false },
+  { key: 'missing_space_after_punctuation', label: '标点符号后遗漏空格', defaultEnabled: false },
+] as const
+
+type QualityQAPlaceholderRule = {
+  key: string
+  label: string
+  percent?: number
+  suffix?: string
+}
+
+const qualityQAPlaceholderRules: readonly QualityQAPlaceholderRule[] = [
+  { key: 'punctuation_leading_extra_space', label: '标点符号前有多余空格' },
+  { key: 'punctuation_leading_missing_space', label: '标点符号前遗漏空格' },
+  { key: 'multiple_spaces', label: '多个空格' },
+  { key: 'segment_trailing_extra_space', label: '句段结束后有多余空格' },
+  { key: 'source_target_initial_case_mismatch', label: '原文和译文首字母大小写不一致' },
+  { key: 'target_word_multiple_upper_initials', label: '译文一个单词中有多个大写首字母' },
+  { key: 'source_target_same_word_case_mismatch', label: '原文和译文的同一单词首字母有不同的大小写' },
+  { key: 'target_word_count_exceeds_source', label: '译文字数超过原文字数的', percent: 50, suffix: '%' },
+  { key: 'target_word_count_below_source', label: '译文字数少于原文字数的', percent: 50, suffix: '%' },
+  { key: 'source_target_word_count_gap_too_large', label: '译文与原文字数相差过大' },
+  { key: 'context_translation_mismatch', label: '翻译与上下文匹配不一致' },
+  { key: 'number_mismatch', label: '原文和译文数字不一致' },
+  { key: 'parameter_mismatch', label: '原文与译文参数不一致' },
+  { key: 'email_mismatch', label: '原文与译文邮件信息不一致' },
+  { key: 'link_mismatch', label: '原文和译文链接信息不一致' },
+  { key: 'consecutive_duplicate_words', label: '连续重复单词' },
+  { key: 'source_target_identical', label: '原文和译文相同' },
+  { key: 'special_symbol_mismatch', label: '特殊符号不一致' },
+]
+
+type QualityQARuleKey = typeof qualityQARules[number]['key']
+type QualityQARuleDraft = Record<QualityQARuleKey, boolean>
+
+function createQualityQARuleDraft(): QualityQARuleDraft {
+  return qualityQARules.reduce((draft, rule) => {
+    draft[rule.key] = rule.defaultEnabled
+    return draft
+  }, {} as QualityQARuleDraft)
+}
+
+const qualityQADraft = reactive({
+  rules: createQualityQARuleDraft(),
+})
+
+const enabledQualityQARuleCount = computed(() => (
+  qualityQARules.filter((rule) => qualityQADraft.rules[rule.key]).length
+))
+const allQualityQARulesEnabled = computed(() => enabledQualityQARuleCount.value === qualityQARules.length)
+const partiallyEnabledQualityQARules = computed(() => (
+  enabledQualityQARuleCount.value > 0 && !allQualityQARulesEnabled.value
+))
+const spellingGrammarQAEnabled = computed(() => qualityQADraft.rules.spelling_grammar)
+function getSavedQualityQARuleEnabled(rule: typeof qualityQARules[number]) {
+  const ruleSetting = qualityQASettings.value?.settings.rules?.[rule.key]
+  if (typeof ruleSetting?.enabled === 'boolean') {
+    return ruleSetting.enabled
+  }
+  if (rule.key === 'spelling_grammar') {
+    return Boolean(qualityQASettings.value?.settings.spelling_grammar.enabled)
+  }
+  return rule.defaultEnabled
+}
+const qualityQASettingsDirty = computed(() => (
+  qualityQARules.some((rule) => qualityQADraft.rules[rule.key] !== getSavedQualityQARuleEnabled(rule))
+))
+const qualityQARuleStatusText = computed(() => {
+  if (enabledQualityQARuleCount.value === 0) {
+    return '全部关闭'
+  }
+  if (enabledQualityQARuleCount.value === qualityQARules.length) {
+    return `全部启用（${enabledQualityQARuleCount.value}/${qualityQARules.length}）`
+  }
+  return `已启用 ${enabledQualityQARuleCount.value}/${qualityQARules.length}`
+})
+const qualityQARuleStatusClass = computed(() => (
+  enabledQualityQARuleCount.value > 0 ? 'is-ok' : 'is-warn'
+))
+const qualityQARuleStatusHint = computed(() => (
+  qualityQASettingsDirty.value
+    ? '有未保存更改'
+    : `已保存 · ${qualityQAPlaceholderRules.length} 项占位`
+))
+
+const autoLocalizationOptions = [
+  '日期',
+  '时间',
+  '数字',
+  '度量单位',
+  '首字母缩写词',
+  '字母数字字符串',
+]
+
+const lockPlaceholderOptions = [
+  '内部重复',
+  '跨文件重复',
+  '100%记忆库匹配',
+  '101%记忆库匹配',
+  '102%记忆库匹配',
+]
 const generatingTermQAReport = ref(false)
 const termQAReport = ref<TermQAReport | null>(null)
 const downloadingTermQAReport = ref(false)
 const exportingFileId = ref('')
+const exportingFileType = ref('')
 const exportFileProgress = ref(0)
 const exportFileMessage = ref('')
+const showProjectExportMenu = ref(false)
+const loadingProjectExportOptions = ref(false)
+const projectExportOptions = ref<FileExportOption[]>([])
 let exportPollTimer: number | null = null
+let activePretranslationPollTimer: number | null = null
+const ACTIVE_PRETRANSLATION_STATUSES = new Set(['queued', 'running', 'canceling'])
+const ACTIVE_PRETRANSLATION_POLL_INTERVAL_MS = 2_500
+const FILE_UNASSIGNED_FILTER = '__unassigned__'
 
 const tabs = computed(() => ([
   { key: 'files' as const, label: t('projectDetail.tabs.files'), disabled: false },
+  { key: 'views' as const, label: t('projectDetail.tabs.views'), disabled: false },
   {
     key: 'issues' as const,
     label: `${t('projectDetail.tabs.issues')}${openIssueCount.value > 0 ? ` (${openIssueCount.value})` : ''}`,
@@ -427,6 +670,104 @@ const tabs = computed(() => ([
   { key: 'quote' as const, label: t('projectDetail.tabs.quote'), disabled: true },
 ]))
 const tableRows = computed<ProjectFileItem[]>(() => project.value?.files ?? [])
+const projectFileById = computed(() => new Map(tableRows.value.map((file) => [file.id, file])))
+const fileStatusFilterOptions = computed(() => {
+  const counts = new Map<string, number>()
+  for (const file of tableRows.value) {
+    const status = String(file.status || '')
+    if (!status) {
+      continue
+    }
+    counts.set(status, (counts.get(status) ?? 0) + 1)
+  }
+  return Array.from(counts.entries())
+    .map(([value, count]) => ({
+      value,
+      count,
+      label: formatStatus(value),
+    }))
+    .sort((left, right) => left.label.localeCompare(right.label, 'zh-CN'))
+})
+const fileLanguagePairFilterOptions = computed(() => {
+  const options = new Map<string, { value: string; label: string; count: number }>()
+  for (const file of tableRows.value) {
+    const value = getFileLanguagePairKey(file)
+    const label = getFileLanguagePairLabel(file)
+    const current = options.get(value)
+    if (current) {
+      current.count += 1
+    } else {
+      options.set(value, { value, label, count: 1 })
+    }
+  }
+  return Array.from(options.values())
+    .sort((left, right) => left.label.localeCompare(right.label, 'zh-CN'))
+})
+const fileAssigneeFilterOptions = computed(() => {
+  const options = new Map<string, { value: string; label: string; count: number }>()
+  let unassignedCount = 0
+  for (const file of tableRows.value) {
+    const assignees = getFileAssignees(file)
+    if (assignees.length === 0) {
+      unassignedCount += 1
+      continue
+    }
+    for (const user of assignees) {
+      const label = getAssigneeDisplayName(user)
+      if (!user.id || !label) {
+        continue
+      }
+      const current = options.get(user.id)
+      if (current) {
+        current.count += 1
+      } else {
+        options.set(user.id, { value: user.id, label, count: 1 })
+      }
+    }
+  }
+  const rows = Array.from(options.values())
+    .sort((left, right) => left.label.localeCompare(right.label, 'zh-CN'))
+  if (unassignedCount > 0) {
+    rows.unshift({ value: FILE_UNASSIGNED_FILTER, label: '未分配', count: unassignedCount })
+  }
+  return rows
+})
+const hasFileFilters = computed(() => (
+  Boolean(normalizeFileFilterKeyword(fileSearchQuery.value))
+  || fileStatusFilter.value !== 'all'
+  || fileLanguagePairFilter.value !== 'all'
+  || fileAssigneeFilter.value !== 'all'
+))
+const filteredTableRows = computed<ProjectFileItem[]>(() => {
+  const keywords = normalizeFileFilterKeyword(fileSearchQuery.value).split(/\s+/).filter(Boolean)
+  let rows = [...tableRows.value]
+
+  if (keywords.length > 0) {
+    rows = rows.filter((file) => {
+      const text = getFileSearchText(file)
+      return keywords.every((keyword) => text.includes(keyword))
+    })
+  }
+
+  if (fileStatusFilter.value !== 'all') {
+    rows = rows.filter((file) => file.status === fileStatusFilter.value)
+  }
+
+  if (fileLanguagePairFilter.value !== 'all') {
+    rows = rows.filter((file) => getFileLanguagePairKey(file) === fileLanguagePairFilter.value)
+  }
+
+  if (fileAssigneeFilter.value === FILE_UNASSIGNED_FILTER) {
+    rows = rows.filter((file) => getFileAssigneeIds(file).length === 0)
+  } else if (fileAssigneeFilter.value !== 'all') {
+    rows = rows.filter((file) => getFileAssigneeIds(file).includes(fileAssigneeFilter.value))
+  }
+
+  return rows
+})
+const fileTableEmptyText = computed(() => (
+  hasFileFilters.value ? '没有符合筛选条件的文件' : t('projectDetail.files.empty')
+))
 const projectWorkflowSteps = computed<WorkflowStep[]>(() => project.value?.workflow_steps ?? [])
 const projectWorkflowProgress = computed<WorkflowProgress[]>(() => project.value?.workflow_progress ?? [])
 const projectWorkflowLabel = computed(() => (
@@ -440,6 +781,9 @@ const activeAssignmentWorkflowStep = computed(() => (
 const activeAssignmentDrafts = computed(() => (
   assignmentDrafts.value.filter((draft) => draft.workflow_step_id === activeAssignmentWorkflowStepId.value)
 ))
+const assignmentMergeViews = computed(() => (
+  mergeViews.value.filter((view) => getAssignableMergeViewFileIds(view).length >= 2)
+))
 const issueMarkers = computed<IssueMarker[]>(() => project.value?.issue_markers ?? [])
 const openIssueCount = computed(() => issueMarkers.value.filter((marker) => marker.status === 'open').length)
 const actionMenuRow = computed<ProjectFileItem | null>(() => {
@@ -449,7 +793,7 @@ const actionMenuRow = computed<ProjectFileItem | null>(() => {
 })
 const pagedRows = computed(() => {
   const start = (currentPage.value - 1) * pageSize.value
-  return tableRows.value.slice(start, start + pageSize.value)
+  return filteredTableRows.value.slice(start, start + pageSize.value)
 })
 const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
 const selectedProjectFiles = computed(() => (
@@ -457,6 +801,60 @@ const selectedProjectFiles = computed(() => (
 ))
 const hasSelectedLockedFile = computed(() => selectedProjectFiles.value.some((row) => row.is_edit_locked))
 const hasSelectedNonWritableFile = computed(() => selectedProjectFiles.value.some((row) => !row.can_write))
+const selectedMergeViewFiles = computed(() => (
+  selectedProjectFiles.value.filter((row) => canUseFileInMergeView(row))
+))
+const selectedMergeViewInvalidFiles = computed(() => (
+  selectedProjectFiles.value.filter((row) => !canUseFileInMergeView(row))
+))
+const selectedMergeViewLanguagePairs = computed<LanguagePairSummary[]>(() => {
+  const pairMap = new Map<string, LanguagePairSummary>()
+  let invalidCount = 0
+  for (const file of selectedMergeViewFiles.value) {
+    const pair = canonicalizeLanguagePair(
+      file.source_language || project.value?.source_language,
+      file.target_language || project.value?.target_language,
+    )
+    if (!pair) {
+      invalidCount += 1
+      continue
+    }
+    const key = `${pair.source}__${pair.target}`
+    const current = pairMap.get(key)
+    if (current) {
+      current.file_count += 1
+    } else {
+      pairMap.set(key, {
+        source_language: pair.source,
+        target_language: pair.target,
+        file_count: 1,
+      })
+    }
+  }
+  const pairs = Array.from(pairMap.values())
+  if (invalidCount > 0) {
+    pairs.push({ source_language: null, target_language: null, file_count: invalidCount })
+  }
+  return pairs
+})
+const selectedMergeViewHasMixedLanguagePairs = computed(() => selectedMergeViewLanguagePairs.value.length > 1)
+const canOpenMergeViewDialog = computed(() => (
+  Boolean(project.value)
+  && selectedMergeViewFiles.value.length >= 2
+  && !savingMergeView.value
+))
+const mergeOpenButtonTitle = computed(() => {
+  if (selectedProjectFiles.value.length === 0) {
+    return t('projectDetail.mergeViews.selectFileFirst')
+  }
+  if (selectedMergeViewFiles.value.length < 2) {
+    return t('projectDetail.mergeViews.selectAtLeastTwo')
+  }
+  if (selectedMergeViewInvalidFiles.value.length > 0) {
+    return t('projectDetail.mergeViews.someFilesIgnored', { count: selectedMergeViewInvalidFiles.value.length })
+  }
+  return ''
+})
 const canDeleteSelectedProjectFiles = computed(() => (
   canManageProject.value
   && selectedProjectFiles.value.length > 0
@@ -494,7 +892,12 @@ const statisticsTotals = computed<DocumentStatisticsTotals>(() => {
     return normalizeStatisticsTotals(activeStatisticsReport.value.totals)
   }
   const totals = createEmptyStatisticsTotals()
+  const matchAnalyses: DocumentMatchAnalysis[] = []
   for (const row of statisticsResultRows.value) {
+    const matchAnalysis = normalizeDocumentMatchAnalysis(row.statistics.match_analysis)
+    if (matchAnalysis) {
+      matchAnalyses.push(matchAnalysis)
+    }
     for (const key of DOCUMENT_STATISTIC_NUMBER_KEYS) {
       const value = getStatisticNumber(row.statistics, key)
       if (value == null) {
@@ -503,8 +906,34 @@ const statisticsTotals = computed<DocumentStatisticsTotals>(() => {
       totals[key] = (totals[key] ?? 0) + value
     }
   }
+  totals.match_analysis = mergeDocumentMatchAnalyses(matchAnalyses)
   return totals
 })
+const statisticsMatchAnalysis = computed(() => (
+  reconcileDocumentMatchAnalysisForDisplay(statisticsTotals.value.match_analysis, statisticsTotals.value.words)
+))
+const statisticsMatchAnalysisRows = computed<DocumentMatchAnalysisDisplayRow[]>(() => (
+  buildDocumentMatchAnalysisRows(statisticsMatchAnalysis.value)
+))
+const statisticsFileMatchAnalysisBlocks = computed<DocumentFileMatchAnalysisBlock[]>(() => (
+  statisticsResultRows.value
+    .map((row) => {
+      const analysis = reconcileDocumentMatchAnalysisForDisplay(
+        row.statistics.match_analysis,
+        getStatisticNumber(row.statistics, 'words'),
+      )
+      if (!analysis) {
+        return null
+      }
+      return {
+        id: row.file_record_id || row.id,
+        file_name: row.file_name,
+        analysis,
+        rows: buildDocumentMatchAnalysisRows(analysis),
+      }
+    })
+    .filter((row): row is DocumentFileMatchAnalysisBlock => Boolean(row && row.rows.length > 0))
+))
 const selectedTermExtractionFile = computed<ProjectFileItem | null>(() => (
   selectedProjectFiles.value.length === 1 ? selectedProjectFiles.value[0] : null
 ))
@@ -594,6 +1023,27 @@ const canOpenTermExtraction = computed(() => (
   && Boolean(selectedTermExtractionSourceLanguage.value)
   && Boolean(selectedTermExtractionTargetLanguage.value)
 ))
+const canOpenProjectExportMenu = computed(() => (
+  selectedProjectFiles.value.length > 0
+  && !exportingFileId.value
+  && !loadingProjectExportOptions.value
+))
+const canExportSelectedProjectFilesAsZip = computed(() => (
+  selectedProjectFiles.value.length > 1
+  && projectExportOptions.value.some((option) => option.id === 'original')
+))
+const projectExportButtonTitle = computed(() => {
+  if (selectedProjectFiles.value.length === 0) {
+    return t('projectDetail.files.actions.exportSelectFirst')
+  }
+  if (loadingProjectExportOptions.value) {
+    return t('projectDetail.files.actions.exportLoading')
+  }
+  if (exportingFileId.value) {
+    return exportFileMessage.value
+  }
+  return ''
+})
 
 const columns = computed<DataTableColumn[]>(() => ([
   { key: 'filename', label: t('projectDetail.files.columns.details'), width: '300px' },
@@ -617,6 +1067,45 @@ const canOpenUploadModal = computed(() => Boolean(project.value) && canManagePro
 const canOpenProjectIssueDialog = computed(() => Boolean(project.value) && !authStore.isExternalTranslator)
 
 const uploadButtonTitle = computed(() => (canManageProject.value ? '' : '只有管理员可以上传项目文件'))
+const projectSyncSegmentCount = computed(() => Number(project.value?.project_sync_segment_count || 0))
+const projectSyncDisabledCount = computed(() => {
+  const total = projectSyncSegmentCount.value
+  const disabled = Number(project.value?.project_sync_disabled_count || 0)
+  return Math.max(0, Math.min(disabled, total))
+})
+const projectSyncAllEnabled = computed(() => (
+  projectSyncSegmentCount.value > 0 && projectSyncDisabledCount.value === 0
+))
+const projectSyncMixed = computed(() => (
+  projectSyncDisabledCount.value > 0 && projectSyncDisabledCount.value < projectSyncSegmentCount.value
+))
+const projectSyncStatusLabel = computed(() => {
+  if (projectSyncSegmentCount.value === 0) {
+    return '暂无句段'
+  }
+  if (projectSyncDisabledCount.value === 0) {
+    return ''
+  }
+  if (projectSyncDisabledCount.value >= projectSyncSegmentCount.value) {
+    return `已全部关闭（${projectSyncDisabledCount.value}/${projectSyncSegmentCount.value}）`
+  }
+  return `已关闭 ${projectSyncDisabledCount.value}/${projectSyncSegmentCount.value}`
+})
+const projectSyncToggleDisabled = computed(() => (
+  projectSyncToggleLoading.value
+  || !project.value
+  || !canManageProject.value
+  || projectSyncSegmentCount.value === 0
+))
+const projectSyncToggleTitle = computed(() => {
+  if (projectSyncSegmentCount.value === 0) {
+    return '项目内暂无可同步句段'
+  }
+  if (projectSyncMixed.value) {
+    return '部分句段已关闭同步，点击后恢复全项目同步'
+  }
+  return projectSyncAllEnabled.value ? '点击关闭全项目同步' : '点击开启全项目同步'
+})
 
 const accessOptions = computed(() => ([
   { value: 'team' as const, label: t('projectList.form.team') },
@@ -662,7 +1151,6 @@ const projectLanguagePairLabel = computed(() => (
       : formatLanguagePair(effectiveProjectSourceLanguage.value, effectiveProjectTargetLanguage.value)
 ))
 
-const uploadFilePreview = computed(() => selectedFiles.value.slice(0, 3).map((file) => file.name))
 const uploadSupportedSummary = computed(() => {
   if (uploadCapabilities.value.length === 0) {
     return uploadFileAccept.value
@@ -674,6 +1162,14 @@ const uploadSupportedSummary = computed(() => {
 })
 const canDetectSourceLanguage = computed(() => (
   selectedFiles.value.length > 0 && !uploading.value && !detectingLanguage.value
+))
+const uploadFileValidationError = computed(() => validateSelectedUploadFiles(selectedFiles.value))
+const canSubmitSourceUpload = computed(() => (
+  selectedFiles.value.length > 0
+  && !uploading.value
+  && !uploadFileValidationError.value
+  && Boolean(uploadSourceLanguage.value)
+  && Boolean(uploadTargetLanguage.value)
 ))
 const cameFromTasks = computed(() => route.query.from === 'tasks')
 const backRoute = computed(() => (
@@ -765,6 +1261,70 @@ function normalizeAssignmentKeyword(value: string | null | undefined) {
   return String(value || '').trim().toLowerCase()
 }
 
+function normalizeFileFilterKeyword(value: string | null | undefined) {
+  return String(value || '').trim().toLowerCase()
+}
+
+function getFileLanguagePairKey(row: ProjectRow) {
+  return `${String(row.source_language || '')}->${String(row.target_language || '')}`
+}
+
+function getFileLanguagePairLabel(row: ProjectRow) {
+  if (!row.source_language || !row.target_language) {
+    return '未设置语言对'
+  }
+  return formatLanguagePair(row.source_language, row.target_language)
+}
+
+function getFileAssignees(row: ProjectRow): User[] {
+  const candidates = [
+    ...(Array.isArray(row.assignees) ? row.assignees : []),
+    row.assignee,
+  ].filter((user): user is User => Boolean(user && typeof user === 'object'))
+  const seen = new Set<string>()
+  const users: User[] = []
+  for (const user of candidates) {
+    if (!user.id || seen.has(user.id)) {
+      continue
+    }
+    seen.add(user.id)
+    users.push(user)
+  }
+  return users
+}
+
+function getFileAssigneeIds(row: ProjectRow) {
+  const ids = new Set(getFileAssignees(row).map((user) => user.id).filter(Boolean))
+  if (typeof row.assignee_id === 'string' && row.assignee_id) {
+    ids.add(row.assignee_id)
+  }
+  return Array.from(ids)
+}
+
+function getFileSearchText(row: ProjectRow) {
+  return [
+    row.filename,
+    row.status,
+    row.status ? formatStatus(String(row.status)) : '',
+    getFileLanguagePairLabel(row),
+    row.source_language,
+    row.target_language,
+    getLanguageLabel(row.source_language),
+    getLanguageLabel(row.target_language),
+    getAssigneeLabel(row),
+    row.creator,
+    formatBytes(row.file_size_bytes),
+    formatDateText(row.created_at),
+  ].map(normalizeFileFilterKeyword).join(' ')
+}
+
+function resetFileFilters() {
+  fileSearchQuery.value = ''
+  fileStatusFilter.value = 'all'
+  fileLanguagePairFilter.value = 'all'
+  fileAssigneeFilter.value = 'all'
+}
+
 function getAssignmentUserSearchText(user: User) {
   return [
     getAssigneeDisplayName(user),
@@ -836,6 +1396,7 @@ function createEmptyStatisticsTotals(): DocumentStatisticsTotals {
     internal_repeated_characters: null,
     cross_file_repeated_words: null,
     cross_file_repeated_characters: null,
+    match_analysis: null,
   }
 }
 
@@ -848,7 +1409,195 @@ function normalizeStatisticsTotals(totals: DocumentStatisticsTotals | null | und
     const value = totals[key]
     normalized[key] = typeof value === 'number' && Number.isFinite(value) ? value : null
   }
+  normalized.match_analysis = normalizeDocumentMatchAnalysis(totals.match_analysis)
   return normalized
+}
+
+function normalizeDocumentMatchAnalysis(value: DocumentMatchAnalysis | null | undefined): DocumentMatchAnalysis | null {
+  if (!value || !Array.isArray(value.rows)) {
+    return null
+  }
+  const rows = DOCUMENT_MATCH_ANALYSIS_ROW_KEYS.map((key) => {
+    const source = value.rows.find((row) => row.key === key)
+    const segmentCount = normalizeStatisticNumber(source?.segment_count) ?? 0
+    const wordCount = normalizeStatisticNumber(source?.word_count) ?? 0
+    return {
+      key,
+      label: source?.label || getDocumentMatchAnalysisLabel(key),
+      segment_count: segmentCount,
+      word_count: wordCount,
+      percent: normalizeStatisticNumber(source?.percent) ?? 0,
+    }
+  })
+  const totalSegments = normalizeStatisticNumber(value.total_segments)
+    ?? rows.reduce((sum, row) => sum + row.segment_count, 0)
+  const totalWords = normalizeStatisticNumber(value.total_words)
+    ?? rows.reduce((sum, row) => sum + row.word_count, 0)
+  return {
+    threshold: normalizeStatisticNumber(value.threshold) ?? 0.5,
+    collection_ids: Array.isArray(value.collection_ids) ? value.collection_ids.filter(Boolean) : [],
+    total_segments: totalSegments,
+    total_words: totalWords,
+    rows,
+  }
+}
+
+function reconcileDocumentMatchAnalysisForDisplay(
+  value: DocumentMatchAnalysis | null | undefined,
+  authoritativeWords: number | null | undefined,
+): DocumentMatchAnalysis | null {
+  const normalized = normalizeDocumentMatchAnalysis(value)
+  const targetTotal = normalizeStatisticNumber(authoritativeWords)
+  if (!normalized || targetTotal == null || targetTotal === normalized.total_words) {
+    return normalized
+  }
+  const rows = normalized.rows.map((row) => ({ ...row }))
+  const currentTotal = rows.reduce((sum, row) => sum + Math.max(row.word_count, 0), 0)
+  if (targetTotal <= 0) {
+    rows.forEach((row) => {
+      row.word_count = 0
+    })
+  } else if (currentTotal <= 0 || targetTotal > currentTotal) {
+    const newRow = rows.find((row) => row.key === 'new')
+    if (newRow) {
+      newRow.word_count = Math.max(0, newRow.word_count + targetTotal - currentTotal)
+    }
+  } else {
+    scaleDocumentMatchRowsToWordTotal(rows, targetTotal, currentTotal)
+  }
+  return rebuildDocumentMatchAnalysisRows({
+    ...normalized,
+    total_words: targetTotal,
+    rows,
+  })
+}
+
+function scaleDocumentMatchRowsToWordTotal(
+  rows: DocumentMatchAnalysis['rows'],
+  targetTotal: number,
+  currentTotal: number,
+) {
+  const scaled = rows.map((row, index) => {
+    const rawValue = Math.max(row.word_count, 0) * targetTotal / currentTotal
+    const floorValue = Math.floor(rawValue)
+    return {
+      index,
+      floorValue,
+      remainder: rawValue - floorValue,
+    }
+  })
+  const floorTotal = scaled.reduce((sum, row) => sum + row.floorValue, 0)
+  let remaining = Math.max(targetTotal - floorTotal, 0)
+  const ranked = [...scaled].sort((left, right) => {
+    if (right.remainder !== left.remainder) {
+      return right.remainder - left.remainder
+    }
+    return left.index - right.index
+  })
+  const extraByIndex = new Map<number, number>()
+  for (const row of ranked) {
+    if (remaining <= 0) break
+    extraByIndex.set(row.index, (extraByIndex.get(row.index) ?? 0) + 1)
+    remaining -= 1
+  }
+  for (const row of scaled) {
+    rows[row.index].word_count = row.floorValue + (extraByIndex.get(row.index) ?? 0)
+  }
+}
+
+function mergeDocumentMatchAnalyses(analyses: DocumentMatchAnalysis[]): DocumentMatchAnalysis | null {
+  if (analyses.length === 0) {
+    return null
+  }
+  const counts = new Map<DocumentMatchAnalysisRowKey, { segment_count: number; word_count: number }>()
+  for (const key of DOCUMENT_MATCH_ANALYSIS_ROW_KEYS) {
+    counts.set(key, { segment_count: 0, word_count: 0 })
+  }
+  const collectionIds = new Set<string>()
+  let threshold = 0.5
+  for (const analysis of analyses) {
+    threshold = analysis.threshold
+    analysis.collection_ids.forEach((id) => collectionIds.add(id))
+    for (const row of analysis.rows) {
+      if (!DOCUMENT_MATCH_ANALYSIS_ROW_KEYS.includes(row.key as DocumentMatchAnalysisRowKey)) {
+        continue
+      }
+      const key = row.key as DocumentMatchAnalysisRowKey
+      const target = counts.get(key)
+      if (!target) continue
+      target.segment_count += row.segment_count
+      target.word_count += row.word_count
+    }
+  }
+  const totalSegments = [...counts.values()].reduce((sum, row) => sum + row.segment_count, 0)
+  const totalWords = [...counts.values()].reduce((sum, row) => sum + row.word_count, 0)
+  return {
+    threshold,
+    collection_ids: [...collectionIds],
+    total_segments: totalSegments,
+    total_words: totalWords,
+    rows: buildDocumentMatchRowsFromCounts(counts, totalWords),
+  }
+}
+
+function rebuildDocumentMatchAnalysisRows(analysis: DocumentMatchAnalysis): DocumentMatchAnalysis {
+  const counts = new Map<DocumentMatchAnalysisRowKey, { segment_count: number; word_count: number }>()
+  for (const key of DOCUMENT_MATCH_ANALYSIS_ROW_KEYS) {
+    const source = analysis.rows.find((row) => row.key === key)
+    counts.set(key, {
+      segment_count: normalizeStatisticNumber(source?.segment_count) ?? 0,
+      word_count: normalizeStatisticNumber(source?.word_count) ?? 0,
+    })
+  }
+  return {
+    ...analysis,
+    rows: buildDocumentMatchRowsFromCounts(counts, analysis.total_words),
+  }
+}
+
+function buildDocumentMatchRowsFromCounts(
+  counts: Map<DocumentMatchAnalysisRowKey, { segment_count: number; word_count: number }>,
+  totalWords: number,
+) {
+  return DOCUMENT_MATCH_ANALYSIS_ROW_KEYS.map((key) => {
+    const row = counts.get(key) ?? { segment_count: 0, word_count: 0 }
+    return {
+      key,
+      label: getDocumentMatchAnalysisLabel(key),
+      segment_count: row.segment_count,
+      word_count: row.word_count,
+      percent: totalWords > 0 ? Number(((row.word_count / totalWords) * 100).toFixed(2)) : 0,
+    }
+  })
+}
+
+function buildDocumentMatchAnalysisRows(
+  analysis: DocumentMatchAnalysis | null | undefined,
+): DocumentMatchAnalysisDisplayRow[] {
+  const normalized = normalizeDocumentMatchAnalysis(analysis)
+  if (!normalized) {
+    return []
+  }
+  const rows: DocumentMatchAnalysisDisplayRow[] = normalized.rows.map((row) => ({
+    key: row.key as DocumentMatchAnalysisRowKey,
+    label: getDocumentMatchAnalysisLabel(row.key as DocumentMatchAnalysisRowKey),
+    percent: row.percent,
+    segment_count: row.segment_count,
+    word_count: row.word_count,
+  }))
+  rows.push({
+    key: 'total',
+    label: t('projectDetail.stats.matchAnalysis.total'),
+    percent: normalized.total_words > 0 ? 100 : 0,
+    segment_count: normalized.total_segments,
+    word_count: normalized.total_words,
+    is_total: true,
+  })
+  return rows
+}
+
+function normalizeStatisticNumber(value: number | null | undefined) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
 
 function getStatisticNumber(
@@ -868,6 +1617,18 @@ function formatStatisticNumber(value: number | null | undefined) {
     return getPlaceholder()
   }
   return new Intl.NumberFormat('zh-CN').format(value)
+}
+
+function formatStatisticPercent(value: number | null | undefined) {
+  if (value == null || Number.isNaN(value)) {
+    return getPlaceholder()
+  }
+  const formatted = Number.isInteger(value) ? value.toFixed(0) : value.toFixed(2)
+  return `${formatted}%`
+}
+
+function getDocumentMatchAnalysisLabel(key: DocumentMatchAnalysisRowKey) {
+  return t(`projectDetail.stats.matchAnalysis.rows.${key}`)
 }
 
 function getStatisticsSourceLabel(statistics: DocumentStatistics | null | undefined) {
@@ -953,6 +1714,47 @@ function canEnterWorkbench(row: ProjectRow) {
   return Boolean(row.can_write) && Number(row.total_segments ?? 0) > 0 && !row.is_edit_locked
 }
 
+function canUseFileInMergeView(row: ProjectRow) {
+  return canEnterWorkbench(row)
+}
+
+function canManageMergeView(view: MergeView) {
+  return canManageProject.value || Boolean(view.can_manage)
+}
+
+function getMergeViewFileNames(view: MergeView) {
+  const fileById = new Map(tableRows.value.map((file) => [file.id, file.filename]))
+  return view.file_ids.map((fileId) => fileById.get(fileId) || fileId)
+}
+
+function getMergeViewMetaText(view: MergeView) {
+  return [
+    t('projectDetail.mergeViews.fileCount', { count: view.file_count }),
+    view.available_file_count !== view.file_count
+      ? t('projectDetail.mergeViews.availableFileCount', { count: view.available_file_count })
+      : '',
+    view.creator_name ? t('projectDetail.mergeViews.creator', { name: view.creator_name }) : '',
+    formatDateText(view.updated_at || view.created_at),
+  ].filter(Boolean).join(' · ')
+}
+
+function formatLanguagePairSummary(pair: LanguagePairSummary) {
+  return `${formatLanguagePair(pair.source_language, pair.target_language)} · ${pair.file_count} 个文件`
+}
+
+function buildDefaultMergeViewName() {
+  const names = selectedMergeViewFiles.value
+    .slice(0, 2)
+    .map((file) => String(file.filename || '').trim())
+    .filter(Boolean)
+  const suffix = selectedMergeViewFiles.value.length > 2
+    ? ` +${selectedMergeViewFiles.value.length - 2}`
+    : ''
+  return names.length > 0
+    ? `${names.join(' + ')}${suffix}`
+    : t('projectDetail.mergeViews.defaultName')
+}
+
 function getFileDetailHint(row: ProjectRow) {
   if (row.is_edit_locked) {
     return row.active_operation_message || t('projectDetail.files.editLockedHint')
@@ -983,9 +1785,55 @@ function clearLanguageDetectState() {
   languageDetectTone.value = 'info'
 }
 
+function getUploadFileExtension(filename: string): string {
+  const dotIndex = filename.lastIndexOf('.')
+  return dotIndex >= 0 ? filename.slice(dotIndex).toLowerCase() : ''
+}
+
+function getMaxUploadSizeMbForFile(filename: string): number {
+  const extension = getUploadFileExtension(filename)
+  for (const capability of uploadCapabilities.value) {
+    if (capability.extensions.includes(extension)) {
+      return capability.max_size_mb
+    }
+  }
+  return 50
+}
+
+function validateSelectedUploadFiles(files: File[]): string {
+  if (files.length === 0) {
+    return ''
+  }
+
+  const limits = uploadLimits.value
+  if (files.length > limits.max_files_per_batch) {
+    return t('projectDetail.errors.tooManyFiles', { max: limits.max_files_per_batch })
+  }
+
+  let totalBytes = 0
+  for (const file of files) {
+    const maxBytes = getMaxUploadSizeMbForFile(file.name) * 1024 * 1024
+    if (file.size > maxBytes) {
+      return t('projectDetail.errors.fileTooLarge', {
+        name: file.name,
+        max: getMaxUploadSizeMbForFile(file.name),
+      })
+    }
+    totalBytes += file.size
+  }
+
+  const maxTotalBytes = limits.max_total_size_mb * 1024 * 1024
+  if (totalBytes > maxTotalBytes) {
+    return t('projectDetail.errors.totalTooLarge', { max: limits.max_total_size_mb })
+  }
+
+  return ''
+}
+
 function updateSelectedFiles(files: File[]) {
   selectedFiles.value = files
   clearLanguageDetectState()
+  uploadMessage.value = validateSelectedUploadFiles(files)
 }
 
 function onFileChange(event: Event) {
@@ -996,14 +1844,22 @@ function onFileDrop(event: DragEvent) {
   updateSelectedFiles(Array.from(event.dataTransfer?.files ?? []))
 }
 
-function resetUploadForm() {
+function clearSelectedUploadFiles() {
+  if (uploading.value) {
+    return
+  }
+
   selectedFiles.value = []
   uploadMessage.value = ''
   clearLanguageDetectState()
+  uploadInputKey.value += 1
+}
+
+function resetUploadForm() {
+  clearSelectedUploadFiles()
   uploadPercent.value = 0
   documentParseMode.value = 'full'
   documentParseOptions.value = { ...DEFAULT_DOCUMENT_PARSE_OPTIONS }
-  uploadInputKey.value += 1
 }
 
 function openUploadDialog() {
@@ -1071,11 +1927,25 @@ async function loadProjectAssignments() {
     if (!activeAssignmentWorkflowStepId.value) {
       activeAssignmentWorkflowStepId.value = data.workflow_steps?.[0]?.id || projectWorkflowSteps.value[0]?.id || ''
     }
-    assignmentDrafts.value = data.assignments.map((assignment) => ({
-      assignee_id: assignment.assignee_id,
-      workflow_step_id: assignment.workflow_step_id || activeAssignmentWorkflowStepId.value,
-      file_record_ids: new Set(assignment.file_record_ids),
-    }))
+    assignmentDrafts.value = data.assignments.map((assignment) => {
+      const fileRanges = new Map<string, AssignmentFileRangeDraft>()
+      const fileIds = new Set(assignment.file_record_ids)
+      for (const range of assignment.file_ranges || []) {
+        fileIds.add(range.file_record_id)
+        if (range.range_start !== null || range.range_end !== null) {
+          fileRanges.set(range.file_record_id, {
+            range_start: range.range_start,
+            range_end: range.range_end,
+          })
+        }
+      }
+      return {
+        assignee_id: assignment.assignee_id,
+        workflow_step_id: assignment.workflow_step_id || activeAssignmentWorkflowStepId.value,
+        file_record_ids: fileIds,
+        file_ranges: fileRanges,
+      }
+    })
   } catch (error) {
     toast.error(getErrorMessage(error, '项目指派加载失败。'))
   } finally {
@@ -1138,6 +2008,7 @@ function toggleAssignmentUser(user: User) {
       assignee_id: user.id,
       workflow_step_id: workflowStepId,
       file_record_ids: new Set<string>(),
+      file_ranges: new Map<string, AssignmentFileRangeDraft>(),
     },
   ]
 }
@@ -1153,14 +2024,17 @@ function toggleAssignmentFile(userId: string, fileRecordId: string) {
       return draft
     }
     const nextFileIds = new Set(draft.file_record_ids)
+    const nextFileRanges = new Map(draft.file_ranges)
     if (nextFileIds.has(fileRecordId)) {
       nextFileIds.delete(fileRecordId)
+      nextFileRanges.delete(fileRecordId)
     } else {
       nextFileIds.add(fileRecordId)
     }
     return {
       ...draft,
       file_record_ids: nextFileIds,
+      file_ranges: nextFileRanges,
     }
   })
 }
@@ -1183,6 +2057,65 @@ function getFilteredAssignmentFiles(draft: AssignmentDraft) {
   return files
 }
 
+function getAssignableMergeViewFileIds(view: MergeView) {
+  const projectFileIds = new Set(tableRows.value.map((file) => file.id))
+  return (view.file_ids || []).filter((fileId) => projectFileIds.has(fileId))
+}
+
+function isAssignmentMergeViewChecked(draft: AssignmentDraft, view: MergeView) {
+  const fileIds = getAssignableMergeViewFileIds(view)
+  return fileIds.length > 0 && fileIds.every((fileId) => draft.file_record_ids.has(fileId))
+}
+
+function isAssignmentMergeViewPartial(draft: AssignmentDraft, view: MergeView) {
+  const fileIds = getAssignableMergeViewFileIds(view)
+  if (fileIds.length === 0 || isAssignmentMergeViewChecked(draft, view)) {
+    return false
+  }
+  return fileIds.some((fileId) => draft.file_record_ids.has(fileId))
+}
+
+function toggleAssignmentMergeView(draft: AssignmentDraft, view: MergeView) {
+  const fileIds = getAssignableMergeViewFileIds(view)
+  if (fileIds.length === 0) {
+    return
+  }
+  const shouldRemove = isAssignmentMergeViewChecked(draft, view)
+  assignmentDrafts.value = assignmentDrafts.value.map((item) => {
+    if (item.assignee_id !== draft.assignee_id || item.workflow_step_id !== draft.workflow_step_id) {
+      return item
+    }
+    const nextFileIds = new Set(item.file_record_ids)
+    const nextFileRanges = new Map(item.file_ranges)
+    for (const fileId of fileIds) {
+      if (shouldRemove) {
+        nextFileIds.delete(fileId)
+        nextFileRanges.delete(fileId)
+      } else {
+        nextFileIds.add(fileId)
+      }
+    }
+    return {
+      ...item,
+      file_record_ids: nextFileIds,
+      file_ranges: nextFileRanges,
+    }
+  })
+}
+
+function getAssignmentMergeViewMeta(view: MergeView) {
+  return [
+    `${getAssignableMergeViewFileIds(view).length} 个文件`,
+    view.creator_name ? `创建人 ${view.creator_name}` : '',
+  ].filter(Boolean).join(' · ')
+}
+
+function getCheckedAssignmentMergeViewIds(draft: AssignmentDraft) {
+  return assignmentMergeViews.value
+    .filter((view) => isAssignmentMergeViewChecked(draft, view))
+    .map((view) => view.id)
+}
+
 function updateFilteredAssignmentFiles(userId: string, checked: boolean) {
   const draft = getAssignmentDraft(userId)
   if (!draft) {
@@ -1198,16 +2131,19 @@ function updateFilteredAssignmentFiles(userId: string, checked: boolean) {
       return item
     }
     const nextFileIds = new Set(item.file_record_ids)
+    const nextFileRanges = new Map(item.file_ranges)
     for (const fileId of filteredFileIds) {
       if (checked) {
         nextFileIds.add(fileId)
       } else {
         nextFileIds.delete(fileId)
+        nextFileRanges.delete(fileId)
       }
     }
     return {
       ...item,
       file_record_ids: nextFileIds,
+      file_ranges: nextFileRanges,
     }
   })
 }
@@ -1218,6 +2154,121 @@ function selectFilteredAssignmentFiles(userId: string) {
 
 function clearFilteredAssignmentFiles(userId: string) {
   updateFilteredAssignmentFiles(userId, false)
+}
+
+function getAssignmentRangeInputValue(
+  draft: AssignmentDraft,
+  fileRecordId: string,
+  field: AssignmentFileRangeField,
+) {
+  const value = draft.file_ranges.get(fileRecordId)?.[field]
+  return value ?? ''
+}
+
+function getAssignmentInputValue(event: Event) {
+  return event.target instanceof HTMLInputElement ? event.target.value : ''
+}
+
+function parseAssignmentRangeInput(value: string) {
+  const trimmed = value.trim()
+  if (!trimmed) {
+    return null
+  }
+  const numericValue = Number(trimmed)
+  return Number.isFinite(numericValue) ? numericValue : null
+}
+
+function updateAssignmentFileRange(
+  userId: string,
+  fileRecordId: string,
+  field: AssignmentFileRangeField,
+  value: string,
+) {
+  const workflowStepId = activeAssignmentWorkflowStepId.value
+  assignmentDrafts.value = assignmentDrafts.value.map((draft) => {
+    if (draft.assignee_id !== userId || draft.workflow_step_id !== workflowStepId) {
+      return draft
+    }
+    const nextFileIds = new Set(draft.file_record_ids)
+    const nextFileRanges = new Map(draft.file_ranges)
+    const currentRange = nextFileRanges.get(fileRecordId) ?? { range_start: null, range_end: null }
+    const nextRange = {
+      ...currentRange,
+      [field]: parseAssignmentRangeInput(value),
+    }
+    nextFileIds.add(fileRecordId)
+    if (nextRange.range_start === null && nextRange.range_end === null) {
+      nextFileRanges.delete(fileRecordId)
+    } else {
+      nextFileRanges.set(fileRecordId, nextRange)
+    }
+    return {
+      ...draft,
+      file_record_ids: nextFileIds,
+      file_ranges: nextFileRanges,
+    }
+  })
+}
+
+function getAssignmentFileSegmentCount(fileRecordId: string) {
+  return Number(projectFileById.value.get(fileRecordId)?.total_segments || 0)
+}
+
+function getAssignmentFileLabel(fileRecordId: string) {
+  return projectFileById.value.get(fileRecordId)?.filename || fileRecordId
+}
+
+function validateAssignmentRanges() {
+  for (const draft of assignmentDrafts.value) {
+    for (const fileRecordId of draft.file_record_ids) {
+      const range = draft.file_ranges.get(fileRecordId)
+      if (!range || (range.range_start === null && range.range_end === null)) {
+        continue
+      }
+      const fileLabel = getAssignmentFileLabel(fileRecordId)
+      if (range.range_start === null || range.range_end === null) {
+        toast.error(`${fileLabel} 的句段范围需要同时填写起始段和结束段。`)
+        return false
+      }
+      if (
+        !Number.isInteger(range.range_start)
+        || !Number.isInteger(range.range_end)
+        || range.range_start < 1
+        || range.range_end < 1
+      ) {
+        toast.error(`${fileLabel} 的句段范围必须是大于 0 的整数。`)
+        return false
+      }
+      if (range.range_start > range.range_end) {
+        toast.error(`${fileLabel} 的起始段不能大于结束段。`)
+        return false
+      }
+      const segmentCount = getAssignmentFileSegmentCount(fileRecordId)
+      if (segmentCount > 0 && range.range_end > segmentCount) {
+        toast.error(`${fileLabel} 的结束段不能超过 ${segmentCount}。`)
+        return false
+      }
+    }
+  }
+  return true
+}
+
+function buildAssignmentFilePayload(draft: AssignmentDraft) {
+  const file_record_ids: string[] = []
+  const file_ranges: Array<{ file_record_id: string; range_start: number; range_end: number }> = []
+  for (const fileRecordId of draft.file_record_ids) {
+    const range = draft.file_ranges.get(fileRecordId)
+    if (range && range.range_start !== null && range.range_end !== null) {
+      file_ranges.push({
+        file_record_id: fileRecordId,
+        range_start: range.range_start,
+        range_end: range.range_end,
+      })
+    } else {
+      file_record_ids.push(fileRecordId)
+    }
+  }
+  return { file_record_ids, file_ranges }
 }
 
 function getAssignmentEventActionLabel(action: string) {
@@ -1278,7 +2329,7 @@ async function openAssignmentDialog(_row?: ProjectFileItem | null) {
   resetAssignmentFilters()
   ensureActiveAssignmentWorkflowStep()
   showAssignmentDialog.value = true
-  await Promise.all([loadAssignableUsers(), loadProjectAssignments()])
+  await Promise.all([loadAssignableUsers(), loadProjectAssignments(), loadMergeViews()])
 }
 
 function closeAssignmentDialog() {
@@ -1293,14 +2344,22 @@ async function saveAssignment() {
   if (!project.value) {
     return
   }
+  if (!validateAssignmentRanges()) {
+    return
+  }
   savingAssignment.value = true
   try {
     await http.patch(`/projects/${project.value.id}/assignments`, {
-      assignments: assignmentDrafts.value.map((draft) => ({
-        assignee_id: draft.assignee_id,
-        workflow_step_id: draft.workflow_step_id,
-        file_record_ids: Array.from(draft.file_record_ids),
-      })),
+      assignments: assignmentDrafts.value.map((draft) => {
+        const filePayload = buildAssignmentFilePayload(draft)
+        return {
+          assignee_id: draft.assignee_id,
+          workflow_step_id: draft.workflow_step_id,
+          file_record_ids: filePayload.file_record_ids,
+          file_ranges: filePayload.file_ranges,
+          merge_view_ids: getCheckedAssignmentMergeViewIds(draft),
+        }
+      }),
     })
     toast.success('项目指派已更新。')
     showAssignmentDialog.value = false
@@ -1338,6 +2397,7 @@ async function handlePreTranslateDone() {
   selectedFileIds.value = new Set<string>()
   await loadProject()
   preTranslateProgressByFileId.value = {}
+  activePretranslationTaskIdByFileId.value = {}
 }
 
 function handlePreTranslateProgress(payload: PreTranslateProgressPayload) {
@@ -1348,6 +2408,85 @@ function handlePreTranslateProgress(payload: PreTranslateProgressPayload) {
       status: payload.status,
       running: payload.running,
     },
+  }
+}
+
+function buildActivePretranslationStatus(task: ActivePretranslationTaskStatus) {
+  const parts: string[] = []
+  if (task.message) {
+    parts.push(task.message)
+  }
+  if (task.provider || task.model) {
+    parts.push([task.provider, task.model].filter(Boolean).join(' / '))
+  }
+  if (task.total_segments > 0 || task.processed_segments > 0) {
+    const total = Math.max(task.total_segments, task.processed_segments)
+    parts.push(`${task.processed_segments}/${total}`)
+  }
+  if (task.unique_segments > 0 && task.deduplicated_segments > 0) {
+    parts.push(`唯一 ${task.unique_segments}，去重 ${task.deduplicated_segments}`)
+  }
+  if (task.updated_segments > 0 || task.error_segments > 0) {
+    parts.push(`成功 ${task.updated_segments}，失败 ${task.error_segments}`)
+  }
+  if (task.error && task.status === 'failed') {
+    parts.push(task.error)
+  }
+  return parts.filter(Boolean).join(' · ') || t('projectDetail.preTranslate.progress.running')
+}
+
+function clearActivePretranslationPollTimer() {
+  if (activePretranslationPollTimer !== null) {
+    window.clearInterval(activePretranslationPollTimer)
+    activePretranslationPollTimer = null
+  }
+}
+
+function ensureActivePretranslationPolling() {
+  if (activePretranslationPollTimer !== null) {
+    return
+  }
+  activePretranslationPollTimer = window.setInterval(() => {
+    void loadActivePretranslationTasks()
+  }, ACTIVE_PRETRANSLATION_POLL_INTERVAL_MS)
+}
+
+async function loadActivePretranslationTasks() {
+  if (!project.value?.id) {
+    clearActivePretranslationPollTimer()
+    activePretranslationTaskIdByFileId.value = {}
+    return
+  }
+  try {
+    const { data } = await http.get<ActivePretranslationTasksResponse>(
+      `/projects/${project.value.id}/pretranslation-tasks/active`,
+    )
+    const hasRunningProgress = Object.values(preTranslateProgressByFileId.value).some((state) => state.running)
+    if (!data.tasks.length) {
+      clearActivePretranslationPollTimer()
+      activePretranslationTaskIdByFileId.value = {}
+      if (hasRunningProgress) {
+        preTranslateProgressByFileId.value = {}
+        await loadProject()
+      }
+      return
+    }
+
+    const nextTaskIdByFileId: Record<string, string> = {}
+    for (const task of data.tasks) {
+      nextTaskIdByFileId[task.file_record_id] = task.id
+      handlePreTranslateProgress({
+        fileId: task.file_record_id,
+        progress: task.progress,
+        status: buildActivePretranslationStatus(task),
+        running: ACTIVE_PRETRANSLATION_STATUSES.has(task.status),
+      })
+    }
+    activePretranslationTaskIdByFileId.value = nextTaskIdByFileId
+    ensureActivePretranslationPolling()
+  } catch {
+    clearActivePretranslationPollTimer()
+    activePretranslationTaskIdByFileId.value = {}
   }
 }
 
@@ -1385,6 +2524,47 @@ function getFilePretranslationProgressMessage(row: ProjectRow) {
   return preTranslateProgressByFileId.value[String(row.id)]?.status
     || (row.active_operation === 'pre_translate' ? row.active_operation_message : '')
     || ''
+}
+
+function getActivePretranslationTaskId(row: ProjectRow) {
+  return activePretranslationTaskIdByFileId.value[String(row.id)] || ''
+}
+
+function setPretranslationTaskCanceling(taskId: string, canceling: boolean) {
+  const next = new Set(cancelingPretranslationTaskIds.value)
+  if (canceling) {
+    next.add(taskId)
+  } else {
+    next.delete(taskId)
+  }
+  cancelingPretranslationTaskIds.value = next
+}
+
+function isFilePretranslationCanceling(row: ProjectRow) {
+  const taskId = getActivePretranslationTaskId(row)
+  return taskId ? cancelingPretranslationTaskIds.value.has(taskId) : false
+}
+
+async function cancelFilePretranslation(row: ProjectRow) {
+  const taskId = getActivePretranslationTaskId(row)
+  if (!taskId) {
+    return
+  }
+  setPretranslationTaskCanceling(taskId, true)
+  handlePreTranslateProgress({
+    fileId: String(row.id),
+    progress: getFilePretranslationProgress(row),
+    status: '正在停止预翻译任务。',
+    running: true,
+  })
+  try {
+    await http.post(`/pretranslation-tasks/${taskId}/cancel`)
+    await loadActivePretranslationTasks()
+  } catch (error) {
+    toast.error(getErrorMessage(error, '预翻译停止失败。'))
+  } finally {
+    setPretranslationTaskCanceling(taskId, false)
+  }
 }
 
 function openProjectIssueDialog() {
@@ -1479,6 +2659,10 @@ function stopActionMenuEventBubble(ev: MouseEvent) {
 }
 
 function handleDocumentClick(ev: MouseEvent) {
+  const target = ev.target as HTMLElement
+  if (!target.closest('.pd-export-dropdown')) {
+    showProjectExportMenu.value = false
+  }
   if (isEventFromFloatingActionMenu(ev)) {
     return
   }
@@ -1486,6 +2670,7 @@ function handleDocumentClick(ev: MouseEvent) {
 }
 
 function handleDocumentScroll() {
+  showProjectExportMenu.value = false
   if (openActionMenuId.value) {
     closeActionMenu()
   }
@@ -1497,6 +2682,9 @@ function goBack() {
 
 function switchProjectTab(tab: ProjectTab) {
   activeTab.value = tab
+  if (tab === 'views') {
+    void loadMergeViews()
+  }
   if (tab === 'stats' && statisticsSelectedFileIds.value.size === 0 && selectedFileIds.value.size > 0) {
     statisticsSelectedFileIds.value = new Set(selectedFileIds.value)
   }
@@ -1615,6 +2803,137 @@ function openWorkbench(row: ProjectRow) {
   window.open(resolved.href, '_blank', 'noopener,noreferrer')
 }
 
+async function loadMergeViews() {
+  if (!project.value || loadingMergeViews.value) {
+    return
+  }
+  loadingMergeViews.value = true
+  try {
+    const data = await listProjectMergeViews(project.value.id)
+    mergeViews.value = data.items
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('projectDetail.mergeViews.errors.load'))
+  } finally {
+    loadingMergeViews.value = false
+  }
+}
+
+function openMergeView(view: MergeView) {
+  const resolved = router.resolve({
+    name: 'merge-view-focus',
+    params: { viewId: view.id },
+    query: {
+      from: 'project',
+      pid: props.id,
+      ...(cameFromTasks.value ? { parent: 'tasks' } : {}),
+    },
+  })
+  window.open(resolved.href, '_blank', 'noopener,noreferrer')
+}
+
+function openCreateMergeViewDialog() {
+  if (!canOpenMergeViewDialog.value) {
+    toast.warn(mergeOpenButtonTitle.value || t('projectDetail.mergeViews.selectAtLeastTwo'))
+    return
+  }
+  mergeViewDialogMode.value = 'create'
+  activeMergeView.value = null
+  mergeViewName.value = buildDefaultMergeViewName()
+  mergeViewDialogError.value = ''
+  showMergeViewDialog.value = true
+}
+
+function openRenameMergeViewDialog(view: MergeView) {
+  if (!canManageMergeView(view)) {
+    return
+  }
+  mergeViewDialogMode.value = 'rename'
+  activeMergeView.value = view
+  mergeViewName.value = view.name
+  mergeViewDialogError.value = ''
+  showMergeViewDialog.value = true
+}
+
+function closeMergeViewDialog() {
+  if (savingMergeView.value) {
+    return
+  }
+  showMergeViewDialog.value = false
+  activeMergeView.value = null
+  mergeViewDialogError.value = ''
+}
+
+async function submitMergeViewDialog() {
+  if (!project.value) {
+    return
+  }
+  const name = mergeViewName.value.trim()
+  if (!name) {
+    mergeViewDialogError.value = t('projectDetail.mergeViews.errors.nameRequired')
+    return
+  }
+
+  savingMergeView.value = true
+  mergeViewDialogError.value = ''
+  try {
+    if (mergeViewDialogMode.value === 'create') {
+      const created = await createProjectMergeView(project.value.id, {
+        name,
+        file_ids: selectedMergeViewFiles.value.map((file) => file.id),
+      })
+      mergeViews.value = [created, ...mergeViews.value.filter((view) => view.id !== created.id)]
+      showMergeViewDialog.value = false
+      toast.success(t('projectDetail.mergeViews.messages.created'))
+      openMergeView(created)
+      return
+    }
+
+    if (!activeMergeView.value) {
+      return
+    }
+    const updated = await updateMergeView(activeMergeView.value.id, { name })
+    mergeViews.value = mergeViews.value.map((view) => (view.id === updated.id ? updated : view))
+    showMergeViewDialog.value = false
+    activeMergeView.value = null
+    toast.success(t('projectDetail.mergeViews.messages.renamed'))
+  } catch (error) {
+    mergeViewDialogError.value = getErrorMessage(
+      error,
+      mergeViewDialogMode.value === 'create'
+        ? t('projectDetail.mergeViews.errors.create')
+        : t('projectDetail.mergeViews.errors.rename'),
+    )
+  } finally {
+    savingMergeView.value = false
+  }
+}
+
+async function deleteSavedMergeView(view: MergeView) {
+  if (!canManageMergeView(view) || mergeViewActionId.value) {
+    return
+  }
+  const confirmed = await confirm({
+    title: t('projectDetail.mergeViews.deleteTitle'),
+    message: t('projectDetail.mergeViews.deleteConfirm', { name: view.name }),
+    confirmText: t('common.actions.delete'),
+    danger: true,
+  })
+  if (!confirmed) {
+    return
+  }
+
+  mergeViewActionId.value = view.id
+  try {
+    await deleteMergeView(view.id)
+    mergeViews.value = mergeViews.value.filter((item) => item.id !== view.id)
+    toast.success(t('projectDetail.mergeViews.messages.deleted'))
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('projectDetail.mergeViews.errors.delete'))
+  } finally {
+    mergeViewActionId.value = ''
+  }
+}
+
 async function loadProject() {
   loading.value = true
   pageError.value = ''
@@ -1631,17 +2950,23 @@ async function loadProject() {
     statisticsResultFileIds.value = new Set<string>()
     statisticsReports.value = []
     activeStatisticsReportId.value = ''
+    if (activeTab.value === 'views') {
+      void loadMergeViews()
+    }
     if (data.can_manage) {
       void loadAssignmentEvents()
       void loadProjectTranslationMemorySettings()
       void loadProjectTermBaseSettings()
+      void loadProjectQualityQASettings()
       if (activeTab.value === 'stats') {
         void loadDocumentStatisticsReports()
       }
     } else {
       translationMemorySettings.value = null
       termBaseSettings.value = null
+      qualityQASettings.value = null
     }
+    void loadActivePretranslationTasks()
   } catch (error) {
     pageError.value = getErrorMessage(error, t('projectDetail.errors.load'))
   } finally {
@@ -1660,7 +2985,7 @@ async function loadProjectTermBaseSettings() {
     const { data } = await http.get<ProjectTermBaseSettingsResponse>(
       `/projects/${project.value.id}/term-base-settings`,
     )
-    sortTermBaseSettings(data)
+    preserveTermBaseSettingsDisplayOrder(data, termBaseSettings.value)
     termBaseSettings.value = data
   } catch (error) {
     termBaseSettingsError.value = getErrorMessage(error, '术语库设置加载失败。')
@@ -1680,7 +3005,7 @@ async function loadProjectTranslationMemorySettings() {
     const { data } = await http.get<ProjectTranslationMemorySettingsResponse>(
       `/projects/${project.value.id}/translation-memory-settings`,
     )
-    sortTranslationMemorySettings(data)
+    preserveTranslationMemorySettingsDisplayOrder(data, translationMemorySettings.value)
     translationMemorySettings.value = data
   } catch (error) {
     translationMemorySettingsError.value = getErrorMessage(error, '记忆库设置加载失败。')
@@ -1688,6 +3013,146 @@ async function loadProjectTranslationMemorySettings() {
     loadingTranslationMemorySettings.value = false
   }
 }
+
+function syncQualityQADraftFromSettings(data: QualityQASettingsResponse) {
+  for (const rule of qualityQARules) {
+    const ruleSetting = data.settings.rules?.[rule.key]
+    qualityQADraft.rules[rule.key] = typeof ruleSetting?.enabled === 'boolean'
+      ? ruleSetting.enabled
+      : (rule.key === 'spelling_grammar' ? data.settings.spelling_grammar.enabled : rule.defaultEnabled)
+  }
+}
+
+function buildQualityQARulesPayload() {
+  return qualityQARules.reduce((payload, rule) => {
+    payload[rule.key] = {
+      enabled: qualityQADraft.rules[rule.key],
+    }
+    return payload
+  }, {} as Record<QualityQARuleKey, { enabled: boolean }>)
+}
+
+function toggleAllQualityQARules(event: Event) {
+  const checked = (event.target as HTMLInputElement | null)?.checked ?? false
+  for (const rule of qualityQARules) {
+    qualityQADraft.rules[rule.key] = checked
+  }
+}
+
+async function loadProjectQualityQASettings() {
+  if (!project.value?.can_manage) {
+    qualityQASettings.value = null
+    return
+  }
+  loadingQualityQASettings.value = true
+  qualityQASettingsError.value = ''
+  try {
+    const { data } = await http.get<QualityQASettingsResponse>(
+      `/projects/${project.value.id}/quality-qa-settings`,
+    )
+    qualityQASettings.value = data
+    syncQualityQADraftFromSettings(data)
+  } catch (error) {
+    qualityQASettingsError.value = getErrorMessage(error, '质量保证设置加载失败。')
+  } finally {
+    loadingQualityQASettings.value = false
+  }
+}
+
+async function saveProjectQualityQASettings() {
+  if (!project.value?.can_manage || savingQualityQASettings.value) {
+    return
+  }
+  savingQualityQASettings.value = true
+  qualityQASettingsError.value = ''
+  try {
+    const { data } = await http.patch<QualityQASettingsResponse>(
+      `/projects/${project.value.id}/quality-qa-settings`,
+      {
+        rules: buildQualityQARulesPayload(),
+        spelling_grammar: {
+          enabled: qualityQADraft.rules.spelling_grammar,
+        },
+      },
+    )
+    qualityQASettings.value = data
+    syncQualityQADraftFromSettings(data)
+    toast.success('质量保证设置已保存')
+  } catch (error) {
+    qualityQASettingsError.value = getErrorMessage(error, '质量保证设置保存失败。')
+  } finally {
+    savingQualityQASettings.value = false
+  }
+}
+
+async function setProjectSyncForProject(enabled: boolean): Promise<boolean> {
+  if (!project.value || projectSyncToggleLoading.value || !canManageProject.value) {
+    return false
+  }
+
+  const disabled = !enabled
+  if (disabled) {
+    const accepted = await confirm({
+      title: '关闭项目同步',
+      message: '将关闭当前项目全部文件的重复句段自动同步，并清除由项目同步生成的译文。人工、AI 和记忆库译文不会被清除。',
+      confirmText: '关闭并清除',
+      cancelText: t('common.actions.cancel'),
+      danger: true,
+    })
+    if (!accepted) {
+      return false
+    }
+  }
+
+  projectSyncToggleLoading.value = true
+  pageError.value = ''
+  try {
+    const { data } = await http.patch<ProjectSyncDisableResult>(
+      `/projects/${project.value.id}/segments/project-sync`,
+      { disabled },
+    )
+    await loadProject()
+    if (disabled) {
+      if (data.updated_count > 0) {
+        toast.success({
+          title: '项目同步已关闭',
+          message: `已处理 ${data.updated_count} 个句段，关闭 ${data.disabled_count} 个同步开关，清除 ${data.cleared_count} 条项目同步译文。`,
+        })
+      } else {
+        toast.info('当前项目没有需要关闭的项目同步句段。')
+      }
+    } else if (data.updated_count > 0) {
+      toast.success({
+        title: '项目同步已开启',
+        message: `已恢复 ${data.updated_count} 个句段的重复句段自动同步。`,
+      })
+    } else {
+      toast.info('当前项目同步已处于开启状态。')
+    }
+    return true
+  } catch (error) {
+    pageError.value = getErrorMessage(error, disabled ? '关闭项目同步失败。' : '开启项目同步失败。')
+    toast.error({
+      title: disabled ? '关闭项目同步失败' : '开启项目同步失败',
+      message: pageError.value,
+    })
+    return false
+  } finally {
+    projectSyncToggleLoading.value = false
+  }
+}
+
+async function handleProjectSyncToggle(event: Event) {
+  const input = event.target as HTMLInputElement | null
+  if (!input) {
+    return
+  }
+
+  await setProjectSyncForProject(input.checked)
+  input.checked = projectSyncAllEnabled.value
+  input.indeterminate = projectSyncMixed.value
+}
+
 
 function translationMemorySettingGroupKey(group: ProjectTranslationMemorySettingGroup) {
   return `${group.source_language}->${group.target_language}`
@@ -1739,6 +3204,56 @@ function getTMCollectionBoundSummary(group: ProjectTranslationMemorySettingGroup
   return `${count}/${group.files.length} 个文件`
 }
 
+function normalizeResourceSettingsSearchText(value: unknown) {
+  return String(value ?? '').trim().toLowerCase()
+}
+
+function getResourceSettingsSearchKeywords(value: string) {
+  return normalizeResourceSettingsSearchText(value).split(/\s+/).filter(Boolean)
+}
+
+function getTMCollectionSearchText(
+  group: ProjectTranslationMemorySettingGroup,
+  collection: ProjectTranslationMemorySettingCollection,
+) {
+  return [
+    collection.name,
+    collection.description,
+    collection.entry_count,
+    formatLanguagePair(collection.source_language, collection.target_language),
+    getLanguageLabel(collection.source_language),
+    getLanguageLabel(collection.target_language),
+    isTMCollectionEnabled(group, collection.id) ? '已启用 enabled' : '未启用 disabled',
+    isTMCollectionWritable(group, collection.id) ? '写入 writable' : '',
+    getTMCollectionBoundSummary(group, collection.id),
+  ].map(normalizeResourceSettingsSearchText).join(' ')
+}
+
+function getFilteredTMCollections(group: ProjectTranslationMemorySettingGroup) {
+  const keywords = getResourceSettingsSearchKeywords(tmSettingsSearchQuery.value)
+  if (keywords.length === 0) {
+    return group.collections
+  }
+  return group.collections.filter((collection) => {
+    const searchText = getTMCollectionSearchText(group, collection)
+    return keywords.every((keyword) => searchText.includes(keyword))
+  })
+}
+
+function getFilteredTMSettingsCollectionCount() {
+  return translationMemorySettings.value?.groups.reduce(
+    (total, group) => total + getFilteredTMCollections(group).length,
+    0,
+  ) ?? 0
+}
+
+function getTMSettingsCollectionCount() {
+  return translationMemorySettings.value?.groups.reduce(
+    (total, group) => total + group.collections.length,
+    0,
+  ) ?? 0
+}
+
 function isTMCollectionEnabled(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
   return getTMCollectionBoundFiles(group, collectionId).length > 0
 }
@@ -1770,6 +3285,45 @@ function sortTranslationMemorySettings(settings: ProjectTranslationMemorySetting
   }
 }
 
+function preserveTranslationMemorySettingsDisplayOrder(
+  settings: ProjectTranslationMemorySettingsResponse,
+  previousSettings: ProjectTranslationMemorySettingsResponse | null,
+) {
+  if (!previousSettings) {
+    sortTranslationMemorySettings(settings)
+    return
+  }
+
+  const previousGroupByKey = new Map(
+    previousSettings.groups.map((group) => [translationMemorySettingGroupKey(group), group]),
+  )
+  for (const group of settings.groups) {
+    const previousGroup = previousGroupByKey.get(translationMemorySettingGroupKey(group))
+    if (!previousGroup) {
+      sortTMCollectionsByEnabled(group)
+      continue
+    }
+    const displayOrderById = new Map(previousGroup.collections.map((collection, index) => [collection.id, index]))
+    group.collections = group.collections
+      .map((collection, index) => ({ collection, index }))
+      .sort((left, right) => {
+        const leftOrder = displayOrderById.get(left.collection.id)
+        const rightOrder = displayOrderById.get(right.collection.id)
+        if (typeof leftOrder === 'number' && typeof rightOrder === 'number') {
+          return leftOrder - rightOrder
+        }
+        if (typeof leftOrder === 'number') {
+          return -1
+        }
+        if (typeof rightOrder === 'number') {
+          return 1
+        }
+        return left.index - right.index
+      })
+      .map(({ collection }) => collection)
+  }
+}
+
 function isTMCollectionWritable(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
   return group.files.some((file) => file.collection_id === collectionId)
 }
@@ -1791,7 +3345,6 @@ function toggleTMCollectionEnabled(
       }
     }
   }
-  sortTMCollectionsByEnabled(group, checked ? collectionId : '')
 }
 
 function toggleTMCollectionWritable(
@@ -1810,7 +3363,6 @@ function toggleTMCollectionWritable(
       file.collection_id = file.collection_ids.find((id) => id !== collectionId) || null
     }
   }
-  sortTMCollectionsByEnabled(group, checked ? collectionId : '')
 }
 
 function toggleTMCollectionDetails(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
@@ -1844,10 +3396,6 @@ function toggleFileTMCollection(
   if (checked && !file.collection_id) {
     file.collection_id = collectionId
   }
-  const group = translationMemorySettings.value?.groups.find((candidate) => candidate.files.some((item) => item.id === file.id))
-  if (group) {
-    sortTMCollectionsByEnabled(group, checked ? collectionId : '')
-  }
 }
 
 function setFilePrimaryTMCollection(file: ProjectTranslationMemorySettingFile, event: Event) {
@@ -1855,10 +3403,6 @@ function setFilePrimaryTMCollection(file: ProjectTranslationMemorySettingFile, e
   file.collection_id = collectionId
   if (collectionId && !file.collection_ids.includes(collectionId)) {
     file.collection_ids = [...file.collection_ids, collectionId]
-  }
-  const group = translationMemorySettings.value?.groups.find((candidate) => candidate.files.some((item) => item.id === file.id))
-  if (group) {
-    sortTMCollectionsByEnabled(group, collectionId || '')
   }
 }
 
@@ -1885,7 +3429,6 @@ function setTMCollectionBindingForAll(
       file.collection_id = collectionId
     }
   }
-  sortTMCollectionsByEnabled(group, enabled ? collectionId : '')
 }
 
 function toggleTMCollectionBindingForAll(
@@ -1926,11 +3469,11 @@ function setGroupPrimaryTMCollection(group: ProjectTranslationMemorySettingGroup
       file.collection_ids = [...file.collection_ids, collectionId]
     }
   }
-  sortTMCollectionsByEnabled(group, collectionId || '')
 }
 
 function buildTranslationMemorySettingsPayload() {
   return {
+    auto_tm_enabled: translationMemorySettings.value?.auto_tm_enabled ?? true,
     settings: (translationMemorySettings.value?.groups || []).map((group) => ({
       source_language: group.source_language,
       target_language: group.target_language,
@@ -1955,12 +3498,14 @@ async function saveProjectTranslationMemorySettings() {
       `/projects/${project.value.id}/translation-memory-settings`,
       buildTranslationMemorySettingsPayload(),
     )
-    sortTranslationMemorySettings(data)
+    preserveTranslationMemorySettingsDisplayOrder(data, translationMemorySettings.value)
     translationMemorySettings.value = data
     toast.show({
       tone: 'success',
       title: '记忆库设置已保存',
-      message: data.initial_match_updated_count
+      message: data.initial_match_queued_count
+        ? `已将 ${data.initial_match_queued_count} 个文件加入后台匹配队列。`
+        : data.initial_match_updated_count
         ? `已同步更新 ${data.initial_match_updated_count} 个句段。`
         : '',
     })
@@ -2053,6 +3598,48 @@ function getTermBaseSettingPairLabel(group: ProjectTermBaseSettingGroup) {
   return formatLanguagePair(group.source_language, group.target_language)
 }
 
+function getTermBaseSearchText(
+  group: ProjectTermBaseSettingGroup,
+  row: ProjectTermBaseSettingRow,
+) {
+  return [
+    row.name,
+    row.description,
+    row.entry_count,
+    getTermBaseSettingPairLabel(group),
+    getLanguageLabel(row.source_language),
+    getLanguageLabel(row.target_language),
+    row.enabled ? '已启用 enabled' : '未启用 disabled',
+    row.writable ? '写入 writable' : '',
+    row.qa ? 'qa 质量检查' : '',
+  ].map(normalizeResourceSettingsSearchText).join(' ')
+}
+
+function getFilteredTermBaseRows(group: ProjectTermBaseSettingGroup) {
+  const keywords = getResourceSettingsSearchKeywords(termBaseSettingsSearchQuery.value)
+  if (keywords.length === 0) {
+    return group.term_bases
+  }
+  return group.term_bases.filter((row) => {
+    const searchText = getTermBaseSearchText(group, row)
+    return keywords.every((keyword) => searchText.includes(keyword))
+  })
+}
+
+function getFilteredTermBaseSettingsRowCount() {
+  return termBaseSettings.value?.groups.reduce(
+    (total, group) => total + getFilteredTermBaseRows(group).length,
+    0,
+  ) ?? 0
+}
+
+function getTermBaseSettingsRowCount() {
+  return termBaseSettings.value?.groups.reduce(
+    (total, group) => total + group.term_bases.length,
+    0,
+  ) ?? 0
+}
+
 function sortTermBaseSettings(settings: ProjectTermBaseSettingsResponse) {
   for (const group of settings.groups) {
     sortTermBaseSettingGroup(group)
@@ -2075,15 +3662,71 @@ function sortTermBaseSettingGroup(group: ProjectTermBaseSettingGroup) {
   normalizeTermBaseQAPriority(group)
 }
 
+function getOrderedTermBaseQARows(group: ProjectTermBaseSettingGroup) {
+  const displayOrderById = new Map(group.term_bases.map((row, index) => [row.id, index]))
+  return group.term_bases
+    .filter((row) => row.qa)
+    .sort((left, right) => {
+      const leftPriority = typeof left.qa_priority === 'number' ? left.qa_priority : Number.MAX_SAFE_INTEGER
+      const rightPriority = typeof right.qa_priority === 'number' ? right.qa_priority : Number.MAX_SAFE_INTEGER
+      if (leftPriority !== rightPriority) {
+        return leftPriority - rightPriority
+      }
+      return (displayOrderById.get(left.id) ?? 0) - (displayOrderById.get(right.id) ?? 0)
+    })
+}
+
 function normalizeTermBaseQAPriority(group: ProjectTermBaseSettingGroup) {
-  let priority = 1
+  const orderedQARows = getOrderedTermBaseQARows(group)
   for (const row of group.term_bases) {
-    if (row.qa) {
-      row.qa_priority = priority
-      priority += 1
-    } else {
+    if (!row.qa) {
       row.qa_priority = null
     }
+  }
+  let priority = 1
+  for (const row of orderedQARows) {
+    row.qa_priority = priority
+    priority += 1
+  }
+}
+
+function preserveTermBaseSettingsDisplayOrder(
+  settings: ProjectTermBaseSettingsResponse,
+  previousSettings: ProjectTermBaseSettingsResponse | null,
+) {
+  if (!previousSettings) {
+    sortTermBaseSettings(settings)
+    return
+  }
+
+  const previousGroupByKey = new Map(
+    previousSettings.groups.map((group) => [termBaseSettingGroupKey(group), group]),
+  )
+  for (const group of settings.groups) {
+    const previousGroup = previousGroupByKey.get(termBaseSettingGroupKey(group))
+    if (!previousGroup) {
+      sortTermBaseSettingGroup(group)
+      continue
+    }
+    const displayOrderById = new Map(previousGroup.term_bases.map((row, index) => [row.id, index]))
+    group.term_bases = group.term_bases
+      .map((row, index) => ({ row, index }))
+      .sort((left, right) => {
+        const leftOrder = displayOrderById.get(left.row.id)
+        const rightOrder = displayOrderById.get(right.row.id)
+        if (typeof leftOrder === 'number' && typeof rightOrder === 'number') {
+          return leftOrder - rightOrder
+        }
+        if (typeof leftOrder === 'number') {
+          return -1
+        }
+        if (typeof rightOrder === 'number') {
+          return 1
+        }
+        return left.index - right.index
+      })
+      .map(({ row }) => row)
+    normalizeTermBaseQAPriority(group)
   }
 }
 
@@ -2106,7 +3749,6 @@ function toggleTermBaseSetting(
     row.enabled = true
   }
   normalizeTermBaseQAPriority(group)
-  sortTermBaseSettingGroup(group)
 }
 
 function moveTermBaseQAPriority(
@@ -2117,22 +3759,20 @@ function moveTermBaseQAPriority(
   if (!row.qa) {
     return
   }
-  const currentIndex = group.term_bases.findIndex((item) => item.id === row.id)
+  const orderedQARows = getOrderedTermBaseQARows(group)
+  const currentIndex = orderedQARows.findIndex((item) => item.id === row.id)
   if (currentIndex < 0) {
     return
   }
   const targetIndex = currentIndex + direction
-  if (
-    targetIndex < 0
-    || targetIndex >= group.term_bases.length
-    || !group.term_bases[targetIndex].qa
-  ) {
+  if (targetIndex < 0 || targetIndex >= orderedQARows.length) {
     return
   }
-  const nextRows = [...group.term_bases]
-  const [movedRow] = nextRows.splice(currentIndex, 1)
-  nextRows.splice(targetIndex, 0, movedRow)
-  group.term_bases = nextRows
+  const [movedRow] = orderedQARows.splice(currentIndex, 1)
+  orderedQARows.splice(targetIndex, 0, movedRow)
+  orderedQARows.forEach((item, index) => {
+    item.qa_priority = index + 1
+  })
   normalizeTermBaseQAPriority(group)
 }
 
@@ -2167,7 +3807,7 @@ function buildTermBaseSettingsPayload() {
       target_language: group.target_language,
       enabled_term_base_ids: group.term_bases.filter((row) => row.enabled).map((row) => row.id),
       writable_term_base_ids: group.term_bases.filter((row) => row.enabled && row.writable).map((row) => row.id),
-      qa_term_base_ids: group.term_bases.filter((row) => row.enabled && row.qa).map((row) => row.id),
+      qa_term_base_ids: getOrderedTermBaseQARows(group).filter((row) => row.enabled).map((row) => row.id),
     })),
   }
 }
@@ -2183,7 +3823,7 @@ async function saveProjectTermBaseSettings(showSuccessToast = true) {
       `/projects/${project.value.id}/term-base-settings`,
       buildTermBaseSettingsPayload(),
     )
-    sortTermBaseSettings(data)
+    preserveTermBaseSettingsDisplayOrder(data, termBaseSettings.value)
     termBaseSettings.value = data
     if (showSuccessToast) {
       toast.show({
@@ -2306,6 +3946,11 @@ async function loadUploadCapabilities() {
   try {
     const { data } = await http.get<UploadCapabilitiesResponse>('/file-records/upload-capabilities')
     uploadCapabilities.value = data.formats
+    uploadLimits.value = {
+      max_files_per_batch: data.limits?.max_files_per_batch ?? 50,
+      max_total_size_mb: data.limits?.max_total_size_mb ?? 500,
+      max_expanded_files: data.limits?.max_expanded_files ?? 100,
+    }
     uploadFileAccept.value = data.accept || supportedTaskFileAccept
   } catch (error) {
     console.error('Failed to load upload capabilities:', error)
@@ -2456,6 +4101,12 @@ async function uploadSourceDocument() {
     return
   }
 
+  const validationError = validateSelectedUploadFiles(selectedFiles.value)
+  if (validationError) {
+    uploadMessage.value = validationError
+    return
+  }
+
   uploadMessage.value = ''
   pageError.value = ''
   uploading.value = true
@@ -2516,15 +4167,35 @@ function waitForExportPoll(ms: number) {
   })
 }
 
-function isProjectFileExporting(row: ProjectRow | null) {
-  return Boolean(row && exportingFileId.value === String(row.id))
+function isProjectFileExporting(row: ProjectRow | null, exportType = '') {
+  if (!row || exportingFileId.value !== String(row.id)) {
+    return false
+  }
+  return !exportType || exportingFileType.value === exportType
 }
 
-function getProjectFileExportLabel(row: ProjectRow | null) {
-  if (!isProjectFileExporting(row)) {
-    return t('projectDetail.files.actions.export')
+function getProjectFileExportLabel(row: ProjectRow | null, exportType = 'original') {
+  if (!isProjectFileExporting(row, exportType)) {
+    return exportType === 'source'
+      ? t('projectDetail.files.actions.exportSource')
+      : t('projectDetail.files.actions.exportTarget')
   }
   return `导出中 ${exportFileProgress.value}%`
+}
+
+function getProjectFileExportFallbackName(filename: string, exportType: string) {
+  return exportType === 'source' ? filename : buildTranslatedTaskFilename(filename)
+}
+
+function getProjectFileExportSuccessMessage(exportType: string, count: number) {
+  if (count > 1) {
+    return exportType === 'source'
+      ? `已开始下载 ${count} 个源文件。`
+      : `已开始下载 ${count} 个导出文件。`
+  }
+  return exportType === 'source'
+    ? '源文件已开始下载。'
+    : '导出完成，文件已开始下载。'
 }
 
 async function waitForFileExportTask(task: FileExportTask) {
@@ -2546,43 +4217,196 @@ async function waitForFileExportTask(task: FileExportTask) {
   }
 }
 
-async function exportProjectFile(row: ProjectRow) {
-  if (!row.has_source_document) {
+async function waitForProjectFileZipExportTask(task: FileExportTask) {
+  let currentTask = task
+  while (true) {
+    exportFileProgress.value = currentTask.progress
+    exportFileMessage.value = currentTask.message || `压缩包导出处理中：${currentTask.progress}%`
+
+    if (currentTask.status === 'completed') {
+      return currentTask
+    }
+    if (currentTask.status === 'failed') {
+      throw new Error(currentTask.error || currentTask.message || '压缩包导出失败。')
+    }
+
+    await waitForExportPoll(1200)
+    const { data } = await http.get<FileExportTask>(`/projects/file-export-zip-tasks/${currentTask.task_id}`)
+    currentTask = data
+  }
+}
+
+async function loadProjectExportOptionsForSelection() {
+  const rows = [...selectedProjectFiles.value]
+  projectExportOptions.value = []
+  if (rows.length === 0) {
     return
   }
+
+  loadingProjectExportOptions.value = true
+  try {
+    const responses = await Promise.all(
+      rows.map((row) => http.get<{ export_options: FileExportOption[] }>(`/file-records/${String(row.id)}/export-options`)),
+    )
+    const optionLists = responses.map((response) => response.data.export_options || [])
+    const firstOptions = optionLists[0] || []
+    const commonIds = new Set(firstOptions.map((option) => option.id))
+    for (const options of optionLists.slice(1)) {
+      const ids = new Set(options.map((option) => option.id))
+      for (const id of Array.from(commonIds)) {
+        if (!ids.has(id)) {
+          commonIds.delete(id)
+        }
+      }
+    }
+    projectExportOptions.value = firstOptions.filter((option) => commonIds.has(option.id))
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('projectDetail.errors.exportOptions'))
+    projectExportOptions.value = []
+  } finally {
+    loadingProjectExportOptions.value = false
+  }
+}
+
+async function toggleProjectExportMenu() {
+  if (!canOpenProjectExportMenu.value) {
+    return
+  }
+  if (showProjectExportMenu.value) {
+    showProjectExportMenu.value = false
+    return
+  }
+  await loadProjectExportOptionsForSelection()
+  showProjectExportMenu.value = true
+}
+
+async function downloadProjectFileExport(row: ProjectRow, exportType: string) {
+  const rowId = String(row.id)
+  const filename = String(row.filename || 'export')
+  const { data: task } = await http.post<FileExportTask>(
+    `/file-records/${rowId}/exports`,
+    null,
+    { params: { type: exportType } },
+  )
+  const completedTask = await waitForFileExportTask(task)
+  const response = await http.get(`/file-records/export-tasks/${completedTask.task_id}/download`, {
+    responseType: 'blob',
+  })
+  const downloadName = resolveDownloadFilename(
+    response.headers['content-disposition'],
+    getProjectFileExportFallbackName(filename, exportType),
+  )
+  downloadBlob(response.data, downloadName)
+}
+
+function getProjectFileZipExportFallbackName() {
+  const projectName = String(project.value?.name || project.value?.filename || '项目')
+  return `${projectName}-目标文件.zip`
+}
+
+async function downloadProjectFileZipExport(rows: ProjectRow[]) {
+  const { data: task } = await http.post<FileExportTask>(
+    `/projects/${props.id}/file-export-zip-tasks`,
+    { file_ids: rows.map((row) => String(row.id)) },
+  )
+  const completedTask = await waitForProjectFileZipExportTask(task)
+  const response = await http.get(`/projects/file-export-zip-tasks/${completedTask.task_id}/download`, {
+    responseType: 'blob',
+  })
+  const downloadName = resolveDownloadFilename(
+    response.headers['content-disposition'],
+    getProjectFileZipExportFallbackName(),
+  )
+  downloadBlob(response.data, downloadName)
+}
+
+async function exportProjectFile(row: ProjectRow, exportType = 'original') {
   if (exportingFileId.value) {
     return
   }
 
   closeActionMenu()
+  showProjectExportMenu.value = false
   pageError.value = ''
-  const rowId = String(row.id)
-  const filename = String(row.filename || 'translated.txt')
-  exportingFileId.value = rowId
+  exportingFileId.value = String(row.id)
+  exportingFileType.value = exportType
   exportFileProgress.value = 0
   exportFileMessage.value = '导出任务提交中。'
 
   try {
-    const { data: task } = await http.post<FileExportTask>(
-      `/file-records/${rowId}/exports`,
-      null,
-      { params: { type: 'original' } },
-    )
-    const completedTask = await waitForFileExportTask(task)
-    const response = await http.get(`/file-records/export-tasks/${completedTask.task_id}/download`, {
-      responseType: 'blob',
-    })
-    const downloadName = resolveDownloadFilename(
-      response.headers['content-disposition'],
-      buildTranslatedTaskFilename(filename),
-    )
-    downloadBlob(response.data, downloadName)
-    toast.success('导出完成，文件已开始下载。')
+    await downloadProjectFileExport(row, exportType)
+    toast.success(getProjectFileExportSuccessMessage(exportType, 1))
   } catch (error) {
-    pageError.value = getErrorMessage(error, t('projectDetail.errors.export'))
+    pageError.value = getErrorMessage(
+      error,
+      exportType === 'source' ? t('projectDetail.errors.exportSource') : t('projectDetail.errors.export'),
+    )
   } finally {
     clearExportPollTimer()
     exportingFileId.value = ''
+    exportingFileType.value = ''
+    exportFileProgress.value = 0
+    exportFileMessage.value = ''
+  }
+}
+
+async function exportSelectedProjectFilesAsZip() {
+  if (!canExportSelectedProjectFilesAsZip.value || exportingFileId.value) {
+    return
+  }
+
+  closeActionMenu()
+  showProjectExportMenu.value = false
+  pageError.value = ''
+  const rows = [...selectedProjectFiles.value]
+  exportingFileId.value = '__project_zip__'
+  exportingFileType.value = 'zip'
+  exportFileProgress.value = 0
+  exportFileMessage.value = '压缩包导出任务提交中。'
+
+  try {
+    await downloadProjectFileZipExport(rows)
+    toast.success(`已开始下载包含 ${rows.length} 个目标文件的压缩包。`)
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('projectDetail.errors.exportZip'))
+  } finally {
+    clearExportPollTimer()
+    exportingFileId.value = ''
+    exportingFileType.value = ''
+    exportFileProgress.value = 0
+    exportFileMessage.value = ''
+  }
+}
+
+async function exportSelectedProjectFiles(exportType: string) {
+  if (selectedProjectFiles.value.length === 0 || exportingFileId.value) {
+    return
+  }
+
+  closeActionMenu()
+  showProjectExportMenu.value = false
+  pageError.value = ''
+  const rows = [...selectedProjectFiles.value]
+
+  try {
+    for (let index = 0; index < rows.length; index += 1) {
+      const current = rows[index]
+      exportingFileId.value = String(current.id)
+      exportingFileType.value = exportType
+      exportFileProgress.value = 0
+      exportFileMessage.value = `导出 ${index + 1}/${rows.length} 提交中。`
+      await downloadProjectFileExport(current, exportType)
+    }
+    toast.success(getProjectFileExportSuccessMessage(exportType, rows.length))
+  } catch (error) {
+    pageError.value = getErrorMessage(
+      error,
+      exportType === 'source' ? t('projectDetail.errors.exportSource') : t('projectDetail.errors.export'),
+    )
+  } finally {
+    clearExportPollTimer()
+    exportingFileId.value = ''
+    exportingFileType.value = ''
     exportFileProgress.value = 0
     exportFileMessage.value = ''
   }
@@ -2718,11 +4542,28 @@ watch(() => route.hash, () => {
   syncProjectSettingsHash()
 })
 
+watch([fileSearchQuery, fileStatusFilter, fileLanguagePairFilter, fileAssigneeFilter], () => {
+  currentPage.value = 1
+  if (selectedFileIds.value.size > 0) {
+    const visibleFileIds = new Set(filteredTableRows.value.map((file) => file.id))
+    selectedFileIds.value = new Set(Array.from(selectedFileIds.value).filter((id) => visibleFileIds.has(id)))
+  }
+  closeActionMenu()
+})
+
+watch([filteredTableRows, pageSize], () => {
+  const totalPages = Math.max(1, Math.ceil(filteredTableRows.value.length / pageSize.value))
+  if (currentPage.value > totalPages) {
+    currentPage.value = totalPages
+  }
+})
+
 onBeforeUnmount(() => {
   document.removeEventListener('click', handleDocumentClick)
   window.removeEventListener('scroll', handleDocumentScroll)
   window.removeEventListener('resize', handleDocumentScroll)
   clearExportPollTimer()
+  clearActivePretranslationPollTimer()
 })
 
 </script>
@@ -2825,14 +4666,29 @@ onBeforeUnmount(() => {
             {{ languageDetectMessage }}
           </p>
 
-          <div v-if="selectedFiles.length" class="upload-file-list">
-            <div v-for="fileName in uploadFilePreview" :key="fileName" class="upload-file-list__item">
-              <FileText :size="15" />
-              <span>{{ fileName }}</span>
+          <div v-if="selectedFiles.length" class="upload-file-list-wrap">
+            <div class="upload-file-list__head">
+              <span class="upload-file-list__summary">已选 {{ selectedFiles.length }} 个文件</span>
+              <button
+                type="button"
+                class="upload-file-list__clear"
+                data-testid="project-upload-clear-files"
+                :disabled="uploading"
+                @click="clearSelectedUploadFiles"
+              >
+                <X :size="14" />
+                取消选中
+              </button>
             </div>
-            <div v-if="selectedFiles.length > uploadFilePreview.length" class="upload-file-list__item">
-              <FileText :size="15" />
-              <span>还有 {{ selectedFiles.length - uploadFilePreview.length }} 个文件</span>
+            <div class="upload-file-list">
+              <div
+                v-for="(file, index) in selectedFiles"
+                :key="`${file.name}-${file.size}-${file.lastModified}-${index}`"
+                class="upload-file-list__item"
+              >
+                <FileText :size="15" />
+                <span>{{ file.name }}</span>
+              </div>
             </div>
           </div>
 
@@ -2859,7 +4715,7 @@ onBeforeUnmount(() => {
               class="button button--primary"
               data-testid="project-upload-submit"
               type="button"
-              :disabled="uploading || selectedFiles.length === 0 || !uploadSourceLanguage || !uploadTargetLanguage"
+              :disabled="!canSubmitSourceUpload"
               @click="uploadSourceDocument"
             >
               <Loader2 v-if="uploading" class="lucide-spin" :size="14" />
@@ -3049,6 +4905,24 @@ onBeforeUnmount(() => {
             </button>
             <button
               class="pd-settings-rail__item"
+              :class="{ 'is-active': activeProjectSettingsSection === 'automation' }"
+              type="button"
+              @click="switchProjectSettingsSection('automation')"
+            >
+              <Sparkles :size="15" />
+              <span>自动应用与锁定</span>
+            </button>
+            <button
+              class="pd-settings-rail__item"
+              :class="{ 'is-active': activeProjectSettingsSection === 'quality-qa' }"
+              type="button"
+              @click="switchProjectSettingsSection('quality-qa')"
+            >
+              <ShieldCheck :size="15" />
+              <span>质量保证</span>
+            </button>
+            <button
+              class="pd-settings-rail__item"
               :class="{ 'is-active': activeProjectSettingsSection === 'term-qa' }"
               type="button"
               @click="switchProjectSettingsSection('term-qa')"
@@ -3215,6 +5089,42 @@ onBeforeUnmount(() => {
                   当前项目还没有可配置语言对的文件。
                 </div>
                 <div v-else class="tm-settings__groups">
+                  <div class="tm-settings__auto-sync">
+                    <label class="term-settings__toggle tm-settings__auto-sync-switch">
+                      <input
+                        v-model="translationMemorySettings.auto_tm_enabled"
+                        type="checkbox"
+                        aria-label="自动写入确认句段到主写入记忆库"
+                      >
+                      <span aria-hidden="true" />
+                    </label>
+                    <div class="tm-settings__auto-sync-copy">
+                      <strong>自动写入确认句段到主写入记忆库</strong>
+                      <span>开启后，已确认且有译文的句段会进入后台队列，写入当前文件的主写入记忆库。</span>
+                    </div>
+                  </div>
+                  <div class="resource-settings-search">
+                    <label class="resource-settings-search__field">
+                      <Search :size="14" />
+                      <input
+                        v-model="tmSettingsSearchQuery"
+                        type="search"
+                        placeholder="搜索记忆库名称、说明、语言或条目数"
+                      >
+                    </label>
+                    <span class="resource-settings-search__summary">
+                      显示 {{ getFilteredTMSettingsCollectionCount() }} / {{ getTMSettingsCollectionCount() }} 个记忆库
+                    </span>
+                    <button
+                      v-if="tmSettingsSearchQuery"
+                      class="resource-settings-search__clear"
+                      type="button"
+                      title="清空搜索"
+                      @click="tmSettingsSearchQuery = ''"
+                    >
+                      <X :size="14" />
+                    </button>
+                  </div>
                   <section
                     v-for="group in translationMemorySettings.groups"
                     :key="translationMemorySettingGroupKey(group)"
@@ -3223,7 +5133,13 @@ onBeforeUnmount(() => {
                     <div class="tm-settings__panel-head">
                       <div>
                         <strong>{{ getTranslationMemorySettingPairLabel(group) }}</strong>
-                        <span>{{ group.file_count }} 个文件 · {{ group.collections.length }} 个记忆库</span>
+                        <span>
+                          {{ group.file_count }} 个文件 ·
+                          <template v-if="tmSettingsSearchQuery">
+                            显示 {{ getFilteredTMCollections(group).length }} / {{ group.collections.length }} 个记忆库
+                          </template>
+                          <template v-else>{{ group.collections.length }} 个记忆库</template>
+                        </span>
                       </div>
                       <div class="tm-settings__panel-actions">
                         <label class="tm-settings__threshold">
@@ -3290,7 +5206,10 @@ onBeforeUnmount(() => {
                           </tr>
                         </thead>
                         <tbody>
-                          <template v-for="(collection, collectionIndex) in group.collections" :key="collection.id">
+                          <tr v-if="getFilteredTMCollections(group).length === 0">
+                            <td colspan="10">没有匹配的记忆库。</td>
+                          </tr>
+                          <template v-for="(collection, collectionIndex) in getFilteredTMCollections(group)" :key="collection.id">
                             <tr>
                               <td>{{ collectionIndex + 1 }}</td>
                               <td>
@@ -3454,6 +5373,28 @@ onBeforeUnmount(() => {
                   当前项目还没有可配置语言对的文件。
                 </div>
                 <div v-else class="term-settings__groups">
+                  <div class="resource-settings-search">
+                    <label class="resource-settings-search__field">
+                      <Search :size="14" />
+                      <input
+                        v-model="termBaseSettingsSearchQuery"
+                        type="search"
+                        placeholder="搜索术语库名称、说明、语言、条目数或 QA"
+                      >
+                    </label>
+                    <span class="resource-settings-search__summary">
+                      显示 {{ getFilteredTermBaseSettingsRowCount() }} / {{ getTermBaseSettingsRowCount() }} 个术语库
+                    </span>
+                    <button
+                      v-if="termBaseSettingsSearchQuery"
+                      class="resource-settings-search__clear"
+                      type="button"
+                      title="清空搜索"
+                      @click="termBaseSettingsSearchQuery = ''"
+                    >
+                      <X :size="14" />
+                    </button>
+                  </div>
                   <section
                     v-for="group in termBaseSettings.groups"
                     :key="termBaseSettingGroupKey(group)"
@@ -3461,7 +5402,11 @@ onBeforeUnmount(() => {
                   >
                     <div class="term-settings__group-head">
                       <span class="term-settings__group-summary">
-                        {{ getTermBaseSettingPairLabel(group) }} · {{ group.file_count }} 个文件 · {{ group.term_bases.length }} 个术语库
+                        {{ getTermBaseSettingPairLabel(group) }} · {{ group.file_count }} 个文件 ·
+                        <template v-if="termBaseSettingsSearchQuery">
+                          显示 {{ getFilteredTermBaseRows(group).length }} / {{ group.term_bases.length }} 个术语库
+                        </template>
+                        <template v-else>{{ group.term_bases.length }} 个术语库</template>
                       </span>
                       <button
                         class="button term-settings__create"
@@ -3497,7 +5442,10 @@ onBeforeUnmount(() => {
                           <tr v-if="group.term_bases.length === 0">
                             <td colspan="6">当前语言对暂无术语库。</td>
                           </tr>
-                          <tr v-for="row in group.term_bases" :key="row.id">
+                          <tr v-else-if="getFilteredTermBaseRows(group).length === 0">
+                            <td colspan="6">没有匹配的术语库。</td>
+                          </tr>
+                          <tr v-for="row in getFilteredTermBaseRows(group)" :key="row.id">
                             <td>
                               <span class="term-settings__name">{{ row.name }}</span>
                               <span class="term-settings__meta">{{ row.entry_count }} 条术语</span>
@@ -3578,6 +5526,232 @@ onBeforeUnmount(() => {
               </div>
             </section>
 
+            <section v-show="activeProjectSettingsSection === 'automation'" id="project-settings-automation" class="pd-settings-section">
+              <header class="pd-settings-section-head">
+                <div class="pd-settings-section-head__copy">
+                  <span class="pd-settings-section-icon">
+                    <Sparkles :size="17" />
+                  </span>
+                  <div>
+                    <div class="section-title section-title--tight">自动应用与锁定</div>
+                    <p class="panel-subtitle">管理重复句段同步、内置自动本地化，以及后续可接入的锁定规则。</p>
+                  </div>
+                </div>
+              </header>
+
+              <div class="pd-settings-section-body automation-settings">
+                <section class="automation-settings__group">
+                  <h3>自动应用</h3>
+                  <label
+                    class="automation-settings__check is-connected"
+                    :class="{ 'is-busy': projectSyncToggleLoading }"
+                    :title="projectSyncToggleTitle"
+                  >
+                    <input
+                      type="checkbox"
+                      :checked="projectSyncAllEnabled"
+                      :indeterminate.prop="projectSyncMixed"
+                      :disabled="projectSyncToggleDisabled"
+                      @change="handleProjectSyncToggle"
+                    />
+                    <span>自动同步重复句段</span>
+                    <small v-if="projectSyncStatusLabel">{{ projectSyncStatusLabel }}</small>
+                  </label>
+                  <label class="automation-settings__check is-placeholder" title="内置自动本地化占位，后续接入项目级保存。">
+                    <input type="checkbox" checked disabled />
+                    <span>自动替换</span>
+                    <CircleHelp :size="13" />
+                  </label>
+                  <div class="automation-settings__children">
+                    <label
+                      v-for="option in autoLocalizationOptions"
+                      :key="option"
+                      class="automation-settings__check is-placeholder"
+                    >
+                      <input type="checkbox" checked disabled />
+                      <span>{{ option }}</span>
+                    </label>
+                  </div>
+                  <label class="automation-settings__check is-placeholder" title="沿用导入和导出中的自动编号/排序处理，占位展示。">
+                    <input type="checkbox" checked disabled />
+                    <span>自动排序</span>
+                  </label>
+                </section>
+
+                <section class="automation-settings__group">
+                  <h3>锁定</h3>
+                  <div class="automation-settings__lock-grid">
+                    <label
+                      v-for="option in lockPlaceholderOptions"
+                      :key="option"
+                      class="automation-settings__check is-placeholder"
+                    >
+                      <input type="checkbox" disabled />
+                      <span>{{ option }}</span>
+                    </label>
+                  </div>
+                </section>
+              </div>
+            </section>
+
+            <section v-show="activeProjectSettingsSection === 'quality-qa'" id="project-settings-quality-qa" class="pd-settings-section">
+              <header class="pd-settings-section-head">
+                <div class="pd-settings-section-head__copy">
+                  <span class="pd-settings-section-icon">
+                    <ShieldCheck :size="17" />
+                  </span>
+                  <div>
+                    <div class="section-title section-title--tight">质量保证</div>
+                    <p class="panel-subtitle">启用拼写/语法 QA 后，译文保存会后台检查，工作台会用红色波浪线提示问题。</p>
+                  </div>
+                </div>
+                <button
+                  class="button button--primary pd-settings-save"
+                  type="button"
+                  :disabled="savingQualityQASettings || loadingQualityQASettings"
+                  @click="saveProjectQualityQASettings"
+                >
+                  <Loader2 v-if="savingQualityQASettings" class="lucide-spin" :size="14" />
+                  <Settings2 v-else :size="14" />
+                  {{ savingQualityQASettings ? '保存中' : '保存质量设置' }}
+                </button>
+              </header>
+
+              <div class="pd-settings-section-body quality-qa-settings">
+                <StateView
+                  v-if="loadingQualityQASettings"
+                  kind="loading"
+                  title="正在加载质量保证设置"
+                  message="正在读取 LanguageTool 配置和项目语言支持情况。"
+                />
+                <p v-else-if="qualityQASettingsError" class="form-message is-error">{{ qualityQASettingsError }}</p>
+                <div v-else class="quality-qa-settings__content">
+                  <div class="quality-qa-settings__rule-table-wrap">
+                    <table class="quality-qa-settings__rule-table">
+                      <thead>
+                        <tr>
+                          <th>序号</th>
+                          <th class="quality-qa-settings__check-cell">
+                            <label class="quality-qa-settings__rule-check" title="全选/取消全选">
+                              <input
+                                type="checkbox"
+                                :checked="allQualityQARulesEnabled"
+                                :indeterminate.prop="partiallyEnabledQualityQARules"
+                                :disabled="savingQualityQASettings || loadingQualityQASettings"
+                                aria-label="全选质量保证规则"
+                                @change="toggleAllQualityQARules"
+                              />
+                            </label>
+                          </th>
+                          <th>规则</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr
+                          v-for="(rule, index) in qualityQARules"
+                          :key="rule.key"
+                          :data-rule-key="rule.key"
+                          :data-testid="`quality-qa-rule-${rule.key}`"
+                        >
+                          <td>{{ index + 1 }}</td>
+                          <td class="quality-qa-settings__check-cell">
+                            <label class="quality-qa-settings__rule-check">
+                              <input
+                                v-model="qualityQADraft.rules[rule.key]"
+                                type="checkbox"
+                                :data-testid="`quality-qa-rule-toggle-${rule.key}`"
+                                :disabled="savingQualityQASettings || loadingQualityQASettings"
+                                :aria-label="`启用${rule.label}`"
+                              />
+                            </label>
+                          </td>
+                          <td>{{ rule.label }}</td>
+                        </tr>
+                        <tr
+                          v-for="(rule, index) in qualityQAPlaceholderRules"
+                          :key="rule.key"
+                          class="is-placeholder"
+                          :data-rule-key="rule.key"
+                          :data-testid="`quality-qa-rule-${rule.key}`"
+                          title="占位展示，后端暂未接入。"
+                        >
+                          <td>{{ qualityQARules.length + index + 1 }}</td>
+                          <td class="quality-qa-settings__check-cell">
+                            <label class="quality-qa-settings__rule-check">
+                              <input
+                                type="checkbox"
+                                disabled
+                                :data-testid="`quality-qa-rule-toggle-${rule.key}`"
+                                :aria-label="`占位${rule.label}`"
+                              />
+                            </label>
+                          </td>
+                          <td>
+                            <span class="quality-qa-settings__rule-text">
+                              <template v-if="typeof rule.percent === 'number'">
+                                <span>{{ rule.label }}</span>
+                                <input
+                                  class="quality-qa-settings__inline-number"
+                                  type="number"
+                                  :value="rule.percent"
+                                  disabled
+                                />
+                                <span>{{ rule.suffix }}</span>
+                              </template>
+                              <template v-else>{{ rule.label }}</template>
+                            </span>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+
+
+                  <div class="quality-qa-settings__status-grid">
+                    <div class="quality-qa-settings__status-item">
+                      <span>规则状态</span>
+                      <strong :class="qualityQARuleStatusClass">{{ qualityQARuleStatusText }}</strong>
+                      <small>{{ qualityQARuleStatusHint }}</small>
+                    </div>
+                    <div class="quality-qa-settings__status-item">
+                      <span>LanguageTool</span>
+                      <strong :class="qualityQASettings?.languagetool_configured ? 'is-ok' : 'is-warn'">
+                        {{ qualityQASettings?.languagetool_configured ? '已配置' : '未配置' }}
+                      </strong>
+                    </div>
+                    <div class="quality-qa-settings__status-item">
+                      <span>检查方式</span>
+                      <strong>后台自动检查</strong>
+                    </div>
+                  </div>
+
+                  <div class="quality-qa-settings__language-list">
+                    <div class="quality-qa-settings__language-head">
+                      <strong>项目目标语言</strong>
+                      <span>{{ qualityQASettings?.target_languages.length || 0 }} 种</span>
+                    </div>
+                    <div v-if="!qualityQASettings || qualityQASettings.target_languages.length === 0" class="empty-state">
+                      当前项目还没有可检查的目标语言文件。
+                    </div>
+                    <div v-else class="quality-qa-settings__language-grid">
+                      <span
+                        v-for="item in qualityQASettings.target_languages"
+                        :key="item.language"
+                        class="quality-qa-settings__language-chip"
+                        :class="{ 'is-supported': item.supported, 'is-unsupported': !item.supported }"
+                      >
+                        <strong>{{ getLanguageLabel(item.language) }}</strong>
+                        <small>{{ item.file_count }} 个文件 · {{ item.supported ? item.languagetool_code : '暂不支持' }}</small>
+                      </span>
+                    </div>
+                  </div>
+
+                  <p v-if="spellingGrammarQAEnabled && !qualityQASettings?.languagetool_configured" class="form-message is-error">
+                    已启用检查，但后端尚未配置 LANGUAGETOOL_BASE_URL，保存译文不会被阻塞，QA 检查会自动跳过。
+                  </p>
+                </div>
+              </div>
+            </section>
             <section v-show="activeProjectSettingsSection === 'term-qa'" id="project-settings-term-qa" class="pd-settings-section">
               <header class="pd-settings-section-head">
                 <div class="pd-settings-section-head__copy">
@@ -3760,6 +5934,77 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
+      <section v-if="activeTab === 'views'" class="panel">
+        <div class="pd-panel-head">
+          <div class="pd-panel-head__copy">
+            <div class="section-title section-title--tight">{{ t('projectDetail.mergeViews.title') }}</div>
+            <p class="panel-subtitle">{{ t('projectDetail.mergeViews.description') }}</p>
+          </div>
+          <button class="button" type="button" :disabled="loadingMergeViews" @click="loadMergeViews">
+            <Loader2 v-if="loadingMergeViews" class="lucide-spin" :size="14" />
+            <RotateCcw v-else :size="14" />
+            {{ t('common.actions.refresh') }}
+          </button>
+        </div>
+
+        <div v-if="loadingMergeViews" class="empty-state issue-empty">
+          {{ t('projectDetail.mergeViews.loading') }}
+        </div>
+        <div v-else-if="mergeViews.length === 0" class="empty-state issue-empty">
+          {{ t('projectDetail.mergeViews.empty') }}
+        </div>
+        <div v-else class="pd-merge-view-list">
+          <article v-for="view in mergeViews" :key="view.id" class="pd-merge-view-item">
+            <div class="pd-merge-view-item__main">
+              <div class="pd-merge-view-item__head">
+                <strong>{{ view.name }}</strong>
+                <span>{{ getMergeViewMetaText(view) }}</span>
+              </div>
+              <div class="pd-merge-view-item__files">
+                <span
+                  v-for="fileName in getMergeViewFileNames(view)"
+                  :key="`${view.id}-${fileName}`"
+                  :title="fileName"
+                >
+                  {{ fileName }}
+                </span>
+              </div>
+            </div>
+            <div class="pd-merge-view-item__actions">
+              <button
+                class="button"
+                type="button"
+                :disabled="view.can_open === false"
+                @click="openMergeView(view)"
+              >
+                <FolderOpen :size="14" />
+                {{ t('projectDetail.mergeViews.open') }}
+              </button>
+              <button
+                v-if="canManageMergeView(view)"
+                class="button"
+                type="button"
+                :disabled="mergeViewActionId === view.id"
+                @click="openRenameMergeViewDialog(view)"
+              >
+                {{ t('projectDetail.mergeViews.rename') }}
+              </button>
+              <button
+                v-if="canManageMergeView(view)"
+                class="button button--danger"
+                type="button"
+                :disabled="mergeViewActionId === view.id"
+                @click="deleteSavedMergeView(view)"
+              >
+                <Loader2 v-if="mergeViewActionId === view.id" class="lucide-spin" :size="14" />
+                <Trash2 v-else :size="14" />
+                {{ t('projectDetail.mergeViews.delete') }}
+              </button>
+            </div>
+          </article>
+        </div>
+      </section>
+
       <section v-if="activeTab === 'files'" class="panel">
         <div class="pd-panel-head">
           <div class="pd-panel-head__copy">
@@ -3842,20 +6087,63 @@ onBeforeUnmount(() => {
               <Users :size="14" />
               {{ t('projectDetail.files.actions.assign') }}
             </button>
-            <button
-              class="button"
-              type="button"
-              disabled
-              :title="t('projectDetail.common.comingSoon')"
-            >
-              <Download :size="14" />
-              {{ t('projectDetail.files.actions.export') }}
-            </button>
+            <div class="pd-export-dropdown">
+              <button
+                class="button"
+                data-testid="project-file-export-selected"
+                type="button"
+                :disabled="!canOpenProjectExportMenu"
+                :title="projectExportButtonTitle || undefined"
+                @click.stop="toggleProjectExportMenu"
+              >
+                <Loader2 v-if="loadingProjectExportOptions || exportingFileId" class="lucide-spin" :size="14" />
+                <Download v-else :size="14" />
+                {{ exportingFileId ? `导出中 ${exportFileProgress}%` : t('projectDetail.files.actions.export') }}
+                <ChevronDown :size="13" />
+              </button>
+              <div v-if="showProjectExportMenu" class="pd-export-menu" role="menu" @click.stop>
+                <div v-if="loadingProjectExportOptions" class="pd-export-menu__loading">
+                  {{ t('projectDetail.files.actions.exportLoading') }}
+                </div>
+                <div v-else-if="projectExportOptions.length === 0" class="pd-export-menu__loading">
+                  {{ t('projectDetail.files.actions.exportNoOptions') }}
+                </div>
+                <template v-else>
+                  <button
+                    v-for="option in projectExportOptions"
+                    :key="option.id"
+                    class="pd-export-menu__item"
+                    type="button"
+                    :disabled="Boolean(exportingFileId)"
+                    @click="exportSelectedProjectFiles(option.id)"
+                  >
+                    <span class="pd-export-menu__item-name">{{ option.name }}</span>
+                    <span class="pd-export-menu__item-desc">{{ option.description }}</span>
+                  </button>
+                  <button
+                    v-if="canExportSelectedProjectFilesAsZip"
+                    class="pd-export-menu__item"
+                    type="button"
+                    :disabled="Boolean(exportingFileId)"
+                    @click="exportSelectedProjectFilesAsZip"
+                  >
+                    <span class="pd-export-menu__item-name">{{ t('projectDetail.files.actions.exportZip') }}</span>
+                    <span class="pd-export-menu__item-desc">{{ t('projectDetail.files.actions.exportZipDescription') }}</span>
+                  </button>
+                </template>
+              </div>
+            </div>
             <button v-if="canManageProject" class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
               <Clock3 :size="14" />
               {{ t('projectDetail.files.actions.modifyTaskType') }}
             </button>
-            <button v-if="canManageProject" class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
+            <button
+              class="button"
+              type="button"
+              :disabled="!canOpenMergeViewDialog"
+              :title="mergeOpenButtonTitle || undefined"
+              @click="openCreateMergeViewDialog"
+            >
               <FolderOpen :size="14" />
               {{ t('projectDetail.files.actions.mergeOpen') }}
             </button>
@@ -3874,10 +6162,75 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="table-toolbar__right pd-toolbar__right">
-            <button class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
-              <Filter :size="14" />
-              {{ t('projectDetail.files.actions.filter') }}
-            </button>
+            <div class="pd-file-filters" role="search" aria-label="文件筛选">
+              <span class="pd-file-filters__lead" title="筛选文件" aria-hidden="true">
+                <Filter :size="14" />
+              </span>
+              <label class="pd-file-filter pd-file-filter--search">
+                <Search class="pd-file-filter__search-icon" :size="14" aria-hidden="true" />
+                <input
+                  v-model="fileSearchQuery"
+                  class="pd-file-filter__input"
+                  type="search"
+                  placeholder="搜索文件名、语言、负责人"
+                  aria-label="搜索文件"
+                  @keydown.esc="fileSearchQuery = ''"
+                />
+                <button
+                  v-if="fileSearchQuery"
+                  class="pd-file-filter__clear"
+                  type="button"
+                  title="清空搜索"
+                  aria-label="清空搜索"
+                  @click="fileSearchQuery = ''"
+                >
+                  <X :size="13" />
+                </button>
+              </label>
+              <select
+                v-model="fileStatusFilter"
+                class="pd-file-filter__select pd-file-filter__select--status"
+                aria-label="状态筛选"
+              >
+                <option value="all">全部状态</option>
+                <option v-for="option in fileStatusFilterOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}（{{ option.count }}）
+                </option>
+              </select>
+              <select
+                v-model="fileLanguagePairFilter"
+                class="pd-file-filter__select pd-file-filter__select--language"
+                aria-label="语言对筛选"
+              >
+                <option value="all">全部语言对</option>
+                <option v-for="option in fileLanguagePairFilterOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}（{{ option.count }}）
+                </option>
+              </select>
+              <select
+                v-model="fileAssigneeFilter"
+                class="pd-file-filter__select pd-file-filter__select--assignee"
+                aria-label="负责人筛选"
+              >
+                <option value="all">全部负责人</option>
+                <option v-for="option in fileAssigneeFilterOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}（{{ option.count }}）
+                </option>
+              </select>
+              <button
+                v-if="hasFileFilters"
+                class="button pd-file-filter__reset"
+                type="button"
+                @click="resetFileFilters"
+              >
+                <RotateCcw :size="14" />
+                清空
+              </button>
+              <span class="pd-file-filter__summary">
+                显示 {{ filteredTableRows.length }} / {{ tableRows.length }} 个文件
+                <template v-if="selectedFileIds.size > 0"> · 已选 {{ selectedFileIds.size }}</template>
+              </span>
+            </div>
             <button class="button" type="button" disabled :title="t('projectDetail.common.comingSoon')">
               <Settings2 :size="14" />
               {{ t('projectDetail.files.actions.columns') }}
@@ -3896,7 +6249,7 @@ onBeforeUnmount(() => {
           :selected-ids="selectedFileIds"
           :show-index="true"
           :index-offset="indexOffset"
-          :empty-text="t('projectDetail.files.empty')"
+          :empty-text="fileTableEmptyText"
           @select="selectedFileIds = $event"
         >
           <template #filename="{ row }">
@@ -3951,6 +6304,17 @@ onBeforeUnmount(() => {
               <span v-if="getFilePretranslationProgressMessage(row)" class="pd-file-progress__status">
                 {{ getFilePretranslationProgressMessage(row) }}
               </span>
+              <button
+                v-if="getActivePretranslationTaskId(row)"
+                class="pd-file-progress__cancel"
+                type="button"
+                :disabled="isFilePretranslationCanceling(row)"
+                @click.stop="cancelFilePretranslation(row)"
+              >
+                <Loader2 v-if="isFilePretranslationCanceling(row)" class="lucide-spin" :size="12" />
+                <X v-else :size="12" />
+                停止
+              </button>
             </div>
           </template>
 
@@ -4008,10 +6372,10 @@ onBeforeUnmount(() => {
         </DataTable>
 
         <Pagination
-          :total="tableRows.length"
+          :total="filteredTableRows.length"
           :page="currentPage"
           :page-size="pageSize"
-          :page-sizes="[10]"
+          :page-sizes="[10, 20, 50, 100, 200]"
           @update:page="currentPage = $event"
           @update:page-size="pageSize = $event"
         />
@@ -4146,13 +6510,89 @@ onBeforeUnmount(() => {
               <span>{{ t('projectDetail.stats.columns.charactersWithSpaces') }}</span>
               <strong>{{ formatStatisticNumber(statisticsTotals.characters_with_spaces) }}</strong>
             </div>
-            <div class="pd-statistics-summary__item">
-              <span>{{ t('projectDetail.stats.columns.internalRepeatedWords') }}</span>
-              <strong>{{ formatStatisticNumber(statisticsTotals.internal_repeated_words) }}</strong>
+          </div>
+
+          <div v-if="statisticsMatchAnalysisRows.length > 0" class="pd-statistics-match-analysis">
+            <div class="pd-statistics-subhead">
+              <div class="section-title section-title--tight">{{ t('projectDetail.stats.matchAnalysis.summaryTitle') }}</div>
+              <span>
+                {{ t('projectDetail.stats.matchAnalysis.meta', {
+                  threshold: formatStatisticPercent((statisticsMatchAnalysis?.threshold ?? 0.5) * 100),
+                  count: statisticsMatchAnalysis?.collection_ids.length ?? 0,
+                }) }}
+              </span>
             </div>
-            <div class="pd-statistics-summary__item">
-              <span>{{ t('projectDetail.stats.columns.crossFileRepeatedWords') }}</span>
-              <strong>{{ formatStatisticNumber(statisticsTotals.cross_file_repeated_words) }}</strong>
+            <div class="pd-statistics-grid-wrap pd-statistics-grid-wrap--match">
+              <table class="pd-statistics-grid pd-statistics-match-grid">
+                <thead>
+                  <tr>
+                    <th>{{ t('projectDetail.stats.matchAnalysis.columns.category') }}</th>
+                    <th>{{ t('projectDetail.stats.matchAnalysis.columns.percent') }}</th>
+                    <th>{{ t('projectDetail.stats.matchAnalysis.columns.segments') }}</th>
+                    <th>{{ t('projectDetail.stats.matchAnalysis.columns.words') }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="row in statisticsMatchAnalysisRows"
+                    :key="row.key"
+                    :class="{ 'is-total': row.is_total }"
+                  >
+                    <td>{{ row.label }}</td>
+                    <td>{{ formatStatisticPercent(row.percent) }}</td>
+                    <td>{{ formatStatisticNumber(row.segment_count) }}</td>
+                    <td>{{ formatStatisticNumber(row.word_count) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div v-if="statisticsFileMatchAnalysisBlocks.length > 1" class="pd-statistics-match-analysis">
+            <div class="pd-statistics-subhead">
+              <div class="section-title section-title--tight">{{ t('projectDetail.stats.matchAnalysis.fileTitle') }}</div>
+              <span>{{ t('projectDetail.stats.matchAnalysis.fileHint') }}</span>
+            </div>
+            <div class="pd-statistics-file-match-list">
+              <section
+                v-for="block in statisticsFileMatchAnalysisBlocks"
+                :key="block.id"
+                class="pd-statistics-file-match-block"
+              >
+                <div class="pd-statistics-file-match-head">
+                  <strong :title="block.file_name">{{ block.file_name }}</strong>
+                  <span>
+                    {{ t('projectDetail.stats.matchAnalysis.fileMeta', {
+                      words: formatStatisticNumber(block.analysis.total_words),
+                      segments: formatStatisticNumber(block.analysis.total_segments),
+                    }) }}
+                  </span>
+                </div>
+                <div class="pd-statistics-grid-wrap pd-statistics-grid-wrap--match">
+                  <table class="pd-statistics-grid pd-statistics-match-grid">
+                    <thead>
+                      <tr>
+                        <th>{{ t('projectDetail.stats.matchAnalysis.columns.category') }}</th>
+                        <th>{{ t('projectDetail.stats.matchAnalysis.columns.percent') }}</th>
+                        <th>{{ t('projectDetail.stats.matchAnalysis.columns.segments') }}</th>
+                        <th>{{ t('projectDetail.stats.matchAnalysis.columns.words') }}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr
+                        v-for="row in block.rows"
+                        :key="`${block.id}-${row.key}`"
+                        :class="{ 'is-total': row.is_total }"
+                      >
+                        <td>{{ row.label }}</td>
+                        <td>{{ formatStatisticPercent(row.percent) }}</td>
+                        <td>{{ formatStatisticNumber(row.segment_count) }}</td>
+                        <td>{{ formatStatisticNumber(row.word_count) }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </section>
             </div>
           </div>
 
@@ -4170,10 +6610,6 @@ onBeforeUnmount(() => {
                   <th>{{ t('projectDetail.stats.columns.charactersWithSpaces') }}</th>
                   <th>{{ t('projectDetail.stats.columns.paragraphs') }}</th>
                   <th>{{ t('projectDetail.stats.columns.lines') }}</th>
-                  <th>{{ t('projectDetail.stats.columns.internalRepeatedWords') }}</th>
-                  <th>{{ t('projectDetail.stats.columns.internalRepeatedCharacters') }}</th>
-                  <th>{{ t('projectDetail.stats.columns.crossFileRepeatedWords') }}</th>
-                  <th>{{ t('projectDetail.stats.columns.crossFileRepeatedCharacters') }}</th>
                   <th>{{ t('projectDetail.stats.columns.license') }}</th>
                 </tr>
               </thead>
@@ -4191,10 +6627,6 @@ onBeforeUnmount(() => {
                   <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'characters_with_spaces')) }}</td>
                   <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'paragraphs')) }}</td>
                   <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'lines')) }}</td>
-                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'internal_repeated_words')) }}</td>
-                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'internal_repeated_characters')) }}</td>
-                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'cross_file_repeated_words')) }}</td>
-                  <td>{{ formatStatisticNumber(getStatisticNumber(row.statistics, 'cross_file_repeated_characters')) }}</td>
                   <td>{{ getStatisticsLicenseLabel(row.statistics) }}</td>
                 </tr>
               </tbody>
@@ -4210,10 +6642,6 @@ onBeforeUnmount(() => {
                   <td>{{ formatStatisticNumber(statisticsTotals.characters_with_spaces) }}</td>
                   <td>{{ formatStatisticNumber(statisticsTotals.paragraphs) }}</td>
                   <td>{{ formatStatisticNumber(statisticsTotals.lines) }}</td>
-                  <td>{{ formatStatisticNumber(statisticsTotals.internal_repeated_words) }}</td>
-                  <td>{{ formatStatisticNumber(statisticsTotals.internal_repeated_characters) }}</td>
-                  <td>{{ formatStatisticNumber(statisticsTotals.cross_file_repeated_words) }}</td>
-                  <td>{{ formatStatisticNumber(statisticsTotals.cross_file_repeated_characters) }}</td>
                   <td>{{ getPlaceholder() }}</td>
                 </tr>
               </tfoot>
@@ -4253,10 +6681,18 @@ onBeforeUnmount(() => {
         <button
           type="button"
           :disabled="!actionMenuRow.has_source_document || Boolean(exportingFileId)"
-          :title="isProjectFileExporting(actionMenuRow) ? exportFileMessage : (!actionMenuRow.has_source_document ? t('projectDetail.common.uploadRequired') : undefined)"
-          @click="exportProjectFile(actionMenuRow)"
+          :title="isProjectFileExporting(actionMenuRow, 'original') ? exportFileMessage : (!actionMenuRow.has_source_document ? t('projectDetail.common.uploadRequired') : undefined)"
+          @click="exportProjectFile(actionMenuRow, 'original')"
         >
-          {{ getProjectFileExportLabel(actionMenuRow) }}
+          {{ getProjectFileExportLabel(actionMenuRow, 'original') }}
+        </button>
+        <button
+          type="button"
+          :disabled="!actionMenuRow.has_source_document || Boolean(exportingFileId)"
+          :title="isProjectFileExporting(actionMenuRow, 'source') ? exportFileMessage : (!actionMenuRow.has_source_document ? t('projectDetail.common.uploadRequired') : undefined)"
+          @click="exportProjectFile(actionMenuRow, 'source')"
+        >
+          {{ getProjectFileExportLabel(actionMenuRow, 'source') }}
         </button>
         <button
           type="button"
@@ -4275,6 +6711,72 @@ onBeforeUnmount(() => {
         </button>
       </div>
     </Teleport>
+
+    <Modal
+      :open="showMergeViewDialog"
+      :title="mergeViewDialogMode === 'create' ? t('projectDetail.mergeViews.dialogCreateTitle') : t('projectDetail.mergeViews.dialogRenameTitle')"
+      width="min(560px, calc(100vw - 32px))"
+      :close-on-overlay="!savingMergeView"
+      :close-on-esc="!savingMergeView"
+      @close="closeMergeViewDialog"
+    >
+      <div class="pd-merge-view-dialog">
+        <label class="field">
+          <span class="field__label">{{ t('projectDetail.mergeViews.nameLabel') }} <span class="field__required">*</span></span>
+          <input
+            v-model="mergeViewName"
+            class="field__control"
+            type="text"
+            maxlength="200"
+            :disabled="savingMergeView"
+            :placeholder="t('projectDetail.mergeViews.namePlaceholder')"
+            @keydown.enter.prevent="submitMergeViewDialog"
+          />
+        </label>
+
+        <div v-if="mergeViewDialogMode === 'create'" class="pd-merge-view-selected">
+          <span>{{ t('projectDetail.mergeViews.selectedFiles', { count: selectedMergeViewFiles.length }) }}</span>
+          <div>
+            <span v-for="file in selectedMergeViewFiles" :key="file.id" :title="file.filename">
+              {{ file.filename }}
+            </span>
+          </div>
+        </div>
+
+        <div
+          v-if="mergeViewDialogMode === 'create' && selectedMergeViewLanguagePairs.length > 0"
+          class="pd-merge-view-language"
+          :class="{ 'is-warning': selectedMergeViewHasMixedLanguagePairs }"
+        >
+          <strong>{{ selectedMergeViewHasMixedLanguagePairs ? '检测到混合语言对' : '语言对一致' }}</strong>
+          <div>
+            <span
+              v-for="pair in selectedMergeViewLanguagePairs"
+              :key="`${pair.source_language || 'unset'}-${pair.target_language || 'unset'}`"
+            >
+              {{ formatLanguagePairSummary(pair) }}
+            </span>
+          </div>
+          <p v-if="selectedMergeViewHasMixedLanguagePairs">
+            合并视图允许混合语言对一起审阅；后续 AI、TM、术语库等批处理会按当前文件或语言对隔离，避免资源串用。
+          </p>
+        </div>
+
+        <p v-if="mergeViewDialogError" class="form-message is-error">{{ mergeViewDialogError }}</p>
+      </div>
+
+      <template #footer>
+        <button class="button" type="button" :disabled="savingMergeView" @click="closeMergeViewDialog">
+          {{ t('common.actions.cancel') }}
+        </button>
+        <button class="button button--primary" type="button" :disabled="savingMergeView" @click="submitMergeViewDialog">
+          <Loader2 v-if="savingMergeView" class="lucide-spin" :size="14" />
+          <FolderOpen v-else-if="mergeViewDialogMode === 'create'" :size="14" />
+          <Check v-else :size="14" />
+          {{ savingMergeView ? t('common.actions.saving') : (mergeViewDialogMode === 'create' ? t('projectDetail.mergeViews.createAndOpen') : t('common.actions.save')) }}
+        </button>
+      </template>
+    </Modal>
 
     <Modal
       :open="showAssignmentDialog"
@@ -4370,10 +6872,10 @@ onBeforeUnmount(() => {
         <section class="pd-assignment-panel pd-assignment-files">
           <div class="pd-assignment-panel__head pd-assignment-panel__head--files">
             <div>
-              <strong>文件授权</strong>
+              <strong>文件 / 视图授权</strong>
               <span>已选择 {{ assignmentDrafts.length }} 位译者</span>
             </div>
-            <span>{{ tableRows.length }} 个文件</span>
+            <span>{{ tableRows.length }} 个文件 · {{ assignmentMergeViews.length }} 个视图</span>
           </div>
 
           <div v-if="projectWorkflowSteps.length > 0" class="pd-assignment-workflow-tabs">
@@ -4463,6 +6965,30 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
+              <div v-if="assignmentMergeViews.length > 0" class="pd-assignment-view-list">
+                <div class="pd-assignment-view-list__head">
+                  <strong>按视图授权</strong>
+                  <span>勾选后自动选择视图内文件</span>
+                </div>
+                <label
+                  v-for="view in assignmentMergeViews"
+                  :key="`${draft.assignee_id}-${draft.workflow_step_id}-${view.id}`"
+                  class="pd-assignment-view-option"
+                  :class="{ 'is-partial': isAssignmentMergeViewPartial(draft, view) }"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="isAssignmentMergeViewChecked(draft, view)"
+                    :disabled="savingAssignment"
+                    @change="toggleAssignmentMergeView(draft, view)"
+                  />
+                  <span>
+                    <strong>{{ view.name }}</strong>
+                    <small>{{ getAssignmentMergeViewMeta(view) }}</small>
+                  </span>
+                </label>
+              </div>
+
               <p v-if="tableRows.length === 0" class="hint-text pd-assignment-mini-empty">
                 当前项目暂无文件，译者会先获得项目可见性。
               </p>
@@ -4470,25 +6996,49 @@ onBeforeUnmount(() => {
                 没有符合条件的文件
               </p>
               <div v-else class="pd-assignment-file-list">
-                <label
+                <div
                   v-for="file in getFilteredAssignmentFiles(draft)"
                   :key="`${draft.assignee_id}-${file.id}`"
                   class="pd-assignment-file-option"
                 >
-                  <input
-                    type="checkbox"
-                    :checked="isFileCheckedForUser(draft.assignee_id, file.id)"
-                  :disabled="savingAssignment"
-                  @change="toggleAssignmentFile(draft.assignee_id, file.id)"
-                />
-                  <span
-                    @mouseenter="showAssignmentTooltip($event, file.filename)"
-                    @mousemove="updateAssignmentTooltipPosition"
-                    @mouseleave="hideAssignmentTooltip"
-                  >
-                    {{ file.filename }}
-                  </span>
-                </label>
+                  <label class="pd-assignment-file-check">
+                    <input
+                      type="checkbox"
+                      :checked="isFileCheckedForUser(draft.assignee_id, file.id)"
+                      :disabled="savingAssignment"
+                      @change="toggleAssignmentFile(draft.assignee_id, file.id)"
+                    />
+                    <span
+                      @mouseenter="showAssignmentTooltip($event, file.filename)"
+                      @mousemove="updateAssignmentTooltipPosition"
+                      @mouseleave="hideAssignmentTooltip"
+                    >
+                      {{ file.filename }}
+                    </span>
+                  </label>
+                  <div class="pd-assignment-range-controls">
+                    <small>{{ getAssignmentFileSegmentCount(file.id) }} 段</small>
+                    <input
+                      type="number"
+                      min="1"
+                      inputmode="numeric"
+                      placeholder="起始"
+                      :value="getAssignmentRangeInputValue(draft, file.id, 'range_start')"
+                      :disabled="savingAssignment || !isFileCheckedForUser(draft.assignee_id, file.id)"
+                      @input="updateAssignmentFileRange(draft.assignee_id, file.id, 'range_start', getAssignmentInputValue($event))"
+                    />
+                    <span>-</span>
+                    <input
+                      type="number"
+                      min="1"
+                      inputmode="numeric"
+                      placeholder="结束"
+                      :value="getAssignmentRangeInputValue(draft, file.id, 'range_end')"
+                      :disabled="savingAssignment || !isFileCheckedForUser(draft.assignee_id, file.id)"
+                      @input="updateAssignmentFileRange(draft.assignee_id, file.id, 'range_end', getAssignmentInputValue($event))"
+                    />
+                  </div>
+                </div>
               </div>
             </section>
           </div>
@@ -4522,6 +7072,7 @@ onBeforeUnmount(() => {
 
     <PreTranslateDialog
       :open="showPreTranslateDialog"
+      :project-id="project?.id ?? null"
       :files="selectedProjectFiles"
       :source-language="project?.source_language ?? null"
       :target-language="project?.target_language ?? null"
@@ -4729,9 +7280,52 @@ onBeforeUnmount(() => {
   color: var(--danger, #dc2626);
 }
 
+.upload-file-list-wrap {
+  display: grid;
+  gap: 8px;
+}
+
+.upload-file-list__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.upload-file-list__summary {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.upload-file-list__clear {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--state-danger, #dc2626);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.upload-file-list__clear:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--state-danger, #dc2626) 30%, transparent);
+  background: var(--state-danger-bg, #fef2f2);
+}
+
+.upload-file-list__clear:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
 .upload-file-list {
   display: grid;
   gap: 8px;
+  max-height: min(280px, 40vh);
+  overflow-y: auto;
 }
 
 .upload-file-list__item {
@@ -5109,6 +7703,332 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
 }
 
+.pd-file-filters {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  max-width: 100%;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.pd-file-filters__lead {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 32px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-muted);
+  color: var(--text-muted);
+}
+
+.pd-file-filter {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.pd-file-filter--search {
+  flex: 1 1 240px;
+  width: min(330px, 36vw);
+  max-width: 360px;
+}
+
+.pd-file-filter__input,
+.pd-file-filter__select {
+  min-height: 32px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--control-bg);
+  color: var(--text-primary);
+  font-size: 13px;
+  transition:
+    border-color var(--motion-base) var(--ease-standard),
+    background var(--motion-base) var(--ease-standard),
+    box-shadow var(--motion-base) var(--ease-standard);
+}
+
+.pd-file-filter__input {
+  width: 100%;
+  padding: 5px 32px 5px 32px;
+}
+
+.pd-file-filter__select {
+  height: 32px;
+  padding: 0 28px 0 10px;
+}
+
+.pd-file-filter__select--status {
+  width: 132px;
+}
+
+.pd-file-filter__select--language {
+  width: 178px;
+}
+
+.pd-file-filter__select--assignee {
+  width: 150px;
+}
+
+.pd-file-filter__input::placeholder {
+  color: var(--text-placeholder);
+}
+
+.pd-file-filter__input:hover,
+.pd-file-filter__select:hover {
+  border-color: color-mix(in srgb, var(--brand-700) 58%, var(--line-strong));
+  background: var(--surface-panel);
+}
+
+.pd-file-filter__input:focus,
+.pd-file-filter__select:focus {
+  outline: none;
+  border-color: var(--brand-700);
+  box-shadow: var(--focus-ring);
+}
+
+.pd-file-filter__search-icon {
+  position: absolute;
+  left: 10px;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+.pd-file-filter__clear {
+  position: absolute;
+  right: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  box-shadow: none;
+}
+
+.pd-file-filter__clear:hover {
+  background: var(--surface-muted);
+  color: var(--brand-700);
+}
+
+.pd-file-filter__reset {
+  min-height: 32px;
+  padding: 4px 10px;
+  font-size: 13px;
+}
+
+.pd-file-filter__summary {
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.pd-merge-view-list {
+  display: grid;
+  gap: 10px;
+}
+
+.pd-merge-view-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: center;
+  padding: 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+}
+
+.pd-merge-view-item__main {
+  min-width: 0;
+  display: grid;
+  gap: 9px;
+}
+
+.pd-merge-view-item__head {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.pd-merge-view-item__head strong,
+.pd-merge-view-item__head span,
+.pd-merge-view-item__files span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-merge-view-item__head strong {
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.pd-merge-view-item__head span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.pd-merge-view-item__files {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.pd-merge-view-item__files span,
+.pd-merge-view-selected span {
+  max-width: 220px;
+  padding: 3px 7px;
+  border: 1px solid color-mix(in srgb, var(--brand-700) 18%, var(--line-soft));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--brand-050) 48%, var(--surface-panel));
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.pd-merge-view-item__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pd-merge-view-dialog {
+  display: grid;
+  gap: 14px;
+}
+
+.pd-merge-view-selected {
+  display: grid;
+  gap: 8px;
+}
+
+.pd-merge-view-selected > span {
+  max-width: none;
+  width: fit-content;
+  background: var(--surface-muted);
+}
+
+.pd-merge-view-selected > div {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.pd-merge-view-language {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--brand-700) 16%, var(--line-soft));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--brand-050) 48%, var(--surface-panel));
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.pd-merge-view-language.is-warning {
+  border-color: rgba(194, 120, 3, 0.3);
+  background: var(--state-warning-bg);
+}
+
+.pd-merge-view-language strong {
+  color: var(--text-primary);
+}
+
+.pd-merge-view-language > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.pd-merge-view-language span {
+  max-width: 100%;
+  padding: 3px 7px;
+  border: 1px solid color-mix(in srgb, var(--brand-700) 14%, var(--line-soft));
+  border-radius: 6px;
+  background: var(--surface-panel);
+  overflow-wrap: anywhere;
+}
+
+.pd-merge-view-language p {
+  margin: 0;
+}
+
+.pd-export-dropdown {
+  position: relative;
+  display: inline-flex;
+}
+
+.pd-export-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 30;
+  min-width: 240px;
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-0);
+  box-shadow: var(--shadow-medium);
+}
+
+.pd-export-menu__loading,
+.pd-export-menu__item {
+  width: 100%;
+  padding: 9px 12px;
+  text-align: left;
+}
+
+.pd-export-menu__loading {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.pd-export-menu__item {
+  display: grid;
+  gap: 3px;
+  border: 0;
+  border-bottom: 1px solid var(--line-soft);
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.pd-export-menu__item:last-child {
+  border-bottom: 0;
+}
+
+.pd-export-menu__item:hover:not(:disabled) {
+  background: var(--surface-muted);
+}
+
+.pd-export-menu__item:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.pd-export-menu__item-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.pd-export-menu__item-desc {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
 .pd-file-table :deep(.data-table) {
   table-layout: fixed;
   min-width: 1080px;
@@ -5190,11 +8110,71 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
+.pd-statistics-match-analysis {
+  display: grid;
+  gap: 10px;
+}
+
+.pd-statistics-subhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.pd-statistics-subhead > span {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.pd-statistics-file-match-list {
+  display: grid;
+  gap: 14px;
+}
+
+.pd-statistics-file-match-block {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.pd-statistics-file-match-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-muted);
+}
+
+.pd-statistics-file-match-head strong {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-statistics-file-match-head span {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 .pd-statistics-grid-wrap {
   overflow-x: auto;
   border: 1px solid var(--line-soft);
   border-radius: 8px;
   background: var(--surface-panel);
+}
+
+.pd-statistics-grid-wrap--match {
+  max-width: 720px;
 }
 
 .pd-statistics-grid {
@@ -5203,6 +8183,10 @@ onBeforeUnmount(() => {
   border-collapse: collapse;
   table-layout: fixed;
   font-size: 13px;
+}
+
+.pd-statistics-match-grid {
+  min-width: 560px;
 }
 
 .pd-statistics-grid th,
@@ -5229,6 +8213,18 @@ onBeforeUnmount(() => {
   border-right: 0;
 }
 
+.pd-statistics-match-grid th:first-child,
+.pd-statistics-match-grid td:first-child {
+  text-align: left;
+}
+
+.pd-statistics-match-grid th:nth-child(n + 2),
+.pd-statistics-match-grid td:nth-child(n + 2),
+.pd-statistics-match-grid th:last-child,
+.pd-statistics-match-grid td:last-child {
+  text-align: right;
+}
+
 .pd-statistics-grid thead th,
 .pd-statistics-grid tfoot th,
 .pd-statistics-grid tfoot td {
@@ -5239,6 +8235,12 @@ onBeforeUnmount(() => {
 
 .pd-statistics-grid tbody tr:last-child td {
   border-bottom: 0;
+}
+
+.pd-statistics-match-grid tbody tr.is-total td {
+  background: var(--surface-muted);
+  color: var(--text-primary);
+  font-weight: 600;
 }
 
 .pd-statistics-grid tfoot th,
@@ -5342,6 +8344,34 @@ onBeforeUnmount(() => {
   line-height: 1.3;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.pd-file-progress__cancel {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  justify-self: flex-start;
+  gap: 4px;
+  min-width: 52px;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--state-danger, #dc2626) 26%, transparent);
+  border-radius: 6px;
+  background: var(--state-danger-bg, #fef2f2);
+  color: var(--state-danger, #dc2626);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.pd-file-progress__cancel:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--state-danger, #dc2626) 42%, transparent);
+  background: color-mix(in srgb, var(--state-danger-bg, #fef2f2) 70%, #fff);
+}
+
+.pd-file-progress__cancel:disabled {
+  cursor: wait;
+  opacity: 0.75;
 }
 
 .pd-task-cell {
@@ -5929,6 +8959,75 @@ onBeforeUnmount(() => {
   box-shadow: none;
 }
 
+.pd-assignment-view-list {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-muted) 54%, var(--surface-panel));
+}
+
+.pd-assignment-view-list__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.pd-assignment-view-list__head strong {
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.pd-assignment-view-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-height: 38px;
+  padding: 7px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.pd-assignment-view-option:hover {
+  border-color: var(--line-soft);
+  background: var(--surface-panel);
+}
+
+.pd-assignment-view-option.is-partial {
+  border-color: color-mix(in srgb, var(--state-warning) 42%, var(--line-soft));
+  background: color-mix(in srgb, var(--state-warning-bg) 62%, var(--surface-panel));
+}
+
+.pd-assignment-view-option > span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.pd-assignment-view-option strong,
+.pd-assignment-view-option small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pd-assignment-view-option strong {
+  color: var(--text-primary);
+}
+
+.pd-assignment-view-option small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 .pd-assignment-file-list {
   display: grid;
   gap: 4px;
@@ -5938,8 +9037,9 @@ onBeforeUnmount(() => {
 }
 
 .pd-assignment-file-option {
-  display: flex;
-  align-items: flex-start;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
   gap: 8px;
   min-height: 30px;
   padding: 6px 8px;
@@ -5953,10 +9053,49 @@ onBeforeUnmount(() => {
   background: var(--surface-muted);
 }
 
-.pd-assignment-file-option span {
+.pd-assignment-file-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
   min-width: 0;
+}
+
+.pd-assignment-file-check span {
+  min-width: 0;
+  flex: 1;
   overflow-wrap: anywhere;
   white-space: normal;
+}
+
+.pd-assignment-range-controls {
+  display: grid;
+  grid-template-columns: auto 68px auto 68px;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.pd-assignment-range-controls input {
+  width: 68px;
+  min-width: 0;
+  padding: 4px 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-panel);
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.pd-assignment-range-controls input:focus {
+  border-color: var(--brand-500);
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--brand-500) 18%, transparent);
+}
+
+.pd-assignment-range-controls input:disabled {
+  background: var(--surface-muted);
+  color: var(--text-muted);
 }
 
 .pd-assignment-mini-empty {
@@ -6423,6 +9562,75 @@ onBeforeUnmount(() => {
   font-size: 12px;
 }
 
+.resource-settings-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-muted) 46%, var(--surface-panel));
+}
+
+.resource-settings-search__field {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 1 1 280px;
+  min-width: min(100%, 240px);
+}
+
+.resource-settings-search__field svg {
+  position: absolute;
+  left: 10px;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+.resource-settings-search__field input {
+  width: 100%;
+  height: 34px;
+  padding: 0 10px 0 32px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface-panel);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+}
+
+.resource-settings-search__field input:focus {
+  border-color: var(--brand-700);
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.resource-settings-search__summary {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.resource-settings-search__clear {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-panel);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.resource-settings-search__clear:hover {
+  border-color: var(--line-strong);
+  color: var(--brand-700);
+}
+
 .tm-settings__bulk {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(190px, 260px);
@@ -6468,6 +9676,37 @@ onBeforeUnmount(() => {
 .tm-settings__groups {
   display: grid;
   gap: 12px;
+}
+
+.tm-settings__auto-sync {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-1);
+}
+
+.tm-settings__auto-sync-switch {
+  flex: 0 0 auto;
+}
+
+.tm-settings__auto-sync-copy {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.tm-settings__auto-sync-copy strong {
+  color: var(--text-primary);
+  font-size: 0.93rem;
+}
+
+.tm-settings__auto-sync-copy span {
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  line-height: 1.45;
 }
 
 .tm-settings__panel {
@@ -7011,6 +10250,232 @@ onBeforeUnmount(() => {
   cursor: help;
 }
 
+.automation-settings {
+  max-width: 680px;
+  gap: 18px;
+}
+
+.automation-settings__group {
+  display: grid;
+  gap: 8px;
+}
+
+.automation-settings__group h3 {
+  margin: 0 0 2px;
+  color: var(--text-primary);
+  font-size: 18px;
+  line-height: 1.25;
+}
+
+.automation-settings__check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  min-height: 24px;
+  color: var(--brand-700);
+  font-size: 14px;
+  line-height: 1.3;
+}
+
+.automation-settings__check.is-connected {
+  cursor: pointer;
+}
+
+.automation-settings__check.is-connected.is-busy {
+  opacity: 0.72;
+  pointer-events: none;
+}
+
+.automation-settings__check input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--brand-700);
+}
+
+.automation-settings__check input:not(:disabled) {
+  cursor: pointer;
+}
+
+.automation-settings__check small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.automation-settings__check.is-placeholder {
+  opacity: 0.84;
+}
+
+.automation-settings__check.is-placeholder input {
+  cursor: not-allowed;
+}
+
+.automation-settings__check svg {
+  color: var(--brand-700);
+}
+
+.automation-settings__children,
+.automation-settings__lock-grid {
+  display: grid;
+  gap: 7px;
+  padding-left: 24px;
+}
+
+.quality-qa-settings__content {
+  display: grid;
+  gap: 16px;
+}
+
+.quality-qa-settings__status-item small,
+.quality-qa-settings__language-chip small,
+.quality-qa-settings__language-head span {
+  color: var(--text-muted);
+}
+
+.quality-qa-settings__rule-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border-muted);
+  border-radius: 8px;
+  background: var(--surface-primary);
+}
+
+.quality-qa-settings__rule-table {
+  width: 100%;
+  min-width: 560px;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.quality-qa-settings__rule-table th,
+.quality-qa-settings__rule-table td {
+  height: 49px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--border-muted);
+  color: var(--text-primary);
+  font-size: 14px;
+  text-align: left;
+  vertical-align: middle;
+}
+
+.quality-qa-settings__rule-table th {
+  background: var(--surface-muted);
+  font-weight: 700;
+}
+
+.quality-qa-settings__rule-table th:first-child,
+.quality-qa-settings__rule-table td:first-child {
+  width: 58px;
+  text-align: center;
+}
+
+.quality-qa-settings__rule-table th:nth-child(2),
+.quality-qa-settings__rule-table td:nth-child(2) {
+  width: 48px;
+}
+
+.quality-qa-settings__rule-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.quality-qa-settings__rule-table tbody tr:hover {
+  background: color-mix(in srgb, var(--brand-050) 48%, transparent);
+}
+
+.quality-qa-settings__rule-table tbody tr.is-placeholder td {
+  color: var(--text-secondary);
+}
+
+.quality-qa-settings__check-cell {
+  text-align: center;
+}
+
+.quality-qa-settings__rule-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+}
+
+.quality-qa-settings__rule-check input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--brand-700);
+}
+
+.quality-qa-settings__rule-check input:not(:disabled) {
+  cursor: pointer;
+}
+
+.quality-qa-settings__rule-check input:disabled {
+  cursor: not-allowed;
+}
+
+.quality-qa-settings__rule-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.quality-qa-settings__inline-number {
+  width: 40px;
+  height: 24px;
+  padding: 0 4px;
+  border: 1px solid var(--border-muted);
+  border-radius: 3px;
+  background: var(--surface-muted);
+  color: var(--text-primary);
+  font: inherit;
+  text-align: center;
+}
+
+.quality-qa-settings__status-grid,
+.quality-qa-settings__language-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+}
+
+.quality-qa-settings__status-item,
+.quality-qa-settings__language-chip {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border: 1px solid var(--border-muted);
+  border-radius: 8px;
+  background: var(--surface-primary);
+}
+
+.quality-qa-settings__status-item span {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.quality-qa-settings__status-item .is-ok,
+.quality-qa-settings__language-chip.is-supported strong {
+  color: #227f58;
+}
+
+.quality-qa-settings__status-item .is-warn,
+.quality-qa-settings__language-chip.is-unsupported strong {
+  color: #b54708;
+}
+
+.quality-qa-settings__language-list {
+  display: grid;
+  gap: 10px;
+}
+
+.quality-qa-settings__language-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .term-qa-report__actions {
   justify-content: flex-end;
 }
@@ -7077,6 +10542,21 @@ onBeforeUnmount(() => {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .pd-toolbar__right {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .pd-file-filters {
+    flex: 1 1 100%;
+    justify-content: flex-start;
+  }
+
+  .pd-file-filter--search {
+    width: auto;
+    max-width: none;
+  }
+
 }
 
 @media (max-width: 720px) {
@@ -7130,6 +10610,21 @@ onBeforeUnmount(() => {
   .pd-settings-actions .button {
     flex: 1 1 140px;
     justify-content: center;
+  }
+
+  .pd-file-filters__lead {
+    display: none;
+  }
+
+  .pd-file-filter--search,
+  .pd-file-filter__select,
+  .pd-file-filter__summary,
+  .pd-file-filter__reset {
+    width: 100%;
+  }
+
+  .pd-file-filter__summary {
+    white-space: normal;
   }
 
   .tm-settings__bulk {
@@ -7215,6 +10710,19 @@ onBeforeUnmount(() => {
 
   .pd-assignment-file-action {
     flex: 1 1 140px;
+  }
+
+  .pd-assignment-file-option {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .pd-assignment-range-controls {
+    grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr);
+  }
+
+  .pd-assignment-range-controls input {
+    width: 100%;
   }
 
   .pd-settings-control,

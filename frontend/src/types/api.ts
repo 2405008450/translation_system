@@ -151,8 +151,15 @@ export interface ProjectAssignmentItem {
   workflow_step_id?: string
   workflow_step?: WorkflowStep | null
   file_record_ids: string[]
+  file_ranges?: ProjectAssignmentFileRange[]
   assigned_by_id: string | null
   assigned_at: string
+}
+
+export interface ProjectAssignmentFileRange {
+  file_record_id: string
+  range_start: number | null
+  range_end: number | null
 }
 
 export interface ProjectAssignmentsResponse {
@@ -166,6 +173,8 @@ export interface ProjectAssignmentPayload {
     assignee_id: string
     workflow_step_id?: string
     file_record_ids: string[]
+    file_ranges?: ProjectAssignmentFileRange[]
+    merge_view_ids?: string[]
   }>
 }
 
@@ -246,6 +255,7 @@ export interface DocumentStatistics {
   engine_version: string | null
   license_status: string | null
   include_textboxes_footnotes_endnotes: boolean | null
+  match_analysis: DocumentMatchAnalysis | null
   pages: number | null
   words: number | null
   non_asian_words: number | null
@@ -258,6 +268,22 @@ export interface DocumentStatistics {
   internal_repeated_characters: number | null
   cross_file_repeated_words: number | null
   cross_file_repeated_characters: number | null
+}
+
+export interface DocumentMatchAnalysisRow {
+  key: string
+  label: string
+  segment_count: number
+  word_count: number
+  percent: number
+}
+
+export interface DocumentMatchAnalysis {
+  threshold: number
+  collection_ids: string[]
+  total_segments: number
+  total_words: number
+  rows: DocumentMatchAnalysisRow[]
 }
 
 export interface DocumentStatisticsTotals {
@@ -273,6 +299,7 @@ export interface DocumentStatisticsTotals {
   internal_repeated_characters: number | null
   cross_file_repeated_words: number | null
   cross_file_repeated_characters: number | null
+  match_analysis: DocumentMatchAnalysis | null
 }
 
 export interface DocumentStatisticsReportItem {
@@ -336,10 +363,17 @@ export interface UploadCapability {
   features: string[]
 }
 
+export interface UploadBatchLimits {
+  max_files_per_batch: number
+  max_total_size_mb: number
+  max_expanded_files: number
+}
+
 export interface UploadCapabilitiesResponse {
   extensions: string[]
   accept: string
   formats: UploadCapability[]
+  limits?: UploadBatchLimits
 }
 
 export interface TMMatchCandidate {
@@ -385,6 +419,8 @@ export interface Segment {
   source: string
   llm_provider: string | null
   llm_model: string | null
+  last_modified_by_id?: string | null
+  last_modified_by?: User | null
   block_type: string
   block_index: number
   row_index?: number | null
@@ -393,13 +429,115 @@ export interface Segment {
   workflow_step_name?: string | null
   workflow_step_order?: number | null
   can_write?: boolean
+  qa_issues?: SegmentQAIssue[]
   updated_at: string | null
+  /** 合并视图聚合读取时附带：句段所属文件 id 与文件名 */
+  file_record_id?: string
+  filename?: string
+}
+
+export type SegmentQAIssueSeverity = 'low' | 'medium' | 'high'
+export type SegmentQAIssueStatus = 'open' | 'ignored' | 'resolved'
+
+export interface SegmentQAIssue {
+  id: string
+  project_id: string | null
+  file_record_id: string
+  segment_id: string
+  sentence_id: string
+  rule_key: string
+  provider: string
+  language: string
+  severity: SegmentQAIssueSeverity
+  message: string
+  short_message: string
+  rule_id: string
+  rule_category: string
+  issue_type: string
+  context_text: string
+  offset: number
+  length: number
+  replacements: string[]
+  target_text_hash: string
+  status: SegmentQAIssueStatus
+  ignored: boolean
+  ignored_at: string | null
+  ignored_by_id: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+export type WorkbenchQAResultItemSourceKind = 'segment_qa_issue' | 'term_qa_report_item'
+export type WorkbenchQAResultRuleKey = 'spelling_grammar' | 'term_inconsistency'
+
+export interface WorkbenchQAResultRule {
+  key: WorkbenchQAResultRuleKey
+  label: string
+  enabled: boolean
+  supported: boolean
+}
+
+export interface WorkbenchQAResultItem {
+  id: string
+  source_id: string
+  source_kind: WorkbenchQAResultItemSourceKind
+  rule_key: WorkbenchQAResultRuleKey
+  rule_label: string
+  project_id: string | null
+  file_record_id: string
+  file_name: string
+  segment_id: string | null
+  sentence_id: string
+  source_text: string
+  target_text: string
+  message: string
+  detail: string
+  suggestion: string
+  source_term: string
+  expected_target_term: string
+  term_base_name: string
+  severity: SegmentQAIssueSeverity
+  status: SegmentQAIssueStatus
+  ignored: boolean
+  ignored_at: string | null
+  ignored_by_id: string | null
+  ignored_by_name: string | null
+  block_index: number
+  row_index: number | null
+  cell_index: number | null
+  created_at: string | null
+}
+
+export interface WorkbenchQAResult {
+  id: string
+  project_id: string
+  file_record_id: string | null
+  scope: 'file' | 'merge_view'
+  file_ids: string[]
+  term_report_id: string | null
+  total_files: number
+  total_segments: number
+  checked_segments: number
+  issue_count: number
+  active_issue_count: number
+  ignored_count: number
+  created_at: string | null
+  rules: WorkbenchQAResultRule[]
+  warnings: string[]
+  items: WorkbenchQAResultItem[]
 }
 
 export interface ProjectSegmentSyncSummary {
   filled_count: number
+  updated_count: number
   conflict_count: number
   affected_file_count: number
+}
+
+export interface ProjectSyncDisableResult {
+  updated_count: number
+  disabled_count: number
+  cleared_count: number
 }
 
 export interface FileRecordDetail {
@@ -462,14 +600,21 @@ export interface SegmentPageFilters {
   scope: string
   source_query: string
   target_query: string
+  source_exclude: string
+  target_exclude: string
   search_fuzzy: boolean
+  case_sensitive: boolean
+  status_filters?: string[]
+  match_filters?: string[]
+  source_filters?: string[]
+  workflow_step_ids?: string[]
 }
 
 export interface SegmentPageResponse {
   file_record_id: string
-  total_segments: number
+  total_segments: number | null
   matched_segments: number
-  status_stats: SegmentStatusStats
+  status_stats: SegmentStatusStats | null
   skip: number
   limit: number
   filters: SegmentPageFilters
@@ -486,6 +631,89 @@ export interface SegmentPositionResponse {
   page: number
   page_size: number
   page_index: number
+}
+
+export interface SegmentNextUnconfirmedPositionResponse {
+  target: SegmentPositionResponse | null
+  wrapped: boolean
+}
+
+/** 合并视图摘要（列表项） */
+export interface MergeView {
+  id: string
+  project_id: string
+  project_name?: string | null
+  name: string
+  file_ids: string[]
+  file_count: number
+  available_file_count: number
+  can_manage?: boolean
+  can_open?: boolean
+  creator_id: string | null
+  creator_name: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+/** 合并视图中的文件元数据（详情用） */
+export interface MergeViewFile {
+  id: string
+  filename: string
+  status: string
+  total_segments: number
+  status_stats: SegmentStatusStats
+  source_language: string | null
+  target_language: string | null
+  progress: number
+  workflow_progress?: WorkflowProgress[]
+  can_write?: boolean
+  is_edit_locked: boolean
+}
+
+export interface MergeViewLanguagePair {
+  source_language: string | null
+  target_language: string | null
+  file_count: number
+}
+
+/** 合并视图详情 */
+export interface MergeViewDetail {
+  id: string
+  project_id: string
+  name: string
+  file_ids: string[]
+  files: MergeViewFile[]
+  total_files: number
+  total_segments: number
+  is_mixed_language_pair: boolean
+  language_pairs: MergeViewLanguagePair[]
+  can_manage?: boolean
+  creator_id: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+/** 合并视图聚合分页中的分组边界信息 */
+export interface MergeViewSegmentGroup {
+  file_record_id: string
+  filename: string
+  matched_segments: number
+  page_segment_count: number
+}
+
+/** 合并视图聚合句段分页响应 */
+export interface MergeViewSegmentPageResponse {
+  merge_view_id: string
+  project_id: string
+  name: string
+  total_segments: number
+  matched_segments: number
+  skip: number
+  limit: number
+  filters: SegmentPageFilters
+  groups: MergeViewSegmentGroup[]
+  server_time?: string
+  segments: Segment[]
 }
 
 export interface FileRecordPreview {
@@ -623,6 +851,32 @@ export interface ProjectTermBaseSettingsResponse {
   groups: ProjectTermBaseSettingGroup[]
 }
 
+export interface QualityQASettingsResponse {
+  project_id: string
+  settings: {
+    rules: Record<string, {
+      enabled: boolean
+    }>
+    spelling_grammar: {
+      enabled: boolean
+      severity: SegmentQAIssueSeverity
+    }
+  }
+  languagetool_configured: boolean
+  supported_languages: Array<{
+    code: string
+    label: string
+    languagetool_code: string | null
+    supported: boolean
+  }>
+  target_languages: Array<{
+    language: string
+    file_count: number
+    supported: boolean
+    languagetool_code: string | null
+  }>
+}
+
 export interface ProjectTranslationMemorySettingCollection {
   id: string
   name: string
@@ -650,8 +904,10 @@ export interface ProjectTranslationMemorySettingGroup {
 
 export interface ProjectTranslationMemorySettingsResponse {
   project_id: string
+  auto_tm_enabled: boolean
   groups: ProjectTranslationMemorySettingGroup[]
   initial_match_updated_count?: number
+  initial_match_queued_count?: number
 }
 
 export interface TermQAReportItem {
@@ -683,7 +939,7 @@ export interface TermQAReport {
   project_id: string | null
   file_record_id: string | null
   created_by_id: string | null
-  scope: 'project' | 'file'
+  scope: 'project' | 'file' | 'merge_view'
   file_ids: string[]
   term_base_ids: string[]
   language_pairs: Array<{ source_language: string, target_language: string }>
@@ -720,6 +976,10 @@ export interface TMEntryRecord {
   target_text: string
   source_language: string | null
   target_language: string | null
+  creator_id?: string | null
+  creator_name?: string | null
+  last_modified_by_id?: string | null
+  last_modified_by_name?: string | null
   created_at: string
   updated_at: string
 }
@@ -731,7 +991,10 @@ export interface TermEntryRecord {
   target_text: string
   source_language: string
   target_language: string
+  creator_id?: string | null
   creator_name: string | null
+  last_modified_by_id?: string | null
+  last_modified_by_name?: string | null
   created_at: string
   updated_at: string
 }
@@ -744,7 +1007,10 @@ export interface GlossaryEntryRecord {
   note: string | null
   source_language: string
   target_language: string
+  creator_id?: string | null
   creator_name: string | null
+  last_modified_by_id?: string | null
+  last_modified_by_name?: string | null
   created_at: string
   updated_at: string
 }
@@ -868,6 +1134,9 @@ export interface TMImportPreview {
   skipped_header_rows: number
   preview_limit: number
   duplicate_policy: 'overwrite' | 'keep'
+  scanned_rows: number
+  truncated: boolean
+  max_scan_rows?: number
   collection_id: string | null
   collection_name: string
   source_language: string
@@ -917,6 +1186,9 @@ export interface TermImportPreview {
   skipped_empty_rows: number
   skipped_header_rows: number
   preview_limit: number
+  scanned_rows: number
+  truncated: boolean
+  max_scan_rows?: number
   term_base_id: string | null
   term_base_name: string
   source_language: string
@@ -931,6 +1203,35 @@ export interface GlossaryImportSummary {
   skipped_header_rows: number
   imported_rows: number
   glossary_base_id: string
+  glossary_base_name: string
+  source_language: string
+  target_language: string
+}
+
+export interface GlossaryImportPreviewRow {
+  row_index: number
+  source_text: string
+  target_text: string
+  note: string
+  status: ImportPreviewStatus
+  message: string
+}
+
+export interface GlossaryImportPreview {
+  filename: string
+  rows: GlossaryImportPreviewRow[]
+  total_rows: number
+  valid_rows: number
+  create_rows: number
+  update_rows: number
+  duplicate_rows: number
+  skipped_empty_rows: number
+  skipped_header_rows: number
+  preview_limit: number
+  scanned_rows: number
+  truncated: boolean
+  max_scan_rows?: number
+  glossary_base_id: string | null
   glossary_base_name: string
   source_language: string
   target_language: string
@@ -957,6 +1258,8 @@ export interface SegmentUpdatePayload {
   track_revision?: boolean
   base_version?: number | null
   confirm?: boolean
+  /** 合并视图模式：该 dirty 条目归属的文件 id（前端分组保存用，后端 PUT 忽略） */
+  file_record_id?: string
 }
 
 export interface SegmentRevisionEntry {
@@ -972,6 +1275,23 @@ export interface SegmentRevisionEntry {
   resolved_by: User | null
   created_at: string
   resolved_at: string | null
+}
+
+export interface RevisionAuthorColors {
+  insert: string
+  delete: string
+}
+
+export interface RevisionDisplaySettings {
+  id: string | null
+  file_record_id: string
+  show_author_time: boolean
+  show_others_revisions: boolean
+  default_insert_color: string
+  default_delete_color: string
+  author_colors: Record<string, RevisionAuthorColors>
+  updated_by: User | null
+  updated_at: string | null
 }
 
 export interface CommentCreatePayload extends CommentAnchorDraft {
@@ -990,12 +1310,14 @@ export interface CommentReplyPayload {
 
 export type LLMTranslateScope = 'current_segment' | 'fuzzy_only' | 'none_only' | 'empty_target_only' | 'all' | 'all_with_exact'
 export type LLMProvider = 'auto' | 'deepseek' | 'openrouter'
+export type LLMMergeTarget = 'current_file' | 'merge_view'
 
 export interface LLMGuidelineOptions {
   guidelineTemplateId?: string
   temporaryPrompt?: string
   model?: string
   sentenceId?: string
+  mergeTarget?: LLMMergeTarget
 }
 
 export interface LLMEvent {
@@ -1022,6 +1344,8 @@ export interface Term {
 
 export interface TermMatch {
   term_id: string
+  term_base_id?: string | null
+  term_base_name?: string | null
   source_text: string
   target_text: string
   start: number

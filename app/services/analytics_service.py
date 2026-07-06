@@ -30,6 +30,9 @@ _BACKFILL_COMPLETED = False
 _DASHBOARD_CACHE_LOCK = Lock()
 _DASHBOARD_CACHE_TTL = timedelta(seconds=15)
 _DASHBOARD_CACHE: dict[str, tuple[datetime, dict]] = {}
+_USER_ACTIVITY_LOCK = Lock()
+_USER_ACTIVITY_WRITE_INTERVAL = timedelta(seconds=60)
+_USER_ACTIVITY_LAST_WRITTEN: dict[tuple[UUID, date], datetime] = {}
 
 SOURCE_WORD_PATTERN = re.compile(
     r"[A-Za-z0-9]+|"
@@ -59,11 +62,22 @@ def count_source_words(text: str | None) -> int:
 
 
 def record_user_activity_safely(user_id: UUID) -> None:
+    today = date.today()
+    now = datetime.now()
+    cache_key = (user_id, today)
+    with _USER_ACTIVITY_LOCK:
+        last_written = _USER_ACTIVITY_LAST_WRITTEN.get(cache_key)
+        if last_written is not None and now - last_written < _USER_ACTIVITY_WRITE_INTERVAL:
+            return
+        _USER_ACTIVITY_LAST_WRITTEN[cache_key] = now
+
     try:
         with SessionLocal() as db:
-            record_user_activity(db, user_id)
+            record_user_activity(db, user_id, activity_date=today)
             db.commit()
     except Exception:  # noqa: BLE001
+        with _USER_ACTIVITY_LOCK:
+            _USER_ACTIVITY_LAST_WRITTEN.pop(cache_key, None)
         logger.debug("failed to record user activity user_id=%s", user_id, exc_info=True)
 
 

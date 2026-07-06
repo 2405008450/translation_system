@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import logging
+import mimetypes
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -168,8 +169,12 @@ _FILE_EXPORT_REQUIRED_INDEXES = {
 }
 
 
+def local_now() -> datetime:
+    return datetime.now()
+
+
 def utcnow() -> datetime:
-    return datetime.now(UTC).replace(tzinfo=None)
+    return local_now()
 
 
 def queue_file_export(
@@ -181,7 +186,7 @@ def queue_file_export(
 ) -> dict[str, Any]:
     ensure_file_export_tasks_schema()
     export_type = normalize_file_export_type(export_type)
-    now = utcnow()
+    now = local_now()
     expires_at = now + timedelta(seconds=FILE_EXPORT_TASK_TTL_SECONDS)
 
     file_record = (
@@ -192,20 +197,6 @@ def queue_file_export(
     )
     if file_record is None:
         raise HTTPException(status_code=404, detail="File record not found.")
-
-    existing_task = (
-        db.query(FileExportTask)
-        .filter(
-            FileExportTask.file_record_id == file_record_id,
-            FileExportTask.export_type == export_type,
-            FileExportTask.expires_at > now,
-            FileExportTask.status.in_(["queued", "running", "completed"]),
-        )
-        .order_by(FileExportTask.created_at.desc())
-        .first()
-    )
-    if existing_task is not None:
-        return serialize_file_export_task(existing_task)
 
     task = FileExportTask(
         file_record_id=file_record_id,
@@ -360,7 +351,7 @@ def _run_file_export_task(task_id: UUID) -> None:
                 raise ValueError("File record not found.")
 
             _set_file_export_task_status(db, task, "running", progress=20, message="正在读取文件和句段。")
-            exported_file = _build_exported_file(db, file_record, task.export_type)
+            exported_file = build_file_record_exported_file(db, file_record, task.export_type)
 
             output_dir = _ensure_export_dir()
             _cleanup_expired_export_files(output_dir)
@@ -382,10 +373,20 @@ def _run_file_export_task(task_id: UUID) -> None:
                 _set_file_export_task_status(db, task, "failed", progress=100, message="导出失败。")
 
 
-def _build_exported_file(db: Session, file_record: FileRecord, export_type: str):
+def build_file_record_exported_file(db: Session, file_record: FileRecord, export_type: str):
     raw_bytes = load_file_record_source(file_record)
-    segments = list_segments_for_file_record(db, file_record.id)
     source_filename = get_file_record_source_filename(file_record)
+
+    if export_type == "source":
+        if raw_bytes is None:
+            raise ValueError("The source file is unavailable.")
+        return _GenericExportedFile(
+            content=raw_bytes,
+            media_type=mimetypes.guess_type(source_filename)[0] or "application/octet-stream",
+            filename=source_filename,
+        )
+
+    segments = list_segments_for_file_record(db, file_record.id)
     document_parse_mode = getattr(file_record, "document_parse_mode", DOCUMENT_PARSE_MODE_FULL)
     document_parse_options = normalize_document_parse_options(
         getattr(file_record, "document_parse_options", None),
@@ -458,7 +459,7 @@ def _set_file_export_task_status(
     task.status = status
     task.progress = max(0, min(100, int(progress)))
     task.message = message
-    task.updated_at = utcnow()
+    task.updated_at = local_now()
     db.commit()
     db.refresh(task)
 
@@ -470,7 +471,7 @@ def _ensure_export_dir() -> Path:
 
 
 def _cleanup_expired_file_exports(db: Session) -> None:
-    now = utcnow()
+    now = local_now()
     expired_tasks = db.query(FileExportTask).filter(FileExportTask.expires_at <= now).all()
     for task in expired_tasks:
         if task.result_path:

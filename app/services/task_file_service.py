@@ -7,6 +7,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.services.adapters import ensure_default_adapters_registered
 from app.services.adapters.base import DEFAULT_MAX_FILE_SIZE, FORMAT_SIZE_LIMITS
 from app.services.adapters.export_formats import get_supported_exports
@@ -498,6 +499,67 @@ def can_export_task_file(filename: str, has_source_file: bool = True) -> bool:
     return any(option.id == "original" for option in get_supported_exports(extension))
 
 
+class UploadLimitError(Exception):
+    def __init__(self, detail: str, *, status_code: int = 400):
+        self.detail = detail
+        self.status_code = status_code
+        super().__init__(detail)
+
+
+def get_max_upload_size_bytes(filename: str) -> int:
+    extension = get_task_file_extension(filename)
+    registry = ensure_default_adapters_registered()
+    try:
+        adapter = registry.get_adapter(filename if extension else "file.txt")
+        return adapter.get_max_file_size()
+    except Exception:
+        return FORMAT_SIZE_LIMITS.get(extension, DEFAULT_MAX_FILE_SIZE)
+
+
+def validate_upload_batch(
+    files: list[tuple[str, bytes]],
+    *,
+    max_files: int | None = None,
+) -> None:
+    settings = get_settings()
+    limit_files = max_files if max_files is not None else settings.upload_max_files_per_batch
+    max_total_bytes = settings.upload_max_total_size_mb * 1024 * 1024
+
+    if len(files) > limit_files:
+        raise UploadLimitError(
+            f"文件数量超过限制，最多 {limit_files} 个。",
+            status_code=400,
+        )
+
+    total = 0
+    for filename, raw_bytes in files:
+        max_size = get_max_upload_size_bytes(filename)
+        size = len(raw_bytes)
+        if size > max_size:
+            max_mb = round(max_size / (1024 * 1024), 2)
+            raise UploadLimitError(
+                f"文件 {filename} 超过大小限制（{max_mb} MB）。",
+                status_code=413,
+            )
+        total += size
+
+    if total > max_total_bytes:
+        raise UploadLimitError(
+            f"上传总大小超过限制（{settings.upload_max_total_size_mb} MB）。",
+            status_code=413,
+        )
+
+
+def validate_expanded_upload_batch(file_payloads: list[dict[str, Any]]) -> None:
+    from app.services.import_task_storage import read_import_file_bytes
+
+    files = [
+        (payload.get("filename") or "source.txt", read_import_file_bytes(payload))
+        for payload in file_payloads
+    ]
+    validate_upload_batch(files, max_files=get_settings().upload_max_expanded_files)
+
+
 def get_upload_capabilities() -> dict[str, Any]:
     supported_extensions = get_supported_task_extensions()
     supported_set = set(supported_extensions)
@@ -524,21 +586,21 @@ def get_upload_capabilities() -> dict[str, Any]:
             }
         )
 
+    settings = get_settings()
     return {
         "extensions": list(supported_extensions),
         "accept": ",".join(supported_extensions),
         "formats": formats,
+        "limits": {
+            "max_files_per_batch": settings.upload_max_files_per_batch,
+            "max_total_size_mb": settings.upload_max_total_size_mb,
+            "max_expanded_files": settings.upload_max_expanded_files,
+        },
     }
 
 
 def _get_upload_max_size_mb(extension: str) -> float:
-    registry = ensure_default_adapters_registered()
-    try:
-        adapter = registry.get_adapter(f"file{extension}")
-        max_size = adapter.get_max_file_size()
-    except Exception:
-        max_size = FORMAT_SIZE_LIMITS.get(extension, DEFAULT_MAX_FILE_SIZE)
-    return round(max_size / (1024 * 1024), 2)
+    return round(get_max_upload_size_bytes(f"file{extension}") / (1024 * 1024), 2)
 
 
 def build_task_workspace(
@@ -599,17 +661,17 @@ def build_task_workspace(
     segments: list[dict[str, Any]] = []
     for index, (segment, match_result) in enumerate(zip(parse_result.segments, match_results, strict=False)):
         context = _build_segment_context(parse_result.ast, segment.block_path, fallback_index=index)
-        
+
         # 获取 segment metadata（包含 DXF/DWG 实体信息如 handle, layer 等）
         seg_metadata = getattr(segment, 'metadata', {}) or {}
-        
+        existing_target_text = str(context.get("target") or "").strip()
         segments.append(
             {
                 "sentence_id": segment.segment_id,
                 "source_text": segment.source_text,
                 "display_text": segment.display_text,
-                "target_text": match_result.target_text or "",
-                "status": match_result.status,
+                "target_text": existing_target_text or match_result.target_text or "",
+                "status": "confirmed" if existing_target_text else match_result.status,
                 "score": match_result.score,
                 "matched_source_text": match_result.matched_source_text or "",
                 "matched_collection_name": match_result.matched_collection_name,
@@ -832,14 +894,14 @@ def build_export_segments_from_source(
         str(_get_segment_value(segment, "sentence_id", _get_segment_value(segment, "segment_id", ""))): segment
         for segment in segments
     }
-    
+
     # 对于 CAD 文件，额外按 handle 建立索引（因为合并后 segment_id 会变）
     extension = (filename or "").lower().rsplit(".", 1)[-1] if filename else ""
     is_cad_file = extension in ("dwg", "dxf")
-    
+
     handle_to_db_segment: dict[str, Any] = {}
     merged_handles_set: set[str] = set()  # 所有被合并的 handles（用于清空）
-    
+
     if is_cad_file:
         for segment in segments:
             db_metadata_str = _get_segment_value(segment, "segment_metadata", "{}")
@@ -847,11 +909,11 @@ def build_export_segments_from_source(
                 db_metadata = _json.loads(db_metadata_str) if db_metadata_str else {}
             except (TypeError, _json.JSONDecodeError):
                 db_metadata = {}
-            
+
             handle = db_metadata.get("handle", "")
             if handle:
                 handle_to_db_segment[handle] = segment
-            
+
             # 收集所有被合并的 handles
             if db_metadata.get("is_merged"):
                 merged_handles = db_metadata.get("merged_handles", [])
@@ -859,12 +921,20 @@ def build_export_segments_from_source(
                 for h in merged_handles:
                     if h != primary_handle:
                         merged_handles_set.add(h)
-        
+
         _logger.info(
             "build_export_segments_from_source: CAD 文件，handle 索引 %d 个，被合并实体 %d 个",
             len(handle_to_db_segment), len(merged_handles_set)
         )
-    
+
+    translated_segments_by_source: dict[str, list[Any]] = {}
+    for segment in segments:
+        source_key = _normalize_export_source_text(_get_segment_value(segment, "source_text", ""))
+        if source_key:
+            translated_segments_by_source.setdefault(source_key, []).append(segment)
+    ordered_translated_segments = list(segments)
+    used_translated_segment_ids: set[int] = set()
+
     _logger.debug(
         "build_export_segments_from_source: 解析得到 %d 个句段，数据库有 %d 个翻译句段",
         len(parse_result.segments), len(translated_segments)
@@ -874,20 +944,43 @@ def build_export_segments_from_source(
     for index, parsed_segment in enumerate(parse_result.segments):
         # 首先尝试按 segment_id 匹配
         translated_segment = translated_segments.get(parsed_segment.segment_id)
-        
-        # 获取解析时的 metadata
+
+        # 获取解析时的 metadata（CAD 文件需要 handle 用于兜底匹配）
         segment_metadata = getattr(parsed_segment, 'metadata', {}) or {}
         handle = segment_metadata.get('handle', '')
-        
-        # 对于 CAD 文件，如果 segment_id 匹配不到，尝试用 handle 匹配
+
+        parsed_source = _normalize_export_source_text(parsed_segment.source_text)
+        if translated_segment is not None and _normalize_export_source_text(
+            _get_segment_value(translated_segment, "source_text", "")
+        ) != parsed_source:
+            translated_segment = None
+        if translated_segment is None and index < len(ordered_translated_segments):
+            candidate_segment = ordered_translated_segments[index]
+            if id(candidate_segment) not in used_translated_segment_ids and _normalize_export_source_text(
+                _get_segment_value(candidate_segment, "source_text", "")
+            ) == parsed_source:
+                translated_segment = candidate_segment
+        if translated_segment is None and parsed_source:
+            candidates = translated_segments_by_source.get(parsed_source, [])
+            while candidates and id(candidates[0]) in used_translated_segment_ids:
+                candidates.pop(0)
+            if candidates:
+                translated_segment = candidates.pop(0)
+
+        # 对于 CAD 文件，如果上述匹配都失败，再用 handle 兜底
         if is_cad_file and translated_segment is None and handle:
             translated_segment = handle_to_db_segment.get(handle)
-            if translated_segment:
+            if translated_segment and id(translated_segment) not in used_translated_segment_ids:
                 _logger.info(
-                    "build_export_segments_from_source: segment_id 匹配失败，使用 handle=%s 匹配成功",
+                    "build_export_segments_from_source: segment_id/source_text 匹配失败，使用 handle=%s 匹配成功",
                     handle
                 )
-        
+            elif translated_segment:
+                # 已经被用过，跳过
+                translated_segment = None
+
+        if translated_segment is not None:
+            used_translated_segment_ids.add(id(translated_segment))
         context = _build_segment_context(parse_result.ast, parsed_segment.block_path, fallback_index=index)
         
         # 优先使用数据库中的 segment_metadata（可能包含手动合并信息）
@@ -981,7 +1074,12 @@ def _build_segment_context(
 
     block_index = root_index
     if block_type == "table_cell":
-        if ".children." not in block_path and ("row" in metadata or "col" in metadata):
+        explicit_block_index = _to_optional_int(metadata.get("block_index"))
+        if explicit_block_index is not None:
+            block_index = explicit_block_index
+        elif ".children." in block_path:
+            block_index = root_index
+        elif "row" in metadata or "col" in metadata:
             block_index = _to_int(metadata.get("table_index"), default=0)
         else:
             block_index = _to_int(metadata.get("table_index"), default=root_index)
@@ -1003,7 +1101,7 @@ def _build_segment_context(
         context["index"] = subtitle_index
         context["subtitle_index"] = subtitle_index
 
-    for field in ("id", "tu_id", "start", "end", "zip_path", "rar_path", "file_type"):
+    for field in ("id", "tu_id", "mid", "target", "start", "end", "zip_path", "rar_path", "file_type"):
         value = metadata.get(field)
         if value is not None and not isinstance(value, (dict, list, set, tuple)):
             context[field] = value
@@ -1049,6 +1147,10 @@ def _get_segment_value(segment: Any, field_name: str, default: Any = None) -> An
     if isinstance(segment, dict):
         return segment.get(field_name, default)
     return getattr(segment, field_name, default)
+
+
+def _normalize_export_source_text(value: Any) -> str:
+    return " ".join(str(value or "").split())
 
 
 def _to_optional_int(value: Any) -> int | None:

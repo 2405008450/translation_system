@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { onBeforeUnmount, ref, watch } from 'vue'
 import { http } from '../api/http'
 import type { TermMatch } from '../types/api'
 
@@ -27,6 +27,16 @@ const error = ref('')
 const candidates = ref<TMCandidate[]>([])
 const termMatches = ref<TermMatch[]>([])
 const currentSourceText = ref('')
+const CANDIDATE_DEBOUNCE_MS = 250
+const CANDIDATE_CACHE_TTL_MS = 30_000
+type CandidateCacheEntry = {
+  candidates: TMCandidate[]
+  sourceText: string
+  expiresAt: number
+}
+const candidateCache = new Map<string, CandidateCacheEntry>()
+let candidateRequestId = 0
+let candidateLoadTimer: number | null = null
 
 async function loadCandidates() {
   if (!props.activeSentenceId || !props.fileRecordId) {
@@ -75,6 +85,96 @@ async function loadCandidates() {
   loading.value = false
 }
 
+function buildCandidateCacheKey() {
+  return [
+    props.fileRecordId,
+    props.activeSentenceId || '',
+    props.threshold == null ? '' : String(props.threshold),
+  ].join(':')
+}
+
+function clearCandidateLoadTimer() {
+  if (candidateLoadTimer !== null) {
+    window.clearTimeout(candidateLoadTimer)
+    candidateLoadTimer = null
+  }
+}
+
+function scheduleLoadCandidates() {
+  const requestId = ++candidateRequestId
+  clearCandidateLoadTimer()
+  candidateLoadTimer = window.setTimeout(() => {
+    candidateLoadTimer = null
+    void loadCandidatesWithRequest(requestId)
+  }, CANDIDATE_DEBOUNCE_MS)
+}
+
+async function loadCandidatesWithRequest(requestId: number) {
+  if (!props.activeSentenceId || !props.fileRecordId) {
+    candidates.value = []
+    termMatches.value = []
+    currentSourceText.value = ''
+    loading.value = false
+    error.value = ''
+    return
+  }
+
+  loading.value = true
+  error.value = ''
+
+  try {
+    const cacheKey = buildCandidateCacheKey()
+    const cached = candidateCache.get(cacheKey)
+    if (cached && cached.expiresAt > Date.now()) {
+      if (requestId !== candidateRequestId) return
+      candidates.value = cached.candidates
+      currentSourceText.value = cached.sourceText
+    } else {
+      const tmResponse = await http.get<{
+        sentence_id: string
+        source_text: string
+        candidates: TMCandidate[]
+      }>(`/file-records/${props.fileRecordId}/segments/${props.activeSentenceId}/tm-candidates`, {
+        params: {
+          ...(props.threshold == null ? {} : { threshold: props.threshold }),
+          max_candidates: 5,
+        },
+      })
+      if (requestId !== candidateRequestId) return
+      candidates.value = tmResponse.data.candidates
+      currentSourceText.value = tmResponse.data.source_text
+      candidateCache.set(cacheKey, {
+        candidates: tmResponse.data.candidates,
+        sourceText: tmResponse.data.source_text,
+        expiresAt: Date.now() + CANDIDATE_CACHE_TTL_MS,
+      })
+    }
+  } catch {
+    if (requestId !== candidateRequestId) return
+    error.value = 'Failed to load TM candidates'
+    candidates.value = []
+  }
+
+  try {
+    if (props.activeSourceText) {
+      const termResponse = await http.get<{ matches: TermMatch[] }>('/termbase/match', {
+        params: { text: props.activeSourceText },
+      })
+      if (requestId !== candidateRequestId) return
+      termMatches.value = termResponse.data.matches
+    } else {
+      termMatches.value = []
+    }
+  } catch {
+    if (requestId !== candidateRequestId) return
+    termMatches.value = []
+  } finally {
+    if (requestId === candidateRequestId) {
+      loading.value = false
+    }
+  }
+}
+
 function handleApply(candidate: TMCandidate) {
   if (props.activeSentenceId) {
     emit('applyTarget', props.activeSentenceId, candidate.target_text)
@@ -87,9 +187,19 @@ function handleApplyTerm(term: TermMatch) {
   }
 }
 
-watch(() => props.activeSentenceId, () => {
-  void loadCandidates()
+watch(() => [
+  props.fileRecordId,
+  props.activeSentenceId,
+  props.activeSourceText,
+  props.threshold ?? '',
+], () => {
+  scheduleLoadCandidates()
 }, { immediate: true })
+
+onBeforeUnmount(() => {
+  candidateRequestId += 1
+  clearCandidateLoadTimer()
+})
 </script>
 
 <template>

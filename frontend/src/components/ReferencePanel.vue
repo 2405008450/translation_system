@@ -759,8 +759,8 @@ function formatFileSize(bytes: number): string {
   display: flex;
   flex-direction: column;
   height: 100%;
-  background: var(--surface-panel);
-  border-left: 1px solid var(--line-soft);
+  background: linear-gradient(180deg, #ffffff 0%, #f7fbfb 100%);
+  border: 0;
 }
 
 .reference-panel__header {
@@ -782,6 +782,24 @@ function formatFileSize(bytes: number): string {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: #9fb8bd transparent;
+}
+
+.reference-panel__body::-webkit-scrollbar {
+  width: 8px;
+}
+
+.reference-panel__body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.reference-panel__body::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-color: #9fb8bd;
+  background-clip: content-box;
 }
 
 .reference-loading {

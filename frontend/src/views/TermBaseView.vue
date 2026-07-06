@@ -11,19 +11,19 @@ import Modal from '../components/base/Modal.vue'
 import Pagination from '../components/Pagination.vue'
 import RowActionMenu from '../components/RowActionMenu.vue'
 import { useConfirm } from '../composables/useConfirm'
-import { canonicalizeLanguagePair, formatLanguagePair, languageOptions } from '../constants/languages'
+import { canonicalizeLanguagePair, formatLanguagePair, getLanguageLabel, languageOptions } from '../constants/languages'
 import { useAuthStore } from '../stores/auth'
 import type { TermBase } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 
-type ExportFormat = 'xlsx' | 'tmx'
+type ExportFormat = 'xlsx' | 'tmx' | 'tbx'
 
 interface ResourceExportTask {
   task_id: string
   resource_type: 'term'
   resource_id: string
   format: ExportFormat
-  status: 'queued' | 'running' | 'completed' | 'failed'
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'canceling' | 'canceled'
   progress: number
   message: string
   result: {
@@ -71,12 +71,36 @@ const mergeMessage = ref('')
 const mergeSubmitting = ref(false)
 const deletingBases = ref(false)
 const exportingKey = ref('')
+const currentExportTaskId = ref('')
 
 const selectedTermBaseId = ref('')
 let exportPollTimer: number | null = null
 let disposed = false
 
 const canManageResources = computed(() => authStore.isAdmin)
+
+function normalizeResourceSearchText(value: unknown) {
+  return String(value ?? '').trim().toLowerCase()
+}
+
+function getResourceSearchKeywords() {
+  return normalizeResourceSearchText(searchQuery.value).split(/\s+/).filter(Boolean)
+}
+
+function getTermBaseSearchText(termBase: TermBase) {
+  return [
+    termBase.name,
+    termBase.description,
+    termBase.source_language,
+    termBase.target_language,
+    getLanguageLabel(termBase.source_language),
+    getLanguageLabel(termBase.target_language),
+    formatLanguagePair(termBase.source_language, termBase.target_language),
+    termBase.entry_count,
+    termBase.created_at,
+    termBase.updated_at,
+  ].map(normalizeResourceSearchText).join(' ')
+}
 
 const columns: DataTableColumn[] = [
   { key: 'name', label: '名称', sortable: true },
@@ -157,6 +181,7 @@ function waitForExportPoll(ms: number) {
 
 async function waitForExportTask(task: ResourceExportTask) {
   let currentTask = task
+  currentExportTaskId.value = task.task_id
   while (!disposed) {
     baseMessage.value = currentTask.message || `导出处理中：${currentTask.progress}%`
 
@@ -166,6 +191,9 @@ async function waitForExportTask(task: ResourceExportTask) {
     if (currentTask.status === 'failed') {
       throw new Error(currentTask.error || currentTask.message || '导出失败。')
     }
+    if (currentTask.status === 'canceled') {
+      throw new DOMException(currentTask.message || '导出已取消。', 'AbortError')
+    }
 
     await waitForExportPoll(1200)
     const { data } = await http.get<ResourceExportTask>(`/term-bases/export-tasks/${currentTask.task_id}`)
@@ -174,12 +202,20 @@ async function waitForExportTask(task: ResourceExportTask) {
   throw new Error('导出任务已取消。')
 }
 
+async function cancelCurrentExport() {
+  if (!currentExportTaskId.value) {
+    return
+  }
+  baseMessage.value = '正在停止导出...'
+  await http.post(`/term-bases/export-tasks/${currentExportTaskId.value}/cancel`).catch(() => undefined)
+}
+
 async function exportTermBase(termBase: TermBase | Record<string, any>, format: ExportFormat) {
   if (exportingKey.value) {
     return
   }
   const currentTermBase = termBase as TermBase
-  const formatLabel = format === 'xlsx' ? 'Excel' : 'TMX'
+  const formatLabel = format === 'xlsx' ? 'Excel' : (format === 'tmx' ? 'TMX' : 'TBX')
   exportingKey.value = getExportKey(currentTermBase.id, format)
   baseMessage.value = ''
   try {
@@ -200,10 +236,13 @@ async function exportTermBase(termBase: TermBase | Record<string, any>, format: 
     downloadBlob(response.data, filename)
     baseMessage.value = `${currentTermBase.name} 已导出为 ${formatLabel}。`
   } catch (error) {
-    baseMessage.value = getErrorMessage(error, `${currentTermBase.name} 导出失败。`)
+    baseMessage.value = error instanceof DOMException && error.name === 'AbortError'
+      ? `${currentTermBase.name} 导出已停止。`
+      : getErrorMessage(error, `${currentTermBase.name} 导出失败。`)
   } finally {
     clearExportPollTimer()
     exportingKey.value = ''
+    currentExportTaskId.value = ''
   }
 }
 
@@ -452,13 +491,12 @@ const filteredBases = computed(() => {
   if (filterTargetLanguage.value) {
     data = data.filter((item) => item.target_language === filterTargetLanguage.value)
   }
-  if (searchQuery.value.trim()) {
-    const q = searchQuery.value.trim().toLowerCase()
-    data = data.filter((item) => (
-      item.name.toLowerCase().includes(q)
-      || (item.description || '').toLowerCase().includes(q)
-      || formatLanguagePair(item.source_language, item.target_language).toLowerCase().includes(q)
-    ))
+  const keywords = getResourceSearchKeywords()
+  if (keywords.length > 0) {
+    data = data.filter((item) => {
+      const searchText = getTermBaseSearchText(item)
+      return keywords.every((keyword) => searchText.includes(keyword))
+    })
   }
   if (sortKey.value) {
     const dir = sortOrder.value === 'asc' ? 1 : -1
@@ -588,6 +626,15 @@ onUnmounted(() => {
           <button class="button" type="button" :disabled="loadingBases" @click="loadTermBases">
             {{ loadingBases ? '刷新中...' : '刷新' }}
           </button>
+          <button
+            v-if="exportingKey"
+            class="button button--danger"
+            type="button"
+            @click="cancelCurrentExport"
+          >
+            <X :size="14" />
+            停止导出
+          </button>
           <span style="font-size: 13px; color: var(--ink-500);">
             已选择：{{ selectedIds.size }}　总数：{{ totalCount }}
           </span>
@@ -678,6 +725,17 @@ onUnmounted(() => {
                       <Loader2 v-if="isExporting(row.id, 'tmx')" class="lucide-spin" :size="13" />
                       <FileCode2 v-else :size="13" />
                       导出 TMX
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      title="导出 TBX"
+                      :disabled="Boolean(exportingKey)"
+                      @click="close(); exportTermBase(row, 'tbx')"
+                    >
+                      <Loader2 v-if="isExporting(row.id, 'tbx')" class="lucide-spin" :size="13" />
+                      <FileCode2 v-else :size="13" />
+                      导出 TBX
                     </button>
                     <button
                       v-if="canManageResources"

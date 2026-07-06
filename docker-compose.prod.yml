@@ -1,0 +1,187 @@
+name: ai-translation-system
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-}
+    image: ai-translation-system:latest
+    container_name: ai-translation-app
+    env_file:
+      - ${APP_ENV_FILE:-.env.prod}
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      FILE_STORAGE_DIR: /app/data/file_records
+      EXPORT_TASK_DIR: /app/data/export_tasks
+      IMPORT_TASK_DIR: /app/data/import_tasks
+      IMPORT_TASK_STAGING_TTL_SECONDS: ${IMPORT_TASK_STAGING_TTL_SECONDS:-86400}
+      RESOURCE_IMPORT_MAX_SIZE_MB: ${RESOURCE_IMPORT_MAX_SIZE_MB:-1024}
+      UPLOAD_MAX_SIZE_MB: ${UPLOAD_MAX_SIZE_MB:-100}
+      UPLOAD_MAX_FILES_PER_BATCH: ${UPLOAD_MAX_FILES_PER_BATCH:-50}
+      UPLOAD_MAX_TOTAL_SIZE_MB: ${UPLOAD_MAX_TOTAL_SIZE_MB:-1024}
+      UPLOAD_MAX_EXPANDED_FILES: ${UPLOAD_MAX_EXPANDED_FILES:-100}
+      GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-600}
+      LIBREOFFICE_SOFFICE_PATH: /usr/bin/libreoffice
+      LIBREOFFICE_PYTHON_PATH: /usr/bin/python3
+    ports:
+      - "${APP_PUBLISH_PORT:-19013}:19013"
+    volumes:
+      - app_file_storage:/app/data/file_records
+      - app_export_tasks:/app/data/export_tasks
+      - app_import_tasks:/app/data/import_tasks
+      - app_logs:/app/logs
+    depends_on:
+      pgbouncer:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      languagetool:
+        condition: service_started
+      db-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:19013/api/health', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+    restart: unless-stopped
+
+  worker:
+    image: ai-translation-system:latest
+    container_name: ai-translation-worker
+    command: ["arq", "app.routers.api.WorkerSettings"]
+    healthcheck:
+      disable: true
+    env_file:
+      - ${APP_ENV_FILE:-.env.prod}
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      FILE_STORAGE_DIR: /app/data/file_records
+      EXPORT_TASK_DIR: /app/data/export_tasks
+      IMPORT_TASK_DIR: /app/data/import_tasks
+      IMPORT_TASK_STAGING_TTL_SECONDS: ${IMPORT_TASK_STAGING_TTL_SECONDS:-86400}
+      RESOURCE_IMPORT_MAX_SIZE_MB: ${RESOURCE_IMPORT_MAX_SIZE_MB:-1024}
+      UPLOAD_MAX_SIZE_MB: ${UPLOAD_MAX_SIZE_MB:-100}
+      UPLOAD_MAX_FILES_PER_BATCH: ${UPLOAD_MAX_FILES_PER_BATCH:-50}
+      UPLOAD_MAX_TOTAL_SIZE_MB: ${UPLOAD_MAX_TOTAL_SIZE_MB:-1024}
+      UPLOAD_MAX_EXPANDED_FILES: ${UPLOAD_MAX_EXPANDED_FILES:-100}
+      LIBREOFFICE_SOFFICE_PATH: /usr/bin/libreoffice
+      LIBREOFFICE_PYTHON_PATH: /usr/bin/python3
+      DATABASE_APPLICATION_NAME: ai-translation-worker
+    volumes:
+      - app_file_storage:/app/data/file_records
+      - app_export_tasks:/app/data/export_tasks
+      - app_import_tasks:/app/data/import_tasks
+      - app_logs:/app/logs
+    depends_on:
+      pgbouncer:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: ai-translation-postgres
+    # max_connections 需覆盖 PgBouncer 后端连接(DEFAULT_POOL_SIZE+RESERVE_POOL_SIZE 等)并留出余量。
+    command: ["postgres", "-c", "timezone=${TZ:-Asia/Shanghai}", "-c", "max_connections=200"]
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      PGTZ: ${TZ:-Asia/Shanghai}
+      POSTGRES_DB: ${POSTGRES_DB:?请在 .env.prod 中设置 POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?请在 .env.prod 中设置 POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env.prod 中设置 POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init/00-extensions.sql:/docker-entrypoint-initdb.d/00-extensions.sql:ro
+      - ./docker/postgres/init/05-users-prereq.sql:/docker-entrypoint-initdb.d/05-users-prereq.sql:ro
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/10-init_db.sql:ro
+      - ./scripts/create_reference_profiles.sql:/docker-entrypoint-initdb.d/20-create_reference_profiles.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # 幂等数据库迁移：每次启动对已有库补齐索引等增量变更（CREATE INDEX IF NOT EXISTS），
+  # 执行完即退出。新库由 /docker-entrypoint-initdb.d 初始化，已有库靠本服务升级。
+  db-migrate:
+    image: ai-translation-system:latest
+    container_name: ai-translation-db-migrate
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:?请在 .env.prod 中设置 POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?请在 .env.prod 中设置 POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB:?请在 .env.prod 中设置 POSTGRES_DB}
+    entrypoint: ["bash", "/app/scripts/run_migrations.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  pgbouncer:
+    image: edoburu/pgbouncer:1.22.1-p0
+    container_name: ai-translation-pgbouncer
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ${POSTGRES_USER:?请在 .env.prod 中设置 POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env.prod 中设置 POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB:?请在 .env.prod 中设置 POSTGRES_DB}
+      LISTEN_PORT: "6432"
+      # 事务级池化：连接只在事务期间占用真实 Postgres backend，应用侧 idle 连接不再占后端。
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: "1000"
+      DEFAULT_POOL_SIZE: "50"
+      MIN_POOL_SIZE: "5"
+      RESERVE_POOL_SIZE: "10"
+      RESERVE_POOL_TIMEOUT: "3"
+      # 内网专用：客户端用明文口令校验 userlist。PG17 后端仍走 SCRAM；勿对公网暴露 6432。
+      AUTH_TYPE: plain
+      # psycopg/SQLAlchemy 可能发送这些启动参数，事务池化下需忽略以避免连接被拒。
+      IGNORE_STARTUP_PARAMETERS: extra_float_digits,options
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: ai-translation-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  languagetool:
+    image: silviof/docker-languagetool:latest
+    container_name: ai-translation-languagetool
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+    expose:
+      - "8010"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  app_file_storage:
+  app_export_tasks:
+  app_import_tasks:
+  app_logs:

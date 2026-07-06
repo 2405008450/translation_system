@@ -1,17 +1,17 @@
 <script setup lang="ts">
-import { BookOpen, BookOpenCheck, Bot, Check, Database, Loader2, Plus, Search, Sparkles, Upload, X } from 'lucide-vue-next'
-import { computed, ref, watch } from 'vue'
+import { AlertTriangle, BookOpen, BookOpenCheck, Bot, Check, Database, Loader2, Pause, Search, Sparkles, Upload, X } from 'lucide-vue-next'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import { http } from '../api/http'
 import { canonicalizeLanguagePair, formatLanguagePair } from '../constants/languages'
-import { llmModelOptions as baseLLMModelOptions } from '../constants/llm'
+import { defaultLLMModelId, llmModelOptions as baseLLMModelOptions } from '../constants/llm'
 import { pushToast } from '../composables/useToast'
 import type { GlossaryBase, GuidelineTemplateSummary, LLMProvider, LLMTranslateScope, TermBase, TMCollection } from '../types/api'
 import { consumeLLMStream } from '../utils/llmStream'
 import { isProgressComplete } from '../utils/progress'
+import ResourceImportDialog from './ResourceImportDialog.vue'
 import Modal from './base/Modal.vue'
-import ResourceCreateDialog from './ResourceCreateDialog.vue'
 
 interface ProjectFileItem {
   id: string
@@ -43,8 +43,54 @@ interface FileOperationLockResponse {
   is_edit_locked: boolean
 }
 
+interface PretranslationTaskStatus {
+  id: string
+  run_id: string
+  file_record_id: string
+  filename?: string | null
+  status: string
+  stage: string
+  progress: number
+  message: string
+  provider?: string | null
+  model?: string | null
+  scope?: string | null
+  total_segments: number
+  unique_segments: number
+  deduplicated_segments: number
+  processed_segments: number
+  updated_segments: number
+  error_segments: number
+  current_action?: string | null
+  cancel_requested: boolean
+  error?: string | null
+  updated_at?: string | null
+  last_heartbeat_at?: string | null
+}
+
+interface PretranslationRunStatus {
+  id: string
+  project_id: string
+  status: string
+  progress: number
+  message: string
+  total_files: number
+  completed_files: number
+  failed_files: number
+  canceled_files: number
+  tasks: PretranslationTaskStatus[]
+}
+
+type ResourceImportTab = 'tm' | 'glossary' | 'term'
+type LanguagePairStat = {
+  source: string | null
+  target: string | null
+  fileCount: number
+}
+
 const props = defineProps<{
   open: boolean
+  projectId: string | null
   files: ProjectFileItem[]
   sourceLanguage: string | null
   targetLanguage: string | null
@@ -61,6 +107,8 @@ const FILE_OPERATION_TOKEN_HEADER = 'X-File-Operation-Token'
 const LOCK_HEARTBEAT_INTERVAL_MS = 30_000
 const LLM_STREAM_IDLE_TIMEOUT_MS = 150_000
 const RELEASE_LOCK_RETRY_DELAYS_MS = [600, 1_500, 3_000]
+const PRETRANSLATION_POLL_INTERVAL_MS = 2_000
+const ACTIVE_PRETRANSLATION_STATUSES = new Set(['queued', 'running', 'canceling'])
 
 const { t } = useI18n()
 
@@ -68,6 +116,7 @@ const loadingResources = ref(false)
 const running = ref(false)
 const stopRequested = ref(false)
 const currentAbortController = ref<AbortController | null>(null)
+const currentLLMReader = ref<ReadableStreamDefaultReader<Uint8Array> | null>(null)
 
 const tmCollections = ref<TMCollection[]>([])
 const termBases = ref<TermBase[]>([])
@@ -84,8 +133,8 @@ const tmAutoConfirmExact = ref(true)
 
 const useLlm = ref(false)
 const llmScope = ref<LLMTranslateScope>('all')
-const llmProvider = ref<LLMProvider>('deepseek')
-const llmModel = ref('')
+const llmProvider = ref<LLMProvider>('openrouter')
+const llmModel = ref(defaultLLMModelId)
 const llmGuidelines = ref('')
 const selectedGuidelineTemplateId = ref('')
 const importingGuidelineTemplate = ref(false)
@@ -102,16 +151,17 @@ const glossarySearchQuery = ref('')
 const errorMessage = ref('')
 const finishedCount = ref(0)
 const runFiles = ref<ProjectFileItem[]>([])
+const activeResourceImportTab = ref<ResourceImportTab | null>(null)
 
 const progressByFileId = ref<Record<string, number>>({})
 const statusByFileId = ref<Record<string, string>>({})
-
-const showTermBaseCreateDialog = ref(false)
-const showGlossaryCreateDialog = ref(false)
+const activeRunId = ref('')
+const activeTaskIdsByFileId = ref<Record<string, string>>({})
+const pretranslationPollTimer = ref<number | null>(null)
 
 const llmProviderOptions = computed<Array<{ value: LLMProvider, label: string }>>(() => [
-  { value: 'deepseek', label: t('projectDetail.preTranslate.llm.providers.deepseek') },
   { value: 'openrouter', label: t('projectDetail.preTranslate.llm.providers.openrouter') },
+  { value: 'deepseek', label: t('projectDetail.preTranslate.llm.providers.deepseek') },
   { value: 'auto', label: t('projectDetail.preTranslate.llm.providers.auto') },
 ])
 
@@ -145,6 +195,37 @@ const selectedFileLanguagePairs = computed(() => {
   return Array.from(pairMap.values())
 })
 
+const selectedFileLanguagePairStats = computed<LanguagePairStat[]>(() => {
+  const pairMap = new Map<string, LanguagePairStat>()
+  let invalidCount = 0
+  for (const file of props.files) {
+    const pair = canonicalizeLanguagePair(
+      file.source_language || props.sourceLanguage,
+      file.target_language || props.targetLanguage,
+    )
+    if (!pair) {
+      invalidCount += 1
+      continue
+    }
+    const key = `${pair.source}__${pair.target}`
+    const current = pairMap.get(key)
+    if (current) {
+      current.fileCount += 1
+    } else {
+      pairMap.set(key, {
+        source: pair.source,
+        target: pair.target,
+        fileCount: 1,
+      })
+    }
+  }
+  const stats = Array.from(pairMap.values())
+  if (invalidCount > 0) {
+    stats.push({ source: null, target: null, fileCount: invalidCount })
+  }
+  return stats
+})
+
 const filesWithInvalidLanguagePair = computed(() => (
   props.files.filter((file) => !canonicalizeLanguagePair(
     file.source_language || props.sourceLanguage,
@@ -159,15 +240,22 @@ const selectedFileLanguagePair = computed(() => (
 const selectedLanguagePairLabel = computed(() => (
   selectedFileLanguagePair.value
     ? formatLanguagePair(selectedFileLanguagePair.value.source, selectedFileLanguagePair.value.target)
-    : t('common.notSet')
+    : (selectedFileLanguagePairs.value.length > 1 ? '混合语言对' : t('common.notSet'))
 ))
 
-const languagePairIssue = computed(() => {
+const invalidLanguagePairIssue = computed(() => {
   if (props.files.length === 0) {
     return ''
   }
   if (filesWithInvalidLanguagePair.value.length > 0) {
     return t('projectDetail.preTranslate.errors.fileLanguagePairRequired')
+  }
+  return ''
+})
+
+const mixedLanguagePairIssue = computed(() => {
+  if (props.files.length === 0) {
+    return ''
   }
   if (selectedFileLanguagePairs.value.length > 1) {
     return t('projectDetail.preTranslate.errors.fileLanguagePairMixed', {
@@ -176,6 +264,21 @@ const languagePairIssue = computed(() => {
   }
   return ''
 })
+
+const languagePairIssue = computed(() => invalidLanguagePairIssue.value || mixedLanguagePairIssue.value)
+
+const usesLanguagePairResources = computed(() => useTm.value || useGlossary.value || useTermBase.value)
+
+const pureLlmMixedLanguagePairNotice = computed(() => {
+  if (!useLlm.value || usesLanguagePairResources.value || selectedFileLanguagePairs.value.length <= 1) {
+    return ''
+  }
+  return `已选择 ${selectedFileLanguagePairs.value.length} 个语言对；纯 LLM 会按每个文件自己的语言对逐个执行，不共用 TM、术语库或词汇表。`
+})
+
+function formatLanguagePairStat(stat: LanguagePairStat) {
+  return `${formatLanguagePair(stat.source, stat.target)} · ${stat.fileCount} 个文件`
+}
 
 function resourceMatchesSelectedLanguagePair(resource: TMCollection | TermBase | GlossaryBase) {
   const selectedPair = selectedFileLanguagePair.value
@@ -262,6 +365,22 @@ const configuredActionCount = computed(() => (
 const progressFiles = computed(() => (
   runFiles.value.length > 0 ? runFiles.value : props.files
 ))
+
+const resourceImportDialogTab = computed<ResourceImportTab>(() => activeResourceImportTab.value || 'tm')
+
+const resourceImportDialogTitle = computed(() => {
+  if (resourceImportDialogTab.value === 'tm') {
+    return '导入记忆库'
+  }
+  if (resourceImportDialogTab.value === 'glossary') {
+    return '导入词汇表'
+  }
+  return '导入术语库'
+})
+
+const resourceImportContextLabel = computed(() => (
+  `预翻译：${selectedLanguagePairLabel.value}`
+))
 const overallProgress = computed(() => {
   if (!progressFiles.value.length) {
     return 0
@@ -340,6 +459,8 @@ function resetProgress() {
   runFiles.value = []
   progressByFileId.value = {}
   statusByFileId.value = {}
+  activeRunId.value = ''
+  activeTaskIdsByFileId.value = {}
 }
 
 function normalizeProgress(progress: number) {
@@ -374,6 +495,132 @@ function setFileProgress(fileId: string, progress: number, status: string) {
     status,
     running: running.value,
   })
+}
+
+function stopPretranslationPolling() {
+  if (pretranslationPollTimer.value !== null) {
+    window.clearInterval(pretranslationPollTimer.value)
+    pretranslationPollTimer.value = null
+  }
+}
+
+function buildTaskStatusText(task: PretranslationTaskStatus) {
+  const parts: string[] = []
+  if (task.message) {
+    parts.push(task.message)
+  } else if (task.status === 'queued') {
+    parts.push(t('projectDetail.preTranslate.progress.pending'))
+  } else if (task.status === 'running') {
+    parts.push(t('projectDetail.preTranslate.progress.running'))
+  }
+  if (task.provider || task.model) {
+    parts.push([task.provider, task.model].filter(Boolean).join(' / '))
+  }
+  if (task.total_segments > 0 || task.processed_segments > 0) {
+    const total = Math.max(task.total_segments, task.processed_segments)
+    parts.push(`${task.processed_segments}/${total}`)
+  }
+  if (task.unique_segments > 0 && task.deduplicated_segments > 0) {
+    parts.push(`唯一 ${task.unique_segments}，去重 ${task.deduplicated_segments}`)
+  }
+  if (task.updated_segments > 0 || task.error_segments > 0) {
+    parts.push(`成功 ${task.updated_segments}，失败 ${task.error_segments}`)
+  }
+  if (task.error && task.status === 'failed') {
+    parts.push(task.error)
+  }
+  return parts.filter(Boolean).join(' · ')
+}
+
+function applyPretranslationRun(run: PretranslationRunStatus) {
+  activeRunId.value = run.id
+  const nextTaskIdsByFileId = { ...activeTaskIdsByFileId.value }
+  let activeCount = 0
+  let terminalCount = 0
+
+  for (const task of run.tasks || []) {
+    nextTaskIdsByFileId[task.file_record_id] = task.id
+    const taskRunning = ACTIVE_PRETRANSLATION_STATUSES.has(task.status)
+    if (taskRunning) {
+      activeCount += 1
+    } else {
+      terminalCount += 1
+    }
+    setFileProgress(
+      task.file_record_id,
+      normalizeProgress(task.progress),
+      buildTaskStatusText(task),
+    )
+  }
+
+  activeTaskIdsByFileId.value = nextTaskIdsByFileId
+  finishedCount.value = terminalCount
+  running.value = activeCount > 0
+  if (!running.value && run.tasks.length > 0) {
+    stopPretranslationPolling()
+    emitCurrentProgress(false)
+  }
+}
+
+async function pollPretranslationRun() {
+  if (!activeRunId.value) {
+    return
+  }
+  try {
+    const { data } = await http.get<PretranslationRunStatus>(`/pretranslation-runs/${activeRunId.value}`)
+    applyPretranslationRun(data)
+    if (!ACTIVE_PRETRANSLATION_STATUSES.has(data.status)) {
+      await handlePretranslationRunFinished(data)
+    }
+  } catch (error) {
+    stopPretranslationPolling()
+    running.value = false
+    const message = error instanceof Error ? error.message : t('projectDetail.preTranslate.errors.unknown')
+    pushToast({
+      tone: 'error',
+      title: t('projectDetail.preTranslate.toast.loadFailedTitle'),
+      message,
+    })
+  }
+}
+
+function startPretranslationPolling() {
+  stopPretranslationPolling()
+  pretranslationPollTimer.value = window.setInterval(() => {
+    void pollPretranslationRun()
+  }, PRETRANSLATION_POLL_INTERVAL_MS)
+}
+
+async function handlePretranslationRunFinished(run: PretranslationRunStatus) {
+  stopPretranslationPolling()
+  running.value = false
+  emitCurrentProgress(false)
+  activeRunId.value = ''
+
+  if (run.status === 'canceled' || stopRequested.value) {
+    pushToast({
+      tone: 'info',
+      title: t('projectDetail.preTranslate.toast.stoppedTitle'),
+      message: t('projectDetail.preTranslate.toast.stoppedMessage'),
+    })
+  } else if (run.status === 'failed') {
+    pushToast({
+      tone: 'warn',
+      title: t('projectDetail.preTranslate.toast.fileFailedTitle', { name: t('projectDetail.preTranslate.dialogTitle') }),
+      message: run.message || t('projectDetail.preTranslate.errors.unknown'),
+    })
+  } else {
+    pushToast({
+      tone: 'success',
+      title: t('projectDetail.preTranslate.toast.doneTitle'),
+      message: t('projectDetail.preTranslate.toast.doneMessage', {
+        done: run.completed_files,
+        total: Math.max(run.total_files, run.tasks.length, selectedCount.value),
+      }),
+    })
+  }
+
+  emit('done')
 }
 
 function emitCurrentProgress(runningState = running.value) {
@@ -473,6 +720,40 @@ function clearTermBases() {
 
 function clearGlossaryBases() {
   glossaryBaseIds.value = []
+}
+
+function openResourceImport(tab: ResourceImportTab) {
+  activeResourceImportTab.value = tab
+}
+
+function closeResourceImport() {
+  activeResourceImportTab.value = null
+}
+
+async function handleResourceImported(payload: { tab: ResourceImportTab, resourceId?: string }) {
+  await loadResources()
+  if (payload.tab === 'tm' && payload.resourceId) {
+    useTm.value = true
+    tmCollectionIds.value = normalizeResourceIds(
+      [...tmCollectionIds.value, payload.resourceId],
+      availableTMCollections.value,
+    )
+  }
+  if (payload.tab === 'glossary' && payload.resourceId) {
+    useGlossary.value = true
+    glossaryBaseIds.value = normalizeResourceIds(
+      [...glossaryBaseIds.value, payload.resourceId],
+      availableGlossaryBases.value,
+    )
+  }
+  if (payload.tab === 'term' && payload.resourceId) {
+    useTermBase.value = true
+    termBaseIds.value = normalizeResourceIds(
+      [...termBaseIds.value, payload.resourceId],
+      availableTermBases.value,
+    )
+  }
+  closeResourceImport()
 }
 
 function getBoundTMCollectionIdsFromFiles() {
@@ -634,8 +915,12 @@ function validateBeforeStart() {
     errorMessage.value = t('projectDetail.preTranslate.errors.selectOneOption')
     return false
   }
-  if ((useTm.value || useGlossary.value || useTermBase.value) && languagePairIssue.value) {
-    errorMessage.value = languagePairIssue.value
+  if (invalidLanguagePairIssue.value) {
+    errorMessage.value = invalidLanguagePairIssue.value
+    return false
+  }
+  if (usesLanguagePairResources.value && mixedLanguagePairIssue.value) {
+    errorMessage.value = mixedLanguagePairIssue.value
     return false
   }
   if (useTm.value && selectedTmCollectionIds.value.length === 0) {
@@ -776,53 +1061,59 @@ async function runLLMForFile(fileId: string, completedActions: number, actionCou
       throw new Error(message)
     }
 
-    await consumeLLMStream(response, ({ event, data }) => {
-      refreshIdleTimer()
-      if (stopRequested.value) {
-        return
-      }
+    await consumeLLMStream(
+      response,
+      ({ event, data }) => {
+        refreshIdleTimer()
+        if (stopRequested.value) {
+          return
+        }
 
-      if (event === 'start') {
-        plannedCount = Number(data.total || 0)
-        processedCount = 0
-        updateLLMProgress(
-          plannedCount > 0
-            ? t('projectDetail.preTranslate.progress.llmRunning', { processed: 0, total: plannedCount })
-            : t('projectDetail.preTranslate.progress.llmStarting'),
-          0,
-        )
-        return
-      }
+        if (event === 'start') {
+          plannedCount = Number(data.total || 0)
+          processedCount = 0
+          updateLLMProgress(
+            plannedCount > 0
+              ? t('projectDetail.preTranslate.progress.llmRunning', { processed: 0, total: plannedCount })
+              : t('projectDetail.preTranslate.progress.llmStarting'),
+            0,
+          )
+          return
+        }
 
-      if (event === 'segment' || event === 'error') {
-        processedCount += 1
-        const total = Math.max(plannedCount, processedCount)
-        const actionPercent = total > 0 ? (processedCount / total) * 100 : 0
-        updateLLMProgress(
-          t('projectDetail.preTranslate.progress.llmRunning', {
-            processed: processedCount,
-            total,
-          }),
-          actionPercent,
-        )
-        return
-      }
+        if (event === 'segment' || event === 'error') {
+          processedCount += 1
+          const total = Math.max(plannedCount, processedCount)
+          const actionPercent = total > 0 ? (processedCount / total) * 100 : 0
+          updateLLMProgress(
+            t('projectDetail.preTranslate.progress.llmRunning', {
+              processed: processedCount,
+              total,
+            }),
+            actionPercent,
+          )
+          return
+        }
 
-      if (event === 'complete') {
-        sawComplete = true
-        const total = Number(data.total || plannedCount || processedCount)
-        const updated = Number(data.updated_count || 0)
-        const error = Number(data.error_count || 0)
-        plannedCount = total
-        processedCount = Math.max(total, updated + error, processedCount)
-        updateLLMProgress(
-          total > 0
-            ? t('projectDetail.preTranslate.progress.llmDone', { updated, error })
-            : t('projectDetail.preTranslate.progress.llmSkipped'),
-          100,
-        )
-      }
-    })
+        if (event === 'complete') {
+          sawComplete = true
+          const total = Number(data.total || plannedCount || processedCount)
+          const updated = Number(data.updated_count || 0)
+          const error = Number(data.error_count || 0)
+          plannedCount = total
+          processedCount = Math.max(total, updated + error, processedCount)
+          updateLLMProgress(
+            total > 0
+              ? t('projectDetail.preTranslate.progress.llmDone', { updated, error })
+              : t('projectDetail.preTranslate.progress.llmSkipped'),
+            100,
+          )
+        }
+      },
+      (reader) => {
+        currentLLMReader.value = reader
+      },
+    )
 
     if (!sawComplete) {
       throw new Error(t('projectDetail.preTranslate.errors.llmStreamInterrupted'))
@@ -835,9 +1126,11 @@ async function runLLMForFile(fileId: string, completedActions: number, actionCou
   } finally {
     clearIdleTimer()
     currentAbortController.value = null
+    currentLLMReader.value = null
   }
 }
 
+/*
 async function startPreTranslate() {
   if (running.value || !validateBeforeStart()) {
     return
@@ -1024,55 +1317,98 @@ async function startPreTranslate() {
   }
 }
 
-function stopPreTranslate() {
+async function stopPreTranslate() {
   if (!running.value) {
     return
   }
   stopRequested.value = true
   currentAbortController.value?.abort()
-}
-
-function openTermBaseCreateDialog() {
-  showTermBaseCreateDialog.value = true
-}
-
-function openGlossaryCreateDialog() {
-  showGlossaryCreateDialog.value = true
-}
-
-async function handleTermBaseCreated(newTermBase: TermBase) {
-  showTermBaseCreateDialog.value = false
-  await loadResources()
-  if (resourceMatchesSelectedLanguagePair(newTermBase)) {
-    termBaseIds.value = normalizeResourceIds(
-      [...termBaseIds.value, newTermBase.id],
-      availableTermBases.value,
-    )
-    useTermBase.value = true
+  try {
+    await currentLLMReader.value?.cancel()
+  } catch {
+    // 忽略浏览器取消流时的竞态错误。
   }
-  pushToast({
-    tone: 'success',
-    title: t('projectDetail.preTranslate.toast.termBaseCreatedTitle'),
-    message: t('projectDetail.preTranslate.toast.termBaseCreatedMessage', { name: newTermBase.name }),
-  })
+    // 忽略浏览器取消流时的竞态错误。
+  }
+}
 }
 
-async function handleGlossaryCreated(newGlossary: GlossaryBase) {
-  showGlossaryCreateDialog.value = false
-  await loadResources()
-  if (resourceMatchesSelectedLanguagePair(newGlossary)) {
-    glossaryBaseIds.value = normalizeResourceIds(
-      [...glossaryBaseIds.value, newGlossary.id],
-      availableGlossaryBases.value,
-    )
-    useGlossary.value = true
+*/
+async function startPreTranslateTaskRun() {
+  if (running.value || !validateBeforeStart()) {
+    return
   }
-  pushToast({
-    tone: 'success',
-    title: t('projectDetail.preTranslate.toast.glossaryCreatedTitle'),
-    message: t('projectDetail.preTranslate.toast.glossaryCreatedMessage', { name: newGlossary.name }),
-  })
+
+  if (!props.projectId) {
+    errorMessage.value = t('projectDetail.preTranslate.errors.unknown')
+    return
+  }
+
+  running.value = true
+  stopRequested.value = false
+  resetProgress()
+  runFiles.value = [...props.files]
+  for (const file of runFiles.value) {
+    setFileProgress(file.id, 0, t('projectDetail.preTranslate.progress.pending'))
+  }
+
+  try {
+    const { data } = await http.post<PretranslationRunStatus>(`/projects/${props.projectId}/pretranslation-runs`, {
+      file_ids: runFiles.value.map((file) => file.id),
+      use_tm: shouldRunTm.value,
+      tm_collection_ids: selectedTmCollectionIds.value,
+      tm_threshold: normalizeTMThreshold(tmThreshold.value),
+      tm_skip_confirmed: tmSkipConfirmed.value,
+      tm_overwrite_fuzzy: tmOverwriteFuzzy.value,
+      tm_auto_confirm_exact: tmAutoConfirmExact.value,
+      use_glossary: useGlossary.value,
+      glossary_base_ids: selectedGlossaryBaseIds.value,
+      use_term_base: useTermBase.value,
+      term_base_ids: selectedTermBaseIds.value,
+      use_llm: useLlm.value,
+      llm_scope: llmScope.value,
+      llm_provider: llmProvider.value,
+      llm_model: llmModel.value || null,
+      llm_translation_unit: 'paragraph',
+      guideline_template_id: selectedGuidelineTemplateId.value || null,
+      temporary_prompt: llmGuidelines.value,
+    })
+
+    applyPretranslationRun(data)
+    if (ACTIVE_PRETRANSLATION_STATUSES.has(data.status)) {
+      startPretranslationPolling()
+      return
+    }
+    await handlePretranslationRunFinished(data)
+  } catch (error) {
+    running.value = false
+    stopPretranslationPolling()
+    const message = error instanceof Error ? error.message : t('projectDetail.preTranslate.errors.unknown')
+    errorMessage.value = message
+    pushToast({
+      tone: 'error',
+      title: t('projectDetail.preTranslate.toast.fileFailedTitle', { name: t('projectDetail.preTranslate.dialogTitle') }),
+      message,
+    })
+  }
 }
+
+async function stopPreTranslateTaskRun() {
+  if (!running.value) {
+    return
+  }
+  stopRequested.value = true
+  const taskIds = Array.from(new Set(Object.values(activeTaskIdsByFileId.value)))
+  await Promise.allSettled(taskIds.map((taskId) => (
+    http.post(`/pretranslation-tasks/${taskId}/cancel`)
+  )))
+  await pollPretranslationRun()
+}
+
+onBeforeUnmount(() => {
+  stopPretranslationPolling()
+})
+
 </script>
 
 <template>
@@ -1109,6 +1445,21 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
       </aside>
 
       <div class="ptd-flow">
+        <div
+          v-if="selectedFileLanguagePairStats.length > 0"
+          class="ptd-language-notice"
+          :class="{ 'is-warning': Boolean(languagePairIssue), 'is-info': !languagePairIssue }"
+        >
+          <div class="ptd-language-notice__head">
+            <strong>{{ selectedFileLanguagePairs.length > 1 ? '已选择混合语言对' : '已选择语言对' }}</strong>
+            <span>{{ selectedFileLanguagePairStats.map(formatLanguagePairStat).join('；') }}</span>
+          </div>
+          <p v-if="invalidLanguagePairIssue">{{ invalidLanguagePairIssue }}</p>
+          <p v-else-if="mixedLanguagePairIssue">
+            混合语言对可以使用纯 LLM 逐文件预翻译；如启用 TM、词汇表或术语库，请按语言对分批执行。
+          </p>
+        </div>
+
         <div class="ptd-section ptd-section--tm" :class="{ 'is-disabled': !useTm }">
           <div class="ptd-section__head">
             <label class="ptd-switch">
@@ -1141,6 +1492,15 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
                 />
               </label>
               <div class="ptd-resource__buttons">
+                <button
+                  class="button button--ghost ptd-resource__button ptd-resource__button--import"
+                  type="button"
+                  :disabled="running || loadingResources || Boolean(languagePairIssue)"
+                  @click="openResourceImport('tm')"
+                >
+                  <Upload :size="14" />
+                  {{ t('common.actions.import') }}
+                </button>
                 <button
                   class="button button--ghost ptd-resource__button ptd-resource__button--select"
                   type="button"
@@ -1262,13 +1622,13 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
             </label>
             <div class="ptd-resource__buttons">
               <button
-                class="button button--ghost ptd-resource__button ptd-resource__button--create"
+                class="button button--ghost ptd-resource__button ptd-resource__button--import"
                 type="button"
-                :disabled="running || loadingResources || !useGlossary || !selectedFileLanguagePair"
-                @click="openGlossaryCreateDialog"
+                :disabled="running || loadingResources || Boolean(languagePairIssue)"
+                @click="openResourceImport('glossary')"
               >
-                <Plus :size="14" />
-                {{ t('projectDetail.preTranslate.resources.create') }}
+                <Upload :size="14" />
+                {{ t('common.actions.import') }}
               </button>
               <button
                 class="button button--ghost ptd-resource__button ptd-resource__button--select"
@@ -1371,13 +1731,13 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
             </label>
             <div class="ptd-resource__buttons">
               <button
-                class="button button--ghost ptd-resource__button ptd-resource__button--create"
+                class="button button--ghost ptd-resource__button ptd-resource__button--import"
                 type="button"
-                :disabled="running || loadingResources || !useTermBase || !selectedFileLanguagePair"
-                @click="openTermBaseCreateDialog"
+                :disabled="running || loadingResources || Boolean(languagePairIssue)"
+                @click="openResourceImport('term')"
               >
-                <Plus :size="14" />
-                {{ t('projectDetail.preTranslate.resources.create') }}
+                <Upload :size="14" />
+                {{ t('common.actions.import') }}
               </button>
               <button
                 class="button button--ghost ptd-resource__button ptd-resource__button--select"
@@ -1457,6 +1817,13 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
             <span>{{ t('projectDetail.preTranslate.sections.llm') }}</span>
           </label>
         </div>
+        <div class="ptd-llm-tip" role="note">
+          <AlertTriangle :size="18" />
+          <div class="ptd-llm-tip__content">
+            <strong>{{ t('projectDetail.preTranslate.llm.modelTipTitle') }}</strong>
+            <p>{{ t('projectDetail.preTranslate.llm.modelTipBody') }}</p>
+          </div>
+        </div>
         <div class="ptd-grid ptd-grid--llm">
           <label class="field">
             <span class="field__label">{{ t('projectDetail.preTranslate.llm.provider') }}</span>
@@ -1481,6 +1848,7 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
                 {{ option.label }}
               </option>
             </select>
+            <span class="field__note">{{ t('projectDetail.preTranslate.llm.scopeHint') }}</span>
           </label>
         </div>
         <label class="field field--full">
@@ -1524,6 +1892,7 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
             :disabled="running || !useLlm"
           />
         </label>
+        <p v-if="pureLlmMixedLanguagePairNotice" class="hint-text is-warning">{{ pureLlmMixedLanguagePairNotice }}</p>
         <p class="hint-text">{{ t('projectDetail.preTranslate.llm.hint') }}</p>
       </div>
       </div>
@@ -1577,17 +1946,19 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
           </button>
           <button
             v-if="running"
-            class="button"
+            class="button button--danger"
             type="button"
-            @click="stopPreTranslate"
+            :disabled="stopRequested"
+            @click="stopPreTranslateTaskRun"
           >
-            {{ t('common.actions.stop') }}
+            <Pause :size="14" />
+            {{ t('common.actions.pause') }}
           </button>
           <button
             class="button button--primary"
             type="button"
             :disabled="running || selectedCount === 0"
-            @click="startPreTranslate"
+            @click="startPreTranslateTaskRun"
           >
             <Loader2 v-if="running" class="lucide-spin" :size="14" />
             <Sparkles v-else :size="14" />
@@ -1598,22 +1969,16 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
     </template>
   </Modal>
 
-  <ResourceCreateDialog
-    :open="showTermBaseCreateDialog"
-    resource-type="termBase"
-    :source-language="selectedFileLanguagePair?.source || ''"
-    :target-language="selectedFileLanguagePair?.target || ''"
-    @close="showTermBaseCreateDialog = false"
-    @created="handleTermBaseCreated"
-  />
-
-  <ResourceCreateDialog
-    :open="showGlossaryCreateDialog"
-    resource-type="glossary"
-    :source-language="selectedFileLanguagePair?.source || ''"
-    :target-language="selectedFileLanguagePair?.target || ''"
-    @close="showGlossaryCreateDialog = false"
-    @created="handleGlossaryCreated"
+  <ResourceImportDialog
+    :open="Boolean(activeResourceImportTab)"
+    :mode="resourceImportDialogTab"
+    :initial-tab="resourceImportDialogTab"
+    :title="resourceImportDialogTitle"
+    :context-label="resourceImportContextLabel"
+    :source-language="selectedFileLanguagePair?.source || props.sourceLanguage"
+    :target-language="selectedFileLanguagePair?.target || props.targetLanguage"
+    @close="closeResourceImport"
+    @imported="handleResourceImported"
   />
 </template>
 
@@ -1683,57 +2048,87 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
   min-width: 0;
 }
 
+.ptd-language-notice {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.ptd-language-notice.is-warning {
+  border-color: rgba(194, 120, 3, 0.3);
+  background: var(--state-warning-bg);
+}
+
+.ptd-language-notice.is-info {
+  border-color: color-mix(in srgb, var(--brand-700) 16%, var(--line-soft));
+  background: color-mix(in srgb, var(--brand-050) 48%, var(--surface-panel));
+}
+
+.ptd-language-notice__head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.ptd-language-notice__head strong {
+  color: var(--text-primary);
+}
+
+.ptd-language-notice p {
+  margin: 0;
+}
+
 .ptd-section {
   --ptd-accent: var(--brand-700);
   --ptd-accent-strong: var(--brand-700);
+  --ptd-accent-soft: color-mix(in srgb, var(--ptd-accent) 8%, transparent);
 
   display: grid;
   gap: 12px;
   align-content: start;
   min-width: 0;
   padding: 14px;
-  border: 1px solid color-mix(in srgb, var(--ptd-accent) 10%, var(--line-soft));
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 6%, var(--line-soft));
   border-radius: 8px;
-  background: color-mix(in srgb, var(--surface-panel) 96%, var(--ptd-accent) 4%);
+  background: color-mix(in srgb, var(--surface-panel) 99%, var(--ptd-accent) 1%);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease, opacity 0.2s ease, filter 0.2s ease;
 }
 
 .ptd-section--tm {
-  --ptd-accent: #0d7a68;
-  --ptd-accent-strong: var(--brand-700);
-
   order: 1;
 }
 
 .ptd-section--term {
-  --ptd-accent: #2563eb;
-  --ptd-accent-strong: #1d4ed8;
-
   order: 4;
 }
 
 .ptd-section--glossary {
-  --ptd-accent: #0891b2;
-  --ptd-accent-strong: #0e7490;
-
   order: 2;
 }
 
 .ptd-section--llm {
-  --ptd-accent: #b7791f;
-  --ptd-accent-strong: #a16207;
-
   order: 3;
 }
 
 .ptd-section.is-disabled {
   background: color-mix(in srgb, var(--surface-1) 97%, var(--ptd-accent) 3%);
-  opacity: 0.55;
-  filter: grayscale(25%);
-  transition: opacity 0.2s ease, filter 0.2s ease;
+  opacity: 0.72;
+  filter: grayscale(18%);
 }
 
 .ptd-section:not(.is-disabled) {
-  transition: opacity 0.2s ease, filter 0.2s ease;
+  border-color: color-mix(in srgb, var(--ptd-accent) 16%, var(--line-soft));
+  box-shadow: 0 8px 18px color-mix(in srgb, var(--ptd-accent) 5%, transparent);
+  filter: none;
 }
 
 .ptd-section__head {
@@ -1743,9 +2138,18 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
   gap: 12px;
   margin: -4px -4px 0;
   padding: 9px 10px;
-  border: 1px solid color-mix(in srgb, var(--ptd-accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 6%, var(--line-soft));
   border-radius: 8px;
-  background: color-mix(in srgb, var(--surface-panel) 94%, var(--ptd-accent) 6%);
+  background: color-mix(in srgb, var(--surface-panel) 98%, var(--ptd-accent) 2%);
+}
+
+.ptd-section:not(.is-disabled) .ptd-section__head {
+  border-color: color-mix(in srgb, var(--ptd-accent) 14%, var(--line-soft));
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--surface-panel) 94%, var(--ptd-accent) 6%),
+    color-mix(in srgb, var(--surface-panel) 98%, var(--ptd-accent) 2%)
+  );
 }
 
 .ptd-section__icon {
@@ -1753,9 +2157,9 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
   place-items: center;
   width: 30px;
   height: 30px;
-  border: 1px solid color-mix(in srgb, var(--ptd-accent) 16%, var(--line-soft));
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 9%, var(--line-soft));
   border-radius: 6px;
-  background: color-mix(in srgb, var(--surface-panel) 88%, var(--ptd-accent) 12%);
+  background: color-mix(in srgb, var(--surface-panel) 95%, var(--ptd-accent) 5%);
   color: var(--ptd-accent-strong);
 }
 
@@ -1764,7 +2168,66 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
   font-size: 13px;
 }
 
+.ptd-section--llm.is-disabled {
+  opacity: 1;
+  filter: none;
+}
+
+.ptd-section--llm.is-disabled .ptd-grid--llm,
+.ptd-section--llm.is-disabled .field--full,
+.ptd-section--llm.is-disabled > .hint-text {
+  opacity: 0.72;
+  filter: grayscale(18%);
+}
+
+.ptd-llm-tip {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 1px solid rgba(194, 120, 3, 0.34);
+  border-left: 4px solid var(--state-warning);
+  border-radius: 8px;
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--state-warning-bg) 78%, var(--surface-panel) 22%),
+      color-mix(in srgb, var(--surface-panel) 96%, var(--state-warning) 4%)
+    ),
+    var(--state-warning-bg);
+  box-shadow: 0 8px 18px rgba(194, 120, 3, 0.12);
+}
+
+.ptd-llm-tip svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--state-warning);
+}
+
+.ptd-llm-tip__content {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.ptd-llm-tip strong {
+  color: color-mix(in srgb, var(--state-warning) 72%, var(--text-primary));
+  font-size: 14px;
+}
+
+.ptd-llm-tip p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 .ptd-switch {
+  --ptd-switch-off: color-mix(in srgb, var(--state-danger) 64%, var(--text-muted) 36%);
+  --ptd-switch-off-strong: color-mix(in srgb, var(--state-danger) 76%, var(--text-secondary) 24%);
+  --ptd-switch-on: var(--brand-500);
+  --ptd-switch-on-strong: var(--brand-700);
+
   display: inline-flex;
   gap: 10px;
   align-items: center;
@@ -1781,16 +2244,24 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
 
 .ptd-switch__control {
   position: relative;
-  width: 34px;
-  height: 20px;
-  border: 1px solid var(--line-strong);
+  width: 46px;
+  height: 26px;
+  border: 1px solid var(--ptd-switch-off-strong);
   border-radius: 999px;
-  background: var(--surface-muted);
+  background: linear-gradient(
+    135deg,
+    var(--ptd-switch-off-strong),
+    color-mix(in srgb, var(--ptd-switch-off) 62%, var(--surface-panel) 38%)
+  );
   flex-shrink: 0;
+  box-shadow:
+    inset 0 1px 2px rgba(17, 49, 42, 0.12),
+    0 0 0 2px color-mix(in srgb, var(--ptd-switch-off) 7%, transparent);
+  transition: background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
 }
 
 .ptd-switch__control::before {
-  content: '✕';
+  content: '\2715';
   position: absolute;
   top: 50%;
   right: 5px;
@@ -1798,43 +2269,51 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
   font-size: 9px;
   font-weight: 600;
   line-height: 1;
-  color: var(--text-muted);
-  opacity: 0.7;
+  color: rgba(255, 255, 255, 0.82);
+  opacity: 0.9;
   transition: opacity 0.18s ease;
 }
 
 .ptd-switch__control::after {
   content: '';
   position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 14px;
-  height: 14px;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
   border-radius: 999px;
-  background: var(--text-muted);
-  transition: transform 0.18s ease, background 0.18s ease;
+  background: #ffffff;
+  box-shadow: 0 2px 5px rgba(15, 23, 42, 0.24);
+  transition: transform 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
 }
 
 .ptd-switch input:checked + .ptd-switch__control {
-  border-color: var(--ptd-accent-strong);
-  background: color-mix(in srgb, var(--surface-panel) 76%, var(--ptd-accent) 24%);
+  border-color: var(--ptd-switch-on-strong);
+  background: linear-gradient(
+    135deg,
+    var(--ptd-switch-on-strong),
+    color-mix(in srgb, var(--ptd-switch-on) 76%, #ffffff 24%)
+  );
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--ptd-switch-on) 12%, transparent),
+    0 6px 14px color-mix(in srgb, var(--ptd-switch-on) 12%, transparent);
 }
 
 .ptd-switch input:checked + .ptd-switch__control::before {
-  content: '✓';
+  content: '\2713';
   right: auto;
-  left: 5px;
-  color: var(--ptd-accent-strong);
+  left: 6px;
+  color: rgba(255, 255, 255, 0.94);
   opacity: 1;
 }
 
 .ptd-switch input:checked + .ptd-switch__control::after {
-  background: var(--ptd-accent-strong);
-  transform: translateX(14px);
+  background: #ffffff;
+  transform: translateX(20px);
 }
 
 .ptd-switch input:focus-visible + .ptd-switch__control {
-  outline: 2px solid rgba(13, 122, 104, 0.18);
+  outline: 2px solid color-mix(in srgb, var(--brand-700) 24%, transparent);
   outline-offset: 2px;
 }
 
@@ -1856,9 +2335,9 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
   display: grid;
   gap: 10px;
   padding: 10px;
-  border: 1px solid color-mix(in srgb, var(--ptd-accent) 8%, var(--line-soft));
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 5%, var(--line-soft));
   border-radius: 8px;
-  background: color-mix(in srgb, var(--surface-1) 96%, var(--ptd-accent) 4%);
+  background: color-mix(in srgb, var(--surface-1) 99%, var(--ptd-accent) 1%);
 }
 
 .ptd-resource__topline,
@@ -1877,9 +2356,9 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
 }
 
 .ptd-resource__topline .tag {
-  border-color: color-mix(in srgb, var(--ptd-accent) 10%, var(--line-soft));
-  background: color-mix(in srgb, var(--surface-panel) 90%, var(--ptd-accent) 10%);
-  color: color-mix(in srgb, var(--ptd-accent-strong) 76%, var(--text-secondary));
+  border-color: color-mix(in srgb, var(--ptd-accent) 6%, var(--line-soft));
+  background: color-mix(in srgb, var(--surface-panel) 96%, var(--ptd-accent) 4%);
+  color: color-mix(in srgb, var(--ptd-accent-strong) 50%, var(--text-secondary));
 }
 
 .ptd-resource__toolbar {
@@ -1895,7 +2374,7 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
   gap: 8px;
   height: 40px;
   padding: 0 11px;
-  border: 1px solid color-mix(in srgb, var(--ptd-accent) 7%, var(--line-soft));
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 5%, var(--line-soft));
   border-radius: 8px;
   background: var(--surface-1);
   color: var(--text-muted);
@@ -1903,8 +2382,8 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
 }
 
 .ptd-resource-search:focus-within {
-  border-color: color-mix(in srgb, var(--ptd-accent) 52%, var(--line-strong));
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ptd-accent) 10%, transparent);
+  border-color: color-mix(in srgb, var(--ptd-accent) 34%, var(--line-strong));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ptd-accent) 7%, transparent);
 }
 
 .ptd-resource-search input {
@@ -1939,40 +2418,40 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
   height: 13px;
 }
 
+.ptd-resource__button--import {
+  border-color: color-mix(in srgb, var(--ptd-accent) 18%, var(--line-soft));
+  background: color-mix(in srgb, var(--surface-panel) 94%, var(--ptd-accent) 6%);
+  color: var(--ptd-accent-strong);
+  font-weight: 600;
+}
+
+.ptd-resource__button--import:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--ptd-accent) 28%, var(--line-strong));
+  background: color-mix(in srgb, var(--surface-panel) 90%, var(--ptd-accent) 10%);
+}
+
 .ptd-resource__button--select {
-  border-color: color-mix(in srgb, var(--ptd-accent) 14%, var(--line-soft));
-  background: color-mix(in srgb, var(--surface-panel) 92%, var(--ptd-accent) 8%);
-  color: color-mix(in srgb, var(--ptd-accent-strong) 52%, var(--text-secondary));
+  border-color: color-mix(in srgb, var(--ptd-accent) 8%, var(--line-soft));
+  background: color-mix(in srgb, var(--surface-panel) 98%, var(--ptd-accent) 2%);
+  color: color-mix(in srgb, var(--ptd-accent-strong) 42%, var(--text-secondary));
 }
 
 .ptd-resource__button--select:not(:disabled):hover {
-  border-color: color-mix(in srgb, var(--ptd-accent) 28%, var(--line-strong));
-  background: color-mix(in srgb, var(--surface-panel) 86%, var(--ptd-accent) 14%);
-  color: color-mix(in srgb, var(--ptd-accent-strong) 72%, var(--text-primary));
+  border-color: color-mix(in srgb, var(--ptd-accent) 18%, var(--line-strong));
+  background: color-mix(in srgb, var(--surface-panel) 94%, var(--ptd-accent) 6%);
+  color: color-mix(in srgb, var(--ptd-accent-strong) 58%, var(--text-primary));
 }
 
 .ptd-resource__button--clear {
-  border-color: color-mix(in srgb, var(--state-danger) 12%, var(--line-soft));
-  background: color-mix(in srgb, var(--surface-panel) 82%, var(--state-danger-bg) 18%);
-  color: color-mix(in srgb, var(--state-danger) 58%, var(--text-secondary));
+  border-color: color-mix(in srgb, var(--state-danger) 8%, var(--line-soft));
+  background: color-mix(in srgb, var(--surface-panel) 92%, var(--state-danger-bg) 8%);
+  color: color-mix(in srgb, var(--state-danger) 42%, var(--text-secondary));
 }
 
 .ptd-resource__button--clear:not(:disabled):hover {
-  border-color: color-mix(in srgb, var(--state-danger) 28%, var(--line-strong));
-  background: color-mix(in srgb, var(--surface-panel) 66%, var(--state-danger-bg) 34%);
-  color: var(--state-danger);
-}
-
-.ptd-resource__button--create {
-  border-color: color-mix(in srgb, var(--state-success) 14%, var(--line-soft));
-  background: color-mix(in srgb, var(--surface-panel) 88%, var(--state-success-bg) 12%);
-  color: color-mix(in srgb, var(--state-success) 72%, var(--text-secondary));
-}
-
-.ptd-resource__button--create:not(:disabled):hover {
-  border-color: color-mix(in srgb, var(--state-success) 28%, var(--line-strong));
-  background: color-mix(in srgb, var(--surface-panel) 76%, var(--state-success-bg) 24%);
-  color: var(--state-success);
+  border-color: color-mix(in srgb, var(--state-danger) 18%, var(--line-strong));
+  background: color-mix(in srgb, var(--surface-panel) 86%, var(--state-danger-bg) 14%);
+  color: color-mix(in srgb, var(--state-danger) 68%, var(--text-primary));
 }
 
 .ptd-resource__note {
@@ -1987,9 +2466,9 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
   max-height: 246px;
   overflow: auto;
   padding: 8px;
-  border: 1px solid color-mix(in srgb, var(--ptd-accent) 7%, var(--line-soft));
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 5%, var(--line-soft));
   border-radius: 8px;
-  background: color-mix(in srgb, var(--surface-panel) 95%, var(--ptd-accent) 5%);
+  background: color-mix(in srgb, var(--surface-panel) 99%, var(--ptd-accent) 1%);
 }
 
 .ptd-resource-item {
@@ -2000,7 +2479,7 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
   align-items: center;
   min-height: 62px;
   padding: 11px 12px;
-  border: 1px solid color-mix(in srgb, var(--ptd-accent) 6%, var(--line-soft));
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 4%, var(--line-soft));
   border-radius: 8px;
   background: var(--surface-1);
   cursor: pointer;
@@ -2008,13 +2487,13 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
 }
 
 .ptd-resource-item:hover {
-  border-color: color-mix(in srgb, var(--ptd-accent) 18%, var(--line-soft));
-  background: color-mix(in srgb, var(--surface-panel) 94%, var(--ptd-accent) 6%);
+  border-color: color-mix(in srgb, var(--ptd-accent) 12%, var(--line-soft));
+  background: color-mix(in srgb, var(--surface-panel) 97%, var(--ptd-accent) 3%);
 }
 
 .ptd-resource-item.is-selected {
-  border-color: color-mix(in srgb, var(--ptd-accent) 34%, var(--line-strong));
-  background: color-mix(in srgb, var(--surface-panel) 90%, var(--ptd-accent) 10%);
+  border-color: color-mix(in srgb, var(--ptd-accent) 22%, var(--line-strong));
+  background: color-mix(in srgb, var(--surface-panel) 96%, var(--ptd-accent) 4%);
   box-shadow: inset 3px 0 0 var(--ptd-accent-strong);
 }
 
@@ -2034,7 +2513,7 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
   place-items: center;
   width: 22px;
   height: 22px;
-  border: 1px solid color-mix(in srgb, var(--ptd-accent) 10%, var(--line-strong));
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 7%, var(--line-strong));
   border-radius: 6px;
   color: transparent;
   background: var(--surface-panel);
@@ -2075,10 +2554,10 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
 .ptd-resource-item__count {
   align-self: center;
   padding: 4px 7px;
-  border: 1px solid color-mix(in srgb, var(--ptd-accent) 7%, var(--line-soft));
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 5%, var(--line-soft));
   border-radius: 999px;
-  background: color-mix(in srgb, var(--surface-muted) 90%, var(--ptd-accent) 10%);
-  color: color-mix(in srgb, var(--ptd-accent-strong) 40%, var(--text-secondary));
+  background: color-mix(in srgb, var(--surface-muted) 97%, var(--ptd-accent) 3%);
+  color: color-mix(in srgb, var(--ptd-accent-strong) 32%, var(--text-secondary));
   font-size: 12px;
   line-height: 1;
   white-space: nowrap;
@@ -2116,9 +2595,9 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
   white-space: nowrap;
   padding: 4px 8px;
   border-radius: 6px;
-  border: 1px solid color-mix(in srgb, var(--ptd-accent) 9%, transparent);
-  background: color-mix(in srgb, var(--surface-panel) 88%, var(--ptd-accent) 12%);
-  color: color-mix(in srgb, var(--ptd-accent-strong) 72%, var(--text-secondary));
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 7%, var(--line-soft));
+  background: color-mix(in srgb, var(--surface-panel) 96%, var(--ptd-accent) 4%);
+  color: color-mix(in srgb, var(--ptd-accent-strong) 54%, var(--text-secondary));
   font-size: 12px;
 }
 
@@ -2138,9 +2617,9 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
   flex-wrap: wrap;
   gap: 8px 14px;
   padding: 10px;
-  border: 1px solid color-mix(in srgb, var(--ptd-accent) 7%, var(--line-soft));
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 5%, var(--line-soft));
   border-radius: 8px;
-  background: color-mix(in srgb, var(--surface-1) 96%, var(--ptd-accent) 4%);
+  background: color-mix(in srgb, var(--surface-1) 99%, var(--ptd-accent) 1%);
   color: var(--text-secondary);
   font-size: 13px;
 }
@@ -2159,9 +2638,9 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
 .ptd-section .field {
   min-width: 0;
   padding: 10px;
-  border: 1px solid color-mix(in srgb, var(--ptd-accent) 7%, var(--line-soft));
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 5%, var(--line-soft));
   border-radius: 8px;
-  background: color-mix(in srgb, var(--surface-1) 96%, var(--ptd-accent) 4%);
+  background: color-mix(in srgb, var(--surface-1) 99%, var(--ptd-accent) 1%);
 }
 
 .ptd-section .field__label {
@@ -2169,16 +2648,28 @@ async function handleGlossaryCreated(newGlossary: GlossaryBase) {
   max-width: 100%;
   padding: 2px 7px;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--surface-panel) 92%, var(--ptd-accent) 8%);
-  color: color-mix(in srgb, var(--ptd-accent-strong) 45%, var(--text-secondary));
+  background: color-mix(in srgb, var(--surface-panel) 97%, var(--ptd-accent) 3%);
+  color: color-mix(in srgb, var(--ptd-accent-strong) 36%, var(--text-secondary));
   font-weight: 600;
+}
+
+.ptd-section .field__note {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  line-height: 1.45;
 }
 
 .ptd-section .hint-text {
   padding: 9px 10px;
-  border: 1px solid color-mix(in srgb, var(--ptd-accent) 6%, var(--line-soft));
+  border: 1px solid color-mix(in srgb, var(--ptd-accent) 5%, var(--line-soft));
   border-radius: 8px;
-  background: color-mix(in srgb, var(--surface-1) 97%, var(--ptd-accent) 3%);
+  background: color-mix(in srgb, var(--surface-1) 99%, var(--ptd-accent) 1%);
+}
+
+.ptd-section .hint-text.is-warning {
+  border-color: rgba(194, 120, 3, 0.28);
+  background: var(--state-warning-bg);
+  color: var(--state-warning);
 }
 
 .ptd-progress {

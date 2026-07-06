@@ -31,7 +31,7 @@ import type { PaginatedResponse, TermBase, TermEntryRecord, TMCollection, TMEntr
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 
 type ResourceMode = 'tm' | 'term'
-type ExportFormat = 'xlsx' | 'tmx'
+type ExportFormat = 'xlsx' | 'tmx' | 'tbx'
 type ResourceRecord = TMCollection | TermBase
 type EntryRecord = TMEntryRecord | TermEntryRecord
 
@@ -40,7 +40,7 @@ interface ResourceExportTask {
   resource_type: ResourceMode
   resource_id: string
   format: ExportFormat
-  status: 'queued' | 'running' | 'completed' | 'failed'
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'canceling' | 'canceled'
   progress: number
   message: string
   result: {
@@ -85,7 +85,12 @@ const showExportMenu = ref(false)
 const showIndexColumn = ref(true)
 const showSourceColumn = ref(true)
 const showTargetColumn = ref(true)
+const showCreatorColumn = ref(true)
+const showCreatedAtColumn = ref(true)
+const showLastModifiedByColumn = ref(true)
+const showUpdatedAtColumn = ref(true)
 const exportProgress = ref(0)
+const currentExportTaskId = ref('')
 const newSourceText = ref('')
 const newTargetText = ref('')
 const editingEntryId = ref('')
@@ -121,6 +126,7 @@ const copy = computed(() => {
       createEndpoint: `/translation-memory/collections/${props.id}/entries`,
       createExportEndpoint: `/translation-memory/collections/${props.id}/exports`,
       exportTaskEndpoint: (taskId: string) => `/translation-memory/export-tasks/${taskId}`,
+      exportCancelEndpoint: (taskId: string) => `/translation-memory/export-tasks/${taskId}/cancel`,
       exportDownloadEndpoint: (taskId: string) => `/translation-memory/export-tasks/${taskId}/download`,
       updateEntryEndpoint: (entryId: string) => `/translation-memory/entries/${entryId}`,
       deleteEntryEndpoint: (entryId: string) => `/translation-memory/entries/${entryId}`,
@@ -151,6 +157,7 @@ const copy = computed(() => {
     createEndpoint: `/term-bases/${props.id}/entries`,
     createExportEndpoint: `/term-bases/${props.id}/exports`,
     exportTaskEndpoint: (taskId: string) => `/term-bases/export-tasks/${taskId}`,
+    exportCancelEndpoint: (taskId: string) => `/term-bases/export-tasks/${taskId}/cancel`,
     exportDownloadEndpoint: (taskId: string) => `/term-bases/export-tasks/${taskId}/download`,
     updateEntryEndpoint: (entryId: string) => `/term-entries/${entryId}`,
     deleteEntryEndpoint: (entryId: string) => `/term-entries/${entryId}`,
@@ -166,6 +173,8 @@ const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
 const canManageResources = computed(() => authStore.isAdmin)
 const tableColumnCount = computed(() => (
   Number(showIndexColumn.value) + Number(showSourceColumn.value) + Number(showTargetColumn.value)
+  + Number(showCreatorColumn.value) + Number(showCreatedAtColumn.value)
+  + Number(showLastModifiedByColumn.value) + Number(showUpdatedAtColumn.value)
   + Number(canManageResources.value)
 ))
 const entryCount = computed(() => resource.value?.entry_count ?? totalEntries.value)
@@ -233,7 +242,7 @@ function getErrorMessage(error: unknown, fallback: string) {
 }
 
 function getExportFormatLabel(format: ExportFormat) {
-  return format === 'xlsx' ? 'Excel' : 'TMX'
+  return format === 'xlsx' ? 'Excel' : (format === 'tmx' ? 'TMX' : 'TBX')
 }
 
 function getExportFilename(format: ExportFormat) {
@@ -437,6 +446,7 @@ async function deleteEntry(entry: EntryRecord) {
 
 async function waitForExportTask(task: ResourceExportTask) {
   let currentTask = task
+  currentExportTaskId.value = task.task_id
   while (!disposed) {
     exportProgress.value = currentTask.progress
     entryMessage.value = currentTask.message || '导出任务处理中。'
@@ -447,12 +457,23 @@ async function waitForExportTask(task: ResourceExportTask) {
     if (currentTask.status === 'failed') {
       throw new Error(currentTask.error || currentTask.message || '导出失败。')
     }
+    if (currentTask.status === 'canceled') {
+      throw new DOMException(currentTask.message || '导出已取消。', 'AbortError')
+    }
 
     await waitForExportPoll(1200)
     const { data } = await http.get<ResourceExportTask>(copy.value.exportTaskEndpoint(currentTask.task_id))
     currentTask = data
   }
   throw new Error('导出任务已取消。')
+}
+
+async function cancelCurrentExport() {
+  if (!currentExportTaskId.value) {
+    return
+  }
+  entryMessage.value = '正在停止导出...'
+  await http.post(copy.value.exportCancelEndpoint(currentExportTaskId.value)).catch(() => undefined)
 }
 
 async function exportEntries(format: ExportFormat) {
@@ -481,15 +502,18 @@ async function exportEntries(format: ExportFormat) {
     downloadBlob(response.data, filename)
     entryMessage.value = `${copy.value.entryName}已导出为 ${formatLabel}。`
   } catch (error) {
-    entryMessage.value = getErrorMessage(error, `${copy.value.entryName}导出失败。`)
+    entryMessage.value = error instanceof DOMException && error.name === 'AbortError'
+      ? `${copy.value.entryName}导出已停止。`
+      : getErrorMessage(error, `${copy.value.entryName}导出失败。`)
   } finally {
     clearExportPollTimer()
     exportingEntries.value = false
     exportProgress.value = 0
+    currentExportTaskId.value = ''
   }
 }
 
-async function handleImported(payload: { tab: 'tm' | 'term' }) {
+async function handleImported(payload: { tab: 'tm' | 'glossary' | 'term' }) {
   if (payload.tab !== copy.value.importTab) {
     return
   }
@@ -584,8 +608,21 @@ onUnmounted(() => {
               <FileCode2 :size="14" />
               TMX
             </button>
+            <button v-if="props.mode === 'term'" type="button" @click="exportEntries('tbx')">
+              <FileCode2 :size="14" />
+              TBX
+            </button>
           </div>
         </div>
+        <button
+          v-if="exportingEntries"
+          class="resource-detail-button resource-detail-button--danger"
+          type="button"
+          @click="cancelCurrentExport"
+        >
+          <X :size="14" />
+          停止导出
+        </button>
         <button class="resource-detail-icon-button" type="button" title="更多">
           <ChevronDown :size="16" />
         </button>
@@ -661,6 +698,22 @@ onUnmounted(() => {
                 <input v-model="showTargetColumn" type="checkbox" />
                 {{ targetLanguageLabel }}
               </label>
+              <label>
+                <input v-model="showCreatorColumn" type="checkbox" />
+                创建人
+              </label>
+              <label>
+                <input v-model="showCreatedAtColumn" type="checkbox" />
+                创建时间
+              </label>
+              <label>
+                <input v-model="showLastModifiedByColumn" type="checkbox" />
+                最后修改人
+              </label>
+              <label>
+                <input v-model="showUpdatedAtColumn" type="checkbox" />
+                最新修改时间
+              </label>
             </div>
           </div>
         </div>
@@ -680,6 +733,10 @@ onUnmounted(() => {
                 <th v-if="showIndexColumn" class="resource-detail-table__index">序号</th>
                 <th v-if="showSourceColumn">{{ sourceLanguageLabel }}</th>
                 <th v-if="showTargetColumn">{{ targetLanguageLabel }}</th>
+                <th v-if="showCreatorColumn" class="resource-detail-table__meta">创建人</th>
+                <th v-if="showCreatedAtColumn" class="resource-detail-table__datetime">创建时间</th>
+                <th v-if="showLastModifiedByColumn" class="resource-detail-table__meta">最后修改人</th>
+                <th v-if="showUpdatedAtColumn" class="resource-detail-table__datetime">最新修改时间</th>
                 <th v-if="canManageResources" class="resource-detail-table__actions">操作</th>
               </tr>
             </thead>
@@ -718,6 +775,18 @@ onUnmounted(() => {
                     :aria-label="`编辑${copy.targetLabel}`"
                   />
                   <span v-else>{{ entry.target_text }}</span>
+                </td>
+                <td v-if="showCreatorColumn" class="resource-detail-table__meta">
+                  {{ entry.creator_name || '-' }}
+                </td>
+                <td v-if="showCreatedAtColumn" class="resource-detail-table__datetime">
+                  {{ formatDate(entry.created_at) }}
+                </td>
+                <td v-if="showLastModifiedByColumn" class="resource-detail-table__meta">
+                  {{ entry.last_modified_by_name || '-' }}
+                </td>
+                <td v-if="showUpdatedAtColumn" class="resource-detail-table__datetime">
+                  {{ formatDate(entry.updated_at) }}
                 </td>
                 <td v-if="canManageResources" class="resource-detail-table__actions">
                   <div v-if="isEditingEntry(entry)" class="resource-detail-row-actions">
@@ -922,6 +991,12 @@ onUnmounted(() => {
   color: #ffffff;
 }
 
+.resource-detail-button--danger {
+  border-color: var(--state-danger);
+  background: color-mix(in srgb, var(--state-danger) 9%, var(--button-bg));
+  color: var(--state-danger);
+}
+
 .resource-detail-back:hover,
 .resource-detail-button:hover:not(:disabled),
 .resource-detail-icon-button:hover,
@@ -935,6 +1010,12 @@ onUnmounted(() => {
   border-color: #0b6b5b;
   background: #0b6b5b;
   color: #ffffff;
+}
+
+.resource-detail-button--danger:hover:not(:disabled) {
+  border-color: var(--state-danger);
+  background: color-mix(in srgb, var(--state-danger) 14%, var(--button-bg));
+  color: var(--state-danger);
 }
 
 .resource-detail-button:disabled {
@@ -1137,7 +1218,7 @@ onUnmounted(() => {
 
 .resource-detail-table {
   width: 100%;
-  min-width: 720px;
+  min-width: 1120px;
   border-collapse: collapse;
   table-layout: fixed;
   font-size: 13px;
@@ -1173,6 +1254,14 @@ onUnmounted(() => {
 .resource-detail-table__index {
   width: 48px;
   text-align: center !important;
+}
+
+.resource-detail-table__meta {
+  width: 112px;
+}
+
+.resource-detail-table__datetime {
+  width: 152px;
 }
 
 .resource-detail-table__actions {

@@ -182,7 +182,7 @@ def update_issue_marker(
         normalized_status = _normalize_status(status)
         marker.status = normalized_status
         if normalized_status == "resolved":
-            marker.resolved_at = datetime.utcnow()
+            marker.resolved_at = datetime.now()
             marker.resolved_by_id = current_user.id
         else:
             marker.resolved_at = None

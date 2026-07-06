@@ -29,6 +29,7 @@ TRANSLATOR_TYPES = {INTERNAL_TRANSLATOR_TYPE, EXTERNAL_TRANSLATOR_TYPE}
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+_users_table_exists_cache = False
 
 
 def is_super_admin_role(role: str | None) -> bool:
@@ -70,10 +71,16 @@ def normalize_translator_type(translator_type: str | None, role: str | None) -> 
 
 
 def users_table_exists() -> bool:
+    global _users_table_exists_cache
+    if _users_table_exists_cache:
+        return True
     try:
-        return inspect(engine).has_table(User.__tablename__)
+        exists = inspect(engine).has_table(User.__tablename__)
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail=f"无法检查 users 表状态：{exc}") from exc
+    if exists:
+        _users_table_exists_cache = True
+    return exists
 
 
 def require_users_table() -> None:
