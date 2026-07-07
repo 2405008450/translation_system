@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.auth import get_current_user, get_user_display_name, require_admin, require_resource_creator
 from app.config import get_settings
@@ -183,6 +183,31 @@ def _serialize_glossary_entry(entry: GlossaryEntry) -> dict:
         "created_at": entry.created_at.isoformat(),
         "updated_at": entry.updated_at.isoformat(),
     }
+
+
+def _apply_glossary_entry_sort(query, sort_by: str | None, sort_order: str | None):
+    order = "asc" if sort_order == "asc" else "desc"
+    sort_columns = {
+        "source_text": GlossaryEntry.source_text,
+        "target_text": GlossaryEntry.target_text,
+        "note": GlossaryEntry.note,
+        "created_at": GlossaryEntry.created_at,
+        "updated_at": GlossaryEntry.updated_at,
+    }
+    if sort_by in sort_columns:
+        column = sort_columns[sort_by]
+        return query.order_by(column.asc() if order == "asc" else column.desc(), GlossaryEntry.id.asc())
+    if sort_by == "creator_name":
+        creator = aliased(User)
+        column = func.coalesce(creator.nickname, creator.username, "")
+        query = query.outerjoin(creator, GlossaryEntry.creator_id == creator.id)
+        return query.order_by(column.asc() if order == "asc" else column.desc(), GlossaryEntry.id.asc())
+    if sort_by == "last_modified_by_name":
+        modifier = aliased(User)
+        column = func.coalesce(modifier.nickname, modifier.username, "")
+        query = query.outerjoin(modifier, GlossaryEntry.last_modified_by_id == modifier.id)
+        return query.order_by(column.asc() if order == "asc" else column.desc(), GlossaryEntry.id.asc())
+    return query.order_by(GlossaryEntry.updated_at.desc(), GlossaryEntry.created_at.desc())
 
 
 def _load_bound_glossary_base_ids(file_record: FileRecord) -> list[str]:
@@ -607,6 +632,8 @@ def list_glossary_entries(
     limit: int = 50,
     search: str | None = None,
     case_sensitive: bool = False,
+    sort_by: str | None = None,
+    sort_order: str | None = "desc",
     db: Session = Depends(get_db),
 ):
     glossary_base = _get_glossary_base_or_404(db, glossary_base_id)
@@ -624,8 +651,7 @@ def list_glossary_entries(
 
     total = query.count()
     rows = (
-        query
-        .order_by(GlossaryEntry.updated_at.desc(), GlossaryEntry.created_at.desc())
+        _apply_glossary_entry_sort(query, sort_by, sort_order)
         .offset(safe_skip)
         .limit(safe_limit)
         .all()

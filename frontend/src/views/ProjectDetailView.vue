@@ -71,6 +71,7 @@ import {
   type FileExportOption,
 } from '../utils/exportOptions'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
+import { matchesSearchKeyword, normalizeSearchKeyword, splitSearchKeywords } from '../utils/search'
 import type {
   DocumentParseMode,
   DocumentParseOptions,
@@ -308,6 +309,14 @@ const DEFAULT_DOCUMENT_PARSE_OPTIONS: DocumentParseOptions = {
 }
 
 const DEFAULT_UPLOAD_MAX_SIZE_MB = 100
+const PROJECT_FILE_SORT_KEYS = new Set<string>([
+  'filename',
+  'progress',
+  'pretranslation_progress',
+  'taskManage',
+  'status',
+  'open_issue_count',
+])
 
 const DOCUMENT_STATISTIC_NUMBER_KEYS: DocumentStatisticNumberKey[] = [
   'pages',
@@ -372,6 +381,13 @@ interface LanguageDetectResponse {
 }
 
 type ProjectRow = ProjectFileItem | Record<string, any>
+type ProjectFileSortKey =
+  | 'filename'
+  | 'progress'
+  | 'pretranslation_progress'
+  | 'taskManage'
+  | 'status'
+  | 'open_issue_count'
 type FileExportStatus = 'queued' | 'running' | 'completed' | 'failed'
 interface FileExportTask {
   task_id: string
@@ -472,6 +488,8 @@ const fileSelectionRangeStart = ref('1')
 const fileSelectionRangeEnd = ref('1')
 const fileSelectionRangeError = ref('')
 const fileSearchQuery = ref('')
+const fileSortKey = ref<ProjectFileSortKey | ''>('')
+const fileSortOrder = ref<'asc' | 'desc'>('asc')
 const fileStatusFilter = ref('all')
 const fileLanguagePairFilter = ref('all')
 const fileAssigneeFilter = ref('all')
@@ -896,13 +914,13 @@ const hasFileFilters = computed(() => (
   || fileAssigneeFilter.value !== 'all'
 ))
 const filteredTableRows = computed<ProjectFileItem[]>(() => {
-  const keywords = normalizeFileFilterKeyword(fileSearchQuery.value).split(/\s+/).filter(Boolean)
+  const keywords = splitSearchKeywords(fileSearchQuery.value)
   let rows = [...tableRows.value]
 
   if (keywords.length > 0) {
     rows = rows.filter((file) => {
       const text = getFileSearchText(file)
-      return keywords.every((keyword) => text.includes(keyword))
+      return keywords.every((keyword) => matchesSearchKeyword(text, keyword, { minSubsequenceLength: 3 }))
     })
   }
 
@@ -918,6 +936,10 @@ const filteredTableRows = computed<ProjectFileItem[]>(() => {
     rows = rows.filter((file) => getFileAssigneeIds(file).length === 0)
   } else if (fileAssigneeFilter.value !== 'all') {
     rows = rows.filter((file) => getFileAssigneeIds(file).includes(fileAssigneeFilter.value))
+  }
+
+  if (fileSortKey.value) {
+    rows.sort(compareProjectFileRows)
   }
 
   return rows
@@ -1229,12 +1251,12 @@ const projectExportButtonTitle = computed(() => {
 })
 
 const columns = computed<DataTableColumn[]>(() => ([
-  { key: 'filename', label: t('projectDetail.files.columns.details'), width: '300px' },
-  { key: 'progress', label: t('projectDetail.files.columns.progress'), width: '150px' },
-  { key: 'pretranslation_progress', label: t('projectDetail.files.columns.pretranslationProgress'), width: '150px' },
-  { key: 'taskManage', label: t('projectDetail.files.columns.task'), width: '140px' },
-  { key: 'status', label: t('projectDetail.files.columns.status'), width: '100px' },
-  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '90px' },
+  { key: 'filename', label: t('projectDetail.files.columns.details'), width: '300px', sortable: true },
+  { key: 'progress', label: t('projectDetail.files.columns.progress'), width: '150px', sortable: true },
+  { key: 'pretranslation_progress', label: t('projectDetail.files.columns.pretranslationProgress'), width: '150px', sortable: true },
+  { key: 'taskManage', label: t('projectDetail.files.columns.task'), width: '140px', sortable: true },
+  { key: 'status', label: t('projectDetail.files.columns.status'), width: '100px', sortable: true },
+  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '90px', sortable: true },
 ]))
 
 const statisticsFileColumns = computed<DataTableColumn[]>(() => ([
@@ -1465,7 +1487,7 @@ function normalizeAssignmentKeyword(value: string | null | undefined) {
 }
 
 function normalizeFileFilterKeyword(value: string | null | undefined) {
-  return String(value || '').trim().toLowerCase()
+  return normalizeSearchKeyword(value)
 }
 
 function getFileLanguagePairKey(row: ProjectRow) {
@@ -1507,18 +1529,77 @@ function getFileAssigneeIds(row: ProjectRow) {
 function getFileSearchText(row: ProjectRow) {
   return [
     row.filename,
-    row.status,
-    row.status ? formatStatus(String(row.status)) : '',
     getFileLanguagePairLabel(row),
     row.source_language,
     row.target_language,
     getLanguageLabel(row.source_language),
     getLanguageLabel(row.target_language),
     getAssigneeLabel(row),
+    ...getFileAssignees(row).flatMap((user) => [
+      user.nickname,
+      user.username,
+      user.translator_type,
+    ]),
+    row.assignee_id,
     row.creator,
-    formatBytes(row.file_size_bytes),
-    formatDateText(row.created_at),
   ].map(normalizeFileFilterKeyword).join(' ')
+}
+
+function isProjectFileSortKey(key: string): key is ProjectFileSortKey {
+  return PROJECT_FILE_SORT_KEYS.has(key)
+}
+
+function getProjectFileNumberSortValue(value: unknown) {
+  const number = Number(value ?? 0)
+  return Number.isFinite(number) ? number : 0
+}
+
+function getProjectFileSortValue(row: ProjectRow, key: ProjectFileSortKey) {
+  switch (key) {
+    case 'filename':
+      return row.filename || ''
+    case 'progress':
+      return getFileDisplayProgress(row)
+    case 'pretranslation_progress':
+      return getFilePretranslationProgress(row)
+    case 'taskManage':
+      return getAssigneeLabel(row)
+    case 'status':
+      return row.status ? formatStatus(String(row.status)) : ''
+    case 'open_issue_count':
+      return getProjectFileNumberSortValue(row.open_issue_count)
+    default:
+      return ''
+  }
+}
+
+function compareProjectFileRows(left: ProjectFileItem, right: ProjectFileItem) {
+  const key = fileSortKey.value
+  if (!key) {
+    return 0
+  }
+
+  const leftValue = getProjectFileSortValue(left, key)
+  const rightValue = getProjectFileSortValue(right, key)
+  const direction = fileSortOrder.value === 'asc' ? 1 : -1
+  if (typeof leftValue === 'number' && typeof rightValue === 'number') {
+    return (leftValue - rightValue) * direction
+  }
+  return String(leftValue ?? '').localeCompare(String(rightValue ?? ''), 'zh-CN', {
+    numeric: true,
+    sensitivity: 'base',
+  }) * direction
+}
+
+function handleFileSort(key: string, order: 'asc' | 'desc') {
+  if (!isProjectFileSortKey(key)) {
+    return
+  }
+  fileSortKey.value = key
+  fileSortOrder.value = order
+  currentPage.value = 1
+  closeFileSelectionMenu()
+  closeActionMenu()
 }
 
 function resetFileFilters() {
@@ -6859,9 +6940,12 @@ onBeforeUnmount(() => {
           :loading="loading"
           :selectable="true"
           :selected-ids="selectedFileIds"
+          :sort-key="fileSortKey"
+          :sort-order="fileSortOrder"
           :show-index="true"
           :index-offset="indexOffset"
           :empty-text="fileTableEmptyText"
+          @sort="handleFileSort"
           @select="selectedFileIds = $event"
         >
           <template #filename="{ row }">

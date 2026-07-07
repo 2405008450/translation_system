@@ -14417,6 +14417,30 @@ def _serialize_tm_entry(entry: TranslationMemory) -> dict:
     }
 
 
+def _apply_tm_entry_sort(query, sort_by: str | None, sort_order: str | None):
+    order = "asc" if sort_order == "asc" else "desc"
+    sort_columns = {
+        "source_text": TranslationMemory.source_text,
+        "target_text": TranslationMemory.target_text,
+        "created_at": TranslationMemory.created_at,
+        "updated_at": TranslationMemory.updated_at,
+    }
+    if sort_by in sort_columns:
+        column = sort_columns[sort_by]
+        return query.order_by(column.asc() if order == "asc" else column.desc(), TranslationMemory.id.asc())
+    if sort_by == "creator_name":
+        creator = aliased(User)
+        column = func.coalesce(creator.nickname, creator.username, "")
+        query = query.outerjoin(creator, TranslationMemory.creator_id == creator.id)
+        return query.order_by(column.asc() if order == "asc" else column.desc(), TranslationMemory.id.asc())
+    if sort_by == "last_modified_by_name":
+        modifier = aliased(User)
+        column = func.coalesce(modifier.nickname, modifier.username, "")
+        query = query.outerjoin(modifier, TranslationMemory.last_modified_by_id == modifier.id)
+        return query.order_by(column.asc() if order == "asc" else column.desc(), TranslationMemory.id.asc())
+    return query.order_by(TranslationMemory.updated_at.desc(), TranslationMemory.created_at.desc())
+
+
 def _require_tm_entry_owner_or_admin(entry: TranslationMemory, current_user: User) -> None:
     if can_access_all_projects(current_user):
         return
@@ -15366,6 +15390,8 @@ def list_tm_collection_entries(
     limit: int = 50,
     search: str | None = None,
     case_sensitive: bool = False,
+    sort_by: str | None = None,
+    sort_order: str | None = "desc",
     db: Session = Depends(get_db),
 ):
     collection = _get_collection_or_404(db, collection_id)
@@ -15398,8 +15424,7 @@ def list_tm_collection_entries(
 
     total = query.count()
     rows = (
-        query
-        .order_by(TranslationMemory.updated_at.desc(), TranslationMemory.created_at.desc())
+        _apply_tm_entry_sort(query, sort_by, sort_order)
         .offset(safe_skip)
         .limit(safe_limit)
         .all()

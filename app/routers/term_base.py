@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.auth import (
     can_access_all_projects,
@@ -221,6 +221,30 @@ def _serialize_term_entry(entry: TermEntry) -> dict:
         "created_at": entry.created_at.isoformat(),
         "updated_at": entry.updated_at.isoformat(),
     }
+
+
+def _apply_term_entry_sort(query, sort_by: str | None, sort_order: str | None):
+    order = "asc" if sort_order == "asc" else "desc"
+    sort_columns = {
+        "source_text": TermEntry.source_text,
+        "target_text": TermEntry.target_text,
+        "created_at": TermEntry.created_at,
+        "updated_at": TermEntry.updated_at,
+    }
+    if sort_by in sort_columns:
+        column = sort_columns[sort_by]
+        return query.order_by(column.asc() if order == "asc" else column.desc(), TermEntry.id.asc())
+    if sort_by == "creator_name":
+        creator = aliased(User)
+        column = func.coalesce(creator.nickname, creator.username, "")
+        query = query.outerjoin(creator, TermEntry.creator_id == creator.id)
+        return query.order_by(column.asc() if order == "asc" else column.desc(), TermEntry.id.asc())
+    if sort_by == "last_modified_by_name":
+        modifier = aliased(User)
+        column = func.coalesce(modifier.nickname, modifier.username, "")
+        query = query.outerjoin(modifier, TermEntry.last_modified_by_id == modifier.id)
+        return query.order_by(column.asc() if order == "asc" else column.desc(), TermEntry.id.asc())
+    return query.order_by(TermEntry.updated_at.desc(), TermEntry.created_at.desc())
 
 
 def _require_term_entry_owner_or_admin(entry: TermEntry, current_user: User) -> None:
@@ -1096,6 +1120,8 @@ def list_term_base_entries(
     limit: int = 50,
     search: str | None = None,
     case_sensitive: bool = False,
+    sort_by: str | None = None,
+    sort_order: str | None = "desc",
     db: Session = Depends(get_db),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
@@ -1125,8 +1151,7 @@ def list_term_base_entries(
 
     total = query.count()
     rows = (
-        query
-        .order_by(TermEntry.updated_at.desc(), TermEntry.created_at.desc())
+        _apply_term_entry_sort(query, sort_by, sort_order)
         .offset(safe_skip)
         .limit(safe_limit)
         .all()

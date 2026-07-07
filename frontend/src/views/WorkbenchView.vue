@@ -101,6 +101,10 @@ import {
   isProgressComplete,
   patchTranslationWorkflowProgress,
 } from '../utils/progress'
+import {
+  matchesSearchKeyword as matchesSharedSearchKeyword,
+  normalizeSearchText as normalizeSharedSearchText,
+} from '../utils/search'
 import { hasTermTextMatch } from '../utils/termMatching'
 import { consumeLLMStream } from '../utils/llmStream'
 import { useAuthStore } from '../stores/auth'
@@ -1976,12 +1980,7 @@ function resolveLiteralSearchKeyword(value: string) {
 }
 
 function normalizeSearchText(value: string, caseSensitive = searchCaseSensitive.value) {
-  const keyword = resolveLiteralSearchKeyword(value)
-  return caseSensitive ? keyword : keyword.toLocaleLowerCase()
-}
-
-function normalizeFuzzySearchText(value: string, caseSensitive = searchCaseSensitive.value) {
-  return normalizeSearchText(value, caseSensitive).replace(/[\s.,，。;；:：'"“”‘’!?！？()[\]{}<>《》、\\/|_-]+/g, '')
+  return normalizeSharedSearchText(resolveLiteralSearchKeyword(value), { caseSensitive })
 }
 
 function buildSourceSearchableText(segment: Segment) {
@@ -1999,32 +1998,15 @@ function getSegmentCopyableSourceText(segment: Segment) {
   return segment.display_text || segment.source_text || ''
 }
 
-function isSubsequenceMatch(value: string, keyword: string) {
-  const normalizedValue = normalizeFuzzySearchText(value)
-  const normalizedKeyword = normalizeFuzzySearchText(keyword)
-  if (!normalizedKeyword) {
-    return !resolveLiteralSearchKeyword(keyword)
-  }
-
-  let cursor = 0
-  for (const char of normalizedValue) {
-    if (char === normalizedKeyword[cursor]) {
-      cursor += 1
-      if (cursor >= normalizedKeyword.length) {
-        return true
-      }
-    }
-  }
-  return false
-}
-
 function matchesSearchKeyword(value: string, keyword: string) {
   if (!keyword) {
     return true
   }
-  const normalizedValue = normalizeSearchText(value)
-  return normalizedValue.includes(keyword)
-    || (searchFuzzyEnabled.value && isSubsequenceMatch(value, keyword))
+  return matchesSharedSearchKeyword(value, keyword, {
+    caseSensitive: searchCaseSensitive.value,
+    fuzzy: searchFuzzyEnabled.value,
+    minSubsequenceLength: 1,
+  })
 }
 
 const normalizedSourceSearchQuery = computed(() => normalizeSearchText(sourceSearchQuery.value))
