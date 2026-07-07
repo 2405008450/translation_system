@@ -519,20 +519,33 @@ def _resolve_export_segment_block_key(
     source_segment_by_text_key: Mapping[str, Mapping[str, Any]],
 ) -> BlockKey:
     sentence_id = str(_get_segment_value(segment, "sentence_id", "") or "")
-    source_segment = source_segment_by_sentence_id.get(sentence_id)
-    if source_segment is None:
-        for text_key in _segment_text_keys(
-            _get_segment_value(segment, "source_text", ""),
-            _get_segment_value(segment, "display_text", ""),
-        ):
-            source_segment = source_segment_by_text_key.get(text_key)
-            if source_segment is not None:
-                break
+    source_segment_by_id = source_segment_by_sentence_id.get(sentence_id)
+    source_segment_by_text = _find_source_segment_by_export_text(
+        segment,
+        source_segment_by_text_key,
+    )
 
-    if source_segment is None:
+    if source_segment_by_text is not None and (
+        source_segment_by_id is None
+        or not _export_segment_text_matches_source_segment(segment, source_segment_by_id)
+    ):
+        return _source_segment_block_key(source_segment_by_text)
+
+    if source_segment_by_id is None:
         return fallback
 
-    return _source_segment_block_key(source_segment)
+    return _source_segment_block_key(source_segment_by_id)
+
+
+def _find_source_segment_by_export_text(
+    segment: Any,
+    source_segment_by_text_key: Mapping[str, Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    for text_key in _export_segment_text_keys_from_any(segment):
+        source_segment = source_segment_by_text_key.get(text_key)
+        if source_segment is not None:
+            return source_segment
+    return None
 
 
 def _order_segment_groups_by_source(
@@ -574,7 +587,16 @@ def _order_export_segments_for_source_block(
             block_segments,
             source_segment,
             used_indexes,
+            require_text_compatibility=True,
         )
+        if match_index is None:
+            match_index = _find_unique_export_segment_by_text(block_segments, source_segment, used_indexes)
+        if match_index is None:
+            match_index = _find_export_segment_by_sentence_id(
+                block_segments,
+                source_segment,
+                used_indexes,
+            )
         if match_index is None:
             match_index = _find_export_segment_by_text(block_segments, source_segment, used_indexes)
         if match_index is None:
@@ -594,6 +616,7 @@ def _find_export_segment_by_sentence_id(
     block_segments: list[ExportSegment],
     source_segment: Mapping[str, Any],
     used_indexes: set[int],
+    require_text_compatibility: bool = False,
 ) -> int | None:
     sentence_id = str(source_segment.get("sentence_id") or "")
     if not sentence_id:
@@ -603,8 +626,27 @@ def _find_export_segment_by_sentence_id(
         if index in used_indexes:
             continue
         if segment.sentence_id == sentence_id:
+            if require_text_compatibility and not _export_segment_text_matches_source_segment(segment, source_segment):
+                continue
             return index
     return None
+
+
+def _find_unique_export_segment_by_text(
+    block_segments: list[ExportSegment],
+    source_segment: Mapping[str, Any],
+    used_indexes: set[int],
+) -> int | None:
+    source_keys = _source_segment_text_keys(source_segment)
+    if not source_keys:
+        return None
+
+    matches = [
+        index
+        for index, segment in enumerate(block_segments)
+        if index not in used_indexes and source_keys & _export_segment_text_keys(segment)
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _find_export_segment_by_text(
@@ -633,6 +675,26 @@ def _source_segment_text_keys(segment: Mapping[str, Any]) -> set[str]:
 
 def _export_segment_text_keys(segment: ExportSegment) -> set[str]:
     return _segment_text_keys(segment.source_text, segment.display_text)
+
+
+def _export_segment_text_keys_from_any(segment: Any) -> set[str]:
+    if isinstance(segment, ExportSegment):
+        return _export_segment_text_keys(segment)
+    return _segment_text_keys(
+        _get_segment_value(segment, "source_text", ""),
+        _get_segment_value(segment, "display_text", ""),
+    )
+
+
+def _export_segment_text_matches_source_segment(
+    segment: Any,
+    source_segment: Mapping[str, Any],
+) -> bool:
+    source_keys = _source_segment_text_keys(source_segment)
+    export_keys = _export_segment_text_keys_from_any(segment)
+    if not source_keys or not export_keys:
+        return True
+    return bool(source_keys & export_keys)
 
 
 def _segment_text_keys(*values: object) -> set[str]:
@@ -1887,7 +1949,8 @@ def _replace_block_tokens(
     if not spans and normalize_text(display_text):
         spans = [_build_trimmed_span(display_text)]
 
-    segment_index = 0
+    used_segment_indexes: set[int] = set()
+    fallback_segment_index = 0
     previous_replacement = ""
     previous_span: SentenceSpan | None = None
     for span in spans:
@@ -1895,11 +1958,24 @@ def _replace_block_tokens(
         if not sentence_source:
             continue
 
-        if segment_index >= len(segments):
+        match_index = _find_export_segment_index_for_span_source(
+            segments=segments,
+            sentence_source=sentence_source,
+            used_indexes=used_segment_indexes,
+            preferred_index=fallback_segment_index,
+        )
+        if match_index is None:
+            match_index = _next_unused_segment_index(segments, used_segment_indexes, fallback_segment_index)
+        if match_index is None:
             break
 
-        segment = segments[segment_index]
-        segment_index += 1
+        used_segment_indexes.add(match_index)
+        fallback_segment_index = _next_unused_segment_index(
+            segments,
+            used_segment_indexes,
+            fallback_segment_index,
+        ) or len(segments)
+        segment = segments[match_index]
         replacement = _resolve_segment_replacement_text(segment)
         if previous_span is not None:
             boundary_text = display_text[previous_span.end:span.start]
@@ -1939,6 +2015,47 @@ def _replace_block_tokens(
         previous_span = span
 
     _apply_token_edits(tokens)
+
+
+def _find_export_segment_index_for_span_source(
+    *,
+    segments: list[ExportSegment],
+    sentence_source: str,
+    used_indexes: set[int],
+    preferred_index: int,
+) -> int | None:
+    if (
+        0 <= preferred_index < len(segments)
+        and preferred_index not in used_indexes
+        and _export_segment_matches_source_text(segments[preferred_index], sentence_source)
+    ):
+        return preferred_index
+
+    matches = [
+        index
+        for index, segment in enumerate(segments)
+        if index not in used_indexes and _export_segment_matches_source_text(segment, sentence_source)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _next_unused_segment_index(
+    segments: list[ExportSegment],
+    used_indexes: set[int],
+    start_index: int,
+) -> int | None:
+    index = max(start_index, 0)
+    while index < len(segments):
+        if index not in used_indexes:
+            return index
+        index += 1
+    return None
+
+
+def _export_segment_matches_source_text(segment: ExportSegment, sentence_source: str) -> bool:
+    if not sentence_source:
+        return False
+    return sentence_source in _export_segment_text_keys(segment)
 
 
 def _is_target_placeholder(text: str | None) -> bool:
