@@ -91,6 +91,8 @@ class Settings(BaseSettings):
     tm_vector_weight: float = 0.35
     tm_fuzzy_match_batch_size: int = 50
     tm_match_statement_timeout_ms: int = 45000
+    tm_search_projection_enabled: bool = False
+    tm_search_projection_fallback_enabled: bool = True
     jwt_secret_key: str = DEFAULT_JWT_SECRET_KEY
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 1440
