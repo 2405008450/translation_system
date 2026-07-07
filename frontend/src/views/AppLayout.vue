@@ -13,9 +13,11 @@ import {
   Moon,
   PanelLeft,
   PanelLeftClose,
+  Quote,
   Settings,
   Sun,
   Users,
+  Wrench,
 } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -64,6 +66,7 @@ const unreadNotificationCount = ref(0)
 
 const expandedGroups = reactive<Record<string, boolean>>({
   assets: true,
+  tools: true,
   system: true,
 })
 
@@ -117,6 +120,20 @@ const navGroups = computed<NavGroup[]>(() => [
         name: 'translation-rules',
         label: t('shell.sections.translationRules'),
         icon: FileText,
+        visible: true,
+      },
+    ],
+  },
+  {
+    key: 'tools',
+    label: t('shell.sections.tools'),
+    icon: Wrench,
+    visible: true,
+    children: [
+      {
+        name: 'tools-quote-converter',
+        label: t('shell.sections.quoteConverter'),
+        icon: Quote,
         visible: true,
       },
     ],
@@ -219,6 +236,11 @@ const breadcrumbs = computed(() => {
       return [
         { label: t('shell.sections.assets') },
         { label: t('shell.sections.translationRules') },
+      ]
+    case 'tools-quote-converter':
+      return [
+        { label: t('shell.sections.tools') },
+        { label: t('shell.sections.quoteConverter') },
       ]
     case 'term-base-edit':
       return [
@@ -429,6 +451,9 @@ watch(() => route.meta.navSection, (section) => {
   }
   if (section === 'users' || section === 'assignment-events') {
     expandedGroups.system = true
+  }
+  if (section === 'tools-quote-converter') {
+    expandedGroups.tools = true
   }
 })
 

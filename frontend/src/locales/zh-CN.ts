@@ -92,6 +92,10 @@ export default {
       title: '指派记录',
       description: '查看项目和文件任务的指派、授权和取消记录',
     },
+    quoteConverter: {
+      title: '引号转换',
+      description: '批量转换文档中的引号形状与宽度，支持纯文本、Office 文档和 HTML',
+    },
   },
     shell: {
     mainNav: '主导航',
@@ -107,6 +111,8 @@ export default {
       system: '系统',
       users: '用户管理',
       assignmentEvents: '指派记录',
+      tools: '文档工具',
+      quoteConverter: '引号转换',
     },
     recent: {
       title: '最近打开',
@@ -1604,5 +1610,47 @@ export default {
     adminDesc: '可导入 TM、创建用户、删除任务',
     user: '普通用户',
     userDesc: '可登录、上传文档、编辑句段、执行翻译流程',
+  },
+  quoteConverter: {
+    title: '引号转换',
+    description: '批量转换文档中的引号形状与宽度，支持纯文本、Office 文档和 HTML；DOCX 会保留字体归属。',
+    breadcrumbTools: '文档工具',
+    fileSection: '文件',
+    filePlaceholder: '未选择文件',
+    chooseFile: '选择文件',
+    fileAccept: '支持 .txt / .md / .markdown / .srt / .rtf / .docx / .xlsx / .pptx / .html / .htm',
+    scopeSection: '处理范围',
+    targetSection: '转换目标',
+    widthLabel: '宽度',
+    shapeLabel: '形状',
+    scopeWidth: {
+      all: '全部',
+      half: '半角',
+      full: '全角',
+    },
+    scopeShape: {
+      all: '全部',
+      straight: '直引号',
+      curly: '弯引号',
+    },
+    targetWidth: {
+      half: '半角',
+      full: '全角',
+    },
+    targetShape: {
+      curly: '弯引号',
+      straight: '直引号',
+    },
+    convert: '开始转换',
+    converting: '转换中...',
+    hint: '选择"半角"处理范围时，目标宽度会自动切换为"全角"，反之亦然；转换完成后会直接下载新文件。',
+    errors: {
+      fileRequired: '请选择要转换的文件。',
+      unsupported: '不支持的文件类型，请选择 txt/md/markdown/srt/rtf/docx/xlsx/pptx/html/htm。',
+      convertFailed: '转换失败，请稍后重试。',
+    },
+    messages: {
+      success: '已生成转换后的文件：{name}',
+    },
   },
 } as const

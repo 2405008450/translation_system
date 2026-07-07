@@ -97,6 +97,10 @@ const overrides = {
       title: 'Assignment Records',
       description: 'View project and file assignment, authorization, and cancellation records',
     },
+    quoteConverter: {
+      title: 'Quote Converter',
+      description: 'Batch convert quote shape and width across plain text, Office documents, and HTML',
+    },
   },
   shell: {
     mainNav: 'Main navigation',
@@ -112,6 +116,8 @@ const overrides = {
       system: 'System',
       users: 'User Management',
       assignmentEvents: 'Assignment Records',
+      tools: 'Document Tools',
+      quoteConverter: 'Quote Converter',
     },
     recent: {
       title: 'Recent',
@@ -591,6 +597,48 @@ const overrides = {
   language: {
     uiChinese: '中文',
     uiEnglish: 'English',
+  },
+  quoteConverter: {
+    title: 'Quote Converter',
+    description: 'Batch convert quote shape and width across plain text, Office documents, and HTML; DOCX keeps original font mapping.',
+    breadcrumbTools: 'Document Tools',
+    fileSection: 'File',
+    filePlaceholder: 'No file selected',
+    chooseFile: 'Choose file',
+    fileAccept: 'Accepts .txt / .md / .markdown / .srt / .rtf / .docx / .xlsx / .pptx / .html / .htm',
+    scopeSection: 'Scope',
+    targetSection: 'Target',
+    widthLabel: 'Width',
+    shapeLabel: 'Shape',
+    scopeWidth: {
+      all: 'All',
+      half: 'Half-width',
+      full: 'Full-width',
+    },
+    scopeShape: {
+      all: 'All',
+      straight: 'Straight',
+      curly: 'Curly',
+    },
+    targetWidth: {
+      half: 'Half-width',
+      full: 'Full-width',
+    },
+    targetShape: {
+      curly: 'Curly',
+      straight: 'Straight',
+    },
+    convert: 'Convert',
+    converting: 'Converting...',
+    hint: 'Selecting a half-width scope auto-switches the target width to full-width and vice versa. The converted file downloads automatically.',
+    errors: {
+      fileRequired: 'Please choose a file to convert.',
+      unsupported: 'Unsupported file type. Choose txt/md/markdown/srt/rtf/docx/xlsx/pptx/html/htm.',
+      convertFailed: 'Conversion failed. Please try again later.',
+    },
+    messages: {
+      success: 'Converted file ready: {name}',
+    },
   },
 } satisfies LocaleTree
 

@@ -15,6 +15,7 @@ import TermBaseEditView from '../views/TermBaseEditView.vue'
 import TermBaseView from '../views/TermBaseView.vue'
 import TMCollectionEditView from '../views/TMCollectionEditView.vue'
 import TMManagementView from '../views/TMManagementView.vue'
+import QuoteConverterView from '../views/QuoteConverterView.vue'
 import TranslationRulesView from '../views/TranslationRulesView.vue'
 import UserManagementView from '../views/UserManagementView.vue'
 import WorkbenchView from '../views/WorkbenchView.vue'
@@ -256,6 +257,18 @@ const router = createRouter({
             pageTitleKey: 'pages.termBaseEdit.title',
             pageDescriptionKey: 'pages.termBaseEdit.description',
             hidePageHeader: true,
+          },
+        },
+        {
+          path: 'tools/quote-converter',
+          name: 'tools-quote-converter',
+          component: QuoteConverterView,
+          meta: {
+            navSection: 'tools-quote-converter',
+            pageTitle: '引号转换',
+            pageDescription: '批量转换 TXT 或 DOCX 文档中的引号形状与宽度',
+            pageTitleKey: 'pages.quoteConverter.title',
+            pageDescriptionKey: 'pages.quoteConverter.description',
           },
         },
         {
