@@ -1845,6 +1845,16 @@ class TranslationMemory(Base):
             postgresql_using="gin",
             postgresql_ops={"source_normalized": "gin_trgm_ops"},
         ),
+        Index(
+            "ix_memory_entries_lang_collection_source_normalized_trgm",
+            "source_language",
+            "target_language",
+            "collection_id",
+            "source_normalized",
+            postgresql_using="gin",
+            postgresql_ops={"source_normalized": "gin_trgm_ops"},
+            postgresql_where=text("source_normalized IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

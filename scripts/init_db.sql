@@ -20,6 +20,7 @@
 -- =============================================================================
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS btree_gin;
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- -----------------------------------------------------------------------------
@@ -176,6 +177,10 @@ CREATE INDEX IF NOT EXISTS ix_memory_entries_source_text_trgm
 CREATE INDEX IF NOT EXISTS ix_memory_entries_source_normalized_trgm
     ON memory_entries
     USING GIN (source_normalized gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS ix_memory_entries_lang_collection_source_normalized_trgm
+    ON memory_entries
+    USING GIN (source_language, target_language, collection_id, source_normalized gin_trgm_ops)
+    WHERE source_normalized IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_memory_entries_source_embedding_version
     ON memory_entries (source_embedding_version);
 CREATE INDEX IF NOT EXISTS ix_memory_entries_source_embedding_ivfflat

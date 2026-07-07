@@ -214,6 +214,8 @@ def create_file_record_with_segments(
     similarity_threshold: float = 0.6,
     workspace_data: dict | None = None,
     collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
     document_parse_options: dict[str, object] | str | None = None,
 ) -> FileRecord:
@@ -228,6 +230,8 @@ def create_file_record_with_segments(
             filename=filename,
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
+            source_language=source_language,
+            target_language=target_language,
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
         )
@@ -479,6 +483,8 @@ def create_file_record_via_adapter(
     filename: str,
     similarity_threshold: float = 0.6,
     collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
 ) -> FileRecord:
     """通过适配器系统创建文件记录（支持多格式）"""
     from app.services.adapters import get_registry, extract_segments
@@ -513,6 +519,8 @@ def create_file_record_via_adapter(
             auxiliary_sentences=source_texts,
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
+            source_language=source_language,
+            target_language=target_language,
         )
         for seg_data, match in zip(segments_data, match_results):
             seg_data["status"] = match.status
@@ -668,6 +676,8 @@ def attach_source_document_to_file_record(
         filename=source_filename,
         similarity_threshold=similarity_threshold,
         collection_ids=collection_ids,
+        source_language=file_record.source_language,
+        target_language=file_record.target_language,
         document_parse_mode=document_parse_mode,
         document_parse_options=document_parse_options,
     )

@@ -591,6 +591,8 @@ def build_task_workspace(
     filename: str,
     similarity_threshold: float,
     collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
     document_parse_options: dict[str, object] | str | None = None,
 ) -> dict[str, Any]:
@@ -612,6 +614,8 @@ def build_task_workspace(
             raw_bytes=parse_bytes,
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
+            source_language=source_language,
+            target_language=target_language,
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
         )
@@ -638,6 +642,8 @@ def build_task_workspace(
         similarity_threshold=similarity_threshold,
         auxiliary_sentences=auxiliary_sentences,
         collection_ids=collection_ids,
+        source_language=source_language,
+        target_language=target_language,
     )
 
     segments: list[dict[str, Any]] = []

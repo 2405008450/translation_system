@@ -707,6 +707,8 @@ def build_docx_workspace(
     similarity_threshold: float = 0.6,
     include_matches: bool = True,
     collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
     document_parse_options: Mapping[str, object] | str | None = None,
 ) -> dict:
@@ -730,6 +732,8 @@ def build_docx_workspace(
             ],
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
+            source_language=source_language,
+            target_language=target_language,
         )
         for segment, match in zip(segments, match_results):
             segment["status"] = match.status

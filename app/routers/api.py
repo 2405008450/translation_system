@@ -391,6 +391,8 @@ def _build_task_workspace_with_new_session(
     filename: str,
     similarity_threshold: float,
     collection_ids: list[UUID] | None,
+    source_language: str | None,
+    target_language: str | None,
     document_parse_mode: str,
     document_parse_options: dict[str, object] | str | None = None,
 ) -> dict:
@@ -401,6 +403,8 @@ def _build_task_workspace_with_new_session(
             filename=filename,
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
+            source_language=source_language,
+            target_language=target_language,
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
         )
@@ -411,6 +415,8 @@ async def _build_task_workspace_async(
     filename: str,
     similarity_threshold: float,
     collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
     document_parse_options: dict[str, object] | str | None = None,
 ) -> dict:
@@ -423,6 +429,8 @@ async def _build_task_workspace_async(
             filename=filename,
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
+            source_language=source_language,
+            target_language=target_language,
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
         ),
@@ -894,6 +902,8 @@ def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[st
         filename=filename,
         similarity_threshold=threshold,
         collection_ids=selected_collection_ids,
+        source_language=resolved_source_language,
+        target_language=resolved_target_language,
         document_parse_mode=document_parse_mode,
         document_parse_options=document_parse_options,
     )
@@ -1134,6 +1144,8 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
             filename=filename,
             similarity_threshold=threshold,
             collection_ids=selected_collection_ids,
+            source_language=resolved_source_language,
+            target_language=resolved_target_language,
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
         )
@@ -2819,6 +2831,10 @@ def _load_document_match_analysis_for_files(
         file_record.id: tuple(_load_file_record_collection_ids(file_record))
         for file_record in files
     }
+    language_pair_by_file_id = {
+        file_record.id: (file_record.source_language, file_record.target_language)
+        for file_record in files
+    }
 
     segments = (
         db.query(
@@ -2836,6 +2852,7 @@ def _load_document_match_analysis_for_files(
         .all()
     )
     for file_record_id, source_text, display_text, source_word_count in segments:
+        source_language, target_language = language_pair_by_file_id.get(file_record_id, (None, None))
         file_segments.setdefault(file_record_id, []).append(
             DocumentMatchSegment(
                 file_id=file_record_id,
@@ -2843,6 +2860,8 @@ def _load_document_match_analysis_for_files(
                 display_text=display_text or "",
                 source_word_count=int(source_word_count or 0),
                 collection_ids=collection_ids_by_file_id.get(file_record_id, ()),
+                source_language=source_language,
+                target_language=target_language,
             )
         )
 
@@ -2864,6 +2883,10 @@ def _load_pretranslation_match_analysis_segments_for_files(
         return file_segments, skipped_confirmed
 
     selected_collection_ids = tuple(dict.fromkeys(collection_ids))
+    language_pair_by_file_id = {
+        file_record.id: (file_record.source_language, file_record.target_language)
+        for file_record in files
+    }
     segments = (
         db.query(
             Segment.file_record_id,
@@ -2886,6 +2909,7 @@ def _load_pretranslation_match_analysis_segments_for_files(
             skipped_confirmed["segment_count"] += 1
             skipped_confirmed["word_count"] += word_count
             continue
+        source_language, target_language = language_pair_by_file_id.get(file_record_id, (None, None))
         file_segments.setdefault(file_record_id, []).append(
             DocumentMatchSegment(
                 file_id=file_record_id,
@@ -2893,6 +2917,8 @@ def _load_pretranslation_match_analysis_segments_for_files(
                 display_text=display_text or "",
                 source_word_count=word_count,
                 collection_ids=selected_collection_ids,
+                source_language=source_language,
+                target_language=target_language,
             )
         )
 
@@ -10937,6 +10963,8 @@ def get_segment_tm_candidates(
                 threshold if threshold is not None else getattr(file_record, "tm_match_threshold", None),
             ),
             collection_ids=collection_ids,
+            source_language=file_record.source_language,
+            target_language=file_record.target_language,
             top_n=max_candidates,
         )
     except OperationalError as exc:
@@ -11055,6 +11083,8 @@ def rematch_file_record(
             auxiliary_sentences=auxiliary_sentences,
             similarity_threshold=threshold,
             collection_ids=selected_collection_ids,
+            source_language=source_language,
+            target_language=target_language,
         )
     else:
         matches = []

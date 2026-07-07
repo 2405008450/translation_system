@@ -151,7 +151,8 @@ def run_auto_tm_background_once() -> None:
                 processed_count += batch_count
                 if batch_count < AUTO_TM_BATCH_SIZE:
                     break
-            process_due_auto_tm_rematches(db, force=processed_count > 0)
+            force_rematch = bool(getattr(settings, "auto_tm_rematch_force_immediate", False))
+            process_due_auto_tm_rematches(db, force=force_rematch and processed_count > 0)
         except Exception:
             logger.exception("auto TM background task failed")
 
@@ -159,7 +160,7 @@ def run_auto_tm_background_once() -> None:
 def run_auto_tm_rematch_background_once() -> None:
     with SessionLocal() as db:
         try:
-            process_due_auto_tm_rematches(db, force=True)
+            process_due_auto_tm_rematches(db, force=False)
         except Exception:
             logger.exception("auto TM rematch background task failed")
 
@@ -223,7 +224,8 @@ def process_due_auto_tm_rematches(db: Session, *, force: bool = False, max_files
     if max_files is None:
         max_files = int(getattr(settings, "auto_tm_rematch_max_files_per_run", 10) or 0)
     now = datetime.now()
-    cutoff = now - AUTO_TM_REMATCH_AGE
+    cutoff = now - _get_auto_tm_rematch_age(settings)
+    count_threshold = _get_auto_tm_rematch_count_threshold(settings)
     candidates = (
         db.query(AutoTMRematchQueue)
         .filter(AutoTMRematchQueue.status == "pending")
@@ -241,7 +243,7 @@ def process_due_auto_tm_rematches(db: Session, *, force: bool = False, max_files
                 or queue.last_pending_at is not None
             )
         )
-        or queue.pending_entry_count >= AUTO_TM_REMATCH_COUNT_THRESHOLD
+        or queue.pending_entry_count >= count_threshold
         or (queue.first_pending_at is not None and queue.first_pending_at <= cutoff)
     ]
     if max_files and max_files > 0:
@@ -255,6 +257,7 @@ def process_due_auto_tm_rematches(db: Session, *, force: bool = False, max_files
             updated_count = refresh_unconfirmed_segment_matches(
                 db,
                 file_record_id=queue.file_record_id,
+                include_fuzzy=_get_auto_tm_rematch_enable_fuzzy(settings),
             )
             queue.pending_entry_count = 0
             queue.first_pending_at = None
@@ -281,6 +284,7 @@ def refresh_unconfirmed_segment_matches(
     file_record_id: UUID,
     collection_id: UUID | None = None,
     collection_ids: list[UUID] | None = None,
+    include_fuzzy: bool | None = None,
 ) -> int:
     settings = get_settings()
     file_record = db.query(FileRecord).filter(FileRecord.id == file_record_id).first()
@@ -301,6 +305,8 @@ def refresh_unconfirmed_segment_matches(
     )
     similarity_threshold = min(max(similarity_threshold, 0.5), 1.0)
     clean_numbering = is_word_document_filename(file_record.filename)
+    include_fuzzy = _get_auto_tm_rematch_enable_fuzzy(settings) if include_fuzzy is None else bool(include_fuzzy)
+    chunk_size = _get_auto_tm_rematch_chunk_size(settings)
 
     updated_count = 0
     offset = 0
@@ -318,7 +324,7 @@ def refresh_unconfirmed_segment_matches(
                 Segment.sentence_id.asc(),
             )
             .offset(offset)
-            .limit(AUTO_TM_REMATCH_CHUNK_SIZE)
+            .limit(chunk_size)
             .all()
         )
         if not segments:
@@ -332,9 +338,14 @@ def refresh_unconfirmed_segment_matches(
             auxiliary_sentences=auxiliary_sentences,
             similarity_threshold=similarity_threshold,
             collection_ids=selected_collection_ids,
+            source_language=file_record.source_language,
+            target_language=file_record.target_language,
+            include_fuzzy=include_fuzzy,
         )
 
         for segment, match in zip(segments, matches, strict=False):
+            if not include_fuzzy and match.status != "exact":
+                continue
             before = (
                 segment.target_text,
                 segment.target_html,
@@ -392,7 +403,7 @@ def refresh_unconfirmed_segment_matches(
                 updated_count += 1
 
         db.flush()
-        offset += AUTO_TM_REMATCH_CHUNK_SIZE
+        offset += chunk_size
 
     return updated_count
 
@@ -581,6 +592,30 @@ def _load_file_record_collection_ids(file_record: FileRecord) -> list[UUID]:
     if not parsed_ids and file_record.collection_id:
         parsed_ids.append(file_record.collection_id)
     return list(dict.fromkeys(parsed_ids))
+
+
+def _get_auto_tm_rematch_enable_fuzzy(settings=None) -> bool:
+    settings = settings or get_settings()
+    return bool(getattr(settings, "auto_tm_rematch_enable_fuzzy", False))
+
+
+def _get_auto_tm_rematch_count_threshold(settings=None) -> int:
+    settings = settings or get_settings()
+    configured = getattr(settings, "auto_tm_rematch_count_threshold", AUTO_TM_REMATCH_COUNT_THRESHOLD)
+    return max(int(configured or AUTO_TM_REMATCH_COUNT_THRESHOLD), 1)
+
+
+def _get_auto_tm_rematch_age(settings=None) -> timedelta:
+    settings = settings or get_settings()
+    configured = getattr(settings, "auto_tm_rematch_delay_minutes", None)
+    minutes = max(int(configured if configured is not None else 15), 1)
+    return timedelta(minutes=minutes)
+
+
+def _get_auto_tm_rematch_chunk_size(settings=None) -> int:
+    settings = settings or get_settings()
+    configured = getattr(settings, "auto_tm_rematch_chunk_size", AUTO_TM_REMATCH_CHUNK_SIZE)
+    return min(max(int(configured or AUTO_TM_REMATCH_CHUNK_SIZE), 1), AUTO_TM_REMATCH_CHUNK_SIZE)
 
 
 def _parse_optional_datetime(value: str | datetime | None) -> datetime | None:
