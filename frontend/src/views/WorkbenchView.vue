@@ -549,6 +549,7 @@ const numberCheckFilter = ref<NumberCheckFilter>('all')
 const numberCheckVisibleLimit = ref(100)
 const numberCheckAiScope = ref<'program_only' | 'all'>('program_only')
 const numberCheckModel = ref<string>('')
+const numberCheckShowAiReason = ref(false)
 const showNumberCheckSettings = ref(false)
 const selectedNumberCheckItemIds = ref<Set<string>>(new Set())
 const numberCheckItemBusyId = ref<string | null>(null)
@@ -4711,6 +4712,15 @@ function numberCheckHasCorrection(item: NumberCheckReportItem) {
     && item.suggested_value
     && (item.target_text || '').includes(item.replace_anchor),
   )
+}
+
+function numberCheckAiReason(item: NumberCheckReportItem): string {
+  const first = item.ai_errors?.[0]
+  if (!first) {
+    return ''
+  }
+  const reason = (first as Record<string, unknown>)['修改理由']
+  return typeof reason === 'string' ? reason : ''
 }
 
 interface NumberCheckStatusTag {
@@ -9511,6 +9521,10 @@ onBeforeRouteLeave(async () => {
                               </template>
                               <span v-else class="number-check__no-fix">—</span>
                             </div>
+                            <div
+                              v-if="numberCheckShowAiReason && numberCheckHasCorrection(item) && numberCheckAiReason(item)"
+                              class="number-check__ai-reason"
+                            >AI 修改理由：{{ numberCheckAiReason(item) }}</div>
                           </td>
                           <td class="number-check__cell">
                             <div class="number-check__status">
@@ -10179,6 +10193,13 @@ onBeforeRouteLeave(async () => {
               :value="modelOption.id"
             >{{ modelOption.name }}</option>
           </select>
+        </div>
+        <div class="number-check__settings-group">
+          <div class="number-check__settings-label">显示选项</div>
+          <label class="number-check__settings-option">
+            <input type="checkbox" v-model="numberCheckShowAiReason">
+            显示 AI 修改理由
+          </label>
         </div>
         <p class="hint-text">设置在下次“开始检查 / 重新检查”时生效。</p>
       </div>
@@ -11974,6 +11995,13 @@ onBeforeRouteLeave(async () => {
 
 .number-check__fix {
   line-height: 1.5;
+}
+
+.number-check__ai-reason {
+  margin-top: 3px;
+  color: #8a6d00;
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .number-check__actions {
@@ -13802,6 +13830,11 @@ onBeforeRouteLeave(async () => {
 }
 
 .workbench-bottom-drawer__qa .number-check__nums {
+  margin-top: 1px;
+  line-height: 1.25;
+}
+
+.workbench-bottom-drawer__qa .number-check__ai-reason {
   margin-top: 1px;
   line-height: 1.25;
 }
