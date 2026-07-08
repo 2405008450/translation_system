@@ -75,6 +75,11 @@ class Settings(BaseSettings):
     pretranslation_run_file_concurrency: int = 2
     auto_tm_outbox_max_batches_per_run: int = 5
     auto_tm_rematch_max_files_per_run: int = 1
+    auto_tm_rematch_force_immediate: bool = False
+    auto_tm_rematch_enable_fuzzy: bool = False
+    auto_tm_rematch_count_threshold: int = 200
+    auto_tm_rematch_delay_minutes: int = 15
+    auto_tm_rematch_chunk_size: int = 100
     aspose_words_license_path: str | None = None
     libreoffice_soffice_path: str | None = None
     libreoffice_python_path: str | None = None
@@ -112,6 +117,8 @@ class Settings(BaseSettings):
     tm_vector_weight: float = 0.35
     tm_fuzzy_match_batch_size: int = 50
     tm_match_statement_timeout_ms: int = 45000
+    tm_search_projection_enabled: bool = False
+    tm_search_projection_fallback_enabled: bool = True
     jwt_secret_key: str = DEFAULT_JWT_SECRET_KEY
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 1440

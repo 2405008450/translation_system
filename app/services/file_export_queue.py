@@ -51,6 +51,23 @@ _FILE_EXPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fi
 _SCHEMA_READY = False
 _SCHEMA_LOCK = Lock()
 
+# 导出样式设置以任务 id 为键暂存在进程内（排队与执行在同一进程内的线程池中完成），
+# 避免为一次性的导出参数新增数据库列。任务执行结束后即清理。
+_STYLE_SETTINGS_BY_TASK: dict[str, dict[str, Any]] = {}
+_STYLE_SETTINGS_LOCK = Lock()
+
+
+def _store_style_settings(task_id: UUID, style_settings: dict[str, Any] | None) -> None:
+    if not style_settings:
+        return
+    with _STYLE_SETTINGS_LOCK:
+        _STYLE_SETTINGS_BY_TASK[str(task_id)] = style_settings
+
+
+def _pop_style_settings(task_id: UUID) -> dict[str, Any] | None:
+    with _STYLE_SETTINGS_LOCK:
+        return _STYLE_SETTINGS_BY_TASK.pop(str(task_id), None)
+
 _FILE_EXPORT_SCHEMA_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS file_export_tasks (
@@ -186,6 +203,7 @@ def queue_file_export(
     file_record_id: UUID,
     export_type: str,
     current_user: User | None,
+    style_settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ensure_file_export_tasks_schema()
     export_type = normalize_file_export_type(export_type)
@@ -213,6 +231,8 @@ def queue_file_export(
     db.add(task)
     db.commit()
     db.refresh(task)
+
+    _store_style_settings(task.id, style_settings)
 
     _cleanup_expired_file_exports(db)
     future = _FILE_EXPORT_EXECUTOR.submit(_run_file_export_task, task.id)
@@ -356,6 +376,7 @@ def _resolve_file_record_export_language_pair(file_record: FileRecord) -> tuple[
 
 
 def _run_file_export_task(task_id: UUID) -> None:
+    style_settings = _pop_style_settings(task_id)
     try:
         with SessionLocal() as db:
             task = get_file_export_task(db, task_id)
@@ -366,7 +387,9 @@ def _run_file_export_task(task_id: UUID) -> None:
                 raise ValueError("File record not found.")
 
             _set_file_export_task_status(db, task, "running", progress=20, message="正在读取文件和句段。")
-            exported_file = build_file_record_exported_file(db, file_record, task.export_type)
+            exported_file = build_file_record_exported_file(
+                db, file_record, task.export_type, style_settings=style_settings
+            )
 
             output_dir = _ensure_export_dir()
             _cleanup_expired_export_files(output_dir)
@@ -388,7 +411,12 @@ def _run_file_export_task(task_id: UUID) -> None:
                 _set_file_export_task_status(db, task, "failed", progress=100, message="导出失败。")
 
 
-def build_file_record_exported_file(db: Session, file_record: FileRecord, export_type: str):
+def build_file_record_exported_file(
+    db: Session,
+    file_record: FileRecord,
+    export_type: str,
+    style_settings: dict[str, Any] | None = None,
+):
     raw_bytes = load_file_record_source(file_record)
     source_filename = get_file_record_source_filename(file_record)
 
@@ -411,26 +439,32 @@ def build_file_record_exported_file(db: Session, file_record: FileRecord, export
     if export_type == "original":
         if not can_export_task_file(source_filename, has_source_file=raw_bytes is not None):
             raise ValueError("Current file format does not support original export yet.")
-        return export_translated_task_file(
-            raw_bytes=raw_bytes,
-            filename=source_filename,
-            segments=segments,
-            document_parse_mode=document_parse_mode,
-            document_parse_options=document_parse_options,
-            target_language=getattr(file_record, "target_language", None),
+        return _apply_style_settings_to_export(
+            export_translated_task_file(
+                raw_bytes=raw_bytes,
+                filename=source_filename,
+                segments=segments,
+                document_parse_mode=document_parse_mode,
+                document_parse_options=document_parse_options,
+                target_language=getattr(file_record, "target_language", None),
+            ),
+            style_settings,
         )
 
     if export_type in BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS:
         if get_task_file_extension(source_filename) != ".docx":
             raise ValueError("Only DOCX source files support layout-preserving bilingual Word export.")
-        return export_bilingual_task_docx_with_layout(
-            raw_bytes=raw_bytes,
-            filename=source_filename,
-            segments=segments,
-            order=BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS[export_type],
-            document_parse_mode=document_parse_mode,
-            document_parse_options=document_parse_options,
-            target_language=getattr(file_record, "target_language", None),
+        return _apply_style_settings_to_export(
+            export_bilingual_task_docx_with_layout(
+                raw_bytes=raw_bytes,
+                filename=source_filename,
+                segments=segments,
+                order=BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS[export_type],
+                document_parse_mode=document_parse_mode,
+                document_parse_options=document_parse_options,
+                target_language=getattr(file_record, "target_language", None),
+            ),
+            style_settings,
         )
 
     if export_type == "bilingual_excel_original":
@@ -465,10 +499,43 @@ def build_file_record_exported_file(db: Session, file_record: FileRecord, export
         export_kwargs["target_lang"] = target_language
 
     exported_bytes, media_type, export_filename = export_file(**export_kwargs)
+    return _apply_style_settings_to_export(
+        _GenericExportedFile(
+            content=exported_bytes,
+            media_type=media_type,
+            filename=export_filename,
+        ),
+        style_settings,
+    )
+
+
+def _apply_style_settings_to_export(exported_file, style_settings: dict[str, Any] | None):
+    """
+    仅对 .docx 导出结果按用户设置调整样式；其余格式或未启用设置时原样返回。
+    调整失败会在内部记录日志并回退到原始内容，绝不影响导出成功。
+    """
+    if not style_settings:
+        return exported_file
+    filename = getattr(exported_file, "filename", "") or ""
+    if not filename.lower().endswith(".docx"):
+        return exported_file
+
+    from app.services.export_settings.style_export_integration import (
+        apply_export_style_settings,
+        style_settings_enabled,
+    )
+
+    if not style_settings_enabled(style_settings):
+        return exported_file
+
+    adjusted = apply_export_style_settings(exported_file.content, style_settings)
+    if adjusted is exported_file.content or adjusted == exported_file.content:
+        return exported_file
     return _GenericExportedFile(
-        content=exported_bytes,
-        media_type=media_type,
-        filename=export_filename,
+        content=adjusted,
+        media_type=getattr(exported_file, "media_type", None)
+        or "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=filename,
     )
 
 

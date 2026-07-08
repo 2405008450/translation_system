@@ -80,6 +80,7 @@ const pageSize = ref(50)
 const totalEntries = ref(0)
 const showAddDialog = ref(false)
 const showImportDialog = ref(false)
+const showResourceEditDialog = ref(false)
 const showFieldMenu = ref(false)
 const showExportMenu = ref(false)
 const showIndexColumn = ref(true)
@@ -91,11 +92,16 @@ const showLastModifiedByColumn = ref(true)
 const showUpdatedAtColumn = ref(true)
 const exportProgress = ref(0)
 const currentExportTaskId = ref('')
+const updatingResource = ref(false)
+const editResourceName = ref('')
+const editResourceDescription = ref('')
 const newSourceText = ref('')
 const newTargetText = ref('')
 const editingEntryId = ref('')
 const editSourceText = ref('')
 const editTargetText = ref('')
+const entrySortKey = ref('updated_at')
+const entrySortOrder = ref<'asc' | 'desc'>('desc')
 let searchTimer: number | null = null
 let exportPollTimer: number | null = null
 let disposed = false
@@ -122,6 +128,7 @@ const copy = computed(() => {
       importTitle: '导入记忆库',
       exportFilenameSuffix: 'tm',
       detailEndpoint: `/translation-memory/collections/${props.id}`,
+      updateEndpoint: `/translation-memory/collections/${props.id}`,
       entriesEndpoint: `/translation-memory/collections/${props.id}/entries`,
       createEndpoint: `/translation-memory/collections/${props.id}/entries`,
       createExportEndpoint: `/translation-memory/collections/${props.id}/exports`,
@@ -153,6 +160,7 @@ const copy = computed(() => {
     importTitle: '导入术语库',
     exportFilenameSuffix: 'term-base',
     detailEndpoint: `/term-bases/${props.id}`,
+    updateEndpoint: `/term-bases/${props.id}`,
     entriesEndpoint: `/term-bases/${props.id}/entries`,
     createEndpoint: `/term-bases/${props.id}/entries`,
     createExportEndpoint: `/term-bases/${props.id}/exports`,
@@ -296,6 +304,23 @@ function openAddDialog() {
   showAddDialog.value = true
 }
 
+function openResourceEditDialog() {
+  if (!resource.value || !canManageResources.value) {
+    entryMessage.value = `当前账号只能查看和导出${copy.value.assetLabel}。`
+    return
+  }
+  editResourceName.value = resource.value.name
+  editResourceDescription.value = resource.value.description || ''
+  entryMessage.value = ''
+  showResourceEditDialog.value = true
+}
+
+function closeResourceEditDialog() {
+  if (!updatingResource.value) {
+    showResourceEditDialog.value = false
+  }
+}
+
 function goBack() {
   void router.push({ name: copy.value.backRoute })
 }
@@ -323,6 +348,8 @@ async function loadEntries() {
         limit: pageSize.value,
         search: searchText.value.trim() || undefined,
         case_sensitive: matchCase.value || undefined,
+        sort_by: entrySortKey.value || undefined,
+        sort_order: entrySortOrder.value,
       },
     })
     entries.value = data.items
@@ -337,6 +364,39 @@ async function loadEntries() {
 
 async function reloadPage() {
   await Promise.all([loadResource(), loadEntries()])
+}
+
+async function updateResourceInfo() {
+  if (!resource.value || !canManageResources.value) {
+    return
+  }
+  const name = editResourceName.value.trim()
+  if (!name) {
+    entryMessage.value = `${copy.value.assetLabel}名称不能为空。`
+    return
+  }
+  if (!resource.value.source_language || !resource.value.target_language) {
+    entryMessage.value = `${copy.value.assetLabel}缺少语言对，暂时无法保存名称。`
+    return
+  }
+
+  updatingResource.value = true
+  entryMessage.value = ''
+  try {
+    await http.put<ResourceRecord>(copy.value.updateEndpoint, {
+      name,
+      description: editResourceDescription.value.trim() || null,
+      source_language: resource.value.source_language,
+      target_language: resource.value.target_language,
+    })
+    showResourceEditDialog.value = false
+    await loadResource()
+    entryMessage.value = `${copy.value.assetLabel}信息已更新。`
+  } catch (error) {
+    entryMessage.value = getErrorMessage(error, `${copy.value.assetLabel}信息更新失败。`)
+  } finally {
+    updatingResource.value = false
+  }
 }
 
 async function createEntry() {
@@ -529,11 +589,7 @@ async function handleImported(payload: { tab: 'tm' | 'glossary' | 'term' }) {
   entryMessage.value = '导入完成，列表已刷新。'
 }
 
-watch([currentPage, pageSize, matchCase], () => {
-  void loadEntries()
-})
-
-watch(searchText, () => {
+function scheduleEntriesReload() {
   if (searchTimer) {
     window.clearTimeout(searchTimer)
   }
@@ -541,14 +597,43 @@ watch(searchText, () => {
     currentPage.value = 1
     void loadEntries()
   }, 250)
+}
+
+function toggleEntrySort(key: string) {
+  if (entrySortKey.value === key) {
+    entrySortOrder.value = entrySortOrder.value === 'asc' ? 'desc' : 'asc'
+  } else {
+    entrySortKey.value = key
+    entrySortOrder.value = 'asc'
+  }
+  currentPage.value = 1
+  void loadEntries()
+}
+
+function getEntrySortArrow(key: string) {
+  if (entrySortKey.value !== key) {
+    return '↕'
+  }
+  return entrySortOrder.value === 'asc' ? '↑' : '↓'
+}
+
+watch([currentPage, pageSize, matchCase], () => {
+  void loadEntries()
+})
+
+watch(searchText, () => {
+  scheduleEntriesReload()
 })
 
 watch(() => [props.id, props.mode] as const, () => {
   currentPage.value = 1
   showAddDialog.value = false
   showImportDialog.value = false
+  showResourceEditDialog.value = false
   showFieldMenu.value = false
   showExportMenu.value = false
+  entrySortKey.value = 'updated_at'
+  entrySortOrder.value = 'desc'
   resetAddForm()
   resetEditForm()
   void reloadPage()
@@ -583,6 +668,16 @@ onUnmounted(() => {
       </div>
 
       <div class="resource-detail-topbar__actions">
+        <button
+          v-if="canManageResources"
+          class="resource-detail-button"
+          type="button"
+          :disabled="!resource"
+          @click="openResourceEditDialog"
+        >
+          <Pencil :size="14" />
+          编辑信息
+        </button>
         <button
           v-if="canManageResources"
           class="resource-detail-button resource-detail-button--primary"
@@ -628,9 +723,6 @@ onUnmounted(() => {
         >
           <X :size="14" />
           停止导出
-        </button>
-        <button class="resource-detail-icon-button" type="button" title="更多">
-          <ChevronDown :size="16" />
         </button>
       </div>
     </section>
@@ -737,12 +829,42 @@ onUnmounted(() => {
             <thead>
               <tr>
                 <th v-if="showIndexColumn" class="resource-detail-table__index">序号</th>
-                <th v-if="showSourceColumn">{{ sourceLanguageLabel }}</th>
-                <th v-if="showTargetColumn">{{ targetLanguageLabel }}</th>
-                <th v-if="showCreatorColumn" class="resource-detail-table__meta">创建人</th>
-                <th v-if="showCreatedAtColumn" class="resource-detail-table__datetime">创建时间</th>
-                <th v-if="showLastModifiedByColumn" class="resource-detail-table__meta">最后修改人</th>
-                <th v-if="showUpdatedAtColumn" class="resource-detail-table__datetime">最新修改时间</th>
+                <th v-if="showSourceColumn">
+                  <button class="resource-detail-th-button" type="button" @click="toggleEntrySort('source_text')">
+                    <span>{{ sourceLanguageLabel }}</span>
+                    <span>{{ getEntrySortArrow('source_text') }}</span>
+                  </button>
+                </th>
+                <th v-if="showTargetColumn">
+                  <button class="resource-detail-th-button" type="button" @click="toggleEntrySort('target_text')">
+                    <span>{{ targetLanguageLabel }}</span>
+                    <span>{{ getEntrySortArrow('target_text') }}</span>
+                  </button>
+                </th>
+                <th v-if="showCreatorColumn" class="resource-detail-table__meta">
+                  <button class="resource-detail-th-button" type="button" @click="toggleEntrySort('creator_name')">
+                    <span>创建人</span>
+                    <span>{{ getEntrySortArrow('creator_name') }}</span>
+                  </button>
+                </th>
+                <th v-if="showCreatedAtColumn" class="resource-detail-table__datetime">
+                  <button class="resource-detail-th-button" type="button" @click="toggleEntrySort('created_at')">
+                    <span>创建时间</span>
+                    <span>{{ getEntrySortArrow('created_at') }}</span>
+                  </button>
+                </th>
+                <th v-if="showLastModifiedByColumn" class="resource-detail-table__meta">
+                  <button class="resource-detail-th-button" type="button" @click="toggleEntrySort('last_modified_by_name')">
+                    <span>最后修改人</span>
+                    <span>{{ getEntrySortArrow('last_modified_by_name') }}</span>
+                  </button>
+                </th>
+                <th v-if="showUpdatedAtColumn" class="resource-detail-table__datetime">
+                  <button class="resource-detail-th-button" type="button" @click="toggleEntrySort('updated_at')">
+                    <span>最新修改时间</span>
+                    <span>{{ getEntrySortArrow('updated_at') }}</span>
+                  </button>
+                </th>
                 <th v-if="canManageResources" class="resource-detail-table__actions">操作</th>
               </tr>
             </thead>
@@ -893,6 +1015,37 @@ onUnmounted(() => {
           <Loader2 v-if="creatingEntry" class="lucide-spin" :size="14" />
           <Plus v-else :size="14" />
           {{ creatingEntry ? '添加中...' : '确认添加' }}
+        </button>
+      </template>
+    </Modal>
+
+    <Modal
+      v-if="canManageResources"
+      :open="showResourceEditDialog"
+      :title="`编辑${copy.assetLabel}信息`"
+      :description="`修改${copy.assetLabel}名称和说明。`"
+      width="min(620px, calc(100vw - 32px))"
+      @close="closeResourceEditDialog"
+    >
+      <div class="upload-form form-grid-2">
+        <label class="field">
+          <span class="field__label">{{ copy.assetLabel }}名称</span>
+          <input v-model="editResourceName" class="field__control" type="text" />
+        </label>
+        <label class="field">
+          <span class="field__label">说明</span>
+          <input v-model="editResourceDescription" class="field__control" type="text" placeholder="可选" />
+        </label>
+      </div>
+
+      <template #footer>
+        <button class="button" type="button" :disabled="updatingResource" @click="closeResourceEditDialog">
+          取消
+        </button>
+        <button class="button button--primary" type="button" :disabled="updatingResource" @click="updateResourceInfo">
+          <Loader2 v-if="updatingResource" class="lucide-spin" :size="14" />
+          <Save v-else :size="14" />
+          {{ updatingResource ? '保存中...' : '保存' }}
         </button>
       </template>
     </Modal>
@@ -1239,6 +1392,30 @@ onUnmounted(() => {
   color: var(--text-secondary);
   font-weight: 600;
   text-align: left;
+  vertical-align: middle;
+}
+
+.resource-detail-th-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+  min-height: 18px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 1.2;
+  text-align: left;
+}
+
+.resource-detail-th-button span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .resource-detail-table th:last-child,

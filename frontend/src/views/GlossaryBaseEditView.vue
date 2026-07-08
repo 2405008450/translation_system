@@ -88,6 +88,8 @@ const editingEntryId = ref('')
 const editSourceText = ref('')
 const editTargetText = ref('')
 const editNote = ref('')
+const entrySortKey = ref('updated_at')
+const entrySortOrder = ref<'asc' | 'desc'>('desc')
 
 const editBaseName = ref('')
 const editBaseDescription = ref('')
@@ -250,6 +252,8 @@ async function loadEntries() {
           limit: pageSize.value,
           search: searchText.value.trim() || undefined,
           case_sensitive: matchCase.value || undefined,
+          sort_by: entrySortKey.value || undefined,
+          sort_order: entrySortOrder.value,
         },
       },
     )
@@ -527,11 +531,7 @@ async function exportEntries(format: ExportFormat) {
   }
 }
 
-watch([currentPage, pageSize, matchCase], () => {
-  void loadEntries()
-})
-
-watch(searchText, () => {
+function scheduleEntriesReload() {
   if (searchTimer) {
     window.clearTimeout(searchTimer)
   }
@@ -539,6 +539,32 @@ watch(searchText, () => {
     currentPage.value = 1
     void loadEntries()
   }, 250)
+}
+
+function toggleEntrySort(key: string) {
+  if (entrySortKey.value === key) {
+    entrySortOrder.value = entrySortOrder.value === 'asc' ? 'desc' : 'asc'
+  } else {
+    entrySortKey.value = key
+    entrySortOrder.value = 'asc'
+  }
+  currentPage.value = 1
+  void loadEntries()
+}
+
+function getEntrySortArrow(key: string) {
+  if (entrySortKey.value !== key) {
+    return '↕'
+  }
+  return entrySortOrder.value === 'asc' ? '↑' : '↓'
+}
+
+watch([currentPage, pageSize, matchCase], () => {
+  void loadEntries()
+})
+
+watch(searchText, () => {
+  scheduleEntriesReload()
 })
 
 watch(() => props.id, () => {
@@ -546,6 +572,8 @@ watch(() => props.id, () => {
   showAddDialog.value = false
   showBaseEditDialog.value = false
   showImportDialog.value = false
+  entrySortKey.value = 'updated_at'
+  entrySortOrder.value = 'desc'
   resetAddForm()
   resetEditForm()
   void reloadPage()
@@ -699,13 +727,48 @@ onUnmounted(() => {
             <thead>
               <tr>
                 <th class="glossary-detail-table__index">序号</th>
-                <th>原文</th>
-                <th>译文</th>
-                <th>备注</th>
-                <th class="glossary-detail-table__meta">创建人</th>
-                <th class="glossary-detail-table__datetime">创建时间</th>
-                <th class="glossary-detail-table__meta">最后修改人</th>
-                <th class="glossary-detail-table__datetime">最新修改时间</th>
+                <th>
+                  <button class="glossary-detail-th-button" type="button" @click="toggleEntrySort('source_text')">
+                    <span>原文</span>
+                    <span>{{ getEntrySortArrow('source_text') }}</span>
+                  </button>
+                </th>
+                <th>
+                  <button class="glossary-detail-th-button" type="button" @click="toggleEntrySort('target_text')">
+                    <span>译文</span>
+                    <span>{{ getEntrySortArrow('target_text') }}</span>
+                  </button>
+                </th>
+                <th>
+                  <button class="glossary-detail-th-button" type="button" @click="toggleEntrySort('note')">
+                    <span>备注</span>
+                    <span>{{ getEntrySortArrow('note') }}</span>
+                  </button>
+                </th>
+                <th class="glossary-detail-table__meta">
+                  <button class="glossary-detail-th-button" type="button" @click="toggleEntrySort('creator_name')">
+                    <span>创建人</span>
+                    <span>{{ getEntrySortArrow('creator_name') }}</span>
+                  </button>
+                </th>
+                <th class="glossary-detail-table__datetime">
+                  <button class="glossary-detail-th-button" type="button" @click="toggleEntrySort('created_at')">
+                    <span>创建时间</span>
+                    <span>{{ getEntrySortArrow('created_at') }}</span>
+                  </button>
+                </th>
+                <th class="glossary-detail-table__meta">
+                  <button class="glossary-detail-th-button" type="button" @click="toggleEntrySort('last_modified_by_name')">
+                    <span>最后修改人</span>
+                    <span>{{ getEntrySortArrow('last_modified_by_name') }}</span>
+                  </button>
+                </th>
+                <th class="glossary-detail-table__datetime">
+                  <button class="glossary-detail-th-button" type="button" @click="toggleEntrySort('updated_at')">
+                    <span>最新修改时间</span>
+                    <span>{{ getEntrySortArrow('updated_at') }}</span>
+                  </button>
+                </th>
                 <th v-if="canManageResources" class="glossary-detail-table__actions">操作</th>
               </tr>
             </thead>
@@ -1253,6 +1316,30 @@ onUnmounted(() => {
   color: var(--text-secondary);
   font-weight: 600;
   text-align: left;
+  vertical-align: middle;
+}
+
+.glossary-detail-th-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+  min-height: 18px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 1.2;
+  text-align: left;
+}
+
+.glossary-detail-th-button span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .glossary-detail-table th:last-child,

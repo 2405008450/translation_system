@@ -17,7 +17,7 @@ from typing import Any, Dict, Iterable, List, Literal, Optional
 from urllib.parse import quote, unquote, urlparse
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, case, func, literal, or_
@@ -392,6 +392,8 @@ def _build_task_workspace_with_new_session(
     filename: str,
     similarity_threshold: float,
     collection_ids: list[UUID] | None,
+    source_language: str | None,
+    target_language: str | None,
     document_parse_mode: str,
     document_parse_options: dict[str, object] | str | None = None,
 ) -> dict:
@@ -402,6 +404,8 @@ def _build_task_workspace_with_new_session(
             filename=filename,
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
+            source_language=source_language,
+            target_language=target_language,
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
         )
@@ -412,6 +416,8 @@ async def _build_task_workspace_async(
     filename: str,
     similarity_threshold: float,
     collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
     document_parse_options: dict[str, object] | str | None = None,
 ) -> dict:
@@ -424,6 +430,8 @@ async def _build_task_workspace_async(
             filename=filename,
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
+            source_language=source_language,
+            target_language=target_language,
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
         ),
@@ -895,6 +903,8 @@ def _process_file_record_import(db: Session, payload: dict[str, Any]) -> dict[st
         filename=filename,
         similarity_threshold=threshold,
         collection_ids=selected_collection_ids,
+        source_language=resolved_source_language,
+        target_language=resolved_target_language,
         document_parse_mode=document_parse_mode,
         document_parse_options=document_parse_options,
     )
@@ -1135,6 +1145,8 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
             filename=filename,
             similarity_threshold=threshold,
             collection_ids=selected_collection_ids,
+            source_language=resolved_source_language,
+            target_language=resolved_target_language,
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
         )
@@ -2660,6 +2672,11 @@ class ProjectFileZipExportPayload(BaseModel):
     file_ids: list[UUID] = Field(default_factory=list)
 
 
+class FileRecordExportPayload(BaseModel):
+    """文件记录导出请求体，可选携带 DOCX 导出样式设置。"""
+    style_settings: dict[str, Any] | None = None
+
+
 def _build_unavailable_document_statistics() -> dict[str, Any]:
     statistics = {
         "source": "unavailable",
@@ -2817,6 +2834,10 @@ def _load_document_match_analysis_for_files(
         file_record.id: tuple(_load_file_record_collection_ids(file_record))
         for file_record in files
     }
+    language_pair_by_file_id = {
+        file_record.id: (file_record.source_language, file_record.target_language)
+        for file_record in files
+    }
 
     segments = (
         db.query(
@@ -2834,6 +2855,7 @@ def _load_document_match_analysis_for_files(
         .all()
     )
     for file_record_id, source_text, display_text, source_word_count in segments:
+        source_language, target_language = language_pair_by_file_id.get(file_record_id, (None, None))
         file_segments.setdefault(file_record_id, []).append(
             DocumentMatchSegment(
                 file_id=file_record_id,
@@ -2841,6 +2863,8 @@ def _load_document_match_analysis_for_files(
                 display_text=display_text or "",
                 source_word_count=int(source_word_count or 0),
                 collection_ids=collection_ids_by_file_id.get(file_record_id, ()),
+                source_language=source_language,
+                target_language=target_language,
             )
         )
 
@@ -2862,6 +2886,10 @@ def _load_pretranslation_match_analysis_segments_for_files(
         return file_segments, skipped_confirmed
 
     selected_collection_ids = tuple(dict.fromkeys(collection_ids))
+    language_pair_by_file_id = {
+        file_record.id: (file_record.source_language, file_record.target_language)
+        for file_record in files
+    }
     segments = (
         db.query(
             Segment.file_record_id,
@@ -2884,6 +2912,7 @@ def _load_pretranslation_match_analysis_segments_for_files(
             skipped_confirmed["segment_count"] += 1
             skipped_confirmed["word_count"] += word_count
             continue
+        source_language, target_language = language_pair_by_file_id.get(file_record_id, (None, None))
         file_segments.setdefault(file_record_id, []).append(
             DocumentMatchSegment(
                 file_id=file_record_id,
@@ -2891,6 +2920,8 @@ def _load_pretranslation_match_analysis_segments_for_files(
                 display_text=display_text or "",
                 source_word_count=word_count,
                 collection_ids=selected_collection_ids,
+                source_language=source_language,
+                target_language=target_language,
             )
         )
 
@@ -10935,6 +10966,8 @@ def get_segment_tm_candidates(
                 threshold if threshold is not None else getattr(file_record, "tm_match_threshold", None),
             ),
             collection_ids=collection_ids,
+            source_language=file_record.source_language,
+            target_language=file_record.target_language,
             top_n=max_candidates,
         )
     except OperationalError as exc:
@@ -11053,6 +11086,8 @@ def rematch_file_record(
             auxiliary_sentences=auxiliary_sentences,
             similarity_threshold=threshold,
             collection_ids=selected_collection_ids,
+            source_language=source_language,
+            target_language=target_language,
         )
     else:
         matches = []
@@ -11297,6 +11332,7 @@ def _queue_file_record_export_for_current_user(
     export_type: str,
     db: Session,
     current_user: User,
+    style_settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
@@ -11324,6 +11360,7 @@ def _queue_file_record_export_for_current_user(
         file_record_id=file_record_id,
         export_type=export_type,
         current_user=current_user,
+        style_settings=style_settings,
     )
 
 
@@ -12204,6 +12241,7 @@ def get_merge_view_segments(
 def create_file_record_export_task(
     file_record_id: UUID,
     type: str = Query(default="original"),
+    payload: FileRecordExportPayload | None = Body(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -12214,6 +12252,7 @@ def create_file_record_export_task(
             export_type=type,
             db=db,
             current_user=current_user,
+            style_settings=payload.style_settings if payload else None,
         ),
     )
 
@@ -14507,6 +14546,30 @@ def _serialize_tm_entry(entry: TranslationMemory) -> dict:
     }
 
 
+def _apply_tm_entry_sort(query, sort_by: str | None, sort_order: str | None):
+    order = "asc" if sort_order == "asc" else "desc"
+    sort_columns = {
+        "source_text": TranslationMemory.source_text,
+        "target_text": TranslationMemory.target_text,
+        "created_at": TranslationMemory.created_at,
+        "updated_at": TranslationMemory.updated_at,
+    }
+    if sort_by in sort_columns:
+        column = sort_columns[sort_by]
+        return query.order_by(column.asc() if order == "asc" else column.desc(), TranslationMemory.id.asc())
+    if sort_by == "creator_name":
+        creator = aliased(User)
+        column = func.coalesce(creator.nickname, creator.username, "")
+        query = query.outerjoin(creator, TranslationMemory.creator_id == creator.id)
+        return query.order_by(column.asc() if order == "asc" else column.desc(), TranslationMemory.id.asc())
+    if sort_by == "last_modified_by_name":
+        modifier = aliased(User)
+        column = func.coalesce(modifier.nickname, modifier.username, "")
+        query = query.outerjoin(modifier, TranslationMemory.last_modified_by_id == modifier.id)
+        return query.order_by(column.asc() if order == "asc" else column.desc(), TranslationMemory.id.asc())
+    return query.order_by(TranslationMemory.updated_at.desc(), TranslationMemory.created_at.desc())
+
+
 def _require_tm_entry_owner_or_admin(entry: TranslationMemory, current_user: User) -> None:
     if can_access_all_projects(current_user):
         return
@@ -15456,6 +15519,8 @@ def list_tm_collection_entries(
     limit: int = 50,
     search: str | None = None,
     case_sensitive: bool = False,
+    sort_by: str | None = None,
+    sort_order: str | None = "desc",
     db: Session = Depends(get_db),
 ):
     collection = _get_collection_or_404(db, collection_id)
@@ -15488,8 +15553,7 @@ def list_tm_collection_entries(
 
     total = query.count()
     rows = (
-        query
-        .order_by(TranslationMemory.updated_at.desc(), TranslationMemory.created_at.desc())
+        _apply_tm_entry_sort(query, sort_by, sort_order)
         .offset(safe_skip)
         .limit(safe_limit)
         .all()
