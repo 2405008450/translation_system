@@ -4,6 +4,7 @@ API 路由模块 - 文件上传、解析和导出接口
 支持多种文档格式的上传、解析和导出。
 """
 import asyncio
+from copy import deepcopy
 import json
 import logging
 import re
@@ -2586,6 +2587,13 @@ class MemoryBasePayload(BaseModel):
     target_language: str
 
 
+class ResourceLanguagePairCopyPayload(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    source_language: str
+    target_language: str
+
+
 class TMCollectionMergePayload(BaseModel):
     source_collection_ids: list[UUID]
     name: str
@@ -4996,6 +5004,20 @@ def _normalize_upload_document_parse_options(
 
 def _normalize_collection_name(name: str) -> str:
     return " ".join(name.strip().split())
+
+
+def _build_unique_resource_name(db: Session, model: Any, raw_name: str, normalize_name) -> str:
+    base_name = normalize_name(raw_name)
+    if not base_name:
+        raise HTTPException(status_code=400, detail="资源库名称不能为空。")
+    base_name = base_name[:120].rstrip()
+    candidate = base_name
+    suffix_index = 2
+    while db.query(model.id).filter(model.name == candidate).first() is not None:
+        suffix = f" {suffix_index}"
+        candidate = f"{base_name[:120 - len(suffix)].rstrip()}{suffix}"
+        suffix_index += 1
+    return candidate
 
 
 def _build_default_save_to_tm_collection_name(file_record: FileRecord) -> str:
@@ -14786,6 +14808,74 @@ def update_tm_collection(
         .count()
     )
     return _serialize_tm_collection(collection, entry_count)
+
+
+@router.post("/translation-memory/collections/{collection_id}/copy-language-pair")
+def copy_tm_collection_to_language_pair(
+    collection_id: UUID,
+    payload: ResourceLanguagePairCopyPayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    source_collection = _get_collection_or_404(db, collection_id)
+    if source_collection is None:
+        raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
+
+    source_language, target_language = _require_tm_language_pair(
+        payload.source_language,
+        payload.target_language,
+    )
+    default_name = f"{source_collection.name} {source_language}->{target_language}"
+    name = _build_unique_resource_name(
+        db,
+        MemoryBase,
+        payload.name or default_name,
+        _normalize_collection_name,
+    )
+    target_collection = MemoryBase(
+        name=name,
+        description=normalize_text(
+            payload.description if payload.description is not None else (source_collection.description or "")
+        ) or None,
+        source_language=source_language,
+        target_language=target_language,
+        creator_id=current_user.id,
+    )
+    db.add(target_collection)
+    try:
+        db.flush()
+        source_entries = (
+            db.query(MemoryEntry)
+            .filter(MemoryEntry.collection_id == source_collection.id)
+            .order_by(MemoryEntry.created_at.asc(), MemoryEntry.id.asc())
+            .all()
+        )
+        for entry in source_entries:
+            db.add(MemoryEntry(
+                collection_id=target_collection.id,
+                source_text=entry.source_text,
+                target_text=entry.target_text,
+                source_hash=entry.source_hash,
+                source_normalized=entry.source_normalized,
+                source_language=source_language,
+                target_language=target_language,
+                creator_id=entry.creator_id or current_user.id,
+                last_modified_by_id=current_user.id,
+                external_tuid=entry.external_tuid,
+                tmx_metadata=deepcopy(entry.tmx_metadata),
+            ))
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="复制记忆库失败，可能存在同名库或重复条目。") from exc
+
+    db.refresh(target_collection)
+    entry_count = (
+        db.query(MemoryEntry)
+        .filter(MemoryEntry.collection_id == target_collection.id)
+        .count()
+    )
+    return _serialize_tm_collection(target_collection, entry_count)
 
 
 @router.post("/translation-memory/collections/merge")

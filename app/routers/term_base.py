@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import json
 import logging
 from concurrent.futures import CancelledError, ThreadPoolExecutor
@@ -84,6 +85,13 @@ class TermBasePayload(BaseModel):
     target_language: str
 
 
+class TermBaseLanguagePairCopyPayload(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    source_language: str
+    target_language: str
+
+
 class TermBaseMergePayload(BaseModel):
     source_term_base_ids: list[UUID]
     name: str
@@ -112,6 +120,20 @@ class TermEntryBatchPayload(BaseModel):
 
 def _normalize_term_base_name(name: str) -> str:
     return " ".join(name.strip().split())
+
+
+def _build_unique_term_base_name(db: Session, raw_name: str) -> str:
+    base_name = _normalize_term_base_name(raw_name)
+    if not base_name:
+        raise HTTPException(status_code=400, detail="术语库名称不能为空。")
+    base_name = base_name[:120].rstrip()
+    candidate = base_name
+    suffix_index = 2
+    while db.query(TermBase.id).filter(TermBase.name == candidate).first() is not None:
+        suffix = f" {suffix_index}"
+        candidate = f"{base_name[:120 - len(suffix)].rstrip()}{suffix}"
+        suffix_index += 1
+    return candidate
 
 
 def _require_term_language_pair(
@@ -673,6 +695,66 @@ def update_term_base(
         .count()
     )
     return _serialize_term_base(term_base, entry_count)
+
+
+@router.post("/term-bases/{term_base_id}/copy-language-pair")
+def copy_term_base_to_language_pair(
+    term_base_id: UUID,
+    payload: TermBaseLanguagePairCopyPayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    source_term_base = _get_term_base_or_404(db, term_base_id)
+    source_language, target_language = _require_term_language_pair(
+        payload.source_language,
+        payload.target_language,
+    )
+    default_name = f"{source_term_base.name} {source_language}->{target_language}"
+    name = _build_unique_term_base_name(db, payload.name or default_name)
+
+    target_term_base = TermBase(
+        name=name,
+        description=normalize_text(
+            payload.description if payload.description is not None else (source_term_base.description or "")
+        ) or None,
+        source_language=source_language,
+        target_language=target_language,
+        creator_id=current_user.id,
+    )
+    db.add(target_term_base)
+    try:
+        db.flush()
+        source_entries = (
+            db.query(TermEntry)
+            .filter(TermEntry.term_base_id == source_term_base.id)
+            .order_by(TermEntry.created_at.asc(), TermEntry.id.asc())
+            .all()
+        )
+        for entry in source_entries:
+            db.add(TermEntry(
+                term_base_id=target_term_base.id,
+                source_text=entry.source_text,
+                target_text=entry.target_text,
+                source_normalized=entry.source_normalized,
+                source_language=source_language,
+                target_language=target_language,
+                creator_id=entry.creator_id or current_user.id,
+                last_modified_by_id=current_user.id,
+                external_tuid=entry.external_tuid,
+                tmx_metadata=deepcopy(entry.tmx_metadata),
+            ))
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="复制术语库失败，可能存在同名库。") from exc
+
+    db.refresh(target_term_base)
+    entry_count = (
+        db.query(TermEntry)
+        .filter(TermEntry.term_base_id == target_term_base.id)
+        .count()
+    )
+    return _serialize_term_base(target_term_base, entry_count)
 
 
 @router.delete("/term-bases/{term_base_id}")

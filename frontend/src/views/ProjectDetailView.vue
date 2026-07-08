@@ -96,7 +96,9 @@ import type {
   ProjectTranslationMemorySettingFile,
   ProjectTranslationMemorySettingGroup,
   ProjectTranslationMemorySettingsResponse,
+  TermBase,
   TermQAReport,
+  TMCollection,
   UploadCapabilitiesResponse,
   UploadCapability,
   UploadBatchLimits,
@@ -233,6 +235,7 @@ type AssignmentUserTypeFilter = 'all' | 'internal' | 'external'
 type AssignmentUserStateFilter = 'all' | 'selected' | 'unselected'
 type AssignmentFileStateFilter = 'all' | 'checked' | 'unchecked'
 type ProjectResourceCreateKind = 'tm' | 'term'
+type ProjectResourceLanguageAsset = TMCollection | TermBase
 
 interface PreTranslateProgressState {
   progress: number
@@ -577,6 +580,44 @@ const projectResourceCreateSubmitText = computed(() => {
   }
   return projectResourceCreateKind.value === 'tm' ? '创建记忆库' : '创建术语库'
 })
+const showProjectResourceLanguageDialog = ref(false)
+const projectResourceLanguageKind = ref<ProjectResourceCreateKind>('tm')
+const projectResourceLanguageTarget = reactive({
+  sourceLanguage: '',
+  targetLanguage: '',
+  pairLabel: '',
+})
+const projectResourceLanguageResources = ref<ProjectResourceLanguageAsset[]>([])
+const projectResourceLanguageSearchQuery = ref('')
+const projectResourceLanguageSelectedId = ref('')
+const projectResourceLanguageLoading = ref(false)
+const projectResourceLanguageSubmitting = ref(false)
+const projectResourceLanguageError = ref('')
+const projectResourceLanguageAssetLabel = computed(() => (
+  projectResourceLanguageKind.value === 'tm' ? '记忆库' : '术语库'
+))
+const projectResourceLanguageEntryLabel = computed(() => (
+  projectResourceLanguageKind.value === 'tm' ? '条记忆条目' : '条术语'
+))
+const projectResourceLanguageTitle = computed(() => (
+  `复制${projectResourceLanguageAssetLabel.value}为当前语言对`
+))
+const projectResourceLanguageDescription = computed(() => (
+  `从已有${projectResourceLanguageAssetLabel.value}复制一个当前项目分组语言对的新库，原库不会被修改。`
+))
+const filteredProjectResourceLanguageResources = computed(() => {
+  const keywords = getResourceSettingsSearchKeywords(projectResourceLanguageSearchQuery.value)
+  if (keywords.length === 0) {
+    return projectResourceLanguageResources.value
+  }
+  return projectResourceLanguageResources.value.filter((resource) => {
+    const searchText = getProjectResourceLanguageSearchText(resource)
+    return keywords.every((keyword) => searchText.includes(keyword))
+  })
+})
+const selectedProjectResourceLanguageResource = computed(() => (
+  projectResourceLanguageResources.value.find((resource) => resource.id === projectResourceLanguageSelectedId.value) ?? null
+))
 const tmImportDialogContext = ref<{
   collectionId: string
   collectionName: string
@@ -3964,6 +4005,172 @@ function closeProjectResourceCreateDialog() {
   projectResourceCreateError.value = ''
 }
 
+function getProjectResourceLanguageSearchText(resource: ProjectResourceLanguageAsset) {
+  return [
+    resource.name,
+    resource.description,
+    resource.entry_count,
+    formatLanguagePair(resource.source_language, resource.target_language),
+    getLanguageLabel(resource.source_language),
+    getLanguageLabel(resource.target_language),
+    isProjectResourceLanguageTargetMatch(resource) ? '当前语言对 已匹配 matched' : '可复制 language pair mismatch',
+  ].map(normalizeResourceSettingsSearchText).join(' ')
+}
+
+function isProjectResourceLanguageTargetMatch(resource: ProjectResourceLanguageAsset) {
+  return resource.source_language === projectResourceLanguageTarget.sourceLanguage
+    && resource.target_language === projectResourceLanguageTarget.targetLanguage
+}
+
+function getProjectResourceLanguageEndpoint(resourceId: string) {
+  return projectResourceLanguageKind.value === 'tm'
+    ? `/translation-memory/collections/${resourceId}/copy-language-pair`
+    : `/term-bases/${resourceId}/copy-language-pair`
+}
+
+function buildProjectResourceLanguageCopyName(resource: ProjectResourceLanguageAsset) {
+  return `${resource.name} ${projectResourceLanguageTarget.pairLabel}`
+}
+
+function findProjectResourceLanguageTMGroup() {
+  return translationMemorySettings.value?.groups.find((group) => (
+    group.source_language === projectResourceLanguageTarget.sourceLanguage
+    && group.target_language === projectResourceLanguageTarget.targetLanguage
+  )) ?? null
+}
+
+function findProjectResourceLanguageTermGroup() {
+  return termBaseSettings.value?.groups.find((group) => (
+    group.source_language === projectResourceLanguageTarget.sourceLanguage
+    && group.target_language === projectResourceLanguageTarget.targetLanguage
+  )) ?? null
+}
+
+async function loadProjectResourceLanguageResources() {
+  projectResourceLanguageLoading.value = true
+  projectResourceLanguageError.value = ''
+  try {
+    const endpoint = projectResourceLanguageKind.value === 'tm'
+      ? '/translation-memory/collections'
+      : '/term-bases'
+    const { data } = await http.get<ProjectResourceLanguageAsset[]>(endpoint)
+    projectResourceLanguageResources.value = data
+    const selectedStillExists = data.some((resource) => resource.id === projectResourceLanguageSelectedId.value)
+    if (!selectedStillExists) {
+      projectResourceLanguageSelectedId.value = data.find((resource) => !isProjectResourceLanguageTargetMatch(resource))?.id
+        ?? ''
+    }
+  } catch (error) {
+    projectResourceLanguageResources.value = []
+    projectResourceLanguageSelectedId.value = ''
+    projectResourceLanguageError.value = getErrorMessage(error, `${projectResourceLanguageAssetLabel.value}列表加载失败。`)
+  } finally {
+    projectResourceLanguageLoading.value = false
+  }
+}
+
+function openProjectResourceLanguageDialog(
+  kind: ProjectResourceCreateKind,
+  group: ProjectTranslationMemorySettingGroup | ProjectTermBaseSettingGroup,
+) {
+  if (projectResourceLanguageSubmitting.value) {
+    return
+  }
+  projectResourceLanguageKind.value = kind
+  projectResourceLanguageTarget.sourceLanguage = group.source_language
+  projectResourceLanguageTarget.targetLanguage = group.target_language
+  projectResourceLanguageTarget.pairLabel = formatLanguagePair(group.source_language, group.target_language)
+  projectResourceLanguageSearchQuery.value = ''
+  projectResourceLanguageSelectedId.value = ''
+  projectResourceLanguageError.value = ''
+  showProjectResourceLanguageDialog.value = true
+  void loadProjectResourceLanguageResources()
+}
+
+function closeProjectResourceLanguageDialog() {
+  if (projectResourceLanguageSubmitting.value || projectResourceLanguageLoading.value) {
+    return
+  }
+  showProjectResourceLanguageDialog.value = false
+  projectResourceLanguageError.value = ''
+}
+
+async function submitProjectResourceLanguageDialog() {
+  const resource = selectedProjectResourceLanguageResource.value
+  if (!resource) {
+    projectResourceLanguageError.value = `请先选择要复制的${projectResourceLanguageAssetLabel.value}。`
+    return
+  }
+  if (isProjectResourceLanguageTargetMatch(resource)) {
+    projectResourceLanguageError.value = `该${projectResourceLanguageAssetLabel.value}已经是当前分组语言对，可直接在列表中启用。`
+    return
+  }
+  if (!projectResourceLanguageTarget.sourceLanguage || !projectResourceLanguageTarget.targetLanguage) {
+    projectResourceLanguageError.value = '当前项目分组缺少语言对，无法复制。'
+    return
+  }
+
+  const accepted = await confirm({
+    title: projectResourceLanguageTitle.value,
+    message: `将从“${resource.name}”复制一个 ${projectResourceLanguageTarget.pairLabel} 的新${projectResourceLanguageAssetLabel.value}，并复制其中 ${resource.entry_count} ${projectResourceLanguageEntryLabel.value}。原库仍保留 ${formatLanguagePair(resource.source_language, resource.target_language)}，不会影响其它项目。`,
+    confirmText: '复制并启用',
+  })
+  if (!accepted) {
+    return
+  }
+
+  projectResourceLanguageSubmitting.value = true
+  projectResourceLanguageError.value = ''
+  try {
+    const { data } = await http.post<ProjectResourceLanguageAsset>(getProjectResourceLanguageEndpoint(resource.id), {
+      name: buildProjectResourceLanguageCopyName(resource),
+      description: resource.description || null,
+      source_language: projectResourceLanguageTarget.sourceLanguage,
+      target_language: projectResourceLanguageTarget.targetLanguage,
+    })
+    if (projectResourceLanguageKind.value === 'tm') {
+      await loadProjectTranslationMemorySettings()
+      const nextGroup = findProjectResourceLanguageTMGroup()
+      if (nextGroup?.collections.some((collection) => collection.id === data.id)) {
+        for (const file of nextGroup.files) {
+          if (!file.collection_ids.includes(data.id)) {
+            file.collection_ids = [...file.collection_ids, data.id]
+          }
+          if (!file.collection_id) {
+            file.collection_id = data.id
+          }
+        }
+        moveTMCollectionToTop(nextGroup, data.id)
+        tmSettingsSearchQuery.value = ''
+        await saveProjectTranslationMemorySettings(false)
+      }
+    } else {
+      await loadProjectTermBaseSettings()
+      const nextGroup = findProjectResourceLanguageTermGroup()
+      const createdRow = nextGroup?.term_bases.find((row) => row.id === data.id)
+      if (nextGroup && createdRow) {
+        createdRow.enabled = true
+        createdRow.writable = true
+        createdRow.qa = false
+        moveTermBaseRowToTop(nextGroup, data.id)
+        termBaseSettingsSearchQuery.value = ''
+        await saveProjectTermBaseSettings(false)
+      }
+    }
+    toast.success(`已复制并启用${projectResourceLanguageAssetLabel.value}：${data.name || resource.name}`)
+    showProjectResourceLanguageDialog.value = false
+  } catch (error) {
+    projectResourceLanguageError.value = getErrorMessage(error, `${projectResourceLanguageAssetLabel.value}复制失败。`)
+    toast.show({
+      tone: 'error',
+      title: `${projectResourceLanguageAssetLabel.value}复制失败`,
+      message: projectResourceLanguageError.value,
+    })
+  } finally {
+    projectResourceLanguageSubmitting.value = false
+  }
+}
+
 function createTranslationMemoryForGroup(group: ProjectTranslationMemorySettingGroup) {
   openProjectResourceCreateDialog('tm', group)
 }
@@ -5684,6 +5891,17 @@ onBeforeUnmount(() => {
                           <Plus v-else :size="14" />
                           新建
                         </button>
+                        <button
+                          class="button term-settings__create"
+                          type="button"
+                          :disabled="projectResourceLanguageLoading || projectResourceLanguageSubmitting"
+                          :title="`复制已有记忆库为 ${getTranslationMemorySettingPairLabel(group)}`"
+                          :aria-label="`复制已有记忆库为 ${getTranslationMemorySettingPairLabel(group)}`"
+                          @click="openProjectResourceLanguageDialog('tm', group)"
+                        >
+                          <Settings2 :size="14" />
+                          复制语言对
+                        </button>
                       </div>
                     </div>
 
@@ -5938,6 +6156,17 @@ onBeforeUnmount(() => {
                         <Loader2 v-if="creatingTermBasePair === termBaseSettingGroupKey(group)" class="lucide-spin" :size="14" />
                         <Plus v-else :size="14" />
                         新建
+                      </button>
+                      <button
+                        class="button term-settings__create"
+                        type="button"
+                        :disabled="projectResourceLanguageLoading || projectResourceLanguageSubmitting"
+                        :title="`复制已有术语库为 ${getTermBaseSettingPairLabel(group)}`"
+                        :aria-label="`复制已有术语库为 ${getTermBaseSettingPairLabel(group)}`"
+                        @click="openProjectResourceLanguageDialog('term', group)"
+                      >
+                        <Settings2 :size="14" />
+                        复制语言对
                       </button>
                     </div>
 
@@ -7565,6 +7794,100 @@ onBeforeUnmount(() => {
           <Loader2 v-if="projectResourceCreateSubmitting" class="lucide-spin" :size="14" />
           <Plus v-else :size="14" />
           {{ projectResourceCreateSubmitText }}
+        </button>
+      </template>
+    </Modal>
+
+    <Modal
+      :open="showProjectResourceLanguageDialog"
+      :title="projectResourceLanguageTitle"
+      :description="projectResourceLanguageDescription"
+      width="min(720px, calc(100vw - 32px))"
+      :close-on-overlay="!projectResourceLanguageSubmitting && !projectResourceLanguageLoading"
+      :close-on-esc="!projectResourceLanguageSubmitting && !projectResourceLanguageLoading"
+      @close="closeProjectResourceLanguageDialog"
+    >
+      <div class="project-resource-language-dialog">
+        <div class="project-resource-language-target">
+          <span>新库语言对</span>
+          <strong>{{ projectResourceLanguageTarget.pairLabel }}</strong>
+        </div>
+
+        <label class="resource-settings-search__field project-resource-language-search">
+          <Search :size="14" />
+          <input
+            v-model="projectResourceLanguageSearchQuery"
+            type="search"
+            :placeholder="`搜索${projectResourceLanguageAssetLabel}名称、说明或语言对`"
+            :disabled="projectResourceLanguageLoading || projectResourceLanguageSubmitting"
+          >
+        </label>
+
+        <StateView
+          v-if="projectResourceLanguageLoading"
+          kind="loading"
+          :title="`正在加载${projectResourceLanguageAssetLabel}`"
+          message="正在读取语言资产列表。"
+        />
+        <div v-else-if="projectResourceLanguageResources.length === 0" class="empty-state">
+          当前还没有可复制的{{ projectResourceLanguageAssetLabel }}。
+        </div>
+        <div v-else class="project-resource-language-list">
+          <label
+            v-for="resource in filteredProjectResourceLanguageResources"
+            :key="resource.id"
+            class="project-resource-language-item"
+            :class="{
+              'is-selected': projectResourceLanguageSelectedId === resource.id,
+              'is-current': isProjectResourceLanguageTargetMatch(resource),
+            }"
+          >
+            <input
+              v-model="projectResourceLanguageSelectedId"
+              type="radio"
+              name="project-resource-language-resource"
+              :value="resource.id"
+              :disabled="projectResourceLanguageSubmitting || isProjectResourceLanguageTargetMatch(resource)"
+            >
+            <span class="project-resource-language-item__body">
+              <strong>{{ resource.name }}</strong>
+              <span>{{ resource.description || '无说明' }}</span>
+            </span>
+            <span class="project-resource-language-item__meta">
+              <small>{{ formatLanguagePair(resource.source_language, resource.target_language) }}</small>
+              <small>{{ resource.entry_count }} {{ projectResourceLanguageEntryLabel }}</small>
+            </span>
+            <span v-if="isProjectResourceLanguageTargetMatch(resource)" class="tag">已匹配</span>
+          </label>
+          <div v-if="filteredProjectResourceLanguageResources.length === 0" class="empty-state">
+            没有符合搜索条件的{{ projectResourceLanguageAssetLabel }}。
+          </div>
+        </div>
+
+        <p class="hint-text">
+          选择一个已有{{ projectResourceLanguageAssetLabel }}后复制，系统会创建新库并把新库条目的语言对写为当前项目分组，原库保持不变。
+        </p>
+        <p v-if="projectResourceLanguageError" class="form-message is-error">{{ projectResourceLanguageError }}</p>
+      </div>
+
+      <template #footer>
+        <button
+          class="button"
+          type="button"
+          :disabled="projectResourceLanguageSubmitting || projectResourceLanguageLoading"
+          @click="closeProjectResourceLanguageDialog"
+        >
+          取消
+        </button>
+        <button
+          class="button button--primary"
+          type="button"
+          :disabled="projectResourceLanguageSubmitting || projectResourceLanguageLoading || !projectResourceLanguageSelectedId"
+          @click="submitProjectResourceLanguageDialog"
+        >
+          <Loader2 v-if="projectResourceLanguageSubmitting" class="lucide-spin" :size="14" />
+          <Settings2 v-else :size="14" />
+          {{ projectResourceLanguageSubmitting ? '复制中...' : '复制并启用' }}
         </button>
       </template>
     </Modal>
@@ -11063,6 +11386,111 @@ onBeforeUnmount(() => {
 .resource-settings-search__clear:hover {
   border-color: var(--line-strong);
   color: var(--brand-700);
+}
+
+.project-resource-language-dialog {
+  display: grid;
+  gap: 12px;
+}
+
+.project-resource-language-target {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--brand-050) 62%, var(--surface-panel));
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.project-resource-language-target strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--brand-700);
+  font-weight: 700;
+}
+
+.project-resource-language-search {
+  flex-basis: 100%;
+  min-width: 0;
+}
+
+.project-resource-language-list {
+  display: grid;
+  gap: 8px;
+  max-height: 360px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.project-resource-language-item {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) minmax(150px, auto) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 58px;
+  padding: 9px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  cursor: pointer;
+  transition:
+    border-color var(--motion-base) var(--ease-standard),
+    background var(--motion-base) var(--ease-standard);
+}
+
+.project-resource-language-item:hover {
+  border-color: color-mix(in srgb, var(--brand-700) 28%, var(--line-soft));
+  background: color-mix(in srgb, var(--brand-050) 42%, var(--surface-panel));
+}
+
+.project-resource-language-item.is-selected {
+  border-color: color-mix(in srgb, var(--brand-700) 48%, var(--line-soft));
+  background: var(--brand-050);
+}
+
+.project-resource-language-item.is-current {
+  cursor: not-allowed;
+  opacity: 0.72;
+}
+
+.project-resource-language-item input {
+  width: 16px;
+  height: 16px;
+}
+
+.project-resource-language-item__body {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.project-resource-language-item__body strong,
+.project-resource-language-item__body span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-resource-language-item__body strong {
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.project-resource-language-item__body span,
+.project-resource-language-item__meta small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.project-resource-language-item__meta {
+  display: grid;
+  justify-items: end;
+  gap: 2px;
+  white-space: nowrap;
 }
 
 .tm-settings__bulk {

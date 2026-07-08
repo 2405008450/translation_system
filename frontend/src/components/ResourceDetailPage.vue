@@ -25,7 +25,7 @@ import Pagination from '../components/Pagination.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { usePageHeader } from '../composables/usePageHeader'
-import { getLanguageLabel } from '../constants/languages'
+import { getLanguageLabel, languageOptions } from '../constants/languages'
 import { useAuthStore } from '../stores/auth'
 import type { PaginatedResponse, TermBase, TermEntryRecord, TMCollection, TMEntryRecord } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
@@ -95,6 +95,8 @@ const currentExportTaskId = ref('')
 const updatingResource = ref(false)
 const editResourceName = ref('')
 const editResourceDescription = ref('')
+const editResourceSourceLanguage = ref('')
+const editResourceTargetLanguage = ref('')
 const newSourceText = ref('')
 const newTargetText = ref('')
 const editingEntryId = ref('')
@@ -311,6 +313,8 @@ function openResourceEditDialog() {
   }
   editResourceName.value = resource.value.name
   editResourceDescription.value = resource.value.description || ''
+  editResourceSourceLanguage.value = resource.value.source_language || ''
+  editResourceTargetLanguage.value = resource.value.target_language || ''
   entryMessage.value = ''
   showResourceEditDialog.value = true
 }
@@ -375,8 +379,12 @@ async function updateResourceInfo() {
     entryMessage.value = `${copy.value.assetLabel}名称不能为空。`
     return
   }
-  if (!resource.value.source_language || !resource.value.target_language) {
-    entryMessage.value = `${copy.value.assetLabel}缺少语言对，暂时无法保存名称。`
+  if (!editResourceSourceLanguage.value || !editResourceTargetLanguage.value) {
+    entryMessage.value = '请先选择源语言和目标语言。'
+    return
+  }
+  if (editResourceSourceLanguage.value === editResourceTargetLanguage.value) {
+    entryMessage.value = '源语言和目标语言不能相同。'
     return
   }
 
@@ -386,8 +394,8 @@ async function updateResourceInfo() {
     await http.put<ResourceRecord>(copy.value.updateEndpoint, {
       name,
       description: editResourceDescription.value.trim() || null,
-      source_language: resource.value.source_language,
-      target_language: resource.value.target_language,
+      source_language: editResourceSourceLanguage.value,
+      target_language: editResourceTargetLanguage.value,
     })
     showResourceEditDialog.value = false
     await loadResource()
@@ -1023,7 +1031,7 @@ onUnmounted(() => {
       v-if="canManageResources"
       :open="showResourceEditDialog"
       :title="`编辑${copy.assetLabel}信息`"
-      :description="`修改${copy.assetLabel}名称和说明。`"
+      :description="`修改${copy.assetLabel}名称、说明和语言对。`"
       width="min(620px, calc(100vw - 32px))"
       @close="closeResourceEditDialog"
     >
@@ -1036,7 +1044,28 @@ onUnmounted(() => {
           <span class="field__label">说明</span>
           <input v-model="editResourceDescription" class="field__control" type="text" placeholder="可选" />
         </label>
+        <label class="field">
+          <span class="field__label">源语言</span>
+          <select v-model="editResourceSourceLanguage" class="field__control">
+            <option value="">请选择</option>
+            <option v-for="option in languageOptions" :key="option.code" :value="option.code">
+              {{ option.label }}
+            </option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="field__label">目标语言</span>
+          <select v-model="editResourceTargetLanguage" class="field__control">
+            <option value="">请选择</option>
+            <option v-for="option in languageOptions" :key="option.code" :value="option.code">
+              {{ option.label }}
+            </option>
+          </select>
+        </label>
       </div>
+      <p class="hint-text resource-detail-language-note">
+        保存后会同步更新当前{{ copy.assetLabel }}下已有{{ copy.entryName }}的语言对，并影响所有项目的资源筛选；仅在确认原库语言对标错时使用。
+      </p>
 
       <template #footer>
         <button class="button" type="button" :disabled="updatingResource" @click="closeResourceEditDialog">
