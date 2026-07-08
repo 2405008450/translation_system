@@ -30,6 +30,55 @@ def get_reference_llm_helper(settings) -> Optional[ReferenceLLMHelper]:
     return ReferenceLLMHelper(api_key=api_key, model=model, base_url=base_url)
 
 
+def _parse_reference_doc(
+    file_path: str,
+    filename: str,
+    llm_helper: Optional[ReferenceLLMHelper],
+) -> Document:
+    """解析参考文档：PDF 优先走 pdfplumber 结构化解析（和 docx 同源），
+    仅在提取内容明显不足（疑似扫描版）时回退到 LLM 视觉提取。
+    """
+    is_pdf = file_path.lower().endswith('.pdf')
+    doc = parse_file(file_path)
+
+    if not is_pdf:
+        return doc
+
+    # 判断结构化解析是否成功：段落数太少或总文本极短就认为是扫描版
+    raw_text_len = len(doc.raw_text or "")
+    para_count = len(doc.paragraphs or [])
+    looks_empty = para_count < 3 or raw_text_len < 50
+
+    if not looks_empty:
+        print(
+            f"[ReferenceAnalyzer] PDF 结构化解析成功: {filename} "
+            f"段落数={para_count}, 文本长度={raw_text_len}"
+        )
+        return doc
+
+    if llm_helper is None:
+        print(
+            f"[ReferenceAnalyzer] PDF 结构化解析内容偏少（{para_count}段/{raw_text_len}字），"
+            f"且未配置LLM，保留原结果: {filename}"
+        )
+        return doc
+
+    print(
+        f"[ReferenceAnalyzer] PDF 结构化解析内容偏少（{para_count}段/{raw_text_len}字），"
+        f"回退到LLM提取: {filename}"
+    )
+    text = llm_helper.extract_pdf_text(file_path)
+    if not text or not text.strip():
+        return doc
+
+    return Document(
+        paragraphs=[Paragraph(text=p) for p in text.split('\n') if p.strip()],
+        tables=[],
+        filename=filename,
+        raw_text=text,
+    )
+
+
 def analyze_reference_files(
     file_paths: List[str],
     bilingual_pairs: Optional[List[Tuple[str, str]]] = None,
@@ -97,35 +146,14 @@ def analyze_reference_files(
             if progress_reporter:
                 progress_reporter.parsing_files(file_index, total_files, source_filename)
             
-            # 如果是 PDF 且有 LLM，用 LLM 提取文本
-            if source_path.lower().endswith('.pdf') and llm_helper:
-                print(f"[ReferenceAnalyzer] 使用LLM提取PDF文本: {source_path}")
-                source_text = llm_helper.extract_pdf_text(source_path)
-                source_doc = Document(
-                    paragraphs=[Paragraph(text=p) for p in source_text.split('\n') if p.strip()],
-                    tables=[],
-                    filename=source_filename,
-                    raw_text=source_text,
-                )
-            else:
-                source_doc = parse_file(source_path)
+            source_doc = _parse_reference_doc(source_path, source_filename, llm_helper)
             
             # 解析译文
             file_index += 1
             if progress_reporter:
                 progress_reporter.parsing_files(file_index, total_files, target_filename)
             
-            if target_path.lower().endswith('.pdf') and llm_helper:
-                print(f"[ReferenceAnalyzer] 使用LLM提取PDF文本: {target_path}")
-                target_text = llm_helper.extract_pdf_text(target_path)
-                target_doc = Document(
-                    paragraphs=[Paragraph(text=p) for p in target_text.split('\n') if p.strip()],
-                    tables=[],
-                    filename=target_filename,
-                    raw_text=target_text,
-                )
-            else:
-                target_doc = parse_file(target_path)
+            target_doc = _parse_reference_doc(target_path, target_filename, llm_helper)
             
             print(f"[ReferenceAnalyzer] 原文文件: {source_doc.filename}, 段落数: {len(source_doc.paragraphs)}")
             print(f"[ReferenceAnalyzer] 译文文件: {target_doc.filename}, 段落数: {len(target_doc.paragraphs)}")
