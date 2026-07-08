@@ -68,12 +68,12 @@ EXPORT_OPTIONS = {
         extension=".docx",
         mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ),
-    "bilingual_pptx_docx_layout": ExportOption(
-        id="bilingual_pptx_docx_layout",
-        name="PPTX 双语 Word",
-        description="按幻灯片阅读顺序导出双语 Word，尽量保留文本框、表格、备注等结构",
-        extension=".docx",
-        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "bilingual_pptx_original": ExportOption(
+        id="bilingual_pptx_original",
+        name="PPTX 原格式双语",
+        description="保留原 PPTX 幻灯片结构，在原文本位置按原文、译文换行导出",
+        extension=".pptx",
+        mime_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ),
     "bilingual_txt": ExportOption(
         id="bilingual_txt",
@@ -147,7 +147,7 @@ FORMAT_EXPORT_SUPPORT: Dict[str, List[str]] = {
     ".pdf": ["bilingual_docx", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],  # PDF 无法原格式导出
     ".pptx": [
         "original",
-        "bilingual_pptx_docx_layout",
+        "bilingual_pptx_original",
         "bilingual_docx",
         "bilingual_excel",
         "bilingual_txt",

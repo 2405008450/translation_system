@@ -22,7 +22,7 @@ const EXPORT_OPTION_GROUPS = [
     label: '双语审校',
     optionIds: [
       'bilingual_excel_original',
-      'bilingual_pptx_docx_layout',
+      'bilingual_pptx_original',
       'bilingual_docx_layout_source_first',
       'bilingual_docx_layout_target_first',
       'bilingual_docx',

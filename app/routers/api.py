@@ -312,15 +312,15 @@ from app.services.resource_export_queue import (
     queue_resource_export,
 )
 from app.services.slate_parser import parse_docx_for_slate
-from app.services.adapters.pptx_bilingual_docx_exporter import PPTX_BILINGUAL_DOCX_EXPORT_TYPE
 from app.services.task_file_service import (
     BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS,
+    BILINGUAL_PPTX_EXPORT_TYPE,
     DOCUMENT_PARSE_MODE_FULL,
     UploadLimitError,
     build_task_preview_html,
     build_task_workspace,
     can_export_task_file,
-    export_bilingual_pptx_task_docx,
+    export_bilingual_pptx_task_file,
     export_bilingual_task_docx_with_layout,
     export_bilingual_xlsx_task_file,
     export_translated_task_file,
@@ -12357,7 +12357,7 @@ def export_file_record_with_type(
     Args:
         file_record_id: 文件记录 ID
         export_type: 导出类型 (source, original, bilingual, bilingual_docx,
-            bilingual_pptx_docx_layout, bilingual_excel_original, bilingual_excel,
+            bilingual_pptx_original, bilingual_excel_original, bilingual_excel,
             bilingual_txt, tmx, xliff, xliff2)
     """
     from app.services.adapters import export_file
@@ -12454,15 +12454,15 @@ def export_file_record_with_type(
             media_type=exported_file.media_type,
         )
 
-    if export_type == PPTX_BILINGUAL_DOCX_EXPORT_TYPE:
+    if export_type == BILINGUAL_PPTX_EXPORT_TYPE:
         source_filename = get_file_record_source_filename(file_record)
         if get_task_file_extension(source_filename) != ".pptx":
             raise HTTPException(
                 status_code=400,
-                detail="Only PPTX source files support slide-structured bilingual Word export.",
+                detail="Only PPTX source files support original-format bilingual PPTX export.",
             )
         try:
-            exported_file = export_bilingual_pptx_task_docx(
+            exported_file = export_bilingual_pptx_task_file(
                 raw_bytes=raw_bytes,
                 filename=source_filename,
                 segments=segments,

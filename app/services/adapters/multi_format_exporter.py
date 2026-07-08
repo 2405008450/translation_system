@@ -81,6 +81,13 @@ class MultiFormatExporter:
                 base_name,
                 original_bytes,
             )
+        if export_type == "bilingual_pptx_original":
+            return self._export_bilingual_pptx_original(
+                extension,
+                normalized_segments,
+                base_name,
+                original_bytes,
+            )
         if export_type == "bilingual_excel":
             return self._export_bilingual_excel(normalized_segments, base_name)
         if export_type == "tmx":
@@ -597,6 +604,26 @@ class MultiFormatExporter:
             XlsxExporter().export(original_bytes, segments, bilingual=True),
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             f"{base_name}_bilingual.xlsx",
+        )
+
+    def _export_bilingual_pptx_original(
+        self,
+        extension: str,
+        segments: list[dict[str, Any]],
+        base_name: str,
+        original_bytes: bytes | None,
+    ) -> tuple[bytes, str, str]:
+        if extension != ".pptx":
+            raise ValueError("Original-format bilingual PPTX export requires a PPTX source file.")
+        if original_bytes is None:
+            raise ValueError("Original-format bilingual PPTX export requires the original source file.")
+
+        from app.services.adapters.pptx_exporter import PPTX_MEDIA_TYPE, PptxExporter
+
+        return (
+            PptxExporter().export(original_bytes, segments, bilingual=True),
+            PPTX_MEDIA_TYPE,
+            f"{base_name}_bilingual.pptx",
         )
 
     def _export_tmx(

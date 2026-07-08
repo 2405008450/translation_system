@@ -13,7 +13,6 @@ from app.services.adapters.base import DEFAULT_MAX_FILE_SIZE, FORMAT_SIZE_LIMITS
 from app.services.adapters.export_formats import get_supported_exports
 from app.services.adapters.models import BlockNode, DocumentAST, NodeType, ParseResult
 from app.services.adapters.multi_format_exporter import export_file as export_multi_format_file
-from app.services.adapters.pptx_bilingual_docx_exporter import PptxBilingualDocxExporter
 from app.services.document_exporter import (
     BILINGUAL_LAYOUT_SOURCE_FIRST,
     BILINGUAL_LAYOUT_TARGET_FIRST,
@@ -443,6 +442,7 @@ BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS = {
     "bilingual_docx_layout_source_first": BILINGUAL_LAYOUT_SOURCE_FIRST,
     "bilingual_docx_layout_target_first": BILINGUAL_LAYOUT_TARGET_FIRST,
 }
+BILINGUAL_PPTX_EXPORT_TYPE = "bilingual_pptx_original"
 
 
 def get_task_file_extension(filename: str) -> str:
@@ -823,27 +823,34 @@ def export_bilingual_xlsx_task_file(
     )
 
 
-def export_bilingual_pptx_task_docx(
+def export_bilingual_pptx_task_file(
     raw_bytes: bytes | None,
     filename: str,
     segments: list[Any],
     document_parse_options: dict[str, object] | str | None = None,
 ) -> ExportedTaskFile:
     if get_task_file_extension(filename) != ".pptx":
-        raise ValueError("仅 PPTX 源文件支持按幻灯片结构导出双语 Word。")
+        raise ValueError("仅 PPTX 源文件支持原格式双语 PPTX 导出。")
     if raw_bytes is None:
-        raise ValueError("PPTX 源文件缺失，暂时无法导出双语 Word。")
+        raise ValueError("PPTX 源文件缺失，暂时无法导出原格式双语 PPTX。")
 
-    content, media_type, export_filename = PptxBilingualDocxExporter().export(
+    from app.services.adapters.pptx_exporter import PPTX_MEDIA_TYPE, PptxExporter
+
+    export_segments = build_export_segments_from_source(
         raw_bytes,
-        segments,
         filename,
+        segments,
         document_parse_options=document_parse_options,
     )
     return ExportedTaskFile(
-        content=content,
-        media_type=media_type,
-        filename=export_filename,
+        content=PptxExporter().export(
+            raw_bytes,
+            export_segments,
+            document_parse_options=document_parse_options,
+            bilingual=True,
+        ),
+        media_type=PPTX_MEDIA_TYPE,
+        filename=_build_bilingual_pptx_filename(filename),
     )
 
 
@@ -1121,3 +1128,9 @@ def _build_bilingual_xlsx_filename(filename: str) -> str:
     path = Path(filename or "bilingual.xlsx")
     stem = path.stem or "bilingual"
     return f"{stem}_bilingual.xlsx"
+
+
+def _build_bilingual_pptx_filename(filename: str) -> str:
+    path = Path(filename or "bilingual.pptx")
+    stem = path.stem or "bilingual"
+    return f"{stem}_bilingual.pptx"
