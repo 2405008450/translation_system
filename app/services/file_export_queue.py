@@ -21,10 +21,12 @@ from app.config import get_settings
 from app.database import SessionLocal, engine
 from app.models import FileExportTask, FileRecord, User
 from app.services.adapters import export_file
+from app.services.adapters.pptx_bilingual_docx_exporter import PPTX_BILINGUAL_DOCX_EXPORT_TYPE
 from app.services.task_file_service import (
     BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS,
     DOCUMENT_PARSE_MODE_FULL,
     can_export_task_file,
+    export_bilingual_pptx_task_docx,
     export_bilingual_task_docx_with_layout,
     export_bilingual_xlsx_task_file,
     export_translated_task_file,
@@ -475,6 +477,19 @@ def build_file_record_exported_file(
             filename=source_filename,
             segments=segments,
             document_parse_options=document_parse_options,
+        )
+
+    if export_type == PPTX_BILINGUAL_DOCX_EXPORT_TYPE:
+        if get_task_file_extension(source_filename) != ".pptx":
+            raise ValueError("Only PPTX source files support slide-structured bilingual Word export.")
+        return _apply_style_settings_to_export(
+            export_bilingual_pptx_task_docx(
+                raw_bytes=raw_bytes,
+                filename=source_filename,
+                segments=segments,
+                document_parse_options=document_parse_options,
+            ),
+            style_settings,
         )
 
     segment_dicts = [

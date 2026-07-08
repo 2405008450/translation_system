@@ -13,6 +13,7 @@ from app.services.adapters.base import DEFAULT_MAX_FILE_SIZE, FORMAT_SIZE_LIMITS
 from app.services.adapters.export_formats import get_supported_exports
 from app.services.adapters.models import BlockNode, DocumentAST, NodeType, ParseResult
 from app.services.adapters.multi_format_exporter import export_file as export_multi_format_file
+from app.services.adapters.pptx_bilingual_docx_exporter import PptxBilingualDocxExporter
 from app.services.document_exporter import (
     BILINGUAL_LAYOUT_SOURCE_FIRST,
     BILINGUAL_LAYOUT_TARGET_FIRST,
@@ -819,6 +820,30 @@ def export_bilingual_xlsx_task_file(
         ),
         media_type=XLSX_MEDIA_TYPE,
         filename=_build_bilingual_xlsx_filename(filename),
+    )
+
+
+def export_bilingual_pptx_task_docx(
+    raw_bytes: bytes | None,
+    filename: str,
+    segments: list[Any],
+    document_parse_options: dict[str, object] | str | None = None,
+) -> ExportedTaskFile:
+    if get_task_file_extension(filename) != ".pptx":
+        raise ValueError("仅 PPTX 源文件支持按幻灯片结构导出双语 Word。")
+    if raw_bytes is None:
+        raise ValueError("PPTX 源文件缺失，暂时无法导出双语 Word。")
+
+    content, media_type, export_filename = PptxBilingualDocxExporter().export(
+        raw_bytes,
+        segments,
+        filename,
+        document_parse_options=document_parse_options,
+    )
+    return ExportedTaskFile(
+        content=content,
+        media_type=media_type,
+        filename=export_filename,
     )
 
 
