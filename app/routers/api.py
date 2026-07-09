@@ -1465,7 +1465,11 @@ class SegmentConfirmationBatchUpdate(BaseModel):
 
 class SegmentSplitRequest(BaseModel):
     """拆分句段请求"""
-    split_offset: int = Field(..., ge=1, description="在 source_text 中的拆分位置（字符偏移）")
+    split_offset: int = Field(
+        ...,
+        ge=1,
+        description="在工作台原文（优先 display_text）中的拆分位置（字符偏移）",
+    )
 
 
 class SegmentMergeRequest(BaseModel):
@@ -12896,7 +12900,10 @@ def split_segment(
     current_user: User = Depends(get_current_user),
     operation_token: str | None = Header(default=None, alias=FILE_OPERATION_TOKEN_HEADER),
 ):
-    """拆分句段：在指定偏移位置将一个句段拆为两个。"""
+    """拆分句段：在指定偏移位置将一个句段拆为两个。
+
+    split_offset 以工作台展示原文为准（优先 display_text，与前端光标偏移一致）。
+    """
     file_record = _require_file_record_write_access(db, file_record_id, current_user, operation_token)
     segment = (
         db.query(Segment)
@@ -12907,24 +12914,54 @@ def split_segment(
         raise HTTPException(status_code=404, detail="片段不存在。")
 
     _require_segment_work_access(db, file_record, segment, current_user)
+
+    # 工作台原文：自动编号场景下前端展示的是 source_text（body），否则优先 display_text
+    numbering_text = ""
+    if is_word_document_filename(get_file_record_source_filename(file_record)):
+        numbering_text = get_automatic_numbering_text(
+            source_text=segment.source_text,
+            display_text=segment.display_text,
+        ) or ""
+    if numbering_text:
+        split_base_text = segment.source_text or ""
+    else:
+        split_base_text = segment.display_text or segment.source_text or ""
+
     source_text = segment.source_text or ""
-    if payload.split_offset <= 0 or payload.split_offset >= len(source_text):
+    display_text = segment.display_text or source_text
+    if payload.split_offset <= 0 or payload.split_offset >= len(split_base_text):
         raise HTTPException(status_code=400, detail="拆分位置无效，必须在文本范围内。")
 
-    # 拆分 source_text
-    first_source = source_text[:payload.split_offset].rstrip()
-    second_source = source_text[payload.split_offset:].lstrip()
+    # 按展示文本拆分，再规范化出 source_text，避免 display/source 偏移错位
+    first_display = split_base_text[:payload.split_offset].rstrip()
+    second_display = split_base_text[payload.split_offset:].lstrip()
+    if not first_display or not second_display:
+        raise HTTPException(status_code=400, detail="拆分后不能产生空句段。")
+
+    first_source = normalize_text(first_display)
+    second_source = normalize_text(second_display)
     if not first_source or not second_source:
         raise HTTPException(status_code=400, detail="拆分后不能产生空句段。")
 
+    # 若拆分基准不是完整 display_text（例如自动编号 body），仍尽量按比例切 display_text
+    if split_base_text == display_text:
+        first_display_text = first_display
+        second_display_text = second_display
+    elif display_text and len(display_text) >= 2:
+        ratio = payload.split_offset / max(len(split_base_text), 1)
+        display_offset = max(1, min(len(display_text) - 1, round(ratio * len(display_text))))
+        first_display_text = display_text[:display_offset].rstrip() or first_source
+        second_display_text = display_text[display_offset:].lstrip() or second_source
+    else:
+        first_display_text = first_source
+        second_display_text = second_source
+
     # 拆分 target_text（按同比例偏移，如果有译文的话）
     target_text = segment.target_text or ""
-    target_html = segment.target_html
     first_target = ""
     second_target = ""
     if target_text.strip():
-        # 按比例估算译文拆分点
-        ratio = payload.split_offset / len(source_text)
+        ratio = payload.split_offset / max(len(split_base_text), 1)
         target_offset = round(ratio * len(target_text))
         first_target = target_text[:target_offset].rstrip()
         second_target = target_text[target_offset:].lstrip()
@@ -12935,7 +12972,7 @@ def split_segment(
     # 更新原句段
     segment.source_text = first_source
     segment.source_hash = build_source_hash(first_source)
-    segment.display_text = first_source
+    segment.display_text = first_display_text
     segment.source_html = None
     segment.target_text = first_target
     segment.target_html = None
@@ -12959,7 +12996,7 @@ def split_segment(
         sentence_id=new_sentence_id,
         source_text=second_source,
         source_hash=build_source_hash(second_source),
-        display_text=second_source,
+        display_text=second_display_text,
         source_html=None,
         target_text=second_target,
         target_html=None,

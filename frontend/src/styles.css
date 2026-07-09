@@ -1963,10 +1963,16 @@ body.modal-open {
   box-shadow: none;
 }
 
+.workbench-page.is-stable-grid .segment-row__source-editor {
+  caret-color: #0b5f52;
+}
+
 .workbench-page.is-stable-grid .segment-row__source-editor.is-focused,
 .workbench-page.is-stable-grid .segment-row__source-editor.is-readonly.is-focused {
   border-color: transparent;
-  box-shadow: inset 0 0 0 2px rgba(13, 122, 104, 0.28);
+  background: #f3fbf9;
+  box-shadow: inset 0 0 0 2px rgba(13, 122, 104, 0.42);
+  caret-color: #063d35;
 }
 
 .workbench-page.is-stable-grid .workbench-rail__button:hover,
@@ -3252,6 +3258,7 @@ body.modal-open {
   overflow-wrap: anywhere;
   color: var(--ink-900);
   line-height: 1.58;
+  cursor: text;
 }
 
 .segment-row__textarea {

@@ -5274,7 +5274,7 @@ function handleSegmentClick(sentenceId: string, event: MouseEvent) {
 }
 
 /**
- * 监听原文编辑器中的光标变化，实时缓存偏移量
+ * 监听原文编辑器中的光标变化，实时缓存偏移量（相对 display_text）
  */
 function trackSourceCaretPosition() {
   if (!segmentStore.activeSentenceId) return
@@ -5291,12 +5291,19 @@ function trackSourceCaretPosition() {
   const preCaretRange = range.cloneRange()
   preCaretRange.selectNodeContents(sourceEditor)
   preCaretRange.setEnd(range.startContainer, range.startOffset)
-  lastSourceCaretOffset.value = preCaretRange.toString().length
+  // 可见换行标记渲染为 "¶\n"，折叠为真实换行长度
+  lastSourceCaretOffset.value = preCaretRange.toString().replace(/¶\n/g, '\n').replace(/¶/g, '\n').length
+}
+
+function handleSourceCaretChange(sentenceId: string, offset: number) {
+  if (sentenceId !== segmentStore.activeSentenceId) return
+  lastSourceCaretOffset.value = offset
 }
 
 const canSplitSegment = computed(() => {
   if (!activeSegment.value) return false
-  return activeSegmentCanWrite.value && (activeSegment.value.source_text || '').length >= 2
+  const displayText = getSegmentCopyableSourceText(activeSegment.value)
+  return activeSegmentCanWrite.value && displayText.length >= 2
 })
 
 const orderedSelectedMergeSegments = computed(() => {
@@ -5349,14 +5356,17 @@ const mergeSegmentButtonTitle = computed(() => {
 async function handleSplitSegment() {
   if (!activeSegment.value || !canSplitSegment.value) return
 
+  // 点击工具栏前再读一次光标，避免 selectionchange 漏记
+  trackSourceCaretPosition()
+
   const caretOffset = lastSourceCaretOffset.value
   if (caretOffset === null || caretOffset <= 0) {
     toast.warn({ message: t('workbench.messages.splitNoCaret') })
     return
   }
 
-  const sourceText = activeSegment.value.source_text || ''
-  if (caretOffset >= sourceText.length) {
+  const displayText = getSegmentCopyableSourceText(activeSegment.value)
+  if (caretOffset >= displayText.length) {
     toast.warn({ message: t('workbench.messages.splitNoCaret') })
     return
   }
@@ -5364,6 +5374,7 @@ async function handleSplitSegment() {
   try {
     await segmentStore.splitSegment(segmentKeyOf(activeSegment.value), caretOffset)
     lastSourceCaretOffset.value = null
+    sourceEditing.value = false
     // 刷新预览（如果预览面板已打开）
     if (activeBottomTool.value === 'source-preview' || activeBottomTool.value === 'split-preview') {
       await segmentStore.ensurePreviewLoaded('source')
@@ -6921,6 +6932,12 @@ function handleSegmentTargetActivate(sentenceId: string) {
   segmentStore.setActiveSentence(sentenceId)
 }
 
+function handleSegmentSourceActivate(sentenceId: string) {
+  selectedSentenceIds.value = new Set([sentenceId])
+  segmentSelectionAnchorId.value = sentenceId
+  segmentStore.setActiveSentence(sentenceId)
+}
+
 watch(() => props.id, () => {
   if (props.mergeViewId) {
     void loadMergeViewTask()
@@ -7577,7 +7594,14 @@ onBeforeRouteLeave(async () => {
                 </span>
               </span>
             </button>
-            <button class="tool-line tool-button" type="button" :disabled="!canSplitSegment" @click="handleSplitSegment">
+            <button
+              class="tool-line tool-button"
+              type="button"
+              :disabled="!canSplitSegment"
+              :title="t('workbench.shortcutItems.splitSegment')"
+              @mousedown.prevent
+              @click="handleSplitSegment"
+            >
               <span class="icon-text-area">
                 <span class="tool-item" :class="{ disabled: !canSplitSegment }">
                   <Split class="tool-label-icon" :size="16" />
@@ -8837,6 +8861,8 @@ onBeforeRouteLeave(async () => {
                       :pending-formats="pendingFormatsForEditor"
                       @focus="segmentStore.setActiveSentence"
                       @activate-target="handleSegmentTargetActivate"
+                      @activate-source="handleSegmentSourceActivate"
+                      @source-caret-change="handleSourceCaretChange"
                       @copy-source-to-target="copySourceToTargetForSegment"
                       @update="updateSegmentTarget"
                       @update-source="updateSegmentSource"
