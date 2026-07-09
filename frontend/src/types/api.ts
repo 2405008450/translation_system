@@ -523,7 +523,19 @@ export interface SegmentQAIssue {
 }
 
 export type WorkbenchQAResultItemSourceKind = 'segment_qa_issue' | 'term_qa_report_item'
-export type WorkbenchQAResultRuleKey = 'spelling_grammar' | 'term_inconsistency'
+export type WorkbenchQAResultRuleKey =
+  | 'spelling_grammar'
+  | 'term_inconsistency'
+  | 'paired_punctuation_missing'
+  | 'ending_punctuation_mismatch'
+  | 'repeated_punctuation'
+  | 'extra_space_after_punctuation'
+  | 'missing_space_after_punctuation'
+  | 'target_without_tag'
+  | 'target_tag_missing'
+  | 'unmatched_closing_tag'
+  | 'unmatched_opening_tag'
+  | 'target_placeholder_missing'
 
 export interface WorkbenchQAResultRule {
   key: WorkbenchQAResultRuleKey

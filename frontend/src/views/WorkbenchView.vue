@@ -470,6 +470,7 @@ const segmentEditorFontScale = ref(getInitialSegmentEditorFontScale())
 const activeSideTool = ref<SideToolKey | null>(null)
 const activeBottomTool = ref<BottomToolKey | null>(null)
 const openingBottomTool = ref<BottomDrawerToolKey | null>(null)
+const referenceMatchResult = ref<import('../types/api').ReferenceMatchResult | null>(null)
 const previewPanelRendering = ref(false)
 const bottomDrawerPanelHeightStyle = computed(() => {
   if (!activeBottomTool.value) {

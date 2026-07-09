@@ -239,8 +239,18 @@ from app.services.notification_service import (
 from app.services.spelling_grammar_qa import (
     QA_ISSUE_STATUS_IGNORED,
     QA_ISSUE_STATUS_OPEN,
+    QA_RULE_ENDING_PUNCTUATION_MISMATCH,
+    QA_RULE_EXTRA_SPACE_AFTER_PUNCTUATION,
+    QA_RULE_MISSING_SPACE_AFTER_PUNCTUATION,
+    QA_RULE_PAIRED_PUNCTUATION_MISSING,
+    QA_RULE_REPEATED_PUNCTUATION,
     QA_RULE_SPELLING_GRAMMAR,
+    QA_RULE_TARGET_PLACEHOLDER_MISSING,
+    QA_RULE_TARGET_TAG_MISSING,
+    QA_RULE_TARGET_WITHOUT_TAG,
     QA_RULE_TERM_INCONSISTENCY,
+    QA_RULE_UNMATCHED_CLOSING_TAG,
+    QA_RULE_UNMATCHED_OPENING_TAG,
     check_segments_with_languagetool,
     get_languagetool_language,
     get_supported_quality_qa_languages,
@@ -252,6 +262,13 @@ from app.services.spelling_grammar_qa import (
     run_spelling_grammar_qa_for_segment_ids,
     serialize_segment_qa_issue,
     store_quality_qa_settings,
+)
+from app.services.local_qa import (
+    LOCAL_QA_RULE_KEYS,
+    PUNCTUATION_QA_RULE_KEYS,
+    TAG_QA_RULE_KEYS,
+    check_segments_local_qa,
+    run_local_qa_for_segment_ids,
 )
 from app.services.file_export_queue import (
     build_file_export_download_response,
@@ -6748,11 +6765,40 @@ def _apply_term_qa_ignore_state(
 
 WORKBENCH_QA_ITEM_PREFIX_SEGMENT = "segment_qa_issue:"
 WORKBENCH_QA_ITEM_PREFIX_TERM = "term_qa_report_item:"
-WORKBENCH_QA_SUPPORTED_RULES = (QA_RULE_SPELLING_GRAMMAR, QA_RULE_TERM_INCONSISTENCY)
+WORKBENCH_QA_SUPPORTED_RULES = (
+    QA_RULE_TARGET_WITHOUT_TAG,
+    QA_RULE_TARGET_TAG_MISSING,
+    QA_RULE_UNMATCHED_CLOSING_TAG,
+    QA_RULE_UNMATCHED_OPENING_TAG,
+    QA_RULE_TARGET_PLACEHOLDER_MISSING,
+    QA_RULE_SPELLING_GRAMMAR,
+    QA_RULE_TERM_INCONSISTENCY,
+    QA_RULE_PAIRED_PUNCTUATION_MISSING,
+    QA_RULE_ENDING_PUNCTUATION_MISMATCH,
+    QA_RULE_REPEATED_PUNCTUATION,
+    QA_RULE_EXTRA_SPACE_AFTER_PUNCTUATION,
+    QA_RULE_MISSING_SPACE_AFTER_PUNCTUATION,
+)
 WORKBENCH_QA_RULE_LABELS = {
+    QA_RULE_TARGET_WITHOUT_TAG: "译文无标记",
+    QA_RULE_TARGET_TAG_MISSING: "译文标记丢失",
+    QA_RULE_UNMATCHED_CLOSING_TAG: "结束标记无匹配的开始标记",
+    QA_RULE_UNMATCHED_OPENING_TAG: "开始标记无匹配的结束标记",
+    QA_RULE_TARGET_PLACEHOLDER_MISSING: "译文占位符标记丢失",
     QA_RULE_SPELLING_GRAMMAR: "拼写/语法",
     QA_RULE_TERM_INCONSISTENCY: "术语不一致",
+    QA_RULE_PAIRED_PUNCTUATION_MISSING: "成对标点符号丢失",
+    QA_RULE_ENDING_PUNCTUATION_MISMATCH: "原文和译文的结束标点不同",
+    QA_RULE_REPEATED_PUNCTUATION: "重复标点",
+    QA_RULE_EXTRA_SPACE_AFTER_PUNCTUATION: "标点符号后有多余空格",
+    QA_RULE_MISSING_SPACE_AFTER_PUNCTUATION: "标点符号后遗漏空格",
 }
+WORKBENCH_QA_PUNCTUATION_RULES: frozenset[str] = frozenset(PUNCTUATION_QA_RULE_KEYS)
+WORKBENCH_QA_TAG_RULES: frozenset[str] = frozenset(TAG_QA_RULE_KEYS)
+WORKBENCH_QA_LOCAL_RULES: frozenset[str] = frozenset(LOCAL_QA_RULE_KEYS)
+WORKBENCH_QA_SEGMENT_ISSUE_RULES: frozenset[str] = frozenset(
+    {QA_RULE_SPELLING_GRAMMAR, *LOCAL_QA_RULE_KEYS}
+)
 
 
 def _is_workbench_qa_rule_enabled(settings: dict[str, Any], rule_key: str) -> bool:
@@ -6808,16 +6854,25 @@ def _load_workbench_segment_qa_issue_items(
     *,
     files: list[FileRecord],
     file_order: dict[UUID, int],
+    enabled_rules: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
     file_ids = [file_record.id for file_record in files]
     if not file_ids:
+        return []
+    rule_keys = (
+        set(enabled_rules)
+        if enabled_rules is not None
+        else set(WORKBENCH_QA_SEGMENT_ISSUE_RULES)
+    )
+    rule_keys &= set(WORKBENCH_QA_SEGMENT_ISSUE_RULES)
+    if not rule_keys:
         return []
     file_by_id = {file_record.id: file_record for file_record in files}
     issues = (
         db.query(SegmentQAIssue)
         .filter(
             SegmentQAIssue.file_record_id.in_(file_ids),
-            SegmentQAIssue.rule_key == QA_RULE_SPELLING_GRAMMAR,
+            SegmentQAIssue.rule_key.in_(rule_keys),
             SegmentQAIssue.status.in_([QA_ISSUE_STATUS_OPEN, QA_ISSUE_STATUS_IGNORED]),
         )
         .all()
@@ -6844,12 +6899,14 @@ def _load_workbench_segment_qa_issue_items(
         if issue.ignored_by_id:
             ignored_by = getattr(issue, "ignored_by", None)
             ignored_by_name = get_user_display_name(ignored_by) if ignored_by else None
+        rule_key = issue.rule_key or QA_RULE_SPELLING_GRAMMAR
+        rule_label = WORKBENCH_QA_RULE_LABELS.get(rule_key, rule_key)
         items.append({
             "id": f"{WORKBENCH_QA_ITEM_PREFIX_SEGMENT}{issue.id}",
             "source_id": str(issue.id),
             "source_kind": "segment_qa_issue",
-            "rule_key": QA_RULE_SPELLING_GRAMMAR,
-            "rule_label": WORKBENCH_QA_RULE_LABELS[QA_RULE_SPELLING_GRAMMAR],
+            "rule_key": rule_key,
+            "rule_label": rule_label,
             "project_id": str(issue.project_id) if issue.project_id else None,
             "file_record_id": str(issue.file_record_id),
             "file_name": file_record.filename if file_record else "",
@@ -6857,7 +6914,7 @@ def _load_workbench_segment_qa_issue_items(
             "sentence_id": issue.sentence_id,
             "source_text": segment.source_text if segment else "",
             "target_text": segment.target_text if segment else "",
-            "message": issue.short_message or issue.message or "译文有拼写或语法错误",
+            "message": issue.short_message or issue.message or rule_label,
             "detail": issue.message,
             "suggestion": suggestion,
             "source_term": "",
@@ -6956,6 +7013,31 @@ def _load_workbench_term_qa_items(
     ]
 
 
+def _run_local_qa_for_workbench_files(
+    db: Session,
+    *,
+    files: list[FileRecord],
+    enabled_rules: Iterable[str],
+) -> None:
+    """一次性跑完本地的标点 + 标记/占位符 QA 规则。
+
+    对未启用规则，也会同步把历史遗留问题标记为 resolved，避免前端出现脏数据。
+    """
+    rule_keys = frozenset(enabled_rules) & WORKBENCH_QA_LOCAL_RULES
+    for file_record in files:
+        segments = (
+            db.query(Segment)
+            .filter(Segment.file_record_id == file_record.id)
+            .all()
+        )
+        check_segments_local_qa(
+            db,
+            file_record=file_record,
+            segments=segments,
+            rule_keys=rule_keys,
+        )
+
+
 def _run_spelling_grammar_for_workbench_files(
     db: Session,
     *,
@@ -7030,6 +7112,16 @@ def _build_workbench_qa_result(
     if enabled_rules[QA_RULE_SPELLING_GRAMMAR] and generate:
         _run_spelling_grammar_for_workbench_files(db, files=files, warnings=warnings)
 
+    enabled_local_rules = {
+        rule_key for rule_key in WORKBENCH_QA_LOCAL_RULES if enabled_rules.get(rule_key)
+    }
+    if generate:
+        _run_local_qa_for_workbench_files(
+            db,
+            files=files,
+            enabled_rules=enabled_local_rules,
+        )
+
     if enabled_rules[QA_RULE_TERM_INCONSISTENCY]:
         if generate:
             term_report = _maybe_create_workbench_term_qa_report(
@@ -7052,8 +7144,20 @@ def _build_workbench_qa_result(
         or 0
     )
     items: list[dict[str, Any]] = []
-    if enabled_rules[QA_RULE_SPELLING_GRAMMAR]:
-        items.extend(_load_workbench_segment_qa_issue_items(db, files=files, file_order=file_order))
+    enabled_segment_rules = {
+        rule_key
+        for rule_key in WORKBENCH_QA_SEGMENT_ISSUE_RULES
+        if enabled_rules.get(rule_key)
+    }
+    if enabled_segment_rules:
+        items.extend(
+            _load_workbench_segment_qa_issue_items(
+                db,
+                files=files,
+                file_order=file_order,
+                enabled_rules=enabled_segment_rules,
+            )
+        )
     if enabled_rules[QA_RULE_TERM_INCONSISTENCY]:
         items.extend(_load_workbench_term_qa_items(db, report=term_report, files=files, file_order=file_order))
 
@@ -9310,6 +9414,22 @@ def _schedule_spelling_grammar_qa_for_segments(
         return
     background_tasks.add_task(
         _dispatch_spelling_grammar_qa_segments, file_record.id, segment_ids
+    )
+
+
+def _schedule_local_qa_for_segments(
+    background_tasks: BackgroundTasks | None,
+    file_record: FileRecord,
+    segments: Iterable[Segment],
+) -> None:
+    """标点 + 标记/占位符 QA 无外部依赖，保存句段时统一异步刷新。"""
+    if background_tasks is None:
+        return
+    segment_ids = [segment.id for segment in segments]
+    if not segment_ids:
+        return
+    background_tasks.add_task(
+        run_local_qa_for_segment_ids, file_record.id, segment_ids
     )
 
 
@@ -12635,6 +12755,7 @@ def update_segment(
     qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, response_segments)
     display_index_map = _get_segment_display_index_map(db, file_record_id, response_segments)
     _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, response_segments)
+    _schedule_local_qa_for_segments(background_tasks, file_record, response_segments)
 
     return {
         "id": segment.id,
@@ -13226,6 +13347,7 @@ def batch_update(
     qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, response_segments)
     display_index_map = _get_segment_display_index_map(db, file_record_id, response_segments)
     _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, response_segments)
+    _schedule_local_qa_for_segments(background_tasks, file_record, response_segments)
     return {
         "updated_count": result.updated_count,
         "conflicts": [_serialize_segment_update_conflict(conflict) for conflict in result.conflicts],
@@ -13428,6 +13550,7 @@ def replace_file_record_segment_targets(
             .all()
         )
         _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, updated_segments)
+        _schedule_local_qa_for_segments(background_tasks, file_record, updated_segments)
     return {"updated_count": updated_count, "occurrence_count": occurrence_count}
 
 
