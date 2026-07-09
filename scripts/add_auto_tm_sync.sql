@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS auto_tm_outbox (
     )::uuid,
     file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
     segment_id UUID NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
-    sentence_id VARCHAR(20) NOT NULL,
+    sentence_id VARCHAR(100) NOT NULL,
     collection_id UUID NOT NULL REFERENCES memory_bases(id) ON DELETE CASCADE,
     source_text TEXT NOT NULL,
     target_text TEXT NOT NULL,

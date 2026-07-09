@@ -2407,7 +2407,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
                 segment_id UUID REFERENCES segments(id) ON DELETE SET NULL,
                 term_base_id UUID REFERENCES term_bases(id) ON DELETE SET NULL,
-                sentence_id VARCHAR(40) NOT NULL DEFAULT '',
+                sentence_id VARCHAR(100) NOT NULL DEFAULT '',
                 file_name VARCHAR(255) NOT NULL DEFAULT '',
                 term_base_name VARCHAR(200) NOT NULL DEFAULT '',
                 source_term TEXT NOT NULL,
@@ -2444,7 +2444,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
             """
             ALTER TABLE IF EXISTS term_qa_report_items
-            ADD COLUMN IF NOT EXISTS sentence_id VARCHAR(40) NOT NULL DEFAULT ''
+            ADD COLUMN IF NOT EXISTS sentence_id VARCHAR(100) NOT NULL DEFAULT ''
             """,
             """
             ALTER TABLE IF EXISTS term_qa_report_items
@@ -2560,7 +2560,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
                 file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
                 segment_id UUID REFERENCES segments(id) ON DELETE SET NULL,
-                sentence_id VARCHAR(40) NOT NULL DEFAULT '',
+                sentence_id VARCHAR(100) NOT NULL DEFAULT '',
                 file_name VARCHAR(255) NOT NULL DEFAULT '',
                 source_text TEXT NOT NULL DEFAULT '',
                 target_text TEXT NOT NULL DEFAULT '',
@@ -2629,7 +2629,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
                 file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
                 segment_id UUID NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
-                sentence_id VARCHAR(40) NOT NULL DEFAULT '',
+                sentence_id VARCHAR(100) NOT NULL DEFAULT '',
                 rule_key VARCHAR(40) NOT NULL DEFAULT 'spelling_grammar',
                 provider VARCHAR(40) NOT NULL DEFAULT 'languagetool',
                 language VARCHAR(20) NOT NULL DEFAULT '',
@@ -2665,7 +2665,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
             """
             ALTER TABLE IF EXISTS segment_qa_issues
-            ADD COLUMN IF NOT EXISTS sentence_id VARCHAR(40) NOT NULL DEFAULT ''
+            ADD COLUMN IF NOT EXISTS sentence_id VARCHAR(100) NOT NULL DEFAULT ''
             """,
             """
             ALTER TABLE IF EXISTS segment_qa_issues
@@ -2823,7 +2823,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
                 file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
                 segment_id UUID NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
-                sentence_id VARCHAR(20) NOT NULL,
+                sentence_id VARCHAR(100) NOT NULL,
                 before_text TEXT NOT NULL DEFAULT '',
                 after_text TEXT NOT NULL DEFAULT '',
                 source VARCHAR(20) NOT NULL DEFAULT 'manual',
@@ -3011,7 +3011,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
                 file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
                 segment_id UUID NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
-                sentence_id VARCHAR(20) NOT NULL,
+                sentence_id VARCHAR(100) NOT NULL,
                 collection_id UUID NOT NULL REFERENCES memory_bases(id) ON DELETE CASCADE,
                 source_text TEXT NOT NULL,
                 target_text TEXT NOT NULL,
@@ -3141,6 +3141,36 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             BEFORE UPDATE ON project_merge_views
             FOR EACH ROW
             EXECUTE FUNCTION update_updated_at_column()
+            """,
+            """
+            DO $$
+            DECLARE
+                target_table TEXT;
+            BEGIN
+                FOREACH target_table IN ARRAY ARRAY[
+                    'segments',
+                    'segment_revisions',
+                    'segment_qa_issues',
+                    'term_qa_report_items',
+                    'number_check_report_items',
+                    'auto_tm_outbox'
+                ]
+                LOOP
+                    IF EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = target_table
+                          AND column_name = 'sentence_id'
+                    ) THEN
+                        EXECUTE format(
+                            'ALTER TABLE %I ALTER COLUMN sentence_id TYPE VARCHAR(100)',
+                            target_table
+                        );
+                    END IF;
+                END LOOP;
+            END
+            $$;
             """,
         ]
     )

@@ -970,7 +970,7 @@ class Segment(Base):
         ForeignKey("project_workflow_steps.id", ondelete="SET NULL"),
         nullable=True,
     )
-    sentence_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    sentence_id: Mapped[str] = mapped_column(String(100), nullable=False)
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
     source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     display_text: Mapped[str] = mapped_column(Text, nullable=False)
@@ -1142,7 +1142,7 @@ class TermQAReportItem(Base):
         ForeignKey("term_bases.id", ondelete="SET NULL"),
         nullable=True,
     )
-    sentence_id: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+    sentence_id: Mapped[str] = mapped_column(String(100), nullable=False, default="")
     file_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     term_base_name: Mapped[str] = mapped_column(String(200), nullable=False, default="")
     source_term: Mapped[str] = mapped_column(Text, nullable=False)
@@ -1260,7 +1260,7 @@ class NumberCheckReportItem(Base):
         ForeignKey("segments.id", ondelete="SET NULL"),
         nullable=True,
     )
-    sentence_id: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+    sentence_id: Mapped[str] = mapped_column(String(100), nullable=False, default="")
     file_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     source_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
     target_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
@@ -1332,7 +1332,7 @@ class SegmentQAIssue(Base):
         ForeignKey("segments.id", ondelete="CASCADE"),
         nullable=False,
     )
-    sentence_id: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+    sentence_id: Mapped[str] = mapped_column(String(100), nullable=False, default="")
     rule_key: Mapped[str] = mapped_column(String(40), nullable=False, default="spelling_grammar")
     provider: Mapped[str] = mapped_column(String(40), nullable=False, default="languagetool")
     language: Mapped[str] = mapped_column(String(20), nullable=False, default="")
@@ -1395,7 +1395,7 @@ class SegmentRevision(Base):
         ForeignKey("segments.id", ondelete="CASCADE"),
         nullable=False,
     )
-    sentence_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    sentence_id: Mapped[str] = mapped_column(String(100), nullable=False)
     before_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
     after_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
     source: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")
@@ -1951,7 +1951,7 @@ class AutoTMOutbox(Base):
         ForeignKey("segments.id", ondelete="CASCADE"),
         nullable=False,
     )
-    sentence_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    sentence_id: Mapped[str] = mapped_column(String(100), nullable=False)
     collection_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("memory_bases.id", ondelete="CASCADE"),

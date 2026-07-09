@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS term_qa_report_items (
   file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
   segment_id UUID REFERENCES segments(id) ON DELETE SET NULL,
   term_base_id UUID REFERENCES term_bases(id) ON DELETE SET NULL,
-  sentence_id VARCHAR(40) NOT NULL DEFAULT '',
+  sentence_id VARCHAR(100) NOT NULL DEFAULT '',
   file_name VARCHAR(255) NOT NULL DEFAULT '',
   term_base_name VARCHAR(200) NOT NULL DEFAULT '',
   source_term TEXT NOT NULL,

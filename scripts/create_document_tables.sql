@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS segments (
         lpad(to_hex(floor(random() * 281474976710656)::bigint), 12, '0')
     )::uuid,
     file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
-    sentence_id VARCHAR(20) NOT NULL,
+    sentence_id VARCHAR(100) NOT NULL,
     source_text TEXT NOT NULL,
     display_text TEXT NOT NULL,
     target_text TEXT NOT NULL DEFAULT '',
