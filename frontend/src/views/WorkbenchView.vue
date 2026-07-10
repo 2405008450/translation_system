@@ -1164,8 +1164,11 @@ const loadedSegmentStatusStats = computed<SegmentStatusStats>(() => {
   const stats = createWorkbenchStatusStats()
   stats.total = segmentStore.segments.length
   for (const segment of segmentStore.segments) {
-    const status = resolveWorkbenchEffectiveStatus(segment)
-    stats[status] += 1
+    const matchStatus = resolveWorkbenchMatchStatus(segment)
+    stats[matchStatus] += 1
+    if (segment.status === 'confirmed') {
+      stats.confirmed += 1
+    }
     if (
       isEmptyTargetForWorkbench(segment.target_text)
       || retainedEmptyTargetSentenceIds.value.has(segment.sentence_id)
@@ -2076,10 +2079,7 @@ function isShortWorkbenchStructuralFragment(value: string | null | undefined) {
   return Boolean(core && core.length <= 4 && /^(?:\d+[A-Za-z]?|[A-Za-z]|[ivxlcdmIVXLCDM]{1,4})$/.test(core))
 }
 
-function resolveWorkbenchEffectiveStatus(segment: Segment) {
-  if (segment.status === 'confirmed') {
-    return 'confirmed'
-  }
+function resolveWorkbenchMatchStatus(segment: Segment) {
   const sourceText = normalizeWorkbenchMatchText(segment.source_text)
   const displayText = normalizeWorkbenchMatchText(segment.display_text)
   const matchedSourceText = normalizeWorkbenchMatchText(segment.matched_source_text)
@@ -2101,18 +2101,18 @@ function resolveWorkbenchEffectiveStatus(segment: Segment) {
 }
 
 function matchesSegmentDisplayScope(segment: Segment) {
-  const effectiveStatus = resolveWorkbenchEffectiveStatus(segment)
+  const matchStatus = resolveWorkbenchMatchStatus(segment)
   if (segmentDisplayScope.value === 'exact_only') {
-    return effectiveStatus === 'exact'
+    return matchStatus === 'exact'
   }
   if (segmentDisplayScope.value === 'fuzzy_only') {
-    return effectiveStatus === 'fuzzy'
+    return matchStatus === 'fuzzy'
   }
   if (segmentDisplayScope.value === 'none_only') {
-    return effectiveStatus === 'none'
+    return matchStatus === 'none'
   }
   if (segmentDisplayScope.value === 'confirmed_only') {
-    return effectiveStatus === 'confirmed'
+    return segment.status === 'confirmed'
   }
   if (segmentDisplayScope.value === 'empty_target') {
     return isEmptyTargetForWorkbench(segment.target_text)
