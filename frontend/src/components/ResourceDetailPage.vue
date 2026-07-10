@@ -180,7 +180,7 @@ const sourceLanguageLabel = computed(() => getDetailLanguageLabel(sourceLanguage
 const targetLanguageLabel = computed(() => getDetailLanguageLabel(targetLanguageCode.value))
 const pageTitle = computed(() => resource.value?.name || copy.value.fallbackTitle)
 const indexOffset = computed(() => (currentPage.value - 1) * pageSize.value)
-const canManageResources = computed(() => authStore.isAdmin)
+const canManageResources = computed(() => authStore.isBusinessManager)
 const tableColumnCount = computed(() => (
   Number(showIndexColumn.value) + Number(showSourceColumn.value) + Number(showTargetColumn.value)
   + Number(showCreatorColumn.value) + Number(showCreatedAtColumn.value)

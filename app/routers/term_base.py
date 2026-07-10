@@ -20,7 +20,6 @@ from app.auth import (
     get_current_user,
     get_user_display_name,
     is_admin_role,
-    require_admin,
     require_resource_creator,
 )
 from app.config import get_settings
@@ -533,7 +532,7 @@ def create_term_base(
 def merge_term_bases(
     payload: TermBaseMergePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_resource_creator),
 ):
     source_term_base_ids = list(dict.fromkeys(payload.source_term_base_ids))
     if len(source_term_base_ids) < 2:
@@ -655,7 +654,7 @@ def update_term_base(
     term_base_id: UUID,
     payload: TermBasePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_resource_creator),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
     name = _normalize_term_base_name(payload.name)
@@ -702,7 +701,7 @@ def copy_term_base_to_language_pair(
     term_base_id: UUID,
     payload: TermBaseLanguagePairCopyPayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_resource_creator),
 ):
     source_term_base = _get_term_base_or_404(db, term_base_id)
     source_language, target_language = _require_term_language_pair(
@@ -761,7 +760,7 @@ def copy_term_base_to_language_pair(
 def delete_term_base(
     term_base_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_resource_creator),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
     entry_count = (
@@ -818,7 +817,7 @@ async def preview_term_base_xlsx(
     preview_limit: int = Form(default=100),
     skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_resource_creator),
 ):
     extension = _validate_term_import_upload(file)
     task_id, staged_file = await asyncio.to_thread(_stage_resource_upload_file, file)
@@ -1115,7 +1114,7 @@ async def import_term_base_xlsx(
     skip_duplicate_row_indexes: str = Form(default="[]"),
     skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_resource_creator),
 ):
     if term_base_id is None:
         raise HTTPException(status_code=400, detail="请先选择要导入的术语库。")
@@ -1184,7 +1183,7 @@ def batch_save_term_base_entries(
     term_base_id: UUID,
     payload: TermEntryBatchPayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_resource_creator),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
     return save_term_entries_batch(

@@ -302,9 +302,9 @@ const projectFilterTags = computed(() => {
   }
   return tags
 })
-const canManageProjects = computed(() => authStore.isAdmin)
-const canCreateProjects = computed(() => authStore.isAdmin || authStore.isInternalTranslator)
-const canAssignProjects = computed(() => authStore.isAdmin || authStore.isInternalTranslator)
+const canManageProjects = computed(() => authStore.isBusinessManager)
+const canCreateProjects = computed(() => authStore.isBusinessManager)
+const canAssignProjects = computed(() => authStore.isBusinessManager)
 const isCreateLanguagePairPartiallySelected = computed(() => (
   Boolean(form.source_language) !== Boolean(form.target_language)
 ))

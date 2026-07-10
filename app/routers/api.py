@@ -10,7 +10,7 @@ import logging
 import re
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import partial
 from io import BytesIO
 from pathlib import Path
@@ -180,6 +180,7 @@ from app.services.file_record_service import (
     update_segment_source_text,
 )
 from app.services.file_operation_lock_service import (
+    FILE_OPERATION_LOCK_TIMEOUT_SECONDS,
     FILE_OPERATION_TOKEN_HEADER,
     PRE_TRANSLATE_OPERATION,
     acquire_file_operation_lock,
@@ -2393,6 +2394,61 @@ def get_pretranslation_run(
     return _serialize_pretranslation_run(run)
 
 
+
+
+def _finalize_stale_pretranslation_tasks(db: Session, project_id: UUID) -> bool:
+    now = _pretranslation_now()
+    stale_before = now - timedelta(seconds=FILE_OPERATION_LOCK_TIMEOUT_SECONDS + 60)
+    stale_tasks = (
+        db.query(PretranslationTask)
+        .join(FileRecord, PretranslationTask.file_record_id == FileRecord.id)
+        .filter(
+            FileRecord.project_id == project_id,
+            PretranslationTask.status.in_(PRETRANSLATION_ACTIVE_STATUSES),
+        )
+        .all()
+    )
+    changed = False
+    touched_runs: set[UUID] = set()
+    for task in stale_tasks:
+        heartbeat_at = task.last_heartbeat_at or task.updated_at or task.started_at or task.created_at
+        if heartbeat_at and heartbeat_at > stale_before:
+            continue
+        if task.cancel_requested or task.status == "canceling":
+            task.status = "canceled"
+            task.stage = "canceled"
+            task.current_action = "canceled"
+            task.message = "Pretranslation was canceled after the worker stopped responding."
+        else:
+            task.status = "failed"
+            task.stage = "failed"
+            task.current_action = "failed"
+            task.message = "Pretranslation stopped responding; status has been refreshed."
+            task.error = task.error or "Pretranslation worker heartbeat timed out."
+        task.progress = 100
+        task.completed_at = task.completed_at or now
+        task.updated_at = now
+        if task.run_id:
+            touched_runs.add(task.run_id)
+        changed = True
+        if task.file_record is not None and task.operation_token:
+            try:
+                release_file_operation_lock(
+                    db,
+                    task.file_record,
+                    operation_token=task.operation_token,
+                )
+            except HTTPException:
+                logger.warning("release stale pretranslation lock failed task_id=%s", task.id, exc_info=True)
+    for run_id in touched_runs:
+        run = db.query(PretranslationRun).filter(PretranslationRun.id == run_id).first()
+        if run is not None:
+            _refresh_pretranslation_run_status(db, run)
+    if changed:
+        db.commit()
+    return changed
+
+
 @router.get("/projects/{project_id}/pretranslation-tasks/active")
 def list_active_pretranslation_tasks(
     project_id: UUID,
@@ -2401,6 +2457,7 @@ def list_active_pretranslation_tasks(
 ):
     project = _get_project_or_404(db, project_id)
     _require_project_read_access(project, current_user, db)
+    _finalize_stale_pretranslation_tasks(db, project_id)
     tasks = (
         db.query(PretranslationTask)
         .join(FileRecord, PretranslationTask.file_record_id == FileRecord.id)

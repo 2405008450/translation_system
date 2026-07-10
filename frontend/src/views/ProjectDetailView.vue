@@ -633,6 +633,9 @@ const termBaseSettings = ref<ProjectTermBaseSettingsResponse | null>(null)
 const loadingTermBaseSettings = ref(false)
 const savingTermBaseSettings = ref(false)
 const creatingTermBasePair = ref('')
+const pendingTMCollectionTopMoves = new Map<string, Set<string>>()
+const pendingTermBaseTopMoves = new Map<string, Set<string>>()
+let resourceTopMoveTimer: number | null = null
 const termBaseSettingsError = ref('')
 const termBaseSettingsSearchQuery = ref('')
 const termImportDialogContext = ref<{
@@ -1310,7 +1313,7 @@ const statisticsFileColumns = computed<DataTableColumn[]>(() => ([
 
 const canManageProject = computed(() => Boolean(project.value?.can_manage))
 const canAssignProject = computed(() => Boolean(project.value) && (canManageProject.value || authStore.isInternalTranslator))
-const canCreateProjects = computed(() => authStore.isAdmin || authStore.isInternalTranslator)
+const canCreateProjects = computed(() => authStore.isBusinessManager)
 const canUploadProjectFiles = computed(() => Boolean(project.value) && canCreateProjects.value)
 const canOpenUploadModal = computed(() => canUploadProjectFiles.value)
 const canOpenProjectIssueDialog = computed(() => Boolean(project.value) && !authStore.isExternalTranslator)
@@ -2794,10 +2797,11 @@ async function loadActivePretranslationTasks() {
       `/projects/${project.value.id}/pretranslation-tasks/active`,
     )
     const hasRunningProgress = Object.values(preTranslateProgressByFileId.value).some((state) => state.running)
+    const hadActiveTasks = Object.keys(activePretranslationTaskIdByFileId.value).length > 0
     if (!data.tasks.length) {
       clearActivePretranslationPollTimer()
       activePretranslationTaskIdByFileId.value = {}
-      if (hasRunningProgress) {
+      if (hasRunningProgress || hadActiveTasks) {
         preTranslateProgressByFileId.value = {}
         await loadProject()
       }
@@ -2849,13 +2853,23 @@ function getFilePretranslationProgress(row: ProjectRow) {
 
 function getFilePretranslationProgressStatus(row: ProjectRow) {
   const state = preTranslateProgressByFileId.value[String(row.id)]
-  return (state && state.progress < 100) || row.is_edit_locked ? 'processing' : String(row.status || '')
+  return (state?.running && state.progress < 100) ? 'processing' : String(row.status || '')
 }
 
 function getFilePretranslationProgressMessage(row: ProjectRow) {
-  return preTranslateProgressByFileId.value[String(row.id)]?.status
-    || (row.active_operation === 'pre_translate' ? row.active_operation_message : '')
-    || ''
+  const state = preTranslateProgressByFileId.value[String(row.id)]
+  if (state?.running || getActivePretranslationTaskId(row)) {
+    return state?.status || (row.active_operation === 'pre_translate' ? row.active_operation_message : '') || ''
+  }
+  if (state?.progress >= 100) {
+    return state.status || ''
+  }
+  return ''
+}
+
+function canCancelFilePretranslation(row: ProjectRow) {
+  const state = preTranslateProgressByFileId.value[String(row.id)]
+  return Boolean(getActivePretranslationTaskId(row) && state?.running !== false)
 }
 
 function getActivePretranslationTaskId(row: ProjectRow) {
@@ -3763,6 +3777,9 @@ function toggleTMCollectionEnabled(
       }
     }
   }
+  if (checked) {
+    scheduleTMCollectionToTop(group, collectionId)
+  }
 }
 
 function toggleTMCollectionWritable(
@@ -3780,6 +3797,9 @@ function toggleTMCollectionWritable(
     } else if (file.collection_id === collectionId) {
       file.collection_id = file.collection_ids.find((id) => id !== collectionId) || null
     }
+  }
+  if (checked) {
+    scheduleTMCollectionToTop(group, collectionId)
   }
 }
 
@@ -3814,6 +3834,14 @@ function toggleFileTMCollection(
   if (checked && !file.collection_id) {
     file.collection_id = collectionId
   }
+  if (checked) {
+    const group = translationMemorySettings.value?.groups.find((item) => (
+      item.files.some((candidate) => candidate.id === file.id)
+    ))
+    if (group) {
+      scheduleTMCollectionToTop(group, collectionId)
+    }
+  }
 }
 
 function setFilePrimaryTMCollection(file: ProjectTranslationMemorySettingFile, event: Event) {
@@ -3846,6 +3874,9 @@ function setTMCollectionBindingForAll(
     if (enabled && !file.collection_id) {
       file.collection_id = collectionId
     }
+  }
+  if (enabled) {
+    scheduleTMCollectionToTop(group, collectionId)
   }
 }
 
@@ -3886,6 +3917,9 @@ function setGroupPrimaryTMCollection(group: ProjectTranslationMemorySettingGroup
     if (collectionId && !file.collection_ids.includes(collectionId)) {
       file.collection_ids = [...file.collection_ids, collectionId]
     }
+  }
+  if (collectionId) {
+    scheduleTMCollectionToTop(group, collectionId)
   }
 }
 
@@ -3962,6 +3996,72 @@ function moveTermBaseRowToTop(group: ProjectTermBaseSettingGroup, termBaseId: st
   const [row] = group.term_bases.splice(index, 1)
   group.term_bases.unshift(row)
   normalizeTermBaseQAPriority(group)
+}
+
+function flushPendingResourceTopMoves() {
+  resourceTopMoveTimer = null
+  const tmSettings = translationMemorySettings.value
+  if (tmSettings && pendingTMCollectionTopMoves.size > 0) {
+    const groupByKey = new Map(tmSettings.groups.map((group) => [translationMemorySettingGroupKey(group), group]))
+    for (const [groupKey, collectionIds] of pendingTMCollectionTopMoves) {
+      const group = groupByKey.get(groupKey)
+      if (!group) {
+        continue
+      }
+      for (const collectionId of collectionIds) {
+        moveTMCollectionToTop(group, collectionId)
+      }
+    }
+  }
+
+  const termSettings = termBaseSettings.value
+  if (termSettings && pendingTermBaseTopMoves.size > 0) {
+    const groupByKey = new Map(termSettings.groups.map((group) => [termBaseSettingGroupKey(group), group]))
+    for (const [groupKey, termBaseIds] of pendingTermBaseTopMoves) {
+      const group = groupByKey.get(groupKey)
+      if (!group) {
+        continue
+      }
+      for (const termBaseId of termBaseIds) {
+        moveTermBaseRowToTop(group, termBaseId)
+      }
+    }
+  }
+
+  pendingTMCollectionTopMoves.clear()
+  pendingTermBaseTopMoves.clear()
+}
+
+function scheduleResourceTopMove() {
+  if (resourceTopMoveTimer !== null) {
+    window.clearTimeout(resourceTopMoveTimer)
+  }
+  resourceTopMoveTimer = window.setTimeout(flushPendingResourceTopMoves, 120)
+}
+
+function clearPendingResourceTopMoves() {
+  if (resourceTopMoveTimer !== null) {
+    window.clearTimeout(resourceTopMoveTimer)
+    resourceTopMoveTimer = null
+  }
+  pendingTMCollectionTopMoves.clear()
+  pendingTermBaseTopMoves.clear()
+}
+
+function scheduleTMCollectionToTop(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
+  const groupKey = translationMemorySettingGroupKey(group)
+  const pendingIds = pendingTMCollectionTopMoves.get(groupKey) ?? new Set<string>()
+  pendingIds.add(collectionId)
+  pendingTMCollectionTopMoves.set(groupKey, pendingIds)
+  scheduleResourceTopMove()
+}
+
+function scheduleTermBaseToTop(group: ProjectTermBaseSettingGroup, termBaseId: string) {
+  const groupKey = termBaseSettingGroupKey(group)
+  const pendingIds = pendingTermBaseTopMoves.get(groupKey) ?? new Set<string>()
+  pendingIds.add(termBaseId)
+  pendingTermBaseTopMoves.set(groupKey, pendingIds)
+  scheduleResourceTopMove()
 }
 
 function findProjectResourceCreateTMGroup() {
@@ -4442,6 +4542,9 @@ function toggleTermBaseSetting(
     row.enabled = true
   }
   normalizeTermBaseQAPriority(group)
+  if (checked) {
+    scheduleTermBaseToTop(group, row.id)
+  }
 }
 
 function moveTermBaseQAPriority(
@@ -5246,6 +5349,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', handleDocumentScroll)
   clearExportPollTimer()
   clearActivePretranslationPollTimer()
+  clearPendingResourceTopMoves()
 })
 
 </script>
@@ -7230,7 +7334,7 @@ onBeforeUnmount(() => {
                 {{ getFilePretranslationProgressMessage(row) }}
               </span>
               <button
-                v-if="getActivePretranslationTaskId(row)"
+                v-if="canCancelFilePretranslation(row)"
                 class="pd-file-progress__cancel"
                 type="button"
                 :disabled="isFilePretranslationCanceling(row)"

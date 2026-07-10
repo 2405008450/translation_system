@@ -263,7 +263,7 @@ const router = createRouter({
           name: 'assignment-events',
           component: AssignmentEventsView,
           meta: {
-            requiresAdmin: true,
+            requiresBusinessManager: true,
             navSection: 'assignment-events',
             pageTitle: '指派记录',
             pageDescription: '查看项目和文件任务的指派、授权和取消记录',
@@ -316,6 +316,10 @@ router.beforeEach(async (to) => {
   }
 
   if (to.meta.requiresAdmin && !authStore.isAdmin) {
+    return { name: getDefaultRouteName(authStore) }
+  }
+
+  if (to.meta.requiresBusinessManager && !authStore.isBusinessManager) {
     return { name: getDefaultRouteName(authStore) }
   }
 

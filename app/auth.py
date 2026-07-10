@@ -356,6 +356,12 @@ def require_resource_creator(current_user: User = Depends(get_current_user)) -> 
     return current_user
 
 
+def require_business_manager(current_user: User = Depends(get_current_user)) -> User:
+    if not can_access_all_projects(current_user):
+        raise HTTPException(status_code=403, detail="\u5f53\u524d\u64cd\u4f5c\u9700\u8981\u7ba1\u7406\u5458\u6216\u5185\u90e8\u8bd1\u8005\u6743\u9650\u3002")
+    return current_user
+
+
 def require_admin(current_user: User = Depends(get_current_user)) -> User:
     if not is_admin_role(current_user.role):
         raise HTTPException(status_code=403, detail="当前操作需要管理员权限。")

@@ -125,13 +125,13 @@ const navGroups = computed<NavGroup[]>(() => [
     key: 'system',
     label: t('shell.sections.system'),
     icon: Settings,
-    visible: authStore.isAdmin,
+    visible: authStore.isBusinessManager,
     children: [
       {
         name: 'assignment-events',
         label: t('shell.sections.assignmentEvents'),
         icon: ClipboardList,
-        visible: authStore.isAdmin,
+        visible: authStore.isBusinessManager,
       },
       {
         name: 'users',

@@ -104,7 +104,7 @@ let searchTimer: number | null = null
 let exportPollTimer: number | null = null
 let disposed = false
 
-const canManageResources = computed(() => authStore.isAdmin)
+const canManageResources = computed(() => authStore.isBusinessManager)
 const pageTitle = computed(() => glossaryBase.value?.name || '词汇表详情')
 const languagePairLabel = computed(() => (
   glossaryBase.value

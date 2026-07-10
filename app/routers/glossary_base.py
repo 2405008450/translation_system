@@ -13,7 +13,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
-from app.auth import get_current_user, get_user_display_name, require_admin, require_resource_creator
+from app.auth import get_current_user, get_user_display_name, require_resource_creator
 from app.config import get_settings
 from app.database import SessionLocal, get_db
 from app.models import FileRecord, GlossaryBase, GlossaryEntry, User
@@ -289,7 +289,7 @@ def update_glossary_base(
     glossary_base_id: UUID,
     payload: GlossaryBasePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_resource_creator),
 ):
     glossary_base = _get_glossary_base_or_404(db, glossary_base_id)
     name = _normalize_glossary_base_name(payload.name)
@@ -332,7 +332,7 @@ def update_glossary_base(
 def delete_glossary_base(
     glossary_base_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_resource_creator),
 ):
     glossary_base = _get_glossary_base_or_404(db, glossary_base_id)
     entry_count = (
@@ -365,7 +365,7 @@ async def preview_glossary_base_xlsx(
     preview_limit: int = Form(default=100),
     skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_resource_creator),
 ):
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
     if extension not in XLSX_EXTENSIONS:
@@ -582,7 +582,7 @@ async def import_glossary_base_xlsx(
     target_language: str = Form(...),
     skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_resource_creator),
 ):
     if glossary_base_id is None:
         raise HTTPException(status_code=400, detail="请先选择要导入的词汇表。")
@@ -669,7 +669,7 @@ def create_glossary_entry(
     glossary_base_id: UUID,
     payload: GlossaryEntryPayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_resource_creator),
 ):
     glossary_base = _get_glossary_base_or_404(db, glossary_base_id)
     source_text = normalize_text(payload.source_text)
@@ -715,7 +715,7 @@ def update_glossary_entry(
     entry_id: UUID,
     payload: GlossaryEntryPayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_resource_creator),
 ):
     entry = db.query(GlossaryEntry).filter(GlossaryEntry.id == entry_id).first()
     if entry is None:
@@ -761,7 +761,7 @@ def update_glossary_entry(
 def delete_glossary_entry(
     entry_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_resource_creator),
 ):
     entry = db.query(GlossaryEntry).filter(GlossaryEntry.id == entry_id).first()
     if entry is None:

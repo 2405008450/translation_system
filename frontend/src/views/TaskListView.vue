@@ -787,7 +787,7 @@ onBeforeUnmount(() => {
                       {{ t('taskList.actions.details') }}
                     </button>
                     <button
-                      v-if="authStore.isAdmin"
+                      v-if="authStore.isBusinessManager"
                       type="button"
                       @click="openImportDialog(row); closeActionMenu()"
                     >
