@@ -30,6 +30,55 @@ def get_reference_llm_helper(settings) -> Optional[ReferenceLLMHelper]:
     return ReferenceLLMHelper(api_key=api_key, model=model, base_url=base_url)
 
 
+def _parse_reference_doc(
+    file_path: str,
+    filename: str,
+    llm_helper: Optional[ReferenceLLMHelper],
+) -> Document:
+    """解析参考文档：PDF 优先走 pdfplumber 结构化解析（和 docx 同源），
+    仅在提取内容明显不足（疑似扫描版）时回退到 LLM 视觉提取。
+    """
+    is_pdf = file_path.lower().endswith('.pdf')
+    doc = parse_file(file_path)
+
+    if not is_pdf:
+        return doc
+
+    # 判断结构化解析是否成功：段落数太少或总文本极短就认为是扫描版
+    raw_text_len = len(doc.raw_text or "")
+    para_count = len(doc.paragraphs or [])
+    looks_empty = para_count < 3 or raw_text_len < 50
+
+    if not looks_empty:
+        print(
+            f"[ReferenceAnalyzer] PDF 结构化解析成功: {filename} "
+            f"段落数={para_count}, 文本长度={raw_text_len}"
+        )
+        return doc
+
+    if llm_helper is None:
+        print(
+            f"[ReferenceAnalyzer] PDF 结构化解析内容偏少（{para_count}段/{raw_text_len}字），"
+            f"且未配置LLM，保留原结果: {filename}"
+        )
+        return doc
+
+    print(
+        f"[ReferenceAnalyzer] PDF 结构化解析内容偏少（{para_count}段/{raw_text_len}字），"
+        f"回退到LLM提取: {filename}"
+    )
+    text = llm_helper.extract_pdf_text(file_path)
+    if not text or not text.strip():
+        return doc
+
+    return Document(
+        paragraphs=[Paragraph(text=p) for p in text.split('\n') if p.strip()],
+        tables=[],
+        filename=filename,
+        raw_text=text,
+    )
+
+
 def analyze_reference_files(
     file_paths: List[str],
     bilingual_pairs: Optional[List[Tuple[str, str]]] = None,
@@ -97,35 +146,14 @@ def analyze_reference_files(
             if progress_reporter:
                 progress_reporter.parsing_files(file_index, total_files, source_filename)
             
-            # 如果是 PDF 且有 LLM，用 LLM 提取文本
-            if source_path.lower().endswith('.pdf') and llm_helper:
-                print(f"[ReferenceAnalyzer] 使用LLM提取PDF文本: {source_path}")
-                source_text = llm_helper.extract_pdf_text(source_path)
-                source_doc = Document(
-                    paragraphs=[Paragraph(text=p) for p in source_text.split('\n') if p.strip()],
-                    tables=[],
-                    filename=source_filename,
-                    raw_text=source_text,
-                )
-            else:
-                source_doc = parse_file(source_path)
+            source_doc = _parse_reference_doc(source_path, source_filename, llm_helper)
             
             # 解析译文
             file_index += 1
             if progress_reporter:
                 progress_reporter.parsing_files(file_index, total_files, target_filename)
             
-            if target_path.lower().endswith('.pdf') and llm_helper:
-                print(f"[ReferenceAnalyzer] 使用LLM提取PDF文本: {target_path}")
-                target_text = llm_helper.extract_pdf_text(target_path)
-                target_doc = Document(
-                    paragraphs=[Paragraph(text=p) for p in target_text.split('\n') if p.strip()],
-                    tables=[],
-                    filename=target_filename,
-                    raw_text=target_text,
-                )
-            else:
-                target_doc = parse_file(target_path)
+            target_doc = _parse_reference_doc(target_path, target_filename, llm_helper)
             
             print(f"[ReferenceAnalyzer] 原文文件: {source_doc.filename}, 段落数: {len(source_doc.paragraphs)}")
             print(f"[ReferenceAnalyzer] 译文文件: {target_doc.filename}, 段落数: {len(target_doc.paragraphs)}")
@@ -213,151 +241,6 @@ def analyze_reference_files(
     return profile
 
 
-def match_segments_with_reference(
-    segments: List[dict],
-    profile: TranslationProfile,
-    exact_threshold: float = 1.0,
-    fuzzy_threshold: float = 0.6,
-) -> dict:
-    """
-    将当前任务的句段与参考文件进行匹配。
-    
-    返回:
-        {
-            "exact_matches": [{"segment_id": ..., "source": ..., "target": ..., "source_file": ...}, ...],
-            "fuzzy_matches": [{"segment_id": ..., "source": ..., "target": ..., "similarity": ..., "source_file": ...}, ...],
-            "term_matches": [{"segment_id": ..., "terms": [...], "source_file": ...}, ...],
-        }
-    """
-    from .similarity import SimpleMatcher
-    
-    exact_matches = []
-    fuzzy_matches = []
-    term_matches = []
-    
-    # 获取参考文件来源（用于显示）
-    source_files = profile.source_files or []
-    source_file_label = ", ".join(source_files) if source_files else "参考文件"
-    
-    # 构建参考 TM 查找表（精确匹配用），同时记录每个原文对应的来源
-    tm_lookup = {}
-    for pair in profile.references.translation_memory:
-        normalized = pair.source.strip().lower()
-        if normalized not in tm_lookup:
-            tm_lookup[normalized] = {
-                "target": pair.target,
-                "source_file": source_file_label,
-            }
-    
-    # 术语列表
-    terms = profile.constraints.terminology
-    
-    # 简单匹配器（模糊匹配用）
-    matcher = SimpleMatcher()
-    
-    for seg in segments:
-        seg_id = seg.get('sentence_id') or seg.get('id')
-        source_text = seg.get('source_text', '').strip()
-        if not source_text:
-            continue
-        
-        normalized_source = source_text.lower()
-        
-        # 1. 精确匹配
-        if normalized_source in tm_lookup:
-            match_info = tm_lookup[normalized_source]
-            exact_matches.append({
-                "segment_id": seg_id,
-                "source": source_text,
-                "target": match_info["target"],
-                "match_type": "reference-exact",
-                "similarity": 1.0,
-                "source_file": match_info["source_file"],
-            })
-            continue
-        
-        # 2. 模糊匹配
-        similar_pairs = matcher.find_similar_pairs(
-            source_text,
-            profile.references.translation_memory,
-            top_k=3,
-            threshold=fuzzy_threshold,
-        )
-        if similar_pairs:
-            for pair in similar_pairs:
-                fuzzy_matches.append({
-                    "segment_id": seg_id,
-                    "source": source_text,
-                    "matched_source": pair.source,
-                    "target": pair.target,
-                    "similarity": pair.similarity,
-                    "match_type": "reference-fuzzy",
-                    "source_file": source_file_label,
-                })
-        
-        # 3. 术语匹配
-        matched_terms = []
-        seen_terms = set()  # 用于去重
-        source_lower = source_text.lower()
-        for term in terms:
-            term_key = (term.source.lower(), term.target)  # 使用原文+译文作为唯一标识
-            if term_key in seen_terms:
-                continue  # 跳过重复术语
-            if term.source.lower() in source_lower:
-                seen_terms.add(term_key)
-                matched_terms.append({
-                    "source": term.source,
-                    "target": term.target,
-                    "category": term.category,
-                    "source_file": source_file_label,
-                })
-        if matched_terms:
-            term_matches.append({
-                "segment_id": seg_id,
-                "terms": matched_terms,
-                "source_file": source_file_label,
-            })
-    
-    # 打印匹配结果摘要
-    print(f"\n[ReferenceAnalyzer] ========== 匹配结果摘要 ==========")
-    print(f"[ReferenceAnalyzer] 精确匹配: {len(exact_matches)} 条")
-    if exact_matches:
-        for i, m in enumerate(exact_matches[:5], 1):
-            print(f"  [{i}] 原文: {m['source'][:50]}{'...' if len(m['source']) > 50 else ''}")
-            print(f"      译文: {m['target'][:50]}{'...' if len(m['target']) > 50 else ''}")
-            print(f"      来源: {m['source_file']}")
-        if len(exact_matches) > 5:
-            print(f"  ... 还有 {len(exact_matches) - 5} 条精确匹配")
-    
-    print(f"\n[ReferenceAnalyzer] 模糊匹配: {len(fuzzy_matches)} 条")
-    if fuzzy_matches:
-        for i, m in enumerate(fuzzy_matches[:5], 1):
-            print(f"  [{i}] 原文: {m['source'][:50]}{'...' if len(m['source']) > 50 else ''}")
-            print(f"      匹配: {m['matched_source'][:50]}{'...' if len(m['matched_source']) > 50 else ''}")
-            print(f"      相似度: {m['similarity']:.1%}")
-            print(f"      来源: {m['source_file']}")
-        if len(fuzzy_matches) > 5:
-            print(f"  ... 还有 {len(fuzzy_matches) - 5} 条模糊匹配")
-    
-    print(f"\n[ReferenceAnalyzer] 术语匹配: {len(term_matches)} 条")
-    if term_matches:
-        for i, m in enumerate(term_matches[:5], 1):
-            terms_str = ", ".join([f"{t['source']}→{t['target']}" for t in m['terms'][:3]])
-            if len(m['terms']) > 3:
-                terms_str += f" 等{len(m['terms'])}个"
-            print(f"  [{i}] 句段ID: {m['segment_id']}")
-            print(f"      术语: {terms_str}")
-            print(f"      来源: {m['source_file']}")
-        if len(term_matches) > 5:
-            print(f"  ... 还有 {len(term_matches) - 5} 条术语匹配")
-    
-    print(f"[ReferenceAnalyzer] =====================================\n")
-    
-    return {
-        "exact_matches": exact_matches,
-        "fuzzy_matches": fuzzy_matches,
-        "term_matches": term_matches,
-    }
 
 
 def profile_to_dict(profile: TranslationProfile) -> dict:

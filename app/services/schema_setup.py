@@ -33,7 +33,13 @@ LEGACY_REQUIRED_EXISTING_TABLES = (
     "translation_memory_entries",
 )
 REQUIRED_SCHEMA = {
-    "memory_bases": {"source_language", "target_language", "creator_id"},
+    "memory_bases": {
+        "source_language",
+        "target_language",
+        "project_id",
+        "origin",
+        "creator_id",
+    },
     "resource_import_batches": {
         "id",
         "resource_type",
@@ -81,6 +87,8 @@ REQUIRED_SCHEMA = {
         "name",
         "source_language",
         "target_language",
+        "project_id",
+        "origin",
         "creator_id",
     },
     "glossary_entries": {
@@ -95,6 +103,21 @@ REQUIRED_SCHEMA = {
         "last_modified_by_id",
     },
     "users": {"nickname", "translator_type"},
+    "reference_profiles": {
+        "id",
+        "file_record_id",
+        "project_id",
+        "glossary_base_id",
+        "memory_base_id",
+        "source_files",
+        "terminology",
+        "translation_memory",
+        "style_guide",
+        "analysis_report",
+        "overall_confidence",
+        "created_at",
+        "updated_at",
+    },
     "guideline_templates": {
         "id",
         "name",
@@ -372,6 +395,7 @@ REQUIRED_SCHEMA = {
         "version",
         "source_html",
         "target_html",
+        "segment_metadata",
     },
     "pretranslation_runs": {
         "id",
@@ -525,6 +549,18 @@ REQUIRED_SCHEMA = {
 }
 
 REQUIRED_INDEXES = {
+    "memory_bases": {
+        "ix_memory_bases_project_id",
+        "ix_memory_bases_origin",
+    },
+    "glossary_bases": {
+        "ix_glossary_bases_project_id",
+        "ix_glossary_bases_origin",
+    },
+    "reference_profiles": {
+        "ix_reference_profiles_file_record_id",
+        "ix_reference_profiles_project_id",
+    },
     "segments": {
         "ix_segments_workflow_step_id",
         "ix_segments_source_word_count",
@@ -790,12 +826,28 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
             """,
             """
+            ALTER TABLE IF EXISTS memory_bases
+            ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS memory_bases
+            ADD COLUMN IF NOT EXISTS origin VARCHAR(20) NOT NULL DEFAULT 'manual'
+            """,
+            """
             CREATE INDEX IF NOT EXISTS ix_memory_bases_language_pair
             ON memory_bases (source_language, target_language)
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_memory_bases_creator_id
             ON memory_bases (creator_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_memory_bases_project_id
+            ON memory_bases (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_memory_bases_origin
+            ON memory_bases (origin)
             """,
             """
             ALTER TABLE IF EXISTS memory_entries
@@ -1096,6 +1148,8 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 description TEXT,
                 source_language VARCHAR(20) NOT NULL,
                 target_language VARCHAR(20) NOT NULL,
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                origin VARCHAR(20) NOT NULL DEFAULT 'manual',
                 creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
@@ -1119,6 +1173,14 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
             """
             ALTER TABLE IF EXISTS glossary_bases
+            ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_bases
+            ADD COLUMN IF NOT EXISTS origin VARCHAR(20) NOT NULL DEFAULT 'manual'
+            """,
+            """
+            ALTER TABLE IF EXISTS glossary_bases
             ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
             """,
             """
@@ -1138,6 +1200,14 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             ON glossary_bases (creator_id)
             """,
             """
+            CREATE INDEX IF NOT EXISTS ix_glossary_bases_project_id
+            ON glossary_bases (project_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_glossary_bases_origin
+            ON glossary_bases (origin)
+            """,
+            """
             DROP TRIGGER IF EXISTS update_glossary_bases_updated_at ON glossary_bases
             """,
             """
@@ -1145,6 +1215,43 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             BEFORE UPDATE ON glossary_bases
             FOR EACH ROW
             EXECUTE FUNCTION update_updated_at_column()
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS reference_profiles (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                file_record_id UUID REFERENCES file_records(id) ON DELETE CASCADE,
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                glossary_base_id UUID REFERENCES glossary_bases(id) ON DELETE SET NULL,
+                memory_base_id UUID REFERENCES memory_bases(id) ON DELETE SET NULL,
+                source_files TEXT NOT NULL DEFAULT '[]',
+                terminology TEXT NOT NULL DEFAULT '[]',
+                translation_memory TEXT NOT NULL DEFAULT '[]',
+                style_guide TEXT,
+                analysis_report TEXT,
+                overall_confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            ALTER TABLE IF EXISTS reference_profiles
+            ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE
+            """,
+            """
+            ALTER TABLE IF EXISTS reference_profiles
+            ADD COLUMN IF NOT EXISTS glossary_base_id UUID REFERENCES glossary_bases(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS reference_profiles
+            ADD COLUMN IF NOT EXISTS memory_base_id UUID REFERENCES memory_bases(id) ON DELETE SET NULL
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_reference_profiles_file_record_id
+            ON reference_profiles (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_reference_profiles_project_id
+            ON reference_profiles (project_id)
             """,
             f"""
             CREATE TABLE IF NOT EXISTS glossary_entries (
@@ -2054,6 +2161,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS segments
             ADD COLUMN IF NOT EXISTS target_html TEXT
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS segment_metadata TEXT NOT NULL DEFAULT '{}'
             """,
             """
             ALTER TABLE IF EXISTS segments

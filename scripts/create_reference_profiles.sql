@@ -5,6 +5,9 @@
 CREATE TABLE IF NOT EXISTS reference_profiles (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     file_record_id UUID REFERENCES file_records(id) ON DELETE CASCADE,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    glossary_base_id UUID REFERENCES glossary_bases(id) ON DELETE SET NULL,
+    memory_base_id UUID REFERENCES memory_bases(id) ON DELETE SET NULL,
     source_files TEXT NOT NULL DEFAULT '[]',
     terminology TEXT NOT NULL DEFAULT '[]',
     translation_memory TEXT NOT NULL DEFAULT '[]',
@@ -18,10 +21,18 @@ CREATE TABLE IF NOT EXISTS reference_profiles (
 
 ALTER TABLE IF EXISTS reference_profiles
     ADD COLUMN IF NOT EXISTS match_result TEXT;
+ALTER TABLE IF EXISTS reference_profiles
+    ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE IF EXISTS reference_profiles
+    ADD COLUMN IF NOT EXISTS glossary_base_id UUID REFERENCES glossary_bases(id) ON DELETE SET NULL;
+ALTER TABLE IF EXISTS reference_profiles
+    ADD COLUMN IF NOT EXISTS memory_base_id UUID REFERENCES memory_bases(id) ON DELETE SET NULL;
 
 -- 索引
 CREATE INDEX IF NOT EXISTS ix_reference_profiles_file_record_id 
     ON reference_profiles(file_record_id);
+CREATE INDEX IF NOT EXISTS ix_reference_profiles_project_id
+    ON reference_profiles(project_id);
 
 -- 参考文件记录表（存储上传的参考文件信息）
 CREATE TABLE IF NOT EXISTS reference_files (

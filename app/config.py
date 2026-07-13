@@ -84,6 +84,32 @@ class Settings(BaseSettings):
     libreoffice_soffice_path: str | None = None
     libreoffice_python_path: str | None = None
     libreoffice_timeout_seconds: float = 60.0
+    # ODA File Converter（DWG <-> DXF 跨平台转换器，需用户自行安装）
+    # Windows 例：C:\Program Files\ODA\ODAFileConverter 25.12.0\ODAFileConverter.exe
+    # Linux 例：  /usr/bin/ODAFileConverter
+    oda_converter_path: str | None = None
+    oda_converter_timeout_seconds: float = 120.0
+    # DWG 导出默认输出 DXF；启用后才尝试回写 DWG（依赖 ODA）
+    dwg_export_to_dwg: bool = False
+    # DWG 转换出的 DXF 目标版本（ACAD2018 兼容性最好）
+    oda_converter_dxf_version: str = "ACAD2018"
+    # DWG 专用：处理 MULTILEADER / ACAD_TABLE 等扩展实体（仅 DWG 链路启用）
+    dwg_handle_extra_entities: bool = True
+    # DWG 专用：跳过纯尺寸/坐标式文本（如 "4-100×100"）避免误送翻译
+    dwg_skip_dimension_like: bool = True
+    # DWG 专用：译文超长时按比例缩字宽因子 / MTEXT 字高
+    dwg_enable_overflow_shrink: bool = True
+    # DWG 专用：字宽因子下限
+    dwg_min_width_factor: float = 0.55
+    # DWG 专用：字高最低缩到原值的比例
+    dwg_min_char_height_ratio: float = 0.5
+    # DWG 专用：为非 ASCII 字符（西班牙语/法语等带重音字母）切换到支持 Unicode 的字体
+    dwg_fix_shx_font_for_unicode: bool = True
+    # DWG 专用：替换 SHX 字体的 TrueType 字体名称
+    dwg_unicode_font_name: str = "Arial"
+    # DWG 专用：启用空间聚类合并（将同一行的多个 TEXT 实体合并为语义完整的句子）
+    # 默认关闭，每个实体独立提取
+    dwg_enable_spatial_merge: bool = False
     tm_vector_enabled: bool = True
     tm_vector_dimensions: int = 128
     tm_vector_candidate_limit: int = 6

@@ -386,6 +386,15 @@ def _create_file_record_from_workspace(
 
     created_segments: list[Segment] = []
     for seg in workspace_data["segments"]:
+        # 序列化 segment_metadata 为 JSON 字符串
+        seg_metadata = seg.get("segment_metadata")
+        if isinstance(seg_metadata, dict):
+            seg_metadata_json = json.dumps(seg_metadata, ensure_ascii=False)
+        elif isinstance(seg_metadata, str):
+            seg_metadata_json = seg_metadata
+        else:
+            seg_metadata_json = "{}"
+        
         segment = Segment(
             file_record_id=file_record.id,
             sentence_id=seg["sentence_id"],
@@ -407,6 +416,7 @@ def _create_file_record_from_workspace(
             block_index=seg["block_index"],
             row_index=seg.get("row_index"),
             cell_index=seg.get("cell_index"),
+            segment_metadata=seg_metadata_json,
         )
         db.add(segment)
         created_segments.append(segment)
@@ -497,6 +507,9 @@ def create_file_record_via_adapter(
     segments_data = []
     source_texts = []
     for i, seg in enumerate(result.segments):
+        # 提取 segment metadata（包含 DXF/DWG 空间合并信息）
+        seg_metadata = getattr(seg, 'metadata', {}) or {}
+        
         segments_data.append({
             "sentence_id": seg.segment_id or f"sent-{i + 1:05d}",
             "source_text": seg.source_text,
@@ -509,6 +522,7 @@ def create_file_record_via_adapter(
             "block_index": i,
             "row_index": None,
             "cell_index": None,
+            "segment_metadata": seg_metadata,
         })
         source_texts.append(seg.source_text)
 
@@ -690,6 +704,15 @@ def attach_source_document_to_file_record(
 
     created_segments: list[Segment] = []
     for seg in workspace_data["segments"]:
+        # 序列化 segment_metadata 为 JSON 字符串
+        seg_metadata = seg.get("segment_metadata")
+        if isinstance(seg_metadata, dict):
+            seg_metadata_json = json.dumps(seg_metadata, ensure_ascii=False)
+        elif isinstance(seg_metadata, str):
+            seg_metadata_json = seg_metadata
+        else:
+            seg_metadata_json = "{}"
+        
         segment = Segment(
             file_record_id=file_record.id,
             sentence_id=seg["sentence_id"],
@@ -711,6 +734,7 @@ def attach_source_document_to_file_record(
             block_index=seg["block_index"],
             row_index=seg.get("row_index"),
             cell_index=seg.get("cell_index"),
+            segment_metadata=seg_metadata_json,
         )
         db.add(segment)
         created_segments.append(segment)

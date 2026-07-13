@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 from collections import defaultdict
 from io import BytesIO
@@ -13,6 +14,9 @@ import yaml
 from app.services.adapters.export_formats import get_supported_exports
 from app.services.adapters.tmx_exporter import TmxExporter
 from app.services.adapters.xliff_exporter import XliffExporter
+
+
+logger = logging.getLogger(__name__)
 
 
 class MultiFormatExporter:
@@ -194,6 +198,10 @@ class MultiFormatExporter:
         for key, values in candidates.items():
             if len(values) == 1:
                 result[key] = next(iter(values))
+            elif len(values) > 1:
+                # 有多个不同译文时，使用第一个（按字母顺序）
+                # 这比完全跳过更好，至少能保证有翻译输出
+                result[key] = sorted(values)[0]
         return result
 
     def _export_original(
@@ -283,9 +291,42 @@ class MultiFormatExporter:
 
             content = TxmlExporter().export(original_bytes, text_map)
         elif extension == ".dxf":
-            from app.services.adapters.dxf_exporter import DxfExporter
+            from app.services.adapters.dxf_exporter import DxfExporter, DxfExportOptions
 
-            content = DxfExporter().export(original_bytes, text_map)
+            # 从 segments 中提取合并文本信息
+            merged_text_info = self._extract_merged_text_info(segments, text_map)
+            has_merged_groups = bool(
+                merged_text_info and 
+                any(len(info.get("merged_handles", [])) > 1 for info in merged_text_info)
+            )
+            
+            dxf_options = DxfExportOptions(
+                enable_spatial_merge_export=has_merged_groups,
+            )
+            content = DxfExporter().export(
+                original_bytes, 
+                text_map,
+                options=dxf_options,
+                merged_text_info=merged_text_info,
+            )
+        elif extension == ".dwg":
+            from app.services.adapters.dwg_exporter import DwgExporter
+
+            # 从 segments 中提取合并文本信息
+            merged_text_info = self._extract_merged_text_info(segments, text_map)
+            
+            result = DwgExporter().export_with_extension(
+                original_bytes, 
+                text_map,
+                merged_text_info=merged_text_info,
+            )
+            content = result.content
+            # 当 DWG 回写不可用时降级为 DXF，需要纠正下游 mime/扩展
+            if result.extension != ".dwg":
+                extension = result.extension
+                export_filename = self._build_translated_filename(
+                    filename, extension_override=result.extension
+                )
         elif extension == ".idml":
             from app.services.adapters.idml_exporter import IdmlExporter
 
@@ -803,6 +844,7 @@ class MultiFormatExporter:
         mime_map = {
             ".csv": "text/csv; charset=utf-8",
             ".dxf": "image/vnd.dxf",
+            ".dwg": "image/vnd.dwg",
             ".idml": "application/vnd.adobe.indesign-idml-package",
             ".json": "application/json; charset=utf-8",
             ".md": "text/markdown; charset=utf-8",
@@ -834,6 +876,101 @@ class MultiFormatExporter:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    def _extract_merged_text_info(
+        self, 
+        segments: list[dict[str, Any]], 
+        translations: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        """从句段中提取合并文本信息，用于 DWG/DXF 导出时的处理。
+        
+        支持两种合并方式：
+        1. 自动空间合并（dwg_enable_spatial_merge=True 时）
+        2. 手动合并（用户在工作台手动合并句段）
+        
+        导出时：
+        - 把合并后的译文写到第一个实体的位置
+        - 清空被合并的其他实体
+        
+        Args:
+            segments: 句段列表
+            translations: 源文本 -> 目标文本的映射
+            
+        Returns:
+            合并文本信息列表
+        """
+        merged_info_list: list[dict[str, Any]] = []
+        
+        logger.debug("_extract_merged_text_info: 处理 %d 个句段", len(segments))
+        
+        for seg in segments:
+            metadata = seg.get('metadata', {}) or {}
+            
+            is_merged = metadata.get('is_merged', False)
+            if not is_merged:
+                continue
+            
+            logger.info(
+                "_extract_merged_text_info: 发现合并句段 segment_id=%s, metadata=%s",
+                seg.get('segment_id', ''), metadata
+            )
+            
+            merged_handles = metadata.get('merged_handles', [])
+            if len(merged_handles) <= 1:
+                logger.warning(
+                    "_extract_merged_text_info: 合并句段 handles 不足 2 个: %s", 
+                    merged_handles
+                )
+                continue
+            
+            primary_handle = metadata.get('primary_handle') or metadata.get('handle', '')
+            if not primary_handle:
+                primary_handle = merged_handles[0] if merged_handles else ''
+            
+            if not primary_handle:
+                logger.warning("_extract_merged_text_info: 无法获取 primary_handle")
+                continue
+            
+            # 获取译文
+            source_text = str(seg.get('source_text', '')).strip()
+            target_text = str(seg.get('target_text', '')).strip()
+            
+            if not target_text and source_text:
+                target_text = translations.get(source_text, '')
+            
+            if not target_text:
+                logger.warning(
+                    "_extract_merged_text_info: 合并句段无译文 source=%s...",
+                    source_text[:50] if source_text else "(empty)"
+                )
+                continue
+            
+            merged_info = {
+                'source_text': source_text,
+                'target_text': target_text,
+                'primary_handle': primary_handle,
+                'merged_handles': merged_handles,
+                'primary_x': metadata.get('primary_x') or metadata.get('x', 0),
+                'primary_y': metadata.get('primary_y') or metadata.get('y', 0),
+                'primary_height': metadata.get('primary_height') or metadata.get('height', 2.5),
+                'layer': metadata.get('layer', '0'),
+            }
+            merged_info_list.append(merged_info)
+            
+            logger.info(
+                "_extract_merged_text_info: 添加合并组 primary=%s, handles=%s",
+                primary_handle, merged_handles
+            )
+        
+        if merged_info_list:
+            logger.info(
+                "DWG 导出合并信息提取：%d 个句段 → %d 个合并组",
+                len(segments), len(merged_info_list)
+            )
+        else:
+            logger.debug("_extract_merged_text_info: 未找到任何合并句段")
+        
+        return merged_info_list
 
 
 def get_export_options_for_file(filename: str) -> list[dict]:

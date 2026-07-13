@@ -32,6 +32,8 @@ SUPPORTED_EXTENSIONS = {
     ".md", ".markdown", ".srt", ".csv",
     # V5 新增格式
     ".sdlxliff", ".txml", ".dxf", ".zip",
+    # DWG（依赖 ODA File Converter）
+    ".dwg",
     # V6 新增格式
     ".idml", ".mif", ".rar",
 }

@@ -1153,6 +1153,8 @@ ALTER TABLE IF EXISTS segments
     ADD COLUMN IF NOT EXISTS llm_provider VARCHAR(40);
 ALTER TABLE IF EXISTS segments
     ADD COLUMN IF NOT EXISTS llm_model VARCHAR(200);
+ALTER TABLE IF EXISTS segments
+    ADD COLUMN IF NOT EXISTS segment_metadata TEXT NOT NULL DEFAULT '{}';
 
 CREATE INDEX IF NOT EXISTS ix_segments_file_record_id
     ON segments (file_record_id);
@@ -1451,6 +1453,25 @@ CREATE TRIGGER update_guideline_templates_updated_at
     BEFORE UPDATE ON guideline_templates
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
+
+-- Lin 分支资源同步与 CAD 句段合并功能所需的兼容字段。
+ALTER TABLE IF EXISTS memory_bases
+    ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE IF EXISTS memory_bases
+    ADD COLUMN IF NOT EXISTS origin VARCHAR(20) NOT NULL DEFAULT 'manual';
+CREATE INDEX IF NOT EXISTS ix_memory_bases_project_id
+    ON memory_bases (project_id);
+CREATE INDEX IF NOT EXISTS ix_memory_bases_origin
+    ON memory_bases (origin);
+
+ALTER TABLE IF EXISTS glossary_bases
+    ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE IF EXISTS glossary_bases
+    ADD COLUMN IF NOT EXISTS origin VARCHAR(20) NOT NULL DEFAULT 'manual';
+CREATE INDEX IF NOT EXISTS ix_glossary_bases_project_id
+    ON glossary_bases (project_id);
+CREATE INDEX IF NOT EXISTS ix_glossary_bases_origin
+    ON glossary_bases (origin);
 
 -- =============================================================================
 -- 完成。首次运行后请通过前端 "/login" 页面使用首次初始化接口创建管理员账号：

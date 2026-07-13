@@ -73,15 +73,35 @@ class SegmentExtractor:
         if node.text_content:
             text = node.text_content.strip()
             if text:
-                sentences = self._split_sentences(text)
-                for sentence_text, display_text in sentences:
-                    if sentence_text:  # 跳过空句子
-                        segment = self._create_segment(
-                            source_text=sentence_text,
-                            display_text=display_text,
-                            block_path=path,
-                        )
-                        segments.append(segment)
+                # 检查是否是 CAD 实体
+                entity_type = node.metadata.get("entity_type", "")
+                is_cad_entity = entity_type in (
+                    "TEXT", "MTEXT", "ATTRIB", "ATTDEF", "DIMENSION", 
+                    "MULTILEADER", "ACAD_TABLE", "MERGED_TEXT"
+                )
+                
+                if is_cad_entity:
+                    # CAD 实体：整体作为一个句段，不自动分割
+                    # 用户可以在工作台手动分割或合并
+                    segment = self._create_segment(
+                        source_text=self._normalize_text(text),
+                        display_text=text,
+                        block_path=path,
+                        metadata=node.metadata,
+                    )
+                    segments.append(segment)
+                else:
+                    # 其他格式：按句子分割
+                    sentences = self._split_sentences(text)
+                    for sentence_text, display_text in sentences:
+                        if sentence_text:  # 跳过空句子
+                            segment = self._create_segment(
+                                source_text=sentence_text,
+                                display_text=display_text,
+                                block_path=path,
+                                metadata=node.metadata,
+                            )
+                            segments.append(segment)
         
         # 递归处理子节点
         if node.children:
@@ -203,6 +223,7 @@ class SegmentExtractor:
         source_text: str,
         display_text: str,
         block_path: str,
+        metadata: dict = None,
     ) -> Segment:
         """创建 Segment 实例
         
@@ -210,6 +231,7 @@ class SegmentExtractor:
             source_text: 规范化后的源文本
             display_text: 原始显示文本
             block_path: 在 AST 中的路径
+            metadata: 节点元数据（如 DXF 的 handle, layer, 合并信息等）
             
         Returns:
             Segment: 新创建的 Segment 实例
@@ -226,6 +248,7 @@ class SegmentExtractor:
             display_text=display_text,
             block_path=block_path,
             position=position,
+            metadata=metadata or {},
         )
 
 

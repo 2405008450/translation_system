@@ -470,6 +470,7 @@ const segmentEditorFontScale = ref(getInitialSegmentEditorFontScale())
 const activeSideTool = ref<SideToolKey | null>(null)
 const activeBottomTool = ref<BottomToolKey | null>(null)
 const openingBottomTool = ref<BottomDrawerToolKey | null>(null)
+const referenceMatchResult = ref<import('../types/api').ReferenceMatchResult | null>(null)
 const previewPanelRendering = ref(false)
 const bottomDrawerPanelHeightStyle = computed(() => {
   if (!activeBottomTool.value) {
@@ -653,7 +654,6 @@ const addTermFormError = ref('')
 const termsMessage = ref(t('workbench.terms.defaultMessage'))
 
 // 参考文件匹配结果
-const referenceMatchResult = ref<import('../types/api').ReferenceMatchResult | null>(null)
 
 let searchLoadRequestId = 0
 let suppressSegmentFilterWatch = false
@@ -5222,6 +5222,13 @@ const selectedSentenceIds = ref<Set<string>>(new Set())
 const segmentSelectionAnchorId = ref<string | null>(null)
 const lastSourceCaretOffset = ref<number | null>(null)
 
+// 判断当前文件是否为 CAD 文件（DWG/DXF）
+const isCadFile = computed(() => {
+  const filename = segmentStore.fileRecord?.filename || ''
+  const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase()
+  return ext === '.dwg' || ext === '.dxf'
+})
+
 // 切换激活句段时清除光标缓存
 watch(() => segmentStore.activeSentenceId, () => {
   lastSourceCaretOffset.value = null
@@ -5401,12 +5408,15 @@ async function handleMergeSegment() {
     return
   }
 
-  // 检查是否属于同一段落
+  // CAD 文件（DWG/DXF）：允许跨 block 合并，不检查相邻性
+  // 其他格式：必须同一 block
   const first = orderedSegments[0]
-  const notSameBlock = orderedSegments.some((segment) => !isSameMergeBlock(segment, first))
-  if (notSameBlock) {
-    toast.warn({ message: t('workbench.messages.mergeDifferentBlock') })
-    return
+  if (!isCadFile.value) {
+    const notSameBlock = orderedSegments.some((segment) => !isSameMergeBlock(segment, first))
+    if (notSameBlock) {
+      toast.warn({ message: t('workbench.messages.mergeDifferentBlock') })
+      return
+    }
   }
 
   try {
