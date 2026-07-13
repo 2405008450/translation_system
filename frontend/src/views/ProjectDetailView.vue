@@ -423,7 +423,9 @@ const languageDetectMessage = ref('')
 const languageDetectTone = ref<LanguageDetectTone>('info')
 const selectedFiles = ref<File[]>([])
 const uploadSourceLanguage = ref('')
-const uploadTargetLanguage = ref('')
+const uploadTargetLanguages = ref<string[]>([])
+const uploadTargetLanguageSearch = ref('')
+const uploadTargetMenuOpen = ref(false)
 const documentParseMode = ref<DocumentParseMode>('full')
 const documentParseOptions = ref<DocumentParseOptions>({ ...DEFAULT_DOCUMENT_PARSE_OPTIONS })
 const uploadCapabilities = ref<UploadCapability[]>([])
@@ -1433,12 +1435,42 @@ const canDetectSourceLanguage = computed(() => (
   && !isProjectLanguagePairBound.value
 ))
 const uploadFileValidationError = computed(() => validateSelectedUploadFiles(selectedFiles.value))
+const effectiveUploadTargetLanguages = computed(() => (
+  projectBoundLanguagePair.value?.target
+    ? [projectBoundLanguagePair.value.target]
+    : uploadTargetLanguages.value
+))
+const generatedUploadTaskCount = computed(() => (
+  selectedFiles.value.length * effectiveUploadTargetLanguages.value.length
+))
+const uploadGenerationValidationError = computed(() => {
+  if (generatedUploadTaskCount.value <= uploadLimits.value.max_expanded_files) {
+    return ''
+  }
+  return t('projectDetail.errors.tooManyGeneratedTasks', {
+    count: generatedUploadTaskCount.value,
+    max: uploadLimits.value.max_expanded_files,
+  })
+})
+const filteredUploadTargetLanguageOptions = computed(() => {
+  const query = normalizeSearchKeyword(uploadTargetLanguageSearch.value)
+  return languageOptions.filter((language) => {
+    if (language.code === uploadSourceLanguage.value) {
+      return false
+    }
+    if (!query) {
+      return true
+    }
+    return normalizeSearchKeyword(`${language.label} ${language.code}`).includes(query)
+  })
+})
 const canSubmitSourceUpload = computed(() => (
   selectedFiles.value.length > 0
   && !uploading.value
   && !uploadFileValidationError.value
+  && !uploadGenerationValidationError.value
   && Boolean(uploadSourceLanguage.value)
-  && Boolean(uploadTargetLanguage.value)
+  && effectiveUploadTargetLanguages.value.length > 0
 ))
 const cameFromTasks = computed(() => route.query.from === 'tasks')
 const backRoute = computed(() => (
@@ -2168,7 +2200,41 @@ function validateSelectedUploadFiles(files: File[]): string {
 function updateSelectedFiles(files: File[]) {
   selectedFiles.value = files
   clearLanguageDetectState()
-  uploadMessage.value = validateSelectedUploadFiles(files)
+  uploadMessage.value = validateSelectedUploadFiles(files) || uploadGenerationValidationError.value
+}
+
+function toggleUploadTargetLanguage(languageCode: string) {
+  if (uploading.value || isProjectLanguagePairBound.value || languageCode === uploadSourceLanguage.value) {
+    return
+  }
+  const selected = uploadTargetLanguages.value.includes(languageCode)
+  uploadTargetLanguages.value = selected
+    ? uploadTargetLanguages.value.filter((code) => code !== languageCode)
+    : [...uploadTargetLanguages.value, languageCode]
+  uploadMessage.value = uploadFileValidationError.value || uploadGenerationValidationError.value
+}
+
+function closeUploadTargetMenu() {
+  uploadTargetMenuOpen.value = false
+  uploadTargetLanguageSearch.value = ''
+}
+
+function toggleUploadTargetMenu() {
+  if (uploading.value || isProjectLanguagePairBound.value) {
+    return
+  }
+  uploadTargetMenuOpen.value = !uploadTargetMenuOpen.value
+  if (!uploadTargetMenuOpen.value) {
+    uploadTargetLanguageSearch.value = ''
+  }
+}
+
+function removeUploadTargetLanguage(languageCode: string) {
+  if (uploading.value || isProjectLanguagePairBound.value) {
+    return
+  }
+  uploadTargetLanguages.value = uploadTargetLanguages.value.filter((code) => code !== languageCode)
+  uploadMessage.value = uploadFileValidationError.value || uploadGenerationValidationError.value
 }
 
 function onFileChange(event: Event) {
@@ -2193,6 +2259,7 @@ function clearSelectedUploadFiles() {
 function resetUploadForm() {
   clearSelectedUploadFiles()
   uploadPercent.value = 0
+  closeUploadTargetMenu()
   documentParseMode.value = 'full'
   documentParseOptions.value = { ...DEFAULT_DOCUMENT_PARSE_OPTIONS }
 }
@@ -2204,7 +2271,9 @@ function openUploadDialog() {
 
   resetUploadForm()
   uploadSourceLanguage.value = projectBoundLanguagePair.value?.source || ''
-  uploadTargetLanguage.value = projectBoundLanguagePair.value?.target || ''
+  uploadTargetLanguages.value = projectBoundLanguagePair.value?.target
+    ? [projectBoundLanguagePair.value.target]
+    : []
   showUploadModal.value = true
 }
 
@@ -3075,6 +3144,9 @@ function stopActionMenuEventBubble(ev: MouseEvent) {
 
 function handleDocumentClick(ev: MouseEvent) {
   const target = ev.target as HTMLElement
+  if (!target.closest('.upload-target-select')) {
+    closeUploadTargetMenu()
+  }
   if (!target.closest('.pd-export-dropdown')) {
     showProjectExportMenu.value = false
   }
@@ -3088,6 +3160,7 @@ function handleDocumentClick(ev: MouseEvent) {
 }
 
 function handleDocumentScroll() {
+  closeUploadTargetMenu()
   showProjectExportMenu.value = false
   closeFileSelectionMenu()
   if (openActionMenuId.value) {
@@ -4825,10 +4898,10 @@ async function detectSourceLanguage() {
     )
 
     if (data.language) {
-      const matchesTargetLanguage = uploadTargetLanguage.value === data.language
+      const matchesTargetLanguage = uploadTargetLanguages.value.includes(data.language)
       uploadSourceLanguage.value = data.language
       if (matchesTargetLanguage) {
-        uploadTargetLanguage.value = ''
+        uploadTargetLanguages.value = uploadTargetLanguages.value.filter((code) => code !== data.language)
       }
       languageDetectTone.value = 'success'
       const confidence = data.confidence > 0 ? `，置信度 ${Math.round(data.confidence * 100)}%` : ''
@@ -4858,18 +4931,20 @@ async function uploadSourceDocument() {
   }
 
   const resolvedSourceLanguage = projectBoundLanguagePair.value?.source || uploadSourceLanguage.value
-  const resolvedTargetLanguage = projectBoundLanguagePair.value?.target || uploadTargetLanguage.value
+  const resolvedTargetLanguages = projectBoundLanguagePair.value?.target
+    ? [projectBoundLanguagePair.value.target]
+    : uploadTargetLanguages.value
   if (isProjectLanguagePairBound.value) {
     uploadSourceLanguage.value = resolvedSourceLanguage
-    uploadTargetLanguage.value = resolvedTargetLanguage
+    uploadTargetLanguages.value = [...resolvedTargetLanguages]
   }
 
-  if (!resolvedSourceLanguage || !resolvedTargetLanguage) {
+  if (!resolvedSourceLanguage || resolvedTargetLanguages.length === 0) {
     uploadMessage.value = t('projectDetail.errors.selectLanguagePair')
     return
   }
 
-  if (resolvedSourceLanguage === resolvedTargetLanguage) {
+  if (resolvedTargetLanguages.includes(resolvedSourceLanguage)) {
     uploadMessage.value = t('projectList.errors.sameLanguage')
     return
   }
@@ -4877,6 +4952,11 @@ async function uploadSourceDocument() {
   const validationError = validateSelectedUploadFiles(selectedFiles.value)
   if (validationError) {
     uploadMessage.value = validationError
+    return
+  }
+
+  if (uploadGenerationValidationError.value) {
+    uploadMessage.value = uploadGenerationValidationError.value
     return
   }
 
@@ -4892,7 +4972,9 @@ async function uploadSourceDocument() {
     })
     formData.append('threshold', '0.6')
     formData.append('source_language', resolvedSourceLanguage)
-    formData.append('target_language', resolvedTargetLanguage)
+    resolvedTargetLanguages.forEach((language) => {
+      formData.append('target_languages', language)
+    })
     formData.append('document_parse_mode', documentParseMode.value)
     formData.append('document_parse_options', JSON.stringify(documentParseOptions.value))
 
@@ -5311,6 +5393,16 @@ onMounted(() => {
   void loadUploadCapabilities()
 })
 
+watch(uploadSourceLanguage, (sourceLanguage) => {
+  if (isProjectLanguagePairBound.value || !sourceLanguage) {
+    return
+  }
+  if (uploadTargetLanguages.value.includes(sourceLanguage)) {
+    uploadTargetLanguages.value = uploadTargetLanguages.value.filter((code) => code !== sourceLanguage)
+    uploadMessage.value = uploadFileValidationError.value || uploadGenerationValidationError.value
+  }
+})
+
 watch(() => route.hash, () => {
   syncProjectSettingsHash()
 })
@@ -5427,20 +5519,19 @@ onBeforeUnmount(() => {
                   v-for="lang in languageOptions"
                   :key="lang.code"
                   :value="lang.code"
-                  :disabled="lang.code === uploadTargetLanguage"
                 >
                   {{ lang.label }}
                 </option>
               </select>
             </label>
 
-            <label class="field">
+            <label v-if="isProjectLanguagePairBound" class="field">
               <span class="field__label">{{ t('projectList.form.targetLanguage') }} <span class="field__required">*</span></span>
               <select
-                v-model="uploadTargetLanguage"
+                :value="effectiveUploadTargetLanguages[0] || ''"
                 class="field__control"
                 data-testid="project-upload-target-language"
-                :disabled="isProjectLanguagePairBound || uploading"
+                disabled
               >
                 <option value="" disabled>{{ t('projectList.form.targetPlaceholder') }}</option>
                 <option
@@ -5453,6 +5544,95 @@ onBeforeUnmount(() => {
                 </option>
               </select>
             </label>
+
+            <div v-else class="field upload-target-field">
+              <span class="field__label">
+                {{ t('projectDetail.uploadLanguage.targetLanguages') }}
+                <span class="field__required">*</span>
+              </span>
+              <div
+                class="upload-target-select"
+                :class="{ 'is-open': uploadTargetMenuOpen }"
+                data-testid="project-upload-target-languages"
+              >
+                <button
+                  class="upload-target-select__trigger"
+                  data-testid="project-upload-target-trigger"
+                  type="button"
+                  :disabled="uploading"
+                  :aria-expanded="uploadTargetMenuOpen"
+                  @click.stop="toggleUploadTargetMenu"
+                >
+                  <span v-if="uploadTargetLanguages.length === 0" class="upload-target-select__placeholder">
+                    {{ t('projectDetail.uploadLanguage.targetPlaceholder') }}
+                  </span>
+                  <span v-else class="upload-target-select__value">
+                    {{ t('projectDetail.uploadLanguage.selectedTargets', { count: uploadTargetLanguages.length }) }}
+                  </span>
+                  <ChevronDown :size="16" :class="{ 'is-rotated': uploadTargetMenuOpen }" />
+                </button>
+
+                <div
+                  v-if="uploadTargetMenuOpen"
+                  class="upload-target-select__popover"
+                  @click.stop
+                  @keydown.esc="closeUploadTargetMenu"
+                >
+                  <label class="upload-target-select__search">
+                    <Search :size="14" />
+                    <input
+                      v-model="uploadTargetLanguageSearch"
+                      data-testid="project-upload-target-search"
+                      type="search"
+                      :placeholder="t('projectDetail.uploadLanguage.searchTarget')"
+                      :disabled="uploading"
+                    />
+                  </label>
+                  <div class="upload-target-select__options">
+                    <label
+                      v-for="lang in filteredUploadTargetLanguageOptions"
+                      :key="lang.code"
+                      class="upload-target-option"
+                      :class="{ 'is-selected': uploadTargetLanguages.includes(lang.code) }"
+                    >
+                      <input
+                        type="checkbox"
+                        :data-testid="`project-upload-target-${lang.code}`"
+                        :checked="uploadTargetLanguages.includes(lang.code)"
+                        :disabled="uploading"
+                        @change="toggleUploadTargetLanguage(lang.code)"
+                      />
+                      <span>{{ lang.label }}</span>
+                      <small>{{ lang.code }}</small>
+                    </label>
+                    <p v-if="filteredUploadTargetLanguageOptions.length === 0" class="upload-target-select__empty">
+                      {{ t('projectDetail.uploadLanguage.noTargetResult') }}
+                    </p>
+                  </div>
+                  <div class="upload-target-select__footer">
+                    <span>{{ t('projectDetail.uploadLanguage.selectedTargets', { count: uploadTargetLanguages.length }) }}</span>
+                    <button class="button button--primary" type="button" @click="closeUploadTargetMenu">
+                      {{ t('common.actions.confirm') }}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div v-if="uploadTargetLanguages.length" class="upload-target-select__chips">
+                <button
+                  v-for="languageCode in uploadTargetLanguages"
+                  :key="languageCode"
+                  class="upload-target-chip"
+                  type="button"
+                  :disabled="uploading"
+                  :aria-label="t('projectDetail.uploadLanguage.removeTarget', { language: getLanguageLabel(languageCode) })"
+                  @click="removeUploadTargetLanguage(languageCode)"
+                >
+                  <span>{{ getLanguageLabel(languageCode) }}</span>
+                  <X :size="12" />
+                </button>
+              </div>
+            </div>
           </div>
 
           <p v-if="isProjectLanguagePairBound" class="upload-bound-language">
@@ -5465,6 +5645,20 @@ onBeforeUnmount(() => {
             :class="`upload-detect-message--${languageDetectTone}`"
           >
             {{ languageDetectMessage }}
+          </p>
+
+          <p
+            v-if="selectedFiles.length && effectiveUploadTargetLanguages.length"
+            class="upload-task-estimate"
+            :class="{ 'is-error': Boolean(uploadGenerationValidationError) }"
+            data-testid="project-upload-task-estimate"
+          >
+            {{ t('projectDetail.uploadLanguage.taskEstimate', {
+              files: selectedFiles.length,
+              languages: effectiveUploadTargetLanguages.length,
+              count: generatedUploadTaskCount,
+            }) }}
+            <span v-if="uploadGenerationValidationError">{{ uploadGenerationValidationError }}</span>
           </p>
 
           <div v-if="selectedFiles.length" class="upload-file-list-wrap">
@@ -5521,7 +5715,9 @@ onBeforeUnmount(() => {
             >
               <Loader2 v-if="uploading" class="lucide-spin" :size="14" />
               <Upload v-else :size="14" />
-              {{ uploading ? t('projectDetail.messages.uploading', { percent: uploadPercent }) : t('projectDetail.messages.startUpload') }}
+              {{ uploading
+                ? t('projectDetail.messages.uploading', { percent: uploadPercent })
+                : t('projectDetail.messages.startUploadCount', { count: generatedUploadTaskCount }) }}
             </button>
           </div>
         </section>
@@ -8444,13 +8640,14 @@ onBeforeUnmount(() => {
 }
 
 .upload-language-panel {
-  width: min(720px, 100%);
+  width: min(760px, 100%);
   display: grid;
-  gap: 14px;
-  padding: 16px;
+  gap: 16px;
+  padding: 18px;
   border: 1px solid var(--line-soft);
-  border-radius: 8px;
+  border-radius: 10px;
   background: var(--surface-panel);
+  box-shadow: 0 6px 18px rgba(27, 55, 48, 0.04);
 }
 
 .upload-language-panel__head {
@@ -8473,7 +8670,240 @@ onBeforeUnmount(() => {
 .upload-language-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
   gap: 14px;
+}
+
+.upload-language-grid > .field {
+  align-content: start;
+  align-self: start;
+  min-width: 0;
+}
+
+.upload-language-grid .field__control {
+  align-self: start;
+  height: 42px;
+}
+
+.upload-target-field {
+  min-width: 0;
+}
+
+.upload-target-select {
+  position: relative;
+  min-width: 0;
+}
+
+.upload-target-select__trigger {
+  width: 100%;
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--control-bg);
+  color: var(--text-primary);
+  text-align: left;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.upload-target-select__trigger:hover:not(:disabled),
+.upload-target-select.is-open .upload-target-select__trigger {
+  border-color: var(--brand-700);
+  background: var(--surface-panel);
+}
+
+.upload-target-select.is-open .upload-target-select__trigger {
+  box-shadow: var(--focus-ring);
+}
+
+.upload-target-select__trigger svg {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  transition: transform 0.16s ease;
+}
+
+.upload-target-select__trigger svg.is-rotated {
+  transform: rotate(180deg);
+}
+
+.upload-target-select__value {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-target-select__popover {
+  position: absolute;
+  z-index: 80;
+  top: calc(100% + 7px);
+  left: 0;
+  width: 100%;
+  min-width: 300px;
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  box-shadow: 0 16px 36px rgba(20, 45, 39, 0.18);
+}
+
+.upload-target-select__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 26px;
+  max-height: 64px;
+  overflow-y: auto;
+}
+
+.upload-target-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  min-height: 26px;
+  padding: 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--state-info) 28%, var(--line-soft));
+  border-radius: 999px;
+  background: var(--state-info-bg);
+  color: var(--state-info);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.upload-target-chip:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.upload-target-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-target-select__placeholder {
+  overflow: hidden;
+  color: var(--text-tertiary, #8a9491);
+  font-size: 13px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-target-select__search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 32px;
+  padding: 0 9px;
+  border: 1px solid var(--line-soft);
+  border-radius: 5px;
+  color: var(--text-secondary);
+  background: var(--surface-panel);
+}
+
+.upload-target-select__search input {
+  min-width: 0;
+  width: 100%;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+}
+
+.upload-target-select__options {
+  display: grid;
+  max-height: 230px;
+  overflow-y: auto;
+  padding: 2px 0;
+}
+
+.upload-target-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 5px 7px;
+  border-radius: 5px;
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.upload-target-option:hover {
+  background: var(--surface-hover, #f3f7f6);
+}
+
+.upload-target-option.is-selected {
+  background: color-mix(in srgb, var(--state-info-bg) 78%, transparent);
+  color: var(--brand-800, var(--brand-700));
+}
+
+.upload-target-option input {
+  margin: 0;
+  accent-color: var(--brand-700);
+}
+
+.upload-target-option small {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.upload-target-select__empty {
+  margin: 0;
+  padding: 12px 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-align: center;
+}
+
+.upload-target-select__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 9px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.upload-target-select__footer .button {
+  min-height: 30px;
+  padding: 5px 12px;
+  font-size: 12px;
+}
+
+.upload-task-estimate {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin: -2px 0 0;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--state-info) 25%, transparent);
+  border-radius: 6px;
+  background: var(--state-info-bg);
+  color: var(--state-info);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.upload-task-estimate.is-error {
+  border-color: color-mix(in srgb, var(--state-danger, #dc2626) 30%, transparent);
+  background: var(--state-danger-bg, #fef2f2);
+  color: var(--state-danger, #dc2626);
 }
 
 .upload-bound-language {
@@ -8585,6 +9015,8 @@ onBeforeUnmount(() => {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line-soft);
 }
 
 .doc-settings {
@@ -12567,6 +12999,10 @@ onBeforeUnmount(() => {
   .upload-language-grid,
   .doc-settings__grid {
     grid-template-columns: 1fr;
+  }
+
+  .upload-target-select__popover {
+    min-width: 0;
   }
 
   .pd-settings-list,

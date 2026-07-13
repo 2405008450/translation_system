@@ -220,7 +220,7 @@ from app.services.term_extraction_service import (
 )
 from app.services.term_matcher import find_non_overlapping_term_text_matches, text_contains_term
 from app.services.language_detection import detect_upload_language
-from app.services.language_pairs import require_language_pair
+from app.services.language_pairs import normalize_language_code, require_language_pair
 from app.services.matcher import get_tm_candidates_for_text, match_sentences_with_stats
 from app.services.normalizer import build_source_hash, normalize_match_text, normalize_text
 from app.services.segment_status import (
@@ -1124,11 +1124,18 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
         db,
         selected_collection_ids[0] if selected_collection_ids else None,
     )
-    resolved_source_language, resolved_target_language = _resolve_upload_language_pair(
+    resolved_source_language, resolved_target_languages = _resolve_project_upload_language_pairs(
         payload.get("source_language"),
         payload.get("target_language"),
+        payload.get("target_languages"),
         primary_collection,
         project,
+    )
+
+    _validate_project_upload_resources(
+        resolved_target_languages,
+        selected_collection_ids,
+        term_base_id,
     )
 
     term_base = None
@@ -1139,7 +1146,7 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
         _ensure_resource_language_pair_matches(
             term_base,
             resolved_source_language,
-            resolved_target_language,
+            resolved_target_languages[0],
             "术语库",
         )
 
@@ -1149,59 +1156,68 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
     expanded_payloads = _expand_archive_payloads(file_payloads)
     validate_expanded_upload_batch(expanded_payloads)
 
+    generated_file_count = _validate_project_upload_generation_count(
+        len(expanded_payloads),
+        len(resolved_target_languages),
+        get_settings().upload_max_expanded_files,
+    )
+
     created_files: list[FileRecord] = []
-    for index, file_payload in enumerate(expanded_payloads, start=1):
-        raise_if_import_task_canceled(task_id)
+    combination_index = 0
+    for file_payload in expanded_payloads:
         filename = file_payload["filename"] or "source.txt"
         raw_bytes = read_import_file_bytes(file_payload)
-        _set_import_task_status(
-            task_id,
-            "running",
-            progress=10 + int((index - 1) / max(len(expanded_payloads), 1) * 80),
-            message=f"正在解析 {filename}",
-        )
-        workspace_data = build_task_workspace(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=filename,
-            similarity_threshold=threshold,
-            collection_ids=selected_collection_ids,
-            source_language=resolved_source_language,
-            target_language=resolved_target_language,
-            document_parse_mode=document_parse_mode,
-            document_parse_options=document_parse_options,
-        )
-        file_record = create_file_record_with_segments(
-            db=db,
-            raw_bytes=raw_bytes,
-            filename=filename,
-            similarity_threshold=threshold,
-            workspace_data=workspace_data,
-            collection_ids=selected_collection_ids,
-            document_parse_mode=document_parse_mode,
-            document_parse_options=document_parse_options,
-        )
-        file_record.project_id = project.id
-        file_record.creator_id = project.creator_id
-        file_record.deadline = project.deadline
-        file_record.access_level = project.access_level
-        file_record.source_language = resolved_source_language
-        file_record.target_language = resolved_target_language
-        if selected_collection_ids:
-            file_record.collection_id = selected_collection_ids[0]
-            file_record.collection_ids_json = json.dumps([str(cid) for cid in selected_collection_ids])
-        if term_base is not None:
-            _store_file_record_term_base_ids(file_record, [term_base_id])
-        # 项目下已有参考分析时，自动把对应的词汇表/记忆库追加到当前文件
-        attach_project_reference_bases_to_file(db, file_record)
-        db.flush()
-        _assign_file_segments_to_first_workflow_step(db, file_record)
-        sync_project_repeated_segments_from_file(
-            db,
-            file_record=file_record,
-            current_user=None,
-        )
-        created_files.append(file_record)
+        for resolved_target_language in resolved_target_languages:
+            combination_index += 1
+            raise_if_import_task_canceled(task_id)
+            _set_import_task_status(
+                task_id,
+                "running",
+                progress=10 + int((combination_index - 1) / max(generated_file_count, 1) * 80),
+                message=f"正在解析 {filename}（{resolved_target_language}）",
+            )
+            workspace_data = build_task_workspace(
+                db=db,
+                raw_bytes=raw_bytes,
+                filename=filename,
+                similarity_threshold=threshold,
+                collection_ids=selected_collection_ids,
+                source_language=resolved_source_language,
+                target_language=resolved_target_language,
+                document_parse_mode=document_parse_mode,
+                document_parse_options=document_parse_options,
+            )
+            file_record = create_file_record_with_segments(
+                db=db,
+                raw_bytes=raw_bytes,
+                filename=filename,
+                similarity_threshold=threshold,
+                workspace_data=workspace_data,
+                collection_ids=selected_collection_ids,
+                document_parse_mode=document_parse_mode,
+                document_parse_options=document_parse_options,
+            )
+            file_record.project_id = project.id
+            file_record.creator_id = project.creator_id
+            file_record.deadline = project.deadline
+            file_record.access_level = project.access_level
+            file_record.source_language = resolved_source_language
+            file_record.target_language = resolved_target_language
+            if selected_collection_ids:
+                file_record.collection_id = selected_collection_ids[0]
+                file_record.collection_ids_json = json.dumps([str(cid) for cid in selected_collection_ids])
+            if term_base is not None:
+                _store_file_record_term_base_ids(file_record, [term_base_id])
+            # 项目下已有参考分析时，按实际语言对追加对应的词汇表/记忆库。
+            attach_project_reference_bases_to_file(db, file_record)
+            db.flush()
+            _assign_file_segments_to_first_workflow_step(db, file_record)
+            sync_project_repeated_segments_from_file(
+                db,
+                file_record=file_record,
+                current_user=None,
+            )
+            created_files.append(file_record)
 
     project.status = "in_progress"
     db.commit()
@@ -1214,6 +1230,7 @@ def _process_project_source_import(db: Session, task_id: str, payload: dict[str,
         "status": project.status,
         "filename": project.name,
         "uploaded_count": len(created_files),
+        "target_languages": resolved_target_languages,
         "files": [
             _json_ready_project_file_payload(
                 _build_project_file_payload(
@@ -5334,6 +5351,103 @@ def _resolve_upload_language_pair(
     raise HTTPException(status_code=400, detail="上传文件前请选择源语言和目标语言。")
 
 
+def _resolve_project_upload_language_pairs(
+    source_language: str | None,
+    target_language: str | None,
+    target_languages: list[str] | None,
+    primary_collection: TMCollection | None = None,
+    project: Project | None = None,
+) -> tuple[str, list[str]]:
+    """解析项目上传语言选择，同时兼容旧的单目标语言参数。"""
+    if target_languages is None:
+        resolved_source, resolved_target = _resolve_upload_language_pair(
+            source_language,
+            target_language,
+            primary_collection,
+            project,
+        )
+        return resolved_source, [resolved_target]
+
+    if not target_languages:
+        raise HTTPException(status_code=400, detail="请至少选择一个目标语言。")
+
+    if project and (project.source_language or project.target_language):
+        project_source, project_target = _require_tm_language_pair(
+            project.source_language,
+            project.target_language,
+        )
+        if source_language:
+            try:
+                submitted_source = normalize_language_code(source_language, field_label="源语言")
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if submitted_source != project_source:
+                raise HTTPException(
+                    status_code=400,
+                    detail="当前项目已绑定语言对，上传文件必须使用项目语言对。",
+                )
+        resolved_source = project_source
+    else:
+        try:
+            resolved_source = normalize_language_code(source_language, field_label="源语言")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not resolved_source:
+            raise HTTPException(status_code=400, detail="上传文件前请选择源语言。")
+
+    resolved_targets: list[str] = []
+    for submitted_target in target_languages:
+        _, resolved_target = _require_tm_language_pair(resolved_source, submitted_target)
+        if resolved_target not in resolved_targets:
+            resolved_targets.append(resolved_target)
+
+    if not resolved_targets:
+        raise HTTPException(status_code=400, detail="请至少选择一个目标语言。")
+
+    if project and (project.source_language or project.target_language):
+        if resolved_targets != [project_target]:
+            raise HTTPException(
+                status_code=400,
+                detail="当前项目已绑定语言对，不支持选择多个或其他目标语言。",
+            )
+
+    if len(resolved_targets) == 1:
+        _ensure_resource_language_pair_matches(
+            primary_collection,
+            resolved_source,
+            resolved_targets[0],
+            "记忆库",
+        )
+
+    return resolved_source, resolved_targets
+
+
+def _validate_project_upload_resources(
+    target_languages: list[str],
+    collection_ids: list[UUID] | None,
+    term_base_id: UUID | None,
+) -> None:
+    if len(target_languages) > 1 and (collection_ids or term_base_id is not None):
+        raise HTTPException(
+            status_code=400,
+            detail="多目标语言上传不能绑定单一语言对的记忆库或术语库，请使用项目语言对资源配置。",
+        )
+
+
+def _validate_project_upload_generation_count(
+    expanded_file_count: int,
+    target_language_count: int,
+    max_generated_files: int,
+) -> int:
+    generated_file_count = expanded_file_count * target_language_count
+    if generated_file_count > max_generated_files:
+        raise UploadLimitError(
+            f"文件与目标语言组合后将生成 {generated_file_count} 个任务，最多允许 {max_generated_files} 个。",
+            status_code=400,
+        )
+    return generated_file_count
+
+
 def _get_collection_or_404(db: Session, collection_id: UUID | None) -> TMCollection | None:
     if collection_id is None:
         return None
@@ -9044,6 +9158,7 @@ async def upload_project_source_document(
     term_base_id: UUID | None = Form(default=None),
     source_language: str | None = Form(default=None),
     target_language: str | None = Form(default=None),
+    target_languages: list[str] | None = Form(default=None),
     document_parse_mode: str = Form(default=DOCUMENT_PARSE_MODE_FULL),
     document_parse_options: str | None = Form(default=None),
     db: Session = Depends(get_db),
@@ -9069,11 +9184,18 @@ async def upload_project_source_document(
         db,
         selected_collection_ids[0] if selected_collection_ids else None,
     )
-    resolved_source_language, resolved_target_language = _resolve_upload_language_pair(
+    resolved_source_language, resolved_target_languages = _resolve_project_upload_language_pairs(
         source_language,
         target_language,
+        target_languages,
         primary_collection,
         project,
+    )
+
+    _validate_project_upload_resources(
+        resolved_target_languages,
+        selected_collection_ids,
+        term_base_id,
     )
 
     term_base = None
@@ -9084,7 +9206,7 @@ async def upload_project_source_document(
         _ensure_resource_language_pair_matches(
             term_base,
             resolved_source_language,
-            resolved_target_language,
+            resolved_target_languages[0],
             "术语库",
         )
 
@@ -9095,7 +9217,8 @@ async def upload_project_source_document(
         "collection_ids": [str(collection_id) for collection_id in selected_collection_ids],
         "term_base_id": str(term_base_id) if term_base_id is not None else None,
         "source_language": resolved_source_language,
-        "target_language": resolved_target_language,
+        "target_language": resolved_target_languages[0],
+        "target_languages": resolved_target_languages,
         "document_parse_mode": document_parse_mode,
         "document_parse_options": normalized_parse_options,
     }

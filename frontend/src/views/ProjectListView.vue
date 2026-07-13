@@ -1387,7 +1387,11 @@ onBeforeUnmount(() => {
             >
               {{ row.filename }}
             </button>
-            <span class="project-main-cell__meta" :title="getProjectMetaText(row as ProjectItem)">
+            <span
+              v-if="!authStore.isExternalTranslator"
+              class="project-main-cell__meta"
+              :title="getProjectMetaText(row as ProjectItem)"
+            >
               {{ getProjectMetaText(row as ProjectItem) }}
             </span>
           </div>
