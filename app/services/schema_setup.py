@@ -335,8 +335,6 @@ REQUIRED_SCHEMA = {
         "revoked_by_id",
         "revoked_at",
         "status",
-        "segment_range_start",
-        "segment_range_end",
     },
     "project_workflow_steps": {
         "id",
@@ -358,6 +356,8 @@ REQUIRED_SCHEMA = {
         "revoked_by_id",
         "revoked_at",
         "status",
+        "segment_range_start",
+        "segment_range_end",
     },
     "assignment_events": {
         "id",
