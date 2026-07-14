@@ -396,6 +396,7 @@ REQUIRED_SCHEMA = {
         "source_html",
         "target_html",
         "segment_metadata",
+        "sequence_index",
     },
     "pretranslation_runs": {
         "id",
@@ -566,6 +567,7 @@ REQUIRED_INDEXES = {
         "ix_segments_source_word_count",
         "ix_segments_source_hash",
         "ix_segments_file_source_hash",
+        "ix_segments_file_record_sequence_order",
         "ix_segments_project_sync_source_segment_id",
         "ix_segments_project_sync_source_file_record_id",
         "ix_segments_translated_source_word_count",
@@ -2168,6 +2170,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
             """
             ALTER TABLE IF EXISTS segments
+            ADD COLUMN IF NOT EXISTS sequence_index INTEGER NOT NULL DEFAULT -1
+            """,
+            """
+            ALTER TABLE IF EXISTS segments
             ADD COLUMN IF NOT EXISTS project_sync_source_segment_id UUID REFERENCES segments(id) ON DELETE SET NULL
             """,
             """
@@ -2177,6 +2183,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_segments_file_record_order
             ON segments (file_record_id, block_index, row_index, cell_index, sentence_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_file_record_sequence_order
+            ON segments (file_record_id, block_index, row_index, cell_index, sequence_index, sentence_id)
             """,
             """
             CREATE INDEX IF NOT EXISTS ix_segments_workflow_step_id

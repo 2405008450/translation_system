@@ -1113,6 +1113,7 @@ def _normalize_existing_segment(segment: Any) -> dict[str, Any]:
         "block_index": _get_segment_value(segment, "block_index", 0),
         "row_index": _get_segment_value(segment, "row_index"),
         "cell_index": _get_segment_value(segment, "cell_index"),
+        "sequence_index": _get_segment_value(segment, "sequence_index", -1),
     }
 
 

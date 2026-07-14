@@ -928,6 +928,15 @@ class Segment(Base):
             "cell_index",
             "sentence_id",
         ),
+        Index(
+            "ix_segments_file_record_sequence_order",
+            "file_record_id",
+            "block_index",
+            "row_index",
+            "cell_index",
+            "sequence_index",
+            "sentence_id",
+        ),
         Index("ix_segments_file_record_status", "file_record_id", "status"),
         Index("ix_segments_file_record_source", "file_record_id", "source"),
         Index("ix_segments_last_modified_by_id", "last_modified_by_id"),
@@ -1014,6 +1023,14 @@ class Segment(Base):
     block_index: Mapped[int] = mapped_column(nullable=False, default=0)
     row_index: Mapped[int | None] = mapped_column(nullable=True)
     cell_index: Mapped[int | None] = mapped_column(nullable=True)
+    # 句段在源文件中的权威顺序。sentence_id 仅用于身份标识，不能再参与位置推断。
+    # -1 表示迁移前的历史数据，导出时继续使用源文档对齐兜底。
+    sequence_index: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=-1,
+        server_default=text("-1"),
+    )
     segment_metadata: Mapped[str] = mapped_column(
         Text,
         nullable=False,

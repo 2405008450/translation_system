@@ -19,7 +19,6 @@ from app.auth import (
     can_access_all_projects,
     get_current_user,
     get_user_display_name,
-    is_admin_role,
     require_resource_creator,
 )
 from app.config import get_settings
@@ -439,7 +438,7 @@ def _require_term_entry_create_access(
     file_record_id: UUID | None,
     current_user: User,
 ) -> None:
-    if is_admin_role(getattr(current_user, "role", None)):
+    if can_access_all_projects(current_user):
         return
 
     if file_record_id is None:

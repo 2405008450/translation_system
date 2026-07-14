@@ -234,11 +234,22 @@ ALTER TABLE IF EXISTS segments
     ADD COLUMN IF NOT EXISTS llm_provider VARCHAR(40);
 ALTER TABLE IF EXISTS segments
     ADD COLUMN IF NOT EXISTS llm_model VARCHAR(200);
+ALTER TABLE IF EXISTS segments
+    ADD COLUMN IF NOT EXISTS sequence_index INTEGER NOT NULL DEFAULT -1;
 
 CREATE INDEX IF NOT EXISTS ix_segments_source_hash
     ON segments (source_hash);
 CREATE INDEX IF NOT EXISTS ix_segments_file_source_hash
     ON segments (file_record_id, source_hash);
+CREATE INDEX IF NOT EXISTS ix_segments_file_record_sequence_order
+    ON segments (
+        file_record_id,
+        block_index,
+        row_index,
+        cell_index,
+        sequence_index,
+        sentence_id
+    );
 
 -- -----------------------------------------------------------------------------
 -- memory_entries 表：缺少 creator_id

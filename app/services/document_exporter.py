@@ -46,7 +46,7 @@ from app.services.document_workspace import (
     normalize_document_parse_mode,
     should_merge_table_cell_paragraph_texts,
 )
-from app.services.normalizer import normalize_text
+from app.services.normalizer import compact_match_core, normalize_text
 from app.services.sentence_splitter import SentenceSpan, split_sentence_spans
 
 
@@ -254,6 +254,7 @@ class ExportSegment:
     matched_source_text: str = ""
     target_html: str | None = None
     math_placeholders: dict[str, str] = field(default_factory=dict)
+    sequence_index: int | None = None
 
 
 @dataclass
@@ -469,6 +470,7 @@ def _group_segments_by_block(
                 matched_source_text=str(_get_segment_value(segment, "matched_source_text", "") or ""),
                 target_html=str(target_html) if target_html else None,
                 math_placeholders=dict(math_map.get(sentence_id) or {}),
+                sequence_index=_get_export_sequence_index(segment),
             )
         )
 
@@ -579,6 +581,9 @@ def _order_export_segments_for_source_block(
     block_segments: list[ExportSegment],
     source_segments: list[Mapping[str, Any]],
 ) -> list[ExportSegment]:
+    if _has_complete_explicit_sequence(block_segments):
+        return sorted(block_segments, key=lambda segment: int(segment.sequence_index or 0))
+
     used_indexes: set[int] = set()
     ordered: list[ExportSegment] = []
 
@@ -702,8 +707,29 @@ def _segment_text_keys(*values: object) -> set[str]:
     for value in values:
         text = _normalize_segment_source_text(str(value or ""))
         if text:
-            keys.add(text)
+            keys.add(f"exact:{text}")
+            compact_text = compact_match_core(text)
+            if compact_text:
+                keys.add(f"compact:{compact_text}")
     return keys
+
+
+def _get_export_sequence_index(segment: Any) -> int | None:
+    value = _get_segment_value(segment, "sequence_index")
+    if value is None or value == "":
+        return None
+    try:
+        sequence_index = int(value)
+    except (TypeError, ValueError):
+        return None
+    return sequence_index if sequence_index >= 0 else None
+
+
+def _has_complete_explicit_sequence(segments: Iterable[ExportSegment]) -> bool:
+    sequence_indexes = [segment.sequence_index for segment in segments]
+    return bool(sequence_indexes) and all(
+        sequence_index is not None for sequence_index in sequence_indexes
+    ) and len(sequence_indexes) == len(set(sequence_indexes))
 
 
 def _export_bilingual_block_sequence(
@@ -1951,6 +1977,7 @@ def _replace_block_tokens(
 
     used_segment_indexes: set[int] = set()
     fallback_segment_index = 0
+    use_explicit_sequence = _has_complete_explicit_sequence(segments)
     previous_replacement = ""
     previous_span: SentenceSpan | None = None
     for span in spans:
@@ -1958,12 +1985,14 @@ def _replace_block_tokens(
         if not sentence_source:
             continue
 
-        match_index = _find_export_segment_index_for_span_source(
-            segments=segments,
-            sentence_source=sentence_source,
-            used_indexes=used_segment_indexes,
-            preferred_index=fallback_segment_index,
-        )
+        match_index = None
+        if not use_explicit_sequence:
+            match_index = _find_export_segment_index_for_span_source(
+                segments=segments,
+                sentence_source=sentence_source,
+                used_indexes=used_segment_indexes,
+                preferred_index=fallback_segment_index,
+            )
         if match_index is None:
             match_index = _next_unused_segment_index(segments, used_segment_indexes, fallback_segment_index)
         if match_index is None:
@@ -2055,7 +2084,7 @@ def _next_unused_segment_index(
 def _export_segment_matches_source_text(segment: ExportSegment, sentence_source: str) -> bool:
     if not sentence_source:
         return False
-    return sentence_source in _export_segment_text_keys(segment)
+    return bool(_segment_text_keys(sentence_source) & _export_segment_text_keys(segment))
 
 
 def _is_target_placeholder(text: str | None) -> bool:
@@ -2160,6 +2189,7 @@ def _build_inline_bilingual_segments(
                 matched_source_text=segment.matched_source_text,
                 target_html=None,
                 math_placeholders=segment.math_placeholders,
+                sequence_index=segment.sequence_index,
             )
         )
     return bilingual_segments

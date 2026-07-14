@@ -31,9 +31,8 @@ from app.auth import (
     get_current_user,
     get_user_by_id,
     get_user_display_name,
-    is_admin_role,
     is_external_translator,
-    require_admin,
+    require_business_manager,
     require_project_assignment_manager,
     require_project_creator,
     require_resource_creator,
@@ -115,7 +114,7 @@ from app.services.comment_service import (
 )
 from app.services.document_statistics import (
     STATISTIC_NUMBER_KEYS,
-    compute_word_document_statistics,
+    compute_document_statistics,
     normalize_document_statistics,
     serialize_document_statistics,
 )
@@ -3066,7 +3065,7 @@ def _safe_int(value: Any) -> int:
 
 
 def _can_manage_workflow(current_user: User | None) -> bool:
-    return is_admin_role(getattr(current_user, "role", None))
+    return can_access_all_projects(current_user)
 
 
 WORKFLOW_TEMPLATE_DEFINITIONS: list[dict[str, Any]] = [
@@ -4541,7 +4540,7 @@ def list_assignment_events(
     action: str | None = None,
     limit: int = 100,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_business_manager),
 ):
     from sqlalchemy.orm import joinedload
 
@@ -5917,7 +5916,7 @@ async def create_file_record(
     document_parse_mode: str = Form(default=DOCUMENT_PARSE_MODE_FULL),
     document_parse_options: str | None = Form(default=None),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ):
     """上传文档并创建持久化记录"""
     _validate_task_upload(file)
@@ -7767,7 +7766,7 @@ def update_project_assignments(
 def get_project_term_base_settings(
     project_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_business_manager),
 ):
     project = _get_project_or_404(db, project_id)
     files = (
@@ -7784,7 +7783,7 @@ def update_project_term_base_settings(
     project_id: UUID,
     payload: ProjectTermBaseSettingsRequest,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_business_manager),
 ):
     project = _get_project_or_404(db, project_id)
     files = (
@@ -7836,7 +7835,7 @@ def update_project_term_base_settings(
 def get_project_translation_memory_settings(
     project_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_business_manager),
 ):
     project = _get_project_or_404(db, project_id)
     files = (
@@ -7854,7 +7853,7 @@ def update_project_translation_memory_settings(
     payload: ProjectTranslationMemorySettingsRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_business_manager),
 ):
     project = _get_project_or_404(db, project_id)
     if "auto_tm_enabled" in payload.model_fields_set and payload.auto_tm_enabled is not None:
@@ -8689,7 +8688,7 @@ def compute_project_document_statistics(
     project_id: UUID,
     payload: ProjectDocumentStatisticsPayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
@@ -8730,8 +8729,8 @@ def compute_project_document_statistics(
     for file_record in files:
         source_bytes = load_file_record_source(file_record)
         source_filename = get_file_record_source_filename(file_record)
-        if source_bytes and Path(source_filename).suffix.lower() in {".doc", ".docx"}:
-            statistics = compute_word_document_statistics(source_bytes, source_filename)
+        if source_bytes and Path(source_filename).suffix.lower() in {".doc", ".docx", ".pptx"}:
+            statistics = compute_document_statistics(source_bytes, source_filename)
         else:
             statistics = unavailable_statistics
         normalized_statistics = normalize_document_statistics(statistics)
@@ -8790,7 +8789,7 @@ def list_project_document_statistics_reports(
     limit: int = 20,
     include_items: bool = True,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
@@ -8821,7 +8820,7 @@ def list_project_document_statistics_reports(
 def get_document_statistics_report(
     report_id: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ):
     report = (
         db.query(DocumentStatisticsReport)
@@ -8839,7 +8838,7 @@ def get_document_statistics_report(
 def delete_project(
     project_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_business_manager),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
@@ -8865,7 +8864,7 @@ def update_project(
     project_id: UUID,
     payload: ProjectUpdatePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
@@ -8923,7 +8922,7 @@ def update_project_quality_qa_settings(
     project_id: UUID,
     payload: QualityQASettingsRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
@@ -9577,6 +9576,7 @@ def _serialize_workbench_segment(
         "block_index": seg.block_index,
         "row_index": seg.row_index,
         "cell_index": seg.cell_index,
+        "sequence_index": seg.sequence_index,
         "workflow_step_id": str(resolved_workflow_step_id) if resolved_workflow_step_id else None,
         "workflow_step_name": workflow_step.name if workflow_step else "翻译",
         "workflow_step_order": int(workflow_step.sort_order or 0) if workflow_step else 0,
@@ -11101,7 +11101,7 @@ def duplicate_file_record_task(
     file_record_id: UUID,
     payload: FileRecordDuplicateRequest | None = None,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ):
     """复制一个文件任务，保留源文件和句段原文，不复制译文。"""
     duplicate = duplicate_file_record(
@@ -11138,7 +11138,7 @@ def assign_file_record_task(
     file_record_id: UUID,
     payload: FileRecordAssignmentRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
@@ -13176,7 +13176,7 @@ def update_project_sync_for_project(
     project_id: UUID,
     payload: SegmentProjectSyncUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ) -> ProjectSyncDisableResponse:
     """开启或关闭项目下全部文件的项目同步。关闭时清空项目同步生成的译文。"""
     summary = _set_project_sync_disabled_for_project(db, project_id, payload.disabled, current_user)
@@ -13188,7 +13188,7 @@ def update_project_sync_for_project(
 def disable_project_sync_for_project(
     project_id: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ) -> ProjectSyncDisableResponse:
     """一键关闭项目下全部文件的项目同步，并清空项目同步生成的译文。"""
     disable_summary = _set_project_sync_disabled_for_project(db, project_id, True, current_user)
@@ -13274,6 +13274,27 @@ def split_segment(
     # 生成新的 sentence_id：使用子编号方式
     new_sentence_id = _generate_split_sentence_id(sentence_id, db, file_record_id)
 
+    # sequence_index 是句段位置的唯一依据。历史记录首次拆分时先按当前文档顺序补齐，
+    # 再为后半句腾出一个紧邻位置，避免退回 sentence_id/UUID 字典序。
+    ordered_file_segments = (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record_id)
+        .order_by(*get_segment_ordering_for_file_record(file_record))
+        .all()
+    )
+    sequence_indexes = [
+        int(item.sequence_index if item.sequence_index is not None else -1)
+        for item in ordered_file_segments
+    ]
+    if any(index < 0 for index in sequence_indexes) or len(sequence_indexes) != len(set(sequence_indexes)):
+        for index, item in enumerate(ordered_file_segments):
+            item.sequence_index = index
+
+    current_sequence_index = int(segment.sequence_index)
+    for item in ordered_file_segments:
+        if item is not segment and int(item.sequence_index) > current_sequence_index:
+            item.sequence_index = int(item.sequence_index) + 1
+
     # 更新原句段
     segment.source_text = first_source
     segment.source_hash = build_source_hash(first_source)
@@ -13313,6 +13334,7 @@ def split_segment(
         block_index=segment.block_index,
         row_index=segment.row_index,
         cell_index=segment.cell_index,
+        sequence_index=current_sequence_index + 1,
     )
     new_segment.status = _resolve_unconfirmed_segment_status(new_segment)
     db.add(new_segment)
@@ -13866,7 +13888,7 @@ def save_file_record_segments_to_tm(
     file_record_id: UUID,
     payload: SaveToTMRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ):
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
@@ -14880,7 +14902,7 @@ async def llm_translate_file_record(
 def remove_file_record(
     file_record_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_business_manager),
 ):
     """删除文档及其所有片段"""
     success = delete_file_record(db, file_record_id)
@@ -15205,7 +15227,7 @@ def update_tm_collection(
     collection_id: UUID,
     payload: MemoryBasePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_business_manager),
 ):
     collection = _get_collection_or_404(db, collection_id)
     if collection is None:
@@ -15254,7 +15276,7 @@ def copy_tm_collection_to_language_pair(
     collection_id: UUID,
     payload: ResourceLanguagePairCopyPayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ):
     source_collection = _get_collection_or_404(db, collection_id)
     if source_collection is None:
@@ -15322,7 +15344,7 @@ def copy_tm_collection_to_language_pair(
 def merge_tm_collections(
     payload: TMCollectionMergePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ):
     source_collection_ids = list(dict.fromkeys(payload.source_collection_ids))
     if len(source_collection_ids) < 2:
@@ -15456,7 +15478,7 @@ def merge_tm_collections(
 def delete_tm_collection(
     collection_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_business_manager),
 ):
     collection = _get_collection_or_404(db, collection_id)
     if collection is None:
@@ -15805,7 +15827,7 @@ async def preview_tm_xlsx(
     preview_limit: int = Form(default=100),
     skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_business_manager),
 ):
     extension = _validate_tm_import_upload(file)
     task_id, staged_file = await asyncio.to_thread(_stage_resource_upload_file, file)
@@ -15922,7 +15944,7 @@ async def import_tm_xlsx(
     skip_duplicate_row_indexes: str = Form(default="[]"),
     skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ):
     extension = _validate_tm_import_upload(file)
     task_id, staged_file = await asyncio.to_thread(_stage_resource_upload_file, file)
@@ -16100,7 +16122,7 @@ def add_tm_collection_entry(
     collection_id: UUID,
     payload: TMEntryUpdatePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ):
     collection = _get_collection_or_404(db, collection_id)
     if collection is None:
@@ -16128,7 +16150,7 @@ def add_tm_collection_entry(
 def add_tm_entry(
     entry: TMEntry,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ):
     """添加单条 TM 记录（去重：相同原文不重复添加）"""
     source_text = normalize_text(entry.source_text)
@@ -16316,7 +16338,7 @@ def _upsert_tm_entry(
 def batch_add_tm_entries(
     batch: BatchTMEntry,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ):
     """批量添加 TM 记录（去重）"""
     skipped_count = 0
@@ -16424,7 +16446,7 @@ def list_termbase_collections(
 def create_termbase_collection(
     payload: TermBasePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ):
     name = _normalize_collection_name(payload.name)
     if not name:
@@ -16452,7 +16474,7 @@ def create_termbase_collection(
 def delete_termbase_collection(
     collection_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_business_manager),
 ):
     collection = _get_termbase_collection_or_404(db, collection_id)
     if collection is None:
@@ -16506,7 +16528,7 @@ def list_terms(
 def add_term(
     payload: TermPayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_business_manager),
 ):
     source_text = normalize_text(payload.source_text)
     target_text = normalize_text(payload.target_text)
@@ -16551,7 +16573,7 @@ def add_term(
 def delete_term(
     term_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_business_manager),
 ):
     term = db.query(TermEntry).filter(TermEntry.id == term_id).first()
     if not term:
@@ -16568,7 +16590,7 @@ def import_termbase_xlsx(
     file: UploadFile = File(...),
     collection_id: UUID | None = Form(default=None),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_business_manager),
 ):
     # 定义为同步 def，由 FastAPI 调度到线程池执行，避免术语库导入的解析/写库阻塞事件循环。
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""

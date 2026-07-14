@@ -480,6 +480,7 @@ export interface Segment {
   block_index: number
   row_index?: number | null
   cell_index?: number | null
+  sequence_index?: number | null
   workflow_step_id?: string | null
   workflow_step_name?: string | null
   workflow_step_order?: number | null

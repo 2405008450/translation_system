@@ -2027,7 +2027,11 @@ function getStatisticsStatusClass(statistics: DocumentStatistics | null | undefi
   if (statistics.source === 'aspose' || statistics.source === 'libreoffice') {
     return 'project-status--success'
   }
-  if (statistics.source === 'openxml_computed' || statistics.source === 'openxml_word_like') {
+  if (
+    statistics.source === 'openxml_computed'
+    || statistics.source === 'openxml_word_like'
+    || statistics.source === 'pptx_word_like'
+  ) {
     return 'project-status--info'
   }
   if (statistics.source === 'docprops_cached') {

@@ -541,7 +541,7 @@ export default {
     },
     stats: {
       title: '文档统计',
-      description: '选择一个或多个 DOC/DOCX 文件，生成 Word 文档级页数、字数和字符数统计表。',
+      description: '选择一个或多个 DOC、DOCX 或 PPTX 文件，生成页数、字数和字符数统计表。',
       generate: '统计',
       generating: '统计中...',
       clear: '清空选择',

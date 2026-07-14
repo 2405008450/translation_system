@@ -1116,6 +1116,7 @@ CREATE TABLE IF NOT EXISTS segments (
     block_index INTEGER NOT NULL DEFAULT 0,
     row_index INTEGER,
     cell_index INTEGER,
+    sequence_index INTEGER NOT NULL DEFAULT -1,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -1155,6 +1156,8 @@ ALTER TABLE IF EXISTS segments
     ADD COLUMN IF NOT EXISTS llm_model VARCHAR(200);
 ALTER TABLE IF EXISTS segments
     ADD COLUMN IF NOT EXISTS segment_metadata TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE IF EXISTS segments
+    ADD COLUMN IF NOT EXISTS sequence_index INTEGER NOT NULL DEFAULT -1;
 
 CREATE INDEX IF NOT EXISTS ix_segments_file_record_id
     ON segments (file_record_id);
@@ -1164,6 +1167,8 @@ CREATE INDEX IF NOT EXISTS ix_segments_file_source_hash
     ON segments (file_record_id, source_hash);
 CREATE INDEX IF NOT EXISTS ix_segments_file_record_order
     ON segments (file_record_id, block_index, row_index, cell_index, sentence_id);
+CREATE INDEX IF NOT EXISTS ix_segments_file_record_sequence_order
+    ON segments (file_record_id, block_index, row_index, cell_index, sequence_index, sentence_id);
 CREATE INDEX IF NOT EXISTS ix_segments_workflow_step_id
     ON segments (workflow_step_id);
 -- 检索/筛选加速：scope、status_filters、match_filters 频繁按这些列过滤。

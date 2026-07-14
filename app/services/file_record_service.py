@@ -48,10 +48,14 @@ SEGMENT_ORDERING = (
     Segment.block_index.asc(),
     Segment.row_index.asc().nullsfirst(),
     Segment.cell_index.asc().nullsfirst(),
+    case((Segment.sequence_index >= 0, 0), else_=1).asc(),
+    Segment.sequence_index.asc(),
     Segment.sentence_id.asc(),
 )
 
 PPTX_SEGMENT_ORDERING = (
+    case((Segment.sequence_index >= 0, 0), else_=1).asc(),
+    Segment.sequence_index.asc(),
     Segment.sentence_id.asc(),
     Segment.block_index.asc(),
     Segment.row_index.asc().nullsfirst(),
@@ -320,7 +324,9 @@ def duplicate_file_record(
     db.flush()
 
     source_segments = list_segments_for_file_record(db, source_record.id)
-    for segment in source_segments:
+    for sequence_index, segment in enumerate(source_segments):
+        raw_sequence_index = getattr(segment, "sequence_index", -1)
+        stored_sequence_index = int(raw_sequence_index if raw_sequence_index is not None else -1)
         db.add(
             Segment(
                 file_record_id=duplicate.id,
@@ -347,6 +353,9 @@ def duplicate_file_record(
                 block_index=segment.block_index,
                 row_index=segment.row_index,
                 cell_index=segment.cell_index,
+                sequence_index=(
+                    stored_sequence_index if stored_sequence_index >= 0 else sequence_index
+                ),
             )
         )
 
@@ -385,7 +394,7 @@ def _create_file_record_from_workspace(
     db.flush()
 
     created_segments: list[Segment] = []
-    for seg in workspace_data["segments"]:
+    for sequence_index, seg in enumerate(workspace_data["segments"]):
         # 序列化 segment_metadata 为 JSON 字符串
         seg_metadata = seg.get("segment_metadata")
         if isinstance(seg_metadata, dict):
@@ -416,6 +425,7 @@ def _create_file_record_from_workspace(
             block_index=seg["block_index"],
             row_index=seg.get("row_index"),
             cell_index=seg.get("cell_index"),
+            sequence_index=sequence_index,
             segment_metadata=seg_metadata_json,
         )
         db.add(segment)
@@ -470,6 +480,7 @@ def create_txt_file_record_with_segments(
             source_word_count=count_source_words(result.source_sentence),
             block_type="paragraph",
             block_index=index,
+            sequence_index=index,
         )
         db.add(segment)
         created_segments.append(segment)
@@ -703,7 +714,7 @@ def attach_source_document_to_file_record(
     file_record.document_statistics = serialize_document_statistics(workspace_data.get("document_statistics"))
 
     created_segments: list[Segment] = []
-    for seg in workspace_data["segments"]:
+    for sequence_index, seg in enumerate(workspace_data["segments"]):
         # 序列化 segment_metadata 为 JSON 字符串
         seg_metadata = seg.get("segment_metadata")
         if isinstance(seg_metadata, dict):
@@ -734,6 +745,7 @@ def attach_source_document_to_file_record(
             block_index=seg["block_index"],
             row_index=seg.get("row_index"),
             cell_index=seg.get("cell_index"),
+            sequence_index=sequence_index,
             segment_metadata=seg_metadata_json,
         )
         db.add(segment)

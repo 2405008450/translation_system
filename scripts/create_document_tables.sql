@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS segments (
     block_index INTEGER NOT NULL DEFAULT 0,
     row_index INTEGER,
     cell_index INTEGER,
+    sequence_index INTEGER NOT NULL DEFAULT -1,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -71,6 +72,11 @@ ALTER TABLE IF EXISTS segments
     ADD COLUMN IF NOT EXISTS llm_provider VARCHAR(40);
 ALTER TABLE IF EXISTS segments
     ADD COLUMN IF NOT EXISTS llm_model VARCHAR(200);
+ALTER TABLE IF EXISTS segments
+    ADD COLUMN IF NOT EXISTS sequence_index INTEGER NOT NULL DEFAULT -1;
+
+CREATE INDEX IF NOT EXISTS ix_segments_file_record_sequence_order
+    ON segments (file_record_id, block_index, row_index, cell_index, sequence_index, sentence_id);
 
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
