@@ -489,6 +489,10 @@ export interface Segment {
   /** 合并视图聚合读取时附带：句段所属文件 id 与文件名 */
   file_record_id?: string
   filename?: string
+  /** DWG/DXF 空间合并信心分数 (0-1)。<0.7 通常需要人工复核。仅合并句段有此字段。 */
+  merge_confidence?: number | null
+  /** 该句段是否由 DWG/DXF 空间合并生成，携带多个原始实体 */
+  is_merged?: boolean | null
 }
 
 export type SegmentQAIssueSeverity = 'low' | 'medium' | 'high'

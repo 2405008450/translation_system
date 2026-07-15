@@ -21,6 +21,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import math
 import re
 from typing import Iterable, List, Optional
 
@@ -149,13 +150,20 @@ class DxfAdapter(FormatAdapter):
     ) -> ParseResult:
         self.validate_file_size(raw_bytes, filename)
         opts = options or {}
+        # 上游 document_parse_options 目前不会带 enable_spatial_merge 键，
+        # 因此 .dxf 文件即便 settings 里开了 dwg_enable_spatial_merge 也不会生效。
+        # 显式退回 settings，让 .dxf 和 .dwg 走同一套开关。
+        settings = get_settings()
+        default_spatial_merge = getattr(settings, "dwg_enable_spatial_merge", False)
+        default_skip_dim_like = getattr(settings, "dwg_skip_dimension_like", False)
+        default_extra = getattr(settings, "dwg_handle_extra_entities", False)
         return self._parse_with_options(
             raw_bytes,
             skip_non_translatable=bool(opts.get("skip_non_translatable", True)),
             filename=filename,
-            extract_extra_entities=bool(opts.get("extract_extra_entities", False)),
-            skip_dimension_like=bool(opts.get("skip_dimension_like", False)),
-            enable_spatial_merge=bool(opts.get("enable_spatial_merge", False)),
+            extract_extra_entities=bool(opts.get("extract_extra_entities", default_extra)),
+            skip_dimension_like=bool(opts.get("skip_dimension_like", default_skip_dim_like)),
+            enable_spatial_merge=bool(opts.get("enable_spatial_merge", default_spatial_merge)),
         )
 
     def _parse_with_options(
@@ -411,107 +419,398 @@ class DxfAdapter(FormatAdapter):
         audit: Optional[List[dict]] = None,
     ) -> List[BlockNode]:
         """收集文本节点并进行语义重建
-        
-        核心流程：
-        1. 先不急着翻译，先做"语义重建"
-        2. 按"阅读顺序"重建句子：同一 baseline + 同一方向 + 距离在阈值内
-        3. 建立 sentence-level grouping
-        4. 合并后的 BlockNode 在 metadata 中包含 merged_handles 列表，供导出时使用
-        
-        排版容错规则：
-        - gap < 3.0 × 字高 → 同句（允许较大间隔）
-        - rotation diff < 5° → 同句
-        - baseline diff < 0.8 × 字高 → 同句
+
+        Stage-1 版本要点：
+        - L0 几何补齐：通过 `_extract_text_entity` 拿真 bbox / 对齐锚点，
+          INSERT 通过 transform 栈把子实体变换到世界坐标。
+        - L4 逻辑分组：ATTRIB 打上 tag + insert_handle；DIMENSION / MULTILEADER /
+          ACAD_TABLE 走独立节点通道，不参与几何合并。
         """
-        seen_handles: set[str] = set()
-        
-        # Step 1: 收集所有文本实体信息
+        seen_handles: set = set()
+        # 记录被 INSERT 展开过的 BLOCK 名，避免顶层 for block in doc.blocks 再走一遍
+        expanded_blocks: set[str] = set()
+        # 直出节点通道：DIMENSION / MULTILEADER / ACAD_TABLE 不进合并
+        standalone_nodes: List[BlockNode] = []
+        # 参与合并的文本实体
         all_entities: List[TextEntity] = []
-        
-        def collect_entity_info(entity, *, scope: str) -> None:
-            handle = getattr(entity.dxf, "handle", None)
-            if handle and handle in seen_handles:
-                return
-            if handle:
-                seen_handles.add(handle)
-            
+        # L2 网格线阻挡索引（按 scope 分桶的水平/垂直线段集合）
+        from app.services.adapters.text_reconstruction import BarrierIndex, BarrierLine
+        barrier_index = BarrierIndex()
+        barrier_stats = {"lines": 0, "hlines": 0, "vlines": 0}
+
+        def _accept_entity(text_entity: Optional[TextEntity]) -> bool:
+            if text_entity is None:
+                return False
+            if skip_non_translatable and not is_translatable_text(text_entity.text):
+                logger.debug(
+                    "DXF 跳过(非可译) [%s|%s]: %s",
+                    text_entity.entity_type,
+                    text_entity.layer,
+                    text_entity.text[:80],
+                )
+                return False
+            if skip_dimension_like and _is_dimension_like(text_entity.text):
+                logger.debug(
+                    "DXF 跳过(尺寸式) [%s|%s]: %s",
+                    text_entity.entity_type,
+                    text_entity.layer,
+                    text_entity.text[:80],
+                )
+                return False
+            return True
+
+        def _emit_standalone(entity, *, scope: str, entity_type: str) -> None:
+            """DIMENSION / MULTILEADER / ACAD_TABLE：不走几何合并，直接出 BlockNode。"""
+            try:
+                if entity_type == "ACAD_TABLE":
+                    standalone_nodes.extend(
+                        n for n in self._acad_table_to_nodes(entity, scope=scope) if n is not None
+                    )
+                    return
+                node = self._entity_to_node(
+                    entity,
+                    scope=scope,
+                    extract_extra_entities=False,
+                )
+                if node is None:
+                    return
+                text = node.text_content or ""
+                if skip_non_translatable and not is_translatable_text(text):
+                    return
+                if skip_dimension_like and _is_dimension_like(text):
+                    return
+                # 打上标记：这些节点不是合并组
+                node.metadata.setdefault("is_merged", False)
+                node.metadata.setdefault("merged_handles", [node.metadata.get("handle", "")])
+                node.metadata.setdefault("merged_count", 1)
+                standalone_nodes.append(node)
+            except Exception as exc:  # noqa: BLE001 - 兼容不同 ezdxf 版本
+                logger.debug("standalone 节点提取失败 [%s]: %s", entity_type, exc)
+
+        def _collect_barrier_lines(entity, scope: str, transform) -> None:
+            """把 LINE / LWPOLYLINE / POLYLINE 里近水平/近垂直的线段收进 barrier_index。"""
             dxftype = entity.dxftype()
-            
-            # INSERT 递归处理 ATTRIB
+            try:
+                if dxftype == "LINE":
+                    start = entity.dxf.start
+                    end = entity.dxf.end
+                    pts = [(float(start[0]), float(start[1])), (float(end[0]), float(end[1]))]
+                elif dxftype == "LWPOLYLINE":
+                    pts = [(float(p[0]), float(p[1])) for p in entity.get_points("xy")]
+                elif dxftype == "POLYLINE":
+                    pts = []
+                    for v in entity.vertices:
+                        loc = v.dxf.location
+                        pts.append((float(loc[0]), float(loc[1])))
+                else:
+                    return
+            except Exception:  # noqa: BLE001
+                return
+
+            if len(pts) < 2:
+                return
+
+            if transform is not None:
+                transformed: List[tuple[float, float]] = []
+                for x, y in pts:
+                    try:
+                        tx, ty, _ = transform.transform((x, y, 0.0))
+                        transformed.append((float(tx), float(ty)))
+                    except Exception:  # noqa: BLE001
+                        transformed.append((x, y))
+                pts = transformed
+
+            for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+                dx = x2 - x1
+                dy = y2 - y1
+                length = math.hypot(dx, dy)
+                if length <= 0:
+                    continue
+                # 水平：|dy| 相对 |dx| 很小；垂直：反之
+                if abs(dy) <= 0.02 * abs(dx) and abs(dx) >= 1e-6:
+                    y_mid = (y1 + y2) / 2.0
+                    barrier_index.add(BarrierLine(
+                        axis="h", pos=y_mid,
+                        range_min=min(x1, x2), range_max=max(x1, x2),
+                        scope=scope,
+                    ))
+                    barrier_stats["hlines"] += 1
+                elif abs(dx) <= 0.02 * abs(dy) and abs(dy) >= 1e-6:
+                    x_mid = (x1 + x2) / 2.0
+                    barrier_index.add(BarrierLine(
+                        axis="v", pos=x_mid,
+                        range_min=min(y1, y2), range_max=max(y1, y2),
+                        scope=scope,
+                    ))
+                    barrier_stats["vlines"] += 1
+                barrier_stats["lines"] += 1
+
+        def visit(
+            entity,
+            *,
+            scope: str,
+            transform=None,
+            insert_handle: str = "",
+            block_name: str = "",
+            depth: int = 0,
+        ) -> None:
+            handle = getattr(entity.dxf, "handle", None)
+            # 只对顶层遍历做 handle 去重；BLOCK 定义里的实体在不同 INSERT 下会重复出现，
+            # 但同一 handle 只需在自己的 scope 内出现一次即可
+            dedup_key = (handle, scope) if handle else None
+            if dedup_key is not None:
+                if dedup_key in seen_handles:  # type: ignore[operator]
+                    return
+                seen_handles.add(dedup_key)  # type: ignore[arg-type]
+
+            dxftype = entity.dxftype()
+
+            # L2：几何线段进 barrier_index，不影响其它分支
+            if dxftype in ("LINE", "LWPOLYLINE", "POLYLINE"):
+                _collect_barrier_lines(entity, scope, transform)
+                return
+
+            # L4：DIMENSION / MULTILEADER / ACAD_TABLE 单独成节点
+            if dxftype in ("DIMENSION", "MULTILEADER", "ACAD_TABLE"):
+                _emit_standalone(entity, scope=scope, entity_type=dxftype)
+                return
+
             if dxftype == "INSERT":
-                block_name = getattr(entity.dxf, "name", "")
-                insert_scope = f"{scope}:insert:{block_name}"
+                sub_block_name = getattr(entity.dxf, "name", "")
+                sub_handle = getattr(entity.dxf, "handle", "") or ""
+                insert_scope = f"{scope}:insert:{sub_block_name}"
+                sub_transform = self._make_insert_transform(entity, parent=transform)
+
+                # 1) INSERT 挂载的 ATTRIB（有真实 handle）
                 try:
                     for attrib in entity.attribs:
-                        collect_entity_info(attrib, scope=insert_scope)
+                        text_entity = self._extract_text_entity(
+                            attrib,
+                            insert_scope,
+                            transform=sub_transform,
+                            insert_handle=sub_handle,
+                            block_name=sub_block_name,
+                        )
+                        if _accept_entity(text_entity):
+                            all_entities.append(text_entity)
                 except Exception:  # noqa: BLE001
                     pass
+
+                # 2) 展开引用的 BLOCK 定义，把块内文本变换到世界坐标
+                if depth < 10 and sub_block_name:
+                    try:
+                        block = doc.blocks.get(sub_block_name)
+                    except Exception:  # noqa: BLE001
+                        block = None
+                    if block is not None:
+                        expanded_blocks.add(sub_block_name)
+                        for sub in block:
+                            visit(
+                                sub,
+                                scope=insert_scope,
+                                transform=sub_transform,
+                                insert_handle=sub_handle,
+                                block_name=sub_block_name,
+                                depth=depth + 1,
+                            )
                 return
-            
-            # 只处理 TEXT 和 MTEXT（ATTRIB/ATTDEF 在 INSERT 分支处理）
-            if dxftype not in ("TEXT", "MTEXT", "ATTRIB", "ATTDEF"):
+
+            # TEXT / MTEXT / 独立 ATTRIB / ATTDEF
+            if dxftype in ("TEXT", "MTEXT", "ATTRIB", "ATTDEF"):
+                text_entity = self._extract_text_entity(
+                    entity,
+                    scope,
+                    transform=transform,
+                    insert_handle=insert_handle,
+                    block_name=block_name,
+                )
+                if _accept_entity(text_entity):
+                    all_entities.append(text_entity)
                 return
-            
-            text_entity = self._extract_text_entity(entity, scope)
-            if text_entity is None:
-                return
-            
-            # 跳过非可译文本
-            if skip_non_translatable and not is_translatable_text(text_entity.text):
-                logger.debug("DXF 跳过(非可译) [%s|%s]: %s", dxftype, text_entity.layer, text_entity.text[:80])
-                return
-            
-            # 跳过尺寸式文本
-            if skip_dimension_like and _is_dimension_like(text_entity.text):
-                logger.debug("DXF 跳过(尺寸式) [%s|%s]: %s", dxftype, text_entity.layer, text_entity.text[:80])
-                return
-            
-            all_entities.append(text_entity)
-        
-        # 收集所有布局的实体
+
+        # 模型空间 + 各 paper space layout
         for layout in doc.layouts:
-            scope = f"layout:{layout.name}"
+            layout_scope = f"layout:{layout.name}"
             for entity in layout:
-                collect_entity_info(entity, scope=scope)
-        
-        # 收集块定义中的实体
+                visit(entity, scope=layout_scope)
+
+        # 未被任何 INSERT 展开过的 BLOCK 定义。已经通过 INSERT 走过 world 变换的块必须跳过，
+        # 否则同一段文字会既以世界坐标出现、又以块局部坐标出现，把合并逻辑搞乱。
         for block in doc.blocks:
             name = block.name
             if name.lower().startswith(("*model_space", "*paper_space")):
                 continue
+            if name in expanded_blocks:
+                continue
             scope = f"block:{name}"
             for entity in block:
-                collect_entity_info(entity, scope=scope)
+                visit(entity, scope=scope, block_name=name)
         
         # Step 2: 使用 TextReconstructor 进行语义重建
-        # 支持两种合并模式：
-        # 1. 同行合并：Y 接近（< 0.8 × 字高），X 有间隔
-        # 2. 换行合并：Y 差 1-2 倍字高，X 范围有重叠（同一段落的多行）
-        # 方案2：语义分割 - 如果句号结尾 + 大写/中文开头，不合并
         settings = get_settings()
-        reconstructor = TextReconstructor(
-            y_threshold_factor=0.8,       # 同行基线差异阈值
-            x_gap_threshold_factor=3.0,   # X 间隔阈值
-            rotation_threshold=5.0,       # 旋转角度阈值
-            enable_semantic_break=settings.dwg_enable_semantic_break,  # 方案2：启用语义边界检测
-        )
-        
-        sentences = reconstructor.reconstruct(all_entities)
-        
-        # 调试日志
+        merge_enabled = getattr(settings, "dwg_enable_spatial_merge", False)
+        semantic_break = getattr(settings, "dwg_enable_semantic_break", True)
+        logical_grouping = getattr(settings, "dwg_enable_logical_grouping", True)
+        h_tol = getattr(settings, "dwg_height_ratio_tolerance", 0.30)
+        next_line_factor = getattr(settings, "dwg_next_line_gap_factor", 3.0)
+        greedy = getattr(settings, "dwg_enable_greedy_merge", True)
+        min_edge_score = getattr(settings, "dwg_min_edge_score", 0.15)
+        iou_thr = getattr(settings, "dwg_iou_split_threshold", 0.5)
+        # 收尾 L2 索引
+        barrier_index.finalize()
         logger.info(
-            "DXF 语义重建：收集到 %d 个实体，重建为 %d 个句子",
-            len(all_entities), len(sentences)
+            "DXF spatial-merge 参数：merge=%s semantic_break=%s logical_grouping=%s "
+            "h_tol=%.2f next_line=%.1f greedy=%s min_edge=%.2f iou_split=%.2f "
+            "barriers(h=%d, v=%d)",
+            merge_enabled, semantic_break, logical_grouping, h_tol, next_line_factor,
+            greedy, min_edge_score, iou_thr,
+            barrier_stats["hlines"], barrier_stats["vlines"],
         )
-        
-        # 找到包含特定文本的实体，帮助诊断
+        reconstructor = TextReconstructor(
+            y_threshold_factor=0.8,
+            x_gap_threshold_factor=3.0,
+            rotation_threshold=5.0,
+            enable_semantic_break=semantic_break,
+            enable_logical_grouping=logical_grouping,
+            height_ratio_tolerance=h_tol,
+            next_line_gap_factor=next_line_factor,
+            barrier_index=barrier_index,
+            enable_greedy_merge=greedy,
+            min_edge_score=min_edge_score,
+            iou_split_threshold=iou_thr,
+        )
+
+        # 诊断：按 (scope, layer) 分桶后每桶大小分布——桶太碎（大量 1 元素桶）
+        # 就说明 scope/layer 天然把同一段拆开了，几何阈值再宽也合不了。
+        from collections import Counter
+        bucket_sizes = Counter()
         for e in all_entities:
-            if "消火栓" in e.text or "DN100" in e.text or "DN65" in e.text:
+            bucket_sizes[(e.scope, e.layer)] += 1
+        singletons = sum(1 for _, n in bucket_sizes.items() if n == 1)
+        top_buckets = bucket_sizes.most_common(5)
+        logger.info(
+            "DXF 分桶分布：共 %d 桶，其中单元素桶 %d 个；Top5=%s",
+            len(bucket_sizes), singletons,
+            [(f"{s[:30]}|{l}", n) for (s, l), n in top_buckets],
+        )
+
+        sentences = reconstructor.reconstruct(all_entities)
+
+        # 诊断：合并前后对比
+        merged_groups = sum(1 for s in sentences if len(s.entities) > 1)
+        logger.info(
+            "DXF 语义重建：%d 实体 → %d 句子（合并组 %d，单实体句 %d）",
+            len(all_entities), len(sentences), merged_groups, len(sentences) - merged_groups,
+        )
+        # 拒绝原因统计（在 TextFlowGraph 里累积）
+        reject_stats = getattr(reconstructor, "last_reject_stats", None)
+        if reject_stats:
+            logger.info("DXF 合并拒绝原因统计：%s", dict(reject_stats))
+
+        # 定向诊断：dump 匹配 dwg_debug_text_patterns 的实体及其同 (scope, layer) 邻居
+        patterns_raw = getattr(settings, "dwg_debug_text_patterns", "") or ""
+        dump_path = (getattr(settings, "dwg_debug_dump_file", "") or "").strip()
+        if patterns_raw.strip():
+            try:
+                dump_re = re.compile(patterns_raw)
+            except re.error as exc:
+                logger.warning("dwg_debug_text_patterns 正则无效：%s (%s)", patterns_raw, exc)
+                dump_re = None
+            if dump_re is not None:
+                matched_keys: set = set()
+                matched_count = 0
+                for e in all_entities:
+                    if dump_re.search(e.text or ""):
+                        matched_keys.add((e.scope, e.layer))
+                        matched_count += 1
                 logger.info(
-                    "  [诊断] 实体 [%s|%s|%s] pos=(%.2f, %.2f) h=%.2f rot=%.1f: %s",
-                    e.entity_type, e.handle, e.layer, e.x, e.y, e.height, e.rotation, repr(e.text)
+                    "DXF 定向诊断：正则 %r 命中 %d 个实体，分布在 %d 个 (scope,layer) 桶",
+                    patterns_raw, matched_count, len(matched_keys),
                 )
-        
+
+                # 兜底：如果正则没命中任何实体，把所有以"、"开头的短碎片打出来看看
+                if not matched_keys:
+                    stray = [
+                        e for e in all_entities
+                        if (e.text or "").strip().startswith("、")
+                        or (e.text or "").strip().startswith(", ")
+                    ]
+                    if stray:
+                        logger.info(
+                            "DXF 定向诊断：正则没命中，但发现 %d 个以'、'开头的碎片："
+                            "前 5 个 handle/scope/layer/text 如下",
+                            len(stray),
+                        )
+                        for e in stray[:5]:
+                            logger.info(
+                                "  [碎片] %s|%s|%s: %r", e.handle, e.scope, e.layer, e.text[:60],
+                            )
+                            matched_keys.add((e.scope, e.layer))
+
+                # 命中的实体所在的 sentence（合并组）
+                entity_to_sentence: dict = {}
+                for sent in sentences:
+                    for ent in sent.entities:
+                        entity_to_sentence[ent.handle] = sent.sentence_id
+
+                fh = None
+                if dump_path:
+                    try:
+                        import os as _os
+                        _os.makedirs(_os.path.dirname(dump_path) or ".", exist_ok=True)
+                        fh = open(dump_path, "a", encoding="utf-8")
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("无法打开 dwg_debug_dump_file=%s：%s", dump_path, exc)
+
+                try:
+                    for key in matched_keys:
+                        group = [e for e in all_entities if (e.scope, e.layer) == key]
+                        # 按 y 降序、同 y 按 x 升序，方便肉眼读
+                        group.sort(key=lambda e: (-round(e.y, 1), e.x))
+                        record = {
+                            "scope": key[0],
+                            "layer": key[1],
+                            "entity_count": len(group),
+                            "entities": [
+                                {
+                                    "handle": e.handle,
+                                    "entity_type": e.entity_type,
+                                    "style": e.style,
+                                    "height": round(e.height, 3),
+                                    "rotation": round(e.rotation, 2),
+                                    "tag": e.tag,
+                                    "insert_handle": e.insert_handle,
+                                    "x": round(e.x, 2),
+                                    "y": round(e.y, 2),
+                                    "width": round(e.width, 2),
+                                    "text": e.text[:120],
+                                    "sentence_id": entity_to_sentence.get(e.handle),
+                                }
+                                for e in group
+                            ],
+                        }
+                        # 日志里出一行 header + 每条 entity 一行，避免被并发日志淹没时至少还能翻到
+                        logger.info(
+                            "[定向] scope=%s layer=%s entities=%d",
+                            key[0], key[1], len(group),
+                        )
+                        for ent in record["entities"]:
+                            logger.info(
+                                "[定向-实体] %s h=%s style=%r H=%.3f y=%.2f x=%.2f text=%r sent=%s",
+                                ent["entity_type"], ent["handle"], ent["style"], ent["height"],
+                                ent["y"], ent["x"], ent["text"], ent["sentence_id"],
+                            )
+                        if fh is not None:
+                            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                finally:
+                    if fh is not None:
+                        try:
+                            fh.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if dump_path:
+                        logger.info("DXF 定向诊断已写入：%s", dump_path)
+
         # Step 3: 将句子转换为 BlockNode
         nodes: List[BlockNode] = []
         merged_count = 0
@@ -537,6 +836,8 @@ class DxfAdapter(FormatAdapter):
                 "merged_handles": handles,
                 "merged_count": len(handles),
                 "sentence_id": sentence.sentence_id,
+                # L1/L5：合并信心分数，供前端 mini-map / 灰度提示
+                "merge_confidence": round(float(sentence.merge_confidence), 3),
             }
             
             if primary:
@@ -580,81 +881,234 @@ class DxfAdapter(FormatAdapter):
                 })
         
         logger.info(
-            "DXF 语义重建完成：%d 个原始实体 → %d 个句子（其中 %d 个合并组）",
+            "DXF 语义重建完成：%d 个原始实体 → %d 个句子（其中 %d 个合并组），"
+            "另有 %d 个独立节点（DIMENSION/MULTILEADER/ACAD_TABLE）",
             len(all_entities),
             len(nodes),
             merged_count,
+            len(standalone_nodes),
         )
-        
-        return nodes
 
-    def _extract_text_entity(self, entity, scope: str) -> Optional[TextEntity]:
-        """从 ezdxf 实体中提取 TextEntity 信息"""
+        # 独立节点（DIMENSION / MULTILEADER / ACAD_TABLE）不参与合并，直接追加
+        if standalone_nodes and audit is not None:
+            for sn in standalone_nodes:
+                text = sn.text_content or ""
+                audit.append({
+                    "handle": sn.metadata.get("handle", ""),
+                    "entity_type": sn.metadata.get("entity_type", ""),
+                    "layer": sn.metadata.get("layer", ""),
+                    "scope": sn.metadata.get("scope", ""),
+                    "text": text,
+                    "has_chinese": bool(re.search(r"[\u4e00-\u9fff]", text)),
+                    "status": "kept",
+                    "reason": "standalone",
+                })
+
+        # L5-LLM 二次校验（可选）：对灰区合并句一次性问 LLM 是否真的是一句
+        try:
+            if getattr(settings, "dwg_llm_verify_enabled", False):
+                from app.services.adapters.dwg_llm_verifier import verify_and_split_sentences
+                nodes = verify_and_split_sentences(nodes)
+        except Exception as exc:  # noqa: BLE001 - 兜底：任何异常都不阻断解析
+            logger.warning("L5-LLM 二次校验失败(容错跳过)：%s", exc)
+
+        return nodes + standalone_nodes
+
+    def _extract_text_entity(
+        self,
+        entity,
+        scope: str,
+        *,
+        transform=None,
+        insert_handle: str = "",
+        block_name: str = "",
+    ) -> Optional[TextEntity]:
+        """从 ezdxf 实体中提取 TextEntity 信息（L0 版本）。
+
+        - x/y 使用锚点（TEXT: halign/valign→align_point；MTEXT: attachment_point 反推左下）
+        - width 用估算（后续 phase 可换成 bbox）
+        - height 始终使用**标称字高**（TEXT.height / MTEXT.char_height），
+          绝不用 `entity.bbox()` 的渲染高度——那个高度依赖字形是否含下沉，
+          会让同一字号的文字之间高度差看似 30%+，反而把 L4 合并门槛卡死。
+        - 处于 INSERT 内部时，(x, y) 通过父级 transform 变换到世界坐标，
+          width/height 按 transform 的 x/y 缩放系数一起放大。
+        """
         dxftype = entity.dxftype()
         if dxftype not in ("TEXT", "MTEXT", "ATTRIB", "ATTDEF"):
             return None
-        
+
         handle = getattr(entity.dxf, "handle", "")
         layer = getattr(entity.dxf, "layer", "0")
         style = getattr(entity.dxf, "style", "") or ""
-        
-        # 获取文本内容和位置
+
         if dxftype == "TEXT":
             text = getattr(entity.dxf, "text", "") or ""
-            try:
-                insert = entity.dxf.insert
-                x, y = float(insert[0]), float(insert[1])
-            except Exception:
-                x, y = 0.0, 0.0
-            height = float(getattr(entity.dxf, "height", 2.5) or 2.5)
+            nominal_height = float(getattr(entity.dxf, "height", 2.5) or 2.5)
             rotation = float(getattr(entity.dxf, "rotation", 0.0) or 0.0)
             width_factor = float(getattr(entity.dxf, "width", 1.0) or 1.0)
-            width = estimate_text_width(text, height, 0.6 * width_factor)
-            
+            local_x, local_y = self._text_anchor(entity)
+            local_width = estimate_text_width(text, nominal_height, 0.6 * width_factor)
+            tag = ""
         elif dxftype == "MTEXT":
             raw = entity.text or ""
             text = clean_mtext(raw)
-            try:
-                insert = entity.dxf.insert
-                x, y = float(insert[0]), float(insert[1])
-            except Exception:
-                x, y = 0.0, 0.0
-            height = float(getattr(entity.dxf, "char_height", 2.5) or 2.5)
+            nominal_height = float(getattr(entity.dxf, "char_height", 2.5) or 2.5)
             rotation = float(getattr(entity.dxf, "rotation", 0.0) or 0.0)
-            width = float(getattr(entity.dxf, "width", 0) or 0)
-            if width <= 0:
-                width = estimate_text_width(text, height)
-                
-        elif dxftype in ("ATTRIB", "ATTDEF"):
+            local_x, local_y = self._mtext_anchor(entity, char_height=nominal_height)
+            mtext_width = float(getattr(entity.dxf, "width", 0) or 0)
+            local_width = mtext_width if mtext_width > 0 else estimate_text_width(text, nominal_height)
+            tag = ""
+        else:  # ATTRIB / ATTDEF
             text = getattr(entity.dxf, "text", "") or ""
-            try:
-                insert = entity.dxf.insert
-                x, y = float(insert[0]), float(insert[1])
-            except Exception:
-                x, y = 0.0, 0.0
-            height = float(getattr(entity.dxf, "height", 2.5) or 2.5)
+            nominal_height = float(getattr(entity.dxf, "height", 2.5) or 2.5)
             rotation = float(getattr(entity.dxf, "rotation", 0.0) or 0.0)
             width_factor = float(getattr(entity.dxf, "width", 1.0) or 1.0)
-            width = estimate_text_width(text, height, 0.6 * width_factor)
-        else:
-            return None
-        
+            local_x, local_y = self._text_anchor(entity)
+            local_width = estimate_text_width(text, nominal_height, 0.6 * width_factor)
+            tag = (getattr(entity.dxf, "tag", "") or "").strip()
+
         if not text.strip():
             return None
-        
+
+        if transform is not None:
+            world_x, world_y = self._transform_point(local_x, local_y, transform)
+            sx, sy = self._transform_scales(transform)
+            world_width = local_width * sx
+            world_height = nominal_height * sy
+            world_rotation = rotation + self._transform_rotation_deg(transform)
+            bbox_source = "align"
+        else:
+            world_x, world_y = local_x, local_y
+            world_width = local_width
+            world_height = nominal_height
+            world_rotation = rotation
+            bbox_source = "nominal"
+
         return TextEntity(
             handle=handle,
             entity_type=dxftype,
             layer=layer,
             text=text.strip(),
-            x=x,
-            y=y,
-            height=height,
-            width=width,
-            rotation=rotation,
+            x=world_x,
+            y=world_y,
+            height=world_height if world_height > 0 else nominal_height,
+            width=world_width if world_width > 0 else local_width,
+            rotation=world_rotation,
             style=style,
             scope=scope,
+            block_name=block_name,
+            tag=tag,
+            insert_handle=insert_handle,
+            bbox_source=bbox_source,
         )
+
+    # ------------------------------------------------------------------
+    # L0 helpers：真 bbox / 对齐锚点 / INSERT 仿射变换
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _text_anchor(entity) -> tuple[float, float]:
+        """TEXT/ATTRIB 的绘制起点：非左下对齐时优先用 align_point。"""
+        halign = int(getattr(entity.dxf, "halign", 0) or 0)
+        valign = int(getattr(entity.dxf, "valign", 0) or 0)
+        try:
+            if (halign != 0 or valign != 0):
+                align_pt = getattr(entity.dxf, "align_point", None)
+                if align_pt is not None:
+                    return float(align_pt[0]), float(align_pt[1])
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            ins = entity.dxf.insert
+            return float(ins[0]), float(ins[1])
+        except Exception:  # noqa: BLE001
+            return 0.0, 0.0
+
+    @staticmethod
+    def _mtext_anchor(entity, *, char_height: float) -> tuple[float, float]:
+        """MTEXT 的左下锚点：根据 attachment_point 从 insert 反推。
+
+        attachment_point:
+          1 top-left  2 top-center  3 top-right
+          4 middle-left 5 middle-center 6 middle-right
+          7 bottom-left 8 bottom-center 9 bottom-right
+        """
+        try:
+            ins = entity.dxf.insert
+            ix, iy = float(ins[0]), float(ins[1])
+        except Exception:  # noqa: BLE001
+            return 0.0, 0.0
+        try:
+            ap = int(getattr(entity.dxf, "attachment_point", 1) or 1)
+        except Exception:  # noqa: BLE001
+            ap = 1
+        # 只在垂直方向做补偿，MTEXT 的水平锚点是绘制左边缘，用于比较左对齐已足够
+        if ap in (1, 2, 3):        # top-*
+            iy -= char_height
+        elif ap in (4, 5, 6):      # middle-*
+            iy -= char_height / 2.0
+        # bottom-* 就是左下（近似）
+        return ix, iy
+
+    @staticmethod
+    def _transform_point(x: float, y: float, transform) -> tuple[float, float]:
+        """把局部 (x,y) 经过 Matrix44 变换到世界坐标。"""
+        try:
+            tx, ty, _ = transform.transform((float(x), float(y), 0.0))
+            return float(tx), float(ty)
+        except Exception:  # noqa: BLE001
+            return float(x), float(y)
+
+    @staticmethod
+    def _transform_scales(transform) -> tuple[float, float]:
+        """从 Matrix44 里估算 x/y 方向的整体缩放系数（含嵌套 INSERT）。"""
+        try:
+            # 基向量在变换下的长度即为缩放
+            x_axis = transform.transform_direction((1.0, 0.0, 0.0))
+            y_axis = transform.transform_direction((0.0, 1.0, 0.0))
+            sx = math.hypot(x_axis[0], x_axis[1]) or 1.0
+            sy = math.hypot(y_axis[0], y_axis[1]) or 1.0
+            return sx, sy
+        except Exception:  # noqa: BLE001
+            return 1.0, 1.0
+
+    @staticmethod
+    def _transform_rotation_deg(transform) -> float:
+        """从 Matrix44 里取 X 轴的整体旋转角度（度）。"""
+        try:
+            x_axis = transform.transform_direction((1.0, 0.0, 0.0))
+            return math.degrees(math.atan2(x_axis[1], x_axis[0]))
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    @staticmethod
+    def _make_insert_transform(insert_entity, parent=None):
+        """把 INSERT 的 (insert, xscale, yscale, rotation) 折成一个 Matrix44，
+        并叠加父级 transform（用于嵌套 INSERT）。拿不到 ezdxf 时返回 None。
+        """
+        try:
+            from ezdxf.math import Matrix44
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            ins = insert_entity.dxf.insert
+            ix, iy = float(ins[0]), float(ins[1])
+            sx = float(getattr(insert_entity.dxf, "xscale", 1.0) or 1.0)
+            sy = float(getattr(insert_entity.dxf, "yscale", 1.0) or 1.0)
+            rot = float(getattr(insert_entity.dxf, "rotation", 0.0) or 0.0)
+        except Exception:  # noqa: BLE001
+            return parent
+        # 先缩放，再旋转，再平移到 insert 点
+        m = Matrix44.chain(
+            Matrix44.scale(sx, sy, 1.0),
+            Matrix44.z_rotate(math.radians(rot)),
+            Matrix44.translate(ix, iy, 0.0),
+        )
+        if parent is not None:
+            m = Matrix44.chain(m, parent)
+        return m
+
+
 
     def _entity_to_nodes(
         self,

@@ -9381,6 +9381,20 @@ def _serialize_workbench_segment(
     }
     if display_index is not None:
         payload["display_index"] = display_index
+
+    # 从 segment_metadata 中挑出前端 UX 需要的字段（DWG/DXF 合并信心分数等）
+    raw_meta = getattr(seg, "segment_metadata", None)
+    if raw_meta:
+        try:
+            meta = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
+            if isinstance(meta, dict):
+                if "merge_confidence" in meta:
+                    payload["merge_confidence"] = meta.get("merge_confidence")
+                if "is_merged" in meta:
+                    payload["is_merged"] = bool(meta.get("is_merged"))
+        except (ValueError, TypeError):
+            pass
+
     return payload
 
 

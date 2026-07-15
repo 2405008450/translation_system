@@ -460,6 +460,32 @@ function highlightSearchText(text: string, keyword: string, caseSensitive = fals
 const automaticNumberingTitle = 'Word 自动编号，导出时会自动生成，译文无需输入编号'
 const automaticNumberingText = computed(() => (props.segment.automatic_numbering_text || '').trim())
 const hasAutomaticNumbering = computed(() => automaticNumberingText.value.length > 0)
+
+// DWG/DXF 合并信心提示：仅对合并句段显示；低于 0.7 才提醒
+const mergeConfidence = computed<number | null>(() => {
+  const raw = props.segment.merge_confidence
+  return typeof raw === 'number' && Number.isFinite(raw) ? raw : null
+})
+const isMergedSegment = computed(() => Boolean(props.segment.is_merged))
+const showMergeConfidenceBadge = computed(() => (
+  isMergedSegment.value && mergeConfidence.value !== null && mergeConfidence.value < 0.7
+))
+const mergeConfidenceLevel = computed(() => {
+  const c = mergeConfidence.value ?? 1
+  if (c < 0.5) return 'low'
+  if (c < 0.7) return 'mid'
+  return 'high'
+})
+const mergeConfidenceLabel = computed(() => {
+  const level = mergeConfidenceLevel.value
+  if (level === 'low') return '合并信心低'
+  if (level === 'mid') return '合并信心一般'
+  return '合并信心高'
+})
+const mergeConfidenceTitle = computed(() => {
+  const pct = Math.round((mergeConfidence.value ?? 0) * 100)
+  return `${mergeConfidenceLabel.value}（${pct}%）\n此句由 DWG/DXF 空间合并自动生成，可能拆错，请核对`
+})
 const targetAutomaticNumberingText = computed(() => (
   props.segment.target_automatic_numbering_text || automaticNumberingText.value
 ).trim())
@@ -2205,6 +2231,16 @@ watch(
         >
           {{ automaticNumberingText }}
         </span>
+        <span
+          v-if="showMergeConfidenceBadge"
+          class="segment-row__merge-confidence-badge"
+          :class="`is-${mergeConfidenceLevel}`"
+          :title="mergeConfidenceTitle"
+          aria-hidden="true"
+          contenteditable="false"
+        >
+          合并
+        </span>
         <div
           v-if="active"
           ref="sourceEditorRef"
@@ -2431,6 +2467,31 @@ watch(
 
 .segment-row__automatic-numbering-badge--target {
   margin-top: 9px;
+}
+
+.segment-row__merge-confidence-badge {
+  flex: 0 0 auto;
+  margin-top: 8px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.45;
+  white-space: nowrap;
+  user-select: none;
+  cursor: help;
+}
+
+.segment-row__merge-confidence-badge.is-mid {
+  background: #fff7d6;
+  color: #8a5d0b;
+  border: 1px solid rgba(217, 152, 8, 0.4);
+}
+
+.segment-row__merge-confidence-badge.is-low {
+  background: #fde2e2;
+  color: #a02929;
+  border: 1px solid rgba(200, 40, 40, 0.4);
 }
 
 .segment-row__copy-source-button,
