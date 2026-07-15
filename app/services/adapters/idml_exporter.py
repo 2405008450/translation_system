@@ -5,6 +5,7 @@ IDML 导出器 - 将翻译后的内容导出为 IDML 格式
 """
 import json
 import logging
+import re
 import zipfile
 from collections import defaultdict
 from io import BytesIO
@@ -74,34 +75,102 @@ class IdmlExporter:
         # 优先按 Story 内段落坐标回写。导入阶段可能把一个 Content 拆成多个
         # 句段，也可能把多个带不同字符样式的 Content 合并成一个句段；按段落
         # 重组可以覆盖这两种边界不一致场景。
-        structured_content_elements: set[Any] = set()
+        changed_content_elements: set[Any] = set()
         paragraph_index = -1
-        for para in root.iter('ParagraphStyleRange'):
+        for para in root.iter():
+            if self._local_name(para) != "ParagraphStyleRange":
+                continue
             paragraph_index += 1
             paragraph_segments = (paragraph_targets or {}).get(paragraph_index)
             if paragraph_segments is None:
                 continue
 
-            content_elements = list(para.iter('Content'))
+            content_elements = self._owned_content_elements(para)
             if not content_elements:
                 continue
+            original_texts = [element.text or "" for element in content_elements]
             self._replace_paragraph_contents(content_elements, paragraph_segments)
-            structured_content_elements.update(content_elements)
+            changed_content_elements.update(
+                element
+                for element, original_text in zip(
+                    content_elements,
+                    original_texts,
+                    strict=True,
+                )
+                if (element.text or "") != original_text
+            )
 
-        # 没有结构元数据的旧调用继续使用精确文本匹配兜底。
-        for content_elem in root.iter('Content'):
-            if content_elem in structured_content_elements:
+        # 对结构回写后仍未变化的 Content 使用文本兜底。旧任务可能手动拆分
+        # 过表格标签，因而无法与重新解析出的整段文本一一对应。
+        for content_elem in root.iter():
+            if self._local_name(content_elem) != "Content":
                 continue
-            if content_elem.text and content_elem.text.strip():
-                text = content_elem.text.strip()
-                if text in translations:
-                    # 保留原始空白
-                    original = content_elem.text
-                    leading = original[:len(original) - len(original.lstrip())]
-                    trailing = original[len(original.rstrip()):]
-                    content_elem.text = leading + translations[text] + trailing
+            if content_elem in changed_content_elements or not content_elem.text:
+                continue
+            content_elem.text = self._replace_content_with_text_map(
+                content_elem.text,
+                translations,
+            )
         
         return etree.tostring(root, encoding='utf-8', xml_declaration=True)
+
+    @staticmethod
+    def _local_name(element: Any) -> str:
+        if not isinstance(getattr(element, "tag", None), str):
+            return ""
+        return etree.QName(element).localname
+
+    @classmethod
+    def _owned_content_elements(cls, paragraph: Any) -> list[Any]:
+        """仅返回当前段落直接拥有的 Content，排除嵌套表格段落。"""
+        result: list[Any] = []
+        for element in paragraph.iter():
+            if cls._local_name(element) != "Content":
+                continue
+            nearest_paragraph = next(
+                (
+                    ancestor
+                    for ancestor in element.iterancestors()
+                    if cls._local_name(ancestor) == "ParagraphStyleRange"
+                ),
+                None,
+            )
+            if nearest_paragraph is paragraph:
+                result.append(element)
+        return result
+
+    @staticmethod
+    def _replace_content_with_text_map(
+        original: str,
+        translations: Dict[str, str],
+    ) -> str:
+        """按完整 Content 或明显的多空格分栏标签进行安全兜底替换。"""
+        if not original.strip():
+            return original
+
+        text = original.strip()
+        if text in translations:
+            leading = original[:len(original) - len(original.lstrip())]
+            trailing = original[len(original.rstrip()):]
+            return leading + translations[text] + trailing
+
+        # 部分图示把多个独立标题放在同一个 Content 中，并用很长的空白隔开。
+        # 只在这种明确边界下做子片段替换，避免把普通正文中的短词误替换。
+        pieces = re.split(r"(\s{2,})", original)
+        if len(pieces) == 1:
+            return original
+
+        changed = False
+        for index in range(0, len(pieces), 2):
+            part = pieces[index]
+            key = part.strip()
+            if not key or key not in translations:
+                continue
+            leading = part[:len(part) - len(part.lstrip())]
+            trailing = part[len(part.rstrip()):]
+            pieces[index] = leading + translations[key] + trailing
+            changed = True
+        return "".join(pieces) if changed else original
 
     def _build_paragraph_targets(
         self,

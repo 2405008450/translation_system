@@ -25,6 +25,57 @@ from app.services.adapters.segment_extractor import extract_segments
 IDML_NS = "http://ns.adobe.com/AdobeInDesign/idml/1.0/packaging"
 
 
+def _local_name(element) -> str:
+    """返回 XML 元素的本地标签名，兼容带命名空间的 IDML。"""
+    if not isinstance(getattr(element, "tag", None), str):
+        return ""
+    return etree.QName(element).localname
+
+
+def _nearest_paragraph(element):
+    """返回元素最近的 ParagraphStyleRange 祖先。"""
+    return next(
+        (
+            ancestor
+            for ancestor in element.iterancestors()
+            if _local_name(ancestor) == "ParagraphStyleRange"
+        ),
+        None,
+    )
+
+
+def _paragraph_text_parts(paragraph) -> List[str]:
+    """提取当前段落直接拥有的文本，避免递归吃进嵌套表格。
+
+    表格单元格中的 ``Br`` 是独立标签之间的显式换行，必须保留为
+    句段边界；普通正文中的软换行继续沿用原有的合并行为。
+    """
+    split_on_break = any(
+        _local_name(ancestor) == "Cell"
+        for ancestor in paragraph.iterancestors()
+    )
+    parts: List[str] = []
+    current: List[str] = []
+
+    def flush() -> None:
+        text = "".join(current).strip()
+        current.clear()
+        if text:
+            parts.append(text)
+
+    for element in paragraph.iter():
+        if element is paragraph or _nearest_paragraph(element) is not paragraph:
+            continue
+        element_name = _local_name(element)
+        if element_name == "Content" and element.text:
+            current.append(element.text)
+        elif element_name == "Br" and split_on_break:
+            flush()
+
+    flush()
+    return parts
+
+
 class IdmlAdapter(FormatAdapter):
     """Adobe InDesign IDML 文件适配器"""
 
@@ -85,17 +136,10 @@ class IdmlAdapter(FormatAdapter):
 
         # 查找所有 ParagraphStyleRange 或 Content 元素
         for para in root.iter():
-            if para.tag == 'ParagraphStyleRange':
+            if _local_name(para) == 'ParagraphStyleRange':
                 paragraph_index += 1
-                text_parts = []
-                
-                # 提取段落中的所有文本
-                for content_elem in para.iter('Content'):
-                    if content_elem.text:
-                        text_parts.append(content_elem.text)
-                
-                text = ''.join(text_parts).strip()
-                if text:
+                paragraph_parts = _paragraph_text_parts(para)
+                if paragraph_parts:
                     # 获取段落样式
                     style = para.get('AppliedParagraphStyle', '')
                     
@@ -104,14 +148,16 @@ class IdmlAdapter(FormatAdapter):
                     if 'Heading' in style or 'Title' in style:
                         node_type = NodeType.HEADING
                     
-                    nodes.append(BlockNode(
-                        node_type=node_type,
-                        text_content=text,
-                        metadata={
-                            "story": story_name,
-                            "style": style,
-                            "paragraph_index": paragraph_index,
-                        },
-                    ))
+                    for part_index, text in enumerate(paragraph_parts):
+                        nodes.append(BlockNode(
+                            node_type=node_type,
+                            text_content=text,
+                            metadata={
+                                "story": story_name,
+                                "style": style,
+                                "paragraph_index": paragraph_index,
+                                "paragraph_part_index": part_index,
+                            },
+                        ))
         
         return nodes

@@ -967,6 +967,7 @@ def build_export_segments_from_source(
     # 对于 CAD 文件，额外按 handle 建立索引（因为合并后 segment_id 会变）
     extension = (filename or "").lower().rsplit(".", 1)[-1] if filename else ""
     is_cad_file = extension in ("dwg", "dxf")
+    is_idml_file = extension == "idml"
 
     handle_to_db_segment: dict[str, Any] = {}
     merged_handles_set: set[str] = set()  # 所有被合并的 handles（用于清空）
@@ -1036,6 +1037,46 @@ def build_export_segments_from_source(
             if candidates:
                 translated_segment = candidates.pop(0)
 
+        # 旧 IDML 任务可能在工作台中把跨 Story 的碎片合并成完整句子。
+        # 重新解析源文件时只能看到其中一个片段，因此完整原文匹配会失败。
+        # 对足够长且仍未使用的候选片段做包含关系兜底，把整句译文放回
+        # 第一个可定位的原始文本框；其他碎片仍按各自的占位译文处理。
+        if is_idml_file and translated_segment is None and parsed_source:
+            significant_length = sum(character.isalnum() for character in parsed_source)
+            if significant_length >= 10:
+                containing_candidates: list[tuple[tuple[int, int, int], Any]] = []
+                for candidate_index, candidate_segment in enumerate(ordered_translated_segments):
+                    if id(candidate_segment) in used_translated_segment_ids:
+                        continue
+                    candidate_source = _normalize_export_source_text(
+                        _get_segment_value(candidate_segment, "source_text", "")
+                    )
+                    candidate_target = _get_segment_value(candidate_segment, "target_text", "")
+                    if (
+                        not candidate_source
+                        or candidate_source == parsed_source
+                        or parsed_source not in candidate_source
+                        or candidate_source.find(parsed_source) > 4
+                        or candidate_target is None
+                        or not str(candidate_target).strip()
+                    ):
+                        continue
+                    score = (
+                        0 if candidate_source.startswith(parsed_source) else 1,
+                        len(candidate_source) - len(parsed_source),
+                        abs(candidate_index - index),
+                    )
+                    containing_candidates.append((score, candidate_segment))
+                if containing_candidates:
+                    _, translated_segment = min(
+                        containing_candidates,
+                        key=lambda item: item[0],
+                    )
+                    _logger.info(
+                        "build_export_segments_from_source: IDML 句段 %s 使用原文片段包含关系匹配",
+                        parsed_segment.segment_id,
+                    )
+
         # 对于 CAD 文件，如果上述匹配都失败，再用 handle 兜底
         if is_cad_file and translated_segment is None and handle:
             translated_segment = handle_to_db_segment.get(handle)
@@ -1096,6 +1137,33 @@ def build_export_segments_from_source(
                 **context,
             }
         )
+
+    if is_idml_file:
+        # 保留未能映射到重新解析句段的旧任务译文。IDML 导出器会在
+        # Content/显式空白分栏层面继续兜底，可覆盖手动拆分的表格标签。
+        for translated_segment in ordered_translated_segments:
+            if id(translated_segment) in used_translated_segment_ids:
+                continue
+            source_text = str(
+                _get_segment_value(translated_segment, "source_text", "") or ""
+            )
+            raw_target_text = _get_segment_value(translated_segment, "target_text", "")
+            if (
+                not source_text.strip()
+                or raw_target_text is None
+                or not str(raw_target_text).strip()
+            ):
+                continue
+            fallback_segment = _normalize_existing_segment(translated_segment)
+            fallback_segment["display_text"] = str(
+                fallback_segment.get("display_text")
+                or fallback_segment.get("source_text")
+                or ""
+            )
+            fallback_segment["metadata"] = {}
+            fallback_segment["sequence_index"] = None
+            fallback_segment["idml_legacy_fallback"] = True
+            export_segments.append(fallback_segment)
 
     return export_segments
 
