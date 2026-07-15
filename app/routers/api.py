@@ -10126,6 +10126,54 @@ def _generate_split_sentence_id(original_id: str, db: Session, file_record_id: U
         suffix += 1
 
 
+def _load_segments_for_structure_change(
+    db: Session,
+    file_record: FileRecord,
+) -> list[Segment]:
+    """锁定并按文档权威顺序读取句段，供拆分、合并等结构操作使用。"""
+    return (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record.id)
+        .order_by(*get_segment_ordering_for_file_record(file_record))
+        .with_for_update()
+        .all()
+    )
+
+
+def _renumber_ordered_segment_sequences(
+    ordered_segments: list[Segment],
+    *,
+    excluded_segment_id: UUID | None = None,
+) -> dict[UUID, int]:
+    """按当前文档顺序重建连续 sequence_index，并返回保留句段的位置。"""
+    positions: dict[UUID, int] = {}
+    next_sequence_index = 0
+    for item in ordered_segments:
+        if excluded_segment_id is not None and item.id == excluded_segment_id:
+            continue
+        item.sequence_index = next_sequence_index
+        positions[item.id] = next_sequence_index
+        next_sequence_index += 1
+    return positions
+
+
+def _reserve_sequence_slot_after_segment(
+    ordered_segments: list[Segment],
+    segment_id: UUID,
+) -> int:
+    """为拆分出的后半句预留紧邻原句的顺序位。"""
+    positions = _renumber_ordered_segment_sequences(ordered_segments)
+    current_sequence_index = positions.get(segment_id)
+    if current_sequence_index is None:
+        raise HTTPException(status_code=404, detail="片段不存在。")
+
+    new_sequence_index = current_sequence_index + 1
+    for item in ordered_segments:
+        if item.sequence_index >= new_sequence_index:
+            item.sequence_index += 1
+    return new_sequence_index
+
+
 def _is_cjk_text(text: str) -> bool:
     """判断文本是否主要为中日韩文字（决定合并时是否加空格）。"""
     if not text:
@@ -12816,6 +12864,7 @@ def export_file_record_with_type(
             "target_text": seg.target_text,
             "status": seg.status,
             "matched_source_text": seg.matched_source_text,
+            "sequence_index": getattr(seg, "sequence_index", None),
             "metadata": json.loads(seg.segment_metadata) if seg.segment_metadata else {},
         }
         for seg in segments
@@ -13271,29 +13320,13 @@ def split_segment(
         first_target = target_text[:target_offset].rstrip()
         second_target = target_text[target_offset:].lstrip()
 
-    # 生成新的 sentence_id：使用子编号方式
+    # 先锁定整份文件的句段顺序，再生成身份 ID 和预留位置，避免并发结构操作产生重复顺序。
+    ordered_file_segments = _load_segments_for_structure_change(db, file_record)
     new_sentence_id = _generate_split_sentence_id(sentence_id, db, file_record_id)
-
-    # sequence_index 是句段位置的唯一依据。历史记录首次拆分时先按当前文档顺序补齐，
-    # 再为后半句腾出一个紧邻位置，避免退回 sentence_id/UUID 字典序。
-    ordered_file_segments = (
-        db.query(Segment)
-        .filter(Segment.file_record_id == file_record_id)
-        .order_by(*get_segment_ordering_for_file_record(file_record))
-        .all()
+    new_sequence_index = _reserve_sequence_slot_after_segment(
+        ordered_file_segments,
+        segment.id,
     )
-    sequence_indexes = [
-        int(item.sequence_index if item.sequence_index is not None else -1)
-        for item in ordered_file_segments
-    ]
-    if any(index < 0 for index in sequence_indexes) or len(sequence_indexes) != len(set(sequence_indexes)):
-        for index, item in enumerate(ordered_file_segments):
-            item.sequence_index = index
-
-    current_sequence_index = int(segment.sequence_index)
-    for item in ordered_file_segments:
-        if item is not segment and int(item.sequence_index) > current_sequence_index:
-            item.sequence_index = int(item.sequence_index) + 1
 
     # 更新原句段
     segment.source_text = first_source
@@ -13334,7 +13367,7 @@ def split_segment(
         block_index=segment.block_index,
         row_index=segment.row_index,
         cell_index=segment.cell_index,
-        sequence_index=current_sequence_index + 1,
+        sequence_index=new_sequence_index,
     )
     new_segment.status = _resolve_unconfirmed_segment_status(new_segment)
     db.add(new_segment)
@@ -13409,6 +13442,9 @@ def merge_segment(
     if first_seg.workflow_step_id != second_seg.workflow_step_id:
         raise HTTPException(status_code=400, detail="只能合并处于同一流程阶段的句段。")
 
+    if first_seg.id == second_seg.id:
+        raise HTTPException(status_code=400, detail="不能将句段与自身合并。")
+
     # DWG/DXF 文件允许跨 block 合并（CAD 图纸中相邻实体可能是独立 block）
     file_ext = (file_record.filename or "").lower().rsplit(".", 1)[-1] if file_record.filename else ""
     is_cad_file = file_ext in ("dwg", "dxf")
@@ -13416,6 +13452,18 @@ def merge_segment(
     if not is_cad_file:
         if not _segments_in_same_merge_block(first_seg, second_seg):
             raise HTTPException(status_code=400, detail="只能合并同一区块内相邻的句段。")
+
+    # sentence_id 只负责身份；合并方向和相邻性一律以当前持久化文档顺序判断。
+    ordered_file_segments = _load_segments_for_structure_change(db, file_record)
+    sequence_positions = _renumber_ordered_segment_sequences(ordered_file_segments)
+    first_position = sequence_positions.get(first_seg.id)
+    second_position = sequence_positions.get(second_seg.id)
+    if first_position is None or second_position is None:
+        raise HTTPException(status_code=404, detail="待合并片段不存在。")
+    if second_position <= first_position:
+        raise HTTPException(status_code=400, detail="请按文档从上到下的顺序合并句段。")
+    if not is_cad_file and second_position != first_position + 1:
+        raise HTTPException(status_code=400, detail="普通文档只能合并前后相邻的句段。")
 
     # 合并文本
     separator = "" if _is_cjk_text(first_seg.source_text) else " "
@@ -13543,6 +13591,12 @@ def merge_segment(
 
     # 删除第二个句段
     db.delete(second_seg)
+
+    # 删除后立即压紧顺序，保证后续拆分、合并和所有导出路径继续使用连续稳定的位置。
+    _renumber_ordered_segment_sequences(
+        ordered_file_segments,
+        excluded_segment_id=second_seg.id,
+    )
 
     sync_file_record_status(db, file_record_id)
     db.commit()

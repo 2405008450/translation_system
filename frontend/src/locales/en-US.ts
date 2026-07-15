@@ -155,6 +155,9 @@ const overrides = {
     kicker: 'Smart Operations Platform',
   },
   workbench: {
+    messages: {
+      mergeNonAdjacent: 'Only adjacent segments can be merged in regular documents.',
+    },
     search: {
       advanced: 'Advanced',
       caseSensitive: 'Match case',

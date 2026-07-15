@@ -79,9 +79,14 @@ class IdmlAdapter(FormatAdapter):
         except etree.XMLSyntaxError:
             return nodes
         
+        # paragraph_index 是 Story 内稳定的结构坐标，导出时据此把句段译文
+        # 重新写回原 ParagraphStyleRange，避免依赖 Content 文本完全匹配。
+        paragraph_index = -1
+
         # 查找所有 ParagraphStyleRange 或 Content 元素
         for para in root.iter():
             if para.tag == 'ParagraphStyleRange':
+                paragraph_index += 1
                 text_parts = []
                 
                 # 提取段落中的所有文本
@@ -105,6 +110,7 @@ class IdmlAdapter(FormatAdapter):
                         metadata={
                             "story": story_name,
                             "style": style,
+                            "paragraph_index": paragraph_index,
                         },
                     ))
         

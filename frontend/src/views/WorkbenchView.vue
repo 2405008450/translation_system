@@ -5339,11 +5339,28 @@ const selectedMergeSegmentsInSameBlock = computed(() => {
   return orderedSegments.every((segment) => isSameMergeBlock(segment, first))
 })
 
+const selectedMergeSegmentsAreAdjacent = computed(() => {
+  if (isCadFile.value) return true
+  const orderedSegments = orderedSelectedMergeSegments.value
+  if (orderedSegments.length < 2) return false
+
+  const firstIndex = editorSegments.value.findIndex(
+    (segment) => segmentKeyOf(segment) === segmentKeyOf(orderedSegments[0]),
+  )
+  if (firstIndex < 0) return false
+
+  return orderedSegments.every((segment, offset) => {
+    const displayedSegment = editorSegments.value[firstIndex + offset]
+    return Boolean(displayedSegment) && segmentKeyOf(displayedSegment) === segmentKeyOf(segment)
+  })
+})
+
 const canMergeSegment = computed(() => {
   return (
     orderedSelectedMergeSegments.value.length >= 2
     && selectedMergeSegmentsCanWrite.value
-    && selectedMergeSegmentsInSameBlock.value
+    && (isCadFile.value || selectedMergeSegmentsInSameBlock.value)
+    && selectedMergeSegmentsAreAdjacent.value
   )
 })
 
@@ -5354,8 +5371,11 @@ const mergeSegmentButtonTitle = computed(() => {
   if (!selectedMergeSegmentsCanWrite.value) {
     return t('workbench.messages.mergeReadonly')
   }
-  if (!selectedMergeSegmentsInSameBlock.value) {
+  if (!isCadFile.value && !selectedMergeSegmentsInSameBlock.value) {
     return t('workbench.messages.mergeDifferentBlock')
+  }
+  if (!selectedMergeSegmentsAreAdjacent.value) {
+    return t('workbench.messages.mergeNonAdjacent')
   }
   return t('workbench.ribbon.mergeSegment')
 })
@@ -5396,7 +5416,7 @@ async function handleSplitSegment() {
 
 async function handleMergeSegment() {
   if (!canMergeSegment.value) {
-    toast.warn({ message: t('workbench.messages.mergeSelectAtLeast') })
+    toast.warn({ message: mergeSegmentButtonTitle.value })
     return
   }
 

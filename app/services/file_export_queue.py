@@ -496,6 +496,7 @@ def build_file_record_exported_file(
             "target_text": seg.target_text,
             "status": seg.status,
             "matched_source_text": seg.matched_source_text,
+            "sequence_index": getattr(seg, "sequence_index", None),
         }
         for seg in segments
     ]

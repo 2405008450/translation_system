@@ -1272,6 +1272,7 @@ export default {
       mergeSuccess: '句段已合并。',
       mergeFailed: '句段合并失败。',
       mergeDifferentBlock: '选中的句段属于不同段落，无法合并。',
+      mergeNonAdjacent: '普通文档只能合并前后相邻的句段。',
       mergeReadonly: '选中的句段包含不可编辑内容，无法合并。',
       mergeSelectAtLeast: '请按住 Ctrl 或 Shift 点击选择至少两个句段。',
     },
