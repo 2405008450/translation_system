@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS segment_revisions (
     )::uuid,
     file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
     segment_id UUID NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
-    sentence_id VARCHAR(20) NOT NULL,
+    sentence_id VARCHAR(100) NOT NULL,
     before_text TEXT NOT NULL DEFAULT '',
     after_text TEXT NOT NULL DEFAULT '',
     source VARCHAR(20) NOT NULL DEFAULT 'manual',

@@ -480,6 +480,7 @@ export interface Segment {
   block_index: number
   row_index?: number | null
   cell_index?: number | null
+  sequence_index?: number | null
   workflow_step_id?: string | null
   workflow_step_name?: string | null
   workflow_step_order?: number | null
@@ -523,7 +524,19 @@ export interface SegmentQAIssue {
 }
 
 export type WorkbenchQAResultItemSourceKind = 'segment_qa_issue' | 'term_qa_report_item'
-export type WorkbenchQAResultRuleKey = 'spelling_grammar' | 'term_inconsistency'
+export type WorkbenchQAResultRuleKey =
+  | 'spelling_grammar'
+  | 'term_inconsistency'
+  | 'paired_punctuation_missing'
+  | 'ending_punctuation_mismatch'
+  | 'repeated_punctuation'
+  | 'extra_space_after_punctuation'
+  | 'missing_space_after_punctuation'
+  | 'target_without_tag'
+  | 'target_tag_missing'
+  | 'unmatched_closing_tag'
+  | 'unmatched_opening_tag'
+  | 'target_placeholder_missing'
 
 export interface WorkbenchQAResultRule {
   key: WorkbenchQAResultRuleKey
@@ -1640,3 +1653,4 @@ export interface ReferenceApplyResult {
   applied_count: number
   skipped_count: number
 }
+

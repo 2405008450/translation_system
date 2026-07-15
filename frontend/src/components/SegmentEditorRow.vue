@@ -61,6 +61,8 @@ const emit = defineEmits<{
   updateSource: [sentenceId: string, value: string]
   focus: [sentenceId: string]
   activateTarget: [sentenceId: string]
+  activateSource: [sentenceId: string]
+  sourceCaretChange: [sentenceId: string, offset: number]
   copySourceToTarget: [sentenceId: string]
   applyPartialRevision: [revisionId: string, newText: string]
   ctrlClick: [sentenceId: string, event: MouseEvent]
@@ -74,6 +76,8 @@ const isFocused = ref(false)
 const isSourceFocused = ref(false)
 const isComposing = ref(false)
 const editorDirtySinceFocus = ref(false)
+const pendingSourceFocus = ref(false)
+const pendingSourceFocusPoint = ref<{ x: number; y: number } | null>(null)
 
 // 对外标识：合并视图使用复合键，单文件回退为 sentence_id
 const segmentKey = computed(() => props.segmentKey || props.segment.sentence_id)
@@ -1368,6 +1372,33 @@ function handleSelectMouseDown(event: MouseEvent) {
   }
 }
 
+function handleSourceCellMouseDown(event: MouseEvent) {
+  handleSelectMouseDown(event)
+  if (isSegmentMultiSelectEvent(event) || props.disabled) {
+    return
+  }
+  // 非激活行点击原文时，先标记待聚焦，激活后把光标落到原文区
+  if (!props.active) {
+    pendingSourceFocus.value = true
+    pendingSourceFocusPoint.value = { x: event.clientX, y: event.clientY }
+  }
+}
+
+function handleSourceCellClick(event: MouseEvent) {
+  resetHistoryGroup()
+  if (isSegmentMultiSelectEvent(event)) {
+    emit('ctrlClick', segmentKey.value, event)
+    return
+  }
+  emit('activateSource', segmentKey.value)
+  if (props.active) {
+    void nextTick(() => {
+      focusSourceEditorAtPoint(event.clientX, event.clientY)
+      emitSourceCaret()
+    })
+  }
+}
+
 function handleClick(event: MouseEvent) {
   resetHistoryGroup()
   if (isSegmentMultiSelectEvent(event)) {
@@ -1376,6 +1407,57 @@ function handleClick(event: MouseEvent) {
   }
   cacheTargetSelectionFromDom()
   emit('activateTarget', segmentKey.value)
+}
+
+function getSourceCaretOffset(editor: HTMLElement): number {
+  const selection = window.getSelection()
+  if (!selection || selection.rangeCount === 0) return 0
+  if (!editor.contains(selection.anchorNode)) return 0
+
+  const range = selection.getRangeAt(0)
+  const preCaretRange = range.cloneRange()
+  preCaretRange.selectNodeContents(editor)
+  preCaretRange.setEnd(range.startContainer, range.startOffset)
+
+  // 可见换行标记渲染为 "¶\n"，长度需折叠为 1；·/→ 与原字符等长
+  return preCaretRange.toString().replace(/¶\n/g, '\n').replace(/¶/g, '\n').length
+}
+
+function emitSourceCaret() {
+  const editor = sourceEditorRef.value
+  if (!editor || !isSourceFocused.value) return
+  const offset = getSourceCaretOffset(editor)
+  emit('sourceCaretChange', segmentKey.value, offset)
+}
+
+function focusSourceEditorAtPoint(clientX?: number, clientY?: number) {
+  const editor = sourceEditorRef.value
+  if (!editor || props.disabled) return
+  editor.focus({ preventScroll: true })
+  if (clientX === undefined || clientY === undefined) {
+    return
+  }
+  // 尽量按点击坐标放置光标（浏览器 caretRangeFromPoint）
+  const doc = document as Document & {
+    caretRangeFromPoint?: (x: number, y: number) => Range | null
+    caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null
+  }
+  let range: Range | null = null
+  if (typeof doc.caretRangeFromPoint === 'function') {
+    range = doc.caretRangeFromPoint(clientX, clientY)
+  } else if (typeof doc.caretPositionFromPoint === 'function') {
+    const pos = doc.caretPositionFromPoint(clientX, clientY)
+    if (pos) {
+      range = document.createRange()
+      range.setStart(pos.offsetNode, pos.offset)
+      range.collapse(true)
+    }
+  }
+  if (range && editor.contains(range.startContainer)) {
+    const selection = window.getSelection()
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+  }
 }
 
 function handleProjectSyncToggle() {
@@ -1395,6 +1477,8 @@ function handleCopySourceToTargetClick() {
 
 function handleSourceFocus() {
   isSourceFocused.value = true
+  emit('focus', segmentKey.value)
+  emitSourceCaret()
 }
 
 function handleSourceBlur() {
@@ -1426,6 +1510,8 @@ function handleSourceKeydown(event: KeyboardEvent) {
       event.preventDefault()
     }
   }
+  // 方向键等会改变光标，下一帧同步偏移
+  void nextTick(() => emitSourceCaret())
 }
 
 function handleEditorShellClick(event: MouseEvent) {
@@ -2143,7 +2229,17 @@ watch(
       sourceEditText.value = sourceTextContent.value
       nextTick(() => {
         syncSourceEditorFromState(false)
+        if (pendingSourceFocus.value) {
+          const point = pendingSourceFocusPoint.value
+          pendingSourceFocus.value = false
+          pendingSourceFocusPoint.value = null
+          focusSourceEditorAtPoint(point?.x, point?.y)
+          emitSourceCaret()
+        }
       })
+    } else {
+      pendingSourceFocus.value = false
+      pendingSourceFocusPoint.value = null
     }
   },
   { immediate: true }
@@ -2194,7 +2290,11 @@ watch(
       <span class="segment-row__index">{{ index + 1 }}</span>
     </div>
 
-    <div class="segment-row__cell segment-row__cell--source" @mousedown="handleSelectMouseDown" @click="handleClick">
+    <div
+      class="segment-row__cell segment-row__cell--source"
+      @mousedown="handleSourceCellMouseDown"
+      @click="handleSourceCellClick"
+    >
       <div class="segment-row__source-content">
         <span
           v-if="hasAutomaticNumbering"
@@ -2210,7 +2310,7 @@ watch(
           ref="sourceEditorRef"
           class="segment-row__source-editor"
           :class="{ 'is-focused': isSourceFocused, 'is-readonly': !sourceEditing }"
-          :contenteditable="sourceEditing && !disabled"
+          :contenteditable="!disabled"
           tabindex="0"
           spellcheck="false"
           @focus="handleSourceFocus"
@@ -2218,6 +2318,8 @@ watch(
           @input="handleSourceInput"
           @keydown="handleSourceKeydown"
           @beforeinput="handleSourceBeforeInput"
+          @mouseup="emitSourceCaret"
+          @keyup="emitSourceCaret"
         ></div>
         <div v-else class="segment-row__text" v-html="sourceHtmlContent"></div>
       </div>
@@ -2409,6 +2511,7 @@ watch(
 .segment-row__text {
   font-size: var(--segment-editor-source-font-size, 13px);
   line-height: var(--segment-editor-source-line-height, 1.45);
+  cursor: text;
 }
 
 .segment-row__automatic-numbering-badge {
@@ -2840,17 +2943,20 @@ watch(
   font-size: var(--segment-editor-source-font-size, 13px);
   line-height: var(--segment-editor-source-line-height, 1.45);
   color: var(--text-primary);
+  caret-color: #0b5f52;
   outline: none;
   white-space: pre-wrap;
   word-break: break-word;
   overflow-wrap: anywhere;
   overflow: auto;
   box-shadow: 0 0 0 3px rgba(13, 122, 104, 0.12);
+  cursor: text;
 }
 
 .segment-row__source-editor.is-focused {
   border-color: var(--brand-700, #0d7a68);
   box-shadow: 0 0 0 3px rgba(13, 122, 104, 0.18);
+  caret-color: #063d35;
 }
 
 .segment-row__source-editor.is-readonly {
@@ -2858,11 +2964,14 @@ watch(
   background: var(--surface-panel, #fff);
   box-shadow: none;
   cursor: text;
+  caret-color: #0b5f52;
 }
 
 .segment-row__source-editor.is-readonly.is-focused {
   border-color: var(--brand-400, #5bb5a6);
-  box-shadow: 0 0 0 2px rgba(13, 122, 104, 0.08);
+  background: #f3fbf9;
+  box-shadow: 0 0 0 2px rgba(13, 122, 104, 0.16);
+  caret-color: #063d35;
 }
 
 /* 显示标记样式 */

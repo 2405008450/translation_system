@@ -23,8 +23,10 @@ from app.models import FileExportTask, FileRecord, User
 from app.services.adapters import export_file
 from app.services.task_file_service import (
     BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS,
+    BILINGUAL_PPTX_EXPORT_TYPE,
     DOCUMENT_PARSE_MODE_FULL,
     can_export_task_file,
+    export_bilingual_pptx_task_file,
     export_bilingual_task_docx_with_layout,
     export_bilingual_xlsx_task_file,
     export_translated_task_file,
@@ -471,6 +473,16 @@ def build_file_record_exported_file(
         if get_task_file_extension(source_filename) != ".xlsx":
             raise ValueError("Only XLSX source files support original-format bilingual Excel export.")
         return export_bilingual_xlsx_task_file(
+            raw_bytes=raw_bytes,
+            filename=source_filename,
+            segments=segments,
+            document_parse_options=document_parse_options,
+        )
+
+    if export_type == BILINGUAL_PPTX_EXPORT_TYPE:
+        if get_task_file_extension(source_filename) != ".pptx":
+            raise ValueError("Only PPTX source files support original-format bilingual PPTX export.")
+        return export_bilingual_pptx_task_file(
             raw_bytes=raw_bytes,
             filename=source_filename,
             segments=segments,

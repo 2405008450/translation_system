@@ -68,6 +68,13 @@ EXPORT_OPTIONS = {
         extension=".docx",
         mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ),
+    "bilingual_pptx_original": ExportOption(
+        id="bilingual_pptx_original",
+        name="PPTX 原格式双语",
+        description="保留原 PPTX 幻灯片结构，在原文本位置按原文、译文换行导出",
+        extension=".pptx",
+        mime_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ),
     "bilingual_txt": ExportOption(
         id="bilingual_txt",
         name="双语文本",
@@ -138,7 +145,15 @@ FORMAT_EXPORT_SUPPORT: Dict[str, List[str]] = {
         "xliff",
     ],
     ".pdf": ["bilingual_docx", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],  # PDF 无法原格式导出
-    ".pptx": ["original", "bilingual_docx", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".pptx": [
+        "original",
+        "bilingual_pptx_original",
+        "bilingual_docx",
+        "bilingual_excel",
+        "bilingual_txt",
+        "tmx",
+        "xliff",
+    ],
     ".xlsx": ["original", "bilingual_excel_original", "bilingual_docx", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
 
     # 纯文本
@@ -175,6 +190,7 @@ FORMAT_EXPORT_SUPPORT: Dict[str, List[str]] = {
 
     # 工程/设计文件
     ".dxf": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
+    ".dwg": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
     ".idml": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
     ".mif": ["original", "bilingual_excel", "bilingual_txt", "tmx", "xliff"],
 

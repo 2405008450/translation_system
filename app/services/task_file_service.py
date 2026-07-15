@@ -66,6 +66,7 @@ TASK_ADAPTER_EXTENSIONS = {
     ".sdlxliff",
     ".txml",
     ".dxf",
+    ".dwg",
     ".idml",
     ".mif",
     ".zip",
@@ -398,6 +399,23 @@ _UPLOAD_CAPABILITY_SPECS = (
         ),
     },
     {
+        "extensions": (".dwg",),
+        "label": "DWG",
+        "category": "engineering",
+        "features": (
+            "依赖 ODA File Converter（需用户安装）",
+            "DWG -> DXF -> 文本提取",
+            "默认导出 DXF；启用后回写 DWG",
+        ),
+        "settings": (
+            {
+                "id": "skip_non_translatable",
+                "label": "非译元素(数字和符号)",
+                "default": True,
+            },
+        ),
+    },
+    {
         "extensions": (".idml",),
         "label": "IDML",
         "category": "design",
@@ -442,6 +460,7 @@ BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS = {
     "bilingual_docx_layout_source_first": BILINGUAL_LAYOUT_SOURCE_FIRST,
     "bilingual_docx_layout_target_first": BILINGUAL_LAYOUT_TARGET_FIRST,
 }
+BILINGUAL_PPTX_EXPORT_TYPE = "bilingual_pptx_original"
 
 
 def get_task_file_extension(filename: str) -> str:
@@ -591,6 +610,8 @@ def build_task_workspace(
     filename: str,
     similarity_threshold: float,
     collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
     document_parse_options: dict[str, object] | str | None = None,
 ) -> dict[str, Any]:
@@ -612,6 +633,8 @@ def build_task_workspace(
             raw_bytes=parse_bytes,
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
+            source_language=source_language,
+            target_language=target_language,
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
         )
@@ -638,11 +661,16 @@ def build_task_workspace(
         similarity_threshold=similarity_threshold,
         auxiliary_sentences=auxiliary_sentences,
         collection_ids=collection_ids,
+        source_language=source_language,
+        target_language=target_language,
     )
 
     segments: list[dict[str, Any]] = []
     for index, (segment, match_result) in enumerate(zip(parse_result.segments, match_results, strict=False)):
         context = _build_segment_context(parse_result.ast, segment.block_path, fallback_index=index)
+
+        # 获取 segment metadata（包含 DXF/DWG 实体信息如 handle, layer 等）
+        seg_metadata = getattr(segment, 'metadata', {}) or {}
         existing_target_text = str(context.get("target") or "").strip()
         segments.append(
             {
@@ -657,6 +685,7 @@ def build_task_workspace(
                 "matched_creator_name": match_result.matched_creator_name,
                 "matched_created_at": match_result.matched_created_at,
                 "matched_updated_at": match_result.matched_updated_at,
+                "segment_metadata": seg_metadata,
                 **context,
             }
         )
@@ -816,6 +845,37 @@ def export_bilingual_xlsx_task_file(
     )
 
 
+def export_bilingual_pptx_task_file(
+    raw_bytes: bytes | None,
+    filename: str,
+    segments: list[Any],
+    document_parse_options: dict[str, object] | str | None = None,
+) -> ExportedTaskFile:
+    if get_task_file_extension(filename) != ".pptx":
+        raise ValueError("仅 PPTX 源文件支持原格式双语 PPTX 导出。")
+    if raw_bytes is None:
+        raise ValueError("PPTX 源文件缺失，暂时无法导出原格式双语 PPTX。")
+
+    from app.services.adapters.pptx_exporter import PPTX_MEDIA_TYPE, PptxExporter
+
+    export_segments = build_export_segments_from_source(
+        raw_bytes,
+        filename,
+        segments,
+        document_parse_options=document_parse_options,
+    )
+    return ExportedTaskFile(
+        content=PptxExporter().export(
+            raw_bytes,
+            export_segments,
+            document_parse_options=document_parse_options,
+            bilingual=True,
+        ),
+        media_type=PPTX_MEDIA_TYPE,
+        filename=_build_bilingual_pptx_filename(filename),
+    )
+
+
 def export_bilingual_task_docx_with_layout(
     raw_bytes: bytes | None,
     filename: str,
@@ -885,6 +945,11 @@ def build_export_segments_from_source(
     segments: list[Any],
     document_parse_options: dict[str, object] | str | None = None,
 ) -> list[dict[str, Any]]:
+    import json as _json
+    import logging
+    
+    _logger = logging.getLogger(__name__)
+    
     if is_word_task(filename):
         return [_normalize_existing_segment(segment) for segment in segments]
 
@@ -892,10 +957,45 @@ def build_export_segments_from_source(
     adapter = registry.get_adapter(filename)
     document_parse_options = normalize_document_parse_options(document_parse_options)
     parse_result = adapter.parse_with_options(raw_bytes, filename=filename, options=document_parse_options)
+    
+    # 按 segment_id 建立数据库句段索引
     translated_segments = {
         str(_get_segment_value(segment, "sentence_id", _get_segment_value(segment, "segment_id", ""))): segment
         for segment in segments
     }
+
+    # 对于 CAD 文件，额外按 handle 建立索引（因为合并后 segment_id 会变）
+    extension = (filename or "").lower().rsplit(".", 1)[-1] if filename else ""
+    is_cad_file = extension in ("dwg", "dxf")
+
+    handle_to_db_segment: dict[str, Any] = {}
+    merged_handles_set: set[str] = set()  # 所有被合并的 handles（用于清空）
+
+    if is_cad_file:
+        for segment in segments:
+            db_metadata_str = _get_segment_value(segment, "segment_metadata", "{}")
+            try:
+                db_metadata = _json.loads(db_metadata_str) if db_metadata_str else {}
+            except (TypeError, _json.JSONDecodeError):
+                db_metadata = {}
+
+            handle = db_metadata.get("handle", "")
+            if handle:
+                handle_to_db_segment[handle] = segment
+
+            # 收集所有被合并的 handles
+            if db_metadata.get("is_merged"):
+                merged_handles = db_metadata.get("merged_handles", [])
+                primary_handle = db_metadata.get("primary_handle", "")
+                for h in merged_handles:
+                    if h != primary_handle:
+                        merged_handles_set.add(h)
+
+        _logger.info(
+            "build_export_segments_from_source: CAD 文件，handle 索引 %d 个，被合并实体 %d 个",
+            len(handle_to_db_segment), len(merged_handles_set)
+        )
+
     translated_segments_by_source: dict[str, list[Any]] = {}
     for segment in segments:
         source_key = _normalize_export_source_text(_get_segment_value(segment, "source_text", ""))
@@ -904,9 +1004,20 @@ def build_export_segments_from_source(
     ordered_translated_segments = list(segments)
     used_translated_segment_ids: set[int] = set()
 
+    _logger.debug(
+        "build_export_segments_from_source: 解析得到 %d 个句段，数据库有 %d 个翻译句段",
+        len(parse_result.segments), len(translated_segments)
+    )
+
     export_segments: list[dict[str, Any]] = []
     for index, parsed_segment in enumerate(parse_result.segments):
+        # 首先尝试按 segment_id 匹配
         translated_segment = translated_segments.get(parsed_segment.segment_id)
+
+        # 获取解析时的 metadata（CAD 文件需要 handle 用于兜底匹配）
+        segment_metadata = getattr(parsed_segment, 'metadata', {}) or {}
+        handle = segment_metadata.get('handle', '')
+
         parsed_source = _normalize_export_source_text(parsed_segment.source_text)
         if translated_segment is not None and _normalize_export_source_text(
             _get_segment_value(translated_segment, "source_text", "")
@@ -924,9 +1035,54 @@ def build_export_segments_from_source(
                 candidates.pop(0)
             if candidates:
                 translated_segment = candidates.pop(0)
+
+        # 对于 CAD 文件，如果上述匹配都失败，再用 handle 兜底
+        if is_cad_file and translated_segment is None and handle:
+            translated_segment = handle_to_db_segment.get(handle)
+            if translated_segment and id(translated_segment) not in used_translated_segment_ids:
+                _logger.info(
+                    "build_export_segments_from_source: segment_id/source_text 匹配失败，使用 handle=%s 匹配成功",
+                    handle
+                )
+            elif translated_segment:
+                # 已经被用过，跳过
+                translated_segment = None
+
         if translated_segment is not None:
             used_translated_segment_ids.add(id(translated_segment))
         context = _build_segment_context(parse_result.ast, parsed_segment.block_path, fallback_index=index)
+        
+        # 优先使用数据库中的 segment_metadata（可能包含手动合并信息）
+        if translated_segment:
+            db_metadata_str = _get_segment_value(translated_segment, "segment_metadata", "{}")
+            try:
+                db_metadata = _json.loads(db_metadata_str) if db_metadata_str else {}
+            except (TypeError, _json.JSONDecodeError):
+                db_metadata = {}
+            
+            # 如果数据库中有合并信息，覆盖解析的 metadata
+            if db_metadata.get("is_merged"):
+                segment_metadata = {**segment_metadata, **db_metadata}
+                _logger.info(
+                    "build_export_segments_from_source: 句段 %s 是合并句段, metadata=%s",
+                    parsed_segment.segment_id, segment_metadata
+                )
+        else:
+            # 没有在数据库中找到对应的翻译句段
+            _logger.debug(
+                "build_export_segments_from_source: 句段 %s 在数据库中不存在 (handle=%s)",
+                parsed_segment.segment_id, handle
+            )
+            
+            # 对于 CAD 文件，检查这个实体是否是被合并的
+            if is_cad_file and handle and handle in merged_handles_set:
+                # 标记这个实体是被合并的一部分，需要被清空
+                segment_metadata['is_merged_secondary'] = True
+                _logger.info(
+                    "build_export_segments_from_source: 实体 handle=%s 是被合并的次级实体",
+                    handle
+                )
+        
         export_segments.append(
             {
                 "segment_id": parsed_segment.segment_id,
@@ -936,6 +1092,7 @@ def build_export_segments_from_source(
                 "target_text": _get_segment_value(translated_segment, "target_text", ""),
                 "status": _get_segment_value(translated_segment, "status", "none"),
                 "matched_source_text": _get_segment_value(translated_segment, "matched_source_text", ""),
+                "metadata": segment_metadata,
                 **context,
             }
         )
@@ -956,6 +1113,7 @@ def _normalize_existing_segment(segment: Any) -> dict[str, Any]:
         "block_index": _get_segment_value(segment, "block_index", 0),
         "row_index": _get_segment_value(segment, "row_index"),
         "cell_index": _get_segment_value(segment, "cell_index"),
+        "sequence_index": _get_segment_value(segment, "sequence_index", -1),
     }
 
 
@@ -1090,3 +1248,9 @@ def _build_bilingual_xlsx_filename(filename: str) -> str:
     path = Path(filename or "bilingual.xlsx")
     stem = path.stem or "bilingual"
     return f"{stem}_bilingual.xlsx"
+
+
+def _build_bilingual_pptx_filename(filename: str) -> str:
+    path = Path(filename or "bilingual.pptx")
+    stem = path.stem or "bilingual"
+    return f"{stem}_bilingual.pptx"

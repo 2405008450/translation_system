@@ -48,6 +48,8 @@ class DocumentMatchSegment:
     display_text: str = ""
     source_word_count: int = 0
     collection_ids: tuple[UUID, ...] = ()
+    source_language: str | None = None
+    target_language: str | None = None
 
 
 Matcher = Callable[
@@ -112,7 +114,8 @@ def compute_document_match_analysis(
             seen_hashes_by_file[file_id].add(source_hash)
             seen_files_by_hash[source_hash].add(file_id)
 
-    for collection_ids, grouped_segments in _group_segments_for_tm(pending_tm_segments).items():
+    default_matcher = matcher is _match_segments_with_tm
+    for (collection_ids, source_language, target_language), grouped_segments in _group_segments_for_tm(pending_tm_segments).items():
         if not collection_ids:
             for segment in grouped_segments:
                 word_count = _segment_word_count(segment)
@@ -122,7 +125,18 @@ def compute_document_match_analysis(
 
         source_sentences = [segment.source_text for segment in grouped_segments]
         auxiliary_sentences = [segment.display_text or segment.source_text for segment in grouped_segments]
-        matches = matcher(db, source_sentences, auxiliary_sentences, list(collection_ids), analysis_threshold)
+        if default_matcher:
+            matches = _match_segments_with_tm(
+                db,
+                source_sentences,
+                auxiliary_sentences,
+                list(collection_ids),
+                analysis_threshold,
+                source_language=source_language,
+                target_language=target_language,
+            )
+        else:
+            matches = matcher(db, source_sentences, auxiliary_sentences, list(collection_ids), analysis_threshold)
         for segment, match in zip(grouped_segments, matches, strict=False):
             bucket = _bucket_for_tm_match(match, match_threshold=analysis_threshold)
             word_count = _segment_word_count(segment)
@@ -252,6 +266,8 @@ def _match_segments_with_tm(
     auxiliary_sentences: list[str],
     collection_ids: list[UUID],
     match_threshold: float,
+    source_language: str | None = None,
+    target_language: str | None = None,
 ) -> Sequence[MatchResult]:
     if db is None:
         return []
@@ -261,6 +277,8 @@ def _match_segments_with_tm(
         auxiliary_sentences=auxiliary_sentences,
         similarity_threshold=match_threshold,
         collection_ids=collection_ids,
+        source_language=source_language,
+        target_language=target_language,
     )
     return matches
 
@@ -305,10 +323,13 @@ def _tm_match_applies_at_threshold(match: MatchResult | Any, threshold: float) -
 
 def _group_segments_for_tm(
     segments: Iterable[DocumentMatchSegment],
-) -> dict[tuple[UUID, ...], list[DocumentMatchSegment]]:
-    grouped: dict[tuple[UUID, ...], list[DocumentMatchSegment]] = defaultdict(list)
+) -> dict[tuple[tuple[UUID, ...], str | None, str | None], list[DocumentMatchSegment]]:
+    grouped: dict[tuple[tuple[UUID, ...], str | None, str | None], list[DocumentMatchSegment]] = defaultdict(list)
     for segment in segments:
-        grouped[tuple(dict.fromkeys(segment.collection_ids))].append(segment)
+        source_language = (segment.source_language or "").strip() or None
+        target_language = (segment.target_language or "").strip() or None
+        key = (tuple(dict.fromkeys(segment.collection_ids)), source_language, target_language)
+        grouped[key].append(segment)
     return dict(grouped)
 
 

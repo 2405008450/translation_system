@@ -1,13 +1,12 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { Upload, FileText, Trash2, Play, RefreshCw, CheckCircle, AlertTriangle, Loader2, Sparkles } from 'lucide-vue-next'
+import { Upload, FileText, Trash2, Play, CheckCircle, AlertTriangle, Loader2, Sparkles } from 'lucide-vue-next'
 
 import type {
   ReferenceFile,
   ReferenceProfile,
   ReferenceAnalyzeResponse,
-  ReferenceMatchResult,
 } from '../types/api'
 import { http } from '../api/http'
 
@@ -16,8 +15,6 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  (e: 'matchesLoaded', matches: ReferenceMatchResult): void
-  (e: 'applyExactMatches'): void
   (e: 'aiTranslateComplete', result: { updated_count: number; error_count: number }): void
 }>()
 
@@ -26,8 +23,6 @@ const { t } = useI18n()
 // 状态
 const loading = ref(false)
 const analyzing = ref(false)
-const matching = ref(false)
-const applying = ref(false)
 const error = ref<string | null>(null)
 
 // AI翻译状态
@@ -51,7 +46,6 @@ let progressEventSource: EventSource | null = null
 
 const referenceFiles = ref<ReferenceFile[]>([])
 const profile = ref<ReferenceProfile | null>(null)
-const matchResult = ref<ReferenceMatchResult | null>(null)
 
 // 上传状态
 const uploadingFiles = ref(false)
@@ -72,9 +66,6 @@ const tmList = ref<Array<{source: string, target: string, similarity?: number}>>
 const loadingTerms = ref(false)
 const showAllTerms = ref(false)
 const showAllTm = ref(false)
-const showAllExactMatches = ref(false)
-const showAllFuzzyMatches = ref(false)
-const showAllTermMatches = ref(false)
 
 const industryLabel = computed(() => {
   const map: Record<string, string> = {
@@ -121,37 +112,16 @@ async function loadData() {
       // 如果有分析结果，加载术语和TM列表
       if (profileRes.data) {
         await loadTerminologyAndTM()
-        // 尝试加载已保存的匹配结果
-        await loadMatchResult()
       }
     } catch {
       profile.value = null
       terminologyList.value = []
       tmList.value = []
-      matchResult.value = null
     }
   } catch (err: unknown) {
     error.value = err instanceof Error ? err.message : '加载失败'
   } finally {
     loading.value = false
-  }
-}
-
-// 加载已保存的匹配结果
-async function loadMatchResult() {
-  if (!props.fileRecordId) return
-  
-  try {
-    const res = await http.get<ReferenceMatchResult | null>(
-      `/reference/file-records/${props.fileRecordId}/match-result`
-    )
-    if (res.data) {
-      matchResult.value = res.data
-      // 不再 emit，因为 WorkbenchView 初始化时已经加载过匹配结果了
-    }
-  } catch {
-    // 没有匹配结果或加载失败，静默处理
-    matchResult.value = null
   }
 }
 
@@ -332,42 +302,12 @@ function stopProgressPolling(intervalId: number) {
 
 // 匹配句段
 async function matchSegments() {
-  if (!props.fileRecordId || !hasProfile.value) return
-  
-  matching.value = true
-  error.value = null
-  
-  try {
-    const res = await http.post<ReferenceMatchResult>(
-      `/reference/file-records/${props.fileRecordId}/match`
-    )
-    matchResult.value = res.data
-    emit('matchesLoaded', res.data)
-  } catch (err: unknown) {
-    error.value = err instanceof Error ? err.message : '匹配失败'
-  } finally {
-    matching.value = false
-  }
+  // 已废弃：参考资料分析后会自动同步到项目级 TM/术语库，匹配通过原生通道命中。
 }
 
 // 应用精确匹配
 async function applyExactMatches() {
-  if (!props.fileRecordId || !profile.value || !matchResult.value?.exact_count) return
-  
-  applying.value = true
-  error.value = null
-  
-  try {
-    await http.post(`/reference/file-records/${props.fileRecordId}/apply`, {
-      profile_id: profile.value.id,
-      apply_exact: true,
-    })
-    emit('applyExactMatches')
-  } catch (err: unknown) {
-    error.value = err instanceof Error ? err.message : '应用失败'
-  } finally {
-    applying.value = false
-  }
+  // 已废弃：见 matchSegments 注释。
 }
 
 // 删除分析结果
@@ -377,7 +317,6 @@ async function deleteProfile() {
   try {
     await http.delete(`/reference/file-records/${props.fileRecordId}/profile`)
     profile.value = null
-    matchResult.value = null
     referenceFiles.value = []  // 同时清空文件列表
   } catch (err: unknown) {
     error.value = err instanceof Error ? err.message : '删除失败'
@@ -481,14 +420,10 @@ watch(() => props.fileRecordId, () => {
   } else {
     referenceFiles.value = []
     profile.value = null
-    matchResult.value = null
     terminologyList.value = []
     tmList.value = []
     showAllTerms.value = false
     showAllTm.value = false
-    showAllExactMatches.value = false
-    showAllFuzzyMatches.value = false
-    showAllTermMatches.value = false
   }
 }, { immediate: true })
 
@@ -753,156 +688,6 @@ function formatFileSize(bytes: number): string {
                 <span class="reference-style__label">避免</span>
                 <span class="reference-style__value reference-style__value--warn">{{ styleGuide.avoid.join('、') }}</span>
               </div>
-            </div>
-          </section>
-
-          <!-- 匹配操作 -->
-          <section class="reference-section">
-            <h4 class="reference-section__title">句段匹配</h4>
-            
-            <div class="reference-actions">
-              <button
-                class="button"
-                type="button"
-                :disabled="matching"
-                @click="matchSegments"
-              >
-                <Loader2 v-if="matching" :size="16" class="spin" />
-                <RefreshCw v-else :size="16" />
-                <span>{{ matching ? '匹配中...' : '执行匹配' }}</span>
-              </button>
-            </div>
-
-            <!-- 匹配结果 -->
-            <div v-if="matchResult" class="reference-match-stats">
-              <div class="reference-match-stat reference-match-stat--exact">
-                <CheckCircle :size="16" />
-                <span class="reference-match-stat__value">{{ matchResult.exact_count }}</span>
-                <span class="reference-match-stat__label">精确匹配</span>
-              </div>
-              <div class="reference-match-stat reference-match-stat--fuzzy">
-                <span class="reference-match-stat__value">{{ matchResult.fuzzy_count }}</span>
-                <span class="reference-match-stat__label">模糊匹配</span>
-              </div>
-              <div class="reference-match-stat reference-match-stat--term">
-                <span class="reference-match-stat__value">{{ matchResult.term_count }}</span>
-                <span class="reference-match-stat__label">术语匹配</span>
-              </div>
-            </div>
-
-            <!-- 精确匹配详情 -->
-            <div v-if="matchResult?.exact_matches?.length" class="reference-match-detail">
-              <div class="reference-match-detail__header">
-                <h5 class="reference-match-detail__title reference-match-detail__title--exact">
-                  <CheckCircle :size="14" />
-                  精确匹配 ({{ matchResult.exact_matches.length }})
-                </h5>
-                <button
-                  v-if="matchResult.exact_matches.length > 3"
-                  class="reference-match-detail__toggle"
-                  type="button"
-                  @click="showAllExactMatches = !showAllExactMatches"
-                >
-                  {{ showAllExactMatches ? '收起' : '展开' }}
-                </button>
-              </div>
-              <div class="reference-match-detail__list">
-                <div
-                  v-for="(match, idx) in (showAllExactMatches ? matchResult.exact_matches : matchResult.exact_matches.slice(0, 3))"
-                  :key="idx"
-                  class="reference-match-item reference-match-item--exact"
-                >
-                  <div class="reference-match-item__source">{{ match.source }}</div>
-                  <div class="reference-match-item__target">{{ match.target }}</div>
-                  <div class="reference-match-item__meta">
-                    <span class="reference-match-item__similarity">100%</span>
-                    <span class="reference-match-item__source-file">来源: {{ match.source_file || '参考文件' }}</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <!-- 模糊匹配详情 -->
-            <div v-if="matchResult?.fuzzy_matches?.length" class="reference-match-detail">
-              <div class="reference-match-detail__header">
-                <h5 class="reference-match-detail__title reference-match-detail__title--fuzzy">
-                  模糊匹配 ({{ matchResult.fuzzy_matches.length }})
-                </h5>
-                <button
-                  v-if="matchResult.fuzzy_matches.length > 3"
-                  class="reference-match-detail__toggle"
-                  type="button"
-                  @click="showAllFuzzyMatches = !showAllFuzzyMatches"
-                >
-                  {{ showAllFuzzyMatches ? '收起' : '展开' }}
-                </button>
-              </div>
-              <div class="reference-match-detail__list">
-                <div
-                  v-for="(match, idx) in (showAllFuzzyMatches ? matchResult.fuzzy_matches : matchResult.fuzzy_matches.slice(0, 3))"
-                  :key="idx"
-                  class="reference-match-item reference-match-item--fuzzy"
-                >
-                  <div class="reference-match-item__source">{{ match.source }}</div>
-                  <div class="reference-match-item__matched">匹配: {{ match.matched_source }}</div>
-                  <div class="reference-match-item__target">{{ match.target }}</div>
-                  <div class="reference-match-item__meta">
-                    <span class="reference-match-item__similarity">{{ Math.round(match.similarity * 100) }}%</span>
-                    <span class="reference-match-item__source-file">来源: {{ match.source_file || '参考文件' }}</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <!-- 术语匹配详情 -->
-            <div v-if="matchResult?.term_matches?.length" class="reference-match-detail">
-              <div class="reference-match-detail__header">
-                <h5 class="reference-match-detail__title reference-match-detail__title--term">
-                  术语匹配 ({{ matchResult.term_matches.length }})
-                </h5>
-                <button
-                  v-if="matchResult.term_matches.length > 3"
-                  class="reference-match-detail__toggle"
-                  type="button"
-                  @click="showAllTermMatches = !showAllTermMatches"
-                >
-                  {{ showAllTermMatches ? '收起' : '展开' }}
-                </button>
-              </div>
-              <div class="reference-match-detail__list">
-                <div
-                  v-for="(match, idx) in (showAllTermMatches ? matchResult.term_matches : matchResult.term_matches.slice(0, 3))"
-                  :key="idx"
-                  class="reference-match-item reference-match-item--term"
-                >
-                  <div class="reference-match-item__terms">
-                    <span
-                      v-for="(term, tidx) in match.terms"
-                      :key="tidx"
-                      class="reference-match-item__term-badge"
-                    >
-                      {{ term.source }} → {{ term.target }}
-                    </span>
-                  </div>
-                  <div class="reference-match-item__meta">
-                    <span class="reference-match-item__source-file">来源: {{ match.source_file || '参考文件' }}</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <!-- 应用精确匹配 -->
-            <div v-if="matchResult?.exact_count" class="reference-actions">
-              <button
-                class="button button--success"
-                type="button"
-                :disabled="applying"
-                @click="applyExactMatches"
-              >
-                <Loader2 v-if="applying" :size="16" class="spin" />
-                <CheckCircle v-else :size="16" />
-                <span>{{ applying ? '应用中...' : `应用 ${matchResult.exact_count} 条精确匹配` }}</span>
-              </button>
             </div>
           </section>
 

@@ -118,12 +118,14 @@ class Segment:
         display_text: 原始显示文本（保留格式）
         block_path: 在 AST 中的路径（如 "0.children.1"）
         position: 文档内顺序位置
+        metadata: 元数据字典（如 DXF 的 handle, layer, 合并信息等）
     """
     segment_id: str
     source_text: str
     display_text: str
     block_path: str
     position: int
+    metadata: dict = field(default_factory=dict)
 
     @staticmethod
     def generate_id(block_path: str, position: int, content_hash: str) -> str:
@@ -142,6 +144,7 @@ class Segment:
             "display_text": self.display_text,
             "block_path": self.block_path,
             "position": self.position,
+            "metadata": self.metadata,
         }
 
     @classmethod
@@ -153,6 +156,7 @@ class Segment:
             display_text=data["display_text"],
             block_path=data["block_path"],
             position=data["position"],
+            metadata=data.get("metadata", {}),
         )
 
 

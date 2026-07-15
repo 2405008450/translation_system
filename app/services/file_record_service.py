@@ -48,10 +48,14 @@ SEGMENT_ORDERING = (
     Segment.block_index.asc(),
     Segment.row_index.asc().nullsfirst(),
     Segment.cell_index.asc().nullsfirst(),
+    case((Segment.sequence_index >= 0, 0), else_=1).asc(),
+    Segment.sequence_index.asc(),
     Segment.sentence_id.asc(),
 )
 
 PPTX_SEGMENT_ORDERING = (
+    case((Segment.sequence_index >= 0, 0), else_=1).asc(),
+    Segment.sequence_index.asc(),
     Segment.sentence_id.asc(),
     Segment.block_index.asc(),
     Segment.row_index.asc().nullsfirst(),
@@ -214,6 +218,8 @@ def create_file_record_with_segments(
     similarity_threshold: float = 0.6,
     workspace_data: dict | None = None,
     collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
     document_parse_mode: str = DOCUMENT_PARSE_MODE_FULL,
     document_parse_options: dict[str, object] | str | None = None,
 ) -> FileRecord:
@@ -228,6 +234,8 @@ def create_file_record_with_segments(
             filename=filename,
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
+            source_language=source_language,
+            target_language=target_language,
             document_parse_mode=document_parse_mode,
             document_parse_options=document_parse_options,
         )
@@ -316,7 +324,9 @@ def duplicate_file_record(
     db.flush()
 
     source_segments = list_segments_for_file_record(db, source_record.id)
-    for segment in source_segments:
+    for sequence_index, segment in enumerate(source_segments):
+        raw_sequence_index = getattr(segment, "sequence_index", -1)
+        stored_sequence_index = int(raw_sequence_index if raw_sequence_index is not None else -1)
         db.add(
             Segment(
                 file_record_id=duplicate.id,
@@ -343,6 +353,9 @@ def duplicate_file_record(
                 block_index=segment.block_index,
                 row_index=segment.row_index,
                 cell_index=segment.cell_index,
+                sequence_index=(
+                    stored_sequence_index if stored_sequence_index >= 0 else sequence_index
+                ),
             )
         )
 
@@ -381,7 +394,16 @@ def _create_file_record_from_workspace(
     db.flush()
 
     created_segments: list[Segment] = []
-    for seg in workspace_data["segments"]:
+    for sequence_index, seg in enumerate(workspace_data["segments"]):
+        # 序列化 segment_metadata 为 JSON 字符串
+        seg_metadata = seg.get("segment_metadata")
+        if isinstance(seg_metadata, dict):
+            seg_metadata_json = json.dumps(seg_metadata, ensure_ascii=False)
+        elif isinstance(seg_metadata, str):
+            seg_metadata_json = seg_metadata
+        else:
+            seg_metadata_json = "{}"
+        
         segment = Segment(
             file_record_id=file_record.id,
             sentence_id=seg["sentence_id"],
@@ -403,6 +425,8 @@ def _create_file_record_from_workspace(
             block_index=seg["block_index"],
             row_index=seg.get("row_index"),
             cell_index=seg.get("cell_index"),
+            sequence_index=sequence_index,
+            segment_metadata=seg_metadata_json,
         )
         db.add(segment)
         created_segments.append(segment)
@@ -456,6 +480,7 @@ def create_txt_file_record_with_segments(
             source_word_count=count_source_words(result.source_sentence),
             block_type="paragraph",
             block_index=index,
+            sequence_index=index,
         )
         db.add(segment)
         created_segments.append(segment)
@@ -479,6 +504,8 @@ def create_file_record_via_adapter(
     filename: str,
     similarity_threshold: float = 0.6,
     collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
 ) -> FileRecord:
     """通过适配器系统创建文件记录（支持多格式）"""
     from app.services.adapters import get_registry, extract_segments
@@ -491,6 +518,9 @@ def create_file_record_via_adapter(
     segments_data = []
     source_texts = []
     for i, seg in enumerate(result.segments):
+        # 提取 segment metadata（包含 DXF/DWG 空间合并信息）
+        seg_metadata = getattr(seg, 'metadata', {}) or {}
+        
         segments_data.append({
             "sentence_id": seg.segment_id or f"sent-{i + 1:05d}",
             "source_text": seg.source_text,
@@ -503,6 +533,7 @@ def create_file_record_via_adapter(
             "block_index": i,
             "row_index": None,
             "cell_index": None,
+            "segment_metadata": seg_metadata,
         })
         source_texts.append(seg.source_text)
 
@@ -513,6 +544,8 @@ def create_file_record_via_adapter(
             auxiliary_sentences=source_texts,
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
+            source_language=source_language,
+            target_language=target_language,
         )
         for seg_data, match in zip(segments_data, match_results):
             seg_data["status"] = match.status
@@ -668,6 +701,8 @@ def attach_source_document_to_file_record(
         filename=source_filename,
         similarity_threshold=similarity_threshold,
         collection_ids=collection_ids,
+        source_language=file_record.source_language,
+        target_language=file_record.target_language,
         document_parse_mode=document_parse_mode,
         document_parse_options=document_parse_options,
     )
@@ -679,7 +714,16 @@ def attach_source_document_to_file_record(
     file_record.document_statistics = serialize_document_statistics(workspace_data.get("document_statistics"))
 
     created_segments: list[Segment] = []
-    for seg in workspace_data["segments"]:
+    for sequence_index, seg in enumerate(workspace_data["segments"]):
+        # 序列化 segment_metadata 为 JSON 字符串
+        seg_metadata = seg.get("segment_metadata")
+        if isinstance(seg_metadata, dict):
+            seg_metadata_json = json.dumps(seg_metadata, ensure_ascii=False)
+        elif isinstance(seg_metadata, str):
+            seg_metadata_json = seg_metadata
+        else:
+            seg_metadata_json = "{}"
+        
         segment = Segment(
             file_record_id=file_record.id,
             sentence_id=seg["sentence_id"],
@@ -701,6 +745,8 @@ def attach_source_document_to_file_record(
             block_index=seg["block_index"],
             row_index=seg.get("row_index"),
             cell_index=seg.get("cell_index"),
+            sequence_index=sequence_index,
+            segment_metadata=seg_metadata_json,
         )
         db.add(segment)
         created_segments.append(segment)

@@ -97,6 +97,10 @@ const overrides = {
       title: 'Assignment Records',
       description: 'View project and file assignment, authorization, and cancellation records',
     },
+    quoteConverter: {
+      title: 'Quote Converter',
+      description: 'Batch convert quote shape and width across plain text, Office documents, and HTML',
+    },
   },
   shell: {
     mainNav: 'Main navigation',
@@ -112,6 +116,8 @@ const overrides = {
       system: 'System',
       users: 'User Management',
       assignmentEvents: 'Assignment Records',
+      tools: 'Document Tools',
+      quoteConverter: 'Quote Converter',
     },
     recent: {
       title: 'Recent',
@@ -395,8 +401,15 @@ const overrides = {
     },
     uploadLanguage: {
       boundHint: 'This project has a bound language pair. All uploaded files will use it.',
-      unboundHint: 'You can detect the first file source language, then adjust source and target manually.',
+      unboundHint: 'Detect the first file source language, then select one or more target languages.',
       boundMessage: 'Project language pair: {pair}',
+      targetLanguages: 'Target languages (multiple allowed)',
+      targetPlaceholder: 'Select one or more target languages',
+      searchTarget: 'Search by language name or code',
+      noTargetResult: 'No matching target languages.',
+      selectedTargets: '{count} target languages selected',
+      removeTarget: 'Remove target language: {language}',
+      taskEstimate: '{files} files × {languages} target languages; {count} tasks will be created',
     },
     settings: {
       languageLockedHint: 'A project language pair can be bound during creation. After creation it is read-only; unbound projects still set language per file.',
@@ -501,6 +514,12 @@ const overrides = {
       tooManyFiles: 'You can upload at most {max} files at once.',
       fileTooLarge: 'File "{name}" exceeds the size limit ({max} MB).',
       totalTooLarge: 'Total selected file size exceeds the limit ({max} MB).',
+      tooManyGeneratedTasks: '{count} tasks would be created, exceeding the limit of {max}.',
+    },
+    messages: {
+      uploading: 'Uploading and processing... {percent}%',
+      startUpload: 'Upload and process',
+      startUploadCount: 'Upload and create {count} tasks',
     },
   },
   documentParsing: {
@@ -607,6 +626,48 @@ const overrides = {
   language: {
     uiChinese: '中文',
     uiEnglish: 'English',
+  },
+  quoteConverter: {
+    title: 'Quote Converter',
+    description: 'Batch convert quote shape and width across plain text, Office documents, and HTML; DOCX keeps original font mapping.',
+    breadcrumbTools: 'Document Tools',
+    fileSection: 'File',
+    filePlaceholder: 'No file selected',
+    chooseFile: 'Choose file',
+    fileAccept: 'Accepts .txt / .md / .markdown / .srt / .rtf / .docx / .xlsx / .pptx / .html / .htm',
+    scopeSection: 'Scope',
+    targetSection: 'Target',
+    widthLabel: 'Width',
+    shapeLabel: 'Shape',
+    scopeWidth: {
+      all: 'All',
+      half: 'Half-width',
+      full: 'Full-width',
+    },
+    scopeShape: {
+      all: 'All',
+      straight: 'Straight',
+      curly: 'Curly',
+    },
+    targetWidth: {
+      half: 'Half-width',
+      full: 'Full-width',
+    },
+    targetShape: {
+      curly: 'Curly',
+      straight: 'Straight',
+    },
+    convert: 'Convert',
+    converting: 'Converting...',
+    hint: 'Selecting a half-width scope auto-switches the target width to full-width and vice versa. The converted file downloads automatically.',
+    errors: {
+      fileRequired: 'Please choose a file to convert.',
+      unsupported: 'Unsupported file type. Choose txt/md/markdown/srt/rtf/docx/xlsx/pptx/html/htm.',
+      convertFailed: 'Conversion failed. Please try again later.',
+    },
+    messages: {
+      success: 'Converted file ready: {name}',
+    },
   },
 } satisfies LocaleTree
 

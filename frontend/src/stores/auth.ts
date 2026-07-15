@@ -22,6 +22,7 @@ export const useAuthStore = defineStore('auth', () => {
   const isAdmin = computed(() => user.value?.role === 'super_admin' || user.value?.role === 'admin')
   const isInternalTranslator = computed(() => user.value?.role === 'user' && user.value?.translator_type !== 'external')
   const isExternalTranslator = computed(() => user.value?.role === 'user' && user.value?.translator_type === 'external')
+  const isBusinessManager = computed(() => isAdmin.value || isInternalTranslator.value)
 
   function persistToken(nextToken: string | null) {
     token.value = nextToken
@@ -168,6 +169,7 @@ export const useAuthStore = defineStore('auth', () => {
     isAdmin,
     isInternalTranslator,
     isExternalTranslator,
+    isBusinessManager,
     bootstrap,
     checkInitStatus,
     fetchMe,

@@ -11,9 +11,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
-from app.auth import get_current_user, get_user_display_name, require_admin, require_resource_creator
+from app.auth import get_current_user, get_user_display_name, require_resource_creator
 from app.config import get_settings
 from app.database import SessionLocal, get_db
 from app.models import FileRecord, GlossaryBase, GlossaryEntry, User
@@ -185,6 +185,31 @@ def _serialize_glossary_entry(entry: GlossaryEntry) -> dict:
     }
 
 
+def _apply_glossary_entry_sort(query, sort_by: str | None, sort_order: str | None):
+    order = "asc" if sort_order == "asc" else "desc"
+    sort_columns = {
+        "source_text": GlossaryEntry.source_text,
+        "target_text": GlossaryEntry.target_text,
+        "note": GlossaryEntry.note,
+        "created_at": GlossaryEntry.created_at,
+        "updated_at": GlossaryEntry.updated_at,
+    }
+    if sort_by in sort_columns:
+        column = sort_columns[sort_by]
+        return query.order_by(column.asc() if order == "asc" else column.desc(), GlossaryEntry.id.asc())
+    if sort_by == "creator_name":
+        creator = aliased(User)
+        column = func.coalesce(creator.nickname, creator.username, "")
+        query = query.outerjoin(creator, GlossaryEntry.creator_id == creator.id)
+        return query.order_by(column.asc() if order == "asc" else column.desc(), GlossaryEntry.id.asc())
+    if sort_by == "last_modified_by_name":
+        modifier = aliased(User)
+        column = func.coalesce(modifier.nickname, modifier.username, "")
+        query = query.outerjoin(modifier, GlossaryEntry.last_modified_by_id == modifier.id)
+        return query.order_by(column.asc() if order == "asc" else column.desc(), GlossaryEntry.id.asc())
+    return query.order_by(GlossaryEntry.updated_at.desc(), GlossaryEntry.created_at.desc())
+
+
 def _load_bound_glossary_base_ids(file_record: FileRecord) -> list[str]:
     raw_ids = getattr(file_record, "glossary_base_ids", "") or "[]"
     try:
@@ -264,7 +289,7 @@ def update_glossary_base(
     glossary_base_id: UUID,
     payload: GlossaryBasePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_resource_creator),
 ):
     glossary_base = _get_glossary_base_or_404(db, glossary_base_id)
     name = _normalize_glossary_base_name(payload.name)
@@ -307,7 +332,7 @@ def update_glossary_base(
 def delete_glossary_base(
     glossary_base_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_resource_creator),
 ):
     glossary_base = _get_glossary_base_or_404(db, glossary_base_id)
     entry_count = (
@@ -340,7 +365,7 @@ async def preview_glossary_base_xlsx(
     preview_limit: int = Form(default=100),
     skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_resource_creator),
 ):
     extension = f".{(file.filename or '').split('.')[-1].lower()}" if file.filename else ""
     if extension not in XLSX_EXTENSIONS:
@@ -557,7 +582,7 @@ async def import_glossary_base_xlsx(
     target_language: str = Form(...),
     skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_resource_creator),
 ):
     if glossary_base_id is None:
         raise HTTPException(status_code=400, detail="请先选择要导入的词汇表。")
@@ -607,6 +632,8 @@ def list_glossary_entries(
     limit: int = 50,
     search: str | None = None,
     case_sensitive: bool = False,
+    sort_by: str | None = None,
+    sort_order: str | None = "desc",
     db: Session = Depends(get_db),
 ):
     glossary_base = _get_glossary_base_or_404(db, glossary_base_id)
@@ -624,8 +651,7 @@ def list_glossary_entries(
 
     total = query.count()
     rows = (
-        query
-        .order_by(GlossaryEntry.updated_at.desc(), GlossaryEntry.created_at.desc())
+        _apply_glossary_entry_sort(query, sort_by, sort_order)
         .offset(safe_skip)
         .limit(safe_limit)
         .all()
@@ -643,7 +669,7 @@ def create_glossary_entry(
     glossary_base_id: UUID,
     payload: GlossaryEntryPayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_resource_creator),
 ):
     glossary_base = _get_glossary_base_or_404(db, glossary_base_id)
     source_text = normalize_text(payload.source_text)
@@ -689,7 +715,7 @@ def update_glossary_entry(
     entry_id: UUID,
     payload: GlossaryEntryPayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_resource_creator),
 ):
     entry = db.query(GlossaryEntry).filter(GlossaryEntry.id == entry_id).first()
     if entry is None:
@@ -735,7 +761,7 @@ def update_glossary_entry(
 def delete_glossary_entry(
     entry_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_resource_creator),
 ):
     entry = db.query(GlossaryEntry).filter(GlossaryEntry.id == entry_id).first()
     if entry is None:

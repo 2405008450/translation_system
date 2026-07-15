@@ -71,6 +71,7 @@ import {
   type FileExportOption,
 } from '../utils/exportOptions'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
+import { matchesSearchKeyword, normalizeSearchKeyword, splitSearchKeywords } from '../utils/search'
 import type {
   DocumentParseMode,
   DocumentParseOptions,
@@ -95,7 +96,9 @@ import type {
   ProjectTranslationMemorySettingFile,
   ProjectTranslationMemorySettingGroup,
   ProjectTranslationMemorySettingsResponse,
+  TermBase,
   TermQAReport,
+  TMCollection,
   UploadCapabilitiesResponse,
   UploadCapability,
   UploadBatchLimits,
@@ -232,6 +235,7 @@ type AssignmentUserTypeFilter = 'all' | 'internal' | 'external'
 type AssignmentUserStateFilter = 'all' | 'selected' | 'unselected'
 type AssignmentFileStateFilter = 'all' | 'checked' | 'unchecked'
 type ProjectResourceCreateKind = 'tm' | 'term'
+type ProjectResourceLanguageAsset = TMCollection | TermBase
 
 interface PreTranslateProgressState {
   progress: number
@@ -308,6 +312,14 @@ const DEFAULT_DOCUMENT_PARSE_OPTIONS: DocumentParseOptions = {
 }
 
 const DEFAULT_UPLOAD_MAX_SIZE_MB = 100
+const PROJECT_FILE_SORT_KEYS = new Set<string>([
+  'filename',
+  'progress',
+  'pretranslation_progress',
+  'taskManage',
+  'status',
+  'open_issue_count',
+])
 
 const DOCUMENT_STATISTIC_NUMBER_KEYS: DocumentStatisticNumberKey[] = [
   'pages',
@@ -372,6 +384,13 @@ interface LanguageDetectResponse {
 }
 
 type ProjectRow = ProjectFileItem | Record<string, any>
+type ProjectFileSortKey =
+  | 'filename'
+  | 'progress'
+  | 'pretranslation_progress'
+  | 'taskManage'
+  | 'status'
+  | 'open_issue_count'
 type FileExportStatus = 'queued' | 'running' | 'completed' | 'failed'
 interface FileExportTask {
   task_id: string
@@ -404,7 +423,9 @@ const languageDetectMessage = ref('')
 const languageDetectTone = ref<LanguageDetectTone>('info')
 const selectedFiles = ref<File[]>([])
 const uploadSourceLanguage = ref('')
-const uploadTargetLanguage = ref('')
+const uploadTargetLanguages = ref<string[]>([])
+const uploadTargetLanguageSearch = ref('')
+const uploadTargetMenuOpen = ref(false)
 const documentParseMode = ref<DocumentParseMode>('full')
 const documentParseOptions = ref<DocumentParseOptions>({ ...DEFAULT_DOCUMENT_PARSE_OPTIONS })
 const uploadCapabilities = ref<UploadCapability[]>([])
@@ -472,6 +493,8 @@ const fileSelectionRangeStart = ref('1')
 const fileSelectionRangeEnd = ref('1')
 const fileSelectionRangeError = ref('')
 const fileSearchQuery = ref('')
+const fileSortKey = ref<ProjectFileSortKey | ''>('')
+const fileSortOrder = ref<'asc' | 'desc'>('asc')
 const fileStatusFilter = ref('all')
 const fileLanguagePairFilter = ref('all')
 const fileAssigneeFilter = ref('all')
@@ -559,6 +582,44 @@ const projectResourceCreateSubmitText = computed(() => {
   }
   return projectResourceCreateKind.value === 'tm' ? '创建记忆库' : '创建术语库'
 })
+const showProjectResourceLanguageDialog = ref(false)
+const projectResourceLanguageKind = ref<ProjectResourceCreateKind>('tm')
+const projectResourceLanguageTarget = reactive({
+  sourceLanguage: '',
+  targetLanguage: '',
+  pairLabel: '',
+})
+const projectResourceLanguageResources = ref<ProjectResourceLanguageAsset[]>([])
+const projectResourceLanguageSearchQuery = ref('')
+const projectResourceLanguageSelectedId = ref('')
+const projectResourceLanguageLoading = ref(false)
+const projectResourceLanguageSubmitting = ref(false)
+const projectResourceLanguageError = ref('')
+const projectResourceLanguageAssetLabel = computed(() => (
+  projectResourceLanguageKind.value === 'tm' ? '记忆库' : '术语库'
+))
+const projectResourceLanguageEntryLabel = computed(() => (
+  projectResourceLanguageKind.value === 'tm' ? '条记忆条目' : '条术语'
+))
+const projectResourceLanguageTitle = computed(() => (
+  `复制${projectResourceLanguageAssetLabel.value}为当前语言对`
+))
+const projectResourceLanguageDescription = computed(() => (
+  `从已有${projectResourceLanguageAssetLabel.value}复制一个当前项目分组语言对的新库，原库不会被修改。`
+))
+const filteredProjectResourceLanguageResources = computed(() => {
+  const keywords = getResourceSettingsSearchKeywords(projectResourceLanguageSearchQuery.value)
+  if (keywords.length === 0) {
+    return projectResourceLanguageResources.value
+  }
+  return projectResourceLanguageResources.value.filter((resource) => {
+    const searchText = getProjectResourceLanguageSearchText(resource)
+    return keywords.every((keyword) => searchText.includes(keyword))
+  })
+})
+const selectedProjectResourceLanguageResource = computed(() => (
+  projectResourceLanguageResources.value.find((resource) => resource.id === projectResourceLanguageSelectedId.value) ?? null
+))
 const tmImportDialogContext = ref<{
   collectionId: string
   collectionName: string
@@ -574,6 +635,9 @@ const termBaseSettings = ref<ProjectTermBaseSettingsResponse | null>(null)
 const loadingTermBaseSettings = ref(false)
 const savingTermBaseSettings = ref(false)
 const creatingTermBasePair = ref('')
+const pendingTMCollectionTopMoves = new Map<string, Set<string>>()
+const pendingTermBaseTopMoves = new Map<string, Set<string>>()
+let resourceTopMoveTimer: number | null = null
 const termBaseSettingsError = ref('')
 const termBaseSettingsSearchQuery = ref('')
 const termImportDialogContext = ref<{
@@ -896,13 +960,13 @@ const hasFileFilters = computed(() => (
   || fileAssigneeFilter.value !== 'all'
 ))
 const filteredTableRows = computed<ProjectFileItem[]>(() => {
-  const keywords = normalizeFileFilterKeyword(fileSearchQuery.value).split(/\s+/).filter(Boolean)
+  const keywords = splitSearchKeywords(fileSearchQuery.value)
   let rows = [...tableRows.value]
 
   if (keywords.length > 0) {
     rows = rows.filter((file) => {
       const text = getFileSearchText(file)
-      return keywords.every((keyword) => text.includes(keyword))
+      return keywords.every((keyword) => matchesSearchKeyword(text, keyword, { minSubsequenceLength: 3 }))
     })
   }
 
@@ -918,6 +982,10 @@ const filteredTableRows = computed<ProjectFileItem[]>(() => {
     rows = rows.filter((file) => getFileAssigneeIds(file).length === 0)
   } else if (fileAssigneeFilter.value !== 'all') {
     rows = rows.filter((file) => getFileAssigneeIds(file).includes(fileAssigneeFilter.value))
+  }
+
+  if (fileSortKey.value) {
+    rows.sort(compareProjectFileRows)
   }
 
   return rows
@@ -1229,12 +1297,12 @@ const projectExportButtonTitle = computed(() => {
 })
 
 const columns = computed<DataTableColumn[]>(() => ([
-  { key: 'filename', label: t('projectDetail.files.columns.details'), width: '300px' },
-  { key: 'progress', label: t('projectDetail.files.columns.progress'), width: '150px' },
-  { key: 'pretranslation_progress', label: t('projectDetail.files.columns.pretranslationProgress'), width: '150px' },
-  { key: 'taskManage', label: t('projectDetail.files.columns.task'), width: '140px' },
-  { key: 'status', label: t('projectDetail.files.columns.status'), width: '100px' },
-  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '90px' },
+  { key: 'filename', label: t('projectDetail.files.columns.details'), width: '300px', sortable: true },
+  { key: 'progress', label: t('projectDetail.files.columns.progress'), width: '150px', sortable: true },
+  { key: 'pretranslation_progress', label: t('projectDetail.files.columns.pretranslationProgress'), width: '150px', sortable: true },
+  { key: 'taskManage', label: t('projectDetail.files.columns.task'), width: '140px', sortable: true },
+  { key: 'status', label: t('projectDetail.files.columns.status'), width: '100px', sortable: true },
+  { key: 'open_issue_count', label: t('issueMarker.list.title'), width: '90px', sortable: true },
 ]))
 
 const statisticsFileColumns = computed<DataTableColumn[]>(() => ([
@@ -1247,7 +1315,7 @@ const statisticsFileColumns = computed<DataTableColumn[]>(() => ([
 
 const canManageProject = computed(() => Boolean(project.value?.can_manage))
 const canAssignProject = computed(() => Boolean(project.value) && (canManageProject.value || authStore.isInternalTranslator))
-const canCreateProjects = computed(() => authStore.isAdmin || authStore.isInternalTranslator)
+const canCreateProjects = computed(() => authStore.isBusinessManager)
 const canUploadProjectFiles = computed(() => Boolean(project.value) && canCreateProjects.value)
 const canOpenUploadModal = computed(() => canUploadProjectFiles.value)
 const canOpenProjectIssueDialog = computed(() => Boolean(project.value) && !authStore.isExternalTranslator)
@@ -1367,12 +1435,42 @@ const canDetectSourceLanguage = computed(() => (
   && !isProjectLanguagePairBound.value
 ))
 const uploadFileValidationError = computed(() => validateSelectedUploadFiles(selectedFiles.value))
+const effectiveUploadTargetLanguages = computed(() => (
+  projectBoundLanguagePair.value?.target
+    ? [projectBoundLanguagePair.value.target]
+    : uploadTargetLanguages.value
+))
+const generatedUploadTaskCount = computed(() => (
+  selectedFiles.value.length * effectiveUploadTargetLanguages.value.length
+))
+const uploadGenerationValidationError = computed(() => {
+  if (generatedUploadTaskCount.value <= uploadLimits.value.max_expanded_files) {
+    return ''
+  }
+  return t('projectDetail.errors.tooManyGeneratedTasks', {
+    count: generatedUploadTaskCount.value,
+    max: uploadLimits.value.max_expanded_files,
+  })
+})
+const filteredUploadTargetLanguageOptions = computed(() => {
+  const query = normalizeSearchKeyword(uploadTargetLanguageSearch.value)
+  return languageOptions.filter((language) => {
+    if (language.code === uploadSourceLanguage.value) {
+      return false
+    }
+    if (!query) {
+      return true
+    }
+    return normalizeSearchKeyword(`${language.label} ${language.code}`).includes(query)
+  })
+})
 const canSubmitSourceUpload = computed(() => (
   selectedFiles.value.length > 0
   && !uploading.value
   && !uploadFileValidationError.value
+  && !uploadGenerationValidationError.value
   && Boolean(uploadSourceLanguage.value)
-  && Boolean(uploadTargetLanguage.value)
+  && effectiveUploadTargetLanguages.value.length > 0
 ))
 const cameFromTasks = computed(() => route.query.from === 'tasks')
 const backRoute = computed(() => (
@@ -1465,7 +1563,7 @@ function normalizeAssignmentKeyword(value: string | null | undefined) {
 }
 
 function normalizeFileFilterKeyword(value: string | null | undefined) {
-  return String(value || '').trim().toLowerCase()
+  return normalizeSearchKeyword(value)
 }
 
 function getFileLanguagePairKey(row: ProjectRow) {
@@ -1507,18 +1605,77 @@ function getFileAssigneeIds(row: ProjectRow) {
 function getFileSearchText(row: ProjectRow) {
   return [
     row.filename,
-    row.status,
-    row.status ? formatStatus(String(row.status)) : '',
     getFileLanguagePairLabel(row),
     row.source_language,
     row.target_language,
     getLanguageLabel(row.source_language),
     getLanguageLabel(row.target_language),
     getAssigneeLabel(row),
+    ...getFileAssignees(row).flatMap((user) => [
+      user.nickname,
+      user.username,
+      user.translator_type,
+    ]),
+    row.assignee_id,
     row.creator,
-    formatBytes(row.file_size_bytes),
-    formatDateText(row.created_at),
   ].map(normalizeFileFilterKeyword).join(' ')
+}
+
+function isProjectFileSortKey(key: string): key is ProjectFileSortKey {
+  return PROJECT_FILE_SORT_KEYS.has(key)
+}
+
+function getProjectFileNumberSortValue(value: unknown) {
+  const number = Number(value ?? 0)
+  return Number.isFinite(number) ? number : 0
+}
+
+function getProjectFileSortValue(row: ProjectRow, key: ProjectFileSortKey) {
+  switch (key) {
+    case 'filename':
+      return row.filename || ''
+    case 'progress':
+      return getFileDisplayProgress(row)
+    case 'pretranslation_progress':
+      return getFilePretranslationProgress(row)
+    case 'taskManage':
+      return getAssigneeLabel(row)
+    case 'status':
+      return row.status ? formatStatus(String(row.status)) : ''
+    case 'open_issue_count':
+      return getProjectFileNumberSortValue(row.open_issue_count)
+    default:
+      return ''
+  }
+}
+
+function compareProjectFileRows(left: ProjectFileItem, right: ProjectFileItem) {
+  const key = fileSortKey.value
+  if (!key) {
+    return 0
+  }
+
+  const leftValue = getProjectFileSortValue(left, key)
+  const rightValue = getProjectFileSortValue(right, key)
+  const direction = fileSortOrder.value === 'asc' ? 1 : -1
+  if (typeof leftValue === 'number' && typeof rightValue === 'number') {
+    return (leftValue - rightValue) * direction
+  }
+  return String(leftValue ?? '').localeCompare(String(rightValue ?? ''), 'zh-CN', {
+    numeric: true,
+    sensitivity: 'base',
+  }) * direction
+}
+
+function handleFileSort(key: string, order: 'asc' | 'desc') {
+  if (!isProjectFileSortKey(key)) {
+    return
+  }
+  fileSortKey.value = key
+  fileSortOrder.value = order
+  currentPage.value = 1
+  closeFileSelectionMenu()
+  closeActionMenu()
 }
 
 function resetFileFilters() {
@@ -1870,7 +2027,11 @@ function getStatisticsStatusClass(statistics: DocumentStatistics | null | undefi
   if (statistics.source === 'aspose' || statistics.source === 'libreoffice') {
     return 'project-status--success'
   }
-  if (statistics.source === 'openxml_computed' || statistics.source === 'openxml_word_like') {
+  if (
+    statistics.source === 'openxml_computed'
+    || statistics.source === 'openxml_word_like'
+    || statistics.source === 'pptx_word_like'
+  ) {
     return 'project-status--info'
   }
   if (statistics.source === 'docprops_cached') {
@@ -2043,7 +2204,41 @@ function validateSelectedUploadFiles(files: File[]): string {
 function updateSelectedFiles(files: File[]) {
   selectedFiles.value = files
   clearLanguageDetectState()
-  uploadMessage.value = validateSelectedUploadFiles(files)
+  uploadMessage.value = validateSelectedUploadFiles(files) || uploadGenerationValidationError.value
+}
+
+function toggleUploadTargetLanguage(languageCode: string) {
+  if (uploading.value || isProjectLanguagePairBound.value || languageCode === uploadSourceLanguage.value) {
+    return
+  }
+  const selected = uploadTargetLanguages.value.includes(languageCode)
+  uploadTargetLanguages.value = selected
+    ? uploadTargetLanguages.value.filter((code) => code !== languageCode)
+    : [...uploadTargetLanguages.value, languageCode]
+  uploadMessage.value = uploadFileValidationError.value || uploadGenerationValidationError.value
+}
+
+function closeUploadTargetMenu() {
+  uploadTargetMenuOpen.value = false
+  uploadTargetLanguageSearch.value = ''
+}
+
+function toggleUploadTargetMenu() {
+  if (uploading.value || isProjectLanguagePairBound.value) {
+    return
+  }
+  uploadTargetMenuOpen.value = !uploadTargetMenuOpen.value
+  if (!uploadTargetMenuOpen.value) {
+    uploadTargetLanguageSearch.value = ''
+  }
+}
+
+function removeUploadTargetLanguage(languageCode: string) {
+  if (uploading.value || isProjectLanguagePairBound.value) {
+    return
+  }
+  uploadTargetLanguages.value = uploadTargetLanguages.value.filter((code) => code !== languageCode)
+  uploadMessage.value = uploadFileValidationError.value || uploadGenerationValidationError.value
 }
 
 function onFileChange(event: Event) {
@@ -2068,6 +2263,7 @@ function clearSelectedUploadFiles() {
 function resetUploadForm() {
   clearSelectedUploadFiles()
   uploadPercent.value = 0
+  closeUploadTargetMenu()
   documentParseMode.value = 'full'
   documentParseOptions.value = { ...DEFAULT_DOCUMENT_PARSE_OPTIONS }
 }
@@ -2079,7 +2275,9 @@ function openUploadDialog() {
 
   resetUploadForm()
   uploadSourceLanguage.value = projectBoundLanguagePair.value?.source || ''
-  uploadTargetLanguage.value = projectBoundLanguagePair.value?.target || ''
+  uploadTargetLanguages.value = projectBoundLanguagePair.value?.target
+    ? [projectBoundLanguagePair.value.target]
+    : []
   showUploadModal.value = true
 }
 
@@ -2672,10 +2870,11 @@ async function loadActivePretranslationTasks() {
       `/projects/${project.value.id}/pretranslation-tasks/active`,
     )
     const hasRunningProgress = Object.values(preTranslateProgressByFileId.value).some((state) => state.running)
+    const hadActiveTasks = Object.keys(activePretranslationTaskIdByFileId.value).length > 0
     if (!data.tasks.length) {
       clearActivePretranslationPollTimer()
       activePretranslationTaskIdByFileId.value = {}
-      if (hasRunningProgress) {
+      if (hasRunningProgress || hadActiveTasks) {
         preTranslateProgressByFileId.value = {}
         await loadProject()
       }
@@ -2727,13 +2926,23 @@ function getFilePretranslationProgress(row: ProjectRow) {
 
 function getFilePretranslationProgressStatus(row: ProjectRow) {
   const state = preTranslateProgressByFileId.value[String(row.id)]
-  return (state && state.progress < 100) || row.is_edit_locked ? 'processing' : String(row.status || '')
+  return (state?.running && state.progress < 100) ? 'processing' : String(row.status || '')
 }
 
 function getFilePretranslationProgressMessage(row: ProjectRow) {
-  return preTranslateProgressByFileId.value[String(row.id)]?.status
-    || (row.active_operation === 'pre_translate' ? row.active_operation_message : '')
-    || ''
+  const state = preTranslateProgressByFileId.value[String(row.id)]
+  if (state?.running || getActivePretranslationTaskId(row)) {
+    return state?.status || (row.active_operation === 'pre_translate' ? row.active_operation_message : '') || ''
+  }
+  if (state?.progress >= 100) {
+    return state.status || ''
+  }
+  return ''
+}
+
+function canCancelFilePretranslation(row: ProjectRow) {
+  const state = preTranslateProgressByFileId.value[String(row.id)]
+  return Boolean(getActivePretranslationTaskId(row) && state?.running !== false)
 }
 
 function getActivePretranslationTaskId(row: ProjectRow) {
@@ -2939,6 +3148,9 @@ function stopActionMenuEventBubble(ev: MouseEvent) {
 
 function handleDocumentClick(ev: MouseEvent) {
   const target = ev.target as HTMLElement
+  if (!target.closest('.upload-target-select')) {
+    closeUploadTargetMenu()
+  }
   if (!target.closest('.pd-export-dropdown')) {
     showProjectExportMenu.value = false
   }
@@ -2952,6 +3164,7 @@ function handleDocumentClick(ev: MouseEvent) {
 }
 
 function handleDocumentScroll() {
+  closeUploadTargetMenu()
   showProjectExportMenu.value = false
   closeFileSelectionMenu()
   if (openActionMenuId.value) {
@@ -3641,6 +3854,9 @@ function toggleTMCollectionEnabled(
       }
     }
   }
+  if (checked) {
+    scheduleTMCollectionToTop(group, collectionId)
+  }
 }
 
 function toggleTMCollectionWritable(
@@ -3658,6 +3874,9 @@ function toggleTMCollectionWritable(
     } else if (file.collection_id === collectionId) {
       file.collection_id = file.collection_ids.find((id) => id !== collectionId) || null
     }
+  }
+  if (checked) {
+    scheduleTMCollectionToTop(group, collectionId)
   }
 }
 
@@ -3692,6 +3911,14 @@ function toggleFileTMCollection(
   if (checked && !file.collection_id) {
     file.collection_id = collectionId
   }
+  if (checked) {
+    const group = translationMemorySettings.value?.groups.find((item) => (
+      item.files.some((candidate) => candidate.id === file.id)
+    ))
+    if (group) {
+      scheduleTMCollectionToTop(group, collectionId)
+    }
+  }
 }
 
 function setFilePrimaryTMCollection(file: ProjectTranslationMemorySettingFile, event: Event) {
@@ -3724,6 +3951,9 @@ function setTMCollectionBindingForAll(
     if (enabled && !file.collection_id) {
       file.collection_id = collectionId
     }
+  }
+  if (enabled) {
+    scheduleTMCollectionToTop(group, collectionId)
   }
 }
 
@@ -3764,6 +3994,9 @@ function setGroupPrimaryTMCollection(group: ProjectTranslationMemorySettingGroup
     if (collectionId && !file.collection_ids.includes(collectionId)) {
       file.collection_ids = [...file.collection_ids, collectionId]
     }
+  }
+  if (collectionId) {
+    scheduleTMCollectionToTop(group, collectionId)
   }
 }
 
@@ -3842,6 +4075,72 @@ function moveTermBaseRowToTop(group: ProjectTermBaseSettingGroup, termBaseId: st
   normalizeTermBaseQAPriority(group)
 }
 
+function flushPendingResourceTopMoves() {
+  resourceTopMoveTimer = null
+  const tmSettings = translationMemorySettings.value
+  if (tmSettings && pendingTMCollectionTopMoves.size > 0) {
+    const groupByKey = new Map(tmSettings.groups.map((group) => [translationMemorySettingGroupKey(group), group]))
+    for (const [groupKey, collectionIds] of pendingTMCollectionTopMoves) {
+      const group = groupByKey.get(groupKey)
+      if (!group) {
+        continue
+      }
+      for (const collectionId of collectionIds) {
+        moveTMCollectionToTop(group, collectionId)
+      }
+    }
+  }
+
+  const termSettings = termBaseSettings.value
+  if (termSettings && pendingTermBaseTopMoves.size > 0) {
+    const groupByKey = new Map(termSettings.groups.map((group) => [termBaseSettingGroupKey(group), group]))
+    for (const [groupKey, termBaseIds] of pendingTermBaseTopMoves) {
+      const group = groupByKey.get(groupKey)
+      if (!group) {
+        continue
+      }
+      for (const termBaseId of termBaseIds) {
+        moveTermBaseRowToTop(group, termBaseId)
+      }
+    }
+  }
+
+  pendingTMCollectionTopMoves.clear()
+  pendingTermBaseTopMoves.clear()
+}
+
+function scheduleResourceTopMove() {
+  if (resourceTopMoveTimer !== null) {
+    window.clearTimeout(resourceTopMoveTimer)
+  }
+  resourceTopMoveTimer = window.setTimeout(flushPendingResourceTopMoves, 120)
+}
+
+function clearPendingResourceTopMoves() {
+  if (resourceTopMoveTimer !== null) {
+    window.clearTimeout(resourceTopMoveTimer)
+    resourceTopMoveTimer = null
+  }
+  pendingTMCollectionTopMoves.clear()
+  pendingTermBaseTopMoves.clear()
+}
+
+function scheduleTMCollectionToTop(group: ProjectTranslationMemorySettingGroup, collectionId: string) {
+  const groupKey = translationMemorySettingGroupKey(group)
+  const pendingIds = pendingTMCollectionTopMoves.get(groupKey) ?? new Set<string>()
+  pendingIds.add(collectionId)
+  pendingTMCollectionTopMoves.set(groupKey, pendingIds)
+  scheduleResourceTopMove()
+}
+
+function scheduleTermBaseToTop(group: ProjectTermBaseSettingGroup, termBaseId: string) {
+  const groupKey = termBaseSettingGroupKey(group)
+  const pendingIds = pendingTermBaseTopMoves.get(groupKey) ?? new Set<string>()
+  pendingIds.add(termBaseId)
+  pendingTermBaseTopMoves.set(groupKey, pendingIds)
+  scheduleResourceTopMove()
+}
+
 function findProjectResourceCreateTMGroup() {
   return translationMemorySettings.value?.groups.find((group) => (
     translationMemorySettingGroupKey(group) === projectResourceCreateGroupKey.value
@@ -3881,6 +4180,172 @@ function closeProjectResourceCreateDialog() {
   }
   showProjectResourceCreateDialog.value = false
   projectResourceCreateError.value = ''
+}
+
+function getProjectResourceLanguageSearchText(resource: ProjectResourceLanguageAsset) {
+  return [
+    resource.name,
+    resource.description,
+    resource.entry_count,
+    formatLanguagePair(resource.source_language, resource.target_language),
+    getLanguageLabel(resource.source_language),
+    getLanguageLabel(resource.target_language),
+    isProjectResourceLanguageTargetMatch(resource) ? '当前语言对 已匹配 matched' : '可复制 language pair mismatch',
+  ].map(normalizeResourceSettingsSearchText).join(' ')
+}
+
+function isProjectResourceLanguageTargetMatch(resource: ProjectResourceLanguageAsset) {
+  return resource.source_language === projectResourceLanguageTarget.sourceLanguage
+    && resource.target_language === projectResourceLanguageTarget.targetLanguage
+}
+
+function getProjectResourceLanguageEndpoint(resourceId: string) {
+  return projectResourceLanguageKind.value === 'tm'
+    ? `/translation-memory/collections/${resourceId}/copy-language-pair`
+    : `/term-bases/${resourceId}/copy-language-pair`
+}
+
+function buildProjectResourceLanguageCopyName(resource: ProjectResourceLanguageAsset) {
+  return `${resource.name} ${projectResourceLanguageTarget.pairLabel}`
+}
+
+function findProjectResourceLanguageTMGroup() {
+  return translationMemorySettings.value?.groups.find((group) => (
+    group.source_language === projectResourceLanguageTarget.sourceLanguage
+    && group.target_language === projectResourceLanguageTarget.targetLanguage
+  )) ?? null
+}
+
+function findProjectResourceLanguageTermGroup() {
+  return termBaseSettings.value?.groups.find((group) => (
+    group.source_language === projectResourceLanguageTarget.sourceLanguage
+    && group.target_language === projectResourceLanguageTarget.targetLanguage
+  )) ?? null
+}
+
+async function loadProjectResourceLanguageResources() {
+  projectResourceLanguageLoading.value = true
+  projectResourceLanguageError.value = ''
+  try {
+    const endpoint = projectResourceLanguageKind.value === 'tm'
+      ? '/translation-memory/collections'
+      : '/term-bases'
+    const { data } = await http.get<ProjectResourceLanguageAsset[]>(endpoint)
+    projectResourceLanguageResources.value = data
+    const selectedStillExists = data.some((resource) => resource.id === projectResourceLanguageSelectedId.value)
+    if (!selectedStillExists) {
+      projectResourceLanguageSelectedId.value = data.find((resource) => !isProjectResourceLanguageTargetMatch(resource))?.id
+        ?? ''
+    }
+  } catch (error) {
+    projectResourceLanguageResources.value = []
+    projectResourceLanguageSelectedId.value = ''
+    projectResourceLanguageError.value = getErrorMessage(error, `${projectResourceLanguageAssetLabel.value}列表加载失败。`)
+  } finally {
+    projectResourceLanguageLoading.value = false
+  }
+}
+
+function openProjectResourceLanguageDialog(
+  kind: ProjectResourceCreateKind,
+  group: ProjectTranslationMemorySettingGroup | ProjectTermBaseSettingGroup,
+) {
+  if (projectResourceLanguageSubmitting.value) {
+    return
+  }
+  projectResourceLanguageKind.value = kind
+  projectResourceLanguageTarget.sourceLanguage = group.source_language
+  projectResourceLanguageTarget.targetLanguage = group.target_language
+  projectResourceLanguageTarget.pairLabel = formatLanguagePair(group.source_language, group.target_language)
+  projectResourceLanguageSearchQuery.value = ''
+  projectResourceLanguageSelectedId.value = ''
+  projectResourceLanguageError.value = ''
+  showProjectResourceLanguageDialog.value = true
+  void loadProjectResourceLanguageResources()
+}
+
+function closeProjectResourceLanguageDialog() {
+  if (projectResourceLanguageSubmitting.value || projectResourceLanguageLoading.value) {
+    return
+  }
+  showProjectResourceLanguageDialog.value = false
+  projectResourceLanguageError.value = ''
+}
+
+async function submitProjectResourceLanguageDialog() {
+  const resource = selectedProjectResourceLanguageResource.value
+  if (!resource) {
+    projectResourceLanguageError.value = `请先选择要复制的${projectResourceLanguageAssetLabel.value}。`
+    return
+  }
+  if (isProjectResourceLanguageTargetMatch(resource)) {
+    projectResourceLanguageError.value = `该${projectResourceLanguageAssetLabel.value}已经是当前分组语言对，可直接在列表中启用。`
+    return
+  }
+  if (!projectResourceLanguageTarget.sourceLanguage || !projectResourceLanguageTarget.targetLanguage) {
+    projectResourceLanguageError.value = '当前项目分组缺少语言对，无法复制。'
+    return
+  }
+
+  const accepted = await confirm({
+    title: projectResourceLanguageTitle.value,
+    message: `将从“${resource.name}”复制一个 ${projectResourceLanguageTarget.pairLabel} 的新${projectResourceLanguageAssetLabel.value}，并复制其中 ${resource.entry_count} ${projectResourceLanguageEntryLabel.value}。原库仍保留 ${formatLanguagePair(resource.source_language, resource.target_language)}，不会影响其它项目。`,
+    confirmText: '复制并启用',
+  })
+  if (!accepted) {
+    return
+  }
+
+  projectResourceLanguageSubmitting.value = true
+  projectResourceLanguageError.value = ''
+  try {
+    const { data } = await http.post<ProjectResourceLanguageAsset>(getProjectResourceLanguageEndpoint(resource.id), {
+      name: buildProjectResourceLanguageCopyName(resource),
+      description: resource.description || null,
+      source_language: projectResourceLanguageTarget.sourceLanguage,
+      target_language: projectResourceLanguageTarget.targetLanguage,
+    })
+    if (projectResourceLanguageKind.value === 'tm') {
+      await loadProjectTranslationMemorySettings()
+      const nextGroup = findProjectResourceLanguageTMGroup()
+      if (nextGroup?.collections.some((collection) => collection.id === data.id)) {
+        for (const file of nextGroup.files) {
+          if (!file.collection_ids.includes(data.id)) {
+            file.collection_ids = [...file.collection_ids, data.id]
+          }
+          if (!file.collection_id) {
+            file.collection_id = data.id
+          }
+        }
+        moveTMCollectionToTop(nextGroup, data.id)
+        tmSettingsSearchQuery.value = ''
+        await saveProjectTranslationMemorySettings(false)
+      }
+    } else {
+      await loadProjectTermBaseSettings()
+      const nextGroup = findProjectResourceLanguageTermGroup()
+      const createdRow = nextGroup?.term_bases.find((row) => row.id === data.id)
+      if (nextGroup && createdRow) {
+        createdRow.enabled = true
+        createdRow.writable = true
+        createdRow.qa = false
+        moveTermBaseRowToTop(nextGroup, data.id)
+        termBaseSettingsSearchQuery.value = ''
+        await saveProjectTermBaseSettings(false)
+      }
+    }
+    toast.success(`已复制并启用${projectResourceLanguageAssetLabel.value}：${data.name || resource.name}`)
+    showProjectResourceLanguageDialog.value = false
+  } catch (error) {
+    projectResourceLanguageError.value = getErrorMessage(error, `${projectResourceLanguageAssetLabel.value}复制失败。`)
+    toast.show({
+      tone: 'error',
+      title: `${projectResourceLanguageAssetLabel.value}复制失败`,
+      message: projectResourceLanguageError.value,
+    })
+  } finally {
+    projectResourceLanguageSubmitting.value = false
+  }
 }
 
 function createTranslationMemoryForGroup(group: ProjectTranslationMemorySettingGroup) {
@@ -4154,6 +4619,9 @@ function toggleTermBaseSetting(
     row.enabled = true
   }
   normalizeTermBaseQAPriority(group)
+  if (checked) {
+    scheduleTermBaseToTop(group, row.id)
+  }
 }
 
 function moveTermBaseQAPriority(
@@ -4434,10 +4902,10 @@ async function detectSourceLanguage() {
     )
 
     if (data.language) {
-      const matchesTargetLanguage = uploadTargetLanguage.value === data.language
+      const matchesTargetLanguage = uploadTargetLanguages.value.includes(data.language)
       uploadSourceLanguage.value = data.language
       if (matchesTargetLanguage) {
-        uploadTargetLanguage.value = ''
+        uploadTargetLanguages.value = uploadTargetLanguages.value.filter((code) => code !== data.language)
       }
       languageDetectTone.value = 'success'
       const confidence = data.confidence > 0 ? `，置信度 ${Math.round(data.confidence * 100)}%` : ''
@@ -4467,18 +4935,20 @@ async function uploadSourceDocument() {
   }
 
   const resolvedSourceLanguage = projectBoundLanguagePair.value?.source || uploadSourceLanguage.value
-  const resolvedTargetLanguage = projectBoundLanguagePair.value?.target || uploadTargetLanguage.value
+  const resolvedTargetLanguages = projectBoundLanguagePair.value?.target
+    ? [projectBoundLanguagePair.value.target]
+    : uploadTargetLanguages.value
   if (isProjectLanguagePairBound.value) {
     uploadSourceLanguage.value = resolvedSourceLanguage
-    uploadTargetLanguage.value = resolvedTargetLanguage
+    uploadTargetLanguages.value = [...resolvedTargetLanguages]
   }
 
-  if (!resolvedSourceLanguage || !resolvedTargetLanguage) {
+  if (!resolvedSourceLanguage || resolvedTargetLanguages.length === 0) {
     uploadMessage.value = t('projectDetail.errors.selectLanguagePair')
     return
   }
 
-  if (resolvedSourceLanguage === resolvedTargetLanguage) {
+  if (resolvedTargetLanguages.includes(resolvedSourceLanguage)) {
     uploadMessage.value = t('projectList.errors.sameLanguage')
     return
   }
@@ -4486,6 +4956,11 @@ async function uploadSourceDocument() {
   const validationError = validateSelectedUploadFiles(selectedFiles.value)
   if (validationError) {
     uploadMessage.value = validationError
+    return
+  }
+
+  if (uploadGenerationValidationError.value) {
+    uploadMessage.value = uploadGenerationValidationError.value
     return
   }
 
@@ -4501,7 +4976,9 @@ async function uploadSourceDocument() {
     })
     formData.append('threshold', '0.6')
     formData.append('source_language', resolvedSourceLanguage)
-    formData.append('target_language', resolvedTargetLanguage)
+    resolvedTargetLanguages.forEach((language) => {
+      formData.append('target_languages', language)
+    })
     formData.append('document_parse_mode', documentParseMode.value)
     formData.append('document_parse_options', JSON.stringify(documentParseOptions.value))
 
@@ -4920,6 +5397,16 @@ onMounted(() => {
   void loadUploadCapabilities()
 })
 
+watch(uploadSourceLanguage, (sourceLanguage) => {
+  if (isProjectLanguagePairBound.value || !sourceLanguage) {
+    return
+  }
+  if (uploadTargetLanguages.value.includes(sourceLanguage)) {
+    uploadTargetLanguages.value = uploadTargetLanguages.value.filter((code) => code !== sourceLanguage)
+    uploadMessage.value = uploadFileValidationError.value || uploadGenerationValidationError.value
+  }
+})
+
 watch(() => route.hash, () => {
   syncProjectSettingsHash()
 })
@@ -4958,6 +5445,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', handleDocumentScroll)
   clearExportPollTimer()
   clearActivePretranslationPollTimer()
+  clearPendingResourceTopMoves()
 })
 
 </script>
@@ -5035,20 +5523,19 @@ onBeforeUnmount(() => {
                   v-for="lang in languageOptions"
                   :key="lang.code"
                   :value="lang.code"
-                  :disabled="lang.code === uploadTargetLanguage"
                 >
                   {{ lang.label }}
                 </option>
               </select>
             </label>
 
-            <label class="field">
+            <label v-if="isProjectLanguagePairBound" class="field">
               <span class="field__label">{{ t('projectList.form.targetLanguage') }} <span class="field__required">*</span></span>
               <select
-                v-model="uploadTargetLanguage"
+                :value="effectiveUploadTargetLanguages[0] || ''"
                 class="field__control"
                 data-testid="project-upload-target-language"
-                :disabled="isProjectLanguagePairBound || uploading"
+                disabled
               >
                 <option value="" disabled>{{ t('projectList.form.targetPlaceholder') }}</option>
                 <option
@@ -5061,6 +5548,95 @@ onBeforeUnmount(() => {
                 </option>
               </select>
             </label>
+
+            <div v-else class="field upload-target-field">
+              <span class="field__label">
+                {{ t('projectDetail.uploadLanguage.targetLanguages') }}
+                <span class="field__required">*</span>
+              </span>
+              <div
+                class="upload-target-select"
+                :class="{ 'is-open': uploadTargetMenuOpen }"
+                data-testid="project-upload-target-languages"
+              >
+                <button
+                  class="upload-target-select__trigger"
+                  data-testid="project-upload-target-trigger"
+                  type="button"
+                  :disabled="uploading"
+                  :aria-expanded="uploadTargetMenuOpen"
+                  @click.stop="toggleUploadTargetMenu"
+                >
+                  <span v-if="uploadTargetLanguages.length === 0" class="upload-target-select__placeholder">
+                    {{ t('projectDetail.uploadLanguage.targetPlaceholder') }}
+                  </span>
+                  <span v-else class="upload-target-select__value">
+                    {{ t('projectDetail.uploadLanguage.selectedTargets', { count: uploadTargetLanguages.length }) }}
+                  </span>
+                  <ChevronDown :size="16" :class="{ 'is-rotated': uploadTargetMenuOpen }" />
+                </button>
+
+                <div
+                  v-if="uploadTargetMenuOpen"
+                  class="upload-target-select__popover"
+                  @click.stop
+                  @keydown.esc="closeUploadTargetMenu"
+                >
+                  <label class="upload-target-select__search">
+                    <Search :size="14" />
+                    <input
+                      v-model="uploadTargetLanguageSearch"
+                      data-testid="project-upload-target-search"
+                      type="search"
+                      :placeholder="t('projectDetail.uploadLanguage.searchTarget')"
+                      :disabled="uploading"
+                    />
+                  </label>
+                  <div class="upload-target-select__options">
+                    <label
+                      v-for="lang in filteredUploadTargetLanguageOptions"
+                      :key="lang.code"
+                      class="upload-target-option"
+                      :class="{ 'is-selected': uploadTargetLanguages.includes(lang.code) }"
+                    >
+                      <input
+                        type="checkbox"
+                        :data-testid="`project-upload-target-${lang.code}`"
+                        :checked="uploadTargetLanguages.includes(lang.code)"
+                        :disabled="uploading"
+                        @change="toggleUploadTargetLanguage(lang.code)"
+                      />
+                      <span>{{ lang.label }}</span>
+                      <small>{{ lang.code }}</small>
+                    </label>
+                    <p v-if="filteredUploadTargetLanguageOptions.length === 0" class="upload-target-select__empty">
+                      {{ t('projectDetail.uploadLanguage.noTargetResult') }}
+                    </p>
+                  </div>
+                  <div class="upload-target-select__footer">
+                    <span>{{ t('projectDetail.uploadLanguage.selectedTargets', { count: uploadTargetLanguages.length }) }}</span>
+                    <button class="button button--primary" type="button" @click="closeUploadTargetMenu">
+                      {{ t('common.actions.confirm') }}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div v-if="uploadTargetLanguages.length" class="upload-target-select__chips">
+                <button
+                  v-for="languageCode in uploadTargetLanguages"
+                  :key="languageCode"
+                  class="upload-target-chip"
+                  type="button"
+                  :disabled="uploading"
+                  :aria-label="t('projectDetail.uploadLanguage.removeTarget', { language: getLanguageLabel(languageCode) })"
+                  @click="removeUploadTargetLanguage(languageCode)"
+                >
+                  <span>{{ getLanguageLabel(languageCode) }}</span>
+                  <X :size="12" />
+                </button>
+              </div>
+            </div>
           </div>
 
           <p v-if="isProjectLanguagePairBound" class="upload-bound-language">
@@ -5073,6 +5649,20 @@ onBeforeUnmount(() => {
             :class="`upload-detect-message--${languageDetectTone}`"
           >
             {{ languageDetectMessage }}
+          </p>
+
+          <p
+            v-if="selectedFiles.length && effectiveUploadTargetLanguages.length"
+            class="upload-task-estimate"
+            :class="{ 'is-error': Boolean(uploadGenerationValidationError) }"
+            data-testid="project-upload-task-estimate"
+          >
+            {{ t('projectDetail.uploadLanguage.taskEstimate', {
+              files: selectedFiles.length,
+              languages: effectiveUploadTargetLanguages.length,
+              count: generatedUploadTaskCount,
+            }) }}
+            <span v-if="uploadGenerationValidationError">{{ uploadGenerationValidationError }}</span>
           </p>
 
           <div v-if="selectedFiles.length" class="upload-file-list-wrap">
@@ -5129,7 +5719,9 @@ onBeforeUnmount(() => {
             >
               <Loader2 v-if="uploading" class="lucide-spin" :size="14" />
               <Upload v-else :size="14" />
-              {{ uploading ? t('projectDetail.messages.uploading', { percent: uploadPercent }) : t('projectDetail.messages.startUpload') }}
+              {{ uploading
+                ? t('projectDetail.messages.uploading', { percent: uploadPercent })
+                : t('projectDetail.messages.startUploadCount', { count: generatedUploadTaskCount }) }}
             </button>
           </div>
         </section>
@@ -5603,6 +6195,17 @@ onBeforeUnmount(() => {
                           <Plus v-else :size="14" />
                           新建
                         </button>
+                        <button
+                          class="button term-settings__create"
+                          type="button"
+                          :disabled="projectResourceLanguageLoading || projectResourceLanguageSubmitting"
+                          :title="`复制已有记忆库为 ${getTranslationMemorySettingPairLabel(group)}`"
+                          :aria-label="`复制已有记忆库为 ${getTranslationMemorySettingPairLabel(group)}`"
+                          @click="openProjectResourceLanguageDialog('tm', group)"
+                        >
+                          <Settings2 :size="14" />
+                          复制语言对
+                        </button>
                       </div>
                     </div>
 
@@ -5857,6 +6460,17 @@ onBeforeUnmount(() => {
                         <Loader2 v-if="creatingTermBasePair === termBaseSettingGroupKey(group)" class="lucide-spin" :size="14" />
                         <Plus v-else :size="14" />
                         新建
+                      </button>
+                      <button
+                        class="button term-settings__create"
+                        type="button"
+                        :disabled="projectResourceLanguageLoading || projectResourceLanguageSubmitting"
+                        :title="`复制已有术语库为 ${getTermBaseSettingPairLabel(group)}`"
+                        :aria-label="`复制已有术语库为 ${getTermBaseSettingPairLabel(group)}`"
+                        @click="openProjectResourceLanguageDialog('term', group)"
+                      >
+                        <Settings2 :size="14" />
+                        复制语言对
                       </button>
                     </div>
 
@@ -6859,9 +7473,12 @@ onBeforeUnmount(() => {
           :loading="loading"
           :selectable="true"
           :selected-ids="selectedFileIds"
+          :sort-key="fileSortKey"
+          :sort-order="fileSortOrder"
           :show-index="true"
           :index-offset="indexOffset"
           :empty-text="fileTableEmptyText"
+          @sort="handleFileSort"
           @select="selectedFileIds = $event"
         >
           <template #filename="{ row }">
@@ -6917,7 +7534,7 @@ onBeforeUnmount(() => {
                 {{ getFilePretranslationProgressMessage(row) }}
               </span>
               <button
-                v-if="getActivePretranslationTaskId(row)"
+                v-if="canCancelFilePretranslation(row)"
                 class="pd-file-progress__cancel"
                 type="button"
                 :disabled="isFilePretranslationCanceling(row)"
@@ -7486,6 +8103,100 @@ onBeforeUnmount(() => {
     </Modal>
 
     <Modal
+      :open="showProjectResourceLanguageDialog"
+      :title="projectResourceLanguageTitle"
+      :description="projectResourceLanguageDescription"
+      width="min(720px, calc(100vw - 32px))"
+      :close-on-overlay="!projectResourceLanguageSubmitting && !projectResourceLanguageLoading"
+      :close-on-esc="!projectResourceLanguageSubmitting && !projectResourceLanguageLoading"
+      @close="closeProjectResourceLanguageDialog"
+    >
+      <div class="project-resource-language-dialog">
+        <div class="project-resource-language-target">
+          <span>新库语言对</span>
+          <strong>{{ projectResourceLanguageTarget.pairLabel }}</strong>
+        </div>
+
+        <label class="resource-settings-search__field project-resource-language-search">
+          <Search :size="14" />
+          <input
+            v-model="projectResourceLanguageSearchQuery"
+            type="search"
+            :placeholder="`搜索${projectResourceLanguageAssetLabel}名称、说明或语言对`"
+            :disabled="projectResourceLanguageLoading || projectResourceLanguageSubmitting"
+          >
+        </label>
+
+        <StateView
+          v-if="projectResourceLanguageLoading"
+          kind="loading"
+          :title="`正在加载${projectResourceLanguageAssetLabel}`"
+          message="正在读取语言资产列表。"
+        />
+        <div v-else-if="projectResourceLanguageResources.length === 0" class="empty-state">
+          当前还没有可复制的{{ projectResourceLanguageAssetLabel }}。
+        </div>
+        <div v-else class="project-resource-language-list">
+          <label
+            v-for="resource in filteredProjectResourceLanguageResources"
+            :key="resource.id"
+            class="project-resource-language-item"
+            :class="{
+              'is-selected': projectResourceLanguageSelectedId === resource.id,
+              'is-current': isProjectResourceLanguageTargetMatch(resource),
+            }"
+          >
+            <input
+              v-model="projectResourceLanguageSelectedId"
+              type="radio"
+              name="project-resource-language-resource"
+              :value="resource.id"
+              :disabled="projectResourceLanguageSubmitting || isProjectResourceLanguageTargetMatch(resource)"
+            >
+            <span class="project-resource-language-item__body">
+              <strong>{{ resource.name }}</strong>
+              <span>{{ resource.description || '无说明' }}</span>
+            </span>
+            <span class="project-resource-language-item__meta">
+              <small>{{ formatLanguagePair(resource.source_language, resource.target_language) }}</small>
+              <small>{{ resource.entry_count }} {{ projectResourceLanguageEntryLabel }}</small>
+            </span>
+            <span v-if="isProjectResourceLanguageTargetMatch(resource)" class="tag">已匹配</span>
+          </label>
+          <div v-if="filteredProjectResourceLanguageResources.length === 0" class="empty-state">
+            没有符合搜索条件的{{ projectResourceLanguageAssetLabel }}。
+          </div>
+        </div>
+
+        <p class="hint-text">
+          选择一个已有{{ projectResourceLanguageAssetLabel }}后复制，系统会创建新库并把新库条目的语言对写为当前项目分组，原库保持不变。
+        </p>
+        <p v-if="projectResourceLanguageError" class="form-message is-error">{{ projectResourceLanguageError }}</p>
+      </div>
+
+      <template #footer>
+        <button
+          class="button"
+          type="button"
+          :disabled="projectResourceLanguageSubmitting || projectResourceLanguageLoading"
+          @click="closeProjectResourceLanguageDialog"
+        >
+          取消
+        </button>
+        <button
+          class="button button--primary"
+          type="button"
+          :disabled="projectResourceLanguageSubmitting || projectResourceLanguageLoading || !projectResourceLanguageSelectedId"
+          @click="submitProjectResourceLanguageDialog"
+        >
+          <Loader2 v-if="projectResourceLanguageSubmitting" class="lucide-spin" :size="14" />
+          <Settings2 v-else :size="14" />
+          {{ projectResourceLanguageSubmitting ? '复制中...' : '复制并启用' }}
+        </button>
+      </template>
+    </Modal>
+
+    <Modal
       :open="showAssignmentDialog"
       title="分配任务"
       width="min(980px, calc(100vw - 32px))"
@@ -7933,13 +8644,14 @@ onBeforeUnmount(() => {
 }
 
 .upload-language-panel {
-  width: min(720px, 100%);
+  width: min(760px, 100%);
   display: grid;
-  gap: 14px;
-  padding: 16px;
+  gap: 16px;
+  padding: 18px;
   border: 1px solid var(--line-soft);
-  border-radius: 8px;
+  border-radius: 10px;
   background: var(--surface-panel);
+  box-shadow: 0 6px 18px rgba(27, 55, 48, 0.04);
 }
 
 .upload-language-panel__head {
@@ -7962,7 +8674,240 @@ onBeforeUnmount(() => {
 .upload-language-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
   gap: 14px;
+}
+
+.upload-language-grid > .field {
+  align-content: start;
+  align-self: start;
+  min-width: 0;
+}
+
+.upload-language-grid .field__control {
+  align-self: start;
+  height: 42px;
+}
+
+.upload-target-field {
+  min-width: 0;
+}
+
+.upload-target-select {
+  position: relative;
+  min-width: 0;
+}
+
+.upload-target-select__trigger {
+  width: 100%;
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--control-bg);
+  color: var(--text-primary);
+  text-align: left;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.upload-target-select__trigger:hover:not(:disabled),
+.upload-target-select.is-open .upload-target-select__trigger {
+  border-color: var(--brand-700);
+  background: var(--surface-panel);
+}
+
+.upload-target-select.is-open .upload-target-select__trigger {
+  box-shadow: var(--focus-ring);
+}
+
+.upload-target-select__trigger svg {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  transition: transform 0.16s ease;
+}
+
+.upload-target-select__trigger svg.is-rotated {
+  transform: rotate(180deg);
+}
+
+.upload-target-select__value {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-target-select__popover {
+  position: absolute;
+  z-index: 80;
+  top: calc(100% + 7px);
+  left: 0;
+  width: 100%;
+  min-width: 300px;
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  box-shadow: 0 16px 36px rgba(20, 45, 39, 0.18);
+}
+
+.upload-target-select__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 26px;
+  max-height: 64px;
+  overflow-y: auto;
+}
+
+.upload-target-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  min-height: 26px;
+  padding: 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--state-info) 28%, var(--line-soft));
+  border-radius: 999px;
+  background: var(--state-info-bg);
+  color: var(--state-info);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.upload-target-chip:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.upload-target-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-target-select__placeholder {
+  overflow: hidden;
+  color: var(--text-tertiary, #8a9491);
+  font-size: 13px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-target-select__search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 32px;
+  padding: 0 9px;
+  border: 1px solid var(--line-soft);
+  border-radius: 5px;
+  color: var(--text-secondary);
+  background: var(--surface-panel);
+}
+
+.upload-target-select__search input {
+  min-width: 0;
+  width: 100%;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+}
+
+.upload-target-select__options {
+  display: grid;
+  max-height: 230px;
+  overflow-y: auto;
+  padding: 2px 0;
+}
+
+.upload-target-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 5px 7px;
+  border-radius: 5px;
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.upload-target-option:hover {
+  background: var(--surface-hover, #f3f7f6);
+}
+
+.upload-target-option.is-selected {
+  background: color-mix(in srgb, var(--state-info-bg) 78%, transparent);
+  color: var(--brand-800, var(--brand-700));
+}
+
+.upload-target-option input {
+  margin: 0;
+  accent-color: var(--brand-700);
+}
+
+.upload-target-option small {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.upload-target-select__empty {
+  margin: 0;
+  padding: 12px 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-align: center;
+}
+
+.upload-target-select__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 9px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.upload-target-select__footer .button {
+  min-height: 30px;
+  padding: 5px 12px;
+  font-size: 12px;
+}
+
+.upload-task-estimate {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin: -2px 0 0;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--state-info) 25%, transparent);
+  border-radius: 6px;
+  background: var(--state-info-bg);
+  color: var(--state-info);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.upload-task-estimate.is-error {
+  border-color: color-mix(in srgb, var(--state-danger, #dc2626) 30%, transparent);
+  background: var(--state-danger-bg, #fef2f2);
+  color: var(--state-danger, #dc2626);
 }
 
 .upload-bound-language {
@@ -8074,6 +9019,8 @@ onBeforeUnmount(() => {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line-soft);
 }
 
 .doc-settings {
@@ -10981,6 +11928,111 @@ onBeforeUnmount(() => {
   color: var(--brand-700);
 }
 
+.project-resource-language-dialog {
+  display: grid;
+  gap: 12px;
+}
+
+.project-resource-language-target {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--brand-050) 62%, var(--surface-panel));
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.project-resource-language-target strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--brand-700);
+  font-weight: 700;
+}
+
+.project-resource-language-search {
+  flex-basis: 100%;
+  min-width: 0;
+}
+
+.project-resource-language-list {
+  display: grid;
+  gap: 8px;
+  max-height: 360px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.project-resource-language-item {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) minmax(150px, auto) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 58px;
+  padding: 9px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  cursor: pointer;
+  transition:
+    border-color var(--motion-base) var(--ease-standard),
+    background var(--motion-base) var(--ease-standard);
+}
+
+.project-resource-language-item:hover {
+  border-color: color-mix(in srgb, var(--brand-700) 28%, var(--line-soft));
+  background: color-mix(in srgb, var(--brand-050) 42%, var(--surface-panel));
+}
+
+.project-resource-language-item.is-selected {
+  border-color: color-mix(in srgb, var(--brand-700) 48%, var(--line-soft));
+  background: var(--brand-050);
+}
+
+.project-resource-language-item.is-current {
+  cursor: not-allowed;
+  opacity: 0.72;
+}
+
+.project-resource-language-item input {
+  width: 16px;
+  height: 16px;
+}
+
+.project-resource-language-item__body {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.project-resource-language-item__body strong,
+.project-resource-language-item__body span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-resource-language-item__body strong {
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.project-resource-language-item__body span,
+.project-resource-language-item__meta small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.project-resource-language-item__meta {
+  display: grid;
+  justify-items: end;
+  gap: 2px;
+  white-space: nowrap;
+}
+
 .tm-settings__bulk {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(190px, 260px);
@@ -11951,6 +13003,10 @@ onBeforeUnmount(() => {
   .upload-language-grid,
   .doc-settings__grid {
     grid-template-columns: 1fr;
+  }
+
+  .upload-target-select__popover {
+    min-width: 0;
   }
 
   .pd-settings-list,

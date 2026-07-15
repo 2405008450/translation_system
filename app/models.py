@@ -928,6 +928,15 @@ class Segment(Base):
             "cell_index",
             "sentence_id",
         ),
+        Index(
+            "ix_segments_file_record_sequence_order",
+            "file_record_id",
+            "block_index",
+            "row_index",
+            "cell_index",
+            "sequence_index",
+            "sentence_id",
+        ),
         Index("ix_segments_file_record_status", "file_record_id", "status"),
         Index("ix_segments_file_record_source", "file_record_id", "source"),
         Index("ix_segments_last_modified_by_id", "last_modified_by_id"),
@@ -970,7 +979,7 @@ class Segment(Base):
         ForeignKey("project_workflow_steps.id", ondelete="SET NULL"),
         nullable=True,
     )
-    sentence_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    sentence_id: Mapped[str] = mapped_column(String(100), nullable=False)
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
     source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     display_text: Mapped[str] = mapped_column(Text, nullable=False)
@@ -1014,6 +1023,20 @@ class Segment(Base):
     block_index: Mapped[int] = mapped_column(nullable=False, default=0)
     row_index: Mapped[int | None] = mapped_column(nullable=True)
     cell_index: Mapped[int | None] = mapped_column(nullable=True)
+    # 句段在源文件中的权威顺序。sentence_id 仅用于身份标识，不能再参与位置推断。
+    # -1 表示迁移前的历史数据，导出时继续使用源文档对齐兜底。
+    sequence_index: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=-1,
+        server_default=text("-1"),
+    )
+    segment_metadata: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="{}",
+        server_default=text("'{}'"),
+    )
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -1142,7 +1165,7 @@ class TermQAReportItem(Base):
         ForeignKey("term_bases.id", ondelete="SET NULL"),
         nullable=True,
     )
-    sentence_id: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+    sentence_id: Mapped[str] = mapped_column(String(100), nullable=False, default="")
     file_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     term_base_name: Mapped[str] = mapped_column(String(200), nullable=False, default="")
     source_term: Mapped[str] = mapped_column(Text, nullable=False)
@@ -1260,7 +1283,7 @@ class NumberCheckReportItem(Base):
         ForeignKey("segments.id", ondelete="SET NULL"),
         nullable=True,
     )
-    sentence_id: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+    sentence_id: Mapped[str] = mapped_column(String(100), nullable=False, default="")
     file_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     source_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
     target_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
@@ -1332,7 +1355,7 @@ class SegmentQAIssue(Base):
         ForeignKey("segments.id", ondelete="CASCADE"),
         nullable=False,
     )
-    sentence_id: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+    sentence_id: Mapped[str] = mapped_column(String(100), nullable=False, default="")
     rule_key: Mapped[str] = mapped_column(String(40), nullable=False, default="spelling_grammar")
     provider: Mapped[str] = mapped_column(String(40), nullable=False, default="languagetool")
     language: Mapped[str] = mapped_column(String(20), nullable=False, default="")
@@ -1395,7 +1418,7 @@ class SegmentRevision(Base):
         ForeignKey("segments.id", ondelete="CASCADE"),
         nullable=False,
     )
-    sentence_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    sentence_id: Mapped[str] = mapped_column(String(100), nullable=False)
     before_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
     after_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
     source: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")
@@ -1767,6 +1790,8 @@ class TMCollection(Base):
     __table_args__ = (
         Index("uq_memory_bases_name", "name", unique=True),
         Index("ix_memory_bases_language_pair", "source_language", "target_language"),
+        Index("ix_memory_bases_project_id", "project_id"),
+        Index("ix_memory_bases_origin", "origin"),
         Index("ix_memory_bases_creator_id", "creator_id"),
     )
 
@@ -1780,6 +1805,17 @@ class TMCollection(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
     target_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    origin: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="manual",
+        server_default=text("'manual'"),
+    )
     creator_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("users.id", ondelete="SET NULL"),
@@ -1844,6 +1880,16 @@ class TranslationMemory(Base):
             "source_normalized",
             postgresql_using="gin",
             postgresql_ops={"source_normalized": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_memory_entries_lang_collection_source_normalized_trgm",
+            "source_language",
+            "target_language",
+            "collection_id",
+            "source_normalized",
+            postgresql_using="gin",
+            postgresql_ops={"source_normalized": "gin_trgm_ops"},
+            postgresql_where=text("source_normalized IS NOT NULL"),
         ),
     )
 
@@ -1941,7 +1987,7 @@ class AutoTMOutbox(Base):
         ForeignKey("segments.id", ondelete="CASCADE"),
         nullable=False,
     )
-    sentence_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    sentence_id: Mapped[str] = mapped_column(String(100), nullable=False)
     collection_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("memory_bases.id", ondelete="CASCADE"),
@@ -2139,6 +2185,8 @@ class GlossaryBase(Base):
     __table_args__ = (
         Index("uq_glossary_bases_name", "name", unique=True),
         Index("ix_glossary_bases_language_pair", "source_language", "target_language"),
+        Index("ix_glossary_bases_project_id", "project_id"),
+        Index("ix_glossary_bases_origin", "origin"),
         Index("ix_glossary_bases_creator_id", "creator_id"),
     )
 
@@ -2152,6 +2200,17 @@ class GlossaryBase(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_language: Mapped[str] = mapped_column(String(20), nullable=False)
     target_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    origin: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="manual",
+        server_default=text("'manual'"),
+    )
     creator_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("users.id", ondelete="SET NULL"),
@@ -2246,6 +2305,7 @@ class ReferenceProfile(Base):
     __tablename__ = "reference_profiles"
     __table_args__ = (
         Index("ix_reference_profiles_file_record_id", "file_record_id"),
+        Index("ix_reference_profiles_project_id", "project_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -2259,6 +2319,21 @@ class ReferenceProfile(Base):
         ForeignKey("file_records.id", ondelete="CASCADE"),
         nullable=True,
     )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    glossary_base_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("glossary_bases.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    memory_base_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("memory_bases.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     source_files: Mapped[str] = mapped_column(
         Text, nullable=False, default="[]", server_default=text("'[]'")
     )
@@ -2270,7 +2345,6 @@ class ReferenceProfile(Base):
     )
     style_guide: Mapped[str | None] = mapped_column(Text, nullable=True)
     analysis_report: Mapped[str | None] = mapped_column(Text, nullable=True)
-    match_result: Mapped[str | None] = mapped_column(Text, nullable=True)  # 匹配结果JSON
     overall_confidence: Mapped[float] = mapped_column(
         nullable=False, default=0.0, server_default=text("0.0")
     )

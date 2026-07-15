@@ -7,6 +7,7 @@ export interface PreviewLikeSegment {
   block_index?: number | null
   row_index?: number | null
   cell_index?: number | null
+  sequence_index?: number | null
 }
 
 const englishBoundaryTrailingPattern = /[,;:.!?]["')\]\}]*$/u

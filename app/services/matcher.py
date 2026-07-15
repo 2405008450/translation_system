@@ -37,6 +37,13 @@ FUZZY_CANDIDATE_LIMIT = 3
 TM_CANDIDATES_LIMIT = 5
 FUZZY_MISMATCH_SCORE_CEILING = 0.99
 SHORT_STRUCTURAL_MISMATCH_SCORE_CEILING = 0.79
+FUZZY_LENGTH_MIN_RATIO = 0.4
+FUZZY_LENGTH_MAX_RATIO = 2.2
+FUZZY_LENGTH_MIN_MARGIN = 4
+FUZZY_LENGTH_MAX_MARGIN = 12
+TM_SEARCH_PROJECTION_TABLE = "memory_entry_search"
+TM_SEARCH_PROJECTION_MISSING_SQLSTATES = {"42P01", "42703", "42809"}
+_TM_SEARCH_PROJECTION_AVAILABILITY_CACHE: dict[str, bool] = {}
 T = TypeVar("T")
 logger = logging.getLogger(__name__)
 
@@ -87,6 +94,9 @@ def match_sentences(
     similarity_threshold: float,
     auxiliary_sentences: list[str] | None = None,
     collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
+    include_fuzzy: bool = True,
 ) -> list[MatchResult]:
     results, _ = match_sentences_with_stats(
         db,
@@ -94,6 +104,9 @@ def match_sentences(
         similarity_threshold,
         auxiliary_sentences=auxiliary_sentences,
         collection_ids=collection_ids,
+        source_language=source_language,
+        target_language=target_language,
+        include_fuzzy=include_fuzzy,
     )
     return results
 
@@ -112,6 +125,8 @@ def get_tm_candidates(
     similarity_threshold: float,
     max_candidates: int = 5,
     collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
 ) -> list[TMCandidate]:
     """获取单个句子的 TM 匹配候选项，返回满足阈值的前 N 条记录"""
     if collection_ids is not None and len(collection_ids) == 0:
@@ -126,8 +141,17 @@ def get_tm_candidates(
 
     # 先检查精确匹配（hash 完全相同）
     normalized_collection_ids = _normalize_collection_ids(collection_ids)
+    normalized_source_language, normalized_target_language = _normalize_language_pair(
+        source_language,
+        target_language,
+    )
     exact_stmt = select(MemoryEntry).where(MemoryEntry.source_hash == source_hash)
-    exact_stmt = _apply_collection_filter(exact_stmt, normalized_collection_ids)
+    exact_stmt = _apply_tm_scope_filter(
+        exact_stmt,
+        normalized_collection_ids,
+        normalized_source_language,
+        normalized_target_language,
+    )
     exact_match = db.execute(exact_stmt).scalars().first()
 
     candidates: list[TMCandidate] = []
@@ -144,42 +168,60 @@ def get_tm_candidates(
             diff_html=_build_diff_html(source_text, exact_match.source_text),
         ))
 
+    if not _allow_fuzzy_text(match_text):
+        candidates.sort(key=lambda c: c.score, reverse=True)
+        return candidates[:max_candidates]
+
     # 模糊匹配
     trigram_threshold = _get_trigram_prefilter_threshold(similarity_threshold)
+    min_length, max_length = _build_fuzzy_length_bounds(match_text)
     params = {
         "query_text": match_text,
+        "min_length": min_length,
+        "max_length": max_length,
         "candidate_limit": max_candidates * 2,
         "trigram_limit": trigram_threshold,
     }
-
-    collection_filter_sql = ""
-    if normalized_collection_ids:
-        collection_param_names: list[str] = []
-        for index, collection_id in enumerate(normalized_collection_ids):
-            param_name = f"collection_id_{index}"
-            params[param_name] = collection_id
-            collection_param_names.append(f":{param_name}")
-        collection_filter_sql = f" AND tm.collection_id IN ({', '.join(collection_param_names)})"
-
-    stmt = text(f"""
-        SELECT
-            tm.source_text,
-            tm.target_text,
-            tm.source_normalized,
-            similarity(tm.source_normalized, :query_text) AS trigram_score
-        FROM memory_entries AS tm
-        WHERE tm.source_normalized IS NOT NULL
-          AND tm.source_normalized % :query_text
-          {collection_filter_sql}
-        ORDER BY similarity(tm.source_normalized, :query_text) DESC, tm.updated_at DESC
-        LIMIT :candidate_limit
-    """)
+    use_projection = _should_use_tm_search_projection(db)
+    stmt = _build_single_fuzzy_candidate_statement(
+        params,
+        use_projection=use_projection,
+        collection_ids=normalized_collection_ids,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
+    )
 
     db.execute(
         text("SELECT set_config('pg_trgm.similarity_threshold', CAST(:trigram_limit AS text), true)"),
         {"trigram_limit": trigram_threshold},
     )
-    rows = db.execute(stmt, params).mappings().all()
+    try:
+        rows = db.execute(stmt, params).mappings().all()
+    except SQLAlchemyError as exc:
+        if (
+            use_projection
+            and _allow_tm_search_projection_fallback()
+            and _is_tm_search_projection_missing_error(exc)
+        ):
+            logger.warning(
+                "tm search projection is enabled but unavailable; falling back to memory_entries: %s",
+                exc,
+            )
+            params = {
+                key: value
+                for key, value in params.items()
+                if not key.startswith("candidate_projection_")
+            }
+            stmt = _build_single_fuzzy_candidate_statement(
+                params,
+                use_projection=False,
+                collection_ids=normalized_collection_ids,
+                source_language=normalized_source_language,
+                target_language=normalized_target_language,
+            )
+            rows = db.execute(stmt, params).mappings().all()
+        else:
+            raise
 
     for row in rows:
         if row["source_text"] in seen_sources:
@@ -272,12 +314,42 @@ def _is_short_structural_core_match(query_text: str, compare_text: str) -> bool:
     return is_short_structural_fragment(query_text) or is_short_structural_fragment(compare_text)
 
 
+def _allow_fuzzy_lookup(sentence: PreparedSentence) -> bool:
+    if _allow_fuzzy_text(sentence.match_text):
+        return True
+    return (
+        bool(sentence.auxiliary_match_text)
+        and sentence.auxiliary_match_text != sentence.match_text
+        and _allow_fuzzy_text(sentence.auxiliary_match_text)
+    )
+
+
+def _allow_fuzzy_text(match_text: str | None) -> bool:
+    normalized = normalize_match_text(match_text or "") or (match_text or "").strip()
+    if not normalized:
+        return False
+    return not is_short_structural_fragment(normalized)
+
+
+def _build_fuzzy_length_bounds(match_text: str) -> tuple[int, int]:
+    normalized = normalize_match_text(match_text) or (match_text or "").strip()
+    length = len(normalized)
+    if length <= 0:
+        return 1, 1
+    min_length = max(1, int(length * FUZZY_LENGTH_MIN_RATIO) - FUZZY_LENGTH_MIN_MARGIN)
+    max_length = max(length + FUZZY_LENGTH_MAX_MARGIN, int(length * FUZZY_LENGTH_MAX_RATIO) + FUZZY_LENGTH_MAX_MARGIN)
+    return min_length, max_length
+
+
 def match_sentences_with_stats(
     db: Session,
     sentences: list[str],
     similarity_threshold: float,
     auxiliary_sentences: list[str] | None = None,
     collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
+    include_fuzzy: bool = True,
 ) -> tuple[list[MatchResult], MatchStats]:
     total_started_at = perf_counter()
     prepared_sentences = _prepare_sentences(sentences, auxiliary_sentences=auxiliary_sentences)
@@ -327,6 +399,9 @@ def match_sentences_with_stats(
         similarity_threshold=similarity_threshold,
         total_input_sentences=len(sentences),
         collection_ids=collection_ids,
+        source_language=source_language,
+        target_language=target_language,
+        include_fuzzy=include_fuzzy,
     )
 
     results = [
@@ -396,6 +471,9 @@ def _resolve_matches(
     similarity_threshold: float,
     total_input_sentences: int,
     collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
+    include_fuzzy: bool = True,
 ) -> tuple[list[ResolvedMatch], MatchStats]:
     resolved_matches: list[ResolvedMatch | None] = [None] * len(prepared_sentences)
     matchable_items = [
@@ -409,6 +487,8 @@ def _resolve_matches(
         db,
         [sentence for _, sentence in matchable_items],
         collection_ids=collection_ids,
+        source_language=source_language,
+        target_language=target_language,
     )
     if isinstance(exact_matches_by_hash, tuple):
         exact_matches_by_hash = exact_matches_by_hash[0]
@@ -483,12 +563,37 @@ def _resolve_matches(
 
         unresolved_items.append((index, sentence))
 
+    if not include_fuzzy:
+        for index, _ in unresolved_items:
+            resolved_matches[index] = ResolvedMatch(
+                status="none",
+                score=0.0,
+                matched_source_text=None,
+                target_text=None,
+                tm_candidates=[],
+            )
+            none_hits += 1
+        return [match for match in resolved_matches if match is not None], MatchStats(
+            total_input_sentences=total_input_sentences,
+            prepared_sentences=len(prepared_sentences),
+            unique_sentences=len({sentence.match_text for sentence in prepared_sentences if sentence.match_text}),
+            exact_hits=exact_hits,
+            fuzzy_hits=0,
+            none_hits=none_hits,
+            exact_phase_ms=round(exact_phase_ms, 2),
+            fuzzy_phase_ms=0.0,
+            total_match_ms=0.0,
+            fuzzy_candidates_evaluated=0,
+        )
+
     fuzzy_started_at = perf_counter()
     fuzzy_matches, fuzzy_candidates_evaluated = _find_fuzzy_matches(
         db=db,
         prepared_sentences=[sentence for _, sentence in unresolved_items],
         similarity_threshold=similarity_threshold,
         collection_ids=collection_ids,
+        source_language=source_language,
+        target_language=target_language,
     )
     fuzzy_phase_ms = (perf_counter() - fuzzy_started_at) * 1000
 
@@ -527,6 +632,8 @@ def _find_exact_matches(
     db: Session,
     sentences: Iterable[PreparedSentence],
     collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
 ) -> dict[str, MemoryEntry]:
     """通过 source_hash 查找精确匹配，确保只有完全相同的文本才算精确匹配"""
     sentences = list(sentences)
@@ -542,9 +649,18 @@ def _find_exact_matches(
 
     matches_by_hash: dict[str, MemoryEntry] = {}
     normalized_collection_ids = _normalize_collection_ids(collection_ids)
+    normalized_source_language, normalized_target_language = _normalize_language_pair(
+        source_language,
+        target_language,
+    )
     for chunk in _chunked(source_hashes, EXACT_MATCH_BATCH_SIZE):
         stmt = select(MemoryEntry).where(MemoryEntry.source_hash.in_(chunk))
-        stmt = _apply_collection_filter(stmt, normalized_collection_ids)
+        stmt = _apply_tm_scope_filter(
+            stmt,
+            normalized_collection_ids,
+            normalized_source_language,
+            normalized_target_language,
+        )
         for match in db.execute(stmt).scalars():
             matches_by_hash.setdefault(match.source_hash, match)
 
@@ -562,61 +678,223 @@ def _find_fuzzy_matches(
     prepared_sentences: list[PreparedSentence],
     similarity_threshold: float,
     collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
 ) -> tuple[list[ResolvedMatch | None], int]:
     if not prepared_sentences:
         return [], 0
 
-    matches: list[ResolvedMatch | None] = []
+    matches: list[ResolvedMatch | None] = [None] * len(prepared_sentences)
+    lookup_items = [
+        (index, sentence)
+        for index, sentence in enumerate(prepared_sentences)
+        if _allow_fuzzy_lookup(sentence)
+    ]
+    if not lookup_items:
+        return matches, 0
+
     total_candidates = 0
-    for chunk in _chunked(prepared_sentences, _get_fuzzy_match_batch_size()):
+    offset = 0
+    lookup_sentences = [sentence for _, sentence in lookup_items]
+    lookup_indexes = [index for index, _ in lookup_items]
+    for chunk in _chunked(lookup_sentences, _get_fuzzy_match_batch_size()):
         chunk_matches, chunk_candidates = _find_fuzzy_matches_chunk(
             db=db,
             prepared_sentences=chunk,
             similarity_threshold=similarity_threshold,
             collection_ids=collection_ids,
+            source_language=source_language,
+            target_language=target_language,
         )
-        matches.extend(chunk_matches)
+        for local_index, match in enumerate(chunk_matches):
+            matches[lookup_indexes[offset + local_index]] = match
+        offset += len(chunk)
         total_candidates += chunk_candidates
 
     return matches, total_candidates
 
 
-def _find_fuzzy_matches_chunk(
-    db: Session,
-    prepared_sentences: list[PreparedSentence],
-    similarity_threshold: float,
-    collection_ids: list[UUID] | None = None,
-) -> tuple[list[ResolvedMatch | None], int]:
-    trigram_prefilter_threshold = _get_trigram_prefilter_threshold(similarity_threshold)
-    params = {
-        "candidate_limit": FUZZY_CANDIDATE_LIMIT,
-        "trigram_limit": trigram_prefilter_threshold,
-    }
-    value_rows: list[str] = []
-    collection_filter_sql = ""
-    normalized_collection_ids = _normalize_collection_ids(collection_ids)
-    if normalized_collection_ids:
-        collection_param_names: list[str] = []
-        for index, collection_id in enumerate(normalized_collection_ids):
-            param_name = f"collection_id_{index}"
-            params[param_name] = collection_id
-            collection_param_names.append(f":{param_name}")
-        collection_filter_sql = (
-            f" AND tm.collection_id IN ({', '.join(collection_param_names)})"
+def _build_single_fuzzy_candidate_statement(
+    params: dict[str, object],
+    *,
+    use_projection: bool,
+    collection_ids: list[UUID] | None,
+    source_language: str | None,
+    target_language: str | None,
+):
+    if use_projection:
+        collection_filter_sql = _build_collection_filter_sql(
+            params,
+            collection_ids,
+            alias="ts",
+            param_prefix="candidate_projection_collection_id",
+        )
+        language_filter_sql = _build_language_filter_sql(
+            params,
+            source_language,
+            target_language,
+            alias="ts",
+            param_prefix="candidate_projection_",
+        )
+        return text(
+            f"""
+            SELECT
+                tm.source_text,
+                tm.target_text,
+                ts.source_normalized,
+                ts.trigram_score
+            FROM (
+                SELECT
+                    ts.entry_id,
+                    ts.source_normalized,
+                    ts.updated_at,
+                    similarity(ts.source_normalized, :query_text) AS trigram_score
+                FROM memory_entry_search AS ts
+                WHERE ts.source_normalized % :query_text
+                  AND ts.source_length BETWEEN :min_length AND :max_length
+                  {collection_filter_sql}
+                  {language_filter_sql}
+                ORDER BY similarity(ts.source_normalized, :query_text) DESC, ts.updated_at DESC
+                LIMIT :candidate_limit
+            ) AS ts
+            JOIN memory_entries AS tm ON tm.id = ts.entry_id
+            ORDER BY ts.trigram_score DESC, ts.updated_at DESC
+            """
         )
 
-    for index, sentence in enumerate(prepared_sentences):
-        source_param_name = f"query_source_{index}"
-        params[source_param_name] = sentence.match_text
-        value_rows.append(f"({index}, 'source', :{source_param_name})")
-        if sentence.auxiliary_match_text and sentence.auxiliary_match_text != sentence.match_text:
-            auxiliary_param_name = f"query_aux_{index}"
-            params[auxiliary_param_name] = sentence.auxiliary_match_text
-            value_rows.append(f"({index}, 'auxiliary', :{auxiliary_param_name})")
-
-    stmt = text(
+    collection_filter_sql = _build_collection_filter_sql(
+        params,
+        collection_ids,
+        alias="tm",
+        param_prefix="candidate_collection_id",
+    )
+    language_filter_sql = _build_language_filter_sql(
+        params,
+        source_language,
+        target_language,
+        alias="tm",
+        param_prefix="candidate_",
+    )
+    return text(
         f"""
-        WITH input(query_index, query_kind, query_text) AS (
+        SELECT
+            tm.source_text,
+            tm.target_text,
+            tm.source_normalized,
+            similarity(tm.source_normalized, :query_text) AS trigram_score
+        FROM memory_entries AS tm
+        WHERE tm.source_normalized IS NOT NULL
+          AND tm.source_normalized % :query_text
+          AND char_length(tm.source_normalized) BETWEEN :min_length AND :max_length
+          {collection_filter_sql}
+          {language_filter_sql}
+        ORDER BY similarity(tm.source_normalized, :query_text) DESC, tm.updated_at DESC
+        LIMIT :candidate_limit
+        """
+    )
+
+
+def _build_fuzzy_match_chunk_statement(
+    params: dict[str, object],
+    *,
+    use_projection: bool,
+    value_rows: list[str],
+    collection_ids: list[UUID] | None,
+    source_language: str | None,
+    target_language: str | None,
+):
+    if use_projection:
+        collection_filter_sql = _build_collection_filter_sql(
+            params,
+            collection_ids,
+            alias="ts",
+            param_prefix="projection_collection_id",
+        )
+        language_filter_sql = _build_language_filter_sql(
+            params,
+            source_language,
+            target_language,
+            alias="ts",
+            param_prefix="projection_",
+        )
+        return text(
+            f"""
+            WITH input(query_index, query_kind, query_text, min_length, max_length) AS (
+                VALUES {", ".join(value_rows)}
+            )
+            SELECT
+                input.query_index,
+                input.query_kind,
+                input.query_text,
+                matched.entry_id,
+                matched.collection_id,
+                matched.creator_id,
+                matched.last_modified_by_id,
+                matched.compare_text,
+                matched.source_text,
+                matched.target_text,
+                matched.collection_name,
+                matched.creator_name,
+                matched.last_modified_by_name,
+                matched.created_at,
+                matched.updated_at,
+                matched.trigram_score
+            FROM input
+            LEFT JOIN LATERAL (
+                SELECT
+                    tm.id AS entry_id,
+                    ts.collection_id,
+                    tm.creator_id,
+                    tm.last_modified_by_id,
+                    ts.source_normalized AS compare_text,
+                    tm.source_text,
+                    tm.target_text,
+                    mb.name AS collection_name,
+                    COALESCE(u.nickname, u.username) AS creator_name,
+                    COALESCE(lu.nickname, lu.username) AS last_modified_by_name,
+                    tm.created_at,
+                    tm.updated_at,
+                    ts.trigram_score
+                FROM (
+                    SELECT
+                        ts.entry_id,
+                        ts.collection_id,
+                        ts.source_normalized,
+                        ts.updated_at,
+                        similarity(ts.source_normalized, input.query_text) AS trigram_score
+                    FROM memory_entry_search AS ts
+                    WHERE ts.source_normalized % input.query_text
+                      AND ts.source_length BETWEEN input.min_length AND input.max_length
+                      {collection_filter_sql}
+                      {language_filter_sql}
+                    ORDER BY similarity(ts.source_normalized, input.query_text) DESC, ts.updated_at DESC
+                    LIMIT :candidate_limit
+                ) AS ts
+                JOIN memory_entries AS tm ON tm.id = ts.entry_id
+                LEFT JOIN memory_bases AS mb ON mb.id = ts.collection_id
+                LEFT JOIN users AS u ON u.id = tm.creator_id
+                LEFT JOIN users AS lu ON lu.id = tm.last_modified_by_id
+                ORDER BY ts.trigram_score DESC, ts.updated_at DESC
+            ) AS matched ON TRUE
+            ORDER BY input.query_index ASC
+            """
+        )
+
+    collection_filter_sql = _build_collection_filter_sql(
+        params,
+        collection_ids,
+        alias="tm",
+        param_prefix="collection_id",
+    )
+    language_filter_sql = _build_language_filter_sql(
+        params,
+        source_language,
+        target_language,
+        alias="tm",
+    )
+    return text(
+        f"""
+        WITH input(query_index, query_kind, query_text, min_length, max_length) AS (
             VALUES {", ".join(value_rows)}
         )
         SELECT
@@ -652,18 +930,84 @@ def _find_fuzzy_matches_chunk(
                 tm.created_at,
                 tm.updated_at,
                 similarity(tm.source_normalized, input.query_text) AS trigram_score
-FROM memory_entries AS tm
+            FROM memory_entries AS tm
             LEFT JOIN memory_bases AS mb ON mb.id = tm.collection_id
             LEFT JOIN users AS u ON u.id = tm.creator_id
             LEFT JOIN users AS lu ON lu.id = tm.last_modified_by_id
             WHERE tm.source_normalized IS NOT NULL
               AND tm.source_normalized % input.query_text
+              AND char_length(tm.source_normalized) BETWEEN input.min_length AND input.max_length
               {collection_filter_sql}
+              {language_filter_sql}
             ORDER BY similarity(tm.source_normalized, input.query_text) DESC, tm.updated_at DESC
             LIMIT :candidate_limit
         ) AS matched ON TRUE
         ORDER BY input.query_index ASC
         """
+    )
+
+
+def _find_fuzzy_matches_chunk(
+    db: Session,
+    prepared_sentences: list[PreparedSentence],
+    similarity_threshold: float,
+    collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
+) -> tuple[list[ResolvedMatch | None], int]:
+    trigram_prefilter_threshold = _get_trigram_prefilter_threshold(similarity_threshold)
+    params = {
+        "candidate_limit": FUZZY_CANDIDATE_LIMIT,
+        "trigram_limit": trigram_prefilter_threshold,
+    }
+    value_rows: list[str] = []
+    normalized_collection_ids = _normalize_collection_ids(collection_ids)
+    normalized_source_language, normalized_target_language = _normalize_language_pair(
+        source_language,
+        target_language,
+    )
+
+    for index, sentence in enumerate(prepared_sentences):
+        if _allow_fuzzy_text(sentence.match_text):
+            source_param_name = f"query_source_{index}"
+            source_min_length, source_max_length = _build_fuzzy_length_bounds(sentence.match_text)
+            source_min_param_name = f"query_source_min_length_{index}"
+            source_max_param_name = f"query_source_max_length_{index}"
+            params[source_param_name] = sentence.match_text
+            params[source_min_param_name] = source_min_length
+            params[source_max_param_name] = source_max_length
+            value_rows.append(
+                f"({index}, 'source', :{source_param_name}, "
+                f":{source_min_param_name}, :{source_max_param_name})"
+            )
+        if (
+            sentence.auxiliary_match_text
+            and sentence.auxiliary_match_text != sentence.match_text
+            and _allow_fuzzy_text(sentence.auxiliary_match_text)
+        ):
+            auxiliary_param_name = f"query_aux_{index}"
+            auxiliary_min_length, auxiliary_max_length = _build_fuzzy_length_bounds(sentence.auxiliary_match_text)
+            auxiliary_min_param_name = f"query_aux_min_length_{index}"
+            auxiliary_max_param_name = f"query_aux_max_length_{index}"
+            params[auxiliary_param_name] = sentence.auxiliary_match_text
+            params[auxiliary_min_param_name] = auxiliary_min_length
+            params[auxiliary_max_param_name] = auxiliary_max_length
+            value_rows.append(
+                f"({index}, 'auxiliary', :{auxiliary_param_name}, "
+                f":{auxiliary_min_param_name}, :{auxiliary_max_param_name})"
+            )
+
+    if not value_rows:
+        return [None] * len(prepared_sentences), 0
+
+    use_projection = _should_use_tm_search_projection(db)
+    stmt = _build_fuzzy_match_chunk_statement(
+        params,
+        use_projection=use_projection,
+        value_rows=value_rows,
+        collection_ids=normalized_collection_ids,
+        source_language=normalized_source_language,
+        target_language=normalized_target_language,
     )
 
     db.execute(
@@ -673,7 +1017,35 @@ FROM memory_entries AS tm
         {"trigram_limit": trigram_prefilter_threshold},
     )
     _apply_match_statement_timeout(db)
-    rows = db.execute(stmt, params).mappings().all()
+    try:
+        rows = db.execute(stmt, params).mappings().all()
+    except SQLAlchemyError as exc:
+        if (
+            use_projection
+            and _allow_tm_search_projection_fallback()
+            and _is_tm_search_projection_missing_error(exc)
+        ):
+            logger.warning(
+                "tm search projection is enabled but unavailable; falling back to memory_entries: %s",
+                exc,
+            )
+            params = {
+                key: value
+                for key, value in params.items()
+                if not key.startswith("projection_")
+                and not key.startswith("projection_collection_id_")
+            }
+            stmt = _build_fuzzy_match_chunk_statement(
+                params,
+                use_projection=False,
+                value_rows=value_rows,
+                collection_ids=normalized_collection_ids,
+                source_language=normalized_source_language,
+                target_language=normalized_target_language,
+            )
+            rows = db.execute(stmt, params).mappings().all()
+        else:
+            raise
 
     grouped_candidates: dict[int, dict[tuple[str, str], dict]] = {}
     for row in rows:
@@ -721,6 +1093,8 @@ FROM memory_entries AS tm
             prepared_sentences=prepared_sentences,
             grouped_candidates=grouped_candidates,
             collection_ids=collection_ids,
+            source_language=source_language,
+            target_language=target_language,
         )
 
     matches: list[ResolvedMatch | None] = []
@@ -779,6 +1153,8 @@ def _merge_vector_candidates(
     prepared_sentences: list[PreparedSentence],
     grouped_candidates: dict[int, dict[tuple[str, str], dict]],
     collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
 ) -> None:
     settings = get_settings()
     vector_candidate_limit = max(int(settings.tm_vector_candidate_limit), 1)
@@ -792,6 +1168,10 @@ def _merge_vector_candidates(
     value_rows: list[str] = []
     collection_filter_sql = ""
     normalized_collection_ids = _normalize_collection_ids(collection_ids)
+    normalized_source_language, normalized_target_language = _normalize_language_pair(
+        source_language,
+        target_language,
+    )
     if normalized_collection_ids:
         collection_param_names: list[str] = []
         for index, collection_id in enumerate(normalized_collection_ids):
@@ -801,17 +1181,27 @@ def _merge_vector_candidates(
         collection_filter_sql = (
             f" AND tm.collection_id IN ({', '.join(collection_param_names)})"
         )
+    language_filter_sql = _build_language_filter_sql(
+        params,
+        normalized_source_language,
+        normalized_target_language,
+    )
 
     for index, sentence in enumerate(prepared_sentences):
-        source_vector_param_name = f"query_source_vector_{index}"
-        params[source_vector_param_name] = build_tm_embedding_literal(
-            sentence.match_text,
-            dimensions=vector_dimensions,
-        )
-        value_rows.append(
-            f"({index}, 'source', CAST(:{source_vector_param_name} AS vector({vector_dimensions})))"
-        )
-        if sentence.auxiliary_match_text and sentence.auxiliary_match_text != sentence.match_text:
+        if _allow_fuzzy_text(sentence.match_text):
+            source_vector_param_name = f"query_source_vector_{index}"
+            params[source_vector_param_name] = build_tm_embedding_literal(
+                sentence.match_text,
+                dimensions=vector_dimensions,
+            )
+            value_rows.append(
+                f"({index}, 'source', CAST(:{source_vector_param_name} AS vector({vector_dimensions})))"
+            )
+        if (
+            sentence.auxiliary_match_text
+            and sentence.auxiliary_match_text != sentence.match_text
+            and _allow_fuzzy_text(sentence.auxiliary_match_text)
+        ):
             auxiliary_vector_param_name = f"query_aux_vector_{index}"
             params[auxiliary_vector_param_name] = build_tm_embedding_literal(
                 sentence.auxiliary_match_text,
@@ -870,6 +1260,7 @@ FROM memory_entries AS tm
               AND tm.source_embedding_version = :embedding_version
               AND 1 - (tm.source_embedding <=> input.query_vector) >= :vector_similarity_floor
               {collection_filter_sql}
+              {language_filter_sql}
             ORDER BY tm.source_embedding <=> input.query_vector ASC, tm.updated_at DESC
             LIMIT :vector_candidate_limit
         ) AS matched ON TRUE
@@ -1064,10 +1455,120 @@ def _normalize_collection_ids(collection_ids: list[UUID] | None) -> list[UUID] |
     return list(dict.fromkeys(collection_ids))
 
 
-def _apply_collection_filter(stmt, collection_ids: list[UUID] | None):
+def _normalize_language_pair(
+    source_language: str | None,
+    target_language: str | None,
+) -> tuple[str | None, str | None]:
+    normalized_source = (source_language or "").strip() or None
+    normalized_target = (target_language or "").strip() or None
+    return normalized_source, normalized_target
+
+
+def _apply_tm_scope_filter(
+    stmt,
+    collection_ids: list[UUID] | None,
+    source_language: str | None,
+    target_language: str | None,
+):
     if not collection_ids:
-        return stmt
-    return stmt.where(MemoryEntry.collection_id.in_(collection_ids))
+        scoped_stmt = stmt
+    else:
+        scoped_stmt = stmt.where(MemoryEntry.collection_id.in_(collection_ids))
+    if source_language:
+        scoped_stmt = scoped_stmt.where(MemoryEntry.source_language == source_language)
+    if target_language:
+        scoped_stmt = scoped_stmt.where(MemoryEntry.target_language == target_language)
+    return scoped_stmt
+
+
+def _build_collection_filter_sql(
+    params: dict[str, object],
+    collection_ids: list[UUID] | None,
+    *,
+    alias: str = "tm",
+    param_prefix: str = "collection_id",
+) -> str:
+    if not collection_ids:
+        return ""
+
+    collection_param_names: list[str] = []
+    for index, collection_id in enumerate(collection_ids):
+        param_name = f"{param_prefix}_{index}"
+        params[param_name] = collection_id
+        collection_param_names.append(f":{param_name}")
+    return f" AND {alias}.collection_id IN ({', '.join(collection_param_names)})"
+
+
+def _build_language_filter_sql(
+    params: dict[str, object],
+    source_language: str | None,
+    target_language: str | None,
+    *,
+    alias: str = "tm",
+    param_prefix: str = "",
+) -> str:
+    clauses: list[str] = []
+    if source_language:
+        param_name = f"{param_prefix}source_language"
+        params[param_name] = source_language
+        clauses.append(f"{alias}.source_language = :{param_name}")
+    if target_language:
+        param_name = f"{param_prefix}target_language"
+        params[param_name] = target_language
+        clauses.append(f"{alias}.target_language = :{param_name}")
+    if not clauses:
+        return ""
+    return " AND " + " AND ".join(clauses)
+
+
+def _should_use_tm_search_projection(db: Session) -> bool:
+    settings = get_settings()
+    if not getattr(settings, "tm_search_projection_enabled", False):
+        return False
+    try:
+        bind = db.get_bind()
+        if bind.dialect.name != "postgresql":
+            return False
+        cache_key = bind.url.render_as_string(hide_password=True)
+        cached = _TM_SEARCH_PROJECTION_AVAILABILITY_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        available = bool(
+            db.execute(
+                text("SELECT to_regclass(:table_name) IS NOT NULL"),
+                {"table_name": TM_SEARCH_PROJECTION_TABLE},
+            ).scalar()
+        )
+        _TM_SEARCH_PROJECTION_AVAILABILITY_CACHE[cache_key] = available
+        if not available:
+            logger.warning(
+                "tm search projection is enabled but %s is missing; using memory_entries",
+                TM_SEARCH_PROJECTION_TABLE,
+            )
+        return available
+    except SQLAlchemyError as exc:
+        logger.warning("tm search projection availability probe failed: %s", exc)
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _allow_tm_search_projection_fallback() -> bool:
+    settings = get_settings()
+    return bool(getattr(settings, "tm_search_projection_fallback_enabled", True))
+
+
+def _is_tm_search_projection_missing_error(exc: SQLAlchemyError) -> bool:
+    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    if sqlstate in TM_SEARCH_PROJECTION_MISSING_SQLSTATES:
+        return True
+    message = str(exc).lower()
+    return TM_SEARCH_PROJECTION_TABLE in message and (
+        "does not exist" in message
+        or "undefined table" in message
+        or "undefined column" in message
+        or "not a table" in message
+    )
 
 
 def _chunked(items: list[T], chunk_size: int) -> list[list[T]]:
@@ -1079,6 +1580,8 @@ def get_tm_candidates_for_text(
     source_text: str,
     similarity_threshold: float = 0.6,
     collection_ids: list[UUID] | None = None,
+    source_language: str | None = None,
+    target_language: str | None = None,
     top_n: int = TM_CANDIDATES_LIMIT,
 ) -> list[TMMatchCandidate]:
     """获取单个文本的TM匹配候选列表"""
@@ -1096,7 +1599,11 @@ def get_tm_candidates_for_text(
 
     # 先尝试精确匹配（只使用 source_hash）
     exact_matches_by_hash = _find_exact_matches(
-        db, [sentence], collection_ids=collection_ids
+        db,
+        [sentence],
+        collection_ids=collection_ids,
+        source_language=source_language,
+        target_language=target_language,
     )
 
     exact_match = exact_matches_by_hash.get(sentence.source_hash)
@@ -1146,6 +1653,8 @@ def get_tm_candidates_for_text(
         prepared_sentences=[sentence],
         similarity_threshold=effective_threshold,
         collection_ids=collection_ids,
+        source_language=source_language,
+        target_language=target_language,
     )
 
     if fuzzy_matches and fuzzy_matches[0]:

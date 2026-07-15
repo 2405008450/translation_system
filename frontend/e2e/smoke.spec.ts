@@ -45,7 +45,8 @@ async function createProjectWithFixture(page: Page, projectName: string) {
   await expect(page.getByTestId('project-upload-page')).toBeVisible()
   await page.getByTestId('project-upload-file-input').setInputFiles(FIXTURE_FILE)
   await page.getByTestId('project-upload-source-language').selectOption('zh-CN')
-  await page.getByTestId('project-upload-target-language').selectOption('en-US')
+  await page.getByTestId('project-upload-target-trigger').click()
+  await page.getByTestId('project-upload-target-en-US').check()
   await expect(page.getByTestId('project-upload-submit')).toBeEnabled()
   await page.getByTestId('project-upload-submit').click()
 
@@ -246,6 +247,34 @@ test.describe.serial('核心 E2E 冒烟流程', () => {
   test('系统初始化后可以重新登录', async ({ page }) => {
     await login(page)
     await expect(page.getByTestId('project-table')).toBeVisible()
+  })
+
+  test('同一原文件一次上传可生成多个目标语种任务', async ({ page }) => {
+    await login(page)
+    await page.getByTestId('project-create-button').click()
+    await page.getByTestId('project-create-name').fill(`E2E Multi Target ${Date.now()}`)
+    await page.getByTestId('project-create-workflow-template').selectOption('translate')
+    await Promise.all([
+      page.waitForURL(/\/projects\/[0-9a-f-]+/i),
+      page.getByTestId('project-create-submit').click(),
+    ])
+
+    await page.getByTestId('project-upload-open').click()
+    await page.getByTestId('project-upload-file-input').setInputFiles(FIXTURE_FILE)
+    await page.getByTestId('project-upload-source-language').selectOption('zh-CN')
+    await page.getByTestId('project-upload-target-trigger').click()
+    await page.getByTestId('project-upload-target-en-US').check()
+    await page.getByTestId('project-upload-target-ja-JP').check()
+
+    await expect(page.getByTestId('project-upload-task-estimate')).toContainText('预计生成 2 个任务')
+    await expect(page.getByTestId('project-upload-submit')).toContainText('上传并生成 2 个任务')
+    await page.getByTestId('project-upload-submit').click()
+
+    await expect(page.getByTestId('project-upload-page')).toBeHidden({ timeout: 45_000 })
+    const fileTable = page.getByTestId('project-file-table')
+    await expect(fileTable.getByText('smoke-source.txt')).toHaveCount(2)
+    await expect(fileTable).toContainText('英语（美国）')
+    await expect(fileTable).toContainText('日语')
   })
 
   test('项目详情工具栏删除只删除选中文件', async ({ page }) => {

@@ -76,6 +76,14 @@ def compute_docx_statistics(raw_bytes: bytes) -> dict[str, Any]:
     return compute_word_document_statistics(raw_bytes, "source.docx")
 
 
+def compute_document_statistics(raw_bytes: bytes, filename: str) -> dict[str, Any]:
+    """根据文件类型计算文档统计，同时保持既有 Word 统计口径不变。"""
+    suffix = Path(filename or "").suffix.lower()
+    if suffix == ".pptx":
+        return compute_pptx_document_statistics(raw_bytes)
+    return compute_word_document_statistics(raw_bytes, filename)
+
+
 def compute_word_document_statistics(raw_bytes: bytes, filename: str) -> dict[str, Any]:
     """Compute Word statistics without starting LibreOffice for DOCX files."""
     suffix = Path(filename or "").suffix.lower()
@@ -99,6 +107,78 @@ def compute_word_document_statistics(raw_bytes: bytes, filename: str) -> dict[st
         statistics_profile="unavailable",
         content_scope="unavailable",
     )
+
+
+def compute_pptx_document_statistics(raw_bytes: bytes) -> dict[str, Any]:
+    """按 PPTX 形状文本 + Word 近似口径统计演示文稿。"""
+    try:
+        from pptx import Presentation
+
+        presentation = Presentation(BytesIO(raw_bytes))
+    except Exception:
+        return _build_statistics_payload(
+            source="unavailable",
+            engine=None,
+            include_textboxes_footnotes_endnotes=False,
+            license_status=None,
+            statistics_profile="unavailable",
+            content_scope="unavailable",
+        )
+
+    main_texts: list[str] = []
+    main_paragraphs = 0
+    main_lines = 0
+    notes_paragraphs = 0
+    notes_lines = 0
+    chart_count = 0
+
+    for slide in presentation.slides:
+        slide_texts: list[str] = []
+        for shape in _iter_ppt_shapes(slide.shapes):
+            shape_texts, paragraph_count, line_count, shape_chart_count = _extract_ppt_shape_texts(shape)
+            slide_texts.extend(shape_texts)
+            main_paragraphs += paragraph_count
+            main_lines += line_count
+            chart_count += shape_chart_count
+        if slide_texts:
+            main_texts.append("\n".join(slide_texts))
+
+        notes_text, paragraph_count, line_count = _extract_ppt_notes_text(slide)
+        if notes_text:
+            notes_paragraphs += paragraph_count
+            notes_lines += line_count
+
+    metrics = _count_tool_word_like_texts(main_texts)
+    image_count, linked_image_count = _count_pptx_image_references(raw_bytes)
+    payload = _build_statistics_payload(
+        source="pptx_word_like",
+        engine="python-pptx-word-like",
+        include_textboxes_footnotes_endnotes=False,
+        license_status=None,
+        statistics_profile="pptx_shape_word_approx",
+        content_scope="slides_shapes_tables_charts",
+        statistics_warnings=(
+            ["pptx_notes_excluded_from_word_count"]
+            if notes_paragraphs or notes_lines
+            else []
+        ),
+    )
+    payload.update(
+        {
+            "pages": len(presentation.slides),
+            "words": metrics["words"],
+            "non_asian_words": metrics["non_asian_words"],
+            "asian_characters": metrics["asian_characters"],
+            "characters": metrics["characters"],
+            "characters_with_spaces": metrics["characters_with_spaces"],
+            "paragraphs": main_paragraphs + notes_paragraphs,
+            "lines": main_lines + notes_lines,
+            "image_count": image_count,
+            "linked_image_count": linked_image_count,
+            "chart_count": chart_count,
+        }
+    )
+    return payload
 
 
 def _convert_doc_to_docx(raw_bytes: bytes, filename: str) -> bytes | None:
@@ -508,6 +588,246 @@ def _decode_symbol(node: ET.Element) -> str:
         return chr(int(raw_value, 16))
     except (TypeError, ValueError):
         return ""
+
+
+def _iter_ppt_shapes(shapes: Any) -> Iterable[Any]:
+    for shape in shapes:
+        yield shape
+        nested_shapes = getattr(shape, "shapes", None)
+        if nested_shapes is not None:
+            yield from _iter_ppt_shapes(nested_shapes)
+
+
+def _extract_ppt_shape_texts(shape: Any) -> tuple[list[str], int, int, int]:
+    texts: list[str] = []
+    paragraph_count = 0
+    line_count = 0
+    chart_count = 0
+
+    if getattr(shape, "has_text_frame", False):
+        text, paragraphs, lines = _extract_ppt_text_frame(shape.text_frame)
+        if text:
+            texts.append(text)
+            paragraph_count += paragraphs
+            line_count += lines
+
+    if getattr(shape, "has_table", False):
+        for row in shape.table.rows:
+            for cell in row.cells:
+                text, paragraphs, lines = _extract_ppt_text_frame(cell.text_frame)
+                if text:
+                    texts.append(text)
+                    paragraph_count += paragraphs
+                    line_count += lines
+
+    if getattr(shape, "has_chart", False):
+        chart_count = 1
+        chart_text = _extract_ppt_chart_text(shape)
+        if chart_text:
+            texts.append(chart_text)
+            paragraph_count += _count_nonempty_text_lines(chart_text)
+            line_count += _count_nonempty_text_lines(chart_text)
+
+    return texts, paragraph_count, line_count, chart_count
+
+
+def _extract_ppt_text_frame(text_frame: Any) -> tuple[str, int, int]:
+    texts: list[str] = []
+    paragraph_count = 0
+    line_count = 0
+    for paragraph in getattr(text_frame, "paragraphs", []) or []:
+        text = (paragraph.text or "").strip()
+        if not text:
+            continue
+        texts.append(text)
+        paragraph_count += 1
+        line_count += _count_nonempty_text_lines(text)
+
+    if not texts:
+        text = (getattr(text_frame, "text", "") or "").strip()
+        if text:
+            texts.append(text)
+            paragraph_count = _count_text_blocks(text)
+            line_count = _count_nonempty_text_lines(text)
+    return "\n".join(texts), paragraph_count, line_count
+
+
+def _extract_ppt_chart_text(shape: Any) -> str:
+    try:
+        chart_space = getattr(shape.chart, "_chartSpace", None)
+        if chart_space is None:
+            return ""
+        texts: list[str] = []
+        seen: set[str] = set()
+        for node in chart_space.iter():
+            local_name = _local_name(str(node.tag))
+            value = (node.text or "").strip()
+            if not value:
+                continue
+            if local_name == "v":
+                try:
+                    float(value)
+                except ValueError:
+                    pass
+                else:
+                    continue
+            elif local_name != "t":
+                continue
+            if value not in seen:
+                seen.add(value)
+                texts.append(value)
+        return "\n".join(texts)
+    except Exception:
+        return ""
+
+
+def _extract_ppt_notes_text(slide: Any) -> tuple[str, int, int]:
+    try:
+        if not getattr(slide, "has_notes_slide", False):
+            return "", 0, 0
+        notes_frame = getattr(slide.notes_slide, "notes_text_frame", None)
+        if notes_frame is None:
+            return "", 0, 0
+        return _extract_ppt_text_frame(notes_frame)
+    except Exception:
+        return "", 0, 0
+
+
+def _count_pptx_image_references(raw_bytes: bytes) -> tuple[int, int]:
+    image_count = 0
+    linked_image_count = 0
+    try:
+        with ZipFile(BytesIO(raw_bytes)) as archive:
+            for part_name in archive.namelist():
+                if not part_name.startswith("ppt/slides/") or not part_name.endswith(".xml"):
+                    continue
+                try:
+                    root = ET.fromstring(archive.read(part_name))
+                except (KeyError, ET.ParseError):
+                    continue
+                for node in root.iter(_a_tag("blip")):
+                    embed_id = node.get(_r_tag("embed"))
+                    link_id = node.get(_r_tag("link"))
+                    if embed_id or link_id:
+                        image_count += 1
+                    if link_id:
+                        linked_image_count += 1
+    except BadZipFile:
+        return 0, 0
+    return image_count, linked_image_count
+
+
+def _count_tool_word_like_texts(texts: Iterable[str]) -> dict[str, int]:
+    asian_characters = 0
+    non_asian_words = 0
+    characters = 0
+    characters_with_spaces = 0
+
+    for text in texts:
+        content = text or ""
+        characters += sum(1 for char in content if not char.isspace())
+        characters_with_spaces += len(content)
+        index = 0
+        while index < len(content):
+            char = content[index]
+            if _ppt_cjk_script(char):
+                asian_characters += 1
+                index += 1
+                continue
+            if _is_ppt_token_char(char):
+                _, index = _consume_ppt_word_like_token(content, index)
+                non_asian_words += 1
+                continue
+            previous_char = content[index - 1] if index > 0 else ""
+            next_char = content[index + 1] if index + 1 < len(content) else ""
+            if _is_ppt_cjk_punctuation(char, previous_char, next_char):
+                asian_characters += 1
+            index += 1
+
+    return {
+        "words": asian_characters + non_asian_words,
+        "non_asian_words": non_asian_words,
+        "asian_characters": asian_characters,
+        "characters": characters,
+        "characters_with_spaces": characters_with_spaces,
+    }
+
+
+def _consume_ppt_word_like_token(text: str, start: int) -> tuple[str, int]:
+    index = start
+    while index < len(text):
+        char = text[index]
+        if _is_ppt_token_char(char) or char in {"'", "’", "-", "_", ".", "/"}:
+            index += 1
+            continue
+        break
+    return text[start:index], index
+
+
+def _ppt_cjk_script(char: str) -> str:
+    if not char or len(char) != 1:
+        return ""
+    code = ord(char)
+    if (
+        0x3400 <= code <= 0x4DBF
+        or 0x4E00 <= code <= 0x9FFF
+        or 0xF900 <= code <= 0xFAFF
+        or 0x20000 <= code <= 0x2A6DF
+        or 0x2A700 <= code <= 0x2B73F
+        or 0x2B740 <= code <= 0x2B81F
+        or 0x2B820 <= code <= 0x2CEAF
+        or 0x2CEB0 <= code <= 0x2EBEF
+        or 0x2F800 <= code <= 0x2FA1F
+        or 0x30000 <= code <= 0x3134F
+    ):
+        return "han"
+    if 0x3040 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF or 0xFF66 <= code <= 0xFF9D:
+        return "kana"
+    if (
+        0x1100 <= code <= 0x11FF
+        or 0x3130 <= code <= 0x318F
+        or 0xA960 <= code <= 0xA97F
+        or 0xAC00 <= code <= 0xD7AF
+        or 0xD7B0 <= code <= 0xD7FF
+    ):
+        return "hangul"
+    return ""
+
+
+def _is_ppt_token_char(char: str) -> bool:
+    if not char or _ppt_cjk_script(char):
+        return False
+    return unicodedata.category(char)[0] in {"L", "N"}
+
+
+def _is_ppt_cjk_punctuation(char: str, previous_char: str = "", next_char: str = "") -> bool:
+    if not char or char.isspace() or _is_ppt_token_char(char):
+        return False
+    code = ord(char)
+    if unicodedata.category(char)[0] not in {"P", "S"}:
+        return False
+    if (
+        0x3000 <= code <= 0x303F
+        or 0xFE10 <= code <= 0xFE1F
+        or 0xFE30 <= code <= 0xFE4F
+        or 0xFF00 <= code <= 0xFFEF
+    ):
+        return True
+    return char in {"“", "”", "‘", "’", "—", "–", "…", "·"} and bool(
+        _ppt_cjk_script(previous_char) or _ppt_cjk_script(next_char)
+    )
+
+
+def _count_nonempty_text_lines(text: str) -> int:
+    return sum(1 for line in re.split(r"\r\n|\r|\n", text or "") if line.strip())
+
+
+def _count_text_blocks(text: str) -> int:
+    content = (text or "").strip()
+    if not content:
+        return 0
+    blocks = [block for block in re.split(r"(?:\r?\n\s*){2,}", content) if block.strip()]
+    return len(blocks) if blocks else _count_nonempty_text_lines(content)
 
 
 def _count_word_words(paragraphs: Iterable[str]) -> int:

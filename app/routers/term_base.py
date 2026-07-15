@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import json
 import logging
 from concurrent.futures import CancelledError, ThreadPoolExecutor
@@ -12,14 +13,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.auth import (
     can_access_all_projects,
     get_current_user,
     get_user_display_name,
-    is_admin_role,
-    require_admin,
     require_resource_creator,
 )
 from app.config import get_settings
@@ -84,6 +83,13 @@ class TermBasePayload(BaseModel):
     target_language: str
 
 
+class TermBaseLanguagePairCopyPayload(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    source_language: str
+    target_language: str
+
+
 class TermBaseMergePayload(BaseModel):
     source_term_base_ids: list[UUID]
     name: str
@@ -112,6 +118,20 @@ class TermEntryBatchPayload(BaseModel):
 
 def _normalize_term_base_name(name: str) -> str:
     return " ".join(name.strip().split())
+
+
+def _build_unique_term_base_name(db: Session, raw_name: str) -> str:
+    base_name = _normalize_term_base_name(raw_name)
+    if not base_name:
+        raise HTTPException(status_code=400, detail="术语库名称不能为空。")
+    base_name = base_name[:120].rstrip()
+    candidate = base_name
+    suffix_index = 2
+    while db.query(TermBase.id).filter(TermBase.name == candidate).first() is not None:
+        suffix = f" {suffix_index}"
+        candidate = f"{base_name[:120 - len(suffix)].rstrip()}{suffix}"
+        suffix_index += 1
+    return candidate
 
 
 def _require_term_language_pair(
@@ -221,6 +241,30 @@ def _serialize_term_entry(entry: TermEntry) -> dict:
         "created_at": entry.created_at.isoformat(),
         "updated_at": entry.updated_at.isoformat(),
     }
+
+
+def _apply_term_entry_sort(query, sort_by: str | None, sort_order: str | None):
+    order = "asc" if sort_order == "asc" else "desc"
+    sort_columns = {
+        "source_text": TermEntry.source_text,
+        "target_text": TermEntry.target_text,
+        "created_at": TermEntry.created_at,
+        "updated_at": TermEntry.updated_at,
+    }
+    if sort_by in sort_columns:
+        column = sort_columns[sort_by]
+        return query.order_by(column.asc() if order == "asc" else column.desc(), TermEntry.id.asc())
+    if sort_by == "creator_name":
+        creator = aliased(User)
+        column = func.coalesce(creator.nickname, creator.username, "")
+        query = query.outerjoin(creator, TermEntry.creator_id == creator.id)
+        return query.order_by(column.asc() if order == "asc" else column.desc(), TermEntry.id.asc())
+    if sort_by == "last_modified_by_name":
+        modifier = aliased(User)
+        column = func.coalesce(modifier.nickname, modifier.username, "")
+        query = query.outerjoin(modifier, TermEntry.last_modified_by_id == modifier.id)
+        return query.order_by(column.asc() if order == "asc" else column.desc(), TermEntry.id.asc())
+    return query.order_by(TermEntry.updated_at.desc(), TermEntry.created_at.desc())
 
 
 def _require_term_entry_owner_or_admin(entry: TermEntry, current_user: User) -> None:
@@ -394,7 +438,7 @@ def _require_term_entry_create_access(
     file_record_id: UUID | None,
     current_user: User,
 ) -> None:
-    if is_admin_role(getattr(current_user, "role", None)):
+    if can_access_all_projects(current_user):
         return
 
     if file_record_id is None:
@@ -487,7 +531,7 @@ def create_term_base(
 def merge_term_bases(
     payload: TermBaseMergePayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_resource_creator),
 ):
     source_term_base_ids = list(dict.fromkeys(payload.source_term_base_ids))
     if len(source_term_base_ids) < 2:
@@ -609,7 +653,7 @@ def update_term_base(
     term_base_id: UUID,
     payload: TermBasePayload,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_resource_creator),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
     name = _normalize_term_base_name(payload.name)
@@ -651,11 +695,71 @@ def update_term_base(
     return _serialize_term_base(term_base, entry_count)
 
 
+@router.post("/term-bases/{term_base_id}/copy-language-pair")
+def copy_term_base_to_language_pair(
+    term_base_id: UUID,
+    payload: TermBaseLanguagePairCopyPayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_resource_creator),
+):
+    source_term_base = _get_term_base_or_404(db, term_base_id)
+    source_language, target_language = _require_term_language_pair(
+        payload.source_language,
+        payload.target_language,
+    )
+    default_name = f"{source_term_base.name} {source_language}->{target_language}"
+    name = _build_unique_term_base_name(db, payload.name or default_name)
+
+    target_term_base = TermBase(
+        name=name,
+        description=normalize_text(
+            payload.description if payload.description is not None else (source_term_base.description or "")
+        ) or None,
+        source_language=source_language,
+        target_language=target_language,
+        creator_id=current_user.id,
+    )
+    db.add(target_term_base)
+    try:
+        db.flush()
+        source_entries = (
+            db.query(TermEntry)
+            .filter(TermEntry.term_base_id == source_term_base.id)
+            .order_by(TermEntry.created_at.asc(), TermEntry.id.asc())
+            .all()
+        )
+        for entry in source_entries:
+            db.add(TermEntry(
+                term_base_id=target_term_base.id,
+                source_text=entry.source_text,
+                target_text=entry.target_text,
+                source_normalized=entry.source_normalized,
+                source_language=source_language,
+                target_language=target_language,
+                creator_id=entry.creator_id or current_user.id,
+                last_modified_by_id=current_user.id,
+                external_tuid=entry.external_tuid,
+                tmx_metadata=deepcopy(entry.tmx_metadata),
+            ))
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="复制术语库失败，可能存在同名库。") from exc
+
+    db.refresh(target_term_base)
+    entry_count = (
+        db.query(TermEntry)
+        .filter(TermEntry.term_base_id == target_term_base.id)
+        .count()
+    )
+    return _serialize_term_base(target_term_base, entry_count)
+
+
 @router.delete("/term-bases/{term_base_id}")
 def delete_term_base(
     term_base_id: UUID,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_resource_creator),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
     entry_count = (
@@ -712,7 +816,7 @@ async def preview_term_base_xlsx(
     preview_limit: int = Form(default=100),
     skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_resource_creator),
 ):
     extension = _validate_term_import_upload(file)
     task_id, staged_file = await asyncio.to_thread(_stage_resource_upload_file, file)
@@ -1009,7 +1113,7 @@ async def import_term_base_xlsx(
     skip_duplicate_row_indexes: str = Form(default="[]"),
     skip_header: bool = Form(default=False),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_resource_creator),
 ):
     if term_base_id is None:
         raise HTTPException(status_code=400, detail="请先选择要导入的术语库。")
@@ -1078,7 +1182,7 @@ def batch_save_term_base_entries(
     term_base_id: UUID,
     payload: TermEntryBatchPayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_resource_creator),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
     return save_term_entries_batch(
@@ -1096,6 +1200,8 @@ def list_term_base_entries(
     limit: int = 50,
     search: str | None = None,
     case_sensitive: bool = False,
+    sort_by: str | None = None,
+    sort_order: str | None = "desc",
     db: Session = Depends(get_db),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
@@ -1125,8 +1231,7 @@ def list_term_base_entries(
 
     total = query.count()
     rows = (
-        query
-        .order_by(TermEntry.updated_at.desc(), TermEntry.created_at.desc())
+        _apply_term_entry_sort(query, sort_by, sort_order)
         .offset(safe_skip)
         .limit(safe_limit)
         .all()

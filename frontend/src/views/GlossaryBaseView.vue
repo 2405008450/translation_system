@@ -64,8 +64,8 @@ const showCreateDialog = ref(false)
 let exportPollTimer: number | null = null
 let disposed = false
 
-const canManageResources = computed(() => authStore.isAdmin)
-const canCreateResources = computed(() => authStore.isAdmin || authStore.isInternalTranslator)
+const canManageResources = computed(() => authStore.isBusinessManager)
+const canCreateResources = computed(() => authStore.isBusinessManager)
 
 function normalizeResourceSearchText(value: unknown) {
   return String(value ?? '').trim().toLowerCase()

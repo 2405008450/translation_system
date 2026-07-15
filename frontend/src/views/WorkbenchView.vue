@@ -101,6 +101,10 @@ import {
   isProgressComplete,
   patchTranslationWorkflowProgress,
 } from '../utils/progress'
+import {
+  matchesSearchKeyword as matchesSharedSearchKeyword,
+  normalizeSearchText as normalizeSharedSearchText,
+} from '../utils/search'
 import { hasTermTextMatch } from '../utils/termMatching'
 import { consumeLLMStream } from '../utils/llmStream'
 import { useAuthStore } from '../stores/auth'
@@ -466,6 +470,7 @@ const segmentEditorFontScale = ref(getInitialSegmentEditorFontScale())
 const activeSideTool = ref<SideToolKey | null>(null)
 const activeBottomTool = ref<BottomToolKey | null>(null)
 const openingBottomTool = ref<BottomDrawerToolKey | null>(null)
+const referenceMatchResult = ref<import('../types/api').ReferenceMatchResult | null>(null)
 const previewPanelRendering = ref(false)
 const bottomDrawerPanelHeightStyle = computed(() => {
   if (!activeBottomTool.value) {
@@ -650,7 +655,6 @@ const addTermFormError = ref('')
 const termsMessage = ref(t('workbench.terms.defaultMessage'))
 
 // 参考文件匹配结果
-const referenceMatchResult = ref<import('../types/api').ReferenceMatchResult | null>(null)
 
 let searchLoadRequestId = 0
 let suppressSegmentFilterWatch = false
@@ -1161,8 +1165,11 @@ const loadedSegmentStatusStats = computed<SegmentStatusStats>(() => {
   const stats = createWorkbenchStatusStats()
   stats.total = segmentStore.segments.length
   for (const segment of segmentStore.segments) {
-    const status = resolveWorkbenchEffectiveStatus(segment)
-    stats[status] += 1
+    const matchStatus = resolveWorkbenchMatchStatus(segment)
+    stats[matchStatus] += 1
+    if (segment.status === 'confirmed') {
+      stats.confirmed += 1
+    }
     if (
       isEmptyTargetForWorkbench(segment.target_text)
       || retainedEmptyTargetSentenceIds.value.has(segment.sentence_id)
@@ -1977,12 +1984,7 @@ function resolveLiteralSearchKeyword(value: string) {
 }
 
 function normalizeSearchText(value: string, caseSensitive = searchCaseSensitive.value) {
-  const keyword = resolveLiteralSearchKeyword(value)
-  return caseSensitive ? keyword : keyword.toLocaleLowerCase()
-}
-
-function normalizeFuzzySearchText(value: string, caseSensitive = searchCaseSensitive.value) {
-  return normalizeSearchText(value, caseSensitive).replace(/[\s.,，。;；:：'"“”‘’!?！？()[\]{}<>《》、\\/|_-]+/g, '')
+  return normalizeSharedSearchText(resolveLiteralSearchKeyword(value), { caseSensitive })
 }
 
 function buildSourceSearchableText(segment: Segment) {
@@ -2000,32 +2002,15 @@ function getSegmentCopyableSourceText(segment: Segment) {
   return segment.display_text || segment.source_text || ''
 }
 
-function isSubsequenceMatch(value: string, keyword: string) {
-  const normalizedValue = normalizeFuzzySearchText(value)
-  const normalizedKeyword = normalizeFuzzySearchText(keyword)
-  if (!normalizedKeyword) {
-    return !resolveLiteralSearchKeyword(keyword)
-  }
-
-  let cursor = 0
-  for (const char of normalizedValue) {
-    if (char === normalizedKeyword[cursor]) {
-      cursor += 1
-      if (cursor >= normalizedKeyword.length) {
-        return true
-      }
-    }
-  }
-  return false
-}
-
 function matchesSearchKeyword(value: string, keyword: string) {
   if (!keyword) {
     return true
   }
-  const normalizedValue = normalizeSearchText(value)
-  return normalizedValue.includes(keyword)
-    || (searchFuzzyEnabled.value && isSubsequenceMatch(value, keyword))
+  return matchesSharedSearchKeyword(value, keyword, {
+    caseSensitive: searchCaseSensitive.value,
+    fuzzy: searchFuzzyEnabled.value,
+    minSubsequenceLength: 1,
+  })
 }
 
 const normalizedSourceSearchQuery = computed(() => normalizeSearchText(sourceSearchQuery.value))
@@ -2095,10 +2080,7 @@ function isShortWorkbenchStructuralFragment(value: string | null | undefined) {
   return Boolean(core && core.length <= 4 && /^(?:\d+[A-Za-z]?|[A-Za-z]|[ivxlcdmIVXLCDM]{1,4})$/.test(core))
 }
 
-function resolveWorkbenchEffectiveStatus(segment: Segment) {
-  if (segment.status === 'confirmed') {
-    return 'confirmed'
-  }
+function resolveWorkbenchMatchStatus(segment: Segment) {
   const sourceText = normalizeWorkbenchMatchText(segment.source_text)
   const displayText = normalizeWorkbenchMatchText(segment.display_text)
   const matchedSourceText = normalizeWorkbenchMatchText(segment.matched_source_text)
@@ -2120,18 +2102,18 @@ function resolveWorkbenchEffectiveStatus(segment: Segment) {
 }
 
 function matchesSegmentDisplayScope(segment: Segment) {
-  const effectiveStatus = resolveWorkbenchEffectiveStatus(segment)
+  const matchStatus = resolveWorkbenchMatchStatus(segment)
   if (segmentDisplayScope.value === 'exact_only') {
-    return effectiveStatus === 'exact'
+    return matchStatus === 'exact'
   }
   if (segmentDisplayScope.value === 'fuzzy_only') {
-    return effectiveStatus === 'fuzzy'
+    return matchStatus === 'fuzzy'
   }
   if (segmentDisplayScope.value === 'none_only') {
-    return effectiveStatus === 'none'
+    return matchStatus === 'none'
   }
   if (segmentDisplayScope.value === 'confirmed_only') {
-    return effectiveStatus === 'confirmed'
+    return segment.status === 'confirmed'
   }
   if (segmentDisplayScope.value === 'empty_target') {
     return isEmptyTargetForWorkbench(segment.target_text)
@@ -5250,6 +5232,13 @@ const selectedSentenceIds = ref<Set<string>>(new Set())
 const segmentSelectionAnchorId = ref<string | null>(null)
 const lastSourceCaretOffset = ref<number | null>(null)
 
+// 判断当前文件是否为 CAD 文件（DWG/DXF）
+const isCadFile = computed(() => {
+  const filename = segmentStore.fileRecord?.filename || ''
+  const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase()
+  return ext === '.dwg' || ext === '.dxf'
+})
+
 // 切换激活句段时清除光标缓存
 watch(() => segmentStore.activeSentenceId, () => {
   lastSourceCaretOffset.value = null
@@ -5302,7 +5291,7 @@ function handleSegmentClick(sentenceId: string, event: MouseEvent) {
 }
 
 /**
- * 监听原文编辑器中的光标变化，实时缓存偏移量
+ * 监听原文编辑器中的光标变化，实时缓存偏移量（相对 display_text）
  */
 function trackSourceCaretPosition() {
   if (!segmentStore.activeSentenceId) return
@@ -5319,12 +5308,19 @@ function trackSourceCaretPosition() {
   const preCaretRange = range.cloneRange()
   preCaretRange.selectNodeContents(sourceEditor)
   preCaretRange.setEnd(range.startContainer, range.startOffset)
-  lastSourceCaretOffset.value = preCaretRange.toString().length
+  // 可见换行标记渲染为 "¶\n"，折叠为真实换行长度
+  lastSourceCaretOffset.value = preCaretRange.toString().replace(/¶\n/g, '\n').replace(/¶/g, '\n').length
+}
+
+function handleSourceCaretChange(sentenceId: string, offset: number) {
+  if (sentenceId !== segmentStore.activeSentenceId) return
+  lastSourceCaretOffset.value = offset
 }
 
 const canSplitSegment = computed(() => {
   if (!activeSegment.value) return false
-  return activeSegmentCanWrite.value && (activeSegment.value.source_text || '').length >= 2
+  const displayText = getSegmentCopyableSourceText(activeSegment.value)
+  return activeSegmentCanWrite.value && displayText.length >= 2
 })
 
 const orderedSelectedMergeSegments = computed(() => {
@@ -5377,14 +5373,17 @@ const mergeSegmentButtonTitle = computed(() => {
 async function handleSplitSegment() {
   if (!activeSegment.value || !canSplitSegment.value) return
 
+  // 点击工具栏前再读一次光标，避免 selectionchange 漏记
+  trackSourceCaretPosition()
+
   const caretOffset = lastSourceCaretOffset.value
   if (caretOffset === null || caretOffset <= 0) {
     toast.warn({ message: t('workbench.messages.splitNoCaret') })
     return
   }
 
-  const sourceText = activeSegment.value.source_text || ''
-  if (caretOffset >= sourceText.length) {
+  const displayText = getSegmentCopyableSourceText(activeSegment.value)
+  if (caretOffset >= displayText.length) {
     toast.warn({ message: t('workbench.messages.splitNoCaret') })
     return
   }
@@ -5392,6 +5391,7 @@ async function handleSplitSegment() {
   try {
     await segmentStore.splitSegment(segmentKeyOf(activeSegment.value), caretOffset)
     lastSourceCaretOffset.value = null
+    sourceEditing.value = false
     // 刷新预览（如果预览面板已打开）
     if (activeBottomTool.value === 'source-preview' || activeBottomTool.value === 'split-preview') {
       await segmentStore.ensurePreviewLoaded('source')
@@ -5418,12 +5418,15 @@ async function handleMergeSegment() {
     return
   }
 
-  // 检查是否属于同一段落
+  // CAD 文件（DWG/DXF）：允许跨 block 合并，不检查相邻性
+  // 其他格式：必须同一 block
   const first = orderedSegments[0]
-  const notSameBlock = orderedSegments.some((segment) => !isSameMergeBlock(segment, first))
-  if (notSameBlock) {
-    toast.warn({ message: t('workbench.messages.mergeDifferentBlock') })
-    return
+  if (!isCadFile.value) {
+    const notSameBlock = orderedSegments.some((segment) => !isSameMergeBlock(segment, first))
+    if (notSameBlock) {
+      toast.warn({ message: t('workbench.messages.mergeDifferentBlock') })
+      return
+    }
   }
 
   try {
@@ -6949,6 +6952,12 @@ function handleSegmentTargetActivate(sentenceId: string) {
   segmentStore.setActiveSentence(sentenceId)
 }
 
+function handleSegmentSourceActivate(sentenceId: string) {
+  selectedSentenceIds.value = new Set([sentenceId])
+  segmentSelectionAnchorId.value = sentenceId
+  segmentStore.setActiveSentence(sentenceId)
+}
+
 watch(() => props.id, () => {
   if (props.mergeViewId) {
     void loadMergeViewTask()
@@ -7605,7 +7614,14 @@ onBeforeRouteLeave(async () => {
                 </span>
               </span>
             </button>
-            <button class="tool-line tool-button" type="button" :disabled="!canSplitSegment" @click="handleSplitSegment">
+            <button
+              class="tool-line tool-button"
+              type="button"
+              :disabled="!canSplitSegment"
+              :title="t('workbench.shortcutItems.splitSegment')"
+              @mousedown.prevent
+              @click="handleSplitSegment"
+            >
               <span class="icon-text-area">
                 <span class="tool-item" :class="{ disabled: !canSplitSegment }">
                   <Split class="tool-label-icon" :size="16" />
@@ -8865,6 +8881,8 @@ onBeforeRouteLeave(async () => {
                       :pending-formats="pendingFormatsForEditor"
                       @focus="segmentStore.setActiveSentence"
                       @activate-target="handleSegmentTargetActivate"
+                      @activate-source="handleSegmentSourceActivate"
+                      @source-caret-change="handleSourceCaretChange"
                       @copy-source-to-target="copySourceToTargetForSegment"
                       @update="updateSegmentTarget"
                       @update-source="updateSegmentSource"

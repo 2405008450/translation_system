@@ -20,6 +20,7 @@
 -- =============================================================================
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS btree_gin;
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- -----------------------------------------------------------------------------
@@ -176,6 +177,10 @@ CREATE INDEX IF NOT EXISTS ix_memory_entries_source_text_trgm
 CREATE INDEX IF NOT EXISTS ix_memory_entries_source_normalized_trgm
     ON memory_entries
     USING GIN (source_normalized gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS ix_memory_entries_lang_collection_source_normalized_trgm
+    ON memory_entries
+    USING GIN (source_language, target_language, collection_id, source_normalized gin_trgm_ops)
+    WHERE source_normalized IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_memory_entries_source_embedding_version
     ON memory_entries (source_embedding_version);
 CREATE INDEX IF NOT EXISTS ix_memory_entries_source_embedding_ivfflat
@@ -188,6 +193,116 @@ CREATE TRIGGER update_memory_entries_updated_at
     BEFORE UPDATE ON memory_entries
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TABLE IF NOT EXISTS memory_entry_search (
+    entry_id UUID NOT NULL,
+    collection_id UUID,
+    source_language VARCHAR(20) NOT NULL,
+    target_language VARCHAR(20) NOT NULL,
+    source_hash VARCHAR(64),
+    source_normalized TEXT NOT NULL,
+    source_length INTEGER NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+) PARTITION BY RANGE (source_length);
+
+CREATE TABLE IF NOT EXISTS memory_entry_search_len_000_016
+    PARTITION OF memory_entry_search FOR VALUES FROM (0) TO (17);
+CREATE TABLE IF NOT EXISTS memory_entry_search_len_017_040
+    PARTITION OF memory_entry_search FOR VALUES FROM (17) TO (41);
+CREATE TABLE IF NOT EXISTS memory_entry_search_len_041_080
+    PARTITION OF memory_entry_search FOR VALUES FROM (41) TO (81);
+CREATE TABLE IF NOT EXISTS memory_entry_search_len_081_160
+    PARTITION OF memory_entry_search FOR VALUES FROM (81) TO (161);
+CREATE TABLE IF NOT EXISTS memory_entry_search_len_161_320
+    PARTITION OF memory_entry_search FOR VALUES FROM (161) TO (321);
+CREATE TABLE IF NOT EXISTS memory_entry_search_len_321_plus
+    PARTITION OF memory_entry_search FOR VALUES FROM (321) TO (MAXVALUE);
+
+CREATE INDEX IF NOT EXISTS ix_mes_000_016_entry_id
+    ON memory_entry_search_len_000_016 (entry_id);
+CREATE INDEX IF NOT EXISTS ix_mes_017_040_entry_id
+    ON memory_entry_search_len_017_040 (entry_id);
+CREATE INDEX IF NOT EXISTS ix_mes_041_080_entry_id
+    ON memory_entry_search_len_041_080 (entry_id);
+CREATE INDEX IF NOT EXISTS ix_mes_081_160_entry_id
+    ON memory_entry_search_len_081_160 (entry_id);
+CREATE INDEX IF NOT EXISTS ix_mes_161_320_entry_id
+    ON memory_entry_search_len_161_320 (entry_id);
+CREATE INDEX IF NOT EXISTS ix_mes_321_plus_entry_id
+    ON memory_entry_search_len_321_plus (entry_id);
+
+CREATE INDEX IF NOT EXISTS ix_mes_000_016_scope_trgm
+    ON memory_entry_search_len_000_016
+    USING GIN (source_language, target_language, collection_id, source_normalized gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS ix_mes_017_040_scope_trgm
+    ON memory_entry_search_len_017_040
+    USING GIN (source_language, target_language, collection_id, source_normalized gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS ix_mes_041_080_scope_trgm
+    ON memory_entry_search_len_041_080
+    USING GIN (source_language, target_language, collection_id, source_normalized gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS ix_mes_081_160_scope_trgm
+    ON memory_entry_search_len_081_160
+    USING GIN (source_language, target_language, collection_id, source_normalized gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS ix_mes_161_320_scope_trgm
+    ON memory_entry_search_len_161_320
+    USING GIN (source_language, target_language, collection_id, source_normalized gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS ix_mes_321_plus_scope_trgm
+    ON memory_entry_search_len_321_plus
+    USING GIN (source_language, target_language, collection_id, source_normalized gin_trgm_ops);
+
+CREATE OR REPLACE FUNCTION sync_memory_entry_search_projection()
+RETURNS TRIGGER AS $$
+DECLARE
+    normalized_length INTEGER;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        DELETE FROM memory_entry_search WHERE entry_id = OLD.id;
+        RETURN OLD;
+    END IF;
+
+    DELETE FROM memory_entry_search WHERE entry_id = NEW.id;
+
+    IF NEW.source_normalized IS NULL
+       OR NEW.source_language IS NULL
+       OR NEW.target_language IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    normalized_length := char_length(NEW.source_normalized);
+    IF normalized_length <= 0 THEN
+        RETURN NEW;
+    END IF;
+
+    INSERT INTO memory_entry_search (
+        entry_id,
+        collection_id,
+        source_language,
+        target_language,
+        source_hash,
+        source_normalized,
+        source_length,
+        updated_at
+    )
+    VALUES (
+        NEW.id,
+        NEW.collection_id,
+        NEW.source_language,
+        NEW.target_language,
+        NEW.source_hash,
+        NEW.source_normalized,
+        normalized_length,
+        COALESCE(NEW.updated_at, NOW())
+    );
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS sync_memory_entry_search_projection_trg ON memory_entries;
+CREATE TRIGGER sync_memory_entry_search_projection_trg
+    AFTER INSERT OR UPDATE OR DELETE ON memory_entries
+    FOR EACH ROW
+    EXECUTE FUNCTION sync_memory_entry_search_projection();
 
 -- 兼容旧库：把 collection_id 仍为 NULL 的历史记录迁入「默认记忆库」
 INSERT INTO memory_bases (name, description)
@@ -980,7 +1095,7 @@ CREATE TABLE IF NOT EXISTS segments (
     )::uuid,
     file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
     workflow_step_id UUID REFERENCES project_workflow_steps(id) ON DELETE SET NULL,
-    sentence_id VARCHAR(20) NOT NULL,
+    sentence_id VARCHAR(100) NOT NULL,
     source_text TEXT NOT NULL,
     source_hash VARCHAR(64),
     display_text TEXT NOT NULL,
@@ -1001,6 +1116,7 @@ CREATE TABLE IF NOT EXISTS segments (
     block_index INTEGER NOT NULL DEFAULT 0,
     row_index INTEGER,
     cell_index INTEGER,
+    sequence_index INTEGER NOT NULL DEFAULT -1,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -1038,6 +1154,10 @@ ALTER TABLE IF EXISTS segments
     ADD COLUMN IF NOT EXISTS llm_provider VARCHAR(40);
 ALTER TABLE IF EXISTS segments
     ADD COLUMN IF NOT EXISTS llm_model VARCHAR(200);
+ALTER TABLE IF EXISTS segments
+    ADD COLUMN IF NOT EXISTS segment_metadata TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE IF EXISTS segments
+    ADD COLUMN IF NOT EXISTS sequence_index INTEGER NOT NULL DEFAULT -1;
 
 CREATE INDEX IF NOT EXISTS ix_segments_file_record_id
     ON segments (file_record_id);
@@ -1047,6 +1167,8 @@ CREATE INDEX IF NOT EXISTS ix_segments_file_source_hash
     ON segments (file_record_id, source_hash);
 CREATE INDEX IF NOT EXISTS ix_segments_file_record_order
     ON segments (file_record_id, block_index, row_index, cell_index, sentence_id);
+CREATE INDEX IF NOT EXISTS ix_segments_file_record_sequence_order
+    ON segments (file_record_id, block_index, row_index, cell_index, sequence_index, sentence_id);
 CREATE INDEX IF NOT EXISTS ix_segments_workflow_step_id
     ON segments (workflow_step_id);
 -- 检索/筛选加速：scope、status_filters、match_filters 频繁按这些列过滤。
@@ -1169,7 +1291,7 @@ CREATE TABLE IF NOT EXISTS segment_qa_issues (
     project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
     file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
     segment_id UUID NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
-    sentence_id VARCHAR(40) NOT NULL DEFAULT '',
+    sentence_id VARCHAR(100) NOT NULL DEFAULT '',
     rule_key VARCHAR(40) NOT NULL DEFAULT 'spelling_grammar',
     provider VARCHAR(40) NOT NULL DEFAULT 'languagetool',
     language VARCHAR(20) NOT NULL DEFAULT '',
@@ -1226,7 +1348,7 @@ CREATE TABLE IF NOT EXISTS segment_revisions (
     )::uuid,
     file_record_id UUID NOT NULL REFERENCES file_records(id) ON DELETE CASCADE,
     segment_id UUID NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
-    sentence_id VARCHAR(20) NOT NULL,
+    sentence_id VARCHAR(100) NOT NULL,
     before_text TEXT NOT NULL DEFAULT '',
     after_text TEXT NOT NULL DEFAULT '',
     source VARCHAR(20) NOT NULL DEFAULT 'manual',
@@ -1336,6 +1458,25 @@ CREATE TRIGGER update_guideline_templates_updated_at
     BEFORE UPDATE ON guideline_templates
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
+
+-- Lin 分支资源同步与 CAD 句段合并功能所需的兼容字段。
+ALTER TABLE IF EXISTS memory_bases
+    ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE IF EXISTS memory_bases
+    ADD COLUMN IF NOT EXISTS origin VARCHAR(20) NOT NULL DEFAULT 'manual';
+CREATE INDEX IF NOT EXISTS ix_memory_bases_project_id
+    ON memory_bases (project_id);
+CREATE INDEX IF NOT EXISTS ix_memory_bases_origin
+    ON memory_bases (origin);
+
+ALTER TABLE IF EXISTS glossary_bases
+    ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE IF EXISTS glossary_bases
+    ADD COLUMN IF NOT EXISTS origin VARCHAR(20) NOT NULL DEFAULT 'manual';
+CREATE INDEX IF NOT EXISTS ix_glossary_bases_project_id
+    ON glossary_bases (project_id);
+CREATE INDEX IF NOT EXISTS ix_glossary_bases_origin
+    ON glossary_bases (origin);
 
 -- =============================================================================
 -- 完成。首次运行后请通过前端 "/login" 页面使用首次初始化接口创建管理员账号：

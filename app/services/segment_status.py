@@ -54,6 +54,11 @@ def resolve_unconfirmed_segment_status(segment: Any) -> str:
     return "none"
 
 
+def resolve_segment_match_status(segment: Any) -> str:
+    """按 TM 匹配信号分类，不受人工确认状态影响。"""
+    return resolve_unconfirmed_segment_status(segment)
+
+
 def sql_normalize_match_text(column: Any) -> Any:
     value = func.coalesce(column, "")
     value = func.regexp_replace(value, r"[[:space:]]+", " ", "g")
@@ -104,16 +109,15 @@ def segment_has_exact_match_signal_expr(segment_model: Any) -> Any:
 
 
 def segment_effective_status_conditions(segment_model: Any) -> dict[str, Any]:
-    unconfirmed = or_(segment_model.status.is_(None), segment_model.status != "confirmed")
     exact_signal = segment_has_exact_match_signal_expr(segment_model)
     fuzzy_signal = or_(
         segment_model.status == "fuzzy",
         func.coalesce(segment_model.score, 0) > 0,
         sql_normalize_match_text(segment_model.matched_source_text) != "",
     )
-    exact = and_(unconfirmed, exact_signal)
-    fuzzy = and_(unconfirmed, ~exact_signal, fuzzy_signal)
-    none = and_(unconfirmed, ~exact_signal, ~fuzzy_signal)
+    exact = exact_signal
+    fuzzy = and_(~exact_signal, fuzzy_signal)
+    none = and_(~exact_signal, ~fuzzy_signal)
     confirmed = segment_model.status == "confirmed"
     return {
         "exact": exact,
