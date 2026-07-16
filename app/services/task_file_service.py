@@ -1052,11 +1052,18 @@ def build_export_segments_from_source(
                         _get_segment_value(candidate_segment, "source_text", "")
                     )
                     candidate_target = _get_segment_value(candidate_segment, "target_text", "")
+                    # 防止把旧解析器生成的整页 Br 合并句段，错误回填到
+                    # 新解析器拆出的第一个短句段中。
+                    max_candidate_length = len(parsed_source) + max(
+                        500,
+                        len(parsed_source) * 5,
+                    )
                     if (
                         not candidate_source
                         or candidate_source == parsed_source
                         or parsed_source not in candidate_source
                         or candidate_source.find(parsed_source) > 4
+                        or len(candidate_source) > max_candidate_length
                         or candidate_target is None
                         or not str(candidate_target).strip()
                     ):

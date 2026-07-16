@@ -88,17 +88,46 @@ class IdmlExporter:
             content_elements = self._owned_content_elements(para)
             if not content_elements:
                 continue
-            original_texts = [element.text or "" for element in content_elements]
-            self._replace_paragraph_contents(content_elements, paragraph_segments)
-            changed_content_elements.update(
-                element
-                for element, original_text in zip(
-                    content_elements,
-                    original_texts,
-                    strict=True,
+
+            # 新解析结果带 paragraph_part_index。按 Br 分组后分别回写，
+            # 避免一个说明项的译文覆盖同段落中的其他项目符号或换行项。
+            part_groups = self._owned_content_groups(para)
+            segments_by_part: dict[int, list[dict[str, Any]]] = defaultdict(list)
+            has_complete_part_coordinates = True
+            for segment in paragraph_segments:
+                part_index = segment.get("paragraph_part_index")
+                if part_index is None or not 0 <= part_index < len(part_groups):
+                    has_complete_part_coordinates = False
+                    break
+                segments_by_part[part_index].append(segment)
+
+            if has_complete_part_coordinates and segments_by_part:
+                for part_index, part_segments in segments_by_part.items():
+                    part_elements = part_groups[part_index]
+                    original_texts = [element.text or "" for element in part_elements]
+                    self._replace_paragraph_contents(part_elements, part_segments)
+                    changed_content_elements.update(
+                        element
+                        for element, original_text in zip(
+                            part_elements,
+                            original_texts,
+                            strict=True,
+                        )
+                        if (element.text or "") != original_text
+                    )
+            else:
+                # 兼容没有 part 坐标的历史任务。
+                original_texts = [element.text or "" for element in content_elements]
+                self._replace_paragraph_contents(content_elements, paragraph_segments)
+                changed_content_elements.update(
+                    element
+                    for element, original_text in zip(
+                        content_elements,
+                        original_texts,
+                        strict=True,
+                    )
+                    if (element.text or "") != original_text
                 )
-                if (element.text or "") != original_text
-            )
 
         # 对结构回写后仍未变化的 Content 使用文本兜底。旧任务可能手动拆分
         # 过表格标签，因而无法与重新解析出的整段文本一一对应。
@@ -138,6 +167,39 @@ class IdmlExporter:
             if nearest_paragraph is paragraph:
                 result.append(element)
         return result
+
+    @classmethod
+    def _owned_content_groups(cls, paragraph: Any) -> list[list[Any]]:
+        """按当前段落直接拥有的 Br，把 Content 划分为视觉文本组。"""
+        groups: list[list[Any]] = []
+        current: list[Any] = []
+
+        def flush() -> None:
+            if current and any((element.text or "").strip() for element in current):
+                groups.append(list(current))
+            current.clear()
+
+        for element in paragraph.iter():
+            if element is paragraph:
+                continue
+            nearest_paragraph = next(
+                (
+                    ancestor
+                    for ancestor in element.iterancestors()
+                    if cls._local_name(ancestor) == "ParagraphStyleRange"
+                ),
+                None,
+            )
+            if nearest_paragraph is not paragraph:
+                continue
+            element_name = cls._local_name(element)
+            if element_name == "Content":
+                current.append(element)
+            elif element_name == "Br":
+                flush()
+
+        flush()
+        return groups
 
     @staticmethod
     def _replace_content_with_text_map(
@@ -191,6 +253,7 @@ class IdmlExporter:
             replacements: list[dict[str, Any]] = []
             has_translation = False
             for segment in paragraph_segments:
+                segment_metadata = self._load_metadata(segment.get("metadata"))
                 source = str(
                     segment.get("display_text")
                     or segment.get("source_text")
@@ -212,6 +275,9 @@ class IdmlExporter:
                         "source": source,
                         "replacement": replacement,
                         "translated": translated,
+                        "paragraph_part_index": self._to_int(
+                            segment_metadata.get("paragraph_part_index")
+                        ),
                     }
                 )
 

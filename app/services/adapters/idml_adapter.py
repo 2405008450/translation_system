@@ -47,13 +47,10 @@ def _nearest_paragraph(element):
 def _paragraph_text_parts(paragraph) -> List[str]:
     """提取当前段落直接拥有的文本，避免递归吃进嵌套表格。
 
-    表格单元格中的 ``Br`` 是独立标签之间的显式换行，必须保留为
-    句段边界；普通正文中的软换行继续沿用原有的合并行为。
+    IDML 会把项目符号、说明项等多个视觉段落放在同一个
+    ``ParagraphStyleRange`` 中，并用 ``Br`` 标记边界。无论是否位于
+    表格单元格，都必须按该边界拆分，否则整页内容会被拼成一个句段。
     """
-    split_on_break = any(
-        _local_name(ancestor) == "Cell"
-        for ancestor in paragraph.iterancestors()
-    )
     parts: List[str] = []
     current: List[str] = []
 
@@ -69,7 +66,7 @@ def _paragraph_text_parts(paragraph) -> List[str]:
         element_name = _local_name(element)
         if element_name == "Content" and element.text:
             current.append(element.text)
-        elif element_name == "Br" and split_on_break:
+        elif element_name == "Br":
             flush()
 
     flush()
