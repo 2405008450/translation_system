@@ -308,7 +308,10 @@ function resourceMatchesSelectedLanguagePair(resource: TMCollection | TermBase |
 }
 
 const availableTMCollections = computed(() => {
-  return tmCollections.value.filter((collection) => resourceMatchesSelectedLanguagePair(collection))
+  const boundIds = new Set(getBoundTMCollectionIdsFromFiles())
+  return tmCollections.value
+    .filter((collection) => resourceMatchesSelectedLanguagePair(collection))
+    .sort((left, right) => Number(boundIds.has(right.id)) - Number(boundIds.has(left.id)))
 })
 
 const selectedTmCollectionIds = computed(() => (

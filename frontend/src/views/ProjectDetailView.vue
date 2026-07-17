@@ -2250,7 +2250,7 @@ function getFileDetailHint(row: ProjectRow) {
 function getFileMetaText(row: ProjectRow) {
   const languagePair = formatLanguagePair(row.source_language, row.target_language)
   const fileSize = formatBytes(row.file_size_bytes)
-  const createdAt = formatDateParts(row.created_at).date
+  const createdAt = formatDateText(row.created_at)
   return [
     getFileDetailHint(row),
     languagePair,
