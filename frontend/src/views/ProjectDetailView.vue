@@ -20,6 +20,7 @@ import {
   Loader2,
   MoreHorizontal,
   Plus,
+  ReplaceAll,
   Search,
   Settings2,
   ShieldCheck,
@@ -217,6 +218,15 @@ interface ProjectFileItem {
   glossary_base_ids: string[]
 }
 
+interface EnglishVariantCopyResponse {
+  file: ProjectFileItem
+  summary: {
+    processed_segments: number
+    changed_segments: number
+    replacement_count: number
+  }
+}
+
 interface AssignmentDraft {
   assignee_id: string
   workflow_step_id: string
@@ -384,6 +394,7 @@ interface LanguageDetectResponse {
 }
 
 type ProjectRow = ProjectFileItem | Record<string, any>
+type DerivedFileKind = 'template-copy' | 'british-copy' | 'american-copy'
 type ProjectFileSortKey =
   | 'filename'
   | 'progress'
@@ -411,6 +422,7 @@ const { t } = useI18n()
 const loading = ref(false)
 const deleting = ref(false)
 const duplicating = ref(false)
+const creatingEnglishVariantCopy = ref(false)
 const uploading = ref(false)
 const statisticsLoading = ref(false)
 const statisticsReportsLoading = ref(false)
@@ -1261,12 +1273,74 @@ const duplicateTemplateButtonTitle = computed(() => {
   }
   return ''
 })
+const englishVariantCopyDirection = computed<'to-british' | 'to-american' | null>(() => {
+  if (selectedProjectFiles.value.length !== 1) {
+    return null
+  }
+  const targetLanguage = selectedProjectFiles.value[0]?.target_language
+  if (targetLanguage === 'en-US') {
+    return 'to-british'
+  }
+  if (targetLanguage === 'en-GB') {
+    return 'to-american'
+  }
+  return null
+})
+const englishVariantCopyLabel = computed(() => {
+  if (englishVariantCopyDirection.value === 'to-british') {
+    return t('projectDetail.files.actions.britishCopy')
+  }
+  if (englishVariantCopyDirection.value === 'to-american') {
+    return t('projectDetail.files.actions.americanCopy')
+  }
+  return t('projectDetail.files.actions.englishVariantCopy')
+})
+const englishVariantCopyShortLabel = computed(() => {
+  if (englishVariantCopyDirection.value === 'to-british') {
+    return t('projectDetail.files.actions.britishCopyShort')
+  }
+  if (englishVariantCopyDirection.value === 'to-american') {
+    return t('projectDetail.files.actions.americanCopyShort')
+  }
+  return t('projectDetail.files.actions.englishVariantCopyShort')
+})
+const englishVariantCopyDisabledReason = computed(() => {
+  if (creatingEnglishVariantCopy.value) {
+    return t('projectDetail.files.actions.englishVariantCopyCreating')
+  }
+  if (selectedFileIds.value.size === 0) {
+    return t('projectDetail.files.actions.englishVariantCopySelectFirst')
+  }
+  if (selectedFileIds.value.size > 1) {
+    return t('projectDetail.files.actions.englishVariantCopySelectOne')
+  }
+  const sourceFile = selectedProjectFiles.value[0]
+  if (!sourceFile) {
+    return t('projectDetail.files.actions.englishVariantCopySelectFirst')
+  }
+  if (sourceFile.is_edit_locked || sourceFile.active_operation) {
+    return sourceFile.active_operation_message || t('projectDetail.files.actions.englishVariantCopyLocked')
+  }
+  if (!['zh-CN', 'zh-TW', 'zh-HK', 'zh-MO'].includes(sourceFile.source_language || '')
+      || !['en-US', 'en-GB'].includes(sourceFile.target_language || '')) {
+    return t('projectDetail.files.actions.englishVariantCopyUnsupportedPair')
+  }
+  if (Number(sourceFile.pretranslated_segments || 0) <= 0) {
+    return t('projectDetail.files.actions.englishVariantCopyNoTranslation')
+  }
+  return ''
+})
 const deleteSelectedFilesButtonTitle = computed(() => (
   selectedProjectFiles.value.length === 0
     ? t('projectDetail.files.actions.deleteSelectFirst')
     : ''
 ))
 const canDuplicateTemplate = computed(() => canManageProject.value && selectedFileIds.value.size === 1 && !duplicating.value)
+const canCreateEnglishVariantCopy = computed(() => (
+  canManageProject.value
+  && !authStore.isExternalTranslator
+  && !englishVariantCopyDisabledReason.value
+))
 const canOpenTermExtraction = computed(() => (
   Boolean(selectedTermExtractionFile.value)
   && Boolean(selectedTermExtractionFile.value?.can_write)
@@ -1575,6 +1649,40 @@ function getFileLanguagePairLabel(row: ProjectRow) {
     return '未设置语言对'
   }
   return formatLanguagePair(row.source_language, row.target_language)
+}
+
+function getDerivedFileKind(row: ProjectRow): DerivedFileKind | undefined {
+  const filename = String(row.filename || '').trim()
+  const basename = filename.replace(/\.[^.]+$/, '')
+  if (/\s-\s副本(?:\s+\d+)?$/u.test(basename)) {
+    return 'template-copy'
+  }
+  if (/\s-\s英式英语(?:\s+\d+)?$/u.test(basename)) {
+    return 'british-copy'
+  }
+  if (/\s-\s美式英语(?:\s+\d+)?$/u.test(basename)) {
+    return 'american-copy'
+  }
+  return undefined
+}
+
+function getProjectFileRowClass(row: ProjectRow) {
+  const kind = getDerivedFileKind(row)
+  return kind ? `pd-file-row--${kind}` : undefined
+}
+
+function getDerivedFileKindLabel(row: ProjectRow) {
+  const kind = getDerivedFileKind(row)
+  if (kind === 'template-copy') {
+    return t('projectDetail.files.kinds.templateCopy')
+  }
+  if (kind === 'british-copy') {
+    return t('projectDetail.files.kinds.britishCopy')
+  }
+  if (kind === 'american-copy') {
+    return t('projectDetail.files.kinds.americanCopy')
+  }
+  return ''
 }
 
 function getFileAssignees(row: ProjectRow): User[] {
@@ -5382,6 +5490,35 @@ async function duplicateSelectedTemplate() {
   }
 }
 
+async function createEnglishVariantCopy() {
+  if (!canCreateEnglishVariantCopy.value || !project.value) {
+    return
+  }
+  const sourceFile = selectedProjectFiles.value[0]
+  if (!sourceFile) {
+    return
+  }
+
+  creatingEnglishVariantCopy.value = true
+  pageError.value = ''
+  try {
+    const { data } = await http.post<EnglishVariantCopyResponse>(
+      `/projects/${project.value.id}/file-records/${sourceFile.id}/english-variant-copy`,
+    )
+    await loadProject()
+    selectedFileIds.value = new Set([data.file.id])
+    toast.success(t('projectDetail.messages.englishVariantCopyCreated', {
+      name: data.file.filename,
+      changed: data.summary.changed_segments,
+      replacements: data.summary.replacement_count,
+    }))
+  } catch (error) {
+    pageError.value = getErrorMessage(error, t('projectDetail.errors.englishVariantCopy'))
+  } finally {
+    creatingEnglishVariantCopy.value = false
+  }
+}
+
 onMounted(() => {
   document.addEventListener('click', handleDocumentClick)
   window.addEventListener('scroll', handleDocumentScroll, { passive: true })
@@ -7222,8 +7359,27 @@ onBeforeUnmount(() => {
 
               <div class="pd-toolbar-action-group" aria-label="文件操作">
                 <button
+                  v-if="canManageProject && !authStore.isExternalTranslator"
+                  class="button pd-toolbar-action-button pd-toolbar-action-button--labeled pd-toolbar-action-button--variant-copy"
+                  :class="{
+                    'pd-toolbar-action-button--british-copy': englishVariantCopyDirection !== 'to-american',
+                    'pd-toolbar-action-button--american-copy': englishVariantCopyDirection === 'to-american',
+                  }"
+                  data-testid="create-english-variant-copy"
+                  type="button"
+                  :disabled="!canCreateEnglishVariantCopy"
+                  :title="englishVariantCopyDisabledReason || englishVariantCopyLabel"
+                  :aria-label="englishVariantCopyLabel"
+                  @click="createEnglishVariantCopy"
+                >
+                  <Loader2 v-if="creatingEnglishVariantCopy" class="lucide-spin" :size="15" />
+                  <ReplaceAll v-else :size="15" />
+                  <span>{{ englishVariantCopyShortLabel }}</span>
+                </button>
+                <button
                   v-if="canManageProject"
-                  class="button pd-toolbar-action-button"
+                  class="button pd-toolbar-action-button pd-toolbar-action-button--labeled pd-toolbar-action-button--template-copy"
+                  data-testid="duplicate-file-template"
                   type="button"
                   :disabled="!canDuplicateTemplate"
                   :title="duplicateTemplateButtonTitle || t('projectDetail.files.actions.duplicateTemplate')"
@@ -7232,6 +7388,7 @@ onBeforeUnmount(() => {
                 >
                   <Loader2 v-if="duplicating" class="lucide-spin" :size="15" />
                   <Copy v-else :size="15" />
+                  <span>{{ t('projectDetail.files.actions.duplicateTemplateShort') }}</span>
                 </button>
                 <button
                   class="button pd-toolbar-action-button pd-toolbar-action-button--labeled"
@@ -7478,6 +7635,7 @@ onBeforeUnmount(() => {
           :show-index="true"
           :index-offset="indexOffset"
           :empty-text="fileTableEmptyText"
+          :row-class="getProjectFileRowClass"
           @sort="handleFileSort"
           @select="selectedFileIds = $event"
         >
@@ -7485,8 +7643,9 @@ onBeforeUnmount(() => {
             <div class="pd-file-cell">
               <FileText class="pd-file-cell__icon" :size="18" />
               <div class="pd-file-cell__content">
-                <div v-if="canEnterWorkbench(row)" class="pd-file-cell__title-row">
+                <div class="pd-file-cell__title-row">
                   <button
+                    v-if="canEnterWorkbench(row)"
                     class="pd-link-button"
                     data-testid="project-file-open-workbench"
                     type="button"
@@ -7495,8 +7654,15 @@ onBeforeUnmount(() => {
                   >
                     {{ row.filename }}
                   </button>
+                  <span v-else class="pd-file-cell__title" :title="row.filename">{{ row.filename }}</span>
+                  <span
+                    v-if="getDerivedFileKind(row)"
+                    class="pd-file-kind-badge"
+                    :class="`pd-file-kind-badge--${getDerivedFileKind(row)}`"
+                  >
+                    {{ getDerivedFileKindLabel(row) }}
+                  </span>
                 </div>
-                <span v-else class="pd-file-cell__title" :title="row.filename">{{ row.filename }}</span>
                 <span class="pd-file-cell__meta" :title="getFileMetaText(row)">{{ getFileMetaText(row) }}</span>
               </div>
             </div>
@@ -9748,74 +9914,69 @@ onBeforeUnmount(() => {
   align-items: center;
   flex: 0 1 auto;
   flex-wrap: wrap;
-  gap: 1px;
+  gap: 4px;
   max-width: 100%;
   min-width: 0;
-  padding: 1px;
-  border: 1px solid color-mix(in srgb, var(--line-soft) 84%, var(--brand-100));
-  border-radius: 7px;
-  background: color-mix(in srgb, var(--surface-panel) 90%, var(--surface-muted));
 }
 
 .pd-toolbar-action-group {
   display: inline-flex;
   align-items: center;
   flex: 0 0 auto;
-  gap: 1px;
+  gap: 2px;
   min-width: 0;
-  padding: 1px 2px;
 }
 
-.pd-toolbar-action-group + .pd-toolbar-action-group {
-  margin-left: 1px;
-  padding-left: 5px;
-  border-left: 1px solid color-mix(in srgb, var(--line-soft) 72%, transparent);
+/* Keep the danger action slightly set apart with a light divider */
+.pd-toolbar-action-group--danger {
+  margin-left: 4px;
+  padding-left: 8px;
+  border-left: 1px solid color-mix(in srgb, var(--line-soft) 60%, transparent);
 }
 
-.pd-toolbar-action-group--featured {
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--brand-050) 36%, transparent);
-}
-
-.pd-toolbar-action-group--reserved {
-  opacity: 0.7;
-}
-
-.pd-toolbar-action-group--reserved .pd-toolbar-action-button,
-.pd-toolbar-action-group--utility .pd-toolbar-action-button {
-  width: 30px;
-  min-width: 30px;
-  height: 27px;
-  min-height: 27px;
+/* Hide not-yet-available placeholders to keep the bar clean and minimal */
+.pd-toolbar-action-group--reserved,
+.pd-toolbar-action-group--utility {
+  display: none;
 }
 
 .pd-toolbar-action-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   width: 32px;
   min-width: 32px;
-  height: 28px;
-  min-height: 28px;
+  height: 32px;
+  min-height: 32px;
   padding: 0;
-  border-color: transparent;
-  border-radius: 5px;
+  border: 1px solid transparent;
+  border-radius: 8px;
   background: transparent;
   color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 650;
+  font-size: 12.5px;
+  font-weight: 600;
   line-height: 1;
   box-shadow: none;
   white-space: nowrap;
 }
 
-.pd-toolbar-action-button:not(.pd-toolbar-action-button--labeled) {
-  width: 32px;
-  min-width: 32px;
-  padding: 0;
+.pd-toolbar-action-button .lucide {
+  flex: 0 0 auto;
+  color: currentColor;
 }
 
-.pd-toolbar-action-button--labeled {
-  max-width: 32px;
+.pd-toolbar-action-button:not(:disabled):hover {
+  background: color-mix(in srgb, var(--brand-050) 66%, var(--surface-muted));
+  color: var(--brand-700);
 }
 
+.pd-toolbar-action-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Secondary actions are icon-only; the label is kept for accessibility */
 .pd-toolbar-action-button--labeled span {
   position: absolute;
   width: 1px;
@@ -9825,92 +9986,68 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.pd-toolbar-action-button .lucide {
-  flex: 0 0 auto;
-  color: currentColor;
+/* Featured "smart" actions keep their text label as compact pills */
+.pd-toolbar-action-group--featured .pd-toolbar-action-button--labeled {
+  width: auto;
+  min-width: 0;
+  padding: 0 12px;
+}
+
+.pd-toolbar-action-group--featured .pd-toolbar-action-button--labeled span {
+  position: static;
+  width: auto;
+  height: auto;
+  overflow: visible;
+  clip: auto;
 }
 
 .pd-toolbar-action-button--accent {
-  background: color-mix(in srgb, var(--brand-100) 52%, var(--surface-panel));
+  background: color-mix(in srgb, var(--brand-100) 46%, var(--surface-panel));
   color: var(--brand-700);
 }
 
-.pd-toolbar-action-button:not(:disabled):hover {
-  border-color: color-mix(in srgb, var(--brand-700) 28%, var(--line-soft));
-  background: var(--surface-panel);
+.pd-toolbar-action-button--accent:not(:disabled):hover {
+  background: color-mix(in srgb, var(--brand-100) 72%, var(--surface-panel));
   color: var(--brand-700);
-  box-shadow: 0 4px 10px rgba(17, 49, 42, 0.08);
 }
 
-.pd-toolbar-action-button:disabled {
-  opacity: 0.42;
+/* Subtle icon tint keeps the copy actions recognisable without a colour block */
+.pd-toolbar-action-button--british-copy .lucide {
+  color: #2563eb;
 }
 
-.pd-toolbar-action-group--reserved .pd-toolbar-action-button:disabled {
-  opacity: 0.36;
+.pd-toolbar-action-button--american-copy .lucide {
+  color: #7c3aed;
+}
+
+.pd-toolbar-action-button--template-copy .lucide {
+  color: #b45309;
+}
+
+.pd-toolbar-export-button {
+  width: auto;
+  min-width: 0;
+  gap: 3px;
+  padding: 0 8px;
+}
+
+.pd-toolbar-export-button .lucide:last-child {
+  width: 12px;
+  height: 12px;
+  opacity: 0.7;
 }
 
 .pd-toolbar-action-button--danger {
   color: var(--state-danger);
 }
 
+.pd-toolbar-action-button--danger .lucide {
+  color: var(--state-danger);
+}
+
 .pd-toolbar-action-button--danger:not(:disabled):hover {
-  border-color: color-mix(in srgb, var(--state-danger) 34%, var(--line-soft));
   background: var(--state-danger-bg);
   color: var(--state-danger);
-  box-shadow: 0 4px 10px rgba(194, 59, 63, 0.1);
-}
-
-.pd-toolbar-export-button {
-  width: 38px;
-  min-width: 38px;
-  max-width: 38px;
-  gap: 2px;
-  padding: 0 3px;
-}
-
-.pd-toolbar-export-button .lucide:last-child {
-  width: 12px;
-  height: 12px;
-  opacity: 0.72;
-}
-
-@media (max-width: 1680px) {
-  .pd-toolbar-action-group--reserved,
-  .pd-toolbar-action-group--utility {
-    display: none;
-  }
-
-  .pd-toolbar-action-group:not(.pd-toolbar-action-group--featured) .pd-toolbar-action-button--labeled {
-    width: 32px;
-    min-width: 32px;
-    max-width: 32px;
-    padding: 0;
-  }
-
-  .pd-toolbar-action-group:not(.pd-toolbar-action-group--featured) .pd-toolbar-export-button {
-    width: 38px;
-    min-width: 38px;
-    max-width: 38px;
-    padding: 0 3px;
-  }
-
-}
-
-@media (max-width: 1280px) {
-  .pd-toolbar-action-button--labeled {
-    width: 32px;
-    min-width: 32px;
-    max-width: 32px;
-    padding: 0;
-  }
-
-  .pd-toolbar-export-button {
-    width: 38px;
-    min-width: 38px;
-    max-width: 38px;
-    padding: 0 3px;
-  }
 }
 
 .pd-file-filters {
@@ -10301,6 +10438,48 @@ onBeforeUnmount(() => {
   min-width: 1080px;
 }
 
+.pd-file-table :deep(.data-table tbody tr.pd-file-row--template-copy) {
+  background: color-mix(in srgb, #d97706 4%, var(--surface-panel));
+  box-shadow: inset 3px 0 0 color-mix(in srgb, #d97706 72%, transparent);
+}
+
+.pd-file-table :deep(.data-table tbody tr.pd-file-row--british-copy) {
+  background: color-mix(in srgb, #2563eb 4%, var(--surface-panel));
+  box-shadow: inset 3px 0 0 color-mix(in srgb, #2563eb 68%, transparent);
+}
+
+.pd-file-table :deep(.data-table tbody tr.pd-file-row--american-copy) {
+  background: color-mix(in srgb, #7c3aed 4%, var(--surface-panel));
+  box-shadow: inset 3px 0 0 color-mix(in srgb, #7c3aed 68%, transparent);
+}
+
+.pd-file-table :deep(.data-table tbody tr.pd-file-row--template-copy:hover) {
+  background: color-mix(in srgb, #d97706 7%, var(--surface-panel));
+}
+
+.pd-file-table :deep(.data-table tbody tr.pd-file-row--british-copy:hover) {
+  background: color-mix(in srgb, #2563eb 7%, var(--surface-panel));
+}
+
+.pd-file-table :deep(.data-table tbody tr.pd-file-row--american-copy:hover) {
+  background: color-mix(in srgb, #7c3aed 7%, var(--surface-panel));
+}
+
+.pd-file-table :deep(.data-table tbody tr.pd-file-row--template-copy.is-selected) {
+  background: color-mix(in srgb, #d97706 5%, var(--teal-050));
+  box-shadow: inset 3px 0 0 #d97706;
+}
+
+.pd-file-table :deep(.data-table tbody tr.pd-file-row--british-copy.is-selected) {
+  background: color-mix(in srgb, #2563eb 5%, var(--teal-050));
+  box-shadow: inset 3px 0 0 #2563eb;
+}
+
+.pd-file-table :deep(.data-table tbody tr.pd-file-row--american-copy.is-selected) {
+  background: color-mix(in srgb, #7c3aed 5%, var(--teal-050));
+  box-shadow: inset 3px 0 0 #7c3aed;
+}
+
 .pd-statistics-file-table :deep(.data-table) {
   min-width: 980px;
 }
@@ -10586,6 +10765,34 @@ onBeforeUnmount(() => {
   font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.pd-file-kind-badge {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.pd-file-kind-badge--template-copy {
+  border-color: color-mix(in srgb, #d97706 18%, transparent);
+  background: color-mix(in srgb, #d97706 6%, transparent);
+  color: #9a5b00;
+}
+
+.pd-file-kind-badge--british-copy {
+  border-color: color-mix(in srgb, #2563eb 18%, transparent);
+  background: color-mix(in srgb, #2563eb 6%, transparent);
+  color: #1d4ed8;
+}
+
+.pd-file-kind-badge--american-copy {
+  border-color: color-mix(in srgb, #7c3aed 18%, transparent);
+  background: color-mix(in srgb, #7c3aed 6%, transparent);
+  color: #6d28d9;
 }
 
 .pd-file-cell__meta {

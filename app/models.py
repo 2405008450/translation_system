@@ -1010,7 +1010,7 @@ class Segment(Base):
     matched_creator_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     matched_created_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
     matched_updated_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
-    source: Mapped[str] = mapped_column(String(20), nullable=False, default="tm")
+    source: Mapped[str] = mapped_column(String(40), nullable=False, default="tm")
     source_word_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     llm_provider: Mapped[str | None] = mapped_column(String(40), nullable=True)
     llm_model: Mapped[str | None] = mapped_column(String(200), nullable=True)

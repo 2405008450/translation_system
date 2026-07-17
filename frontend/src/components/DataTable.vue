@@ -25,6 +25,7 @@ const props = withDefaults(defineProps<{
   emptyText?: string
   testId?: string
   rowTestIdPrefix?: string
+  rowClass?: (row: Record<string, any>, index: number) => string | undefined
 }>(), {
   loading: false,
   selectable: false,
@@ -37,6 +38,7 @@ const props = withDefaults(defineProps<{
   emptyText: '',
   testId: undefined,
   rowTestIdPrefix: undefined,
+  rowClass: undefined,
 })
 
 const emit = defineEmits<{
@@ -168,7 +170,10 @@ watch([allSelected, someSelected], () => {
           <tr
             v-for="(row, rowIndex) in data"
             :key="row[rowKey]"
-            :class="{ 'is-selected': selectedIds.has(row[rowKey]) }"
+            :class="[
+              { 'is-selected': selectedIds.has(row[rowKey]) },
+              rowClass?.(row, rowIndex),
+            ]"
             :data-testid="rowTestIdPrefix ? `${rowTestIdPrefix}-${row[rowKey]}` : undefined"
           >
             <td v-if="selectable" class="data-table__checkbox">

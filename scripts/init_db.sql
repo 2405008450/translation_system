@@ -1109,7 +1109,7 @@ CREATE TABLE IF NOT EXISTS segments (
     matched_creator_name VARCHAR(100),
     matched_created_at TIMESTAMP,
     matched_updated_at TIMESTAMP,
-    source VARCHAR(20) NOT NULL DEFAULT 'tm',
+    source VARCHAR(40) NOT NULL DEFAULT 'tm',
     llm_provider VARCHAR(40),
     llm_model VARCHAR(200),
     block_type VARCHAR(20) NOT NULL DEFAULT 'paragraph',

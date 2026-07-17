@@ -256,12 +256,24 @@ def build_duplicate_filename(
     filename: str,
     project_id: UUID | None,
 ) -> str:
+    return build_labeled_copy_filename(db, filename, project_id, "副本")
+
+
+def build_labeled_copy_filename(
+    db: Session,
+    filename: str,
+    project_id: UUID | None,
+    label: str,
+) -> str:
     path = Path(filename or "untitled.txt")
     suffix = path.suffix
     stem = path.name[: -len(suffix)] if suffix else path.name
     stem = stem or "untitled"
 
-    base_name = f"{stem} - 副本{suffix}"
+    normalized_label = label.strip()
+    if not normalized_label:
+        raise ValueError("副本名称标签不能为空")
+    base_name = f"{stem} - {normalized_label}{suffix}"
     query = db.query(FileRecord.filename)
     if project_id is None:
         query = query.filter(FileRecord.project_id.is_(None))
@@ -273,10 +285,78 @@ def build_duplicate_filename(
 
     index = 2
     while True:
-        candidate = f"{stem} - 副本 {index}{suffix}"
+        candidate = f"{stem} - {normalized_label} {index}{suffix}"
         if candidate not in existing_names:
             return candidate
         index += 1
+
+
+def create_file_record_copy_shell(
+    db: Session,
+    source_record: FileRecord,
+    *,
+    filename: str,
+    project_id: UUID | None,
+    current_user: User | None,
+    target_language: str | None = None,
+    preserve_language_resources: bool = True,
+) -> tuple[FileRecord, bytes | None]:
+    source_bytes = load_file_record_source(source_record)
+    duplicate = FileRecord(
+        project_id=project_id,
+        filename=filename,
+        file_hash=source_record.file_hash,
+        status="in_progress",
+        document_parse_mode=source_record.document_parse_mode,
+        document_parse_options=source_record.document_parse_options,
+        document_statistics=source_record.document_statistics,
+        source_language=source_record.source_language,
+        target_language=target_language if target_language is not None else source_record.target_language,
+        creator_id=current_user.id if current_user is not None else source_record.creator_id,
+        collection_id=source_record.collection_id if preserve_language_resources else None,
+        collection_ids_json=(source_record.collection_ids_json if preserve_language_resources else "[]"),
+        tm_match_threshold=getattr(source_record, "tm_match_threshold", 0.8),
+        tm_match_signature=None,
+        tm_last_matched_at=None,
+        term_base_id=source_record.term_base_id if preserve_language_resources else None,
+        term_base_ids=source_record.term_base_ids if preserve_language_resources else "[]",
+        term_base_write_ids=(
+            getattr(source_record, "term_base_write_ids", "[]")
+            if preserve_language_resources
+            else "[]"
+        ),
+        qa_term_base_ids=(
+            getattr(source_record, "qa_term_base_ids", "[]")
+            if preserve_language_resources
+            else "[]"
+        ),
+        glossary_base_ids=(
+            getattr(source_record, "glossary_base_ids", "[]")
+            if preserve_language_resources
+            else "[]"
+        ),
+        deadline=source_record.deadline,
+        access_level=source_record.access_level,
+    )
+    db.add(duplicate)
+    db.flush()
+    return duplicate, source_bytes
+
+
+def copy_file_record_source(
+    db: Session,
+    source_record: FileRecord,
+    duplicate: FileRecord,
+    source_bytes: bytes | None,
+) -> None:
+    if source_bytes is None:
+        return
+    duplicate_source_filename = _build_duplicate_source_filename(
+        source_record,
+        duplicate.filename,
+    )
+    _remember_pending_source_file(db, duplicate.id, duplicate_source_filename)
+    save_source_file(duplicate.id, duplicate_source_filename, source_bytes)
 
 
 def duplicate_file_record(
@@ -291,37 +371,19 @@ def duplicate_file_record(
     if source_record is None:
         return None
 
-    source_bytes = load_file_record_source(source_record)
     target_project_id = project_id if project_id is not None else source_record.project_id
     next_filename = (filename or "").strip() or build_duplicate_filename(
         db,
         source_record.filename,
         target_project_id,
     )
-    duplicate = FileRecord(
-        project_id=target_project_id,
+    duplicate, source_bytes = create_file_record_copy_shell(
+        db,
+        source_record,
         filename=next_filename,
-        file_hash=source_record.file_hash,
-        status="in_progress",
-        document_parse_mode=source_record.document_parse_mode,
-        document_parse_options=source_record.document_parse_options,
-        document_statistics=source_record.document_statistics,
-        source_language=source_record.source_language,
-        target_language=source_record.target_language,
-        creator_id=current_user.id if current_user is not None else source_record.creator_id,
-        collection_id=source_record.collection_id,
-        collection_ids_json=source_record.collection_ids_json,
-        tm_match_threshold=getattr(source_record, "tm_match_threshold", 0.8),
-        term_base_id=source_record.term_base_id,
-        term_base_ids=source_record.term_base_ids,
-        term_base_write_ids=getattr(source_record, "term_base_write_ids", "[]"),
-        qa_term_base_ids=getattr(source_record, "qa_term_base_ids", "[]"),
-        glossary_base_ids=getattr(source_record, "glossary_base_ids", "[]"),
-        deadline=source_record.deadline,
-        access_level=source_record.access_level,
+        project_id=target_project_id,
+        current_user=current_user,
     )
-    db.add(duplicate)
-    db.flush()
 
     source_segments = list_segments_for_file_record(db, source_record.id)
     for sequence_index, segment in enumerate(source_segments):
@@ -356,16 +418,11 @@ def duplicate_file_record(
                 sequence_index=(
                     stored_sequence_index if stored_sequence_index >= 0 else sequence_index
                 ),
+                segment_metadata=getattr(segment, "segment_metadata", "{}") or "{}",
             )
         )
 
-    if source_bytes is not None:
-        duplicate_source_filename = _build_duplicate_source_filename(
-            source_record,
-            next_filename,
-        )
-        save_source_file(duplicate.id, duplicate_source_filename, source_bytes)
-        _remember_pending_source_file(db, duplicate.id, duplicate_source_filename)
+    copy_file_record_source(db, source_record, duplicate, source_bytes)
 
     db.flush()
     return duplicate
@@ -932,7 +989,14 @@ def _normalize_segment_target_for_save(
     return target_text, target_html
 
 
-MACHINE_SEGMENT_SOURCES = {"llm", "tm", "project_sync", "none", ""}
+MACHINE_SEGMENT_SOURCES = {
+    "llm",
+    "tm",
+    "project_sync",
+    "english_variant_conversion",
+    "none",
+    "",
+}
 
 
 def _mark_segment_modified_by(segment: Segment, current_user: User | None) -> None:

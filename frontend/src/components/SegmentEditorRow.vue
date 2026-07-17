@@ -276,6 +276,9 @@ const showSourceTag = computed(() => {
   if (source === 'llm') {
     return !isEmptyTarget.value
   }
+  if (source === 'english_variant_conversion') {
+    return !isEmptyTarget.value
+  }
   return effectiveSegmentStatus.value !== 'none' && effectiveSegmentStatus.value !== 'fuzzy'
 })
 const showProjectSyncToggle = computed(() => true)

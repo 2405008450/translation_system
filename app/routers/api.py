@@ -178,6 +178,11 @@ from app.services.file_record_service import (
     update_segment_by_sentence_id,
     update_segment_source_text,
 )
+from app.services.english_variant_copy_service import (
+    EnglishVariantCopyError,
+    create_british_english_copy,
+    create_english_variant_copy,
+)
 from app.services.file_operation_lock_service import (
     FILE_OPERATION_LOCK_TIMEOUT_SECONDS,
     FILE_OPERATION_TOKEN_HEADER,
@@ -11178,6 +11183,101 @@ def duplicate_file_record_task(
         current_user=current_user,
         workflow_steps=workflow_steps,
         workflow_progress=workflow_progress,
+    )
+
+
+def _create_english_variant_copy_task_response(
+    project_id: UUID,
+    file_record_id: UUID,
+    *,
+    db: Session,
+    current_user: User,
+    british_only: bool,
+):
+    try:
+        copy_service = create_british_english_copy if british_only else create_english_variant_copy
+        result = copy_service(
+            db,
+            project_id=project_id,
+            file_record_id=file_record_id,
+            current_user=current_user,
+        )
+        duplicate = result.file_record
+        _assign_file_segments_to_first_workflow_step(db, duplicate)
+        db.commit()
+    except EnglishVariantCopyError as exc:
+        db.rollback()
+        status_code = {
+            "not_found": 404,
+            "unsupported_language_pair": 422,
+            "active_operation": 409,
+            "empty_translation": 409,
+        }[exc.code]
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    db.refresh(duplicate)
+    file_stats = _get_file_segment_stats(db, [duplicate.id]).get(
+        duplicate.id,
+        {"total": 0, "filled": 0, "pretranslated": 0},
+    )
+    workflow_steps = _load_project_workflow_steps(db, duplicate.project_id)
+    workflow_progress = _get_file_workflow_progress(db, [duplicate.id]).get(duplicate.id, [])
+    return {
+        "file": _build_project_file_payload(
+            duplicate,
+            total_segments=file_stats["total"],
+            translated_segments=file_stats["filled"],
+            pretranslated_segments=file_stats["pretranslated"],
+            current_user=current_user,
+            workflow_steps=workflow_steps,
+            workflow_progress=workflow_progress,
+        ),
+        "summary": {
+            "processed_segments": result.summary.processed_segments,
+            "changed_segments": result.summary.changed_segments,
+            "replacement_count": result.summary.replacement_count,
+        },
+    }
+
+
+@router.post(
+    "/projects/{project_id}/file-records/{file_record_id}/english-variant-copy"
+)
+def create_english_variant_copy_task(
+    project_id: UUID,
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_business_manager),
+):
+    """根据目标语言自动创建英式或美式英语待复核副本。"""
+    return _create_english_variant_copy_task_response(
+        project_id,
+        file_record_id,
+        db=db,
+        current_user=current_user,
+        british_only=False,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/file-records/{file_record_id}/british-english-copy"
+)
+def create_british_english_copy_task(
+    project_id: UUID,
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_business_manager),
+):
+    """兼容旧接口：把美式英语译文转换为英式英语副本。"""
+    return _create_english_variant_copy_task_response(
+        project_id,
+        file_record_id,
+        db=db,
+        current_user=current_user,
+        british_only=True,
     )
 
 
