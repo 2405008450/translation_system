@@ -18,10 +18,12 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import { http } from '../api/http'
+import { getLLMModelShortLabel } from '../constants/llm'
 import { formatLanguagePair } from '../constants/languages'
 import type {
   AnalyticsDashboardResponse,
   AnalyticsGranularity,
+  AnalyticsLlmModelSeries,
   AnalyticsSeriesPoint,
   AnalyticsUserStat,
 } from '../types/api'
@@ -36,6 +38,11 @@ type SeriesKey = keyof Pick<
 
 interface LineSpec {
   key: SeriesKey
+  label: string
+  color: string
+}
+
+interface LlmModelLineSpec extends AnalyticsLlmModelSeries {
   label: string
   color: string
 }
@@ -57,9 +64,18 @@ const chartPadding = {
   bottom: 36,
   left: 46,
 }
+const llmModelChartHeight = 210
+const llmModelColors = ['#7c3aed', '#2563eb', '#059669', '#d97706', '#db2777', '#64748b']
 
 const summary = computed(() => dashboard.value?.summary)
 const series = computed(() => dashboard.value?.series ?? [])
+const llmModelLines = computed<LlmModelLineSpec[]>(() => (
+  (dashboard.value?.llm_model_series ?? []).map((item, index) => ({
+    ...item,
+    label: getLlmModelLabel(item.model),
+    color: llmModelColors[index % llmModelColors.length],
+  }))
+))
 const topLanguagePairs = computed(() => (dashboard.value?.language_pairs ?? []).slice(0, 8))
 const userStats = computed(() => {
   const stats = [...(dashboard.value?.user_stats ?? [])]
@@ -73,6 +89,9 @@ const hasSeriesData = computed(() => series.value.some((item) => (
   || item.translated_source_word_count
   || item.llm_processed_source_word_count
   || item.active_user_count
+)))
+const hasLlmModelSeriesData = computed(() => llmModelLines.value.some((line) => (
+  line.total_segment_count > 0
 )))
 
 const translationLines = computed<LineSpec[]>(() => [
@@ -339,6 +358,60 @@ function getAxisLabels() {
   }))
 }
 
+function getLlmModelLabel(model: string) {
+  if (model === '__other__') {
+    return t('dashboard.charts.otherModels')
+  }
+  if (model === '__unknown__') {
+    return t('dashboard.charts.unknownModel')
+  }
+  return getLLMModelShortLabel(model)
+}
+
+function getLlmModelChartMax() {
+  const values = llmModelLines.value.flatMap((line) => line.points.map((point) => Number(point.segment_count || 0)))
+  return Math.max(1, ...values)
+}
+
+function buildLlmModelPoints(line: LlmModelLineSpec) {
+  const items = line.points
+  if (!items.length) {
+    return []
+  }
+  const maxValue = getLlmModelChartMax()
+  const innerWidth = chartWidth - chartPadding.left - chartPadding.right
+  const innerHeight = llmModelChartHeight - chartPadding.top - chartPadding.bottom
+  return items.map((item, index) => ({
+    ...item,
+    x: Math.round((chartPadding.left + (
+      items.length === 1 ? innerWidth / 2 : (innerWidth * index) / (items.length - 1)
+    )) * 100) / 100,
+    y: Math.round((chartPadding.top + innerHeight - (Number(item.segment_count || 0) / maxValue) * innerHeight) * 100) / 100,
+  }))
+}
+
+function buildLlmModelLinePath(line: LlmModelLineSpec) {
+  return buildLlmModelPoints(line)
+    .map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x} ${point.y}`)
+    .join(' ')
+}
+
+function getLlmModelAxisLabels() {
+  const items = llmModelLines.value[0]?.points ?? []
+  if (!items.length) {
+    return []
+  }
+  const indexes = Array.from(new Set([0, Math.floor((items.length - 1) / 2), items.length - 1]))
+  return indexes.map((index) => ({
+    bucket: items[index].bucket,
+    x: chartPadding.left + (
+      items.length === 1
+        ? (chartWidth - chartPadding.left - chartPadding.right) / 2
+        : ((chartWidth - chartPadding.left - chartPadding.right) * index) / (items.length - 1)
+    ),
+  }))
+}
+
 function getPairLabel(sourceLanguage: string | null, targetLanguage: string | null) {
   return formatLanguagePair(sourceLanguage, targetLanguage)
 }
@@ -525,6 +598,69 @@ onMounted(() => {
             </div>
           </div>
           <div v-else class="dashboard-empty">{{ t('dashboard.empty.series') }}</div>
+        </article>
+
+        <article class="dashboard-panel dashboard-panel--full dashboard-panel--llm-models">
+          <div class="dashboard-panel__header">
+            <div>
+              <h3>{{ t('dashboard.charts.llmModelsTitle') }}</h3>
+              <p>{{ t('dashboard.charts.llmModelsHint') }}</p>
+            </div>
+            <Sparkles :size="20" />
+          </div>
+          <div v-if="hasLlmModelSeriesData" class="line-chart line-chart--llm-models">
+            <svg :viewBox="`0 0 ${chartWidth} ${llmModelChartHeight}`" role="img" :aria-label="t('dashboard.charts.llmModelsTitle')">
+              <line
+                :x1="chartPadding.left"
+                :x2="chartWidth - chartPadding.right"
+                :y1="llmModelChartHeight - chartPadding.bottom"
+                :y2="llmModelChartHeight - chartPadding.bottom"
+                class="line-chart__axis"
+              />
+              <line
+                :x1="chartPadding.left"
+                :x2="chartPadding.left"
+                :y1="chartPadding.top"
+                :y2="llmModelChartHeight - chartPadding.bottom"
+                class="line-chart__axis"
+              />
+              <path
+                v-for="line in llmModelLines"
+                :key="line.model"
+                class="line-chart__line"
+                :d="buildLlmModelLinePath(line)"
+                :stroke="line.color"
+              />
+              <g v-for="line in llmModelLines" :key="`${line.model}-points`">
+                <circle
+                  v-for="point in buildLlmModelPoints(line)"
+                  :key="`${line.model}-${point.bucket}`"
+                  :cx="point.x"
+                  :cy="point.y"
+                  r="3"
+                  :fill="line.color"
+                >
+                  <title>{{ `${line.label} · ${point.bucket}: ${formatNumber(point.segment_count)} ${t('dashboard.charts.segments')}` }}</title>
+                </circle>
+              </g>
+              <text
+                v-for="label in getLlmModelAxisLabels()"
+                :key="label.bucket"
+                :x="label.x"
+                :y="llmModelChartHeight - 10"
+                class="line-chart__label"
+                text-anchor="middle"
+              >
+                {{ label.bucket }}
+              </text>
+            </svg>
+            <div class="line-chart__legend">
+              <span v-for="line in llmModelLines" :key="line.model" :title="line.model.startsWith('__') ? line.label : line.model">
+                <i :style="{ backgroundColor: line.color }"></i>{{ line.label }}（{{ formatNumber(line.total_segment_count) }}）
+              </span>
+            </div>
+          </div>
+          <div v-else class="dashboard-empty">{{ t('dashboard.empty.llmModels') }}</div>
         </article>
 
         <article class="dashboard-panel dashboard-panel--full">
@@ -837,6 +973,14 @@ onMounted(() => {
   width: 100%;
   height: auto;
   min-height: 220px;
+}
+
+.line-chart--llm-models {
+  min-height: 220px;
+}
+
+.line-chart--llm-models svg {
+  min-height: 180px;
 }
 
 .line-chart__axis {

@@ -155,6 +155,9 @@ const overrides = {
     kicker: 'Smart Operations Platform',
   },
   workbench: {
+    statusSummary: {
+      projectSync: 'Project sync',
+    },
     messages: {
       mergeNonAdjacent: 'Only adjacent segments can be merged in regular documents.',
     },
@@ -323,8 +326,24 @@ const overrides = {
       activeUsers: 'Active users today',
       progress: 'Overall progress',
     },
+    charts: {
+      translationTitle: 'Translation processing trends',
+      translationHint: 'New translated source words and LLM-processed source words',
+      activityTitle: 'User and project trends',
+      activityHint: 'Active users and newly created projects',
+      translatedWords: 'Translated source words',
+      llmWords: 'LLM-processed words',
+      activeUsers: 'Active users',
+      createdProjects: 'New projects',
+      llmModelsTitle: 'MT segments by LLM',
+      llmModelsHint: 'Groups current MT segments by their last update; high-volume models are shown and the long tail is combined',
+      otherModels: 'Other models',
+      unknownModel: 'Model not recorded',
+      segments: 'segments',
+    },
     empty: {
       series: 'No trend data',
+      llmModels: 'No LLM segment trend data',
       languagePairs: 'No language-pair data',
       sources: 'No source statistics',
       userStats: 'No user statistics',

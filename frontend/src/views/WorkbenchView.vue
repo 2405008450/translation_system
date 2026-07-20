@@ -158,7 +158,7 @@ type SideToolKey = 'match-info' | 'terms' | 'resource-search' | 'notes' | 'refer
 type ResourceImportTab = 'tm' | 'glossary' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
 type SaveToTMTargetMode = 'new' | 'existing'
-type SegmentDisplayScope = 'all' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'confirmed_only' | 'empty_target'
+type SegmentDisplayScope = 'all' | 'project_sync_only' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'confirmed_only' | 'empty_target'
 type RevisionMenuKind = 'track' | 'accept' | 'reject'
 type ResourceSearchMode = 'exact' | 'fuzzy'
 type FileExportStatus = 'queued' | 'running' | 'completed' | 'failed'
@@ -1152,6 +1152,7 @@ const projectReturnParent = computed(() => (
 function createWorkbenchStatusStats(): SegmentStatusStats {
   return {
     total: 0,
+    project_sync: 0,
     exact: 0,
     fuzzy: 0,
     none: 0,
@@ -1189,6 +1190,14 @@ const statusSummary = computed(() => {
   const counters = statusSummaryCounters.value
 
   return [
+    {
+      key: 'project_sync',
+      label: t('workbench.statusSummary.projectSync'),
+      value: counters.project_sync,
+      tone: 'project-sync',
+      scope: 'project_sync_only' as const,
+      description: '项目同步：由同一项目内相同原文句段自动同步生成的译文。',
+    },
     {
       key: 'exact',
       label: t('workbench.statusSummary.exact'),
@@ -1253,6 +1262,7 @@ const activeFileStatusStats = computed(() => {
   }
   return activeMergeViewFile.value?.status_stats ?? {
     total: 0,
+    project_sync: 0,
     exact: 0,
     fuzzy: 0,
     none: 0,
@@ -1741,6 +1751,7 @@ const segmentScreeningMatchOptions: SegmentScreeningOption[] = [
   { value: 'context_102', label: '102%匹配', disabled: true, hint: '暂无上下文匹配字段，先占位。' },
   { value: 'context_101', label: '101%匹配', disabled: true, hint: '暂无上下文匹配字段，先占位。' },
   { value: 'exact', label: '精确匹配' },
+  { value: 'project_sync', label: '项目同步' },
   { value: 'fuzzy', label: '模糊匹配' },
   { value: 'none', label: '无匹配' },
   { value: 'machine_translation', label: '机器翻译' },
@@ -2059,6 +2070,7 @@ function countTargetReplaceOccurrences(segment: Segment) {
 
 const segmentDisplayScopeOptions = computed<Array<{ value: SegmentDisplayScope; label: string }>>(() => [
   { value: 'all', label: t('workbench.search.scopes.all') },
+  { value: 'project_sync_only', label: t('workbench.statusSummary.projectSync') },
   { value: 'exact_only', label: t('workbench.statusSummary.exact') },
   { value: 'fuzzy_only', label: t('workbench.search.scopes.fuzzyOnly') },
   { value: 'none_only', label: t('workbench.search.scopes.noneOnly') },
@@ -2080,6 +2092,9 @@ function isShortWorkbenchStructuralFragment(value: string | null | undefined) {
 }
 
 function resolveWorkbenchMatchStatus(segment: Segment) {
+  if (segment.source === 'project_sync') {
+    return 'project_sync'
+  }
   const sourceText = normalizeWorkbenchMatchText(segment.source_text)
   const displayText = normalizeWorkbenchMatchText(segment.display_text)
   const matchedSourceText = normalizeWorkbenchMatchText(segment.matched_source_text)
@@ -2102,6 +2117,9 @@ function resolveWorkbenchMatchStatus(segment: Segment) {
 
 function matchesSegmentDisplayScope(segment: Segment) {
   const matchStatus = resolveWorkbenchMatchStatus(segment)
+  if (segmentDisplayScope.value === 'project_sync_only') {
+    return matchStatus === 'project_sync'
+  }
   if (segmentDisplayScope.value === 'exact_only') {
     return matchStatus === 'exact'
   }

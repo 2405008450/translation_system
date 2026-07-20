@@ -19,6 +19,7 @@ const fileStatusMap: Record<string, StatusMeta> = {
 }
 
 const segmentStatusMap: Record<string, StatusMeta> = {
+  project_sync: { value: 'project_sync', label: 'status.source.projectSync', tone: 'success' },
   exact: { value: 'exact', label: 'status.segment.exact', tone: 'success' },
   fuzzy: { value: 'fuzzy', label: 'status.segment.fuzzy', tone: 'warning' },
   none: { value: 'none', label: 'status.segment.none', tone: 'default' },

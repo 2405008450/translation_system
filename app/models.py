@@ -952,6 +952,12 @@ class Segment(Base):
         Index("ix_segments_project_sync_source_file_record_id", "project_sync_source_file_record_id"),
         Index("ix_segments_updated_at", "updated_at"),
         Index(
+            "ix_segments_llm_model_updated_at",
+            "updated_at",
+            "llm_model",
+            postgresql_where=text("source = 'llm'"),
+        ),
+        Index(
             "ix_segments_source_text_trgm",
             "source_text",
             postgresql_using="gin",
@@ -2060,6 +2066,7 @@ class FileSegmentStats(Base):
         primary_key=True,
     )
     total: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    project_sync_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     exact_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     fuzzy_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     none_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))

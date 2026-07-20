@@ -253,6 +253,11 @@ export default {
       llmWords: 'LLM 处理字数',
       activeUsers: '活跃用户',
       createdProjects: '新增项目',
+      llmModelsTitle: '不同 LLM 的 MT 句段趋势',
+      llmModelsHint: '按当前 MT 来源的最近更新时间汇总句段数量，仅展示高频模型并合并长尾模型',
+      otherModels: '其他模型',
+      unknownModel: '未记录模型',
+      segments: '个句段',
     },
     userStats: {
       title: '账户工作量统计',
@@ -291,6 +296,7 @@ export default {
     },
     empty: {
       series: '暂无趋势数据',
+      llmModels: '暂无 LLM 句段趋势数据',
       languagePairs: '暂无语种方向数据',
       sources: '暂无来源统计数据',
       userStats: '暂无账户统计数据',
@@ -1156,6 +1162,7 @@ export default {
       hyphenation: '自动断字（布局→断字）',
     },
     statusSummary: {
+      projectSync: '项目同步',
       exact: '精确匹配',
       fuzzy: '模糊匹配',
       none: '无匹配',

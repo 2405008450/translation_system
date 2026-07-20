@@ -1658,6 +1658,15 @@ body.modal-open {
   --workbench-stat-active-shadow: rgba(79, 168, 115, 0.14);
 }
 
+.workbench-page .workbench-stat--project-sync {
+  --workbench-stat-bg: linear-gradient(180deg, #e7f6fb, #fbfeff);
+  --workbench-stat-border: #91cbdc;
+  --workbench-stat-active-bg: linear-gradient(180deg, #c9ebf4, #eaf8fb);
+  --workbench-stat-active-border: #3f96ad;
+  --workbench-stat-active-text: #17586a;
+  --workbench-stat-active-shadow: rgba(63, 150, 173, 0.15);
+}
+
 .workbench-page .workbench-stat--fuzzy {
   --workbench-stat-bg: linear-gradient(180deg, #fff3d6, #fffdf7);
   --workbench-stat-border: #edc96d;
@@ -1897,7 +1906,6 @@ body.modal-open {
   line-height: 1.15;
 }
 
-.workbench-page.is-stable-grid .segment-row__sync-toggle,
 .workbench-page.is-stable-grid .segment-row__tag--revision {
   grid-column: 1 / -1;
 }
@@ -2870,6 +2878,15 @@ body.modal-open {
   --workbench-stat-active-border: #4fa873;
   --workbench-stat-active-text: #17633b;
   --workbench-stat-active-shadow: rgba(79, 168, 115, 0.14);
+}
+
+.workbench-stat--project-sync {
+  --workbench-stat-bg: linear-gradient(180deg, #e7f6fb, #fbfeff);
+  --workbench-stat-border: #91cbdc;
+  --workbench-stat-active-bg: linear-gradient(180deg, #c9ebf4, #eaf8fb);
+  --workbench-stat-active-border: #3f96ad;
+  --workbench-stat-active-text: #17586a;
+  --workbench-stat-active-shadow: rgba(63, 150, 173, 0.15);
 }
 
 .workbench-stat--fuzzy {

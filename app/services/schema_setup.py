@@ -578,6 +578,7 @@ REQUIRED_INDEXES = {
         "ix_segments_translated_source_word_count",
         "ix_segments_source_word_backfill",
         "ix_segments_translated_backfill",
+        "ix_segments_llm_model_updated_at",
     },
     "translation_metric_events": {
         "ix_translation_metric_events_source_created_at",
@@ -2267,6 +2268,11 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             CREATE INDEX IF NOT EXISTS ix_segments_translated_backfill
             ON segments (updated_at, id)
             WHERE target_text <> '' AND source_word_count > 0
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_llm_model_updated_at
+            ON segments (updated_at, llm_model)
+            WHERE source = 'llm'
             """,
             f"""
             CREATE TABLE IF NOT EXISTS translation_metric_events (

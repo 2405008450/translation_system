@@ -58,6 +58,7 @@ interface FileExportTask {
 function createEmptySegmentStatusStats(): SegmentStatusStats {
   return {
     total: 0,
+    project_sync: 0,
     exact: 0,
     fuzzy: 0,
     none: 0,
@@ -71,6 +72,7 @@ function buildMergeViewStatusStats(detail: MergeViewDetail | null): SegmentStatu
   for (const file of detail?.files ?? []) {
     const stats = { ...createEmptySegmentStatusStats(), ...(file.status_stats || {}) }
     totals.total += Number(stats.total || file.total_segments || 0)
+    totals.project_sync += Number(stats.project_sync || 0)
     totals.exact += Number(stats.exact || 0)
     totals.fuzzy += Number(stats.fuzzy || 0)
     totals.none += Number(stats.none || 0)
@@ -119,9 +121,9 @@ function resolveUnconfirmedSegmentStatus(segment: Segment, _targetText = segment
   return 'none'
 }
 
-function resolveSegmentStatusForStats(segment: Segment) {
-  if (segment.status === 'confirmed') {
-    return 'confirmed'
+function resolveSegmentMatchStatusForStats(segment: Segment) {
+  if (segment.source === 'project_sync') {
+    return 'project_sync'
   }
   return resolveUnconfirmedSegmentStatus(segment)
 }
@@ -732,11 +734,17 @@ export const useSegmentStore = defineStore('segment', () => {
 
   function adjustSegmentStatusStats(previousSegment: Segment, nextSegment: Segment) {
     const nextStats = { ...segmentStatusStats.value }
-    const previousStatus = resolveSegmentStatusForStats(previousSegment)
-    const nextStatus = resolveSegmentStatusForStats(nextSegment)
-    if (previousStatus !== nextStatus) {
-      nextStats[previousStatus] = Math.max(0, nextStats[previousStatus] - 1)
-      nextStats[nextStatus] += 1
+    const previousMatchStatus = resolveSegmentMatchStatusForStats(previousSegment)
+    const nextMatchStatus = resolveSegmentMatchStatusForStats(nextSegment)
+    if (previousMatchStatus !== nextMatchStatus) {
+      nextStats[previousMatchStatus] = Math.max(0, nextStats[previousMatchStatus] - 1)
+      nextStats[nextMatchStatus] += 1
+    }
+
+    const wasConfirmed = previousSegment.status === 'confirmed'
+    const isConfirmed = nextSegment.status === 'confirmed'
+    if (wasConfirmed !== isConfirmed) {
+      nextStats.confirmed = Math.max(0, nextStats.confirmed + (isConfirmed ? 1 : -1))
     }
 
     const wasEmptyTarget = hasEmptyTarget(previousSegment.target_text)

@@ -4,7 +4,6 @@ import { computed, onBeforeUnmount, onMounted, ref, watch, nextTick } from 'vue'
 
 import InteractiveDiffText from './InteractiveDiffText.vue'
 
-import { getLLMModelShortLabel } from '../constants/llm'
 import { getSegmentSourceMeta, getSegmentStatusMeta } from '../constants/status'
 import { useAuthStore } from '../stores/auth'
 import type { RevisionDisplaySettings, Segment, SegmentQAIssue, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
@@ -220,6 +219,9 @@ const hasExactTextMatch = computed(() => {
   )
 })
 const effectiveSegmentStatus = computed(() => {
+  if (props.segment.source === 'project_sync') {
+    return 'project_sync'
+  }
   if (props.segment.status === 'confirmed') {
     return 'confirmed'
   }
@@ -242,15 +244,10 @@ const isEmptyTarget = computed(() => {
 })
 const statusMeta = computed(() => getSegmentStatusMeta(effectiveSegmentStatus.value))
 const sourceMeta = computed(() => getSegmentSourceMeta(props.segment.source))
-const shouldHideLLMModel = computed(() => authStore.isExternalTranslator)
 const isProjectSynced = computed(() => props.segment.source === 'project_sync')
 const sourceLabel = computed(() => {
   if (props.segment.source === 'llm') {
-    if (shouldHideLLMModel.value) {
-      return '机器翻译'
-    }
-    const modelId = props.segment.llm_model?.trim()
-    return modelId ? getLLMModelShortLabel(modelId) : sourceMeta.value.label
+    return 'MT'
   }
   return sourceMeta.value.label
 })
@@ -287,14 +284,10 @@ const projectSyncToggleLabel = computed(() => (
 ))
 const sourceTitle = computed(() => {
   if (props.segment.source === 'llm') {
-    if (shouldHideLLMModel.value) {
-      return '机器翻译'
+    if (!authStore.isExternalTranslator && props.segment.llm_model?.trim()) {
+      return props.segment.llm_model
     }
-    if (props.segment.llm_model?.trim()) {
-      return props.segment.llm_provider
-        ? `${props.segment.llm_model} (${props.segment.llm_provider})`
-        : props.segment.llm_model
-    }
+    return 'MT'
   }
   return sourceMeta.value.label
 })
@@ -2291,6 +2284,25 @@ watch(
   >
     <div class="segment-row__meta">
       <span class="segment-row__index">{{ index + 1 }}</span>
+      <button
+        v-if="showProjectSyncToggle"
+        class="segment-row__sync-toggle"
+        :class="{ 'is-disabled-sync': segment.project_sync_disabled }"
+        type="button"
+        :title="projectSyncToggleLabel"
+        :aria-label="projectSyncToggleLabel"
+        :aria-pressed="!segment.project_sync_disabled"
+        :disabled="disabled"
+        @click.stop="handleProjectSyncToggle"
+      >
+        <component
+          :is="segment.project_sync_disabled ? Link2 : Link2Off"
+          :size="13"
+          :stroke-width="2.2"
+          aria-hidden="true"
+        />
+        <span class="sr-only">{{ projectSyncToggleLabel }}</span>
+      </button>
     </div>
 
     <div
@@ -2446,25 +2458,6 @@ watch(
       <span v-if="showSourceTag" class="segment-row__compact-tag" :class="sourceClass" :title="sourceTitle">
         {{ compactSourceLabel }}
       </span>
-      <button
-        v-if="showProjectSyncToggle"
-        class="segment-row__sync-toggle"
-        :class="{ 'is-disabled-sync': segment.project_sync_disabled }"
-        type="button"
-        :title="projectSyncToggleLabel"
-        :aria-label="projectSyncToggleLabel"
-        :aria-pressed="!segment.project_sync_disabled"
-        :disabled="disabled"
-        @click.stop="handleProjectSyncToggle"
-      >
-        <component
-          :is="segment.project_sync_disabled ? Link2 : Link2Off"
-          :size="13"
-          :stroke-width="2.2"
-          aria-hidden="true"
-        />
-        <span class="sr-only">{{ projectSyncToggleLabel }}</span>
-      </button>
       <span
         v-if="hasPendingRevision"
         class="segment-row__compact-tag segment-row__tag--revision"
@@ -2619,7 +2612,7 @@ watch(
   justify-content: center;
   min-width: 18px;
   min-height: 18px;
-  color: #4fa873;
+  color: #166534;
   font-size: 18px;
   font-weight: 800;
   line-height: 1;
@@ -2765,22 +2758,30 @@ watch(
   min-width: 24px;
   min-height: 24px;
   padding: 0;
-  border: 1px solid rgba(34, 127, 88, 0.28);
-  border-radius: 6px;
-  background: rgba(34, 127, 88, 0.08);
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
   color: #146c49;
   line-height: 1;
   cursor: pointer;
 }
 
-.segment-row__sync-toggle:hover {
-  background: rgba(34, 127, 88, 0.14);
+.segment-row__sync-toggle:hover:not(:disabled),
+.segment-row__sync-toggle:focus-visible {
+  background: transparent;
+  color: #084c35;
+  outline: 1px solid currentColor;
+  outline-offset: 1px;
 }
 
 .segment-row__sync-toggle.is-disabled-sync {
-  border-color: rgba(91, 115, 132, 0.26);
-  background: rgba(91, 115, 132, 0.08);
+  background: transparent;
   color: #526574;
+}
+
+.segment-row__sync-toggle:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
 }
 
 .segment-row__term-highlight {

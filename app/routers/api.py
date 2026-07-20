@@ -9785,6 +9785,8 @@ def _resolve_unconfirmed_segment_status(segment: Segment) -> str:
 def _apply_segment_scope_filter(query, scope: str):
     normalized_scope = (scope or "all").strip().lower()
     status_conditions = segment_effective_status_conditions(Segment)
+    if normalized_scope == "project_sync_only":
+        return query.filter(status_conditions["project_sync"])
     if normalized_scope == "exact_only":
         return query.filter(status_conditions["exact"])
     if normalized_scope == "fuzzy_only":
@@ -10278,6 +10280,7 @@ def _get_segment_status_stats(db: Session, file_record_id: UUID) -> dict[str, in
     if stats is not None:
         return {
             "total": int(stats.total or 0),
+            "project_sync": int(stats.project_sync_count or 0),
             "exact": int(stats.exact_count or 0),
             "fuzzy": int(stats.fuzzy_count or 0),
             "none": int(stats.none_count or 0),
@@ -10295,6 +10298,7 @@ def _get_segment_status_stats_for_query(query) -> dict[str, int]:
     row = (
         query.with_entities(
             func.count(Segment.id).label("total"),
+            func.coalesce(func.sum(case((status_conditions["project_sync"], 1), else_=0)), 0).label("project_sync"),
             func.coalesce(func.sum(case((status_conditions["exact"], 1), else_=0)), 0).label("exact"),
             func.coalesce(func.sum(case((status_conditions["fuzzy"], 1), else_=0)), 0).label("fuzzy"),
             func.coalesce(func.sum(case((status_conditions["none"], 1), else_=0)), 0).label("none"),
@@ -10305,6 +10309,7 @@ def _get_segment_status_stats_for_query(query) -> dict[str, int]:
     )
     return {
         "total": int(row.total or 0),
+        "project_sync": int(row.project_sync or 0),
         "exact": int(row.exact or 0),
         "fuzzy": int(row.fuzzy or 0),
         "none": int(row.none or 0),

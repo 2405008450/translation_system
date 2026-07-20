@@ -44,6 +44,17 @@ export interface AnalyticsSeriesPoint {
   active_user_count: number
 }
 
+export interface AnalyticsLlmModelSeriesPoint {
+  bucket: string
+  segment_count: number
+}
+
+export interface AnalyticsLlmModelSeries {
+  model: string
+  total_segment_count: number
+  points: AnalyticsLlmModelSeriesPoint[]
+}
+
 export interface AnalyticsLanguagePair {
   source_language: string | null
   target_language: string | null
@@ -83,6 +94,7 @@ export interface AnalyticsDashboardResponse {
   granularity: AnalyticsGranularity
   summary: AnalyticsSummary
   series: AnalyticsSeriesPoint[]
+  llm_model_series: AnalyticsLlmModelSeries[]
   language_pairs: AnalyticsLanguagePair[]
   source_breakdown: AnalyticsSourceBreakdown[]
   user_stats: AnalyticsUserStat[]
@@ -713,6 +725,7 @@ export interface FileRecordDetail {
 
 export interface SegmentStatusStats {
   total: number
+  project_sync: number
   exact: number
   fuzzy: number
   none: number

@@ -1179,6 +1179,10 @@ CREATE INDEX IF NOT EXISTS ix_segments_file_record_source
 -- 增量游标端点 /segments/changes 按 updated_at 过滤并排序。
 CREATE INDEX IF NOT EXISTS ix_segments_updated_at
     ON segments (updated_at);
+-- 数据看板按模型聚合 MT 句段，仅索引 LLM 句段以控制索引体积和查询开销。
+CREATE INDEX IF NOT EXISTS ix_segments_llm_model_updated_at
+    ON segments (updated_at, llm_model)
+    WHERE source = 'llm';
 -- 文本检索：ilike('%kw%') 双向通配无法走 B-tree，改用 pg_trgm GIN 索引加速。
 CREATE INDEX IF NOT EXISTS ix_segments_source_text_trgm
     ON segments USING GIN (source_text gin_trgm_ops);
