@@ -16,6 +16,7 @@ from app.services.automatic_numbering import (
     strip_segment_automatic_numbering_prefix,
 )
 from app.services.normalizer import build_source_hash, normalize_text
+from app.services.segment_status import apply_segment_status
 
 
 PROJECT_SYNC_SOURCE = "project_sync"
@@ -78,7 +79,7 @@ class _SyncCandidate:
     segment: Segment
     source_hash: str
     target_text: str
-    rank: tuple[int, int, datetime]
+    rank: tuple[int, int, datetime, str]
 
 
 def empty_project_segment_sync_summary() -> ProjectSegmentSyncSummary:
@@ -221,6 +222,66 @@ def sync_project_repeated_segments_from_segments(
             current_user=current_user,
         )
 
+    if summary.filled_count or summary.updated_count:
+        db.flush()
+    return summary
+
+
+def sync_project_segments_for_hash(
+    db: Session,
+    *,
+    project_id: UUID,
+    source_language: str,
+    target_language: str,
+    source_hash: str,
+    current_user=None,
+) -> ProjectSegmentSyncSummary:
+    """对项目内同一 source_hash 的全部句段做一次收敛同步（outbox worker 使用）。
+
+    候选与目标取同一批已锁定行：全局最高优先级（最新确认 > 人工 > LLM > TM）
+    的译文胜出，天然不会用低优先级结果覆盖人工确认。
+    """
+    summary = ProjectSegmentSyncSummary()
+    if not source_hash:
+        return summary
+
+    rows = (
+        db.query(Segment)
+        .join(FileRecord, Segment.file_record_id == FileRecord.id)
+        .filter(
+            FileRecord.project_id == project_id,
+            func.coalesce(FileRecord.source_language, "") == (source_language or ""),
+            func.coalesce(FileRecord.target_language, "") == (target_language or ""),
+            Segment.source_hash == source_hash,
+            _segment_project_sync_enabled(),
+        )
+        .order_by(Segment.id.asc())
+        .with_for_update(of=Segment)
+        .all()
+    )
+    if len(rows) < 2:
+        return summary
+
+    candidates = [
+        candidate
+        for candidate in (_build_candidate(row) for row in rows)
+        if candidate is not None
+    ]
+    resolved = _resolve_candidate(candidates)
+    if resolved is None:
+        if candidates:
+            summary.conflict_count += 1
+        return summary
+
+    targets = [row for row in rows if row.id != resolved.segment.id]
+    _apply_candidate_to_targets(
+        db,
+        candidate=resolved,
+        targets=targets,
+        summary=summary,
+        current_file_id=resolved.segment.file_record_id,
+        current_user=current_user,
+    )
     if summary.filled_count or summary.updated_count:
         db.flush()
     return summary
@@ -384,7 +445,10 @@ def _apply_candidate_to_targets(
 
         target.target_text = candidate.target_text
         target.target_html = None
-        target.status = "confirmed" if target.status == "confirmed" else PROJECT_SYNC_STATUS
+        apply_segment_status(
+            target,
+            "confirmed" if target.status == "confirmed" else PROJECT_SYNC_STATUS,
+        )
         target.source = PROJECT_SYNC_SOURCE
         target.project_sync_source_segment_id = candidate.segment.id
         target.project_sync_source_file_record_id = candidate.segment.file_record_id
@@ -420,7 +484,11 @@ def _build_candidate(segment: Segment) -> _SyncCandidate | None:
         return None
     confirmed_priority = 1 if segment.status == "confirmed" else 0
     source_priority = _SOURCE_PRIORITY.get(segment.source or "", -1)
-    updated_at = segment.updated_at or datetime.min
+    # 已确认句段以确认时间决胜（最新确认胜出）；未确认沿用更新时间。
+    if confirmed_priority:
+        updated_at = getattr(segment, "confirmed_at", None) or segment.updated_at or datetime.min
+    else:
+        updated_at = segment.updated_at or datetime.min
     filename = getattr(getattr(segment, "file_record", None), "filename", None)
     target_text = (
         strip_segment_automatic_numbering_prefix(
@@ -437,7 +505,7 @@ def _build_candidate(segment: Segment) -> _SyncCandidate | None:
         segment=segment,
         source_hash=source_hash,
         target_text=target_text,
-        rank=(confirmed_priority, source_priority, updated_at),
+        rank=(confirmed_priority, source_priority, updated_at, str(segment.id)),
     )
 
 
@@ -460,6 +528,7 @@ def _clear_project_synced_segment_fields(segment: Segment) -> bool:
         "target_text": "",
         "target_html": None,
         "status": "none",
+        "confirmed_at": None,
         "source": "none",
         "score": 0.0,
         "matched_source_text": None,

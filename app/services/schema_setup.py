@@ -70,6 +70,7 @@ REQUIRED_SCHEMA = {
         "name",
         "source_language",
         "target_language",
+        "entry_count",
         "creator_id",
     },
     "term_entries": {
@@ -167,6 +168,7 @@ REQUIRED_SCHEMA = {
         "creator_id",
         "collection_id",
         "collection_ids_json",
+        "tm_scope_mode",
         "term_base_id",
         "term_base_ids",
         "term_base_write_ids",
@@ -1018,6 +1020,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 description TEXT,
                 source_language VARCHAR(20) NOT NULL,
                 target_language VARCHAR(20) NOT NULL,
+                entry_count BIGINT NOT NULL DEFAULT 0,
                 creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
@@ -1038,6 +1041,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS term_bases
             ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS term_bases
+            ADD COLUMN IF NOT EXISTS entry_count BIGINT NOT NULL DEFAULT 0
             """,
             """
             ALTER TABLE IF EXISTS term_bases
@@ -1646,6 +1653,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS file_records
             ADD COLUMN IF NOT EXISTS tm_match_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.8
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS tm_scope_mode VARCHAR(24) NOT NULL DEFAULT 'selected'
             """,
             """
             ALTER TABLE IF EXISTS file_records

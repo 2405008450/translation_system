@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, Uuid, func, text
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, Uuid, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -265,6 +265,12 @@ class FileRecord(Base):
         nullable=False,
         default=0.8,
         server_default=text("0.8"),
+    )
+    tm_scope_mode: Mapped[str] = mapped_column(
+        String(24),
+        nullable=False,
+        default="selected",
+        server_default=text("'selected'"),
     )
     tm_match_signature: Mapped[str | None] = mapped_column(String(64), nullable=True)
     tm_last_matched_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
@@ -939,6 +945,8 @@ class Segment(Base):
         ),
         Index("ix_segments_file_record_status", "file_record_id", "status"),
         Index("ix_segments_file_record_source", "file_record_id", "source"),
+        Index("ix_segments_file_display_index", "file_record_id", "display_index"),
+        Index("ix_segments_file_updated_at_id", "file_record_id", "updated_at", "id"),
         Index("ix_segments_last_modified_by_id", "last_modified_by_id"),
         Index("ix_segments_project_sync_source_segment_id", "project_sync_source_segment_id"),
         Index("ix_segments_project_sync_source_file_record_id", "project_sync_source_file_record_id"),
@@ -1037,6 +1045,15 @@ class Segment(Base):
         default="{}",
         server_default=text("'{}'"),
     )
+    # 文档内显示序号（0 起）。-1 表示待回填，读取端会自动刷新。
+    display_index: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=-1,
+        server_default=text("-1"),
+    )
+    # 最近一次人工确认时间；取消确认后清空。项目同步冲突用其决胜。
+    confirmed_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), nullable=False
     )
@@ -1816,6 +1833,13 @@ class TMCollection(Base):
         default="manual",
         server_default=text("'manual'"),
     )
+    # 持久化条目总数，由数据库语句级触发器维护（见迁移 0015）。
+    entry_count: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
     creator_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("users.id", ondelete="SET NULL"),
@@ -2022,6 +2046,97 @@ class AutoTMOutbox(Base):
     )
 
 
+class FileSegmentStats(Base):
+    """文件级句段统计，由数据库语句级触发器维护（见迁移 0017）。
+
+    应用侧只读；缺行按全零处理（文件尚无句段或历史环境未回填）。
+    """
+
+    __tablename__ = "file_segment_stats"
+
+    file_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    total: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    exact_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    fuzzy_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    none_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    confirmed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    empty_target_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class ProjectSegmentSyncOutbox(Base):
+    """项目重复句段同步 outbox：同一 (项目, 语言对, source_hash) 的任务合并去重。"""
+
+    __tablename__ = "project_segment_sync_outbox"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "source_language",
+            "target_language",
+            "source_hash",
+            name="uq_project_sync_outbox_scope",
+        ),
+        Index("ix_project_sync_outbox_status_enqueued", "status", "last_enqueued_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_language: Mapped[str] = mapped_column(String(20), nullable=False, default="", server_default=text("''"))
+    target_language: Mapped[str] = mapped_column(String(20), nullable=False, default="", server_default=text("''"))
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_file_record_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    source_segment_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("segments.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    requested_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default=text("'pending'"))
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    last_enqueued_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        nullable=False,
+    )
+    processed_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=False), nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
 class AutoTMRematchQueue(Base):
     __tablename__ = "auto_tm_rematch_queue"
     __table_args__ = (
@@ -2081,6 +2196,13 @@ class TermBase(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_language: Mapped[str] = mapped_column(String(20), nullable=False)
     target_language: Mapped[str] = mapped_column(String(20), nullable=False)
+    # 持久化条目总数，由数据库语句级触发器维护（见迁移 0020）。
+    entry_count: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
     creator_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("users.id", ondelete="SET NULL"),

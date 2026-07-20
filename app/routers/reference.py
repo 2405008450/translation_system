@@ -46,6 +46,7 @@ from app.services.file_operation_lock_service import (
 from app.services.file_record_service import SEGMENT_ORDERING
 from app.services.analytics_service import count_source_words, record_translation_metric_event
 from app.services.normalizer import normalize_text
+from app.services.segment_status import apply_segment_status
 
 router = APIRouter(prefix="/reference", tags=["reference"])
 REFERENCE_UPLOAD_COPY_CHUNK_SIZE = 1024 * 1024
@@ -927,7 +928,7 @@ async def reference_ai_translate(
                 segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
                 segment.llm_provider = result.provider
                 segment.llm_model = result.model
-                segment.status = _resolve_segment_status(segment)
+                apply_segment_status(segment, _resolve_segment_status(segment))
                 
                 # 记录修订历史
                 if (before_text or "") != (result.translated_text or ""):

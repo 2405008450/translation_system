@@ -119,6 +119,10 @@ class Settings(BaseSettings):
     tm_match_statement_timeout_ms: int = 45000
     tm_search_projection_enabled: bool = False
     tm_search_projection_fallback_enabled: bool = True
+    # 项目重复句段同步是否仅由“确认”触发（False 时保留旧行为：有译文的保存也触发）。
+    project_sync_confirmed_only: bool = True
+    # 句段变更 SSE 推送（依赖 redis_url；不可用时前端自动回退轮询）。
+    segment_events_enabled: bool = True
     jwt_secret_key: str = DEFAULT_JWT_SECRET_KEY
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 1440

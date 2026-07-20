@@ -36,6 +36,7 @@ const MAX_SEGMENT_PAGE_SIZE = 500
 const AUTO_SYNC_DELAY_MS = 1500
 const CHANGE_POLL_INTERVAL_MS = 10000
 const CHANGE_POLL_BURST_DELAYS_MS = [1200, 3000, 6000, 10000]
+const SEGMENT_EVENT_RECONNECT_DELAY_MS = 15000
 const EXPORT_POLL_INTERVAL_MS = 1200
 const REVISION_TRACKING_STORAGE_KEY = 'workbench.revisionTrackingEnabled'
 const DEFAULT_REVISION_INSERT_COLOR = '#2563eb'
@@ -411,6 +412,9 @@ export const useSegmentStore = defineStore('segment', () => {
   let syncPromise: Promise<boolean> | null = null
   let changePollTimer: number | null = null
   let changePollBurstTimers: number[] = []
+  let segmentEventAbortController: AbortController | null = null
+  let segmentEventReconnectTimer: number | null = null
+  let segmentEventGeneration = 0
   let changeCursor: string | null = null
   let pollingChanges = false
   let loadMorePromise: Promise<boolean> | null = null
@@ -898,9 +902,94 @@ export const useSegmentStore = defineStore('segment', () => {
     if (!fileRecord.value) {
       return
     }
+    const generation = ++segmentEventGeneration
+    void connectSegmentEventStream(fileRecord.value.id, generation)
+  }
+
+  function startChangePollingFallback() {
+    if (changePollTimer !== null || !fileRecord.value) {
+      return
+    }
+    void pollSegmentChanges()
     changePollTimer = window.setInterval(() => {
       void pollSegmentChanges()
     }, CHANGE_POLL_INTERVAL_MS)
+  }
+
+  function stopChangePollingFallback() {
+    if (changePollTimer !== null) {
+      window.clearInterval(changePollTimer)
+      changePollTimer = null
+    }
+  }
+
+  function scheduleSegmentEventReconnect(fileRecordId: string, generation: number) {
+    if (generation !== segmentEventGeneration || !fileRecord.value) {
+      return
+    }
+    if (segmentEventReconnectTimer !== null) {
+      window.clearTimeout(segmentEventReconnectTimer)
+    }
+    segmentEventReconnectTimer = window.setTimeout(() => {
+      segmentEventReconnectTimer = null
+      void connectSegmentEventStream(fileRecordId, generation)
+    }, SEGMENT_EVENT_RECONNECT_DELAY_MS)
+  }
+
+  async function connectSegmentEventStream(fileRecordId: string, generation: number) {
+    if (generation !== segmentEventGeneration || fileRecord.value?.id !== fileRecordId) {
+      return
+    }
+    segmentEventAbortController?.abort()
+    const controller = new AbortController()
+    segmentEventAbortController = controller
+    const token = window.localStorage.getItem('token')
+    const baseUrl = http.defaults.baseURL || '/api'
+
+    try {
+      const response = await fetch(`${baseUrl}/file-records/${fileRecordId}/segments/events`, {
+        headers: {
+          Accept: 'text/event-stream',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        signal: controller.signal,
+      })
+      if (!response.ok || !response.body) {
+        throw new Error(`segment event stream unavailable: ${response.status}`)
+      }
+      stopChangePollingFallback()
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (generation === segmentEventGeneration) {
+        const { done, value } = await reader.read()
+        if (done) {
+          break
+        }
+        buffer += decoder.decode(value, { stream: true })
+        let boundary = buffer.indexOf('\n\n')
+        while (boundary >= 0) {
+          const block = buffer.slice(0, boundary)
+          buffer = buffer.slice(boundary + 2)
+          if (block.split('\n').some((line) => line.trim() === 'event: segments')) {
+            void pollSegmentChanges()
+          }
+          boundary = buffer.indexOf('\n\n')
+        }
+      }
+    } catch (error) {
+      if (!controller.signal.aborted && generation === segmentEventGeneration) {
+        startChangePollingFallback()
+      }
+    } finally {
+      if (segmentEventAbortController === controller) {
+        segmentEventAbortController = null
+      }
+      if (!controller.signal.aborted && generation === segmentEventGeneration) {
+        startChangePollingFallback()
+        scheduleSegmentEventReconnect(fileRecordId, generation)
+      }
+    }
   }
 
   function clearChangePollBurstTimers() {
@@ -921,10 +1010,14 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   function stopChangePolling() {
-    if (changePollTimer !== null) {
-      window.clearInterval(changePollTimer)
-      changePollTimer = null
+    segmentEventGeneration += 1
+    segmentEventAbortController?.abort()
+    segmentEventAbortController = null
+    if (segmentEventReconnectTimer !== null) {
+      window.clearTimeout(segmentEventReconnectTimer)
+      segmentEventReconnectTimer = null
     }
+    stopChangePollingFallback()
     clearChangePollBurstTimers()
     pollingChanges = false
   }
@@ -1502,7 +1595,11 @@ export const useSegmentStore = defineStore('segment', () => {
     delete nextConflicts[segmentKey]
     conflictEntries.value = nextConflicts
     syncMessage.value = translate('stores.segment.syncPending', { count: dirtyCount.value })
-    scheduleSync()
+    if (confirm) {
+      void syncToBackend()
+    } else {
+      scheduleSync()
+    }
   }
 
   async function updateSource(sentenceId: string, sourceText: string) {

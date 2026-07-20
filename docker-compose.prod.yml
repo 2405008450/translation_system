@@ -243,8 +243,12 @@ services:
   postgres:
     image: pgvector/pgvector:pg17
     container_name: ai-translation-postgres
+    # 并行查询的动态共享内存走 /dev/shm，Docker 默认 64MB 会导致并行执行报错，需放大。
+    shm_size: 2gb
     # max_connections 需覆盖 PgBouncer 后端连接(DEFAULT_POOL_SIZE+RESERVE_POOL_SIZE 等)并留出余量。
-    command: ["postgres", "-c", "timezone=${TZ:-Asia/Shanghai}", "-c", "max_connections=200"]
+    # 内存/IO 等生产参数通过 ALTER SYSTEM 持久化在数据卷的 postgresql.auto.conf 中。
+    # TM 检索属于高频短查询，关闭 JIT 可避免每批额外数百毫秒的编译开销。
+    command: ["postgres", "-c", "timezone=${TZ:-Asia/Shanghai}", "-c", "max_connections=200", "-c", "jit=off"]
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       PGTZ: ${TZ:-Asia/Shanghai}

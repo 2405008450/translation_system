@@ -48,12 +48,13 @@ class DocumentMatchSegment:
     display_text: str = ""
     source_word_count: int = 0
     collection_ids: tuple[UUID, ...] = ()
+    tm_scope_mode: str = "selected"
     source_language: str | None = None
     target_language: str | None = None
 
 
 Matcher = Callable[
-    [Session | None, list[str], list[str], list[UUID], float],
+    [Session | None, list[str], list[str], list[UUID] | None, float],
     Sequence[MatchResult],
 ]
 
@@ -93,7 +94,7 @@ def compute_document_match_analysis(
             word_count = _segment_word_count(segment)
             source_hash = _segment_source_hash(segment)
 
-            for collection_id in segment.collection_ids:
+            for collection_id in segment.collection_ids or ():
                 if collection_id not in collection_ids_by_file[file_id]:
                     collection_ids_by_file[file_id].append(collection_id)
 
@@ -115,8 +116,8 @@ def compute_document_match_analysis(
             seen_files_by_hash[source_hash].add(file_id)
 
     default_matcher = matcher is _match_segments_with_tm
-    for (collection_ids, source_language, target_language), grouped_segments in _group_segments_for_tm(pending_tm_segments).items():
-        if not collection_ids:
+    for (scope_mode, collection_ids, source_language, target_language), grouped_segments in _group_segments_for_tm(pending_tm_segments).items():
+        if not collection_ids and scope_mode != "language_pair_all":
             for segment in grouped_segments:
                 word_count = _segment_word_count(segment)
                 _add_to_counts(counts_by_file[segment.file_id], "new", word_count)
@@ -130,13 +131,19 @@ def compute_document_match_analysis(
                 db,
                 source_sentences,
                 auxiliary_sentences,
-                list(collection_ids),
+                None if scope_mode == "language_pair_all" else list(collection_ids),
                 analysis_threshold,
                 source_language=source_language,
                 target_language=target_language,
             )
         else:
-            matches = matcher(db, source_sentences, auxiliary_sentences, list(collection_ids), analysis_threshold)
+            matches = matcher(
+                db,
+                source_sentences,
+                auxiliary_sentences,
+                None if scope_mode == "language_pair_all" else list(collection_ids),
+                analysis_threshold,
+            )
         for segment, match in zip(grouped_segments, matches, strict=False):
             bucket = _bucket_for_tm_match(match, match_threshold=analysis_threshold)
             word_count = _segment_word_count(segment)
@@ -264,7 +271,7 @@ def _match_segments_with_tm(
     db: Session | None,
     source_sentences: list[str],
     auxiliary_sentences: list[str],
-    collection_ids: list[UUID],
+    collection_ids: list[UUID] | None,
     match_threshold: float,
     source_language: str | None = None,
     target_language: str | None = None,
@@ -323,12 +330,25 @@ def _tm_match_applies_at_threshold(match: MatchResult | Any, threshold: float) -
 
 def _group_segments_for_tm(
     segments: Iterable[DocumentMatchSegment],
-) -> dict[tuple[tuple[UUID, ...], str | None, str | None], list[DocumentMatchSegment]]:
-    grouped: dict[tuple[tuple[UUID, ...], str | None, str | None], list[DocumentMatchSegment]] = defaultdict(list)
+) -> dict[tuple[str, tuple[UUID, ...], str | None, str | None], list[DocumentMatchSegment]]:
+    grouped: dict[
+        tuple[str, tuple[UUID, ...], str | None, str | None],
+        list[DocumentMatchSegment],
+    ] = defaultdict(list)
     for segment in segments:
         source_language = (segment.source_language or "").strip() or None
         target_language = (segment.target_language or "").strip() or None
-        key = (tuple(dict.fromkeys(segment.collection_ids)), source_language, target_language)
+        scope_mode = (
+            "language_pair_all"
+            if segment.tm_scope_mode == "language_pair_all"
+            else "selected"
+        )
+        key = (
+            scope_mode,
+            tuple(dict.fromkeys(segment.collection_ids or ())),
+            source_language,
+            target_language,
+        )
         grouped[key].append(segment)
     return dict(grouped)
 

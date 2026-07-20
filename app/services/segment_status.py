@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import and_, func, or_
@@ -9,6 +10,16 @@ from app.services.normalizer import (
     normalize_match_text,
     normalize_text,
 )
+
+
+def apply_segment_status(segment: Any, next_status: str) -> None:
+    """统一维护句段状态与最近确认时间。"""
+    if next_status == "confirmed":
+        if getattr(segment, "status", None) != "confirmed" or getattr(segment, "confirmed_at", None) is None:
+            segment.confirmed_at = datetime.now()
+    else:
+        segment.confirmed_at = None
+    segment.status = next_status
 
 
 def _normalized_source_values(segment: Any) -> tuple[str, str, str]:

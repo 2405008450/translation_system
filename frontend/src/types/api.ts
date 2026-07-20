@@ -678,6 +678,7 @@ export interface FileRecordDetail {
   collection_id: string | null
   collection_ids: string[]
   tm_match_threshold: number
+  tm_scope_mode?: 'selected' | 'language_pair_all'
   collection_name: string | null
   term_base_id: string | null
   term_base_name: string | null
@@ -1028,6 +1029,7 @@ export interface ProjectTranslationMemorySettingFile {
   collection_id: string | null
   collection_ids: string[]
   tm_match_threshold: number
+  tm_scope_mode?: 'selected' | 'language_pair_all'
 }
 
 export interface ProjectTranslationMemorySettingGroup {
