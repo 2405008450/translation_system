@@ -4,8 +4,10 @@ import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import AppLayout from '../views/AppLayout.vue'
 import AssignmentEventsView from '../views/AssignmentEventsView.vue'
-import DashboardView from '../views/DashboardView.vue'
 import GlossaryBaseEditView from '../views/GlossaryBaseEditView.vue'
+
+// 数据看板按需懒加载：naive-ui + echarts 体积较大，避免拖慢首屏
+const DashboardView = () => import('../views/DashboardView.vue')
 import GlossaryBaseView from '../views/GlossaryBaseView.vue'
 import LoginView from '../views/LoginView.vue'
 import ProjectDetailView from '../views/ProjectDetailView.vue'

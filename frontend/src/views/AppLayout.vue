@@ -160,7 +160,7 @@ const navGroups = computed<NavGroup[]>(() => [
   },
 ])
 
-const recentItems = computed(() => shellStore.recentItems)
+const recentItems = computed(() => shellStore.recentItems.slice(0, 3))
 const pageTitle = computed(() => {
   if (shellStore.pageContext.title) {
     return String(shellStore.pageContext.title)
@@ -422,13 +422,6 @@ function getUserInitial() {
   return name.charAt(0).toUpperCase()
 }
 
-function getRoleLabel(role?: string | null) {
-  if (role === 'super_admin') {
-    return t('common.roles.superAdmin')
-  }
-  return role === 'admin' ? t('common.roles.admin') : t('common.roles.user')
-}
-
 function getRecentIcon(section: string) {
   if (section === 'projects') {
     return Briefcase
@@ -628,35 +621,6 @@ watch(
             {{ t('shell.recent.empty') }}
           </div>
         </div>
-      </div>
-
-      <div class="sidebar-footer">
-        <div class="sidebar-user-avatar">{{ getUserInitial() }}</div>
-        <div v-if="!sidebarCollapsed" class="sidebar-user-info">
-          <strong>{{ getUserDisplayName() || authStore.user?.username }}</strong>
-          <span>{{ getRoleLabel(authStore.user?.role) }}</span>
-        </div>
-        <button
-          v-if="!sidebarCollapsed"
-          class="button"
-          type="button"
-          :title="t('shell.topbar.logout')"
-          :aria-label="t('shell.topbar.logout')"
-          style="margin-left: auto;"
-          @click="logout"
-        >
-          <LogOut :size="14" />
-        </button>
-        <button
-          v-else
-          class="button"
-          type="button"
-          :title="t('shell.topbar.logout')"
-          :aria-label="t('shell.topbar.logout')"
-          @click="logout"
-        >
-          <LogOut :size="14" />
-        </button>
       </div>
     </aside>
 

@@ -229,12 +229,12 @@ export default {
     kicker: '智慧运营平台',
   },
   dashboard: {
-    title: '系统数据看板',
+    title: '数据总览',
     subtitle: '按源文工作量统计翻译进度、LLM 处理量和团队活跃情况',
     range: {
-      label: '统计范围',
-      day: '按天',
-      month: '按月',
+      label: '趋势与工作量统计周期',
+      day: '近 30 天',
+      month: '近 12 个月',
     },
     kpis: {
       projects: '总项目数',
@@ -243,6 +243,12 @@ export default {
       llmWords: 'LLM 处理源文字数',
       activeUsers: '今日活跃用户',
       progress: '整体翻译进度',
+      resources: '资源规模（项目 / 文件）',
+    },
+    tabs: {
+      languageSources: '语言与来源',
+      models: '模型分析',
+      team: '团队工作量',
     },
     charts: {
       translationTitle: '翻译处理趋势',
@@ -269,6 +275,7 @@ export default {
       requests: '请求次数',
       newWords: '新增源文字数',
       modifiedWords: '修改源文字数',
+      newModifiedWords: '新增 / 修改源文字数',
       totalWords: '总源文字数',
       lastSeen: '最后活跃时间',
       durationHoursMinutes: '{hours} 小时 {minutes} 分钟',
@@ -290,8 +297,8 @@ export default {
       llm: 'LLM',
     },
     sources: {
-      title: '来源处理量',
-      hint: '按人工、记忆库和 LLM 来源汇总统计事件',
+      title: '来源处理量（源文字数）',
+      hint: '按人工、记忆库和 LLM 来源汇总源文字数',
       events: '{count} 次事件',
     },
     empty: {
