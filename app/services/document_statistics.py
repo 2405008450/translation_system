@@ -81,7 +81,11 @@ def compute_document_statistics(raw_bytes: bytes, filename: str) -> dict[str, An
     suffix = Path(filename or "").suffix.lower()
     if suffix == ".pptx":
         return compute_pptx_document_statistics(raw_bytes)
-    return compute_word_document_statistics(raw_bytes, filename)
+    if suffix == ".idml":
+        return compute_idml_document_statistics(raw_bytes)
+    if suffix in {".doc", ".docx"}:
+        return compute_word_document_statistics(raw_bytes, filename)
+    return compute_adapter_document_statistics(raw_bytes, filename)
 
 
 def compute_word_document_statistics(raw_bytes: bytes, filename: str) -> dict[str, Any]:
@@ -179,6 +183,185 @@ def compute_pptx_document_statistics(raw_bytes: bytes) -> dict[str, Any]:
         }
     )
     return payload
+
+
+def compute_idml_document_statistics(raw_bytes: bytes) -> dict[str, Any]:
+    """统计 IDML 中所有 Story 的可编辑文本，并读取基础版面信息。"""
+    try:
+        with ZipFile(BytesIO(raw_bytes)) as archive:
+            story_names = sorted(
+                name
+                for name in archive.namelist()
+                if name.startswith("Stories/") and name.lower().endswith(".xml")
+            )
+            if not story_names:
+                return _unavailable_statistics_payload()
+
+            paragraphs: list[str] = []
+            parsed_story_count = 0
+            for story_name in story_names:
+                try:
+                    root = ET.fromstring(archive.read(story_name))
+                except (KeyError, ET.ParseError):
+                    continue
+                parsed_story_count += 1
+                paragraphs.extend(_extract_idml_paragraph_texts(root))
+
+            if parsed_story_count == 0:
+                return _unavailable_statistics_payload()
+
+            pages, image_count, unique_image_count = _count_idml_layout_objects(archive)
+    except BadZipFile:
+        return _unavailable_statistics_payload()
+
+    payload = _build_statistics_payload(
+        source="idml_word_like",
+        engine="idml-xml-word-like",
+        include_textboxes_footnotes_endnotes=None,
+        license_status=None,
+        statistics_profile="idml_story_word_approx",
+        content_scope="all_stories",
+        statistics_warnings=["idml_lines_derived_from_story_paragraphs"],
+    )
+    payload.update(
+        {
+            "pages": pages,
+            "words": _count_word_words(paragraphs),
+            "non_asian_words": _count_non_asian_words(paragraphs),
+            "asian_characters": _count_asian_characters(paragraphs),
+            "characters": _count_characters(paragraphs, include_spaces=False),
+            "characters_with_spaces": _count_characters(paragraphs, include_spaces=True),
+            "paragraphs": len(paragraphs),
+            "lines": len(paragraphs),
+            "image_count": image_count,
+            "unique_image_count": unique_image_count,
+        }
+    )
+    return payload
+
+
+def compute_adapter_document_statistics(raw_bytes: bytes, filename: str) -> dict[str, Any]:
+    """复用项目格式适配器统计其已经能够提取的可翻译文本。"""
+    try:
+        # 延迟导入，避免适配器注册阶段与统计服务形成循环依赖。
+        from app.services.adapters import get_registry
+
+        adapter = get_registry().get_adapter(filename)
+        result = adapter.parse_with_options(raw_bytes, filename=filename, options=None)
+    except Exception:
+        return _unavailable_statistics_payload()
+
+    text_blocks = [
+        text.strip()
+        for text in _iter_adapter_node_texts(result.ast.nodes)
+        if text and text.strip()
+    ]
+    page_count = _to_optional_int(result.metadata.get("page_count"))
+    line_count = sum(_count_nonempty_text_lines(text) for text in text_blocks)
+    payload = _build_statistics_payload(
+        source="adapter_word_like",
+        engine="format-adapter-word-like",
+        include_textboxes_footnotes_endnotes=None,
+        license_status=None,
+        statistics_profile="adapter_text_word_approx",
+        content_scope="parser_translatable_text",
+        statistics_warnings=["statistics_derived_from_parser_text_blocks"],
+    )
+    payload.update(
+        {
+            "pages": page_count,
+            "words": _count_word_words(text_blocks),
+            "non_asian_words": _count_non_asian_words(text_blocks),
+            "asian_characters": _count_asian_characters(text_blocks),
+            "characters": _count_characters(text_blocks, include_spaces=False),
+            "characters_with_spaces": _count_characters(text_blocks, include_spaces=True),
+            "paragraphs": len(text_blocks),
+            "lines": line_count,
+        }
+    )
+    return payload
+
+
+def _iter_adapter_node_texts(nodes: Iterable[Any]) -> Iterable[str]:
+    for node in nodes:
+        text_content = getattr(node, "text_content", None)
+        if isinstance(text_content, str):
+            yield text_content
+        children = getattr(node, "children", None)
+        if children:
+            yield from _iter_adapter_node_texts(children)
+
+
+def _extract_idml_paragraph_texts(root: ET.Element) -> list[str]:
+    """提取 Story 段落；遇到嵌套段落时避免重复统计表格单元格文本。"""
+    paragraphs: list[str] = []
+
+    def extract(paragraph: ET.Element) -> None:
+        current: list[str] = []
+
+        def flush() -> None:
+            text = "".join(current).strip()
+            current.clear()
+            if text:
+                paragraphs.append(text)
+
+        def walk(node: ET.Element) -> None:
+            for child in node:
+                local_name = _local_name(child.tag)
+                if local_name == "ParagraphStyleRange":
+                    continue
+                if local_name == "Content":
+                    current.append(child.text or "")
+                elif local_name == "Br":
+                    flush()
+                else:
+                    walk(child)
+
+        walk(paragraph)
+        flush()
+
+    for element in root.iter():
+        if _local_name(element.tag) == "ParagraphStyleRange":
+            extract(element)
+    return paragraphs
+
+
+def _count_idml_layout_objects(archive: ZipFile) -> tuple[int, int, int]:
+    page_count = 0
+    image_count = 0
+    unique_images: set[str] = set()
+    for part_name in archive.namelist():
+        if not part_name.startswith("Spreads/") or not part_name.lower().endswith(".xml"):
+            continue
+        try:
+            root = ET.fromstring(archive.read(part_name))
+        except (KeyError, ET.ParseError):
+            continue
+        for element in root.iter():
+            local_name = _local_name(element.tag)
+            if local_name == "Page":
+                page_count += 1
+            elif local_name == "Image":
+                image_count += 1
+                resource = (
+                    element.get("LinkResourceURI")
+                    or element.get("LinkResourceID")
+                    or element.get("Self")
+                )
+                if resource:
+                    unique_images.add(resource)
+    return page_count, image_count, len(unique_images)
+
+
+def _unavailable_statistics_payload() -> dict[str, Any]:
+    return _build_statistics_payload(
+        source="unavailable",
+        engine=None,
+        include_textboxes_footnotes_endnotes=False,
+        license_status=None,
+        statistics_profile="unavailable",
+        content_scope="unavailable",
+    )
 
 
 def _convert_doc_to_docx(raw_bytes: bytes, filename: str) -> bytes | None:
@@ -980,6 +1163,10 @@ def _coerce_statistics_payload(value: dict[str, Any]) -> dict[str, Any]:
 def _default_statistics_profile(source: str) -> str:
     if source in {"openxml_word_like", "openxml_computed"}:
         return "word_web_approx"
+    if source == "idml_word_like":
+        return "idml_story_word_approx"
+    if source == "adapter_word_like":
+        return "adapter_text_word_approx"
     if source == "aspose":
         return "aspose_word"
     if source == "libreoffice":
@@ -992,6 +1179,10 @@ def _default_statistics_profile(source: str) -> str:
 def _default_content_scope(source: str) -> str:
     if source in {"openxml_word_like", "openxml_computed"}:
         return "main_document_body"
+    if source == "idml_word_like":
+        return "all_stories"
+    if source == "adapter_word_like":
+        return "parser_translatable_text"
     if source == "aspose":
         return "aspose_document"
     if source == "libreoffice":

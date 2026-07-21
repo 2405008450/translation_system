@@ -178,9 +178,11 @@ export interface ProjectAssignmentsResponse {
   project_id: string
   workflow_steps?: WorkflowStep[]
   assignments: ProjectAssignmentItem[]
+  revision: string
 }
 
 export interface ProjectAssignmentPayload {
+  base_revision?: string
   assignments: Array<{
     assignee_id: string
     workflow_step_id?: string

@@ -49,6 +49,7 @@ import {
 import { http } from '../api/http'
 import DataTable from '../components/DataTable.vue'
 import type { DataTableColumn } from '../components/DataTable.vue'
+import AssignmentModal from '../components/AssignmentModal.vue'
 import DocumentParseSettings from '../components/DocumentParseSettings.vue'
 import IssueMarkerDialog from '../components/IssueMarkerDialog.vue'
 import Modal from '../components/base/Modal.vue'
@@ -73,6 +74,7 @@ import {
 } from '../utils/exportOptions'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
 import { matchesSearchKeyword, normalizeSearchKeyword, splitSearchKeywords } from '../utils/search'
+import type { AssignmentDraft, AssignmentFileRangeDraft, AssignmentSaveRequest } from '../types/assignment'
 import type {
   DocumentParseMode,
   DocumentParseOptions,
@@ -227,23 +229,6 @@ interface EnglishVariantCopyResponse {
   }
 }
 
-interface AssignmentDraft {
-  assignee_id: string
-  workflow_step_id: string
-  file_record_ids: Set<string>
-  file_ranges: Map<string, AssignmentFileRangeDraft>
-}
-
-interface AssignmentFileRangeDraft {
-  range_start: number | null
-  range_end: number | null
-}
-
-type AssignmentFileRangeField = 'range_start' | 'range_end'
-
-type AssignmentUserTypeFilter = 'all' | 'internal' | 'external'
-type AssignmentUserStateFilter = 'all' | 'selected' | 'unselected'
-type AssignmentFileStateFilter = 'all' | 'checked' | 'unchecked'
 type ProjectResourceCreateKind = 'tm' | 'term'
 type ProjectResourceLanguageAsset = TMCollection | TermBase
 
@@ -544,14 +529,8 @@ const loadingAssignableUsers = ref(false)
 const loadingAssignments = ref(false)
 const savingAssignment = ref(false)
 const assignmentDrafts = ref<AssignmentDraft[]>([])
-const activeAssignmentWorkflowStepId = ref('')
-const assignmentUserSearch = ref('')
-const assignmentUserTypeFilter = ref<AssignmentUserTypeFilter>('all')
-const assignmentUserStateFilter = ref<AssignmentUserStateFilter>('all')
-const assignmentFileSearch = ref('')
-const assignmentFileStateFilter = ref<AssignmentFileStateFilter>('all')
-const assignmentTooltipText = ref('')
-const assignmentTooltipStyle = ref<Record<string, string>>({})
+const assignmentRevision = ref('')
+const assignmentInitialFileId = ref<string | null>(null)
 const assignmentEvents = ref<AssignmentEvent[]>([])
 const assignmentEventsLoading = ref(false)
 const translationMemorySettings = ref<ProjectTranslationMemorySettingsResponse | null>(null)
@@ -1012,14 +991,11 @@ const projectWorkflowLabel = computed(() => (
     ? projectWorkflowSteps.value.map((step) => step.name).join(' / ')
     : getPlaceholder()
 ))
-const activeAssignmentWorkflowStep = computed(() => (
-  projectWorkflowSteps.value.find((step) => step.id === activeAssignmentWorkflowStepId.value) ?? projectWorkflowSteps.value[0] ?? null
-))
-const activeAssignmentDrafts = computed(() => (
-  assignmentDrafts.value.filter((draft) => draft.workflow_step_id === activeAssignmentWorkflowStepId.value)
-))
 const assignmentMergeViews = computed(() => (
-  mergeViews.value.filter((view) => getAssignableMergeViewFileIds(view).length >= 2)
+  mergeViews.value.filter((view) => {
+    const projectFileIds = new Set(tableRows.value.map((file) => file.id))
+    return (view.file_ids || []).filter((fileId) => projectFileIds.has(fileId)).length >= 2
+  })
 ))
 const issueMarkers = computed<IssueMarker[]>(() => project.value?.issue_markers ?? [])
 const openIssueCount = computed(() => issueMarkers.value.filter((marker) => marker.status === 'open').length)
@@ -1224,28 +1200,6 @@ const canAssignSelectedFile = computed(() => (
   canAssignProject.value
   && Boolean(project.value)
 ))
-const filteredAssignableUsers = computed<User[]>(() => {
-  let users = [...assignableUsers.value]
-
-  if (assignmentUserTypeFilter.value !== 'all') {
-    users = users.filter((user) => user.translator_type === assignmentUserTypeFilter.value)
-  }
-
-  if (assignmentUserStateFilter.value !== 'all') {
-    users = users.filter((user) => (
-      assignmentUserStateFilter.value === 'selected'
-        ? isUserInAssignmentDraft(user.id)
-        : !isUserInAssignmentDraft(user.id)
-    ))
-  }
-
-  const keyword = normalizeAssignmentKeyword(assignmentUserSearch.value)
-  if (keyword) {
-    users = users.filter((user) => getAssignmentUserSearchText(user).includes(keyword))
-  }
-
-  return users
-})
 const termExtractionButtonTitle = computed(() => {
   if (selectedFileIds.value.size === 0) {
     return t('projectDetail.termExtraction.selectFileFirst')
@@ -1600,40 +1554,12 @@ function getAssigneeDisplayName(user: User | null | undefined) {
   return user?.nickname || user?.username || ''
 }
 
-function ensureActiveAssignmentWorkflowStep() {
-  if (activeAssignmentWorkflowStep.value) {
-    activeAssignmentWorkflowStepId.value = activeAssignmentWorkflowStep.value.id
-    return
-  }
-  activeAssignmentWorkflowStepId.value = projectWorkflowSteps.value[0]?.id ?? ''
-}
-
 function getAssigneeLabel(row: ProjectRow) {
   const assignees = Array.isArray(row.assignees) ? row.assignees : []
   if (assignees.length > 0) {
     return assignees.map((user) => getAssigneeDisplayName(user)).filter(Boolean).join('、')
   }
   return getAssigneeDisplayName(row.assignee) || '未分配'
-}
-
-function getTranslatorTypeLabel(user: User) {
-  return user.translator_type === 'internal' ? '内部译者' : '外部译者'
-}
-
-function getAssigneeSecondaryLabel(user: User) {
-  const typeLabel = getTranslatorTypeLabel(user)
-  if (user.nickname && user.nickname !== user.username) {
-    return `${user.username} · ${typeLabel}`
-  }
-  return typeLabel
-}
-
-function getAssigneeTooltip(user: User) {
-  return `${getAssigneeDisplayName(user)} · ${getAssigneeSecondaryLabel(user)}`
-}
-
-function normalizeAssignmentKeyword(value: string | null | undefined) {
-  return String(value || '').trim().toLowerCase()
 }
 
 function normalizeFileFilterKeyword(value: string | null | undefined) {
@@ -1791,15 +1717,6 @@ function resetFileFilters() {
   fileStatusFilter.value = 'all'
   fileLanguagePairFilter.value = 'all'
   fileAssigneeFilter.value = 'all'
-}
-
-function getAssignmentUserSearchText(user: User) {
-  return [
-    getAssigneeDisplayName(user),
-    user.username,
-    getTranslatorTypeLabel(user),
-    user.translator_type,
-  ].map(normalizeAssignmentKeyword).join(' ')
 }
 
 function formatDateTimeLocalValue(value: string | null) {
@@ -2139,6 +2056,8 @@ function getStatisticsStatusClass(statistics: DocumentStatistics | null | undefi
     statistics.source === 'openxml_computed'
     || statistics.source === 'openxml_word_like'
     || statistics.source === 'pptx_word_like'
+    || statistics.source === 'idml_word_like'
+    || statistics.source === 'adapter_word_like'
   ) {
     return 'project-status--info'
   }
@@ -2435,14 +2354,14 @@ async function loadAssignableUsers() {
 async function loadProjectAssignments() {
   if (!project.value) {
     assignmentDrafts.value = []
+    assignmentRevision.value = ''
     return
   }
   loadingAssignments.value = true
   try {
     const { data } = await http.get<ProjectAssignmentsResponse>(`/projects/${project.value.id}/assignments`)
-    if (!activeAssignmentWorkflowStepId.value) {
-      activeAssignmentWorkflowStepId.value = data.workflow_steps?.[0]?.id || projectWorkflowSteps.value[0]?.id || ''
-    }
+    assignmentRevision.value = data.revision || ''
+    const defaultWorkflowStepId = data.workflow_steps?.[0]?.id || projectWorkflowSteps.value[0]?.id || ''
     assignmentDrafts.value = data.assignments.map((assignment) => {
       const fileRanges = new Map<string, AssignmentFileRangeDraft>()
       const fileIds = new Set(assignment.file_record_ids)
@@ -2457,7 +2376,7 @@ async function loadProjectAssignments() {
       }
       return {
         assignee_id: assignment.assignee_id,
-        workflow_step_id: assignment.workflow_step_id || activeAssignmentWorkflowStepId.value,
+        workflow_step_id: assignment.workflow_step_id || defaultWorkflowStepId,
         file_record_ids: fileIds,
         file_ranges: fileRanges,
       }
@@ -2487,306 +2406,6 @@ async function loadAssignmentEvents() {
   }
 }
 
-function isUserInAssignmentDraft(userId: string) {
-  const workflowStepId = activeAssignmentWorkflowStepId.value
-  return assignmentDrafts.value.some((draft) => draft.assignee_id === userId && draft.workflow_step_id === workflowStepId)
-}
-
-function getAssignmentDraft(userId: string) {
-  const workflowStepId = activeAssignmentWorkflowStepId.value
-  return assignmentDrafts.value.find((draft) => (
-    draft.assignee_id === userId && draft.workflow_step_id === workflowStepId
-  )) || null
-}
-
-function getAssignableUserById(userId: string) {
-  return assignableUsers.value.find((user) => user.id === userId) || null
-}
-
-function getAssignmentUserName(userId: string) {
-  return getAssigneeDisplayName(getAssignableUserById(userId)) || '未知译者'
-}
-
-function toggleAssignmentUser(user: User) {
-  const workflowStepId = activeAssignmentWorkflowStepId.value
-  if (!workflowStepId) {
-    return
-  }
-  if (isUserInAssignmentDraft(user.id)) {
-    assignmentDrafts.value = assignmentDrafts.value.filter((draft) => !(
-      draft.assignee_id === user.id && draft.workflow_step_id === workflowStepId
-    ))
-    return
-  }
-  assignmentDrafts.value = [
-    ...assignmentDrafts.value,
-    {
-      assignee_id: user.id,
-      workflow_step_id: workflowStepId,
-      file_record_ids: new Set<string>(),
-      file_ranges: new Map<string, AssignmentFileRangeDraft>(),
-    },
-  ]
-}
-
-function isFileCheckedForUser(userId: string, fileRecordId: string) {
-  return getAssignmentDraft(userId)?.file_record_ids.has(fileRecordId) ?? false
-}
-
-function toggleAssignmentFile(userId: string, fileRecordId: string) {
-  const workflowStepId = activeAssignmentWorkflowStepId.value
-  assignmentDrafts.value = assignmentDrafts.value.map((draft) => {
-    if (draft.assignee_id !== userId || draft.workflow_step_id !== workflowStepId) {
-      return draft
-    }
-    const nextFileIds = new Set(draft.file_record_ids)
-    const nextFileRanges = new Map(draft.file_ranges)
-    if (nextFileIds.has(fileRecordId)) {
-      nextFileIds.delete(fileRecordId)
-      nextFileRanges.delete(fileRecordId)
-    } else {
-      nextFileIds.add(fileRecordId)
-    }
-    return {
-      ...draft,
-      file_record_ids: nextFileIds,
-      file_ranges: nextFileRanges,
-    }
-  })
-}
-
-function getFilteredAssignmentFiles(draft: AssignmentDraft) {
-  let files = [...tableRows.value]
-
-  const keyword = normalizeAssignmentKeyword(assignmentFileSearch.value)
-  if (keyword) {
-    files = files.filter((file) => normalizeAssignmentKeyword(file.filename).includes(keyword))
-  }
-
-  if (assignmentFileStateFilter.value !== 'all') {
-    files = files.filter((file) => {
-      const checked = draft.file_record_ids.has(file.id)
-      return assignmentFileStateFilter.value === 'checked' ? checked : !checked
-    })
-  }
-
-  return files
-}
-
-function getAssignableMergeViewFileIds(view: MergeView) {
-  const projectFileIds = new Set(tableRows.value.map((file) => file.id))
-  return (view.file_ids || []).filter((fileId) => projectFileIds.has(fileId))
-}
-
-function isAssignmentMergeViewChecked(draft: AssignmentDraft, view: MergeView) {
-  const fileIds = getAssignableMergeViewFileIds(view)
-  return fileIds.length > 0 && fileIds.every((fileId) => draft.file_record_ids.has(fileId))
-}
-
-function isAssignmentMergeViewPartial(draft: AssignmentDraft, view: MergeView) {
-  const fileIds = getAssignableMergeViewFileIds(view)
-  if (fileIds.length === 0 || isAssignmentMergeViewChecked(draft, view)) {
-    return false
-  }
-  return fileIds.some((fileId) => draft.file_record_ids.has(fileId))
-}
-
-function toggleAssignmentMergeView(draft: AssignmentDraft, view: MergeView) {
-  const fileIds = getAssignableMergeViewFileIds(view)
-  if (fileIds.length === 0) {
-    return
-  }
-  const shouldRemove = isAssignmentMergeViewChecked(draft, view)
-  assignmentDrafts.value = assignmentDrafts.value.map((item) => {
-    if (item.assignee_id !== draft.assignee_id || item.workflow_step_id !== draft.workflow_step_id) {
-      return item
-    }
-    const nextFileIds = new Set(item.file_record_ids)
-    const nextFileRanges = new Map(item.file_ranges)
-    for (const fileId of fileIds) {
-      if (shouldRemove) {
-        nextFileIds.delete(fileId)
-        nextFileRanges.delete(fileId)
-      } else {
-        nextFileIds.add(fileId)
-      }
-    }
-    return {
-      ...item,
-      file_record_ids: nextFileIds,
-      file_ranges: nextFileRanges,
-    }
-  })
-}
-
-function getAssignmentMergeViewMeta(view: MergeView) {
-  return [
-    `${getAssignableMergeViewFileIds(view).length} 个文件`,
-    view.creator_name ? `创建人 ${view.creator_name}` : '',
-  ].filter(Boolean).join(' · ')
-}
-
-function getCheckedAssignmentMergeViewIds(draft: AssignmentDraft) {
-  return assignmentMergeViews.value
-    .filter((view) => isAssignmentMergeViewChecked(draft, view))
-    .map((view) => view.id)
-}
-
-function updateFilteredAssignmentFiles(userId: string, checked: boolean) {
-  const draft = getAssignmentDraft(userId)
-  if (!draft) {
-    return
-  }
-  const filteredFileIds = getFilteredAssignmentFiles(draft).map((file) => file.id)
-  if (filteredFileIds.length === 0) {
-    return
-  }
-
-  assignmentDrafts.value = assignmentDrafts.value.map((item) => {
-    if (item.assignee_id !== userId || item.workflow_step_id !== draft.workflow_step_id) {
-      return item
-    }
-    const nextFileIds = new Set(item.file_record_ids)
-    const nextFileRanges = new Map(item.file_ranges)
-    for (const fileId of filteredFileIds) {
-      if (checked) {
-        nextFileIds.add(fileId)
-      } else {
-        nextFileIds.delete(fileId)
-        nextFileRanges.delete(fileId)
-      }
-    }
-    return {
-      ...item,
-      file_record_ids: nextFileIds,
-      file_ranges: nextFileRanges,
-    }
-  })
-}
-
-function selectFilteredAssignmentFiles(userId: string) {
-  updateFilteredAssignmentFiles(userId, true)
-}
-
-function clearFilteredAssignmentFiles(userId: string) {
-  updateFilteredAssignmentFiles(userId, false)
-}
-
-function getAssignmentRangeInputValue(
-  draft: AssignmentDraft,
-  fileRecordId: string,
-  field: AssignmentFileRangeField,
-) {
-  const value = draft.file_ranges.get(fileRecordId)?.[field]
-  return value ?? ''
-}
-
-function getAssignmentInputValue(event: Event) {
-  return event.target instanceof HTMLInputElement ? event.target.value : ''
-}
-
-function parseAssignmentRangeInput(value: string) {
-  const trimmed = value.trim()
-  if (!trimmed) {
-    return null
-  }
-  const numericValue = Number(trimmed)
-  return Number.isFinite(numericValue) ? numericValue : null
-}
-
-function updateAssignmentFileRange(
-  userId: string,
-  fileRecordId: string,
-  field: AssignmentFileRangeField,
-  value: string,
-) {
-  const workflowStepId = activeAssignmentWorkflowStepId.value
-  assignmentDrafts.value = assignmentDrafts.value.map((draft) => {
-    if (draft.assignee_id !== userId || draft.workflow_step_id !== workflowStepId) {
-      return draft
-    }
-    const nextFileIds = new Set(draft.file_record_ids)
-    const nextFileRanges = new Map(draft.file_ranges)
-    const currentRange = nextFileRanges.get(fileRecordId) ?? { range_start: null, range_end: null }
-    const nextRange = {
-      ...currentRange,
-      [field]: parseAssignmentRangeInput(value),
-    }
-    nextFileIds.add(fileRecordId)
-    if (nextRange.range_start === null && nextRange.range_end === null) {
-      nextFileRanges.delete(fileRecordId)
-    } else {
-      nextFileRanges.set(fileRecordId, nextRange)
-    }
-    return {
-      ...draft,
-      file_record_ids: nextFileIds,
-      file_ranges: nextFileRanges,
-    }
-  })
-}
-
-function getAssignmentFileSegmentCount(fileRecordId: string) {
-  return Number(projectFileById.value.get(fileRecordId)?.total_segments || 0)
-}
-
-function getAssignmentFileLabel(fileRecordId: string) {
-  return projectFileById.value.get(fileRecordId)?.filename || fileRecordId
-}
-
-function validateAssignmentRanges() {
-  for (const draft of assignmentDrafts.value) {
-    for (const fileRecordId of draft.file_record_ids) {
-      const range = draft.file_ranges.get(fileRecordId)
-      if (!range || (range.range_start === null && range.range_end === null)) {
-        continue
-      }
-      const fileLabel = getAssignmentFileLabel(fileRecordId)
-      if (range.range_start === null || range.range_end === null) {
-        toast.error(`${fileLabel} 的句段范围需要同时填写起始段和结束段。`)
-        return false
-      }
-      if (
-        !Number.isInteger(range.range_start)
-        || !Number.isInteger(range.range_end)
-        || range.range_start < 1
-        || range.range_end < 1
-      ) {
-        toast.error(`${fileLabel} 的句段范围必须是大于 0 的整数。`)
-        return false
-      }
-      if (range.range_start > range.range_end) {
-        toast.error(`${fileLabel} 的起始段不能大于结束段。`)
-        return false
-      }
-      const segmentCount = getAssignmentFileSegmentCount(fileRecordId)
-      if (segmentCount > 0 && range.range_end > segmentCount) {
-        toast.error(`${fileLabel} 的结束段不能超过 ${segmentCount}。`)
-        return false
-      }
-    }
-  }
-  return true
-}
-
-function buildAssignmentFilePayload(draft: AssignmentDraft) {
-  const file_record_ids: string[] = []
-  const file_ranges: Array<{ file_record_id: string; range_start: number; range_end: number }> = []
-  for (const fileRecordId of draft.file_record_ids) {
-    const range = draft.file_ranges.get(fileRecordId)
-    if (range && range.range_start !== null && range.range_end !== null) {
-      file_ranges.push({
-        file_record_id: fileRecordId,
-        range_start: range.range_start,
-        range_end: range.range_end,
-      })
-    } else {
-      file_record_ids.push(fileRecordId)
-    }
-  }
-  return { file_record_ids, file_ranges }
-}
-
 function getAssignmentEventActionLabel(action: string) {
   const labels: Record<string, string> = {
     project_assigned: '项目指派',
@@ -2797,53 +2416,18 @@ function getAssignmentEventActionLabel(action: string) {
   return labels[action] || action
 }
 
-function resetAssignmentFilters() {
-  assignmentUserSearch.value = ''
-  assignmentUserTypeFilter.value = 'all'
-  assignmentUserStateFilter.value = 'all'
-  assignmentFileSearch.value = ''
-  assignmentFileStateFilter.value = 'all'
-  hideAssignmentTooltip()
-}
-
 function resetAssignmentDialogState() {
   assignmentDrafts.value = []
-  resetAssignmentFilters()
+  assignmentRevision.value = ''
+  assignmentInitialFileId.value = null
 }
 
-function updateAssignmentTooltipPosition(event: MouseEvent) {
-  const maxWidth = Math.min(340, Math.max(220, window.innerWidth - 32))
-  const left = Math.min(event.clientX + 14, window.innerWidth - maxWidth - 12)
-  const top = Math.min(event.clientY + 16, window.innerHeight - 80)
-  assignmentTooltipStyle.value = {
-    left: `${Math.max(12, left)}px`,
-    top: `${Math.max(12, top)}px`,
-    maxWidth: `${maxWidth}px`,
-  }
-}
-
-function showAssignmentTooltip(event: MouseEvent, text: string | null | undefined) {
-  const value = String(text || '').trim()
-  if (!value) {
-    hideAssignmentTooltip()
-    return
-  }
-  assignmentTooltipText.value = value
-  updateAssignmentTooltipPosition(event)
-}
-
-function hideAssignmentTooltip() {
-  assignmentTooltipText.value = ''
-  assignmentTooltipStyle.value = {}
-}
-
-async function openAssignmentDialog(_row?: ProjectFileItem | null) {
+async function openAssignmentDialog(row?: ProjectFileItem | null) {
   if (!canAssignProject.value) {
     return
   }
   closeActionMenu()
-  resetAssignmentFilters()
-  ensureActiveAssignmentWorkflowStep()
+  assignmentInitialFileId.value = row?.id || null
   showAssignmentDialog.value = true
   await Promise.all([loadAssignableUsers(), loadProjectAssignments(), loadMergeViews()])
 }
@@ -2856,33 +2440,38 @@ function closeAssignmentDialog() {
   resetAssignmentDialogState()
 }
 
-async function saveAssignment() {
+async function saveAssignment(request: AssignmentSaveRequest) {
   if (!project.value || !canAssignProject.value) {
-    return
-  }
-  if (!validateAssignmentRanges()) {
     return
   }
   savingAssignment.value = true
   try {
-    await http.patch(`/projects/${project.value.id}/assignments`, {
-      assignments: assignmentDrafts.value.map((draft) => {
-        const filePayload = buildAssignmentFilePayload(draft)
-        return {
-          assignee_id: draft.assignee_id,
-          workflow_step_id: draft.workflow_step_id,
-          file_record_ids: filePayload.file_record_ids,
-          file_ranges: filePayload.file_ranges,
-          merge_view_ids: getCheckedAssignmentMergeViewIds(draft),
-        }
-      }),
-    })
+    await http.patch(`/projects/${project.value.id}/assignments`, request)
     toast.success('项目指派已更新。')
     showAssignmentDialog.value = false
     resetAssignmentDialogState()
     await loadProject()
     await loadAssignmentEvents()
   } catch (error) {
+    if (axios.isAxiosError(error)) {
+      const detail = error.response?.data?.detail
+      if (detail && typeof detail === 'object' && detail.code === 'assignment_state_changed') {
+        const reload = await confirm({
+          title: '分配信息已更新',
+          message: String(detail.message || '其他管理员已更新任务分配。是否放弃当前草稿并加载最新数据？'),
+          confirmText: '加载最新数据',
+          cancelText: '保留当前草稿',
+        })
+        if (reload) {
+          await loadProjectAssignments()
+        }
+        return
+      }
+      if (detail && typeof detail === 'object' && detail.code === 'assignment_conflict') {
+        toast.error(String(detail.message || '任务分配存在冲突，请检查后重试。'))
+        return
+      }
+    }
     toast.error(getErrorMessage(error, '项目指派保存失败。'))
   } finally {
     savingAssignment.value = false
@@ -3550,7 +3139,6 @@ async function loadProject(options: { preserveFilePagination?: boolean } = {}) {
   try {
     const { data } = await http.get<ProjectDetail>(`/projects/${props.id}`)
     project.value = data
-    ensureActiveAssignmentWorkflowStep()
     syncSettingsForm(data)
     guidelinesText.value = data.translation_guidelines || ''
     if (options.preserveFilePagination) {
@@ -7404,6 +6992,7 @@ onBeforeUnmount(() => {
                 <button
                   v-if="canAssignProject"
                   class="button pd-toolbar-action-button pd-toolbar-action-button--labeled"
+                  data-testid="project-assignment-open"
                   type="button"
                   :disabled="!canAssignSelectedFile"
                   :title="t('projectDetail.files.actions.assign')"
@@ -7721,6 +7310,7 @@ onBeforeUnmount(() => {
               <div v-if="canAssignProject" class="pd-task-links">
                 <button
                   class="pd-inline-link"
+                  data-testid="project-file-assignment-open"
                   type="button"
                   @click.stop="openAssignmentDialog(row as ProjectFileItem)"
                 >
@@ -8362,297 +7952,21 @@ onBeforeUnmount(() => {
       </template>
     </Modal>
 
-    <Modal
+    <AssignmentModal
       :open="showAssignmentDialog"
-      title="分配任务"
-      width="min(980px, calc(100vw - 32px))"
-      :close-on-overlay="!savingAssignment"
-      :close-on-esc="!savingAssignment"
+      :files="tableRows"
+      :users="assignableUsers"
+      :workflow-steps="projectWorkflowSteps"
+      :merge-views="assignmentMergeViews"
+      :assignments="assignmentDrafts"
+      :revision="assignmentRevision"
+      :loading="loadingAssignableUsers || loadingAssignments"
+      :saving="savingAssignment"
+      :initial-file-id="assignmentInitialFileId"
       @close="closeAssignmentDialog"
-    >
-      <div class="pd-assignment-dialog pd-assignment-dialog--project">
-        <aside class="pd-assignment-panel pd-assignment-users">
-          <div class="pd-assignment-panel__head">
-            <div>
-              <strong>译者</strong>
-              <span>{{ filteredAssignableUsers.length }} / {{ assignableUsers.length }}</span>
-            </div>
-          </div>
+      @save="saveAssignment"
+    />
 
-          <label class="pd-assignment-search">
-            <Search :size="14" />
-            <input
-              v-model="assignmentUserSearch"
-              type="search"
-              placeholder="搜索昵称、用户名或译者类型"
-              :disabled="loadingAssignableUsers || loadingAssignments || savingAssignment"
-            />
-            <button
-              v-if="assignmentUserSearch"
-              class="pd-assignment-clear"
-              type="button"
-              aria-label="清空搜索"
-              :disabled="loadingAssignableUsers || loadingAssignments || savingAssignment"
-              @mouseenter="showAssignmentTooltip($event, '清空搜索')"
-              @mousemove="updateAssignmentTooltipPosition"
-              @mouseleave="hideAssignmentTooltip"
-              @click="assignmentUserSearch = ''"
-            >
-              <X :size="13" />
-            </button>
-          </label>
-
-          <div class="pd-assignment-filter-row">
-            <select
-              v-model="assignmentUserTypeFilter"
-              class="pd-assignment-filter-select"
-              aria-label="译者类型筛选"
-              :disabled="loadingAssignableUsers || loadingAssignments || savingAssignment"
-            >
-              <option value="all">全部译者类型</option>
-              <option value="internal">内部译者</option>
-              <option value="external">外部译者</option>
-            </select>
-            <select
-              v-model="assignmentUserStateFilter"
-              class="pd-assignment-filter-select"
-              aria-label="译者选择状态筛选"
-              :disabled="loadingAssignableUsers || loadingAssignments || savingAssignment"
-            >
-              <option value="all">全部选择状态</option>
-              <option value="selected">已选择</option>
-              <option value="unselected">未选择</option>
-            </select>
-          </div>
-
-          <p v-if="loadingAssignableUsers || loadingAssignments" class="hint-text pd-assignment-state">
-            正在加载指派信息...
-          </p>
-          <p v-else-if="assignableUsers.length === 0" class="form-message is-error pd-assignment-state">
-            暂无可分配的启用译者账号。
-          </p>
-          <p v-else-if="filteredAssignableUsers.length === 0" class="pd-assignment-state">
-            没有符合条件的译者
-          </p>
-          <div v-else class="pd-assignment-user-list">
-            <button
-              v-for="user in filteredAssignableUsers"
-              :key="user.id"
-              class="pd-assignment-user"
-              :class="{ 'is-active': isUserInAssignmentDraft(user.id) }"
-              type="button"
-              :disabled="savingAssignment"
-              @mouseenter="showAssignmentTooltip($event, getAssigneeTooltip(user))"
-              @mousemove="updateAssignmentTooltipPosition"
-              @mouseleave="hideAssignmentTooltip"
-              @click="toggleAssignmentUser(user)"
-            >
-              <span>{{ getAssigneeDisplayName(user) }}</span>
-              <small>{{ getAssigneeSecondaryLabel(user) }}</small>
-            </button>
-          </div>
-        </aside>
-
-        <section class="pd-assignment-panel pd-assignment-files">
-          <div class="pd-assignment-panel__head pd-assignment-panel__head--files">
-            <div>
-              <strong>文件 / 视图授权</strong>
-              <span>已选择 {{ assignmentDrafts.length }} 位译者</span>
-            </div>
-            <span>{{ tableRows.length }} 个文件 · {{ assignmentMergeViews.length }} 个视图</span>
-          </div>
-
-          <div v-if="projectWorkflowSteps.length > 0" class="pd-assignment-workflow-tabs">
-            <button
-              v-for="step in projectWorkflowSteps"
-              :key="step.id"
-              class="pd-assignment-workflow-tab"
-              :class="{ 'is-active': step.id === activeAssignmentWorkflowStepId }"
-              type="button"
-              :disabled="savingAssignment"
-              @click="activeAssignmentWorkflowStepId = step.id"
-            >
-              {{ step.name }}
-            </button>
-          </div>
-
-          <div class="pd-assignment-file-toolbar">
-            <label class="pd-assignment-search pd-assignment-search--files">
-              <Search :size="14" />
-              <input
-                v-model="assignmentFileSearch"
-                type="search"
-                placeholder="搜索文件名"
-                :disabled="savingAssignment || activeAssignmentDrafts.length === 0"
-              />
-              <button
-                v-if="assignmentFileSearch"
-                class="pd-assignment-clear"
-                type="button"
-                aria-label="清空搜索"
-                :disabled="savingAssignment"
-                @mouseenter="showAssignmentTooltip($event, '清空搜索')"
-                @mousemove="updateAssignmentTooltipPosition"
-                @mouseleave="hideAssignmentTooltip"
-                @click="assignmentFileSearch = ''"
-              >
-                <X :size="13" />
-              </button>
-            </label>
-            <select
-              v-model="assignmentFileStateFilter"
-              class="pd-assignment-filter-select"
-              aria-label="文件授权状态筛选"
-              :disabled="savingAssignment || activeAssignmentDrafts.length === 0"
-            >
-              <option value="all">全部文件</option>
-              <option value="checked">已授权</option>
-              <option value="unchecked">未授权</option>
-            </select>
-          </div>
-
-          <div v-if="activeAssignmentDrafts.length === 0" class="empty-state pd-assignment-empty">
-            请选择至少一位译者。
-          </div>
-          <div v-else class="pd-assignment-file-groups">
-            <section
-              v-for="draft in activeAssignmentDrafts"
-              :key="`${draft.workflow_step_id}-${draft.assignee_id}`"
-              class="pd-assignment-file-group"
-            >
-              <div class="pd-assignment-file-group__head">
-                <div class="pd-assignment-file-group__title">
-                  <strong>{{ getAssignmentUserName(draft.assignee_id) }}</strong>
-                  <span>
-                    已授权 {{ draft.file_record_ids.size }} 个文件 · 当前筛选 {{ getFilteredAssignmentFiles(draft).length }} 个
-                  </span>
-                </div>
-                <div class="pd-assignment-file-group__actions">
-                  <button
-                    class="button pd-assignment-file-action"
-                    type="button"
-                    :disabled="savingAssignment || getFilteredAssignmentFiles(draft).length === 0"
-                    @click="selectFilteredAssignmentFiles(draft.assignee_id)"
-                  >
-                    <Check :size="13" />
-                    全选筛选结果
-                  </button>
-                  <button
-                    class="button pd-assignment-file-action"
-                    type="button"
-                    :disabled="savingAssignment || getFilteredAssignmentFiles(draft).length === 0"
-                    @click="clearFilteredAssignmentFiles(draft.assignee_id)"
-                  >
-                    <X :size="13" />
-                    清空筛选结果
-                  </button>
-                </div>
-              </div>
-
-              <div v-if="assignmentMergeViews.length > 0" class="pd-assignment-view-list">
-                <div class="pd-assignment-view-list__head">
-                  <strong>按视图授权</strong>
-                  <span>勾选后自动选择视图内文件</span>
-                </div>
-                <label
-                  v-for="view in assignmentMergeViews"
-                  :key="`${draft.assignee_id}-${draft.workflow_step_id}-${view.id}`"
-                  class="pd-assignment-view-option"
-                  :class="{ 'is-partial': isAssignmentMergeViewPartial(draft, view) }"
-                >
-                  <input
-                    type="checkbox"
-                    :checked="isAssignmentMergeViewChecked(draft, view)"
-                    :disabled="savingAssignment"
-                    @change="toggleAssignmentMergeView(draft, view)"
-                  />
-                  <span>
-                    <strong>{{ view.name }}</strong>
-                    <small>{{ getAssignmentMergeViewMeta(view) }}</small>
-                  </span>
-                </label>
-              </div>
-
-              <p v-if="tableRows.length === 0" class="hint-text pd-assignment-mini-empty">
-                当前项目暂无文件，译者会先获得项目可见性。
-              </p>
-              <p v-else-if="getFilteredAssignmentFiles(draft).length === 0" class="pd-assignment-mini-empty">
-                没有符合条件的文件
-              </p>
-              <div v-else class="pd-assignment-file-list">
-                <div
-                  v-for="file in getFilteredAssignmentFiles(draft)"
-                  :key="`${draft.assignee_id}-${file.id}`"
-                  class="pd-assignment-file-option"
-                >
-                  <label class="pd-assignment-file-check">
-                    <input
-                      type="checkbox"
-                      :checked="isFileCheckedForUser(draft.assignee_id, file.id)"
-                      :disabled="savingAssignment"
-                      @change="toggleAssignmentFile(draft.assignee_id, file.id)"
-                    />
-                    <span
-                      @mouseenter="showAssignmentTooltip($event, file.filename)"
-                      @mousemove="updateAssignmentTooltipPosition"
-                      @mouseleave="hideAssignmentTooltip"
-                    >
-                      {{ file.filename }}
-                    </span>
-                  </label>
-                  <div class="pd-assignment-range-controls">
-                    <small>{{ getAssignmentFileSegmentCount(file.id) }} 段</small>
-                    <input
-                      type="number"
-                      min="1"
-                      inputmode="numeric"
-                      placeholder="起始"
-                      :value="getAssignmentRangeInputValue(draft, file.id, 'range_start')"
-                      :disabled="savingAssignment || !isFileCheckedForUser(draft.assignee_id, file.id)"
-                      @input="updateAssignmentFileRange(draft.assignee_id, file.id, 'range_start', getAssignmentInputValue($event))"
-                    />
-                    <span>-</span>
-                    <input
-                      type="number"
-                      min="1"
-                      inputmode="numeric"
-                      placeholder="结束"
-                      :value="getAssignmentRangeInputValue(draft, file.id, 'range_end')"
-                      :disabled="savingAssignment || !isFileCheckedForUser(draft.assignee_id, file.id)"
-                      @input="updateAssignmentFileRange(draft.assignee_id, file.id, 'range_end', getAssignmentInputValue($event))"
-                    />
-                  </div>
-                </div>
-              </div>
-            </section>
-          </div>
-        </section>
-      </div>
-      <div
-        v-if="assignmentTooltipText"
-        class="pd-assignment-tooltip"
-        :style="assignmentTooltipStyle"
-        role="tooltip"
-      >
-        {{ assignmentTooltipText }}
-      </div>
-
-      <template #footer>
-        <button class="button" type="button" :disabled="savingAssignment" @click="closeAssignmentDialog">
-          {{ t('common.actions.cancel') }}
-        </button>
-        <button
-          class="button button--primary"
-          type="button"
-          :disabled="savingAssignment || loadingAssignableUsers || loadingAssignments"
-          @click="saveAssignment"
-        >
-          <Loader2 v-if="savingAssignment" class="lucide-spin" :size="14" />
-          <Users v-else :size="14" />
-          {{ savingAssignment ? t('common.actions.saving') : '保存分配' }}
-        </button>
-      </template>
-    </Modal>
 
     <PreTranslateDialog
       :open="showPreTranslateDialog"
@@ -11083,524 +10397,6 @@ onBeforeUnmount(() => {
   margin-top: 12px;
 }
 
-.pd-assignment-dialog {
-  display: grid;
-  gap: 12px;
-}
-
-.pd-assignment-dialog--project {
-  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
-  align-items: stretch;
-  gap: 16px;
-  min-height: min(560px, calc(100vh - 220px));
-}
-
-.pd-assignment-users,
-.pd-assignment-files {
-  min-height: 360px;
-  max-height: min(600px, calc(100vh - 220px));
-  overflow: hidden;
-  border: 1px solid var(--line-soft);
-  border-radius: 8px;
-  background: var(--surface-panel);
-}
-
-.pd-assignment-users {
-  display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr);
-  gap: 8px;
-  padding: 10px;
-}
-
-.pd-assignment-panel__head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 10px;
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
-.pd-assignment-panel__head > div {
-  min-width: 0;
-  display: grid;
-  gap: 2px;
-}
-
-.pd-assignment-panel__head strong {
-  overflow: hidden;
-  color: var(--text-primary);
-  font-size: 13px;
-  line-height: 1.25;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.pd-assignment-panel__head span {
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
-.pd-assignment-panel__head--files {
-  align-items: center;
-}
-
-.pd-assignment-search {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 36px;
-  padding: 0 10px;
-  border: 1px solid var(--line-soft);
-  border-radius: 8px;
-  background: var(--surface-1);
-  color: var(--text-muted);
-  font-size: 13px;
-}
-
-.pd-assignment-search:focus-within {
-  border-color: color-mix(in srgb, var(--brand-700) 45%, var(--line-strong));
-  box-shadow: var(--focus-ring);
-}
-
-.pd-assignment-search input {
-  min-width: 0;
-  width: 100%;
-  border: 0;
-  outline: 0;
-  background: transparent;
-  color: var(--text-primary);
-}
-
-.pd-assignment-search input::placeholder {
-  color: var(--text-placeholder);
-}
-
-.pd-assignment-search input:disabled {
-  cursor: not-allowed;
-}
-
-.pd-assignment-clear {
-  display: grid;
-  place-items: center;
-  flex: 0 0 auto;
-  width: 24px;
-  height: 24px;
-  padding: 0;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-muted);
-  box-shadow: none;
-}
-
-.pd-assignment-clear:hover:not(:disabled) {
-  background: var(--surface-muted);
-  color: var(--text-primary);
-}
-
-.pd-assignment-filter-row {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.pd-assignment-filter-select {
-  min-width: 0;
-  width: 100%;
-  min-height: 36px;
-  padding: 0 28px 0 10px;
-  border: 1px solid var(--line-soft);
-  border-radius: 6px;
-  background: var(--surface-muted);
-  color: var(--text-primary);
-  font-size: 13px;
-  line-height: 1.35;
-}
-
-.pd-assignment-filter-select:focus {
-  outline: none;
-  border-color: var(--brand-700);
-  background: var(--surface-panel);
-  box-shadow: var(--focus-ring);
-}
-
-.pd-assignment-state {
-  display: grid;
-  place-items: center;
-  min-height: 90px;
-  margin: 0;
-  padding: 12px;
-  border: 1px dashed var(--line-soft);
-  border-radius: 8px;
-  color: var(--text-muted);
-  font-size: 13px;
-  text-align: center;
-}
-
-.pd-assignment-user-list {
-  min-height: 0;
-  display: grid;
-  grid-auto-rows: minmax(64px, auto);
-  align-content: start;
-  gap: 6px;
-  overflow: auto;
-  padding-right: 2px;
-}
-
-.pd-assignment-user {
-  position: relative;
-  display: grid;
-  align-content: center;
-  gap: 4px;
-  justify-items: start;
-  min-height: 64px;
-  width: 100%;
-  padding: 10px 36px 10px 12px;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--text-secondary);
-  box-shadow: none;
-}
-
-.pd-assignment-user:hover:not(:disabled) {
-  border-color: var(--line-soft);
-  background: var(--surface-muted);
-  color: var(--text-primary);
-}
-
-.pd-assignment-user.is-active {
-  border-color: color-mix(in srgb, var(--brand-700) 58%, var(--line-strong));
-  background:
-    linear-gradient(90deg, color-mix(in srgb, var(--brand-700) 12%, transparent), transparent 34%),
-    color-mix(in srgb, var(--brand-100) 74%, var(--surface-panel));
-  color: var(--text-primary);
-  box-shadow:
-    inset 4px 0 0 var(--brand-700),
-    0 0 0 1px color-mix(in srgb, var(--brand-700) 14%, transparent);
-}
-
-.pd-assignment-user.is-active::after {
-  content: "✓";
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  display: grid;
-  place-items: center;
-  width: 18px;
-  height: 18px;
-  border-radius: 999px;
-  background: var(--brand-700);
-  color: #fff;
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1;
-}
-
-.pd-assignment-user.is-active:hover:not(:disabled) {
-  border-color: var(--brand-700);
-  background:
-    linear-gradient(90deg, color-mix(in srgb, var(--brand-700) 16%, transparent), transparent 36%),
-    color-mix(in srgb, var(--brand-100) 86%, var(--surface-panel));
-}
-
-.pd-assignment-user span {
-  max-width: 100%;
-  font-size: 13px;
-  font-weight: 600;
-  line-height: 1.35;
-  overflow-wrap: anywhere;
-  white-space: normal;
-}
-
-.pd-assignment-user small {
-  max-width: 100%;
-  color: var(--text-muted);
-  font-size: 12px;
-  line-height: 1.35;
-  overflow-wrap: anywhere;
-  white-space: normal;
-}
-
-.pd-assignment-files {
-  display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
-  gap: 10px;
-  padding: 12px;
-}
-
-.pd-assignment-file-toolbar {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(132px, 160px);
-  gap: 8px;
-  align-items: center;
-}
-
-.pd-assignment-workflow-tabs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.pd-assignment-workflow-tab {
-  height: 30px;
-  padding: 0 12px;
-  border: 1px solid var(--line-soft);
-  border-radius: 6px;
-  background: var(--surface-panel);
-  color: var(--text-secondary);
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.pd-assignment-workflow-tab.is-active {
-  border-color: var(--brand-600);
-  color: var(--brand-700);
-  background: color-mix(in srgb, var(--brand-100) 82%, var(--surface-panel));
-}
-
-.pd-assignment-file-groups {
-  min-height: 0;
-  display: grid;
-  align-content: start;
-  gap: 12px;
-  overflow: auto;
-  padding-right: 2px;
-}
-
-.pd-assignment-empty {
-  min-height: 220px;
-}
-
-.pd-assignment-file-group {
-  display: grid;
-  gap: 8px;
-  padding: 10px;
-  border: 1px solid var(--line-soft);
-  border-radius: 8px;
-  background: var(--surface-1);
-}
-
-.pd-assignment-file-group__head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 10px;
-  flex-wrap: wrap;
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
-.pd-assignment-file-group__title {
-  min-width: 160px;
-  display: grid;
-  flex: 1 1 180px;
-  gap: 2px;
-}
-
-.pd-assignment-file-group__title strong {
-  overflow: hidden;
-  color: var(--text-primary);
-  font-size: 13px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.pd-assignment-file-group__title span {
-  overflow: hidden;
-  color: var(--text-muted);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.pd-assignment-file-group__actions {
-  display: flex;
-  flex: 0 1 auto;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
-}
-
-.pd-assignment-file-action {
-  min-height: 30px;
-  padding: 5px 8px;
-  border-radius: 6px;
-  font-size: 12px;
-  line-height: 1.2;
-  box-shadow: none;
-}
-
-.pd-assignment-view-list {
-  display: grid;
-  gap: 6px;
-  padding: 8px;
-  border: 1px solid var(--line-soft);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--surface-muted) 54%, var(--surface-panel));
-}
-
-.pd-assignment-view-list__head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  flex-wrap: wrap;
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
-.pd-assignment-view-list__head strong {
-  color: var(--text-primary);
-  font-size: 13px;
-}
-
-.pd-assignment-view-option {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  min-height: 38px;
-  padding: 7px 8px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  color: var(--text-secondary);
-  font-size: 13px;
-  line-height: 1.4;
-}
-
-.pd-assignment-view-option:hover {
-  border-color: var(--line-soft);
-  background: var(--surface-panel);
-}
-
-.pd-assignment-view-option.is-partial {
-  border-color: color-mix(in srgb, var(--state-warning) 42%, var(--line-soft));
-  background: color-mix(in srgb, var(--state-warning-bg) 62%, var(--surface-panel));
-}
-
-.pd-assignment-view-option > span {
-  min-width: 0;
-  display: grid;
-  gap: 2px;
-}
-
-.pd-assignment-view-option strong,
-.pd-assignment-view-option small {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.pd-assignment-view-option strong {
-  color: var(--text-primary);
-}
-
-.pd-assignment-view-option small {
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
-.pd-assignment-file-list {
-  display: grid;
-  gap: 4px;
-  max-height: 240px;
-  overflow: auto;
-  padding: 2px;
-}
-
-.pd-assignment-file-option {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  min-height: 30px;
-  padding: 6px 8px;
-  border-radius: 6px;
-  color: var(--text-secondary);
-  font-size: 13px;
-  line-height: 1.45;
-}
-
-.pd-assignment-file-option:hover {
-  background: var(--surface-muted);
-}
-
-.pd-assignment-file-check {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  min-width: 0;
-}
-
-.pd-assignment-file-check span {
-  min-width: 0;
-  flex: 1;
-  overflow-wrap: anywhere;
-  white-space: normal;
-}
-
-.pd-assignment-range-controls {
-  display: grid;
-  grid-template-columns: auto 68px auto 68px;
-  align-items: center;
-  gap: 6px;
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
-.pd-assignment-range-controls input {
-  width: 68px;
-  min-width: 0;
-  padding: 4px 6px;
-  border: 1px solid var(--line-soft);
-  border-radius: 6px;
-  background: var(--surface-panel);
-  color: var(--text-primary);
-  font: inherit;
-}
-
-.pd-assignment-range-controls input:focus {
-  border-color: var(--brand-500);
-  outline: none;
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--brand-500) 18%, transparent);
-}
-
-.pd-assignment-range-controls input:disabled {
-  background: var(--surface-muted);
-  color: var(--text-muted);
-}
-
-.pd-assignment-mini-empty {
-  display: grid;
-  place-items: center;
-  min-height: 58px;
-  margin: 0;
-  padding: 10px;
-  border: 1px dashed var(--line-soft);
-  border-radius: 8px;
-  color: var(--text-muted);
-  font-size: 13px;
-  text-align: center;
-}
-
-.pd-assignment-tooltip {
-  position: fixed;
-  z-index: 10000;
-  padding: 8px 10px;
-  border: 1px solid color-mix(in srgb, var(--brand-700) 54%, var(--line-strong));
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--surface-panel) 96%, var(--brand-050));
-  color: var(--text-primary);
-  box-shadow: 0 10px 28px rgba(17, 49, 42, 0.16);
-  font-size: 12px;
-  line-height: 1.45;
-  overflow-wrap: anywhere;
-  pointer-events: none;
-  white-space: normal;
-}
-
 .assignment-event-list {
   display: grid;
   gap: 10px;
@@ -13341,52 +12137,6 @@ onBeforeUnmount(() => {
   .pd-settings-row--name {
     grid-template-columns: 1fr;
     align-items: stretch;
-  }
-
-  .pd-assignment-dialog--project {
-    grid-template-columns: 1fr;
-    min-height: 0;
-  }
-
-  .pd-assignment-users,
-  .pd-assignment-files {
-    min-height: 0;
-    max-height: none;
-  }
-
-  .pd-assignment-users {
-    max-height: 340px;
-  }
-
-  .pd-assignment-files {
-    max-height: 520px;
-  }
-
-  .pd-assignment-filter-row,
-  .pd-assignment-file-toolbar {
-    grid-template-columns: 1fr;
-  }
-
-  .pd-assignment-file-group__actions {
-    width: 100%;
-    justify-content: flex-start;
-  }
-
-  .pd-assignment-file-action {
-    flex: 1 1 140px;
-  }
-
-  .pd-assignment-file-option {
-    grid-template-columns: 1fr;
-    align-items: stretch;
-  }
-
-  .pd-assignment-range-controls {
-    grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr);
-  }
-
-  .pd-assignment-range-controls input {
-    width: 100%;
   }
 
   .pd-settings-control,

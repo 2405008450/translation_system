@@ -47,6 +47,8 @@ SOURCE_LABELS = {
     "manual": "人工",
     "tm": "记忆库",
     "llm": "LLM",
+    "project_sync": "项目同步",
+    "english_variant_conversion": "英文变体转换",
     "none": "未匹配",
 }
 

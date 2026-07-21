@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "e2e:reset": "node ../scripts/e2e_reset_db_runner.mjs",
     "e2e": "npm run e2e:reset && playwright test",
+    "e2e:assignment-ui": "playwright test --config playwright.assignment-ui.config.ts",
     "e2e:concurrency": "npm run e2e:reset && playwright test --config playwright.concurrency.config.ts",
     "e2e:ui": "npm run e2e:reset && playwright test --ui",
     "e2e:headed": "npm run e2e:reset && playwright test --headed"

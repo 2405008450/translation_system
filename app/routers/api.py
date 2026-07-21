@@ -5,6 +5,7 @@ API 路由模块 - 文件上传、解析和导出接口
 """
 import asyncio
 from copy import deepcopy
+import hashlib
 import json
 import logging
 import re
@@ -2692,6 +2693,7 @@ class ProjectAssignmentEntryRequest(BaseModel):
 
 class ProjectAssignmentsRequest(BaseModel):
     assignments: list[ProjectAssignmentEntryRequest] = Field(default_factory=list)
+    base_revision: str | None = None
 
 
 class WorkflowStepRequest(BaseModel):
@@ -4195,7 +4197,7 @@ def _validate_assignment_payload(
             ranges_by_file_step.setdefault((workflow_step_id, file_record_id), []).append(
                 (assignee_id, range_start, range_end)
             )
-    for range_items in ranges_by_file_step.values():
+    for (workflow_step_id, file_record_id), range_items in ranges_by_file_step.items():
         sorted_items = sorted(range_items, key=lambda item: (str(item[0]), item[1] or 0, item[2] or 0))
         for index, current in enumerate(sorted_items):
             for other in sorted_items[index + 1:]:
@@ -4206,8 +4208,29 @@ def _validate_assignment_payload(
                     )
                 if _assignment_ranges_overlap(current[1], current[2], other[1], other[2]):
                     raise HTTPException(
-                        status_code=400,
-                        detail="同一文件同一流程阶段的句段范围不能重叠。",
+                        status_code=409,
+                        detail={
+                            "code": "assignment_conflict",
+                            "message": "同一文件同一流程阶段的句段范围不能重叠。",
+                            "conflicts": [
+                                {
+                                    "file_record_id": str(file_record_id),
+                                    "workflow_step_id": str(workflow_step_id),
+                                    "allocations": [
+                                        {
+                                            "assignee_id": str(current[0]),
+                                            "range_start": current[1],
+                                            "range_end": current[2],
+                                        },
+                                        {
+                                            "assignee_id": str(other[0]),
+                                            "range_start": other[1],
+                                            "range_end": other[2],
+                                        },
+                                    ],
+                                }
+                            ],
+                        },
                     )
     return desired, desired_user_ids
 
@@ -4232,6 +4255,44 @@ def _sync_legacy_file_assignees(db: Session, project_id: UUID) -> None:
         file_record.assignee_id = first_assignment.assignee_id if first_assignment else None
         file_record.assigned_by_id = first_assignment.assigned_by_id if first_assignment else None
         file_record.assigned_at = first_assignment.assigned_at if first_assignment else None
+
+
+def _calculate_project_assignment_revision(db: Session, project_id: UUID) -> str:
+    """根据当前有效的项目成员与文件授权生成稳定版本号。"""
+    member_ids = sorted(
+        str(row.assignee_id)
+        for row in (
+            db.query(ProjectAssignment.assignee_id)
+            .filter(
+                ProjectAssignment.project_id == project_id,
+                ProjectAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            )
+            .all()
+        )
+    )
+    allocations = sorted(
+        (
+            str(row.assignee_id),
+            str(row.workflow_step_id) if row.workflow_step_id else "",
+            str(row.file_record_id),
+            row.segment_range_start,
+            row.segment_range_end,
+        )
+        for row in (
+            db.query(FileAssignment)
+            .filter(
+                FileAssignment.project_id == project_id,
+                FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            )
+            .all()
+        )
+    )
+    canonical_payload = json.dumps(
+        {"members": member_ids, "allocations": allocations},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
 
 
 def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, Any]:
@@ -4316,6 +4377,7 @@ def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, A
         "project_id": str(project_id),
         "workflow_steps": [_serialize_workflow_step(step) for step in workflow_steps],
         "assignments": assignment_items,
+        "revision": _calculate_project_assignment_revision(db, project_id),
     }
 
 
@@ -4327,6 +4389,18 @@ def _update_project_assignments_by_workflow(
     payload: ProjectAssignmentsRequest,
     current_user: User,
 ) -> dict[str, Any]:
+    # 串行化同一项目的分配写入，避免两个管理员同时基于同一版本保存时都通过校验。
+    db.query(Project.id).filter(Project.id == project_id).with_for_update().one()
+    current_revision = _calculate_project_assignment_revision(db, project_id)
+    if payload.base_revision and payload.base_revision != current_revision:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "assignment_state_changed",
+                "message": "任务分配已被其他管理员更新，请重新加载后再保存。",
+                "current_revision": current_revision,
+            },
+        )
     desired, desired_user_ids = _validate_assignment_payload(db, project, payload)
     now = datetime.now()
     workflow_steps = _load_project_workflow_steps(db, project_id)
@@ -8808,7 +8882,7 @@ def compute_project_document_statistics(
     for file_record in files:
         source_bytes = load_file_record_source(file_record)
         source_filename = get_file_record_source_filename(file_record)
-        if source_bytes and Path(source_filename).suffix.lower() in {".doc", ".docx", ".pptx"}:
+        if source_bytes and Path(source_filename).suffix.lower() in SUPPORTED_EXTENSIONS:
             statistics = compute_document_statistics(source_bytes, source_filename)
         else:
             statistics = unavailable_statistics

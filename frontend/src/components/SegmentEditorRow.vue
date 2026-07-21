@@ -1380,10 +1380,26 @@ function handleSourceCellMouseDown(event: MouseEvent) {
   }
 }
 
+function hasExpandedSelectionWithin(element: HTMLElement): boolean {
+  const selection = window.getSelection()
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+    return false
+  }
+
+  const range = selection.getRangeAt(0)
+  return element.contains(range.startContainer) && element.contains(range.endContainer)
+}
+
 function handleSourceCellClick(event: MouseEvent) {
   resetHistoryGroup()
   if (isSegmentMultiSelectEvent(event)) {
     emit('ctrlClick', segmentKey.value, event)
+    return
+  }
+  const sourceCell = event.currentTarget
+  if (sourceCell instanceof HTMLElement && hasExpandedSelectionWithin(sourceCell)) {
+    pendingSourceFocus.value = false
+    pendingSourceFocusPoint.value = null
     return
   }
   emit('activateSource', segmentKey.value)
