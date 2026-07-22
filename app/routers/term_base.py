@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, aliased
+from sqlalchemy.orm import Session, aliased, joinedload
 
 from app.auth import (
     can_access_all_projects,
@@ -177,7 +177,8 @@ def _resolve_term_base_language_pair(
     return normalized_source_language, normalized_target_language
 
 
-def _serialize_term_base(term_base: TermBase, entry_count: int = 0) -> dict:
+def _serialize_term_base(term_base: TermBase, entry_count: int | None = None) -> dict:
+    resolved_entry_count = term_base.entry_count if entry_count is None else entry_count
     return {
         "id": term_base.id,
         "name": term_base.name,
@@ -188,7 +189,7 @@ def _serialize_term_base(term_base: TermBase, entry_count: int = 0) -> dict:
         "creator_name": get_user_display_name(term_base.creator),
         "created_at": term_base.created_at.isoformat(),
         "updated_at": term_base.updated_at.isoformat(),
-        "entry_count": entry_count,
+        "entry_count": int(resolved_entry_count or 0),
     }
 
 
@@ -467,18 +468,18 @@ def _store_bound_ids(file_record: FileRecord, field_name: str, ids: list[str]) -
 
 
 @router.get("/term-bases")
-def list_term_bases(db: Session = Depends(get_db)):
-    rows = (
-        db.query(TermBase, func.count(TermEntry.id).label("entry_count"))
-        .outerjoin(TermEntry, TermEntry.term_base_id == TermBase.id)
-        .group_by(TermBase.id)
-        .order_by(TermBase.created_at.desc())
-        .all()
-    )
-    return [
-        _serialize_term_base(term_base, int(entry_count))
-        for term_base, entry_count in rows
-    ]
+def list_term_bases(
+    source_language: str | None = Query(default=None),
+    target_language: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    query = db.query(TermBase).options(joinedload(TermBase.creator))
+    if source_language:
+        query = query.filter(TermBase.source_language == source_language.strip())
+    if target_language:
+        query = query.filter(TermBase.target_language == target_language.strip())
+    rows = query.order_by(TermBase.created_at.desc()).all()
+    return [_serialize_term_base(term_base) for term_base in rows]
 
 
 @router.get("/term-bases/{term_base_id}")
@@ -487,12 +488,7 @@ def get_term_base(
     db: Session = Depends(get_db),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
-    entry_count = (
-        db.query(TermEntry)
-        .filter(TermEntry.term_base_id == term_base.id)
-        .count()
-    )
-    return _serialize_term_base(term_base, entry_count)
+    return _serialize_term_base(term_base)
 
 
 @router.post("/term-bases")
@@ -632,14 +628,9 @@ def merge_term_bases(
 
     db.commit()
 
-    entry_count = (
-        db.query(TermEntry)
-        .filter(TermEntry.term_base_id == target_term_base.id)
-        .count()
-    )
     db.refresh(target_term_base)
     return {
-        "term_base": _serialize_term_base(target_term_base, entry_count),
+        "term_base": _serialize_term_base(target_term_base),
         "source_count": len(source_term_base_ids),
         "created_rows": created_rows,
         "updated_rows": updated_rows,
@@ -687,12 +678,7 @@ def update_term_base(
         raise HTTPException(status_code=409, detail="同名术语库已存在。") from exc
 
     db.refresh(term_base)
-    entry_count = (
-        db.query(TermEntry)
-        .filter(TermEntry.term_base_id == term_base.id)
-        .count()
-    )
-    return _serialize_term_base(term_base, entry_count)
+    return _serialize_term_base(term_base)
 
 
 @router.post("/term-bases/{term_base_id}/copy-language-pair")
@@ -747,12 +733,7 @@ def copy_term_base_to_language_pair(
         raise HTTPException(status_code=409, detail="复制术语库失败，可能存在同名库。") from exc
 
     db.refresh(target_term_base)
-    entry_count = (
-        db.query(TermEntry)
-        .filter(TermEntry.term_base_id == target_term_base.id)
-        .count()
-    )
-    return _serialize_term_base(target_term_base, entry_count)
+    return _serialize_term_base(target_term_base)
 
 
 @router.delete("/term-bases/{term_base_id}")
@@ -762,11 +743,7 @@ def delete_term_base(
     _: User = Depends(require_resource_creator),
 ):
     term_base = _get_term_base_or_404(db, term_base_id)
-    entry_count = (
-        db.query(TermEntry)
-        .filter(TermEntry.term_base_id == term_base.id)
-        .count()
-    )
+    entry_count = int(term_base.entry_count or 0)
     (
         db.query(FileRecord)
         .filter(FileRecord.term_base_id == term_base.id)
@@ -1229,7 +1206,7 @@ def list_term_base_entries(
                 )
             )
 
-    total = query.count()
+    total = query.count() if normalized_search else int(term_base.entry_count or 0)
     rows = (
         _apply_term_entry_sort(query, sort_by, sort_order)
         .offset(safe_skip)

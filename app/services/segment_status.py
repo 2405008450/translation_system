@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import and_, func, or_
@@ -9,6 +10,16 @@ from app.services.normalizer import (
     normalize_match_text,
     normalize_text,
 )
+
+
+def apply_segment_status(segment: Any, next_status: str) -> None:
+    """统一维护句段状态与最近确认时间。"""
+    if next_status == "confirmed":
+        if getattr(segment, "status", None) != "confirmed" or getattr(segment, "confirmed_at", None) is None:
+            segment.confirmed_at = datetime.now()
+    else:
+        segment.confirmed_at = None
+    segment.status = next_status
 
 
 def _normalized_source_values(segment: Any) -> tuple[str, str, str]:
@@ -55,7 +66,9 @@ def resolve_unconfirmed_segment_status(segment: Any) -> str:
 
 
 def resolve_segment_match_status(segment: Any) -> str:
-    """按 TM 匹配信号分类，不受人工确认状态影响。"""
+    """按译文来源和 TM 匹配信号分类，不受人工确认状态影响。"""
+    if str(getattr(segment, "source", "") or "") == "project_sync":
+        return "project_sync"
     return resolve_unconfirmed_segment_status(segment)
 
 
@@ -110,16 +123,18 @@ def segment_has_exact_match_signal_expr(segment_model: Any) -> Any:
 
 def segment_effective_status_conditions(segment_model: Any) -> dict[str, Any]:
     exact_signal = segment_has_exact_match_signal_expr(segment_model)
+    project_sync = func.coalesce(segment_model.source, "") == "project_sync"
     fuzzy_signal = or_(
         segment_model.status == "fuzzy",
         func.coalesce(segment_model.score, 0) > 0,
         sql_normalize_match_text(segment_model.matched_source_text) != "",
     )
-    exact = exact_signal
-    fuzzy = and_(~exact_signal, fuzzy_signal)
-    none = and_(~exact_signal, ~fuzzy_signal)
+    exact = and_(~project_sync, exact_signal)
+    fuzzy = and_(~project_sync, ~exact_signal, fuzzy_signal)
+    none = and_(~project_sync, ~exact_signal, ~fuzzy_signal)
     confirmed = segment_model.status == "confirmed"
     return {
+        "project_sync": project_sync,
         "exact": exact,
         "fuzzy": fuzzy,
         "none": none,

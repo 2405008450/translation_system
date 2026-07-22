@@ -30,6 +30,9 @@ _BACKFILL_COMPLETED = False
 _DASHBOARD_CACHE_LOCK = Lock()
 _DASHBOARD_CACHE_TTL = timedelta(seconds=15)
 _DASHBOARD_CACHE: dict[str, tuple[datetime, dict]] = {}
+_MAX_LLM_MODEL_SERIES = 6
+_UNKNOWN_LLM_MODEL = "__unknown__"
+_OTHER_LLM_MODELS = "__other__"
 _USER_ACTIVITY_LOCK = Lock()
 _USER_ACTIVITY_WRITE_INTERVAL = timedelta(seconds=60)
 _USER_ACTIVITY_LAST_WRITTEN: dict[tuple[UUID, date], datetime] = {}
@@ -44,6 +47,8 @@ SOURCE_LABELS = {
     "manual": "人工",
     "tm": "记忆库",
     "llm": "LLM",
+    "project_sync": "项目同步",
+    "english_variant_conversion": "英文变体转换",
     "none": "未匹配",
 }
 
@@ -232,12 +237,19 @@ def get_dashboard_payload(db: Session, granularity: str = "day") -> dict:
         llm_processed_source_words=llm_processed_source_words,
     )
     series = _build_series(db, labels, start_date, start_at, normalized_granularity)
+    llm_model_series = _build_llm_model_series(
+        db,
+        labels=labels,
+        start_at=start_at,
+        granularity=normalized_granularity,
+    )
     user_stats = _build_user_stats(db, start_date=start_date, start_at=start_at)
 
     payload = {
         "granularity": normalized_granularity,
         "summary": summary,
         "series": series,
+        "llm_model_series": llm_model_series,
         "language_pairs": language_pairs,
         "source_breakdown": source_breakdown,
         "user_stats": user_stats,
@@ -650,6 +662,88 @@ def _build_series_postgres(
             "active_user_count": active_users.get(label, 0),
         }
         for label in labels
+    ]
+
+
+def _build_llm_model_series(
+    db: Session,
+    *,
+    labels: list[str],
+    start_at: datetime,
+    granularity: str,
+) -> list[dict]:
+    """按时间桶聚合当前由各 LLM 生成的句段，响应只包含少量图表数据点。"""
+    counts: defaultdict[str, defaultdict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    if db.get_bind().dialect.name == "postgresql":
+        bucket_sql = (
+            "to_char(date_trunc('month', updated_at), 'YYYY-MM')"
+            if granularity == "month"
+            else "updated_at::date::text"
+        )
+        rows = db.execute(
+            text(
+                f"""
+                SELECT
+                    {bucket_sql} AS bucket,
+                    COALESCE(NULLIF(BTRIM(llm_model), ''), :unknown_model) AS model,
+                    COUNT(*) AS segment_count
+                FROM segments
+                WHERE source = 'llm'
+                  AND updated_at >= :start_at
+                GROUP BY 1, 2
+                """
+            ),
+            {"start_at": start_at, "unknown_model": _UNKNOWN_LLM_MODEL},
+        ).all()
+        for bucket, model, segment_count in rows:
+            counts[str(model)][str(bucket)] += int(segment_count or 0)
+    else:
+        rows = (
+            db.query(Segment.updated_at, Segment.llm_model)
+            .filter(Segment.source == "llm", Segment.updated_at >= start_at)
+            .all()
+        )
+        for updated_at, model in rows:
+            if updated_at is None:
+                continue
+            normalized_model = (model or "").strip() or _UNKNOWN_LLM_MODEL
+            counts[normalized_model][_bucket_key(updated_at.date(), granularity)] += 1
+
+    if not counts:
+        return []
+
+    totals = {
+        model: sum(bucket_counts.values())
+        for model, bucket_counts in counts.items()
+    }
+    ranked_models = sorted(totals, key=lambda model: (-totals[model], model))
+    if len(ranked_models) > _MAX_LLM_MODEL_SERIES:
+        visible_models = ranked_models[: _MAX_LLM_MODEL_SERIES - 1]
+        hidden_models = ranked_models[_MAX_LLM_MODEL_SERIES - 1 :]
+        other_counts: defaultdict[str, int] = defaultdict(int)
+        for model in hidden_models:
+            for bucket, segment_count in counts[model].items():
+                other_counts[bucket] += segment_count
+        counts[_OTHER_LLM_MODELS] = other_counts
+        totals[_OTHER_LLM_MODELS] = sum(other_counts.values())
+        visible_models.append(_OTHER_LLM_MODELS)
+    else:
+        visible_models = ranked_models
+
+    return [
+        {
+            "model": model,
+            "total_segment_count": totals[model],
+            "points": [
+                {
+                    "bucket": label,
+                    "segment_count": counts[model].get(label, 0),
+                }
+                for label in labels
+            ],
+        }
+        for model in visible_models
     ]
 
 

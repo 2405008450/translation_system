@@ -9,15 +9,19 @@
     "preview": "vite preview",
     "e2e:reset": "node ../scripts/e2e_reset_db_runner.mjs",
     "e2e": "npm run e2e:reset && playwright test",
+    "e2e:assignment-ui": "playwright test --config playwright.assignment-ui.config.ts",
     "e2e:concurrency": "npm run e2e:reset && playwright test --config playwright.concurrency.config.ts",
     "e2e:ui": "npm run e2e:reset && playwright test --ui",
     "e2e:headed": "npm run e2e:reset && playwright test --headed"
   },
   "dependencies": {
     "axios": "^1.9.0",
+    "echarts": "^6.1.0",
     "lucide-vue-next": "^1.0.0",
+    "naive-ui": "^2.44.1",
     "pinia": "^2.1.7",
     "vue": "^3.5.13",
+    "vue-echarts": "^8.0.1",
     "vue-i18n": "^9.14.5",
     "vue-router": "^4.5.1"
   },

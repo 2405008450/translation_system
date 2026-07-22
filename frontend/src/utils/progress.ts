@@ -11,7 +11,8 @@ function normalizeProgress(progress: number) {
 
 export function clampDisplayProgress(value: unknown) {
   const progress = Number(value)
-  return Math.max(0, Math.min(Number.isFinite(progress) ? Math.round(progress) : 0, 100))
+  const normalized = Math.max(0, Math.min(Number.isFinite(progress) ? progress : 0, 100))
+  return Number(normalized.toFixed(2))
 }
 
 export function calculateProgressPercent(completed: number, total: number) {

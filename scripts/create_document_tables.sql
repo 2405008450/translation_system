@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS segments (
     status VARCHAR(20) NOT NULL DEFAULT 'none',
     score FLOAT NOT NULL DEFAULT 0.0,
     matched_source_text TEXT,
-    source VARCHAR(20) NOT NULL DEFAULT 'tm',
+    source VARCHAR(40) NOT NULL DEFAULT 'tm',
     llm_provider VARCHAR(40),
     llm_model VARCHAR(200),
     block_type VARCHAR(20) NOT NULL DEFAULT 'paragraph',

@@ -180,9 +180,18 @@ def _file_status_stats(db: Session, file_record_id: UUID) -> dict[str, int]:
 
     total = db.query(func.count(Segment.id)).filter(Segment.file_record_id == file_record_id).scalar() or 0
     if total == 0:
-        return {"total": 0, "exact": 0, "fuzzy": 0, "none": 0, "confirmed": 0, "empty_target": 0}
+        return {
+            "total": 0,
+            "project_sync": 0,
+            "exact": 0,
+            "fuzzy": 0,
+            "none": 0,
+            "confirmed": 0,
+            "empty_target": 0,
+        }
     status_conditions = segment_effective_status_conditions(Segment)
     rows = db.query(
+        func.count(case((status_conditions["project_sync"], 1), else_=None)).label("project_sync"),
         func.count(case((status_conditions["exact"], 1), else_=None)).label("exact"),
         func.count(case((status_conditions["fuzzy"], 1), else_=None)).label("fuzzy"),
         func.count(case((status_conditions["none"], 1), else_=None)).label("none"),
@@ -193,6 +202,7 @@ def _file_status_stats(db: Session, file_record_id: UUID) -> dict[str, int]:
     ).filter(Segment.file_record_id == file_record_id).one()
     return {
         "total": int(total),
+        "project_sync": int(rows.project_sync or 0),
         "exact": int(rows.exact or 0),
         "fuzzy": int(rows.fuzzy or 0),
         "none": int(rows.none or 0),

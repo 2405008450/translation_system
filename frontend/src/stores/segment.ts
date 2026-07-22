@@ -27,6 +27,7 @@ import type {
   SegmentUpdatePayload,
   SaveToTMStats,
   TermMatch,
+  WorkflowProgress,
 } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 import { consumeLLMStream } from '../utils/llmStream'
@@ -36,6 +37,7 @@ const MAX_SEGMENT_PAGE_SIZE = 500
 const AUTO_SYNC_DELAY_MS = 1500
 const CHANGE_POLL_INTERVAL_MS = 10000
 const CHANGE_POLL_BURST_DELAYS_MS = [1200, 3000, 6000, 10000]
+const SEGMENT_EVENT_RECONNECT_DELAY_MS = 15000
 const EXPORT_POLL_INTERVAL_MS = 1200
 const REVISION_TRACKING_STORAGE_KEY = 'workbench.revisionTrackingEnabled'
 const DEFAULT_REVISION_INSERT_COLOR = '#2563eb'
@@ -57,6 +59,7 @@ interface FileExportTask {
 function createEmptySegmentStatusStats(): SegmentStatusStats {
   return {
     total: 0,
+    project_sync: 0,
     exact: 0,
     fuzzy: 0,
     none: 0,
@@ -70,6 +73,7 @@ function buildMergeViewStatusStats(detail: MergeViewDetail | null): SegmentStatu
   for (const file of detail?.files ?? []) {
     const stats = { ...createEmptySegmentStatusStats(), ...(file.status_stats || {}) }
     totals.total += Number(stats.total || file.total_segments || 0)
+    totals.project_sync += Number(stats.project_sync || 0)
     totals.exact += Number(stats.exact || 0)
     totals.fuzzy += Number(stats.fuzzy || 0)
     totals.none += Number(stats.none || 0)
@@ -118,9 +122,9 @@ function resolveUnconfirmedSegmentStatus(segment: Segment, _targetText = segment
   return 'none'
 }
 
-function resolveSegmentStatusForStats(segment: Segment) {
-  if (segment.status === 'confirmed') {
-    return 'confirmed'
+function resolveSegmentMatchStatusForStats(segment: Segment) {
+  if (segment.source === 'project_sync') {
+    return 'project_sync'
   }
   return resolveUnconfirmedSegmentStatus(segment)
 }
@@ -227,6 +231,7 @@ interface SegmentChangeResponse {
   next_cursor?: string
   has_more?: boolean
   status_stats?: SegmentStatusStats | null
+  workflow_progress?: WorkflowProgress[] | null
   segments: Segment[]
 }
 
@@ -411,6 +416,9 @@ export const useSegmentStore = defineStore('segment', () => {
   let syncPromise: Promise<boolean> | null = null
   let changePollTimer: number | null = null
   let changePollBurstTimers: number[] = []
+  let segmentEventAbortController: AbortController | null = null
+  let segmentEventReconnectTimer: number | null = null
+  let segmentEventGeneration = 0
   let changeCursor: string | null = null
   let pollingChanges = false
   let loadMorePromise: Promise<boolean> | null = null
@@ -711,6 +719,22 @@ export const useSegmentStore = defineStore('segment', () => {
     }
   }
 
+  function applyServerSegmentPatches(
+    patches: Array<Pick<Segment, 'sentence_id'> & Partial<Segment>>,
+    statusStats?: SegmentStatusStats | null,
+  ) {
+    for (const patch of patches) {
+      const index = segments.value.findIndex((segment) => segment.sentence_id === patch.sentence_id)
+      if (index === -1) {
+        continue
+      }
+      applyServerSegment({ ...segments.value[index], ...patch })
+    }
+    if (statusStats) {
+      setSegmentStatusStats(statusStats)
+    }
+  }
+
   function setSegmentStatusStats(stats?: SegmentStatusStats | null) {
     segmentStatusStats.value = stats ? { ...createEmptySegmentStatusStats(), ...stats } : createEmptySegmentStatusStats()
   }
@@ -728,11 +752,17 @@ export const useSegmentStore = defineStore('segment', () => {
 
   function adjustSegmentStatusStats(previousSegment: Segment, nextSegment: Segment) {
     const nextStats = { ...segmentStatusStats.value }
-    const previousStatus = resolveSegmentStatusForStats(previousSegment)
-    const nextStatus = resolveSegmentStatusForStats(nextSegment)
-    if (previousStatus !== nextStatus) {
-      nextStats[previousStatus] = Math.max(0, nextStats[previousStatus] - 1)
-      nextStats[nextStatus] += 1
+    const previousMatchStatus = resolveSegmentMatchStatusForStats(previousSegment)
+    const nextMatchStatus = resolveSegmentMatchStatusForStats(nextSegment)
+    if (previousMatchStatus !== nextMatchStatus) {
+      nextStats[previousMatchStatus] = Math.max(0, nextStats[previousMatchStatus] - 1)
+      nextStats[nextMatchStatus] += 1
+    }
+
+    const wasConfirmed = previousSegment.status === 'confirmed'
+    const isConfirmed = nextSegment.status === 'confirmed'
+    if (wasConfirmed !== isConfirmed) {
+      nextStats.confirmed = Math.max(0, nextStats.confirmed + (isConfirmed ? 1 : -1))
     }
 
     const wasEmptyTarget = hasEmptyTarget(previousSegment.target_text)
@@ -886,6 +916,12 @@ export const useSegmentStore = defineStore('segment', () => {
     if (data.status_stats) {
       setSegmentStatusStats(data.status_stats)
     }
+    if (fileRecord.value && data.workflow_progress) {
+      fileRecord.value = {
+        ...fileRecord.value,
+        workflow_progress: data.workflow_progress,
+      }
+    }
     resetSegments(data.segments)
     if (data.change_cursor || data.server_time) {
       changeCursor = data.change_cursor || data.server_time || null
@@ -898,9 +934,94 @@ export const useSegmentStore = defineStore('segment', () => {
     if (!fileRecord.value) {
       return
     }
+    const generation = ++segmentEventGeneration
+    void connectSegmentEventStream(fileRecord.value.id, generation)
+  }
+
+  function startChangePollingFallback() {
+    if (changePollTimer !== null || !fileRecord.value) {
+      return
+    }
+    void pollSegmentChanges()
     changePollTimer = window.setInterval(() => {
       void pollSegmentChanges()
     }, CHANGE_POLL_INTERVAL_MS)
+  }
+
+  function stopChangePollingFallback() {
+    if (changePollTimer !== null) {
+      window.clearInterval(changePollTimer)
+      changePollTimer = null
+    }
+  }
+
+  function scheduleSegmentEventReconnect(fileRecordId: string, generation: number) {
+    if (generation !== segmentEventGeneration || !fileRecord.value) {
+      return
+    }
+    if (segmentEventReconnectTimer !== null) {
+      window.clearTimeout(segmentEventReconnectTimer)
+    }
+    segmentEventReconnectTimer = window.setTimeout(() => {
+      segmentEventReconnectTimer = null
+      void connectSegmentEventStream(fileRecordId, generation)
+    }, SEGMENT_EVENT_RECONNECT_DELAY_MS)
+  }
+
+  async function connectSegmentEventStream(fileRecordId: string, generation: number) {
+    if (generation !== segmentEventGeneration || fileRecord.value?.id !== fileRecordId) {
+      return
+    }
+    segmentEventAbortController?.abort()
+    const controller = new AbortController()
+    segmentEventAbortController = controller
+    const token = window.localStorage.getItem('token')
+    const baseUrl = http.defaults.baseURL || '/api'
+
+    try {
+      const response = await fetch(`${baseUrl}/file-records/${fileRecordId}/segments/events`, {
+        headers: {
+          Accept: 'text/event-stream',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        signal: controller.signal,
+      })
+      if (!response.ok || !response.body) {
+        throw new Error(`segment event stream unavailable: ${response.status}`)
+      }
+      stopChangePollingFallback()
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (generation === segmentEventGeneration) {
+        const { done, value } = await reader.read()
+        if (done) {
+          break
+        }
+        buffer += decoder.decode(value, { stream: true })
+        let boundary = buffer.indexOf('\n\n')
+        while (boundary >= 0) {
+          const block = buffer.slice(0, boundary)
+          buffer = buffer.slice(boundary + 2)
+          if (block.split('\n').some((line) => line.trim() === 'event: segments')) {
+            void pollSegmentChanges()
+          }
+          boundary = buffer.indexOf('\n\n')
+        }
+      }
+    } catch (error) {
+      if (!controller.signal.aborted && generation === segmentEventGeneration) {
+        startChangePollingFallback()
+      }
+    } finally {
+      if (segmentEventAbortController === controller) {
+        segmentEventAbortController = null
+      }
+      if (!controller.signal.aborted && generation === segmentEventGeneration) {
+        startChangePollingFallback()
+        scheduleSegmentEventReconnect(fileRecordId, generation)
+      }
+    }
   }
 
   function clearChangePollBurstTimers() {
@@ -921,10 +1042,14 @@ export const useSegmentStore = defineStore('segment', () => {
   }
 
   function stopChangePolling() {
-    if (changePollTimer !== null) {
-      window.clearInterval(changePollTimer)
-      changePollTimer = null
+    segmentEventGeneration += 1
+    segmentEventAbortController?.abort()
+    segmentEventAbortController = null
+    if (segmentEventReconnectTimer !== null) {
+      window.clearTimeout(segmentEventReconnectTimer)
+      segmentEventReconnectTimer = null
     }
+    stopChangePollingFallback()
     clearChangePollBurstTimers()
     pollingChanges = false
   }
@@ -937,8 +1062,10 @@ export const useSegmentStore = defineStore('segment', () => {
     pollingChanges = true
     try {
       const currentFileRecordId = fileRecord.value.id
-      const nextConflicts = { ...conflictEntries.value }
-      const nextDirtyEntries = { ...dirtyEntries.value }
+      // 轮询期间自动保存可能会完成并清空 dirtyEntries。这里只记录轮询发现的
+      // 版本推进和冲突，结束时再合并到最新状态，避免旧快照把已保存条目“复活”。
+      const dirtyBaseVersionBumps = new Map<string, number>()
+      const addedConflicts: Record<string, string> = {}
       let conflictAdded = false
       let hasMore = true
       let pageGuard = 0
@@ -960,16 +1087,22 @@ export const useSegmentStore = defineStore('segment', () => {
             const remoteVersion = Number(remoteSegment.version || 1)
             if (remoteVersion > baseVersion) {
               if ((remoteSegment.target_text || '') === (dirtyEntry.target_text || '')) {
-                bumpDirtyBaseVersion(nextDirtyEntries, remoteSegment.sentence_id, remoteVersion)
+                dirtyBaseVersionBumps.set(
+                  remoteSegment.sentence_id,
+                  Math.max(dirtyBaseVersionBumps.get(remoteSegment.sentence_id) || 0, remoteVersion),
+                )
               } else if (isSensitiveRemoteConflict(
                 remoteSegment.source,
                 remoteSegment.last_modified_by_id,
                 dirtyEntry.source,
               )) {
-                nextConflicts[remoteSegment.sentence_id] = remoteSegment.target_text || ''
+                addedConflicts[remoteSegment.sentence_id] = remoteSegment.target_text || ''
                 conflictAdded = true
               } else {
-                bumpDirtyBaseVersion(nextDirtyEntries, remoteSegment.sentence_id, remoteVersion)
+                dirtyBaseVersionBumps.set(
+                  remoteSegment.sentence_id,
+                  Math.max(dirtyBaseVersionBumps.get(remoteSegment.sentence_id) || 0, remoteVersion),
+                )
               }
               applyServerSegmentMetadata(remoteSegment.sentence_id, remoteSegment)
               continue
@@ -980,12 +1113,25 @@ export const useSegmentStore = defineStore('segment', () => {
         if (data.status_stats) {
           setSegmentStatusStats(data.status_stats)
         }
+        if (fileRecord.value?.id === currentFileRecordId && data.workflow_progress) {
+          fileRecord.value = {
+            ...fileRecord.value,
+            workflow_progress: data.workflow_progress,
+          }
+        }
         changeCursor = data.next_cursor || data.server_time || new Date().toISOString()
         hasMore = Boolean(data.has_more)
       }
 
-      dirtyEntries.value = nextDirtyEntries
-      conflictEntries.value = nextConflicts
+      const latestDirtyEntries = { ...dirtyEntries.value }
+      for (const [sentenceId, version] of dirtyBaseVersionBumps) {
+        bumpDirtyBaseVersion(latestDirtyEntries, sentenceId, version)
+      }
+      dirtyEntries.value = latestDirtyEntries
+      conflictEntries.value = {
+        ...conflictEntries.value,
+        ...addedConflicts,
+      }
       if (conflictAdded) {
         syncMessage.value = '检测到其他用户已更新同一句段，请确认后再保存本地修改。'
         pushToast({
@@ -1502,7 +1648,11 @@ export const useSegmentStore = defineStore('segment', () => {
     delete nextConflicts[segmentKey]
     conflictEntries.value = nextConflicts
     syncMessage.value = translate('stores.segment.syncPending', { count: dirtyCount.value })
-    scheduleSync()
+    if (confirm) {
+      void syncToBackend()
+    } else {
+      scheduleSync()
+    }
   }
 
   async function updateSource(sentenceId: string, sourceText: string) {
@@ -1791,6 +1941,7 @@ export const useSegmentStore = defineStore('segment', () => {
       }
       project_sync?: ProjectSegmentSyncSummary
       status_stats?: SegmentStatusStats | null
+      workflow_progress?: WorkflowProgress[]
       segments?: Segment[]
     }>(`/file-records/${fileId}/segments`, {
       updates,
@@ -1859,6 +2010,12 @@ export const useSegmentStore = defineStore('segment', () => {
     }
     if (data.status_stats) {
       setSegmentStatusStats(data.status_stats)
+    }
+    if (fileRecord.value?.id === fileId && data.workflow_progress) {
+      fileRecord.value = {
+        ...fileRecord.value,
+        workflow_progress: data.workflow_progress,
+      }
     }
     return finishSyncState(hadConflict)
   }
@@ -1935,6 +2092,21 @@ export const useSegmentStore = defineStore('segment', () => {
         )),
       }
       setSegmentStatusStats(buildMergeViewStatusStats(mergeViewDetail.value))
+    }
+    const workflowProgressByFileId = new Map(
+      results
+        .filter((result) => result.data.workflow_progress)
+        .map((result) => [result.fileId, result.data.workflow_progress as WorkflowProgress[]]),
+    )
+    if (workflowProgressByFileId.size > 0 && mergeViewDetail.value) {
+      mergeViewDetail.value = {
+        ...mergeViewDetail.value,
+        files: mergeViewDetail.value.files.map((file) => (
+          workflowProgressByFileId.has(file.id)
+            ? { ...file, workflow_progress: workflowProgressByFileId.get(file.id)! }
+            : file
+        )),
+      }
     }
     dirtyEntries.value = nextDirtyEntries
     clearLocalRevisionDrafts(syncedSentenceIds)
@@ -2681,6 +2853,7 @@ export const useSegmentStore = defineStore('segment', () => {
     ensureSentenceLoaded,
     loadRevisions,
     loadSaveToTMStats,
+    applyServerSegmentPatches,
     updateTarget,
     updateSource,
     setProjectSyncDisabled,

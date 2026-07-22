@@ -44,7 +44,7 @@ QUALITY_QA_RULE_DEFINITIONS: tuple[dict[str, Any], ...] = (
     {"key": QA_RULE_UNMATCHED_OPENING_TAG, "default_enabled": True},
     {"key": QA_RULE_TARGET_PLACEHOLDER_MISSING, "default_enabled": True},
     {"key": QA_RULE_SPELLING_GRAMMAR, "default_enabled": True},
-    {"key": QA_RULE_TERM_INCONSISTENCY, "default_enabled": False},
+    {"key": QA_RULE_TERM_INCONSISTENCY, "default_enabled": True},
     {"key": QA_RULE_PAIRED_PUNCTUATION_MISSING, "default_enabled": False},
     {"key": QA_RULE_ENDING_PUNCTUATION_MISMATCH, "default_enabled": False},
     {"key": QA_RULE_REPEATED_PUNCTUATION, "default_enabled": False},

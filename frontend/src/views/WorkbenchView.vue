@@ -99,7 +99,6 @@ import {
   calculateOverallWorkflowProgress,
   calculateProgressPercent,
   isProgressComplete,
-  patchTranslationWorkflowProgress,
 } from '../utils/progress'
 import {
   matchesSearchKeyword as matchesSharedSearchKeyword,
@@ -158,7 +157,7 @@ type SideToolKey = 'match-info' | 'terms' | 'resource-search' | 'notes' | 'refer
 type ResourceImportTab = 'tm' | 'glossary' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
 type SaveToTMTargetMode = 'new' | 'existing'
-type SegmentDisplayScope = 'all' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'confirmed_only' | 'empty_target'
+type SegmentDisplayScope = 'all' | 'project_sync_only' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'pending_confirmation' | 'confirmed_only' | 'empty_target'
 type RevisionMenuKind = 'track' | 'accept' | 'reject'
 type ResourceSearchMode = 'exact' | 'fuzzy'
 type FileExportStatus = 'queued' | 'running' | 'completed' | 'failed'
@@ -170,6 +169,24 @@ type SegmentSearchReturnTarget = {
   sentenceId: string | null
   displayIndex: number | null
   page: number
+}
+type SegmentReplacementPatch = Pick<Segment, 'sentence_id'> & Partial<Pick<
+  Segment,
+  | 'target_text'
+  | 'target_html'
+  | 'status'
+  | 'source'
+  | 'version'
+  | 'llm_provider'
+  | 'llm_model'
+  | 'last_modified_by_id'
+  | 'updated_at'
+>>
+type SegmentReplacementResponse = {
+  updated_count: number
+  occurrence_count: number
+  segments: SegmentReplacementPatch[]
+  status_stats?: SegmentStatusStats
 }
 interface SegmentScreeningOption {
   value: string
@@ -204,6 +221,7 @@ type SegmentEditorRowPublic = ComponentPublicInstance & {
   }) => boolean
   insertOrReplaceTargetText: (text: string) => boolean
   commitEditorContent: () => CommittedSegmentEditorContent | null
+  focusTargetEditorAtEnd: () => boolean
 }
 type WorkbenchMatchPanelPublic = ComponentPublicInstance & {
   applyMatchAtIndex: (index: number) => boolean
@@ -538,6 +556,8 @@ const loadingTermQAReport = ref(false)
 const generatingTermQAReport = ref(false)
 const downloadingTermQAReport = ref(false)
 const locatingTermQAReportItemId = ref<string | null>(null)
+const activeTermQAReportItemId = ref<string | null>(null)
+const termQAReportTableWrapRef = ref<HTMLElement | null>(null)
 const updatingTermQAIgnore = ref(false)
 const selectedTermQAItemIds = ref<Set<string>>(new Set())
 const termQAReportPage = ref(1)
@@ -1153,6 +1173,7 @@ const projectReturnParent = computed(() => (
 function createWorkbenchStatusStats(): SegmentStatusStats {
   return {
     total: 0,
+    project_sync: 0,
     exact: 0,
     fuzzy: 0,
     none: 0,
@@ -1188,8 +1209,20 @@ const statusSummaryCounters = computed(() => (
 
 const statusSummary = computed(() => {
   const counters = statusSummaryCounters.value
+  const pendingConfirmationCount = Math.max(
+    0,
+    counters.total - counters.confirmed - counters.empty_target,
+  )
 
   return [
+    {
+      key: 'project_sync',
+      label: t('workbench.statusSummary.projectSync'),
+      value: counters.project_sync,
+      tone: 'project-sync',
+      scope: 'project_sync_only' as const,
+      description: '项目同步：由同一项目内相同原文句段自动同步生成的译文。',
+    },
     {
       key: 'exact',
       label: t('workbench.statusSummary.exact'),
@@ -1215,12 +1248,20 @@ const statusSummary = computed(() => {
       description: '无匹配：没有从记忆库找到可用匹配的句段。',
     },
     {
+      key: 'pending_confirmation',
+      label: '待确认译文',
+      value: pendingConfirmationCount,
+      tone: 'pending-confirmation',
+      scope: 'pending_confirmation' as const,
+      description: '待确认译文：内容已经自动保存，但尚未经过人工确认。',
+    },
+    {
       key: 'confirmed',
       label: '已确认译文',
       value: counters.confirmed,
       tone: 'confirmed',
       scope: 'confirmed_only' as const,
-      description: '已确认译文：表示人工保存的译文，后续批处理默认会跳过。',
+      description: '已确认译文：表示已经人工确认的译文，后续批处理默认会跳过。',
     },
     {
       key: 'empty_target',
@@ -1254,6 +1295,7 @@ const activeFileStatusStats = computed(() => {
   }
   return activeMergeViewFile.value?.status_stats ?? {
     total: 0,
+    project_sync: 0,
     exact: 0,
     fuzzy: 0,
     none: 0,
@@ -1308,23 +1350,25 @@ const workbenchFooterProgressContext = computed(() => {
   const total = activeFileSegmentTotal.value
   const confirmed = activeFileStatusStats.value.confirmed
   const liveProgress = calculateProgressPercent(confirmed, total)
+  const activeStepId = activeSegment.value?.workflow_step_id || null
 
   if (isMergeWorkbench.value) {
     const file = activeMergeViewFile.value
     if (!file) {
       return null
     }
-    const workflowProgress = patchTranslationWorkflowProgress(
-      (file.workflow_progress || []) as WorkflowProgress[],
-      confirmed,
-      total,
-    )
+    const workflowProgress = (file.workflow_progress || []) as WorkflowProgress[]
+    const currentStep = workflowProgress.find((item) => item.id === activeStepId) ?? null
     return {
       progress: workflowProgress.length
         ? calculateOverallWorkflowProgress(workflowProgress, liveProgress)
         : liveProgress,
       status: file.status,
       workflowProgress,
+      currentStepId: currentStep?.id ?? null,
+      label: currentStep ? `${currentStep.name}阶段` : '当前阶段',
+      completedSegments: currentStep?.completed_segments ?? confirmed,
+      totalSegments: currentStep?.total_segments ?? total,
     }
   }
 
@@ -1332,17 +1376,18 @@ const workbenchFooterProgressContext = computed(() => {
   if (!record) {
     return null
   }
-  const workflowProgress = patchTranslationWorkflowProgress(
-    record.workflow_progress || [],
-    confirmed,
-    total,
-  )
+  const workflowProgress = record.workflow_progress || []
+  const currentStep = workflowProgress.find((item) => item.id === activeStepId) ?? null
   return {
     progress: workflowProgress.length
       ? calculateOverallWorkflowProgress(workflowProgress, liveProgress)
       : liveProgress,
     status: record.status,
     workflowProgress,
+    currentStepId: currentStep?.id ?? null,
+    label: currentStep ? `${currentStep.name}阶段` : '确认进度',
+    completedSegments: currentStep?.completed_segments ?? confirmed,
+    totalSegments: currentStep?.total_segments ?? total,
   }
 })
 
@@ -1527,7 +1572,7 @@ const qualityQARules = [
   { key: 'unmatched_opening_tag', label: '开始标记无匹配的结束标记', defaultEnabled: true },
   { key: 'target_placeholder_missing', label: '译文占位符标记丢失', defaultEnabled: true },
   { key: 'spelling_grammar', label: '译文有拼写或语法错误（查看支持的语种）', defaultEnabled: true },
-  { key: 'term_inconsistency', label: '术语不一致', defaultEnabled: false },
+  { key: 'term_inconsistency', label: '术语不一致', defaultEnabled: true },
   { key: 'paired_punctuation_missing', label: '成对标点符号丢失', defaultEnabled: false },
   { key: 'ending_punctuation_mismatch', label: '原文和译文的结束标点不同', defaultEnabled: false },
   { key: 'repeated_punctuation', label: '重复标点', defaultEnabled: false },
@@ -1632,8 +1677,7 @@ const lastModifiedStatusText = computed(() => {
     || null
   )
   const formatted = formatWorkbenchStatusTime(modifiedAt)
-  const pendingSuffix = segmentStore.dirtyCount > 0 ? `（待保存 ${segmentStore.dirtyCount} 条）` : ''
-  return `最后修改：${formatted || '--'}${pendingSuffix}`
+  return `最后修改：${formatted || '--'}`
 })
 
 const ribbonStatusTitle = computed(() => (
@@ -1729,6 +1773,22 @@ function getMergeGroupProgressText(segment: Segment) {
 const activeSegmentCanWrite = computed(() => Boolean(activeSegment.value?.can_write))
 const workflowSteps = computed(() => segmentStore.fileRecord?.workflow_steps || [])
 const workflowStepById = computed(() => new Map(workflowSteps.value.map((step) => [step.id, step])))
+const currentPageWorkflowReadOnlyNotice = computed(() => {
+  if (
+    isMergeWorkbench.value
+    || segmentStore.segments.length === 0
+    || segmentStore.segments.some((segment) => segment.can_write !== false)
+  ) {
+    return ''
+  }
+  const stageNames = Array.from(new Set(
+    segmentStore.segments
+      .map((segment) => segment.workflow_step_name?.trim())
+      .filter((name): name is string => Boolean(name)),
+  ))
+  const stageText = stageNames.length > 0 ? `（当前阶段：${stageNames.join('、')}）` : ''
+  return `当前页句段${stageText}仅可查看，尚未流转到你被分配的流程阶段；请联系项目管理员完成流程流转后再编辑。`
+})
 const segmentScreeningDisplayRangeOptions: SegmentScreeningOption[] = [
   { value: 'my_tasks', label: '我的任务' },
 ]
@@ -1742,6 +1802,7 @@ const segmentScreeningMatchOptions: SegmentScreeningOption[] = [
   { value: 'context_102', label: '102%匹配', disabled: true, hint: '暂无上下文匹配字段，先占位。' },
   { value: 'context_101', label: '101%匹配', disabled: true, hint: '暂无上下文匹配字段，先占位。' },
   { value: 'exact', label: '精确匹配' },
+  { value: 'project_sync', label: '项目同步' },
   { value: 'fuzzy', label: '模糊匹配' },
   { value: 'none', label: '无匹配' },
   { value: 'machine_translation', label: '机器翻译' },
@@ -2060,9 +2121,11 @@ function countTargetReplaceOccurrences(segment: Segment) {
 
 const segmentDisplayScopeOptions = computed<Array<{ value: SegmentDisplayScope; label: string }>>(() => [
   { value: 'all', label: t('workbench.search.scopes.all') },
+  { value: 'project_sync_only', label: t('workbench.statusSummary.projectSync') },
   { value: 'exact_only', label: t('workbench.statusSummary.exact') },
   { value: 'fuzzy_only', label: t('workbench.search.scopes.fuzzyOnly') },
   { value: 'none_only', label: t('workbench.search.scopes.noneOnly') },
+  { value: 'pending_confirmation', label: '待确认译文' },
   { value: 'confirmed_only', label: '已确认译文' },
   { value: 'empty_target', label: '空译文' },
 ])
@@ -2081,6 +2144,9 @@ function isShortWorkbenchStructuralFragment(value: string | null | undefined) {
 }
 
 function resolveWorkbenchMatchStatus(segment: Segment) {
+  if (segment.source === 'project_sync') {
+    return 'project_sync'
+  }
   const sourceText = normalizeWorkbenchMatchText(segment.source_text)
   const displayText = normalizeWorkbenchMatchText(segment.display_text)
   const matchedSourceText = normalizeWorkbenchMatchText(segment.matched_source_text)
@@ -2103,6 +2169,9 @@ function resolveWorkbenchMatchStatus(segment: Segment) {
 
 function matchesSegmentDisplayScope(segment: Segment) {
   const matchStatus = resolveWorkbenchMatchStatus(segment)
+  if (segmentDisplayScope.value === 'project_sync_only') {
+    return matchStatus === 'project_sync'
+  }
   if (segmentDisplayScope.value === 'exact_only') {
     return matchStatus === 'exact'
   }
@@ -2114,6 +2183,9 @@ function matchesSegmentDisplayScope(segment: Segment) {
   }
   if (segmentDisplayScope.value === 'confirmed_only') {
     return segment.status === 'confirmed'
+  }
+  if (segmentDisplayScope.value === 'pending_confirmation') {
+    return segment.status !== 'confirmed' && !isEmptyTargetForWorkbench(segment.target_text)
   }
   if (segmentDisplayScope.value === 'empty_target') {
     return isEmptyTargetForWorkbench(segment.target_text)
@@ -3464,7 +3536,7 @@ function getCurrentSegmentIndex() {
   return activeEditorIndex.value
 }
 
-async function focusEditorSegmentAtIndex(index: number) {
+async function focusEditorSegmentAtIndex(index: number, options: { caretAtEnd?: boolean } = {}) {
   const target = editorSegments.value[index]
   if (!target) {
     return
@@ -3476,9 +3548,13 @@ async function focusEditorSegmentAtIndex(index: number) {
   }
   await nextTick()
   await virtualListRef.value?.focusIndex(index, '[data-segment-target="true"]', 'nearest')
+  if (options.caretAtEnd) {
+    await nextTick()
+    segmentEditorRowRefs.get(segmentKeyOf(target))?.focusTargetEditorAtEnd()
+  }
 }
 
-async function focusMatchedSegment(offset: number) {
+async function focusMatchedSegment(offset: number, options: { caretAtEnd?: boolean } = {}) {
   if (!hasEditorSegmentFilter.value) {
     return
   }
@@ -3507,10 +3583,16 @@ async function focusMatchedSegment(offset: number) {
     await refreshSegmentPage(targetPage, pageSize)
   }
 
-  await focusEditorSegmentAtIndex(Math.min(targetPageIndex, Math.max(editorSegments.value.length - 1, 0)))
+  await focusEditorSegmentAtIndex(
+    Math.min(targetPageIndex, Math.max(editorSegments.value.length - 1, 0)),
+    options,
+  )
 }
 
-async function focusSegmentByGlobalIndex(globalIndex: number) {
+async function focusSegmentByGlobalIndex(
+  globalIndex: number,
+  options: { caretAtEnd?: boolean } = {},
+) {
   const total = segmentStore.matchedSegmentCount
   if (total <= 0) {
     return false
@@ -3532,7 +3614,7 @@ async function focusSegmentByGlobalIndex(globalIndex: number) {
   if (targetIndex < 0) {
     return false
   }
-  await focusEditorSegmentAtIndex(targetIndex)
+  await focusEditorSegmentAtIndex(targetIndex, options)
   return true
 }
 
@@ -3592,7 +3674,7 @@ async function replaceAllSearchMatches() {
     if (!synced) {
       return
     }
-    const { data } = await http.post<{ updated_count: number; occurrence_count: number }>(
+    const { data } = await http.post<SegmentReplacementResponse>(
       `/file-records/${segmentStore.fileRecord.id}/segments/replace`,
       {
         scope: segmentDisplayScope.value,
@@ -3608,13 +3690,16 @@ async function replaceAllSearchMatches() {
         match_filters: [...segmentScreeningMatchFilters.value],
         source_content_filters: [...segmentScreeningSourceContentFilters.value],
         workflow_step_ids: [...segmentScreeningWorkflowStepIds.value],
+        visible_sentence_ids: editorSegments.value.map((segment) => segment.sentence_id),
       },
     )
     if (data.updated_count === 0) {
       toast.warn(t('workbench.search.replaceNoMatch'))
       return
     }
-    await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize)
+    // 保留替换前的检索结果集和当前位置，仅把服务端最新字段合并到当前页。
+    // 用户修改检索条件或主动翻页时，现有逻辑仍会重新执行检索。
+    segmentStore.applyServerSegmentPatches(data.segments || [], data.status_stats)
     toast.success(t('workbench.search.replacedAll', {
       count: data.occurrence_count,
       segments: data.updated_count,
@@ -3624,9 +3709,9 @@ async function replaceAllSearchMatches() {
   }
 }
 
-async function focusSentenceByOffset(offset: number) {
+async function focusSentenceByOffset(offset: number, options: { caretAtEnd?: boolean } = {}) {
   if (hasEditorSegmentFilter.value) {
-    await focusMatchedSegment(offset)
+    await focusMatchedSegment(offset, options)
     return
   }
 
@@ -3637,7 +3722,7 @@ async function focusSentenceByOffset(offset: number) {
   const pageSize = Math.max(segmentStore.pageSize, 1)
   const currentPageStartIndex = Math.max(segmentStore.currentPage - 1, 0) * pageSize
   const targetGlobalIndex = currentPageStartIndex + getCurrentSegmentIndex() + offset
-  await focusSegmentByGlobalIndex(targetGlobalIndex)
+  await focusSegmentByGlobalIndex(targetGlobalIndex, options)
 }
 
 function getEditorSegmentDisplayIndex(sentenceId: string, fallbackIndex: number) {
@@ -3708,7 +3793,7 @@ async function focusSegmentPosition(target: SegmentPositionResponse) {
   if (resolvedIndex < 0) {
     return false
   }
-  await focusEditorSegmentAtIndex(resolvedIndex)
+  await focusEditorSegmentAtIndex(resolvedIndex, { caretAtEnd: true })
   return true
 }
 
@@ -3756,7 +3841,7 @@ async function focusNextUnconfirmedSegment(currentIndex: number, currentSegment:
 
   let nextIndex = findUnconfirmedSegmentIndex(currentIndex + 1)
   if (nextIndex !== -1) {
-    await focusEditorSegmentAtIndex(nextIndex)
+    await focusEditorSegmentAtIndex(nextIndex, { caretAtEnd: true })
     return true
   }
 
@@ -3765,7 +3850,7 @@ async function focusNextUnconfirmedSegment(currentIndex: number, currentSegment:
     const refreshedStartIndex = Math.min(Math.max(currentIndex, 0), editorSegments.value.length)
     nextIndex = findUnconfirmedSegmentIndex(refreshedStartIndex)
     if (nextIndex !== -1) {
-      await focusEditorSegmentAtIndex(nextIndex)
+      await focusEditorSegmentAtIndex(nextIndex, { caretAtEnd: true })
       return true
     }
   }
@@ -3780,7 +3865,7 @@ async function focusNextUnconfirmedSegment(currentIndex: number, currentSegment:
     }
     nextIndex = findUnconfirmedSegmentIndex(0)
     if (nextIndex !== -1) {
-      await focusEditorSegmentAtIndex(nextIndex)
+      await focusEditorSegmentAtIndex(nextIndex, { caretAtEnd: true })
       return true
     }
   }
@@ -3791,7 +3876,7 @@ async function focusNextUnconfirmedSegment(currentIndex: number, currentSegment:
 
   nextIndex = findUnconfirmedSegmentIndex(0, currentIndex)
   if (nextIndex !== -1) {
-    await focusEditorSegmentAtIndex(nextIndex)
+    await focusEditorSegmentAtIndex(nextIndex, { caretAtEnd: true })
     return true
   }
 
@@ -3873,7 +3958,7 @@ async function confirmAndMoveToNextUnconfirmed() {
     }
 
     if (preferencesStore.confirmJumpMode === 'next_segment') {
-      await focusSentenceByOffset(1)
+      await focusSentenceByOffset(1, { caretAtEnd: true })
       return
     }
 
@@ -4101,6 +4186,10 @@ function setCurrentTermQAReport(report: WorkbenchQAResult | null) {
   const normalizedReport = normalizeTermQAReportForCurrentWorkbench(report)
   termQAReport.value = normalizedReport
   setTermQAReportPage(termQAReportPage.value)
+  const reportItemIds = new Set(normalizedReport?.items.map((item) => item.id) ?? [])
+  if (activeTermQAReportItemId.value && !reportItemIds.has(activeTermQAReportItemId.value)) {
+    activeTermQAReportItemId.value = null
+  }
   const validIds = new Set(normalizedReport?.items.filter((item) => !item.ignored).map((item) => item.id) ?? [])
   selectedTermQAItemIds.value = new Set(
     [...selectedTermQAItemIds.value].filter((id) => validIds.has(id)),
@@ -4498,7 +4587,9 @@ async function focusTermQAReportItem(item: WorkbenchQAResultItem) {
     return
   }
 
+  activeTermQAReportItemId.value = item.id
   locatingTermQAReportItemId.value = item.id
+  let qaTableScrollTop: number | null = null
   try {
     const currentPageIndex = editorSegments.value.findIndex((segment) => (
       isMergeMode
@@ -4534,6 +4625,7 @@ async function focusTermQAReportItem(item: WorkbenchQAResultItem) {
       )).data
     }
     await clearSegmentFiltersForTermQANavigation()
+    qaTableScrollTop = termQAReportTableWrapRef.value?.scrollTop ?? null
     await refreshSegmentPage(data.page, data.page_size)
     const targetIndex = editorSegments.value.findIndex((segment) => (
       isMergeMode
@@ -4552,6 +4644,12 @@ async function focusTermQAReportItem(item: WorkbenchQAResultItem) {
     })
   } finally {
     locatingTermQAReportItemId.value = null
+    if (qaTableScrollTop !== null) {
+      await nextTick()
+      if (termQAReportTableWrapRef.value) {
+        termQAReportTableWrapRef.value.scrollTop = qaTableScrollTop
+      }
+    }
   }
 }
 
@@ -5349,11 +5447,28 @@ const selectedMergeSegmentsInSameBlock = computed(() => {
   return orderedSegments.every((segment) => isSameMergeBlock(segment, first))
 })
 
+const selectedMergeSegmentsAreAdjacent = computed(() => {
+  if (isCadFile.value) return true
+  const orderedSegments = orderedSelectedMergeSegments.value
+  if (orderedSegments.length < 2) return false
+
+  const firstIndex = editorSegments.value.findIndex(
+    (segment) => segmentKeyOf(segment) === segmentKeyOf(orderedSegments[0]),
+  )
+  if (firstIndex < 0) return false
+
+  return orderedSegments.every((segment, offset) => {
+    const displayedSegment = editorSegments.value[firstIndex + offset]
+    return Boolean(displayedSegment) && segmentKeyOf(displayedSegment) === segmentKeyOf(segment)
+  })
+})
+
 const canMergeSegment = computed(() => {
   return (
     orderedSelectedMergeSegments.value.length >= 2
     && selectedMergeSegmentsCanWrite.value
-    && selectedMergeSegmentsInSameBlock.value
+    && (isCadFile.value || selectedMergeSegmentsInSameBlock.value)
+    && selectedMergeSegmentsAreAdjacent.value
   )
 })
 
@@ -5364,8 +5479,11 @@ const mergeSegmentButtonTitle = computed(() => {
   if (!selectedMergeSegmentsCanWrite.value) {
     return t('workbench.messages.mergeReadonly')
   }
-  if (!selectedMergeSegmentsInSameBlock.value) {
+  if (!isCadFile.value && !selectedMergeSegmentsInSameBlock.value) {
     return t('workbench.messages.mergeDifferentBlock')
+  }
+  if (!selectedMergeSegmentsAreAdjacent.value) {
+    return t('workbench.messages.mergeNonAdjacent')
   }
   return t('workbench.ribbon.mergeSegment')
 })
@@ -5406,7 +5524,7 @@ async function handleSplitSegment() {
 
 async function handleMergeSegment() {
   if (!canMergeSegment.value) {
-    toast.warn({ message: t('workbench.messages.mergeSelectAtLeast') })
+    toast.warn({ message: mergeSegmentButtonTitle.value })
     return
   }
 
@@ -8233,7 +8351,7 @@ onBeforeRouteLeave(async () => {
         </button>
 
         <p class="workbench-overview__tip">
-          Tips：已确认译文表示人工保存的译文，后续批处理默认会跳过。
+          Tips：译文会自动保存；人工确认后的译文，后续批处理默认会跳过。
         </p>
 
         <div class="workbench-load-all">
@@ -8289,8 +8407,8 @@ onBeforeRouteLeave(async () => {
               <span>{{ item.label }}</span>
               <strong>{{ item.value }}</strong>
             </button>
-            <span class="segment-editor-toolbar__tip" title="已确认译文表示人工保存的译文，后续批处理默认会跳过。">
-              Tips：已确认译文后续批处理默认跳过。
+            <span class="segment-editor-toolbar__tip" title="译文会自动保存；人工确认后的译文，后续批处理默认会跳过。">
+              Tips：译文自动保存，确认后批处理默认跳过。
             </span>
             <span class="segment-editor-toolbar__loaded">
               {{ t('workbench.pageModeHint') }}
@@ -8804,13 +8922,26 @@ onBeforeRouteLeave(async () => {
             :class="{ 'has-bottom-drawer': activeBottomTool }"
             :style="bottomDrawerPanelHeightStyle"
           >
-          <div ref="segmentEditorResultsRef" class="segment-editor-results">
+          <div
+            ref="segmentEditorResultsRef"
+            class="segment-editor-results"
+            :class="{ 'has-workflow-readonly-notice': currentPageWorkflowReadOnlyNotice }"
+          >
             <div class="segment-table-head" aria-hidden="true">
               <span>句段</span>
               <span>原文</span>
               <span>译文</span>
               <span>状态</span>
               <span>阶段</span>
+            </div>
+
+            <div
+              v-if="currentPageWorkflowReadOnlyNotice"
+              class="workbench-workflow-readonly-notice"
+              role="status"
+            >
+              <Info :size="16" />
+              <span>{{ currentPageWorkflowReadOnlyNotice }}</span>
             </div>
 
             <div class="segment-editor-list-stage">
@@ -8902,13 +9033,17 @@ onBeforeRouteLeave(async () => {
               v-if="workbenchFooterProgressContext"
               class="segment-editor-footer__progress"
             >
-              <span class="segment-editor-footer__progress-label">{{ t('common.progress.total') }}</span>
+              <span class="segment-editor-footer__progress-label">{{ workbenchFooterProgressContext.label }}</span>
               <WorkflowProgressSummary
                 compact
                 :progress="workbenchFooterProgressContext.progress"
                 :status="workbenchFooterProgressContext.status"
                 :workflow-progress="workbenchFooterProgressContext.workflowProgress"
-                :label="t('common.progress.total')"
+                display-mode="current-stage"
+                :current-step-id="workbenchFooterProgressContext.currentStepId"
+                :completed-segments="workbenchFooterProgressContext.completedSegments"
+                :total-segments="workbenchFooterProgressContext.totalSegments"
+                :label="workbenchFooterProgressContext.label"
                 :detail-title="t('common.progress.workflowDetail')"
               />
             </div>
@@ -9217,7 +9352,7 @@ onBeforeRouteLeave(async () => {
                   <div v-if="filteredTermQAReportItems.length === 0" class="empty-state">
                     {{ termQAReportEmptyText }}
                   </div>
-                  <div v-else class="term-qa-dialog__table-wrap">
+                  <div v-else ref="termQAReportTableWrapRef" class="term-qa-dialog__table-wrap">
                     <table class="term-qa-dialog__table">
                       <thead>
                         <tr>
@@ -9246,9 +9381,11 @@ onBeforeRouteLeave(async () => {
                           class="term-qa-dialog__row"
                           :class="{
                             'is-locating': locatingTermQAReportItemId === item.id,
+                            'is-current': activeTermQAReportItemId === item.id,
                             'is-ignored': item.ignored,
                           }"
                           tabindex="0"
+                          :aria-current="activeTermQAReportItemId === item.id ? 'true' : undefined"
                           :aria-label="`跳转到句段 ${formatTermQASegmentNumber(item.sentence_id)}`"
                           @click="void focusTermQAReportItem(item)"
                           @keydown.enter.prevent="void focusTermQAReportItem(item)"
@@ -10594,6 +10731,10 @@ onBeforeRouteLeave(async () => {
   grid-template-rows: auto minmax(0, 1fr);
 }
 
+.workbench-page.is-standalone .segment-editor-results.has-workflow-readonly-notice {
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
 .workbench-page.is-standalone .segment-editor-list-stage {
   height: auto;
   min-height: 0;
@@ -11887,7 +12028,8 @@ onBeforeRouteLeave(async () => {
 
 .term-qa-dialog__row:hover,
 .term-qa-dialog__row:focus-visible,
-.term-qa-dialog__row.is-locating {
+.term-qa-dialog__row.is-locating,
+.term-qa-dialog__row.is-current {
   background: #e4f3ff;
   outline: none;
   box-shadow: inset 3px 0 0 #2a7fb8;
@@ -12745,6 +12887,22 @@ onBeforeRouteLeave(async () => {
   position: relative;
 }
 
+.workbench-workflow-readonly-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #ead8a4;
+  background: #fff8e6;
+  color: #75520b;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.workbench-workflow-readonly-notice svg {
+  flex: 0 0 auto;
+}
+
 .segment-editor-list-loading {
   position: absolute;
   inset: 0;
@@ -12771,6 +12929,8 @@ onBeforeRouteLeave(async () => {
   grid-template-columns: minmax(0, 1fr);
   align-items: stretch;
   gap: 8px;
+  container-type: inline-size;
+  container-name: segment-editor-shell;
 }
 
 .segment-editor-shell.has-bottom-drawer {
@@ -12785,6 +12945,10 @@ onBeforeRouteLeave(async () => {
   display: grid;
   grid-template-rows: auto minmax(390px, var(--workbench-editor-stage-height));
   min-height: 0;
+}
+
+.segment-editor-results.has-workflow-readonly-notice {
+  grid-template-rows: auto auto minmax(390px, var(--workbench-editor-stage-height));
 }
 
 .workbench-layout {
@@ -12828,6 +12992,7 @@ onBeforeRouteLeave(async () => {
   z-index: 2;
   order: 3;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
@@ -12842,7 +13007,7 @@ onBeforeRouteLeave(async () => {
   display: flex;
   align-items: center;
   gap: 12px;
-  flex: 1 1 auto;
+  flex: 1 1 680px;
   min-width: 0;
 }
 
@@ -12851,8 +13016,8 @@ onBeforeRouteLeave(async () => {
   align-items: center;
   gap: 8px;
   flex: 0 0 auto;
-  width: min(220px, 28vw);
-  min-width: 148px;
+  width: min(290px, 38vw);
+  min-width: 220px;
 }
 
 .segment-editor-footer__progress-label {
@@ -13372,7 +13537,7 @@ onBeforeRouteLeave(async () => {
   min-height: 30px;
   min-width: 0;
   width: max-content;
-  max-width: min(540px, 48vw);
+  max-width: min(600px, 100%);
   overflow-x: auto;
   overflow-y: hidden;
   padding: 0;
@@ -13395,7 +13560,7 @@ onBeforeRouteLeave(async () => {
   left: auto;
   z-index: 1710;
   width: max-content;
-  max-width: min(540px, 48vw);
+  max-width: min(600px, 100%);
   min-height: 29px;
   padding: 0;
   border-color: #b8cbd5;
@@ -13412,8 +13577,8 @@ onBeforeRouteLeave(async () => {
   justify-content: center;
   gap: 4px;
   height: 28px;
-  min-width: 88px;
-  padding: 0 9px;
+  min-width: 84px;
+  padding: 0 7px;
   border: 0;
   border-left: 1px solid #d7e2e8;
   border-radius: 0;
@@ -13484,7 +13649,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .segment-editor-bottom-tool--qa {
-  padding-right: 24px;
+  padding-right: 22px;
 }
 
 .segment-editor-bottom-tool--qa svg {
@@ -13528,6 +13693,53 @@ onBeforeRouteLeave(async () => {
 .segment-editor-bottom-tool__badge.is-clean {
   background: #e6f6ef;
   color: #15795d;
+}
+
+/*
+ * 侧栏打开后，编辑区宽度会明显小于浏览器视口，不能只依赖 viewport 媒体查询。
+ * 按编辑区自身宽度切换成图标模式，为分页控件保留稳定空间；按钮文字仍供
+ * 屏幕阅读器读取，并可通过原有 title 查看。
+ */
+@container segment-editor-shell (max-width: 860px) {
+  .segment-editor-bottom-tools,
+  .segment-editor-bottom-tools.is-docked {
+    flex: 0 0 auto;
+    width: max-content;
+    max-width: 100%;
+  }
+
+  .segment-editor-bottom-tool {
+    width: 42px;
+    min-width: 42px;
+    padding: 0;
+  }
+
+  .segment-editor-bottom-tool--qa {
+    padding-right: 0;
+  }
+
+  .segment-editor-bottom-tool > span:not(.segment-editor-bottom-tool__badge) {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .segment-editor-bottom-tool--qa > svg {
+    transform: translateX(-5px);
+  }
+
+  .segment-editor-bottom-tool__badge {
+    top: 1px;
+    right: 1px;
+    min-width: 15px;
+    height: 15px;
+    padding: 0 3px;
+    font-size: 9px;
+  }
 }
 
 .workbench-bottom-drawer {
@@ -14066,6 +14278,10 @@ onBeforeRouteLeave(async () => {
 
 .segment-editor-shell.has-bottom-drawer .segment-editor-results {
   grid-template-rows: auto minmax(140px, 1fr);
+}
+
+.segment-editor-shell.has-bottom-drawer .segment-editor-results.has-workflow-readonly-notice {
+  grid-template-rows: auto auto minmax(140px, 1fr);
 }
 
 .segment-editor-shell.has-bottom-drawer .segment-editor-list-stage {
@@ -14707,6 +14923,10 @@ onBeforeRouteLeave(async () => {
     grid-template-rows: auto 420px;
   }
 
+  .segment-editor-results.has-workflow-readonly-notice {
+    grid-template-rows: auto auto 420px;
+  }
+
   .segment-editor-list-stage {
     height: 420px;
     min-height: 0;
@@ -14838,6 +15058,10 @@ onBeforeRouteLeave(async () => {
 
   .segment-editor-results {
     grid-template-rows: auto 520px;
+  }
+
+  .segment-editor-results.has-workflow-readonly-notice {
+    grid-template-rows: auto auto 520px;
   }
 
   .segment-editor-list-stage {

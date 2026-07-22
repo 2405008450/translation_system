@@ -120,6 +120,7 @@ class MultiFormatExporter:
                     "block_index": getattr(segment, "block_index", index),
                     "row_index": getattr(segment, "row_index", None),
                     "cell_index": getattr(segment, "cell_index", None),
+                    "sequence_index": getattr(segment, "sequence_index", None),
                 }
 
             sentence_id = item.get("sentence_id") or item.get("segment_id") or f"seg_{index}"
@@ -134,8 +135,37 @@ class MultiFormatExporter:
             item.setdefault("block_index", index)
             item.setdefault("row_index", None)
             item.setdefault("cell_index", None)
+            item.setdefault("sequence_index", None)
             normalized.append(item)
-        return normalized
+        return self._order_segments_by_sequence_index(normalized)
+
+    @staticmethod
+    def _order_segments_by_sequence_index(
+        segments: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """完整、唯一的持久化顺序存在时，以它覆盖调用方传入顺序。"""
+        sequence_indexes: list[int] = []
+        for segment in segments:
+            raw_value = segment.get("sequence_index")
+            if raw_value is None or raw_value == "":
+                return segments
+            try:
+                sequence_index = int(raw_value)
+            except (TypeError, ValueError):
+                return segments
+            if sequence_index < 0:
+                return segments
+            sequence_indexes.append(sequence_index)
+
+        if len(sequence_indexes) != len(set(sequence_indexes)):
+            return segments
+        return [
+            segment
+            for _, segment in sorted(
+                zip(sequence_indexes, segments, strict=True),
+                key=lambda item: item[0],
+            )
+        ]
 
     def _build_translation_maps(self, segments: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
         source_candidates: dict[str, set[str]] = defaultdict(set)
@@ -147,9 +177,15 @@ class MultiFormatExporter:
         segment_id_map: dict[str, str] = {}
 
         for segment in segments:
-            target_text = str(segment.get("target_text") or "").strip()
-            if not target_text:
+            raw_target_text = segment.get("target_text")
+            if raw_target_text is None or str(raw_target_text) == "":
                 continue
+            raw_target_text = str(raw_target_text)
+            target_text = (
+                raw_target_text
+                if not raw_target_text.strip()
+                else raw_target_text.strip()
+            )
 
             source_text = str(segment.get("source_text") or "").strip()
             display_text = str(segment.get("display_text") or "").strip()
@@ -330,7 +366,11 @@ class MultiFormatExporter:
         elif extension == ".idml":
             from app.services.adapters.idml_exporter import IdmlExporter
 
-            content = IdmlExporter().export(original_bytes, text_map)
+            content = IdmlExporter().export(
+                original_bytes,
+                text_map,
+                segments=segments,
+            )
         elif extension == ".mif":
             from app.services.adapters.mif_exporter import MifExporter
 

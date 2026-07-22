@@ -44,6 +44,17 @@ export interface AnalyticsSeriesPoint {
   active_user_count: number
 }
 
+export interface AnalyticsLlmModelSeriesPoint {
+  bucket: string
+  segment_count: number
+}
+
+export interface AnalyticsLlmModelSeries {
+  model: string
+  total_segment_count: number
+  points: AnalyticsLlmModelSeriesPoint[]
+}
+
 export interface AnalyticsLanguagePair {
   source_language: string | null
   target_language: string | null
@@ -83,6 +94,7 @@ export interface AnalyticsDashboardResponse {
   granularity: AnalyticsGranularity
   summary: AnalyticsSummary
   series: AnalyticsSeriesPoint[]
+  llm_model_series: AnalyticsLlmModelSeries[]
   language_pairs: AnalyticsLanguagePair[]
   source_breakdown: AnalyticsSourceBreakdown[]
   user_stats: AnalyticsUserStat[]
@@ -166,9 +178,12 @@ export interface ProjectAssignmentsResponse {
   project_id: string
   workflow_steps?: WorkflowStep[]
   assignments: ProjectAssignmentItem[]
+  revision: string
 }
 
 export interface ProjectAssignmentPayload {
+  base_revision?: string
+  workflow_transition_mode?: 'prompt' | 'advance' | 'assign_only'
   assignments: Array<{
     assignee_id: string
     workflow_step_id?: string
@@ -678,6 +693,7 @@ export interface FileRecordDetail {
   collection_id: string | null
   collection_ids: string[]
   tm_match_threshold: number
+  tm_scope_mode?: 'selected' | 'language_pair_all'
   collection_name: string | null
   term_base_id: string | null
   term_base_name: string | null
@@ -712,6 +728,7 @@ export interface FileRecordDetail {
 
 export interface SegmentStatusStats {
   total: number
+  project_sync: number
   exact: number
   fuzzy: number
   none: number
@@ -739,6 +756,7 @@ export interface SegmentPageResponse {
   total_segments: number | null
   matched_segments: number
   status_stats: SegmentStatusStats | null
+  workflow_progress?: WorkflowProgress[]
   skip: number
   limit: number
   filters: SegmentPageFilters
@@ -1028,6 +1046,7 @@ export interface ProjectTranslationMemorySettingFile {
   collection_id: string | null
   collection_ids: string[]
   tm_match_threshold: number
+  tm_scope_mode?: 'selected' | 'language_pair_all'
 }
 
 export interface ProjectTranslationMemorySettingGroup {

@@ -58,6 +58,8 @@ const SIDEBAR_STORAGE_KEY = 'tm-workbench-sidebar-collapsed'
 const sidebarCollapsed = ref(
   typeof window !== 'undefined' && window.localStorage.getItem(SIDEBAR_STORAGE_KEY) === '1',
 )
+let wasCompactSidebarViewport = false
+let sidebarCollapsedBeforeCompact = sidebarCollapsed.value
 const notificationsOpen = ref(false)
 const languageMenuOpen = ref(false)
 const notificationsLoading = ref(false)
@@ -160,7 +162,7 @@ const navGroups = computed<NavGroup[]>(() => [
   },
 ])
 
-const recentItems = computed(() => shellStore.recentItems)
+const recentItems = computed(() => shellStore.recentItems.slice(0, 3))
 const pageTitle = computed(() => {
   if (shellStore.pageContext.title) {
     return String(shellStore.pageContext.title)
@@ -392,9 +394,25 @@ function openRecentItem(item: (typeof recentItems.value)[number]) {
 
 function toggleSidebar() {
   sidebarCollapsed.value = !sidebarCollapsed.value
+  sidebarCollapsedBeforeCompact = sidebarCollapsed.value
   if (typeof window !== 'undefined') {
     window.localStorage.setItem(SIDEBAR_STORAGE_KEY, sidebarCollapsed.value ? '1' : '0')
   }
+}
+
+function syncSidebarWithViewport() {
+  if (typeof window === 'undefined') {
+    return
+  }
+
+  const isCompactViewport = window.innerWidth <= 1180
+  if (isCompactViewport && !wasCompactSidebarViewport) {
+    sidebarCollapsedBeforeCompact = sidebarCollapsed.value
+    sidebarCollapsed.value = true
+  } else if (!isCompactViewport && wasCompactSidebarViewport) {
+    sidebarCollapsed.value = sidebarCollapsedBeforeCompact
+  }
+  wasCompactSidebarViewport = isCompactViewport
 }
 
 function toggleTheme() {
@@ -420,13 +438,6 @@ function getUserDisplayName() {
 function getUserInitial() {
   const name = getUserDisplayName()
   return name.charAt(0).toUpperCase()
-}
-
-function getRoleLabel(role?: string | null) {
-  if (role === 'super_admin') {
-    return t('common.roles.superAdmin')
-  }
-  return role === 'admin' ? t('common.roles.admin') : t('common.roles.user')
 }
 
 function getRecentIcon(section: string) {
@@ -471,12 +482,15 @@ watch(
 )
 
 onMounted(() => {
+  syncSidebarWithViewport()
   document.addEventListener('click', closeNotificationsOnOutsideClick)
+  window.addEventListener('resize', syncSidebarWithViewport)
   window.addEventListener(GLOBAL_NOTIFICATIONS_REFRESH_EVENT, handleNotificationsRefresh)
 })
 
 onBeforeUnmount(() => {
   document.removeEventListener('click', closeNotificationsOnOutsideClick)
+  window.removeEventListener('resize', syncSidebarWithViewport)
   window.removeEventListener(GLOBAL_NOTIFICATIONS_REFRESH_EVENT, handleNotificationsRefresh)
 })
 
@@ -628,35 +642,6 @@ watch(
             {{ t('shell.recent.empty') }}
           </div>
         </div>
-      </div>
-
-      <div class="sidebar-footer">
-        <div class="sidebar-user-avatar">{{ getUserInitial() }}</div>
-        <div v-if="!sidebarCollapsed" class="sidebar-user-info">
-          <strong>{{ getUserDisplayName() || authStore.user?.username }}</strong>
-          <span>{{ getRoleLabel(authStore.user?.role) }}</span>
-        </div>
-        <button
-          v-if="!sidebarCollapsed"
-          class="button"
-          type="button"
-          :title="t('shell.topbar.logout')"
-          :aria-label="t('shell.topbar.logout')"
-          style="margin-left: auto;"
-          @click="logout"
-        >
-          <LogOut :size="14" />
-        </button>
-        <button
-          v-else
-          class="button"
-          type="button"
-          :title="t('shell.topbar.logout')"
-          :aria-label="t('shell.topbar.logout')"
-          @click="logout"
-        >
-          <LogOut :size="14" />
-        </button>
       </div>
     </aside>
 

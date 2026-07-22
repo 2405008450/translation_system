@@ -31,11 +31,15 @@ async function login(page: Page) {
   ])
 }
 
-async function createProjectWithFixture(page: Page, projectName: string) {
+async function createProjectWithFixture(
+  page: Page,
+  projectName: string,
+  workflowTemplate = 'translate',
+) {
   await page.getByTestId('project-create-button').click()
   await expect(page.getByTestId('project-create-dialog')).toBeVisible()
   await page.getByTestId('project-create-name').fill(projectName)
-  await page.getByTestId('project-create-workflow-template').selectOption('translate')
+  await page.getByTestId('project-create-workflow-template').selectOption(workflowTemplate)
   await Promise.all([
     page.waitForURL(/\/projects\/[0-9a-f-]+/i),
     page.getByTestId('project-create-submit').click(),
@@ -54,8 +58,12 @@ async function createProjectWithFixture(page: Page, projectName: string) {
   await expect(page.getByTestId('project-file-table')).toContainText('smoke-source.txt')
 }
 
-async function createProjectWithFixtureAndOpenFocusWorkbench(page: Page, projectName: string) {
-  await createProjectWithFixture(page, projectName)
+async function createProjectWithFixtureAndOpenFocusWorkbench(
+  page: Page,
+  projectName: string,
+  workflowTemplate = 'translate',
+) {
+  await createProjectWithFixture(page, projectName, workflowTemplate)
 
   const focusPagePromise = page.waitForEvent('popup')
   await page.getByTestId('project-file-open-workbench').click()
@@ -326,15 +334,96 @@ test.describe.serial('核心 E2E 冒烟流程', () => {
     await expect(focusEditor).toBeVisible()
     await focusEditor.fill(translatedText)
     await saveWorkbenchNow(focusPage)
+    await expect(focusPage.locator('.workbench-ribbon__status')).toContainText('已自动保存')
+    await expect(focusPage.locator('.workbench-ribbon__modified-time')).not.toContainText('待保存')
+
+    // 保存事件会触发增量轮询；轮询完成后再次保存不应重发已经落库的译文。
+    let redundantSegmentPuts = 0
+    focusPage.on('request', (request) => {
+      if (request.method() === 'PUT' && request.url().includes('/segments')) {
+        redundantSegmentPuts += 1
+      }
+    })
+    await focusPage.waitForTimeout(2_000)
+    await focusPage.getByTestId('workbench-save-button').click()
+    await focusPage.waitForTimeout(500)
+    expect(redundantSegmentPuts).toBe(0)
 
     await focusPage.reload()
     await expect(focusPage.getByTestId('segment-target-editor').first()).toContainText(translatedText)
+    const pendingConfirmationStat = focusPage.locator('.workbench-stat--pending-confirmation')
+    await expect(pendingConfirmationStat).toContainText('待确认译文')
+    await expect(pendingConfirmationStat).toContainText('1')
+    await pendingConfirmationStat.click()
+    await expect(focusPage.getByTestId('segment-target-editor')).toHaveCount(1)
+    await expect(focusPage.getByTestId('segment-target-editor')).toContainText(translatedText)
 
     const focusDownloadPromise = focusPage.waitForEvent('download')
     await expect(focusPage.getByTestId('workbench-export-button')).toBeEnabled()
     await focusPage.getByTestId('workbench-export-button').click()
     const focusDownload = await focusDownloadPromise
     expect(focusDownload.suggestedFilename()).toContain('smoke-source')
+    await focusPage.close()
+  })
+
+  test('编辑页显示当前阶段进度，项目页显示多阶段总进度', async ({ page }) => {
+    await login(page)
+    const focusPage = await createProjectWithFixtureAndOpenFocusWorkbench(
+      page,
+      `E2E Workflow Progress ${Date.now()}`,
+      'translate_review',
+    )
+
+    const editor = focusPage.getByTestId('segment-target-editor').first()
+    await editor.fill(`Workflow translated ${Date.now()}`)
+    await saveWorkbenchNow(focusPage)
+
+    const footerProgress = focusPage.locator('.segment-editor-footer__progress')
+    await expect(footerProgress).toContainText('翻译阶段')
+    await expect(footerProgress).toContainText('50% · 1/2')
+
+    await page.reload()
+    const projectProgress = page.locator('.pd-hero__progress')
+    await expect(projectProgress).toContainText('总进度')
+    await expect(projectProgress).toContainText('25%')
+
+    await projectProgress.locator('.workflow-progress-summary').hover()
+    const workflowDetails = page.locator('.workflow-progress-popover')
+    await expect(workflowDetails).toContainText('翻译')
+    await expect(workflowDetails).toContainText('50%')
+    await expect(workflowDetails).toContainText('审校')
+    await expect(workflowDetails).toContainText('0%')
+
+    await focusPage.close()
+  })
+
+  test('回车确认并跳转后将译文光标放在文本末尾', async ({ page }) => {
+    await login(page)
+    const focusPage = await createProjectWithFixtureAndOpenFocusWorkbench(
+      page,
+      `E2E Confirm Caret ${Date.now()}`,
+    )
+
+    const editors = focusPage.getByTestId('segment-target-editor')
+    await expect(editors).toHaveCount(2)
+    await editors.nth(0).fill('01')
+    await editors.nth(1).fill('03')
+    await saveWorkbenchNow(focusPage)
+
+    await editors.nth(0).click()
+    await focusPage.keyboard.press('Enter')
+    await expect(editors.nth(1)).toBeFocused()
+    await expect.poll(async () => editors.nth(1).evaluate((element) => {
+      const selection = window.getSelection()
+      if (!selection || selection.rangeCount === 0) return -1
+      const range = selection.getRangeAt(0)
+      if (!element.contains(range.startContainer)) return -1
+      const beforeCaret = range.cloneRange()
+      beforeCaret.selectNodeContents(element)
+      beforeCaret.setEnd(range.startContainer, range.startOffset)
+      return beforeCaret.toString().length
+    })).toBe(2)
+
     await focusPage.close()
   })
 

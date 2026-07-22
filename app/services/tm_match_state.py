@@ -5,10 +5,9 @@ import json
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models import FileRecord, MemoryBase, MemoryEntry, Segment
+from app.models import FileRecord, MemoryBase, Segment
 from app.services.normalizer import build_source_hash
 
 
@@ -24,19 +23,36 @@ def build_tm_match_signature(
     db: Session,
     *,
     file_record_id: UUID,
-    collection_ids: list[UUID],
+    collection_ids: list[UUID] | None,
     threshold: float,
     skip_confirmed: bool,
     overwrite_fuzzy: bool,
     auto_confirm_exact: bool,
+    scope_mode: str = "selected",
+    source_language: str | None = None,
+    target_language: str | None = None,
 ) -> str:
-    selected_collection_ids = [str(item) for item in list(dict.fromkeys(collection_ids))]
+    normalized_scope_mode = (
+        "language_pair_all" if scope_mode == "language_pair_all" else "selected"
+    )
+    selected_collection_ids = sorted(
+        str(item) for item in dict.fromkeys(collection_ids or [])
+    )
     payload = {
-        "version": 1,
+        "version": 2,
         "file_record_id": str(file_record_id),
         "source_fingerprint": _build_file_source_fingerprint(db, file_record_id),
-        "collections": _build_collection_fingerprints(db, collection_ids),
+        "collections": _build_collection_fingerprints(
+            db,
+            collection_ids=collection_ids,
+            scope_mode=normalized_scope_mode,
+            source_language=source_language,
+            target_language=target_language,
+        ),
         "collection_ids": selected_collection_ids,
+        "scope_mode": normalized_scope_mode,
+        "source_language": (source_language or "").strip(),
+        "target_language": (target_language or "").strip(),
         "threshold": normalize_tm_match_threshold(threshold),
         "skip_confirmed": bool(skip_confirmed),
         "overwrite_fuzzy": bool(overwrite_fuzzy),
@@ -85,24 +101,39 @@ def _build_file_source_fingerprint(db: Session, file_record_id: UUID) -> dict[st
     }
 
 
-def _build_collection_fingerprints(db: Session, collection_ids: list[UUID]) -> list[dict[str, object]]:
-    fingerprints: list[dict[str, object]] = []
-    for collection_id in list(dict.fromkeys(collection_ids)):
-        collection = db.query(MemoryBase).filter(MemoryBase.id == collection_id).first()
-        entry_count, last_entry_updated_at = (
-            db.query(func.count(MemoryEntry.id), func.max(MemoryEntry.updated_at))
-            .filter(MemoryEntry.collection_id == collection_id)
-            .one()
+def _build_collection_fingerprints(
+    db: Session,
+    *,
+    collection_ids: list[UUID] | None,
+    scope_mode: str,
+    source_language: str | None,
+    target_language: str | None,
+) -> list[dict[str, object]]:
+    """只读 memory_bases 元数据，避免为签名扫描千万级 memory_entries。"""
+    query = db.query(
+        MemoryBase.id,
+        MemoryBase.entry_count,
+        MemoryBase.updated_at,
+    )
+    if scope_mode == "language_pair_all":
+        query = query.filter(
+            MemoryBase.source_language == (source_language or "").strip(),
+            MemoryBase.target_language == (target_language or "").strip(),
         )
-        fingerprints.append(
-            {
-                "id": str(collection_id),
-                "base_updated_at": _format_dt(collection.updated_at if collection else None),
-                "entry_count": int(entry_count or 0),
-                "last_entry_updated_at": _format_dt(last_entry_updated_at),
-            }
-        )
-    return fingerprints
+    else:
+        normalized_ids = list(dict.fromkeys(collection_ids or []))
+        if not normalized_ids:
+            return []
+        query = query.filter(MemoryBase.id.in_(normalized_ids))
+
+    return [
+        {
+            "id": str(row.id),
+            "base_updated_at": _format_dt(row.updated_at),
+            "entry_count": int(row.entry_count or 0),
+        }
+        for row in query.order_by(MemoryBase.id.asc()).all()
+    ]
 
 
 def _format_dt(value: object) -> str | None:

@@ -18,6 +18,7 @@ from app.services.automatic_numbering import (
 )
 from app.services.matcher import match_sentences_with_stats
 from app.services.normalizer import normalize_text
+from app.services.segment_status import apply_segment_status
 from app.services.tm_vector import sync_tm_embeddings
 from app.services.translation_memory_service import TMUpsertEntry, batch_upsert_tm_entries
 
@@ -291,13 +292,24 @@ def refresh_unconfirmed_segment_matches(
     if file_record is None:
         return 0
 
-    selected_collection_ids = _resolve_refresh_collection_ids(
-        db,
-        file_record=file_record,
-        collection_id=collection_id,
-        collection_ids=collection_ids,
+    language_pair_all = (
+        getattr(file_record, "tm_scope_mode", "selected") == "language_pair_all"
+        and collection_id is None
+        and collection_ids is None
     )
-    if not selected_collection_ids:
+    selected_collection_ids = (
+        None
+        if language_pair_all
+        else _resolve_refresh_collection_ids(
+            db,
+            file_record=file_record,
+            collection_id=collection_id,
+            collection_ids=collection_ids,
+        )
+    )
+    if selected_collection_ids == []:
+        return 0
+    if not file_record.source_language or not file_record.target_language:
         return 0
     similarity_threshold = round(
         float(getattr(file_record, "tm_match_threshold", None) or settings.default_similarity_threshold),
@@ -383,7 +395,7 @@ def refresh_unconfirmed_segment_matches(
                     continue
                 segment.target_text = target_text
                 segment.target_html = None
-                segment.status = match.status
+                apply_segment_status(segment, match.status)
                 segment.source = "tm"
             after = (
                 segment.target_text,

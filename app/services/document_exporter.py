@@ -255,6 +255,7 @@ class ExportSegment:
     target_html: str | None = None
     math_placeholders: dict[str, str] = field(default_factory=dict)
     sequence_index: int | None = None
+    source_structure_changed: bool = False
 
 
 @dataclass
@@ -459,6 +460,15 @@ def _group_segments_by_block(
             source_segment_by_sentence_id=source_segment_by_sentence_id,
             source_segment_by_text_key=source_segment_by_text_key,
         )
+        source_segment_by_id = source_segment_by_sentence_id.get(sentence_id)
+        source_segment_by_text = _find_source_segment_by_export_text(
+            segment,
+            source_segment_by_text_key,
+        )
+        has_original_source_match = source_segment_by_text is not None or bool(
+            source_segment_by_id
+            and _export_segment_text_matches_source_segment(segment, source_segment_by_id)
+        )
 
         grouped[block_key].append(
             ExportSegment(
@@ -471,13 +481,13 @@ def _group_segments_by_block(
                 target_html=str(target_html) if target_html else None,
                 math_placeholders=dict(math_map.get(sentence_id) or {}),
                 sequence_index=_get_export_sequence_index(segment),
+                source_structure_changed=bool(source_segment_list) and not has_original_source_match,
             )
         )
 
-    if source_segment_list:
-        return _order_segment_groups_by_source(grouped, source_segment_list)
-
-    return grouped
+    # 原格式译文和双语 Word 共用这一排序入口。即使源块元数据无法重新定位，
+    # 仍应优先使用持久化的 sequence_index，不能保留调用方或哈希 ID 带来的乱序。
+    return _order_segment_groups_by_source(grouped, source_segment_list)
 
 
 def _build_source_segment_lookup_by_sentence_id(
@@ -561,11 +571,10 @@ def _order_segment_groups_by_source(
 
     ordered: dict[BlockKey, list[ExportSegment]] = {}
     for block_key, block_segments in grouped.items():
-        source_block_segments = source_by_block.get(block_key)
-        if not source_block_segments:
-            ordered[block_key] = block_segments
-            continue
-        ordered[block_key] = _order_export_segments_for_source_block(block_segments, source_block_segments)
+        ordered[block_key] = _order_export_segments_for_source_block(
+            block_segments,
+            source_by_block.get(block_key, []),
+        )
     return ordered
 
 
@@ -1209,12 +1218,51 @@ def _export_bilingual_table_cell(
         if not paragraph_buffer:
             return
 
-        for paragraph_group, sentence_count in _group_table_cell_paragraph_groups(paragraph_buffer, numbering_schema):
+        paragraph_groups = _group_table_cell_paragraph_groups(paragraph_buffer, numbering_schema)
+        buffer_sentence_count = sum(sentence_count for _, sentence_count in paragraph_groups)
+        buffer_tokens = _cell_paragraph_group_tokens(paragraph_buffer)
+        buffer_segments, buffer_consumed_count = _take_segments_matching_token_source(
+            cell_segments,
+            segment_cursor,
+            buffer_tokens,
+            buffer_sentence_count,
+        )
+        if _tokens_have_structural_segment_change(buffer_tokens, buffer_segments):
+            target_paragraphs = [_clone_bilingual_paragraph(item.paragraph) for item in paragraph_buffer]
+            target_tokens = _collect_cell_group_tokens(
+                paragraphs=target_paragraphs,
+                story=story,
+                block_counter=block_counter,
+                numbering_schema=numbering_schema,
+                segments_by_block=segments_by_block,
+            )
+            _replace_block_tokens(
+                tokens=target_tokens,
+                segments=buffer_segments,
+                keep_source_when_empty=False,
+            )
+            _insert_cloned_table_cell_paragraphs(
+                cell=cell,
+                paragraph_group=paragraph_buffer,
+                target_paragraphs=target_paragraphs,
+                order=order,
+            )
+            segment_cursor += buffer_consumed_count
+            paragraph_buffer = []
+            return
+
+        for paragraph_group, sentence_count in paragraph_groups:
             if sentence_count == 0:
                 continue
 
-            group_segments = cell_segments[segment_cursor : segment_cursor + sentence_count]
-            segment_cursor += sentence_count
+            target_tokens = _cell_paragraph_group_tokens(paragraph_group)
+            group_segments, consumed_count = _take_segments_matching_token_source(
+                cell_segments,
+                segment_cursor,
+                target_tokens,
+                sentence_count,
+            )
+            segment_cursor += consumed_count
             if not group_segments:
                 continue
 
@@ -1356,10 +1404,34 @@ def _export_table_cell(
         if not paragraph_buffer:
             return
 
-        for paragraph_group, sentence_count in _group_table_cell_paragraph_groups(paragraph_buffer, numbering_schema):
+        paragraph_groups = _group_table_cell_paragraph_groups(paragraph_buffer, numbering_schema)
+        buffer_sentence_count = sum(sentence_count for _, sentence_count in paragraph_groups)
+        buffer_tokens = _cell_paragraph_group_tokens(paragraph_buffer)
+        buffer_segments, buffer_consumed_count = _take_segments_matching_token_source(
+            cell_segments,
+            segment_cursor,
+            buffer_tokens,
+            buffer_sentence_count,
+        )
+        if _tokens_have_structural_segment_change(buffer_tokens, buffer_segments):
+            _replace_block_tokens(
+                tokens=buffer_tokens,
+                segments=buffer_segments,
+            )
+            segment_cursor += buffer_consumed_count
+            paragraph_buffer = []
+            return
+
+        for paragraph_group, sentence_count in paragraph_groups:
             if sentence_count == 0:
                 continue
-            group_segments = cell_segments[segment_cursor : segment_cursor + sentence_count]
+            token_group = _cell_paragraph_group_tokens(paragraph_group)
+            group_segments, consumed_count = _take_segments_matching_token_source(
+                cell_segments,
+                segment_cursor,
+                token_group,
+                sentence_count,
+            )
             if _try_distribute_table_cell_paragraph_lines(
                 cell=cell,
                 paragraph_group=paragraph_group,
@@ -1369,14 +1441,13 @@ def _export_table_cell(
                 numbering_schema=numbering_schema,
                 segments_by_block=segments_by_block,
             ):
-                segment_cursor += sentence_count
+                segment_cursor += consumed_count
                 continue
-            token_group = _cell_paragraph_group_tokens(paragraph_group)
             _replace_block_tokens(
                 tokens=token_group,
                 segments=group_segments,
             )
-            segment_cursor += sentence_count
+            segment_cursor += consumed_count
 
         paragraph_buffer = []
 
@@ -1511,7 +1582,7 @@ def _export_bilingual_paragraph(
     )
     _replace_block_tokens(
         tokens=target_tokens,
-        segments=block_segments[:sentence_count],
+        segments=block_segments,
         keep_source_when_empty=False,
     )
     _insert_cloned_blocks(
@@ -1975,6 +2046,20 @@ def _replace_block_tokens(
     if not spans and normalize_text(display_text):
         spans = [_build_trimmed_span(display_text)]
 
+    source_spans = [
+        (span, _normalize_segment_source_text(_collect_span_text(tokens, span, use_source=True)))
+        for span in spans
+    ]
+    source_spans = [(span, source_text) for span, source_text in source_spans if source_text]
+    if _should_replace_structurally_modified_block(source_spans, segments):
+        _replace_structurally_modified_block(
+            tokens=tokens,
+            source_spans=source_spans,
+            segments=segments,
+            keep_source_when_empty=keep_source_when_empty,
+        )
+        return
+
     used_segment_indexes: set[int] = set()
     fallback_segment_index = 0
     use_explicit_sequence = _has_complete_explicit_sequence(segments)
@@ -2044,6 +2129,130 @@ def _replace_block_tokens(
         previous_span = span
 
     _apply_token_edits(tokens)
+
+
+def _structure_text_key(text: str) -> str:
+    """结构对齐时忽略空白差异，但保留实际字符和标点。"""
+    return "".join(_normalize_segment_source_text(text).split())
+
+
+def _should_replace_structurally_modified_block(
+    source_spans: list[tuple[SentenceSpan, str]],
+    segments: list[ExportSegment],
+) -> bool:
+    if not source_spans or not segments:
+        return False
+    if not any(segment.source_structure_changed for segment in segments):
+        return False
+
+    span_keys = [_structure_text_key(source_text) for _, source_text in source_spans]
+    segment_keys = [_structure_text_key(segment.source_text) for segment in segments]
+    if not all(span_keys) or not all(segment_keys):
+        return False
+
+    return len(span_keys) != len(segment_keys) or any(
+        span_key != segment_key
+        for span_key, segment_key in zip(span_keys, segment_keys, strict=True)
+    )
+
+
+def _tokens_have_structural_segment_change(
+    tokens: list[TextToken],
+    segments: list[ExportSegment],
+) -> bool:
+    if not tokens or not segments:
+        return False
+    _assign_token_offsets(tokens)
+    display_text = "".join(token.display_text for token in tokens)
+    spans = split_sentence_spans(display_text)
+    if not spans and normalize_text(display_text):
+        spans = [_build_trimmed_span(display_text)]
+    source_spans = [
+        (span, _normalize_segment_source_text(_collect_span_text(tokens, span, use_source=True)))
+        for span in spans
+    ]
+    return _should_replace_structurally_modified_block(
+        [(span, source_text) for span, source_text in source_spans if source_text],
+        segments,
+    )
+
+
+def _replace_structurally_modified_block(
+    *,
+    tokens: list[TextToken],
+    source_spans: list[tuple[SentenceSpan, str]],
+    segments: list[ExportSegment],
+    keep_source_when_empty: bool,
+) -> None:
+    """拆分或合并改变句段边界时，按当前顺序完整重建对应源文本区间。"""
+    replacement = ""
+    for segment in segments:
+        current = _resolve_segment_replacement_text(segment)
+        if not normalize_text(current):
+            if _is_target_placeholder(segment.target_text):
+                current = segment.target_text
+            elif keep_source_when_empty:
+                current = segment.source_text
+            else:
+                current = ""
+        replacement = _append_structural_replacement(replacement, current)
+
+    first_span = source_spans[0][0]
+    last_span = source_spans[-1][0]
+    _queue_sentence_replacement(
+        tokens,
+        SentenceSpan(start=first_span.start, end=last_span.end),
+        replacement,
+    )
+    _apply_token_edits(tokens)
+
+
+def _append_structural_replacement(previous: str, current: str) -> str:
+    if not current:
+        return previous
+    if not previous or previous[-1].isspace() or current[0].isspace():
+        return previous + current
+
+    previous_char = previous[-1]
+    current_char = current[0]
+    needs_word_space = (
+        previous_char.isascii()
+        and previous_char.isalnum()
+        and current_char.isascii()
+        and current_char.isalnum()
+    )
+    needs_sentence_space = bool(
+        ENGLISH_BOUNDARY_TRAILING_RE.search(previous)
+        and ENGLISH_WORD_LEADING_RE.match(current)
+    )
+    separator = " " if needs_word_space or needs_sentence_space else ""
+    return previous + separator + current
+
+
+def _take_segments_matching_token_source(
+    segments: list[ExportSegment],
+    start_index: int,
+    tokens: list[TextToken],
+    fallback_count: int,
+) -> tuple[list[ExportSegment], int]:
+    """按源文本累计选取句段，使表格单元格中的拆分/合并不再按旧句数截断。"""
+    expected_key = _structure_text_key("".join(token.source_text for token in tokens))
+    if expected_key:
+        accumulated_key = ""
+        for end_index in range(start_index, len(segments)):
+            accumulated_key += _structure_text_key(segments[end_index].source_text)
+            if accumulated_key == expected_key:
+                consumed_count = end_index - start_index + 1
+                return segments[start_index : end_index + 1], consumed_count
+            if not expected_key.startswith(accumulated_key):
+                break
+
+    remaining_segments = segments[start_index:]
+    if any(segment.source_structure_changed for segment in remaining_segments):
+        return remaining_segments, len(remaining_segments)
+
+    fallback_segments = segments[start_index : start_index + fallback_count]
+    return fallback_segments, len(fallback_segments)
 
 
 def _find_export_segment_index_for_span_source(
@@ -2190,6 +2399,7 @@ def _build_inline_bilingual_segments(
                 target_html=None,
                 math_placeholders=segment.math_placeholders,
                 sequence_index=segment.sequence_index,
+                source_structure_changed=segment.source_structure_changed,
             )
         )
     return bilingual_segments

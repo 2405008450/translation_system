@@ -9,7 +9,7 @@ from uuid import UUID
 from sqlalchemy import case, event, func, or_, update
 from sqlalchemy.orm import Session
 
-from app.models import FileRecord, Segment, TranslationMemory, User
+from app.models import FileRecord, FileSegmentStats, Segment, TranslationMemory, User
 from app.services.document_storage import (
     delete_source_file,
     load_source_file,
@@ -33,7 +33,7 @@ from app.services.automatic_numbering import (
 )
 from app.services.normalizer import build_source_hash
 from app.services.revision_service import create_revision
-from app.services.segment_status import resolve_unconfirmed_segment_status
+from app.services.segment_status import apply_segment_status, resolve_unconfirmed_segment_status
 from app.services.task_file_service import build_task_workspace
 
 logger = logging.getLogger(__name__)
@@ -146,36 +146,43 @@ def get_file_record_segment_counts(db: Session, file_record_id: UUID) -> tuple[i
     return int(total_segments or 0), int(translated_segments or 0)
 
 
+def get_file_segment_status_counts(db: Session, file_record_id: UUID) -> tuple[int, int]:
+    """读取文件的 (总句段数, 已确认数)。优先读触发器维护的统计表，缺行时回退实时计数。"""
+    stats_row = (
+        db.query(FileSegmentStats.total, FileSegmentStats.confirmed_count)
+        .filter(FileSegmentStats.file_record_id == file_record_id)
+        .first()
+    )
+    if stats_row is not None:
+        return int(stats_row.total or 0), int(stats_row.confirmed_count or 0)
+    row = (
+        db.query(
+            func.count(Segment.id),
+            func.count(case((Segment.status == "confirmed", 1))),
+        )
+        .filter(Segment.file_record_id == file_record_id)
+        .one()
+    )
+    return int(row[0] or 0), int(row[1] or 0)
+
+
 def sync_file_record_status(db: Session, file_record_id: UUID) -> str | None:
     db.flush()
-    total_segments = (
-        db.query(func.count(Segment.id))
-        .filter(Segment.file_record_id == file_record_id)
-        .scalar_subquery()
-    )
-    translated_segments = (
-        db.query(func.count(Segment.id))
-        .filter(
-            Segment.file_record_id == file_record_id,
-            Segment.status == "confirmed",
-        )
-        .scalar_subquery()
-    )
-    status_expr = case(
-        (FileRecord.status == "error", FileRecord.status),
-        (
-            total_segments > 0,
-            case(
-                (translated_segments >= total_segments, "completed"),
-                else_="in_progress",
-            ),
-        ),
-        else_=FileRecord.status,
-    )
+    total_segments, translated_segments = get_file_segment_status_counts(db, file_record_id)
+    if total_segments <= 0:
+        row = db.query(FileRecord.status).filter(FileRecord.id == file_record_id).first()
+        return row[0] if row else None
+
+    next_status = "completed" if translated_segments >= total_segments else "in_progress"
     result = db.execute(
         update(FileRecord)
         .where(FileRecord.id == file_record_id)
-        .values(status=status_expr)
+        .values(
+            status=case(
+                (FileRecord.status == "error", FileRecord.status),
+                else_=next_status,
+            )
+        )
         .returning(FileRecord.status)
         .execution_options(synchronize_session="fetch")
     )
@@ -194,6 +201,31 @@ def get_segment_ordering_for_file_record(file_record: FileRecord | None):
     if file_record is not None and Path(file_record.filename or "").suffix.lower() == ".pptx":
         return PPTX_SEGMENT_ORDERING
     return SEGMENT_ORDERING
+
+
+def refresh_segment_display_indexes(db: Session, file_record: FileRecord) -> None:
+    """按文档权威顺序重建整个文件的持久化 display_index（一条 UPDATE）。
+
+    供导入、拆分/合并等结构变更后调用；常规译文保存不需要。
+    """
+    ordered = (
+        db.query(
+            Segment.id.label("id"),
+            (func.row_number().over(order_by=get_segment_ordering_for_file_record(file_record)) - 1).label("rn"),
+        )
+        .filter(Segment.file_record_id == file_record.id)
+        .subquery()
+    )
+    db.execute(
+        update(Segment)
+        .where(Segment.id == ordered.c.id, Segment.display_index != ordered.c.rn)
+        .values(display_index=ordered.c.rn)
+        .execution_options(synchronize_session=False)
+    )
+    # 让 ORM 中已加载的句段在下次访问时取到新序号。
+    for obj in list(db.identity_map.values()):
+        if isinstance(obj, Segment) and obj.file_record_id == file_record.id:
+            db.expire(obj, ["display_index"])
 
 
 def _record_initial_translation_events(db: Session, segments: list[Segment]) -> None:
@@ -256,12 +288,24 @@ def build_duplicate_filename(
     filename: str,
     project_id: UUID | None,
 ) -> str:
+    return build_labeled_copy_filename(db, filename, project_id, "副本")
+
+
+def build_labeled_copy_filename(
+    db: Session,
+    filename: str,
+    project_id: UUID | None,
+    label: str,
+) -> str:
     path = Path(filename or "untitled.txt")
     suffix = path.suffix
     stem = path.name[: -len(suffix)] if suffix else path.name
     stem = stem or "untitled"
 
-    base_name = f"{stem} - 副本{suffix}"
+    normalized_label = label.strip()
+    if not normalized_label:
+        raise ValueError("副本名称标签不能为空")
+    base_name = f"{stem} - {normalized_label}{suffix}"
     query = db.query(FileRecord.filename)
     if project_id is None:
         query = query.filter(FileRecord.project_id.is_(None))
@@ -273,10 +317,83 @@ def build_duplicate_filename(
 
     index = 2
     while True:
-        candidate = f"{stem} - 副本 {index}{suffix}"
+        candidate = f"{stem} - {normalized_label} {index}{suffix}"
         if candidate not in existing_names:
             return candidate
         index += 1
+
+
+def create_file_record_copy_shell(
+    db: Session,
+    source_record: FileRecord,
+    *,
+    filename: str,
+    project_id: UUID | None,
+    current_user: User | None,
+    target_language: str | None = None,
+    preserve_language_resources: bool = True,
+) -> tuple[FileRecord, bytes | None]:
+    source_bytes = load_file_record_source(source_record)
+    duplicate = FileRecord(
+        project_id=project_id,
+        filename=filename,
+        file_hash=source_record.file_hash,
+        status="in_progress",
+        document_parse_mode=source_record.document_parse_mode,
+        document_parse_options=source_record.document_parse_options,
+        document_statistics=source_record.document_statistics,
+        source_language=source_record.source_language,
+        target_language=target_language if target_language is not None else source_record.target_language,
+        creator_id=current_user.id if current_user is not None else source_record.creator_id,
+        collection_id=source_record.collection_id if preserve_language_resources else None,
+        collection_ids_json=(source_record.collection_ids_json if preserve_language_resources else "[]"),
+        tm_match_threshold=getattr(source_record, "tm_match_threshold", 0.8),
+        tm_scope_mode=(
+            getattr(source_record, "tm_scope_mode", "selected")
+            if preserve_language_resources
+            else "selected"
+        ),
+        tm_match_signature=None,
+        tm_last_matched_at=None,
+        term_base_id=source_record.term_base_id if preserve_language_resources else None,
+        term_base_ids=source_record.term_base_ids if preserve_language_resources else "[]",
+        term_base_write_ids=(
+            getattr(source_record, "term_base_write_ids", "[]")
+            if preserve_language_resources
+            else "[]"
+        ),
+        qa_term_base_ids=(
+            getattr(source_record, "qa_term_base_ids", "[]")
+            if preserve_language_resources
+            else "[]"
+        ),
+        glossary_base_ids=(
+            getattr(source_record, "glossary_base_ids", "[]")
+            if preserve_language_resources
+            else "[]"
+        ),
+        deadline=source_record.deadline,
+        access_level=source_record.access_level,
+    )
+    db.add(duplicate)
+    db.flush()
+    return duplicate, source_bytes
+
+
+def copy_file_record_source(
+    db: Session,
+    source_record: FileRecord,
+    duplicate: FileRecord,
+    source_bytes: bytes | None,
+) -> None:
+    if source_bytes is None:
+        return
+    duplicate_source_filename = _build_duplicate_source_filename(
+        source_record,
+        duplicate.filename,
+    )
+    _remember_pending_source_file(db, duplicate.id, duplicate_source_filename)
+    save_source_file(duplicate.id, duplicate_source_filename, source_bytes)
 
 
 def duplicate_file_record(
@@ -291,37 +408,19 @@ def duplicate_file_record(
     if source_record is None:
         return None
 
-    source_bytes = load_file_record_source(source_record)
     target_project_id = project_id if project_id is not None else source_record.project_id
     next_filename = (filename or "").strip() or build_duplicate_filename(
         db,
         source_record.filename,
         target_project_id,
     )
-    duplicate = FileRecord(
-        project_id=target_project_id,
+    duplicate, source_bytes = create_file_record_copy_shell(
+        db,
+        source_record,
         filename=next_filename,
-        file_hash=source_record.file_hash,
-        status="in_progress",
-        document_parse_mode=source_record.document_parse_mode,
-        document_parse_options=source_record.document_parse_options,
-        document_statistics=source_record.document_statistics,
-        source_language=source_record.source_language,
-        target_language=source_record.target_language,
-        creator_id=current_user.id if current_user is not None else source_record.creator_id,
-        collection_id=source_record.collection_id,
-        collection_ids_json=source_record.collection_ids_json,
-        tm_match_threshold=getattr(source_record, "tm_match_threshold", 0.8),
-        term_base_id=source_record.term_base_id,
-        term_base_ids=source_record.term_base_ids,
-        term_base_write_ids=getattr(source_record, "term_base_write_ids", "[]"),
-        qa_term_base_ids=getattr(source_record, "qa_term_base_ids", "[]"),
-        glossary_base_ids=getattr(source_record, "glossary_base_ids", "[]"),
-        deadline=source_record.deadline,
-        access_level=source_record.access_level,
+        project_id=target_project_id,
+        current_user=current_user,
     )
-    db.add(duplicate)
-    db.flush()
 
     source_segments = list_segments_for_file_record(db, source_record.id)
     for sequence_index, segment in enumerate(source_segments):
@@ -356,16 +455,12 @@ def duplicate_file_record(
                 sequence_index=(
                     stored_sequence_index if stored_sequence_index >= 0 else sequence_index
                 ),
+                display_index=sequence_index,
+                segment_metadata=getattr(segment, "segment_metadata", "{}") or "{}",
             )
         )
 
-    if source_bytes is not None:
-        duplicate_source_filename = _build_duplicate_source_filename(
-            source_record,
-            next_filename,
-        )
-        save_source_file(duplicate.id, duplicate_source_filename, source_bytes)
-        _remember_pending_source_file(db, duplicate.id, duplicate_source_filename)
+    copy_file_record_source(db, source_record, duplicate, source_bytes)
 
     db.flush()
     return duplicate
@@ -426,6 +521,7 @@ def _create_file_record_from_workspace(
             row_index=seg.get("row_index"),
             cell_index=seg.get("cell_index"),
             sequence_index=sequence_index,
+            display_index=sequence_index,
             segment_metadata=seg_metadata_json,
         )
         db.add(segment)
@@ -481,6 +577,7 @@ def create_txt_file_record_with_segments(
             block_type="paragraph",
             block_index=index,
             sequence_index=index,
+            display_index=index,
         )
         db.add(segment)
         created_segments.append(segment)
@@ -746,6 +843,7 @@ def attach_source_document_to_file_record(
             row_index=seg.get("row_index"),
             cell_index=seg.get("cell_index"),
             sequence_index=sequence_index,
+            display_index=sequence_index,
             segment_metadata=seg_metadata_json,
         )
         db.add(segment)
@@ -932,7 +1030,14 @@ def _normalize_segment_target_for_save(
     return target_text, target_html
 
 
-MACHINE_SEGMENT_SOURCES = {"llm", "tm", "project_sync", "none", ""}
+MACHINE_SEGMENT_SOURCES = {
+    "llm",
+    "tm",
+    "project_sync",
+    "english_variant_conversion",
+    "none",
+    "",
+}
 
 
 def _mark_segment_modified_by(segment: Segment, current_user: User | None) -> None:
@@ -1004,7 +1109,7 @@ def update_segment_target(
     else:
         segment.llm_provider = None
         segment.llm_model = None
-    segment.status = _resolve_status_after_target_update(segment, before_text, target_text, confirm)
+    apply_segment_status(segment, _resolve_status_after_target_update(segment, before_text, target_text, confirm))
     if track_revision:
         create_revision(
             db,
@@ -1042,6 +1147,7 @@ def update_segment_by_sentence_id(
     llm_model: str | None = None,
     track_revision: bool = True,
     confirm: bool = False,
+    defer_commit: bool = False,
 ) -> Segment | None:
     segment = (
         db.query(Segment)
@@ -1071,7 +1177,7 @@ def update_segment_by_sentence_id(
     else:
         segment.llm_provider = None
         segment.llm_model = None
-    segment.status = _resolve_status_after_target_update(segment, before_text, target_text, confirm)
+    apply_segment_status(segment, _resolve_status_after_target_update(segment, before_text, target_text, confirm))
     if track_revision:
         create_revision(
             db,
@@ -1092,8 +1198,11 @@ def update_segment_by_sentence_id(
     )
 
     sync_file_record_status(db, segment.file_record_id)
-    db.commit()
-    db.refresh(segment)
+    if defer_commit:
+        db.flush()
+    else:
+        db.commit()
+        db.refresh(segment)
     return segment
 
 
@@ -1153,6 +1262,7 @@ def batch_update_segments(
     current_user: User | None = None,
     *,
     return_result: bool = False,
+    defer_commit: bool = False,
 ) -> int | SegmentBatchUpdateResult:
     updates_by_sentence_id: dict[str, dict] = {}
     for item in updates:
@@ -1231,7 +1341,7 @@ def batch_update_segments(
         else:
             segment.llm_provider = None
             segment.llm_model = None
-        segment.status = _resolve_status_after_target_update(segment, before_text, target_text, confirm)
+        apply_segment_status(segment, _resolve_status_after_target_update(segment, before_text, target_text, confirm))
         if track_revision:
             create_revision(
                 db,
@@ -1256,7 +1366,10 @@ def batch_update_segments(
     if updated_count > 0:
         sync_file_record_status(db, file_record_id)
 
-    db.commit()
+    if defer_commit:
+        db.flush()
+    else:
+        db.commit()
     result = SegmentBatchUpdateResult(
         updated_count=updated_count,
         updated_segments=updated_segments,

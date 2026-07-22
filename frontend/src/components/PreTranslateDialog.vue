@@ -92,6 +92,7 @@ interface PretranslationRunStatus {
 
 type ResourceImportTab = 'tm' | 'glossary' | 'term'
 type LLMTranslationUnit = 'sentence' | 'paragraph'
+type TMScopeMode = 'selected' | 'language_pair_all'
 type LanguagePairStat = {
   source: string | null
   target: string | null
@@ -308,11 +309,21 @@ function resourceMatchesSelectedLanguagePair(resource: TMCollection | TermBase |
 }
 
 const availableTMCollections = computed(() => {
-  return tmCollections.value.filter((collection) => resourceMatchesSelectedLanguagePair(collection))
+  const boundIds = new Set(getBoundTMCollectionIdsFromFiles())
+  return tmCollections.value
+    .filter((collection) => resourceMatchesSelectedLanguagePair(collection))
+    .sort((left, right) => Number(boundIds.has(right.id)) - Number(boundIds.has(left.id)))
 })
 
 const selectedTmCollectionIds = computed(() => (
   normalizeResourceIds(tmCollectionIds.value, availableTMCollections.value)
+))
+
+const tmScopeMode = computed<TMScopeMode>(() => (
+  availableTMCollections.value.length > 0
+  && selectedTmCollectionIds.value.length === availableTMCollections.value.length
+    ? 'language_pair_all'
+    : 'selected'
 ))
 
 const shouldRunTm = computed(() => useTm.value && selectedTmCollectionIds.value.length > 0)
@@ -495,6 +506,7 @@ async function loadWorkloadPreview() {
       {
         file_ids: props.files.map((file) => file.id),
         tm_collection_ids: selectedTmCollectionIds.value,
+        tm_scope_mode: tmScopeMode.value,
         tm_threshold: normalizeTMThreshold(tmThreshold.value),
         tm_skip_confirmed: tmSkipConfirmed.value,
       },
@@ -985,9 +997,26 @@ function resourceEntryCountLabel(count: number) {
 async function loadResources() {
   loadingResources.value = true
   try {
+    const resourcePair = selectedFileLanguagePairs.value.length === 1
+      ? selectedFileLanguagePairs.value[0]
+      : null
     const [{ data: collections }, { data: bases }, { data: glossaries }, { data: templates }] = await Promise.all([
-      http.get<TMCollection[]>('/translation-memory/collections'),
-      http.get<TermBase[]>('/term-bases'),
+      http.get<TMCollection[]>('/translation-memory/collections', {
+        params: resourcePair
+          ? {
+              source_language: resourcePair.source,
+              target_language: resourcePair.target,
+            }
+          : undefined,
+      }),
+      http.get<TermBase[]>('/term-bases', {
+        params: resourcePair
+          ? {
+              source_language: resourcePair.source,
+              target_language: resourcePair.target,
+            }
+          : undefined,
+      }),
       http.get<GlossaryBase[]>('/glossary-bases'),
       http.get<GuidelineTemplateSummary[]>('/guideline-templates'),
     ])
@@ -1494,6 +1523,7 @@ async function startPreTranslateTaskRun() {
       file_ids: runFiles.value.map((file) => file.id),
       use_tm: shouldRunTm.value,
       tm_collection_ids: selectedTmCollectionIds.value,
+      tm_scope_mode: tmScopeMode.value,
       tm_threshold: normalizeTMThreshold(tmThreshold.value),
       tm_skip_confirmed: tmSkipConfirmed.value,
       tm_overwrite_fuzzy: tmOverwriteFuzzy.value,

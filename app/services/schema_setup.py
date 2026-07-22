@@ -26,6 +26,9 @@ UUID_SQL_DEFAULT = """
 """
 
 REQUIRED_EXISTING_TABLES = ("memory_bases", "memory_entries")
+REQUIRED_COLUMN_MIN_LENGTHS = {
+    ("segments", "source"): 40,
+}
 LEGACY_REQUIRED_EXISTING_TABLES = (
     "tm_collections",
     "translation_memory",
@@ -67,6 +70,7 @@ REQUIRED_SCHEMA = {
         "name",
         "source_language",
         "target_language",
+        "entry_count",
         "creator_id",
     },
     "term_entries": {
@@ -164,6 +168,7 @@ REQUIRED_SCHEMA = {
         "creator_id",
         "collection_id",
         "collection_ids_json",
+        "tm_scope_mode",
         "term_base_id",
         "term_base_ids",
         "term_base_write_ids",
@@ -573,6 +578,7 @@ REQUIRED_INDEXES = {
         "ix_segments_translated_source_word_count",
         "ix_segments_source_word_backfill",
         "ix_segments_translated_backfill",
+        "ix_segments_llm_model_updated_at",
     },
     "translation_metric_events": {
         "ix_translation_metric_events_source_created_at",
@@ -707,19 +713,26 @@ def _ensure_runtime_schema_once() -> None:
             )
 
         missing_items = _collect_missing_schema(inspector)
-        if not missing_items:
+        length_items, length_statements = _collect_column_length_migrations(inspector)
+        all_missing_items = [*missing_items, *length_items]
+        if not all_missing_items:
             return
 
-        statements = _build_schema_statements(
-            create_update_function=not _update_trigger_function_exists(connection),
-        )
+        statements: list[str] = []
+        if missing_items:
+            statements.extend(
+                _build_schema_statements(
+                    create_update_function=not _update_trigger_function_exists(connection),
+                )
+            )
+        statements.extend(length_statements)
 
     try:
         with engine.begin() as connection:
             for statement in statements:
                 connection.execute(text(statement))
     except ProgrammingError as exc:
-        missing_text = ", ".join(missing_items)
+        missing_text = ", ".join(all_missing_items)
         raise RuntimeError(
             "数据库账号缺少结构升级权限，请使用有权限的账号执行 scripts/init_db.sql "
             "或 scripts/rename_translation_memory_tables.sql 后再启动服务。"
@@ -759,6 +772,30 @@ def _collect_missing_schema(inspector) -> list[str]:
         for index_name in sorted(required_indexes - existing_indexes):
             missing_items.append(f"{table_name}.{index_name}")
     return missing_items
+
+
+def _collect_column_length_migrations(inspector) -> tuple[list[str], list[str]]:
+    missing_items: list[str] = []
+    statements: list[str] = []
+    for (table_name, column_name), minimum_length in REQUIRED_COLUMN_MIN_LENGTHS.items():
+        if not inspector.has_table(table_name):
+            continue
+        columns_by_name = {
+            column["name"]: column
+            for column in inspector.get_columns(table_name)
+        }
+        column = columns_by_name.get(column_name)
+        if column is None:
+            continue
+        column_length = getattr(column["type"], "length", None)
+        if column_length is None or column_length >= minimum_length:
+            continue
+        missing_items.append(f"{table_name}.{column_name}_length")
+        statements.append(
+            f'ALTER TABLE "{table_name}" '
+            f'ALTER COLUMN "{column_name}" TYPE VARCHAR({minimum_length})'
+        )
+    return missing_items, statements
 
 
 def _update_trigger_function_exists(connection) -> bool:
@@ -984,6 +1021,7 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
                 description TEXT,
                 source_language VARCHAR(20) NOT NULL,
                 target_language VARCHAR(20) NOT NULL,
+                entry_count BIGINT NOT NULL DEFAULT 0,
                 creator_id UUID REFERENCES users(id) ON DELETE SET NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
@@ -1004,6 +1042,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             ALTER TABLE IF EXISTS term_bases
             ADD COLUMN IF NOT EXISTS creator_id UUID REFERENCES users(id) ON DELETE SET NULL
+            """,
+            """
+            ALTER TABLE IF EXISTS term_bases
+            ADD COLUMN IF NOT EXISTS entry_count BIGINT NOT NULL DEFAULT 0
             """,
             """
             ALTER TABLE IF EXISTS term_bases
@@ -1615,6 +1657,10 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """,
             """
             ALTER TABLE IF EXISTS file_records
+            ADD COLUMN IF NOT EXISTS tm_scope_mode VARCHAR(24) NOT NULL DEFAULT 'selected'
+            """,
+            """
+            ALTER TABLE IF EXISTS file_records
             ADD COLUMN IF NOT EXISTS tm_match_signature VARCHAR(64)
             """,
             """
@@ -2222,6 +2268,11 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             CREATE INDEX IF NOT EXISTS ix_segments_translated_backfill
             ON segments (updated_at, id)
             WHERE target_text <> '' AND source_word_count > 0
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_segments_llm_model_updated_at
+            ON segments (updated_at, llm_model)
+            WHERE source = 'llm'
             """,
             f"""
             CREATE TABLE IF NOT EXISTS translation_metric_events (

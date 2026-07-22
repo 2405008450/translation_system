@@ -5,6 +5,7 @@ API 路由模块 - 文件上传、解析和导出接口
 """
 import asyncio
 from copy import deepcopy
+import hashlib
 import json
 import logging
 import re
@@ -47,6 +48,7 @@ from app.models import (
     FileAssignment,
     FileExportTask,
     FileRecord,
+    FileSegmentStats,
     GlossaryBase,
     IssueMarker,
     MemoryBase,
@@ -158,6 +160,7 @@ from app.services.file_record_service import (
     SEGMENT_ORDERING,
     SegmentUpdateConflict,
     _can_auto_merge_stale_segment,
+    apply_segment_status,
     backfill_file_record_source_html,
     batch_update_segments,
     calculate_file_record_progress,
@@ -173,10 +176,16 @@ from app.services.file_record_service import (
     list_file_records,
     list_segments_for_file_record,
     load_file_record_source,
+    refresh_segment_display_indexes,
     resolve_file_record_status,
     sync_file_record_status,
     update_segment_by_sentence_id,
     update_segment_source_text,
+)
+from app.services.english_variant_copy_service import (
+    EnglishVariantCopyError,
+    create_british_english_copy,
+    create_english_variant_copy,
 )
 from app.services.file_operation_lock_service import (
     FILE_OPERATION_LOCK_TIMEOUT_SECONDS,
@@ -292,12 +301,24 @@ from app.services.merge_view_service import (
     serialize_merge_view_summary,
 )
 from app.services.project_segment_sync import (
+    PretranslationLLMConvergenceSummary,
     ProjectSyncDisableSummary,
+    converge_pretranslation_llm_segments,
     disable_project_sync_for_segments,
     empty_project_segment_sync_summary,
     enable_project_sync_for_segments,
     run_project_sync_for_segment_ids,
     sync_project_repeated_segments_from_file,
+)
+from app.services.project_sync_outbox import (
+    enqueue_project_segment_sync,
+    run_project_sync_outbox_once,
+)
+from app.services.segment_events import (
+    create_async_subscriber_client,
+    publish_segment_changes,
+    segment_event_channel,
+    segment_events_available,
 )
 from app.services.term_importer import (
     TERM_IMPORT_EXTENSIONS,
@@ -643,28 +664,14 @@ async def _dispatch_auto_tm_rematch_background() -> None:
     await asyncio.to_thread(run_auto_tm_rematch_background_once)
 
 
-async def _dispatch_project_segment_sync(
-    file_record_id: UUID,
-    segment_ids: list[UUID],
-    current_user_id: UUID | None,
-) -> None:
-    """优先把项目重复句段同步投递到 arq worker，失败时后台线程兜底。"""
-    if not segment_ids:
-        return
+async def _dispatch_project_segment_sync(*_legacy_args: Any) -> None:
+    """通知 segment-sync worker 消费已提交的 outbox，失败时在线程中兜底。"""
     if await _enqueue_arq_job(
         "project_segment_sync_job",
-        str(file_record_id),
-        [str(segment_id) for segment_id in segment_ids],
-        str(current_user_id) if current_user_id else None,
         queue_name=ARQ_SEGMENT_SYNC_QUEUE_NAME,
     ):
         return
-    await asyncio.to_thread(
-        run_project_sync_for_segment_ids,
-        file_record_id,
-        segment_ids,
-        current_user_id,
-    )
+    await asyncio.to_thread(run_project_sync_outbox_once)
 
 
 async def _queue_import_task(
@@ -1348,16 +1355,20 @@ async def auto_tm_rematch_background_job(ctx) -> None:
 
 async def project_segment_sync_job(
     ctx,
-    file_record_id: str,
-    segment_ids: list[str],
+    file_record_id: str | None = None,
+    segment_ids: list[str] | None = None,
     current_user_id: str | None = None,
 ) -> None:
-    await asyncio.to_thread(
-        run_project_sync_for_segment_ids,
-        UUID(file_record_id),
-        [UUID(segment_id) for segment_id in segment_ids],
-        UUID(current_user_id) if current_user_id else None,
-    )
+    # 兼容部署前已进入 Redis 的旧格式任务；新任务统一消费 outbox。
+    if file_record_id and segment_ids:
+        await asyncio.to_thread(
+            run_project_sync_for_segment_ids,
+            UUID(file_record_id),
+            [UUID(segment_id) for segment_id in segment_ids],
+            UUID(current_user_id) if current_user_id else None,
+        )
+        return
+    await asyncio.to_thread(run_project_sync_outbox_once)
 
 
 async def _dispatch_pretranslation_run(run_id: UUID) -> None:
@@ -1529,6 +1540,7 @@ class SegmentReplaceRequest(BaseModel):
     source_filters: list[str] = Field(default_factory=list)
     source_content_filters: list[str] = Field(default_factory=list)
     workflow_step_ids: list[str] = Field(default_factory=list)
+    visible_sentence_ids: list[str] = Field(default_factory=list)
 
 
 class RevisionResolvePayload(BaseModel):
@@ -1587,7 +1599,8 @@ class GuidelineTemplateUpdateRequest(BaseModel):
 
 
 class RematchRequest(BaseModel):
-    collection_ids: list[UUID]
+    collection_ids: list[UUID] = Field(default_factory=list)
+    tm_scope_mode: Literal["selected", "language_pair_all"] = "selected"
     threshold: float = 0.75
     skip_confirmed: bool = True
     overwrite_fuzzy: bool = True
@@ -1603,12 +1616,14 @@ class FileRecordBindingsRequest(BaseModel):
     collection_id: UUID | None = None
     collection_ids: list[UUID] | None = None
     tm_match_threshold: float | None = None
+    tm_scope_mode: Literal["selected", "language_pair_all"] | None = None
 
 
 class PretranslationRunRequest(BaseModel):
     file_ids: list[UUID] = Field(default_factory=list)
     use_tm: bool = True
     tm_collection_ids: list[UUID] = Field(default_factory=list)
+    tm_scope_mode: Literal["selected", "language_pair_all"] = "selected"
     tm_threshold: float = 0.75
     tm_skip_confirmed: bool = True
     tm_overwrite_fuzzy: bool = True
@@ -1629,6 +1644,7 @@ class PretranslationRunRequest(BaseModel):
 class PretranslationMatchAnalysisPreviewRequest(BaseModel):
     file_ids: list[UUID] = Field(default_factory=list)
     tm_collection_ids: list[UUID] = Field(default_factory=list)
+    tm_scope_mode: Literal["selected", "language_pair_all"] = "selected"
     tm_threshold: float = Field(default=0.75, ge=0.5, le=1.0)
     tm_skip_confirmed: bool = True
 
@@ -1698,7 +1714,12 @@ def _serialize_pretranslation_task(task: PretranslationTask) -> dict[str, Any]:
     }
 
 
-def _refresh_pretranslation_run_status(db: Session, run: PretranslationRun) -> None:
+def _refresh_pretranslation_run_status(
+    db: Session,
+    run: PretranslationRun,
+    *,
+    finalize_if_terminal: bool = True,
+) -> None:
     tasks = (
         db.query(PretranslationTask)
         .filter(PretranslationTask.run_id == run.id)
@@ -1721,6 +1742,13 @@ def _refresh_pretranslation_run_status(db: Session, run: PretranslationRun) -> N
             run.started_at = _pretranslation_now()
         run.completed_at = None
         run.message = "预翻译正在后台执行"
+    elif not finalize_if_terminal:
+        if run.status not in PRETRANSLATION_TERMINAL_STATUSES:
+            # 文件任务结束后还有一次跨文件收敛；在收敛提交前不能提前对外宣告完成。
+            run.status = "running"
+            run.progress = min(run.progress, 99)
+            run.completed_at = None
+            run.message = "正在统一跨文件重复译文"
     else:
         if failed:
             run.status = "failed"
@@ -1784,7 +1812,7 @@ def _update_pretranslation_task(task_id: UUID, **values: Any) -> None:
             task.progress = 100
         run = db.query(PretranslationRun).filter(PretranslationRun.id == task.run_id).first()
         if run is not None:
-            _refresh_pretranslation_run_status(db, run)
+            _refresh_pretranslation_run_status(db, run, finalize_if_terminal=False)
         db.commit()
 
 
@@ -1833,10 +1861,17 @@ def _pretranslation_options_for_run(task_id: UUID) -> dict[str, Any]:
 
 def _run_pretranslation_binding_stage(task_id: UUID, options: dict[str, Any]) -> None:
     binding_payload: dict[str, Any] = {}
-    if options.get("use_tm") and options.get("tm_collection_ids"):
+    if options.get("use_tm"):
         collection_ids = [UUID(str(item)) for item in options.get("tm_collection_ids") or []]
-        binding_payload["collection_ids"] = collection_ids
-        binding_payload["collection_id"] = collection_ids[0] if collection_ids else None
+        scope_mode = options.get("tm_scope_mode", "selected")
+        binding_payload["tm_scope_mode"] = scope_mode
+        if scope_mode == "language_pair_all":
+            # 仅保留一个主写入库；检索本身按语言对覆盖全部库。
+            binding_payload["collection_ids"] = collection_ids[:1]
+            binding_payload["collection_id"] = collection_ids[0] if collection_ids else None
+        else:
+            binding_payload["collection_ids"] = collection_ids
+            binding_payload["collection_id"] = collection_ids[0] if collection_ids else None
         binding_payload["tm_match_threshold"] = options.get("tm_threshold", 0.75)
     if options.get("use_glossary"):
         binding_payload["glossary_base_ids"] = [
@@ -1879,7 +1914,8 @@ def _run_pretranslation_tm_stage(task_id: UUID, options: dict[str, Any]) -> None
     if not options.get("use_tm"):
         return
     collection_ids = [UUID(str(item)) for item in options.get("tm_collection_ids") or []]
-    if not collection_ids:
+    scope_mode = options.get("tm_scope_mode", "selected")
+    if scope_mode == "selected" and not collection_ids:
         return
 
     _update_pretranslation_task(
@@ -1898,14 +1934,25 @@ def _run_pretranslation_tm_stage(task_id: UUID, options: dict[str, Any]) -> None
         user = db.query(User).filter(User.id == task.run.created_by_id).first()
         if user is None:
             raise RuntimeError("预翻译发起用户不存在")
+        source_language, target_language = _resolve_file_record_language_pair(task.file_record)
+        _, matcher_collection_ids = _resolve_tm_scope_collection_ids(
+            db,
+            requested_collection_ids=collection_ids,
+            scope_mode=scope_mode,
+            source_language=source_language,
+            target_language=target_language,
+        )
         signature = build_tm_match_signature(
             db,
             file_record_id=task.file_record_id,
-            collection_ids=collection_ids,
+            collection_ids=matcher_collection_ids,
             threshold=float(options.get("tm_threshold") or 0.75),
             skip_confirmed=bool(options.get("tm_skip_confirmed", True)),
             overwrite_fuzzy=bool(options.get("tm_overwrite_fuzzy", True)),
             auto_confirm_exact=bool(options.get("tm_auto_confirm_exact", True)),
+            scope_mode=scope_mode,
+            source_language=source_language,
+            target_language=target_language,
         )
         if is_tm_match_signature_current(task.file_record, signature):
             _update_pretranslation_task(
@@ -1919,6 +1966,7 @@ def _run_pretranslation_tm_stage(task_id: UUID, options: dict[str, Any]) -> None
             task.file_record_id,
             RematchRequest(
                 collection_ids=collection_ids,
+                tm_scope_mode=scope_mode,
                 threshold=float(options.get("tm_threshold") or 0.75),
                 skip_confirmed=bool(options.get("tm_skip_confirmed", True)),
                 overwrite_fuzzy=bool(options.get("tm_overwrite_fuzzy", True)),
@@ -2210,6 +2258,52 @@ def _run_pretranslation_tasks_for_run(run_id: UUID, task_ids: list[UUID]) -> Non
                 )
 
 
+def _converge_pretranslation_run_llm_segments(
+    run_id: UUID,
+    task_ids: list[UUID],
+) -> PretranslationLLMConvergenceSummary:
+    summary = PretranslationLLMConvergenceSummary()
+    with SessionLocal() as db:
+        run = db.query(PretranslationRun).filter(PretranslationRun.id == run_id).first()
+        if run is None or not _load_pretranslation_options(run).get("use_llm"):
+            return summary
+
+        tasks = (
+            db.query(PretranslationTask)
+            .filter(
+                PretranslationTask.run_id == run_id,
+                PretranslationTask.id.in_(task_ids),
+            )
+            .all()
+        )
+        tasks_by_id = {task.id: task for task in tasks}
+        ordered_file_record_ids = [
+            tasks_by_id[task_id].file_record_id
+            for task_id in task_ids
+            if task_id in tasks_by_id and tasks_by_id[task_id].status == "completed"
+        ]
+        if len(ordered_file_record_ids) < 2:
+            return summary
+
+        current_user = (
+            db.query(User).filter(User.id == run.created_by_id).first()
+            if run.created_by_id is not None
+            else None
+        )
+        summary = converge_pretranslation_llm_segments(
+            db,
+            project_id=run.project_id,
+            ordered_file_record_ids=ordered_file_record_ids,
+            current_user=current_user,
+            updated_since=run.started_at,
+        )
+        db.commit()
+
+    if summary.affected_file_ids:
+        publish_segment_changes(summary.affected_file_ids)
+    return summary
+
+
 def _run_pretranslation_run(run_id: UUID) -> None:
     with SessionLocal() as db:
         run = db.query(PretranslationRun).filter(PretranslationRun.id == run_id).first()
@@ -2232,10 +2326,28 @@ def _run_pretranslation_run(run_id: UUID) -> None:
 
     _run_pretranslation_tasks_for_run(run_id, task_ids)
 
+    convergence_summary = PretranslationLLMConvergenceSummary()
+    convergence_error: Exception | None = None
+    try:
+        convergence_summary = _converge_pretranslation_run_llm_segments(run_id, task_ids)
+    except Exception as exc:  # noqa: BLE001
+        convergence_error = exc
+        logger.exception("pretranslation cross-file convergence failed run_id=%s", run_id)
+
     with SessionLocal() as db:
         run = db.query(PretranslationRun).filter(PretranslationRun.id == run_id).first()
         if run is not None:
             _refresh_pretranslation_run_status(db, run)
+            if convergence_error is not None:
+                run.status = "failed"
+                run.progress = 100
+                run.message = "预翻译文件处理已完成，但跨文件重复译文统一失败"
+                run.completed_at = run.completed_at or _pretranslation_now()
+            elif run.status == "completed" and convergence_summary.updated_count:
+                run.message = (
+                    "预翻译已完成，已统一 "
+                    f"{convergence_summary.updated_count} 条跨文件重复译文"
+                )
             db.commit()
 
 
@@ -2253,9 +2365,6 @@ def preview_pretranslation_match_analysis(
     if not file_ids:
         raise HTTPException(status_code=400, detail="请至少选择一个文件进行预估。")
 
-    selected_collection_ids = _require_selected_collection_ids(
-        _validate_collection_ids(db, payload.tm_collection_ids)
-    )
     threshold = round(float(payload.tm_threshold), 2)
     if threshold < 0.5 or threshold > 1:
         raise HTTPException(status_code=400, detail="TM 匹配阈值必须在 0.50 到 1.00 之间。")
@@ -2271,21 +2380,25 @@ def preview_pretranslation_match_analysis(
         raise HTTPException(status_code=404, detail="选择的文件不存在或不属于当前项目。")
 
     ordered_files = [files_by_id[file_id] for file_id in file_ids]
-    collections = (
-        db.query(MemoryBase)
-        .filter(MemoryBase.id.in_(selected_collection_ids))
-        .all()
-    )
     for file_record in ordered_files:
         _require_file_record_work_access(file_record, current_user)
         source_language, target_language = _resolve_file_record_language_pair(file_record)
-        for collection in collections:
-            _ensure_resource_language_pair_matches(collection, source_language, target_language, "记忆库")
+        _resolve_tm_scope_collection_ids(
+            db,
+            requested_collection_ids=payload.tm_collection_ids,
+            scope_mode=payload.tm_scope_mode,
+            source_language=source_language,
+            target_language=target_language,
+        )
 
     file_segments, skipped_confirmed = _load_pretranslation_match_analysis_segments_for_files(
         db,
         ordered_files,
-        collection_ids=selected_collection_ids,
+        collection_ids=(
+            None
+            if payload.tm_scope_mode == "language_pair_all"
+            else list(dict.fromkeys(payload.tm_collection_ids))
+        ),
         skip_confirmed=payload.tm_skip_confirmed,
     )
     analysis_by_file_id = compute_document_match_analysis(
@@ -2325,7 +2438,11 @@ async def create_pretranslation_run(
         raise HTTPException(status_code=400, detail="请至少选择一个文件进行预翻译。")
     if not (payload.use_tm or payload.use_glossary or payload.use_term_base or payload.use_llm):
         raise HTTPException(status_code=400, detail="请至少选择一种预翻译操作。")
-    if payload.use_tm and not payload.tm_collection_ids:
+    if (
+        payload.use_tm
+        and payload.tm_scope_mode == "selected"
+        and not payload.tm_collection_ids
+    ):
         raise HTTPException(status_code=400, detail="请选择用于预匹配的记忆库。")
     if payload.use_glossary and not payload.glossary_base_ids:
         raise HTTPException(status_code=400, detail="请选择用于 LLM 的词汇表。")
@@ -2344,6 +2461,15 @@ async def create_pretranslation_run(
     ordered_files = [files_by_id[file_id] for file_id in file_ids]
     for file_record in ordered_files:
         _require_file_record_work_access(file_record, current_user)
+        if payload.use_tm:
+            source_language, target_language = _resolve_file_record_language_pair(file_record)
+            _resolve_tm_scope_collection_ids(
+                db,
+                requested_collection_ids=payload.tm_collection_ids,
+                scope_mode=payload.tm_scope_mode,
+                source_language=source_language,
+                target_language=target_language,
+            )
 
     active_tasks = (
         db.query(PretranslationTask)
@@ -2424,7 +2550,7 @@ def get_pretranslation_run(
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在。")
     _require_project_read_access(project, current_user, db)
-    _refresh_pretranslation_run_status(db, run)
+    _refresh_pretranslation_run_status(db, run, finalize_if_terminal=False)
     db.commit()
     db.refresh(run)
     return _serialize_pretranslation_run(run)
@@ -2646,6 +2772,8 @@ class ProjectAssignmentEntryRequest(BaseModel):
 
 class ProjectAssignmentsRequest(BaseModel):
     assignments: list[ProjectAssignmentEntryRequest] = Field(default_factory=list)
+    base_revision: str | None = None
+    workflow_transition_mode: Literal["prompt", "advance", "assign_only"] = "prompt"
 
 
 class WorkflowStepRequest(BaseModel):
@@ -2979,7 +3107,7 @@ def _load_pretranslation_match_analysis_segments_for_files(
     db: Session,
     files: list[FileRecord],
     *,
-    collection_ids: list[UUID],
+    collection_ids: list[UUID] | None,
     skip_confirmed: bool,
 ) -> tuple[dict[UUID, list[DocumentMatchSegment]], dict[str, int]]:
     file_segments: dict[UUID, list[DocumentMatchSegment]] = {
@@ -2989,7 +3117,11 @@ def _load_pretranslation_match_analysis_segments_for_files(
     if not file_segments:
         return file_segments, skipped_confirmed
 
-    selected_collection_ids = tuple(dict.fromkeys(collection_ids))
+    selected_collection_ids = (
+        tuple(dict.fromkeys(collection_ids))
+        if collection_ids is not None
+        else None
+    )
     language_pair_by_file_id = {
         file_record.id: (file_record.source_language, file_record.target_language)
         for file_record in files
@@ -3023,7 +3155,12 @@ def _load_pretranslation_match_analysis_segments_for_files(
                 source_text=source_text or "",
                 display_text=display_text or "",
                 source_word_count=word_count,
-                collection_ids=selected_collection_ids,
+                collection_ids=selected_collection_ids or (),
+                tm_scope_mode=(
+                    "language_pair_all"
+                    if selected_collection_ids is None
+                    else "selected"
+                ),
                 source_language=source_language,
                 target_language=target_language,
             )
@@ -3569,28 +3706,40 @@ def _apply_segment_assignment_visibility_filter(
     if not visible_assignments:
         return query.filter(literal(False))
 
-    ordered_segments = (
-        db.query(
-            Segment.id.label("id"),
-            Segment.workflow_step_id.label("workflow_step_id"),
-            func.row_number()
-            .over(
-                order_by=get_segment_ordering_for_file_record(file_record)
-            )
-            .label("display_index"),
-        )
-        .filter(Segment.file_record_id == file_record.id)
-        .subquery()
-    )
+    if _file_has_unindexed_display_segments(db, file_record.id):
+        refresh_segment_display_indexes(db, file_record)
+
+    # 流程阶段限制的是编辑权，而不是审阅上下文的读取权。后续阶段的译者需要
+    # 看到当前阶段及之前阶段的内容，否则在管理员尚未执行流程流转时，任务页会
+    # 返回 0 个句段并呈现空白。编辑接口仍通过
+    # ``_can_write_segment_with_assignments`` 严格校验为“当前阶段完全匹配”。
+    workflow_steps = _load_project_workflow_steps(db, file_record.project_id)
+    workflow_step_by_id = {step.id: step for step in workflow_steps}
+    first_step_id = workflow_steps[0].id if workflow_steps else None
 
     visibility_conditions = []
     for assignment in visible_assignments:
-        condition = ordered_segments.c.workflow_step_id == assignment.workflow_step_id
+        assigned_step = workflow_step_by_id.get(assignment.workflow_step_id)
+        if assigned_step is None:
+            readable_step_ids = [assignment.workflow_step_id]
+        else:
+            assigned_order = int(assigned_step.sort_order or 0)
+            readable_step_ids = [
+                step.id
+                for step in workflow_steps
+                if int(step.sort_order or 0) <= assigned_order
+            ]
+
+        step_condition = Segment.workflow_step_id.in_(readable_step_ids)
+        if first_step_id in readable_step_ids:
+            # 兼容尚未完成历史数据回填的句段；正常详情接口会先将其归到首阶段。
+            step_condition = or_(step_condition, Segment.workflow_step_id.is_(None))
+        condition = step_condition
         if assignment.range_start is not None and assignment.range_end is not None:
             condition = and_(
                 condition,
-                ordered_segments.c.display_index >= assignment.range_start,
-                ordered_segments.c.display_index <= assignment.range_end,
+                Segment.display_index >= assignment.range_start - 1,
+                Segment.display_index <= assignment.range_end - 1,
             )
         elif assignment.range_start is not None or assignment.range_end is not None:
             continue
@@ -3598,8 +3747,7 @@ def _apply_segment_assignment_visibility_filter(
 
     if not visibility_conditions:
         return query.filter(literal(False))
-    visible_segment_ids = db.query(ordered_segments.c.id).filter(or_(*visibility_conditions))
-    return query.filter(Segment.id.in_(visible_segment_ids))
+    return query.filter(or_(*visibility_conditions))
 
 
 def _has_active_file_assignment_for_step(
@@ -4152,7 +4300,7 @@ def _validate_assignment_payload(
             ranges_by_file_step.setdefault((workflow_step_id, file_record_id), []).append(
                 (assignee_id, range_start, range_end)
             )
-    for range_items in ranges_by_file_step.values():
+    for (workflow_step_id, file_record_id), range_items in ranges_by_file_step.items():
         sorted_items = sorted(range_items, key=lambda item: (str(item[0]), item[1] or 0, item[2] or 0))
         for index, current in enumerate(sorted_items):
             for other in sorted_items[index + 1:]:
@@ -4163,8 +4311,29 @@ def _validate_assignment_payload(
                     )
                 if _assignment_ranges_overlap(current[1], current[2], other[1], other[2]):
                     raise HTTPException(
-                        status_code=400,
-                        detail="同一文件同一流程阶段的句段范围不能重叠。",
+                        status_code=409,
+                        detail={
+                            "code": "assignment_conflict",
+                            "message": "同一文件同一流程阶段的句段范围不能重叠。",
+                            "conflicts": [
+                                {
+                                    "file_record_id": str(file_record_id),
+                                    "workflow_step_id": str(workflow_step_id),
+                                    "allocations": [
+                                        {
+                                            "assignee_id": str(current[0]),
+                                            "range_start": current[1],
+                                            "range_end": current[2],
+                                        },
+                                        {
+                                            "assignee_id": str(other[0]),
+                                            "range_start": other[1],
+                                            "range_end": other[2],
+                                        },
+                                    ],
+                                }
+                            ],
+                        },
                     )
     return desired, desired_user_ids
 
@@ -4189,6 +4358,198 @@ def _sync_legacy_file_assignees(db: Session, project_id: UUID) -> None:
         file_record.assignee_id = first_assignment.assignee_id if first_assignment else None
         file_record.assigned_by_id = first_assignment.assigned_by_id if first_assignment else None
         file_record.assigned_at = first_assignment.assigned_at if first_assignment else None
+
+
+def _calculate_project_assignment_revision(db: Session, project_id: UUID) -> str:
+    """根据当前有效的项目成员与文件授权生成稳定版本号。"""
+    member_ids = sorted(
+        str(row.assignee_id)
+        for row in (
+            db.query(ProjectAssignment.assignee_id)
+            .filter(
+                ProjectAssignment.project_id == project_id,
+                ProjectAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            )
+            .all()
+        )
+    )
+    allocations = sorted(
+        (
+            str(row.assignee_id),
+            str(row.workflow_step_id) if row.workflow_step_id else "",
+            str(row.file_record_id),
+            row.segment_range_start,
+            row.segment_range_end,
+        )
+        for row in (
+            db.query(FileAssignment)
+            .filter(
+                FileAssignment.project_id == project_id,
+                FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            )
+            .all()
+        )
+    )
+    canonical_payload = json.dumps(
+        {"members": member_ids, "allocations": allocations},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+
+
+def _assignment_transition_range_condition(
+    ranges: list[tuple[int | None, int | None]],
+):
+    if any(range_start is None and range_end is None for range_start, range_end in ranges):
+        return None
+    conditions = [
+        and_(
+            Segment.display_index >= int(range_start) - 1,
+            Segment.display_index <= int(range_end) - 1,
+        )
+        for range_start, range_end in ranges
+        if range_start is not None and range_end is not None
+    ]
+    return or_(*conditions) if conditions else literal(False)
+
+
+def _build_assignment_workflow_transition_preview(
+    db: Session,
+    project: Project,
+    desired: dict[tuple[UUID, UUID], set[AssignmentTarget]],
+) -> list[dict[str, Any]]:
+    """找出派稿目标阶段之前、可一键推进的句段。
+
+    只允许从紧邻的上一阶段推进，避免把“翻译”静默跨级推进到“终审”。
+    同一文件、同一目标阶段下的多人分段授权会合并成一个范围并集。
+    """
+    workflow_steps = _load_project_workflow_steps(db, project.id)
+    workflow_step_index = {step.id: index for index, step in enumerate(workflow_steps)}
+    first_step_id = workflow_steps[0].id if workflow_steps else None
+    existing_targets = {
+        (
+            assignment.assignee_id,
+            assignment.workflow_step_id or first_step_id,
+            assignment.file_record_id,
+            assignment.segment_range_start,
+            assignment.segment_range_end,
+        )
+        for assignment in (
+            db.query(FileAssignment)
+            .filter(
+                FileAssignment.project_id == project.id,
+                FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            )
+            .all()
+        )
+    }
+    targets_by_file_step: dict[tuple[UUID, UUID], set[tuple[int | None, int | None]]] = {}
+    for (assignee_id, workflow_step_id), targets in desired.items():
+        for file_record_id, range_start, range_end in targets:
+            if (
+                assignee_id,
+                workflow_step_id,
+                file_record_id,
+                range_start,
+                range_end,
+            ) in existing_targets:
+                continue
+            targets_by_file_step.setdefault((file_record_id, workflow_step_id), set()).add(
+                (range_start, range_end)
+            )
+
+    file_ids = sorted({file_id for file_id, _ in targets_by_file_step}, key=str)
+    files_by_id = {
+        file_record.id: file_record
+        for file_record in (
+            db.query(FileRecord)
+            .filter(FileRecord.project_id == project.id, FileRecord.id.in_(file_ids))
+            .all()
+            if file_ids
+            else []
+        )
+    }
+    preview: list[dict[str, Any]] = []
+    for (file_record_id, target_step_id), raw_ranges in sorted(
+        targets_by_file_step.items(),
+        key=lambda item: (str(item[0][0]), str(item[0][1])),
+    ):
+        target_index = workflow_step_index.get(target_step_id)
+        if target_index is None or target_index <= 0:
+            continue
+        file_record = files_by_id.get(file_record_id)
+        if file_record is None:
+            continue
+        from_step = workflow_steps[target_index - 1]
+        target_step = workflow_steps[target_index]
+        ranges = sorted(
+            raw_ranges,
+            key=lambda item: (
+                item[0] is not None,
+                item[0] if item[0] is not None else 0,
+                item[1] if item[1] is not None else 0,
+            ),
+        )
+        if not any(range_start is None and range_end is None for range_start, range_end in ranges):
+            if _file_has_unindexed_display_segments(db, file_record_id):
+                refresh_segment_display_indexes(db, file_record)
+        query = db.query(Segment.id).filter(
+            Segment.file_record_id == file_record_id,
+            Segment.workflow_step_id == from_step.id,
+        )
+        range_condition = _assignment_transition_range_condition(ranges)
+        if range_condition is not None:
+            query = query.filter(range_condition)
+        matched_count = int(query.count() or 0)
+        if matched_count <= 0:
+            continue
+        preview.append({
+            "file_record_id": str(file_record_id),
+            "filename": file_record.filename,
+            "from_step": _serialize_workflow_step(from_step),
+            "target_step": _serialize_workflow_step(target_step),
+            "ranges": [
+                {"range_start": range_start, "range_end": range_end}
+                for range_start, range_end in ranges
+            ],
+            "matched_count": matched_count,
+        })
+    return preview
+
+
+def _advance_assignment_workflow_transitions(
+    db: Session,
+    preview: list[dict[str, Any]],
+    current_user: User,
+) -> int:
+    updated_count = 0
+    changed_file_ids: set[UUID] = set()
+    for item in preview:
+        file_record_id = UUID(str(item["file_record_id"]))
+        from_step_id = UUID(str(item["from_step"]["id"]))
+        target_step_id = UUID(str(item["target_step"]["id"]))
+        ranges = [
+            (range_item.get("range_start"), range_item.get("range_end"))
+            for range_item in item.get("ranges", [])
+        ]
+        query = db.query(Segment).filter(
+            Segment.file_record_id == file_record_id,
+            Segment.workflow_step_id == from_step_id,
+        )
+        range_condition = _assignment_transition_range_condition(ranges)
+        if range_condition is not None:
+            query = query.filter(range_condition)
+        for segment in query.all():
+            segment.workflow_step_id = target_step_id
+            apply_segment_status(segment, _resolve_unconfirmed_segment_status(segment))
+            segment.last_modified_by_id = current_user.id
+            segment.version = int(segment.version or 1) + 1
+            updated_count += 1
+            changed_file_ids.add(file_record_id)
+    for file_record_id in changed_file_ids:
+        sync_file_record_status(db, file_record_id)
+    return updated_count
 
 
 def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, Any]:
@@ -4273,6 +4634,7 @@ def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, A
         "project_id": str(project_id),
         "workflow_steps": [_serialize_workflow_step(step) for step in workflow_steps],
         "assignments": assignment_items,
+        "revision": _calculate_project_assignment_revision(db, project_id),
     }
 
 
@@ -4284,7 +4646,40 @@ def _update_project_assignments_by_workflow(
     payload: ProjectAssignmentsRequest,
     current_user: User,
 ) -> dict[str, Any]:
+    # 串行化同一项目的分配写入，避免两个管理员同时基于同一版本保存时都通过校验。
+    db.query(Project.id).filter(Project.id == project_id).with_for_update().one()
+    current_revision = _calculate_project_assignment_revision(db, project_id)
+    if payload.base_revision and payload.base_revision != current_revision:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "assignment_state_changed",
+                "message": "任务分配已被其他管理员更新，请重新加载后再保存。",
+                "current_revision": current_revision,
+            },
+        )
     desired, desired_user_ids = _validate_assignment_payload(db, project, payload)
+    workflow_transition_preview = _build_assignment_workflow_transition_preview(db, project, desired)
+    workflow_transition_count = sum(
+        int(item.get("matched_count") or 0)
+        for item in workflow_transition_preview
+    )
+    workflow_transition_file_count = len({
+        str(item.get("file_record_id") or "")
+        for item in workflow_transition_preview
+        if item.get("file_record_id")
+    })
+    if payload.workflow_transition_mode == "prompt" and workflow_transition_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workflow_transition_required",
+                "message": "部分句段尚未进入本次派稿的目标流程阶段，请选择是否立即推进。",
+                "file_count": workflow_transition_file_count,
+                "matched_count": workflow_transition_count,
+                "transitions": workflow_transition_preview,
+            },
+        )
     now = datetime.now()
     workflow_steps = _load_project_workflow_steps(db, project_id)
     first_step_id = workflow_steps[0].id if workflow_steps else None
@@ -4445,8 +4840,23 @@ def _update_project_assignments_by_workflow(
             )
 
     _sync_legacy_file_assignees(db, project_id)
+    workflow_transition_updated_count = 0
+    if payload.workflow_transition_mode == "advance" and workflow_transition_preview:
+        workflow_transition_updated_count = _advance_assignment_workflow_transitions(
+            db,
+            workflow_transition_preview,
+            current_user,
+        )
     db.commit()
-    return _serialize_project_assignments(db, project_id)
+    response = _serialize_project_assignments(db, project_id)
+    response["workflow_transition"] = {
+        "mode": payload.workflow_transition_mode,
+        "file_count": workflow_transition_file_count,
+        "matched_count": workflow_transition_count,
+        "updated_count": workflow_transition_updated_count,
+        "transitions": workflow_transition_preview,
+    }
+    return response
 
 
 @router.get("/analytics/dashboard")
@@ -5299,6 +5709,59 @@ def _require_selected_collection_ids(
     return collection_ids
 
 
+def _resolve_tm_scope_collection_ids(
+    db: Session,
+    *,
+    requested_collection_ids: list[UUID] | None,
+    scope_mode: str,
+    source_language: str,
+    target_language: str,
+) -> tuple[list[UUID], list[UUID] | None]:
+    """返回（已校验的显式库 ID、传给 matcher 的范围）。
+
+    language_pair_all 用 None 表示不生成 collection_id IN (...)，仅依靠语言对过滤。
+    """
+    if scope_mode == "language_pair_all":
+        exists = (
+            db.query(MemoryBase.id)
+            .filter(
+                MemoryBase.source_language == source_language,
+                MemoryBase.target_language == target_language,
+            )
+            .first()
+        )
+        if exists is None:
+            raise HTTPException(status_code=400, detail="当前语言对没有可用的 TM 记忆库。")
+        explicit_ids = _validate_collection_ids(db, requested_collection_ids) or []
+        if explicit_ids:
+            collections = db.query(MemoryBase).filter(MemoryBase.id.in_(explicit_ids)).all()
+            for collection in collections:
+                _ensure_resource_language_pair_matches(
+                    collection,
+                    source_language,
+                    target_language,
+                    "记忆库",
+                )
+        return explicit_ids, None
+
+    explicit_ids = _require_selected_collection_ids(
+        _validate_collection_ids(db, requested_collection_ids)
+    )
+    collections = (
+        db.query(MemoryBase)
+        .filter(MemoryBase.id.in_(explicit_ids))
+        .all()
+    )
+    for collection in collections:
+        _ensure_resource_language_pair_matches(
+            collection,
+            source_language,
+            target_language,
+            "记忆库",
+        )
+    return explicit_ids, explicit_ids
+
+
 def _resolve_upload_language_pair(
     source_language: str | None,
     target_language: str | None,
@@ -5474,7 +5937,7 @@ def _filter_tm_collection(
     return query
 
 
-def _serialize_tm_collection(collection: MemoryBase, entry_count: int = 0) -> dict:
+def _serialize_tm_collection(collection: MemoryBase, entry_count: int | None = None) -> dict:
     return {
         "id": collection.id,
         "name": collection.name,
@@ -5485,7 +5948,11 @@ def _serialize_tm_collection(collection: MemoryBase, entry_count: int = 0) -> di
         "creator_name": _entry_user_name(collection.creator),
         "created_at": collection.created_at.isoformat(),
         "updated_at": collection.updated_at.isoformat(),
-        "entry_count": entry_count,
+        "entry_count": int(
+            getattr(collection, "entry_count", 0)
+            if entry_count is None
+            else entry_count
+        ),
     }
 
 
@@ -6233,6 +6700,7 @@ def _build_project_file_payload(
         "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
         "collection_ids": [str(collection_id) for collection_id in collection_ids],
         "tm_match_threshold": _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
+        "tm_scope_mode": getattr(file_record, "tm_scope_mode", "selected"),
         "term_base_id": file_record.term_base_id,
         "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
         "term_base_write_ids": [str(term_base_id) for term_base_id in term_base_write_ids],
@@ -6402,19 +6870,6 @@ def _serialize_project_term_base_settings(
 ) -> dict[str, Any]:
     pair_map = _project_file_language_pair_map(files)
     term_bases = db.query(TermBase).order_by(TermBase.name.asc(), TermBase.created_at.desc()).all()
-    term_base_ids = [term_base.id for term_base in term_bases]
-    entry_counts: dict[UUID, int] = {}
-    if term_base_ids:
-        entry_counts = {
-            term_base_id: int(entry_count or 0)
-            for term_base_id, entry_count in (
-                db.query(TermEntry.term_base_id, func.count(TermEntry.id))
-                .filter(TermEntry.term_base_id.in_(term_base_ids))
-                .group_by(TermEntry.term_base_id)
-                .all()
-            )
-        }
-
     groups: list[dict[str, Any]] = []
     for source_language, target_language in sorted(pair_map):
         group_files = pair_map[(source_language, target_language)]
@@ -6461,7 +6916,7 @@ def _serialize_project_term_base_settings(
                     "description": term_base.description,
                     "source_language": term_base.source_language,
                     "target_language": term_base.target_language,
-                    "entry_count": entry_counts.get(term_base.id, 0),
+                    "entry_count": int(term_base.entry_count or 0),
                     "enabled": term_base.id in enabled_set,
                     "writable": term_base.id in writable_set,
                     "qa": term_base.id in qa_set,
@@ -6484,19 +6939,6 @@ def _serialize_project_translation_memory_settings(
 ) -> dict[str, Any]:
     pair_map = _project_file_language_pair_map(files)
     collections = db.query(MemoryBase).order_by(MemoryBase.name.asc(), MemoryBase.created_at.desc()).all()
-    collection_ids = [collection.id for collection in collections]
-    entry_counts: dict[UUID, int] = {}
-    if collection_ids:
-        entry_counts = {
-            collection_id: int(entry_count or 0)
-            for collection_id, entry_count in (
-                db.query(MemoryEntry.collection_id, func.count(MemoryEntry.id))
-                .filter(MemoryEntry.collection_id.in_(collection_ids))
-                .group_by(MemoryEntry.collection_id)
-                .all()
-            )
-        }
-
     groups: list[dict[str, Any]] = []
     for source_language, target_language in sorted(pair_map):
         group_files = pair_map[(source_language, target_language)]
@@ -6516,7 +6958,7 @@ def _serialize_project_translation_memory_settings(
                     "description": collection.description,
                     "source_language": collection.source_language,
                     "target_language": collection.target_language,
-                    "entry_count": entry_counts.get(collection.id, 0),
+                    "entry_count": int(collection.entry_count or 0),
                 }
                 for collection in group_collections
             ],
@@ -6532,6 +6974,7 @@ def _serialize_project_translation_memory_settings(
                     "tm_match_threshold": _normalize_tm_match_threshold(
                         getattr(file_record, "tm_match_threshold", None),
                     ),
+                    "tm_scope_mode": getattr(file_record, "tm_scope_mode", "selected"),
                 }
                 for file_record in group_files
             ],
@@ -7914,14 +8357,17 @@ def update_project_translation_memory_settings(
                 tuple(_load_file_record_collection_ids(file_record)),
                 file_record.collection_id,
                 _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
+                getattr(file_record, "tm_scope_mode", "selected"),
             )
             _store_file_record_collection_ids(file_record, selected_ids)
             file_record.collection_id = primary_collection_id
             file_record.tm_match_threshold = next_threshold
+            file_record.tm_scope_mode = "selected"
             after = (
                 tuple(_load_file_record_collection_ids(file_record)),
                 file_record.collection_id,
                 _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
+                getattr(file_record, "tm_scope_mode", "selected"),
             )
             if before != after:
                 changed_files.append(file_record)
@@ -8729,7 +9175,7 @@ def compute_project_document_statistics(
     for file_record in files:
         source_bytes = load_file_record_source(file_record)
         source_filename = get_file_record_source_filename(file_record)
-        if source_bytes and Path(source_filename).suffix.lower() in {".doc", ".docx", ".pptx"}:
+        if source_bytes and Path(source_filename).suffix.lower() in SUPPORTED_EXTENSIONS:
             statistics = compute_document_statistics(source_bytes, source_filename)
         else:
             statistics = unavailable_statistics
@@ -9674,28 +10120,13 @@ def _schedule_auto_tm_processing(
         background_tasks.add_task(_dispatch_auto_tm_background)
 
 
-def _schedule_project_segment_sync_for_segments(
+def _schedule_project_segment_sync_processing(
     background_tasks: BackgroundTasks | None,
-    file_record: FileRecord,
-    segments: Iterable[Segment],
-    current_user: User | None,
+    queued_count: int,
 ) -> None:
-    if background_tasks is None:
+    if background_tasks is None or queued_count <= 0:
         return
-    segment_ids = [
-        segment.id
-        for segment in segments
-        if normalize_text(getattr(segment, "target_text", "") or "")
-        and not getattr(segment, "project_sync_disabled", False)
-    ]
-    if not segment_ids:
-        return
-    background_tasks.add_task(
-        _dispatch_project_segment_sync,
-        file_record.id,
-        list(dict.fromkeys(segment_ids)),
-        current_user.id if current_user else None,
-    )
+    background_tasks.add_task(_dispatch_project_segment_sync)
 
 
 def _notify_tm_collections_changed(
@@ -9721,6 +10152,8 @@ def _resolve_unconfirmed_segment_status(segment: Segment) -> str:
 def _apply_segment_scope_filter(query, scope: str):
     normalized_scope = (scope or "all").strip().lower()
     status_conditions = segment_effective_status_conditions(Segment)
+    if normalized_scope == "project_sync_only":
+        return query.filter(status_conditions["project_sync"])
     if normalized_scope == "exact_only":
         return query.filter(status_conditions["exact"])
     if normalized_scope == "fuzzy_only":
@@ -9729,6 +10162,11 @@ def _apply_segment_scope_filter(query, scope: str):
         return query.filter(status_conditions["none"])
     if normalized_scope == "confirmed_only":
         return query.filter(status_conditions["confirmed"])
+    if normalized_scope == "pending_confirmation":
+        return query.filter(
+            ~status_conditions["confirmed"],
+            func.coalesce(Segment.target_text, "") != "",
+        )
     if normalized_scope == "empty_target":
         return query.filter(func.coalesce(Segment.target_text, "") == "")
     return query
@@ -10041,6 +10479,15 @@ def _order_segment_query(query, file_record: FileRecord | None = None):
     return query.order_by(*get_segment_ordering_for_file_record(file_record))
 
 
+def _file_has_unindexed_display_segments(db: Session, file_record_id: UUID) -> bool:
+    return (
+        db.query(Segment.id)
+        .filter(Segment.file_record_id == file_record_id, Segment.display_index < 0)
+        .first()
+        is not None
+    )
+
+
 def _get_segment_display_index_map(
     db: Session,
     file_record_id: UUID,
@@ -10050,25 +10497,32 @@ def _get_segment_display_index_map(
     if not segment_ids:
         return {}
 
-    file_record = get_file_record_model(db, file_record_id)
-    ordered_segments = (
-        db.query(
-            Segment.id.label("id"),
-            func.row_number()
-            .over(
-                order_by=get_segment_ordering_for_file_record(file_record)
-            )
-            .label("display_index"),
+    # 常规路径：直接读持久化 display_index，避免全文件 row_number()。
+    def _resolved_index(value) -> int:
+        return int(value) if value is not None else -1
+
+    inline_indexes = {
+        segment.id: _resolved_index(getattr(segment, "display_index", None))
+        for segment in segments
+    }
+    if all(value >= 0 for value in inline_indexes.values()):
+        return inline_indexes
+
+    # with_entities() 产生的部分行可能未携带 display_index，先按当前页 ID 补查；
+    # 只有数据库里确实存在 -1 时才刷新整个文件。
+    def _load_rows():
+        return (
+            db.query(Segment.id, Segment.display_index)
+            .filter(Segment.id.in_(segment_ids))
+            .all()
         )
-        .filter(Segment.file_record_id == file_record_id)
-        .subquery()
-    )
-    rows = (
-        db.query(ordered_segments.c.id, ordered_segments.c.display_index)
-        .filter(ordered_segments.c.id.in_(segment_ids))
-        .all()
-    )
-    return {row.id: int(row.display_index) - 1 for row in rows}
+
+    rows = _load_rows()
+    if any(_resolved_index(row.display_index) < 0 for row in rows):
+        file_record = get_file_record_model(db, file_record_id)
+        refresh_segment_display_indexes(db, file_record)
+        rows = _load_rows()
+    return {row.id: _resolved_index(row.display_index) for row in rows if _resolved_index(row.display_index) >= 0}
 
 
 def _apply_segment_display_range_filter(
@@ -10088,25 +10542,14 @@ def _apply_segment_display_range_filter(
     if start > end:
         raise HTTPException(status_code=400, detail="句段范围起始值不能大于结束值。")
 
-    file_record = get_file_record_model(db, file_record_id)
-    ordered_segments = (
-        db.query(
-            Segment.id.label("id"),
-            func.row_number()
-            .over(
-                order_by=get_segment_ordering_for_file_record(file_record)
-            )
-            .label("display_index"),
-        )
-        .filter(Segment.file_record_id == file_record_id)
-        .subquery()
-    )
-    return (
-        query.join(ordered_segments, ordered_segments.c.id == Segment.id)
-        .filter(
-            ordered_segments.c.display_index >= start,
-            ordered_segments.c.display_index <= end,
-        )
+    # 持久化 display_index 存在未回填句段时先刷新，保证范围过滤准确。
+    if _file_has_unindexed_display_segments(db, file_record_id):
+        file_record = get_file_record_model(db, file_record_id)
+        refresh_segment_display_indexes(db, file_record)
+    # 入参为 1 起的显示序号；持久化 display_index 为 0 起。
+    return query.filter(
+        Segment.display_index >= start - 1,
+        Segment.display_index <= end - 1,
     )
 
 
@@ -10124,6 +10567,54 @@ def _generate_split_sentence_id(original_id: str, db: Session, file_record_id: U
         if not exists:
             return candidate
         suffix += 1
+
+
+def _load_segments_for_structure_change(
+    db: Session,
+    file_record: FileRecord,
+) -> list[Segment]:
+    """锁定并按文档权威顺序读取句段，供拆分、合并等结构操作使用。"""
+    return (
+        db.query(Segment)
+        .filter(Segment.file_record_id == file_record.id)
+        .order_by(*get_segment_ordering_for_file_record(file_record))
+        .with_for_update()
+        .all()
+    )
+
+
+def _renumber_ordered_segment_sequences(
+    ordered_segments: list[Segment],
+    *,
+    excluded_segment_id: UUID | None = None,
+) -> dict[UUID, int]:
+    """按当前文档顺序重建连续 sequence_index，并返回保留句段的位置。"""
+    positions: dict[UUID, int] = {}
+    next_sequence_index = 0
+    for item in ordered_segments:
+        if excluded_segment_id is not None and item.id == excluded_segment_id:
+            continue
+        item.sequence_index = next_sequence_index
+        positions[item.id] = next_sequence_index
+        next_sequence_index += 1
+    return positions
+
+
+def _reserve_sequence_slot_after_segment(
+    ordered_segments: list[Segment],
+    segment_id: UUID,
+) -> int:
+    """为拆分出的后半句预留紧邻原句的顺序位。"""
+    positions = _renumber_ordered_segment_sequences(ordered_segments)
+    current_sequence_index = positions.get(segment_id)
+    if current_sequence_index is None:
+        raise HTTPException(status_code=404, detail="片段不存在。")
+
+    new_sequence_index = current_sequence_index + 1
+    for item in ordered_segments:
+        if item.sequence_index >= new_sequence_index:
+            item.sequence_index += 1
+    return new_sequence_index
 
 
 def _is_cjk_text(text: str) -> bool:
@@ -10152,6 +10643,22 @@ def _build_preview_render_segments(
 
 
 def _get_segment_status_stats(db: Session, file_record_id: UUID) -> dict[str, int]:
+    # 优先读触发器维护的文件级统计表（见迁移 0017），避免整文件实时聚合。
+    stats = (
+        db.query(FileSegmentStats)
+        .filter(FileSegmentStats.file_record_id == file_record_id)
+        .first()
+    )
+    if stats is not None:
+        return {
+            "total": int(stats.total or 0),
+            "project_sync": int(stats.project_sync_count or 0),
+            "exact": int(stats.exact_count or 0),
+            "fuzzy": int(stats.fuzzy_count or 0),
+            "none": int(stats.none_count or 0),
+            "confirmed": int(stats.confirmed_count or 0),
+            "empty_target": int(stats.empty_target_count or 0),
+        }
     return _get_segment_status_stats_for_query(
         db.query(Segment).filter(Segment.file_record_id == file_record_id)
     )
@@ -10163,6 +10670,7 @@ def _get_segment_status_stats_for_query(query) -> dict[str, int]:
     row = (
         query.with_entities(
             func.count(Segment.id).label("total"),
+            func.coalesce(func.sum(case((status_conditions["project_sync"], 1), else_=0)), 0).label("project_sync"),
             func.coalesce(func.sum(case((status_conditions["exact"], 1), else_=0)), 0).label("exact"),
             func.coalesce(func.sum(case((status_conditions["fuzzy"], 1), else_=0)), 0).label("fuzzy"),
             func.coalesce(func.sum(case((status_conditions["none"], 1), else_=0)), 0).label("none"),
@@ -10173,6 +10681,7 @@ def _get_segment_status_stats_for_query(query) -> dict[str, int]:
     )
     return {
         "total": int(row.total or 0),
+        "project_sync": int(row.project_sync or 0),
         "exact": int(row.exact or 0),
         "fuzzy": int(row.fuzzy or 0),
         "none": int(row.none or 0),
@@ -10286,24 +10795,12 @@ def _apply_workflow_transition_filters(
         range_end = payload.range_end if payload.range_end is not None else payload.range_start
         if payload.range_start > range_end:
             raise HTTPException(status_code=400, detail="句段范围起始值不能大于结束值。")
-        ordered_segments = (
-            db.query(
-                Segment.id.label("id"),
-                func.row_number()
-                .over(
-                    order_by=get_segment_ordering_for_file_record(file_record)
-                )
-                .label("display_index"),
-            )
-            .filter(Segment.file_record_id == file_record_id)
-            .subquery()
-        )
-        query = (
-            query.join(ordered_segments, ordered_segments.c.id == Segment.id)
-            .filter(
-                ordered_segments.c.display_index >= payload.range_start,
-                ordered_segments.c.display_index <= range_end,
-            )
+        if _file_has_unindexed_display_segments(db, file_record_id):
+            refresh_segment_display_indexes(db, file_record)
+        # 入参为 1 起的显示序号；持久化 display_index 为 0 起。
+        query = query.filter(
+            Segment.display_index >= payload.range_start - 1,
+            Segment.display_index <= range_end - 1,
         )
     return query
 
@@ -10383,7 +10880,7 @@ def transition_file_record_workflow(
         next_status = "confirmed" if payload.target_status == "confirmed" else _resolve_unconfirmed_segment_status(segment)
         if segment.workflow_step_id != target_step.id or segment.status != next_status:
             segment.workflow_step_id = target_step.id
-            segment.status = next_status
+            apply_segment_status(segment, next_status)
             segment.last_modified_by_id = current_user.id
             segment.version = int(segment.version or 1) + 1
             updated_count += 1
@@ -10554,6 +11051,7 @@ def get_file_record(
         "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
         "collection_ids": [str(collection_id) for collection_id in collection_ids],
         "tm_match_threshold": _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
+        "tm_scope_mode": getattr(file_record, "tm_scope_mode", "selected"),
         "collection_name": collection_name,
         "term_base_id": file_record.term_base_id,
         "term_base_name": term_base_name,
@@ -10771,7 +11269,12 @@ def get_file_record_segments(
         "file_record_id": str(file_record_id),
         "total_segments": total_segments,
         "matched_segments": matched_segments,
-        "status_stats": _get_segment_status_stats_for_query(base_query) if include_stats else None,
+        "status_stats": (
+            _get_segment_status_stats(db, file_record_id)
+            if include_stats and can_access_all_projects(current_user)
+            else (_get_segment_status_stats_for_query(base_query) if include_stats else None)
+        ),
+        "workflow_progress": _get_file_workflow_progress(db, [file_record_id]).get(file_record_id, []),
         "skip": safe_skip,
         "limit": safe_limit,
         "filters": {
@@ -10836,6 +11339,78 @@ def _get_latest_segment_change_cursor(query) -> str:
     return _format_segment_change_cursor(segment)
 
 
+async def _close_async_redis_resource(resource) -> None:
+    if resource is None:
+        return
+    close = getattr(resource, "aclose", None) or getattr(resource, "close", None)
+    if close is None:
+        return
+    result = close()
+    if asyncio.iscoroutine(result):
+        await result
+
+
+@router.get("/file-records/{file_record_id}/segments/events")
+async def stream_file_record_segment_events(
+    file_record_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """推送文件级变更通知；客户端收到后再调用 changes 接口拉增量数据。"""
+    file_record = get_file_record_model(db, file_record_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="文件不存在。")
+    _require_file_record_read_access(file_record, current_user)
+
+    # SSE 生命周期很长；鉴权完成后立即释放 SQLAlchemy/PgBouncer 后端连接。
+    db.rollback()
+    if not segment_events_available():
+        raise HTTPException(status_code=503, detail="句段事件流暂不可用，请使用轮询。")
+
+    redis_client = create_async_subscriber_client()
+    if redis_client is None:
+        raise HTTPException(status_code=503, detail="句段事件流暂不可用，请使用轮询。")
+    try:
+        await redis_client.ping()
+        pubsub = redis_client.pubsub()
+        await pubsub.subscribe(segment_event_channel(file_record_id))
+    except Exception as exc:
+        await _close_async_redis_resource(redis_client)
+        logger.debug("segment event subscription unavailable file=%s: %s", file_record_id, exc)
+        raise HTTPException(status_code=503, detail="句段事件流暂不可用，请使用轮询。") from exc
+
+    async def event_stream():
+        try:
+            yield "retry: 3000\n\n"
+            while not await request.is_disconnected():
+                message = await pubsub.get_message(
+                    ignore_subscribe_messages=True,
+                    timeout=15.0,
+                )
+                if message and message.get("type") == "message":
+                    payload = message.get("data") or "{}"
+                    yield f"event: segments\ndata: {payload}\n\n"
+                else:
+                    yield ": keep-alive\n\n"
+        finally:
+            try:
+                await pubsub.unsubscribe(segment_event_channel(file_record_id))
+            finally:
+                await _close_async_redis_resource(pubsub)
+                await _close_async_redis_resource(redis_client)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.get("/file-records/{file_record_id}/segments/changes")
 def get_file_record_segment_changes(
     file_record_id: UUID,
@@ -10895,7 +11470,16 @@ def get_file_record_segment_changes(
         "server_time": server_time,
         "next_cursor": next_cursor,
         "has_more": has_more,
-        "status_stats": _get_segment_status_stats_for_query(visible_base_query),
+        "status_stats": (
+            _get_segment_status_stats(db, file_record_id)
+            if can_access_all_projects(current_user)
+            else _get_segment_status_stats_for_query(visible_base_query)
+        ),
+        "workflow_progress": (
+            _get_file_workflow_progress(db, [file_record_id]).get(file_record_id, [])
+            if changed_segments
+            else None
+        ),
         "segments": [
             _serialize_workbench_segment(
                 segment,
@@ -11133,6 +11717,101 @@ def duplicate_file_record_task(
     )
 
 
+def _create_english_variant_copy_task_response(
+    project_id: UUID,
+    file_record_id: UUID,
+    *,
+    db: Session,
+    current_user: User,
+    british_only: bool,
+):
+    try:
+        copy_service = create_british_english_copy if british_only else create_english_variant_copy
+        result = copy_service(
+            db,
+            project_id=project_id,
+            file_record_id=file_record_id,
+            current_user=current_user,
+        )
+        duplicate = result.file_record
+        _assign_file_segments_to_first_workflow_step(db, duplicate)
+        db.commit()
+    except EnglishVariantCopyError as exc:
+        db.rollback()
+        status_code = {
+            "not_found": 404,
+            "unsupported_language_pair": 422,
+            "active_operation": 409,
+            "empty_translation": 409,
+        }[exc.code]
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    db.refresh(duplicate)
+    file_stats = _get_file_segment_stats(db, [duplicate.id]).get(
+        duplicate.id,
+        {"total": 0, "filled": 0, "pretranslated": 0},
+    )
+    workflow_steps = _load_project_workflow_steps(db, duplicate.project_id)
+    workflow_progress = _get_file_workflow_progress(db, [duplicate.id]).get(duplicate.id, [])
+    return {
+        "file": _build_project_file_payload(
+            duplicate,
+            total_segments=file_stats["total"],
+            translated_segments=file_stats["filled"],
+            pretranslated_segments=file_stats["pretranslated"],
+            current_user=current_user,
+            workflow_steps=workflow_steps,
+            workflow_progress=workflow_progress,
+        ),
+        "summary": {
+            "processed_segments": result.summary.processed_segments,
+            "changed_segments": result.summary.changed_segments,
+            "replacement_count": result.summary.replacement_count,
+        },
+    }
+
+
+@router.post(
+    "/projects/{project_id}/file-records/{file_record_id}/english-variant-copy"
+)
+def create_english_variant_copy_task(
+    project_id: UUID,
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_business_manager),
+):
+    """根据目标语言自动创建英式或美式英语待复核副本。"""
+    return _create_english_variant_copy_task_response(
+        project_id,
+        file_record_id,
+        db=db,
+        current_user=current_user,
+        british_only=False,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/file-records/{file_record_id}/british-english-copy"
+)
+def create_british_english_copy_task(
+    project_id: UUID,
+    file_record_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_business_manager),
+):
+    """兼容旧接口：把美式英语译文转换为英式英语副本。"""
+    return _create_english_variant_copy_task_response(
+        project_id,
+        file_record_id,
+        db=db,
+        current_user=current_user,
+        british_only=True,
+    )
+
+
 @router.patch("/file-records/{file_record_id}/assignment")
 def assign_file_record_task(
     file_record_id: UUID,
@@ -11284,6 +11963,11 @@ def get_segment_tm_candidates(
             pass
     if not collection_ids and file_record.collection_id:
         collection_ids = [file_record.collection_id]
+    matcher_collection_ids = (
+        None
+        if getattr(file_record, "tm_scope_mode", "selected") == "language_pair_all"
+        else collection_ids
+    )
 
     timed_out = False
     try:
@@ -11293,7 +11977,7 @@ def get_segment_tm_candidates(
             similarity_threshold=_normalize_tm_match_threshold(
                 threshold if threshold is not None else getattr(file_record, "tm_match_threshold", None),
             ),
-            collection_ids=collection_ids,
+            collection_ids=matcher_collection_ids,
             source_language=file_record.source_language,
             target_language=file_record.target_language,
             top_n=max_candidates,
@@ -11370,17 +12054,14 @@ def rematch_file_record(
 
     _require_file_record_work_access(file_record, current_user)
     ensure_file_record_write_allowed(db, file_record, operation_token=operation_token)
-    selected_collection_ids = _require_selected_collection_ids(
-        _validate_collection_ids(db, payload.collection_ids)
-    )
     source_language, target_language = _resolve_file_record_language_pair(file_record)
-    collections = (
-        db.query(MemoryBase)
-        .filter(MemoryBase.id.in_(selected_collection_ids))
-        .all()
+    selected_collection_ids, matcher_collection_ids = _resolve_tm_scope_collection_ids(
+        db,
+        requested_collection_ids=payload.collection_ids,
+        scope_mode=payload.tm_scope_mode,
+        source_language=source_language,
+        target_language=target_language,
     )
-    for collection in collections:
-        _ensure_resource_language_pair_matches(collection, source_language, target_language, "记忆库")
 
     threshold = float(payload.threshold)
     if threshold < 0.5 or threshold > 1:
@@ -11389,11 +12070,14 @@ def rematch_file_record(
     tm_match_signature = build_tm_match_signature(
         db,
         file_record_id=file_record_id,
-        collection_ids=selected_collection_ids,
+        collection_ids=matcher_collection_ids,
         threshold=threshold,
         skip_confirmed=payload.skip_confirmed,
         overwrite_fuzzy=payload.overwrite_fuzzy,
         auto_confirm_exact=payload.auto_confirm_exact,
+        scope_mode=payload.tm_scope_mode,
+        source_language=source_language,
+        target_language=target_language,
     )
 
     segments = list_segments_for_file_record(db, file_record_id)
@@ -11413,7 +12097,7 @@ def rematch_file_record(
             sentences=source_sentences,
             auxiliary_sentences=auxiliary_sentences,
             similarity_threshold=threshold,
-            collection_ids=selected_collection_ids,
+            collection_ids=matcher_collection_ids,
             source_language=source_language,
             target_language=target_language,
         )
@@ -11461,7 +12145,10 @@ def rematch_file_record(
                 continue
             segment.target_text = target_text
             segment.source = "tm"
-            segment.status = "confirmed" if payload.auto_confirm_exact else "exact"
+            apply_segment_status(
+                segment,
+                "confirmed" if payload.auto_confirm_exact else "exact",
+            )
             exact_count += 1
         elif match.status == "fuzzy" and match.target_text is not None:
             can_overwrite = payload.overwrite_fuzzy or (
@@ -11483,7 +12170,7 @@ def rematch_file_record(
                     continue
                 segment.target_text = target_text
                 segment.source = "tm"
-                segment.status = "fuzzy"
+                apply_segment_status(segment, "fuzzy")
                 fuzzy_count += 1
 
         after = (
@@ -11503,9 +12190,14 @@ def rematch_file_record(
             updated_count += 1
 
     # 保留当前文档绑定的记忆库，供右侧匹配面板查询 TM 候选。
-    if selected_collection_ids:
+    if payload.tm_scope_mode == "selected" and selected_collection_ids:
         file_record.collection_id = selected_collection_ids[0]
         file_record.collection_ids_json = json.dumps([str(cid) for cid in selected_collection_ids])
+    elif payload.tm_scope_mode == "language_pair_all" and selected_collection_ids:
+        # 全语言对检索无需绑定数百个库，只保留一个主库供确认后 Auto-TM 写入。
+        file_record.collection_id = selected_collection_ids[0]
+        file_record.collection_ids_json = json.dumps([str(selected_collection_ids[0])])
+    file_record.tm_scope_mode = payload.tm_scope_mode
     file_record.tm_match_threshold = threshold
     mark_tm_match_signature_current(file_record, tm_match_signature)
 
@@ -11538,6 +12230,7 @@ def patch_file_record_bindings(
         tuple(_load_file_record_collection_ids(file_record)),
         file_record.collection_id,
         _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
+        getattr(file_record, "tm_scope_mode", "selected"),
     )
 
     if "collection_ids" in payload.model_fields_set:
@@ -11555,6 +12248,8 @@ def patch_file_record_bindings(
                 primary_collection_id = selected_collection_ids[0]
         _store_file_record_collection_ids(file_record, selected_collection_ids)
         file_record.collection_id = primary_collection_id
+        if "tm_scope_mode" not in payload.model_fields_set:
+            file_record.tm_scope_mode = "selected"
     elif "collection_id" in payload.model_fields_set:
         if payload.collection_id is None:
             file_record.collection_id = None
@@ -11565,9 +12260,13 @@ def patch_file_record_bindings(
             file_record.collection_id = payload.collection_id
             # 同步更新 collection_ids_json，保持单记忆库场景的一致性
             file_record.collection_ids_json = json.dumps([str(payload.collection_id)])
+        if "tm_scope_mode" not in payload.model_fields_set:
+            file_record.tm_scope_mode = "selected"
 
     if "tm_match_threshold" in payload.model_fields_set:
         file_record.tm_match_threshold = _normalize_tm_match_threshold(payload.tm_match_threshold)
+    if "tm_scope_mode" in payload.model_fields_set:
+        file_record.tm_scope_mode = payload.tm_scope_mode or "selected"
 
     if "term_base_ids" in payload.model_fields_set:
         term_bases = _validate_term_base_ids(db, payload.term_base_ids)
@@ -11616,13 +12315,18 @@ def patch_file_record_bindings(
         tuple(_load_file_record_collection_ids(file_record)),
         file_record.collection_id,
         _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
+        getattr(file_record, "tm_scope_mode", "selected"),
     )
     if refresh_tm_matches and before_collection_binding != after_collection_binding:
         db.flush()
         refresh_unconfirmed_segment_matches(
             db,
             file_record_id=file_record.id,
-            collection_ids=_load_file_record_collection_ids(file_record),
+            collection_ids=(
+                None
+                if getattr(file_record, "tm_scope_mode", "selected") == "language_pair_all"
+                else _load_file_record_collection_ids(file_record)
+            ),
         )
 
     db.commit()
@@ -11637,6 +12341,7 @@ def patch_file_record_bindings(
         "collection_id": str(file_record.collection_id) if file_record.collection_id else None,
         "collection_ids": [str(collection_id) for collection_id in collection_ids],
         "tm_match_threshold": _normalize_tm_match_threshold(getattr(file_record, "tm_match_threshold", None)),
+        "tm_scope_mode": getattr(file_record, "tm_scope_mode", "selected"),
         "term_base_id": str(file_record.term_base_id) if file_record.term_base_id else None,
         "term_base_ids": [str(term_base_id) for term_base_id in term_base_ids],
         "term_base_write_ids": [str(term_base_id) for term_base_id in term_base_write_ids],
@@ -12816,6 +13521,7 @@ def export_file_record_with_type(
             "target_text": seg.target_text,
             "status": seg.status,
             "matched_source_text": seg.matched_source_text,
+            "sequence_index": getattr(seg, "sequence_index", None),
             "metadata": json.loads(seg.segment_metadata) if seg.segment_metadata else {},
         }
         for seg in segments
@@ -12955,12 +13661,10 @@ def update_segment(
         current_user=current_user,
         track_revision=update.track_revision,
         confirm=update.confirm,
+        defer_commit=True,
     )
     if not segment:
         raise HTTPException(status_code=404, detail="片段不存在。")
-
-    project_sync_summary = empty_project_segment_sync_summary()
-    segments_for_project_sync = [segment]
 
     auto_tm_summary = _empty_auto_tm_summary()
     if segment.status == "confirmed":
@@ -12970,15 +13674,18 @@ def update_segment(
             segments=[segment],
             current_user=current_user,
         )
-    if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0 or project_sync_summary.updated_count > 0:
-        db.commit()
-        _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
-    _schedule_project_segment_sync_for_segments(
-        background_tasks,
-        file_record,
-        segments_for_project_sync,
-        current_user,
+    project_sync_queued_count = enqueue_project_segment_sync(
+        db,
+        file_record=file_record,
+        segments=[segment],
+        current_user=current_user,
     )
+    db.commit()
+    db.refresh(segment)
+    publish_segment_changes([file_record_id])
+    _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+    _schedule_project_segment_sync_processing(background_tasks, project_sync_queued_count)
+    project_sync_summary = empty_project_segment_sync_summary()
     workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
         db,
         file_record,
@@ -13271,29 +13978,13 @@ def split_segment(
         first_target = target_text[:target_offset].rstrip()
         second_target = target_text[target_offset:].lstrip()
 
-    # 生成新的 sentence_id：使用子编号方式
+    # 先锁定整份文件的句段顺序，再生成身份 ID 和预留位置，避免并发结构操作产生重复顺序。
+    ordered_file_segments = _load_segments_for_structure_change(db, file_record)
     new_sentence_id = _generate_split_sentence_id(sentence_id, db, file_record_id)
-
-    # sequence_index 是句段位置的唯一依据。历史记录首次拆分时先按当前文档顺序补齐，
-    # 再为后半句腾出一个紧邻位置，避免退回 sentence_id/UUID 字典序。
-    ordered_file_segments = (
-        db.query(Segment)
-        .filter(Segment.file_record_id == file_record_id)
-        .order_by(*get_segment_ordering_for_file_record(file_record))
-        .all()
+    new_sequence_index = _reserve_sequence_slot_after_segment(
+        ordered_file_segments,
+        segment.id,
     )
-    sequence_indexes = [
-        int(item.sequence_index if item.sequence_index is not None else -1)
-        for item in ordered_file_segments
-    ]
-    if any(index < 0 for index in sequence_indexes) or len(sequence_indexes) != len(set(sequence_indexes)):
-        for index, item in enumerate(ordered_file_segments):
-            item.sequence_index = index
-
-    current_sequence_index = int(segment.sequence_index)
-    for item in ordered_file_segments:
-        if item is not segment and int(item.sequence_index) > current_sequence_index:
-            item.sequence_index = int(item.sequence_index) + 1
 
     # 更新原句段
     segment.source_text = first_source
@@ -13312,7 +14003,7 @@ def split_segment(
     segment.matched_updated_at = None
     segment.project_sync_source_segment_id = None
     segment.project_sync_source_file_record_id = None
-    segment.status = _resolve_unconfirmed_segment_status(segment)
+    apply_segment_status(segment, _resolve_unconfirmed_segment_status(segment))
     segment.version = int(segment.version or 1) + 1
 
     # 创建新句段
@@ -13334,13 +14025,16 @@ def split_segment(
         block_index=segment.block_index,
         row_index=segment.row_index,
         cell_index=segment.cell_index,
-        sequence_index=current_sequence_index + 1,
+        sequence_index=new_sequence_index,
     )
-    new_segment.status = _resolve_unconfirmed_segment_status(new_segment)
+    apply_segment_status(new_segment, _resolve_unconfirmed_segment_status(new_segment))
     db.add(new_segment)
 
+    db.flush()
+    refresh_segment_display_indexes(db, file_record)
     sync_file_record_status(db, file_record_id)
     db.commit()
+    publish_segment_changes([file_record_id])
     db.refresh(segment)
     db.refresh(new_segment)
     workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
@@ -13409,6 +14103,9 @@ def merge_segment(
     if first_seg.workflow_step_id != second_seg.workflow_step_id:
         raise HTTPException(status_code=400, detail="只能合并处于同一流程阶段的句段。")
 
+    if first_seg.id == second_seg.id:
+        raise HTTPException(status_code=400, detail="不能将句段与自身合并。")
+
     # DWG/DXF 文件允许跨 block 合并（CAD 图纸中相邻实体可能是独立 block）
     file_ext = (file_record.filename or "").lower().rsplit(".", 1)[-1] if file_record.filename else ""
     is_cad_file = file_ext in ("dwg", "dxf")
@@ -13416,6 +14113,18 @@ def merge_segment(
     if not is_cad_file:
         if not _segments_in_same_merge_block(first_seg, second_seg):
             raise HTTPException(status_code=400, detail="只能合并同一区块内相邻的句段。")
+
+    # sentence_id 只负责身份；合并方向和相邻性一律以当前持久化文档顺序判断。
+    ordered_file_segments = _load_segments_for_structure_change(db, file_record)
+    sequence_positions = _renumber_ordered_segment_sequences(ordered_file_segments)
+    first_position = sequence_positions.get(first_seg.id)
+    second_position = sequence_positions.get(second_seg.id)
+    if first_position is None or second_position is None:
+        raise HTTPException(status_code=404, detail="待合并片段不存在。")
+    if second_position <= first_position:
+        raise HTTPException(status_code=400, detail="请按文档从上到下的顺序合并句段。")
+    if not is_cad_file and second_position != first_position + 1:
+        raise HTTPException(status_code=400, detail="普通文档只能合并前后相邻的句段。")
 
     # 合并文本
     separator = "" if _is_cjk_text(first_seg.source_text) else " "
@@ -13531,7 +14240,7 @@ def merge_segment(
     first_seg.matched_updated_at = None
     first_seg.project_sync_source_segment_id = None
     first_seg.project_sync_source_file_record_id = None
-    first_seg.status = _resolve_unconfirmed_segment_status(first_seg)
+    apply_segment_status(first_seg, _resolve_unconfirmed_segment_status(first_seg))
     first_seg.version = int(first_seg.version or 1) + 1
 
     # 迁移第二个句段的评论到第一个句段
@@ -13544,8 +14253,17 @@ def merge_segment(
     # 删除第二个句段
     db.delete(second_seg)
 
+    # 删除后立即压紧顺序，保证后续拆分、合并和所有导出路径继续使用连续稳定的位置。
+    _renumber_ordered_segment_sequences(
+        ordered_file_segments,
+        excluded_segment_id=second_seg.id,
+    )
+
+    db.flush()
+    refresh_segment_display_indexes(db, file_record)
     sync_file_record_status(db, file_record_id)
     db.commit()
+    publish_segment_changes([file_record_id])
     db.refresh(first_seg)
     workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
         db,
@@ -13604,28 +14322,25 @@ def batch_update(
         updates=update_items,
         current_user=current_user,
         return_result=True,
+        defer_commit=True,
     )
-    segments_for_project_sync = [
-        segment
-        for segment in result.updated_segments
-        if normalize_text(segment.target_text) and not segment.project_sync_disabled
-    ]
-    project_sync_summary = empty_project_segment_sync_summary()
     auto_tm_summary = enqueue_confirmed_segments_for_auto_tm(
         db,
         file_record=file_record,
         segments=result.updated_segments,
         current_user=current_user,
     )
-    if auto_tm_summary.queued_count > 0 or project_sync_summary.filled_count > 0 or project_sync_summary.updated_count > 0:
-        db.commit()
-        _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
-    _schedule_project_segment_sync_for_segments(
-        background_tasks,
-        file_record,
-        segments_for_project_sync,
-        current_user,
+    project_sync_queued_count = enqueue_project_segment_sync(
+        db,
+        file_record=file_record,
+        segments=result.updated_segments,
+        current_user=current_user,
     )
+    db.commit()
+    publish_segment_changes([file_record_id])
+    _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
+    _schedule_project_segment_sync_processing(background_tasks, project_sync_queued_count)
+    project_sync_summary = empty_project_segment_sync_summary()
     workflow_step_by_id, writable_workflow_assignments, can_manage = _build_segment_workflow_context(
         db,
         file_record,
@@ -13643,6 +14358,7 @@ def batch_update(
         "auto_tm": auto_tm_summary.to_dict(),
         "project_sync": project_sync_summary.to_dict(),
         "status_stats": _get_segment_status_stats(db, file_record_id),
+        "workflow_progress": _get_file_workflow_progress(db, [file_record_id]).get(file_record_id, []),
         "segments": [
             _serialize_workbench_segment(
                 segment,
@@ -13689,11 +14405,10 @@ def batch_update_segment_confirmation(
         )
         segments = query.all()
         segments = _filter_writable_segments(db, file_record, current_user, segments)
-        next_status = "confirmed"
         updated_count = 0
         for segment in segments:
-            if segment.status != next_status:
-                segment.status = next_status
+            if segment.status != "confirmed" or segment.confirmed_at is None:
+                apply_segment_status(segment, "confirmed")
                 segment.last_modified_by_id = current_user.id
                 segment.version = int(segment.version or 1) + 1
                 updated_count += 1
@@ -13715,14 +14430,13 @@ def batch_update_segment_confirmation(
         for segment in segments:
             next_status = _resolve_unconfirmed_segment_status(segment)
             if segment.status != next_status:
-                segment.status = next_status
+                apply_segment_status(segment, next_status)
                 segment.last_modified_by_id = current_user.id
                 segment.version = int(segment.version or 1) + 1
                 updated_count += 1
 
     auto_tm_summary = _empty_auto_tm_summary()
-    project_sync_summary = empty_project_segment_sync_summary()
-    confirmed_segments_for_sync: list[Segment] = []
+    project_sync_queued_count = 0
     if payload.action == "confirm" and updated_count:
         confirmed_segments_for_sync = [
             segment
@@ -13735,22 +14449,24 @@ def batch_update_segment_confirmation(
             segments=segments,
             current_user=current_user,
         )
+        project_sync_queued_count = enqueue_project_segment_sync(
+            db,
+            file_record=file_record,
+            segments=confirmed_segments_for_sync,
+            current_user=current_user,
+        )
 
     if updated_count:
         sync_file_record_status(db, file_record_id)
         db.commit()
+        publish_segment_changes([file_record_id])
         _schedule_auto_tm_processing(background_tasks, auto_tm_summary)
-        _schedule_project_segment_sync_for_segments(
-            background_tasks,
-            file_record,
-            confirmed_segments_for_sync,
-            current_user,
-        )
+        _schedule_project_segment_sync_processing(background_tasks, project_sync_queued_count)
 
     return {
         "updated_count": updated_count,
         "auto_tm": auto_tm_summary.to_dict(),
-        "project_sync": project_sync_summary.to_dict(),
+        "project_sync": empty_project_segment_sync_summary().to_dict(),
     }
 
 
@@ -13799,7 +14515,7 @@ def replace_file_record_segment_targets(
     segments = _order_segment_query(query, file_record).all()
     segments = _filter_writable_segments(db, file_record, current_user, segments)
     if not segments:
-        return {"updated_count": 0, "occurrence_count": 0}
+        return {"updated_count": 0, "occurrence_count": 0, "segments": []}
 
     flags = 0 if payload.case_sensitive else re.IGNORECASE
     pattern = re.compile(re.escape(target_query), flags)
@@ -13820,27 +14536,50 @@ def replace_file_record_segment_targets(
             break
 
     if not updates:
-        return {"updated_count": 0, "occurrence_count": 0}
+        return {"updated_count": 0, "occurrence_count": 0, "segments": []}
 
-    updated_count = batch_update_segments(
+    update_result = batch_update_segments(
         db=db,
         file_record_id=file_record_id,
         updates=updates,
         current_user=current_user,
+        return_result=True,
     )
+    updated_count = update_result.updated_count
+    updated_segments = update_result.updated_segments
     if updated_count:
-        updated_sentence_ids = [item["sentence_id"] for item in updates]
-        updated_segments = (
-            db.query(Segment)
-            .filter(
-                Segment.file_record_id == file_record_id,
-                Segment.sentence_id.in_(updated_sentence_ids),
-            )
-            .all()
-        )
         _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, updated_segments)
         _schedule_local_qa_for_segments(background_tasks, file_record, updated_segments)
-    return {"updated_count": updated_count, "occurrence_count": occurrence_count}
+        publish_segment_changes([file_record_id])
+    visible_sentence_ids = set(payload.visible_sentence_ids)
+    response_segments = [
+        segment
+        for segment in updated_segments
+        if not visible_sentence_ids or segment.sentence_id in visible_sentence_ids
+    ]
+    return {
+        "updated_count": updated_count,
+        "occurrence_count": occurrence_count,
+        # 前端使用这些轻量字段就地更新当前检索结果，避免按旧关键词刷新后结果瞬间清空。
+        "segments": [
+            {
+                "sentence_id": segment.sentence_id,
+                "target_text": segment.target_text or "",
+                "target_html": segment.target_html,
+                "status": segment.status,
+                "source": segment.source,
+                "version": int(segment.version or 1),
+                "llm_provider": segment.llm_provider,
+                "llm_model": segment.llm_model,
+                "last_modified_by_id": (
+                    str(segment.last_modified_by_id) if segment.last_modified_by_id else None
+                ),
+                "updated_at": segment.updated_at.isoformat() if segment.updated_at else None,
+            }
+            for segment in response_segments
+        ],
+        "status_stats": _get_segment_status_stats(db, file_record_id),
+    }
 
 
 @router.get("/file-records/{file_record_id}/save-to-tm/stats")
@@ -14714,7 +15453,7 @@ async def llm_translate_file_record(
                             segment.source_word_count = segment.source_word_count or count_source_words(segment.source_text)
                             segment.llm_provider = result.provider
                             segment.llm_model = result.model
-                            segment.status = _resolve_unconfirmed_segment_status(segment)
+                            apply_segment_status(segment, _resolve_unconfirmed_segment_status(segment))
                             reject_stale_manual_revisions_for_segment(
                                 fdb,
                                 segment_id=segment.id,
@@ -15155,19 +15894,17 @@ def search_file_record_bound_resources(
 @router.get("/translation-memory/collections")
 @router.get("/tm/collections", include_in_schema=False)
 def list_tm_collections(
+    source_language: str | None = Query(default=None),
+    target_language: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ):
-    rows = (
-        db.query(MemoryBase, func.count(MemoryEntry.id).label("entry_count"))
-        .outerjoin(MemoryEntry, MemoryEntry.collection_id == MemoryBase.id)
-        .group_by(MemoryBase.id)
-        .order_by(MemoryBase.created_at.desc())
-        .all()
-    )
-    return [
-        _serialize_tm_collection(collection, int(entry_count))
-        for collection, entry_count in rows
-    ]
+    query = db.query(MemoryBase)
+    if source_language:
+        query = query.filter(MemoryBase.source_language == source_language.strip())
+    if target_language:
+        query = query.filter(MemoryBase.target_language == target_language.strip())
+    rows = query.order_by(MemoryBase.created_at.desc()).all()
+    return [_serialize_tm_collection(collection) for collection in rows]
 
 
 @router.get("/translation-memory/collections/{collection_id}")
@@ -15180,12 +15917,7 @@ def get_tm_collection(
     if collection is None:
         raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
 
-    entry_count = (
-        db.query(TranslationMemory)
-        .filter(TranslationMemory.collection_id == collection.id)
-        .count()
-    )
-    return _serialize_tm_collection(collection, entry_count)
+    return _serialize_tm_collection(collection)
 
 
 @router.post("/translation-memory/collections")
@@ -15263,12 +15995,7 @@ def update_tm_collection(
         raise HTTPException(status_code=409, detail="同名记忆库已存在。") from exc
 
     db.refresh(collection)
-    entry_count = (
-        db.query(MemoryEntry)
-        .filter(MemoryEntry.collection_id == collection.id)
-        .count()
-    )
-    return _serialize_tm_collection(collection, entry_count)
+    return _serialize_tm_collection(collection)
 
 
 @router.post("/translation-memory/collections/{collection_id}/copy-language-pair")
@@ -15331,12 +16058,7 @@ def copy_tm_collection_to_language_pair(
         raise HTTPException(status_code=409, detail="复制记忆库失败，可能存在同名库或重复条目。") from exc
 
     db.refresh(target_collection)
-    entry_count = (
-        db.query(MemoryEntry)
-        .filter(MemoryEntry.collection_id == target_collection.id)
-        .count()
-    )
-    return _serialize_tm_collection(target_collection, entry_count)
+    return _serialize_tm_collection(target_collection)
 
 
 @router.post("/translation-memory/collections/merge")
@@ -15457,14 +16179,9 @@ def merge_tm_collections(
     db.commit()
     sync_tm_embeddings(db, sync_rows)
 
-    entry_count = (
-        db.query(MemoryEntry)
-        .filter(MemoryEntry.collection_id == target_collection.id)
-        .count()
-    )
     db.refresh(target_collection)
     return {
-        "collection": _serialize_tm_collection(target_collection, entry_count),
+        "collection": _serialize_tm_collection(target_collection),
         "source_count": len(source_collection_ids),
         "created_rows": created_rows,
         "updated_rows": updated_rows,
@@ -15484,11 +16201,7 @@ def delete_tm_collection(
     if collection is None:
         raise HTTPException(status_code=404, detail="TM 记忆库不存在。")
 
-    entry_count = (
-        db.query(MemoryEntry)
-        .filter(MemoryEntry.collection_id == collection.id)
-        .count()
-    )
+    entry_count = int(collection.entry_count or 0)
     (
         db.query(FileRecord)
         .filter(FileRecord.collection_id == collection.id)
@@ -16400,7 +17113,8 @@ def batch_add_tm_entries(
 
 # ========== 术语库管理 API ==========
 
-def _serialize_termbase_collection(collection: TermBase, entry_count: int = 0) -> dict:
+def _serialize_termbase_collection(collection: TermBase, entry_count: int | None = None) -> dict:
+    resolved_entry_count = collection.entry_count if entry_count is None else entry_count
     return {
         "id": collection.id,
         "name": collection.name,
@@ -16411,7 +17125,7 @@ def _serialize_termbase_collection(collection: TermBase, entry_count: int = 0) -
         "creator_name": get_user_display_name(collection.creator),
         "created_at": collection.created_at.isoformat(),
         "updated_at": collection.updated_at.isoformat(),
-        "entry_count": entry_count,
+        "entry_count": int(resolved_entry_count or 0),
     }
 
 
@@ -16429,17 +17143,8 @@ def _get_termbase_collection_or_404(db: Session, collection_id: UUID | None) -> 
 def list_termbase_collections(
     db: Session = Depends(get_db),
 ):
-    rows = (
-        db.query(TermBase, func.count(TermEntry.id).label("entry_count"))
-        .outerjoin(TermEntry, TermEntry.term_base_id == TermBase.id)
-        .group_by(TermBase.id)
-        .order_by(TermBase.created_at.desc())
-        .all()
-    )
-    return [
-        _serialize_termbase_collection(collection, int(entry_count))
-        for collection, entry_count in rows
-    ]
+    rows = db.query(TermBase).order_by(TermBase.created_at.desc()).all()
+    return [_serialize_termbase_collection(collection) for collection in rows]
 
 
 @router.post("/termbase/collections")
@@ -16480,11 +17185,7 @@ def delete_termbase_collection(
     if collection is None:
         raise HTTPException(status_code=404, detail="术语库不存在。")
 
-    entry_count = (
-        db.query(TermEntry)
-        .filter(TermEntry.term_base_id == collection.id)
-        .count()
-    )
+    entry_count = int(collection.entry_count or 0)
     if entry_count:
         raise HTTPException(status_code=409, detail="请先清空该术语库中的术语记录。")
 
