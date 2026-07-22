@@ -1140,6 +1140,19 @@ function commitEditorContent(): CommittedEditorContent | null {
   }
 }
 
+function focusTargetEditorAtEnd(): boolean {
+  const editor = editorRef.value
+  if (!editor) {
+    return false
+  }
+
+  editor.focus({ preventScroll: true })
+  const caretOffset = getCurrentEditorText().length
+  restoreSerializableCaretPosition(editor, caretOffset)
+  lastTargetSelectionRange.value = { start: caretOffset, end: caretOffset }
+  return true
+}
+
 function getCurrentEditorSnapshot(): EditorHistorySnapshot {
   const text = getCurrentEditorText()
   return {
@@ -2214,6 +2227,7 @@ defineExpose({
   recordEditorUndoBoundary,
   insertOrReplaceTargetText,
   commitEditorContent,
+  focusTargetEditorAtEnd,
   canUndoEditorChange,
   canRedoEditorChange,
 })

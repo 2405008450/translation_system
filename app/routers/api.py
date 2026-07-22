@@ -1540,6 +1540,7 @@ class SegmentReplaceRequest(BaseModel):
     source_filters: list[str] = Field(default_factory=list)
     source_content_filters: list[str] = Field(default_factory=list)
     workflow_step_ids: list[str] = Field(default_factory=list)
+    visible_sentence_ids: list[str] = Field(default_factory=list)
 
 
 class RevisionResolvePayload(BaseModel):
@@ -11273,6 +11274,7 @@ def get_file_record_segments(
             if include_stats and can_access_all_projects(current_user)
             else (_get_segment_status_stats_for_query(base_query) if include_stats else None)
         ),
+        "workflow_progress": _get_file_workflow_progress(db, [file_record_id]).get(file_record_id, []),
         "skip": safe_skip,
         "limit": safe_limit,
         "filters": {
@@ -11472,6 +11474,11 @@ def get_file_record_segment_changes(
             _get_segment_status_stats(db, file_record_id)
             if can_access_all_projects(current_user)
             else _get_segment_status_stats_for_query(visible_base_query)
+        ),
+        "workflow_progress": (
+            _get_file_workflow_progress(db, [file_record_id]).get(file_record_id, [])
+            if changed_segments
+            else None
         ),
         "segments": [
             _serialize_workbench_segment(
@@ -14351,6 +14358,7 @@ def batch_update(
         "auto_tm": auto_tm_summary.to_dict(),
         "project_sync": project_sync_summary.to_dict(),
         "status_stats": _get_segment_status_stats(db, file_record_id),
+        "workflow_progress": _get_file_workflow_progress(db, [file_record_id]).get(file_record_id, []),
         "segments": [
             _serialize_workbench_segment(
                 segment,
@@ -14507,7 +14515,7 @@ def replace_file_record_segment_targets(
     segments = _order_segment_query(query, file_record).all()
     segments = _filter_writable_segments(db, file_record, current_user, segments)
     if not segments:
-        return {"updated_count": 0, "occurrence_count": 0}
+        return {"updated_count": 0, "occurrence_count": 0, "segments": []}
 
     flags = 0 if payload.case_sensitive else re.IGNORECASE
     pattern = re.compile(re.escape(target_query), flags)
@@ -14528,27 +14536,50 @@ def replace_file_record_segment_targets(
             break
 
     if not updates:
-        return {"updated_count": 0, "occurrence_count": 0}
+        return {"updated_count": 0, "occurrence_count": 0, "segments": []}
 
-    updated_count = batch_update_segments(
+    update_result = batch_update_segments(
         db=db,
         file_record_id=file_record_id,
         updates=updates,
         current_user=current_user,
+        return_result=True,
     )
+    updated_count = update_result.updated_count
+    updated_segments = update_result.updated_segments
     if updated_count:
-        updated_sentence_ids = [item["sentence_id"] for item in updates]
-        updated_segments = (
-            db.query(Segment)
-            .filter(
-                Segment.file_record_id == file_record_id,
-                Segment.sentence_id.in_(updated_sentence_ids),
-            )
-            .all()
-        )
         _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, updated_segments)
         _schedule_local_qa_for_segments(background_tasks, file_record, updated_segments)
-    return {"updated_count": updated_count, "occurrence_count": occurrence_count}
+        publish_segment_changes([file_record_id])
+    visible_sentence_ids = set(payload.visible_sentence_ids)
+    response_segments = [
+        segment
+        for segment in updated_segments
+        if not visible_sentence_ids or segment.sentence_id in visible_sentence_ids
+    ]
+    return {
+        "updated_count": updated_count,
+        "occurrence_count": occurrence_count,
+        # 前端使用这些轻量字段就地更新当前检索结果，避免按旧关键词刷新后结果瞬间清空。
+        "segments": [
+            {
+                "sentence_id": segment.sentence_id,
+                "target_text": segment.target_text or "",
+                "target_html": segment.target_html,
+                "status": segment.status,
+                "source": segment.source,
+                "version": int(segment.version or 1),
+                "llm_provider": segment.llm_provider,
+                "llm_model": segment.llm_model,
+                "last_modified_by_id": (
+                    str(segment.last_modified_by_id) if segment.last_modified_by_id else None
+                ),
+                "updated_at": segment.updated_at.isoformat() if segment.updated_at else None,
+            }
+            for segment in response_segments
+        ],
+        "status_stats": _get_segment_status_stats(db, file_record_id),
+    }
 
 
 @router.get("/file-records/{file_record_id}/save-to-tm/stats")

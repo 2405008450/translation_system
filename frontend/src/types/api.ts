@@ -756,6 +756,7 @@ export interface SegmentPageResponse {
   total_segments: number | null
   matched_segments: number
   status_stats: SegmentStatusStats | null
+  workflow_progress?: WorkflowProgress[]
   skip: number
   limit: number
   filters: SegmentPageFilters

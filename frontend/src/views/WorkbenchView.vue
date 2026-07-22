@@ -99,7 +99,6 @@ import {
   calculateOverallWorkflowProgress,
   calculateProgressPercent,
   isProgressComplete,
-  patchTranslationWorkflowProgress,
 } from '../utils/progress'
 import {
   matchesSearchKeyword as matchesSharedSearchKeyword,
@@ -171,6 +170,24 @@ type SegmentSearchReturnTarget = {
   displayIndex: number | null
   page: number
 }
+type SegmentReplacementPatch = Pick<Segment, 'sentence_id'> & Partial<Pick<
+  Segment,
+  | 'target_text'
+  | 'target_html'
+  | 'status'
+  | 'source'
+  | 'version'
+  | 'llm_provider'
+  | 'llm_model'
+  | 'last_modified_by_id'
+  | 'updated_at'
+>>
+type SegmentReplacementResponse = {
+  updated_count: number
+  occurrence_count: number
+  segments: SegmentReplacementPatch[]
+  status_stats?: SegmentStatusStats
+}
 interface SegmentScreeningOption {
   value: string
   label: string
@@ -204,6 +221,7 @@ type SegmentEditorRowPublic = ComponentPublicInstance & {
   }) => boolean
   insertOrReplaceTargetText: (text: string) => boolean
   commitEditorContent: () => CommittedSegmentEditorContent | null
+  focusTargetEditorAtEnd: () => boolean
 }
 type WorkbenchMatchPanelPublic = ComponentPublicInstance & {
   applyMatchAtIndex: (index: number) => boolean
@@ -1331,23 +1349,25 @@ const workbenchFooterProgressContext = computed(() => {
   const total = activeFileSegmentTotal.value
   const confirmed = activeFileStatusStats.value.confirmed
   const liveProgress = calculateProgressPercent(confirmed, total)
+  const activeStepId = activeSegment.value?.workflow_step_id || null
 
   if (isMergeWorkbench.value) {
     const file = activeMergeViewFile.value
     if (!file) {
       return null
     }
-    const workflowProgress = patchTranslationWorkflowProgress(
-      (file.workflow_progress || []) as WorkflowProgress[],
-      confirmed,
-      total,
-    )
+    const workflowProgress = (file.workflow_progress || []) as WorkflowProgress[]
+    const currentStep = workflowProgress.find((item) => item.id === activeStepId) ?? null
     return {
       progress: workflowProgress.length
         ? calculateOverallWorkflowProgress(workflowProgress, liveProgress)
         : liveProgress,
       status: file.status,
       workflowProgress,
+      currentStepId: currentStep?.id ?? null,
+      label: currentStep ? `${currentStep.name}阶段` : '当前阶段',
+      completedSegments: currentStep?.completed_segments ?? confirmed,
+      totalSegments: currentStep?.total_segments ?? total,
     }
   }
 
@@ -1355,17 +1375,18 @@ const workbenchFooterProgressContext = computed(() => {
   if (!record) {
     return null
   }
-  const workflowProgress = patchTranslationWorkflowProgress(
-    record.workflow_progress || [],
-    confirmed,
-    total,
-  )
+  const workflowProgress = record.workflow_progress || []
+  const currentStep = workflowProgress.find((item) => item.id === activeStepId) ?? null
   return {
     progress: workflowProgress.length
       ? calculateOverallWorkflowProgress(workflowProgress, liveProgress)
       : liveProgress,
     status: record.status,
     workflowProgress,
+    currentStepId: currentStep?.id ?? null,
+    label: currentStep ? `${currentStep.name}阶段` : '确认进度',
+    completedSegments: currentStep?.completed_segments ?? confirmed,
+    totalSegments: currentStep?.total_segments ?? total,
   }
 })
 
@@ -3514,7 +3535,7 @@ function getCurrentSegmentIndex() {
   return activeEditorIndex.value
 }
 
-async function focusEditorSegmentAtIndex(index: number) {
+async function focusEditorSegmentAtIndex(index: number, options: { caretAtEnd?: boolean } = {}) {
   const target = editorSegments.value[index]
   if (!target) {
     return
@@ -3526,9 +3547,13 @@ async function focusEditorSegmentAtIndex(index: number) {
   }
   await nextTick()
   await virtualListRef.value?.focusIndex(index, '[data-segment-target="true"]', 'nearest')
+  if (options.caretAtEnd) {
+    await nextTick()
+    segmentEditorRowRefs.get(segmentKeyOf(target))?.focusTargetEditorAtEnd()
+  }
 }
 
-async function focusMatchedSegment(offset: number) {
+async function focusMatchedSegment(offset: number, options: { caretAtEnd?: boolean } = {}) {
   if (!hasEditorSegmentFilter.value) {
     return
   }
@@ -3557,10 +3582,16 @@ async function focusMatchedSegment(offset: number) {
     await refreshSegmentPage(targetPage, pageSize)
   }
 
-  await focusEditorSegmentAtIndex(Math.min(targetPageIndex, Math.max(editorSegments.value.length - 1, 0)))
+  await focusEditorSegmentAtIndex(
+    Math.min(targetPageIndex, Math.max(editorSegments.value.length - 1, 0)),
+    options,
+  )
 }
 
-async function focusSegmentByGlobalIndex(globalIndex: number) {
+async function focusSegmentByGlobalIndex(
+  globalIndex: number,
+  options: { caretAtEnd?: boolean } = {},
+) {
   const total = segmentStore.matchedSegmentCount
   if (total <= 0) {
     return false
@@ -3582,7 +3613,7 @@ async function focusSegmentByGlobalIndex(globalIndex: number) {
   if (targetIndex < 0) {
     return false
   }
-  await focusEditorSegmentAtIndex(targetIndex)
+  await focusEditorSegmentAtIndex(targetIndex, options)
   return true
 }
 
@@ -3642,7 +3673,7 @@ async function replaceAllSearchMatches() {
     if (!synced) {
       return
     }
-    const { data } = await http.post<{ updated_count: number; occurrence_count: number }>(
+    const { data } = await http.post<SegmentReplacementResponse>(
       `/file-records/${segmentStore.fileRecord.id}/segments/replace`,
       {
         scope: segmentDisplayScope.value,
@@ -3658,13 +3689,16 @@ async function replaceAllSearchMatches() {
         match_filters: [...segmentScreeningMatchFilters.value],
         source_content_filters: [...segmentScreeningSourceContentFilters.value],
         workflow_step_ids: [...segmentScreeningWorkflowStepIds.value],
+        visible_sentence_ids: editorSegments.value.map((segment) => segment.sentence_id),
       },
     )
     if (data.updated_count === 0) {
       toast.warn(t('workbench.search.replaceNoMatch'))
       return
     }
-    await refreshSegmentPage(segmentStore.currentPage, segmentStore.pageSize)
+    // 保留替换前的检索结果集和当前位置，仅把服务端最新字段合并到当前页。
+    // 用户修改检索条件或主动翻页时，现有逻辑仍会重新执行检索。
+    segmentStore.applyServerSegmentPatches(data.segments || [], data.status_stats)
     toast.success(t('workbench.search.replacedAll', {
       count: data.occurrence_count,
       segments: data.updated_count,
@@ -3674,9 +3708,9 @@ async function replaceAllSearchMatches() {
   }
 }
 
-async function focusSentenceByOffset(offset: number) {
+async function focusSentenceByOffset(offset: number, options: { caretAtEnd?: boolean } = {}) {
   if (hasEditorSegmentFilter.value) {
-    await focusMatchedSegment(offset)
+    await focusMatchedSegment(offset, options)
     return
   }
 
@@ -3687,7 +3721,7 @@ async function focusSentenceByOffset(offset: number) {
   const pageSize = Math.max(segmentStore.pageSize, 1)
   const currentPageStartIndex = Math.max(segmentStore.currentPage - 1, 0) * pageSize
   const targetGlobalIndex = currentPageStartIndex + getCurrentSegmentIndex() + offset
-  await focusSegmentByGlobalIndex(targetGlobalIndex)
+  await focusSegmentByGlobalIndex(targetGlobalIndex, options)
 }
 
 function getEditorSegmentDisplayIndex(sentenceId: string, fallbackIndex: number) {
@@ -3758,7 +3792,7 @@ async function focusSegmentPosition(target: SegmentPositionResponse) {
   if (resolvedIndex < 0) {
     return false
   }
-  await focusEditorSegmentAtIndex(resolvedIndex)
+  await focusEditorSegmentAtIndex(resolvedIndex, { caretAtEnd: true })
   return true
 }
 
@@ -3806,7 +3840,7 @@ async function focusNextUnconfirmedSegment(currentIndex: number, currentSegment:
 
   let nextIndex = findUnconfirmedSegmentIndex(currentIndex + 1)
   if (nextIndex !== -1) {
-    await focusEditorSegmentAtIndex(nextIndex)
+    await focusEditorSegmentAtIndex(nextIndex, { caretAtEnd: true })
     return true
   }
 
@@ -3815,7 +3849,7 @@ async function focusNextUnconfirmedSegment(currentIndex: number, currentSegment:
     const refreshedStartIndex = Math.min(Math.max(currentIndex, 0), editorSegments.value.length)
     nextIndex = findUnconfirmedSegmentIndex(refreshedStartIndex)
     if (nextIndex !== -1) {
-      await focusEditorSegmentAtIndex(nextIndex)
+      await focusEditorSegmentAtIndex(nextIndex, { caretAtEnd: true })
       return true
     }
   }
@@ -3830,7 +3864,7 @@ async function focusNextUnconfirmedSegment(currentIndex: number, currentSegment:
     }
     nextIndex = findUnconfirmedSegmentIndex(0)
     if (nextIndex !== -1) {
-      await focusEditorSegmentAtIndex(nextIndex)
+      await focusEditorSegmentAtIndex(nextIndex, { caretAtEnd: true })
       return true
     }
   }
@@ -3841,7 +3875,7 @@ async function focusNextUnconfirmedSegment(currentIndex: number, currentSegment:
 
   nextIndex = findUnconfirmedSegmentIndex(0, currentIndex)
   if (nextIndex !== -1) {
-    await focusEditorSegmentAtIndex(nextIndex)
+    await focusEditorSegmentAtIndex(nextIndex, { caretAtEnd: true })
     return true
   }
 
@@ -3923,7 +3957,7 @@ async function confirmAndMoveToNextUnconfirmed() {
     }
 
     if (preferencesStore.confirmJumpMode === 'next_segment') {
-      await focusSentenceByOffset(1)
+      await focusSentenceByOffset(1, { caretAtEnd: true })
       return
     }
 
@@ -8989,13 +9023,17 @@ onBeforeRouteLeave(async () => {
               v-if="workbenchFooterProgressContext"
               class="segment-editor-footer__progress"
             >
-              <span class="segment-editor-footer__progress-label">{{ t('common.progress.total') }}</span>
+              <span class="segment-editor-footer__progress-label">{{ workbenchFooterProgressContext.label }}</span>
               <WorkflowProgressSummary
                 compact
                 :progress="workbenchFooterProgressContext.progress"
                 :status="workbenchFooterProgressContext.status"
                 :workflow-progress="workbenchFooterProgressContext.workflowProgress"
-                :label="t('common.progress.total')"
+                display-mode="current-stage"
+                :current-step-id="workbenchFooterProgressContext.currentStepId"
+                :completed-segments="workbenchFooterProgressContext.completedSegments"
+                :total-segments="workbenchFooterProgressContext.totalSegments"
+                :label="workbenchFooterProgressContext.label"
                 :detail-title="t('common.progress.workflowDetail')"
               />
             </div>
@@ -12950,8 +12988,8 @@ onBeforeRouteLeave(async () => {
   align-items: center;
   gap: 8px;
   flex: 0 0 auto;
-  width: min(220px, 28vw);
-  min-width: 148px;
+  width: min(290px, 38vw);
+  min-width: 220px;
 }
 
 .segment-editor-footer__progress-label {

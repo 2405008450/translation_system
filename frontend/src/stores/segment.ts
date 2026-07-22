@@ -27,6 +27,7 @@ import type {
   SegmentUpdatePayload,
   SaveToTMStats,
   TermMatch,
+  WorkflowProgress,
 } from '../types/api'
 import { downloadBlob, resolveDownloadFilename } from '../utils/download'
 import { consumeLLMStream } from '../utils/llmStream'
@@ -230,6 +231,7 @@ interface SegmentChangeResponse {
   next_cursor?: string
   has_more?: boolean
   status_stats?: SegmentStatusStats | null
+  workflow_progress?: WorkflowProgress[] | null
   segments: Segment[]
 }
 
@@ -717,6 +719,22 @@ export const useSegmentStore = defineStore('segment', () => {
     }
   }
 
+  function applyServerSegmentPatches(
+    patches: Array<Pick<Segment, 'sentence_id'> & Partial<Segment>>,
+    statusStats?: SegmentStatusStats | null,
+  ) {
+    for (const patch of patches) {
+      const index = segments.value.findIndex((segment) => segment.sentence_id === patch.sentence_id)
+      if (index === -1) {
+        continue
+      }
+      applyServerSegment({ ...segments.value[index], ...patch })
+    }
+    if (statusStats) {
+      setSegmentStatusStats(statusStats)
+    }
+  }
+
   function setSegmentStatusStats(stats?: SegmentStatusStats | null) {
     segmentStatusStats.value = stats ? { ...createEmptySegmentStatusStats(), ...stats } : createEmptySegmentStatusStats()
   }
@@ -897,6 +915,12 @@ export const useSegmentStore = defineStore('segment', () => {
     matchedSegmentCount.value = data.matched_segments
     if (data.status_stats) {
       setSegmentStatusStats(data.status_stats)
+    }
+    if (fileRecord.value && data.workflow_progress) {
+      fileRecord.value = {
+        ...fileRecord.value,
+        workflow_progress: data.workflow_progress,
+      }
     }
     resetSegments(data.segments)
     if (data.change_cursor || data.server_time) {
@@ -1088,6 +1112,12 @@ export const useSegmentStore = defineStore('segment', () => {
         }
         if (data.status_stats) {
           setSegmentStatusStats(data.status_stats)
+        }
+        if (fileRecord.value?.id === currentFileRecordId && data.workflow_progress) {
+          fileRecord.value = {
+            ...fileRecord.value,
+            workflow_progress: data.workflow_progress,
+          }
         }
         changeCursor = data.next_cursor || data.server_time || new Date().toISOString()
         hasMore = Boolean(data.has_more)
@@ -1911,6 +1941,7 @@ export const useSegmentStore = defineStore('segment', () => {
       }
       project_sync?: ProjectSegmentSyncSummary
       status_stats?: SegmentStatusStats | null
+      workflow_progress?: WorkflowProgress[]
       segments?: Segment[]
     }>(`/file-records/${fileId}/segments`, {
       updates,
@@ -1979,6 +2010,12 @@ export const useSegmentStore = defineStore('segment', () => {
     }
     if (data.status_stats) {
       setSegmentStatusStats(data.status_stats)
+    }
+    if (fileRecord.value?.id === fileId && data.workflow_progress) {
+      fileRecord.value = {
+        ...fileRecord.value,
+        workflow_progress: data.workflow_progress,
+      }
     }
     return finishSyncState(hadConflict)
   }
@@ -2055,6 +2092,21 @@ export const useSegmentStore = defineStore('segment', () => {
         )),
       }
       setSegmentStatusStats(buildMergeViewStatusStats(mergeViewDetail.value))
+    }
+    const workflowProgressByFileId = new Map(
+      results
+        .filter((result) => result.data.workflow_progress)
+        .map((result) => [result.fileId, result.data.workflow_progress as WorkflowProgress[]]),
+    )
+    if (workflowProgressByFileId.size > 0 && mergeViewDetail.value) {
+      mergeViewDetail.value = {
+        ...mergeViewDetail.value,
+        files: mergeViewDetail.value.files.map((file) => (
+          workflowProgressByFileId.has(file.id)
+            ? { ...file, workflow_progress: workflowProgressByFileId.get(file.id)! }
+            : file
+        )),
+      }
     }
     dirtyEntries.value = nextDirtyEntries
     clearLocalRevisionDrafts(syncedSentenceIds)
@@ -2801,6 +2853,7 @@ export const useSegmentStore = defineStore('segment', () => {
     ensureSentenceLoaded,
     loadRevisions,
     loadSaveToTMStats,
+    applyServerSegmentPatches,
     updateTarget,
     updateSource,
     setProjectSyncDisabled,

@@ -3,7 +3,15 @@ import { computed, nextTick, onBeforeUnmount, ref } from 'vue'
 import type { CSSProperties } from 'vue'
 
 import type { WorkflowProgress } from '../types/api'
-import { getProgressStyle, isProgressComplete } from '../utils/progress'
+import {
+  calculateOverallWorkflowProgress,
+  calculateProgressPercent,
+  clampDisplayProgress,
+  getProgressStyle,
+  isProgressComplete,
+} from '../utils/progress'
+
+type ProgressDisplayMode = 'overall' | 'current-stage'
 
 const props = withDefaults(defineProps<{
   progress: number
@@ -12,12 +20,20 @@ const props = withDefaults(defineProps<{
   label?: string
   detailTitle?: string
   compact?: boolean
+  displayMode?: ProgressDisplayMode
+  currentStepId?: string | null
+  completedSegments?: number
+  totalSegments?: number
 }>(), {
   status: '',
   workflowProgress: () => [],
   label: '总进度',
   detailTitle: '阶段进度',
   compact: false,
+  displayMode: 'overall',
+  currentStepId: null,
+  completedSegments: 0,
+  totalSegments: 0,
 })
 
 const anchorRef = ref<HTMLElement | null>(null)
@@ -26,41 +42,61 @@ const showDetails = ref(false)
 const popoverStyle = ref<CSSProperties>({})
 let hideTimer: number | null = null
 
-function clampProgress(value: unknown) {
-  const progress = Number(value)
-  return Math.max(0, Math.min(Number.isFinite(progress) ? Math.round(progress) : 0, 100))
-}
-
-const normalizedProgress = computed(() => clampProgress(props.progress))
 const workflowItems = computed(() => (
   [...(props.workflowProgress || [])]
     .sort((left, right) => left.sort_order - right.sort_order)
-    .map((item) => ({
-      ...item,
-      progress: clampProgress(item.progress),
-      total_segments: Number(item.total_segments || 0),
-      completed_segments: Number(item.completed_segments || 0),
-    }))
+    .map((item) => {
+      const totalSegments = Number(item.total_segments || 0)
+      const completedSegments = Number(item.completed_segments || 0)
+      return {
+        ...item,
+        progress: totalSegments > 0
+          ? calculateProgressPercent(completedSegments, totalSegments)
+          : clampDisplayProgress(item.progress),
+        total_segments: totalSegments,
+        completed_segments: completedSegments,
+      }
+    })
 ))
-const hasWorkflowDetails = computed(() => workflowItems.value.length > 1)
-const translationWorkflowItem = computed(() => (
-  workflowItems.value.find((item) => (
-    item.step_key === 'translate' || item.step_type === 'translation'
-  )) ?? null
+const hasWorkflowDetails = computed(() => workflowItems.value.length > 0)
+const normalizedProgress = computed(() => calculateOverallWorkflowProgress(
+  workflowItems.value,
+  props.progress,
+))
+const currentWorkflowItem = computed(() => (
+  workflowItems.value.find((item) => item.id === props.currentStepId) ?? null
 ))
 const displayProgress = computed(() => {
-  if (hasWorkflowDetails.value && translationWorkflowItem.value) {
-    return translationWorkflowItem.value.progress
+  if (props.displayMode === 'current-stage') {
+    if (currentWorkflowItem.value) {
+      return currentWorkflowItem.value.progress
+    }
+    if (Number(props.totalSegments || 0) > 0) {
+      return calculateProgressPercent(props.completedSegments, props.totalSegments)
+    }
   }
   return normalizedProgress.value
 })
 const displayProgressLabel = computed(() => {
-  if (hasWorkflowDetails.value && translationWorkflowItem.value) {
-    return translationWorkflowItem.value.name
+  if (props.displayMode === 'current-stage' && currentWorkflowItem.value) {
+    return currentWorkflowItem.value.name
   }
   return props.label
 })
-const progressAriaLabel = computed(() => `${displayProgressLabel.value} ${displayProgress.value}%`)
+const displayCompletedSegments = computed(() => (
+  currentWorkflowItem.value?.completed_segments ?? Number(props.completedSegments || 0)
+))
+const displayTotalSegments = computed(() => (
+  currentWorkflowItem.value?.total_segments ?? Number(props.totalSegments || 0)
+))
+const displayCountText = computed(() => (
+  props.displayMode === 'current-stage' && displayTotalSegments.value > 0
+    ? `${displayCompletedSegments.value}/${displayTotalSegments.value}`
+    : ''
+))
+const progressAriaLabel = computed(() => (
+  `${displayProgressLabel.value} ${displayProgress.value}%${displayCountText.value ? `，${displayCountText.value}` : ''}`
+))
 
 function removePositionListeners() {
   window.removeEventListener('resize', updatePopoverPosition)
@@ -179,11 +215,16 @@ onBeforeUnmount(() => {
       <div class="progress-bar__track">
         <div
           class="progress-bar__fill"
-          :class="{ 'is-complete': isProgressComplete(displayProgress) }"
+          :class="{
+            'has-progress': displayProgress > 0,
+            'is-complete': isProgressComplete(displayProgress),
+          }"
           :style="getProgressStyle(displayProgress, status)"
         />
       </div>
-      <span class="progress-bar__text">{{ displayProgress }}%</span>
+      <span class="progress-bar__text">
+        {{ displayProgress }}%<template v-if="displayCountText"> · {{ displayCountText }}</template>
+      </span>
     </div>
   </div>
 
@@ -215,7 +256,10 @@ onBeforeUnmount(() => {
             <div class="progress-bar__track">
               <div
                 class="progress-bar__fill"
-                :class="{ 'is-complete': isProgressComplete(item.progress) }"
+                :class="{
+                  'has-progress': item.progress > 0,
+                  'is-complete': isProgressComplete(item.progress),
+                }"
                 :style="getProgressStyle(item.progress)"
               />
             </div>
@@ -255,6 +299,10 @@ onBeforeUnmount(() => {
 
 .workflow-progress-summary--compact :deep(.progress-bar__track) {
   min-width: 58px;
+}
+
+.workflow-progress-summary :deep(.progress-bar__fill.has-progress) {
+  min-width: 2px;
 }
 
 .workflow-progress-popover {
