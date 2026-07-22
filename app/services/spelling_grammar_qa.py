@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -15,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.database import SessionLocal
 from app.models import FileRecord, Project, Segment, SegmentQAIssue
+from app.services.cache import aget_json, aset_json
 from app.services.language_pairs import LANGUAGE_OPTIONS
 from app.services.normalizer import normalize_text
 
@@ -62,6 +64,7 @@ DEFAULT_QUALITY_QA_SETTINGS: dict[str, Any] = {
         "severity": "medium",
     }
 }
+DEFAULT_QUALITY_QA_SETTINGS["rules"][QA_RULE_TERM_INCONSISTENCY]["case_sensitive"] = False
 
 LANGUAGETOOL_LANGUAGE_MAP: dict[str, str] = {
     "zh-CN": "zh-CN",
@@ -76,6 +79,7 @@ LANGUAGETOOL_LANGUAGE_MAP: dict[str, str] = {
     "es-ES": "es",
     "es-419": "es",
     "pt-BR": "pt-BR",
+    "pt-PT": "pt-PT",
     "it-IT": "it",
     "ru-RU": "ru-RU",
     "ar-SA": "ar",
@@ -94,6 +98,10 @@ LANGUAGETOOL_LANGUAGE_MAP: dict[str, str] = {
 
 
 class LanguageToolUnavailableError(RuntimeError):
+    pass
+
+
+class LanguageToolBusyError(RuntimeError):
     pass
 
 
@@ -119,6 +127,21 @@ class CleanedLanguageToolIssue:
             self.length,
             self.message,
         )
+
+
+_live_check_semaphore: asyncio.Semaphore | None = None
+_live_check_semaphore_limit: int | None = None
+
+
+def _get_live_check_semaphore() -> asyncio.Semaphore:
+    """返回当前 Web worker 内共享的实时检查并发闸门。"""
+    global _live_check_semaphore, _live_check_semaphore_limit
+    settings = get_settings()
+    limit = max(1, int(settings.languagetool_live_max_concurrency_per_worker or 1))
+    if _live_check_semaphore is None or _live_check_semaphore_limit != limit:
+        _live_check_semaphore = asyncio.Semaphore(limit)
+        _live_check_semaphore_limit = limit
+    return _live_check_semaphore
 
 
 def _clone_default_quality_qa_settings() -> dict[str, Any]:
@@ -158,6 +181,11 @@ def normalize_quality_qa_settings(raw: Any) -> dict[str, Any]:
             settings["rules"][key]["enabled"] = _normalize_rule_enabled(
                 rules.get(key),
                 bool(settings["rules"][key]["enabled"]),
+            )
+        term_inconsistency = rules.get(QA_RULE_TERM_INCONSISTENCY)
+        if isinstance(term_inconsistency, dict):
+            settings["rules"][QA_RULE_TERM_INCONSISTENCY]["case_sensitive"] = bool(
+                term_inconsistency.get("case_sensitive", False)
             )
 
     settings[QA_RULE_SPELLING_GRAMMAR]["enabled"] = bool(
@@ -359,6 +387,122 @@ def clean_languagetool_matches(
             )
         )
     return cleaned
+
+
+def is_spelling_issue(issue: CleanedLanguageToolIssue) -> bool:
+    """只挑出适合在编辑器中显示红色波浪线的拼写问题。"""
+    issue_type = (issue.issue_type or "").strip().lower()
+    if issue_type == "misspelling":
+        return True
+    # 兼容部分旧版/第三方规则没有正确填写 issueType 的情况。
+    rule_id = (issue.rule_id or "").strip().upper()
+    return any(marker in rule_id for marker in ("MORFOLOGIK_RULE", "HUNSPELL", "SPELLER_RULE"))
+
+
+def serialize_live_spelling_issue(
+    issue: CleanedLanguageToolIssue,
+    *,
+    text_hash: str,
+) -> dict[str, Any]:
+    fingerprint = hashlib.sha256(
+        f"{text_hash}\0{issue.rule_id}\0{issue.offset}\0{issue.length}\0{issue.message}".encode("utf-8")
+    ).hexdigest()[:24]
+    return {
+        "id": f"live-{fingerprint}",
+        "language": issue.language,
+        "severity": issue.severity,
+        "message": issue.message,
+        "short_message": issue.short_message,
+        "rule_id": issue.rule_id,
+        "rule_category": issue.rule_category,
+        "issue_type": issue.issue_type,
+        "context_text": issue.context_text,
+        "offset": issue.offset,
+        "length": issue.length,
+        "replacements": issue.replacements,
+        "target_text_hash": text_hash,
+        "status": QA_ISSUE_STATUS_OPEN,
+    }
+
+
+async def check_live_spelling_text(
+    *,
+    text: str,
+    language: str,
+    severity: str = "medium",
+) -> dict[str, Any]:
+    """检查一段未保存译文，只返回拼写问题且不写数据库。"""
+    settings = get_settings()
+    resolved_base_url = (settings.languagetool_base_url or "").strip().rstrip("/")
+    if not resolved_base_url:
+        raise LanguageToolUnavailableError("LanguageTool base URL is not configured.")
+
+    max_length = max(1, int(settings.languagetool_max_text_length or 20000))
+    checked_text = (text or "")[:max_length]
+    text_hash = target_text_hash(text or "")
+    if not normalize_text(checked_text):
+        return {
+            "language": language,
+            "target_text_hash": text_hash,
+            "checked_length": len(checked_text),
+            "truncated": len(text or "") > len(checked_text),
+            "cached": False,
+            "issues": [],
+        }
+
+    cache_key = f"languagetool:live:v1:{language}:{severity}:{text_hash}"
+    cached = await aget_json(cache_key)
+    if isinstance(cached, dict) and isinstance(cached.get("issues"), list):
+        return {**cached, "cached": True}
+
+    semaphore = _get_live_check_semaphore()
+    try:
+        await asyncio.wait_for(
+            semaphore.acquire(),
+            timeout=max(0.01, float(settings.languagetool_live_queue_timeout_seconds or 0.3)),
+        )
+    except TimeoutError as exc:
+        raise LanguageToolBusyError("LanguageTool live check is busy.") from exc
+
+    try:
+        check_url = resolved_base_url if resolved_base_url.endswith("/check") else f"{resolved_base_url}/check"
+        timeout = max(0.1, float(settings.languagetool_live_timeout_seconds or 2.5))
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                check_url,
+                data={"text": checked_text, "language": language},
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise LanguageToolUnavailableError("LanguageTool live check failed.") from exc
+    finally:
+        semaphore.release()
+
+    cleaned = clean_languagetool_matches(
+        payload if isinstance(payload, dict) else {},
+        text=checked_text,
+        language=language,
+        severity=severity,
+    )
+    result = {
+        "language": language,
+        "target_text_hash": text_hash,
+        "checked_length": len(checked_text),
+        "truncated": len(text or "") > len(checked_text),
+        "cached": False,
+        "issues": [
+            serialize_live_spelling_issue(issue, text_hash=text_hash)
+            for issue in cleaned
+            if is_spelling_issue(issue)
+        ],
+    }
+    await aset_json(
+        cache_key,
+        result,
+        ttl_seconds=max(1, int(settings.languagetool_live_cache_ttl_seconds or 300)),
+    )
+    return result
 
 
 def _existing_issue_fingerprint(issue: SegmentQAIssue) -> tuple[str, str, int, int, str]:

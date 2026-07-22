@@ -76,6 +76,8 @@ LLM 预翻译的理论请求上限约为 `ARQ_PRETRANSLATION_MAX_JOBS × PRETRAN
 
 拼写/语法 QA 默认手动生成：`SPELLING_GRAMMAR_QA_AUTO_SCHEDULE=false`。不要轻易开启自动调度，否则保存/确认句段会持续产生 QA 任务并增加维护队列与数据库压力。
 
+工作台实时拼写检查不走维护队列，每个 Web worker 默认最多并发 2 个 LanguageTool 请求；4 个 Web worker 的理论上限为 8。默认给 LanguageTool 容器分配 2 CPU、2 GB 内存，并用 `LANGUAGETOOL_JAVA_OPTIONS=-Xms512m -Xmx1536m` 限制 JVM 堆。可通过 `LANGUAGETOOL_LIVE_MAX_CONCURRENCY_PER_WORKER`、`LANGUAGETOOL_CPU_LIMIT` 和 `LANGUAGETOOL_MEMORY_LIMIT` 调整。
+
 密码含 `@`、`:`、`/`、`?`、`#` 等字符时，`DATABASE_URL` 须 URL 编码。
 
 ### `.env.prod` 和 `.env`

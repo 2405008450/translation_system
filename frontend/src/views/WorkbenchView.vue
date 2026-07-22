@@ -1591,6 +1591,7 @@ function createQualityQARuleDraft(): QualityQARuleDraft {
 
 const qualityQADraft = reactive({
   rules: createQualityQARuleDraft(),
+  termQACaseSensitive: false,
 })
 
 const enabledQualityQARuleCount = computed(() => (
@@ -1615,6 +1616,9 @@ function syncQualityQADraftFromSettings(data: QualityQASettingsResponse) {
   for (const rule of qualityQARules) {
     qualityQADraft.rules[rule.key] = getSavedQualityQARuleEnabledFrom(data, rule)
   }
+  qualityQADraft.termQACaseSensitive = Boolean(
+    data.settings.rules?.term_inconsistency?.case_sensitive,
+  )
 }
 
 function getSavedQualityQARuleEnabledFrom(data: QualityQASettingsResponse, rule: typeof qualityQARules[number]) {
@@ -1632,9 +1636,12 @@ function buildQualityQARulesPayload() {
   return qualityQARules.reduce((payload, rule) => {
     payload[rule.key] = {
       enabled: qualityQADraft.rules[rule.key],
+      ...(rule.key === 'term_inconsistency'
+        ? { case_sensitive: qualityQADraft.termQACaseSensitive }
+        : {}),
     }
     return payload
-  }, {} as Record<QualityQARuleKey, { enabled: boolean }>)
+  }, {} as Record<QualityQARuleKey, { enabled: boolean; case_sensitive?: boolean }>)
 }
 
 function setAllQualityQARules(checked: boolean) {
@@ -4429,26 +4436,71 @@ function toggleAllActiveTermQAItems(checked: boolean) {
   ])
 }
 
+function getTermQAItemDuplicateFingerprint(item: WorkbenchQAResultItem) {
+  return JSON.stringify([
+    item.source_kind,
+    item.rule_key,
+    item.message,
+    item.detail,
+    item.suggestion,
+    item.source_text,
+    item.target_text,
+  ])
+}
+
+function resolveTermQAIgnoreItemIds(itemIds: string[], ignored: boolean) {
+  const requestedIds = [...new Set(itemIds)]
+  const reportItems = termQAReport.value?.items || []
+  if (!ignored || !preferencesStore.batchIgnoreIdenticalQA || reportItems.length === 0) {
+    return requestedIds
+  }
+
+  const requestedIdSet = new Set(requestedIds)
+  const duplicateFingerprints = new Set(
+    reportItems
+      .filter((item) => !item.ignored && requestedIdSet.has(item.id))
+      .map(getTermQAItemDuplicateFingerprint),
+  )
+  if (duplicateFingerprints.size === 0) {
+    return requestedIds
+  }
+
+  const resolvedIds = new Set(requestedIds)
+  for (const item of reportItems) {
+    if (!item.ignored && duplicateFingerprints.has(getTermQAItemDuplicateFingerprint(item))) {
+      resolvedIds.add(item.id)
+    }
+  }
+  return [...resolvedIds]
+}
+
 async function setTermQAReportItemsIgnored(itemIds: string[], ignored: boolean) {
   if (!termQAReport.value || updatingTermQAIgnore.value || itemIds.length === 0) {
     return
   }
-  const nextItem = ignored ? findNextActiveTermQAReportItemAfter(itemIds) : null
+  const requestedItemIds = [...new Set(itemIds)]
+  const resolvedItemIds = resolveTermQAIgnoreItemIds(requestedItemIds, ignored)
+  const autoIncludedCount = Math.max(resolvedItemIds.length - requestedItemIds.length, 0)
+  const nextItem = ignored ? findNextActiveTermQAReportItemAfter(resolvedItemIds) : null
   updatingTermQAIgnore.value = true
   try {
     await http.patch(
       '/qa-result-items/ignore',
       {
-        item_ids: itemIds,
+        item_ids: resolvedItemIds,
         ignored,
       },
     )
-    updateCurrentTermQAReportItemsIgnored(itemIds, ignored)
+    updateCurrentTermQAReportItemsIgnored(resolvedItemIds, ignored)
     if (nextItem) {
       setTermQAReportPageForItem(nextItem.id)
       await focusTermQAReportItem(nextItem)
     }
-    toast.success(ignored ? '已忽略所选 QA 问题。' : '已恢复所选 QA 问题。')
+    if (ignored && autoIncludedCount > 0) {
+      toast.success(`已忽略 ${resolvedItemIds.length} 条 QA 问题（自动包含 ${autoIncludedCount} 条相同问题）。`)
+    } else {
+      toast.success(`${ignored ? '已忽略' : '已恢复'} ${resolvedItemIds.length} 条 QA 问题。`)
+    }
   } catch (error) {
     toast.error({
       title: ignored ? '忽略失败' : '恢复失败',
@@ -4460,33 +4512,7 @@ async function setTermQAReportItemsIgnored(itemIds: string[], ignored: boolean) 
 }
 
 async function setSingleTermQAReportItemIgnored(item: WorkbenchQAResultItem, ignored: boolean) {
-  if (updatingTermQAIgnore.value) {
-    return
-  }
-  const nextItem = ignored ? findNextActiveTermQAReportItemAfter([item.id]) : null
-  updatingTermQAIgnore.value = true
-  try {
-    await http.patch(
-      '/qa-result-items/ignore',
-      {
-        item_ids: [item.id],
-        ignored,
-      },
-    )
-    updateCurrentTermQAReportItemsIgnored([item.id], ignored)
-    if (nextItem) {
-      setTermQAReportPageForItem(nextItem.id)
-      await focusTermQAReportItem(nextItem)
-    }
-    toast.success(ignored ? '已忽略该 QA 问题。' : '已恢复该 QA 问题。')
-  } catch (error) {
-    toast.error({
-      title: ignored ? '忽略失败' : '恢复失败',
-      message: getErrorMessage(error, ignored ? '忽略 QA 问题失败。' : '恢复 QA 问题失败。'),
-    })
-  } finally {
-    updatingTermQAIgnore.value = false
-  }
+  await setTermQAReportItemsIgnored([item.id], ignored)
 }
 
 async function ignoreSelectedTermQAReportItems() {
@@ -8994,7 +9020,7 @@ onBeforeRouteLeave(async () => {
                       :revision-settings="segmentStore.revisionSettings"
                       :revision-busy="revisionActionLoading"
                       :matched-terms="segmentStore.activeSentenceId === segmentKeyOf(item) ? activeMatchedTerms : []"
-                      :qa-issues="item.qa_issues || []"
+                      :qa-issues="segmentStore.getInlineSpellingIssues(item)"
                       :source-search-query="sourceSearchQuery"
                       :target-search-query="targetSearchQuery"
                       :search-case-sensitive="searchCaseSensitive"
@@ -9259,6 +9285,21 @@ onBeforeRouteLeave(async () => {
                   </div>
 
                   <div class="term-qa-dialog__actions">
+                    <label
+                      v-if="termQAReport && termQAReport.items.length > 0"
+                      class="term-qa-dialog__toggle term-qa-dialog__batch-ignore-toggle"
+                      :class="{ 'is-disabled': updatingTermQAIgnore }"
+                      title="开启后，忽略时会同时处理当前 QA 结果中跨分页、跨文件的完全相同问题"
+                    >
+                      <input
+                        type="checkbox"
+                        :checked="preferencesStore.batchIgnoreIdenticalQA"
+                        :disabled="updatingTermQAIgnore"
+                        aria-label="相同问题批量忽略"
+                        @change="preferencesStore.setBatchIgnoreIdenticalQA(($event.target as HTMLInputElement).checked)"
+                      >
+                      <span>相同问题批量忽略</span>
+                    </label>
                     <select
                       v-if="termQAReport && termQAReport.items.length > 0"
                       v-model="termQAReportFilter"
@@ -10268,18 +10309,36 @@ onBeforeRouteLeave(async () => {
           </div>
 
           <div class="quality-qa-adjust-dialog__options">
-            <label
+            <div
               v-for="rule in qualityQARules"
               :key="rule.key"
               class="quality-qa-adjust-dialog__option"
             >
-              <input
-                v-model="qualityQADraft.rules[rule.key]"
-                type="checkbox"
-                :disabled="savingQualityQASettings"
+              <label class="quality-qa-adjust-dialog__option-main">
+                <input
+                  v-model="qualityQADraft.rules[rule.key]"
+                  type="checkbox"
+                  :disabled="savingQualityQASettings"
+                >
+                <span class="quality-qa-adjust-dialog__option-label">{{ rule.label }}</span>
+              </label>
+              <button
+                v-if="rule.key === 'term_inconsistency'"
+                class="quality-qa-adjust-dialog__case-switch"
+                :class="{ 'is-active': qualityQADraft.termQACaseSensitive }"
+                type="button"
+                role="switch"
+                :aria-checked="qualityQADraft.termQACaseSensitive"
+                :aria-label="qualityQADraft.termQACaseSensitive ? '术语不一致检查区分大小写' : '术语不一致检查不区分大小写'"
+                :disabled="savingQualityQASettings || !qualityQADraft.rules.term_inconsistency"
+                @click="qualityQADraft.termQACaseSensitive = !qualityQADraft.termQACaseSensitive"
               >
-              <span>{{ rule.label }}</span>
-            </label>
+                <span class="quality-qa-adjust-dialog__case-switch-track" aria-hidden="true">
+                  <span class="quality-qa-adjust-dialog__case-switch-thumb"></span>
+                </span>
+                <span>{{ qualityQADraft.termQACaseSensitive ? '区分大小写' : '不区分大小写' }}</span>
+              </button>
+            </div>
           </div>
 
           <p v-if="qualityQASettingsError" class="form-message is-error">{{ qualityQASettingsError }}</p>
@@ -12066,6 +12125,20 @@ onBeforeRouteLeave(async () => {
   user-select: none;
 }
 
+.term-qa-dialog__toggle input {
+  margin: 0;
+  accent-color: #0d7a68;
+}
+
+.term-qa-dialog__toggle.is-disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.term-qa-dialog__batch-ignore-toggle {
+  white-space: nowrap;
+}
+
 .number-check__col-reason {
   width: 34%;
 }
@@ -12343,7 +12416,6 @@ onBeforeRouteLeave(async () => {
   border: 1px solid var(--border-color, #dbe3ea);
   border-radius: 8px;
   background: #ffffff;
-  cursor: pointer;
 }
 
 .quality-qa-adjust-dialog__option:hover {
@@ -12358,11 +12430,68 @@ onBeforeRouteLeave(async () => {
   accent-color: #0d7a68;
 }
 
-.quality-qa-adjust-dialog__option span {
+.quality-qa-adjust-dialog__option-main {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.quality-qa-adjust-dialog__option-label {
+  flex: 1 1 auto;
   min-width: 0;
   color: var(--text-primary, #1f2f36);
   font-size: 13px;
   line-height: 1.35;
+}
+
+.quality-qa-adjust-dialog__case-switch {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary, #52646d);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.quality-qa-adjust-dialog__case-switch:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.quality-qa-adjust-dialog__case-switch-track {
+  position: relative;
+  width: 28px;
+  height: 16px;
+  border-radius: 999px;
+  background: #b8c5ca;
+  transition: background 0.18s ease;
+}
+
+.quality-qa-adjust-dialog__case-switch.is-active .quality-qa-adjust-dialog__case-switch-track {
+  background: #0d7a68;
+}
+
+.quality-qa-adjust-dialog__case-switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 24%);
+  transition: transform 0.18s ease;
+}
+
+.quality-qa-adjust-dialog__case-switch.is-active .quality-qa-adjust-dialog__case-switch-thumb {
+  transform: translateX(12px);
 }
 
 .workbench-toolbar__progress {

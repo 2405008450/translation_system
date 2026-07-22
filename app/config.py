@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     languagetool_base_url: str | None = None
     languagetool_timeout_seconds: float = 10.0
     languagetool_max_text_length: int = 20000
+    # 工作台实时拼写检查使用更短的超时和独立并发上限，避免交互请求拖慢 Web worker。
+    languagetool_live_timeout_seconds: float = 2.5
+    languagetool_live_max_concurrency_per_worker: int = 2
+    languagetool_live_queue_timeout_seconds: float = 0.3
+    languagetool_live_cache_ttl_seconds: int = 300
     # 默认关闭保存/确认后的自动拼写语法 QA，避免低优先级检查挤占上传导入队列。
     spelling_grammar_qa_auto_schedule: bool = False
     # LLM settings for reference analysis.

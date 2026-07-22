@@ -11,6 +11,8 @@ import { useAuthStore } from './auth'
 import type {
   FileRecordDetail,
   FileRecordPreview,
+  LiveSpellingIssue,
+  LiveSpellingPreviewResponse,
   LLMGuidelineOptions,
   LLMMergeTarget,
   LLMProvider,
@@ -21,6 +23,7 @@ import type {
   ProjectSyncDisableResult,
   RevisionDisplaySettings,
   Segment,
+  SegmentQAIssue,
   SegmentPageResponse,
   SegmentRevisionEntry,
   SegmentStatusStats,
@@ -35,6 +38,10 @@ import { consumeLLMStream } from '../utils/llmStream'
 const DEFAULT_SEGMENT_PAGE_SIZE = 100
 const MAX_SEGMENT_PAGE_SIZE = 500
 const AUTO_SYNC_DELAY_MS = 1500
+const LIVE_SPELLING_WORD_BOUNDARY_DELAY_MS = 250
+const LIVE_SPELLING_IDLE_DELAY_MS = 400
+const LIVE_SPELLING_RETRY_DELAY_MS = 900
+const LIVE_SPELLING_FAILURE_COOLDOWN_MS = 30000
 const CHANGE_POLL_INTERVAL_MS = 10000
 const CHANGE_POLL_BURST_DELAYS_MS = [1200, 3000, 6000, 10000]
 const SEGMENT_EVENT_RECONNECT_DELAY_MS = 15000
@@ -245,6 +252,12 @@ interface SegmentConflictResponse {
   resolution?: string | null
 }
 
+interface LiveSpellingState {
+  text: string
+  issues: LiveSpellingIssue[]
+  status: 'pending' | 'ready' | 'unavailable'
+}
+
 export const useSegmentStore = defineStore('segment', () => {
   const authStore = useAuthStore()
   const fileRecord = ref<FileRecordDetail | null>(null)
@@ -297,6 +310,7 @@ export const useSegmentStore = defineStore('segment', () => {
   const localRevisionBaselines = ref<Record<string, string>>({})
   const revisionTrackingEnabled = ref(getInitialRevisionTrackingEnabled())
   const revisionSettings = ref<RevisionDisplaySettings>(createDefaultRevisionSettings())
+  const liveSpellingBySegmentKey = ref<Record<string, LiveSpellingState>>({})
 
   // ---- 合并视图(merge-view)模式状态 ----
   // mergeViewId 非空即处于合并模式：segments 中每段带 file_record_id，
@@ -429,6 +443,11 @@ export const useSegmentStore = defineStore('segment', () => {
   let llmAbortController: AbortController | null = null
   let llmReader: ReadableStreamDefaultReader<Uint8Array> | null = null
   let llmAbortRequested = false
+  let liveSpellingTimer: number | null = null
+  let liveSpellingRetryTimer: number | null = null
+  let liveSpellingAbortController: AbortController | null = null
+  let liveSpellingGeneration = 0
+  const liveSpellingCooldownUntilByFileId = new Map<string, number>()
 
   const dirtyCount = computed(() => Object.keys(dirtyEntries.value).length)
   const conflictCount = computed(() => Object.keys(conflictEntries.value).length)
@@ -1217,6 +1236,7 @@ export const useSegmentStore = defineStore('segment', () => {
       syncTimer = null
     }
     stopChangePolling()
+    clearLiveSpellingTimersAndRequest()
 
     fileRecord.value = null
     resetSegments()
@@ -1265,6 +1285,8 @@ export const useSegmentStore = defineStore('segment', () => {
     localRevisionBaselines.value = {}
     revisionTrackingEnabled.value = getInitialRevisionTrackingEnabled()
     revisionSettings.value = createDefaultRevisionSettings()
+    liveSpellingBySegmentKey.value = {}
+    liveSpellingCooldownUntilByFileId.clear()
     syncPromise = null
     loadMorePromise = null
     pendingSegmentPageQuery = null
@@ -1629,6 +1651,7 @@ export const useSegmentStore = defineStore('segment', () => {
     segments.value[index] = nextSegment
     adjustSegmentStatusStats(segment, nextSegment)
     markPreviewUpdate(segmentKey, targetText)
+    scheduleLiveSpellingCheck(segmentKey, targetText)
 
     dirtyEntries.value = {
       ...dirtyEntries.value,
@@ -1760,8 +1783,174 @@ export const useSegmentStore = defineStore('segment', () => {
     return data
   }
 
+  function clearLiveSpellingTimersAndRequest() {
+    if (liveSpellingTimer !== null) {
+      window.clearTimeout(liveSpellingTimer)
+      liveSpellingTimer = null
+    }
+    if (liveSpellingRetryTimer !== null) {
+      window.clearTimeout(liveSpellingRetryTimer)
+      liveSpellingRetryTimer = null
+    }
+    liveSpellingAbortController?.abort()
+    liveSpellingAbortController = null
+    liveSpellingGeneration += 1
+  }
+
+  function isInlineSpellingIssue(issue: SegmentQAIssue | LiveSpellingIssue) {
+    const issueType = (issue.issue_type || '').toLowerCase()
+    const ruleId = (issue.rule_id || '').toUpperCase()
+    const ruleKey = 'rule_key' in issue ? issue.rule_key : 'spelling_grammar'
+    return ruleKey === 'spelling_grammar' && (
+      issueType === 'misspelling'
+      || ruleId.includes('MORFOLOGIK_RULE')
+      || ruleId.includes('HUNSPELL')
+      || ruleId.includes('SPELLER_RULE')
+    )
+  }
+
+  function getInlineSpellingIssues(segment: Segment): Array<SegmentQAIssue | LiveSpellingIssue> {
+    const key = segmentKeyOf(segment)
+    const liveState = liveSpellingBySegmentKey.value[key]
+    if (liveState) {
+      return liveState.text === (segment.target_text || '')
+        ? liveState.issues.filter(isInlineSpellingIssue)
+        : []
+    }
+    return (segment.qa_issues || []).filter(isInlineSpellingIssue)
+  }
+
+  function markLiveSpellingPending(segmentKey: string, text: string) {
+    liveSpellingBySegmentKey.value = {
+      ...liveSpellingBySegmentKey.value,
+      [segmentKey]: {
+        text,
+        issues: [],
+        status: 'pending',
+      },
+    }
+  }
+
+  function scheduleLiveSpellingCheck(segmentKey: string, text: string, delayOverride?: number) {
+    if (activeSentenceId.value !== segmentKey) {
+      return
+    }
+    const index = getSegmentIndex(segmentKey)
+    if (index === -1) {
+      return
+    }
+    const segment = segments.value[index]
+    const fileId = fileRecordIdForSegment(segment)
+    if (!fileId || segment.can_write === false) {
+      return
+    }
+
+    clearLiveSpellingTimersAndRequest()
+    const normalizedText = text || ''
+    markLiveSpellingPending(segmentKey, normalizedText)
+    if (!normalizedText.trim()) {
+      liveSpellingBySegmentKey.value = {
+        ...liveSpellingBySegmentKey.value,
+        [segmentKey]: { text: normalizedText, issues: [], status: 'ready' },
+      }
+      return
+    }
+    if ((liveSpellingCooldownUntilByFileId.get(fileId) || 0) > Date.now()) {
+      liveSpellingBySegmentKey.value = {
+        ...liveSpellingBySegmentKey.value,
+        [segmentKey]: { text: normalizedText, issues: [], status: 'unavailable' },
+      }
+      return
+    }
+
+    const generation = liveSpellingGeneration
+    const delay = delayOverride ?? (
+      /(?:\s|[.,!?;:])$/u.test(normalizedText)
+        ? LIVE_SPELLING_WORD_BOUNDARY_DELAY_MS
+        : LIVE_SPELLING_IDLE_DELAY_MS
+    )
+    liveSpellingTimer = window.setTimeout(() => {
+      liveSpellingTimer = null
+      void runLiveSpellingCheck(segmentKey, normalizedText, fileId, generation, 0)
+    }, delay)
+  }
+
+  async function runLiveSpellingCheck(
+    segmentKey: string,
+    text: string,
+    fileId: string,
+    generation: number,
+    retryCount: number,
+  ) {
+    if (generation !== liveSpellingGeneration || activeSentenceId.value !== segmentKey) {
+      return
+    }
+    const index = getSegmentIndex(segmentKey)
+    const segment = index === -1 ? null : segments.value[index]
+    if (!segment || (segment.target_text || '') !== text) {
+      return
+    }
+
+    const controller = new AbortController()
+    liveSpellingAbortController = controller
+    try {
+      const { data } = await http.post<LiveSpellingPreviewResponse>(
+        `/file-records/${fileId}/segments/${segment.sentence_id}/qa-checks/spelling-grammar/preview`,
+        { text: text.slice(0, 20000) },
+        { signal: controller.signal },
+      )
+      if (
+        generation !== liveSpellingGeneration
+        || activeSentenceId.value !== segmentKey
+        || (segments.value[getSegmentIndex(segmentKey)]?.target_text || '') !== text
+      ) {
+        return
+      }
+      liveSpellingBySegmentKey.value = {
+        ...liveSpellingBySegmentKey.value,
+        [segmentKey]: {
+          text,
+          issues: data.issues || [],
+          status: 'ready',
+        },
+      }
+    } catch (error) {
+      if (controller.signal.aborted || axios.isCancel(error)) {
+        return
+      }
+      const status = Number((error as any)?.response?.status || 0)
+      if (status === 429 && retryCount === 0 && generation === liveSpellingGeneration) {
+        const retryDelay = LIVE_SPELLING_RETRY_DELAY_MS + Math.round(Math.random() * 300)
+        liveSpellingRetryTimer = window.setTimeout(() => {
+          liveSpellingRetryTimer = null
+          void runLiveSpellingCheck(segmentKey, text, fileId, generation, 1)
+        }, retryDelay)
+        return
+      }
+      if (status === 400 || status === 403 || status === 503 || status === 0) {
+        liveSpellingCooldownUntilByFileId.set(
+          fileId,
+          Date.now() + LIVE_SPELLING_FAILURE_COOLDOWN_MS,
+        )
+      }
+      if (generation === liveSpellingGeneration) {
+        liveSpellingBySegmentKey.value = {
+          ...liveSpellingBySegmentKey.value,
+          [segmentKey]: { text, issues: [], status: 'unavailable' },
+        }
+      }
+    } finally {
+      if (liveSpellingAbortController === controller) {
+        liveSpellingAbortController = null
+      }
+    }
+  }
+
   function setActiveSentence(sentenceId: string | null) {
     // sentenceId 在合并模式下是复合键（${file_record_id}:${sentence_id}）
+    if (activeSentenceId.value !== sentenceId) {
+      clearLiveSpellingTimersAndRequest()
+    }
     activeSentenceId.value = sentenceId
     if (sentenceId) {
       const segment = mergeViewId.value
@@ -1770,7 +1959,14 @@ export const useSegmentStore = defineStore('segment', () => {
       activeSourceText.value = segment?.source_text || ''
       activeFileRecordId.value = segment ? fileRecordIdForSegment(segment) : null
       void loadTermMatches(sentenceId, activeSourceText.value)
+      if (segment) {
+        const liveState = liveSpellingBySegmentKey.value[sentenceId]
+        if (!liveState || liveState.text !== (segment.target_text || '') || liveState.status !== 'ready') {
+          scheduleLiveSpellingCheck(sentenceId, segment.target_text || '', LIVE_SPELLING_WORD_BOUNDARY_DELAY_MS)
+        }
+      }
     } else {
+      clearLiveSpellingTimersAndRequest()
       activeSourceText.value = ''
       activeFileRecordId.value = null
     }
@@ -2861,6 +3057,7 @@ export const useSegmentStore = defineStore('segment', () => {
     setActiveSentence,
     refreshActiveTermMatches,
     getTermMatches,
+    getInlineSpellingIssues,
     syncToBackend,
     acceptRevision,
     rejectRevision,

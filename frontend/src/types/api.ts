@@ -538,6 +538,35 @@ export interface SegmentQAIssue {
   updated_at: string | null
 }
 
+export interface LiveSpellingIssue {
+  id: string
+  language: string
+  severity: SegmentQAIssueSeverity
+  message: string
+  short_message: string
+  rule_id: string
+  rule_category: string
+  issue_type: string
+  context_text: string
+  offset: number
+  length: number
+  replacements: string[]
+  target_text_hash: string
+  status: SegmentQAIssueStatus
+}
+
+export interface LiveSpellingPreviewResponse {
+  file_record_id: string
+  segment_id: string
+  sentence_id: string
+  language: string
+  target_text_hash: string
+  checked_length: number
+  truncated: boolean
+  cached: boolean
+  issues: LiveSpellingIssue[]
+}
+
 export type WorkbenchQAResultItemSourceKind = 'segment_qa_issue' | 'term_qa_report_item'
 export type WorkbenchQAResultRuleKey =
   | 'spelling_grammar'
@@ -1010,6 +1039,7 @@ export interface QualityQASettingsResponse {
   settings: {
     rules: Record<string, {
       enabled: boolean
+      case_sensitive?: boolean
     }>
     spelling_grammar: {
       enabled: boolean

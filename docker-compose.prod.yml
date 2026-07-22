@@ -333,6 +333,9 @@ services:
     container_name: ai-translation-languagetool
     environment:
       TZ: ${TZ:-Asia/Shanghai}
+      EXTRAOPTIONS: ${LANGUAGETOOL_JAVA_OPTIONS:--Xms512m -Xmx1536m}
+    mem_limit: ${LANGUAGETOOL_MEMORY_LIMIT:-2g}
+    cpus: ${LANGUAGETOOL_CPU_LIMIT:-2.0}
     expose:
       - "8010"
     restart: unless-stopped

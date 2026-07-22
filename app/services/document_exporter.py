@@ -4,6 +4,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+from html import escape as escape_html
 from html.parser import HTMLParser
 from io import BytesIO
 from itertools import count
@@ -176,6 +177,17 @@ class FormattedTextFragment:
     subscript: bool = False
     superscript: bool = False
 
+    @property
+    def formats(self) -> tuple[bool, bool, bool, bool, bool, bool]:
+        return (
+            self.bold,
+            self.italic,
+            self.underline,
+            self.strike,
+            self.subscript,
+            self.superscript,
+        )
+
 
 def _has_format_tags(html: str | None) -> bool:
     """检查 HTML 是否包含格式标签"""
@@ -185,51 +197,45 @@ def _has_format_tags(html: str | None) -> bool:
 
 
 def _parse_formatted_html(html: str) -> list[FormattedTextFragment]:
-    """解析带格式的 HTML，返回格式化文本片段列表"""
+    """解析编辑器或源文档 HTML，返回仅包含受支持基础格式的文本片段。"""
     fragments: list[FormattedTextFragment] = []
 
     class FormatHTMLParser(HTMLParser):
         def __init__(self):
             super().__init__()
-            self.format_stack: list[set[str]] = [set()]
+            self.format_stack: list[set[str]] = []
             self.current_formats: set[str] = set()
 
         def handle_starttag(self, tag: str, attrs):
             tag_lower = tag.lower()
-            if tag_lower in ('b', 'strong'):
-                self.current_formats.add('bold')
-            elif tag_lower in ('i', 'em'):
-                self.current_formats.add('italic')
-            elif tag_lower == 'u':
-                self.current_formats.add('underline')
-            elif tag_lower in ('s', 'strike', 'del'):
-                self.current_formats.add('strike')
-            elif tag_lower == 'sub':
-                self.current_formats.add('subscript')
-            elif tag_lower == 'sup':
-                self.current_formats.add('superscript')
             self.format_stack.append(self.current_formats.copy())
+            next_formats = self.current_formats.copy()
+            if tag_lower in ('b', 'strong'):
+                next_formats.add('bold')
+            elif tag_lower in ('i', 'em'):
+                next_formats.add('italic')
+            elif tag_lower == 'u':
+                next_formats.add('underline')
+            elif tag_lower in ('s', 'strike', 'del'):
+                next_formats.add('strike')
+            elif tag_lower == 'sub':
+                next_formats.add('subscript')
+            elif tag_lower == 'sup':
+                next_formats.add('superscript')
+
+            style = dict(attrs).get("style") or ""
+            next_formats.update(_formats_from_inline_css(style))
+            self.current_formats = next_formats
 
         def handle_endtag(self, tag: str):
-            tag_lower = tag.lower()
-            if tag_lower in ('b', 'strong'):
-                self.current_formats.discard('bold')
-            elif tag_lower in ('i', 'em'):
-                self.current_formats.discard('italic')
-            elif tag_lower == 'u':
-                self.current_formats.discard('underline')
-            elif tag_lower in ('s', 'strike', 'del'):
-                self.current_formats.discard('strike')
-            elif tag_lower == 'sub':
-                self.current_formats.discard('subscript')
-            elif tag_lower == 'sup':
-                self.current_formats.discard('superscript')
             if self.format_stack:
-                self.format_stack.pop()
+                self.current_formats = self.format_stack.pop()
+            else:
+                self.current_formats = set()
 
         def handle_data(self, data: str):
             if data:
-                fragments.append(FormattedTextFragment(
+                fragment = FormattedTextFragment(
                     text=data,
                     bold='bold' in self.current_formats,
                     italic='italic' in self.current_formats,
@@ -237,11 +243,178 @@ def _parse_formatted_html(html: str) -> list[FormattedTextFragment]:
                     strike='strike' in self.current_formats,
                     subscript='subscript' in self.current_formats,
                     superscript='superscript' in self.current_formats,
-                ))
+                )
+                if fragments and fragments[-1].formats == fragment.formats:
+                    previous = fragments[-1]
+                    fragments[-1] = FormattedTextFragment(
+                        text=previous.text + fragment.text,
+                        bold=fragment.bold,
+                        italic=fragment.italic,
+                        underline=fragment.underline,
+                        strike=fragment.strike,
+                        subscript=fragment.subscript,
+                        superscript=fragment.superscript,
+                    )
+                else:
+                    fragments.append(fragment)
 
     parser = FormatHTMLParser()
     parser.feed(html)
     return fragments
+
+
+def _formats_from_inline_css(style: str) -> set[str]:
+    declarations: dict[str, str] = {}
+    for declaration in style.split(";"):
+        if ":" not in declaration:
+            continue
+        name, value = declaration.split(":", 1)
+        declarations[name.strip().lower()] = value.strip().lower()
+
+    formats: set[str] = set()
+    font_weight = declarations.get("font-weight", "")
+    if font_weight in {"bold", "bolder"}:
+        formats.add("bold")
+    else:
+        try:
+            if int(font_weight) >= 600:
+                formats.add("bold")
+        except ValueError:
+            pass
+
+    font_style = declarations.get("font-style", "")
+    if "italic" in font_style or "oblique" in font_style:
+        formats.add("italic")
+
+    text_decoration = " ".join(
+        (
+            declarations.get("text-decoration", ""),
+            declarations.get("text-decoration-line", ""),
+        )
+    )
+    if "underline" in text_decoration:
+        formats.add("underline")
+    if "line-through" in text_decoration:
+        formats.add("strike")
+
+    vertical_align = declarations.get("vertical-align", "")
+    if vertical_align == "sub":
+        formats.add("subscript")
+    elif vertical_align in {"super", "sup"}:
+        formats.add("superscript")
+    return formats
+
+
+def _derive_target_html_from_source(source_html: str | None, target_text: str) -> str | None:
+    """保守地把源文档的基础字符格式投影到译文。
+
+    文本完全相同时逐 run 保留；文本变化后只保留全段共同格式，并迁移在译文中
+    唯一出现的带格式原文片段。这样可以保留姓名、日期等锚点，同时避免首个 run
+    的下划线或粗体错误扩散到整句。
+    """
+    if (
+        not source_html
+        or not target_text
+        or "\n" in target_text
+        or "\r" in target_text
+        or re.search(r"<\s*a\b", source_html, re.IGNORECASE)
+    ):
+        return None
+
+    source_fragments = _parse_formatted_html(source_html)
+    if not source_fragments or not any(any(fragment.formats) for fragment in source_fragments):
+        return None
+
+    source_text = "".join(fragment.text for fragment in source_fragments)
+    if (
+        source_text == target_text
+        or _collapse_html_projection_whitespace(source_text)
+        == _collapse_html_projection_whitespace(target_text)
+    ):
+        return "".join(_formatted_fragment_to_html(fragment) for fragment in source_fragments)
+
+    meaningful_fragments = [fragment for fragment in source_fragments if fragment.text.strip()]
+    common_formats = tuple(
+        bool(meaningful_fragments) and all(fragment.formats[index] for fragment in meaningful_fragments)
+        for index in range(6)
+    )
+    target_formats = [set(_format_names_from_flags(common_formats)) for _ in target_text]
+
+    candidates = sorted(
+        (
+            fragment for fragment in source_fragments
+            if any(fragment.formats) and len(re.sub(r"\W", "", fragment.text, flags=re.UNICODE)) >= 2
+        ),
+        key=lambda fragment: len(fragment.text),
+        reverse=True,
+    )
+    for fragment in candidates:
+        matches = _find_unique_whitespace_flexible_match(target_text, fragment.text)
+        if len(matches) != 1:
+            continue
+        start, end = matches[0]
+        names = _format_names_from_flags(fragment.formats)
+        for index in range(start, end):
+            target_formats[index].update(names)
+
+    if not any(target_formats):
+        return None
+    return _render_text_with_format_sets(target_text, target_formats)
+
+
+FORMAT_NAMES = ("bold", "italic", "underline", "strike", "subscript", "superscript")
+
+
+def _collapse_html_projection_whitespace(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _format_names_from_flags(flags: tuple[bool, bool, bool, bool, bool, bool]) -> tuple[str, ...]:
+    return tuple(name for name, enabled in zip(FORMAT_NAMES, flags, strict=True) if enabled)
+
+
+def _find_unique_whitespace_flexible_match(text: str, candidate: str) -> list[tuple[int, int]]:
+    stripped = candidate.strip()
+    if not stripped:
+        return []
+    pieces = re.split(r"\s+", stripped)
+    pattern = r"\s+".join(re.escape(piece) for piece in pieces)
+    return [(match.start(), match.end()) for match in re.finditer(pattern, text)]
+
+
+def _formatted_fragment_to_html(fragment: FormattedTextFragment) -> str:
+    return _wrap_html_with_formats(escape_html(fragment.text), _format_names_from_flags(fragment.formats))
+
+
+def _render_text_with_format_sets(text: str, format_sets: list[set[str]]) -> str:
+    parts: list[str] = []
+    start = 0
+    while start < len(text):
+        current_formats = format_sets[start]
+        end = start + 1
+        while end < len(text) and format_sets[end] == current_formats:
+            end += 1
+        ordered_formats = tuple(name for name in FORMAT_NAMES if name in current_formats)
+        parts.append(_wrap_html_with_formats(escape_html(text[start:end]), ordered_formats))
+        start = end
+    return "".join(parts)
+
+
+def _wrap_html_with_formats(content: str, formats: tuple[str, ...]) -> str:
+    tag_by_format = {
+        "bold": "b",
+        "italic": "i",
+        "underline": "u",
+        "strike": "s",
+        "subscript": "sub",
+        "superscript": "sup",
+    }
+    for format_name in reversed(FORMAT_NAMES):
+        if format_name not in formats:
+            continue
+        tag = tag_by_format[format_name]
+        content = f"<{tag}>{content}</{tag}>"
+    return content
 
 
 @dataclass(frozen=True)
@@ -253,6 +426,7 @@ class ExportSegment:
     numbering_text: str = ""
     matched_source_text: str = ""
     target_html: str | None = None
+    source_html: str | None = None
     math_placeholders: dict[str, str] = field(default_factory=dict)
     sequence_index: int | None = None
     source_structure_changed: bool = False
@@ -469,6 +643,15 @@ def _group_segments_by_block(
             source_segment_by_id
             and _export_segment_text_matches_source_segment(segment, source_segment_by_id)
         )
+        source_html = _get_segment_value(segment, "source_html")
+        if not source_html and has_original_source_match and source_segment_by_id is not None:
+            source_html = source_segment_by_id.get("source_html")
+        if not source_html and has_original_source_match and source_segment_by_text is not None:
+            source_html = source_segment_by_text.get("source_html")
+        resolved_target_html = str(target_html) if target_html else _derive_target_html_from_source(
+            str(source_html) if source_html else None,
+            str(_get_segment_value(segment, "target_text", "") or ""),
+        )
 
         grouped[block_key].append(
             ExportSegment(
@@ -478,7 +661,8 @@ def _group_segments_by_block(
                 display_text=str(_get_segment_value(segment, "display_text", "") or ""),
                 numbering_text=str(_get_segment_value(segment, "numbering_text", "") or ""),
                 matched_source_text=str(_get_segment_value(segment, "matched_source_text", "") or ""),
-                target_html=str(target_html) if target_html else None,
+                target_html=resolved_target_html,
+                source_html=str(source_html) if source_html else None,
                 math_placeholders=dict(math_map.get(sentence_id) or {}),
                 sequence_index=_get_export_sequence_index(segment),
                 source_structure_changed=bool(source_segment_list) and not has_original_source_match,
@@ -2397,6 +2581,7 @@ def _build_inline_bilingual_segments(
                 numbering_text=segment.numbering_text,
                 matched_source_text=segment.matched_source_text,
                 target_html=None,
+                source_html=segment.source_html,
                 math_placeholders=segment.math_placeholders,
                 sequence_index=segment.sequence_index,
                 source_structure_changed=segment.source_structure_changed,

@@ -712,6 +712,7 @@ function createQualityQARuleDraft(): QualityQARuleDraft {
 
 const qualityQADraft = reactive({
   rules: createQualityQARuleDraft(),
+  termQACaseSensitive: false,
 })
 
 const enabledQualityQARuleCount = computed(() => (
@@ -734,6 +735,9 @@ function getSavedQualityQARuleEnabled(rule: typeof qualityQARules[number]) {
 }
 const qualityQASettingsDirty = computed(() => (
   qualityQARules.some((rule) => qualityQADraft.rules[rule.key] !== getSavedQualityQARuleEnabled(rule))
+  || qualityQADraft.termQACaseSensitive !== Boolean(
+    qualityQASettings.value?.settings.rules?.term_inconsistency?.case_sensitive,
+  )
 ))
 const qualityQARuleStatusText = computed(() => {
   if (enabledQualityQARuleCount.value === 0) {
@@ -3248,15 +3252,21 @@ function syncQualityQADraftFromSettings(data: QualityQASettingsResponse) {
       ? ruleSetting.enabled
       : (rule.key === 'spelling_grammar' ? data.settings.spelling_grammar.enabled : rule.defaultEnabled)
   }
+  qualityQADraft.termQACaseSensitive = Boolean(
+    data.settings.rules?.term_inconsistency?.case_sensitive,
+  )
 }
 
 function buildQualityQARulesPayload() {
   return qualityQARules.reduce((payload, rule) => {
     payload[rule.key] = {
       enabled: qualityQADraft.rules[rule.key],
+      ...(rule.key === 'term_inconsistency'
+        ? { case_sensitive: qualityQADraft.termQACaseSensitive }
+        : {}),
     }
     return payload
-  }, {} as Record<QualityQARuleKey, { enabled: boolean }>)
+  }, {} as Record<QualityQARuleKey, { enabled: boolean; case_sensitive?: boolean }>)
 }
 
 function toggleAllQualityQARules(event: Event) {
@@ -6469,7 +6479,31 @@ onBeforeUnmount(() => {
                               />
                             </label>
                           </td>
-                          <td>{{ rule.label }}</td>
+                          <td>
+                            <span class="quality-qa-settings__rule-content">
+                              <span>{{ rule.label }}</span>
+                              <label
+                                v-if="rule.key === 'term_inconsistency'"
+                                class="quality-qa-settings__case-switch"
+                                :class="{
+                                  'is-active': qualityQADraft.termQACaseSensitive,
+                                  'is-disabled': savingQualityQASettings || loadingQualityQASettings || !qualityQADraft.rules.term_inconsistency,
+                                }"
+                              >
+                                <input
+                                  v-model="qualityQADraft.termQACaseSensitive"
+                                  type="checkbox"
+                                  role="switch"
+                                  :disabled="savingQualityQASettings || loadingQualityQASettings || !qualityQADraft.rules.term_inconsistency"
+                                  aria-label="术语不一致检查区分大小写"
+                                />
+                                <span class="quality-qa-settings__case-switch-track" aria-hidden="true">
+                                  <span class="quality-qa-settings__case-switch-thumb"></span>
+                                </span>
+                                <span>{{ qualityQADraft.termQACaseSensitive ? '区分大小写' : '不区分大小写' }}</span>
+                              </label>
+                            </span>
+                          </td>
                         </tr>
                         <tr
                           v-for="(rule, index) in qualityQAPlaceholderRules"
@@ -12020,6 +12054,66 @@ onBeforeUnmount(() => {
     scroll-snap-align: start;
   }
 
+}
+
+.quality-qa-settings__rule-content {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.quality-qa-settings__case-switch {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.quality-qa-settings__case-switch input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.quality-qa-settings__case-switch.is-disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.quality-qa-settings__case-switch-track {
+  position: relative;
+  width: 28px;
+  height: 16px;
+  border-radius: 999px;
+  background: var(--border-strong, #aebdc4);
+  transition: background 0.18s ease;
+}
+
+.quality-qa-settings__case-switch.is-active .quality-qa-settings__case-switch-track {
+  background: var(--brand-700);
+}
+
+.quality-qa-settings__case-switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 24%);
+  transition: transform 0.18s ease;
+}
+
+.quality-qa-settings__case-switch.is-active .quality-qa-settings__case-switch-thumb {
+  transform: translateX(12px);
 }
 
 @media (max-width: 720px) {
