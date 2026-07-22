@@ -158,7 +158,7 @@ type SideToolKey = 'match-info' | 'terms' | 'resource-search' | 'notes' | 'refer
 type ResourceImportTab = 'tm' | 'glossary' | 'term'
 type SaveToTMScope = 'translated' | 'confirmed'
 type SaveToTMTargetMode = 'new' | 'existing'
-type SegmentDisplayScope = 'all' | 'project_sync_only' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'confirmed_only' | 'empty_target'
+type SegmentDisplayScope = 'all' | 'project_sync_only' | 'exact_only' | 'fuzzy_only' | 'none_only' | 'pending_confirmation' | 'confirmed_only' | 'empty_target'
 type RevisionMenuKind = 'track' | 'accept' | 'reject'
 type ResourceSearchMode = 'exact' | 'fuzzy'
 type FileExportStatus = 'queued' | 'running' | 'completed' | 'failed'
@@ -1190,6 +1190,10 @@ const statusSummaryCounters = computed(() => (
 
 const statusSummary = computed(() => {
   const counters = statusSummaryCounters.value
+  const pendingConfirmationCount = Math.max(
+    0,
+    counters.total - counters.confirmed - counters.empty_target,
+  )
 
   return [
     {
@@ -1225,12 +1229,20 @@ const statusSummary = computed(() => {
       description: '无匹配：没有从记忆库找到可用匹配的句段。',
     },
     {
+      key: 'pending_confirmation',
+      label: '待确认译文',
+      value: pendingConfirmationCount,
+      tone: 'pending-confirmation',
+      scope: 'pending_confirmation' as const,
+      description: '待确认译文：内容已经自动保存，但尚未经过人工确认。',
+    },
+    {
       key: 'confirmed',
       label: '已确认译文',
       value: counters.confirmed,
       tone: 'confirmed',
       scope: 'confirmed_only' as const,
-      description: '已确认译文：表示人工保存的译文，后续批处理默认会跳过。',
+      description: '已确认译文：表示已经人工确认的译文，后续批处理默认会跳过。',
     },
     {
       key: 'empty_target',
@@ -1643,8 +1655,7 @@ const lastModifiedStatusText = computed(() => {
     || null
   )
   const formatted = formatWorkbenchStatusTime(modifiedAt)
-  const pendingSuffix = segmentStore.dirtyCount > 0 ? `（待保存 ${segmentStore.dirtyCount} 条）` : ''
-  return `最后修改：${formatted || '--'}${pendingSuffix}`
+  return `最后修改：${formatted || '--'}`
 })
 
 const ribbonStatusTitle = computed(() => (
@@ -2092,6 +2103,7 @@ const segmentDisplayScopeOptions = computed<Array<{ value: SegmentDisplayScope; 
   { value: 'exact_only', label: t('workbench.statusSummary.exact') },
   { value: 'fuzzy_only', label: t('workbench.search.scopes.fuzzyOnly') },
   { value: 'none_only', label: t('workbench.search.scopes.noneOnly') },
+  { value: 'pending_confirmation', label: '待确认译文' },
   { value: 'confirmed_only', label: '已确认译文' },
   { value: 'empty_target', label: '空译文' },
 ])
@@ -2149,6 +2161,9 @@ function matchesSegmentDisplayScope(segment: Segment) {
   }
   if (segmentDisplayScope.value === 'confirmed_only') {
     return segment.status === 'confirmed'
+  }
+  if (segmentDisplayScope.value === 'pending_confirmation') {
+    return segment.status !== 'confirmed' && !isEmptyTargetForWorkbench(segment.target_text)
   }
   if (segmentDisplayScope.value === 'empty_target') {
     return isEmptyTargetForWorkbench(segment.target_text)
@@ -8292,7 +8307,7 @@ onBeforeRouteLeave(async () => {
         </button>
 
         <p class="workbench-overview__tip">
-          Tips：已确认译文表示人工保存的译文，后续批处理默认会跳过。
+          Tips：译文会自动保存；人工确认后的译文，后续批处理默认会跳过。
         </p>
 
         <div class="workbench-load-all">
@@ -8348,8 +8363,8 @@ onBeforeRouteLeave(async () => {
               <span>{{ item.label }}</span>
               <strong>{{ item.value }}</strong>
             </button>
-            <span class="segment-editor-toolbar__tip" title="已确认译文表示人工保存的译文，后续批处理默认会跳过。">
-              Tips：已确认译文后续批处理默认跳过。
+            <span class="segment-editor-toolbar__tip" title="译文会自动保存；人工确认后的译文，后续批处理默认会跳过。">
+              Tips：译文自动保存，确认后批处理默认跳过。
             </span>
             <span class="segment-editor-toolbar__loaded">
               {{ t('workbench.pageModeHint') }}

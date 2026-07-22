@@ -1694,6 +1694,15 @@ body.modal-open {
   --workbench-stat-active-shadow: rgba(93, 149, 202, 0.15);
 }
 
+.workbench-page .workbench-stat--pending-confirmation {
+  --workbench-stat-bg: linear-gradient(180deg, #fff8df, #fffef9);
+  --workbench-stat-border: #e2c875;
+  --workbench-stat-active-bg: linear-gradient(180deg, #ffecad, #fff7da);
+  --workbench-stat-active-border: #bd8d18;
+  --workbench-stat-active-text: #70500a;
+  --workbench-stat-active-shadow: rgba(189, 141, 24, 0.16);
+}
+
 .workbench-page .workbench-stat--empty {
   --workbench-stat-bg: linear-gradient(180deg, #fff0eb, #fffdfb);
   --workbench-stat-border: #e5b5a4;
@@ -2914,6 +2923,15 @@ body.modal-open {
   --workbench-stat-active-border: #5d95ca;
   --workbench-stat-active-text: #24577f;
   --workbench-stat-active-shadow: rgba(93, 149, 202, 0.15);
+}
+
+.workbench-stat--pending-confirmation {
+  --workbench-stat-bg: linear-gradient(180deg, #fff8df, #fffef9);
+  --workbench-stat-border: #e2c875;
+  --workbench-stat-active-bg: linear-gradient(180deg, #ffecad, #fff7da);
+  --workbench-stat-active-border: #bd8d18;
+  --workbench-stat-active-text: #70500a;
+  --workbench-stat-active-shadow: rgba(189, 141, 24, 0.16);
 }
 
 .workbench-stat--empty {

@@ -1038,8 +1038,10 @@ export const useSegmentStore = defineStore('segment', () => {
     pollingChanges = true
     try {
       const currentFileRecordId = fileRecord.value.id
-      const nextConflicts = { ...conflictEntries.value }
-      const nextDirtyEntries = { ...dirtyEntries.value }
+      // 轮询期间自动保存可能会完成并清空 dirtyEntries。这里只记录轮询发现的
+      // 版本推进和冲突，结束时再合并到最新状态，避免旧快照把已保存条目“复活”。
+      const dirtyBaseVersionBumps = new Map<string, number>()
+      const addedConflicts: Record<string, string> = {}
       let conflictAdded = false
       let hasMore = true
       let pageGuard = 0
@@ -1061,16 +1063,22 @@ export const useSegmentStore = defineStore('segment', () => {
             const remoteVersion = Number(remoteSegment.version || 1)
             if (remoteVersion > baseVersion) {
               if ((remoteSegment.target_text || '') === (dirtyEntry.target_text || '')) {
-                bumpDirtyBaseVersion(nextDirtyEntries, remoteSegment.sentence_id, remoteVersion)
+                dirtyBaseVersionBumps.set(
+                  remoteSegment.sentence_id,
+                  Math.max(dirtyBaseVersionBumps.get(remoteSegment.sentence_id) || 0, remoteVersion),
+                )
               } else if (isSensitiveRemoteConflict(
                 remoteSegment.source,
                 remoteSegment.last_modified_by_id,
                 dirtyEntry.source,
               )) {
-                nextConflicts[remoteSegment.sentence_id] = remoteSegment.target_text || ''
+                addedConflicts[remoteSegment.sentence_id] = remoteSegment.target_text || ''
                 conflictAdded = true
               } else {
-                bumpDirtyBaseVersion(nextDirtyEntries, remoteSegment.sentence_id, remoteVersion)
+                dirtyBaseVersionBumps.set(
+                  remoteSegment.sentence_id,
+                  Math.max(dirtyBaseVersionBumps.get(remoteSegment.sentence_id) || 0, remoteVersion),
+                )
               }
               applyServerSegmentMetadata(remoteSegment.sentence_id, remoteSegment)
               continue
@@ -1085,8 +1093,15 @@ export const useSegmentStore = defineStore('segment', () => {
         hasMore = Boolean(data.has_more)
       }
 
-      dirtyEntries.value = nextDirtyEntries
-      conflictEntries.value = nextConflicts
+      const latestDirtyEntries = { ...dirtyEntries.value }
+      for (const [sentenceId, version] of dirtyBaseVersionBumps) {
+        bumpDirtyBaseVersion(latestDirtyEntries, sentenceId, version)
+      }
+      dirtyEntries.value = latestDirtyEntries
+      conflictEntries.value = {
+        ...conflictEntries.value,
+        ...addedConflicts,
+      }
       if (conflictAdded) {
         syncMessage.value = '检测到其他用户已更新同一句段，请确认后再保存本地修改。'
         pushToast({

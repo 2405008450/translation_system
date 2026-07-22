@@ -326,9 +326,29 @@ test.describe.serial('核心 E2E 冒烟流程', () => {
     await expect(focusEditor).toBeVisible()
     await focusEditor.fill(translatedText)
     await saveWorkbenchNow(focusPage)
+    await expect(focusPage.locator('.workbench-ribbon__status')).toContainText('已自动保存')
+    await expect(focusPage.locator('.workbench-ribbon__modified-time')).not.toContainText('待保存')
+
+    // 保存事件会触发增量轮询；轮询完成后再次保存不应重发已经落库的译文。
+    let redundantSegmentPuts = 0
+    focusPage.on('request', (request) => {
+      if (request.method() === 'PUT' && request.url().includes('/segments')) {
+        redundantSegmentPuts += 1
+      }
+    })
+    await focusPage.waitForTimeout(2_000)
+    await focusPage.getByTestId('workbench-save-button').click()
+    await focusPage.waitForTimeout(500)
+    expect(redundantSegmentPuts).toBe(0)
 
     await focusPage.reload()
     await expect(focusPage.getByTestId('segment-target-editor').first()).toContainText(translatedText)
+    const pendingConfirmationStat = focusPage.locator('.workbench-stat--pending-confirmation')
+    await expect(pendingConfirmationStat).toContainText('待确认译文')
+    await expect(pendingConfirmationStat).toContainText('1')
+    await pendingConfirmationStat.click()
+    await expect(focusPage.getByTestId('segment-target-editor')).toHaveCount(1)
+    await expect(focusPage.getByTestId('segment-target-editor')).toContainText(translatedText)
 
     const focusDownloadPromise = focusPage.waitForEvent('download')
     await expect(focusPage.getByTestId('workbench-export-button')).toBeEnabled()

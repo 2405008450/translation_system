@@ -301,7 +301,9 @@ from app.services.merge_view_service import (
     serialize_merge_view_summary,
 )
 from app.services.project_segment_sync import (
+    PretranslationLLMConvergenceSummary,
     ProjectSyncDisableSummary,
+    converge_pretranslation_llm_segments,
     disable_project_sync_for_segments,
     empty_project_segment_sync_summary,
     enable_project_sync_for_segments,
@@ -1711,7 +1713,12 @@ def _serialize_pretranslation_task(task: PretranslationTask) -> dict[str, Any]:
     }
 
 
-def _refresh_pretranslation_run_status(db: Session, run: PretranslationRun) -> None:
+def _refresh_pretranslation_run_status(
+    db: Session,
+    run: PretranslationRun,
+    *,
+    finalize_if_terminal: bool = True,
+) -> None:
     tasks = (
         db.query(PretranslationTask)
         .filter(PretranslationTask.run_id == run.id)
@@ -1734,6 +1741,13 @@ def _refresh_pretranslation_run_status(db: Session, run: PretranslationRun) -> N
             run.started_at = _pretranslation_now()
         run.completed_at = None
         run.message = "预翻译正在后台执行"
+    elif not finalize_if_terminal:
+        if run.status not in PRETRANSLATION_TERMINAL_STATUSES:
+            # 文件任务结束后还有一次跨文件收敛；在收敛提交前不能提前对外宣告完成。
+            run.status = "running"
+            run.progress = min(run.progress, 99)
+            run.completed_at = None
+            run.message = "正在统一跨文件重复译文"
     else:
         if failed:
             run.status = "failed"
@@ -1797,7 +1811,7 @@ def _update_pretranslation_task(task_id: UUID, **values: Any) -> None:
             task.progress = 100
         run = db.query(PretranslationRun).filter(PretranslationRun.id == task.run_id).first()
         if run is not None:
-            _refresh_pretranslation_run_status(db, run)
+            _refresh_pretranslation_run_status(db, run, finalize_if_terminal=False)
         db.commit()
 
 
@@ -2243,6 +2257,52 @@ def _run_pretranslation_tasks_for_run(run_id: UUID, task_ids: list[UUID]) -> Non
                 )
 
 
+def _converge_pretranslation_run_llm_segments(
+    run_id: UUID,
+    task_ids: list[UUID],
+) -> PretranslationLLMConvergenceSummary:
+    summary = PretranslationLLMConvergenceSummary()
+    with SessionLocal() as db:
+        run = db.query(PretranslationRun).filter(PretranslationRun.id == run_id).first()
+        if run is None or not _load_pretranslation_options(run).get("use_llm"):
+            return summary
+
+        tasks = (
+            db.query(PretranslationTask)
+            .filter(
+                PretranslationTask.run_id == run_id,
+                PretranslationTask.id.in_(task_ids),
+            )
+            .all()
+        )
+        tasks_by_id = {task.id: task for task in tasks}
+        ordered_file_record_ids = [
+            tasks_by_id[task_id].file_record_id
+            for task_id in task_ids
+            if task_id in tasks_by_id and tasks_by_id[task_id].status == "completed"
+        ]
+        if len(ordered_file_record_ids) < 2:
+            return summary
+
+        current_user = (
+            db.query(User).filter(User.id == run.created_by_id).first()
+            if run.created_by_id is not None
+            else None
+        )
+        summary = converge_pretranslation_llm_segments(
+            db,
+            project_id=run.project_id,
+            ordered_file_record_ids=ordered_file_record_ids,
+            current_user=current_user,
+            updated_since=run.started_at,
+        )
+        db.commit()
+
+    if summary.affected_file_ids:
+        publish_segment_changes(summary.affected_file_ids)
+    return summary
+
+
 def _run_pretranslation_run(run_id: UUID) -> None:
     with SessionLocal() as db:
         run = db.query(PretranslationRun).filter(PretranslationRun.id == run_id).first()
@@ -2265,10 +2325,28 @@ def _run_pretranslation_run(run_id: UUID) -> None:
 
     _run_pretranslation_tasks_for_run(run_id, task_ids)
 
+    convergence_summary = PretranslationLLMConvergenceSummary()
+    convergence_error: Exception | None = None
+    try:
+        convergence_summary = _converge_pretranslation_run_llm_segments(run_id, task_ids)
+    except Exception as exc:  # noqa: BLE001
+        convergence_error = exc
+        logger.exception("pretranslation cross-file convergence failed run_id=%s", run_id)
+
     with SessionLocal() as db:
         run = db.query(PretranslationRun).filter(PretranslationRun.id == run_id).first()
         if run is not None:
             _refresh_pretranslation_run_status(db, run)
+            if convergence_error is not None:
+                run.status = "failed"
+                run.progress = 100
+                run.message = "预翻译文件处理已完成，但跨文件重复译文统一失败"
+                run.completed_at = run.completed_at or _pretranslation_now()
+            elif run.status == "completed" and convergence_summary.updated_count:
+                run.message = (
+                    "预翻译已完成，已统一 "
+                    f"{convergence_summary.updated_count} 条跨文件重复译文"
+                )
             db.commit()
 
 
@@ -2471,7 +2549,7 @@ def get_pretranslation_run(
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在。")
     _require_project_read_access(project, current_user, db)
-    _refresh_pretranslation_run_status(db, run)
+    _refresh_pretranslation_run_status(db, run, finalize_if_terminal=False)
     db.commit()
     db.refresh(run)
     return _serialize_pretranslation_run(run)
@@ -10083,6 +10161,11 @@ def _apply_segment_scope_filter(query, scope: str):
         return query.filter(status_conditions["none"])
     if normalized_scope == "confirmed_only":
         return query.filter(status_conditions["confirmed"])
+    if normalized_scope == "pending_confirmation":
+        return query.filter(
+            ~status_conditions["confirmed"],
+            func.coalesce(Segment.target_text, "") != "",
+        )
     if normalized_scope == "empty_target":
         return query.filter(func.coalesce(Segment.target_text, "") == "")
     return query
