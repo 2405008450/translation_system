@@ -2694,6 +2694,7 @@ class ProjectAssignmentEntryRequest(BaseModel):
 class ProjectAssignmentsRequest(BaseModel):
     assignments: list[ProjectAssignmentEntryRequest] = Field(default_factory=list)
     base_revision: str | None = None
+    workflow_transition_mode: Literal["prompt", "advance", "assign_only"] = "prompt"
 
 
 class WorkflowStepRequest(BaseModel):
@@ -3629,9 +3630,32 @@ def _apply_segment_assignment_visibility_filter(
     if _file_has_unindexed_display_segments(db, file_record.id):
         refresh_segment_display_indexes(db, file_record)
 
+    # 流程阶段限制的是编辑权，而不是审阅上下文的读取权。后续阶段的译者需要
+    # 看到当前阶段及之前阶段的内容，否则在管理员尚未执行流程流转时，任务页会
+    # 返回 0 个句段并呈现空白。编辑接口仍通过
+    # ``_can_write_segment_with_assignments`` 严格校验为“当前阶段完全匹配”。
+    workflow_steps = _load_project_workflow_steps(db, file_record.project_id)
+    workflow_step_by_id = {step.id: step for step in workflow_steps}
+    first_step_id = workflow_steps[0].id if workflow_steps else None
+
     visibility_conditions = []
     for assignment in visible_assignments:
-        condition = Segment.workflow_step_id == assignment.workflow_step_id
+        assigned_step = workflow_step_by_id.get(assignment.workflow_step_id)
+        if assigned_step is None:
+            readable_step_ids = [assignment.workflow_step_id]
+        else:
+            assigned_order = int(assigned_step.sort_order or 0)
+            readable_step_ids = [
+                step.id
+                for step in workflow_steps
+                if int(step.sort_order or 0) <= assigned_order
+            ]
+
+        step_condition = Segment.workflow_step_id.in_(readable_step_ids)
+        if first_step_id in readable_step_ids:
+            # 兼容尚未完成历史数据回填的句段；正常详情接口会先将其归到首阶段。
+            step_condition = or_(step_condition, Segment.workflow_step_id.is_(None))
+        condition = step_condition
         if assignment.range_start is not None and assignment.range_end is not None:
             condition = and_(
                 condition,
@@ -4295,6 +4319,160 @@ def _calculate_project_assignment_revision(db: Session, project_id: UUID) -> str
     return hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
 
 
+def _assignment_transition_range_condition(
+    ranges: list[tuple[int | None, int | None]],
+):
+    if any(range_start is None and range_end is None for range_start, range_end in ranges):
+        return None
+    conditions = [
+        and_(
+            Segment.display_index >= int(range_start) - 1,
+            Segment.display_index <= int(range_end) - 1,
+        )
+        for range_start, range_end in ranges
+        if range_start is not None and range_end is not None
+    ]
+    return or_(*conditions) if conditions else literal(False)
+
+
+def _build_assignment_workflow_transition_preview(
+    db: Session,
+    project: Project,
+    desired: dict[tuple[UUID, UUID], set[AssignmentTarget]],
+) -> list[dict[str, Any]]:
+    """找出派稿目标阶段之前、可一键推进的句段。
+
+    只允许从紧邻的上一阶段推进，避免把“翻译”静默跨级推进到“终审”。
+    同一文件、同一目标阶段下的多人分段授权会合并成一个范围并集。
+    """
+    workflow_steps = _load_project_workflow_steps(db, project.id)
+    workflow_step_index = {step.id: index for index, step in enumerate(workflow_steps)}
+    first_step_id = workflow_steps[0].id if workflow_steps else None
+    existing_targets = {
+        (
+            assignment.assignee_id,
+            assignment.workflow_step_id or first_step_id,
+            assignment.file_record_id,
+            assignment.segment_range_start,
+            assignment.segment_range_end,
+        )
+        for assignment in (
+            db.query(FileAssignment)
+            .filter(
+                FileAssignment.project_id == project.id,
+                FileAssignment.status == ASSIGNMENT_STATUS_ACTIVE,
+            )
+            .all()
+        )
+    }
+    targets_by_file_step: dict[tuple[UUID, UUID], set[tuple[int | None, int | None]]] = {}
+    for (assignee_id, workflow_step_id), targets in desired.items():
+        for file_record_id, range_start, range_end in targets:
+            if (
+                assignee_id,
+                workflow_step_id,
+                file_record_id,
+                range_start,
+                range_end,
+            ) in existing_targets:
+                continue
+            targets_by_file_step.setdefault((file_record_id, workflow_step_id), set()).add(
+                (range_start, range_end)
+            )
+
+    file_ids = sorted({file_id for file_id, _ in targets_by_file_step}, key=str)
+    files_by_id = {
+        file_record.id: file_record
+        for file_record in (
+            db.query(FileRecord)
+            .filter(FileRecord.project_id == project.id, FileRecord.id.in_(file_ids))
+            .all()
+            if file_ids
+            else []
+        )
+    }
+    preview: list[dict[str, Any]] = []
+    for (file_record_id, target_step_id), raw_ranges in sorted(
+        targets_by_file_step.items(),
+        key=lambda item: (str(item[0][0]), str(item[0][1])),
+    ):
+        target_index = workflow_step_index.get(target_step_id)
+        if target_index is None or target_index <= 0:
+            continue
+        file_record = files_by_id.get(file_record_id)
+        if file_record is None:
+            continue
+        from_step = workflow_steps[target_index - 1]
+        target_step = workflow_steps[target_index]
+        ranges = sorted(
+            raw_ranges,
+            key=lambda item: (
+                item[0] is not None,
+                item[0] if item[0] is not None else 0,
+                item[1] if item[1] is not None else 0,
+            ),
+        )
+        if not any(range_start is None and range_end is None for range_start, range_end in ranges):
+            if _file_has_unindexed_display_segments(db, file_record_id):
+                refresh_segment_display_indexes(db, file_record)
+        query = db.query(Segment.id).filter(
+            Segment.file_record_id == file_record_id,
+            Segment.workflow_step_id == from_step.id,
+        )
+        range_condition = _assignment_transition_range_condition(ranges)
+        if range_condition is not None:
+            query = query.filter(range_condition)
+        matched_count = int(query.count() or 0)
+        if matched_count <= 0:
+            continue
+        preview.append({
+            "file_record_id": str(file_record_id),
+            "filename": file_record.filename,
+            "from_step": _serialize_workflow_step(from_step),
+            "target_step": _serialize_workflow_step(target_step),
+            "ranges": [
+                {"range_start": range_start, "range_end": range_end}
+                for range_start, range_end in ranges
+            ],
+            "matched_count": matched_count,
+        })
+    return preview
+
+
+def _advance_assignment_workflow_transitions(
+    db: Session,
+    preview: list[dict[str, Any]],
+    current_user: User,
+) -> int:
+    updated_count = 0
+    changed_file_ids: set[UUID] = set()
+    for item in preview:
+        file_record_id = UUID(str(item["file_record_id"]))
+        from_step_id = UUID(str(item["from_step"]["id"]))
+        target_step_id = UUID(str(item["target_step"]["id"]))
+        ranges = [
+            (range_item.get("range_start"), range_item.get("range_end"))
+            for range_item in item.get("ranges", [])
+        ]
+        query = db.query(Segment).filter(
+            Segment.file_record_id == file_record_id,
+            Segment.workflow_step_id == from_step_id,
+        )
+        range_condition = _assignment_transition_range_condition(ranges)
+        if range_condition is not None:
+            query = query.filter(range_condition)
+        for segment in query.all():
+            segment.workflow_step_id = target_step_id
+            apply_segment_status(segment, _resolve_unconfirmed_segment_status(segment))
+            segment.last_modified_by_id = current_user.id
+            segment.version = int(segment.version or 1) + 1
+            updated_count += 1
+            changed_file_ids.add(file_record_id)
+    for file_record_id in changed_file_ids:
+        sync_file_record_status(db, file_record_id)
+    return updated_count
+
+
 def _serialize_project_assignments(db: Session, project_id: UUID) -> dict[str, Any]:
     workflow_steps = _load_project_workflow_steps(db, project_id)
     workflow_step_by_id = {step.id: step for step in workflow_steps}
@@ -4402,6 +4580,27 @@ def _update_project_assignments_by_workflow(
             },
         )
     desired, desired_user_ids = _validate_assignment_payload(db, project, payload)
+    workflow_transition_preview = _build_assignment_workflow_transition_preview(db, project, desired)
+    workflow_transition_count = sum(
+        int(item.get("matched_count") or 0)
+        for item in workflow_transition_preview
+    )
+    workflow_transition_file_count = len({
+        str(item.get("file_record_id") or "")
+        for item in workflow_transition_preview
+        if item.get("file_record_id")
+    })
+    if payload.workflow_transition_mode == "prompt" and workflow_transition_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workflow_transition_required",
+                "message": "部分句段尚未进入本次派稿的目标流程阶段，请选择是否立即推进。",
+                "file_count": workflow_transition_file_count,
+                "matched_count": workflow_transition_count,
+                "transitions": workflow_transition_preview,
+            },
+        )
     now = datetime.now()
     workflow_steps = _load_project_workflow_steps(db, project_id)
     first_step_id = workflow_steps[0].id if workflow_steps else None
@@ -4562,8 +4761,23 @@ def _update_project_assignments_by_workflow(
             )
 
     _sync_legacy_file_assignees(db, project_id)
+    workflow_transition_updated_count = 0
+    if payload.workflow_transition_mode == "advance" and workflow_transition_preview:
+        workflow_transition_updated_count = _advance_assignment_workflow_transitions(
+            db,
+            workflow_transition_preview,
+            current_user,
+        )
     db.commit()
-    return _serialize_project_assignments(db, project_id)
+    response = _serialize_project_assignments(db, project_id)
+    response["workflow_transition"] = {
+        "mode": payload.workflow_transition_mode,
+        "file_count": workflow_transition_file_count,
+        "matched_count": workflow_transition_count,
+        "updated_count": workflow_transition_updated_count,
+        "transitions": workflow_transition_preview,
+    }
+    return response
 
 
 @router.get("/analytics/dashboard")

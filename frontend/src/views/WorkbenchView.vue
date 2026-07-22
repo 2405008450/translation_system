@@ -538,6 +538,8 @@ const loadingTermQAReport = ref(false)
 const generatingTermQAReport = ref(false)
 const downloadingTermQAReport = ref(false)
 const locatingTermQAReportItemId = ref<string | null>(null)
+const activeTermQAReportItemId = ref<string | null>(null)
+const termQAReportTableWrapRef = ref<HTMLElement | null>(null)
 const updatingTermQAIgnore = ref(false)
 const selectedTermQAItemIds = ref<Set<string>>(new Set())
 const termQAReportPage = ref(1)
@@ -1536,7 +1538,7 @@ const qualityQARules = [
   { key: 'unmatched_opening_tag', label: '开始标记无匹配的结束标记', defaultEnabled: true },
   { key: 'target_placeholder_missing', label: '译文占位符标记丢失', defaultEnabled: true },
   { key: 'spelling_grammar', label: '译文有拼写或语法错误（查看支持的语种）', defaultEnabled: true },
-  { key: 'term_inconsistency', label: '术语不一致', defaultEnabled: false },
+  { key: 'term_inconsistency', label: '术语不一致', defaultEnabled: true },
   { key: 'paired_punctuation_missing', label: '成对标点符号丢失', defaultEnabled: false },
   { key: 'ending_punctuation_mismatch', label: '原文和译文的结束标点不同', defaultEnabled: false },
   { key: 'repeated_punctuation', label: '重复标点', defaultEnabled: false },
@@ -1738,6 +1740,22 @@ function getMergeGroupProgressText(segment: Segment) {
 const activeSegmentCanWrite = computed(() => Boolean(activeSegment.value?.can_write))
 const workflowSteps = computed(() => segmentStore.fileRecord?.workflow_steps || [])
 const workflowStepById = computed(() => new Map(workflowSteps.value.map((step) => [step.id, step])))
+const currentPageWorkflowReadOnlyNotice = computed(() => {
+  if (
+    isMergeWorkbench.value
+    || segmentStore.segments.length === 0
+    || segmentStore.segments.some((segment) => segment.can_write !== false)
+  ) {
+    return ''
+  }
+  const stageNames = Array.from(new Set(
+    segmentStore.segments
+      .map((segment) => segment.workflow_step_name?.trim())
+      .filter((name): name is string => Boolean(name)),
+  ))
+  const stageText = stageNames.length > 0 ? `（当前阶段：${stageNames.join('、')}）` : ''
+  return `当前页句段${stageText}仅可查看，尚未流转到你被分配的流程阶段；请联系项目管理员完成流程流转后再编辑。`
+})
 const segmentScreeningDisplayRangeOptions: SegmentScreeningOption[] = [
   { value: 'my_tasks', label: '我的任务' },
 ]
@@ -4118,6 +4136,10 @@ function setCurrentTermQAReport(report: WorkbenchQAResult | null) {
   const normalizedReport = normalizeTermQAReportForCurrentWorkbench(report)
   termQAReport.value = normalizedReport
   setTermQAReportPage(termQAReportPage.value)
+  const reportItemIds = new Set(normalizedReport?.items.map((item) => item.id) ?? [])
+  if (activeTermQAReportItemId.value && !reportItemIds.has(activeTermQAReportItemId.value)) {
+    activeTermQAReportItemId.value = null
+  }
   const validIds = new Set(normalizedReport?.items.filter((item) => !item.ignored).map((item) => item.id) ?? [])
   selectedTermQAItemIds.value = new Set(
     [...selectedTermQAItemIds.value].filter((id) => validIds.has(id)),
@@ -4515,7 +4537,9 @@ async function focusTermQAReportItem(item: WorkbenchQAResultItem) {
     return
   }
 
+  activeTermQAReportItemId.value = item.id
   locatingTermQAReportItemId.value = item.id
+  let qaTableScrollTop: number | null = null
   try {
     const currentPageIndex = editorSegments.value.findIndex((segment) => (
       isMergeMode
@@ -4551,6 +4575,7 @@ async function focusTermQAReportItem(item: WorkbenchQAResultItem) {
       )).data
     }
     await clearSegmentFiltersForTermQANavigation()
+    qaTableScrollTop = termQAReportTableWrapRef.value?.scrollTop ?? null
     await refreshSegmentPage(data.page, data.page_size)
     const targetIndex = editorSegments.value.findIndex((segment) => (
       isMergeMode
@@ -4569,6 +4594,12 @@ async function focusTermQAReportItem(item: WorkbenchQAResultItem) {
     })
   } finally {
     locatingTermQAReportItemId.value = null
+    if (qaTableScrollTop !== null) {
+      await nextTick()
+      if (termQAReportTableWrapRef.value) {
+        termQAReportTableWrapRef.value.scrollTop = qaTableScrollTop
+      }
+    }
   }
 }
 
@@ -8832,13 +8863,26 @@ onBeforeRouteLeave(async () => {
             :class="{ 'has-bottom-drawer': activeBottomTool }"
             :style="bottomDrawerPanelHeightStyle"
           >
-          <div ref="segmentEditorResultsRef" class="segment-editor-results">
+          <div
+            ref="segmentEditorResultsRef"
+            class="segment-editor-results"
+            :class="{ 'has-workflow-readonly-notice': currentPageWorkflowReadOnlyNotice }"
+          >
             <div class="segment-table-head" aria-hidden="true">
               <span>句段</span>
               <span>原文</span>
               <span>译文</span>
               <span>状态</span>
               <span>阶段</span>
+            </div>
+
+            <div
+              v-if="currentPageWorkflowReadOnlyNotice"
+              class="workbench-workflow-readonly-notice"
+              role="status"
+            >
+              <Info :size="16" />
+              <span>{{ currentPageWorkflowReadOnlyNotice }}</span>
             </div>
 
             <div class="segment-editor-list-stage">
@@ -9245,7 +9289,7 @@ onBeforeRouteLeave(async () => {
                   <div v-if="filteredTermQAReportItems.length === 0" class="empty-state">
                     {{ termQAReportEmptyText }}
                   </div>
-                  <div v-else class="term-qa-dialog__table-wrap">
+                  <div v-else ref="termQAReportTableWrapRef" class="term-qa-dialog__table-wrap">
                     <table class="term-qa-dialog__table">
                       <thead>
                         <tr>
@@ -9274,9 +9318,11 @@ onBeforeRouteLeave(async () => {
                           class="term-qa-dialog__row"
                           :class="{
                             'is-locating': locatingTermQAReportItemId === item.id,
+                            'is-current': activeTermQAReportItemId === item.id,
                             'is-ignored': item.ignored,
                           }"
                           tabindex="0"
+                          :aria-current="activeTermQAReportItemId === item.id ? 'true' : undefined"
                           :aria-label="`跳转到句段 ${formatTermQASegmentNumber(item.sentence_id)}`"
                           @click="void focusTermQAReportItem(item)"
                           @keydown.enter.prevent="void focusTermQAReportItem(item)"
@@ -10611,6 +10657,10 @@ onBeforeRouteLeave(async () => {
   grid-template-rows: auto minmax(0, 1fr);
 }
 
+.workbench-page.is-standalone .segment-editor-results.has-workflow-readonly-notice {
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
 .workbench-page.is-standalone .segment-editor-list-stage {
   height: auto;
   min-height: 0;
@@ -11904,7 +11954,8 @@ onBeforeRouteLeave(async () => {
 
 .term-qa-dialog__row:hover,
 .term-qa-dialog__row:focus-visible,
-.term-qa-dialog__row.is-locating {
+.term-qa-dialog__row.is-locating,
+.term-qa-dialog__row.is-current {
   background: #e4f3ff;
   outline: none;
   box-shadow: inset 3px 0 0 #2a7fb8;
@@ -12755,6 +12806,22 @@ onBeforeRouteLeave(async () => {
   position: relative;
 }
 
+.workbench-workflow-readonly-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #ead8a4;
+  background: #fff8e6;
+  color: #75520b;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.workbench-workflow-readonly-notice svg {
+  flex: 0 0 auto;
+}
+
 .segment-editor-list-loading {
   position: absolute;
   inset: 0;
@@ -12781,6 +12848,8 @@ onBeforeRouteLeave(async () => {
   grid-template-columns: minmax(0, 1fr);
   align-items: stretch;
   gap: 8px;
+  container-type: inline-size;
+  container-name: segment-editor-shell;
 }
 
 .segment-editor-shell.has-bottom-drawer {
@@ -12795,6 +12864,10 @@ onBeforeRouteLeave(async () => {
   display: grid;
   grid-template-rows: auto minmax(390px, var(--workbench-editor-stage-height));
   min-height: 0;
+}
+
+.segment-editor-results.has-workflow-readonly-notice {
+  grid-template-rows: auto auto minmax(390px, var(--workbench-editor-stage-height));
 }
 
 .workbench-layout {
@@ -12838,6 +12911,7 @@ onBeforeRouteLeave(async () => {
   z-index: 2;
   order: 3;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
@@ -12852,7 +12926,7 @@ onBeforeRouteLeave(async () => {
   display: flex;
   align-items: center;
   gap: 12px;
-  flex: 1 1 auto;
+  flex: 1 1 680px;
   min-width: 0;
 }
 
@@ -13382,7 +13456,7 @@ onBeforeRouteLeave(async () => {
   min-height: 30px;
   min-width: 0;
   width: max-content;
-  max-width: min(540px, 48vw);
+  max-width: min(600px, 100%);
   overflow-x: auto;
   overflow-y: hidden;
   padding: 0;
@@ -13405,7 +13479,7 @@ onBeforeRouteLeave(async () => {
   left: auto;
   z-index: 1710;
   width: max-content;
-  max-width: min(540px, 48vw);
+  max-width: min(600px, 100%);
   min-height: 29px;
   padding: 0;
   border-color: #b8cbd5;
@@ -13422,8 +13496,8 @@ onBeforeRouteLeave(async () => {
   justify-content: center;
   gap: 4px;
   height: 28px;
-  min-width: 88px;
-  padding: 0 9px;
+  min-width: 84px;
+  padding: 0 7px;
   border: 0;
   border-left: 1px solid #d7e2e8;
   border-radius: 0;
@@ -13494,7 +13568,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .segment-editor-bottom-tool--qa {
-  padding-right: 24px;
+  padding-right: 22px;
 }
 
 .segment-editor-bottom-tool--qa svg {
@@ -13538,6 +13612,53 @@ onBeforeRouteLeave(async () => {
 .segment-editor-bottom-tool__badge.is-clean {
   background: #e6f6ef;
   color: #15795d;
+}
+
+/*
+ * 侧栏打开后，编辑区宽度会明显小于浏览器视口，不能只依赖 viewport 媒体查询。
+ * 按编辑区自身宽度切换成图标模式，为分页控件保留稳定空间；按钮文字仍供
+ * 屏幕阅读器读取，并可通过原有 title 查看。
+ */
+@container segment-editor-shell (max-width: 860px) {
+  .segment-editor-bottom-tools,
+  .segment-editor-bottom-tools.is-docked {
+    flex: 0 0 auto;
+    width: max-content;
+    max-width: 100%;
+  }
+
+  .segment-editor-bottom-tool {
+    width: 42px;
+    min-width: 42px;
+    padding: 0;
+  }
+
+  .segment-editor-bottom-tool--qa {
+    padding-right: 0;
+  }
+
+  .segment-editor-bottom-tool > span:not(.segment-editor-bottom-tool__badge) {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .segment-editor-bottom-tool--qa > svg {
+    transform: translateX(-5px);
+  }
+
+  .segment-editor-bottom-tool__badge {
+    top: 1px;
+    right: 1px;
+    min-width: 15px;
+    height: 15px;
+    padding: 0 3px;
+    font-size: 9px;
+  }
 }
 
 .workbench-bottom-drawer {
@@ -14071,6 +14192,10 @@ onBeforeRouteLeave(async () => {
 
 .segment-editor-shell.has-bottom-drawer .segment-editor-results {
   grid-template-rows: auto minmax(140px, 1fr);
+}
+
+.segment-editor-shell.has-bottom-drawer .segment-editor-results.has-workflow-readonly-notice {
+  grid-template-rows: auto auto minmax(140px, 1fr);
 }
 
 .segment-editor-shell.has-bottom-drawer .segment-editor-list-stage {
@@ -14712,6 +14837,10 @@ onBeforeRouteLeave(async () => {
     grid-template-rows: auto 420px;
   }
 
+  .segment-editor-results.has-workflow-readonly-notice {
+    grid-template-rows: auto auto 420px;
+  }
+
   .segment-editor-list-stage {
     height: 420px;
     min-height: 0;
@@ -14843,6 +14972,10 @@ onBeforeRouteLeave(async () => {
 
   .segment-editor-results {
     grid-template-rows: auto 520px;
+  }
+
+  .segment-editor-results.has-workflow-readonly-notice {
+    grid-template-rows: auto auto 520px;
   }
 
   .segment-editor-list-stage {

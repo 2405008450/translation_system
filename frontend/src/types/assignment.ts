@@ -14,6 +14,35 @@ export interface AssignmentDraft {
 
 export interface AssignmentSaveRequest extends ProjectAssignmentPayload {
   base_revision: string
+  workflow_transition_mode?: 'prompt' | 'advance' | 'assign_only'
+}
+
+export interface AssignmentWorkflowTransitionItem {
+  file_record_id: string
+  filename: string
+  from_step: {
+    id: string
+    name: string
+    sort_order: number
+  }
+  target_step: {
+    id: string
+    name: string
+    sort_order: number
+  }
+  ranges: Array<{
+    range_start: number | null
+    range_end: number | null
+  }>
+  matched_count: number
+}
+
+export interface AssignmentWorkflowTransitionRequired {
+  code: 'workflow_transition_required'
+  message: string
+  file_count: number
+  matched_count: number
+  transitions: AssignmentWorkflowTransitionItem[]
 }
 
 export function cloneAssignmentDrafts(drafts: AssignmentDraft[]): AssignmentDraft[] {

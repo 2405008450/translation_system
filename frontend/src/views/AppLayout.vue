@@ -58,6 +58,8 @@ const SIDEBAR_STORAGE_KEY = 'tm-workbench-sidebar-collapsed'
 const sidebarCollapsed = ref(
   typeof window !== 'undefined' && window.localStorage.getItem(SIDEBAR_STORAGE_KEY) === '1',
 )
+let wasCompactSidebarViewport = false
+let sidebarCollapsedBeforeCompact = sidebarCollapsed.value
 const notificationsOpen = ref(false)
 const languageMenuOpen = ref(false)
 const notificationsLoading = ref(false)
@@ -392,9 +394,25 @@ function openRecentItem(item: (typeof recentItems.value)[number]) {
 
 function toggleSidebar() {
   sidebarCollapsed.value = !sidebarCollapsed.value
+  sidebarCollapsedBeforeCompact = sidebarCollapsed.value
   if (typeof window !== 'undefined') {
     window.localStorage.setItem(SIDEBAR_STORAGE_KEY, sidebarCollapsed.value ? '1' : '0')
   }
+}
+
+function syncSidebarWithViewport() {
+  if (typeof window === 'undefined') {
+    return
+  }
+
+  const isCompactViewport = window.innerWidth <= 1180
+  if (isCompactViewport && !wasCompactSidebarViewport) {
+    sidebarCollapsedBeforeCompact = sidebarCollapsed.value
+    sidebarCollapsed.value = true
+  } else if (!isCompactViewport && wasCompactSidebarViewport) {
+    sidebarCollapsed.value = sidebarCollapsedBeforeCompact
+  }
+  wasCompactSidebarViewport = isCompactViewport
 }
 
 function toggleTheme() {
@@ -464,12 +482,15 @@ watch(
 )
 
 onMounted(() => {
+  syncSidebarWithViewport()
   document.addEventListener('click', closeNotificationsOnOutsideClick)
+  window.addEventListener('resize', syncSidebarWithViewport)
   window.addEventListener(GLOBAL_NOTIFICATIONS_REFRESH_EVENT, handleNotificationsRefresh)
 })
 
 onBeforeUnmount(() => {
   document.removeEventListener('click', closeNotificationsOnOutsideClick)
+  window.removeEventListener('resize', syncSidebarWithViewport)
   window.removeEventListener(GLOBAL_NOTIFICATIONS_REFRESH_EVENT, handleNotificationsRefresh)
 })
 

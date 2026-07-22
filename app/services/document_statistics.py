@@ -214,6 +214,9 @@ def compute_idml_document_statistics(raw_bytes: bytes) -> dict[str, Any]:
     except BadZipFile:
         return _unavailable_statistics_payload()
 
+    # IDML 常见中文弯引号、连接符和中英混排内容。沿用 PPTX 已验证的
+    # Office-like 口径，比仅按 East Asian Width 统计更接近 Word 字数。
+    metrics = _count_tool_word_like_texts(paragraphs)
     payload = _build_statistics_payload(
         source="idml_word_like",
         engine="idml-xml-word-like",
@@ -226,11 +229,11 @@ def compute_idml_document_statistics(raw_bytes: bytes) -> dict[str, Any]:
     payload.update(
         {
             "pages": pages,
-            "words": _count_word_words(paragraphs),
-            "non_asian_words": _count_non_asian_words(paragraphs),
-            "asian_characters": _count_asian_characters(paragraphs),
-            "characters": _count_characters(paragraphs, include_spaces=False),
-            "characters_with_spaces": _count_characters(paragraphs, include_spaces=True),
+            "words": metrics["words"],
+            "non_asian_words": metrics["non_asian_words"],
+            "asian_characters": metrics["asian_characters"],
+            "characters": metrics["characters"],
+            "characters_with_spaces": metrics["characters_with_spaces"],
             "paragraphs": len(paragraphs),
             "lines": len(paragraphs),
             "image_count": image_count,

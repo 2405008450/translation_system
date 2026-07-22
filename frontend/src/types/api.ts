@@ -183,6 +183,7 @@ export interface ProjectAssignmentsResponse {
 
 export interface ProjectAssignmentPayload {
   base_revision?: string
+  workflow_transition_mode?: 'prompt' | 'advance' | 'assign_only'
   assignments: Array<{
     assignee_id: string
     workflow_step_id?: string

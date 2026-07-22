@@ -74,7 +74,12 @@ import {
 } from '../utils/exportOptions'
 import { getProgressStyle, isProgressComplete } from '../utils/progress'
 import { matchesSearchKeyword, normalizeSearchKeyword, splitSearchKeywords } from '../utils/search'
-import type { AssignmentDraft, AssignmentFileRangeDraft, AssignmentSaveRequest } from '../types/assignment'
+import type {
+  AssignmentDraft,
+  AssignmentFileRangeDraft,
+  AssignmentSaveRequest,
+  AssignmentWorkflowTransitionRequired,
+} from '../types/assignment'
 import type {
   DocumentParseMode,
   DocumentParseOptions,
@@ -117,6 +122,9 @@ const props = defineProps<{
 type ProjectTab = 'files' | 'views' | 'issues' | 'assignments' | 'settings' | 'stats' | 'summary' | 'quote'
 type ProjectSettingsSection = 'basic' | 'guidelines' | 'translation-memory' | 'terms' | 'automation' | 'quality-qa' | 'term-qa'
 type AccessLevel = 'team' | 'private' | 'public'
+type AssignmentModalPublic = {
+  showWorkflowTransitionPrompt: (detail: AssignmentWorkflowTransitionRequired) => void
+}
 type DocumentStatisticNumberKey =
   | 'pages'
   | 'words'
@@ -528,6 +536,7 @@ const assignableUsers = ref<User[]>([])
 const loadingAssignableUsers = ref(false)
 const loadingAssignments = ref(false)
 const savingAssignment = ref(false)
+const assignmentModalRef = ref<AssignmentModalPublic | null>(null)
 const assignmentDrafts = ref<AssignmentDraft[]>([])
 const assignmentRevision = ref('')
 const assignmentInitialFileId = ref<string | null>(null)
@@ -655,7 +664,7 @@ const qualityQARules = [
   { key: 'unmatched_opening_tag', label: '开始标记无匹配的结束标记', defaultEnabled: true },
   { key: 'target_placeholder_missing', label: '译文占位符标记丢失', defaultEnabled: true },
   { key: 'spelling_grammar', label: '译文有拼写或语法错误（查看支持的语种）', defaultEnabled: true },
-  { key: 'term_inconsistency', label: '术语不一致', defaultEnabled: false },
+  { key: 'term_inconsistency', label: '术语不一致', defaultEnabled: true },
   { key: 'paired_punctuation_missing', label: '成对标点符号丢失', defaultEnabled: false },
   { key: 'ending_punctuation_mismatch', label: '原文和译文的结束标点不同', defaultEnabled: false },
   { key: 'repeated_punctuation', label: '重复标点', defaultEnabled: false },
@@ -2446,8 +2455,15 @@ async function saveAssignment(request: AssignmentSaveRequest) {
   }
   savingAssignment.value = true
   try {
-    await http.patch(`/projects/${project.value.id}/assignments`, request)
-    toast.success('项目指派已更新。')
+    const { data } = await http.patch<{
+      workflow_transition?: { updated_count?: number }
+    }>(`/projects/${project.value.id}/assignments`, request)
+    const updatedCount = Number(data.workflow_transition?.updated_count || 0)
+    toast.success(
+      updatedCount > 0
+        ? `项目指派已更新，并已将 ${updatedCount} 个句段推进到目标阶段。`
+        : '项目指派已更新。',
+    )
     showAssignmentDialog.value = false
     resetAssignmentDialogState()
     await loadProject()
@@ -2469,6 +2485,12 @@ async function saveAssignment(request: AssignmentSaveRequest) {
       }
       if (detail && typeof detail === 'object' && detail.code === 'assignment_conflict') {
         toast.error(String(detail.message || '任务分配存在冲突，请检查后重试。'))
+        return
+      }
+      if (detail && typeof detail === 'object' && detail.code === 'workflow_transition_required') {
+        assignmentModalRef.value?.showWorkflowTransitionPrompt(
+          detail as AssignmentWorkflowTransitionRequired,
+        )
         return
       }
     }
@@ -7953,6 +7975,7 @@ onBeforeUnmount(() => {
     </Modal>
 
     <AssignmentModal
+      ref="assignmentModalRef"
       :open="showAssignmentDialog"
       :files="tableRows"
       :users="assignableUsers"
@@ -8627,6 +8650,7 @@ onBeforeUnmount(() => {
 
 .pd-hero__main {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
@@ -8636,6 +8660,7 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex: 1 1 360px;
   min-width: 0;
 }
 
@@ -8701,12 +8726,14 @@ onBeforeUnmount(() => {
 .pd-hero__copy {
   display: grid;
   gap: 2px;
+  min-width: 0;
 }
 
 .pd-hero__copy .section-title {
   margin-bottom: 0;
   font-size: 15px;
   line-height: 1.25;
+  overflow-wrap: anywhere;
 }
 
 .pd-hero__copy .panel-subtitle {
@@ -8715,6 +8742,7 @@ onBeforeUnmount(() => {
 }
 
 .pd-hero__progress {
+  flex: 0 1 230px;
   width: min(230px, 100%);
   display: grid;
   gap: 3px;
@@ -11982,9 +12010,28 @@ onBeforeUnmount(() => {
     max-width: none;
   }
 
+  .pd-tabs {
+    width: 100%;
+    scroll-snap-type: x proximity;
+    scrollbar-width: thin;
+  }
+
+  .pd-tabs__item {
+    scroll-snap-align: start;
+  }
+
 }
 
 @media (max-width: 720px) {
+  .pd-layout {
+    gap: 6px;
+    padding: 8px;
+  }
+
+  .pd-hero {
+    padding: 8px;
+  }
+
   .upload-page__topbar {
     padding: 0 14px;
   }

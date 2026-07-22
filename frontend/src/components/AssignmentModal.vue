@@ -13,7 +13,11 @@ import {
 import { computed, nextTick, ref, watch } from 'vue'
 
 import { useToast } from '../composables/useToast'
-import type { AssignmentDraft, AssignmentSaveRequest } from '../types/assignment'
+import type {
+  AssignmentDraft,
+  AssignmentSaveRequest,
+  AssignmentWorkflowTransitionRequired,
+} from '../types/assignment'
 import { cloneAssignmentDrafts } from '../types/assignment'
 import type { MergeView, User, WorkflowStep } from '../types/api'
 import Modal from './base/Modal.vue'
@@ -78,6 +82,8 @@ const transferFileId = ref('')
 const rangeStart = ref('')
 const rangeEnd = ref('')
 const showSaveConfirm = ref(false)
+const showWorkflowTransitionConfirm = ref(false)
+const workflowTransitionPrompt = ref<AssignmentWorkflowTransitionRequired | null>(null)
 const showDiscardConfirm = ref(false)
 const showTransferConfirm = ref(false)
 const statusMessage = ref('')
@@ -558,7 +564,16 @@ function requestSave() {
 
 function confirmSave() {
   showSaveConfirm.value = false
-  emit('save', buildSaveRequest())
+  emit('save', { ...buildSaveRequest(), workflow_transition_mode: 'prompt' })
+}
+
+function showWorkflowTransitionPrompt(detail: AssignmentWorkflowTransitionRequired) {
+  workflowTransitionPrompt.value = detail
+  showWorkflowTransitionConfirm.value = true
+}
+
+function submitWorkflowTransitionChoice(mode: 'advance' | 'assign_only') {
+  emit('save', { ...buildSaveRequest(), workflow_transition_mode: mode })
 }
 
 function requestClose() {
@@ -605,6 +620,8 @@ function initializeDraft() {
   advancedFileId.value = ''
   transferFileId.value = ''
   showSaveConfirm.value = false
+  showWorkflowTransitionConfirm.value = false
+  workflowTransitionPrompt.value = null
   showDiscardConfirm.value = false
   showTransferConfirm.value = false
   statusMessage.value = ''
@@ -630,6 +647,8 @@ watch(activeWorkflowStepId, () => {
   fileStateFilter.value = 'unassigned'
   assigneeFilter.value = 'all'
 })
+
+defineExpose({ showWorkflowTransitionPrompt })
 </script>
 
 <template>
@@ -638,8 +657,8 @@ watch(activeWorkflowStepId, () => {
     title="分配任务"
     description="按文件批量指派；已分配文件需要明确转交，句段拆分请使用高级操作。"
     width="min(1160px, calc(100vw - 32px))"
-    :close-on-overlay="!saving && !showSaveConfirm && !showDiscardConfirm && !showTransferConfirm"
-    :close-on-esc="!saving && !showSaveConfirm && !showDiscardConfirm && !showTransferConfirm"
+    :close-on-overlay="!saving && !showSaveConfirm && !showWorkflowTransitionConfirm && !showDiscardConfirm && !showTransferConfirm"
+    :close-on-esc="!saving && !showSaveConfirm && !showWorkflowTransitionConfirm && !showDiscardConfirm && !showTransferConfirm"
     @close="requestClose"
   >
     <div class="assignment-workbench" data-testid="assignment-workbench">
@@ -925,6 +944,35 @@ watch(activeWorkflowStepId, () => {
           <footer>
             <button type="button" @click="showSaveConfirm = false">返回检查</button>
             <button class="is-primary" type="button" @click="confirmSave">确认保存</button>
+          </footer>
+        </section>
+      </div>
+
+      <div v-if="showWorkflowTransitionConfirm && workflowTransitionPrompt" class="assignment-confirm-backdrop" role="presentation">
+        <section class="assignment-confirm assignment-confirm--workflow" role="alertdialog" aria-modal="true" aria-label="确认流程推进">
+          <header>
+            <strong>所选任务尚未进入目标阶段</strong>
+            <span>
+              {{ workflowTransitionPrompt.file_count }} 个文件共 {{ workflowTransitionPrompt.matched_count }} 个句段仍在前一阶段。
+              是否在完成指派的同时推进流程？
+            </span>
+          </header>
+          <div class="assignment-transition-list">
+            <div v-for="item in workflowTransitionPrompt.transitions" :key="`${item.file_record_id}-${item.target_step.id}`">
+              <span :title="item.filename">{{ item.filename }}</span>
+              <strong>{{ item.from_step.name }} → {{ item.target_step.name }}</strong>
+              <em>{{ item.matched_count }} 段</em>
+            </div>
+          </div>
+          <p class="assignment-transition-hint">
+            选择“仅指派”后，译者可以查看前序内容，但在句段正式流转前不能编辑。
+          </p>
+          <footer>
+            <button type="button" :disabled="saving" @click="showWorkflowTransitionConfirm = false">返回修改</button>
+            <button type="button" :disabled="saving" @click="submitWorkflowTransitionChoice('assign_only')">仅指派，暂不流转</button>
+            <button class="is-primary" type="button" :disabled="saving" @click="submitWorkflowTransitionChoice('advance')">
+              {{ saving ? '处理中...' : '指派并进入目标阶段' }}
+            </button>
           </footer>
         </section>
       </div>
@@ -1427,6 +1475,57 @@ watch(activeWorkflowStepId, () => {
 
 .assignment-confirm--small {
   width: min(460px, 100%);
+}
+
+.assignment-confirm--workflow {
+  width: min(680px, 100%);
+}
+
+.assignment-transition-list {
+  display: grid;
+  gap: 6px;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.assignment-transition-list > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: var(--surface-muted);
+  font-size: 12px;
+}
+
+.assignment-transition-list span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.assignment-transition-list strong {
+  color: var(--text-secondary);
+}
+
+.assignment-transition-list em {
+  color: var(--brand-700);
+  font-style: normal;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.assignment-transition-hint {
+  margin: 0;
+  padding: 9px 10px;
+  border: 1px solid #ead8a4;
+  border-radius: 7px;
+  background: #fff8e6;
+  color: #75520b;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .assignment-confirm header {
