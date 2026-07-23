@@ -7,7 +7,6 @@ import InteractiveDiffText from './InteractiveDiffText.vue'
 import { getSegmentSourceMeta, getSegmentStatusMeta } from '../constants/status'
 import { useAuthStore } from '../stores/auth'
 import type { LiveSpellingIssue, RevisionDisplaySettings, Segment, SegmentQAIssue, SegmentRevisionEntry, TermEntryRecord } from '../types/api'
-import { clearActiveSpellingHighlight, showActiveSpellingHighlight } from '../utils/spellingHighlight'
 import { findTermTextRanges } from '../utils/termMatching'
 import { computeDiff } from '../utils/textDiff'
 import type { TextFormat } from '../composables/useRichTextEditor'
@@ -498,21 +497,6 @@ const activeQAIssues = computed(() => {
     .sort((a, b) => a.offset - b.offset || b.length - a.length)
 })
 
-function refreshActiveSpellingHighlight() {
-  const owner = segmentKey.value
-  if (!isFocused.value || isComposing.value || !editorRef.value) {
-    clearActiveSpellingHighlight(owner)
-    return
-  }
-  void nextTick(() => {
-    if (!isFocused.value || isComposing.value || !editorRef.value) {
-      clearActiveSpellingHighlight(owner)
-      return
-    }
-    showActiveSpellingHighlight(owner, editorRef.value, activeQAIssues.value)
-  })
-}
-
 function highlightQAText(
   text: string,
   issues: InlineSpellingIssue[],
@@ -643,27 +627,22 @@ function renderTargetTextWithHighlights(text: string, absoluteOffset = 0): strin
   return renderHighlightPartsAsHtml(parts, text)
 }
 
-function shouldRenderTargetHighlights(): boolean {
-  return !isFocused.value
-}
-
 function getTargetHighlightParts(text: string): HighlightPart[] | null {
-  if (!shouldRenderTargetHighlights()) {
-    return null
-  }
   return highlightQAText(text, activeQAIssues.value)
-    || highlightSearchText(text, props.targetSearchQuery, props.searchCaseSensitive)
-    || highlightText(text, props.matchedTerms || [], 'target_text')
-}
-
-function hasTargetHighlightSources(): boolean {
-  return Boolean(resolveSearchKeyword(props.targetSearchQuery))
-    || (props.matchedTerms || []).some((term) => Boolean(term.target_text))
-    || activeQAIssues.value.length > 0
+    || (!isFocused.value
+      ? highlightSearchText(text, props.targetSearchQuery, props.searchCaseSensitive)
+        || highlightText(text, props.matchedTerms || [], 'target_text')
+      : null)
 }
 
 function hasRenderedTargetHighlights(): boolean {
-  return shouldRenderTargetHighlights() && hasTargetHighlightSources()
+  if (activeQAIssues.value.length > 0) {
+    return true
+  }
+  return !isFocused.value && (
+    Boolean(resolveSearchKeyword(props.targetSearchQuery))
+    || (props.matchedTerms || []).some((term) => Boolean(term.target_text))
+  )
 }
 
 function hasRenderedEditorDecorations(): boolean {
@@ -1394,12 +1373,10 @@ function handleFocus() {
   editorDirtySinceFocus.value = false
   emit('focus', segmentKey.value)
   cacheTargetSelectionFromDom()
-  refreshActiveSpellingHighlight()
 }
 
 function handleBlur() {
   clearRevisionRerenderTimer()
-  clearActiveSpellingHighlight(segmentKey.value)
   cacheTargetSelectionFromDom()
   commitEditorContent()
   isFocused.value = false
@@ -1713,7 +1690,6 @@ function handleInput() {
   if (isApplyingHistory.value) return
   if (isComposing.value) return
   clearRevisionRerenderTimer()
-  clearActiveSpellingHighlight(segmentKey.value)
   editorDirtySinceFocus.value = true
   cacheTargetSelectionFromDom()
 
@@ -1847,14 +1823,12 @@ function handleCompositionStart() {
     compositionSnapshotRecorded.value = true
   }
   isComposing.value = true
-  clearActiveSpellingHighlight(segmentKey.value)
 }
 
 function handleCompositionEnd() {
   isComposing.value = false
   handleInput()
   scheduleRevisionRerender()
-  refreshActiveSpellingHighlight()
   compositionSnapshotRecorded.value = false
 }
 
@@ -2283,14 +2257,13 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   clearRevisionRerenderTimer()
-  clearActiveSpellingHighlight(segmentKey.value)
 })
 
 watch(
   () => activeQAIssues.value
     .map((issue) => `${issue.id}:${issue.offset}:${issue.length}:${issue.target_text_hash}`)
     .join('|'),
-  () => refreshActiveSpellingHighlight(),
+  () => syncFocusedTargetHighlightsFromState(),
   { flush: 'post' },
 )
 

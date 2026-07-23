@@ -1882,7 +1882,7 @@ export const useSegmentStore = defineStore('segment', () => {
     generation: number,
     retryCount: number,
   ) {
-    if (generation !== liveSpellingGeneration || activeSentenceId.value !== segmentKey) {
+    if (generation !== liveSpellingGeneration) {
       return
     }
     const index = getSegmentIndex(segmentKey)
@@ -1901,7 +1901,6 @@ export const useSegmentStore = defineStore('segment', () => {
       )
       if (
         generation !== liveSpellingGeneration
-        || activeSentenceId.value !== segmentKey
         || (segments.value[getSegmentIndex(segmentKey)]?.target_text || '') !== text
       ) {
         return
@@ -1948,9 +1947,6 @@ export const useSegmentStore = defineStore('segment', () => {
 
   function setActiveSentence(sentenceId: string | null) {
     // sentenceId 在合并模式下是复合键（${file_record_id}:${sentence_id}）
-    if (activeSentenceId.value !== sentenceId) {
-      clearLiveSpellingTimersAndRequest()
-    }
     activeSentenceId.value = sentenceId
     if (sentenceId) {
       const segment = mergeViewId.value
@@ -1959,14 +1955,7 @@ export const useSegmentStore = defineStore('segment', () => {
       activeSourceText.value = segment?.source_text || ''
       activeFileRecordId.value = segment ? fileRecordIdForSegment(segment) : null
       void loadTermMatches(sentenceId, activeSourceText.value)
-      if (segment) {
-        const liveState = liveSpellingBySegmentKey.value[sentenceId]
-        if (!liveState || liveState.text !== (segment.target_text || '') || liveState.status !== 'ready') {
-          scheduleLiveSpellingCheck(sentenceId, segment.target_text || '', LIVE_SPELLING_WORD_BOUNDARY_DELAY_MS)
-        }
-      }
     } else {
-      clearLiveSpellingTimersAndRequest()
       activeSourceText.value = ''
       activeFileRecordId.value = null
     }
