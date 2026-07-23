@@ -4622,7 +4622,7 @@ async function focusTermQAReportItem(item: WorkbenchQAResultItem) {
         : segment.sentence_id === item.sentence_id
     ))
     if (currentPageIndex >= 0) {
-      await focusEditorSegmentAtIndex(currentPageIndex)
+      await focusEditorSegmentAtIndex(currentPageIndex, { caretAtEnd: true })
       return
     }
 
@@ -4661,7 +4661,7 @@ async function focusTermQAReportItem(item: WorkbenchQAResultItem) {
       toast.warn('已切换到目标页，但未找到对应句段。')
       return
     }
-    await focusEditorSegmentAtIndex(targetIndex)
+    await focusEditorSegmentAtIndex(targetIndex, { caretAtEnd: true })
   } catch (error) {
     toast.error({
       title: '跳转 QA 句段失败',
@@ -5904,7 +5904,7 @@ function clearActiveTarget() {
   toast.success(t('workbench.ribbon.messages.targetCleared'))
 }
 
-function setActiveTargetSpacePlaceholder() {
+async function setActiveTargetSpacePlaceholder() {
   if (!activeSegment.value) {
     toast.warn(t('workbench.ribbon.noActiveSegment'))
     return
@@ -5914,12 +5914,15 @@ function setActiveTargetSpacePlaceholder() {
     return
   }
 
+  const sentenceId = segmentKeyOf(activeSegment.value)
   updateSegmentTarget(
-    segmentKeyOf(activeSegment.value),
+    sentenceId,
     ' ',
     undefined,
     { recordUndo: true, undoInputType: 'spacePlaceholder' },
   )
+  await nextTick()
+  segmentEditorRowRefs.get(sentenceId)?.focusTargetEditorAtEnd()
   toast.success(t('workbench.ribbon.messages.spacePlaceholderSet'))
 }
 
@@ -10143,7 +10146,7 @@ onBeforeRouteLeave(async () => {
                 </thead>
                 <tbody>
                   <tr v-for="item in resourceSearchItems" :key="`${item.type}-${item.id}`">
-                    <td>
+                    <td data-label="类型">
                       <span
                         class="resource-search-panel__badge"
                         :class="`is-${item.type}`"
@@ -10151,14 +10154,19 @@ onBeforeRouteLeave(async () => {
                       >
                         {{ item.type === 'tm' ? 'TM' : 'TB' }}
                       </span>
+                      <span v-if="item.library_name" class="resource-search-panel__library-name">
+                        {{ item.library_name }}
+                      </span>
                     </td>
                     <td
                       class="resource-search-panel__text"
+                      data-label="原文"
                       :title="item.source_text"
                       v-html="renderResourceSearchResultText(item.source_text)"
                     ></td>
                     <td
                       class="resource-search-panel__text"
+                      data-label="译文"
                       :title="item.target_text"
                       v-html="renderResourceSearchResultText(item.target_text)"
                     ></td>
@@ -13461,6 +13469,8 @@ onBeforeRouteLeave(async () => {
   padding: 18px;
   overflow: hidden;
   background: linear-gradient(180deg, #ffffff 0%, #f7fbfb 100%);
+  container-type: inline-size;
+  container-name: resource-search-panel;
 }
 
 .resource-search-panel__header {
@@ -13529,6 +13539,7 @@ onBeforeRouteLeave(async () => {
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
   border: 1px solid #d6e1e5;
   border-radius: 6px;
   background: #fff;
@@ -13619,8 +13630,85 @@ onBeforeRouteLeave(async () => {
   background: #5b8edc;
 }
 
+.resource-search-panel__library-name {
+  display: none;
+}
+
 .resource-search-panel__empty {
   margin-top: 16px;
+}
+
+@container resource-search-panel (max-width: 620px) {
+  .resource-search-panel__table {
+    display: block;
+  }
+
+  .resource-search-panel__table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .resource-search-panel__table tbody {
+    display: grid;
+    gap: 10px;
+    padding: 10px;
+  }
+
+  .resource-search-panel__table tr {
+    display: block;
+    overflow: hidden;
+    border: 1px solid #d8e4e9;
+    border-radius: 7px;
+    background: #fff;
+    box-shadow: 0 2px 7px rgba(31, 69, 81, 0.06);
+  }
+
+  .resource-search-panel__table tbody tr:nth-child(even) {
+    background: #fff;
+  }
+
+  .resource-search-panel__table td,
+  .resource-search-panel__table td:first-child {
+    display: block;
+    width: auto;
+    padding: 9px 11px;
+    border-bottom: 1px solid #e4edf0;
+    text-align: left;
+  }
+
+  .resource-search-panel__table td:first-child {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    background: #f3f8fa;
+  }
+
+  .resource-search-panel__table td:last-child {
+    border-bottom: 0;
+  }
+
+  .resource-search-panel__table td:not(:first-child)::before {
+    display: block;
+    margin-bottom: 4px;
+    color: #69808a;
+    content: attr(data-label);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+  }
+
+  .resource-search-panel__library-name {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    color: #526b75;
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 }
 
 .segment-editor-bottom-tools {
@@ -14968,8 +15056,8 @@ onBeforeRouteLeave(async () => {
 }
 
 @media (max-width: 1180px) {
-  .workbench-layout,
-  .workbench-layout.has-active-tool {
+  .workbench-page.is-stable-grid .workbench-layout,
+  .workbench-page.is-stable-grid .workbench-layout.has-active-tool {
     grid-template-columns: minmax(0, 1fr);
   }
 
@@ -14978,7 +15066,7 @@ onBeforeRouteLeave(async () => {
     grid-row: 2;
   }
 
-  .segment-editor-side-tools {
+  .workbench-layout.has-active-tool .segment-editor-side-tools {
     grid-column: 1;
     grid-row: 1;
     order: -1;
@@ -14992,6 +15080,28 @@ onBeforeRouteLeave(async () => {
     padding: 4px 0;
     border-left: 0;
     border-bottom: 1px solid #d9e4e8;
+  }
+
+  .workbench-page.is-standalone .workbench-layout.has-active-tool {
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .workbench-page.is-standalone .workbench-layout.has-active-tool .panel--editor,
+  .workbench-page.is-standalone .workbench-layout.has-active-tool .workbench-sidecar {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .workbench-page.is-standalone .workbench-layout.has-active-tool .workbench-sidecar,
+  .workbench-page.is-standalone .workbench-layout.has-active-tool .workbench-sidecar__panel {
+    width: 100% !important;
+    min-width: 0;
+    height: 100%;
+    max-height: 100%;
+  }
+
+  .workbench-page.is-standalone .workbench-layout.has-active-tool .workbench-sidecar {
+    z-index: 4;
   }
 
   .segment-editor-side-tool {

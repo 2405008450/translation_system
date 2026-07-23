@@ -839,12 +839,16 @@ function isRevisionDeleteNode(node: Node): boolean {
   return Boolean(element?.closest('[data-revision-type="delete"]'))
 }
 
-function isVisibleNewlineMarker(node: Node | null): node is HTMLElement {
+function isVisibleCharacterMarker(node: Node | null): node is HTMLElement {
   return Boolean(
     node
     && node.nodeType === Node.ELEMENT_NODE
-    && (node as HTMLElement).classList.contains('visible-char--newline'),
+    && (node as HTMLElement).classList.contains('visible-char'),
   )
+}
+
+function isVisibleNewlineMarker(node: Node | null): node is HTMLElement {
+  return isVisibleCharacterMarker(node) && node.classList.contains('visible-char--newline')
 }
 
 /**
@@ -876,8 +880,7 @@ function getSerializableNodeLength(node: Node): number {
     return 0
   }
   if (
-    node.nodeType === Node.ELEMENT_NODE
-    && (node as HTMLElement).classList.contains('visible-char')
+    isVisibleCharacterMarker(node)
   ) {
     return 1
   }
@@ -979,7 +982,7 @@ function getSerializableOffsetForPosition(el: HTMLElement, container: Node, posi
 
     if (
       node.nodeType === Node.TEXT_NODE
-      || isVisibleNewlineMarker(node)
+      || isVisibleCharacterMarker(node)
       || (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR')
     ) {
       offset += getSerializableNodeLength(node)
@@ -1042,15 +1045,19 @@ function resolveSerializablePosition(el: HTMLElement, targetOffset: number): { n
       return false
     }
 
-    if (isVisibleNewlineMarker(node)) {
+    if (isVisibleCharacterMarker(node)) {
       const parent = node.parentNode || el
       const index = Math.max(0, getNodeIndex(node))
-      if (currentOffset + 1 >= normalizedOffset) {
+      if (normalizedOffset <= currentOffset) {
         resolved = { node: parent, offset: index }
         return true
       }
       currentOffset += 1
       fallback = { node: parent, offset: index + 1 }
+      if (normalizedOffset <= currentOffset) {
+        resolved = fallback
+        return true
+      }
       return false
     }
 
