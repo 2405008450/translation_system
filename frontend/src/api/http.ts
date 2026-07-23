@@ -24,6 +24,12 @@ http.interceptors.request.use((config) => {
 http.interceptors.response.use(
   (response) => response,
   async (error) => {
+    // 实时拼写检查会在用户继续输入时主动取消旧请求。
+    // Axios 的取消错误没有 response，不能按普通网络故障弹出“请求失败”。
+    if (axios.isCancel(error) || error.code === 'ERR_CANCELED') {
+      return Promise.reject(error)
+    }
+
     if (error.response?.status === 401 && unauthorizedHandler) {
       await unauthorizedHandler()
       return Promise.reject(error)
