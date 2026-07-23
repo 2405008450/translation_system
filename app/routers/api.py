@@ -271,10 +271,12 @@ from app.services.spelling_grammar_qa import (
     load_open_segment_qa_issues_by_segment_id,
     load_quality_qa_settings,
     normalize_quality_qa_settings,
+    persist_cached_live_spelling_issues_for_segment_ids,
     run_spelling_grammar_qa_for_project,
     run_spelling_grammar_qa_for_segment_ids,
     serialize_segment_qa_issue,
     store_quality_qa_settings,
+    target_text_hash,
 )
 from app.services.local_qa import (
     LOCAL_QA_RULE_KEYS,
@@ -10145,6 +10147,7 @@ def _serialize_workbench_segment(
         "qa_issues": [
             serialize_segment_qa_issue(issue)
             for issue in (qa_issues_by_segment_id or {}).get(seg.id, [])
+            if issue.target_text_hash == target_text_hash(seg.target_text or "")
         ],
         "updated_at": seg.updated_at.isoformat() if seg.updated_at else None,
     }
@@ -10183,6 +10186,24 @@ def _schedule_spelling_grammar_qa_for_segments(
         return
     background_tasks.add_task(
         _dispatch_spelling_grammar_qa_segments, file_record.id, segment_ids
+    )
+
+
+def _schedule_cached_live_spelling_backup_for_segments(
+    background_tasks: BackgroundTasks | None,
+    file_record: FileRecord,
+    segments: Iterable[Segment],
+) -> None:
+    """保存译文后复用实时检查缓存写入 QA 表，不额外调用 LanguageTool。"""
+    if background_tasks is None:
+        return
+    segment_ids = list(dict.fromkeys(segment.id for segment in segments))
+    if not segment_ids:
+        return
+    background_tasks.add_task(
+        persist_cached_live_spelling_issues_for_segment_ids,
+        file_record.id,
+        segment_ids,
     )
 
 
@@ -13812,6 +13833,7 @@ def update_segment(
     qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, response_segments)
     display_index_map = _get_segment_display_index_map(db, file_record_id, response_segments)
     _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, response_segments)
+    _schedule_cached_live_spelling_backup_for_segments(background_tasks, file_record, response_segments)
     _schedule_local_qa_for_segments(background_tasks, file_record, response_segments)
 
     return {
@@ -14467,6 +14489,7 @@ def batch_update(
     qa_issues_by_segment_id = _load_workbench_segment_qa_issues(db, response_segments)
     display_index_map = _get_segment_display_index_map(db, file_record_id, response_segments)
     _schedule_spelling_grammar_qa_for_segments(background_tasks, file_record, response_segments)
+    _schedule_cached_live_spelling_backup_for_segments(background_tasks, file_record, response_segments)
     _schedule_local_qa_for_segments(background_tasks, file_record, response_segments)
     return {
         "updated_count": result.updated_count,

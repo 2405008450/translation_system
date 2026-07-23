@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.database import SessionLocal
 from app.models import FileRecord, Project, Segment, SegmentQAIssue
-from app.services.cache import aget_json, aset_json
+from app.services.cache import aget_json, aset_json, get_json
 from app.services.language_pairs import LANGUAGE_OPTIONS
 from app.services.normalizer import normalize_text
 
@@ -245,6 +245,10 @@ def target_text_hash(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
+def _live_spelling_cache_key(language: str, severity: str, text_hash: str) -> str:
+    return f"languagetool:live:v1:{language}:{severity}:{text_hash}"
+
+
 def serialize_segment_qa_issue(issue: SegmentQAIssue) -> dict[str, Any]:
     try:
         replacements = json.loads(issue.replacements or "[]")
@@ -391,11 +395,15 @@ def clean_languagetool_matches(
 
 def is_spelling_issue(issue: CleanedLanguageToolIssue) -> bool:
     """只挑出适合在编辑器中显示红色波浪线的拼写问题。"""
-    issue_type = (issue.issue_type or "").strip().lower()
+    return _is_spelling_issue_fields(issue.issue_type, issue.rule_id)
+
+
+def _is_spelling_issue_fields(issue_type: str | None, rule_id: str | None) -> bool:
+    issue_type = (issue_type or "").strip().lower()
     if issue_type == "misspelling":
         return True
     # 兼容部分旧版/第三方规则没有正确填写 issueType 的情况。
-    rule_id = (issue.rule_id or "").strip().upper()
+    rule_id = (rule_id or "").strip().upper()
     return any(marker in rule_id for marker in ("MORFOLOGIK_RULE", "HUNSPELL", "SPELLER_RULE"))
 
 
@@ -450,7 +458,7 @@ async def check_live_spelling_text(
             "issues": [],
         }
 
-    cache_key = f"languagetool:live:v1:{language}:{severity}:{text_hash}"
+    cache_key = _live_spelling_cache_key(language, severity, text_hash)
     cached = await aget_json(cache_key)
     if isinstance(cached, dict) and isinstance(cached.get("issues"), list):
         return {**cached, "cached": True}
@@ -524,6 +532,8 @@ def _apply_cleaned_issues(
     text_hash: str,
     language: str,
     cleaned_issues: list[CleanedLanguageToolIssue],
+    spelling_only: bool = False,
+    touch_segment: bool = True,
 ) -> bool:
     existing_issues = (
         db.query(SegmentQAIssue)
@@ -533,15 +543,20 @@ def _apply_cleaned_issues(
         )
         .all()
     )
+    managed_existing_issues = [
+        issue
+        for issue in existing_issues
+        if not spelling_only or _is_spelling_issue_fields(issue.issue_type, issue.rule_id)
+    ]
     existing_by_fingerprint = {
         _existing_issue_fingerprint(issue): issue
-        for issue in existing_issues
+        for issue in managed_existing_issues
     }
     next_fingerprints = {issue.fingerprint(text_hash) for issue in cleaned_issues}
     changed = False
     now = datetime.now()
 
-    for existing in existing_issues:
+    for existing in managed_existing_issues:
         if _existing_issue_fingerprint(existing) not in next_fingerprints and existing.status != QA_ISSUE_STATUS_RESOLVED:
             existing.status = QA_ISSUE_STATUS_RESOLVED
             existing.updated_at = now
@@ -589,9 +604,145 @@ def _apply_cleaned_issues(
         existing.replacements = json.dumps(cleaned.replacements, ensure_ascii=False)
         existing.updated_at = now
 
-    if changed:
+    if changed and touch_segment:
         segment.updated_at = now
     return changed
+
+
+def _deserialize_cached_live_spelling_issues(
+    payload: Any,
+    *,
+    expected_text_hash: str,
+    language: str,
+    severity: str,
+) -> list[CleanedLanguageToolIssue] | None:
+    """把实时检查缓存还原为可写入 QA 表的拼写问题。
+
+    返回 None 表示缓存不存在或不属于当前译文；空列表表示检查成功且没有拼写问题。
+    """
+    if not isinstance(payload, dict) or payload.get("target_text_hash") != expected_text_hash:
+        return None
+    raw_issues = payload.get("issues")
+    if not isinstance(raw_issues, list):
+        return None
+
+    issues: list[CleanedLanguageToolIssue] = []
+    for raw in raw_issues:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            offset = max(0, int(raw.get("offset") or 0))
+            length = max(0, int(raw.get("length") or 0))
+        except (TypeError, ValueError):
+            continue
+        if length <= 0:
+            continue
+        raw_replacements = raw.get("replacements")
+        replacements = (
+            [str(value) for value in raw_replacements if str(value).strip()]
+            if isinstance(raw_replacements, list)
+            else []
+        )
+        issue = CleanedLanguageToolIssue(
+            language=str(raw.get("language") or language),
+            severity=str(raw.get("severity") or severity),
+            message=str(raw.get("message") or ""),
+            short_message=str(raw.get("short_message") or ""),
+            rule_id=str(raw.get("rule_id") or ""),
+            rule_category=str(raw.get("rule_category") or ""),
+            issue_type=str(raw.get("issue_type") or ""),
+            context_text=str(raw.get("context_text") or ""),
+            offset=offset,
+            length=length,
+            replacements=replacements,
+        )
+        if is_spelling_issue(issue):
+            issues.append(issue)
+    return issues
+
+
+def apply_cached_live_spelling_issues(
+    db: Session,
+    *,
+    file_record: FileRecord,
+    segments: list[Segment],
+) -> int:
+    """复用实时拼写检查缓存写入 QA 表，不再请求 LanguageTool。"""
+    project = file_record.project or (
+        db.query(Project).filter(Project.id == file_record.project_id).first()
+        if file_record.project_id
+        else None
+    )
+    if not project or not is_spelling_grammar_enabled(project):
+        return 0
+
+    language = get_languagetool_language(file_record.target_language)
+    if not language:
+        return 0
+    qa_settings = load_quality_qa_settings(project)
+    severity = str(qa_settings[QA_RULE_SPELLING_GRAMMAR].get("severity") or "medium")
+    changed_count = 0
+
+    for segment in segments:
+        text = segment.target_text or ""
+        text_hash = target_text_hash(text)
+        if normalize_text(text):
+            cached = get_json(_live_spelling_cache_key(language, severity, text_hash))
+            cleaned = _deserialize_cached_live_spelling_issues(
+                cached,
+                expected_text_hash=text_hash,
+                language=language,
+                severity=severity,
+            )
+            if cleaned is None:
+                continue
+        else:
+            # 清空译文时不会发起实时请求，但应将旧拼写问题标记为已解决。
+            cleaned = []
+
+        if _apply_cleaned_issues(
+            db,
+            file_record=file_record,
+            project=project,
+            segment=segment,
+            text_hash=text_hash,
+            language=language,
+            cleaned_issues=cleaned,
+            spelling_only=True,
+            touch_segment=False,
+        ):
+            changed_count += 1
+
+    if changed_count:
+        db.commit()
+    return changed_count
+
+
+def persist_cached_live_spelling_issues_for_segment_ids(
+    file_record_id: UUID,
+    segment_ids: list[UUID],
+) -> int:
+    """在译文保存后持久化已完成的实时拼写检查结果。"""
+    ids = list(dict.fromkeys(segment_ids))
+    if not ids:
+        return 0
+    with SessionLocal() as db:
+        file_record = db.query(FileRecord).filter(FileRecord.id == file_record_id).first()
+        if not file_record:
+            return 0
+        segments = (
+            db.query(Segment)
+            .filter(
+                Segment.file_record_id == file_record_id,
+                Segment.id.in_(ids),
+            )
+            .all()
+        )
+        return apply_cached_live_spelling_issues(
+            db,
+            file_record=file_record,
+            segments=segments,
+        )
 
 
 def check_segments_with_languagetool(
