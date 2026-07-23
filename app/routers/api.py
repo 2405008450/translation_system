@@ -2916,6 +2916,7 @@ class ProjectFileZipExportPayload(BaseModel):
 class FileRecordExportPayload(BaseModel):
     """文件记录导出请求体，可选携带 DOCX 导出样式设置。"""
     style_settings: dict[str, Any] | None = None
+    include_revision_marks: bool = False
 
 
 def _build_unavailable_document_statistics() -> dict[str, Any]:
@@ -12502,6 +12503,7 @@ def _queue_file_record_export_for_current_user(
     db: Session,
     current_user: User,
     style_settings: dict[str, Any] | None = None,
+    include_revision_marks: bool = False,
 ) -> dict[str, Any]:
     file_record = get_file_record_model(db, file_record_id)
     if not file_record:
@@ -12530,6 +12532,7 @@ def _queue_file_record_export_for_current_user(
         export_type=export_type,
         current_user=current_user,
         style_settings=style_settings,
+        include_revision_marks=include_revision_marks,
     )
 
 
@@ -13423,6 +13426,7 @@ def create_file_record_export_task(
             db=db,
             current_user=current_user,
             style_settings=payload.style_settings if payload else None,
+            include_revision_marks=payload.include_revision_marks if payload else False,
         ),
     )
 

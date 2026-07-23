@@ -6787,9 +6787,21 @@ async function exportWithTypeForFile(exportType: string, fileRecordId?: string |
     }
 
     const stylePayload = exportStyleSettings.value.enabled ? exportStyleSettings.value : null
+    const includeRevisionMarks = (
+      exportType === 'original'
+      && segmentStore.revisionTrackingEnabled
+    )
+    const exportPayload = (
+      stylePayload || includeRevisionMarks
+        ? {
+            ...(stylePayload ? { style_settings: stylePayload } : {}),
+            ...(includeRevisionMarks ? { include_revision_marks: true } : {}),
+          }
+        : null
+    )
     const { data: task } = await http.post<FileExportTask>(
       `/file-records/${targetFileRecordId}/exports`,
-      stylePayload ? { style_settings: stylePayload } : null,
+      exportPayload,
       { params: { type: exportType } },
     )
     const completedTask = await waitForFileExportTask(task)
@@ -13475,15 +13487,20 @@ onBeforeRouteLeave(async () => {
 
 .resource-search-panel__header {
   display: flex;
+  flex: 0 0 auto;
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
 }
 
 .resource-search-panel__bar {
+  position: relative;
+  z-index: 2;
   display: grid;
   grid-template-columns: 118px minmax(0, 1fr) 44px;
+  flex: 0 0 auto;
   align-items: center;
+  min-height: 36px;
   overflow: hidden;
   border: 1px solid #c9d7dd;
   border-radius: 6px;
@@ -13529,6 +13546,7 @@ onBeforeRouteLeave(async () => {
 }
 
 .resource-search-panel__message {
+  flex: 0 0 auto;
   min-height: 20px;
   color: #647780;
   font-size: 12px;

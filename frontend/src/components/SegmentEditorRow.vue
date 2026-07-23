@@ -704,7 +704,10 @@ function renderSourceHtmlWithHighlights(sourceHtml: string): string {
 }
 
 function renderTargetHtmlWithHighlights(targetHtml: string): string {
-  if (!hasRenderedTargetHighlights() || typeof document === 'undefined') {
+  if (
+    (!hasRenderedTargetHighlights() && !props.showVisibleChars)
+    || typeof document === 'undefined'
+  ) {
     return targetHtml
   }
 
@@ -717,7 +720,9 @@ function renderTargetHtmlWithHighlights(targetHtml: string): string {
       const text = node.textContent || ''
       if (!text) return
       const wrapper = document.createElement('span')
-      wrapper.innerHTML = renderTargetTextWithHighlights(text, absoluteOffset)
+      wrapper.innerHTML = hasRenderedTargetHighlights()
+        ? renderTargetTextWithHighlights(text, absoluteOffset)
+        : textToVisibleChars(text)
       absoluteOffset += text.length
       const textNode = node as ChildNode
       textNode.replaceWith(...Array.from(wrapper.childNodes))
@@ -1677,15 +1682,9 @@ function insertEditorLineBreak() {
   }
 
   recordUndoSnapshot(true, { force: true, inputType: 'insertLineBreak' })
-  if (props.showVisibleChars) {
-    document.execCommand(
-      'insertHTML',
-      false,
-      '<span class="visible-char visible-char--newline" contenteditable="false">¶</span>\n',
-    )
-  } else {
-    document.execCommand('insertLineBreak')
-  }
+  // 始终只编辑真实内容。¶ 属于显示层，状态同步后再按 showVisibleChars 渲染，
+  // 避免相邻换行被写成不可编辑的 “¶¶” DOM。
+  document.execCommand('insertLineBreak')
   handleInput()
 }
 
@@ -2053,7 +2052,7 @@ function collectBasicSourceFormatRuns(sourceHtml: string): BasicFormatRun[] {
  * 带格式片段，避免把首个 run 的下划线或粗体扩散到整句。
  */
 function projectSourceFormatsToTarget(sourceHtml: string, targetText: string): string | null {
-  if (!targetText || /[\r\n]/u.test(targetText) || /<\s*a\b/i.test(sourceHtml)) {
+  if (!targetText || /<\s*a\b/i.test(sourceHtml)) {
     return null
   }
 

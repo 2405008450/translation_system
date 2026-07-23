@@ -2842,7 +2842,7 @@ export const useSegmentStore = defineStore('segment', () => {
 
     const { data: task } = await http.post<FileExportTask>(
       `/file-records/${fileRecord.value.id}/exports`,
-      null,
+      revisionTrackingEnabled.value ? { include_revision_marks: true } : null,
       { params: { type: 'original' } },
     )
     const completedTask = await waitForFileExportTask(task)

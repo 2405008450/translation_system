@@ -40,6 +40,7 @@ from app.services.file_record_service import (
     load_file_record_source,
 )
 from app.services.language_pairs import require_language_pair
+from app.services.revision_service import list_revisions
 
 
 logger = logging.getLogger(__name__)
@@ -53,10 +54,11 @@ _FILE_EXPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fi
 _SCHEMA_READY = False
 _SCHEMA_LOCK = Lock()
 
-# 导出样式设置以任务 id 为键暂存在进程内（排队与执行在同一进程内的线程池中完成），
-# 避免为一次性的导出参数新增数据库列。任务执行结束后即清理。
+# 一次性导出选项以任务 id 为键暂存在进程内（排队与执行在同一进程内的线程池中完成），
+# 避免为样式设置和修订痕迹开关新增数据库列。任务执行结束后即清理。
 _STYLE_SETTINGS_BY_TASK: dict[str, dict[str, Any]] = {}
 _STYLE_SETTINGS_LOCK = Lock()
+_REVISION_MARK_TASK_IDS: set[str] = set()
 
 
 def _store_style_settings(task_id: UUID, style_settings: dict[str, Any] | None) -> None:
@@ -69,6 +71,22 @@ def _store_style_settings(task_id: UUID, style_settings: dict[str, Any] | None) 
 def _pop_style_settings(task_id: UUID) -> dict[str, Any] | None:
     with _STYLE_SETTINGS_LOCK:
         return _STYLE_SETTINGS_BY_TASK.pop(str(task_id), None)
+
+
+def _store_revision_mark_option(task_id: UUID, include_revision_marks: bool) -> None:
+    if not include_revision_marks:
+        return
+    with _STYLE_SETTINGS_LOCK:
+        _REVISION_MARK_TASK_IDS.add(str(task_id))
+
+
+def _pop_revision_mark_option(task_id: UUID) -> bool:
+    with _STYLE_SETTINGS_LOCK:
+        task_key = str(task_id)
+        enabled = task_key in _REVISION_MARK_TASK_IDS
+        _REVISION_MARK_TASK_IDS.discard(task_key)
+        return enabled
+
 
 _FILE_EXPORT_SCHEMA_STATEMENTS = [
     """
@@ -206,6 +224,7 @@ def queue_file_export(
     export_type: str,
     current_user: User | None,
     style_settings: dict[str, Any] | None = None,
+    include_revision_marks: bool = False,
 ) -> dict[str, Any]:
     ensure_file_export_tasks_schema()
     export_type = normalize_file_export_type(export_type)
@@ -235,6 +254,7 @@ def queue_file_export(
     db.refresh(task)
 
     _store_style_settings(task.id, style_settings)
+    _store_revision_mark_option(task.id, include_revision_marks)
 
     _cleanup_expired_file_exports(db)
     future = _FILE_EXPORT_EXECUTOR.submit(_run_file_export_task, task.id)
@@ -379,6 +399,7 @@ def _resolve_file_record_export_language_pair(file_record: FileRecord) -> tuple[
 
 def _run_file_export_task(task_id: UUID) -> None:
     style_settings = _pop_style_settings(task_id)
+    include_revision_marks = _pop_revision_mark_option(task_id)
     try:
         with SessionLocal() as db:
             task = get_file_export_task(db, task_id)
@@ -390,7 +411,11 @@ def _run_file_export_task(task_id: UUID) -> None:
 
             _set_file_export_task_status(db, task, "running", progress=20, message="正在读取文件和句段。")
             exported_file = build_file_record_exported_file(
-                db, file_record, task.export_type, style_settings=style_settings
+                db,
+                file_record,
+                task.export_type,
+                style_settings=style_settings,
+                include_revision_marks=include_revision_marks,
             )
 
             output_dir = _ensure_export_dir()
@@ -418,6 +443,7 @@ def build_file_record_exported_file(
     file_record: FileRecord,
     export_type: str,
     style_settings: dict[str, Any] | None = None,
+    include_revision_marks: bool = False,
 ):
     raw_bytes = load_file_record_source(file_record)
     source_filename = get_file_record_source_filename(file_record)
@@ -441,6 +467,15 @@ def build_file_record_exported_file(
     if export_type == "original":
         if not can_export_task_file(source_filename, has_source_file=raw_bytes is not None):
             raise ValueError("Current file format does not support original export yet.")
+        word_revision_marks_enabled = (
+            include_revision_marks
+            and get_task_file_extension(source_filename) in {".doc", ".docx"}
+        )
+        revisions = (
+            list_revisions(db, file_record_id=file_record.id)
+            if word_revision_marks_enabled
+            else None
+        )
         return _apply_style_settings_to_export(
             export_translated_task_file(
                 raw_bytes=raw_bytes,
@@ -449,6 +484,8 @@ def build_file_record_exported_file(
                 document_parse_mode=document_parse_mode,
                 document_parse_options=document_parse_options,
                 target_language=getattr(file_record, "target_language", None),
+                revisions=revisions,
+                include_revision_marks=word_revision_marks_enabled,
             ),
             style_settings,
         )
