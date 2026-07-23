@@ -60,7 +60,11 @@ import Pagination from '../components/Pagination.vue'
 import PreviewPanel from '../components/PreviewPanel.vue'
 import ResourceImportDialog from '../components/ResourceImportDialog.vue'
 import RevisionSettingsDialog from '../components/RevisionSettingsDialog.vue'
-import ExportStyleSettingsDialog, { type ExportStyleSettings } from '../components/ExportStyleSettingsDialog.vue'
+import ExportStyleSettingsDialog, {
+  type ExportStyleSettings,
+  createDefaultPptxLayoutSettings,
+  normalizePptxLayoutSettings,
+} from '../components/ExportStyleSettingsDialog.vue'
 import SegmentEditorRow from '../components/SegmentEditorRow.vue'
 import SplitPreviewPanel from '../components/SplitPreviewPanel.vue'
 import TMMatchPanel from '../components/TMMatchPanel.vue'
@@ -884,12 +888,12 @@ const exportMessage = ref('')
 let exportPollTimer: number | null = null
 const groupedExportOptions = computed(() => groupExportOptions(exportOptions.value))
 
-// 导出样式设置（仅对 DOCX 生效）
+// 导出样式设置（DOCX 文字样式 / PPTX 版式优化）
 const EXPORT_STYLE_SETTINGS_STORAGE_KEY = 'workbench.exportStyleSettings'
 const showExportStyleDialog = ref(false)
 
 function createEmptyExportStyleSettings(): ExportStyleSettings {
-  return { enabled: false, defaults: {}, styles: {}, hyphenation: {} }
+  return { enabled: false, defaults: {}, styles: {}, hyphenation: {}, pptx: createDefaultPptxLayoutSettings() }
 }
 
 function loadExportStyleSettings(): ExportStyleSettings {
@@ -904,6 +908,7 @@ function loadExportStyleSettings(): ExportStyleSettings {
       defaults: parsed?.defaults && typeof parsed.defaults === 'object' ? parsed.defaults : {},
       styles: parsed?.styles && typeof parsed.styles === 'object' ? parsed.styles : {},
       hyphenation: parsed?.hyphenation && typeof parsed.hyphenation === 'object' ? parsed.hyphenation : {},
+      pptx: normalizePptxLayoutSettings(parsed?.pptx),
     }
   } catch {
     return createEmptyExportStyleSettings()
@@ -6767,7 +6772,8 @@ async function exportWithTypeForFile(exportType: string, fileRecordId?: string |
       return
     }
 
-    const stylePayload = exportStyleSettings.value.enabled ? exportStyleSettings.value : null
+    const styleActive = exportStyleSettings.value.enabled || Boolean(exportStyleSettings.value.pptx?.enabled)
+    const stylePayload = styleActive ? exportStyleSettings.value : null
     const { data: task } = await http.post<FileExportTask>(
       `/file-records/${targetFileRecordId}/exports`,
       stylePayload ? { style_settings: stylePayload } : null,

@@ -305,6 +305,44 @@ REQUIRED_SCHEMA = {
         "cell_index",
         "created_at",
     },
+    "pptx_layout_reports": {
+        "id",
+        "file_record_id",
+        "export_task_id",
+        "created_by_id",
+        "export_type",
+        "filename",
+        "mode",
+        "provider",
+        "model",
+        "total_candidates",
+        "adjusted_count",
+        "vlm_used",
+        "status",
+        "created_at",
+    },
+    "pptx_layout_report_items": {
+        "id",
+        "report_id",
+        "slide_index",
+        "tag",
+        "uid",
+        "kind",
+        "source_text",
+        "orig_left",
+        "orig_top",
+        "orig_width",
+        "orig_height",
+        "new_left",
+        "new_top",
+        "new_width",
+        "new_height",
+        "overflow_ratio",
+        "font_scale",
+        "applied",
+        "reason",
+        "created_at",
+    },
     "segment_qa_issues": {
         "id",
         "project_id",
@@ -662,6 +700,14 @@ REQUIRED_INDEXES = {
         "ix_guideline_templates_updated_at",
         "ix_guideline_templates_created_by_id",
         "ix_guideline_templates_last_modified_by_id",
+    },
+    "pptx_layout_reports": {
+        "ix_pptx_layout_reports_file_record_id",
+        "ix_pptx_layout_reports_created_by_id",
+        "ix_pptx_layout_reports_created_at",
+    },
+    "pptx_layout_report_items": {
+        "ix_pptx_layout_report_items_report_id",
     },
 }
 
@@ -2794,6 +2840,64 @@ def _build_schema_statements(*, create_update_function: bool) -> list[str]:
             """
             CREATE INDEX IF NOT EXISTS ix_number_check_report_items_status
             ON number_check_report_items (status)
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS pptx_layout_reports (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                file_record_id UUID REFERENCES file_records(id) ON DELETE CASCADE,
+                export_task_id UUID,
+                created_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                export_type VARCHAR(40) NOT NULL DEFAULT '',
+                filename VARCHAR(255) NOT NULL DEFAULT '',
+                mode VARCHAR(20) NOT NULL DEFAULT '',
+                provider VARCHAR(40) NOT NULL DEFAULT '',
+                model VARCHAR(120) NOT NULL DEFAULT '',
+                total_candidates INTEGER NOT NULL DEFAULT 0,
+                adjusted_count INTEGER NOT NULL DEFAULT 0,
+                vlm_used BOOLEAN NOT NULL DEFAULT FALSE,
+                status VARCHAR(20) NOT NULL DEFAULT 'completed',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS pptx_layout_report_items (
+                id UUID PRIMARY KEY DEFAULT {UUID_SQL_DEFAULT},
+                report_id UUID NOT NULL REFERENCES pptx_layout_reports(id) ON DELETE CASCADE,
+                slide_index INTEGER NOT NULL DEFAULT 0,
+                tag VARCHAR(40) NOT NULL DEFAULT '',
+                uid VARCHAR(80) NOT NULL DEFAULT '',
+                kind VARCHAR(20) NOT NULL DEFAULT '',
+                source_text TEXT NOT NULL DEFAULT '',
+                orig_left DOUBLE PRECISION,
+                orig_top DOUBLE PRECISION,
+                orig_width DOUBLE PRECISION,
+                orig_height DOUBLE PRECISION,
+                new_left DOUBLE PRECISION,
+                new_top DOUBLE PRECISION,
+                new_width DOUBLE PRECISION,
+                new_height DOUBLE PRECISION,
+                overflow_ratio DOUBLE PRECISION,
+                font_scale DOUBLE PRECISION,
+                applied BOOLEAN NOT NULL DEFAULT FALSE,
+                reason TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_pptx_layout_reports_file_record_id
+            ON pptx_layout_reports (file_record_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_pptx_layout_reports_created_by_id
+            ON pptx_layout_reports (created_by_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_pptx_layout_reports_created_at
+            ON pptx_layout_reports (created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_pptx_layout_report_items_report_id
+            ON pptx_layout_report_items (report_id)
             """,
             f"""
             CREATE TABLE IF NOT EXISTS segment_qa_issues (

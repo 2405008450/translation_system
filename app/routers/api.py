@@ -5949,7 +5949,7 @@ def _serialize_tm_collection(collection: MemoryBase, entry_count: int | None = N
         "created_at": collection.created_at.isoformat(),
         "updated_at": collection.updated_at.isoformat(),
         "entry_count": int(
-            getattr(collection, "entry_count", 0)
+            (getattr(collection, "entry_count", 0) or 0)
             if entry_count is None
             else entry_count
         ),

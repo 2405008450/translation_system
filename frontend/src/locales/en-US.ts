@@ -215,6 +215,25 @@ const overrides = {
       groupPara: 'Paragraph format',
       groupTable: 'Table format',
       hyphenation: 'Automatic hyphenation (Layout → Hyphenation)',
+      pptx: {
+        enable: 'Enable PPTX layout optimization',
+        enableHint: 'When on, PPTX exports use a vision model to detect and fix text overflow caused by longer translations; when off, the original export is kept. Applies to .pptx only.',
+        modeLabel: 'Adjustment mode',
+        modelLabel: 'Vision model',
+        modelHint: 'Always called via OpenRouter; pick one of the multimodal models below.',
+        modes: {
+          model_scale: 'Shrink font only (safest)',
+          shrink: 'Keep box · shrink font',
+          both: 'Adjust box + shrink font',
+          expand: 'Enlarge text box only',
+        },
+        modeHints: {
+          model_scale: 'Keeps box position and size; only shrinks font by the overflow ratio. Least disruptive.',
+          shrink: 'Keeps the original box and shrinks the font by area ratio to fit the text.',
+          both: 'Moves/enlarges the box as suggested by the vision model, then shrinks the font if still needed.',
+          expand: 'Enlarges/moves the text box as suggested by the vision model; font size unchanged.',
+        },
+      },
     },
     settings: {
       title: 'Settings',

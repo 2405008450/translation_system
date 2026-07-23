@@ -389,8 +389,19 @@ def _run_file_export_task(task_id: UUID) -> None:
                 raise ValueError("File record not found.")
 
             _set_file_export_task_status(db, task, "running", progress=20, message="正在读取文件和句段。")
+            report_context = {
+                "file_record_id": task.file_record_id,
+                "export_task_id": task.id,
+                "created_by_id": task.created_by_id,
+                "export_type": task.export_type,
+                "filename": file_record.filename,
+            }
             exported_file = build_file_record_exported_file(
-                db, file_record, task.export_type, style_settings=style_settings
+                db,
+                file_record,
+                task.export_type,
+                style_settings=style_settings,
+                report_context=report_context,
             )
 
             output_dir = _ensure_export_dir()
@@ -418,6 +429,7 @@ def build_file_record_exported_file(
     file_record: FileRecord,
     export_type: str,
     style_settings: dict[str, Any] | None = None,
+    report_context: dict[str, Any] | None = None,
 ):
     raw_bytes = load_file_record_source(file_record)
     source_filename = get_file_record_source_filename(file_record)
@@ -451,6 +463,7 @@ def build_file_record_exported_file(
                 target_language=getattr(file_record, "target_language", None),
             ),
             style_settings,
+            report_context,
         )
 
     if export_type in BILINGUAL_DOCX_LAYOUT_EXPORT_ORDERS:
@@ -467,6 +480,7 @@ def build_file_record_exported_file(
                 target_language=getattr(file_record, "target_language", None),
             ),
             style_settings,
+            report_context,
         )
 
     if export_type == "bilingual_excel_original":
@@ -482,11 +496,15 @@ def build_file_record_exported_file(
     if export_type == BILINGUAL_PPTX_EXPORT_TYPE:
         if get_task_file_extension(source_filename) != ".pptx":
             raise ValueError("Only PPTX source files support original-format bilingual PPTX export.")
-        return export_bilingual_pptx_task_file(
-            raw_bytes=raw_bytes,
-            filename=source_filename,
-            segments=segments,
-            document_parse_options=document_parse_options,
+        return _apply_style_settings_to_export(
+            export_bilingual_pptx_task_file(
+                raw_bytes=raw_bytes,
+                filename=source_filename,
+                segments=segments,
+                document_parse_options=document_parse_options,
+            ),
+            style_settings,
+            report_context,
         )
 
     segment_dicts = [
@@ -519,20 +537,32 @@ def build_file_record_exported_file(
             filename=export_filename,
         ),
         style_settings,
+        report_context,
     )
 
 
-def _apply_style_settings_to_export(exported_file, style_settings: dict[str, Any] | None):
+def _apply_style_settings_to_export(
+    exported_file,
+    style_settings: dict[str, Any] | None,
+    report_context: dict[str, Any] | None = None,
+):
     """
-    仅对 .docx 导出结果按用户设置调整样式；其余格式或未启用设置时原样返回。
-    调整失败会在内部记录日志并回退到原始内容，绝不影响导出成功。
+    按导出结果扩展名分派样式后处理：.docx 走文字样式调整、.pptx 走版式优化。
+    其余格式或未启用设置时原样返回；调整失败会在内部记录日志并回退到原始内容，
+    绝不影响导出成功。
     """
     if not style_settings:
         return exported_file
     filename = getattr(exported_file, "filename", "") or ""
-    if not filename.lower().endswith(".docx"):
-        return exported_file
+    lowered = filename.lower()
+    if lowered.endswith(".docx"):
+        return _apply_docx_style_settings(exported_file, style_settings, filename)
+    if lowered.endswith(".pptx"):
+        return _apply_pptx_layout_settings(exported_file, style_settings, filename, report_context)
+    return exported_file
 
+
+def _apply_docx_style_settings(exported_file, style_settings: dict[str, Any], filename: str):
     from app.services.export_settings.style_export_integration import (
         apply_export_style_settings,
         style_settings_enabled,
@@ -548,6 +578,33 @@ def _apply_style_settings_to_export(exported_file, style_settings: dict[str, Any
         content=adjusted,
         media_type=getattr(exported_file, "media_type", None)
         or "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=filename,
+    )
+
+
+def _apply_pptx_layout_settings(
+    exported_file,
+    style_settings: dict[str, Any],
+    filename: str,
+    report_context: dict[str, Any] | None = None,
+):
+    from app.services.export_settings.pptx_layout import (
+        apply_pptx_layout_settings,
+        pptx_layout_settings_enabled,
+    )
+
+    if not pptx_layout_settings_enabled(style_settings):
+        return exported_file
+
+    adjusted = apply_pptx_layout_settings(
+        exported_file.content, style_settings, report_context=report_context
+    )
+    if adjusted is exported_file.content or adjusted == exported_file.content:
+        return exported_file
+    return _GenericExportedFile(
+        content=adjusted,
+        media_type=getattr(exported_file, "media_type", None)
+        or "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         filename=filename,
     )
 

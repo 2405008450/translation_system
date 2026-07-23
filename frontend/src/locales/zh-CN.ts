@@ -1167,6 +1167,25 @@ export default {
       groupPara: '段落格式',
       groupTable: '表格格式',
       hyphenation: '自动断字（布局→断字）',
+      pptx: {
+        enable: '启用 PPTX 版式优化',
+        enableHint: '开启后，导出 PPTX 时会用视觉模型检测因翻译变长导致的文字溢出并自动调整；关闭则保持原始导出。仅对 .pptx 生效。',
+        modeLabel: '调整模式',
+        modelLabel: '视觉模型',
+        modelHint: '统一通过 OpenRouter 调用，请从下列多模态模型中选择。',
+        modes: {
+          model_scale: '仅缩字号（最安全）',
+          shrink: '框不动·缩字号',
+          both: '调整框+缩字号',
+          expand: '仅放大文本框',
+        },
+        modeHints: {
+          model_scale: '文本框位置大小不变，只按溢出比例缩小字号，最不易破坏版面。',
+          shrink: '保持原文本框，按面积比缩小字号以容纳文字。',
+          both: '按视觉模型建议移动/放大文本框，仍放不下时再缩小字号。',
+          expand: '按视觉模型建议放大/移动文本框，字号保持不变。',
+        },
+      },
     },
     statusSummary: {
       projectSync: '项目同步',

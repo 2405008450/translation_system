@@ -2533,3 +2533,95 @@ class ReferenceFile(Base):
     profile: Mapped["ReferenceProfile"] = relationship(
         "ReferenceProfile", back_populates="reference_files"
     )
+
+
+class PptxLayoutReport(Base):
+    """PPTX 版式优化报告：记录一次导出后处理的整体情况与参数。"""
+
+    __tablename__ = "pptx_layout_reports"
+    __table_args__ = (
+        Index("ix_pptx_layout_reports_file_record_id", "file_record_id"),
+        Index("ix_pptx_layout_reports_created_by_id", "created_by_id"),
+        Index("ix_pptx_layout_reports_created_at", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    file_record_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("file_records.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    export_task_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    export_type: Mapped[str] = mapped_column(String(40), nullable=False, default="", server_default=text("''"))
+    filename: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default=text("''"))
+    mode: Mapped[str] = mapped_column(String(20), nullable=False, default="", server_default=text("''"))
+    provider: Mapped[str] = mapped_column(String(40), nullable=False, default="", server_default=text("''"))
+    model: Mapped[str] = mapped_column(String(120), nullable=False, default="", server_default=text("''"))
+    total_candidates: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    adjusted_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    vlm_used: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="completed", server_default=text("'completed'"))
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+
+    file_record: Mapped["FileRecord | None"] = relationship("FileRecord")
+    created_by: Mapped["User | None"] = relationship("User", foreign_keys=[created_by_id])
+    items: Mapped[list["PptxLayoutReportItem"]] = relationship(
+        "PptxLayoutReportItem",
+        back_populates="report",
+        cascade="all, delete-orphan",
+    )
+
+
+class PptxLayoutReportItem(Base):
+    """PPTX 版式优化报告项：单个文本框的 AI 判断与实际调整结果。"""
+
+    __tablename__ = "pptx_layout_report_items"
+    __table_args__ = (
+        Index("ix_pptx_layout_report_items_report_id", "report_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=UUID_SQL_DEFAULT,
+    )
+    report_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("pptx_layout_reports.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    slide_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    tag: Mapped[str] = mapped_column(String(40), nullable=False, default="", server_default=text("''"))
+    uid: Mapped[str] = mapped_column(String(80), nullable=False, default="", server_default=text("''"))
+    kind: Mapped[str] = mapped_column(String(20), nullable=False, default="", server_default=text("''"))
+    source_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    orig_left: Mapped[float | None] = mapped_column(Float, nullable=True)
+    orig_top: Mapped[float | None] = mapped_column(Float, nullable=True)
+    orig_width: Mapped[float | None] = mapped_column(Float, nullable=True)
+    orig_height: Mapped[float | None] = mapped_column(Float, nullable=True)
+    new_left: Mapped[float | None] = mapped_column(Float, nullable=True)
+    new_top: Mapped[float | None] = mapped_column(Float, nullable=True)
+    new_width: Mapped[float | None] = mapped_column(Float, nullable=True)
+    new_height: Mapped[float | None] = mapped_column(Float, nullable=True)
+    overflow_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    font_scale: Mapped[float | None] = mapped_column(Float, nullable=True)
+    applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), nullable=False
+    )
+
+    report: Mapped["PptxLayoutReport"] = relationship("PptxLayoutReport", back_populates="items")

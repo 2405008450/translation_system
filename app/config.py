@@ -84,6 +84,21 @@ class Settings(BaseSettings):
     libreoffice_soffice_path: str | None = None
     libreoffice_python_path: str | None = None
     libreoffice_timeout_seconds: float = 60.0
+    # PPTX 版式优化：视觉复核统一走的 LLM provider（需支持多模态 image_url，如 openrouter）。
+    pptx_layout_vlm_provider: str = "openrouter"
+    # PPTX 版式优化：可选视觉模型列表（前端下拉与后端校验共用；从 env 传 JSON 数组）。
+    pptx_layout_vlm_models: list[str] = Field(
+        default_factory=lambda: [
+            "google/gemini-3.1-pro-preview",
+            "google/gemini-3.6-flash",
+            "anthropic/claude-sonnet-5",
+            "anthropic/claude-fable-5",
+        ]
+    )
+    # PPTX 版式优化：默认视觉模型（留空则取模型列表首个）。
+    pptx_layout_vlm_model: str = "google/gemini-3.1-pro-preview"
+    # PPTX 版式优化：LibreOffice 渲染页面截图的 DPI。
+    pptx_layout_render_dpi: int = 200
     # ODA File Converter（DWG <-> DXF 跨平台转换器，需用户自行安装）
     # Windows 例：C:\Program Files\ODA\ODAFileConverter 25.12.0\ODAFileConverter.exe
     # Linux 例：  /usr/bin/ODAFileConverter
