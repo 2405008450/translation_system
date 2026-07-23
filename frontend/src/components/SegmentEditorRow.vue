@@ -839,6 +839,38 @@ function isRevisionDeleteNode(node: Node): boolean {
   return Boolean(element?.closest('[data-revision-type="delete"]'))
 }
 
+function isVisibleNewlineMarker(node: Node | null): node is HTMLElement {
+  return Boolean(
+    node
+    && node.nodeType === Node.ELEMENT_NODE
+    && (node as HTMLElement).classList.contains('visible-char--newline'),
+  )
+}
+
+/**
+ * 可见换行渲染为“¶ 标记 + \n 文本节点”。后面的 \n 只负责视觉断行，
+ * 序列化和光标偏移时必须忽略，否则每次状态回填都会把一个换行复制成两个。
+ */
+function getSerializableTextNodeValue(node: Node): string {
+  const text = node.textContent || ''
+  if (
+    node.nodeType === Node.TEXT_NODE
+    && isVisibleNewlineMarker(node.previousSibling)
+    && text.startsWith('\n')
+  ) {
+    return text.slice(1)
+  }
+  return text
+}
+
+function getSerializableTextNodeDomStart(node: Node): number {
+  return (
+    node.nodeType === Node.TEXT_NODE
+    && isVisibleNewlineMarker(node.previousSibling)
+    && (node.textContent || '').startsWith('\n')
+  ) ? 1 : 0
+}
+
 function getSerializableNodeLength(node: Node): number {
   if (isRevisionDeleteNode(node)) {
     return 0
@@ -850,7 +882,7 @@ function getSerializableNodeLength(node: Node): number {
     return 1
   }
   if (node.nodeType === Node.TEXT_NODE) {
-    return node.textContent?.length || 0
+    return getSerializableTextNodeValue(node).length
   }
   if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR') {
     return 1
@@ -872,7 +904,7 @@ function serializeEditorContent(node: Node): string {
     if (el.classList.contains('visible-char--newline')) return '\n'
   }
   if (node.nodeType === Node.TEXT_NODE) {
-    return node.textContent || ''
+    return getSerializableTextNodeValue(node)
   }
   if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR') {
     return '\n'
@@ -894,7 +926,7 @@ function serializeEditorContentWithFormat(node: Node): string {
     return escapeHtml(serializeEditorContent(node))
   }
   if (node.nodeType === Node.TEXT_NODE) {
-    return escapeHtml(node.textContent || '')
+    return escapeHtml(getSerializableTextNodeValue(node))
   }
   if (node.nodeType === Node.ELEMENT_NODE) {
     const el = node as HTMLElement
@@ -933,9 +965,10 @@ function getSerializableOffsetForPosition(el: HTMLElement, container: Node, posi
 
     if (node === container) {
       if (node.nodeType === Node.TEXT_NODE) {
-        offset += isRevisionDeleteNode(node)
-          ? 0
-          : (node.textContent || '').slice(0, positionOffset).length
+        if (!isRevisionDeleteNode(node)) {
+          const domStart = getSerializableTextNodeDomStart(node)
+          offset += Math.max(0, positionOffset - domStart)
+        }
       } else {
         const children = Array.from(node.childNodes).slice(0, positionOffset)
         offset += children.reduce((total, child) => total + getSerializableNodeLength(child), 0)
@@ -944,7 +977,11 @@ function getSerializableOffsetForPosition(el: HTMLElement, container: Node, posi
       return true
     }
 
-    if (node.nodeType === Node.TEXT_NODE || (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR')) {
+    if (
+      node.nodeType === Node.TEXT_NODE
+      || isVisibleNewlineMarker(node)
+      || (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR')
+    ) {
       offset += getSerializableNodeLength(node)
       return false
     }
@@ -1005,12 +1042,25 @@ function resolveSerializablePosition(el: HTMLElement, targetOffset: number): { n
       return false
     }
 
+    if (isVisibleNewlineMarker(node)) {
+      const parent = node.parentNode || el
+      const index = Math.max(0, getNodeIndex(node))
+      if (currentOffset + 1 >= normalizedOffset) {
+        resolved = { node: parent, offset: index }
+        return true
+      }
+      currentOffset += 1
+      fallback = { node: parent, offset: index + 1 }
+      return false
+    }
+
     if (node.nodeType === Node.TEXT_NODE) {
-      const textLength = node.textContent?.length || 0
+      const domStart = getSerializableTextNodeDomStart(node)
+      const textLength = getSerializableTextNodeValue(node).length
       if (currentOffset + textLength >= normalizedOffset) {
         resolved = {
           node,
-          offset: Math.max(0, Math.min(textLength, normalizedOffset - currentOffset)),
+          offset: domStart + Math.max(0, Math.min(textLength, normalizedOffset - currentOffset)),
         }
         return true
       }
