@@ -1143,7 +1143,11 @@ function getCurrentEditorText(): string {
 }
 
 function getPropTargetStateText(): string {
-  return props.pendingRevision?.after_text ?? props.segment.target_text ?? ''
+  if (props.pendingRevision) {
+    return props.pendingRevision.after_text ?? ''
+  }
+  // 多样式句段以“带标签版式译文”为编辑对象（内联标签编辑）；纯译文由后端拆分派生。
+  return props.segment.target_layout_text || props.segment.target_text || ''
 }
 
 function getPropTargetStateHtml(): string | null {

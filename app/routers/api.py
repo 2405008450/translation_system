@@ -5171,6 +5171,19 @@ def _segment_metadata_format_map(segment: Any) -> dict:
     format_map = metadata.get("source_layout_formats")
     return format_map if isinstance(format_map, dict) else {}
 
+def _segment_metadata_target_layout_text(segment: Any) -> str:
+    """从句段 segment_metadata 取带标签版式译文（供前端内联标签编辑）。"""
+    raw = getattr(segment, "segment_metadata", None)
+    if not raw:
+        return ""
+    try:
+        metadata = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(metadata, dict):
+        return ""
+    return str(metadata.get("target_layout_text") or "")
+
 
 def _build_llm_translation_tasks(
     db: Session,
@@ -10010,6 +10023,7 @@ def _serialize_workbench_segment(
     if not source_layout_text and "\n" in (seg.display_text or ""):
         source_layout_text = seg.display_text or ""
     source_format_map = _segment_metadata_format_map(seg)
+    target_layout_text = _segment_metadata_target_layout_text(seg)
     resolved_workflow_step_id = seg.workflow_step_id
     if resolved_workflow_step_id is None and workflow_step_by_id:
         resolved_workflow_step_id = next(iter(workflow_step_by_id.keys()), None)
@@ -15540,7 +15554,8 @@ async def llm_translate_file_record(
                         "segment",
                         {
                             "sentence_id": segment.sentence_id,
-                            "target_text": segment.target_text,
+                            # 带标签版式译文优先下发，前端据此拆分：纯译文展示、带标签供内联编辑
+                            "target_text": layout_translated_text or segment.target_text,
                             "status": segment.status,
                             "source": segment.source,
                             "provider": result.provider,

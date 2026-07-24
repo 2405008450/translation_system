@@ -473,6 +473,8 @@ export interface Segment {
   source_layout_text?: string | null
   /** 逐标记样式表：{标签 id / "base": [开 span, 闭 span]}，用于把译文里的 ⟦n⟧ 渲染为行内样式 */
   source_format_map?: Record<string, [string, string]> | null
+  /** 带标签版式译文（内联标签编辑用）；target_text 是它剥标签后的纯译文 */
+  target_layout_text?: string | null
   automatic_numbering_text?: string | null
   target_automatic_numbering_text?: string | null
   source_html?: string | null

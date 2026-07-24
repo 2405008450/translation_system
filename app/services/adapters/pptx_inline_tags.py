@@ -269,7 +269,7 @@ def build_tagged_paragraph(paragraph: ET.Element) -> TaggedParagraph | None:
         t_element = run.find(f"{_A}t")
         rpr = run.find(f"{_A}rPr")
         text = t_element.text if (t_element is not None and t_element.text) else ""
-        key = _visual_rpr_key(rpr)
+        key = ET.tostring(rpr, encoding="unicode") if rpr is not None else ""
         segments.append((text, rpr, key))
 
     # 选“文本量最大”的样式作为基准，标签数量最少

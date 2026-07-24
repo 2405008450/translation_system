@@ -42,6 +42,9 @@ const EXPORT_POLL_INTERVAL_MS = 1200
 const REVISION_TRACKING_STORAGE_KEY = 'workbench.revisionTrackingEnabled'
 const DEFAULT_REVISION_INSERT_COLOR = '#2563eb'
 const DEFAULT_REVISION_DELETE_COLOR = '#dc2626'
+// 行内样式标记 ⟦n⟧ / ⟦/n⟧：非全局用于 test，全局用于 replace（避免 lastIndex 状态问题）
+const FORMAT_MARK_RE = /⟦\s*\/?\s*\d+\s*⟧/
+const FORMAT_MARK_RE_GLOBAL = /⟦\s*\/?\s*\d+\s*⟧/g
 type SegmentBatchTarget = LLMMergeTarget
 interface SegmentConfirmationOptions {
   rangeStart?: number | null
@@ -1605,30 +1608,37 @@ export const useSegmentStore = defineStore('segment', () => {
     const segment = segments.value[index]
     const confirm = options.confirm === true
     const nextTargetHtml = targetHtml || null
+    // 内联标签编辑：编辑值可能带 ⟦n⟧ 标签。存储/展示用纯译文（剥标签），
+    // 带标签版式译文单独留存；发给后端的仍是带标签文本，由后端拆分落库。
+    const hasMarks = FORMAT_MARK_RE.test(targetText || '')
+    const cleanTargetText = hasMarks ? (targetText || '').replace(FORMAT_MARK_RE_GLOBAL, '') : (targetText || '')
+    const layoutTargetText = hasMarks ? (targetText || '') : ''
     const currentTargetText = segment.target_text || ''
     const currentTargetHtml = segment.target_html || null
     if (
-      currentTargetText === (targetText || '')
+      currentTargetText === cleanTargetText
+      && (segment.target_layout_text || '') === layoutTargetText
       && currentTargetHtml === nextTargetHtml
       && (!confirm || segment.status === 'confirmed')
     ) {
       return
     }
     if (revisionTrackingEnabled.value) {
-      upsertLocalRevisionDraft(segment, targetText)
+      upsertLocalRevisionDraft(segment, cleanTargetText)
     }
     const nextSegment = {
       ...segment,
-      target_text: targetText,
+      target_text: cleanTargetText,
+      target_layout_text: layoutTargetText || null,
       target_html: nextTargetHtml,
       source: 'manual',
-      status: resolveSegmentStatusAfterTargetUpdate(segment, targetText, confirm),
+      status: resolveSegmentStatusAfterTargetUpdate(segment, cleanTargetText, confirm),
       llm_provider: null,
       llm_model: null,
     }
     segments.value[index] = nextSegment
     adjustSegmentStatusStats(segment, nextSegment)
-    markPreviewUpdate(segmentKey, targetText)
+    markPreviewUpdate(segmentKey, cleanTargetText)
 
     dirtyEntries.value = {
       ...dirtyEntries.value,
@@ -2348,10 +2358,15 @@ export const useSegmentStore = defineStore('segment', () => {
 
     const currentSegment = segments.value[index]
     const isLLMSource = source === 'llm'
-    const nextStatus = status || resolveUnconfirmedSegmentStatus(currentSegment, targetText)
+    // 兼容带标签版式译文：拆出纯译文用于展示/状态，带标签文本单独留存供内联标签编辑。
+    const hasMarks = FORMAT_MARK_RE.test(targetText || '')
+    const cleanTargetText = hasMarks ? (targetText || '').replace(FORMAT_MARK_RE_GLOBAL, '') : (targetText || '')
+    const layoutTargetText = hasMarks ? (targetText || '') : ''
+    const nextStatus = status || resolveUnconfirmedSegmentStatus(currentSegment, cleanTargetText)
     const nextSegment = {
       ...currentSegment,
-      target_text: targetText,
+      target_text: cleanTargetText,
+      target_layout_text: layoutTargetText || null,
       source,
       status: nextStatus,
       llm_provider: isLLMSource ? (llmInfo.provider ?? currentSegment.llm_provider ?? null) : null,
@@ -2359,8 +2374,8 @@ export const useSegmentStore = defineStore('segment', () => {
     }
     segments.value[index] = nextSegment
     adjustSegmentStatusStats(currentSegment, nextSegment)
-    markPreviewUpdate(segmentKey, targetText)
-    updateRevisionBaselineAfterPrefill(segmentKey, targetText)
+    markPreviewUpdate(segmentKey, cleanTargetText)
+    updateRevisionBaselineAfterPrefill(segmentKey, cleanTargetText)
 
     const nextDirtyEntries = { ...dirtyEntries.value }
     delete nextDirtyEntries[segmentKey]
