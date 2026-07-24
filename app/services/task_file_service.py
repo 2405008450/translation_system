@@ -1112,6 +1112,7 @@ def build_export_segments_from_source(
         if translated_segment is not None:
             used_translated_segment_ids.add(id(translated_segment))
         context = _build_segment_context(parse_result.ast, parsed_segment.block_path, fallback_index=index)
+        target_layout_text = ""
         
         # 优先使用数据库中的 segment_metadata（可能包含手动合并信息）
         if translated_segment:
@@ -1120,7 +1121,10 @@ def build_export_segments_from_source(
                 db_metadata = _json.loads(db_metadata_str) if db_metadata_str else {}
             except (TypeError, _json.JSONDecodeError):
                 db_metadata = {}
-            
+
+            # 带标签版式译文：导出时优先用它还原 run 级格式（译文本身保持纯净）
+            target_layout_text = str(db_metadata.get("target_layout_text") or "")
+
             # 如果数据库中有合并信息，覆盖解析的 metadata
             if db_metadata.get("is_merged"):
                 segment_metadata = {**segment_metadata, **db_metadata}
@@ -1151,6 +1155,7 @@ def build_export_segments_from_source(
                 "source_text": parsed_segment.source_text,
                 "display_text": parsed_segment.display_text,
                 "target_text": _get_segment_value(translated_segment, "target_text", ""),
+                "target_layout_text": target_layout_text,
                 "status": _get_segment_value(translated_segment, "status", "none"),
                 "matched_source_text": _get_segment_value(translated_segment, "matched_source_text", ""),
                 "metadata": segment_metadata,

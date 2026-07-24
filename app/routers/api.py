@@ -179,6 +179,7 @@ from app.services.file_record_service import (
     load_file_record_source,
     refresh_segment_display_indexes,
     resolve_file_record_status,
+    set_segment_target_layout_text,
     sync_file_record_status,
     update_segment_by_sentence_id,
     update_segment_source_text,
@@ -216,6 +217,7 @@ from app.services.llm_service import (
     LLMTranslationFailure,
     LLMTranslationTask,
     iter_batch_translate,
+    split_format_tagged_translation,
     validate_provider_choice,
 )
 from app.services.term_entry_service import build_term_entry_conflict_items, save_term_entries_batch
@@ -15472,17 +15474,22 @@ async def llm_translate_file_record(
                     try:
                         with fdb.begin_nested():
                             before_text = segment.target_text
+                            # 拆分：纯译文入库 target_text，带标签版式译文单独存放供导出
+                            clean_translated_text, layout_translated_text = split_format_tagged_translation(
+                                result.translated_text
+                            )
                             translated_text = (
                                 strip_automatic_numbering_prefix(
-                                    result.translated_text,
+                                    clean_translated_text,
                                     source_text=segment.source_text,
                                     display_text=segment.display_text,
                                     reference_texts=[segment.matched_source_text],
                                 )
                                 if is_word_document
-                                else result.translated_text
+                                else clean_translated_text
                             )
                             segment.target_text = translated_text
+                            set_segment_target_layout_text(segment, layout_translated_text)
                             segment.target_html = None
                             segment.source = "llm"
                             segment.last_modified_by_id = current_user_id

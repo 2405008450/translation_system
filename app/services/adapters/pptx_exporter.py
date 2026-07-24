@@ -93,9 +93,12 @@ class PptxExporter:
         translated_segments: Iterable[Any],
         bilingual: bool = False,
     ) -> dict[tuple[Any, ...], Replacement]:
+        # 导出优先使用带标签版式译文（还原 run 级格式）；缺失时回退到纯译文。
         targets = {
             str(_get_segment_value(segment, "sentence_id", _get_segment_value(segment, "segment_id", ""))): str(
-                _get_segment_value(segment, "target_text", "") or ""
+                _get_segment_value(segment, "target_layout_text", "")
+                or _get_segment_value(segment, "target_text", "")
+                or ""
             )
             for segment in translated_segments
         }

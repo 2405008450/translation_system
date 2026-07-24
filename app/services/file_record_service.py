@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -794,6 +795,37 @@ def _merge_segment_layout_metadata(segment: Segment, layout_text: str, format_ma
     segment.segment_metadata = json.dumps(metadata, ensure_ascii=False)
 
 
+_FORMAT_MARK_RE = re.compile(r"⟦\s*/?\s*\d+\s*⟧")
+
+
+def _split_format_tagged_text(text: str) -> tuple[str, str]:
+    """把（可能带 ⟦n⟧ 标签的）译文拆成 (纯译文, 带标签版式译文)。无标签时版式译文为空串。"""
+    if not text or not _FORMAT_MARK_RE.search(text):
+        return text, ""
+    return _FORMAT_MARK_RE.sub("", text), text
+
+
+def set_segment_target_layout_text(segment: Segment, layout_text: str) -> None:
+    """写入/清除句段的带标签版式译文（segment_metadata.target_layout_text）。
+
+    译文本身（target_text）保持纯净；带标签版式译文单独存放，仅供导出还原 run 级格式。
+    传空串表示清除（如手动改动译文后使旧版式译文失效）。
+    """
+    try:
+        metadata = json.loads(segment.segment_metadata) if segment.segment_metadata else {}
+    except (TypeError, json.JSONDecodeError):
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    if layout_text:
+        metadata["target_layout_text"] = layout_text
+    elif "target_layout_text" in metadata:
+        del metadata["target_layout_text"]
+    else:
+        return
+    segment.segment_metadata = json.dumps(metadata, ensure_ascii=False)
+
+
 def backfill_file_record_pptx_layout(db: Session, file_record: FileRecord) -> int:
     """为既有 PPTX 文件回填原文列样式与版式标签，不改动译文。
 
@@ -1176,8 +1208,10 @@ def update_segment_target(
         target_text,
         target_html,
     )
+    target_text, layout_target_text = _split_format_tagged_text(target_text)
     before_text = segment.target_text
     segment.target_text = target_text
+    set_segment_target_layout_text(segment, layout_target_text)
     segment.target_html = target_html if target_html else None
     segment.source = source
     if source != "project_sync":
@@ -1244,8 +1278,10 @@ def update_segment_by_sentence_id(
         target_text,
         target_html,
     )
+    target_text, layout_target_text = _split_format_tagged_text(target_text)
     before_text = segment.target_text
     segment.target_text = target_text
+    set_segment_target_layout_text(segment, layout_target_text)
     segment.target_html = target_html if target_html else None
     segment.source = source
     if source != "project_sync":
@@ -1407,9 +1443,11 @@ def batch_update_segments(
             target_html,
             clean_numbering=clean_numbering,
         )
+        target_text, layout_target_text = _split_format_tagged_text(target_text)
         track_revision = bool(item.get("track_revision", True))
         confirm = bool(item.get("confirm", False))
         segment.target_text = target_text
+        set_segment_target_layout_text(segment, layout_target_text)
         segment.target_html = target_html if target_html else None
         segment.source = source
         if source != "project_sync":

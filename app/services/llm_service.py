@@ -938,6 +938,20 @@ def _has_format_tags(text: str) -> bool:
     return bool(FORMAT_TAG_RE.search(text or ""))
 
 
+def split_format_tagged_translation(text: str) -> tuple[str, str]:
+    """把 LLM 译文拆成 (纯译文, 带标签版式译文)。
+
+    - 纯译文：剥掉行内格式标签（⟦n⟧），用于入库 target_text、TM、匹配、展示；
+    - 版式译文：保留标签，单独存放（segment_metadata.target_layout_text）供导出还原 run 级格式。
+    无格式标签时版式译文为空串。
+    """
+    if not text or not _has_format_tags(text):
+        return text, ""
+    layout_text = text
+    clean_text = FORMAT_TAG_RE.sub("", text)
+    return clean_text, layout_text
+
+
 def _format_tag_instruction(task: LLMTranslationTask) -> str:
     tags = _extract_format_tag_sequence(_task_preservation_source_text(task))
     if not tags:

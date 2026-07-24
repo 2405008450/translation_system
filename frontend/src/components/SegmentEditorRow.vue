@@ -667,13 +667,16 @@ function renderMarkedTargetHtml(text: string, formatMap: Record<string, [string,
 function renderTargetTextWithHighlights(text: string): string {
   const formatMap = props.segment.source_format_map
   if (formatMap && Object.keys(formatMap).length > 0) {
-    // 多样式句段：按 ⟦n⟧ 逐词还原样式
+    // 兼容旧数据：译文若仍带 ⟦n⟧ 标记，按标记逐词还原样式
     if (hasFormatMarks(text)) {
       return renderMarkedTargetHtml(text, formatMap as Record<string, [string, string]>)
     }
-    // 统一样式句段（无标记）：整段套用 base 样式，与原文一致
+    // 统一样式句段（格式表只有 base）：整段套用 base 样式，与原文一致。
+    // 多样式句段的译文是纯译文、无逐词映射，保持纯文本展示。
+    const keys = Object.keys(formatMap)
+    const isUniform = keys.length === 1 && keys[0] === 'base'
     const base = formatMap.base
-    if (base && (base[0] || base[1])) {
+    if (isUniform && base && (base[0] || base[1])) {
       const highlightParts = getTargetHighlightParts(text)
       const inner = !highlightParts
         ? textToVisibleChars(text)
