@@ -210,6 +210,25 @@ def tagged_fragment_to_html(fragment: str, format_map: dict[str, list[str]]) -> 
     return "".join(parts)
 
 
+# run 属性里与“视觉样式”无关的噪声属性：仅影响拼写/语言/校对标记，不影响外观。
+# 归一化时剔除它们，使视觉一致但 lang/dirty 等不同的相邻 run 能合并为同一个标签。
+_NON_VISUAL_RPR_ATTRS = ("lang", "altLang", "dirty", "err", "noProof", "smtClean", "smtId")
+
+
+def _visual_rpr_key(rpr: ET.Element | None) -> str:
+    """把 ``<a:rPr>`` 归一化为“视觉样式” key：剥掉非视觉属性后序列化。
+
+    这样相邻且外观一致的 run（例如仅 lang 不同的中英混排数字）会被合并成一个标签，
+    任何真实格式差异（粗斜下划删/颜色/字号/字体等）仍会分到不同 key。
+    """
+    if rpr is None:
+        return ""
+    clone = copy.deepcopy(rpr)
+    for attr in _NON_VISUAL_RPR_ATTRS:
+        clone.attrib.pop(attr, None)
+    return ET.tostring(clone, encoding="unicode")
+
+
 @dataclass
 class TaggedParagraph:
     """一个段落的标签化结果。"""
@@ -250,7 +269,7 @@ def build_tagged_paragraph(paragraph: ET.Element) -> TaggedParagraph | None:
         t_element = run.find(f"{_A}t")
         rpr = run.find(f"{_A}rPr")
         text = t_element.text if (t_element is not None and t_element.text) else ""
-        key = ET.tostring(rpr, encoding="unicode") if rpr is not None else ""
+        key = _visual_rpr_key(rpr)
         segments.append((text, rpr, key))
 
     # 选“文本量最大”的样式作为基准，标签数量最少
