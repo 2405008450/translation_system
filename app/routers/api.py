@@ -10051,6 +10051,7 @@ def _serialize_workbench_segment(
         "source_body_text": seg.source_text,
         "source_layout_text": source_layout_text or None,
         "source_format_map": source_format_map or None,
+        "target_layout_text": target_layout_text or None,
         "automatic_numbering_text": automatic_numbering_text or None,
         "target_automatic_numbering_text": target_automatic_numbering_text or None,
         "source_html": seg.source_html,
