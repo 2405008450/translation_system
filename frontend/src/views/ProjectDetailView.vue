@@ -31,7 +31,7 @@ import {
   RotateCcw,
   X,
 } from 'lucide-vue-next'
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 
@@ -489,6 +489,7 @@ const showTermImportDialog = ref(false)
 const termExtractionNeedsReload = ref(false)
 const uploadInputKey = ref(0)
 const openActionMenuId = ref<string | null>(null)
+const actionMenuElement = ref<HTMLElement | null>(null)
 const actionMenuStyle = ref<Record<string, string>>({})
 const currentPage = ref(1)
 const pageSize = ref(10)
@@ -2842,19 +2843,51 @@ function closeActionMenu() {
   actionMenuStyle.value = {}
 }
 
-function toggleActionMenu(ev: MouseEvent, id: string) {
+async function toggleActionMenu(ev: MouseEvent, id: string) {
   if (openActionMenuId.value === id) {
     closeActionMenu()
     return
   }
+
   const btn = ev.currentTarget as HTMLElement
-  const r = btn.getBoundingClientRect()
+  const buttonRect = btn.getBoundingClientRect()
   openActionMenuId.value = id
   actionMenuStyle.value = {
     position: 'fixed',
-    top: `${Math.round(r.bottom + 6)}px`,
-    left: `${Math.round(r.right)}px`,
-    transform: 'translateX(-100%)',
+    top: '0',
+    left: '0',
+    visibility: 'hidden',
+    zIndex: '3000',
+  }
+
+  await nextTick()
+  if (openActionMenuId.value !== id || !actionMenuElement.value) {
+    return
+  }
+
+  const menuRect = actionMenuElement.value.getBoundingClientRect()
+  const viewportWidth = document.documentElement.clientWidth
+  const viewportHeight = document.documentElement.clientHeight
+  const viewportMargin = 8
+  const menuGap = 6
+  const maxLeft = Math.max(viewportMargin, viewportWidth - viewportMargin - menuRect.width)
+  const left = Math.min(
+    Math.max(viewportMargin, buttonRect.right - menuRect.width),
+    maxLeft,
+  )
+  const belowTop = buttonRect.bottom + menuGap
+  const aboveTop = buttonRect.top - menuGap - menuRect.height
+  const maxTop = Math.max(viewportMargin, viewportHeight - viewportMargin - menuRect.height)
+  const top = belowTop + menuRect.height <= viewportHeight - viewportMargin
+    ? belowTop
+    : aboveTop >= viewportMargin
+      ? aboveTop
+      : Math.min(Math.max(viewportMargin, belowTop), maxTop)
+
+  actionMenuStyle.value = {
+    position: 'fixed',
+    top: `${Math.round(top)}px`,
+    left: `${Math.round(left)}px`,
     zIndex: '3000',
   }
 }
@@ -7714,6 +7747,7 @@ onBeforeUnmount(() => {
     <Teleport to="body">
       <div
         v-if="openActionMenuId && actionMenuRow"
+        ref="actionMenuElement"
         class="pd-action-menu__dropdown pd-action-menu__dropdown--floating"
         :style="actionMenuStyle"
         role="menu"
@@ -10424,6 +10458,9 @@ onBeforeUnmount(() => {
   right: auto;
   top: auto;
   margin: 0;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
 }
 
 .pd-action-menu__dropdown button {

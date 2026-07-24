@@ -2834,6 +2834,12 @@ class TMCollectionMergePayload(BaseModel):
     description: str | None = None
 
 
+class TMCollectionAppendPayload(BaseModel):
+    target_collection_id: UUID
+    source_collection_ids: list[UUID]
+    duplicate_policy: Literal["keep", "overwrite"] = "keep"
+
+
 class TermBasePayload(BaseModel):
     name: str
     description: str | None = None
@@ -16330,6 +16336,134 @@ def merge_tm_collections(
         "updated_rows": updated_rows,
         "skipped_rows": skipped_rows,
         "merged_rows": created_rows + updated_rows,
+    }
+
+
+@router.post("/translation-memory/collections/append")
+@router.post("/tm/collections/append", include_in_schema=False)
+def append_tm_collections(
+    payload: TMCollectionAppendPayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_business_manager),
+):
+    source_collection_ids = list(dict.fromkeys(payload.source_collection_ids))
+    if not source_collection_ids:
+        raise HTTPException(status_code=400, detail="请至少选择一个要追加的来源记忆库。")
+    if payload.target_collection_id in source_collection_ids:
+        raise HTTPException(status_code=400, detail="目标记忆库不能同时作为来源记忆库。")
+
+    requested_collection_ids = [payload.target_collection_id, *source_collection_ids]
+    collections = (
+        db.query(MemoryBase)
+        .filter(MemoryBase.id.in_(requested_collection_ids))
+        .all()
+    )
+    collection_by_id = {collection.id: collection for collection in collections}
+    missing_ids = [
+        collection_id
+        for collection_id in requested_collection_ids
+        if collection_id not in collection_by_id
+    ]
+    if missing_ids:
+        raise HTTPException(status_code=404, detail="目标或来源记忆库不存在。")
+
+    target_collection = collection_by_id[payload.target_collection_id]
+    ordered_source_collections = [
+        collection_by_id[collection_id]
+        for collection_id in source_collection_ids
+    ]
+    try:
+        source_language, target_language = _require_same_tm_collection_language_pair(
+            [target_collection, *ordered_source_collections],
+        )
+    except HTTPException as exc:
+        if exc.status_code == 400:
+            raise HTTPException(
+                status_code=400,
+                detail="只能向语言对完全一致的目标记忆库追加内容。",
+            ) from exc
+        raise
+
+    created_rows = 0
+    updated_rows = 0
+    skipped_rows = 0
+    sync_rows: list[tuple[UUID, str]] = []
+    pending_entries: list[TMUpsertEntry] = []
+    append_batch_size = 1000
+
+    def flush_pending_entries() -> None:
+        nonlocal created_rows, updated_rows, skipped_rows, pending_entries
+        if not pending_entries:
+            return
+        summary = batch_upsert_tm_entries(
+            db,
+            pending_entries,
+            duplicate_policy=payload.duplicate_policy,
+        )
+        created_rows += summary.created_count
+        updated_rows += summary.updated_count
+        skipped_rows += summary.skipped_count
+        sync_rows.extend(summary.sync_rows or [])
+        pending_entries = []
+
+    try:
+        for source_collection_id in source_collection_ids:
+            source_entries = (
+                db.query(MemoryEntry)
+                .filter(MemoryEntry.collection_id == source_collection_id)
+                .order_by(MemoryEntry.created_at.asc(), MemoryEntry.id.asc())
+                .all()
+            )
+            for entry in source_entries:
+                pending_entries.append(TMUpsertEntry(
+                    collection_id=target_collection.id,
+                    source_text=entry.source_text,
+                    target_text=entry.target_text,
+                    source_language=source_language,
+                    target_language=target_language,
+                    creator_id=entry.creator_id or current_user.id,
+                    last_modified_by_id=current_user.id,
+                    external_tuid=entry.external_tuid,
+                    tmx_metadata=deepcopy(entry.tmx_metadata),
+                ))
+                if len(pending_entries) >= append_batch_size:
+                    flush_pending_entries()
+        flush_pending_entries()
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="追加记忆库失败，目标库中存在冲突条目。") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    sync_tm_embeddings(
+        db,
+        list({entry_id: source_text for entry_id, source_text in sync_rows}.items()),
+    )
+    refreshed_segments = 0
+    if created_rows > 0 or updated_rows > 0:
+        refreshed_segments = _notify_tm_collections_changed(db, [target_collection.id])
+
+    db.refresh(target_collection)
+    target_entry_count = (
+        db.query(func.count(MemoryEntry.id))
+        .filter(MemoryEntry.collection_id == target_collection.id)
+        .scalar()
+        or 0
+    )
+    return {
+        "collection": _serialize_tm_collection(
+            target_collection,
+            entry_count=int(target_entry_count),
+        ),
+        "source_count": len(source_collection_ids),
+        "created_rows": created_rows,
+        "updated_rows": updated_rows,
+        "skipped_rows": skipped_rows,
+        "appended_rows": created_rows + updated_rows,
+        "refreshed_segments": refreshed_segments,
+        "duplicate_policy": payload.duplicate_policy,
     }
 
 

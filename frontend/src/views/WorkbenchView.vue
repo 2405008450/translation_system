@@ -2536,8 +2536,8 @@ usePageHeader(() => ({
 useWorkbenchShortcuts({
   save: () => { void saveNow() },
   runAI: () => { void runLLMTranslation() },
-  focusPrev: () => { void focusSentenceByOffset(-1) },
-  focusNext: () => { void focusSentenceByOffset(1) },
+  focusPrev: () => { void focusSentenceByOffset(-1, { caretAtEnd: true }) },
+  focusNext: () => { void focusSentenceByOffset(1, { caretAtEnd: true }) },
   focusPrevSearchResult: () => { void focusSearchResultByOffset(-1) },
   focusNextSearchResult: () => { void focusSearchResultByOffset(1) },
   confirmSegment: () => { void confirmAndMoveToNextUnconfirmed() },
