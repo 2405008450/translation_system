@@ -166,9 +166,10 @@ class DitaAdapter(FormatAdapter):
                 # 跳过非元素节点
                 if not isinstance(child.tag, str):
                     continue
-                child_tag = etree.QName(child).localname
-                # 只递归处理块级子元素
-                if child_tag in DITA_ELEMENT_MAP:
+                # DITA 表格等结构中可能存在未显式映射的容器元素，
+                # 例如 table/tgroup/tbody/row。只要其后代包含块级元素，
+                # 就必须按结构递归，不能把整个容器误当作内联文本聚合。
+                if self._is_structural_child(child):
                     child_nodes = self._parse_element(child)
                     children.extend(child_nodes)
             
@@ -241,7 +242,7 @@ class DitaAdapter(FormatAdapter):
                 })
                 
                 text_parts.append(child_text)
-            elif child_tag not in DITA_ELEMENT_MAP:
+            elif not self._is_structural_child(child):
                 # 未知元素，提取文本
                 text_parts.append(self._get_all_text(child))
             
@@ -250,6 +251,30 @@ class DitaAdapter(FormatAdapter):
                 text_parts.append(child.tail)
         
         return "".join(text_parts), inline_tags
+
+    def _is_structural_child(self, element: etree._Element) -> bool:
+        """判断子元素是否承载块级结构，而不是普通内联文本。
+
+        DITA 允许通过专用化或中间容器包装标准块级元素。例如标准表格的
+        ``<table>`` 与 ``<row>`` 之间通常还有 ``<tgroup>/<tbody>``。
+        这些容器即使没有出现在映射表中，也不能整体聚合成父节点文本。
+        """
+        if not isinstance(element.tag, str):
+            return False
+
+        tag = etree.QName(element).localname
+        if tag in INLINE_ELEMENTS:
+            return False
+        if tag in DITA_ELEMENT_MAP:
+            return True
+
+        for descendant in element.iterdescendants():
+            if not isinstance(descendant.tag, str):
+                continue
+            descendant_tag = etree.QName(descendant).localname
+            if descendant_tag in DITA_ELEMENT_MAP:
+                return True
+        return False
 
     def _get_all_text(self, element: etree._Element) -> str:
         """获取元素及其所有子元素的文本
@@ -278,6 +303,7 @@ class DitaAdapter(FormatAdapter):
                     display_text=display_text,
                     block_path=path,
                     position=position,
+                    metadata=node.metadata,
                 ))
                 position += 1
 
